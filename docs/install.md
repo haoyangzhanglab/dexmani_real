@@ -1,4 +1,7 @@
+# 安装指南
+
 ## Pytorch相关安装
+
 ```bash
 pip install torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -6,6 +9,7 @@ pip install torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 \
 ```
 
 ## XHand相关安装
+
 ```bash
 pip install "dex-retargeting<0.5.0"
 pip install mediapipe==0.10.20
@@ -17,7 +21,9 @@ sudo setcap cap_net_raw+ep $(readlink -f $(which python3))
 ```
 
 ## RealSense相关安装
-#### 安装SDK
+
+### 安装SDK
+
 ```bash
 sudo rm -f /etc/apt/sources.list.d/librealsense*
 sudo apt-get update
@@ -47,28 +53,36 @@ sudo apt-mark hold \
   librealsense2 librealsense2-dev librealsense2-utils \
   librealsense2-gl librealsense2-udev-rules
 ```
+
 L515 是退役型号，较新的 librealsense / viewer 版本已经不再支持它
 L515 最后一个经过验证的 SDK 版本是 v2.50.0，v2.54.2 仍可支持但不再验证；从 v2.55.1 起，L515/SR300 的支持代码已经被移除
 安装完成后执行,查看是否安装成功
+
 ```bash
 realsense-viewer
 ```
-#### 安装python库
+
+### 安装python库
+
 ```bash
 pip install pyrealsense2==2.54.2.5684   #和SDK版本号最好保持一致
 ```
-#### 安装pytorch3d和open3d
+
+### 安装pytorch3d和open3d
+
 ```bash
 python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 pip install open3d
 ```
 
 ## XArm相关安装
+
 ```bash
 pip install mplib==0.2.1
 ```
 
 ## VR相关安装
+
 ```bash
 pip install av
 pip install "hand-tracking-sdk[visualization]"
@@ -102,15 +116,13 @@ ip addr show | grep "inet " | grep -v 127.0.0.1
 
 1. 戴上 Quest，打开 Hand Tracking Streamer
 2. 填入以下配置：
-
 | 设置项 | 值 | 说明 |
-|--------|------|------|
+| -------- | ------ | ------ |
 | **Protocol** | TCP | 可靠传输，数据不丢失 |
 | **IP Address** | 电脑的 IP | 第一步记下的地址 |
 | **Port** | 8000 | 与代码默认端口一致 |
 | **Hand Mode** | Left/Right/Dual | 选择追踪的手 |
-
-3. 点 **Start Streaming**
+3. Start Streaming
 
 ### 2.4 启动电脑端接收
 
@@ -123,4 +135,4 @@ ip addr show | grep "inet " | grep -v 127.0.0.1
 3. 确认 Quest 里填的 IP 与电脑实际 IP 一致
 4. 用 `ping <电脑IP>` 测试连通性
 
-**帧率低？** 确保使用 5GHz Wi-Fi，信号良好。
+**帧率低？** 确保使用 5GHz Wi-Fi，信号良好
