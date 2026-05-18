@@ -1,377 +1,644 @@
-import time
-import argparse
-from typing import Optional, Tuple, Dict, List
-
 import cv2
+import time
 import numpy as np
+import argparse
 import pyrealsense2 as rs
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dexmani_real.sensor.pcd_utils import get_pointcloud
-
-try:
-    from dexmani_real.sensor.pcd_utils import vis_point_cloud
-except ImportError:
-    vis_point_cloud = None
+from dexmani_real.sensor.pcd_utils import (
+    blend_overlay,
+    check_transform,
+    depth_meters_to_mm,
+    depth_valid_ratio,
+    intrinsics_to_dict,
+    intrinsics_to_matrix,
+    make_depth_vis,
+    make_rays,
+    pack_obs,
+    parse_resolution,
+    rgbd_to_pointcloud,
+    vis_point_cloud,
+)
 
 
 class RealSense:
+    """Minimal RealSense RGB-D camera wrapper.
+
+    Coordinate convention:
+    - align_to='depth': color is aligned to depth, K is depth intrinsics.
+    - align_to='color': depth is aligned to color, K is color intrinsics.
+    - align_to='none': no SDK alignment, K is depth intrinsics.
+
+    Point cloud convention:
+    - If T_out_camera is None, point clouds are in current camera frame.
+    - If T_out_camera is provided, point clouds are transformed before workspace crop.
+      Therefore workspace should be expressed in the output/world/base frame.
+    """
+
     def __init__(
         self,
-        serial: str,
+        serial: Optional[str] = None,
         depth_resolution: Tuple[int, int] = (640, 480),
-        color_resolution: Tuple[int, int] = (1280, 720),
+        color_resolution: Tuple[int, int] = (640, 480),
         fps: int = 30,
+        enable_color: bool = True,
+        align_to: str = "depth",
         depth_hole_filling: bool = False,
-        pose: Optional[np.ndarray] = None,   # camera -> world, 4x4
-    ):
+        T_out_camera: Optional[np.ndarray] = None,
+        enable_global_time: bool = True,
+        warmup_frames: int = 10,
+    ) -> None:
+        if align_to not in ("depth", "color", "none"):
+            raise ValueError("align_to must be one of: 'depth', 'color', 'none'.")
+        if not enable_color and align_to == "color":
+            raise ValueError("align_to='color' requires enable_color=True.")
+
         self.serial = serial
         self.depth_resolution = depth_resolution
         self.color_resolution = color_resolution
-        self.fps = fps
-        self.depth_hole_filling = depth_hole_filling
-        self.pose = pose
+        self.fps = int(fps)
+        self.enable_color = bool(enable_color)
+        self.align_to = align_to
+        self.depth_hole_filling = bool(depth_hole_filling)
+        self.T_out_camera = check_transform(T_out_camera)
+        self.enable_global_time = bool(enable_global_time)
+        self.warmup_frames = int(warmup_frames)
 
         self.pipeline: Optional[rs.pipeline] = None
         self.config: Optional[rs.config] = None
-        self.aligner: Optional[rs.align] = None
-        self.hole_filling = None
+        self.pipeline_profile: Optional[rs.pipeline_profile] = None
+        self.align: Optional[rs.align] = None
+        self.hole_filling_filter: Optional[rs.hole_filling_filter] = None
 
         self.depth_scale: Optional[float] = None
-        self.intrinsics: Optional[np.ndarray] = None   # depth intrinsics, (3, 3)
+        self.depth_intrinsics: Optional[np.ndarray] = None
+        self.color_intrinsics: Optional[np.ndarray] = None
+        self.active_intrinsics: Optional[np.ndarray] = None
+        self.depth_intrinsics_info: Optional[dict] = None
+        self.color_intrinsics_info: Optional[dict] = None
+        self.active_intrinsics_info: Optional[dict] = None
+
+        self.rays_cache: Dict[Tuple[int, int, str], Any] = {}
+        self.frame_id = 0
+        self.last_timestamp: Optional[float] = None
+        self.last_host_time: Optional[float] = None
 
     def start(self) -> None:
+        """Start the RealSense pipeline."""
         if self.pipeline is not None:
             return
 
-        dw, dh = self.depth_resolution
-        cw, ch = self.color_resolution
+        if self.serial is None:
+            cameras = self.list_cameras()
+            if len(cameras) == 0:
+                raise RuntimeError("No RealSense camera found.")
+            self.serial = cameras[0]["serial"]
 
-        self.config = rs.config()
-        self.config.enable_device(self.serial)
-        self.config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, self.fps)
-        self.config.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, self.fps)
+        depth_width, depth_height = self.depth_resolution
+        color_width, color_height = self.color_resolution
 
         self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_device(self.serial)
+        self.config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, self.fps)
+        if self.enable_color:
+            self.config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, self.fps)
 
         try:
             self.config.resolve(rs.pipeline_wrapper(self.pipeline))
-        except RuntimeError as e:
+        except RuntimeError as error:
             raise RuntimeError(
                 "Failed to resolve RealSense stream config. "
                 f"serial={self.serial}, "
-                f"depth={dw}x{dh}@{self.fps}, "
-                f"color={cw}x{ch}@{self.fps}"
-            ) from e
+                f"depth={depth_width}x{depth_height}@{self.fps}, "
+                f"color={color_width}x{color_height}@{self.fps}, "
+                f"enable_color={self.enable_color}, align_to={self.align_to}"
+            ) from error
 
-        profile = self.pipeline.start(self.config)
+        self.pipeline_profile = self.pipeline.start(self.config)
+        self.align = self.create_aligner()
+        self.hole_filling_filter = rs.hole_filling_filter(2) if self.depth_hole_filling else None
 
-        self.aligner = rs.align(rs.stream.depth)
+        self.set_global_time()
+        self.depth_scale = float(self.pipeline_profile.get_device().first_depth_sensor().get_depth_scale())
+        self.update_intrinsics_from_profile()
+        self.frame_id = 0
+        self.last_timestamp = None
+        self.last_host_time = None
+        self.rays_cache.clear()
 
-        if self.depth_hole_filling:
-            self.hole_filling = rs.hole_filling_filter(mode=2)
-
-        self.depth_scale = (
-            profile.get_device()
-            .first_depth_sensor()
-            .get_depth_scale()
-        )
-
-        di = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
-        self.intrinsics = np.array([
-            [di.fx, 0.0, di.ppx],
-            [0.0, di.fy, di.ppy],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-
-        try:
-            profile.get_device().first_color_sensor().set_option(
-                rs.option.global_time_enabled, 1
-            )
-        except Exception:
-            pass
-
-        for _ in range(5):
+        for warmup_index in range(max(self.warmup_frames, 0)):
             self.pipeline.wait_for_frames()
 
     def stop(self) -> None:
+        """Stop the RealSense pipeline. Safe to call repeatedly."""
         if self.pipeline is not None:
-            self.pipeline.stop()
-            self.pipeline = None
-
-        self.config = None
-        self.aligner = None
-        self.hole_filling = None
-        self.depth_scale = None
-        self.intrinsics = None
+            try:
+                self.pipeline.stop()
+            finally:
+                self.pipeline = None
+                self.config = None
+                self.pipeline_profile = None
+                self.align = None
+                self.hole_filling_filter = None
+                self.depth_scale = None
+                self.depth_intrinsics = None
+                self.color_intrinsics = None
+                self.active_intrinsics = None
+                self.depth_intrinsics_info = None
+                self.color_intrinsics_info = None
+                self.active_intrinsics_info = None
+                self.rays_cache.clear()
+                self.last_timestamp = None
+                self.last_host_time = None
 
     def __enter__(self) -> "RealSense":
         self.start()
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         self.stop()
 
-    def get_frame(self, timeout_ms: int = 5000) -> Tuple[np.ndarray, np.ndarray, float]:
-        if self.pipeline is None or self.aligner is None:
-            raise RuntimeError("RealSense is not started")
+    def create_aligner(self) -> Optional[rs.align]:
+        """Create an SDK aligner according to align_to."""
+        if not self.enable_color or self.align_to == "none":
+            return None
+        if self.align_to == "depth":
+            return rs.align(rs.stream.depth)
+        if self.align_to == "color":
+            return rs.align(rs.stream.color)
+        return None
 
-        frameset = self.pipeline.wait_for_frames(timeout_ms)
-        frameset = self.aligner.process(frameset)
+    def set_global_time(self) -> None:
+        """Try to enable RealSense global time on all sensors that support it."""
+        if not self.enable_global_time or self.pipeline_profile is None:
+            return
+        device = self.pipeline_profile.get_device()
+        for sensor in device.query_sensors():
+            try:
+                if sensor.supports(rs.option.global_time_enabled):
+                    sensor.set_option(rs.option.global_time_enabled, 1)
+            except Exception:
+                pass
 
-        depth_frame = frameset.get_depth_frame()
-        color_frame = frameset.get_color_frame()
+    def update_intrinsics_from_profile(self) -> None:
+        """Read active intrinsics from the started pipeline profile."""
+        if self.pipeline_profile is None:
+            raise RuntimeError("RealSense is not started.")
 
-        if not depth_frame or not color_frame:
-            raise RuntimeError("Failed to get aligned depth/color frame")
+        depth_profile = self.pipeline_profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        depth_intrinsics = depth_profile.get_intrinsics()
+        self.depth_intrinsics = intrinsics_to_matrix(depth_intrinsics)
+        self.depth_intrinsics_info = intrinsics_to_dict(depth_intrinsics)
 
-        if self.hole_filling is not None:
-            depth_frame = self.hole_filling.process(depth_frame)
+        if self.enable_color:
+            color_profile = self.pipeline_profile.get_stream(rs.stream.color).as_video_stream_profile()
+            color_intrinsics = color_profile.get_intrinsics()
+            self.color_intrinsics = intrinsics_to_matrix(color_intrinsics)
+            self.color_intrinsics_info = intrinsics_to_dict(color_intrinsics)
+        else:
+            self.color_intrinsics = None
+            self.color_intrinsics_info = None
 
-        depth = np.asanyarray(depth_frame.get_data()).astype(np.float32)
-        depth *= self.depth_scale
+        if self.align_to == "color" and self.color_intrinsics is not None:
+            self.active_intrinsics = self.color_intrinsics.copy()
+            self.active_intrinsics_info = dict(self.color_intrinsics_info)
+        else:
+            self.active_intrinsics = self.depth_intrinsics.copy()
+            self.active_intrinsics_info = dict(self.depth_intrinsics_info)
+        self.rays_cache.clear()
 
-        color_bgr = np.asanyarray(color_frame.get_data())
-        color = np.ascontiguousarray(color_bgr[..., ::-1])   # RGB, contiguous
+    def update_active_intrinsics_from_depth_frame(self, depth_frame: rs.depth_frame) -> None:
+        """Update active intrinsics from the current depth frame profile."""
+        video_profile = depth_frame.get_profile().as_video_stream_profile()
+        intrinsics = video_profile.get_intrinsics()
+        active_intrinsics = intrinsics_to_matrix(intrinsics)
+        active_intrinsics_info = intrinsics_to_dict(intrinsics)
+        if self.active_intrinsics is None or not np.allclose(active_intrinsics, self.active_intrinsics):
+            self.active_intrinsics = active_intrinsics
+            self.active_intrinsics_info = active_intrinsics_info
+            self.rays_cache.clear()
 
-        timestamp = depth_frame.get_timestamp() / 1000.0
+    def read(self, timeout_ms: int = 5000, return_dict: bool = False):
+        """Read one RGB-D frame.
+
+        Default return:
+            color, depth, timestamp
+
+        Data format:
+            color: np.uint8 RGB, shape (H, W, 3), value range [0, 255].
+            depth: np.uint16 millimeters, shape (H, W).
+            timestamp: RealSense frame timestamp in seconds.
+
+        return_dict=True:
+            plain dict with rgb, depth, timestamp, host_time, intrinsics, depth_scale and meta.
+        """
+        if self.pipeline is None:
+            raise RuntimeError("RealSense is not started. Call start() first.")
+        if self.depth_scale is None:
+            raise RuntimeError("RealSense depth_scale is unavailable. Call start() first.")
+
+        frames = self.pipeline.wait_for_frames(timeout_ms)
+        if self.align is not None:
+            frames = self.align.process(frames)
+
+        host_time = time.time()
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame() if self.enable_color else None
+
+        if not depth_frame:
+            raise RuntimeError("Failed to get depth frame from RealSense.")
+        if self.enable_color and not color_frame:
+            raise RuntimeError("Failed to get color frame from RealSense.")
+
+        if self.hole_filling_filter is not None:
+            depth_frame = self.hole_filling_filter.process(depth_frame).as_depth_frame()
+
+        self.update_active_intrinsics_from_depth_frame(depth_frame)
+
+        depth_meters = np.asanyarray(depth_frame.get_data()).astype(np.float32) * self.depth_scale
+        depth = depth_meters_to_mm(depth_meters)
+        color = None
+        if color_frame is not None:
+            color_bgr = np.asanyarray(color_frame.get_data())
+            color = np.ascontiguousarray(color_bgr[..., ::-1])
+
+        timestamp = float(depth_frame.get_timestamp()) * 1e-3
+        self.frame_id += 1
+        self.last_timestamp = timestamp
+        self.last_host_time = host_time
+
+        if return_dict:
+            return pack_obs(
+                color=color,
+                depth=depth,
+                timestamp=timestamp,
+                host_time=host_time,
+                intrinsics=self.get_intrinsics(),
+                intrinsics_info=self.get_intrinsics_info(),
+                depth_scale=self.get_depth_scale(),
+                serial=self.serial,
+                frame_id=self.frame_id,
+                align_to=self.align_to,
+                pointcloud_frame="out" if self.T_out_camera is not None else "camera",
+                valid_ratio=depth_valid_ratio(depth),
+                mode="rgbd",
+            )
         return color, depth, timestamp
 
     def get_intrinsics(self) -> np.ndarray:
-        if self.intrinsics is None:
-            raise RuntimeError("RealSense is not started")
-        return self.intrinsics.copy()
+        """Return a copy of active intrinsics matrix K for current depth image."""
+        if self.active_intrinsics is None:
+            raise RuntimeError("RealSense is not started or active intrinsics are unavailable.")
+        return self.active_intrinsics.copy()
+
+    def get_intrinsics_info(self) -> dict:
+        """Return active intrinsics as fx/fy/cx/cy/width/height dict."""
+        if self.active_intrinsics_info is None:
+            raise RuntimeError("RealSense is not started or active intrinsics info is unavailable.")
+        return dict(self.active_intrinsics_info)
 
     def get_depth_scale(self) -> float:
+        """Return RealSense raw-depth to meter scale."""
         if self.depth_scale is None:
-            raise RuntimeError("RealSense is not started")
+            raise RuntimeError("RealSense is not started or depth scale is unavailable.")
         return float(self.depth_scale)
 
-    def frames_to_pointcloud(
+    def get_device_info(self) -> dict:
+        """Return basic device information for the active camera."""
+        if self.pipeline_profile is None:
+            raise RuntimeError("RealSense is not started.")
+        device = self.pipeline_profile.get_device()
+        info = {}
+        for camera_info in [
+            rs.camera_info.name,
+            rs.camera_info.serial_number,
+            rs.camera_info.firmware_version,
+            rs.camera_info.product_line,
+        ]:
+            try:
+                if device.supports(camera_info):
+                    info[str(camera_info)] = device.get_info(camera_info)
+            except Exception:
+                pass
+        return info
+
+    def rays(self, shape: Tuple[int, int], device: str = "cpu"):
+        """Return cached camera rays for a given depth shape and torch device."""
+        if self.active_intrinsics is None:
+            raise RuntimeError("RealSense is not started or active intrinsics are unavailable.")
+        height, width = int(shape[0]), int(shape[1])
+        cache_key = (height, width, str(device))
+        if cache_key not in self.rays_cache:
+            self.rays_cache[cache_key] = make_rays(height, width, self.active_intrinsics, device=device)
+        return self.rays_cache[cache_key]
+
+    def pointcloud_from_frame(
         self,
-        color: np.ndarray,
+        color: Optional[np.ndarray],
         depth: np.ndarray,
         *,
-        bound: Optional[list[float]] = None,
-        npoints: int = 1024,
-        min_depth: float = 0.1,
-        max_depth: float = 5.0,
+        workspace: Optional[Sequence[float]] = None,
+        bound: Optional[Sequence[float]] = None,
+        npoints: Optional[int] = 1024,
+        min_depth: Optional[float] = 0.05,
+        max_depth: Optional[float] = 2.0,
+        sampling: str = "random",
         device: str = "cpu",
-    ) -> Dict[str, np.ndarray]:
-        return get_pointcloud(
+        return_tensor: bool = True,
+    ):
+        """Convert one RGB-D frame to point cloud.
+
+        workspace is applied after T_out_camera. If T_out_camera is None, workspace is in camera frame.
+        bound is kept as a backward-compatible alias for workspace.
+        """
+        if workspace is not None and bound is not None:
+            raise ValueError("Use only one of workspace or bound, not both.")
+        if workspace is None:
+            workspace = bound
+
+        return rgbd_to_pointcloud(
             depth=depth,
-            intr=self.get_intrinsics(),
             color=color,
-            bound=bound,
+            rays=self.rays(depth.shape, device=device),
+            T_out_camera=self.T_out_camera,
+            workspace=workspace,
             npoints=npoints,
             min_depth=min_depth,
             max_depth=max_depth,
+            sampling=sampling,
             device=device,
-            transform=self.pose,
+            return_tensor=return_tensor,
         )
 
-    def get_pointcloud(
+    def pointcloud(self, **kwargs):
+        """Read one frame and return packed XYZRGB point cloud.
+
+        Return shape is (N, 6), dtype float32. Columns 0:3 are XYZ in meters;
+        columns 3:6 are normalized RGB in [0, 1].
+        """
+        color, depth, timestamp = self.read()
+        return self.pointcloud_from_frame(color, depth, **kwargs)
+
+    def get_obs(
         self,
         *,
-        bound: Optional[list[float]] = None,
-        npoints: int = 1024,
-        min_depth: float = 0.1,
-        max_depth: float = 5.0,
+        mode: str = "full",
+        workspace: Optional[Sequence[float]] = None,
+        bound: Optional[Sequence[float]] = None,
+        npoints: Optional[int] = 1024,
+        min_depth: Optional[float] = 0.05,
+        max_depth: Optional[float] = 2.0,
+        sampling: str = "random",
         device: str = "cpu",
-    ) -> Dict[str, np.ndarray]:
-        color, depth, _ = self.get_frame()
-        return self.frames_to_pointcloud(
+        return_tensor: bool = True,
+    ) -> dict:
+        """Read one frame and pack an observation dict.
+
+        mode:
+        - 'rgbd': RGB-D only, no point cloud generation.
+        - 'pointcloud': point cloud and metadata only.
+        - 'full': RGB-D + point cloud + metadata.
+        """
+        if mode not in ("rgbd", "pointcloud", "full"):
+            raise ValueError("mode must be one of: 'rgbd', 'pointcloud', 'full'.")
+        if workspace is not None and bound is not None:
+            raise ValueError("Use only one of workspace or bound, not both.")
+        if workspace is None:
+            workspace = bound
+
+        color, depth, timestamp = self.read()
+        host_time = self.last_host_time
+        pointcloud = None
+
+        if mode in ("pointcloud", "full"):
+            pointcloud = self.pointcloud_from_frame(
+                color,
+                depth,
+                workspace=workspace,
+                npoints=npoints,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                sampling=sampling,
+                device=device,
+                return_tensor=return_tensor,
+            )
+
+        return pack_obs(
             color=color,
             depth=depth,
-            bound=bound,
+            timestamp=timestamp,
+            host_time=host_time,
+            pointcloud=pointcloud,
+            intrinsics=self.get_intrinsics(),
+            intrinsics_info=self.get_intrinsics_info(),
+            depth_scale=self.get_depth_scale(),
+            serial=self.serial,
+            frame_id=self.frame_id,
+            align_to=self.align_to,
+            pointcloud_frame="out" if self.T_out_camera is not None else "camera",
+            workspace=workspace,
             npoints=npoints,
+            sampling=sampling,
             min_depth=min_depth,
             max_depth=max_depth,
-            device=device,
+            valid_ratio=depth_valid_ratio(depth, min_depth=min_depth, max_depth=max_depth),
+            mode=mode,
         )
 
     @staticmethod
     def list_cameras() -> List[Dict[str, str]]:
-        ctx = rs.context()
+        """List connected RealSense devices."""
+        context = rs.context()
         cameras = []
-        for dev in ctx.query_devices():
-            cameras.append({
-                "serial": dev.get_info(rs.camera_info.serial_number),
-                "name": dev.get_info(rs.camera_info.name),
-                "firmware": dev.get_info(rs.camera_info.firmware_version),
-            })
+        for device in context.query_devices():
+            camera = {}
+            for key, value in [
+                ("serial", rs.camera_info.serial_number),
+                ("name", rs.camera_info.name),
+                ("firmware", rs.camera_info.firmware_version),
+                ("product_line", rs.camera_info.product_line),
+            ]:
+                try:
+                    camera[key] = device.get_info(value) if device.supports(value) else ""
+                except Exception:
+                    camera[key] = ""
+            cameras.append(camera)
         return cameras
-
-
-def _parse_resolution(text: str) -> Tuple[int, int]:
-    w, h = text.lower().split("x")
-    return int(w), int(h)
-
-
-def _to_numpy(x):
-    if hasattr(x, "detach"):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def _make_depth_vis(
-    depth: np.ndarray,
-    min_depth: float = 0.1,
-    max_depth: float = 1.5,
-) -> np.ndarray:
-    valid = (depth > 0.0) & np.isfinite(depth)
-
-    depth_clip = np.clip(depth, min_depth, max_depth)
-    depth_norm = (depth_clip - min_depth) / max(max_depth - min_depth, 1e-6)
-    depth_u8 = (255.0 * (1.0 - depth_norm)).astype(np.uint8)
-
-    depth_vis = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
-    depth_vis[~valid] = 0
-    return depth_vis
 
 
 def example(
     serial: Optional[str] = None,
     depth_resolution: Tuple[int, int] = (640, 480),
-    color_resolution: Tuple[int, int] = (1280, 720),
+    color_resolution: Tuple[int, int] = (640, 480),
     fps: int = 30,
-    npoints: int = 1024,
-    bound: Optional[list[float]] = None,
-    min_depth: float = 0.1,
+    enable_color: bool = True,
+    align_to: str = "depth",
+    npoints: Optional[int] = 1024,
+    workspace: Optional[Sequence[float]] = None,
+    min_depth: float = 0.05,
     max_depth: float = 1.5,
+    sampling: str = "random",
     device: str = "cpu",
     depth_hole_filling: bool = False,
+    overlay_path: Optional[str] = None,
+    overlay_alpha: float = 0.5,
 ) -> None:
-    cams = RealSense.list_cameras()
-    if not cams:
-        print("[ERROR] 未检测到 RealSense 相机")
+    """Interactive RealSense RGB-D and packed XYZRGB point cloud smoke test."""
+    cameras = RealSense.list_cameras()
+    if len(cameras) == 0:
+        print("[ERROR] No RealSense camera found.")
         return
 
-    print("检测到相机:")
-    for cam in cams:
-        print(f"  {cam['name']:30s} SN={cam['serial']}  FW={cam['firmware']}")
+    print("Detected RealSense cameras:")
+    for camera in cameras:
+        print(
+            f"  {camera.get('name', ''):30s} SN={camera.get('serial', '')} "
+            f"FW={camera.get('firmware', '')} LINE={camera.get('product_line', '')}"
+        )
 
-    serial = serial or cams[0]["serial"]
-    print(f"\n使用设备: {serial}")
-    print(f"depth: {depth_resolution[0]}x{depth_resolution[1]} @ {fps}fps")
-    print(f"color: {color_resolution[0]}x{color_resolution[1]} @ {fps}fps")
-    print("align: color -> depth")
-    print(f"npoints: {npoints}, device={device}")
-    if bound is not None:
-        print(f"bound: {bound}")
+    serial = serial or cameras[0]["serial"]
     print()
+    print(f"Using serial: {serial}")
+    print(f"depth: {depth_resolution[0]}x{depth_resolution[1]} @ {fps}fps")
+    print(f"color: {color_resolution[0]}x{color_resolution[1]} @ {fps}fps, enable_color={enable_color}")
+    print(f"align_to: {align_to}")
+    print(f"npoints: {npoints}, sampling={sampling}, device={device}")
+    print(f"workspace: {workspace}")
+    print()
+
+    overlay_bgr = cv2.imread(overlay_path) if overlay_path else None
+    if overlay_path and overlay_bgr is None:
+        print(f"[WARN] Failed to read overlay image: {overlay_path}")
 
     with RealSense(
         serial=serial,
         depth_resolution=depth_resolution,
         color_resolution=color_resolution,
         fps=fps,
+        enable_color=enable_color,
+        align_to=align_to,
         depth_hole_filling=depth_hole_filling,
-    ) as cam:
-        intr = cam.get_intrinsics()
-        print("depth intrinsics:")
-        print(f"  {intr[0]}")
-        print(f"  {intr[1]}")
-        print(f"  {intr[2]}")
-        print(f"  depth_scale = {cam.get_depth_scale()}")
+        warmup_frames=10,
+    ) as camera:
+        print("Active intrinsics K:")
+        print(camera.get_intrinsics())
+        print("Active intrinsics info:")
+        print(camera.get_intrinsics_info())
+        print(f"depth_scale = {camera.get_depth_scale()}")
         print()
-        print("按键: q 退出, p 查看当前点云")
-        print()
+        print("Keys: q quit | p show current point cloud")
 
-        try:
-            while True:
-                t0 = time.perf_counter()
-                color, depth, ts = cam.get_frame()
-                grab_ms = (time.perf_counter() - t0) * 1000.0
+        while True:
+            grab_start = time.perf_counter()
+            color, depth, timestamp = camera.read()
+            grab_ms = (time.perf_counter() - grab_start) * 1000.0
 
-                t1 = time.perf_counter()
-                pcd = cam.frames_to_pointcloud(
-                    color=color,
-                    depth=depth,
-                    bound=bound,
+            pcd_start = time.perf_counter()
+            try:
+                pointcloud = camera.pointcloud_from_frame(
+                    color,
+                    depth,
+                    workspace=workspace,
                     npoints=npoints,
                     min_depth=min_depth,
                     max_depth=max_depth,
+                    sampling=sampling,
                     device=device,
+                    return_tensor=False,
                 )
-                pcd_ms = (time.perf_counter() - t1) * 1000.0
+            except ValueError as error:
+                print(f"[WARN] {error}")
+                pointcloud = np.empty((0, 6), dtype=np.float32)
+            pcd_ms = (time.perf_counter() - pcd_start) * 1000.0
 
-                num_points = int(pcd["pos"].shape[0])
-
+            depth_vis = make_depth_vis(depth, min_depth=min_depth, max_depth=max_depth)
+            if color is not None:
                 color_bgr = np.ascontiguousarray(color[..., ::-1])
-                depth_vis = _make_depth_vis(depth, min_depth=min_depth, max_depth=max_depth)
+                color_bgr = blend_overlay(color_bgr, overlay_bgr, alpha=overlay_alpha)
+                if color_bgr.shape[:2] == depth_vis.shape[:2]:
+                    panel = np.concatenate([color_bgr, depth_vis], axis=1)
+                else:
+                    depth_resized = cv2.resize(depth_vis, (color_bgr.shape[1], color_bgr.shape[0]))
+                    panel = np.concatenate([color_bgr, depth_resized], axis=1)
+            else:
+                panel = depth_vis
 
-                panel = np.concatenate([color_bgr, depth_vis], axis=1)
-                panel = np.ascontiguousarray(panel)
+            valid_ratio = depth_valid_ratio(depth, min_depth=min_depth, max_depth=max_depth)
+            cv2.putText(
+                panel,
+                f"ts={timestamp:.3f}s grab={grab_ms:.1f}ms pcd={pcd_ms:.1f}ms points={pointcloud.shape[0]}",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                panel,
+                f"align_to={align_to} valid_depth={valid_ratio:.3f} sampling={sampling} device={device}",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
-                cv2.putText(
-                    panel,
-                    f"ts={ts:.3f}s  grab={grab_ms:.1f}ms  pcd={pcd_ms:.1f}ms",
-                    (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    panel,
-                    f"aligned_to_depth  points={num_points}  device={device}",
-                    (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+            title = "RealSense V2 | RGB(left) Depth(right)" if color is not None else "RealSense V2 | Depth"
+            cv2.imshow(title, panel)
+            key = cv2.waitKey(1) & 0xFF
 
-                cv2.imshow("RealSense | RGB(left) Depth(right)", panel)
-                key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord("p") and pointcloud.shape[0] > 0:
+                try:
+                    vis_point_cloud(pointcloud, voxel_size=0.005)
+                except ImportError:
+                    print("[WARN] open3d is not installed; cannot visualize point cloud.")
 
-                if key == ord("q"):
-                    break
-
-                if key == ord("p"):
-                    if vis_point_cloud is None:
-                        print("[WARN] vis_point_cloud 不可用")
-                    else:
-                        pos = _to_numpy(pcd["pos"])
-                        print(f"Visualizing point cloud with {pos.shape[0]} points...")
-                        vis_point_cloud(pos, voxel_size=0.005)
-
-        finally:
-            cv2.destroyAllWindows()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RealSense RGBD example (color aligned to depth)")
-    parser.add_argument("--serial", type=str, default=None, help="相机序列号")
-    parser.add_argument("--fps", type=int, default=30, help="帧率")
-    parser.add_argument("--depth-res", type=str, default="640x480", help="深度分辨率 WxH")
-    parser.add_argument("--color-res", type=str, default="1280x720", help="彩色分辨率 WxH")
-    parser.add_argument("--npoints", type=int, default=1024, help="点云下采样点数")
-    parser.add_argument("--device", type=str, default="cpu", help="pointcloud device")
-    parser.add_argument("--hole-filling", action="store_true", help="启用 depth hole filling")
-    parser.add_argument(
-        "--bound",
-        type=float,
-        nargs=6,
-        default=None,
-        help="workspace crop: x_min x_max y_min y_max z_min z_max",
-    )
-    parser.add_argument("--min-depth", type=float, default=0.1, help="最小深度")
-    parser.add_argument("--max-depth", type=float, default=1.5, help="最大深度")
-
+    parser = argparse.ArgumentParser(description="RealSense V2 RGB-D / point cloud demo")
+    parser.add_argument("--serial", type=str, default=None)
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--depth-res", type=str, default="640x480")
+    parser.add_argument("--color-res", type=str, default="640x480")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--align-to", type=str, default="depth", choices=["depth", "color", "none"])
+    parser.add_argument("--npoints", type=int, default=1024)
+    parser.add_argument("--all-points", action="store_true")
+    parser.add_argument("--sampling", type=str, default="random", choices=["none", "random", "fps", "first"])
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--hole-filling", action="store_true")
+    parser.add_argument("--workspace", type=float, nargs=6, default=[-0.5, -0.5, 0.0, 0.5, 0.5, 1.5], help="Workspace XYZ min/max in meters: --workspace x_min y_min z_min x_max y_max z_max")
+    parser.add_argument("--bound", type=float, nargs=6, default=None, help="Alias of --workspace")
+    parser.add_argument("--min-depth", type=float, default=0.05)
+    parser.add_argument("--max-depth", type=float, default=1.5)
+    parser.add_argument("--overlay", type=str, default=None, help="Optional BGR/RGB image path for alpha-blended display overlay")
+    parser.add_argument("--overlay-alpha", type=float, default=0.5)
     args = parser.parse_args()
+
+    workspace_arg = args.workspace if args.workspace is not None else args.bound
+    npoints_arg = None if args.all_points else args.npoints
 
     example(
         serial=args.serial,
-        depth_resolution=_parse_resolution(args.depth_res),
-        color_resolution=_parse_resolution(args.color_res),
+        depth_resolution=parse_resolution(args.depth_res),
+        color_resolution=parse_resolution(args.color_res),
         fps=args.fps,
-        npoints=args.npoints,
-        bound=args.bound,
+        enable_color=not args.no_color,
+        align_to=args.align_to,
+        npoints=npoints_arg,
+        workspace=workspace_arg,
         min_depth=args.min_depth,
         max_depth=args.max_depth,
+        sampling=args.sampling,
         device=args.device,
         depth_hole_filling=args.hole_filling,
+        overlay_path=args.overlay,
+        overlay_alpha=args.overlay_alpha,
     )
