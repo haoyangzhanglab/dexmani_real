@@ -136,3 +136,7 @@ ip addr show | grep "inet " | grep -v 127.0.0.1
 4. 用 `ping <电脑IP>` 测试连通性
 
 **帧率低？** 确保使用 5GHz Wi-Fi，信号良好
+
+
+## 小键盘使用教程
+https://www.yuque.com/typekey/icgxzm/qzswugkc9qgai7mm?singleDoc=
