@@ -1,0 +1,306 @@
+"""Meta Quest hand-tracking receiver based on hand-tracking-sdk."""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any
+
+import numpy as np
+from hand_tracking_sdk import (
+    ErrorPolicy,
+    HandFilter,
+    HandFrame,
+    HTSClient,
+    HTSClientConfig,
+    StreamOutput,
+    TransportMode,
+    unity_left_to_flu_position,
+    unity_left_to_flu_rotation,
+    unity_left_to_rfu_position,
+    unity_left_to_rfu_rotation,
+)
+
+
+class QuestHandTracker:
+    """Receive wrist pose and 21 hand landmarks from HTS."""
+
+    def __init__(
+        self,
+        transport: str = "tcp_server",
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        hand_side: str = "right",
+        output_frame: str = "flu",
+        max_frame_age_s: float = 0.20,
+        strict: bool = False,
+        verbose: bool = False,
+    ) -> None:
+        self.transport = transport
+        self.host = host
+        self.port = port
+        self.hand_side = hand_side
+        self.output_frame = output_frame
+        self.max_frame_age_s = max_frame_age_s
+        self.strict = strict
+        self.verbose = verbose
+
+        self.client: HTSClient | None = None
+        self.thread: threading.Thread | None = None
+        self.started = False
+        self.running = False
+
+        self.latest_frame: dict[str, Any] | None = None
+        self.lock = threading.Lock()
+        self.event = threading.Event()
+        self.last_read_key = None
+
+        self.received_frames = 0
+        self.ignored_events = 0
+        self.malformed_frames = 0
+        self.last_error: str | None = None
+
+    def connect(self) -> None:
+        if self.running:
+            return
+
+        self.client = self.create_client()
+        self.started = True
+        self.running = True
+        self.last_error = None
+
+        self.thread = threading.Thread(target=self.receive_loop, daemon=True)
+        self.thread.start()
+
+        if self.verbose:
+            print(f"[QuestHandTracker] {self.transport}://{self.host}:{self.port}")
+
+    def disconnect(self) -> None:
+        self.running = False
+        self.started = False
+        self.event.set()
+
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=6.0)
+
+        self.thread = None
+        self.client = None
+
+    def get_latest(self, max_age_s: float | None = None) -> dict[str, Any] | None:
+        max_age_s = self.max_frame_age_s if max_age_s is None else max_age_s
+
+        with self.lock:
+            if self.latest_frame is None:
+                return None
+            if self.frame_age(self.latest_frame) > max_age_s:
+                return None
+            return self.copy_frame(self.latest_frame)
+
+    def read(self, timeout_s: float = 1.0) -> dict[str, Any]:
+        start = time.monotonic()
+
+        while True:
+            frame = self.get_latest()
+            if frame is not None:
+                key = (frame["sequence_id"], frame["recv_ts_ns"])
+                if key != self.last_read_key:
+                    self.last_read_key = key
+                    return frame
+
+            remain = timeout_s - (time.monotonic() - start)
+            if remain <= 0:
+                raise TimeoutError("No new VR frame received.")
+
+            self.event.wait(timeout=remain)
+            self.event.clear()
+
+    def clear(self) -> None:
+        with self.lock:
+            self.latest_frame = None
+        self.last_read_key = None
+        self.event.set()
+
+    def get_status(self) -> dict[str, Any]:
+        age = None
+        sequence_id = None
+
+        with self.lock:
+            if self.latest_frame is not None:
+                age = self.frame_age(self.latest_frame)
+                sequence_id = self.latest_frame["sequence_id"]
+
+        stats = self.client.get_stats() if self.client is not None else None
+
+        return {
+            "started": self.started,
+            "running": self.running,
+            "transport": self.transport,
+            "host": self.host,
+            "port": self.port,
+            "hand_side": self.hand_side,
+            "output_frame": self.output_frame,
+            "received_frames": self.received_frames,
+            "ignored_events": self.ignored_events,
+            "malformed_frames": self.malformed_frames,
+            "sdk_lines_received": getattr(stats, "lines_received", None),
+            "sdk_parse_errors": getattr(stats, "parse_errors", None),
+            "sdk_dropped_lines": getattr(stats, "dropped_lines", None),
+            "sequence_id": sequence_id,
+            "frame_age_s": age,
+            "last_error": self.last_error,
+        }
+
+    def create_client(self) -> HTSClient:
+        return HTSClient(
+            HTSClientConfig(
+                transport_mode=TransportMode(self.transport),
+                host=self.host,
+                port=self.port,
+                timeout_s=1.0,
+                output=StreamOutput.FRAMES,
+                hand_filter=HandFilter(self.hand_side),
+                error_policy=ErrorPolicy.STRICT if self.strict else ErrorPolicy.TOLERANT,
+                include_wall_time=True,
+            )
+        )
+
+    def receive_loop(self) -> None:
+        assert self.client is not None
+
+        try:
+            for event in self.client.iter_events():
+                if not self.running:
+                    break
+
+                if not isinstance(event, HandFrame):
+                    self.ignored_events += 1
+                    continue
+
+                try:
+                    frame = self.convert_frame(event)
+                except Exception as exc:
+                    self.malformed_frames += 1
+                    self.last_error = str(exc)
+                    if self.strict:
+                        break
+                    continue
+
+                with self.lock:
+                    self.latest_frame = frame
+                    self.received_frames += 1
+                self.event.set()
+
+        except Exception as exc:
+            self.last_error = str(exc)
+        finally:
+            self.running = False
+            self.started = False
+
+    def convert_frame(self, frame: HandFrame) -> dict[str, Any]:
+        pos, quat_wxyz, landmarks = self.extract_geometry(frame)
+
+        return {
+            "side": frame.side.value,
+            "wrist_pos": np.asarray(pos, dtype=np.float64),
+            "wrist_quat_wxyz": np.asarray(quat_wxyz, dtype=np.float64),
+            "landmarks": np.asarray(landmarks, dtype=np.float64).reshape(21, 3),
+            "recv_ts_ns": frame.recv_ts_ns,
+            "source_ts_ns": frame.source_ts_ns,
+            "sequence_id": frame.sequence_id,
+            "source_frame_seq": frame.source_frame_seq,
+            "coordinate_frame": self.output_frame,
+            "local_recv_ns": time.monotonic_ns(),
+        }
+
+    def extract_geometry(self, frame: HandFrame):
+        wrist = frame.wrist
+        pos = (wrist.x, wrist.y, wrist.z)
+        quat_xyzw = (wrist.qx, wrist.qy, wrist.qz, wrist.qw)
+        landmarks = frame.landmarks.points
+
+        if self.output_frame == "unity":
+            return pos, self.xyzw_to_wxyz(quat_xyzw), landmarks
+
+        if self.output_frame == "rfu":
+            return (
+                unity_left_to_rfu_position(*pos),
+                self.xyzw_to_wxyz(unity_left_to_rfu_rotation(*quat_xyzw)),
+                [unity_left_to_rfu_position(*point) for point in landmarks],
+            )
+
+        if self.output_frame == "flu":
+            return (
+                unity_left_to_flu_position(*pos),
+                self.xyzw_to_wxyz(unity_left_to_flu_rotation(*quat_xyzw)),
+                [unity_left_to_flu_position(*point) for point in landmarks],
+            )
+
+        raise ValueError(f"Unsupported output_frame: {self.output_frame}")
+
+    def xyzw_to_wxyz(self, quat_xyzw) -> np.ndarray:
+        q = np.asarray(quat_xyzw, dtype=np.float64)
+        return np.array([q[3], q[0], q[1], q[2]], dtype=np.float64)
+
+    def frame_age(self, frame: dict[str, Any]) -> float:
+        return (time.monotonic_ns() - frame["local_recv_ns"]) * 1e-9
+
+    def copy_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "side": frame["side"],
+            "wrist_pos": frame["wrist_pos"].copy(),
+            "wrist_quat_wxyz": frame["wrist_quat_wxyz"].copy(),
+            "landmarks": frame["landmarks"].copy(),
+            "recv_ts_ns": frame["recv_ts_ns"],
+            "source_ts_ns": frame["source_ts_ns"],
+            "sequence_id": frame["sequence_id"],
+            "source_frame_seq": frame["source_frame_seq"],
+            "coordinate_frame": frame["coordinate_frame"],
+        }
+
+    def __enter__(self) -> "QuestHandTracker":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.disconnect()
+
+
+def example() -> None:
+    tracker = QuestHandTracker(
+        transport="tcp_server",
+        host="0.0.0.0",
+        port=8000,
+        hand_side="right",
+        output_frame="flu",
+        verbose=True,
+    )
+
+    print("Waiting for Quest/HTS frames on tcp://0.0.0.0:8000")
+    print("Press Ctrl+C to stop")
+
+    try:
+        with tracker:
+            while True:
+                frame = tracker.get_latest()
+                if frame is None:
+                    print(tracker.get_status())
+                    time.sleep(0.5)
+                    continue
+
+                wrist = frame["wrist_pos"]
+                quat = frame["wrist_quat_wxyz"]
+                print(
+                    f"seq={frame['sequence_id']} "
+                    f"side={frame['side']} "
+                    f"wrist=({wrist[0]:+.3f}, {wrist[1]:+.3f}, {wrist[2]:+.3f}) "
+                    f"quat_wxyz=({quat[0]:+.3f}, {quat[1]:+.3f}, {quat[2]:+.3f}, {quat[3]:+.3f}) "
+                    f"landmarks={frame['landmarks'].shape} "
+                    f"frame={frame['coordinate_frame']}"
+                )
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nStopped")
+
+
+if __name__ == "__main__":
+    example()
