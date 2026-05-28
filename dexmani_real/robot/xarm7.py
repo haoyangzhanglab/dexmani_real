@@ -8,12 +8,16 @@ from typing import Any
 import numpy as np
 from xarm.wrapper import XArmAPI
 
+np.set_printoptions(suppress=True, precision=3)
 
 @dataclass
 class XArm7Config:
     ip: str = "192.168.1.111"
     dt: float = 1.0 / 50.0
-    init_qpos: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
+    # init_qpos: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
+    init_qpos: np.ndarray = field(
+        default_factory=lambda: np.deg2rad([-30, -45, 0, 20, -180, 25, 0])
+    )
     qpos_min: np.ndarray = field(
         default_factory=lambda: np.deg2rad([-360, -118, -360, -11, -360, -97, -360])
     )
@@ -207,6 +211,7 @@ def main():
     try:
         if args.test == "obs":
             print_obs(robot.get_obs())
+            print(np.rad2deg(robot.get_obs()["qpos"]))
         elif args.test == "full-obs":
             print_obs(robot.get_obs(full=True))
         elif args.test == "reset":
