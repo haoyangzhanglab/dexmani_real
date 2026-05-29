@@ -37,14 +37,31 @@ class XHandConfig:
 
     dt: float = 1.0 / 83.0
     num_joints: int = 12
-    force_update_state: bool = False
 
-    home_qpos: np.ndarray = field(default_factory=lambda: np.zeros(12, dtype=np.float64))
+    # Important:
+    # True  -> force SDK to refresh state from hardware.
+    # False -> may return SDK cached state. After open_serial(), cache may be all zeros.
+    force_update_state: bool = True
+
+    # Connect-time state initialization.
+    # Even if force_update_state is manually set to False for runtime speed,
+    # connect() should still force refresh several frames to avoid zero-cache initialization.
+    init_state_read_attempts: int = 10
+    init_state_read_interval: float = 0.02
+
+    home_qpos: np.ndarray = field(default_factory=lambda: np.deg2rad(np.array([
+        0.0, 45.0, 0.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0,
+        0.0, 0.0,
+        0.0, 0.0,
+    ], dtype=np.float64)))
+
     qpos_min: np.ndarray = field(
         default_factory=lambda: np.array(
             [
-                -1.57, -1.05, 0.0,
-                -0.087, 0.0, 0.0,
+                0.0, -0.698, 0.0,
+                -0.174, 0.0, 0.0,
                 0.0, 0.0,
                 0.0, 0.0,
                 0.0, 0.0,
@@ -52,27 +69,29 @@ class XHandConfig:
             dtype=np.float64,
         )
     )
+
     qpos_max: np.ndarray = field(
         default_factory=lambda: np.array(
             [
-                1.57, 1.57, 1.57,
-                0.297, 1.92, 1.92,
-                1.92, 1.92,
-                1.92, 1.92,
-                1.92, 1.92,
+                1.832, 1.57, 1.57,
+                0.174, 1.919, 1.919,
+                1.919, 1.919,
+                1.919, 1.919,
+                1.919, 1.919,
             ],
             dtype=np.float64,
         )
     )
+
     max_qvel: np.ndarray = field(default_factory=lambda: np.deg2rad(np.ones(12) * 180.0))
 
     kp: int = 100
     ki: int = 0
     kd: int = 1
-    tor_max: int = 100
+    tor_max: int = 300
     mode: int = 3
 
-    use_delta_limit: bool = True
+    use_delta_limit: bool = False
     clip_joint_limit: bool = True
 
     tactile_scale: float = 0.1
@@ -146,11 +165,28 @@ class XHand:
         self.error_state = False
         self.build_command()
 
-        state = self.get_state(full=False)
-        if np.all(np.isfinite(state["qpos"])):
-            self.last_qpos_cmd = state["qpos"].copy()
+        # Critical fix:
+        # Force-refresh real hardware state during connect.
+        # Do not use SDK cache here, because after open_serial() the cache may be all zeros.
+        valid_state: dict[str, Any] | None = None
+
+        attempts = max(1, int(self.config.init_state_read_attempts))
+        interval = max(0.0, float(self.config.init_state_read_interval))
+
+        for _ in range(attempts):
+            state = self.get_state(full=True, force_update=True)
+            if self.is_valid_qpos_state(state):
+                valid_state = state
+            if interval > 0:
+                time.sleep(interval)
+
+        if valid_state is not None:
+            self.last_qpos_cmd = valid_state["qpos"].copy()
+            print("Initial qpos from hand state:", self.last_qpos_cmd)
         else:
             self.last_qpos_cmd = self.array12(self.config.home_qpos)
+            print("Using home_qpos as initial qpos:", self.last_qpos_cmd)
+
         self.last_cmd_time = time.time()
         return True
 
@@ -191,7 +227,14 @@ class XHand:
     def stop(self) -> bool:
         if self.control is None:
             return False
-        command = self.make_command(self.array12(self.config.home_qpos), mode=0, tor_max=0, kp=0, ki=0, kd=0)
+        command = self.make_command(
+            self.array12(self.config.home_qpos),
+            mode=0,
+            tor_max=0,
+            kp=0,
+            ki=0,
+            kd=0,
+        )
         err = self.control.send_command(self.config.device_id, command)
         self.last_action_code = self.error_code(err)
         self.error_state = True
@@ -207,8 +250,16 @@ class XHand:
     def move_to_joint_positions(self, qpos: np.ndarray) -> bool:
         return self.reset(qpos)
 
-    def get_state(self, full: bool = False) -> dict[str, Any]:
-        err, hand_state = self.read_raw_state(force_update=self.config.force_update_state)
+    def get_state(
+        self,
+        full: bool = False,
+        force_update: bool | None = None,
+    ) -> dict[str, Any]:
+        if force_update is None:
+            force_update = self.config.force_update_state
+
+        err, hand_state = self.read_raw_state(force_update=force_update)
+
         if not self.error_ok(err) or hand_state is None:
             self.save_error(err)
             self.error_state = True
@@ -321,6 +372,7 @@ class XHand:
             idx = int(getattr(item, "id", -1))
             if idx < 0 or idx >= 12:
                 continue
+
             finger_ids[idx] = idx
             sensor_ids[idx] = int(getattr(item, "sensor_id", -1))
             qpos[idx] = float(getattr(item, "position", np.nan))
@@ -384,6 +436,7 @@ class XHand:
                 tactile[i, j, 0] = float(getattr(force, "fx", 0.0))
                 tactile[i, j, 1] = float(getattr(force, "fy", 0.0))
                 tactile[i, j, 2] = float(getattr(force, "fz", 0.0))
+
         if scaled:
             tactile *= self.config.tactile_scale
         return tactile
@@ -401,6 +454,7 @@ class XHand:
             force_sum[i, 0] = float(getattr(calc_force, "fx", 0.0))
             force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0))
             force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0))
+
         if scaled:
             force_sum *= self.config.tactile_scale
         return force_sum
@@ -421,6 +475,7 @@ class XHand:
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
+
         clipped = np.clip(qpos, self.config.qpos_min, self.config.qpos_max)
         self.last_joint_limit_clipped = not np.allclose(qpos, clipped)
         return clipped
@@ -431,10 +486,13 @@ class XHand:
             return target_qpos
 
         now = time.time()
+
         if self.last_qpos_cmd is None:
-            self.last_qpos_cmd = self.get_state()["qpos"].copy()
+            state = self.get_state(force_update=True)
+            self.last_qpos_cmd = state["qpos"].copy()
             if not np.all(np.isfinite(self.last_qpos_cmd)):
                 self.last_qpos_cmd = self.array12(self.config.home_qpos)
+
         if self.last_cmd_time is None:
             self.last_cmd_time = now
 
@@ -445,12 +503,35 @@ class XHand:
         self.last_delta_limited = not np.allclose(raw_step, step)
         return self.last_qpos_cmd + step
 
+    def is_valid_qpos_state(self, state: dict[str, Any]) -> bool:
+        qpos = state.get("qpos", None)
+        if qpos is None:
+            return False
+
+        qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
+        if qpos.size != 12:
+            return False
+
+        if not np.all(np.isfinite(qpos)):
+            return False
+
+        finger_ids = state.get("finger_ids", None)
+        if finger_ids is not None:
+            finger_ids = np.asarray(finger_ids).reshape(-1)
+            if finger_ids.size >= 12 and np.sum(finger_ids[:12] >= 0) < 12:
+                return False
+
+        return True
+
     def array12(self, value) -> np.ndarray:
         if value is None:
             return np.full(12, np.nan, dtype=np.float64)
+
         arr = np.asarray(value, dtype=np.float64).reshape(-1)
+
         if arr.size >= 12:
             return arr[:12]
+
         out = np.full(12, np.nan, dtype=np.float64)
         out[: arr.size] = arr
         return out
@@ -492,13 +573,15 @@ class XHand:
         return self.config.comm_type
 
     def unpack_result(self, result):
-        if isinstance(result, tuple) or isinstance(result, list):
+        if isinstance(result, (tuple, list)):
             if len(result) >= 2:
                 return result[0], result[1]
+
         if isinstance(result, dict):
             items = list(result.items())
             if len(items) > 0:
                 return items[0][0], items[0][1]
+
         return None, None
 
     def error_code(self, err) -> int | None:
@@ -514,6 +597,7 @@ class XHand:
             self.last_error_code = -1
             self.last_error_message = "empty error object"
             return
+
         self.last_error_code = self.error_code(err)
         self.last_error_message = str(getattr(err, "error_message", ""))
 
@@ -541,7 +625,8 @@ def example():
         print_state(state)
 
         ok = hand.send_action(config.home_qpos)
-        print(f"send_action home_qpos ok: {ok}")
+        print("send_action ok:", ok)
+
     finally:
         hand.disconnect()
 

@@ -108,23 +108,107 @@ class SingleHandDetector:
 
     @staticmethod
     def estimate_frame_from_hand_points(keypoint_3d_array: np.ndarray) -> np.ndarray:
+        keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
         assert keypoint_3d_array.shape == (21, 3)
-        points = keypoint_3d_array[[0, 5, 9], :]
 
-        # Compute vector from palm to the first joint of middle finger
-        x_vector = points[0] - points[2]
-        
-        points = points - np.mean(points, axis=0, keepdims=True)
-        u, s, v = np.linalg.svd(points)
-        normal = v[2, :]
+        eps = 1e-8
 
-        x = x_vector - np.sum(x_vector * normal) * normal
-        x = x / np.linalg.norm(x)
+        wrist = keypoint_3d_array[0]
+        index_mcp = keypoint_3d_array[5]
+        middle_mcp = keypoint_3d_array[9]
+        ring_mcp = keypoint_3d_array[13]
+        pinky_mcp = keypoint_3d_array[17]
+
+        # 1. Use more palm points for plane fitting.
+        # Original version only used [0, 5, 9].
+        # This version uses wrist + four MCP joints for a more stable palm plane.
+        palm_points = np.stack(
+            [wrist, index_mcp, middle_mcp, ring_mcp, pinky_mcp],
+            axis=0,
+        )
+
+        # Remove invalid landmarks early.
+        if not np.all(np.isfinite(palm_points)):
+            return np.eye(3, dtype=np.float64)
+
+        palm_center = palm_points.mean(axis=0, keepdims=True)
+        centered = palm_points - palm_center
+
+        # Degenerate case: all palm points collapse or are nearly identical.
+        if np.linalg.norm(centered) < eps:
+            return np.eye(3, dtype=np.float64)
+
+        # 2. Fit palm plane using SVD.
+        # The last right-singular vector is the normal of the best-fit plane.
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return np.eye(3, dtype=np.float64)
+
+        normal = vh[-1, :]
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm < eps:
+            return np.eye(3, dtype=np.float64)
+        normal = normal / normal_norm
+
+        # 3. Define x axis.
+        # Keep original behavior: x points from middle MCP to wrist.
+        x_vector = wrist - middle_mcp
+
+        # Project x_vector onto palm plane to make it orthogonal to normal.
+        x = x_vector - np.dot(x_vector, normal) * normal
+        x_norm = np.linalg.norm(x)
+
+        # Fallback: use palm center to wrist if middle_mcp is unreliable.
+        if x_norm < eps:
+            x_vector = wrist - palm_center.reshape(3)
+            x = x_vector - np.dot(x_vector, normal) * normal
+            x_norm = np.linalg.norm(x)
+
+        if x_norm < eps:
+            return np.eye(3, dtype=np.float64)
+
+        x = x / x_norm
+
+        # 4. Construct lateral axis.
         z = np.cross(x, normal)
+        z_norm = np.linalg.norm(z)
+        if z_norm < eps:
+            return np.eye(3, dtype=np.float64)
+        z = z / z_norm
 
-        # We assume that the vector from pinky to index is similar the z axis in MANO convention
-        if np.sum(z * (points[1] - points[2])) < 0:
-            normal *= -1
-            z *= -1
+        # 5. Resolve sign ambiguity.
+        # SVD normal has arbitrary sign. Use pinky -> index direction to orient z.
+        lateral_ref = index_mcp - pinky_mcp
+        lateral_ref = lateral_ref - np.dot(lateral_ref, x) * x
+        lateral_norm = np.linalg.norm(lateral_ref)
+
+        if lateral_norm > eps:
+            lateral_ref = lateral_ref / lateral_norm
+            if np.dot(z, lateral_ref) < 0:
+                normal *= -1.0
+                z *= -1.0
+
+        # 6. Recompute normal to enforce right-handed orthonormal frame.
+        # Since z = x × normal, the consistent inverse is normal = z × x.
+        normal = np.cross(z, x)
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm < eps:
+            return np.eye(3, dtype=np.float64)
+        normal = normal / normal_norm
+
         frame = np.stack([x, normal, z], axis=1)
+
+        # 7. Final orthogonalization via SVD.
+        # This removes small numerical drift and makes frame closer to SO(3).
+        try:
+            u, _, vh = np.linalg.svd(frame)
+            frame = u @ vh
+        except np.linalg.LinAlgError:
+            pass
+
+        # Keep right-handed rotation. det should be +1.
+        if np.linalg.det(frame) < 0:
+            frame[:, 2] *= -1.0
+
         return frame
