@@ -5,6 +5,10 @@
 > 本文档按实际调试过程反思整理，目标是避免 `apt / DKMS / conda-forge / pip wheel / 源码安装` 混用导致的版本污染。
 
 ---
+## L515参数参考
+```text
+https://github.com/JS-RML/Learning-to-Grasp-by-Digging/blob/main/real/640X480_L_short_default.json
+```
 
 ## 0. 最终结论
 

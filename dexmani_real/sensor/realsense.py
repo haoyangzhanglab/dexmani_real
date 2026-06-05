@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
 import cv2
@@ -32,6 +33,84 @@ ALIGN_MODE_ALIASES = {
 
 
 @dataclass(frozen=True)
+class L515DepthConfig:
+    """
+    L515-only depth preset converted from the previous exported JSON.
+
+    It is applied through rs.serializable_device(...).load_json(...).
+    D400 cameras such as D435/D455 will not use this config.
+    """
+
+    enabled: bool = True
+
+    visual_preset: int = 5
+    depth_units: float = 0.000250000011874363
+    depth_offset: float = 4.5
+    min_distance: int = 190
+
+    laser_power: int = 100
+    receiver_gain: int = 18
+    confidence_threshold: int = 1
+    digital_gain: int = 2
+
+    noise_filtering: int = 4
+    noise_estimation: float = 0.0
+    pre_processing_sharpening: float = 0.0
+    post_processing_sharpening: int = 1
+
+    alternate_ir: float = 0.0
+    enable_ir_reflectivity: float = 0.0
+    enable_max_usable_range: float = 0.0
+    error_polling_enabled: int = 1
+    frames_queue_size: int = 16
+    freefall_detection_enabled: int = 1
+    global_time_enabled: float = 0.0
+    host_performance: float = 0.0
+    inter_cam_sync_mode: float = 0.0
+    invalidation_bypass: float = 0.0
+    reset_camera_accuracy_health: float = 0.0
+    sensor_mode: float = 0.0
+    trigger_camera_accuracy_health: float = 0.0
+
+    def to_json_dict(self, depth_resolution: tuple[int, int], fps: int) -> dict[str, Any]:
+        depth_width, depth_height = depth_resolution
+        return {
+            "Alternate IR": self.alternate_ir,
+            "Confidence Threshold": self.confidence_threshold,
+            "Depth Offset": self.depth_offset,
+            "Depth Units": self.depth_units,
+            "Digital Gain": self.digital_gain,
+            "Enable IR Reflectivity": self.enable_ir_reflectivity,
+            "Enable Max Usable Range": self.enable_max_usable_range,
+            "Error Polling Enabled": self.error_polling_enabled,
+            "Frames Queue Size": self.frames_queue_size,
+            "Freefall Detection Enabled": self.freefall_detection_enabled,
+            "Global Time Enabled": self.global_time_enabled,
+            "Host Performance": self.host_performance,
+            "Inter Cam Sync Mode": self.inter_cam_sync_mode,
+            "Invalidation Bypass": self.invalidation_bypass,
+            "Laser Power": self.laser_power,
+            "Min Distance": self.min_distance,
+            "Noise Estimation": self.noise_estimation,
+            "Noise Filtering": self.noise_filtering,
+            "Post Processing Sharpening": self.post_processing_sharpening,
+            "Pre Processing Sharpening": self.pre_processing_sharpening,
+            "Receiver Gain": self.receiver_gain,
+            "Reset Camera Accuracy Health": self.reset_camera_accuracy_health,
+            "Sensor Mode": self.sensor_mode,
+            "Trigger Camera Accuracy Health": self.trigger_camera_accuracy_health,
+            "Visual Preset": self.visual_preset,
+            "stream-depth-format": "Z16",
+            "stream-fps": str(int(fps)),
+            "stream-height": str(int(depth_height)),
+            "stream-width": str(int(depth_width)),
+        }
+
+    def to_json_string(self, depth_resolution: tuple[int, int], fps: int) -> str:
+        return json.dumps(self.to_json_dict(depth_resolution, fps))
+
+
+@dataclass(frozen=True)
 class RealSenseConfig:
     camera_name: str = "realsense"
     serial: str | None = None
@@ -44,6 +123,7 @@ class RealSenseConfig:
     enable_global_time: bool = True
     warmup_frames: int = 10
     frame_name: str | None = None
+    l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
 
     def __post_init__(self) -> None:
         mode = normalize_align_mode(self.align_mode)
@@ -131,6 +211,9 @@ class RealSense:
             return
 
         self.active_serial = self.config.serial or self.find_default_serial()
+        device = self.find_device_by_serial(self.active_serial)
+        self.load_model_specific_config(device)
+
         self.pipeline = rs.pipeline()
         rs_config = self.create_rs_config()
 
@@ -204,6 +287,31 @@ class RealSense:
                     sensor.set_option(rs.option.global_time_enabled, 1)
             except RuntimeError:
                 pass
+
+    def load_model_specific_config(self, device: rs.device) -> None:
+        if self.is_l515_device(device):
+            self.load_l515_depth_config(device)
+
+    def load_l515_depth_config(self, device: rs.device) -> None:
+        l515_config = self.config.l515_depth_config
+        if l515_config is None or not l515_config.enabled:
+            return
+
+        json_string = l515_config.to_json_string(
+            depth_resolution=self.config.depth_resolution,
+            fps=self.config.fps,
+        )
+        try:
+            serializable_device = rs.serializable_device(device)
+            serializable_device.load_json(json_string)
+        except Exception as error:
+            raise RuntimeError("Failed to load L515 depth config through load_json().") from error
+
+    @staticmethod
+    def is_l515_device(device: rs.device) -> bool:
+        name = RealSense.get_device_info_value(device, rs.camera_info.name).upper()
+        product_line = RealSense.get_device_info_value(device, rs.camera_info.product_line)
+        return product_line == "L500" or "L515" in name
 
     def update_intrinsics_from_profile(self) -> None:
         if self.profile is None:
@@ -385,6 +493,22 @@ class RealSense:
         if key not in self.rays_cache:
             self.rays_cache[key] = make_rays(height, width, self.K, device=device)
         return self.rays_cache[key]
+
+    @staticmethod
+    def get_device_info_value(device: rs.device, key: rs.camera_info) -> str:
+        try:
+            return str(device.get_info(key)) if device.supports(key) else ""
+        except RuntimeError:
+            return ""
+
+    @staticmethod
+    def find_device_by_serial(serial: str) -> rs.device:
+        context = rs.context()
+        for device in context.query_devices():
+            device_serial = RealSense.get_device_info_value(device, rs.camera_info.serial_number)
+            if device_serial == serial:
+                return device
+        raise RuntimeError(f"No RealSense camera found with serial={serial}.")
 
     def find_default_serial(self) -> str:
         cameras = self.list_cameras()
