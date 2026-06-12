@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -8,13 +7,11 @@ from typing import Any
 import numpy as np
 from xarm.wrapper import XArmAPI
 
-np.set_printoptions(suppress=True, precision=3)
 
 @dataclass
 class XArm7Config:
     ip: str = "192.168.1.111"
     dt: float = 1.0 / 50.0
-    # init_qpos: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=np.float64))
     init_qpos: np.ndarray = field(
         default_factory=lambda: np.deg2rad([-30, -45, 0, 20, -180, 25, 0])
     )
@@ -37,67 +34,102 @@ class XArm7:
     def __init__(self, config: XArm7Config):
         self.config = config
         self.arm: XArmAPI | None = None
+
+        self.connected_flag = False
+        self.error_state = False
+        self.last_error_message = ""
+        self.last_action_code: int | None = None
+
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
+        self.last_joint_limit_clipped = False
+        self.last_delta_limited = False
 
-    def connect(self):
-        self.arm = XArmAPI(self.config.ip, is_radian=True)
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
+    def connect(self) -> bool:
+        if self.connected_flag and self.arm is not None:
+            return True
+
+        try:
+            self.arm = XArmAPI(self.config.ip, is_radian=True)
+        except Exception as e:
+            self.error_state = True
+            self.last_error_message = f"XArmAPI init failed: {e}"
+            return False
+
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self.set_servo_mode()
-        self.last_qpos_cmd = self.get_obs()["qpos"].copy()
-        self.last_cmd_time = time.time()
-        return self
+        self._set_servo_mode()
 
-    def disconnect(self):
+        state = self.get_state()
+        if np.all(np.isfinite(state["qpos"])):
+            self.last_qpos_cmd = state["qpos"].copy()
+        else:
+            self.last_qpos_cmd = self.config.init_qpos.copy()
+
+        self.last_cmd_time = time.time()
+        self.connected_flag = True
+        self.error_state = False
+        return True
+
+    def disconnect(self) -> None:
         if self.arm is not None:
             self.arm.disconnect()
+        self.connected_flag = False
 
-    def set_servo_mode(self):
-        self.arm.set_mode(1)
-        self.arm.set_state(0)
+    def is_connected(self) -> bool:
+        return self.arm is not None and self.connected_flag and not self.error_state
 
-    def set_position_mode(self):
-        self.arm.set_mode(0)
-        self.arm.set_state(0)
+    def is_error(self) -> bool:
+        if self.arm is None:
+            return True
+        if not self.connected_flag:
+            return True
+        if self.error_state:
+            return True
+        if self.arm.error_code != 0:
+            return True
+        return False
 
-    def clear_error(self):
+    def clear_error(self) -> bool:
+        if self.arm is None:
+            return False
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self.set_servo_mode()
+        self._set_servo_mode()
+        self.error_state = False
+        self.last_error_message = ""
+        return self.arm.error_code == 0
 
-    def stop(self):
-        return self.arm.set_state(4)
+    def stop(self) -> bool:
+        """硬件急停。set_state(4) 进入 emergency stop 状态。"""
+        if self.arm is None:
+            return False
+        code = self.arm.set_state(4)
+        self.error_state = True
+        return code == 0
 
-    def reset(self, qpos: np.ndarray | None = None):
-        target = self.config.init_qpos if qpos is None else np.asarray(qpos, dtype=np.float64)
-        self.set_position_mode()
-        code = self.arm.set_servo_angle(
-            angle=target.tolist(),
-            speed=self.config.reset_speed,
-            mvacc=self.config.reset_acc,
-            is_radian=True,
-            wait=True,
-        )
-        self.set_servo_mode()
-        self.last_qpos_cmd = self.get_obs()["qpos"].copy()
-        self.last_cmd_time = time.time()
-        return code
+    # ------------------------------------------------------------------
+    # 状态读取
+    # ------------------------------------------------------------------
 
-    def get_obs(self, full: bool = False) -> dict[str, Any]:
+    def get_state(self, full: bool = False) -> dict[str, Any]:
         code, states = self.arm.get_joint_states(is_radian=True, num=3)
         if code == 0:
-            qpos = self.array7(states[0])
-            qvel = self.array7(states[1])
-            tau = self.array7(states[2])
+            qpos = self._array7(states[0])
+            qvel = self._array7(states[1])
+            tau = self._array7(states[2])
         else:
-            qpos = self.read_qpos()
-            qvel = self.array7(getattr(self.arm, "realtime_joint_speeds", None))
-            tau = self.read_tau()
+            qpos = self._read_qpos()
+            qvel = np.full(7, np.nan, dtype=np.float64)
+            tau = np.full(7, np.nan, dtype=np.float64)
 
-        obs = {
+        state: dict[str, Any] = {
             "qpos": qpos,
             "qvel": qvel,
             "tau": tau,
@@ -105,83 +137,122 @@ class XArm7:
         }
 
         if full:
-            obs.update(
-                {
-                    "mode": self.arm.mode,
-                    "state": self.arm.state,
-                    "connected": self.arm.connected,
-                    "error_code": self.arm.error_code,
-                    "warn_code": self.arm.warn_code,
-                    "cmd_num": self.arm.cmd_num,
-                    "servo_codes": getattr(self.arm, "servo_codes", None),
-                    "temperatures": self.array7(getattr(self.arm, "temperatures", None)),
-                    "currents": self.array7(getattr(self.arm, "currents", None)),
-                    "voltages": self.array7(getattr(self.arm, "voltages", None)),
-                    "motor_enable_states": self.array7(getattr(self.arm, "motor_enable_states", None)),
-                    "motor_brake_states": self.array7(getattr(self.arm, "motor_brake_states", None)),
-                }
-            )
-        return obs
+            state.update({
+                "mode": self.arm.mode,
+                "state": self.arm.state,
+                "connected": self.arm.connected,
+                "error_code": self.arm.error_code,
+                "warn_code": self.arm.warn_code,
+                "cmd_num": self.arm.cmd_num,
+                "servo_codes": getattr(self.arm, "servo_codes", None),
+                "temperatures": self._array7(getattr(self.arm, "temperatures", None)),
+                "currents": self._array7(getattr(self.arm, "currents", None)),
+                "voltages": self._array7(getattr(self.arm, "voltages", None)),
+                "motor_enable_states": self._array7(getattr(self.arm, "motor_enable_states", None)),
+                "motor_brake_states": self._array7(getattr(self.arm, "motor_brake_states", None)),
+                "connected_flag": self.connected_flag,
+                "error_state": self.error_state,
+                "last_error_message": self.last_error_message,
+                "last_action_code": self.last_action_code,
+                "last_joint_limit_clipped": self.last_joint_limit_clipped,
+                "last_delta_limited": self.last_delta_limited,
+            })
+        return state
 
-    def send_action(self, action) -> dict[str, Any]:
-        target_qpos = self.parse_action(action)
-        target_qpos = self.limit_joint_range(target_qpos)
-        qpos_cmd = self.limit_joint_step(target_qpos)
+    # ------------------------------------------------------------------
+    # 动作发送
+    # ------------------------------------------------------------------
+
+    def send_action(self, action: np.ndarray) -> bool:
+        target_qpos = np.asarray(action, dtype=np.float64).reshape(7)
+        target_qpos = self._limit_joint_range(target_qpos)
+        qpos_cmd = self._limit_joint_step(target_qpos)
 
         if self.arm.mode != 1:
-            self.set_servo_mode()
+            self._set_servo_mode()
 
         code = self.arm.set_servo_angle_j(angles=qpos_cmd.tolist(), is_radian=True)
-        ok = code == 0
-        if ok:
+        self.last_action_code = code
+
+        if code == 0:
             self.last_qpos_cmd = qpos_cmd.copy()
             self.last_cmd_time = time.time()
+            return True
 
-        return {
-            "ok": ok,
-            "code": code,
-            "qpos_cmd": qpos_cmd,
-            "qpos_target": target_qpos,
-        }
+        self.error_state = True
+        self.last_error_message = f"set_servo_angle_j failed: code={code}"
+        return False
 
-    def parse_action(self, action) -> np.ndarray:
-        if isinstance(action, dict):
-            action = action["qpos"]
-        return np.asarray(action, dtype=np.float64).reshape(7)
+    def reset(self, target: np.ndarray | None = None) -> bool:
+        qpos = self.config.init_qpos if target is None else np.asarray(target, dtype=np.float64).reshape(7)
+        self._set_position_mode()
+        code = self.arm.set_servo_angle(
+            angle=qpos.tolist(),
+            speed=self.config.reset_speed,
+            mvacc=self.config.reset_acc,
+            is_radian=True,
+            wait=True,
+        )
+        self._set_servo_mode()
 
-    def limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
+        state = self.get_state()
+        if np.all(np.isfinite(state["qpos"])):
+            self.last_qpos_cmd = state["qpos"].copy()
+        else:
+            self.last_qpos_cmd = qpos.copy()
+        self.last_cmd_time = time.time()
+        self.last_action_code = code
+        return code == 0
+
+    # ------------------------------------------------------------------
+    # 内部方法
+    # ------------------------------------------------------------------
+
+    def _set_servo_mode(self):
+        self.arm.set_mode(1)
+        self.arm.set_state(0)
+
+    def _set_position_mode(self):
+        self.arm.set_mode(0)
+        self.arm.set_state(0)
+
+    def _read_qpos(self) -> np.ndarray:
+        code, qpos = self.arm.get_servo_angle(is_radian=True)
+        if code != 0:
+            return np.full(7, np.nan, dtype=np.float64)
+        return self._array7(qpos)
+
+    def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
         if not self.config.clip_joint_limit:
+            self.last_joint_limit_clipped = False
             return qpos
-        return np.clip(qpos, self.config.qpos_min, self.config.qpos_max)
+        clipped = np.clip(qpos, self.config.qpos_min, self.config.qpos_max)
+        self.last_joint_limit_clipped = not np.allclose(qpos, clipped)
+        return clipped
 
-    def limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
+    def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
         if not self.config.use_delta_limit:
+            self.last_delta_limited = False
             return target_qpos
 
         now = time.time()
         if self.last_qpos_cmd is None:
-            self.last_qpos_cmd = self.get_obs()["qpos"].copy()
+            state = self.get_state()
+            self.last_qpos_cmd = state["qpos"].copy()
+            if not np.all(np.isfinite(self.last_qpos_cmd)):
+                self.last_qpos_cmd = self.config.init_qpos.copy()
         if self.last_cmd_time is None:
             self.last_cmd_time = now
 
         dt = max(now - self.last_cmd_time, self.config.dt)
         max_step = self.config.max_qvel * dt
-        step = np.clip(target_qpos - self.last_qpos_cmd, -max_step, max_step)
+        raw_step = target_qpos - self.last_qpos_cmd
+        step = np.clip(raw_step, -max_step, max_step)
+        self.last_delta_limited = not np.allclose(raw_step, step)
         return self.last_qpos_cmd + step
 
-    def read_qpos(self) -> np.ndarray:
-        code, qpos = self.arm.get_servo_angle(is_radian=True)
-        if code != 0:
-            return np.full(7, np.nan, dtype=np.float64)
-        return self.array7(qpos)
-
-    def read_tau(self) -> np.ndarray:
-        code, tau = self.arm.get_joints_torque()
-        if code != 0:
-            return np.full(7, np.nan, dtype=np.float64)
-        return self.array7(tau)
-
-    def array7(self, value) -> np.ndarray:
+    @staticmethod
+    def _array7(value) -> np.ndarray:
         if value is None:
             return np.full(7, np.nan, dtype=np.float64)
         arr = np.asarray(value, dtype=np.float64).reshape(-1)
@@ -192,44 +263,50 @@ class XArm7:
         return out
 
 
-def print_obs(obs: dict[str, Any]):
-    for key, value in obs.items():
+# ------------------------------------------------------------------
+# 工具函数
+# ------------------------------------------------------------------
+
+def _print_state(state: dict[str, Any]):
+    for key, value in state.items():
         if isinstance(value, np.ndarray):
-            print(f"{key}: {np.round(value, 6)}")
+            print(f"{key}: shape={value.shape}, value={np.round(value, 6)}")
         else:
             print(f"{key}: {value}")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ip", default="192.168.1.111")
-    parser.add_argument("--test", default="obs", choices=["obs", "full-obs", "reset", "hold"])
-    parser.add_argument("--seconds", type=float, default=3.0)
-    args = parser.parse_args()
+def example():
+    config = XArm7Config(ip="192.168.1.111")
+    robot = XArm7(config)
 
-    robot = XArm7(XArm7Config(ip=args.ip)).connect()
+    if not robot.connect():
+        raise RuntimeError(f"Failed to connect XArm7: {robot.last_error_message}")
+
     try:
-        if args.test == "obs":
-            print_obs(robot.get_obs())
-            print(np.rad2deg(robot.get_obs()["qpos"]))
-        elif args.test == "full-obs":
-            print_obs(robot.get_obs(full=True))
-        elif args.test == "reset":
-            print("reset code:", robot.reset())
-            print_obs(robot.get_obs())
-        elif args.test == "hold":
-            qpos = robot.get_obs()["qpos"]
-            end_time = time.time() + args.seconds
-            while time.time() < end_time:
-                result = robot.send_action(qpos)
-                if not result["ok"]:
-                    print(result)
-                    break
-                time.sleep(robot.config.dt)
-            print_obs(robot.get_obs())
+        print("=== get_state() ===")
+        _print_state(robot.get_state())
+
+        print("\n=== get_state(full=True) ===")
+        _print_state(robot.get_state(full=True))
+
+        print("\n=== reset() ===")
+        ok = robot.reset()
+        print(f"reset ok: {ok}")
+        _print_state(robot.get_state())
+
+        print("\n=== hold 3s ===")
+        qpos = robot.get_state()["qpos"]
+        end_time = time.time() + 3.0
+        while time.time() < end_time:
+            if not robot.send_action(qpos):
+                print(f"send_action failed: {robot.last_error_message}")
+                break
+            time.sleep(robot.config.dt)
+        _print_state(robot.get_state())
+
     finally:
         robot.disconnect()
 
 
 if __name__ == "__main__":
-    main()
+    example()
