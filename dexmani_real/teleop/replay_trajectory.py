@@ -4,6 +4,9 @@ Usage:
   python replay_trajectory.py                           # latest episode
   python replay_trajectory.py episode_000/trajectory.npz
   python replay_trajectory.py recordings/episode_001/trajectory.npz
+
+TRANSITIONAL: Reads the legacy .npz format produced by TrajectoryBuffer.
+Will be replaced by an HDF5-based replay tool once EpisodeRecorder is in place.
 """
 
 from __future__ import annotations

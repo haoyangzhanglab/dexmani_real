@@ -395,9 +395,15 @@ class RobotInterface:
     ) -> bool:
         """路径规划回 home + hand 复位。
 
-        use_planning=True: 使用 planner.plan_path() 规划路径
-        规划失败时 fallback 直线 reset()
+        use_planning=True: 使用 planner.plan_path() 规划路径（规划失败时 fallback 直线 reset()）
+        use_planning=False: 直接 arm.reset() + hand.reset()
         """
+        if use_planning:
+            raise NotImplementedError(
+                "Path-planned return_to_home is not yet implemented. "
+                "Workaround: pass use_planning=False for direct reset, "
+                "or call robot.arm.reset() / robot.reset_hand() directly."
+            )
         arm_ok = self.arm.reset()
         hand_ok = self.reset_hand()
         return arm_ok and hand_ok

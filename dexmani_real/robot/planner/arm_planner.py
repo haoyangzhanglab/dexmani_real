@@ -178,16 +178,10 @@ class XArm7MotionPlanner:
         best.report["num_valid_plans"] = len(valid_results)
         return best
 
-    # --- Delegation: Kinematics ---
+    # ── Public API: Kinematics delegation ──
 
     def world_to_base_pose(self, pose_world: Pose) -> Pose:
         return self.kin.world_to_base_pose(pose_world)
-
-    def base_to_world_pose(self, pose_base: Pose) -> Pose:
-        return self.kin.base_to_world_pose(pose_base)
-
-    def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
-        return self.kin.compute_eef_pose_base(qpos)
 
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
         return self.kin.compute_eef_pose_world(qpos)
@@ -204,15 +198,12 @@ class XArm7MotionPlanner:
     def to_mplib_pose(self, pose: Pose) -> Any:
         return self.kin.to_mplib_pose(pose)
 
-    # --- Delegation: IK Candidates ---
+    # ── Public API: IK Candidates delegation ──
 
     def call_mplib_ik(
         self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
     ) -> tuple[str, Any]:
         return self.ik_mgr.call_mplib_ik(target_pose_base, seed_qpos, n_init_qpos, return_closest)
-
-    def generate_ik_seeds(self, current_qpos: np.ndarray, profile: PlanningProfile) -> list[np.ndarray]:
-        return self.ik_mgr.generate_ik_seeds(current_qpos, profile)
 
     def collect_ik_candidates(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
@@ -225,14 +216,8 @@ class XArm7MotionPlanner:
     ) -> tuple[bool, dict[str, Any]]:
         return self.ik_mgr.filter_ik_candidate(qpos, raw_qpos, target_eef_pose_world, current_qpos, profile, limits)
 
-    def score_ik_candidate(self, qpos: np.ndarray, current_qpos: np.ndarray, report: dict[str, Any]) -> float:
-        return self.ik_mgr.score_ik_candidate(qpos, current_qpos, report, self.planning_profile)
-
     def resolve_planning_limits(self, profile: PlanningProfile, reference_qpos: np.ndarray | None = None) -> np.ndarray:
         return self.ik_mgr.resolve_planning_limits(profile, reference_qpos)
-
-    def nearest_equivalent_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        return self.ik_mgr.nearest_equivalent_qpos(qpos, reference_qpos)
 
     def canonicalize_qpos(
         self, qpos: np.ndarray, reference_qpos: np.ndarray, limits: np.ndarray | None = None, limit_tol: float = 1e-5
@@ -275,13 +260,7 @@ class XArm7MotionPlanner:
     def profile_array(self, values: tuple[float, ...], name: str) -> np.ndarray:
         return self.ik_mgr.profile_array(values, name)
 
-    def unique_qpos_list(self, qpos_list: list[np.ndarray], atol: float = 1e-8) -> list[np.ndarray]:
-        return self.ik_mgr.unique_qpos_list(qpos_list, atol)
-
-    def compact_reject_report(self, seed_index: int, report: dict[str, Any]) -> dict[str, Any]:
-        return self.ik_mgr.compact_reject_report(seed_index, report)
-
-    # --- Planning strategies ---
+    # ── Planning strategies (internal) ──
 
     def try_screw_plan(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
@@ -358,7 +337,7 @@ class XArm7MotionPlanner:
         path_result.report.update(mplib_status=status)
         return path_result
 
-    # --- Path validation ---
+    # ── Path validation (internal) ──
 
     def shortcut_smooth_path(
         self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile
@@ -503,4 +482,4 @@ class XArm7MotionPlanner:
             }
         return False, {}
 
-    # --- Internal (empty, reserved for future use) ---
+    # ── Elbow consistency check (internal) ──

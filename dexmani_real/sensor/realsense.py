@@ -254,6 +254,33 @@ class RealSense:
             self.rays_cache.clear()
             self.last_frame = None
 
+    # ------------------------------------------------------------------
+    # connect / disconnect aliases (CLAUDE.md Section 2.3 sensor interface)
+    # ------------------------------------------------------------------
+
+    def connect(self) -> bool:
+        """Alias for start(). Returns True on success."""
+        try:
+            self.start()
+            return True
+        except Exception:
+            return False
+
+    def disconnect(self) -> None:
+        """Alias for stop()."""
+        self.stop()
+
+    def is_connected(self) -> bool:
+        return self.pipeline is not None
+
+    def is_error(self) -> bool:
+        return False
+
+    def clear_error(self) -> bool:
+        return True
+
+    # ------------------------------------------------------------------
+
     def __enter__(self) -> "RealSense":
         self.start()
         return self

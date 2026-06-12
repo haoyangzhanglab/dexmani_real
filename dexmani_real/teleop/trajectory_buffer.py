@@ -1,4 +1,8 @@
-"""Simple in-memory trajectory buffer for recording and playback."""
+"""Simple in-memory trajectory buffer for recording and playback.
+
+NOTE: This is a transitional .npz-based implementation. The long-term plan is to
+replace it with HDF5-based EpisodeRecorder (see CLAUDE.md Section 5).
+"""
 
 from __future__ import annotations
 

@@ -8,6 +8,10 @@ Keyboard:
   R — Start recording (from IDLE)
   Q — Stop recording
   Esc — Exit
+
+TRANSITIONAL: This script bypasses the Controller architecture and uses .npz
+TrajectoryBuffer directly. The final flow will be: Controller._tick() →
+RobotInterface → EpisodeRecorder (HDF5). See CLAUDE.md Sections 4-5.
 """
 
 from __future__ import annotations
