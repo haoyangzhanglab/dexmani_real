@@ -2,7 +2,7 @@ import time
 import numpy as np
 from typing import Optional
 from dex_retargeting.retargeting_config import RetargetingConfig
-from dexmani_real import ASSET_DIR, CONFIG_DIR
+from dexmani_real import ASSET_DIR
 from dexmani_real.teleop.xhand_ref_adapter import XHandRefAdapter
 
 class XHandRetargeter:
@@ -48,7 +48,7 @@ class XHandRetargeter:
         )
 
     def load_retargeter(self):
-        config_path = CONFIG_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
+        config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
 
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
         self.retargeter = RetargetingConfig.load_from_file(str(config_path)).build()

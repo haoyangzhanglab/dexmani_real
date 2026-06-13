@@ -6,7 +6,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 if TYPE_CHECKING:
-    from .arm_planner import XArm7MotionPlanner
+    from .ik_candidates import IKCandidateManager
+    from .kinematics import XArm7Kinematics
 
 from .planner_types import IKResult, Pose, TeleopProfile
 from .pose_utils import compute_pose_error, ensure_qpos, pose_error_vector, wxyz_to_xyzw
@@ -19,15 +20,17 @@ class TeleopIKSolver:
     used as a local fallback when discrete IK fails or only returns far branches.
     """
 
-    def __init__(self, planner: XArm7MotionPlanner) -> None:
-        self.planner = planner
+    def __init__(self, kin: XArm7Kinematics, ik_mgr: IKCandidateManager, teleop_profile: TeleopProfile) -> None:
+        self.kin = kin
+        self.ik_mgr = ik_mgr
+        self.profile = teleop_profile
 
     def solve(self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> IKResult:
-        profile = self.planner.teleop_profile
-        current_qpos = ensure_qpos(current_qpos, self.planner.dof, "current_qpos")
-        previous_qpos_cmd = ensure_qpos(previous_qpos_cmd, self.planner.dof, "previous_qpos_cmd")
+        profile = self.profile
+        current_qpos = ensure_qpos(current_qpos, self.kin.dof, "current_qpos")
+        previous_qpos_cmd = ensure_qpos(previous_qpos_cmd, self.kin.dof, "previous_qpos_cmd")
 
-        current_pose = self.planner.compute_eef_pose_world(current_qpos)
+        current_pose = self.kin.compute_eef_pose_world(current_qpos)
         pos_err, rot_err = compute_pose_error(target_eef_pose_world, current_pose)
         tracking_delta = pos_err + 0.1 * rot_err
 
@@ -97,8 +100,8 @@ class TeleopIKSolver:
         n_init: int,
         tracking_delta: float,
     ) -> tuple[np.ndarray | None, dict[str, Any]]:
-        target_pose_base = self.planner.world_to_base_pose(target_eef_pose_world)
-        jump_limit = np.deg2rad(self.planner.profile_array(profile.max_ik_jump_deg, "max_ik_jump_deg"))
+        target_pose_base = self.kin.world_to_base_pose(target_eef_pose_world)
+        jump_limit = np.deg2rad(self.ik_mgr.profile_array(profile.max_ik_jump_deg, "max_ik_jump_deg"))
 
         # Greedy: return first valid candidate (prefers prev_cmd branch for teleop stability).
         # Offline collect_ik_candidates sorts all candidates by score instead.
@@ -113,7 +116,7 @@ class TeleopIKSolver:
         reject_counts: dict[str, int] = {}
 
         for seed_index, (seed_name, seed, n_init_seed) in enumerate(seed_specs):
-            status, raw_qpos = self.planner.call_mplib_ik(
+            status, raw_qpos = self.ik_mgr.call_mplib_ik(
                 target_pose_base, seed, n_init_qpos=n_init_seed, return_closest=True
             )
             attempt = {
@@ -129,9 +132,9 @@ class TeleopIKSolver:
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
-            qpos = self.planner.canonicalize_qpos(raw_qpos, previous_qpos_cmd)
-            pos_err, rot_err = self.planner.compute_world_pose_error(target_eef_pose_world, qpos)
-            delta = self.planner.compute_qpos_delta(qpos, previous_qpos_cmd)
+            qpos = self.ik_mgr.canonicalize_qpos(raw_qpos, previous_qpos_cmd)
+            pos_err, rot_err = self.kin.compute_world_pose_error(target_eef_pose_world, qpos)
+            delta = self.ik_mgr.compute_qpos_delta(qpos, previous_qpos_cmd)
 
             if pos_err > profile.max_pose_error_pos_m or rot_err > profile.max_pose_error_rot_rad:
                 reject_counts["pose_error"] = reject_counts.get("pose_error", 0) + 1
@@ -182,16 +185,16 @@ class TeleopIKSolver:
         method: str,
     ) -> IKResult:
         max_step = (
-            np.deg2rad(self.planner.profile_array(profile.max_qpos_cmd_speed_deg, "max_qpos_cmd_speed_deg"))
+            np.deg2rad(self.ik_mgr.profile_array(profile.max_qpos_cmd_speed_deg, "max_qpos_cmd_speed_deg"))
             * profile.teleop_dt
         )
-        raw_delta = self.planner.compute_qpos_delta(target_qpos, previous_qpos_cmd)
+        raw_delta = self.ik_mgr.compute_qpos_delta(target_qpos, previous_qpos_cmd)
         clipped_delta = np.clip(raw_delta, -max_step, max_step)
         qpos_cmd = previous_qpos_cmd + clipped_delta
-        qpos_cmd = self.planner.canonicalize_qpos(qpos_cmd, previous_qpos_cmd)
+        qpos_cmd = self.ik_mgr.canonicalize_qpos(qpos_cmd, previous_qpos_cmd)
         clipped = bool(np.any(np.abs(clipped_delta - raw_delta) > 1e-12))
 
-        cmd_pos_error, cmd_rot_error = self.planner.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
+        cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
         result_report = {
             **report,
             "teleop_ik_method": method,
@@ -212,7 +215,7 @@ class TeleopIKSolver:
         current_pose: Pose | None = None,
     ) -> IKResult:
         if current_pose is None:
-            current_pose = self.planner.compute_eef_pose_world(current_qpos)
+            current_pose = self.kin.compute_eef_pose_world(current_qpos)
         error_world = pose_error_vector(
             target=target_eef_pose_world,
             actual=current_pose,
@@ -229,7 +232,7 @@ class TeleopIKSolver:
         R6[3:, 3:] = R_local_world
         error = R6 @ error_world
 
-        jacobian = self.planner.compute_eef_jacobian(current_qpos)
+        jacobian = self.kin.compute_eef_jacobian(current_qpos)
         damping = float(profile.differential_ik_damping)
         lhs = jacobian @ jacobian.T + (damping * damping) * np.eye(6)
         try:
@@ -243,7 +246,7 @@ class TeleopIKSolver:
             )
 
         raw_target_qpos = current_qpos + dq
-        raw_target_qpos = self.planner.canonicalize_qpos(raw_target_qpos, previous_qpos_cmd)
+        raw_target_qpos = self.ik_mgr.canonicalize_qpos(raw_target_qpos, previous_qpos_cmd)
 
         diff_report = {
             "differential_ik_status": "success",

@@ -1,5 +1,7 @@
 # dexmani_real 项目代码风格约束
 
+> **Python 环境**：`conda activate real`（`/home/zhy/anaconda3/envs/real/bin/python`）。运行/测试任何 Python 代码前必须先激活此环境：`source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real`。
+>
 > **文件定位**：本文档是项目的**活代码风格与接口约束**——定义各模块的接口签名、行为契约和设计原则。它不包含实现细节或工期安排。
 > 
 > **与 development_plan.md 的关系**：`docs/development_plan.md` 是本约束的**具体实施方案**（含工期、文件清单、验收标准），实施时必须遵循本文档的接口规范。两个文件中的架构图有重复是故意的——CLAUDE.md 供 AI 编码时快速参考，development_plan.md 供开发者通读。

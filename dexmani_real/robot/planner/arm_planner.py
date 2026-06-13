@@ -79,7 +79,7 @@ class XArm7MotionPlanner:
         self.ik_mgr = IKCandidateManager(self.kin)
         self.mp_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
-        self.teleop_solver = TeleopIKSolver(self)
+        self.teleop_solver = TeleopIKSolver(self.kin, self.ik_mgr, self.teleop_profile)
 
         # Convenience aliases (used by teleop_solver and external code)
         self.dof = dof

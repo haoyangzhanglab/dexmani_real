@@ -31,14 +31,11 @@ class SimRobotConfig:
 
 
 class SimRobotInterface:
-    """SAPIEN 仿真 → 真机 RobotInterface 接口适配。
+    """SAPIEN 仿真 → 独立测试接口。
 
-    提供与 RobotInterface (CLAUDE.md Section 2.8) 一致的接口:
-      connect() → bool
-      get_state() → dict (含 arm_qpos, hand_qpos, eef_pos 等)
-      send_action(action: np.ndarray) → bool
-      reset() → bool
-      stop() / is_connected() / is_error() / clear_error()
+    提供 get_state()/send_action()/reset() 等基础方法用于仿真内验证，
+    不依赖真机硬件。注意：参数和返回类型与 RobotInterface 不同，
+    不可直接替换。
     """
 
     def __init__(self, config: SimRobotConfig | None = None):

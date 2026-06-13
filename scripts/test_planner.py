@@ -43,7 +43,6 @@ def test_imports() -> None:
     print("TEST: 模块导入")
     from dexmani_real.robot.planner import (
         XArm7MotionPlanner,
-        HierarchicalMotionPlanner,
         WorkspaceSafety,
         XArm7Kinematics,
         IKCandidateManager,
@@ -278,7 +277,6 @@ def test_file_structure() -> None:
         "workspace_safety.py",
         "planner_types.py",
         "pose_utils.py",
-        "hierarchical_planner.py",
     ]
     for f in expected:
         p = os.path.join(base, f)
@@ -289,8 +287,7 @@ def test_file_structure() -> None:
     from dexmani_real.robot.planner import (
         Pose, IKResult, PathResult,
         XArm7PlannerConfig, PlanningProfile, TeleopProfile,
-        HandPlanningProfile,
-        XArm7MotionPlanner, HierarchicalMotionPlanner,
+        XArm7MotionPlanner,
         WorkspaceSafety, XArm7Kinematics, IKCandidateManager,
     )
     print("  公共 API 导出不变")

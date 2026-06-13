@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 import numpy as np
+from dexmani_real.robot.planner.pose_utils import xyzw_to_wxyz
 from hand_tracking_sdk import (
     ErrorPolicy,
     HandFilter,
@@ -219,27 +220,23 @@ class QuestHandTracker:
         landmarks = frame.landmarks.points
 
         if self.output_frame == "unity":
-            return pos, self.xyzw_to_wxyz(quat_xyzw), landmarks
+            return pos, xyzw_to_wxyz(quat_xyzw), landmarks
 
         if self.output_frame == "rfu":
             return (
                 unity_left_to_rfu_position(*pos),
-                self.xyzw_to_wxyz(unity_left_to_rfu_rotation(*quat_xyzw)),
+                xyzw_to_wxyz(unity_left_to_rfu_rotation(*quat_xyzw)),
                 [unity_left_to_rfu_position(*point) for point in landmarks],
             )
 
         if self.output_frame == "flu":
             return (
                 unity_left_to_flu_position(*pos),
-                self.xyzw_to_wxyz(unity_left_to_flu_rotation(*quat_xyzw)),
+                xyzw_to_wxyz(unity_left_to_flu_rotation(*quat_xyzw)),
                 [unity_left_to_flu_position(*point) for point in landmarks],
             )
 
         raise ValueError(f"Unsupported output_frame: {self.output_frame}")
-
-    def xyzw_to_wxyz(self, quat_xyzw) -> np.ndarray:
-        q = np.asarray(quat_xyzw, dtype=np.float64)
-        return np.array([q[3], q[0], q[1], q[2]], dtype=np.float64)
 
     def frame_age(self, frame: dict[str, Any]) -> float:
         return (time.monotonic_ns() - frame["local_recv_ns"]) * 1e-9

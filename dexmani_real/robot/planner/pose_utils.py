@@ -95,28 +95,13 @@ def pose_error_vector(target: Pose, actual: Pose, max_pos_step: float, max_rot_s
     return np.concatenate([position_error, rotation_vector])
 
 
-def interpolate_qpos_path(start: np.ndarray, goal: np.ndarray, max_step: float) -> np.ndarray:
-    start = np.asarray(start, dtype=np.float64).reshape(-1)
-    goal = np.asarray(goal, dtype=np.float64).reshape(-1)
-    delta = goal - start
-    step_count = int(np.ceil(np.max(np.abs(delta)) / max(max_step, 1e-12)))
-    step_count = max(step_count, 1)
-    weights = np.linspace(0.0, 1.0, step_count + 1)
-    return start[None, :] + weights[:, None] * delta[None, :]
-
-
-def resample_qpos_path(path: np.ndarray, target_length: int) -> np.ndarray:
-    path = np.asarray(path, dtype=np.float64)
-    if target_length <= 0:
-        raise ValueError("target_length must be positive.")
-    if len(path) == target_length:
-        return path.copy()
-    if len(path) == 1:
-        return np.repeat(path, target_length, axis=0)
-    source_t = np.linspace(0.0, 1.0, len(path))
-    target_t = np.linspace(0.0, 1.0, target_length)
-    columns = [np.interp(target_t, source_t, path[:, index]) for index in range(path.shape[1])]
-    return np.stack(columns, axis=1)
+def normalize_quat_wxyz(q: np.ndarray) -> np.ndarray:
+    """Normalize a wxyz quaternion, returning identity on degenerate input."""
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return q / norm
 
 
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:

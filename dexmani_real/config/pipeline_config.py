@@ -5,6 +5,7 @@ Single-point serializable config source for HDF5 /meta pipeline_snapshot.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -53,24 +54,4 @@ class PipelineConfig:
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict (numpy arrays converted to lists)."""
-        return {
-            "pipeline_name": self.pipeline_name,
-            "description": self.description,
-            "control_rate_hz": self.control_rate_hz,
-            "hand_ema_alpha_teleop": self.hand_ema_alpha_teleop,
-            "arm_ema_alpha_teleop": self.arm_ema_alpha_teleop,
-            "arm_ema_alpha_deploy": self.arm_ema_alpha_deploy,
-            "hand_ema_alpha_deploy": self.hand_ema_alpha_deploy,
-            "data_dir": self.data_dir,
-            "robot": _ndarray_to_list(self._config_to_dict(self.robot)),
-            "planning_profile": _ndarray_to_list(self._config_to_dict(self.planning_profile)),
-            "teleop_profile": _ndarray_to_list(self._config_to_dict(self.teleop_profile)),
-        }
-
-    @staticmethod
-    def _config_to_dict(config) -> dict:
-        """Convert a @dataclass config to a plain dict."""
-        result = {}
-        for fld in config.__dataclass_fields__:
-            result[fld] = getattr(config, fld)
-        return result
+        return _ndarray_to_list(dataclasses.asdict(self))

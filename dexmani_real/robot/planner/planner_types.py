@@ -176,17 +176,3 @@ class TeleopProfile:
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
     debug: bool = False
 
-
-@dataclass(kw_only=True)
-class HandPlanningProfile:
-    hand_dt: float = 1 / 15
-    max_hand_qpos_speed: float = np.pi / 2.0
-    max_hand_waypoint_delta: float | None = None
-    sync_mode: Literal["pre", "post", "interp"] = "post"
-
-    @property
-    def effective_max_step(self) -> float:
-        step = self.max_hand_qpos_speed * self.hand_dt
-        if self.max_hand_waypoint_delta is not None:
-            step = min(step, float(self.max_hand_waypoint_delta))
-        return step

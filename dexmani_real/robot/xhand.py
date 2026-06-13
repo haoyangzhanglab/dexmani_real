@@ -247,9 +247,6 @@ class XHand:
         target = self.array12(self.config.home_qpos if qpos is None else qpos)
         return self.send_action(target)
 
-    def move_to_joint_positions(self, qpos: np.ndarray) -> bool:
-        return self.reset(qpos)
-
     def get_state(
         self,
         full: bool = False,
@@ -282,8 +279,8 @@ class XHand:
             return False
 
         target_qpos = self.array12(action)
-        qpos_after_limit = self.limit_joint_range(target_qpos)
-        qpos_cmd = self.limit_joint_step(qpos_after_limit)
+        qpos_after_limit = self._limit_joint_range(target_qpos)
+        qpos_cmd = self._limit_joint_step(qpos_after_limit)
 
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)
@@ -471,7 +468,7 @@ class XHand:
                 temperature[i, : min(20, temp.size)] = temp[:20]
         return temperature
 
-    def limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
+    def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
@@ -480,7 +477,7 @@ class XHand:
         self.last_joint_limit_clipped = not np.allclose(qpos, clipped)
         return clipped
 
-    def limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
+    def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
         if not self.config.use_delta_limit:
             self.last_delta_limited = False
             return target_qpos

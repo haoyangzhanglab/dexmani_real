@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from dexmani_real.robot.planner.pose_utils import normalize_quat_wxyz
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
 
@@ -38,10 +39,10 @@ class ArmWristMapper:
         eef_quat_wxyz: np.ndarray,
     ) -> None:
         self.wrist_pos0 = np.asarray(wrist_pos, dtype=np.float64).copy()
-        self.wrist_rot0 = quat2mat(self.norm_quat(wrist_quat_wxyz))
+        self.wrist_rot0 = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
         self.eef_pos0 = np.asarray(eef_pos, dtype=np.float64).copy()
-        self.eef_rot0 = quat2mat(self.norm_quat(eef_quat_wxyz))
-        self.last_quat_wxyz = self.norm_quat(eef_quat_wxyz)
+        self.eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz))
+        self.last_quat_wxyz = normalize_quat_wxyz(eef_quat_wxyz)
 
     def map(
         self,
@@ -52,7 +53,7 @@ class ArmWristMapper:
             return None
 
         wrist_pos = np.asarray(wrist_pos, dtype=np.float64)
-        wrist_rot = quat2mat(self.norm_quat(wrist_quat_wxyz))
+        wrist_rot = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
 
         delta_pos_vr = wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
@@ -93,18 +94,11 @@ class ArmWristMapper:
         return axangle2mat(axis, self.rot_scale * angle, is_normalized=True)
 
     def continuous_quat(self, quat_wxyz: np.ndarray) -> np.ndarray:
-        quat_wxyz = self.norm_quat(quat_wxyz)
+        quat_wxyz = normalize_quat_wxyz(quat_wxyz)
         if self.last_quat_wxyz is not None and np.dot(quat_wxyz, self.last_quat_wxyz) < 0:
             quat_wxyz = -quat_wxyz
         self.last_quat_wxyz = quat_wxyz.copy()
         return quat_wxyz
-
-    def norm_quat(self, quat_wxyz: np.ndarray) -> np.ndarray:
-        quat_wxyz = np.asarray(quat_wxyz, dtype=np.float64)
-        norm = np.linalg.norm(quat_wxyz)
-        if norm < 1e-8:
-            return np.array([1.0, 0.0, 0.0, 0.0])
-        return quat_wxyz / norm
 
 
 def example() -> None:

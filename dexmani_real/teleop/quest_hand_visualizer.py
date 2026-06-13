@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from dexmani_real.robot.planner.pose_utils import normalize_quat_wxyz
 from transforms3d.quaternions import quat2mat
 
 
@@ -68,7 +69,7 @@ class QuestHandVisualizer:
         wrist_quat = np.asarray(frame["wrist_quat_wxyz"], dtype=np.float64)
         landmarks_local = np.asarray(frame["landmarks"], dtype=np.float64).reshape(21, 3)
 
-        wrist_rot = quat2mat(self._norm_quat(wrist_quat))
+        wrist_rot = quat2mat(normalize_quat_wxyz(wrist_quat))
         landmarks_world = wrist_pos + (wrist_rot @ landmarks_local.T).T
 
         self._log_palm(f"{path}/palm", landmarks_world)
@@ -88,7 +89,7 @@ class QuestHandVisualizer:
         self.rr.log(path, self.rr.LineStrips3D(strips, colors=colors))
 
     def log_axes(self, path: str, pos: np.ndarray, quat_wxyz: np.ndarray) -> None:
-        rot = quat2mat(self._norm_quat(quat_wxyz))
+        rot = quat2mat(normalize_quat_wxyz(quat_wxyz))
         axes = np.eye(3) * self.axis_length
         axis_colors = [[255, 0, 0], [0, 255, 0], [0, 128, 255]]
         strips = [[pos.tolist(), (pos + rot @ axis).tolist()] for axis in axes]
@@ -134,11 +135,3 @@ class QuestHandVisualizer:
             if idx in chain[1:]:
                 return FINGER_COLORS[fi]
         return [200, 200, 200]
-
-    @staticmethod
-    def _norm_quat(quat_wxyz: np.ndarray) -> np.ndarray:
-        quat_wxyz = np.asarray(quat_wxyz, dtype=np.float64)
-        norm = np.linalg.norm(quat_wxyz)
-        if norm < 1e-8:
-            return np.array([1.0, 0.0, 0.0, 0.0])
-        return quat_wxyz / norm
