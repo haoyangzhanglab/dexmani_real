@@ -164,6 +164,11 @@ class XArm7:
     # ------------------------------------------------------------------
 
     def send_action(self, action: np.ndarray) -> bool:
+        if self.arm is None:
+            self.error_state = True
+            self.last_error_message = "arm not connected"
+            return False
+
         target_qpos = np.asarray(action, dtype=np.float64).reshape(7)
         target_qpos = self._limit_joint_range(target_qpos)
         qpos_cmd = self._limit_joint_step(target_qpos)

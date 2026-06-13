@@ -6,17 +6,22 @@
 from __future__ import annotations
 
 import time
+import traceback
+import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from dexmani_real.robot.planner.kinematics import XArm7Kinematics
 from dexmani_real.robot.planner.planner_types import Pose
-from dexmani_real.robot.planner.pose_utils import quat_wxyz_to_rot6d
+from dexmani_real.robot.planner.pose_utils import compute_pose_error, quat_wxyz_to_rot6d
 from dexmani_real.robot.planner.workspace_safety import WorkspaceSafety
 from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 from dexmani_real.robot.xhand import XHand, XHandConfig
+
+if TYPE_CHECKING:
+    from dexmani_real.robot.planner.arm_planner import XArm7MotionPlanner
 
 
 # ---------------------------------------------------------------------------
@@ -249,9 +254,12 @@ class RobotInterface:
         self,
         config: RobotInterfaceConfig,
         kinematics: XArm7Kinematics,
+        *,
+        planner: XArm7MotionPlanner | None = None,
     ) -> None:
         self.config = config
         self.kinematics = kinematics
+        self.planner = planner
         self.workspace = WorkspaceSafety(config.workspace_bounds)
 
         self.arm = XArm7(config.arm)
@@ -368,20 +376,31 @@ class RobotInterface:
     # 动作发送
     # ------------------------------------------------------------------
 
-    def send_action(self, action: RobotAction) -> dict[str, bool]:
-        """发送 arm + hand 动作。返回 {"arm": bool, "hand": bool}。
+    def send_action(self, action: RobotAction) -> dict:
+        """发送 arm + hand 动作。
 
-        EEF 目标必须在 workspace 内。
+        Returns:
+            {"arm_ok": bool, "hand_ok": bool,
+             "arm_cmd": ndarray | None,   # (7,) post-clip 实际发送值
+             "hand_cmd": ndarray | None}  # (12,) post-clip 实际发送值
+
+        arm_cmd/hand_cmd 是经过 joint limit + delta limit 裁剪后的实际命令值。
+        发送失败时为 None。录制时应使用这些 post-clip 值而非 IK 原始输出。
         """
-        result: dict[str, bool] = {}
+        result: dict = {}
 
         # Workspace 检查
         target_pos = action.target_eef_pos
         if target_pos is not None and not self.workspace.check(target_pos):
             target_pos = self.workspace.clamp(target_pos)
 
-        result["arm"] = self.arm.send_action(action.arm_qpos_cmd)
-        result["hand"] = self.hand.send_action(action.hand_qpos_cmd)
+        arm_ok = self.arm.send_action(action.arm_qpos_cmd)
+        hand_ok = self.hand.send_action(action.hand_qpos_cmd)
+
+        result["arm_ok"] = arm_ok
+        result["hand_ok"] = hand_ok
+        result["arm_cmd"] = self.arm.last_qpos_cmd.copy() if arm_ok else None
+        result["hand_cmd"] = self.hand.last_qpos_cmd.copy() if hand_ok else None
         return result
 
     # ------------------------------------------------------------------
@@ -393,19 +412,81 @@ class RobotInterface:
         use_planning: bool = True,
         cancel_event: Any = None,
     ) -> bool:
-        """路径规划回 home + hand 复位。
+        """Path-planned return to home + hand reset.
 
-        use_planning=True: 使用 planner.plan_path() 规划路径（规划失败时 fallback 直线 reset()）
-        use_planning=False: 直接 arm.reset() + hand.reset()
+        use_planning=True: plan a collision-free path (falls back to direct
+            reset on failure).
+        use_planning=False: direct arm.reset() + hand.reset().
         """
-        if use_planning:
-            raise NotImplementedError(
-                "Path-planned return_to_home is not yet implemented. "
-                "Workaround: pass use_planning=False for direct reset, "
-                "or call robot.arm.reset() / robot.reset_hand() directly."
+        # 1. Arm not connected → bail out
+        if not self.arm.is_connected():
+            return False
+
+        # 2. Read current qpos; NaN → fallback
+        arm_state = self.arm.get_state()
+        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+        if not np.all(np.isfinite(current_qpos)):
+            return self._return_to_home_direct()
+
+        # 3. Not using planning → direct reset
+        if not use_planning:
+            return self._return_to_home_direct()
+
+        # 4. planner is None → warn + fallback
+        if self.planner is None:
+            warnings.warn(
+                "use_planning=True but planner is None, falling back to direct reset"
             )
+            return self._return_to_home_direct()
+
+        # 5. FK(home_qpos) → home EEF pose, workspace check/clamp
+        home_qpos = self.arm.config.init_qpos.copy()
+        home_eef_pose = self.kinematics.compute_eef_pose_world(home_qpos)
+        if not self.workspace.check(home_eef_pose.p):
+            warnings.warn(
+                f"Home EEF position {np.round(home_eef_pose.p, 4)} "
+                "is outside workspace, clamping"
+            )
+            home_eef_pose.p = self.workspace.clamp(home_eef_pose.p)
+
+        # 6. Already at home? (< 5 mm pos error, < 0.05 rad rot error)
+        current_eef = self.kinematics.compute_eef_pose_world(current_qpos)
+        pos_err, rot_err = compute_pose_error(home_eef_pose, current_eef)
+        if pos_err <= 0.005 and rot_err <= 0.05:
+            hand_ok = self.reset_hand() if self.hand.is_connected() else True
+            return True and hand_ok
+
+        # 7. Plan path
+        try:
+            result = self.planner.plan_path(home_eef_pose, current_qpos)
+        except Exception:
+            traceback.print_exc()
+            return self._return_to_home_direct()
+
+        # 8. Path failed or zero waypoints → fallback
+        if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
+            return self._return_to_home_direct()
+
+        # 9. Execute waypoints one by one
+        dt = float(self.arm.config.dt)
+        waypoints = result.qpos_path
+        for waypoint in waypoints:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            if self.arm.is_error():
+                break
+            self.arm.send_action(waypoint)
+            time.sleep(dt)
+
+        # 10. Hand reset (degraded if hand not connected)
+        hand_ok = self.reset_hand() if self.hand.is_connected() else True
+        arm_ok = not self.arm.is_error()
+        return arm_ok and hand_ok
+
+    def _return_to_home_direct(self) -> bool:
+        """Fallback: direct arm.reset() + hand reset (straight-line in joint space)."""
         arm_ok = self.arm.reset()
-        hand_ok = self.reset_hand()
+        hand_ok = self.reset_hand() if self.hand.is_connected() else True
         return arm_ok and hand_ok
 
     def reset_hand(self) -> bool:

@@ -91,7 +91,7 @@ class XHandConfig:
     tor_max: int = 300
     mode: int = 3
 
-    use_delta_limit: bool = False
+    use_delta_limit: bool = True
     clip_joint_limit: bool = True
 
     tactile_scale: float = 0.1

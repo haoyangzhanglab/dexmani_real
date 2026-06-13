@@ -25,7 +25,7 @@ VR 进程(80Hz) ──► ring["vr_frame"] ──┐
                                      ├── Controller 进程(50Hz)
 Camera 进程(30Hz) ──► ring["camera"] ─┘     │
                                             ├─ _tick(): 同一份 VR frame 同时驱动 arm + hand
-                                            │    arm: IK(pose, qpos, prev) → arm_cmd
+                                            │    arm: IK(pose, qpos, prev) → EMA(alpha=0.3) → arm_cmd
                                             │    hand: retarget(landmarks) → EMA(alpha=0.3) → hand_cmd
                                             ├─ robot.send_action()
                                             └─ [RECORDING] recorder.add_frame()
@@ -474,9 +474,14 @@ class RobotInterface:
     def get_state(self) -> RobotState: ...
         """读取 arm + hand 状态，含 FK 计算 eef_pos/eef_quat。"""
 
-    def send_action(self, action: RobotAction) -> dict[str, bool]: ...
-        """发送 arm + hand 动作。返回 {"arm": True, "hand": False}。
-        内部调用 arm.send_action() 和 hand.send_action()。"""
+    def send_action(self, action: RobotAction) -> dict: ...
+        """发送 arm + hand 动作。
+        Returns:
+            {"arm_ok": bool, "hand_ok": bool,
+             "arm_cmd": ndarray | None,   # (7,) post-clip 实际发送值
+             "hand_cmd": ndarray | None}  # (12,) post-clip 实际发送值
+        arm_cmd/hand_cmd 经过 joint limit + delta limit 裁剪。
+        发送失败时为 None。录制时使用 post-clip 值而非 IK 原始输出。"""
 
     def emergency_stop(self) -> None: ...
         """arm + hand 同时急停。"""
@@ -486,7 +491,7 @@ class RobotInterface:
     def clear_error(self) -> bool: ...
 ```
 
-**注意**：`RobotInterface` 是复合层，`send_action()` 返回 `dict[str, bool]` 以区分各子设备状态。底层 `XArm7.send_action()` / `XHand.send_action()` 仍只返回 `bool`。
+**注意**：`RobotInterface` 是复合层，`send_action()` 返回 `{"arm_ok", "hand_ok", "arm_cmd", "hand_cmd"}`。`arm_cmd`/`hand_cmd` 是经过 joint limit + delta limit 裁剪后的实际发送值（post-clip），录制时必须使用这些值而非 IK 原始输出。底层 `XArm7.send_action()` / `XHand.send_action()` 仍只返回 `bool`。
 
 ### 2.9 Workspace 安全（Day 1）
 
@@ -610,19 +615,21 @@ while running:
 ```python
 def _tick(self, vr_frame):
     # 0. 追踪质量门控
-    # 1. Arm: VR wrist → EEF → IK（不平滑，保留原始追踪）
+    # 1. Arm: VR wrist → EEF → IK → EMA 平滑（alpha=0.3）
     # 2. Hand: landmarks → retarget → EMA 平滑（alpha=0.3）
     # 3. 关节跳变 clamp（arm + hand 各自独立限速）
     return RobotAction(arm_qpos_cmd=..., hand_qpos_cmd=...)
 ```
 
-### 4.2 Hand EMA 平滑规则及原因
+### 4.2 EMA 平滑规则及原因
 
-- **遥操作录制时仅 hand 做 EMA 平滑（alpha=0.3），arm 不平滑**
-  - 原因：arm IK 输出本身已平滑（solver 内置限速）；hand retargeting 从 21 个稀疏 landmark 映射到 12 DOF，输入噪声大，需要 EMA 过滤手指抖动
-  - arm 不平滑是为了在录制数据中保留原始 VR→robot 映射关系，供策略学习真实的 arm 动态
+- **遥操作录制时 arm+hand 都做 EMA 平滑（alpha=0.3）**
+  - Arm IK 使用数值方法（MPlib），seed 随机性会导致帧间关节跳变，需要轻度 EMA 抑制。ref: LeFranX `arm_ik_processor.py:360-363` 对 arm IK 输出使用相同 alpha（`smoothing_factor=0.7`，等价于 EMA alpha=0.3）
+  - Hand retargeting 从 21 个稀疏 landmark 映射到 12 DOF，输入噪声大，需要 EMA 过滤手指抖动
+  - Alpha=0.3 是轻度平滑，在抑制抖动的同时保持响应性（手部动作延迟 < 50ms）
 - **策略部署时 arm+hand 都做 EMA 平滑（alpha=0.5）**
-  - 原因：策略推理可能有帧间抖动，需要抑制高频噪声保护真实机器人
+  - 原因：策略推理可能有帧间抖动，需要更强的平滑来抑制高频噪声保护真实机器人
+  - 部署时 alpha 更高（0.5 vs 0.3），因为策略输出比人类遥操作更不稳定
 
 ### 4.3 VR Re-anchoring 规则
 
@@ -679,7 +686,7 @@ episode_000.h5
 
 **相机内外参存储说明：**
 
-- `/meta/camera_K`：内参标量值 `[fx, fy, cx, cy]`，来自 `config/calib/cameras.json`，方便快速读取
+- `/meta/camera_K`：内参标量值 `[fx, fy, cx, cy]`，录制时从 RealSense 硬件读取，方便快速读取
 - `/meta/camera_T_base_camera`（eye-to-hand）或 `/meta/camera_T_eef_camera`（eye-in-hand）：4x4 矩阵以 16 个 float 存储，原始标定值
 - `/camera/K(3,3)`：3x3 内参矩阵，与图像数据放一起便于预处理
 - `/camera/extrinsics(T,4,4)`：逐帧的外参，已在录制时计算为 T_base_camera

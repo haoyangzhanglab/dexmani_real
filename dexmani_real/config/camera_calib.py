@@ -1,11 +1,14 @@
-"""Camera calibration loader.
+"""Camera extrinsics loader.
 
-Loads per-camera intrinsics and extrinsics from config/calib/cameras.json.
+Loads per-camera extrinsics from the bundled calib/cameras.json data file.
 Supports eye-to-hand (static camera) and eye-in-hand (end-effector mounted).
 
+Intrinsics (K matrix) are read from the RealSense hardware at runtime, not from
+this calibration file. They are stored into HDF5 /meta at recording time for
+self-contained episodes.
+
 Usage:
-    calib = CameraCalib("config/calib/cameras.json")
-    K = calib.get_K("camera_0")
+    calib = CameraCalib()
     T_base_camera = calib.get_extrinsics("camera_0")                              # eye-to-hand
     T_base_camera = calib.get_extrinsics("camera_0", T_base_eef=T_base_eef)       # eye-in-hand
     meta = calib.to_meta_dict("camera_0")  # for HDF5 /meta attributes
@@ -25,7 +28,6 @@ import numpy as np
 class CameraCalibEntry:
     serial: str
     type: str  # "eye_to_hand" | "eye_in_hand"
-    K: np.ndarray  # (3,3)
     T_base_camera: np.ndarray | None = None  # (4,4) eye-to-hand
     T_eef_camera: np.ndarray | None = None  # (4,4) eye-in-hand
 
@@ -43,9 +45,7 @@ class CameraCalibEntry:
 class CameraCalib:
     def __init__(self, calib_path: str | None = None):
         if calib_path is None:
-            calib_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "config", "calib", "cameras.json"
-            )
+            calib_path = os.path.join(os.path.dirname(__file__), "calib", "cameras.json")
         self.calib_path = Path(calib_path).resolve()
         self._entries: dict[str, CameraCalibEntry] = {}
         self._load()
@@ -60,11 +60,9 @@ class CameraCalib:
             raw = json.load(f)
 
         for cam_name, cam in raw.items():
-            K = self._build_K(cam["K"])
             entry = CameraCalibEntry(
                 serial=cam["serial"],
                 type=cam["type"],
-                K=K,
                 T_base_camera=(
                     np.array(cam["T_base_camera"], dtype=np.float64)
                     if cam.get("T_base_camera") is not None
@@ -78,27 +76,11 @@ class CameraCalib:
             )
             self._entries[cam_name] = entry
 
-    @staticmethod
-    def _build_K(params: list[float]) -> np.ndarray:
-        fx, fy, cx, cy = params
-        return np.array(
-            [[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64
-        )
-
     # ---- public API ----
 
     @property
     def camera_names(self) -> list[str]:
         return list(self._entries.keys())
-
-    def get_K(self, cam_name: str) -> np.ndarray:
-        """Return 3x3 intrinsic matrix."""
-        return self._entries[cam_name].K.copy()
-
-    def get_intrinsics(self, cam_name: str) -> dict[str, float]:
-        """Return {"fx", "fy", "cx", "cy"} as scalars."""
-        K = self._entries[cam_name].K
-        return {"fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2]}
 
     def get_extrinsics(
         self, cam_name: str, T_base_eef: np.ndarray | None = None
@@ -118,17 +100,18 @@ class CameraCalib:
         return T_base_eef @ entry.T_eef_camera
 
     def to_meta_dict(self, cam_name: str) -> dict:
-        """Return calibration values for HDF5 /meta attributes.
+        """Return extrinsics values for HDF5 /meta attributes.
 
-        Contains camera_serial, camera_type, camera_K (flat list),
-        and either camera_T_base_camera or camera_T_eef_camera (4x4 flat list).
+        Contains camera_serial, camera_type, and either
+        camera_T_base_camera or camera_T_eef_camera (4x4 flat list).
+
+        camera_K is not included here — intrinsics are read from the
+        RealSense hardware at recording time and written to HDF5 separately.
         """
         entry = self._entries[cam_name]
-        K = self.get_intrinsics(cam_name)
         meta = {
             "camera_serial": entry.serial,
             "camera_type": entry.type,
-            "camera_K": [float(K["fx"]), float(K["fy"]), float(K["cx"]), float(K["cy"])],
         }
         if entry.type == "eye_to_hand":
             meta["camera_T_base_camera"] = entry.T_base_camera.flatten().tolist()
@@ -151,7 +134,6 @@ def example():
         "cam_static": {
             "serial": "000000000001",
             "type": "eye_to_hand",
-            "K": [615.0, 615.0, 320.0, 240.0],
             "T_base_camera": [
                 [1.0, 0.0, 0.0, 0.50],
                 [0.0, 1.0, 0.0, -0.35],
@@ -162,7 +144,6 @@ def example():
         "cam_wrist": {
             "serial": "000000000002",
             "type": "eye_in_hand",
-            "K": [610.0, 610.0, 320.0, 240.0],
             "T_eef_camera": [
                 [0.0, 1.0, 0.0, 0.05],
                 [-1.0, 0.0, 0.0, -0.02],
@@ -181,10 +162,8 @@ def example():
         print(f"Cameras: {calib.camera_names}")
 
         # eye-to-hand
-        K = calib.get_K("cam_static")
         T = calib.get_extrinsics("cam_static")
-        print(f"\n[cam_static] K:\n{K}")
-        print(f"[cam_static] T_base_camera:\n{T}")
+        print(f"\n[cam_static] T_base_camera:\n{T}")
 
         # eye-in-hand
         T_base_eef = np.eye(4)

@@ -206,13 +206,23 @@ class RealSense:
         self.frame_id = 0
         self.last_frame: CameraFrame | None = None
 
-    def start(self) -> None:
-        if self.pipeline is not None:
-            return
+    def connect(self) -> bool:
+        """Open RealSense pipeline. Returns True on success.
 
-        self.active_serial = self.config.serial or self.find_default_serial()
-        device = self.find_device_by_serial(self.active_serial)
-        self.load_model_specific_config(device)
+        Canonical lifecycle method per CLAUDE.md Section 2.3.
+        Idempotent: calling on an already-connected camera returns True.
+        """
+        import warnings
+
+        if self.pipeline is not None:
+            return True
+
+        try:
+            self.active_serial = self.config.serial or self.find_default_serial()
+            device = self.find_device_by_serial(self.active_serial)
+            self.load_model_specific_config(device)
+        except Exception:
+            return False
 
         self.pipeline = rs.pipeline()
         rs_config = self.create_rs_config()
@@ -223,7 +233,7 @@ class RealSense:
         except RuntimeError:
             self.pipeline = None
             self.profile = None
-            raise
+            return False
 
         self.aligner = self.create_aligner()
         self.hole_filling_filter = rs.hole_filling_filter(2) if self.config.depth_hole_filling else None
@@ -237,7 +247,14 @@ class RealSense:
         for _ in range(max(self.config.warmup_frames, 0)):
             self.pipeline.wait_for_frames()
 
-    def stop(self) -> None:
+        return True
+
+    def disconnect(self) -> None:
+        """Close RealSense pipeline.
+
+        Canonical lifecycle method per CLAUDE.md Section 2.3.
+        Idempotent: calling on an already-disconnected camera is a no-op.
+        """
         if self.pipeline is None:
             return
         try:
@@ -255,20 +272,23 @@ class RealSense:
             self.last_frame = None
 
     # ------------------------------------------------------------------
-    # connect / disconnect aliases (CLAUDE.md Section 2.3 sensor interface)
+    # start / stop (deprecated aliases)
     # ------------------------------------------------------------------
 
-    def connect(self) -> bool:
-        """Alias for start(). Returns True on success."""
-        try:
-            self.start()
-            return True
-        except Exception:
-            return False
+    def start(self) -> None:
+        """Deprecated. Use connect() instead."""
+        import warnings
 
-    def disconnect(self) -> None:
-        """Alias for stop()."""
-        self.stop()
+        warnings.warn("start() is deprecated, use connect()", DeprecationWarning, stacklevel=2)
+        if not self.connect():
+            raise RuntimeError("RealSense failed to connect.")
+
+    def stop(self) -> None:
+        """Deprecated. Use disconnect() instead."""
+        import warnings
+
+        warnings.warn("stop() is deprecated, use disconnect()", DeprecationWarning, stacklevel=2)
+        self.disconnect()
 
     def is_connected(self) -> bool:
         return self.pipeline is not None
@@ -282,11 +302,11 @@ class RealSense:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "RealSense":
-        self.start()
+        self.connect()
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        self.stop()
+        self.disconnect()
 
     def create_rs_config(self) -> rs.config:
         depth_width, depth_height = self.config.depth_resolution
@@ -342,7 +362,7 @@ class RealSense:
 
     def update_intrinsics_from_profile(self) -> None:
         if self.profile is None:
-            raise RuntimeError("RealSense is not started.")
+            raise RuntimeError("RealSense is not connected.")
         stream = rs.stream.color if self.config.align_mode == "depth_to_color" else rs.stream.depth
         video_profile = self.profile.get_stream(stream).as_video_stream_profile()
         self.set_intrinsics(video_profile.get_intrinsics())
@@ -361,7 +381,7 @@ class RealSense:
 
     def read(self, timeout_ms: int = 5000) -> CameraFrame:
         if self.pipeline is None:
-            raise RuntimeError("RealSense is not started. Call start() first.")
+            raise RuntimeError("RealSense is not connected. Call connect() first.")
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
@@ -482,22 +502,22 @@ class RealSense:
 
     def get_intrinsics(self) -> np.ndarray:
         if self.K is None:
-            raise RuntimeError("RealSense is not started or intrinsics are unavailable.")
+            raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
         return self.K.copy()
 
     def get_intrinsics_info(self) -> dict:
         if self.intrinsics_info is None:
-            raise RuntimeError("RealSense is not started or intrinsics info is unavailable.")
+            raise RuntimeError("RealSense is not connected or intrinsics info is unavailable.")
         return dict(self.intrinsics_info)
 
     def get_depth_scale(self) -> float:
         if self.depth_scale is None:
-            raise RuntimeError("RealSense is not started or depth_scale is unavailable.")
+            raise RuntimeError("RealSense is not connected or depth_scale is unavailable.")
         return float(self.depth_scale)
 
     def get_device_info(self) -> dict:
         if self.profile is None:
-            raise RuntimeError("RealSense is not started.")
+            raise RuntimeError("RealSense is not connected.")
         device = self.profile.get_device()
         info = {}
         for name, key in [
@@ -514,7 +534,7 @@ class RealSense:
 
     def get_rays(self, shape: tuple[int, int], device: str = "cpu"):
         if self.K is None:
-            raise RuntimeError("RealSense is not started or intrinsics are unavailable.")
+            raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
         height, width = int(shape[0]), int(shape[1])
         key = (height, width, str(device))
         if key not in self.rays_cache:
