@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional, Sequence, Tuple, Union
 
-import cv2
 import numpy as np
 import torch
 
@@ -18,6 +17,7 @@ class PointCloudConfig:
     min_depth: float | None = 0.05
     max_depth: float | None = 1.5
     sampling: SamplingMode = "random"
+    voxel_size: float | None = None
     workspace: tuple[float, float, float, float, float, float] | None = None
     device: str = "cpu"
     return_tensor: bool = True
@@ -25,6 +25,8 @@ class PointCloudConfig:
     def __post_init__(self) -> None:
         if self.sampling not in ("none", "random", "fps", "first"):
             raise ValueError("sampling must be one of: 'none', 'random', 'fps', 'first'.")
+        if self.voxel_size is not None and self.voxel_size <= 0:
+            raise ValueError("voxel_size must be positive or None.")
         if self.workspace is not None:
             object.__setattr__(self, "workspace", check_workspace(self.workspace))
 
@@ -94,17 +96,10 @@ def check_workspace(workspace: Optional[Sequence[float]]) -> Optional[tuple[floa
 
 
 def depth_to_meters(depth: ArrayLike) -> np.ndarray:
-    depth_array = np.asarray(to_numpy(depth))
+    depth_array = to_numpy(depth)
     if np.issubdtype(depth_array.dtype, np.integer):
         return depth_array.astype(np.float32) * 0.001
     return depth_array.astype(np.float32)
-
-
-def depth_meters_to_mm(depth: ArrayLike) -> np.ndarray:
-    depth_m = np.asarray(to_numpy(depth), dtype=np.float32)
-    depth_mm = np.rint(depth_m * 1000.0)
-    depth_mm = np.nan_to_num(depth_mm, nan=0.0, posinf=0.0, neginf=0.0)
-    return np.clip(depth_mm, 0.0, np.iinfo(np.uint16).max).astype(np.uint16)
 
 
 def make_rays(height: int, width: int, K: ArrayLike, device: str = "cpu") -> torch.Tensor:
@@ -181,7 +176,6 @@ def crop_points(
     colors: Optional[torch.Tensor] = None,
     workspace: Optional[Sequence[float]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    workspace = check_workspace(workspace)
     if workspace is None:
         return points, colors
     x_min, y_min, z_min, x_max, y_max, z_max = workspace
@@ -189,6 +183,77 @@ def crop_points(
     keep = keep & (points[:, 1] >= y_min) & (points[:, 1] <= y_max)
     keep = keep & (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
     return points[keep], colors[keep] if colors is not None else None
+
+
+def voxel_down_sample(
+    points: torch.Tensor,
+    colors: Optional[torch.Tensor] = None,
+    voxel_size: float = 0.005,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """体素降采样：同一体素内的点取均值。返回降采样后的 (points, colors)。
+
+    应在 sample_points 之前调用，使后续 FPS 在空间均匀的体素中心上选取。
+    优先使用 open3d C++ 实现（~1ms），回退到 torch 实现（~300ms/25万点）。
+    """
+    if points.shape[0] == 0 or voxel_size <= 0:
+        return points, colors
+
+    # 优先使用 open3d（CPU 上比 torch scatter 快 100x+）
+    try:
+        return _voxel_down_sample_o3d(points, colors, voxel_size)
+    except ImportError:
+        return _voxel_down_sample_torch(points, colors, voxel_size)
+
+
+def _voxel_down_sample_o3d(
+    points: torch.Tensor,
+    colors: Optional[torch.Tensor],
+    voxel_size: float,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    import open3d as o3d
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.detach().cpu().numpy().astype(np.float64))
+    if colors is not None:
+        c = colors.detach().cpu().numpy().astype(np.float64)
+        if c.size and c.max() > 1.0:
+            c /= 255.0
+        pcd.colors = o3d.utility.Vector3dVector(c)
+
+    pcd = pcd.voxel_down_sample(voxel_size)
+
+    new_points = torch.as_tensor(np.asarray(pcd.points), dtype=points.dtype, device=points.device)
+    new_colors = None
+    if colors is not None and pcd.has_colors():
+        new_colors = torch.as_tensor(np.asarray(pcd.colors), dtype=colors.dtype, device=colors.device)
+
+    return new_points, new_colors
+
+
+def _voxel_down_sample_torch(
+    points: torch.Tensor,
+    colors: Optional[torch.Tensor],
+    voxel_size: float,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    voxel_ijk = (points / voxel_size).floor().long()
+    unique_voxels, inverse = voxel_ijk.unique(dim=0, return_inverse=True)
+    n_voxels = unique_voxels.shape[0]
+
+    new_points = torch.zeros(n_voxels, 3, device=points.device, dtype=torch.float32)
+    new_points.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, 3), points.float())
+    count = torch.zeros(n_voxels, device=points.device, dtype=torch.float32)
+    count.scatter_add_(0, inverse, torch.ones(points.shape[0], device=points.device, dtype=torch.float32))
+    new_points /= count.unsqueeze(-1)
+    new_points = new_points.to(points.dtype)
+
+    new_colors = None
+    if colors is not None:
+        new_colors = torch.zeros(n_voxels, 3, device=colors.device, dtype=torch.float32)
+        new_colors.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, 3), colors.float())
+        new_colors /= count.unsqueeze(-1)
+        new_colors = new_colors.to(colors.dtype)
+
+    return new_points, new_colors
 
 
 def sample_points(
@@ -216,7 +281,12 @@ def sample_points(
         try:
             import pytorch3d.ops as torch3d_ops
 
-            index = torch3d_ops.sample_farthest_points(points[None], K=npoints)[1][0]
+            if torch.cuda.is_available() and points.device.type == "cpu":
+                pts_gpu = points.cuda()
+                index = torch3d_ops.sample_farthest_points(pts_gpu[None], K=npoints)[1][0]
+                index = index.cpu()
+            else:
+                index = torch3d_ops.sample_farthest_points(points[None], K=npoints)[1][0]
         except ImportError:
             index = torch.randperm(count, device=points.device)[:npoints]
     elif count >= npoints:
@@ -251,6 +321,7 @@ def rgbd_to_pointcloud(
     min_depth: Optional[float] = None,
     max_depth: Optional[float] = None,
     sampling: Optional[SamplingMode] = None,
+    voxel_size: Optional[float] = None,
     device: Optional[str] = None,
     return_tensor: Optional[bool] = None,
 ) -> Union[torch.Tensor, np.ndarray]:
@@ -267,6 +338,8 @@ def rgbd_to_pointcloud(
         config = replace(config, max_depth=max_depth)
     if sampling is not None:
         config = replace(config, sampling=sampling)
+    if voxel_size is not None:
+        config = replace(config, voxel_size=voxel_size)
     if device is not None:
         config = replace(config, device=device)
     if return_tensor is not None:
@@ -283,6 +356,8 @@ def rgbd_to_pointcloud(
     points, colors = filter_points_by_depth(points, colors, config.min_depth, config.max_depth)
     points = transform_points(points, T_out_camera)
     points, colors = crop_points(points, colors, config.workspace)
+    if config.voxel_size is not None:
+        points, colors = voxel_down_sample(points, colors, config.voxel_size)
     points, colors = sample_points(points, colors, config.npoints, config.sampling)
 
     pointcloud = pack_xyzrgb(points, colors)
@@ -302,6 +377,8 @@ def depth_valid_ratio(depth: ArrayLike, min_depth: Optional[float] = 0.05, max_d
 
 
 def make_depth_vis(depth: ArrayLike, min_depth: float = 0.05, max_depth: float = 1.5) -> np.ndarray:
+    import cv2
+
     depth_m = depth_to_meters(depth)
     valid = np.isfinite(depth_m) & (depth_m > 0.0)
     depth_clip = np.clip(depth_m, min_depth, max_depth)
@@ -315,7 +392,7 @@ def make_depth_vis(depth: ArrayLike, min_depth: float = 0.05, max_depth: float =
 def vis_point_cloud(pointcloud: ArrayLike, voxel_size: Optional[float] = None, point_size: float = 5.0) -> None:
     import open3d as o3d
 
-    pointcloud_array = np.asarray(to_numpy(pointcloud), dtype=np.float32)
+    pointcloud_array = to_numpy(pointcloud).astype(np.float32)
     if pointcloud_array.ndim != 2 or pointcloud_array.shape[1] not in (3, 6):
         raise ValueError("pointcloud must have shape (N, 3) or (N, 6).")
 

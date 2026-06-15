@@ -5,11 +5,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
-import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-from dexmani_real.sensor.pointcloud_utils import (
+from dexmani_real.utils.pointcloud_utils import (
     PointCloudConfig,
     depth_valid_ratio,
     intrinsics_to_dict,
@@ -271,36 +270,6 @@ class RealSense:
             self.rays_cache.clear()
             self.last_frame = None
 
-    # ------------------------------------------------------------------
-    # start / stop (deprecated aliases)
-    # ------------------------------------------------------------------
-
-    def start(self) -> None:
-        """Deprecated. Use connect() instead."""
-        import warnings
-
-        warnings.warn("start() is deprecated, use connect()", DeprecationWarning, stacklevel=2)
-        if not self.connect():
-            raise RuntimeError("RealSense failed to connect.")
-
-    def stop(self) -> None:
-        """Deprecated. Use disconnect() instead."""
-        import warnings
-
-        warnings.warn("stop() is deprecated, use disconnect()", DeprecationWarning, stacklevel=2)
-        self.disconnect()
-
-    def is_connected(self) -> bool:
-        return self.pipeline is not None
-
-    def is_error(self) -> bool:
-        return False
-
-    def clear_error(self) -> bool:
-        return True
-
-    # ------------------------------------------------------------------
-
     def __enter__(self) -> "RealSense":
         self.connect()
         return self
@@ -432,10 +401,6 @@ class RealSense:
         self.last_frame = frame
         return frame
 
-    def read_rgbd(self, timeout_ms: int = 5000) -> tuple[np.ndarray | None, np.ndarray, float]:
-        frame = self.read(timeout_ms=timeout_ms)
-        return frame.rgb, frame.depth, frame.timestamp
-
     def get_obs(
         self,
         *,
@@ -495,10 +460,6 @@ class RealSense:
             config=config or PointCloudConfig(),
             T_out_camera=T_out_camera,
         )
-
-    def pointcloud(self, config: PointCloudConfig | None = None, *, T_out_camera: Optional[np.ndarray] = None):
-        frame = self.read()
-        return self.pointcloud_from_frame(frame, config, T_out_camera=T_out_camera)
 
     def get_intrinsics(self) -> np.ndarray:
         if self.K is None:
@@ -591,6 +552,8 @@ def example(
     camera_config: RealSenseConfig = EXAMPLE_CAMERA_CONFIG,
     pointcloud_config: PointCloudConfig = EXAMPLE_POINTCLOUD_CONFIG,
 ) -> None:
+    import cv2
+
     cameras = RealSense.list_cameras()
     if len(cameras) == 0:
         print("No RealSense camera found.")

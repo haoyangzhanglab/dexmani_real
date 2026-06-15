@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dexmani_real.robot.planner.planner_types import PlanningProfile, TeleopProfile
+from dexmani_real.planner.planner_types import PlanningProfile, TeleopProfile
 from dexmani_real.robot.robot_interface import RobotInterfaceConfig
 
 

@@ -444,93 +444,12 @@ finally:
 
 ---
 
-## 3. 后续需要实现的
+## 3. 相关文档
 
-### 3.1 P0：真机安全与可观测性
-
-这些是后续最优先的工作：
-
-1. **控制循环 watchdog**  
-   如果超过固定时间没有收到新的 `send_action()`，自动保持当前关节角或停止。避免上层 policy crash 后机械臂继续执行旧目标。
-
-2. **更清晰的错误恢复流程**  
-   当前已有 `is_error()`、`clear_error()`、`stop()`，但还需要把常见错误码映射成更明确的提示，例如：关节超限、速度超限、急停、碰撞、自碰撞。
-
-3. **状态缓存**  
-   当 `get_joint_states()` 失败时，除了返回 fallback，也可以保留 `last_good_state`，避免短暂通信波动导致上层 observation 出现 NaN。
-
-4. **日志系统**  
-   记录每次 `send_action()` 的 `target_qpos`、实际 `qpos_cmd`、是否 joint limit clip、是否 delta limit、SDK code 和 timestamp。对模仿学习/VLA 真机部署很关键。
-
-### 3.2 P1：数据采集与策略部署接口
-
-1. **episode recorder**  
-   将 `get_state()`、action、图像、外部 tactile/force 数据按 timestamp 对齐保存。
-
-2. **统一 observation/action schema**  
-   给 policy 明确固定字段，例如：
-
-   ```python
-   obs = {
-       "qpos": ..., 
-       "qvel": ..., 
-       "tau": ...,
-       "image": ...,
-       "timestamp": ...,
-   }
-   ```
-
-3. **action postprocessor**  
-   将 policy 输出统一转换为绝对关节角：
-
-   ```text
-   policy output -> denormalize -> IK or joint target -> send_action(qpos)
-   ```
-
-4. **频率监控**  
-   记录实际控制频率、最大周期抖动、连续丢帧次数。servoj 对轨迹平滑和发送频率敏感，这部分后续应该显式监控。
-
-### 3.3 P2：硬件扩展
-
-1. **夹爪 / 灵巧手接口**  
-   如果后续接 Robotiq、xArm gripper 或 XHand，不建议塞进 `send_action(qpos)`；更建议新增：
-
-   ```python
-   get_gripper_state()
-   send_gripper_action(action)
-   ```
-
-2. **外部 IK 模块集成**  
-   当前 `xarm7.py` 不负责 IK。后续可以写独立模块：
-
-   ```text
-   custom_tcp_pose -> IK -> qpos -> xarm7.send_action(qpos)
-   ```
-
-   保持 `xarm7.py` 只负责硬件 joint control。
-
-3. **相机/触觉/力传感器同步**  
-   建议不要直接塞进 `xarm7.py`；可以做一个上层 `RobotSystem`，统一管理：
-
-   ```text
-   XArm7 + Camera + Tactile + Gripper
-   ```
-
-4. **安全边界与自碰撞检查**  
-   当前只有关节角限位和单步速度限制。后续可以增加基于 URDF/Pinocchio 的 self-collision check，或至少增加 workspace / forbidden zone 检查。
-
-### 3.4 不建议马上实现的内容
-
-以下内容暂时不建议并入 `xarm7.py`：
-
-- Cartesian action
-- TCP pose 读取
-- SDK 内置 IK
-- shared memory
-- 复杂 action 类型：delta pose、velocity、torque
-- 夹爪和相机强耦合
-
-当前文件的价值在于：**小、清晰、只做 xArm7 关节空间真机控制**。复杂能力应该放在上层模块，避免底层硬件接口变得臃肿。
+- [quest.md](quest.md) — VR 遥操作输入（Quest hand tracking、arm wrist mapping、hand retargeting）
+- [xhand.md](xhand.md) — XHand 灵巧手硬件控制与 API
+- [realsense.md](realsense.md) — RealSense 相机驱动与点云工具
+- [CLAUDE.md](../CLAUDE.md) — 项目接口规范（RobotInterface、安全约束、架构总览）
 
 ---
 

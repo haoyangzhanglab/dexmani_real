@@ -30,7 +30,7 @@
 | 文件 | 角色 |
 |------|------|
 | `sensor/realsense.py` | RealSense 驱动：`start()→read()→CameraFrame→stop()` |
-| `sensor/pointcloud_utils.py` | 纯函数：`rgbd_to_pointcloud()` 及采样/过滤/变换 |
+| `utils/pointcloud_utils.py` | 纯函数：`rgbd_to_pointcloud()` 及采样/过滤/变换 |
 | `utils/camera_calib.py` | `CameraCalib`：从 `config/calib/cameras.json` 加载内参+外参 |
 | `config/calib/cameras.json` | 标定文件 (eye_to_hand 或 eye_in_hand) |
 

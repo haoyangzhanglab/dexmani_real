@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from .planner_types import Pose, XArm7PlannerConfig
+from .planner_types import Pose
 from .pose_utils import compose_pose, compute_pose_error, ensure_qpos, invert_pose
 
 
@@ -20,7 +20,6 @@ class XArm7Kinematics:
         joint_limits: np.ndarray,
         equivalent_joint_mask: np.ndarray,
         base_pose_world: Pose,
-        config: XArm7PlannerConfig,
         mp: Any,
     ) -> None:
         self.mp_planner = mp_planner
@@ -31,7 +30,6 @@ class XArm7Kinematics:
         self.equivalent_joint_mask = equivalent_joint_mask
         self.base_pose_world = base_pose_world.copy()
         self.base_pose_inverse = invert_pose(self.base_pose_world)
-        self.config = config
         self.mp = mp
 
     def set_base_pose(self, base_pose_world: Pose) -> None:
@@ -75,12 +73,6 @@ class XArm7Kinematics:
 
     def compute_world_pose_error(self, target_eef_pose_world: Pose, qpos: np.ndarray) -> tuple[float, float]:
         return compute_pose_error(target_eef_pose_world, self.compute_eef_pose_world(qpos))
-
-    def find_link_id(self, link_name: str) -> int:
-        names = list(self.pinocchio_model.get_link_names())
-        if link_name not in names:
-            raise ValueError(f"Link {link_name!r} not found. Available links: {names}")
-        return int(names.index(link_name))
 
     def to_mplib_pose(self, pose: Pose) -> Any:
         return self.mp.Pose(p=pose.p, q=pose.q)

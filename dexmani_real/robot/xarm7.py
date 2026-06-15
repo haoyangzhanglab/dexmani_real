@@ -45,10 +45,6 @@ class XArm7:
         self.last_joint_limit_clipped = False
         self.last_delta_limited = False
 
-    # ------------------------------------------------------------------
-    # 生命周期
-    # ------------------------------------------------------------------
-
     def connect(self) -> bool:
         if self.connected_flag and self.arm is not None:
             return True
@@ -63,7 +59,7 @@ class XArm7:
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self._set_servo_mode()
+        self._set_mode(1)
 
         state = self.get_state()
         if np.all(np.isfinite(state["qpos"])):
@@ -101,22 +97,17 @@ class XArm7:
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self._set_servo_mode()
+        self._set_mode(1)
         self.error_state = False
         self.last_error_message = ""
         return self.arm.error_code == 0
 
     def stop(self) -> bool:
-        """硬件急停。set_state(4) 进入 emergency stop 状态。"""
         if self.arm is None:
             return False
         code = self.arm.set_state(4)
         self.error_state = True
         return code == 0
-
-    # ------------------------------------------------------------------
-    # 状态读取
-    # ------------------------------------------------------------------
 
     def get_state(self, full: bool = False) -> dict[str, Any]:
         code, states = self.arm.get_joint_states(is_radian=True, num=3)
@@ -174,7 +165,7 @@ class XArm7:
         qpos_cmd = self._limit_joint_step(target_qpos)
 
         if self.arm.mode != 1:
-            self._set_servo_mode()
+            self._set_mode(1)
 
         code = self.arm.set_servo_angle_j(angles=qpos_cmd.tolist(), is_radian=True)
         self.last_action_code = code
@@ -190,7 +181,7 @@ class XArm7:
 
     def reset(self, target: np.ndarray | None = None) -> bool:
         qpos = self.config.init_qpos if target is None else np.asarray(target, dtype=np.float64).reshape(7)
-        self._set_position_mode()
+        self._set_mode(0)
         code = self.arm.set_servo_angle(
             angle=qpos.tolist(),
             speed=self.config.reset_speed,
@@ -198,7 +189,7 @@ class XArm7:
             is_radian=True,
             wait=True,
         )
-        self._set_servo_mode()
+        self._set_mode(1)
 
         state = self.get_state()
         if np.all(np.isfinite(state["qpos"])):
@@ -209,16 +200,8 @@ class XArm7:
         self.last_action_code = code
         return code == 0
 
-    # ------------------------------------------------------------------
-    # 内部方法
-    # ------------------------------------------------------------------
-
-    def _set_servo_mode(self):
-        self.arm.set_mode(1)
-        self.arm.set_state(0)
-
-    def _set_position_mode(self):
-        self.arm.set_mode(0)
+    def _set_mode(self, mode: int):
+        self.arm.set_mode(mode)
         self.arm.set_state(0)
 
     def _read_qpos(self) -> np.ndarray:
@@ -267,10 +250,6 @@ class XArm7:
         out[: arr.size] = arr
         return out
 
-
-# ------------------------------------------------------------------
-# 工具函数
-# ------------------------------------------------------------------
 
 def _print_state(state: dict[str, Any]):
     for key, value in state.items():

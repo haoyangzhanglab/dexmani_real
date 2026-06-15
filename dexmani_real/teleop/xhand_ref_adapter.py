@@ -5,7 +5,7 @@ EPS = 1e-8
 PINKY = (17, 18, 19, 20)
 
 
-def scale_chain(src, dst, ids, scale):
+def _scale_chain(src, dst, ids, scale):
     p0 = src[ids[0]]
     p1 = src[ids[1]]
     p2 = src[ids[2]]
@@ -84,7 +84,7 @@ class XHandRefAdapter:
             ratio = 0.0
 
         scale = self.pinky_scale[0] + (self.pinky_scale[1] - self.pinky_scale[0]) * ratio
-        scale_chain(hand, mapped_hand, PINKY, scale)
+        _scale_chain(hand, mapped_hand, PINKY, scale)
 
         length = self.chain_length(hand, PINKY)
         straightness = extension / length if length > EPS else 0.0

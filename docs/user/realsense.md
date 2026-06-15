@@ -1,6 +1,8 @@
 # RealSense 单相机驱动与点云工具使用说明
 
-本文档对应当前项目中的 `realsense.py` 与 `pcd_utils.py` 设计。整体风格与 `xarm7.py`、`xhand.py` 保持一致：硬件驱动层尽量轻量、接口显式、默认状态简单、调试信息通过 `full=True` 返回，点云构造放在独立工具层。
+> **相关文档**：L515 SDK 编译安装见 [L515 SDK.md](L515%20SDK.md)。
+
+本文档对应当前项目中的 `realsense.py` 与 `pointcloud_utils.py` 设计。整体风格与 `xarm7.py`、`xhand.py` 保持一致：硬件驱动层尽量轻量、接口显式、默认状态简单、调试信息通过 `full=True` 返回，点云构造放在独立工具层。
 
 ---
 
@@ -28,7 +30,7 @@ pip install pyrealsense2 numpy
 
 如果只使用 `realsense.py`，不需要安装 `torch`、`open3d` 或 `opencv-python`。这些依赖只与点云采样、可视化或调试工具有关。
 
-如果需要使用 `pcd_utils.py` 中的可视化功能，再安装：
+如果需要使用 `pointcloud_utils.py` 中的可视化功能，再安装：
 
 ```bash
 pip install open3d opencv-python
@@ -101,7 +103,7 @@ RealSenseCamera
     输入：相机配置
     输出：color / depth / timestamp / intrinsics / depth_scale
 
-pcd_utils.py
+pointcloud_utils.py
     输入：depth + K + color + transform
     输出：point cloud
 ```
@@ -169,7 +171,7 @@ class RealSenseConfig:
 align_mode="depth_to_color"
 ```
 
-这样 `state["color"]` 与 `state["depth"]` 的图像尺寸一致，`pcd_utils.rgbd_to_pointcloud()` 才能直接使用 RGB 作为点颜色。
+这样 `state["color"]` 与 `state["depth"]` 的图像尺寸一致，`pointcloud_utils.rgbd_to_pointcloud()` 才能直接使用 RGB 作为点颜色。
 
 ### 2.4 主要 API
 
@@ -338,18 +340,18 @@ if state.get("stale", False):
 
 ---
 
-## 3. `pcd_utils.py` 点云工具用法
+## 3. `pointcloud_utils.py` 点云工具用法
 
 ### 3.1 设计定位
 
-`pcd_utils.py` 负责纯几何变换，不关心数据来自 RealSense、仿真还是离线数据集。RealSense 驱动不应该直接 import `pcd_utils.py`，点云构造由上层显式调用。
+`pointcloud_utils.py` 负责纯几何变换，不关心数据来自 RealSense、仿真还是离线数据集。RealSense 驱动不应该直接 import `pointcloud_utils.py`，点云构造由上层显式调用。
 
 推荐调用链：
 
 ```text
 RealSenseCamera.get_state(full=True)
     -> color / depth / K / transform
-pcd_utils.rgbd_to_pointcloud(...)
+pointcloud_utils.rgbd_to_pointcloud(...)
     -> pointcloud, shape (N, 6), xyzrgb
 ```
 
@@ -381,7 +383,7 @@ class PointCloudConfig:
 ### 3.3 RGB-D 转点云
 
 ```python
-from pcd_utils import PointCloudConfig, rgbd_to_pointcloud
+from dexmani_real.utils.pointcloud_utils import PointCloudConfig, rgbd_to_pointcloud
 
 state = cam.get_state(full=True)
 
@@ -415,13 +417,13 @@ pointcloud[:, 3:6] = rgb, range = [0, 1]
 
 ```text
 realsense.py 输出的 state["depth"] 已经是 meters
-pcd_utils.rgbd_to_pointcloud() 默认 depth 输入也是 meters
+pointcloud_utils.rgbd_to_pointcloud() 默认 depth 输入也是 meters
 ```
 
 如果你只有 RealSense 原始 Z16 深度图，应显式传入 `depth_scale`：
 
 ```python
-from pcd_utils import depth_raw_to_meters
+from dexmani_real.utils.pointcloud_utils import depth_raw_to_meters
 
 depth = depth_raw_to_meters(depth_raw, depth_scale)
 ```
@@ -458,7 +460,7 @@ T_out_camera = T_base_camera:
 ### 3.6 点云可视化
 
 ```python
-from pcd_utils import vis_point_cloud
+from dexmani_real.utils.pointcloud_utils import vis_point_cloud
 
 vis_point_cloud(pcd, voxel_size=0.005)
 ```
@@ -517,68 +519,85 @@ cam.connect()
 
 ---
 
-## 5. 后续需要实现的功能
+## 5. L515 材质、光照与对象选择
 
-当前阶段只实现单相机驱动和点云工具。后续可以按以下顺序扩展：
+> 本节内容从 L515 SDK.md 迁移。L515 是 LiDAR depth camera，适合反射较稳定、表面偏漫反射的物体。
 
-### 5.1 `multi_realsense.py`
+### 5.1 不适合的材质
 
-用于管理多个 `RealSenseCamera` 实例：
+| 材质/表面 | 问题 | 建议 |
+|-----------|------|------|
+| 透明玻璃、透明塑料、亚克力、水杯 | 深度可能穿透、缺失或落到背景上 | 不作为初期主训练对象；可贴哑光胶带或换哑光替代物 |
+| 镜面金属、亮面陶瓷、反光桌面 | 入射光不一定反射回相机，深度空洞或跳变 | 改用哑光表面，调整视角 |
+| 黑色/深色低反射物体 | 反射信号弱，深度噪声增加 | 换浅色物体，增加辅助标记 |
+| 高光塑料包装、保鲜膜、塑料袋 | 透明 + 高光，深度和分割都不稳定 | 不建议作为早期学习对象 |
+| 毛巾、衣物、软袋 | 形变大，3D 状态难定义 | 需要单独的柔性物体策略 |
+| 细杆、细线、薄片边缘 | 点云稀疏，边缘容易断裂 | 近距离、多视角、避免作为关键抓取依据 |
 
-```text
-MultiRealSense
-    connect()
-    disconnect()
-    get_state(full=False) -> dict[str, dict]
-```
+### 5.2 不适合的光照
 
-注意：多相机状态应按相机名分组，不要写死 `front/right` 这类固定字段。
+| 场景光 | 问题 | 建议 |
+|--------|------|------|
+| 太阳直射、窗边强日光 | 环境红外会降低深度质量 | 避开窗户，拉窗帘，使用稳定室内光 |
+| LED/PWM 灯频闪 | RGB 画面可能出现水波纹、滚动暗带 | 设置 Power Line Frequency 为 50Hz 或 60Hz |
+| 强背光 | RGB 曝光和白平衡漂移 | 光源放在相机同侧或侧前方 |
+| 反光背景 | 深度和 RGB 都不稳定 | 使用哑光背景板和哑光桌面 |
+| 频繁变化光照 | 训练数据分布漂移 | 固定灯光、曝光、白平衡 |
 
-### 5.2 异步采集与 latest-frame buffer
+### 5.3 不适合的对象
 
-后续如需高频控制，可以把每个相机放入线程或进程中采集。推荐 latest-frame 语义：只保留最新帧，旧帧自动丢弃，不使用无限队列堆积旧观测。
+| 对象 | 问题 | 建议 |
+|------|------|------|
+| 透明杯子、玻璃瓶 | 深度不可依赖 | 初期不要作为主要操作对象 |
+| 镜面工具、金属杯 | 点云跳变、空洞 | 贴哑光胶带或换物体 |
+| 黑色小零件 | 深度缺失概率高 | 换颜色或增加视觉标记 |
+| 高反光包装盒 | 分割和深度都不稳定 | 使用哑光替代物 |
+| 软袋、毛巾、衣物 | 状态空间复杂 | 后期单独建模 |
+| 细小零件 | L515 点云分辨率和空洞影响定位 | 近距离、多视角、提高质量筛选 |
 
-### 5.3 多相机点云融合
-
-多相机融合不应放进 `RealSenseCamera`。建议独立实现：
-
-```text
-pointcloud_observation.py
-    build_multiview_pointcloud(camera_states)
-    merge_pointclouds(...)
-    crop_workspace(...)
-    sample_fixed_points(...)
-```
-
-### 5.4 数据录制模块
-
-数据录制应独立为 `realsense_recorder.py`，不要放进相机驱动。建议录制：
-
-```text
-color
- depth
-depth_raw
-K
-transform
-timestamp
-camera_name
-serial_number
-```
-
-### 5.5 可视化模块
-
-OpenCV/Open3D 可视化建议独立为：
-
-```text
-realsense_viewer.py
-pointcloud_viewer.py
-```
-
-不要让实时硬件驱动默认依赖 GUI 库。
+L515 有最小有效深度距离，过近物体不可靠。实际机器人操作中建议让目标处于约 `0.35 m ~ 1.2 m` 的稳定工作范围。
 
 ---
 
-## 6. 设计原则回顾
+## 6. 3D 模仿学习数据采集建议
+
+### 6.1 固定相机-机器人关系
+
+必须稳定保存并复用：camera intrinsics、camera extrinsics (`camera_to_robot_base` 或 `camera_to_ee`)、depth scale、RGB-D 对齐方式、分辨率、FPS、桌面高度、物体初始区域、光照配置。建议每次任务开始前保存一次相机状态，采集中每帧保存时间戳。
+
+### 6.2 不要让策略学习坏深度
+
+坏深度会导致：抓取点错误、物体中心漂移、点云空洞、接触前距离估计错误、轨迹回放碰撞、策略学到错误 affordance。
+
+建议过滤：`depth == 0` 的点、`< 0.25 m` 的点、`> 任务最大距离` 的点（如 `> 1.5 m`）、confidence 低的点、mask 外的点、反光边缘离群点。
+
+### 6.3 固定 RGB 设置
+
+为了减少视觉分布漂移，建议固定：Power Line Frequency（中国大陆 50Hz；北美 60Hz）、White Balance Auto: Off、Auto Exposure: Off（稳定采集时）、Color/Depth resolution、FPS。
+
+如果 RGB 像水波一样波动，优先检查 `Power Line Frequency`，而不是 SDK 安装。
+
+### 6.4 采集任务从易到难
+
+1. 哑光、浅色、刚体、大物体
+2. 不同颜色、不同形状刚体
+3. 轻微反光物体
+4. 小物体、细长物体、多物体遮挡
+5. 透明、高反光、软体物体
+
+早期不要直接使用：透明杯子、玻璃瓶、镜面金属、黑色小零件、塑料袋、毛巾衣物——否则很难区分是感知失败还是策略失败。
+
+### 6.5 保留失败样本，标注失败原因
+
+失败原因建议分为：`depth_missing`、`segmentation_error`、`gripper_slip`、`collision`、`occlusion`、`operator_error`、`object_moved`、`lighting_failure`、`calibration_drift`。训练时可以先只用成功样本；调试和后续提升时再使用失败样本做筛选、分类或数据增强。
+
+### 6.6 单视角和多视角建议
+
+单个 L515 推荐放置在斜上方 30°~60°，能看到桌面、目标物体和夹爪，不正对窗户/镜面反光面，尽量不被机械臂长期遮挡。如果条件允许，建议加一个辅助相机（主视角：策略输入；辅助视角：标注、调试、遮挡补偿）。
+
+---
+
+## 7. 设计原则回顾
 
 `xarm7.py`、`xhand.py`、`realsense.py` 应保持一致的工程风格：
 
@@ -613,13 +632,13 @@ full=True 返回调试和几何信息
 
 ```text
 RealSenseCamera 负责把 RGB-D 与标定信息稳定读出来；
-pcd_utils 负责把 RGB-D 转成点云；
+pointcloud_utils 负责把 RGB-D 转成点云；
 策略模块再决定如何 crop、sample、merge、normalize。
 ```
 
 ---
 
-## 7. 参考资料
+## 8. 参考资料
 
 - Intel RealSense SDK 2.0 / librealsense GitHub: https://github.com/realsenseai/librealsense
 - pyrealsense2 Python package: https://pypi.org/project/pyrealsense2/

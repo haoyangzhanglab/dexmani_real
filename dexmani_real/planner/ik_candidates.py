@@ -218,19 +218,12 @@ class IKCandidateManager:
             limits[joint_index, 1] = min(hardware_high, local_high)
         return limits
 
-    def nearest_equivalent_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        qpos = ensure_qpos(qpos, self.dof, "qpos")
-        reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
-        result = qpos.copy()
-        mask = self.equivalent_joint_mask
+    def _periods(self) -> np.ndarray:
         joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
-        periods = np.where(mask, np.minimum(2.0 * np.pi, joint_ranges), 1.0)
-        low, high = self.joint_limits[:, 0], self.joint_limits[:, 1]
-        k = np.round((reference_qpos[mask] - result[mask]) / periods[mask])
-        k_min = np.ceil((low[mask] - result[mask]) / periods[mask])
-        k_max = np.floor((high[mask] - result[mask]) / periods[mask])
-        result[mask] += np.clip(k, k_min, k_max) * periods[mask]
-        return result
+        return np.where(self.equivalent_joint_mask, np.minimum(2.0 * np.pi, joint_ranges), 1.0)
+
+    def nearest_equivalent_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
+        return self.canonicalize_qpos(qpos, reference_qpos, limits=self.joint_limits, limit_tol=0.0)
 
     def canonicalize_qpos(
         self,
@@ -245,8 +238,7 @@ class IKCandidateManager:
             limits = self.joint_limits
         result = qpos.copy()
         mask = self.equivalent_joint_mask
-        joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
-        periods = np.where(mask, np.minimum(2.0 * np.pi, joint_ranges), 1.0)
+        periods = self._periods()
         low, high = limits[:, 0], limits[:, 1]
 
         k_min = np.ceil((low[mask] - result[mask] - limit_tol) / periods[mask])
@@ -285,11 +277,9 @@ class IKCandidateManager:
         qpos = ensure_qpos(qpos, self.dof, "qpos")
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
         delta = qpos - reference_qpos
-        mask = self.equivalent_joint_mask
-        joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
-        periods = np.where(mask, np.minimum(2.0 * np.pi, joint_ranges), 1.0)
-        half = periods[mask] / 2.0
-        delta[mask] = (delta[mask] + half) % periods[mask] - half
+        periods = self._periods()
+        half = periods[self.equivalent_joint_mask] / 2.0
+        delta[self.equivalent_joint_mask] = (delta[self.equivalent_joint_mask] + half) % periods[self.equivalent_joint_mask] - half
         return delta
 
     # --- Limit checking ---

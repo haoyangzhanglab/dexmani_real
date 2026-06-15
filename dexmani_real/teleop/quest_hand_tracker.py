@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 import numpy as np
-from dexmani_real.robot.planner.pose_utils import xyzw_to_wxyz
+from dexmani_real.planner.pose_utils import xyzw_to_wxyz
 from hand_tracking_sdk import (
     ErrorPolicy,
     HandFilter,

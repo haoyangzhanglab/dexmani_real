@@ -17,6 +17,8 @@
 > - `sdk-dependencies.md` — 外部 SDK 版本/API/陷阱速查（xArm/XHand/HTS/dex-retargeting/MPlib/SAPIEN）
 >
 > 本文档是权威参考（含完整的接口签名和数据流），规则文件是精简的行动指南。两者冲突时以本文档为准。
+>
+> **用户文档**：`docs/user/` 目录包含硬件安装、SDK 编译、驱动 API 及遥操作模块的使用说明（xArm7、XHand、RealSense、L515、Quest VR）。
 
 ## 0. 项目架构速览
 

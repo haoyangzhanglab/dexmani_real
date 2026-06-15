@@ -1,25 +1,115 @@
 # VR Teleoperation Input Utilities Guide
 
-本文档对应三个轻量模块：
+本文档对应五个轻量模块：
 
 ```text
 quest_hand_tracker.py       # Quest/HTS 数据接收：wrist pose + 21 landmarks
 arm_wrist_mapper.py         # VR wrist 相对运动 -> target EEF pose
 quest_hand_visualizer.py    # Rerun 可视化：wrist、landmarks、骨架、腕部坐标轴
+hand_retarget.py            # dex-retargeting: 21 landmarks → 12 DOF XHand 关节角
+xhand_ref_adapter.py        # LeFranX 风格小指参考自适应适配器
 ```
 
-设计目标：输入层简单、接口稳定、robot-agnostic。当前版本不包含 IK、不包含 XHand retargeting、不发送机器人控制命令。
+设计目标：输入层简单、接口稳定、robot-agnostic。当前版本不包含 IK、不发送机器人控制命令。
+
+> **相关文档**：XHand 硬件控制见 [xhand.md](xhand.md)，xArm7 硬件控制见 [xarm7.md](xarm7.md)，手部重定向与 retargeting 配置见本文档 Section 6。
 
 ---
 
+## 1. 前置条件: ADB 连接与调试
 
-## 0. 小键盘说明书
-https://docs.qq.com/doc/DRG9DYmtqbVhwZkZH
+### 1.1 目标状态
 
+连接成功后执行 `adb devices -l` 应看到：
 
-## 1. 软件安装与通信连接
+```text
+340YC10GCD0RZV    device usb:2-1 product:xxx model:xxx device:xxx transport_id:1
+```
 
-### 1.1 Python 依赖
+关键字段是 `device`。常见异常状态：`no permissions`（Linux/udev 权限问题）、`unauthorized`（Quest 未授权 ADB RSA key）、`offline`（需重启 adb server 或重新插拔 USB）。
+
+### 1.2 前置条件
+
+**Quest 侧**：Meta 账号已启用开发者身份、已开启 Developer Mode、使用支持数据传输的 USB-C 线（不要只用充电线）、头显保持开机/解锁/亮屏、首次连接时在头显中允许 USB debugging（推荐选 "Always allow from this computer"）。
+
+**Ubuntu/Debian 侧**：
+
+```bash
+sudo apt update
+sudo apt install adb android-sdk-platform-tools-common
+```
+
+确认当前用户在 `plugdev` 组：
+
+```bash
+groups
+# 如果没有 plugdev，执行 sudo usermod -aG plugdev $USER，然后重新登录
+```
+
+### 1.3 一键检查流程
+
+```bash
+# 1. 安装 adb 和常见 udev rules
+sudo apt update
+sudo apt install adb android-sdk-platform-tools-common
+
+# 2. 清理 adb
+sudo pkill adb || true
+adb kill-server
+
+# 3. 插上 Quest 后检查
+lsusb
+adb start-server
+adb devices -l
+```
+
+如果出现 `no permissions`，添加 udev rule（vendor id 通常为 `2833`）：
+
+```bash
+sudo tee /etc/udev/rules.d/51-android-local.rules > /dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="2833", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+EOF
+
+sudo chmod a+r /etc/udev/rules.d/51-android-local.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo systemctl restart udev
+
+adb kill-server
+adb start-server
+adb devices -l
+```
+
+然后拔插 USB，并在 Quest 中允许 USB debugging。
+
+### 1.4 连接状态速查
+
+| adb 状态 | 含义 | 下一步 |
+|----------|------|--------|
+| 无设备 | 系统没识别到 USB 设备 | 换线、换口、检查 Quest 是否开机 |
+| `no permissions` | Linux udev 权限未匹配 | 添加 udev rule |
+| `unauthorized` | Quest 未授权 ADB RSA key | 在头显里允许 USB debugging |
+| `offline` | adb server / 设备状态异常 | 重启 adb server，重新插拔 |
+| `device` | 正常 | 可以跑 SDK、安装 APK、看 logcat |
+
+### 1.5 常用 ADB 命令
+
+```bash
+adb devices -l                          # 查看设备列表
+adb shell getprop ro.product.model      # 查看设备型号
+adb shell                               # 进入设备 shell
+adb install -r path/to/app.apk          # 安装 APK
+adb logcat | grep -iE "hand|tracking"   # 查看 hand tracking 日志
+adb logcat -d > quest_logcat.txt        # 截取日志到文件
+```
+
+**注意**：不要长期使用 `sudo adb`——可能启动 root 用户的 adb server，导致后续普通用户调用 SDK 时状态不一致。如果已误用，执行：`sudo pkill adb || true && adb kill-server && adb start-server`，并 `sudo chown -R $USER:$USER ~/.android` 修复本地 adb key 权限。
+
+---
+
+## 2. 软件安装与通信连接
+
+### 2.1 Python 依赖
 
 基础依赖：
 
@@ -39,7 +129,7 @@ pip install rerun-sdk
 pip install "hand-tracking-sdk[visualization]"
 ```
 
-### 1.2 Quest 端 App
+### 2.2 Quest 端 App
 
 需要在 Meta Quest 上运行 **Hand Tracking Streamer / HTS**。该 App 会将以下数据流式发送到 PC：
 
@@ -50,7 +140,7 @@ pip install "hand-tracking-sdk[visualization]"
 
 当前代码推荐使用 **TCP server** 模式：PC 端监听 `0.0.0.0:8000`，Quest/HTS 主动发送数据。
 
-### 1.3 USB wired TCP / ADB reverse
+### 2.3 USB wired TCP / ADB reverse
 
 推荐先用 USB + ADB reverse 调试，稳定性更高。
 
@@ -81,7 +171,7 @@ tracker = QuestHandTracker(
 )
 ```
 
-### 1.4 Wireless TCP / UDP
+### 2.4 Wireless TCP / UDP
 
 无线模式下，Quest/HTS 端 `Host` 应填写 PC 的局域网 IPv4 地址，例如：
 
@@ -101,9 +191,9 @@ Port: 8000
 
 ---
 
-## 2. 文件说明
+## 3. 文件说明
 
-### 2.1 `quest_hand_tracker.py`
+### 3.1 `quest_hand_tracker.py`
 
 职责：
 
@@ -127,7 +217,7 @@ clutch / recenter
 数据录制
 ```
 
-### 2.2 `arm_wrist_mapper.py`
+### 3.2 `arm_wrist_mapper.py`
 
 职责：
 
@@ -145,7 +235,7 @@ map 时根据 wrist 相对 reset 的运动输出 target_eef_pose
 }
 ```
 
-### 2.3 `quest_hand_visualizer.py`
+### 3.3 `quest_hand_visualizer.py`
 
 职责：
 
@@ -154,11 +244,34 @@ map 时根据 wrist 相对 reset 的运动输出 target_eef_pose
 显示 wrist 点、landmarks、手部骨架、可选 wrist 坐标轴
 ```
 
+### 3.4 `hand_retarget.py`
+
+职责：
+
+```text
+加载 dex-retargeting RetargetingConfig (DexPilot)
+接收 21 个 MediaPipe hand landmarks
+输出 12 DOF XHand 关节角
+处理 retargeting → sapien 关节顺序映射
+```
+
+不负责：VR 数据接收、机器人控制、数据录制。
+
+### 3.5 `xhand_ref_adapter.py`
+
+职责：
+
+```text
+LeFranX 风格小指参考适配器
+动态调整 retargeting 的 pinky reference 值
+根据当前拇指-食指距离自适应调整小指姿态
+```
+
 ---
 
-## 3. 关键参数物理意义与默认值
+## 4. 关键参数物理意义与默认值
 
-### 3.1 `QuestHandTracker`
+### 4.1 `QuestHandTracker`
 
 | 参数              |         默认值 | 物理/工程含义                                                |
 | ----------------- | -------------: | ------------------------------------------------------------ |
@@ -171,7 +284,7 @@ map 时根据 wrist 相对 reset 的运动输出 target_eef_pose
 | `strict`          |        `False` | SDK 错误策略。调试阶段推荐 tolerant。                        |
 | `verbose`         |        `False` | 是否打印简短连接信息。                                       |
 
-### 3.2 `ArmWristMapper`
+### 4.2 `ArmWristMapper`
 
 | 参数               |      默认值 | 物理/工程含义                                                |
 | ------------------ | ----------: | ------------------------------------------------------------ |
@@ -198,7 +311,7 @@ target_eef_pos - reset_eef_pos
 
 会被限制在这个 box 内。
 
-### 3.3 `QuestHandVisualizer`
+### 4.3 `QuestHandVisualizer`
 
 | 参数           |               默认值 | 含义                        |
 | -------------- | -------------------: | --------------------------- |
@@ -211,9 +324,9 @@ target_eef_pos - reset_eef_pos
 
 ---
 
-## 4. 主要 API 接口与返回值定义
+## 5. 主要 API 接口与返回值定义
 
-### 4.1 `QuestHandTracker.connect()`
+### 5.1 `QuestHandTracker.connect()`
 
 启动后台接收线程。
 
@@ -223,7 +336,7 @@ tracker.connect()
 
 重复调用不会重复启动。
 
-### 4.2 `QuestHandTracker.disconnect()`
+### 5.2 `QuestHandTracker.disconnect()`
 
 停止后台接收线程并释放本地状态。
 
@@ -231,7 +344,7 @@ tracker.connect()
 tracker.disconnect()
 ```
 
-### 4.3 `QuestHandTracker.get_latest(max_age_s=None)`
+### 5.3 `QuestHandTracker.get_latest(max_age_s=None)`
 
 非阻塞读取 latest frame。
 
@@ -263,7 +376,7 @@ frame schema：
 }
 ```
 
-### 4.4 `QuestHandTracker.read(timeout_s=1.0)`
+### 5.4 `QuestHandTracker.read(timeout_s=1.0)`
 
 阻塞等待新 frame。
 
@@ -280,7 +393,7 @@ frame = tracker.read(timeout_s=1.0)
 
 注意：`read()` 会根据 `(sequence_id, recv_ts_ns)` 避免重复返回同一帧。
 
-### 4.5 `QuestHandTracker.get_status()`
+### 5.5 `QuestHandTracker.get_status()`
 
 返回状态诊断 dict。
 
@@ -311,7 +424,7 @@ status = tracker.get_status()
 }
 ```
 
-### 4.6 `ArmWristMapper.reset(...)`
+### 5.6 `ArmWristMapper.reset(...)`
 
 记录当前 wrist pose 和当前 robot EEF pose，作为后续相对映射的零点。
 
@@ -326,7 +439,7 @@ mapper.reset(
 
 必须先 reset，才能调用 `map()` 得到有效输出。
 
-### 4.7 `ArmWristMapper.map(...)`
+### 5.7 `ArmWristMapper.map(...)`
 
 将当前 wrist pose 映射为 target EEF pose。
 
@@ -348,7 +461,7 @@ None | {
 
 如果没有 reset，返回 `None`。
 
-### 4.8 `QuestHandVisualizer.log_frame(frame)`
+### 5.8 `QuestHandVisualizer.log_frame(frame)`
 
 将 frame 可视化到 Rerun。
 
@@ -358,9 +471,64 @@ visualizer.log_frame(frame)
 
 ---
 
-## 5. 推荐使用流程
+## 6. `hand_retarget.py` 使用说明
 
-### 5.1 仅验证 Quest 数据
+`hand_retarget.py` 基于 dex-retargeting 的 DexPilot 优化器，将 21 个 MediaPipe hand landmarks 映射为 12 DOF XHand 关节角。
+
+### 6.1 `XHandRetargeter`
+
+```python
+from dexmani_real.teleop.hand_retarget import XHandRetargeter
+
+retargeter = XHandRetargeter(
+    hand_type="right",
+    retargeting_type="dexpilot",
+    enable_ref_adapter=True,
+    pinky_extension_range=(0.03, 0.07),
+    pinky_scale=(1.2, 2.2),
+    pinky_blend=1.0,
+)
+```
+
+参数：
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `hand_type` | `"right"` | 手型：`"right"` 或 `"left"` |
+| `retargeting_type` | `"dexpilot"` | 优化器类型：`"dexpilot"`（VR 遥操作）或 `"position"`（数据集后处理） |
+| `enable_ref_adapter` | `True` | 是否启用 LeFranX 风格小指参考适配器 |
+| `pinky_extension_range` | `(0.03, 0.07)` | 小指伸展检测的拇指-食指距离范围 (m) |
+| `pinky_scale` | `(1.2, 2.2)` | 小指 landmark 缩放范围 |
+| `pinky_blend` | `1.0` | 小指自适应混合权重 |
+
+### 6.2 `retarget(hand_joint_pos) -> np.ndarray | None`
+
+输入 21 个手部 landmark 坐标（shape `(21, 3)`，单位 m），输出 12 DOF XHand 关节角（shape `(12,)`，单位 rad）。
+
+```python
+frame = tracker.get_latest()
+if frame is not None:
+    qpos = retargeter.retarget(frame["landmarks"])
+    # qpos: shape (12,), rad, XHand hardware order
+```
+
+返回 `None` 表示输入无效或 retargeting 失败。
+
+### 6.3 `XHandRefAdapter`（xhand_ref_adapter.py）
+
+小指参考适配器（LeFranX 风格），动态调整 retargeting 的 pinky reference 值：
+
+- 根据当前拇指指尖到食指指尖的距离判断小指是否伸展
+- 在小指伸展/弯曲时对 landmarks 17-20（pinky chain）做 scale 自适应
+- 通过 `pinky_blend` 与原始 reference 混合，避免姿态突变
+
+通常在 `XHandRetargeter` 内部自动启用，不需要单独调用。
+
+---
+
+## 7. 推荐使用流程
+
+### 7.1 仅验证 Quest 数据
 
 ```python
 from quest_hand_tracker import QuestHandTracker
@@ -374,7 +542,7 @@ with tracker:
             print(frame["wrist_pos"], frame["landmarks"].shape)
 ```
 
-### 5.2 可视化调试
+### 7.2 可视化调试
 
 ```python
 from quest_hand_tracker import QuestHandTracker
@@ -390,7 +558,7 @@ with tracker:
             visualizer.log_frame(frame)
 ```
 
-### 5.3 wrist -> target EEF pose
+### 7.3 wrist -> target EEF pose
 
 ```python
 import numpy as np
@@ -431,9 +599,9 @@ with tracker:
 
 ---
 
-## 6. 注意事项
+## 8. 注意事项
 
-### 6.1 四元数顺序
+### 8.1 四元数顺序
 
 项目内部统一使用：
 
@@ -451,7 +619,7 @@ quat_wxyz
 
 不要和 SDK 原始的 `xyzw` 顺序混用。
 
-### 6.2 坐标系
+### 8.2 坐标系
 
 默认输出：
 
@@ -475,7 +643,7 @@ vr_to_base_rot
 
 不要在 `QuestHandTracker` 里写 robot-specific 坐标变换。
 
-### 6.3 `ArmWristMapper` 必须 reset
+### 8.3 `ArmWristMapper` 必须 reset
 
 `ArmWristMapper` 使用 reset-relative mapping，不是 absolute mapping。必须先记录：
 
@@ -486,7 +654,7 @@ reset EEF pose
 
 然后才能把 wrist 相对运动映射为 target EEF pose。
 
-### 6.4 `get_latest()` 和 `read()` 不同
+### 8.4 `get_latest()` 和 `read()` 不同
 
 ```text
 get_latest(): 非阻塞，控制循环用，可能返回 None
@@ -495,7 +663,7 @@ read(): 阻塞等待新 frame，调试/初始化用
 
 控制循环建议用 `get_latest()`，不要让机器人控制因 VR 暂时断流而阻塞。
 
-### 6.5 当前代码不包含 robot safety policy
+### 8.5 当前代码不包含 robot safety policy
 
 当前代码只提供输入和几何目标，不负责最终机器人安全。真实机器人上还需要额外层处理：
 
@@ -511,7 +679,7 @@ emergency stop
 
 这些建议放到后续 `VRTeleopPolicy` 或 robot controller 层，不要塞进当前两个基础类。
 
-### 6.6 不建议用右手 pinch 做 clutch
+### 8.6 不建议用右手 pinch 做 clutch
 
 右手 landmarks 后续会用于 dex_retargeting 控制灵巧手。如果用右手 pinch 同时做 clutch，容易和真实抓取动作冲突。后续可以考虑：
 
@@ -524,10 +692,13 @@ Quest controller button
 
 ---
 
-## 7. 参考资料
+## 9. 参考资料
 
 - hand-tracking-sdk: https://github.com/wengmister/hand-tracking-sdk
 - Hand Tracking Streamer / Quest wrist tracker: https://github.com/wengmister/quest-wrist-tracker
+- dex-retargeting: https://github.com/dexsuite/dex-retargeting
+- vr-dex-retargeting: https://github.com/wengmister/vr-dex-retargeting
 - LeFranX: https://github.com/wengmister/LeFranX
 - LeVR paper: https://arxiv.org/abs/2509.14349
 - Rerun: https://github.com/rerun-io/rerun
+- 相关文档：[xarm7.md](xarm7.md) | [xhand.md](xhand.md) | [realsense.md](realsense.md)

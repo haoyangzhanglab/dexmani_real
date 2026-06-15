@@ -10,14 +10,6 @@ OPERATOR2MANO_RIGHT = np.array(
     ]
 )
 
-OPERATOR2MANO_LEFT = np.array(
-    [
-        [0, 0, -1],
-        [1, 0, 0],
-        [0, -1, 0],
-    ]
-)
-
 
 def estimate_frame_from_hand_points(keypoint_3d_array: np.ndarray) -> np.ndarray:
     """Estimate palm coordinate frame (3x3 rotation matrix) from 21 hand landmarks via SVD.

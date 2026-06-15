@@ -119,16 +119,11 @@ class XHand:
         self.last_jointboard_err = np.zeros(12, dtype=np.int32)
         self.last_tipboard_err = np.zeros(12, dtype=np.int32)
         self.last_hand_ids: list[int] = []
+        self.cached_comm_type = self._resolve_comm_type()
 
     def connect(self) -> bool:
-        if xh is None:
-            self.error_state = True
-            self.last_error_code = -1
-            self.last_error_message = "xhand_controller is not installed or cannot be imported"
-            return False
-
         self.control = xh.XHandControl()
-        comm_type = self.comm_type()
+        comm_type = self.cached_comm_type
 
         if self.config.device_name is None:
             devices = self.control.enumerate_devices(comm_type)
@@ -152,7 +147,7 @@ class XHand:
             return False
 
         if not self.error_ok(err):
-            self.save_error(err)
+            self._record_error(err)
             self.error_state = True
             return False
 
@@ -163,7 +158,7 @@ class XHand:
 
         self.connected_flag = True
         self.error_state = False
-        self.build_command()
+        self.hand_command = self.make_command(self._array12(self.config.home_qpos))
 
         # Critical fix:
         # Force-refresh real hardware state during connect.
@@ -184,7 +179,7 @@ class XHand:
             self.last_qpos_cmd = valid_state["qpos"].copy()
             print("Initial qpos from hand state:", self.last_qpos_cmd)
         else:
-            self.last_qpos_cmd = self.array12(self.config.home_qpos)
+            self.last_qpos_cmd = self._array12(self.config.home_qpos)
             print("Using home_qpos as initial qpos:", self.last_qpos_cmd)
 
         self.last_cmd_time = time.time()
@@ -225,10 +220,10 @@ class XHand:
         return self.control is not None and self.connected_flag
 
     def stop(self) -> bool:
-        if self.control is None:
+        if self.control is None or not self.connected_flag:
             return False
         command = self.make_command(
-            self.array12(self.config.home_qpos),
+            self._array12(self.config.home_qpos),
             mode=0,
             tor_max=0,
             kp=0,
@@ -239,12 +234,12 @@ class XHand:
         self.last_action_code = self.error_code(err)
         self.error_state = True
         if not self.error_ok(err):
-            self.save_error(err)
+            self._record_error(err)
             return False
         return True
 
     def reset(self, qpos: np.ndarray | None = None) -> bool:
-        target = self.array12(self.config.home_qpos if qpos is None else qpos)
+        target = self._array12(self.config.home_qpos if qpos is None else qpos)
         return self.send_action(target)
 
     def get_state(
@@ -258,7 +253,7 @@ class XHand:
         err, hand_state = self.read_raw_state(force_update=force_update)
 
         if not self.error_ok(err) or hand_state is None:
-            self.save_error(err)
+            self._record_error(err)
             self.error_state = True
             state = {
                 "qpos": np.full(12, np.nan, dtype=np.float64),
@@ -266,7 +261,7 @@ class XHand:
                 "timestamp": time.time(),
             }
             if full:
-                state.update(self.empty_full_state())
+                state.update(self._empty_state())
             return state
 
         state = self.parse_state(hand_state, full=full)
@@ -278,7 +273,7 @@ class XHand:
         if self.control is None or self.hand_command is None:
             return False
 
-        target_qpos = self.array12(action)
+        target_qpos = self._array12(action)
         qpos_after_limit = self._limit_joint_range(target_qpos)
         qpos_cmd = self._limit_joint_step(qpos_after_limit)
 
@@ -291,7 +286,7 @@ class XHand:
             self.last_cmd_time = time.time()
             return True
 
-        self.save_error(err)
+        self._record_error(err)
         self.error_state = True
         return False
 
@@ -303,12 +298,9 @@ class XHand:
         for sid in sensor_ids:
             err = self.control.reset_sensor(self.config.device_id, sid)
             if not self.error_ok(err):
-                self.save_error(err)
+                self._record_error(err)
                 ok = False
         return ok
-
-    def build_command(self):
-        self.hand_command = self.make_command(self.array12(self.config.home_qpos))
 
     def make_command(
         self,
@@ -344,14 +336,12 @@ class XHand:
     def write_command_positions(self, qpos: np.ndarray):
         for i in range(12):
             self.hand_command.finger_command[i].position = float(qpos[i])
-            self.hand_command.finger_command[i].mode = int(self.config.mode)
-            self.hand_command.finger_command[i].tor_max = int(self.config.tor_max)
 
     def read_raw_state(self, force_update: bool = False):
-        if self.control is None:
+        if self.control is None or not self.connected_flag:
             return None, None
         result = self.control.read_state(self.config.device_id, force_update)
-        return self.unpack_result(result)
+        return self._unpack_result(result)
 
     def parse_state(self, hand_state, full: bool = False) -> dict[str, Any]:
         qpos = np.full(12, np.nan, dtype=np.float64)
@@ -413,7 +403,7 @@ class XHand:
                     "last_joint_limit_clipped": self.last_joint_limit_clipped,
                     "last_delta_limited": self.last_delta_limited,
                     "last_hand_ids": self.last_hand_ids,
-                    "comm_type": self.comm_type(),
+                    "comm_type": self.cached_comm_type,
                     "device_name": self.device_name,
                     "joint_names": JOINT_NAMES,
                     "sensor_names": SENSOR_NAMES,
@@ -421,13 +411,15 @@ class XHand:
             )
         return state
 
-    def parse_tactile(self, hand_state, scaled: bool = True) -> np.ndarray:
-        tactile = np.zeros((5, 120, 3), dtype=np.float64)
+    def _iter_sensors(self, hand_state):
         sensor_data = getattr(hand_state, "sensor_data", None)
         if sensor_data is None:
-            sensor_data = getattr(hand_state, "senser_data", [])
+            sensor_data = getattr(hand_state, "sensor_data", [])
+        return enumerate(list(sensor_data)[:5])
 
-        for i, sensor in enumerate(list(sensor_data)[:5]):
+    def parse_tactile(self, hand_state, scaled: bool = True) -> np.ndarray:
+        tactile = np.zeros((5, 120, 3), dtype=np.float64)
+        for i, sensor in self._iter_sensors(hand_state):
             raw_force = getattr(sensor, "raw_force", [])
             for j, force in enumerate(list(raw_force)[:120]):
                 tactile[i, j, 0] = float(getattr(force, "fx", 0.0))
@@ -440,11 +432,7 @@ class XHand:
 
     def parse_tactile_sum(self, hand_state, scaled: bool = True) -> np.ndarray:
         force_sum = np.zeros((5, 3), dtype=np.float64)
-        sensor_data = getattr(hand_state, "sensor_data", None)
-        if sensor_data is None:
-            sensor_data = getattr(hand_state, "senser_data", [])
-
-        for i, sensor in enumerate(list(sensor_data)[:5]):
+        for i, sensor in self._iter_sensors(hand_state):
             calc_force = getattr(sensor, "calc_force", None)
             if calc_force is None:
                 continue
@@ -458,11 +446,7 @@ class XHand:
 
     def parse_tactile_temperature(self, hand_state) -> np.ndarray:
         temperature = np.full((5, 20), np.nan, dtype=np.float64)
-        sensor_data = getattr(hand_state, "sensor_data", None)
-        if sensor_data is None:
-            sensor_data = getattr(hand_state, "senser_data", [])
-
-        for i, sensor in enumerate(list(sensor_data)[:5]):
+        for i, sensor in self._iter_sensors(hand_state):
             temp = np.asarray(getattr(sensor, "temperature", []), dtype=np.float64).reshape(-1)
             if temp.size > 0:
                 temperature[i, : min(20, temp.size)] = temp[:20]
@@ -488,7 +472,7 @@ class XHand:
             state = self.get_state(force_update=True)
             self.last_qpos_cmd = state["qpos"].copy()
             if not np.all(np.isfinite(self.last_qpos_cmd)):
-                self.last_qpos_cmd = self.array12(self.config.home_qpos)
+                self.last_qpos_cmd = self._array12(self.config.home_qpos)
 
         if self.last_cmd_time is None:
             self.last_cmd_time = now
@@ -520,7 +504,7 @@ class XHand:
 
         return True
 
-    def array12(self, value) -> np.ndarray:
+    def _array12(self, value) -> np.ndarray:
         if value is None:
             return np.full(12, np.nan, dtype=np.float64)
 
@@ -533,7 +517,7 @@ class XHand:
         out[: arr.size] = arr
         return out
 
-    def empty_full_state(self) -> dict[str, Any]:
+    def _empty_state(self) -> dict[str, Any]:
         return {
             "finger_ids": np.full(12, -1, dtype=np.int32),
             "sensor_ids": np.full(12, -1, dtype=np.int32),
@@ -555,13 +539,13 @@ class XHand:
             "last_joint_limit_clipped": self.last_joint_limit_clipped,
             "last_delta_limited": self.last_delta_limited,
             "last_hand_ids": self.last_hand_ids,
-            "comm_type": self.comm_type(),
+            "comm_type": self.cached_comm_type,
             "device_name": self.device_name,
             "joint_names": JOINT_NAMES,
             "sensor_names": SENSOR_NAMES,
         }
 
-    def comm_type(self) -> str:
+    def _resolve_comm_type(self) -> str:
         name = str(self.config.comm_type).strip().lower()
         if name in ["rs485", "serial", "usb"]:
             return "RS485"
@@ -569,7 +553,7 @@ class XHand:
             return "EtherCAT"
         return self.config.comm_type
 
-    def unpack_result(self, result):
+    def _unpack_result(self, result):
         if isinstance(result, (tuple, list)):
             if len(result) >= 2:
                 return result[0], result[1]
@@ -589,7 +573,7 @@ class XHand:
     def error_ok(self, err) -> bool:
         return err is not None and self.error_code(err) == 0
 
-    def save_error(self, err):
+    def _record_error(self, err):
         if err is None:
             self.last_error_code = -1
             self.last_error_message = "empty error object"
@@ -599,7 +583,7 @@ class XHand:
         self.last_error_message = str(getattr(err, "error_message", ""))
 
 
-def print_state(state: dict[str, Any]):
+def _print_state(state: dict[str, Any]):
     for key, value in state.items():
         if isinstance(value, np.ndarray):
             print(f"{key}: shape={value.shape}, value={np.round(value, 6)}")
@@ -619,7 +603,7 @@ def example():
 
     try:
         state = hand.get_state(full=True)
-        print_state(state)
+        _print_state(state)
 
         ok = hand.send_action(config.home_qpos)
         print("send_action ok:", ok)

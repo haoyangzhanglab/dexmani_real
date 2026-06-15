@@ -507,81 +507,18 @@ while True:
 
 ---
 
-## 3. 后续需要实现或验证的内容
+## 3. 相关文档
 
-### 3.1 真机兼容性校验
+- [quest.md](quest.md) — VR 遥操作输入（Quest hand tracking、hand retargeting、xhand_ref_adapter）
+- [xarm7.md](xarm7.md) — xArm7 机械臂硬件控制与 API
+- [realsense.md](realsense.md) — RealSense 相机驱动与点云工具
+- [CLAUDE.md](../CLAUDE.md) — 项目接口规范（XHand 接口模板、安全约束、架构总览）
 
-当前代码已经通过 Python 语法检查，但尚未真机验证。需要重点验证：
+---
 
-- `xhand_controller` 的实际 import 路径是否始终为 `from xhand_controller import xhand_control as xh`。
-- `read_state()` 实际返回的是 tuple、list 还是 dict。
-- SDK 字段是否为 `sensor_data` 还是 `senser_data`。
-- SDK 字段是否为 `jonitboard_err` 还是 `jointboard_err`。
-- `FingerState_t.torque` 是否稳定表示电流，单位 mA。
-- `reset_sensor()` 在当前 SDK 版本中的返回值格式。
+## 参考来源
 
-### 3.2 错误恢复机制
-
-当前 `clear_error()` 只清本地错误状态。后续如果 SDK 提供硬件级清错接口，可以扩展为：
-
-```text
-清 SDK 错误
-清板级错误
-重新读取状态
-必要时重新 build_command
-恢复 connected_flag / error_state
-```
-
-### 3.3 更严格的输入策略
-
-当前 `array12()` 的风格比较宽松：输入长度不足时用 NaN 填充，长度超过时截断。后续真机版本可以改得更严格：
-
-```text
-action 必须是 shape=(12,)
-否则直接返回 False
-```
-
-这会更安全，但代码也会稍微更硬。
-
-### 3.4 `move_to_joint_positions()` 到位判据优化
-
-当前阻塞移动只用：
-
-```python
-max(abs(current_qpos - target)) <= atol
-```
-
-后续可以增加：
-
-- 连续 N 帧满足阈值才算到位。
-- 电流异常提前退出。
-- 板级错误码非零提前退出。
-- 可选打印当前误差。
-
-### 3.5 触觉数据标准化与日志
-
-当前 `full=True` 同时返回 raw 和 scaled 触觉数据。后续可以补：
-
-- 触觉 offset / bias 管理。
-- 自动 `reset_sensor()` 后记录 baseline。
-- tactile flatten 工具函数，方便数据集写入。
-- tactile summary，例如每个指尖合力模长。
-
-### 3.6 与 xArm7 集成
-
-如果后续需要 XArm7 + XHand 联合控制，建议保持两个驱动文件独立：
-
-```text
-xarm7.py     # 只管 7DoF arm
-xhand.py     # 只管 12DoF hand
-robot.py     # 可选，组合 arm + hand
-```
-
-`robot.py` 可以把动作拼成：
-
-```python
-arm_action = action[:7]
-hand_action = action[7:19]
-```
-
-但不要把 XHand 逻辑塞进 `xarm7.py`，也不要把 xArm 逻辑塞进 `xhand.py`。
+- XHand SDK 接口说明文档：XHandControl API、HandCommand_t、FingerState_t、触觉传感器数据格式。
+- XOS / XHAND 上位机：设备枚举、连接、手动调试和传感器读取。
+- DexUMI `dexumi/hand_sdk/xhand/hand_api_cls.py`：XHand SDK 封装参考（后台读取线程 + joint clip + 触觉读取）。
+- LeFranX `src/lerobot/robots/xhand/xhand.py`：XHand 接口设计参考。

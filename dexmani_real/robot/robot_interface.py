@@ -13,20 +13,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.robot.planner.kinematics import XArm7Kinematics
-from dexmani_real.robot.planner.planner_types import Pose
-from dexmani_real.robot.planner.pose_utils import compute_pose_error, quat_wxyz_to_rot6d
-from dexmani_real.robot.planner.workspace_safety import WorkspaceSafety
+from dexmani_real.planner.kinematics import XArm7Kinematics
+from dexmani_real.planner.planner_types import Pose
+from dexmani_real.planner.pose_utils import compose_pose, compute_pose_error, quat_wxyz_to_rot6d
+from dexmani_real.planner.workspace_safety import WorkspaceSafety
 from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 from dexmani_real.robot.xhand import XHand, XHandConfig
 
 if TYPE_CHECKING:
-    from dexmani_real.robot.planner.arm_planner import XArm7MotionPlanner
+    from dexmani_real.planner.arm_planner import XArm7MotionPlanner
 
-
-# ---------------------------------------------------------------------------
-# 手部运动学辅助类
-# ---------------------------------------------------------------------------
 
 
 class HandKinematics:
@@ -114,10 +110,6 @@ class HandKinematics:
             tips[i] = placement.translation.copy()
         return tips
 
-
-# ---------------------------------------------------------------------------
-# 统一状态与动作类型
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -210,10 +202,6 @@ class RobotAction:
                     )
 
 
-# ---------------------------------------------------------------------------
-# RobotInterface 复合接口
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class RobotInterfaceConfig:
@@ -272,9 +260,8 @@ class RobotInterface:
             if hk.is_ready():
                 self.hand_kinematics = hk
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
     # 生命周期
-    # ------------------------------------------------------------------
 
     def connect(self) -> dict[str, bool]:
         """连接 arm + hand。返回 {"arm": bool, "hand": bool}。"""
@@ -299,13 +286,8 @@ class RobotInterface:
         return arm_ok and hand_ok
 
     def emergency_stop(self) -> None:
-        """Arm + Hand 同时急停。"""
         self.arm.stop()
         self.hand.stop()
-
-    # ------------------------------------------------------------------
-    # 状态读取
-    # ------------------------------------------------------------------
 
     def get_state(self) -> RobotState:
         """读取 arm + hand 状态，含 FK 计算。"""
@@ -372,10 +354,6 @@ class RobotInterface:
             timestamp=time.perf_counter(),
         )
 
-    # ------------------------------------------------------------------
-    # 动作发送
-    # ------------------------------------------------------------------
-
     def send_action(self, action: RobotAction) -> dict:
         """发送 arm + hand 动作。
 
@@ -403,20 +381,17 @@ class RobotInterface:
         result["hand_cmd"] = self.hand.last_qpos_cmd.copy() if hand_ok else None
         return result
 
-    # ------------------------------------------------------------------
-    # 复位
-    # ------------------------------------------------------------------
 
     def return_to_home(
         self,
         use_planning: bool = True,
         cancel_event: Any = None,
     ) -> bool:
-        """Path-planned return to home + hand reset.
+        """两阶段 return_home：EEF 归位 → 冗余关节归位。
 
-        use_planning=True: plan a collision-free path (falls back to direct
-            reset on failure).
-        use_planning=False: direct arm.reset() + hand.reset().
+        Phase 1: plan_path(home_eef) — Cartesian 路径把 EEF 移回 home。
+        Phase 2: 关节空间插值 — 当前 qpos → home_qpos，逐点碰撞检测。
+        use_planning=False 时走 direct reset（直线关节空间 + hand reset）。
         """
         # 1. Arm not connected → bail out
         if not self.arm.is_connected():
@@ -453,48 +428,70 @@ class RobotInterface:
         current_eef = self.kinematics.compute_eef_pose_world(current_qpos)
         pos_err, rot_err = compute_pose_error(home_eef_pose, current_eef)
         if pos_err <= 0.005 and rot_err <= 0.05:
-            hand_ok = self.reset_hand() if self.hand.is_connected() else True
-            return True and hand_ok
+            hand_ok = self.hand.reset() if self.hand.is_connected() else True
+            return hand_ok
 
-        # 7. Plan path
+        # ── Phase 1: EEF 路径 → home EEF ──
         try:
             result = self.planner.plan_path(home_eef_pose, current_qpos)
         except Exception:
             traceback.print_exc()
             return self._return_to_home_direct()
 
-        # 8. Path failed or zero waypoints → fallback
         if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
             return self._return_to_home_direct()
 
-        # 9. Execute waypoints one by one
         dt = float(self.arm.config.dt)
-        waypoints = result.qpos_path
-        for waypoint in waypoints:
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            if self.arm.is_error():
+        phase1_completed = True
+        for waypoint in result.qpos_path:
+            if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
+                phase1_completed = False
                 break
             self.arm.send_action(waypoint)
             time.sleep(dt)
 
-        # 10. Hand reset (degraded if hand not connected)
-        hand_ok = self.reset_hand() if self.hand.is_connected() else True
+        # 等 servo 收敛到最后一个 waypoint，再读当前 qpos 做 Phase 2
+        if phase1_completed:
+            time.sleep(dt * 3)
+
+        # ── Phase 2: 关节空间归位 → home_qpos ──
+        if phase1_completed:
+            arm_state = self.arm.get_state()
+            current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+            if np.all(np.isfinite(current_qpos)):
+                joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
+                if joint_delta > np.deg2rad(0.5):
+                    joint_path = self._safe_joint_path(current_qpos, home_qpos)
+                    if joint_path is not None:
+                        for waypoint in joint_path:
+                            if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
+                                break
+                            self.arm.send_action(waypoint)
+                            time.sleep(dt)
+
+        # Hand reset (degraded if hand not connected)
+        hand_ok = self.hand.reset() if self.hand.is_connected() else True
         arm_ok = not self.arm.is_error()
         return arm_ok and hand_ok
+
+    def _safe_joint_path(
+        self, start: np.ndarray, goal: np.ndarray, max_step_rad: float = np.deg2rad(2.0)
+    ) -> np.ndarray | None:
+        """线性插值 start → goal，逐点碰撞检测。不安全返回 None。"""
+        dist = float(np.max(np.abs(goal - start)))
+        n = max(2, int(np.ceil(dist / max_step_rad)) + 1)
+        path = np.array([start + (k / (n - 1)) * (goal - start) for k in range(n)])
+
+        if self.planner is not None and self.planner.planning_profile.check_self_collision:
+            if any(self.planner.has_self_collision(q) for q in path):
+                return None
+        return path
 
     def _return_to_home_direct(self) -> bool:
         """Fallback: direct arm.reset() + hand reset (straight-line in joint space)."""
         arm_ok = self.arm.reset()
-        hand_ok = self.reset_hand() if self.hand.is_connected() else True
+        hand_ok = self.hand.reset() if self.hand.is_connected() else True
         return arm_ok and hand_ok
-
-    def reset_hand(self) -> bool:
-        return self.hand.reset()
-
-    # ------------------------------------------------------------------
-    # 内部方法
-    # ------------------------------------------------------------------
 
     def _compute_fingertip_pos(
         self,
@@ -502,10 +499,6 @@ class RobotInterface:
         eef_quat_wxyz: np.ndarray,
         hand_qpos: np.ndarray,
     ) -> np.ndarray:
-        """计算 5 个指尖在世界坐标系中的位置。
-
-        链式 FK: T_world_fingertip = T_world_eef @ T_eef_handbase @ T_handbase_fingertip
-        """
         if self.hand_kinematics is None or not self.hand_kinematics.is_ready():
             return np.full((5, 3), np.nan, dtype=np.float64)
 
@@ -516,15 +509,11 @@ class RobotInterface:
         if not np.all(np.isfinite(tips_in_handbase)):
             return np.full((5, 3), np.nan, dtype=np.float64)
 
-        # T_world_eef
-        from dexmani_real.robot.planner.pose_utils import compose_pose
+        T_world_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
 
-        T_world_eef = Pose(p=eef_pos.copy(), q=eef_quat_wxyz.copy())
-
-        # T_eef_handbase (static)
         T_eef_handbase = Pose(
-            p=self.config.T_eef_handbase_pos.copy(),
-            q=self.config.T_eef_handbase_quat_wxyz.copy(),
+            p=self.config.T_eef_handbase_pos,
+            q=self.config.T_eef_handbase_quat_wxyz,
         )
 
         # 每个指尖

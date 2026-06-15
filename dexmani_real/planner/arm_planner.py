@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -73,7 +72,6 @@ class XArm7MotionPlanner:
             joint_limits=joint_limits,
             equivalent_joint_mask=equivalent_joint_mask,
             base_pose_world=base_pose_world,
-            config=config,
             mp=self.mp,
         )
         self.ik_mgr = IKCandidateManager(self.kin)
@@ -90,15 +88,6 @@ class XArm7MotionPlanner:
 
     def set_base_pose(self, base_pose_world: Pose) -> None:
         self.kin.set_base_pose(base_pose_world)
-
-    @contextmanager
-    def with_planning_profile(self, profile: PlanningProfile):
-        saved = self.planning_profile
-        self.planning_profile = profile
-        try:
-            yield
-        finally:
-            self.planning_profile = saved
 
     def solve_ik(self, target_eef_pose_world: Pose, current_qpos: np.ndarray) -> IKResult:
         current_qpos = ensure_qpos(current_qpos, self.dof, "current_qpos")

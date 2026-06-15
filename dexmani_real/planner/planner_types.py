@@ -1,63 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
-
-
-def build_brief_dict(report: dict[str, Any], keys: tuple[tuple[str, str], ...], max_items: int) -> dict[str, Any]:
-    compact: dict[str, Any] = {}
-    for source_key, display_key in keys:
-        value = report.get(source_key)
-        if value is None or (isinstance(value, str) and value == ""):
-            continue
-        if isinstance(value, np.generic):
-            value = value.item()
-        if isinstance(value, float):
-            value = round(value, 6)
-        compact[display_key] = value
-        if len(compact) >= max_items:
-            break
-    return compact
-
-
-def format_brief(
-    label_prefix: str, success: bool, reason: str, compact: dict[str, Any], max_reason_lines: int = 3
-) -> str:
-    label = f"{label_prefix} success" if success else f"{label_prefix} failure"
-    reason_str = str(reason or "").strip() or ("ok" if success else "unknown")
-    lines = [line.strip() for line in reason_str.splitlines() if line.strip()]
-    reason_text = " | ".join(lines[:max_reason_lines]) or reason_str
-    if compact:
-        return f"{label}: {reason_text}\n{label_prefix} summary: {compact}"
-    return f"{label}: {reason_text}"
-
-
-IK_BRIEF_KEYS: tuple[tuple[str, str], ...] = (
-    ("held", "held"),
-    ("teleop_ik_method", "method"),
-    ("fallback_method", "fallback"),
-    ("differential_ik_status", "diff_status"),
-    ("teleop_ik_success_count", "ik_success"),
-    ("teleop_ik_rejected_success_count", "ik_rejected"),
-    ("max_raw_delta_deg", "max_raw_delta_deg"),
-    ("cmd_tracking_error_pos_m", "tracking_pos_m"),
-    ("raw_pose_error_pos_m", "raw_pos_err_m"),
-)
-
-
-PATH_BRIEF_KEYS: tuple[tuple[str, str], ...] = (
-    ("source", "source"),
-    ("num_waypoints", "waypoints"),
-    ("joint_path_length", "joint_path_len"),
-    ("max_waypoint_delta_rad", "max_step_rad"),
-    ("terminal_pos_error_m", "terminal_pos_err_m"),
-    ("terminal_rot_error_rad", "terminal_rot_err_rad"),
-    ("num_planning_attempts", "attempts"),
-    ("num_valid_plans", "valid_plans"),
-    ("max_limit_violation_deg", "max_limit_violation_deg"),
-)
 
 
 @dataclass
@@ -91,12 +37,6 @@ class IKResult:
     report: dict[str, Any] = field(default_factory=dict)
     held: bool = False
 
-    def brief_dict(self, max_items: int = 8) -> dict[str, Any]:
-        return build_brief_dict(self.report or {}, IK_BRIEF_KEYS, max_items)
-
-    def brief(self, max_reason_lines: int = 3, max_items: int = 8) -> str:
-        return format_brief("IK", self.success, self.reason, self.brief_dict(max_items=max_items), max_reason_lines)
-
 
 @dataclass(kw_only=True)
 class PathResult:
@@ -105,13 +45,6 @@ class PathResult:
     reason: str = ""
     source: str = ""
     report: dict[str, Any] = field(default_factory=dict)
-
-    def brief_dict(self, max_items: int = 10) -> dict[str, Any]:
-        report = {**self.report, "source": self.source}
-        return build_brief_dict(report, PATH_BRIEF_KEYS, max_items)
-
-    def brief(self, max_reason_lines: int = 3, max_items: int = 10) -> str:
-        return format_brief("Path", self.success, self.reason, self.brief_dict(max_items=max_items), max_reason_lines)
 
 
 @dataclass(kw_only=True)
