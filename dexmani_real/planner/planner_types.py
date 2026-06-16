@@ -101,6 +101,7 @@ class TeleopProfile:
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     hold_on_failure: bool = True
+    check_self_collision: bool = True
 
     use_position_ik: bool = True
     use_differential_ik_fallback: bool = True

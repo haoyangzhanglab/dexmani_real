@@ -500,30 +500,31 @@ class RobotInterface:
 
             dt = float(self.arm.config.dt)
 
-            # 执行层指尖校验：用实际 hand_qpos + 路径终点 EEF 检查指尖是否穿桌。
-            # 规划层的 URDF 手模型是固定的，但真机手部可能被遥操作驱动到
-            # 低于桌面的位置。这里在发送 arm 命令前先把手收起来。
+            # Phase 1 前先把手部复位到 home。
+            # 规划器 URDF 模型中手部是固定默认构型，真机手部可能被遥操作
+            # 驱动到任意构型（手指张开/握拳等），二者不一致会导致碰撞检测
+            # 失效。这里先复位手部使真机构型与规划模型一致。
+            if self.hand.is_connected():
+                self.hand.reset()
+                time.sleep(dt * 10)  # 等手部收敛
+
+            # 复位后验证指尖确实在桌面之上（安全冗余）
             desk_z = self.config.table_z_world if self.config.add_table_collision else 0.0
-            hand_state = self.hand.get_state() if self.hand.is_connected() else {"qpos": None}
-            actual_hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
-            if (len(actual_hand_qpos) == 12
-                    and self.planner is not None
-                    and self.config.add_table_collision):
-                # 用路径两端 arm_qpos + 实际 hand_qpos 检查指尖是否穿桌
-                above_first, min_z_first = self._check_fingertips_above_desk(
-                    result.qpos_path[0], actual_hand_qpos, desk_z,
-                )
-                above_last, min_z_last = self._check_fingertips_above_desk(
-                    result.qpos_path[-1], actual_hand_qpos, desk_z,
-                )
-                if not above_first or not above_last:
-                    print(
-                        f"[return_to_home] Fingertips below desk "
-                        f"(first_z={min_z_first:.3f}m last_z={min_z_last:.3f}m), "
-                        f"resetting hand first..."
+            if self.planner is not None and self.config.add_table_collision:
+                hand_state = self.hand.get_state() if self.hand.is_connected() else {"qpos": None}
+                actual_hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
+                if len(actual_hand_qpos) == 12:
+                    above_first, min_z_first = self._check_fingertips_above_desk(
+                        result.qpos_path[0], actual_hand_qpos, desk_z,
                     )
-                    self.hand.reset()
-                    time.sleep(dt * 10)  # 等手部收敛
+                    above_last, min_z_last = self._check_fingertips_above_desk(
+                        result.qpos_path[-1], actual_hand_qpos, desk_z,
+                    )
+                    if not above_first or not above_last:
+                        warnings.warn(
+                            f"Fingertips still below desk after hand reset "
+                            f"(first_z={min_z_first:.3f}m last_z={min_z_last:.3f}m)"
+                        )
 
             phase1_completed = True
             for waypoint in result.qpos_path:
@@ -535,14 +536,35 @@ class RobotInterface:
                     break
                 time.sleep(dt)
 
-            # 等 servo 收敛到路径终点，等待时间与路径长度成正比
+            # 闭环等待 servo 收敛到路径终点
             if phase1_completed:
-                min_qvel = float(np.min(self.arm.config.max_qvel))
-                path_joint_len = float(
-                    np.max(np.abs(result.qpos_path[-1] - result.qpos_path[0]))
-                )
-                converge_wait = max(dt * 5, path_joint_len / min_qvel * 1.2)
-                time.sleep(converge_wait)
+                target_qpos = result.qpos_path[-1]
+                max_wait = max(dt * 5, float(np.max(np.abs(
+                    target_qpos - result.qpos_path[0]))) / float(np.min(
+                    self.arm.config.max_qvel)) * 1.5)
+                poll_interval = dt * 2
+                elapsed = 0.0
+                converged = False
+                while elapsed < max_wait:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    try:
+                        poll_qpos = np.asarray(
+                            self.arm.get_state()["qpos"], dtype=np.float64)
+                        if not np.all(np.isfinite(poll_qpos)):
+                            continue
+                        err = float(np.max(np.abs(poll_qpos - target_qpos)))
+                        if err < np.deg2rad(3.0):
+                            converged = True
+                            break
+                    except Exception:
+                        continue
+                if not converged:
+                    warnings.warn(
+                        f"Phase 1 convergence timeout after {max_wait:.1f}s, "
+                        f"skipping Phase 2 joint fine-tuning"
+                    )
+                    phase1_completed = False
 
             # ── Phase 2: 关节空间归位 → home_qpos ──
             if phase1_completed:
@@ -560,12 +582,15 @@ class RobotInterface:
                                     break
                                 time.sleep(dt)
                         else:
-                            # Joint path would self-collide → fallback
+                            # Joint path would self-collide → skip Phase 2.
+                            # _return_to_home_direct() 走的是同一条关节直线路径
+                            # （只是由 SDK 轨迹生成器执行），并不会更安全。
+                            # Phase 1 已把 EEF 归位，跳过 Phase 2 最多损失
+                            # 冗余关节的精确对齐，不会造成碰撞风险。
                             warnings.warn(
                                 "Joint-space home path self-collides, "
-                                "falling back to direct reset"
+                                "skipping Phase 2 (EEF already at home from Phase 1)"
                             )
-                            return self._return_to_home_direct()
 
             # Hand reset (degraded if hand not connected)
             hand_ok = self.hand.reset() if self.hand.is_connected() else True

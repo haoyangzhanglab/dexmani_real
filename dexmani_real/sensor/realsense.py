@@ -401,7 +401,7 @@ class RealSense:
         self.last_frame = frame
         return frame
 
-    def get_obs(
+    def get_state(
         self,
         *,
         mode: Literal["rgbd", "pointcloud", "full"] = "full",

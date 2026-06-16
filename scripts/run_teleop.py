@@ -14,16 +14,17 @@ Usage:
     # IPC mode (VR frames from SharedRingBuffer)
     python scripts/run_teleop.py --ipc --arm-ip 192.168.1.113
 
-    # VR + hand only
-    python scripts/run_teleop.py --vr-only --hand-device /dev/ttyUSB0
+    # With recording
+    python scripts/run_teleop.py --record --data-dir /data/episodes
 
-    # Custom arm EMA
-    python scripts/run_teleop.py --ema-arm 0.5
+    # Custom arm + hand EMA
+    python scripts/run_teleop.py --ema-arm 0.5 --ema-hand 0.5
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import multiprocessing
 import signal
 
@@ -39,6 +40,7 @@ from dexmani_real.planner.planner_types import (
 )
 from dexmani_real.robot.robot_interface import RobotInterface, RobotInterfaceConfig
 from dexmani_real.teleop.arm_wrist_mapper import ArmWristMapper
+from dexmani_real.teleop.dummy_tracker import DummyTracker
 from dexmani_real.teleop.hand_retarget import XHandRetargeter
 from dexmani_real.teleop.quest_hand_tracker import QuestHandTracker
 
@@ -51,8 +53,6 @@ HAND_URDF_PATH = str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf")
 EEF_LINK_NAME = "custom_eef_link"
 
 # Robot base relative to world: +30° yaw about Z
-import math
-
 BASE_YAW_DEG = 30.0
 _HALF_YAW = math.radians(BASE_YAW_DEG / 2.0)
 BASE_POSE_WORLD = Pose(
@@ -104,30 +104,7 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
     # Tracker
     tracker = None
     if args.dry_run or args.arm_only_vr:
-        # In dry-run, provide a dummy tracker that always returns a fresh frame
-        import time as _time
-
-        class _DummyTracker:
-            def __init__(self):
-                self._seq = 0
-                self.started = True
-            def get_latest(self, max_age_s=None):
-                self._seq += 1
-                return {
-                    "side": "right",
-                    "wrist_pos": np.zeros(3, dtype=np.float64),
-                    "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
-                    "landmarks": np.zeros((21, 3), dtype=np.float64),
-                    "recv_ts_ns": _time.monotonic_ns(),
-                    "source_ts_ns": _time.monotonic_ns(),
-                    "sequence_id": self._seq,
-                    "source_frame_seq": self._seq,
-                    "coordinate_frame": "flu",
-                    "local_recv_ns": _time.monotonic_ns(),
-                }
-            def connect(self): pass
-            def disconnect(self): pass
-        tracker = _DummyTracker()
+        tracker = DummyTracker()
     elif args.ipc:
         tracker = None  # VR frames come from IPC
     else:
@@ -158,6 +135,14 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
     # Retargeter
     retargeter = XHandRetargeter()
 
+    # Recorder (optional)
+    recorder = None
+    if getattr(args, "record", False):
+        from dexmani_real.recording.episode_recorder import EpisodeRecorder
+
+        recorder = EpisodeRecorder(data_dir=getattr(args, "data_dir", "data/recordings"))
+        print(f"[run_teleop] Recording enabled → {recorder.data_dir}")
+
     # Keyboard queue
     keyboard_queue: multiprocessing.Queue = multiprocessing.Queue()
 
@@ -171,7 +156,9 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
         keyboard_queue=keyboard_queue,
         target_hz=float(args.rate),
         ema_alpha_arm=float(args.ema_arm),
+        ema_alpha_hand=float(getattr(args, "ema_hand", 0.3)),
         dry_run=args.dry_run,
+        recorder=recorder,
     )
     return controller
 
@@ -215,11 +202,20 @@ def main() -> None:
                         help="Control loop frequency (Hz)")
     parser.add_argument("--ema-arm", type=float, default=0.3,
                         help="EMA alpha for arm smoothing")
+    parser.add_argument("--ema-hand", type=float, default=0.3,
+                        help="EMA alpha for hand smoothing (joint-level)")
+
     # Mapper
     parser.add_argument("--mapper-pos-scale", type=float, default=1.0,
                         help="Position scale for wrist mapping")
     parser.add_argument("--mapper-rot-scale", type=float, default=1.0,
                         help="Rotation scale for wrist mapping")
+
+    # Recording
+    parser.add_argument("--record", action="store_true",
+                        help="Enable HDF5 episode recording")
+    parser.add_argument("--data-dir", default="data/recordings",
+                        help="Directory to save recorded episodes")
 
     args = parser.parse_args()
 

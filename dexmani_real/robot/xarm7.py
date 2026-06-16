@@ -29,6 +29,16 @@ class XArm7Config:
     use_delta_limit: bool = True
     clip_joint_limit: bool = True
 
+    # 碰撞检测参数 — 防止 C31 误触发
+    # tcp_load_kg: XHand 重量 (kg)，非零值使动力学模型正确估算力矩
+    tcp_load_kg: float = 1.2
+    # tcp_load_cog_mm: 负载重心 [x, y, z] mm，相对法兰坐标系
+    tcp_load_cog_mm: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 80.0]
+    )
+    # collision_sensitivity: 0=最敏感, 5=最不敏感。伺服模式推荐 3
+    collision_sensitivity: int = 3
+
 
 class XArm7:
     def __init__(self, config: XArm7Config):
@@ -60,6 +70,10 @@ class XArm7:
         self.arm.clean_warn()
         self.arm.motion_enable(True)
         self._set_mode(1)
+
+        # 设置 TCP 负载和碰撞灵敏度 — 防止 C31 误触发
+        # ref: xarm-sdk set_tcp_load / set_collision_sensitivity
+        self._configure_collision_params()
 
         state = self.get_state()
         if np.all(np.isfinite(state["qpos"])):
@@ -203,6 +217,38 @@ class XArm7:
     def _set_mode(self, mode: int):
         self.arm.set_mode(mode)
         self.arm.set_state(0)
+
+    def _configure_collision_params(self) -> None:
+        """设置 TCP 负载和碰撞灵敏度，防止 C31 误触发。
+
+        C31 (Collision Caused Abnormal Current) 检测机制:
+          - xArm 控制器用动力学模型估算各关节理论力矩
+          - 比较实际力矩(电机电流)与理论力矩
+          - 偏差超过阈值 → C31 急停
+
+        未设置负载时动力学模型按 0kg 计算 → 理论力矩被严重低估
+        → 正常驱动 XHand(~1.2kg) 所需的力矩被误判为碰撞。
+        """
+        if self.arm is None:
+            return
+        cfg = self.config
+
+        try:
+            code = self.arm.set_tcp_load(
+                cfg.tcp_load_kg,
+                list(cfg.tcp_load_cog_mm),
+            )
+            if code != 0:
+                self.last_error_message = f"set_tcp_load failed: code={code}"
+        except Exception as e:
+            self.last_error_message = f"set_tcp_load exception: {e}"
+
+        try:
+            code = self.arm.set_collision_sensitivity(cfg.collision_sensitivity)
+            if code != 0:
+                self.last_error_message = f"set_collision_sensitivity failed: code={code}"
+        except Exception as e:
+            self.last_error_message = f"set_collision_sensitivity exception: {e}"
 
     def _read_qpos(self) -> np.ndarray:
         code, qpos = self.arm.get_servo_angle(is_radian=True)

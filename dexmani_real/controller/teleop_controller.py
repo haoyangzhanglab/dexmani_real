@@ -25,6 +25,7 @@ import numpy as np
 
 from dexmani_real.controller.error_handler import TeleopErrorHandler
 from dexmani_real.controller.keyboard_handler import ControlSignal, KeyboardHandler
+from dexmani_real.controller.safety_checker import SafetyChecker
 from dexmani_real.controller.tracking_quality import (
     TrackingQuality,
     TrackingQualityConfig,
@@ -66,11 +67,6 @@ class ControllerState(Enum):
 _ARM_JUMP_LIMIT_RAD = np.deg2rad(5.0)
 _HAND_JUMP_LIMIT_RAD = np.deg2rad(10.0)
 
-# Safety thresholds
-_ARM_TORQUE_LIMIT_NM = 50.0       # N·m
-_HAND_CURRENT_LIMIT_MA = 500.0    # mA
-_HAND_TEMP_LIMIT_C = 70.0         # °C
-
 
 class TeleopController:
     """Main teleoperation controller.
@@ -93,6 +89,7 @@ class TeleopController:
         keyboard_queue: Any | None = None,
         target_hz: float = 50.0,
         ema_alpha_arm: float = 0.3,
+        ema_alpha_hand: float = 0.3,
         dry_run: bool = False,
         recorder: Any | None = None,
     ) -> None:
@@ -107,6 +104,7 @@ class TeleopController:
 
         self.limiter = RateLimiter(target_hz)
         self.ema_alpha_arm = float(ema_alpha_arm)
+        self.ema_alpha_hand = float(ema_alpha_hand)
 
         self.tracking_quality = TrackingQuality(TrackingQualityConfig(max_frame_age_s=0.2))
         self.error_handler = TeleopErrorHandler()
@@ -163,7 +161,7 @@ class TeleopController:
         print(f"[TeleopController] Entering main loop at {self.limiter.target_hz:.0f} Hz")
         print(f"  Mode: {'dry-run' if self.dry_run else 'hardware'}")
         print(f"  VR: {'IPC' if self.ipc_buffer is not None else 'direct'}")
-        print(f"  EMA: arm_alpha={self.ema_alpha_arm}  (hand uses dex-retargeting built-in smoothing)")
+        print(f"  EMA: arm_alpha={self.ema_alpha_arm}  hand_alpha={self.ema_alpha_hand}")
         print(f"  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
 
         self.last_status_ts = time.monotonic()
@@ -208,10 +206,10 @@ class TeleopController:
         action, quality = self._compute_action(vr_frame, state)
 
         # 5. Safety checks on state (arm torque, hand current, hand temp, hand comm)
-        quality.set(ARM_TORQUE_OK, self._check_arm_torque(state))
-        quality.set(HAND_CURRENT_OK, self._check_hand_current(state))
-        quality.set(HAND_TEMP_OK, self._check_hand_temperature(state))
-        quality.set(HAND_COMM_OK, not state.hand_error)
+        quality.set(ARM_TORQUE_OK, SafetyChecker.check_arm_torque(state))
+        quality.set(HAND_CURRENT_OK, SafetyChecker.check_hand_current(state))
+        quality.set(HAND_TEMP_OK, SafetyChecker.check_hand_temperature(state))
+        quality.set(HAND_COMM_OK, SafetyChecker.check_hand_comm(state))
 
         flags = quality.get()
 
@@ -322,7 +320,8 @@ class TeleopController:
             target_hand = self.retargeter.retarget(mano_landmarks)
             if target_hand is not None and len(target_hand) == 12:
                 retarget_ok = True
-                hand_cmd = np.asarray(target_hand, dtype=np.float64)
+                raw_hand = np.asarray(target_hand, dtype=np.float64)
+                hand_cmd = self._ema_smooth(raw_hand, self._last_hand_cmd, self.ema_alpha_hand)
                 self._last_hand_cmd = hand_cmd.copy()
                 self.retarget_success_count += 1
             else:
@@ -335,7 +334,7 @@ class TeleopController:
             hand_cmd = prev_hand_cmd.copy()
 
         quality.set(RETARGET_OK, retarget_ok)
-        quality.set(RETARGET_VALID, self._check_retarget_valid(hand_cmd))
+        quality.set(RETARGET_VALID, SafetyChecker.check_retarget_valid(hand_cmd))
 
         # ── Joint jump clamp ──
         jump_ok = True
@@ -530,49 +529,23 @@ class TeleopController:
         alpha = float(np.clip(alpha, 0.0, 1.0))
         return alpha * np.asarray(new_val, dtype=np.float64) + (1.0 - alpha) * prev_val
 
-    # ------------------------------------------------------------------
-    # Safety checks
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _check_arm_torque(state: RobotState) -> bool:
-        tau = state.arm_tau
-        if not np.all(np.isfinite(tau)):
-            return False
-        return float(np.max(np.abs(tau))) < _ARM_TORQUE_LIMIT_NM
-
-    @staticmethod
-    def _check_hand_current(state: RobotState) -> bool:
-        cur = state.hand_current
-        if not np.all(np.isfinite(cur)):
-            return False
-        return float(np.max(cur)) < _HAND_CURRENT_LIMIT_MA
-
-    @staticmethod
-    def _check_hand_temperature(state: RobotState) -> bool:
-        temp = state.hand_temperature
-        if not np.all(np.isfinite(temp)):
-            return False
-        return float(np.max(temp)) < _HAND_TEMP_LIMIT_C
-
-    @staticmethod
-    def _check_retarget_valid(hand_qpos: np.ndarray) -> bool:
-        """Check that retarget result looks physiologically plausible."""
-        if not np.all(np.isfinite(hand_qpos)):
-            return False
-        if np.any(hand_qpos < -0.5) or np.any(hand_qpos > 2.5):
-            return False
-        return True
+    def _quat_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
+        """Convert wxyz quaternion to 3x3 rotation matrix."""
+        w, x, y, z = q_wxyz[0], q_wxyz[1], q_wxyz[2], q_wxyz[3]
+        return np.array([
+            [1 - 2*y*y - 2*z*z,     2*x*y - 2*w*z,     2*x*z + 2*w*y],
+            [    2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z,     2*y*z - 2*w*x],
+            [    2*x*z - 2*w*y,     2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y],
+        ], dtype=np.float64)
 
     def _compute_T_base_eef(self, state: RobotState) -> np.ndarray | None:
         """Compute 4x4 T_base_eef from EEF pose for camera extrinsics."""
         if not np.all(np.isfinite(state.eef_pos)):
             return None
-        from dexmani_real.planner.pose_utils import quat_wxyz_to_mat
-
         T = np.eye(4, dtype=np.float64)
         T[:3, 3] = state.eef_pos
-        T[:3, :3] = quat_wxyz_to_mat(state.eef_quat_wxyz)
+        T[:3, :3] = self._quat_to_rotmat(state.eef_quat_wxyz)
         return T
 
     @staticmethod
@@ -674,24 +647,9 @@ def example() -> None:
     print("Starting dry-run TeleopController. Press Ctrl+C to stop.")
     print("Insert dummy VR frames for 5 s to simulate tracking...")
 
-    # Inject a dummy VR frame so the arm mapper can be reset
-    import time
+    from dexmani_real.teleop.dummy_tracker import DummyTracker
 
-    dummy_frame = {
-        "wrist_pos": np.array([0.0, 0.0, 0.0], dtype=np.float64),
-        "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
-        "landmarks": np.zeros((21, 3), dtype=np.float64),
-        "sequence_id": 0,
-        "local_recv_ns": time.monotonic_ns(),
-    }
-    class _DummyTracker:
-        def get_latest(self, max_age_s=None):
-            dummy_frame["local_recv_ns"] = time.monotonic_ns()
-            dummy_frame["sequence_id"] = getattr(self, "_seq", 0)
-            self._seq = getattr(self, "_seq", 0) + 1
-            return dummy_frame.copy()
-
-    controller.tracker = _DummyTracker()
+    controller.tracker = DummyTracker()
 
     # Reset mapper so IK works
     arm_mapper.reset(

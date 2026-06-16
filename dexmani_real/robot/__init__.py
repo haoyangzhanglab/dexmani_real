@@ -1,7 +1,6 @@
 from dexmani_real.robot.robot_interface import RobotAction, RobotInterface, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 from dexmani_real.robot.xhand import XHand, XHandConfig
-from dexmani_real.planner.workspace_safety import WorkspaceSafety
 
 __all__ = [
     "RobotInterface",
@@ -12,5 +11,4 @@ __all__ = [
     "XArm7Config",
     "XHand",
     "XHandConfig",
-    "WorkspaceSafety",
 ]

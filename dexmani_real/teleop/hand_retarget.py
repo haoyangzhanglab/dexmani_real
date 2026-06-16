@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import time
-import numpy as np
 from typing import Optional
+
+import numpy as np
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dexmani_real import ASSET_DIR
 from dexmani_real.teleop.xhand_ref_adapter import XHandRefAdapter

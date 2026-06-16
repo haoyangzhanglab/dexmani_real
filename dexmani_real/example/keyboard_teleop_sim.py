@@ -43,7 +43,7 @@ INTERP_MAX_STEP_RAD = np.deg2rad(2.0)
 CTRL_DT = 0.02          # 控制周期 (s)，50Hz
 
 WORKSPACE_BOUNDS = np.array([
-    [0.24, 0.72],   # x [min, max] m  — 在所有 y/z 下 IK 100% 可达
+    [0.28, 0.70],   # x [min, max] m  — 在所有 y/z 下 IK 100% 可达
     [-0.40, 0.40],  # y [min, max] m
     [0.02, 0.55],   # z [min, max] m
 ])

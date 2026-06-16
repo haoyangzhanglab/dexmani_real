@@ -47,7 +47,7 @@ class TeleopIKSolver:
                 tracking_delta,
             )
             if qpos is not None:
-                return self.command_from_target_qpos(
+                result = self.command_from_target_qpos(
                     target_eef_pose_world=target_eef_pose_world,
                     current_qpos=current_qpos,
                     previous_qpos_cmd=previous_qpos_cmd,
@@ -56,6 +56,14 @@ class TeleopIKSolver:
                     report=position_report,
                     method="position_ik",
                 )
+                if profile.check_self_collision and self.ik_mgr.has_self_collision(result.qpos):
+                    return IKResult(
+                        success=False, qpos=previous_qpos_cmd.copy(),
+                        reason="Self-collision detected in teleop IK result",
+                        report={**result.report, "held": True, "self_collision": True},
+                        held=True,
+                    )
+                return result
         else:
             position_report = {
                 "teleop_ik_method": "position_ik_disabled",
@@ -81,6 +89,13 @@ class TeleopIKSolver:
                     )
                     if k in position_report
                 }
+                if profile.check_self_collision and self.ik_mgr.has_self_collision(diff_result.qpos):
+                    return IKResult(
+                        success=False, qpos=previous_qpos_cmd.copy(),
+                        reason="Self-collision detected in teleop IK result (diff IK)",
+                        report={**diff_result.report, "held": True, "self_collision": True},
+                        held=True,
+                    )
                 return diff_result
             reason = reason + "\nDifferential IK fallback failed."
             report = {**position_report, "differential_ik_report": diff_result.report}
@@ -188,11 +203,20 @@ class TeleopIKSolver:
             np.deg2rad(self.ik_mgr.profile_array(profile.max_qpos_cmd_speed_deg, "max_qpos_cmd_speed_deg"))
             * profile.teleop_dt
         )
-        raw_delta = self.ik_mgr.compute_qpos_delta(target_qpos, previous_qpos_cmd)
+        raw_delta = self.ik_mgr.compute_qpos_delta(target_qpos, current_qpos)
         clipped_delta = np.clip(raw_delta, -max_step, max_step)
-        qpos_cmd = previous_qpos_cmd + clipped_delta
-        qpos_cmd = self.ik_mgr.canonicalize_qpos(qpos_cmd, previous_qpos_cmd)
+        qpos_cmd = current_qpos + clipped_delta
+        qpos_cmd = self.ik_mgr.canonicalize_qpos(qpos_cmd, current_qpos)
         clipped = bool(np.any(np.abs(clipped_delta - raw_delta) > 1e-12))
+
+        if clipped:
+            import sys
+            print(f"  [IK-CLIP] max_step_deg={np.round(np.rad2deg(max_step),1)}",
+                  f"raw_delta_deg={np.round(np.rad2deg(raw_delta),1)}",
+                  f"clipped_delta_deg={np.round(np.rad2deg(clipped_delta),1)}",
+                  f"cur={np.round(np.rad2deg(current_qpos),1)}",
+                  f"cmd={np.round(np.rad2deg(qpos_cmd),1)}",
+                  file=sys.stderr, flush=True)
 
         cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
         result_report = {

@@ -53,7 +53,7 @@ DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
 EMA_ALPHA = 1.0      # EMA 平滑系数 (1.0 = 禁用平滑)
 
 WORKSPACE_BOUNDS = np.array([
-    [0.24, 0.72],    # x [min, max] m
+    [0.28, 0.70],    # x [min, max] m
     [-0.40, 0.40],   # y [min, max] m
     [0.02, 0.55],    # z [min, max] m
 ], dtype=np.float64)
@@ -390,6 +390,16 @@ def main():
 
             # ── 安全检查 ──
             if robot.arm.is_error():
+                arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
+                if arm_code == 22:
+                    # 自碰撞预警 (xArm ControllerError 22): 清错保持, 继续操作
+                    print("  ⚠ 自碰撞预警，清除错误并保持位置", flush=True)
+                    robot.arm.clear_error()
+                    error_count = 0
+                    target_pos = state.eef_pos.copy()
+                    target_quat = state.eef_quat_wxyz.copy()
+                    prev_qpos_cmd = state.arm_qpos.copy()
+                    continue
                 print(f"arm 错误: {robot.arm.last_error_message}")
                 robot.emergency_stop()
                 running = False
@@ -478,6 +488,14 @@ def main():
                 target_eef_pos=target_pos.copy(),
             )
 
+            # DEBUG: 记录 qpos + EEF 用于抖动分析
+            if loop_count % 5 == 0:
+                qpos_delta = arm_cmd - state.arm_qpos
+                print(f"  [DBG {loop_count}] cur_qpos={np.round(np.rad2deg(state.arm_qpos),1)}")
+                print(f"                     cmd_qpos={np.round(np.rad2deg(arm_cmd),1)}")
+                print(f"                     ik_qpos ={np.round(np.rad2deg(ik_result.qpos),1)}")
+                print(f"                     delta_deg={np.round(np.rad2deg(qpos_delta),2)}")
+                print(f"                     eef={np.round(state.eef_pos,4)} -> tgt={np.round(target_pos,4)}", flush=True)
             send_result = robot.send_action(action)
             if not send_result.get("arm_ok"):
                 error_count += 1

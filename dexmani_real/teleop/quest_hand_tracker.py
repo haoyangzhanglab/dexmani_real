@@ -293,6 +293,7 @@ class QuestHandTracker:
             "sequence_id": frame["sequence_id"],
             "source_frame_seq": frame["source_frame_seq"],
             "coordinate_frame": frame["coordinate_frame"],
+            "local_recv_ns": frame["local_recv_ns"],
         }
 
     def __enter__(self) -> "QuestHandTracker":
