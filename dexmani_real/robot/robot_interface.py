@@ -277,6 +277,10 @@ class RobotInterface:
     def is_connected(self) -> bool:
         return self.arm.is_connected()
 
+    def check_workspace(self, pos: np.ndarray) -> bool:
+        """Check if a 3D position (world frame) is within workspace bounds."""
+        return self.workspace.check(pos)
+
     def is_error(self) -> bool:
         return self.arm.is_error() or self.hand.is_error()
 
@@ -367,10 +371,15 @@ class RobotInterface:
         """
         result: dict = {}
 
-        # Workspace 检查
-        target_pos = action.target_eef_pos
-        if target_pos is not None and not self.workspace.check(target_pos):
-            target_pos = self.workspace.clamp(target_pos)
+        # FK 验证实际关节命令的 EEF 位姿是否在 workspace 内
+        if np.all(np.isfinite(action.arm_qpos_cmd)):
+            cmd_eef_pose = self.kinematics.compute_eef_pose_world(action.arm_qpos_cmd)
+            if not self.workspace.check(cmd_eef_pose.p):
+                warnings.warn(
+                    f"Command EEF {np.round(cmd_eef_pose.p, 4)} m "
+                    f"outside workspace bounds, send_action proceeds "
+                    f"(enforcement at controller level)"
+                )
 
         arm_ok = self.arm.send_action(action.arm_qpos_cmd)
         hand_ok = self.hand.send_action(action.hand_qpos_cmd)
@@ -381,6 +390,12 @@ class RobotInterface:
         result["hand_cmd"] = self.hand.last_qpos_cmd.copy() if hand_ok else None
         return result
 
+
+    def reset_hand(self) -> bool:
+        """复位手部到 home 位置。hand 断连时返回 False。"""
+        if not self.hand.is_connected():
+            return False
+        return self.hand.reset()
 
     def return_to_home(
         self,
