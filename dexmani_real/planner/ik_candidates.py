@@ -309,6 +309,9 @@ class IKCandidateManager:
     def has_self_collision(self, qpos: np.ndarray) -> bool:
         return len(self.mp_planner.check_for_self_collision(qpos)) > 0
 
+    def has_env_collision(self, qpos: np.ndarray) -> bool:
+        return len(self.mp_planner.check_for_env_collision(qpos)) > 0
+
     def check_path_collisions(self, path: np.ndarray) -> dict[str, Any]:
         indices = [0, len(path) - 1]
         if len(path) >= 3:

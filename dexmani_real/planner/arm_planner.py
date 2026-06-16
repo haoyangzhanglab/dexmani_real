@@ -237,8 +237,28 @@ class XArm7MotionPlanner:
     def has_self_collision(self, qpos: np.ndarray) -> bool:
         return self.ik_mgr.has_self_collision(qpos)
 
+    def has_env_collision(self, qpos: np.ndarray) -> bool:
+        return self.ik_mgr.has_env_collision(qpos)
+
     def check_path_collisions(self, path: np.ndarray) -> dict[str, Any]:
         return self.ik_mgr.check_path_collisions(path)
+
+    # ── Environment collision objects ──
+
+    def add_point_cloud(
+        self, points: np.ndarray, name: str = "table", resolution: float = 0.01
+    ) -> None:
+        """Add a static point cloud collision object to the planning world.
+
+        The points are in world frame.  plan_screw/plan_qpos/IK will
+        automatically avoid this obstacle.  Re-calling with the same name
+        updates the point cloud.
+        """
+        self.mp_planner.update_point_cloud(points, resolution, name)
+
+    def remove_point_cloud(self, name: str = "table") -> bool:
+        """Remove a point cloud collision object by name."""
+        return self.mp_planner.remove_point_cloud(name)
 
     def normalized_joint_distance(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> float:
         return self.ik_mgr.normalized_joint_distance(qpos, reference_qpos)
@@ -270,18 +290,24 @@ class XArm7MotionPlanner:
         candidates: list[tuple[np.ndarray, dict[str, Any]]],
         profile: PlanningProfile,
     ) -> list[PathResult]:
+        import io
+        import contextlib
+
         goal_qposes = [qpos for qpos, report in candidates]
         results: list[PathResult] = []
         for rrt_range in profile.rrt_range_options:
             for attempt_index in range(profile.num_rrt_attempts):
-                result = self.mp_planner.plan_qpos(
-                    goal_qposes=goal_qposes,
-                    current_qpos=current_qpos,
-                    time_step=profile.path_dt,
-                    rrt_range=rrt_range,
-                    planning_time=profile.rrt_time_limit,
-                    simplify=profile.simplify_path,
-                )
+                # MPlib plan_qpos unconditionally prints collision warnings
+                # for the start state via print() — capture and discard them.
+                with contextlib.redirect_stdout(io.StringIO()) as _f:
+                    result = self.mp_planner.plan_qpos(
+                        goal_qposes=goal_qposes,
+                        current_qpos=current_qpos,
+                        time_step=profile.path_dt,
+                        rrt_range=rrt_range,
+                        planning_time=profile.rrt_time_limit,
+                        simplify=profile.simplify_path,
+                    )
                 path_result = self.result_from_mplib(
                     result, target_eef_pose_world, current_qpos, source="rrt", profile=profile
                 )

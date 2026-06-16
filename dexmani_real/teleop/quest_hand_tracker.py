@@ -61,31 +61,72 @@ class QuestHandTracker:
         self.malformed_frames = 0
         self.last_error: str | None = None
 
-    def connect(self) -> None:
+    def connect(self) -> bool:
         if self.running:
-            return
+            return True
 
         self.client = self.create_client()
-        self.started = True
         self.running = True
         self.last_error = None
 
-        self.thread = threading.Thread(target=self.receive_loop, daemon=True)
+        self.thread = threading.Thread(target=self._receive_loop, daemon=True)
         self.thread.start()
 
         if self.verbose:
             print(f"[QuestHandTracker] {self.transport}://{self.host}:{self.port}")
 
+        # Verify the receive thread is actually alive.
+        # In tcp_client mode we also wait for the first event to confirm the
+        # server is reachable; in tcp_server/udp mode the client may connect
+        # later, so we only verify the thread didn't crash immediately.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not self.running:
+                self.started = False
+                return False
+            if self.received_frames > 0 or self.ignored_events > 0:
+                self.started = True
+                return True
+            # In server modes the first event may take arbitrarily long
+            # (waiting for Quest to connect).  Only require it for client mode.
+            if self._is_server_mode():
+                if time.monotonic() > deadline:
+                    break
+            time.sleep(0.05)
+
+        if self._is_server_mode():
+            # Server mode: thread is alive and listening.  Client connects later.
+            self.started = True
+            return True
+
+        # Client mode timed out — server unreachable.
+        self.running = False
+        self.event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+        self.started = False
+        self.last_error = (
+            f"No events received within 3s ({self.transport}://{self.host}:{self.port}). "
+            "Check: adb reverse (USB) or HTS app mode (TCP Server vs Client)."
+        )
+        return False
+
+    def _is_server_mode(self) -> bool:
+        return self.transport in ("tcp_server", "udp")
+
     def disconnect(self) -> None:
         self.running = False
-        self.started = False
         self.event.set()
 
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=6.0)
 
+        self.started = False
         self.thread = None
         self.client = None
+
+    def is_connected(self) -> bool:
+        return self.started and self.running and self.received_frames > 0
 
     def get_latest(self, max_age_s: float | None = None) -> dict[str, Any] | None:
         max_age_s = self.max_frame_age_s if max_age_s is None else max_age_s
@@ -165,7 +206,7 @@ class QuestHandTracker:
             )
         )
 
-    def receive_loop(self) -> None:
+    def _receive_loop(self) -> None:
         assert self.client is not None
 
         try:
@@ -255,7 +296,8 @@ class QuestHandTracker:
         }
 
     def __enter__(self) -> "QuestHandTracker":
-        self.connect()
+        if not self.connect():
+            raise RuntimeError(f"QuestHandTracker connect failed: {self.last_error}")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

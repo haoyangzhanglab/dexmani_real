@@ -81,6 +81,7 @@ class PlanningProfile:
     n_init_qpos: int = 3
     random_seed: int | None = None
     check_self_collision: bool = True
+    check_env_collision: bool = True
 
     neutral_qpos: np.ndarray | None = None
     ik_score_manipulability_weight: float = 1.0

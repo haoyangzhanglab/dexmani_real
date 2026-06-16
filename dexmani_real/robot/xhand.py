@@ -57,30 +57,26 @@ class XHandConfig:
         0.0, 0.0,
     ], dtype=np.float64)))
 
+    # Distal joints (index/middle/ring/little joint2) min=5°
+    # to prevent mechanical clogging. ref: LeFranX xhand_config.py L50-51.
     qpos_min: np.ndarray = field(
-        default_factory=lambda: np.array(
-            [
-                0.0, -0.698, 0.0,
-                -0.174, 0.0, 0.0,
-                0.0, 0.0,
-                0.0, 0.0,
-                0.0, 0.0,
-            ],
-            dtype=np.float64,
-        )
+        default_factory=lambda: np.deg2rad(np.array([
+            0.0, -40.0, 0.0,
+            -10.0, 0.0, 5.0,
+            0.0, 5.0,
+            0.0, 5.0,
+            0.0, 5.0,
+        ], dtype=np.float64))
     )
 
     qpos_max: np.ndarray = field(
-        default_factory=lambda: np.array(
-            [
-                1.832, 1.57, 1.57,
-                0.174, 1.919, 1.919,
-                1.919, 1.919,
-                1.919, 1.919,
-                1.919, 1.919,
-            ],
-            dtype=np.float64,
-        )
+        default_factory=lambda: np.deg2rad(np.array([
+            105.0, 90.0, 90.0,
+            10.0, 110.0, 110.0,
+            110.0, 110.0,
+            110.0, 110.0,
+            110.0, 110.0,
+        ], dtype=np.float64))
     )
 
     max_qvel: np.ndarray = field(default_factory=lambda: np.deg2rad(np.ones(12) * 180.0))
@@ -91,7 +87,7 @@ class XHandConfig:
     tor_max: int = 300
     mode: int = 3
 
-    use_delta_limit: bool = True
+    use_delta_limit: bool = False
     clip_joint_limit: bool = True
 
     tactile_scale: float = 0.1

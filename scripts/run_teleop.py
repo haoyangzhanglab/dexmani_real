@@ -17,8 +17,8 @@ Usage:
     # VR + hand only
     python scripts/run_teleop.py --vr-only --hand-device /dev/ttyUSB0
 
-    # Custom EMA parameters
-    python scripts/run_teleop.py --ema-arm 0.5 --ema-hand 0.5
+    # Custom arm EMA
+    python scripts/run_teleop.py --ema-arm 0.5
 """
 
 from __future__ import annotations
@@ -45,10 +45,10 @@ from dexmani_real.teleop.quest_hand_tracker import QuestHandTracker
 # ── Paths ─────────────────────────────────────────────────────────
 from dexmani_real import ASSET_DIR
 
-URDF_PATH = str(ASSET_DIR / "robots" / "xarm7" / "xarm7_glb.urdf")
-SRDF_PATH = str(ASSET_DIR / "robots" / "xarm7" / "xarm7_glb_mplib.srdf")
+URDF_PATH = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
+SRDF_PATH = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf")
 HAND_URDF_PATH = str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf")
-EEF_LINK_NAME = "custom_link_eef"
+EEF_LINK_NAME = "custom_eef_link"
 
 # Robot base relative to world: +30° yaw about Z
 import math
@@ -171,7 +171,6 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
         keyboard_queue=keyboard_queue,
         target_hz=float(args.rate),
         ema_alpha_arm=float(args.ema_arm),
-        ema_alpha_hand=float(args.ema_hand),
         dry_run=args.dry_run,
     )
     return controller
@@ -200,10 +199,10 @@ def main() -> None:
                         help="No arm connection (use with --ipc + VR process)")
 
     # VR
-    parser.add_argument("--vr-transport", default="tcp_client",
+    parser.add_argument("--vr-transport", default="tcp_server",
                         choices=["tcp_client", "tcp_server", "udp"],
                         help="VR transport mode")
-    parser.add_argument("--vr-host", default="127.0.0.1",
+    parser.add_argument("--vr-host", default="0.0.0.0",
                         help="VR host/interface")
     parser.add_argument("--vr-port", type=int, default=8000,
                         help="VR port")
@@ -216,9 +215,6 @@ def main() -> None:
                         help="Control loop frequency (Hz)")
     parser.add_argument("--ema-arm", type=float, default=0.3,
                         help="EMA alpha for arm smoothing")
-    parser.add_argument("--ema-hand", type=float, default=0.3,
-                        help="EMA alpha for hand smoothing")
-
     # Mapper
     parser.add_argument("--mapper-pos-scale", type=float, default=1.0,
                         help="Position scale for wrist mapping")
@@ -232,10 +228,8 @@ def main() -> None:
     # Start tracker if direct mode
     if controller.tracker is not None and not args.dry_run:
         print(f"[run_teleop] Connecting VR tracker ({args.vr_transport}://{args.vr_host}:{args.vr_port})...")
-        controller.tracker.connect()
-        if not controller.tracker.started:
-            print("[run_teleop] ERROR: Tracker not receiving frames. "
-                  "Is HTS streaming? Aborting.")
+        if not controller.tracker.connect():
+            print(f"[run_teleop] ERROR: Tracker connect failed: {controller.tracker.last_error}")
             return
 
     def shutdown(sig=None, frame=None):

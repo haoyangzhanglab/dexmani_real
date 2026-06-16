@@ -23,7 +23,11 @@ Usage:
 
 from __future__ import annotations
 
+import select
+import sys
+import termios
 import time
+import tty
 
 import numpy as np
 
@@ -40,8 +44,8 @@ np.set_printoptions(precision=3, suppress=True, linewidth=120)
 # 无线 WiFi: transport="tcp_server"  host="0.0.0.0"    (Quest 主动连 PC)
 # 无线 WiFi: transport="udp"         host="0.0.0.0"    port=9000
 
-VR_TRANSPORT = "tcp_client"
-VR_HOST = "127.0.0.1"
+VR_TRANSPORT = "tcp_server"
+VR_HOST = "0.0.0.0"
 VR_PORT = 8000
 VR_HAND_SIDE = "right"
 VR_OUTPUT_FRAME = "flu"
@@ -55,6 +59,24 @@ XHAND_DEVICE = "/dev/ttyUSB0"
 
 CONTROL_HZ = 50.0
 STATUS_INTERVAL = 2.0  # print status every N seconds
+
+
+def _setup_nonblock_stdin():
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    return old
+
+
+def _restore_stdin(old):
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+
+
+def _check_quit():
+    if select.select([sys.stdin], [], [], 0)[0]:
+        c = sys.stdin.read(1)
+        return c.lower() == 'q'
+    return False
 
 
 def test_quest_hand_teleop() -> None:
@@ -73,10 +95,15 @@ def test_quest_hand_teleop() -> None:
         max_frame_age_s=0.20,
         verbose=True,
     )
-    tracker.connect()
-
-    if not tracker.started:
-        raise RuntimeError("QuestHandTracker failed to start. Is HTS streaming?")
+    if not tracker.connect():
+        status = tracker.get_status()
+        raise RuntimeError(
+            f"QuestHandTracker failed to connect: {tracker.last_error}\n"
+            f"  Status: {status}\n"
+            f"  USB mode:  adb reverse tcp:8000 tcp:8000  +  HTS app in TCP Server mode\n"
+            f"  WiFi mode: set VR_TRANSPORT='tcp_server' VR_HOST='0.0.0.0'  +  HTS app in TCP Client mode"
+        )
+    print(f"  VR ready. ({tracker.get_status()['received_frames']} frames received)")
 
     # ── 2. XHand ───────────────────────────────────────────────
     print(f"\n[2/3] Connecting XHand ({XHAND_COMM_TYPE}:{XHAND_DEVICE})...")
@@ -110,24 +137,49 @@ def test_quest_hand_teleop() -> None:
     retarget_fail_count = 0
     no_frame_count = 0
     last_qpos = state["qpos"].copy()
+    had_first_frame = False  # suppress "no frame" warnings before first VR frame arrives
+
+    # Non-blocking keyboard input for 'q' to quit
+    stdin_old = _setup_nonblock_stdin()
 
     print("\n" + "=" * 60)
-    print("  Teleop running. Press Ctrl+C to stop.")
+    print("  Teleop running. Press 'q' to quit, Ctrl+C to abort.")
     print(f"  Control rate: {CONTROL_HZ} Hz")
     print("=" * 60 + "\n")
 
     try:
         while True:
+            # ── Quit check ──
+            if _check_quit():
+                print("\n[Quit] 'q' pressed — stopping.")
+                break
+
             # ── VR frame ──
             frame = tracker.get_latest()
             if frame is None:
                 no_frame_count += 1
-                if no_frame_count == 1 or no_frame_count % 50 == 0:
-                    print(f"[VR] no frame (x{no_frame_count})")
+                # Silence warnings until at least one frame has arrived
+                # (tcp_server mode: Quest may connect later)
+                if had_first_frame and (no_frame_count == 1 or no_frame_count % 50 == 0):
+                    status = tracker.get_status()
+                    print(
+                        f"[VR] no frame (x{no_frame_count}) "
+                        f"running={status['running']} received={status['received_frames']} "
+                        f"lines={status.get('sdk_lines_received')} "
+                        f"parse_err={status.get('sdk_parse_errors')} "
+                        f"dropped={status.get('sdk_dropped_lines')} "
+                        f"last_err={status.get('last_error')}"
+                    )
+                    if not status["running"] and not status["started"]:
+                        print("[VR] Receive thread is dead — exiting.")
+                        break
                 limiter.wait()
                 continue
 
             no_frame_count = 0
+            if not had_first_frame:
+                had_first_frame = True
+                print(f"[VR] First frame received (seq={frame['sequence_id']}). Starting teleop.")
             frame_count += 1
 
             # ── Retarget ──
@@ -145,21 +197,17 @@ def test_quest_hand_teleop() -> None:
                 retarget_count += 1
                 last_qpos = target_qpos
 
-            # ── Safety check ──
-            if xhand.is_error():
-                print("[SAFETY] XHand error detected, attempting clear...")
-                xhand.clear_error()
-                if xhand.is_error():
-                    print("[SAFETY] Unrecoverable error, stopping.")
-                    xhand.stop()
-                    break
-
             # ── Send action ──
             ok = xhand.send_action(target_qpos)
             if not ok:
-                print(f"[XHand] send_action failed: {xhand.last_error_message}")
-                if xhand.is_error():
-                    break
+                err_code = xhand.last_error_code
+                err_msg = xhand.last_error_message
+                xhand.clear_error()
+                print(f"[XHand] send_action failed: code={err_code} msg='{err_msg}' — cleared, retrying")
+                qpos_now = xhand.get_state()["qpos"]
+                if np.all(np.isfinite(qpos_now)):
+                    xhand.last_qpos_cmd = qpos_now.copy()
+                continue
 
             # ── Status print ──
             now = time.monotonic()
@@ -187,9 +235,20 @@ def test_quest_hand_teleop() -> None:
         print("\n\n[Stopping] KeyboardInterrupt received.")
 
     finally:
-        print("[Cleanup] Resetting XHand to home...")
-        xhand.reset()
-        time.sleep(1.0)
+        _restore_stdin(stdin_old)
+        print("[Cleanup] Returning XHand to home...")
+        # reset() only sends one frame — delta limit caps it to ~3.6°/step.
+        # Loop until all joints are within tolerance of home (or max steps).
+        home = xhand.config.home_qpos
+        for i in range(120):  # up to ~2.4s at 50Hz
+            xhand.send_action(home)
+            qpos = xhand.get_state()["qpos"]
+            if np.allclose(qpos, home, atol=0.05):
+                print(f"  Home reached after {i + 1} steps.")
+                break
+            time.sleep(xhand.config.dt)
+        else:
+            print("  Max steps reached — stopping.")
         xhand.disconnect()
         tracker.disconnect()
 

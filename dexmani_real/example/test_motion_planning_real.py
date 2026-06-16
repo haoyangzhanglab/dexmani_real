@@ -566,12 +566,14 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
                      home_eef: Pose, dt: float = ARM_DT) -> float:
     """两阶段安全归位（ref: RobotInterface.return_to_home）。
 
-    Phase 1: plan_path → home EEF（碰撞检测）
-    Phase 2: 关节空间精调，逐点自碰撞检查 → home_qpos
+    Phase 1: plan_path → home EEF（自碰撞 + 环境碰撞检测）
+    Phase 2: 关节空间精调，逐点自碰撞+环境碰撞 → home_qpos
     Fallback: arm.reset(home_qpos)
 
     Returns: max joint error from home_qpos (deg)
     """
+    profile = planner.planning_profile
+
     current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
     if not np.all(np.isfinite(current_qpos)):
         arm.reset(home_qpos)
@@ -589,25 +591,36 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
         for wp in result.qpos_path:
             if arm.is_error():
                 break
-            arm.send_action(wp)
+            if not arm.send_action(wp):
+                break
             time.sleep(dt)
-        time.sleep(dt * 3)
+        # 收敛等待与路径长度成正比
+        min_qvel = float(np.min(arm.config.max_qvel))
+        path_len = float(np.max(np.abs(result.qpos_path[-1] - result.qpos_path[0])))
+        time.sleep(max(dt * 5, path_len / min_qvel * 1.2))
 
-    # Phase 2: 关节空间精调，逐点自碰撞检查
+    # Phase 2: 关节空间精调，逐点自碰撞 + 环境碰撞检查
     current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
     if np.all(np.isfinite(current_qpos)):
         joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
         if joint_delta > np.deg2rad(0.5):
-            # 线性插值 + 逐点自碰撞检测
             max_step = np.deg2rad(2.0)
             n = max(2, int(np.ceil(joint_delta / max_step)) + 1)
             joint_path = np.array([current_qpos + (k / (n - 1)) * (home_qpos - current_qpos)
                                    for k in range(n)])
-            if not any(planner.has_self_collision(q) for q in joint_path):
+
+            collision_free = True
+            for q in joint_path:
+                if (profile.check_self_collision and planner.has_self_collision(q)) or \
+                   (profile.check_env_collision and planner.has_env_collision(q)):
+                    collision_free = False
+                    break
+            if collision_free:
                 for wp in joint_path:
                     if arm.is_error():
                         break
-                    arm.send_action(wp)
+                    if not arm.send_action(wp):
+                        break
                     time.sleep(dt)
 
     # 如果仍然偏离 > 3°，直接 reset

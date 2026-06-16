@@ -68,6 +68,24 @@ base_pose_world = Pose(p=[0,0,0], q=[cos(15°), 0, 0, sin(15°)])
 
 MPlib IK/planning 在 base frame 执行，VR 目标/相机外参/workspace 在 world frame。变换通过 `XArm7Kinematics.world_to_base_pose()` / `base_to_world_pose()` 完成。`XArm7PlannerConfig.base_pose_world` 默认为 identity，真机运行时必须覆盖。
 
+### VR 连接模式（重要）
+
+**PC 作为 TCP Server 监听，Quest 作为 TCP Client 主动连接。** 这是本项目的标准连接方式：
+
+| 角色 | 传输模式 | 地址 | 说明 |
+|------|---------|------|------|
+| PC（本机） | `tcp_server` | `0.0.0.0:8000` | 监听所有网络接口 |
+| Quest HTS App | TCP Client | `<PC 局域网 IP>:8000` | 主动连 PC |
+
+```python
+# 所有脚本/测试中 VR 连接默认值必须遵循此约定
+VR_TRANSPORT = "tcp_server"
+VR_HOST = "0.0.0.0"
+VR_PORT = 8000
+```
+
+USB 有线模式（`tcp_client` + `adb reverse`）仅在 WiFi 不可用时作为备选，**不作为默认配置**。
+
 ### 设计原则
 
 - 硬件驱动只依赖 SDK + numpy + 标准库（cv2/torch 局部 import）

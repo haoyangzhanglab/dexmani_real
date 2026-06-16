@@ -211,11 +211,20 @@ class RobotInterfaceConfig:
     # Workspace safety
     workspace_bounds: np.ndarray = field(
         default_factory=lambda: np.array([
-            [0.2, 0.7],   # x [min, max] m
-            [-0.3, 0.3],  # y [min, max] m
+            [0.0, 0.75],  # x [min, max] m
+            [-0.5, 0.5],  # y [min, max] m
             [0.0, 0.6],   # z [min, max] m
         ], dtype=np.float64)
     )
+
+    # Environment collision (table at z=0.0 m in world frame)
+    add_table_collision: bool = True
+    table_z_world: float = 0.0      # table surface height (world frame, meters)
+    table_margin_xy: float = 0.15   # extra margin beyond workspace bounds
+    table_layers: int = 5           # number of z-layers for solid volume
+    table_layer_spacing: float = 0.01  # spacing between z-layers (meters)
+    table_xy_resolution: float = 0.02  # point spacing on each layer (meters)
+    table_x_min_clearance: float = 0.15  # minimum x distance from origin (protect robot base)
 
     # Hand FK
     hand_urdf_path: str = ""
@@ -252,6 +261,30 @@ class RobotInterface:
 
         self.arm = XArm7(config.arm)
         self.hand = XHand(config.hand)
+
+        # 验证 home EEF 在 workspace 内（提前发现配置错误）
+        home_pose = self.kinematics.compute_eef_pose_world(self.arm.config.init_qpos)
+        if not self.workspace.check(home_pose.p):
+            msg = (
+                f"init_qpos FK yields EEF {np.round(home_pose.p, 4)} m "
+                f"outside workspace bounds {self.workspace.bounds}. "
+                f"Fix init_qpos, base_pose_world, or workspace_bounds."
+            )
+            if np.all(np.isfinite(home_pose.p)):
+                raise ValueError(msg)
+            else:
+                warnings.warn(f"Cannot validate home EEF workspace (NaN FK): {msg}")
+
+        # 设置桌面碰撞几何（plan_screw/plan_qpos 会自动避开）
+        if config.add_table_collision and self.planner is not None:
+            self._setup_table_collision(
+                table_z=config.table_z_world,
+                margin_xy=config.table_margin_xy,
+                n_layers=config.table_layers,
+                layer_spacing=config.table_layer_spacing,
+                xy_resolution=config.table_xy_resolution,
+                x_min_clearance=config.table_x_min_clearance,
+            )
 
         # 手部运动学
         self.hand_kinematics: HandKinematics | None = None
@@ -407,98 +440,161 @@ class RobotInterface:
         Phase 1: plan_path(home_eef) — Cartesian 路径把 EEF 移回 home。
         Phase 2: 关节空间插值 — 当前 qpos → home_qpos，逐点碰撞检测。
         use_planning=False 时走 direct reset（直线关节空间 + hand reset）。
+
+        SIGINT (Ctrl+C) 会设置 cancel_event 来中止路径执行。
         """
-        # 1. Arm not connected → bail out
-        if not self.arm.is_connected():
-            return False
+        # Install SIGINT handler so Ctrl+C cancels waypoint execution
+        import signal as _signal
 
-        # 2. Read current qpos; NaN → fallback
-        arm_state = self.arm.get_state()
-        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-        if not np.all(np.isfinite(current_qpos)):
-            return self._return_to_home_direct()
+        def _on_sigint(signum, frame):
+            if cancel_event is not None:
+                cancel_event.set()
 
-        # 3. Not using planning → direct reset
-        if not use_planning:
-            return self._return_to_home_direct()
-
-        # 4. planner is None → warn + fallback
-        if self.planner is None:
-            warnings.warn(
-                "use_planning=True but planner is None, falling back to direct reset"
-            )
-            return self._return_to_home_direct()
-
-        # 5. FK(home_qpos) → home EEF pose, workspace check/clamp
-        home_qpos = self.arm.config.init_qpos.copy()
-        home_eef_pose = self.kinematics.compute_eef_pose_world(home_qpos)
-        if not self.workspace.check(home_eef_pose.p):
-            warnings.warn(
-                f"Home EEF position {np.round(home_eef_pose.p, 4)} "
-                "is outside workspace, clamping"
-            )
-            home_eef_pose.p = self.workspace.clamp(home_eef_pose.p)
-
-        # 6. Already at home? (< 5 mm pos error, < 0.05 rad rot error)
-        current_eef = self.kinematics.compute_eef_pose_world(current_qpos)
-        pos_err, rot_err = compute_pose_error(home_eef_pose, current_eef)
-        if pos_err <= 0.005 and rot_err <= 0.05:
-            hand_ok = self.hand.reset() if self.hand.is_connected() else True
-            return hand_ok
-
-        # ── Phase 1: EEF 路径 → home EEF ──
+        old_handler = _signal.signal(_signal.SIGINT, _on_sigint)
         try:
-            result = self.planner.plan_path(home_eef_pose, current_qpos)
-        except Exception:
-            traceback.print_exc()
-            return self._return_to_home_direct()
+            # 1. Arm not connected → bail out
+            if not self.arm.is_connected():
+                return False
 
-        if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
-            return self._return_to_home_direct()
-
-        dt = float(self.arm.config.dt)
-        phase1_completed = True
-        for waypoint in result.qpos_path:
-            if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
-                phase1_completed = False
-                break
-            self.arm.send_action(waypoint)
-            time.sleep(dt)
-
-        # 等 servo 收敛到最后一个 waypoint，再读当前 qpos 做 Phase 2
-        if phase1_completed:
-            time.sleep(dt * 3)
-
-        # ── Phase 2: 关节空间归位 → home_qpos ──
-        if phase1_completed:
+            # 2. Read current qpos; NaN → fallback
             arm_state = self.arm.get_state()
             current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-            if np.all(np.isfinite(current_qpos)):
-                joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
-                if joint_delta > np.deg2rad(0.5):
-                    joint_path = self._safe_joint_path(current_qpos, home_qpos)
-                    if joint_path is not None:
-                        for waypoint in joint_path:
-                            if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
-                                break
-                            self.arm.send_action(waypoint)
-                            time.sleep(dt)
+            if not np.all(np.isfinite(current_qpos)):
+                return self._return_to_home_direct()
 
-        # Hand reset (degraded if hand not connected)
-        hand_ok = self.hand.reset() if self.hand.is_connected() else True
-        arm_ok = not self.arm.is_error()
-        return arm_ok and hand_ok
+            # 3. Not using planning → direct reset
+            if not use_planning:
+                return self._return_to_home_direct()
+
+            # 4. planner is None → warn + fallback
+            if self.planner is None:
+                warnings.warn(
+                    "use_planning=True but planner is None, falling back to direct reset"
+                )
+                return self._return_to_home_direct()
+
+            # 5. FK(home_qpos) → home EEF pose, workspace check/clamp
+            home_qpos = self.arm.config.init_qpos.copy()
+            home_eef_pose = self.kinematics.compute_eef_pose_world(home_qpos)
+            if not self.workspace.check(home_eef_pose.p):
+                warnings.warn(
+                    f"Home EEF position {np.round(home_eef_pose.p, 4)} "
+                    "is outside workspace, clamping"
+                )
+                home_eef_pose.p = self.workspace.clamp(home_eef_pose.p)
+
+            # 6. Already at home? (joint error < 1 deg, covers redundant IK)
+            if float(np.max(np.abs(current_qpos - home_qpos))) < np.deg2rad(1.0):
+                hand_ok = self.hand.reset() if self.hand.is_connected() else True
+                return hand_ok
+
+            # ── Phase 1: EEF 路径 → home EEF ──
+            try:
+                result = self.planner.plan_path(home_eef_pose, current_qpos)
+            except Exception:
+                traceback.print_exc()
+                return self._return_to_home_direct()
+
+            if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
+                return self._return_to_home_direct()
+
+            dt = float(self.arm.config.dt)
+
+            # 执行层指尖校验：用实际 hand_qpos + 路径终点 EEF 检查指尖是否穿桌。
+            # 规划层的 URDF 手模型是固定的，但真机手部可能被遥操作驱动到
+            # 低于桌面的位置。这里在发送 arm 命令前先把手收起来。
+            desk_z = self.config.table_z_world if self.config.add_table_collision else 0.0
+            hand_state = self.hand.get_state() if self.hand.is_connected() else {"qpos": None}
+            actual_hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
+            if (len(actual_hand_qpos) == 12
+                    and self.planner is not None
+                    and self.config.add_table_collision):
+                # 用路径两端 arm_qpos + 实际 hand_qpos 检查指尖是否穿桌
+                above_first, min_z_first = self._check_fingertips_above_desk(
+                    result.qpos_path[0], actual_hand_qpos, desk_z,
+                )
+                above_last, min_z_last = self._check_fingertips_above_desk(
+                    result.qpos_path[-1], actual_hand_qpos, desk_z,
+                )
+                if not above_first or not above_last:
+                    print(
+                        f"[return_to_home] Fingertips below desk "
+                        f"(first_z={min_z_first:.3f}m last_z={min_z_last:.3f}m), "
+                        f"resetting hand first..."
+                    )
+                    self.hand.reset()
+                    time.sleep(dt * 10)  # 等手部收敛
+
+            phase1_completed = True
+            for waypoint in result.qpos_path:
+                if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
+                    phase1_completed = False
+                    break
+                if not self.arm.send_action(waypoint):
+                    phase1_completed = False
+                    break
+                time.sleep(dt)
+
+            # 等 servo 收敛到路径终点，等待时间与路径长度成正比
+            if phase1_completed:
+                min_qvel = float(np.min(self.arm.config.max_qvel))
+                path_joint_len = float(
+                    np.max(np.abs(result.qpos_path[-1] - result.qpos_path[0]))
+                )
+                converge_wait = max(dt * 5, path_joint_len / min_qvel * 1.2)
+                time.sleep(converge_wait)
+
+            # ── Phase 2: 关节空间归位 → home_qpos ──
+            if phase1_completed:
+                arm_state = self.arm.get_state()
+                current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+                if np.all(np.isfinite(current_qpos)):
+                    joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
+                    if joint_delta > np.deg2rad(0.5):
+                        joint_path = self._safe_joint_path(current_qpos, home_qpos)
+                        if joint_path is not None:
+                            for waypoint in joint_path:
+                                if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
+                                    break
+                                if not self.arm.send_action(waypoint):
+                                    break
+                                time.sleep(dt)
+                        else:
+                            # Joint path would self-collide → fallback
+                            warnings.warn(
+                                "Joint-space home path self-collides, "
+                                "falling back to direct reset"
+                            )
+                            return self._return_to_home_direct()
+
+            # Hand reset (degraded if hand not connected)
+            hand_ok = self.hand.reset() if self.hand.is_connected() else True
+            arm_ok = not self.arm.is_error()
+            return arm_ok and hand_ok
+        finally:
+            _signal.signal(_signal.SIGINT, old_handler)
 
     def _safe_joint_path(
         self, start: np.ndarray, goal: np.ndarray, max_step_rad: float = np.deg2rad(2.0)
     ) -> np.ndarray | None:
-        """线性插值 start → goal，逐点碰撞检测。不安全返回 None。"""
+        """线性插值 start → goal，逐点碰撞检测（自碰撞 + 环境碰撞）。
+        不安全返回 None。"""
         dist = float(np.max(np.abs(goal - start)))
         n = max(2, int(np.ceil(dist / max_step_rad)) + 1)
         path = np.array([start + (k / (n - 1)) * (goal - start) for k in range(n)])
 
-        if self.planner is not None and self.planner.planning_profile.check_self_collision:
+        if self.planner is None:
+            warnings.warn(
+                "_safe_joint_path called without planner, cannot check collisions"
+            )
+            return None
+
+        profile = self.planner.planning_profile
+        if profile.check_self_collision:
             if any(self.planner.has_self_collision(q) for q in path):
+                return None
+        if profile.check_env_collision:
+            if any(self.planner.has_env_collision(q) for q in path):
                 return None
         return path
 
@@ -507,6 +603,84 @@ class RobotInterface:
         arm_ok = self.arm.reset()
         hand_ok = self.hand.reset() if self.hand.is_connected() else True
         return arm_ok and hand_ok
+
+    def _setup_table_collision(
+        self,
+        table_z: float = 0.0,
+        margin_xy: float = 0.15,
+        n_layers: int = 5,
+        layer_spacing: float = 0.01,
+        xy_resolution: float = 0.02,
+        x_min_clearance: float = 0.15,
+    ) -> None:
+        """Add a dense point-cloud representation of the table at z=table_z.
+
+        The point cloud covers the workspace footprint plus margin, with
+        *n_layers* stacked downward from table_z.  MPlib converts this to
+        an octree used by plan_screw / plan_qpos / IK to avoid collisions.
+
+        All coordinates are in the world frame.  x_min_clearance keeps the
+        cloud away from the robot base at origin.
+        """
+        if self.planner is None:
+            return
+
+        bounds = self.config.workspace_bounds
+        x_min = max(float(bounds[0, 0]), x_min_clearance)
+        x_max = float(bounds[0, 1]) + margin_xy
+        y_min = float(bounds[1, 0]) - margin_xy
+        y_max = float(bounds[1, 1]) + margin_xy
+
+        nx = max(2, int(np.ceil((x_max - x_min) / xy_resolution)) + 1)
+        ny = max(2, int(np.ceil((y_max - y_min) / xy_resolution)) + 1)
+
+        xs = np.linspace(x_min, x_max, nx, dtype=np.float64)
+        ys = np.linspace(y_min, y_max, ny, dtype=np.float64)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+
+        zs = np.linspace(
+            table_z, table_z - (n_layers - 1) * layer_spacing, n_layers,
+            dtype=np.float64,
+        )
+
+        points_list = []
+        for z in zs:
+            layer = np.column_stack([
+                grid_x.ravel(), grid_y.ravel(),
+                np.full(grid_x.size, z, dtype=np.float64),
+            ])
+            points_list.append(layer)
+
+        points = np.vstack(points_list)
+        self.planner.add_point_cloud(
+            points, name="table", resolution=xy_resolution,
+        )
+        print(
+            f"[RobotInterface] Table collision: {points.shape[0]} points, "
+            f"{n_layers} layers, z=[{zs[-1]:.3f}, {zs[0]:.3f}] m, "
+            f"xy=[{x_min:.2f},{x_max:.2f}]x[{y_min:.2f},{y_max:.2f}] m"
+        )
+
+    def _check_fingertips_above_desk(
+        self, arm_qpos: np.ndarray, hand_qpos: np.ndarray, desk_z: float = 0.0,
+    ) -> tuple[bool, float]:
+        """用实际 hand_qpos + arm waypoint FK 检查指尖是否在桌面之上。
+
+        Returns: (all_above, min_z).  仅用于 hand_kinematics 可用时的执行层校验。
+        """
+        if self.hand_kinematics is None or not self.hand_kinematics.is_ready():
+            return True, float("inf")
+
+        if not np.all(np.isfinite(arm_qpos)) or not np.all(np.isfinite(hand_qpos)):
+            return True, float("inf")
+
+        eef = self.kinematics.compute_eef_pose_world(arm_qpos)
+        tips = self._compute_fingertip_pos(eef.p, eef.q, hand_qpos)
+        if not np.all(np.isfinite(tips)):
+            return True, float("inf")
+
+        min_z = float(np.min(tips[:, 2]))
+        return min_z >= desk_z, min_z
 
     def _compute_fingertip_pos(
         self,

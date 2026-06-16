@@ -75,7 +75,7 @@ _HAND_TEMP_LIMIT_C = 70.0         # °C
 class TeleopController:
     """Main teleoperation controller.
 
-    Owns the control loop: reads VR, runs IK+retarget, applies EMA smoothing,
+    Owns the control loop: reads VR, runs IK+retarget, applies EMA smoothing (arm only),
     enforces safety clamps, manages recording lifecycle.
 
     The controller operates on RobotInterface (not XArm7/XHand directly).
@@ -93,7 +93,6 @@ class TeleopController:
         keyboard_queue: Any | None = None,
         target_hz: float = 50.0,
         ema_alpha_arm: float = 0.3,
-        ema_alpha_hand: float = 0.3,
         dry_run: bool = False,
         recorder: Any | None = None,
     ) -> None:
@@ -108,7 +107,6 @@ class TeleopController:
 
         self.limiter = RateLimiter(target_hz)
         self.ema_alpha_arm = float(ema_alpha_arm)
-        self.ema_alpha_hand = float(ema_alpha_hand)
 
         self.tracking_quality = TrackingQuality(TrackingQualityConfig(max_frame_age_s=0.2))
         self.error_handler = TeleopErrorHandler()
@@ -117,7 +115,7 @@ class TeleopController:
         self.state = ControllerState.IDLE
         self.running = False
         self._ema_arm_qpos: np.ndarray | None = None
-        self._ema_hand_qpos: np.ndarray | None = None
+        self._last_hand_cmd: np.ndarray | None = None
 
         # Keyboard
         self.keyboard: KeyboardHandler | None = None
@@ -165,7 +163,7 @@ class TeleopController:
         print(f"[TeleopController] Entering main loop at {self.limiter.target_hz:.0f} Hz")
         print(f"  Mode: {'dry-run' if self.dry_run else 'hardware'}")
         print(f"  VR: {'IPC' if self.ipc_buffer is not None else 'direct'}")
-        print(f"  EMA: arm_alpha={self.ema_alpha_arm}, hand_alpha={self.ema_alpha_hand}")
+        print(f"  EMA: arm_alpha={self.ema_alpha_arm}  (hand uses dex-retargeting built-in smoothing)")
         print(f"  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
 
         self.last_status_ts = time.monotonic()
@@ -266,8 +264,8 @@ class TeleopController:
             else current_arm_qpos
         )
         prev_hand_cmd = (
-            self._ema_hand_qpos.copy()
-            if self._ema_hand_qpos is not None
+            self._last_hand_cmd.copy()
+            if self._last_hand_cmd is not None
             else current_hand_qpos
         )
 
@@ -324,9 +322,8 @@ class TeleopController:
             target_hand = self.retargeter.retarget(mano_landmarks)
             if target_hand is not None and len(target_hand) == 12:
                 retarget_ok = True
-                raw_hand = np.asarray(target_hand, dtype=np.float64)
-                hand_cmd = self._ema_smooth(raw_hand, self._ema_hand_qpos, self.ema_alpha_hand)
-                self._ema_hand_qpos = hand_cmd
+                hand_cmd = np.asarray(target_hand, dtype=np.float64)
+                self._last_hand_cmd = hand_cmd.copy()
                 self.retarget_success_count += 1
             else:
                 self.retarget_fail_count += 1
@@ -422,15 +419,15 @@ class TeleopController:
 
     def _do_home(self) -> None:
         print("[Controller] Returning to home...")
-        self.state = ControllerState.IDLE
         self._ema_arm_qpos = None
-        self._ema_hand_qpos = None
+        self._last_hand_cmd = None
 
         if not self.dry_run:
             self.robot.return_to_home(use_planning=True, cancel_event=self._cancel_event)
         else:
             print("  [dry-run] home (no hardware)")
 
+        self.state = ControllerState.IDLE
         self.error_handler.clear()
         self.tracking_quality.reset()
         print("[Controller] Home complete.")
@@ -641,13 +638,13 @@ def example() -> None:
 
     q = multiprocessing.Queue()
 
-    # Planner
-    urdf_path = str(ASSET_DIR / "robots" / "xarm7" / "xarm7_glb.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xarm7" / "xarm7_glb_mplib.srdf")
+    # Planner (use collision URDF for arm+hand collision detection with desk)
+    urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
+    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf")
     planner_config = XArm7PlannerConfig(
         urdf_path=urdf_path,
         srdf_path=srdf_path,
-        eef_link_name="custom_link_eef",
+        eef_link_name="custom_eef_link",
     )
     planner = XArm7MotionPlanner(
         config=planner_config,
