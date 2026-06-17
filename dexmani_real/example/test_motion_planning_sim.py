@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 
@@ -22,9 +23,9 @@ import numpy as np
 import sapien.core as sapien
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planner import PlanningProfile, Pose, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.robot.model import SimRobotConfig, SimRobotInterface
-from dexmani_real.robot.model.constructor import add_light, create_viewer
+from dexmani_real.planning import PlanningProfile, Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
+from dexmani_real.simulation.constructor import add_light, create_viewer
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -338,7 +339,8 @@ def main():
 
     sim = SimRobotInterface(SimRobotConfig(headless=HEADLESS))
     if not sim.connect():
-        raise RuntimeError(f"connect failed: {sim.last_error_message}")
+        print(f"ERROR: connect failed: {sim.last_error_message}", file=sys.stderr)
+        return
 
     # Planner: 坐标系对齐 sim root_pose
     root_pose = sim.robot.model.get_root_pose()

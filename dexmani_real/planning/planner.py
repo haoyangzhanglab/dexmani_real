@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import os
+import warnings
 from typing import Any
 
 import numpy as np
@@ -7,7 +11,7 @@ import numpy as np
 from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
-from .planner_types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
+from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
 from .pose_utils import compute_pose_error, ensure_qpos
 
 
@@ -28,8 +32,6 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
     ) -> None:
-        import os
-
         import mplib as mp
 
         self.mp = mp
@@ -290,9 +292,6 @@ class XArm7MotionPlanner:
         candidates: list[tuple[np.ndarray, dict[str, Any]]],
         profile: PlanningProfile,
     ) -> list[PathResult]:
-        import io
-        import contextlib
-
         goal_qposes = [qpos for qpos, report in candidates]
         results: list[PathResult] = []
         for rrt_range in profile.rrt_range_options:
@@ -344,8 +343,6 @@ class XArm7MotionPlanner:
 
         path = np.asarray(result.get("position", []), dtype=np.float64)
         if len(path) == 0:
-            import warnings
-
             warnings.warn(f"MPlib {source} returned success but empty position; falling back to current_qpos.")
             path = current_qpos.reshape(1, -1)
         path_result = self.validate_path(path, target_eef_pose_world, current_qpos, source=source, profile=profile)
@@ -498,3 +495,33 @@ class XArm7MotionPlanner:
         return False, {}
 
     # ── Elbow consistency check (internal) ──
+
+
+class WorkspaceSafety:
+    """EEF workspace bounds checking and clamping.
+
+    workspace_bounds: (3, 2) array [[x_min, x_max], [y_min, y_max], [z_min, z_max]] in meters.
+    """
+
+    def __init__(self, workspace_bounds: np.ndarray) -> None:
+        self.bounds = np.asarray(workspace_bounds, dtype=np.float64)
+        if self.bounds.shape != (3, 2):
+            raise ValueError(f"workspace_bounds must have shape (3, 2), got {self.bounds.shape}.")
+
+    def check(self, eef_pos: np.ndarray) -> bool:
+        """Check whether EEF position is within workspace bounds."""
+        eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
+        return bool(
+            (eef_pos[0] >= self.bounds[0, 0])
+            and (eef_pos[0] <= self.bounds[0, 1])
+            and (eef_pos[1] >= self.bounds[1, 0])
+            and (eef_pos[1] <= self.bounds[1, 1])
+            and (eef_pos[2] >= self.bounds[2, 0])
+            and (eef_pos[2] <= self.bounds[2, 1])
+        )
+
+    def clamp(self, target_pos: np.ndarray) -> np.ndarray:
+        """Clip target position to workspace bounds."""
+        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3).copy()
+        np.clip(target_pos, self.bounds[:, 0], self.bounds[:, 1], out=target_pos)
+        return target_pos

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .planner_types import Pose
+from .types import Pose
 
 _WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
 _XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)

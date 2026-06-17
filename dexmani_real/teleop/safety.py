@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.robot.robot_interface import RobotState
+from dexmani_real.robot.interface import RobotState
 
 # Default thresholds (teleop). Deploy may use stricter values.
 _ARM_TORQUE_LIMIT_NM = 50.0
@@ -54,6 +54,30 @@ class SafetyChecker:
     @staticmethod
     def check_hand_comm(state: RobotState) -> bool:
         return not state.hand_error
+
+    @staticmethod
+    def check_arm_joint_limits(
+        state: RobotState,
+        qpos_min: np.ndarray,
+        qpos_max: np.ndarray,
+    ) -> bool:
+        """Check arm_qpos is within hardware joint limits."""
+        qpos = state.arm_qpos
+        if not np.all(np.isfinite(qpos)):
+            return False
+        return not (np.any(qpos < qpos_min) or np.any(qpos > qpos_max))
+
+    @staticmethod
+    def check_hand_joint_limits(
+        state: RobotState,
+        qpos_min: np.ndarray,
+        qpos_max: np.ndarray,
+    ) -> bool:
+        """Check hand_qpos is within hardware joint limits."""
+        qpos = state.hand_qpos
+        if not np.all(np.isfinite(qpos)):
+            return False
+        return not (np.any(qpos < qpos_min) or np.any(qpos > qpos_max))
 
     @staticmethod
     def check_retarget_valid(

@@ -69,6 +69,13 @@ class SharedRingBuffer:
         offset = slot_idx * self._slot_bytes
 
         payload_len = min(len(data), self._config.slot_size)
+        if len(data) > self._config.slot_size:
+            import warnings
+            warnings.warn(
+                f"SharedRingBuffer[{self._name}]: payload ({len(data)} bytes) "
+                f"exceeds slot_size ({self._config.slot_size}), truncated.",
+                RuntimeWarning,
+            )
         self._buf[offset : offset + 8] = np.frombuffer(
             np.int64(seq).tobytes(), dtype=np.uint8
         )
@@ -103,13 +110,22 @@ class SharedRingBuffer:
             return None, last_seq
 
         payload = bytes(self._buf[offset + 16 : offset + 16 + payload_len])
+
+        # Double-check seq after reading payload (torn-read protection):
+        # if writer updated this slot between our seq read and payload read,
+        # the seq will have changed. In SPSC this is unlikely but guards
+        # against subtle corruption on high-frequency writes.
+        seq_after = int(np.frombuffer(self._buf[offset : offset + 8], dtype=np.int64)[0])
+        if seq_after != best_seq:
+            return None, last_seq
+
         return payload, best_seq
 
     def close(self) -> None:
         self._shm.close()
         try:
             self._shm.unlink()
-        except Exception:
+        except (FileNotFoundError, OSError):
             pass
 
     @property

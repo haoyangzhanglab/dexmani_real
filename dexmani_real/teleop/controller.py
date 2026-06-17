@@ -1,7 +1,7 @@
 """Teleoperation controller: state machine, _tick(), EMA smoothing, quality gating.
 
 State machine:
-    IDLE --T--> TELEOP --R--> RECORDING --S--> IDLE
+    IDLE --T--> TELEOP --R--> RECORDING --S--> TELEOP
       |        |   S->IDLE      |   H->IDLE
       H        H                |
       v        v                v
@@ -23,14 +23,14 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.controller.error_handler import TeleopErrorHandler
-from dexmani_real.controller.keyboard_handler import ControlSignal, KeyboardHandler
-from dexmani_real.controller.safety_checker import SafetyChecker
-from dexmani_real.controller.tracking_quality import (
+from dexmani_real.teleop.error_handler import TeleopErrorHandler
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.teleop.safety import SafetyChecker
+from dexmani_real.teleop.tracking import (
     TrackingQuality,
     TrackingQualityConfig,
 )
-from dexmani_real.planner.planner_types import IKResult, Pose
+from dexmani_real.planning.types import IKResult, Pose
 from dexmani_real.recording.quality_flags import (
     ARM_TORQUE_OK,
     HAND_COMM_OK,
@@ -44,7 +44,7 @@ from dexmani_real.recording.quality_flags import (
     TRACKING_OK,
     QualityFlags,
 )
-from dexmani_real.robot.robot_interface import (
+from dexmani_real.robot.interface import (
     RobotAction,
     RobotInterface,
     RobotInterfaceConfig,
@@ -71,7 +71,7 @@ _HAND_JUMP_LIMIT_RAD = np.deg2rad(10.0)
 class TeleopController:
     """Main teleoperation controller.
 
-    Owns the control loop: reads VR, runs IK+retarget, applies EMA smoothing (arm only),
+    Owns the control loop: reads VR, runs IK+retarget, applies EMA smoothing (arm + hand),
     enforces safety clamps, manages recording lifecycle.
 
     The controller operates on RobotInterface (not XArm7/XHand directly).
@@ -211,6 +211,26 @@ class TeleopController:
         quality.set(HAND_TEMP_OK, SafetyChecker.check_hand_temperature(state))
         quality.set(HAND_COMM_OK, SafetyChecker.check_hand_comm(state))
 
+        # Hard safety: joint limits (trigger E-Stop, not just quality flags)
+        if not self.dry_run:
+            if not SafetyChecker.check_arm_joint_limits(
+                state,
+                self.robot.arm.config.qpos_min,
+                self.robot.arm.config.qpos_max,
+            ):
+                self._escalate_to_emergency(
+                    f"Arm joint out of limits: {state.arm_qpos}"
+                )
+                return
+            if not SafetyChecker.check_hand_joint_limits(
+                state,
+                self.robot.hand.config.qpos_min,
+                self.robot.hand.config.qpos_max,
+            ):
+                print(
+                    f"[WARN] Hand joint out of limits: {state.hand_qpos}"
+                )
+
         flags = quality.get()
 
         # 6. Execute action based on state
@@ -228,11 +248,12 @@ class TeleopController:
             if self.robot.is_error():
                 self._escalate_to_emergency("Robot error state detected before send_action")
                 return
-            result = self.robot.send_action(action)
-            arm_ok = result.get("arm_ok", False)
-            hand_ok = result.get("hand_ok", False)
-            if not arm_ok or not hand_ok:
-                print(f"[WARN] send_action: arm_ok={arm_ok} hand_ok={hand_ok}")
+            if self.state != ControllerState.IDLE:
+                result = self.robot.send_action(action)
+                arm_ok = result.get("arm_ok", False)
+                hand_ok = result.get("hand_ok", False)
+                if not arm_ok or not hand_ok:
+                    print(f"[WARN] send_action: arm_ok={arm_ok} hand_ok={hand_ok}")
 
         if self.error_handler.should_emergency_stop:
             self._escalate_to_emergency(self.error_handler.summary())
@@ -308,7 +329,9 @@ class TeleopController:
         in_workspace = self.robot.check_workspace(arm_eef_pos)
         quality.set(IN_WORKSPACE, in_workspace)
         if not in_workspace:
-            arm_cmd = self.error_handler.hold_action().arm_qpos_cmd
+            hold = self.error_handler.hold_action()
+            arm_cmd = hold.arm_qpos_cmd
+            hand_cmd = hold.hand_qpos_cmd
 
         # ── Hand retarget ──
         hand_cmd = prev_hand_cmd.copy()
@@ -359,9 +382,14 @@ class TeleopController:
             arm_cmd = hold.arm_qpos_cmd
             hand_cmd = hold.hand_qpos_cmd
 
-        # Record success for hold-on-failure
-        if ik_ok and retarget_ok and jump_ok:
-            self.error_handler.record_success(arm_cmd, hand_cmd)
+        # Record success for hold-on-failure (counters reset independently
+        # so that a persistent retarget failure doesn't prevent IK counter reset)
+        if ik_ok:
+            self.error_handler.record_arm_ok(arm_cmd)
+        if retarget_ok:
+            self.error_handler.record_hand_ok(hand_cmd)
+        if jump_ok:
+            self.error_handler.record_jump_ok()
 
         action = RobotAction(
             arm_qpos_cmd=arm_cmd,
@@ -397,6 +425,8 @@ class TeleopController:
 
         if signal == ControlSignal.TELEOP:
             if self.state == ControllerState.IDLE:
+                # Re-anchor VR reference so arm starts tracking immediately
+                self._reset_mapper()
                 self.state = ControllerState.TELEOP
                 print("[Controller] IDLE → TELEOP")
             # else: already in TELEOP or RECORDING, no-op
@@ -410,8 +440,8 @@ class TeleopController:
         elif signal == ControlSignal.STOP:
             if self.state == ControllerState.RECORDING:
                 self._stop_recording()
-                self.state = ControllerState.IDLE
-                print("[Controller] RECORDING → IDLE")
+                self.state = ControllerState.TELEOP
+                print("[Controller] RECORDING → TELEOP")
             elif self.state == ControllerState.TELEOP:
                 self.state = ControllerState.IDLE
                 print("[Controller] TELEOP → IDLE")
@@ -431,14 +461,16 @@ class TeleopController:
         self.tracking_quality.reset()
         print("[Controller] Home complete.")
 
-    def _start_recording(self) -> None:
-        print("[Controller] Starting episode recording...")
+    def _reset_mapper(self) -> bool:
+        """Re-anchor VR reference from current VR frame + robot state.
 
-        # Re-anchor VR reference
+        Returns True on success, False if no VR frame available.
+        Called on IDLE→TELEOP and TELEOP→RECORDING transitions.
+        """
         vr_frame = self._read_vr_frame()
         if vr_frame is None:
-            print("  [ERROR] No VR frame available, cannot reset mapper.")
-            return
+            print("  [WARN] No VR frame available, cannot reset mapper.")
+            return False
 
         if self.dry_run:
             state = self._dummy_state()
@@ -451,6 +483,15 @@ class TeleopController:
             eef_pos=state.eef_pos,
             eef_quat_wxyz=state.eef_quat_wxyz,
         )
+        return True
+
+    def _start_recording(self) -> None:
+        print("[Controller] Starting episode recording...")
+
+        # Re-anchor VR reference
+        if not self._reset_mapper():
+            print("  [ERROR] Cannot start recording without VR frame.")
+            return
 
         if self.recorder is not None:
             try:
@@ -471,7 +512,7 @@ class TeleopController:
                     print(f"  Saved to {path}")
             except Exception:
                 traceback.print_exc()
-        print("[Controller] RECORDING → IDLE")
+        print("[Controller] Episode stopped.")
 
     def _escalate_to_emergency(self, reason: str) -> None:
         print(f"[EMERGENCY_STOP] {reason}")
@@ -579,7 +620,7 @@ class TeleopController:
         failed = QualityFlags.describe(quality_flags)
         flags_str = ",".join(failed) if failed else "ALL_OK"
         age_s = (
-            self.tracking_quality._frame_age(vr_frame)
+            self.tracking_quality.frame_age(vr_frame)
             if vr_frame is not None
             else float("inf")
         )
@@ -598,15 +639,15 @@ def example() -> None:
     """Dry-run example: no hardware required, tests full control logic."""
     import multiprocessing
 
-    from dexmani_real.planner.arm_planner import XArm7MotionPlanner
+    from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real import ASSET_DIR
-    from dexmani_real.planner.planner_types import (
+    from dexmani_real.planning.types import (
         PlanningProfile,
         TeleopProfile,
         XArm7PlannerConfig,
     )
-    from dexmani_real.robot.robot_interface import RobotInterfaceConfig
-    from dexmani_real.teleop.arm_wrist_mapper import ArmWristMapper
+    from dexmani_real.robot.interface import RobotInterfaceConfig
+    from dexmani_real.teleop.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.hand_retarget import XHandRetargeter
 
     q = multiprocessing.Queue()

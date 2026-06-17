@@ -45,7 +45,7 @@ class TrackingQuality:
         if vr_frame is None:
             return self._handle_missing(now)
 
-        age_s = self._frame_age(vr_frame)
+        age_s = self.frame_age(vr_frame)
         stale = age_s > self.config.max_frame_age_s
 
         if stale:
@@ -77,7 +77,7 @@ class TrackingQuality:
         )
 
     @staticmethod
-    def _frame_age(frame: dict[str, Any]) -> float:
+    def frame_age(frame: dict[str, Any]) -> float:
         local_recv = frame.get("local_recv_ns")
         if local_recv is not None:
             return (time.monotonic_ns() - local_recv) * 1e-9

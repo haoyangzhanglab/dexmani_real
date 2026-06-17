@@ -363,6 +363,8 @@ class XHand:
             raw_position[idx] = float(getattr(item, "raw_position", np.nan))
             temperature[idx] = float(getattr(item, "temperature", np.nan))
             commboard_err[idx] = int(getattr(item, "commboard_err", 0))
+            # SDK v1.1.8: field is misspelled "jonitboard_err" (not "jointboard_err").
+            # Use fallback chain to be compatible with both current and future SDK versions.
             jointboard_err[idx] = int(getattr(item, "jonitboard_err", getattr(item, "jointboard_err", 0)))
             tipboard_err[idx] = int(getattr(item, "tipboard_err", 0))
 

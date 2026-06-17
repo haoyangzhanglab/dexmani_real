@@ -262,7 +262,7 @@ class XArm7_XHand:
 
 def xarm7_xhand_example():
 
-    from dexmani_real.robot.model.constructor import add_base_components, add_light, create_viewer, setup_scene
+    from dexmani_real.simulation.constructor import add_base_components, add_light, create_viewer, setup_scene
 
     scene = setup_scene()
     add_light(scene)

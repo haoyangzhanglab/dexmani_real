@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from .planner_types import Pose
+from .types import Pose
 from .pose_utils import compose_pose, compute_pose_error, ensure_qpos, invert_pose
 
 

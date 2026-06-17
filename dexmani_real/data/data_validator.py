@@ -146,49 +146,45 @@ class DataValidator:
                     )
 
     def _check_timestamps(self, f: h5py.File, warnings: list[str]) -> None:
-        # Check for non-monotonic sequence in VR source_ts if available
-        pass
+        """Check for non-monotonic sequence in VR source_ts if available.
+
+        TODO: Implement timestamp monotonicity check once source_ts field is
+        consistently available across all recording versions.
+        See docs/code_quality_review.md for tracking.
+        """
+        # Not yet implemented — no-op placeholder
+
+    def _check_joint_range_group(
+        self,
+        f: h5py.File,
+        warnings: list[str],
+        keys: list[str],
+        lo: float,
+        hi: float,
+    ) -> None:
+        """Check that joint values for a group of keys fall within [lo, hi]."""
+        for key in keys:
+            if key not in f:
+                continue
+            data = np.asarray(f[key])
+            below = data < lo
+            above = data > hi
+            n_below = int(np.any(below, axis=1).sum())
+            n_above = int(np.any(above, axis=1).sum())
+            if n_below > 0:
+                warnings.append(f"/{key}: {n_below} frames below {lo} rad")
+            if n_above > 0:
+                warnings.append(f"/{key}: {n_above} frames above {hi} rad")
 
     def _check_joint_ranges(self, f: h5py.File, warnings: list[str]) -> None:
-        for key, (lo, hi) in [
-            ("obs/arm_qpos", self.ARM_JOINT_RANGE),
-            ("action/arm_qpos", self.ARM_JOINT_RANGE),
-        ]:
-            if key not in f:
-                continue
-            data = np.asarray(f[key])
-            below = data < lo
-            above = data > hi
-            n_below = int(np.any(below, axis=1).sum())
-            n_above = int(np.any(above, axis=1).sum())
-            if n_below > 0:
-                warnings.append(
-                    f"/{key}: {n_below} frames below {lo} rad"
-                )
-            if n_above > 0:
-                warnings.append(
-                    f"/{key}: {n_above} frames above {hi} rad"
-                )
-
-        for key, (lo, hi) in [
-            ("obs/hand_qpos", self.HAND_JOINT_RANGE),
-            ("action/hand_qpos", self.HAND_JOINT_RANGE),
-        ]:
-            if key not in f:
-                continue
-            data = np.asarray(f[key])
-            below = data < lo
-            above = data > hi
-            n_below = int(np.any(below, axis=1).sum())
-            n_above = int(np.any(above, axis=1).sum())
-            if n_below > 0:
-                warnings.append(
-                    f"/{key}: {n_below} frames below {lo} rad"
-                )
-            if n_above > 0:
-                warnings.append(
-                    f"/{key}: {n_above} frames above {hi} rad"
-                )
+        arm_keys = ["obs/arm_qpos", "action/arm_qpos"]
+        hand_keys = ["obs/hand_qpos", "action/hand_qpos"]
+        self._check_joint_range_group(
+            f, warnings, arm_keys, *self.ARM_JOINT_RANGE,
+        )
+        self._check_joint_range_group(
+            f, warnings, hand_keys, *self.HAND_JOINT_RANGE,
+        )
 
     def _check_current_temperature(self, f: h5py.File, warnings: list[str]) -> None:
         if "obs/hand_current" in f:

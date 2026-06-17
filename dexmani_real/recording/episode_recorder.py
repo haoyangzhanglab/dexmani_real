@@ -29,7 +29,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
-from dexmani_real.robot.robot_interface import RobotAction, RobotState
+from dexmani_real.robot.interface import RobotAction, RobotState
 
 
 class EpisodeRecorder:
@@ -161,7 +161,7 @@ class EpisodeRecorder:
         # Camera extrinsics
         if T_base_eef is not None:
             calib = self._file["meta"].attrs
-            camera_type = calib.get("camera_type", "") if hasattr(calib, "get") else ""
+            camera_type = calib.get("camera_type", "")
             if camera_type == "eye_in_hand":
                 T_eef_camera_raw = calib.get("camera_T_eef_camera", None)
                 if T_eef_camera_raw is not None:

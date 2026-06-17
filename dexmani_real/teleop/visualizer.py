@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from dexmani_real.planner.pose_utils import normalize_quat_wxyz
+from dexmani_real.planning.pose_utils import normalize_quat_wxyz
 from transforms3d.quaternions import quat2mat
 
 

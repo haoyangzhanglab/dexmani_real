@@ -11,8 +11,8 @@ Usage:
     # Direct VR (no IPC)
     python scripts/run_teleop.py --arm-ip 192.168.1.113 --hand-device /dev/ttyUSB0
 
-    # IPC mode (VR frames from SharedRingBuffer)
-    python scripts/run_teleop.py --ipc --arm-ip 192.168.1.113
+    # IPC mode (VR frames from SharedRingBuffer, no arm hardware)
+    python scripts/run_teleop.py --ipc --arm-only-vr
 
     # With recording
     python scripts/run_teleop.py --record --data-dir /data/episodes
@@ -30,19 +30,19 @@ import signal
 
 import numpy as np
 
-from dexmani_real.controller.teleop_controller import TeleopController
-from dexmani_real.planner.arm_planner import XArm7MotionPlanner
-from dexmani_real.planner.planner_types import (
+from dexmani_real.teleop.controller import TeleopController
+from dexmani_real.planning.planner import XArm7MotionPlanner
+from dexmani_real.planning.types import (
     PlanningProfile,
     Pose,
     TeleopProfile,
     XArm7PlannerConfig,
 )
-from dexmani_real.robot.robot_interface import RobotInterface, RobotInterfaceConfig
-from dexmani_real.teleop.arm_wrist_mapper import ArmWristMapper
+from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
+from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.dummy_tracker import DummyTracker
 from dexmani_real.teleop.hand_retarget import XHandRetargeter
-from dexmani_real.teleop.quest_hand_tracker import QuestHandTracker
+from dexmani_real.teleop.vr_tracker import QuestHandTracker
 
 # ── Paths ─────────────────────────────────────────────────────────
 from dexmani_real import ASSET_DIR
@@ -103,10 +103,10 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
 
     # Tracker
     tracker = None
-    if args.dry_run or args.arm_only_vr:
+    if args.dry_run:
         tracker = DummyTracker()
     elif args.ipc:
-        tracker = None  # VR frames come from IPC
+        tracker = None  # VR frames come from IPC (separate VR process)
     else:
         tracker = QuestHandTracker(
             transport=args.vr_transport,
@@ -137,10 +137,10 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
 
     # Recorder (optional)
     recorder = None
-    if getattr(args, "record", False):
+    if args.record:
         from dexmani_real.recording.episode_recorder import EpisodeRecorder
 
-        recorder = EpisodeRecorder(data_dir=getattr(args, "data_dir", "data/recordings"))
+        recorder = EpisodeRecorder(data_dir=args.data_dir)
         print(f"[run_teleop] Recording enabled → {recorder.data_dir}")
 
     # Keyboard queue
@@ -156,7 +156,7 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
         keyboard_queue=keyboard_queue,
         target_hz=float(args.rate),
         ema_alpha_arm=float(args.ema_arm),
-        ema_alpha_hand=float(getattr(args, "ema_hand", 0.3)),
+        ema_alpha_hand=float(args.ema_hand),
         dry_run=args.dry_run,
         recorder=recorder,
     )
@@ -174,9 +174,6 @@ def main() -> None:
                         help="Read VR frames from SharedRingBuffer")
     parser.add_argument("--ipc-name", default="vr_frame",
                         help="SharedRingBuffer name (default: vr_frame)")
-    parser.add_argument("--vr-only", action="store_true",
-                        help="VR + hand only (no arm hardware)")
-
     # Hardware
     parser.add_argument("--arm-ip", default="192.168.1.113",
                         help="xArm IP address")

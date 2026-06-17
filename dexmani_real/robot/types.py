@@ -1,0 +1,140 @@
+"""Robot 核心数据类型 — RobotState, RobotAction, RobotInterfaceConfig.
+
+这些类型被 controller/recording/config 等多个模块使用，
+独立于 RobotInterface 编排类，避免循环依赖。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.robot.xhand import XHandConfig
+
+
+@dataclass
+class RobotState:
+    """完整机器人状态 — 来自 RobotInterface.get_state()。
+
+    所有物理量单位标注在注释中。
+    """
+
+    # ── Arm 关节 ──
+    arm_qpos: np.ndarray          # (7,)  float64  rad
+    arm_qvel: np.ndarray          # (7,)  float64  rad/s
+    arm_tau: np.ndarray           # (7,)  float64  N·m (实为电机电流)
+
+    # ── EEF 位姿（双表示）──
+    eef_pos: np.ndarray           # (3,)  float64  m
+    eef_quat_wxyz: np.ndarray     # (4,)  float64
+    eef_rot6d: np.ndarray         # (6,)  float64
+
+    # ── Hand 关节 ──
+    hand_qpos: np.ndarray         # (12,) float64  rad
+    hand_current: np.ndarray      # (12,) float64  mA
+
+    # ── 触觉 ──
+    hand_tactile_sum: np.ndarray  # (5,3) float64  N
+    hand_tactile_raw: np.ndarray  # (5,120,3) float64
+
+    hand_temperature: np.ndarray  # (12,) float64  °C
+
+    # ── 派生（链式 FK）──
+    fingertip_pos: np.ndarray     # (5,3) float64  m (world frame)
+
+    # ── 状态 ──
+    arm_connected: bool
+    hand_connected: bool
+    hand_error: bool
+    timestamp: float              # seconds
+
+    def __post_init__(self):
+        for field_name, expected_shape in [
+            ("arm_qpos", (7,)),
+            ("arm_qvel", (7,)),
+            ("arm_tau", (7,)),
+            ("eef_pos", (3,)),
+            ("eef_quat_wxyz", (4,)),
+            ("eef_rot6d", (6,)),
+            ("hand_qpos", (12,)),
+            ("hand_current", (12,)),
+            ("hand_tactile_sum", (5, 3)),
+            ("hand_tactile_raw", (5, 120, 3)),
+            ("hand_temperature", (12,)),
+            ("fingertip_pos", (5, 3)),
+        ]:
+            val = getattr(self, field_name)
+            if val is not None:
+                arr = np.asarray(val)
+                if arr.shape != expected_shape:
+                    raise ValueError(
+                        f"RobotState.{field_name} shape mismatch: "
+                        f"expected {expected_shape}, got {arr.shape}"
+                    )
+
+
+@dataclass
+class RobotAction:
+    """发送给硬件的动作命令。
+
+    arm_qpos_cmd / hand_qpos_cmd: 经过 joint limit + delta limit 后的最终命令。
+    target_eef_pos / target_eef_rot6d: IK 前的 EEF 目标（可选）。
+    """
+
+    arm_qpos_cmd: np.ndarray             # (7,)  float64  rad
+    hand_qpos_cmd: np.ndarray            # (12,) float64  rad
+
+    target_eef_pos: np.ndarray | None = None    # (3,)  float64  m
+    target_eef_rot6d: np.ndarray | None = None  # (6,)  float64
+
+    def __post_init__(self):
+        for field_name, expected_shape in [
+            ("arm_qpos_cmd", (7,)),
+            ("hand_qpos_cmd", (12,)),
+        ]:
+            val = getattr(self, field_name)
+            if val is not None:
+                arr = np.asarray(val)
+                if arr.shape != expected_shape:
+                    raise ValueError(
+                        f"RobotAction.{field_name} shape mismatch: "
+                        f"expected {expected_shape}, got {arr.shape}"
+                    )
+
+
+@dataclass
+class RobotInterfaceConfig:
+    arm: XArm7Config = field(default_factory=XArm7Config)
+    hand: XHandConfig = field(default_factory=XHandConfig)
+
+    # Workspace safety
+    workspace_bounds: np.ndarray = field(
+        default_factory=lambda: np.array([
+            [0.0, 0.75],  # x [min, max] m
+            [-0.5, 0.5],  # y [min, max] m
+            [0.0, 0.6],   # z [min, max] m
+        ], dtype=np.float64)
+    )
+
+    # Environment collision (table at z=0.0 m in world frame)
+    add_table_collision: bool = True
+    table_z_world: float = 0.0      # table surface height (world frame, meters)
+    table_margin_xy: float = 0.15   # extra margin beyond workspace bounds
+    table_layers: int = 5           # number of z-layers for solid volume
+    table_layer_spacing: float = 0.01  # spacing between z-layers (meters)
+    table_xy_resolution: float = 0.02  # point spacing on each layer (meters)
+    table_x_min_clearance: float = 0.15  # minimum x distance from origin (protect robot base)
+
+    # Hand FK
+    hand_urdf_path: str = ""
+    fingertip_link_names: list[str] = field(default_factory=list)
+
+    # Static transform from EEF to hand base
+    T_eef_handbase_pos: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float64)
+    )
+    T_eef_handbase_quat_wxyz: np.ndarray = field(
+        default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    )

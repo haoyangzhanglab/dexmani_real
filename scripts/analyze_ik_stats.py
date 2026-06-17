@@ -22,8 +22,8 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planner.arm_planner import XArm7MotionPlanner
-from dexmani_real.planner.planner_types import (
+from dexmani_real.planning.planner import XArm7MotionPlanner
+from dexmani_real.planning.types import (
     PlanningProfile,
     Pose,
     TeleopProfile,
@@ -182,7 +182,7 @@ def analyze_ik_pipeline(
 
         # Track nominal tracking error
         current_pose = kin.compute_eef_pose_world(current_qpos)
-        from dexmani_real.planner.pose_utils import compute_pose_error
+        from dexmani_real.planning.pose_utils import compute_pose_error
         pos_err, rot_err = compute_pose_error(target_pose_world, current_pose)
         stats["tracking_pos_errors"].append(pos_err)
         stats["tracking_rot_errors"].append(rot_err)

@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dexmani_real.planner.planner_types import PlanningProfile, TeleopProfile
-from dexmani_real.robot.robot_interface import RobotInterfaceConfig
+from dexmani_real.planning.types import PlanningProfile, TeleopProfile
+from dexmani_real.robot.interface import RobotInterfaceConfig
 
 
 def _ndarray_to_list(obj):

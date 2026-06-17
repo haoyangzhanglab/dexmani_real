@@ -33,7 +33,7 @@ import numpy as np
 
 from dexmani_real.robot.xhand import JOINT_NAMES, XHand, XHandConfig
 from dexmani_real.teleop.hand_retarget import XHandRetargeter
-from dexmani_real.teleop.quest_hand_tracker import QuestHandTracker
+from dexmani_real.teleop.vr_tracker import QuestHandTracker
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.rate_limiter import RateLimiter
 
@@ -97,12 +97,14 @@ def test_quest_hand_teleop() -> None:
     )
     if not tracker.connect():
         status = tracker.get_status()
-        raise RuntimeError(
-            f"QuestHandTracker failed to connect: {tracker.last_error}\n"
+        print(
+            f"ERROR: QuestHandTracker failed to connect: {tracker.last_error}\n"
             f"  Status: {status}\n"
             f"  USB mode:  adb reverse tcp:8000 tcp:8000  +  HTS app in TCP Server mode\n"
-            f"  WiFi mode: set VR_TRANSPORT='tcp_server' VR_HOST='0.0.0.0'  +  HTS app in TCP Client mode"
+            f"  WiFi mode: set VR_TRANSPORT='tcp_server' VR_HOST='0.0.0.0'  +  HTS app in TCP Client mode",
+            file=sys.stderr,
         )
+        return
     print(f"  VR ready. ({tracker.get_status()['received_frames']} frames received)")
 
     # ── 2. XHand ───────────────────────────────────────────────
@@ -115,7 +117,8 @@ def test_quest_hand_teleop() -> None:
 
     if not xhand.connect():
         tracker.disconnect()
-        raise RuntimeError(f"XHand connect failed: {xhand.last_error_message}")
+        print(f"ERROR: XHand connect failed: {xhand.last_error_message}", file=sys.stderr)
+        return
 
     # Print initial state
     state = xhand.get_state(full=True)

@@ -40,10 +40,9 @@ Keyboard ──► multiprocessing.Queue ──► 控制信号(T/R/S/H/ESC)
 | **参考检索** | [reference-protocol.md](.claude/rules/reference-protocol.md) | 参考优先级、代码库位置、模块映射、Fact-Check、不采纳清单 |
 | **SDK 依赖** | [sdk-dependencies.md](.claude/rules/sdk-dependencies.md) | xArm/XHand/HTS/dex-retargeting/MPlib/SAPIEN API + 陷阱 |
 | **IPC 通信** | [ipc-spec.md](.claude/rules/ipc-spec.md) | RingBuffer、键盘事件、两阶段握手 |
-| **控制器** | [controller-spec.md](.claude/rules/controller-spec.md) | _tick 逻辑、EMA 平滑、VR re-anchoring、RateLimiter |
+| **遥操作** | [controller-spec.md](.claude/rules/controller-spec.md) | _tick 逻辑、EMA 平滑、VR re-anchoring、RateLimiter（controller + teleop 已合并为 `teleop/`） |
 | **录制层** | [recording-spec.md](.claude/rules/recording-spec.md) | HDF5 结构、EpisodeRecorder、QualityFlags |
 | **数据层** | [data-spec.md](.claude/rules/data-spec.md) | EpisodeReader、DataValidator、归一化 |
-| **部署层** | [deploy-spec.md](.claude/rules/deploy-spec.md) | PolicyLoader、PolicyRunner、SafetyMonitor |
 | **检查清单** | [checklist.md](.claude/rules/checklist.md) | 硬件驱动/传感器/控制器/录制/数据模块验收清单 |
 
 ---
@@ -104,8 +103,27 @@ libfranka+Ruckig C++ server / 解析式 IK (geofik) / LeRobot Parquet+draccus / 
 
 ---
 
+## 目录架构
+
+> 参考 LeFranX 的 `robots/` + `teleoperators/` 分层，BunnyVisionPro 的扁平整合模式。
+
+| 目录 | 说明 | 参考 |
+|------|------|------|
+| `robot/` | 硬件驱动（xarm7, xhand, interface, types） | LeFranX `robots/` |
+| `simulation/` | SAPIEN 物理仿真（constructor, xarm7_xhand, sim_adapter） | — |
+| `teleop/` | VR 遥操作（controller + teleop 合并） | LeFranX `teleoperators/` |
+| `planning/` | 运动规划、IK、运动学、WorkspaceSafety | LeFranX `arm_ik_processor.py` |
+| `recording/` | HDF5 录制（EpisodeRecorder, CameraRecorder） | — |
+| `sensor/` | 传感器驱动（RealSense） | — |
+| `data/` | 离线数据读写（EpisodeReader, DataValidator） | — |
+| `ipc/` | 进程间通信（SharedRingBuffer） | — |
+| `config/` | 全局配置（相机标定, PipelineConfig） | — |
+| `utils/` | 纯函数工具（rate_limiter, hand_utils, pointcloud_utils） | — |
+
 ## 参考模板
 
 **XHand（`robot/xhand.py`）** — 执行器模板：完整 Config dataclass + `connect()→bool` + `send_action(np.ndarray)→bool`（含 range clip + delta limit）+ 状态变量 + `example()`
 
 **RealSense（`sensor/realsense.py`）** — 传感器模板：frozen dataclass + 结构化 Frame 输出 + 点云解耦到 utils
+
+**SimRobotInterface（`simulation/sim_adapter.py`）** — 仿真适配器模板：实现 RobotInterface 接口，SAPIEN 物理推进

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planner import (
+from dexmani_real.planning import (
     PlanningProfile,
     Pose,
     TeleopProfile,
@@ -622,7 +622,7 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
                     if float(np.max(np.abs(poll_qpos - target_qpos))) < CONVERGE_THRESHOLD_RAD:
                         phase1_ok = True
                         break
-                except Exception:
+                except (RuntimeError, ValueError, OSError):
                     continue
             if not phase1_ok:
                 print(f"  [safe_return_home] Phase 1 convergence timeout after {max_wait:.1f}s")

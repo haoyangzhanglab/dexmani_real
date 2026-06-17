@@ -14,8 +14,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot.model.constructor import add_base_components, setup_scene
-from dexmani_real.robot.model.xarm7_xhand import XArm7_XHand
+from dexmani_real.simulation.constructor import add_base_components, setup_scene
+from dexmani_real.simulation.xarm7_xhand import XArm7_XHand
 
 
 @dataclass

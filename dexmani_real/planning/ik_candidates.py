@@ -7,7 +7,7 @@ import numpy as np
 if TYPE_CHECKING:
     from .kinematics import XArm7Kinematics
 
-from .planner_types import PlanningProfile, Pose
+from .types import PlanningProfile, Pose
 from .pose_utils import ensure_qpos
 
 

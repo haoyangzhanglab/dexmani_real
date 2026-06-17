@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -9,8 +10,10 @@ if TYPE_CHECKING:
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
-from .planner_types import IKResult, Pose, TeleopProfile
+from .types import IKResult, Pose, TeleopProfile
 from .pose_utils import compute_pose_error, ensure_qpos, pose_error_vector, wxyz_to_xyzw
+
+logger = logging.getLogger(__name__)
 
 
 class TeleopIKSolver:
@@ -210,13 +213,14 @@ class TeleopIKSolver:
         clipped = bool(np.any(np.abs(clipped_delta - raw_delta) > 1e-12))
 
         if clipped:
-            import sys
-            print(f"  [IK-CLIP] max_step_deg={np.round(np.rad2deg(max_step),1)}",
-                  f"raw_delta_deg={np.round(np.rad2deg(raw_delta),1)}",
-                  f"clipped_delta_deg={np.round(np.rad2deg(clipped_delta),1)}",
-                  f"cur={np.round(np.rad2deg(current_qpos),1)}",
-                  f"cmd={np.round(np.rad2deg(qpos_cmd),1)}",
-                  file=sys.stderr, flush=True)
+            logger.warning(
+                "  [IK-CLIP] max_step_deg=%s raw_delta_deg=%s clipped_delta_deg=%s cur=%s cmd=%s",
+                np.round(np.rad2deg(max_step), 1),
+                np.round(np.rad2deg(raw_delta), 1),
+                np.round(np.rad2deg(clipped_delta), 1),
+                np.round(np.rad2deg(current_qpos), 1),
+                np.round(np.rad2deg(qpos_cmd), 1),
+            )
 
         cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
         result_report = {

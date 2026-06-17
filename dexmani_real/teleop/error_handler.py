@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.robot.robot_interface import RobotAction
+from dexmani_real.robot.interface import RobotAction
 
 
 class TeleopErrorHandler:
@@ -28,6 +28,9 @@ class TeleopErrorHandler:
         self,
         ik_failure_limit: int = 10,
         vr_stale_limit: int = 50,  # frames at 50 Hz ≈ 1 s
+        retarget_failure_limit: int = 20,  # hand tracking may be noisier
+        wrist_map_failure_limit: int = 10,
+        joint_jump_failure_limit: int = 5,
     ) -> None:
         self._last_good_arm_qpos: np.ndarray | None = None
         self._last_good_hand_qpos: np.ndarray | None = None
@@ -40,6 +43,9 @@ class TeleopErrorHandler:
 
         self.ik_failure_limit = ik_failure_limit
         self.vr_stale_limit = vr_stale_limit
+        self.retarget_failure_limit = retarget_failure_limit
+        self.wrist_map_failure_limit = wrist_map_failure_limit
+        self.joint_jump_failure_limit = joint_jump_failure_limit
 
     # ------------------------------------------------------------------
     # Public API
@@ -49,6 +55,20 @@ class TeleopErrorHandler:
         self._last_good_arm_qpos = np.asarray(arm_qpos, dtype=np.float64).copy()
         self._last_good_hand_qpos = np.asarray(hand_qpos, dtype=np.float64).copy()
         self._reset_counters()
+
+    def record_arm_ok(self, arm_qpos: np.ndarray) -> None:
+        """IK succeeded: update last good arm position, reset IK counter."""
+        self._last_good_arm_qpos = np.asarray(arm_qpos, dtype=np.float64).copy()
+        self.ik_failures = 0
+
+    def record_hand_ok(self, hand_qpos: np.ndarray) -> None:
+        """Retarget succeeded: update last good hand position, reset retarget counter."""
+        self._last_good_hand_qpos = np.asarray(hand_qpos, dtype=np.float64).copy()
+        self.retarget_failures = 0
+
+    def record_jump_ok(self) -> None:
+        """Joint jump check passed: reset jump counter."""
+        self.joint_jump_failures = 0
 
     def record_failure(self, stage: str, msg: str = "") -> RobotAction:
         """Record a failure at a given stage and return a hold action."""
@@ -89,14 +109,18 @@ class TeleopErrorHandler:
         return (
             self.ik_failures > self.ik_failure_limit
             or self.vr_stale_frames > self.vr_stale_limit
+            or self.retarget_failures > self.retarget_failure_limit
+            or self.wrist_map_failures > self.wrist_map_failure_limit
+            or self.joint_jump_failures > self.joint_jump_failure_limit
         )
 
     def summary(self) -> str:
         return (
             f"ik={self.ik_failures}/{self.ik_failure_limit} "
             f"vr_stale={self.vr_stale_frames}/{self.vr_stale_limit} "
-            f"retarget={self.retarget_failures} wrist_map={self.wrist_map_failures} "
-            f"joint_jump={self.joint_jump_failures}"
+            f"retarget={self.retarget_failures}/{self.retarget_failure_limit} "
+            f"wrist_map={self.wrist_map_failures}/{self.wrist_map_failure_limit} "
+            f"joint_jump={self.joint_jump_failures}/{self.joint_jump_failure_limit}"
         )
 
     def clear(self) -> None:

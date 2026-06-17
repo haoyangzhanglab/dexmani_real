@@ -29,8 +29,8 @@ from collections import Counter
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planner import PlanningProfile, Pose, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.robot.model import SimRobotConfig, SimRobotInterface
+from dexmani_real.planning import PlanningProfile, Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 
 # ═══════════════════════════════════════════════ 配置
 

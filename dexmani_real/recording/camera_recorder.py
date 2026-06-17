@@ -7,6 +7,8 @@ for the controller process to consume during recording.
 from __future__ import annotations
 
 import multiprocessing
+import pickle
+import sys
 import time
 from typing import Any
 
@@ -74,8 +76,6 @@ class CameraRecorder:
         ring_config = RingBufferConfig(slot_count=256, slot_size=4_194_304, create=True)
         ring = SharedRingBuffer(self.ring_name, ring_config)
 
-        import pickle
-
         self._ready.set()
 
         dt = 1.0 / self.target_fps
@@ -96,8 +96,8 @@ class CameraRecorder:
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
                 last_time = time.perf_counter()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CameraRecorder] capture error: {e}", file=sys.stderr)
         finally:
             camera.disconnect()
             ring.close()
@@ -105,8 +105,6 @@ class CameraRecorder:
     @staticmethod
     def read_frame(ring_buffer: Any) -> dict[str, Any] | None:
         """Read latest camera frame from ring buffer. Called from controller."""
-        import pickle
-
         data, _ = ring_buffer.read(last_seq=-1)
         if data is None:
             return None

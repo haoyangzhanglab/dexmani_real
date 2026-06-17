@@ -27,11 +27,11 @@ from pynput import keyboard as pynput_keyboard
 from transforms3d import euler
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planner import (
+from dexmani_real.planning import (
     PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig,
 )
-from dexmani_real.robot.model import SimRobotConfig, SimRobotInterface
-from dexmani_real.robot.model.constructor import add_light, create_viewer
+from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
+from dexmani_real.simulation.constructor import add_light, create_viewer
 
 # ═══════════════════════════════════════════════ 配置
 

@@ -35,14 +35,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planner import (
+from dexmani_real.planning import (
     PlanningProfile,
     Pose,
     TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.robot.robot_interface import RobotAction, RobotInterface, RobotInterfaceConfig
+from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
 
 # ═══════════════════════════════════════════════ 配置
