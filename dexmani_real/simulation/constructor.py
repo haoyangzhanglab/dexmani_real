@@ -4,9 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import sapien.core as sapien
-from transforms3d import quaternions
 
-__all__ = ["PhysxConfig", "setup_scene", "create_viewer", "add_light", "add_base_components", "look_at"]
+__all__ = ["PhysxConfig", "setup_scene", "create_viewer", "add_light", "add_base_components"]
 
 
 @dataclass
@@ -99,24 +98,3 @@ def add_base_components(scene: sapien.Scene):
     table_builder.add_box_collision(half_size=[0.5, 1.0, 0.5], material=sapien.physx.PhysxMaterial(0.8, 0.8, 0))
     table = table_builder.build_kinematic(name="table")
     table.set_pose(sapien.Pose(p=[0.4, 0, -0.5]))
-
-
-def look_at(eye: np.ndarray, target: np.ndarray) -> sapien.Pose:
-    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-    forward = target - eye
-    forward_norm = np.linalg.norm(forward)
-    if forward_norm < 1e-6:
-        raise ValueError("eye and target are too close")
-    forward /= forward_norm
-
-    left = np.cross(up, forward)
-    left_norm = np.linalg.norm(left)
-    if left_norm < 1e-6:
-        raise ValueError("up is parallel to viewing direction")
-    left /= left_norm
-
-    up = np.cross(forward, left)
-    rotation = np.column_stack((forward, left, up))
-
-    return sapien.Pose(p=eye, q=quaternions.mat2quat(rotation))

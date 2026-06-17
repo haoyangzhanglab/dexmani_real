@@ -41,11 +41,9 @@ class EpisodeRecorder:
     def __init__(
         self,
         data_dir: str,
-        camera_recorder: Any | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.camera_recorder = camera_recorder
 
         self._file: h5py.File | None = None
         self._frame_count: int = 0
@@ -114,8 +112,6 @@ class EpisodeRecorder:
         self._file.create_group("obs")
         self._file.create_group("action")
         self._file.create_group("vr")
-        if self.camera_recorder is not None:
-            self._file.create_group("camera")
 
         return True
 
@@ -174,7 +170,7 @@ class EpisodeRecorder:
             self._append_or_create("camera/extrinsics", T_base_camera)
 
         # Camera frames (RGB + depth)
-        if camera_frame is not None and self.camera_recorder is not None:
+        if camera_frame is not None:
             rgb = camera_frame.get("rgb")
             depth = camera_frame.get("depth")
             ts = camera_frame.get("timestamp", 0.0)

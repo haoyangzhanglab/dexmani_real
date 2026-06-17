@@ -45,7 +45,13 @@ class CameraCalibEntry:
 class CameraCalib:
     def __init__(self, calib_path: str | None = None):
         if calib_path is None:
-            calib_path = os.path.join(os.path.dirname(__file__), "calib", "cameras.json")
+            # 优先查找项目根目录下的 configs/cameras.json（外提后位置）
+            # fallback 到包内旧路径 calib/cameras.json
+            pkg_dir = Path(__file__).resolve().parent
+            project_root = pkg_dir.parent.parent
+            new_path = project_root / "configs" / "cameras.json"
+            old_path = pkg_dir / "calib" / "cameras.json"
+            calib_path = str(new_path) if new_path.exists() else str(old_path)
         self.calib_path = Path(calib_path).resolve()
         self._entries: dict[str, CameraCalibEntry] = {}
         self._load()

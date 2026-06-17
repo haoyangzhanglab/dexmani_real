@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dexmani_real import ASSET_DIR
-from dexmani_real.teleop.ref_adapter import XHandRefAdapter
+from dexmani_real.teleop.vr.ref_adapter import XHandRefAdapter
 
 class XHandRetargeter:
     def __init__(

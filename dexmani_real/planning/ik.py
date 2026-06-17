@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -12,8 +11,6 @@ if TYPE_CHECKING:
 
 from .types import IKResult, Pose, TeleopProfile
 from .pose_utils import ensure_qpos, pose_error_vector, wxyz_to_xyzw
-
-logger = logging.getLogger(__name__)
 
 
 class TeleopIKSolver:

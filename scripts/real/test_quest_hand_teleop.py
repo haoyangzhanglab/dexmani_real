@@ -23,6 +23,11 @@ Usage:
 
 from __future__ import annotations
 
+# sys.path修正：脚本已从dexmani_real/example/移至scripts/
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+
+
 import select
 import sys
 import termios
@@ -32,8 +37,8 @@ import tty
 import numpy as np
 
 from dexmani_real.robot.xhand import JOINT_NAMES, XHand, XHandConfig
-from dexmani_real.teleop.hand_retarget import XHandRetargeter
-from dexmani_real.teleop.vr_tracker import QuestHandTracker
+from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.rate_limiter import RateLimiter
 

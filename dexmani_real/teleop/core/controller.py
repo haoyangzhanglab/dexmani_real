@@ -8,9 +8,8 @@ State machine:
   return_to_home          EMERGENCY_STOP (ESC / timeout)
 
 Data sources:
-    --no-ipc (default): tracker.get_latest() directly
-    --ipc:               ipc_buffer.read() → pickle.loads()
-    dry-run:             dummy state, no hardware
+    tracker: tracker.get_latest() directly
+    dry-run: dummy state, no hardware
 """
 
 from __future__ import annotations
@@ -23,10 +22,10 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.teleop.error_handler import TeleopErrorHandler
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
-from dexmani_real.teleop.safety import SafetyChecker
-from dexmani_real.teleop.tracking import (
+from dexmani_real.teleop.core.error_handler import TeleopErrorHandler
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.teleop.control.safety import SafetyChecker
+from dexmani_real.teleop.core.tracking import (
     TrackingQuality,
     TrackingQualityConfig,
 )
@@ -85,8 +84,7 @@ class TeleopController:
         retargeter: Any,             # XHandRetargeter
         planner: Any,                # XArm7MotionPlanner
         *,
-        tracker: Any | None = None,  # QuestHandTracker (None = dry-run or IPC)
-        ipc_buffer: Any | None = None,  # SharedRingBuffer
+        tracker: Any | None = None,  # QuestHandTracker (None = dry-run)
         keyboard_queue: Any | None = None,
         target_hz: float = 50.0,
         ema_alpha_arm: float = 1.0,  # 1.0 = no smoothing (disabled)
@@ -98,7 +96,6 @@ class TeleopController:
         self.retargeter = retargeter
         self.planner = planner
         self.tracker = tracker
-        self.ipc_buffer = ipc_buffer
         self.dry_run = dry_run
         self.recorder = recorder
 
@@ -159,7 +156,7 @@ class TeleopController:
 
         print(f"[TeleopController] Entering main loop at {self.limiter.target_hz:.0f} Hz")
         print(f"  Mode: {'dry-run' if self.dry_run else 'hardware'}")
-        print(f"  VR: {'IPC' if self.ipc_buffer is not None else 'direct'}")
+        print(f"  VR: direct")
         print(f"  EMA: arm_alpha={self.ema_alpha_arm} (hand uses dex-retargeting low_pass_alpha)")
         print(f"  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
 
@@ -542,23 +539,9 @@ class TeleopController:
     # ------------------------------------------------------------------
 
     def _read_vr_frame(self) -> dict[str, Any] | None:
-        if self.ipc_buffer is not None:
-            return self._read_vr_ipc()
         if self.tracker is not None:
             return self.tracker.get_latest()
         return None
-
-    def _read_vr_ipc(self) -> dict[str, Any] | None:
-        import pickle
-
-        data, _ = self.ipc_buffer.read(last_seq=-1)
-        if data is None:
-            return None
-        try:
-            return pickle.loads(data)
-        except Exception as e:
-            print(f"[WARN] VR IPC deserialization failed: {e}")
-            return None
 
     # ------------------------------------------------------------------
     # EMA smoothing
@@ -650,8 +633,8 @@ def example() -> None:
         XArm7PlannerConfig,
     )
     from dexmani_real.robot.interface import RobotInterfaceConfig
-    from dexmani_real.teleop.arm_mapper import ArmWristMapper
-    from dexmani_real.teleop.hand_retarget import XHandRetargeter
+    from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
+    from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 
     q = multiprocessing.Queue()
 
@@ -691,7 +674,7 @@ def example() -> None:
     print("Starting dry-run TeleopController. Press Ctrl+C to stop.")
     print("Insert dummy VR frames for 5 s to simulate tracking...")
 
-    from dexmani_real.teleop.dummy_tracker import DummyTracker
+    from dexmani_real.teleop.vr.dummy_tracker import DummyTracker
 
     controller.tracker = DummyTracker()
 
