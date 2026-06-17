@@ -44,6 +44,8 @@ SAMPLE_X = (0.28, 0.70)
 SAMPLE_Y = (-0.40, 0.40)
 SAMPLE_Z = (0.02, 0.55)
 
+SIMULATE_PATHS = False  # Set True to validate paths in SAPIEN before real-arm exec
+
 SAFE_WAYPOINTS = [
     {"pos": (0.45,  0.00, 0.33), "label": "center"},
     {"pos": (0.30,  0.00, 0.35), "label": "near_center"},
@@ -169,7 +171,6 @@ def create_planner(seed: int = DEFAULT_SEED) -> XArm7MotionPlanner:
             max_ik_jump_deg=(30, 30, 30, 30, 45, 45, 60),
             max_pose_error_pos_m=0.01,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            hold_on_failure=True,
         ),
     )
 
@@ -531,6 +532,19 @@ def run_waypoint_test(
     print(f"  [{label}] plan: src={result.source}  wp={num_waypoints}  "
           f"len={path_len:.2f}rad  t={plan_t:.3f}s")
 
+    # 碰撞检测验证（使用 planner 内置 FCL）
+    collision_report = validate_path_collisions(planner, result.qpos_path)
+    if not collision_report["ok"]:
+        print(f"  [{label}] COLLISION WARNING: {collision_report['errors']}")
+
+    # SAPIEN 仿真验证（可选，较重）
+    if SIMULATE_PATHS:
+        sim_report = simulate_path_in_sapien(result.qpos_path, arm.config.init_qpos)
+        if not sim_report["ok"]:
+            print(f"  [{label}] SIM WARNING: {sim_report['errors']}")
+            if sim_report["warnings"]:
+                print(f"           sim warnings: {sim_report['warnings']}")
+
     exec_ok, _, track = execute_path_on_arm(arm, result.qpos_path)
     if not exec_ok:
         print(f"  [{label}] EXEC FAILED")
@@ -564,98 +578,171 @@ def run_waypoint_test(
     return ok
 
 
+def validate_path_collisions(
+    planner: XArm7MotionPlanner, qpos_path: np.ndarray
+) -> dict:
+    """Validate a planned joint path for self- and environment collisions.
+
+    Returns dict with:
+        ok: bool
+        errors: list[str]
+        checked: int — number of waypoints checked
+    """
+    profile = planner.planning_profile
+    errors = []
+    checked = 0
+    for i, q in enumerate(qpos_path):
+        q_7 = np.asarray(q, dtype=np.float64).ravel()[:7]
+        if profile.check_self_collision and planner.has_self_collision(q_7):
+            errors.append(f"waypoint {i}: self-collision")
+        if profile.check_env_collision and planner.has_env_collision(q_7):
+            errors.append(f"waypoint {i}: env-collision")
+        checked += 1
+    return {"ok": len(errors) == 0, "errors": errors, "checked": checked}
+
+
+def simulate_path_in_sapien(
+    qpos_path: np.ndarray, home_qpos: np.ndarray
+) -> dict:
+    """Validate a planned joint path in SAPIEN simulation.
+
+    NOTE: Heavy dependency (sapien). Only call when full physics verification
+    is needed.  For fast collision checking, use validate_path_collisions().
+
+    Returns dict with:
+        ok: bool
+        errors: list[str]
+        warnings: list[str]
+    """
+    import sapien.core as sapien
+    from dexmani_real.simulation.constructor import setup_scene
+    from dexmani_real.simulation.xarm7_xhand import XArm7_XHand
+
+    report: dict = {"ok": True, "errors": [], "warnings": []}
+    scene = None
+    try:
+        scene = setup_scene(time_step=1.0 / 240.0)
+        robot = XArm7_XHand(
+            scene,
+            disable_self_collision=False,
+            arm_home_qpos=np.asarray(home_qpos, dtype=np.float64).ravel()[:7],
+        )
+    except Exception as e:
+        report["ok"] = False
+        report["errors"].append(f"Sim setup failed: {e}")
+        return report
+
+    try:
+        qlimits = robot.qlimits
+        for i, qpos_arm7 in enumerate(qpos_path):
+            full_qpos = np.concatenate([
+                np.asarray(qpos_arm7, dtype=np.float64).ravel()[:7],
+                np.zeros(12, dtype=np.float64),
+            ])
+
+            # Joint limit check
+            if np.any(full_qpos[:7] < qlimits[:7, 0]) or np.any(full_qpos[:7] > qlimits[:7, 1]):
+                report["warnings"].append(f"Waypoint {i}: joint limit violation")
+
+            robot.set_qpos(full_qpos)
+            robot.balance_passive_force()
+
+            # Step physics to let contacts settle
+            for _ in range(3):
+                scene.step()
+
+            # Check self-collision
+            contacts = scene.get_contacts()
+            if contacts is not None and len(contacts) > 0:
+                report["errors"].append(f"Waypoint {i}: {len(contacts)} contacts detected")
+                report["ok"] = False
+    except Exception as e:
+        report["ok"] = False
+        report["errors"].append(f"Path sim error: {e}")
+
+    return report
+
+
+def _fallback_reset(arm: XArm7, home_qpos: np.ndarray) -> float:
+    """紧急恢复：stop → clear_error → arm.reset(home_qpos)。
+
+    仅在 arm.reset() 直接调用失败时使用。通过 E-stop 清空所有 pending
+    命令，重置 arm 状态，再用阻塞式 set_servo_angle(wait=True) 归位。
+
+    Returns: max joint error from home_qpos (deg)
+    """
+    print("  [_fallback_reset] emergency stop + clear...")
+    arm.stop()
+    time.sleep(0.5)
+    arm.clear_error()
+    time.sleep(0.3)
+
+    print("  [_fallback_reset] resetting to home (blocking)...")
+    ok = arm.reset(home_qpos)
+    if not ok:
+        print(f"  [_fallback_reset] reset failed ({arm.last_error_message}), retrying...")
+        arm.stop()
+        time.sleep(0.3)
+        arm.clear_error()
+        time.sleep(0.3)
+        arm.reset(home_qpos)
+
+    time.sleep(0.5)
+    final = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
+    err = float(np.rad2deg(np.max(np.abs(final - home_qpos))))
+    print(f"  [_fallback_reset] final error: {err:.2f}deg")
+    return err
+
+
 def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndarray,
                      home_eef: Pose, dt: float = ARM_DT) -> float:
-    """两阶段安全归位（ref: RobotInterface.return_to_home）。
+    """安全归位：plan_path 碰撞预警 + 阻塞式 arm.reset() 执行。
 
-    Phase 1: plan_path → home EEF（自碰撞 + 环境碰撞检测），闭环收敛验证
-    Phase 2: 关节空间精调，逐点自碰撞+环境碰撞 → home_qpos
-             碰撞时跳过 Phase 2（不 fallback 到 arm.reset，那是同一条直线路径）
+    设计原则：
+    - arm.reset() 使用 set_servo_angle(wait=True)，不经过伺服缓冲区
+    - plan_path 仅做碰撞安全预警（~0.01s），不改变执行路径
+    - _fallback_reset() 仅在 arm.reset() 直接失败时调用
 
     Returns: max joint error from home_qpos (deg)
     """
     current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
-    if not np.all(np.isfinite(current_qpos)):
-        arm.reset(home_qpos)
-        time.sleep(1.0)
-        final = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
-        return float(np.rad2deg(np.max(np.abs(final - home_qpos))))
 
-    # 已在 home？（joint 偏差 < HOME_AT_THRESHOLD_RAD）
+    if not np.all(np.isfinite(current_qpos)):
+        return _fallback_reset(arm, home_qpos)
+
+    # 已在 home（joint 偏差 < 1°）
     if float(np.max(np.abs(current_qpos - home_qpos))) < HOME_AT_THRESHOLD_RAD:
         return float(np.rad2deg(np.max(np.abs(current_qpos - home_qpos))))
 
-    # Phase 1: EEF 路径 → home EEF
-    phase1_ok = False
-    phase1_send_ok = True
+    # 碰撞安全预警（plan_path 内部已做 FCL 碰撞检测）
     result = planner.plan_path(home_eef, current_qpos)
-    if result.success and result.qpos_path is not None and len(result.qpos_path) > 0:
-        # 插值为 1° 步长稠密路径，避免 _limit_joint_step 裁剪大跳变
-        dense_path = interpolate_waypoints(result.qpos_path)
-        for wp in dense_path:
-            if arm.is_error():
-                phase1_send_ok = False
-                break
-            if not arm.send_action(wp):
-                phase1_send_ok = False
-                break
-            time.sleep(dt)
+    if result.success:
+        print(f"  [safe_return_home] plan OK (src={result.source})")
+    else:
+        print(f"  [safe_return_home] plan WARNING: {result.reason}")
 
-        if not phase1_send_ok:
-            print("  [safe_return_home] Phase 1 send_action failed, skipping convergence")
-        else:
-            # 闭环收敛验证：轮询 qpos 直到误差 < CONVERGE_THRESHOLD_RAD 或超时
-            target_qpos = result.qpos_path[-1]
-            min_qvel = float(np.min(arm.config.max_qvel))
-            path_len = float(np.max(np.abs(target_qpos - result.qpos_path[0])))
-            max_wait = max(dt * 5, path_len / min_qvel * 5.0)
-            poll_interval = dt * 2
-            elapsed = 0.0
-            while elapsed < max_wait:
-                time.sleep(poll_interval)
-                elapsed += poll_interval
-                try:
-                    poll_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
-                    if not np.all(np.isfinite(poll_qpos)):
-                        continue
-                    if float(np.max(np.abs(poll_qpos - target_qpos))) < CONVERGE_THRESHOLD_RAD:
-                        phase1_ok = True
-                        break
-                except (RuntimeError, ValueError, OSError):
-                    continue
-            if not phase1_ok:
-                print(f"  [safe_return_home] Phase 1 convergence timeout after {max_wait:.1f}s")
+    # 轻量清理 + 阻塞式归位（不走 servo 缓冲区，无 code=1 风险）
+    arm.clear_error()
+    ok = arm.reset(home_qpos)
+    time.sleep(0.3)
 
-    # Phase 2: 关节空间精调，逐点自碰撞 + 环境碰撞检查
-    if phase1_ok:
-        current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
-        if np.all(np.isfinite(current_qpos)):
-            joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
-            if joint_delta > PHASE2_MIN_DELTA_RAD:
-                n = max(2, int(np.ceil(joint_delta / PHASE2_MAX_STEP_RAD)) + 1)
-                joint_path = np.array([current_qpos + (k / (n - 1)) * (home_qpos - current_qpos)
-                                       for k in range(n)])
-
-                profile = planner.planning_profile
-                collision_free = True
-                for q in joint_path:
-                    if (profile.check_self_collision and planner.has_self_collision(q)) or \
-                       (profile.check_env_collision and planner.has_env_collision(q)):
-                        collision_free = False
-                        break
-                if collision_free:
-                    for wp in joint_path:
-                        if arm.is_error():
-                            break
-                        if not arm.send_action(wp):
-                            break
-                        time.sleep(dt)
-                else:
-                    print("  [safe_return_home] Phase 2 self-collides, skipping "
-                          "(EEF already at home from Phase 1)")
+    if not ok or arm.is_error():
+        print("  [safe_return_home] direct reset failed, falling back to _fallback_reset()")
+        return _fallback_reset(arm, home_qpos)
 
     final = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
-    return float(np.rad2deg(np.max(np.abs(final - home_qpos))))
+    err = float(np.rad2deg(np.max(np.abs(final - home_qpos))))
+
+    # 残余误差微调（arm.reset 后通常 < 0.1°，此处仅为安全网）
+    if err > 0.5:
+        for _ in range(3):
+            arm.send_action(home_qpos)
+            time.sleep(0.1)
+        time.sleep(0.2)
+        final = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
+        err = float(np.rad2deg(np.max(np.abs(final - home_qpos))))
+
+    return err
 
 
 # ═══════════════════════════════════════════════ 主流程
@@ -695,6 +782,10 @@ def main():
         print("初始归位...")
         init_err = safe_return_home(arm, planner, home_qpos, home_eef)
         print(f"初始归位误差: {init_err:.2f}deg")
+        if init_err > 5.0:
+            print("归位误差过大，fallback 到 arm.reset()")
+            arm.reset(home_qpos)
+            time.sleep(1.0)
         print(f"home EEF: {np.round(home_eef.p, 4)}m  quat={np.round(home_eef.q, 4)}")
 
         # 首次运动递增验证
@@ -757,6 +848,12 @@ def main():
         print("最终归位...")
         final_err = safe_return_home(arm, planner, home_qpos, home_eef)
         print(f"最终归位误差: {final_err:.2f}deg")
+        if final_err > 5.0:
+            print("最终归位误差过大，fallback 到 arm.reset()")
+            arm.reset(home_qpos)
+            time.sleep(1.0)
+            final_retry = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
+            print(f"额外 reset 后误差: {np.rad2deg(np.max(np.abs(final_retry - home_qpos))):.2f}deg")
 
         # ══ Summary ══
         print(f"\n{'='*60}")

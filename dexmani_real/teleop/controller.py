@@ -426,6 +426,10 @@ class TeleopController:
             if self.state == ControllerState.IDLE:
                 # Re-anchor VR reference so arm starts tracking immediately
                 self._reset_mapper()
+                # Reset soft-start ramp — ensures speed limit protection
+                # even if robot was idle for minutes after connect()
+                if not self.dry_run:
+                    self.robot.reset_soft_start()
                 self.state = ControllerState.TELEOP
                 print("[Controller] IDLE → TELEOP")
             # else: already in TELEOP or RECORDING, no-op

@@ -56,6 +56,9 @@ class XArm7PlannerConfig:
     use_convex: bool = False
     joint_vel_limits_deg: tuple[float, ...] = (60, 60, 60, 60, 90, 90, 120)
     joint_acc_scale: float = 2.0
+    # Cartesian workspace bounds (world frame). (3,2) [[x_min,x_max],[y_min,y_max],[z_min,z_max]].
+    # None disables the check (backward compatible).
+    workspace_bounds: np.ndarray | None = None
 
 
 @dataclass(kw_only=True)
@@ -102,14 +105,12 @@ class TeleopProfile:
     # max_qpos_cmd_speed_deg was removed — IK/planning layer should not clip speed.
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
-    hold_on_failure: bool = True
-    check_self_collision: bool = True
+    check_self_collision: bool = True  # only used in path planning, not teleop hot path
 
     use_position_ik: bool = True
     use_differential_ik_fallback: bool = True
-    differential_ik_gain: float = 0.6
+    differential_ik_gain: float = 1.0       # full tracking, bottleneck limit handles speed
     differential_ik_damping: float = 0.05
     differential_ik_max_pos_step_m: float = 0.02
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
-    debug: bool = False
 

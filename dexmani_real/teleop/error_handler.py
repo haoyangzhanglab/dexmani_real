@@ -1,12 +1,13 @@
-"""hold-on-failure + error counting + emergency-stop escalation.
+"""hold-on-failure: on any pipeline failure, return current joint positions (hold in place).
 
-LeFranX pattern: on any failure, return current joint positions (hold in place).
-Five fallback points:
-  1. VR tracking stale → hold
-  2. Wrist mapper not ready → hold
-  3. IK failed → hold
-  4. Retarget failed → hold
-  5. Joint jump abnormal → hold
+Simplified design (ref: ufactory_teleop — no cumulative counters, just per-frame hold):
+  VR tracking stale → hold
+  Wrist mapper not ready → hold
+  IK failed → hold
+  Retarget failed → hold
+
+Cumulative E-Stop escalation removed — per-frame hold is sufficient safety;
+persistent failures are caught by robot.is_error() at the driver level.
 """
 
 from __future__ import annotations
@@ -17,81 +18,40 @@ from dexmani_real.robot.interface import RobotAction
 
 
 class TeleopErrorHandler:
-    """Hold-on-failure accumulator with emergency-stop escalation.
+    """Per-frame hold-on-failure.  No cumulative counters, no E-Stop escalation.
 
-    Keeps track of the last known-good arm and hand qpos so that any
-    pipeline failure can return a ``RobotAction`` that holds the robot
-    in place instead of sending a wild command.
+    Keeps the last known-good arm and hand qpos so that any pipeline
+    failure returns a ``RobotAction`` that holds the robot in place
+    instead of sending a wild command.
     """
 
-    def __init__(
-        self,
-        ik_failure_limit: int = 10,
-        vr_stale_limit: int = 50,  # frames at 50 Hz ≈ 1 s
-        retarget_failure_limit: int = 20,  # hand tracking may be noisier
-        wrist_map_failure_limit: int = 10,
-        joint_jump_failure_limit: int = 5,
-    ) -> None:
+    def __init__(self) -> None:
         self._last_good_arm_qpos: np.ndarray | None = None
         self._last_good_hand_qpos: np.ndarray | None = None
-
-        self.ik_failures: int = 0
-        self.retarget_failures: int = 0
-        self.vr_stale_frames: int = 0
-        self.wrist_map_failures: int = 0
-        self.joint_jump_failures: int = 0
-
-        self.ik_failure_limit = ik_failure_limit
-        self.vr_stale_limit = vr_stale_limit
-        self.retarget_failure_limit = retarget_failure_limit
-        self.wrist_map_failure_limit = wrist_map_failure_limit
-        self.joint_jump_failure_limit = joint_jump_failure_limit
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def record_success(self, arm_qpos: np.ndarray, hand_qpos: np.ndarray) -> None:
-        self._last_good_arm_qpos = np.asarray(arm_qpos, dtype=np.float64).copy()
-        self._last_good_hand_qpos = np.asarray(hand_qpos, dtype=np.float64).copy()
-        self._reset_counters()
-
-    def record_arm_ok(self, arm_qpos: np.ndarray) -> None:
-        """IK succeeded: update last good arm position, reset IK counter."""
-        self._last_good_arm_qpos = np.asarray(arm_qpos, dtype=np.float64).copy()
-        self.ik_failures = 0
-
-    def record_hand_ok(self, hand_qpos: np.ndarray) -> None:
-        """Retarget succeeded: update last good hand position, reset retarget counter."""
-        self._last_good_hand_qpos = np.asarray(hand_qpos, dtype=np.float64).copy()
-        self.retarget_failures = 0
-
-    def record_jump_ok(self) -> None:
-        """Joint jump check passed: reset jump counter."""
-        self.joint_jump_failures = 0
-
     def record_failure(self, stage: str, msg: str = "") -> RobotAction:
         """Record a failure at a given stage and return a hold action."""
-        if stage == "ik":
-            self.ik_failures += 1
-        elif stage == "retarget":
-            self.retarget_failures += 1
-        elif stage == "vr_stale":
-            self.vr_stale_frames += 1
-        elif stage == "wrist_map":
-            self.wrist_map_failures += 1
-        elif stage == "joint_jump":
-            self.joint_jump_failures += 1
         return self.hold_action()
 
     def init_fallback(self, arm_qpos: np.ndarray, hand_qpos: np.ndarray) -> None:
-        """Initialize fallback positions from current state. Idempotent."""
+        """Initialize fallback positions from current state. Idempotent — only
+        sets positions that haven't been recorded yet."""
         if self._last_good_arm_qpos is None:
             self._last_good_arm_qpos = np.asarray(arm_qpos, dtype=np.float64).copy()
         if self._last_good_hand_qpos is None:
             self._last_good_hand_qpos = np.asarray(hand_qpos, dtype=np.float64).copy()
 
     def hold_action(self) -> RobotAction:
+        """Return a hold-in-place action (last good positions).
+
+        Falls back to zero positions only if no good position has ever been
+        recorded — this should never happen in normal operation since
+        init_fallback() is called at the top of every _compute_action().
+        """
         arm = (
             self._last_good_arm_qpos.copy()
             if self._last_good_arm_qpos is not None
@@ -104,54 +64,37 @@ class TeleopErrorHandler:
         )
         return RobotAction(arm_qpos_cmd=arm, hand_qpos_cmd=hand)
 
-    @property
-    def should_emergency_stop(self) -> bool:
-        return (
-            self.ik_failures > self.ik_failure_limit
-            or self.vr_stale_frames > self.vr_stale_limit
-            or self.retarget_failures > self.retarget_failure_limit
-            or self.wrist_map_failures > self.wrist_map_failure_limit
-            or self.joint_jump_failures > self.joint_jump_failure_limit
-        )
+    def update_good_positions(self, arm_qpos: np.ndarray, hand_qpos: np.ndarray) -> None:
+        """Update last-good positions after a successful arm + hand pipeline tick."""
+        self._last_good_arm_qpos = np.asarray(arm_qpos, dtype=np.float64).copy()
+        self._last_good_hand_qpos = np.asarray(hand_qpos, dtype=np.float64).copy()
 
-    def summary(self) -> str:
-        return (
-            f"ik={self.ik_failures}/{self.ik_failure_limit} "
-            f"vr_stale={self.vr_stale_frames}/{self.vr_stale_limit} "
-            f"retarget={self.retarget_failures}/{self.retarget_failure_limit} "
-            f"wrist_map={self.wrist_map_failures}/{self.wrist_map_failure_limit} "
-            f"joint_jump={self.joint_jump_failures}/{self.joint_jump_failure_limit}"
-        )
+    @property
+    def is_ready(self) -> bool:
+        """True once fallback positions have been initialised."""
+        return self._last_good_arm_qpos is not None
 
     def clear(self) -> None:
-        self._reset_counters()
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _reset_counters(self) -> None:
-        self.ik_failures = 0
-        self.retarget_failures = 0
-        self.vr_stale_frames = 0
-        self.wrist_map_failures = 0
-        self.joint_jump_failures = 0
+        """Reset last-good positions (e.g. on state transition)."""
+        self._last_good_arm_qpos = None
+        self._last_good_hand_qpos = None
 
 
 def example() -> None:
     handler = TeleopErrorHandler()
-    handler.record_success(
-        arm_qpos=np.zeros(7), hand_qpos=np.zeros(12)
-    )
+    handler.init_fallback(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))
 
     action = handler.record_failure("ik", "IK returned None")
     print(f"hold action arm={action.arm_qpos_cmd[:3]}...")
-    print(f"summary: {handler.summary()}")
 
-    # Simulate IK failures > limit
-    for _ in range(11):
-        handler.record_failure("ik")
-    print(f"should_emergency_stop: {handler.should_emergency_stop}")
+    # Update after successful tick
+    handler.update_good_positions(
+        arm_qpos=np.array([0.1] * 7), hand_qpos=np.array([0.5] * 12)
+    )
+    action = handler.hold_action()
+    print(f"updated hold arm={action.arm_qpos_cmd[:3]}...")
+
+    print(f"is_ready: {handler.is_ready}")
 
 
 if __name__ == "__main__":

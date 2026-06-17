@@ -197,7 +197,7 @@ def main():
             max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),  # tight: reject IK branch switches (keyboard EEF moves 5mm/step → ~0.5° per joint)
             max_pose_error_pos_m=0.01,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            hold_on_failure=True,
+            
         ),
     )
 

@@ -309,6 +309,14 @@ class RobotInterface:
         return result
 
 
+    def reset_soft_start(self) -> None:
+        """Reset arm soft-start ramp on TELEOP entry.
+
+        Ensures the soft-start speed ramp always applies to the first
+        teleop motion, regardless of idle duration since connect().
+        """
+        self.arm.reset_soft_start()
+
     def reset_hand(self) -> bool:
         """复位手部到 home 位置。hand 断连时返回 False。"""
         if not self.hand.is_connected():
@@ -373,6 +381,34 @@ class RobotInterface:
                 hand_ok = self.hand.reset() if self.hand.is_connected() else True
                 return hand_ok
 
+            dt = float(self.arm.config.dt)
+
+            # ── Phase 0: 手部复位（必须在 plan_path 之前）──
+            # 规划器 URDF 模型中手部是固定默认构型。plan_path 用
+            # current_qpos 做 start state 碰撞检测，如果真机手部处于
+            # 非默认构型（如遥操作后的握拳/张开），桌面碰撞检测会误判。
+            # 必须在规划路径前先复位手部，使真机构型与规划模型一致。
+            if self.hand.is_connected():
+                self.hand.reset()
+                # 主动轮询等待手部收敛（替代固定 sleep）
+                converge_timeout = 3.0
+                poll_interval = 0.05
+                elapsed = 0.0
+                while elapsed < converge_timeout:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    hand_state = self.hand.get_state()
+                    hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
+                    if len(hand_qpos) == 12 and np.all(np.isfinite(hand_qpos)):
+                        hand_target = np.asarray(self.hand.config.home_qpos, dtype=np.float64)
+                        if float(np.max(np.abs(hand_qpos - hand_target))) < np.deg2rad(5.0):
+                            break
+                # 手部复位后重读 arm 状态（arm 可能因手部复位微动）
+                arm_state = self.arm.get_state()
+                current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+                if not np.all(np.isfinite(current_qpos)):
+                    return self._return_to_home_direct()
+
             # ── Phase 1: EEF 路径 → home EEF ──
             try:
                 result = self.planner.plan_path(home_eef_pose, current_qpos)
@@ -383,17 +419,7 @@ class RobotInterface:
             if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
                 return self._return_to_home_direct()
 
-            dt = float(self.arm.config.dt)
-
-            # Phase 1 前先把手部复位到 home。
-            # 规划器 URDF 模型中手部是固定默认构型，真机手部可能被遥操作
-            # 驱动到任意构型（手指张开/握拳等），二者不一致会导致碰撞检测
-            # 失效。这里先复位手部使真机构型与规划模型一致。
-            if self.hand.is_connected():
-                self.hand.reset()
-                time.sleep(dt * 10)  # 等手部收敛
-
-            # 复位后验证指尖确实在桌面之上（安全冗余）
+            # Phase 1 路径执行前验证指尖在桌面之上（安全冗余）
             desk_z = self.config.table_z_world if self.config.add_table_collision else 0.0
             if self.planner is not None and self.config.add_table_collision:
                 hand_state = self.hand.get_state() if self.hand.is_connected() else {"qpos": None}
@@ -511,7 +537,27 @@ class RobotInterface:
         return path
 
     def _return_to_home_direct(self) -> bool:
-        """Fallback: direct arm.reset() + hand reset (straight-line in joint space)."""
+        """Fallback: 先沿 Z+ 抬起 EEF 远离桌面，再走关节空间归位。
+
+        直接直线关节空间运动可能穿过桌面。先抬高 EEF 消除碰撞风险，
+        然后再走 SDK 直线轨迹。如 Z+ 抬起失败也继续尝试 reset。
+        """
+        # Phase A: 沿 Z+ 微小抬起（远离桌面，避免直线关节运动碰撞）
+        arm_state = self.arm.get_state()
+        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+        if np.all(np.isfinite(current_qpos)):
+            current_pose = self.kinematics.compute_eef_pose_world(current_qpos)
+            lift_pose = Pose(
+                p=current_pose.p + np.array([0.0, 0.0, 0.05], dtype=np.float64),
+                q=current_pose.q.copy(),
+            )
+            if self.planner is not None:
+                lift_result = self.planner.solve_teleop_ik(lift_pose, current_qpos, current_qpos)
+                if lift_result.success and lift_result.qpos is not None:
+                    self.arm.send_action(lift_result.qpos)
+                    time.sleep(0.3)
+
+        # Phase B: SDK 关节空间归位
         arm_ok = self.arm.reset()
         hand_ok = self.hand.reset() if self.hand.is_connected() else True
         return arm_ok and hand_ok

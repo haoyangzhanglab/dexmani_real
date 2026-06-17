@@ -50,7 +50,7 @@ from dexmani_real.robot.xarm7 import XArm7Config
 CTRL_DT = 0.02       # 50Hz
 DELTA_POS = 0.005    # 每次按键 EEF 平移量 (m)
 DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
-EMA_ALPHA = 1.0      # EMA 平滑系数 (1.0 = 禁用平滑)
+EMA_ALPHA = 0.3      # EMA 平滑系数 (抑制 MPlib IK 随机 seed 帧间跳变, ref: controller-spec.md)
 
 WORKSPACE_BOUNDS = np.array([
     [0.28, 0.72],    # x [min, max] m
@@ -276,7 +276,6 @@ def main():
             max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),  # tight: reject IK branch switches (keyboard EEF moves 5mm/step → ~0.5° per joint)
             max_pose_error_pos_m=0.01,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            hold_on_failure=True,
         ),
     )
 
@@ -295,6 +294,9 @@ def main():
     if not result.get("arm"):
         print("arm 连接失败，退出")
         return
+
+    # 重置 soft-start 计数器 — 确保前 20 帧有限速保护
+    robot.arm.reset_soft_start()
 
     # ── 3. Pre-Flight 检查 ──
     report = preflight_check(robot)
@@ -499,16 +501,21 @@ def main():
                 target_eef_pos=target_pos.copy(),
             )
 
-            # DEBUG: 每 50 帧 (1s) 打印一次，避免终端 I/O 阻塞影响控制频率
+            send_result = robot.send_action(action)
+
+            # DEBUG: 每 50 帧 (1s), 使用 post-clip 值对比 pre-clip IK
             if loop_count % 50 == 0:
-                qpos_delta = arm_cmd - state.arm_qpos
+                post_clip = send_result.get("arm_cmd")
+                qpos_delta = (post_clip - state.arm_qpos) if post_clip is not None else np.zeros(7)
+                clipped = not np.allclose(arm_cmd, post_clip, atol=1e-4) if post_clip is not None else False
+                post_str = f"post={np.round(np.rad2deg(post_clip),1)}" if post_clip is not None else "post=N/A"
+                clip_tag = " CLIPPED!" if clipped else " ok"
                 print(
                     f"  [DBG {loop_count}] cur={np.round(np.rad2deg(state.arm_qpos),1)} "
-                    f"cmd={np.round(np.rad2deg(arm_cmd),1)} "
                     f"ik={np.round(np.rad2deg(ik_result.qpos),1)} "
+                    f"{post_str}{clip_tag} "
                     f"Δ={np.round(np.rad2deg(qpos_delta),1)} "
                     f"eef→{np.round(target_pos,3)}")
-            send_result = robot.send_action(action)
             if not send_result.get("arm_ok"):
                 error_count += 1
                 if error_count > max_consecutive_errors:

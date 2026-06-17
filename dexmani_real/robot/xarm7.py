@@ -28,6 +28,8 @@ class XArm7Config:
     reset_acc: float = np.deg2rad(180)
     use_delta_limit: bool = True
     clip_joint_limit: bool = True
+    soft_start_frames: int = 20          # ref: ufactory_teleop — first N frames at reduced speed
+    soft_start_speed_rad_s: float = 0.3  # ref: ufactory_teleop 0.2 rad/s; slightly higher for VR teleop
 
     # 碰撞检测参数 — 防止 C31 误触发
     # tcp_load_kg: XHand 重量 (kg)，非零值使动力学模型正确估算力矩
@@ -55,6 +57,7 @@ class XArm7:
         self.last_cmd_time: float | None = None
         self.last_joint_limit_clipped = False
         self.last_delta_limited = False
+        self._cmd_cnt: int = 0  # soft-start frame counter (ref: ufactory_teleop)
 
     def connect(self) -> bool:
         if self.connected_flag and self.arm is not None:
@@ -228,9 +231,22 @@ class XArm7:
         self.last_action_code = code
         return code == 0
 
+    # ------------------------------------------------------------------
+    # Soft-start
+    # ------------------------------------------------------------------
+
+    def reset_soft_start(self) -> None:
+        """Reset soft-start ramp counter. Call on TELEOP entry.
+
+        Ensures the soft-start speed ramp always applies to the first
+        teleop motion, regardless of idle duration since connect().
+        """
+        self._cmd_cnt = 0
+
     def _set_mode(self, mode: int):
         self.arm.set_mode(mode)
         self.arm.set_state(0)
+        self._cmd_cnt = 0  # reset soft-start counter on mode change
 
     def _configure_collision_params(self) -> None:
         """设置 TCP 负载和碰撞灵敏度，防止 C31 误触发。
@@ -290,6 +306,11 @@ class XArm7:
         Reference is the hardware position (not previous command), so that
         tracking lag does not cause command compounding.
 
+        Soft-start (ref: ufactory_teleop uf_robot.py L206): first N frames
+        use a linear ramp from soft_start_speed_rad_s to per-joint max_qvel,
+        eliminating the speed jump that a hard switch would cause. After the
+        ramp period, per-joint max_qvel limits apply at full speed.
+
         ref: BunnyVisionPro xarm7_ability.py clip_arm_next_qpos() — scalar
         scaling with hardware position as reference.
         """
@@ -312,7 +333,16 @@ class XArm7:
             self.last_cmd_time = now
 
         dt = max(now - self.last_cmd_time, self.config.dt)
-        max_step = self.config.max_qvel * dt
+
+        # Soft-start linear ramp: soft_start_speed → per-joint max_qvel
+        # Linear interpolation avoids the N× speed jump at the ramp boundary
+        # that a hard if/else switch would produce.
+        ramp_progress = min(self._cmd_cnt / max(self.config.soft_start_frames, 1), 1.0)
+        current_max_qvel = (
+            (1.0 - ramp_progress) * self.config.soft_start_speed_rad_s
+            + ramp_progress * self.config.max_qvel
+        )
+        max_step = current_max_qvel * dt
 
         # Use hardware position as the delta reference.  When the hardware has
         # not yet reached the previous command (tracking lag), the delta from
@@ -337,6 +367,7 @@ class XArm7:
         else:
             self.last_delta_limited = False
 
+        self._cmd_cnt += 1
         return ref + delta
 
     @staticmethod

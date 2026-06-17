@@ -65,6 +65,11 @@ class XArm7MotionPlanner:
         equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) >= np.pi
 
         base_pose_world = config.base_pose_world.copy()
+        self.workspace_bounds = (
+            np.asarray(config.workspace_bounds, dtype=np.float64)
+            if config.workspace_bounds is not None
+            else None
+        )
 
         self.kin = XArm7Kinematics(
             mp_planner=self.mp_planner,
@@ -435,6 +440,36 @@ class XArm7MotionPlanner:
             return PathResult(
                 success=False, qpos_path=None, source=source, reason="Terminal pose error too large.", report=report
             )
+        if self.workspace_bounds is not None:
+            eef_positions = np.array(
+                [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
+            )
+            for i, eef_p in enumerate(eef_positions):
+                if not (
+                    eef_p[0] >= self.workspace_bounds[0, 0] and eef_p[0] <= self.workspace_bounds[0, 1]
+                    and eef_p[1] >= self.workspace_bounds[1, 0] and eef_p[1] <= self.workspace_bounds[1, 1]
+                    and eef_p[2] >= self.workspace_bounds[2, 0] and eef_p[2] <= self.workspace_bounds[2, 1]
+                ):
+                    axis_name = {0: "X", 1: "Y", 2: "Z"}
+                    violations = []
+                    for ax in range(3):
+                        if eef_p[ax] < self.workspace_bounds[ax, 0]:
+                            violations.append(
+                                f"axis={axis_name[ax]} val={eef_p[ax]:.3f} < {self.workspace_bounds[ax, 0]:.3f}"
+                            )
+                        elif eef_p[ax] > self.workspace_bounds[ax, 1]:
+                            violations.append(
+                                f"axis={axis_name[ax]} val={eef_p[ax]:.3f} > {self.workspace_bounds[ax, 1]:.3f}"
+                            )
+                    report["workspace_violation_index"] = i
+                    report["workspace_violation_summary"] = "; ".join(violations)
+                    return PathResult(
+                        success=False,
+                        qpos_path=None,
+                        source=source,
+                        reason=f"Path contains workspace violations: waypoint[{i}] ({'; '.join(violations)})",
+                        report=report,
+                    )
         report["path_score"] = float(
             report.get("joint_path_length", 0.0)
             + 2.0 * report.get("max_waypoint_delta_rad", 0.0)

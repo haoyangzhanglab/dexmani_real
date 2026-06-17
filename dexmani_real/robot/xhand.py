@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +36,10 @@ class XHandConfig:
     device_name: str | None = None
     baudrate: int = 3_000_000
     device_id: int = 0
+
+    # Connection retry (RS485 may need several attempts after cold start)
+    open_serial_retries: int = 5
+    open_serial_retry_delay_s: float = 2.0
 
     dt: float = 1.0 / 83.0
     num_joints: int = 12
@@ -118,33 +124,63 @@ class XHand:
         self.cached_comm_type = self._resolve_comm_type()
 
     def connect(self) -> bool:
-        self.control = xh.XHandControl()
         comm_type = self.cached_comm_type
 
+        # Device enumeration (runs once)
+        self.control = xh.XHandControl()
         if self.config.device_name is None:
             devices = self.control.enumerate_devices(comm_type)
             if devices is None or len(devices) == 0:
                 self.error_state = True
                 self.last_error_code = -2
                 self.last_error_message = f"no XHand device found for {comm_type}"
+                self._diagnose_connection_failure()
                 return False
             self.device_name = devices[0]
         else:
             self.device_name = self.config.device_name
 
-        if comm_type == "RS485":
-            err = self.control.open_serial(self.device_name, int(self.config.baudrate))
-        elif comm_type == "EtherCAT":
-            err = self.control.open_ethercat(self.device_name)
-        else:
-            self.error_state = True
-            self.last_error_code = -3
-            self.last_error_message = f"unsupported comm_type: {self.config.comm_type}"
-            return False
+        # Retry loop for open_serial / open_ethercat.
+        # RS485 may need several attempts after cold start
+        # (C++ SDK retries internally, but may still fail intermittently).
+        retries = max(1, int(self.config.open_serial_retries))
+        delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
-        if not self.error_ok(err):
+        for attempt in range(1, retries + 1):
+            if comm_type == "RS485":
+                err = self.control.open_serial(self.device_name, int(self.config.baudrate))
+            elif comm_type == "EtherCAT":
+                err = self.control.open_ethercat(self.device_name)
+            else:
+                self.error_state = True
+                self.last_error_code = -3
+                self.last_error_message = f"unsupported comm_type: {self.config.comm_type}"
+                return False
+
+            if self.error_ok(err):
+                break  # success
+
             self._record_error(err)
+            if attempt < retries:
+                print(
+                    f"XHand connect attempt {attempt}/{retries} failed: "
+                    f"{self.last_error_message}, retrying in {delay}s..."
+                )
+                # Close and recreate control for clean retry
+                try:
+                    self.control.close_device()
+                except Exception:
+                    pass
+                self.control = xh.XHandControl()
+                time.sleep(delay)
+        else:
+            # All retries exhausted
             self.error_state = True
+            print(
+                f"XHand connect failed after {retries} attempts: "
+                f"{self.last_error_message}"
+            )
+            self._diagnose_connection_failure()
             return False
 
         try:
@@ -185,6 +221,80 @@ class XHand:
         if self.control is not None:
             self.control.close_device()
         self.connected_flag = False
+
+    def reconnect(self) -> bool:
+        """Close existing connection and re-connect.
+
+        Returns True if reconnection succeeded.  Callers (e.g. RobotInterface)
+        can use this at runtime to recover from a transient hand disconnect.
+        """
+        if self.control is not None:
+            try:
+                self.control.close_device()
+            except Exception:
+                pass
+        self.connected_flag = False
+        self.error_state = False
+        time.sleep(1.0)
+        return self.connect()
+
+    def _diagnose_connection_failure(self) -> None:
+        """Print diagnostic info for a failed RS485/EtherCAT connection.
+
+        Checks /dev/ttyUSB* existence, permissions, and whether another
+        process is holding the device.
+        """
+        comm_type = self.cached_comm_type
+        device = self.device_name or "<auto>"
+        print(f"[XHand diagnostics] comm_type={comm_type}, device={device}")
+
+        # List available ttyUSB devices
+        if comm_type == "RS485":
+            import glob
+            tty_devices = sorted(glob.glob("/dev/ttyUSB*"))
+            if not tty_devices:
+                print("  No /dev/ttyUSB* devices found. Check USB cable and power.")
+            else:
+                print(f"  Available tty devices: {tty_devices}")
+                for tty in tty_devices:
+                    try:
+                        st = os.stat(tty)
+                        import stat
+                        perms = stat.filemode(st.st_mode)
+                        print(f"    {tty}: {perms} owner={st.st_uid} group={st.st_gid}")
+                    except OSError as e:
+                        print(f"    {tty}: stat failed — {e}")
+
+            # Check if device is held by another process (lsof)
+            target = self.device_name if self.device_name else (
+                tty_devices[0] if tty_devices else None
+            )
+            if target is not None:
+                try:
+                    result = subprocess.run(
+                        ["lsof", target],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.stdout.strip():
+                        print(f"  lsof {target}:")
+                        for line in result.stdout.strip().splitlines():
+                            print(f"    {line}")
+                    else:
+                        print(f"  lsof {target}: not held by any process")
+                except FileNotFoundError:
+                    pass  # lsof not installed
+                except subprocess.TimeoutExpired:
+                    print(f"  lsof {target}: timed out")
+                except Exception as e:
+                    print(f"  lsof {target}: error — {e}")
+
+            # Suggestions
+            print("  Troubleshooting:")
+            print("    1. Check XHand power supply is on")
+            print("    2. Check USB cable is firmly connected")
+            print("    3. sudo chmod 666 /dev/ttyUSB* (or add user to dialout group)")
+            print("    4. Verify no other process is holding the device (lsof /dev/ttyUSB*)")
+            print("    5. Try power-cycling the XHand controller")
 
     def is_connected(self) -> bool:
         return self.control is not None and self.connected_flag and not self.error_state
