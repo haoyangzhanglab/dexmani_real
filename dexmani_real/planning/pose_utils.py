@@ -1,3 +1,5 @@
+"""Pose math utilities — composition, error, quaternion/rot6d conversions."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -156,3 +158,15 @@ def quat_wxyz_to_rot6d(q_wxyz: np.ndarray) -> np.ndarray:
     quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
     R = Rotation.from_quat(quat_xyzw).as_matrix()
     return np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
+
+
+def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
+    """WXYZ quaternion → 3×3 rotation matrix.
+
+    Uses scipy.spatial.transform.Rotation for numerical stability.
+    Replaces the hand-rolled _quat_to_rotmat previously in controller.py.
+    """
+    from scipy.spatial.transform import Rotation
+
+    quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
+    return Rotation.from_quat(quat_xyzw).as_matrix().astype(np.float64)

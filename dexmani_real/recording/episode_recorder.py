@@ -15,11 +15,13 @@ HDF5 structure (per recording-spec.md):
       /vr/wrist_pos(3)  wrist_quat(4)  landmarks(21,3)
       /quality_flags(T,) uint16
       /camera/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)
-      /camera/K(3,3)                        # 内参矩阵
-      /camera/extrinsics(T,4,4)             # T_base_camera，逐帧外参
+      /camera/K(3,3)                        # intrinsics matrix
+      /camera/extrinsics(T,4,4)             # T_base_camera, per-frame extrinsics
 """
 
 from __future__ import annotations
+
+__all__ = ["EpisodeRecorder"]
 
 import time
 from pathlib import Path

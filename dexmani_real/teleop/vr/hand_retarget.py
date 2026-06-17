@@ -1,17 +1,24 @@
+"""VR-to-XHand retargeting via dex_retargeting + pinky ref adapter."""
+
 from __future__ import annotations
 
+__all__ = ["XHandRetargeter"]
+
 import time
-from typing import Optional
 
 import numpy as np
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dexmani_real import ASSET_DIR
+from dexmani_real.log import get_logger
 from dexmani_real.teleop.vr.ref_adapter import XHandRefAdapter
+
+logger = get_logger(__name__)
+
 
 class XHandRetargeter:
     def __init__(
         self,
-        fixed_joint_values: Optional[np.ndarray] = None,
+        fixed_joint_values: np.ndarray | None = None,
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         enable_ref_adapter: bool = True,
@@ -62,7 +69,11 @@ class XHandRetargeter:
             [retargeter_joint_names.index(name) for name in self.sapien_joint_names]
         ).astype(int)
 
-    def build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
+    def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
+        """Build reference value from hand landmarks for retargeting.
+
+        (Phase 4.3: renamed from build_ref_value — only called by self.retarget().)
+        """
         if self.retargeting_type == "position":
             return hand_joint_pos[self.indices, :]
 
@@ -79,17 +90,17 @@ class XHandRetargeter:
 
         return ref_value
 
-    def retarget(self, hand_joint_pos: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    def retarget(self, hand_joint_pos: np.ndarray | None) -> np.ndarray | None:
         if hand_joint_pos is None:
             return None
 
         start_time = time.time()
 
-        ref_value = self.build_ref_value(hand_joint_pos)
+        ref_value = self._build_ref_value(hand_joint_pos)
         qpos = self.retargeter.retarget(ref_value, fixed_qpos=self.fixed_joint_values)
 
         if qpos is None:
-            print("Warning: Retargeting returned None.")
+            logger.warning("Retargeting returned None.")
             return None
 
         qpos = np.asarray(qpos, dtype=float)[self.retargeted_joint_order]
@@ -99,10 +110,6 @@ class XHandRetargeter:
                 "retarget_ms": 1000 * (time.time() - start_time),
                 "ref_adapter": self.ref_adapter.last_debug,
             }
-            print("retarget_debug:", self.last_debug)
+            logger.info("retarget_debug: %s", self.last_debug)
 
         return qpos
-
-
-
-

@@ -1,7 +1,7 @@
-"""Robot 核心数据类型 — RobotState, RobotAction, RobotInterfaceConfig.
+"""Core robot data types — RobotState, RobotAction, RobotInterfaceConfig.
 
-这些类型被 controller/recording/config 等多个模块使用，
-独立于 RobotInterface 编排类，避免循环依赖。
+These types are shared across controller, recording, config, and other modules.
+They are independent of the RobotInterface orchestration class to avoid circular imports.
 """
 
 from __future__ import annotations
@@ -16,35 +16,35 @@ from dexmani_real.robot.xhand import XHandConfig
 
 @dataclass
 class RobotState:
-    """完整机器人状态 — 来自 RobotInterface.get_state()。
+    """Complete robot state — from RobotInterface.get_state().
 
-    所有物理量单位标注在注释中。
+    All physical quantities annotated with units in comments.
     """
 
-    # ── Arm 关节 ──
+    # ── Arm joints ──
     arm_qpos: np.ndarray          # (7,)  float64  rad
     arm_qvel: np.ndarray          # (7,)  float64  rad/s
-    arm_tau: np.ndarray           # (7,)  float64  N·m (实为电机电流)
+    arm_tau: np.ndarray           # (7,)  float64  N·m (motor current)
 
-    # ── EEF 位姿（双表示）──
+    # ── EEF pose (dual representation) ──
     eef_pos: np.ndarray           # (3,)  float64  m
     eef_quat_wxyz: np.ndarray     # (4,)  float64
     eef_rot6d: np.ndarray         # (6,)  float64
 
-    # ── Hand 关节 ──
+    # ── Hand joints ──
     hand_qpos: np.ndarray         # (12,) float64  rad
     hand_current: np.ndarray      # (12,) float64  mA
 
-    # ── 触觉 ──
+    # ── Tactile ──
     hand_tactile_sum: np.ndarray  # (5,3) float64  N
     hand_tactile_raw: np.ndarray  # (5,120,3) float64
 
     hand_temperature: np.ndarray  # (12,) float64  °C
 
-    # ── 派生（链式 FK）──
+    # ── Derived (chained FK) ──
     fingertip_pos: np.ndarray     # (5,3) float64  m (world frame)
 
-    # ── 状态 ──
+    # ── Status ──
     arm_connected: bool
     hand_connected: bool
     hand_error: bool
@@ -77,10 +77,10 @@ class RobotState:
 
 @dataclass
 class RobotAction:
-    """发送给硬件的动作命令。
+    """Action command sent to hardware.
 
-    arm_qpos_cmd / hand_qpos_cmd: 经过 joint limit + delta limit 后的最终命令。
-    target_eef_pos / target_eef_rot6d: IK 前的 EEF 目标（可选）。
+    arm_qpos_cmd / hand_qpos_cmd: final command after joint limit + delta limit.
+    target_eef_pos / target_eef_rot6d: EEF target before IK (optional).
     """
 
     arm_qpos_cmd: np.ndarray             # (7,)  float64  rad

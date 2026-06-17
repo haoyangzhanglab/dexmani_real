@@ -1,9 +1,13 @@
+"""RealSense D400/L515 camera driver — streaming, alignment, point clouds."""
+
 from __future__ import annotations
 
 import json
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal
+
+__all__ = ["RealSense", "RealSenseConfig", "CameraFrame", "L515DepthConfig", "AlignMode", "_normalize_align_mode"]
 
 import numpy as np
 import pyrealsense2 as rs
@@ -125,7 +129,9 @@ class RealSenseConfig:
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
 
     def __post_init__(self) -> None:
-        mode = normalize_align_mode(self.align_mode)
+        # TODO(refactor): object.__setattr__ bypasses frozen=True; replace with
+        # a non-frozen dataclass or a cached property pattern.
+        mode = _normalize_align_mode(self.align_mode)
         object.__setattr__(self, "align_mode", mode)
         if mode != "none" and not self.enable_color:
             raise ValueError("alignment requires enable_color=True.")
@@ -178,7 +184,7 @@ class CameraFrame:
         }
 
 
-def normalize_align_mode(mode: str) -> AlignMode:
+def _normalize_align_mode(mode: str) -> AlignMode:
     key = str(mode).lower()
     if key not in ALIGN_MODE_ALIASES:
         valid = ", ".join(ALIGN_MODE_ALIASES.keys())
@@ -220,7 +226,7 @@ class RealSense:
             self.active_serial = self.config.serial or self.find_default_serial()
             device = self.find_device_by_serial(self.active_serial)
             self.load_model_specific_config(device)
-        except Exception:
+        except (RuntimeError, OSError):
             return False
 
         self.pipeline = rs.pipeline()
@@ -320,7 +326,7 @@ class RealSense:
         try:
             serializable_device = rs.serializable_device(device)
             serializable_device.load_json(json_string)
-        except Exception as error:
+        except (RuntimeError, OSError) as error:
             raise RuntimeError("Failed to load L515 depth config through load_json().") from error
 
     @staticmethod
@@ -406,7 +412,7 @@ class RealSense:
         *,
         mode: Literal["rgbd", "pointcloud", "full"] = "full",
         pcd_config: PointCloudConfig | None = None,
-        T_out_camera: Optional[np.ndarray] = None,
+        T_out_camera: np.ndarray | None = None,
         timeout_ms: int = 5000,
     ) -> dict:
         if mode not in ("rgbd", "pointcloud", "full"):
@@ -451,8 +457,8 @@ class RealSense:
         frame: CameraFrame,
         config: PointCloudConfig | None = None,
         *,
-        T_out_camera: Optional[np.ndarray] = None,
-    ):
+        T_out_camera: np.ndarray | None = None,
+    ) -> np.ndarray:
         return rgbd_to_pointcloud(
             depth=frame.depth,
             K=frame.K,
@@ -493,7 +499,7 @@ class RealSense:
                 info[name] = ""
         return info
 
-    def get_rays(self, shape: tuple[int, int], device: str = "cpu"):
+    def get_rays(self, shape: tuple[int, int], device: str = "cpu") -> np.ndarray:
         if self.K is None:
             raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
         height, width = int(shape[0]), int(shape[1])

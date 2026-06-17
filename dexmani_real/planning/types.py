@@ -1,3 +1,5 @@
+"""Core planning types — Pose, IKResult, PathResult, config/profile dataclasses."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

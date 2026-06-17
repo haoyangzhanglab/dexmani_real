@@ -1,11 +1,21 @@
+"""XArm7 + XHand simulated robot model for SAPIEN."""
+
 import numpy as np
 import sapien.core as sapien
 from transforms3d import euler
 
 from dexmani_real import ASSET_DIR
 
+__all__ = ["XArm7XHand", "XArm7_XHand"]
 
-class XArm7_XHand:
+
+class XArm7XHand:
+    """XArm7 + XHand simulated robot model for SAPIEN.
+
+    Renamed from XArm7_XHand (PEP 8 compliance — underscores in class names
+    are reserved for leading/trailing double underscores). The old name is
+    available as a deprecated alias.
+    """
     def __init__(
         self,
         scene: sapien.Scene,
@@ -29,7 +39,7 @@ class XArm7_XHand:
         self.set_physx_and_render_properties()
 
     # --------------------------------------------------------------
-    # 模型建模和初始化部分
+    # Model loading and initialization
     # --------------------------------------------------------------
     def load_model(self, disable_self_collision, root_pose: sapien.Pose):
         loader = self.scene.create_urdf_loader()
@@ -142,7 +152,7 @@ class XArm7_XHand:
                             part.material.set_roughness(0.5)
 
     # --------------------------------------------------------------
-    # 本体感知信息获取
+    # Proprioceptive state retrieval
     # --------------------------------------------------------------
     @property
     def qlimits(self):
@@ -180,7 +190,7 @@ class XArm7_XHand:
         for name in target_link_names:
             link_idx = self.link_names.index(name)
             link_pose = self.pin_model.get_link_pose(link_idx)
-            # 需要把机器人坐标系下的pose转换到世界坐标系下，才能和get_link_poses得到的pose进行对比验证
+            # Transform from robot-local frame to world frame for comparison with get_link_poses
             link_pose = self.model.get_root_pose() * link_pose
             target_link_poses.append(np.concatenate([link_pose.p, link_pose.q]))
         return np.asarray(target_link_poses)
@@ -225,7 +235,7 @@ class XArm7_XHand:
         return qpos
 
     # --------------------------------------------------------------
-    # 控制接口
+    # Control interface
     # --------------------------------------------------------------
     def set_qpos(self, qpos: np.ndarray):
         self.model.set_qpos(qpos[self.mapping])
@@ -269,7 +279,7 @@ def xarm7_xhand_example():
     add_base_components(scene)
     viewer_pose = sapien.Pose([0.784212, 0.0267081, 0.630188], [0.00493842, -0.232841, 0.00108951, 0.972502])
     viewer = create_viewer(scene, viewer_pose)
-    robot = XArm7_XHand(
+    robot = XArm7XHand(
         scene,
         disable_self_collision=True,
     )
@@ -295,6 +305,10 @@ def xarm7_xhand_example():
     )
     print("IK qpos:\n", ik_qpos)
     print("IK eef pose:\n", robot.forward_kinematics(ik_qpos, target_link_names=["custom_eef_link"])[0])
+
+
+# Deprecated alias (PEP 8: underscores in class names are reserved)
+XArm7_XHand = XArm7XHand
 
 
 if __name__ == "__main__":

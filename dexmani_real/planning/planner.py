@@ -1,3 +1,5 @@
+"""xArm7 motion planner with MPlib backend — IK, path planning, collision checks."""
+
 from __future__ import annotations
 
 import contextlib
@@ -14,16 +16,33 @@ from .kinematics import XArm7Kinematics
 from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
 from .pose_utils import compute_pose_error, ensure_qpos
 
+__all__ = [
+    "XArm7MotionPlanner",
+    "WorkspaceSafety",
+]
+
+# Path scoring weights (Phase 4.2)
+_PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
+_PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
+_PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
+
 
 class XArm7MotionPlanner:
-    """Arm-only xArm7 planner.
+    """Arm-only xArm7 motion planner with MPlib backend.
 
-    The backend is MPlib. This wrapper keeps three task-specific policies explicit:
-    local IK branch selection, full-turn joint canonicalization, and path quality
-    validation for data collection.
+    Three internal subsystems:
+      - ``kin`` (:class:`XArm7Kinematics`): FK / Jacobian / pose transforms.
+      - ``ik_mgr`` (:class:`IKCandidateManager`): IK candidate generation,
+        filtering, scoring, canonicalization.
+      - ``mp_planner`` (:class:`mplib.Planner`): raw MPlib plan_screw /
+        plan_qpos calls.
 
-    Internally delegates to XArm7Kinematics (FK/Jacobian/pose transforms) and
-    IKCandidateManager (IK candidate generation/filtering/scoring/canonicalization).
+    Public API (prefer these over direct subsystem access):
+      - ``solve_ik`` / ``solve_teleop_ik`` — single-shot IK suitable for teleop.
+      - ``plan_path`` — multi-strategy path planning (screw → RRT).
+      - ``compute_eef_pose_world`` / ``compute_eef_jacobian`` — FK queries.
+      - ``has_self_collision`` / ``has_env_collision`` — collision queries.
+      - ``add_point_cloud`` / ``remove_point_cloud`` — environment setup.
     """
 
     def __init__(
@@ -471,9 +490,9 @@ class XArm7MotionPlanner:
                         report=report,
                     )
         report["path_score"] = float(
-            report.get("joint_path_length", 0.0)
-            + 2.0 * report.get("max_waypoint_delta_rad", 0.0)
-            + 3.0 * (1.0 - report.get("eef_efficiency", 1.0))
+            _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
+            + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
+            + _PATH_SCORE_EEF_EFFICIENCY_WEIGHT * (1.0 - report.get("eef_efficiency", 1.0))
         )
         return PathResult(success=True, qpos_path=path, source=source, report=report)
 

@@ -16,6 +16,8 @@ Usage:
 
 from __future__ import annotations
 
+__all__ = ["CameraCalib", "CameraCalibEntry"]
+
 import json
 import os
 from dataclasses import dataclass
@@ -45,8 +47,8 @@ class CameraCalibEntry:
 class CameraCalib:
     def __init__(self, calib_path: str | None = None):
         if calib_path is None:
-            # 优先查找项目根目录下的 configs/cameras.json（外提后位置）
-            # fallback 到包内旧路径 calib/cameras.json
+            # Prefer project-root configs/cameras.json (extracted path)
+            # fallback to in-package legacy path calib/cameras.json
             pkg_dir = Path(__file__).resolve().parent
             project_root = pkg_dir.parent.parent
             new_path = project_root / "configs" / "cameras.json"

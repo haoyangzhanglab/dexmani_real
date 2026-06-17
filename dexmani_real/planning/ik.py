@@ -1,3 +1,5 @@
+"""Teleoperation IK solver — differential IK (primary) with position IK fallback."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any

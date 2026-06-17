@@ -1,4 +1,8 @@
+"""Fake VR tracker for dry-run/testing — emits static frames."""
+
 from __future__ import annotations
+
+__all__ = ["DummyTracker"]
 
 import time
 from typing import Any

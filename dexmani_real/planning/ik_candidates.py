@@ -1,3 +1,5 @@
+"""IK candidate management — generation, filtering, scoring, canonicalization."""
+
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING

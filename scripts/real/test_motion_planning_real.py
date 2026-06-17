@@ -621,13 +621,13 @@ def simulate_path_in_sapien(
     """
     import sapien.core as sapien
     from dexmani_real.simulation.constructor import setup_scene
-    from dexmani_real.simulation.xarm7_xhand import XArm7_XHand
+    from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 
     report: dict = {"ok": True, "errors": [], "warnings": []}
     scene = None
     try:
         scene = setup_scene(time_step=1.0 / 240.0)
-        robot = XArm7_XHand(
+        robot = XArm7XHand(
             scene,
             disable_self_collision=False,
             arm_home_qpos=np.asarray(home_qpos, dtype=np.float64).ravel()[:7],

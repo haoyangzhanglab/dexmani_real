@@ -1,21 +1,21 @@
-"""Teleop 模块 — VR 遥操作控制。
+"""Teleop module — VR teleoperation control.
 
-拆分为 core / vr / control 三个子包：
+Split into core / vr / control sub-packages:
   - core:    TeleopController, ErrorHandler, TrackingQuality
   - vr:      ArmMapper, HandRetargeter, VRTracker
-  - control: KeyboardHandler, SafetyChecker
+  - control: KeyboardHandler, safety checks
 
-顶层 __init__.py 提供向后兼容重导出。
+Top-level __init__.py provides backward-compatible re-exports.
 """
 
-# ── 控制器 ──
+# ── Controller ──
 from dexmani_real.teleop.core.controller import ControllerState, TeleopController
 from dexmani_real.teleop.core.error_handler import TeleopErrorHandler
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
-from dexmani_real.teleop.control.safety import SafetyChecker
+from dexmani_real.teleop.control import safety
 from dexmani_real.teleop.core.tracking import TrackingQuality, TrackingQualityConfig, TrackingQualityResult
 
-# ── VR 追踪 ──
+# ── VR tracking ──
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.vr.dummy_tracker import DummyTracker
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
@@ -27,7 +27,7 @@ __all__ = [
     "ControllerState",
     "ControlSignal",
     "KeyboardHandler",
-    "SafetyChecker",
+    "safety",
     "TeleopController",
     "TeleopErrorHandler",
     "TrackingQuality",

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+__all__ = ["QuestHandTracker"]
+
 import threading
 import time
 from typing import Any
 
 import numpy as np
+
+from dexmani_real.log import get_logger
 from dexmani_real.planning.pose_utils import xyzw_to_wxyz
 from hand_tracking_sdk import (
     ErrorPolicy,
@@ -21,6 +25,13 @@ from hand_tracking_sdk import (
     unity_left_to_rfu_position,
     unity_left_to_rfu_rotation,
 )
+
+logger = get_logger(__name__)
+
+# ── Magic numbers ──
+_CONNECT_DEADLINE_S = 3.0
+_THREAD_JOIN_CLIENT_TIMEOUT_S = 2.0
+_THREAD_JOIN_SERVER_TIMEOUT_S = 6.0
 
 
 class QuestHandTracker:
@@ -73,13 +84,13 @@ class QuestHandTracker:
         self.thread.start()
 
         if self.verbose:
-            print(f"[QuestHandTracker] {self.transport}://{self.host}:{self.port}")
+            logger.info("[QuestHandTracker] %s://%s:%s", self.transport, self.host, self.port)
 
         # Verify the receive thread is actually alive.
         # In tcp_client mode we also wait for the first event to confirm the
         # server is reachable; in tcp_server/udp mode the client may connect
         # later, so we only verify the thread didn't crash immediately.
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + _CONNECT_DEADLINE_S
         while time.monotonic() < deadline:
             if not self.running:
                 self.started = False
@@ -103,10 +114,10 @@ class QuestHandTracker:
         self.running = False
         self.event.set()
         if self.thread.is_alive():
-            self.thread.join(timeout=2.0)
+            self.thread.join(timeout=_THREAD_JOIN_CLIENT_TIMEOUT_S)
         self.started = False
         self.last_error = (
-            f"No events received within 3s ({self.transport}://{self.host}:{self.port}). "
+            f"No events received within {_CONNECT_DEADLINE_S}s ({self.transport}://{self.host}:{self.port}). "
             "Check: adb reverse (USB) or HTS app mode (TCP Server vs Client)."
         )
         return False
@@ -119,7 +130,7 @@ class QuestHandTracker:
         self.event.set()
 
         if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=6.0)
+            self.thread.join(timeout=_THREAD_JOIN_SERVER_TIMEOUT_S)
 
         self.started = False
         self.thread = None
@@ -220,7 +231,7 @@ class QuestHandTracker:
 
                 try:
                     frame = self.convert_frame(event)
-                except Exception as exc:
+                except (ValueError, TypeError) as exc:
                     self.malformed_frames += 1
                     self.last_error = str(exc)
                     if self.strict:
@@ -232,7 +243,7 @@ class QuestHandTracker:
                     self.received_frames += 1
                 self.event.set()
 
-        except Exception as exc:
+        except (ConnectionError, TimeoutError, RuntimeError) as exc:
             self.last_error = str(exc)
         finally:
             self.running = False

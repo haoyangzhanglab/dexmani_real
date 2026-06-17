@@ -16,19 +16,20 @@ from __future__ import annotations
 
 import threading
 import time
-import traceback
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.log import get_logger
 from dexmani_real.teleop.core.error_handler import TeleopErrorHandler
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
-from dexmani_real.teleop.control.safety import SafetyChecker
+from dexmani_real.teleop.control import safety
 from dexmani_real.teleop.core.tracking import (
     TrackingQuality,
     TrackingQualityConfig,
 )
+from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.planning.types import IKResult, Pose
 from dexmani_real.recording.quality_flags import (
     ARM_TORQUE_OK,
@@ -54,6 +55,16 @@ from dexmani_real.utils.hand_utils import (
     estimate_frame_from_hand_points,
 )
 from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.signal_utils import ema_smooth
+
+if TYPE_CHECKING:
+    from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
+    from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+    from dexmani_real.planning.planner import XArm7MotionPlanner
+    from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
+    from dexmani_real.recording.episode_recorder import EpisodeRecorder
+
+logger = get_logger(__name__)
 
 
 class ControllerState(Enum):
@@ -80,16 +91,16 @@ class TeleopController:
     def __init__(
         self,
         robot: RobotInterface,
-        arm_mapper: Any,             # ArmWristMapper
-        retargeter: Any,             # XHandRetargeter
-        planner: Any,                # XArm7MotionPlanner
+        arm_mapper: ArmWristMapper,
+        retargeter: XHandRetargeter,
+        planner: XArm7MotionPlanner,
         *,
-        tracker: Any | None = None,  # QuestHandTracker (None = dry-run)
-        keyboard_queue: Any | None = None,
+        tracker: QuestHandTracker | None = None,
+        keyboard_queue: object | None = None,
         target_hz: float = 50.0,
         ema_alpha_arm: float = 1.0,  # 1.0 = no smoothing (disabled)
         dry_run: bool = False,
-        recorder: Any | None = None,
+        recorder: EpisodeRecorder | None = None,
     ) -> None:
         self.robot = robot
         self.arm_mapper = arm_mapper
@@ -150,15 +161,15 @@ class TeleopController:
         """Main control loop."""
         self.start()
         if not self.dry_run and not self.robot.is_connected():
-            print("[TeleopController] Robot not connected. Attempting connect...")
+            logger.info("Robot not connected. Attempting connect...")
             result = self.robot.connect()
-            print(f"  connect result: {result}")
+            logger.info("connect result: %s", result)
 
-        print(f"[TeleopController] Entering main loop at {self.limiter.target_hz:.0f} Hz")
-        print(f"  Mode: {'dry-run' if self.dry_run else 'hardware'}")
-        print(f"  VR: direct")
-        print(f"  EMA: arm_alpha={self.ema_alpha_arm} (hand uses dex-retargeting low_pass_alpha)")
-        print(f"  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
+        logger.info("Entering main loop at %.0f Hz", self.limiter.target_hz)
+        logger.info("  Mode: %s", "dry-run" if self.dry_run else "hardware")
+        logger.info("  VR: direct")
+        logger.info("  EMA: arm_alpha=%s (hand uses dex-retargeting low_pass_alpha)", self.ema_alpha_arm)
+        logger.info("  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
 
         self.last_status_ts = time.monotonic()
 
@@ -168,9 +179,9 @@ class TeleopController:
                 self._tick()
                 self.limiter.wait()
         except KeyboardInterrupt:
-            print("\n[TeleopController] KeyboardInterrupt — stopping.")
-        except Exception:
-            traceback.print_exc()
+            logger.info("KeyboardInterrupt — stopping.")
+        except (RuntimeError, ConnectionError, ValueError) as e:
+            logger.exception("Unhandled exception in main loop: %s", e)
         finally:
             self._shutdown()
 
@@ -188,7 +199,7 @@ class TeleopController:
         tq_result = self.tracking_quality.check(vr_frame)
         if not tq_result.ok:
             self.error_handler.record_failure("vr_stale")
-            if tq_result.tracking_lost or self.error_handler.should_emergency_stop:
+            if tq_result.tracking_lost:
                 self._escalate_to_emergency(f"VR tracking lost for {tq_result.lost_duration_s:.1f}s")
             return
 
@@ -202,14 +213,14 @@ class TeleopController:
         action, quality = self._compute_action(vr_frame, state)
 
         # 5. Safety checks on state (arm torque, hand current, hand temp, hand comm)
-        quality.set(ARM_TORQUE_OK, SafetyChecker.check_arm_torque(state))
-        quality.set(HAND_CURRENT_OK, SafetyChecker.check_hand_current(state))
-        quality.set(HAND_TEMP_OK, SafetyChecker.check_hand_temperature(state))
-        quality.set(HAND_COMM_OK, SafetyChecker.check_hand_comm(state))
+        quality.set(ARM_TORQUE_OK, safety.check_arm_torque(state))
+        quality.set(HAND_CURRENT_OK, safety.check_hand_current(state))
+        quality.set(HAND_TEMP_OK, safety.check_hand_temperature(state))
+        quality.set(HAND_COMM_OK, safety.check_hand_comm(state))
 
         # Hard safety: joint limits (trigger E-Stop, not just quality flags)
         if not self.dry_run:
-            if not SafetyChecker.check_arm_joint_limits(
+            if not safety.check_arm_joint_limits(
                 state,
                 self.robot.arm.config.qpos_min,
                 self.robot.arm.config.qpos_max,
@@ -218,13 +229,13 @@ class TeleopController:
                     f"Arm joint out of limits: {state.arm_qpos}"
                 )
                 return
-            if not SafetyChecker.check_hand_joint_limits(
+            if not safety.check_hand_joint_limits(
                 state,
                 self.robot.hand.config.qpos_min,
                 self.robot.hand.config.qpos_max,
             ):
-                print(
-                    f"[WARN] Hand joint out of limits: {state.hand_qpos}"
+                logger.warning(
+                    "Hand joint out of limits: %s", state.hand_qpos
                 )
 
         flags = quality.get()
@@ -237,8 +248,8 @@ class TeleopController:
                     quality_flags=flags,
                     T_base_eef=self._compute_T_base_eef(state),
                 )
-            except Exception:
-                traceback.print_exc()
+            except (ValueError, OSError) as e:
+                logger.exception("recorder add_frame failed: %s", e)
 
         if not self.dry_run:
             if self.robot.is_error():
@@ -249,10 +260,10 @@ class TeleopController:
                 arm_ok = result.get("arm_ok", False)
                 hand_ok = result.get("hand_ok", False)
                 if not arm_ok or not hand_ok:
-                    print(f"[WARN] send_action: arm_ok={arm_ok} hand_ok={hand_ok}")
+                    logger.warning("send_action: arm_ok=%s hand_ok=%s", arm_ok, hand_ok)
 
-        if self.error_handler.should_emergency_stop:
-            self._escalate_to_emergency(self.error_handler.summary())
+        # Note: cumulative E-Stop escalation removed per error_handler design.
+        # Persistent failures are caught by robot.is_error() at driver level.
 
         # 7. Periodic status
         now = time.monotonic()
@@ -260,15 +271,15 @@ class TeleopController:
             self.last_status_ts = now
             self._print_status(vr_frame, flags, now)
 
+    # ------------------------------------------------------------------
+    # Action computation (split into sub-methods per Phase 3.2)
+    # ------------------------------------------------------------------
+
     def _compute_action(
-        self, vr_frame: dict[str, Any], state: RobotState
+        self, vr_frame: dict, state: RobotState
     ) -> tuple[RobotAction, QualityFlags]:
         quality = QualityFlags()
         quality.set(TRACKING_OK, True)
-
-        wrist_pos = vr_frame["wrist_pos"]
-        wrist_quat_wxyz = vr_frame["wrist_quat_wxyz"]
-        landmarks = vr_frame["landmarks"]
 
         current_arm_qpos = state.arm_qpos.copy()
         current_hand_qpos = state.hand_qpos.copy()
@@ -288,10 +299,58 @@ class TeleopController:
         self.error_handler.init_fallback(current_arm_qpos, current_hand_qpos)
 
         # ── Arm IK ──
+        arm_cmd, ik_ok, target_eef_pos = self._compute_arm_command(
+            vr_frame, state, prev_arm_cmd, quality
+        )
+
+        # Workspace check on computed arm command
+        arm_eef_pos = self.planner.compute_eef_pose_world(arm_cmd).p
+        in_workspace = self.robot.check_workspace(arm_eef_pos)
+        quality.set(IN_WORKSPACE, in_workspace)
+        if not in_workspace:
+            hold = self.error_handler.hold_action()
+            arm_cmd = hold.arm_qpos_cmd
+            hand_cmd = hold.hand_qpos_cmd
+        else:
+            # ── Hand retarget ──
+            hand_cmd, retarget_ok = self._compute_hand_command(
+                vr_frame, prev_hand_cmd, quality
+            )
+
+        # ── Joint jump clamp ──
+        arm_cmd, hand_cmd, jump_ok = self._apply_jump_clamp(
+            arm_cmd, hand_cmd, prev_arm_cmd, prev_hand_cmd, quality
+        )
+
+        # Update last-good positions for hold-on-failure
+        if ik_ok and retarget_ok:
+            self.error_handler.update_good_positions(arm_cmd, hand_cmd)
+
+        action = RobotAction(
+            arm_qpos_cmd=arm_cmd,
+            hand_qpos_cmd=hand_cmd,
+            target_eef_pos=target_eef_pos,
+        )
+        return action, quality
+
+    def _compute_arm_command(
+        self,
+        vr_frame: dict,
+        state: RobotState,
+        prev_arm_cmd: np.ndarray,
+        quality: QualityFlags,
+    ) -> tuple[np.ndarray, bool, np.ndarray | None]:
+        """Compute arm IK command from VR wrist pose.
+
+        Returns:
+            (arm_cmd, ik_ok, target_eef_pos).
+        """
+        wrist_pos = vr_frame["wrist_pos"]
+        wrist_quat_wxyz = vr_frame["wrist_quat_wxyz"]
+
         arm_cmd = prev_arm_cmd.copy()
         ik_ok = False
         target_eef_pos = None
-        target_eef_rot6d = None
 
         if self.arm_mapper.is_ready():
             mapped = self.arm_mapper.map(wrist_pos, wrist_quat_wxyz)
@@ -300,12 +359,12 @@ class TeleopController:
                 target_eef_quat = mapped["quat_wxyz"]
                 target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
                 ik_result: IKResult = self.planner.solve_teleop_ik(
-                    target_pose, current_arm_qpos, prev_arm_cmd
+                    target_pose, state.arm_qpos.copy(), prev_arm_cmd
                 )
                 if ik_result.success and ik_result.qpos is not None:
                     ik_ok = True
                     raw_arm = np.asarray(ik_result.qpos, dtype=np.float64)
-                    arm_cmd = self._ema_smooth(raw_arm, self._last_arm_cmd, self.ema_alpha_arm)
+                    arm_cmd = ema_smooth(raw_arm, self._last_arm_cmd, self.ema_alpha_arm)
                     self._last_arm_cmd = arm_cmd
                     self.ik_success_count += 1
                 else:
@@ -316,20 +375,23 @@ class TeleopController:
                     arm_cmd = prev_arm_cmd.copy()
             else:
                 self.error_handler.record_failure("wrist_map", "mapper returned None")
-        else:
-            pass  # arm_mapper not ready yet (not reset), hold in place
+        # else: arm_mapper not ready yet (not reset), hold in place
 
         quality.set(IK_SUCCESS, ik_ok)
-        # Check workspace by computing EEF FK for the arm command
-        arm_eef_pos = self.planner.compute_eef_pose_world(arm_cmd).p
-        in_workspace = self.robot.check_workspace(arm_eef_pos)
-        quality.set(IN_WORKSPACE, in_workspace)
-        if not in_workspace:
-            hold = self.error_handler.hold_action()
-            arm_cmd = hold.arm_qpos_cmd
-            hand_cmd = hold.hand_qpos_cmd
+        return arm_cmd, ik_ok, target_eef_pos
 
-        # ── Hand retarget ──
+    def _compute_hand_command(
+        self,
+        vr_frame: dict,
+        prev_hand_cmd: np.ndarray,
+        quality: QualityFlags,
+    ) -> tuple[np.ndarray, bool]:
+        """Compute hand retargeting command from VR landmarks.
+
+        Returns:
+            (hand_cmd, retarget_ok).
+        """
+        landmarks = vr_frame["landmarks"]
         hand_cmd = prev_hand_cmd.copy()
         retarget_ok = False
 
@@ -347,15 +409,28 @@ class TeleopController:
                 self.retarget_fail_count += 1
                 self.error_handler.record_failure("retarget", "retarget returned None")
                 hand_cmd = prev_hand_cmd.copy()
-        except Exception:
+        except (ValueError, TypeError) as e:
             self.retarget_fail_count += 1
-            self.error_handler.record_failure("retarget", "retarget threw exception")
+            self.error_handler.record_failure("retarget", f"retarget threw exception: {e}")
             hand_cmd = prev_hand_cmd.copy()
 
         quality.set(RETARGET_OK, retarget_ok)
-        quality.set(RETARGET_VALID, SafetyChecker.check_retarget_valid(hand_cmd))
+        quality.set(RETARGET_VALID, safety.check_retarget_valid(hand_cmd))
+        return hand_cmd, retarget_ok
 
-        # ── Joint jump clamp ──
+    def _apply_jump_clamp(
+        self,
+        arm_cmd: np.ndarray,
+        hand_cmd: np.ndarray,
+        prev_arm_cmd: np.ndarray,
+        prev_hand_cmd: np.ndarray,
+        quality: QualityFlags,
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Clamp per-step joint deltas to prevent command jumps.
+
+        Returns:
+            (arm_cmd, hand_cmd, jump_ok).
+        """
         jump_ok = True
         if prev_arm_cmd is not None:
             arm_delta = np.max(np.abs(arm_cmd - prev_arm_cmd))
@@ -378,21 +453,7 @@ class TeleopController:
             arm_cmd = hold.arm_qpos_cmd
             hand_cmd = hold.hand_qpos_cmd
 
-        # Record success for hold-on-failure (counters reset independently
-        # so that a persistent retarget failure doesn't prevent IK counter reset)
-        if ik_ok:
-            self.error_handler.record_arm_ok(arm_cmd)
-        if retarget_ok:
-            self.error_handler.record_hand_ok(hand_cmd)
-        if jump_ok:
-            self.error_handler.record_jump_ok()
-
-        action = RobotAction(
-            arm_qpos_cmd=arm_cmd,
-            hand_qpos_cmd=hand_cmd,
-            target_eef_pos=target_eef_pos,
-        )
-        return action, quality
+        return arm_cmd, hand_cmd, jump_ok
 
     # ------------------------------------------------------------------
     # State machine transitions
@@ -407,7 +468,7 @@ class TeleopController:
 
     def _transition(self, signal: ControlSignal) -> None:
         if signal == ControlSignal.QUIT:
-            print("[Controller] QUIT — shutting down.")
+            logger.info("QUIT — shutting down.")
             self.running = False
             return
 
@@ -428,38 +489,38 @@ class TeleopController:
                 if not self.dry_run:
                     self.robot.reset_soft_start()
                 self.state = ControllerState.TELEOP
-                print("[Controller] IDLE → TELEOP")
+                logger.info("IDLE → TELEOP")
             # else: already in TELEOP or RECORDING, no-op
 
         elif signal == ControlSignal.RECORD:
             if self.state == ControllerState.TELEOP:
                 self._start_recording()
             elif self.state == ControllerState.RECORDING:
-                print("[Controller] Already RECORDING, press S to stop.")
+                logger.info("Already RECORDING, press S to stop.")
 
         elif signal == ControlSignal.STOP:
             if self.state == ControllerState.RECORDING:
                 self._stop_recording()
                 self.state = ControllerState.TELEOP
-                print("[Controller] RECORDING → TELEOP")
+                logger.info("RECORDING → TELEOP")
             elif self.state == ControllerState.TELEOP:
                 self.state = ControllerState.IDLE
-                print("[Controller] TELEOP → IDLE")
+                logger.info("TELEOP → IDLE")
 
     def _do_home(self) -> None:
-        print("[Controller] Returning to home...")
+        logger.info("Returning to home...")
         self._last_arm_cmd = None
         self._last_hand_cmd = None
 
         if not self.dry_run:
             self.robot.return_to_home(use_planning=True, cancel_event=self._cancel_event)
         else:
-            print("  [dry-run] home (no hardware)")
+            logger.info("  [dry-run] home (no hardware)")
 
         self.state = ControllerState.IDLE
         self.error_handler.clear()
         self.tracking_quality.reset()
-        print("[Controller] Home complete.")
+        logger.info("Home complete.")
 
     def _reset_mapper(self) -> bool:
         """Re-anchor VR reference from current VR frame + robot state.
@@ -469,7 +530,7 @@ class TeleopController:
         """
         vr_frame = self._read_vr_frame()
         if vr_frame is None:
-            print("  [WARN] No VR frame available, cannot reset mapper.")
+            logger.warning("No VR frame available, cannot reset mapper.")
             return False
 
         if self.dry_run:
@@ -486,85 +547,66 @@ class TeleopController:
         return True
 
     def _start_recording(self) -> None:
-        print("[Controller] Starting episode recording...")
+        logger.info("Starting episode recording...")
 
         # Re-anchor VR reference
         if not self._reset_mapper():
-            print("  [ERROR] Cannot start recording without VR frame.")
+            logger.error("Cannot start recording without VR frame.")
             return
 
         if self.recorder is not None:
             try:
                 self.recorder.start_episode(task_label="teleop", operator="")
-            except Exception:
-                traceback.print_exc()
+            except (ValueError, OSError) as e:
+                logger.exception("recorder start_episode failed: %s", e)
 
         self.state = ControllerState.RECORDING
         self.error_handler.clear()
-        print("[Controller] TELEOP → RECORDING")
+        logger.info("TELEOP → RECORDING")
 
     def _stop_recording(self) -> None:
-        print(f"[Controller] Stopping episode. frames={self.frame_count}")
+        logger.info("Stopping episode. frames=%s", self.frame_count)
         if self.recorder is not None and self.recorder.is_recording:
             try:
                 path = self.recorder.stop_episode(success=True)
                 if path:
-                    print(f"  Saved to {path}")
-            except Exception:
-                traceback.print_exc()
-        print("[Controller] Episode stopped.")
+                    logger.info("  Saved to %s", path)
+            except (ValueError, OSError) as e:
+                logger.exception("recorder stop_episode failed: %s", e)
+        logger.info("Episode stopped.")
 
     def _escalate_to_emergency(self, reason: str) -> None:
-        print(f"[EMERGENCY_STOP] {reason}")
+        logger.error("EMERGENCY_STOP: %s", reason)
         self.state = ControllerState.EMERGENCY_STOP
         if not self.dry_run:
             self.robot.emergency_stop()
         self.running = False
 
     def _shutdown(self) -> None:
-        print("[TeleopController] Shutting down...")
+        logger.info("Shutting down...")
         if self.recorder is not None and self.recorder.is_recording:
             try:
                 self.recorder.stop_episode(success=False)
             except Exception:
-                pass
+                pass  # shutdown must never fail
         if self.keyboard is not None:
             self.keyboard.stop()
-        print(f"  Frames: {self.frame_count}")
-        print(f"  IK: ok={self.ik_success_count} fail={self.ik_fail_count}")
-        print(f"  Retarget: ok={self.retarget_success_count} fail={self.retarget_fail_count}")
+        logger.info("  Frames: %s", self.frame_count)
+        logger.info("  IK: ok=%s fail=%s", self.ik_success_count, self.ik_fail_count)
+        logger.info("  Retarget: ok=%s fail=%s", self.retarget_success_count, self.retarget_fail_count)
 
     # ------------------------------------------------------------------
     # VR data source
     # ------------------------------------------------------------------
 
-    def _read_vr_frame(self) -> dict[str, Any] | None:
+    def _read_vr_frame(self) -> dict | None:
         if self.tracker is not None:
             return self.tracker.get_latest()
         return None
 
     # ------------------------------------------------------------------
-    # EMA smoothing
+    # EEF pose utilities
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _ema_smooth(
-        new_val: np.ndarray, prev_val: np.ndarray | None, alpha: float
-    ) -> np.ndarray:
-        if prev_val is None:
-            return np.asarray(new_val, dtype=np.float64).copy()
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-        return alpha * np.asarray(new_val, dtype=np.float64) + (1.0 - alpha) * prev_val
-
-    @staticmethod
-    def _quat_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
-        """Convert wxyz quaternion to 3x3 rotation matrix."""
-        w, x, y, z = q_wxyz[0], q_wxyz[1], q_wxyz[2], q_wxyz[3]
-        return np.array([
-            [1 - 2*y*y - 2*z*z,     2*x*y - 2*w*z,     2*x*z + 2*w*y],
-            [    2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z,     2*y*z - 2*w*x],
-            [    2*x*z - 2*w*y,     2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y],
-        ], dtype=np.float64)
 
     def _compute_T_base_eef(self, state: RobotState) -> np.ndarray | None:
         """Compute 4x4 T_base_eef from EEF pose for camera extrinsics."""
@@ -572,7 +614,7 @@ class TeleopController:
             return None
         T = np.eye(4, dtype=np.float64)
         T[:3, 3] = state.eef_pos
-        T[:3, :3] = self._quat_to_rotmat(state.eef_quat_wxyz)
+        T[:3, :3] = quat_wxyz_to_rotmat(state.eef_quat_wxyz)
         return T
 
     @staticmethod
@@ -601,7 +643,7 @@ class TeleopController:
     # ------------------------------------------------------------------
 
     def _print_status(
-        self, vr_frame: dict[str, Any] | None, quality_flags: int, now: float
+        self, vr_frame: dict | None, quality_flags: int, now: float
     ) -> None:
         failed = QualityFlags.describe(quality_flags)
         flags_str = ",".join(failed) if failed else "ALL_OK"
@@ -611,13 +653,13 @@ class TeleopController:
             else float("inf")
         )
         seq = vr_frame.get("sequence_id", "?") if vr_frame else "?"
-        print(
-            f"[t={now:.1f}] frames={self.frame_count} "
-            f"state={self.state.value} "
-            f"vr_seq={seq} age={age_s*1000:.0f}ms "
-            f"ik={self.ik_success_count}/{self.ik_fail_count} "
-            f"retarget={self.retarget_success_count}/{self.retarget_fail_count} "
-            f"[{flags_str}]"
+        logger.info(
+            "[t=%.1f] frames=%s state=%s vr_seq=%s age=%sms "
+            "ik=%s/%s retarget=%s/%s [%s]",
+            now, self.frame_count, self.state.value, seq, f"{age_s*1000:.0f}",
+            self.ik_success_count, self.ik_fail_count,
+            self.retarget_success_count, self.retarget_fail_count,
+            flags_str,
         )
 
 

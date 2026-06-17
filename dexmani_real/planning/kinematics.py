@@ -1,3 +1,5 @@
+"""xArm7 kinematics via Pinocchio — FK, Jacobian, pose transforms."""
+
 from __future__ import annotations
 
 from typing import Any

@@ -18,7 +18,7 @@ class RateLimiter:
             do_work()
             limiter.wait()  # sleeps only the remaining time in this cycle
 
-    CLUADE.md Section 4.4 reference: 控制循环必须使用速率限制器而非单纯 time.sleep().
+    CLAUDE.md Section 4.4 reference: control loops must use rate limiter, not plain time.sleep().
     """
 
     def __init__(self, target_hz: float) -> None:

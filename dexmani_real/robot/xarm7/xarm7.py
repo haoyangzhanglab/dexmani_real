@@ -1,3 +1,5 @@
+"""xArm7 7-DOF robot arm hardware driver."""
+
 from __future__ import annotations
 
 import time
@@ -6,6 +8,11 @@ from typing import Any
 
 import numpy as np
 from xarm.wrapper import XArmAPI
+
+from dexmani_real.log import get_logger
+from dexmani_real.robot._connection_state import ConnectionStateMixin
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -31,26 +38,23 @@ class XArm7Config:
     soft_start_frames: int = 20          # ref: ufactory_teleop — first N frames at reduced speed
     soft_start_speed_rad_s: float = 0.3  # ref: ufactory_teleop 0.2 rad/s; slightly higher for VR teleop
 
-    # 碰撞检测参数 — 防止 C31 误触发
-    # tcp_load_kg: XHand 重量 (kg)，非零值使动力学模型正确估算力矩
+    # Collision detection params — prevent false C31 triggering
+    # tcp_load_kg: XHand weight (kg); non-zero enables correct dynamics torque estimation
     tcp_load_kg: float = 1.2
-    # tcp_load_cog_mm: 负载重心 [x, y, z] mm，相对法兰坐标系
+    # tcp_load_cog_mm: load center of gravity [x, y, z] mm, relative to flange frame
     tcp_load_cog_mm: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 80.0]
     )
-    # collision_sensitivity: 0=最敏感, 5=最不敏感。伺服模式推荐 3
+    # collision_sensitivity: 0=most sensitive, 5=least sensitive. Servo mode recommends 3
     collision_sensitivity: int = 3
 
 
-class XArm7:
+class XArm7(ConnectionStateMixin):
     def __init__(self, config: XArm7Config):
+        super().__init__()
         self.config = config
         self.arm: XArmAPI | None = None
 
-        self.connected_flag = False
-        self.error_state = False
-        self.last_error_message = ""
-        self.last_action_code: int | None = None
         self.last_sdk_error_code: int = 0  # SDK-level error code for C31/C32 recovery
 
         self.last_qpos_cmd: np.ndarray | None = None
@@ -65,7 +69,7 @@ class XArm7:
 
         try:
             self.arm = XArmAPI(self.config.ip, is_radian=True)
-        except Exception as e:
+        except (OSError, ConnectionError, RuntimeError) as e:
             self.error_state = True
             self.last_error_message = f"XArmAPI init failed: {e}"
             return False
@@ -75,7 +79,7 @@ class XArm7:
         self.arm.motion_enable(True)
         self._set_mode(1)
 
-        # 设置 TCP 负载和碰撞灵敏度 — 防止 C31 误触发
+        # Set TCP load and collision sensitivity — prevent false C31 triggering
         # ref: xarm-sdk set_tcp_load / set_collision_sensitivity
         self._configure_collision_params()
 
@@ -170,7 +174,7 @@ class XArm7:
         return state
 
     # ------------------------------------------------------------------
-    # 动作发送
+    # Action sending
     # ------------------------------------------------------------------
 
     def send_action(self, action: np.ndarray) -> bool:
@@ -199,7 +203,7 @@ class XArm7:
         # controller to miss C31/C32 recovery opportunities.
         try:
             _, _, sdk_err, sdk_warn = self.arm.get_err_warn_code()
-        except Exception:
+        except (RuntimeError, OSError):
             sdk_err, sdk_warn = -1, -1
 
         self.last_sdk_error_code = int(sdk_err)
@@ -249,15 +253,16 @@ class XArm7:
         self._cmd_cnt = 0  # reset soft-start counter on mode change
 
     def _configure_collision_params(self) -> None:
-        """设置 TCP 负载和碰撞灵敏度，防止 C31 误触发。
+        """Set TCP load and collision sensitivity to prevent false C31 triggering.
 
-        C31 (Collision Caused Abnormal Current) 检测机制:
-          - xArm 控制器用动力学模型估算各关节理论力矩
-          - 比较实际力矩(电机电流)与理论力矩
-          - 偏差超过阈值 → C31 急停
+        C31 (Collision Caused Abnormal Current) detection mechanism:
+          - xArm controller estimates theoretical joint torques via dynamics model
+          - Compares actual torque (motor current) against theoretical torque
+          - Deviation exceeds threshold → C31 emergency stop
 
-        未设置负载时动力学模型按 0kg 计算 → 理论力矩被严重低估
-        → 正常驱动 XHand(~1.2kg) 所需的力矩被误判为碰撞。
+        Without load configured, dynamics model assumes 0kg → theoretical torque is
+        severely underestimated → the torque needed to drive XHand (~1.2kg) is
+        misclassified as a collision.
         """
         if self.arm is None:
             return
@@ -270,14 +275,14 @@ class XArm7:
             )
             if code != 0:
                 self.last_error_message = f"set_tcp_load failed: code={code}"
-        except Exception as e:
+        except RuntimeError as e:
             self.last_error_message = f"set_tcp_load exception: {e}"
 
         try:
             code = self.arm.set_collision_sensitivity(cfg.collision_sensitivity)
             if code != 0:
                 self.last_error_message = f"set_collision_sensitivity failed: code={code}"
-        except Exception as e:
+        except RuntimeError as e:
             self.last_error_message = f"set_collision_sensitivity exception: {e}"
 
     def _read_qpos(self) -> np.ndarray:
@@ -382,15 +387,9 @@ class XArm7:
         return out
 
 
-def _print_state(state: dict[str, Any]):
-    for key, value in state.items():
-        if isinstance(value, np.ndarray):
-            print(f"{key}: shape={value.shape}, value={np.round(value, 6)}")
-        else:
-            print(f"{key}: {value}")
-
-
 def example():
+    from dexmani_real.robot._debug import print_state
+
     config = XArm7Config(ip="192.168.1.111")
     robot = XArm7(config)
 
@@ -399,15 +398,15 @@ def example():
 
     try:
         print("=== get_state() ===")
-        _print_state(robot.get_state())
+        print_state(robot.get_state())
 
         print("\n=== get_state(full=True) ===")
-        _print_state(robot.get_state(full=True))
+        print_state(robot.get_state(full=True))
 
         print("\n=== reset() ===")
         ok = robot.reset()
         print(f"reset ok: {ok}")
-        _print_state(robot.get_state())
+        print_state(robot.get_state())
 
         print("\n=== hold 3s ===")
         qpos = robot.get_state()["qpos"]
@@ -417,7 +416,7 @@ def example():
                 print(f"send_action failed: {robot.last_error_message}")
                 break
             time.sleep(robot.config.dt)
-        _print_state(robot.get_state())
+        print_state(robot.get_state())
 
     finally:
         robot.disconnect()

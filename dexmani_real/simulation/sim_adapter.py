@@ -1,12 +1,13 @@
-"""XArm7_XHand 仿真 → RobotInterface 接口适配器。
+"""Simulation-to-RobotInterface adapter — wraps SAPIEN with hardware-compatible API.
 
-将 SAPIEN 仿真类包装为与真机驱动一致的接口，使 controller 和 test
-可以在仿真/真机之间无缝切换。
-
-无硬件依赖: SAPIEN headless 模式可在 CI 中运行 (无 GPU/显示器)。
+Enables seamless switching between simulation and real hardware for controllers
+and tests. No hardware dependencies — SAPIEN headless mode runs in CI
+(no GPU/display required).
 """
 
 from __future__ import annotations
+
+__all__ = ["SimRobotConfig", "SimRobotInterface"]
 
 import time
 from dataclasses import dataclass, field
@@ -14,14 +15,15 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.simulation.constructor import add_base_components, setup_scene
-from dexmani_real.simulation.xarm7_xhand import XArm7_XHand
+from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 
 
 @dataclass
 class SimRobotConfig:
     dt: float = 1.0 / 50.0
-    time_step: float = 1.0 / 240.0      # SAPIEN 物理步长 (通常 > 控制频率)
+    time_step: float = 1.0 / 240.0      # SAPIEN physics step (typically > control rate)
     headless: bool = True
     arm_home_qpos: np.ndarray = field(
         default_factory=lambda: np.array(
@@ -30,31 +32,28 @@ class SimRobotConfig:
     )
 
 
-class SimRobotInterface:
-    """SAPIEN 仿真 → 独立测试接口。
+class SimRobotInterface(ConnectionStateMixin):
+    """SAPIEN simulation interface for independent testing.
 
-    提供 get_state()/send_action()/reset() 等基础方法用于仿真内验证，
-    不依赖真机硬件。注意：参数和返回类型与 RobotInterface 不同，
-    不可直接替换。
+    Provides get_state()/send_action()/reset() for simulation-internal
+    validation without real hardware. Note: parameter and return types
+    differ from RobotInterface — not a drop-in replacement.
     """
 
     def __init__(self, config: SimRobotConfig | None = None):
+        super().__init__()
         self.config = config or SimRobotConfig()
         self.scene = None
-        self.robot: XArm7_XHand | None = None
+        self.robot: XArm7XHand | None = None
         self.step_count = 0
 
-        self.connected_flag = False
-        self.error_state = False
-        self.last_error_message = ""
-        self.last_action_code: int | None = None
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
         self.last_joint_limit_clipped = False
         self.last_delta_limited = False
 
     # ------------------------------------------------------------------
-    # 生命周期
+    # Lifecycle
     # ------------------------------------------------------------------
 
     def connect(self) -> bool:
@@ -62,12 +61,12 @@ class SimRobotInterface:
             self.scene = setup_scene(time_step=self.config.time_step)
             if not self.config.headless:
                 add_base_components(self.scene)
-            self.robot = XArm7_XHand(
+            self.robot = XArm7XHand(
                 self.scene,
                 disable_self_collision=True,
                 arm_home_qpos=self.config.arm_home_qpos.copy(),
             )
-        except Exception as e:
+        except (OSError, ConnectionError, RuntimeError) as e:
             self.error_state = True
             self.last_error_message = f"sim setup failed: {e}"
             return False
@@ -101,7 +100,7 @@ class SimRobotInterface:
         return self.is_connected()
 
     def stop(self) -> bool:
-        """软停 — 发送当前位置作为目标（原地保持）。"""
+        """Soft-stop — send current position as target (hold in place)."""
         if self.robot is None:
             return False
         qpos = self.robot.get_qpos()
@@ -109,7 +108,7 @@ class SimRobotInterface:
         return True
 
     # ------------------------------------------------------------------
-    # 状态读取
+    # State retrieval
     # ------------------------------------------------------------------
 
     def get_state(self, full: bool = False) -> dict[str, Any]:
@@ -144,7 +143,7 @@ class SimRobotInterface:
         return state
 
     # ------------------------------------------------------------------
-    # 动作发送
+    # Action sending
     # ------------------------------------------------------------------
 
     def send_action(self, action: np.ndarray) -> bool:
@@ -153,7 +152,7 @@ class SimRobotInterface:
 
         target_qpos = np.asarray(action, dtype=np.float64).reshape(19)
 
-        # joint limit clip (使用仿真 URDF 限位)
+        # joint limit clip (using simulation URDF limits)
         if self.robot.qlimits is not None:
             qmin = self.robot.qlimits[:, 0]
             qmax = self.robot.qlimits[:, 1]
@@ -171,7 +170,7 @@ class SimRobotInterface:
         return True
 
     # ------------------------------------------------------------------
-    # 复位
+    # Reset
     # ------------------------------------------------------------------
 
     def reset(self, target: np.ndarray | None = None) -> bool:
@@ -197,26 +196,26 @@ class SimRobotInterface:
         self.stop()
 
     # ------------------------------------------------------------------
-    # 内部
+    # Internal
     # ------------------------------------------------------------------
 
     def _step_physics(self, n: int = 5):
-        """推进物理仿真。n=5: 240Hz → 48Hz 有效控制频率。"""
+        """Advance physics simulation. n=5: 240Hz → 48Hz effective control rate."""
         for _ in range(n):
             self.scene.step()
 
     def get_full_qpos(self) -> np.ndarray:
-        """返回完整 19-DOF qpos [arm7, hand12]。"""
+        """Return full 19-DOF qpos [arm7, hand12]."""
         if self.robot is None:
             return np.full(19, np.nan)
         return self.robot.get_qpos().copy()
 
     # ------------------------------------------------------------------
-    # 仿真专属验证方法
+    # Simulation-specific validation
     # ------------------------------------------------------------------
 
     def validate_fk_consistency(self) -> dict[str, Any]:
-        """验证 FK 一致性: link poses vs forward_kinematics。"""
+        """Validate FK consistency: link poses vs forward_kinematics."""
         if self.robot is None:
             return {"ok": False, "error": "not connected"}
 
@@ -228,7 +227,7 @@ class SimRobotInterface:
         return {"ok": max_err < 1e-4, "max_error": float(max_err)}
 
     def validate_ik_roundtrip(self, n_tests: int = 20) -> dict[str, Any]:
-        """验证 IK 往返一致性: IK(FK(q)) ≈ q。"""
+        """Validate IK roundtrip consistency: IK(FK(q)) ≈ q."""
         if self.robot is None:
             return {"ok": False, "error": "not connected"}
 
@@ -239,7 +238,7 @@ class SimRobotInterface:
         for i in range(n_tests):
             try:
                 ik_qpos = self.robot.inverse_kinematics(eef_pose, full_qpos_init=qpos)
-                err = np.max(np.abs(ik_qpos[:7] - qpos[:7]))  # 仅比较 arm 关节
+                err = np.max(np.abs(ik_qpos[:7] - qpos[:7]))  # compare arm joints only
                 max_err = max(max_err, err)
             except RuntimeError:
                 return {"ok": False, "error": f"IK failed at test {i}"}
@@ -260,11 +259,11 @@ def example():
         print(f"arm_qpos: {np.round(state['arm_qpos'], 3)}")
         print(f"eef_pos: {np.round(state['eef_pos'], 3)}")
 
-        # FK 一致性
+        # FK consistency
         fk = sim.validate_fk_consistency()
         print(f"FK consistency: ok={fk['ok']}, max_err={fk['max_error']:.6f}")
 
-        # IK 往返
+        # IK roundtrip
         ik = sim.validate_ik_roundtrip()
         print(f"IK roundtrip: ok={ik['ok']}, max_err={ik.get('max_error', 0):.6f}")
 

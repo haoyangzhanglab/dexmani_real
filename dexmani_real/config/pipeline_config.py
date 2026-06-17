@@ -5,6 +5,8 @@ Single-point serializable config source for HDF5 /meta pipeline_snapshot.
 
 from __future__ import annotations
 
+__all__ = ["PipelineConfig"]
+
 import dataclasses
 from dataclasses import dataclass, field
 

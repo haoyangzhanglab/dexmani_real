@@ -1,3 +1,5 @@
+"""XHand 12-DOF robot hand hardware driver via xhand_controller SDK."""
+
 from __future__ import annotations
 
 import os
@@ -8,7 +10,11 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.log import get_logger
+from dexmani_real.robot._connection_state import ConnectionStateMixin
 from xhand_controller import xhand_control as xh
+
+logger = get_logger(__name__)
 
 
 JOINT_NAMES = [
@@ -99,21 +105,17 @@ class XHandConfig:
     tactile_scale: float = 0.1
 
 
-class XHand:
+class XHand(ConnectionStateMixin):
     def __init__(self, config: XHandConfig):
+        super().__init__()
         self.config = config
         self.control = None
         self.device_name: str | None = None
         self.hand_command = None
 
-        self.connected_flag = False
-        self.error_state = False
-
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
-        self.last_action_code: int | None = None
         self.last_error_code: int | None = None
-        self.last_error_message = ""
         self.last_joint_limit_clipped = False
         self.last_delta_limited = False
 
@@ -123,10 +125,39 @@ class XHand:
         self.last_hand_ids: list[int] = []
         self.cached_comm_type = self._resolve_comm_type()
 
+    # ── Connect lifecycle ──
+
     def connect(self) -> bool:
+        """Connect to XHand hardware.
+
+        Orchestrates device enumeration, retry-based port opening, and
+        initial state initialization. Returns True on success.
+        """
         comm_type = self.cached_comm_type
 
-        # Device enumeration (runs once)
+        if not self._retry_open_device(comm_type):
+            return False
+
+        try:
+            self.last_hand_ids = list(self.control.list_hands_id())
+        except (OSError, RuntimeError):
+            self.last_hand_ids = []
+
+        self.connected_flag = True
+        self.error_state = False
+        self.hand_command = self.make_command(self._array12(self.config.home_qpos))
+
+        self._init_hand_state()
+
+        self.last_cmd_time = time.time()
+        return True
+
+    def _retry_open_device(self, comm_type: str) -> bool:
+        """Enumerate devices and open port with configurable retries.
+
+        RS485 may need several attempts after cold start (C++ SDK retries
+        internally, but may still fail intermittently).
+        """
         self.control = xh.XHandControl()
         if self.config.device_name is None:
             devices = self.control.enumerate_devices(comm_type)
@@ -140,9 +171,6 @@ class XHand:
         else:
             self.device_name = self.config.device_name
 
-        # Retry loop for open_serial / open_ethercat.
-        # RS485 may need several attempts after cold start
-        # (C++ SDK retries internally, but may still fail intermittently).
         retries = max(1, int(self.config.open_serial_retries))
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
@@ -158,45 +186,39 @@ class XHand:
                 return False
 
             if self.error_ok(err):
-                break  # success
+                return True
 
             self._record_error(err)
             if attempt < retries:
-                print(
-                    f"XHand connect attempt {attempt}/{retries} failed: "
-                    f"{self.last_error_message}, retrying in {delay}s..."
+                logger.warning(
+                    "XHand connect attempt %s/%s failed: %s, retrying in %.1fs...",
+                    attempt, retries, self.last_error_message, delay,
                 )
                 # Close and recreate control for clean retry
                 try:
                     self.control.close_device()
-                except Exception:
+                except (OSError, RuntimeError):
                     pass
                 self.control = xh.XHandControl()
                 time.sleep(delay)
-        else:
-            # All retries exhausted
-            self.error_state = True
-            print(
-                f"XHand connect failed after {retries} attempts: "
-                f"{self.last_error_message}"
-            )
-            self._diagnose_connection_failure()
-            return False
 
-        try:
-            self.last_hand_ids = list(self.control.list_hands_id())
-        except Exception:
-            self.last_hand_ids = []
+        # All retries exhausted
+        self.error_state = True
+        logger.error(
+            "XHand connect failed after %s attempts: %s",
+            retries, self.last_error_message,
+        )
+        self._diagnose_connection_failure()
+        return False
 
-        self.connected_flag = True
-        self.error_state = False
-        self.hand_command = self.make_command(self._array12(self.config.home_qpos))
+    def _init_hand_state(self) -> None:
+        """Force-refresh hardware state and read initial qpos.
 
-        # Critical fix:
-        # Force-refresh real hardware state during connect.
-        # Do not use SDK cache here, because after open_serial() the cache may be all zeros.
+        Do not use SDK cache here — after open_serial() the cache
+        may be all zeros. Falls back to home_qpos if no valid state
+        is obtained.
+        """
         valid_state: dict[str, Any] | None = None
-
         attempts = max(1, int(self.config.init_state_read_attempts))
         interval = max(0.0, float(self.config.init_state_read_interval))
 
@@ -209,13 +231,10 @@ class XHand:
 
         if valid_state is not None:
             self.last_qpos_cmd = valid_state["qpos"].copy()
-            print("Initial qpos from hand state:", self.last_qpos_cmd)
+            logger.info("Initial qpos from hand state: %s", self.last_qpos_cmd)
         else:
             self.last_qpos_cmd = self._array12(self.config.home_qpos)
-            print("Using home_qpos as initial qpos:", self.last_qpos_cmd)
-
-        self.last_cmd_time = time.time()
-        return True
+            logger.info("Using home_qpos as initial qpos: %s", self.last_qpos_cmd)
 
     def disconnect(self):
         if self.control is not None:
@@ -231,7 +250,7 @@ class XHand:
         if self.control is not None:
             try:
                 self.control.close_device()
-            except Exception:
+            except (OSError, RuntimeError):
                 pass
         self.connected_flag = False
         self.error_state = False
@@ -246,24 +265,24 @@ class XHand:
         """
         comm_type = self.cached_comm_type
         device = self.device_name or "<auto>"
-        print(f"[XHand diagnostics] comm_type={comm_type}, device={device}")
+        logger.warning("[XHand diagnostics] comm_type=%s, device=%s", comm_type, device)
 
         # List available ttyUSB devices
         if comm_type == "RS485":
             import glob
             tty_devices = sorted(glob.glob("/dev/ttyUSB*"))
             if not tty_devices:
-                print("  No /dev/ttyUSB* devices found. Check USB cable and power.")
+                logger.warning("  No /dev/ttyUSB* devices found. Check USB cable and power.")
             else:
-                print(f"  Available tty devices: {tty_devices}")
+                logger.warning("  Available tty devices: %s", tty_devices)
                 for tty in tty_devices:
                     try:
                         st = os.stat(tty)
                         import stat
                         perms = stat.filemode(st.st_mode)
-                        print(f"    {tty}: {perms} owner={st.st_uid} group={st.st_gid}")
+                        logger.warning("    %s: %s owner=%s group=%s", tty, perms, st.st_uid, st.st_gid)
                     except OSError as e:
-                        print(f"    {tty}: stat failed — {e}")
+                        logger.warning("    %s: stat failed — %s", tty, e)
 
             # Check if device is held by another process (lsof)
             target = self.device_name if self.device_name else (
@@ -276,25 +295,25 @@ class XHand:
                         capture_output=True, text=True, timeout=5,
                     )
                     if result.stdout.strip():
-                        print(f"  lsof {target}:")
+                        logger.warning("  lsof %s:", target)
                         for line in result.stdout.strip().splitlines():
-                            print(f"    {line}")
+                            logger.warning("    %s", line)
                     else:
-                        print(f"  lsof {target}: not held by any process")
+                        logger.warning("  lsof %s: not held by any process", target)
                 except FileNotFoundError:
                     pass  # lsof not installed
                 except subprocess.TimeoutExpired:
-                    print(f"  lsof {target}: timed out")
-                except Exception as e:
-                    print(f"  lsof {target}: error — {e}")
+                    logger.warning("  lsof %s: timed out", target)
+                except (subprocess.SubprocessError, OSError) as e:
+                    logger.warning("  lsof %s: error — %s", target, e)
 
             # Suggestions
-            print("  Troubleshooting:")
-            print("    1. Check XHand power supply is on")
-            print("    2. Check USB cable is firmly connected")
-            print("    3. sudo chmod 666 /dev/ttyUSB* (or add user to dialout group)")
-            print("    4. Verify no other process is holding the device (lsof /dev/ttyUSB*)")
-            print("    5. Try power-cycling the XHand controller")
+            logger.warning("  Troubleshooting:")
+            logger.warning("    1. Check XHand power supply is on")
+            logger.warning("    2. Check USB cable is firmly connected")
+            logger.warning("    3. sudo chmod 666 /dev/ttyUSB* (or add user to dialout group)")
+            logger.warning("    4. Verify no other process is holding the device (lsof /dev/ttyUSB*)")
+            logger.warning("    5. Try power-cycling the XHand controller")
 
     def is_connected(self) -> bool:
         return self.control is not None and self.connected_flag and not self.error_state
@@ -691,15 +710,9 @@ class XHand:
         self.last_error_message = str(getattr(err, "error_message", ""))
 
 
-def _print_state(state: dict[str, Any]):
-    for key, value in state.items():
-        if isinstance(value, np.ndarray):
-            print(f"{key}: shape={value.shape}, value={np.round(value, 6)}")
-        else:
-            print(f"{key}: {value}")
-
-
 def example():
+    from dexmani_real.robot._debug import print_state
+
     config = XHandConfig(
         comm_type="RS485",
         device_name="/dev/ttyUSB0",
@@ -711,7 +724,7 @@ def example():
 
     try:
         state = hand.get_state(full=True)
-        _print_state(state)
+        print_state(state)
 
         ok = hand.send_action(config.home_qpos)
         print("send_action ok:", ok)

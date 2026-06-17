@@ -1,13 +1,24 @@
+"""LeFranX-style pinky reference adapter for XHand retargeting."""
+
 from __future__ import annotations
+
+__all__ = ["XHandRefAdapter"]
+
+from typing import Any
 
 import numpy as np
 
 
-EPS = 1e-8
-PINKY = (17, 18, 19, 20)
+EPS: float = 1e-8
+PINKY: tuple[int, int, int, int] = (17, 18, 19, 20)
 
 
-def _scale_chain(src, dst, ids, scale):
+def _scale_chain(
+    src: np.ndarray,
+    dst: np.ndarray,
+    ids: tuple[int, int, int, int],
+    scale: float,
+) -> None:
     p0 = src[ids[0]]
     p1 = src[ids[1]]
     p2 = src[ids[2]]
@@ -23,12 +34,12 @@ class XHandRefAdapter:
 
     def __init__(
         self,
-        enable=True,
-        pinky_extension_range=(0.03, 0.07),
-        pinky_scale=(1.2, 2.2),
-        pinky_blend=1.0,
-        debug=False,
-    ):
+        enable: bool = True,
+        pinky_extension_range: tuple[float, float] = (0.03, 0.07),
+        pinky_scale: tuple[float, float] = (1.2, 2.2),
+        pinky_blend: float = 1.0,
+        debug: bool = False,
+    ) -> None:
         self.enable = bool(enable)
         self.pinky_extension_range = pinky_extension_range
         self.pinky_scale = pinky_scale
@@ -36,7 +47,13 @@ class XHandRefAdapter:
         self.debug = bool(debug)
         self.last_debug = {}
 
-    def apply(self, ref_value, hand, origin_indices, task_indices):
+    def apply(
+        self,
+        ref_value: np.ndarray,
+        hand: np.ndarray | None,
+        origin_indices: np.ndarray,
+        task_indices: np.ndarray,
+    ) -> np.ndarray:
         if not self.enable or hand is None:
             return ref_value
 
@@ -75,7 +92,7 @@ class XHandRefAdapter:
 
         return out
 
-    def adapt_pinky(self, hand, mapped_hand):
+    def adapt_pinky(self, hand: np.ndarray, mapped_hand: np.ndarray) -> dict[str, Any]:
         mcp, pip, dip, tip = PINKY
         extension = float(np.linalg.norm(hand[tip] - hand[mcp]))
         low, high = self.pinky_extension_range
@@ -99,10 +116,10 @@ class XHandRefAdapter:
             "blend": self.pinky_blend,
         }
 
-    def use_pinky_row(self, origin, task):
+    def use_pinky_row(self, origin: int, task: int) -> bool:
         return origin in PINKY or task in PINKY
 
-    def chain_length(self, points, ids):
+    def chain_length(self, points: np.ndarray, ids: tuple[int, ...]) -> float:
         return float(
             np.linalg.norm(points[ids[1]] - points[ids[0]])
             + np.linalg.norm(points[ids[2]] - points[ids[1]])
