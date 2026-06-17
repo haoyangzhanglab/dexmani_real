@@ -265,25 +265,50 @@ class XArm7:
         return clipped
 
     def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
+        """Limit per-joint step size using current hardware position as reference.
+
+        Measures delta from the hardware's actual position (not the previous
+        command), so that the real robot motion cannot exceed max_qvel * dt
+        even when hardware tracking lags behind the command stream.
+
+        ref: BunnyVisionPro xarm7_ability.py clip_arm_next_qpos() — uses
+        hardware position as the delta reference.
+        """
         if not self.config.use_delta_limit:
             self.last_delta_limited = False
             return target_qpos
 
         now = time.time()
+
+        # Read current hardware position — the ground-truth reference for
+        # how far the robot will actually move.
+        hw_qpos = self._read_qpos()
+
         if self.last_qpos_cmd is None:
-            state = self.get_state()
-            self.last_qpos_cmd = state["qpos"].copy()
-            if not np.all(np.isfinite(self.last_qpos_cmd)):
+            if np.all(np.isfinite(hw_qpos)):
+                self.last_qpos_cmd = hw_qpos.copy()
+            else:
                 self.last_qpos_cmd = self.config.init_qpos.copy()
         if self.last_cmd_time is None:
             self.last_cmd_time = now
 
         dt = max(now - self.last_cmd_time, self.config.dt)
         max_step = self.config.max_qvel * dt
-        raw_step = target_qpos - self.last_qpos_cmd
-        step = np.clip(raw_step, -max_step, max_step)
-        self.last_delta_limited = not np.allclose(raw_step, step)
-        return self.last_qpos_cmd + step
+
+        # Use hardware position as the delta reference.  When the hardware has
+        # not yet reached the previous command (tracking lag), the delta from
+        # hardware to target is larger than from last_cmd to target — measuring
+        # from hardware catches this and clips the actual robot motion.
+        if np.all(np.isfinite(hw_qpos)):
+            ref = hw_qpos
+        else:
+            ref = self.last_qpos_cmd
+
+        delta = target_qpos - ref
+        step = np.clip(delta, -max_step, max_step)
+        self.last_delta_limited = not np.allclose(delta, step)
+
+        return ref + step
 
     @staticmethod
     def _array7(value) -> np.ndarray:
