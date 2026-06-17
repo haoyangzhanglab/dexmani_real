@@ -25,6 +25,19 @@ if TYPE_CHECKING:
 
 
 
+def _dense_interpolate(path: np.ndarray, max_step_rad: float = np.deg2rad(1.0)) -> np.ndarray:
+    """将稀疏关节路径插值为稠密路径（每步 ≤ max_step_rad）。"""
+    if len(path) <= 1:
+        return path
+    dense = [path[0]]
+    for i in range(len(path) - 1):
+        a, b = path[i], path[i + 1]
+        n = int(np.ceil(float(np.max(np.abs(b - a))) / max_step_rad))
+        for k in range(1, n + 1):
+            dense.append(a + (k / n) * (b - a))
+    return np.array(dense, dtype=np.float64)
+
+
 class HandKinematics:
     """手部 FK 辅助：计算指尖在世界坐标系中的位置。
 
@@ -527,7 +540,9 @@ class RobotInterface:
                         )
 
             phase1_completed = True
-            for waypoint in result.qpos_path:
+            # 插值为 1° 步长稠密路径，避免 _limit_joint_step 裁剪大跳变
+            dense_path = _dense_interpolate(result.qpos_path)
+            for waypoint in dense_path:
                 if (cancel_event is not None and cancel_event.is_set()) or self.arm.is_error():
                     phase1_completed = False
                     break
@@ -541,7 +556,7 @@ class RobotInterface:
                 target_qpos = result.qpos_path[-1]
                 max_wait = max(dt * 5, float(np.max(np.abs(
                     target_qpos - result.qpos_path[0]))) / float(np.min(
-                    self.arm.config.max_qvel)) * 1.5)
+                    self.arm.config.max_qvel)) * 5.0)
                 poll_interval = dt * 2
                 elapsed = 0.0
                 converged = False

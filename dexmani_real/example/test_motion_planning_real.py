@@ -4,7 +4,6 @@
 用法:
     source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real
     python test_motion_planning_real.py
-    python test_motion_planning_real.py --num-samples 5 --num-ik 50 --seed 123
 
 测试流程:
     0. 连接硬件 + Pre-Flight 安全检查
@@ -12,6 +11,8 @@
     2. solve_teleop_ik() 批量遥操作 IK 验证 (不移动)
     3. plan_path() 规划成功率 (不执行)
     4. 安全 waypoints 路径规划 + 硬件执行 + return_home
+
+如需修改测试参数，编辑本文件顶部的 DEFAULT_* 常量。
 """
 
 from __future__ import annotations
@@ -58,6 +59,11 @@ SAFE_WAYPOINTS = [
 
 INTERP_MAX_STEP_RAD = np.deg2rad(1.0)
 ARM_DT = 1.0 / 30.0
+CONVERGE_THRESHOLD_RAD = np.deg2rad(3.0)       # Phase 1 收敛阈值
+HOME_AT_THRESHOLD_RAD = np.deg2rad(1.0)        # 视为已归位的关节偏差
+PHASE2_MIN_DELTA_RAD = np.deg2rad(0.5)         # Phase 2 跳过的关节偏差下限
+PHASE2_MAX_STEP_RAD = np.deg2rad(2.0)          # Phase 2 关节空间最大步长
+POS_ERR_THRESHOLD_M = 0.03                     # waypoint 终点位置误差阈值 (m)
 
 
 # ═══════════════════════════════════════════════ 数学工具
@@ -407,7 +413,7 @@ def incremental_motion_check(arm: XArm7, planner: XArm7MotionPlanner, home_qpos:
     time.sleep(0.5)
     qpos_after = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
     home_err = float(np.max(np.abs(qpos_after - home_qpos)))
-    if home_err > np.deg2rad(3.0):
+    if home_err > CONVERGE_THRESHOLD_RAD:
         print(f"    FAILED: home error {np.rad2deg(home_err):.2f}deg")
         return False
     print(f"    OK (home_err={np.rad2deg(home_err):.2f}deg)")
@@ -551,15 +557,12 @@ def run_waypoint_test(
     rot_err = angular_dist_rad(final_eef.q, target.q)
 
     max_joint_err = float(np.max(np.abs(final_qpos - result.qpos_path[-1])))
-    ok = pos_err < 0.03 and max_joint_err < np.deg2rad(3.0)
+    ok = pos_err < POS_ERR_THRESHOLD_M and max_joint_err < CONVERGE_THRESHOLD_RAD
 
     print(f"  [{label}] final: pos_err={pos_err:.4f}m  rot_err={np.rad2deg(rot_err):.2f}deg  "
           f"joint_err={np.rad2deg(max_joint_err):.2f}deg  [{'OK' if ok else 'FAIL'}]")
 
     return ok
-
-
-# ═══════════════════════════════════════════════ 主流程
 
 
 def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndarray,
@@ -572,8 +575,6 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
 
     Returns: max joint error from home_qpos (deg)
     """
-    profile = planner.planning_profile
-
     current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
     if not np.all(np.isfinite(current_qpos)):
         arm.reset(home_qpos)
@@ -581,53 +582,62 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
         final = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
         return float(np.rad2deg(np.max(np.abs(final - home_qpos))))
 
-    # 已在 home？（joint 偏差 < 1°）
-    if float(np.max(np.abs(current_qpos - home_qpos))) < np.deg2rad(1.0):
+    # 已在 home？（joint 偏差 < HOME_AT_THRESHOLD_RAD）
+    if float(np.max(np.abs(current_qpos - home_qpos))) < HOME_AT_THRESHOLD_RAD:
         return float(np.rad2deg(np.max(np.abs(current_qpos - home_qpos))))
 
     # Phase 1: EEF 路径 → home EEF
     phase1_ok = False
+    phase1_send_ok = True
     result = planner.plan_path(home_eef, current_qpos)
     if result.success and result.qpos_path is not None and len(result.qpos_path) > 0:
-        for wp in result.qpos_path:
+        # 插值为 1° 步长稠密路径，避免 _limit_joint_step 裁剪大跳变
+        dense_path = interpolate_waypoints(result.qpos_path)
+        for wp in dense_path:
             if arm.is_error():
+                phase1_send_ok = False
                 break
             if not arm.send_action(wp):
+                phase1_send_ok = False
                 break
             time.sleep(dt)
-        # 闭环收敛验证：轮询 qpos 直到误差 < 3° 或超时
-        target_qpos = result.qpos_path[-1]
-        min_qvel = float(np.min(arm.config.max_qvel))
-        path_len = float(np.max(np.abs(target_qpos - result.qpos_path[0])))
-        max_wait = max(dt * 5, path_len / min_qvel * 1.5)
-        poll_interval = dt * 2
-        elapsed = 0.0
-        while elapsed < max_wait:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            try:
-                poll_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
-                if not np.all(np.isfinite(poll_qpos)):
+
+        if not phase1_send_ok:
+            print("  [safe_return_home] Phase 1 send_action failed, skipping convergence")
+        else:
+            # 闭环收敛验证：轮询 qpos 直到误差 < CONVERGE_THRESHOLD_RAD 或超时
+            target_qpos = result.qpos_path[-1]
+            min_qvel = float(np.min(arm.config.max_qvel))
+            path_len = float(np.max(np.abs(target_qpos - result.qpos_path[0])))
+            max_wait = max(dt * 5, path_len / min_qvel * 5.0)
+            poll_interval = dt * 2
+            elapsed = 0.0
+            while elapsed < max_wait:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    poll_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
+                    if not np.all(np.isfinite(poll_qpos)):
+                        continue
+                    if float(np.max(np.abs(poll_qpos - target_qpos))) < CONVERGE_THRESHOLD_RAD:
+                        phase1_ok = True
+                        break
+                except Exception:
                     continue
-                if float(np.max(np.abs(poll_qpos - target_qpos))) < np.deg2rad(3.0):
-                    phase1_ok = True
-                    break
-            except Exception:
-                continue
-        if not phase1_ok:
-            print(f"  [safe_return_home] Phase 1 convergence timeout after {max_wait:.1f}s")
+            if not phase1_ok:
+                print(f"  [safe_return_home] Phase 1 convergence timeout after {max_wait:.1f}s")
 
     # Phase 2: 关节空间精调，逐点自碰撞 + 环境碰撞检查
     if phase1_ok:
         current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
         if np.all(np.isfinite(current_qpos)):
             joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
-            if joint_delta > np.deg2rad(0.5):
-                max_step = np.deg2rad(2.0)
-                n = max(2, int(np.ceil(joint_delta / max_step)) + 1)
+            if joint_delta > PHASE2_MIN_DELTA_RAD:
+                n = max(2, int(np.ceil(joint_delta / PHASE2_MAX_STEP_RAD)) + 1)
                 joint_path = np.array([current_qpos + (k / (n - 1)) * (home_qpos - current_qpos)
                                        for k in range(n)])
 
+                profile = planner.planning_profile
                 collision_free = True
                 for q in joint_path:
                     if (profile.check_self_collision and planner.has_self_collision(q)) or \
@@ -642,8 +652,6 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
                             break
                         time.sleep(dt)
                 else:
-                    # 跳过 Phase 2：arm.reset(home_qpos) 走的是同一条关节直线
-                    # 路径，不会更安全。Phase 1 已把 EEF 归位。
                     print("  [safe_return_home] Phase 2 self-collides, skipping "
                           "(EEF already at home from Phase 1)")
 
