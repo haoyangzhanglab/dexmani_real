@@ -49,6 +49,7 @@ class XArm7:
         self.error_state = False
         self.last_error_message = ""
         self.last_action_code: int | None = None
+        self.last_sdk_error_code: int = 0  # SDK-level error code for C31/C32 recovery
 
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
@@ -159,6 +160,7 @@ class XArm7:
                 "error_state": self.error_state,
                 "last_error_message": self.last_error_message,
                 "last_action_code": self.last_action_code,
+                "last_sdk_error_code": self.last_sdk_error_code,
                 "last_joint_limit_clipped": self.last_joint_limit_clipped,
                 "last_delta_limited": self.last_delta_limited,
             })
@@ -189,8 +191,20 @@ class XArm7:
             self.last_cmd_time = time.time()
             return True
 
+        # Refresh SDK error/warn codes immediately — the background report
+        # callback may not have updated arm.error_code yet, causing the
+        # controller to miss C31/C32 recovery opportunities.
+        try:
+            _, _, sdk_err, sdk_warn = self.arm.get_err_warn_code()
+        except Exception:
+            sdk_err, sdk_warn = -1, -1
+
+        self.last_sdk_error_code = int(sdk_err)
         self.error_state = True
-        self.last_error_message = f"set_servo_angle_j failed: code={code}"
+        self.last_error_message = (
+            f"set_servo_angle_j failed: code={code}, "
+            f"sdk_err={sdk_err}, sdk_warn={sdk_warn}"
+        )
         return False
 
     def reset(self, target: np.ndarray | None = None) -> bool:
@@ -265,14 +279,19 @@ class XArm7:
         return clipped
 
     def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
-        """Limit per-joint step size using current hardware position as reference.
+        """Limit per-step joint motion using proportional (bottleneck) scaling.
 
-        Measures delta from the hardware's actual position (not the previous
-        command), so that the real robot motion cannot exceed max_qvel * dt
-        even when hardware tracking lags behind the command stream.
+        Uses a scalar scaling approach: when any joint exceeds its individual
+        speed limit, ALL joints are scaled by the same factor. This preserves
+        the relative joint-space trajectory (and approximately the Cartesian
+        trajectory), unlike per-joint independent clipping which distorts the
+        motion path.
 
-        ref: BunnyVisionPro xarm7_ability.py clip_arm_next_qpos() — uses
-        hardware position as the delta reference.
+        Reference is the hardware position (not previous command), so that
+        tracking lag does not cause command compounding.
+
+        ref: BunnyVisionPro xarm7_ability.py clip_arm_next_qpos() — scalar
+        scaling with hardware position as reference.
         """
         if not self.config.use_delta_limit:
             self.last_delta_limited = False
@@ -305,10 +324,20 @@ class XArm7:
             ref = self.last_qpos_cmd
 
         delta = target_qpos - ref
-        step = np.clip(delta, -max_step, max_step)
-        self.last_delta_limited = not np.allclose(delta, step)
 
-        return ref + step
+        # Proportional (bottleneck) scaling — same factor applied to all joints.
+        # Normalize each joint's delta by its individual speed limit, then find
+        # the bottleneck joint. If any joint exceeds its limit, scale ALL joints
+        # proportionally to preserve the trajectory shape.
+        normalized = np.abs(delta) / max_step
+        max_ratio = np.max(normalized)
+        if max_ratio > 1.0:
+            delta = delta / max_ratio
+            self.last_delta_limited = True
+        else:
+            self.last_delta_limited = False
+
+        return ref + delta
 
     @staticmethod
     def _array7(value) -> np.ndarray:

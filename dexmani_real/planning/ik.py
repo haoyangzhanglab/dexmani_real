@@ -202,35 +202,23 @@ class TeleopIKSolver:
         report: dict[str, Any],
         method: str,
     ) -> IKResult:
-        max_step = (
-            np.deg2rad(self.ik_mgr.profile_array(profile.max_qpos_cmd_speed_deg, "max_qpos_cmd_speed_deg"))
-            * profile.teleop_dt
-        )
-        raw_delta = self.ik_mgr.compute_qpos_delta(target_qpos, current_qpos)
-        clipped_delta = np.clip(raw_delta, -max_step, max_step)
-        qpos_cmd = current_qpos + clipped_delta
-        qpos_cmd = self.ik_mgr.canonicalize_qpos(qpos_cmd, current_qpos)
-        clipped = bool(np.any(np.abs(clipped_delta - raw_delta) > 1e-12))
+        """Canonicalize IK result and compute tracking error.
 
-        if clipped:
-            logger.warning(
-                "  [IK-CLIP] max_step_deg=%s raw_delta_deg=%s clipped_delta_deg=%s cur=%s cmd=%s",
-                np.round(np.rad2deg(max_step), 1),
-                np.round(np.rad2deg(raw_delta), 1),
-                np.round(np.rad2deg(clipped_delta), 1),
-                np.round(np.rad2deg(current_qpos), 1),
-                np.round(np.rad2deg(qpos_cmd), 1),
-            )
+        Speed limiting is NOT done here — it is handled exclusively by
+        XArm7._limit_joint_step() in the hardware driver layer, following
+        the BunnyVisionPro architecture (single speed limit point).
+        """
+        qpos_cmd = self.ik_mgr.canonicalize_qpos(target_qpos, previous_qpos_cmd)
 
+        qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
         cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
         result_report = {
             **report,
             "teleop_ik_method": method,
-            "clipped": clipped,
             "cmd_tracking_error_pos_m": cmd_pos_error,
             "cmd_tracking_error_rot_rad": cmd_rot_error,
-            "qpos_distance_to_current": float(np.linalg.norm(qpos_cmd - current_qpos)),
-            "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(clipped_delta)))),
+            "qpos_distance_to_current": float(np.linalg.norm(qpos_delta)),
+            "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
         }
         return IKResult(success=True, qpos=qpos_cmd, report=result_report)
 

@@ -156,8 +156,11 @@ def analyze_ik_pipeline(
 
             prev_cmd = result.qpos.copy()
             # Simulate hardware tracking: move toward target at limited speed
+            # Uses XArm7Config.max_qvel defaults (matches _limit_joint_step).
+            # max_qpos_cmd_speed_deg was removed from TeleopProfile — speed limit
+            # is now exclusively in the hardware driver layer.
             err = result.qpos - current_qpos
-            max_step = np.deg2rad(ik_solver.profile.max_qpos_cmd_speed_deg) * ik_solver.profile.teleop_dt
+            max_step = np.deg2rad([90, 90, 90, 90, 120, 120, 150]) * ik_solver.profile.teleop_dt
             step = np.clip(err, -max_step, max_step)
             current_qpos = current_qpos + step
         else:

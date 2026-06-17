@@ -71,8 +71,9 @@ _HAND_JUMP_LIMIT_RAD = np.deg2rad(10.0)
 class TeleopController:
     """Main teleoperation controller.
 
-    Owns the control loop: reads VR, runs IK+retarget, applies EMA smoothing (arm + hand),
+    Owns the control loop: reads VR, runs IK+retarget, applies EMA smoothing (arm only),
     enforces safety clamps, manages recording lifecycle.
+    Hand retargeting smoothing is handled by dex-retargeting's built-in low_pass_alpha.
 
     The controller operates on RobotInterface (not XArm7/XHand directly).
     """
@@ -88,8 +89,7 @@ class TeleopController:
         ipc_buffer: Any | None = None,  # SharedRingBuffer
         keyboard_queue: Any | None = None,
         target_hz: float = 50.0,
-        ema_alpha_arm: float = 0.3,
-        ema_alpha_hand: float = 0.3,
+        ema_alpha_arm: float = 1.0,  # 1.0 = no smoothing (disabled)
         dry_run: bool = False,
         recorder: Any | None = None,
     ) -> None:
@@ -104,7 +104,6 @@ class TeleopController:
 
         self.limiter = RateLimiter(target_hz)
         self.ema_alpha_arm = float(ema_alpha_arm)
-        self.ema_alpha_hand = float(ema_alpha_hand)
 
         self.tracking_quality = TrackingQuality(TrackingQualityConfig(max_frame_age_s=0.2))
         self.error_handler = TeleopErrorHandler()
@@ -112,7 +111,7 @@ class TeleopController:
         # State
         self.state = ControllerState.IDLE
         self.running = False
-        self._ema_arm_qpos: np.ndarray | None = None
+        self._last_arm_cmd: np.ndarray | None = None
         self._last_hand_cmd: np.ndarray | None = None
 
         # Keyboard
@@ -161,7 +160,7 @@ class TeleopController:
         print(f"[TeleopController] Entering main loop at {self.limiter.target_hz:.0f} Hz")
         print(f"  Mode: {'dry-run' if self.dry_run else 'hardware'}")
         print(f"  VR: {'IPC' if self.ipc_buffer is not None else 'direct'}")
-        print(f"  EMA: arm_alpha={self.ema_alpha_arm}  hand_alpha={self.ema_alpha_hand}")
+        print(f"  EMA: arm_alpha={self.ema_alpha_arm} (hand uses dex-retargeting low_pass_alpha)")
         print(f"  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
 
         self.last_status_ts = time.monotonic()
@@ -278,8 +277,8 @@ class TeleopController:
         current_hand_qpos = state.hand_qpos.copy()
 
         prev_arm_cmd = (
-            self._ema_arm_qpos.copy()
-            if self._ema_arm_qpos is not None
+            self._last_arm_cmd.copy()
+            if self._last_arm_cmd is not None
             else current_arm_qpos
         )
         prev_hand_cmd = (
@@ -309,8 +308,8 @@ class TeleopController:
                 if ik_result.success and ik_result.qpos is not None:
                     ik_ok = True
                     raw_arm = np.asarray(ik_result.qpos, dtype=np.float64)
-                    arm_cmd = self._ema_smooth(raw_arm, self._ema_arm_qpos, self.ema_alpha_arm)
-                    self._ema_arm_qpos = arm_cmd
+                    arm_cmd = self._ema_smooth(raw_arm, self._last_arm_cmd, self.ema_alpha_arm)
+                    self._last_arm_cmd = arm_cmd
                     self.ik_success_count += 1
                 else:
                     self.ik_fail_count += 1
@@ -344,7 +343,7 @@ class TeleopController:
             if target_hand is not None and len(target_hand) == 12:
                 retarget_ok = True
                 raw_hand = np.asarray(target_hand, dtype=np.float64)
-                hand_cmd = self._ema_smooth(raw_hand, self._last_hand_cmd, self.ema_alpha_hand)
+                hand_cmd = raw_hand.copy()  # no EMA — dex_retargeting has built-in low_pass_alpha
                 self._last_hand_cmd = hand_cmd.copy()
                 self.retarget_success_count += 1
             else:
@@ -448,7 +447,7 @@ class TeleopController:
 
     def _do_home(self) -> None:
         print("[Controller] Returning to home...")
-        self._ema_arm_qpos = None
+        self._last_arm_cmd = None
         self._last_hand_cmd = None
 
         if not self.dry_run:

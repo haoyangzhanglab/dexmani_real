@@ -53,9 +53,9 @@ DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
 EMA_ALPHA = 1.0      # EMA 平滑系数 (1.0 = 禁用平滑)
 
 WORKSPACE_BOUNDS = np.array([
-    [0.28, 0.70],    # x [min, max] m
-    [-0.40, 0.40],   # y [min, max] m
-    [0.02, 0.55],    # z [min, max] m
+    [0.28, 0.72],    # x [min, max] m
+    [-0.45, 0.45],   # y [min, max] m
+    [0.05, 0.5],    # z [min, max] m
 ], dtype=np.float64)
 
 # ═══════════════════════════════════════════════ 键盘输入
@@ -273,8 +273,7 @@ def main():
         planning_profile=PlanningProfile(check_self_collision=False),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            max_qpos_cmd_speed_deg=(90, 90, 90, 90, 120, 120, 150),
-            max_ik_jump_deg=(30, 30, 30, 30, 45, 45, 60),
+            max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),  # tight: reject IK branch switches (keyboard EEF moves 5mm/step → ~0.5° per joint)
             max_pose_error_pos_m=0.01,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             hold_on_failure=True,
@@ -390,15 +389,27 @@ def main():
 
             # ── 安全检查 ──
             if robot.arm.is_error():
+                # Check SDK-level error code. send_action() now calls
+                # get_err_warn_code() on failure, so last_sdk_error_code
+                # is fresh; arm.error_code may still be stale from async
+                # report callback. Check both.
                 arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
-                if arm_code == 22:
-                    # 自碰撞预警 (xArm ControllerError 22): 清错保持, 继续操作
-                    print("  ⚠ 自碰撞预警，清除错误并保持位置", flush=True)
+                sdk_code = robot.arm.last_sdk_error_code
+
+                # Code 22 = ControllerError (C31 collision / C32 overcurrent).
+                # Often false-positive when hand is disconnected (TCP load
+                # mismatch) or at workspace boundaries. Attempt recovery
+                # before escalating to emergency_stop.
+                if arm_code == 22 or sdk_code == 22:
+                    print("  ⚠ ControllerError 22 (C31/C32)，清除错误并保持位置", flush=True)
                     robot.arm.clear_error()
+                    # Re-read state to reset targets to actual position
+                    state = robot.get_state()
+                    if np.all(np.isfinite(state.arm_qpos)):
+                        target_pos = state.eef_pos.copy()
+                        target_quat = state.eef_quat_wxyz.copy()
+                        prev_qpos_cmd = state.arm_qpos.copy()
                     error_count = 0
-                    target_pos = state.eef_pos.copy()
-                    target_quat = state.eef_quat_wxyz.copy()
-                    prev_qpos_cmd = state.arm_qpos.copy()
                     continue
                 print(f"arm 错误: {robot.arm.last_error_message}")
                 robot.emergency_stop()
@@ -488,14 +499,15 @@ def main():
                 target_eef_pos=target_pos.copy(),
             )
 
-            # DEBUG: 记录 qpos + EEF 用于抖动分析
-            if loop_count % 5 == 0:
+            # DEBUG: 每 50 帧 (1s) 打印一次，避免终端 I/O 阻塞影响控制频率
+            if loop_count % 50 == 0:
                 qpos_delta = arm_cmd - state.arm_qpos
-                print(f"  [DBG {loop_count}] cur_qpos={np.round(np.rad2deg(state.arm_qpos),1)}")
-                print(f"                     cmd_qpos={np.round(np.rad2deg(arm_cmd),1)}")
-                print(f"                     ik_qpos ={np.round(np.rad2deg(ik_result.qpos),1)}")
-                print(f"                     delta_deg={np.round(np.rad2deg(qpos_delta),2)}")
-                print(f"                     eef={np.round(state.eef_pos,4)} -> tgt={np.round(target_pos,4)}", flush=True)
+                print(
+                    f"  [DBG {loop_count}] cur={np.round(np.rad2deg(state.arm_qpos),1)} "
+                    f"cmd={np.round(np.rad2deg(arm_cmd),1)} "
+                    f"ik={np.round(np.rad2deg(ik_result.qpos),1)} "
+                    f"Δ={np.round(np.rad2deg(qpos_delta),1)} "
+                    f"eef→{np.round(target_pos,3)}")
             send_result = robot.send_action(action)
             if not send_result.get("arm_ok"):
                 error_count += 1

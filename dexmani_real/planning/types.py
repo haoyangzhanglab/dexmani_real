@@ -96,8 +96,10 @@ class TeleopProfile:
     """Online teleoperation IK/servo configuration."""
 
     teleop_dt: float = 0.04
-    max_qpos_cmd_speed_deg: tuple[float, ...] = (90, 90, 90, 90, 120, 120, 150)
-    max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 120, 120, 180)
+    max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 30, 45, 45, 60)
+    # Speed limiting is handled exclusively by XArm7._limit_joint_step()
+    # (hardware driver layer, per BunnyVisionPro architecture).
+    # max_qpos_cmd_speed_deg was removed — IK/planning layer should not clip speed.
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     hold_on_failure: bool = True

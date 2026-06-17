@@ -112,9 +112,9 @@ class RobotInterfaceConfig:
     # Workspace safety
     workspace_bounds: np.ndarray = field(
         default_factory=lambda: np.array([
-            [0.0, 0.75],  # x [min, max] m
-            [-0.5, 0.5],  # y [min, max] m
-            [0.0, 0.6],   # z [min, max] m
+            [0.28, 0.72],  # x [min, max] m
+            [-0.45, 0.45],  # y [min, max] m
+            [0.05, 0.5],   # z [min, max] m
         ], dtype=np.float64)
     )
 

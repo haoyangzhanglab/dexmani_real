@@ -194,8 +194,7 @@ def main():
         ),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            max_qpos_cmd_speed_deg=(90, 90, 90, 90, 120, 120, 150),
-            max_ik_jump_deg=(30, 30, 30, 30, 45, 45, 60),
+            max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),  # tight: reject IK branch switches (keyboard EEF moves 5mm/step → ~0.5° per joint)
             max_pose_error_pos_m=0.01,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             hold_on_failure=True,

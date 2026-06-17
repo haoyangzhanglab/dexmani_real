@@ -17,8 +17,8 @@ Usage:
     # With recording
     python scripts/run_teleop.py --record --data-dir /data/episodes
 
-    # Custom arm + hand EMA
-    python scripts/run_teleop.py --ema-arm 0.5 --ema-hand 0.5
+    # Custom arm EMA (hand uses dex-retargeting built-in low_pass_alpha)
+    python scripts/run_teleop.py --ema-arm 0.5
 """
 
 from __future__ import annotations
@@ -156,7 +156,6 @@ def build_controller(args: argparse.Namespace) -> TeleopController:
         keyboard_queue=keyboard_queue,
         target_hz=float(args.rate),
         ema_alpha_arm=float(args.ema_arm),
-        ema_alpha_hand=float(args.ema_hand),
         dry_run=args.dry_run,
         recorder=recorder,
     )
@@ -197,10 +196,8 @@ def main() -> None:
     # Control
     parser.add_argument("--rate", type=float, default=50.0,
                         help="Control loop frequency (Hz)")
-    parser.add_argument("--ema-arm", type=float, default=0.3,
-                        help="EMA alpha for arm smoothing")
-    parser.add_argument("--ema-hand", type=float, default=0.3,
-                        help="EMA alpha for hand smoothing (joint-level)")
+    parser.add_argument("--ema-arm", type=float, default=1.0,
+                        help="EMA alpha for arm smoothing (1.0 = disabled, 0.3 was old default)")
 
     # Mapper
     parser.add_argument("--mapper-pos-scale", type=float, default=1.0,
