@@ -314,14 +314,94 @@ class IKCandidateManager:
     def has_env_collision(self, qpos: np.ndarray) -> bool:
         return len(self.mp_planner.check_for_env_collision(qpos)) > 0
 
-    def check_path_collisions(self, path: np.ndarray) -> dict[str, Any]:
-        indices = [0, len(path) - 1]
-        if len(path) >= 3:
-            indices.append(len(path) // 2)
-        for idx in indices:
-            if self.has_self_collision(path[idx]):
-                return {"path_self_collision": True, "collision_waypoint_index": idx}
+    def _check_segment_collision(
+        self, start: np.ndarray, end: np.ndarray, collision_type: str = "self", step_size: float = 0.02,
+    ) -> bool:
+        """Check if the linear joint-space segment start→end is collision-free.
+
+        Interpolates at ``step_size`` (L∞ joint distance) resolution and checks
+        every intermediate configuration.
+
+        ``step_size=0.02`` rad ≈ 1.15° (ref: dimos collision_step_size=0.02).
+        This provides ~2 samples per degree at the largest joints (J1-J2) and
+        ~4 samples per degree at wrist joints (J6-J7).  Trade-off: each MPlib
+        collision query costs ~0.1-0.3 ms.  At 0.02 rad, a 180° sweep of J1
+        costs ~16 ms, acceptable for path planning (< 2 s budget) but too
+        expensive for the teleop hot path (< 1 ms budget) — hence teleop only
+        does single-point collision checks.
+
+        Args:
+            collision_type: ``"self"`` or ``"env"``.
+
+        Returns:
+            True if all sampled points are collision-free.
+        """
+        checker = self.has_self_collision if collision_type == "self" else self.has_env_collision
+        diff = end - start
+        dist = float(np.max(np.abs(diff)))
+        if dist <= step_size:
+            return not checker(end)
+        n_steps = int(np.ceil(dist / step_size))
+        for step in range(1, n_steps + 1):
+            alpha = step / n_steps
+            q = start + alpha * diff
+            if checker(q):
+                return False
+        return True
+
+    def _check_segment_collision_free(
+        self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
+    ) -> bool:
+        """Check if the linear joint-space segment start→end is self-collision-free.
+
+        Thin wrapper around ``_check_segment_collision`` for backward compatibility.
+        """
+        return self._check_segment_collision(start, end, "self", step_size)
+
+    def _check_segment_env_collision_free(
+        self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
+    ) -> bool:
+        """Check if the linear joint-space segment start→end is env-collision-free.
+
+        Thin wrapper around ``_check_segment_collision`` for backward compatibility.
+        """
+        return self._check_segment_collision(start, end, "env", step_size)
+
+    def check_path_collisions(
+        self, path: np.ndarray, collision_step_size: float = 0.02,
+    ) -> dict[str, Any]:
+        """Check self-collision along path with dense interpolation (ref: dimos).
+
+        Linearly interpolates between consecutive waypoints at the given step
+        size and checks self-collision at every sampled point.
+        """
+        for i in range(len(path) - 1):
+            if not self._check_segment_collision_free(
+                path[i], path[i + 1], collision_step_size,
+            ):
+                return {
+                    "path_self_collision": True,
+                    "collision_waypoint_index": i,
+                    "collision_waypoint_count": len(path),
+                    "collision_step_size": collision_step_size,
+                }
         return {"path_self_collision": False}
+
+    def check_path_env_collisions(
+        self, path: np.ndarray, collision_step_size: float = 0.02,
+    ) -> dict[str, Any]:
+        """Check environment collision along path with dense interpolation."""
+        for i in range(len(path) - 1):
+            if not self._check_segment_env_collision_free(
+                path[i], path[i + 1], collision_step_size,
+            ):
+                return {
+                    "path_env_collision": True,
+                    "collision_waypoint_index": i,
+                    "collision_waypoint_count": len(path),
+                    "collision_step_size": collision_step_size,
+                }
+        return {"path_env_collision": False}
 
     # --- Distance / penalty ---
 

@@ -31,7 +31,7 @@ class TeleopIKSolver:
 
     Speed limiting is handled by XArm7._limit_joint_step()
     (driver bottleneck scaling + soft-start).
-    Self-collision checks are only done during path planning, not teleop.
+    Self-collision checks are done when TeleopProfile.check_self_collision=True.
     """
 
     def __init__(self, kin: XArm7Kinematics, ik_mgr: IKCandidateManager, teleop_profile: TeleopProfile) -> None:
@@ -195,6 +195,22 @@ class TeleopIKSolver:
         XArm7._limit_joint_step() in the hardware driver layer.
         """
         qpos_cmd = self.ik_mgr.canonicalize_qpos(target_qpos, previous_qpos_cmd)
+
+        # Self-collision check (teleop hot path, ~0.1-0.3 ms per call)
+        if profile.check_self_collision and self.ik_mgr.has_self_collision(qpos_cmd):
+            qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
+            return IKResult(
+                success=False, qpos=previous_qpos_cmd.copy(),
+                reason="IK result in self-collision, holding.",
+                report={
+                    **report,
+                    "teleop_ik_method": method,
+                    "held": True,
+                    "self_collision": True,
+                    "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
+                },
+                held=True,
+            )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
         cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .collision_config import CollisionConfig
 
 
 @dataclass
@@ -62,6 +65,10 @@ class XArm7PlannerConfig:
     # None disables the check (backward compatible).
     workspace_bounds: np.ndarray | None = None
 
+    # Unified collision configuration (desk safety, hand margins, fingertip FK).
+    # None disables geometric FK desk safety checks (backward compatible).
+    collision: CollisionConfig | None = None
+
 
 @dataclass(kw_only=True)
 class PlanningProfile:
@@ -107,12 +114,21 @@ class TeleopProfile:
     # max_qpos_cmd_speed_deg was removed — IK/planning layer should not clip speed.
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
-    check_self_collision: bool = True  # only used in path planning, not teleop hot path
+    check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
 
     use_position_ik: bool = True
     use_differential_ik_fallback: bool = True
     differential_ik_gain: float = 1.0       # full tracking, bottleneck limit handles speed
-    differential_ik_damping: float = 0.05
+    differential_ik_damping: float = 0.02
+    # NOTE: damping=0.02 (λ²=0.0004) is a "single-step DLS" design choice.
+    # Single-step DLS avoids the ~100 iteration cost of iterative DLS
+    # (BunnyVisionPro uses damping=1e-5 with 100 iterations) at the cost of
+    # ~1-2 mm extra IK error in non-singular regions — the λ² term in the
+    # damped pseudo-inverse (J·Jᵀ + λ²I)⁻¹ biases the solution away from the
+    # optimal least-squares direction even when far from singularities.
+    # Trade-off: 1 ms latency vs ~1-2 mm precision. Acceptable for teleop
+    # where human hand tremor (~2-3 mm) dominates. For precision tasks,
+    # consider an adaptive damping schedule (lower λ² in non-singular regions).
     differential_ik_max_pos_step_m: float = 0.02
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
 

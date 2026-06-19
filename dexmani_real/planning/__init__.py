@@ -1,6 +1,7 @@
+from .collision_config import CollisionConfig
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
-from .planner import WorkspaceSafety, XArm7MotionPlanner
+from .planner import FingertipDeskSafety, WorkspaceSafety, XArm7MotionPlanner
 from .types import (
     IKResult,
     PathResult,
@@ -11,14 +12,16 @@ from .types import (
 )
 
 __all__ = [
-    "Pose",
+    "CollisionConfig",
+    "FingertipDeskSafety",
+    "IKCandidateManager",
     "IKResult",
     "PathResult",
-    "XArm7PlannerConfig",
     "PlanningProfile",
+    "Pose",
     "TeleopProfile",
-    "XArm7MotionPlanner",
     "WorkspaceSafety",
     "XArm7Kinematics",
-    "IKCandidateManager",
+    "XArm7MotionPlanner",
+    "XArm7PlannerConfig",
 ]

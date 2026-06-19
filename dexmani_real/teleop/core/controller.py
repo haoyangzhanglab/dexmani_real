@@ -74,6 +74,13 @@ class ControllerState(Enum):
     EMERGENCY_STOP = "EMERGENCY_STOP"
 
 
+# Per-step joint jump limits (rad).
+# NOTE: These are IK-anomaly defenses, NOT routine speed limits.
+# Routine speed limiting is handled by XArm7._limit_joint_step() at the driver
+# layer (bottleneck scaling to max_qvel, ~1.8-3.0°/frame @ 50 Hz).
+# These thresholds (5°/frame = 250°/s) are deliberately higher than max_qvel
+# (~90-150°/s) — they only trigger when IK produces an abnormally large jump,
+# e.g. a discontinuous solution from a poor seed or singularity crossing.
 _ARM_JUMP_LIMIT_RAD = np.deg2rad(5.0)
 _HAND_JUMP_LIMIT_RAD = np.deg2rad(10.0)
 
@@ -234,6 +241,12 @@ class TeleopController:
                 self.robot.hand.config.qpos_min,
                 self.robot.hand.config.qpos_max,
             ):
+                # NOTE: Hand joint limit violations log a warning (not E-Stop),
+                # unlike arm violations which trigger an immediate E-Stop.
+                # Rationale: XHand has its own internal commboard-level error
+                # protection that will fault on out-of-range commands before
+                # mechanical damage occurs. If this assumption proves false
+                # in testing, elevate to E-Stop.
                 logger.warning(
                     "Hand joint out of limits: %s", state.hand_qpos
                 )

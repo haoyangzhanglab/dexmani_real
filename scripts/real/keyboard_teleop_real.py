@@ -49,19 +49,29 @@ from dexmani_real.planning import (
 )
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.planning.collision_config import CollisionConfig
 
 # ═══════════════════════════════════════════════ 配置
 
 CTRL_DT = 0.02       # 50Hz
 DELTA_POS = 0.005    # 每次按键 EEF 平移量 (m)
 DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
-EMA_ALPHA = 0.3      # EMA 平滑系数 (抑制 MPlib IK 随机 seed 帧间跳变, ref: controller-spec.md)
+EMA_ALPHA = 0.7      # EMA 平滑系数 (geometric_fk 下 IK 确定性, 无随机 seed 抖动; 0.7兼顾响应速度与平滑)
 
 WORKSPACE_BOUNDS = np.array([
     [0.28, 0.72],    # x [min, max] m
     [-0.45, 0.45],   # y [min, max] m
     [0.05, 0.5],    # z [min, max] m
 ], dtype=np.float64)
+
+# 碰撞检测配置 — geometric_fk 使用 Pinocchio FK 指尖 Z 检测桌面
+# 零成本，不污染 IK（MPlib 点云会使 IK 成功率从 100% → 53%）
+COLLISION_CONFIG = CollisionConfig(
+    table_z_world=0.0,
+    hand_extension_below_eef=0.076,   # pinky_tip 在 home 位 EEF 下方距离
+    hand_safe_margin=0.03,            # 指尖到桌面最小安全间距
+    env_collision_mode="geometric_fk",
+)
 
 # ═══════════════════════════════════════════════ 键盘输入
 
@@ -274,6 +284,7 @@ def main():
             urdf_path=urdf_path,
             srdf_path=srdf_path,
             base_pose_world=Pose(p=np.array([0.0, 0.0, 0.0]), q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)])),
+            collision=COLLISION_CONFIG,
         ),
         planning_profile=PlanningProfile(check_self_collision=False),
         teleop_profile=TeleopProfile(
@@ -286,7 +297,11 @@ def main():
 
     # ── 2. 连接硬件 ──
     robot = RobotInterface(
-        RobotInterfaceConfig(arm=arm_config),
+        RobotInterfaceConfig(
+            arm=arm_config,
+            collision=COLLISION_CONFIG,
+            hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
+        ),
         kinematics=planner.kin,
         planner=planner,
     )

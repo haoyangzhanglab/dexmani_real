@@ -1,7 +1,21 @@
-"""xArm7 7-DOF robot arm hardware driver."""
+"""xArm7 7-DOF robot arm hardware driver.
+
+Two control modes (ref: BunnyVisionPro xarm7_ability.py):
+
+  Mode 1 (servo, default): position servo via set_servo_angle_j.
+      Controller calls send_action(qpos) → direct position command.
+
+  Mode 4 (velocity, PID inner loop): velocity control via vc_set_joint_velocity.
+      Controller calls send_action(qpos) → stores target.
+      250Hz inner thread: reads target → PID → velocity clip → hardware.
+
+Mode 4 produces smoother motion because the PID converts position error
+into continuous velocity, eliminating step-jump artifacts.
+"""
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +27,76 @@ from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 
 logger = get_logger(__name__)
+
+
+# ===========================================================================
+# PID Controller (ref: BunnyVisionPro xarm7_ability.py PIDController)
+# ===========================================================================
+
+
+class PIDController:
+    """Per-joint PID controller for joint-space velocity control.
+
+    Operates on 7-DOF joint position error::
+
+        vel = Kp * err + Kd * (err - prev_err) / dt + Ki * cum_err
+
+    Integral term (Ki) is disabled by default to prevent windup in
+    teleoperation where the target is continuously changing.
+
+    ref: BunnyVisionPro xarm7_ability.py:11-36
+    """
+
+    def __init__(
+        self,
+        kp: np.ndarray,
+        ki: np.ndarray | None = None,
+        kd: np.ndarray | None = None,
+    ) -> None:
+        self.kp = np.asarray(kp, dtype=np.float64)
+        self.ki = (
+            np.asarray(ki, dtype=np.float64)
+            if ki is not None
+            else np.zeros_like(self.kp)
+        )
+        self.kd = (
+            np.asarray(kd, dtype=np.float64)
+            if kd is not None
+            else self.kp / 20.0
+        )
+        self._prev_err: np.ndarray | None = None
+        self._cum_err: np.ndarray = np.zeros_like(self.kp)
+
+    def reset(self) -> None:
+        """Clear error history (call on mode switch or arm reset)."""
+        self._prev_err = None
+        self._cum_err = np.zeros_like(self.kp)
+
+    def control(self, err: np.ndarray, dt: float) -> np.ndarray:
+        """Compute velocity command from position error.
+
+        Args:
+            err: Joint position error (target - current), shape (7,).
+            dt: Time step in seconds (inner loop period).
+
+        Returns:
+            Joint velocity command, shape (7,).
+        """
+        err = np.asarray(err, dtype=np.float64)
+        if self._prev_err is None:
+            self._prev_err = err.copy()
+
+        # P + D + I
+        value = (
+            self.kp * err
+            + self.kd * (err - self._prev_err) / dt
+            + self.ki * self._cum_err
+        )
+
+        self._prev_err = err.copy()
+        self._cum_err += dt * err
+
+        return value
 
 
 @dataclass
@@ -33,10 +117,45 @@ class XArm7Config:
     )
     reset_speed: float = np.deg2rad(20)
     reset_acc: float = np.deg2rad(180)
+    # NOTE: use_delta_limit (step bottleneck) and clip_joint_limit (range clamp)
+    # are kept as separate flags even though both default to True and there is no
+    # known use case for enabling only one. The separation preserves explicit
+    # per-behavior control — hardware-range protection and per-step-speed limiting
+    # are conceptually independent concerns.
     use_delta_limit: bool = True
     clip_joint_limit: bool = True
+    # Soft-start for servo mode (frame-counted ramp).
+    # Equivalent to pid_soft_start_duration_s: 20 frames @ 50 Hz = 0.4 s.
+    # Uses frame counting (not wall-clock) because the servo loop is driven by
+    # send_action calls at ~50 Hz, unlike the PID inner loop which has its own
+    # 250 Hz timer thread.
     soft_start_frames: int = 20          # ref: ufactory_teleop — first N frames at reduced speed
     soft_start_speed_rad_s: float = 0.3  # ref: ufactory_teleop 0.2 rad/s; slightly higher for VR teleop
+
+    # PID inner-loop velocity control (ref: BunnyVisionPro xarm7_ability.py)
+    # pid_soft_start_duration_s: time-based velocity ramp for PID inner loop.
+    # When the inner thread starts or soft-start is reset, the effective velocity
+    # limit ramps from 30%→100% of pid_max_vel over this duration.
+    # Equivalent to soft_start_frames: 0.4 s @ 50 Hz = 20 frames.
+    # ref: BunnyVisionPro — reduces max_arm_velocity to 1/3 during init convergence.
+    pid_soft_start_duration_s: float = 0.4
+    # When use_servo_control=False, a 250Hz inner thread runs PID + velocity control
+    # via xArm Mode 4 (vc_set_joint_velocity). When True (default), uses the
+    # existing Mode 1 position servo (backward compatible).
+    use_servo_control: bool = True
+    inner_control_dt: float = 1.0 / 250.0  # 250 Hz inner loop
+    pid_kp: np.ndarray = field(
+        default_factory=lambda: np.array([10.0, 10.0, 5.0, 5.0, 5.0, 5.0, 5.0])
+    )  # ref: BunnyVisionPro — higher Kp for joints 1-2 (base), lower for wrist
+    pid_kd: np.ndarray = field(
+        default_factory=lambda: np.array([0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 0.25])
+    )  # Kd = Kp / 20
+    pid_max_vel: np.ndarray = field(
+        default_factory=lambda: np.array([1.2, 1.2, 1.2, 1.2, 1.6, 1.6, 2.0])
+    )  # rad/s, ~80% of max_qvel — balances PID overshoot headroom with speed parity
+    # Prior value [0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.5] was ~50% of max_qvel,
+    # directly inherited from BunnyVisionPro (which had no servo-mode baseline).
+    # Raised to match the hardware capability established by max_qvel.
 
     # Collision detection params — prevent false C31 triggering
     # tcp_load_kg: XHand weight (kg); non-zero enables correct dynamics torque estimation
@@ -45,7 +164,7 @@ class XArm7Config:
     tcp_load_cog_mm: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 80.0]
     )
-    # collision_sensitivity: 0=most sensitive, 5=least sensitive. Servo mode recommends 3
+    # collision_sensitivity: 0=disabled, 1=least sensitive, 5=most sensitive. Factory default is 3.
     collision_sensitivity: int = 3
 
 
@@ -62,6 +181,18 @@ class XArm7(ConnectionStateMixin):
         self.last_joint_limit_clipped = False
         self.last_delta_limited = False
         self._cmd_cnt: int = 0  # soft-start frame counter (ref: ufactory_teleop)
+        self._vel_ramp_start: float | None = None  # velocity soft-start timer (perf_counter)
+
+        # ── PID inner-loop state (velocity control mode) ──
+        self._arm_thread: threading.Thread | None = None
+        self._arm_lock: threading.Lock = threading.Lock()
+        self._arm_pos_target: np.ndarray | None = None
+        self._arm_should_stop: threading.Event = threading.Event()
+        if not self.config.use_servo_control:
+            self._arm_pid = PIDController(
+                kp=self.config.pid_kp,
+                kd=self.config.pid_kd,
+            )
 
     def connect(self) -> bool:
         if self.connected_flag and self.arm is not None:
@@ -77,7 +208,10 @@ class XArm7(ConnectionStateMixin):
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self._set_mode(1)
+
+        # Mode: 4 (velocity) when PID inner loop is enabled, 1 (servo) otherwise
+        mode = 4 if not self.config.use_servo_control else 1
+        self._set_mode(mode)
 
         # Set TCP load and collision sensitivity — prevent false C31 triggering
         # ref: xarm-sdk set_tcp_load / set_collision_sensitivity
@@ -92,9 +226,28 @@ class XArm7(ConnectionStateMixin):
         self.last_cmd_time = time.time()
         self.connected_flag = True
         self.error_state = False
+
+        # Start PID inner thread for velocity control mode
+        if not self.config.use_servo_control:
+            self._arm_should_stop.clear()
+            self._arm_pos_target = self.last_qpos_cmd
+            self._vel_ramp_start = time.perf_counter()  # activate velocity soft-start
+            self._arm_thread = threading.Thread(
+                target=self._internal_control_arm_qpos,
+                name="xarm7_pid_inner",
+                daemon=True,
+            )
+            self._arm_thread.start()
+            logger.info(
+                "PID inner loop started at %.0f Hz (mode 4, velocity control)",
+                1.0 / self.config.inner_control_dt,
+            )
+
         return True
 
     def disconnect(self) -> None:
+        # Stop PID inner thread before disconnecting hardware
+        self._stop_inner_thread()
         if self.arm is not None:
             self.arm.disconnect()
         self.connected_flag = False
@@ -119,7 +272,13 @@ class XArm7(ConnectionStateMixin):
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self._set_mode(1)
+        mode = 4 if not self.config.use_servo_control else 1
+        self._set_mode(mode)
+        # Reset PID to prevent error accumulation from pre-error state
+        if not self.config.use_servo_control:
+            self._arm_pid.reset()
+            with self._arm_lock:
+                self._arm_pos_target = self._read_qpos()
         self.error_state = False
         self.last_error_message = ""
         return self.arm.error_code == 0
@@ -127,6 +286,13 @@ class XArm7(ConnectionStateMixin):
     def stop(self) -> bool:
         if self.arm is None:
             return False
+        # Send zero velocity before stopping (velocity control mode)
+        if not self.config.use_servo_control:
+            try:
+                self.arm.vc_set_joint_velocity(np.zeros(7, dtype=np.float64))
+            except (RuntimeError, OSError):
+                pass
+        self._stop_inner_thread()
         code = self.arm.set_state(4)
         self.error_state = True
         return code == 0
@@ -178,6 +344,18 @@ class XArm7(ConnectionStateMixin):
     # ------------------------------------------------------------------
 
     def send_action(self, action: np.ndarray) -> bool:
+        """Send joint position command to the arm.
+
+        Two modes (controlled by config.use_servo_control):
+
+        **Servo mode (mode 1, default)**: Direct position command.
+        Clips joint limits → bottleneck velocity limit → set_servo_angle_j.
+
+        **Velocity mode (mode 4, PID inner loop)**: Store target only.
+        The 250Hz inner thread reads the target, runs PID, clips velocity,
+        and sends vc_set_joint_velocity. Returns True if target was stored
+        (the inner thread handles error reporting).
+        """
         if self.arm is None:
             self.error_state = True
             self.last_error_message = "arm not connected"
@@ -185,38 +363,54 @@ class XArm7(ConnectionStateMixin):
 
         target_qpos = np.asarray(action, dtype=np.float64).reshape(7)
         target_qpos = self._limit_joint_range(target_qpos)
-        qpos_cmd = self._limit_joint_step(target_qpos)
 
-        if self.arm.mode != 1:
-            self._set_mode(1)
+        if self.config.use_servo_control:
+            # ── Servo mode (mode 1): direct position command ──
+            qpos_cmd = self._limit_joint_step(target_qpos)
 
-        code = self.arm.set_servo_angle_j(angles=qpos_cmd.tolist(), is_radian=True)
-        self.last_action_code = code
+            if self.arm.mode != 1:
+                self._set_mode(1)
 
-        if code == 0:
-            self.last_qpos_cmd = qpos_cmd.copy()
+            code = self.arm.set_servo_angle_j(
+                angles=qpos_cmd.tolist(), is_radian=True
+            )
+            self.last_action_code = code
+
+            if code == 0:
+                self.last_qpos_cmd = qpos_cmd.copy()
+                self.last_cmd_time = time.time()
+                return True
+
+            # Refresh SDK error/warn codes immediately
+            try:
+                _, _, sdk_err, sdk_warn = self.arm.get_err_warn_code()
+            except (RuntimeError, OSError):
+                sdk_err, sdk_warn = -1, -1
+
+            self.last_sdk_error_code = int(sdk_err)
+            self.error_state = True
+            self.last_error_message = (
+                f"set_servo_angle_j failed: code={code}, "
+                f"sdk_err={sdk_err}, sdk_warn={sdk_warn}"
+            )
+            return False
+
+        else:
+            # ── Velocity mode (mode 4): store target for PID inner loop ──
+            if self.arm.mode != 4:
+                self._set_mode(4)
+
+            with self._arm_lock:
+                self._arm_pos_target = target_qpos
+
+            self.last_qpos_cmd = target_qpos.copy()
             self.last_cmd_time = time.time()
+            self.last_action_code = 0
             return True
-
-        # Refresh SDK error/warn codes immediately — the background report
-        # callback may not have updated arm.error_code yet, causing the
-        # controller to miss C31/C32 recovery opportunities.
-        try:
-            _, _, sdk_err, sdk_warn = self.arm.get_err_warn_code()
-        except (RuntimeError, OSError):
-            sdk_err, sdk_warn = -1, -1
-
-        self.last_sdk_error_code = int(sdk_err)
-        self.error_state = True
-        self.last_error_message = (
-            f"set_servo_angle_j failed: code={code}, "
-            f"sdk_err={sdk_err}, sdk_warn={sdk_warn}"
-        )
-        return False
 
     def reset(self, target: np.ndarray | None = None) -> bool:
         qpos = self.config.init_qpos if target is None else np.asarray(target, dtype=np.float64).reshape(7)
-        self._set_mode(0)
+        self._set_mode(0)  # position control mode for blocking move
         code = self.arm.set_servo_angle(
             angle=qpos.tolist(),
             speed=self.config.reset_speed,
@@ -224,7 +418,9 @@ class XArm7(ConnectionStateMixin):
             is_radian=True,
             wait=True,
         )
-        self._set_mode(1)
+        # Restore control mode (1 = servo, 4 = velocity)
+        mode = 4 if not self.config.use_servo_control else 1
+        self._set_mode(mode)
 
         state = self.get_state()
         if np.all(np.isfinite(state["qpos"])):
@@ -233,6 +429,13 @@ class XArm7(ConnectionStateMixin):
             self.last_qpos_cmd = qpos.copy()
         self.last_cmd_time = time.time()
         self.last_action_code = code
+
+        # Reset PID error accumulation and sync target to current position
+        if not self.config.use_servo_control:
+            self._arm_pid.reset()
+            with self._arm_lock:
+                self._arm_pos_target = self.last_qpos_cmd.copy()
+
         return code == 0
 
     # ------------------------------------------------------------------
@@ -244,13 +447,151 @@ class XArm7(ConnectionStateMixin):
 
         Ensures the soft-start speed ramp always applies to the first
         teleop motion, regardless of idle duration since connect().
+        Resets both servo (position) and PID (velocity) soft-start.
         """
         self._cmd_cnt = 0
+        if not self.config.use_servo_control:
+            self._vel_ramp_start = time.perf_counter()
+
+    # ------------------------------------------------------------------
+    # PID inner loop (velocity control mode, ref: BunnyVisionPro)
+    # ------------------------------------------------------------------
+
+    def _clip_arm_velocity(self, arm_qvel: np.ndarray) -> np.ndarray:
+        """Bottleneck-scale joint velocities to per-joint limits.
+
+        Same proportional-scaling approach as _limit_joint_step, but applied
+        to velocity output rather than position delta.  When any joint exceeds
+        its max velocity, ALL joints are scaled by the same factor to preserve
+        the joint-space trajectory shape.
+
+        Includes a time-based soft-start ramp: effective velocity limit ramps
+        from 30%→100% of pid_max_vel over pid_soft_start_duration_s.
+        Activated on connect(), reset(), clear_error(), and reset_soft_start().
+        ref: BunnyVisionPro — reduces max_arm_velocity to 1/3 during init.
+
+        ref: BunnyVisionPro xarm7_ability.py clip_arm_velocity()
+        """
+        # ── Velocity soft-start ramp (ref: BunnyVisionPro init speed reduction) ──
+        if self._vel_ramp_start is not None:
+            elapsed = time.perf_counter() - self._vel_ramp_start
+            duration = self.config.pid_soft_start_duration_s
+            if elapsed < duration:
+                ramp = elapsed / duration  # 0 → 1 linear
+                effective_limit = self.config.pid_max_vel * (0.3 + 0.7 * ramp)
+            else:
+                self._vel_ramp_start = None  # ramp complete — hot path zero-overhead
+                effective_limit = self.config.pid_max_vel
+        else:
+            effective_limit = self.config.pid_max_vel
+
+        velocity_overshoot = np.abs(arm_qvel) / effective_limit
+        max_overshoot = np.max(velocity_overshoot)
+        if max_overshoot > 1.0 + 1e-4:
+            safe_velocity = arm_qvel / max_overshoot
+            bottleneck_joint = int(np.argmax(velocity_overshoot))
+            logger.debug(
+                "Velocity bottleneck: joint-%d overshoot=%.2f",
+                bottleneck_joint + 1,
+                max_overshoot,
+            )
+            return safe_velocity
+        return arm_qvel
+
+    def _internal_control_arm_qpos(self) -> None:
+        """250Hz inner control loop: PID position→velocity→hardware.
+
+        Runs on a dedicated daemon thread.  Reads the latest target from
+        _arm_pos_target (set by send_action at 50Hz), computes joint-space
+        position error, runs PID to produce velocity, clips to per-joint
+        limits, and sends vc_set_joint_velocity.
+
+        Errors (C31/C32, connection loss) are flagged via error_state so
+        the controller's is_error() check catches them on the next cycle.
+        """
+        dt = float(self.config.inner_control_dt)
+        logger.info("PID inner loop running at %.0f Hz", 1.0 / dt)
+
+        while not self._arm_should_stop.is_set():
+            time.sleep(dt)
+
+            if self.arm is None or not self.connected_flag:
+                continue
+
+            # Read latest target (under lock)
+            with self._arm_lock:
+                target = self._arm_pos_target
+            if target is None:
+                continue
+
+            # Read current hardware position
+            try:
+                code, xarm_state = self.arm.get_joint_states(is_radian=True)
+            except (RuntimeError, OSError) as e:
+                logger.error("PID inner: get_joint_states failed: %s", e)
+                self.error_state = True
+                self.last_error_message = f"PID inner get_joint_states: {e}"
+                continue
+
+            if code != 0:
+                logger.error(
+                    "PID inner: arm error code=%d, disabling velocity control", code
+                )
+                self.error_state = True
+                self.last_error_message = f"PID inner arm error code={code}"
+                continue
+
+            arm_current_qpos = np.asarray(xarm_state[0], dtype=np.float64)
+            if arm_current_qpos.shape[0] < 7:
+                continue
+
+            # Joint-space position error → PID → velocity
+            error = target[:7] - arm_current_qpos[:7]
+            qvel = self._arm_pid.control(error, dt)
+            safe_qvel = self._clip_arm_velocity(qvel)
+
+            # Send velocity command to hardware
+            try:
+                vc_code = self.arm.vc_set_joint_velocity(safe_qvel.tolist())
+            except (RuntimeError, OSError) as e:
+                logger.error("PID inner: vc_set_joint_velocity failed: %s", e)
+                self.error_state = True
+                self.last_error_message = f"PID inner vc_set_joint_velocity: {e}"
+                continue
+
+            if vc_code != 0:
+                # Refresh SDK error codes for diagnosis
+                try:
+                    _, _, sdk_err, sdk_warn = self.arm.get_err_warn_code()
+                except (RuntimeError, OSError):
+                    sdk_err, sdk_warn = -1, -1
+                logger.error(
+                    "PID inner: vc_set_joint_velocity code=%d, "
+                    "sdk_err=%s, sdk_warn=%s",
+                    vc_code, sdk_err, sdk_warn,
+                )
+                self.error_state = True
+                self.last_error_message = (
+                    f"PID inner vc_set_joint_velocity: code={vc_code}"
+                )
+
+    def _stop_inner_thread(self) -> None:
+        """Signal the PID inner thread to stop and wait for it to exit."""
+        if self._arm_thread is None or not self._arm_thread.is_alive():
+            return
+        self._arm_should_stop.set()
+        self._arm_thread.join(timeout=2.0)
+        if self._arm_thread.is_alive():
+            logger.warning("PID inner thread did not exit within timeout")
+        else:
+            logger.info("PID inner thread stopped")
 
     def _set_mode(self, mode: int):
         self.arm.set_mode(mode)
         self.arm.set_state(0)
-        self._cmd_cnt = 0  # reset soft-start counter on mode change
+        self._cmd_cnt = 0  # reset servo soft-start counter on mode change
+        if not self.config.use_servo_control:
+            self._vel_ramp_start = time.perf_counter()  # reset velocity soft-start
 
     def _configure_collision_params(self) -> None:
         """Set TCP load and collision sensitivity to prevent false C31 triggering.
@@ -337,7 +678,13 @@ class XArm7(ConnectionStateMixin):
         if self.last_cmd_time is None:
             self.last_cmd_time = now
 
-        dt = max(now - self.last_cmd_time, self.config.dt)
+        dt_raw = now - self.last_cmd_time
+        dt = min(max(dt_raw, self.config.dt), self.config.dt * 10)
+        # dt floor: prevents divide-by-zero / infinite speed when commands
+        #   arrive faster than expected.
+        # dt ceiling (10× dt): if the control loop stalls (GC, system pause),
+        #   caps the allowed step to 10 frames of motion (~0.2 s @ 50 Hz).
+        #   Without this, a 500 ms gap would allow a 45-75° jump.
 
         # Soft-start linear ramp: soft_start_speed → per-joint max_qvel
         # Linear interpolation avoids the N× speed jump at the ramp boundary

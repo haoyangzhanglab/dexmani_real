@@ -7,11 +7,15 @@ They are independent of the RobotInterface orchestration class to avoid circular
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.robot.xhand import XHandConfig
+
+if TYPE_CHECKING:
+    from dexmani_real.planning.collision_config import CollisionConfig
 
 
 @dataclass
@@ -138,3 +142,10 @@ class RobotInterfaceConfig:
     T_eef_handbase_quat_wxyz: np.ndarray = field(
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     )
+
+    # Unified collision configuration (preferred over individual table_* fields).
+    # When set, desk safety uses geometric FK (FingertipDeskSafety).
+    # The legacy table_* fields (add_table_collision, table_z_world, etc.) are
+    # still supported for backward compatibility but deprecated in favor of
+    # CollisionConfig.
+    collision: CollisionConfig | None = None

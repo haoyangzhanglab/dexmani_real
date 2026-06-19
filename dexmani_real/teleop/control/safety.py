@@ -7,20 +7,28 @@ import numpy as np
 from dexmani_real.robot.interface import RobotState
 
 # Default thresholds (teleop). Deploy may use stricter values.
-_ARM_TORQUE_LIMIT_NM = 50.0
-_HAND_CURRENT_LIMIT_MA = 500.0
-_HAND_TEMP_LIMIT_C = 70.0
+# Per-joint torque limits from URDF: J1-J2=50, J3-J5=30, J6-J7=20 Nm.
+# Using per-joint limits protects the wrist (J6-J7) whose rated torque is
+# only 20 Nm — a unified 50 Nm threshold would allow 2.5× rated torque
+# before triggering a warning.
+_ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
+_HAND_CURRENT_LIMIT_MA = 500.0  # TODO: verify against XHand motor datasheet
+_HAND_TEMP_LIMIT_C = 70.0       # TODO: verify against XHand motor datasheet
 _RETARGET_PHYSIO_MIN = -0.5
 _RETARGET_PHYSIO_MAX = 2.5
 
 
 def check_arm_torque(
     state: RobotState,
-    torque_limit_nm: float = _ARM_TORQUE_LIMIT_NM,
+    torque_limit_nm: np.ndarray | float = _ARM_TORQUE_LIMIT_NM,
 ) -> bool:
     tau = state.arm_tau
     if not np.all(np.isfinite(tau)):
         return False
+    if isinstance(torque_limit_nm, np.ndarray):
+        if len(tau) != len(torque_limit_nm):
+            return False
+        return not np.any(np.abs(tau) >= torque_limit_nm)
     return float(np.max(np.abs(tau))) < torque_limit_nm
 
 

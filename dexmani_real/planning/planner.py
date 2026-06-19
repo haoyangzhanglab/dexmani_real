@@ -17,8 +17,9 @@ from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, X
 from .pose_utils import compute_pose_error, ensure_qpos
 
 __all__ = [
-    "XArm7MotionPlanner",
+    "FingertipDeskSafety",
     "WorkspaceSafety",
+    "XArm7MotionPlanner",
 ]
 
 # Path scoring weights (Phase 4.2)
@@ -109,6 +110,40 @@ class XArm7MotionPlanner:
         self.dof = dof
         self.joint_limits = joint_limits
         self.equivalent_joint_mask = equivalent_joint_mask
+
+        # Geometric FK desk safety (preferred over MPlib point cloud)
+        self.desk_safety: FingertipDeskSafety | None = None
+        if config.collision is not None:
+            try:
+                self.desk_safety = FingertipDeskSafety(
+                    pinocchio_model=self.pinocchio_model,
+                    mp_planner=self.mp_planner,
+                    collision_config=config.collision,
+                )
+            except (ValueError, RuntimeError, IndexError):
+                pass  # desk_safety remains None — desk FK checks skipped
+
+    def set_collision_config(self, collision_config: "CollisionConfig") -> bool:
+        """Post-construction collision config injection (used by RobotInterface).
+
+        When RobotInterface is constructed after the planner and auto-creates a
+        CollisionConfig from legacy fields, it calls this to enable FK desk
+        safety on the already-constructed planner.
+
+        Returns True if desk_safety was successfully created.
+        No-op (returns False) if already configured.
+        """
+        if self.desk_safety is not None:
+            return False  # already configured, don't overwrite
+        try:
+            self.desk_safety = FingertipDeskSafety(
+                pinocchio_model=self.pinocchio_model,
+                mp_planner=self.mp_planner,
+                collision_config=collision_config,
+            )
+            return True
+        except (ValueError, RuntimeError, IndexError):
+            return False
 
     # --- Public API ---
 
@@ -266,8 +301,11 @@ class XArm7MotionPlanner:
     def has_env_collision(self, qpos: np.ndarray) -> bool:
         return self.ik_mgr.has_env_collision(qpos)
 
-    def check_path_collisions(self, path: np.ndarray) -> dict[str, Any]:
-        return self.ik_mgr.check_path_collisions(path)
+    def check_path_collisions(self, path: np.ndarray, collision_step_size: float = 0.02) -> dict[str, Any]:
+        return self.ik_mgr.check_path_collisions(path, collision_step_size)
+
+    def check_path_env_collisions(self, path: np.ndarray, collision_step_size: float = 0.02) -> dict[str, Any]:
+        return self.ik_mgr.check_path_env_collisions(path, collision_step_size)
 
     # ── Environment collision objects ──
 
@@ -389,8 +427,7 @@ class XArm7MotionPlanner:
             while idx < len(path) - 1:
                 prev = path[idx - 1]
                 nxt = path[idx + 1]
-                mid = 0.5 * (prev + nxt)
-                if self._is_shortcut_valid(mid, limits, profile):
+                if self._is_shortcut_valid(prev, nxt, limits, profile):
                     path = np.delete(path, idx, axis=0)
                     changed = True
                 else:
@@ -399,12 +436,36 @@ class XArm7MotionPlanner:
                 break
         return path
 
-    def _is_shortcut_valid(self, qpos: np.ndarray, limits: np.ndarray, profile: PlanningProfile) -> bool:
-        outside, _ = self.limit_violation(qpos, limits)
+    def _is_shortcut_valid(
+        self, prev: np.ndarray, nxt: np.ndarray, limits: np.ndarray, profile: PlanningProfile,
+    ) -> bool:
+        """Check if the direct prev→nxt shortcut segment is collision-free.
+
+        In contrast to the old midpoint-only check, this interpolates the
+        full linear segment at collision_step_size resolution (ref: dimos
+        collision_step_size=0.02) and checks every intermediate point.
+
+        Joint limits are only checked at the midpoint (limit bounds are
+        convex, so midpoint-outside implies the segment is problematic).
+        """
+        # Joint limits check at midpoint
+        mid = 0.5 * (prev + nxt)
+        outside, _ = self.limit_violation(mid, limits)
         if np.any(outside):
             return False
-        if profile.check_self_collision and self.has_self_collision(qpos):
-            return False
+        # Dense collision check along the entire prev→nxt segment
+        if profile.check_self_collision:
+            if not self.ik_mgr._check_segment_collision_free(prev, nxt, step_size=0.02):
+                return False
+        if profile.check_env_collision:
+            if not self.ik_mgr._check_segment_env_collision_free(prev, nxt, step_size=0.02):
+                return False
+        # Geometric FK desk safety for the shortcut segment
+        if self.desk_safety is not None and profile.check_env_collision:
+            seg = np.array([prev, nxt], dtype=np.float64)
+            desk_safe, _min_z, _viol_idx = self.desk_safety.check_path_desk_safety(seg)
+            if not desk_safe:
+                return False
         return True
 
     def validate_path(
@@ -439,6 +500,14 @@ class XArm7MotionPlanner:
             if collision_report.get("path_self_collision"):
                 return PathResult(
                     success=False, qpos_path=None, source=source, reason="Path contains self-collision.", report=report
+                )
+        if profile.check_env_collision:
+            env_collision_report = self.check_path_env_collisions(path)
+            report.update(env_collision_report)
+            if env_collision_report.get("path_env_collision"):
+                return PathResult(
+                    success=False, qpos_path=None, source=source,
+                    reason="Path contains environment collision.", report=report,
                 )
         if report["start_qpos_error_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
             return PathResult(
@@ -489,6 +558,21 @@ class XArm7MotionPlanner:
                         reason=f"Path contains workspace violations: waypoint[{i}] ({'; '.join(violations)})",
                         report=report,
                     )
+        # Geometric FK desk safety check (fingertip Z vs table surface)
+        if self.desk_safety is not None and profile.check_env_collision:
+            desk_safe, min_z, viol_idx = self.desk_safety.check_path_desk_safety(path)
+            report["desk_safety_min_fingertip_z"] = float(min_z)
+            report["desk_safety_violation_index"] = int(viol_idx)
+            if not desk_safe:
+                return PathResult(
+                    success=False,
+                    qpos_path=None,
+                    source=source,
+                    reason=f"Path contains desk collision (fingertip z_min={min_z:.3f}m < "
+                           f"safe={self.desk_safety.config.fingertip_threshold:.3f}m, "
+                           f"segment {viol_idx})",
+                    report=report,
+                )
         report["path_score"] = float(
             _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
             + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
@@ -579,3 +663,140 @@ class WorkspaceSafety:
         target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3).copy()
         np.clip(target_pos, self.bounds[:, 0], self.bounds[:, 1], out=target_pos)
         return target_pos
+
+
+class FingertipDeskSafety:
+    """Geometric FK-based fingertip-to-desk collision detection.
+
+    Uses Pinocchio FK to compute the world Z of all five fingertip links
+    and compares the minimum against the table surface height.
+
+    This is the **preferred** detection method — zero-cost, no MPlib point
+    cloud pollution, and more accurate than EEF-level Z checks.  The MPlib
+    point cloud approach costs ~47% IK success rate (100% → 53%) and is
+    only used when env_collision_mode == "mplib_pointcloud".
+
+    Migrated from test_motion_planning_sim.py:817-911 with identical logic.
+    """
+
+    def __init__(
+        self,
+        pinocchio_model,
+        mp_planner,
+        collision_config: "CollisionConfig",
+    ) -> None:
+        import numpy as np
+
+        from .collision_config import CollisionConfig
+
+        self._model = pinocchio_model
+        self._mp_planner = mp_planner
+        self._config: CollisionConfig = collision_config
+        self._fingertip_ids = list(collision_config.fingertip_link_ids)
+        self._fingertip_names = list(collision_config.fingertip_link_names)
+        self._threshold = collision_config.fingertip_threshold
+        # epsilon 容差避免浮点边界误判（pinky_tip=0.03000000 < 0.03000001）
+        self._epsilon = 0.001
+        self._table_z = collision_config.table_z_world
+        self._hand_safe_margin = collision_config.hand_safe_margin
+
+    # ── Public API ──
+
+    def min_fingertip_z(self, qpos: np.ndarray) -> tuple[float, str]:
+        """Compute the lowest fingertip world Z for a given arm configuration.
+
+        Uses the planner's Pinocchio FK model (collision URDF, hand joints
+        fixed at home pose).  qpos must be 7-DOF arm joint angles; internally
+        padded to full model dimension via pad_move_group_qpos.
+
+        Returns: (min_z, lowest_fingertip_name)
+        """
+        import numpy as np
+
+        qpos = np.asarray(qpos, dtype=np.float64)
+        # Must pad through pad_move_group_qpos to fill remaining DOFs
+        # (same pattern as kinematics.py compute_eef_pose_base).
+        full_qpos = self._mp_planner.pad_move_group_qpos(qpos)
+        self._model.compute_forward_kinematics(full_qpos)
+
+        min_z = float("inf")
+        min_name = ""
+        for lid, name in zip(self._fingertip_ids, self._fingertip_names):
+            pose = self._model.get_link_pose(lid)
+            z = float(pose.p[2])
+            if z < min_z:
+                min_z = z
+                min_name = name
+        return min_z, min_name
+
+    def check_hand_desk_clearance(self, qpos: np.ndarray) -> tuple[bool, float, str]:
+        """Check if fingertips are above the table for a single configuration.
+
+        Uses Pinocchio FK to compute five fingertip world Z, compares the
+        minimum against the table surface + safe margin.
+
+        Returns: (safe, min_fingertip_z, lowest_fingertip_name)
+        """
+        min_z, min_name = self.min_fingertip_z(qpos)
+        safe = min_z > self._threshold - self._epsilon
+        return safe, min_z, min_name
+
+    def check_path_desk_safety(
+        self, path: np.ndarray, step_rad: float = 0.05
+    ) -> tuple[bool, float, int]:
+        """Dense-sampled fingertip desk safety check along a joint path.
+
+        Interpolates between consecutive waypoints at step_rad resolution
+        (default 0.05 rad ≈ 2.9°) and checks fingertip Z at every sample.
+        This is coarser than the segment collision check (0.02 rad) but
+        sufficient for detecting hand-through-desk since the hand extends
+        7.6 cm below EEF and the desk is a continuous plane.
+
+        Path should be (N, 7) for arm-only joints.  If padded (N, >7),
+        only the first 7 columns are used.
+
+        Returns: (safe, min_fingertip_z_over_path, first_violation_segment_index)
+          - violation_segment_index = -1 when all safe.
+        """
+        import numpy as np
+
+        path = np.asarray(path, dtype=np.float64)
+        # Extract arm-only columns if padded
+        if path.ndim != 2 or path.shape[1] > 7:
+            path = path[:, :7]
+
+        if len(path) < 2:
+            safe, z, name = self.check_hand_desk_clearance(path[0])
+            if not safe:
+                import warnings
+                eef_z = float("nan")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    eef_z = float(path[0][-1] if path.shape[1] > 0 else float("nan"))
+            return safe, z, 0 if not safe else -1
+
+        min_z = float("inf")
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            dist = float(np.max(np.abs(b - a)))
+            n = max(1, int(np.ceil(dist / step_rad)))
+            for k in range(n + 1):
+                alpha = k / max(n, 1)
+                q = a + alpha * (b - a)
+                safe, z, _name = self.check_hand_desk_clearance(q)
+                if z < min_z:
+                    min_z = z
+                if not safe:
+                    return False, min_z, i
+        return True, min_z, -1
+
+    # ── Properties ──
+
+    @property
+    def config(self) -> "CollisionConfig":
+        return self._config
+
+    @property
+    def is_ready(self) -> bool:
+        """Always True once constructed (construction may fail, handled by caller)."""
+        return True

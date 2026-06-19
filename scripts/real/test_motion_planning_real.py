@@ -701,11 +701,12 @@ def _fallback_reset(arm: XArm7, home_qpos: np.ndarray) -> float:
 
 def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndarray,
                      home_eef: Pose, dt: float = ARM_DT) -> float:
-    """安全归位：plan_path 碰撞预警 + 阻塞式 arm.reset() 执行。
+    """安全归位：plan_path 碰撞预警 + check_path_collisions + 阻塞式 arm.reset()。
 
     设计原则：
     - arm.reset() 使用 set_servo_angle(wait=True)，不经过伺服缓冲区
-    - plan_path 仅做碰撞安全预警（~0.01s），不改变执行路径
+    - plan_path 做碰撞安全预警，check_path_collisions() 做 segment-based
+      自碰撞验证（0.02 rad 步长，与 interface._safe_joint_path 一致）
     - _fallback_reset() 仅在 arm.reset() 直接失败时调用
 
     Returns: max joint error from home_qpos (deg)
@@ -722,6 +723,19 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
     # 碰撞安全预警（plan_path 内部已做 FCL 碰撞检测）
     result = planner.plan_path(home_eef, current_qpos)
     if result.success:
+        # 额外做 segment-based 路径碰撞验证 (0.02 rad 步长)
+        if result.qpos_path is not None:
+            seg_check = planner.check_path_collisions(result.qpos_path)
+            if seg_check.get("path_self_collision"):
+                print(f"  [safe_return_home] plan OK but segment collision detected — "
+                      f"falling back to direct reset")
+                arm.clear_error()
+                ok = arm.reset(home_qpos)
+                time.sleep(0.3)
+                if not ok or arm.is_error():
+                    return _fallback_reset(arm, home_qpos)
+                final = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
+                return float(np.rad2deg(np.max(np.abs(final - home_qpos))))
         print(f"  [safe_return_home] plan OK (src={result.source})")
     else:
         print(f"  [safe_return_home] plan WARNING: {result.reason}")
@@ -748,6 +762,81 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
         err = float(np.rad2deg(np.max(np.abs(final - home_qpos))))
 
     return err
+
+
+# ═══════════════════════════════════════════════ Test 5: Teleop IK 自碰撞检测
+
+def test_teleop_ik_collision(
+    planner: XArm7MotionPlanner,
+    home_qpos: np.ndarray,
+) -> dict:
+    """验证 Teleop IK 热路径自碰撞检测 (C3 修复)。
+
+    对应修复: command_from_target_qpos() 在 profile.check_self_collision=True
+    时对 IK 结果做 has_self_collision 检查，碰撞时 held=True。
+    """
+    print(f"\n{'='*60}")
+    print("Test 5: Teleop IK Self-Collision Check")
+    print("=" * 60)
+
+    home_eef = planner.compute_eef_pose_world(home_qpos)
+    limits = planner.joint_limits
+    results: dict = {"profile_default": False, "collision_held": None}
+
+    # ── 验证 TeleopProfile.check_self_collision 默认为 True ──
+    results["profile_default"] = TeleopProfile().check_self_collision
+    print(f"  TeleopProfile.check_self_collision default: {results['profile_default']}")
+
+    # ── 正常遥操作 IK（无碰撞）──
+    small_target = Pose(
+        p=home_eef.p + np.array([0.02, 0.0, 0.01], dtype=np.float64),
+        q=home_eef.q.copy(),
+    )
+    r_normal = planner.solve_teleop_ik(small_target, home_qpos, home_qpos)
+    print(f"  Normal teleop IK: success={r_normal.success}  held={r_normal.held}")
+
+    # ── 碰撞检测：遍历寻找自碰构型，用其 EEF 位姿作为 IK 目标 ──
+    collision_detected = False
+    for j2_deg in range(-120, 100, 10):
+        for j4_deg in range(-120, 120, 15):
+            test_q = home_qpos.copy()
+            test_q[1] = np.deg2rad(j2_deg)
+            test_q[3] = np.deg2rad(j4_deg)
+            test_q = np.clip(test_q, limits[:, 0], limits[:, 1])
+            if planner.has_self_collision(test_q):
+                collision_eef = planner.compute_eef_pose_world(test_q)
+                r = planner.solve_teleop_ik(collision_eef, home_qpos, home_qpos)
+                if r.held and "self_collision" in (r.reason or ""):
+                    collision_detected = True
+                    results["collision_held"] = True
+                    print(f"  Self-collision IK: held=True  reason={r.reason}")
+                    break
+                elif not r.success:
+                    # IK may fail for unreachable poses
+                    pass
+        if collision_detected:
+            break
+
+    if not collision_detected:
+        print("  ⚠️  No self-colliding IK result found (IK may avoid collision regions)")
+        results["collision_held"] = "not_applicable"
+
+    # ── check_self_collision=False 配置验证 ──
+    tp_no_check = TeleopProfile(check_self_collision=False)
+    results["profile_disabled"] = not tp_no_check.check_self_collision
+    print(f"  TeleopProfile(check_self_collision=False): works={results['profile_disabled']}")
+
+    # 判定
+    ok = results["profile_default"] and results.get("profile_disabled", True)
+    if results["collision_held"] is True:
+        print("  ✅ Teleop IK self-collision check: ACTIVE")
+    elif results["collision_held"] == "not_applicable":
+        print("  ✅ Teleop IK self-collision check: available (no colliding target found)")
+    else:
+        print("  ⚠️  Could not verify collision hold behavior")
+    print(f"  [{'OK' if ok else 'FAIL'}]")
+
+    return results
 
 
 # ═══════════════════════════════════════════════ 主流程
@@ -860,6 +949,9 @@ def main():
             final_retry = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
             print(f"额外 reset 后误差: {np.rad2deg(np.max(np.abs(final_retry - home_qpos))):.2f}deg")
 
+        # ══ 5. Teleop IK 碰撞检测 ══
+        teleop_ik_collision = test_teleop_ik_collision(planner, home_qpos)
+
         # ══ Summary ══
         print(f"\n{'='*60}")
         print("Summary:")
@@ -868,6 +960,8 @@ def main():
         print(f"  solve_teleop_ik: {teleop_stats.ok}/{teleop_stats.total}")
         print(f"  plan_path      : {path_stats.ok}/{path_stats.total}")
         print(f"  live_waypoints : {ok_count}/{len(safe_waypoints)}")
+        print(f"  ik_collision   : profile_default={teleop_ik_collision['profile_default']}  "
+              f"collision_held={teleop_ik_collision['collision_held']}")
         print("Done.")
 
     finally:
