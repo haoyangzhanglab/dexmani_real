@@ -8,6 +8,10 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.log import get_logger
+
+logger = get_logger(__name__)
+
 from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
@@ -125,7 +129,8 @@ class XArm7MotionPlanner:
                     collision_config=config.collision,
                 )
             except (ValueError, RuntimeError, IndexError):
-                pass  # desk_safety remains None — desk FK checks skipped
+                logger.warning("FingertipDeskSafety init failed — desk FK checks disabled.", exc_info=True)
+                # desk_safety remains None — desk FK checks skipped
 
     def __getattr__(self, name: str):
         """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mp_planner.
@@ -166,6 +171,7 @@ class XArm7MotionPlanner:
             )
             return True
         except (ValueError, RuntimeError, IndexError):
+            logger.warning("set_collision_config: FingertipDeskSafety init failed.", exc_info=True)
             return False
 
     # --- Public API ---
@@ -399,10 +405,10 @@ class XArm7MotionPlanner:
             return False
         # Dense collision check along the entire prev→nxt segment
         if profile.check_self_collision:
-            if not self.ik_mgr._check_segment_collision_free(prev, nxt, step_size=COLLISION_STEP_SIZE):
+            if not self.ik_mgr.check_segment_collision_free(prev, nxt, step_size=COLLISION_STEP_SIZE):
                 return False
         if profile.check_env_collision:
-            if not self.ik_mgr._check_segment_env_collision_free(prev, nxt, step_size=COLLISION_STEP_SIZE):
+            if not self.ik_mgr.check_segment_env_collision_free(prev, nxt, step_size=COLLISION_STEP_SIZE):
                 return False
         # Geometric FK desk safety for the shortcut segment
         if self.desk_safety is not None and profile.check_env_collision:

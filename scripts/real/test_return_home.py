@@ -736,11 +736,11 @@ def test_check_path_collisions(
         f"result={env_result}")
 
     # ── Test 5: 兼容旧 API（通过 ik_mgr 访问）──
-    seg_ok = planner.ik_mgr._check_segment_collision_free(q1, q2)
-    _ok("_check_segment_collision_free backward compat", seg_ok is True or seg_ok is False)
+    seg_ok = planner.ik_mgr.check_segment_collision_free(q1, q2)
+    _ok("check_segment_collision_free backward compat", seg_ok is True or seg_ok is False)
 
-    seg_env_ok = planner.ik_mgr._check_segment_env_collision_free(q1, q2)
-    _ok("_check_segment_env_collision_free backward compat", seg_env_ok is True or seg_env_ok is False)
+    seg_env_ok = planner.ik_mgr.check_segment_env_collision_free(q1, q2)
+    _ok("check_segment_env_collision_free backward compat", seg_env_ok is True or seg_env_ok is False)
 
     return {"passed": passed}
 

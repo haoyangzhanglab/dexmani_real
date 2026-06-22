@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.robot.interface import RobotState
+from dexmani_real.robot.types import RobotState, _ARM_TORQUE_LIMIT_NM
 
 # Default thresholds (teleop). Deploy may use stricter values.
-# Per-joint torque limits from URDF: J1-J2=50, J3-J5=30, J6-J7=20 Nm.
-# Using per-joint limits protects the wrist (J6-J7) whose rated torque is
-# only 20 Nm — a unified 50 Nm threshold would allow 2.5× rated torque
-# before triggering a warning.
-_ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
+# _ARM_TORQUE_LIMIT_NM is defined in robot/types.py (hardware property, not teleop policy).
 # Conservative defaults based on XHand specs. Validate against the actual
 # motor datasheet before production use.
 _HAND_CURRENT_LIMIT_MA = 500.0

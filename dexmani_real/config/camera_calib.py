@@ -19,7 +19,6 @@ from __future__ import annotations
 __all__ = ["CameraCalib", "CameraCalibEntry"]
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 

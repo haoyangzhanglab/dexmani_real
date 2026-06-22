@@ -421,8 +421,14 @@ class TeleopIKSolver:
                     dq2 = jacobian.T @ np.linalg.solve(lhs2, error)
                     raw_target_qpos = current_qpos + dq2
                 except np.linalg.LinAlgError:
-                    # Can't escape singularity — fall through to position IK
-                    pass
+                    # Can't escape singularity — return failure so solve()
+                    # falls back to position IK (ref: BunnyVisionPro DLS fallback).
+                    return IKResult(
+                        success=False,
+                        qpos=None,
+                        reason="Differential IK: heavy-damping retry failed (near singularity).",
+                        report={"differential_ik_status": "singularity_escape_failed"},
+                    )
 
         raw_target_qpos = self.ik_mgr.canonicalize_qpos(raw_target_qpos, previous_qpos_cmd)
 

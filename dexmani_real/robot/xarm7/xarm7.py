@@ -853,6 +853,8 @@ class XArm7(ConnectionStateMixin):
         return self._array7(qpos)
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
+        # XArm7 variant: same np.clip logic as XHand._limit_joint_range but with
+        # different clipping targets (arm joint ranges vs hand finger ranges).
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
@@ -879,6 +881,9 @@ class XArm7(ConnectionStateMixin):
 
         ref: BunnyVisionPro xarm7_ability.py clip_arm_next_qpos() — scalar
         scaling with hardware position as reference.
+
+        See also: XHand._limit_joint_step (xhand.py) — per-joint independent
+        clipping (different strategy for hand finger joints).
         """
         if not self.config.use_delta_limit:
             self.last_delta_limited = False

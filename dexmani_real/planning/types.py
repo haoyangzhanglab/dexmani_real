@@ -65,6 +65,9 @@ class XArm7PlannerConfig:
     joint_acc_scale: float = 2.0
     # Cartesian workspace bounds (world frame). (3,2) [[x_min,x_max],[y_min,y_max],[z_min,z_max]].
     # None disables the check (backward compatible).
+    #
+    # NOTE: robot/types.py RobotInterfaceConfig also has workspace_bounds with a hardcoded
+    # default. These are independent config paths — keep them in sync when tuning workspace.
     workspace_bounds: np.ndarray | None = None
 
     # Unified collision configuration (desk safety, hand margins, fingertip FK).

@@ -5,7 +5,7 @@ from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 __all__ = [
     "SimRobotInterface",
     "SimRobotConfig",
-    "XArm7XHand"
+    "XArm7XHand",
     "setup_scene",
     "add_base_components",
 ]

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import signal as _signal
 import time
-import traceback
 import warnings
 from typing import TYPE_CHECKING
 
@@ -17,11 +16,10 @@ import numpy as np
 from dexmani_real.log import get_logger
 from dexmani_real.planning.kinematics import XArm7Kinematics
 from dexmani_real.planning.types import Pose
-from dexmani_real.planning.pose_utils import compose_pose, compute_pose_error, quat_wxyz_to_rot6d
+from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
 from dexmani_real.planning import WorkspaceSafety
 from dexmani_real.robot.hand_kinematics import HandKinematics
-from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState
-from dexmani_real.teleop.control.safety import _ARM_TORQUE_LIMIT_NM
+from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState, _ARM_TORQUE_LIMIT_NM
 from dexmani_real.robot.xarm7 import XArm7
 from dexmani_real.robot.xhand import XHand
 from dexmani_real.utils.array_utils import nan_array

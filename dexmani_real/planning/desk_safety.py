@@ -22,10 +22,9 @@ Key design decisions:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import warnings
 
-if TYPE_CHECKING:
-    pass
+import numpy as np
 
 
 class FingertipDeskSafety:
@@ -48,7 +47,6 @@ class FingertipDeskSafety:
         mp_planner,
         collision_config: "CollisionConfig",
     ) -> None:
-        import numpy as np
 
         from .collision_config import CollisionConfig
 
@@ -74,7 +72,6 @@ class FingertipDeskSafety:
 
         Returns: (min_z, lowest_fingertip_name)
         """
-        import numpy as np
 
         qpos = np.asarray(qpos, dtype=np.float64)
         # Must pad through pad_move_group_qpos to fill remaining DOFs
@@ -121,7 +118,6 @@ class FingertipDeskSafety:
         Returns: (safe, min_fingertip_z_over_path, first_violation_segment_index)
           - violation_segment_index = -1 when all safe.
         """
-        import numpy as np
 
         path = np.asarray(path, dtype=np.float64)
         # Extract arm-only columns if padded
@@ -131,7 +127,6 @@ class FingertipDeskSafety:
         if len(path) < 2:
             safe, z, name = self.check_hand_desk_clearance(path[0])
             if not safe:
-                import warnings
                 eef_z = float("nan")
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")

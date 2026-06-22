@@ -109,9 +109,9 @@ class TeleopController:
         ema_alpha_arm: float = 1.0,  # 1.0 = no smoothing (disabled)
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
-        use_cartesian_interpolation: bool = False,
-        interpolation_max_pos_speed: float = 0.25,
-        interpolation_max_rot_speed: float = 0.5,
+        use_cartesian_interpolation: bool | None = None,
+        interpolation_max_pos_speed: float | None = None,
+        interpolation_max_rot_speed: float | None = None,
         use_zmq_vr: bool = False,
         zmq_vr_port: int = 5555,
         camera_process: object | None = None,
@@ -123,6 +123,15 @@ class TeleopController:
         self.tracker = tracker
         self.dry_run = dry_run
         self.recorder = recorder
+
+        # Resolve interpolation settings from planner's TeleopProfile when not
+        # explicitly passed (ref: ManiUniCon use_interpolator config→constructor pattern).
+        if use_cartesian_interpolation is None:
+            use_cartesian_interpolation = self.planner.teleop_profile.use_cartesian_interpolation
+        if interpolation_max_pos_speed is None:
+            interpolation_max_pos_speed = self.planner.teleop_profile.interpolation_max_pos_speed
+        if interpolation_max_rot_speed is None:
+            interpolation_max_rot_speed = self.planner.teleop_profile.interpolation_max_rot_speed
 
         self.limiter = RateLimiter(target_hz)
         self.ema_alpha_arm = float(ema_alpha_arm)

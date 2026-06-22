@@ -903,6 +903,8 @@ class XHand(ConnectionStateMixin):
         return temperature
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
+        # XHand variant: same np.clip logic as XArm7._limit_joint_range (xarm7.py:855)
+        # but with different clipping targets (hand finger ranges vs arm joint ranges).
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
@@ -912,6 +914,17 @@ class XHand(ConnectionStateMixin):
         return clipped
 
     def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
+        """Clip target_qpos per-joint independently against max_qvel * dt.
+
+        Unlike XArm7._limit_joint_step (xarm7.py:867) which uses bottleneck
+        proportional scaling to preserve the motion path, XHand clips each
+        finger joint independently — finger joints have independent range/velocity
+        constraints and coupling them is undesirable for dexterous manipulation.
+
+        Delta reference uses hardware position (from background state reader)
+        when available, falling back to last_qpos_cmd on first frame or when
+        the reader is disabled. (ref: BunnyVisionPro / LeFranX hardware ref pattern)
+        """
         if not self.config.use_delta_limit:
             self.last_delta_limited = False
             return target_qpos
@@ -929,6 +942,24 @@ class XHand(ConnectionStateMixin):
 
         dt = max(now - self.last_cmd_time, self.config.dt)
         max_step = self.config.max_qvel * dt
+
+        # Use hardware position as delta reference (ref: BunnyVisionPro xarm7_ability.py:177-183,
+        # LeFranX utils.py ensure_safe_goal_position). Prevents error accumulation when
+        # hardware lags behind commands.
+        # Falls back to last_qpos_cmd when cached state is invalid (first frame, reader not started).
+        if self.config.use_background_state_reader and self._state_thread is not None:
+            with self._state_lock:
+                cached = self._latest_state
+            if cached is not None:
+                hw_qpos = np.asarray(cached.get("qpos", None) or nan_array(12), dtype=np.float64)
+                if np.all(np.isfinite(hw_qpos)) and hw_qpos.shape == (12,):
+                    raw_step = target_qpos - hw_qpos
+                    step = np.clip(raw_step, -max_step, max_step)
+                    self.last_delta_limited = not np.allclose(raw_step, step)
+                    return hw_qpos + step
+
+        # Fallback: use last command as reference (original behavior, for first frame or
+        # when background reader is disabled).
         raw_step = target_qpos - self.last_qpos_cmd
         step = np.clip(raw_step, -max_step, max_step)
         self.last_delta_limited = not np.allclose(raw_step, step)

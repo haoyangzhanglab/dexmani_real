@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import signal
 import sys
 import time
@@ -21,6 +20,7 @@ from typing import Any
 import numpy as np
 import zmq
 
+from dexmani_real.log import get_logger
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT
 
@@ -28,12 +28,7 @@ from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT
 # Logging
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("retarget_server")
+logger = get_logger("retarget_server")
 
 # ---------------------------------------------------------------------------
 # Globals for graceful shutdown

@@ -52,8 +52,7 @@ _ACTION_KEYS: list[tuple[str, int]] = [
     ("action/hand_qpos", 12),
 ]
 
-# ALL_GOOD_MASK: bits 0-5,7-10 all set (see recording/quality_flags.py).
-ALL_GOOD_MASK: int = 0x07BF
+from dexmani_real.recording.quality_flags import ALL_GOOD_MASK
 
 
 def load_episodes(

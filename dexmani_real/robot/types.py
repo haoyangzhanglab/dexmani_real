@@ -17,6 +17,11 @@ from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.robot.xhand import XHandConfig
 from dexmani_real.utils.serialization import from_dict_helper
 
+# Per-joint arm torque limits from URDF: J1-J2=50, J3-J5=30, J6-J7=20 Nm.
+# Defined here (robot layer) because these are hardware properties, not teleop policy.
+# Used by both teleop safety checks and RobotInterface path execution.
+_ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
+
 if TYPE_CHECKING:
     from dexmani_real.planning.collision_config import CollisionConfig
 else:

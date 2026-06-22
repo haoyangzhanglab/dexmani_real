@@ -372,16 +372,13 @@ class IKCandidateManager:
                 return False
         return True
 
-    def _check_segment_collision_free(
+    def check_segment_collision_free(
         self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
     ) -> bool:
-        """Check if the linear joint-space segment start→end is self-collision-free.
-
-        Thin wrapper around ``_check_segment_collision`` for backward compatibility.
-        """
+        """Check if the linear joint-space segment start→end is self-collision-free."""
         return self._check_segment_collision(start, end, "self", step_size)
 
-    def _check_segment_env_collision_free(
+    def check_segment_env_collision_free(
         self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
     ) -> bool:
         """Check if the linear joint-space segment start→end is env-collision-free.
@@ -399,7 +396,7 @@ class IKCandidateManager:
         size and checks self-collision at every sampled point.
         """
         for i in range(len(path) - 1):
-            if not self._check_segment_collision_free(
+            if not self.check_segment_collision_free(
                 path[i], path[i + 1], collision_step_size,
             ):
                 return {
@@ -415,7 +412,7 @@ class IKCandidateManager:
     ) -> dict[str, Any]:
         """Check environment collision along path with dense interpolation."""
         for i in range(len(path) - 1):
-            if not self._check_segment_env_collision_free(
+            if not self.check_segment_env_collision_free(
                 path[i], path[i + 1], collision_step_size,
             ):
                 return {
