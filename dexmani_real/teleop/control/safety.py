@@ -16,8 +16,14 @@ _ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
 # motor datasheet before production use.
 _HAND_CURRENT_LIMIT_MA = 500.0
 _HAND_TEMP_LIMIT_C = 70.0
-_RETARGET_PHYSIO_MIN = -0.5
-_RETARGET_PHYSIO_MAX = 2.5
+# Retarget validity range aligned with XHand hardware joint limits (2026-06-22).
+# Previous hardcoded [-0.5, 2.5] was too narrow on the low end (-0.5 > XHand
+# thumb min -0.698 rad, causing false negatives) and too wide on the high end
+# (2.5 > XHand max 1.92 rad, risking false positives).
+# New bounds match XHand qpos_min.min() ≈ -0.698 rad and qpos_max.max() ≈ 1.92 rad,
+# with a small safety margin (±0.05 rad) to allow for numerical noise at IK boundaries.
+_RETARGET_VALID_MIN = -0.75   # rad, ~43°, XHand thumb min=-40° (-0.698 rad)
+_RETARGET_VALID_MAX = 2.0     # rad, ~115°, XHand max=110° (1.92 rad)
 
 
 def check_arm_torque(
@@ -84,9 +90,14 @@ def check_hand_joint_limits(
 
 def check_retarget_valid(
     hand_qpos: np.ndarray,
-    physio_min: float = _RETARGET_PHYSIO_MIN,
-    physio_max: float = _RETARGET_PHYSIO_MAX,
+    physio_min: float = _RETARGET_VALID_MIN,
+    physio_max: float = _RETARGET_VALID_MAX,
 ) -> bool:
+    """Check retargeted hand_qpos is within hardware-aligned range.
+
+    Default bounds match XHand joint limits with safety margin (±0.05 rad).
+    Callers can override for other hand hardware or tighter safety policies.
+    """
     if not np.all(np.isfinite(hand_qpos)):
         return False
     if np.any(hand_qpos < physio_min) or np.any(hand_qpos > physio_max):

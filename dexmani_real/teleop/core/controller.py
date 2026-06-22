@@ -275,44 +275,15 @@ class TeleopController:
         # 4. Compute action
         action, quality = self._compute_action(vr_frame, state)
 
-        # 5. Safety checks on state (arm torque, hand current, hand temp, hand comm)
+        # 5. Quality flags on hardware state (recorded for post-hoc filtering)
         quality.set(ARM_TORQUE_OK, safety.check_arm_torque(state))
         quality.set(HAND_CURRENT_OK, safety.check_hand_current(state))
         quality.set(HAND_TEMP_OK, safety.check_hand_temperature(state))
         quality.set(HAND_COMM_OK, safety.check_hand_comm(state))
 
-        # Hard safety: joint limits (trigger E-Stop, not just quality flags)
-        if not self.dry_run:
-            if not safety.check_arm_joint_limits(
-                state,
-                self.robot.arm.config.qpos_min,
-                self.robot.arm.config.qpos_max,
-            ):
-                self._escalate_to_emergency(
-                    f"Arm joint out of limits: {state.arm_qpos}"
-                )
-                return
-            if not safety.check_hand_joint_limits(
-                state,
-                self.robot.hand.config.qpos_min,
-                self.robot.hand.config.qpos_max,
-            ):
-                # NOTE: Hand joint limit violations log a warning (not E-Stop),
-                # unlike arm violations which trigger an immediate E-Stop.
-                # Rationale: XHand has its own internal commboard-level error
-                # protection that will fault on out-of-range commands before
-                # mechanical damage occurs. If this assumption proves false
-                # in testing, elevate to E-Stop.
-                logger.warning(
-                    "Hand joint out of limits: %s", state.hand_qpos
-                )
-
         flags = quality.get()
 
-        # 6. Execute action based on state
-
-        # Poll camera frame from daemon process (crash-isolated).
-        # A crashed camera process does NOT block the control loop.
+        # 6. Record frame (before safety gate — captures pre-hold action + flags)
         camera_frame = None
         if self._camera_process is not None:
             try:
@@ -333,15 +304,14 @@ class TeleopController:
             except (ValueError, OSError) as e:
                 logger.exception("recorder add_frame failed: %s", e)
 
+        # 7. Pre-send safety gate (ManiUniCon validate_action + ufactory_teleop driver-trust).
+        #    Joint limits enforced by XArm7/XHand drivers (error latch → is_error below).
+        #    Controller adds checks the driver CANNOT cover: torque/current soft faults.
         if not self.dry_run:
             if self.robot.is_error():
                 self._escalate_to_emergency("Robot error state detected before send_action")
                 return
-            # Pre-send safety: torque/current hold (was validate_action).
-            # workspace position/orientation is enforced at L2
-            # (_compute_action IN_WORKSPACE flag → hold).
-            # arm_joint_limits is enforced at L4 (E-Stop, stricter than hold).
-            # hand_joint_limits is warn-only per XHand internal protection design.
+
             if not (flags & ARM_TORQUE_OK) or not (flags & HAND_CURRENT_OK):
                 logger.warning(
                     "Pre-send safety: torque=%s current=%s — holding",
@@ -353,6 +323,7 @@ class TeleopController:
                     arm_qpos_cmd=hold.arm_qpos_cmd,
                     hand_qpos_cmd=hold.hand_qpos_cmd,
                 )
+
             if self.state != ControllerState.IDLE:
                 result = self.robot.send_action(action)
                 arm_ok = result.get("arm_ok", False)
@@ -360,10 +331,7 @@ class TeleopController:
                 if not arm_ok or not hand_ok:
                     logger.warning("send_action: arm_ok=%s hand_ok=%s", arm_ok, hand_ok)
 
-        # Note: cumulative E-Stop escalation removed per error_handler design.
-        # Persistent failures are caught by robot.is_error() at driver level.
-
-        # 7. Periodic status
+        # 8. Periodic status
         now = time.monotonic()
         if now - self.last_status_ts >= self.status_interval:
             self.last_status_ts = now
