@@ -6,7 +6,6 @@ from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
 
 __all__ = [
     "ArmWristMapper",
-    "DummyTracker",
     "QuestHandTracker",
     "XHandRefAdapter",
     "XHandRetargeter",

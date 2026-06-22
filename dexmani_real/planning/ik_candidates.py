@@ -35,7 +35,12 @@ def _categorize_rejects(reject_counts: dict[str, int]) -> dict[str, int]:
 
 
 class IKCandidateManager:
-    """IK candidate generation, filtering, scoring, and joint canonicalization."""
+    """IK candidate generation, filtering, scoring, and joint canonicalization.
+
+    References:
+      - LeFranX weighted_ik.cpp
+      - dimos collision_step_size
+    """
 
     def __init__(self, kinematics: XArm7Kinematics) -> None:
         self.kin = kinematics
@@ -44,7 +49,6 @@ class IKCandidateManager:
         self.equivalent_joint_mask = kinematics.equivalent_joint_mask
         self.mp_planner = kinematics.mp_planner
 
-    # --- MPlib IK call ---
 
     def call_mplib_ik(
         self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
@@ -58,7 +62,6 @@ class IKCandidateManager:
             return_closest=return_closest,
         )
 
-    # --- Seed generation ---
 
     def generate_ik_seeds(self, current_qpos: np.ndarray, profile: PlanningProfile) -> list[np.ndarray]:
         limits = self.resolve_planning_limits(profile, current_qpos)
@@ -73,7 +76,6 @@ class IKCandidateManager:
             seeds.append(seed)
         return self.unique_qpos_list(seeds)
 
-    # --- Candidate collection ---
 
     def collect_ik_candidates(
         self,
@@ -130,7 +132,6 @@ class IKCandidateManager:
             summary["reject_examples"] = reject_examples
         return candidates[: profile.num_ik_candidates], summary
 
-    # --- Candidate filtering ---
 
     def filter_ik_candidate(
         self,
@@ -191,7 +192,6 @@ class IKCandidateManager:
 
         return True, report
 
-    # --- Candidate scoring ---
 
     def score_ik_candidate(
         self, qpos: np.ndarray, current_qpos: np.ndarray, report: dict[str, Any], profile: PlanningProfile
@@ -216,7 +216,6 @@ class IKCandidateManager:
 
         return float(score)
 
-    # --- Joint canonicalization ---
 
     def resolve_planning_limits(
         self, profile: PlanningProfile, reference_qpos: np.ndarray | None = None
@@ -307,7 +306,6 @@ class IKCandidateManager:
         delta[self.equivalent_joint_mask] = (delta[self.equivalent_joint_mask] + half) % periods[self.equivalent_joint_mask] - half
         return delta
 
-    # --- Limit checking ---
 
     def limit_violation(
         self, qpos: np.ndarray, limits: np.ndarray, limit_tol: float = 1e-5
@@ -329,7 +327,6 @@ class IKCandidateManager:
         upper = np.maximum(path - limits[None, :, 1], 0.0)
         return outside, np.maximum(lower, upper)
 
-    # --- Collision ---
 
     def has_self_collision(self, qpos: np.ndarray) -> bool:
         return len(self.mp_planner.check_for_self_collision(qpos)) > 0
@@ -378,15 +375,6 @@ class IKCandidateManager:
         """Check if the linear joint-space segment start→end is self-collision-free."""
         return self._check_segment_collision(start, end, "self", step_size)
 
-    def check_segment_env_collision_free(
-        self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
-    ) -> bool:
-        """Check if the linear joint-space segment start→end is env-collision-free.
-
-        Thin wrapper around ``_check_segment_collision`` for backward compatibility.
-        """
-        return self._check_segment_collision(start, end, "env", step_size)
-
     def check_path_collisions(
         self, path: np.ndarray, collision_step_size: float = 0.02,
     ) -> dict[str, Any]:
@@ -412,8 +400,8 @@ class IKCandidateManager:
     ) -> dict[str, Any]:
         """Check environment collision along path with dense interpolation."""
         for i in range(len(path) - 1):
-            if not self.check_segment_env_collision_free(
-                path[i], path[i + 1], collision_step_size,
+            if not self._check_segment_collision(
+                path[i], path[i + 1], "env", collision_step_size,
             ):
                 return {
                     "path_env_collision": True,
@@ -423,7 +411,6 @@ class IKCandidateManager:
                 }
         return {"path_env_collision": False}
 
-    # --- Distance / penalty ---
 
     def normalized_joint_distance(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> float:
         """Per-joint-range normalized Euclidean distance (ref: LeFranX weighted_ik.cpp)."""
@@ -439,7 +426,6 @@ class IKCandidateManager:
         half_range = np.maximum(0.5 * (limits[:, 1] - limits[:, 0]), 1e-6)
         return float(np.sum(((qpos - center) / half_range) ** 2))
 
-    # --- Utilities ---
 
     def profile_array(self, values: tuple[float, ...], name: str) -> np.ndarray:
         array = np.asarray(values, dtype=np.float64).reshape(-1)

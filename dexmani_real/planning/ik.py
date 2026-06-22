@@ -32,6 +32,15 @@ class TeleopIKSolver:
     Speed limiting is handled by XArm7._limit_joint_step()
     (driver bottleneck scaling + soft-start).
     Self-collision checks are done when TeleopProfile.check_self_collision=True.
+    
+
+    References:
+      - BunnyVisionPro DLS + LeFranX scoring)
+      - BunnyVisionPro DLS fallback)
+      - LeFranX current_distance penalty)
+      - ssik explain=True pattern)
+      - ssik max_solutions=1
+      - ssik seed_tolerance hard boundary)
     """
 
     def __init__(self, kin: XArm7Kinematics, ik_mgr: IKCandidateManager, teleop_profile: TeleopProfile) -> None:
@@ -39,9 +48,7 @@ class TeleopIKSolver:
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def solve(self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> IKResult:
         """Deterministic IK for real-time teleop (ref: BunnyVisionPro DLS + LeFranX scoring).
@@ -58,8 +65,8 @@ class TeleopIKSolver:
         previous_qpos_cmd = ensure_qpos(previous_qpos_cmd, self.kin.dof, "previous_qpos_cmd")
 
         # ── Step 1: Differential IK (deterministic, primary) ──
-        diff_failed = False
-        diff_reason = ""
+        diff_ik_failed = False
+        diff_ik_reason = ""
         if profile.use_differential_ik_fallback:
             diff_result = self.solve_differential_ik(
                 target_eef_pose_world, current_qpos, previous_qpos_cmd, profile,
@@ -72,11 +79,11 @@ class TeleopIKSolver:
                 if pos_err <= profile.max_pose_error_pos_m and rot_err <= profile.max_pose_error_rot_rad:
                     return diff_result
                 # Diff IK converged but pose error too large → fall through to position IK.
-                diff_failed = True
-                diff_reason = f"pose_error({pos_err:.4f}m,{rot_err:.4f}rad)"
+                diff_ik_failed = True
+                diff_ik_reason = f"pose_error({pos_err:.4f}m,{rot_err:.4f}rad)"
             else:
-                diff_failed = True
-                diff_reason = diff_result.reason
+                diff_ik_failed = True
+                diff_ik_reason = diff_result.reason
 
         # ── Step 2: Position IK (stochastic fallback) ──
         position_report: dict[str, Any] = {}
@@ -97,8 +104,8 @@ class TeleopIKSolver:
 
         # ── All strategies failed → hold ──
         diagnostic = self._build_ik_diagnostic(
-            diff_failed=diff_failed,
-            diff_reason=diff_reason if diff_failed else "",
+            diff_ik_failed=diff_ik_failed,
+            diff_ik_reason=diff_ik_reason if diff_ik_failed else "",
             position_report=position_report,
         )
         return IKResult(
@@ -107,9 +114,7 @@ class TeleopIKSolver:
             report={"held": True, "diagnostic": diagnostic}, held=True,
         )
 
-    # ------------------------------------------------------------------
     # Position IK — simplified single-seed with fallback
-    # ------------------------------------------------------------------
 
     def solve_position_ik(
         self,
@@ -184,14 +189,12 @@ class TeleopIKSolver:
 
         return None, {"teleop_ik_method": "position_ik", "failure_reason": f"all failed: {attempts}"}
 
-    # ------------------------------------------------------------------
     # Structured IK diagnostics (ref: ssik explain=True pattern)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_ik_diagnostic(
-        diff_failed: bool,
-        diff_reason: str,
+        diff_ik_failed: bool,
+        diff_ik_reason: str,
         position_report: dict[str, Any],
     ) -> dict[str, Any]:
         """Build structured IK failure diagnostic categorising why each tier failed.
@@ -216,8 +219,8 @@ class TeleopIKSolver:
         }
 
         # ── Categorise diff IK failure ──
-        if diff_failed:
-            reason_lower = diff_reason.lower()
+        if diff_ik_failed:
+            reason_lower = diff_ik_reason.lower()
             if "singular" in reason_lower:
                 category = "singular"
             elif "self-collision" in reason_lower:
@@ -229,7 +232,7 @@ class TeleopIKSolver:
             diagnostic["diff_ik"] = {
                 "failed": True,
                 "category": category,
-                "detail": diff_reason,
+                "detail": diff_ik_reason,
             }
         else:
             diagnostic["diff_ik"] = {"failed": False}
@@ -266,31 +269,29 @@ class TeleopIKSolver:
         diff_cat = diagnostic["diff_ik"].get("category", "")
         pos_cat = diagnostic["position_ik"].get("category", "")
 
-        if diff_failed and not position_report.get("disabled"):
+        if diff_ik_failed and not position_report.get("disabled"):
             if pos_cat == "unreachable":
                 diagnostic["classification"] = "unreachable"
             elif pos_cat == "filtered":
                 diagnostic["classification"] = "all_filtered"
             else:
                 diagnostic["classification"] = "all_methods_exhausted"
-        elif diff_failed and position_report.get("disabled"):
+        elif diff_ik_failed and position_report.get("disabled"):
             diagnostic["classification"] = f"diff_ik_failed:{diff_cat}"
         else:
             diagnostic["classification"] = "held"
 
         # ── Human-readable summary ──
         parts: list[str] = []
-        if diff_failed:
-            parts.append(f"Diff IK [{diagnostic['diff_ik'].get('category', '?')}]: {diff_reason}")
+        if diff_ik_failed:
+            parts.append(f"Diff IK [{diagnostic['diff_ik'].get('category', '?')}]: {diff_ik_reason}")
         if position_report and not position_report.get("disabled"):
             parts.append(f"Position IK [{pos_cat}]: {position_report.get('failure_reason', '?')}")
         diagnostic["summary"] = " | ".join(parts) if parts else "All IK strategies failed"
 
         return diagnostic
 
-    # ------------------------------------------------------------------
     # Command assembly
-    # ------------------------------------------------------------------
 
     def command_from_target_qpos(
         self,
@@ -337,9 +338,17 @@ class TeleopIKSolver:
         }
         return IKResult(success=True, qpos=qpos_cmd, report=result_report)
 
-    # ------------------------------------------------------------------
+    # Differential IK helpers
+
+    @staticmethod
+    def _solve_damped_least_squares(
+        jacobian: np.ndarray, error: np.ndarray, damping: float,
+    ) -> np.ndarray:
+        """Damped least-squares: dq = J^T (J J^T + λ² I)^{-1} error."""
+        damped_JJt = jacobian @ jacobian.T + (damping * damping) * np.eye(6)
+        return jacobian.T @ np.linalg.solve(damped_JJt, error)
+
     # Differential IK fallback
-    # ------------------------------------------------------------------
 
     def solve_differential_ik(
         self,
@@ -395,9 +404,8 @@ class TeleopIKSolver:
         else:
             damping = float(profile.differential_ik_damping)
 
-        lhs = jacobian @ jacobian.T + (damping * damping) * np.eye(6)
         try:
-            dq = jacobian.T @ np.linalg.solve(lhs, error)
+            dq = self._solve_damped_least_squares(jacobian, error, damping)
         except np.linalg.LinAlgError:
             return IKResult(
                 success=False,
@@ -416,9 +424,8 @@ class TeleopIKSolver:
             if target_manip < profile.min_manipulability:
                 # Retry with higher damping to push away from singularity
                 heavy_damping = damping * profile.singularity_damping_scale
-                lhs2 = jacobian @ jacobian.T + (heavy_damping * heavy_damping) * np.eye(6)
                 try:
-                    dq2 = jacobian.T @ np.linalg.solve(lhs2, error)
+                    dq2 = self._solve_damped_least_squares(jacobian, error, heavy_damping)
                     raw_target_qpos = current_qpos + dq2
                 except np.linalg.LinAlgError:
                     # Can't escape singularity — return failure so solve()

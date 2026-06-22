@@ -22,7 +22,7 @@ class XArm7Kinematics:
         joint_limits: np.ndarray,
         equivalent_joint_mask: np.ndarray,
         base_pose_world: Pose,
-        mp: Any,
+        mplib: Any,
     ) -> None:
         self.mp_planner = mp_planner
         self.pinocchio_model = pinocchio_model
@@ -32,7 +32,7 @@ class XArm7Kinematics:
         self.equivalent_joint_mask = equivalent_joint_mask
         self.base_pose_world = base_pose_world.copy()
         self.base_pose_inverse = invert_pose(self.base_pose_world)
-        self.mp = mp
+        self.mplib = mplib
 
     def set_base_pose(self, base_pose_world: Pose) -> None:
         self.base_pose_world = base_pose_world.copy()
@@ -132,4 +132,4 @@ class XArm7Kinematics:
         return compute_pose_error(target_eef_pose_world, self.compute_eef_pose_world(qpos))
 
     def to_mplib_pose(self, pose: Pose) -> Any:
-        return self.mp.Pose(p=pose.p, q=pose.q)
+        return self.mplib.Pose(p=pose.p, q=pose.q)

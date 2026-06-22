@@ -12,10 +12,10 @@ import numpy as np
 
 from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
-from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.serialization import from_dict_helper
-from xhand_controller import xhand_control as xh
+from xhand_controller import xhand_control as xhc
 
 logger = get_logger(__name__)
 
@@ -49,62 +49,6 @@ _KNOWN_SENSOR_ERROR_PATTERNS = [
     "communication data crc error",
     "this hardware version does not support force control mode",
 ]
-
-# ── F2: Predefined grasp presets (ref: DexUMI constants.py:18-21) ──
-# Each preset is a dict with "qpos" (12,) array in radians and "description".
-GRASP_PRESETS: dict[str, dict] = {
-    "home": {
-        "qpos": np.deg2rad(np.array([
-            0.0, 45.0, 0.0,   # thumb
-            0.0, 0.0, 0.0,    # index
-            0.0, 0.0,          # middle
-            0.0, 0.0,          # ring
-            0.0, 0.0,          # little
-        ], dtype=np.float64)),
-        "description": "Open hand, all fingers extended",
-    },
-    "open": {
-        "qpos": np.deg2rad(np.array([
-            0.0, 45.0, 0.0,   # thumb
-            0.0, 0.0, 5.0,    # index
-            0.0, 5.0,          # middle
-            0.0, 5.0,          # ring
-            0.0, 5.0,          # little
-        ], dtype=np.float64)),
-        "description": "Wide-open hand",
-    },
-    "fist": {
-        "qpos": np.deg2rad(np.array([
-            50.0, 90.0, 90.0,   # thumb
-            10.0, 110.0, 110.0, # index
-            110.0, 110.0,        # middle
-            110.0, 110.0,        # ring
-            110.0, 110.0,        # little
-        ], dtype=np.float64)),
-        "description": "Full fist closure",
-    },
-    "pinch": {
-        "qpos": np.deg2rad(np.array([
-            30.0, 60.0, 45.0,   # thumb
-            5.0, 50.0, 60.0,    # index
-            0.0, 5.0,            # middle (open)
-            0.0, 5.0,            # ring (open)
-            0.0, 5.0,            # little (open)
-        ], dtype=np.float64)),
-        "description": "Thumb-index pinch grip",
-    },
-    "tripod": {
-        "qpos": np.deg2rad(np.array([
-            35.0, 65.0, 60.0,    # thumb
-            5.0, 50.0, 60.0,     # index
-            50.0, 60.0,           # middle
-            0.0, 5.0,             # ring (open)
-            0.0, 5.0,             # little (open)
-        ], dtype=np.float64)),
-        "description": "Thumb-index-middle tripod grip",
-    },
-}
-
 
 @dataclass
 class XHandConfig:
@@ -207,11 +151,6 @@ class XHandConfig:
     # Minimum duration for trajectory execution; actual duration is max(min_duration, computed).
     traj_min_duration_s: float = 0.5
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "XHandConfig":
-        """Reconstruct from a serialized dict."""
-        kw = from_dict_helper(cls, d)
-        return cls(**kw)
 
 
 class XHand(ConnectionStateMixin):
@@ -282,7 +221,7 @@ class XHand(ConnectionStateMixin):
         RS485 may need several attempts after cold start (C++ SDK retries
         internally, but may still fail intermittently).
         """
-        self.control = xh.XHandControl()
+        self.control = xhc.XHandControl()
         if self.config.device_name is None:
             devices = self.control.enumerate_devices(comm_type)
             if devices is None or len(devices) == 0:
@@ -323,7 +262,7 @@ class XHand(ConnectionStateMixin):
                     self.control.close_device()
                 except (OSError, RuntimeError):
                     pass
-                self.control = xh.XHandControl()
+                self.control = xhc.XHandControl()
                 time.sleep(delay)
 
         # All retries exhausted
@@ -365,22 +304,6 @@ class XHand(ConnectionStateMixin):
         if self.control is not None:
             self.control.close_device()
         self.connected_flag = False
-
-    def reconnect(self) -> bool:
-        """Close existing connection and re-connect.
-
-        Returns True if reconnection succeeded.  Callers (e.g. RobotInterface)
-        can use this at runtime to recover from a transient hand disconnect.
-        """
-        if self.control is not None:
-            try:
-                self.control.close_device()
-            except (OSError, RuntimeError):
-                pass
-        self.connected_flag = False
-        self.error_state = False
-        time.sleep(1.0)
-        return self.connect()
 
     def _diagnose_connection_failure(self) -> None:
         """Print diagnostic info for a failed RS485/EtherCAT connection.
@@ -564,21 +487,7 @@ class XHand(ConnectionStateMixin):
         self._record_error(err)
         return False
 
-    def reset_sensor(self, sensor_id: int | None = None) -> bool:
-        if self.control is None:
-            return False
-        sensor_ids = SENSOR_IDS if sensor_id is None else [int(sensor_id)]
-        ok = True
-        for sid in sensor_ids:
-            err = self.control.reset_sensor(self.config.device_id, sid)
-            if not self.error_ok(err):
-                self._record_error(err)
-                ok = False
-        return ok
-
-    # ------------------------------------------------------------------
-    # E1: Background state reader (ref: DexUMI hand_api_cls.py:228-275)
-    # ------------------------------------------------------------------
+    # E1: Background state reader
 
     def _start_state_reader(self) -> None:
         """Start the daemon thread that reads hardware state at state_reader_hz."""
@@ -625,9 +534,7 @@ class XHand(ConnectionStateMixin):
             with self._state_lock:
                 self._latest_state = state
 
-    # ------------------------------------------------------------------
     # F1: Tactile contact detection (ref: DexUMI eval_xhand.py:40-57)
-    # ------------------------------------------------------------------
 
     def detect_contact(self, threshold: float | None = None) -> np.ndarray:
         """Detect per-finger contact from tactile force.
@@ -647,49 +554,7 @@ class XHand(ConnectionStateMixin):
         norm = np.linalg.norm(force_sum, axis=1)  # (5,) L2 per finger
         return norm > thresh
 
-    def get_finger_contacts(self) -> dict[str, bool]:
-        """Get per-finger contact status as a named dict.
-
-        Returns:
-            Dict mapping sensor name → contact boolean.
-        """
-        contacts = self.detect_contact()
-        return {SENSOR_NAMES[i]: bool(contacts[i]) for i in range(5)}
-
-    # ------------------------------------------------------------------
-    # F2: Predefined grasp presets (ref: DexUMI constants.py:18-21)
-    # ------------------------------------------------------------------
-
-    def move_to_preset(self, name: str, duration_s: float = 1.0) -> bool:
-        """Move hand to a predefined grasp preset.
-
-        Args:
-            name: Preset name — one of "home", "open", "fist", "pinch", "tripod".
-            duration_s: Time to execute the motion.
-
-        Returns:
-            True if preset was found and command sent.
-        """
-        name = name.lower().strip()
-        if name not in GRASP_PRESETS:
-            logger.warning("Unknown preset '%s'. Available: %s", name, self.list_presets())
-            return False
-
-        target = GRASP_PRESETS[name]["qpos"].copy()
-        return self.send_trajectory(target.reshape(1, 12), duration_s)
-
-    @staticmethod
-    def list_presets() -> list[str]:
-        """Return available preset names."""
-        return [
-            f"{k}: {GRASP_PRESETS[k]['description']}"
-            for k in GRASP_PRESETS
-        ]
-
-    # ------------------------------------------------------------------
     # F3: Trajectory interpolation with velocity constraints
-    #     (ref: DexUMI motor_trajectory_interpolator.py:1-217)
-    # ------------------------------------------------------------------
 
     def send_trajectory(self, waypoints: np.ndarray, duration_s: float) -> bool:
         """Execute a joint-space trajectory with linear interpolation.
@@ -756,7 +621,7 @@ class XHand(ConnectionStateMixin):
         ki: int | None = None,
         kd: int | None = None,
     ):
-        command = xh.HandCommand_t()
+        command = xhc.HandCommand_t()
         mode = self.config.mode if mode is None else mode
         tor_max = self.config.tor_max if tor_max is None else tor_max
         kp = self.config.kp if kp is None else kp
@@ -814,8 +679,7 @@ class XHand(ConnectionStateMixin):
             raw_position[idx] = float(getattr(item, "raw_position", np.nan))
             temperature[idx] = float(getattr(item, "temperature", np.nan))
             commboard_err[idx] = int(getattr(item, "commboard_err", 0))
-            # SDK v1.1.8: field is misspelled "jonitboard_err" (not "jointboard_err").
-            # Use fallback chain to be compatible with both current and future SDK versions.
+            # SDK misspelling: "jonitboard_err" for "jointboard_err".
             jointboard_err[idx] = int(getattr(item, "jonitboard_err", getattr(item, "jointboard_err", 0)))
             tipboard_err[idx] = int(getattr(item, "tipboard_err", 0))
 
@@ -986,17 +850,7 @@ class XHand(ConnectionStateMixin):
         return True
 
     def _array12(self, value) -> np.ndarray:
-        if value is None:
-            return nan_array(12)
-
-        arr = np.asarray(value, dtype=np.float64).reshape(-1)
-
-        if arr.size >= 12:
-            return arr[:12]
-
-        out = nan_array(12)
-        out[: arr.size] = arr
-        return out
+        return safe_resize(value, 12)
 
     def _empty_state(self) -> dict[str, Any]:
         return {

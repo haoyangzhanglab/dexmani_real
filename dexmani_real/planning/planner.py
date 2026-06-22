@@ -60,9 +60,9 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
     ) -> None:
-        import mplib as mp
+        import mplib
 
-        self.mp = mp
+        self.mplib = mplib
         self.config = config
         self.planning_profile = planning_profile or PlanningProfile()
         self.teleop_profile = teleop_profile or TeleopProfile()
@@ -70,9 +70,9 @@ class XArm7MotionPlanner:
         joint_vel_limits = np.deg2rad(np.asarray(config.joint_vel_limits_deg, dtype=np.float64))
         joint_acc_limits = joint_vel_limits * float(config.joint_acc_scale)
         if not os.path.exists(config.srdf_path):
-            mp.urdf_utils.generate_srdf(config.urdf_path, config.srdf_path)
+            mplib.urdf_utils.generate_srdf(config.urdf_path, config.srdf_path)
 
-        self.mp_planner = self.mp.Planner(
+        self.mplib_planner = self.mplib.Planner(
             urdf=str(config.urdf_path),
             srdf=str(config.srdf_path),
             move_group=config.eef_link_name,
@@ -80,7 +80,7 @@ class XArm7MotionPlanner:
             joint_vel_limits=joint_vel_limits.tolist(),
             joint_acc_limits=joint_acc_limits.tolist(),
         )
-        self.pinocchio_model = self.mp_planner.pinocchio_model
+        self.pinocchio_model = self.mplib_planner.pinocchio_model
 
         link_names = list(self.pinocchio_model.get_link_names())
         if config.eef_link_name not in link_names:
@@ -88,7 +88,7 @@ class XArm7MotionPlanner:
         eef_link_id = int(link_names.index(config.eef_link_name))
 
         self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
-        joint_limits = np.asarray(self.mp_planner.joint_limits, dtype=np.float64)
+        joint_limits = np.asarray(self.mplib_planner.joint_limits, dtype=np.float64)
         dof = int(joint_limits.shape[0])
         equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) >= np.pi
 
@@ -100,17 +100,17 @@ class XArm7MotionPlanner:
         )
 
         self.kin = XArm7Kinematics(
-            mp_planner=self.mp_planner,
+            mp_planner=self.mplib_planner,
             pinocchio_model=self.pinocchio_model,
             eef_link_id=eef_link_id,
             dof=dof,
             joint_limits=joint_limits,
             equivalent_joint_mask=equivalent_joint_mask,
             base_pose_world=base_pose_world,
-            mp=self.mp,
+            mplib=self.mplib,
         )
         self.ik_mgr = IKCandidateManager(self.kin)
-        self.mp_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
+        self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
         self.teleop_solver = TeleopIKSolver(self.kin, self.ik_mgr, self.teleop_profile)
 
@@ -125,7 +125,7 @@ class XArm7MotionPlanner:
             try:
                 self.desk_safety = FingertipDeskSafety(
                     pinocchio_model=self.pinocchio_model,
-                    mp_planner=self.mp_planner,
+                    mp_planner=self.mplib_planner,
                     collision_config=config.collision,
                 )
             except (ValueError, RuntimeError, IndexError):
@@ -133,7 +133,7 @@ class XArm7MotionPlanner:
                 # desk_safety remains None — desk FK checks skipped
 
     def __getattr__(self, name: str):
-        """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mp_planner.
+        """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mplib_planner.
 
         Eliminates 24 pure-delegation methods (ref: code-simplification-review).
         Callers use ``planner.compute_eef_pose_world(q)`` as before — the proxy
@@ -141,10 +141,10 @@ class XArm7MotionPlanner:
 
         Only fires when normal attribute lookup fails (i.e. the method is not
         defined on XArm7MotionPlanner directly).  ``self.kin``, ``self.ik_mgr``,
-        and ``self.mp_planner`` are regular attributes set in ``__init__`` and
+        and ``self.mplib_planner`` are regular attributes set in ``__init__`` and
         are never proxied.
         """
-        for delegate in (self.kin, self.ik_mgr, self.mp_planner):
+        for delegate in (self.kin, self.ik_mgr, self.mplib_planner):
             if hasattr(delegate, name):
                 return getattr(delegate, name)
         raise AttributeError(
@@ -166,7 +166,7 @@ class XArm7MotionPlanner:
         try:
             self.desk_safety = FingertipDeskSafety(
                 pinocchio_model=self.pinocchio_model,
-                mp_planner=self.mp_planner,
+                mp_planner=self.mplib_planner,
                 collision_config=collision_config,
             )
             return True
@@ -232,8 +232,8 @@ class XArm7MotionPlanner:
         if not valid_results:
             reason_counts: dict[str, int] = {}
             for result in results:
-                r = result.reason or "unknown"
-                reason_counts[r] = reason_counts.get(r, 0) + 1
+                reason = result.reason or "unknown"
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
             reason = (
                 "; ".join(f"{text} x{count}" for text, count in reason_counts.items())
                 or "All planning strategies failed."
@@ -259,8 +259,8 @@ class XArm7MotionPlanner:
 
     # ── Pass-through delegates ──
     # All kinematics, IK candidate, and collision-check methods are proxied via
-    # __getattr__ to self.kin / self.ik_mgr / self.mp_planner (22 methods
-    # removed).  See __getattr__ docstring for rationale.
+    # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
+    # See __getattr__ docstring for rationale.
     #
     # Explicit delegates retained only for methods that add semantic value:
     #   - solve_ik / solve_teleop_ik / plan_path  (planning orchestration)
@@ -279,18 +279,18 @@ class XArm7MotionPlanner:
         automatically avoid this obstacle.  Re-calling with the same name
         updates the point cloud.
         """
-        self.mp_planner.update_point_cloud(points, resolution, name)
+        self.mplib_planner.update_point_cloud(points, resolution, name)
 
     def remove_point_cloud(self, name: str = "table") -> bool:
         """Remove a point cloud collision object by name."""
-        return self.mp_planner.remove_point_cloud(name)
+        return self.mplib_planner.remove_point_cloud(name)
 
     # ── Planning strategies (internal) ──
 
     def try_screw_plan(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
     ) -> PathResult:
-        result = self.mp_planner.plan_screw(
+        result = self.mplib_planner.plan_screw(
             goal_pose=self.to_mplib_pose(target_eef_pose_world),
             current_qpos=current_qpos,
             time_step=profile.path_dt,
@@ -310,7 +310,7 @@ class XArm7MotionPlanner:
         results: list[PathResult] = []
         for rrt_range in profile.rrt_range_options:
             for attempt_index in range(profile.num_rrt_attempts):
-                result = self.mp_planner.plan_qpos(
+                result = self.mplib_planner.plan_qpos(
                     goal_qposes=goal_qposes,
                     current_qpos=current_qpos,
                     time_step=profile.path_dt,

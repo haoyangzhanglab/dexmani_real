@@ -35,7 +35,6 @@ __all__ = [
     "TrackingQualityResult",
     # ── VR ──
     "ArmWristMapper",
-    "DummyTracker",
     "QuestHandTracker",
     "XHandRefAdapter",
     "XHandRetargeter",

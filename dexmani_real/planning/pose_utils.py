@@ -64,9 +64,9 @@ def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
     return angle * np.array([x, y, z], dtype=np.float64) / sin_half
 
 
-def compose_pose(a: Pose, b: Pose) -> Pose:
-    p = a.p + _quat_rotate_vector(a.q, b.p)
-    q = _quat_multiply(a.q, b.q)
+def compose_pose(parent: Pose, child: Pose) -> Pose:
+    p = parent.p + _quat_rotate_vector(parent.q, child.p)
+    q = _quat_multiply(parent.q, child.q)
     return Pose(p=p, q=q)
 
 

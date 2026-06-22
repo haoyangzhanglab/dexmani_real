@@ -9,6 +9,7 @@ from __future__ import annotations
 import signal as _signal
 import time
 import warnings
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -29,9 +30,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
 # Magic numbers (Phase 4.2)
-# ---------------------------------------------------------------------------
 
 _HAND_RESET_CONVERGE_TIMEOUT_S = 3.0
 _HAND_RESET_CONVERGE_THRESHOLD_RAD = np.deg2rad(5.0)
@@ -109,42 +108,9 @@ class RobotInterface:
         # Only add MPlib point cloud when env_collision_mode == "mplib_pointcloud".
         # Default "geometric_fk" mode uses FingertipDeskSafety (FK fingertip Z)
         # which is zero-cost and does NOT pollute the IK solver.
-        if self.planner is not None:
-            use_pointcloud = False
-            if config.collision is not None:
-                use_pointcloud = config.collision.env_collision_mode == "mplib_pointcloud"
-            elif config.add_table_collision:
-                # Backward compat: old config without CollisionConfig.
-                # Default to geometric_fk (zero-cost, no IK pollution) instead of
-                # MPlib point cloud which costs ~47% IK success rate (100% → 53%).
-                # Auto-create CollisionConfig and inject into planner so FK desk
-                # safety is active even for consumers that haven't migrated yet.
-                from dexmani_real.planning.collision_config import CollisionConfig
-
-                auto_collision = CollisionConfig(
-                    table_z_world=config.table_z_world,
-                    env_collision_mode="geometric_fk",
-                )
-                if self.planner.set_collision_config(auto_collision):
-                    logger.info(
-                        "Auto-configured geometric_fk desk safety "
-                        "(table_z=%.2f m) from legacy add_table_collision=True. "
-                        "Pass CollisionConfig(env_collision_mode='mplib_pointcloud') "
-                        "to RobotInterfaceConfig to opt into MPlib point cloud instead.",
-                        config.table_z_world,
-                    )
-                # geometric_fk uses planner's Pinocchio FK — no MPlib point cloud
-                use_pointcloud = False
-
-            if use_pointcloud:
-                self._setup_table_collision(
-                    table_z=config.table_z_world,
-                    margin_xy=config.table_margin_xy,
-                    n_layers=config.table_layers,
-                    layer_spacing=config.table_layer_spacing,
-                    xy_resolution=config.table_xy_resolution,
-                    x_min_clearance=config.table_x_min_clearance,
-                )
+        if self.planner is not None and config.collision is not None:
+            if config.collision.env_collision_mode == "mplib_pointcloud":
+                self._setup_table_collision(table_z=config.collision.table_z_world)
 
         # Hand kinematics
         self.hand_kinematics: HandKinematics | None = None
@@ -153,9 +119,7 @@ class RobotInterface:
             if hk.is_ready():
                 self.hand_kinematics = hk
 
-    # ------------------------------------------------------------
     # Lifecycle
-    # ------------------------------------------------------------
 
     def connect(self) -> dict[str, bool]:
         """Connect arm + hand. Returns {"arm": bool, "hand": bool}."""
@@ -303,9 +267,7 @@ class RobotInterface:
             return False
         return self.hand.reset()
 
-    # ------------------------------------------------------------
     # Return-to-home (split into sub-methods per Phase 3.1)
-    # ------------------------------------------------------------
 
     def return_to_home(
         self,
@@ -409,33 +371,21 @@ class RobotInterface:
             arm_ok = not self.arm.is_error()
             return arm_ok and hand_ok
 
-    # --- return_to_home sub-methods (Phase 3.1) ---
 
     @staticmethod
-    def _install_sigint_handler(cancel_event: object) -> object:
-        """Context manager: install SIGINT handler that sets cancel_event.
+    @contextmanager
+    def _install_sigint_handler(cancel_event: object):
+        """Context manager: install SIGINT handler that sets cancel_event, restore on exit."""
 
-        Returns the old handler for restoration.
-        """
+        def _on_sigint(signum, frame):
+            if cancel_event is not None and hasattr(cancel_event, "set"):
+                cancel_event.set()
 
-        class _SigintGuard:
-            def __init__(self, event):
-                self.event = event
-                self.old = None
-
-            def __enter__(self):
-                def _on_sigint(signum, frame):
-                    if self.event is not None:
-                        if hasattr(self.event, "set"):
-                            self.event.set()
-
-                self.old = _signal.signal(_signal.SIGINT, _on_sigint)
-                return self
-
-            def __exit__(self, *args):
-                _signal.signal(_signal.SIGINT, self.old)
-
-        return _SigintGuard(cancel_event)
+        old = _signal.signal(_signal.SIGINT, _on_sigint)
+        try:
+            yield
+        finally:
+            _signal.signal(_signal.SIGINT, old)
 
     def _arm_ready(self) -> np.ndarray | None:
         """Read arm qpos; return None on NaN (caller should fall back)."""
@@ -552,8 +502,6 @@ class RobotInterface:
         desk_z: float | None = None
         if self.config.collision is not None:
             desk_z = self.config.collision.table_z_world
-        elif self.config.add_table_collision:
-            desk_z = self.config.table_z_world
 
         if desk_z is not None and self.planner is not None:
             hand_state = self.hand.get_state() if self.hand.is_connected() else {"qpos": None}
@@ -672,9 +620,7 @@ class RobotInterface:
                 "skipping Phase 2 (EEF already at home from Phase 1)"
             )
 
-    # ------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------
 
     def _safe_joint_path(
         self, start: np.ndarray, goal: np.ndarray, max_step_rad: float = np.deg2rad(1.0)
@@ -768,7 +714,7 @@ class RobotInterface:
         if self.config.collision is not None:
             desk_safe_z = self.config.collision.desk_safe_z
         else:
-            desk_safe_z = self.config.table_z_world + _HAND_EXTENSION_Z_M + _HAND_SAFETY_MARGIN_Z_M
+            desk_safe_z = _HAND_EXTENSION_Z_M + _HAND_SAFETY_MARGIN_Z_M  # default table at z=0
 
         min_safe_z = desk_safe_z + _JOINT_DIP_ALLOWANCE_Z_M
         if current_z >= min_safe_z:
@@ -935,12 +881,10 @@ class RobotInterface:
             q=self.config.T_eef_handbase_quat_wxyz,
         )
 
+        identity_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         tips_world = np.zeros((5, 3), dtype=np.float64)
         for i in range(5):
-            tip_in_handbase = Pose(
-                p=tips_in_handbase[i],
-                q=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
-            )
+            tip_in_handbase = Pose(p=tips_in_handbase[i], q=identity_quat)
             T_world_tip = compose_pose(
                 compose_pose(T_world_eef, T_eef_handbase),
                 tip_in_handbase,

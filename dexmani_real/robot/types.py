@@ -145,15 +145,6 @@ class RobotInterfaceConfig:
     # None disables orientation checking (backward compatible).
     workspace_orientation_bounds: np.ndarray | None = None
 
-    # Environment collision (table at z=0.0 m in world frame)
-    add_table_collision: bool = True
-    table_z_world: float = 0.0      # table surface height (world frame, meters)
-    table_margin_xy: float = 0.15   # extra margin beyond workspace bounds
-    table_layers: int = 5           # number of z-layers for solid volume
-    table_layer_spacing: float = 0.01  # spacing between z-layers (meters)
-    table_xy_resolution: float = 0.02  # point spacing on each layer (meters)
-    table_x_min_clearance: float = 0.15  # minimum x distance from origin (protect robot base)
-
     # Hand FK
     hand_urdf_path: str = ""
     fingertip_link_names: list[str] = field(default_factory=list)
@@ -166,11 +157,8 @@ class RobotInterfaceConfig:
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     )
 
-    # Unified collision configuration (preferred over individual table_* fields).
+    # Unified collision configuration.
     # When set, desk safety uses geometric FK (FingertipDeskSafety).
-    # The legacy table_* fields (add_table_collision, table_z_world, etc.) are
-    # still supported for backward compatibility but deprecated in favor of
-    # CollisionConfig.
     collision: CollisionConfig | None = None
 
     @classmethod

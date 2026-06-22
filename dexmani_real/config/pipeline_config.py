@@ -18,7 +18,7 @@ from dexmani_real.robot.interface import RobotInterfaceConfig
 # Default max frames per recording episode — single source of truth
 # used by both PipelineConfig and EpisodeRecorder.
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
-from dexmani_real.utils.serialization import from_dict_helper
+from dexmani_real.utils.serialization import FromDictMixin, from_dict_helper
 
 
 def _ndarray_to_list(obj):
@@ -37,7 +37,7 @@ def _ndarray_to_list(obj):
 
 
 @dataclass
-class PipelineConfig:
+class PipelineConfig(FromDictMixin):
     """Aggregated configuration for the entire teleoperation pipeline.
 
     Serialized into HDF5 /meta as pipeline_snapshot for full reproducibility.
@@ -64,21 +64,5 @@ class PipelineConfig:
         """Return a JSON-serializable dict (numpy arrays converted to lists)."""
         return _ndarray_to_list(dataclasses.asdict(self))
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "PipelineConfig":
-        """Reconstruct PipelineConfig from a dict (reverse of to_dict()).
-
-        Handles:
-          - list → np.ndarray for ndarray-annotated fields
-          - list → tuple for tuple-annotated fields (e.g. max_ik_jump_deg)
-          - dict → nested dataclass (via subclass from_dict())
-          - None for Optional ndarray fields (e.g. neutral_qpos)
-
-        Usage:
-            cfg = PipelineConfig(...)
-            d = cfg.to_dict()
-            cfg2 = PipelineConfig.from_dict(d)
-            assert cfg2.to_dict() == d  # round-trip reproducible
-        """
-        kw = from_dict_helper(cls, d)
-        return cls(**kw)
+    # from_dict inherited from FromDictMixin.
+    # Handles: list→ndarray, list→tuple, dict→nested dataclass, None for Optional.

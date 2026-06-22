@@ -75,6 +75,26 @@ class ControllerState(Enum):
     EMERGENCY_STOP = "EMERGENCY_STOP"
 
 
+from dataclasses import dataclass
+
+
+@dataclass
+class TeleopControllerConfig:
+    """Configuration for TeleopController runtime behavior.
+
+    Collapses 8 scattered keyword arguments into a single cfg parameter.
+    """
+
+    target_hz: float = 50.0
+    ema_alpha_arm: float = 1.0  # 1.0 = no smoothing
+    dry_run: bool = False
+    use_cartesian_interpolation: bool | None = None
+    interpolation_max_pos_speed: float | None = None
+    interpolation_max_rot_speed: float | None = None
+    use_zmq_vr: bool = False
+    zmq_vr_port: int = 5555
+
+
 # Per-step joint jump limits (rad).
 # NOTE: These are IK-anomaly defenses, NOT routine speed limits.
 # Routine speed limiting is handled by XArm7._limit_joint_step() at the driver
@@ -102,11 +122,13 @@ class TeleopController:
         arm_mapper: ArmWristMapper,
         retargeter: XHandRetargeter,
         planner: XArm7MotionPlanner,
+        cfg: TeleopControllerConfig | None = None,
         *,
         tracker: QuestHandTracker | None = None,
         keyboard_queue: object | None = None,
+        # Backward compat individual kwargs (deprecated; prefer cfg)
         target_hz: float = 50.0,
-        ema_alpha_arm: float = 1.0,  # 1.0 = no smoothing (disabled)
+        ema_alpha_arm: float = 1.0,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_cartesian_interpolation: bool | None = None,
@@ -116,46 +138,58 @@ class TeleopController:
         zmq_vr_port: int = 5555,
         camera_process: object | None = None,
     ) -> None:
+        if cfg is None:
+            cfg = TeleopControllerConfig(
+                target_hz=target_hz,
+                ema_alpha_arm=ema_alpha_arm,
+                dry_run=dry_run,
+                use_cartesian_interpolation=use_cartesian_interpolation,
+                interpolation_max_pos_speed=interpolation_max_pos_speed,
+                interpolation_max_rot_speed=interpolation_max_rot_speed,
+                use_zmq_vr=use_zmq_vr,
+                zmq_vr_port=zmq_vr_port,
+            )
+
         self.robot = robot
         self.arm_mapper = arm_mapper
         self.retargeter = retargeter
         self.planner = planner
         self.tracker = tracker
-        self.dry_run = dry_run
+        self.dry_run = cfg.dry_run
         self.recorder = recorder
 
-        # Resolve interpolation settings from planner's TeleopProfile when not
-        # explicitly passed (ref: ManiUniCon use_interpolator config→constructor pattern).
-        if use_cartesian_interpolation is None:
-            use_cartesian_interpolation = self.planner.teleop_profile.use_cartesian_interpolation
-        if interpolation_max_pos_speed is None:
-            interpolation_max_pos_speed = self.planner.teleop_profile.interpolation_max_pos_speed
-        if interpolation_max_rot_speed is None:
-            interpolation_max_rot_speed = self.planner.teleop_profile.interpolation_max_rot_speed
+        self.limiter = RateLimiter(cfg.target_hz)
+        self.ema_alpha_arm = float(cfg.ema_alpha_arm)
 
-        self.limiter = RateLimiter(target_hz)
-        self.ema_alpha_arm = float(ema_alpha_arm)
+        # Resolve interpolation settings from planner's TeleopProfile when not
+        # explicitly passed.
+        use_ci = cfg.use_cartesian_interpolation
+        max_pos = cfg.interpolation_max_pos_speed
+        max_rot = cfg.interpolation_max_rot_speed
+        if use_ci is None:
+            use_ci = self.planner.teleop_profile.use_cartesian_interpolation
+        if max_pos is None:
+            max_pos = self.planner.teleop_profile.interpolation_max_pos_speed
+        if max_rot is None:
+            max_rot = self.planner.teleop_profile.interpolation_max_rot_speed
 
         # Cartesian pose interpolator (optional, disabled by default).
-        # Ref: ManiUniCon PoseTrajectoryInterpolator.
         self._pose_interpolator: CartPoseInterpolator | None = None
-        if use_cartesian_interpolation:
+        if use_ci:
             from dexmani_real.teleop.vr.pose_interpolator import CartPoseInterpolator
             self._pose_interpolator = CartPoseInterpolator(
-                max_pos_speed=interpolation_max_pos_speed,
-                max_rot_speed=interpolation_max_rot_speed,
+                max_pos_speed=max_pos,
+                max_rot_speed=max_rot,
             )
 
         # Camera daemon process (optional — crash-isolated frame capture).
-        # Ref: ManiUniCon Camera Process.
         self._camera_process = camera_process
 
         # ZMQ VR subscriber (optional, disabled by default).
-        # Ref: Open-Teach multi-process ZMQ PUB/SUB pattern.
         self._vr_subscriber: VRFrameSubscriber | None = None
-        if use_zmq_vr:
+        if cfg.use_zmq_vr:
             from dexmani_real.teleop.vr.vr_publisher import VRFrameSubscriber
-            self._vr_subscriber = VRFrameSubscriber(sub_port=zmq_vr_port)
+            self._vr_subscriber = VRFrameSubscriber(sub_port=cfg.zmq_vr_port)
             self._vr_subscriber.connect()
 
         self.tracking_quality = TrackingQuality(TrackingQualityConfig(max_frame_age_s=0.2))
@@ -188,9 +222,7 @@ class TeleopController:
         # Cancel event for return_to_home
         self._cancel_event = threading.Event()
 
-    # ------------------------------------------------------------------
     # Lifecycle
-    # ------------------------------------------------------------------
 
     def start(self) -> None:
         if self.keyboard is not None:
@@ -230,9 +262,35 @@ class TeleopController:
         finally:
             self._shutdown()
 
-    # ------------------------------------------------------------------
+    # Soft deceleration
+
+    def _apply_soft_deceleration(self, lost_duration_s: float) -> None:
+        """Exponentially pull arm toward current physical position during VR stale window.
+
+        Avoids abrupt holds when VR tracking is briefly lost (< 1.0 s).
+        """
+        if self._last_arm_cmd is None:
+            return
+        state = self._dummy_state() if self.dry_run else self.robot.get_state()
+        decay = float(np.exp(-lost_duration_s * 3.0))
+        arm_interp = decay * self._last_arm_cmd + (1.0 - decay) * state.arm_qpos
+        action = RobotAction(
+            arm_qpos_cmd=arm_interp,
+            hand_qpos_cmd=(
+                self._last_hand_cmd
+                if self._last_hand_cmd is not None
+                else state.hand_qpos
+            ),
+        )
+        if not self.dry_run and self.state != ControllerState.IDLE:
+            if self.robot.is_error():
+                self._escalate_to_emergency(
+                    "Robot error state detected during soft deceleration"
+                )
+                return
+            self.robot.send_action(action)
+
     # State machine tick
-    # ------------------------------------------------------------------
 
     def _tick(self) -> None:
         self.frame_count += 1
@@ -252,32 +310,8 @@ class TeleopController:
             # Soft deceleration: during stale-but-not-lost window
             # (0.2s < age < 1.0s continuous), exponentially pull arm
             # toward current physical position to avoid abrupt holds.
-            # Ref: BVPro clip_arm_velocity() soft-start pattern.
-            if tq_result.lost_duration_s > 0.0 and self._last_arm_cmd is not None:
-                if not self.dry_run:
-                    state = self.robot.get_state()
-                else:
-                    state = self._dummy_state()
-                decay = float(np.exp(-tq_result.lost_duration_s * 3.0))
-                arm_interp = (
-                    decay * self._last_arm_cmd
-                    + (1.0 - decay) * state.arm_qpos
-                )
-                action = RobotAction(
-                    arm_qpos_cmd=arm_interp,
-                    hand_qpos_cmd=(
-                        self._last_hand_cmd
-                        if self._last_hand_cmd is not None
-                        else state.hand_qpos
-                    ),
-                )
-                if not self.dry_run and self.state != ControllerState.IDLE:
-                    if self.robot.is_error():
-                        self._escalate_to_emergency(
-                            "Robot error state detected during soft deceleration"
-                        )
-                        return
-                    self.robot.send_action(action)
+            if tq_result.lost_duration_s > 0.0:
+                self._apply_soft_deceleration(tq_result.lost_duration_s)
             return
 
         # 3. Read robot state
@@ -356,9 +390,7 @@ class TeleopController:
             self.last_status_ts = now
             self._print_status(vr_frame, flags, now)
 
-    # ------------------------------------------------------------------
     # Action computation (split into sub-methods per Phase 3.2)
-    # ------------------------------------------------------------------
 
     def _compute_action(
         self, vr_frame: dict, state: RobotState
@@ -366,16 +398,16 @@ class TeleopController:
         quality = QualityFlags()
         quality.set(TRACKING_OK, True)
 
-        current_arm_qpos = state.arm_qpos.copy()
-        current_hand_qpos = state.hand_qpos.copy()
+        current_arm_qpos = state.arm_qpos
+        current_hand_qpos = state.hand_qpos
 
         prev_arm_cmd = (
-            self._last_arm_cmd.copy()
+            self._last_arm_cmd
             if self._last_arm_cmd is not None
             else current_arm_qpos
         )
         prev_hand_cmd = (
-            self._last_hand_cmd.copy()
+            self._last_hand_cmd
             if self._last_hand_cmd is not None
             else current_hand_qpos
         )
@@ -458,7 +490,7 @@ class TeleopController:
 
                 target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
                 ik_result: IKResult = self.planner.solve_teleop_ik(
-                    target_pose, state.arm_qpos.copy(), prev_arm_cmd
+                    target_pose, state.arm_qpos, prev_arm_cmd
                 )
                 if ik_result.success and ik_result.qpos is not None:
                     ik_ok = True
@@ -550,9 +582,7 @@ class TeleopController:
         # would discard the clamped correction, so we rely on clamp alone.
         return arm_cmd, hand_cmd, jump_ok
 
-    # ------------------------------------------------------------------
     # State machine transitions
-    # ------------------------------------------------------------------
 
     def _handle_keyboard(self) -> None:
         if self.keyboard is None:
@@ -731,9 +761,7 @@ class TeleopController:
         logger.info("  IK: ok=%s fail=%s", self.ik_success_count, self.ik_fail_count)
         logger.info("  Retarget: ok=%s fail=%s", self.retarget_success_count, self.retarget_fail_count)
 
-    # ------------------------------------------------------------------
     # VR data source
-    # ------------------------------------------------------------------
 
     def _read_vr_frame(self) -> dict | None:
         if self._vr_subscriber is not None:
@@ -742,9 +770,7 @@ class TeleopController:
             return self.tracker.get_latest()
         return None
 
-    # ------------------------------------------------------------------
     # EEF pose utilities
-    # ------------------------------------------------------------------
 
     def _compute_T_base_eef(self, state: RobotState) -> np.ndarray | None:
         """Compute 4x4 T_base_eef from EEF pose for camera extrinsics."""
@@ -776,9 +802,7 @@ class TeleopController:
             timestamp=time.perf_counter(),
         )
 
-    # ------------------------------------------------------------------
     # Status
-    # ------------------------------------------------------------------
 
     def _print_status(
         self, vr_frame: dict | None, quality_flags: int, now: float

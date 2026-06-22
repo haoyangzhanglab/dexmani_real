@@ -197,3 +197,21 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
         kw[f.name] = convert_field_value(val, target)
 
     return kw
+
+
+class FromDictMixin:
+    """Mixin providing ``from_dict(cls, d)`` for dataclass deserialization.
+
+    Usage::
+
+        @dataclass
+        class MyConfig(FromDictMixin):
+            field1: float = 0.0
+
+        cfg = MyConfig.from_dict({"field1": 1.5})
+    """
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Any:
+        """Reconstruct from a serialized dict."""
+        return cls(**from_dict_helper(cls, d))

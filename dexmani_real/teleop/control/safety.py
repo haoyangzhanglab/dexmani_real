@@ -60,30 +60,6 @@ def check_hand_comm(state: RobotState) -> bool:
     return not state.hand_error
 
 
-def check_arm_joint_limits(
-    state: RobotState,
-    qpos_min: np.ndarray,
-    qpos_max: np.ndarray,
-) -> bool:
-    """Check arm_qpos is within hardware joint limits."""
-    qpos = state.arm_qpos
-    if not np.all(np.isfinite(qpos)):
-        return False
-    return not (np.any(qpos < qpos_min) or np.any(qpos > qpos_max))
-
-
-def check_hand_joint_limits(
-    state: RobotState,
-    qpos_min: np.ndarray,
-    qpos_max: np.ndarray,
-) -> bool:
-    """Check hand_qpos is within hardware joint limits."""
-    qpos = state.hand_qpos
-    if not np.all(np.isfinite(qpos)):
-        return False
-    return not (np.any(qpos < qpos_min) or np.any(qpos > qpos_max))
-
-
 def check_retarget_valid(
     hand_qpos: np.ndarray,
     physio_min: float = _RETARGET_VALID_MIN,

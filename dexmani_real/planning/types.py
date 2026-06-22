@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.utils.serialization import from_dict_helper
+from dexmani_real.utils.serialization import FromDictMixin, from_dict_helper
 
 if TYPE_CHECKING:
     from .collision_config import CollisionConfig
@@ -76,7 +76,7 @@ class XArm7PlannerConfig:
 
 
 @dataclass(kw_only=True)
-class PlanningProfile:
+class PlanningProfile(FromDictMixin):
     """Offline path planning configuration."""
 
     path_dt: float = 1 / 15
@@ -107,14 +107,9 @@ class PlanningProfile:
     ik_score_pose_error_weight: float = 0.2
     ik_score_joint_limit_weight: float = 0.2
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "PlanningProfile":
-        kw = from_dict_helper(cls, d)
-        return cls(**kw)
-
 
 @dataclass(kw_only=True)
-class TeleopProfile:
+class TeleopProfile(FromDictMixin):
     """Online teleoperation IK/servo configuration."""
 
     teleop_dt: float = 0.04
@@ -190,9 +185,4 @@ class TeleopProfile:
     # Speed limits for interpolator (prevent sudden jumps).
     interpolation_max_pos_speed: float = 0.25   # m/s
     interpolation_max_rot_speed: float = 0.5    # rad/s
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "TeleopProfile":
-        kw = from_dict_helper(cls, d)
-        return cls(**kw)
 

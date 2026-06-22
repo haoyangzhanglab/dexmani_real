@@ -25,7 +25,7 @@ from xarm.wrapper import XArmAPI
 
 from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
-from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.serialization import from_dict_helper
 
@@ -153,10 +153,6 @@ class XArm7Config:
     # Mode 6 (joint-space trajectory planning): when True, uses xArm controller
     # firmware's built-in trajectory smoother instead of host-side PID.
     # Offloads trajectory smoothing to the controller, reducing host CPU load.
-    # ref: ufactory_teleop uf_robot.py:53,206-218
-    use_traj_mode: bool = False
-    traj_max_velocity: float = 0.5   # rad/s, joint-space trajectory speed
-    traj_max_accel: float = 2.0      # rad/s², joint-space trajectory acceleration
     inner_control_dt: float = 1.0 / 250.0  # 250 Hz inner loop
     pid_kp: np.ndarray = field(
         default_factory=lambda: np.array([10.0, 10.0, 5.0, 5.0, 5.0, 5.0, 5.0])
@@ -184,11 +180,6 @@ class XArm7Config:
     # ref: ufactory_teleop uf_robot.py:137
     collision_sensitivity: int = 0
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "XArm7Config":
-        """Reconstruct from a serialized dict."""
-        kw = from_dict_helper(cls, d)
-        return cls(**kw)
 
 
 class XArm7(ConnectionStateMixin):
@@ -203,9 +194,8 @@ class XArm7(ConnectionStateMixin):
         self.last_cmd_time: float | None = None
         self.last_joint_limit_clipped = False
         self.last_delta_limited = False
-        self._cmd_cnt: int = 0  # soft-start frame counter (ref: ufactory_teleop)
+        self._cmd_count: int = 0  # soft-start frame counter (ref: ufactory_teleop)
         self._vel_ramp_start: float | None = None  # velocity soft-start timer (perf_counter)
-        self._velocity_scale: float = 1.0  # runtime velocity limit scaler (B2)
         self._pid_converged: bool = False  # threshold-based convergence flag (B3)
 
         # ── PID inner-loop state (velocity control mode) ──
@@ -360,9 +350,7 @@ class XArm7(ConnectionStateMixin):
             })
         return state
 
-    # ------------------------------------------------------------------
     # Action sending
-    # ------------------------------------------------------------------
 
     def send_action(self, action: np.ndarray) -> bool:
         """Send joint position command to the arm.
@@ -472,60 +460,7 @@ class XArm7(ConnectionStateMixin):
 
         return code == 0
 
-    # ------------------------------------------------------------------
-    # Mode 6 trajectory (ref: ufactory_teleop uf_robot.py:206-218)
-    # ------------------------------------------------------------------
-
-    def send_traj_joint(self, qpos_path: np.ndarray) -> bool:
-        """Send a joint-space trajectory via xArm Mode 6.
-
-        Mode 6 uses the controller firmware's built-in trajectory smoother,
-        offloading trajectory interpolation from host-side PID. Each waypoint
-        is sent via set_servo_angle with wait=False for streaming execution.
-
-        Args:
-            qpos_path: (N, 7) array of joint position waypoints in radians.
-
-        Returns:
-            True if all waypoints were accepted by the controller.
-        """
-        if self.arm is None:
-            return False
-
-        qpos_path = np.asarray(qpos_path, dtype=np.float64)
-        if qpos_path.ndim == 1:
-            qpos_path = qpos_path.reshape(1, 7)
-
-        # Switch to Mode 6 if needed (uses A3 safe transition)
-        if self.arm.mode != 6:
-            self._set_mode(6)
-
-        for waypoint in qpos_path:
-            code = self.arm.set_servo_angle(
-                angle=waypoint[:7].tolist(),
-                speed=self.config.traj_max_velocity,
-                mvacc=self.config.traj_max_accel,
-                is_radian=True,
-                wait=False,
-            )
-            if code != 0:
-                self.last_action_code = code
-                self.last_sdk_error_code = self.arm.error_code
-                self.error_state = True
-                self.last_error_message = (
-                    f"send_traj_joint failed: code={code}, "
-                    f"sdk_err={self.arm.error_code}"
-                )
-                return False
-
-        self.last_action_code = 0
-        self.last_qpos_cmd = qpos_path[-1, :7].copy()
-        self.last_cmd_time = time.time()
-        return True
-
-    # ------------------------------------------------------------------
-    # Cartesian pose queries (ref: ufactory_teleop uf_robot.py:189-194)
-    # ------------------------------------------------------------------
+    # Cartesian pose queries
 
     def get_position(self) -> np.ndarray:
         """Get Cartesian pose as (x, y, z, roll, pitch, yaw).
@@ -553,9 +488,7 @@ class XArm7(ConnectionStateMixin):
             return nan_array(6)
         return np.asarray(pos, dtype=np.float64)
 
-    # ------------------------------------------------------------------
     # Soft-start
-    # ------------------------------------------------------------------
 
     def reset_soft_start(self) -> None:
         """Reset soft-start ramp counter. Call on TELEOP entry.
@@ -564,31 +497,11 @@ class XArm7(ConnectionStateMixin):
         teleop motion, regardless of idle duration since connect().
         Resets both servo (position) and PID (velocity) soft-start.
         """
-        self._cmd_cnt = 0
+        self._cmd_count = 0
         self._pid_converged = False  # reset convergence state for new teleop session
         if not self.config.use_servo_control:
             self._vel_ramp_start = time.perf_counter()
 
-    # ------------------------------------------------------------------
-    # Runtime velocity scaling (ref: BunnyVisionPro teleop_bimanual_xarm7_ability.py:150-183)
-    # ------------------------------------------------------------------
-
-    def set_max_velocity(self, scale: float) -> None:
-        """Reduce effective velocity limit to *scale* (0.0–1.0).
-
-        Typical use: scale=0.3 during teleop initialization convergence,
-        then restore to 1.0 once the arm has caught up with the target.
-        Affects both PID inner-loop velocity clipping and servo step limiting.
-        """
-        self._velocity_scale = max(0.0, min(1.0, float(scale)))
-
-    def restore_max_velocity(self) -> None:
-        """Restore velocity limit to 100% (equivalent to set_max_velocity(1.0))."""
-        self._velocity_scale = 1.0
-
-    # ------------------------------------------------------------------
-    # PID inner loop (velocity control mode, ref: BunnyVisionPro)
-    # ------------------------------------------------------------------
 
     def _clip_arm_velocity(self, arm_qvel: np.ndarray) -> np.ndarray:
         """Bottleneck-scale joint velocities to per-joint limits.
@@ -616,17 +529,17 @@ class XArm7(ConnectionStateMixin):
             # time-based ramp (backward compatible).
             if self.config.pid_convergence_threshold_rad > 0 and not self._pid_converged:
                 # Not yet converged — keep reduced speed
-                effective_limit = self.config.pid_max_vel * 0.3 * self._velocity_scale
+                effective_limit = self.config.pid_max_vel * 0.3
             elif elapsed < duration:
                 ramp = elapsed / duration  # 0 → 1 linear
                 effective_limit = (
-                    self.config.pid_max_vel * (0.3 + 0.7 * ramp) * self._velocity_scale
+                    self.config.pid_max_vel * (0.3 + 0.7 * ramp)
                 )
             else:
                 self._vel_ramp_start = None  # ramp complete — hot path zero-overhead
-                effective_limit = self.config.pid_max_vel * self._velocity_scale
+                effective_limit = self.config.pid_max_vel
         else:
-            effective_limit = self.config.pid_max_vel * self._velocity_scale
+            effective_limit = self.config.pid_max_vel
 
         velocity_overshoot = np.abs(arm_qvel) / effective_limit
         max_overshoot = np.max(velocity_overshoot)
@@ -771,7 +684,7 @@ class XArm7(ConnectionStateMixin):
                 f"_set_mode({mode}) post-check failed: err_warn={err_warn}"
             )
 
-        self._cmd_cnt = 0  # reset servo soft-start counter on mode change
+        self._cmd_count = 0  # reset servo soft-start counter on mode change
         if not self.config.use_servo_control:
             self._vel_ramp_start = time.perf_counter()  # reset velocity soft-start
 
@@ -914,7 +827,7 @@ class XArm7(ConnectionStateMixin):
         # Soft-start linear ramp: soft_start_speed → per-joint max_qvel
         # Linear interpolation avoids the N× speed jump at the ramp boundary
         # that a hard if/else switch would produce.
-        ramp_progress = min(self._cmd_cnt / max(self.config.soft_start_frames, 1), 1.0)
+        ramp_progress = min(self._cmd_count / max(self.config.soft_start_frames, 1), 1.0)
         current_max_qvel = (
             (1.0 - ramp_progress) * self.config.soft_start_speed_rad_s
             + ramp_progress * self.config.max_qvel
@@ -944,18 +857,11 @@ class XArm7(ConnectionStateMixin):
         else:
             self.last_delta_limited = False
 
-        self._cmd_cnt += 1
+        self._cmd_count += 1
         return ref + delta
 
     @staticmethod
     def _array7(value) -> np.ndarray:
-        if value is None:
-            return nan_array(7)
-        arr = np.asarray(value, dtype=np.float64).reshape(-1)
-        if arr.size >= 7:
-            return arr[:7]
-        out = nan_array(7)
-        out[: arr.size] = arr
-        return out
+        return safe_resize(value, 7)
 
 
