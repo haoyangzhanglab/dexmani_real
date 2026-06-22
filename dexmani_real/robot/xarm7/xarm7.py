@@ -26,6 +26,7 @@ from xarm.wrapper import XArmAPI
 from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
@@ -141,10 +142,21 @@ class XArm7Config:
     # Equivalent to soft_start_frames: 0.4 s @ 50 Hz = 20 frames.
     # ref: BunnyVisionPro — reduces max_arm_velocity to 1/3 during init convergence.
     pid_soft_start_duration_s: float = 0.4
+    # Threshold-based convergence exit (ref: BunnyVisionPro teleop_bimanual_xarm7_ability.py:144-175).
+    # When > 0, the velocity soft-start ramp is held until ALL joint errors drop below
+    # this threshold (rad).  When <= 0, falls back to pure time-based ramp (backward compat).
+    pid_convergence_threshold_rad: float = np.deg2rad(2.0)
     # When use_servo_control=False, a 250Hz inner thread runs PID + velocity control
     # via xArm Mode 4 (vc_set_joint_velocity). When True (default), uses the
     # existing Mode 1 position servo (backward compatible).
     use_servo_control: bool = True
+    # Mode 6 (joint-space trajectory planning): when True, uses xArm controller
+    # firmware's built-in trajectory smoother instead of host-side PID.
+    # Offloads trajectory smoothing to the controller, reducing host CPU load.
+    # ref: ufactory_teleop uf_robot.py:53,206-218
+    use_traj_mode: bool = False
+    traj_max_velocity: float = 0.5   # rad/s, joint-space trajectory speed
+    traj_max_accel: float = 2.0      # rad/s², joint-space trajectory acceleration
     inner_control_dt: float = 1.0 / 250.0  # 250 Hz inner loop
     pid_kp: np.ndarray = field(
         default_factory=lambda: np.array([10.0, 10.0, 5.0, 5.0, 5.0, 5.0, 5.0])
@@ -167,7 +179,10 @@ class XArm7Config:
         default_factory=lambda: [0.0, 0.0, 80.0]
     )
     # collision_sensitivity: 0=disabled, 1=least sensitive, 5=most sensitive. Factory default is 3.
-    collision_sensitivity: int = 3
+    # NOTE: Set to 0 (disabled) for teleoperation — even with correct TCP load configured,
+    # rapid teleop motions can still trigger false C31. 0 is the most reliable choice.
+    # ref: ufactory_teleop uf_robot.py:137
+    collision_sensitivity: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> "XArm7Config":
@@ -190,6 +205,8 @@ class XArm7(ConnectionStateMixin):
         self.last_delta_limited = False
         self._cmd_cnt: int = 0  # soft-start frame counter (ref: ufactory_teleop)
         self._vel_ramp_start: float | None = None  # velocity soft-start timer (perf_counter)
+        self._velocity_scale: float = 1.0  # runtime velocity limit scaler (B2)
+        self._pid_converged: bool = False  # threshold-based convergence flag (B3)
 
         # ── PID inner-loop state (velocity control mode) ──
         self._arm_thread: threading.Thread | None = None
@@ -217,13 +234,9 @@ class XArm7(ConnectionStateMixin):
         self.arm.clean_warn()
         self.arm.motion_enable(True)
 
-        # Mode: 4 (velocity) when PID inner loop is enabled, 1 (servo) otherwise
-        mode = 4 if not self.config.use_servo_control else 1
-        self._set_mode(mode)
-
-        # Set TCP load and collision sensitivity — prevent false C31 triggering
-        # ref: xarm-sdk set_tcp_load / set_collision_sensitivity
-        self._configure_collision_params()
+        # Full init sequence (mode switch, collision params, verification)
+        # ref: ufactory_teleop uf_robot.py:139-187
+        self.robot_init()
 
         state = self.get_state()
         if np.all(np.isfinite(state["qpos"])):
@@ -277,16 +290,14 @@ class XArm7(ConnectionStateMixin):
     def clear_error(self) -> bool:
         if self.arm is None:
             return False
-        self.arm.clean_error()
-        self.arm.clean_warn()
-        self.arm.motion_enable(True)
-        mode = 4 if not self.config.use_servo_control else 1
-        self._set_mode(mode)
+        # Re-run full init sequence (clean, mode switch, collision params)
+        self.robot_init()
         # Reset PID to prevent error accumulation from pre-error state
         if not self.config.use_servo_control:
             self._arm_pid.reset()
             with self._arm_lock:
                 self._arm_pos_target = self._read_qpos()
+        # Clear error state AFTER robot_init (which may set it on init failure)
         self.error_state = False
         self.last_error_message = ""
         return self.arm.error_code == 0
@@ -330,6 +341,8 @@ class XArm7(ConnectionStateMixin):
                 "connected": self.arm.connected,
                 "error_code": self.arm.error_code,
                 "warn_code": self.arm.warn_code,
+                "cartesian_position": self.get_position(),
+                "cartesian_position_aa": self.get_position_aa(),
                 "cmd_num": self.arm.cmd_num,
                 "servo_codes": getattr(self.arm, "servo_codes", None),
                 "temperatures": self._array7(getattr(self.arm, "temperatures", None)),
@@ -367,6 +380,19 @@ class XArm7(ConnectionStateMixin):
         if self.arm is None:
             self.error_state = True
             self.last_error_message = "arm not connected"
+            return False
+
+        # ── SDK-level pre-checks (ref: ufactory_teleop uf_robot.py:197-200) ──
+        # send_action is called at 50 Hz — catching errors here reduces invalid
+        # commands before the slower is_error() polling in the control loop.
+        if not self.arm.connected:
+            self.error_state = True
+            self.last_error_message = "SDK reports arm not connected"
+            return False
+        if self.arm.error_code != 0:
+            self.last_sdk_error_code = self.arm.error_code
+            self.error_state = True
+            self.last_error_message = f"SDK error code: {self.arm.error_code}"
             return False
 
         target_qpos = np.asarray(action, dtype=np.float64).reshape(7)
@@ -447,6 +473,87 @@ class XArm7(ConnectionStateMixin):
         return code == 0
 
     # ------------------------------------------------------------------
+    # Mode 6 trajectory (ref: ufactory_teleop uf_robot.py:206-218)
+    # ------------------------------------------------------------------
+
+    def send_traj_joint(self, qpos_path: np.ndarray) -> bool:
+        """Send a joint-space trajectory via xArm Mode 6.
+
+        Mode 6 uses the controller firmware's built-in trajectory smoother,
+        offloading trajectory interpolation from host-side PID. Each waypoint
+        is sent via set_servo_angle with wait=False for streaming execution.
+
+        Args:
+            qpos_path: (N, 7) array of joint position waypoints in radians.
+
+        Returns:
+            True if all waypoints were accepted by the controller.
+        """
+        if self.arm is None:
+            return False
+
+        qpos_path = np.asarray(qpos_path, dtype=np.float64)
+        if qpos_path.ndim == 1:
+            qpos_path = qpos_path.reshape(1, 7)
+
+        # Switch to Mode 6 if needed (uses A3 safe transition)
+        if self.arm.mode != 6:
+            self._set_mode(6)
+
+        for waypoint in qpos_path:
+            code = self.arm.set_servo_angle(
+                angle=waypoint[:7].tolist(),
+                speed=self.config.traj_max_velocity,
+                mvacc=self.config.traj_max_accel,
+                is_radian=True,
+                wait=False,
+            )
+            if code != 0:
+                self.last_action_code = code
+                self.last_sdk_error_code = self.arm.error_code
+                self.error_state = True
+                self.last_error_message = (
+                    f"send_traj_joint failed: code={code}, "
+                    f"sdk_err={self.arm.error_code}"
+                )
+                return False
+
+        self.last_action_code = 0
+        self.last_qpos_cmd = qpos_path[-1, :7].copy()
+        self.last_cmd_time = time.time()
+        return True
+
+    # ------------------------------------------------------------------
+    # Cartesian pose queries (ref: ufactory_teleop uf_robot.py:189-194)
+    # ------------------------------------------------------------------
+
+    def get_position(self) -> np.ndarray:
+        """Get Cartesian pose as (x, y, z, roll, pitch, yaw).
+
+        Returns:
+            Array of shape (6,) in meters / radians, or NaN on failure.
+        """
+        if self.arm is None:
+            return nan_array(6)
+        code, pos = self.arm.get_position(is_radian=True)
+        if code != 0:
+            return nan_array(6)
+        return np.asarray(pos, dtype=np.float64)
+
+    def get_position_aa(self) -> np.ndarray:
+        """Get Cartesian pose as (x, y, z, rx, ry, rz) axis-angle.
+
+        Returns:
+            Array of shape (6,) in meters / radians, or NaN on failure.
+        """
+        if self.arm is None:
+            return nan_array(6)
+        code, pos = self.arm.get_position_aa(is_radian=True)
+        if code != 0:
+            return nan_array(6)
+        return np.asarray(pos, dtype=np.float64)
+
+    # ------------------------------------------------------------------
     # Soft-start
     # ------------------------------------------------------------------
 
@@ -458,8 +565,26 @@ class XArm7(ConnectionStateMixin):
         Resets both servo (position) and PID (velocity) soft-start.
         """
         self._cmd_cnt = 0
+        self._pid_converged = False  # reset convergence state for new teleop session
         if not self.config.use_servo_control:
             self._vel_ramp_start = time.perf_counter()
+
+    # ------------------------------------------------------------------
+    # Runtime velocity scaling (ref: BunnyVisionPro teleop_bimanual_xarm7_ability.py:150-183)
+    # ------------------------------------------------------------------
+
+    def set_max_velocity(self, scale: float) -> None:
+        """Reduce effective velocity limit to *scale* (0.0–1.0).
+
+        Typical use: scale=0.3 during teleop initialization convergence,
+        then restore to 1.0 once the arm has caught up with the target.
+        Affects both PID inner-loop velocity clipping and servo step limiting.
+        """
+        self._velocity_scale = max(0.0, min(1.0, float(scale)))
+
+    def restore_max_velocity(self) -> None:
+        """Restore velocity limit to 100% (equivalent to set_max_velocity(1.0))."""
+        self._velocity_scale = 1.0
 
     # ------------------------------------------------------------------
     # PID inner loop (velocity control mode, ref: BunnyVisionPro)
@@ -484,14 +609,24 @@ class XArm7(ConnectionStateMixin):
         if self._vel_ramp_start is not None:
             elapsed = time.perf_counter() - self._vel_ramp_start
             duration = self.config.pid_soft_start_duration_s
-            if elapsed < duration:
+
+            # Threshold-based convergence (B3): hold at 30% until ALL joint
+            # errors drop below pid_convergence_threshold_rad, THEN ramp.
+            # When pid_convergence_threshold_rad <= 0, falls back to pure
+            # time-based ramp (backward compatible).
+            if self.config.pid_convergence_threshold_rad > 0 and not self._pid_converged:
+                # Not yet converged — keep reduced speed
+                effective_limit = self.config.pid_max_vel * 0.3 * self._velocity_scale
+            elif elapsed < duration:
                 ramp = elapsed / duration  # 0 → 1 linear
-                effective_limit = self.config.pid_max_vel * (0.3 + 0.7 * ramp)
+                effective_limit = (
+                    self.config.pid_max_vel * (0.3 + 0.7 * ramp) * self._velocity_scale
+                )
             else:
                 self._vel_ramp_start = None  # ramp complete — hot path zero-overhead
-                effective_limit = self.config.pid_max_vel
+                effective_limit = self.config.pid_max_vel * self._velocity_scale
         else:
-            effective_limit = self.config.pid_max_vel
+            effective_limit = self.config.pid_max_vel * self._velocity_scale
 
         velocity_overshoot = np.abs(arm_qvel) / effective_limit
         max_overshoot = np.max(velocity_overshoot)
@@ -518,10 +653,11 @@ class XArm7(ConnectionStateMixin):
         the controller's is_error() check catches them on the next cycle.
         """
         dt = float(self.config.inner_control_dt)
+        rate_limiter = RateLimiter(1.0 / dt)
         logger.info("PID inner loop running at %.0f Hz", 1.0 / dt)
 
         while not self._arm_should_stop.is_set():
-            time.sleep(dt)
+            rate_limiter.wait()
 
             if self.arm is None or not self.connected_flag:
                 continue
@@ -555,6 +691,16 @@ class XArm7(ConnectionStateMixin):
 
             # Joint-space position error → PID → velocity
             error = target[:7] - arm_current_qpos[:7]
+
+            # Threshold-based convergence check (B3)
+            if self.config.pid_convergence_threshold_rad > 0 and not self._pid_converged:
+                if np.all(np.abs(error) < self.config.pid_convergence_threshold_rad):
+                    self._pid_converged = True
+                    logger.info(
+                        "PID converged: all joint errors < %.3f rad",
+                        self.config.pid_convergence_threshold_rad,
+                    )
+
             qvel = self._arm_pid.control(error, dt)
             safe_qvel = self._clip_arm_velocity(qvel)
 
@@ -595,11 +741,77 @@ class XArm7(ConnectionStateMixin):
             logger.info("PID inner thread stopped")
 
     def _set_mode(self, mode: int):
+        """Transition arm to target control mode with safety guards.
+
+        Uses Mode 0 (idle) as an intermediate state to prevent the xArm
+        controller's internal state machine from entering undefined states
+        during direct mode switches.
+
+        Sequence: idle → target → verify (ref: BunnyVisionPro xarm7_ability.py:163-167,
+        ufactory_teleop uf_robot.py:124-125,210-216).
+        """
+        # Step 1: enter idle mode for safe state machine transition
+        self.arm.set_mode(0)
+        self.arm.set_state(0)
+        time.sleep(0.05)
+
+        # Step 2: switch to target mode with double set_state for reliability
         self.arm.set_mode(mode)
         self.arm.set_state(0)
+        time.sleep(0.05)
+        self.arm.set_state(0)
+
+        # Step 3: verify no latent errors after mode switch
+        # xArm controller can silently fail — mode switch reports success but
+        # internal error code is non-zero (ref: ufactory_teleop uf_robot.py:147-149).
+        _, err_warn = self.arm.get_err_warn_code()
+        if err_warn[0] != 0:
+            self.error_state = True
+            self.last_error_message = (
+                f"_set_mode({mode}) post-check failed: err_warn={err_warn}"
+            )
+
         self._cmd_cnt = 0  # reset servo soft-start counter on mode change
         if not self.config.use_servo_control:
             self._vel_ramp_start = time.perf_counter()  # reset velocity soft-start
+
+    def robot_init(self) -> None:
+        """Full initialization sequence for the xArm7 controller.
+
+        Encapsulates the complete init ritual required after connect() and
+        after C31/C32 error recovery.  Safe to call at any time while connected.
+
+        Sequence (ref: ufactory_teleop uf_robot.py:139-187):
+          1. clean_error + clean_warn
+          2. motion_enable(True)
+          3. _set_mode() with Mode-0 transition + error verification (A2/A3)
+          4. set_collision_sensitivity(0)
+          5. set_tcp_load(...)
+          6. get_err_warn_code() final verification
+          7. reset soft-start
+        """
+        if self.arm is None:
+            return
+
+        self.arm.clean_error()
+        self.arm.clean_warn()
+        self.arm.motion_enable(True)
+
+        mode = 4 if not self.config.use_servo_control else 1
+        self._set_mode(mode)
+
+        self._configure_collision_params()
+
+        # Final error/warning verification (ref: ufactory_teleop uf_robot.py:147-149)
+        _, err_warn = self.arm.get_err_warn_code()
+        if err_warn[0] != 0:
+            self.error_state = True
+            self.last_error_message = (
+                f"robot_init post-check failed: err_warn={err_warn}"
+            )
+
+        # Reset soft-start so the next teleop motion gets the full ramp
+        self.reset_soft_start()
 
     def _configure_collision_params(self) -> None:
         """Set TCP load and collision sensitivity to prevent false C31 triggering.

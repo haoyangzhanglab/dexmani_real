@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,6 +13,7 @@ import numpy as np
 from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.serialization import from_dict_helper
 from xhand_controller import xhand_control as xh
 
@@ -35,6 +37,73 @@ JOINT_NAMES = [
 
 SENSOR_IDS = [0x11, 0x12, 0x13, 0x14, 0x15]
 SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
+
+# Known non-critical sensor error patterns (ref: LeFranX xhand.py:230-241).
+# These are hardware-level warnings that do not affect joint position reading
+# or motion control — filtering them prevents spurious error_state triggers
+# during normal teleoperation.
+_KNOWN_SENSOR_ERROR_PATTERNS = [
+    "sensor fails to read the combined force",
+    "sensor fails to read the distributed force",
+    "sensor fails to read temperature",
+    "communication data crc error",
+    "this hardware version does not support force control mode",
+]
+
+# ── F2: Predefined grasp presets (ref: DexUMI constants.py:18-21) ──
+# Each preset is a dict with "qpos" (12,) array in radians and "description".
+GRASP_PRESETS: dict[str, dict] = {
+    "home": {
+        "qpos": np.deg2rad(np.array([
+            0.0, 45.0, 0.0,   # thumb
+            0.0, 0.0, 0.0,    # index
+            0.0, 0.0,          # middle
+            0.0, 0.0,          # ring
+            0.0, 0.0,          # little
+        ], dtype=np.float64)),
+        "description": "Open hand, all fingers extended",
+    },
+    "open": {
+        "qpos": np.deg2rad(np.array([
+            0.0, 45.0, 0.0,   # thumb
+            0.0, 0.0, 5.0,    # index
+            0.0, 5.0,          # middle
+            0.0, 5.0,          # ring
+            0.0, 5.0,          # little
+        ], dtype=np.float64)),
+        "description": "Wide-open hand",
+    },
+    "fist": {
+        "qpos": np.deg2rad(np.array([
+            50.0, 90.0, 90.0,   # thumb
+            10.0, 110.0, 110.0, # index
+            110.0, 110.0,        # middle
+            110.0, 110.0,        # ring
+            110.0, 110.0,        # little
+        ], dtype=np.float64)),
+        "description": "Full fist closure",
+    },
+    "pinch": {
+        "qpos": np.deg2rad(np.array([
+            30.0, 60.0, 45.0,   # thumb
+            5.0, 50.0, 60.0,    # index
+            0.0, 5.0,            # middle (open)
+            0.0, 5.0,            # ring (open)
+            0.0, 5.0,            # little (open)
+        ], dtype=np.float64)),
+        "description": "Thumb-index pinch grip",
+    },
+    "tripod": {
+        "qpos": np.deg2rad(np.array([
+            35.0, 65.0, 60.0,    # thumb
+            5.0, 50.0, 60.0,     # index
+            50.0, 60.0,           # middle
+            0.0, 5.0,             # ring (open)
+            0.0, 5.0,             # little (open)
+        ], dtype=np.float64)),
+        "description": "Thumb-index-middle tripod grip",
+    },
+}
 
 
 @dataclass
@@ -97,13 +166,46 @@ class XHandConfig:
     kp: int = 100
     ki: int = 0
     kd: int = 1
-    tor_max: int = 300
+    # Per-joint gain overrides (ref: DexUMI hand_api_cls.py:317-319).
+    # When set (shape (12,)), individual joint gains replace the scalar kp/ki/kd.
+    # Distal joints (especially little finger joint 11) benefit from higher gains
+    # to compensate for longer linkage and higher mechanical load.
+    kp_per_joint: np.ndarray | None = None  # (12,) per-joint kp overrides
+    ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
+    kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
+    tor_max: int = 400  # ref: LeFranX xhand_config.py:25, DexUMI hand_api_cls.py:289 — 400mA torque-current limit
     mode: int = 3
 
     use_delta_limit: bool = False
     clip_joint_limit: bool = True
 
     tactile_scale: float = 0.1
+
+    # Known non-critical sensor error filtering (ref: LeFranX xhand.py:230-241).
+    # When True, errors matching known patterns (sensor read failures, CRC errors,
+    # unsupported-force-mode warnings) are logged but do NOT trigger error_state.
+    filter_known_sensor_errors: bool = True
+
+    # ── E1: Background state reader (ref: DexUMI hand_api_cls.py:228-275) ──
+    # When True, a daemon thread continuously reads hardware state at state_reader_hz
+    # and caches it. get_state() returns the cached value, decoupling read timing
+    # from consumption and guaranteeing consistent sample rate.
+    use_background_state_reader: bool = False
+    state_reader_hz: float = 100.0
+
+    # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
+    # 0.0 = disabled (default, backward compatible). 0.3 = LeFranX recommended.
+    # Exponential Moving Average filters high-frequency jitter from position commands,
+    # producing smoother finger motion.
+    ema_alpha: float = 0.0
+
+    # ── F1: Tactile contact detection ──
+    # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
+    tactile_contact_threshold: float = 0.5
+
+    # ── F3: Trajectory interpolation ──
+    # Minimum duration for trajectory execution; actual duration is max(min_duration, computed).
+    traj_min_duration_s: float = 0.5
 
     @classmethod
     def from_dict(cls, d: dict) -> "XHandConfig":
@@ -130,7 +232,17 @@ class XHand(ConnectionStateMixin):
         self.last_jointboard_err = np.zeros(12, dtype=np.int32)
         self.last_tipboard_err = np.zeros(12, dtype=np.int32)
         self.last_hand_ids: list[int] = []
+        self.last_sensor_error_filtered: str | None = None  # D1: last known-non-critical error
         self.cached_comm_type = self._resolve_comm_type()
+
+        # ── E1: Background state reader ──
+        self._state_thread: threading.Thread | None = None
+        self._state_stop: threading.Event = threading.Event()
+        self._state_lock: threading.Lock = threading.Lock()
+        self._latest_state: dict[str, Any] | None = None
+
+        # ── E2: EMA filtering ──
+        self._ema_qpos: np.ndarray | None = None
 
     # ── Connect lifecycle ──
 
@@ -157,6 +269,11 @@ class XHand(ConnectionStateMixin):
         self._init_hand_state()
 
         self.last_cmd_time = time.time()
+
+        # E1: Start background state reader if configured
+        if self.config.use_background_state_reader:
+            self._start_state_reader()
+
         return True
 
     def _retry_open_device(self, comm_type: str) -> bool:
@@ -244,6 +361,7 @@ class XHand(ConnectionStateMixin):
             logger.info("Using home_qpos as initial qpos: %s", self.last_qpos_cmd)
 
     def disconnect(self):
+        self._stop_state_reader()  # E1
         if self.control is not None:
             self.control.close_device()
         self.connected_flag = False
@@ -380,6 +498,23 @@ class XHand(ConnectionStateMixin):
         full: bool = False,
         force_update: bool | None = None,
     ) -> dict[str, Any]:
+        # ── E1: Return cached state when background reader is active ──
+        if self.config.use_background_state_reader and self._state_thread is not None:
+            with self._state_lock:
+                cached = self._latest_state
+            if cached is not None and not force_update:
+                if not full:
+                    return {
+                        "qpos": cached.get("qpos", nan_array(12)).copy(),
+                        "current": cached.get("current", nan_array(12)).copy(),
+                        "timestamp": cached.get("timestamp", time.time()),
+                    }
+                state = {k: v.copy() if hasattr(v, "copy") else v for k, v in cached.items()}
+                # F1: Add tactile contact detection to full state
+                if full:
+                    state["tactile_contact"] = self.detect_contact()
+                return state
+
         if force_update is None:
             force_update = self.config.force_update_state
 
@@ -387,7 +522,6 @@ class XHand(ConnectionStateMixin):
 
         if not self.error_ok(err) or hand_state is None:
             self._record_error(err)
-            self.error_state = True
             state = {
                 "qpos": nan_array(12),
                 "current": nan_array(12),
@@ -410,6 +544,14 @@ class XHand(ConnectionStateMixin):
         qpos_after_limit = self._limit_joint_range(target_qpos)
         qpos_cmd = self._limit_joint_step(qpos_after_limit)
 
+        # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
+        if self.config.ema_alpha > 0 and self._ema_qpos is not None:
+            qpos_cmd = (
+                (1.0 - self.config.ema_alpha) * self._ema_qpos
+                + self.config.ema_alpha * qpos_cmd
+            )
+        self._ema_qpos = qpos_cmd.copy()
+
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)
         self.last_action_code = self.error_code(err)
@@ -420,7 +562,6 @@ class XHand(ConnectionStateMixin):
             return True
 
         self._record_error(err)
-        self.error_state = True
         return False
 
     def reset_sensor(self, sensor_id: int | None = None) -> bool:
@@ -433,6 +574,177 @@ class XHand(ConnectionStateMixin):
             if not self.error_ok(err):
                 self._record_error(err)
                 ok = False
+        return ok
+
+    # ------------------------------------------------------------------
+    # E1: Background state reader (ref: DexUMI hand_api_cls.py:228-275)
+    # ------------------------------------------------------------------
+
+    def _start_state_reader(self) -> None:
+        """Start the daemon thread that reads hardware state at state_reader_hz."""
+        if self._state_thread is not None and self._state_thread.is_alive():
+            return
+        self._state_stop.clear()
+        self._state_thread = threading.Thread(
+            target=self._read_state_loop,
+            name="xhand_state_reader",
+            daemon=True,
+        )
+        self._state_thread.start()
+        logger.info(
+            "XHand state reader started at %.0f Hz", self.config.state_reader_hz,
+        )
+
+    def _stop_state_reader(self) -> None:
+        """Signal the state reader thread to stop and wait for exit."""
+        if self._state_thread is None or not self._state_thread.is_alive():
+            return
+        self._state_stop.set()
+        self._state_thread.join(timeout=2.0)
+        if self._state_thread.is_alive():
+            logger.warning("XHand state reader thread did not exit within timeout")
+        else:
+            logger.info("XHand state reader stopped")
+
+    def _read_state_loop(self) -> None:
+        """Daemon loop: read hardware state at state_reader_hz, cache latest.
+
+        Uses RateLimiter (E3) for precise frame timing instead of plain sleep.
+        """
+        rate_limiter = RateLimiter(self.config.state_reader_hz)
+        while not self._state_stop.is_set():
+            rate_limiter.wait()
+
+            # Read raw state from hardware (force_update=True to bypass SDK cache)
+            err, hand_state = self.read_raw_state(force_update=True)
+            if not self.error_ok(err) or hand_state is None:
+                self._record_error(err)
+                continue
+
+            state = self.parse_state(hand_state, full=True)
+            with self._state_lock:
+                self._latest_state = state
+
+    # ------------------------------------------------------------------
+    # F1: Tactile contact detection (ref: DexUMI eval_xhand.py:40-57)
+    # ------------------------------------------------------------------
+
+    def detect_contact(self, threshold: float | None = None) -> np.ndarray:
+        """Detect per-finger contact from tactile force.
+
+        Uses the L2 norm of the combined force vector (fx, fy, fz) on each
+        fingertip sensor, compared against tactile_contact_threshold.
+
+        Args:
+            threshold: Override for tactile_contact_threshold (Newtons).
+
+        Returns:
+            bool array of shape (5,), True where L2-norm > threshold.
+        """
+        thresh = threshold if threshold is not None else self.config.tactile_contact_threshold
+        state = self.get_state(full=True)
+        force_sum = np.asarray(state.get("tactile_force_sum", np.zeros((5, 3))))
+        norm = np.linalg.norm(force_sum, axis=1)  # (5,) L2 per finger
+        return norm > thresh
+
+    def get_finger_contacts(self) -> dict[str, bool]:
+        """Get per-finger contact status as a named dict.
+
+        Returns:
+            Dict mapping sensor name → contact boolean.
+        """
+        contacts = self.detect_contact()
+        return {SENSOR_NAMES[i]: bool(contacts[i]) for i in range(5)}
+
+    # ------------------------------------------------------------------
+    # F2: Predefined grasp presets (ref: DexUMI constants.py:18-21)
+    # ------------------------------------------------------------------
+
+    def move_to_preset(self, name: str, duration_s: float = 1.0) -> bool:
+        """Move hand to a predefined grasp preset.
+
+        Args:
+            name: Preset name — one of "home", "open", "fist", "pinch", "tripod".
+            duration_s: Time to execute the motion.
+
+        Returns:
+            True if preset was found and command sent.
+        """
+        name = name.lower().strip()
+        if name not in GRASP_PRESETS:
+            logger.warning("Unknown preset '%s'. Available: %s", name, self.list_presets())
+            return False
+
+        target = GRASP_PRESETS[name]["qpos"].copy()
+        return self.send_trajectory(target.reshape(1, 12), duration_s)
+
+    @staticmethod
+    def list_presets() -> list[str]:
+        """Return available preset names."""
+        return [
+            f"{k}: {GRASP_PRESETS[k]['description']}"
+            for k in GRASP_PRESETS
+        ]
+
+    # ------------------------------------------------------------------
+    # F3: Trajectory interpolation with velocity constraints
+    #     (ref: DexUMI motor_trajectory_interpolator.py:1-217)
+    # ------------------------------------------------------------------
+
+    def send_trajectory(self, waypoints: np.ndarray, duration_s: float) -> bool:
+        """Execute a joint-space trajectory with linear interpolation.
+
+        Waypoints are interpolated at the control rate (1/dt). If the
+        computed speed exceeds max_qvel, duration is automatically extended.
+
+        Args:
+            waypoints: (N, 12) array of joint positions in radians.
+            duration_s: Desired total duration; clamped to traj_min_duration_s.
+
+        Returns:
+            True if all waypoints were reached.
+        """
+        waypoints = np.asarray(waypoints, dtype=np.float64)
+        if waypoints.ndim == 1:
+            waypoints = waypoints.reshape(1, 12)
+
+        duration_s = max(duration_s, self.config.traj_min_duration_s)
+        n_waypoints = waypoints.shape[0]
+
+        if n_waypoints == 1:
+            # Single waypoint — send directly
+            return self.send_action(waypoints[0])
+
+        # Compute required velocity and extend duration if needed
+        segment_dist = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+        total_dist = np.sum(segment_dist)
+        required_vel = total_dist / duration_s
+        max_allowed_vel = np.min(self.config.max_qvel)
+        if required_vel > max_allowed_vel:
+            duration_s = total_dist / max_allowed_vel
+            logger.info(
+                "Trajectory speed limited: extended duration to %.2fs (max_qvel=%.2f)",
+                duration_s, max_allowed_vel,
+            )
+
+        # Linear interpolation
+        n_steps = max(2, int(duration_s / self.config.dt))
+        t = np.linspace(0, 1, n_steps)
+        segment_indices = np.linspace(0, n_waypoints - 1, n_steps)
+
+        ok = True
+        for i in range(n_steps):
+            idx_float = segment_indices[i]
+            idx_lo = int(np.floor(idx_float))
+            idx_hi = min(idx_lo + 1, n_waypoints - 1)
+            frac = idx_float - idx_lo
+            interp_qpos = (1 - frac) * waypoints[idx_lo] + frac * waypoints[idx_hi]
+            if not self.send_action(interp_qpos):
+                ok = False
+                break
+            if i < n_steps - 1:
+                time.sleep(self.config.dt)
+
         return ok
 
     def make_command(
@@ -454,9 +766,11 @@ class XHand(ConnectionStateMixin):
         for i in range(12):
             cmd = command.finger_command[i]
             cmd.id = i
-            cmd.kp = int(kp)
-            cmd.ki = int(ki)
-            cmd.kd = int(kd)
+            # Per-joint gain overrides (D2) — when provided, individual joint
+            # gains replace the scalar defaults (ref: DexUMI hand_api_cls.py:317-319).
+            cmd.kp = int(self.config.kp_per_joint[i]) if self.config.kp_per_joint is not None else int(kp)
+            cmd.ki = int(self.config.ki_per_joint[i]) if self.config.ki_per_joint is not None else int(ki)
+            cmd.kd = int(self.config.kd_per_joint[i]) if self.config.kd_per_joint is not None else int(kd)
             cmd.position = float(qpos[i])
             cmd.tor_max = int(tor_max)
             cmd.mode = int(mode)
@@ -542,6 +856,7 @@ class XHand(ConnectionStateMixin):
                     "device_name": self.device_name,
                     "joint_names": JOINT_NAMES,
                     "sensor_names": SENSOR_NAMES,
+                    "tactile_contact": self.detect_contact(),  # F1
                 }
             )
         return state
@@ -714,7 +1029,21 @@ class XHand(ConnectionStateMixin):
             self.last_error_message = "empty error object"
             return
 
-        self.last_error_code = self.error_code(err)
-        self.last_error_message = str(getattr(err, "error_message", ""))
+        code = self.error_code(err)
+        msg = str(getattr(err, "error_message", ""))
+        self.last_error_code = code
+        self.last_error_message = msg
+
+        # D1: Filter known non-critical sensor errors (ref: LeFranX xhand.py:230-241).
+        # These hardware-level warnings do not affect position reading or motion
+        # control — log them but don't trigger error_state.
+        if self.config.filter_known_sensor_errors and code != 0 and msg:
+            msg_lower = msg.lower()
+            for pattern in _KNOWN_SENSOR_ERROR_PATTERNS:
+                if pattern in msg_lower:
+                    self.last_sensor_error_filtered = msg
+                    return  # do NOT set error_state for known non-critical errors
+
+        self.error_state = True
 
 

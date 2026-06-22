@@ -96,16 +96,15 @@ class TeleopIKSolver:
                 )
 
         # ── All strategies failed → hold ──
-        parts = []
-        if diff_failed:
-            parts.append(f"Diff IK: {diff_reason}")
-        if position_report:
-            parts.append(str(position_report.get("failure_reason", "no position IK candidate")))
-        reason = "\n".join(parts) if parts else "All IK strategies failed"
-
+        diagnostic = self._build_ik_diagnostic(
+            diff_failed=diff_failed,
+            diff_reason=diff_reason if diff_failed else "",
+            position_report=position_report,
+        )
         return IKResult(
-            success=False, qpos=previous_qpos_cmd.copy(), reason=reason,
-            report={"held": True}, held=True,
+            success=False, qpos=previous_qpos_cmd.copy(),
+            reason=diagnostic["summary"],
+            report={"held": True, "diagnostic": diagnostic}, held=True,
         )
 
     # ------------------------------------------------------------------
@@ -126,7 +125,7 @@ class TeleopIKSolver:
         """
         target_pose_base = self.kin.world_to_base_pose(target_eef_pose_world)
         jump_limit = np.deg2rad(self.ik_mgr.profile_array(profile.max_ik_jump_deg, "max_ik_jump_deg"))
-        _HW_BRANCH_CHECK_RAD = np.deg2rad(15.0)
+        fast_accept_rad = profile.position_ik_fast_accept_rad
 
         seeds: list[tuple[str, np.ndarray, int]] = [
             ("prev_cmd", previous_qpos_cmd.copy(), 3),
@@ -166,14 +165,128 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:ok")
 
             # Fast path: prev_cmd seed, close to hardware → accept immediately
-            if seed_name == "prev_cmd" and hw_dist <= _HW_BRANCH_CHECK_RAD:
+            # (ref: ssik seed_tolerance hard boundary)
+            if seed_name == "prev_cmd" and hw_dist <= fast_accept_rad:
                 return qpos, {"teleop_ik_method": "position_ik", "seed": seed_name, "attempts": attempts}
+
+            # Early exit: any seed with excellent quality → stop searching
+            # (ref: ssik max_solutions=1 — first good solution wins)
+            quality_pos = pos_err < profile.max_pose_error_pos_m * 0.3
+            quality_rot = rot_err < profile.max_pose_error_rot_rad * 0.3
+            quality_delta = hw_dist < fast_accept_rad * 0.5
+            if quality_pos and quality_rot and quality_delta:
+                return qpos, {"teleop_ik_method": "position_ik", "seed": seed_name,
+                              "attempts": attempts, "early_exit": "excellent_quality"}
 
         if best is not None:
             qpos, seed_name, _ = best
             return qpos, {"teleop_ik_method": "position_ik", "seed": seed_name, "fallback": True, "attempts": attempts}
 
         return None, {"teleop_ik_method": "position_ik", "failure_reason": f"all failed: {attempts}"}
+
+    # ------------------------------------------------------------------
+    # Structured IK diagnostics (ref: ssik explain=True pattern)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_ik_diagnostic(
+        diff_failed: bool,
+        diff_reason: str,
+        position_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build structured IK failure diagnostic categorising why each tier failed.
+
+        Categories map to actionable root causes:
+          - ``singular``: near-singularity, damping exhausted → adjust target or
+            reduce pose step
+          - ``pose_error``: converged but FK residual too large → target may be
+            out of workspace
+          - ``self_collision``: solution would cause arm self-collision → adjust
+            target or add collision margin
+          - ``unreachable``: MPlib IK returned no solution → target truly out of
+            reachable workspace
+          - ``filtered``: MPlib found solutions but all were filtered (limits /
+            delta / pose_error / collision) → relax filter thresholds or adjust seed
+        """
+        diagnostic: dict[str, Any] = {
+            "diff_ik": {},
+            "position_ik": {},
+            "classification": "unknown",
+            "summary": "",
+        }
+
+        # ── Categorise diff IK failure ──
+        if diff_failed:
+            reason_lower = diff_reason.lower()
+            if "singular" in reason_lower:
+                category = "singular"
+            elif "self-collision" in reason_lower:
+                category = "self_collision"
+            elif "pose_error" in reason_lower:
+                category = "pose_error"
+            else:
+                category = "other"
+            diagnostic["diff_ik"] = {
+                "failed": True,
+                "category": category,
+                "detail": diff_reason,
+            }
+        else:
+            diagnostic["diff_ik"] = {"failed": False}
+
+        # ── Categorise position IK failure ──
+        if position_report:
+            pos_diag: dict[str, Any] = {"failed": True}
+            failure_reason = str(position_report.get("failure_reason", ""))
+            pos_diag["detail"] = failure_reason
+
+            # Classify based on the failure reason string
+            if "all failed" in failure_reason:
+                # Parse attempt strings to categorise individual failures
+                attempts_str = str(position_report.get("attempts", failure_reason))
+                if "mplib_failed" in attempts_str and "ok" not in attempts_str:
+                    pos_diag["category"] = "unreachable"
+                elif "ok" in attempts_str:
+                    pos_diag["category"] = "filtered"
+                else:
+                    pos_diag["category"] = "unreachable"
+            elif "mplib_failed" in failure_reason:
+                pos_diag["category"] = "unreachable"
+            elif "pose_err" in failure_reason:
+                pos_diag["category"] = "pose_error"
+            elif "jump" in failure_reason:
+                pos_diag["category"] = "delta"
+            else:
+                pos_diag["category"] = "other"
+            diagnostic["position_ik"] = pos_diag
+        else:
+            diagnostic["position_ik"] = {"failed": False, "disabled": True}
+
+        # ── Overall classification ──
+        diff_cat = diagnostic["diff_ik"].get("category", "")
+        pos_cat = diagnostic["position_ik"].get("category", "")
+
+        if diff_failed and not position_report.get("disabled"):
+            if pos_cat == "unreachable":
+                diagnostic["classification"] = "unreachable"
+            elif pos_cat == "filtered":
+                diagnostic["classification"] = "all_filtered"
+            else:
+                diagnostic["classification"] = "all_methods_exhausted"
+        elif diff_failed and position_report.get("disabled"):
+            diagnostic["classification"] = f"diff_ik_failed:{diff_cat}"
+        else:
+            diagnostic["classification"] = "held"
+
+        # ── Human-readable summary ──
+        parts: list[str] = []
+        if diff_failed:
+            parts.append(f"Diff IK [{diagnostic['diff_ik'].get('category', '?')}]: {diff_reason}")
+        if position_report and not position_report.get("disabled"):
+            parts.append(f"Position IK [{pos_cat}]: {position_report.get('failure_reason', '?')}")
+        diagnostic["summary"] = " | ".join(parts) if parts else "All IK strategies failed"
+
+        return diagnostic
 
     # ------------------------------------------------------------------
     # Command assembly

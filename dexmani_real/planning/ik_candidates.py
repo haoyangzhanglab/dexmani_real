@@ -13,6 +13,27 @@ from .types import PlanningProfile, Pose
 from .pose_utils import ensure_qpos
 
 
+# Map freeform reject reason strings → structured diagnostic categories.
+# Used in collect_ik_candidates() to produce reject_by_category summary.
+# Ref: ssik explain=True pattern — distinguishes unreachable vs all-filtered.
+_REJECT_CATEGORY_MAP: dict[str, str] = {
+    "mplib_ik_failed": "unreachable",
+    "IK candidate outside planning limits.": "limits",
+    "IK candidate exceeds max_ik_delta_deg.": "delta",
+    "IK candidate pose error exceeds threshold.": "pose_error",
+    "IK candidate in self-collision.": "collision",
+}
+
+
+def _categorize_rejects(reject_counts: dict[str, int]) -> dict[str, int]:
+    """Aggregate freeform reject reason counts into diagnostic categories."""
+    categorized: dict[str, int] = {}
+    for reason, count in reject_counts.items():
+        category = _REJECT_CATEGORY_MAP.get(reason, "other")
+        categorized[category] = categorized.get(category, 0) + count
+    return categorized
+
+
 class IKCandidateManager:
     """IK candidate generation, filtering, scoring, and joint canonicalization."""
 
@@ -95,12 +116,14 @@ class IKCandidateManager:
                 reject_examples.append(self.compact_reject_report(seed_index, report))
 
         candidates.sort(key=lambda item: item[1]["ik_score"])
+        reject_by_category = _categorize_rejects(reject_counts)
         summary: dict[str, Any] = {
             "num_seeds": len(seeds),
             "raw_ik_success_count": raw_success_count,
             "valid_candidate_count": len(candidates),
             "returned_candidate_count": min(len(candidates), profile.num_ik_candidates),
             "reject_counts": reject_counts,
+            "reject_by_category": reject_by_category,
             "random_seed": profile.random_seed,
         }
         if reject_examples:

@@ -123,6 +123,12 @@ class TeleopProfile:
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
 
+    # Fast-accept threshold for position IK fallback (ref: ssik seed_tolerance).
+    # A candidate is accepted immediately without trying additional seeds when
+    # max single-joint delta from current hardware position is below this value.
+    # 15° default: accept quickly if the solution is close to where we already are.
+    position_ik_fast_accept_rad: float = np.deg2rad(15.0)
+
     use_position_ik: bool = True
     use_differential_ik_fallback: bool = True
     differential_ik_gain: float = 1.0       # full tracking, bottleneck limit handles speed
