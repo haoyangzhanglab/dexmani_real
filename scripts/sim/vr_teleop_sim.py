@@ -18,22 +18,25 @@
     python scripts/sim/vr_teleop_sim.py --dummy --headless --data-dir ./my_episodes
 
 键位:
-    B   - Begin:     开始遥操作（重置 mapper，开始录制 episode）
-    R   - Return:    规划路径回 home（保持在遥操作状态）
-    C   - Calibrate: 重新标定 arm mapper——抵消 VR↔机器人间的累积漂移。
-                     这是遥操作中最常用的辅助功能：当手腕与 EEF 之间出现
-                     偏移时，按 C 重新锚定参考系，无需退出遥操作状态。
-                     在 IDLE 和 TELEOP_RECORDING 下均可用。
-    Q   - Quit:      结束遥操作 → 提示保存/丢弃
+    B   - Begin:  开始遥操作（重置 mapper，开始录制 episode）
+    R   - Return: 规划路径回 home（保持在当前状态）
+    C   - Pause:  暂停/恢复遥操作。暂停时冻结 EEF、暂停录制，
+                  恢复时自动重新标定 mapper（抵消暂停期间的漂移）。
+                  这是遥操作中最实用的功能——接电话、思考策略、
+                  调整坐姿时按 C 暂停，回来后按 C 继续。
+    Q   - Quit:   结束遥操作 → 提示保存/丢弃
 
-    S   - Save:      保存录制的 episode 到 HDF5（仅在 SAVE_PROMPT 下）
-    N   - No save:   丢弃当前 episode（仅在 SAVE_PROMPT 下）
+    S   - Save:   保存录制的 episode 到 HDF5（仅在 SAVE_PROMPT 下）
+    N   - No save: 丢弃当前 episode（仅在 SAVE_PROMPT 下）
 
 状态机:
     IDLE ──B──→ TELEOP_RECORDING  (start_episode, reset_mapper)
     TELEOP_RECORDING ──R──→ return_home (保持在 TELEOP_RECORDING)
-    TELEOP_RECORDING ──C──→ reset_mapper (重新锚定，抵消漂移)
+    TELEOP_RECORDING ──C──→ PAUSED (冻结 EEF，暂停录制)
+    PAUSED ──C──→ TELEOP_RECORDING (自动 re-anchor mapper，恢复录制)
+    PAUSED ──R──→ return_home (保持在 PAUSED)
     TELEOP_RECORDING ──Q──→ SAVE_PROMPT (stop_episode)
+    PAUSED ──Q──→ SAVE_PROMPT (stop_episode)
     SAVE_PROMPT ──S──→ IDLE (save episode to disk)
     SAVE_PROMPT ──N──→ IDLE (discard episode)
 
@@ -810,7 +813,7 @@ def main() -> None:
     # else: headless mode, camera auto-disabled (no render context)
 
     # ── 控制状态变量 ──
-    state = "IDLE"               # IDLE | TELEOP_RECORDING | SAVE_PROMPT
+    state = "IDLE"               # IDLE | TELEOP_RECORDING | PAUSED | SAVE_PROMPT
     rate_limiter = RateLimiter(CTRL_HZ)
     prev_arm_cmd = sim.get_full_qpos()[:7].copy()
     prev_hand_cmd = sim.get_full_qpos()[7:].copy()
@@ -829,7 +832,7 @@ def main() -> None:
     print(f"  Data dir:   {args.data_dir}")
     print(f"  Home EEF:   pos={np.round(home_eef.p, 3)}")
     print("  B: 开始遥操作+录制  |  Q: 结束  |  R: 回 home")
-    print("  C: 重新标定 mapper  |  S: 保存  |  N: 丢弃")
+    print("  C: 暂停/恢复         |  S: 保存  |  N: 丢弃")
     print("=" * 60)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -851,7 +854,7 @@ def main() -> None:
             if keys.is_pressed('q') or keys.is_pressed('Q'):
                 keys.clear('q')
                 keys.clear('Q')
-                if state == "TELEOP_RECORDING":
+                if state in ("TELEOP_RECORDING", "PAUSED"):
                     # 停止录制，进入保存提示
                     path = recorder.stop_episode(success=True)
                     state = "SAVE_PROMPT"
@@ -906,11 +909,12 @@ def main() -> None:
                 elif state == "SAVE_PROMPT":
                     print("[State] 请先按 S 保存或 N 丢弃当前 episode")
 
-            # R: Return home（保持在 TELEOP_RECORDING）
+            # R: Return home（保持在当前状态）
             if keys.is_pressed('r') or keys.is_pressed('R'):
                 keys.clear('r')
                 keys.clear('R')
-                if state == "TELEOP_RECORDING":
+                if state in ("TELEOP_RECORDING", "PAUSED"):
+                    state_before = state
                     print("\n[Return] 规划回 home...")
                     execute_return_home(sim, planner, home_eef, viewer)
                     prev_arm_cmd = sim.get_full_qpos()[:7].copy()
@@ -918,7 +922,10 @@ def main() -> None:
                     ik_fail_count = 0
                     retarget_fail_count = 0
                     lost_since_ns = None
-                    print("[Return] 已回 home，继续遥操作 + 录制")
+                    if state_before == "PAUSED":
+                        print("[Return] 已回 home，仍在暂停中（按 C 恢复）")
+                    else:
+                        print("[Return] 已回 home，继续遥操作 + 录制")
                 elif state == "IDLE":
                     print("\n[Return] 规划回 home...")
                     execute_return_home(sim, planner, home_eef, viewer)
@@ -927,15 +934,22 @@ def main() -> None:
                 elif state == "SAVE_PROMPT":
                     print("[Return] 请先按 S 保存或 N 丢弃当前 episode")
 
-            # C: Calibrate — 重新标定 arm mapper
-            #     这是遥操作中最常用的辅助功能。VR↔机器人映射使用 delta-relative
-            #     模式，长时间遥操作会累积微小漂移（VR 追踪噪声 + IK 近似误差）。
-            #     按 C 重新锚定当前手腕位姿与 EEF 位姿之间的对应关系，无需退出
-            #     遥操作状态即可抵消漂移。
+            # C: Pause / Resume — 冻结/恢复遥操作
+            #     暂停：冻结 EEF（PD 保持当前位置），暂停向 episode 写入帧。
+            #     恢复：自动重新标定 arm mapper（抵消暂停期间的漂移），
+            #           继续录制。典型使用场景：接电话、思考策略、调整坐姿。
             if keys.is_pressed('c') or keys.is_pressed('C'):
                 keys.clear('c')
                 keys.clear('C')
-                if state in ("TELEOP_RECORDING", "IDLE"):
+                if state == "TELEOP_RECORDING":
+                    state = "PAUSED"
+                    print(
+                        f"\n[Pause] 遥操作已暂停  |  EEF 冻结  |  "
+                        f"录制暂停 ({recorder.frame_count} 帧)"
+                        f"\n        按 C 恢复，按 R 回 home，按 Q 退出"
+                    )
+                elif state == "PAUSED":
+                    # 恢复：重新锚定 mapper，抵消暂停期间的 VR 漂移
                     frame = tracker.get_latest()
                     sim_state = sim.get_state()
                     if frame is not None:
@@ -945,14 +959,19 @@ def main() -> None:
                             eef_pos=sim_state["eef_pos"],
                             eef_quat_wxyz=sim_state["eef_quat_wxyz"],
                         )
+                        state = "TELEOP_RECORDING"
+                        ik_fail_count = 0
+                        retarget_fail_count = 0
+                        stale_frame_count = 0
+                        lost_since_ns = None
                         print(
-                            f"[Calibrate] Mapper re-anchored at "
+                            f"\n[Resume] 遥操作已恢复  |  Mapper 已重新锚定  |  "
                             f"EEF={np.round(sim_state['eef_pos'], 3)}"
                         )
                     else:
-                        print("[Calibrate] 无法获取 VR 帧，标定失败")
+                        print("[Resume] 无法获取 VR 帧，恢复失败")
                 elif state == "SAVE_PROMPT":
-                    print("[Calibrate] 请先按 S 保存或 N 丢弃当前 episode")
+                    print("[Pause] 请先按 S 保存或 N 丢弃当前 episode")
 
             # S: Save episode（仅在 SAVE_PROMPT 下）
             if keys.is_pressed('s') or keys.is_pressed('S'):
@@ -1091,6 +1110,14 @@ def main() -> None:
                     prev_arm_cmd = arm_cmd.copy()
                     prev_hand_cmd = hand_cmd.copy()
 
+            elif state == "PAUSED":
+                # PAUSED: 冻结 EEF（PD 保持当前位置），不读取 VR、不录制
+                #         保持与 TELEOP_RECORDING 相同的物理步数以维持渲染流畅
+                full_cmd = np.concatenate([prev_arm_cmd, prev_hand_cmd])
+                sim.robot.balance_passive_force()
+                sim.robot.apply_action(full_cmd)
+                sim._step_physics(n=PHYSICS_STEPS_PER_TICK)
+
             elif state == "IDLE" or state == "SAVE_PROMPT":
                 # IDLE / SAVE_PROMPT: 仅推进物理（PD 保持当前位置）
                 sim._step_physics(n=1)
@@ -1117,6 +1144,13 @@ def main() -> None:
                     if stale_frame_count > 0:
                         lost_s = (time.perf_counter_ns() - (lost_since_ns or 0)) * 1e-9
                         status += f"  stale={stale_frame_count} (lost={lost_s:.1f}s)"
+                elif state == "PAUSED":
+                    rec_frames = recorder.frame_count if recorder.is_recording else 0
+                    status = (
+                        f"[PAUSED] EEF={np.round(sim_state['eef_pos'], 3)}"
+                        f"  frames={rec_frames}"
+                        f"  |  C: 恢复  R: 回 home  Q: 退出"
+                    )
                 elif state == "SAVE_PROMPT":
                     status = "[SAVE_PROMPT] S: 保存  |  N: 丢弃  |  Q: 退出"
                 else:
