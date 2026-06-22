@@ -263,6 +263,11 @@ class TeleopController:
                     ),
                 )
                 if not self.dry_run and self.state != ControllerState.IDLE:
+                    if self.robot.is_error():
+                        self._escalate_to_emergency(
+                            "Robot error state detected during soft deceleration"
+                        )
+                        return
                     self.robot.send_action(action)
             return
 
@@ -312,11 +317,16 @@ class TeleopController:
                 self._escalate_to_emergency("Robot error state detected before send_action")
                 return
 
-            if not (flags & ARM_TORQUE_OK) or not (flags & HAND_CURRENT_OK):
+            if (
+                not (flags & ARM_TORQUE_OK)
+                or not (flags & HAND_CURRENT_OK)
+                or not (flags & HAND_TEMP_OK)
+            ):
                 logger.warning(
-                    "Pre-send safety: torque=%s current=%s — holding",
+                    "Pre-send safety: torque=%s current=%s temp=%s — holding",
                     not (flags & ARM_TORQUE_OK),
                     not (flags & HAND_CURRENT_OK),
+                    not (flags & HAND_TEMP_OK),
                 )
                 hold = self.error_handler.hold_action()
                 action = RobotAction(
@@ -374,6 +384,7 @@ class TeleopController:
         in_workspace = self.robot.check_workspace(arm_eef_pose.p)
         ori_ok = self.robot.check_workspace_orientation(arm_eef_pose.q)
         quality.set(IN_WORKSPACE, in_workspace and ori_ok)
+        retarget_ok = False  # init: only set True by _compute_hand_command below
         if not in_workspace or not ori_ok:
             hold = self.error_handler.hold_action()
             arm_cmd = hold.arm_qpos_cmd
@@ -526,12 +537,8 @@ class TeleopController:
                     hand_cmd - prev_hand_cmd, -_HAND_JUMP_LIMIT_RAD, _HAND_JUMP_LIMIT_RAD
                 )
         quality.set(JOINT_JUMP_OK, jump_ok)
-
-        if not jump_ok:
-            hold = self.error_handler.record_failure("joint_jump")
-            arm_cmd = hold.arm_qpos_cmd
-            hand_cmd = hold.hand_qpos_cmd
-
+        # Clamp already limits deltas to safe range; hold_action() override
+        # would discard the clamped correction, so we rely on clamp alone.
         return arm_cmd, hand_cmd, jump_ok
 
     # ------------------------------------------------------------------

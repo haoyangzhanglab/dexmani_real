@@ -83,17 +83,14 @@ TABLE_TOP_Z = TABLE_CENTER[2] + TABLE_HALF[2]  # = 0.0 桌面上表面
 #   HAND_EXTENSION_BELOW_EEF → collision_config.hand_extension_below_eef (0.076)
 #   HAND_SAFE_MARGIN         → collision_config.hand_safe_margin (0.03)
 #   DESK_SAFE_Z              → collision_config.desk_safe_z (0.106)
-#   REJECT_BELOW_DESK_Z      → collision_config.reject_below_desk_z
 #   REJECT_EPSILON           → FingertipDeskSafety._epsilon (0.001)
 collision_config = CollisionConfig(
     table_z_world=TABLE_TOP_Z,
     hand_extension_below_eef=0.076,
     hand_safe_margin=0.03,
-    reject_below_desk_z=True,
 )
 # 向后兼容别名（test_motion_planning_sim.py 内大量引用这些旧名，逐步迁移）
 DESK_SAFE_Z = collision_config.desk_safe_z
-REJECT_BELOW_DESK_Z = collision_config.reject_below_desk_z
 
 # 手部随机化配置
 RANDOMIZE_HAND = False          # 是否随机化手部关节（测试不同手型下的桌面碰撞）
@@ -1549,7 +1546,7 @@ def main():
     if args.with_objects and test_desk:
         print("  Objects mode: EEF pre-filter OFF, desk safety via FK fingertip Z check")
 
-    reject_below = REJECT_BELOW_DESK_Z and not test_desk  # test-desk 模式关闭预过滤
+    reject_below = not test_desk  # test-desk 模式关闭预过滤
     print(f"Desk safety: SAPIEN physics + Z guard (DESK_SAFE_Z={DESK_SAFE_Z:.3f}m, "
           f"fingertip_safe={collision_config.fingertip_threshold:.3f}m)")
     print(f"  Table: X∈[{TABLE_CENTER[0]-TABLE_HALF[0]:.1f}, {TABLE_CENTER[0]+TABLE_HALF[0]:.1f}]  "

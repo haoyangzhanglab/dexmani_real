@@ -58,12 +58,6 @@ class CollisionConfig:
       - "none": No environment collision detection.
     """
 
-    # ── Pre-filter ──
-    reject_below_desk_z: bool = True
-    """When True, reject planning targets whose EEF Z is below desk_safe_z.
-    This is a fast pre-filter; actual collision detection uses fingertip FK.
-    Disable for desk-interaction tests (--test-desk, --with-objects)."""
-
     # ── Derived properties ──
 
     @property
