@@ -31,7 +31,11 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.config.pipeline_config import DEFAULT_MAX_RECORD_FRAMES
+from dexmani_real.log import get_logger
 from dexmani_real.robot.interface import RobotAction, RobotState
+
+logger = get_logger(__name__)
 
 
 class EpisodeRecorder:
@@ -43,9 +47,11 @@ class EpisodeRecorder:
     def __init__(
         self,
         data_dir: str,
+        max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.max_frames = max_frames
 
         self._file: h5py.File | None = None
         self._frame_count: int = 0
@@ -129,6 +135,15 @@ class EpisodeRecorder:
         """Append one frame to the HDF5 file."""
         if not self._recording or self._file is None:
             return False
+
+        # Hard cap: auto-stop when max_frames reached (prevents disk exhaustion).
+        if self._frame_count >= self.max_frames:
+            logger.warning(
+                "Episode reached max_frames=%d, auto-stopping.", self.max_frames
+            )
+            self._file.attrs["stopped_reason"] = "max_frames"
+            self.stop_episode(success=True)
+            return True
 
         self._append_or_create("obs/arm_qpos", state.arm_qpos)
         self._append_or_create("obs/arm_qvel", state.arm_qvel)

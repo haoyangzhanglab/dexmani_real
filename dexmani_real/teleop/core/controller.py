@@ -60,6 +60,7 @@ from dexmani_real.utils.signal_utils import ema_smooth
 if TYPE_CHECKING:
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+    from dexmani_real.teleop.vr.pose_interpolator import CartPoseInterpolator
     from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
@@ -108,6 +109,12 @@ class TeleopController:
         ema_alpha_arm: float = 1.0,  # 1.0 = no smoothing (disabled)
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
+        use_cartesian_interpolation: bool = False,
+        interpolation_max_pos_speed: float = 0.25,
+        interpolation_max_rot_speed: float = 0.5,
+        use_zmq_vr: bool = False,
+        zmq_vr_port: int = 5555,
+        camera_process: object | None = None,
     ) -> None:
         self.robot = robot
         self.arm_mapper = arm_mapper
@@ -119,6 +126,28 @@ class TeleopController:
 
         self.limiter = RateLimiter(target_hz)
         self.ema_alpha_arm = float(ema_alpha_arm)
+
+        # Cartesian pose interpolator (optional, disabled by default).
+        # Ref: ManiUniCon PoseTrajectoryInterpolator.
+        self._pose_interpolator: CartPoseInterpolator | None = None
+        if use_cartesian_interpolation:
+            from dexmani_real.teleop.vr.pose_interpolator import CartPoseInterpolator
+            self._pose_interpolator = CartPoseInterpolator(
+                max_pos_speed=interpolation_max_pos_speed,
+                max_rot_speed=interpolation_max_rot_speed,
+            )
+
+        # Camera daemon process (optional — crash-isolated frame capture).
+        # Ref: ManiUniCon Camera Process.
+        self._camera_process = camera_process
+
+        # ZMQ VR subscriber (optional, disabled by default).
+        # Ref: Open-Teach multi-process ZMQ PUB/SUB pattern.
+        self._vr_subscriber: VRFrameSubscriber | None = None
+        if use_zmq_vr:
+            from dexmani_real.teleop.vr.vr_publisher import VRFrameSubscriber
+            self._vr_subscriber = VRFrameSubscriber(sub_port=zmq_vr_port)
+            self._vr_subscriber.connect()
 
         self.tracking_quality = TrackingQuality(TrackingQualityConfig(max_frame_age_s=0.2))
         self.error_handler = TeleopErrorHandler()
@@ -207,7 +236,34 @@ class TeleopController:
         if not tq_result.ok:
             self.error_handler.record_failure("vr_stale")
             if tq_result.tracking_lost:
-                self._escalate_to_emergency(f"VR tracking lost for {tq_result.lost_duration_s:.1f}s")
+                self._escalate_to_emergency(
+                    f"VR tracking lost for {tq_result.lost_duration_s:.1f}s"
+                )
+                return
+            # Soft deceleration: during stale-but-not-lost window
+            # (0.2s < age < 1.0s continuous), exponentially pull arm
+            # toward current physical position to avoid abrupt holds.
+            # Ref: BVPro clip_arm_velocity() soft-start pattern.
+            if tq_result.lost_duration_s > 0.0 and self._last_arm_cmd is not None:
+                if not self.dry_run:
+                    state = self.robot.get_state()
+                else:
+                    state = self._dummy_state()
+                decay = float(np.exp(-tq_result.lost_duration_s * 3.0))
+                arm_interp = (
+                    decay * self._last_arm_cmd
+                    + (1.0 - decay) * state.arm_qpos
+                )
+                action = RobotAction(
+                    arm_qpos_cmd=arm_interp,
+                    hand_qpos_cmd=(
+                        self._last_hand_cmd
+                        if self._last_hand_cmd is not None
+                        else state.hand_qpos
+                    ),
+                )
+                if not self.dry_run and self.state != ControllerState.IDLE:
+                    self.robot.send_action(action)
             return
 
         # 3. Read robot state
@@ -254,11 +310,24 @@ class TeleopController:
         flags = quality.get()
 
         # 6. Execute action based on state
+
+        # Poll camera frame from daemon process (crash-isolated).
+        # A crashed camera process does NOT block the control loop.
+        camera_frame = None
+        if self._camera_process is not None:
+            try:
+                camera_frame = self._camera_process.poll_latest_frame()
+                if getattr(self._camera_process, "crashed", False):
+                    logger.warning("Camera daemon crashed — continuing without camera data.")
+            except (ValueError, RuntimeError, KeyError):
+                logger.debug("Camera poll failed — continuing without camera frame.")
+
         if self.state == ControllerState.RECORDING and self.recorder is not None:
             try:
                 self.recorder.add_frame(
                     state=state, action=action, vr_frame=vr_frame,
                     quality_flags=flags,
+                    camera_frame=camera_frame,
                     T_base_eef=self._compute_T_base_eef(state),
                 )
             except (ValueError, OSError) as e:
@@ -268,6 +337,22 @@ class TeleopController:
             if self.robot.is_error():
                 self._escalate_to_emergency("Robot error state detected before send_action")
                 return
+            # Pre-send safety: torque/current hold (was validate_action).
+            # workspace position/orientation is enforced at L2
+            # (_compute_action IN_WORKSPACE flag → hold).
+            # arm_joint_limits is enforced at L4 (E-Stop, stricter than hold).
+            # hand_joint_limits is warn-only per XHand internal protection design.
+            if not (flags & ARM_TORQUE_OK) or not (flags & HAND_CURRENT_OK):
+                logger.warning(
+                    "Pre-send safety: torque=%s current=%s — holding",
+                    not (flags & ARM_TORQUE_OK),
+                    not (flags & HAND_CURRENT_OK),
+                )
+                hold = self.error_handler.hold_action()
+                action = RobotAction(
+                    arm_qpos_cmd=hold.arm_qpos_cmd,
+                    hand_qpos_cmd=hold.hand_qpos_cmd,
+                )
             if self.state != ControllerState.IDLE:
                 result = self.robot.send_action(action)
                 arm_ok = result.get("arm_ok", False)
@@ -316,11 +401,12 @@ class TeleopController:
             vr_frame, state, prev_arm_cmd, quality
         )
 
-        # Workspace check on computed arm command
-        arm_eef_pos = self.planner.compute_eef_pose_world(arm_cmd).p
-        in_workspace = self.robot.check_workspace(arm_eef_pos)
-        quality.set(IN_WORKSPACE, in_workspace)
-        if not in_workspace:
+        # Workspace check on computed arm command (position + orientation)
+        arm_eef_pose = self.planner.compute_eef_pose_world(arm_cmd)
+        in_workspace = self.robot.check_workspace(arm_eef_pose.p)
+        ori_ok = self.robot.check_workspace_orientation(arm_eef_pose.q)
+        quality.set(IN_WORKSPACE, in_workspace and ori_ok)
+        if not in_workspace or not ori_ok:
             hold = self.error_handler.hold_action()
             arm_cmd = hold.arm_qpos_cmd
             hand_cmd = hold.hand_qpos_cmd
@@ -370,6 +456,18 @@ class TeleopController:
             if mapped is not None:
                 target_eef_pos = mapped["pos"]
                 target_eef_quat = mapped["quat_wxyz"]
+
+                # Cartesian pose interpolation (optional).
+                # Ref: ManiUniCon PoseTrajectoryInterpolator — linear pos +
+                # SLERP rot between VR frames, eliminating stale re-use.
+                if self._pose_interpolator is not None:
+                    self._pose_interpolator.push_target_pose(
+                        target_eef_pos, target_eef_quat,
+                    )
+                    result = self._pose_interpolator.get_interpolated_pose()
+                    if result is not None:
+                        target_eef_pos, target_eef_quat = result
+
                 target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
                 ik_result: IKResult = self.planner.solve_teleop_ik(
                     target_pose, state.arm_qpos.copy(), prev_arm_cmd
@@ -489,6 +587,10 @@ class TeleopController:
             self._escalate_to_emergency("Keyboard ESC")
             return
 
+        if signal == ControlSignal.REARM:
+            self._rearm()
+            return
+
         if signal == ControlSignal.HOME:
             self._do_home()
             return
@@ -557,6 +659,11 @@ class TeleopController:
             eef_pos=state.eef_pos,
             eef_quat_wxyz=state.eef_quat_wxyz,
         )
+
+        # Reset pose interpolator to clear stale waypoints.
+        if self._pose_interpolator is not None:
+            self._pose_interpolator.reset()
+
         return True
 
     def _start_recording(self) -> None:
@@ -595,12 +702,44 @@ class TeleopController:
             self.robot.emergency_stop()
         self.running = False
 
+    def _rearm(self) -> None:
+        """Re-arm from EMERGENCY_STOP without script restart.
+
+        Clears errors, resets tracking, transitions to IDLE.
+        No-op if not in EMERGENCY_STOP state.
+
+        Ref: ManiUniCon reset_event (keyboard 'h' / Quest 'A' button).
+        """
+        if self.state != ControllerState.EMERGENCY_STOP:
+            logger.info(
+                "REARM ignored: not in EMERGENCY_STOP (current=%s)",
+                self.state.value,
+            )
+            return
+
+        logger.info("REARM: clearing errors and resetting...")
+        self.running = True
+        self.error_handler.clear()
+        self.tracking_quality.reset()
+
+        if not self.dry_run:
+            try:
+                self.robot.arm.clear_error()
+                self.robot.reset_soft_start()
+            except (ValueError, RuntimeError, KeyError, AttributeError) as e:
+                logger.warning("REARM: error clearing robot state: %s", e)
+
+        self.state = ControllerState.IDLE
+        self._last_arm_cmd = None
+        self._last_hand_cmd = None
+        logger.info("REARM complete. State: IDLE")
+
     def _shutdown(self) -> None:
         logger.info("Shutting down...")
         if self.recorder is not None and self.recorder.is_recording:
             try:
                 self.recorder.stop_episode(success=False)
-            except Exception:
+            except (ValueError, RuntimeError, KeyError):
                 pass  # shutdown must never fail
         if self.keyboard is not None:
             self.keyboard.stop()
@@ -613,6 +752,8 @@ class TeleopController:
     # ------------------------------------------------------------------
 
     def _read_vr_frame(self) -> dict | None:
+        if self._vr_subscriber is not None:
+            return self._vr_subscriber.recv_latest()
         if self.tracker is not None:
             return self.tracker.get_latest()
         return None
@@ -676,86 +817,3 @@ class TeleopController:
         )
 
 
-def example() -> None:
-    """Dry-run example: no hardware required, tests full control logic."""
-    import multiprocessing
-
-    from dexmani_real.planning.planner import XArm7MotionPlanner
-    from dexmani_real import ASSET_DIR
-    from dexmani_real.planning.types import (
-        PlanningProfile,
-        TeleopProfile,
-        XArm7PlannerConfig,
-    )
-    from dexmani_real.robot.interface import RobotInterfaceConfig
-    from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
-    from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
-
-    q = multiprocessing.Queue()
-
-    # Planner (use collision URDF for arm+hand collision detection with desk)
-    urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf")
-    planner_config = XArm7PlannerConfig(
-        urdf_path=urdf_path,
-        srdf_path=srdf_path,
-        eef_link_name="custom_eef_link",
-    )
-    planner = XArm7MotionPlanner(
-        config=planner_config,
-        planning_profile=PlanningProfile(),
-        teleop_profile=TeleopProfile(),
-    )
-
-    robot_config = RobotInterfaceConfig()
-    robot = RobotInterface(
-        config=robot_config,
-        kinematics=planner.kin,
-        planner=planner,
-    )
-
-    arm_mapper = ArmWristMapper()
-    retargeter = XHandRetargeter()
-
-    controller = TeleopController(
-        robot=robot,
-        arm_mapper=arm_mapper,
-        retargeter=retargeter,
-        planner=planner,
-        keyboard_queue=q,
-        dry_run=True,
-        target_hz=50.0,
-    )
-    print("Starting dry-run TeleopController. Press Ctrl+C to stop.")
-    print("Insert dummy VR frames for 5 s to simulate tracking...")
-
-    from dexmani_real.teleop.vr.dummy_tracker import DummyTracker
-
-    controller.tracker = DummyTracker()
-
-    # Reset mapper so IK works
-    arm_mapper.reset(
-        wrist_pos=np.zeros(3),
-        wrist_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-        eef_pos=np.array([0.4, 0.0, 0.3]),
-        eef_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-    )
-
-    # Press T to enter TELEOP
-    q.put(ControlSignal.TELEOP)
-
-    # Run for 3 seconds in background
-    import threading
-
-    t = threading.Thread(target=controller.run, daemon=True)
-    t.start()
-    time.sleep(3.0)
-    q.put(ControlSignal.HOME)
-    time.sleep(1.0)
-    controller.stop()
-    t.join(timeout=3.0)
-    print("Dry-run complete.")
-
-
-if __name__ == "__main__":
-    example()

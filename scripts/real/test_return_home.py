@@ -20,14 +20,13 @@
 
 from __future__ import annotations
 
-# sys.path修正：脚本位于scripts/real/，项目根目录在3层之上
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 import argparse
 import math
-import sys
 import time
 from collections import Counter
 

@@ -15,12 +15,9 @@
 
 from __future__ import annotations
 
-# sys.path修正：脚本已从dexmani_real/example/移至scripts/
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import time
 from dataclasses import dataclass
 
@@ -33,6 +30,18 @@ from dexmani_real.planning import (
 )
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, create_viewer
+
+from scripts._test_utils import (
+    IKStats,
+    angular_dist_rad,
+    build_target_pose,
+    execute_dense_path,
+    interpolate_waypoints,
+    quat_multiply,
+    quat_to_rotmat,
+    random_quat_within_angle,
+    settle_at_target,
+)
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -190,170 +199,18 @@ _RESIDUAL_ERROR_MAX_DEG = 10.0                      # 残余误差上限（超�
 # ═══════════════════════════════════════════════ 数学工具
 
 
-def angular_dist_rad(q1: np.ndarray, q2: np.ndarray) -> float:
-    return float(2 * np.arccos(np.clip(np.abs(np.dot(q1, q2)), 0.0, 1.0)))
 
 
-def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """wxyz 四元数 Hamilton 乘积。"""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-    ])
 
 
-def quat_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
-    """wxyz 四元数 → 3x3 旋转矩阵。"""
-    w, x, y, z = q_wxyz
-    return np.array([
-        [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z,     2*x*z + 2*w*y],
-        [2*x*y + 2*w*z,     1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-        [2*x*z - 2*w*y,     2*y*z + 2*w*x,     1 - 2*x*x - 2*y*y],
-    ])
 
 
-def random_quat_within_angle(rng: np.random.RandomState, max_deg: float) -> np.ndarray:
-    """均匀随机旋转，角度 ≤ max_deg。返回 wxyz 四元数。"""
-    axis = rng.randn(3)
-    axis /= np.linalg.norm(axis)
-    angle = rng.uniform(0, np.deg2rad(max_deg))
-    half = angle / 2
-    return np.array([np.cos(half), axis[0] * np.sin(half),
-                     axis[1] * np.sin(half), axis[2] * np.sin(half)])
 
 
-def random_quat_full_so3(rng: np.random.RandomState) -> np.ndarray:
-    """均匀采样 SO(3) 全空间随机四元数（wxyz）。"""
-    # Marsaglia 方法：均匀分布在单位球面
-    u = rng.uniform(0, 1, 3)
-    q = np.array([
-        np.sqrt(1 - u[0]) * np.sin(2 * np.pi * u[1]),
-        np.sqrt(1 - u[0]) * np.cos(2 * np.pi * u[1]),
-        np.sqrt(u[0]) * np.sin(2 * np.pi * u[2]),
-        np.sqrt(u[0]) * np.cos(2 * np.pi * u[2]),
-    ])
-    q /= np.linalg.norm(q)
-    return q
-
-
-def random_quat_multi_axis(
-    rng: np.random.RandomState, max_deg1: float = 45.0, max_deg2: float = 30.0,
-) -> np.ndarray:
-    """绕两个独立随机轴依次旋转，产生更丰富的姿态分布。
-
-    先绕 axis1 旋转 angle1 ∈ [0, max_deg1]，再绕 axis2 旋转 angle2 ∈ [0, max_deg2]，
-    合成旋转 = R2 * R1。比单轴旋转覆盖更大的 SO(3) 子集。
-    """
-    # Axis 1: random direction
-    a1 = rng.randn(3)
-    a1 /= np.linalg.norm(a1)
-    angle1 = rng.uniform(0, np.deg2rad(max_deg1))
-    half1 = angle1 / 2
-    q1 = np.array([np.cos(half1), a1[0] * np.sin(half1),
-                   a1[1] * np.sin(half1), a1[2] * np.sin(half1)])
-
-    # Axis 2: orthogonal to axis 1 (or random)
-    a2 = rng.randn(3)
-    a2 -= a1 * np.dot(a2, a1)  # orthogonalize
-    norm = np.linalg.norm(a2)
-    if norm < 1e-10:
-        a2 = np.array([-a1[1], a1[0], 0.0]) if abs(a1[0]) > 1e-10 else np.array([1.0, 0.0, 0.0])
-        a2 -= a1 * np.dot(a2, a1)
-    a2 /= np.linalg.norm(a2)
-    angle2 = rng.uniform(0, np.deg2rad(max_deg2))
-    half2 = angle2 / 2
-    q2 = np.array([np.cos(half2), a2[0] * np.sin(half2),
-                   a2[1] * np.sin(half2), a2[2] * np.sin(half2)])
-
-    return quat_multiply(q2, q1)  # R2 * R1
-
-
-def build_target_pose(
-    pos: np.ndarray, home_quat: np.ndarray, rng: np.random.RandomState | None = None,
-) -> Pose:
-    """构建目标位姿，支持多种姿态随机化模式。
-
-    Modes:
-      "fixed"       — 保持 home 姿态不变
-      "single_axis" — 绕随机轴旋转 ≤ ROT_MAX_DEG
-      "multi_axis"  — 绕两个独立轴旋转 (≤ ROT_AXIS1_DEG, ≤ ROT_AXIS2_DEG)
-      "full_so3"    — SO(3) 均匀采样（IK 可达率会降低）
-    """
-    quat = home_quat
-    if rng is None:
-        return Pose(p=pos, q=quat)
-
-    if ROT_MODE == "full_so3":
-        quat = random_quat_full_so3(rng)
-    elif ROT_MODE == "multi_axis":
-        delta_q = random_quat_multi_axis(rng, ROT_AXIS1_DEG, ROT_AXIS2_DEG)
-        quat = quat_multiply(delta_q, home_quat)
-    elif ROT_MODE == "single_axis" and ROT_MAX_DEG > 0:
-        quat = quat_multiply(random_quat_within_angle(rng, ROT_MAX_DEG), home_quat)
-    # else: "fixed" — keep home quat
-
-    return Pose(p=pos, q=quat)
-
-
-def interpolate_waypoints(path: np.ndarray, max_step: float = INTERP_MAX_STEP_RAD) -> np.ndarray:
-    """对稀疏关节路径线性插值，每步关节变化 ≤ max_step rad。"""
-    if len(path) <= 1:
-        return path
-    dense = [path[0]]
-    for i in range(len(path) - 1):
-        a, b = path[i], path[i + 1]
-        n = int(np.ceil(float(np.max(np.abs(b - a))) / max_step))
-        for k in range(1, n + 1):
-            dense.append(a + (k / n) * (b - a))
-    return np.array(dense, dtype=np.float64)
 
 # ═══════════════════════════════════════════════ 仿真执行
 
 
-def execute_dense_path(
-    sim: SimRobotInterface, dense: np.ndarray, viewer: sapien.Viewer | None = None,
-) -> bool:
-    """执行已插值的稠密关节路径，(N,7) arm-only。hand 保持不变。"""
-    assert dense.ndim == 2 and dense.shape[1] == 7
-    hand = sim.get_full_qpos()[7:]
-    for wp in dense:
-        if viewer is not None and viewer.closed:
-            return False
-        sim.robot.balance_passive_force()
-        sim.robot.apply_action(np.concatenate([wp, hand]))
-        sim._step_physics(n=PHYSICS_STEPS_PER_WP)
-        if viewer is not None:
-            sim.scene.update_render()
-            viewer.render()
-    return True
-
-
-def settle_at_target(
-    sim: SimRobotInterface, target_arm: np.ndarray, hand_qpos: np.ndarray,
-    max_iter: int = 30, converge_threshold_rad: float = np.deg2rad(0.05),
-) -> float:
-    """闭环收敛：迭代 PD 控制直到关节误差 < converge_threshold_rad。
-
-    对应真机 arm.reset(wait=True) 的阻塞等待行为 — 不停留在固定轮数，
-    而是持续驱动直到实际关节角收敛到目标值。
-
-    Returns: final max joint error (rad)
-    """
-    for _ in range(max_iter):
-        sim.robot.balance_passive_force()
-        sim.robot.apply_action(np.concatenate([target_arm, hand_qpos]))
-        sim._step_physics(n=PHYSICS_STEPS_PER_WP)
-        current = sim.get_full_qpos()[:7]
-        err = float(np.max(np.abs(current - target_arm)))
-        if err < converge_threshold_rad:
-            return err
-    # Max iterations reached — return current error
-    current = sim.get_full_qpos()[:7]
-    return float(np.max(np.abs(current - target_arm)))
 
 
 def smooth_drive_to_target(
@@ -1216,14 +1073,14 @@ def plan_and_execute(
         if joint_goal is not None:
             path = append_joint_goal(planner, path, joint_goal)
 
-    dense = interpolate_waypoints(path)
+    dense = interpolate_waypoints(path, INTERP_MAX_STEP_RAD)
     print(f"  [{label}] exec {len(dense)} wp")
 
     if not used_safe_descent:
         # Normal execution (safe_descent already executed the path)
         tips_before = check_fingertips(sim)
         hand_qpos = sim.get_full_qpos()[7:]
-        execute_dense_path(sim, dense, viewer)
+        execute_dense_path(sim, dense, viewer, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
         settle_at_target(sim, dense[-1, :7], hand_qpos)
 
     if used_safe_descent:
@@ -1267,13 +1124,6 @@ def plan_and_execute(
 # ═══════════════════════════════════════════════ IK 测试
 
 
-@dataclass
-class IKStats:
-    ok: int
-    pos_errs: list[float]
-    rot_errs: list[float]
-
-
 def _run_ik_loop(
     planner: XArm7MotionPlanner, targets: list[Pose], init_qpos: np.ndarray,
     chained: bool,
@@ -1296,20 +1146,20 @@ def _run_ik_loop(
         eef = planner.compute_eef_pose_world(r.qpos)
         pos_errs.append(float(np.linalg.norm(eef.p - target.p)))
         rot_errs.append(angular_dist_rad(eef.q, target.q))
-    return IKStats(ok=ok, pos_errs=pos_errs, rot_errs=rot_errs)
+    return IKStats(ok=ok, pos_errs_mm=[e * 1000 for e in pos_errs], rot_errs_deg=np.rad2deg(rot_errs).tolist())
 
 
 def print_ik_stats(label: str, stats: IKStats) -> None:
-    pos = np.array(stats.pos_errs)
-    rot = np.array(stats.rot_errs)
+    pos = np.array(stats.pos_errs_mm)
+    rot = np.array(stats.rot_errs_deg)
     valid = ~np.isnan(pos)
     pos_v = pos[valid] if valid.any() else np.array([np.inf])
     rot_v = rot[valid] if valid.any() else np.array([np.inf])
     total = len(pos)
     rate = f"{stats.ok}/{total} ({100*stats.ok/total:.1f}%)" if total else "0"
     print(f"  [{label}] success_rate={rate}  "
-          f"pos_err: avg={np.mean(pos_v)*1000:.1f}mm  max={np.max(pos_v)*1000:.1f}mm  "
-          f"rot_err: avg={np.rad2deg(np.mean(rot_v)):.2f}deg  max={np.rad2deg(np.max(rot_v)):.2f}deg")
+          f"pos_err: avg={np.mean(pos_v):.1f}mm  max={np.max(pos_v):.1f}mm  "
+          f"rot_err: avg={np.mean(rot_v):.2f}deg  max={np.max(rot_v):.2f}deg")
 
 
 def ik_test(
@@ -1327,7 +1177,7 @@ def ik_test(
         sample_z_biased(rng, num_samples) if num_samples > 20
         else rng.uniform(*SAMPLE_Z, num_samples),
     ])
-    targets = [build_target_pose(positions[i], home_eef.q, rng) for i in range(num_samples)]
+    targets = [build_target_pose(positions[i], home_eef.q, rng, rot_mode=ROT_MODE, rot_max_deg=ROT_MAX_DEG, rot_axis1_deg=ROT_AXIS1_DEG, rot_axis2_deg=ROT_AXIS2_DEG) for i in range(num_samples)]
 
     return {
         "fresh":   _run_ik_loop(planner, targets, home_qpos,            chained=False),
@@ -1444,8 +1294,6 @@ def _run_desk_test(
     with_objects: bool = False,
 ) -> dict:
     """Run a single --test-desk configuration and return statistics."""
-    from dexmani_real.planning import FingertipDeskSafety
-
     rng = np.random.RandomState(seed)
 
     sim = SimRobotInterface(SimRobotConfig(headless=headless))
@@ -1508,7 +1356,7 @@ def _run_desk_test(
         smooth_drive_to_target(sim, target_full, None, max_iter=30,
                                label=f"sweep_{i+1}")
 
-        target_pose = build_target_pose(pos, home_quat, rng)
+        target_pose = build_target_pose(pos, home_quat, rng, rot_mode=ROT_MODE, rot_max_deg=ROT_MAX_DEG, rot_axis1_deg=ROT_AXIS1_DEG, rot_axis2_deg=ROT_AXIS2_DEG)
         current_qpos = sim.get_full_qpos()[:7]
 
         result = planner.plan_path(target_pose, current_qpos)
@@ -1699,9 +1547,7 @@ def main():
     # DESK_SAFE_Z = 0.106m 是 EEF 级保守预过滤，真实碰撞检测使用指尖 FK。
     # Apply collision_config override for --with-objects mode
     if args.with_objects and test_desk:
-        collision_config.table_object_max_height = 0.15  # max object height for safety calc
-        print(f"  Objects mode: table_object_max_height={collision_config.table_object_max_height:.2f}m, "
-              f"eef_safe_z_with_objects={collision_config.eef_safe_z_with_objects:.3f}m")
+        print("  Objects mode: EEF pre-filter OFF, desk safety via FK fingertip Z check")
 
     reject_below = REJECT_BELOW_DESK_Z and not test_desk  # test-desk 模式关闭预过滤
     print(f"Desk safety: SAPIEN physics + Z guard (DESK_SAFE_Z={DESK_SAFE_Z:.3f}m, "
@@ -1942,7 +1788,7 @@ def main():
                 if not lift_success:
                     print(f"  [{i+1:2d}/{num_samples}] ⬆️  ALL lift stages FAILED — continuing with unsafe start")
 
-        target_pose = build_target_pose(pos, home_quat, rng)
+        target_pose = build_target_pose(pos, home_quat, rng, rot_mode=ROT_MODE, rot_max_deg=ROT_MAX_DEG, rot_axis1_deg=ROT_AXIS1_DEG, rot_axis2_deg=ROT_AXIS2_DEG)
         marker = place_marker(sim.scene, pos) if viewer else None
         if viewer:
             sim.scene.update_render()

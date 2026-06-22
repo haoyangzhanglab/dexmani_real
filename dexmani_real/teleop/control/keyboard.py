@@ -14,6 +14,7 @@ class ControlSignal(Enum):
     STOP = "S"
     HOME = "H"
     EMERGENCY_STOP = "ESC"
+    REARM = "X"
     QUIT = "Q"
 
 
@@ -23,6 +24,7 @@ _KEY_MAP = {
     "r": ControlSignal.RECORD,
     "s": ControlSignal.STOP,
     "h": ControlSignal.HOME,
+    "x": ControlSignal.REARM,
     "q": ControlSignal.QUIT,
 }
 
@@ -80,7 +82,7 @@ class KeyboardHandler:
                     ch = key.char.lower()
                 else:
                     ch = str(key)
-            except Exception:
+            except (OSError, ValueError):
                 return True
 
             if ch == "esc" or (hasattr(key, "name") and key.name == "esc"):
@@ -93,25 +95,3 @@ class KeyboardHandler:
 
         with keyboard.Listener(on_press=on_press) as listener:
             listener.join()
-
-
-def example() -> None:
-    import time
-
-    q: multiprocessing.Queue = multiprocessing.Queue()
-    handler = KeyboardHandler(q)
-    handler.start()
-    print("KeyboardHandler running. Press T/R/S/H/ESC/Q. Polling for 10 s...")
-
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < 10:
-        for sig in handler.poll():
-            print(f"  → {sig}")
-        time.sleep(0.1)
-
-    handler.stop()
-    print("Done")
-
-
-if __name__ == "__main__":
-    example()

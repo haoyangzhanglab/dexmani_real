@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,6 +11,8 @@ import numpy as np
 
 from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
+from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.serialization import from_dict_helper
 from xhand_controller import xhand_control as xh
 
 logger = get_logger(__name__)
@@ -103,6 +104,12 @@ class XHandConfig:
     clip_joint_limit: bool = True
 
     tactile_scale: float = 0.1
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "XHandConfig":
+        """Reconstruct from a serialized dict."""
+        kw = from_dict_helper(cls, d)
+        return cls(**kw)
 
 
 class XHand(ConnectionStateMixin):
@@ -289,6 +296,7 @@ class XHand(ConnectionStateMixin):
                 tty_devices[0] if tty_devices else None
             )
             if target is not None:
+                import subprocess
                 try:
                     result = subprocess.run(
                         ["lsof", target],
@@ -381,8 +389,8 @@ class XHand(ConnectionStateMixin):
             self._record_error(err)
             self.error_state = True
             state = {
-                "qpos": np.full(12, np.nan, dtype=np.float64),
-                "current": np.full(12, np.nan, dtype=np.float64),
+                "qpos": nan_array(12),
+                "current": nan_array(12),
                 "timestamp": time.time(),
             }
             if full:
@@ -469,12 +477,12 @@ class XHand(ConnectionStateMixin):
         return self._unpack_result(result)
 
     def parse_state(self, hand_state, full: bool = False) -> dict[str, Any]:
-        qpos = np.full(12, np.nan, dtype=np.float64)
-        current = np.full(12, np.nan, dtype=np.float64)
+        qpos = nan_array(12)
+        current = nan_array(12)
         finger_ids = np.full(12, -1, dtype=np.int32)
         sensor_ids = np.full(12, -1, dtype=np.int32)
-        raw_position = np.full(12, np.nan, dtype=np.float64)
-        temperature = np.full(12, np.nan, dtype=np.float64)
+        raw_position = nan_array(12)
+        temperature = nan_array(12)
         commboard_err = np.zeros(12, dtype=np.int32)
         jointboard_err = np.zeros(12, dtype=np.int32)
         tipboard_err = np.zeros(12, dtype=np.int32)
@@ -572,7 +580,7 @@ class XHand(ConnectionStateMixin):
         return force_sum
 
     def parse_tactile_temperature(self, hand_state) -> np.ndarray:
-        temperature = np.full((5, 20), np.nan, dtype=np.float64)
+        temperature = nan_array((5, 20))
         for i, sensor in self._iter_sensors(hand_state):
             temp = np.asarray(getattr(sensor, "temperature", []), dtype=np.float64).reshape(-1)
             if temp.size > 0:
@@ -633,14 +641,14 @@ class XHand(ConnectionStateMixin):
 
     def _array12(self, value) -> np.ndarray:
         if value is None:
-            return np.full(12, np.nan, dtype=np.float64)
+            return nan_array(12)
 
         arr = np.asarray(value, dtype=np.float64).reshape(-1)
 
         if arr.size >= 12:
             return arr[:12]
 
-        out = np.full(12, np.nan, dtype=np.float64)
+        out = nan_array(12)
         out[: arr.size] = arr
         return out
 
@@ -648,8 +656,8 @@ class XHand(ConnectionStateMixin):
         return {
             "finger_ids": np.full(12, -1, dtype=np.int32),
             "sensor_ids": np.full(12, -1, dtype=np.int32),
-            "raw_position": np.full(12, np.nan, dtype=np.float64),
-            "temperature": np.full(12, np.nan, dtype=np.float64),
+            "raw_position": nan_array(12),
+            "temperature": nan_array(12),
             "commboard_err": np.zeros(12, dtype=np.int32),
             "jointboard_err": np.zeros(12, dtype=np.int32),
             "tipboard_err": np.zeros(12, dtype=np.int32),
@@ -657,7 +665,7 @@ class XHand(ConnectionStateMixin):
             "tactile_force_raw": np.zeros((5, 120, 3), dtype=np.float64),
             "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
             "tactile_force_sum_raw": np.zeros((5, 3), dtype=np.float64),
-            "tactile_temperature": np.full((5, 20), np.nan, dtype=np.float64),
+            "tactile_temperature": nan_array((5, 20)),
             "connected_flag": self.connected_flag,
             "error_state": self.error_state,
             "last_action_code": self.last_action_code,
@@ -710,28 +718,3 @@ class XHand(ConnectionStateMixin):
         self.last_error_message = str(getattr(err, "error_message", ""))
 
 
-def example():
-    from dexmani_real.robot._debug import print_state
-
-    config = XHandConfig(
-        comm_type="RS485",
-        device_name="/dev/ttyUSB0",
-    )
-    hand = XHand(config)
-
-    if not hand.connect():
-        raise RuntimeError(f"Failed to connect XHand: {hand.last_error_message}")
-
-    try:
-        state = hand.get_state(full=True)
-        print_state(state)
-
-        ok = hand.send_action(config.home_qpos)
-        print("send_action ok:", ok)
-
-    finally:
-        hand.disconnect()
-
-
-if __name__ == "__main__":
-    example()

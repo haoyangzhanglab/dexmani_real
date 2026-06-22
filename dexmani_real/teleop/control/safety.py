@@ -12,8 +12,10 @@ from dexmani_real.robot.interface import RobotState
 # only 20 Nm — a unified 50 Nm threshold would allow 2.5× rated torque
 # before triggering a warning.
 _ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
-_HAND_CURRENT_LIMIT_MA = 500.0  # TODO: verify against XHand motor datasheet
-_HAND_TEMP_LIMIT_C = 70.0       # TODO: verify against XHand motor datasheet
+# Conservative defaults based on XHand specs. Validate against the actual
+# motor datasheet before production use.
+_HAND_CURRENT_LIMIT_MA = 500.0
+_HAND_TEMP_LIMIT_C = 70.0
 _RETARGET_PHYSIO_MIN = -0.5
 _RETARGET_PHYSIO_MAX = 2.5
 

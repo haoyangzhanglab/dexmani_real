@@ -294,17 +294,15 @@ class QuestHandTracker:
         return (time.monotonic_ns() - frame["local_recv_ns"]) * 1e-9
 
     def copy_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Deep-copy a VR frame dict, copying numpy arrays by value.
+
+        Uses a generic pattern instead of listing every key manually (P2.2).
+        Automatically handles new keys added to the frame dict without
+        requiring code changes here.
+        """
         return {
-            "side": frame["side"],
-            "wrist_pos": frame["wrist_pos"].copy(),
-            "wrist_quat_wxyz": frame["wrist_quat_wxyz"].copy(),
-            "landmarks": frame["landmarks"].copy(),
-            "recv_ts_ns": frame["recv_ts_ns"],
-            "source_ts_ns": frame["source_ts_ns"],
-            "sequence_id": frame["sequence_id"],
-            "source_frame_seq": frame["source_frame_seq"],
-            "coordinate_frame": frame["coordinate_frame"],
-            "local_recv_ns": frame["local_recv_ns"],
+            k: v.copy() if isinstance(v, np.ndarray) else v
+            for k, v in frame.items()
         }
 
     def __enter__(self) -> "QuestHandTracker":
@@ -315,43 +313,3 @@ class QuestHandTracker:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.disconnect()
 
-
-def example() -> None:
-    tracker = QuestHandTracker(
-        transport="tcp_server",
-        host="0.0.0.0",
-        port=8000,
-        hand_side="right",
-        output_frame="flu",
-        verbose=True,
-    )
-
-    print("Waiting for Quest/HTS frames on tcp://0.0.0.0:8000")
-    print("Press Ctrl+C to stop")
-
-    try:
-        with tracker:
-            while True:
-                frame = tracker.get_latest()
-                if frame is None:
-                    print(tracker.get_status())
-                    time.sleep(0.5)
-                    continue
-
-                wrist = frame["wrist_pos"]
-                quat = frame["wrist_quat_wxyz"]
-                print(
-                    f"seq={frame['sequence_id']} "
-                    f"side={frame['side']} "
-                    f"wrist=({wrist[0]:+.3f}, {wrist[1]:+.3f}, {wrist[2]:+.3f}) "
-                    f"quat_wxyz=({quat[0]:+.3f}, {quat[1]:+.3f}, {quat[2]:+.3f}, {quat[3]:+.3f}) "
-                    f"landmarks={frame['landmarks'].shape} "
-                    f"frame={frame['coordinate_frame']}"
-                )
-                time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("\nStopped")
-
-
-if __name__ == "__main__":
-    example()

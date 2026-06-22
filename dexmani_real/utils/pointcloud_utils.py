@@ -25,8 +25,8 @@ class PointCloudConfig:
     return_tensor: bool = True
 
     def __post_init__(self) -> None:
-        # TODO(refactor): object.__setattr__ bypasses frozen=True; replace with
-        # a non-frozen dataclass or a cached property pattern.
+        # object.__setattr__ bypasses frozen=True in __post_init__ to normalize
+        # the workspace tuple after construction.
         if self.sampling not in ("none", "random", "fps", "first"):
             raise ValueError("sampling must be one of: 'none', 'random', 'fps', 'first'.")
         if self.voxel_size is not None and self.voxel_size <= 0:

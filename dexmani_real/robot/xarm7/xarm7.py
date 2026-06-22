@@ -25,6 +25,8 @@ from xarm.wrapper import XArmAPI
 
 from dexmani_real.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
+from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
@@ -167,6 +169,12 @@ class XArm7Config:
     # collision_sensitivity: 0=disabled, 1=least sensitive, 5=most sensitive. Factory default is 3.
     collision_sensitivity: int = 3
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "XArm7Config":
+        """Reconstruct from a serialized dict."""
+        kw = from_dict_helper(cls, d)
+        return cls(**kw)
+
 
 class XArm7(ConnectionStateMixin):
     def __init__(self, config: XArm7Config):
@@ -305,8 +313,8 @@ class XArm7(ConnectionStateMixin):
             tau = self._array7(states[2])
         else:
             qpos = self._read_qpos()
-            qvel = np.full(7, np.nan, dtype=np.float64)
-            tau = np.full(7, np.nan, dtype=np.float64)
+            qvel = nan_array(7)
+            tau = nan_array(7)
 
         state: dict[str, Any] = {
             "qpos": qpos,
@@ -629,7 +637,7 @@ class XArm7(ConnectionStateMixin):
     def _read_qpos(self) -> np.ndarray:
         code, qpos = self.arm.get_servo_angle(is_radian=True)
         if code != 0:
-            return np.full(7, np.nan, dtype=np.float64)
+            return nan_array(7)
         return self._array7(qpos)
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
@@ -725,49 +733,12 @@ class XArm7(ConnectionStateMixin):
     @staticmethod
     def _array7(value) -> np.ndarray:
         if value is None:
-            return np.full(7, np.nan, dtype=np.float64)
+            return nan_array(7)
         arr = np.asarray(value, dtype=np.float64).reshape(-1)
         if arr.size >= 7:
             return arr[:7]
-        out = np.full(7, np.nan, dtype=np.float64)
+        out = nan_array(7)
         out[: arr.size] = arr
         return out
 
 
-def example():
-    from dexmani_real.robot._debug import print_state
-
-    config = XArm7Config(ip="192.168.1.111")
-    robot = XArm7(config)
-
-    if not robot.connect():
-        raise RuntimeError(f"Failed to connect XArm7: {robot.last_error_message}")
-
-    try:
-        print("=== get_state() ===")
-        print_state(robot.get_state())
-
-        print("\n=== get_state(full=True) ===")
-        print_state(robot.get_state(full=True))
-
-        print("\n=== reset() ===")
-        ok = robot.reset()
-        print(f"reset ok: {ok}")
-        print_state(robot.get_state())
-
-        print("\n=== hold 3s ===")
-        qpos = robot.get_state()["qpos"]
-        end_time = time.time() + 3.0
-        while time.time() < end_time:
-            if not robot.send_action(qpos):
-                print(f"send_action failed: {robot.last_error_message}")
-                break
-            time.sleep(robot.config.dt)
-        print_state(robot.get_state())
-
-    finally:
-        robot.disconnect()
-
-
-if __name__ == "__main__":
-    example()

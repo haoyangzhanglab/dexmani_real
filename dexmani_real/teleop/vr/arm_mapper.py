@@ -5,9 +5,12 @@ from __future__ import annotations
 __all__ = ["ArmWristMapper"]
 
 import numpy as np
+from dexmani_real.log import get_logger
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
+
+logger = get_logger(__name__)
 
 
 class ArmWristMapper:
@@ -19,6 +22,7 @@ class ArmWristMapper:
         rot_scale: float = 1.0,
         vr_to_base_rot: np.ndarray | None = None,
         eef_delta_bounds: np.ndarray | None = None,
+        max_delta_rot_rad: float = 1.0,
     ) -> None:
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
@@ -26,6 +30,8 @@ class ArmWristMapper:
         self.vr_to_base_rot = np.eye(3) if vr_to_base_rot is None else np.asarray(vr_to_base_rot, dtype=np.float64)
         # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
         self.eef_delta_bounds = None if eef_delta_bounds is None else np.asarray(eef_delta_bounds, dtype=np.float64)
+        # Per-frame rotation delta cap (rad). ~57° default — catches VR tracking glitches.
+        self.max_delta_rot_rad = max_delta_rot_rad
 
         self.wrist_pos0 = None
         self.wrist_rot0 = None
@@ -63,6 +69,7 @@ class ArmWristMapper:
 
         delta_rot_vr = wrist_rot @ self.wrist_rot0.T
         delta_rot_vr = self.scale_rot(delta_rot_vr)
+        delta_rot_vr = self._clip_delta_rot(delta_rot_vr)
         delta_rot_base = self.vr_to_base_rot @ delta_rot_vr @ self.vr_to_base_rot.T
 
         target_pos = self.eef_pos0 + delta_pos_base
@@ -95,6 +102,21 @@ class ArmWristMapper:
         axis, angle = mat2axangle(rot)
         return axangle2mat(axis, self.rot_scale * angle, is_normalized=True)
 
+    def _clip_delta_rot(self, delta_rot: np.ndarray) -> np.ndarray:
+        """Clamp per-frame rotation delta to prevent VR tracking glitches.
+
+        Ref: ManiUniCon max_delta_rot=1.0rad (~57°).
+        Catches transient VR jumps before they reach IK.
+        """
+        axis, angle = mat2axangle(delta_rot)
+        if angle > self.max_delta_rot_rad:
+            logger.debug(
+                "clip_delta_rot: clamping %.3f rad -> %.3f rad",
+                angle, self.max_delta_rot_rad,
+            )
+            return axangle2mat(axis, self.max_delta_rot_rad, is_normalized=True)
+        return delta_rot
+
     def continuous_quat(self, quat_wxyz: np.ndarray) -> np.ndarray:
         quat_wxyz = normalize_quat_wxyz(quat_wxyz)
         if self.last_quat_wxyz is not None and np.dot(quat_wxyz, self.last_quat_wxyz) < 0:
@@ -103,31 +125,3 @@ class ArmWristMapper:
         return quat_wxyz
 
 
-def example() -> None:
-    mapper = ArmWristMapper(
-        pos_scale=1.0,
-        rot_scale=1.0,
-        eef_delta_bounds=np.array([
-            [-0.3, 0.3],
-            [-0.3, 0.3],
-            [-0.2, 0.2],
-        ]),
-    )
-
-    mapper.reset(
-        wrist_pos=np.array([0.0, 0.0, 0.0]),
-        wrist_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-        eef_pos=np.array([0.4, 0.0, 0.3]),
-        eef_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-    )
-
-    target = mapper.map(
-        wrist_pos=np.array([0.1, 0.0, 0.0]),
-        wrist_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-    )
-
-    print(target)
-
-
-if __name__ == "__main__":
-    example()

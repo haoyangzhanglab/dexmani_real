@@ -1,7 +1,9 @@
 from .collision_config import CollisionConfig
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
-from .planner import FingertipDeskSafety, WorkspaceSafety, XArm7MotionPlanner
+from .desk_safety import FingertipDeskSafety
+from .planner import XArm7MotionPlanner
+from .workspace_safety import WorkspaceSafety
 from .types import (
     IKResult,
     PathResult,

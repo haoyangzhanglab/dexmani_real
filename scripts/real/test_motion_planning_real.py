@@ -17,9 +17,9 @@
 
 from __future__ import annotations
 
-# sys.path修正：脚本已从dexmani_real/example/移至scripts/
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 import time
@@ -37,6 +37,16 @@ from dexmani_real.planning import (
     XArm7PlannerConfig,
 )
 from dexmani_real.robot.xarm7 import XArm7, XArm7Config
+
+from scripts._test_utils import (
+    IKStats,
+    angular_dist_rad,
+    build_target_pose,
+    ik_stats_empty,
+    interpolate_waypoints,
+    quat_multiply,
+    random_quat_within_angle,
+)
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -76,61 +86,15 @@ POS_ERR_THRESHOLD_M = 0.03                     # waypoint 终点位置误差阈�
 # ═══════════════════════════════════════════════ 数学工具
 
 
-def angular_dist_rad(q1: np.ndarray, q2: np.ndarray) -> float:
-    return float(2 * np.arccos(np.clip(np.abs(np.dot(q1, q2)), 0.0, 1.0)))
 
 
-def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-    ])
 
 
-def random_quat_within_angle(rng: np.random.RandomState, max_deg: float) -> np.ndarray:
-    axis = rng.randn(3)
-    axis /= np.linalg.norm(axis)
-    angle = rng.uniform(0, np.deg2rad(max_deg))
-    half = angle / 2
-    return np.array([np.cos(half), axis[0] * np.sin(half),
-                     axis[1] * np.sin(half), axis[2] * np.sin(half)])
 
 
-def build_target_pose(
-    pos: np.ndarray, home_quat: np.ndarray, rng: np.random.RandomState | None = None,
-) -> Pose:
-    quat = home_quat
-    if RANDOM_ROT_DEG > 0 and rng is not None:
-        quat = quat_multiply(random_quat_within_angle(rng, RANDOM_ROT_DEG), home_quat)
-    return Pose(p=pos, q=quat)
-
-
-def interpolate_waypoints(path: np.ndarray, max_step: float = INTERP_MAX_STEP_RAD) -> np.ndarray:
-    if len(path) <= 1:
-        return path
-    dense = [path[0]]
-    for i in range(len(path) - 1):
-        a, b = path[i], path[i + 1]
-        n = int(np.ceil(float(np.max(np.abs(b - a))) / max_step))
-        for k in range(1, n + 1):
-            dense.append(a + (k / n) * (b - a))
-    return np.array(dense, dtype=np.float64)
 
 
 # ═══════════════════════════════════════════════ 数据结构
-
-
-@dataclass
-class IKStats:
-    ok: int
-    total: int
-    pos_errs_mm: list[float]
-    rot_errs_deg: list[float]
-    max_dq_deg: list[float]
 
 
 @dataclass
@@ -144,8 +108,6 @@ class PathPlanStats:
     reasons: list[str]
 
 
-def ik_stats_empty() -> IKStats:
-    return IKStats(ok=0, total=0, pos_errs_mm=[], rot_errs_deg=[], max_dq_deg=[])
 
 
 # ═══════════════════════════════════════════════ Planner
@@ -228,7 +190,7 @@ def test_solve_ik(
         rng.uniform(*SAMPLE_Y, num_samples),
         rng.uniform(*SAMPLE_Z, num_samples),
     ])
-    targets = [build_target_pose(positions[i], home_eef.q, rng) for i in range(num_samples)]
+    targets = [build_target_pose(positions[i], home_eef.q, rng, rot_max_deg=RANDOM_ROT_DEG) for i in range(num_samples)]
 
     fresh = ik_stats_empty()
     fresh.total = num_samples
@@ -285,7 +247,7 @@ def test_solve_teleop_ik(
     prev_cmd = home_qpos.copy()
 
     for pos in positions[1:]:
-        target = build_target_pose(pos, home_eef.q)
+        target = build_target_pose(pos, home_eef.q, rot_max_deg=RANDOM_ROT_DEG)
         r = planner.solve_teleop_ik(target, prev_qpos, prev_cmd)
 
         if r.success and r.qpos is not None:
@@ -323,7 +285,7 @@ def test_plan_path(
     ])
 
     for i in range(num_samples):
-        target = build_target_pose(positions[i], home_eef.q, rng)
+        target = build_target_pose(positions[i], home_eef.q, rng, rot_max_deg=RANDOM_ROT_DEG)
         r = planner.plan_path(target, home_qpos)
 
         if r.success and r.qpos_path is not None:
@@ -458,7 +420,7 @@ def execute_path_on_arm(arm: XArm7, path: np.ndarray) -> tuple[bool, np.ndarray 
     每 send_action 后抽样读取实际关节角（每 5 步读一次，避免过多 SDK 调用），
     与规划路径对比计算跟踪精度。
     """
-    dense = interpolate_waypoints(path)
+    dense = interpolate_waypoints(path, INTERP_MAX_STEP_RAD)
     n = len(dense)
     sample_step = max(1, n // 20)  # 至少 20 个采样点
     actual_samples = []
@@ -513,7 +475,7 @@ def run_waypoint_test(
     """单个 waypoint: plan_path → execute → verify → return_home。"""
     label = waypoint["label"]
     pos = np.array(waypoint["pos"], dtype=np.float64)
-    target = build_target_pose(pos, home_eef.q, rng)
+    target = build_target_pose(pos, home_eef.q, rng, rot_max_deg=RANDOM_ROT_DEG)
 
     current_qpos = np.asarray(arm.get_state()["qpos"], dtype=np.float64)
     dist = float(np.linalg.norm(target.p - planner.compute_eef_pose_world(current_qpos).p))

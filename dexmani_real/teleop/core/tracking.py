@@ -83,30 +83,3 @@ class TrackingQuality:
             return (time.monotonic_ns() - local_recv) * 1e-9
         return float("inf")
 
-
-def example() -> None:
-    tq = TrackingQuality()
-
-    # Simulate fresh frame
-    fresh = {
-        "local_recv_ns": time.monotonic_ns(),
-        "sequence_id": 42,
-    }
-    result = tq.check(fresh)
-    print(f"fresh: ok={result.ok}, age={result.age_s:.4f}s")
-
-    # Simulate None
-    result = tq.check(None)
-    print(f"none: ok={result.ok}, lost_duration={result.lost_duration_s:.4f}s")
-
-    # Simulate stale
-    stale = {
-        "local_recv_ns": time.monotonic_ns() - int(0.3 * 1e9),
-        "sequence_id": 40,
-    }
-    result = tq.check(stale)
-    print(f"stale: ok={result.ok}, stale={result.stale}, tracking_lost={result.tracking_lost}")
-
-
-if __name__ == "__main__":
-    example()

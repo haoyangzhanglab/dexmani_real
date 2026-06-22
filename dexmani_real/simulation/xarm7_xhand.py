@@ -6,15 +6,14 @@ from transforms3d import euler
 
 from dexmani_real import ASSET_DIR
 
-__all__ = ["XArm7XHand", "XArm7_XHand"]
+__all__ = ["XArm7XHand"]
 
 
 class XArm7XHand:
     """XArm7 + XHand simulated robot model for SAPIEN.
 
-    Renamed from XArm7_XHand (PEP 8 compliance — underscores in class names
-    are reserved for leading/trailing double underscores). The old name is
-    available as a deprecated alias.
+    Formerly XArm7_XHand (PEP 8 compliance — underscores in class names
+    are reserved for leading/trailing double underscores).
     """
     def __init__(
         self,
@@ -270,46 +269,3 @@ class XArm7XHand:
         self.apply_action(reset_qpos)
 
 
-def xarm7_xhand_example():
-
-    from dexmani_real.simulation.constructor import add_base_components, add_light, create_viewer, setup_scene
-
-    scene = setup_scene()
-    add_light(scene)
-    add_base_components(scene)
-    viewer_pose = sapien.Pose([0.784212, 0.0267081, 0.630188], [0.00493842, -0.232841, 0.00108951, 0.972502])
-    viewer = create_viewer(scene, viewer_pose)
-    robot = XArm7XHand(
-        scene,
-        disable_self_collision=True,
-    )
-
-    while not viewer.closed:
-        qf = robot.model.compute_passive_force()
-        robot.model.set_qf(qf)
-        qpos = robot.get_qpos()
-        robot.apply_action(qpos)
-        scene.step()
-        scene.update_render()
-        viewer.render()
-
-    pose1 = robot.get_link_poses(robot.fingertip_link_names)
-    print("Real pose:\n", pose1)
-    pose2 = robot.forward_kinematics(robot.get_qpos(), target_link_names=robot.fingertip_link_names)
-    print("FK pose:\n", pose2)
-
-    eef_pose = robot.get_eef_pose()
-    print("Real eef pose:\n", eef_pose)
-    ik_qpos = robot.inverse_kinematics(
-        eef_pose, full_qpos_init=robot.home_qpos + np.random.uniform(-0.1, 0.1, robot.dof)
-    )
-    print("IK qpos:\n", ik_qpos)
-    print("IK eef pose:\n", robot.forward_kinematics(ik_qpos, target_link_names=["custom_eef_link"])[0])
-
-
-# Deprecated alias (PEP 8: underscores in class names are reserved)
-XArm7_XHand = XArm7XHand
-
-
-if __name__ == "__main__":
-    xarm7_xhand_example()

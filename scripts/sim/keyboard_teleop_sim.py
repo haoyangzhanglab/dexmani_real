@@ -18,9 +18,9 @@
 
 from __future__ import annotations
 
-# sys.path修正：脚本已从dexmani_real/example/移至scripts/
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 import threading
@@ -37,6 +37,8 @@ from dexmani_real.planning import (
 )
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, create_viewer
+
+from scripts._test_utils import execute_dense_path, interpolate_waypoints, settle_at_target
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -100,43 +102,9 @@ class GlobalKeyState:
 # ═══════════════════════════════════════════════ 仿真辅助
 
 
-def interpolate_waypoints(path: np.ndarray, max_step: float = INTERP_MAX_STEP_RAD) -> np.ndarray:
-    """对稀疏关节路径线性插值。"""
-    if len(path) <= 1:
-        return path
-    dense = [path[0]]
-    for i in range(len(path) - 1):
-        a, b = path[i], path[i + 1]
-        n = int(np.ceil(float(np.max(np.abs(b - a))) / max_step))
-        for k in range(1, n + 1):
-            dense.append(a + (k / n) * (b - a))
-    return np.array(dense, dtype=np.float64)
 
 
-def execute_dense_path(
-    sim: SimRobotInterface, dense: np.ndarray, viewer: sapien.Viewer | None = None,
-) -> bool:
-    """执行已插值的稠密关节路径，(N,7) arm-only。"""
-    assert dense.ndim == 2 and dense.shape[1] == 7
-    hand = sim.get_full_qpos()[7:]
-    for wp in dense:
-        if viewer is not None and viewer.closed:
-            return False
-        sim.robot.balance_passive_force()
-        sim.robot.apply_action(np.concatenate([wp, hand]))
-        sim._step_physics(n=PHYSICS_STEPS_PER_WP)
-        if viewer is not None:
-            sim.scene.update_render()
-            viewer.render()
-    return True
 
-
-def settle_at_target(sim: SimRobotInterface, target_arm: np.ndarray, hand_qpos: np.ndarray) -> None:
-    """在目标 arm 关节上稳定 PD 控制器。"""
-    for _ in range(3):
-        sim.robot.balance_passive_force()
-        sim.robot.apply_action(np.concatenate([target_arm, hand_qpos]))
-        sim._step_physics(n=PHYSICS_STEPS_PER_WP)
 
 
 def execute_return_home(
@@ -156,14 +124,14 @@ def execute_return_home(
     path = result.qpos_path
     # 追加关节归位目标
     full = np.vstack([path, home_qpos])
-    dense_joint = interpolate_waypoints(full)
+    dense_joint = interpolate_waypoints(full, INTERP_MAX_STEP_RAD)
     if not any(planner.has_self_collision(q) for q in dense_joint):
         path = full
 
-    dense = interpolate_waypoints(path)
+    dense = interpolate_waypoints(path, INTERP_MAX_STEP_RAD)
     hand_qpos = sim.get_full_qpos()[7:]
-    execute_dense_path(sim, dense, viewer)
-    settle_at_target(sim, dense[-1, :7], hand_qpos)
+    execute_dense_path(sim, dense, viewer, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
+    settle_at_target(sim, dense[-1, :7], hand_qpos, max_iter=3, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
 
     final_qpos = sim.get_full_qpos()[:7]
     joint_err = float(np.max(np.abs(final_qpos - home_qpos)))

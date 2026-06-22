@@ -17,6 +17,7 @@ import numpy as np
 
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.simulation.constructor import add_base_components, setup_scene
+from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 
 
@@ -114,8 +115,8 @@ class SimRobotInterface(ConnectionStateMixin):
     def get_state(self, full: bool = False) -> dict[str, Any]:
         if self.robot is None:
             return {
-                "qpos": np.full(19, np.nan),
-                "qvel": np.full(19, np.nan),
+                "qpos": nan_array(19),
+                "qvel": nan_array(19),
                 "timestamp": time.time(),
             }
 
@@ -207,7 +208,7 @@ class SimRobotInterface(ConnectionStateMixin):
     def get_full_qpos(self) -> np.ndarray:
         """Return full 19-DOF qpos [arm7, hand12]."""
         if self.robot is None:
-            return np.full(19, np.nan)
+            return nan_array(19)
         return self.robot.get_qpos().copy()
 
     # ------------------------------------------------------------------
@@ -245,47 +246,3 @@ class SimRobotInterface(ConnectionStateMixin):
 
         return {"ok": max_err < 0.1, "max_error": float(max_err), "n_tests": n_tests}
 
-
-def example():
-    sim = SimRobotInterface(SimRobotConfig(headless=True))
-    if not sim.connect():
-        print(f"connect failed: {sim.last_error_message}")
-        return
-
-    try:
-        print("connected:", sim.is_connected())
-
-        state = sim.get_state(full=True)
-        print(f"arm_qpos: {np.round(state['arm_qpos'], 3)}")
-        print(f"eef_pos: {np.round(state['eef_pos'], 3)}")
-
-        # FK consistency
-        fk = sim.validate_fk_consistency()
-        print(f"FK consistency: ok={fk['ok']}, max_err={fk['max_error']:.6f}")
-
-        # IK roundtrip
-        ik = sim.validate_ik_roundtrip()
-        print(f"IK roundtrip: ok={ik['ok']}, max_err={ik.get('max_error', 0):.6f}")
-
-        # stay-in-place
-        ok = sim.send_action(sim.get_full_qpos())
-        print(f"send_action: {ok}")
-
-        # small-move
-        target = sim.get_full_qpos() + np.deg2rad(2.0)
-        ok = sim.send_action(target)
-        print(f"small-move: {ok}")
-
-        # reset
-        ok = sim.reset()
-        print(f"reset: {ok}")
-        print(f"  arm_qpos after: {np.round(sim.get_state()['arm_qpos'], 3)}")
-
-        print("\nall sim tests passed")
-
-    finally:
-        sim.disconnect()
-
-
-if __name__ == "__main__":
-    example()

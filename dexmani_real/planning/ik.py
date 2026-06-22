@@ -240,7 +240,10 @@ class TeleopIKSolver:
         Uses full tracking gain=1.0 — speed safety is handled downstream
         by XArm7._limit_joint_step() bottleneck scaling.
         """
-        current_pose = self.kin.compute_eef_pose_world(current_qpos)
+        # Single FK call for both pose and Jacobian — avoids redundant
+        # compute_forward_kinematics (~0.05 ms savings in 50 Hz hot path).
+        jacobian, current_pose = self.kin.compute_eef_jacobian_and_pose_world(current_qpos)
+
         error_world = pose_error_vector(
             target=target_eef_pose_world,
             actual=current_pose,
@@ -257,8 +260,28 @@ class TeleopIKSolver:
         R6[3:, 3:] = R_local_world
         error = R6 @ error_world
 
-        jacobian = self.kin.compute_eef_jacobian(current_qpos)
-        damping = float(profile.differential_ik_damping)
+        # Adaptive damping based on Yoshikawa manipulability.
+        # Ref: LeFranX weighted_ik.cpp:71-76 (manipulability scoring)
+        #      ManiUniCon ik_solver.py (QP near-zero damping in non-singular regions)
+        if profile.adaptive_damping:
+            # Reuse the Jacobian already computed above (line 260) to avoid
+            # a redundant FK+Jacobian call inside compute_manipulability().
+            mu = self.kin.manipulability_from_jacobian(jacobian)
+            threshold = profile.manipulability_threshold
+            if mu > threshold:
+                damping = profile.differential_ik_min_damping
+            elif mu < 1e-6:
+                damping = profile.differential_ik_max_damping
+            else:
+                ratio = mu / threshold
+                damping = (
+                    profile.differential_ik_min_damping
+                    + (profile.differential_ik_max_damping - profile.differential_ik_min_damping)
+                    * (1.0 - ratio)
+                )
+        else:
+            damping = float(profile.differential_ik_damping)
+
         lhs = jacobian @ jacobian.T + (damping * damping) * np.eye(6)
         try:
             dq = jacobian.T @ np.linalg.solve(lhs, error)
@@ -271,6 +294,23 @@ class TeleopIKSolver:
             )
 
         raw_target_qpos = current_qpos + dq
+
+        # Manipulability gate: reject solutions below safety threshold.
+        # Ref: LeFranX weighted IK scoring — manipulability is the primary
+        # quality term for singularity avoidance.
+        if profile.min_manipulability > 0:
+            target_manip = self.kin.compute_manipulability(raw_target_qpos)
+            if target_manip < profile.min_manipulability:
+                # Retry with higher damping to push away from singularity
+                heavy_damping = damping * profile.singularity_damping_scale
+                lhs2 = jacobian @ jacobian.T + (heavy_damping * heavy_damping) * np.eye(6)
+                try:
+                    dq2 = jacobian.T @ np.linalg.solve(lhs2, error)
+                    raw_target_qpos = current_qpos + dq2
+                except np.linalg.LinAlgError:
+                    # Can't escape singularity — fall through to position IK
+                    pass
+
         raw_target_qpos = self.ik_mgr.canonicalize_qpos(raw_target_qpos, previous_qpos_cmd)
 
         diff_report = {

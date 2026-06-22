@@ -26,12 +26,9 @@
 
 from __future__ import annotations
 
-# sys.path修正：脚本已从dexmani_real/example/移至scripts/
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
-
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import time
 from collections import deque
 from dataclasses import dataclass

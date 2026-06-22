@@ -6,6 +6,8 @@ They are independent of the RobotInterface orchestration class to avoid circular
 
 from __future__ import annotations
 
+import dataclasses
+import typing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -13,9 +15,37 @@ import numpy as np
 
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.robot.xhand import XHandConfig
+from dexmani_real.utils.serialization import from_dict_helper
 
 if TYPE_CHECKING:
     from dexmani_real.planning.collision_config import CollisionConfig
+else:
+    CollisionConfig = None  # resolved lazily when needed
+
+
+def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
+    """Validate ndarray field shapes for a dataclass instance.
+
+    For each (field_name, expected_shape) in specs:
+      - retrieves the field value via getattr
+      - skips None-valued fields
+      - converts to np.ndarray via np.asarray
+      - raises ValueError on shape mismatch
+
+    The error message includes the class name and field name, matching the
+    format originally used inline in RobotState/RobotAction.__post_init__.
+    """
+    cls_name = type(instance).__name__
+    for field_name, expected_shape in specs:
+        val = getattr(instance, field_name)
+        if val is None:
+            continue
+        arr = np.asarray(val)
+        if arr.shape != expected_shape:
+            raise ValueError(
+                f"{cls_name}.{field_name} shape mismatch: "
+                f"expected {expected_shape}, got {arr.shape}"
+            )
 
 
 @dataclass
@@ -55,7 +85,7 @@ class RobotState:
     timestamp: float              # seconds
 
     def __post_init__(self):
-        for field_name, expected_shape in [
+        _validate_field_shapes(self, [
             ("arm_qpos", (7,)),
             ("arm_qvel", (7,)),
             ("arm_tau", (7,)),
@@ -68,15 +98,7 @@ class RobotState:
             ("hand_tactile_raw", (5, 120, 3)),
             ("hand_temperature", (12,)),
             ("fingertip_pos", (5, 3)),
-        ]:
-            val = getattr(self, field_name)
-            if val is not None:
-                arr = np.asarray(val)
-                if arr.shape != expected_shape:
-                    raise ValueError(
-                        f"RobotState.{field_name} shape mismatch: "
-                        f"expected {expected_shape}, got {arr.shape}"
-                    )
+        ])
 
 
 @dataclass
@@ -94,18 +116,10 @@ class RobotAction:
     target_eef_rot6d: np.ndarray | None = None  # (6,)  float64
 
     def __post_init__(self):
-        for field_name, expected_shape in [
+        _validate_field_shapes(self, [
             ("arm_qpos_cmd", (7,)),
             ("hand_qpos_cmd", (12,)),
-        ]:
-            val = getattr(self, field_name)
-            if val is not None:
-                arr = np.asarray(val)
-                if arr.shape != expected_shape:
-                    raise ValueError(
-                        f"RobotAction.{field_name} shape mismatch: "
-                        f"expected {expected_shape}, got {arr.shape}"
-                    )
+        ])
 
 
 @dataclass
@@ -121,6 +135,10 @@ class RobotInterfaceConfig:
             [0.05, 0.5],   # z [min, max] m
         ], dtype=np.float64)
     )
+
+    # Orientation workspace safety (Euler XYZ, radians).
+    # None disables orientation checking (backward compatible).
+    workspace_orientation_bounds: np.ndarray | None = None
 
     # Environment collision (table at z=0.0 m in world frame)
     add_table_collision: bool = True
@@ -149,3 +167,9 @@ class RobotInterfaceConfig:
     # still supported for backward compatibility but deprecated in favor of
     # CollisionConfig.
     collision: CollisionConfig | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RobotInterfaceConfig":
+        """Reconstruct from a serialized dict (reverse of PipelineConfig.to_dict())."""
+        kw = from_dict_helper(cls, d)
+        return cls(**kw)

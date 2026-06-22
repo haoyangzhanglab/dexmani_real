@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 __all__ = ["RealSense", "RealSenseConfig", "CameraFrame", "L515DepthConfig", "AlignMode", "_normalize_align_mode"]
@@ -129,8 +129,8 @@ class RealSenseConfig:
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
 
     def __post_init__(self) -> None:
-        # TODO(refactor): object.__setattr__ bypasses frozen=True; replace with
-        # a non-frozen dataclass or a cached property pattern.
+        # object.__setattr__ bypasses frozen=True in __post_init__ so we can
+        # normalize/normalize assign immutable fields after construction.
         mode = _normalize_align_mode(self.align_mode)
         object.__setattr__(self, "align_mode", mode)
         if mode != "none" and not self.enable_color:
@@ -550,68 +550,3 @@ class RealSense:
         return cameras
 
 
-EXAMPLE_CAMERA_CONFIG = RealSenseConfig()
-EXAMPLE_POINTCLOUD_CONFIG = PointCloudConfig(return_tensor=False)
-
-
-def example(
-    camera_config: RealSenseConfig = EXAMPLE_CAMERA_CONFIG,
-    pointcloud_config: PointCloudConfig = EXAMPLE_POINTCLOUD_CONFIG,
-) -> None:
-    import cv2
-
-    cameras = RealSense.list_cameras()
-    if len(cameras) == 0:
-        print("No RealSense camera found.")
-        return
-
-    print("Detected RealSense cameras:")
-    for camera in cameras:
-        print(f"  {camera.get('name', ''):28s} SN={camera.get('serial', '')} FW={camera.get('firmware', '')}")
-    print(f"Camera config: {asdict(camera_config)}")
-    print(f"PointCloud config: {asdict(pointcloud_config)}")
-    print("Keys: q quit | p show current point cloud")
-
-    with RealSense(camera_config) as camera:
-        print("Active K:")
-        print(camera.get_intrinsics())
-        print(f"depth_scale: {camera.get_depth_scale()}")
-
-        last_pointcloud = None
-        while True:
-            start_time = time.perf_counter()
-            frame = camera.read()
-            grab_ms = (time.perf_counter() - start_time) * 1000.0
-
-            depth_vis = make_depth_vis(frame.depth, pointcloud_config.min_depth or 0.05, pointcloud_config.max_depth or 1.5)
-            if frame.rgb is not None:
-                color_bgr = np.ascontiguousarray(frame.rgb[..., ::-1])
-                if color_bgr.shape[:2] != depth_vis.shape[:2]:
-                    depth_vis = cv2.resize(depth_vis, (color_bgr.shape[1], color_bgr.shape[0]))
-                panel = np.concatenate([color_bgr, depth_vis], axis=1)
-            else:
-                panel = depth_vis
-
-            valid_ratio = depth_valid_ratio(frame.depth, pointcloud_config.min_depth, pointcloud_config.max_depth)
-            text = f"id={frame.frame_id} ts={frame.timestamp:.3f}s grab={grab_ms:.1f}ms valid={valid_ratio:.3f}"
-            cv2.putText(panel, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(panel, f"align={frame.align_mode}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-
-            cv2.imshow("RealSense | RGB(left) Depth(right)", panel)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("p"):
-                try:
-                    last_pointcloud = camera.pointcloud_from_frame(frame, pointcloud_config)
-                    vis_point_cloud(last_pointcloud, voxel_size=0.005)
-                except ImportError:
-                    print("open3d is not installed; cannot visualize point cloud.")
-                except ValueError as error:
-                    print(error)
-
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    example()

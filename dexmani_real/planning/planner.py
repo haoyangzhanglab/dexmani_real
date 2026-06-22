@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import os
 import warnings
 from typing import Any
@@ -14,7 +12,9 @@ from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
 from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
+from .desk_safety import FingertipDeskSafety
 from .pose_utils import compute_pose_error, ensure_qpos
+from .workspace_safety import WorkspaceSafety
 
 __all__ = [
     "FingertipDeskSafety",
@@ -26,6 +26,10 @@ __all__ = [
 _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
+
+# Collision check step size in radians for segment dense interpolation.
+# Used by check_path_collisions / _is_shortcut_valid (ref: dimos collision_step_size).
+COLLISION_STEP_SIZE = 0.02
 
 
 class XArm7MotionPlanner:
@@ -122,6 +126,25 @@ class XArm7MotionPlanner:
                 )
             except (ValueError, RuntimeError, IndexError):
                 pass  # desk_safety remains None — desk FK checks skipped
+
+    def __getattr__(self, name: str):
+        """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mp_planner.
+
+        Eliminates 24 pure-delegation methods (ref: code-simplification-review).
+        Callers use ``planner.compute_eef_pose_world(q)`` as before — the proxy
+        routes to ``self.kin.compute_eef_pose_world(q)`` transparently.
+
+        Only fires when normal attribute lookup fails (i.e. the method is not
+        defined on XArm7MotionPlanner directly).  ``self.kin``, ``self.ik_mgr``,
+        and ``self.mp_planner`` are regular attributes set in ``__init__`` and
+        are never proxied.
+        """
+        for delegate in (self.kin, self.ik_mgr, self.mp_planner):
+            if hasattr(delegate, name):
+                return getattr(delegate, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
 
     def set_collision_config(self, collision_config: "CollisionConfig") -> bool:
         """Post-construction collision config injection (used by RobotInterface).
@@ -228,86 +251,18 @@ class XArm7MotionPlanner:
         best.report["num_valid_plans"] = len(valid_results)
         return best
 
-    # ── Public API: Kinematics delegation ──
-
-    def world_to_base_pose(self, pose_world: Pose) -> Pose:
-        return self.kin.world_to_base_pose(pose_world)
-
-    def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
-        return self.kin.compute_eef_pose_world(qpos)
-
-    def compute_eef_jacobian(self, qpos: np.ndarray) -> np.ndarray:
-        return self.kin.compute_eef_jacobian(qpos)
-
-    def compute_manipulability(self, qpos: np.ndarray) -> float:
-        return self.kin.compute_manipulability(qpos)
-
-    def compute_world_pose_error(self, target_eef_pose_world: Pose, qpos: np.ndarray) -> tuple[float, float]:
-        return self.kin.compute_world_pose_error(target_eef_pose_world, qpos)
-
-    def to_mplib_pose(self, pose: Pose) -> Any:
-        return self.kin.to_mplib_pose(pose)
-
-    # ── Public API: IK Candidates delegation ──
-
-    def call_mplib_ik(
-        self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
-    ) -> tuple[str, Any]:
-        return self.ik_mgr.call_mplib_ik(target_pose_base, seed_qpos, n_init_qpos, return_closest)
-
-    def collect_ik_candidates(
-        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
-    ) -> tuple[list[tuple[np.ndarray, dict[str, Any]]], dict[str, Any]]:
-        return self.ik_mgr.collect_ik_candidates(target_eef_pose_world, current_qpos, profile)
-
-    def filter_ik_candidate(
-        self, qpos: np.ndarray, raw_qpos: np.ndarray, target_eef_pose_world: Pose,
-        current_qpos: np.ndarray, profile: PlanningProfile, limits: np.ndarray,
-    ) -> tuple[bool, dict[str, Any]]:
-        return self.ik_mgr.filter_ik_candidate(qpos, raw_qpos, target_eef_pose_world, current_qpos, profile, limits)
-
-    def resolve_planning_limits(self, profile: PlanningProfile, reference_qpos: np.ndarray | None = None) -> np.ndarray:
-        return self.ik_mgr.resolve_planning_limits(profile, reference_qpos)
-
-    def canonicalize_qpos(
-        self, qpos: np.ndarray, reference_qpos: np.ndarray, limits: np.ndarray | None = None, limit_tol: float = 1e-5
-    ) -> np.ndarray:
-        return self.ik_mgr.canonicalize_qpos(qpos, reference_qpos, limits, limit_tol)
-
-    def canonicalize_path_to_planning_limits(
-        self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile
-    ) -> np.ndarray:
-        return self.ik_mgr.canonicalize_path_to_planning_limits(path, current_qpos, profile)
-
-    def snap_path_to_nearest_equivalent(self, path: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        return self.ik_mgr.snap_path_to_nearest_equivalent(path, reference_qpos)
-
-    def compute_qpos_delta(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        return self.ik_mgr.compute_qpos_delta(qpos, reference_qpos)
-
-    def limit_violation(
-        self, qpos: np.ndarray, limits: np.ndarray, limit_tol: float = 1e-5
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return self.ik_mgr.limit_violation(qpos, limits, limit_tol)
-
-    def path_limit_violation(
-        self, path: np.ndarray, limits: np.ndarray, limit_tol: float = 1e-5
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return self.ik_mgr.path_limit_violation(path, limits, limit_tol)
-
-    def has_self_collision(self, qpos: np.ndarray) -> bool:
-        return self.ik_mgr.has_self_collision(qpos)
-
-    def has_env_collision(self, qpos: np.ndarray) -> bool:
-        return self.ik_mgr.has_env_collision(qpos)
-
-    def check_path_collisions(self, path: np.ndarray, collision_step_size: float = 0.02) -> dict[str, Any]:
-        return self.ik_mgr.check_path_collisions(path, collision_step_size)
-
-    def check_path_env_collisions(self, path: np.ndarray, collision_step_size: float = 0.02) -> dict[str, Any]:
-        return self.ik_mgr.check_path_env_collisions(path, collision_step_size)
-
-    # ── Environment collision objects ──
+    # ── Pass-through delegates ──
+    # All kinematics, IK candidate, and collision-check methods are proxied via
+    # __getattr__ to self.kin / self.ik_mgr / self.mp_planner (22 methods
+    # removed).  See __getattr__ docstring for rationale.
+    #
+    # Explicit delegates retained only for methods that add semantic value:
+    #   - solve_ik / solve_teleop_ik / plan_path  (planning orchestration)
+    #   - set_base_pose  (coordinates kin + mp_planner)
+    #   - add_point_cloud / remove_point_cloud (different API than mp_planner)
+    #
+    # Direct passthrough callers use the same syntax as before (e.g.
+    # planner.compute_eef_pose_world(q)), now routed via __getattr__.
 
     def add_point_cloud(
         self, points: np.ndarray, name: str = "table", resolution: float = 0.01
@@ -323,15 +278,6 @@ class XArm7MotionPlanner:
     def remove_point_cloud(self, name: str = "table") -> bool:
         """Remove a point cloud collision object by name."""
         return self.mp_planner.remove_point_cloud(name)
-
-    def normalized_joint_distance(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> float:
-        return self.ik_mgr.normalized_joint_distance(qpos, reference_qpos)
-
-    def joint_limit_penalty(self, qpos: np.ndarray, limits: np.ndarray) -> float:
-        return self.ik_mgr.joint_limit_penalty(qpos, limits)
-
-    def profile_array(self, values: tuple[float, ...], name: str) -> np.ndarray:
-        return self.ik_mgr.profile_array(values, name)
 
     # ── Planning strategies (internal) ──
 
@@ -358,17 +304,15 @@ class XArm7MotionPlanner:
         results: list[PathResult] = []
         for rrt_range in profile.rrt_range_options:
             for attempt_index in range(profile.num_rrt_attempts):
-                # MPlib plan_qpos unconditionally prints collision warnings
-                # for the start state via print() — capture and discard them.
-                with contextlib.redirect_stdout(io.StringIO()) as _f:
-                    result = self.mp_planner.plan_qpos(
-                        goal_qposes=goal_qposes,
-                        current_qpos=current_qpos,
-                        time_step=profile.path_dt,
-                        rrt_range=rrt_range,
-                        planning_time=profile.rrt_time_limit,
-                        simplify=profile.simplify_path,
-                    )
+                result = self.mp_planner.plan_qpos(
+                    goal_qposes=goal_qposes,
+                    current_qpos=current_qpos,
+                    time_step=profile.path_dt,
+                    rrt_range=rrt_range,
+                    planning_time=profile.rrt_time_limit,
+                    simplify=profile.simplify_path,
+                    verbose=False,  # MPlib verbose=False suppresses debug output (P3.2)
+                )
                 path_result = self.result_from_mplib(
                     result, target_eef_pose_world, current_qpos, source="rrt", profile=profile
                 )
@@ -442,8 +386,8 @@ class XArm7MotionPlanner:
         """Check if the direct prev→nxt shortcut segment is collision-free.
 
         In contrast to the old midpoint-only check, this interpolates the
-        full linear segment at collision_step_size resolution (ref: dimos
-        collision_step_size=0.02) and checks every intermediate point.
+        full linear segment at COLLISION_STEP_SIZE resolution (ref: dimos
+        collision_step_size) and checks every intermediate point.
 
         Joint limits are only checked at the midpoint (limit bounds are
         convex, so midpoint-outside implies the segment is problematic).
@@ -455,10 +399,10 @@ class XArm7MotionPlanner:
             return False
         # Dense collision check along the entire prev→nxt segment
         if profile.check_self_collision:
-            if not self.ik_mgr._check_segment_collision_free(prev, nxt, step_size=0.02):
+            if not self.ik_mgr._check_segment_collision_free(prev, nxt, step_size=COLLISION_STEP_SIZE):
                 return False
         if profile.check_env_collision:
-            if not self.ik_mgr._check_segment_env_collision_free(prev, nxt, step_size=0.02):
+            if not self.ik_mgr._check_segment_env_collision_free(prev, nxt, step_size=COLLISION_STEP_SIZE):
                 return False
         # Geometric FK desk safety for the shortcut segment
         if self.desk_safety is not None and profile.check_env_collision:
@@ -476,6 +420,12 @@ class XArm7MotionPlanner:
         source: str,
         profile: PlanningProfile,
     ) -> PathResult:
+        """Validate a planned path through a chain of independent checks.
+
+        Each check returns None on pass or a failure PathResult.  Checks are
+        ordered by cost (cheapest first) to fail fast.
+        """
+        # ── Preprocessing ──
         try:
             path = self.snap_path_to_nearest_equivalent(path, current_qpos)
             path = self.canonicalize_path_to_planning_limits(path, current_qpos, profile)
@@ -484,101 +434,129 @@ class XArm7MotionPlanner:
             return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
 
         report = self.compute_path_metrics(path, target_eef_pose_world, current_qpos, profile)
-        if report["limit_violation"]:
-            return PathResult(
-                success=False, qpos_path=None, source=source, reason="Path violates planning limits.", report=report
-            )
-        has_flip, flip_info = self.check_elbow_consistency(path)
-        if has_flip:
-            report.update(flip_info)
-            return PathResult(
-                success=False, qpos_path=None, source=source, reason="Elbow branch flip detected.", report=report
-            )
-        if profile.check_self_collision:
-            collision_report = self.check_path_collisions(path)
-            report.update(collision_report)
-            if collision_report.get("path_self_collision"):
-                return PathResult(
-                    success=False, qpos_path=None, source=source, reason="Path contains self-collision.", report=report
-                )
-        if profile.check_env_collision:
-            env_collision_report = self.check_path_env_collisions(path)
-            report.update(env_collision_report)
-            if env_collision_report.get("path_env_collision"):
-                return PathResult(
-                    success=False, qpos_path=None, source=source,
-                    reason="Path contains environment collision.", report=report,
-                )
-        if report["start_qpos_error_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
-            return PathResult(
-                success=False,
-                qpos_path=None,
-                source=source,
-                reason="Path start is too far from current_qpos.",
-                report=report,
-            )
-        if report["max_waypoint_delta_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
-            return PathResult(
-                success=False, qpos_path=None, source=source, reason="Path waypoint delta too large.", report=report
-            )
-        if (
-            report["terminal_pos_error_m"] > profile.max_pose_error_pos_m
-            or report["terminal_rot_error_rad"] > profile.max_pose_error_rot_rad
+
+        # ── Validation chain (fail-fast, cheapest first) ──
+        for check in (
+            self._check_limit_violation,
+            self._check_elbow_consistency,
+            self._check_start_distance,
+            self._check_waypoint_delta,
+            self._check_terminal_pose,
+            self._check_self_collision,
+            self._check_env_collision,
+            self._check_workspace_bounds,
+            self._check_desk_safety,
         ):
-            return PathResult(
-                success=False, qpos_path=None, source=source, reason="Terminal pose error too large.", report=report
-            )
-        if self.workspace_bounds is not None:
-            eef_positions = np.array(
-                [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
-            )
-            for i, eef_p in enumerate(eef_positions):
-                if not (
-                    eef_p[0] >= self.workspace_bounds[0, 0] and eef_p[0] <= self.workspace_bounds[0, 1]
-                    and eef_p[1] >= self.workspace_bounds[1, 0] and eef_p[1] <= self.workspace_bounds[1, 1]
-                    and eef_p[2] >= self.workspace_bounds[2, 0] and eef_p[2] <= self.workspace_bounds[2, 1]
-                ):
-                    axis_name = {0: "X", 1: "Y", 2: "Z"}
-                    violations = []
-                    for ax in range(3):
-                        if eef_p[ax] < self.workspace_bounds[ax, 0]:
-                            violations.append(
-                                f"axis={axis_name[ax]} val={eef_p[ax]:.3f} < {self.workspace_bounds[ax, 0]:.3f}"
-                            )
-                        elif eef_p[ax] > self.workspace_bounds[ax, 1]:
-                            violations.append(
-                                f"axis={axis_name[ax]} val={eef_p[ax]:.3f} > {self.workspace_bounds[ax, 1]:.3f}"
-                            )
-                    report["workspace_violation_index"] = i
-                    report["workspace_violation_summary"] = "; ".join(violations)
-                    return PathResult(
-                        success=False,
-                        qpos_path=None,
-                        source=source,
-                        reason=f"Path contains workspace violations: waypoint[{i}] ({'; '.join(violations)})",
-                        report=report,
-                    )
-        # Geometric FK desk safety check (fingertip Z vs table surface)
-        if self.desk_safety is not None and profile.check_env_collision:
-            desk_safe, min_z, viol_idx = self.desk_safety.check_path_desk_safety(path)
-            report["desk_safety_min_fingertip_z"] = float(min_z)
-            report["desk_safety_violation_index"] = int(viol_idx)
-            if not desk_safe:
-                return PathResult(
-                    success=False,
-                    qpos_path=None,
-                    source=source,
-                    reason=f"Path contains desk collision (fingertip z_min={min_z:.3f}m < "
-                           f"safe={self.desk_safety.config.fingertip_threshold:.3f}m, "
-                           f"segment {viol_idx})",
-                    report=report,
-                )
+            failure = check(path, report, source, profile)
+            if failure is not None:
+                return failure
+
+        # ── All checks passed ──
         report["path_score"] = float(
             _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
             + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
             + _PATH_SCORE_EEF_EFFICIENCY_WEIGHT * (1.0 - report.get("eef_efficiency", 1.0))
         )
         return PathResult(success=True, qpos_path=path, source=source, report=report)
+
+    # ── Path validators (each returns None on pass, PathResult on failure) ──
+
+    @staticmethod
+    def _make_failure(reason: str, source: str, report: dict) -> PathResult:
+        return PathResult(success=False, qpos_path=None, source=source, reason=reason, report=report)
+
+    def _check_limit_violation(self, _path, report, source, _profile):
+        if report.get("limit_violation"):
+            return self._make_failure("Path violates planning limits.", source, report)
+        return None
+
+    def _check_elbow_consistency(self, path, report, source, _profile):
+        has_flip, flip_info = self.check_elbow_consistency(path)
+        if has_flip:
+            report.update(flip_info)
+            return self._make_failure("Elbow branch flip detected.", source, report)
+        return None
+
+    def _check_start_distance(self, _path, report, source, profile):
+        if report["start_qpos_error_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
+            return self._make_failure("Path start is too far from current_qpos.", source, report)
+        return None
+
+    def _check_waypoint_delta(self, _path, report, source, profile):
+        if report["max_waypoint_delta_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
+            return self._make_failure("Path waypoint delta too large.", source, report)
+        return None
+
+    def _check_terminal_pose(self, _path, report, source, profile):
+        if (
+            report["terminal_pos_error_m"] > profile.max_pose_error_pos_m
+            or report["terminal_rot_error_rad"] > profile.max_pose_error_rot_rad
+        ):
+            return self._make_failure("Terminal pose error too large.", source, report)
+        return None
+
+    def _check_self_collision(self, path, report, source, profile):
+        if not profile.check_self_collision:
+            return None
+        collision_report = self.check_path_collisions(path)
+        report.update(collision_report)
+        if collision_report.get("path_self_collision"):
+            return self._make_failure("Path contains self-collision.", source, report)
+        return None
+
+    def _check_env_collision(self, path, report, source, profile):
+        if not profile.check_env_collision:
+            return None
+        env_collision_report = self.check_path_env_collisions(path)
+        report.update(env_collision_report)
+        if env_collision_report.get("path_env_collision"):
+            return self._make_failure("Path contains environment collision.", source, report)
+        return None
+
+    def _check_workspace_bounds(self, path, report, source, _profile):
+        if self.workspace_bounds is None:
+            return None
+        eef_positions = np.array(
+            [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
+        )
+        for i, eef_p in enumerate(eef_positions):
+            if not (
+                eef_p[0] >= self.workspace_bounds[0, 0] and eef_p[0] <= self.workspace_bounds[0, 1]
+                and eef_p[1] >= self.workspace_bounds[1, 0] and eef_p[1] <= self.workspace_bounds[1, 1]
+                and eef_p[2] >= self.workspace_bounds[2, 0] and eef_p[2] <= self.workspace_bounds[2, 1]
+            ):
+                axis_name = {0: "X", 1: "Y", 2: "Z"}
+                violations = []
+                for ax in range(3):
+                    if eef_p[ax] < self.workspace_bounds[ax, 0]:
+                        violations.append(
+                            f"axis={axis_name[ax]} val={eef_p[ax]:.3f} < {self.workspace_bounds[ax, 0]:.3f}"
+                        )
+                    elif eef_p[ax] > self.workspace_bounds[ax, 1]:
+                        violations.append(
+                            f"axis={axis_name[ax]} val={eef_p[ax]:.3f} > {self.workspace_bounds[ax, 1]:.3f}"
+                        )
+                report["workspace_violation_index"] = i
+                report["workspace_violation_summary"] = "; ".join(violations)
+                return self._make_failure(
+                    f"Path contains workspace violations: waypoint[{i}] ({'; '.join(violations)})",
+                    source, report,
+                )
+        return None
+
+    def _check_desk_safety(self, path, report, source, profile):
+        if self.desk_safety is None or not profile.check_env_collision:
+            return None
+        desk_safe, min_z, viol_idx = self.desk_safety.check_path_desk_safety(path)
+        report["desk_safety_min_fingertip_z"] = float(min_z)
+        report["desk_safety_violation_index"] = int(viol_idx)
+        if not desk_safe:
+            return self._make_failure(
+                f"Path contains desk collision (fingertip z_min={min_z:.3f}m < "
+                f"safe={self.desk_safety.config.fingertip_threshold:.3f}m, segment {viol_idx})",
+                source, report,
+            )
+        return None
 
     def compute_path_metrics(
         self, path: np.ndarray, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
@@ -633,170 +611,3 @@ class XArm7MotionPlanner:
         return False, {}
 
     # ── Elbow consistency check (internal) ──
-
-
-class WorkspaceSafety:
-    """EEF workspace bounds checking and clamping.
-
-    workspace_bounds: (3, 2) array [[x_min, x_max], [y_min, y_max], [z_min, z_max]] in meters.
-    """
-
-    def __init__(self, workspace_bounds: np.ndarray) -> None:
-        self.bounds = np.asarray(workspace_bounds, dtype=np.float64)
-        if self.bounds.shape != (3, 2):
-            raise ValueError(f"workspace_bounds must have shape (3, 2), got {self.bounds.shape}.")
-
-    def check(self, eef_pos: np.ndarray) -> bool:
-        """Check whether EEF position is within workspace bounds."""
-        eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
-        return bool(
-            (eef_pos[0] >= self.bounds[0, 0])
-            and (eef_pos[0] <= self.bounds[0, 1])
-            and (eef_pos[1] >= self.bounds[1, 0])
-            and (eef_pos[1] <= self.bounds[1, 1])
-            and (eef_pos[2] >= self.bounds[2, 0])
-            and (eef_pos[2] <= self.bounds[2, 1])
-        )
-
-    def clamp(self, target_pos: np.ndarray) -> np.ndarray:
-        """Clip target position to workspace bounds."""
-        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3).copy()
-        np.clip(target_pos, self.bounds[:, 0], self.bounds[:, 1], out=target_pos)
-        return target_pos
-
-
-class FingertipDeskSafety:
-    """Geometric FK-based fingertip-to-desk collision detection.
-
-    Uses Pinocchio FK to compute the world Z of all five fingertip links
-    and compares the minimum against the table surface height.
-
-    This is the **preferred** detection method — zero-cost, no MPlib point
-    cloud pollution, and more accurate than EEF-level Z checks.  The MPlib
-    point cloud approach costs ~47% IK success rate (100% → 53%) and is
-    only used when env_collision_mode == "mplib_pointcloud".
-
-    Migrated from test_motion_planning_sim.py:817-911 with identical logic.
-    """
-
-    def __init__(
-        self,
-        pinocchio_model,
-        mp_planner,
-        collision_config: "CollisionConfig",
-    ) -> None:
-        import numpy as np
-
-        from .collision_config import CollisionConfig
-
-        self._model = pinocchio_model
-        self._mp_planner = mp_planner
-        self._config: CollisionConfig = collision_config
-        self._fingertip_ids = list(collision_config.fingertip_link_ids)
-        self._fingertip_names = list(collision_config.fingertip_link_names)
-        self._threshold = collision_config.fingertip_threshold
-        # epsilon 容差避免浮点边界误判（pinky_tip=0.03000000 < 0.03000001）
-        self._epsilon = 0.001
-        self._table_z = collision_config.table_z_world
-        self._hand_safe_margin = collision_config.hand_safe_margin
-
-    # ── Public API ──
-
-    def min_fingertip_z(self, qpos: np.ndarray) -> tuple[float, str]:
-        """Compute the lowest fingertip world Z for a given arm configuration.
-
-        Uses the planner's Pinocchio FK model (collision URDF, hand joints
-        fixed at home pose).  qpos must be 7-DOF arm joint angles; internally
-        padded to full model dimension via pad_move_group_qpos.
-
-        Returns: (min_z, lowest_fingertip_name)
-        """
-        import numpy as np
-
-        qpos = np.asarray(qpos, dtype=np.float64)
-        # Must pad through pad_move_group_qpos to fill remaining DOFs
-        # (same pattern as kinematics.py compute_eef_pose_base).
-        full_qpos = self._mp_planner.pad_move_group_qpos(qpos)
-        self._model.compute_forward_kinematics(full_qpos)
-
-        min_z = float("inf")
-        min_name = ""
-        for lid, name in zip(self._fingertip_ids, self._fingertip_names):
-            pose = self._model.get_link_pose(lid)
-            z = float(pose.p[2])
-            if z < min_z:
-                min_z = z
-                min_name = name
-        return min_z, min_name
-
-    def check_hand_desk_clearance(self, qpos: np.ndarray) -> tuple[bool, float, str]:
-        """Check if fingertips are above the table for a single configuration.
-
-        Uses Pinocchio FK to compute five fingertip world Z, compares the
-        minimum against the table surface + safe margin.
-
-        Returns: (safe, min_fingertip_z, lowest_fingertip_name)
-        """
-        min_z, min_name = self.min_fingertip_z(qpos)
-        safe = min_z > self._threshold - self._epsilon
-        return safe, min_z, min_name
-
-    def check_path_desk_safety(
-        self, path: np.ndarray, step_rad: float = 0.05
-    ) -> tuple[bool, float, int]:
-        """Dense-sampled fingertip desk safety check along a joint path.
-
-        Interpolates between consecutive waypoints at step_rad resolution
-        (default 0.05 rad ≈ 2.9°) and checks fingertip Z at every sample.
-        This is coarser than the segment collision check (0.02 rad) but
-        sufficient for detecting hand-through-desk since the hand extends
-        7.6 cm below EEF and the desk is a continuous plane.
-
-        Path should be (N, 7) for arm-only joints.  If padded (N, >7),
-        only the first 7 columns are used.
-
-        Returns: (safe, min_fingertip_z_over_path, first_violation_segment_index)
-          - violation_segment_index = -1 when all safe.
-        """
-        import numpy as np
-
-        path = np.asarray(path, dtype=np.float64)
-        # Extract arm-only columns if padded
-        if path.ndim != 2 or path.shape[1] > 7:
-            path = path[:, :7]
-
-        if len(path) < 2:
-            safe, z, name = self.check_hand_desk_clearance(path[0])
-            if not safe:
-                import warnings
-                eef_z = float("nan")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    eef_z = float(path[0][-1] if path.shape[1] > 0 else float("nan"))
-            return safe, z, 0 if not safe else -1
-
-        min_z = float("inf")
-        for i in range(len(path) - 1):
-            a, b = path[i], path[i + 1]
-            dist = float(np.max(np.abs(b - a)))
-            n = max(1, int(np.ceil(dist / step_rad)))
-            for k in range(n + 1):
-                alpha = k / max(n, 1)
-                q = a + alpha * (b - a)
-                safe, z, _name = self.check_hand_desk_clearance(q)
-                if z < min_z:
-                    min_z = z
-                if not safe:
-                    return False, min_z, i
-        return True, min_z, -1
-
-    # ── Properties ──
-
-    @property
-    def config(self) -> "CollisionConfig":
-        return self._config
-
-    @property
-    def is_ready(self) -> bool:
-        """Always True once constructed (construction may fail, handled by caller)."""
-        return True

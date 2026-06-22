@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from dexmani_real.utils.serialization import from_dict_helper
+
 if TYPE_CHECKING:
     from .collision_config import CollisionConfig
 
@@ -102,6 +104,11 @@ class PlanningProfile:
     ik_score_pose_error_weight: float = 0.2
     ik_score_joint_limit_weight: float = 0.2
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "PlanningProfile":
+        kw = from_dict_helper(cls, d)
+        return cls(**kw)
+
 
 @dataclass(kw_only=True)
 class TeleopProfile:
@@ -131,4 +138,52 @@ class TeleopProfile:
     # consider an adaptive damping schedule (lower λ² in non-singular regions).
     differential_ik_max_pos_step_m: float = 0.02
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
+
+    # ── Adaptive damping (NEW) ──
+    # When True, damping scales with manipulability:
+    #   high manipulability (far from singularity) → min_damping (~0.001)
+    #   low manipulability (near singularity) → max_damping (~0.05)
+    # Enabled by default (2026-06-22): the redundant Jacobian computation
+    # in the adaptive path has been eliminated (ik.py reuses the pre-computed
+    # Jacobian via manipulability_from_jacobian), so there is no performance
+    # cost.  Set to False to use fixed differential_ik_damping.
+    adaptive_damping: bool = True
+
+    # Min damping in non-singular regions (near-zero to minimize tracking bias).
+    differential_ik_min_damping: float = 0.001
+
+    # Max damping near singularities (prevents unsafe joint velocities).
+    differential_ik_max_damping: float = 0.05
+
+    # Manipulability threshold below which damping begins to ramp up.
+    # Typical XArm7 values: ~0.01 (far from singularity), ~0.001 (near elbow singularity).
+    manipulability_threshold: float = 0.005
+
+    # Minimum manipulability for IK acceptance.
+    # qpos solutions with manipulability below this value are rejected.
+    # Retries with heavier damping (singularity_damping_scale × damping)
+    # before falling through to position IK.
+    # 0.001 is near-elbow-singularity for XArm7 (far-from-singularity ≈ 0.01).
+    # Set to 0.0 to disable (backward compatible).
+    # Ref: LeFranX weighted_ik.cpp:71-76 Yoshikawa manipulability scoring.
+    min_manipulability: float = 0.001
+
+    # Damping multiplier when manipulability falls below min_manipulability.
+    singularity_damping_scale: float = 10.0
+
+    # ── Cartesian pose interpolation (NEW) ──
+    # When True, CartPoseInterpolator runs between VR input and IK,
+    # linearly interpolating position and SLERP-interpolating rotation.
+    # Eliminates stale VR frame re-use when VR rate < control rate.
+    # Ref: ManiUniCon PoseTrajectoryInterpolator.
+    use_cartesian_interpolation: bool = False
+
+    # Speed limits for interpolator (prevent sudden jumps).
+    interpolation_max_pos_speed: float = 0.25   # m/s
+    interpolation_max_rot_speed: float = 0.5    # rad/s
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TeleopProfile":
+        kw = from_dict_helper(cls, d)
+        return cls(**kw)
 

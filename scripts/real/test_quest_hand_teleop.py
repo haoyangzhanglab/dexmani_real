@@ -17,19 +17,18 @@ Quest WiFi 无线连接:
 
 Usage:
   source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real
-  cd dexmani_real/example
+  cd scripts/real
   python test_quest_hand_teleop.py
 """
 
 from __future__ import annotations
 
-# sys.path修正：脚本已从dexmani_real/example/移至scripts/
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 import select
-import sys
 import termios
 import time
 import tty

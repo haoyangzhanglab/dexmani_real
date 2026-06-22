@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from .types import Pose
 
@@ -145,16 +146,12 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     if np.linalg.det(R) < 0.0:
         R[:, 2] = -u3
 
-    from scipy.spatial.transform import Rotation
-
     quat_xyzw = Rotation.from_matrix(R).as_quat()
     return xyzw_to_wxyz(quat_xyzw)
 
 
 def quat_wxyz_to_rot6d(q_wxyz: np.ndarray) -> np.ndarray:
     """WXYZ quaternion → 6D rotation (first two columns of the 3×3 rotation matrix)."""
-    from scipy.spatial.transform import Rotation
-
     quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
     R = Rotation.from_quat(quat_xyzw).as_matrix()
     return np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
@@ -164,9 +161,6 @@ def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
     """WXYZ quaternion → 3×3 rotation matrix.
 
     Uses scipy.spatial.transform.Rotation for numerical stability.
-    Replaces the hand-rolled _quat_to_rotmat previously in controller.py.
     """
-    from scipy.spatial.transform import Rotation
-
     quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
     return Rotation.from_quat(quat_xyzw).as_matrix().astype(np.float64)

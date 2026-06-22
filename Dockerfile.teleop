@@ -1,0 +1,39 @@
+# Docker 化重定向服务 — 隔离 dex-retargeting 依赖
+#
+# Ref: BunnyVision Pro bunny_teleop_server Docker deployment pattern.
+#
+# 构建: docker build -f Dockerfile.teleop -t dexmani-teleop .
+# 运行: docker run --rm --network host dexmani-teleop
+#
+# 注意: 此 Dockerfile 用于隔离重定向计算服务。实时控制仍建议在宿主机运行。
+#       ZMQ 通信端口默认 5555 (VR PUB) + 5556 (retarget REP)。
+
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+RUN pip install --no-cache-dir \
+    dex-retargeting \
+    numpy \
+    scipy \
+    trimesh \
+    pyzmq \
+    h5py
+
+WORKDIR /app
+
+# Copy retargeting service code
+COPY dexmani_real/teleop/vr/hand_retarget.py /app/dexmani_real/teleop/vr/
+COPY dexmani_real/teleop/vr/ref_adapter.py /app/dexmani_real/teleop/vr/
+COPY dexmani_real/utils/hand_utils.py /app/dexmani_real/utils/
+COPY scripts/services/retarget_server.py /app/
+
+# Default: run retargeting server on port 5556
+EXPOSE 5556
+
+ENTRYPOINT ["python", "/app/retarget_server.py"]

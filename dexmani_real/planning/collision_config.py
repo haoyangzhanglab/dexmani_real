@@ -38,14 +38,6 @@ class CollisionConfig:
     hand_safe_margin: float = 0.03
     """Minimum fingertip-to-table clearance (meters)."""
 
-    # ── Table-top object interaction ──
-    table_object_max_height: float = 0.0
-    """Maximum height of objects on the table surface (m).
-    Default 0.0 = no objects.  Set to e.g. 0.10 for a 10 cm tall box."""
-
-    table_object_safe_margin: float = 0.02
-    """Additional EEF-to-object-top clearance when objects are present (m)."""
-
     # ── Fingertip link identification (from collision URDF) ──
     # xarm7_xhand_collision.urdf link order (0-indexed):
     #   0-11: arm (link_base..custom_eef_link)
@@ -91,34 +83,14 @@ class CollisionConfig:
         """
         return self.table_z_world + self.hand_safe_margin
 
-    @property
-    def eef_safe_z_with_objects(self) -> float:
-        """EEF safe Z considering table-top objects.
-
-        Computed as: table_z_world + table_object_max_height
-                    + table_object_safe_margin
-                    + hand_extension_below_eef + hand_safe_margin.
-        """
-        return (
-            self.table_z_world
-            + self.table_object_max_height
-            + self.table_object_safe_margin
-            + self.hand_extension_below_eef
-            + self.hand_safe_margin
-        )
-
     # ── Factory / utility ──
 
     def with_overrides(self, **kwargs) -> "CollisionConfig":
-        """Return a new CollisionConfig with specified fields overridden."""
-        new_dict = {
-            k: getattr(self, k)
-            for k in [
-                "table_z_world", "hand_extension_below_eef", "hand_safe_margin",
-                "table_object_max_height", "table_object_safe_margin",
-                "fingertip_link_ids", "fingertip_link_names",
-                "env_collision_mode", "reject_below_desk_z",
-            ]
-        }
-        new_dict.update(kwargs)
-        return CollisionConfig(**new_dict)
+        """Return a new CollisionConfig with specified fields overridden.
+
+        Uses ``dataclasses.replace()`` (stdlib) instead of manually listing
+        every field name (P3.1).  Automatically stays in sync when new fields
+        are added to the dataclass.
+        """
+        from dataclasses import replace
+        return replace(self, **kwargs)

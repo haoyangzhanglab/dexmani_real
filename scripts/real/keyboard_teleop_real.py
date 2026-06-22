@@ -26,11 +26,9 @@
 
 from __future__ import annotations
 
-# sys.path修正：脚本已从dexmani_real/example/移至scripts/
-import sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
-
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import termios
 
 import time
@@ -50,6 +48,8 @@ from dexmani_real.planning import (
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.planning.collision_config import CollisionConfig
+
+from scripts._test_utils import quat_multiply
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -225,17 +225,6 @@ def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
         cr * cp * sy - sr * sp * cy,
     ])
 
-
-def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """wxyz 四元数 Hamilton 乘积 q1 ⊗ q2。"""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-    ])
 
 
 # ═══════════════════════════════════════════════ 主循环

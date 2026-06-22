@@ -26,7 +26,11 @@ def setup_scene(
 ):
     p = physx or PhysxConfig()
 
-    sapien.render.set_global_config(max_num_materials=50000, max_num_textures=50000)
+    # SAPIEN render resource limits — conservative defaults to handle
+    # complex scenes with multiple articulated bodies and textures.
+    _MAX_MATERIALS = 50000
+    _MAX_TEXTURES = 50000
+    sapien.render.set_global_config(max_num_materials=_MAX_MATERIALS, max_num_textures=_MAX_TEXTURES)
     sapien.render.set_camera_shader_dir(shader_type)
     if shader_type == "rt":
         sapien.render.set_ray_tracing_samples_per_pixel(32)

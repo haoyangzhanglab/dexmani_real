@@ -80,22 +80,3 @@ class TeleopErrorHandler:
         self._last_good_hand_qpos = None
 
 
-def example() -> None:
-    handler = TeleopErrorHandler()
-    handler.init_fallback(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))
-
-    action = handler.record_failure("ik", "IK returned None")
-    print(f"hold action arm={action.arm_qpos_cmd[:3]}...")
-
-    # Update after successful tick
-    handler.update_good_positions(
-        arm_qpos=np.array([0.1] * 7), hand_qpos=np.array([0.5] * 12)
-    )
-    action = handler.hold_action()
-    print(f"updated hold arm={action.arm_qpos_cmd[:3]}...")
-
-    print(f"is_ready: {handler.is_ready}")
-
-
-if __name__ == "__main__":
-    example()
