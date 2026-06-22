@@ -1,4 +1,15 @@
-"""pynput keyboard listener → multiprocessing.Queue for control signals."""
+"""pynput keyboard listener → multiprocessing.Queue for control signals.
+
+Unified key mapping (ref: data collection loop design):
+    T  → TELEOP        (IDLE → TELEOP)
+    R  → RECORD        (toggle recording in TELEOP/PAUSED)
+    C  → PAUSE         (TELEOP ⇄ PAUSED)
+    S  → STOP          (stop recording → SAVE_PROMPT; TELEOP→IDLE; SAVE→confirm)
+    Q  → QUIT          (IDLE→quit; recording→SAVE_PROMPT; SAVE_PROMPT→discard)
+    H  → HOME          (return to home)
+    ESC → EMERGENCY_STOP
+    `   → REARM        (EMERGENCY_STOP → IDLE)
+"""
 
 from __future__ import annotations
 
@@ -11,10 +22,11 @@ from enum import Enum
 class ControlSignal(Enum):
     TELEOP = "T"
     RECORD = "R"
+    PAUSE = "C"
     STOP = "S"
     HOME = "H"
     EMERGENCY_STOP = "ESC"
-    REARM = "X"
+    REARM = "`"
     QUIT = "Q"
 
 
@@ -22,9 +34,10 @@ class ControlSignal(Enum):
 _KEY_MAP = {
     "t": ControlSignal.TELEOP,
     "r": ControlSignal.RECORD,
+    "c": ControlSignal.PAUSE,
     "s": ControlSignal.STOP,
     "h": ControlSignal.HOME,
-    "x": ControlSignal.REARM,
+    "`": ControlSignal.REARM,
     "q": ControlSignal.QUIT,
 }
 

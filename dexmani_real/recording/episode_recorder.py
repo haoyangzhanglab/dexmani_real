@@ -232,13 +232,24 @@ class EpisodeRecorder:
         meta.attrs["success"] = success
         meta.attrs["fps"] = self._frame_count / duration if duration > 0 else 0.0
 
-        # num_valid_frames
+        # num_valid_frames + quality_summary
+        quality_ratio = 1.0
         if "quality_flags" in self._file:
             from dexmani_real.recording.quality_flags import ALL_GOOD_MASK
 
             qf = np.asarray(self._file["quality_flags"][:], dtype=np.uint16)
             valid = int(np.sum((qf & np.uint16(ALL_GOOD_MASK)) == np.uint16(ALL_GOOD_MASK)))
             meta.attrs["num_valid_frames"] = valid
+            quality_ratio = valid / max(self._frame_count, 1)
+
+        # Write per-bit quality summary for offline filtering
+        meta.attrs["quality_ratio"] = quality_ratio
+        meta.attrs["min_frames_met"] = self._frame_count >= 50
+        meta.attrs["quality_ok"] = quality_ratio >= 0.6
+
+        # Camera frame presence
+        has_camera = "camera/timestamps" in self._file
+        meta.attrs["has_camera"] = has_camera
 
         path = self._episode_path
         self._file.close()
