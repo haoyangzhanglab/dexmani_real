@@ -153,6 +153,18 @@ class RobotInterface:
         """
         return self.workspace.clamp_orientation(eef_quat_wxyz)
 
+    def clamp_workspace_pose(self, pose: Pose) -> Pose:
+        """Clamp a target EEF pose to workspace bounds (position + orientation).
+
+        Returns a new Pose with both position and orientation clamped.
+        Used by the controller to nudge targets back into workspace instead
+        of holding on boundary violations.
+        (ref: ManiUniCon _clip_action_to_bounds)
+        """
+        clamped_pos = self.workspace.clamp(pose.p.copy())
+        clamped_quat = self.workspace.clamp_orientation(pose.q.copy())
+        return Pose(p=clamped_pos, q=clamped_quat)
+
     def is_error(self) -> bool:
         return self.arm.is_error() or self.hand.is_error()
 
@@ -160,6 +172,48 @@ class RobotInterface:
         arm_ok = self.arm.clear_error()
         hand_ok = self.hand.clear_error()
         return arm_ok and hand_ok
+
+    def validate_action(self, action: RobotAction, quality_flags: int = 0) -> tuple[bool, str]:
+        """Centralized pre-send validation (ref: ManiUniCon validate_action).
+
+        Checks all safety conditions that should gate action sending.
+        Returns (ok, reason_string).
+
+        Checks performed (fail-fast order):
+          1. Robot error state (arm/hand SDK errors)
+          2. Arm connection
+          3. Soft faults via quality_flags (torque/current/temp)
+          4. Workspace position bounds
+          5. Workspace orientation bounds
+        """
+        # 1. Hardware error state
+        if self.is_error():
+            return False, "robot error state"
+
+        # 2. Arm connection
+        if not self.arm.is_connected():
+            return False, "arm not connected"
+
+        # 3. Soft faults (torque/current/temperature — extracted from quality_flags)
+        from dexmani_real.recording.quality_flags import (
+            ARM_TORQUE_OK, HAND_CURRENT_OK, HAND_TEMP_OK, IN_WORKSPACE,
+        )
+        if quality_flags != 0:
+            if not (quality_flags & ARM_TORQUE_OK):
+                return False, "arm torque exceeded"
+            if not (quality_flags & HAND_CURRENT_OK):
+                return False, "hand current exceeded"
+            if not (quality_flags & HAND_TEMP_OK):
+                return False, "hand temperature exceeded"
+
+        # 4. Workspace bounds (computed from action command)
+        arm_eef = self.kinematics.compute_eef_pose_world(action.arm_qpos_cmd)
+        if not self.workspace.check(arm_eef.p):
+            return False, "workspace position violation"
+        if not self.workspace.check_orientation(arm_eef.q):
+            return False, "workspace orientation violation"
+
+        return True, "ok"
 
     def emergency_stop(self) -> None:
         self.arm.stop()

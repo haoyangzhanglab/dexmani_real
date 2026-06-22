@@ -293,6 +293,7 @@ class TeleopController:
     # State machine tick
 
     def _tick(self) -> None:
+        tick_start = time.perf_counter()
         self.frame_count += 1
 
         # 1. Get VR frame
@@ -352,25 +353,18 @@ class TeleopController:
             except (ValueError, OSError) as e:
                 logger.exception("recorder add_frame failed: %s", e)
 
-        # 7. Pre-send safety gate (ManiUniCon validate_action + ufactory_teleop driver-trust).
-        #    Joint limits enforced by XArm7/XHand drivers (error latch → is_error below).
-        #    Controller adds checks the driver CANNOT cover: torque/current soft faults.
+        # 7. Pre-send safety gate — centralized validate_action (ref: ManiUniCon).
+        #    Joint limits enforced by XArm7/XHand drivers (error latch → is_error).
+        #    Soft faults (torque/current/temp) trigger hold; hard faults escalate.
         if not self.dry_run:
-            if self.robot.is_error():
-                self._escalate_to_emergency("Robot error state detected before send_action")
-                return
-
-            if (
-                not (flags & ARM_TORQUE_OK)
-                or not (flags & HAND_CURRENT_OK)
-                or not (flags & HAND_TEMP_OK)
-            ):
-                logger.warning(
-                    "Pre-send safety: torque=%s current=%s temp=%s — holding",
-                    not (flags & ARM_TORQUE_OK),
-                    not (flags & HAND_CURRENT_OK),
-                    not (flags & HAND_TEMP_OK),
-                )
+            action_valid, fail_reason = self.robot.validate_action(action, flags)
+            if not action_valid:
+                if "error state" in fail_reason or "not connected" in fail_reason:
+                    self._escalate_to_emergency(
+                        f"Robot error before send_action: {fail_reason}"
+                    )
+                    return
+                logger.warning("Pre-send safety: %s — holding", fail_reason)
                 hold = self.error_handler.hold_action()
                 action = RobotAction(
                     arm_qpos_cmd=hold.arm_qpos_cmd,
@@ -389,6 +383,17 @@ class TeleopController:
         if now - self.last_status_ts >= self.status_interval:
             self.last_status_ts = now
             self._print_status(vr_frame, flags, now)
+
+        # 9. Control loop overrun detection (ref: BunnyVisionPro wait_until_next_control_signal).
+        #    Warns when a tick exceeds 150% of the target period — flags IK slowdowns,
+        #    GC pauses, or system contention before they cause visible stutter.
+        tick_elapsed_ms = (time.perf_counter() - tick_start) * 1000.0
+        target_ms = self.limiter.period * 1000.0
+        if tick_elapsed_ms > target_ms * 1.5:
+            logger.warning(
+                "Loop overrun: tick=%.1fms target=%.1fms frame=%s",
+                tick_elapsed_ms, target_ms, self.frame_count,
+            )
 
     # Action computation (split into sub-methods per Phase 3.2)
 
@@ -420,21 +425,43 @@ class TeleopController:
             vr_frame, state, prev_arm_cmd, quality
         )
 
-        # Workspace check on computed arm command (position + orientation)
+        # Workspace check on computed arm command (position + orientation).
+        # If out of bounds, attempt to clamp the target pose and re-solve IK
+        # rather than immediately holding — allows the arm to track the VR
+        # wrist up to the boundary instead of stopping abruptly.
+        # (ref: ManiUniCon _clip_action_to_bounds → re-IK)
         arm_eef_pose = self.planner.compute_eef_pose_world(arm_cmd)
         in_workspace = self.robot.check_workspace(arm_eef_pose.p)
         ori_ok = self.robot.check_workspace_orientation(arm_eef_pose.q)
-        quality.set(IN_WORKSPACE, in_workspace and ori_ok)
         retarget_ok = False  # init: only set True by _compute_hand_command below
         if not in_workspace or not ori_ok:
-            hold = self.error_handler.hold_action()
-            arm_cmd = hold.arm_qpos_cmd
-            hand_cmd = hold.hand_qpos_cmd
+            # Clamp target pose to workspace boundaries and re-solve IK
+            clamped_pose = self.robot.clamp_workspace_pose(arm_eef_pose)
+            re_ik = self.planner.solve_teleop_ik(
+                clamped_pose, state.arm_qpos, prev_arm_cmd,
+            )
+            if re_ik.success and re_ik.qpos is not None:
+                arm_cmd = np.asarray(re_ik.qpos, dtype=np.float64)
+                ik_ok = True
+                # Re-evaluate workspace on the clamped result
+                clamped_eef = self.planner.compute_eef_pose_world(arm_cmd)
+                in_workspace = self.robot.check_workspace(clamped_eef.p)
+                ori_ok = self.robot.check_workspace_orientation(clamped_eef.q)
+                # Hand retarget — proceed with clamped arm position
+                hand_cmd, retarget_ok = self._compute_hand_command(
+                    vr_frame, prev_hand_cmd, quality
+                )
+            else:
+                # Re-IK on clamped pose also failed — hold in place
+                hold = self.error_handler.hold_action()
+                arm_cmd = hold.arm_qpos_cmd
+                hand_cmd = hold.hand_qpos_cmd
         else:
             # ── Hand retarget ──
             hand_cmd, retarget_ok = self._compute_hand_command(
                 vr_frame, prev_hand_cmd, quality
             )
+        quality.set(IN_WORKSPACE, in_workspace and ori_ok)
 
         # ── Joint jump clamp ──
         arm_cmd, hand_cmd, jump_ok = self._apply_jump_clamp(
