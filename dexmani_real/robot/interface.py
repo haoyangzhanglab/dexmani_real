@@ -165,8 +165,21 @@ class RobotInterface:
         Checks performed (fail-fast order):
           1. Robot error state (arm/hand SDK errors)
           2. Arm connection
-          3. Workspace position bounds
+          3. Arm torque (per-joint, NaN → fail)
+          4. Hand current (fail-closed)
+          5. Hand temperature (fail-closed)
+          6. Hand communication (board errors)
+          7. Workspace position bounds
         """
+        # Lazy import to avoid circular dependency:
+        #   interface → teleop.control.safety → teleop.__init__ → controller → interface
+        from dexmani_real.teleop.control.safety import (
+            check_arm_torque,
+            check_hand_comm,
+            check_hand_current,
+            check_hand_temperature,
+        )
+
         # 1. Hardware error state
         if self.is_error():
             return False, "robot error state"
@@ -175,7 +188,27 @@ class RobotInterface:
         if not self.arm.is_connected():
             return False, "arm not connected"
 
-        # 3. Workspace bounds (computed from action command)
+        # 3. Arm torque (fail-closed: NaN/unknown → unsafe)
+        arm_state = self.arm.get_state()
+        arm_tau = np.asarray(arm_state.get("tau", []), dtype=np.float64)
+        if not check_arm_torque(arm_tau):
+            return False, "arm torque violation"
+
+        # 4-6. Hand safety (current, temperature, communication)
+        hand_state = self.hand.get_state(full=True)
+        if not check_hand_current(hand_state.get("current", np.zeros(12))):
+            return False, "hand current violation"
+        if not check_hand_temperature(hand_state.get("temperature", np.full(12, 30.0))):
+            return False, "hand temperature violation"
+        hand_has_error = bool(
+            np.any(hand_state.get("commboard_err", np.zeros(12)) != 0)
+            or np.any(hand_state.get("jointboard_err", np.zeros(12)) != 0)
+            or np.any(hand_state.get("tipboard_err", np.zeros(12)) != 0)
+        )
+        if not check_hand_comm(hand_has_error):
+            return False, "hand communication error"
+
+        # 7. Workspace bounds (computed from action command)
         arm_eef = self.kinematics.compute_eef_pose_world(action.arm_qpos_cmd)
         if not self.workspace.check(arm_eef.p):
             return False, "workspace position violation"
@@ -494,6 +527,18 @@ class RobotInterface:
             return False
 
         if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
+            # Diagnostic: log WHY plan_path failed so operators can identify
+            # the root cause (workspace, collision, IK seeding, joint delta, etc.)
+            current_pose = self.kinematics.compute_eef_pose_world(current_qpos)
+            cart_dist = float(np.linalg.norm(home_eef_pose.p - current_pose.p))
+            logger.warning(
+                "plan_path: %s | current_eef=[%.3f,%.3f,%.3f]m "
+                "home_eef=[%.3f,%.3f,%.3f]m cart_dist=%.3fm",
+                result.reason or "unknown",
+                current_pose.p[0], current_pose.p[1], current_pose.p[2],
+                home_eef_pose.p[0], home_eef_pose.p[1], home_eef_pose.p[2],
+                cart_dist,
+            )
             return False
 
         # Safety: verify fingertips above desk before path execution.

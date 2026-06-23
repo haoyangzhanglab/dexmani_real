@@ -179,10 +179,13 @@ class TeleopProfile(FromDictMixin):
     # When True, CartPoseInterpolator runs between VR input and IK,
     # linearly interpolating position and SLERP-interpolating rotation.
     # Eliminates stale VR frame re-use when VR rate < control rate.
+    # Default changed to True for smoother motion in keyboard/VR teleop.
     # Ref: ManiUniCon PoseTrajectoryInterpolator.
-    use_cartesian_interpolation: bool = False
+    use_cartesian_interpolation: bool = True
 
     # Speed limits for interpolator (prevent sudden jumps).
-    interpolation_max_pos_speed: float = 0.25   # m/s
-    interpolation_max_rot_speed: float = 0.5    # rad/s
+    # Raised for dexterous teleop: 0.4 m/s accommodates natural arm reaching
+    # (~0.3-0.5 m/s), 0.25 m/s was clipping faster hand motions.
+    interpolation_max_pos_speed: float = 0.4    # m/s
+    interpolation_max_rot_speed: float = 0.8    # rad/s
 

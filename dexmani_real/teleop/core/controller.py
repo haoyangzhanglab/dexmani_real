@@ -26,10 +26,7 @@ from dexmani_real.teleop.core.error_handler import TeleopErrorHandler
 from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.control import safety
-from dexmani_real.teleop.core.tracking import (
-    TrackingQuality,
-    TrackingQualityConfig,
-)
+from dexmani_real.teleop.core.tracking import TrackingQuality
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
@@ -73,11 +70,10 @@ class TeleopControllerConfig:
     """
 
     target_hz: float = 50.0
-    ema_alpha_arm: float = 1.0  # 1.0 = no smoothing
+    ema_alpha_arm: float = 0.75  # Light EMA smoothing for hand tremor filtering.
+    # 1.0 = no smoothing; 0.75 = ~3-frame time constant at 50Hz (~60ms lag).
+    # Smoothing hand tremor (~2-3mm) without perceptible latency for dexterous teleop.
     dry_run: bool = False
-    use_cartesian_interpolation: bool | None = None
-    interpolation_max_pos_speed: float | None = None
-    interpolation_max_rot_speed: float | None = None
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
     use_precise_wait: bool = False  # True → RateManager busy-wait; False → RateLimiter sleep
@@ -98,10 +94,18 @@ class TeleopControllerConfig:
     # Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD.
     tracking_divergence_threshold_rad: float = 5.0
 
-    # ── Velocity-limited smoothing (Phase 2.1) ──
-    # When True, applies velocity-limited step between pipeline output and
-    # send_action, bottleneck-scaling the joint delta to max_qvel * dt.
-    # Reuses the existing _limit_joint_step bottleneck algorithm.
+    # ── Velocity-limited step smoothing ──
+    # Per-frame position-delta bottleneck between pipeline output and send_action.
+    # Uses bottleneck scaling (same algorithm as XArm7._limit_joint_step):
+    # when any joint exceeds its per-step velocity limit, ALL joints are
+    # scaled proportionally to preserve the trajectory shape.
+    #
+    # This is NOT redundant with the PID inner loop's _clip_arm_velocity:
+    # - PID _clip_arm_velocity limits VELOCITY at 250 Hz (per inner tick)
+    # - This limits POSITION DELTA at 50 Hz (per controller tick)
+    # Without this, VR jitter / IK noise can cause frame-to-frame position
+    # jumps that, while individually within PID velocity limits, produce
+    # perceptibly less smooth motion — the PID tracks each jump aggressively.
     use_velocity_limited_smooth: bool = True
 
 
@@ -130,9 +134,6 @@ class TeleopController:
         ema_alpha_arm: float = 1.0,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
-        use_cartesian_interpolation: bool | None = None,
-        interpolation_max_pos_speed: float | None = None,
-        interpolation_max_rot_speed: float | None = None,
         use_zmq_vr: bool = False,
         zmq_vr_port: int = 5555,
         camera_process: object | None = None,
@@ -142,9 +143,6 @@ class TeleopController:
                 target_hz=target_hz,
                 ema_alpha_arm=ema_alpha_arm,
                 dry_run=dry_run,
-                use_cartesian_interpolation=use_cartesian_interpolation,
-                interpolation_max_pos_speed=interpolation_max_pos_speed,
-                interpolation_max_rot_speed=interpolation_max_rot_speed,
                 use_zmq_vr=use_zmq_vr,
                 zmq_vr_port=zmq_vr_port,
             )
@@ -176,17 +174,11 @@ class TeleopController:
         self.vr_stats = StreamStats(name="vr_track", target_hz=120.0)
         self.camera_stats = StreamStats(name="camera", target_hz=30.0)
 
-        # Resolve interpolation settings from planner's TeleopProfile when not
-        # explicitly passed.
-        use_ci = cfg.use_cartesian_interpolation
-        max_pos = cfg.interpolation_max_pos_speed
-        max_rot = cfg.interpolation_max_rot_speed
-        if use_ci is None:
-            use_ci = self.planner.teleop_profile.use_cartesian_interpolation
-        if max_pos is None:
-            max_pos = self.planner.teleop_profile.interpolation_max_pos_speed
-        if max_rot is None:
-            max_rot = self.planner.teleop_profile.interpolation_max_rot_speed
+        # Interpolation settings from TeleopProfile (authoritative source).
+        tp = self.planner.teleop_profile
+        use_ci = tp.use_cartesian_interpolation
+        max_pos = tp.interpolation_max_pos_speed
+        max_rot = tp.interpolation_max_rot_speed
 
         # Cartesian pose interpolator (optional, disabled by default).
         self._pose_interpolator: CartPoseInterpolator | None = None
@@ -222,7 +214,7 @@ class TeleopController:
             self._vr_subscriber = VRFrameSubscriber(sub_port=cfg.zmq_vr_port)
             self._vr_subscriber.connect()
 
-        self.tracking_quality = TrackingQuality(TrackingQualityConfig(max_frame_age_s=0.2))
+        self.tracking_quality = TrackingQuality()
         self.error_handler = TeleopErrorHandler()
 
         # State
@@ -237,7 +229,7 @@ class TeleopController:
         self._consecutive_divergence: int = 0
         self._tracking_divergence_threshold = cfg.tracking_divergence_threshold_rad
 
-        # ── Velocity-limited smoothing (Phase 2.1) ──
+        # ── Velocity-limited step smoothing ──
         self._use_vel_limited_smooth = cfg.use_velocity_limited_smooth
 
         # ── IK miss counter (Phase 2.2 — rate decoupling) ──
@@ -251,13 +243,7 @@ class TeleopController:
         )
 
         # Keyboard
-        self.keyboard: KeyboardHandler | None = None
-        if keyboard_queue is not None:
-            self.keyboard = KeyboardHandler(keyboard_queue)
-        else:
-            import multiprocessing
-            q = multiprocessing.Queue()
-            self.keyboard = KeyboardHandler(q)
+        self.keyboard = KeyboardHandler(keyboard_queue) if keyboard_queue is not None else None
 
         # Status
         self.frame_count: int = 0
@@ -354,28 +340,29 @@ class TeleopController:
                 return
             self.robot.send_action(action)
 
-    # Velocity-limited step (Phase 2.1)
+    # Velocity-limited step (per-frame command smoothing)
 
     def _apply_velocity_limited_step(
         self, action: RobotAction, state: RobotState
     ) -> RobotAction:
-        """Apply velocity-limited smoothing between pipeline output and send_action.
+        """Per-frame position-delta bottleneck between pipeline and send_action.
 
-        Uses bottleneck scaling (same algorithm as XArm7._limit_joint_step):
-        when any joint exceeds its per-step velocity limit, ALL joints are
-        scaled by the same factor to preserve the trajectory shape.
+        Bottleneck-scales the joint delta to max_qvel * dt, preserving the
+        trajectory shape (all joints scaled by the same worst-case ratio).
 
-        Uses per-joint max_qvel from the arm config (default 90-150°/s per joint)
-        converted to a per-step limit via dt = 1/target_hz.
-
-        Ref: T-Rex arm_hand_control.py SmootherVelocity — bottleneck scaling
-        with the same ratio applied to all joints.
+        This complements, but is NOT redundant with, the PID inner loop's
+        _clip_arm_velocity (250 Hz velocity clipping):
+        - PID _clip_arm_velocity: per-250Hz-tick VELOCITY ceiling
+        - This method: per-50Hz-tick POSITION DELTA ceiling
+        Without this layer, VR jitter / IK noise can cause frame-to-frame
+        position jumps that the PID tracks aggressively, producing
+        perceptibly less smooth motion even though each jump is within
+        individual PID velocity limits.
         """
         if self._last_arm_cmd is None:
             return action
 
         dt = 1.0 / self.limiter.target_hz
-        # Use arm config max_qvel as per-joint velocity limits
         arm_cfg = self.robot.arm.config
         max_step = arm_cfg.max_qvel * dt  # rad per tick
 
@@ -383,15 +370,13 @@ class TeleopController:
         prev_cmd = np.asarray(self._last_arm_cmd, dtype=np.float64)
         delta = arm_target - prev_cmd
 
-        # Bottleneck scaling: normalize each joint's delta by its limit,
-        # find the worst offender, scale all joints proportionally.
         normalized = np.abs(delta) / max_step
         max_ratio = np.max(normalized)
         if max_ratio > 1.0:
             delta = delta / max_ratio
             action.arm_qpos_cmd = prev_cmd + delta
             logger.debug(
-                "Velocity-limited step applied: max_ratio=%.2f joint=%d",
+                "Velocity-limited step: max_ratio=%.2f joint=%d",
                 max_ratio, int(np.argmax(normalized)) + 1,
             )
 
@@ -503,31 +488,14 @@ class TeleopController:
                     self._ik_miss_count,
                 )
 
-        # 4c. Velocity-limited step (Phase 2.1 — smoothing safety net)
-        #     Applies bottleneck scaling between pipeline output and send_action,
-        #     ensuring joint velocity stays within per-joint max_qvel limits.
-        #     This is a software-level safety net; the primary speed limit is
-        #     still XArm7._limit_joint_step() at the driver layer.
+        # 4c. Velocity-limited step — per-frame position-delta smoothing.
+        #     Bottleneck-scales the pipeline output to prevent VR jitter / IK
+        #     noise from producing perceptibly jerky motion between 50 Hz ticks.
+        #     Complements (not redundant with) PID _clip_arm_velocity at 250 Hz.
         if self._use_vel_limited_smooth and self._last_arm_cmd is not None:
             action = self._apply_velocity_limited_step(action, state)
 
-        # 5. Safety checks on hardware state (direct checks, no bitmask layer)
-        hand_state = self.robot.hand.get_state(full=True)
-        torque_ok = safety.check_arm_torque(state.arm_tau)
-        current_ok = safety.check_hand_current(hand_state.get("current", np.zeros(12)))
-        temp_ok = safety.check_hand_temperature(hand_state.get("temperature", np.full(12, 30.0)))
-        comm_ok = safety.check_hand_comm(
-            bool(
-                np.any(hand_state.get("commboard_err", np.zeros(12)) != 0)
-                or np.any(hand_state.get("jointboard_err", np.zeros(12)) != 0)
-                or np.any(hand_state.get("tipboard_err", np.zeros(12)) != 0)
-            )
-        )
-
-        if not (torque_ok and current_ok and temp_ok and comm_ok):
-            action = self.error_handler.hold_action()
-
-        # 6. Record frame (before safety gate — captures pre-hold action)
+        # 5. Record frame (before safety gate — captures pre-hold action)
         camera_frame = None
         camera_frames: dict[str, dict] | None = None
 
@@ -588,16 +556,6 @@ class TeleopController:
                     )
                 except (ValueError, OSError) as e:
                     logger.exception("collection_loop record_frame failed: %s", e)
-            elif self.recorder is not None:
-                try:
-                    self.recorder.add_frame(
-                        state=state, action=action, vr_frame=vr_frame,
-                        camera_frame=camera_frame,
-                        camera_frames=camera_frames,
-                        T_base_eef=T_base_eef,
-                    )
-                except (ValueError, OSError) as e:
-                    logger.exception("recorder add_frame failed: %s", e)
 
         # 7. Pre-send safety gate — centralized validate_action (ref: ManiUniCon).
         #    Joint limits enforced by XArm7/XHand drivers (error latch → is_error).
@@ -843,11 +801,6 @@ class TeleopController:
                     self._collection_loop.stop_episode(success=False, reason="home")
                 except (ValueError, OSError):
                     pass
-            elif self.recorder is not None and self.recorder.is_recording:
-                try:
-                    self.recorder.stop_episode(success=False)
-                except (ValueError, OSError):
-                    pass
 
         if not self.dry_run:
             self.robot.return_to_home(use_planning=True, cancel_event=self._cancel_event)
@@ -860,6 +813,14 @@ class TeleopController:
         self.tracking_quality.reset()
         self._consecutive_divergence = 0
         self._ik_miss_count = 0
+
+        # Reset rate limiter — return_to_home blocks the main loop for seconds,
+        # so the next limiter.wait() would otherwise see a huge elapsed time
+        # and emit a spurious "Control loop over budget" warning.
+        self.limiter.reset()
+        if self.rate_manager is not None:
+            self.rate_manager.reset()
+
         logger.info("Home complete.")
 
     def _reset_mapper(self) -> bool:
@@ -907,11 +868,6 @@ class TeleopController:
                 )
             except (ValueError, OSError) as e:
                 logger.exception("collection_loop start_episode failed: %s", e)
-        elif self.recorder is not None:
-            try:
-                self.recorder.start_episode(task_label="teleop", operator="")
-            except (ValueError, OSError) as e:
-                logger.exception("recorder start_episode failed: %s", e)
 
         self.error_handler.clear()
         logger.info("Episode recording started.")
@@ -938,13 +894,6 @@ class TeleopController:
                     logger.info("  Saved to %s", path)
             except (ValueError, OSError) as e:
                 logger.exception("collection_loop stop_episode failed: %s", e)
-        elif self.recorder is not None and self.recorder.is_recording:
-            try:
-                path = self.recorder.stop_episode(success=(classification == "success"))
-                if path:
-                    logger.info("  Saved to %s", path)
-            except (ValueError, OSError) as e:
-                logger.exception("recorder stop_episode failed: %s", e)
         self.recording = False
         logger.info("Episode stopped.")
 
@@ -952,15 +901,6 @@ class TeleopController:
         """Discard the current episode file (SAVE_PROMPT → discard)."""
         if self._collection_loop is not None:
             self._collection_loop.discard_episode()
-        elif self.recorder is not None and hasattr(self.recorder, '_episode_path'):
-            path = getattr(self.recorder, '_episode_path', None)
-            if path:
-                try:
-                    from pathlib import Path
-                    Path(path).unlink(missing_ok=True)
-                    logger.info("Episode discarded: %s", path)
-                except OSError:
-                    pass
 
     def _escalate_to_emergency(self, reason: str) -> None:
         logger.error("EMERGENCY_STOP: %s", reason)
@@ -1012,11 +952,6 @@ class TeleopController:
                     self._collection_loop.stop_episode(success=False, reason="shutdown")
                 except (ValueError, RuntimeError, KeyError):
                     pass  # shutdown must never fail
-            elif self.recorder is not None and self.recorder.is_recording:
-                try:
-                    self.recorder.stop_episode(success=False)
-                except (ValueError, RuntimeError, KeyError):
-                    pass
 
         # Stop multi-camera if active
         if self._multi_camera is not None:

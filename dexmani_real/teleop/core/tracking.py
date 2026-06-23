@@ -55,8 +55,6 @@ class TrackingQualityResult:
 
 @dataclass
 class TrackingQualityConfig:
-    max_frame_age_s: float = 0.2
-    ema_loss_timeout_s: float = 1.0  # continuous loss > this → emergency_stop
     drop_policy: FrameDropPolicy | None = None  # if None, uses defaults
 
 
