@@ -36,6 +36,11 @@ Usage:
         --data_dir data/episodes/ --output data/export/ \\
         --validate --train_val_split 0.8 \\
         --filter_success true --min_quality_ratio 0.7
+
+    # Timestamp alignment (post-process multi-rate streams to unified grid)
+    python scripts/tools/export_hdf5_to_zarr.py \\
+        --data_dir data/episodes/ --output data/export/ \\
+        --align --align_dt 0.020 --align_method linear
 """
 
 from __future__ import annotations
@@ -302,6 +307,94 @@ def split_train_val(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Timestamp alignment
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _align_all_episodes(
+    episode_paths: list[Path],
+    obs_list: list[np.ndarray],
+    action_list: list[np.ndarray],
+    episode_lengths: list[int],
+    dt: float = 0.020,
+    method: str = "linear",
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+    """Align all episodes using TimestampAligner and reconstruct obs/action.
+
+    Returns updated (obs_list, action_list, episode_lengths).
+    """
+    from dexmani_real.recording.post_processor import TimestampAligner
+
+    aligner = TimestampAligner(dt=dt, method=method)
+
+    new_obs_list: list[np.ndarray] = []
+    new_action_list: list[np.ndarray] = []
+    new_lengths: list[int] = []
+
+    for i, h5_path in enumerate(episode_paths):
+        try:
+            aligned = aligner.align(str(h5_path), dt=dt)
+            if aligned is None:
+                print(f"  [SKIP] {h5_path.name}: alignment failed")
+                # Keep original
+                new_obs_list.append(obs_list[i])
+                new_action_list.append(action_list[i])
+                new_lengths.append(episode_lengths[i])
+                continue
+
+            # Reconstruct obs from aligned data
+            obs_parts = []
+            for key, dim in _OBS_KEYS:
+                if key in aligned:
+                    arr = aligned[key]
+                    if arr.ndim == 1:
+                        arr = arr[:, np.newaxis]
+                    obs_parts.append(arr)
+            if obs_parts:
+                new_obs = np.concatenate(obs_parts, axis=1).astype(np.float32)
+            else:
+                new_obs = obs_list[i]
+
+            # Reconstruct action from aligned data
+            act_parts = []
+            for key, dim in _ACTION_KEYS:
+                if key in aligned:
+                    arr = aligned[key]
+                    if arr.ndim == 1:
+                        arr = arr[:, np.newaxis]
+                    act_parts.append(arr)
+            if act_parts:
+                new_act = np.concatenate(act_parts, axis=1).astype(np.float32)
+            else:
+                new_act = action_list[i]
+
+            # Remove NaN frames (gaps beyond max_gap)
+            valid_mask = ~np.isnan(new_obs).any(axis=1)
+            new_obs = new_obs[valid_mask]
+            new_act = new_act[valid_mask]
+
+            original_len = len(obs_list[i])
+            aligned_len = len(new_obs)
+            print(
+                f"  {h5_path.name}: aligned {original_len}→{aligned_len} frames "
+                f"(removed {original_len - aligned_len} NaN-gap frames)"
+            )
+
+            new_obs_list.append(new_obs)
+            new_action_list.append(new_act)
+            new_lengths.append(aligned_len)
+
+        except (OSError, KeyError, ValueError) as e:
+            print(f"  [ERROR] {h5_path.name}: alignment error: {e}")
+            # Keep original
+            new_obs_list.append(obs_list[i])
+            new_action_list.append(action_list[i])
+            new_lengths.append(episode_lengths[i])
+
+    return new_obs_list, new_action_list, new_lengths
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Norm stats (train-only to avoid leakage)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -476,6 +569,20 @@ def main() -> None:
         "--validate", action="store_true",
         help="Run DataValidator on episodes before export.",
     )
+    # ── Timestamp alignment ──
+    parser.add_argument(
+        "--align", action="store_true",
+        help="Post-process timestamp alignment: interpolate all streams to a unified time grid.",
+    )
+    parser.add_argument(
+        "--align_dt", type=float, default=0.020,
+        help="Target dt for aligned grid in seconds (default: 0.020 = 20ms).",
+    )
+    parser.add_argument(
+        "--align_method", type=str, default="linear",
+        choices=["linear", "nearest"],
+        help="Interpolation method for alignment (default: linear).",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser().resolve()
@@ -523,6 +630,14 @@ def main() -> None:
     if not obs_list:
         print("No valid episodes to export.", file=sys.stderr)
         sys.exit(1)
+
+    # ── Timestamp alignment (if requested) ──
+    if args.align:
+        print(f"\nTimestamp alignment: dt={args.align_dt*1000:.0f}ms method={args.align_method}")
+        obs_list, action_list, episode_lengths = _align_all_episodes(
+            episode_paths, obs_list, action_list, episode_lengths,
+            dt=args.align_dt, method=args.align_method,
+        )
 
     # ── Train/val split ──
     if args.train_val_split is not None:

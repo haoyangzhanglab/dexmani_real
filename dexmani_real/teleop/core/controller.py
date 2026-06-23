@@ -52,6 +52,7 @@ from dexmani_real.robot.interface import (
     RobotState,
 )
 from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager, StreamStats
 
 if TYPE_CHECKING:
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
@@ -90,6 +91,7 @@ class TeleopControllerConfig:
     interpolation_max_rot_speed: float | None = None
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
+    use_precise_wait: bool = False  # True → RateManager busy-wait; False → RateLimiter sleep
 
 
 class TeleopController:
@@ -145,7 +147,12 @@ class TeleopController:
         self.recorder = recorder
 
         self.limiter = RateLimiter(cfg.target_hz)
+        self.rate_manager = RateManager(cfg.target_hz) if cfg.use_precise_wait else None
         self.ema_alpha_arm = float(cfg.ema_alpha_arm)
+
+        # Stream statistics
+        self.vr_stats = StreamStats(name="vr_track", target_hz=120.0)
+        self.camera_stats = StreamStats(name="camera", target_hz=30.0)
 
         # Resolve interpolation settings from planner's TeleopProfile when not
         # explicitly passed.
@@ -248,7 +255,10 @@ class TeleopController:
             while self.running:
                 self._handle_keyboard()
                 self._tick()
-                self.limiter.wait()
+                if self.rate_manager is not None:
+                    self.rate_manager.wait()
+                else:
+                    self.limiter.wait()
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt — stopping.")
         except (RuntimeError, ConnectionError, ValueError) as e:
@@ -316,6 +326,12 @@ class TeleopController:
         # 1. Get VR frame
         vr_frame = self._read_vr_frame()
 
+        # Track VR frame age in stats
+        if vr_frame is not None:
+            self.vr_stats.record_consume(
+                self.tracking_quality.frame_age(vr_frame)
+            )
+
         # 2. Tracking quality gate
         tq_result = self.tracking_quality.check(vr_frame)
         if not tq_result.ok:
@@ -359,6 +375,9 @@ class TeleopController:
                 logger.debug("Camera poll failed — continuing without camera frame.")
 
         if camera_frame is not None:
+            self.camera_stats.record_consume(
+                time.perf_counter() - camera_frame.get("timestamp", time.perf_counter())
+            )
             ts = camera_frame.get("timestamp", 0.0)
             if ts > 0 and (time.perf_counter() - ts) < 0.5:
                 flags |= CAMERA_OK  # bit 6: camera frame fresh (<500ms)
@@ -843,10 +862,14 @@ class TeleopController:
         )
         seq = vr_frame.get("sequence_id", "?") if vr_frame else "?"
         rec = "REC" if self.recording else "   "
+        vr_mean_age = self.vr_stats.mean_age_s * 1000
+        cam_mean_age = self.camera_stats.mean_age_s * 1000
         logger.info(
             "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms "
+            "vr_ema=%.0fms cam_ema=%.0fms "
             "ik=%s/%s retarget=%s/%s [%s]",
             now, self.frame_count, self.state.value, rec, seq, f"{age_s*1000:.0f}",
+            vr_mean_age, cam_mean_age,
             self.ik_success_count, self.ik_fail_count,
             self.retarget_success_count, self.retarget_fail_count,
             flags_str,

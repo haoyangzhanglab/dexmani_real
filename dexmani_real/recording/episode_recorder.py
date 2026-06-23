@@ -17,6 +17,12 @@ HDF5 structure (per recording-spec.md):
       /camera/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)
       /camera/K(3,3)                        # intrinsics matrix
       /camera/extrinsics(T,4,4)             # T_base_camera, per-frame extrinsics
+      /timestamps(T,)                       # control loop timestamps
+      /vr_timestamps(T,)                    # VR frame receive timestamps
+
+Supports two write modes:
+  - Direct: per-frame h5py.Dataset.resize() (legacy, simple, many resize calls)
+  - Batch:  pre-allocated InMemoryFrameBuffer with batch flush every 100 frames
 """
 
 from __future__ import annotations
@@ -42,16 +48,22 @@ class EpisodeRecorder:
     """Records teleoperation episodes to HDF5 files.
 
     Lifecycle: start_episode() → add_frame() × N → stop_episode()
+
+    Two write modes:
+      - use_batch_buffer=False (default): per-frame h5py resize (simple, legacy).
+      - use_batch_buffer=True: InMemoryFrameBuffer with batch flush (fast, recommended).
     """
 
     def __init__(
         self,
         data_dir: str,
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
+        use_batch_buffer: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.max_frames = max_frames
+        self.use_batch_buffer = use_batch_buffer
 
         self._file: h5py.File | None = None
         self._frame_count: int = 0
@@ -59,8 +71,11 @@ class EpisodeRecorder:
         self._start_time: float | None = None
         self._episode_path: str | None = None
 
-        # Expandable datasets — use chunked + resizable storage
+        # Expandable datasets — use chunked + resizable storage (direct mode)
         self._datasets: dict[str, Any] = {}
+
+        # Batch buffer (batch mode)
+        self._buffer: Any = None  # InMemoryFrameBuffer
 
     @property
     def is_recording(self) -> bool:
@@ -121,6 +136,14 @@ class EpisodeRecorder:
         self._file.create_group("action")
         self._file.create_group("vr")
 
+        # ── Initialize batch buffer if enabled ──
+        if self.use_batch_buffer:
+            from dexmani_real.recording.frame_buffer import InMemoryFrameBuffer
+            self._buffer = InMemoryFrameBuffer(
+                max_frames=self.max_frames,
+                h5_file=self._file,
+            )
+
         return True
 
     def add_frame(
@@ -145,6 +168,24 @@ class EpisodeRecorder:
             self.stop_episode(success=True)
             return True
 
+        if self._buffer is not None:
+            # Batch mode: O(1) numpy assignment
+            vr_ts = vr_frame.get("local_recv_ns")
+            ok = self._buffer.add_frame(
+                state=state,
+                action=action,
+                vr_frame=vr_frame,
+                quality_flags=quality_flags,
+                camera_frame=camera_frame,
+                T_base_eef=T_base_eef,
+                timestamp_ns=int(time.perf_counter_ns()),
+                vr_timestamp_ns=vr_ts,
+            )
+            if ok:
+                self._frame_count += 1
+            return ok
+
+        # Direct mode (legacy): per-frame resize + write
         self._append_or_create("obs/arm_qpos", state.arm_qpos)
         self._append_or_create("obs/arm_qvel", state.arm_qvel)
         self._append_or_create("obs/arm_tau", state.arm_tau)
@@ -170,6 +211,27 @@ class EpisodeRecorder:
             )
         else:
             self._resize_append("quality_flags", qf_arr)
+
+        # Timestamps
+        ts_arr = np.array([time.perf_counter()], dtype=np.float64)
+        if "timestamps" not in self._datasets:
+            self._datasets["timestamps"] = self._file.create_dataset(
+                "timestamps", data=ts_arr,
+                maxshape=(None,), chunks=True, dtype=np.float64,
+            )
+        else:
+            self._resize_append("timestamps", ts_arr)
+
+        vr_ts_arr = np.array(
+            [vr_frame.get("local_recv_ns", 0) * 1e-9], dtype=np.float64
+        )
+        if "vr_timestamps" not in self._datasets:
+            self._datasets["vr_timestamps"] = self._file.create_dataset(
+                "vr_timestamps", data=vr_ts_arr,
+                maxshape=(None,), chunks=True, dtype=np.float64,
+            )
+        else:
+            self._resize_append("vr_timestamps", vr_ts_arr)
 
         # Camera extrinsics
         if T_base_eef is not None:
@@ -224,6 +286,13 @@ class EpisodeRecorder:
         if not self._recording or self._file is None:
             return None
 
+        # Flush batch buffer if active
+        if self._buffer is not None:
+            flushed = self._buffer.flush_all()
+            logger.debug("Batch buffer flushed: %d frames", flushed)
+            self._buffer.close()
+            self._buffer = None
+
         duration = time.perf_counter() - (self._start_time or 0.0)
 
         meta = self._file["meta"]
@@ -250,6 +319,8 @@ class EpisodeRecorder:
         # Camera frame presence
         has_camera = "camera/timestamps" in self._file
         meta.attrs["has_camera"] = has_camera
+        meta.attrs["has_timestamps"] = "timestamps" in self._file
+        meta.attrs["has_vr_timestamps"] = "vr_timestamps" in self._file
 
         path = self._episode_path
         self._file.close()
