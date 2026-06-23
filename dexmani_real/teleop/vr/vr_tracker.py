@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["QuestHandTracker"]
+__all__ = ["QuestHandTracker", "VRFrameSimulator"]
 
 import threading
 import time
@@ -313,3 +313,128 @@ class QuestHandTracker:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.disconnect()
 
+
+class VRFrameSimulator:
+    """Dummy VR frame generator — sinusoidal wrist trajectory for testing.
+
+    Produces a repeating figure-8 wrist trajectory in the XY plane with
+    a fixed Z height and constant identity orientation.  21 landmarks
+    form a rigid hand shape (fingers spread).
+
+    Compatible with the QuestHandTracker API (get_latest, is_connected)
+    so it can be dropped into any code that expects a tracker.
+
+    Usage:
+        sim = VRFrameSimulator(hz=50.0)
+        while loop:
+            frame = sim.get_latest()
+            ... use frame just like a real VR frame ...
+
+    Ref: Phase 3.3 — automated testing without Quest hardware.
+    """
+
+    def __init__(
+        self,
+        hz: float = 50.0,
+        amplitude_m: float = 0.15,
+        center_pos: tuple[float, float, float] = (0.45, 0.0, 0.30),
+        hand_side: str = "right",
+    ) -> None:
+        self._hz = float(hz)
+        self._amplitude = float(amplitude_m)
+        self._center = np.asarray(center_pos, dtype=np.float64)
+        self._hand_side = hand_side
+
+        self._seq: int = 0
+        self._start_time: float = time.perf_counter()
+
+        # Pre-compute rigid landmark positions (right hand, palm down).
+        # 21 landmarks × (x, y, z) in meters relative to wrist.
+        self._base_landmarks: np.ndarray = self._make_base_landmarks()
+
+    # ------------------------------------------------------------------
+    # Tracker-compatible API
+    # ------------------------------------------------------------------
+
+    def get_latest(self, max_age_s: float | None = None) -> dict | None:
+        """Return a dummy VR frame dict with sinusoidal wrist trajectory.
+
+        Always returns a fresh frame (never None, no age check).
+        """
+        self._seq += 1
+        now_s = time.perf_counter() - self._start_time
+
+        # Sinusoidal figure-8 trajectory in XY plane
+        t = now_s
+        x = self._center[0] + self._amplitude * np.sin(2.0 * np.pi * 0.3 * t)
+        y = self._center[1] + self._amplitude * 0.6 * np.sin(4.0 * np.pi * 0.3 * t)
+        z = self._center[2] + 0.03 * np.sin(2.0 * np.pi * 0.15 * t)
+
+        wrist_pos = np.array([x, y, z], dtype=np.float64)
+        wrist_quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        landmarks = self._base_landmarks + wrist_pos.reshape(1, 3)
+
+        return {
+            "side": self._hand_side,
+            "wrist_pos": wrist_pos,
+            "wrist_quat_wxyz": wrist_quat_wxyz,
+            "landmarks": landmarks,
+            "recv_ts_ns": time.monotonic_ns(),
+            "source_ts_ns": time.monotonic_ns(),
+            "sequence_id": self._seq,
+            "source_frame_seq": self._seq,
+            "coordinate_frame": "flu",
+            "local_recv_ns": time.monotonic_ns(),
+        }
+
+    def is_connected(self) -> bool:
+        return True
+
+    # ------------------------------------------------------------------
+    # Landmark generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_base_landmarks() -> np.ndarray:
+        """Generate 21 rigid hand landmarks (finger-spread pose).
+
+        Coordinates in FLU frame, meters, relative to wrist center.
+        Wrist landmark (index 0) is at origin.
+        """
+        # Hand scale: ~8cm from wrist to middle finger MCP
+        pts = np.zeros((21, 3), dtype=np.float64)
+
+        # Wrist
+        pts[0] = [0.00, 0.00, 0.00]
+
+        # Thumb: extends sideways (positive X in FLU = left)
+        pts[1]  = [0.025, -0.010, -0.020]  # THUMB_CMC
+        pts[2]  = [0.045, -0.005, -0.030]  # THUMB_MCP
+        pts[3]  = [0.060,  0.000, -0.035]  # THUMB_IP
+        pts[4]  = [0.070,  0.005, -0.038]  # THUMB_TIP
+
+        # Index finger
+        pts[5]  = [-0.020,  0.010, -0.070]  # INDEX_FINGER_MCP
+        pts[6]  = [-0.018,  0.010, -0.095]  # INDEX_FINGER_PIP
+        pts[7]  = [-0.015,  0.010, -0.115]  # INDEX_FINGER_DIP
+        pts[8]  = [-0.013,  0.010, -0.130]  # INDEX_FINGER_TIP
+
+        # Middle finger
+        pts[9]  = [0.000,  0.005, -0.072]   # MIDDLE_FINGER_MCP
+        pts[10] = [0.000,  0.005, -0.100]   # MIDDLE_FINGER_PIP
+        pts[11] = [0.000,  0.005, -0.120]   # MIDDLE_FINGER_DIP
+        pts[12] = [0.000,  0.005, -0.138]   # MIDDLE_FINGER_TIP
+
+        # Ring finger
+        pts[13] = [0.015,  0.000, -0.068]   # RING_FINGER_MCP
+        pts[14] = [0.015,  0.000, -0.090]   # RING_FINGER_PIP
+        pts[15] = [0.015,  0.000, -0.108]   # RING_FINGER_DIP
+        pts[16] = [0.015,  0.000, -0.120]   # RING_FINGER_TIP
+
+        # Pinky
+        pts[17] = [0.028, -0.008, -0.060]   # PINKY_MCP
+        pts[18] = [0.030, -0.008, -0.078]   # PINKY_PIP
+        pts[19] = [0.030, -0.008, -0.092]   # PINKY_DIP
+        pts[20] = [0.030, -0.008, -0.102]   # PINKY_TIP
+
+        return pts

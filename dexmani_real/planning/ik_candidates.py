@@ -375,6 +375,12 @@ class IKCandidateManager:
         """Check if the linear joint-space segment start→end is self-collision-free."""
         return self._check_segment_collision(start, end, "self", step_size)
 
+    def check_segment_env_collision_free(
+        self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
+    ) -> bool:
+        """Check if the linear joint-space segment start→end is env-collision-free."""
+        return self._check_segment_collision(start, end, "env", step_size)
+
     def check_path_collisions(
         self, path: np.ndarray, collision_step_size: float = 0.02,
     ) -> dict[str, Any]:

@@ -89,6 +89,21 @@ class TeleopControllerConfig:
     multi_camera_configs: list | None = None  # None → single-camera (backward compat)
     multi_camera_auto_restart: bool = True
 
+    # ── Tracking safety ──
+    # Max single-joint deviation between commanded and actual position (rad).
+    # When |q_actual[i] - q_command[i]| exceeds this threshold for any joint,
+    # _consecutive_divergence increments.  Three consecutive divergences
+    # trigger emergency stop.  Default 5.0 rad (~286°) — intentionally high:
+    # only triggers on gross mechanical failure / encoder fault.
+    # Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD.
+    tracking_divergence_threshold_rad: float = 5.0
+
+    # ── Velocity-limited smoothing (Phase 2.1) ──
+    # When True, applies velocity-limited step between pipeline output and
+    # send_action, bottleneck-scaling the joint delta to max_qvel * dt.
+    # Reuses the existing _limit_joint_step bottleneck algorithm.
+    use_velocity_limited_smooth: bool = True
+
 
 class TeleopController:
     """Main teleoperation controller.
@@ -217,6 +232,17 @@ class TeleopController:
         self._last_arm_cmd: np.ndarray | None = None
         self._last_hand_cmd: np.ndarray | None = None
 
+        # ── Tracking safety: command-vs-actual deviation monitoring ──
+        # Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD
+        self._consecutive_divergence: int = 0
+        self._tracking_divergence_threshold = cfg.tracking_divergence_threshold_rad
+
+        # ── Velocity-limited smoothing (Phase 2.1) ──
+        self._use_vel_limited_smooth = cfg.use_velocity_limited_smooth
+
+        # ── IK miss counter (Phase 2.2 — rate decoupling) ──
+        self._ik_miss_count: int = 0
+
         # Pipeline — shared action computation (extracted from controller)
         self.pipeline = TeleopPipeline(
             arm_mapper, retargeter, planner,
@@ -291,12 +317,22 @@ class TeleopController:
     # Soft deceleration
 
     def _apply_soft_deceleration(self, lost_duration_s: float) -> None:
-        """Hold current physical position during VR stale window.
+        """Decelerate during VR stale window (0.2s < age < 1.0s).
 
-        Instant hold — no exponential decay.
+        Velocity mode (Phase 2.4 None-sentinel): clears the PID target so
+        the inner loop sends zero velocity → natural deceleration.
+        Servo mode: holds current physical position.
         """
         if self._last_arm_cmd is None:
             return
+
+        arm_cfg = self.robot.arm.config
+        if not arm_cfg.use_servo_control:
+            # Velocity mode: let PID decelerate naturally via None-sentinel
+            self.robot.arm.clear_target()
+            return
+
+        # Servo mode: hold current position
         state = self._dummy_state() if self.dry_run else self.robot.get_state()
         hand_cmd = (
             self._last_hand_cmd
@@ -318,25 +354,78 @@ class TeleopController:
                 return
             self.robot.send_action(action)
 
+    # Velocity-limited step (Phase 2.1)
+
+    def _apply_velocity_limited_step(
+        self, action: RobotAction, state: RobotState
+    ) -> RobotAction:
+        """Apply velocity-limited smoothing between pipeline output and send_action.
+
+        Uses bottleneck scaling (same algorithm as XArm7._limit_joint_step):
+        when any joint exceeds its per-step velocity limit, ALL joints are
+        scaled by the same factor to preserve the trajectory shape.
+
+        Uses per-joint max_qvel from the arm config (default 90-150°/s per joint)
+        converted to a per-step limit via dt = 1/target_hz.
+
+        Ref: T-Rex arm_hand_control.py SmootherVelocity — bottleneck scaling
+        with the same ratio applied to all joints.
+        """
+        if self._last_arm_cmd is None:
+            return action
+
+        dt = 1.0 / self.limiter.target_hz
+        # Use arm config max_qvel as per-joint velocity limits
+        arm_cfg = self.robot.arm.config
+        max_step = arm_cfg.max_qvel * dt  # rad per tick
+
+        arm_target = np.asarray(action.arm_qpos_cmd, dtype=np.float64)
+        prev_cmd = np.asarray(self._last_arm_cmd, dtype=np.float64)
+        delta = arm_target - prev_cmd
+
+        # Bottleneck scaling: normalize each joint's delta by its limit,
+        # find the worst offender, scale all joints proportionally.
+        normalized = np.abs(delta) / max_step
+        max_ratio = np.max(normalized)
+        if max_ratio > 1.0:
+            delta = delta / max_ratio
+            action.arm_qpos_cmd = prev_cmd + delta
+            logger.debug(
+                "Velocity-limited step applied: max_ratio=%.2f joint=%d",
+                max_ratio, int(np.argmax(normalized)) + 1,
+            )
+
+        return action
+
     # State machine tick
 
     def _tick(self) -> None:
         tick_start = time.perf_counter()
         self.frame_count += 1
 
-        # PAUSED: hold position, no VR reading or pipeline computation
+        # PAUSED: decelerate naturally (velocity mode) or hold position (servo mode).
+        # No VR reading or pipeline computation.
         if self.state == ControllerState.PAUSED:
             if not self.dry_run and self._last_arm_cmd is not None:
-                state = self.robot.get_state()
-                hold_action = RobotAction(
-                    arm_qpos_cmd=self._last_arm_cmd,
-                    hand_qpos_cmd=(
-                        self._last_hand_cmd
-                        if self._last_hand_cmd is not None
-                        else state.hand_qpos
-                    ),
-                )
-                self.robot.send_action(hold_action)
+                # None-sentinel (Phase 2.4): for velocity control mode,
+                # clear the PID target so the inner loop sends zero velocity
+                # → natural deceleration.  For servo mode, hold position as before.
+                arm_cfg = self.robot.arm.config
+                if not arm_cfg.use_servo_control:
+                    # Velocity mode: let PID decelerate naturally
+                    self.robot.arm.clear_target()
+                else:
+                    # Servo mode: hold last commanded position
+                    state = self.robot.get_state()
+                    hold_action = RobotAction(
+                        arm_qpos_cmd=self._last_arm_cmd,
+                        hand_qpos_cmd=(
+                            self._last_hand_cmd
+                            if self._last_hand_cmd is not None
+                            else state.hand_qpos
+                        ),
+                    )
+                    self.robot.send_action(hold_action)
             return
 
         # IDLE / SAVE_PROMPT: no pipeline (waiting for user input)
@@ -374,8 +463,53 @@ class TeleopController:
         else:
             state = self.robot.get_state()
 
+        # 3b. Tracking safety: command-vs-actual deviation check
+        #     Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD (10 rad).
+        #     Detects mechanical jams / encoder faults that may not trigger
+        #     hardware-layer torque/current thresholds.
+        if not self.dry_run and self._last_arm_cmd is not None:
+            err = np.abs(state.arm_qpos - self._last_arm_cmd)
+            if np.any(err > self._tracking_divergence_threshold):
+                self._consecutive_divergence += 1
+                logger.warning(
+                    "Tracking divergence: max_err=%.2f rad frame=%s consecutive=%d",
+                    float(np.max(err)), self.frame_count, self._consecutive_divergence,
+                )
+                if self._consecutive_divergence >= 3:
+                    self._escalate_to_emergency(
+                        f"Tracking divergence > {self._tracking_divergence_threshold} rad "
+                        f"for 3 consecutive frames (max_err={np.max(err):.2f} rad)"
+                    )
+                    return
+            else:
+                self._consecutive_divergence = 0
+
         # 4. Compute action
         action, status = self._compute_action(vr_frame, state)
+
+        # 4b. IK miss tracking (Phase 2.2 — rate decoupling)
+        #     Increment counter on IK failure; reset on success.
+        #     The hold-on-failure strategy (send last good target) ensures
+        #     the PID inner loop continues to receive commands at 50 Hz
+        #     even when IK temporarily fails — isolating IK jitter from
+        #     command sending.
+        if status["ik_ok"]:
+            self._ik_miss_count = 0
+        else:
+            self._ik_miss_count += 1
+            if self._ik_miss_count >= 3:
+                logger.warning(
+                    "IK missed %d consecutive frames — holding position",
+                    self._ik_miss_count,
+                )
+
+        # 4c. Velocity-limited step (Phase 2.1 — smoothing safety net)
+        #     Applies bottleneck scaling between pipeline output and send_action,
+        #     ensuring joint velocity stays within per-joint max_qvel limits.
+        #     This is a software-level safety net; the primary speed limit is
+        #     still XArm7._limit_joint_step() at the driver layer.
+        if self._use_vel_limited_smooth and self._last_arm_cmd is not None:
+            action = self._apply_velocity_limited_step(action, state)
 
         # 5. Safety checks on hardware state (direct checks, no bitmask layer)
         hand_state = self.robot.hand.get_state(full=True)
@@ -427,8 +561,23 @@ class TeleopController:
                 )
 
         # ── Recording (delegated to CollectionLoop if available) ──
+        T_base_eef = self._compute_T_base_eef(state)
+
+        # Pre-record buffer (Phase 3.1): always buffer frames so that
+        # pressing R captures the last N seconds before the keypress.
+        # Flushed to HDF5 on start_episode() before normal recording.
+        if self._collection_loop is not None:
+            try:
+                self._collection_loop.add_pre_frame(
+                    state=state, action=action, vr_frame=vr_frame,
+                    camera_frame=camera_frame,
+                    camera_frames=camera_frames,
+                    T_base_eef=T_base_eef,
+                )
+            except (ValueError, OSError) as e:
+                logger.debug("collection_loop add_pre_frame failed: %s", e)
+
         if self.recording:
-            T_base_eef = self._compute_T_base_eef(state)
             if self._collection_loop is not None:
                 try:
                     self._collection_loop.record_frame(
@@ -709,6 +858,8 @@ class TeleopController:
         self.recording = False
         self.error_handler.clear()
         self.tracking_quality.reset()
+        self._consecutive_divergence = 0
+        self._ik_miss_count = 0
         logger.info("Home complete.")
 
     def _reset_mapper(self) -> bool:
@@ -765,20 +916,31 @@ class TeleopController:
         self.error_handler.clear()
         logger.info("Episode recording started.")
 
-    def _stop_recording(self) -> None:
-        """Stop episode recording. Does NOT change controller state."""
-        logger.info("Stopping episode. frames=%s", self.frame_count)
+    def _stop_recording(self, classification: str = "success") -> None:
+        """Stop episode recording. Does NOT change controller state.
+
+        Args:
+            classification: "success", "failure", or "partial" —
+                used for sidecar JSON metadata and file directory routing.
+        """
+        logger.info("Stopping episode. frames=%s classification=%s", self.frame_count, classification)
         path = None
         if self._collection_loop is not None and self._collection_loop.is_recording:
             try:
-                path = self._collection_loop.stop_episode(success=True)
+                path = self._collection_loop.stop_episode(
+                    success=(classification == "success"),
+                    reason="manual",
+                    classification=classification,
+                    ik_success_rate=self._compute_ik_success_rate(),
+                    vr_drop_rate=self._compute_vr_drop_rate(),
+                )
                 if path:
                     logger.info("  Saved to %s", path)
             except (ValueError, OSError) as e:
                 logger.exception("collection_loop stop_episode failed: %s", e)
         elif self.recorder is not None and self.recorder.is_recording:
             try:
-                path = self.recorder.stop_episode(success=True)
+                path = self.recorder.stop_episode(success=(classification == "success"))
                 if path:
                     logger.info("  Saved to %s", path)
             except (ValueError, OSError) as e:
@@ -826,6 +988,8 @@ class TeleopController:
         self.running = True
         self.error_handler.clear()
         self.tracking_quality.reset()
+        self._consecutive_divergence = 0
+        self._ik_miss_count = 0
 
         if not self.dry_run:
             try:
@@ -943,6 +1107,20 @@ class TeleopController:
         )
 
     # Status
+
+    def _compute_ik_success_rate(self) -> float:
+        total = self.ik_success_count + self.ik_fail_count
+        return self.ik_success_count / total if total > 0 else 1.0
+
+    def _compute_vr_drop_rate(self) -> float:
+        """VR frame drop rate: fraction of ticks that had no valid VR frame.
+
+        Uses (total_ticks - vr_consumed) / total_ticks as a conservative
+        estimate — frames consumed count is incremented only when a valid
+        VR frame passes the tracking quality gate.
+        """
+        total = max(self.frame_count, 1)
+        return max(0.0, (total - self.vr_stats.consumed) / total)
 
     def _print_status(
         self, vr_frame: dict | None, now: float

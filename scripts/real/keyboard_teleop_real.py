@@ -345,6 +345,9 @@ def main():
     loop_count = 0
     error_count = 0
     max_consecutive_errors = 10
+    # ── 追踪安全 (Phase 1.1) — cmd-vs-actual 偏差监控 ──
+    consecutive_divergence = 0
+    TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
 
     print("\n进入遥操作循环...\n")
 
@@ -381,6 +384,7 @@ def main():
                     prev_qpos_cmd = state.arm_qpos.copy()
                     target_pos = state.eef_pos.copy()
                     target_quat = state.eef_quat_wxyz.copy()
+                consecutive_divergence = 0
                 continue
 
             # ── 读状态 ──
@@ -511,6 +515,24 @@ def main():
             )
 
             send_result = robot.send_action(action)
+
+            # ── 追踪安全 (Phase 1.1): |q_actual - q_cmd| 偏差监控 ──
+            post_clip_cmd = send_result.get("arm_cmd")
+            if post_clip_cmd is not None and np.all(np.isfinite(state.arm_qpos)):
+                tracking_err = np.max(np.abs(state.arm_qpos - post_clip_cmd))
+                if tracking_err > TRACKING_DIVERGENCE_THRESHOLD_RAD:
+                    consecutive_divergence += 1
+                    print(
+                        f"  [SAFETY] Tracking divergence: max_err={tracking_err:.1f}rad "
+                        f"(frame {consecutive_divergence}/3)"
+                    )
+                    if consecutive_divergence >= 3:
+                        print("  [SAFETY] Emergency stop — persistent tracking divergence")
+                        robot.emergency_stop()
+                        running = False
+                        break
+                else:
+                    consecutive_divergence = 0
 
             # DEBUG: 每 50 帧 (1s), 使用 post-clip 值对比 pre-clip IK
             if loop_count % 50 == 0:

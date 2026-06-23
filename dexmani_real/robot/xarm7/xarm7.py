@@ -490,6 +490,20 @@ class XArm7(ConnectionStateMixin):
 
     # Soft-start
 
+    def clear_target(self) -> None:
+        """Clear the PID target (set to None) for natural deceleration.
+
+        When the PID inner loop sees None, it sends zero velocity rather
+        than holding the last position.  Used by the controller during
+        PAUSED, soft-deceleration, and EMERGENCY_STOP transitions.
+
+        Only meaningful in velocity control mode (use_servo_control=False).
+        In servo mode, this is a no-op — position hold is the only option.
+        """
+        if not self.config.use_servo_control:
+            with self._arm_lock:
+                self._arm_pos_target = None
+
     def reset_soft_start(self) -> None:
         """Reset soft-start ramp counter. Call on TELEOP entry.
 
@@ -579,6 +593,15 @@ class XArm7(ConnectionStateMixin):
             with self._arm_lock:
                 target = self._arm_pos_target
             if target is None:
+                # None-sentinel: send zero velocity for natural deceleration.
+                # Ref: T-Rex arm_hand_control.py action_buffer None → stop command.
+                # Used by controller during PAUSED / soft-deceleration / emergency
+                # to let the PID inner loop decelerate smoothly rather than
+                # abruptly holding position.
+                try:
+                    self.arm.vc_set_joint_velocity(np.zeros(7, dtype=np.float64))
+                except (RuntimeError, OSError):
+                    pass
                 continue
 
             # Read current hardware position

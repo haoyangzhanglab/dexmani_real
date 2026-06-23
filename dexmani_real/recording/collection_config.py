@@ -40,5 +40,22 @@ class CollectionConfig:
     # ── Auto-stop triggers ──
     auto_stop_on_max_frames: bool = True
 
+    # ── Episode file classification (Phase 1.2) ──
+    # After stop_episode(), files are moved to success_dir / failure_dir
+    # based on the classification parameter.  None disables move (backward compat).
+    # Ref: T-Rex data_writer.py move_episode_files().
+    success_dir: str | None = None   # e.g. "data/success"
+    failure_dir: str | None = None   # e.g. "data/failure"
+
+    # ── Sidecar JSON (Phase 1.2) ──
+    # When True, writes an episode_NNN.json sidecar next to the HDF5 file.
+    save_sidecar_json: bool = True
+
+    # ── Pre-record buffer (Phase 3.1) ──
+    # Seconds of frames to buffer before the Record key is pressed.
+    # When > 0, InMemoryFrameBuffer runs a ring buffer in pre-record mode,
+    # flushing buffered frames to HDF5 on start_episode().
+    pre_record_duration_s: float = 0.0
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
