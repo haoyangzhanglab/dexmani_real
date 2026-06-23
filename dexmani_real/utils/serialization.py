@@ -20,7 +20,6 @@ from typing import Any, get_args, get_origin
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Type-introspection helpers
 # ---------------------------------------------------------------------------
@@ -209,9 +208,45 @@ class FromDictMixin:
             field1: float = 0.0
 
         cfg = MyConfig.from_dict({"field1": 1.5})
+
+        # Hot-reload from file (P3.2):
+        cfg = MyConfig.from_yaml("configs/profile.yaml")
+        cfg = MyConfig.from_json("configs/profile.json")
     """
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Any:
         """Reconstruct from a serialized dict."""
         return cls(**from_dict_helper(cls, d))
+
+    @classmethod
+    def from_yaml(cls, path: str) -> Any:
+        """Load configuration from a YAML file (hot-reload, P3.2).
+
+        Supports nested dataclass fields — uses from_dict_helper internally
+        which handles tuple/list/ndarray conversion, Enum lookup, and nested
+        FromDictMixin dataclasses.
+        """
+        import yaml
+        from pathlib import Path
+
+        with open(Path(path), "r", encoding="utf-8") as f:
+            d = yaml.safe_load(f)
+        if not isinstance(d, dict):
+            raise TypeError(f"YAML file {path} must contain a mapping at the top level, " f"got {type(d).__name__}")
+        return cls.from_dict(d)
+
+    @classmethod
+    def from_json(cls, path: str) -> Any:
+        """Load configuration from a JSON file (hot-reload, P3.2).
+
+        Same semantics as from_yaml but for JSON format.
+        """
+        import json
+        from pathlib import Path
+
+        with open(Path(path), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise TypeError(f"JSON file {path} must contain a mapping at the top level, " f"got {type(d).__name__}")
+        return cls.from_dict(d)

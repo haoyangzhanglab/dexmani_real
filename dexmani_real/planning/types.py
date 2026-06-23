@@ -129,7 +129,7 @@ class TeleopProfile(FromDictMixin):
 
     use_position_ik: bool = True
     use_differential_ik_fallback: bool = True
-    differential_ik_gain: float = 1.0       # full tracking, bottleneck limit handles speed
+    differential_ik_gain: float = 1.0  # full tracking, bottleneck limit handles speed
     differential_ik_damping: float = 0.02
     # NOTE: damping=0.02 (λ²=0.0004) is a "single-step DLS" design choice.
     # Single-step DLS avoids the ~100 iteration cost of iterative DLS
@@ -175,17 +175,16 @@ class TeleopProfile(FromDictMixin):
     # Damping multiplier when manipulability falls below min_manipulability.
     singularity_damping_scale: float = 10.0
 
-    # ── Cartesian pose interpolation (NEW) ──
-    # When True, CartPoseInterpolator runs between VR input and IK,
-    # linearly interpolating position and SLERP-interpolating rotation.
-    # Eliminates stale VR frame re-use when VR rate < control rate.
-    # Default changed to True for smoother motion in keyboard/VR teleop.
-    # Ref: ManiUniCon PoseTrajectoryInterpolator.
-    use_cartesian_interpolation: bool = True
+    # ── Cartesian pose interpolation (REMOVED 2026-06-24) ──
+    # CartPoseInterpolator (linear + SLERP) was removed because:
+    #   1. VR is native 50 Hz = control loop rate → no frequency decoupling needed
+    #   2. EMA smoothing (ema_alpha_arm) already handles frame-to-frame filtering
+    #   3. Velocity-limited step provides per-frame delta capping
+    #   4. BunnyVisionPro / LeFranX / T-Rex all operate without Cartesian interpolation
+    # The interpolator added ~20ms latency without measurable smoothness benefit.
+    use_cartesian_interpolation: bool = False
 
-    # Speed limits for interpolator (prevent sudden jumps).
-    # Raised for dexterous teleop: 0.4 m/s accommodates natural arm reaching
-    # (~0.3-0.5 m/s), 0.25 m/s was clipping faster hand motions.
-    interpolation_max_pos_speed: float = 0.4    # m/s
-    interpolation_max_rot_speed: float = 0.8    # rad/s
-
+    # Speed limits for interpolator (DEPRECATED — no longer used).
+    # Kept for backward-compatible config deserialization.
+    interpolation_max_pos_speed: float = 0.4  # m/s
+    interpolation_max_rot_speed: float = 0.8  # rad/s

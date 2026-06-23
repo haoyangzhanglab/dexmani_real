@@ -32,7 +32,6 @@ from dexmani_real.utils.signal_utils import ema_smooth
 if TYPE_CHECKING:
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
-    from dexmani_real.teleop.vr.pose_interpolator import CartPoseInterpolator
     from dexmani_real.planning.planner import XArm7MotionPlanner
 
 logger = get_logger(__name__)
@@ -66,7 +65,6 @@ class TeleopPipeline:
         retargeter: XHandRetargeter,
         planner: XArm7MotionPlanner,
         *,
-        pose_interpolator: CartPoseInterpolator | None = None,
         ema_alpha_arm: float = 1.0,
         arm_jump_limit_rad: float = _ARM_JUMP_LIMIT_RAD,
         hand_jump_limit_rad: float = _HAND_JUMP_LIMIT_RAD,
@@ -74,7 +72,6 @@ class TeleopPipeline:
         self.arm_mapper = arm_mapper
         self.retargeter = retargeter
         self.planner = planner
-        self._pose_interpolator = pose_interpolator
         self.ema_alpha_arm = float(ema_alpha_arm)
         self.arm_jump_limit_rad = float(arm_jump_limit_rad)
         self.hand_jump_limit_rad = float(hand_jump_limit_rad)
@@ -119,7 +116,10 @@ class TeleopPipeline:
         """
         # ── 1. Arm IK ──
         arm_cmd, ik_ok, target_eef_pos = self.compute_arm_command(
-            vr_frame, current_arm_qpos, prev_arm_cmd, last_arm_cmd=last_arm_cmd,
+            vr_frame,
+            current_arm_qpos,
+            prev_arm_cmd,
+            last_arm_cmd=last_arm_cmd,
         )
 
         # ── 2. Workspace check + clamp + re-IK (optional) ──
@@ -141,7 +141,9 @@ class TeleopPipeline:
                     clamped_pos = clamp_workspace_pos(arm_eef_pose.p)
                     clamped_pose = Pose(p=clamped_pos, q=arm_eef_pose.q)
                     re_ik = self.planner.solve_teleop_ik(
-                        clamped_pose, current_arm_qpos, prev_arm_cmd,
+                        clamped_pose,
+                        current_arm_qpos,
+                        prev_arm_cmd,
                     )
                     if re_ik.success and re_ik.qpos is not None:
                         arm_cmd = np.asarray(re_ik.qpos, dtype=np.float64)
@@ -151,7 +153,8 @@ class TeleopPipeline:
                         in_workspace = check_workspace(clamped_eef.p)
                         # Hand retarget — proceed with clamped arm position
                         hand_cmd, retarget_ok = self.compute_hand_command(
-                            vr_frame, prev_hand_cmd,
+                            vr_frame,
+                            prev_hand_cmd,
                         )
                     else:
                         # Re-IK on clamped pose also failed — hold in place
@@ -164,17 +167,22 @@ class TeleopPipeline:
             else:
                 # Workspace OK — proceed to hand retarget
                 hand_cmd, retarget_ok = self.compute_hand_command(
-                    vr_frame, prev_hand_cmd,
+                    vr_frame,
+                    prev_hand_cmd,
                 )
         else:
             # No workspace check or IK failed — proceed to hand retarget
             hand_cmd, retarget_ok = self.compute_hand_command(
-                vr_frame, prev_hand_cmd,
+                vr_frame,
+                prev_hand_cmd,
             )
 
         # ── 3. Joint jump clamp ──
         arm_cmd, hand_cmd, jump_ok = self.apply_jump_clamp(
-            arm_cmd, hand_cmd, prev_arm_cmd, prev_hand_cmd,
+            arm_cmd,
+            hand_cmd,
+            prev_arm_cmd,
+            prev_hand_cmd,
         )
 
         action = RobotAction(
@@ -225,20 +233,14 @@ class TeleopPipeline:
         target_eef_pos = np.asarray(mapped["pos"], dtype=np.float64)
         target_eef_quat = np.asarray(mapped["quat_wxyz"], dtype=np.float64)
 
-        # Cartesian pose interpolation (optional).
-        # Ref: ManiUniCon PoseTrajectoryInterpolator — linear pos +
-        # SLERP rot between VR frames, eliminating stale re-use.
-        if self._pose_interpolator is not None:
-            self._pose_interpolator.push_target_pose(
-                target_eef_pos, target_eef_quat,
-            )
-            result = self._pose_interpolator.get_interpolated_pose()
-            if result is not None:
-                target_eef_pos, target_eef_quat = result
+        # EMA smoothing (arm only) handles frame-to-frame filtering.
+        # No Cartesian interpolation needed — VR is native 50 Hz = control rate.
 
         target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
         ik_result = self.planner.solve_teleop_ik(
-            target_pose, arm_qpos, prev_arm_cmd,
+            target_pose,
+            arm_qpos,
+            prev_arm_cmd,
         )
 
         if ik_result.success and ik_result.qpos is not None:
@@ -345,12 +347,3 @@ class TeleopPipeline:
             (arm_cmd, hand_cmd): Current position copies.
         """
         return current_arm_qpos.copy(), current_hand_qpos.copy()
-
-    @property
-    def has_pose_interpolator(self) -> bool:
-        return self._pose_interpolator is not None
-
-    def reset_pose_interpolator(self) -> None:
-        """Reset pose interpolator (e.g. on mapper re-anchor)."""
-        if self._pose_interpolator is not None:
-            self._pose_interpolator.reset()

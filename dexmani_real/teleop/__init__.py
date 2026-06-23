@@ -1,7 +1,7 @@
 """Teleop module — VR teleoperation control.
 
 Split into core / vr / control sub-packages:
-  - core:    TeleopController, ErrorHandler, TrackingQuality
+  - core:    TeleopController
   - vr:      ArmMapper, HandRetargeter, VRTracker
   - control: KeyboardHandler, safety checks
 
@@ -10,10 +10,8 @@ Top-level __init__.py provides backward-compatible re-exports.
 
 # ── Controller ──
 from dexmani_real.teleop.core.controller import ControllerState, TeleopController
-from dexmani_real.teleop.core.error_handler import TeleopErrorHandler
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.control import safety
-from dexmani_real.teleop.core.tracking import TrackingQuality, TrackingQualityConfig, TrackingQualityResult
 
 # ── VR tracking ──
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
@@ -29,10 +27,6 @@ __all__ = [
     "KeyboardHandler",
     "safety",
     "TeleopController",
-    "TeleopErrorHandler",
-    "TrackingQuality",
-    "TrackingQualityConfig",
-    "TrackingQualityResult",
     # ── VR ──
     "ArmWristMapper",
     "QuestHandTracker",

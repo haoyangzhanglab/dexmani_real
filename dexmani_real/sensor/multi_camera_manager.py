@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,6 +74,7 @@ class MultiCameraManager:
 
         self._processes: list[CameraProcess] = []
         self._names: list[str] = []
+        self._exit_stack: ExitStack | None = None
 
         self._last_health_check: float = 0.0
 
@@ -135,6 +137,33 @@ class MultiCameraManager:
                 logger.info("  Camera '%s' stopped.", name)
             except (ValueError, RuntimeError) as e:
                 logger.warning("  Camera '%s' stop error: %s", name, e)
+
+    # ------------------------------------------------------------------
+    # Context manager (ExitStack — auto-cleanup on scope exit)
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> MultiCameraManager:
+        """Start all cameras and register cleanup via ExitStack.
+
+        Usage:
+            with MultiCameraManager(configs) as mgr:
+                frames = mgr.read_all_latest()
+                ...
+            # All cameras auto-stopped on scope exit, even on exception.
+        """
+        self._exit_stack = ExitStack()
+        self._exit_stack.callback(self.stop_all)
+        self.start_all()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Stop all cameras and release ExitStack resources."""
+        if hasattr(self, "_exit_stack") and self._exit_stack is not None:
+            self._exit_stack.close()
+            self._exit_stack = None
+        else:
+            self.stop_all()
+        return False  # don't suppress exceptions
 
     # ------------------------------------------------------------------
     # Frame access

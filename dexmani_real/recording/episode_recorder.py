@@ -50,15 +50,15 @@ class EpisodeRecorder:
     Lifecycle: start_episode() → add_frame() × N → stop_episode()
 
     Two write modes:
-      - use_batch_buffer=False (default): per-frame h5py resize (simple, legacy).
-      - use_batch_buffer=True: InMemoryFrameBuffer with batch flush (fast, recommended).
+      - use_batch_buffer=True (default): InMemoryFrameBuffer with batch flush (fast, recommended).
+      - use_batch_buffer=False: per-frame h5py resize (simple, legacy).
     """
 
     def __init__(
         self,
         data_dir: str,
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
-        use_batch_buffer: bool = False,
+        use_batch_buffer: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +139,7 @@ class EpisodeRecorder:
         # ── Initialize batch buffer if enabled ──
         if self.use_batch_buffer:
             from dexmani_real.recording.frame_buffer import InMemoryFrameBuffer
+
             self._buffer = InMemoryFrameBuffer(
                 max_frames=self.max_frames,
                 h5_file=self._file,
@@ -170,9 +171,7 @@ class EpisodeRecorder:
 
         # Hard cap: auto-stop when max_frames reached (prevents disk exhaustion).
         if self._frame_count >= self.max_frames:
-            logger.warning(
-                "Episode reached max_frames=%d, auto-stopping.", self.max_frames
-            )
+            logger.warning("Episode reached max_frames=%d, auto-stopping.", self.max_frames)
             self._file.attrs["stopped_reason"] = "max_frames"
             self.stop_episode(success=True)
             return True
@@ -214,19 +213,23 @@ class EpisodeRecorder:
         ts_arr = np.array([time.perf_counter()], dtype=np.float64)
         if "timestamps" not in self._datasets:
             self._datasets["timestamps"] = self._file.create_dataset(
-                "timestamps", data=ts_arr,
-                maxshape=(None,), chunks=True, dtype=np.float64,
+                "timestamps",
+                data=ts_arr,
+                maxshape=(None,),
+                chunks=True,
+                dtype=np.float64,
             )
         else:
             self._resize_append("timestamps", ts_arr)
 
-        vr_ts_arr = np.array(
-            [vr_frame.get("local_recv_ns", 0) * 1e-9], dtype=np.float64
-        )
+        vr_ts_arr = np.array([vr_frame.get("local_recv_ns", 0) * 1e-9], dtype=np.float64)
         if "vr_timestamps" not in self._datasets:
             self._datasets["vr_timestamps"] = self._file.create_dataset(
-                "vr_timestamps", data=vr_ts_arr,
-                maxshape=(None,), chunks=True, dtype=np.float64,
+                "vr_timestamps",
+                data=vr_ts_arr,
+                maxshape=(None,),
+                chunks=True,
+                dtype=np.float64,
             )
         else:
             self._resize_append("vr_timestamps", vr_ts_arr)
@@ -256,18 +259,27 @@ class EpisodeRecorder:
                 if rgb is not None:
                     maxshape = (None,) + rgb.shape
                     self._datasets["camera/rgb"] = self._file.create_dataset(
-                        "camera/rgb", data=rgb[np.newaxis, ...],
-                        maxshape=maxshape, chunks=True, dtype=rgb.dtype,
+                        "camera/rgb",
+                        data=rgb[np.newaxis, ...],
+                        maxshape=maxshape,
+                        chunks=True,
+                        dtype=rgb.dtype,
                     )
                 if depth is not None:
                     maxshape = (None,) + depth.shape
                     self._datasets["camera/depth"] = self._file.create_dataset(
-                        "camera/depth", data=depth[np.newaxis, ...],
-                        maxshape=maxshape, chunks=True, dtype=depth.dtype,
+                        "camera/depth",
+                        data=depth[np.newaxis, ...],
+                        maxshape=maxshape,
+                        chunks=True,
+                        dtype=depth.dtype,
                     )
                 self._datasets["camera/timestamps"] = self._file.create_dataset(
-                    "camera/timestamps", data=[ts],
-                    maxshape=(None,), chunks=True, dtype=np.float64,
+                    "camera/timestamps",
+                    data=[ts],
+                    maxshape=(None,),
+                    chunks=True,
+                    dtype=np.float64,
                 )
             else:
                 if rgb is not None:
@@ -295,20 +307,27 @@ class EpisodeRecorder:
                     if rgb is not None and hasattr(rgb, "shape"):
                         maxshape = (None,) + rgb.shape
                         self._datasets[rgb_key] = self._file.create_dataset(
-                            rgb_key, data=rgb[np.newaxis, ...],
-                            maxshape=maxshape, chunks=True,
+                            rgb_key,
+                            data=rgb[np.newaxis, ...],
+                            maxshape=maxshape,
+                            chunks=True,
                             dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
                         )
                     if depth is not None and hasattr(depth, "shape"):
                         maxshape = (None,) + depth.shape
                         self._datasets[depth_key] = self._file.create_dataset(
-                            depth_key, data=depth[np.newaxis, ...],
-                            maxshape=maxshape, chunks=True,
+                            depth_key,
+                            data=depth[np.newaxis, ...],
+                            maxshape=maxshape,
+                            chunks=True,
                             dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
                         )
                     self._datasets[ts_key] = self._file.create_dataset(
-                        ts_key, data=np.array([ts]),
-                        maxshape=(None,), chunks=True, dtype=np.float64,
+                        ts_key,
+                        data=np.array([ts]),
+                        maxshape=(None,),
+                        chunks=True,
+                        dtype=np.float64,
                     )
                 else:
                     if rgb is not None and hasattr(rgb, "shape"):
@@ -362,8 +381,11 @@ class EpisodeRecorder:
         if key not in self._datasets:
             maxshape = (None,) + arr.shape
             self._datasets[key] = self._file.create_dataset(
-                key, data=arr[np.newaxis, ...],
-                maxshape=maxshape, chunks=True, dtype=arr.dtype,
+                key,
+                data=arr[np.newaxis, ...],
+                maxshape=maxshape,
+                chunks=True,
+                dtype=arr.dtype,
             )
         else:
             self._resize_append(key, arr)

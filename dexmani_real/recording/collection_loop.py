@@ -110,7 +110,9 @@ class CollectionLoop:
             self._classification = "success"
             logger.info(
                 "Episode started: task=%s operator=%s tags=%s",
-                task, op, tags_list,
+                task,
+                op,
+                tags_list,
             )
 
         # ── Flush pre-record buffer (Phase 3.1) ──
@@ -120,7 +122,8 @@ class CollectionLoop:
                 self.recorder.add_frame(**frame_data)
             logger.info(
                 "Pre-record buffer flushed: %d frames (%.1fs)",
-                pre_count, pre_count / 50.0,
+                pre_count,
+                pre_count / 50.0,
             )
             self._pre_record_deque.clear()
 
@@ -145,14 +148,16 @@ class CollectionLoop:
         """
         if self._pre_record_deque is None:
             return
-        self._pre_record_deque.append({
-            "state": state,
-            "action": action,
-            "vr_frame": vr_frame,
-            "camera_frame": camera_frame,
-            "T_base_eef": T_base_eef,
-            "camera_frames": camera_frames,
-        })
+        self._pre_record_deque.append(
+            {
+                "state": state,
+                "action": action,
+                "vr_frame": vr_frame,
+                "camera_frame": camera_frame,
+                "T_base_eef": T_base_eef,
+                "camera_frames": camera_frames,
+            }
+        )
 
     def record_frame(
         self,
@@ -191,6 +196,9 @@ class CollectionLoop:
         classification: str | None = None,
         ik_success_rate: float | None = None,
         vr_drop_rate: float | None = None,
+        ik_miss_count: int | None = None,
+        ik_miss_max_consecutive: int = 0,
+        camera_frame_rate: float | None = None,
     ) -> str | None:
         """Stop recording and finalize the episode file.
 
@@ -202,6 +210,9 @@ class CollectionLoop:
                     file routing to success_dir / failure_dir.
             ik_success_rate: Optional IK success rate (0.0–1.0) for metadata.
             vr_drop_rate: Optional VR frame drop rate (0.0–1.0) for metadata.
+            ik_miss_count: Total IK miss count (all frames, not just consecutive).
+            ik_miss_max_consecutive: Maximum consecutive IK misses during episode.
+            camera_frame_rate: Average camera frame rate during episode (Hz).
 
         Returns the file path of the saved episode, or None if no episode was active.
         """
@@ -221,9 +232,13 @@ class CollectionLoop:
         # ── Sidecar JSON (Phase 1.2) ──
         if self.config.save_sidecar_json and path is not None:
             self._write_sidecar_json(
-                path, duration,
+                path,
+                duration,
                 ik_success_rate=ik_success_rate,
                 vr_drop_rate=vr_drop_rate,
+                ik_miss_count=ik_miss_count,
+                ik_miss_max_consecutive=ik_miss_max_consecutive,
+                camera_frame_rate=camera_frame_rate,
             )
 
         # ── File classification routing (Phase 1.2) ──
@@ -236,8 +251,11 @@ class CollectionLoop:
         # Log summary
         logger.info(
             "Episode stopped: frames=%d duration=%.1fs reason=%s classification=%s path=%s",
-            self._episode_frame_count, duration, self._stopped_reason,
-            self._classification, path,
+            self._episode_frame_count,
+            duration,
+            self._stopped_reason,
+            self._classification,
+            path,
         )
 
         return path
@@ -272,6 +290,9 @@ class CollectionLoop:
         duration_s: float,
         ik_success_rate: float | None = None,
         vr_drop_rate: float | None = None,
+        ik_miss_count: int | None = None,
+        ik_miss_max_consecutive: int = 0,
+        camera_frame_rate: float | None = None,
     ) -> None:
         """Write episode metadata as JSON sidecar next to the HDF5 file.
 
@@ -296,6 +317,40 @@ class CollectionLoop:
             metadata["ik_success_rate"] = round(ik_success_rate, 4)
         if vr_drop_rate is not None:
             metadata["vr_drop_rate"] = round(vr_drop_rate, 4)
+        if ik_miss_count is not None:
+            metadata["ik_miss_count"] = ik_miss_count
+        if ik_miss_max_consecutive > 0:
+            metadata["ik_miss_max_consecutive"] = ik_miss_max_consecutive
+        if camera_frame_rate is not None:
+            metadata["camera_frame_rate_hz"] = round(camera_frame_rate, 2)
+
+        # ── Episode score (weighted composite, 0.0–1.0) ──
+        # IK success rate (0.0–1.0): weight 0.5 — most critical for data quality
+        # VR drop rate    (0.0–1.0): weight 0.3 — framerate matters for training
+        # Camera rate     (0.0–1.0): weight 0.2 — normalized to 30 Hz target
+        components = []
+        weights = []
+
+        if ik_success_rate is not None:
+            components.append(ik_success_rate)
+            weights.append(0.5)
+
+        if vr_drop_rate is not None:
+            # Invert: low drop rate → high score
+            components.append(1.0 - vr_drop_rate)
+            weights.append(0.3)
+
+        if camera_frame_rate is not None:
+            # Normalize: assume 30 Hz is perfect
+            cam_score = min(camera_frame_rate / 30.0, 1.0)
+            components.append(cam_score)
+            weights.append(0.2)
+
+        if components:
+            total_w = sum(weights)
+            if total_w > 0:
+                episode_score = sum(c * w for c, w in zip(components, weights)) / total_w
+                metadata["episode_score"] = round(episode_score, 4)
 
         try:
             json_path.write_text(

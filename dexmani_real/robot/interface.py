@@ -45,11 +45,11 @@ _PHASE2_MIN_DELTA_RAD = np.deg2rad(0.5)
 _HOME_JOINT_THRESHOLD_RAD = np.deg2rad(3.0)  # matches _PHASE1_CONVERGE_THRESHOLD_RAD; arm.reset() servo tolerance
 
 # Safety lift geometry (Phase 4.2) — used by _lift_eef_z_safe()
-_HAND_EXTENSION_Z_M = 0.076         # max fingertip-to-EEF vertical offset when hand is extended
-_HAND_SAFETY_MARGIN_Z_M = 0.03     # additional clearance above table+hand_extension
-_JOINT_DIP_ALLOWANCE_Z_M = 0.05     # extra margin for joint-space trajectory dip below EEF Z
-_Z_LIFT_EXTRA_MARGIN_M = 0.05       # additional lift past min_safe_z toward workspace midpoint
-_Z_LIFT_WS_TOP_MARGIN_M = 0.02      # margin below workspace ceiling to avoid singularity
+_HAND_EXTENSION_Z_M = 0.076  # max fingertip-to-EEF vertical offset when hand is extended
+_HAND_SAFETY_MARGIN_Z_M = 0.03  # additional clearance above table+hand_extension
+_JOINT_DIP_ALLOWANCE_Z_M = 0.05  # extra margin for joint-space trajectory dip below EEF Z
+_Z_LIFT_EXTRA_MARGIN_M = 0.05  # additional lift past min_safe_z toward workspace midpoint
+_Z_LIFT_WS_TOP_MARGIN_M = 0.02  # margin below workspace ceiling to avoid singularity
 
 
 def _dense_interpolate(path: np.ndarray, max_step_rad: float = np.deg2rad(1.0)) -> np.ndarray:
@@ -246,9 +246,7 @@ class RobotInterface:
         )
 
         # Fingertip world positions
-        fingertip_pos = self._compute_fingertip_pos(
-            eef_pos, eef_quat_wxyz, hand_qpos
-        )
+        fingertip_pos = self._compute_fingertip_pos(eef_pos, eef_quat_wxyz, hand_qpos)
 
         return RobotState(
             arm_qpos=arm_qpos,
@@ -311,6 +309,9 @@ class RobotInterface:
     ) -> bool:
         """Two-phase return_home: EEF homing → redundant joint homing.
 
+        Delegates to ReturnToHomeOrchestrator (P2.2) which encapsulates the
+        phase sequencing, cancellation, and fallback logic.
+
         Phase 1: plan_path(home_eef) — Cartesian path to move EEF to home.
         Phase 2: Joint-space interpolation — current qpos → home_qpos,
                  per-waypoint collision check.
@@ -320,92 +321,17 @@ class RobotInterface:
         SIGINT (Ctrl+C) sets cancel_event to abort waypoint execution.
         """
         with self._install_sigint_handler(cancel_event):
-            # 1. Arm not connected → bail out
-            if not self.arm.is_connected():
-                return False
-
-            # 2. Read current qpos; NaN → fallback
-            current_qpos = self._arm_ready()
-            if current_qpos is None:
-                return self._return_to_home_direct()
-
-            # 3. Not using planning → direct reset
+            # Fall back to direct reset if planning disabled or planner unavailable
             if not use_planning:
                 return self._return_to_home_direct()
-
-            # 4. planner is None → warn + fallback
             if self.planner is None:
-                warnings.warn(
-                    "use_planning=True but planner is None, falling back to direct reset"
-                )
+                warnings.warn("use_planning=True but planner is None, falling back to direct reset")
                 return self._return_to_home_direct()
 
-            # 5. Get home EEF pose, workspace check/clamp
-            home_qpos = self.arm.config.init_qpos.copy()
-            home_eef_pose = self._get_home_eef_pose(home_qpos)
+            from dexmani_real.planning.return_home import create_return_to_home_orchestrator
 
-            # 5.5 Snap current_qpos to nearest equivalent of home.
-            # Continuous joints (J0/J2/J4/J6) can wrap around 2π —
-            # e.g. J4 at 155° is physically equivalent to -205°, only
-            # 25° from home (-180°).  Without snapping, the raw 335°
-            # difference causes IK seeding failures, plan_path rejection,
-            # and false "335° from home" error reports.
-            current_qpos = self._snap_to_nearest_equivalent(current_qpos, home_qpos)
-
-            # 6. Already at home? (joint error < 1°)
-            if self._at_home(current_qpos, home_qpos):
-                hand_ok = self.hand.reset() if self.hand.is_connected() else True
-                return hand_ok
-
-            dt = float(self.arm.config.dt)
-
-            # ── Phase 0: Hand reset (must happen before plan_path) ──
-            current_qpos = self._reset_hand_before_planning(current_qpos)
-            if current_qpos is None:
-                return self._return_to_home_direct()
-
-            # ── Phase 1: EEF path → home EEF ──
-            phase1_completed = self._execute_phase1_eef_cartesian(
-                home_eef_pose, current_qpos, dt, cancel_event
-            )
-
-            # ── Phase 2: Joint-space homing → home_qpos ──
-            if phase1_completed:
-                self._execute_phase2_joint_space(home_qpos, dt, cancel_event)
-            else:
-                # Phase 1 planning failed — typically because the joint-space
-                # distance exceeds max_waypoint_delta_deg (default 8°) or the
-                # IK solver can't seed from the current equivalent-joint phase.
-                # Fall back to SDK joint-space homing: lift EEF for safety,
-                # then arm.reset() which uses the SDK's built-in trajectory
-                # generator and bypasses planner limitations entirely.
-                logger.warning(
-                    "Phase 1 plan_path failed, falling back to direct reset "
-                    "(SDK joint-space home)"
-                )
-                return self._return_to_home_direct()
-
-            # ── Verify final distance to home (M2) ──
-            final_qpos = self._arm_ready()
-            if final_qpos is not None:
-                err_rad = self._joint_error_to_home(final_qpos, home_qpos)
-                if err_rad > np.deg2rad(10.0):
-                    warnings.warn(
-                        f"return_to_home incomplete: joint error "
-                        f"{np.rad2deg(err_rad):.1f}° from home"
-                    )
-                    # Large residual error — report failure
-                    return False
-                if err_rad < _HOME_JOINT_THRESHOLD_RAD:
-                    # Already at home — skip redundant hand reset (L1)
-                    arm_ok = not self.arm.is_error()
-                    return arm_ok
-
-            # Hand reset (degraded if hand not connected)
-            hand_ok = self.hand.reset() if self.hand.is_connected() else True
-            arm_ok = not self.arm.is_error()
-            return arm_ok and hand_ok
-
+            orchestrator = create_return_to_home_orchestrator(self)
+            return orchestrator.execute(cancel_event=cancel_event)
 
     @staticmethod
     @contextmanager
@@ -431,7 +357,9 @@ class RobotInterface:
         return current_qpos
 
     def _snap_to_nearest_equivalent(
-        self, qpos: np.ndarray, reference_qpos: np.ndarray,
+        self,
+        qpos: np.ndarray,
+        reference_qpos: np.ndarray,
     ) -> np.ndarray:
         """Snap continuous joints to the equivalent nearest *reference_qpos*.
 
@@ -448,7 +376,9 @@ class RobotInterface:
             return qpos
 
     def _joint_error_to_home(
-        self, current_qpos: np.ndarray, home_qpos: np.ndarray,
+        self,
+        current_qpos: np.ndarray,
+        home_qpos: np.ndarray,
     ) -> float:
         """Max absolute joint error, accounting for equivalent joints."""
         if self.planner is not None:
@@ -469,10 +399,7 @@ class RobotInterface:
         """FK home qpos → EEF pose, clamp to workspace if needed."""
         home_eef_pose = self.kinematics.compute_eef_pose_world(home_qpos)
         if not self.workspace.check(home_eef_pose.p):
-            warnings.warn(
-                f"Home EEF position {np.round(home_eef_pose.p, 4)} "
-                "is outside workspace, clamping"
-            )
+            warnings.warn(f"Home EEF position {np.round(home_eef_pose.p, 4)} " "is outside workspace, clamping")
             home_eef_pose.p = self.workspace.clamp(home_eef_pose.p)
         return home_eef_pose
 
@@ -532,11 +459,14 @@ class RobotInterface:
             current_pose = self.kinematics.compute_eef_pose_world(current_qpos)
             cart_dist = float(np.linalg.norm(home_eef_pose.p - current_pose.p))
             logger.warning(
-                "plan_path: %s | current_eef=[%.3f,%.3f,%.3f]m "
-                "home_eef=[%.3f,%.3f,%.3f]m cart_dist=%.3fm",
+                "plan_path: %s | current_eef=[%.3f,%.3f,%.3f]m " "home_eef=[%.3f,%.3f,%.3f]m cart_dist=%.3fm",
                 result.reason or "unknown",
-                current_pose.p[0], current_pose.p[1], current_pose.p[2],
-                home_eef_pose.p[0], home_eef_pose.p[1], home_eef_pose.p[2],
+                current_pose.p[0],
+                current_pose.p[1],
+                current_pose.p[2],
+                home_eef_pose.p[0],
+                home_eef_pose.p[1],
+                home_eef_pose.p[2],
                 cart_dist,
             )
             return False
@@ -555,17 +485,23 @@ class RobotInterface:
             actual_hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
             if len(actual_hand_qpos) == 12:
                 above_first, min_z_first = self._check_fingertips_above_desk(
-                    result.qpos_path[0], actual_hand_qpos, desk_z,
+                    result.qpos_path[0],
+                    actual_hand_qpos,
+                    desk_z,
                 )
                 above_last, min_z_last = self._check_fingertips_above_desk(
-                    result.qpos_path[-1], actual_hand_qpos, desk_z,
+                    result.qpos_path[-1],
+                    actual_hand_qpos,
+                    desk_z,
                 )
                 if not above_first or not above_last:
                     logger.error(
                         "Phase 1 ABORT: fingertips below desk after hand reset "
                         "(first_z=%.3f m, last_z=%.3f m, desk_z=%.3f m). "
                         "Hand may not have converged to default pose.",
-                        min_z_first, min_z_last, desk_z,
+                        min_z_first,
+                        min_z_last,
+                        desk_z,
                     )
                     return False
 
@@ -573,7 +509,9 @@ class RobotInterface:
         dense_path = _dense_interpolate(result.qpos_path)
         phase1_completed = True
         for waypoint in dense_path:
-            if (cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()) or self.arm.is_error():
+            if (
+                cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
+            ) or self.arm.is_error():
                 phase1_completed = False
                 break
             if not self._check_arm_torque_ok():
@@ -590,15 +528,16 @@ class RobotInterface:
             target_qpos = result.qpos_path[-1]
             start_qpos = result.qpos_path[0]
             if not self._wait_for_arm_convergence(target_qpos, start_qpos, dt):
-                warnings.warn(
-                    "Phase 1 convergence timeout, skipping Phase 2 joint fine-tuning"
-                )
+                warnings.warn("Phase 1 convergence timeout, skipping Phase 2 joint fine-tuning")
                 phase1_completed = False
 
         return phase1_completed
 
     def _wait_for_arm_convergence(
-        self, target_qpos: np.ndarray, start_qpos: np.ndarray | None = None, dt: float = 0.02,
+        self,
+        target_qpos: np.ndarray,
+        start_qpos: np.ndarray | None = None,
+        dt: float = 0.02,
     ) -> bool:
         """Poll arm state until joints converge to *target_qpos*.
 
@@ -618,8 +557,7 @@ class RobotInterface:
             time.sleep(poll_interval)
             elapsed += poll_interval
             try:
-                poll_qpos = np.asarray(
-                    self.arm.get_state()["qpos"], dtype=np.float64)
+                poll_qpos = np.asarray(self.arm.get_state()["qpos"], dtype=np.float64)
                 if not np.all(np.isfinite(poll_qpos)):
                     continue
                 err = float(np.max(np.abs(poll_qpos - target_qpos)))
@@ -648,7 +586,9 @@ class RobotInterface:
         joint_path = self._safe_joint_path(current_qpos, home_qpos)
         if joint_path is not None:
             for waypoint in joint_path:
-                if (cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()) or self.arm.is_error():
+                if (
+                    cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
+                ) or self.arm.is_error():
                     break
                 if not self._check_arm_torque_ok():
                     logger.warning("Phase 2: arm torque exceeded safe limit, aborting waypoint execution")
@@ -663,8 +603,7 @@ class RobotInterface:
             # Phase 1 already homed the EEF; skipping Phase 2 only loses
             # exact redundant joint alignment, with no collision risk.
             warnings.warn(
-                "Joint-space home path unsafe or unverifiable, "
-                "skipping Phase 2 (EEF already at home from Phase 1)"
+                "Joint-space home path unsafe or unverifiable, " "skipping Phase 2 (EEF already at home from Phase 1)"
             )
 
     # Internal helpers
@@ -685,9 +624,7 @@ class RobotInterface:
         path = np.array([start + (k / (n - 1)) * (goal - start) for k in range(n)])
 
         if self.planner is None:
-            warnings.warn(
-                "_safe_joint_path: planner unavailable, cannot verify collision safety"
-            )
+            warnings.warn("_safe_joint_path: planner unavailable, cannot verify collision safety")
             return None
 
         profile = self.planner.planning_profile
@@ -704,12 +641,14 @@ class RobotInterface:
         # when MPlib point cloud is absent (geometric_fk mode).
         if self.planner.desk_safety is not None and profile.check_env_collision:
             desk_safe, min_z, viol_idx = self.planner.desk_safety.check_path_desk_safety(
-                path, step_rad=max_step_rad,
+                path,
+                step_rad=max_step_rad,
             )
             if not desk_safe:
                 logger.warning(
-                    "_safe_joint_path: FK desk collision detected "
-                    "(fingertip z_min=%.3f m, segment %d)", min_z, viol_idx,
+                    "_safe_joint_path: FK desk collision detected " "(fingertip z_min=%.3f m, segment %d)",
+                    min_z,
+                    viol_idx,
                 )
                 return None
         return path
@@ -860,31 +799,46 @@ class RobotInterface:
         grid_x, grid_y = np.meshgrid(xs, ys)
 
         zs = np.linspace(
-            table_z, table_z - (n_layers - 1) * layer_spacing, n_layers,
+            table_z,
+            table_z - (n_layers - 1) * layer_spacing,
+            n_layers,
             dtype=np.float64,
         )
 
         points_list = []
         for z in zs:
-            layer = np.column_stack([
-                grid_x.ravel(), grid_y.ravel(),
-                np.full(grid_x.size, z, dtype=np.float64),
-            ])
+            layer = np.column_stack(
+                [
+                    grid_x.ravel(),
+                    grid_y.ravel(),
+                    np.full(grid_x.size, z, dtype=np.float64),
+                ]
+            )
             points_list.append(layer)
 
         points = np.vstack(points_list)
         self.planner.add_point_cloud(
-            points, name="table", resolution=xy_resolution,
+            points,
+            name="table",
+            resolution=xy_resolution,
         )
         logger.info(
-            "Table collision: %s points, %s layers, z=[%.3f, %.3f] m, "
-            "xy=[%.2f,%.2f]x[%.2f,%.2f] m",
-            points.shape[0], n_layers, zs[-1], zs[0],
-            x_min, x_max, y_min, y_max,
+            "Table collision: %s points, %s layers, z=[%.3f, %.3f] m, " "xy=[%.2f,%.2f]x[%.2f,%.2f] m",
+            points.shape[0],
+            n_layers,
+            zs[-1],
+            zs[0],
+            x_min,
+            x_max,
+            y_min,
+            y_max,
         )
 
     def _check_fingertips_above_desk(
-        self, arm_qpos: np.ndarray, hand_qpos: np.ndarray, desk_z: float = 0.0,
+        self,
+        arm_qpos: np.ndarray,
+        hand_qpos: np.ndarray,
+        desk_z: float = 0.0,
     ) -> tuple[bool, float]:
         """Check if fingertips are above desk using actual hand_qpos + arm waypoint FK.
 
