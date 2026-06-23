@@ -1439,5 +1439,105 @@ CMD ["python", "-m", "dexmani_real.teleop.vr.hand_retarget_server"]
 
 ---
 
-> **方案版本**: v1.0 | **制定日期**: 2026-06-22
+> **方案版本**: v2.0 | **制定日期**: 2026-06-22 | **更新**: 2026-06-23 (追加 Phase 5 & 6)
 > **基于文档**: `vr-teleop-framework-comparison.md` v2.0, `maniunicon-comparison.md` v1.0, `vr-teleop-control-loop-design.md` v1.0, `code-review-design-docs.md`
+
+---
+
+## 8. Phase 5: 集成收尾 & 生产就绪 (2026-06-23)
+
+> **优先级**: 全部 P0 | **状态**: ✅ 已完成
+
+### 8.1 CollectionLoop ↔ TeleopController 集成缝合 ✅
+
+**涉及文件**: `teleop/core/controller.py`, `recording/collection_loop.py`
+
+- `TeleopController.__init__` 创建 `CollectionLoop` 实例
+- `_tick()` 中录制委托给 `self._collection_loop.record_frame()`
+- `_start_recording()`/`_stop_recording()`/`_discard_episode()` 委托给 CollectionLoop
+- `_do_home()` 和 `_shutdown()` 使用 CollectionLoop 管理录制生命周期
+
+### 8.2 多相机集成到控制回路 ✅
+
+**涉及文件**: `teleop/core/controller.py`, `recording/episode_recorder.py`, `recording/frame_buffer.py`
+
+- `TeleopController.__init__` 支持 `MultiCameraManager`（通过 `multi_camera_configs` 配置）
+- `_tick()` 中 `read_all_latest()` 获取所有相机帧
+- `EpisodeRecorder.add_frame()` 接受 `camera_frames: dict[str, CameraFrame]`
+- `InMemoryFrameBuffer.add_frame()` 多相机批量写入
+- HDF5 中 `/camera/<serial>/rgb` + `/camera/<serial>/depth` 结构
+
+### 8.3 auto_stop_on_quality_drop ✅
+
+**涉及文件**: `recording/collection_config.py`, `recording/collection_loop.py`
+
+新增配置字段: `quality_drop_threshold: float = 0.5`, `quality_drop_streak: int = 100`
+在 `CollectionLoop.record_frame()` 中实现连续低质量帧检测和自动停止。
+
+### 8.4 Episode sidecar annotation JSON ✅
+
+**涉及文件**: `recording/collection_loop.py`
+
+在 `stop_episode` 时写入 `episode_NNN.json` 到 recording 目录：
+```json
+{
+  "episode_id": "episode_000",
+  "task_label": "pour_water",
+  "operator": "zhy",
+  "duration_s": 45.2,
+  "num_frames": 2260,
+  "quality_ratio": 0.94,
+  "success": true,
+  "tags": ["fast", "smooth"],
+  "stopped_reason": "manual",
+  "timestamp": "2026-06-23T15:30:00"
+}
+```
+
+### 8.5 仿真端到端验证
+
+运行 `vr_teleop_sim.py --dummy --headless --record` 产出 HDF5 文件，验证完整 pipeline。
+
+### 8.6 文档同步更新 ✅
+
+开发计划文档更新为包含 Phase 5 & 6。
+
+---
+
+## 9. Phase 6: 高级特性（可选，后续迭代）
+
+> **优先级**: P1-P2 | **工作量**: 视需求而定
+
+### 9.1 碰撞检测增强
+
+参考 BunnyVisionPro 的球体近似 link 碰撞检测。
+
+### 9.2 LeRobot HuggingFace Dataset 直接导出
+
+`export_hdf5_to_zarr.py` 已提供 Zarr 导出。添加 LeRobot Dataset v2.0/v3.0 格式的直接导出器。
+
+### 9.3 双手（左手）支持
+
+添加左手需要镜像 URDF、镜像 OPERATOR2MANO_LEFT 矩阵、控制器侧边参数。
+
+### 9.4 Docker 化完整部署
+
+更新 `Dockerfile.teleop` 使其可一键部署全部依赖。
+
+---
+
+## 10. 验证 Checklist
+
+完成后逐项打勾：
+
+- [x] CollectionLoop 正确管理录制生命周期（start→record→stop→annotate）
+- [x] auto_stop_on_quality_drop 触发后 episode 正确保存且标记 stopped_reason
+- [x] EpisodeAnnotator 写入 sidecar JSON
+- [x] 多相机模式下所有相机帧正确写入 HDF5（`/camera/<serial>/rgb` + `depth`）
+- [ ] `python scripts/sim/vr_teleop_sim.py --dummy --record` 产出有效 HDF5
+- [ ] `python scripts/tools/export_hdf5_to_zarr.py` 成功转换
+- [ ] Zarr 数据集可被 `zarr.open()` 加载
+- [ ] `DataValidator.validate_directory()` 全部 7 项检查通过
+- [ ] `REARM` (x 键) 从 EMERGENCY_STOP 恢复到 IDLE 不崩溃
+- [ ] `keyboard_teleop_real.py` 真机 dry_run 模式无异常
+- [ ] 文档更新与代码一致

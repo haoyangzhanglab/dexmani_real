@@ -95,6 +95,12 @@ class InMemoryFrameBuffer:
         self._camera_ts_batch: list[float] = []
         self._camera_written: bool = False  # track if camera datasets exist
 
+        # Multi-camera batch accumulators: name → { rgb: [...], depth: [...], ts: [...] }
+        self._mc_rgb_batches: dict[str, list[np.ndarray | None]] = {}
+        self._mc_depth_batches: dict[str, list[np.ndarray | None]] = {}
+        self._mc_ts_batches: dict[str, list[float]] = {}
+        self._mc_written: set[str] = set()  # track which camera names have datasets
+
         # Frame counter
         self._frame_count: int = 0
         self._total_written: int = 0  # frames flushed to HDF5
@@ -133,8 +139,20 @@ class InMemoryFrameBuffer:
         T_base_eef: np.ndarray | None = None,
         timestamp_ns: int | None = None,
         vr_timestamp_ns: int | None = None,
+        camera_frames: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
         """Append one frame to the in-memory buffer. O(1) numpy assignment.
+
+        Args:
+            state: Current robot state.
+            action: Computed robot action.
+            vr_frame: VR tracking frame dict.
+            quality_flags: Per-frame quality flags bitmask.
+            camera_frame: Single camera frame (backward compat).
+            T_base_eef: 4x4 base→EEF transform.
+            timestamp_ns: Control loop timestamp in nanoseconds.
+            vr_timestamp_ns: VR frame receive timestamp in nanoseconds.
+            camera_frames: Multi-camera frames dict (name → frame dict).
 
         Returns True if the frame was buffered, False if the buffer is full.
         """
@@ -198,6 +216,32 @@ class InMemoryFrameBuffer:
             self._camera_depth_batch.append(None)
             self._camera_ts_batch.append(-1.0)
 
+        # Multi-camera frames: accumulate per-camera
+        if camera_frames:
+            for cam_name, cam_frame in camera_frames.items():
+                safe_name = str(cam_name).replace("/", "_").replace("\\", "_")
+                if safe_name not in self._mc_rgb_batches:
+                    self._mc_rgb_batches[safe_name] = [None] * self._frame_count
+                    self._mc_depth_batches[safe_name] = [None] * self._frame_count
+                    self._mc_ts_batches[safe_name] = [-1.0] * self._frame_count
+                # Extend to match current frame count if needed
+                while len(self._mc_rgb_batches[safe_name]) <= i:
+                    self._mc_rgb_batches[safe_name].append(None)
+                    self._mc_depth_batches[safe_name].append(None)
+                    self._mc_ts_batches[safe_name].append(-1.0)
+
+                if cam_frame is not None:
+                    rgb = cam_frame.get("rgb")
+                    depth = cam_frame.get("depth")
+                    ts = cam_frame.get("timestamp", 0.0)
+                    self._mc_rgb_batches[safe_name][i] = (
+                        np.asarray(rgb, dtype=np.uint8) if rgb is not None else None
+                    )
+                    self._mc_depth_batches[safe_name][i] = (
+                        np.asarray(depth, dtype=np.uint16) if depth is not None else None
+                    )
+                    self._mc_ts_batches[safe_name][i] = ts
+
         # Auto-flush when batch is full
         if self._frame_count > 0 and self._frame_count % self.BATCH_SIZE == 0:
             self.flush_batch()
@@ -227,6 +271,7 @@ class InMemoryFrameBuffer:
 
         self._flush_datasets(start, end, n)
         self._flush_camera_batch(start, end)
+        self._flush_multi_camera_batches(start, end)
 
         self._total_written = end
         return n
@@ -311,6 +356,69 @@ class InMemoryFrameBuffer:
             ts_ds.resize(n_old + len(ts_arr), axis=0)
             ts_ds[n_old:] = ts_arr
 
+    def _flush_multi_camera_batches(self, start: int, end: int) -> None:
+        """Write multi-camera frames to HDF5 in per-camera batch."""
+        if not self._mc_rgb_batches:
+            return
+
+        for cam_name in list(self._mc_rgb_batches.keys()):
+            rgb_batch = self._mc_rgb_batches.get(cam_name, [])
+            depth_batch = self._mc_depth_batches.get(cam_name, [])
+            ts_batch = self._mc_ts_batches.get(cam_name, [])
+
+            if len(rgb_batch) <= end:
+                continue
+
+            rgb_slice = rgb_batch[start:end]
+            depth_slice = depth_batch[start:end]
+            ts_slice = ts_batch[start:end]
+
+            # Filter out None entries
+            valid_rgb = [r for r in rgb_slice if r is not None]
+            valid_depth = [d for d in depth_slice if d is not None]
+            valid_ts = [t for t, r in zip(ts_slice, rgb_slice) if r is not None]
+
+            if not valid_rgb:
+                continue
+
+            rgb_stack = np.stack(valid_rgb, axis=0)
+            depth_stack = np.stack(valid_depth, axis=0)
+            ts_arr = np.array(valid_ts, dtype=np.float64)
+
+            rgb_key = f"camera/{cam_name}/rgb"
+            depth_key = f"camera/{cam_name}/depth"
+            ts_key = f"camera/{cam_name}/timestamps"
+
+            if cam_name not in self._mc_written:
+                self._datasets[rgb_key] = self._h5_file.create_dataset(
+                    rgb_key, data=rgb_stack,
+                    maxshape=(None,) + rgb_stack.shape[1:],
+                    chunks=True, dtype=np.uint8,
+                )
+                self._datasets[depth_key] = self._h5_file.create_dataset(
+                    depth_key, data=depth_stack,
+                    maxshape=(None,) + depth_stack.shape[1:],
+                    chunks=True, dtype=np.uint16,
+                )
+                self._datasets[ts_key] = self._h5_file.create_dataset(
+                    ts_key, data=ts_arr,
+                    maxshape=(None,), chunks=True, dtype=np.float64,
+                )
+                self._mc_written.add(cam_name)
+            else:
+                for key, stack in [
+                    (rgb_key, rgb_stack),
+                    (depth_key, depth_stack),
+                ]:
+                    ds = self._datasets[key]
+                    n_old = ds.shape[0]
+                    ds.resize(n_old + stack.shape[0], axis=0)
+                    ds[n_old:] = stack
+                ts_ds = self._datasets[ts_key]
+                n_old = ts_ds.shape[0]
+                ts_ds.resize(n_old + len(ts_arr), axis=0)
+                ts_ds[n_old:] = ts_arr
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -341,6 +449,10 @@ class InMemoryFrameBuffer:
         self._camera_rgb_batch.clear()
         self._camera_depth_batch.clear()
         self._camera_ts_batch.clear()
+        self._mc_rgb_batches.clear()
+        self._mc_depth_batches.clear()
+        self._mc_ts_batches.clear()
+        self._mc_written.clear()
         self._buffer_mask = None
         self._frame_count = 0
         self._total_written = 0

@@ -40,10 +40,12 @@ class CollectionConfig:
 
     # ── Auto-stop triggers ──
     auto_stop_on_max_frames: bool = True
-    auto_stop_on_quality_drop: bool = False  # WIP: abort if quality drops too low
+    auto_stop_on_quality_drop: bool = False       # abort if quality drops too low
+    quality_drop_threshold: float = 0.5            # minimum quality ratio before triggering
+    quality_drop_streak: int = 100                 # consecutive low-quality frames to trigger
 
     # ── Episode annotation (post-recording) ──
-    annotate_on_save: bool = False  # run EpisodeAnnotator on stop_episode
+    annotate_on_save: bool = True   # run EpisodeAnnotator on stop_episode (sidecar JSON)
     success_default: bool = True    # default success flag (can override per-episode)
 
     def to_dict(self) -> dict:

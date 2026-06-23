@@ -31,6 +31,8 @@ from dexmani_real.teleop.core.tracking import (
     TrackingQualityConfig,
 )
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
+from dexmani_real.recording.collection_config import CollectionConfig
+from dexmani_real.recording.collection_loop import CollectionLoop
 from dexmani_real.recording.quality_flags import (
     ARM_TORQUE_OK,
     CAMERA_OK,
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
+    from dexmani_real.sensor.multi_camera_manager import MultiCameraManager
 
 logger = get_logger(__name__)
 
@@ -92,6 +95,13 @@ class TeleopControllerConfig:
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
     use_precise_wait: bool = False  # True → RateManager busy-wait; False → RateLimiter sleep
+
+    # Collection config
+    collection_config: CollectionConfig | None = None  # None → defaults
+
+    # Multi-camera config
+    multi_camera_configs: list | None = None  # None → single-camera (backward compat)
+    multi_camera_auto_restart: bool = True
 
 
 class TeleopController:
@@ -144,7 +154,18 @@ class TeleopController:
         self.planner = planner
         self.tracker = tracker
         self.dry_run = cfg.dry_run
-        self.recorder = recorder
+
+        # Recording: prefer CollectionLoop (new), fallback to legacy EpisodeRecorder
+        if recorder is not None:
+            from dexmani_real.recording.collection_config import CollectionConfig
+            from dexmani_real.recording.collection_loop import CollectionLoop
+
+            coll_cfg = cfg.collection_config or CollectionConfig()
+            self._collection_loop = CollectionLoop(recorder, coll_cfg)
+            self.recorder = recorder  # backward compat
+        else:
+            self._collection_loop = None
+            self.recorder = None
 
         self.limiter = RateLimiter(cfg.target_hz)
         self.rate_manager = RateManager(cfg.target_hz) if cfg.use_precise_wait else None
@@ -175,8 +196,23 @@ class TeleopController:
                 max_rot_speed=max_rot,
             )
 
-        # Camera daemon process (optional — crash-isolated frame capture).
+        # Camera: MultiCameraManager (new) or legacy single CameraProcess
         self._camera_process = camera_process
+        self._multi_camera: MultiCameraManager | None = None
+        if cfg.multi_camera_configs is not None and len(cfg.multi_camera_configs) > 0:
+            from dexmani_real.sensor.multi_camera_manager import (
+                MultiCameraConfig,
+                MultiCameraManager,
+            )
+            mc_cfg = MultiCameraConfig(auto_restart=cfg.multi_camera_auto_restart)
+            self._multi_camera = MultiCameraManager(cfg.multi_camera_configs, mc_cfg)
+            logger.info(
+                "MultiCameraManager created: %d camera(s)",
+                self._multi_camera.n_cameras,
+            )
+            # Start camera processes if not already managed externally
+            if camera_process is None:
+                self._multi_camera.start_all()
 
         # ZMQ VR subscriber (optional, disabled by default).
         self._vr_subscriber: VRFrameSubscriber | None = None
@@ -367,35 +403,79 @@ class TeleopController:
 
         # 6. Record frame (before safety gate — captures pre-hold action + flags)
         camera_frame = None
-        if self._camera_process is not None:
+        camera_frames: dict[str, dict] | None = None
+
+        # ── Multi-camera path (new) ──
+        if self._multi_camera is not None:
+            self._ensure_multi_camera_running()
+            try:
+                camera_frames = self._multi_camera.read_all_latest()
+                # Update CAMERA_OK: set if at least one camera has fresh frames
+                any_fresh = False
+                for cam_name, cam_frame in camera_frames.items():
+                    if cam_frame is not None:
+                        ts = cam_frame.get("timestamp", 0.0)
+                        if ts > 0 and (time.perf_counter() - ts) < 0.5:
+                            any_fresh = True
+                            rgb = cam_frame.get("rgb")
+                            if rgb is not None and np.count_nonzero(rgb) == 0:
+                                any_fresh = False  # all-zero frame
+                        self.camera_stats.record_consume(
+                            time.perf_counter() - ts if ts > 0 else 0.0
+                        )
+                        break  # stats for first camera only
+                if any_fresh:
+                    flags |= CAMERA_OK
+                else:
+                    flags &= ~CAMERA_OK
+            except (ValueError, RuntimeError, KeyError) as e:
+                logger.debug("Multi-camera poll failed: %s", e)
+
+        # ── Single-camera path (backward compat) ──
+        elif self._camera_process is not None:
             self._ensure_camera_running()
             try:
                 camera_frame = self._camera_process.poll_latest_frame()
             except (ValueError, RuntimeError, KeyError):
                 logger.debug("Camera poll failed — continuing without camera frame.")
 
-        if camera_frame is not None:
-            self.camera_stats.record_consume(
-                time.perf_counter() - camera_frame.get("timestamp", time.perf_counter())
-            )
-            ts = camera_frame.get("timestamp", 0.0)
-            if ts > 0 and (time.perf_counter() - ts) < 0.5:
-                flags |= CAMERA_OK  # bit 6: camera frame fresh (<500ms)
-            # Validate camera frame has non-zero content
-            rgb = camera_frame.get("rgb")
-            if rgb is not None and np.count_nonzero(rgb) == 0:
-                flags &= ~CAMERA_OK  # all-zero frame → not OK
-
-        if self.recording and self.recorder is not None:
-            try:
-                self.recorder.add_frame(
-                    state=state, action=action, vr_frame=vr_frame,
-                    quality_flags=flags,
-                    camera_frame=camera_frame,
-                    T_base_eef=self._compute_T_base_eef(state),
+            if camera_frame is not None:
+                self.camera_stats.record_consume(
+                    time.perf_counter() - camera_frame.get("timestamp", time.perf_counter())
                 )
-            except (ValueError, OSError) as e:
-                logger.exception("recorder add_frame failed: %s", e)
+                ts = camera_frame.get("timestamp", 0.0)
+                if ts > 0 and (time.perf_counter() - ts) < 0.5:
+                    flags |= CAMERA_OK  # bit 6: camera frame fresh (<500ms)
+                # Validate camera frame has non-zero content
+                rgb = camera_frame.get("rgb")
+                if rgb is not None and np.count_nonzero(rgb) == 0:
+                    flags &= ~CAMERA_OK  # all-zero frame → not OK
+
+        # ── Recording (delegated to CollectionLoop if available) ──
+        if self.recording:
+            T_base_eef = self._compute_T_base_eef(state)
+            if self._collection_loop is not None:
+                try:
+                    self._collection_loop.record_frame(
+                        state=state, action=action, vr_frame=vr_frame,
+                        quality_flags=flags,
+                        camera_frame=camera_frame,
+                        camera_frames=camera_frames,
+                        T_base_eef=T_base_eef,
+                    )
+                except (ValueError, OSError) as e:
+                    logger.exception("collection_loop record_frame failed: %s", e)
+            elif self.recorder is not None:
+                try:
+                    self.recorder.add_frame(
+                        state=state, action=action, vr_frame=vr_frame,
+                        quality_flags=flags,
+                        camera_frame=camera_frame,
+                        camera_frames=camera_frames,
+                        T_base_eef=T_base_eef,
+                    )
+                except (ValueError, OSError) as e:
+                    logger.exception("recorder add_frame failed: %s", e)
 
         # 7. Pre-send safety gate — centralized validate_action (ref: ManiUniCon).
         #    Joint limits enforced by XArm7/XHand drivers (error latch → is_error).
@@ -644,11 +724,17 @@ class TeleopController:
         self._last_hand_cmd = None
 
         # Stop recording if active (discard current episode)
-        if self.recording and self.recorder is not None and self.recorder.is_recording:
-            try:
-                self.recorder.stop_episode(success=False)
-            except (ValueError, OSError):
-                pass
+        if self.recording:
+            if self._collection_loop is not None and self._collection_loop.is_recording:
+                try:
+                    self._collection_loop.stop_episode(success=False, reason="home")
+                except (ValueError, OSError):
+                    pass
+            elif self.recorder is not None and self.recorder.is_recording:
+                try:
+                    self.recorder.stop_episode(success=False)
+                except (ValueError, OSError):
+                    pass
 
         if not self.dry_run:
             self.robot.return_to_home(use_planning=True, cancel_event=self._cancel_event)
@@ -699,7 +785,14 @@ class TeleopController:
             logger.error("Cannot start recording without VR frame.")
             return
 
-        if self.recorder is not None:
+        if self._collection_loop is not None:
+            try:
+                self._collection_loop.start_episode(
+                    task_label="teleop", operator="",
+                )
+            except (ValueError, OSError) as e:
+                logger.exception("collection_loop start_episode failed: %s", e)
+        elif self.recorder is not None:
             try:
                 self.recorder.start_episode(task_label="teleop", operator="")
             except (ValueError, OSError) as e:
@@ -711,7 +804,15 @@ class TeleopController:
     def _stop_recording(self) -> None:
         """Stop episode recording. Does NOT change controller state."""
         logger.info("Stopping episode. frames=%s", self.frame_count)
-        if self.recorder is not None and self.recorder.is_recording:
+        path = None
+        if self._collection_loop is not None and self._collection_loop.is_recording:
+            try:
+                path = self._collection_loop.stop_episode(success=True)
+                if path:
+                    logger.info("  Saved to %s", path)
+            except (ValueError, OSError) as e:
+                logger.exception("collection_loop stop_episode failed: %s", e)
+        elif self.recorder is not None and self.recorder.is_recording:
             try:
                 path = self.recorder.stop_episode(success=True)
                 if path:
@@ -723,7 +824,9 @@ class TeleopController:
 
     def _discard_episode(self) -> None:
         """Discard the current episode file (SAVE_PROMPT → discard)."""
-        if self.recorder is not None and hasattr(self.recorder, '_episode_path'):
+        if self._collection_loop is not None:
+            self._collection_loop.discard_episode()
+        elif self.recorder is not None and hasattr(self.recorder, '_episode_path'):
             path = getattr(self.recorder, '_episode_path', None)
             if path:
                 try:
@@ -775,11 +878,25 @@ class TeleopController:
 
     def _shutdown(self) -> None:
         logger.info("Shutting down...")
-        if self.recording and self.recorder is not None and self.recorder.is_recording:
+        if self.recording:
+            if self._collection_loop is not None and self._collection_loop.is_recording:
+                try:
+                    self._collection_loop.stop_episode(success=False, reason="shutdown")
+                except (ValueError, RuntimeError, KeyError):
+                    pass  # shutdown must never fail
+            elif self.recorder is not None and self.recorder.is_recording:
+                try:
+                    self.recorder.stop_episode(success=False)
+                except (ValueError, RuntimeError, KeyError):
+                    pass
+
+        # Stop multi-camera if active
+        if self._multi_camera is not None:
             try:
-                self.recorder.stop_episode(success=False)
-            except (ValueError, RuntimeError, KeyError):
-                pass  # shutdown must never fail
+                self._multi_camera.stop_all()
+            except (ValueError, RuntimeError):
+                pass
+
         if self.keyboard is not None:
             self.keyboard.stop()
         logger.info("  Frames: %s", self.frame_count)
@@ -815,6 +932,23 @@ class TeleopController:
             time.sleep(0.5)
             self._camera_process.start()
             logger.info("Camera process restarted.")
+
+    def _ensure_multi_camera_running(self) -> None:
+        """Periodic multi-camera health check with auto-restart.
+
+        Checks all camera processes and restarts any that have crashed.
+        """
+        if self._multi_camera is None:
+            return
+        now = time.perf_counter()
+        # Throttle health checks to avoid overhead (every 5s)
+        if now - getattr(self, '_last_mc_health_check', 0.0) < 5.0:
+            return
+        self._last_mc_health_check = now
+        health = self._multi_camera.check_health()
+        unhealthy = [name for name, ok in health.items() if not ok]
+        if unhealthy:
+            logger.warning("Unhealthy cameras: %s", unhealthy)
 
     # EEF pose utilities
 

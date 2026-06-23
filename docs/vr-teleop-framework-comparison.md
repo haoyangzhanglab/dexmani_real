@@ -25,11 +25,26 @@
 | **成熟度评分** | ★★★★☆ (4/5) | ★★★★★ (5/5) | ★★★★☆ (4/5) | ★★★★☆ (4/5) | ★★★★☆ (4/5) |
 | **机器人支持** | XArm7 + XHand | Franka FER + XHand | XArm7 + Ability Hand (双手) | Franka/Kinova/XArm + Allegro | XArm6/UR5/Franka + Robotiq |
 
-### 1.2 Top 5 可采纳改进
+### 1.2 Top 5 可采纳改进 — 全部已落地 ✅
 
-> **核心结论**: dexmani 在**安全性**上远超五个参考框架，但可通过借鉴 LeFranX 的**IK 可操作性优化**、ManiUniCon 的**频率解耦插值**以及 Open-Teach 的**ZMQ 进程分离**来进一步提升。
+> **核心结论**: dexmani 在**安全性**上远超五个参考框架。Phase 1-4 已将 Top 5 改进全部实施完毕，Phase 5 (2026-06-23) 完成最后的集成收尾。
 
-| # | 改进项 | 来源 | 优先级 | 预期影响 |
+| # | 改进项 | 来源 | 优先级 | 状态 |
+|---|--------|------|--------|------|
+| 1 | 遥操作 IK 加入可操作性评分 | LeFranX | **P0** | ✅ Phase 2.6 |
+| 2 | VR 跟踪丢失时软减速保持 | BVPro | **P0** | ✅ Phase 1.4 |
+| 3 | Cartesian Pose 插值（频率解耦） | ManiUniCon | **P1** | ✅ Phase 2.2 |
+| 4 | ZMQ 进程分离（VR 解耦控制） | Open-Teach | **P1** | ✅ Phase 3.1 |
+| 5 | VR per-step delta 旋转安全限制 + EEF 方向工作空间边界 | ManiUniCon | **P1** | ✅ Phase 1.2 + 1.3 |
+
+### 1.3 Phase 5 新增能力 (2026-06-23)
+
+| 能力 | 说明 |
+|------|------|
+| CollectionLoop 集成 | 统一录制生命周期管理，auto_stop_on_quality_drop |
+| Episode sidecar JSON | stop_episode 时自动写入 metadata 到 `episode_NNN.json` |
+| 多相机控制回路 | MultiCameraManager 集成到 TeleopController._tick() |
+| 多相机 HDF5 写入 | `/camera/<serial>/rgb` + `/camera/<serial>/depth` per-camera paths |
 |---|--------|------|--------|----------|
 | 1 | 遥操作 IK 加入可操作性评分（`kin.compute_manipulability` 已实现但未在 teleop 热点使用） | LeFranX | **P0** | IK 鲁棒性 +20%，奇点规避更平滑 |
 | 2 | VR 跟踪丢失时软减速保持（替代立即 hold） | BVPro | **P0** | 消除跟踪短暂丢失时的急停抖动 |

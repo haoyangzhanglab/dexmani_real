@@ -14,7 +14,8 @@ HDF5 structure (per recording-spec.md):
       /action/arm_qpos(7)  hand_qpos(12)
       /vr/wrist_pos(3)  wrist_quat(4)  landmarks(21,3)
       /quality_flags(T,) uint16
-      /camera/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)
+      /camera/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)     # single-camera (backward compat)
+      /camera/<serial>/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)  # multi-camera
       /camera/K(3,3)                        # intrinsics matrix
       /camera/extrinsics(T,4,4)             # T_base_camera, per-frame extrinsics
       /timestamps(T,)                       # control loop timestamps
@@ -154,8 +155,19 @@ class EpisodeRecorder:
         quality_flags: int,
         camera_frame: dict[str, Any] | None = None,
         T_base_eef: np.ndarray | None = None,
+        camera_frames: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
-        """Append one frame to the HDF5 file."""
+        """Append one frame to the HDF5 file.
+
+        Args:
+            state: Current robot state.
+            action: Computed robot action.
+            vr_frame: VR tracking frame dict.
+            quality_flags: Per-frame quality flags bitmask.
+            camera_frame: Single camera frame dict (backward compat).
+            T_base_eef: 4x4 base→EEF transform for camera extrinsics.
+            camera_frames: Multi-camera frames dict (name → frame dict).
+        """
         if not self._recording or self._file is None:
             return False
 
@@ -177,6 +189,7 @@ class EpisodeRecorder:
                 vr_frame=vr_frame,
                 quality_flags=quality_flags,
                 camera_frame=camera_frame,
+                camera_frames=camera_frames,
                 T_base_eef=T_base_eef,
                 timestamp_ns=int(time.perf_counter_ns()),
                 vr_timestamp_ns=vr_ts,
@@ -248,7 +261,7 @@ class EpisodeRecorder:
                 T_base_camera = T_base_eef
             self._append_or_create("camera/extrinsics", T_base_camera)
 
-        # Camera frames (RGB + depth)
+        # Camera frames (RGB + depth) — single-camera (backward compat)
         if camera_frame is not None:
             rgb = camera_frame.get("rgb")
             depth = camera_frame.get("depth")
@@ -277,6 +290,47 @@ class EpisodeRecorder:
                 if depth is not None:
                     self._resize_append("camera/depth", depth)
                 self._resize_append("camera/timestamps", np.array([ts]))
+
+        # Multi-camera frames — per-camera path: /camera/<serial>/rgb
+        if camera_frames:
+            for cam_name, cam_frame in camera_frames.items():
+                if cam_frame is None:
+                    continue
+                # Sanitize camera name for HDF5 path
+                safe_name = str(cam_name).replace("/", "_").replace("\\", "_")
+                rgb = cam_frame.get("rgb")
+                depth = cam_frame.get("depth")
+                ts = cam_frame.get("timestamp", 0.0)
+
+                rgb_key = f"camera/{safe_name}/rgb"
+                depth_key = f"camera/{safe_name}/depth"
+                ts_key = f"camera/{safe_name}/timestamps"
+
+                if rgb_key not in self._datasets:
+                    if rgb is not None and hasattr(rgb, "shape"):
+                        maxshape = (None,) + rgb.shape
+                        self._datasets[rgb_key] = self._file.create_dataset(
+                            rgb_key, data=rgb[np.newaxis, ...],
+                            maxshape=maxshape, chunks=True,
+                            dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
+                        )
+                    if depth is not None and hasattr(depth, "shape"):
+                        maxshape = (None,) + depth.shape
+                        self._datasets[depth_key] = self._file.create_dataset(
+                            depth_key, data=depth[np.newaxis, ...],
+                            maxshape=maxshape, chunks=True,
+                            dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
+                        )
+                    self._datasets[ts_key] = self._file.create_dataset(
+                        ts_key, data=np.array([ts]),
+                        maxshape=(None,), chunks=True, dtype=np.float64,
+                    )
+                else:
+                    if rgb is not None and hasattr(rgb, "shape"):
+                        self._resize_append(rgb_key, rgb)
+                    if depth is not None and hasattr(depth, "shape"):
+                        self._resize_append(depth_key, depth)
+                    self._resize_append(ts_key, np.array([ts]))
 
         self._frame_count += 1
         return True

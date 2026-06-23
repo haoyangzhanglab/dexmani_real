@@ -122,7 +122,7 @@ QuestHandTracker ──(vr_frame)──► TeleopController
 
 ### 3.1 管道总览
 
-`_tick()` 一帧内的数据流，共 7 个阶段（对应代码中 _tick() 的 7 个注释块）：
+`_tick()` 一帧内的数据流，共 8 个阶段（对应代码中 _tick() 的注释块）：
 
 ```
   Stage 1                    Stage 2         Stage 3         Stage 4
@@ -136,18 +136,20 @@ QuestHandTracker ──(vr_frame)──► TeleopController
  + TrackingQuality       .solve()         .retarget()      check_*()
    .check()
 
-  Stage 5 (incremental)   Stage 6         Stage 7
-┌──────────────────────┐ ┌───────────┐  ┌──────────┐
-│ QUALITY FLAGS        │ │ RECORD    │  │ EXECUTE  │
-│ (set across stages)  │─►│ FRAME     │─►│ ACTION   │
-└──────────────────────┘ └───────────┘  └──────────┘
-     │                          │              │
-     ▼                          ▼              ▼
- QualityFlags.set()*10    recorder          robot
- (in pipeline steps)      .add_frame()      .send_action()
+  Stage 5 (incremental)     Stage 6            Stage 7         Stage 8
+┌──────────────────────┐  ┌──────────────┐  ┌───────────┐  ┌──────────┐
+│ QUALITY FLAGS        │  │ READ CAMERA  │  │ RECORD    │  │ EXECUTE  │
+│ (set across stages)  │─►│ (multi/single)│─►│ FRAME     │─►│ ACTION   │
+└──────────────────────┘  └──────────────┘  └───────────┘  └──────────┘
+     │                           │                 │              │
+     ▼                           ▼                 ▼              ▼
+ QualityFlags.set()*10    MultiCameraManager  CollectionLoop  robot
+ (in pipeline steps)      .read_all_latest()  .record_frame() .send_action()
+                          or CameraProcess
+                          .poll_latest_frame()
 ```
 
-> **注意**: Quality Flags 不是独立的单一步骤 — bits 0-5（TRACKING/IK/RETARGET/JUMP/WORKSPACE）在 `_compute_action()` 内增量设置，bits 7-10（TORQUE/CURRENT/TEMP/COMM）在 `_tick()` step 5 设置。Stage 6 (Record) 在 Stage 7 (Execute) 之前执行 — 录制的是本帧计算出的 action，不等硬件执行结果。
+> **注意**: Quality Flags 不是独立的单一步骤 — bits 0-5（TRACKING/IK/RETARGET/JUMP/WORKSPACE）在 `_compute_action()` 内增量设置，bits 7-10（TORQUE/CURRENT/TEMP/COMM）在 `_tick()` step 5 设置。Stage 7 (Record) 在 Stage 8 (Execute) 之前执行 — 录制的是本帧计算出的 action，不等硬件执行结果。录制通过 `CollectionLoop.record_frame()` 委托执行（支持 auto_stop_on_quality_drop + 多相机帧）。
 
 ### 3.2 Stage 1: VR Input Gate
 
