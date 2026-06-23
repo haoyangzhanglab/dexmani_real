@@ -261,9 +261,7 @@ class TimestampAligner:
             ("obs/eef_pos", ctrl_ts, "linear"),
             ("obs/eef_quat", ctrl_ts, "linear"),  # Note: quaternion needs SLERP
             ("obs/hand_qpos", ctrl_ts, "linear"),
-            ("obs/hand_current", ctrl_ts, "linear"),
             ("obs/hand_tactile_sum", ctrl_ts, "linear"),
-            ("obs/hand_temperature", ctrl_ts, "linear"),
             ("action/arm_qpos", ctrl_ts, "linear"),
             ("action/hand_qpos", ctrl_ts, "linear"),
             ("vr/wrist_pos", ctrl_ts, "linear"),
@@ -294,12 +292,6 @@ class TimestampAligner:
 
         result["aligned_timestamps"] = target_ts
         result["aligned_fps"] = np.float64(1.0 / dt)
-
-        # Quality flags: nearest-neighbor to preserve bit field integrity
-        if "quality_flags" in f:
-            qf = np.asarray(f["quality_flags"][:], dtype=np.uint16)
-            si = StreamInterpolator(InterpolationConfig(method="nearest"))
-            result["quality_flags"] = si.interpolate(ctrl_ts, qf, target_ts).astype(np.uint16)
 
         logger.info(
             "TimestampAligner: %d streams aligned to %.0fms grid (%d→%d frames)",

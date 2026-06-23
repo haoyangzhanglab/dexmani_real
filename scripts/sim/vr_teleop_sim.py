@@ -46,7 +46,6 @@
       workspace clamp+re-IK、loop overrun detection
     - keyboard_teleop_sim.py: SAPIEN viewer、GlobalKeyState、execute_return_home
     - EpisodeRecorder (recording/episode_recorder.py): HDF5 录制生命周期
-    - QualityFlags (recording/quality_flags.py): 逐帧质量标记（10-bit）
 """
 
 from __future__ import annotations
@@ -72,20 +71,7 @@ from dexmani_real.planning import (
 )
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.planning.types import Pose  # used in workspace clamp wrapper
-from dexmani_real.recording import EpisodeRecorder, QualityFlags
-from dexmani_real.recording.quality_flags import (
-    ARM_TORQUE_OK,
-    CAMERA_OK,
-    HAND_COMM_OK,
-    HAND_CURRENT_OK,
-    HAND_TEMP_OK,
-    IK_SUCCESS,
-    IN_WORKSPACE,
-    JOINT_JUMP_OK,
-    RETARGET_OK,
-    RETARGET_VALID,
-    TRACKING_OK,
-)
+from dexmani_real.recording import EpisodeRecorder
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, create_viewer
@@ -215,16 +201,6 @@ def clamp_to_workspace(pos: np.ndarray) -> np.ndarray:
     return np.clip(pos, WORKSPACE_BOUNDS[:, 0], WORKSPACE_BOUNDS[:, 1])
 
 
-def _sim_clamp_workspace_pose(pose: Pose) -> Pose:
-    """仿真工作空间 clamp：仅限制位置，保留原始朝向。
-
-    TeleopPipeline 的 clamp_workspace_pose 回调，将 EEF pose 限制在
-    工作空间内。仿真中只检查位置边界，不限制朝向。
-    """
-    clamped_pos = clamp_to_workspace(pose.p)
-    return Pose(p=clamped_pos, q=pose.q)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # 仿真状态 → RobotState/RobotAction 构造（供 EpisodeRecorder 使用）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -244,14 +220,10 @@ def build_robot_state(sim_state: dict) -> RobotState:
         eef_quat_wxyz=eef_quat,
         eef_rot6d=quat_wxyz_to_rot6d(eef_quat),
         hand_qpos=sim_state["hand_qpos"],
-        hand_current=np.zeros(12, dtype=np.float64),
         hand_tactile_sum=np.zeros((5, 3), dtype=np.float64),
-        hand_tactile_raw=np.zeros((5, 120, 3), dtype=np.float64),
-        hand_temperature=np.full(12, 30.0, dtype=np.float64),
         fingertip_pos=np.zeros((5, 3), dtype=np.float64),
         arm_connected=True,
         hand_connected=True,
-        hand_error=False,
         timestamp=sim_state["timestamp"],
     )
 
@@ -787,12 +759,10 @@ def main() -> None:
                         print(f"[VR] 帧过期或不可用 (age > {VR_FRAME_MAX_AGE_S}s)，"
                               f"软减速中...")
 
-                    # 软减速：使用 TeleopPipeline.soft_deceleration
+                    # Hold current position (soft deceleration simplified to instant hold)
                     sim_state = sim.get_state()
                     arm_blend, hand_blend = TeleopPipeline.soft_deceleration(
-                        prev_arm_cmd, prev_hand_cmd,
                         sim_state["arm_qpos"], sim_state["hand_qpos"],
-                        lost_duration_s,
                     )
                     full_cmd = np.concatenate([arm_blend, hand_blend])
                     sim.robot.balance_passive_force()
@@ -809,31 +779,26 @@ def main() -> None:
                     sim_state = sim.get_state()
 
                     # 2. 计算遥操作命令（使用 TeleopPipeline — 与真机共享逻辑）
-                    action, quality_flags = pipeline.compute_action(
+                    action, status = pipeline.compute_action(
                         vr_frame=frame,
                         current_arm_qpos=sim_state["arm_qpos"],
                         current_hand_qpos=sim_state["hand_qpos"],
                         prev_arm_cmd=prev_arm_cmd,
                         prev_hand_cmd=prev_hand_cmd,
                         check_workspace=is_in_workspace,
-                        clamp_workspace_pose=_sim_clamp_workspace_pose,
+                        clamp_workspace_pos=clamp_to_workspace,
                         last_arm_cmd=prev_arm_cmd,
                     )
                     arm_cmd = action.arm_qpos_cmd
                     hand_cmd = action.hand_qpos_cmd
                     target_eef_pos = action.target_eef_pos
 
-                    # 仿真硬件质量标记（始终为 OK — 无真实传感器）
-                    quality_flags |= (
-                        ARM_TORQUE_OK | HAND_CURRENT_OK | HAND_TEMP_OK | HAND_COMM_OK
-                    )
-
                     # 更新失败计数（用于状态打印）
-                    if not (quality_flags & IK_SUCCESS):
+                    if not status["ik_ok"]:
                         ik_fail_count += 1
                     else:
                         ik_fail_count = 0
-                    if not (quality_flags & RETARGET_OK):
+                    if not status["retarget_ok"]:
                         retarget_fail_count += 1
                     else:
                         retarget_fail_count = 0
@@ -843,9 +808,6 @@ def main() -> None:
                     T_base_eef = None
                     if ee_camera is not None:
                         camera_frame = capture_camera_frame(ee_camera)
-                        if camera_frame is not None:
-                            # CAMERA_OK: simulation camera is always "fresh"
-                            quality_flags |= CAMERA_OK
                         # 计算 T_base_eef 用于相机外参（eye-in-hand）
                         try:
                             eef_link = sim.robot.model.find_link_by_name("custom_eef_link")
@@ -871,7 +833,6 @@ def main() -> None:
                                 state=robot_state,
                                 action=robot_action,
                                 vr_frame=frame,
-                                quality_flags=quality_flags,
                                 camera_frame=camera_frame,
                                 T_base_eef=T_base_eef,
                             )

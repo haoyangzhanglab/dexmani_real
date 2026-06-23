@@ -10,10 +10,9 @@ HDF5 structure (per recording-spec.md):
              camera_T_base_camera | camera_T_eef_camera,  # 4x4 flat
              retargeting_config, pipeline_snapshot
       /obs/arm_qpos(7)  arm_qvel(7)  arm_tau(7)  eef_pos(3)  eef_quat(4)
-      /obs/hand_qpos(12)  hand_current(12)  hand_tactile_sum(5,3)  hand_temperature(12)
+      /obs/hand_qpos(12)  hand_tactile_sum(5,3)
       /action/arm_qpos(7)  hand_qpos(12)
       /vr/wrist_pos(3)  wrist_quat(4)  landmarks(21,3)
-      /quality_flags(T,) uint16
       /camera/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)     # single-camera (backward compat)
       /camera/<serial>/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)  # multi-camera
       /camera/K(3,3)                        # intrinsics matrix
@@ -152,7 +151,6 @@ class EpisodeRecorder:
         state: RobotState,
         action: RobotAction,
         vr_frame: dict[str, Any],
-        quality_flags: int,
         camera_frame: dict[str, Any] | None = None,
         T_base_eef: np.ndarray | None = None,
         camera_frames: dict[str, dict[str, Any]] | None = None,
@@ -163,7 +161,6 @@ class EpisodeRecorder:
             state: Current robot state.
             action: Computed robot action.
             vr_frame: VR tracking frame dict.
-            quality_flags: Per-frame quality flags bitmask.
             camera_frame: Single camera frame dict (backward compat).
             T_base_eef: 4x4 base→EEF transform for camera extrinsics.
             camera_frames: Multi-camera frames dict (name → frame dict).
@@ -187,7 +184,6 @@ class EpisodeRecorder:
                 state=state,
                 action=action,
                 vr_frame=vr_frame,
-                quality_flags=quality_flags,
                 camera_frame=camera_frame,
                 camera_frames=camera_frames,
                 T_base_eef=T_base_eef,
@@ -205,9 +201,7 @@ class EpisodeRecorder:
         self._append_or_create("obs/eef_pos", state.eef_pos)
         self._append_or_create("obs/eef_quat", state.eef_quat_wxyz)
         self._append_or_create("obs/hand_qpos", state.hand_qpos)
-        self._append_or_create("obs/hand_current", state.hand_current)
         self._append_or_create("obs/hand_tactile_sum", state.hand_tactile_sum)
-        self._append_or_create("obs/hand_temperature", state.hand_temperature)
 
         self._append_or_create("action/arm_qpos", action.arm_qpos_cmd)
         self._append_or_create("action/hand_qpos", action.hand_qpos_cmd)
@@ -215,15 +209,6 @@ class EpisodeRecorder:
         self._append_or_create("vr/wrist_pos", vr_frame["wrist_pos"])
         self._append_or_create("vr/wrist_quat", vr_frame["wrist_quat_wxyz"])
         self._append_or_create("vr/landmarks", vr_frame["landmarks"])
-
-        qf_arr = np.array([quality_flags], dtype=np.uint16)
-        if "quality_flags" not in self._datasets:
-            self._datasets["quality_flags"] = self._file.create_dataset(
-                "quality_flags", data=qf_arr,
-                maxshape=(None,), chunks=True, dtype=np.uint16,
-            )
-        else:
-            self._resize_append("quality_flags", qf_arr)
 
         # Timestamps
         ts_arr = np.array([time.perf_counter()], dtype=np.float64)
@@ -354,21 +339,7 @@ class EpisodeRecorder:
         meta.attrs["num_frames"] = self._frame_count
         meta.attrs["success"] = success
         meta.attrs["fps"] = self._frame_count / duration if duration > 0 else 0.0
-
-        # num_valid_frames + quality_summary
-        quality_ratio = 1.0
-        if "quality_flags" in self._file:
-            from dexmani_real.recording.quality_flags import ALL_GOOD_MASK
-
-            qf = np.asarray(self._file["quality_flags"][:], dtype=np.uint16)
-            valid = int(np.sum((qf & np.uint16(ALL_GOOD_MASK)) == np.uint16(ALL_GOOD_MASK)))
-            meta.attrs["num_valid_frames"] = valid
-            quality_ratio = valid / max(self._frame_count, 1)
-
-        # Write per-bit quality summary for offline filtering
-        meta.attrs["quality_ratio"] = quality_ratio
         meta.attrs["min_frames_met"] = self._frame_count >= 50
-        meta.attrs["quality_ok"] = quality_ratio >= 0.6
 
         # Camera frame presence
         has_camera = "camera/timestamps" in self._file

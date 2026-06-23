@@ -32,21 +32,13 @@ class CollectionConfig:
     # ── Camera ──
     camera_enabled: bool = True
     camera_recovery_enabled: bool = True  # auto-restart crashed camera daemon
-    camera_max_age_s: float = 0.5         # CAMERA_OK freshness threshold
+    camera_max_age_s: float = 0.5         # camera frame freshness threshold (seconds)
 
-    # ── Quality gating ──
-    min_quality_ratio: float = 0.6  # minimum ratio of quality-OK frames
-    record_all_frames: bool = True   # record even low-quality frames (filter offline)
+    # ── Recording ──
+    record_all_frames: bool = True   # record all frames
 
     # ── Auto-stop triggers ──
     auto_stop_on_max_frames: bool = True
-    auto_stop_on_quality_drop: bool = False       # abort if quality drops too low
-    quality_drop_threshold: float = 0.5            # minimum quality ratio before triggering
-    quality_drop_streak: int = 100                 # consecutive low-quality frames to trigger
-
-    # ── Episode annotation (post-recording) ──
-    annotate_on_save: bool = True   # run EpisodeAnnotator on stop_episode (sidecar JSON)
-    success_default: bool = True    # default success flag (can override per-episode)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

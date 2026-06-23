@@ -1,10 +1,14 @@
-"""Per-frame safety checks on RobotState. Stateless, shared by teleop and deploy."""
+"""Per-frame safety checks. Stateless, shared by teleop and deploy.
+
+Functions accept base numpy types (not RobotState) for flexible use
+by both controller and pipeline layers.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.robot.types import RobotState, _ARM_TORQUE_LIMIT_NM
+from dexmani_real.robot.types import _ARM_TORQUE_LIMIT_NM
 
 # Default thresholds (teleop). Deploy may use stricter values.
 # _ARM_TORQUE_LIMIT_NM is defined in robot/types.py (hardware property, not teleop policy).
@@ -23,10 +27,10 @@ _RETARGET_VALID_MAX = 2.0     # rad, ~115°, XHand max=110° (1.92 rad)
 
 
 def check_arm_torque(
-    state: RobotState,
+    arm_tau: np.ndarray,
     torque_limit_nm: np.ndarray | float = _ARM_TORQUE_LIMIT_NM,
 ) -> bool:
-    tau = state.arm_tau
+    tau = np.asarray(arm_tau, dtype=np.float64)
     if not np.all(np.isfinite(tau)):
         return False
     if isinstance(torque_limit_nm, np.ndarray):
@@ -37,27 +41,27 @@ def check_arm_torque(
 
 
 def check_hand_current(
-    state: RobotState,
+    hand_current: np.ndarray,
     current_limit_ma: float = _HAND_CURRENT_LIMIT_MA,
 ) -> bool:
-    cur = state.hand_current
+    cur = np.asarray(hand_current, dtype=np.float64)
     if not np.all(np.isfinite(cur)):
         return False
     return float(np.max(cur)) < current_limit_ma
 
 
 def check_hand_temperature(
-    state: RobotState,
+    hand_temp: np.ndarray,
     temp_limit_c: float = _HAND_TEMP_LIMIT_C,
 ) -> bool:
-    temp = state.hand_temperature
+    temp = np.asarray(hand_temp, dtype=np.float64)
     if not np.all(np.isfinite(temp)):
         return False
     return float(np.max(temp)) < temp_limit_c
 
 
-def check_hand_comm(state: RobotState) -> bool:
-    return not state.hand_error
+def check_hand_comm(hand_error: bool) -> bool:
+    return not hand_error
 
 
 def check_retarget_valid(

@@ -72,13 +72,9 @@ class RobotState:
 
     # ── Hand joints ──
     hand_qpos: np.ndarray         # (12,) float64  rad
-    hand_current: np.ndarray      # (12,) float64  mA
 
     # ── Tactile ──
     hand_tactile_sum: np.ndarray  # (5,3) float64  N
-    hand_tactile_raw: np.ndarray  # (5,120,3) float64
-
-    hand_temperature: np.ndarray  # (12,) float64  °C
 
     # ── Derived (chained FK) ──
     fingertip_pos: np.ndarray     # (5,3) float64  m (world frame)
@@ -86,7 +82,6 @@ class RobotState:
     # ── Status ──
     arm_connected: bool
     hand_connected: bool
-    hand_error: bool
     timestamp: float              # seconds
 
     def __post_init__(self):
@@ -98,10 +93,7 @@ class RobotState:
             ("eef_quat_wxyz", (4,)),
             ("eef_rot6d", (6,)),
             ("hand_qpos", (12,)),
-            ("hand_current", (12,)),
             ("hand_tactile_sum", (5, 3)),
-            ("hand_tactile_raw", (5, 120, 3)),
-            ("hand_temperature", (12,)),
             ("fingertip_pos", (5, 3)),
         ])
 
@@ -140,10 +132,6 @@ class RobotInterfaceConfig:
             [0.05, 0.5],   # z [min, max] m
         ], dtype=np.float64)
     )
-
-    # Orientation workspace safety (Euler XYZ, radians).
-    # None disables orientation checking (backward compatible).
-    workspace_orientation_bounds: np.ndarray | None = None
 
     # Hand FK
     hand_urdf_path: str = ""

@@ -22,15 +22,6 @@ import numpy as np
 
 from dexmani_real.log import get_logger
 from dexmani_real.planning.types import Pose
-from dexmani_real.recording.quality_flags import (
-    IK_SUCCESS,
-    IN_WORKSPACE,
-    JOINT_JUMP_OK,
-    RETARGET_OK,
-    RETARGET_VALID,
-    TRACKING_OK,
-    QualityFlags,
-)
 from dexmani_real.robot.types import RobotAction
 from dexmani_real.utils.hand_utils import (
     OPERATOR2MANO_RIGHT,
@@ -101,10 +92,9 @@ class TeleopPipeline:
         prev_hand_cmd: np.ndarray,
         *,
         check_workspace: Callable[[np.ndarray], bool] | None = None,
-        check_orientation: Callable[[np.ndarray], bool] | None = None,
-        clamp_workspace_pose: Callable[[Pose], Pose] | None = None,
+        clamp_workspace_pos: Callable[[np.ndarray], np.ndarray] | None = None,
         last_arm_cmd: np.ndarray | None = None,
-    ) -> tuple[RobotAction, int]:
+    ) -> tuple[RobotAction, dict[str, bool]]:
         """Full action computation pipeline.
 
         Flow:
@@ -120,61 +110,45 @@ class TeleopPipeline:
             prev_arm_cmd: Previous arm command (7,) for jump clamp reference.
             prev_hand_cmd: Previous hand command (12,) for jump clamp reference.
             check_workspace: pos → bool, checks if position is within workspace.
-            check_orientation: quat_wxyz → bool, checks if orientation is within bounds.
-            clamp_workspace_pose: Pose → Pose, clamps pose to workspace boundaries.
+            clamp_workspace_pos: pos → pos, clamps position to workspace boundaries.
             last_arm_cmd: Last successfully sent arm command (for EMA smoothing).
 
         Returns:
-            (action, quality_flags) where action is RobotAction and quality_flags
-            is a uint16 bitmask.
+            (action, status) where action is RobotAction and status is a dict
+            with keys: ik_ok, retarget_ok, jump_ok.
         """
-        quality = QualityFlags()
-        quality.set(TRACKING_OK, True)
-
         # ── 1. Arm IK ──
         arm_cmd, ik_ok, target_eef_pos = self.compute_arm_command(
             vr_frame, current_arm_qpos, prev_arm_cmd, last_arm_cmd=last_arm_cmd,
         )
-        quality.set(IK_SUCCESS, ik_ok)
 
         # ── 2. Workspace check + clamp + re-IK (optional) ──
-        #     If workspace checkers are provided and the computed EEF pose is
-        #     out of bounds, clamp the target pose and re-solve IK rather than
+        #     If workspace checker is provided and the computed EEF pose is
+        #     out of bounds, clamp the target position and re-solve IK rather than
         #     immediately holding — allows the arm to track the VR wrist up to
         #     the boundary instead of stopping abruptly.
         #     (ref: ManiUniCon _clip_action_to_bounds → re-IK)
         in_workspace = True
-        ori_ok = True
         retarget_ok = False  # init; only set True by compute_hand_command below
 
         if check_workspace is not None and ik_ok:
             arm_eef_pose = self.planner.compute_eef_pose_world(arm_cmd)
             in_workspace = check_workspace(arm_eef_pose.p)
-            ori_ok = (
-                check_orientation(arm_eef_pose.q)
-                if check_orientation is not None
-                else True
-            )
 
-            if not in_workspace or not ori_ok:
-                # Clamp target pose to workspace boundaries and re-solve IK
-                if clamp_workspace_pose is not None:
-                    clamped_pose = clamp_workspace_pose(arm_eef_pose)
+            if not in_workspace:
+                # Clamp target position to workspace boundaries and re-solve IK
+                if clamp_workspace_pos is not None:
+                    clamped_pos = clamp_workspace_pos(arm_eef_pose.p)
+                    clamped_pose = Pose(p=clamped_pos, q=arm_eef_pose.q)
                     re_ik = self.planner.solve_teleop_ik(
                         clamped_pose, current_arm_qpos, prev_arm_cmd,
                     )
                     if re_ik.success and re_ik.qpos is not None:
                         arm_cmd = np.asarray(re_ik.qpos, dtype=np.float64)
                         ik_ok = True
-                        quality.set(IK_SUCCESS, True)
                         # Re-evaluate workspace on the clamped result
                         clamped_eef = self.planner.compute_eef_pose_world(arm_cmd)
                         in_workspace = check_workspace(clamped_eef.p)
-                        ori_ok = (
-                            check_orientation(clamped_eef.q)
-                            if check_orientation is not None
-                            else True
-                        )
                         # Hand retarget — proceed with clamped arm position
                         hand_cmd, retarget_ok = self.compute_hand_command(
                             vr_frame, prev_hand_cmd,
@@ -198,22 +172,18 @@ class TeleopPipeline:
                 vr_frame, prev_hand_cmd,
             )
 
-        quality.set(IN_WORKSPACE, in_workspace and ori_ok)
-        quality.set(RETARGET_OK, retarget_ok)
-        quality.set(RETARGET_VALID, retarget_ok)  # caller may override with safety check
-
         # ── 3. Joint jump clamp ──
         arm_cmd, hand_cmd, jump_ok = self.apply_jump_clamp(
             arm_cmd, hand_cmd, prev_arm_cmd, prev_hand_cmd,
         )
-        quality.set(JOINT_JUMP_OK, jump_ok)
 
         action = RobotAction(
             arm_qpos_cmd=arm_cmd,
             hand_qpos_cmd=hand_cmd,
             target_eef_pos=target_eef_pos,
         )
-        return action, quality.get()
+        status = {"ik_ok": ik_ok, "retarget_ok": retarget_ok, "jump_ok": jump_ok}
+        return action, status
 
     # ------------------------------------------------------------------
     # Arm IK
@@ -366,33 +336,15 @@ class TeleopPipeline:
 
     @staticmethod
     def soft_deceleration(
-        prev_arm_cmd: np.ndarray,
-        prev_hand_cmd: np.ndarray,
         current_arm_qpos: np.ndarray,
         current_hand_qpos: np.ndarray,
-        lost_duration_s: float,
-        decay_rate: float = 3.0,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Exponentially pull arm/hand toward current physical position during VR loss.
-
-        Avoids abrupt holds when VR tracking is briefly lost (< 1.0 s).
-        Matching TeleopController._apply_soft_deceleration decay_rate=3.0.
-
-        Args:
-            prev_arm_cmd: Previous arm command (7,).
-            prev_hand_cmd: Previous hand command (12,).
-            current_arm_qpos: Current physical arm position (7,).
-            current_hand_qpos: Current physical hand position (12,).
-            lost_duration_s: Continuous VR loss duration in seconds.
-            decay_rate: Exponential decay rate (1/s). Default 3.0.
+        """Hold current physical position during VR loss.
 
         Returns:
-            (arm_cmd, hand_cmd): Blended commands.
+            (arm_cmd, hand_cmd): Current position copies.
         """
-        decay = float(np.exp(-lost_duration_s * decay_rate))
-        arm_cmd = decay * prev_arm_cmd + (1.0 - decay) * current_arm_qpos
-        hand_cmd = decay * prev_hand_cmd + (1.0 - decay) * current_hand_qpos
-        return arm_cmd, hand_cmd
+        return current_arm_qpos.copy(), current_hand_qpos.copy()
 
     @property
     def has_pose_interpolator(self) -> bool:

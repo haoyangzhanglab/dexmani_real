@@ -33,20 +33,6 @@ from dexmani_real.teleop.core.tracking import (
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
-from dexmani_real.recording.quality_flags import (
-    ARM_TORQUE_OK,
-    CAMERA_OK,
-    HAND_COMM_OK,
-    HAND_CURRENT_OK,
-    HAND_TEMP_OK,
-    IK_SUCCESS,
-    IN_WORKSPACE,
-    JOINT_JUMP_OK,
-    RETARGET_OK,
-    RETARGET_VALID,
-    TRACKING_OK,
-    QualityFlags,
-)
 from dexmani_real.robot.interface import (
     RobotAction,
     RobotInterface,
@@ -305,9 +291,9 @@ class TeleopController:
     # Soft deceleration
 
     def _apply_soft_deceleration(self, lost_duration_s: float) -> None:
-        """Exponentially pull arm toward current physical position during VR stale window.
+        """Hold current physical position during VR stale window.
 
-        Avoids abrupt holds when VR tracking is briefly lost (< 1.0 s).
+        Instant hold — no exponential decay.
         """
         if self._last_arm_cmd is None:
             return
@@ -318,9 +304,7 @@ class TeleopController:
             else state.hand_qpos
         )
         arm_cmd, hand_cmd = TeleopPipeline.soft_deceleration(
-            self._last_arm_cmd, hand_cmd,
             state.arm_qpos, state.hand_qpos,
-            lost_duration_s,
         )
         action = RobotAction(
             arm_qpos_cmd=arm_cmd,
@@ -391,17 +375,25 @@ class TeleopController:
             state = self.robot.get_state()
 
         # 4. Compute action
-        action, quality = self._compute_action(vr_frame, state)
+        action, status = self._compute_action(vr_frame, state)
 
-        # 5. Quality flags on hardware state (recorded for post-hoc filtering)
-        quality.set(ARM_TORQUE_OK, safety.check_arm_torque(state))
-        quality.set(HAND_CURRENT_OK, safety.check_hand_current(state))
-        quality.set(HAND_TEMP_OK, safety.check_hand_temperature(state))
-        quality.set(HAND_COMM_OK, safety.check_hand_comm(state))
+        # 5. Safety checks on hardware state (direct checks, no bitmask layer)
+        hand_state = self.robot.hand.get_state(full=True)
+        torque_ok = safety.check_arm_torque(state.arm_tau)
+        current_ok = safety.check_hand_current(hand_state.get("current", np.zeros(12)))
+        temp_ok = safety.check_hand_temperature(hand_state.get("temperature", np.full(12, 30.0)))
+        comm_ok = safety.check_hand_comm(
+            bool(
+                np.any(hand_state.get("commboard_err", np.zeros(12)) != 0)
+                or np.any(hand_state.get("jointboard_err", np.zeros(12)) != 0)
+                or np.any(hand_state.get("tipboard_err", np.zeros(12)) != 0)
+            )
+        )
 
-        flags = quality.get()
+        if not (torque_ok and current_ok and temp_ok and comm_ok):
+            action = self.error_handler.hold_action()
 
-        # 6. Record frame (before safety gate — captures pre-hold action + flags)
+        # 6. Record frame (before safety gate — captures pre-hold action)
         camera_frame = None
         camera_frames: dict[str, dict] | None = None
 
@@ -410,24 +402,14 @@ class TeleopController:
             self._ensure_multi_camera_running()
             try:
                 camera_frames = self._multi_camera.read_all_latest()
-                # Update CAMERA_OK: set if at least one camera has fresh frames
-                any_fresh = False
                 for cam_name, cam_frame in camera_frames.items():
                     if cam_frame is not None:
                         ts = cam_frame.get("timestamp", 0.0)
-                        if ts > 0 and (time.perf_counter() - ts) < 0.5:
-                            any_fresh = True
-                            rgb = cam_frame.get("rgb")
-                            if rgb is not None and np.count_nonzero(rgb) == 0:
-                                any_fresh = False  # all-zero frame
-                        self.camera_stats.record_consume(
-                            time.perf_counter() - ts if ts > 0 else 0.0
-                        )
+                        if ts > 0:
+                            self.camera_stats.record_consume(
+                                time.perf_counter() - ts
+                            )
                         break  # stats for first camera only
-                if any_fresh:
-                    flags |= CAMERA_OK
-                else:
-                    flags &= ~CAMERA_OK
             except (ValueError, RuntimeError, KeyError) as e:
                 logger.debug("Multi-camera poll failed: %s", e)
 
@@ -443,13 +425,6 @@ class TeleopController:
                 self.camera_stats.record_consume(
                     time.perf_counter() - camera_frame.get("timestamp", time.perf_counter())
                 )
-                ts = camera_frame.get("timestamp", 0.0)
-                if ts > 0 and (time.perf_counter() - ts) < 0.5:
-                    flags |= CAMERA_OK  # bit 6: camera frame fresh (<500ms)
-                # Validate camera frame has non-zero content
-                rgb = camera_frame.get("rgb")
-                if rgb is not None and np.count_nonzero(rgb) == 0:
-                    flags &= ~CAMERA_OK  # all-zero frame → not OK
 
         # ── Recording (delegated to CollectionLoop if available) ──
         if self.recording:
@@ -458,7 +433,6 @@ class TeleopController:
                 try:
                     self._collection_loop.record_frame(
                         state=state, action=action, vr_frame=vr_frame,
-                        quality_flags=flags,
                         camera_frame=camera_frame,
                         camera_frames=camera_frames,
                         T_base_eef=T_base_eef,
@@ -469,7 +443,6 @@ class TeleopController:
                 try:
                     self.recorder.add_frame(
                         state=state, action=action, vr_frame=vr_frame,
-                        quality_flags=flags,
                         camera_frame=camera_frame,
                         camera_frames=camera_frames,
                         T_base_eef=T_base_eef,
@@ -479,9 +452,8 @@ class TeleopController:
 
         # 7. Pre-send safety gate — centralized validate_action (ref: ManiUniCon).
         #    Joint limits enforced by XArm7/XHand drivers (error latch → is_error).
-        #    Soft faults (torque/current/temp) trigger hold; hard faults escalate.
         if not self.dry_run:
-            action_valid, fail_reason = self.robot.validate_action(action, flags)
+            action_valid, fail_reason = self.robot.validate_action(action)
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
                     self._escalate_to_emergency(
@@ -506,7 +478,7 @@ class TeleopController:
         now = time.monotonic()
         if now - self.last_status_ts >= self.status_interval:
             self.last_status_ts = now
-            self._print_status(vr_frame, flags, now)
+            self._print_status(vr_frame, now)
 
         # 9. Control loop overrun detection (ref: BunnyVisionPro wait_until_next_control_signal).
         #    Warns when a tick exceeds 150% of the target period — flags IK slowdowns,
@@ -523,7 +495,7 @@ class TeleopController:
 
     def _compute_action(
         self, vr_frame: dict, state: RobotState
-    ) -> tuple[RobotAction, QualityFlags]:
+    ) -> tuple[RobotAction, dict[str, bool]]:
         """Compute action via TeleopPipeline (shared with sim controller)."""
         current_arm_qpos = state.arm_qpos
         current_hand_qpos = state.hand_qpos
@@ -543,32 +515,24 @@ class TeleopController:
         self.error_handler.init_fallback(current_arm_qpos, current_hand_qpos)
 
         # Delegate to shared pipeline
-        action, flags = self.pipeline.compute_action(
+        action, status = self.pipeline.compute_action(
             vr_frame=vr_frame,
             current_arm_qpos=current_arm_qpos,
             current_hand_qpos=current_hand_qpos,
             prev_arm_cmd=prev_arm_cmd,
             prev_hand_cmd=prev_hand_cmd,
             check_workspace=self.robot.check_workspace,
-            check_orientation=self.robot.check_workspace_orientation,
-            clamp_workspace_pose=self.robot.clamp_workspace_pose,
+            clamp_workspace_pos=self.robot.clamp_workspace_pos,
             last_arm_cmd=self._last_arm_cmd,
         )
 
-        # Wrap flags in QualityFlags builder for caller convenience
-        quality = QualityFlags()
-        quality.flags = flags
+        ik_ok = status["ik_ok"]
+        retarget_ok = status["retarget_ok"]
 
-        # Extract per-flag status
-        ik_ok = bool(flags & IK_SUCCESS)
-        retarget_ok = bool(flags & RETARGET_OK)
-
-        # Override RETARGET_VALID with hardware safety check
-        # (pipeline sets it equal to retarget_ok; real hardware overrides)
-        quality.set(
-            RETARGET_VALID,
-            safety.check_retarget_valid(action.hand_qpos_cmd),
-        )
+        # Check retarget validity with hardware safety
+        retarget_valid = safety.check_retarget_valid(action.hand_qpos_cmd)
+        if not retarget_valid:
+            retarget_ok = False
 
         # Update last-good positions for hold-on-failure
         if ik_ok and retarget_ok:
@@ -592,7 +556,7 @@ class TeleopController:
         else:
             self.retarget_fail_count += 1
 
-        return action, quality
+        return action, {"ik_ok": ik_ok, "retarget_ok": retarget_ok}
 
     # State machine transitions
 
@@ -971,24 +935,18 @@ class TeleopController:
             eef_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
             eef_rot6d=np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64),
             hand_qpos=np.zeros(12, dtype=np.float64),
-            hand_current=np.zeros(12, dtype=np.float64),
             hand_tactile_sum=np.zeros((5, 3), dtype=np.float64),
-            hand_tactile_raw=np.zeros((5, 120, 3), dtype=np.float64),
-            hand_temperature=np.full(12, 30.0, dtype=np.float64),
             fingertip_pos=np.zeros((5, 3), dtype=np.float64),
             arm_connected=True,
             hand_connected=True,
-            hand_error=False,
             timestamp=time.perf_counter(),
         )
 
     # Status
 
     def _print_status(
-        self, vr_frame: dict | None, quality_flags: int, now: float
+        self, vr_frame: dict | None, now: float
     ) -> None:
-        failed = QualityFlags.describe(quality_flags)
-        flags_str = ",".join(failed) if failed else "ALL_OK"
         age_s = (
             self.tracking_quality.frame_age(vr_frame)
             if vr_frame is not None
@@ -1001,12 +959,11 @@ class TeleopController:
         logger.info(
             "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms "
             "vr_ema=%.0fms cam_ema=%.0fms "
-            "ik=%s/%s retarget=%s/%s [%s]",
+            "ik=%s/%s retarget=%s/%s",
             now, self.frame_count, self.state.value, rec, seq, f"{age_s*1000:.0f}",
             vr_mean_age, cam_mean_age,
             self.ik_success_count, self.ik_fail_count,
             self.retarget_success_count, self.retarget_fail_count,
-            flags_str,
         )
 
 

@@ -85,7 +85,6 @@ class RobotInterface:
         self.planner = planner
         self.workspace = WorkspaceSafety(
             config.workspace_bounds,
-            orientation_bounds=config.workspace_orientation_bounds,
         )
 
         self.arm = XArm7(config.arm)
@@ -139,31 +138,15 @@ class RobotInterface:
         """Check if a 3D position (world frame) is within workspace bounds."""
         return self.workspace.check(pos)
 
-    def check_workspace_orientation(self, eef_quat_wxyz: np.ndarray) -> bool:
-        """Check if EEF orientation is within orientation bounds.
+    def clamp_workspace_pos(self, pos: np.ndarray) -> np.ndarray:
+        """Clamp a target EEF position to workspace bounds.
 
-        Returns True if orientation_bounds is not configured (backward compatible).
-        """
-        return self.workspace.check_orientation(eef_quat_wxyz)
-
-    def clamp_workspace_orientation(self, eef_quat_wxyz: np.ndarray) -> np.ndarray:
-        """Clamp EEF orientation to orientation bounds.
-
-        Returns input unchanged if orientation_bounds is not configured.
-        """
-        return self.workspace.clamp_orientation(eef_quat_wxyz)
-
-    def clamp_workspace_pose(self, pose: Pose) -> Pose:
-        """Clamp a target EEF pose to workspace bounds (position + orientation).
-
-        Returns a new Pose with both position and orientation clamped.
+        Returns the clamped position.
         Used by the controller to nudge targets back into workspace instead
         of holding on boundary violations.
         (ref: ManiUniCon _clip_action_to_bounds)
         """
-        clamped_pos = self.workspace.clamp(pose.p.copy())
-        clamped_quat = self.workspace.clamp_orientation(pose.q.copy())
-        return Pose(p=clamped_pos, q=clamped_quat)
+        return self.workspace.clamp(np.asarray(pos, dtype=np.float64))
 
     def is_error(self) -> bool:
         return self.arm.is_error() or self.hand.is_error()
@@ -173,7 +156,7 @@ class RobotInterface:
         hand_ok = self.hand.clear_error()
         return arm_ok and hand_ok
 
-    def validate_action(self, action: RobotAction, quality_flags: int = 0) -> tuple[bool, str]:
+    def validate_action(self, action: RobotAction) -> tuple[bool, str]:
         """Centralized pre-send validation (ref: ManiUniCon validate_action).
 
         Checks all safety conditions that should gate action sending.
@@ -182,9 +165,7 @@ class RobotInterface:
         Checks performed (fail-fast order):
           1. Robot error state (arm/hand SDK errors)
           2. Arm connection
-          3. Soft faults via quality_flags (torque/current/temp)
-          4. Workspace position bounds
-          5. Workspace orientation bounds
+          3. Workspace position bounds
         """
         # 1. Hardware error state
         if self.is_error():
@@ -194,24 +175,10 @@ class RobotInterface:
         if not self.arm.is_connected():
             return False, "arm not connected"
 
-        # 3. Soft faults (torque/current/temperature — extracted from quality_flags)
-        from dexmani_real.recording.quality_flags import (
-            ARM_TORQUE_OK, HAND_CURRENT_OK, HAND_TEMP_OK, IN_WORKSPACE,
-        )
-        if quality_flags != 0:
-            if not (quality_flags & ARM_TORQUE_OK):
-                return False, "arm torque exceeded"
-            if not (quality_flags & HAND_CURRENT_OK):
-                return False, "hand current exceeded"
-            if not (quality_flags & HAND_TEMP_OK):
-                return False, "hand temperature exceeded"
-
-        # 4. Workspace bounds (computed from action command)
+        # 3. Workspace bounds (computed from action command)
         arm_eef = self.kinematics.compute_eef_pose_world(action.arm_qpos_cmd)
         if not self.workspace.check(arm_eef.p):
             return False, "workspace position violation"
-        if not self.workspace.check_orientation(arm_eef.q):
-            return False, "workspace orientation violation"
 
         return True, "ok"
 
@@ -240,29 +207,14 @@ class RobotInterface:
             eef_rot6d = nan_array(6)
 
         hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
-        hand_current = np.asarray(hand_state["current"], dtype=np.float64)
         hand_tactile_sum = np.asarray(
             hand_state.get("tactile_force_sum", np.zeros((5, 3))),
-            dtype=np.float64,
-        )
-        hand_tactile_raw = np.asarray(
-            hand_state.get("tactile_force_raw", np.zeros((5, 120, 3))),
-            dtype=np.float64,
-        )
-        hand_temperature = np.asarray(
-            hand_state.get("temperature", nan_array(12)),
             dtype=np.float64,
         )
 
         # Fingertip world positions
         fingertip_pos = self._compute_fingertip_pos(
             eef_pos, eef_quat_wxyz, hand_qpos
-        )
-
-        hand_error = bool(
-            np.any(hand_state.get("commboard_err", np.zeros(12)) != 0)
-            or np.any(hand_state.get("jointboard_err", np.zeros(12)) != 0)
-            or np.any(hand_state.get("tipboard_err", np.zeros(12)) != 0)
         )
 
         return RobotState(
@@ -273,14 +225,10 @@ class RobotInterface:
             eef_quat_wxyz=eef_quat_wxyz,
             eef_rot6d=eef_rot6d,
             hand_qpos=hand_qpos,
-            hand_current=hand_current,
             hand_tactile_sum=hand_tactile_sum,
-            hand_tactile_raw=hand_tactile_raw,
-            hand_temperature=hand_temperature,
             fingertip_pos=fingertip_pos,
             arm_connected=self.arm.is_connected(),
             hand_connected=self.hand.is_connected(),
-            hand_error=hand_error,
             timestamp=time.perf_counter(),
         )
 

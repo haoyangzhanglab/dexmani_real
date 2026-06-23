@@ -1,13 +1,12 @@
 """DataValidator — automated quality checks for teleop episodes.
 
-7 validation checks run on HDF5 episode files before Zarr export:
+5 validation checks run on HDF5 episode files before Zarr export:
   1. no_nan_obs     — observations contain no NaN values
   2. no_nan_action  — actions contain no NaN values
   3. non_zero_variance — each dimension has variance > epsilon
   4. camera_fresh   — camera frames are non-all-zero (if camera data present)
   5. min_frames     — episode has >= 50 frames
-  6. quality_ratio  — >= 60% frames pass ALL_GOOD_MASK
-  7. no_duplicate_frames — no consecutive identical frames (stuck sensor)
+  6. no_duplicate_frames — no consecutive identical frames (stuck sensor)
 
 Ref: data collection loop design — Phase 3 (offline tools).
 """
@@ -21,8 +20,6 @@ from typing import Any
 
 import h5py
 import numpy as np
-
-from dexmani_real.recording.quality_flags import ALL_GOOD_MASK
 
 __all__ = ["DataValidator", "ValidationReport", "ValidationCheck"]
 
@@ -62,11 +59,9 @@ class DataValidator:
     def __init__(
         self,
         min_frames: int = 50,
-        min_quality_ratio: float = 0.6,
         variance_epsilon: float = 1e-8,
     ) -> None:
         self.min_frames = min_frames
-        self.min_quality_ratio = min_quality_ratio
         self.variance_epsilon = variance_epsilon
 
     def validate(self, h5_path: str | Path) -> ValidationReport:
@@ -107,10 +102,7 @@ class DataValidator:
                 # ── 5. Minimum frames ──
                 checks.append(self._check_min_frames(f))
 
-                # ── 6. Quality ratio ──
-                checks.append(self._check_quality_ratio(f))
-
-                # ── 7. No consecutive duplicate frames ──
+                # ── 6. No consecutive duplicate frames ──
                 checks.append(self._check_duplicate_frames(f))
 
         except (OSError, KeyError) as e:
@@ -182,23 +174,6 @@ class DataValidator:
             name="min_frames",
             passed=ok,
             detail=f"{n_frames} frames (min={self.min_frames})"
-        )
-
-    def _check_quality_ratio(self, f: h5py.File) -> ValidationCheck:
-        if "quality_flags" not in f:
-            return ValidationCheck(
-                name="quality_ratio", passed=True,
-                detail="No quality_flags (skipped).",
-            )
-        qf = np.asarray(f["quality_flags"][:], dtype=np.uint16)
-        n_frames = len(qf)
-        valid = int(np.sum((qf & np.uint16(ALL_GOOD_MASK)) == np.uint16(ALL_GOOD_MASK)))
-        ratio = valid / max(n_frames, 1)
-        ok = ratio >= self.min_quality_ratio
-        return ValidationCheck(
-            name="quality_ratio",
-            passed=ok,
-            detail=f"{ratio:.1%} ({valid}/{n_frames})"
         )
 
     def _check_duplicate_frames(self, f: h5py.File) -> ValidationCheck:

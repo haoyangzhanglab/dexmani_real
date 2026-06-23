@@ -36,9 +36,7 @@ _DATASET_SPECS: list[tuple[str, tuple[int, ...], np.dtype]] = [
     ("obs/eef_pos", (3,), np.float64),
     ("obs/eef_quat", (4,), np.float64),
     ("obs/hand_qpos", (12,), np.float64),
-    ("obs/hand_current", (12,), np.float64),
     ("obs/hand_tactile_sum", (5, 3), np.float64),
-    ("obs/hand_temperature", (12,), np.float64),
     # Action
     ("action/arm_qpos", (7,), np.float64),
     ("action/hand_qpos", (12,), np.float64),
@@ -46,8 +44,6 @@ _DATASET_SPECS: list[tuple[str, tuple[int, ...], np.dtype]] = [
     ("vr/wrist_pos", (3,), np.float64),
     ("vr/wrist_quat", (4,), np.float64),
     ("vr/landmarks", (21, 3), np.float64),
-    # Quality
-    ("quality_flags", (1,), np.uint16),
     # Camera extrinsics
     ("camera/extrinsics", (4, 4), np.float64),
     # Timestamps
@@ -67,7 +63,7 @@ class InMemoryFrameBuffer:
     Lifecycle:
         buf = InMemoryFrameBuffer(max_frames=10000, h5_file=h5_file)
         for ...:
-            buf.add_frame(state, action, vr_frame, quality_flags, ...)
+            buf.add_frame(state, action, vr_frame, ...)
         buf.flush_all()
         buf.close()
     """
@@ -134,7 +130,6 @@ class InMemoryFrameBuffer:
         state: Any,          # RobotState
         action: Any,         # RobotAction
         vr_frame: dict[str, Any],
-        quality_flags: int,
         camera_frame: dict[str, Any] | None = None,
         T_base_eef: np.ndarray | None = None,
         timestamp_ns: int | None = None,
@@ -147,7 +142,6 @@ class InMemoryFrameBuffer:
             state: Current robot state.
             action: Computed robot action.
             vr_frame: VR tracking frame dict.
-            quality_flags: Per-frame quality flags bitmask.
             camera_frame: Single camera frame (backward compat).
             T_base_eef: 4x4 base→EEF transform.
             timestamp_ns: Control loop timestamp in nanoseconds.
@@ -169,9 +163,7 @@ class InMemoryFrameBuffer:
         self._assign("obs/eef_pos", i, state.eef_pos)
         self._assign("obs/eef_quat", i, state.eef_quat_wxyz)
         self._assign("obs/hand_qpos", i, state.hand_qpos)
-        self._assign("obs/hand_current", i, state.hand_current)
         self._assign("obs/hand_tactile_sum", i, state.hand_tactile_sum)
-        self._assign("obs/hand_temperature", i, state.hand_temperature)
 
         # Action
         self._assign("action/arm_qpos", i, action.arm_qpos_cmd)
@@ -181,9 +173,6 @@ class InMemoryFrameBuffer:
         self._assign("vr/wrist_pos", i, vr_frame["wrist_pos"])
         self._assign("vr/wrist_quat", i, vr_frame["wrist_quat_wxyz"])
         self._assign("vr/landmarks", i, vr_frame["landmarks"])
-
-        # Quality flags
-        self._buffers["quality_flags"][i] = np.uint16(quality_flags)
 
         # Camera extrinsics
         if T_base_eef is not None:

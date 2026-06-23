@@ -28,14 +28,11 @@ Usage:
     # Basic export
     python scripts/tools/export_hdf5_to_zarr.py --data_dir ./recordings/ --output ./zarr_data/
 
-    # Filter only high-quality frames
-    python scripts/tools/export_hdf5_to_zarr.py --data_dir ./recordings/ --output ./zarr_data/ --quality_filter
-
     # Train/val split + task filter + validation
     python scripts/tools/export_hdf5_to_zarr.py \\
         --data_dir data/episodes/ --output data/export/ \\
         --validate --train_val_split 0.8 \\
-        --filter_success true --min_quality_ratio 0.7
+        --filter_success true --min_frames 50
 
     # Timestamp alignment (post-process multi-rate streams to unified grid)
     python scripts/tools/export_hdf5_to_zarr.py \\
@@ -56,8 +53,6 @@ import h5py
 import numpy as np
 import zarr
 from numcodecs import Blosc
-
-from dexmani_real.recording.quality_flags import ALL_GOOD_MASK
 
 # Default observation / action keys to read from HDF5.
 # Maps HDF5 dataset path → target dimension per frame.
@@ -94,7 +89,6 @@ def _episode_passes_filters(
     filter_task: str | None = None,
     filter_success: bool | None = None,
     filter_tags: str | None = None,
-    min_quality_ratio: float | None = None,
     min_frames: int | None = None,
 ) -> bool:
     """Check if episode metadata passes all filter criteria."""
@@ -115,11 +109,6 @@ def _episode_passes_filters(
         if filter_tags not in tags_str:
             return False
 
-    if min_quality_ratio is not None:
-        qr = float(meta.get("quality_ratio", 0.0))
-        if qr < min_quality_ratio:
-            return False
-
     if min_frames is not None:
         nf = int(meta.get("num_frames", 0))
         if nf < min_frames:
@@ -130,22 +119,18 @@ def _episode_passes_filters(
 
 def load_episodes(
     data_dir: Path,
-    quality_mask: int | None = None,
     filter_task: str | None = None,
     filter_success: bool | None = None,
     filter_tags: str | None = None,
-    min_quality_ratio: float | None = None,
     min_frames: int | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[Path]]:
     """Load all HDF5 episodes from data_dir with optional metadata filtering.
 
     Args:
         data_dir: Directory containing episode_*.h5 files.
-        quality_mask: If set, only frames where (flags & mask) == mask are kept.
         filter_task: Episode-level filter: substring match on task_label.
         filter_success: Episode-level filter: exact match on success flag.
         filter_tags: Episode-level filter: substring match on tags.
-        min_quality_ratio: Episode-level filter: minimum quality ratio.
         min_frames: Episode-level filter: minimum frame count.
 
     Returns:
@@ -172,26 +157,18 @@ def load_episodes(
             meta = _read_episode_meta(h5_path)
             if not _episode_passes_filters(
                 meta, filter_task, filter_success, filter_tags,
-                min_quality_ratio, min_frames,
+                min_frames,
             ):
                 skipped_meta += 1
                 continue
 
             with h5py.File(str(h5_path), "r") as f:
-                # Read quality flags and build frame mask
-                if "quality_flags" in f:
-                    flags = np.asarray(f["quality_flags"][:], dtype=np.uint16)
-                    if quality_mask is not None:
-                        valid = (flags & np.uint16(quality_mask)) == np.uint16(quality_mask)
-                    else:
-                        valid = np.ones(len(flags), dtype=bool)
-                else:
-                    n_frames = f["obs/arm_qpos"].shape[0]
-                    valid = np.ones(n_frames, dtype=bool)
+                n_frames = f["obs/arm_qpos"].shape[0]
+                valid = np.ones(n_frames, dtype=bool)
 
                 num_kept = int(np.sum(valid))
                 if num_kept == 0:
-                    print(f"  [SKIP] {h5_path.name}: 0 valid frames after quality filter")
+                    print(f"  [SKIP] {h5_path.name}: 0 valid frames")
                     continue
 
                 # Read and concatenate observation channels
@@ -525,14 +502,6 @@ def main() -> None:
         "--output", required=True,
         help="Output directory (zarr files will be created inside).",
     )
-    parser.add_argument(
-        "--quality_filter", action="store_true",
-        help=f"Keep only frames with ALL_GOOD_MASK (0x{ALL_GOOD_MASK:04X}) quality flags set.",
-    )
-    parser.add_argument(
-        "--quality_mask", type=lambda x: int(x, 0), default=None,
-        help="Custom quality mask (e.g. 0x07BF). Overrides --quality_filter.",
-    )
     # ── Train/val split ──
     parser.add_argument(
         "--train_val_split", type=float, default=None,
@@ -555,10 +524,6 @@ def main() -> None:
     parser.add_argument(
         "--filter_tags", type=str, default=None,
         help="Only include episodes whose tags contain this string.",
-    )
-    parser.add_argument(
-        "--min_quality_ratio", type=float, default=None,
-        help="Minimum quality_ratio per episode (0.0-1.0).",
     )
     parser.add_argument(
         "--min_frames", type=int, default=None,
@@ -592,23 +557,12 @@ def main() -> None:
 
     output_dir = Path(args.output).expanduser().resolve()
 
-    # Determine quality mask
-    quality_mask: int | None = None
-    if args.quality_mask is not None:
-        quality_mask = args.quality_mask
-    elif args.quality_filter:
-        quality_mask = ALL_GOOD_MASK
-
-    if quality_mask is not None:
-        print(f"Quality filter: mask=0x{quality_mask:04X} (ALL_GOOD=0x{ALL_GOOD_MASK:04X})")
-
     # ── Validation (if requested) ──
     if args.validate:
         from dexmani_real.recording.data_validator import DataValidator
 
         validator = DataValidator(
             min_frames=args.min_frames or 50,
-            min_quality_ratio=args.min_quality_ratio or 0.6,
         )
         print("Running DataValidator...")
         reports = validator.validate_directory(data_dir)
@@ -619,11 +573,9 @@ def main() -> None:
     # ── Load episodes ──
     obs_list, action_list, episode_lengths, episode_paths = load_episodes(
         data_dir,
-        quality_mask=quality_mask,
         filter_task=args.filter_task,
         filter_success=args.filter_success,
         filter_tags=args.filter_tags,
-        min_quality_ratio=args.min_quality_ratio,
         min_frames=args.min_frames,
     )
 
