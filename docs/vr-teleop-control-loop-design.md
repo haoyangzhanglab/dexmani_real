@@ -28,7 +28,7 @@
 | **Safety-First** | 任何管道失败 → hold last_good，硬件异常 → E-Stop。安全不可妥协 |
 | **Deterministic Primary** | IK 优先确定性方法（DLS），仅在必要时回退随机方法（MPlib） |
 | **Fail-Safe Defaults** | 未连接的模块返回 hold，不发散；未知状态视为不安全 |
-| **Observable** | 每帧产生 10bit quality flags，录制完整的 state×action×vr 三元组 |
+| **Observable** | 每帧产生 11-bit quality flags（含 CAMERA_OK），录制完整的 state×action×vr 三元组 |
 | **Single-Thread Simplicity** | 当前单线程足够(7-12ms DLS路径满足 20ms 预算)；解耦是未来优化方向 |
 
 ### 1.2 设计约束
@@ -339,7 +339,7 @@ Stage 3 输出 arm_cmd, hand_cmd
 
 ### 3.6 Stage 5: Quality Flags Assembly
 
-**职责**: 汇总所有检查结果到 10bit flag。
+**职责**: 汇总所有检查结果到 11-bit flag（含 CAMERA_OK bit 6）。
 
 **bit 定义** (`recording/quality_flags.py:25-34`):
 
@@ -416,7 +416,7 @@ def add_frame(
     state: RobotState,           # 完整 robot state
     action: RobotAction,         # 发送的 action
     vr_frame: dict[str, Any],    # VR 原始帧
-    quality_flags: int,          # 10bit quality
+    quality_flags: int,          # 11-bit quality (含 CAMERA_OK)
     camera_frame: dict | None,   # 相机帧（可选）
     T_base_eef: np.ndarray | None, # (4,4) EEF 位姿（用于相机外参）
 ) -> bool:
@@ -838,7 +838,7 @@ if ik_ok and retarget_ok:
 │                                                                   │
 │  Jump Clamp ─────► arm_cmd', hand_cmd' (clipped)                  │
 │                                                                   │
-│  Safety ─────────► QualityFlags (10bit)                            │
+│  Safety ─────────► QualityFlags (11-bit)                            │
 │    check_arm_torque, check_hand_current, etc.                     │
 │                                                                   │
 │  Record ─────────► HDF5 append (在 Execute 之前)                  │

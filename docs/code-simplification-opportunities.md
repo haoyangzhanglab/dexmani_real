@@ -229,12 +229,12 @@ Open-Teach 的主 teleop 脚本仅 16 行——这正是 Hydra 配置管理的�
 
 | 方面 | dexmani 优势 | Reference 对比 |
 |------|-------------|---------------|
-| **安全性** | 四层安全模型（driver/interface/controller/path）+ 10bit 质量标记 + FK desk safety | 无 Reference 有等效机制 |
+| **安全性** | 四层安全模型（driver/interface/controller/path）+ 11-bit 质量标记 + FK desk safety | 无 Reference 有等效机制 |
 | **RateLimiter** | 带超时跟踪和限流警告的完整实现 | LeFranX 使用简单 sleep，BVPro 使用 warnings.warn |
 | **error_handler** | 结构化的 hold-on-failure + last-good 回退 | ufactory 直接返回错误码 |
 | **IK 回退链** | DLS → position IK → hold 的完整回退链 | BVPro 只有 DLS，无回退 |
 | **自碰撞检测** | 每帧 check_self_collision | LeFranX/BVPro 无此功能 |
-| **数据录制品控** | 10bit QualityFlags + per-frame 元数据 | Open-Teach 只有时间戳 |
+| **数据录制品控** | 11-bit QualityFlags (含 CAMERA_OK) + per-frame 元数据 | Open-Teach 只有时间戳 |
 | **工作空间安全** | WorkspaceSafety 向量化检查 | ManiUniCon 使用 per-axis clip（更冗长） |
 | **EMA 平滑** | 极简实现（signals_utils.py:27行） | 各 Reference 实现等价 |
 

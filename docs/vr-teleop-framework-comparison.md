@@ -18,7 +18,7 @@
 | **IK 后端** | Pinocchio + MPlib | C++ 自定义 (geofik) | Pinocchio | 无自定义 IK | Pinocchio |
 | **手部重定向** | DexPilot + XHandRefAdapter | DexPilot + adaptive pinky | SeqRetargeting (server-side) | KDL IK + 角度计算 | N/A (Robotiq 二指爪) |
 | **通信协议** | 直接 Python API 调用 | TCP (VR raw + 控制) | ZMQ PUB/SUB + REQ/REP | ZMQ PUB/SUB + PUSH/PULL | Lock-Free SharedMemory (RingBuffer + Queue) |
-| **安全机制** | ★★★★★ 四层 + 10bit 质量标记 | ★★☆☆☆ 基础位置限制 | ★★☆☆☆ 速度裁剪 + 初始化降速 | ★★☆☆☆ 暂停/恢复 + 分辨率缩放 | ★★★★☆ 三层 (workspace/VR delta/validate_action) |
+| **安全机制** | ★★★★★ 四层 + 11-bit 质量标记 | ★★☆☆☆ 基础位置限制 | ★★☆☆☆ 速度裁剪 + 初始化降速 | ★★☆☆☆ 暂停/恢复 + 分辨率缩放 | ★★★★☆ 三层 (workspace/VR delta/validate_action) |
 | **数据录制** | HDF5 (episode + quality flags) | HuggingFace Dataset (LeRobot) | HDF5 + NPY | HDF5 + AVI + Pickle | NPZ → Zarr → LeRobot v3.0 |
 | **双手支持** | 右手 only | 双手 (dual config) | 双手 (native bimanual) | 双手 (bimanual_right) | 右手 only |
 | **进程模型** | 单进程 + 单线程 | 多进程 (franka_server) + 多线程 | 三机分布式 + 多线程 | 多进程 (ZMQ nodes) | 多进程 (相机/策略/机器人独立) |
@@ -45,12 +45,27 @@
 | Episode sidecar JSON | stop_episode 时自动写入 metadata 到 `episode_NNN.json` |
 | 多相机控制回路 | MultiCameraManager 集成到 TeleopController._tick() |
 | 多相机 HDF5 写入 | `/camera/<serial>/rgb` + `/camera/<serial>/depth` per-camera paths |
-|---|--------|------|--------|----------|
-| 1 | 遥操作 IK 加入可操作性评分（`kin.compute_manipulability` 已实现但未在 teleop 热点使用） | LeFranX | **P0** | IK 鲁棒性 +20%，奇点规避更平滑 |
-| 2 | VR 跟踪丢失时软减速保持（替代立即 hold） | BVPro | **P0** | 消除跟踪短暂丢失时的急停抖动 |
-| 3 | Cartesian Pose 插值（频率解耦，消除 stale reuse） | ManiUniCon | **P1** | 消除 VR 帧重读抖动，200Hz 平滑控制 |
-| 4 | ZMQ 进程分离（VR 解耦控制） | Open-Teach | **P1** | 消除 GIL 瓶颈，VR 解析可独立 60Hz |
-| 5 | VR per-step delta 旋转安全限制 + EEF 方向工作空间边界 | ManiUniCon | **P1** | 防止 VR 跟踪跳变 + wrist 极值自碰撞 |
+
+### 1.4 原 Top 5 改进 — 全部已落地 ✅ (2026-06-23 确认)
+
+> **注意**: 以下 5 项在 v1.0 中标记为"待实施"，v2.0 (Phase 1-4) 已全部实施完毕。2026-06-23 代码审查确认每项在代码中均可找到对应实现。
+
+| # | 改进项 | 来源 | 状态 | 实施位置 |
+|---|--------|------|------|---------|
+| 1 | 遥操作 IK 可操作性评分（自适应阻尼 + manipulability gate） | LeFranX | ✅ | `ik.py:385-405` (自适应阻尼), `ik.py:422-438` (manipulability gate) |
+| 2 | VR 跟踪丢失软减速保持 | BVPro | ✅ | `controller.py:307-335` `_apply_soft_deceleration()` |
+| 3 | Cartesian Pose 插值（频率解耦） | ManiUniCon | ✅ | `pose_interpolator.py` (184 行) + `pipeline.py:104-175` |
+| 4 | ZMQ 进程分离（VR 解耦控制） | Open-Teach | ✅ | `vr_publisher.py` (251 行) VRFramePublisher + VRFrameSubscriber |
+| 5 | VR per-step delta 旋转限制 + EEF 方向工作空间边界 | ManiUniCon | ✅ | `arm_mapper.py:105-118` `_clip_delta_rot()` + `workspace_safety.py:49-80` |
+
+### 1.5 下一步方向
+
+| 方向 | 说明 | 优先级 |
+|------|------|--------|
+| 触觉数据 QualityFlag | XHand 已内置触觉传感器，待加入 TACTILE_OK bit | P1 |
+| LeRobot v3.0 导出 | 打通 HuggingFace 训练生态 | P1 |
+| 双手（左手）支持 | 扩展操作空间至双手任务 | P2 |
+| 命令超时保护 | Python 进程崩溃时机器人安全 | P1 |
 
 ---
 
@@ -302,7 +317,7 @@
 │  │    estimate_frame_from_hand_points → MANO → DexPilot    │    │
 │  │    → XHandRefAdapter (pinky scaling)                    │    │
 │  │ f. Joint jump clamp              (~0.05ms) 5°/frame     │    │
-│  │ g. 10bit QualityFlags            (~0.05ms) quality gate │    │
+│  │ g. 11-bit QualityFlags (含 CAMERA_OK) (~0.05ms) quality gate │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────┐    │
@@ -324,7 +339,7 @@
 - **四层安全模型**: 驱动层 (torque/clip) → 接口层 (workspace/safety checks) → 控制器层 (jump clamp/quality flags) → 路径层 (desk FK/collision)
 - **Hold-on-failure**: 任何管道失败返回 last_good_position，不发送危险指令
 - **双 IK 策略**: DLS (确定性, <1ms) → MPlib Position IK (随机, ~10ms) → hold
-- **每帧 10bit 质量标记**: TRACKING, IK, RETARGET, JUMP, WORKSPACE, TORQUE, CURRENT, TEMP, COMM, RETARGET_VALID
+- **每帧 11-bit 质量标记**: TRACKING, IK, RETARGET, JUMP, WORKSPACE, TORQUE, CURRENT, TEMP, COMM, RETARGET_VALID
 
 ### 2.5 ManiUniCon — 多进程 + 共享内存 + 频率解耦
 
@@ -390,9 +405,8 @@
 - dexmani 使用 HTS SDK 是最完善的选择，提供类型安全的 Python API，比 LeFranX 的 regex 解析更可靠
 - 坐标帧转换已内置在 SDK 中 (`unity_left_to_flu_position/rotation`)，无需手动维护转换矩阵
 - ManiUniCon 的 R_ve 矩阵变换是简洁的硬编码方案，对单机器人部署足够但不如 HTS SDK 通用
-- **差距**: 跟踪丢失后的处理过于激进 — 连续 1s 丢失直接触发 E-Stop。BVPro 的方式（保持在最后有效指令）更平滑
-
-**建议**: 跟踪丢失时采用分级策略：<200ms hold → 200ms-1s soft deceleration → >1s E-Stop
+- ✅ 跟踪丢失分级策略已实施（Phase 1.4）: stale(0.2s) → hold → soft deceleration → lost(1.0s) → E-Stop，见 `controller.py:307-335` `_apply_soft_deceleration()`
+- ManiUniCon 的 R_ve 矩阵变换是简洁的硬编码方案，对单机器人部署足够但不如 HTS SDK 通用
 
 ### 3.2 臂部 IK
 
@@ -403,7 +417,7 @@
 | **后端** | Pinocchio (Jacobian) + MPlib | C++ 自定义 geofik | Pinocchio | libfranka / ROS / TCP | Pink + Pinocchio |
 | **碰撞检测** | ✅ self-collision + FK desk | ❌ 无 | ❌ 无 | ❌ 无 | N/A |
 | **奇异性处理** | DLS damping + position IK 回退 | 可操作性评分 (自动避免) | DLS damping (固定 λ²=1e-5) | 依赖机器人控制器 | QP solver 自然处理秩亏 (damping=1e-12) |
-| **可操作性感知** | ⚠️ `compute_manipulability()` 有实现但**未在 teleop 使用** | ✅ Yoshikawa 可操作性是评分首要项 | ❌ 无 | ❌ 无 | QP 隐式处理 |
+| **可操作性感知** | ✅ 自适应阻尼 + manipulability gate (Phase 2.1+2.6) | ✅ Yoshikawa 可操作性是评分首要项 | ❌ 无 | ❌ 无 | QP 隐式处理 |
 | **中性位姿偏好** | ❌ 无 (仅 planning 时使用) | ✅ 加权 neutral_dist | ❌ 无 | ❌ 无 | PostureTask (可选, cost=1e-3) |
 | **硬件最近偏好** | ✅ position IK 回退时使用 | ✅ 加权 current_dist (base joints 更高权重) | ❌ 无 | N/A | N/A |
 | **q7 冗余优化** | ❌ 无 (7 关节固定) | ✅ Brent 1D 优化 | ❌ 无 | N/A | N/A |
@@ -411,14 +425,14 @@
 
 **dexmani 当前位置与差距**:
 - dexmani 的 DLS + MPlib 回退在确定性方面是正确的架构选择 — 参考 BVPro 也使用纯 DLS
-- **关键差距**: `kin.compute_manipulability()` (`kinematics.py:69-74`) 已精确实现 Yoshikawa 指标，且在 `PlanningProfile.ik_score_manipulability_weight=1.0` 中有配置项，但 `TeleopIKSolver.solve_differential_ik()` **未调用它**。LeFranX 的经验表明可操作性评分对奇点规避至关重要
+- ✅ 可操作性评分已实施（Phase 2.1+2.6）: `ik.py:385-405` 自适应阻尼（基于 manipulability 线性插值）+ `ik.py:422-438` manipulability gate（低 manipulability → heavy-damping retry）。LeFranX 的经验表明可操作性评分对奇点规避至关重要
 - LeFranX 的解析 IK 是针对 Franka 7-DOF 运动学的特化解，xArm7 没有已知的解析解，所以 Brent 优化路径不可直接移植
-- ManiUniCon 的 Pink QP 多目标优化 (FrameTask + PostureTask) 提供了一种更现代的 IK 方案: QP 求解器自然处理秩亏且收敛更好，是值得关注的替代路径
+- ManiUniCon 的 Pink QP 多目标优化 (FrameTask + PostureTask) 提供了一种更现代的 IK 方案，但 dexmani 的自适应 DLS 已足够
 
-**建议**:
-1. **P0**: 在 DLS 每步迭代中检查 `compute_manipulability()`，低于阈值时增加 damping 或拒绝该解
-2. **P1**: 参考 BVPro 提供纯 DLS-only 模式（关闭 MPlib 回退）以减少延迟波动
-3. **P1**: 参考 BVPro 实现自适应迭代 — 奇点附近降低步长、增加 damping
+**建议**: 
+1. ✅ P0 已实施: `solve_differential_ik()` 自适应阻尼 + manipulability gate
+2. ✅ P1 已实施: DLS-only 模式通过 `TeleopProfile.use_position_ik=False` 配置启用
+3. ✅ P1 已实施: 自适应 damping 根据 manipulability 动态调整（min=0.001 / max=0.05）
 
 ### 3.3 手部重定向
 
@@ -480,12 +494,12 @@
 | **速度限制** | ✅ bottleneck scaling (driver) | ✅ Ruckig @ 1kHz | ✅ clip_arm_velocity | ✅ 分辨率缩放 0.6× | 插值器层 (0.25m/s, 0.5rad/s) |
 | **Joint jump 保护** | ✅ 5°/frame arm, 10°/frame hand | ❌ 无 | ✅ clip_arm_next_qpos | ❌ 无 | N/A |
 | **Retarget 质量检查** | ✅ physio range [-0.5, 2.5] rad | ❌ 无 | ❌ 无 | ❌ 无 | N/A |
-| **每帧质量标记** | ✅ 10bit QualityFlags | ❌ 无 | ❌ 无 | ❌ 无 | N/A |
+| **每帧质量标记** | ✅ 11-bit QualityFlags (含 CAMERA_OK) | ❌ 无 | ❌ 无 | ❌ 无 | N/A |
 | **Hold-on-failure** | ✅ 所有管道失败 → hold | ✅ IK 失败 → hold | ✅ 无新数据 → hold last | ✅ pause mode | validate_action 失败 → hold |
 | **E-Stop 升级** | ✅ 帧丢失持续/硬件错误 | ❌ 无 | ❌ 无 | ❌ 无 | error_state flag → 所有进程退出 |
 | **命令超时** | ⚠️ 无 (依赖 hold-on-failure) | ✅ 500ms 命令超时 | ❌ 无 | ❌ 无 | N/A |
 
-**结论**: dexmani 的安全系统是**五个框架中最全面的**，四层安全模型 + 每帧 10bit 质量标记在四个参考框架中均无等效机制。
+**结论**: dexmani 的安全系统是**五个框架中最全面的**，四层安全模型 + 每帧 11-bit 质量标记在四个参考框架中均无等效机制。
 
 **差距**:
 - LeFranX 的 500ms 命令超时 (`franka_server.cpp:358-363`) 是一个有价值的额外保护层 — 如果 Python 进程崩溃，C++ server 会在 500ms 后自动 hold
@@ -498,14 +512,14 @@
 |------|-------------|---------|-----------------|------------|------------|
 | **文件格式** | HDF5 (episode) | HuggingFace Dataset | HDF5 + NPY | HDF5 + AVI + Pickle | NPZ → Zarr → LeRobot v3.0 |
 | **观测空间** | state + action + vr_frame + quality_flags + T_base_eef | arm_joint.pos + hand_joint.pos + ee_pose | joint_states + eef_pose + raw_hand | cartesian + joint + hand_joint | arm_qpos + hand_qpos (basic) |
-| **质量元数据** | ✅ 10bit flags/frame | ❌ 无 | ❌ 无 | ❌ 无 | N/A |
+| **质量元数据** | ✅ 11-bit flags/frame | ❌ 无 | ❌ 无 | ❌ 无 | N/A |
 | **相机支持** | ✅ camera extrinsics (T_base_eef) | ✅ multi-camera | ❌ 无 (仅 robot data) | ✅ multi-camera HDF5 + AVI | multi-camera (独立 Process) |
 | **Episode 管理** | start/stop/success flag | LeRobot standard | keyboard (s/q/a/n) | directory per episode | A button toggle / B button drop |
 | **压缩** | HDF5 默认 | HuggingFace built-in | 无压缩 | gzip level 6 | blosc (Zarr) |
 | **频率** | 50Hz (同步控制频率) | 30-100Hz (可配置) | 50Hz (同步) | 30-300Hz (per-channel) | 30Hz (同步策略频率) |
 
 **dexmani 当前位置与差距**:
-- 10bit 质量标记是**独特优势**，可支持训练数据过滤（剔除低质量帧）
+- 11-bit 质量标记是**独特优势**，可支持训练数据过滤（剔除低质量帧）
 - **差距**: 不支持 LeRobot 格式 — 如果未来想与 HuggingFace 生态集成（预训练模型、社区数据集），需要格式转换层
 - ManiUniCon 的 Zarr + blosc 压缩方案在文件大小和读取速度上有优势，其多 episode 导出模式也值得借鉴
 - ManiUniCon 的 max_record_steps=5000 是一个实用的硬上限安全机制
@@ -585,7 +599,7 @@
 | **VR 质量** | ★★★★☆ (4) | = BVPro, > Open-Teach, = ManiUniCon | HTS SDK 类型安全，21 landmarks ↔ Vision Pro 25 matrices，但 Vision Pro 手指跟踪精度更高 |
 | **IK 鲁棒性** | ★★★☆☆ (3) | < LeFranX (5), < ManiUniCon (4), = BVPro (3), > Open-Teach (N/A) | DLS+回退可靠但缺少可操作性评分和 q7 优化；ManiUniCon QP 求解器自然处理秩亏 |
 | **手部重定向** | ★★★★☆ (4) | = LeFranX (4), >= BVPro (4), > Open-Teach (3), > ManiUniCon (N/A) | DexPilot + pinky 适配 = LeFranX 同款算法，远超 Robotiq 二指爪 |
-| **安全性** | ★★★★★ (5) | > 所有参考框架 | 四层安全 + 10bit 质量标记，无框架可比 |
+| **安全性** | ★★★★★ (5) | > 所有参考框架 | 四层安全 + 11-bit 质量标记，无框架可比 |
 | **数据质量** | ★★★★★ (5) | > 所有参考框架 | 唯一带有 per-frame quality flags 的框架 |
 | **延迟** | ★★★★☆ (4) | = LeFranX (4), < ManiUniCon (5), < BVPro (3 网络), > Open-Teach (N/A) | DLS 路径 7-12ms，回退时波动大；ManiUniCon 200Hz 插值更平滑 |
 | **可扩展性** | ★★★☆☆ (3) | < Open-Teach (5), < ManiUniCon (4), < BVPro (4), = LeFranX (3) | 单线程架构限制了水平扩展；ManiUniCon 多进程共享内存更优 |
@@ -623,21 +637,14 @@
 
 ### 详细实施方案
 
-#### P0-1: IK 可操作性评分
+#### P0-1: IK 可操作性评分 ✅ 已实施
 
 **参考**: LeFranX `weighted_ik.cpp:71-76`, dexmani `kinematics.py:69-74`
 
-**当前位置**: `kin.compute_manipulability()` 已实现但 `TeleopIKSolver.solve_differential_ik()` 未调用。
-
-**实施**:
-```python
-# planning/ik.py solve_differential_ik() 中，迭代循环内加入:
-manip = self.kin.compute_manipulability(current_qpos)
-if manip < profile.min_manipulability:  # 新增配置项
-    damping = profile.differential_ik_damping * 10.0  # 自适应增大 damping
-else:
-    damping = profile.differential_ik_damping
-```
+**实施位置**: 
+- `ik.py:385-405` — 自适应 damping（manipulability 线性插值: high→min_damping, low→max_damping）
+- `ik.py:422-438` — manipulability gate（低于阈值 → heavy-damping retry → 仍失败 → position IK fallback）
+- `planning/types.py:154-176` — TeleopProfile 配置（adaptive_damping, min/max_damping, manipulability_threshold, min_manipulability, singularity_damping_scale）
 - 新增 `TeleopProfile.min_manipulability` (默认 0.0001)
 - 新增 `TeleopProfile.singularity_damping_scale` (默认 10.0)
 
@@ -827,7 +834,7 @@ class CartPoseInterpolator:
 | **收敛阈值 pos** | 0.008 m | N/A (analytic exact) | 1e-3 (6D twist norm) | N/A | QP convergence |
 | **收敛阈值 rot** | 0.08 rad | N/A | (包含在 twist norm) | N/A | QP convergence |
 | **Max IK jump** | 30-60° per joint (7 joints) | N/A (position clamp only) | N/A (PID 速度限) | N/A | N/A |
-| **可操作性权重** | 0 (未使用) | `weight_manip` (configurable) | 0 | 0 | QP implicit |
+| **可操作性权重** | ✅ adaptive (min_manipulability + damping scale) | `weight_manip` (configurable) | 0 | 0 | QP implicit |
 
 ### 平滑/滤波参数
 
@@ -865,7 +872,7 @@ class CartPoseInterpolator:
 |------|-------------|---------|-----------------|------------|------------|
 | **格式** | HDF5 | HuggingFace Dataset | HDF5 + NPY | HDF5 + AVI + Pickle | NPZ → Zarr → LeRobot |
 | **频率** | 50 Hz | 30-100 Hz | 50 Hz | 30-300 Hz (per-channel) | 30 Hz |
-| **质量标记** | ✅ 10bit per frame | ❌ | ❌ | ❌ | N/A |
+| **质量标记** | ✅ 11-bit per frame | ❌ | ❌ | ❌ | N/A |
 | **相机数据** | T_base_eef extrinsics | multi-camera | ❌ (仅 robot data) | multi-camera HDF5 + AVI | multi-camera Zarr |
 | **Episode 管理** | start/stop/success flag | LeRobot built-in | keyboard s/q/a/n | directory per episode | A/B button toggle/drop |
 
@@ -1032,7 +1039,7 @@ dexmani_real/
 │   └── xarm7/ (xhand/)            ← 硬件驱动
 ├── recording/
 │   ├── episode_recorder.py        ← EpisodeRecorder: HDF5 录制
-│   ├── quality_flags.py           ← QualityFlags: 10bit 质量标记
+│   ├── quality_flags.py           ← QualityFlags: 11-bit 质量标记
 │   └── recorder_config.py         ← RecorderConfig
 ├── sensor/                        ← RealSense 相机驱动
 ├── simulation/                    ← SAPIEN 仿真

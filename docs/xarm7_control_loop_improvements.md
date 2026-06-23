@@ -322,7 +322,7 @@ xArm 还支持 Mode 7（笛卡尔在线轨迹规划），接收 6D 位姿直接�
 | 硬件位置参考 | delta 以 hw_qpos 为基准 | BVPro 同策略 | ✅ 对齐 |
 | 四元数连续化 | `continuous_quat()` 防翻转 | ManiUniCon 无 | ✅ 独有优势 |
 | C31 碰撞防护 | TCP load + sensitivity=0 | ufactory_teleop sensitivity=0 同 | ✅ 对齐 |
-| QualityFlags 10bit | 录制时标记每帧质量 | 所有参考均无 | ✅ 独有优势 |
+| QualityFlags 11-bit | 录制时标记每帧质量（含 CAMERA_OK） | 所有参考均无 | ✅ 独有优势 |
 
 ---
 

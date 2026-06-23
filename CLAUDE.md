@@ -1,10 +1,12 @@
-# dexmani_real
+# CLAUDE.md
 
-> **Python 环境**：`source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real`（`/home/zhy/anaconda3/envs/real/bin/python`）
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+> **Python 环境**: `source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real`（`/home/zhy/anaconda3/envs/real/bin/python`）
 
 ## 项目简介
 
-dexmani_real 是一个灵巧操作机器人遥操作与数据采集系统。
+dexmani_real 是一个 xArm7 + XHand 灵巧操作机器人遥操作与数据采集系统。VR 输入通过 Meta Quest HTS SDK，支持仿真（SAPIEN）和真机两种模式。
 
 ## 开发进度
 
@@ -15,33 +17,156 @@ dexmani_real 是一个灵巧操作机器人遥操作与数据采集系统。
 | Phase 2 | P1 运动质量（6 项） | ✅ |
 | Phase 3 | P2 架构增强（4+4 项） | ✅ |
 | Phase 4 | P3 工程优化（3 项） | ✅ |
-| **Phase 5** | **集成收尾 & 生产就绪（6 项）** | ✅ **2026-06-23** |
+| Phase 5 | 集成收尾 & 生产就绪（6 项） | ✅ 2026-06-23 |
 | Phase 6 | 高级特性（可选） | 📋 待排期 |
 
 ### Phase 5 实施内容（2026-06-23）
-- 5.1: CollectionLoop ↔ TeleopController 集成缝合
-- 5.2: 多相机集成到控制回路（MultiCameraManager + HDF5 per-camera paths）
-- 5.3a: auto_stop_on_quality_drop（连续低质量帧自动停止）
-- 5.3b: Episode sidecar annotation JSON（stop_episode 时写入 metadata）
-- 5.4: 仿真端到端验证（待手动运行）
-- 5.5: 真机测试脚本完善（scripts/real/ 受权限保护，跳过）
-- 5.6: 文档同步更新
+- CollectionLoop ↔ TeleopController 集成缝合
+- 多相机集成到控制回路（MultiCameraManager + HDF5 per-camera paths）
+- auto_stop_on_quality_drop（连续低质量帧自动停止）
+- Episode sidecar annotation JSON（stop_episode 时写入 metadata）
+- 仿真端到端验证（待手动运行）
+- 真机测试脚本完善（scripts/real/ 受权限保护）
 
-## 目录结构
+## 常用命令
 
-| 目录 | 说明 |
+### 仿真模式
+
+```bash
+# VR 遥操作仿真（dummy VR 数据，无需头显）
+python scripts/sim/vr_teleop_sim.py --dummy
+
+# VR 遥操作仿真（真实 Quest VR）
+python scripts/sim/vr_teleop_sim.py
+
+# 无头模式 + 指定数据目录
+python scripts/sim/vr_teleop_sim.py --dummy --headless --data-dir ./my_episodes
+
+# 键盘直接控制仿真（无 VR）
+python scripts/sim/keyboard_teleop_sim.py
+```
+
+### 真机模式
+
+```bash
+# 真机遥操作（需连接 xArm7 + XHand + Quest VR）
+python scripts/real/keyboard_teleop_real.py
+```
+
+### 运动规划测试
+
+```bash
+python scripts/sim/test_motion_planning_sim.py
+```
+
+### 代码格式化
+
+```bash
+black dexmani_real/ scripts/ --line-length 120
+isort dexmani_real/ scripts/
+```
+
+## 架构总览
+
+### 控制回路数据流
+
+```
+Meta Quest (HTS TCP, ~50Hz)
+  │ 21 hand landmarks + wrist pose
+  ▼
+QuestHandTracker (daemon thread)
+  │ get_latest() → vr_frame dict
+  ▼
+TeleopController._tick() (主线程, 50Hz)
+  │
+  ├─ 1. _read_vr_frame()          ← VR 帧 + 跟踪质量检查（四层分级）
+  ├─ 2. TeleopPipeline.compute_action()
+  │     ├─ ArmWristMapper.map()    ← reset-relative wrist→EEF delta
+  │     ├─ CartPoseInterpolator    ← 可选，频率解耦（关闭默认）
+  │     ├─ TeleopIKSolver.solve()  ← DLS primary → MPlib fallback
+  │     ├─ ema_smooth (arm only)   ← 手部平滑由 dex-retargeting 内置
+  │     ├─ XHandRetargeter.retarget() ← DexPilot + XHandRefAdapter
+  │     ├─ joint jump clamp (5°/frame arm, 10°/frame hand)
+  │     └─ 11-bit QualityFlags     ← 每帧质量标记（含 CAMERA_OK）
+  ├─ 3. safety checks              ← torque/current/temp/comm/workspace/desk-FK
+  ├─ 4. robot.send_action()        ← 伺服模式 / PID 速度模式
+  └─ 5. CollectionLoop.add_frame() ← HDF5 录制 + 质量标记
+```
+
+### 关键设计决策
+
+- **单步 DLS（非迭代）**: damping=0.02（λ²=0.0004），单次 Jacobian 伪逆。相比 BunnyVisionPro 的迭代 DLS（λ²=1e-5, 100 次迭代），牺牲 ~1-2mm 精度换取 <1ms 延迟。人手震颤（~2-3mm）主导误差，此方案合理。
+- **自适应 damping**（`adaptive_damping=True`，默认开启）: 根据 manipulability 线性调整 damping（非奇异区 min=0.001，近奇异区 max=0.05），无需额外 FK 开销（Jacobian 复用）。
+- **双 IK 策略**: DLS（确定性，<1ms）→ MPlib Position IK（随机，~10ms）→ hold。选中 hardware-closest 候选避免分支跳变。
+- **速度限制在驱动层**: `XArm7._limit_joint_step()` bottleneck scaling。IK/planning 层不裁剪速度，职责分离（参考 BunnyVisionPro 架构）。
+- **Hold-on-failure**: 任何管道失败返回 `last_good_position`，不发送危险指令。
+
+### 四层安全模型
+
+| 层 | 位置 | 检查项 |
+|----|------|--------|
+| 驱动层 | `xarm7.py`, `xhand.py` | 力矩裁剪、关节限位、step bottleneck、C31/C32 恢复 |
+| 接口层 | `interface.py`, `safety.py` | workspace bounds、力矩/电流/温度/通信状态 |
+| 控制器层 | `controller.py`, `pipeline.py` | jump clamp、VR 帧新鲜度、quality flags |
+| 路径层 | `planner.py` | FingertipDeskSafety（桌面 FK 碰撞）、自碰撞检测 |
+
+### 状态机
+
+```
+IDLE ──T/Enter──→ TELEOP ──R──→ RECORDING ──S──→ TELEOP
+  │                  │              │
+  H                  H              H
+  │                  │              │
+  ▼                  ▼              ▼
+return_to_home    EMERGENCY_STOP (ESC / timeout)
+```
+
+- **C 键（Pause/Resume）**: 暂停时冻结 EEF、暂停录制；恢复时自动 re-anchor mapper 抵消暂停期间的漂移
+- **SAVE_PROMPT 状态**: Q 退出时提示 S（保存）/ N（丢弃）当前 episode
+
+### xArm7 控制模式
+
+- **Mode 1（伺服，默认）**: `set_servo_angle_j` 直接位置指令。简单可靠。
+- **Mode 4（速度，PID 内环）**: `vc_set_joint_velocity` @ 250Hz。设置 `XArm7Config.use_servo_control=False` 启用。PID 将位置误差转为连续速度，运动更平滑。参考 BunnyVisionPro `xarm7_ability.py`。
+
+### 录制系统
+
+- **格式**: HDF5（episode_NNN.h5）+ Episode sidecar JSON（episode_NNN.json）
+- **质量标记**: 每帧 11-bit QualityFlags（TRACKING/IK/RETARGET/RETARGET_VALID/JUMP/WORKSPACE/CAMERA_OK/TORQUE/CURRENT/TEMP/COMM），支持训练时过滤低质量帧
+- **多相机**: MultiCameraManager 集成到控制回路，HDF5 per-camera paths（`/camera/<serial>/rgb` + `/camera/<serial>/depth`）
+- **生命周期**: CollectionLoop 管理 start/stop/auto_stop_on_quality_drop
+
+## 关键文件速查
+
+| 文件 | 职责 |
 |------|------|
-| `dexmani_real/` | 主 Python 包 |
-| `dexmani_real/robot/` | 硬件驱动（xarm7/xhand 子包） |
-| `dexmani_real/simulation/` | 物理仿真（SAPIEN） |
-| `dexmani_real/teleop/` | VR 遥操作（core/vr/control 子包） |
-| `dexmani_real/planning/` | 运动规划与 IK |
-| `dexmani_real/recording/` | 数据录制（HDF5）+ CollectionLoop/Config/Annotator |
-| `dexmani_real/sensor/` | 传感器驱动（RealSense + MultiCameraManager） |
-| `dexmani_real/config/` | 全局配置（CameraCalib, PipelineConfig） |
-| `dexmani_real/utils/` | 工具函数 |
-| `assets/` | 3D 模型、URDF 等静态资源 |
-| `scripts/real/` | 真机测试脚本 |
-| `scripts/sim/` | 仿真测试脚本 |
-| `configs/` | 运行时配置文件（cameras.json 等） |
-| `docs/` | 文档 |
+| `dexmani_real/teleop/core/controller.py` | TeleopController: 主循环、状态机、_tick() |
+| `dexmani_real/teleop/core/pipeline.py` | TeleopPipeline: 无状态 action 计算（实机/仿真共用）|
+| `dexmani_real/teleop/core/tracking.py` | TrackingQuality + FrameDropPolicy: 四层帧新鲜度分级 |
+| `dexmani_real/teleop/vr/vr_tracker.py` | QuestHandTracker: HTS SDK 接收（daemon 线程）|
+| `dexmani_real/teleop/vr/arm_mapper.py` | ArmWristMapper: reset-relative wrist→EEF 映射 |
+| `dexmani_real/teleop/vr/hand_retarget.py` | XHandRetargeter: DexPilot + XHandRefAdapter |
+| `dexmani_real/planning/ik.py` | TeleopIKSolver: DLS (primary) + MPlib Position IK (fallback) |
+| `dexmani_real/planning/kinematics.py` | XArm7Kinematics: FK, Jacobian, manipulability |
+| `dexmani_real/planning/planner.py` | XArm7MotionPlanner: IK, 路径规划, FingertipDeskSafety |
+| `dexmani_real/planning/types.py` | Pose, IKResult, TeleopProfile, PlanningProfile, XArm7PlannerConfig |
+| `dexmani_real/robot/xarm7/xarm7.py` | XArm7: 硬件驱动（伺服/PID 双模式，250Hz 内环）|
+| `dexmani_real/robot/interface.py` | RobotInterface: 统一机器人接口 |
+| `dexmani_real/recording/episode_recorder.py` | EpisodeRecorder: HDF5 录制生命周期 |
+| `dexmani_real/recording/collection_loop.py` | CollectionLoop: 录制状态机 + auto_stop + sidecar JSON |
+| `dexmani_real/recording/quality_flags.py` | QualityFlags: 11-bit 质量标记（含 CAMERA_OK bit 6） |
+| `dexmani_real/teleop/control/safety.py` | 安全检查函数（torque/current/temp/limits）|
+| `dexmani_real/sensor/multi_camera_manager.py` | MultiCameraManager: 多相机进程管理 |
+
+TeleopProfile 配置参数（`planning/types.py:112-188`）：所有 IK/servo/插值参数均在此 dataclass 中，支持 `FromDictMixin` 从 YAML/JSON 加载。仿真配置文件示例见 `configs/` 目录。
+
+## 参考框架与设计来源
+
+dexmani 的设计参考了五个同类框架，详细对比见 `docs/vr-teleop-framework-comparison.md`：
+
+| 框架 | 主要借鉴 |
+|------|----------|
+| BunnyVision Pro | DLS IK、250Hz PID 速度内环、clip_arm_velocity、FrameAge gate |
+| LeFranX | manipulability 评分、hardware-closest IK 候选、position IK fallback、XHandRefAdapter |
+| Open-Teach | ZMQ 进程分离（可选）、VR 订阅进程 |
+| ManiUniCon | PoseTrajectoryInterpolator（Cartesian 插值频率解耦）|

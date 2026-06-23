@@ -1262,7 +1262,7 @@ if __name__ == "__main__":
 
 **参考**: ManiUniCon Hydra 自动 YAML 往返
 
-**问题**: `PipelineConfig.to_dict()` 存在但 `from_dict()` 未实现，无法还原配置。
+**问题**: `PipelineConfig.to_dict()` 存在，`from_dict()` 已通过 `FromDictMixin`（`utils/serialization.py`）实现。配置 round-trip 已完成。
 
 **实施方案**:
 

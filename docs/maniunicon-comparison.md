@@ -18,7 +18,7 @@
 | **IK 后端** | Pinocchio + MPlib | Pinocchio | 持平 |
 | **手部重定向** | DexPilot + XHandRefAdapter | DexPilot (Quest) | dexmani |
 | **通信协议** | 直接 Python API 调用 | SharedMemoryQueue (跨进程) | ManiUniCon |
-| **安全机制** | ★★★★★ 四层 + 10bit QualityFlags | ★★★★☆ 三层: 位置/方向/ workspace 限制 | dexmani |
+| **安全机制** | ★★★★★ 四层 + 11-bit QualityFlags (含 CAMERA_OK) | ★★★★☆ 三层: 位置/方向/ workspace 限制 | dexmani |
 | **数据录制** | HDF5 (episode + quality flags) | Zarr/LeRobot v3.0 (multi-ep) | ManiUniCon |
 | **双手支持** | 右手 only | 右手 only | 持平 |
 | **插值框架** | 无 (EMA 可选, 默认关闭) | PoseTrajectoryInterpolator 200Hz | ManiUniCon |
@@ -143,10 +143,10 @@ Quest VR(30Hz)          QuestPolicy(30Hz)           IK Solver(200Hz)          Ro
 |--------|-------------|------------|----------|
 | **主 IK 算法** | Damped Least-Squares (DLS) 差分 IK | Pinocchio task-driven IK | dexmani 使用 DLS 伪逆，ManiUniCon 使用 Pinocchio 内置 IK |
 | **回退策略** | Position IK (MPlib) 两个 seed (prev_cmd / current_qpos) | 无（单策略） | dexmani 的两层回退更鲁棒 |
-| **阻尼策略** | 固定 λ²=0.0004 | 近零阻尼 1e-12 (QP 求解器) | ManiUniCon 的 QP 求解器自然处理秩亏，dexmani 固定阻尼有 ~1-2mm 偏差 |
-| **可操作性利用** | compute_manipulability() 已实现但未在 teleop 热点使用 | QP 求解器隐式处理 | 两者都未显式利用可操作性做自适应 |
+| **阻尼策略** | ✅ 自适应 (min=0.001 / max=0.05, manipulability 线性插值) | 近零阻尼 1e-12 (QP 求解器) | dexmani 自适应阻尼在非奇异区域接近 QP 精度 |
+| **可操作性利用** | ✅ 自适应阻尼 (ik.py:385-405) + manipulability gate (ik.py:422-438) | QP 求解器隐式处理 | dexmani 显式利用可操作性做自适应 |
 | **自碰撞检测** | TeleopProfile.check_self_collision + ik_mgr.has_self_collision() | 未在 IK 路径中检查 | dexmani 更安全 |
-| **Fingertip 桌面安全** | FingertipDeskSafety FK 检测 (:732-742) | 未实现 | dexmani 独有 |
+| **Fingertip 桌面安全** | FingertipDeskSafety FK 检测 (`desk_safety.py`) | 未实现 | dexmani 独有 |
 | **速度限制** | XArm7._limit_joint_step() 驱动层限制 | 插值器速度限制 (0.25 m/s, 0.5 rad/s) | 分层不同: dexmani 驱动层, ManiUniCon 规划层 |
 | **IK 失败处理** | hold 前一帧命令 + error_handler 记录 | hold (默认行为) | 类似 |
 
@@ -196,7 +196,7 @@ Quest VR(30Hz)          QuestPolicy(30Hz)           IK Solver(200Hz)          Ro
 | 对比项 | dexmani_real | ManiUniCon | 差异分析 |
 |--------|-------------|------------|----------|
 | **安全层数** | 4 层: 跟踪质量 / workspace / joint limit / 质量标记 | 3 层: position limit / orientation limit / torque limit | dexmani 更全面 |
-| **质量标记** | 10-bit QualityFlags (TRACKING_OK, IK_SUCCESS, RETARGET_OK, RETARGET_VALID, JOINT_JUMP_OK, IN_WORKSPACE, ARM_TORQUE_OK, HAND_CURRENT_OK, HAND_TEMP_OK, HAND_COMM_OK) | 无显式质量标记系统 | dexmani 独有，可过滤高质量数据 |
+| **质量标记** | 11-bit QualityFlags (含 CAMERA_OK) (TRACKING_OK, IK_SUCCESS, RETARGET_OK, RETARGET_VALID, JOINT_JUMP_OK, IN_WORKSPACE, ARM_TORQUE_OK, HAND_CURRENT_OK, HAND_TEMP_OK, HAND_COMM_OK) | 无显式质量标记系统 | dexmani 独有，可过滤高质量数据 |
 | **Workspace 检查** | EEF 位置 bounds (3,2) + IN_WORKSPACE flag | 位置 workspace + 方向 workspace (Euler) | ManiUniCon 的方向检查 dexmani 缺失 |
 | **关节限制** | check_arm_joint_limits → E-Stop, check_hand_joint_limits → 警告 | 内置 (驱动层) | dexmani 更严格 |
 | **Torque 检查** | check_arm_torque 每关节 20-50 Nm (ARM_TORQUE_OK flag) | validate_action 中统一检查 | dexmani 更细粒度 |
@@ -221,7 +221,7 @@ Quest VR(30Hz)          QuestPolicy(30Hz)           IK Solver(200Hz)          Ro
 | 对比项 | dexmani_real | ManiUniCon | 差异分析 |
 |--------|-------------|------------|----------|
 | **数据格式** | HDF5 (.h5), 单 episode | Zarr + LeRobot v3.0, 多 episode | 不同生态: dexmani 独立格式, ManiUniCon 兼容 Diffusion Policy |
-| **质量标记** | 10-bit per-frame QualityFlags | 无 per-frame 质量标记 | dexmani 可基于质量过滤训练数据 |
+| **质量标记** | 11-bit per-frame QualityFlags (含 CAMERA_OK) | 无 per-frame 质量标记 | dexmani 可基于质量过滤训练数据 |
 | **录制结构** | /obs/arm_qpos(N,7), /action/arm_qpos(N,7), /vr/..., /quality_flags, /camera/ | /data/obs, /data/action, /meta/norm_stats | dexmani 更丰富的传感器数据 |
 | **传感器覆盖** | arm_qpos/qvel/tau, eef_pos/quat, hand_qpos/current/tactile/temperature, fingertip_pos, VR landmarks, camera RGBD | arm_qpos, hand_qpos (基础) | dexmani 数据维度远高于 ManiUniCon |
 | **帧数限制** | 无上限 (可无限录制) | max_record_steps=5000 | ManiUniCon 有硬上限防磁盘耗尽 |
@@ -242,7 +242,7 @@ Quest VR(30Hz)          QuestPolicy(30Hz)           IK Solver(200Hz)          Ro
 |--------|-------------|------------|----------|
 | **配置框架** | Python @dataclass (PipelineConfig + RobotInterfaceConfig + PlanningProfile + TeleopProfile) | Hydra (YAML + OmegaConf) | Hydra 更标准化, dataclass 更类型安全 |
 | **配置源** | Python 源码 (dataclass instantiation) | YAML 文件 (configs/*.yaml) | ManiUniCon 无需修改 Python 代码 |
-| **序列化/反序列化** | to_dict() 支持, from_dict() 未实现 | 自动 YAML→object→YAML 往返 | ManiUniCon 配置可完全还原 |
+| **序列化/反序列化** | ✅ to_dict() + from_dict() (FromDictMixin) | 自动 YAML→object→YAML 往返 | ManiUniCon Hydra 可 diff, dexmani dataclass 更类型安全 |
 | **递归实例化** | 手动逐层构造 (~25 LOC) | Hydra instantiate() 递归自动 | ManiUniCon 更便捷 |
 | **配置层级** | PipelineConfig → RobotInterfaceConfig → XArm7Config/XHandConfig → CollisionConfig | default.yaml → robot/xarm6.yaml → policy/quest.yaml | 类似三层结构 |
 | **配置版本管理** | 无内置版本 | YAML 文件天然支持 git diff | ManiUniCon 可 diff 配置变更 |
@@ -264,7 +264,7 @@ Quest VR(30Hz)          QuestPolicy(30Hz)           IK Solver(200Hz)          Ro
 
 **来源**: ManiUniCon `quest_controller.py:134-158 _check_safety_limits()` + `quest_controller.py:160-190 _apply_safety_limits()`
 
-**问题描述**: dexmani 的 WorkspaceSafety (`planner.py:638-665`) 仅检查 EEF 位置 (x, y, z)。当 wrist 姿态在位置边界内但方向处于极值 (±180° roll 或极端 pitch) 时，可能导致:
+**问题描述**: dexmani 的 WorkspaceSafety (`workspace_safety.py`) 原本仅检查 EEF 位置 (x, y, z)。当 wrist 姿态在位置边界内但方向处于极值 (±180° roll 或极端 pitch) 时，可能导致:
 1. 手臂连杆自碰撞 (arm links hit each other)
 2. wrist 奇点接近 (J6-J7 对齐)
 3. 位置 workspace 无法捕获
@@ -337,7 +337,7 @@ quality.set(IN_WORKSPACE, in_workspace and ori_ok)
 ```
 
 **需修改文件**:
-- `/home/zhy/Desktop/dexmani_real/dexmani_real/planning/planner.py:638-665` (WorkspaceSafety 类)
+- `/home/zhy/Desktop/dexmani_real/dexmani_real/planning/workspace_safety.py` (WorkspaceSafety 类，已重构到独立文件)
 - `/home/zhy/Desktop/dexmani_real/dexmani_real/robot/types.py:112-151` (RobotInterfaceConfig)
 - `/home/zhy/Desktop/dexmani_real/dexmani_real/robot/interface.py:249-252` (check_workspace → 增加方向)
 - `/home/zhy/Desktop/dexmani_real/dexmani_real/teleop/core/controller.py:319-322` (_compute_action)
@@ -949,7 +949,7 @@ class TeleopProfile:
 
 **来源**: ManiUniCon Hydra 自动 YAML 往返
 
-**问题描述**: dexmani 的 PipelineConfig.to_dict() 序列化到 HDF5 /meta 但 from_dict() 未实现, 无法还原完整配置。这破坏了录制 episode 的可复现性。
+**问题描述**: dexmani 的 PipelineConfig.to_dict() 序列化到 HDF5 /meta，from_dict() 已通过 FromDictMixin 实现（`serialization.py`）。配置 round-trip 已完成。
 
 **实现指导**:
 
@@ -1022,7 +1022,7 @@ assert d == config2.to_dict()
 | **Torque 检查** | teleop/control/safety.py | 21-32 | check_arm_torque() |
 | **Joint limit 检查** | teleop/control/safety.py | 59-68 | check_arm_joint_limits() |
 | **手部 safety 检查** | teleop/control/safety.py | 35-80 | check_hand_current/temperature/comm() |
-| **10-bit QualityFlags** | recording/quality_flags.py | 1-78 | QualityFlags builder |
+| **11-bit QualityFlags (含 CAMERA_OK)** | recording/quality_flags.py | 1-78 | QualityFlags builder |
 | **动作发送** | robot/interface.py | 330-365 | send_action() to arm+hand |
 | **状态获取** | robot/interface.py | 265-328 | get_state() |
 | **Workspace 检查** | planning/planner.py | 638-665 | WorkspaceSafety.check() |
@@ -1075,7 +1075,7 @@ assert d == config2.to_dict()
 | 参数 | dexmani_real | ManiUniCon |
 |------|-------------|------------|
 | 格式 | HDF5 (.h5) | Zarr + LeRobot v3.0 |
-| 质量过滤 | 10-bit QualityFlags | 无 per-frame 标记 |
+| 质量过滤 | 11-bit QualityFlags (含 CAMERA_OK) | 无 per-frame 标记 |
 | 最大帧数 | **无限制** | max_record_steps=5000 |
 | 压缩 | gzip chunked | blosc |
 | 归一化统计 | 无 | obs_mean/std, action_mean/std 预计算 |
@@ -1105,7 +1105,7 @@ dexmani_real/
 │                                       # 73-104 PlanningProfile
 │                                       # 106-133 TeleopProfile
 ├── recording/
-│   ├── quality_flags.py                # 1-78   10-bit QualityFlags
+│   ├── quality_flags.py                # 1-78   11-bit QualityFlags (含 CAMERA_OK)
 │   └── episode_recorder.py             # 37-260 EpisodeRecorder
 │                                       # 120    add_frame()
 │                                       # 207    stop_episode()

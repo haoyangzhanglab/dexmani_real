@@ -551,9 +551,9 @@ score = joint_delta_weight × joint_cost              (关节变化代价)
 
 ### 3.4 控制层安全
 
-#### 3.4.1 10-Flag 质量标记
+#### 3.4.1 11-Flag 质量标记
 
-`QualityFlags`（`recording/quality_flags.py`）使用 10-bit 位掩码标记每帧数据质量：
+`QualityFlags`（`recording/quality_flags.py`）使用 11-bit 位掩码标记每帧数据质量（含 CAMERA_OK bit 6）：
 
 | Bit | Flag | 检查内容 | 检查位置 |
 |-----|------|---------|---------|
