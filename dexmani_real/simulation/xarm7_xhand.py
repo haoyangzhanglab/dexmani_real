@@ -122,13 +122,14 @@ class XArm7XHand:
             name = joint.get_name()
             if name in self.arm_joint_names:
                 joint.set_drive_property(
+                    # stiffness=1000, damping=120 → default PD for bare xArm7.
                     stiffness=arm_pd_gains.get("stiffness", 1000),
-                    damping=arm_pd_gains.get("damping", 100),
+                    damping=arm_pd_gains.get("damping", 120),
                     force_limit=arm_pd_gains.get("force_limit", 200),
                 )
             elif name in self.hand_joint_names:
                 joint.set_drive_property(
-                    stiffness=hand_pd_gains.get("stiffness", 1000),
+                    stiffness=hand_pd_gains.get("stiffness", 500),
                     damping=hand_pd_gains.get("damping", 100),
                     force_limit=hand_pd_gains.get("force_limit", 80),
                 )

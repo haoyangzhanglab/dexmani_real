@@ -473,8 +473,9 @@ def main() -> None:
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
             max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),
-            max_pose_error_pos_m=0.01,
+            max_pose_error_pos_m=0.05,
             max_pose_error_rot_rad=np.deg2rad(5.0),
+            differential_ik_max_pos_step_m=0.05,
         ),
     )
 

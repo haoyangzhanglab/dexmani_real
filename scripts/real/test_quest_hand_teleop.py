@@ -1,4 +1,10 @@
-"""Test real XHand teleop via Quest VR hand tracking + dex-retargeting.
+"""DEPRECATED: 请使用 vr_teleop_sim.py（仿真）或 TeleopPipeline.compute_hand_command()（真机）替代。
+
+本脚本使用内联 termios + select 键盘输入，缺乏状态机、安全检查和录制功能。
+vr_teleop_sim.py 提供等效的 VR→retarget→执行 流程（仿真模式），
+TeleopPipeline 提供可复用的 hand command 计算逻辑（真机模式）。
+
+Test real XHand teleop via Quest VR hand tracking + dex-retargeting.
 
 Hardware prerequisites:
   - XHand connected via RS485 (default /dev/ttyUSB0)

@@ -31,6 +31,19 @@ class SimRobotConfig:
             [-np.pi / 6, -np.pi / 4, 0, np.deg2rad(20), -np.pi, np.deg2rad(25), 0]
         )
     )
+    # SAPIEN PD gains for the implicit joint-level position controller.
+    # stiffness=1000, damping=100 → default SAPIEN values for bare xArm7
+    # (no payload).  Increase damping if oscillation appears under load.
+    arm_pd_gains: dict | None = field(default_factory=lambda: {
+        "stiffness": 1000,
+        "damping": 120,
+        "force_limit": 200,
+    })
+    hand_pd_gains: dict | None = field(default_factory=lambda: {
+        "stiffness": 500,
+        "damping": 100,
+        "force_limit": 80,
+    })
 
 
 class SimRobotInterface(ConnectionStateMixin):
@@ -66,6 +79,8 @@ class SimRobotInterface(ConnectionStateMixin):
                 self.scene,
                 disable_self_collision=True,
                 arm_home_qpos=self.config.arm_home_qpos.copy(),
+                arm_pd_gains=self.config.arm_pd_gains,
+                hand_pd_gains=self.config.hand_pd_gains,
             )
         except (OSError, ConnectionError, RuntimeError) as e:
             self.error_state = True

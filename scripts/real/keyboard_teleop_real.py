@@ -20,8 +20,8 @@
 安全:
     - 启动时执行 Pre-Flight 检查清单
     - 软墙 workspace 安全 (到达边界拒绝移动)
-    - solve_teleop_ik 保证分支连续性
-    - EMA 平滑抑制抖动
+    - solve_teleop_ik 纯差分模式 (use_position_ik=False) 保证分支连续性
+    - 速度平滑由 PID 内环 _clip_arm_velocity 统一负责
 """
 
 from __future__ import annotations
@@ -56,7 +56,8 @@ from scripts._test_utils import quat_multiply
 CTRL_DT = 0.02       # 50Hz
 DELTA_POS = 0.005    # 每次按键 EEF 平移量 (m)
 DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
-EMA_ALPHA = 0.7      # EMA 平滑系数 (geometric_fk 下 IK 确定性, 无随机 seed 抖动; 0.7兼顾响应速度与平滑)
+# EMA 平滑已移除 — 速度控制收敛到 PID 内环 _clip_arm_velocity 一处
+# 外环键盘脚本只负责累积 target + 安全边界，不做滤波/裁剪
 
 WORKSPACE_BOUNDS = np.array([
     [0.28, 0.72],    # x [min, max] m
@@ -278,9 +279,10 @@ def main():
         planning_profile=PlanningProfile(check_self_collision=False),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),  # tight: reject IK branch switches (keyboard EEF moves 5mm/step → ~0.5° per joint)
-            max_pose_error_pos_m=0.01,
+            use_position_ik=False,          # 关闭随机 IK 兜底 → 无分支跳变
+            max_pose_error_pos_m=0.05,      # 放宽 FK gate → diff IK 不被误杀
             max_pose_error_rot_rad=np.deg2rad(5.0),
+            differential_ik_max_pos_step_m=0.05,  # 匹配 MAX_LEAD
         ),
     )
 
@@ -348,6 +350,10 @@ def main():
     # ── 追踪安全 (Phase 1.1) — cmd-vs-actual 偏差监控 ──
     consecutive_divergence = 0
     TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
+    # ── 周期性摘要变量 ──
+    start_time = time.perf_counter()
+    prev_eef_pos = None  # type: np.ndarray | None
+    ik_method = "-"
 
     print("\n进入遥操作循环...\n")
 
@@ -467,6 +473,28 @@ def main():
             if keys.is_pressed("l"):
                 drpy[2] += DELTA_RPY
 
+            # ── 目标超前限制 + 周期性摘要（每次循环都执行）──
+            MAX_LEAD = 0.03  # 3cm — arm covers this in <0.2s @ 0.15 m/s
+            chase_pos = np.clip(target_pos, state.eef_pos - MAX_LEAD, state.eef_pos + MAX_LEAD)
+
+            if loop_count % 50 == 0:
+                elapsed = time.perf_counter() - start_time
+                lag_mm = np.linalg.norm(target_pos - state.eef_pos) * 1000
+                if prev_eef_pos is not None:
+                    vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (50 * CTRL_DT)
+                else:
+                    vel = 0.0
+                prev_eef_pos = state.eef_pos.copy()
+                print(
+                    f"[T+{elapsed:.1f}s f={loop_count}] "
+                    f"eef={np.round(state.eef_pos, 3)}m  "
+                    f"cur→{np.round(target_pos, 3)}  "
+                    f"cmd→{np.round(chase_pos, 3)}  "
+                    f"|Δ|={lag_mm:.1f}mm  v={vel:.2f}m/s  "
+                    f"ik={ik_method}  err={error_count}",
+                    flush=True,
+                )
+
             # 无输入则保持
             if np.all(dx == 0) and np.all(drpy == 0):
                 continue
@@ -494,24 +522,26 @@ def main():
                 dq = rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
                 target_quat = quat_multiply(dq, target_quat)
 
-            # ── IK ──
-            target_pose = Pose(p=target_pos, q=target_quat)
+            # ── IK ──（chase_pos 已在上方 Target Lead Governor 中计算）
+            target_pose = Pose(p=chase_pos, q=target_quat)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:
                 # hold_on_failure：原地不动，回退 target 到实际 EEF 避免累积跳变
                 target_pos = state.eef_pos.copy()
                 target_quat = state.eef_quat_wxyz.copy()
+                ik_method = "held"
                 continue
 
-            # ── EMA 平滑 + 发送 ──
-            arm_cmd = EMA_ALPHA * ik_result.qpos + (1 - EMA_ALPHA) * prev_qpos_cmd
-            prev_qpos_cmd = arm_cmd.copy()
+            ik_method = "diff"
+            # ── 发送（无 EMA 滤波 — 平滑由 PID 内环 _clip_arm_velocity 负责）──
+            prev_qpos_cmd = ik_result.qpos.copy()
+            arm_cmd = ik_result.qpos  # 直接透传
 
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
                 hand_qpos_cmd=state.hand_qpos.copy(),
-                target_eef_pos=target_pos.copy(),
+                target_eef_pos=chase_pos.copy(),
             )
 
             send_result = robot.send_action(action)
@@ -534,19 +564,7 @@ def main():
                 else:
                     consecutive_divergence = 0
 
-            # DEBUG: 每 50 帧 (1s), 使用 post-clip 值对比 pre-clip IK
-            if loop_count % 50 == 0:
-                post_clip = send_result.get("arm_cmd")
-                qpos_delta = (post_clip - state.arm_qpos) if post_clip is not None else np.zeros(7)
-                clipped = not np.allclose(arm_cmd, post_clip, atol=1e-4) if post_clip is not None else False
-                post_str = f"post={np.round(np.rad2deg(post_clip),1)}" if post_clip is not None else "post=N/A"
-                clip_tag = " CLIPPED!" if clipped else " ok"
-                print(
-                    f"  [DBG {loop_count}] cur={np.round(np.rad2deg(state.arm_qpos),1)} "
-                    f"ik={np.round(np.rad2deg(ik_result.qpos),1)} "
-                    f"{post_str}{clip_tag} "
-                    f"Δ={np.round(np.rad2deg(qpos_delta),1)} "
-                    f"eef→{np.round(target_pos,3)}")
+
             if not send_result.get("arm_ok"):
                 error_count += 1
                 if error_count > max_consecutive_errors:
@@ -555,13 +573,7 @@ def main():
                     running = False
                     break
 
-            # 状态打印 (每 100 帧)
-            if loop_count % 100 == 0:
-                eef = state.eef_pos
-                in_ws = "OK" if np.all(
-                    (WORKSPACE_BOUNDS[:, 0] <= eef) & (eef <= WORKSPACE_BOUNDS[:, 1])
-                ) else "EDGE"
-                print(f"  [{loop_count}] eef={np.round(eef, 3)}m  ws={in_ws}", flush=True)
+
 
     finally:
         keys.stop()

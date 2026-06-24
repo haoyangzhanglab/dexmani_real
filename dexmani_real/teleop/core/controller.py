@@ -71,6 +71,16 @@ class TeleopControllerConfig:
     ema_alpha_arm: float = 0.75  # Light EMA smoothing for hand tremor filtering.
     # 1.0 = no smoothing; 0.75 = ~3-frame time constant at 50Hz (~60ms lag).
     # Smoothing hand tremor (~2-3mm) without perceptible latency for dexterous teleop.
+
+    # ── Adaptive EMA (B1 — responsiveness + compliance) ──
+    # When True, ema_alpha scales with wrist velocity: higher alpha (less
+    # smoothing, faster response) during fast motions, lower alpha (more
+    # smoothing, less jitter) during fine manipulation.
+    # Replaces the fixed ema_alpha_arm with a velocity-dependent schedule.
+    adaptive_ema: bool = True
+    ema_alpha_min: float = 0.5   # Heavy smoothing for fine manipulation (< 0.05 m/s)
+    ema_alpha_max: float = 0.95  # Light smoothing for fast motions (> 0.3 m/s)
+
     dry_run: bool = False
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
@@ -179,6 +189,12 @@ class TeleopController:
         self.rate_manager = RateManager(cfg.target_hz) if cfg.use_precise_wait else None
         self.ema_alpha_arm = float(cfg.ema_alpha_arm)
 
+        # ── Adaptive EMA (B1) ──
+        self._adaptive_ema = cfg.adaptive_ema
+        self._ema_alpha_min = float(cfg.ema_alpha_min)
+        self._ema_alpha_max = float(cfg.ema_alpha_max)
+        self._prev_wrist_pos: np.ndarray | None = None  # for velocity estimation
+
         # Stream statistics
         self.vr_stats = StreamStats(name="vr_track", target_hz=120.0)
         self.camera_stats = StreamStats(name="camera", target_hz=30.0)
@@ -225,6 +241,11 @@ class TeleopController:
         self.running = False
         self._last_arm_cmd: np.ndarray | None = None
         self._last_hand_cmd: np.ndarray | None = None
+        # F2: pre-clip IK output used as EMA reference (avoids compounding
+        # velocity-limited lag into the EMA filter).  Separate from
+        # _last_arm_cmd which is post-clip and used for velocity-limited
+        # step reference and tracking safety.
+        self._last_raw_arm: np.ndarray | None = None
 
         # ── Tracking safety: command-vs-actual deviation monitoring ──
         # Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD
@@ -267,6 +288,9 @@ class TeleopController:
             retargeter,
             planner,
             ema_alpha_arm=self.ema_alpha_arm,
+            adaptive_ema=self._adaptive_ema,
+            ema_alpha_min=self._ema_alpha_min,
+            ema_alpha_max=self._ema_alpha_max,
         )
 
         # Keyboard
@@ -503,8 +527,29 @@ class TeleopController:
             else:
                 self._consecutive_divergence = 0
 
+        # H3 (fix B): PID inner thread alive monitor.
+        # The PID daemon thread can die silently from an unhandled
+        # exception (IndexError, TypeError, ValueError).  Check every
+        # 50 frames (~1 s) so the controller can escalate to E-Stop
+        # before the arm drifts on a stale velocity command.
+        if self.frame_count % 50 == 0 and not self.dry_run:
+            arm = self.robot.arm
+            if (
+                not arm.config.use_servo_control
+                and arm._arm_thread is not None
+                and not arm._arm_thread.is_alive()
+            ):
+                self._escalate_to_emergency("PID inner thread died")
+                return
+
         # 4. Compute action
         action, status = self._compute_action(vr_frame, state)
+
+        # F2: save pre-clip IK output as EMA reference for next frame.
+        # _last_raw_arm tracks the INTENDED trajectory (raw IK), while
+        # _last_arm_cmd tracks the SENT trajectory (post velocity-limit).
+        if status.get("ik_ok"):
+            self._last_raw_arm = action.arm_qpos_cmd.copy()
 
         # 4b. IK miss tracking (Phase 2.2 — rate decoupling)
         #     Increment counter on IK failure; reset on success.
@@ -529,7 +574,17 @@ class TeleopController:
         #     Bottleneck-scales the pipeline output to prevent VR jitter / IK
         #     noise from producing perceptibly jerky motion between 50 Hz ticks.
         #     Complements (not redundant with) PID _clip_arm_velocity at 250 Hz.
-        if self._use_vel_limited_smooth and self._last_arm_cmd is not None:
+        #
+        #     M3: only active in velocity (PID) mode.  In servo mode,
+        #     XArm7._limit_joint_step() already applies the same bottleneck
+        #     scaling — running both in series double-bottlenecks the same
+        #     delta, producing overly conservative motion.
+        arm_cfg = self.robot.arm.config
+        if (
+            self._use_vel_limited_smooth
+            and not arm_cfg.use_servo_control
+            and self._last_arm_cmd is not None
+        ):
             action = self._apply_velocity_limited_step(action, state)
 
         # Update EMA/motion reference AFTER velocity-limited step so the
@@ -754,7 +809,11 @@ class TeleopController:
         # Load last_good for hold-on-failure
         self._init_fallback(current_arm_qpos, current_hand_qpos)
 
-        # Delegate to shared pipeline
+        # Delegate to shared pipeline.
+        # F2: pass _last_raw_arm (pre-clip IK) as EMA reference so the
+        # filter tracks the intended trajectory, not the velocity-clipped
+        # command.  This prevents the velocity limiter's lag from compounding
+        # into the EMA filter (~20-40ms improvement during fast motions).
         action, status = self.pipeline.compute_action(
             vr_frame=vr_frame,
             current_arm_qpos=current_arm_qpos,
@@ -763,7 +822,9 @@ class TeleopController:
             prev_hand_cmd=prev_hand_cmd,
             check_workspace=self.robot.check_workspace,
             clamp_workspace_pos=self.robot.clamp_workspace_pos,
-            last_arm_cmd=self._last_arm_cmd,
+            last_arm_cmd=self._last_raw_arm
+            if self._last_raw_arm is not None
+            else self._last_arm_cmd,
         )
 
         ik_ok = status["ik_ok"]
@@ -836,13 +897,25 @@ class TeleopController:
             self._escalate_to_emergency("Keyboard ESC")
             return
 
-        # ── ESTOP guard: only QUIT accepted ──
+        # ── ESTOP guard: Q=quit, H=recover+home ──
         if self.state == ControllerState.EMERGENCY_STOP:
             if signal == ControlSignal.QUIT:
                 logger.info("=== STATE: ESTOP → EXIT ===")
                 self.running = False
+            elif signal == ControlSignal.HOME:
+                # M1: recovery path from E-Stop — clear errors and
+                # return home so the operator doesn't have to restart
+                # the entire process after a spurious E-Stop.
+                logger.info("=== STATE: ESTOP → recovery → HOME ===")
+                if not self.dry_run:
+                    self.robot.clear_error()
+                self.state = ControllerState.IDLE
+                self._do_home()
             else:
-                logger.info("ESTOP active — only Q (QUIT) accepted, got %s", signal.value)
+                logger.info(
+                    "ESTOP active — Q=quit, H=recover+home (got %s)",
+                    signal.value,
+                )
             return
 
         # ── QUIT: context-dependent ──
@@ -914,6 +987,13 @@ class TeleopController:
                 # Re-anchor mapper to compensate for drift during pause
                 if self._reset_mapper():
                     self.state = ControllerState.TELEOP
+                    # M2: reset soft-start so the first few frames after
+                    # resume are speed-limited (30%%).  Without this, the
+                    # PID has converged (vel_ramp_start=None) and resumes
+                    # at full speed, risking a snap if the operator's hand
+                    # has drifted during the pause.
+                    if not self.dry_run:
+                        self.robot.arm.reset_soft_start()
                     logger.info("=== STATE: PAUSED → TELEOP (recording=%s, mapper re-anchored) ===", self.recording)
                 else:
                     lost_msg = ""
@@ -942,6 +1022,7 @@ class TeleopController:
         logger.info("Returning to home...")
         self._last_arm_cmd = None
         self._last_hand_cmd = None
+        self._last_raw_arm = None  # F2
 
         # Stop recording if active (discard current episode)
         if self.recording:

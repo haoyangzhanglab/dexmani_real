@@ -140,6 +140,14 @@ class TeleopProfile(FromDictMixin):
     # Trade-off: 1 ms latency vs ~1-2 mm precision. Acceptable for teleop
     # where human hand tremor (~2-3 mm) dominates. For precision tasks,
     # consider an adaptive damping schedule (lower λ² in non-singular regions).
+    #
+    # L5: the FIRST line of defense against large IK steps is NOT the damping
+    # value — it's pose_error_vector()'s max_step clipping
+    # (differential_ik_max_pos_step_m / differential_ik_max_rot_step_rad),
+    # which caps the per-frame Cartesian error BEFORE it reaches the DLS
+    # solver.  Damping is the SECOND line of defense for near-singularity
+    # joints.  Together: max_step → stable IK input; damping → safe joint
+    # velocities even when manipulability is low.
     differential_ik_max_pos_step_m: float = 0.02
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
 

@@ -66,6 +66,9 @@ class TeleopPipeline:
         planner: XArm7MotionPlanner,
         *,
         ema_alpha_arm: float = 1.0,
+        adaptive_ema: bool = False,
+        ema_alpha_min: float = 0.5,
+        ema_alpha_max: float = 0.95,
         arm_jump_limit_rad: float = _ARM_JUMP_LIMIT_RAD,
         hand_jump_limit_rad: float = _HAND_JUMP_LIMIT_RAD,
     ) -> None:
@@ -73,6 +76,10 @@ class TeleopPipeline:
         self.retargeter = retargeter
         self.planner = planner
         self.ema_alpha_arm = float(ema_alpha_arm)
+        self._adaptive_ema = adaptive_ema
+        self._ema_alpha_min = float(ema_alpha_min)
+        self._ema_alpha_max = float(ema_alpha_max)
+        self._prev_wrist_pos: np.ndarray | None = None
         self.arm_jump_limit_rad = float(arm_jump_limit_rad)
         self.hand_jump_limit_rad = float(hand_jump_limit_rad)
 
@@ -244,7 +251,27 @@ class TeleopPipeline:
         target_eef_quat = np.asarray(mapped["quat_wxyz"], dtype=np.float64)
 
         # EMA smoothing (arm only) handles frame-to-frame filtering.
-        # No Cartesian interpolation needed — VR is native 50 Hz = control rate.
+        # B1: Adaptive EMA — alpha scales with wrist velocity.
+        #   Slow / fine manipulation (< 0.05 m/s) → low alpha → heavy smoothing.
+        #   Fast / gross motion (> 0.3 m/s) → high alpha → light smoothing.
+        #   This gives responsiveness during large movements and stability
+        #   during dexterous tasks, without the fixed ~60ms lag of alpha=0.75.
+        if self._adaptive_ema:
+            dt = 0.02  # nominal 50 Hz inter-frame period
+            if self._prev_wrist_pos is not None:
+                wrist_vel = (
+                    np.linalg.norm(wrist_pos - self._prev_wrist_pos) / dt
+                )
+                # Linear mapping: 0→alpha_min, 0.3 m/s→alpha_max
+                vel_ratio = min(float(wrist_vel) / 0.3, 1.0)
+                alpha = self._ema_alpha_min + (
+                    self._ema_alpha_max - self._ema_alpha_min
+                ) * vel_ratio
+            else:
+                alpha = self.ema_alpha_arm
+            self._prev_wrist_pos = wrist_pos.copy()
+        else:
+            alpha = self.ema_alpha_arm
 
         target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
         ik_result = self.planner.solve_teleop_ik(
@@ -256,7 +283,7 @@ class TeleopPipeline:
         if ik_result.success and ik_result.qpos is not None:
             ik_ok = True
             raw_arm = np.asarray(ik_result.qpos, dtype=np.float64)
-            arm_cmd = ema_smooth(raw_arm, last_arm_cmd, self.ema_alpha_arm)
+            arm_cmd = ema_smooth(raw_arm, last_arm_cmd, alpha)
         # else: hold previous command
 
         return arm_cmd, ik_ok, target_eef_pos
@@ -327,30 +354,33 @@ class TeleopPipeline:
         prev_arm_cmd: np.ndarray,
         prev_hand_cmd: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, bool]:
-        """Clamp per-step joint deltas to prevent command jumps.
+        """Clamp per-step joint deltas with bottleneck scaling (F3).
+
+        Uses the same proportional-scaling approach as _clip_arm_velocity
+        and _limit_joint_step: when any joint exceeds its limit, ALL joints
+        are scaled by the same factor to preserve the joint-space trajectory
+        shape.  The previous per-joint independent clip distorted Cartesian
+        paths during IK anomaly recovery — the bottleneck joint was clipped
+        while others moved freely, producing an unpredictable new path.
 
         Returns:
             (arm_cmd, hand_cmd, jump_ok).
         """
         jump_ok = True
         if prev_arm_cmd is not None:
-            arm_delta = np.max(np.abs(arm_cmd - prev_arm_cmd))
-            if arm_delta > self.arm_jump_limit_rad:
+            delta = arm_cmd - prev_arm_cmd
+            normalized = np.abs(delta) / self.arm_jump_limit_rad
+            max_ratio = np.max(normalized)
+            if max_ratio > 1.0:
                 jump_ok = False
-                arm_cmd = prev_arm_cmd + np.clip(
-                    arm_cmd - prev_arm_cmd,
-                    -self.arm_jump_limit_rad,
-                    self.arm_jump_limit_rad,
-                )
+                arm_cmd = prev_arm_cmd + delta / max_ratio
         if prev_hand_cmd is not None:
-            hand_delta = np.max(np.abs(hand_cmd - prev_hand_cmd))
-            if hand_delta > self.hand_jump_limit_rad:
+            delta = hand_cmd - prev_hand_cmd
+            normalized = np.abs(delta) / self.hand_jump_limit_rad
+            max_ratio = np.max(normalized)
+            if max_ratio > 1.0:
                 jump_ok = False
-                hand_cmd = prev_hand_cmd + np.clip(
-                    hand_cmd - prev_hand_cmd,
-                    -self.hand_jump_limit_rad,
-                    self.hand_jump_limit_rad,
-                )
+                hand_cmd = prev_hand_cmd + delta / max_ratio
         return arm_cmd, hand_cmd, jump_ok
 
     # ------------------------------------------------------------------
