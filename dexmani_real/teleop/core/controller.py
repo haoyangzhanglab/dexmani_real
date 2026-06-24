@@ -272,6 +272,9 @@ class TeleopController:
         # Keyboard
         self.keyboard = KeyboardHandler(keyboard_queue) if keyboard_queue is not None else None
 
+        # ── Idle quit double-tap confirmation (Opt 2) ──
+        self._idle_quit_pending_ts: float | None = None
+
         # Status
         self.frame_count: int = 0
         self.ik_success_count: int = 0
@@ -824,6 +827,10 @@ class TeleopController:
             self._transition(sig)
 
     def _transition(self, signal: ControlSignal) -> None:
+        # Reset idle quit pending on any non-QUIT signal (Opt 2)
+        if signal != ControlSignal.QUIT:
+            self._idle_quit_pending_ts = None
+
         # ── EMERGENCY_STOP: any state ──
         if signal == ControlSignal.EMERGENCY_STOP:
             self._escalate_to_emergency("Keyboard ESC")
@@ -832,28 +839,36 @@ class TeleopController:
         # ── ESTOP guard: only QUIT accepted ──
         if self.state == ControllerState.EMERGENCY_STOP:
             if signal == ControlSignal.QUIT:
-                logger.info("ESTOP → exit")
+                logger.info("=== STATE: ESTOP → EXIT ===")
                 self.running = False
+            else:
+                logger.info("ESTOP active — only Q (QUIT) accepted, got %s", signal.value)
             return
 
         # ── QUIT: context-dependent ──
         if signal == ControlSignal.QUIT:
             if self.state == ControllerState.IDLE:
-                logger.info("QUIT — shutting down.")
-                self.running = False
+                now = time.perf_counter()
+                if self._idle_quit_pending_ts is not None and (now - self._idle_quit_pending_ts) < 2.0:
+                    logger.info("=== STATE: IDLE → EXIT (double-tap confirmed) ===")
+                    self.running = False
+                else:
+                    self._idle_quit_pending_ts = now
+                    logger.info("QUIT pending — press Q again within 2s to confirm exit (any other key cancels)")
             elif self.state == ControllerState.SAVE_PROMPT:
                 # Discard episode → IDLE
                 self._discard_episode()
                 self.state = ControllerState.IDLE
-                logger.info("SAVE_PROMPT → IDLE (discarded)")
+                logger.info("=== STATE: SAVE_PROMPT → IDLE (discarded) ===")
             else:
                 # TELEOP / PAUSED → stop recording → SAVE_PROMPT
+                old_state = self.state.value
                 self._stop_recording()
                 self.state = ControllerState.SAVE_PROMPT
-                logger.info("Recording stopped → SAVE_PROMPT")
+                logger.info("=== STATE: %s → SAVE_PROMPT ===", old_state)
             return
 
-        # ── BEGIN (B): IDLE → TELEOP + recording ──
+        # ── BEGIN (B): IDLE → TELEOP + recording; SAVE_PROMPT → save+new episode ──
         if signal == ControlSignal.BEGIN:
             if self.state == ControllerState.IDLE:
                 self._reset_mapper()
@@ -862,9 +877,17 @@ class TeleopController:
                 self._start_recording()
                 self.state = ControllerState.TELEOP
                 self.recording = True
-                logger.info("IDLE → TELEOP (recording started)")
+                logger.info("=== STATE: IDLE → TELEOP (recording started) ===")
             elif self.state == ControllerState.SAVE_PROMPT:
-                logger.info("BEGIN ignored: in SAVE_PROMPT (press S to save, Q to discard)")
+                # Save current episode + start new episode directly (skip IDLE roundtrip)
+                # Episode is already persisted by _stop_recording() — just start fresh.
+                self._reset_mapper()
+                if not self.dry_run:
+                    self.robot.reset_soft_start()
+                self._start_recording()
+                self.state = ControllerState.TELEOP
+                self.recording = True
+                logger.info("=== STATE: SAVE_PROMPT → TELEOP (saved + new episode) ===")
             return
 
         # ── STOP (S): context-dependent ──
@@ -873,35 +896,45 @@ class TeleopController:
                 # Confirm save
                 self.state = ControllerState.IDLE
                 self.recording = False
-                logger.info("SAVE_PROMPT → IDLE (saved)")
+                logger.info("=== STATE: SAVE_PROMPT → IDLE (saved) ===")
             elif self.state in (ControllerState.TELEOP, ControllerState.PAUSED):
                 # Stop recording → SAVE_PROMPT
+                old_state = self.state.value
                 self._stop_recording()
                 self.state = ControllerState.SAVE_PROMPT
-                logger.info("Recording stopped → SAVE_PROMPT")
+                logger.info("=== STATE: %s → SAVE_PROMPT ===", old_state)
             return
 
         # ── PAUSE (C): TELEOP ⇄ PAUSED ──
         if signal == ControlSignal.PAUSE:
             if self.state == ControllerState.TELEOP:
                 self.state = ControllerState.PAUSED
-                logger.info("TELEOP → PAUSED (recording=%s)", self.recording)
+                logger.info("=== STATE: TELEOP → PAUSED (recording=%s) ===", self.recording)
             elif self.state == ControllerState.PAUSED:
                 # Re-anchor mapper to compensate for drift during pause
                 if self._reset_mapper():
                     self.state = ControllerState.TELEOP
-                    logger.info("PAUSED → TELEOP (recording=%s, mapper re-anchored)", self.recording)
+                    logger.info("=== STATE: PAUSED → TELEOP (recording=%s, mapper re-anchored) ===", self.recording)
                 else:
-                    logger.warning("Cannot resume: no VR frame for mapper re-anchor")
+                    lost_msg = ""
+                    if self._vr_lost_since is not None:
+                        lost_dur = time.perf_counter() - self._vr_lost_since
+                        lost_msg = f" (VR lost for {lost_dur:.1f}s)"
+                    logger.warning(
+                        "Cannot resume: no VR frame for mapper re-anchor.%s "
+                        "Check headset connection / HTS SDK. Use H to return home, Q to stop.",
+                        lost_msg,
+                    )
             elif self.state == ControllerState.SAVE_PROMPT:
-                logger.info("PAUSE ignored: in SAVE_PROMPT (press S to save, Q to discard)")
+                logger.info("PAUSE ignored: in SAVE_PROMPT (press S to save, Q to discard, B to save+continue)")
             return
 
         # ── HOME (H): any non-ESTOP / non-SAVE_PROMPT state ──
         if signal == ControlSignal.HOME:
             if self.state == ControllerState.SAVE_PROMPT:
-                logger.info("HOME ignored: in SAVE_PROMPT (press S to save, Q to discard)")
+                logger.info("HOME ignored: in SAVE_PROMPT (press S to save, Q to discard, B to save+continue)")
             elif self.state != ControllerState.EMERGENCY_STOP:
+                logger.info("=== STATE: %s → HOME ===", self.state.value)
                 self._do_home()
             return
 
@@ -945,7 +978,7 @@ class TeleopController:
         if self.rate_manager is not None:
             self.rate_manager.reset()
 
-        logger.info("Home complete.")
+        logger.info("=== STATE: HOME → IDLE ===")
 
     def _reset_mapper(self) -> bool:
         """Re-anchor VR reference from current VR frame + robot state.
@@ -1046,7 +1079,7 @@ class TeleopController:
             self._collection_loop.discard_episode()
 
     def _escalate_to_emergency(self, reason: str) -> None:
-        logger.error("EMERGENCY_STOP: %s", reason)
+        logger.error("=== STATE: → EMERGENCY_STOP: %s ===", reason)
         self.state = ControllerState.EMERGENCY_STOP
         if not self.dry_run:
             self.robot.emergency_stop()
@@ -1171,12 +1204,21 @@ class TeleopController:
         rec = "REC" if self.recording else "   "
         vr_mean_age = self.vr_stats.mean_age_s * 1000
         cam_mean_age = self.camera_stats.mean_age_s * 1000
+        # Episode elapsed time + actual fps
+        ep_elapsed = ""
+        actual_fps = ""
+        if self.recording and self._episode_start_time is not None:
+            ep_dur = now - self._episode_start_time
+            ep_elapsed = f"ep_t={ep_dur:.1f}s "
+            actual_fps = f"fps={self.frame_count / max(ep_dur, 0.001):.1f} "
         logger.info(
-            "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms "
+            "[t=%.1f] frames=%s %s%sstate=%s %s vr_seq=%s age=%sms "
             "vr_ema=%.0fms cam_ema=%.0fms "
             "ik=%s/%s retarget=%s/%s",
             now,
             self.frame_count,
+            ep_elapsed,
+            actual_fps,
             self.state.value,
             rec,
             seq,

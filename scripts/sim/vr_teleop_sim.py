@@ -26,26 +26,29 @@
 
 键位:
     B   - Begin:  开始遥操作 + 录制（重置 mapper，开始 episode）
+                  SAVE_PROMPT 下：保存当前 episode + 立即开始新 episode
     C   - Pause:  暂停/恢复遥操作。暂停时冻结 EEF，
                   恢复时自动重新标定 mapper（抵消暂停期间的漂移）。
-    H   - Home:   规划路径回 home
-    S   - Stop:   停止录制 → 提示保存/丢弃；SAVE_PROMPT 下保存
-    Q   - Quit:   结束遥操作 → 提示保存/丢弃；SAVE_PROMPT 下丢弃；IDLE 下退出
+    H   - Home:   规划路径回 home → IDLE（停止录制并丢弃）
+    S   - Stop:   停止录制 → 提示保存/丢弃；SAVE_PROMPT 下确认保存
+    Q   - Quit:   结束遥操作 → 提示保存/丢弃；SAVE_PROMPT 下丢弃；
+                  IDLE 下需双击确认退出（2 秒内）
     ESC - 紧急停止（仅 Q 可退出）
 
 状态机:
     IDLE ──B──→ TELEOP_RECORDING  (start_episode, reset_mapper)
-    TELEOP_RECORDING ──H──→ return_home (保持在 TELEOP_RECORDING)
+    TELEOP_RECORDING ──H──→ return_home → IDLE
     TELEOP_RECORDING ──C──→ PAUSED (冻结 EEF)
     PAUSED ──C──→ TELEOP_RECORDING (自动 re-anchor mapper，恢复录制)
-    PAUSED ──H──→ return_home (保持在 PAUSED)
+    PAUSED ──H──→ return_home → IDLE
     TELEOP_RECORDING ──S──→ SAVE_PROMPT (stop_episode)
     TELEOP_RECORDING ──Q──→ SAVE_PROMPT (stop_episode)
     PAUSED ──S──→ SAVE_PROMPT (stop_episode)
     PAUSED ──Q──→ SAVE_PROMPT (stop_episode)
     SAVE_PROMPT ──S──→ IDLE (save episode to disk)
     SAVE_PROMPT ──Q──→ IDLE (discard episode)
-    IDLE ──Q──→ exit
+    SAVE_PROMPT ──B──→ TELEOP_RECORDING (save + new episode，跳过 IDLE)
+    IDLE ──Q──→ 双击确认退出（2 秒内再按确认，其他按键取消）
     ESC (any) ──→ ESTOP (仅 Q 可退出)
 
 Phase 7 新增特性:
@@ -563,6 +566,8 @@ def main() -> None:
     lost_since_ns: int | None = None
     # 追踪安全（Phase 1.1）
     consecutive_divergence = 0
+    # Idle quit double-tap confirmation (Opt 2)
+    idle_quit_pending_ts = 0.0
 
     print("=" * 60)
     print("VR Teleop — xArm7+XHand SAPIEN 仿真 + 数据录制")
@@ -594,10 +599,15 @@ def main() -> None:
 
                 # ── 键盘状态机（6 键统一方案：B/C/S/H/Q/ESC）──
                 for sig in kb.poll(timeout=0.0):
+                    # Reset idle quit pending on any non-QUIT signal (Opt 2)
+                    if sig != ControlSignal.QUIT:
+                        idle_quit_pending_ts = 0.0
+
                     # ── ESC: 紧急停止（任何状态）──
                     if sig == ControlSignal.EMERGENCY_STOP:
                         if state != "ESTOP":
-                            print("\n[ESC] Emergency stop — 冻结运动，仅 Q 可退出")
+                            print("\n=== STATE: → EMERGENCY_STOP ===")
+                            print("[ESC] Emergency stop — 冻结运动，仅 Q 可退出")
                             if collection.is_recording:
                                 collection.stop_episode(
                                     success=False, reason="emergency_stop",
@@ -609,7 +619,10 @@ def main() -> None:
                     # ── ESTOP guard: 仅 Q 可退出 ──
                     if state == "ESTOP":
                         if sig == ControlSignal.QUIT:
+                            print("=== STATE: ESTOP → EXIT ===")
                             raise KeyboardInterrupt
+                        else:
+                            print(f"[ESTOP] 仅 Q 可退出，忽略: {sig.value}")
                         continue
 
                     # ── Q: 上下文重载（停止录制 / 丢弃 / 退出）──
@@ -632,20 +645,29 @@ def main() -> None:
                                 ik_success_rate=round(ik_rate, 4),
                                 vr_drop_rate=round(vr_drop, 4),
                             )
+                            old_state = state
                             state = "SAVE_PROMPT"
                             last_episode_path = path
-                            print(f"\n[Recorder] 录制已停止 ({collection.frame_count} 帧)")
+                            print(f"\n=== STATE: {old_state} → SAVE_PROMPT ===")
+                            print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
                             print(f"  classification={classification} ik_rate={ik_rate:.2%} vr_drop={vr_drop:.2%}")
-                            print("  S: 保存 episode  |  Q: 丢弃  |  H/C/B: 无效（请先处理 episode）")
+                            print("  S: 保存 episode  |  Q: 丢弃  |  B: 保存+新episode")
                         elif state == "SAVE_PROMPT":
                             # 丢弃并返回 IDLE
                             collection.discard_episode()
                             last_episode_path = None
                             state = "IDLE"
+                            print("=== STATE: SAVE_PROMPT → IDLE (discarded) ===")
                             print("[State] IDLE — episode 已丢弃，按 B 开始新的遥操作")
                         else:
-                            # IDLE: 直接退出
-                            raise KeyboardInterrupt
+                            # IDLE: double-tap Q to confirm exit (Opt 2)
+                            now = time.perf_counter()
+                            if idle_quit_pending_ts > 0 and (now - idle_quit_pending_ts) < 2.0:
+                                print("\n=== STATE: IDLE → EXIT (double-tap confirmed) ===")
+                                raise KeyboardInterrupt
+                            else:
+                                idle_quit_pending_ts = now
+                                print("[QUIT] 再按一次 Q 确认退出（2 秒内有效，其他按键取消）")
 
                     # ── B: Begin — 开始遥操作 + 录制（合并原 T+R）──
                     if sig == ControlSignal.BEGIN:
@@ -676,19 +698,54 @@ def main() -> None:
                                 consecutive_divergence = 0
                                 lost_since_ns = None
                                 print(
+                                    f"\n=== STATE: IDLE → TELEOP_RECORDING ==="
                                     f"\n[State] TELEOP_RECORDING  episode=#{episode_idx}"
                                     f"  EEF={np.round(sim_state['eef_pos'], 3)}"
                                 )
                             else:
                                 print("[State] 无法获取 VR 帧，请确保 tracker 已连接")
                         elif state == "SAVE_PROMPT":
-                            print("[State] 请先按 S 保存或 Q 丢弃当前 episode")
+                            # Save + start new episode — skip IDLE roundtrip (Opt 1)
+                            frame = tracker.get_latest()
+                            sim_state = sim.get_state()
+                            if frame is not None:
+                                arm_mapper.reset(
+                                    wrist_pos=frame["wrist_pos"],
+                                    wrist_quat_wxyz=frame["wrist_quat_wxyz"],
+                                    eef_pos=sim_state["eef_pos"],
+                                    eef_quat_wxyz=sim_state["eef_quat_wxyz"],
+                                )
+                                episode_idx += 1
+                                collection.start_episode(
+                                    task_label="teleop", operator="",
+                                    camera_K=camera_K,
+                                )
+                                state = "TELEOP_RECORDING"
+                                ik_fail_total = 0
+                                ik_fail_consecutive = 0
+                                retarget_fail_total = 0
+                                retarget_fail_consecutive = 0
+                                stale_frame_count = 0
+                                episode_tick_count = 0
+                                consecutive_divergence = 0
+                                lost_since_ns = None
+                                print(
+                                    f"\n=== STATE: SAVE_PROMPT → TELEOP_RECORDING (saved + new episode) ==="
+                                    f"\n[State] TELEOP_RECORDING  episode=#{episode_idx}"
+                                    f"  EEF={np.round(sim_state['eef_pos'], 3)}"
+                                )
+                            else:
+                                print("[State] 无法获取 VR 帧，请确保 tracker 已连接")
 
-                    # ── H: Home — 规划路径回 home（保持当前状态）──
+                    # ── H: Home — 规划路径回 home → IDLE（对齐 controller.py）──
                     if sig == ControlSignal.HOME:
                         if state in ("TELEOP_RECORDING", "PAUSED"):
-                            state_before = state
-                            print("\n[Home] 规划回 home...")
+                            print(f"\n=== STATE: {state} → HOME ===")
+                            print("[Home] 规划回 home...")
+                            # Stop recording if active (discard for home)
+                            if collection.is_recording:
+                                collection.stop_episode(success=False, reason="home",
+                                                        classification="failure")
                             execute_return_home(sim, planner, home_eef, viewer)
                             prev_arm_cmd = sim.get_full_qpos()[:7].copy()
                             prev_hand_cmd = sim.get_full_qpos()[7:].copy()
@@ -696,25 +753,29 @@ def main() -> None:
                             ik_fail_consecutive = 0
                             retarget_fail_total = 0
                             retarget_fail_consecutive = 0
+                            stale_frame_count = 0
+                            episode_tick_count = 0
                             consecutive_divergence = 0
                             lost_since_ns = None
-                            if state_before == "PAUSED":
-                                print("[Home] 已回 home，仍在暂停中（按 C 恢复）")
-                            else:
-                                print("[Home] 已回 home，继续遥操作 + 录制")
+                            state = "IDLE"
+                            print("=== STATE: HOME → IDLE ===")
+                            print("[State] IDLE — 按 B 开始新的遥操作")
                         elif state == "IDLE":
-                            print("\n[Home] 规划回 home...")
+                            print("\n=== STATE: IDLE → HOME ===")
+                            print("[Home] 规划回 home...")
                             execute_return_home(sim, planner, home_eef, viewer)
                             prev_arm_cmd = sim.get_full_qpos()[:7].copy()
                             prev_hand_cmd = sim.get_full_qpos()[7:].copy()
+                            print("=== STATE: HOME → IDLE ===")
                         elif state == "SAVE_PROMPT":
-                            print("[Home] 请先按 S 保存或 Q 丢弃当前 episode")
+                            print("[Home] 请先按 S 保存、Q 丢弃或 B 保存+新 episode")
 
                     # ── C: Pause / Resume — 冻结/恢复遥操作 ──
                     if sig == ControlSignal.PAUSE:
                         if state == "TELEOP_RECORDING":
                             state = "PAUSED"
                             print(
+                                f"\n=== STATE: TELEOP_RECORDING → PAUSED ==="
                                 f"\n[Pause] 遥操作已暂停  |  EEF 冻结  |  "
                                 f"录制暂停 ({collection.frame_count} 帧)"
                                 f"\n        按 C 恢复，按 H 回 home，按 Q 退出"
@@ -739,13 +800,19 @@ def main() -> None:
                                 consecutive_divergence = 0
                                 lost_since_ns = None
                                 print(
+                                    f"\n=== STATE: PAUSED → TELEOP_RECORDING ==="
                                     f"\n[Resume] 遥操作已恢复  |  Mapper 已重新锚定  |  "
                                     f"EEF={np.round(sim_state['eef_pos'], 3)}"
                                 )
                             else:
-                                print("[Resume] 无法获取 VR 帧，恢复失败")
+                                lost_msg = ""
+                                if lost_since_ns is not None:
+                                    lost_dur = (time.perf_counter_ns() - lost_since_ns) * 1e-9
+                                    lost_msg = f" (VR 丢失 {lost_dur:.1f}s)"
+                                print(f"[Resume] 无法获取 VR 帧，恢复失败{lost_msg}")
+                                print("         检查头显连接 / HTS SDK。按 H 回 home，Q 停止。")
                         elif state == "SAVE_PROMPT":
-                            print("[Pause] 请先按 S 保存或 Q 丢弃当前 episode")
+                            print("[Pause] 请先按 S 保存、Q 丢弃或 B 保存+新 episode")
 
                     # ── S: Stop — 停止录制 → SAVE_PROMPT；SAVE_PROMPT 下保存 → IDLE ──
                     if sig == ControlSignal.STOP:
@@ -757,6 +824,7 @@ def main() -> None:
                                 print("[Save] Episode saved (no path returned)")
                             last_episode_path = None
                             state = "IDLE"
+                            print("=== STATE: SAVE_PROMPT → IDLE (saved) ===")
                             print("[State] IDLE — 按 B 开始新的遥操作")
                         elif state in ("TELEOP_RECORDING", "PAUSED"):
                             # 停止录制 → SAVE_PROMPT
@@ -775,11 +843,13 @@ def main() -> None:
                                 ik_success_rate=round(ik_rate, 4),
                                 vr_drop_rate=round(vr_drop, 4),
                             )
+                            old_state = state
                             state = "SAVE_PROMPT"
                             last_episode_path = path
-                            print(f"\n[Recorder] 录制已停止 ({collection.frame_count} 帧)")
+                            print(f"\n=== STATE: {old_state} → SAVE_PROMPT ===")
+                            print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
                             print(f"  classification={classification}")
-                            print("  S: 保存 episode  |  Q: 丢弃")
+                            print("  S: 保存 episode  |  Q: 丢弃  |  B: 保存+新episode")
 
                 # ═══════════════════════════════════════════════════════════
                 # TELEOP_RECORDING 控制 tick
@@ -978,9 +1048,14 @@ def main() -> None:
                     sim_state = sim.get_state()
                     if state == "TELEOP_RECORDING":
                         rec_frames = collection.frame_count
+                        ep_elapsed = now - tick_start + episode_tick_count * CTRL_DT  # approximate
+                        # Use actual episode duration based on tick count
+                        ep_dur = episode_tick_count * CTRL_DT
+                        actual_fps = episode_tick_count / max(ep_dur, 0.001)
                         status = (
                             f"[REC] EEF={np.round(sim_state['eef_pos'], 3)}"
                             f"  frames={rec_frames}  tick={episode_tick_count}"
+                            f"  ep_t={ep_dur:.1f}s  fps={actual_fps:.1f}"
                         )
                         if ik_fail_consecutive > 0:
                             status += f"  IK_fail(consec)={ik_fail_consecutive}"
@@ -991,15 +1066,28 @@ def main() -> None:
                             status += f"  stale={stale_frame_count} (lost={lost_s:.1f}s)"
                     elif state == "PAUSED":
                         rec_frames = collection.frame_count
+                        ep_dur = episode_tick_count * CTRL_DT
+                        # VR health info
+                        frame = tracker.get_latest()
+                        vr_status = ""
+                        if frame is None:
+                            if lost_since_ns is not None:
+                                lost_dur = (time.perf_counter_ns() - lost_since_ns) * 1e-9
+                                vr_status = f"  VR丢失={lost_dur:.1f}s"
+                            else:
+                                vr_status = "  VR: 无信号"
+                        else:
+                            vr_status = "  VR: OK"
                         status = (
                             f"[PAUSED] EEF={np.round(sim_state['eef_pos'], 3)}"
-                            f"  frames={rec_frames}"
+                            f"  frames={rec_frames}  ep_t={ep_dur:.1f}s"
+                            f"{vr_status}"
                             f"  |  C: 恢复  H: 回 home  Q: 退出"
                         )
                     elif state == "ESTOP":
                         status = "[ESTOP] 紧急停止 — 仅 Q 可退出"
                     elif state == "SAVE_PROMPT":
-                        status = "[SAVE_PROMPT] S: 保存  |  Q: 丢弃"
+                        status = "[SAVE_PROMPT] S: 保存  |  Q: 丢弃  |  B: 保存+新episode"
                     else:
                         status = f"[IDLE] EEF={np.round(sim_state['eef_pos'], 3)}"
                     print(status)
