@@ -100,6 +100,13 @@ class PIDController:
     Integral term (Ki) is disabled by default to prevent windup in
     teleoperation where the target is continuously changing.
 
+    **Anti-windup**: when ``max_vel`` is provided to ``control()``, the
+    integral accumulator ``_cum_err`` is clamped per-joint so that the
+    total I contribution never exceeds the velocity limit.  Without this
+    a sustained small error with non-zero Ki would cause unbounded
+    integral growth, leading to severe overshoot when the error changes
+    sign.  The clamp is conservative: ``|Ki * cum_err| <= max_vel``.
+
     ref: BunnyVisionPro xarm7_ability.py:11-36
     """
 
@@ -122,18 +129,22 @@ class PIDController:
         )
         self._prev_err: np.ndarray | None = None
         self._cum_err: np.ndarray = np.zeros_like(self.kp)
+        self._ki_nonzero = np.any(self.ki != 0.0)  # fast-path gate
 
     def reset(self) -> None:
         """Clear error history (call on mode switch or arm reset)."""
         self._prev_err = None
         self._cum_err = np.zeros_like(self.kp)
 
-    def control(self, err: np.ndarray, dt: float) -> np.ndarray:
+    def control(self, err: np.ndarray, dt: float, max_vel: np.ndarray | None = None) -> np.ndarray:
         """Compute velocity command from position error.
 
         Args:
             err: Joint position error (target - current), shape (7,).
             dt: Time step in seconds (inner loop period).
+            max_vel: Per-joint velocity limit for anti-windup clamping.
+                     When None (or Ki=0), integral accumulation is
+                     unconditional (backward-compatible default).
 
         Returns:
             Joint velocity command, shape (7,).
@@ -141,6 +152,20 @@ class PIDController:
         err = np.asarray(err, dtype=np.float64)
         if self._prev_err is None:
             self._prev_err = err.copy()
+
+        # Integral accumulation with anti-windup clamping when Ki is active.
+        if self._ki_nonzero:
+            self._cum_err += dt * err
+            if max_vel is not None:
+                # Clamp each joint's integral term so |Ki * cum_err| <= max_vel.
+                # This prevents integral windup when the velocity output is
+                # saturated — the integral won't continue to grow beyond what
+                # the velocity limit can express.
+                i_contrib = self.ki * self._cum_err
+                i_max = np.abs(max_vel)
+                i_clipped = np.clip(i_contrib, -i_max, i_max)
+                # Back-calculate the clamped cum_err (safe because ki != 0)
+                self._cum_err = np.where(self.ki != 0, i_clipped / self.ki, self._cum_err)
 
         # P + D + I
         value = (
@@ -150,7 +175,6 @@ class PIDController:
         )
 
         self._prev_err = err.copy()
-        self._cum_err += dt * err
 
         return value
 
@@ -714,7 +738,7 @@ class XArm7(ConnectionStateMixin):
                         self.config.pid_convergence_threshold_rad,
                     )
 
-            qvel = self._arm_pid.control(error, dt)
+            qvel = self._arm_pid.control(error, dt, max_vel=self.config.pid_max_vel)
             safe_qvel = self._clip_arm_velocity(qvel)
 
             # Send velocity command to hardware

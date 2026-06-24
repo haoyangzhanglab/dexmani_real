@@ -216,12 +216,22 @@ class TeleopPipeline:
         Returns:
             (arm_cmd, ik_ok, target_eef_pos).
         """
-        wrist_pos = vr_frame["wrist_pos"]
-        wrist_quat_wxyz = vr_frame["wrist_quat_wxyz"]
+        wrist_pos = np.asarray(vr_frame["wrist_pos"], dtype=np.float64)
+        wrist_quat_wxyz = np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)
 
         arm_cmd = prev_arm_cmd.copy()
         ik_ok = False
         target_eef_pos: np.ndarray | None = None
+
+        # NaN/Inf guard: a VR tracking glitch producing degenerate wrist pose
+        # would propagate through IK → NaN joint command → crash or dangerous
+        # motion.  Hold position and log once per burst.
+        if not np.all(np.isfinite(wrist_pos)) or not np.all(np.isfinite(wrist_quat_wxyz)):
+            if not getattr(self, "_nan_warned_wrist", False):
+                logger.warning("VR wrist pose contains NaN/Inf — holding position")
+                self._nan_warned_wrist = True
+            return arm_cmd, ik_ok, target_eef_pos
+        self._nan_warned_wrist = False
 
         if not self.arm_mapper.is_ready():
             return arm_cmd, ik_ok, target_eef_pos
@@ -281,6 +291,16 @@ class TeleopPipeline:
         if landmarks is None or landmarks.shape != (21, 3):
             return hand_cmd, retarget_ok
 
+        # NaN/Inf guard: degenerate landmarks (e.g. from VR tracking glitch)
+        # produce NaN wrist_rot from SVD, which crashes the retargeter optimizer
+        # or produces NaN joint commands.  Hold position and log once per burst.
+        if not np.all(np.isfinite(landmarks)):
+            if not getattr(self, "_nan_warned_landmarks", False):
+                logger.warning("VR landmarks contain NaN/Inf — holding hand position")
+                self._nan_warned_landmarks = True
+            return hand_cmd, retarget_ok
+        self._nan_warned_landmarks = False
+
         try:
             wrist_rot = estimate_frame_from_hand_points(landmarks)
             mano_landmarks = landmarks @ wrist_rot @ OPERATOR2MANO_RIGHT
@@ -289,8 +309,9 @@ class TeleopPipeline:
                 retarget_ok = True
                 hand_cmd = np.asarray(target_hand, dtype=np.float64)
             # else: hold previous command
-        except (ValueError, TypeError):
-            # Retarget exception: hold previous command, quality marked as fail
+        except (ValueError, TypeError, np.linalg.LinAlgError):
+            # Retarget exception (incl. SVD non-convergence): hold previous
+            # command, quality marked as fail
             pass
 
         return hand_cmd, retarget_ok
