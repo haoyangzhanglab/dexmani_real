@@ -291,7 +291,13 @@ class InMemoryFrameBuffer:
                 ds[current_len:] = data
 
     def _flush_camera_batch(self, start: int, end: int) -> None:
-        """Write camera frames directly to HDF5 in a batch."""
+        """Write camera frames directly to HDF5 in a batch.
+
+        Missing frames (None) are replaced with zero-placeholder frames to
+        maintain index alignment with non-camera data (obs, action, VR).
+        Without this, skipping None entries causes camera frame indices to
+        drift relative to the main timeline.
+        """
         if not self._camera_rgb_batch:
             return
 
@@ -300,18 +306,29 @@ class InMemoryFrameBuffer:
         depth_slice = self._camera_depth_batch[start:end]
         ts_slice = self._camera_ts_batch[start:end]
 
-        # Filter out None entries (missing frames)
-        valid_rgb = [r for r in rgb_slice if r is not None]
-        valid_depth = [d for d in depth_slice if d is not None]
-        valid_ts = [t for t, r in zip(ts_slice, rgb_slice) if r is not None]
+        # Check if we have any valid frame to determine shapes
+        first_valid_rgb = next((r for r in rgb_slice if r is not None), None)
+        first_valid_depth = next((d for d in depth_slice if d is not None), None)
 
-        if not valid_rgb:
+        if first_valid_rgb is None or first_valid_depth is None:
             return
 
-        # Stack into a single array per channel
-        rgb_stack = np.stack(valid_rgb, axis=0)
-        depth_stack = np.stack(valid_depth, axis=0)
-        ts_arr = np.array(valid_ts, dtype=np.float64)
+        rgb_shape = first_valid_rgb.shape
+        depth_shape = first_valid_depth.shape
+
+        # Replace None with zero-placeholder frames to maintain alignment
+        rgb_stack = np.stack(
+            [r if r is not None else np.zeros(rgb_shape, dtype=np.uint8) for r in rgb_slice],
+            axis=0,
+        )
+        depth_stack = np.stack(
+            [d if d is not None else np.zeros(depth_shape, dtype=np.uint16) for d in depth_slice],
+            axis=0,
+        )
+        ts_arr = np.array(
+            [t if (t is not None and r is not None) else 0.0 for t, r in zip(ts_slice, rgb_slice)],
+            dtype=np.float64,
+        )
 
         if not self._camera_written:
             # First batch: create datasets
@@ -346,7 +363,11 @@ class InMemoryFrameBuffer:
             ts_ds[n_old:] = ts_arr
 
     def _flush_multi_camera_batches(self, start: int, end: int) -> None:
-        """Write multi-camera frames to HDF5 in per-camera batch."""
+        """Write multi-camera frames to HDF5 in per-camera batch.
+
+        Missing frames (None) are replaced with zero-placeholder frames to
+        maintain index alignment with non-camera data.
+        """
         if not self._mc_rgb_batches:
             return
 
@@ -362,17 +383,29 @@ class InMemoryFrameBuffer:
             depth_slice = depth_batch[start:end]
             ts_slice = ts_batch[start:end]
 
-            # Filter out None entries
-            valid_rgb = [r for r in rgb_slice if r is not None]
-            valid_depth = [d for d in depth_slice if d is not None]
-            valid_ts = [t for t, r in zip(ts_slice, rgb_slice) if r is not None]
+            # Determine shapes from first valid frame
+            first_valid_rgb = next((r for r in rgb_slice if r is not None), None)
+            first_valid_depth = next((d for d in depth_slice if d is not None), None)
 
-            if not valid_rgb:
+            if first_valid_rgb is None or first_valid_depth is None:
                 continue
 
-            rgb_stack = np.stack(valid_rgb, axis=0)
-            depth_stack = np.stack(valid_depth, axis=0)
-            ts_arr = np.array(valid_ts, dtype=np.float64)
+            rgb_shape = first_valid_rgb.shape
+            depth_shape = first_valid_depth.shape
+
+            # Replace None with zero-placeholder frames for alignment
+            rgb_stack = np.stack(
+                [r if r is not None else np.zeros(rgb_shape, dtype=np.uint8) for r in rgb_slice],
+                axis=0,
+            )
+            depth_stack = np.stack(
+                [d if d is not None else np.zeros(depth_shape, dtype=np.uint16) for d in depth_slice],
+                axis=0,
+            )
+            ts_arr = np.array(
+                [t if (t is not None and r is not None) else 0.0 for t, r in zip(ts_slice, rgb_slice)],
+                dtype=np.float64,
+            )
 
             rgb_key = f"camera/{cam_name}/rgb"
             depth_key = f"camera/{cam_name}/depth"

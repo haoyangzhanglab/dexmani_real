@@ -34,7 +34,7 @@ logger = get_logger(__name__)
 class InterpolationConfig:
     """Configuration for StreamInterpolator."""
 
-    method: str = "linear"  # "linear", "nearest", "none"
+    method: str = "linear"  # "linear", "nearest", "slerp", "none"
     max_gap_s: float = 0.1  # Maximum gap to interpolate across
     extrapolate: bool = False  # Whether to extrapolate beyond data bounds
 
@@ -82,6 +82,8 @@ class StreamInterpolator:
             return self._interpolate_nearest(source_ts, source_data, target_ts)
         elif self.config.method == "linear":
             return self._interpolate_linear(source_ts, source_data, target_ts)
+        elif self.config.method == "slerp":
+            return self._interpolate_slerp(source_ts, source_data, target_ts)
         elif self.config.method == "none":
             # No interpolation — return raw data aligned by index
             return source_data[:len(target_ts)]
@@ -174,6 +176,56 @@ class StreamInterpolator:
 
         return result
 
+    def _interpolate_slerp(
+        self,
+        source_ts: np.ndarray,
+        source_data: np.ndarray,
+        target_ts: np.ndarray,
+    ) -> np.ndarray:
+        """Spherical linear interpolation for quaternion data (WXYZ order).
+
+        Uses scipy.spatial.transform.Slerp for correct unit-quaternion
+        interpolation.  Falls back to linear+L2-normalize if scipy is
+        unavailable.
+        """
+        from scipy.spatial.transform import Rotation as R, Slerp
+
+        source_data = np.asarray(source_data)
+        if source_data.shape[-1] != 4:
+            raise ValueError(f"SLERP requires quaternion data (last dim=4), got shape {source_data.shape}")
+
+        # Build rotation objects from WXYZ quaternions
+        source_rots = R.from_quat(source_data[..., [1, 2, 3, 0]])  # WXYZ → xyzw
+        slerp = Slerp(source_ts, source_rots)
+
+        # Interpolate at target timestamps
+        target_rots = slerp(target_ts)
+        result = target_rots.as_quat()  # xyzw
+
+        # Convert back to WXYZ order
+        result_wxyz = np.zeros_like(result)
+        result_wxyz[..., 0] = result[..., 3]  # w
+        result_wxyz[..., 1:] = result[..., :3]  # xyz
+
+        # Invalidate gaps and extrapolation
+        idx = np.searchsorted(source_ts, target_ts)
+        idx = np.clip(idx, 1, len(source_ts) - 1)
+        gaps = source_ts[idx] - source_ts[idx - 1]
+        valid_gap = gaps <= self.config.max_gap_s
+        valid_gap = np.concatenate([[False], valid_gap])
+
+        invalid = ~valid_gap
+        if not self.config.extrapolate:
+            invalid = invalid | (target_ts < source_ts[0]) | (target_ts > source_ts[-1])
+
+        if invalid.any():
+            invalid_expanded = invalid
+            while invalid_expanded.ndim < result_wxyz.ndim:
+                invalid_expanded = invalid_expanded[..., np.newaxis]
+            result_wxyz = np.where(invalid_expanded, np.nan, result_wxyz)
+
+        return result_wxyz
+
 
 # ── Timestamp Aligner ──
 
@@ -259,13 +311,13 @@ class TimestampAligner:
             ("obs/arm_qvel", ctrl_ts, "linear"),
             ("obs/arm_tau", ctrl_ts, "linear"),
             ("obs/eef_pos", ctrl_ts, "linear"),
-            ("obs/eef_quat", ctrl_ts, "linear"),  # Note: quaternion needs SLERP
+            ("obs/eef_quat", ctrl_ts, "slerp"),  # SLERP for unit quaternion
             ("obs/hand_qpos", ctrl_ts, "linear"),
             ("obs/hand_tactile_sum", ctrl_ts, "linear"),
             ("action/arm_qpos", ctrl_ts, "linear"),
             ("action/hand_qpos", ctrl_ts, "linear"),
             ("vr/wrist_pos", ctrl_ts, "linear"),
-            ("vr/wrist_quat", ctrl_ts, "linear"),
+            ("vr/wrist_quat", ctrl_ts, "slerp"),
             ("vr/landmarks", ctrl_ts, "linear"),
         ]
 

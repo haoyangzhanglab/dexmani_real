@@ -3,15 +3,16 @@
 Replaces the pynput + multiprocessing.Queue pattern with termios cbreak
 mode + select.select — no extra process/thread, no queue overhead.
 
-Unified key mapping:
-    T  → TELEOP        (IDLE → TELEOP)
-    R  → RECORD        (toggle recording in TELEOP/PAUSED)
-    C  → PAUSE         (TELEOP ⇄ PAUSED)
-    S  → STOP          (stop recording → SAVE_PROMPT; TELEOP→IDLE; SAVE→confirm)
-    Q  → QUIT          (IDLE→quit; recording→SAVE_PROMPT; SAVE_PROMPT→discard)
-    H  → HOME          (return to home)
+Unified 6-key mapping:
+    B  → BEGIN          (IDLE → TELEOP + recording)
+    C  → PAUSE          (TELEOP ⇄ PAUSED)
+    S  → STOP           (stop recording → SAVE_PROMPT; SAVE_PROMPT→save→IDLE)
+    H  → HOME           (return to home)
+    Q  → QUIT           (IDLE→quit; teleop→SAVE_PROMPT; SAVE_PROMPT→discard)
     ESC → EMERGENCY_STOP
-    `   → REARM        (EMERGENCY_STOP → IDLE)
+
+Context-overloaded: BEGIN merges teleop start + recording (always together);
+QUIT serves dual role (stop→SAVE_PROMPT vs discard→exit).
 
 Ref: T-Rex main_teleop.py EpisodeKeyListener — termios.tcgetattr /
      tty.setcbreak + select.select single-key response pattern.
@@ -27,24 +28,20 @@ from enum import Enum
 
 
 class ControlSignal(Enum):
-    TELEOP = "T"
-    RECORD = "R"
-    PAUSE = "C"
-    STOP = "S"
-    HOME = "H"
-    EMERGENCY_STOP = "ESC"
-    REARM = "`"
-    QUIT = "Q"
+    BEGIN = "BEGIN"
+    PAUSE = "PAUSE"
+    STOP = "STOP"
+    HOME = "HOME"
+    EMERGENCY_STOP = "EMERGENCY_STOP"
+    QUIT = "QUIT"
 
 
 # Key → ControlSignal mapping (lowercase)
 _KEY_MAP: dict[str, ControlSignal] = {
-    "t": ControlSignal.TELEOP,
-    "r": ControlSignal.RECORD,
+    "b": ControlSignal.BEGIN,
     "c": ControlSignal.PAUSE,
     "s": ControlSignal.STOP,
     "h": ControlSignal.HOME,
-    "`": ControlSignal.REARM,
     "q": ControlSignal.QUIT,
 }
 
@@ -86,8 +83,12 @@ class KeyboardHandler:
         """Enter cbreak mode and start capturing keystrokes.
 
         Idempotent: calling on an already-started handler is a no-op.
+        Safe no-op when stdin is not a TTY (e.g. headless / piped input).
         """
         if self._running:
+            return
+        if not sys.stdin.isatty():
+            self._running = False
             return
         self._old_settings = termios.tcgetattr(self._stdin_fd)
         tty.setcbreak(self._stdin_fd)
@@ -97,12 +98,12 @@ class KeyboardHandler:
         """Restore terminal settings and stop capturing.
 
         Idempotent: calling on an already-stopped handler is a no-op.
-        Safe to call from finally blocks.
+        Safe to call from finally blocks.  Safe when stdin is not a TTY.
         """
         if not self._running:
             return
         try:
-            if self._old_settings is not None:
+            if self._old_settings is not None and sys.stdin.isatty():
                 termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._old_settings)
         except (termios.error, OSError):
             pass  # stdin may already be closed
@@ -115,7 +116,8 @@ class KeyboardHandler:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "KeyboardHandler":
-        self.start()
+        if sys.stdin.isatty():
+            self.start()
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -129,12 +131,15 @@ class KeyboardHandler:
         """Non-blocking poll for pending keystrokes.
 
         Drains all available input from stdin and returns a list of
-        ControlSignal values (may be empty).
+        ControlSignal values (may be empty).  Returns empty list when
+        stdin is not a TTY.
 
         Args:
             timeout: Seconds to wait for input (default 0.05s).
                      Use 0 for completely non-blocking poll.
         """
+        if not sys.stdin.isatty():
+            return []
         signals: list[ControlSignal] = []
         while True:
             r, _, _ = select.select([sys.stdin], [], [], timeout)

@@ -56,8 +56,10 @@ class FingertipDeskSafety:
         self._fingertip_ids = list(collision_config.fingertip_link_ids)
         self._fingertip_names = list(collision_config.fingertip_link_names)
         self._threshold = collision_config.fingertip_threshold
-        # epsilon 容差避免浮点边界误判（pinky_tip=0.03000000 < 0.03000001）
-        self._epsilon = 0.001
+        # Floating-point tolerance for boundary comparison only.
+        # Using 1e-8 (not 0.001) ensures the comparison boundary is tight —
+        # the epsilon widens the comparison window, NOT the safety margin.
+        self._epsilon = 1e-8
         self._table_z = collision_config.table_z_world
         self._hand_safe_margin = collision_config.hand_safe_margin
 
@@ -98,7 +100,7 @@ class FingertipDeskSafety:
         Returns: (safe, min_fingertip_z, lowest_fingertip_name)
         """
         min_z, min_name = self.min_fingertip_z(qpos)
-        safe = min_z > self._threshold - self._epsilon
+        safe = min_z >= self._threshold - self._epsilon
         return safe, min_z, min_name
 
     def check_path_desk_safety(

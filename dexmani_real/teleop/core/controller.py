@@ -308,7 +308,7 @@ class TeleopController:
         logger.info("  Mode: %s", "dry-run" if self.dry_run else "hardware")
         logger.info("  VR: direct")
         logger.info("  EMA: arm_alpha=%s (hand uses dex-retargeting low_pass_alpha)", self.ema_alpha_arm)
-        logger.info("  Controls: T=teleop R=record S=stop H=home ESC=emergency Q=quit")
+        logger.info("  Controls: B=begin S=stop C=pause H=home Q=quit ESC=emergency")
 
         self.last_status_ts = time.monotonic()
 
@@ -406,6 +406,11 @@ class TeleopController:
     # State machine tick
 
     def _tick(self) -> None:
+        # ESTOP guard: freeze all motion, only keyboard polling continues.
+        # The main loop stays alive so QUIT can set self.running = False.
+        if self.state == ControllerState.EMERGENCY_STOP:
+            return
+
         tick_start = time.perf_counter()
         self.frame_count += 1
 
@@ -421,11 +426,17 @@ class TeleopController:
                     # Velocity mode: let PID decelerate naturally
                     self.robot.arm.clear_target()
                 else:
-                    # Servo mode: hold last commanded position
-                    state = self.robot.get_state()
+                    # Servo mode: hold last commanded position.
+                    # Only call get_state() when _last_hand_cmd is None
+                    # (first PAUSED tick after startup without a prior command).
+                    if self._last_hand_cmd is None:
+                        state = self.robot.get_state()
+                        hand_cmd = state.hand_qpos
+                    else:
+                        hand_cmd = self._last_hand_cmd
                     hold_action = RobotAction(
                         arm_qpos_cmd=self._last_arm_cmd,
-                        hand_qpos_cmd=(self._last_hand_cmd if self._last_hand_cmd is not None else state.hand_qpos),
+                        hand_qpos_cmd=hand_cmd,
                     )
                     self.robot.send_action(hold_action)
             return
@@ -517,6 +528,15 @@ class TeleopController:
         #     Complements (not redundant with) PID _clip_arm_velocity at 250 Hz.
         if self._use_vel_limited_smooth and self._last_arm_cmd is not None:
             action = self._apply_velocity_limited_step(action, state)
+
+        # Update EMA/motion reference AFTER velocity-limited step so the
+        # inter-frame delta represents the actual sent command.  Updating
+        # before this point causes _apply_velocity_limited_step to always
+        # see delta=0 (no-op bug).
+        if status.get("ik_ok"):
+            self._last_arm_cmd = action.arm_qpos_cmd.copy()
+        if status.get("retarget_ok"):
+            self._last_hand_cmd = action.hand_qpos_cmd.copy()
 
         # 4d. Sliding window cyclic limit monitors (P3.3)
         #     Tracks hand temp and current over a 50-tick (~1s) window to
@@ -685,10 +705,19 @@ class TeleopController:
 
     @staticmethod
     def _frame_age(frame: dict) -> float:
-        """Seconds since VR frame was received on this machine."""
+        """Seconds since VR frame was received on this machine.
+
+        Falls back to frame["timestamp"] when local_recv_ns is missing
+        (e.g. DummyTracker).  Only returns inf when both are absent.
+        """
         local_recv = frame.get("local_recv_ns")
-        if local_recv is not None:
+        if local_recv is not None and np.isfinite(local_recv):
             return (time.monotonic_ns() - local_recv) * 1e-9
+        # Fallback: use frame's own timestamp (less precise but prevents
+        # false EMERGENCY classification when tracker doesn't set local_recv_ns).
+        ts = frame.get("timestamp")
+        if ts is not None and np.isfinite(ts):
+            return max(0.0, time.perf_counter() - ts)
         return float("inf")
 
     def _reset_vr_tracking(self) -> None:
@@ -747,11 +776,12 @@ class TeleopController:
             self._last_good_arm = np.asarray(action.arm_qpos_cmd, dtype=np.float64).copy()
             self._last_good_hand = np.asarray(action.hand_qpos_cmd, dtype=np.float64).copy()
 
-        # Update EMA reference
-        if ik_ok:
-            self._last_arm_cmd = action.arm_qpos_cmd.copy()
-        if retarget_ok:
-            self._last_hand_cmd = action.hand_qpos_cmd.copy()
+        # NOTE: _last_arm_cmd / _last_hand_cmd are NOT updated here.
+        # They serve as the reference for velocity-limited step smoothing
+        # and EMA in the pipeline.  They are updated in _tick() AFTER the
+        # velocity-limited step so the delta between ticks reflects the
+        # actual sent command, not the raw IK output.  Otherwise the
+        # velocity-limited step would always see delta=0 and be a no-op.
 
         # Update counters
         if ik_ok:
@@ -794,77 +824,61 @@ class TeleopController:
             self._transition(sig)
 
     def _transition(self, signal: ControlSignal) -> None:
+        # ── EMERGENCY_STOP: any state ──
+        if signal == ControlSignal.EMERGENCY_STOP:
+            self._escalate_to_emergency("Keyboard ESC")
+            return
+
+        # ── ESTOP guard: only QUIT accepted ──
+        if self.state == ControllerState.EMERGENCY_STOP:
+            if signal == ControlSignal.QUIT:
+                logger.info("ESTOP → exit")
+                self.running = False
+            return
+
         # ── QUIT: context-dependent ──
         if signal == ControlSignal.QUIT:
             if self.state == ControllerState.IDLE:
                 logger.info("QUIT — shutting down.")
                 self.running = False
-            elif self.recording:
-                # Stop recording → prompt save/discard
-                self._stop_recording()
-                self.state = ControllerState.SAVE_PROMPT
-                logger.info("Recording stopped → SAVE_PROMPT")
             elif self.state == ControllerState.SAVE_PROMPT:
                 # Discard episode → IDLE
                 self._discard_episode()
                 self.state = ControllerState.IDLE
                 logger.info("SAVE_PROMPT → IDLE (discarded)")
             else:
-                # TELEOP (not recording) → IDLE
-                self.state = ControllerState.IDLE
-                logger.info("TELEOP → IDLE")
+                # TELEOP / PAUSED → stop recording → SAVE_PROMPT
+                self._stop_recording()
+                self.state = ControllerState.SAVE_PROMPT
+                logger.info("Recording stopped → SAVE_PROMPT")
             return
 
-        # ── EMERGENCY_STOP: any state ──
-        if signal == ControlSignal.EMERGENCY_STOP:
-            self._escalate_to_emergency("Keyboard ESC")
-            return
-
-        # ── REARM: EMERGENCY_STOP only ──
-        if signal == ControlSignal.REARM:
-            self._rearm()
-            return
-
-        # ── HOME: any non-EMERGENCY state ──
-        if signal == ControlSignal.HOME:
-            if self.state != ControllerState.EMERGENCY_STOP:
-                self._do_home()
-            return
-
-        # ── TELEOP (T): IDLE → TELEOP ──
-        if signal == ControlSignal.TELEOP:
+        # ── BEGIN (B): IDLE → TELEOP + recording ──
+        if signal == ControlSignal.BEGIN:
             if self.state == ControllerState.IDLE:
                 self._reset_mapper()
                 if not self.dry_run:
                     self.robot.reset_soft_start()
+                self._start_recording()
                 self.state = ControllerState.TELEOP
-                self.recording = False
-                logger.info("IDLE → TELEOP (recording=False)")
+                self.recording = True
+                logger.info("IDLE → TELEOP (recording started)")
+            elif self.state == ControllerState.SAVE_PROMPT:
+                logger.info("BEGIN ignored: in SAVE_PROMPT (press S to save, Q to discard)")
             return
 
-        # ── RECORD (R): toggle recording in TELEOP/PAUSED ──
-        if signal == ControlSignal.RECORD:
-            if self.state == ControllerState.TELEOP:
-                if self.recording:
-                    # Stop recording → prompt save/discard
-                    self._stop_recording()
-                    self.state = ControllerState.SAVE_PROMPT
-                    logger.info("TELEOP(rec=True) → SAVE_PROMPT")
-                else:
-                    # Start recording
-                    self._start_recording()
-                    self.recording = True
-                    logger.info("TELEOP(rec=False) → TELEOP(rec=True)")
-            elif self.state == ControllerState.PAUSED:
-                if self.recording:
-                    self._stop_recording()
-                    self.state = ControllerState.SAVE_PROMPT
-                    logger.info("PAUSED(rec=True) → SAVE_PROMPT")
-                else:
-                    self._start_recording()
-                    self.recording = True
-                    self.state = ControllerState.TELEOP
-                    logger.info("PAUSED(rec=False) → TELEOP(rec=True)")
+        # ── STOP (S): context-dependent ──
+        if signal == ControlSignal.STOP:
+            if self.state == ControllerState.SAVE_PROMPT:
+                # Confirm save
+                self.state = ControllerState.IDLE
+                self.recording = False
+                logger.info("SAVE_PROMPT → IDLE (saved)")
+            elif self.state in (ControllerState.TELEOP, ControllerState.PAUSED):
+                # Stop recording → SAVE_PROMPT
+                self._stop_recording()
+                self.state = ControllerState.SAVE_PROMPT
+                logger.info("Recording stopped → SAVE_PROMPT")
             return
 
         # ── PAUSE (C): TELEOP ⇄ PAUSED ──
@@ -879,32 +893,16 @@ class TeleopController:
                     logger.info("PAUSED → TELEOP (recording=%s, mapper re-anchored)", self.recording)
                 else:
                     logger.warning("Cannot resume: no VR frame for mapper re-anchor")
+            elif self.state == ControllerState.SAVE_PROMPT:
+                logger.info("PAUSE ignored: in SAVE_PROMPT (press S to save, Q to discard)")
             return
 
-        # ── STOP (S): context-dependent ──
-        if signal == ControlSignal.STOP:
+        # ── HOME (H): any non-ESTOP / non-SAVE_PROMPT state ──
+        if signal == ControlSignal.HOME:
             if self.state == ControllerState.SAVE_PROMPT:
-                # Confirm save
-                self.state = ControllerState.IDLE
-                self.recording = False
-                logger.info("SAVE_PROMPT → IDLE (saved)")
-            elif self.state == ControllerState.TELEOP:
-                if self.recording:
-                    # Stop recording → prompt
-                    self._stop_recording()
-                    self.state = ControllerState.SAVE_PROMPT
-                    logger.info("TELEOP(rec=True) → SAVE_PROMPT")
-                else:
-                    self.state = ControllerState.IDLE
-                    logger.info("TELEOP(rec=False) → IDLE")
-            elif self.state == ControllerState.PAUSED:
-                if self.recording:
-                    self._stop_recording()
-                    self.state = ControllerState.SAVE_PROMPT
-                    logger.info("PAUSED(rec=True) → SAVE_PROMPT")
-                else:
-                    self.state = ControllerState.IDLE
-                    logger.info("PAUSED(rec=False) → IDLE")
+                logger.info("HOME ignored: in SAVE_PROMPT (press S to save, Q to discard)")
+            elif self.state != ControllerState.EMERGENCY_STOP:
+                self._do_home()
             return
 
     def _do_home(self) -> None:
@@ -1052,50 +1050,7 @@ class TeleopController:
         self.state = ControllerState.EMERGENCY_STOP
         if not self.dry_run:
             self.robot.emergency_stop()
-        self.running = False
 
-    def _rearm(self) -> None:
-        """Re-arm from EMERGENCY_STOP without script restart.
-
-        Clears errors, resets tracking, transitions to IDLE.
-        No-op if not in EMERGENCY_STOP state.
-
-        Ref: ManiUniCon reset_event (keyboard 'h' / Quest 'A' button).
-        """
-        if self.state != ControllerState.EMERGENCY_STOP:
-            logger.info(
-                "REARM ignored: not in EMERGENCY_STOP (current=%s)",
-                self.state.value,
-            )
-            return
-
-        logger.info("REARM: clearing errors and resetting...")
-        self.running = True
-        self._last_good_arm = None
-        self._last_good_hand = None
-        self._reset_vr_tracking()
-        self._consecutive_divergence = 0
-        self._ik_miss_count = 0
-        self._ik_miss_total = 0
-        self._ik_miss_max_consecutive = 0
-        self._camera_frame_count = 0
-        self._retarget_consecutive_none = 0
-        self._episode_start_time = None
-        self._hand_temp_monitor.reset()
-        self._hand_current_monitor.reset()
-
-        if not self.dry_run:
-            try:
-                self.robot.arm.clear_error()
-                self.robot.reset_soft_start()
-            except (ValueError, RuntimeError, KeyError, AttributeError) as e:
-                logger.warning("REARM: error clearing robot state: %s", e)
-
-        self.state = ControllerState.IDLE
-        self.recording = False
-        self._last_arm_cmd = None
-        self._last_hand_cmd = None
-        logger.info("REARM complete. State: IDLE")
 
     def _shutdown(self) -> None:
         logger.info("Shutting down...")

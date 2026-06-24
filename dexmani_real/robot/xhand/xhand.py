@@ -804,7 +804,14 @@ class XHand(ConnectionStateMixin):
         if self.last_cmd_time is None:
             self.last_cmd_time = now
 
-        dt = max(now - self.last_cmd_time, self.config.dt)
+        dt_raw = now - self.last_cmd_time
+        dt = min(max(dt_raw, self.config.dt), self.config.dt * 10)
+        # dt floor: prevents divide-by-zero / infinite speed when commands
+        #   arrive faster than expected.
+        # dt ceiling (10× dt): caps the allowed step to ~0.2s @ 50Hz.
+        #   Without this, a 500ms control loop stall (GC, system pause)
+        #   allows max_qvel * 0.5s jump per joint (e.g. 180°/s * 0.5s = 90°).
+        #   Ref: XArm7._limit_joint_step (xarm7.py:934).
         max_step = self.config.max_qvel * dt
 
         # Use hardware position as delta reference (ref: BunnyVisionPro xarm7_ability.py:177-183,

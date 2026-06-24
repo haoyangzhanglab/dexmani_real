@@ -252,22 +252,16 @@ class CameraProcess:
 
                 h = self.config.rgb_height
                 w = self.config.rgb_width
-                try:
-                    shm_writer = CameraRingBuffer(
-                        name=self.config.shm_name,
-                        rgb_shape=(h, w, 3),
-                        depth_shape=(h, w),
-                        maxlen=5,
-                        create=True,
-                    )
-                except FileExistsError:
-                    shm_writer = CameraRingBuffer(
-                        name=self.config.shm_name,
-                        rgb_shape=(h, w, 3),
-                        depth_shape=(h, w),
-                        maxlen=5,
-                        create=False,
-                    )
+                # Child process: parent already created the shared memory.
+                # Using create=False avoids the unnecessary FileExistsError
+                # fallback path and eliminates a race window.
+                shm_writer = CameraRingBuffer(
+                    name=self.config.shm_name,
+                    rgb_shape=(h, w, 3),
+                    depth_shape=(h, w),
+                    maxlen=5,
+                    create=False,
+                )
 
             last_ts = time.monotonic()
             while not self._stop_event.is_set():

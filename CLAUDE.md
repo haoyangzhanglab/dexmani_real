@@ -133,19 +133,30 @@ TeleopController._tick() (主线程, 50Hz)
 | 控制器层 | `controller.py`, `pipeline.py` | jump clamp、VR 帧新鲜度、quality flags |
 | 路径层 | `planner.py` | FingertipDeskSafety（桌面 FK 碰撞）、自碰撞检测 |
 
-### 状态机
+### 状态机（6 键统一方案）
 
 ```
-IDLE ──T/Enter──→ TELEOP ──R──→ RECORDING ──S──→ TELEOP
-  │                  │              │
-  H                  H              H
-  │                  │              │
-  ▼                  ▼              ▼
-return_to_home    EMERGENCY_STOP (ESC / timeout)
+IDLE ──B(BEGIN)──→ TELEOP ──S(STOP)/Q──→ SAVE_PROMPT
+  │    (start+rec)    │ C⇄C(Pause)    S→IDLE / Q→IDLE
+  H                   H
+  │                   │
+  ▼                   ▼
+return_to_home    EMERGENCY_STOP (ESC / timeout, 仅 Q 可退出)
 ```
 
-- **C 键（Pause/Resume）**: 暂停时冻结 EEF、暂停录制；恢复时自动 re-anchor mapper 抵消暂停期间的漂移
-- **SAVE_PROMPT 状态**: Q 退出时提示 S（保存）/ N（丢弃）当前 episode
+| Key | Signal | IDLE | TELEOP/PAUSED | SAVE_PROMPT | ESTOP |
+|-----|--------|------|---------------|-------------|-------|
+| **B** | BEGIN | →TELEOP+录制 | - | 提示 | - |
+| **S** | STOP | - | →SAVE_PROMPT | save→IDLE | - |
+| **Q** | QUIT | exit | →SAVE_PROMPT | discard→IDLE | exit |
+| **C** | PAUSE | - | ⇄PAUSED | 提示 | - |
+| **H** | HOME | →home | →home | 提示 | - |
+| **ESC** | EMERGENCY_STOP | →ESTOP | →ESTOP | →ESTOP | - |
+
+- **B 键（Begin）**: 合并原 T（Teleop）+ R（Record），开始遥操作即自动录制
+- **C 键（Pause/Resume）**: 暂停时冻结 EEF；恢复时自动 re-anchor mapper 抵消暂停期间的漂移
+- **Q 键（上下文重载）**: TELEOP/PAUSED→停止录制提示保存/丢弃；SAVE_PROMPT→丢弃返回 IDLE；IDLE→退出；ESTOP→退出
+- **ESTOP 守卫**: ESC 后仅 Q 接受，主循环继续运行（不退出），可安全恢复或退出
 
 ### xArm7 控制模式
 

@@ -13,12 +13,13 @@ Ref: data collection loop design — Phase 2 (Collection lifecycle).
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import time
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -27,6 +28,23 @@ from dexmani_real.recording.collection_config import CollectionConfig
 
 if TYPE_CHECKING:
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
+
+
+def _deep_copy_dict(d: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Deep-copy a dict, handling numpy arrays and nested structures."""
+    if d is None:
+        return None
+    result: dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, np.ndarray):
+            result[k] = v.copy()
+        elif isinstance(v, dict):
+            result[k] = _deep_copy_dict(v)
+        elif isinstance(v, (list, tuple)):
+            result[k] = type(v)(np.asarray(x).copy() if isinstance(x, np.ndarray) else x for x in v)
+        else:
+            result[k] = v
+    return result
 
 logger = get_logger(__name__)
 
@@ -145,19 +163,51 @@ class CollectionLoop:
         to the HDF5 file before normal recording begins.
 
         If pre_record_duration_s is 0 (disabled), this is a no-op.
+
+        IMPORTANT: Values are deep-copied to prevent all entries in the
+        deque from pointing to the same mutable object when the caller
+        reuses variable names across ticks (e.g. sim scripts).
         """
         if self._pre_record_deque is None:
             return
         self._pre_record_deque.append(
             {
-                "state": state,
-                "action": action,
-                "vr_frame": vr_frame,
-                "camera_frame": camera_frame,
-                "T_base_eef": T_base_eef,
-                "camera_frames": camera_frames,
+                "state": self._copy_state(state),
+                "action": self._copy_action(action),
+                "vr_frame": _deep_copy_dict(vr_frame),
+                "camera_frame": _deep_copy_dict(camera_frame) if camera_frame else None,
+                "T_base_eef": np.asarray(T_base_eef, dtype=np.float64).copy() if T_base_eef is not None else None,
+                "camera_frames": {k: _deep_copy_dict(v) for k, v in camera_frames.items()} if camera_frames else None,
             }
         )
+
+    @staticmethod
+    def _copy_state(state: object) -> object:
+        """Deep-copy a RobotState or dict-like state for pre-record buffer."""
+        if state is None:
+            return None
+        if hasattr(state, "_asdict"):
+            return state._asdict()
+        if hasattr(state, "__dict__"):
+            import copy
+            return copy.deepcopy(state.__dict__)
+        if isinstance(state, dict):
+            return _deep_copy_dict(state)
+        return state
+
+    @staticmethod
+    def _copy_action(action: object) -> object:
+        """Deep-copy a RobotAction or dict-like action for pre-record buffer."""
+        if action is None:
+            return None
+        if hasattr(action, "_asdict"):
+            return action._asdict()
+        if hasattr(action, "__dict__"):
+            import copy
+            return copy.deepcopy(action.__dict__)
+        if isinstance(action, dict):
+            return _deep_copy_dict(action)
+        return action
 
     def record_frame(
         self,
@@ -183,6 +233,16 @@ class CollectionLoop:
             T_base_eef=T_base_eef,
             camera_frames=camera_frames,
         )
+
+        # Auto-stop: max_frames reached inside add_frame — stop safely from
+        # the caller context to avoid the reentrancy hazard of stop_episode()
+        # closing self._file while add_frame's caller might still reference it.
+        if self.recorder.max_frames_reached:
+            logger.warning(
+                "Auto-stopping episode at max_frames=%d", self.recorder.max_frames,
+            )
+            self.stop_episode(success=True, reason="max_frames", classification="success")
+            return True
 
         if recorded:
             self._episode_frame_count += 1
@@ -369,6 +429,10 @@ class CollectionLoop:
         """Move episode files to success_dir / failure_dir based on classification.
 
         Ref: T-Rex data_writer.py move_episode_files().
+
+        Avoids silent overwrite: if the target file already exists (e.g.
+        re-recording an episode with the same index), appends a numeric
+        suffix (_1, _2, ...) rather than clobbering existing data.
         """
         target_dir = None
         if self._classification in ("success", "partial") and self.config.success_dir is not None:
@@ -384,13 +448,20 @@ class CollectionLoop:
         h5_file = Path(h5_path)
         json_file = h5_file.with_suffix(".json")
 
+        # Avoid silent overwrite: if target already exists, append _1, _2, ...
+        stem = h5_file.stem
+        new_h5 = target_dir / h5_file.name
+        suffix = 1
+        while new_h5.exists():
+            new_h5 = target_dir / f"{stem}_{suffix}.h5"
+            suffix += 1
+
         try:
-            new_h5 = target_dir / h5_file.name
             shutil.move(str(h5_file), str(new_h5))
             logger.info("Episode routed: %s → %s", h5_file.name, target_dir)
 
             if json_file.exists():
-                new_json = target_dir / json_file.name
+                new_json = target_dir / (new_h5.stem + ".json")
                 shutil.move(str(json_file), str(new_json))
 
             return str(new_h5)

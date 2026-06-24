@@ -1,10 +1,16 @@
 """VR frame quality check, timeout detection, and frame drop policy.
 
-FrameDropPolicy provides three-tier staleness classification:
-  - Tier 0 (FRESH):       age <= soft_threshold  → use frame normally
-  - Tier 1 (SOFT_STALE):  soft < age <= hard      → linear interpolation (soft decel)
-  - Tier 2 (HARD_STALE):  hard < age <= emergency → hold position, TRACKING_LOST
-  - Tier 3 (EMERGENCY):   age > emergency         → immediate emergency stop
+.. deprecated::
+    This module is superseded by inlined VR tracking logic in
+    TeleopController (controller.py:691-713).  FrameDropPolicy and
+    TrackingQuality classes are retained for reference/documentation
+    but are no longer imported or used by the controller.
+
+    The inlined version provides the same three-tier staleness:
+      - Tier 0 (FRESH):       age <= soft_threshold  → use frame normally
+      - Tier 1 (SOFT_STALE):  soft < age <= hard      → hold position
+      - Tier 2 (HARD_STALE):  hard < age <= emergency → soft deceleration
+      - Tier 3 (EMERGENCY):   age > emergency         → immediate emergency stop
 
 Ref: DexUMI drop-oldest backpressure.
      BunnyVisionPro FrameAge gate.

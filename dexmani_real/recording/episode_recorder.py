@@ -68,6 +68,7 @@ class EpisodeRecorder:
         self._file: h5py.File | None = None
         self._frame_count: int = 0
         self._recording: bool = False
+        self._max_frames_reached: bool = False
         self._start_time: float | None = None
         self._episode_path: str | None = None
 
@@ -84,6 +85,11 @@ class EpisodeRecorder:
     @property
     def frame_count(self) -> int:
         return self._frame_count
+
+    @property
+    def max_frames_reached(self) -> bool:
+        """True when the episode has hit max_frames and needs stop_episode()."""
+        return self._max_frames_reached
 
     def start_episode(
         self,
@@ -107,6 +113,7 @@ class EpisodeRecorder:
         self._file = h5py.File(str(path), "w")
         self._episode_path = str(path)
         self._frame_count = 0
+        self._max_frames_reached = False
         self._start_time = time.perf_counter()
         self._recording = True
         self._datasets = {}
@@ -170,11 +177,15 @@ class EpisodeRecorder:
             return False
 
         # Hard cap: auto-stop when max_frames reached (prevents disk exhaustion).
+        # We set a flag rather than calling stop_episode() here to avoid the
+        # reentrancy hazard of stop_episode() closing self._file while the
+        # caller may still hold references to it. The caller (CollectionLoop)
+        # checks max_frames_reached and calls stop_episode() from a safe context.
         if self._frame_count >= self.max_frames:
             logger.warning("Episode reached max_frames=%d, auto-stopping.", self.max_frames)
             self._file.attrs["stopped_reason"] = "max_frames"
-            self.stop_episode(success=True)
-            return True
+            self._max_frames_reached = True
+            return False
 
         if self._buffer is not None:
             # Batch mode: O(1) numpy assignment
@@ -371,13 +382,18 @@ class EpisodeRecorder:
         self._file = None
         self._datasets.clear()
         self._recording = False
+        self._max_frames_reached = False
         self._frame_count = 0
         self._start_time = None
         self._episode_path = None
         return path
 
     def _append_or_create(self, key: str, data: np.ndarray) -> None:
-        arr = np.asarray(data, dtype=np.float64)
+        # Preserve original dtype for consistency with batch buffer path.
+        # _DATASET_SPECS in frame_buffer.py defines expected dtypes per key;
+        # we use the input data's dtype directly (the caller is responsible
+        # for providing correctly-typed data).
+        arr = np.asarray(data)
         if key not in self._datasets:
             maxshape = (None,) + arr.shape
             self._datasets[key] = self._file.create_dataset(

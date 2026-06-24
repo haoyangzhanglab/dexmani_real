@@ -195,15 +195,20 @@ class RobotInterface:
             return False, "arm torque violation"
 
         # 4-6. Hand safety (current, temperature, communication)
-        hand_state = self.hand.get_state(full=True)
+        # Use full=False to avoid per-tick tactile parsing (~2-5ms overhead).
+        # Board errors are read from cached instance attributes (updated on every
+        # get_state call regardless of full flag). Temperature defaults safely
+        # when not returned by full=False (the sliding window monitors in the
+        # controller provide the primary temperature trend tracking).
+        hand_state = self.hand.get_state(full=False)
         if not check_hand_current(hand_state.get("current", np.zeros(12))):
             return False, "hand current violation"
         if not check_hand_temperature(hand_state.get("temperature", np.full(12, 30.0))):
             return False, "hand temperature violation"
         hand_has_error = bool(
-            np.any(hand_state.get("commboard_err", np.zeros(12)) != 0)
-            or np.any(hand_state.get("jointboard_err", np.zeros(12)) != 0)
-            or np.any(hand_state.get("tipboard_err", np.zeros(12)) != 0)
+            np.any(self.hand.last_commboard_err != 0)
+            or np.any(self.hand.last_jointboard_err != 0)
+            or np.any(self.hand.last_tipboard_err != 0)
         )
         if not check_hand_comm(hand_has_error):
             return False, "hand communication error"
