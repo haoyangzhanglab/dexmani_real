@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-import os
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
+try:
+    from xhand_controller import xhand_control as xhc
+
+    _SDK_AVAILABLE = True
+except ImportError:
+    xhc = None  # type: ignore[assignment]
+    _SDK_AVAILABLE = False
+
 from dexmani_real.robot._connection_state import ConnectionStateMixin
+from dexmani_real.robot.xhand.motor_trajectory_interpolator import MotorTrajectoryInterpolator
 from dexmani_real.utils.array_utils import nan_array, safe_resize
-from dexmani_real.utils.rate_limiter import RateLimiter
-from dexmani_real.utils.serialization import from_dict_helper
-from xhand_controller import xhand_control as xhc
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
@@ -50,6 +54,7 @@ _KNOWN_SENSOR_ERROR_PATTERNS = [
     "this hardware version does not support force control mode",
 ]
 
+
 @dataclass
 class XHandConfig:
     comm_type: str = "RS485"
@@ -58,10 +63,10 @@ class XHandConfig:
     device_id: int = 0
 
     # Connection retry (RS485 may need several attempts after cold start)
-    open_serial_retries: int = 5
+    open_serial_retries: int = 3  # ref: LeFranX (no retry, but RS485 needs a few attempts)
     open_serial_retry_delay_s: float = 2.0
 
-    dt: float = 1.0 / 83.0
+    dt: float = 1.0 / 30.0  # 30 Hz (ref: LeFranX, DexUMI)
     num_joints: int = 12
 
     # Important:
@@ -72,44 +77,85 @@ class XHandConfig:
     # Connect-time state initialization.
     # Even if force_update_state is manually set to False for runtime speed,
     # connect() should still force refresh several frames to avoid zero-cache initialization.
-    init_state_read_attempts: int = 10
+    init_state_read_attempts: int = 3
     init_state_read_interval: float = 0.02
 
-    home_qpos: np.ndarray = field(default_factory=lambda: np.deg2rad(np.array([
-        0.0, 45.0, 0.0,
-        0.0, 0.0, 0.0,
-        0.0, 0.0,
-        0.0, 0.0,
-        0.0, 0.0,
-    ], dtype=np.float64)))
+    home_qpos: np.ndarray = field(
+        default_factory=lambda: np.deg2rad(
+            np.array(
+                [
+                    0.0,
+                    45.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+        )
+    )
 
-    # Distal joints (index/middle/ring/little joint2) min=5°
-    # to prevent mechanical clogging. ref: LeFranX xhand_config.py L50-51.
     qpos_min: np.ndarray = field(
-        default_factory=lambda: np.deg2rad(np.array([
-            0.0, -40.0, 0.0,
-            -10.0, 0.0, 5.0,
-            0.0, 5.0,
-            0.0, 5.0,
-            0.0, 5.0,
-        ], dtype=np.float64))
+        default_factory=lambda: np.deg2rad(
+            np.array(
+                [
+                    0.0,
+                    -40.0,
+                    0.0,
+                    -10.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+        )
     )
 
     qpos_max: np.ndarray = field(
-        default_factory=lambda: np.deg2rad(np.array([
-            105.0, 90.0, 90.0,
-            10.0, 110.0, 110.0,
-            110.0, 110.0,
-            110.0, 110.0,
-            110.0, 110.0,
-        ], dtype=np.float64))
+        default_factory=lambda: np.array(
+            # XHand joint limits from URDF (xhand_right.urdf), in radians.
+            # Using exact URDF values avoids floating-point rounding from deg2rad.
+            [
+                1.832,  # J0  thumb_abd
+                1.57,  # J1  thumb_j1
+                1.57,  # J2  thumb_j2
+                0.174,  # J3  index_abd
+                1.919,  # J4  index_j1
+                1.919,  # J5  index_j2
+                1.919,  # J6  middle_j1
+                1.919,  # J7  middle_j2
+                1.919,  # J8  ring_j1
+                1.919,  # J9  ring_j2
+                1.919,  # J10 little_j1
+                1.919,  # J11 little_j2
+            ],
+            dtype=np.float64,
+        ),
     )
 
-    max_qvel: np.ndarray = field(default_factory=lambda: np.deg2rad(np.ones(12) * 180.0))
+    max_qvel: np.ndarray = field(
+        default_factory=lambda: np.deg2rad(np.ones(12) * 180.0),
+        metadata={
+            "help": "Per-joint max velocity (rad/s). Used with MotorTrajectoryInterpolator.drive_to_waypoint/schedule_waypoint as max_speed."
+        },
+    )
 
-    kp: int = 100
-    ki: int = 0
-    kd: int = 1
+    kp: int = 80  # ref: LeFranX xhand_config.py:22
+    ki: int = 0  # ref: LeFranX xhand_config.py:23
+    kd: int = 0  # ref: LeFranX xhand_config.py:24
     # Per-joint gain overrides (ref: DexUMI hand_api_cls.py:317-319).
     # When set (shape (12,)), individual joint gains replace the scalar kp/ki/kd.
     # Distal joints (especially little finger joint 11) benefit from higher gains
@@ -117,25 +163,21 @@ class XHandConfig:
     kp_per_joint: np.ndarray | None = None  # (12,) per-joint kp overrides
     ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
     kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
-    tor_max: int = 400  # ref: LeFranX xhand_config.py:25, DexUMI hand_api_cls.py:289 — 400mA torque-current limit
+    tor_max: int = (
+        300  # max 320mA; ref: LeFranX xhand_config.py:25 (400), DexUMI hand_api_cls.py:289 (400). Reduced to 300 for safety margin per XHand spec.
+    )
     mode: int = 3
 
-    use_delta_limit: bool = False
     clip_joint_limit: bool = True
-
-    tactile_scale: float = 0.1
+    # Minimum per-joint deviation (rad) before CLIP flag is set in status output.
+    # Prevents logspam from sub-degree retargeting imprecision (≈0.57° = 0.01 rad).
+    # Actual np.clip is always enforced regardless of this threshold.
+    clip_report_tolerance: float = 0.01
 
     # Known non-critical sensor error filtering (ref: LeFranX xhand.py:230-241).
     # When True, errors matching known patterns (sensor read failures, CRC errors,
     # unsupported-force-mode warnings) are logged but do NOT trigger error_state.
     filter_known_sensor_errors: bool = True
-
-    # ── E1: Background state reader (ref: DexUMI hand_api_cls.py:228-275) ──
-    # When True, a daemon thread continuously reads hardware state at state_reader_hz
-    # and caches it. get_state() returns the cached value, decoupling read timing
-    # from consumption and guaranteeing consistent sample rate.
-    use_background_state_reader: bool = False
-    state_reader_hz: float = 100.0
 
     # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
     # 0.0 = disabled (default, backward compatible). 0.3 = LeFranX recommended.
@@ -145,12 +187,7 @@ class XHandConfig:
 
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
-    tactile_contact_threshold: float = 0.5
-
-    # ── F3: Trajectory interpolation ──
-    # Minimum duration for trajectory execution; actual duration is max(min_duration, computed).
-    traj_min_duration_s: float = 0.5
-
+    tactile_contact_threshold: float = 10.0  # raw sensor units (ref: DexUMI eval_xhand.py:72 binary_cutoff=[10,10,10])
 
 
 class XHand(ConnectionStateMixin):
@@ -165,20 +202,10 @@ class XHand(ConnectionStateMixin):
         self.last_cmd_time: float | None = None
         self.last_error_code: int | None = None
         self.last_joint_limit_clipped = False
-        self.last_delta_limited = False
 
-        self.last_commboard_err = np.zeros(12, dtype=np.int32)
-        self.last_jointboard_err = np.zeros(12, dtype=np.int32)
-        self.last_tipboard_err = np.zeros(12, dtype=np.int32)
+        self._stub_mode = False  # True when xhand_controller SDK unavailable (ref: LeFranX)
         self.last_hand_ids: list[int] = []
-        self.last_sensor_error_filtered: str | None = None  # D1: last known-non-critical error
         self.cached_comm_type = self._resolve_comm_type()
-
-        # ── E1: Background state reader ──
-        self._state_thread: threading.Thread | None = None
-        self._state_stop: threading.Event = threading.Event()
-        self._state_lock: threading.Lock = threading.Lock()
-        self._latest_state: dict[str, Any] | None = None
 
         # ── E2: EMA filtering ──
         self._ema_qpos: np.ndarray | None = None
@@ -190,7 +217,17 @@ class XHand(ConnectionStateMixin):
 
         Orchestrates device enumeration, retry-based port opening, and
         initial state initialization. Returns True on success.
+
+        Falls back to stub mode when xhand_controller SDK is unavailable
+        (ref: LeFranX xhand.py:158-163).
         """
+        if not _SDK_AVAILABLE:
+            logger.warning("XHand SDK unavailable — entering stub mode (ref: LeFranX)")
+            self._stub_mode = True
+            self.connected_flag = True
+            self.last_qpos_cmd = self._array12(self.config.home_qpos)
+            return True
+
         comm_type = self.cached_comm_type
 
         if not self._retry_open_device(comm_type):
@@ -208,10 +245,6 @@ class XHand(ConnectionStateMixin):
         self._init_hand_state()
 
         self.last_cmd_time = time.time()
-
-        # E1: Start background state reader if configured
-        if self.config.use_background_state_reader:
-            self._start_state_reader()
 
         return True
 
@@ -255,7 +288,10 @@ class XHand(ConnectionStateMixin):
             if attempt < retries:
                 logger.warning(
                     "XHand connect attempt %s/%s failed: %s, retrying in %.1fs...",
-                    attempt, retries, self.last_error_message, delay,
+                    attempt,
+                    retries,
+                    self.last_error_message,
+                    delay,
                 )
                 # Close and recreate control for clean retry
                 try:
@@ -269,7 +305,8 @@ class XHand(ConnectionStateMixin):
         self.error_state = True
         logger.error(
             "XHand connect failed after %s attempts: %s",
-            retries, self.last_error_message,
+            retries,
+            self.last_error_message,
         )
         self._diagnose_connection_failure()
         return False
@@ -300,100 +337,46 @@ class XHand(ConnectionStateMixin):
             logger.info("Using home_qpos as initial qpos: %s", self.last_qpos_cmd)
 
     def disconnect(self):
-        self._stop_state_reader()  # E1
+        if self._stub_mode:
+            self.connected_flag = False
+            return
         if self.control is not None:
             self.control.close_device()
         self.connected_flag = False
 
     def _diagnose_connection_failure(self) -> None:
-        """Print diagnostic info for a failed RS485/EtherCAT connection.
+        logger.warning("XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions")
 
-        Checks /dev/ttyUSB* existence, permissions, and whether another
-        process is holding the device.
-        """
-        comm_type = self.cached_comm_type
-        device = self.device_name or "<auto>"
-        logger.warning("[XHand diagnostics] comm_type=%s, device=%s", comm_type, device)
-
-        # List available ttyUSB devices
-        if comm_type == "RS485":
-            import glob
-            tty_devices = sorted(glob.glob("/dev/ttyUSB*"))
-            if not tty_devices:
-                logger.warning("  No /dev/ttyUSB* devices found. Check USB cable and power.")
-            else:
-                logger.warning("  Available tty devices: %s", tty_devices)
-                for tty in tty_devices:
-                    try:
-                        st = os.stat(tty)
-                        import stat
-                        perms = stat.filemode(st.st_mode)
-                        logger.warning("    %s: %s owner=%s group=%s", tty, perms, st.st_uid, st.st_gid)
-                    except OSError as e:
-                        logger.warning("    %s: stat failed — %s", tty, e)
-
-            # Check if device is held by another process (lsof)
-            target = self.device_name if self.device_name else (
-                tty_devices[0] if tty_devices else None
-            )
-            if target is not None:
-                import subprocess
-                try:
-                    result = subprocess.run(
-                        ["lsof", target],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    if result.stdout.strip():
-                        logger.warning("  lsof %s:", target)
-                        for line in result.stdout.strip().splitlines():
-                            logger.warning("    %s", line)
-                    else:
-                        logger.warning("  lsof %s: not held by any process", target)
-                except FileNotFoundError:
-                    pass  # lsof not installed
-                except subprocess.TimeoutExpired:
-                    logger.warning("  lsof %s: timed out", target)
-                except (subprocess.SubprocessError, OSError) as e:
-                    logger.warning("  lsof %s: error — %s", target, e)
-
-            # Suggestions
-            logger.warning("  Troubleshooting:")
-            logger.warning("    1. Check XHand power supply is on")
-            logger.warning("    2. Check USB cable is firmly connected")
-            logger.warning("    3. sudo chmod 666 /dev/ttyUSB* (or add user to dialout group)")
-            logger.warning("    4. Verify no other process is holding the device (lsof /dev/ttyUSB*)")
-            logger.warning("    5. Try power-cycling the XHand controller")
+    def _stub_state(self, full: bool = False) -> dict[str, Any]:
+        """Return zero state for stub mode (ref: LeFranX xhand.py:219-223)."""
+        state: dict[str, Any] = {
+            "qpos": np.zeros(12, dtype=np.float64),
+            "current": np.zeros(12, dtype=np.float64),
+            "timestamp": time.time(),
+            "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
+            "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
+            "tactile_contact": np.zeros(5, dtype=bool),
+        }
+        if full:
+            state.update(self._empty_state())
+        return state
 
     def is_connected(self) -> bool:
         return self.control is not None and self.connected_flag and not self.error_state
 
     def is_error(self) -> bool:
-        if self.control is None:
-            return True
-        if not self.connected_flag:
-            return True
-        if self.error_state:
-            return True
-        if self.last_error_code not in [None, 0]:
-            return True
-        if np.any(self.last_commboard_err != 0):
-            return True
-        if np.any(self.last_jointboard_err != 0):
-            return True
-        if np.any(self.last_tipboard_err != 0):
-            return True
-        return False
+        return self.control is None or not self.connected_flag or self.error_state
 
     def clear_error(self) -> bool:
         self.error_state = False
         self.last_error_code = None
         self.last_error_message = ""
-        self.last_commboard_err[:] = 0
-        self.last_jointboard_err[:] = 0
-        self.last_tipboard_err[:] = 0
         return self.control is not None and self.connected_flag
 
     def stop(self) -> bool:
+        if self._stub_mode:
+            self.error_state = True
+            return True
         if self.control is None or not self.connected_flag:
             return False
         command = self.make_command(
@@ -421,22 +404,8 @@ class XHand(ConnectionStateMixin):
         full: bool = False,
         force_update: bool | None = None,
     ) -> dict[str, Any]:
-        # ── E1: Return cached state when background reader is active ──
-        if self.config.use_background_state_reader and self._state_thread is not None:
-            with self._state_lock:
-                cached = self._latest_state
-            if cached is not None and not force_update:
-                if not full:
-                    return {
-                        "qpos": cached.get("qpos", nan_array(12)).copy(),
-                        "current": cached.get("current", nan_array(12)).copy(),
-                        "timestamp": cached.get("timestamp", time.time()),
-                    }
-                state = {k: v.copy() if hasattr(v, "copy") else v for k, v in cached.items()}
-                # F1: Add tactile contact detection to full state
-                if full:
-                    state["tactile_contact"] = self.detect_contact()
-                return state
+        if self._stub_mode:
+            return self._stub_state(full)
 
         if force_update is None:
             force_update = self.config.force_update_state
@@ -449,6 +418,9 @@ class XHand(ConnectionStateMixin):
                 "qpos": nan_array(12),
                 "current": nan_array(12),
                 "timestamp": time.time(),
+                "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
+                "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
+                "tactile_contact": np.zeros(5, dtype=bool),
             }
             if full:
                 state.update(self._empty_state())
@@ -460,19 +432,18 @@ class XHand(ConnectionStateMixin):
         return state
 
     def send_action(self, action: np.ndarray) -> bool:
+        if self._stub_mode:
+            return True
+
         if self.control is None or self.hand_command is None:
             return False
 
         target_qpos = self._array12(action)
-        qpos_after_limit = self._limit_joint_range(target_qpos)
-        qpos_cmd = self._limit_joint_step(qpos_after_limit)
+        qpos_cmd = self._limit_joint_range(target_qpos)
 
         # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
         if self.config.ema_alpha > 0 and self._ema_qpos is not None:
-            qpos_cmd = (
-                (1.0 - self.config.ema_alpha) * self._ema_qpos
-                + self.config.ema_alpha * qpos_cmd
-            )
+            qpos_cmd = (1.0 - self.config.ema_alpha) * self._ema_qpos + self.config.ema_alpha * qpos_cmd
         self._ema_qpos = qpos_cmd.copy()
 
         self.write_command_positions(qpos_cmd)
@@ -487,56 +458,9 @@ class XHand(ConnectionStateMixin):
         self._record_error(err)
         return False
 
-    # E1: Background state reader
-
-    def _start_state_reader(self) -> None:
-        """Start the daemon thread that reads hardware state at state_reader_hz."""
-        if self._state_thread is not None and self._state_thread.is_alive():
-            return
-        self._state_stop.clear()
-        self._state_thread = threading.Thread(
-            target=self._read_state_loop,
-            name="xhand_state_reader",
-            daemon=True,
-        )
-        self._state_thread.start()
-        logger.info(
-            "XHand state reader started at %.0f Hz", self.config.state_reader_hz,
-        )
-
-    def _stop_state_reader(self) -> None:
-        """Signal the state reader thread to stop and wait for exit."""
-        if self._state_thread is None or not self._state_thread.is_alive():
-            return
-        self._state_stop.set()
-        self._state_thread.join(timeout=2.0)
-        if self._state_thread.is_alive():
-            logger.warning("XHand state reader thread did not exit within timeout")
-        else:
-            logger.info("XHand state reader stopped")
-
-    def _read_state_loop(self) -> None:
-        """Daemon loop: read hardware state at state_reader_hz, cache latest.
-
-        Uses RateLimiter (E3) for precise frame timing instead of plain sleep.
-        """
-        rate_limiter = RateLimiter(self.config.state_reader_hz)
-        while not self._state_stop.is_set():
-            rate_limiter.wait()
-
-            # Read raw state from hardware (force_update=True to bypass SDK cache)
-            err, hand_state = self.read_raw_state(force_update=True)
-            if not self.error_ok(err) or hand_state is None:
-                self._record_error(err)
-                continue
-
-            state = self.parse_state(hand_state, full=True)
-            with self._state_lock:
-                self._latest_state = state
-
     # F1: Tactile contact detection (ref: DexUMI eval_xhand.py:40-57)
 
-    def detect_contact(self, threshold: float | None = None) -> np.ndarray:
+    def detect_contact(self, threshold: float | None = None, force_sum: np.ndarray | None = None) -> np.ndarray:
         """Detect per-finger contact from tactile force.
 
         Uses the L2 norm of the combined force vector (fx, fy, fz) on each
@@ -544,27 +468,42 @@ class XHand(ConnectionStateMixin):
 
         Args:
             threshold: Override for tactile_contact_threshold (Newtons).
+            force_sum: Pre-parsed (5,3) force_sum array. When provided,
+                       skips get_state() call (used inside parse_state to
+                       avoid recursion).
 
         Returns:
             bool array of shape (5,), True where L2-norm > threshold.
         """
         thresh = threshold if threshold is not None else self.config.tactile_contact_threshold
-        state = self.get_state(full=True)
-        force_sum = np.asarray(state.get("tactile_force_sum", np.zeros((5, 3))))
+        if force_sum is None:
+            state = self.get_state(full=True)
+            force_sum = np.asarray(state.get("tactile_force_sum", np.zeros((5, 3))))
         norm = np.linalg.norm(force_sum, axis=1)  # (5,) L2 per finger
         return norm > thresh
 
-    # F3: Trajectory interpolation with velocity constraints
+    # F3: Trajectory interpolation (ref: DexUMI MotorTrajectoryInterpolator)
 
-    def send_trajectory(self, waypoints: np.ndarray, duration_s: float) -> bool:
-        """Execute a joint-space trajectory with linear interpolation.
+    def send_trajectory(
+        self,
+        waypoints: np.ndarray,
+        duration_s: float,
+        max_speed: float | None = None,
+    ) -> bool:
+        """Execute a joint-space trajectory with scipy-based linear interpolation.
 
-        Waypoints are interpolated at the control rate (1/dt). If the
-        computed speed exceeds max_qvel, duration is automatically extended.
+        Uses MotorTrajectoryInterpolator (ref: DexUMI) for smooth interp1d-based
+        interpolation. When max_speed is provided, speed-limited waypoint driving
+        is used — duration is automatically extended if the required speed exceeds
+        the limit.
 
         Args:
             waypoints: (N, 12) array of joint positions in radians.
-            duration_s: Desired total duration; clamped to traj_min_duration_s.
+            duration_s: Desired total duration in seconds.
+            max_speed: Optional scalar speed limit (L2 norm). When provided,
+                       uses MotorTrajectoryInterpolator.drive_to_waypoint which
+                       auto-extends duration to respect the speed limit.
+                       Default: config.max_qvel.min().
 
         Returns:
             True if all waypoints were reached.
@@ -573,37 +512,38 @@ class XHand(ConnectionStateMixin):
         if waypoints.ndim == 1:
             waypoints = waypoints.reshape(1, 12)
 
-        duration_s = max(duration_s, self.config.traj_min_duration_s)
         n_waypoints = waypoints.shape[0]
-
         if n_waypoints == 1:
-            # Single waypoint — send directly
             return self.send_action(waypoints[0])
 
-        # Compute required velocity and extend duration if needed
-        segment_dist = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
-        total_dist = np.sum(segment_dist)
-        required_vel = total_dist / duration_s
-        max_allowed_vel = np.min(self.config.max_qvel)
-        if required_vel > max_allowed_vel:
-            duration_s = total_dist / max_allowed_vel
-            logger.info(
-                "Trajectory speed limited: extended duration to %.2fs (max_qvel=%.2f)",
-                duration_s, max_allowed_vel,
-            )
+        duration_s = max(duration_s, 0.0)
 
-        # Linear interpolation
-        n_steps = max(2, int(duration_s / self.config.dt))
-        t = np.linspace(0, 1, n_steps)
-        segment_indices = np.linspace(0, n_waypoints - 1, n_steps)
+        # Resolve max_speed
+        speed_limit = max_speed if max_speed is not None else float(np.min(self.config.max_qvel))
+
+        if np.isfinite(speed_limit) and speed_limit > 0:
+            # Speed-limited: build interpolator from start, drive to final waypoint
+            interp = MotorTrajectoryInterpolator(times=np.array([0.0]), values=waypoints[0:1]).drive_to_waypoint(
+                value=waypoints[-1],
+                time=duration_s,
+                curr_time=0.0,
+                max_speed=speed_limit,
+            )
+        else:
+            # No speed limit: interpolate all waypoints directly
+            times = np.linspace(0.0, duration_s, n_waypoints)
+            interp = MotorTrajectoryInterpolator(times, waypoints)
+
+        # Execute at control rate
+        start_t = float(interp.times[0])
+        end_t = float(interp.times[-1])
+        exec_duration = end_t - start_t
+        n_steps = max(2, int(exec_duration / self.config.dt))
+        t_exec = np.linspace(start_t, end_t, n_steps)
 
         ok = True
         for i in range(n_steps):
-            idx_float = segment_indices[i]
-            idx_lo = int(np.floor(idx_float))
-            idx_hi = min(idx_lo + 1, n_waypoints - 1)
-            frac = idx_float - idx_lo
-            interp_qpos = (1 - frac) * waypoints[idx_lo] + frac * waypoints[idx_hi]
+            interp_qpos = interp(t_exec[i])
             if not self.send_action(interp_qpos):
                 ok = False
                 break
@@ -683,14 +623,16 @@ class XHand(ConnectionStateMixin):
             jointboard_err[idx] = int(getattr(item, "jonitboard_err", getattr(item, "jointboard_err", 0)))
             tipboard_err[idx] = int(getattr(item, "tipboard_err", 0))
 
-        self.last_commboard_err = commboard_err.copy()
-        self.last_jointboard_err = jointboard_err.copy()
-        self.last_tipboard_err = tipboard_err.copy()
-
+        tactile_force_sum = self.parse_tactile_sum(hand_state)
         state = {
             "qpos": qpos,
             "current": current,
             "timestamp": time.time(),
+            # Tactile data in default mode (ref: DexUMI eval_xhand.py:40-57).
+            # (5,120,3) raw force array + (5,3) combined force per finger.
+            "tactile_force": self.parse_tactile(hand_state),
+            "tactile_force_sum": tactile_force_sum,
+            "tactile_contact": self.detect_contact(force_sum=tactile_force_sum),
         }
 
         if full:
@@ -703,10 +645,6 @@ class XHand(ConnectionStateMixin):
                     "commboard_err": commboard_err,
                     "jointboard_err": jointboard_err,
                     "tipboard_err": tipboard_err,
-                    "tactile_force": self.parse_tactile(hand_state, scaled=True),
-                    "tactile_force_raw": self.parse_tactile(hand_state, scaled=False),
-                    "tactile_force_sum": self.parse_tactile_sum(hand_state, scaled=True),
-                    "tactile_force_sum_raw": self.parse_tactile_sum(hand_state, scaled=False),
                     "tactile_temperature": self.parse_tactile_temperature(hand_state),
                     "connected_flag": self.connected_flag,
                     "error_state": self.error_state,
@@ -714,13 +652,11 @@ class XHand(ConnectionStateMixin):
                     "last_error_code": self.last_error_code,
                     "last_error_message": self.last_error_message,
                     "last_joint_limit_clipped": self.last_joint_limit_clipped,
-                    "last_delta_limited": self.last_delta_limited,
                     "last_hand_ids": self.last_hand_ids,
                     "comm_type": self.cached_comm_type,
                     "device_name": self.device_name,
                     "joint_names": JOINT_NAMES,
                     "sensor_names": SENSOR_NAMES,
-                    "tactile_contact": self.detect_contact(),  # F1
                 }
             )
         return state
@@ -731,7 +667,11 @@ class XHand(ConnectionStateMixin):
             sensor_data = getattr(hand_state, "sensor_data", [])
         return enumerate(list(sensor_data)[:5])
 
-    def parse_tactile(self, hand_state, scaled: bool = True) -> np.ndarray:
+    def parse_tactile(self, hand_state) -> np.ndarray:
+        """Parse raw tactile force array (5 fingers × 120 points × 3 axes).
+
+        Returns raw sensor values without scaling (ref: DexUMI, skill-teleop).
+        """
         tactile = np.zeros((5, 120, 3), dtype=np.float64)
         for i, sensor in self._iter_sensors(hand_state):
             raw_force = getattr(sensor, "raw_force", [])
@@ -739,12 +679,13 @@ class XHand(ConnectionStateMixin):
                 tactile[i, j, 0] = float(getattr(force, "fx", 0.0))
                 tactile[i, j, 1] = float(getattr(force, "fy", 0.0))
                 tactile[i, j, 2] = float(getattr(force, "fz", 0.0))
-
-        if scaled:
-            tactile *= self.config.tactile_scale
         return tactile
 
-    def parse_tactile_sum(self, hand_state, scaled: bool = True) -> np.ndarray:
+    def parse_tactile_sum(self, hand_state) -> np.ndarray:
+        """Parse combined force per finger (5 × 3 axes).
+
+        Returns raw sensor values without scaling (ref: DexUMI, skill-teleop).
+        """
         force_sum = np.zeros((5, 3), dtype=np.float64)
         for i, sensor in self._iter_sensors(hand_state):
             calc_force = getattr(sensor, "calc_force", None)
@@ -753,9 +694,6 @@ class XHand(ConnectionStateMixin):
             force_sum[i, 0] = float(getattr(calc_force, "fx", 0.0))
             force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0))
             force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0))
-
-        if scaled:
-            force_sum *= self.config.tactile_scale
         return force_sum
 
     def parse_tactile_temperature(self, hand_state) -> np.ndarray:
@@ -769,91 +707,22 @@ class XHand(ConnectionStateMixin):
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
         # XHand variant: same np.clip logic as XArm7._limit_joint_range (xarm7.py:855)
         # but with different clipping targets (hand finger ranges vs arm joint ranges).
+        # clip_report_tolerance suppresses false CLIP flags from sub-degree retargeting noise.
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
 
         clipped = np.clip(qpos, self.config.qpos_min, self.config.qpos_max)
-        self.last_joint_limit_clipped = not np.allclose(qpos, clipped)
+        max_deviation = float(np.max(np.abs(qpos - clipped)))
+        self.last_joint_limit_clipped = max_deviation > self.config.clip_report_tolerance
         return clipped
-
-    def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
-        """Clip target_qpos per-joint independently against max_qvel * dt.
-
-        XHand clips each finger joint independently — finger joints have
-        independent range/velocity constraints and coupling them is
-        undesirable for dexterous manipulation.
-
-        Delta reference uses hardware position (from background state reader)
-        when available, falling back to last_qpos_cmd on first frame or when
-        the reader is disabled. (ref: BunnyVisionPro / LeFranX hardware ref pattern)
-        """
-        if not self.config.use_delta_limit:
-            self.last_delta_limited = False
-            return target_qpos
-
-        now = time.time()
-
-        if self.last_qpos_cmd is None:
-            state = self.get_state(force_update=True)
-            self.last_qpos_cmd = state["qpos"].copy()
-            if not np.all(np.isfinite(self.last_qpos_cmd)):
-                self.last_qpos_cmd = self._array12(self.config.home_qpos)
-
-        if self.last_cmd_time is None:
-            self.last_cmd_time = now
-
-        dt_raw = now - self.last_cmd_time
-        dt = min(max(dt_raw, self.config.dt), self.config.dt * 10)
-        # dt floor: prevents divide-by-zero / infinite speed when commands
-        #   arrive faster than expected.
-        # dt ceiling (10× dt): caps the allowed step to ~0.2s @ 50Hz.
-        #   Without this, a 500ms control loop stall (GC, system pause)
-        #   allows max_qvel * 0.5s jump per joint (e.g. 180°/s * 0.5s = 90°).
-        #   Ref: XArm7._limit_joint_step (xarm7.py:934).
-        max_step = self.config.max_qvel * dt
-
-        # Use hardware position as delta reference (ref: BunnyVisionPro xarm7_ability.py:177-183,
-        # LeFranX utils.py ensure_safe_goal_position). Prevents error accumulation when
-        # hardware lags behind commands.
-        # Falls back to last_qpos_cmd when cached state is invalid (first frame, reader not started).
-        if self.config.use_background_state_reader and self._state_thread is not None:
-            with self._state_lock:
-                cached = self._latest_state
-            if cached is not None:
-                hw_qpos = np.asarray(cached.get("qpos", None) or nan_array(12), dtype=np.float64)
-                if np.all(np.isfinite(hw_qpos)) and hw_qpos.shape == (12,):
-                    raw_step = target_qpos - hw_qpos
-                    step = np.clip(raw_step, -max_step, max_step)
-                    self.last_delta_limited = not np.allclose(raw_step, step)
-                    return hw_qpos + step
-
-        # Fallback: use last command as reference (original behavior, for first frame or
-        # when background reader is disabled).
-        raw_step = target_qpos - self.last_qpos_cmd
-        step = np.clip(raw_step, -max_step, max_step)
-        self.last_delta_limited = not np.allclose(raw_step, step)
-        return self.last_qpos_cmd + step
 
     def is_valid_qpos_state(self, state: dict[str, Any]) -> bool:
         qpos = state.get("qpos", None)
         if qpos is None:
             return False
-
         qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
-        if qpos.size != 12:
-            return False
-
-        if not np.all(np.isfinite(qpos)):
-            return False
-
-        finger_ids = state.get("finger_ids", None)
-        if finger_ids is not None:
-            finger_ids = np.asarray(finger_ids).reshape(-1)
-            if finger_ids.size >= 12 and np.sum(finger_ids[:12] >= 0) < 12:
-                return False
-
-        return True
+        return qpos.size == 12 and np.all(np.isfinite(qpos))
 
     def _array12(self, value) -> np.ndarray:
         return safe_resize(value, 12)
@@ -868,9 +737,7 @@ class XHand(ConnectionStateMixin):
             "jointboard_err": np.zeros(12, dtype=np.int32),
             "tipboard_err": np.zeros(12, dtype=np.int32),
             "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
-            "tactile_force_raw": np.zeros((5, 120, 3), dtype=np.float64),
             "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
-            "tactile_force_sum_raw": np.zeros((5, 3), dtype=np.float64),
             "tactile_temperature": nan_array((5, 20)),
             "connected_flag": self.connected_flag,
             "error_state": self.error_state,
@@ -878,7 +745,6 @@ class XHand(ConnectionStateMixin):
             "last_error_code": self.last_error_code,
             "last_error_message": self.last_error_message,
             "last_joint_limit_clipped": self.last_joint_limit_clipped,
-            "last_delta_limited": self.last_delta_limited,
             "last_hand_ids": self.last_hand_ids,
             "comm_type": self.cached_comm_type,
             "device_name": self.device_name,
@@ -932,9 +798,7 @@ class XHand(ConnectionStateMixin):
             msg_lower = msg.lower()
             for pattern in _KNOWN_SENSOR_ERROR_PATTERNS:
                 if pattern in msg_lower:
-                    self.last_sensor_error_filtered = msg
+                    logger.debug("XHand filtered known sensor error (code=%d): %s", code, msg)
                     return  # do NOT set error_state for known non-critical errors
 
         self.error_state = True
-
-

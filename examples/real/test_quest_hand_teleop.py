@@ -230,8 +230,7 @@ def test_quest_hand_teleop() -> None:
                 qpos = xhand.get_state()["qpos"]
                 age_ms = tracker_status.get("frame_age_s", 0) * 1000
                 clipped = "CLIP" if xhand.last_joint_limit_clipped else ""
-                dlimited = "DLIM" if xhand.last_delta_limited else ""
-                flags = " ".join(f for f in [clipped, dlimited] if f) or "ok"
+                flags = clipped or "ok"
                 print(
                     f"[t={now:.1f}] frames={frame_count} "
                     f"retarget_ok={retarget_count} fail={retarget_fail_count} "
