@@ -26,33 +26,29 @@
 
 键位:
     B   - Begin:  开始遥操作 + 录制（重置 mapper，开始 episode）
-                  SAVE_PROMPT 下：保存当前 episode + 立即开始新 episode
     C   - Pause:  暂停/恢复遥操作。暂停时冻结 EEF，
                   恢复时自动重新标定 mapper（抵消暂停期间的漂移）。
     H   - Home:   规划路径回 home → IDLE（停止录制并丢弃）
-    S   - Stop:   停止录制 → 提示保存/丢弃；SAVE_PROMPT 下确认保存
-    Q   - Quit:   结束遥操作 → 提示保存/丢弃；SAVE_PROMPT 下丢弃；
+    S   - Stop:   停止录制 → 自动保存 → IDLE
+    Q   - Quit:   结束遥操作 → 自动保存 → IDLE；
                   IDLE 下需双击确认退出（2 秒内）
     ESC - 紧急停止（仅 Q 可退出）
 
 状态机:
     IDLE ──B──→ TELEOP_RECORDING  (start_episode, reset_mapper)
-    TELEOP_RECORDING ──H──→ return_home → IDLE
+    TELEOP_RECORDING ──H──→ return_home → IDLE (discard)
     TELEOP_RECORDING ──C──→ PAUSED (冻结 EEF)
     PAUSED ──C──→ TELEOP_RECORDING (自动 re-anchor mapper，恢复录制)
-    PAUSED ──H──→ return_home → IDLE
-    TELEOP_RECORDING ──S──→ SAVE_PROMPT (stop_episode)
-    TELEOP_RECORDING ──Q──→ SAVE_PROMPT (stop_episode)
-    PAUSED ──S──→ SAVE_PROMPT (stop_episode)
-    PAUSED ──Q──→ SAVE_PROMPT (stop_episode)
-    SAVE_PROMPT ──S──→ IDLE (save episode to disk)
-    SAVE_PROMPT ──Q──→ IDLE (discard episode)
-    SAVE_PROMPT ──B──→ TELEOP_RECORDING (save + new episode，跳过 IDLE)
+    PAUSED ──H──→ return_home → IDLE (discard)
+    TELEOP_RECORDING ──S──→ IDLE (auto-save episode)
+    TELEOP_RECORDING ──Q──→ IDLE (auto-save episode)
+    PAUSED ──S──→ IDLE (auto-save episode)
+    PAUSED ──Q──→ IDLE (auto-save episode)
     IDLE ──Q──→ 双击确认退出（2 秒内再按确认，其他按键取消）
     ESC (any) ──→ ESTOP (仅 Q 可退出)
 
 Phase 7 新增特性:
-    - CollectionLoop: sidecar JSON + 文件分类路由 + 预录制缓冲区
+    - CollectionLoop: sidecar JSON
     - VRFrameSimulator: --dummy-vr-sinusoidal 正弦手腕轨迹
     - cbreak 键盘: termios + select 替代 pynput（与 KeyboardHandler 同技术栈）
     - 追踪安全: |q_actual - q_cmd| 偏差监控
@@ -403,19 +399,6 @@ def main() -> None:
         "--camera-height", type=int, default=CAMERA_HEIGHT,
         help=f"相机图像高度（默认: {CAMERA_HEIGHT}）",
     )
-    # ── Phase 7 新增 CLI 参数 ──
-    parser.add_argument(
-        "--pre-record-duration", type=float, default=2.0,
-        help="预录制缓冲区时长 (s)，按 R 前缓冲的帧数（Phase 3.1，默认: 2.0）",
-    )
-    parser.add_argument(
-        "--success-dir", type=str, default=None,
-        help="成功 episode 文件路由目录（Phase 1.2，默认: 不路由）",
-    )
-    parser.add_argument(
-        "--failure-dir", type=str, default=None,
-        help="失败 episode 文件路由目录（Phase 1.2，默认: 不路由）",
-    )
     args = parser.parse_args()
 
     # ── VR Tracker 初始化 ──
@@ -512,9 +495,6 @@ def main() -> None:
     collection_config = CollectionConfig(
         task_label="teleop",
         operator="",
-        pre_record_duration_s=args.pre_record_duration,
-        success_dir=args.success_dir,
-        failure_dir=args.failure_dir,
         save_sidecar_json=True,
     )
     collection = CollectionLoop(recorder, collection_config)
@@ -550,7 +530,7 @@ def main() -> None:
         print("[Camera] 已通过 --no-camera 禁用")
 
     # ── 控制状态变量 ──
-    state = "IDLE"               # IDLE | TELEOP_RECORDING | PAUSED | SAVE_PROMPT
+    state = "IDLE"               # IDLE | TELEOP_RECORDING | PAUSED
     rate_limiter = RateLimiter(CTRL_HZ)
     prev_arm_cmd = sim.get_full_qpos()[:7].copy()
     prev_hand_cmd = sim.get_full_qpos()[7:].copy()
@@ -561,7 +541,6 @@ def main() -> None:
     stale_frame_count = 0
     episode_tick_count = 0       # Phase 1.2: 当前 episode 内的 tick 计数
     episode_idx = 0
-    last_episode_path: str | None = None  # set by Q handler, read by S/N handlers
     last_status_time = time.perf_counter()
     # VR 丢帧计时（用于软减速）
     lost_since_ns: int | None = None
@@ -574,11 +553,6 @@ def main() -> None:
     print("VR Teleop — xArm7+XHand SAPIEN 仿真 + 数据录制")
     print(f"  Mode:       {'VRFrameSimulator' if args.dummy_vr_sinusoidal else ('Dummy (no headset)' if args.dummy else 'Quest VR')}")
     print(f"  Data dir:   {args.data_dir}")
-    print(f"  Pre-record: {args.pre_record_duration}s")
-    if args.success_dir:
-        print(f"  Success dir: {args.success_dir}")
-    if args.failure_dir:
-        print(f"  Failure dir: {args.failure_dir}")
     print(f"  Home EEF:   pos={np.round(home_eef.p, 3)}")
     print("  B: 开始遥操作+录制  |  C: 暂停/恢复  |  H: 回 home")
     print("  Q: 退出/丢弃         |  S: 停止/保存   |  ESC: 紧急停止")
@@ -629,8 +603,7 @@ def main() -> None:
                     # ── Q: 上下文重载（停止录制 / 丢弃 / 退出）──
                     if sig == ControlSignal.QUIT:
                         if state in ("TELEOP_RECORDING", "PAUSED"):
-                            # 计算 episode 质量指标 → stop_episode → SAVE_PROMPT
-                            # 使用累计失败总数（非连续计数），正确反映真实 IK 失败率
+                            # Auto-save → IDLE (matches TeleopController behavior)
                             ik_rate = 1.0 - min(
                                 ik_fail_total / max(episode_tick_count, 1), 1.0,
                             )
@@ -647,19 +620,13 @@ def main() -> None:
                                 vr_drop_rate=round(vr_drop, 4),
                             )
                             old_state = state
-                            state = "SAVE_PROMPT"
-                            last_episode_path = path
-                            print(f"\n=== STATE: {old_state} → SAVE_PROMPT ===")
+                            state = "IDLE"
+                            if path:
+                                print(f"[Save] Episode saved to {path}")
+                            print(f"\n=== STATE: {old_state} → IDLE (auto-saved) ===")
                             print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
                             print(f"  classification={classification} ik_rate={ik_rate:.2%} vr_drop={vr_drop:.2%}")
-                            print("  S: 保存 episode  |  Q: 丢弃  |  B: 保存+新episode")
-                        elif state == "SAVE_PROMPT":
-                            # 丢弃并返回 IDLE
-                            collection.discard_episode()
-                            last_episode_path = None
-                            state = "IDLE"
-                            print("=== STATE: SAVE_PROMPT → IDLE (discarded) ===")
-                            print("[State] IDLE — episode 已丢弃，按 B 开始新的遥操作")
+                            print("[State] IDLE — 按 B 开始新的遥操作")
                         else:
                             # IDLE: double-tap Q to confirm exit (Opt 2)
                             now = time.perf_counter()
@@ -705,38 +672,6 @@ def main() -> None:
                                 )
                             else:
                                 print("[State] 无法获取 VR 帧，请确保 tracker 已连接")
-                        elif state == "SAVE_PROMPT":
-                            # Save + start new episode — skip IDLE roundtrip (Opt 1)
-                            frame = tracker.get_latest()
-                            sim_state = sim.get_state()
-                            if frame is not None:
-                                arm_mapper.reset(
-                                    wrist_pos=frame["wrist_pos"],
-                                    wrist_quat_wxyz=frame["wrist_quat_wxyz"],
-                                    eef_pos=sim_state["eef_pos"],
-                                    eef_quat_wxyz=sim_state["eef_quat_wxyz"],
-                                )
-                                episode_idx += 1
-                                collection.start_episode(
-                                    task_label="teleop", operator="",
-                                    camera_K=camera_K,
-                                )
-                                state = "TELEOP_RECORDING"
-                                ik_fail_total = 0
-                                ik_fail_consecutive = 0
-                                retarget_fail_total = 0
-                                retarget_fail_consecutive = 0
-                                stale_frame_count = 0
-                                episode_tick_count = 0
-                                consecutive_divergence = 0
-                                lost_since_ns = None
-                                print(
-                                    f"\n=== STATE: SAVE_PROMPT → TELEOP_RECORDING (saved + new episode) ==="
-                                    f"\n[State] TELEOP_RECORDING  episode=#{episode_idx}"
-                                    f"  EEF={np.round(sim_state['eef_pos'], 3)}"
-                                )
-                            else:
-                                print("[State] 无法获取 VR 帧，请确保 tracker 已连接")
 
                     # ── H: Home — 规划路径回 home → IDLE（对齐 controller.py）──
                     if sig == ControlSignal.HOME:
@@ -768,8 +703,6 @@ def main() -> None:
                             prev_arm_cmd = sim.get_full_qpos()[:7].copy()
                             prev_hand_cmd = sim.get_full_qpos()[7:].copy()
                             print("=== STATE: HOME → IDLE ===")
-                        elif state == "SAVE_PROMPT":
-                            print("[Home] 请先按 S 保存、Q 丢弃或 B 保存+新 episode")
 
                     # ── C: Pause / Resume — 冻结/恢复遥操作 ──
                     if sig == ControlSignal.PAUSE:
@@ -812,23 +745,10 @@ def main() -> None:
                                     lost_msg = f" (VR 丢失 {lost_dur:.1f}s)"
                                 print(f"[Resume] 无法获取 VR 帧，恢复失败{lost_msg}")
                                 print("         检查头显连接 / HTS SDK。按 H 回 home，Q 停止。")
-                        elif state == "SAVE_PROMPT":
-                            print("[Pause] 请先按 S 保存、Q 丢弃或 B 保存+新 episode")
-
-                    # ── S: Stop — 停止录制 → SAVE_PROMPT；SAVE_PROMPT 下保存 → IDLE ──
+                    # ── S: Stop — 停止录制 → 自动保存 → IDLE ──
                     if sig == ControlSignal.STOP:
-                        if state == "SAVE_PROMPT":
-                            # 确认保存
-                            if last_episode_path is not None:
-                                print(f"[Save] Episode saved to {last_episode_path}")
-                            else:
-                                print("[Save] Episode saved (no path returned)")
-                            last_episode_path = None
-                            state = "IDLE"
-                            print("=== STATE: SAVE_PROMPT → IDLE (saved) ===")
-                            print("[State] IDLE — 按 B 开始新的遥操作")
-                        elif state in ("TELEOP_RECORDING", "PAUSED"):
-                            # 停止录制 → SAVE_PROMPT
+                        if state in ("TELEOP_RECORDING", "PAUSED"):
+                            # Auto-save → IDLE (matches TeleopController behavior)
                             ik_rate = 1.0 - min(
                                 ik_fail_total / max(episode_tick_count, 1), 1.0,
                             )
@@ -845,12 +765,13 @@ def main() -> None:
                                 vr_drop_rate=round(vr_drop, 4),
                             )
                             old_state = state
-                            state = "SAVE_PROMPT"
-                            last_episode_path = path
-                            print(f"\n=== STATE: {old_state} → SAVE_PROMPT ===")
+                            state = "IDLE"
+                            if path:
+                                print(f"[Save] Episode saved to {path}")
+                            print(f"\n=== STATE: {old_state} → IDLE (auto-saved) ===")
                             print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
                             print(f"  classification={classification}")
-                            print("  S: 保存 episode  |  Q: 丢弃  |  B: 保存+新episode")
+                            print("[State] IDLE — 按 B 开始新的遥操作")
 
                 # ═══════════════════════════════════════════════════════════
                 # TELEOP_RECORDING 控制 tick
@@ -888,19 +809,6 @@ def main() -> None:
                         prev_arm_cmd = arm_blend.copy()
                         prev_hand_cmd = hand_blend.copy()
 
-                        # ── Pre-record buffer（Phase 3.1）──
-                        try:
-                            robot_state = build_robot_state(sim_state)
-                            robot_action = build_robot_action(arm_blend, hand_blend, None)
-                            collection.add_pre_frame(
-                                state=robot_state,
-                                action=robot_action,
-                                vr_frame={},  # no valid VR frame
-                                camera_frame=None,
-                                T_base_eef=None,
-                            )
-                        except (ValueError, OSError):
-                            pass
                     else:
                         # ── VR 帧有效：正常控制 ──
                         lost_since_ns = None      # 重置丢帧计时
@@ -959,21 +867,7 @@ def main() -> None:
                             except (RuntimeError, AttributeError) as e:
                                 print(f"[Camera] T_base_eef 计算失败: {e}")
 
-                        # ── Pre-record buffer（Phase 3.1）──
-                        try:
-                            robot_state = build_robot_state(sim_state)
-                            robot_action = build_robot_action(arm_cmd, hand_cmd, target_eef_pos)
-                            collection.add_pre_frame(
-                                state=robot_state,
-                                action=robot_action,
-                                vr_frame=frame,
-                                camera_frame=camera_frame,
-                                T_base_eef=T_base_eef,
-                            )
-                        except (ValueError, OSError):
-                            pass
-
-                        # 4. 录制帧（使用 CollectionLoop — Phase 1.2）
+                        # 4. 录制帧（使用 CollectionLoop）
                         if collection.is_recording:
                             try:
                                 robot_state = build_robot_state(sim_state)
@@ -1034,8 +928,8 @@ def main() -> None:
                     sim.robot.apply_action(full_cmd)
                     sim._step_physics(n=PHYSICS_STEPS_PER_TICK)
 
-                elif state == "IDLE" or state == "SAVE_PROMPT":
-                    # IDLE / SAVE_PROMPT: 仅推进物理（PD 保持当前位置）
+                elif state == "IDLE":
+                    # IDLE: 仅推进物理（PD 保持当前位置）
                     sim._step_physics(n=1)
 
                 # ── 渲染 ──
@@ -1087,8 +981,6 @@ def main() -> None:
                         )
                     elif state == "ESTOP":
                         status = "[ESTOP] 紧急停止 — 仅 Q 可退出"
-                    elif state == "SAVE_PROMPT":
-                        status = "[SAVE_PROMPT] S: 保存  |  Q: 丢弃  |  B: 保存+新episode"
                     else:
                         status = f"[IDLE] EEF={np.round(sim_state['eef_pos'], 3)}"
                     print(status)

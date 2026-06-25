@@ -1,28 +1,6 @@
-"""EpisodeRecorder — HDF5-based teleoperation data recorder.
+"""EpisodeRecorder — HDF5-based teleoperation data recorder (simplified).
 
-HDF5 structure (per recording-spec.md):
-
-    episode_000.h5
-      /meta: task_label, operator, tags, duration, fps,
-             num_frames, num_valid_frames, success,
-             camera_serial, camera_type,
-             camera_K,                             # [fx, fy, cx, cy]
-             camera_T_base_camera | camera_T_eef_camera,  # 4x4 flat
-             retargeting_config, pipeline_snapshot
-      /obs/arm_qpos(7)  arm_qvel(7)  arm_tau(7)  eef_pos(3)  eef_quat(4)
-      /obs/hand_qpos(12)  hand_tactile_sum(5,3)
-      /action/arm_qpos(7)  hand_qpos(12)
-      /vr/wrist_pos(3)  wrist_quat(4)  landmarks(21,3)
-      /camera/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)     # single-camera (backward compat)
-      /camera/<serial>/rgb(T,H,W,3)  depth(T,H,W)  timestamps(T)  # multi-camera
-      /camera/K(3,3)                        # intrinsics matrix
-      /camera/extrinsics(T,4,4)             # T_base_camera, per-frame extrinsics
-      /timestamps(T,)                       # control loop timestamps
-      /vr_timestamps(T,)                    # VR frame receive timestamps
-
-Supports two write modes:
-  - Direct: per-frame h5py.Dataset.resize() (legacy, simple, many resize calls)
-  - Batch:  pre-allocated InMemoryFrameBuffer with batch flush every 100 frames
+Uses direct per-frame h5py.Dataset.resize() write mode.
 """
 
 from __future__ import annotations
@@ -39,7 +17,6 @@ import numpy as np
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.pipeline_config import DEFAULT_MAX_RECORD_FRAMES
 from dexmani_real.log import get_logger
-from dexmani_real.robot.interface import RobotAction, RobotState
 
 logger = get_logger(__name__)
 
@@ -48,22 +25,16 @@ class EpisodeRecorder:
     """Records teleoperation episodes to HDF5 files.
 
     Lifecycle: start_episode() → add_frame() × N → stop_episode()
-
-    Two write modes:
-      - use_batch_buffer=True (default): InMemoryFrameBuffer with batch flush (fast, recommended).
-      - use_batch_buffer=False: per-frame h5py resize (simple, legacy).
     """
 
     def __init__(
         self,
         data_dir: str,
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
-        use_batch_buffer: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.max_frames = max_frames
-        self.use_batch_buffer = use_batch_buffer
 
         self._file: h5py.File | None = None
         self._frame_count: int = 0
@@ -71,12 +42,7 @@ class EpisodeRecorder:
         self._max_frames_reached: bool = False
         self._start_time: float | None = None
         self._episode_path: str | None = None
-
-        # Expandable datasets — use chunked + resizable storage (direct mode)
         self._datasets: dict[str, Any] = {}
-
-        # Batch buffer (batch mode)
-        self._buffer: Any = None  # InMemoryFrameBuffer
 
     @property
     def is_recording(self) -> bool:
@@ -88,7 +54,6 @@ class EpisodeRecorder:
 
     @property
     def max_frames_reached(self) -> bool:
-        """True when the episode has hit max_frames and needs stop_episode()."""
         return self._max_frames_reached
 
     def start_episode(
@@ -100,11 +65,9 @@ class EpisodeRecorder:
         camera_K: np.ndarray | None = None,
         camera_name: str | None = None,
     ) -> bool:
-        """Create a new HDF5 episode file and write initial metadata."""
         if self._recording:
             return False
 
-        # Find next episode index
         idx = 0
         while (self.data_dir / f"episode_{idx:03d}.h5").exists():
             idx += 1
@@ -118,14 +81,12 @@ class EpisodeRecorder:
         self._recording = True
         self._datasets = {}
 
-        # ── /meta ──
         meta = self._file.create_group("meta")
         meta.attrs["task_label"] = task_label
         meta.attrs["operator"] = operator
         meta.attrs["tags"] = ",".join(tags) if tags else ""
-        meta.attrs["fps"] = 50.0  # will be updated at stop
+        meta.attrs["fps"] = 50.0
 
-        # Camera calibration metadata
         if calib is not None and camera_name is not None:
             calib_meta = calib.to_meta_dict(camera_name)
             meta.attrs["camera_serial"] = calib_meta.get("camera_serial", "")
@@ -134,77 +95,33 @@ class EpisodeRecorder:
                 meta.attrs["camera_T_base_camera"] = calib_meta["camera_T_base_camera"]
             if "camera_T_eef_camera" in calib_meta:
                 meta.attrs["camera_T_eef_camera"] = calib_meta["camera_T_eef_camera"]
-
         if camera_K is not None:
-            meta.attrs["camera_K"] = camera_K.flatten().tolist()  # [fx, fy, cx, cy]
+            meta.attrs["camera_K"] = camera_K.flatten().tolist()
 
-        # ── Create groups ──
         self._file.create_group("obs")
         self._file.create_group("action")
         self._file.create_group("vr")
-
-        # ── Initialize batch buffer if enabled ──
-        if self.use_batch_buffer:
-            from dexmani_real.recording.frame_buffer import InMemoryFrameBuffer
-
-            self._buffer = InMemoryFrameBuffer(
-                max_frames=self.max_frames,
-                h5_file=self._file,
-            )
 
         return True
 
     def add_frame(
         self,
-        state: RobotState,
-        action: RobotAction,
+        state,
+        action,
         vr_frame: dict[str, Any],
         camera_frame: dict[str, Any] | None = None,
         T_base_eef: np.ndarray | None = None,
         camera_frames: dict[str, dict[str, Any]] | None = None,
     ) -> bool:
-        """Append one frame to the HDF5 file.
-
-        Args:
-            state: Current robot state.
-            action: Computed robot action.
-            vr_frame: VR tracking frame dict.
-            camera_frame: Single camera frame dict (backward compat).
-            T_base_eef: 4x4 base→EEF transform for camera extrinsics.
-            camera_frames: Multi-camera frames dict (name → frame dict).
-        """
         if not self._recording or self._file is None:
             return False
 
-        # Hard cap: auto-stop when max_frames reached (prevents disk exhaustion).
-        # We set a flag rather than calling stop_episode() here to avoid the
-        # reentrancy hazard of stop_episode() closing self._file while the
-        # caller may still hold references to it. The caller (CollectionLoop)
-        # checks max_frames_reached and calls stop_episode() from a safe context.
         if self._frame_count >= self.max_frames:
             logger.warning("Episode reached max_frames=%d, auto-stopping.", self.max_frames)
-            self._file.attrs["stopped_reason"] = "max_frames"
             self._max_frames_reached = True
             return False
 
-        if self._buffer is not None:
-            # Batch mode: O(1) numpy assignment
-            vr_ts = vr_frame.get("local_recv_ns")
-            ok = self._buffer.add_frame(
-                state=state,
-                action=action,
-                vr_frame=vr_frame,
-                camera_frame=camera_frame,
-                camera_frames=camera_frames,
-                T_base_eef=T_base_eef,
-                timestamp_ns=int(time.perf_counter_ns()),
-                vr_timestamp_ns=vr_ts,
-            )
-            if ok:
-                self._frame_count += 1
-            return ok
-
-        # Direct mode (legacy): per-frame resize + write
+        # Observation
         self._append_or_create("obs/arm_qpos", state.arm_qpos)
         self._append_or_create("obs/arm_qvel", state.arm_qvel)
         self._append_or_create("obs/arm_tau", state.arm_tau)
@@ -213,9 +130,11 @@ class EpisodeRecorder:
         self._append_or_create("obs/hand_qpos", state.hand_qpos)
         self._append_or_create("obs/hand_tactile_sum", state.hand_tactile_sum)
 
+        # Action
         self._append_or_create("action/arm_qpos", action.arm_qpos_cmd)
         self._append_or_create("action/hand_qpos", action.hand_qpos_cmd)
 
+        # VR
         self._append_or_create("vr/wrist_pos", vr_frame["wrist_pos"])
         self._append_or_create("vr/wrist_quat", vr_frame["wrist_quat_wxyz"])
         self._append_or_create("vr/landmarks", vr_frame["landmarks"])
@@ -224,26 +143,18 @@ class EpisodeRecorder:
         ts_arr = np.array([time.perf_counter()], dtype=np.float64)
         if "timestamps" not in self._datasets:
             self._datasets["timestamps"] = self._file.create_dataset(
-                "timestamps",
-                data=ts_arr,
-                maxshape=(None,),
-                chunks=True,
-                dtype=np.float64,
+                "timestamps", data=ts_arr, maxshape=(None,), chunks=True, dtype=np.float64,
             )
         else:
             self._resize_append("timestamps", ts_arr)
 
-        vr_ts_arr = np.array([vr_frame.get("local_recv_ns", 0) * 1e-9], dtype=np.float64)
+        vr_ts = np.array([vr_frame.get("local_recv_ns", 0) * 1e-9], dtype=np.float64)
         if "vr_timestamps" not in self._datasets:
             self._datasets["vr_timestamps"] = self._file.create_dataset(
-                "vr_timestamps",
-                data=vr_ts_arr,
-                maxshape=(None,),
-                chunks=True,
-                dtype=np.float64,
+                "vr_timestamps", data=vr_ts, maxshape=(None,), chunks=True, dtype=np.float64,
             )
         else:
-            self._resize_append("vr_timestamps", vr_ts_arr)
+            self._resize_append("vr_timestamps", vr_ts)
 
         # Camera extrinsics
         if T_base_eef is not None:
@@ -260,37 +171,24 @@ class EpisodeRecorder:
                 T_base_camera = T_base_eef
             self._append_or_create("camera/extrinsics", T_base_camera)
 
-        # Camera frames (RGB + depth) — single-camera (backward compat)
+        # Camera frames (single-camera)
         if camera_frame is not None:
             rgb = camera_frame.get("rgb")
             depth = camera_frame.get("depth")
             ts = camera_frame.get("timestamp", 0.0)
-
             if "camera/rgb" not in self._datasets:
                 if rgb is not None:
-                    maxshape = (None,) + rgb.shape
                     self._datasets["camera/rgb"] = self._file.create_dataset(
-                        "camera/rgb",
-                        data=rgb[np.newaxis, ...],
-                        maxshape=maxshape,
-                        chunks=True,
-                        dtype=rgb.dtype,
+                        "camera/rgb", data=rgb[np.newaxis, ...],
+                        maxshape=(None,) + rgb.shape, chunks=True, dtype=rgb.dtype,
                     )
                 if depth is not None:
-                    maxshape = (None,) + depth.shape
                     self._datasets["camera/depth"] = self._file.create_dataset(
-                        "camera/depth",
-                        data=depth[np.newaxis, ...],
-                        maxshape=maxshape,
-                        chunks=True,
-                        dtype=depth.dtype,
+                        "camera/depth", data=depth[np.newaxis, ...],
+                        maxshape=(None,) + depth.shape, chunks=True, dtype=depth.dtype,
                     )
                 self._datasets["camera/timestamps"] = self._file.create_dataset(
-                    "camera/timestamps",
-                    data=[ts],
-                    maxshape=(None,),
-                    chunks=True,
-                    dtype=np.float64,
+                    "camera/timestamps", data=[ts], maxshape=(None,), chunks=True, dtype=np.float64,
                 )
             else:
                 if rgb is not None:
@@ -299,12 +197,11 @@ class EpisodeRecorder:
                     self._resize_append("camera/depth", depth)
                 self._resize_append("camera/timestamps", np.array([ts]))
 
-        # Multi-camera frames — per-camera path: /camera/<serial>/rgb
+        # Multi-camera frames
         if camera_frames:
             for cam_name, cam_frame in camera_frames.items():
                 if cam_frame is None:
                     continue
-                # Sanitize camera name for HDF5 path
                 safe_name = str(cam_name).replace("/", "_").replace("\\", "_")
                 rgb = cam_frame.get("rgb")
                 depth = cam_frame.get("depth")
@@ -316,29 +213,19 @@ class EpisodeRecorder:
 
                 if rgb_key not in self._datasets:
                     if rgb is not None and hasattr(rgb, "shape"):
-                        maxshape = (None,) + rgb.shape
                         self._datasets[rgb_key] = self._file.create_dataset(
-                            rgb_key,
-                            data=rgb[np.newaxis, ...],
-                            maxshape=maxshape,
-                            chunks=True,
+                            rgb_key, data=rgb[np.newaxis, ...],
+                            maxshape=(None,) + rgb.shape, chunks=True,
                             dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
                         )
                     if depth is not None and hasattr(depth, "shape"):
-                        maxshape = (None,) + depth.shape
                         self._datasets[depth_key] = self._file.create_dataset(
-                            depth_key,
-                            data=depth[np.newaxis, ...],
-                            maxshape=maxshape,
-                            chunks=True,
+                            depth_key, data=depth[np.newaxis, ...],
+                            maxshape=(None,) + depth.shape, chunks=True,
                             dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
                         )
                     self._datasets[ts_key] = self._file.create_dataset(
-                        ts_key,
-                        data=np.array([ts]),
-                        maxshape=(None,),
-                        chunks=True,
-                        dtype=np.float64,
+                        ts_key, data=np.array([ts]), maxshape=(None,), chunks=True, dtype=np.float64,
                     )
                 else:
                     if rgb is not None and hasattr(rgb, "shape"):
@@ -351,31 +238,18 @@ class EpisodeRecorder:
         return True
 
     def stop_episode(self, success: bool = True) -> str | None:
-        """Close the HDF5 file and finalize metadata. Returns file path."""
         if not self._recording or self._file is None:
             return None
 
-        # Flush batch buffer if active
-        if self._buffer is not None:
-            flushed = self._buffer.flush_all()
-            logger.debug("Batch buffer flushed: %d frames", flushed)
-            self._buffer.close()
-            self._buffer = None
-
         duration = time.perf_counter() - (self._start_time or 0.0)
-
         meta = self._file["meta"]
         meta.attrs["duration"] = duration
         meta.attrs["num_frames"] = self._frame_count
         meta.attrs["success"] = success
         meta.attrs["fps"] = self._frame_count / duration if duration > 0 else 0.0
         meta.attrs["min_frames_met"] = self._frame_count >= 50
-
-        # Camera frame presence
-        has_camera = "camera/timestamps" in self._file
-        meta.attrs["has_camera"] = has_camera
+        meta.attrs["has_camera"] = "camera/timestamps" in self._file
         meta.attrs["has_timestamps"] = "timestamps" in self._file
-        meta.attrs["has_vr_timestamps"] = "vr_timestamps" in self._file
 
         path = self._episode_path
         self._file.close()
@@ -389,19 +263,11 @@ class EpisodeRecorder:
         return path
 
     def _append_or_create(self, key: str, data: np.ndarray) -> None:
-        # Preserve original dtype for consistency with batch buffer path.
-        # _DATASET_SPECS in frame_buffer.py defines expected dtypes per key;
-        # we use the input data's dtype directly (the caller is responsible
-        # for providing correctly-typed data).
         arr = np.asarray(data)
         if key not in self._datasets:
-            maxshape = (None,) + arr.shape
             self._datasets[key] = self._file.create_dataset(
-                key,
-                data=arr[np.newaxis, ...],
-                maxshape=maxshape,
-                chunks=True,
-                dtype=arr.dtype,
+                key, data=arr[np.newaxis, ...], maxshape=(None,) + arr.shape,
+                chunks=True, dtype=arr.dtype,
             )
         else:
             self._resize_append(key, arr)

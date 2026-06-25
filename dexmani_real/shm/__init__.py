@@ -1,14 +1,7 @@
-"""Shared memory infrastructure for zero-copy cross-process sensor communication.
+"""Shared memory infrastructure for zero-copy cross-process communication.
 
-Provides lock-free FILO ring buffers in shared memory, numpy dtype layouts,
+Provides lock-free FILO ring buffers, PID process channels, numpy dtype layouts,
 and a centralized frame manager for VR and camera data streams.
-
-Usage:
-    from dexmani_real.shm import (
-        SharedMemoryRingBuffer,
-        SharedMemoryFrameManager,
-        CameraRingBuffer,
-    )
 """
 
 from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
@@ -20,6 +13,7 @@ from dexmani_real.shm.layouts import (
     camera_frame_to_bytes,
     vr_frame_to_array,
 )
+from dexmani_real.shm.pid_channels import PIDStateChannel, PIDTargetChannel
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
 
 __all__ = [
@@ -28,6 +22,8 @@ __all__ = [
     "CAMERA_FRAME_HEADER_DTYPE",
     "CameraRingBuffer",
     "camera_frame_to_bytes",
+    "PIDStateChannel",
+    "PIDTargetChannel",
     "SharedMemoryFrameManager",
     "SharedMemoryRingBuffer",
     "VR_FRAME_DTYPE",

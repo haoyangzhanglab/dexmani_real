@@ -1,9 +1,11 @@
 from dexmani_real.robot.interface import RobotInterface
+from dexmani_real.robot.pid_process import PIDProcess
 from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState, _ARM_TORQUE_LIMIT_NM
 from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 from dexmani_real.robot.xhand import XHand, XHandConfig
 
 __all__ = [
+    "PIDProcess",
     "RobotInterface",
     "RobotInterfaceConfig",
     "RobotState",

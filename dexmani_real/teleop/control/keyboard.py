@@ -4,15 +4,15 @@ Replaces the pynput + multiprocessing.Queue pattern with termios cbreak
 mode + select.select — no extra process/thread, no queue overhead.
 
 Unified 6-key mapping:
-    B  → BEGIN          (IDLE → TELEOP + recording)
+    B  → BEGIN          (IDLE → TELEOP + auto-recording)
     C  → PAUSE          (TELEOP ⇄ PAUSED)
-    S  → STOP           (stop recording → SAVE_PROMPT; SAVE_PROMPT→save→IDLE)
+    S  → STOP           (stop recording → auto-save → IDLE)
     H  → HOME           (return to home)
-    Q  → QUIT           (IDLE→quit; teleop→SAVE_PROMPT; SAVE_PROMPT→discard)
+    Q  → QUIT           (IDLE→quit; teleop→auto-save→IDLE)
     ESC → EMERGENCY_STOP
 
 Context-overloaded: BEGIN merges teleop start + recording (always together);
-QUIT serves dual role (stop→SAVE_PROMPT vs discard→exit).
+QUIT serves dual role (stop→auto-save vs idle→exit).
 
 Ref: T-Rex main_teleop.py EpisodeKeyListener — termios.tcgetattr /
      tty.setcbreak + select.select single-key response pattern.

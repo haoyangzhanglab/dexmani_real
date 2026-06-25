@@ -46,7 +46,9 @@ from dexmani_real.planning import (
     XArm7PlannerConfig,
 )
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
+from dexmani_real.robot.pid_process import PIDProcess
 from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.shm.pid_channels import PIDStateChannel, PIDTargetChannel
 from dexmani_real.planning.collision_config import CollisionConfig
 
 from examples._test_utils import quat_multiply
@@ -54,8 +56,9 @@ from examples._test_utils import quat_multiply
 # ═══════════════════════════════════════════════ 配置
 
 CTRL_DT = 0.02       # 50Hz
-DELTA_POS = 0.005    # 每次按键 EEF 平移量 (m)
+DELTA_POS = 0.005    # 每次按键 EEF 平移量 (m) — 用于 idle→移动过渡
 DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
+TARGET_LEAD_MAX = 0.03  # target 领先 arm 的最大距离 (m)，超过则限速
 # 外环键盘脚本只负责累积 target + 安全边界，不做滤波/裁剪。
 # Target Lead Governor (MAX_LEAD / chase_pos) 已删除 —
 # BunnyVisionPro 不存在该机制，VR 目标位姿直接入 IK。
@@ -245,16 +248,42 @@ class RateLimiter:
         self.last_wake = time.perf_counter()
 
 
-def do_return_home(robot: RobotInterface, planner: XArm7MotionPlanner):
-    """执行 return_home。"""
+def do_return_home(
+    robot: RobotInterface,
+    planner: XArm7MotionPlanner,
+    pid_process: PIDProcess | None = None,
+    pid_target: PIDTargetChannel | None = None,
+) -> PIDProcess | None:
+    """执行 return_home（停止 PID 进程 → 归位 → 重启 PID 进程）。
+
+    Returns:
+        新的 PIDProcess 实例（已启动），或 None（如果原 pid_process 为 None）。
+    """
     print("return_home ...", flush=True)
     try:
-        ok = robot.return_to_home(use_planning=True)
+        # Stop PID process before return_to_home to avoid mode conflicts
+        # (PID process uses mode 4 velocity control; return_to_home uses mode 1 position servo)
+        if pid_process is not None and pid_process.is_alive():
+            if pid_target is not None:
+                pid_target.write(None)  # signal deceleration
+            pid_process.stop()
+            print("  PID process stopped for return-to-home")
+
+        ok = robot.return_to_home()
         print(f"  {'OK' if ok else 'FAIL'}")
+
+        # Restart PID process
+        if pid_process is not None:
+            new_pid = PIDProcess()
+            new_pid.start()
+            print("  PID process restarted")
+            return new_pid
+        return None
     except Exception:
         traceback.print_exc()
         print("  return_to_home 异常，尝试 emergency_stop")
         robot.emergency_stop()
+        return None
 
 
 def main():
@@ -307,9 +336,6 @@ def main():
         print("arm 连接失败，退出")
         return
 
-    # 重置 soft-start 计数器 — 确保前 20 帧有限速保护
-    robot.arm.reset_soft_start()
-
     # ── 3. Pre-Flight 检查 ──
     report = preflight_check(robot)
     print_preflight(report)
@@ -318,8 +344,34 @@ def main():
         robot.disconnect()
         return
 
-    # ── 4. 获取当前状态 ──
-    state = robot.get_state()
+    # ── 3.5. 启动 PID 进程隔离 ──
+    # PIDProcess 拥有独立 XArmAPI 连接，Main 通过共享内存通信
+    #   PIDTargetChannel: Main → PID (arm 目标位置)
+    #   PIDStateChannel:  PID → Main (arm 当前状态)
+    pid_target = PIDTargetChannel(create=True)
+    pid_state = PIDStateChannel(create=True)
+    pid_process = PIDProcess()
+    pid_process.start()
+    print("PID 进程启动中...")
+    sys.stdout.flush()
+
+    # 轮询等待 PID 进程就绪（XArmAPI 连接 + 模式切换需数秒）
+    startup_deadline = time.perf_counter() + 30.0
+    arm_qpos = None
+    while time.perf_counter() < startup_deadline:
+        arm_qpos, error_state, pid_ts = pid_state.read()
+        if not error_state and pid_ts > 0 and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+            print("PID 进程已就绪 (250Hz velocity control)")
+            break
+        if error_state:
+            print("  PID 进程错误，重试中...")
+        time.sleep(0.1)
+
+    if arm_qpos is None or np.all(arm_qpos == 0):
+        # Fallback: read from robot directly
+        print("PID 进程启动超时，降级为直接读取")
+        arm_qpos = None
+    state = robot.get_state(arm_qpos=arm_qpos)
     home_qpos = arm_config.init_qpos.copy()
     prev_qpos_cmd = state.arm_qpos.copy()
 
@@ -384,19 +436,54 @@ def main():
 
             if keys.is_pressed("r"):
                 print("\nR: return_home")
-                do_return_home(robot, planner)
-                # 重置目标为当前状态
-                state = robot.get_state()
-                if np.all(np.isfinite(state.arm_qpos)):
-                    prev_qpos_cmd = state.arm_qpos.copy()
-                    target_pos = state.eef_pos.copy()
-                    target_quat = state.eef_quat_wxyz.copy()
-                consecutive_divergence = 0
+                # 记录旧 PID 最后的 timestamp，等待新 PID 写入 fresh data
+                _old_ts = pid_state.read()[2]
+                new_pid = do_return_home(robot, planner, pid_process, pid_target)
+                if new_pid is not None:
+                    pid_process = new_pid
+                # 轮询等待新 PID 进程写入第一帧（pid_ts 发生变化）
+                startup_deadline = time.perf_counter() + 30.0
+                while time.perf_counter() < startup_deadline:
+                    arm_qpos, error_state, pid_ts = pid_state.read()
+                    if not error_state and pid_ts != _old_ts and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                        state = robot.get_state(arm_qpos=arm_qpos)
+                        prev_qpos_cmd = state.arm_qpos.copy()
+                        target_pos = state.eef_pos.copy()
+                        target_quat = state.eef_quat_wxyz.copy()
+                        consecutive_divergence = 0
+                        error_count = 0  # reset stale counter on successful restart
+                        print("  PID 进程重启就绪")
+                        break
+                    time.sleep(0.1)
+                else:
+                    # 超时：降级为直接读取
+                    print("  PID 重启超时，降级为直接读取")
+                    state = robot.get_state()
+                    if np.all(np.isfinite(state.arm_qpos)):
+                        prev_qpos_cmd = state.arm_qpos.copy()
+                        target_pos = state.eef_pos.copy()
+                        target_quat = state.eef_quat_wxyz.copy()
+                    consecutive_divergence = 0
+                    error_count = 0
                 continue
 
-            # ── 读状态 ──
+            # ── 读状态 (从 PID 进程获取 arm_qpos，robot.get_state 获取 hand/EFF FK) ──
             try:
-                state = robot.get_state()
+                arm_qpos, error_state, pid_ts = pid_state.read()
+                now = time.perf_counter()
+
+                # PID 进程存活检测: 100ms 无更新 → 异常
+                if error_state or (now - pid_ts) > 0.1:
+                    print(f"  PID 进程异常: error={error_state} stale_ms={(now-pid_ts)*1000:.0f}")
+                    if error_count > 3:
+                        print("PID 连续异常，急停退出")
+                        robot.emergency_stop()
+                        running = False
+                        break
+                    error_count += 1
+                    continue
+
+                state = robot.get_state(arm_qpos=arm_qpos)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -492,9 +579,17 @@ def main():
                     flush=True,
                 )
 
-            # 无输入则保持
+            # 无输入 → 重置 target 到当前 EEF 位置（避免累积偏移导致反向运动）
             if np.all(dx == 0) and np.all(drpy == 0):
+                target_pos = state.eef_pos.copy()
+                target_quat = state.eef_quat_wxyz.copy()
+                prev_qpos_cmd = state.arm_qpos.copy()
                 continue
+
+            # ── target lead 限幅: 不让 target_pos 领先实际 EEF 太远 ──
+            lead = np.linalg.norm(target_pos - state.eef_pos)
+            if lead > TARGET_LEAD_MAX:
+                target_pos = state.eef_pos + (target_pos - state.eef_pos) * (TARGET_LEAD_MAX / lead)
 
             # ── 软墙: 逐轴拒绝边界外移动，离开时重置警告 ──
             new_pos = target_pos + dx
@@ -533,22 +628,25 @@ def main():
                 continue
 
             ik_method = "diff"
-            # ── 发送（无 EMA 滤波 — 平滑由 PID 内环 _clip_arm_velocity 负责）──
+            # ── 发送 ──
+            # Arm: 写入 PIDTargetChannel → PIDProcess 250Hz 速度控制
+            #      平滑/jerk限幅/软启动由 PID 内环统一负责
+            # Hand: 直接通过 robot.send_action() 发送
             prev_qpos_cmd = ik_result.qpos.copy()
             arm_cmd = ik_result.qpos  # 直接透传
+
+            pid_target.write(arm_cmd)
 
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
                 hand_qpos_cmd=state.hand_qpos.copy(),
                 target_eef_pos=target_pos.copy(),
             )
+            robot.send_action(action)  # hand only
 
-            send_result = robot.send_action(action)
-
-            # ── 追踪安全 (Phase 1.1): |q_actual - q_cmd| 偏差监控 ──
-            post_clip_cmd = send_result.get("arm_cmd")
-            if post_clip_cmd is not None and np.all(np.isfinite(state.arm_qpos)):
-                tracking_err = np.max(np.abs(state.arm_qpos - post_clip_cmd))
+            # ── 追踪安全: |q_actual - q_cmd| 偏差监控 ──
+            if np.all(np.isfinite(state.arm_qpos)):
+                tracking_err = np.max(np.abs(state.arm_qpos - arm_cmd))
                 if tracking_err > TRACKING_DIVERGENCE_THRESHOLD_RAD:
                     consecutive_divergence += 1
                     print(
@@ -562,15 +660,6 @@ def main():
                         break
                 else:
                     consecutive_divergence = 0
-
-
-            if not send_result.get("arm_ok"):
-                error_count += 1
-                if error_count > max_consecutive_errors:
-                    print("连续发送失败，急停退出")
-                    robot.emergency_stop()
-                    running = False
-                    break
 
 
 
@@ -587,11 +676,28 @@ def main():
         print("\n按 R 执行 return_home，或按 Q 直接退出...")
         while True:
             if keys.is_pressed("r"):
-                do_return_home(robot, planner)
+                new_pid = do_return_home(robot, planner, pid_process, pid_target)
+                if new_pid is not None:
+                    pid_process = new_pid
                 print("按 Q 退出...")
             if keys.is_pressed("q") or keys.is_pressed("esc"):
                 break
             time.sleep(0.1)
+
+        # ── PID 进程清理 ──
+        if pid_process is not None and pid_process.is_alive():
+            if pid_target is not None:
+                pid_target.write(None)  # signal deceleration
+            pid_process.stop()
+            print("PID 进程已停止")
+
+        # ── 共享内存清理 ──
+        if pid_target is not None:
+            pid_target.unlink()
+            pid_target.close()
+        if pid_state is not None:
+            pid_state.unlink()
+            pid_state.close()
 
         robot.disconnect()
         print("Done.")

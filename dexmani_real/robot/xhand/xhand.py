@@ -780,10 +780,9 @@ class XHand(ConnectionStateMixin):
     def _limit_joint_step(self, target_qpos: np.ndarray) -> np.ndarray:
         """Clip target_qpos per-joint independently against max_qvel * dt.
 
-        Unlike XArm7._limit_joint_step (xarm7.py:867) which uses bottleneck
-        proportional scaling to preserve the motion path, XHand clips each
-        finger joint independently — finger joints have independent range/velocity
-        constraints and coupling them is undesirable for dexterous manipulation.
+        XHand clips each finger joint independently — finger joints have
+        independent range/velocity constraints and coupling them is
+        undesirable for dexterous manipulation.
 
         Delta reference uses hardware position (from background state reader)
         when available, falling back to last_qpos_cmd on first frame or when

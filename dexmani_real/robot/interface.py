@@ -1,15 +1,16 @@
-"""RobotInterface — arm + hand unified interface.
+"""RobotInterface — arm + hand unified interface (simplified).
 
-Controllers and deployment modules operate hardware exclusively through
-RobotInterface, never calling XArm7/XHand directly.
+Controllers operate hardware exclusively through RobotInterface, never calling
+XArm7/XHand directly.
+
+Velocity PID control is owned by PIDProcess in a separate process — interface.py
+only handles hand commands and blocking arm moves (reset, home).
 """
 
 from __future__ import annotations
 
-import signal as _signal
 import time
 import warnings
-from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -20,7 +21,7 @@ from dexmani_real.planning.types import Pose
 from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
 from dexmani_real.planning import WorkspaceSafety
 from dexmani_real.robot.hand_kinematics import HandKinematics
-from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState, _ARM_TORQUE_LIMIT_NM
+from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.xarm7 import XArm7
 from dexmani_real.robot.xhand import XHand
 from dexmani_real.utils.array_utils import nan_array
@@ -30,47 +31,16 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Magic numbers (Phase 4.2)
-
-_HAND_RESET_CONVERGE_TIMEOUT_S = 3.0
-_HAND_RESET_CONVERGE_THRESHOLD_RAD = np.deg2rad(5.0)
-_HAND_RESET_POLL_INTERVAL_S = 0.05
-
-_PHASE1_CONVERGE_THRESHOLD_RAD = np.deg2rad(3.0)
-_PHASE1_POLL_INTERVAL_MULT = 2  # × dt
-_PHASE1_MAX_WAIT_MULT = 5  # × theoretical travel time
-
-_PHASE2_MIN_DELTA_RAD = np.deg2rad(0.5)
-
-_HOME_JOINT_THRESHOLD_RAD = np.deg2rad(3.0)  # matches _PHASE1_CONVERGE_THRESHOLD_RAD; arm.reset() servo tolerance
-
-# Safety lift geometry (Phase 4.2) — used by _lift_eef_z_safe()
-_HAND_EXTENSION_Z_M = 0.076  # max fingertip-to-EEF vertical offset when hand is extended
-_HAND_SAFETY_MARGIN_Z_M = 0.03  # additional clearance above table+hand_extension
-_JOINT_DIP_ALLOWANCE_Z_M = 0.05  # extra margin for joint-space trajectory dip below EEF Z
-_Z_LIFT_EXTRA_MARGIN_M = 0.05  # additional lift past min_safe_z toward workspace midpoint
-_Z_LIFT_WS_TOP_MARGIN_M = 0.02  # margin below workspace ceiling to avoid singularity
-
-
-def _dense_interpolate(path: np.ndarray, max_step_rad: float = np.deg2rad(1.0)) -> np.ndarray:
-    """Densify a sparse joint path so each step ≤ max_step_rad."""
-    if len(path) <= 1:
-        return path
-    dense = [path[0]]
-    for i in range(len(path) - 1):
-        a, b = path[i], path[i + 1]
-        n = int(np.ceil(float(np.max(np.abs(b - a))) / max_step_rad))
-        for k in range(1, n + 1):
-            dense.append(a + (k / n) * (b - a))
-    return np.array(dense, dtype=np.float64)
-
 
 class RobotInterface:
-    """Arm + Hand unified interface.
+    """Arm + Hand unified interface — hand commands + blocking arm moves.
 
-    - Controllers and deployment modules operate hardware exclusively through this class.
-    - Degraded operation when hand disconnects (arm still works).
-    - send_action() returns dict[str, bool] with per-device status.
+    Teleop arm position servo is handled by PIDProcess (separate process).
+    This class manages:
+      - Hand send_action (12-DOF position commands)
+      - Arm blocking moves (reset, emergency stop)
+      - State reading (arm + hand + FK)
+      - Workspace safety checks
     """
 
     def __init__(
@@ -83,14 +53,12 @@ class RobotInterface:
         self.config = config
         self.kinematics = kinematics
         self.planner = planner
-        self.workspace = WorkspaceSafety(
-            config.workspace_bounds,
-        )
+        self.workspace = WorkspaceSafety(config.workspace_bounds)
 
         self.arm = XArm7(config.arm)
         self.hand = XHand(config.hand)
 
-        # Validate home EEF is within workspace (catch config errors early)
+        # Validate home EEF is within workspace
         home_pose = self.kinematics.compute_eef_pose_world(self.arm.config.init_qpos)
         if not self.workspace.check(home_pose.p):
             msg = (
@@ -103,10 +71,7 @@ class RobotInterface:
             else:
                 warnings.warn(f"Cannot validate home EEF workspace (NaN FK): {msg}")
 
-        # Set up table collision geometry (plan_screw/plan_qpos will avoid).
-        # Only add MPlib point cloud when env_collision_mode == "mplib_pointcloud".
-        # Default "geometric_fk" mode uses FingertipDeskSafety (FK fingertip Z)
-        # which is zero-cost and does NOT pollute the IK solver.
+        # Table collision geometry
         if self.planner is not None and config.collision is not None:
             if config.collision.env_collision_mode == "mplib_pointcloud":
                 self._setup_table_collision(table_z=config.collision.table_z_world)
@@ -118,10 +83,9 @@ class RobotInterface:
             if hk.is_ready():
                 self.hand_kinematics = hk
 
-    # Lifecycle
+    # ── Lifecycle ──
 
     def connect(self) -> dict[str, bool]:
-        """Connect arm + hand. Returns {"arm": bool, "hand": bool}."""
         result: dict[str, bool] = {}
         result["arm"] = self.arm.connect()
         result["hand"] = self.hand.connect()
@@ -135,17 +99,9 @@ class RobotInterface:
         return self.arm.is_connected()
 
     def check_workspace(self, pos: np.ndarray) -> bool:
-        """Check if a 3D position (world frame) is within workspace bounds."""
         return self.workspace.check(pos)
 
     def clamp_workspace_pos(self, pos: np.ndarray) -> np.ndarray:
-        """Clamp a target EEF position to workspace bounds.
-
-        Returns the clamped position.
-        Used by the controller to nudge targets back into workspace instead
-        of holding on boundary violations.
-        (ref: ManiUniCon _clip_action_to_bounds)
-        """
         return self.workspace.clamp(np.asarray(pos, dtype=np.float64))
 
     def is_error(self) -> bool:
@@ -156,82 +112,33 @@ class RobotInterface:
         hand_ok = self.hand.clear_error()
         return arm_ok and hand_ok
 
-    def validate_action(self, action: RobotAction) -> tuple[bool, str]:
-        """Centralized pre-send validation (ref: ManiUniCon validate_action).
-
-        Checks all safety conditions that should gate action sending.
-        Returns (ok, reason_string).
-
-        Checks performed (fail-fast order):
-          1. Robot error state (arm/hand SDK errors)
-          2. Arm connection
-          3. Arm torque (per-joint, NaN → fail)
-          4. Hand current (fail-closed)
-          5. Hand temperature (fail-closed)
-          6. Hand communication (board errors)
-          7. Workspace position bounds
-        """
-        # Lazy import to avoid circular dependency:
-        #   interface → teleop.control.safety → teleop.__init__ → controller → interface
-        from dexmani_real.teleop.control.safety import (
-            check_arm_torque,
-            check_hand_comm,
-            check_hand_current,
-            check_hand_temperature,
-        )
-
-        # 1. Hardware error state
-        if self.is_error():
-            return False, "robot error state"
-
-        # 2. Arm connection
-        if not self.arm.is_connected():
-            return False, "arm not connected"
-
-        # 3. Arm torque (fail-closed: NaN/unknown → unsafe)
-        arm_state = self.arm.get_state()
-        arm_tau = np.asarray(arm_state.get("tau", []), dtype=np.float64)
-        if not check_arm_torque(arm_tau):
-            return False, "arm torque violation"
-
-        # 4-6. Hand safety (current, temperature, communication)
-        # Use full=False to avoid per-tick tactile parsing (~2-5ms overhead).
-        # Board errors are read from cached instance attributes (updated on every
-        # get_state call regardless of full flag). Temperature defaults safely
-        # when not returned by full=False (the sliding window monitors in the
-        # controller provide the primary temperature trend tracking).
-        hand_state = self.hand.get_state(full=False)
-        if not check_hand_current(hand_state.get("current", np.zeros(12))):
-            return False, "hand current violation"
-        if not check_hand_temperature(hand_state.get("temperature", np.full(12, 30.0))):
-            return False, "hand temperature violation"
-        hand_has_error = bool(
-            np.any(self.hand.last_commboard_err != 0)
-            or np.any(self.hand.last_jointboard_err != 0)
-            or np.any(self.hand.last_tipboard_err != 0)
-        )
-        if not check_hand_comm(hand_has_error):
-            return False, "hand communication error"
-
-        # 7. Workspace bounds (computed from action command)
-        arm_eef = self.kinematics.compute_eef_pose_world(action.arm_qpos_cmd)
-        if not self.workspace.check(arm_eef.p):
-            return False, "workspace position violation"
-
-        return True, "ok"
-
     def emergency_stop(self) -> None:
         self.arm.stop()
         self.hand.stop()
 
-    def get_state(self) -> RobotState:
-        """Read arm + hand state with FK computation."""
-        arm_state = self.arm.get_state()
-        hand_state = self.hand.get_state(full=True)
+    # ── State ──
 
-        arm_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-        arm_qvel = np.asarray(arm_state["qvel"], dtype=np.float64)
-        arm_tau = np.asarray(arm_state["tau"], dtype=np.float64)
+    def get_state(self, arm_qpos: np.ndarray | None = None) -> RobotState:
+        """Read arm + hand state with FK computation.
+
+        Args:
+            arm_qpos: Optional arm joint positions from PIDStateChannel.
+                      When provided, skips arm SDK call (used in teleop loop).
+        """
+        if arm_qpos is not None:
+            arm_qvel = nan_array(7)
+            arm_tau = nan_array(7)
+        else:
+            arm_state = self.arm.get_state()
+            arm_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+            arm_qvel = np.asarray(arm_state["qvel"], dtype=np.float64)
+            arm_tau = np.asarray(arm_state["tau"], dtype=np.float64)
+
+        hand_state = self.hand.get_state(full=True)
+        hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
+        hand_tactile_sum = np.asarray(
+            hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64
+        )
 
         # EEF FK
         if np.all(np.isfinite(arm_qpos)):
@@ -244,17 +151,10 @@ class RobotInterface:
             eef_quat_wxyz = nan_array(4)
             eef_rot6d = nan_array(6)
 
-        hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
-        hand_tactile_sum = np.asarray(
-            hand_state.get("tactile_force_sum", np.zeros((5, 3))),
-            dtype=np.float64,
-        )
-
-        # Fingertip world positions
         fingertip_pos = self._compute_fingertip_pos(eef_pos, eef_quat_wxyz, hand_qpos)
 
         return RobotState(
-            arm_qpos=arm_qpos,
+            arm_qpos=np.asarray(arm_qpos, dtype=np.float64),
             arm_qvel=arm_qvel,
             arm_tau=arm_tau,
             eef_pos=eef_pos,
@@ -268,506 +168,217 @@ class RobotInterface:
             timestamp=time.perf_counter(),
         )
 
+    # ── Hand action ──
+
     def send_action(self, action: RobotAction) -> dict:
-        """Send arm + hand action.
+        """Send hand action only (arm is handled by PIDProcess).
 
         Returns:
-            {"arm_ok": bool, "hand_ok": bool,
-             "arm_cmd": ndarray | None,   # (7,) post-clip actual sent value
-             "hand_cmd": ndarray | None}  # (12,) post-clip actual sent value
-
-        arm_cmd/hand_cmd are post joint-limit + delta-limit clipped values.
-        None on send failure. Recordings should use these post-clip values,
-        not the raw IK output.
+            {"hand_ok": bool, "hand_cmd": ndarray | None}
         """
-        result: dict = {}
-
-        arm_ok = self.arm.send_action(action.arm_qpos_cmd)
         hand_ok = self.hand.send_action(action.hand_qpos_cmd)
+        return {
+            "hand_ok": hand_ok,
+            "hand_cmd": self.hand.last_qpos_cmd.copy() if hand_ok else None,
+        }
 
-        result["arm_ok"] = arm_ok
-        result["hand_ok"] = hand_ok
-        result["arm_cmd"] = self.arm.last_qpos_cmd.copy() if arm_ok else None
-        result["hand_cmd"] = self.hand.last_qpos_cmd.copy() if hand_ok else None
-        return result
-
-    def reset_soft_start(self) -> None:
-        """Reset arm soft-start ramp on TELEOP entry.
-
-        Ensures the soft-start speed ramp always applies to the first
-        teleop motion, regardless of idle duration since connect().
-        """
-        self.arm.reset_soft_start()
+    # ── Hand reset ──
 
     def reset_hand(self) -> bool:
-        """Reset hand to home position. Returns False if hand disconnected."""
         if not self.hand.is_connected():
             return False
         return self.hand.reset()
 
-    # Return-to-home (split into sub-methods per Phase 3.1)
+    # ── Return to home (path-planned) ──
 
-    def return_to_home(
-        self,
-        use_planning: bool = True,
-        cancel_event: object = None,
-    ) -> bool:
-        """Two-phase return_home: EEF homing → redundant joint homing.
+    def return_to_home(self) -> bool:
+        """Path-planned return-to-home with collision avoidance.
 
-        Delegates to ReturnToHomeOrchestrator (P2.2) which encapsulates the
-        phase sequencing, cancellation, and fallback logic.
+        Two-phase execution:
+          Phase 1: plan_path(home EEF) — full collision-checked Cartesian path.
+          Phase 2: collision-checked joint-space interpolation to exact init_qpos.
 
-        Phase 1: plan_path(home_eef) — Cartesian path to move EEF to home.
-        Phase 2: Joint-space interpolation — current qpos → home_qpos,
-                 per-waypoint collision check.
-
-        use_planning=False falls back to direct reset (linear joint space + hand reset).
-
-        SIGINT (Ctrl+C) sets cancel_event to abort waypoint execution.
+        Falls back to arm.reset() (SDK blocking move) if planner unavailable
+        or planning fails.
         """
-        with self._install_sigint_handler(cancel_event):
-            # Fall back to direct reset if planning disabled or planner unavailable
-            if not use_planning:
-                return self._return_to_home_direct()
-            if self.planner is None:
-                warnings.warn("use_planning=True but planner is None, falling back to direct reset")
-                return self._return_to_home_direct()
+        if not self.arm.is_connected():
+            return False
 
-            from dexmani_real.planning.return_home import create_return_to_home_orchestrator
+        home_qpos = self.arm.config.init_qpos.copy()
+        dt = float(self.arm.config.dt)
 
-            orchestrator = create_return_to_home_orchestrator(self)
-            return orchestrator.execute(cancel_event=cancel_event)
+        # ── 1. Read current position ──
+        qpos = self._read_arm_qpos()
+        if qpos is None:
+            return self._reset_blocking()
 
-    @staticmethod
-    @contextmanager
-    def _install_sigint_handler(cancel_event: object):
-        """Context manager: install SIGINT handler that sets cancel_event, restore on exit."""
-
-        def _on_sigint(signum, frame):
-            if cancel_event is not None and hasattr(cancel_event, "set"):
-                cancel_event.set()
-
-        old = _signal.signal(_signal.SIGINT, _on_sigint)
-        try:
-            yield
-        finally:
-            _signal.signal(_signal.SIGINT, old)
-
-    def _arm_ready(self) -> np.ndarray | None:
-        """Read arm qpos; return None on NaN (caller should fall back)."""
-        arm_state = self.arm.get_state()
-        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-        if not np.all(np.isfinite(current_qpos)):
-            return None
-        return current_qpos
-
-    def _snap_to_nearest_equivalent(
-        self,
-        qpos: np.ndarray,
-        reference_qpos: np.ndarray,
-    ) -> np.ndarray:
-        """Snap continuous joints to the equivalent nearest *reference_qpos*.
-
-        Joints whose range ≥ π (J0/J2/J4/J6 on xArm7) can wrap around 2π
-        — e.g. J4 at 155° is physically equivalent to -205°.  Without snapping,
-        the raw difference vs home (-180°) is 335°, causing IK seeding failures
-        and false distance reports.
-        """
+        # ── 2. No planner → fallback ──
         if self.planner is None:
-            return qpos
+            return self._reset_blocking()
+
+        # ── 3. Snap continuous joints (J0/J2/J4/J6) to nearest 2π-equivalent ──
         try:
-            return self.planner.ik_mgr.nearest_equivalent_qpos(qpos, reference_qpos)
-        except (ValueError, RuntimeError, AttributeError):
-            return qpos
+            qpos = self.planner.nearest_equivalent_qpos(qpos, home_qpos)
+        except Exception:
+            pass
 
-    def _joint_error_to_home(
-        self,
-        current_qpos: np.ndarray,
-        home_qpos: np.ndarray,
-    ) -> float:
-        """Max absolute joint error, accounting for equivalent joints."""
-        if self.planner is not None:
-            try:
-                delta = self.planner.ik_mgr.compute_qpos_delta(current_qpos, home_qpos)
-                return float(np.max(np.abs(delta)))
-            except (ValueError, RuntimeError, AttributeError):
-                pass
-        return float(np.max(np.abs(current_qpos - home_qpos)))
+        # ── 4. Already at home? ──
+        if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(1.0):
+            return self.hand.reset() if self.hand.is_connected() else True
 
-    @staticmethod
-    def _at_home(current_qpos: np.ndarray, home_qpos: np.ndarray) -> bool:
-        """Check if all joint errors are < 1° (raw comparison — caller should
-        snap to nearest equivalent first via _snap_to_nearest_equivalent)."""
-        return float(np.max(np.abs(current_qpos - home_qpos))) < _HOME_JOINT_THRESHOLD_RAD
+        # ── 5. Pre-flight: reset hand (align FK model to reality) ──
+        if self.hand.is_connected():
+            self.hand.reset()
+            time.sleep(0.3)
+        qpos = self._read_arm_qpos()
+        if qpos is None:
+            return self._reset_blocking()
 
-    def _get_home_eef_pose(self, home_qpos: np.ndarray) -> Pose:
-        """FK home qpos → EEF pose, clamp to workspace if needed."""
-        home_eef_pose = self.kinematics.compute_eef_pose_world(home_qpos)
-        if not self.workspace.check(home_eef_pose.p):
-            warnings.warn(f"Home EEF position {np.round(home_eef_pose.p, 4)} " "is outside workspace, clamping")
-            home_eef_pose.p = self.workspace.clamp(home_eef_pose.p)
-        return home_eef_pose
+        # ── 6. Phase 1: Plan + execute EEF Cartesian path ──
+        home_eef = self.kinematics.compute_eef_pose_world(home_qpos)
+        try:
+            result = self.planner.plan_path(home_eef, qpos)
+        except Exception:
+            logger.warning("plan_path exception, falling back to direct reset", exc_info=True)
+            return self._reset_blocking()
 
-    def _reset_hand_before_planning(self, current_qpos: np.ndarray) -> np.ndarray | None:
-        """Reset hand to default config before planning.
+        if not (result.success and result.qpos_path is not None and len(result.qpos_path) > 0):
+            logger.warning("plan_path failed: %s, falling back to direct reset", result.reason or "unknown")
+            return self._reset_blocking()
 
-        The planner URDF model uses the default hand configuration.
-        If the real hand is in a non-default pose (e.g. fist/open from teleop),
-        desk collision checks will mispredict. Must reset hand first so the
-        real configuration matches the planning model.
+        logger.info(
+            "return_to_home Phase 1: %d waypoints, source=%s, score=%.3f",
+            len(result.qpos_path), result.source,
+            result.report.get("path_score", float("nan")),
+        )
+        self._execute_waypoints(result.qpos_path, dt)
 
-        Returns updated arm qpos after hand reset (arm may micro-move), or None on NaN.
-        """
-        if not self.hand.is_connected():
-            return current_qpos
+        # ── 7. Phase 2: Joint-space interpolation to exact home ──
+        if not self.arm.is_error():
+            qpos = self._read_arm_qpos()
+            if qpos is not None:
+                self._execute_joint_homing(qpos, home_qpos, dt)
 
-        self.hand.reset()
-        # Active polling wait for hand convergence (replaces fixed sleep)
-        elapsed = 0.0
-        while elapsed < _HAND_RESET_CONVERGE_TIMEOUT_S:
-            time.sleep(_HAND_RESET_POLL_INTERVAL_S)
-            elapsed += _HAND_RESET_POLL_INTERVAL_S
-            hand_state = self.hand.get_state()
-            hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
-            if len(hand_qpos) == 12 and np.all(np.isfinite(hand_qpos)):
-                hand_target = np.asarray(self.hand.config.home_qpos, dtype=np.float64)
-                if float(np.max(np.abs(hand_qpos - hand_target))) < _HAND_RESET_CONVERGE_THRESHOLD_RAD:
-                    break
+        # ── 8. Finalize: blocking converge to exact init_qpos ──
+        # Phase 2's send_action() uses non-blocking set_servo_angle_j() —
+        # the arm may not have physically settled.  arm.reset() calls
+        # set_servo_angle(wait=True) which blocks until the arm reaches
+        # init_qpos within the SDK's internal convergence tolerance.
+        if not self.arm.is_error():
+            arm_ok = self.arm.reset()
+            if not arm_ok:
+                logger.warning("Blocking reset failed: %s", self.arm.last_error_message)
+        else:
+            arm_ok = False
 
-        # Re-read arm state after hand reset (arm may micro-move)
-        arm_state = self.arm.get_state()
-        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-        if not np.all(np.isfinite(current_qpos)):
-            return None
-        return current_qpos
+        hand_ok = self.hand.reset() if self.hand.is_connected() else True
+        # Re-read actual position to verify precision
+        final = self._read_arm_qpos()
+        if final is not None:
+            err_deg = float(np.rad2deg(np.max(np.abs(final - home_qpos))))
+            logger.info("return_to_home final error: %.2f deg", err_deg)
+        return arm_ok and hand_ok
 
-    def _execute_phase1_eef_cartesian(
-        self,
-        home_eef_pose: Pose,
-        current_qpos: np.ndarray,
-        dt: float,
-        cancel_event: object,
+    # ── Return-to-home helpers ──
+
+    def _read_arm_qpos(self) -> np.ndarray | None:
+        """Read arm joint positions; return None on NaN/error."""
+        try:
+            arm_state = self.arm.get_state()
+            qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+            if np.all(np.isfinite(qpos)):
+                return qpos
+        except Exception:
+            pass
+        return None
+
+    def _reset_blocking(self) -> bool:
+        """Fallback: SDK blocking move — no collision avoidance."""
+        arm_ok = self.arm.reset()
+        hand_ok = self.hand.reset() if self.hand.is_connected() else True
+        return arm_ok and hand_ok
+
+    def _execute_waypoints(
+        self, path: np.ndarray, dt: float, max_step_rad: float = np.deg2rad(1.0)
     ) -> bool:
-        """Execute Phase 1: plan_path + dense waypoint execution.
+        """Execute a joint-space path via position servo with dense interpolation.
 
-        Returns True if Phase 1 completed successfully.
+        Densely interpolates waypoints at ``max_step_rad`` resolution (default 1°)
+        for smooth motion without large joint-step clipping. Aborts on arm error.
         """
-        try:
-            result = self.planner.plan_path(home_eef_pose, current_qpos)
-        except RuntimeError as e:
-            logger.exception("plan_path failed: %s", e)
-            return False
+        if len(path) == 0:
+            return True
+        if len(path) == 1:
+            return self.arm.send_action(path[0]) if not self.arm.is_error() else False
 
-        if not result.success or result.qpos_path is None or len(result.qpos_path) == 0:
-            # Diagnostic: log WHY plan_path failed so operators can identify
-            # the root cause (workspace, collision, IK seeding, joint delta, etc.)
-            current_pose = self.kinematics.compute_eef_pose_world(current_qpos)
-            cart_dist = float(np.linalg.norm(home_eef_pose.p - current_pose.p))
-            logger.warning(
-                "plan_path: %s | current_eef=[%.3f,%.3f,%.3f]m " "home_eef=[%.3f,%.3f,%.3f]m cart_dist=%.3fm",
-                result.reason or "unknown",
-                current_pose.p[0],
-                current_pose.p[1],
-                current_pose.p[2],
-                home_eef_pose.p[0],
-                home_eef_pose.p[1],
-                home_eef_pose.p[2],
-                cart_dist,
-            )
-            return False
+        # Build dense path: linear interpolation at max_step_rad resolution
+        dense: list[np.ndarray] = [path[0]]
+        for i in range(len(path) - 1):
+            seg_dist = float(np.max(np.abs(path[i + 1] - path[i])))
+            n = max(1, int(np.ceil(seg_dist / max_step_rad)))
+            for k in range(1, n + 1):
+                alpha = k / n
+                dense.append(path[i] + alpha * (path[i + 1] - path[i]))
 
-        # Safety: verify fingertips above desk before path execution.
-        # This is a last-resort execution-level check; the planner's
-        # validate_path() already performed FK desk safety during planning.
-        # If fingertips are still below desk here, something went wrong
-        # (e.g. hand didn't reset to default pose) — abort execution.
-        desk_z: float | None = None
-        if self.config.collision is not None:
-            desk_z = self.config.collision.table_z_world
-
-        if desk_z is not None and self.planner is not None:
-            hand_state = self.hand.get_state() if self.hand.is_connected() else {"qpos": None}
-            actual_hand_qpos = np.asarray(hand_state.get("qpos", []), dtype=np.float64)
-            if len(actual_hand_qpos) == 12:
-                above_first, min_z_first = self._check_fingertips_above_desk(
-                    result.qpos_path[0],
-                    actual_hand_qpos,
-                    desk_z,
-                )
-                above_last, min_z_last = self._check_fingertips_above_desk(
-                    result.qpos_path[-1],
-                    actual_hand_qpos,
-                    desk_z,
-                )
-                if not above_first or not above_last:
-                    logger.error(
-                        "Phase 1 ABORT: fingertips below desk after hand reset "
-                        "(first_z=%.3f m, last_z=%.3f m, desk_z=%.3f m). "
-                        "Hand may not have converged to default pose.",
-                        min_z_first,
-                        min_z_last,
-                        desk_z,
-                    )
-                    return False
-
-        # Dense interpolation (1° step) to avoid _limit_joint_step clipping large jumps
-        dense_path = _dense_interpolate(result.qpos_path)
-        phase1_completed = True
-        for waypoint in dense_path:
-            if (
-                cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
-            ) or self.arm.is_error():
-                phase1_completed = False
-                break
-            if not self._check_arm_torque_ok():
-                logger.warning("Phase 1: arm torque exceeded safe limit, aborting waypoint execution")
-                phase1_completed = False
-                break
+        for waypoint in dense:
+            if self.arm.is_error():
+                return False
             if not self.arm.send_action(waypoint):
-                phase1_completed = False
-                break
+                return False
             time.sleep(dt)
+        return True
 
-        # Closed-loop wait for servo convergence to path endpoint
-        if phase1_completed:
-            target_qpos = result.qpos_path[-1]
-            start_qpos = result.qpos_path[0]
-            if not self._wait_for_arm_convergence(target_qpos, start_qpos, dt):
-                warnings.warn("Phase 1 convergence timeout, skipping Phase 2 joint fine-tuning")
-                phase1_completed = False
+    def _check_joint_path_safe(self, path: np.ndarray) -> bool:
+        """Check self-collision + env-collision + FK desk safety for a joint path.
 
-        return phase1_completed
-
-    def _wait_for_arm_convergence(
-        self,
-        target_qpos: np.ndarray,
-        start_qpos: np.ndarray | None = None,
-        dt: float = 0.02,
-    ) -> bool:
-        """Poll arm state until joints converge to *target_qpos*.
-
-        Uses an adaptive timeout: max(dt * multiplier, theoretical_travel_time * multiplier).
-        Extracted from _execute_phase1_eef_cartesian (P2.3).
+        Returns True if all checks pass or planner unavailable (can't verify).
         """
-        max_qvel = float(np.min(self.arm.config.max_qvel))
-        if start_qpos is not None:
-            theoretical_time = float(np.max(np.abs(target_qpos - start_qpos))) / max_qvel
-        else:
-            theoretical_time = 2.0  # conservative fallback
-        max_wait = max(dt * _PHASE1_MAX_WAIT_MULT, theoretical_time * _PHASE1_MAX_WAIT_MULT)
-        poll_interval = dt * _PHASE1_POLL_INTERVAL_MULT
-
-        elapsed = 0.0
-        while elapsed < max_wait:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            try:
-                poll_qpos = np.asarray(self.arm.get_state()["qpos"], dtype=np.float64)
-                if not np.all(np.isfinite(poll_qpos)):
-                    continue
-                err = float(np.max(np.abs(poll_qpos - target_qpos)))
-                if err < _PHASE1_CONVERGE_THRESHOLD_RAD:
-                    return True
-            except (ValueError, RuntimeError):
-                continue
-        return False
-
-    def _execute_phase2_joint_space(
-        self,
-        home_qpos: np.ndarray,
-        dt: float,
-        cancel_event: object,
-    ) -> None:
-        """Execute Phase 2: joint-space interpolation to home_qpos."""
-        arm_state = self.arm.get_state()
-        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-        if not np.all(np.isfinite(current_qpos)):
-            return
-
-        joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
-        if joint_delta <= _PHASE2_MIN_DELTA_RAD:
-            return
-
-        joint_path = self._safe_joint_path(current_qpos, home_qpos)
-        if joint_path is not None:
-            for waypoint in joint_path:
-                if (
-                    cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
-                ) or self.arm.is_error():
-                    break
-                if not self._check_arm_torque_ok():
-                    logger.warning("Phase 2: arm torque exceeded safe limit, aborting waypoint execution")
-                    break
-                if not self.arm.send_action(waypoint):
-                    break
-                time.sleep(dt)
-        else:
-            # Joint path would collide or planner unavailable → skip Phase 2.
-            # _return_to_home_direct() uses the same linear joint path
-            # (just executed by SDK trajectory generator), which isn't safer.
-            # Phase 1 already homed the EEF; skipping Phase 2 only loses
-            # exact redundant joint alignment, with no collision risk.
-            warnings.warn(
-                "Joint-space home path unsafe or unverifiable, " "skipping Phase 2 (EEF already at home from Phase 1)"
-            )
-
-    # Internal helpers
-
-    def _safe_joint_path(
-        self, start: np.ndarray, goal: np.ndarray, max_step_rad: float = np.deg2rad(1.0)
-    ) -> np.ndarray | None:
-        """Linear interpolation start → goal, collision-verified.
-
-        Generates dense path at ``max_step_rad`` resolution for smooth execution,
-        then validates with planner.check_path_collisions() which uses 0.02 rad
-        internal step size (ref: dimos collision_step_size=0.02).
-
-        Returns None if unsafe or planner unavailable (cannot verify safety).
-        """
-        dist = float(np.max(np.abs(goal - start)))
-        n = max(2, int(np.ceil(dist / max_step_rad)) + 1)
-        path = np.array([start + (k / (n - 1)) * (goal - start) for k in range(n)])
-
         if self.planner is None:
-            warnings.warn("_safe_joint_path: planner unavailable, cannot verify collision safety")
-            return None
+            return True  # can't verify, caller decides
 
         profile = self.planner.planning_profile
         if profile.check_self_collision:
             result = self.planner.check_path_collisions(path)
             if result.get("path_self_collision"):
-                return None
+                return False
         if profile.check_env_collision:
             result = self.planner.check_path_env_collisions(path)
             if result.get("path_env_collision"):
-                return None
-        # Geometric FK desk safety (fingertip Z vs table surface).
-        # Complements MPlib-based checks above — catches desk collisions even
-        # when MPlib point cloud is absent (geometric_fk mode).
-        if self.planner.desk_safety is not None and profile.check_env_collision:
-            desk_safe, min_z, viol_idx = self.planner.desk_safety.check_path_desk_safety(
-                path,
-                step_rad=max_step_rad,
-            )
-            if not desk_safe:
-                logger.warning(
-                    "_safe_joint_path: FK desk collision detected " "(fingertip z_min=%.3f m, segment %d)",
-                    min_z,
-                    viol_idx,
-                )
-                return None
-        return path
-
-    def _check_arm_torque_ok(self) -> bool:
-        """Check arm torque is within per-joint safe limits.
-
-        Returns True if torque is safe or unreadable (fail-open: can't check → assume ok).
-        """
-        arm_state = self.arm.get_state()
-        tau = np.asarray(arm_state.get("tau", []), dtype=np.float64)
-        if len(tau) != 7 or not np.all(np.isfinite(tau)):
-            return True  # can't read, assume ok
-        return not np.any(np.abs(tau) >= _ARM_TORQUE_LIMIT_NM)
-
-    def _lift_eef_z_safe(self, current_qpos: np.ndarray) -> bool:
-        """Safety lift: move EEF upward to clear desk (C2 fallback).
-
-        Only lifts when the EEF is near the desk surface.  When the EEF is
-        already at a safe height, returns True without moving — avoids the
-        sudden fast lift that alarms operators during return_home.
-
-        Executes the lift as a dense joint-space interpolation at ~1°/step,
-        producing smooth, controlled motion rather than a single high-speed
-        servo jump.
-
-        Returns True if EEF is already safe or lift was executed.
-        """
-        if not np.all(np.isfinite(current_qpos)):
-            return False
-        current_pose = self.kinematics.compute_eef_pose_world(current_qpos)
-
-        target_z = self._compute_safe_lift_z(float(current_pose.p[2]))
-        if target_z is None:
-            return True  # already safe, no lift needed
-
-        lift_pose = Pose(
-            p=np.array([current_pose.p[0], current_pose.p[1], target_z], dtype=np.float64),
-            q=current_pose.q.copy(),
-        )
-        return self._execute_lift_via_ik(lift_pose, current_qpos)
-
-    def _compute_safe_lift_z(self, current_z: float) -> float | None:
-        """Compute a safe target Z for EEF lift.  Returns None if already safe.
-
-        Extracted from _lift_eef_z_safe (P2.3) to separate Z computation
-        from motion execution.
-        """
-        if self.config.collision is not None:
-            desk_safe_z = self.config.collision.desk_safe_z
-        else:
-            desk_safe_z = _HAND_EXTENSION_Z_M + _HAND_SAFETY_MARGIN_Z_M  # default table at z=0
-
-        min_safe_z = desk_safe_z + _JOINT_DIP_ALLOWANCE_Z_M
-        if current_z >= min_safe_z:
-            return None  # already safe
-
-        ws_z_mid = float(np.mean(self.workspace.bounds[2]))
-        ws_z_max = float(self.workspace.bounds[2, 1])
-        target_z = max(min_safe_z + _Z_LIFT_EXTRA_MARGIN_M, ws_z_mid)
-        return min(target_z, ws_z_max - _Z_LIFT_WS_TOP_MARGIN_M)
-
-    def _execute_lift_via_ik(self, lift_pose: Pose, current_qpos: np.ndarray) -> bool:
-        """Solve IK for a lift pose and execute as dense joint-space path."""
-        if self.planner is None:
-            return False
-
-        lift_result = self.planner.solve_teleop_ik(lift_pose, current_qpos, current_qpos)
-        if not lift_result.success or lift_result.qpos is None:
-            logger.warning(
-                "Safety lift: teleop IK failed (%s), falling back to solve_ik",
-                lift_result.reason,
-            )
-            lift_result = self.planner.solve_ik(lift_pose, current_qpos)
-        if not lift_result.success or lift_result.qpos is None:
-            logger.warning("Safety lift: solve_ik also failed: %s", lift_result.reason)
-            return False
-        if self.planner.has_env_collision(lift_result.qpos):
-            logger.warning("Safety lift result in env-collision, skipping lift")
-            return False
-
-        lift_path = _dense_interpolate(
-            np.array([current_qpos, lift_result.qpos], dtype=np.float64),
-            max_step_rad=np.deg2rad(1.0),
-        )
-        dt = float(self.arm.config.dt)
-        for waypoint in lift_path:
-            if not self.arm.send_action(waypoint):
-                logger.warning("Safety lift: send_action failed mid-path")
                 return False
-            time.sleep(dt)
+        if profile.check_env_collision and self.planner.desk_safety is not None:
+            desk_safe, _min_z, _idx = self.planner.desk_safety.check_path_desk_safety(path)
+            if not desk_safe:
+                return False
         return True
 
-    def _return_to_home_direct(self) -> bool:
-        """Fallback: lift EEF along Z+ away from desk, then joint-space home.
+    def _execute_joint_homing(
+        self, current: np.ndarray, target: np.ndarray, dt: float
+    ) -> None:
+        """Phase 2: collision-checked joint-space interpolation to exact home.
 
-        Linear joint-space motion could pass through the desk.
-        Lift EEF first to eliminate collision risk, then run SDK linear trajectory.
+        Skips if joint delta is negligible or the linear path has collisions.
         """
-        # Phase A: Z+ lift to clear desk
-        arm_state = self.arm.get_state()
-        current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-        if np.all(np.isfinite(current_qpos)):
-            # Snap to nearest equivalent of home so lift IK doesn't
-            # reject solutions on spurious "jumps" from wrapped joints.
-            home_qpos = self.arm.config.init_qpos.copy()
-            current_qpos = self._snap_to_nearest_equivalent(current_qpos, home_qpos)
-            if not self._lift_eef_z_safe(current_qpos):
-                logger.warning("Direct lift failed or skipped; proceeding to arm.reset()")
+        delta = float(np.max(np.abs(current - target)))
+        if delta < np.deg2rad(0.5):
+            return
 
-        # Phase B: SDK joint-space home
-        arm_ok = self.arm.reset()
-        hand_ok = self.hand.reset() if self.hand.is_connected() else True
-        return arm_ok and hand_ok
+        n = max(2, int(np.ceil(delta / np.deg2rad(1.0))) + 1)
+        path = np.array(
+            [current + (k / (n - 1)) * (target - current) for k in range(n)],
+            dtype=np.float64,
+        )
+
+        if not self._check_joint_path_safe(path):
+            logger.warning(
+                "Phase 2 joint path has collisions, skipping "
+                "(EEF already at home from Phase 1)"
+            )
+            return
+
+        logger.info("return_to_home Phase 2: %d joint waypoints, delta=%.1f°", n, np.rad2deg(delta))
+        self._execute_waypoints(path, dt)
+
+    # ── Table collision setup ──
 
     def _setup_table_collision(
         self,
@@ -778,15 +389,6 @@ class RobotInterface:
         xy_resolution: float = 0.02,
         x_min_clearance: float = 0.15,
     ) -> None:
-        """Add a dense point-cloud representation of the table at z=table_z.
-
-        The point cloud covers the workspace footprint plus margin, with
-        *n_layers* stacked downward from table_z.  MPlib converts this to
-        an octree used by plan_screw / plan_qpos / IK to avoid collisions.
-
-        All coordinates are in the world frame.  x_min_clearance keeps the
-        cloud away from the robot base at origin.
-        """
         if self.planner is None:
             return
 
@@ -803,66 +405,21 @@ class RobotInterface:
         ys = np.linspace(y_min, y_max, ny, dtype=np.float64)
         grid_x, grid_y = np.meshgrid(xs, ys)
 
-        zs = np.linspace(
-            table_z,
-            table_z - (n_layers - 1) * layer_spacing,
-            n_layers,
-            dtype=np.float64,
-        )
+        zs = np.linspace(table_z, table_z - (n_layers - 1) * layer_spacing, n_layers, dtype=np.float64)
 
         points_list = []
         for z in zs:
-            layer = np.column_stack(
-                [
-                    grid_x.ravel(),
-                    grid_y.ravel(),
-                    np.full(grid_x.size, z, dtype=np.float64),
-                ]
-            )
+            layer = np.column_stack([grid_x.ravel(), grid_y.ravel(), np.full(grid_x.size, z, dtype=np.float64)])
             points_list.append(layer)
 
         points = np.vstack(points_list)
-        self.planner.add_point_cloud(
-            points,
-            name="table",
-            resolution=xy_resolution,
-        )
+        self.planner.add_point_cloud(points, name="table", resolution=xy_resolution)
         logger.info(
-            "Table collision: %s points, %s layers, z=[%.3f, %.3f] m, " "xy=[%.2f,%.2f]x[%.2f,%.2f] m",
-            points.shape[0],
-            n_layers,
-            zs[-1],
-            zs[0],
-            x_min,
-            x_max,
-            y_min,
-            y_max,
+            "Table collision: %s points, %s layers, z=[%.3f, %.3f] m",
+            points.shape[0], n_layers, zs[-1], zs[0],
         )
 
-    def _check_fingertips_above_desk(
-        self,
-        arm_qpos: np.ndarray,
-        hand_qpos: np.ndarray,
-        desk_z: float = 0.0,
-    ) -> tuple[bool, float]:
-        """Check if fingertips are above desk using actual hand_qpos + arm waypoint FK.
-
-        Returns: (all_above, min_z). Only used for execution-level validation
-        when hand_kinematics is available.
-        """
-        if self.hand_kinematics is None or not self.hand_kinematics.is_ready():
-            return True, float("inf")
-
-        if not np.all(np.isfinite(arm_qpos)) or not np.all(np.isfinite(hand_qpos)):
-            return True, float("inf")
-
-        eef = self.kinematics.compute_eef_pose_world(arm_qpos)
-        tips = self._compute_fingertip_pos(eef.p, eef.q, hand_qpos)
-        if not np.all(np.isfinite(tips)):
-            return True, float("inf")
-
-        min_z = float(np.min(tips[:, 2]))
-        return min_z >= desk_z, min_z
+    # ── Fingertip FK ──
 
     def _compute_fingertip_pos(
         self,
@@ -872,7 +429,6 @@ class RobotInterface:
     ) -> np.ndarray:
         if self.hand_kinematics is None or not self.hand_kinematics.is_ready():
             return nan_array((5, 3))
-
         if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(hand_qpos)):
             return nan_array((5, 3))
 
@@ -881,20 +437,13 @@ class RobotInterface:
             return nan_array((5, 3))
 
         T_world_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
-
-        T_eef_handbase = Pose(
-            p=self.config.T_eef_handbase_pos,
-            q=self.config.T_eef_handbase_quat_wxyz,
-        )
-
+        T_eef_handbase = Pose(p=self.config.T_eef_handbase_pos, q=self.config.T_eef_handbase_quat_wxyz)
         identity_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
         tips_world = np.zeros((5, 3), dtype=np.float64)
         for i in range(5):
             tip_in_handbase = Pose(p=tips_in_handbase[i], q=identity_quat)
-            T_world_tip = compose_pose(
-                compose_pose(T_world_eef, T_eef_handbase),
-                tip_in_handbase,
-            )
+            T_world_tip = compose_pose(compose_pose(T_world_eef, T_eef_handbase), tip_in_handbase)
             tips_world[i] = T_world_tip.p
 
         return tips_world
