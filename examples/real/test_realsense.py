@@ -34,6 +34,7 @@ from collections import deque
 from dataclasses import dataclass
 
 import cv2
+import open3d as o3d
 import numpy as np
 
 from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
@@ -497,7 +498,7 @@ def run_pcd_variants(camera: RealSense) -> None:
 
     Variant = tuple[str, PointCloudConfig]  # type: ignore[no-redef]
 
-    variants: list[Variant] = [
+    variants = [
     ("random 1024 (default)", PointCloudConfig(
         npoints=1024, sampling="random", min_depth=0.05, max_depth=1.5,
         return_tensor=False)),

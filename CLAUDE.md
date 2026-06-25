@@ -2,6 +2,10 @@
 
 Dexterous manipulation teleoperation & data collection for **xArm7 (7-DOF arm) + XHand (12-DOF hand)** with VR control.
 
+## 调研规则
+
+当用户说"调研某个项目"时，先在 `~/Desktop/Reference/` 目录下查找对应项目的代码仓库，基于实际代码进行分析，而非依赖记忆或猜测。
+
 ## Project overview
 
 ```

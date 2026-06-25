@@ -215,8 +215,31 @@ def test_quest_hand_teleop() -> None:
             if not ok:
                 err_code = xhand.last_error_code
                 err_msg = xhand.last_error_message
+                consecutive = xhand.consecutive_send_errors
+                delay = xhand.get_recovery_delay(err_code)
+
                 xhand.clear_error()
-                print(f"[XHand] send_action failed: code={err_code} msg='{err_msg}' — cleared, retrying")
+
+                # Circuit breaker: full reconnect after too many consecutive errors.
+                # After ERR_BOOT_CMD (1501036), the hand controller is re-initializing
+                # and may never recover without a hardware-level reset.
+                if consecutive >= 10:
+                    print(
+                        f"[XHand] {consecutive} consecutive errors — reconnecting... "
+                        f"(last: code={err_code} msg='{err_msg}')"
+                    )
+                    if not xhand.reset_connection():
+                        print("[XHand] Reconnect failed — exiting teleop loop.", file=sys.stderr)
+                        break
+                    print("[XHand] Reconnected successfully.")
+                else:
+                    print(
+                        f"[XHand] send_action failed (x{consecutive}): "
+                        f"code={err_code} msg='{err_msg}' — waiting {delay*1000:.0f}ms"
+                    )
+                    time.sleep(delay)
+
+                # Sync last command to current position after recovery
                 qpos_now = xhand.get_state()["qpos"]
                 if np.all(np.isfinite(qpos_now)):
                     xhand.last_qpos_cmd = qpos_now.copy()

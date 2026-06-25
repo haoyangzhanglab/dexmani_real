@@ -197,6 +197,7 @@ def build_robot_state(sim_state: dict) -> RobotState:
         eef_rot6d=quat_wxyz_to_rot6d(eef_quat),
         hand_qpos=sim_state["hand_qpos"],
         hand_tactile_sum=np.zeros((5, 3), dtype=np.float64),
+        hand_tactile_force=np.zeros((5, 120, 3), dtype=np.float64),
         fingertip_pos=np.zeros((5, 3), dtype=np.float64),
         arm_connected=True,
         hand_connected=True,
@@ -482,7 +483,6 @@ def main() -> None:
     hand_retargeter = XHandRetargeter(
         hand_type="right",
         retargeting_type="dexpilot",
-        enable_ref_adapter=True,
     )
 
     # ── TeleopPipeline (shared action computation with real controller) ──
@@ -617,8 +617,6 @@ def main() -> None:
                             path = collection.stop_episode(
                                 success=(classification != "failure"),
                                 classification=classification,
-                                ik_success_rate=round(ik_rate, 4),
-                                vr_drop_rate=round(vr_drop, 4),
                             )
                             old_state = state
                             state = "IDLE"
@@ -762,8 +760,6 @@ def main() -> None:
                             path = collection.stop_episode(
                                 success=(classification != "failure"),
                                 classification=classification,
-                                ik_success_rate=round(ik_rate, 4),
-                                vr_drop_rate=round(vr_drop, 4),
                             )
                             old_state = state
                             state = "IDLE"

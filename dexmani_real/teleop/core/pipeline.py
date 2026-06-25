@@ -63,7 +63,10 @@ class TeleopPipeline:
         Returns (action, status) where status has keys: ik_ok, retarget_ok.
         """
         arm_cmd, ik_ok, target_eef_pos = self.compute_arm_command(
-            vr_frame, current_arm_qpos, prev_arm_cmd, last_arm_cmd=last_arm_cmd,
+            vr_frame, current_arm_qpos, prev_arm_cmd,
+            check_workspace=check_workspace,
+            clamp_workspace_pos=clamp_workspace_pos,
+            last_arm_cmd=last_arm_cmd,
         )
 
         hand_cmd, retarget_ok = self.compute_hand_command(vr_frame, prev_hand_cmd)
@@ -81,6 +84,8 @@ class TeleopPipeline:
         arm_qpos: np.ndarray,
         prev_arm_cmd: np.ndarray,
         *,
+        check_workspace: Callable[[np.ndarray], bool] | None = None,
+        clamp_workspace_pos: Callable[[np.ndarray], np.ndarray] | None = None,
         last_arm_cmd: np.ndarray | None = None,
     ) -> tuple[np.ndarray, bool, np.ndarray | None]:
         """Compute arm IK command from VR wrist pose with robust EMA."""
@@ -107,6 +112,33 @@ class TeleopPipeline:
 
         target_eef_pos = np.asarray(mapped["pos"], dtype=np.float64)
         target_eef_quat = np.asarray(mapped["quat_wxyz"], dtype=np.float64)
+
+        # ── Workspace clamping: keep IK target within reachable bounds ──
+        # On real hardware, RobotInterface.validate_action() gates the final
+        # command. In sim / headless workflows, clamping the target BEFORE IK
+        # avoids flooding the solver with unreachable poses and keeps the arm
+        # moving toward the closest feasible position instead of freezing.
+        if check_workspace is not None and not check_workspace(target_eef_pos):
+            if clamp_workspace_pos is not None:
+                clamped = clamp_workspace_pos(target_eef_pos)
+                if not getattr(self, "_workspace_clamped_warned", False):
+                    logger.warning(
+                        "VR target outside workspace: raw=%.3f clamped=%.3f",
+                        target_eef_pos, clamped,
+                    )
+                    self._workspace_clamped_warned = True
+                target_eef_pos = clamped
+            else:
+                if not getattr(self, "_workspace_oob_warned", False):
+                    logger.warning(
+                        "VR target outside workspace (no clamp): pos=%.3f — holding",
+                        target_eef_pos,
+                    )
+                    self._workspace_oob_warned = True
+                return arm_cmd, ik_ok, target_eef_pos
+        else:
+            self._workspace_clamped_warned = False
+            self._workspace_oob_warned = False
 
         target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
         ik_result = self.planner.solve_teleop_ik(target_pose, arm_qpos, prev_arm_cmd)

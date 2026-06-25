@@ -1,8 +1,15 @@
-"""VR-to-XHand retargeting via dex_retargeting + pinky ref adapter."""
+"""VR-to-XHand retargeting via dex_retargeting + adaptive pinky scaling.
+
+Pinky adaptation uses LeFranX's landmark-space approach (adaptive_retargeting_xhand):
+directly scales pinky chain segments (MCP→PIP→DIP→TIP) on MANO-space landmarks
+before computing reference vectors.
+
+Ref: LeFranX vr_hand_detector_adapter.py:27-84
+"""
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter"]
+__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]
 
 import time
 
@@ -10,9 +17,68 @@ import numpy as np
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
-from dexmani_real.teleop.vr.ref_adapter import XHandRefAdapter
 
 logger = get_logger(__name__)
+
+# ── Pinky landmark indices (MediaPipe convention) ──
+_PINKY_MCP = 17
+_PINKY_PIP = 18
+_PINKY_DIP = 19
+_PINKY_TIP = 20
+
+# LeFranX adaptive scaling parameters (vr_hand_detector_adapter.py:52-60)
+_PINKY_MIN_EXTENSION = 0.03  # fully curled
+_PINKY_MAX_EXTENSION = 0.10  # fully extended
+_PINKY_BASE_SCALE = 1.2  # minimum scaling for curled positions
+_PINKY_MAX_SCALE = 2.2  # maximum scaling for extended positions
+
+
+def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
+    """Apply adaptive pinky scaling for XHand robot (LeFranX approach).
+
+    Compensates for human-to-robot finger length differences by adaptively
+    scaling pinky chain segments based on finger extension state.
+    Scales more when extended (for reaching), less when curled (for fist-making).
+
+    Operates on MANO-space landmarks — modifies pinky PIP/DIP/TIP positions
+    in-place on a copy. The scaled landmarks are then used directly by the
+    existing retargeting pipeline.
+
+    Ref: LeFranX vr_hand_detector_adapter.py:27-84
+
+    Args:
+        landmarks: (21, 3) array in MANO coordinate space.
+
+    Returns:
+        (21, 3) array with pinky chain scaled (new copy, input unchanged).
+    """
+    landmarks = landmarks.copy()
+
+    # Finger extension: distance from MCP to TIP
+    pinky_extension = float(np.linalg.norm(landmarks[_PINKY_TIP] - landmarks[_PINKY_MCP]))
+
+    # Normalize extension ratio (0.0 = fully curled, 1.0 = fully extended)
+    extension_ratio = np.clip(
+        (pinky_extension - _PINKY_MIN_EXTENSION) / (_PINKY_MAX_EXTENSION - _PINKY_MIN_EXTENSION),
+        0.0,
+        1.0,
+    )
+
+    # Adaptive scaling: more when extended, less when curled
+    adaptive_scale = _PINKY_BASE_SCALE + (_PINKY_MAX_SCALE - _PINKY_BASE_SCALE) * extension_ratio
+
+    # Apply progressive scaling along the kinematic chain (MCP→PIP→DIP→TIP).
+    # Each segment is extended from the (possibly modified) parent joint.
+    mcp_to_pip = landmarks[_PINKY_PIP] - landmarks[_PINKY_MCP]
+    landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * adaptive_scale
+
+    pip_to_dip = landmarks[_PINKY_DIP] - landmarks[_PINKY_PIP]
+    landmarks[_PINKY_DIP] = landmarks[_PINKY_PIP] + pip_to_dip * adaptive_scale
+
+    dip_to_tip = landmarks[_PINKY_TIP] - landmarks[_PINKY_DIP]
+    landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * adaptive_scale
+
+    return landmarks
 
 
 class XHandRetargeter:
@@ -21,10 +87,6 @@ class XHandRetargeter:
         fixed_joint_values: np.ndarray | None = None,
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
-        enable_ref_adapter: bool = True,
-        pinky_extension_range=(0.03, 0.07),
-        pinky_scale=(1.2, 2.2),
-        pinky_blend: float = 1.0,
         debug_adapters: bool = False,
     ):
         self.hand_type = hand_type
@@ -49,13 +111,6 @@ class XHandRetargeter:
         ]
 
         self.load_retargeter()
-        self.ref_adapter = XHandRefAdapter(
-            enable=enable_ref_adapter and retargeting_type != "position",
-            pinky_extension_range=pinky_extension_range,
-            pinky_scale=pinky_scale,
-            pinky_blend=pinky_blend,
-            debug=debug_adapters,
-        )
 
     def load_retargeter(self):
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
@@ -72,22 +127,21 @@ class XHandRetargeter:
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
         """Build reference value from hand landmarks for retargeting.
 
-        (Phase 4.3: renamed from build_ref_value — only called by self.retarget().)
+        Applies LeFranX-style adaptive pinky scaling on MANO landmarks
+        before computing origin→task difference vectors.
         """
         if self.retargeting_type == "position":
             return hand_joint_pos[self.indices, :]
 
+        # LeFranX: scale pinky chain on landmarks before computing ref vectors.
+        # This directly modifies PIP/DIP/TIP positions along the MCP→TIP chain,
+        # compensating for human-robot finger length differences.
+        scaled_landmarks = adaptive_retargeting_xhand(hand_joint_pos)
+
         origin_indices = self.indices[0, :]
         task_indices = self.indices[1, :]
 
-        ref_value = hand_joint_pos[task_indices, :] - hand_joint_pos[origin_indices, :]
-        ref_value = self.ref_adapter.apply(
-            ref_value,
-            hand_joint_pos,
-            origin_indices,
-            task_indices,
-        )
-
+        ref_value = scaled_landmarks[task_indices, :] - scaled_landmarks[origin_indices, :]
         return ref_value
 
     def retarget(self, hand_joint_pos: np.ndarray | None) -> np.ndarray | None:
@@ -108,7 +162,7 @@ class XHandRetargeter:
         if self.debug_adapters:
             self.last_debug = {
                 "retarget_ms": 1000 * (time.time() - start_time),
-                "ref_adapter": self.ref_adapter.last_debug,
+                "pinky_method": "LeFranX adaptive_retargeting_xhand (landmark-space)",
             }
             logger.info("retarget_debug: %s", self.last_debug)
 

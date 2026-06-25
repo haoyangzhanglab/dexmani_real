@@ -54,6 +54,25 @@ _KNOWN_SENSOR_ERROR_PATTERNS = [
     "this hardware version does not support force control mode",
 ]
 
+# XHand SDK error codes (xhand_controller)
+ERR_OK = 0
+ERR_CRC = 1501070  # Communication data CRC error (RS485 transient)
+ERR_BOOT_CMD = 1501036  # Error running CMD during boot, non-existent CMD (hand re-initializing)
+
+# Recovery delays per error type (seconds).
+# - CRC errors are transient and clear immediately — short delay suffices.
+# - Boot CMD errors mean the hand controller is re-initializing after a
+#   communication fault — needs longer for firmware to complete boot.
+_RECOVERY_DELAY: dict[int, float] = {
+    ERR_CRC: 0.05,  # 50 ms — transient, retry quickly
+    ERR_BOOT_CMD: 0.5,  # 500 ms — hand needs time to finish boot sequence
+}
+
+# Threshold for consecutive send errors before triggering a full reconnect.
+# After this many failures in a row, the hand connection is likely in an
+# unrecoverable state and needs a hardware-level reset.
+_CONSECUTIVE_ERROR_RECONNECT_THRESHOLD = 10
+
 
 @dataclass
 class XHandConfig:
@@ -203,6 +222,9 @@ class XHand(ConnectionStateMixin):
         self.last_error_code: int | None = None
         self.last_joint_limit_clipped = False
 
+        # Error recovery: track consecutive send failures for circuit breaker
+        self._consecutive_send_errors: int = 0
+
         self._stub_mode = False  # True when xhand_controller SDK unavailable (ref: LeFranX)
         self.last_hand_ids: list[int] = []
         self.cached_comm_type = self._resolve_comm_type()
@@ -240,6 +262,7 @@ class XHand(ConnectionStateMixin):
 
         self.connected_flag = True
         self.error_state = False
+        self._consecutive_send_errors = 0
         self.hand_command = self.make_command(self._array12(self.config.home_qpos))
 
         self._init_hand_state()
@@ -373,6 +396,52 @@ class XHand(ConnectionStateMixin):
         self.last_error_message = ""
         return self.control is not None and self.connected_flag
 
+    @property
+    def consecutive_send_errors(self) -> int:
+        """Number of consecutive send_action() failures (circuit breaker counter)."""
+        return self._consecutive_send_errors
+
+    @staticmethod
+    def get_recovery_delay(error_code: int | None = None) -> float:
+        """Recommended recovery delay (seconds) for a send error code.
+
+        Different errors need different recovery times:
+        - ERR_CRC (1501070): transient RS485 corruption → 50ms
+        - ERR_BOOT_CMD (1501036): hand controller re-initializing → 500ms
+        - Unknown: conservative 100ms
+
+        Callers should sleep this duration before retrying send_action().
+        """
+        if error_code is not None and error_code in _RECOVERY_DELAY:
+            return _RECOVERY_DELAY[error_code]
+        return 0.1  # conservative default for unknown errors
+
+    def reset_connection(self) -> bool:
+        """Full hardware reconnect after persistent send errors.
+
+        Disconnects, waits 1s for hardware to stabilize, then reconnects.
+        Resets consecutive error counter on success.
+
+        Returns:
+            True if reconnection succeeded.
+        """
+        logger.warning(
+            "XHand: resetting connection after %d consecutive send errors (last code=%d)",
+            self._consecutive_send_errors,
+            self.last_error_code,
+        )
+        try:
+            self.disconnect()
+        except Exception:
+            pass
+        time.sleep(1.0)
+        ok = self.connect()
+        if ok:
+            logger.info("XHand: reconnection succeeded")
+        else:
+            logger.error("XHand: reconnection failed")
+        return ok
+
     def stop(self) -> bool:
         if self._stub_mode:
             self.error_state = True
@@ -453,9 +522,11 @@ class XHand(ConnectionStateMixin):
         if self.error_ok(err):
             self.last_qpos_cmd = qpos_cmd.copy()
             self.last_cmd_time = time.time()
+            self._consecutive_send_errors = 0
             return True
 
         self._record_error(err)
+        self._consecutive_send_errors += 1
         return False
 
     # F1: Tactile contact detection (ref: DexUMI eval_xhand.py:40-57)
