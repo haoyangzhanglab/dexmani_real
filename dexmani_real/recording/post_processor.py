@@ -75,8 +75,7 @@ class StreamInterpolator:
         target_ts = np.asarray(target_ts, dtype=np.float64)
 
         if len(source_ts) == 0 or len(target_ts) == 0:
-            return np.full((len(target_ts),) + source_data.shape[1:], np.nan,
-                           dtype=source_data.dtype)
+            return np.full((len(target_ts),) + source_data.shape[1:], np.nan, dtype=source_data.dtype)
 
         if self.config.method == "nearest":
             return self._interpolate_nearest(source_ts, source_data, target_ts)
@@ -86,7 +85,7 @@ class StreamInterpolator:
             return self._interpolate_slerp(source_ts, source_data, target_ts)
         elif self.config.method == "none":
             # No interpolation — return raw data aligned by index
-            return source_data[:len(target_ts)]
+            return source_data[: len(target_ts)]
         else:
             raise ValueError(f"Unknown interpolation method: {self.config.method}")
 
@@ -188,7 +187,8 @@ class StreamInterpolator:
         interpolation.  Falls back to linear+L2-normalize if scipy is
         unavailable.
         """
-        from scipy.spatial.transform import Rotation as R, Slerp
+        from scipy.spatial.transform import Rotation as R
+        from scipy.spatial.transform import Slerp
 
         source_data = np.asarray(source_data)
         if source_data.shape[-1] != 4:
@@ -314,6 +314,7 @@ class TimestampAligner:
             ("obs/eef_quat", ctrl_ts, "slerp"),  # SLERP for unit quaternion
             ("obs/hand_qpos", ctrl_ts, "linear"),
             ("obs/hand_tactile_sum", ctrl_ts, "linear"),
+            ("obs/hand_tactile_force", ctrl_ts, "linear"),
             ("action/arm_qpos", ctrl_ts, "linear"),
             ("action/hand_qpos", ctrl_ts, "linear"),
             ("vr/wrist_pos", ctrl_ts, "linear"),
@@ -347,14 +348,15 @@ class TimestampAligner:
 
         logger.info(
             "TimestampAligner: %d streams aligned to %.0fms grid (%d→%d frames)",
-            len(result) - 2, dt * 1000, len(ctrl_ts), len(target_ts),
+            len(result) - 2,
+            dt * 1000,
+            len(ctrl_ts),
+            len(target_ts),
         )
 
         return result
 
-    def validate_alignment(
-        self, aligned: dict[str, np.ndarray]
-    ) -> dict[str, Any]:
+    def validate_alignment(self, aligned: dict[str, np.ndarray]) -> dict[str, Any]:
         """Validate aligned data for NaN gaps and consistency.
 
         Returns a validation report dict.

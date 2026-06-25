@@ -21,24 +21,24 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.validate import validate_action
-from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.teleop.core.pipeline import TeleopPipeline
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
 
 if TYPE_CHECKING:
-    from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
-    from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
     from dexmani_real.planning.planner import XArm7MotionPlanner
-    from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
     from dexmani_real.sensor.multi_camera_manager import MultiCameraManager
+    from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
+    from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+    from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
 
 logger = get_logger(__name__)
 
@@ -98,8 +98,11 @@ class TeleopController:
     ) -> None:
         if cfg is None:
             cfg = TeleopControllerConfig(
-                target_hz=target_hz, ema_alpha_arm=ema_alpha_arm, dry_run=dry_run,
-                use_zmq_vr=use_zmq_vr, zmq_vr_port=zmq_vr_port,
+                target_hz=target_hz,
+                ema_alpha_arm=ema_alpha_arm,
+                dry_run=dry_run,
+                use_zmq_vr=use_zmq_vr,
+                zmq_vr_port=zmq_vr_port,
                 use_shm_vr=use_shm_vr,
             )
 
@@ -116,7 +119,9 @@ class TeleopController:
             inner_cfg = cfg.inner_loop_cfg if cfg.inner_loop_cfg is not None else ArmInnerLoopConfig()
             self._arm_inner = ArmInnerLoop(cfg=inner_cfg)
             self._arm_inner.start()
-            mode_label = {4: "velocity control + PID", 1: "position servo"}.get(inner_cfg.control_mode, f"mode {inner_cfg.control_mode}")
+            mode_label = {4: "velocity control + PID", 1: "position servo"}.get(
+                inner_cfg.control_mode, f"mode {inner_cfg.control_mode}"
+            )
             logger.info("ArmInnerLoop started (mode %d, %s, 250Hz)", inner_cfg.control_mode, mode_label)
 
         # Recording with async writer thread (offloads HDF5 I/O from hot path)
@@ -143,6 +148,7 @@ class TeleopController:
         self._multi_camera: MultiCameraManager | None = None
         if cfg.multi_camera_configs is not None and len(cfg.multi_camera_configs) > 0:
             from dexmani_real.sensor.multi_camera_manager import MultiCameraConfig, MultiCameraManager
+
             mc_cfg = MultiCameraConfig(auto_restart=cfg.multi_camera_auto_restart)
             self._multi_camera = MultiCameraManager(cfg.multi_camera_configs, mc_cfg)
             if camera_process is None:
@@ -154,6 +160,7 @@ class TeleopController:
 
         if cfg.use_shm_vr:
             from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
+
             try:
                 self._vr_shm = SharedMemoryFrameManager(create=False)
                 logger.info("VR source: SharedMemory (attached, zero-copy)")
@@ -162,6 +169,7 @@ class TeleopController:
                 self._vr_shm = None
         elif cfg.use_zmq_vr:
             from dexmani_real.teleop.vr.vr_publisher import VRFrameSubscriber
+
             self._vr_subscriber = VRFrameSubscriber(sub_port=cfg.zmq_vr_port)
             self._vr_subscriber.connect()
             logger.info("VR source: ZMQ SUB (tcp://127.0.0.1:%d)", cfg.zmq_vr_port)
@@ -295,11 +303,16 @@ class TeleopController:
 
         if self.recording and self._collection_loop is not None and self._recording_queue is not None:
             try:
-                self._recording_queue.put_nowait(dict(
-                    state=state, action=action, vr_frame=vr_frame,
-                    camera_frame=camera_frame, camera_frames=camera_frames,
-                    T_base_eef=T_base_eef,
-                ))
+                self._recording_queue.put_nowait(
+                    dict(
+                        state=state,
+                        action=action,
+                        vr_frame=vr_frame,
+                        camera_frame=camera_frame,
+                        camera_frames=camera_frames,
+                        T_base_eef=T_base_eef,
+                    )
+                )
             except queue.Full:
                 logger.warning("Recording queue full — dropping frame")
 
@@ -480,7 +493,7 @@ class TeleopController:
             return
         logger.info("Restarting arm inner loop...")
         # Preserve the same inner loop config (mode, PID gains, etc.)
-        inner_cfg = getattr(self._arm_inner, '_cfg', ArmInnerLoopConfig())
+        inner_cfg = getattr(self._arm_inner, "_cfg", ArmInnerLoopConfig())
         self._arm_inner = ArmInnerLoop(cfg=inner_cfg)
         self._arm_inner.start()
         logger.info("Arm inner loop restarted")
@@ -600,8 +613,10 @@ class TeleopController:
             eef_rot6d=np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64),
             hand_qpos=np.zeros(12, dtype=np.float64),
             hand_tactile_sum=np.zeros((5, 3), dtype=np.float64),
+            hand_tactile_force=np.zeros((5, 120, 3), dtype=np.float64),
             fingertip_pos=np.zeros((5, 3), dtype=np.float64),
-            arm_connected=True, hand_connected=True,
+            arm_connected=True,
+            hand_connected=True,
             timestamp=time.perf_counter(),
         )
 
@@ -613,9 +628,16 @@ class TeleopController:
         rec = "REC" if self.recording else "   "
         logger.info(
             "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms ik=%s/%s retarget=%s/%s",
-            now, self.frame_count, self.state.value, rec, seq,
-            f"{age_s*1000:.0f}", self.ik_success_count, self.ik_fail_count,
-            self.retarget_success_count, self.retarget_fail_count,
+            now,
+            self.frame_count,
+            self.state.value,
+            rec,
+            seq,
+            f"{age_s*1000:.0f}",
+            self.ik_success_count,
+            self.ik_fail_count,
+            self.retarget_success_count,
+            self.retarget_fail_count,
         )
 
     # ── Recording writer thread (offloads HDF5 I/O from 50Hz hot path) ──

@@ -59,10 +59,8 @@ def preflight_check(robot) -> PreFlightReport:
     checks.append(("hand 连接", hand_connected or None, "" if hand_connected else "降级运行 (arm only)"))
 
     if hand_connected:
-        hand_state = robot.hand.get_state(full=True)
-        hand_errs = hand_state.get("commboard_err", np.zeros(12))
-        hand_comm_ok = bool(np.all(hand_errs == 0))
-        checks.append(("hand 通信正常", hand_comm_ok or None, f"commboard_err={hand_errs}" if not hand_comm_ok else ""))
+        hand_has_error = robot.hand.is_error()
+        checks.append(("hand 通信正常", None if hand_has_error else True, "board error" if hand_has_error else ""))
 
     # ── Overall pass ──
     passed = all(ok is not False for _, ok, _ in checks)

@@ -15,16 +15,16 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
-from dexmani_real.planning.kinematics import XArm7Kinematics
-from dexmani_real.planning.types import Pose
-from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
 from dexmani_real.planning import WorkspaceSafety
+from dexmani_real.planning.kinematics import XArm7Kinematics
+from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
+from dexmani_real.planning.types import Pose
 from dexmani_real.robot.hand_kinematics import HandKinematics
 from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.xarm7 import XArm7
 from dexmani_real.robot.xhand import XHand
 from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
@@ -134,11 +134,10 @@ class RobotInterface:
             arm_qvel = np.asarray(arm_state["qvel"], dtype=np.float64)
             arm_tau = np.asarray(arm_state["tau"], dtype=np.float64)
 
-        hand_state = self.hand.get_state(full=True)
+        hand_state = self.hand.get_state()  # default mode now includes tactile (ref: DexUMI)
         hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
-        hand_tactile_sum = np.asarray(
-            hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64
-        )
+        hand_tactile_sum = np.asarray(hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64)
+        hand_tactile_force = np.asarray(hand_state.get("tactile_force", np.zeros((5, 120, 3))), dtype=np.float64)
 
         # EEF FK
         if np.all(np.isfinite(arm_qpos)):
@@ -162,6 +161,7 @@ class RobotInterface:
             eef_rot6d=eef_rot6d,
             hand_qpos=hand_qpos,
             hand_tactile_sum=hand_tactile_sum,
+            hand_tactile_force=hand_tactile_force,
             fingertip_pos=fingertip_pos,
             arm_connected=self.arm.is_connected(),
             hand_connected=self.hand.is_connected(),
@@ -261,7 +261,8 @@ class RobotInterface:
                     plan_ok = True
                     logger.info(
                         "return_to_home Phase 1: %d waypoints, source=%s, score=%.3f",
-                        len(result.qpos_path), result.source,
+                        len(result.qpos_path),
+                        result.source,
                         result.report.get("path_score", float("nan")),
                     )
                     self._execute_waypoints(result.qpos_path, dt)
@@ -274,7 +275,8 @@ class RobotInterface:
             if not plan_ok:
                 # ── Tier 2: Safe joint-space fallback (collision-checked) ──
                 logger.warning(
-                    "plan_path failed: %s, trying safe joint-space fallback", plan_reason,
+                    "plan_path failed: %s, trying safe joint-space fallback",
+                    plan_reason,
                 )
                 if not self.arm.is_error() and not self._safe_joint_home_fallback(qpos, home_qpos, dt):
                     logger.warning("Safe joint fallback also failed, falling back to arm.reset()")
@@ -325,9 +327,7 @@ class RobotInterface:
         hand_ok = self.hand.reset() if self.hand.is_connected() else True
         return arm_ok and hand_ok
 
-    def _execute_waypoints(
-        self, path: np.ndarray, dt: float, max_step_rad: float = np.deg2rad(1.0)
-    ) -> bool:
+    def _execute_waypoints(self, path: np.ndarray, dt: float, max_step_rad: float = np.deg2rad(1.0)) -> bool:
         """Execute a joint-space path via position servo with dense interpolation.
 
         Densely interpolates waypoints at ``max_step_rad`` resolution (default 1°)
@@ -378,9 +378,7 @@ class RobotInterface:
                 return False
         return True
 
-    def _execute_joint_homing(
-        self, current: np.ndarray, target: np.ndarray, dt: float
-    ) -> None:
+    def _execute_joint_homing(self, current: np.ndarray, target: np.ndarray, dt: float) -> None:
         """Phase 2: collision-checked joint-space interpolation to exact home.
 
         Skips if joint delta is negligible or the linear path has collisions.
@@ -396,18 +394,13 @@ class RobotInterface:
         )
 
         if not self._check_joint_path_safe(path):
-            logger.warning(
-                "Phase 2 joint path has collisions, skipping "
-                "(EEF already at home from Phase 1)"
-            )
+            logger.warning("Phase 2 joint path has collisions, skipping " "(EEF already at home from Phase 1)")
             return
 
         logger.info("return_to_home Phase 2: %d joint waypoints, delta=%.1f°", n, np.rad2deg(delta))
         self._execute_waypoints(path, dt)
 
-    def _safe_joint_home_fallback(
-        self, current: np.ndarray, target: np.ndarray, dt: float
-    ) -> bool:
+    def _safe_joint_home_fallback(self, current: np.ndarray, target: np.ndarray, dt: float) -> bool:
         """Tier 2 fallback: collision-checked joint-space linear interpolation to home.
 
         Used when plan_path fails (e.g. waypoint delta too large after shortcut
@@ -430,15 +423,15 @@ class RobotInterface:
 
         if not self._check_joint_path_safe(path):
             logger.warning(
-                "Safe joint fallback: path has collisions (self/env/desk), "
-                "delta=%.1f°",
+                "Safe joint fallback: path has collisions (self/env/desk), " "delta=%.1f°",
                 np.rad2deg(delta),
             )
             return False
 
         logger.info(
             "return_to_home safe joint fallback: %d waypoints, delta=%.1f°",
-            n, np.rad2deg(delta),
+            n,
+            np.rad2deg(delta),
         )
         return self._execute_waypoints(path, dt)
 
@@ -480,7 +473,10 @@ class RobotInterface:
         self.planner.add_point_cloud(points, name="table", resolution=xy_resolution)
         logger.info(
             "Table collision: %s points, %s layers, z=[%.3f, %.3f] m",
-            points.shape[0], n_layers, zs[-1], zs[0],
+            points.shape[0],
+            n_layers,
+            zs[-1],
+            zs[0],
         )
 
     # ── Fingertip FK ──

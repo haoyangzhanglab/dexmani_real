@@ -47,10 +47,7 @@ def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
             continue
         arr = np.asarray(val)
         if arr.shape != expected_shape:
-            raise ValueError(
-                f"{cls_name}.{field_name} shape mismatch: "
-                f"expected {expected_shape}, got {arr.shape}"
-            )
+            raise ValueError(f"{cls_name}.{field_name} shape mismatch: " f"expected {expected_shape}, got {arr.shape}")
 
 
 @dataclass
@@ -61,41 +58,46 @@ class RobotState:
     """
 
     # ── Arm joints ──
-    arm_qpos: np.ndarray          # (7,)  float64  rad
-    arm_qvel: np.ndarray          # (7,)  float64  rad/s
-    arm_tau: np.ndarray           # (7,)  float64  N·m (motor current)
+    arm_qpos: np.ndarray  # (7,)  float64  rad
+    arm_qvel: np.ndarray  # (7,)  float64  rad/s
+    arm_tau: np.ndarray  # (7,)  float64  N·m (motor current)
 
     # ── EEF pose (dual representation) ──
-    eef_pos: np.ndarray           # (3,)  float64  m
-    eef_quat_wxyz: np.ndarray     # (4,)  float64
-    eef_rot6d: np.ndarray         # (6,)  float64
+    eef_pos: np.ndarray  # (3,)  float64  m
+    eef_quat_wxyz: np.ndarray  # (4,)  float64
+    eef_rot6d: np.ndarray  # (6,)  float64
 
     # ── Hand joints ──
-    hand_qpos: np.ndarray         # (12,) float64  rad
+    hand_qpos: np.ndarray  # (12,) float64  rad
 
-    # ── Tactile ──
-    hand_tactile_sum: np.ndarray  # (5,3) float64  N
+    # ── Tactile (ref: DexUMI — both combined force and raw array in default mode) ──
+    hand_tactile_sum: np.ndarray  # (5,3)     float64  N — per-finger combined force
+    hand_tactile_force: np.ndarray  # (5,120,3) float64  N — per-finger raw force array
 
     # ── Derived (chained FK) ──
-    fingertip_pos: np.ndarray     # (5,3) float64  m (world frame)
+    fingertip_pos: np.ndarray  # (5,3) float64  m (world frame)
 
     # ── Status ──
     arm_connected: bool
     hand_connected: bool
-    timestamp: float              # seconds
+    timestamp: float  # seconds
 
     def __post_init__(self):
-        _validate_field_shapes(self, [
-            ("arm_qpos", (7,)),
-            ("arm_qvel", (7,)),
-            ("arm_tau", (7,)),
-            ("eef_pos", (3,)),
-            ("eef_quat_wxyz", (4,)),
-            ("eef_rot6d", (6,)),
-            ("hand_qpos", (12,)),
-            ("hand_tactile_sum", (5, 3)),
-            ("fingertip_pos", (5, 3)),
-        ])
+        _validate_field_shapes(
+            self,
+            [
+                ("arm_qpos", (7,)),
+                ("arm_qvel", (7,)),
+                ("arm_tau", (7,)),
+                ("eef_pos", (3,)),
+                ("eef_quat_wxyz", (4,)),
+                ("eef_rot6d", (6,)),
+                ("hand_qpos", (12,)),
+                ("hand_tactile_sum", (5, 3)),
+                ("hand_tactile_force", (5, 120, 3)),
+                ("fingertip_pos", (5, 3)),
+            ],
+        )
 
 
 @dataclass
@@ -106,17 +108,20 @@ class RobotAction:
     target_eef_pos / target_eef_rot6d: EEF target before IK (optional).
     """
 
-    arm_qpos_cmd: np.ndarray             # (7,)  float64  rad
-    hand_qpos_cmd: np.ndarray            # (12,) float64  rad
+    arm_qpos_cmd: np.ndarray  # (7,)  float64  rad
+    hand_qpos_cmd: np.ndarray  # (12,) float64  rad
 
-    target_eef_pos: np.ndarray | None = None    # (3,)  float64  m
+    target_eef_pos: np.ndarray | None = None  # (3,)  float64  m
     target_eef_rot6d: np.ndarray | None = None  # (6,)  float64
 
     def __post_init__(self):
-        _validate_field_shapes(self, [
-            ("arm_qpos_cmd", (7,)),
-            ("hand_qpos_cmd", (12,)),
-        ])
+        _validate_field_shapes(
+            self,
+            [
+                ("arm_qpos_cmd", (7,)),
+                ("hand_qpos_cmd", (12,)),
+            ],
+        )
 
 
 @dataclass
@@ -126,11 +131,14 @@ class RobotInterfaceConfig:
 
     # Workspace safety
     workspace_bounds: np.ndarray = field(
-        default_factory=lambda: np.array([
-            [0.28, 0.72],  # x [min, max] m
-            [-0.45, 0.45],  # y [min, max] m
-            [0.05, 0.5],   # z [min, max] m
-        ], dtype=np.float64)
+        default_factory=lambda: np.array(
+            [
+                [0.28, 0.72],  # x [min, max] m
+                [-0.45, 0.45],  # y [min, max] m
+                [0.05, 0.5],  # z [min, max] m
+            ],
+            dtype=np.float64,
+        )
     )
 
     # Hand FK
@@ -138,9 +146,7 @@ class RobotInterfaceConfig:
     fingertip_link_names: list[str] = field(default_factory=list)
 
     # Static transform from EEF to hand base
-    T_eef_handbase_pos: np.ndarray = field(
-        default_factory=lambda: np.zeros(3, dtype=np.float64)
-    )
+    T_eef_handbase_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     T_eef_handbase_quat_wxyz: np.ndarray = field(
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     )
