@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.recording.collection_config import CollectionConfig
 
 if TYPE_CHECKING:

@@ -9,7 +9,7 @@ import time
 import numpy as np
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dexmani_real import ASSET_DIR
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.teleop.vr.ref_adapter import XHandRefAdapter
 
 logger = get_logger(__name__)

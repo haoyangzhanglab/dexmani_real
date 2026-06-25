@@ -1,7 +1,35 @@
 """Camera extrinsics loader.
 
-Loads per-camera extrinsics from the bundled calib/cameras.json data file.
+Loads per-camera extrinsics from a bundled cameras.json data file.
 Supports eye-to-hand (static camera) and eye-in-hand (end-effector mounted).
+
+Two storage formats are supported:
+
+1. **Pose format** (recommended, human-readable)::
+
+       {
+         "camera_0": {
+           "serial": "241322110633",
+           "type": "eye_to_hand",
+           "pose": {
+             "position": [0.5, -0.35, 0.82],
+             "orientation": [1.0, 0.0, 0.0, 0.0]
+           }
+         }
+       }
+
+   ``position`` is XYZ in meters, ``orientation`` is WXYZ quaternion.
+   Converted to a 4×4 homogeneous matrix at load time.
+
+2. **Matrix format** (legacy, for backward compatibility)::
+
+       {
+         "camera_0": {
+           "serial": "...",
+           "type": "eye_to_hand",
+           "T_base_camera": [[...], ...]
+         }
+       }
 
 Intrinsics (K matrix) are read from the RealSense hardware at runtime, not from
 this calibration file. They are stored into HDF5 /meta at recording time for
@@ -25,6 +53,26 @@ from pathlib import Path
 import numpy as np
 
 
+def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarray:
+    """Convert pose (position XYZ + orientation WXYZ quaternion) to 4×4 homogeneous matrix.
+
+    Args:
+        position: [x, y, z] in meters.
+        orientation: [w, x, y, z] quaternion (scalar-first).
+
+    Returns:
+        (4, 4) homogeneous transformation matrix, float64.
+    """
+    from scipy.spatial.transform import Rotation as R
+
+    px, py, pz = float(position[0]), float(position[1]), float(position[2])
+    w, x, y, z = float(orientation[0]), float(orientation[1]), float(orientation[2]), float(orientation[3])
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = [px, py, pz]
+    T[:3, :3] = R.from_quat([x, y, z, w]).as_matrix()  # scipy uses xyzw
+    return T
+
+
 @dataclass
 class CameraCalibEntry:
     serial: str
@@ -44,42 +92,73 @@ class CameraCalibEntry:
 
 
 class CameraCalib:
+
     def __init__(self, calib_path: str | None = None):
         if calib_path is None:
-            # Prefer project-root configs/cameras.json (extracted path)
-            # fallback to in-package legacy path calib/cameras.json
-            pkg_dir = Path(__file__).resolve().parent
-            project_root = pkg_dir.parent.parent
-            new_path = project_root / "configs" / "cameras.json"
-            old_path = pkg_dir / "calib" / "cameras.json"
-            calib_path = str(new_path) if new_path.exists() else str(old_path)
+            calib_path = self._resolve_default_path()
         self.calib_path = Path(calib_path).resolve()
         self._entries: dict[str, CameraCalibEntry] = {}
         self._load()
+
+    @classmethod
+    def _resolve_default_path(cls) -> str:
+        """Find cameras.json using priority-ordered search paths.
+
+        1. Package directory: ``dexmani_real/config/cameras.json``
+        2. Project root (legacy): ``<project>/configs/cameras.json``
+        3. Package legacy fallback: ``dexmani_real/config/calib/cameras.json``
+        """
+        pkg_dir = Path(__file__).resolve().parent  # dexmani_real/config/
+        project_root = pkg_dir.parent.parent
+
+        candidates = [
+            pkg_dir / "cameras.json",                       # in-package (recommended)
+            project_root / "configs" / "cameras.json",      # legacy top-level
+            pkg_dir / "calib" / "cameras.json",             # legacy in-package
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return str(cand)
+        # Default to the recommended path (let _load() raise FileNotFoundError
+        # with a helpful message if the file doesn't exist).
+        return str(candidates[0])
 
     def _load(self) -> None:
         if not self.calib_path.exists():
             raise FileNotFoundError(
                 f"Calibration file not found: {self.calib_path}\n"
-                "Create it with format: https://..."
+                "Create it at dexmani_real/config/cameras.json with format:\n"
+                '  {"camera_0": {"serial": "...", "type": "eye_to_hand", '
+                '"pose": {"position": [x,y,z], "orientation": [w,x,y,z]}}}'
             )
         with open(self.calib_path) as f:
             raw = json.load(f)
 
         for cam_name, cam in raw.items():
+            # Resolve extrinsics: prefer pose format, fall back to legacy matrix format
+            T_base_camera = None
+            T_eef_camera = None
+
+            if "pose" in cam:
+                # Pose format (recommended): position + orientation quaternion
+                pose = cam["pose"]
+                T = _pose_to_matrix(pose["position"], pose["orientation"])
+                if cam["type"] == "eye_to_hand":
+                    T_base_camera = T
+                else:
+                    T_eef_camera = T
+            else:
+                # Legacy matrix format
+                if cam.get("T_base_camera") is not None:
+                    T_base_camera = np.array(cam["T_base_camera"], dtype=np.float64)
+                if cam.get("T_eef_camera") is not None:
+                    T_eef_camera = np.array(cam["T_eef_camera"], dtype=np.float64)
+
             entry = CameraCalibEntry(
                 serial=cam["serial"],
                 type=cam["type"],
-                T_base_camera=(
-                    np.array(cam["T_base_camera"], dtype=np.float64)
-                    if cam.get("T_base_camera") is not None
-                    else None
-                ),
-                T_eef_camera=(
-                    np.array(cam["T_eef_camera"], dtype=np.float64)
-                    if cam.get("T_eef_camera") is not None
-                    else None
-                ),
+                T_base_camera=T_base_camera,
+                T_eef_camera=T_eef_camera,
             )
             self._entries[cam_name] = entry
 

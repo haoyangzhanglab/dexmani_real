@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 

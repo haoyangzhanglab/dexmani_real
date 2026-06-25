@@ -1,10 +1,10 @@
-"""xArm7 7-DOF robot arm hardware driver — simplified for PID process isolation.
+"""xArm7 7-DOF robot arm hardware driver — thin wrapper for blocking moves.
 
 Control mode: position servo via set_servo_angle_j (blocking moves only: reset, home).
-Velocity PID control is owned by PIDProcess (robot/pid_process.py), which has its
-own XArmAPI connection in a separate process.
+Teleop arm position servo is handled by ArmInnerLoop (robot/inner_loop.py), which
+runs as an in-process daemon thread with its own XArmAPI connection.
 
-The xArm7 class is now a thin hardware wrapper — no inner threads, no PID, no velocity mode.
+This class is a thin hardware wrapper — no inner threads, no PID, no velocity mode.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 from xarm.wrapper import XArmAPI
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.serialization import from_dict_helper
@@ -45,7 +45,7 @@ class XArm7Config:
     clip_joint_limit: bool = True
 
     # Collision detection — set to 1 (least sensitive) to prevent false C31 during teleop.
-    # PIDProcess manages its own collision params independently.
+    # ArmInnerLoop manages its own collision params independently.
     collision_sensitivity: int = 1
 
     # TCP load for correct dynamics torque estimation
@@ -56,7 +56,7 @@ class XArm7Config:
 class XArm7(ConnectionStateMixin):
     """Thin xArm7 hardware wrapper — blocking moves only (reset, home).
 
-    Velocity PID control is owned by PIDProcess in a separate process.
+    Velocity PID control is owned by ArmInnerLoop in a separate process.
     This class only handles: connect, disconnect, reset, stop, get_state,
     and blocking position moves via set_servo_angle_j.
     """
@@ -183,7 +183,7 @@ class XArm7(ConnectionStateMixin):
         """Send joint position command for blocking moves (reset).
 
         Simple position servo — clips joint limits, then set_servo_angle_j.
-        For teleop position servo, use PIDProcess.
+        For teleop position servo, use ArmInnerLoop.
         """
         if self.arm is None:
             self.error_state = True

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 

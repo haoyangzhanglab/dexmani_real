@@ -95,7 +95,8 @@ from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker, VRFrameSimulator
 from dexmani_real.utils.rate_limiter import RateLimiter
 
-from examples._test_utils import execute_dense_path, interpolate_waypoints, settle_at_target
+from dexmani_real.planning.path_utils import interpolate_waypoints
+from dexmani_real.simulation import execute_dense_path, settle_at_target
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 模块常量
@@ -107,7 +108,7 @@ PHYSICS_STEPS_PER_WP = 20
 PHYSICS_STEPS_PER_TICK = 5          # 240Hz → 48Hz effective
 INTERP_MAX_STEP_RAD = np.deg2rad(2.0)
 VR_FRAME_MAX_AGE_S = 0.2            # 仿真容忍度高于真机（0.1s）：dummy VR 无网络延迟
-DEFAULT_DATA_DIR = "./recordings"
+DEFAULT_DATA_DIR = "./episodes"
 
 # 工作空间边界（world frame，与 RobotInterfaceConfig 默认值保持一致）
 WORKSPACE_BOUNDS = np.array([

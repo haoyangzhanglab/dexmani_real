@@ -2,7 +2,7 @@
 
 Flow: arm IK → robust EMA → hand retarget → assemble action.
 
-Workspace clamping is handled by PIDTargetChannel + workspace safety in validate_action().
+Workspace clamping is handled by ArmInnerLoop timeout hold + validate_action().
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.types import Pose
 from dexmani_real.robot.types import RobotAction
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points

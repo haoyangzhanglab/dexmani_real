@@ -1,9 +1,12 @@
 # DexMani 控制回路架构
 
 > xArm7 (7-DOF) + XHand (12-DOF) 遥操作控制系统的完整控制链路。
-> 基于进程隔离 + 位置伺服 (mode 1) + 自适应 EMA 平滑。
+> 基于线程内环 + 速度控制 (mode 4) + 用户态 PID + 自适应 EMA 平滑。
 >
-> 主要参考: BunnyVisionPro (双层频率), LeFranX (EMA 思想), ManiUniCon (进程隔离)
+> 主要参考: BunnyVisionPro (双层频率 + 线程内环 + mode 4 PID), LeFranX (EMA 思想), T-Rex (action_buffer 模式)
+>
+> **2025-06-25 架构演进**: PID 进程隔离 (mp.Process + SharedMemory) → ArmInnerLoop (threading.Thread + Lock)
+> → 默认 mode 4 速度控制 + 用户态 PID (对标 BVP)
 
 ---
 
@@ -12,7 +15,7 @@
 1. [架构总览](#1-架构总览)
 2. [参考矩阵](#2-参考矩阵)
 3. [进程边界隔离](#3-进程边界隔离)
-4. [PID 进程 (250Hz 内环)](#4-pid-进程-250hz-内环)
+4. [Arm 内环线程 (250Hz, 默认 Mode 4)](#4-arm-内环线程-250hz-默认-mode-4)
 5. [主进程 (50Hz 外环)](#5-主进程-50hz-外环)
 6. [安全架构](#6-安全架构)
 7. [录制系统](#7-录制系统)
@@ -28,52 +31,51 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  MAIN PROCESS (50Hz)                                                     │
+│  MAIN PROCESS (单进程, 3+ 线程)                                           │
 │                                                                          │
-│  _tick() 清洁管线:                                                        │
+│  Main Thread (50Hz):                                                     │
 │  1. 读 VR frame (ZMQ / Tracker)                                         │
-│  2. VR staleness check (单一阈值 0.5s → None-sentinel 自然减速)           │
-│  3. 读 arm state ← PIDStateChannel (SharedMemory)                       │
+│  2. VR staleness check (单一阈值 0.5s → inner.set_target(None))          │
+│  3. 读 arm state ← inner.get_state() (Lock)                             │
 │  4. IK: 迭代 DLS (λ²=1e-5, 100 iter)                                    │
 │  5. RobustEMA (α=0.95→0.3 自适应, LeFranX+ManiUniCon 融合)              │
 │  6. Hand retarget → RobotInterface.send_action() (直接发送)              │
-│  7. validate_action (3 项) → 写 target → PIDTargetChannel               │
+│  7. validate_action + actual_arm_qpos → inner.set_target(cmd)           │
 │                                                                          │
 │  状态机: IDLE ⇄ TELEOP ⇄ PAUSED → EMERGENCY_STOP                        │
-│  PAUSED / VR丢失 → PIDTargetChannel.write(None) → 保持当前位置            │
-└──────────┬───────────────────────────────────────────┬───────────────────┘
-           │ PIDTargetChannel (target →, 9 floats)    │ PIDStateChannel
-           │ SharedMemory, lock-free, <1μs            │ (state ←, 9 floats)
-           ▼                                          ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│  PID PROCESS (独立 mp.Process, 2 线程)                                   │
+│  PAUSED / VR丢失 → inner.set_target(None) → 发送零速度 (mode 4)          │
 │                                                                          │
-│  Target Loop Thread (250Hz):                State Reader Thread (50Hz):  │
-│  1. read target from PIDTargetChannel      1. XArmAPI.get_joint_states() │
-│  2. 200ms timeout → hold position          2. write → PIDStateChannel    │
-│  3. NaN guard → hold last valid                                          │
-│  4. arm.set_servo_angle_j() (mode 1)                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐     │
+│  │ Inner Loop Thread (250Hz, daemon):                               │     │
+│  │  1. with lock: target = self._arm_target                         │     │
+│  │  2. 200ms timeout → send zero velocity (mode 4) / hold (mode 1)  │     │
+│  │  3. NaN guard → send zero velocity / last_valid                  │     │
+│  │  4. arm.get_joint_states() → update shared _arm_qpos              │     │
+│  │  5. PID: error → velocity → clip → accel limit → jerk limit      │     │
+│  │  6. arm.vc_set_joint_velocity(qvel) (mode 4)                     │     │
+│  │                                                                  │     │
+│  │  拥有独立的 XArmAPI() 连接 — 对标 BunnyVisionPro                   │     │
+│  │  _internal_control_arm_qpos() 线程模式                            │     │
+│  └─────────────────────────────────────────────────────────────────┘     │
 │                                                                          │
-│  拥有独立的 XArmAPI() 连接 — Main 不直接访问 xArm SDK                    │
-│  对标 ManiUniCon Robot(mp.Process) 双线程 + SDK + SharedMemory           │
-│                                                                          │
-│  位置伺服模式 (mode 1): arm 内部伺服负责 PID、平滑、速度限制               │
-│  PIDProcess 仅做 target 转发 + 超时/NaN 安全兜底                          │
+│  RecordingWriter Thread (daemon):                                        │
+│    queue.Queue → collection_loop.record_frame() — offloads HDF5 I/O      │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 关键时序
 
-| 特性 | 主进程 (外环) | PID 进程 (内环) |
-|------|-------------|----------------|
+| 特性 | 主线程 (外环) | 内环线程 (ArmInnerLoop) |
+|------|-------------|--------------------------|
 | 频率 | 50 Hz | 250 Hz |
 | 周期 | 20 ms | 4 ms |
 | 过采样比 | — | 5:1 |
-| 线程 | 主线程 (`run()`) | Target Loop Thread + State Reader Thread |
-| 同步方式 | `RateLimiter.wait()` 补偿式 | 简单 `time.sleep` 闭包 |
-| 指令类型 | 位置目标 (`arm_qpos_cmd[7]`) | 位置目标 (`set_servo_angle_j`) |
-| SDK 连接 | **无** (仅通过 SharedMemory) | **拥有** XArmAPI 连接 |
-| 控制模式 | — | mode 1 (position servo) |
+| 运行位置 | 主进程主线程 | 主进程 daemon 线程 |
+| 同步方式 | `RateLimiter.wait()` 补偿式 | `RateLimiter.wait()` 补偿式 |
+| 指令类型 | 位置目标 (`arm_qpos_cmd[7]`) | 速度指令 (`vc_set_joint_velocity`) |
+| SDK 连接 | **无** (通过 inner.set_target()) | **拥有** XArmAPI 连接 |
+| 控制模式 | — | mode 4 (velocity control + 用户态 PID) |
+| 通信 | `threading.Lock` + numpy array | ← 同进程共享变量 |
 
 ---
 
@@ -85,14 +87,14 @@ DexMani 控制回路的设计有意识地参考了三个项目，同时保留了
 
 | 来源 | 模式 | DexMani 实现 | 对齐度 |
 |------|------|-------------|--------|
-| **BVP** | 双层频率 (50Hz + 250Hz) | controller.py + pid_process.py | ✅ |
+| **BVP** | 双层频率 (50Hz + 250Hz) | controller.py + inner_loop.py | ✅ |
 | **BVP** | 迭代 DLS IK (λ²=1e-5, 100 iter) | `planning/ik.py` | ✅ |
 | **BVP** | Pinocchio FK/Jacobian | `planning/kinematics.py` | ✅ |
+| **BVP** | mode 4 速度控制 + 用户态 PID | `PIDController` (inner_loop.py) | ✅ |
+| **BVP** | 线程内环 (threading.Lock + 共享变量) | `ArmInnerLoop` (inner_loop.py) | ✅ |
 | **LeFranX** | EMA 关节空间平滑概念 | `robust_ema()` — α 不同 (0.95 vs 0.3) | ⚠️ |
 | **LeFranX** | 差分式 VR 映射 (delta from initial) | `teleop/vr/arm_mapper.py` | ✅ |
-| **LeFranX** | 命令超时保护 | PIDTargetChannel 200ms 超时 | ✅ |
-| **ManiUniCon** | 进程边界隔离 (SharedMemory) | PIDTargetChannel + PIDStateChannel | ✅ |
-| **ManiUniCon** | 双线程 PID 进程 (control + state reader) | `pid_process.py` | ✅ |
+| **LeFranX** | 命令超时保护 | ArmInnerLoop 200ms 超时 | ✅ |
 | **ManiUniCon** | RateLimiter 补偿式频率控制 | `utils/rate_limiter.py` | ✅ |
 | **ManiUniCon** | 自适应 α 概念 (MA+EWMA) | `robust_ema()` 连续 α 自适应 | ✅ |
 
@@ -100,17 +102,12 @@ DexMani 控制回路的设计有意识地参考了三个项目，同时保留了
 
 | 不采纳 | 来源 | 原因 |
 |--------|------|------|
-| D-on-error PID | BVP | 位置伺服模式，arm 内部伺服处理 PID |
-| 用户态 PID 控制 | BVP | 位置伺服模式无需用户态 PID；简化为 target 转发 |
 | 无 EMA 平滑 | BVP | robust_ema 自适应 α 优于零平滑 |
-| TCP 进程边界 | LeFranX | SharedMemory 延迟 <1μs (vs TCP ~1-2ms) |
+| TCP 进程边界 | LeFranX | threading.Lock 延迟 ~100ns (vs TCP ~1-2ms) |
 | Ruckig OTG (C++ 实时) | LeFranX | xArm SDK 不支持 libfranka 式用户态回调 |
-| 解析 IK | LeFranX | Franka 专用，xArm7 无通用解析解 |
+| mp.Process 进程隔离 | ManiUniCon | 2025-06-25 移除；线程模型 (BVP) 更简单且足够 |
 | 6 级 JointSpaceSmoother | ManiUniCon | ~50-100ms 相位滞后不可接受 |
 | Pink QP 基 IK | ManiUniCon | QP 开销 > 50Hz 约束；DLS 已验证稳定 |
-| PoseTrajectoryInterpolator | ManiUniCon | 关节空间位置伺服已满足需求 |
-| 多策略/多机器人抽象 | ManiUniCon | DexMani 专注 xArm7+XHand 深度优化 |
-| 速度控制模式 (mode 4) | BVP | mode 1 位置伺服避免双连接模式冲突 |
 
 ### 2.3 独家保留机制
 
@@ -119,129 +116,156 @@ DexMani 控制回路的设计有意识地参考了三个项目，同时保留了
 | # | 机制 | 本质 | 四个参考项目均无 |
 |---|------|------|-----------------|
 | **C4** | validate_action 预发送安全门 | 3 项 fail-fast 检查 (error/connection/workspace) | BVP 仅 error code; LeFranX 仅 max_relative_target; ManiUniCon 仅 joint clip |
-| **C8** | None-sentinel 协议 | target=None → 保持当前位置 | 三者均无此语义，各自独立处理减速 |
+| **C8** | None-sentinel 协议 | target=None → 零速度停止 (mode 4) / 保持位姿 (mode 1) | 三者均无此语义，各自独立处理减速 |
 
 ---
 
-## 3. 进程边界隔离
+## 3. 线程内环架构
 
 ### 3.1 设计动机
 
-三个参考项目都有进程边界 (BVP: ZMQ, LeFranX: TCP, ManiUniCon: SharedMemory)。
-DexMani 原架构使用同进程 `threading.Lock`，无故障隔离 — 外环崩溃时内环线程在过期 target 上持续运行。
+2025-06-25 架构演进: 移除 mp.Process 进程隔离，采用 BunnyVisionPro 线程模型。
 
-新架构对齐 ManiUniCon: PID 进程拥有 XArmAPI 连接，Main 通过 SharedMemory 通道通信。
+原 PID 进程隔离的问题:
+- 进程生命周期管理复杂 (return_to_home 时 stop/restart)
+- SharedMemory 崩溃残留 (`/dev/shm/pid_*`)
+- 30s 启动等待
+- 调试困难 (子进程无堆栈)
+- 手部架构不对称 (arm 有隔离, hand 无)
 
-### 3.2 双通道设计
+线程模型优势:
+- 同进程 `threading.Lock` + numpy array 通信，延迟 ~100ns
+- 无 SHM 生命周期管理
+- 启动同步 <1s (vs 30s)
+- 同进程异常可见，完整堆栈
+- 对标 BVP/T-Rex 成熟模式
+
+### 3.2 通信机制
 
 ```
-Main Process (外环 50Hz)              PID Process (内环 250Hz)
-┌───────────────────────┐              ┌────────────────────────────┐
-│ compute_action()      │              │ Target Loop Thread (250Hz) │
-│        │              │              │   read target →            │
-│        ▼              │              │   NaN guard →              │
-│  PIDTargetChannel     │── target ──→│   timeout check →          │
-│  (9 float64, 72B)     │              │   set_servo_angle_j()      │
-│                       │              │                            │
-│  PIDStateChannel      │←─ state ────│ State Reader Thread (50Hz) │
-│  (9 float64, 72B)     │              │   XArmAPI.get_joint_states │
-│    arm_qpos(7)        │              │   write state → channel   │
-│    error_flag          │              └────────────────────────────┘
-└───────────────────────┘
+Main Thread (50Hz)                    Inner Loop Thread (250Hz, daemon)
+──────────────────                    ─────────────────────────────────
+inner.set_target(cmd)  ──Lock──→     self._arm_target (np.ndarray)
+qpos, err, ts = get_state() ←─Lock── self._arm_qpos, self._error_state
 ```
 
-通道布局 (9 × float64 = 72 bytes):
-- `[0:7)` — 数据 (target_qpos 或 arm_qpos)
-- `[7]` — 标志 (valid_flag 或 error_flag)
-- `[8]` — 时间戳 (perf_counter)
+通信由 `ArmInnerLoop` 类内部管理:
+- `set_target(target)`: Lock 保护下写入 `_arm_target` (numpy array) 或 None
+- `get_state()`: Lock 保护下读取 `_arm_qpos` + `_error_state`
+- 对标 BVP 的 `_arm_pos_target` + `_arm_lock` 模式
 
-### 3.3 故障响应矩阵 — 双向独立检测
+### 3.3 故障响应
 
-每方不信任对端，所有故障都有独立的、不依赖对端的停转路径:
-
-| 故障 | 谁检测 | 检测方式 | 响应 | 最坏延迟 |
-|------|--------|---------|------|---------|
-| **Main 崩溃** | PID 进程 | `now - target_ts > 200ms` | 保持当前位姿 | 200ms |
-| **PID 崩溃** | xArm SDK | `set_servo_angle_j` 停发 | SDK 内置超时停转 | ~100ms |
-| **PID 崩溃** | Main 进程 | `now - state_ts > 100ms` 或 error_flag=1 | 急停 + 告警 | ~100ms |
-| **xArm 断连** | PID 进程 | `get_joint_states()` 失败 | error_flag=1, PID 退出 | 即时 |
-| **SharedMemory 损坏** | 读方 | NaN/Inf 校验 | 保持位姿 (PID) / 急停 (Main) | 即时 |
-
-**双向检测优势**: 三个参考项目仅单向检测（计算端崩被检测），DexMani 提供双向 — PIDStateChannel 让 Main 能独立发现 PID 进程存活状态。这是 SharedMemory 双向通道相对 ZMQ/TCP 单工的结构性优势。
+| 故障 | 检测方式 | 响应 | 最坏延迟 |
+|------|---------|------|---------|
+| **Main 线程崩溃** | 内环线程 `try/finally` | arm.disconnect() + SDK 超时停转 | ~100ms |
+| **内环线程异常** | `_error_state=True` + 主线程 `error_state` 检测 | 急停 | 20ms (50Hz) |
+| **xArm 断连** | 内环 `get_joint_states()` 失败 | error_state=True, 线程退出 | 即时 |
+| **Target 超时 (200ms)** | 内环自检 `now - target_ts` | 发送零速度 (mode 4) / 保持位姿 (mode 1) | 200ms |
+| **NaN target** | 内环 `np.all(np.isfinite)` | 发送零速度 (mode 4) / last_valid_qpos (mode 1) | 4ms (250Hz) |
 
 ---
 
-## 4. PID 进程 (250Hz 内环)
+## 4. Arm 内环线程 (250Hz, 默认 Mode 4)
 
-### 4.1 设计决策: 位置伺服 vs 速度控制
+### 4.1 设计决策: 速度控制 (Mode 4) vs 位置伺服 (Mode 1)
 
-**最终选择: mode 1 位置伺服 (`set_servo_angle_j`)**
+**默认选择: mode 4 速度控制 + 用户态 PID (`vc_set_joint_velocity`)**
 
 | 方案 | 优点 | 缺点 |
 |------|------|------|
-| mode 4 速度控制 + 用户态 PID | 完全控制 PID 行为、可加 jerk 限幅 | 需要两个 XArmAPI 连接、mode 冲突、PID 调参复杂 |
-| **mode 1 位置伺服 (采用)** | 无 mode 冲突、arm 内部伺服处理平滑/PID、代码简洁 | 无法自定义 PID 参数、无 jerk 限幅 |
+| **mode 4 + 用户态 PID (默认)** | 完全控制 PID 行为、可加 jerk/accel 限幅、对标 BVP | PID 调参需验证 |
+| mode 1 位置伺服 (fallback) | 无 mode 冲突、arm 固件处理一切、代码简洁 | 无法自定义 PID 参数 |
 
-**关键原因**: xArm 同一物理臂只能处于一个 mode。Main 进程的 `RobotInterface` (用于 reset/home) 和 PID 进程如果同时持有 XArmAPI 连接且使用不同 mode，会导致 `ControllerError 22`。统一使用 mode 1 消除了 mode 冲突。
+**PID 增益**: kp=[10,10,10,10,10,10,10], kd=[0.04,…,0.04], ki=0 (对称化，保证各关节协调跟踪)
+**kd = kp × dt 黄金比例**: 在 250Hz (dt=0.004s) 下，kd = 10 × 0.004 = 0.04 恰好处于临界不震荡点——既不引发超调，又提供最小必要阻尼。
+**速度限幅**: [1.2, 1.0, 1.2, 1.0, 1.5, 1.0, 1.5] rad/s (BVP 遥操作安全值, ~33-50% 硬件能力)
 
-### 4.2 主循环
+### 4.2 主循环 (Mode 4 默认)
 
 ```python
-# pid_process.py: run() — 子进程主循环 @ 250Hz
+# inner_loop.py: _run() — 内环线程主循环 @ 250Hz, mode 4
 while not stopped:
-    rate_limiter()  # 精确 4ms 周期
+    limiter.wait()
 
-    # 1. 读目标 (SharedMemory, 无锁)
-    target, target_ts = target_ch.read()
+    # 1. 读目标 (Lock 保护)
+    target = self._arm_target
 
-    # 2. 超时检测: 200ms 无新目标 → 保持当前位姿
-    if target is None or timeout:
-        # 读当前关节位置，重新发送作为 hold 命令
-        arm.set_servo_angle_j(angles=current_qpos, is_radian=True)
-        continue
+    # 2. 超时 → vc_set_joint_velocity(zeros)
+    # 3. NaN → vc_set_joint_velocity(zeros)
+    # 4. 可选 position EMA 平滑 (smooth_position_alpha > 0)
+    # 5. 读关节状态 → current_qpos
 
-    # 3. NaN 守卫 → 发送上次有效位姿
-    if not all(isfinite(target)):
-        arm.set_servo_angle_j(angles=last_valid_qpos, is_radian=True)
-        continue
+    # 6. PID 控制: error → velocity
+    error = target - current_qpos
+    qvel = PID.control(error, dt)
 
-    # 4. 发送目标位姿 (arm 内部伺服处理 PID/平滑/速度限制)
-    arm.set_servo_angle_j(angles=target[:7], is_radian=True)
+    # 7. 多级限幅: velocity → accel → jerk
+    qvel = clip(qvel, max_velocity)
+    qvel = limit_accel(qvel, prev_qvel, max_accel)
+    qvel = limit_jerk(qvel, prev_qvel, prev_qacc, max_jerk)
+
+    # 8. 发送速度指令
+    arm.vc_set_joint_velocity(qvel)
 ```
 
-### 4.3 核心行为
+### 4.3 PID 参数分析
 
-| 场景 | 行为 | 说明 |
+**D-term 安全边界**: kd < kp × dt，否则 D 项在 250Hz 采样率下主导 P 项，引发"猛冲-急刹"振荡。
+
+| 参数 | 值 | 物理意义 |
+|------|-----|---------|
+| kp | 10 | 比例增益: 1 rad 误差 → 10 rad/s 速度 (10× 放大) |
+| kd | 0.04 | 阻尼增益: kd/dt=0.04/0.004=10→D 项等效 kp=10 (与 P 项平分) |
+| kd/kp 比 | 0.004 (dt) | 黄金比例 — D 项恰好阻尼高频而不超调 |
+| 等效时间常数 | ~30ms | (1/kp)*2.5 个周期 → 稳定时间 ~304ms |
+| D 项噪声放大 | ~0.01 rad/s | 1e-4 rad 量化噪声 × 10 = 极低 |
+
+**调参历程**:
+1. BVP 原始: kp=[10,10,5,5,5,5,5], kd=[2,2,1,1,1,1,1] — 非对称增益导致 J1-J2 跟踪快于 J3-J7，产生 EEF 寄生位移
+2. 方案B: kp=[5,5,5,5,5,5,5], kd=[1,1,1,1,1,1,1] — 对称但 kd=1.0 过大 (kd/dt=250, 50× 安全边界)，D 项振荡导致净速度仅 2%
+3. 当前: kp=[10,10,10,10,10,10,10], kd=[0.04,…,0.04] — 对称 + 黄金比例，89% 斜坡跟踪率，0% 超调，~25mm EEF 滞后
+
+### 4.4 核心行为
+
+| 场景 | Mode 4 (默认) | Mode 1 |
 |------|------|------|
-| **正常遥操作** | 转发 target → `set_servo_angle_j()` | arm 内部伺服跟踪目标 |
-| **超时 (200ms)** | 读当前位姿 → 重新发送 | 不依赖 last target，读真实硬件位姿 |
-| **NaN target** | 发送 `last_valid_qpos` | 防止 NaN 传播到硬件 |
-| **PAUSED / VR 丢失** | Main 写 `None` → PID 读当前位姿保持 | None-sentinel 协议 |
+| **正常遥操作** | PID(error)→速度→限幅→`vc_set_joint_velocity()` | `set_servo_angle_j()` |
+| **超时 (200ms)** | 发送零速度 (停止) | 读当前位姿→保持 |
+| **NaN target** | 发送零速度 (停止) | 发送 last_valid_qpos |
+| **PAUSED / VR 丢失** | Main 调 `set_target(None)` → 零速度停止 | Main 调 `set_target(None)` → 保持位姿 |
 
-### 4.4 State Reader 线程 (50Hz)
+### 4.5 状态读取 (统一循环)
 
-```python
-# 独立线程，与 Target Loop 并行
-while not stopped:
-    code, states = arm.get_joint_states()
-    if ok:
-        state_ch.write(qpos, error_state=False)
-    else:
-        state_ch.write(zeros(7), error_state=True)
-    sleep(0.02)
+与旧 PIDProcess 不同，ArmInnerLoop 没有独立的 State Reader 线程。
+状态读取和目标转发在同一个 250Hz 循环中完成：
+
+```
+每 4ms 周期:
+  1. 读 target (Lock)
+  2. 超时/NaN 检查
+  3. 可选 position EMA 平滑
+  4. arm.get_joint_states() → 更新 self._arm_qpos (Lock)
+  5. PID: error → velocity → 多级限幅
+  6. arm.vc_set_joint_velocity(qvel)
 ```
 
-State Reader 的存在使得 Main 进程无需访问 xArm SDK 即可获取实时关节位置（用于 FK 计算、录制等）。
+Main 线程通过 `get_state()` 获取最新 arm 状态（250Hz 更新频率，比旧 50Hz 快 5×）。
 
-### 4.5 与原始设计的差异
+### 4.6 与原始 PID 进程的差异
 
-原始计划使用 mode 4 速度控制 + D-on-Measurement PID + Jerk 限幅 + Bottleneck 裁剪，但在实际调试中发现:
-
-1. **Mode 冲突不可解**: 两个 XArmAPI 连接同时操作同一 arm 的不同 mode → `ControllerError 22`
-2. **位置伺服已足够**: arm 内部伺服 (kHz 级) 的 PID/平滑/限速优于 Python 250Hz 用户态实现
-3. **简化收益大**: 删除 ~80 行 PID/jerk/bottleneck 代码，消除一整类 bug
-
-`utils/signal_utils.py` 中的 `limit_jerk()` 函数保留但不被 PID 进程使用 — 供未来可能的离线轨迹平滑使用。
+| 维度 | 旧 (PIDProcess) | 新 (ArmInnerLoop) |
+|------|:---:|:---:|
+| 运行方式 | mp.Process (独立进程) | threading.Thread (daemon) |
+| 通信 | SharedMemory 双通道 (72B) | Lock + numpy array |
+| 控制模式 | mode 1 (位置伺服) | **mode 4 (速度控制 + 用户态 PID)** |
+| 状态线程 | 独立 State Reader (50Hz) | 统一循环 (250Hz) |
+| PID 位置 | 无 (arm 固件 PID) | 用户态 PIDController |
+| 限幅管线 | 无 | velocity → accel → jerk |
+| 速率控制 | 简单 time.sleep | 补偿式 RateLimiter |
+| 启动 | 30s 轮询等待 | wait_ready() <1s |
+| 清理 | SHM unlink/close | 进程退出 OS 回收 |
+| 调试 | 无堆栈 | 完整堆栈 |
 
 ---
 
@@ -260,8 +284,8 @@ IDLE ──B(begin)──→ TELEOP ──R(自动录制)──→ (recording=Tr
 |------|---------|------|
 | **IDLE** | 启动 / HOME / STOP / QUIT | 管道空闲，不发送命令 |
 | **TELEOP** | B 键 | 运行完整管线 (IK→EMA→retarget→send) |
-| **PAUSED** | C 键 (toggle) | PIDTargetChannel.write(None) → 保持当前位姿 |
-| **EMERGENCY_STOP** | ESC / 硬件错误 / PID 超时 | 调用 robot.emergency_stop()，仅 Q 退出或 H 恢复 |
+| **PAUSED** | C 键 (toggle) | inner.set_target(None) → 零速度停止 (mode 4) |
+| **EMERGENCY_STOP** | ESC / 硬件错误 / 内环超时 | 调用 robot.emergency_stop()，仅 Q 退出或 H 恢复 |
 
 **变更**: 原 5 状态含 SAVE_PROMPT（录制停止后确认保存/丢弃）。现改为自动保存 — STOP/QUIT 时自动调用 `collection_loop.stop_episode()`。
 
@@ -271,16 +295,16 @@ IDLE ──B(begin)──→ TELEOP ──R(自动录制)──→ (recording=Tr
 _tick() @ 50Hz
 │
 ├─[Guard] EMERGENCY_STOP → return
-├─[Guard] PAUSED → write(None) → return
+├─[Guard] PAUSED → set_target(None) → return
 ├─[Guard] IDLE → return
 │
 ├─[1] 读 VR frame (ZMQ / Tracker)
 │
-├─[2] VR staleness: age > 0.5s 或 frame=None → write(None) → return
+├─[2] VR staleness: age > 0.5s 或 frame=None → set_target(None) → return
 │     单一阈值，对标 LeFranX 500ms 命令超时
 │
-├─[3] 读 arm state ← PIDStateChannel
-│     error_flag=1 或 state_ts > 100ms → 急停
+├─[3] 读 arm state ← inner.get_state()
+│     error_flag=True 或 state_ts > 100ms → 急停
 │
 ├─[4] pipeline.compute_action()
 │     arm: IK (DLS 迭代) → robust_ema()
@@ -291,7 +315,7 @@ _tick() @ 50Hz
 ├─[6] validate_action() — 3 项检查
 │     error/not_connected → 急停
 │     workspace violation → hold last good
-│     → 写 arm target → PIDTargetChannel
+│     → inner.set_target(cmd)
 │     → 发 hand command → RobotInterface.send_action()
 │
 ├─[7] 周期性状态日志 (每 2s)
@@ -334,7 +358,7 @@ VR landmarks(21,3) → estimate_frame_from_hand_points → wrist_rot
 
 发送路径: controller → RobotInterface.send_action() → XHand.send_action()
           (直接发送，无 PID 内环)
-Bounds check: [-0.75, 2.0] rad (内联在 controller._compute_action())
+Bounds check: 从 XHandConfig.qpos_min/qpos_max 读取逐关节限位
 ```
 
 ---
@@ -345,14 +369,14 @@ Bounds check: [-0.75, 2.0] rad (内联在 controller._compute_action())
 
 | 层 | 位置 | 内容 |
 |----|------|------|
-| **L1** | controller._tick() | VR staleness (0.5s) → None-sentinel 保持位姿 |
+| **L1** | controller._tick() | VR staleness (0.5s) → None-sentinel 零速度停止 |
 | **L2** | validate_action() | 3 项 fail-fast (error state / connection / workspace bounds) |
 | **L3** | xArm SDK | collision_sensitivity=1 (kHz 级硬件碰撞检测) |
 
 ### 6.2 validate_action() — 3 项检查
 
 ```python
-# robot/validate.py (~44 行)
+# robot/validate.py (~55 行)
 def validate_action(robot, action) -> tuple[bool, str]:
     # 1. SDK error state (覆盖 arm error_code + connected_flag + hand comm errors)
     if robot.is_error():
@@ -390,11 +414,11 @@ DexMani 用 `sensitivity=1` (最不敏感) + 正确 TCP 负载。
 
 ### 6.4 None-Sentinel 协议
 
-| 场景 | 触发 | PID 内环行为 |
+| 场景 | 触发 | 内环行为 (mode 4) |
 |------|------|-------------|
-| PAUSED | `pid_target.write(None)` | 读当前位姿 → 保持 |
-| VR 丢失 (>0.5s) | `pid_target.write(None)` | 读当前位姿 → 保持 |
-| PID 超时 (200ms) | PID 进程自检 | 读当前位姿 → 保持 |
+| PAUSED | `inner.set_target(None)` | 发送零速度 → 停止 |
+| VR 丢失 (>0.5s) | `inner.set_target(None)` | 发送零速度 → 停止 |
+| 内环超时 (200ms) | 内环自检 | 发送零速度 → 停止 |
 | 紧急停止 | `robot.emergency_stop()` | arm.stop() + hand.stop() |
 
 ---
@@ -437,24 +461,45 @@ episode_000.h5
 
 ## 8. Return-to-Home
 
-三阶段执行:
+### 8.1 三级 Fallback 架构
 
 ```
-Phase 1: plan_path(home EEF) — 完整碰撞检测 Cartesian 路径
-         plan_path → execute_dense_waypoints (1° 分辨率)
-Phase 2: 碰撞检测关节空间插值 → 接近 init_qpos
-         若 joint delta < 0.5° 或路径有碰撞 → 跳过
-Finalize: arm.reset() 阻塞收敛 — set_servo_angle(wait=True)
-          SDK 内部闭环等待到位 → 精确 init_qpos
+Tier 1: plan_path(home EEF)
+  └─ screw/RRT Cartesian 路径 + 完整碰撞检测 (self + env + desk + workspace)
+     └─ 成功 → execute_waypoints (1° 分辨率插补)
+
+Tier 2: _safe_joint_home_fallback()          ← plan_path 失败时
+  └─ 稠密关节空间线性插补 (1° 分辨率), 碰撞检查
+     └─ 通过 → execute_waypoints
+
+Tier 3: arm.reset()                           ← Tier 1 + Tier 2 均失败
+  └─ SDK 原生阻塞 move, 无碰撞检测 (最后手段)
 ```
 
-关键设计:
-- Phase 1/2 使用 `send_action()` → `set_servo_angle_j()` (非阻塞)
-- Finalize 使用 `arm.reset()` → `set_servo_angle(wait=True)` (阻塞)
-- 非阻塞阶段有碰撞检测，阻塞阶段确保精度
-- 若 planner 不可用: fallback → 直接 `arm.reset()` (SDK 阻塞 move)
-- PID 进程在 return-to-home 前被停止，return-to-home 完成后重启
-  (两个进程都使用 mode 1，停止 PID 是为了避免两个连接同时向 arm 发送位置指令)
+### 8.2 执行流程
+
+```
+1. 读当前位置 qpos
+2. 无 planner → Tier 2 safe joint fallback → 失败则 Tier 3
+3. Snap 连续关节 (J0/J2/J4/J6) 到最近 2π 等效位
+4. 已在 home (delta < 1°) → 直接返回
+5. Hand reset (对齐 FK 模型)
+6. Tier 1: plan_path(home_eef, qpos)
+   ├─ 成功 → _execute_waypoints (dense 1° interpolation)
+   └─ 失败 → Tier 2: _safe_joint_home_fallback
+              ├─ 成功 → 继续
+              └─ 失败 → Tier 3: arm.reset()
+7. Phase 2: 关节空间插补到精确 home (_execute_joint_homing)
+8. Finalize: arm.reset() — set_servo_angle(wait=True) 阻塞收敛到 init_qpos
+```
+
+### 8.3 关键设计
+
+- **home_dt 参数**: 控制 waypoint 间隔时间。默认 0.02s (~50°/s)，keyboard_teleop 使用 0.04s (~25°/s) 更安全
+- **非阻塞阶段** (Tier 1/2, Phase 2): 使用 `send_action()` → `set_servo_angle_j()` 逐点执行，有碰撞检测
+- **阻塞阶段** (Finalize): 使用 `arm.reset()` → `set_servo_angle(wait=True)`，确保子度级精度
+- **线程模型**: 无需停止/重启内环线程 — return_to_home 期间内环线程自动超时停止 (200ms 无 target)
+- **max_waypoint_delta_deg=360.0**: keyboard_teleop 中禁用该冗余检查，因为执行层已做 1° 密集插补
 
 ---
 
@@ -466,8 +511,8 @@ VR @ 120Hz → 采集+传输 (~15-25ms)
   → ArmMapper (<0.1ms)
   → IK DLS (~1ms, 通常 3-5 iter 收敛)
   → RobustEMA (~2ms 正常帧)
-  → PIDTargetChannel SharedMemory (<1μs)
-  → PID 进程 target 转发 + arm 内部伺服跟踪 (10-30ms)
+  → inner.set_target() (Lock ~100ns)
+  → 内环 PID → 速度指令 (4ms 内)
   → 机电执行 (~5ms)
 
 ═══════════════════════════════
@@ -480,7 +525,7 @@ VR @ 120Hz → 采集+传输 (~15-25ms)
 | VR 采集+传输+排队 | ~15-25ms | ~45% |
 | RobustEMA (正常帧) | ~2ms | ~3% |
 | IK + 计算 | ~1ms | ~2% |
-| arm 内部伺服跟踪 | 10-30ms | ~40% |
+| 内环 PID + arm 跟踪 | 10-30ms | ~40% |
 | 机电执行 | ~5ms | ~10% |
 
 ---
@@ -492,22 +537,27 @@ VR @ 120Hz → 采集+传输 (~15-25ms)
 | 参数 | 值 | 位置 |
 |------|-----|------|
 | 外环频率 | 50 Hz (20ms) | `controller.py` `target_hz=50.0` |
-| 内环频率 | 250 Hz (4ms) | `pid_process.py` `dt=1/250.0` |
+| 内环频率 | 250 Hz (4ms) | `inner_loop.py` `dt=1/250.0` |
 | 过采样比 | 5:1 | — |
-| 命令超时 (PID 进程) | 200ms | `pid_process.py` `target_timeout_s=0.2` |
+| 命令超时 (内环) | 200ms | `inner_loop.py` `target_timeout_s=0.2` |
 | State 超时 (Main 进程) | 100ms | `controller.py` |
 | VR staleness 阈值 | 0.5s | `controller.py` `_VR_STALE_THRESHOLD_S` |
 | 循环超限报警 | >30ms (150% × 20ms) | `controller.py` |
 
-### 10.2 PID 进程 (位置伺服)
+### 10.2 内环线程 (Mode 4 速度控制, 默认)
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| 控制模式 | mode 1 (position servo) | 与 Main 进程统一，避免 mode 冲突 |
-| SDK 指令 | `set_servo_angle_j()` | arm 内部伺服处理 PID/平滑/速度 |
-| 超时行为 | 读当前位姿 → 重新发送 | 200ms 无新 target 触发 |
-| NaN 行为 | 发送 `last_valid_qpos` | 防止 NaN 传播 |
-| PID / 平滑 | arm 固件内置 (kHz 级) | 无用户态 PID 控制器 |
+| 控制模式 | mode 4 (velocity control) | `vc_set_joint_velocity()` + 用户态 PID |
+| PID 增益 (kp) | `[10,10,10,10,10,10,10]` | 对称化 (所有关节统一，消除 EEF 寄生位移) |
+| PID 增益 (kd) | `[0.04,…,0.04]` | kp × dt 黄金比例 (临界阻尼，零超调) |
+| PID 增益 (ki) | `0` (默认关闭) | 可开启；抗积分饱和 (windup_limit=0.3) |
+| 速度限幅 | `[1.2,1.0,1.2,1.0,1.5,1.0,1.5]` rad/s | ~33-50% 硬件能力 |
+| 加速度限幅 | `None` (可选) | 可设 ~3 rad/s² |
+| 加加速度限幅 | `None` (可选) | 可设 ~10 rad/s³, Ruckig 等效 |
+| 位置平滑 α | `0.0` (可选) | 可设 0.3-0.8 减 IK 抖动 |
+| 超时行为 | 发送零速度 | 200ms 无新 target |
+| Fallback 模式 | mode 1 (position servo) | 设置 `control_mode=1` |
 
 ### 10.3 平滑
 
@@ -538,8 +588,9 @@ VR @ 120Hz → 采集+传输 (~15-25ms)
 | 工作空间 Z | [0.05, 0.50] m | `types.py` |
 | 碰撞检测 | sensitivity=1 | `xarm7.py` |
 | TCP 负载 | 1.2kg, [0,0,80]mm | `xarm7.py` |
-| 手部 retarget 范围 | [-0.75, 2.0] rad | `controller.py` |
+| 手部 retarget 范围 | 从 XHandConfig 逐关节读取 | `controller.py` |
 | 桌面安全 Z (指尖) | 0.03 m (仅在 planner 离线) | `desk_safety.py` |
+| Return-to-Home 速度 | ~25°/s (home_dt=0.04s) | `keyboard_teleop_real.py` |
 
 ---
 
@@ -550,9 +601,9 @@ VR @ 120Hz → 采集+传输 (~15-25ms)
 | 维度 | BVP | LeFranX | ManiUniCon | DexMani |
 |------|-----|---------|------------|---------|
 | **控制层数** | 双层 (50+250Hz) | 单层 + C++ 1kHz | 单层 (100Hz) | 双层 (50+250Hz) |
-| **进程边界** | ZMQ (网络) | TCP (网络) | SharedMemory (进程) | SharedMemory (进程) |
-| **故障检测** | 单向 | 单向 | 单向 | **双向** |
-| **内环控制** | 用户态 D-on-error PID | Ruckig + 阻抗控制 | 硬件内置 | **arm 内部伺服** (mode 1) |
+| **进程边界** | ZMQ (网络) | TCP (网络) | SharedMemory (进程) | threading.Lock (同进程) |
+| **故障检测** | 单向 | 单向 | 单向 | 双向 (Lock + error_state) |
+| **内环运行** | 用户态 D-on-error PID (mode 4) | Ruckig + 阻抗控制 | 硬件内置 | **用户态 PID (mode 4)** 对标 BVP |
 | **平滑** | 无 | EMA (α=0.3) | 6 级管线 (~50-100ms) | RobustEMA (α=0.95→0.3) |
 | **安全门** | 1 项 (error code) | ~3 项 | ~2-3 项 | 3 项 |
 | **录制** | dict → HDF5 | LeRobot 框架 | 分进程 dump | HDF5 逐帧 |
@@ -564,17 +615,19 @@ VR @ 120Hz → 采集+传输 (~15-25ms)
 BVP:         极简主义 ── "越少代码越少 bug"
 LeFranX:     工业轨迹 ── "最优轨迹 = 最优安全"
 ManiUniCon:  信号优先 ── "干净信号 = 安全运动"
-DexMani:     实用主义 ── "arm 内部伺服 + 进程隔离 + 双向安全"
+DexMani:     实用主义 ── "对标 BVP mode 4 PID + 线程内环 + 队列录制"
 ```
 
 ### 11.3 独家优势
 
-| 优势 | 四个参考项目均无 |
-|------|-----------------|
-| 双向进程级故障检测 | 三者仅单向 |
-| None-sentinel 统一保持协议 | 三者各自独立处理 |
+| 优势 | 说明 |
+|------|------|
+| 线程内环 + Lock 通信 (对标 BVP) | 2025-06-25 移除进程隔离，延迟 ~100ns |
+| mode 4 速度控制 + 用户态 PID (对标 BVP) | kp=10, kd=0.04 黄金比例，零超调 |
 | RobustEMA 自适应平滑 | 单滤波器替代 EMA+MA 级联 |
-| mode 1 统一 (无 mode 冲突) | BVP 使用 mode 4 速度控制 |
+| validate_action 预发送安全门 | 3 项 fail-fast + actual_qpos workspace check |
+| 录制队列异步写入 | queue.Queue 解耦录制 I/O，不影响 50Hz 热路径 |
+| Return-to-Home 三级 Fallback | plan_path → safe joint → arm.reset，逐级降级保安全 |
 
 ---
 
@@ -582,13 +635,14 @@ DexMani:     实用主义 ── "arm 内部伺服 + 进程隔离 + 双向安全
 
 | 模块 | 文件 | 行数 | 说明 |
 |------|------|------|------|
-| **TeleopController** | `teleop/core/controller.py` | 621 | 外环主循环, 状态机, 录制管理 |
+| **TeleopController** | `teleop/core/controller.py` | 667 | 外环主循环, 状态机, 录制管理 |
 | **TeleopPipeline** | `teleop/core/pipeline.py` | 161 | 管线: IK → robust EMA → retarget |
-| **PIDProcess** | `robot/pid_process.py` | 240 | 独立进程, 250Hz 位置伺服 target 转发 |
-| **PID Channels** | `shm/pid_channels.py` | 135 | SharedMemory 双通道 |
-| **XArm7** | `robot/xarm7/xarm7.py` | 326 | 精简硬件 wrapper (servo 模式 blocking moves) |
-| **RobotInterface** | `robot/interface.py` | 449 | 统一接口: hand send + arm return-to-home |
-| **validate_action** | `robot/validate.py` | 44 | 3 项预发送安全门 |
+| **ArmInnerLoop** | `robot/inner_loop.py` | 557 | 内环线程, 250Hz mode 4 PID + 多级限幅 |
+| **PIDController** | `robot/inner_loop.py` | — | 用户态逐关节 PID + 抗积分饱和 |
+| **RecordWriter** | `controller.py:_recording_writer()` | ~15 | 异步 HDF5 写入 daemon 线程 |
+| **XArm7** | `robot/xarm7/xarm7.py` | 326 | 精简硬件 wrapper |
+| **RobotInterface** | `robot/interface.py` | 513 | 统一接口: hand send + arm return-to-home (3-tier) |
+| **validate_action** | `robot/validate.py` | 55 | 3 项预发送安全门 |
 | **signal_utils** | `utils/signal_utils.py` | 120 | robust_ema, limit_jerk, ema_smooth |
 | **CollectionLoop** | `recording/collection_loop.py` | 181 | 录制生命周期 |
 | **EpisodeRecorder** | `recording/episode_recorder.py` | 279 | HDF5 逐帧写入 |
@@ -604,6 +658,8 @@ DexMani:     实用主义 ── "arm 内部伺服 + 进程隔离 + 双向安全
 
 | 文件 | 原因 |
 |------|------|
+| `robot/pid_process.py` (240 行) | 被 `robot/inner_loop.py` 替代 — 线程模型无需进程隔离 |
+| `shm/pid_channels.py` (135 行) | 不再需要跨进程 SharedMemory 通信 |
 | `teleop/control/safety.py` (186 行) | 合并到 `robot/validate.py` + 内联 bounds check |
 | `recording/frame_buffer.py` (481 行) | 批次写入删除，仅保留逐帧写入路径 |
 | `planning/return_home.py` | 合并到 `robot/interface.py` |
@@ -616,18 +672,17 @@ DexMani:     实用主义 ── "arm 内部伺服 + 进程隔离 + 双向安全
 
 | 机制 | 原因 |
 |------|------|
-| D-on-Measurement PID (用户态) | mode 1 位置伺服，arm 内部伺服处理 PID |
-| 速度控制模式 (mode 4) | 双连接 mode 冲突 (ControllerError 22) |
-| Jerk 限幅 (用户态) | 位置伺服模式不需要速度级 jerk 限幅 |
-| Bottleneck 速度裁剪 | 位置伺服模式不需要速度缩放 |
-| Soft-start 斜坡 | 位置伺服模式不需要速度启动 |
+| PID 进程隔离 (mp.Process + SharedMemory) | 线程模型 (BVP) 消除进程管理、SHM 残留、启动延迟 |
+| mode 1 位置伺服 (默认) | 切换为 mode 4 速度控制 + 用户态 PID (对标 BVP) |
+| Bottleneck 速度裁剪 | mode 4 PID 已内置多级 velocity/accel/jerk 限幅 |
+| Soft-start 斜坡 | PID 自然过渡，无需显式斜坡 |
 | CartPoseInterpolator | VR 50Hz = 控制频率，无频率解耦需求 |
 | 跳变钳位 (arm 5°/hand 10°) | 驱动层 + retargeter low_pass_alpha 覆盖 |
 | 滑动窗口趋势监控 | 仅 warning，不参与控制决策 |
 | 跟踪发散检测 | PID 内环 try/except + error_state 已覆盖 |
 | Target Lead Governor | 逐轴 clip 扭曲运动方向 |
 | VR 3 层时效分级 (C5) | 简化为单阈值 0.5s + None-sentinel |
-| PID 线程存活监控 (C6) | 进程隔离后 PIDStateChannel 停更检测替代 |
+| PID 线程存活监控 (C6) | 内环 error_state + is_alive() 替代 |
 | 指尖桌面 FK hot path (C7) | 保留在 planner 离线，hot path 删除 |
 | SAVE_PROMPT 状态 (C11) | 改为自动保存 |
 | 预录制缓冲区 (C12) | 简化录制流程 |
@@ -639,9 +694,16 @@ DexMani:     实用主义 ── "arm 内部伺服 + 进程隔离 + 双向安全
 
 | 机制 | 来源 |
 |------|------|
-| 进程边界隔离 (PIDProcess + SharedMemory) | ManiUniCon |
+| 线程内环 (ArmInnerLoop + threading.Lock) | BVP |
+| mode 4 速度控制 + 用户态 PID | BVP |
+| PID 多级限幅管线 (velocity → accel → jerk) | BVP + LeFranX |
+| kd = kp × dt 黄金比例 (零超调) | 独家 |
+| PID 抗积分饱和 (windup_limit=0.3) | 独家 (BVP 无) |
 | RobustEMA (自适应 α) | LeFranX + ManiUniCon |
-| 命令超时 (200ms) | LeFranX |
-| 双向故障检测 | 独家 |
+| 命令超时 (200ms) → 零速度停止 | LeFranX |
+| 双向故障检测 (error_state + is_alive) | 独家 |
 | collision_sensitivity=1 | BVP 验证 |
-| mode 1 统一 (消除 mode 冲突) | 独家 |
+| Return-to-Home 三级 Fallback (plan_path → safe joint → arm.reset) | 独家 |
+| Hand bounds 从 XHandConfig 逐关节读取 | 独家 |
+| 录制异步写入 (queue.Queue + daemon 线程) | 独家 |
+| VR SharedMemory 零拷贝路径 | 独家 |

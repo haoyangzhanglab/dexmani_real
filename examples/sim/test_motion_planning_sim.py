@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import sapien.core as sapien
@@ -31,17 +31,56 @@ from dexmani_real.planning import (
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, create_viewer
 
-from examples._test_utils import (
-    IKStats,
+from dexmani_real.planning.path_utils import interpolate_waypoints
+from dexmani_real.planning.pose_utils import (
     angular_dist_rad,
-    build_target_pose,
-    execute_dense_path,
-    interpolate_waypoints,
     quat_multiply,
-    quat_to_rotmat,
+    quat_wxyz_to_rotmat as quat_to_rotmat,
+    random_quat_full_so3,
+    random_quat_multi_axis,
     random_quat_within_angle,
-    settle_at_target,
 )
+from dexmani_real.simulation import execute_dense_path, settle_at_target
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Local test utilities (lightweight — not worth a shared module)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class IKStats:
+    """Aggregate IK test statistics."""
+    ok: int
+    total: int = 0
+    pos_errs_mm: list[float] = field(default_factory=list)
+    rot_errs_deg: list[float] = field(default_factory=list)
+    max_dq_deg: list[float] = field(default_factory=list)
+
+
+def build_target_pose(
+    pos: np.ndarray,
+    home_quat: np.ndarray,
+    rng: "np.random.RandomState | None" = None,
+    *,
+    rot_mode: str = "single_axis",
+    rot_max_deg: float = 30.0,
+    rot_axis1_deg: float = 45.0,
+    rot_axis2_deg: float = 30.0,
+) -> Pose:
+    """Build a target EEF pose with optional random rotation."""
+    quat = home_quat
+    if rng is None:
+        return Pose(p=pos, q=quat)
+    if rot_mode == "full_so3":
+        quat = random_quat_full_so3(rng)
+    elif rot_mode == "multi_axis":
+        delta_q = random_quat_multi_axis(rng, rot_axis1_deg, rot_axis2_deg)
+        quat = quat_multiply(delta_q, home_quat)
+    elif rot_mode == "single_axis" and rot_max_deg > 0:
+        quat = quat_multiply(random_quat_within_angle(rng, rot_max_deg), home_quat)
+    return Pose(p=pos, q=quat)
+
 
 # ═══════════════════════════════════════════════ 配置
 

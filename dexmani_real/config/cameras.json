@@ -1,0 +1,10 @@
+{
+  "camera_0": {
+    "serial": "241322110633",
+    "type": "eye_to_hand",
+    "pose": {
+      "position": [0.5, -0.35, 0.82],
+      "orientation": [1.0, 0.0, 0.0, 0.0]
+    }
+  }
+}

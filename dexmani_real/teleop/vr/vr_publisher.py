@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
     from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker

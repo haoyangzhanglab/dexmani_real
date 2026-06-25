@@ -1,4 +1,4 @@
-"""Teleoperation controller — simplified state machine with PID process isolation.
+"""Teleoperation controller — simplified state machine with in-process inner loop.
 
 State machine:
     IDLE ──T(teleop)──→ TELEOP ──R(record)──→ RECORDING
@@ -6,12 +6,14 @@ State machine:
       ├───H(home)─────┘              │
       └──ESC / timeout: EMERGENCY_STOP
 
-Arm position servo is handled by PIDProcess (separate process) via shared memory.
-Controller sends target qpos → PIDTargetChannel, reads state ← PIDStateChannel.
+Arm position servo is handled by ArmInnerLoop (daemon thread, same process).
+Controller sends target qpos via inner.set_target(), reads state via inner.get_state().
+Ref: BunnyVisionPro _internal_control_arm_qpos() thread pattern.
 """
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from enum import Enum
@@ -19,14 +21,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
+from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig, RobotState
-from dexmani_real.robot.pid_process import PIDProcess
 from dexmani_real.robot.validate import validate_action
-from dexmani_real.shm.pid_channels import PIDStateChannel, PIDTargetChannel
 from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.rate_limiter import RateLimiter
@@ -59,6 +60,8 @@ class TeleopControllerConfig:
     dry_run: bool = False
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
+    use_shm_vr: bool = False
+    inner_loop_cfg: ArmInnerLoopConfig | None = None
     use_precise_wait: bool = False
     collection_config: CollectionConfig | None = None
     multi_camera_configs: list | None = None
@@ -90,12 +93,14 @@ class TeleopController:
         recorder: EpisodeRecorder | None = None,
         use_zmq_vr: bool = False,
         zmq_vr_port: int = 5555,
+        use_shm_vr: bool = False,
         camera_process: object | None = None,
     ) -> None:
         if cfg is None:
             cfg = TeleopControllerConfig(
                 target_hz=target_hz, ema_alpha_arm=ema_alpha_arm, dry_run=dry_run,
                 use_zmq_vr=use_zmq_vr, zmq_vr_port=zmq_vr_port,
+                use_shm_vr=use_shm_vr,
             )
 
         self.robot = robot
@@ -105,25 +110,30 @@ class TeleopController:
         self.tracker = tracker
         self.dry_run = cfg.dry_run
 
-        # ── PID process isolation ──
-        self._pid_target: PIDTargetChannel | None = None
-        self._pid_state: PIDStateChannel | None = None
-        self._pid_process: PIDProcess | None = None
+        # ── Arm inner loop (in-process thread, 250Hz) ──
+        self._arm_inner: ArmInnerLoop | None = None
         if not self.dry_run:
-            self._pid_target = PIDTargetChannel(create=True)
-            self._pid_state = PIDStateChannel(create=True)
-            self._pid_process = PIDProcess()
-            self._pid_process.start()
-            logger.info("PIDProcess started in separate process")
+            inner_cfg = cfg.inner_loop_cfg if cfg.inner_loop_cfg is not None else ArmInnerLoopConfig()
+            self._arm_inner = ArmInnerLoop(cfg=inner_cfg)
+            self._arm_inner.start()
+            mode_label = {4: "velocity control + PID", 1: "position servo"}.get(inner_cfg.control_mode, f"mode {inner_cfg.control_mode}")
+            logger.info("ArmInnerLoop started (mode %d, %s, 250Hz)", inner_cfg.control_mode, mode_label)
 
-        # Recording
+        # Recording with async writer thread (offloads HDF5 I/O from hot path)
         if recorder is not None:
             coll_cfg = cfg.collection_config or CollectionConfig()
             self._collection_loop = CollectionLoop(recorder, coll_cfg)
             self.recorder = recorder
+            self._recording_queue: queue.Queue[dict | None] = queue.Queue(maxsize=500)
+            self._recording_thread = threading.Thread(
+                target=self._recording_writer, name="recording_writer", daemon=True
+            )
+            self._recording_thread.start()
         else:
             self._collection_loop = None
             self.recorder = None
+            self._recording_queue = None
+            self._recording_thread = None
 
         self.limiter = RateLimiter(cfg.target_hz)
         self.ema_alpha_arm = float(cfg.ema_alpha_arm)
@@ -138,12 +148,23 @@ class TeleopController:
             if camera_process is None:
                 self._multi_camera.start_all()
 
-        # ZMQ VR
+        # VR data sources (priority: SHM > ZMQ > Tracker)
+        self._vr_shm: object | None = None  # SharedMemoryFrameManager
         self._vr_subscriber = None
-        if cfg.use_zmq_vr:
+
+        if cfg.use_shm_vr:
+            from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
+            try:
+                self._vr_shm = SharedMemoryFrameManager(create=False)
+                logger.info("VR source: SharedMemory (attached, zero-copy)")
+            except FileNotFoundError:
+                logger.warning("VR SHM not found — falling back to ZMQ/tracker")
+                self._vr_shm = None
+        elif cfg.use_zmq_vr:
             from dexmani_real.teleop.vr.vr_publisher import VRFrameSubscriber
             self._vr_subscriber = VRFrameSubscriber(sub_port=cfg.zmq_vr_port)
             self._vr_subscriber.connect()
+            logger.info("VR source: ZMQ SUB (tcp://127.0.0.1:%d)", cfg.zmq_vr_port)
 
         # State
         self.state = ControllerState.IDLE
@@ -157,8 +178,9 @@ class TeleopController:
         # Pipeline
         self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner, ema_alpha_arm=self.ema_alpha_arm)
 
-        # Keyboard
-        self.keyboard = KeyboardHandler(keyboard_queue) if keyboard_queue is not None else None
+        # Keyboard (accepts queue=None for backward compatibility;
+        # KeyboardHandler now uses termios cbreak + select internally)
+        self.keyboard = KeyboardHandler(keyboard_queue)
 
         # Status
         self.frame_count: int = 0
@@ -214,10 +236,10 @@ class TeleopController:
         tick_start = time.perf_counter()
         self.frame_count += 1
 
-        # PAUSED: send None-sentinel → PID process decelerates naturally
+        # PAUSED: send None-sentinel → inner loop holds position
         if self.state == ControllerState.PAUSED:
-            if not self.dry_run and self._pid_target is not None:
-                self._pid_target.write(None)
+            if not self.dry_run and self._arm_inner is not None:
+                self._arm_inner.set_target(None)
             return
 
         # IDLE: no pipeline
@@ -230,8 +252,8 @@ class TeleopController:
 
         # ── 2. VR staleness check (single threshold) ──
         if age_s > self._VR_STALE_THRESHOLD_S or vr_frame is None:
-            if not self.dry_run and self._pid_target is not None:
-                self._pid_target.write(None)  # natural deceleration
+            if not self.dry_run and self._arm_inner is not None:
+                self._arm_inner.set_target(None)  # hold position
             return
 
         # ── 3. Read arm state from PID process ──
@@ -239,10 +261,10 @@ class TeleopController:
             state = self._dummy_state()
             arm_qpos = state.arm_qpos
         else:
-            arm_qpos, error_state, pid_ts = self._pid_state.read()
+            arm_qpos, error_state, _inner_ts = self._arm_inner.get_state()
             now = time.perf_counter()
-            if error_state or (now - pid_ts) > 0.1:
-                self._escalate_to_emergency("PID process error or timeout")
+            if error_state:
+                self._escalate_to_emergency("Arm inner loop error")
                 return
             state = self.robot.get_state(arm_qpos=arm_qpos)
 
@@ -271,19 +293,19 @@ class TeleopController:
 
         T_base_eef = self._compute_T_base_eef(state)
 
-        if self.recording and self._collection_loop is not None:
+        if self.recording and self._collection_loop is not None and self._recording_queue is not None:
             try:
-                self._collection_loop.record_frame(
+                self._recording_queue.put_nowait(dict(
                     state=state, action=action, vr_frame=vr_frame,
                     camera_frame=camera_frame, camera_frames=camera_frames,
                     T_base_eef=T_base_eef,
-                )
-            except (ValueError, OSError) as e:
-                logger.exception("record_frame failed: %s", e)
+                ))
+            except queue.Full:
+                logger.warning("Recording queue full — dropping frame")
 
         # ── 6. Pre-send validation ──
         if not self.dry_run:
-            action_valid, fail_reason = validate_action(self.robot, action)
+            action_valid, fail_reason = validate_action(self.robot, action, actual_arm_qpos=arm_qpos)
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
                     self._escalate_to_emergency(f"Robot error before send: {fail_reason}")
@@ -292,8 +314,8 @@ class TeleopController:
                 hold = self._hold_action()
                 action = RobotAction(arm_qpos_cmd=hold.arm_qpos_cmd, hand_qpos_cmd=hold.hand_qpos_cmd)
 
-            # Send arm target to PID process
-            self._pid_target.write(action.arm_qpos_cmd)
+            # Send arm target to inner loop
+            self._arm_inner.set_target(action.arm_qpos_cmd)
             # Send hand directly
             self.robot.send_action(action)
 
@@ -333,10 +355,12 @@ class TeleopController:
         ik_ok = status["ik_ok"]
         retarget_ok = status["retarget_ok"]
 
-        # Retarget bounds check (inlined from safety.py)
+        # Retarget bounds check — uses XHandConfig per-joint limits
         if retarget_ok:
             hq = action.hand_qpos_cmd
-            if not np.all(np.isfinite(hq)) or np.any(hq < -0.75) or np.any(hq > 2.0):
+            hand_min = self.robot.hand.config.qpos_min
+            hand_max = self.robot.hand.config.qpos_max
+            if not np.all(np.isfinite(hq)) or np.any(hq < hand_min) or np.any(hq > hand_max):
                 retarget_ok = False
 
         if ik_ok and retarget_ok:
@@ -389,7 +413,7 @@ class TeleopController:
         if signal == ControlSignal.BEGIN:
             if self.state == ControllerState.IDLE:
                 if not self.dry_run:
-                    self._ensure_pid_running()
+                    self._ensure_inner_running()
                 self._reset_mapper()
                 self._start_recording()
                 self.state = ControllerState.TELEOP
@@ -431,12 +455,12 @@ class TeleopController:
             except (ValueError, OSError):
                 pass
 
-        # Stop PID process before return_to_home to avoid dual-connection conflicts
-        # (both use mode 1 position servo; stopping prevents two connections sending cmds simultaneously)
-        if not self.dry_run and self._pid_process is not None and self._pid_process.is_alive():
-            self._pid_target.write(None)  # signal deceleration
-            self._pid_process.stop()
-            logger.info("PID process stopped for return-to-home")
+        # Stop inner loop before return_to_home to avoid dual-connection conflicts
+        # (RobotInterface.return_to_home() uses its own XArmAPI connection)
+        if not self.dry_run and self._arm_inner is not None and self._arm_inner.is_alive:
+            self._arm_inner.set_target(None)  # signal hold
+            self._arm_inner.stop()
+            logger.info("Arm inner loop stopped for return-to-home")
 
         if not self.dry_run:
             self.robot.return_to_home()
@@ -448,21 +472,27 @@ class TeleopController:
         self.limiter.reset()
         logger.info("=== STATE: HOME → IDLE ===")
 
-    def _ensure_pid_running(self) -> None:
-        """Restart the PID process if it has been stopped (e.g. after return-to-home)."""
-        if self._pid_process is None:
+    def _ensure_inner_running(self) -> None:
+        """Restart the inner loop thread if it has been stopped (e.g. after return-to-home)."""
+        if self._arm_inner is None:
             return
-        if self._pid_process.is_alive():
+        if self._arm_inner.is_alive:
             return
-        logger.info("Restarting PID process...")
-        self._pid_process = PIDProcess()
-        self._pid_process.start()
-        logger.info("PID process restarted")
+        logger.info("Restarting arm inner loop...")
+        # Preserve the same inner loop config (mode, PID gains, etc.)
+        inner_cfg = getattr(self._arm_inner, '_cfg', ArmInnerLoopConfig())
+        self._arm_inner = ArmInnerLoop(cfg=inner_cfg)
+        self._arm_inner.start()
+        logger.info("Arm inner loop restarted")
 
     def _escalate_to_emergency(self, reason: str) -> None:
         logger.error("=== STATE: → EMERGENCY_STOP: %s ===", reason)
         self.state = ControllerState.EMERGENCY_STOP
         if not self.dry_run:
+            # Stop inner loop first to prevent SDK error spam
+            if self._arm_inner is not None and self._arm_inner.is_alive:
+                self._arm_inner.set_target(None)
+                self._arm_inner.stop()
             self.robot.emergency_stop()
 
     # ── Recording ──
@@ -496,6 +526,9 @@ class TeleopController:
     # ── VR ──
 
     def _read_vr_frame(self) -> dict | None:
+        # Priority: SharedMemory (zero-copy, ~1μs) > ZMQ (TCP, ~1-2ms) > Tracker (direct SDK)
+        if self._vr_shm is not None:
+            return self._vr_shm.read_latest_vr()
         if self._vr_subscriber is not None:
             return self._vr_subscriber.recv_latest()
         if self.tracker is not None:
@@ -520,8 +553,8 @@ class TeleopController:
         if self.dry_run:
             state = self._dummy_state()
         else:
-            if self._pid_state is not None:
-                arm_qpos, _, _ = self._pid_state.read()
+            if self._arm_inner is not None:
+                arm_qpos, _, _ = self._arm_inner.get_state()
                 state = self.robot.get_state(arm_qpos=arm_qpos)
             else:
                 state = self.robot.get_state()
@@ -585,6 +618,19 @@ class TeleopController:
             self.retarget_success_count, self.retarget_fail_count,
         )
 
+    # ── Recording writer thread (offloads HDF5 I/O from 50Hz hot path) ──
+
+    def _recording_writer(self) -> None:
+        """Daemon thread: consume recording frames from queue, write to HDF5."""
+        while True:
+            item = self._recording_queue.get()
+            if item is None:  # sentinel — stop
+                break
+            try:
+                self._collection_loop.record_frame(**item)
+            except (ValueError, OSError) as e:
+                logger.exception("record_frame failed: %s", e)
+
     # ── Shutdown ──
 
     def _shutdown(self) -> None:
@@ -595,17 +641,17 @@ class TeleopController:
             except (ValueError, RuntimeError, KeyError):
                 pass
 
-        # Stop PID process
-        if self._pid_process is not None:
-            self._pid_process.stop()
+        # Stop recording writer thread
+        if self._recording_queue is not None and self._recording_thread is not None:
+            self._recording_queue.put(None)  # sentinel
+            self._recording_thread.join(timeout=5.0)
 
-        # Clean up shared memory
-        if self._pid_target is not None:
-            self._pid_target.unlink()
-            self._pid_target.close()
-        if self._pid_state is not None:
-            self._pid_state.unlink()
-            self._pid_state.close()
+        # Stop VR shared memory access (consumer-side only — no cleanup needed)
+        self._vr_shm = None
+
+        # Stop arm inner loop
+        if self._arm_inner is not None:
+            self._arm_inner.stop()
 
         if self._multi_camera is not None:
             try:

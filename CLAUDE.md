@@ -16,16 +16,15 @@ dexmani_real/          ← Python package root
 ├── sensor/            ← RealSense camera driver, multi-camera manager, VR receiver
 ├── simulation/        ← SAPIEN-based simulation mirror of real hardware
 ├── shm/               ← SharedMemoryRingBuffer for cross-process camera data
-├── config/            ← Camera calibration, PipelineConfig (serializable aggregator)
-├── utils/             ← Shared utilities (array, signal, hand geom, rate limiting)
+├── config/            ← Camera extrinsics (cameras.json), PipelineConfig (serializable)
+├── utils/             ← Shared utilities (log, serialization, rate limiting, signal)
+├── tools/             ← CLI utilities (HDF5→Zarr export)
+├── services/          ← Standalone services (retarget server)
 ├── assets/            ← URDF, SRDF, meshes, retargeting configs
-├── examples/           ← Entry points: real/sim teleop, retarget server, tools
+├── examples/          ← Real/sim teleop entry points + motion planning tests
 │   ├── real/          ← Real-hardware examples (keyboard_teleop, test_motion, quest_teleop)
-│   ├── sim/           ← Simulation examples (vr_teleop_sim, test_motion)
-│   ├── services/      ← Standalone services (retarget_server)
-│   └── tools/         ← HDF5→Zarr export
+│   └── sim/           ← Simulation examples (vr_teleop_sim, test_motion)
 ├── docs/              ← Architecture docs, analysis notes
-└── configs/           ← Runtime config (cameras.json)
 ```
 
 ## Key data flow (teleop loop @ 50 Hz)
@@ -96,21 +95,21 @@ episode_000.h5
 | Imports | `from __future__ import annotations`; `TYPE_CHECKING` for circular deps |
 | Data types | `dataclass` for config/state; `numpy` for all math |
 | Naming | `snake_case` files/vars/funcs, `PascalCase` classes, `UPPER_SNAKE` module constants |
-| Logging | `from dexmani_real.log import get_logger` → `logger = get_logger(__name__)` |
+| Logging | `from dexmani_real.utils.log import get_logger` → `logger = get_logger(__name__)` |
 | Error handling | fail-safe (NaN→neutral, errors→warning+fallback); try/except with `logger.warning` |
 | Hardware access | ONLY via `RobotInterface`; never call XArm7/XHand directly |
 | Thread safety | `threading.Event` for cancellation; `ExitStack` for cleanup; GIL-protected numpy ops |
 | Cross-process | `SharedMemoryRingBuffer` (shm/) — camera/VR processes ↔ controller |
 
-## Example entry points
+## Entry points
 
-| Example | Purpose |
-|--------|---------|
+| Entry point | Purpose |
+|-------------|---------|
 | `examples/real/test_quest_hand_teleop.py` | Main real-hardware VR teleop |
 | `examples/real/keyboard_teleop_real.py` | Keyboard-based arm control |
 | `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
-| `examples/services/retarget_server.py` | Standalone hand retargeting service |
-| `examples/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
+| `dexmani_real/services/retarget_server.py` | Standalone hand retargeting service (ZMQ REP) |
+| `dexmani_real/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
 
 ## Safety architecture
 

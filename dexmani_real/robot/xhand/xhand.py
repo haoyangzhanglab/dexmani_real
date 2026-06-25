@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.rate_limiter import RateLimiter

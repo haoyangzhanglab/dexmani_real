@@ -54,7 +54,7 @@ class PipelineConfig(FromDictMixin):
     cartesian_ema_alpha_deploy: float = 0.5
     hand_ema_alpha_deploy: float = 0.5
 
-    data_dir: str = "data"
+    data_dir: str = "episodes"
     max_record_frames: int = DEFAULT_MAX_RECORD_FRAMES
 
     pipeline_name: str = ""

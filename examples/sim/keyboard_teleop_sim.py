@@ -55,12 +55,9 @@ from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, setup_scene
 from dexmani_real.utils.rate_limiter import RateLimiter
 
-from examples._test_utils import (
-    execute_dense_path,
-    interpolate_waypoints,
-    quat_multiply,
-    settle_at_target,
-)
+from dexmani_real.planning.path_utils import interpolate_waypoints
+from dexmani_real.planning.pose_utils import quat_multiply
+from dexmani_real.simulation import execute_dense_path, settle_at_target
 
 # ═══════════════════════════════════════════════ 配置
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 __all__ = ["ArmWristMapper"]
 
 import numpy as np
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat

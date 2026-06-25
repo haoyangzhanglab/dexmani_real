@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.shm.layouts import (
     VR_FRAME_DTYPE,
     array_to_vr_frame,

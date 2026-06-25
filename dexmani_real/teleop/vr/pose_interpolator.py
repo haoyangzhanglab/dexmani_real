@@ -19,7 +19,7 @@ from collections import deque
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 

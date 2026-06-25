@@ -16,7 +16,7 @@ import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.pipeline_config import DEFAULT_MAX_RECORD_FRAMES
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 

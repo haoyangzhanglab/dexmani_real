@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.pose_utils import xyzw_to_wxyz
 from hand_tracking_sdk import (
     ErrorPolicy,

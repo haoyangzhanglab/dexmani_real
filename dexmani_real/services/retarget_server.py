@@ -4,7 +4,7 @@ Listens on port 5556, receives hand-landmark JSON requests,
 runs XHandRetargeter.retarget(), and sends back joint positions.
 
 Usage:
-    python retarget_server.py [--port PORT] [--hand-type right|left] [--retargeting-type dexpilot|position]
+    python -m dexmani_real.services.retarget_server [--port PORT] [--hand-type right|left] [--retargeting-type dexpilot|position]
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import zmq
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT
 

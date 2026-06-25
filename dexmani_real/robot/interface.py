@@ -1,10 +1,10 @@
-"""RobotInterface — arm + hand unified interface (simplified).
+"""RobotInterface — arm + hand unified interface.
 
 Controllers operate hardware exclusively through RobotInterface, never calling
 XArm7/XHand directly.
 
-Velocity PID control is owned by PIDProcess in a separate process — interface.py
-only handles hand commands and blocking arm moves (reset, home).
+Arm position servo is handled by ArmInnerLoop (in-process 250Hz daemon thread).
+interface.py handles hand commands and blocking arm moves (reset, home).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.log import get_logger
+from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.kinematics import XArm7Kinematics
 from dexmani_real.planning.types import Pose
 from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
@@ -35,7 +35,7 @@ logger = get_logger(__name__)
 class RobotInterface:
     """Arm + Hand unified interface — hand commands + blocking arm moves.
 
-    Teleop arm position servo is handled by PIDProcess (separate process).
+    Teleop arm position servo is handled by ArmInnerLoop (in-process daemon thread).
     This class manages:
       - Hand send_action (12-DOF position commands)
       - Arm blocking moves (reset, emergency stop)
@@ -122,7 +122,7 @@ class RobotInterface:
         """Read arm + hand state with FK computation.
 
         Args:
-            arm_qpos: Optional arm joint positions from PIDStateChannel.
+            arm_qpos: Optional arm joint positions from ArmInnerLoop.get_state().
                       When provided, skips arm SDK call (used in teleop loop).
         """
         if arm_qpos is not None:
@@ -171,7 +171,7 @@ class RobotInterface:
     # ── Hand action ──
 
     def send_action(self, action: RobotAction) -> dict:
-        """Send hand action only (arm is handled by PIDProcess).
+        """Send hand action only (arm is handled by ArmInnerLoop).
 
         Returns:
             {"hand_ok": bool, "hand_cmd": ndarray | None}
@@ -191,67 +191,94 @@ class RobotInterface:
 
     # ── Return to home (path-planned) ──
 
-    def return_to_home(self) -> bool:
+    def return_to_home(self, *, home_dt: float | None = None) -> bool:
         """Path-planned return-to-home with collision avoidance.
 
-        Two-phase execution:
-          Phase 1: plan_path(home EEF) — full collision-checked Cartesian path.
-          Phase 2: collision-checked joint-space interpolation to exact init_qpos.
+        Three-tier execution (in priority order):
+          Tier 1: plan_path(home EEF) — screw/RRT Cartesian path with full
+                  collision checking (self + env + desk + workspace).
+          Tier 2: Safe joint-space interpolation — dense linear joint-space
+                  path at 1° resolution, collision-checked. Used when
+                  plan_path fails (e.g. waypoint delta too large).
+          Tier 3: arm.reset() — SDK raw blocking move, NO collision avoidance.
+                  Only used when both Tier 1 and Tier 2 are unavailable or fail.
 
-        Falls back to arm.reset() (SDK blocking move) if planner unavailable
-        or planning fails.
+        After Cartesian/joint approach, a final arm.reset() is always called
+        for sub-degree convergence to exact init_qpos.
+
+        Args:
+            home_dt: Sleep interval between waypoints (s). Default: arm.config.dt
+                     (~0.02s → ~50°/s). Increase for slower, safer homing
+                     (e.g. 0.04 → ~25°/s).
         """
         if not self.arm.is_connected():
             return False
 
         home_qpos = self.arm.config.init_qpos.copy()
-        dt = float(self.arm.config.dt)
+        dt = home_dt if home_dt is not None else float(self.arm.config.dt)
 
         # ── 1. Read current position ──
         qpos = self._read_arm_qpos()
         if qpos is None:
             return self._reset_blocking()
 
-        # ── 2. No planner → fallback ──
+        # ── 2. No planner → safe joint fallback → reset ──
         if self.planner is None:
-            return self._reset_blocking()
+            logger.warning("No planner available, trying safe joint fallback")
+            if not self._safe_joint_home_fallback(qpos, home_qpos, dt):
+                return self._reset_blocking()
+            # Continue to Phase 2 + final reset below
+            qpos = self._read_arm_qpos()
+            if qpos is None:
+                return self._reset_blocking()
 
-        # ── 3. Snap continuous joints (J0/J2/J4/J6) to nearest 2π-equivalent ──
-        try:
-            qpos = self.planner.nearest_equivalent_qpos(qpos, home_qpos)
-        except Exception:
-            pass
+        else:
+            # ── 3. Snap continuous joints (J0/J2/J4/J6) to nearest 2π-equivalent ──
+            try:
+                qpos = self.planner.nearest_equivalent_qpos(qpos, home_qpos)
+            except Exception:
+                pass
 
-        # ── 4. Already at home? ──
-        if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(1.0):
-            return self.hand.reset() if self.hand.is_connected() else True
+            # ── 4. Already at home? ──
+            if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(1.0):
+                return self.hand.reset() if self.hand.is_connected() else True
 
-        # ── 5. Pre-flight: reset hand (align FK model to reality) ──
-        if self.hand.is_connected():
-            self.hand.reset()
-            time.sleep(0.3)
-        qpos = self._read_arm_qpos()
-        if qpos is None:
-            return self._reset_blocking()
+            # ── 5. Pre-flight: reset hand (align FK model to reality) ──
+            if self.hand.is_connected():
+                self.hand.reset()
+                time.sleep(0.3)
+            qpos = self._read_arm_qpos()
+            if qpos is None:
+                return self._reset_blocking()
 
-        # ── 6. Phase 1: Plan + execute EEF Cartesian path ──
-        home_eef = self.kinematics.compute_eef_pose_world(home_qpos)
-        try:
-            result = self.planner.plan_path(home_eef, qpos)
-        except Exception:
-            logger.warning("plan_path exception, falling back to direct reset", exc_info=True)
-            return self._reset_blocking()
+            # ── 6. Tier 1: Plan + execute EEF Cartesian path ──
+            home_eef = self.kinematics.compute_eef_pose_world(home_qpos)
+            plan_ok = False
+            plan_reason = ""
+            try:
+                result = self.planner.plan_path(home_eef, qpos)
+                if result.success and result.qpos_path is not None and len(result.qpos_path) > 0:
+                    plan_ok = True
+                    logger.info(
+                        "return_to_home Phase 1: %d waypoints, source=%s, score=%.3f",
+                        len(result.qpos_path), result.source,
+                        result.report.get("path_score", float("nan")),
+                    )
+                    self._execute_waypoints(result.qpos_path, dt)
+                else:
+                    plan_reason = result.reason or "unknown"
+            except Exception:
+                logger.warning("plan_path exception", exc_info=True)
+                plan_reason = "exception"
 
-        if not (result.success and result.qpos_path is not None and len(result.qpos_path) > 0):
-            logger.warning("plan_path failed: %s, falling back to direct reset", result.reason or "unknown")
-            return self._reset_blocking()
-
-        logger.info(
-            "return_to_home Phase 1: %d waypoints, source=%s, score=%.3f",
-            len(result.qpos_path), result.source,
-            result.report.get("path_score", float("nan")),
-        )
-        self._execute_waypoints(result.qpos_path, dt)
+            if not plan_ok:
+                # ── Tier 2: Safe joint-space fallback (collision-checked) ──
+                logger.warning(
+                    "plan_path failed: %s, trying safe joint-space fallback", plan_reason,
+                )
+                if not self.arm.is_error() and not self._safe_joint_home_fallback(qpos, home_qpos, dt):
+                    logger.warning("Safe joint fallback also failed, falling back to arm.reset()")
+                    return self._reset_blocking()
 
         # ── 7. Phase 2: Joint-space interpolation to exact home ──
         if not self.arm.is_error():
@@ -377,6 +404,43 @@ class RobotInterface:
 
         logger.info("return_to_home Phase 2: %d joint waypoints, delta=%.1f°", n, np.rad2deg(delta))
         self._execute_waypoints(path, dt)
+
+    def _safe_joint_home_fallback(
+        self, current: np.ndarray, target: np.ndarray, dt: float
+    ) -> bool:
+        """Tier 2 fallback: collision-checked joint-space linear interpolation to home.
+
+        Used when plan_path fails (e.g. waypoint delta too large after shortcut
+        smoothing). Builds a dense 1°-resolution joint-space path, checks
+        self/env/desk collisions, and executes if safe.
+
+        Returns:
+            True if arm is already close enough or the path was safe and executed.
+            False if collisions were detected or execution failed.
+        """
+        delta = float(np.max(np.abs(current - target)))
+        if delta < np.deg2rad(0.5):
+            return True
+
+        n = max(2, int(np.ceil(delta / np.deg2rad(1.0))) + 1)
+        path = np.array(
+            [current + (k / (n - 1)) * (target - current) for k in range(n)],
+            dtype=np.float64,
+        )
+
+        if not self._check_joint_path_safe(path):
+            logger.warning(
+                "Safe joint fallback: path has collisions (self/env/desk), "
+                "delta=%.1f°",
+                np.rad2deg(delta),
+            )
+            return False
+
+        logger.info(
+            "return_to_home safe joint fallback: %d waypoints, delta=%.1f°",
+            n, np.rad2deg(delta),
+        )
+        return self._execute_waypoints(path, dt)
 
     # ── Table collision setup ──
 

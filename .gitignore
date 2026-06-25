@@ -3,6 +3,7 @@ logs
 wandb
 outputs
 data_local
+episodes/
 .vscode
 _wandb
 
