@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Internal test utility module — shared math helpers, dataclasses, and sim exec utils.
 
-Consolidates duplicated functions that were scattered across scripts/real/
-and scripts/sim/.  All callers import from here to avoid drift.
+Consolidates duplicated functions that were scattered across examples/real/
+and examples/sim/.  All callers import from here to avoid drift.
 
 Usage:
-    from scripts._test_utils import quat_multiply, angular_dist_rad, ...
+    from examples._test_utils import quat_multiply, angular_dist_rad, ...
 """
 
 from __future__ import annotations

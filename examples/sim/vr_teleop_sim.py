@@ -6,22 +6,22 @@
 
 用法:
     # Dummy 模式（无需 VR 头显即可测试）
-    python scripts/sim/vr_teleop_sim.py --dummy
+    python examples/sim/vr_teleop_sim.py --dummy
 
     # 真实 Quest VR 模式
-    python scripts/sim/vr_teleop_sim.py
+    python examples/sim/vr_teleop_sim.py
 
     # VR 帧模拟器（正弦轨迹，无需 Quest 设备）— Phase 3.3
-    python scripts/sim/vr_teleop_sim.py --dummy-vr-sinusoidal
+    python examples/sim/vr_teleop_sim.py --dummy-vr-sinusoidal
 
     # 禁用相机（默认启用）
-    python scripts/sim/vr_teleop_sim.py --dummy --no-camera
+    python examples/sim/vr_teleop_sim.py --dummy --no-camera
 
     # 无头模式 + 指定数据目录
-    python scripts/sim/vr_teleop_sim.py --dummy --headless --data-dir ./my_episodes
+    python examples/sim/vr_teleop_sim.py --dummy --headless --data-dir ./my_episodes
 
     # 预录制缓冲区 + 文件分类路由
-    python scripts/sim/vr_teleop_sim.py --dummy --pre-record-duration 3.0 \\
+    python examples/sim/vr_teleop_sim.py --dummy --pre-record-duration 3.0 \\
         --success-dir ./data/success --failure-dir ./data/failure
 
 键位:
@@ -99,7 +99,7 @@ from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker, VRFrameSimulator
 from dexmani_real.utils.rate_limiter import RateLimiter
 
-from scripts._test_utils import execute_dense_path, interpolate_waypoints, settle_at_target
+from examples._test_utils import execute_dense_path, interpolate_waypoints, settle_at_target
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 模块常量
@@ -472,7 +472,7 @@ def main() -> None:
         ),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            max_ik_jump_deg=(8, 8, 8, 8, 12, 12, 18),
+            max_ik_jump_deg=(15, 15, 15, 15, 15, 15, 15),
             max_pose_error_pos_m=0.05,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             differential_ik_max_pos_step_m=0.05,

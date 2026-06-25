@@ -19,10 +19,12 @@ dexmani_real/          ← Python package root
 ├── config/            ← Camera calibration, PipelineConfig (serializable aggregator)
 ├── utils/             ← Shared utilities (array, signal, hand geom, rate limiting)
 ├── assets/            ← URDF, SRDF, meshes, retargeting configs
-├── scripts/           ← Entry points: real/sim teleop, retarget server, tools
-│   ├── real/          ← Real-hardware scripts (keyboard_teleop, test_motion, quest_teleop)
-│   ├── sim/           ← Simulation scripts (vr_teleop_sim, test_motion)
+├── examples/           ← Entry points: real/sim teleop, retarget server, tools
+│   ├── real/          ← Real-hardware examples (keyboard_teleop, test_motion, quest_teleop)
+│   ├── sim/           ← Simulation examples (vr_teleop_sim, test_motion)
+│   ├── services/      ← Standalone services (retarget_server)
 │   └── tools/         ← HDF5→Zarr export
+├── docs/              ← Architecture docs, analysis notes
 └── configs/           ← Runtime config (cameras.json)
 ```
 
@@ -32,7 +34,7 @@ dexmani_real/          ← Python package root
 VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compute_action()
             XHandRetargeter (landmarks→12-DOF) ──┘   ├─ arm: wrist pose → solve_teleop_ik
                                                       ├─ hand: MANO skeleton retargeting
-                                                      ├─ EMA smoothing (adaptive by wrist velocity)
+                                                      ├─ EMA smoothing (fixed alpha, default 0.75)
                                                       └─ jump-limit safety gate (5°/10° arm/hand)
                                                                    │
 RobotInterface.validate_action() ← pre-send gate (torque, current, temp, comm, workspace)
@@ -100,15 +102,15 @@ episode_000.h5
 | Thread safety | `threading.Event` for cancellation; `ExitStack` for cleanup; GIL-protected numpy ops |
 | Cross-process | `SharedMemoryRingBuffer` (shm/) — camera/VR processes ↔ controller |
 
-## Script entry points
+## Example entry points
 
-| Script | Purpose |
+| Example | Purpose |
 |--------|---------|
-| `scripts/real/test_quest_hand_teleop.py` | Main real-hardware VR teleop |
-| `scripts/real/keyboard_teleop_real.py` | Keyboard-based arm control |
-| `scripts/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
-| `scripts/services/retarget_server.py` | Standalone hand retargeting service |
-| `scripts/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
+| `examples/real/test_quest_hand_teleop.py` | Main real-hardware VR teleop |
+| `examples/real/keyboard_teleop_real.py` | Keyboard-based arm control |
+| `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
+| `examples/services/retarget_server.py` | Standalone hand retargeting service |
+| `examples/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
 
 ## Safety architecture
 

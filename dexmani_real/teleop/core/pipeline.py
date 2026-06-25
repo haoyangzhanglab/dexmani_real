@@ -36,16 +36,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Per-step joint jump limits (rad).
-# NOTE: These are IK-anomaly defenses, NOT routine speed limits.
-# Routine speed limiting is handled by XArm7._limit_joint_step() at the driver
-# layer (bottleneck scaling to max_qvel, ~1.8-3.0°/frame @ 50 Hz).
-# These thresholds (5°/frame = 250°/s) are deliberately higher than max_qvel
-# (~90-150°/s) — they only trigger when IK produces an abnormally large jump,
-# e.g. a discontinuous solution from a poor seed or singularity crossing.
-_ARM_JUMP_LIMIT_RAD = np.deg2rad(5.0)
-_HAND_JUMP_LIMIT_RAD = np.deg2rad(10.0)
-
 
 class TeleopPipeline:
     """Stateless action computation pipeline.
@@ -66,22 +56,11 @@ class TeleopPipeline:
         planner: XArm7MotionPlanner,
         *,
         ema_alpha_arm: float = 1.0,
-        adaptive_ema: bool = False,
-        ema_alpha_min: float = 0.5,
-        ema_alpha_max: float = 0.95,
-        arm_jump_limit_rad: float = _ARM_JUMP_LIMIT_RAD,
-        hand_jump_limit_rad: float = _HAND_JUMP_LIMIT_RAD,
     ) -> None:
         self.arm_mapper = arm_mapper
         self.retargeter = retargeter
         self.planner = planner
         self.ema_alpha_arm = float(ema_alpha_arm)
-        self._adaptive_ema = adaptive_ema
-        self._ema_alpha_min = float(ema_alpha_min)
-        self._ema_alpha_max = float(ema_alpha_max)
-        self._prev_wrist_pos: np.ndarray | None = None
-        self.arm_jump_limit_rad = float(arm_jump_limit_rad)
-        self.hand_jump_limit_rad = float(hand_jump_limit_rad)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -105,21 +84,20 @@ class TeleopPipeline:
           1. Arm IK from VR wrist pose
           2. Workspace check on computed EEF → clamp + re-IK if out of bounds
           3. Hand retarget from VR landmarks (MANO frame transform)
-          4. Joint jump clamp
 
         Args:
             vr_frame: VR tracker frame dict (wrist_pos, wrist_quat_wxyz, landmarks).
             current_arm_qpos: Current arm joint positions (7,).
             current_hand_qpos: Current hand joint positions (12,).
-            prev_arm_cmd: Previous arm command (7,) for jump clamp reference.
-            prev_hand_cmd: Previous hand command (12,) for jump clamp reference.
+            prev_arm_cmd: Previous arm command (7,) for fallback reference.
+            prev_hand_cmd: Previous hand command (12,) for fallback reference.
             check_workspace: pos → bool, checks if position is within workspace.
             clamp_workspace_pos: pos → pos, clamps position to workspace boundaries.
             last_arm_cmd: Last successfully sent arm command (for EMA smoothing).
 
         Returns:
             (action, status) where action is RobotAction and status is a dict
-            with keys: ik_ok, retarget_ok, jump_ok.
+            with keys: ik_ok, retarget_ok.
         """
         # ── 1. Arm IK ──
         arm_cmd, ik_ok, target_eef_pos = self.compute_arm_command(
@@ -184,20 +162,13 @@ class TeleopPipeline:
                 prev_hand_cmd,
             )
 
-        # ── 3. Joint jump clamp ──
-        arm_cmd, hand_cmd, jump_ok = self.apply_jump_clamp(
-            arm_cmd,
-            hand_cmd,
-            prev_arm_cmd,
-            prev_hand_cmd,
-        )
-
+        # ── 3. Assemble action ──
         action = RobotAction(
             arm_qpos_cmd=arm_cmd,
             hand_qpos_cmd=hand_cmd,
             target_eef_pos=target_eef_pos,
         )
-        status = {"ik_ok": ik_ok, "retarget_ok": retarget_ok, "jump_ok": jump_ok}
+        status = {"ik_ok": ik_ok, "retarget_ok": retarget_ok}
         return action, status
 
     # ------------------------------------------------------------------
@@ -250,28 +221,10 @@ class TeleopPipeline:
         target_eef_pos = np.asarray(mapped["pos"], dtype=np.float64)
         target_eef_quat = np.asarray(mapped["quat_wxyz"], dtype=np.float64)
 
-        # EMA smoothing (arm only) handles frame-to-frame filtering.
-        # B1: Adaptive EMA — alpha scales with wrist velocity.
-        #   Slow / fine manipulation (< 0.05 m/s) → low alpha → heavy smoothing.
-        #   Fast / gross motion (> 0.3 m/s) → high alpha → light smoothing.
-        #   This gives responsiveness during large movements and stability
-        #   during dexterous tasks, without the fixed ~60ms lag of alpha=0.75.
-        if self._adaptive_ema:
-            dt = 0.02  # nominal 50 Hz inter-frame period
-            if self._prev_wrist_pos is not None:
-                wrist_vel = (
-                    np.linalg.norm(wrist_pos - self._prev_wrist_pos) / dt
-                )
-                # Linear mapping: 0→alpha_min, 0.3 m/s→alpha_max
-                vel_ratio = min(float(wrist_vel) / 0.3, 1.0)
-                alpha = self._ema_alpha_min + (
-                    self._ema_alpha_max - self._ema_alpha_min
-                ) * vel_ratio
-            else:
-                alpha = self.ema_alpha_arm
-            self._prev_wrist_pos = wrist_pos.copy()
-        else:
-            alpha = self.ema_alpha_arm
+        # EMA smoothing (arm only) — fixed alpha for frame-to-frame filtering.
+        # 1.0 = no smoothing; 0.95 = ~1-frame time constant at 50Hz (~2ms lag).
+        # Hand smoothing is handled by dex-retargeting's built-in low_pass_alpha.
+        alpha = self.ema_alpha_arm
 
         target_pose = Pose(p=target_eef_pos, q=target_eef_quat)
         ik_result = self.planner.solve_teleop_ik(
@@ -342,46 +295,6 @@ class TeleopPipeline:
             pass
 
         return hand_cmd, retarget_ok
-
-    # ------------------------------------------------------------------
-    # Joint jump clamp
-    # ------------------------------------------------------------------
-
-    def apply_jump_clamp(
-        self,
-        arm_cmd: np.ndarray,
-        hand_cmd: np.ndarray,
-        prev_arm_cmd: np.ndarray,
-        prev_hand_cmd: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, bool]:
-        """Clamp per-step joint deltas with bottleneck scaling (F3).
-
-        Uses the same proportional-scaling approach as _clip_arm_velocity
-        and _limit_joint_step: when any joint exceeds its limit, ALL joints
-        are scaled by the same factor to preserve the joint-space trajectory
-        shape.  The previous per-joint independent clip distorted Cartesian
-        paths during IK anomaly recovery — the bottleneck joint was clipped
-        while others moved freely, producing an unpredictable new path.
-
-        Returns:
-            (arm_cmd, hand_cmd, jump_ok).
-        """
-        jump_ok = True
-        if prev_arm_cmd is not None:
-            delta = arm_cmd - prev_arm_cmd
-            normalized = np.abs(delta) / self.arm_jump_limit_rad
-            max_ratio = np.max(normalized)
-            if max_ratio > 1.0:
-                jump_ok = False
-                arm_cmd = prev_arm_cmd + delta / max_ratio
-        if prev_hand_cmd is not None:
-            delta = hand_cmd - prev_hand_cmd
-            normalized = np.abs(delta) / self.hand_jump_limit_rad
-            max_ratio = np.max(normalized)
-            if max_ratio > 1.0:
-                jump_ok = False
-                hand_cmd = prev_hand_cmd + delta / max_ratio
-        return arm_cmd, hand_cmd, jump_ok
 
     # ------------------------------------------------------------------
     # Soft deceleration (static — no instance state needed)

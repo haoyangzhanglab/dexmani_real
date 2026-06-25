@@ -96,7 +96,7 @@ class PIDController:
     Operates on 7-DOF joint position error using **derivative on measurement**
     (not derivative on error)::
 
-        vel = Kp * err - Kd * (current - prev_current) / dt + Ki * cum_err
+        vel = Kp * err - Kd * (current - prev_current) / dt
 
     **Derivative on measurement (F1)**: the D term reacts only to changes in
     the process variable (joint position), NOT changes in the setpoint (target).
@@ -105,15 +105,8 @@ class PIDController:
     the original implementation.  The P term alone handles setpoint tracking;
     the D term provides identical oscillation damping without reacting to steps.
 
-    Integral term (Ki) is disabled by default to prevent windup in
-    teleoperation where the target is continuously changing.
-
-    **Anti-windup**: when ``max_vel`` is provided to ``control()``, the
-    integral accumulator ``_cum_err`` is clamped per-joint so that the
-    total I contribution never exceeds the velocity limit.  Without this
-    a sustained small error with non-zero Ki would cause unbounded
-    integral growth, leading to severe overshoot when the error changes
-    sign.  The clamp is conservative: ``|Ki * cum_err| <= max_vel``.
+    Integral term (Ki) and anti-windup removed — Ki=0 in teleop makes them
+    dead code.  Aligned with BunnyVisionPro PID which has no anti-windup.
 
     ref: BunnyVisionPro xarm7_ability.py:11-36 (original D-on-error)
          Franklin Feedback Control ch.6 — derivative-on-measurement
@@ -138,14 +131,11 @@ class PIDController:
         )
         self._prev_err: np.ndarray | None = None
         self._prev_current: np.ndarray | None = None  # F1: D-on-measurement
-        self._cum_err: np.ndarray = np.zeros_like(self.kp)
-        self._ki_nonzero = np.any(self.ki != 0.0)  # fast-path gate
 
     def reset(self) -> None:
         """Clear error history (call on mode switch or arm reset)."""
         self._prev_err = None
         self._prev_current = None  # F1
-        self._cum_err = np.zeros_like(self.kp)
 
     def control(
         self,
@@ -160,7 +150,7 @@ class PIDController:
         Args:
             err: Joint position error (target - current), shape (7,).
             dt: Time step in seconds (inner loop period).
-            max_vel: Per-joint velocity limit for anti-windup clamping.
+            max_vel: Per-joint velocity limit (unused; kept for API compat).
             current: Current joint position (process variable) for
                      derivative-on-measurement.  Required for the D term
                      to avoid reacting to setpoint steps.
@@ -172,15 +162,6 @@ class PIDController:
         if self._prev_err is None:
             self._prev_err = err.copy()
 
-        # Integral accumulation with anti-windup clamping when Ki is active.
-        if self._ki_nonzero:
-            self._cum_err += dt * err
-            if max_vel is not None:
-                i_contrib = self.ki * self._cum_err
-                i_max = np.abs(max_vel)
-                i_clipped = np.clip(i_contrib, -i_max, i_max)
-                self._cum_err = np.where(self.ki != 0, i_clipped / self.ki, self._cum_err)
-
         # F1: Derivative on measurement — D term uses -d(current)/dt
         # instead of d(error)/dt.  This gives identical oscillation damping
         # without reacting to setpoint steps (the 50Hz target update).
@@ -190,12 +171,8 @@ class PIDController:
             # Fallback: derivative on error (backward compatible)
             d_term = self.kd * (err - self._prev_err) / dt
 
-        # P + D + I
-        value = (
-            self.kp * err
-            + d_term
-            + self.ki * self._cum_err
-        )
+        # P + D (I term removed — Ki=0 in teleop, anti-windup deleted)
+        value = self.kp * err + d_term
 
         self._prev_err = err.copy()
         if current is not None:
@@ -218,7 +195,7 @@ class XArm7Config:
         default_factory=lambda: np.deg2rad([360, 120, 360, 225, 360, 180, 360])
     )
     max_qvel: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([90, 90, 90, 90, 120, 120, 150])
+        default_factory=lambda: np.deg2rad([180, 180, 180, 180, 180, 180, 180])
     )
     reset_speed: float = np.deg2rad(20)
     reset_acc: float = np.deg2rad(180)
@@ -234,7 +211,7 @@ class XArm7Config:
     # drop below this threshold (rad), then immediately released to 100%.
     # Pure state-driven — no time-based ramp, fully deterministic & reproducible.
     # When <= 0, soft-start is disabled (skip directly to full speed).
-    # Default 0 (disabled): with conservative pid_max_vel (~50% max_qvel),
+    # Default 0 (disabled): with conservative pid_max_vel (60% max_qvel),
     # the two-phase soft-start is unnecessary — the bottleneck scaling alone
     # produces smooth velocity profiles without stair-step gating.
     pid_convergence_threshold_rad: float = 0.0
@@ -257,35 +234,28 @@ class XArm7Config:
         default_factory=lambda: np.array([0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35])
     )  # Kd = Kp / 20
     pid_max_vel: np.ndarray = field(
-        default_factory=lambda: np.array([0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.5])
-    )  # rad/s, ~50% of max_qvel — conservative cap for smooth teleop motion.
-    # Aligned with BunnyVisionPro's default.  Lower max_vel removes the need for
-    # complex soft-start logic: natural PID damping + bottleneck scaling produce
-    # smooth velocity profiles without multi-phase ramp gating.
+        default_factory=lambda: np.deg2rad([108, 108, 108, 108, 108, 108, 108])
+    )  # rad/s, 60% of max_qvel — balanced cap for smooth teleop motion.
+    # 108°/s provides ample headroom for dexterous manipulation while keeping
+    # motion smooth.  The bottleneck scaling in _clip_arm_velocity preserves
+    # trajectory shape when any joint approaches the limit.
 
     # ── Integral term (C1 — replay precision) ──
     # Per-joint integral gain for steady-state error elimination.
     # Default 0.0 for teleop (prevents integral windup with continuously
     # moving targets).  Set to ~0.1 × Kp during replay for accurate
-    # trajectory tracking.  Anti-windup clamping is built into PIDController
-    # (clamps |Ki * cum_err| <= max_vel per joint).
+    # trajectory tracking.  Anti-windup removed — use with caution if
+    # setting non-zero Ki.
     pid_ki: np.ndarray = field(
         default_factory=lambda: np.zeros(7)
     )
 
-    # ── Inner-loop target interpolation (A1 — smoothness) ──
-    # When True, the PID inner loop linearly interpolates between consecutive
-    # 50 Hz targets at 250 Hz, eliminating the stair-step pattern in the
-    # position error signal.  Adds ~4ms effective latency (half the 8ms
-    # inter-target gap) for significantly smoother velocity profiles.
-    inner_target_interpolation: bool = True
-
-    # ── Soft-start linear ramp (A2 — smooth engagement) ──
+    # ── Soft-start linear ramp (smooth engagement) ──
     # Duration (seconds) of a linear velocity ramp from 0% → 100% when
     # pid_convergence_threshold_rad > 0 and convergence has been reached,
     # or when pid_convergence_threshold_rad <= 0 (simplified single-phase).
     # 0 = no ramp, full speed immediately (backward compatible).
-    # 0.3s default (reduced from 0.5): with conservative max_vel (~50% of
+    # 0.3s default (reduced from 0.5): with conservative max_vel (60% of
     # max_qvel), the arm engages gently without needing a long ramp.
     soft_start_ramp_duration: float = 0.3
 
@@ -323,12 +293,6 @@ class XArm7(ConnectionStateMixin):
         self._arm_thread: threading.Thread | None = None
         self._arm_lock: threading.Lock = threading.Lock()
         self._arm_pos_target: np.ndarray | None = None
-        # A1: Target interpolation — stores the previous target + timestamps
-        # so the inner loop can linearly interpolate between 50 Hz updates
-        # at 250 Hz, eliminating the stair-step error pattern.
-        self._arm_pos_target_prev: np.ndarray | None = None
-        self._arm_pos_target_ts: float = 0.0
-        self._arm_pos_target_prev_ts: float = 0.0
         self._arm_should_stop: threading.Event = threading.Event()
         # Gate flag: when False, the PID inner loop skips velocity commands.
         # Managed by _set_mode() — cleared when mode transitions away from 4,
@@ -398,10 +362,6 @@ class XArm7(ConnectionStateMixin):
         if not self.config.use_servo_control:
             self._arm_should_stop.clear()
             self._arm_pos_target = self.last_qpos_cmd
-            # A1: reset interpolation state on fresh connection
-            self._arm_pos_target_prev = None
-            self._arm_pos_target_ts = time.perf_counter()
-            self._arm_pos_target_prev_ts = 0.0
             self._vel_ramp_start = time.perf_counter()  # activate velocity soft-start
             self._arm_thread = threading.Thread(
                 target=self._internal_control_arm_qpos,
@@ -593,8 +553,10 @@ class XArm7(ConnectionStateMixin):
 
             # Refresh SDK error/warn codes immediately
             try:
-                _, _, sdk_err, sdk_warn = self.arm.get_err_warn_code()
-            except (RuntimeError, OSError):
+                ret, err_warn = self.arm.get_err_warn_code()
+                sdk_err = err_warn[0] if len(err_warn) > 0 else -1
+                sdk_warn = err_warn[1] if len(err_warn) > 1 else -1
+            except (RuntimeError, OSError, ValueError, IndexError):
                 sdk_err, sdk_warn = -1, -1
 
             self.last_sdk_error_code = int(sdk_err)
@@ -610,16 +572,8 @@ class XArm7(ConnectionStateMixin):
             if self.arm.mode != 4:
                 self._set_mode(4)
 
-            now = time.perf_counter()
             with self._arm_lock:
-                # A1: save previous target for linear interpolation in inner loop
-                if self.config.inner_target_interpolation and self._arm_pos_target is not None:
-                    self._arm_pos_target_prev = self._arm_pos_target.copy()
-                    self._arm_pos_target_prev_ts = self._arm_pos_target_ts
-                else:
-                    self._arm_pos_target_prev = None
                 self._arm_pos_target = target_qpos
-                self._arm_pos_target_ts = now
 
             self.last_qpos_cmd = target_qpos.copy()
             self.last_cmd_time = time.time()
@@ -699,9 +653,6 @@ class XArm7(ConnectionStateMixin):
         if not self.config.use_servo_control:
             with self._arm_lock:
                 self._arm_pos_target = None
-                # A1: clear interpolation state so the inner loop doesn't
-                # try to interpolate from a stale previous target after resume.
-                self._arm_pos_target_prev = None
 
     def reset_soft_start(self) -> None:
         """Reset soft-start ramp counter. Call on TELEOP entry.
@@ -717,11 +668,13 @@ class XArm7(ConnectionStateMixin):
     def set_pid_ki(self, ki: np.ndarray | float) -> None:
         """Set integral gain at runtime (C1 — replay precision).
 
+        Note: anti-windup has been removed — if Ki is set non-zero, the
+        integral will accumulate without clamping.  Use with caution.
+
         During teleop, Ki=0 prevents integral windup with continuously
         moving targets.  During replay, a small Ki (~0.1 × Kp ≈ 0.5-0.7)
         eliminates steady-state tracking error for faithful trajectory
-        reproduction.  The built-in anti-windup clamps |Ki*cum_err| ≤
-        max_vel per joint.
+        reproduction.
 
         Args:
             ki: Per-joint integral gains (7,) or scalar broadcast to all joints.
@@ -729,8 +682,7 @@ class XArm7(ConnectionStateMixin):
         if not self.config.use_servo_control:
             ki_arr = np.broadcast_to(np.asarray(ki, dtype=np.float64), 7).copy()
             self._arm_pid.ki = ki_arr
-            self._arm_pid._ki_nonzero = np.any(ki_arr != 0.0)
-            self._arm_pid.reset()  # clear accumulated integral
+            self._arm_pid.reset()
             logger.info("PID Ki set to %s", ki_arr)
 
     def _clip_arm_velocity(self, arm_qvel: np.ndarray) -> np.ndarray:
@@ -831,15 +783,9 @@ class XArm7(ConnectionStateMixin):
                     if not self._velocity_control_active or self.arm.mode != 4:
                         continue
 
-                    # Read latest target + interpolation state (under lock)
+                    # Read latest target (under lock)
                     with self._arm_lock:
                         target = self._arm_pos_target
-                        if self.config.inner_target_interpolation:
-                            target_prev = self._arm_pos_target_prev
-                            target_ts = self._arm_pos_target_ts
-                            target_prev_ts = self._arm_pos_target_prev_ts
-                        else:
-                            target_prev = None
                     if target is None:
                         # None-sentinel: send zero velocity for natural
                         # deceleration.  Used by controller during PAUSED /
@@ -867,29 +813,6 @@ class XArm7(ConnectionStateMixin):
                         except (RuntimeError, OSError):
                             pass
                         continue
-
-                    # A1: Target interpolation — linearly interpolate between
-                    # consecutive 50 Hz targets at 250 Hz to eliminate the
-                    # stair-step pattern in the position error signal.
-                    # Without this, the PID sees step changes every 5th tick
-                    # (~4 ms gap), producing higher-frequency content in the
-                    # velocity command.  The interpolation adds at most ~4 ms
-                    # effective latency (half the 8 ms inter-target gap).
-                    if (
-                        self.config.inner_target_interpolation
-                        and target_prev is not None
-                        and np.all(np.isfinite(target_prev))
-                    ):
-                        now = time.perf_counter()
-                        gap = target_ts - target_prev_ts
-                        if gap > 0 and gap < 0.1:  # sanity: gap must be < 100ms
-                            t = (now - target_prev_ts) / gap
-                            if t < 1.0:
-                                # Linear interpolation between prev and current
-                                target = target_prev + (
-                                    target - target_prev
-                                ) * min(max(t, 0.0), 1.0)
-                            # else t >= 1.0: use current target directly
 
                     # Read current hardware position
                     try:
@@ -960,12 +883,13 @@ class XArm7(ConnectionStateMixin):
                         continue
 
                     if vc_code != 0:
-                        # Refresh SDK error codes for diagnosis
+                        # Refresh SDK error codes for diagnosis.
+                        # get_err_warn_code() returns (ret, [err, warn]).
                         try:
-                            _, _, sdk_err, sdk_warn = (
-                                self.arm.get_err_warn_code()
-                            )
-                        except (RuntimeError, OSError):
+                            ret, err_warn = self.arm.get_err_warn_code()
+                            sdk_err = err_warn[0] if len(err_warn) > 0 else -1
+                            sdk_warn = err_warn[1] if len(err_warn) > 1 else -1
+                        except (RuntimeError, OSError, ValueError, IndexError):
                             sdk_err, sdk_warn = -1, -1
                         logger.error(
                             "PID inner: vc_set_joint_velocity code=%d, "

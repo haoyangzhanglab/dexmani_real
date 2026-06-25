@@ -26,16 +26,16 @@ Output structure (with --train_val_split 0.8):
 
 Usage:
     # Basic export
-    python scripts/tools/export_hdf5_to_zarr.py --data_dir ./recordings/ --output ./zarr_data/
+    python examples/tools/export_hdf5_to_zarr.py --data_dir ./recordings/ --output ./zarr_data/
 
     # Train/val split + task filter + validation
-    python scripts/tools/export_hdf5_to_zarr.py \\
+    python examples/tools/export_hdf5_to_zarr.py \\
         --data_dir data/episodes/ --output data/export/ \\
         --validate --train_val_split 0.8 \\
         --filter_success true --min_frames 50
 
     # Timestamp alignment (post-process multi-rate streams to unified grid)
-    python scripts/tools/export_hdf5_to_zarr.py \\
+    python examples/tools/export_hdf5_to_zarr.py \\
         --data_dir data/episodes/ --output data/export/ \\
         --align --align_dt 0.020 --align_method linear
 """

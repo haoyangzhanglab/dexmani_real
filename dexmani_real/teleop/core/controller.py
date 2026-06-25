@@ -25,7 +25,6 @@ from dexmani_real.log import get_logger
 from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.control import safety
-from dexmani_real.teleop.control.safety import SlidingWindowMonitor
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
@@ -68,18 +67,10 @@ class TeleopControllerConfig:
     """
 
     target_hz: float = 50.0
-    ema_alpha_arm: float = 0.75  # Light EMA smoothing for hand tremor filtering.
-    # 1.0 = no smoothing; 0.75 = ~3-frame time constant at 50Hz (~60ms lag).
-    # Smoothing hand tremor (~2-3mm) without perceptible latency for dexterous teleop.
-
-    # ── Adaptive EMA (B1 — responsiveness + compliance) ──
-    # When True, ema_alpha scales with wrist velocity: higher alpha (less
-    # smoothing, faster response) during fast motions, lower alpha (more
-    # smoothing, less jitter) during fine manipulation.
-    # Replaces the fixed ema_alpha_arm with a velocity-dependent schedule.
-    adaptive_ema: bool = True
-    ema_alpha_min: float = 0.5   # Heavy smoothing for fine manipulation (< 0.05 m/s)
-    ema_alpha_max: float = 0.95  # Light smoothing for fast motions (> 0.3 m/s)
+    ema_alpha_arm: float = 0.95  # Fixed EMA smoothing for arm joint commands.
+    # 1.0 = no smoothing; 0.95 = light smoothing (~1-frame time constant at 50Hz, ~2ms lag).
+    # Smoothing hand tremor (~2-3mm) with minimal perceptible latency for dexterous teleop.
+    # Lower values (e.g. 0.5) = heavier smoothing, higher values (e.g. 0.95) = lighter.
 
     dry_run: bool = False
     use_zmq_vr: bool = False
@@ -93,28 +84,9 @@ class TeleopControllerConfig:
     multi_camera_configs: list | None = None  # None → single-camera (backward compat)
     multi_camera_auto_restart: bool = True
 
-    # ── Tracking safety ──
-    # Max single-joint deviation between commanded and actual position (rad).
-    # When |q_actual[i] - q_command[i]| exceeds this threshold for any joint,
-    # _consecutive_divergence increments.  Three consecutive divergences
-    # trigger emergency stop.  Default 5.0 rad (~286°) — intentionally high:
-    # only triggers on gross mechanical failure / encoder fault.
-    # Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD.
-    tracking_divergence_threshold_rad: float = 5.0
-
-    # ── Velocity-limited step smoothing ──
-    # Per-frame position-delta bottleneck between pipeline output and send_action.
-    # Uses bottleneck scaling (same algorithm as XArm7._limit_joint_step):
-    # when any joint exceeds its per-step velocity limit, ALL joints are
-    # scaled proportionally to preserve the trajectory shape.
-    #
-    # This is NOT redundant with the PID inner loop's _clip_arm_velocity:
-    # - PID _clip_arm_velocity limits VELOCITY at 250 Hz (per inner tick)
-    # - This limits POSITION DELTA at 50 Hz (per controller tick)
-    # Without this, VR jitter / IK noise can cause frame-to-frame position
-    # jumps that, while individually within PID velocity limits, produce
-    # perceptibly less smooth motion — the PID tracks each jump aggressively.
-    use_velocity_limited_smooth: bool = True
+    # Velocity-limited step smoothing removed — PID inner loop at 250 Hz
+    # provides sufficient per-tick velocity clipping (108°/s).  Aligned with
+    # BunnyVisionPro which has no outer-loop position-delta limiting.
 
 
 class TeleopController:
@@ -150,7 +122,7 @@ class TeleopController:
         keyboard_queue: object | None = None,
         # Backward compat individual kwargs (deprecated; prefer cfg)
         target_hz: float = 50.0,
-        ema_alpha_arm: float = 1.0,
+        ema_alpha_arm: float = 0.95,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_zmq_vr: bool = False,
@@ -188,12 +160,6 @@ class TeleopController:
         self.limiter = RateLimiter(cfg.target_hz)
         self.rate_manager = RateManager(cfg.target_hz) if cfg.use_precise_wait else None
         self.ema_alpha_arm = float(cfg.ema_alpha_arm)
-
-        # ── Adaptive EMA (B1) ──
-        self._adaptive_ema = cfg.adaptive_ema
-        self._ema_alpha_min = float(cfg.ema_alpha_min)
-        self._ema_alpha_max = float(cfg.ema_alpha_max)
-        self._prev_wrist_pos: np.ndarray | None = None  # for velocity estimation
 
         # Stream statistics
         self.vr_stats = StreamStats(name="vr_track", target_hz=120.0)
@@ -241,19 +207,6 @@ class TeleopController:
         self.running = False
         self._last_arm_cmd: np.ndarray | None = None
         self._last_hand_cmd: np.ndarray | None = None
-        # F2: pre-clip IK output used as EMA reference (avoids compounding
-        # velocity-limited lag into the EMA filter).  Separate from
-        # _last_arm_cmd which is post-clip and used for velocity-limited
-        # step reference and tracking safety.
-        self._last_raw_arm: np.ndarray | None = None
-
-        # ── Tracking safety: command-vs-actual deviation monitoring ──
-        # Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD
-        self._consecutive_divergence: int = 0
-        self._tracking_divergence_threshold = cfg.tracking_divergence_threshold_rad
-
-        # ── Velocity-limited step smoothing ──
-        self._use_vel_limited_smooth = cfg.use_velocity_limited_smooth
 
         # ── IK miss counter (Phase 2.2 — rate decoupling) ──
         self._ik_miss_count: int = 0
@@ -270,27 +223,12 @@ class TeleopController:
         # ── Episode telemetry (P2.1) ──
         self._episode_start_time: float | None = None
 
-        # ── Sliding window monitors (P3.3) ──
-        self._hand_temp_monitor = SlidingWindowMonitor(
-            window_size=50,
-            warn_threshold=55.0,
-            warn_fraction=0.6,
-        )
-        self._hand_current_monitor = SlidingWindowMonitor(
-            window_size=50,
-            warn_threshold=400.0,
-            warn_fraction=0.6,
-        )
-
         # Pipeline — shared action computation (extracted from controller)
         self.pipeline = TeleopPipeline(
             arm_mapper,
             retargeter,
             planner,
             ema_alpha_arm=self.ema_alpha_arm,
-            adaptive_ema=self._adaptive_ema,
-            ema_alpha_min=self._ema_alpha_min,
-            ema_alpha_max=self._ema_alpha_max,
         )
 
         # Keyboard
@@ -389,47 +327,6 @@ class TeleopController:
                 return
             self.robot.send_action(action)
 
-    # Velocity-limited step (per-frame command smoothing)
-
-    def _apply_velocity_limited_step(self, action: RobotAction, state: RobotState) -> RobotAction:
-        """Per-frame position-delta bottleneck between pipeline and send_action.
-
-        Bottleneck-scales the joint delta to max_qvel * dt, preserving the
-        trajectory shape (all joints scaled by the same worst-case ratio).
-
-        This complements, but is NOT redundant with, the PID inner loop's
-        _clip_arm_velocity (250 Hz velocity clipping):
-        - PID _clip_arm_velocity: per-250Hz-tick VELOCITY ceiling
-        - This method: per-50Hz-tick POSITION DELTA ceiling
-        Without this layer, VR jitter / IK noise can cause frame-to-frame
-        position jumps that the PID tracks aggressively, producing
-        perceptibly less smooth motion even though each jump is within
-        individual PID velocity limits.
-        """
-        if self._last_arm_cmd is None:
-            return action
-
-        dt = 1.0 / self.limiter.target_hz
-        arm_cfg = self.robot.arm.config
-        max_step = arm_cfg.max_qvel * dt  # rad per tick
-
-        arm_target = np.asarray(action.arm_qpos_cmd, dtype=np.float64)
-        prev_cmd = np.asarray(self._last_arm_cmd, dtype=np.float64)
-        delta = arm_target - prev_cmd
-
-        normalized = np.abs(delta) / max_step
-        max_ratio = np.max(normalized)
-        if max_ratio > 1.0:
-            delta = delta / max_ratio
-            action.arm_qpos_cmd = prev_cmd + delta
-            logger.debug(
-                "Velocity-limited step: max_ratio=%.2f joint=%d",
-                max_ratio,
-                int(np.argmax(normalized)) + 1,
-            )
-
-        return action
-
     # State machine tick
 
     def _tick(self) -> None:
@@ -504,30 +401,7 @@ class TeleopController:
         else:
             state = self.robot.get_state()
 
-        # 3b. Tracking safety: command-vs-actual deviation check
-        #     Ref: T-Rex arm_hand_control.py TRACKING_SAFETY_THRESHOLD (10 rad).
-        #     Detects mechanical jams / encoder faults that may not trigger
-        #     hardware-layer torque/current thresholds.
-        if not self.dry_run and self._last_arm_cmd is not None:
-            err = np.abs(state.arm_qpos - self._last_arm_cmd)
-            if np.any(err > self._tracking_divergence_threshold):
-                self._consecutive_divergence += 1
-                logger.warning(
-                    "Tracking divergence: max_err=%.2f rad frame=%s consecutive=%d",
-                    float(np.max(err)),
-                    self.frame_count,
-                    self._consecutive_divergence,
-                )
-                if self._consecutive_divergence >= 3:
-                    self._escalate_to_emergency(
-                        f"Tracking divergence > {self._tracking_divergence_threshold} rad "
-                        f"for 3 consecutive frames (max_err={np.max(err):.2f} rad)"
-                    )
-                    return
-            else:
-                self._consecutive_divergence = 0
-
-        # H3 (fix B): PID inner thread alive monitor.
+        # H3: PID inner thread alive monitor.
         # The PID daemon thread can die silently from an unhandled
         # exception (IndexError, TypeError, ValueError).  Check every
         # 50 frames (~1 s) so the controller can escalate to E-Stop
@@ -545,11 +419,11 @@ class TeleopController:
         # 4. Compute action
         action, status = self._compute_action(vr_frame, state)
 
-        # F2: save pre-clip IK output as EMA reference for next frame.
-        # _last_raw_arm tracks the INTENDED trajectory (raw IK), while
-        # _last_arm_cmd tracks the SENT trajectory (post velocity-limit).
+        # Update motion reference for next frame's EMA and prev_cmd fallback.
         if status.get("ik_ok"):
-            self._last_raw_arm = action.arm_qpos_cmd.copy()
+            self._last_arm_cmd = action.arm_qpos_cmd.copy()
+        if status.get("retarget_ok"):
+            self._last_hand_cmd = action.hand_qpos_cmd.copy()
 
         # 4b. IK miss tracking (Phase 2.2 — rate decoupling)
         #     Increment counter on IK failure; reset on success.
@@ -569,65 +443,6 @@ class TeleopController:
                     "IK missed %d consecutive frames — holding position",
                     self._ik_miss_count,
                 )
-
-        # 4c. Velocity-limited step — per-frame position-delta smoothing.
-        #     Bottleneck-scales the pipeline output to prevent VR jitter / IK
-        #     noise from producing perceptibly jerky motion between 50 Hz ticks.
-        #     Complements (not redundant with) PID _clip_arm_velocity at 250 Hz.
-        #
-        #     M3: only active in velocity (PID) mode.  In servo mode,
-        #     XArm7._limit_joint_step() already applies the same bottleneck
-        #     scaling — running both in series double-bottlenecks the same
-        #     delta, producing overly conservative motion.
-        arm_cfg = self.robot.arm.config
-        if (
-            self._use_vel_limited_smooth
-            and not arm_cfg.use_servo_control
-            and self._last_arm_cmd is not None
-        ):
-            action = self._apply_velocity_limited_step(action, state)
-
-        # Update EMA/motion reference AFTER velocity-limited step so the
-        # inter-frame delta represents the actual sent command.  Updating
-        # before this point causes _apply_velocity_limited_step to always
-        # see delta=0 (no-op bug).
-        if status.get("ik_ok"):
-            self._last_arm_cmd = action.arm_qpos_cmd.copy()
-        if status.get("retarget_ok"):
-            self._last_hand_cmd = action.hand_qpos_cmd.copy()
-
-        # 4d. Sliding window cyclic limit monitors (P3.3)
-        #     Tracks hand temp and current over a 50-tick (~1s) window to
-        #     detect gradual degradation before the hard limit triggers.
-        #     Complements per-tick threshold checks in validate_action() below.
-        #     Reads only temperature + current from hand state (full=False for
-        #     minimal overhead — skips tactile force sum computation).
-        if not self.dry_run and self.state != ControllerState.IDLE:
-            try:
-                hand_state = self.robot.hand.get_state(full=False)
-                if hand_state is not None:
-                    hand_temp = hand_state.get("temperature")
-                    hand_current = hand_state.get("current")
-                    if hand_temp is not None and np.all(np.isfinite(hand_temp)):
-                        _, temp_warn = self._hand_temp_monitor.update(hand_temp)
-                        if temp_warn and self.frame_count % 50 == 0:
-                            logger.warning(
-                                "Hand temp elevated: mean=%.1f°C max=%.1f°C over %d ticks",
-                                self._hand_temp_monitor.window_mean,
-                                self._hand_temp_monitor.window_max,
-                                self._hand_temp_monitor.window_size,
-                            )
-                    if hand_current is not None and np.all(np.isfinite(hand_current)):
-                        _, curr_warn = self._hand_current_monitor.update(hand_current)
-                        if curr_warn and self.frame_count % 50 == 0:
-                            logger.warning(
-                                "Hand current elevated: mean=%.1fmA max=%.1fmA over %d ticks",
-                                self._hand_current_monitor.window_mean,
-                                self._hand_current_monitor.window_max,
-                                self._hand_current_monitor.window_size,
-                            )
-            except (ValueError, RuntimeError, KeyError, AttributeError) as e:
-                logger.debug("Sliding window monitor update failed: %s", e)
 
         # 5. Record frame (before safety gate — captures pre-hold action)
         camera_frame = None
@@ -810,10 +625,6 @@ class TeleopController:
         self._init_fallback(current_arm_qpos, current_hand_qpos)
 
         # Delegate to shared pipeline.
-        # F2: pass _last_raw_arm (pre-clip IK) as EMA reference so the
-        # filter tracks the intended trajectory, not the velocity-clipped
-        # command.  This prevents the velocity limiter's lag from compounding
-        # into the EMA filter (~20-40ms improvement during fast motions).
         action, status = self.pipeline.compute_action(
             vr_frame=vr_frame,
             current_arm_qpos=current_arm_qpos,
@@ -822,9 +633,7 @@ class TeleopController:
             prev_hand_cmd=prev_hand_cmd,
             check_workspace=self.robot.check_workspace,
             clamp_workspace_pos=self.robot.clamp_workspace_pos,
-            last_arm_cmd=self._last_raw_arm
-            if self._last_raw_arm is not None
-            else self._last_arm_cmd,
+            last_arm_cmd=self._last_arm_cmd,
         )
 
         ik_ok = status["ik_ok"]
@@ -839,13 +648,6 @@ class TeleopController:
         if ik_ok and retarget_ok:
             self._last_good_arm = np.asarray(action.arm_qpos_cmd, dtype=np.float64).copy()
             self._last_good_hand = np.asarray(action.hand_qpos_cmd, dtype=np.float64).copy()
-
-        # NOTE: _last_arm_cmd / _last_hand_cmd are NOT updated here.
-        # They serve as the reference for velocity-limited step smoothing
-        # and EMA in the pipeline.  They are updated in _tick() AFTER the
-        # velocity-limited step so the delta between ticks reflects the
-        # actual sent command, not the raw IK output.  Otherwise the
-        # velocity-limited step would always see delta=0 and be a no-op.
 
         # Update counters
         if ik_ok:
@@ -1022,7 +824,6 @@ class TeleopController:
         logger.info("Returning to home...")
         self._last_arm_cmd = None
         self._last_hand_cmd = None
-        self._last_raw_arm = None  # F2
 
         # Stop recording if active (discard current episode)
         if self.recording:
@@ -1042,15 +843,12 @@ class TeleopController:
         self._last_good_arm = None
         self._last_good_hand = None
         self._reset_vr_tracking()
-        self._consecutive_divergence = 0
         self._ik_miss_count = 0
         self._ik_miss_total = 0
         self._ik_miss_max_consecutive = 0
         self._camera_frame_count = 0
         self._retarget_consecutive_none = 0
         self._episode_start_time = None
-        self._hand_temp_monitor.reset()
-        self._hand_current_monitor.reset()
 
         # Reset rate limiter — return_to_home blocks the main loop for seconds,
         # so the next limiter.wait() would otherwise see a huge elapsed time

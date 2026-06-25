@@ -23,7 +23,7 @@ Quest WiFi 无线连接:
 
 Usage:
   source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real
-  cd scripts/real
+  cd examples/real
   python test_quest_hand_teleop.py
 """
 

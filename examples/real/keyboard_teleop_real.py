@@ -20,7 +20,7 @@
 安全:
     - 启动时执行 Pre-Flight 检查清单
     - 软墙 workspace 安全 (到达边界拒绝移动)
-    - solve_teleop_ik 纯差分模式 (use_position_ik=False) 保证分支连续性
+    - solve_teleop_ik 迭代 DLS (ref: BunnyVisionPro) + MPlib 位置 IK 兜底 (use_position_ik=True)
     - 速度平滑由 PID 内环 _clip_arm_velocity 统一负责
 """
 
@@ -49,15 +49,16 @@ from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInter
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.planning.collision_config import CollisionConfig
 
-from scripts._test_utils import quat_multiply
+from examples._test_utils import quat_multiply
 
 # ═══════════════════════════════════════════════ 配置
 
 CTRL_DT = 0.02       # 50Hz
 DELTA_POS = 0.005    # 每次按键 EEF 平移量 (m)
 DELTA_RPY = 0.02     # 每次按键 EEF 旋转量 (rad)
-# EMA 平滑已移除 — 速度控制收敛到 PID 内环 _clip_arm_velocity 一处
-# 外环键盘脚本只负责累积 target + 安全边界，不做滤波/裁剪
+# 外环键盘脚本只负责累积 target + 安全边界，不做滤波/裁剪。
+# Target Lead Governor (MAX_LEAD / chase_pos) 已删除 —
+# BunnyVisionPro 不存在该机制，VR 目标位姿直接入 IK。
 
 WORKSPACE_BOUNDS = np.array([
     [0.28, 0.72],    # x [min, max] m
@@ -279,10 +280,10 @@ def main():
         planning_profile=PlanningProfile(check_self_collision=False),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            use_position_ik=False,          # 关闭随机 IK 兜底 → 无分支跳变
-            max_pose_error_pos_m=0.05,      # 放宽 FK gate → diff IK 不被误杀
-            max_pose_error_rot_rad=np.deg2rad(5.0),
-            differential_ik_max_pos_step_m=0.05,  # 匹配 MAX_LEAD
+            use_position_ik=True,           # MPlib 兜底: DLS 迭代不收敛时接管
+            max_pose_error_pos_m=0.02,      # 2cm FK gate (tight enough for teleop)
+            max_pose_error_rot_rad=np.deg2rad(5.0),  # 5° FK gate
+            differential_ik_max_pos_step_m=0.05,  # 5cm final-step cap (ref: BVP DLS)
         ),
     )
 
@@ -473,13 +474,10 @@ def main():
             if keys.is_pressed("l"):
                 drpy[2] += DELTA_RPY
 
-            # ── 目标超前限制 + 周期性摘要（每次循环都执行）──
-            MAX_LEAD = 0.03  # 3cm — arm covers this in <0.2s @ 0.15 m/s
-            chase_pos = np.clip(target_pos, state.eef_pos - MAX_LEAD, state.eef_pos + MAX_LEAD)
+            # ── 周期性摘要 ──
 
             if loop_count % 50 == 0:
                 elapsed = time.perf_counter() - start_time
-                lag_mm = np.linalg.norm(target_pos - state.eef_pos) * 1000
                 if prev_eef_pos is not None:
                     vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (50 * CTRL_DT)
                 else:
@@ -488,9 +486,8 @@ def main():
                 print(
                     f"[T+{elapsed:.1f}s f={loop_count}] "
                     f"eef={np.round(state.eef_pos, 3)}m  "
-                    f"cur→{np.round(target_pos, 3)}  "
-                    f"cmd→{np.round(chase_pos, 3)}  "
-                    f"|Δ|={lag_mm:.1f}mm  v={vel:.2f}m/s  "
+                    f"target={np.round(target_pos, 3)}  "
+                    f"v={vel:.2f}m/s  "
                     f"ik={ik_method}  err={error_count}",
                     flush=True,
                 )
@@ -522,12 +519,14 @@ def main():
                 dq = rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
                 target_quat = quat_multiply(dq, target_quat)
 
-            # ── IK ──（chase_pos 已在上方 Target Lead Governor 中计算）
-            target_pose = Pose(p=chase_pos, q=target_quat)
+            # ── IK ──（target_pos 直接作为 IK 输入，ref: BunnyVisionPro）
+            target_pose = Pose(p=target_pos, q=target_quat)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:
-                # hold_on_failure：原地不动，回退 target 到实际 EEF 避免累积跳变
+                # hold_on_failure: 同时回退 target_pos 和 target_quat。
+                # DLS 和 MPlib 都失败说明 target pose 从当前构型不可达，
+                # 直接 snap 回实际 EEF 状态给 IK 一个可行的恢复起点。
                 target_pos = state.eef_pos.copy()
                 target_quat = state.eef_quat_wxyz.copy()
                 ik_method = "held"
@@ -541,7 +540,7 @@ def main():
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
                 hand_qpos_cmd=state.hand_qpos.copy(),
-                target_eef_pos=chase_pos.copy(),
+                target_eef_pos=target_pos.copy(),
             )
 
             send_result = robot.send_action(action)

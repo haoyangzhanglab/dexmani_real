@@ -61,7 +61,7 @@ class XArm7PlannerConfig:
     eef_link_name: str = "custom_eef_link"
     base_pose_world: Pose = field(default_factory=Pose.identity)
     use_convex: bool = False
-    joint_vel_limits_deg: tuple[float, ...] = (60, 60, 60, 60, 90, 90, 120)
+    joint_vel_limits_deg: tuple[float, ...] = (180, 180, 180, 180, 180, 180, 180)
     joint_acc_scale: float = 2.0
     # Cartesian workspace bounds (world frame). (3,2) [[x_min,x_max],[y_min,y_max],[z_min,z_max]].
     # None disables the check (backward compatible).
@@ -113,7 +113,7 @@ class TeleopProfile(FromDictMixin):
     """Online teleoperation IK/servo configuration."""
 
     teleop_dt: float = 0.04
-    max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 30, 45, 45, 60)
+    max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
     # Speed limiting is handled exclusively by XArm7._limit_joint_step()
     # (hardware driver layer, per BunnyVisionPro architecture).
     # max_qpos_cmd_speed_deg was removed — IK/planning layer should not clip speed.
@@ -129,37 +129,23 @@ class TeleopProfile(FromDictMixin):
 
     use_position_ik: bool = True
     use_differential_ik_fallback: bool = True
-    differential_ik_gain: float = 1.0  # full tracking, bottleneck limit handles speed
-    differential_ik_damping: float = 0.02
-    # NOTE: damping=0.02 (λ²=0.0004) is a "single-step DLS" design choice.
-    # Single-step DLS avoids the ~100 iteration cost of iterative DLS
-    # (BunnyVisionPro uses damping=1e-5 with 100 iterations) at the cost of
-    # ~1-2 mm extra IK error in non-singular regions — the λ² term in the
-    # damped pseudo-inverse (J·Jᵀ + λ²I)⁻¹ biases the solution away from the
-    # optimal least-squares direction even when far from singularities.
-    # Trade-off: 1 ms latency vs ~1-2 mm precision. Acceptable for teleop
-    # where human hand tremor (~2-3 mm) dominates. For precision tasks,
-    # consider an adaptive damping schedule (lower λ² in non-singular regions).
-    #
-    # L5: the FIRST line of defense against large IK steps is NOT the damping
-    # value — it's pose_error_vector()'s max_step clipping
-    # (differential_ik_max_pos_step_m / differential_ik_max_rot_step_rad),
-    # which caps the per-frame Cartesian error BEFORE it reaches the DLS
-    # solver.  Damping is the SECOND line of defense for near-singularity
-    # joints.  Together: max_step → stable IK input; damping → safe joint
-    # velocities even when manipulability is low.
+
+    # ── Iterative DLS (ref: BunnyVisionPro xarm7_ability.py:136-159 compute_ik) ──
+    # Each iteration: FK → Jacobian → DLS solve → integrate.  Converges when
+    # ||error|| < convergence_threshold or max_iterations reached.
+    differential_ik_gain: float = 0.05  # step size per iteration (matches BVP v*0.05)
+    differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
+    differential_ik_max_iterations: int = 100  # matches BVP for k in range(100)
+    differential_ik_convergence_threshold: float = 1e-3  # matches BVP norm(err) < 1e-3
+
+    # Step limits applied to the FINAL iteration only (not internal iterations).
+    # These cap the per-frame Cartesian delta at the solver output, preventing
+    # large joint jumps from unconverged DLS.  Set to inf for no limit.
     differential_ik_max_pos_step_m: float = 0.02
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
 
-    # ── Adaptive damping (NEW) ──
-    # When True, damping scales with manipulability:
-    #   high manipulability (far from singularity) → min_damping (~0.001)
-    #   low manipulability (near singularity) → max_damping (~0.05)
-    # Enabled by default (2026-06-22): the redundant Jacobian computation
-    # in the adaptive path has been eliminated (ik.py reuses the pre-computed
-    # Jacobian via manipulability_from_jacobian), so there is no performance
-    # cost.  Set to False to use fixed differential_ik_damping.
-    adaptive_damping: bool = True
+    # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──
+    adaptive_damping: bool = False
 
     # Min damping in non-singular regions (near-zero to minimize tracking bias).
     differential_ik_min_damping: float = 0.001

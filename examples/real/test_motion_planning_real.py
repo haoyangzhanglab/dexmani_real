@@ -38,7 +38,7 @@ from dexmani_real.planning import (
 )
 from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 
-from scripts._test_utils import (
+from examples._test_utils import (
     IKStats,
     angular_dist_rad,
     build_target_pose,

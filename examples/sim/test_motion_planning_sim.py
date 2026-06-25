@@ -3,7 +3,7 @@
 
 用法:
     conda activate real
-    python scripts/sim/test_motion_planning_sim.py
+    python examples/sim/test_motion_planning_sim.py
 
 修改顶部常量控制测试。
 
@@ -31,7 +31,7 @@ from dexmani_real.planning import (
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, create_viewer
 
-from scripts._test_utils import (
+from examples._test_utils import (
     IKStats,
     angular_dist_rad,
     build_target_pose,
