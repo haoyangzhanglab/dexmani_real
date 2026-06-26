@@ -78,10 +78,7 @@ WORKSPACE_BOUNDS = np.array([
 ], dtype=np.float64)
 
 # Home 关节角
-ARM_HOME_QPOS = np.array(
-    [-np.pi / 6, -np.pi / 4, 0, np.deg2rad(20), -np.pi, np.deg2rad(25), 0],
-    dtype=np.float64,
-)
+ARM_HOME_QPOS = np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]).astype(np.float64)
 
 # 速度限制 (rad/s)
 MAX_QVEL_RAD_S = np.deg2rad([180, 180, 180, 180, 180, 180, 180])

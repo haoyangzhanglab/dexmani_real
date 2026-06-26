@@ -1,6 +1,6 @@
-"""TeleopPipeline — stateless action computation (simplified).
+"""TeleopPipeline — stateless action computation.
 
-Flow: arm IK → EMA → hand retarget → assemble action.
+Flow: arm mapper → workspace clamp → complementary filter → deadzone → IK → assemble.
 
 Workspace clamping is handled by ArmInnerLoop timeout hold + validate_action().
 """
@@ -15,7 +15,7 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.types import Pose
 from dexmani_real.robot.types import RobotAction
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
-from dexmani_real.utils.signal_utils import ema_smooth
+from dexmani_real.utils.signal_utils import ComplementaryFilter, ema_smooth
 
 if TYPE_CHECKING:
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
@@ -29,7 +29,16 @@ class TeleopPipeline:
     """Stateless action computation pipeline.
 
     Holds references to arm_mapper, retargeter, planner — but no control state.
-    Uses simple EMA (LeFranX-style) for arm joint-space smoothing.
+
+    Smoothing architecture (configurable, opt-in):
+      - **Complementary Filter** (pose-space, BEFORE IK): decoupled position
+        EMA + orientation Slerp.  Tune ``comp_ratio_pos`` / ``comp_ratio_rot``
+        independently.  Ref: OpenTeach franka.py:21-33.
+      - **Joint-space EMA** (AFTER IK): single-alpha exponential moving average
+        on the 7-DOF arm command.  Ref: LeFranX xhand_vr_teleoperator.py:306-308.
+
+    When the complementary filter is active, set ``ema_alpha_arm=1.0``
+    (pass-through) to avoid double smoothing.
 
     Deadzone filtering (ref: LeFranX config_franka_fer_vr.py:32-33):
     VR wrist poses that haven't moved beyond position_deadzone (m) AND
@@ -47,6 +56,8 @@ class TeleopPipeline:
         ema_alpha_arm: float = 1.0,
         position_deadzone: float = 0.001,
         orientation_deadzone: float = 0.03,
+        comp_ratio_pos: float = 0.0,
+        comp_ratio_rot: float = 0.0,
     ) -> None:
         self.arm_mapper = arm_mapper
         self.retargeter = retargeter
@@ -58,6 +69,24 @@ class TeleopPipeline:
         # Deadzone state: last transmitted VR pose (not last received)
         self._last_deadzone_pos: np.ndarray | None = None
         self._last_deadzone_quat: np.ndarray | None = None
+
+        # Complementary filter (opt-in, default 0.0 = disabled)
+        if comp_ratio_pos > 0 or comp_ratio_rot > 0:
+            self._comp_filter: ComplementaryFilter | None = ComplementaryFilter(
+                pos_comp_ratio=comp_ratio_pos,
+                rot_comp_ratio=comp_ratio_rot,
+            )
+        else:
+            self._comp_filter = None
+
+    def reset_filter(self) -> None:
+        """Reset complementary filter state (e.g. after calibration/recalibration).
+
+        The next ``compute_arm_command()`` call will seed the filter with the
+        current VR pose and pass it through unfiltered.
+        """
+        if self._comp_filter is not None:
+            self._comp_filter.reset()
 
     def compute_action(
         self,
@@ -159,10 +188,21 @@ class TeleopPipeline:
             self._workspace_clamped_warned = False
             self._workspace_oob_warned = False
 
+        # ── Complementary Filter: pose-space smoothing BEFORE IK ──
+        # Position EMA + orientation Slerp, independently tuned.
+        # Ref: OpenTeach franka.py:21-33.
+        # NOTE: operate on the clamped target so filter state stays
+        # consistent even when the workspace clamp is active.
+        if self._comp_filter is not None:
+            target_eef_pos, target_eef_quat = self._comp_filter(target_eef_pos, target_eef_quat)
+
         # ── Deadzone check: skip IK if VR hand hasn't moved enough ──
         # Ref: LeFranX config_franka_fer_vr.py — position_deadzone=0.001, orientation_deadzone=0.03
+        # Returning ik_ok=True: prev_arm_cmd is a valid, previously-computed
+        # command — the arm is still tracking correctly, we just didn't need
+        # to recompute this frame.
         if self._within_deadzone(target_eef_pos, target_eef_quat):
-            return arm_cmd, ik_ok, target_eef_pos
+            return arm_cmd, True, target_eef_pos
 
         # Mark pose as "transmitted" for next deadzone comparison
         self._last_deadzone_pos = target_eef_pos.copy()

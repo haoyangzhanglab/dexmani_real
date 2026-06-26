@@ -27,9 +27,7 @@ class SimRobotConfig:
     time_step: float = 1.0 / 240.0      # SAPIEN physics step (typically > control rate)
     headless: bool = True
     arm_home_qpos: np.ndarray = field(
-        default_factory=lambda: np.array(
-            [-np.pi / 6, -np.pi / 4, 0, np.deg2rad(20), -np.pi, np.deg2rad(25), 0]
-        )
+        default_factory=lambda: np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0])
     )
     # SAPIEN PD gains for the implicit joint-level position controller.
     # stiffness=1000, damping=100 → default SAPIEN values for bare xArm7

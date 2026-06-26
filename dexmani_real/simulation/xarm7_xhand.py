@@ -20,7 +20,7 @@ class XArm7XHand:
         scene: sapien.Scene,
         disable_self_collision: bool = True,
         root_pose=sapien.Pose(p=[0.0, 0.0, 0.0], q=euler.euler2quat(0, 0, np.pi / 6)),
-        arm_home_qpos=np.array([-np.pi / 6, -np.pi / 4, 0, np.deg2rad(20), -np.pi, np.deg2rad(25), 0]),
+        arm_home_qpos=np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]),
         arm_pd_gains: dict | None = None,
         hand_pd_gains: dict | None = None,
     ):

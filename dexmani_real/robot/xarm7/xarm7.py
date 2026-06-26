@@ -28,8 +28,11 @@ logger = get_logger(__name__)
 class XArm7Config:
     ip: str = "192.168.1.111"
     dt: float = 1.0 / 50.0
+    # Comfortable home posture — joint-safe, high manipulability, EEF low near desk.
+    # J4=13.5deg (24.5deg above flip boundary), J6=74.7deg (mid-range, 105deg from limit).
+    # EEF world pos ~ [0.305, 0.0, 0.176] m (with 30deg Z base rotation).
     init_qpos: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([-30, -45, 0, 20, -180, 25, 0])
+        default_factory=lambda: np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0])
     )
     qpos_min: np.ndarray = field(
         default_factory=lambda: np.deg2rad([-360, -118, -360, -11, -360, -97, -360])
