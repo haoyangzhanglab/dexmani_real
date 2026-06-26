@@ -139,10 +139,7 @@ MAX_QVEL_RAD_S = np.deg2rad([180, 180, 180, 180, 180, 180, 180])
 TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
 
 # Home 关节角
-ARM_HOME_QPOS = np.array(
-    [-np.pi / 6, -np.pi / 4, 0, np.deg2rad(20), -np.pi, np.deg2rad(25), 0],
-    dtype=np.float64,
-)
+ARM_HOME_QPOS = np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]).astype(np.float64)
 HAND_HOME_QPOS = np.zeros(12, dtype=np.float64)
 
 # ── 仿真 RGBD 相机配置 ──
@@ -543,6 +540,7 @@ def main() -> None:
     episode_tick_count = 0       # Phase 1.2: 当前 episode 内的 tick 计数
     episode_idx = 0
     last_status_time = time.perf_counter()
+    last_overrun_warn_ts = 0.0
     # VR 丢帧计时（用于软减速）
     lost_since_ns: int | None = None
     # 追踪安全（Phase 1.1）
@@ -609,9 +607,14 @@ def main() -> None:
                                 ik_fail_total / max(episode_tick_count, 1), 1.0,
                             )
                             vr_drop = stale_frame_count / max(episode_tick_count, 1)
+                            # Rate-based classification: 绝对帧数阈值在超长/short
+                            # episode 中都会失真。改用 ik_rate 判定：
+                            #   failure  — 超过 10% 帧 IK 失败（运动学问题严重）
+                            #   partial  — 1%~10% 帧失败（偶发不可达，数据仍可用）
+                            #   success  — <1% 帧失败（几乎完美跟踪）
                             classification = (
-                                "failure" if ik_fail_total > 10
-                                else "partial" if ik_fail_total > 0
+                                "failure" if ik_rate < 0.90
+                                else "partial" if ik_rate < 0.99
                                 else "success"
                             )
                             path = collection.stop_episode(
@@ -752,9 +755,10 @@ def main() -> None:
                                 ik_fail_total / max(episode_tick_count, 1), 1.0,
                             )
                             vr_drop = stale_frame_count / max(episode_tick_count, 1)
+                            # Rate-based classification (same as QUIT handler above)
                             classification = (
-                                "failure" if ik_fail_total > 10
-                                else "partial" if ik_fail_total > 0
+                                "failure" if ik_rate < 0.90
+                                else "partial" if ik_rate < 0.99
                                 else "success"
                             )
                             path = collection.stop_episode(
@@ -767,7 +771,7 @@ def main() -> None:
                                 print(f"[Save] Episode saved to {path}")
                             print(f"\n=== STATE: {old_state} → IDLE (auto-saved) ===")
                             print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
-                            print(f"  classification={classification}")
+                            print(f"  classification={classification} ik_rate={ik_rate:.2%} vr_drop={vr_drop:.2%}")
                             print("[State] IDLE — 按 B 开始新的遥操作")
 
                 # ═══════════════════════════════════════════════════════════
@@ -983,15 +987,18 @@ def main() -> None:
                     print(status)
                     last_status_time = now
 
-                # ── 循环超限检测 ──
+                # ── 循环超限检测（节流：最多每 2 秒打印一次）──
                 tick_elapsed_ms = (time.perf_counter() - tick_start) * 1000.0
                 target_ms = CTRL_DT * 1000.0
                 if tick_elapsed_ms > target_ms * OVERRUN_WARN_RATIO:
-                    print(
-                        f"[Overrun] tick={tick_elapsed_ms:.1f}ms "
-                        f"target={target_ms:.1f}ms "
-                        f"(IK 耗时异常或系统负载过高)"
-                    )
+                    now_ov = time.perf_counter()
+                    if now_ov - last_overrun_warn_ts > 2.0:
+                        print(
+                            f"[Overrun] tick={tick_elapsed_ms:.1f}ms "
+                            f"target={target_ms:.1f}ms "
+                            f"(SAPIEN 渲染占 ~21ms，仿真预期内)"
+                        )
+                        last_overrun_warn_ts = now_ov
 
                 # ── 频率限制 (50Hz) ──
                 rate_limiter.wait()
