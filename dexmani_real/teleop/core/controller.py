@@ -600,6 +600,9 @@ class TeleopController:
             eef_pos=state.eef_pos,
             eef_quat_wxyz=state.eef_quat_wxyz,
         )
+        # Reset complementary filter state so the first pose after calibration
+        # passes through unfiltered — avoids mixing old-frame and new-frame data.
+        self.pipeline.reset_filter()
         return True
 
     # ── Hold-on-failure ──
@@ -649,8 +652,21 @@ class TeleopController:
         age_s = self._frame_age(vr_frame) if vr_frame is not None else float("inf")
         seq = vr_frame.get("sequence_id", "?") if vr_frame else "?"
         rec = "REC" if self.recording else "   "
+        # Posture quality metrics (null-space health indicators)
+        jl_pct, mu = 0.0, 0.0
+        if self._last_arm_cmd is not None and hasattr(self.planner, "kin"):
+            try:
+                limits = self.planner.kin.joint_limits
+                mid = 0.5 * (limits[:, 0] + limits[:, 1])
+                half = 0.5 * (limits[:, 1] - limits[:, 0])
+                jl_pct = float(np.max(np.abs(self._last_arm_cmd - mid) / half) * 100.0)
+                mu = float(self.planner.kin.manipulability_from_jacobian(
+                    self.planner.kin.compute_eef_jacobian(self._last_arm_cmd)
+                ))
+            except Exception:
+                pass
         logger.info(
-            "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms ik=%s/%s retarget=%s/%s",
+            "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms ik=%s/%s retarget=%s/%s jlimit=%.0f%% mu=%.4f",
             now,
             self.frame_count,
             self.state.value,
@@ -661,6 +677,8 @@ class TeleopController:
             self.ik_fail_count,
             self.retarget_success_count,
             self.retarget_fail_count,
+            jl_pct,
+            mu,
         )
 
     # ── Recording writer thread (offloads HDF5 I/O from 50Hz hot path) ──

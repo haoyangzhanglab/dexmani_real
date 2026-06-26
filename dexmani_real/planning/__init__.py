@@ -2,6 +2,7 @@ from .collision_config import CollisionConfig
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
 from .desk_safety import FingertipDeskSafety
+from .nullspace import apply_nullspace_optimization, joint_limit_gradient, nullspace_projector
 from .planner import XArm7MotionPlanner
 from .workspace_safety import WorkspaceSafety
 from .types import (
@@ -26,4 +27,7 @@ __all__ = [
     "XArm7Kinematics",
     "XArm7MotionPlanner",
     "XArm7PlannerConfig",
+    "apply_nullspace_optimization",
+    "joint_limit_gradient",
+    "nullspace_projector",
 ]

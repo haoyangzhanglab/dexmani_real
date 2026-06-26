@@ -5,14 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 if TYPE_CHECKING:
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
 from .types import IKResult, Pose, TeleopProfile
-from .pose_utils import ensure_qpos, pose_error_vector, wxyz_to_xyzw
+from .pose_utils import ensure_qpos, pose_error_vector
 
 
 class TeleopIKSolver:
@@ -42,6 +41,15 @@ class TeleopIKSolver:
       - ssik max_solutions=1
       - ssik seed_tolerance hard boundary)
     """
+
+    # xArm7 joint4 (elbow) — distinguishes elbow-up vs elbow-down IK branches.
+    # Range [-11°, 225°]: negative values ≈ elbow-up branch, large positive ≈ elbow-down.
+    _ELBOW_JOINT_INDEX: int = 3
+
+    # Elbow flip detection thresholds (ref: planner.py check_elbow_consistency).
+    _ELBOW_FLIP_NEG_THRESH_RAD: float = np.deg2rad(-5.0)   # below this → elbow-up branch
+    _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)    # above this → elbow-down branch
+    _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)     # minimum J4 change to count as flip
 
     def __init__(self, kin: XArm7Kinematics, ik_mgr: IKCandidateManager, teleop_profile: TeleopProfile) -> None:
         self.kin = kin
@@ -163,6 +171,16 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:jump")
                 continue
 
+            # Elbow branch consistency: reject candidates that would flip the
+            # elbow (joint4) from one branch to the other relative to the
+            # previous command.  MPlib's stochastic IK can produce valid-looking
+            # solutions on either elbow branch; this guards against a visually
+            # jarring arm "snap" when the position IK fallback picks the wrong branch.
+            # (ref: planner.py check_elbow_consistency — same thresholds)
+            if self._has_elbow_flip(qpos, previous_qpos_cmd):
+                attempts.append(f"{seed_name}:elbow_flip")
+                continue
+
             # Per-frame safety gate: max single-joint delta (L-infinity).
             # Guards against any individual joint jumping too far regardless of
             # how "cheap" the weighted metric considers that joint.
@@ -201,6 +219,31 @@ class TeleopIKSolver:
             return qpos, {"teleop_ik_method": "position_ik", "seed": seed_name, "fallback": True, "attempts": attempts}
 
         return None, {"teleop_ik_method": "position_ik", "failure_reason": f"all failed: {attempts}"}
+
+    # ── Elbow branch flip detection ──
+
+    def _has_elbow_flip(self, candidate_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> bool:
+        """Return True if ``candidate_qpos`` would cause an elbow branch flip vs ``previous_qpos_cmd``.
+
+        xArm7 joint4 (elbow, index 3) has range [-11°, 225°].  Negative values
+        correspond to the elbow-up branch and large positive values to the
+        elbow-down branch.  A branch flip is detected when the previous command
+        and candidate are on opposite sides of the threshold band AND the
+        absolute J4 change exceeds the minimum delta.
+
+        Thresholds match the offline path planner's ``check_elbow_consistency``
+        (planner.py:606-617).
+        """
+        prev_j4 = float(previous_qpos_cmd[self._ELBOW_JOINT_INDEX])
+        cand_j4 = float(candidate_qpos[self._ELBOW_JOINT_INDEX])
+        delta_j4 = abs(cand_j4 - prev_j4)
+
+        # One side on the elbow-up branch (negative), the other on elbow-down (positive).
+        if prev_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and cand_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
+            return bool(delta_j4 > self._ELBOW_FLIP_MIN_DELTA_RAD)
+        if cand_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and prev_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
+            return bool(delta_j4 > self._ELBOW_FLIP_MIN_DELTA_RAD)
+        return False
 
     # Structured IK diagnostics (ref: ssik explain=True pattern)
 
@@ -323,6 +366,26 @@ class TeleopIKSolver:
         """
         qpos_cmd = self.ik_mgr.canonicalize_qpos(target_qpos, previous_qpos_cmd)
 
+        # Null-space joint-limit repulsion (post-IK, zero EEF error by construction).
+        # Adjusts the redundant DOF to push joints away from limits without
+        # altering the end-effector pose.  Runs before collision check so the
+        # safety gate covers the adjusted result.
+        if profile.enable_nullspace_optimization:
+            try:
+                jacobian, _eef_world = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
+                from .nullspace import apply_nullspace_optimization
+
+                qpos_cmd = apply_nullspace_optimization(
+                    qpos_cmd,
+                    jacobian,
+                    self.ik_mgr.joint_limits,
+                    step_size_rad=np.deg2rad(profile.nullspace_step_size_deg),
+                    margin_deg=profile.nullspace_joint_limit_margin_deg,
+                )
+            except Exception:
+                # Null-space failure is non-critical — skip and use raw IK result.
+                pass
+
         # Self-collision check (teleop hot path, ~0.1-0.3 ms per call)
         if profile.check_self_collision and self.ik_mgr.has_self_collision(qpos_cmd):
             qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
@@ -417,17 +480,11 @@ class TeleopIKSolver:
             if np.linalg.norm(error_world) < conv_thresh:
                 break
 
-            # Rotate error from world to EEF local frame.
-            quat_xyzw = wxyz_to_xyzw(current_pose.q)
-            R_local_world = Rotation.from_quat(quat_xyzw).inv().as_matrix()
-            R6 = np.zeros((6, 6))
-            R6[:3, :3] = R_local_world
-            R6[3:, 3:] = R_local_world
-            error = R6 @ error_world
-
             # DLS solve: dq = J^T (J·J^T + λ²I)^(-1) · error · step
+            # Both Jacobian (local_frame=False) and error are in world/base frame.
+            # Ref: BunnyVisionPro xarm7_ability.py:136-159 — consistent frame J+error.
             try:
-                dq = self._solve_damped_least_squares(jacobian, error, damping)
+                dq = self._solve_damped_least_squares(jacobian, error_world, damping)
             except np.linalg.LinAlgError:
                 if iterations == 0:
                     return IKResult(

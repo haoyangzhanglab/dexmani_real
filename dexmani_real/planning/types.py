@@ -222,3 +222,13 @@ class TeleopProfile(FromDictMixin):
     # Kept for backward-compatible config deserialization.
     interpolation_max_pos_speed: float = 0.4  # m/s
     interpolation_max_rot_speed: float = 0.8  # rad/s
+
+    # ── Null-space optimization ──
+    # Post-IK null-space projection that adjusts the redundant DOF to repel
+    # joints from their limits without altering the EEF pose (J · dq_null = 0).
+    # Enabled by default: the ~130 us overhead is negligible at 50 Hz, all
+    # safety gates (collision, pre-send, step-limit) run after this step,
+    # and it cannot degrade EEF tracking by construction.
+    enable_nullspace_optimization: bool = True
+    nullspace_step_size_deg: float = 1.0       # max null-space joint step per frame [deg]
+    nullspace_joint_limit_margin_deg: float = 15.0  # repulsion margin from limits [deg]
