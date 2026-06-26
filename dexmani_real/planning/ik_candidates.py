@@ -427,6 +427,32 @@ class IKCandidateManager:
         normalized_diff = (qpos - reference_qpos) / joint_ranges
         return float(np.sqrt(np.sum(normalized_diff ** 2)))
 
+    def weighted_joint_distance(
+        self, qpos: np.ndarray, reference_qpos: np.ndarray, weights: tuple[float, ...] | np.ndarray,
+    ) -> float:
+        """Per-joint weighted, range-normalised L2 distance (ref: LeFranX weighted_ik.cpp:62-69).
+
+        Formula: ``sqrt(Σ wⱼ · (Δqⱼ / rangeⱼ)²)``
+
+        - Δq is the wrapped equivalent-angle delta (handles ±2π ambiguity).
+        - Each joint's delta is divided by its hardware range, so 1° on a
+          joint with 238° range counts more than 1° on a joint with 720° range.
+        - Per-joint weights ``wⱼ`` then scale the normalised squared error:
+          higher weight → that joint is "expensive" to move away from current.
+
+        This is the metric that LeFranX uses for ``current_distance`` in their
+        multi-objective IK scoring function.  In DexMani it is used by the
+        teleop position-IK fallback to rank candidates.
+        """
+        qpos = ensure_qpos(qpos, self.dof, "qpos")
+        reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
+        delta = self.compute_qpos_delta(qpos, reference_qpos)
+        joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
+        joint_ranges = np.maximum(joint_ranges, 1e-6)
+        weights_arr = self.profile_array(weights, "joint_weights")
+        normalized = delta / joint_ranges
+        return float(np.sqrt(np.sum(weights_arr * normalized ** 2)))
+
     def joint_limit_penalty(self, qpos: np.ndarray, limits: np.ndarray) -> float:
         center = 0.5 * (limits[:, 0] + limits[:, 1])
         half_range = np.maximum(0.5 * (limits[:, 1] - limits[:, 0]), 1e-6)

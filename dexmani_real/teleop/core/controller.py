@@ -56,7 +56,7 @@ from dataclasses import dataclass
 @dataclass
 class TeleopControllerConfig:
     target_hz: float = 50.0
-    ema_alpha_arm: float = 0.95
+    ema_alpha_arm: float = 1.0
     dry_run: bool = False
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
@@ -66,6 +66,7 @@ class TeleopControllerConfig:
     collection_config: CollectionConfig | None = None
     multi_camera_configs: list | None = None
     multi_camera_auto_restart: bool = True
+    vr_disconnect_timeout_s: float = 3.0
 
 
 class TeleopController:
@@ -88,7 +89,7 @@ class TeleopController:
         tracker: QuestHandTracker | None = None,
         keyboard_queue: object | None = None,
         target_hz: float = 50.0,
-        ema_alpha_arm: float = 0.95,
+        ema_alpha_arm: float = 1.0,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_zmq_vr: bool = False,
@@ -187,7 +188,7 @@ class TeleopController:
         self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner, ema_alpha_arm=self.ema_alpha_arm)
 
         # Keyboard (accepts queue=None for backward compatibility;
-        # KeyboardHandler now uses termios cbreak + select internally)
+        # KeyboardHandler now uses pynput for global key capture)
         self.keyboard = KeyboardHandler(keyboard_queue)
 
         # Status
@@ -198,6 +199,10 @@ class TeleopController:
         self.retarget_fail_count: int = 0
         self.last_status_ts: float = 0.0
         self.status_interval: float = 2.0
+
+        # VR disconnect auto-stop (ref: LeFranX franka_server.cpp COMMAND_TIMEOUT_SEC=0.5)
+        self._vr_disconnect_timeout_s: float = float(cfg.vr_disconnect_timeout_s)
+        self._vr_consecutive_loss: int = 0
 
     # ── Lifecycle ──
 
@@ -258,11 +263,29 @@ class TeleopController:
         vr_frame = self._read_vr_frame()
         age_s = self._frame_age(vr_frame) if vr_frame is not None else float("inf")
 
-        # ── 2. VR staleness check (single threshold) ──
+        # ── 2. VR staleness check with cumulative timeout ──
+        # Single-frame staleness (0.5s): hold position, count consecutive losses.
+        # Cumulative timeout (vr_disconnect_timeout_s, default 3.0s):
+        #   auto-stop recording and transition to IDLE to prevent the robot
+        #   from holding a stale pose indefinitely.
+        # Ref: LeFranX franka_server.cpp:58 COMMAND_TIMEOUT_SEC = 0.5
         if age_s > self._VR_STALE_THRESHOLD_S or vr_frame is None:
+            self._vr_consecutive_loss += 1
             if not self.dry_run and self._arm_inner is not None:
                 self._arm_inner.set_target(None)  # hold position
+            # Check cumulative timeout
+            loss_duration_s = self._vr_consecutive_loss / self.limiter.target_hz
+            if loss_duration_s >= self._vr_disconnect_timeout_s:
+                logger.error(
+                    "VR disconnected for %.1fs (%d consecutive frames) — auto-stopping",
+                    loss_duration_s, self._vr_consecutive_loss,
+                )
+                self._stop_recording()
+                self.state = ControllerState.IDLE
+                self._vr_consecutive_loss = 0
+                logger.info("=== STATE: TELEOP → IDLE (VR timeout) ===")
             return
+        self._vr_consecutive_loss = 0  # reset on valid frame
 
         # ── 3. Read arm state from PID process ──
         if self.dry_run:

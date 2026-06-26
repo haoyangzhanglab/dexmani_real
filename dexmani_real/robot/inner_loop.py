@@ -120,9 +120,9 @@ class ArmInnerLoopConfig:
                   is limited via proportional scaling (ref: limit_jerk in signal_utils).
                   Only used in mode 4. Default: None (disabled).
         smooth_position_alpha: If > 0, applies EMA smoothing to the target position
-                               before sending. Reduces IK jitter at the cost of
-                               ~1 frame latency. Default: 0.0 (disabled).
-                               Used in both mode 1 and mode 4.
+                               before sending (mode 1 only; mode 4 already has PID +
+                               vel/accel/jerk limiting). Reduces raw-target jitter at
+                               the cost of ~1 frame latency. Default: 0.0 (disabled).
         target_timeout_s: Max age of target before auto-stop (0.2s).
     """
 
@@ -300,12 +300,12 @@ class ArmInnerLoop:
             # For mode 4: track previous velocity + acceleration for limiting
             prev_qvel: np.ndarray | None = np.zeros(7, dtype=np.float64) if mode == 4 else None
             prev_qacc: np.ndarray | None = np.zeros(7, dtype=np.float64) if (mode == 4 and self._cfg.max_jerk is not None) else None
-            # For position EMA smoothing (both modes): track smoothed target
-            smoothed_target: np.ndarray | None = current_qpos.copy() if self._cfg.smooth_position_alpha > 0 else None
+            # For mode 1 position EMA smoothing (mode 4 has PID + vel/accel/jerk limiting)
+            self._mode1_smoothed: np.ndarray | None = None
 
             # Build mode label with smoothing details
             parts = [{1: "position servo", 4: "velocity control + PID"}.get(mode, f"mode {mode}")]
-            if self._cfg.smooth_position_alpha > 0:
+            if mode == 1 and self._cfg.smooth_position_alpha > 0:
                 parts.append(f"pos EMA α={self._cfg.smooth_position_alpha}")
             if mode == 4:
                 if self._cfg.max_accel is not None:
@@ -337,8 +337,8 @@ class ArmInnerLoop:
                         self._send_zero_velocity(arm)
                     else:
                         self._hold_position(arm)
-                    # Reset smoothing state on timeout
-                    smoothed_target = None
+                    # Reset mode-1 smoothing state on timeout
+                    self._mode1_smoothed = None
                     if target is not None:
                         last_target_ts = target_ts
                     continue
@@ -357,19 +357,10 @@ class ArmInnerLoop:
                             arm.set_servo_angle_j(angles=last_valid_qpos.tolist(), is_radian=True)
                         except (RuntimeError, OSError):
                             pass
-                    smoothed_target = None
+                    self._mode1_smoothed = None
                     continue
 
                 last_valid_qpos = target[:7].copy()
-
-                # ── 3b. Position EMA smoothing (optional, both modes) ──
-                if self._cfg.smooth_position_alpha > 0:
-                    if smoothed_target is None:
-                        smoothed_target = target[:7].copy()
-                    else:
-                        alpha = self._cfg.smooth_position_alpha
-                        smoothed_target = alpha * target[:7] + (1.0 - alpha) * smoothed_target
-                    target = smoothed_target  # use smoothed target for this cycle
 
                 # ── 4. Read current joint state ──
                 try:
@@ -432,7 +423,22 @@ class ArmInnerLoop:
     # ── Mode 1: Position Servo ──
 
     def _tick_mode1(self, arm, target: np.ndarray) -> None:
-        """Mode 1: forward target position → set_servo_angle_j()."""
+        """Mode 1: forward target position → set_servo_angle_j().
+
+        Position EMA smoothing is applied here (not in the common path) because
+        mode 4 already has PID + velocity/accel/jerk limiting for implicit
+        smoothing.  Mode 1 has no such downstream filtering, so the optional EMA
+        compensates for that.
+        """
+        # ── Position EMA smoothing (mode 1 only) ──
+        if self._cfg.smooth_position_alpha > 0:
+            if self._mode1_smoothed is None:
+                self._mode1_smoothed = target[:7].copy()
+            else:
+                alpha = self._cfg.smooth_position_alpha
+                self._mode1_smoothed = alpha * target[:7] + (1.0 - alpha) * self._mode1_smoothed
+            target = self._mode1_smoothed
+
         try:
             code = arm.set_servo_angle_j(angles=target[:7].tolist(), is_radian=True)
         except (RuntimeError, OSError) as e:
@@ -538,10 +544,22 @@ class ArmInnerLoop:
 
     @staticmethod
     def _clip_velocity(qvel: np.ndarray, max_vel: np.ndarray) -> np.ndarray:
-        """Clip per-joint velocity to max limits, preserving direction."""
+        """Clip per-joint velocity to max limits, preserving direction.
+
+        Logs the bottleneck joint when clipping occurs (ref: BunnyVisionPro
+        xarm7_ability.py:185-194 — prints which joint limited the velocity).
+        """
         overshot = np.abs(qvel) / max_vel
         max_overshot = np.max(overshot)
         if max_overshot > 1.0 + 1e-4:
+            bottleneck = int(np.argmax(overshot))
+            logger.debug(
+                "Vel clip: joint-%d overshot %.2fx (%.3f / %.3f rad/s)",
+                bottleneck + 1,
+                max_overshot,
+                float(qvel[bottleneck]),
+                float(max_vel[bottleneck]),
+            )
             return qvel / max_overshot
         return qvel
 

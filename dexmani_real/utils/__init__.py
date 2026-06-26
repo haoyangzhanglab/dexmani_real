@@ -4,7 +4,7 @@ from dexmani_real.utils.pointcloud_utils import PointCloudConfig, rgbd_to_pointc
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.rate_manager import RateManager, StreamStats
 from dexmani_real.utils.serialization import from_dict_helper
-from dexmani_real.utils.signal_utils import ema_smooth, limit_jerk, robust_ema
+from dexmani_real.utils.signal_utils import ema_smooth, limit_jerk
 
 __all__ = [
     "OPERATOR2MANO_RIGHT",
@@ -17,6 +17,5 @@ __all__ = [
     "RateLimiter",
     "RateManager",
     "rgbd_to_pointcloud",
-    "robust_ema",
     "StreamStats",
 ]

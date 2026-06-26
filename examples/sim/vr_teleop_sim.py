@@ -112,7 +112,7 @@ DEFAULT_DATA_DIR = "./episodes"
 
 # 工作空间边界（world frame，与 RobotInterfaceConfig 默认值保持一致）
 WORKSPACE_BOUNDS = np.array([
-    [0.28, 0.70],   # x [min, max] m
+    [0.27, 0.70],   # x [min, max] m
     [-0.40, 0.40],  # y [min, max] m
     [0.02, 0.55],   # z [min, max] m
 ])
@@ -266,7 +266,7 @@ def setup_ee_camera(
 
     cam = scene.add_mounted_camera(
         name="ee_camera",
-        mount=eef_link,
+        mount=eef_link.get_entity(),
         pose=eef_cam_pose,
         width=width,
         height=height,
@@ -457,7 +457,7 @@ def main() -> None:
         ),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            max_ik_jump_deg=(15, 15, 15, 15, 15, 15, 15),
+            max_ik_jump_deg=(90, 90, 90, 90, 90, 90, 90),
             max_pose_error_pos_m=0.05,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             differential_ik_max_pos_step_m=0.05,
@@ -488,7 +488,7 @@ def main() -> None:
     # ── TeleopPipeline (shared action computation with real controller) ──
     pipeline = TeleopPipeline(
         arm_mapper, hand_retargeter, planner,
-        ema_alpha_arm=1.0,  # No EMA smoothing — use direct IK result in simulation
+        ema_alpha_arm=0.3,  # EMA smoothing — low-pass filter in joint space
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──

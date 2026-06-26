@@ -169,6 +169,46 @@ class TeleopProfile(FromDictMixin):
     # Damping multiplier when manipulability falls below min_manipulability.
     singularity_damping_scale: float = 10.0
 
+    # ── Joint-specific IK scoring weights (ref: LeFranX weighted_ik.cpp:62-69) ──
+    # Higher weight → solver penalises moving that joint away from its current
+    # position, i.e. "expensive" joints stay stable while "cheap" joints do the
+    # tracking work.  Applied via weighted, range-normalised L2 distance.
+    #
+    # xArm7 joint semantics and tuning rationale:
+    #   joint1 (base rotation, ±360°):     3.0 — huge range makes raw radians
+    #                                             cheap; high weight keeps the base
+    #                                             stable and avoids large arm swings
+    #                                             for small VR hand motions.
+    #   joint2 (shoulder lift, -118~120°): 1.2 — small range (238°) already
+    #                                             provides natural normalisation
+    #                                             penalty; moderate extra weight
+    #                                             because shoulder is the heaviest
+    #                                             joint yet essential for vertical
+    #                                             VR tracking.
+    #   joint3 (elbow, ±360°):             1.0 — neutral; elbow contributes to
+    #                                             both reach and orientation and
+    #                                             should move without bias.
+    #   joint4 (wrist pitch, -11~225°):    0.5 — small range provides natural
+    #                                             penalty; low weight lets wrist
+    #                                             pitch track VR orientation freely
+    #                                             within its asymmetric limits.
+    #   joint5 (wrist roll, ±360°):        0.5 — low weight; wrist roll is the
+    #                                             primary manipulation axis and
+    #                                             has ample range.
+    #   joint6 (wrist yaw, -97~180°):      0.8 — moderate range (277°); slight
+    #                                             penalty relative to roll to
+    #                                             prefer roll (joint5) over yaw
+    #                                             for hand orientation changes.
+    #   joint7 (tool flange, ±360°):       0.3 — lowest weight; tool rotation
+    #                                             has negligible effect on arm
+    #                                             configuration and should move
+    #                                             most freely.
+    #
+    # Effective cost per radian (weight ÷ joint_range):
+    #   J2(0.289) > J1(0.239) > J6(0.166) > J4(0.121)
+    #   > J3(0.080) > J5(0.040) > J7(0.024)
+    joint_weights: tuple[float, ...] = (3.0, 1.2, 1.0, 0.5, 0.5, 0.8, 0.3)
+
     # ── Cartesian pose interpolation (REMOVED 2026-06-24) ──
     # CartPoseInterpolator (linear + SLERP) was removed because:
     #   1. VR is native 50 Hz = control loop rate → no frequency decoupling needed

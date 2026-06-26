@@ -138,7 +138,8 @@ class TeleopIKSolver:
         ]
 
         attempts: list[str] = []
-        best: tuple[np.ndarray, str, float] | None = None  # (qpos, seed_name, hw_dist)
+        best: tuple[np.ndarray, str, float] | None = None  # (qpos, seed_name, weighted_dist)
+        weights = self.ik_mgr.profile_array(profile.joint_weights, "joint_weights")
 
         for seed_name, seed, n_init in seeds:
             status, raw_qpos = self.ik_mgr.call_mplib_ik(
@@ -162,14 +163,26 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:jump")
                 continue
 
+            # Per-frame safety gate: max single-joint delta (L-infinity).
+            # Guards against any individual joint jumping too far regardless of
+            # how "cheap" the weighted metric considers that joint.
             hw_dist = float(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, current_qpos))))
 
-            # Track hardware-closest candidate (ref: LeFranX current_distance penalty)
-            if best is None or hw_dist < best[2]:
-                best = (qpos.copy(), seed_name, hw_dist)
+            # Candidate ranking: weighted, range-normalised L2 distance.
+            # Base joints (high weight) are penalised more than wrist joints,
+            # so the solver prefers solutions that keep the base stable and
+            # move the wrist for orientation tracking.
+            # Ref: LeFranX weighted_ik.cpp:62-69 calculate_normalized_weighted_distance.
+            weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights)
+
+            if best is None or weighted_dist < best[2]:
+                best = (qpos.copy(), seed_name, weighted_dist)
                 attempts.append(f"{seed_name}:ok")
 
-            # Fast path: prev_cmd seed, close to hardware → accept immediately
+            # Fast path: prev_cmd seed, close to hardware → accept immediately.
+            # Uses L-infinity (not weighted distance) as a per-joint safety gate
+            # — if ANY single joint has jumped more than fast_accept_rad, we
+            # keep searching for a safer candidate.
             # (ref: ssik seed_tolerance hard boundary)
             if seed_name == "prev_cmd" and hw_dist <= fast_accept_rad:
                 return qpos, {"teleop_ik_method": "position_ik", "seed": seed_name, "attempts": attempts}
