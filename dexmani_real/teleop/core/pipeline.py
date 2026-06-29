@@ -104,6 +104,11 @@ class TeleopPipeline:
 
         Returns (action, status) where status has keys: ik_ok, retarget_ok.
         """
+        # Set current hand state for 19-DOF collision detection (no-op in 7-DOF mode).
+        # Uses prev_hand_cmd because hand retargeting hasn't run yet this frame;
+        # hand position changes slowly (EMA-smoothed), so this is a safe approximation.
+        self.planner.set_hand_qpos(prev_hand_cmd)
+
         arm_cmd, ik_ok, target_eef_pos = self.compute_arm_command(
             vr_frame, current_arm_qpos, prev_arm_cmd,
             check_workspace=check_workspace,

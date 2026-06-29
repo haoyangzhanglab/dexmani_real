@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
@@ -11,6 +11,102 @@ from dexmani_real.utils.serialization import FromDictMixin, from_dict_helper
 
 if TYPE_CHECKING:
     from .collision_config import CollisionConfig
+
+
+@dataclass(frozen=True, slots=True)
+class CollisionPair:
+    """A single self-collision contact between two links.
+
+    Extracted from MPlib ``WorldCollisionResult`` into a lightweight,
+    hashable, pickle-safe dataclass suitable for diagnostic dicts and logs.
+    """
+
+    link_name1: str
+    link_name2: str
+    object_name1: str
+    object_name2: str
+    collision_type: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "link1": self.link_name1,
+            "link2": self.link_name2,
+            "obj1": self.object_name1,
+            "obj2": self.object_name2,
+            "type": self.collision_type,
+        }
+
+
+@dataclass
+class CollisionInfo:
+    """Structured self-collision diagnostic result.
+
+    **Hot-path safety:** When no collision is detected, ``no_collision()``
+    returns a module-level cached singleton — zero allocation beyond the
+    underlying MPlib C++ ``check_for_self_collision`` call.
+
+    When a collision exists, the ``WorldCollisionResult`` list is already
+    computed by MPlib; wrapping it here only iterates the result strings
+    (no second collision query).
+
+    ``bool(collision_info)`` returns ``in_collision``, so existing code
+    that checks ``if check_self_collision(q):`` continues to work.
+    """
+
+    in_collision: bool
+    collision_pairs: tuple[CollisionPair, ...] = ()
+    num_contacts: int = 0
+
+    # Module-level cached singleton — set after the class body.
+    _NO_COLLISION: ClassVar[CollisionInfo]
+
+    @classmethod
+    def no_collision(cls) -> CollisionInfo:
+        """Return the cached no-collision singleton (zero allocation)."""
+        return cls._NO_COLLISION
+
+    @classmethod
+    def from_mplib_results(cls, results: list[Any]) -> CollisionInfo:
+        """Build ``CollisionInfo`` from a list of MPlib ``WorldCollisionResult``.
+
+        ``results`` is the raw list returned by
+        ``mp_planner.check_for_self_collision(qpos)``.
+        """
+        pairs = tuple(
+            CollisionPair(
+                link_name1=str(r.link_name1),
+                link_name2=str(r.link_name2),
+                object_name1=str(r.object_name1),
+                object_name2=str(r.object_name2),
+                collision_type=str(r.collision_type),
+            )
+            for r in results
+        )
+        return cls(in_collision=True, collision_pairs=pairs, num_contacts=len(pairs))
+
+    def __bool__(self) -> bool:
+        return self.in_collision
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializable dict for ``IKResult.report`` integration."""
+        if not self.in_collision:
+            return {"in_collision": False}
+        return {
+            "in_collision": True,
+            "num_contacts": self.num_contacts,
+            "collision_pairs": [p.to_dict() for p in self.collision_pairs],
+        }
+
+    @property
+    def summary(self) -> str:
+        """One-line human-readable summary for log messages."""
+        if not self.in_collision:
+            return "no collision"
+        pairs = [f"{p.link_name1}↔{p.link_name2}" for p in self.collision_pairs]
+        return f"{self.num_contacts} contact(s): " + ", ".join(pairs)
+
+
+CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
 
 @dataclass
@@ -120,6 +216,7 @@ class TeleopProfile(FromDictMixin):
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
+    check_env_collision: bool = True   # env (table/obstacle) collision gate; holds on contact
 
     # Fast-accept threshold for position IK fallback (ref: ssik seed_tolerance).
     # A candidate is accepted immediately without trying additional seeds when

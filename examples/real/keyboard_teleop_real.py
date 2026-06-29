@@ -75,7 +75,6 @@ COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
     hand_extension_below_eef=0.076,
     hand_safe_margin=0.03,
-    env_collision_mode="geometric_fk",
 )
 
 # ═══════════════════════════════════════════════ 键盘输入
@@ -210,7 +209,7 @@ def main():
     # ── 1. Planner ──
     arm_config = XArm7Config()
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf")
+    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf")
 
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
@@ -223,8 +222,7 @@ def main():
             collision=COLLISION_CONFIG,
         ),
         planning_profile=PlanningProfile(
-            check_self_collision=False,
-            max_waypoint_delta_deg=360.0,  # 禁用冗余检查；执行层已做 1° 密集插补
+            max_waypoint_delta_deg=360.0,
         ),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,

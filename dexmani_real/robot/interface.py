@@ -71,10 +71,16 @@ class RobotInterface:
             else:
                 warnings.warn(f"Cannot validate home EEF workspace (NaN FK): {msg}")
 
-        # Table collision geometry
+        # Table collision geometry — lightweight CollisionModel (no MPlib point cloud penalty)
         if self.planner is not None and config.collision is not None:
-            if config.collision.env_collision_mode == "mplib_pointcloud":
-                self._setup_table_collision(table_z=config.collision.table_z_world)
+            if config.collision.enable_env_collision:
+                self.planner.collision_model.add_table(
+                    table_height=config.collision.table_z_world,
+                    x_center=config.collision.table_x_center,
+                    half_x=config.collision.table_half_x,
+                    half_y=config.collision.table_half_y,
+                    half_z=config.collision.table_half_z,
+                )
 
         # Hand kinematics
         self.hand_kinematics: HandKinematics | None = None
@@ -247,6 +253,16 @@ class RobotInterface:
             if self.hand.is_connected():
                 self.hand.reset()
                 time.sleep(0.3)
+                # Sync CollisionModel hand buffer so env collision checks use
+                # the post-reset hand geometry (defence-in-depth; today the
+                # 7-DOF collision URDF ignores hand DOFs entirely).
+                try:
+                    hand_state = self.hand.get_state()
+                    hand_qpos = np.asarray(hand_state.get("qpos", np.zeros(12)), dtype=np.float64)
+                    if hand_qpos.shape == (12,) and np.all(np.isfinite(hand_qpos)):
+                        self.planner.set_hand_qpos(hand_qpos)
+                except Exception:
+                    pass  # non-critical: CollisionModel defaults to open hand
             qpos = self._read_arm_qpos()
             if qpos is None:
                 return self._reset_blocking()
@@ -434,50 +450,6 @@ class RobotInterface:
             np.rad2deg(delta),
         )
         return self._execute_waypoints(path, dt)
-
-    # ── Table collision setup ──
-
-    def _setup_table_collision(
-        self,
-        table_z: float = 0.0,
-        margin_xy: float = 0.15,
-        n_layers: int = 5,
-        layer_spacing: float = 0.01,
-        xy_resolution: float = 0.02,
-        x_min_clearance: float = 0.15,
-    ) -> None:
-        if self.planner is None:
-            return
-
-        bounds = self.config.workspace_bounds
-        x_min = max(float(bounds[0, 0]), x_min_clearance)
-        x_max = float(bounds[0, 1]) + margin_xy
-        y_min = float(bounds[1, 0]) - margin_xy
-        y_max = float(bounds[1, 1]) + margin_xy
-
-        nx = max(2, int(np.ceil((x_max - x_min) / xy_resolution)) + 1)
-        ny = max(2, int(np.ceil((y_max - y_min) / xy_resolution)) + 1)
-
-        xs = np.linspace(x_min, x_max, nx, dtype=np.float64)
-        ys = np.linspace(y_min, y_max, ny, dtype=np.float64)
-        grid_x, grid_y = np.meshgrid(xs, ys)
-
-        zs = np.linspace(table_z, table_z - (n_layers - 1) * layer_spacing, n_layers, dtype=np.float64)
-
-        points_list = []
-        for z in zs:
-            layer = np.column_stack([grid_x.ravel(), grid_y.ravel(), np.full(grid_x.size, z, dtype=np.float64)])
-            points_list.append(layer)
-
-        points = np.vstack(points_list)
-        self.planner.add_point_cloud(points, name="table", resolution=xy_resolution)
-        logger.info(
-            "Table collision: %s points, %s layers, z=[%.3f, %.3f] m",
-            points.shape[0],
-            n_layers,
-            zs[-1],
-            zs[0],
-        )
 
     # ── Fingertip FK ──
 

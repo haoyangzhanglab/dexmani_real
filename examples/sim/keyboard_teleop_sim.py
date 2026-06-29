@@ -283,7 +283,7 @@ def main():
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
         ),
         planning_profile=PlanningProfile(

@@ -8,8 +8,9 @@ import numpy as np
 
 if TYPE_CHECKING:
     from .kinematics import XArm7Kinematics
+    from .collision_model import CollisionModel
 
-from .types import PlanningProfile, Pose
+from .types import CollisionInfo, PlanningProfile, Pose
 from .pose_utils import ensure_qpos
 
 
@@ -42,12 +43,13 @@ class IKCandidateManager:
       - dimos collision_step_size
     """
 
-    def __init__(self, kinematics: XArm7Kinematics) -> None:
+    def __init__(self, kinematics: XArm7Kinematics, collision_model: CollisionModel | None = None) -> None:
         self.kin = kinematics
         self.dof = kinematics.dof
         self.joint_limits = kinematics.joint_limits
         self.equivalent_joint_mask = kinematics.equivalent_joint_mask
         self.mp_planner = kinematics.mp_planner
+        self._cm = collision_model
 
 
     def call_mplib_ik(
@@ -186,9 +188,12 @@ class IKCandidateManager:
             report["reason"] = "IK candidate pose error exceeds threshold."
             return False, report
 
-        if profile.check_self_collision and self.has_self_collision(qpos):
-            report["reason"] = "IK candidate in self-collision."
-            return False, report
+        if profile.check_self_collision:
+            collision_info = self.check_self_collision(qpos)
+            if collision_info:
+                report["reason"] = "IK candidate in self-collision."
+                report["collision"] = collision_info.to_dict()
+                return False, report
 
         return True, report
 
@@ -329,9 +334,33 @@ class IKCandidateManager:
 
 
     def has_self_collision(self, qpos: np.ndarray) -> bool:
+        """Backward-compatible bool collision check (fast path for dense segment checks)."""
+        if self._cm is not None:
+            return self._cm.check_self_collision(qpos)
         return len(self.mp_planner.check_for_self_collision(qpos)) > 0
 
+    def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
+        """Structured self-collision check with diagnostic link-pair details.
+
+        Returns the cached ``CollisionInfo.no_collision()`` singleton when
+        no collision is detected (zero Python-side allocation).  When a
+        collision exists, the ``WorldCollisionResult`` list from MPlib is
+        already computed — this method wraps it into ``CollisionPair``
+        objects at negligible cost.
+
+        Use ``bool(result)`` or ``result.in_collision`` for the simple bool
+        branch; use ``result.to_dict()`` or ``result.summary`` for logging.
+        """
+        if self._cm is not None:
+            return self._cm.check_self_collision_details(qpos)
+        results = self.mp_planner.check_for_self_collision(qpos)
+        if len(results) == 0:
+            return CollisionInfo.no_collision()
+        return CollisionInfo.from_mplib_results(results)
+
     def has_env_collision(self, qpos: np.ndarray) -> bool:
+        if self._cm is not None:
+            return self._cm.check_env_collision(qpos)
         return len(self.mp_planner.check_for_env_collision(qpos)) > 0
 
     def _check_segment_collision(
@@ -356,6 +385,11 @@ class IKCandidateManager:
         Returns:
             True if all sampled points are collision-free.
         """
+        if self._cm is not None:
+            if collision_type == "self":
+                return self._cm.check_segment_collision_free(start, end, step_size)
+            else:
+                return self._cm.check_segment_env_collision_free(start, end, step_size)
         checker = self.has_self_collision if collision_type == "self" else self.has_env_collision
         diff = end - start
         dist = float(np.max(np.abs(diff)))
@@ -387,19 +421,49 @@ class IKCandidateManager:
         """Check self-collision along path with dense interpolation (ref: dimos).
 
         Linearly interpolates between consecutive waypoints at the given step
-        size and checks self-collision at every sampled point.
+        size and checks self-collision at every sampled point.  When a
+        collision is found, includes structured ``CollisionInfo`` at the
+        violating configuration for root-cause diagnostics.
         """
         for i in range(len(path) - 1):
+            # Dense segment check — fast bool path for most points.
             if not self.check_segment_collision_free(
                 path[i], path[i + 1], collision_step_size,
             ):
+                # Pinpoint the exact violating configuration and get full details.
+                collision_info = self._find_collision_in_segment(
+                    path[i], path[i + 1], collision_step_size,
+                )
                 return {
                     "path_self_collision": True,
                     "collision_waypoint_index": i,
                     "collision_waypoint_count": len(path),
                     "collision_step_size": collision_step_size,
+                    "collision": collision_info.to_dict() if collision_info else None,
                 }
         return {"path_self_collision": False}
+
+    def _find_collision_in_segment(
+        self, start: np.ndarray, end: np.ndarray, step_size: float,
+    ) -> CollisionInfo | None:
+        """Locate the first self-colliding configuration in segment [start, end].
+
+        Returns structured ``CollisionInfo`` for the first collision found,
+        or ``None`` if the segment is collision-free (unexpected caller path).
+        """
+        diff = end - start
+        dist = float(np.max(np.abs(diff)))
+        if dist <= step_size:
+            info = self.check_self_collision(end)
+            return info if info else None
+        n_steps = int(np.ceil(dist / step_size))
+        for step in range(1, n_steps + 1):
+            alpha = step / n_steps
+            q = start + alpha * diff
+            info = self.check_self_collision(q)
+            if info:
+                return info
+        return None
 
     def check_path_env_collisions(
         self, path: np.ndarray, collision_step_size: float = 0.02,

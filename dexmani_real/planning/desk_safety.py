@@ -22,8 +22,6 @@ Key design decisions:
 
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 
 
@@ -34,9 +32,9 @@ class FingertipDeskSafety:
     and compares the minimum against the table surface height.
 
     This is the **preferred** detection method — zero-cost, no MPlib point
-    cloud pollution, and more accurate than EEF-level Z checks.  The MPlib
-    point cloud approach costs ~47% IK success rate (100% → 53%) and is
-    only used when env_collision_mode == "mplib_pointcloud".
+    cloud pollution, and more accurate than EEF-level Z checks.  Always
+    active when ``check_env_collision=True`` in the planning profile,
+    independent of the CollisionModel FCL box obstacle layer.
 
     Migrated from test_motion_planning_sim.py:817-911 with identical logic.
     """
@@ -56,12 +54,7 @@ class FingertipDeskSafety:
         self._fingertip_ids = list(collision_config.fingertip_link_ids)
         self._fingertip_names = list(collision_config.fingertip_link_names)
         self._threshold = collision_config.fingertip_threshold
-        # Floating-point tolerance for boundary comparison only.
-        # Using 1e-8 (not 0.001) ensures the comparison boundary is tight —
-        # the epsilon widens the comparison window, NOT the safety margin.
-        self._epsilon = 1e-8
-        self._table_z = collision_config.table_z_world
-        self._hand_safe_margin = collision_config.hand_safe_margin
+        self._epsilon = 1e-8  # floating-point tolerance for boundary comparison
 
     # ── Public API ──
 
@@ -104,7 +97,7 @@ class FingertipDeskSafety:
         return safe, min_z, min_name
 
     def check_path_desk_safety(
-        self, path: np.ndarray, step_rad: float = 0.05
+        self, path: np.ndarray, step_rad: float | None = None
     ) -> tuple[bool, float, int]:
         """Dense-sampled fingertip desk safety check along a joint path.
 
@@ -120,6 +113,8 @@ class FingertipDeskSafety:
         Returns: (safe, min_fingertip_z_over_path, first_violation_segment_index)
           - violation_segment_index = -1 when all safe.
         """
+        if step_rad is None:
+            step_rad = self._config.desk_safety_step_rad
 
         path = np.asarray(path, dtype=np.float64)
         # Extract arm-only columns if padded
@@ -127,12 +122,7 @@ class FingertipDeskSafety:
             path = path[:, :7]
 
         if len(path) < 2:
-            safe, z, name = self.check_hand_desk_clearance(path[0])
-            if not safe:
-                eef_z = float("nan")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    eef_z = float(path[0][-1] if path.shape[1] > 0 else float("nan"))
+            safe, z, _name = self.check_hand_desk_clearance(path[0])
             return safe, z, 0 if not safe else -1
 
         min_z = float("inf")

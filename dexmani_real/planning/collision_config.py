@@ -2,33 +2,52 @@
 
 Replaces the previously scattered DESK_SAFE_Z / HAND_SAFE_MARGIN /
 HAND_EXTENSION_BELOW_EEF constants that were spread across 4 files.
+
+YAML file support (P3.2):
+  Load:  CollisionConfig.from_yaml("config/collision.yaml")
+  Save:  cfg.to_yaml("config/collision.yaml")
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from dexmani_real.utils.serialization import FromDictMixin
 
 
 @dataclass
-class CollisionConfig:
+class CollisionConfig(FromDictMixin):
     """Unified collision detection and safety margin configuration.
 
     All parameters in meters / world frame unless noted otherwise.
 
     Two complementary safety layers:
-      - Geometric FK: Pinocchio FK computes fingertip world Z → compare to
-        table surface.  Zero-cost, no MPlib point cloud needed.
-      - MPlib point cloud: Dense point cloud added to MPlib octree, used by
-        plan_screw/plan_qpos/IK for avoidance.  Costs IK success rate (~53%
-        vs 100% without).
-
-    Default mode is "geometric_fk" — the MPlib point cloud is only used
-    when explicitly requested (e.g. for non-table obstacles).
+      - CollisionModel FCL: box obstacle registered via add_table(), checked by
+        teleop env gate (ik.py) and path validation (planner.py).  Uses actual
+        hand joint angles in 19-DOF mode.
+      - FingertipDeskSafety FK: Pinocchio FK computes five fingertip world Z
+        coordinates and compares min against table surface + safe margin.
+        Fast, zero-obstacle, independent layer.
     """
 
-    # ── Table geometry (world frame) ──
+    # ── Table geometry (world frame, shared by CollisionModel.add_table + FingertipDeskSafety) ──
     table_z_world: float = 0.0
     """Table surface height in world frame (meters)."""
+
+    table_x_center: float = 0.5
+    """Table box centre X in robot base frame (meters)."""
+
+    table_half_x: float = 1.0
+    """Table box half-extent X (meters)."""
+
+    table_half_y: float = 2.0
+    """Table box half-extent Y (meters)."""
+
+    table_half_z: float = 0.04
+    """Table box half-extent Z (meters).  Box top = table_z_world, bottom = table_z_world - 2*half_z."""
 
     # ── Hand geometry (derived from collision URDF, home hand pose) ──
     hand_extension_below_eef: float = 0.076
@@ -48,15 +67,22 @@ class CollisionConfig:
         "thumb_tip", "index_tip", "mid_tip", "ring_tip", "pinky_tip",
     )
 
-    # ── Environment collision mode ──
-    env_collision_mode: str = "geometric_fk"
-    """Collision detection strategy for environment (table/objects).
+    # ── Environment collision ──
+    enable_env_collision: bool = True
+    """Enable environment (table/obstacle) collision detection.
 
-    Options:
-      - "geometric_fk": Pinocchio FK fingertip Z detection (fast, accurate, default).
-      - "mplib_pointcloud": MPlib octree via add_point_cloud() (costs IK success rate).
-      - "none": No environment collision detection.
+    When True, registers an FCL box obstacle in CollisionModel (teleop env gate
+    + path validation) and activates FK fingertip Z desk safety checks.  Set to
+    False to disable all environment collision layers.
     """
+
+    collision_step_size: float = 0.02
+    """Joint-space step size [rad] for dense segment collision interpolation.
+    Default 0.02 rad ~1.15° (ref: dimos collision_step_size)."""
+
+    desk_safety_step_rad: float = 0.02
+    """Joint-space step size [rad] for fingertip desk safety path checks.
+    Matches collision_step_size for consistent sampling resolution."""
 
     # ── Derived properties ──
 
@@ -88,3 +114,26 @@ class CollisionConfig:
         """
         from dataclasses import replace
         return replace(self, **kwargs)
+
+    # ── YAML / dict serialization ──
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict (tuples → lists for YAML compatibility)."""
+        import dataclasses
+        result = {}
+        for f in dataclasses.fields(self):
+            val = getattr(self, f.name)
+            result[f.name] = list(val) if isinstance(val, tuple) else val
+        return result
+
+    def to_yaml(self, path: str | Path) -> None:
+        """Write this CollisionConfig to a YAML file.
+
+        Uses ``to_dict()`` + ``yaml.dump()``.  Reload with
+        ``CollisionConfig.from_yaml(path)``.
+        """
+        import yaml
+
+        path = Path(path)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)

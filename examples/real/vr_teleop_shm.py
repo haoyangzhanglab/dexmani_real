@@ -81,13 +81,12 @@ def main():
     # ── 2. Planner ──
     arm_config = XArm7Config()
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf")
+    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf")
 
     collision = CollisionConfig(
         table_z_world=0.0,
         hand_extension_below_eef=0.076,
         hand_safe_margin=0.03,
-        env_collision_mode="geometric_fk",
     )
 
     planner = XArm7MotionPlanner(
@@ -100,7 +99,7 @@ def main():
             ),
             collision=collision,
         ),
-        planning_profile=PlanningProfile(check_self_collision=False),
+        planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
             teleop_dt=0.02,
             use_position_ik=True,

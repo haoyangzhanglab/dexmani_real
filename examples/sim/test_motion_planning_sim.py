@@ -28,6 +28,7 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import (
     CollisionConfig, PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig,
 )
+from dexmani_real.planning.collision_model import CollisionModel
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, create_viewer
 
@@ -84,13 +85,13 @@ def build_target_pose(
 
 # ═══════════════════════════════════════════════ 配置
 
-NUM_SAMPLES = 30           # 默认路径规划采样点
-NUM_IK_SAMPLES = 100       # 默认 IK 采样点
+NUM_SAMPLES = 90           # 默认路径规划采样点（stratified 15 区域）
+NUM_IK_SAMPLES = 200       # 默认 IK 采样点
 HEADLESS = False
 SEED = 123
 
-# --comprehensive 模式配置
-COMPREHENSIVE_NUM_SAMPLES = 60
+# --comprehensive 模式（已废弃：现为默认行为，保留 flag 向后兼容）
+COMPREHENSIVE_NUM_SAMPLES = 90
 COMPREHENSIVE_NUM_IK = 200
 
 # 采样空间（world frame，与真机 workspace 一致）
@@ -99,7 +100,7 @@ SAMPLE_Y = (-0.40, 0.40)
 SAMPLE_Z = (0.02, 0.55)
 
 # Z 偏置：低区 [0.02, 0.20] 权重放大（穿桌高风险区）
-Z_LOW_WEIGHT = 4.0         # 低区相对权重
+Z_LOW_WEIGHT = 6.0         # 低区相对权重（增强近桌面测试密度）
 Z_LOW_RANGE = (0.02, 0.20)
 Z_MID_RANGE = (0.20, 0.36)
 Z_HIGH_RANGE = (0.36, 0.55)
@@ -128,11 +129,64 @@ collision_config = CollisionConfig(
     hand_extension_below_eef=0.076,
     hand_safe_margin=0.03,
 )
-# 向后兼容别名（test_motion_planning_sim.py 内大量引用这些旧名，逐步迁移）
-DESK_SAFE_Z = collision_config.desk_safe_z
+# ── 统一碰撞模型（CollisionModel FCL 替代 DESK_SAFE_Z + FingertipDeskSafety）──
+# 不再使用 EEF 级固定阈值或 FK 指尖 Z 检测。
+# CollisionModel 支持 19-DOF 全模型 + table box obstacle 的 mesh 级碰撞检测。
+_env_cm: "CollisionModel | None" = None  # set by main()
 
-# 手部随机化配置
-RANDOMIZE_HAND = False          # 是否随机化手部关节（测试不同手型下的桌面碰撞）
+def _get_cm() -> CollisionModel:
+    assert _env_cm is not None, "CollisionModel not initialized — call main() first"
+    return _env_cm
+
+
+# ═══════════════════════════════════════════════ CollisionModel 桌面碰撞 wrapper
+# 以下函数保持原有签名（兼容所有调用者），内部委托给 CollisionModel FCL。
+
+def check_path_desk_safety(
+    _planner, path: np.ndarray, step_rad: float = 0.02,
+) -> tuple[bool, float, int]:
+    """Check env collision along arm path using CollisionModel FCL (replaces FK Z)."""
+    cm = _get_cm()
+    path_arm = path[:, :7] if path.ndim == 2 and path.shape[1] > 7 else path
+    for i in range(len(path_arm) - 1):
+        if not cm.check_segment_env_collision_free(path_arm[i], path_arm[i + 1], step_rad):
+            return False, 0.0, i
+    return True, float("inf"), -1
+
+
+def check_hand_desk_clearance(
+    _planner, qpos: np.ndarray,
+) -> tuple[bool, float, str]:
+    """Check env collision at single qpos using CollisionModel FCL (replaces FK Z)."""
+    cm = _get_cm()
+    q = np.asarray(qpos, dtype=np.float64)
+    in_collision = cm.check_env_collision(q)
+    return not in_collision, 0.0, "fcl" if in_collision else "ok"
+
+
+def check_hand_desk_clearance_sim(sim: SimRobotInterface) -> tuple[bool, float, str]:
+    """Sim FK → CollisionModel: check current sim arm qpos against table.
+
+    Uses planner's 7-DOF CollisionModel (collision URDF, hand fixed at home).
+    Home hand (open, max extension) is the most conservative check.
+    """
+    cm = _get_cm()
+    arm = sim.get_full_qpos()[:7]  # planner cm is 7-DOF
+    in_collision = cm.check_env_collision(arm)
+    return not in_collision, 0.0, "fcl" if in_collision else "ok"
+
+
+def check_path_desk_safety_sim(
+    _sim, arm_path: np.ndarray, step_rad: float = 0.02,
+) -> tuple[bool, float, int]:
+    """CollisionModel segment check using current sim hand (replaces FK Z)."""
+    cm = _get_cm()
+    path_arm = arm_path[:, :7] if arm_path.ndim == 2 and arm_path.shape[1] > 7 else arm_path
+    for i in range(len(path_arm) - 1):
+        if not cm.check_segment_env_collision_free(path_arm[i], path_arm[i + 1], step_rad):
+            return False, 0.0, i
+    return True, float("inf"), -1
+RANDOMIZE_HAND = True           # 是否随机化手部关节（默认开启，测试不同手型下的桌面碰撞）
 HAND_RANDOM_RANGE_DEG = 30.0    # 手部关节随机范围 ±30°（相对 home=0°）
 NUM_HAND_JOINTS = 12            # 手部 DOF（xhand_right.urdf 中 12 个 revolute 关节）
 
@@ -198,24 +252,29 @@ TEST_DESK_Z_RANGE = (0.02, 0.18)  # 桌面附近 Z 范围
 TEST_DESK_X_RANGE = (0.28, 0.70)
 TEST_DESK_Y_RANGE = (-0.35, 0.35)
 
-# 分层采样区域（Z低区重点覆盖：穿桌高风险区分配更多区域）
+# 分层采样区域（Z低区重点覆盖：超低/很低/低 三档共 9 个子区域 vs 原来的 6 个）
 STRATIFIED_REGIONS = [
     # (label, x_range, y_range, z_range, weight)
-    # ── Z 低区 [0.02, 0.20]：重点覆盖（权重 ×4），共 6 个子区域 ──
-    ("near_low_a",   (0.28, 0.40), (-0.30, 0.30), (0.02, 0.10), 4.0),
-    ("near_low_b",   (0.28, 0.40), (-0.30, 0.30), (0.10, 0.20), 4.0),
-    ("mid_low_a",    (0.40, 0.55), (-0.40, 0.40), (0.02, 0.10), 4.0),
-    ("mid_low_b",    (0.40, 0.55), (-0.40, 0.40), (0.10, 0.20), 4.0),
-    ("far_low_a",    (0.55, 0.70), (-0.40, 0.40), (0.02, 0.10), 4.0),
-    ("far_low_b",    (0.55, 0.70), (-0.40, 0.40), (0.10, 0.20), 4.0),
+    # ── Z 超低区 [0.02, 0.06]：紧贴桌面，极高风险（权重 ×6）──
+    ("ultra_low_a",   (0.28, 0.40), (-0.30, 0.30), (0.02, 0.06), 6.0),
+    ("ultra_low_b",   (0.40, 0.55), (-0.40, 0.40), (0.02, 0.06), 6.0),
+    ("ultra_low_c",   (0.55, 0.70), (-0.40, 0.40), (0.02, 0.06), 6.0),
+    # ── Z 很低区 [0.06, 0.12]：高风险（权重 ×5）──
+    ("very_low_a",    (0.28, 0.40), (-0.30, 0.30), (0.06, 0.12), 5.0),
+    ("very_low_b",    (0.40, 0.55), (-0.40, 0.40), (0.06, 0.12), 5.0),
+    ("very_low_c",    (0.55, 0.70), (-0.40, 0.40), (0.06, 0.12), 5.0),
+    # ── Z 低区 [0.12, 0.20]：中等风险（权重 ×4）──
+    ("low_a",         (0.28, 0.40), (-0.30, 0.30), (0.12, 0.20), 4.0),
+    ("low_b",         (0.40, 0.55), (-0.40, 0.40), (0.12, 0.20), 4.0),
+    ("low_c",         (0.55, 0.70), (-0.40, 0.40), (0.12, 0.20), 4.0),
     # ── Z 中区 [0.20, 0.36]：正常操作区 ──
-    ("near_mid",     (0.28, 0.40), (-0.30, 0.30), (0.20, 0.36), 1.0),
-    ("mid_mid",      (0.40, 0.55), (-0.40, 0.40), (0.20, 0.36), 1.0),
-    ("far_mid",      (0.55, 0.70), (-0.40, 0.40), (0.20, 0.36), 1.0),
+    ("near_mid",      (0.28, 0.40), (-0.30, 0.30), (0.20, 0.36), 1.0),
+    ("mid_mid",       (0.40, 0.55), (-0.40, 0.40), (0.20, 0.36), 1.0),
+    ("far_mid",       (0.55, 0.70), (-0.40, 0.40), (0.20, 0.36), 1.0),
     # ── Z 高区 [0.36, 0.55]：安全区 ──
-    ("near_high",    (0.28, 0.40), (-0.30, 0.30), (0.36, 0.55), 0.5),
-    ("mid_high",     (0.40, 0.55), (-0.40, 0.40), (0.36, 0.55), 0.5),
-    ("far_high",     (0.55, 0.70), (-0.40, 0.40), (0.36, 0.55), 0.5),
+    ("near_high",     (0.28, 0.40), (-0.30, 0.30), (0.36, 0.55), 0.5),
+    ("mid_high",      (0.40, 0.55), (-0.40, 0.40), (0.36, 0.55), 0.5),
+    ("far_high",      (0.55, 0.70), (-0.40, 0.40), (0.36, 0.55), 0.5),
 ]
 
 PHYSICS_STEPS_PER_WP = 20
@@ -351,8 +410,8 @@ def _safe_two_step_home(
     hand_qpos = sim.get_full_qpos()[7:].copy()
     current_pose = planner.compute_eef_pose_world(current_qpos)
 
-    # Step A: Lift Z to at least desk_safe level
-    safe_z = max(collision_config.desk_safe_z + 0.05, current_pose.p[2] + _DIRECT_LIFT_Z_M)
+    # Step A: Lift Z to safe level above table
+    safe_z = max(TABLE_TOP_Z + 0.15, current_pose.p[2] + _DIRECT_LIFT_Z_M)
     safe_z = min(safe_z, 0.55)  # clamp to workspace ceiling
     lift_pose = Pose(
         p=np.array([current_pose.p[0], current_pose.p[1], safe_z], dtype=np.float64),
@@ -557,6 +616,8 @@ def return_to_home_sim(
     if not np.all(np.isfinite(current_qpos)):
         print("  [return_to_home_sim] Invalid qpos, falling back to animated reset")
         animated_reset_to_home(sim, home_qpos, viewer)
+        smooth_drive_to_target(sim, np.concatenate([home_qpos, np.zeros(NUM_HAND_JOINTS)]),
+                               viewer, max_iter=60, label="hand_home_fallback")
         final_qpos = sim.get_full_qpos()[:7]
         err = float(np.rad2deg(np.max(np.abs(final_qpos - home_qpos))))
         return {"success": err < _RESIDUAL_ERROR_MAX_DEG, "phase1_completed": False,
@@ -565,7 +626,10 @@ def return_to_home_sim(
 
     # Already at home?
     if float(np.max(np.abs(current_qpos - home_qpos))) < _HOME_JOINT_THRESHOLD_RAD:
-        print("  [return_to_home_sim] Already at home")
+        # Arm already home — still restore hand to zero
+        smooth_drive_to_target(sim, np.concatenate([home_qpos, np.zeros(NUM_HAND_JOINTS)]),
+                               viewer, max_iter=60, label="hand_home_already")
+        print("  [return_to_home_sim] Already at home (hand restored)")
         return {"success": True, "phase1_completed": False, "phase2_executed": False,
                 "lift_used": False, "final_err_deg": 0.0, "final_pos_err_mm": 0.0}
 
@@ -682,7 +746,15 @@ def return_to_home_sim(
     # fall back to 2-step safe path (lift Z → joint space to home)
     settle_err_rad = animated_reset_to_home(sim, home_qpos, viewer, planner=planner)
 
+    # ── Restore hand to home (zero) position ──
+    # Use smooth_drive_to_target (checks full 19-DOF convergence) instead of
+    # settle_at_target (arm-only check) so the hand actually reaches zero.
+    smooth_drive_to_target(sim, np.concatenate([home_qpos, np.zeros(NUM_HAND_JOINTS)]),
+                           viewer, max_iter=60, label="hand_home")
+
     final_qpos = sim.get_full_qpos()[:7]
+    final_hand = sim.get_full_qpos()[7:]
+    hand_err_deg = float(np.rad2deg(np.max(np.abs(final_hand))))
     err_rad = float(np.max(np.abs(final_qpos - home_qpos)))
     err_deg = float(np.rad2deg(err_rad))
     final_eef = planner.compute_eef_pose_world(final_qpos)
@@ -694,156 +766,11 @@ def return_to_home_sim(
                 "phase2_executed": phase2_executed, "lift_used": not phase1_completed,
                 "final_err_deg": err_deg, "final_pos_err_mm": pos_err_mm}
 
-    print(f"  [return_to_home_sim] CONVERGED: err={err_deg:.2f}deg  pos={pos_err_mm:.1f}mm")
+    print(f"  [return_to_home_sim] CONVERGED: err={err_deg:.2f}deg  pos={pos_err_mm:.1f}mm  "
+          f"hand={hand_err_deg:.1f}deg")
     return {"success": True, "phase1_completed": phase1_completed,
             "phase2_executed": phase2_executed, "lift_used": not phase1_completed,
             "final_err_deg": err_deg, "final_pos_err_mm": pos_err_mm}
-
-
-# ═══════════════════════════════════════════════ 桌面碰撞检测（FK 手部几何 Z 检测）
-
-# 不使用 MPlib 全局点云（污染 IK solver）。改用 Pinocchio FK 直接计算
-# 五指指尖的世界坐标，检查最低指尖 Z 是否高于桌面。比 EEF Z 检测更精确。
-# SAPIEN 物理桌面仍提供物理碰撞反馈。
-
-# 指尖 link ID 信息现在由 CollisionConfig 统一管理。
-
-
-def _min_fingertip_z(planner: XArm7MotionPlanner, qpos: np.ndarray) -> tuple[float, str]:
-    """计算给定 arm 构型下五指指尖的最低 world Z 坐标（委托给 planner.desk_safety）。"""
-    if planner.desk_safety is not None:
-        return planner.desk_safety.min_fingertip_z(qpos)
-    # Fallback (should not happen when collision config is set)
-    return float("inf"), ""
-
-
-def check_eef_desk_clearance(
-    planner: XArm7MotionPlanner, qpos: np.ndarray,
-) -> tuple[bool, float]:
-    """检查给定构型下 EEF 是否在桌面之上安全高度（委托给 CollisionConfig）。"""
-    eef_pose = planner.compute_eef_pose_world(qpos)
-    eef_z = float(eef_pose.p[2])
-    return eef_z >= DESK_SAFE_Z, eef_z
-
-
-def check_hand_desk_clearance(
-    planner: XArm7MotionPlanner, qpos: np.ndarray,
-) -> tuple[bool, float, str]:
-    """检查给定构型下手指是否在桌面之上（委托给 planner.desk_safety）。"""
-    if planner.desk_safety is not None:
-        return planner.desk_safety.check_hand_desk_clearance(qpos)
-    # Fallback: EEF-level check
-    eef_pose = planner.compute_eef_pose_world(qpos)
-    eef_z = float(eef_pose.p[2])
-    return eef_z >= DESK_SAFE_Z, eef_z, "eef_only"
-
-
-def check_path_desk_safety(
-    planner: XArm7MotionPlanner, path: np.ndarray, step_rad: float = 0.05,
-) -> tuple[bool, float, int]:
-    """FK 手指桌面安全检查：沿关节路径密集采样（委托给 planner.desk_safety）。
-
-    Returns: (safe, min_fingertip_z, first_violation_index)
-    """
-    if planner.desk_safety is not None:
-        return planner.desk_safety.check_path_desk_safety(path, step_rad)
-    # Fallback: simple EEF Z check (coarse)
-    fingertip_threshold = collision_config.fingertip_threshold
-    path_arm = path[:, :7] if path.ndim == 2 and path.shape[1] > 7 else path
-    min_z = float("inf")
-    for i in range(len(path_arm)):
-        eef_z = float(planner.compute_eef_pose_world(path_arm[i]).p[2])
-        if eef_z < min_z:
-            min_z = eef_z
-        if eef_z <= fingertip_threshold:
-            return False, min_z, i
-    return True, min_z, -1
-
-
-# ═══════════════════════════════════════════════ Sim FK 碰撞检测（支持手部随机化）
-
-# planner FK（固定手型）用于规划阶段的快速预检，sim FK（实际手型）
-# 用于执行后的精确碰撞检测。当 RANDOMIZE_HAND=True 时，路径规划使用
-# 固定手型的 planner FK 做预检（保守估计），sim FK 做最终确认。
-
-
-def _min_fingertip_z_sim(sim: SimRobotInterface) -> tuple[float, str]:
-    """使用 sim 的 SAPIEN Pinocchio FK 计算五指指尖最低 world Z。
-
-    与 _min_fingertip_z(planner, qpos) 不同，此函数使用 sim 的实际手部
-    关节角（支持手部随机化），而非 collision URDF 的固定手型。
-    """
-    full_qpos = sim.get_full_qpos()  # (19,) arm(7) + hand(12)
-    names = sim.robot.fingertip_link_names
-    tips = sim.robot.forward_kinematics(full_qpos, target_link_names=names)  # (5,7)
-    min_z = float("inf")
-    min_name = ""
-    for i, name in enumerate(names):
-        z = float(tips[i, 2])
-        if z < min_z:
-            min_z = z
-            min_name = name.split("right_hand_")[-1]
-    return min_z, min_name
-
-
-_SIM_FK_EPSILON = 0.001  # FK 浮点比较容差（1mm）
-
-
-def check_hand_desk_clearance_sim(sim: SimRobotInterface) -> tuple[bool, float, str]:
-    """Sim FK 版本的手指桌面碰撞检查（支持手部随机化）。
-
-    使用 sim 的实际手部关节角计算指尖位置，比 planner FK 更精确。
-    """
-    min_z, min_name = _min_fingertip_z_sim(sim)
-    safe = min_z > collision_config.fingertip_threshold - _SIM_FK_EPSILON
-    return safe, min_z, min_name
-
-
-def check_path_desk_safety_sim(
-    sim: SimRobotInterface,
-    arm_path: np.ndarray,
-    step_rad: float = 0.05,
-) -> tuple[bool, float, int]:
-    """Sim FK 版本的路径桌面安全检查（支持手部随机化）。
-
-    对于 arm-only 路径 (N,7)，用当前 sim 手部关节角拼接完整 qpos，
-    通过 SAPIEN Pinocchio FK 计算每个采样点的指尖位置。
-
-    Returns: (safe, min_fingertip_z, first_violation_index)
-    """
-    if arm_path.ndim != 2 or arm_path.shape[1] > 7:
-        arm_path = arm_path[:, :7]
-
-    hand_qpos = sim.get_full_qpos()[7:].copy()
-    fingertip_threshold = collision_config.fingertip_threshold - _SIM_FK_EPSILON
-    names = sim.robot.fingertip_link_names
-
-    min_z = float("inf")
-    min_name = ""
-
-    for i in range(len(arm_path) - 1):
-        a, b = arm_path[i], arm_path[i + 1]
-        dist = float(np.max(np.abs(b - a)))
-        n = max(1, int(np.ceil(dist / step_rad)))
-        for k in range(n + 1):
-            alpha = k / max(n, 1)
-            q = a + alpha * (b - a)
-            full = np.concatenate([q, hand_qpos])
-            tips = sim.robot.forward_kinematics(full, target_link_names=names)
-            for tip_idx, name in enumerate(names):
-                z = float(tips[tip_idx, 2])
-                if z < min_z:
-                    min_z = z
-                    min_name = name.split("right_hand_")[-1]
-                if z <= fingertip_threshold:
-                    # Compute EEF Z for diagnostic
-                    eef = sim.robot.forward_kinematics(full, target_link_names=["custom_eef_link"])
-                    eef_z = float(eef[0, 2])
-                    print(f"  [desk_safety_sim] {name.split('right_hand_')[-1]}={z:.3f}m "
-                          f"≤ {fingertip_threshold:.3f}m "
-                          f"(segment {i}, α={alpha:.2f}, EEF_z={eef_z:.3f}m)")
-                    return False, min_z, i
-    return True, min_z, -1
 
 
 def hand_randomize(rng: np.random.RandomState | None = None) -> np.ndarray:
@@ -977,7 +904,7 @@ def plan_safe_descent(
     hand_qpos = sim.get_full_qpos()[7:].copy()
 
     # Stage 1: plan to waypoint above target (same XY, safe Z)
-    safe_z = max(DESK_SAFE_Z + 0.02, target_eef.p[2] + collision_config.hand_extension_below_eef + collision_config.hand_safe_margin + 0.03)
+    safe_z = max(target_eef.p[2] + 0.10, TABLE_TOP_Z + collision_config.hand_safe_margin + 0.05)
     safe_z = min(safe_z, 0.55)
     above_pose = Pose(
         p=np.array([target_eef.p[0], target_eef.p[1], safe_z], dtype=np.float64),
@@ -1082,28 +1009,20 @@ def plan_and_execute(
     used_safe_descent = False
 
     if not desk_safe:
-        # ── 对低 Z 目标尝试安全下降（模拟真机遥操作）──
-        if target_eef.p[2] < DESK_SAFE_Z:
-            print(f"  [{label}] 🔽 screw path unsafe → trying safe descent")
-            descent_path, descent_desc = plan_safe_descent(planner, sim, target_eef, viewer)
-            if descent_path is not None:
-                print(f"  [{label}] ✅ safe descent: {descent_desc}")
-                path = descent_path
-                used_safe_descent = True
-                desk_safe = True  # override: path is now safe
+        # ── 路径有桌面碰撞 → 尝试安全下降（模拟真机遥操作）──
+        print(f"  [{label}] 🔽 path has env collision → trying safe descent")
+        descent_path, descent_desc = plan_safe_descent(planner, sim, target_eef, viewer)
+        if descent_path is not None:
+            print(f"  [{label}] ✅ safe descent: {descent_desc}")
+            path = descent_path
+            used_safe_descent = True
+            desk_safe = True  # override: path is now safe
 
         if not desk_safe and not check_desk_with_sim:
-            # Planner FK says unsafe AND we're not doing sim FK override → reject
-            wp0_eef = planner.compute_eef_pose_world(path[0])
-            fingertip_threshold = collision_config.fingertip_threshold
-            print(f"  [{label}] ❌ DESK COLLISION (planner FK): fingertip z_min={min_z:.3f}m "
-                  f"< safe={fingertip_threshold:.3f}m (waypoint {viol_idx})")
-            print(f"  [{label}]     path shape={path.shape}  wp0_eef_z={wp0_eef.p[2]:.3f}m  "
-                  f"DESK_SAFE_Z(EEF)={DESK_SAFE_Z:.3f}m")
+            print(f"  [{label}] ❌ DESK COLLISION (CollisionModel FCL): waypoint {viol_idx}")
             return False
         elif not desk_safe:
-            # Planner FK says unsafe but we'll verify with sim FK after execution
-            print(f"  [{label}] ⚠️  planner FK预检不安全 → 执行后用 sim FK 确认")
+            print(f"  [{label}] ⚠️  CollisionModel预检不安全 → 执行后用 sim FK 确认")
 
     if not used_safe_descent:
         if joint_goal is not None:
@@ -1122,15 +1041,12 @@ def plan_and_execute(
     if used_safe_descent:
         # safe_descent already executed the path; need tips_before for drift check
         tips_before = check_fingertips(sim)
-    # ── Sim FK 桌面碰撞确认（用于手部随机化场景）──
+    # ── CollisionModel 桌面碰撞确认（用于手部随机化场景）──
     desk_ok = True
     if check_desk_with_sim:
-        # 对执行后的实际路径做 sim FK 碰撞检测（考虑实际手型）
-        sim_desk_safe, sim_z, sim_viol = check_path_desk_safety_sim(sim, path)
+        sim_desk_safe, _sim_z, sim_viol = check_path_desk_safety_sim(sim, path)
         if not sim_desk_safe:
-            fingertip_threshold = collision_config.fingertip_threshold
-            print(f"  [{label}] ❌ DESK COLLISION (sim FK): fingertip z_min={sim_z:.3f}m "
-                  f"< safe={fingertip_threshold:.3f}m (waypoint {sim_viol})")
+            print(f"  [{label}] ❌ DESK COLLISION (CollisionModel FCL): waypoint {sim_viol}")
             desk_ok = False
 
     # 验证
@@ -1340,7 +1256,7 @@ def _run_desk_test(
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
             workspace_bounds=np.array([[0.0, 0.75], [-0.5, 0.5], [0.0, 0.6]], dtype=np.float64),
             collision=collision_cfg,
@@ -1409,10 +1325,9 @@ def _run_desk_test(
 
         settle_at_target(sim, path[-1, :7], hand)
 
-        # Sim FK desk check
-        _, min_z, _ = check_hand_desk_clearance_sim(sim)
-        fingertip_threshold = collision_cfg.fingertip_threshold
-        if min_z <= fingertip_threshold - _SIM_FK_EPSILON:
+        # CollisionModel desk check
+        desk_safe, _, _ = check_hand_desk_clearance_sim(sim)
+        if not desk_safe:
             desk_collisions += 1
             continue
 
@@ -1491,13 +1406,16 @@ def main():
     import argparse
     p = argparse.ArgumentParser(description="Workspace 路径规划仿真测试")
     p.add_argument("--comprehensive", action="store_true",
-                   help=f"全面模式：{COMPREHENSIVE_NUM_SAMPLES} 采样点 "
-                        f"(含分层采样) + {COMPREHENSIVE_NUM_IK} IK 采样")
+                   help=f"（已废弃：现为默认行为，保留向后兼容）"
+                        f"{NUM_SAMPLES} 采样点(分层) + {NUM_IK_SAMPLES} IK 采样")
     p.add_argument("--test-desk", action="store_true",
                    help="桌面碰撞专项测试：聚焦 Z∈[0.02,0.18] 区域，关闭 EEF 预过滤，"
                         "手部随机化，用 sim FK 精确检测手指穿桌")
     p.add_argument("--randomize-hand", action="store_true",
-                   help=f"手部关节随机化 (±{HAND_RANDOM_RANGE_DEG}°)，测试不同手型下的桌面碰撞")
+                   help=f"手部关节随机化（默认已开启，±{HAND_RANDOM_RANGE_DEG}°），"
+                        "使用 --no-randomize-hand 关闭")
+    p.add_argument("--no-randomize-hand", action="store_true",
+                   help="关闭手部随机化（使用 home=0° 固定手型）")
     p.add_argument("--optimize-z-min", action="store_true",
                    help="网格搜索最优 hand_safe_margin（需与 --test-desk 联用），"
                         "输出安全性与可达性 trade-off 表格")
@@ -1509,14 +1427,14 @@ def main():
     p.add_argument("--seed", type=int, default=SEED, help="随机种子")
     args = p.parse_args()
 
-    num_samples = 5 if args.ci else (COMPREHENSIVE_NUM_SAMPLES if args.comprehensive else NUM_SAMPLES)
-    num_ik = 20 if args.ci else (COMPREHENSIVE_NUM_IK if args.comprehensive else NUM_IK_SAMPLES)
+    num_samples = 5 if args.ci else NUM_SAMPLES
+    num_ik = 20 if args.ci else NUM_IK_SAMPLES
     seed = args.seed
     headless = HEADLESS or args.headless or args.ci
 
     # 桌面碰撞专项模式
     test_desk = args.test_desk
-    randomize_hand = args.randomize_hand or test_desk  # test-desk 强制手部随机化
+    randomize_hand = not args.no_randomize_hand  # 默认开启，--no-randomize-hand 关闭
 
     # --optimize-z-min: run grid search and exit
     if args.optimize_z_min:
@@ -1548,12 +1466,11 @@ def main():
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_mplib.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
             # Workspace bounds for _lift_eef_z_safe (mirrors RobotInterface)
             workspace_bounds=np.array([[0.0, 0.75], [-0.5, 0.5], [0.0, 0.6]], dtype=np.float64),
-            # Unified collision config (geometric FK desk safety)
-            collision=collision_config,
+            # collision= not set — CollisionModel handles env collision, FingertipDeskSafety not needed
         ),
         planning_profile=PlanningProfile(
             max_waypoint_delta_deg=360.0,
@@ -1563,6 +1480,7 @@ def main():
             rrt_time_limit=2.0,
             num_rrt_attempts=2,
             random_seed=seed,
+            check_env_collision=False,  # CollisionModel handles env collision
         ),
         teleop_profile=TeleopProfile(
             check_self_collision=True,
@@ -1577,25 +1495,37 @@ def main():
     assert float(np.linalg.norm(home_eef.p - np.array(sim.robot.eef_home_pose.p))) < 1e-6
 
     # ── 桌面碰撞保护 ──
-    # 不使用 MPlib 全局点云（会污染 IK/planning，使成功率从 100% 跌到 53%）。
-    # 改用几何 Z 检测 + SAPIEN 物理桌面（与真机 WorkspaceSafety 方式一致）。
-    # planner.planning_profile.check_env_collision 保持 False（默认）。
-    # DESK_SAFE_Z = 0.106m 是 EEF 级保守预过滤，真实碰撞检测使用指尖 FK。
-    # Apply collision_config override for --with-objects mode
+    # 使用 planner 的同款 CollisionModel（7-DOF collision URDF，与 planner 同一坐标系）。
+    # 手部固定在 home 位姿（张开，最大延伸），是最保守的碰撞检测。
+    # 不再使用 EEF 级 DESK_SAFE_Z 或 FK 指尖 Z 检测。
     if args.with_objects and test_desk:
-        print("  Objects mode: EEF pre-filter OFF, desk safety via FK fingertip Z check")
+        print("  Objects mode: desk safety via CollisionModel FCL")
 
-    reject_below = not test_desk  # test-desk 模式关闭预过滤
-    print(f"Desk safety: SAPIEN physics + Z guard (DESK_SAFE_Z={DESK_SAFE_Z:.3f}m, "
-          f"fingertip_safe={collision_config.fingertip_threshold:.3f}m)")
+    # 将 table obstacle 注册到 planner 的 CollisionModel（共享坐标系）
+    table_world = np.array([TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z], dtype=np.float64)
+    table_in_urdf = root_pose.inv() * sapien.Pose(table_world)
+    global _env_cm
+    _env_cm = planner.collision_model
+    _env_cm.add_table(
+        table_height=float(table_in_urdf.p[2]),
+        x_center=float(table_in_urdf.p[0]),
+        half_x=TABLE_HALF[0],
+        half_y=TABLE_HALF[1],
+        half_z=TABLE_HALF[2],
+    )
+
+    reject_below = not test_desk
+    reject_below_z = TABLE_TOP_Z + 0.01  # 仅过滤物理上低于桌面的目标
+    print(f"Desk safety: CollisionModel FCL (19-DOF + table box)  "
+          f"fingertip_safe={collision_config.fingertip_threshold:.3f}m  "
+          f"reject_below={reject_below_z:.3f}m")
     print(f"  Table: X∈[{TABLE_CENTER[0]-TABLE_HALF[0]:.1f}, {TABLE_CENTER[0]+TABLE_HALF[0]:.1f}]  "
           f"Y∈[{TABLE_CENTER[1]-TABLE_HALF[1]:.1f}, {TABLE_CENTER[1]+TABLE_HALF[1]:.1f}]  "
           f"z_top={TABLE_TOP_Z:.1f}")
     print(f"  Hand extension: pinky_tip={collision_config.hand_extension_below_eef*1000:.0f}mm below EEF (home hand)")
     if test_desk:
-        print(f"  Mode: DESK TEST — EEF pre-filter OFF, hand randomized ±{HAND_RANDOM_RANGE_DEG}°, sim FK verify")
-    elif randomize_hand:
-        print(f"  Hand: randomized ±{HAND_RANDOM_RANGE_DEG}°")
+        print(f"  Mode: DESK TEST — EEF pre-filter OFF, sim FK verify")
+    print(f"  Hand: {'randomized ±' + str(HAND_RANDOM_RANGE_DEG) + '° (6 grasp types)' if randomize_hand else 'fixed (home=0°, --no-randomize-hand)'}")
 
     viewer = _setup_viewer(sim) if not headless else None
 
@@ -1627,8 +1557,8 @@ def main():
         ])
         z_low_pct = 100 * np.mean(target_positions[:, 2] <= Z_LOW_RANGE[1])
         sampling_mode = f"desk-test Z∈{TEST_DESK_Z_RANGE} (Z-low {z_low_pct:.0f}%)"
-    elif args.comprehensive:
-        # 分层加权采样：低 Z 区权重 ×4 分配更多采样点
+    else:
+        # 默认：分层加权采样（15 区域，低 Z 占 9/15 超低/很低/低三档梯度权重）
         region_weights = np.array([r[4] for r in STRATIFIED_REGIONS])
         region_weights /= region_weights.sum()
         region_counts = np.round(region_weights * num_samples).astype(int)
@@ -1660,16 +1590,6 @@ def main():
                                    (target_positions[:, 2] <= Z_LOW_RANGE[1]))
         sampling_mode = (f"stratified × {len(STRATIFIED_REGIONS)} regions "
                          f"(Z-low {z_low_pct:.0f}%)")
-    else:
-        # 默认模式：Z 偏置采样（低区权重 ×{Z_LOW_WEIGHT}）
-        target_positions = np.column_stack([
-            rng.uniform(*SAMPLE_X, num_samples),
-            rng.uniform(*SAMPLE_Y, num_samples),
-            sample_z_biased(rng, num_samples),
-        ])
-        z_low_pct = 100 * np.mean((target_positions[:, 2] >= Z_LOW_RANGE[0]) &
-                                   (target_positions[:, 2] <= Z_LOW_RANGE[1]))
-        sampling_mode = f"Z-biased (low weight ×{Z_LOW_WEIGHT:.0f}, Z-low {z_low_pct:.0f}%)"
 
     rot_info = f"  rot={ROT_MODE}"
     if ROT_MODE == "multi_axis":
@@ -1695,17 +1615,15 @@ def main():
             break
 
         # ── 桌面安全预过滤 ──
-        # DESK_SAFE_Z 是 EEF 级保守估计：home 手型下最低指尖比 EEF 低 7.6cm。
-        # 如果手部已随机化，手型可能更"收紧"（手指比 home 更靠上），
-        # EEF Z < DESK_SAFE_Z 不意味着一定碰撞 — 由 sim FK 做最终判定。
+        # 手部随机化后不再使用保守的 DESK_SAFE_Z（EEF 级 10.6cm），改用
+        # 指尖级阈值（桌面+1cm）。planner FK + sim FK 做真正的碰撞检测。
         # test-desk 模式关闭预过滤以允许测试低 Z 目标。
-        if reject_below and pos[2] < DESK_SAFE_Z:
+        if reject_below and pos[2] < reject_below_z:
             skipped_desk += 1
-            print(f"  [{i+1:2d}/{num_samples}] ⏭️  SKIP: z={pos[2]:.3f}m < DESK_SAFE_Z={DESK_SAFE_Z:.3f}m")
+            print(f"  [{i+1:2d}/{num_samples}] ⏭️  SKIP: z={pos[2]:.3f}m < reject_below={reject_below_z:.3f}m")
             continue
 
         # ── 手部随机化（抓取姿态，PD 平滑驱动）──
-        hand_note = ""
         hand_qpos = None
         grasp_type_name = ""
         if randomize_hand:
@@ -1714,48 +1632,33 @@ def main():
             # 通过 PD 控制器平滑驱动手部到随机目标位姿
             smooth_drive_to_target(sim, target_full, viewer, max_iter=40,
                                    label=f"grasp_{i+1}")
-            # Log hand fingertip Z and extension (BOTH from sim FK, same reference frame)
-            hand_safe, hand_min_z, hand_min_name = check_hand_desk_clearance_sim(sim)
-            eef_sim = sim.robot.forward_kinematics(sim.get_full_qpos(), target_link_names=["custom_eef_link"])
-            eef_z_sim = float(eef_sim[0, 2])
-            hand_ext = eef_z_sim - hand_min_z
-            hand_note = f" hand:{hand_min_name}={hand_min_z:.3f}m ext={hand_ext*1000:.0f}mm"
-            print(f"  [{i+1:2d}/{num_samples}] 🖐️  {grasp_type_name}: {hand_min_name}={hand_min_z:.3f}m "
-                  f"(ext={hand_ext*1000:.0f}mm) "
-                  f"({'OK' if hand_safe else '⚠️BELOW DESK'})")
+            _env_cm.set_hand_qpos(hand_qpos)  # 同步 CollisionModel 手部姿态
+            # Log hand safety
+            hand_safe, _, _ = check_hand_desk_clearance_sim(sim)
+            print(f"  [{i+1:2d}/{num_samples}] 🖐️  {grasp_type_name}: "
+                  f"{'OK' if hand_safe else '⚠️BELOW DESK'}")
 
-        # ── 起点安全检查（sim FK，考虑随机化手型）──
-        start_collision_type = ""  # "" | "start" | "path"
+        # ── 起点安全检查（CollisionModel FCL）──
         if randomize_hand:
-            start_safe, start_z, start_name = check_hand_desk_clearance_sim(sim)
+            start_safe, _, _ = check_hand_desk_clearance_sim(sim)
             if not start_safe:
-                # 多层抬升策略：
-                # Stage 1: 保持当前随机手型，抬升 EEF
-                # Stage 2: 如果仍不安全，手部回 home（延伸更小），抬升 EEF
+                # 两层抬升策略：Stage 1 保持手型抬升，Stage 2 手回 home 再抬升
                 start_unsafe_lifts += 1
-                current_arm = sim.get_full_qpos()[:7]
-                current_pose = planner.compute_eef_pose_world(current_arm)
                 lift_success = False
+                _SAFE_LIFT_Z = TABLE_TOP_Z + 0.15  # 安全抬升目标（15cm 高于桌面）
 
                 for stage in range(2):
                     if stage == 1:
-                        # Stage 2: reset hand to home (7.6cm extension, minimal) via smooth PD
                         home_hand = np.zeros(NUM_HAND_JOINTS)
                         target_full = np.concatenate([sim.get_full_qpos()[:7], home_hand])
                         smooth_drive_to_target(sim, target_full, viewer, max_iter=30,
                                                label=f"hand_home_{i+1}")
-                        hand_qpos = home_hand  # update for later use
+                        hand_qpos = home_hand
+                        _env_cm.set_hand_qpos(home_hand)  # 同步 CollisionModel 手部姿态
 
-                    # Compute lift target: raise EEF Z to clear desk + hand extension
                     current_arm = sim.get_full_qpos()[:7]
                     current_pose = planner.compute_eef_pose_world(current_arm)
-                    _, hand_z, _ = check_hand_desk_clearance_sim(sim)
-                    eef_sim = sim.robot.forward_kinematics(sim.get_full_qpos(), target_link_names=["custom_eef_link"])
-                    eef_z = float(eef_sim[0, 2])
-                    hand_ext = eef_z - hand_z
-                    # Need EEF high enough: eef_z > TABLE_TOP_Z + margin + hand_ext + extra
-                    target_eef_z = collision_config.fingertip_threshold + hand_ext + 0.03
-                    target_eef_z = max(target_eef_z, current_pose.p[2] + _DIRECT_LIFT_Z_M)
+                    target_eef_z = max(current_pose.p[2] + _DIRECT_LIFT_Z_M, _SAFE_LIFT_Z)
                     target_eef_z = min(target_eef_z, 0.55)
 
                     lift_pose = Pose(
@@ -1764,33 +1667,28 @@ def main():
                     )
                     stage_tag = f"S{stage+1}" + ("(home_hand)" if stage == 1 else "")
 
-                    # Try teleop IK first (fast, for small lifts)
                     lift_ik = planner.solve_teleop_ik(lift_pose, current_arm, current_arm)
                     if lift_ik.success and lift_ik.qpos is not None:
-                        # Smooth PD-driven lift (arm + hand)
                         target_full = np.concatenate([lift_ik.qpos, hand_qpos])
                         smooth_drive_to_target(sim, target_full, viewer, max_iter=40,
                                                label=f"lift_{i+1}_{stage_tag}")
-                        _, lift_z, lift_name = check_hand_desk_clearance_sim(sim)
-                        lifted_eef_z = float(planner.compute_eef_pose_world(lift_ik.qpos).p[2])
-                        if lift_z > collision_config.fingertip_threshold:
-                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} OK: "
-                                  f"EEF z={lifted_eef_z:.3f}m, {lift_name}={lift_z:.3f}m")
+                        lift_safe, _, _ = check_hand_desk_clearance_sim(sim)
+                        if lift_safe:
+                            eef_z = float(planner.compute_eef_pose_world(lift_ik.qpos).p[2])
+                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} OK "
+                                  f"(EEF z={eef_z:.3f}m)")
                             lift_success = True
                             break
                         else:
-                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag}: "
-                                  f"EEF z={lifted_eef_z:.3f}m, {lift_name}={lift_z:.3f}m (STILL LOW, "
-                                  f"need ext<{lifted_eef_z - collision_config.table_z_world - collision_config.hand_safe_margin:.3f}m)")
-                        continue  # try next stage if still low
+                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} "
+                                  f"STILL IN COLLISION")
+                        continue
                     else:
-                        # Teleop IK rejected (jump too large) → try plan_path for multi-waypoint lift
                         try:
                             plan_result = planner.plan_path(lift_pose, current_arm)
                         except RuntimeError:
                             plan_result = None
                         if plan_result is not None and plan_result.success and plan_result.qpos_path is not None:
-                            # Execute planned path waypoints
                             hand = hand_qpos
                             for wp in plan_result.qpos_path:
                                 if viewer is not None and viewer.closed:
@@ -1801,25 +1699,24 @@ def main():
                                 if viewer is not None:
                                     sim.scene.update_render()
                                     viewer.render()
-                            # Settle
                             settle_at_target(sim, plan_result.qpos_path[-1], hand,
                                              converge_threshold_rad=_PHASE1_CONVERGE_THRESHOLD_RAD)
-                            _, lift_z, lift_name = check_hand_desk_clearance_sim(sim)
-                            lifted_eef_z = float(planner.compute_eef_pose_world(plan_result.qpos_path[-1]).p[2])
-                            if lift_z > collision_config.fingertip_threshold:
-                                print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → plan_path lift {stage_tag} OK: "
-                                      f"EEF z={lifted_eef_z:.3f}m, {lift_name}={lift_z:.3f}m")
+                            lift_safe, _, _ = check_hand_desk_clearance_sim(sim)
+                            if lift_safe:
+                                eef_z = float(planner.compute_eef_pose_world(plan_result.qpos_path[-1]).p[2])
+                                print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → plan_path lift "
+                                      f"{stage_tag} OK (EEF z={eef_z:.3f}m)")
                                 lift_success = True
                                 break
                             else:
-                                print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → plan_path lift {stage_tag}: "
-                                      f"EEF z={lifted_eef_z:.3f}m, {lift_name}={lift_z:.3f}m (STILL LOW)")
+                                print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → plan_path lift "
+                                      f"{stage_tag} STILL IN COLLISION")
                                 continue
                         else:
                             reason = plan_result.reason if plan_result else "plan error"
                             print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} "
                                   f"plan_path FAILED: {reason}")
-                            continue  # try next stage
+                            continue
 
                 if not lift_success:
                     print(f"  [{i+1:2d}/{num_samples}] ⬆️  ALL lift stages FAILED — continuing with unsafe start")
@@ -1835,10 +1732,8 @@ def main():
         if ok:
             ok_count += 1
         elif randomize_hand:
-            # Determine failure type: start vs path collision
-            _, final_min_z, final_min_name = check_hand_desk_clearance_sim(sim)
-            fingertip_threshold = collision_config.fingertip_threshold
-            if final_min_z <= fingertip_threshold:
+            final_safe, _, _ = check_hand_desk_clearance_sim(sim)
+            if not final_safe:
                 desk_collisions += 1
         if marker:
             sim.scene.remove_actor(marker)

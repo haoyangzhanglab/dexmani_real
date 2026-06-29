@@ -1,4 +1,5 @@
 from .collision_config import CollisionConfig
+from .collision_model import CollisionModel
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
 from .desk_safety import FingertipDeskSafety
@@ -6,6 +7,8 @@ from .nullspace import apply_nullspace_optimization, joint_limit_gradient, nulls
 from .planner import XArm7MotionPlanner
 from .workspace_safety import WorkspaceSafety
 from .types import (
+    CollisionInfo,
+    CollisionPair,
     IKResult,
     PathResult,
     PlanningProfile,
@@ -16,6 +19,9 @@ from .types import (
 
 __all__ = [
     "CollisionConfig",
+    "CollisionInfo",
+    "CollisionModel",
+    "CollisionPair",
     "FingertipDeskSafety",
     "IKCandidateManager",
     "IKResult",
