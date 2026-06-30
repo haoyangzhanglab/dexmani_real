@@ -283,7 +283,7 @@ def main():
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
         ),
         planning_profile=PlanningProfile(
@@ -310,6 +310,19 @@ def main():
     sim.reset()
     for _ in range(5):
         sim._step_physics(n=10)
+
+    # 初始化碰撞模型手部姿态（消除 set_hand_qpos 未调用警告）
+    planner.collision_model.set_hand_qpos(sim.get_full_qpos()[7:])
+
+    # 注册桌面障碍物 — 匹配 SAPIEN 场景中 constructor.py 的 table actor
+    # (中心 [0.4, 0, -0.5], half_size [0.5, 1.0, 0.5] → 桌面顶部 z=0)
+    planner.collision_model.add_table(
+        table_height=0.0,
+        x_center=0.4,
+        half_x=0.5,
+        half_y=1.0,
+        half_z=0.04,
+    )
 
     # ── 2. Viewer ──
     viewer: sapien.Viewer | None = None
@@ -465,6 +478,10 @@ def main():
                     ik_fail_consecutive += 1
                     target_pos = np.asarray(sim_state["eef_pos"], dtype=np.float64).copy()
                     target_quat = np.asarray(sim_state["eef_quat_wxyz"], dtype=np.float64).copy()
+                    # Hold current position — don't keep driving toward the last
+                    # successful command that led into collision.
+                    arm_cmd = current_arm_qpos.copy()
+                    prev_arm_cmd = arm_cmd.copy()
                     ik_method = "held"
             else:
                 # Idle: hold current position via PD

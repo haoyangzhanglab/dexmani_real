@@ -441,7 +441,7 @@ def main() -> None:
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
         ),
         planning_profile=PlanningProfile(
@@ -467,6 +467,18 @@ def main() -> None:
     sim.reset()
     for _ in range(5):
         sim._step_physics(n=10)
+
+    # 初始化碰撞模型手部姿态（消除 set_hand_qpos 未调用警告）
+    planner.collision_model.set_hand_qpos(sim.get_full_qpos()[7:])
+
+    # 注册桌面障碍物 — 匹配 SAPIEN 场景中 constructor.py 的 table actor
+    planner.collision_model.add_table(
+        table_height=0.0,
+        x_center=0.4,
+        half_x=0.5,
+        half_y=1.0,
+        half_z=0.04,
+    )
 
     # ── VR Mapper 初始化 ──
     arm_mapper = ArmWristMapper(

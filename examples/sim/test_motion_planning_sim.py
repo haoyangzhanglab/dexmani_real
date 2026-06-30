@@ -1399,387 +1399,580 @@ def _spawn_table_objects(
     return actors
 
 
+
+# ═══════════════════════════════════════════════ Pick-and-Place 场景
+
+
+@dataclass
+class EpisodeResult:
+    """单次 Pick-and-Place episode 结果."""
+    episode: int = 0
+    success: bool = False
+    cube_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    cube_size: float = 0.05
+    total_holds: int = 0
+    collision_warnings: int = 0
+    duration_s: float = 0.0
+    failure_reason: str = ""
+    phases_completed: list[str] = field(default_factory=list)
+
+
+# ── 立方块生成区域 ──
+CUBE_X_RANGE = (0.35, 0.70)
+CUBE_Y_RANGE = (-0.30, 0.30)
+CUBE_SIZE_RANGE = (0.03, 0.08)      # 3-8 cm 正方块
+REGION_CENTER = np.array([0.525, 0.0], dtype=np.float64)  # 区域中心 XY
+
+# ── Pick-and-Place 运动参数 ──
+APPROACH_Z_OFFSET = 0.12      # 接近阶段：目标物体上方高度 (m)
+GRASP_Z_OFFSET = 0.01         # 抓取阶段：物体顶部上方间隙 (m)
+GRASP_Z_MIN = 0.12            # 抓取 EEF 最低 Z（避免手指穿透桌面）
+LIFT_Z_OFFSET = 0.15          # 抬起阶段：抓取后抬升高度 (m)
+PLACE_Z_OFFSET = 0.02         # 放置阶段：桌面/物体顶部上方间隙 (m)
+SAFE_RETURN_Z = 0.25          # 返回安全位置的高度 (m)
+
+# ── 碰撞 HOLD 参数 ──
+HOLD_DURATION_S = 0.15        # 碰撞检测到后的暂停时间
+MAX_CONSECUTIVE_HOLDS = 4     # 同一 waypoint 最大连续 hold 次数（超过则 skip）
+MAX_TOTAL_HOLDS = 20          # 单 episode 最大 hold 总次数（超过则 abort）
+
+# ── 手型选择 ──
+GRASP_TYPES_ALL = ["hook", "open"]  # 排除 pinch/power（拇指延伸致物理穿桌）
+
+
+def spawn_pick_cube(
+    sim: SimRobotInterface,
+    rng: np.random.RandomState,
+) -> dict:
+    """在桌面指定区域随机生成一个正方块（SAPIEN kinematic actor）。"""
+    half = float(rng.uniform(*CUBE_SIZE_RANGE)) / 2
+    cx = float(rng.uniform(*CUBE_X_RANGE))
+    cy = float(rng.uniform(*CUBE_Y_RANGE))
+    cz = TABLE_TOP_Z + half
+
+    color = tuple(float(x) for x in rng.uniform(0.1, 0.95, 3))
+
+    builder = sim.scene.create_actor_builder()
+    builder.add_box_visual(half_size=[half, half, half], material=color)
+    builder.add_box_collision(half_size=[half, half, half])
+    actor = builder.build_kinematic(name=f"pick_cube_{rng.randint(0, 9999)}")
+    actor.set_pose(sapien.Pose(p=[cx, cy, cz]))
+
+    return {
+        "actor": actor,
+        "half_size": half,
+        "center_pos": (cx, cy, cz),
+        "color": color,
+    }
+
+
+def execute_path_with_collision_hold(
+    sim: SimRobotInterface,
+    path_arm: np.ndarray,
+    cm: CollisionModel,
+    hand_qpos: np.ndarray,
+    viewer: sapien.Viewer | None = None,
+    *,
+    episode_idx: int = 0,
+    label: str = "",
+    cube_actor: sapien.Actor | None = None,
+    is_grasping: bool = False,
+    eef_to_cube_offset: np.ndarray | None = None,
+    check_env: bool | str = True,  # True=full HOLD, "warn"=env→warn-only, False=self-only
+) -> tuple[bool, int, int]:
+    """执行 arm 关节路径，逐 waypoint 碰撞检测 + HOLD 行为。
+
+    先检查再执行（与遥操作 HOLD 模式一致）：
+      1. cm.check_teleop_collision(wp) → 碰撞检测
+      2. 碰撞 → [HOLD] sleep → retry 同一 waypoint
+      3. 连续 > MAX_CONSECUTIVE_HOLDS → [SKIP]
+      4. 总计 > MAX_TOTAL_HOLDS → [ABORT]
+      5. 无碰撞 → execute + step_physics
+
+    Returns: (completed, total_holds, collision_warnings)
+    """
+    total_holds = 0
+    collision_warnings = 0
+    consecutive_holds = 0
+    wp_idx = 0
+
+    while wp_idx < len(path_arm):
+        wp = path_arm[wp_idx]
+
+        # ── 碰撞检测：先检查后执行 ──
+        # True: self+env → HOLD; "warn": self→HOLD, env→日志; False: self-only
+        if check_env is True:
+            has_self, has_env = cm.check_teleop_collision(wp)
+        elif check_env == "warn":
+            has_self = cm.check_self_collision(wp)
+            has_env = cm.check_env_collision(wp)  # Tier2 FCL, 比 Tier1 更精确
+        else:
+            has_self = cm.check_self_collision(wp)
+            has_env = False
+
+        if has_self or has_env:
+            parts = []
+            if has_self:
+                parts.append("self")
+            if has_env:
+                parts.append("env")
+            reason = "+".join(parts)
+            collision_warnings += 1
+
+            # ── warn 模式：仅 env → 日志警告，非阻塞 ──
+            if check_env == "warn" and has_env and not has_self:
+                print(f"  ⚠️  ep={episode_idx} {label} wp={wp_idx+1}/{len(path_arm)} "
+                      f"env near table (expected, non-blocking)")
+                collision_warnings -= 1  # 不计入 collision counter
+                consecutive_holds = 0
+                # 继续执行（fall through to execution below — 不 sleep/continue）
+
+            # ── self / strict env → HOLD ──
+            elif has_self or (check_env is True and has_env):
+                total_holds += 1
+                consecutive_holds += 1
+
+                print(f"  [HOLD] ep={episode_idx} {label} wp={wp_idx+1}/{len(path_arm)} "
+                      f"reason={reason:<6s} consecutive={consecutive_holds} total={total_holds}")
+
+                if total_holds > MAX_TOTAL_HOLDS:
+                    print(f"  [ABORT] ep={episode_idx} too many total holds "
+                          f"({total_holds} > {MAX_TOTAL_HOLDS}) during {label}")
+                    return False, total_holds, collision_warnings
+
+                if consecutive_holds > MAX_CONSECUTIVE_HOLDS:
+                    print(f"  [SKIP] ep={episode_idx} skipping wp {wp_idx+1} "
+                          f"after {consecutive_holds} consecutive holds")
+                    wp_idx += 1
+                    consecutive_holds = 0
+                    continue
+
+                time.sleep(HOLD_DURATION_S)
+                continue
+
+        # ── 无碰撞：执行 waypoint ──
+        consecutive_holds = 0
+        full_target = np.concatenate([wp, hand_qpos])
+        sim.robot.balance_passive_force()
+        sim.robot.apply_action(full_target)
+        sim._step_physics(n=PHYSICS_STEPS_PER_WP)
+
+        if is_grasping and cube_actor is not None:
+            eef_pose = sim.robot.get_eef_pose()
+            offset = eef_to_cube_offset if eef_to_cube_offset is not None else np.zeros(3)
+            cube_p = np.array(eef_pose.p) + offset
+            cube_actor.set_pose(sapien.Pose(p=cube_p))
+
+        if viewer is not None and wp_idx % 4 == 0:
+            sim.scene.update_render()
+            viewer.render()
+
+        wp_idx += 1
+
+    return True, total_holds, collision_warnings
+
+
+def pick_and_place_episode(
+    sim: SimRobotInterface,
+    planner: XArm7MotionPlanner,
+    cm: CollisionModel,
+    home_qpos: np.ndarray,
+    home_quat: np.ndarray,
+    cube_info: dict,
+    episode_idx: int,
+    viewer: sapien.Viewer | None = None,
+    rng: np.random.RandomState | None = None,
+) -> EpisodeResult:
+    """执行一次完整的 Pick-and-Place episode。
+
+    流程: APPROACH → DESCEND → GRASP → LIFT → TRANSPORT → PLACE → RELEASE → RETURN
+    """
+    t_start = time.perf_counter()
+    result = EpisodeResult(
+        episode=episode_idx,
+        cube_pos=cube_info["center_pos"],
+        cube_size=cube_info["half_size"] * 2,
+    )
+
+    cube_actor = cube_info["actor"]
+    cube_half = cube_info["half_size"]
+    cube_cx, cube_cy, cube_cz = cube_info["center_pos"]
+    cube_top_z = cube_cz + cube_half
+
+    # ── 选择手型（check 无碰撞才使用）──
+    arm_at_home = sim.get_full_qpos()[:7].copy()
+    grasp_hand_qpos: np.ndarray | None = None
+    grasp_type: str = "open"
+    for _ in range(10):
+        candidate_type = rng.choice(GRASP_TYPES_ALL) if rng else "hook"
+        candidate_qpos, _ = hand_grasp_pose(rng, grasp_type=candidate_type)
+        cm.set_hand_qpos(candidate_qpos)
+        has_self, has_env = cm.check_teleop_collision(arm_at_home)
+        if not has_self and not has_env:
+            grasp_hand_qpos = candidate_qpos
+            grasp_type = candidate_type
+            break
+    else:
+        grasp_hand_qpos = np.zeros(12, dtype=np.float64)
+        grasp_type = "open"
+        cm.set_hand_qpos(grasp_hand_qpos)
+        print(f"  ⚠️  All hand poses in collision at home, fallback to open-hand")
+
+    sim.robot.balance_passive_force()
+    sim.robot.apply_action(np.concatenate([arm_at_home, grasp_hand_qpos]))
+    sim._step_physics(n=5)
+    hand_qpos = grasp_hand_qpos.copy()
+
+    # ── 计算各阶段目标位姿（Z 钳位确保手指不穿桌面）──
+    grasp_z = max(cube_top_z + GRASP_Z_OFFSET, TABLE_TOP_Z + GRASP_Z_MIN)
+    approach_z = cube_top_z + APPROACH_Z_OFFSET
+
+    approach_pose = Pose(p=np.array([cube_cx, cube_cy, approach_z], dtype=np.float64), q=home_quat.copy())
+    grasp_pose = Pose(p=np.array([cube_cx, cube_cy, grasp_z], dtype=np.float64), q=home_quat.copy())
+    lift_pose = Pose(p=np.array([cube_cx, cube_cy, grasp_z + LIFT_Z_OFFSET], dtype=np.float64), q=home_quat.copy())
+    transport_pose = Pose(p=np.array([REGION_CENTER[0], REGION_CENTER[1], grasp_z + LIFT_Z_OFFSET], dtype=np.float64), q=home_quat.copy())
+    place_pose = Pose(p=np.array([REGION_CENTER[0], REGION_CENTER[1],
+                                  max(TABLE_TOP_Z + cube_half * 2 + PLACE_Z_OFFSET, TABLE_TOP_Z + GRASP_Z_MIN, 0.15)],
+                                 dtype=np.float64), q=home_quat.copy())
+
+    phases = [("approach", approach_pose), ("descend", grasp_pose),
+              ("lift+transport", transport_pose), ("place", place_pose)]
+
+    print(f"\n{'─'*55}")
+    print(f"  🎯 Episode {episode_idx+1}: cube=({cube_cx:.3f}, {cube_cy:.3f}, {cube_cz:.3f}) "
+          f"size={cube_half*2*100:.1f}cm  hand={grasp_type}")
+    print(f"{'─'*55}")
+
+    is_grasping = False
+    eef_to_cube_offset: np.ndarray | None = None
+    current_qpos = arm_at_home.copy()
+
+    # ── 闭合手型 (power grip): 低噪声确保视觉一致性 ──
+    close_hand_qpos, close_grasp_type = hand_grasp_pose(rng, grasp_type="power")
+    close_hand_qpos = np.clip(close_hand_qpos, np.deg2rad(-10), np.deg2rad(90))
+
+    for phase_name, target_pose in phases:
+        # ── lift+transport / place: 使用直接 IK + joint-space 插值 ──
+        # plan_path 的保守手部碰撞模型 (home=全伸展) 会在近桌面位姿误杀所有 IK 候选。
+        # 这些阶段是短距离垂直运动，joint-space 插值可安全替代规划。
+        if phase_name in ("lift+transport", "place"):
+            ik_result = planner.solve_teleop_ik(target_pose, current_qpos, current_qpos)
+            if not ik_result.success or ik_result.qpos is None:
+                result.failure_reason = f"{phase_name} IK failed: {ik_result.reason}"
+                print(f"  ❌ {phase_name} IK: {ik_result.reason}")
+                result.duration_s = time.perf_counter() - t_start
+                return result
+            # Joint-space linear path (no collision check needed — moving upward)
+            joint_delta = float(np.max(np.abs(ik_result.qpos - current_qpos)))
+            n_wp = max(2, int(np.ceil(joint_delta / INTERP_MAX_STEP_RAD)) + 1)
+            path = np.array([current_qpos + (k / (n_wp - 1)) * (ik_result.qpos - current_qpos)
+                            for k in range(n_wp)])
+            interp_label = f"ik({n_wp}wp)"
+        else:
+            try:
+                plan_result = planner.plan_path(target_pose, current_qpos)
+            except RuntimeError as e:
+                result.failure_reason = f"{phase_name} plan_path error: {e}"
+                print(f"  ❌ {phase_name}: plan_path exception: {e}")
+                result.duration_s = time.perf_counter() - t_start
+                return result
+
+            if not plan_result.success or plan_result.qpos_path is None:
+                result.failure_reason = f"{phase_name} plan failed: {plan_result.reason}"
+                print(f"  ❌ {phase_name}: {plan_result.reason}")
+                result.duration_s = time.perf_counter() - t_start
+                return result
+
+            path = plan_result.qpos_path
+            interp_label = plan_result.report.get("num_waypoints", "?")
+
+        dense = interpolate_waypoints(path, INTERP_MAX_STEP_RAD)
+
+        # 桌面是已知静态障碍物，各阶段有意接近/远离它。
+        # 自碰撞 → HOLD（危险），环境碰撞 → WARNING 日志（非阻塞）。
+        _check_env = "warn"
+        completed, holds, warnings = execute_path_with_collision_hold(
+            sim, dense, cm, hand_qpos, viewer,
+            episode_idx=episode_idx + 1, label=phase_name,
+            cube_actor=cube_actor if is_grasping else None,
+            is_grasping=is_grasping,
+            eef_to_cube_offset=eef_to_cube_offset if is_grasping else None,
+            check_env=_check_env,
+        )
+
+        result.total_holds += holds
+        result.collision_warnings += warnings
+        result.phases_completed.append(phase_name)
+
+        if not completed:
+            result.failure_reason = f"{phase_name} aborted: {holds} holds, {warnings} warnings"
+            print(f"  ⚠️  {phase_name} ABORTED (holds={holds} warnings={warnings})")
+            result.duration_s = time.perf_counter() - t_start
+            return result
+
+        current_qpos = dense[-1].copy()
+
+        # ── DESCEND → 闭合手部抓取立方块 ──
+        if phase_name == "descend" and not is_grasping:
+            # 平滑动画：open → close (power grip 包裹物体)
+            _n_close = 20
+            for _step in range(_n_close):
+                alpha = (_step + 1) / _n_close
+                blend_hand = hand_qpos * (1.0 - alpha) + close_hand_qpos * alpha
+                current_arm = sim.get_full_qpos()[:7]
+                sim.robot.balance_passive_force()
+                sim.robot.apply_action(np.concatenate([current_arm, blend_hand]))
+                sim._step_physics(n=PHYSICS_STEPS_PER_WP)
+                if viewer is not None and _step % 4 == 0:
+                    sim.scene.update_render()
+                    viewer.render()
+            hand_qpos = close_hand_qpos.copy()
+            cm.set_hand_qpos(hand_qpos)
+
+            is_grasping = True
+            eef_pose = sim.robot.get_eef_pose()
+            cube_p = np.array([cube_cx, cube_cy, cube_cz], dtype=np.float64)
+            eef_to_cube_offset = cube_p - np.array(eef_pose.p)
+            print(f"  ✋ CLOSE: {close_grasp_type} grip, cube attached "
+                  f"offset={np.round(eef_to_cube_offset, 3)}")
+
+        # ── PLACE → 张开放置并释放立方块 ──
+        if phase_name == "place":
+            is_grasping = False
+            place_p = np.array([REGION_CENTER[0], REGION_CENTER[1],
+                                TABLE_TOP_Z + cube_half], dtype=np.float64)
+            cube_actor.set_pose(sapien.Pose(p=place_p))
+
+            # 平滑动画：close → open (释放物体)
+            _n_open = 15
+            for _step in range(_n_open):
+                alpha = (_step + 1) / _n_open
+                blend_hand = hand_qpos * (1.0 - alpha) + grasp_hand_qpos * alpha
+                current_arm = sim.get_full_qpos()[:7]
+                sim.robot.balance_passive_force()
+                sim.robot.apply_action(np.concatenate([current_arm, blend_hand]))
+                sim._step_physics(n=PHYSICS_STEPS_PER_WP)
+                if viewer is not None and _step % 3 == 0:
+                    sim.scene.update_render()
+                    viewer.render()
+            hand_qpos = grasp_hand_qpos.copy()
+            cm.set_hand_qpos(hand_qpos)
+            print(f"  📍 OPEN: cube released at ({place_p[0]:.3f}, {place_p[1]:.3f}, {place_p[2]:.3f})")
+
+        settle_at_target(sim, current_qpos, hand_qpos)
+        print(f"  ✅ {phase_name:<15s} {interp_label}wp  holds={holds}  warn={warnings}")
+
+    # ── RETURN to safe position ──
+    print(f"  🔄 return: moving to safe position...")
+    current_qpos = sim.get_full_qpos()[:7].copy()
+    current_pose = planner.compute_eef_pose_world(current_qpos)
+    safe_return_pose = Pose(
+        p=np.array([current_pose.p[0], current_pose.p[1],
+                    max(current_pose.p[2] + 0.10, SAFE_RETURN_Z)], dtype=np.float64),
+        q=home_quat.copy(),
+    )
+
+    try:
+        return_result = planner.plan_path(safe_return_pose, current_qpos)
+        if return_result.success and return_result.qpos_path is not None:
+            return_dense = interpolate_waypoints(return_result.qpos_path, INTERP_MAX_STEP_RAD)
+            completed, holds, warnings = execute_path_with_collision_hold(
+                sim, return_dense, cm, hand_qpos, viewer,
+                episode_idx=episode_idx + 1, label="return",
+            )
+            result.total_holds += holds
+            result.collision_warnings += warnings
+            result.phases_completed.append("return")
+            if not completed:
+                print(f"  ⚠️  return ABORTED (holds={holds})")
+            else:
+                settle_at_target(sim, return_dense[-1], hand_qpos)
+                print(f"  ✅ return   holds={holds}")
+    except RuntimeError:
+        print(f"  ⚠️  return plan failed, using animated reset")
+        animated_reset_to_home(sim, home_qpos, viewer)
+
+    result.success = len(result.phases_completed) >= 5
+    result.duration_s = time.perf_counter() - t_start
+    status = "✅ SUCCESS" if result.success else f"❌ FAILED: {result.failure_reason}"
+    print(f"  {status}  holds={result.total_holds}  warnings={result.collision_warnings}  t={result.duration_s:.1f}s")
+    return result
+
+
 # ═══════════════════════════════════════════════ 主流程
 
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="Workspace 路径规划仿真测试")
-    p.add_argument("--comprehensive", action="store_true",
-                   help=f"（已废弃：现为默认行为，保留向后兼容）"
-                        f"{NUM_SAMPLES} 采样点(分层) + {NUM_IK_SAMPLES} IK 采样")
-    p.add_argument("--test-desk", action="store_true",
-                   help="桌面碰撞专项测试：聚焦 Z∈[0.02,0.18] 区域，关闭 EEF 预过滤，"
-                        "手部随机化，用 sim FK 精确检测手指穿桌")
-    p.add_argument("--randomize-hand", action="store_true",
-                   help=f"手部关节随机化（默认已开启，±{HAND_RANDOM_RANGE_DEG}°），"
-                        "使用 --no-randomize-hand 关闭")
-    p.add_argument("--no-randomize-hand", action="store_true",
-                   help="关闭手部随机化（使用 home=0° 固定手型）")
-    p.add_argument("--optimize-z-min", action="store_true",
-                   help="网格搜索最优 hand_safe_margin（需与 --test-desk 联用），"
-                        "输出安全性与可达性 trade-off 表格")
-    p.add_argument("--with-objects", action="store_true",
-                   help="在桌面上添加随机物体（box/cylinder，高度 5-15cm），"
-                        "测试物体场景下的碰撞安全性")
-    p.add_argument("--ci", action="store_true", help="CI 快速模式 (5 samples, headless)")
+    p = argparse.ArgumentParser(description="Pick-and-Place 抓取放置仿真测试")
     p.add_argument("--headless", action="store_true", help="无头模式（无 GUI）")
     p.add_argument("--seed", type=int, default=SEED, help="随机种子")
+    p.add_argument("--episodes", type=int, default=20, help="episode 数量")
     args = p.parse_args()
 
-    num_samples = 5 if args.ci else NUM_SAMPLES
-    num_ik = 20 if args.ci else NUM_IK_SAMPLES
     seed = args.seed
-    headless = HEADLESS or args.headless or args.ci
-
-    # 桌面碰撞专项模式
-    test_desk = args.test_desk
-    randomize_hand = not args.no_randomize_hand  # 默认开启，--no-randomize-hand 关闭
-
-    # --optimize-z-min: run grid search and exit
-    if args.optimize_z_min:
-        if not test_desk:
-            print("NOTE: --optimize-z-min implies --test-desk mode")
-            test_desk = True
-        sweep_z_min(
-            sim_config={},
-            headless=headless or True,  # optimize always headless for speed
-            num_samples=TEST_DESK_NUM_SAMPLES,
-            seed=seed,
-            with_objects=args.with_objects,
-        )
-        return
-
-    if test_desk:
-        num_samples = TEST_DESK_NUM_SAMPLES
-        num_ik = min(num_ik, 30)  # IK 测试在 desk 模式下不重要
-
+    headless = HEADLESS or args.headless
+    num_episodes = args.episodes
     rng = np.random.RandomState(seed)
+
+    print("=" * 70)
+    print(f"  Pick-and-Place 抓取放置仿真测试 — {num_episodes} episodes")
+    print("=" * 70)
+    print(f"  桌面区域: x{CUBE_X_RANGE} y{CUBE_Y_RANGE}")
+    print(f"  立方块:   {CUBE_SIZE_RANGE[0]*100:.0f}-{CUBE_SIZE_RANGE[1]*100:.0f}cm")
+    print(f"  区域中心: ({REGION_CENTER[0]:.3f}, {REGION_CENTER[1]:.3f})")
+    print(f"  手型: {GRASP_TYPES_ALL}")
+    print(f"  碰撞HOLD: {HOLD_DURATION_S}s × max {MAX_CONSECUTIVE_HOLDS} consecutive, {MAX_TOTAL_HOLDS} total")
 
     sim = SimRobotInterface(SimRobotConfig(headless=headless))
     if not sim.connect():
         print(f"ERROR: connect failed: {sim.last_error_message}", file=sys.stderr)
         return
 
-    # Planner: 坐标系对齐 sim root_pose
     root_pose = sim.robot.model.get_root_pose()
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
-            # Workspace bounds for _lift_eef_z_safe (mirrors RobotInterface)
             workspace_bounds=np.array([[0.0, 0.75], [-0.5, 0.5], [0.0, 0.6]], dtype=np.float64),
-            # collision= not set — CollisionModel handles env collision, FingertipDeskSafety not needed
         ),
         planning_profile=PlanningProfile(
-            max_waypoint_delta_deg=360.0,
-            max_ik_delta_deg=(180,) * 7,
-            max_pose_error_rot_rad=np.deg2rad(5.0),
-            num_random_ik_seeds=30,
-            rrt_time_limit=2.0,
-            num_rrt_attempts=2,
-            random_seed=seed,
-            check_env_collision=False,  # CollisionModel handles env collision
+            max_waypoint_delta_deg=360.0, max_ik_delta_deg=(180,) * 7,
+            max_pose_error_rot_rad=np.deg2rad(5.0), num_random_ik_seeds=50,
+            rrt_time_limit=2.0, num_rrt_attempts=2, random_seed=seed,
         ),
-        teleop_profile=TeleopProfile(
-            check_self_collision=True,
-            max_pose_error_pos_m=0.01,
-            max_pose_error_rot_rad=np.deg2rad(5.0),
-        ),
+        teleop_profile=TeleopProfile(check_self_collision=True),
     )
 
     home_qpos = sim.config.arm_home_qpos.copy()
     home_eef = planner.compute_eef_pose_world(home_qpos)
     home_quat = home_eef.q.copy()
-    assert float(np.linalg.norm(home_eef.p - np.array(sim.robot.eef_home_pose.p))) < 1e-6
 
-    # ── 桌面碰撞保护 ──
-    # 使用 planner 的同款 CollisionModel（7-DOF collision URDF，与 planner 同一坐标系）。
-    # 手部固定在 home 位姿（张开，最大延伸），是最保守的碰撞检测。
-    # 不再使用 EEF 级 DESK_SAFE_Z 或 FK 指尖 Z 检测。
-    if args.with_objects and test_desk:
-        print("  Objects mode: desk safety via CollisionModel FCL")
-
-    # 将 table obstacle 注册到 planner 的 CollisionModel（共享坐标系）
-    table_world = np.array([TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z], dtype=np.float64)
-    table_in_urdf = root_pose.inv() * sapien.Pose(table_world)
+    # ── 注册 CollisionModel + 桌面障碍物 ──
     global _env_cm
     _env_cm = planner.collision_model
-    _env_cm.add_table(
+    cm = _env_cm
+
+    table_world = np.array([TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z], dtype=np.float64)
+    table_in_urdf = root_pose.inv() * sapien.Pose(table_world)
+    cm.add_table(
         table_height=float(table_in_urdf.p[2]),
         x_center=float(table_in_urdf.p[0]),
-        half_x=TABLE_HALF[0],
-        half_y=TABLE_HALF[1],
-        half_z=TABLE_HALF[2],
+        half_x=TABLE_HALF[0], half_y=TABLE_HALF[1], half_z=TABLE_HALF[2],
     )
+    print(f"  CollisionModel: {cm.nq}-DOF, {cm._collision_model.ngeoms} geometries, "
+          f"{len(cm._collision_model.collisionPairs)} pairs")
+    print(f"  桌面障碍物: table @ z_top={TABLE_TOP_Z:.1f}m")
 
-    reject_below = not test_desk
-    reject_below_z = TABLE_TOP_Z + 0.01  # 仅过滤物理上低于桌面的目标
-    print(f"Desk safety: CollisionModel FCL (19-DOF + table box)  "
-          f"fingertip_safe={collision_config.fingertip_threshold:.3f}m  "
-          f"reject_below={reject_below_z:.3f}m")
-    print(f"  Table: X∈[{TABLE_CENTER[0]-TABLE_HALF[0]:.1f}, {TABLE_CENTER[0]+TABLE_HALF[0]:.1f}]  "
-          f"Y∈[{TABLE_CENTER[1]-TABLE_HALF[1]:.1f}, {TABLE_CENTER[1]+TABLE_HALF[1]:.1f}]  "
-          f"z_top={TABLE_TOP_Z:.1f}")
-    print(f"  Hand extension: pinky_tip={collision_config.hand_extension_below_eef*1000:.0f}mm below EEF (home hand)")
-    if test_desk:
-        print(f"  Mode: DESK TEST — EEF pre-filter OFF, sim FK verify")
-    print(f"  Hand: {'randomized ±' + str(HAND_RANDOM_RANGE_DEG) + '° (6 grasp types)' if randomize_hand else 'fixed (home=0°, --no-randomize-hand)'}")
-
-    viewer = _setup_viewer(sim) if not headless else None
-
-    # 复位到 home
     sim.reset()
     for _ in range(5):
         sim._step_physics(n=10)
-    if viewer:
-        for _ in range(5):
-            sim.scene.update_render()
-            viewer.render()
 
-    # ── 桌面物体交互测试（--with-objects）──
-    table_objects = []
-    if args.with_objects and test_desk:
-        table_objects = _spawn_table_objects(sim, rng, n_objects=3)
-        # Reset to let objects settle in physics
+    viewer = _setup_viewer(sim) if not headless else None
+
+    print(f"\n{'='*70}")
+    print(f"  开始 {num_episodes} 次 Pick-and-Place 循环")
+    print(f"{'='*70}")
+
+    episode_results: list[EpisodeResult] = []
+    t_total_start = time.perf_counter()
+
+    for ep in range(num_episodes):
+        cube_info = spawn_pick_cube(sim, rng)
+        cube_half = cube_info["half_size"]
+        cube_cx, cube_cy, _ = cube_info["center_pos"]
+
+        print(f"\n  🧊 Episode {ep+1}/{num_episodes}: "
+              f"cube @ ({cube_cx:.3f}, {cube_cy:.3f}) size={cube_half*2*100:.1f}cm")
+
+        ep_result = pick_and_place_episode(
+            sim, planner, cm, home_qpos, home_quat, cube_info, ep, viewer, rng)
+        episode_results.append(ep_result)
+
+        if cube_info["actor"] is not None:
+            try:
+                sim.scene.remove_actor(cube_info["actor"])
+            except Exception:
+                pass
+
+        print(f"  🔄 resetting to home...")
+        sim.reset()
         for _ in range(5):
             sim._step_physics(n=10)
-        print()
+        sim.robot.balance_passive_force()
+        sim.robot.apply_action(np.concatenate([home_qpos, np.zeros(12, dtype=np.float64)]))
+        sim._step_physics(n=10)
 
-    # ── 路径规划测试 ──
-    if test_desk:
-        # 桌面碰撞专项：Z 集中在 [0.02, 0.18]，X/Y 全 workspace
-        target_positions = np.column_stack([
-            rng.uniform(*TEST_DESK_X_RANGE, num_samples),
-            rng.uniform(*TEST_DESK_Y_RANGE, num_samples),
-            rng.uniform(*TEST_DESK_Z_RANGE, num_samples),
-        ])
-        z_low_pct = 100 * np.mean(target_positions[:, 2] <= Z_LOW_RANGE[1])
-        sampling_mode = f"desk-test Z∈{TEST_DESK_Z_RANGE} (Z-low {z_low_pct:.0f}%)"
-    else:
-        # 默认：分层加权采样（15 区域，低 Z 占 9/15 超低/很低/低三档梯度权重）
-        region_weights = np.array([r[4] for r in STRATIFIED_REGIONS])
-        region_weights /= region_weights.sum()
-        region_counts = np.round(region_weights * num_samples).astype(int)
-        # 修正 rounding 导致的偏差
-        diff = num_samples - region_counts.sum()
-        if diff > 0:
-            idx = np.argmax(region_weights)
-            region_counts[idx] += diff
-        elif diff < 0:
-            for i in np.argsort(region_counts)[::-1]:
-                if region_counts[i] > 1 and diff < 0:
-                    region_counts[i] -= 1
-                    diff += 1
-                if diff == 0:
-                    break
+    # ── 汇总报告 ──
+    t_total = time.perf_counter() - t_total_start
+    n_success = sum(1 for r in episode_results if r.success)
+    n_failed = num_episodes - n_success
 
-        positions_list = []
-        for i, (label, xr, yr, zr, _) in enumerate(STRATIFIED_REGIONS):
-            n = region_counts[i]
-            if n > 0:
-                positions_list.append(np.column_stack([
-                    rng.uniform(*xr, n),
-                    rng.uniform(*yr, n),
-                    rng.uniform(*zr, n),
-                ]))
-        target_positions = np.vstack(positions_list)
-        rng.shuffle(target_positions)
-        z_low_pct = 100 * np.mean((target_positions[:, 2] >= Z_LOW_RANGE[0]) &
-                                   (target_positions[:, 2] <= Z_LOW_RANGE[1]))
-        sampling_mode = (f"stratified × {len(STRATIFIED_REGIONS)} regions "
-                         f"(Z-low {z_low_pct:.0f}%)")
+    print(f"\n{'='*70}")
+    print(f"  Pick-and-Place 汇总报告")
+    print(f"{'='*70}")
+    print(f"\n  📊 总体统计:")
+    print(f"    Episodes:        {num_episodes}")
+    print(f"    成功:            {n_success} ({n_success/max(num_episodes,1)*100:.0f}%)")
+    print(f"    失败:            {n_failed} ({n_failed/max(num_episodes,1)*100:.0f}%)")
 
-    rot_info = f"  rot={ROT_MODE}"
-    if ROT_MODE == "multi_axis":
-        rot_info += f" (axis1≤{ROT_AXIS1_DEG}° axis2≤{ROT_AXIS2_DEG}°)"
-    elif ROT_MODE == "single_axis":
-        rot_info += f" (≤{ROT_MAX_DEG}°)"
-    print(f"{'='*60}")
-    print(f"Workspace 路径规划 — {num_samples} 采样点 ({sampling_mode}) + return_home")
-    print(f"  home EEF: {np.round(home_eef.p, 4)}  quat={np.round(home_quat, 4)}")
-    print(f"  空间: x{SAMPLE_X} y{SAMPLE_Y} z{SAMPLE_Z}{rot_info}  seed={seed}")
-    if test_desk:
-        print(f"  手部: 随机化 ±{HAND_RANDOM_RANGE_DEG}°  sim FK 验证")
-    print(f"{'='*60}\n")
+    total_holds = sum(r.total_holds for r in episode_results)
+    total_warnings = sum(r.collision_warnings for r in episode_results)
+    episodes_with_holds = sum(1 for r in episode_results if r.total_holds > 0)
 
-    t_start = time.perf_counter()
-    ok_count = 0
-    skipped_desk = 0
-    desk_collisions = 0
-    start_unsafe_lifts = 0  # 起点手部不安全，需抬升
+    print(f"\n  🛡️  碰撞 HOLD 统计:")
+    print(f"    总 HOLD 次数:    {total_holds}")
+    print(f"    总碰撞预警:      {total_warnings}")
+    print(f"    触发 HOLD:       {episodes_with_holds}/{num_episodes}")
+    print(f"    平均 HOLD/ep:    {total_holds/max(num_episodes,1):.1f}")
+    print(f"    最大 HOLD/ep:    {max((r.total_holds for r in episode_results), default=0)}")
 
-    for i, pos in enumerate(target_positions):
-        if viewer and viewer.closed:
-            break
+    if n_failed > 0:
+        print(f"\n  ❌ 失败原因:")
+        reasons: dict[str, int] = {}
+        for r in episode_results:
+            if not r.success:
+                reason = r.failure_reason or "unknown"
+                if "plan fail" in reason.lower():
+                    reason = "planning failure"
+                elif "abort" in reason.lower():
+                    reason = "collision abort"
+                reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+            print(f"    {reason:<25s} {count}")
 
-        # ── 桌面安全预过滤 ──
-        # 手部随机化后不再使用保守的 DESK_SAFE_Z（EEF 级 10.6cm），改用
-        # 指尖级阈值（桌面+1cm）。planner FK + sim FK 做真正的碰撞检测。
-        # test-desk 模式关闭预过滤以允许测试低 Z 目标。
-        if reject_below and pos[2] < reject_below_z:
-            skipped_desk += 1
-            print(f"  [{i+1:2d}/{num_samples}] ⏭️  SKIP: z={pos[2]:.3f}m < reject_below={reject_below_z:.3f}m")
-            continue
+    print(f"\n  📋 阶段完成率:")
+    for phase in ["approach", "descend", "lift+transport", "place", "return"]:
+        completed = sum(1 for r in episode_results if phase in r.phases_completed)
+        pct = completed / max(num_episodes, 1) * 100
+        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+        print(f"    {phase:<10s} {bar} {completed}/{num_episodes} ({pct:.0f}%)")
 
-        # ── 手部随机化（抓取姿态，PD 平滑驱动）──
-        hand_qpos = None
-        grasp_type_name = ""
-        if randomize_hand:
-            hand_qpos, grasp_type_name = hand_grasp_pose(rng)
-            target_full = np.concatenate([sim.get_full_qpos()[:7], hand_qpos])
-            # 通过 PD 控制器平滑驱动手部到随机目标位姿
-            smooth_drive_to_target(sim, target_full, viewer, max_iter=40,
-                                   label=f"grasp_{i+1}")
-            _env_cm.set_hand_qpos(hand_qpos)  # 同步 CollisionModel 手部姿态
-            # Log hand safety
-            hand_safe, _, _ = check_hand_desk_clearance_sim(sim)
-            print(f"  [{i+1:2d}/{num_samples}] 🖐️  {grasp_type_name}: "
-                  f"{'OK' if hand_safe else '⚠️BELOW DESK'}")
+    durations = [r.duration_s for r in episode_results]
+    print(f"\n  ⏱️  性能:")
+    print(f"    总耗时:          {t_total:.1f}s")
+    print(f"    平均/episode:    {np.mean(durations):.1f}s" if durations else "    N/A")
+    print(f"    最快/最慢:       {min(durations):.1f}s / {max(durations):.1f}s" if durations else "    N/A")
 
-        # ── 起点安全检查（CollisionModel FCL）──
-        if randomize_hand:
-            start_safe, _, _ = check_hand_desk_clearance_sim(sim)
-            if not start_safe:
-                # 两层抬升策略：Stage 1 保持手型抬升，Stage 2 手回 home 再抬升
-                start_unsafe_lifts += 1
-                lift_success = False
-                _SAFE_LIFT_Z = TABLE_TOP_Z + 0.15  # 安全抬升目标（15cm 高于桌面）
+    print(f"\n  📝 Episode 明细:")
+    print(f"  {'#':>3s}  {'cube_pos':>18s}  {'size':>5s}  {'holds':>6s}  {'dur':>6s}  {'result'}")
+    print(f"  {'─'*3}  {'─'*18}  {'─'*5}  {'─'*6}  {'─'*6}  {'─'*8}")
+    for r in episode_results:
+        pos_str = f"({r.cube_pos[0]:.2f},{r.cube_pos[1]:.2f})"
+        status = "✅" if r.success else f"❌ {r.failure_reason[:25]}"
+        print(f"  {r.episode+1:>3d}  {pos_str:>18s}  {r.cube_size*100:>4.1f}cm  "
+              f"{r.total_holds:>5d}  {r.duration_s:>5.1f}s  {status}")
 
-                for stage in range(2):
-                    if stage == 1:
-                        home_hand = np.zeros(NUM_HAND_JOINTS)
-                        target_full = np.concatenate([sim.get_full_qpos()[:7], home_hand])
-                        smooth_drive_to_target(sim, target_full, viewer, max_iter=30,
-                                               label=f"hand_home_{i+1}")
-                        hand_qpos = home_hand
-                        _env_cm.set_hand_qpos(home_hand)  # 同步 CollisionModel 手部姿态
-
-                    current_arm = sim.get_full_qpos()[:7]
-                    current_pose = planner.compute_eef_pose_world(current_arm)
-                    target_eef_z = max(current_pose.p[2] + _DIRECT_LIFT_Z_M, _SAFE_LIFT_Z)
-                    target_eef_z = min(target_eef_z, 0.55)
-
-                    lift_pose = Pose(
-                        p=np.array([current_pose.p[0], current_pose.p[1], target_eef_z], dtype=np.float64),
-                        q=current_pose.q.copy(),
-                    )
-                    stage_tag = f"S{stage+1}" + ("(home_hand)" if stage == 1 else "")
-
-                    lift_ik = planner.solve_teleop_ik(lift_pose, current_arm, current_arm)
-                    if lift_ik.success and lift_ik.qpos is not None:
-                        target_full = np.concatenate([lift_ik.qpos, hand_qpos])
-                        smooth_drive_to_target(sim, target_full, viewer, max_iter=40,
-                                               label=f"lift_{i+1}_{stage_tag}")
-                        lift_safe, _, _ = check_hand_desk_clearance_sim(sim)
-                        if lift_safe:
-                            eef_z = float(planner.compute_eef_pose_world(lift_ik.qpos).p[2])
-                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} OK "
-                                  f"(EEF z={eef_z:.3f}m)")
-                            lift_success = True
-                            break
-                        else:
-                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} "
-                                  f"STILL IN COLLISION")
-                        continue
-                    else:
-                        try:
-                            plan_result = planner.plan_path(lift_pose, current_arm)
-                        except RuntimeError:
-                            plan_result = None
-                        if plan_result is not None and plan_result.success and plan_result.qpos_path is not None:
-                            hand = hand_qpos
-                            for wp in plan_result.qpos_path:
-                                if viewer is not None and viewer.closed:
-                                    break
-                                sim.robot.balance_passive_force()
-                                sim.robot.apply_action(np.concatenate([wp, hand]))
-                                sim._step_physics(n=PHYSICS_STEPS_PER_WP)
-                                if viewer is not None:
-                                    sim.scene.update_render()
-                                    viewer.render()
-                            settle_at_target(sim, plan_result.qpos_path[-1], hand,
-                                             converge_threshold_rad=_PHASE1_CONVERGE_THRESHOLD_RAD)
-                            lift_safe, _, _ = check_hand_desk_clearance_sim(sim)
-                            if lift_safe:
-                                eef_z = float(planner.compute_eef_pose_world(plan_result.qpos_path[-1]).p[2])
-                                print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → plan_path lift "
-                                      f"{stage_tag} OK (EEF z={eef_z:.3f}m)")
-                                lift_success = True
-                                break
-                            else:
-                                print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → plan_path lift "
-                                      f"{stage_tag} STILL IN COLLISION")
-                                continue
-                        else:
-                            reason = plan_result.reason if plan_result else "plan error"
-                            print(f"  [{i+1:2d}/{num_samples}] ⬆️  start unsafe → lift {stage_tag} "
-                                  f"plan_path FAILED: {reason}")
-                            continue
-
-                if not lift_success:
-                    print(f"  [{i+1:2d}/{num_samples}] ⬆️  ALL lift stages FAILED — continuing with unsafe start")
-
-        target_pose = build_target_pose(pos, home_quat, rng, rot_mode=ROT_MODE, rot_max_deg=ROT_MAX_DEG, rot_axis1_deg=ROT_AXIS1_DEG, rot_axis2_deg=ROT_AXIS2_DEG)
-        marker = place_marker(sim.scene, pos) if viewer else None
-        if viewer:
-            sim.scene.update_render()
-            viewer.render()
-
-        ok = plan_and_execute(planner, sim, target_pose, viewer, f"{i+1:2d}/{num_samples}",
-                              check_desk_with_sim=randomize_hand)
-        if ok:
-            ok_count += 1
-        elif randomize_hand:
-            final_safe, _, _ = check_hand_desk_clearance_sim(sim)
-            if not final_safe:
-                desk_collisions += 1
-        if marker:
-            sim.scene.remove_actor(marker)
-
-    # ── return_home (mirrors RobotInterface.return_to_home()) ──
-    home_report = {}
-    if not viewer or not viewer.closed:
-        print(f"\n{'='*60}")
-        print("return_home (mirrors RobotInterface 两阶段归航)")
-        print("=" * 60)
-        # Workspace bounds for safety lift (matches RobotInterface config)
-        ws_bounds = np.array([[0.0, 0.75], [-0.5, 0.5], [0.0, 0.6]], dtype=np.float64)
-        home_report = return_to_home_sim(planner, sim, home_qpos, ws_bounds, viewer)
-        home_ok = home_report.get("success", False)
-    else:
-        home_ok = False
-
-    # ── IK 独立测试 ──
-    if num_ik > 0:
-        ik_report = ik_test(planner, sim, home_qpos, num_samples=num_ik, rng=rng)
-        print(f"\n{'='*60}\nIK solve_ik 独立测试 ({num_ik} 采样)")
-        print_ik_stats("fresh  ", ik_report["fresh"])
-        print_ik_stats("chained", ik_report["chained"])
-
-    print(f"\n{'='*60}")
-    collision_str = f"  desk_collisions={desk_collisions}" if randomize_hand else ""
-    lift_str = f"  start_lifts={start_unsafe_lifts}" if randomize_hand else ""
-    print(f"targets_ok={ok_count}/{num_samples}  skipped_desk={skipped_desk}{collision_str}{lift_str}  "
-          f"return_home={'OK' if home_ok else 'FAIL'}  "
-          f"total={time.perf_counter()-t_start:.1f}s")
-    if home_report:
-        print(f"  home phase1={home_report.get('phase1_completed')}  "
-              f"phase2={home_report.get('phase2_executed')}  "
-              f"lift={home_report.get('lift_used')}  "
-              f"err={home_report.get('final_err_deg', '?'):.2f}deg  "
-              f"pos={home_report.get('final_pos_err_mm', '?'):.1f}mm")
-
+    cm.clear_obstacles()
     if viewer and not viewer.closed:
         print("\nClose viewer to exit...")
         while not viewer.closed:
-            sim.scene.update_render()
-            viewer.render()
-
+            sim.scene.update_render(); viewer.render()
     sim.disconnect()
-    print("Done.")
-
+    print(f"\n{'='*70}")
+    print(f"  ✅ Pick-and-Place 测试完成 ({n_success}/{num_episodes} success)")
+    print(f"{'='*70}")
 
 if __name__ == "__main__":
     main()

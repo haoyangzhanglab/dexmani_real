@@ -159,7 +159,7 @@ class PathPlanStats:
 
 def create_planner(seed: int = DEFAULT_SEED) -> XArm7MotionPlanner:
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf")
+    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
 
     return XArm7MotionPlanner(
         XArm7PlannerConfig(

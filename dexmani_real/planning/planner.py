@@ -22,8 +22,6 @@ from .pose_utils import compute_pose_error, ensure_qpos
 from .workspace_safety import WorkspaceSafety
 
 __all__ = [
-    "FingertipDeskSafety",
-    "WorkspaceSafety",
     "XArm7MotionPlanner",
 ]
 
@@ -117,7 +115,7 @@ class XArm7MotionPlanner:
         self.joint_limits = joint_limits
         self.equivalent_joint_mask = equivalent_joint_mask
 
-        # Geometric FK desk safety (preferred over MPlib point cloud)
+        # Geometric FK desk safety — fingertip Z vs desk
         self.desk_safety: FingertipDeskSafety | None = None
         if config.collision is not None:
             try:
@@ -372,10 +370,6 @@ class XArm7MotionPlanner:
         and environment collision.  Joint limits are only checked at the
         midpoint (limit bounds are convex, so midpoint-outside implies the
         segment is problematic).
-
-        This replaces the old dense-segment interpolation (0.02 rad step)
-        which caused ~80× more collision queries.  Three-point sampling
-        gives ~95% of the safety at ~4% of the cost.
         """
         # Joint limits check at midpoint (convex → midpoint suffices)
         mid = 0.5 * (prev + nxt)
@@ -395,7 +389,7 @@ class XArm7MotionPlanner:
                     return False
         if profile.check_env_collision:
             for q in samples:
-                if self.ik_mgr.has_env_collision_fast(q):
+                if self.ik_mgr.has_env_collision(q):
                     return False
         # Geometric FK desk safety — check the segment endpoints
         if self.desk_safety is not None and profile.check_env_collision:

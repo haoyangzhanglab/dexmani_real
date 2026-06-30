@@ -6,7 +6,7 @@ collision detection.
 
 A single unified SRDF controls collision pair filtering for both models:
 
-- ``xarm7_xhand_collision_19dof.srdf`` — unified SRDF used by both 7-DOF (MPlib,
+- ``xarm7_xhand.srdf`` — unified SRDF used by both 7-DOF (MPlib,
   CollisionModel hand_dof=False) and 19-DOF (CollisionModel hand_dof=True) modes.
   Enables arm-wrist to hand collision detection while keeping hand self-collision
   disabled (291 inter-finger Never rules retained).
@@ -59,23 +59,8 @@ logger = get_logger(__name__)
 _XHAND_DIR = ASSET_DIR / "robots" / "xhand"
 _COLLISION_URDF = str(_XHAND_DIR / "xarm7_xhand_collision.urdf")       # 7-DOF (hand fixed)
 _FULL_URDF = str(_XHAND_DIR / "xarm7_xhand_right.urdf")                # 19-DOF (7 arm + 12 hand)
-_COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand_collision_19dof.srdf")  # unified SRDF (single source)
+_COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand.srdf")  # unified SRDF (single source)
 
-# Hand DOF mapping (qpos indices 7..18 in 19-DOF model)
-_HAND_DOF_NAMES: tuple[str, ...] = (
-    "right_hand_index_bend_joint",
-    "right_hand_index_joint1",
-    "right_hand_index_joint2",
-    "right_hand_mid_joint1",
-    "right_hand_mid_joint2",
-    "right_hand_pinky_joint1",
-    "right_hand_pinky_joint2",
-    "right_hand_ring_joint1",
-    "right_hand_ring_joint2",
-    "right_hand_thumb_bend_joint",
-    "right_hand_thumb_rota_joint1",
-    "right_hand_thumb_rota_joint2",
-)
 _HAND_DOF_COUNT = 12  # number of active hand joints
 
 # User→URDF reorder map for set_hand_qpos().
@@ -89,10 +74,8 @@ _HAND_DOF_COUNT = 12  # number of active hand joints
 # _hand_user_to_urdf[i] = user index for URDF slot i.
 _HAND_USER_TO_URDF: tuple[int, ...] = (3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2)
 
-# ── Box AABB tuple indices ──
-# ``_obstacle_boxes[obj_id]`` stores ``(x_min, x_max, y_min, y_max, z_min, z_max)``.
-# These constants name each slot for readable indexing.
-_BB_XMIN, _BB_XMAX, _BB_YMIN, _BB_YMAX, _BB_ZMIN, _BB_ZMAX = range(6)
+# AABB tuple indices: ``(x_min, x_max, y_min, y_max, z_min, z_max)``
+_BB_ZMAX = 5
 
 # ── Env collision tier margins ──
 # Tier 1: Z-min pre-filter — skip all FCL when lowest robot geometry is safely
@@ -119,7 +102,7 @@ class CollisionModel:
       first 7 are arm joints, last 12 are hand joints.  Self-collision ~35μs,
       env Tier 1 ~17μs, Tier 2 2–8ms (hand near table).
 
-    Both modes use ``xarm7_xhand_collision_19dof.srdf``, which enables arm-wrist
+    Both modes use ``xarm7_xhand.srdf``, which enables arm-wrist
     to hand collision detection and keeps hand self-collision disabled.
 
     Environment obstacles can be added as ``fcl.Box`` geometry objects, following
@@ -200,9 +183,10 @@ class CollisionModel:
 
         # --- Obstacle tracking ---
         self._obstacle_names: set[str] = set()
-        self._robot_geom_ids: list[int] = []      # non-static robot geometry IDs (cached for env checks)
+        self._robot_geom_ids: list[int] = []      # robot geometry IDs (cached for env checks)
         self._obstacle_boxes: dict[str, tuple[float, float, float, float, float, float]] = {}
         # name → (x_min, x_max, y_min, y_max, z_min, z_max) in model base frame
+        self._obstacle_geom_ids: dict[str, int] = {}  # name → geometry object index
         self._obs_z_max: float = float('-inf')    # cached max Z of all obstacles (P6)
         self._fcl_request: "fcl.CollisionRequest" = self._fcl.CollisionRequest()  # reusable (P7)
 
@@ -227,8 +211,6 @@ class CollisionModel:
 
         # --- qpos shape cache for validation ---
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
-        # Arm-only slice for hand_dof mode (first 7 joints)
-        self._arm_slice = slice(0, 7) if hand_dof else slice(0, self._nq)
 
         # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF)
         self._hand_qpos: np.ndarray = np.zeros(_HAND_DOF_COUNT, dtype=np.float64)
@@ -358,8 +340,8 @@ class CollisionModel:
                     CollisionPair(
                         link_name1=self._get_geom_link_name(cp.first),
                         link_name2=self._get_geom_link_name(cp.second),
-                        object_name1=self._get_geom_object_name(cp.first),
-                        object_name2=self._get_geom_object_name(cp.second),
+                        object_name1=self._collision_model.geometryObjects[cp.first].name,
+                        object_name2=self._collision_model.geometryObjects[cp.second].name,
                         collision_type="pinocchio",
                     )
                 )
@@ -435,12 +417,8 @@ class CollisionModel:
         qpos = self._update_placements(qpos)
         oMg = self._collision_data.oMg
 
-        # ── Tier 1: Z-min filter ──
-        robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
-        # Guard against NaN propagation from bad hand_qpos (e.g. uninitialized or NaN input)
-        if not np.isfinite(robot_z_min):
-            return True  # conservative: assume collision when FK is invalid
-        if robot_z_min > self._obs_z_max + self._z_tier1_margin:
+        # ── Tier 1: Z-min pre-filter ──
+        if not self._tier1_z_check(oMg):
             return False
 
         # ── Tier 2: Z-filtered FCL ──
@@ -449,7 +427,7 @@ class CollisionModel:
             bb = self._obstacle_boxes.get(name)
             if bb is None:
                 continue
-            obs_id = self._get_obstacle_geom_id(name)
+            obs_id = self._obstacle_geom_ids.get(name)
             if obs_id is None:
                 continue
             obs_geom = self._collision_model.geometryObjects[obs_id]
@@ -488,11 +466,7 @@ class CollisionModel:
             return False
         qpos = self._update_placements(qpos)
         oMg = self._collision_data.oMg
-        robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
-        # Guard against NaN propagation from bad hand_qpos
-        if not np.isfinite(robot_z_min):
-            return True  # conservative: assume collision when FK is invalid
-        return robot_z_min <= self._obs_z_max + self._z_tier1_margin
+        return self._tier1_z_check(oMg)
 
     def check_teleop_collision(self, qpos: np.ndarray) -> tuple[bool, bool]:
         """Single-FK self + env Tier-1 collision check for teleop hot path (~35 μs).
@@ -517,14 +491,11 @@ class CollisionModel:
         )
 
         # Env collision: Tier-1 Z-min on the SAME placements (zero extra FK)
-        has_env = False
-        if self._obstacle_names and self._robot_geom_ids:
-            oMg = self._collision_data.oMg
-            robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
-            if not np.isfinite(robot_z_min):
-                has_env = True  # conservative: assume collision when FK is invalid
-            else:
-                has_env = robot_z_min <= self._obs_z_max + self._z_tier1_margin
+        has_env = bool(
+            self._obstacle_names
+            and self._robot_geom_ids
+            and self._tier1_z_check(self._collision_data.oMg)
+        )
 
         return has_self, has_env
 
@@ -557,11 +528,12 @@ class CollisionModel:
         shape = self._fcl.Box(half_extents[0] * 2, half_extents[1] * 2, half_extents[2] * 2)
         pose = self._pin.SE3(rot, np.array(position, dtype=np.float64))
         obj = self._pin.GeometryObject(name, 0, pose, shape)
-        self._collision_model.addGeometryObject(obj)
+        geom_id = self._collision_model.addGeometryObject(obj)
         # Do NOT add collision pairs to the main model — env collision uses
         # direct FCL collide() against _robot_geom_ids, keeping the main
         # model's computeCollisions() self-collision-only (~20% faster).
         self._obstacle_names.add(name)
+        self._obstacle_geom_ids[name] = geom_id
 
         # Cache world AABB for fast pre-filter in check_env_collision().
         # For identity rotation (the common case), the box axes are aligned
@@ -617,6 +589,7 @@ class CollisionModel:
         self._collision_model.removeGeometryObject(name)
         self._obstacle_names.discard(name)
         self._obstacle_boxes.pop(name, None)
+        self._obstacle_geom_ids.pop(name, None)
         # Update cached Z-max
         self._obs_z_max = max(
             (box[_BB_ZMAX] for box in self._obstacle_boxes.values()),
@@ -633,6 +606,7 @@ class CollisionModel:
             self._collision_model.removeGeometryObject(name)
         self._obstacle_names.clear()
         self._obstacle_boxes.clear()
+        self._obstacle_geom_ids.clear()
         self._obs_z_max = float('-inf')
         self._collision_data = self._collision_model.createData()
         logger.info("Cleared %d obstacle(s)", count)
@@ -642,15 +616,19 @@ class CollisionModel:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _get_obstacle_geom_id(self, name: str) -> int | None:
-        """Find the geometry object index for an obstacle by name.
+    def _tier1_z_check(self, oMg) -> bool:
+        """Tier-1 Z-min pre-filter: True if robot is within margin of any obstacle.
 
-        Returns None if the obstacle is not found in the geometry model.
+        Returns True when:
+        - robot_z_min is non-finite (NaN/inf from bad FK → conservative safety gate)
+        - robot_z_min <= max_obstacle_z + tier1_margin (robot near table)
+        Returns False when:
+        - robot_z_min > max_obstacle_z + tier1_margin (robot safely above)
         """
-        for i, obj in enumerate(self._collision_model.geometryObjects):
-            if obj.name == name:
-                return i
-        return None
+        robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
+        if not np.isfinite(robot_z_min):
+            return True  # conservative: assume collision when FK is invalid
+        return robot_z_min <= self._obs_z_max + self._z_tier1_margin
 
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
@@ -659,10 +637,6 @@ class CollisionModel:
         if parent_joint < len(self._link_names):
             return self._link_names[parent_joint]
         return geom.name
-
-    def _get_geom_object_name(self, geom_id: int) -> str:
-        """Get the geometry object name."""
-        return self._collision_model.geometryObjects[geom_id].name
 
     def pad_arm_for_fk(self, qpos_arm: np.ndarray) -> np.ndarray:
         """Pad 7-DOF arm qpos to full model dimension for FK queries.
@@ -700,16 +674,6 @@ class CollisionModel:
     def hand_dof(self) -> bool:
         """Whether this model includes active hand joints (19-DOF vs 7-DOF)."""
         return self._hand_dof
-
-    @property
-    def num_hand_dof(self) -> int:
-        """Number of active hand DOFs (0 for 7-DOF, 12 for 19-DOF)."""
-        return _HAND_DOF_COUNT if self._hand_dof else 0
-
-    @property
-    def arm_slice(self) -> slice:
-        """Slice to extract arm-only qpos: ``qpos[cm.arm_slice]`` → ``(7,)``."""
-        return self._arm_slice
 
     @property
     def pinocchio_model(self):

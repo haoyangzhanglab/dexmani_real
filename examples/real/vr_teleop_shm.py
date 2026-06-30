@@ -81,7 +81,7 @@ def main():
     # ── 2. Planner ──
     arm_config = XArm7Config()
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf")
+    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
 
     collision = CollisionConfig(
         table_z_world=0.0,

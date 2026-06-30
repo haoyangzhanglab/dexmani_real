@@ -197,7 +197,7 @@ class IKCandidateManager:
                 return False, report
 
         if profile.check_env_collision and self._cm is not None:
-            if self._cm.check_env_collision_fast(qpos):
+            if self._cm.check_env_collision(qpos):
                 report["reason"] = "IK candidate in environment collision."
                 return False, report
 
@@ -340,8 +340,6 @@ class IKCandidateManager:
 
 
     # ── Collision check wrappers (delegate to CollisionModel) ──
-    # MPlib fallback branches removed — CollisionModel is always available
-    # when constructed through XArm7MotionPlanner (the only construction path).
 
     def has_self_collision(self, qpos: np.ndarray) -> bool:
         return self._cm.check_self_collision(qpos)
@@ -351,37 +349,6 @@ class IKCandidateManager:
 
     def has_env_collision(self, qpos: np.ndarray) -> bool:
         return self._cm.check_env_collision(qpos)
-
-    def has_env_collision_fast(self, qpos: np.ndarray) -> bool:
-        return self._cm.check_env_collision_fast(qpos)
-
-    def check_teleop_collision(self, qpos: np.ndarray) -> tuple[bool, bool]:
-        """Single-FK self + env Tier-1 collision check for teleop hot path.
-
-        Returns ``(has_self_collision, has_env_collision)``.
-        """
-        return self._cm.check_teleop_collision(qpos)
-
-    def _check_segment_collision(
-        self, start: np.ndarray, end: np.ndarray, collision_type: str = "self", step_size: float = 0.02,
-    ) -> bool:
-        """Check if the linear joint-space segment start→end is collision-free."""
-        if collision_type == "self":
-            return self._cm.check_segment_collision_free(start, end, step_size)
-        else:
-            return self._cm.check_segment_env_collision_free(start, end, step_size)
-
-    def check_segment_collision_free(
-        self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
-    ) -> bool:
-        """Check if the linear joint-space segment start→end is self-collision-free."""
-        return self._check_segment_collision(start, end, "self", step_size)
-
-    def check_segment_env_collision_free(
-        self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,
-    ) -> bool:
-        """Check if the linear joint-space segment start→end is env-collision-free."""
-        return self._check_segment_collision(start, end, "env", step_size)
 
     def check_path_collisions(
         self, path: np.ndarray, collision_step_size: float = 0.02,
@@ -395,7 +362,7 @@ class IKCandidateManager:
         """
         for i in range(len(path) - 1):
             # Dense segment check — fast bool path for most points.
-            if not self.check_segment_collision_free(
+            if not self._cm.check_segment_collision_free(
                 path[i], path[i + 1], collision_step_size,
             ):
                 # Pinpoint the exact violating configuration and get full details.
@@ -438,8 +405,8 @@ class IKCandidateManager:
     ) -> dict[str, Any]:
         """Check environment collision along path with dense interpolation."""
         for i in range(len(path) - 1):
-            if not self._check_segment_collision(
-                path[i], path[i + 1], "env", collision_step_size,
+            if not self._cm.check_segment_env_collision_free(
+                path[i], path[i + 1], collision_step_size,
             ):
                 return {
                     "path_env_collision": True,

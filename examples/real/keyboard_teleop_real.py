@@ -209,7 +209,7 @@ def main():
     # ── 1. Planner ──
     arm_config = XArm7Config()
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf")
+    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
 
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(

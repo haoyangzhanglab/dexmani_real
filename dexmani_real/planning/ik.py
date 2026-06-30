@@ -352,28 +352,27 @@ class TeleopIKSolver:
     def _check_teleop_collision_gate(
         self, qpos_cmd: np.ndarray, profile: TeleopProfile,
     ) -> tuple[str | None, dict[str, Any]]:
-        """Unified self + env collision gate for teleop IK result validation.
+        """Self + env collision gate for teleop IK result validation.
 
-        Returns ``(reason, extra_report)`` — ``(None, {})`` when all clear,
-        or a rejection reason + diagnostic dict when a collision is detected.
-
-        Uses CollisionModel.check_teleop_collision() for a single-FK fast path
-        (~35 μs), then falls back to detailed self-collision check only when a
-        collision is actually detected (rare case).
+        Returns ``(reason, extra_report)`` — ``(None, {})`` when all clear.
+        Env collision uses the full two-tier check for accuracy (Tier1 Z-min
+        pre-filter + Tier2 FCL mesh-mesh).
         """
         if not profile.check_self_collision and not profile.check_env_collision:
             return None, {}
 
-        has_self, has_env = self.ik_mgr.check_teleop_collision(qpos_cmd)
+        # Self: fast bool gate (stop_at_first=True), detail only on hit.
+        if profile.check_self_collision:
+            if self.ik_mgr.has_self_collision(qpos_cmd):
+                info = self.ik_mgr.check_self_collision(qpos_cmd)
+                if info:
+                    return (
+                        f"IK result in self-collision ({info.summary}), holding.",
+                        {"collision": info.to_dict()},
+                    )
 
-        if profile.check_self_collision and has_self:
-            info = self.ik_mgr.check_self_collision(qpos_cmd)
-            if info:
-                return (
-                    f"IK result in self-collision ({info.summary}), holding.",
-                    {"collision": info.to_dict()},
-                )
-        if profile.check_env_collision and has_env:
+        # Env: Tier2 FCL (Tier1 pre-filter → Tier2 mesh only when near table)
+        if profile.check_env_collision and self.ik_mgr.has_env_collision(qpos_cmd):
             return (
                 "IK result in environment collision (table/obstacle), holding.",
                 {"env_collision": True},
@@ -424,11 +423,9 @@ class TeleopIKSolver:
                 # Null-space failure is non-critical — skip and use raw IK result.
                 pass
 
-        # ── Collision safety gates (teleop hot path) ──
-        # Unified single-FK check (~35 μs) via CollisionModel.check_teleop_collision().
-        # Self-collision: full FCL (computeCollisions, stop_at_first).
-        # Env collision: Tier-1-only Z-min (conservative, zero FCL cost).
-        # Path planning uses the full two-tier env check via check_env_collision().
+        # ── Collision safety gates ──
+        # Self: FCL (stop_at_first=True for fast gate, detail on hit).
+        # Env: full two-tier (Tier1 Z-min + Tier2 FCL mesh-mesh).
         collision_reason, collision_extra = self._check_teleop_collision_gate(
             qpos_cmd, profile,
         )
