@@ -32,6 +32,9 @@ Usage::
     cm.add_box_obstacle("table", [1.0,2.0,0.04], [0.5, 0.0, -0.04])
     cm.check_env_collision(qpos)            # bool — full two-tier (path planning)
     cm.check_env_collision_fast(qpos)       # bool — Tier 1 only (teleop hot path)
+    cm.check_teleop_collision(qpos)         # (has_self, has_env) — single-FK (teleop)
+    cm.remove_obstacle("table")             # remove a single obstacle
+    cm.clear_obstacles()                    # remove all obstacles
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
+    from .collision_config import CollisionConfig
     from .types import CollisionInfo
 
 logger = get_logger(__name__)
@@ -134,6 +138,7 @@ class CollisionModel:
         urdf_path: str | None = None,
         srdf_path: str | None = None,
         package_dir: str | None = None,
+        collision_config: "CollisionConfig | None" = None,
     ) -> None:
         import coal as fcl
         import pinocchio as pin
@@ -141,6 +146,14 @@ class CollisionModel:
         self._pin = pin
         self._fcl = fcl
         self._hand_dof = hand_dof
+
+        # Tier margins from CollisionConfig (A7), with module-constant fallback
+        if collision_config is not None:
+            self._z_tier1_margin = collision_config.tier1_z_margin
+            self._z_tier2_margin = collision_config.tier2_z_margin
+        else:
+            self._z_tier1_margin = _Z_TIER1_MARGIN
+            self._z_tier2_margin = _Z_TIER2_MARGIN
 
         pkg = package_dir or str(_XHAND_DIR)
         _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
@@ -166,14 +179,32 @@ class CollisionModel:
             self._collision_model.addCollisionPair(pin.CollisionPair(i, j))
         pin.removeCollisionPairs(self._model, self._collision_model, _srdf)
 
+        # Selectively re-enable high-risk cross-finger collision pairs (G1).
+        # SRDF Never rules disable ALL hand self-collision (483 rules) to avoid
+        # the 66 finger-to-finger pair explosion.  We explicitly re-enable only
+        # the thumb_tip ↔ index_tip pair — the most common pinch-contact risk.
+        # Other cross-finger pairs remain disabled (hardware torque limits +
+        # low collision risk in normal operation).
+        if hand_dof:
+            tip_geom_map: dict[str, int] = {}
+            for i in range(self._collision_model.ngeoms):
+                tip_geom_map[self._collision_model.geometryObjects[i].name] = i
+            thumb_key = "right_hand_thumb_rota_tip_0"
+            index_key = "right_hand_index_rota_tip_0"
+            if thumb_key in tip_geom_map and index_key in tip_geom_map:
+                self._collision_model.addCollisionPair(
+                    pin.CollisionPair(tip_geom_map[thumb_key], tip_geom_map[index_key])
+                )
+
         self._collision_data = self._collision_model.createData()
 
         # --- Obstacle tracking ---
         self._obstacle_names: set[str] = set()
-        self._obstacle_geom_ids: list[int] = []  # geometry object IDs for env obstacles
         self._robot_geom_ids: list[int] = []      # non-static robot geometry IDs (cached for env checks)
-        self._obstacle_boxes: dict[int, tuple[float, float, float, float, float, float]] = {}
-        # obs_id → (x_min, x_max, y_min, y_max, z_min, z_max) in model base frame
+        self._obstacle_boxes: dict[str, tuple[float, float, float, float, float, float]] = {}
+        # name → (x_min, x_max, y_min, y_max, z_min, z_max) in model base frame
+        self._obs_z_max: float = float('-inf')    # cached max Z of all obstacles (P6)
+        self._fcl_request: "fcl.CollisionRequest" = self._fcl.CollisionRequest()  # reusable (P7)
 
         self._nq: int = self._model.nq
         self._link_names: list[str] = (
@@ -398,7 +429,7 @@ class CollisionModel:
         Obstacle pairs are NOT registered in the main model, so self-collision
         checks are unaffected.
         """
-        if not self._obstacle_geom_ids:
+        if not self._obstacle_names or not self._robot_geom_ids:
             return False
 
         qpos = self._update_placements(qpos)
@@ -406,29 +437,26 @@ class CollisionModel:
 
         # ── Tier 1: Z-min filter ──
         robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
-        obs_z_max = max(
-            (self._obstacle_boxes[oid][_BB_ZMAX]
-             for oid in self._obstacle_geom_ids if oid in self._obstacle_boxes),
-            default=float('-inf'),
-        )
         # Guard against NaN propagation from bad hand_qpos (e.g. uninitialized or NaN input)
-        if not np.isfinite(robot_z_min) or not np.isfinite(obs_z_max):
+        if not np.isfinite(robot_z_min):
             return True  # conservative: assume collision when FK is invalid
-        if robot_z_min > obs_z_max + _Z_TIER1_MARGIN:
+        if robot_z_min > self._obs_z_max + self._z_tier1_margin:
             return False
 
         # ── Tier 2: Z-filtered FCL ──
-        request = self._fcl.CollisionRequest()
         result = self._fcl.CollisionResult()
-        for obs_id in self._obstacle_geom_ids:
-            bb = self._obstacle_boxes.get(obs_id)
+        for name in self._obstacle_names:
+            bb = self._obstacle_boxes.get(name)
             if bb is None:
+                continue
+            obs_id = self._get_obstacle_geom_id(name)
+            if obs_id is None:
                 continue
             obs_geom = self._collision_model.geometryObjects[obs_id]
             obs_placement = oMg[obs_id]
             obs_z_max_i = bb[_BB_ZMAX]
             for robot_id in self._robot_geom_ids:
-                if oMg[robot_id].translation[2] > obs_z_max_i + _Z_TIER2_MARGIN:
+                if oMg[robot_id].translation[2] > obs_z_max_i + self._z_tier2_margin:
                     continue
                 result.clear()
                 try:
@@ -436,7 +464,7 @@ class CollisionModel:
                         obs_geom.geometry, obs_placement,
                         self._collision_model.geometryObjects[robot_id].geometry,
                         oMg[robot_id],
-                        request, result,
+                        self._fcl_request, result,
                     )
                 except Exception:
                     logger.warning("FCL collide() failed — treating as collision (conservative)", exc_info=True)
@@ -456,20 +484,15 @@ class CollisionModel:
         In practice, teleop operators keep the hand visibly above the table, so
         Tier 1 almost always passes and this returns False.
         """
-        if not self._obstacle_geom_ids:
+        if not self._obstacle_names or not self._robot_geom_ids:
             return False
         qpos = self._update_placements(qpos)
         oMg = self._collision_data.oMg
         robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
-        obs_z_max = max(
-            (self._obstacle_boxes[oid][_BB_ZMAX]
-             for oid in self._obstacle_geom_ids if oid in self._obstacle_boxes),
-            default=float('-inf'),
-        )
         # Guard against NaN propagation from bad hand_qpos
-        if not np.isfinite(robot_z_min) or not np.isfinite(obs_z_max):
+        if not np.isfinite(robot_z_min):
             return True  # conservative: assume collision when FK is invalid
-        return robot_z_min <= obs_z_max + _Z_TIER1_MARGIN
+        return robot_z_min <= self._obs_z_max + self._z_tier1_margin
 
     def check_teleop_collision(self, qpos: np.ndarray) -> tuple[bool, bool]:
         """Single-FK self + env Tier-1 collision check for teleop hot path (~35 μs).
@@ -495,18 +518,13 @@ class CollisionModel:
 
         # Env collision: Tier-1 Z-min on the SAME placements (zero extra FK)
         has_env = False
-        if self._obstacle_geom_ids:
+        if self._obstacle_names and self._robot_geom_ids:
             oMg = self._collision_data.oMg
             robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
-            obs_z_max = max(
-                (self._obstacle_boxes[oid][_BB_ZMAX]
-                 for oid in self._obstacle_geom_ids if oid in self._obstacle_boxes),
-                default=float('-inf'),
-            )
-            if not np.isfinite(robot_z_min) or not np.isfinite(obs_z_max):
+            if not np.isfinite(robot_z_min):
                 has_env = True  # conservative: assume collision when FK is invalid
             else:
-                has_env = robot_z_min <= obs_z_max + _Z_TIER1_MARGIN
+                has_env = robot_z_min <= self._obs_z_max + self._z_tier1_margin
 
         return has_self, has_env
 
@@ -539,11 +557,10 @@ class CollisionModel:
         shape = self._fcl.Box(half_extents[0] * 2, half_extents[1] * 2, half_extents[2] * 2)
         pose = self._pin.SE3(rot, np.array(position, dtype=np.float64))
         obj = self._pin.GeometryObject(name, 0, pose, shape)
-        obj_id = self._collision_model.addGeometryObject(obj)
+        self._collision_model.addGeometryObject(obj)
         # Do NOT add collision pairs to the main model — env collision uses
         # direct FCL collide() against _robot_geom_ids, keeping the main
         # model's computeCollisions() self-collision-only (~20% faster).
-        self._obstacle_geom_ids.append(obj_id)
         self._obstacle_names.add(name)
 
         # Cache world AABB for fast pre-filter in check_env_collision().
@@ -553,16 +570,18 @@ class CollisionModel:
         hx, hy, hz = half_extents
         cx, cy, cz = position
         if rotation is None or np.allclose(rot, np.eye(3)):
-            self._obstacle_boxes[obj_id] = (
+            self._obstacle_boxes[name] = (
                 cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz,
             )
         else:
             # Conservative: sphere radius = box half-diagonal
             r = float(np.sqrt(hx * hx + hy * hy + hz * hz))
-            self._obstacle_boxes[obj_id] = (
+            self._obstacle_boxes[name] = (
                 cx - r, cx + r, cy - r, cy + r, cz - r, cz + r,
             )
 
+        # Update cached obstacle Z-max (P6)
+        self._obs_z_max = max(box[_BB_ZMAX] for box in self._obstacle_boxes.values()) if self._obstacle_boxes else float('-inf')
         self._collision_data = self._collision_model.createData()
         logger.info("Added box obstacle '%s' at (%s) half_extents=%s", name, position, half_extents)
 
@@ -586,9 +605,52 @@ class CollisionModel:
             position=(x_center, 0.0, table_height - half_z),
         )
 
+    def remove_obstacle(self, name: str) -> bool:
+        """Remove a box obstacle by name.
+
+        Returns True if the obstacle was found and removed, False otherwise.
+        After removal, the collision data is refreshed and the Z-max cache
+        is updated.
+        """
+        if name not in self._obstacle_names:
+            return False
+        self._collision_model.removeGeometryObject(name)
+        self._obstacle_names.discard(name)
+        self._obstacle_boxes.pop(name, None)
+        # Update cached Z-max
+        self._obs_z_max = max(
+            (box[_BB_ZMAX] for box in self._obstacle_boxes.values()),
+            default=float('-inf'),
+        )
+        self._collision_data = self._collision_model.createData()
+        logger.info("Removed obstacle '%s'", name)
+        return True
+
+    def clear_obstacles(self) -> int:
+        """Remove all box obstacles.  Returns the number of obstacles cleared."""
+        count = len(self._obstacle_names)
+        for name in list(self._obstacle_names):
+            self._collision_model.removeGeometryObject(name)
+        self._obstacle_names.clear()
+        self._obstacle_boxes.clear()
+        self._obs_z_max = float('-inf')
+        self._collision_data = self._collision_model.createData()
+        logger.info("Cleared %d obstacle(s)", count)
+        return count
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _get_obstacle_geom_id(self, name: str) -> int | None:
+        """Find the geometry object index for an obstacle by name.
+
+        Returns None if the obstacle is not found in the geometry model.
+        """
+        for i, obj in enumerate(self._collision_model.geometryObjects):
+            if obj.name == name:
+                return i
+        return None
 
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
@@ -601,6 +663,30 @@ class CollisionModel:
     def _get_geom_object_name(self, geom_id: int) -> str:
         """Get the geometry object name."""
         return self._collision_model.geometryObjects[geom_id].name
+
+    def pad_arm_for_fk(self, qpos_arm: np.ndarray) -> np.ndarray:
+        """Pad 7-DOF arm qpos to full model dimension for FK queries.
+
+        Used by external FK consumers (e.g. FingertipDeskSafety) that need
+        a full qpos for the Pinocchio model.  In 7-DOF mode the model already
+        has hand joints fixed at home, so arm qpos is returned as-is.  In
+        19-DOF mode the hand DOFs are taken from the ``_hand_qpos`` buffer
+        (set via ``set_hand_qpos()``), falling back to zeros when the buffer
+        has not been initialized.
+
+        Args:
+            qpos_arm: 7-DOF arm joint angles [rad].
+
+        Returns:
+            Full qpos of shape ``(self._nq,)`` suitable for FK.
+        """
+        qpos = np.asarray(qpos_arm, dtype=np.float64)
+        if qpos.shape != (7,):
+            raise ValueError(f"Expected arm qpos shape (7,), got {qpos.shape}")
+        if not self._hand_dof:
+            return qpos
+        hand = self._hand_qpos if self._hand_qpos_initialized else np.zeros(_HAND_DOF_COUNT, dtype=np.float64)
+        return np.concatenate([qpos, hand])
 
     # ------------------------------------------------------------------
     # Properties
@@ -624,3 +710,13 @@ class CollisionModel:
     def arm_slice(self) -> slice:
         """Slice to extract arm-only qpos: ``qpos[cm.arm_slice]`` → ``(7,)``."""
         return self._arm_slice
+
+    @property
+    def pinocchio_model(self):
+        """The underlying Pinocchio model (read-only)."""
+        return self._model
+
+    @property
+    def pinocchio_data(self):
+        """The underlying Pinocchio data (read-only)."""
+        return self._data

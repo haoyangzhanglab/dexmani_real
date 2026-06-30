@@ -341,7 +341,14 @@ class TeleopController:
 
         # ── 6. Pre-send validation ──
         if not self.dry_run:
-            action_valid, fail_reason = validate_action(self.robot, action, actual_arm_qpos=arm_qpos)
+            # Defence in depth (S4): pass the CollisionModel fast-check as an
+            # independent second collision gate beyond the IK-layer check.
+            env_col_check = None
+            if self.robot.planner is not None:
+                env_col_check = self.robot.planner.collision_model.check_env_collision_fast
+            action_valid, fail_reason = validate_action(
+                self.robot, action, actual_arm_qpos=arm_qpos, env_collision_check=env_col_check,
+            )
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
                     self._escalate_to_emergency(f"Robot error before send: {fail_reason}")

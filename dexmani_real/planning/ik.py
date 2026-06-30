@@ -389,11 +389,17 @@ class TeleopIKSolver:
         profile: TeleopProfile,
         report: dict[str, Any],
         method: str,
+        jacobian: np.ndarray | None = None,
     ) -> IKResult:
         """Canonicalize IK result and compute tracking error.
 
         Speed limiting is NOT done here — it is handled exclusively by
         XArm7._limit_joint_step() in the hardware driver layer.
+
+        Args:
+            jacobian: Optional pre-computed 6×7 EEF Jacobian at ``target_qpos``.
+                When provided (from diff IK's final iteration), avoids ~80 μs
+                FK+Jacobian recomputation in the nullspace optimisation path (P5).
         """
         qpos_cmd = self.ik_mgr.canonicalize_qpos(target_qpos, previous_qpos_cmd)
 
@@ -403,7 +409,8 @@ class TeleopIKSolver:
         # safety gate covers the adjusted result.
         if profile.enable_nullspace_optimization:
             try:
-                jacobian, _eef_world = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
+                if jacobian is None:
+                    jacobian, _eef_world = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
                 from .nullspace import apply_nullspace_optimization
 
                 qpos_cmd = apply_nullspace_optimization(
@@ -503,8 +510,10 @@ class TeleopIKSolver:
                 )
 
         iterations = 0
+        last_jacobian: np.ndarray | None = None  # P5: reuse in nullspace path
         for iterations in range(max_iter):
             jacobian, current_pose = self.kin.compute_eef_jacobian_and_pose_world(qpos)
+            last_jacobian = jacobian  # cache for nullspace FK reuse (P5)
 
             # 6D error in world frame (no step limit during internal iterations).
             error_world = pose_error_vector(
@@ -558,5 +567,6 @@ class TeleopIKSolver:
             profile=profile,
             report=diff_report,
             method="differential_ik",
+            jacobian=last_jacobian,
         )
 

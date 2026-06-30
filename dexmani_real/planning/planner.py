@@ -106,7 +106,7 @@ class XArm7MotionPlanner:
             base_pose_world=base_pose_world,
             mplib=self.mplib,
         )
-        self.collision_model = CollisionModel(hand_dof=hand_dof)
+        self.collision_model = CollisionModel(hand_dof=hand_dof, collision_config=config.collision)
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
@@ -122,8 +122,7 @@ class XArm7MotionPlanner:
         if config.collision is not None:
             try:
                 self.desk_safety = FingertipDeskSafety(
-                    pinocchio_model=self.pinocchio_model,
-                    mp_planner=self.mplib_planner,
+                    collision_model=self.collision_model,
                     collision_config=config.collision,
                 )
             except (ValueError, RuntimeError, IndexError):
@@ -186,12 +185,12 @@ class XArm7MotionPlanner:
         )
 
         # Diagnostic: when hand_dof=True, CollisionModel auto-expands arm qpos
-        # with _hand_qpos.  If the buffer was never set (still all-zero), the
-        # collision geometry uses open-hand pose which may not match reality.
-        if self.collision_model.hand_dof and not self.collision_model._hand_qpos.any():
+        # with _hand_qpos.  Warn if the buffer was never initialized — all-zero
+        # is ambiguous (could be a valid home pose), so use the dedicated flag.
+        if self.collision_model.hand_dof and not self.collision_model._hand_qpos_initialized:
             logger.warning(
-                "plan_path: _hand_qpos is all-zero (never set).  "
-                "CollisionModel env/self checks may use stale hand geometry.  "
+                "plan_path: _hand_qpos was never set — "
+                "CollisionModel env/self checks use zero (open-hand) pose.  "
                 "Call set_hand_qpos() before plan_path() to sync."
             )
 

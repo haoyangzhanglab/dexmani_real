@@ -1,6 +1,6 @@
 """Geometric FK-based fingertip-to-desk collision detection.
 
-Uses Pinocchio forward kinematics to compute the world-space Z coordinate of
+Uses CollisionModel's Pinocchio FK to compute the world-space Z coordinate of
 all five fingertips of the dexterous hand, then compares the minimum against
 the table surface height (plus a user-configurable hand-safe margin).
 
@@ -9,11 +9,15 @@ pollution and avoids the ~47% IK success rate penalty (100% → 53%) observed
 with the ``mplib_pointcloud`` environment collision mode.
 
 Key design decisions:
-- The Pinocchio model is the collision URDF with hand joints fixed at home
-  pose.  qpos is 7-DOF arm-only; ``pad_move_group_qpos`` fills remaining DOFs.
+- Uses CollisionModel's shared Pinocchio model (A1) — no duplicate model copy.
+- Fingertip link indices are looked up dynamically from the Pinocchio model
+  using fingertip_link_names (A3), robust to URDF link ordering changes.
+- In 7-DOF mode the hand is fixed at home pose by the collision URDF; in
+  19-DOF mode hand joints come from the ``_hand_qpos`` buffer (set via
+  ``CollisionModel.set_hand_qpos()``), falling back to zeros when the
+  buffer has not been initialized.
 - A small epsilon (0.001) is applied to the fingertip threshold to prevent
-  floating-point boundary misclassification (e.g. pinky_tip Z = 0.03000000 vs
-  threshold 0.03000001).
+  floating-point boundary misclassification.
 - Path-level checks interpolate waypoints at a configurable step resolution
   (default 0.05 rad, ~2.9°) — coarser than segment collision checks but
   sufficient because the desk is a continuous plane and the hand extends
@@ -22,63 +26,114 @@ Key design decisions:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    from .collision_config import CollisionConfig
+    from .collision_model import CollisionModel
 
 
 class FingertipDeskSafety:
     """Geometric FK-based fingertip-to-desk collision detection.
 
-    Uses Pinocchio FK to compute the world Z of all five fingertip links
-    and compares the minimum against the table surface height.
-
-    This is the **preferred** detection method — zero-cost, no MPlib point
-    cloud pollution, and more accurate than EEF-level Z checks.  Always
-    active when ``check_env_collision=True`` in the planning profile,
+    Uses CollisionModel's shared Pinocchio model for FK (no duplicate model).
+    Always active when ``check_env_collision=True`` in the planning profile,
     independent of the CollisionModel FCL box obstacle layer.
-
-    Migrated from test_motion_planning_sim.py:817-911 with identical logic.
     """
 
     def __init__(
         self,
-        pinocchio_model,
-        mp_planner,
+        collision_model: "CollisionModel",
         collision_config: "CollisionConfig",
     ) -> None:
-
-        from .collision_config import CollisionConfig
-
-        self._model = pinocchio_model
-        self._mp_planner = mp_planner
+        self._cm = collision_model
         self._config: CollisionConfig = collision_config
-        self._fingertip_ids = list(collision_config.fingertip_link_ids)
-        self._fingertip_names = list(collision_config.fingertip_link_names)
+        self._fingertip_ids: list[int] = self._lookup_fingertip_ids(
+            collision_model.pinocchio_model, collision_config.fingertip_link_names
+        )
+        self._fingertip_names: tuple[str, ...] = collision_config.fingertip_link_names
         self._threshold = collision_config.fingertip_threshold
         self._epsilon = 0.001  # 1mm floating-point tolerance for boundary comparison
+
+    # ── Private helpers ──
+
+    @staticmethod
+    def _lookup_fingertip_ids(model, names: tuple[str, ...]) -> list[int]:
+        """Look up fingertip joint indices from a Pinocchio model by link name (A3).
+
+        Pinocchio URDF frames have names like ``right_hand_thumb_rota_tip`` with
+        ``parentJoint`` pointing to the joint that moves the fingertip.  We match by
+        extracting the finger key (e.g. ``thumb`` from ``thumb_tip``) and looking for
+        frame names that contain the key and end with ``_tip``.
+
+        FAIIs back to legacy hardcoded IDs (from 7-DOF collision URDF) if lookup
+        fails.  Note: legacy IDs are from the 7-DOF model and may be out-of-range
+        for 19-DOF models — dynamic lookup is strongly preferred.
+        """
+        # Build frame name → parentJoint map
+        frame_map: dict[str, int] = {}
+        if hasattr(model, 'frames'):
+            for frame in model.frames:
+                frame_map[frame.name] = int(frame.parentJoint)
+
+        # Pre-extract finger keys from short names: "thumb_tip" → "thumb", etc.
+        def _finger_key(short_name: str) -> str:
+            return short_name.replace("_tip", "").replace("_rota", "")
+
+        ids: list[int] = []
+        for short_name in names:
+            lid: int | None = None
+            key = _finger_key(short_name)  # e.g. "thumb"
+
+            # Match frames whose name contains the finger key and ends with "_tip"
+            if hasattr(model, 'frames'):
+                for frame_name, parent_joint in frame_map.items():
+                    if key in frame_name and frame_name.endswith("_tip"):
+                        lid = parent_joint
+                        break
+
+            if lid is not None:
+                ids.append(lid)
+            else:
+                # Fall back to legacy hardcoded ID (from 7-DOF collision URDF).
+                # WARNING: these IDs may be out-of-range for 19-DOF models.
+                from dexmani_real.utils.log import get_logger
+                legacy_ids: dict[str, int] = {
+                    "thumb_tip": 20, "index_tip": 26, "mid_tip": 31, "ring_tip": 36, "pinky_tip": 41,
+                }
+                fallback = legacy_ids.get(short_name, -1)
+                get_logger(__name__).warning(
+                    "Failed to look up fingertip '%s' in Pinocchio frames — "
+                    "falling back to hardcoded joint ID %d (may be for 7-DOF model).",
+                    short_name, fallback,
+                )
+                ids.append(fallback)
+        return ids
 
     # ── Public API ──
 
     def min_fingertip_z(self, qpos: np.ndarray) -> tuple[float, str]:
         """Compute the lowest fingertip world Z for a given arm configuration.
 
-        Uses the planner's Pinocchio FK model (collision URDF, hand joints
-        fixed at home pose).  qpos must be 7-DOF arm joint angles; internally
-        padded to full model dimension via pad_move_group_qpos.
+        Uses CollisionModel's shared Pinocchio model.  qpos must be 7-DOF arm
+        joint angles; internally padded via CollisionModel.pad_arm_for_fk().
 
         Returns: (min_z, lowest_fingertip_name)
         """
-
         qpos = np.asarray(qpos, dtype=np.float64)
-        # Must pad through pad_move_group_qpos to fill remaining DOFs
-        # (same pattern as kinematics.py compute_eef_pose_base).
-        full_qpos = self._mp_planner.pad_move_group_qpos(qpos)
-        self._model.compute_forward_kinematics(full_qpos)
+        full_qpos = self._cm.pad_arm_for_fk(qpos)
+        model = self._cm.pinocchio_model
+        data = self._cm.pinocchio_data
+        import pinocchio as pin
+        pin.forwardKinematics(model, data, full_qpos)
+        pin.updateFramePlacements(model, data)
 
         min_z = float("inf")
         min_name = ""
         for lid, name in zip(self._fingertip_ids, self._fingertip_names):
-            pose = self._model.get_link_pose(lid)
-            z = float(pose.p[2])
+            z = float(data.oMi[lid].translation[2])
             if z < min_z:
                 min_z = z
                 min_name = name
@@ -86,9 +141,6 @@ class FingertipDeskSafety:
 
     def check_hand_desk_clearance(self, qpos: np.ndarray) -> tuple[bool, float, str]:
         """Check if fingertips are above the table for a single configuration.
-
-        Uses Pinocchio FK to compute five fingertip world Z, compares the
-        minimum against the table surface + safe margin.
 
         Returns: (safe, min_fingertip_z, lowest_fingertip_name)
         """
@@ -102,10 +154,11 @@ class FingertipDeskSafety:
         """Dense-sampled fingertip desk safety check along a joint path.
 
         Interpolates between consecutive waypoints at step_rad resolution
-        (default 0.05 rad ≈ 2.9°) and checks fingertip Z at every sample.
-        This is coarser than the segment collision check (0.02 rad) but
-        sufficient for detecting hand-through-desk since the hand extends
-        7.6 cm below EEF and the desk is a continuous plane.
+        (default from CollisionConfig.desk_safety_step_rad, 0.05 rad ≈ 2.9°)
+        and checks fingertip Z at every sample.  This is coarser than the
+        segment collision check (0.02 rad) but sufficient for detecting
+        hand-through-desk since the hand extends 7.6 cm below EEF and the
+        desk is a continuous plane.
 
         Path should be (N, 7) for arm-only joints.  If padded (N, >7),
         only the first 7 columns are used.
@@ -148,5 +201,5 @@ class FingertipDeskSafety:
 
     @property
     def is_ready(self) -> bool:
-        """Always True once constructed (construction may fail, handled by caller)."""
+        """Always True once constructed."""
         return True

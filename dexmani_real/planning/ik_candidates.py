@@ -23,6 +23,7 @@ _REJECT_CATEGORY_MAP: dict[str, str] = {
     "IK candidate exceeds max_ik_delta_deg.": "delta",
     "IK candidate pose error exceeds threshold.": "pose_error",
     "IK candidate in self-collision.": "collision",
+    "IK candidate in environment collision.": "env_collision",
 }
 
 
@@ -193,6 +194,11 @@ class IKCandidateManager:
             if collision_info:
                 report["reason"] = "IK candidate in self-collision."
                 report["collision"] = collision_info.to_dict()
+                return False, report
+
+        if profile.check_env_collision and self._cm is not None:
+            if self._cm.check_env_collision_fast(qpos):
+                report["reason"] = "IK candidate in environment collision."
                 return False, report
 
         return True, report

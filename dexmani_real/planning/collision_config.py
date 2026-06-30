@@ -80,9 +80,23 @@ class CollisionConfig(FromDictMixin):
     """Joint-space step size [rad] for dense segment collision interpolation.
     Default 0.02 rad ~1.15° (ref: dimos collision_step_size)."""
 
-    desk_safety_step_rad: float = 0.02
+    desk_safety_step_rad: float = 0.05
     """Joint-space step size [rad] for fingertip desk safety path checks.
-    Matches collision_step_size for consistent sampling resolution."""
+
+    Default 0.05 rad (≈2.9°).  The desk is a continuous plane — fingertip Z
+    changes smoothly, so a coarser step than collision_step_size (0.02) is
+    sufficient and halves FK calls (P4 optimisation)."""
+
+    # ── Tier margins for env collision Z-filter ──
+    tier1_z_margin: float = 0.05
+    """Tier 1 Z-min pre-filter margin [m].
+    4 cm fingertip mesh half-extent + 1 cm safety margin."""
+
+    tier2_z_margin: float = 0.25
+    """Tier 2 per-geometry Z skip margin [m].
+    Robot geometries whose FK centre is this far above an obstacle are skipped
+    in the expensive FCL mesh-mesh check.  Only hand/wrist/forearm geometries
+    pass through to Tier 2."""
 
     # ── Derived properties ──
 

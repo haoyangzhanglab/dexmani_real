@@ -8,6 +8,8 @@ Ref: ManiUniCon validate_action pattern.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
@@ -21,6 +23,7 @@ def validate_action(
     action: RobotAction,
     *,
     actual_arm_qpos: np.ndarray | None = None,
+    env_collision_check: Callable[[np.ndarray], bool] | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
 
@@ -32,6 +35,9 @@ def validate_action(
          Real-time position is preferred because the "hold last command"
          fallback may drift past workspace bounds if commands progressively
          diverge from actual positions.
+      4. Environment collision (defence in depth, S4) — independent
+         second check beyond the IK-layer collision gate.  Uses the
+         CollisionModel Tier-1 fast check (~17μs).
 
     Returns (ok, reason_string).
     """
@@ -51,5 +57,11 @@ def validate_action(
     arm_eef = robot.kinematics.compute_eef_pose_world(qpos_for_fk)
     if not robot.workspace.check(arm_eef.p):
         return False, "workspace position violation"
+
+    # 4. Environment collision — defence in depth (S4)
+    if env_collision_check is not None:
+        qpos_for_col = actual_arm_qpos if actual_arm_qpos is not None else action.arm_qpos_cmd
+        if env_collision_check(qpos_for_col):
+            return False, "environment collision (pre-send gate)"
 
     return True, "ok"
