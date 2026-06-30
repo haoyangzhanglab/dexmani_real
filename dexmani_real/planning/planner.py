@@ -55,7 +55,7 @@ class XArm7MotionPlanner:
         config: XArm7PlannerConfig,
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
-        hand_dof: bool = False,
+        hand_dof: bool = True,
     ) -> None:
         import mplib
 
@@ -107,7 +107,7 @@ class XArm7MotionPlanner:
             mplib=self.mplib,
         )
         self.collision_model = CollisionModel(hand_dof=hand_dof)
-        self.ik_mgr = IKCandidateManager(self.kin)
+        self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
         self.teleop_solver = TeleopIKSolver(self.kin, self.ik_mgr, self.teleop_profile)
@@ -396,7 +396,7 @@ class XArm7MotionPlanner:
                     return False
         if profile.check_env_collision:
             for q in samples:
-                if self.ik_mgr.has_env_collision(q):
+                if self.ik_mgr.has_env_collision_fast(q):
                     return False
         # Geometric FK desk safety — check the segment endpoints
         if self.desk_safety is not None and profile.check_env_collision:

@@ -1,7 +1,7 @@
 """Standalone Pinocchio collision model for xArm7 + XHand.
 
 Builds a lightweight Pinocchio collision model from the collision URDF, independent of
-MPlib. Uses T-Rex's `pin.computeCollisions()` pattern for self-collision and environment
+MPlib. Uses T-Rex's ``pin.computeCollisions()`` pattern for self-collision and environment
 collision detection.
 
 A single unified SRDF controls collision pair filtering for both models:
@@ -11,7 +11,16 @@ A single unified SRDF controls collision pair filtering for both models:
   Enables arm-wrist to hand collision detection while keeping hand self-collision
   disabled (291 inter-finger Never rules retained).
 
-Performance: ~0.001ms per single-point check for a 7-DOF / 34-geometry / 141-pair model.
+Performance (post-optimisation, measured on i9-13900K):
+
+=============  ==========  ============  ===========================================
+Operation       7-DOF       19-DOF        Notes
+=============  ==========  ============  ===========================================
+self-collision    ~30 μs     ~35 μs      ``pin.computeCollisions(stop_at_first)``
+env (safe)       ~17 μs      ~17 μs      Tier 1 Z-min filter, zero FCL calls
+env (near)          —       2–8 ms       Tier 2 FCL mesh-mesh (hand near table)
+segment (Δ=0.5)     —      ~870 μs      step_size=0.02 rad, 25 samples × ~35 μs
+=============  ==========  ============  ===========================================
 
 Usage::
 
@@ -21,7 +30,8 @@ Usage::
     cm.check_self_collision(qpos)           # bool
     cm.check_self_collision_details(qpos)   # CollisionInfo (from types.py)
     cm.add_box_obstacle("table", [1.0,2.0,0.04], [0.5, 0.0, -0.04])
-    cm.check_env_collision(qpos)            # bool (obstacles only)
+    cm.check_env_collision(qpos)            # bool — full two-tier (path planning)
+    cm.check_env_collision_fast(qpos)       # bool — Tier 1 only (teleop hot path)
 """
 
 from __future__ import annotations
@@ -64,6 +74,32 @@ _HAND_DOF_NAMES: tuple[str, ...] = (
 )
 _HAND_DOF_COUNT = 12  # number of active hand joints
 
+# User→URDF reorder map for set_hand_qpos().
+# Hardware and simulation return hand qpos in user order:
+#   [thumb_bend, thumb_rota1, thumb_rota2, index_bend, index_j1, index_j2,
+#    mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2]
+# But the URDF (and thus Pinocchio) expects:
+#   [index_bend, index_j1, index_j2, mid_j1, mid_j2,
+#    pinky_j1, pinky_j2, ring_j1, ring_j2,
+#    thumb_bend, thumb_rota1, thumb_rota2]
+# _hand_user_to_urdf[i] = user index for URDF slot i.
+_HAND_USER_TO_URDF: tuple[int, ...] = (3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2)
+
+# ── Box AABB tuple indices ──
+# ``_obstacle_boxes[obj_id]`` stores ``(x_min, x_max, y_min, y_max, z_min, z_max)``.
+# These constants name each slot for readable indexing.
+_BB_XMIN, _BB_XMAX, _BB_YMIN, _BB_YMAX, _BB_ZMIN, _BB_ZMAX = range(6)
+
+# ── Env collision tier margins ──
+# Tier 1: Z-min pre-filter — skip all FCL when lowest robot geometry is safely
+# above the highest obstacle.  0.02 m accounts for fingertip mesh extent (~4 cm
+# below fingertip centre).
+_Z_TIER1_MARGIN = 0.05  # [m] (4 cm fingertip mesh half-extent + 1 cm safety)
+# Tier 2: per-geometry Z skip — ignore robot geometries whose FK centre is more
+# than 0.25 m above the obstacle (arm base, shoulder, upper arm).  Only hand,
+# wrist, and forearm geometries (~15–25 of 39) pass through to FCL.
+_Z_TIER2_MARGIN = 0.25  # [m]
+
 
 class CollisionModel:
     """Standalone Pinocchio collision model for xArm7 + XHand.
@@ -72,11 +108,12 @@ class CollisionModel:
 
     - **7-DOF** (default, ``hand_dof=False``): arm-only collision model from the
       collision URDF (hand joints merged as fixed).  Accepts ``qpos`` of shape
-      ``(7,)``.  ~1.5μs/check.
+      ``(7,)``.  Self-collision ~30μs, env ~17μs (Tier 1).
 
     - **19-DOF** (``hand_dof=True``): full arm + hand collision model from the
       full URDF (hand joints active).  Accepts ``qpos`` of shape ``(19,)`` —
-      first 7 are arm joints, last 12 are hand joints.  ~64μs/check.
+      first 7 are arm joints, last 12 are hand joints.  Self-collision ~35μs,
+      env Tier 1 ~17μs, Tier 2 2–8ms (hand near table).
 
     Both modes use ``xarm7_xhand_collision_19dof.srdf``, which enables arm-wrist
     to hand collision detection and keeps hand self-collision disabled.
@@ -133,11 +170,21 @@ class CollisionModel:
 
         # --- Obstacle tracking ---
         self._obstacle_names: set[str] = set()
+        self._obstacle_geom_ids: list[int] = []  # geometry object IDs for env obstacles
+        self._robot_geom_ids: list[int] = []      # non-static robot geometry IDs (cached for env checks)
+        self._obstacle_boxes: dict[int, tuple[float, float, float, float, float, float]] = {}
+        # obs_id → (x_min, x_max, y_min, y_max, z_min, z_max) in model base frame
 
         self._nq: int = self._model.nq
         self._link_names: list[str] = (
             self._model.names.tolist() if hasattr(self._model.names, "tolist") else list(self._model.names)
         )
+
+        # Cache non-static robot geometry IDs for env collision queries.
+        self._robot_geom_ids = [
+            i for i in range(self._collision_model.ngeoms)
+            if self._collision_model.geometryObjects[i].parentJoint != 0
+        ]
 
         logger.info(
             "CollisionModel ready: %d DOF%s, %d geometries, %d collision pairs",
@@ -154,6 +201,7 @@ class CollisionModel:
 
         # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF)
         self._hand_qpos: np.ndarray = np.zeros(_HAND_DOF_COUNT, dtype=np.float64)
+        self._hand_qpos_initialized: bool = False
 
     # ------------------------------------------------------------------
     # qpos handling
@@ -166,13 +214,27 @@ class CollisionModel:
         and automatically concatenate with this buffer to form a full 19-DOF
         qpos.  Call this each frame before arm collision checks.
 
+        Accepts hand qpos in **user order** (hardware / simulation native):
+        ``[thumb_bend, thumb_rota1, thumb_rota2, index_bend, index_j1, index_j2,
+        mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2]``.
+
+        Internally reorders to URDF joint order for correct Pinocchio FK:
+        ``[index_…, mid_…, pinky_…, ring_…, thumb_…]``.
+
         Args:
-            hand_qpos: 12-DOF hand joint angles [rad].
+            hand_qpos: 12-DOF hand joint angles [rad] in **user order**.
+
+        Raises:
+            ValueError: If shape is wrong or values contain NaN/Inf.
         """
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
         if hand_qpos.shape != (_HAND_DOF_COUNT,):
             raise ValueError(f"Expected hand_qpos shape ({_HAND_DOF_COUNT},), got {hand_qpos.shape}")
-        self._hand_qpos = hand_qpos.copy()
+        if not np.all(np.isfinite(hand_qpos)):
+            raise ValueError("hand_qpos contains NaN or Inf — FK would silently fail")
+        # Reorder user→URDF: _hand_user_to_urdf[i] = which user index maps to URDF slot i
+        self._hand_qpos = hand_qpos[list(_HAND_USER_TO_URDF)]
+        self._hand_qpos_initialized = True
 
     def _to_full_qpos(self, qpos: np.ndarray) -> np.ndarray:
         """Normalize qpos for internal use, auto-expanding arm→full in hand_dof mode.
@@ -183,6 +245,12 @@ class CollisionModel:
         """
         qpos = np.asarray(qpos, dtype=np.float64)
         if self._hand_dof and qpos.shape == (7,):
+            if not self._hand_qpos_initialized:
+                logger.warning(
+                    "hand_qpos not initialized — collision checks use zero (open-hand) pose, "
+                    "which may not match actual hand configuration. "
+                    "Call set_hand_qpos() before collision checks."
+                )
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:
             raise ValueError(
@@ -196,14 +264,10 @@ class CollisionModel:
     # ------------------------------------------------------------------
 
     def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> tuple[np.ndarray, bool]:
-        """Run FK + update geometry placements + compute collisions.
+        """FK + update geometry placements + compute self-collisions.
 
         Returns ``(full_qpos, has_any_collision)`` where ``has_any_collision`` is
-        the return value of ``pin.computeCollisions()`` — True if at least one
-        collision pair is in collision, False if all pairs are collision-free.
-
-        Callers use ``has_any_collision`` to skip the per-pair iteration on the
-        common collision-free path, avoiding ~233 ``isCollision()`` calls per query.
+        the return value of ``pin.computeCollisions()``.
         """
         qpos = self._to_full_qpos(qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos)
@@ -215,6 +279,19 @@ class CollisionModel:
         )
         return qpos, has_any
 
+    def _update_placements(self, qpos: np.ndarray) -> np.ndarray:
+        """FK + update geometry placements only — no collision computation.
+
+        Used by env collision checks (which use direct FCL calls, not
+        ``computeCollisions``) and the Tier-1-only fast path.
+        """
+        qpos = self._to_full_qpos(qpos)
+        self._pin.forwardKinematics(self._model, self._data, qpos)
+        self._pin.updateGeometryPlacements(
+            self._model, self._data, self._collision_model, self._collision_data,
+        )
+        return qpos
+
     # ------------------------------------------------------------------
     # Self-collision
     # ------------------------------------------------------------------
@@ -222,22 +299,12 @@ class CollisionModel:
     def check_self_collision(self, qpos: np.ndarray) -> bool:
         """Check if qpos is in self-collision (fast bool, single point).
 
-        Uses ``stop_at_first_collision=True`` for early exit.
-
-        - 7-DOF model: ~1.5μs/check
-        - 19-DOF model: ~64μs/check
-
-        This is a drop-in replacement for MPlib's ``has_self_collision(qpos)``
-        in the teleop hot path, at ~1/100 the cost.
+        Uses ``stop_at_first_collision=True`` for early exit.  Obstacle pairs
+        are NOT registered in the main model (env checks use direct FCL), so
+        every collision result is a genuine self-collision.
         """
         _qpos, has_any = self._pin_update(qpos, stop_at_first=True)
-        if not has_any:
-            return False  # fast path: no collision at all → skip per-pair iteration
-        return any(
-            self._collision_data.collisionResults[i].isCollision()
-            and not self._is_obstacle_pair(self._collision_model.collisionPairs[i])
-            for i in range(len(self._collision_data.collisionResults))
-        )
+        return has_any
 
     def check_self_collision_details(self, qpos: np.ndarray) -> CollisionInfo:
         """Check self-collision and return structured ``CollisionInfo``.
@@ -249,15 +316,13 @@ class CollisionModel:
 
         _qpos, has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
-            return CollisionInfo.no_collision()  # fast path: no collision at all
+            return CollisionInfo.no_collision()
         results = self._collision_data.collisionResults
         pairs: list[CollisionPair] = []
         for i in range(len(results)):
             cr = results[i]
             if cr.isCollision():
                 cp = self._collision_model.collisionPairs[i]
-                if self._is_obstacle_pair(cp):
-                    continue  # skip obstacle pairs — these are env, not self
                 pairs.append(
                     CollisionPair(
                         link_name1=self._get_geom_link_name(cp.first),
@@ -275,70 +340,175 @@ class CollisionModel:
     # Segment collision checking
     # ------------------------------------------------------------------
 
-    def check_segment_collision_free(
-        self, q1: np.ndarray, q2: np.ndarray, step_size: float = 0.02,
+    def _check_segment_free(
+        self, q1: np.ndarray, q2: np.ndarray, step_size: float,
+        check_fn,
     ) -> bool:
-        """Check if the linear joint-space segment q1→q2 is self-collision-free.
+        """Generic dense segment interpolation with early exit on collision.
 
-        Interpolates at ``step_size`` (L∞ rad) resolution using the fast
-        ``check_self_collision()`` (stop_at_first_collision=True).
-
-        Returns True if all intermediate configurations are collision-free.
+        Interpolates at ``step_size`` (L∞ rad) resolution and calls ``check_fn(q)``
+        at each sample.  Returns True if all samples pass.
         """
         q1 = self._to_full_qpos(q1)
         q2 = self._to_full_qpos(q2)
         diff = q2 - q1
         dist = float(np.max(np.abs(diff)))
         if dist <= step_size:
-            return not self.check_self_collision(q2)
-        n_steps = int(np.ceil(dist / step_size))
-        for step in range(1, n_steps + 1):
-            alpha = step / n_steps
-            q = q1 + alpha * diff
-            if self.check_self_collision(q):
+            return not check_fn(q2)
+        n = int(np.ceil(dist / step_size))
+        for step in range(1, n + 1):
+            if check_fn(q1 + (step / n) * diff):
                 return False
         return True
+
+    def check_segment_collision_free(
+        self, q1: np.ndarray, q2: np.ndarray, step_size: float = 0.02,
+    ) -> bool:
+        """Check if the linear joint-space segment q1→q2 is self-collision-free."""
+        return self._check_segment_free(q1, q2, step_size, self.check_self_collision)
 
     def check_segment_env_collision_free(
         self, q1: np.ndarray, q2: np.ndarray, step_size: float = 0.02,
     ) -> bool:
         """Check if the linear joint-space segment q1→q2 is env-collision-free.
 
-        Returns early (True) when no obstacles are registered.
-        Returns True if all intermediate configurations are env-collision-free.
+        Returns True immediately when no obstacles are registered.
         """
         if not self._obstacle_names:
             return True
-        q1 = self._to_full_qpos(q1)
-        q2 = self._to_full_qpos(q2)
-        diff = q2 - q1
-        dist = float(np.max(np.abs(diff)))
-        if dist <= step_size:
-            return not self.check_env_collision(q2)
-        n_steps = int(np.ceil(dist / step_size))
-        for step in range(1, n_steps + 1):
-            alpha = step / n_steps
-            q = q1 + alpha * diff
-            if self.check_env_collision(q):
-                return False
-        return True
+        return self._check_segment_free(q1, q2, step_size, self.check_env_collision)
 
     # ------------------------------------------------------------------
     # Environment collision (obstacles only)
     # ------------------------------------------------------------------
 
     def check_env_collision(self, qpos: np.ndarray) -> bool:
-        """Check if qpos collides with any added environment obstacles."""
-        if not self._obstacle_names:
+        """Full two-tier env collision check (path planning, return-to-home).
+
+        Tier 1: Z-min pre-filter (~17 μs, zero FCL calls).
+            If the lowest robot geometry is safely above all obstacles, return
+            False immediately — the common case in teleop.
+
+        Tier 2: Z-filtered FCL (2–8 ms in 19-DOF mode).
+            Only triggers when a robot geometry is within 25 cm of an obstacle.
+            Arm base / shoulder / upper arm are skipped by Z filter; only hand,
+            wrist, and forearm geometries (~15–25 of 39) pass through to the
+            expensive FCL mesh-mesh check.
+
+        Obstacle pairs are NOT registered in the main model, so self-collision
+        checks are unaffected.
+        """
+        if not self._obstacle_geom_ids:
             return False
-        _qpos, has_any = self._pin_update(qpos, stop_at_first=True)
-        if not has_any:
-            return False  # fast path: no collision at all → skip per-pair iteration
-        for i in range(len(self._collision_data.collisionResults)):
-            if self._collision_data.collisionResults[i].isCollision():
-                if self._is_obstacle_pair(self._collision_model.collisionPairs[i]):
+
+        qpos = self._update_placements(qpos)
+        oMg = self._collision_data.oMg
+
+        # ── Tier 1: Z-min filter ──
+        robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
+        obs_z_max = max(
+            (self._obstacle_boxes[oid][_BB_ZMAX]
+             for oid in self._obstacle_geom_ids if oid in self._obstacle_boxes),
+            default=float('-inf'),
+        )
+        # Guard against NaN propagation from bad hand_qpos (e.g. uninitialized or NaN input)
+        if not np.isfinite(robot_z_min) or not np.isfinite(obs_z_max):
+            return True  # conservative: assume collision when FK is invalid
+        if robot_z_min > obs_z_max + _Z_TIER1_MARGIN:
+            return False
+
+        # ── Tier 2: Z-filtered FCL ──
+        request = self._fcl.CollisionRequest()
+        result = self._fcl.CollisionResult()
+        for obs_id in self._obstacle_geom_ids:
+            bb = self._obstacle_boxes.get(obs_id)
+            if bb is None:
+                continue
+            obs_geom = self._collision_model.geometryObjects[obs_id]
+            obs_placement = oMg[obs_id]
+            obs_z_max_i = bb[_BB_ZMAX]
+            for robot_id in self._robot_geom_ids:
+                if oMg[robot_id].translation[2] > obs_z_max_i + _Z_TIER2_MARGIN:
+                    continue
+                result.clear()
+                try:
+                    self._fcl.collide(
+                        obs_geom.geometry, obs_placement,
+                        self._collision_model.geometryObjects[robot_id].geometry,
+                        oMg[robot_id],
+                        request, result,
+                    )
+                except Exception:
+                    logger.warning("FCL collide() failed — treating as collision (conservative)", exc_info=True)
+                    return True  # conservative: assume collision on FCL error
+                if result.isCollision():
                     return True
         return False
+
+    def check_env_collision_fast(self, qpos: np.ndarray) -> bool:
+        """Tier-1-only env collision check for the teleop hot path (~17 μs, zero FCL).
+
+        Conservative: returns True when Z-min cannot rule out a collision
+        (i.e. some robot geometry is within ``_Z_TIER1_MARGIN`` of an obstacle).
+        The full ``check_env_collision()`` with Tier 2 FCL is reserved for path
+        planning and return-to-home, where the 2–8 ms penalty is acceptable.
+
+        In practice, teleop operators keep the hand visibly above the table, so
+        Tier 1 almost always passes and this returns False.
+        """
+        if not self._obstacle_geom_ids:
+            return False
+        qpos = self._update_placements(qpos)
+        oMg = self._collision_data.oMg
+        robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
+        obs_z_max = max(
+            (self._obstacle_boxes[oid][_BB_ZMAX]
+             for oid in self._obstacle_geom_ids if oid in self._obstacle_boxes),
+            default=float('-inf'),
+        )
+        # Guard against NaN propagation from bad hand_qpos
+        if not np.isfinite(robot_z_min) or not np.isfinite(obs_z_max):
+            return True  # conservative: assume collision when FK is invalid
+        return robot_z_min <= obs_z_max + _Z_TIER1_MARGIN
+
+    def check_teleop_collision(self, qpos: np.ndarray) -> tuple[bool, bool]:
+        """Single-FK self + env Tier-1 collision check for teleop hot path (~35 μs).
+
+        Replaces two separate FK calls (``check_self_collision`` + ``check_env_collision_fast``,
+        ~52 μs total) with a single FK+placements pass.  Self-collision uses
+        ``computeCollisions(stop_at_first=True)``; env collision uses the Tier-1
+        Z-min pre-filter on the same FK result (zero extra cost).
+
+        Returns ``(has_self_collision, has_env_collision)``.
+        """
+        qpos_full = self._to_full_qpos(qpos)
+        self._pin.forwardKinematics(self._model, self._data, qpos_full)
+        self._pin.updateGeometryPlacements(
+            self._model, self._data, self._collision_model, self._collision_data,
+        )
+
+        # Self-collision: full FCL with early exit on first contact
+        has_self = self._pin.computeCollisions(
+            self._model, self._data, self._collision_model, self._collision_data,
+            qpos_full, True,
+        )
+
+        # Env collision: Tier-1 Z-min on the SAME placements (zero extra FK)
+        has_env = False
+        if self._obstacle_geom_ids:
+            oMg = self._collision_data.oMg
+            robot_z_min = min(oMg[rid].translation[2] for rid in self._robot_geom_ids)
+            obs_z_max = max(
+                (self._obstacle_boxes[oid][_BB_ZMAX]
+                 for oid in self._obstacle_geom_ids if oid in self._obstacle_boxes),
+                default=float('-inf'),
+            )
+            if not np.isfinite(robot_z_min) or not np.isfinite(obs_z_max):
+                has_env = True  # conservative: assume collision when FK is invalid
+            else:
+                has_env = robot_z_min <= obs_z_max + _Z_TIER1_MARGIN
+
+        return has_self, has_env
 
     # ------------------------------------------------------------------
     # Obstacle management (T-Rex add_env_obstacles pattern)
@@ -370,13 +540,29 @@ class CollisionModel:
         pose = self._pin.SE3(rot, np.array(position, dtype=np.float64))
         obj = self._pin.GeometryObject(name, 0, pose, shape)
         obj_id = self._collision_model.addGeometryObject(obj)
-        # Register collision pairs: this obstacle × every robot geometry except
-        # static base/world-frame geometries (parentJoint == 0 === universe).
-        for existing_id in range(self._collision_model.ngeoms - 1):
-            if self._collision_model.geometryObjects[existing_id].parentJoint == 0:
-                continue  # skip static base geometry (e.g. link_base)
-            self._collision_model.addCollisionPair(self._pin.CollisionPair(existing_id, obj_id))
+        # Do NOT add collision pairs to the main model — env collision uses
+        # direct FCL collide() against _robot_geom_ids, keeping the main
+        # model's computeCollisions() self-collision-only (~20% faster).
+        self._obstacle_geom_ids.append(obj_id)
         self._obstacle_names.add(name)
+
+        # Cache world AABB for fast pre-filter in check_env_collision().
+        # For identity rotation (the common case), the box axes are aligned
+        # with world axes.  For rotated obstacles, use a conservative
+        # bounding sphere to avoid recomputing the exact OBB.
+        hx, hy, hz = half_extents
+        cx, cy, cz = position
+        if rotation is None or np.allclose(rot, np.eye(3)):
+            self._obstacle_boxes[obj_id] = (
+                cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz,
+            )
+        else:
+            # Conservative: sphere radius = box half-diagonal
+            r = float(np.sqrt(hx * hx + hy * hy + hz * hz))
+            self._obstacle_boxes[obj_id] = (
+                cx - r, cx + r, cy - r, cy + r, cz - r, cz + r,
+            )
+
         self._collision_data = self._collision_model.createData()
         logger.info("Added box obstacle '%s' at (%s) half_extents=%s", name, position, half_extents)
 
@@ -415,12 +601,6 @@ class CollisionModel:
     def _get_geom_object_name(self, geom_id: int) -> str:
         """Get the geometry object name."""
         return self._collision_model.geometryObjects[geom_id].name
-
-    def _is_obstacle_pair(self, pair) -> bool:
-        """Check if a collision pair involves an obstacle geometry."""
-        g1 = self._collision_model.geometryObjects[pair.first]
-        g2 = self._collision_model.geometryObjects[pair.second]
-        return g1.name in self._obstacle_names or g2.name in self._obstacle_names
 
     # ------------------------------------------------------------------
     # Properties

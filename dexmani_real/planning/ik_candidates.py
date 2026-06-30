@@ -333,75 +333,37 @@ class IKCandidateManager:
         return outside, np.maximum(lower, upper)
 
 
+    # ── Collision check wrappers (delegate to CollisionModel) ──
+    # MPlib fallback branches removed — CollisionModel is always available
+    # when constructed through XArm7MotionPlanner (the only construction path).
+
     def has_self_collision(self, qpos: np.ndarray) -> bool:
-        """Backward-compatible bool collision check (fast path for dense segment checks)."""
-        if self._cm is not None:
-            return self._cm.check_self_collision(qpos)
-        return len(self.mp_planner.check_for_self_collision(qpos)) > 0
+        return self._cm.check_self_collision(qpos)
 
     def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
-        """Structured self-collision check with diagnostic link-pair details.
-
-        Returns the cached ``CollisionInfo.no_collision()`` singleton when
-        no collision is detected (zero Python-side allocation).  When a
-        collision exists, the ``WorldCollisionResult`` list from MPlib is
-        already computed — this method wraps it into ``CollisionPair``
-        objects at negligible cost.
-
-        Use ``bool(result)`` or ``result.in_collision`` for the simple bool
-        branch; use ``result.to_dict()`` or ``result.summary`` for logging.
-        """
-        if self._cm is not None:
-            return self._cm.check_self_collision_details(qpos)
-        results = self.mp_planner.check_for_self_collision(qpos)
-        if len(results) == 0:
-            return CollisionInfo.no_collision()
-        return CollisionInfo.from_mplib_results(results)
+        return self._cm.check_self_collision_details(qpos)
 
     def has_env_collision(self, qpos: np.ndarray) -> bool:
-        if self._cm is not None:
-            return self._cm.check_env_collision(qpos)
-        return len(self.mp_planner.check_for_env_collision(qpos)) > 0
+        return self._cm.check_env_collision(qpos)
+
+    def has_env_collision_fast(self, qpos: np.ndarray) -> bool:
+        return self._cm.check_env_collision_fast(qpos)
+
+    def check_teleop_collision(self, qpos: np.ndarray) -> tuple[bool, bool]:
+        """Single-FK self + env Tier-1 collision check for teleop hot path.
+
+        Returns ``(has_self_collision, has_env_collision)``.
+        """
+        return self._cm.check_teleop_collision(qpos)
 
     def _check_segment_collision(
         self, start: np.ndarray, end: np.ndarray, collision_type: str = "self", step_size: float = 0.02,
     ) -> bool:
-        """Check if the linear joint-space segment start→end is collision-free.
-
-        Interpolates at ``step_size`` (L∞ joint distance) resolution and checks
-        every intermediate configuration.
-
-        ``step_size=0.02`` rad ≈ 1.15° (ref: dimos collision_step_size=0.02).
-        This provides ~2 samples per degree at the largest joints (J1-J2) and
-        ~4 samples per degree at wrist joints (J6-J7).  Trade-off: each MPlib
-        collision query costs ~0.1-0.3 ms.  At 0.02 rad, a 180° sweep of J1
-        costs ~16 ms, acceptable for path planning (< 2 s budget) but too
-        expensive for the teleop hot path (< 1 ms budget) — hence teleop only
-        does single-point collision checks.
-
-        Args:
-            collision_type: ``"self"`` or ``"env"``.
-
-        Returns:
-            True if all sampled points are collision-free.
-        """
-        if self._cm is not None:
-            if collision_type == "self":
-                return self._cm.check_segment_collision_free(start, end, step_size)
-            else:
-                return self._cm.check_segment_env_collision_free(start, end, step_size)
-        checker = self.has_self_collision if collision_type == "self" else self.has_env_collision
-        diff = end - start
-        dist = float(np.max(np.abs(diff)))
-        if dist <= step_size:
-            return not checker(end)
-        n_steps = int(np.ceil(dist / step_size))
-        for step in range(1, n_steps + 1):
-            alpha = step / n_steps
-            q = start + alpha * diff
-            if checker(q):
-                return False
-        return True
+        """Check if the linear joint-space segment start→end is collision-free."""
+        if collision_type == "self":
+            return self._cm.check_segment_collision_free(start, end, step_size)
+        else:
+            return self._cm.check_segment_env_collision_free(start, end, step_size)
 
     def check_segment_collision_free(
         self, start: np.ndarray, end: np.ndarray, step_size: float = 0.02,

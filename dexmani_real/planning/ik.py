@@ -349,6 +349,37 @@ class TeleopIKSolver:
 
     # Command assembly
 
+    def _check_teleop_collision_gate(
+        self, qpos_cmd: np.ndarray, profile: TeleopProfile,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Unified self + env collision gate for teleop IK result validation.
+
+        Returns ``(reason, extra_report)`` — ``(None, {})`` when all clear,
+        or a rejection reason + diagnostic dict when a collision is detected.
+
+        Uses CollisionModel.check_teleop_collision() for a single-FK fast path
+        (~35 μs), then falls back to detailed self-collision check only when a
+        collision is actually detected (rare case).
+        """
+        if not profile.check_self_collision and not profile.check_env_collision:
+            return None, {}
+
+        has_self, has_env = self.ik_mgr.check_teleop_collision(qpos_cmd)
+
+        if profile.check_self_collision and has_self:
+            info = self.ik_mgr.check_self_collision(qpos_cmd)
+            if info:
+                return (
+                    f"IK result in self-collision ({info.summary}), holding.",
+                    {"collision": info.to_dict()},
+                )
+        if profile.check_env_collision and has_env:
+            return (
+                "IK result in environment collision (table/obstacle), holding.",
+                {"env_collision": True},
+            )
+        return None, {}
+
     def command_from_target_qpos(
         self,
         target_eef_pose_world: Pose,
@@ -386,44 +417,25 @@ class TeleopIKSolver:
                 # Null-space failure is non-critical — skip and use raw IK result.
                 pass
 
-        # Self-collision check (teleop hot path, ~1.5μs per call with CollisionModel).
-        # Uses check_self_collision() instead of has_self_collision() so the
-        # IKResult report carries structured link-pair diagnostics when a
-        # collision is detected (no overhead on the common no-collision path
-        # thanks to CollisionInfo.no_collision() singleton).
-        if profile.check_self_collision:
-            collision_info = self.ik_mgr.check_self_collision(qpos_cmd)
-            if collision_info:
-                qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-                return IKResult(
-                    success=False, qpos=previous_qpos_cmd.copy(),
-                    reason=f"IK result in self-collision ({collision_info.summary}), holding.",
-                    report={
-                        **report,
-                        "teleop_ik_method": method,
-                        "held": True,
-                        "collision": collision_info.to_dict(),
-                        "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
-                    },
-                    held=True,
-                )
-
-        # Environment collision gate (table / obstacles, ~64μs for 19-DOF).
-        # When CollisionModel has registered obstacles (e.g. table), this
-        # prevents the hand from penetrating the desk surface.  In 19-DOF
-        # mode, the current hand joint angles (set via set_hand_qpos()) are
-        # included, so fingertip-table contact is detected.
-        if profile.check_env_collision and self.ik_mgr.has_env_collision(qpos_cmd):
+        # ── Collision safety gates (teleop hot path) ──
+        # Unified single-FK check (~35 μs) via CollisionModel.check_teleop_collision().
+        # Self-collision: full FCL (computeCollisions, stop_at_first).
+        # Env collision: Tier-1-only Z-min (conservative, zero FCL cost).
+        # Path planning uses the full two-tier env check via check_env_collision().
+        collision_reason, collision_extra = self._check_teleop_collision_gate(
+            qpos_cmd, profile,
+        )
+        if collision_reason is not None:
             qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
             return IKResult(
                 success=False, qpos=previous_qpos_cmd.copy(),
-                reason="IK result in environment collision (table/obstacle), holding.",
+                reason=collision_reason,
                 report={
                     **report,
                     "teleop_ik_method": method,
                     "held": True,
-                    "env_collision": True,
                     "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
+                    **collision_extra,
                 },
                 held=True,
             )

@@ -54,7 +54,7 @@ class FingertipDeskSafety:
         self._fingertip_ids = list(collision_config.fingertip_link_ids)
         self._fingertip_names = list(collision_config.fingertip_link_names)
         self._threshold = collision_config.fingertip_threshold
-        self._epsilon = 1e-8  # floating-point tolerance for boundary comparison
+        self._epsilon = 0.001  # 1mm floating-point tolerance for boundary comparison
 
     # ── Public API ──
 
