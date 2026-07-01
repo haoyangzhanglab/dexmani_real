@@ -24,10 +24,21 @@ from __future__ import annotations
 
 __all__ = ["XHandRetargeter", "adaptive_retargeting_thumb", "adaptive_retargeting_xhand"]
 
+import os
+import tempfile
 import time
+from typing import List, Optional
 
 import numpy as np
-from dex_retargeting.retargeting_config import RetargetingConfig
+import torch
+import yaml
+from dex_retargeting import yourdfpy as urdf
+from dex_retargeting.optimizer import DexPilotOptimizer
+from dex_retargeting.optimizer_utils import LPFilter
+from dex_retargeting.retargeting_config import RetargetingConfig, parse_mimic_joint
+from dex_retargeting.robot_wrapper import RobotWrapper
+from dex_retargeting.seq_retarget import SeqRetargeting
+from dex_retargeting.kinematics_adaptor import MimicJointKinematicAdaptor
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
 
@@ -50,10 +61,10 @@ _PINKY_TIP = 20
 # with calibrated _MIN/_MAX.  Chose 2.4 as the best balance between
 # straightening the extended pinky and preserving curl range.
 
-_PINKY_MIN_EXTENSION = 0.030  # P5 of MANO pinky MCP→TIP (fully curled)
-_PINKY_MAX_EXTENSION = 0.073  # P95 of MANO pinky MCP→TIP (fully extended)
-_PINKY_BASE_SCALE = 1.2  # minimum scaling for curled positions
-_PINKY_MAX_SCALE = 2.4  # maximum scaling for extended positions (calibrated)
+_PINKY_MIN_EXTENSION = 0.0280  # P2 of MANO pinky MCP→TIP (fully curled)
+_PINKY_MAX_EXTENSION = 0.074  # P98 of MANO pinky MCP→TIP (fully extended)
+_PINKY_BASE_SCALE = 1.15  # minimum scaling for curled: enough push so J11 can reach
+_PINKY_MAX_SCALE = 2.40  # maximum scaling: match robot pinky length when extended
 
 
 def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
@@ -116,10 +127,10 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
 # toward zero.  When the human thumb is curled, scale conservatively to
 # preserve the optimizerʼs ability to increase rot2 for opposition / grip.
 
-_THUMB_MIN_EXTENSION = 0.117  # P5  of human wrist→thumb_tip (curled)
-_THUMB_MAX_EXTENSION = 0.139  # P95 of human wrist→thumb_tip (extended)
-_THUMB_BASE_SCALE = 1.05  # minimum scaling for curled thumb
-_THUMB_MAX_SCALE = 1.25  # maximum scaling for extended thumb
+_THUMB_MIN_EXTENSION = 0.105  # P3  of human wrist→thumb_tip (curled)
+_THUMB_MAX_EXTENSION = 0.140  # P97 of human wrist→thumb_tip (extended)
+_THUMB_BASE_SCALE = 1.02  # minimum scaling: slight push for baseline J2 engagement
+_THUMB_MAX_SCALE = 1.35  # maximum scaling: balanced approach to robot 0.161m length
 
 
 def adaptive_retargeting_thumb(landmarks: np.ndarray) -> np.ndarray:
@@ -157,6 +168,129 @@ def adaptive_retargeting_thumb(landmarks: np.ndarray) -> np.ndarray:
     return landmarks
 
 
+class XHandDexPilotOptimizer(DexPilotOptimizer):
+    """DexPilot variant with balanced wrist→fingertip vs between-finger weights.
+
+    The original DexPilotOptimizer assigns weight ~15 to wrist→fingertip vectors
+    and weight 1 to between-finger vectors, causing distal joints (J2, J11) to
+    serve as binary length compensators instead of tracking finger flexion.
+
+    This subclass rebalances the weights so between-finger vectors (which carry
+    the true finger flexion signal) have more influence on the optimizer.
+    """
+
+    def __init__(self, wrist_weight: float = 2.0, **kwargs):
+        super().__init__(**kwargs)
+        self.wrist_weight = float(wrist_weight)
+
+    def get_objective_function(self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray):
+        """Same as parent but with configurable wrist→fingertip weight.
+
+        The only change from DexPilotOptimizer.get_objective_function() is the
+        weight computation: wrist→fingertip vectors use self.wrist_weight * n_fingers
+        instead of hardcoded len_proj + n_fingers (~15).
+        """
+        qpos = np.zeros(self.num_joints)
+        qpos[self.idx_pin2fixed] = fixed_qpos
+
+        len_proj = len(self.projected)
+        len_s2 = len(self.s2_project_index_task)
+        len_s1 = len_proj - len_s2
+
+        # Update projection indicator
+        target_vec_dist = np.linalg.norm(target_vector[:len_proj], axis=1)
+        self.projected[:len_s1][target_vec_dist[0:len_s1] < self.project_dist] = True
+        self.projected[:len_s1][target_vec_dist[0:len_s1] > self.escape_dist] = False
+        self.projected[len_s1:len_proj] = np.logical_and(
+            self.projected[:len_s1][self.s2_project_index_origin], self.projected[:len_s1][self.s2_project_index_task]
+        )
+        self.projected[len_s1:len_proj] = np.logical_and(
+            self.projected[len_s1:len_proj], target_vec_dist[len_s1:len_proj] <= 0.03
+        )
+
+        # Update weight vector
+        normal_weight = np.ones(len_proj, dtype=np.float32) * 1
+        high_weight = np.array([200] * len_s1 + [400] * len_s2, dtype=np.float32)
+        weight = np.where(self.projected, high_weight, normal_weight)
+
+        # ── KEY CHANGE: balanced wrist→fingertip weight ──
+        # Original: wrist weight = len_proj + n_fingers ≈ 15 (dominates between-finger weight 1)
+        # New:       wrist weight = wrist_weight * n_fingers → DEFAULT 10 (= 2.0 * 5)
+        #            This gives between-finger vectors a stronger voice in the optimizer,
+        #            reducing the optimizer's reliance on distal joints for length compensation.
+        wrist_finger_weight = self.wrist_weight * self.num_fingers
+        weight = torch.from_numpy(
+            np.concatenate([weight, np.ones(self.num_fingers, dtype=np.float32) * wrist_finger_weight])
+        )
+
+        # Compute reference distance vector
+        normal_vec = target_vector * self.scaling  # (10, 3)
+        dir_vec = target_vector[:len_proj] / (target_vec_dist[:, None] + 1e-6)  # (6, 3)
+        projected_vec = dir_vec * self.projected_dist[:, None]  # (6, 3)
+
+        # Compute final reference vector
+        reference_vec = np.where(self.projected[:, None], projected_vec, normal_vec[:len_proj])  # (6, 3)
+        reference_vec = np.concatenate([reference_vec, normal_vec[len_proj:]], axis=0)  # (10, 3)
+        torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
+        torch_target_vec.requires_grad_(False)
+
+        def objective(x: np.ndarray, grad: np.ndarray) -> float:
+            qpos[self.idx_pin2target] = x
+
+            # Kinematics forwarding for qpos
+            if self.adaptor is not None:
+                qpos[:] = self.adaptor.forward_qpos(qpos)[:]
+
+            self.robot.compute_forward_kinematics(qpos)
+            target_link_poses = [self.robot.get_link_pose(index) for index in self.computed_link_indices]
+            body_pos = np.array([pose[:3, 3] for pose in target_link_poses])
+
+            # Torch computation for accurate loss and grad
+            torch_body_pos = torch.as_tensor(body_pos)
+            torch_body_pos.requires_grad_()
+
+            # Index link for computation
+            origin_link_pos = torch_body_pos[self.origin_link_indices, :]
+            task_link_pos = torch_body_pos[self.task_link_indices, :]
+            robot_vec = task_link_pos - origin_link_pos
+
+            vec_dist = torch.norm(robot_vec - torch_target_vec, dim=1, keepdim=False)
+            huber_distance = (
+                self.huber_loss(vec_dist, torch.zeros_like(vec_dist)) * weight / (robot_vec.shape[0])
+            ).sum()
+            huber_distance = huber_distance.sum()
+            result = huber_distance.cpu().detach().item()
+
+            if grad.size > 0:
+                jacobians = []
+                for i, index in enumerate(self.computed_link_indices):
+                    link_body_jacobian = self.robot.compute_single_link_local_jacobian(qpos, index)[:3, ...]
+                    link_pose = target_link_poses[i]
+                    link_rot = link_pose[:3, :3]
+                    link_kinematics_jacobian = link_rot @ link_body_jacobian
+                    jacobians.append(link_kinematics_jacobian)
+
+                jacobians = np.stack(jacobians, axis=0)
+                huber_distance.backward()
+                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]
+
+                if self.adaptor is not None:
+                    jacobians = self.adaptor.backward_jacobian(jacobians)
+                else:
+                    jacobians = jacobians[..., self.idx_pin2target]
+
+                grad_qpos = np.matmul(grad_pos, np.array(jacobians))
+                grad_qpos = grad_qpos.mean(1).sum(0)
+
+                grad_qpos += 2 * self.norm_delta * (x - last_qpos)
+
+                grad[:] = grad_qpos[:]
+
+            return result
+
+        return objective
+
+
 class XHandRetargeter:
     def __init__(
         self,
@@ -191,8 +325,61 @@ class XHandRetargeter:
     def load_retargeter(self):
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
 
+        # Load YAML config
+        with open(str(config_path), "r") as f:
+            yaml_config = yaml.load(f, Loader=yaml.FullLoader)
+        cfg = yaml_config["retargeting"]
+
+        # Extract XHand-specific wrist_weight (default 2.0 if not specified)
+        wrist_weight = float(cfg.get("wrist_weight", 2.0))
+        scaling_factor = float(cfg.get("scaling_factor", 1.0))
+
+        # ── Manual build (replaces RetargetingConfig.build()) ──
+        # We build the retargeter manually so we can inject XHandDexPilotOptimizer
+        # with balanced wrist→fingertip weights.
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
-        self.retargeter = RetargetingConfig.load_from_file(str(config_path)).build()
+        urdf_path = str(ASSET_DIR / "robots" / cfg["urdf_path"])
+
+        robot_urdf = urdf.URDF.load(urdf_path, add_dummy_free_joints=False, build_scene_graph=False)
+        urdf_name = os.path.basename(urdf_path)
+        temp_dir = tempfile.mkdtemp(prefix="dex_retargeting-")
+        temp_path = os.path.join(temp_dir, urdf_name)
+        robot_urdf.write_xml_file(temp_path)
+        robot = RobotWrapper(temp_path)
+
+        joint_names = robot.dof_joint_names
+        target_joint_names = cfg.get("target_joint_names", joint_names)
+
+        optimizer = XHandDexPilotOptimizer(
+            robot=robot,
+            target_joint_names=target_joint_names,
+            finger_tip_link_names=cfg["finger_tip_link_names"],
+            wrist_link_name=cfg["wrist_link_name"],
+            target_link_human_indices=cfg.get("target_link_human_indices"),
+            scaling=scaling_factor,
+            project_dist=cfg.get("project_dist", 0.03),
+            escape_dist=cfg.get("escape_dist", 0.05),
+            wrist_weight=wrist_weight,
+        )
+
+        # Set up mimic joints (same as RetargetingConfig.build())
+        has_mimic, src_names, mimic_names, multipliers, offsets = parse_mimic_joint(robot_urdf)
+        if has_mimic:
+            adaptor = MimicJointKinematicAdaptor(
+                robot,
+                target_joint_names=target_joint_names,
+                source_joint_names=src_names,
+                mimic_joint_names=mimic_names,
+                multipliers=multipliers,
+                offsets=offsets,
+            )
+            optimizer.set_kinematic_adaptor(adaptor)
+
+        # Low-pass filter
+        alpha = float(cfg.get("low_pass_alpha", 0.6))
+        lp_filter = LPFilter(alpha) if 0 <= alpha <= 1 else None
+
+        self.retargeter = SeqRetargeting(optimizer, has_joint_limits=True, lp_filter=lp_filter)
         self.indices = self.retargeter.optimizer.target_link_human_indices
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names

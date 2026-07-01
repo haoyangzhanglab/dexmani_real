@@ -7,7 +7,7 @@ TeleopPipeline 提供可复用的 hand command 计算逻辑（真机模式）。
 Test real XHand teleop via Quest VR hand tracking + dex-retargeting.
 
 Hardware prerequisites:
-  - XHand connected via RS485 (default /dev/ttyUSB0)
+  - XHand connected via EtherCAT
   - Quest 3/Pro connected via USB-C cable (or WiFi — see VR_TRANSPORT below)
 
 Quest 有线连接设置 (USB-C):
@@ -63,8 +63,8 @@ VR_OUTPUT_FRAME = "flu"
 
 # ── XHand 配置 ─────────────────────────────────────────────────
 
-XHAND_COMM_TYPE = "RS485"
-XHAND_DEVICE = "/dev/ttyUSB0"
+XHAND_COMM_TYPE = "EtherCAT"
+XHAND_DEVICE = None  # None = auto-discover; set to e.g. "enp1s0" for specific EtherCAT interface
 
 # ── 控制参数 ───────────────────────────────────────────────────
 
@@ -148,7 +148,8 @@ def test_quest_hand_teleop() -> None:
     print(f"  VR ready. ({tracker.get_status()['received_frames']} frames received)")
 
     # ── 2. XHand ───────────────────────────────────────────────
-    print(f"\n[2/3] Connecting XHand ({XHAND_COMM_TYPE}:{XHAND_DEVICE})...")
+    device_label = XHAND_DEVICE or "auto"
+    print(f"\n[2/3] Connecting XHand ({XHAND_COMM_TYPE}:{device_label})...")
     hand_config = XHandConfig(
         comm_type=XHAND_COMM_TYPE,
         device_name=XHAND_DEVICE,

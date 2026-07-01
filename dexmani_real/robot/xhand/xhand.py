@@ -127,7 +127,7 @@ class XHandConfig:
                 [
                     0.0,
                     -40.0,
-                    5.0,   # thumb_j2:   prevent mechanical clogging (ref: LeFranX)
+                    10.0,  # thumb_j2:   prevent mechanical clogging (ref: LeFranX)
                     -10.0,
                     0.0,
                     5.0,   # index_j2:  prevent mechanical clogging (ref: LeFranX)
