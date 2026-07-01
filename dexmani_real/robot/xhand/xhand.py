@@ -76,7 +76,7 @@ _CONSECUTIVE_ERROR_RECONNECT_THRESHOLD = 10
 
 @dataclass
 class XHandConfig:
-    comm_type: str = "RS485"
+    comm_type: str = "EtherCAT"
     device_name: str | None = None
     baudrate: int = 3_000_000
     device_id: int = 0
@@ -127,7 +127,7 @@ class XHandConfig:
                 [
                     0.0,
                     -40.0,
-                    0.0,
+                    5.0,   # thumb_j2:   prevent mechanical clogging (ref: LeFranX)
                     -10.0,
                     0.0,
                     5.0,   # index_j2:  prevent mechanical clogging (ref: LeFranX)
@@ -202,7 +202,15 @@ class XHandConfig:
     # 0.0 = disabled (default, backward compatible). 0.3 = LeFranX recommended.
     # Exponential Moving Average filters high-frequency jitter from position commands,
     # producing smoother finger motion.
+    # NOTE: dex_retargetingʼs LPFilter(alpha=0.6) already applies EMA post-optimization.
+    # Enable this only if additional hardware-level smoothing is needed.
     ema_alpha: float = 0.0
+
+    # ── E3: Per-step delta jump limit ──
+    # Hard-clips the per-frame change in each joint command (rad). Complements
+    # dex_retargetingʼs LPFilter — EMA attenuates noise, this safety-gates outliers.
+    # 0.0 = disabled. Recommended: 0.3 rad (~17°/step, ~850°/s at 50 Hz).
+    max_delta_rad: float = 0.3
 
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
@@ -509,6 +517,14 @@ class XHand(ConnectionStateMixin):
 
         target_qpos = self._array12(action)
         qpos_cmd = self._limit_joint_range(target_qpos)
+
+        # ── E3: Delta jump limit ──
+        # Hard safety gate: per-step change never exceeds max_delta_rad on any
+        # joint, regardless of EMA state.  Complements dex_retargetingʼs LPFilter.
+        if self.config.max_delta_rad > 0 and self.last_qpos_cmd is not None:
+            delta = qpos_cmd - self.last_qpos_cmd
+            delta = np.clip(delta, -self.config.max_delta_rad, self.config.max_delta_rad)
+            qpos_cmd = self.last_qpos_cmd + delta
 
         # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
         if self.config.ema_alpha > 0 and self._ema_qpos is not None:

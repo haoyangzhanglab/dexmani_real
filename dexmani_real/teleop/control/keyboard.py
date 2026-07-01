@@ -5,16 +5,13 @@ running in a daemon thread.  Key events are captured globally (even when the
 terminal window is NOT focused), stored in a thread-safe buffer, and drained by
 poll() on the main thread.
 
-Unified 6-key mapping:
-    B  → BEGIN          (IDLE → TELEOP + auto-recording)
-    C  → PAUSE          (TELEOP ⇄ PAUSED)
-    S  → STOP           (stop recording → auto-save → IDLE)
-    H  → HOME           (return to home)
-    Q  → QUIT           (IDLE→quit; teleop→auto-save→IDLE)
+6-key mapping:
+    B  → BEGIN             (IDLE → TELEOP + auto-recording)
+    C  → PAUSE             (TELEOP ⇄ PAUSED)
+    S  → STOP              (stop recording → auto-save → IDLE)
+    H  → HOME              (stop recording → return to home → IDLE)
+    Q  → QUIT              (always quit; auto-save if recording)
     ESC → EMERGENCY_STOP
-
-Context-overloaded: BEGIN merges teleop start + recording (always together);
-QUIT serves dual role (stop→auto-save vs idle→exit).
 """
 
 from __future__ import annotations

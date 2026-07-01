@@ -200,6 +200,25 @@ class XHandRetargeter:
             [retargeter_joint_names.index(name) for name in self.sapien_joint_names]
         ).astype(int)
 
+    @property
+    def low_pass_alpha(self) -> float:
+        """Current LPFilter alpha (0.0 = disabled, 1.0 = no smoothing)."""
+        return float(self.retargeter.filter.alpha)
+
+    @low_pass_alpha.setter
+    def low_pass_alpha(self, value: float) -> None:
+        """Tune the built-in EMA smoothing strength at runtime.
+
+        dex_retargeting applies LPFilter after NLP optimisation, before returning
+        qpos.  Default from YAML config: 0.6 (new-value weight, i.e. 60 % new +
+        40 % old per frame at 50 Hz).
+
+        0.0 = pass-through (raw optimizer output)
+        0.6 = default (moderate smoothing)
+        1.0 = no smoothing (always use latest — equivalent to 0.0)
+        """
+        self.retargeter.filter.alpha = float(value)
+
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
         """Build reference value from hand landmarks for retargeting.
 

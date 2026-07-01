@@ -224,7 +224,7 @@ class TeleopController:
             logger.info("connect result: %s", result)
 
         logger.info("Entering main loop at %.0f Hz", self.limiter.target_hz)
-        logger.info("  Controls: B=begin S=stop C=pause H=home Q=quit ESC=emergency")
+        self._print_available_keys()
 
         self.last_status_ts = time.monotonic()
 
@@ -440,17 +440,15 @@ class TeleopController:
             elif signal == ControlSignal.HOME:
                 if not self.dry_run:
                     self.robot.clear_error()
-                self.state = ControllerState.IDLE
                 self._do_home()
             return
 
+        # Q = quit without saving
         if signal == ControlSignal.QUIT:
-            if self.state == ControllerState.IDLE:
-                self.running = False
-            else:
-                self._stop_recording()
-                self.state = ControllerState.IDLE
-                logger.info("=== STATE: → IDLE (quit) ===")
+            if self.recording:
+                self._stop_recording(save=False)
+            self.running = False
+            logger.info("=== QUIT ===")
             return
 
         if signal == ControlSignal.BEGIN:
@@ -462,23 +460,27 @@ class TeleopController:
                 self.state = ControllerState.TELEOP
                 self.recording = True
                 logger.info("=== STATE: IDLE → TELEOP ===")
+                self._print_available_keys()
             return
 
         if signal == ControlSignal.STOP:
             if self.state in (ControllerState.TELEOP, ControllerState.PAUSED):
-                self._stop_recording()
+                self._stop_recording(save=True)  # S = Save
                 self.state = ControllerState.IDLE
-                logger.info("=== STATE: → IDLE (stopped) ===")
+                logger.info("=== STATE: → IDLE (saved) ===")
+                self._print_available_keys()
             return
 
         if signal == ControlSignal.PAUSE:
             if self.state == ControllerState.TELEOP:
                 self.state = ControllerState.PAUSED
                 logger.info("=== STATE: TELEOP → PAUSED ===")
+                self._print_available_keys()
             elif self.state == ControllerState.PAUSED:
                 if self._reset_mapper():
                     self.state = ControllerState.TELEOP
                     logger.info("=== STATE: PAUSED → TELEOP ===")
+                    self._print_available_keys()
             return
 
         if signal == ControlSignal.HOME:
@@ -491,12 +493,6 @@ class TeleopController:
         logger.info("Returning to home...")
         self._last_arm_cmd = None
         self._last_hand_cmd = None
-
-        if self.recording and self._collection_loop is not None and self._collection_loop.is_recording:
-            try:
-                self._collection_loop.stop_episode(success=False, reason="home")
-            except (ValueError, OSError):
-                pass
 
         # Stop inner loop before return_to_home to avoid dual-connection conflicts
         # (RobotInterface.return_to_home() uses its own XArmAPI connection)
@@ -554,13 +550,16 @@ class TeleopController:
         self._last_good_hand = None
         logger.info("Episode recording started.")
 
-    def _stop_recording(self) -> None:
-        logger.info("Stopping episode. frames=%s", self.frame_count)
+    def _stop_recording(self, save: bool = True) -> None:
+        logger.info("Stopping episode. frames=%s save=%s", self.frame_count, save)
         if self._collection_loop is not None and self._collection_loop.is_recording:
             try:
-                path = self._collection_loop.stop_episode(success=True, reason="manual")
-                if path:
-                    logger.info("  Saved to %s", path)
+                if save:
+                    path = self._collection_loop.stop_episode(success=True, reason="manual")
+                    if path:
+                        logger.info("  Saved to %s", path)
+                else:
+                    self._collection_loop.discard_episode()
             except (ValueError, OSError) as e:
                 logger.exception("stop_episode failed: %s", e)
         self.recording = False
@@ -624,6 +623,20 @@ class TeleopController:
         arm = self._last_good_arm.copy() if self._last_good_arm is not None else np.zeros(7, dtype=np.float64)
         hand = self._last_good_hand.copy() if self._last_good_hand is not None else np.zeros(12, dtype=np.float64)
         return RobotAction(arm_qpos_cmd=arm, hand_qpos_cmd=hand)
+
+    # ── Keyboard hints ──
+
+    _KEY_HINTS: dict[ControllerState, str] = {
+        ControllerState.IDLE: "[B] Begin  [H] Home  [Q] Quit",
+        ControllerState.TELEOP: "[C] Pause  [S] Save  [H] Home  [Q] Quit",
+        ControllerState.PAUSED: "[C] Resume  [S] Save  [H] Home  [Q] Quit",
+        ControllerState.EMERGENCY_STOP: "[H] Home  [Q] Quit",
+    }
+
+    def _print_available_keys(self) -> None:
+        hint = self._KEY_HINTS.get(self.state)
+        if hint:
+            logger.info("  Keys: %s", hint)
 
     # ── EEF ──
 

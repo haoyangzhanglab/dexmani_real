@@ -50,9 +50,7 @@ class PipelineConfig(FromDictMixin):
     control_rate_hz: float = 50.0
 
     cartesian_ema_alpha_teleop: float = 0.3   # Cartesian EEF EMA before IK
-    hand_ema_alpha_teleop: float = 0.3         # dex-retargeting built-in low_pass_alpha
     cartesian_ema_alpha_deploy: float = 0.5
-    hand_ema_alpha_deploy: float = 0.5
 
     data_dir: str = "episodes"
     max_record_frames: int = DEFAULT_MAX_RECORD_FRAMES

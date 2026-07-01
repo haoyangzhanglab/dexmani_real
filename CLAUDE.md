@@ -102,14 +102,17 @@ dexmani_real/          ← Python package root
 VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compute_action()
             XHandRetargeter (landmarks→12-DOF) ──┘   ├─ arm: wrist pose → solve_teleop_ik
                                                       ├─ hand: MANO skeleton retargeting
-                                                      ├─ EMA smoothing (fixed alpha, default 0.75)
-                                                      └─ jump-limit safety gate (5°/10° arm/hand)
+                                                      │   → adaptive scaling → NLP optimize
+                                                      │   → LPFilter(alpha=0.6) EMA (dex_retargeting built-in)
+                                                      │   → delta clip(max_delta_rad=0.3) (XHand E3)
+                                                      ├─ arm: EMA smoothing (cartesian_ema_alpha_teleop, default 0.3)
+                                                      └─ arm IK anomaly jump-limit (default 90°, planning/ik.py)
                                                                    │
 RobotInterface.validate_action() ← pre-send gate (torque, current, temp, comm, workspace)
-RobotInterface.send_action()    ← joint-limit + delta-limit clipping
-         │
+RobotInterface.send_action()    ← joint-limit + delta-limit clipping (arm)
+        │
     ┌── XArm7 (SDK C++ binding)
-    └── XHand (SDK C++ binding)
+    └── XHand (SDK C++ binding)  ← joint-limit + delta clip(E3) + optional EMA(E2)
 ```
 
 ## Core types (robot/types.py)
@@ -152,8 +155,7 @@ episode_000.h5
   /camera/<serial>/rgb(T,H,W,3), depth(T,H,W), timestamps(T)
   /timestamps(T), /vr_timestamps(T)
 ```
-- **Batch mode** (default): `InMemoryFrameBuffer` flushes every 100 frames
-- **CollectionLoop** orchestrates lifecycle: pre-record buffer (N seconds), start/stop, sidecar JSON, file routing (success_dir / failure_dir)
+- **CollectionLoop** orchestrates lifecycle: start/stop, sidecar JSON, file routing (success_dir / failure_dir)
 
 ## Conventions
 
@@ -183,11 +185,13 @@ episode_000.h5
 ## Safety architecture
 
 1. **Pre-send gate** (`validate_action()`): robot error, arm connection, arm torque, hand current/temp/comm, workspace bounds
-2. **IK-level**: workspace clamping, IK anomaly jump limits (5° arm / 10° hand)
-3. **Path execution**: torque monitoring per waypoint, collision verification (self + env + desk FK)
-4. **Desk safety**: `FingertipDeskSafety` — FK-based fingertip Z check (complements MPlib point cloud)
-5. **Emergency stop**: `RobotInterface.emergency_stop()` → arm.stop() + hand.stop()
-6. **SlidingWindowMonitor**: trend tracking for hand temperature, current, IK miss counts
+2. **IK-level**: workspace clamping, IK anomaly jump-limit (arm: 90° default, `planning/ik.py:140`)
+3. **Hand command-level**: delta clip (E3, `max_delta_rad=0.3` per-step hard gate) + optional EMA (E2, `XHandConfig.ema_alpha`)
+4. **Retargeting-level**: built-in LPFilter EMA (`low_pass_alpha=0.6`, dex_retargeting `SeqRetargeting.retarget()`)
+5. **Path execution**: torque monitoring per waypoint, collision verification (self + env + desk FK)
+6. **Desk safety**: `FingertipDeskSafety` — FK-based fingertip Z check (complements MPlib point cloud)
+7. **Emergency stop**: `RobotInterface.emergency_stop()` → arm.stop() + hand.stop()
+8. **SlidingWindowMonitor**: trend tracking for hand temperature, current, IK miss counts
 
 ## Key dependencies
 
