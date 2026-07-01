@@ -416,7 +416,7 @@
     <parent link="right_hand_thumb_bend_link" />
     <child link="right_hand_thumb_rota_link1" />
     <axis xyz="1 0 0" />
-    <limit lower="-0.698" upper="1.57" effort="1.1" velocity="8.63" />
+    <limit lower="-0.698" upper="1.745" effort="1.1" velocity="8.63" />
     <dynamics damping="0" friction="0" />
   </joint>
   <link name="right_hand_thumb_rotaback_link1">
@@ -475,7 +475,7 @@
     <parent link="right_hand_thumb_rota_link1" />
     <child link="right_hand_thumb_rota_link2" />
     <axis xyz="1 0 0" />
-    <limit lower="0" upper="1.57" effort="0.4" velocity="14.38" />
+    <limit lower="0" upper="1.745" effort="0.4" velocity="14.38" />
     <dynamics damping="0" friction="0" />
   </joint>
   <link name="right_hand_thumb_rotaback_link2">

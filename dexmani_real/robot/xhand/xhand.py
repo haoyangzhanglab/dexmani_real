@@ -130,13 +130,13 @@ class XHandConfig:
                     0.0,
                     -10.0,
                     0.0,
+                    5.0,   # index_j2:  prevent mechanical clogging (ref: LeFranX)
                     0.0,
+                    5.0,   # middle_j2: prevent mechanical clogging (ref: LeFranX)
                     0.0,
+                    5.0,   # ring_j2:   prevent mechanical clogging (ref: LeFranX)
                     0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
+                    5.0,   # little_j2: prevent mechanical clogging (ref: LeFranX)
                 ],
                 dtype=np.float64,
             )
@@ -149,8 +149,8 @@ class XHandConfig:
             # Using exact URDF values avoids floating-point rounding from deg2rad.
             [
                 1.832,  # J0  thumb_abd
-                1.57,  # J1  thumb_j1
-                1.57,  # J2  thumb_j2
+                1.745,  # J1  thumb_j1 (-40° ~ 100°)
+                1.745,  # J2  thumb_j2 (0° ~ 100°)
                 0.174,  # J3  index_abd
                 1.919,  # J4  index_j1
                 1.919,  # J5  index_j2

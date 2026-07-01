@@ -38,11 +38,12 @@ import select
 import termios
 import time
 import tty
+from datetime import datetime
 
 import numpy as np
 
 from dexmani_real.robot.xhand import JOINT_NAMES, XHand, XHandConfig
-from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter, adaptive_retargeting_thumb, adaptive_retargeting_xhand
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.rate_limiter import RateLimiter
@@ -87,6 +88,35 @@ def _check_quit():
         c = sys.stdin.read(1)
         return c.lower() == 'q'
     return False
+
+
+def _save_recording(rec: dict, ref_indices: np.ndarray, output_dir: str | None = None) -> str | None:
+    """Save recorded teleop debug data to NPZ file.
+
+    Returns the file path on success, None if no data to save.
+    """
+    if not rec["timestamps"]:
+        print("[record] No data to save.")
+        return None
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(output_dir) if output_dir else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filepath = out_dir / f"{stamp}_teleop_debug.npz"
+
+    arrays: dict[str, np.ndarray] = {}
+    for key in ("landmarks_raw", "wrist_rot", "mano_landmarks", "scaled_landmarks",
+                "ref_vectors", "projected", "target_qpos", "actual_qpos"):
+        arrays[key] = np.stack(rec[key], axis=0)  # (T, ...)
+    arrays["timestamps"] = np.array(rec["timestamps"], dtype=np.float64)
+    arrays["ref_indices"] = np.asarray(ref_indices, dtype=np.int32)
+
+    np.savez_compressed(str(filepath), **arrays)
+
+    T = len(rec["timestamps"])
+    size_kb = filepath.stat().st_size / 1024
+    print(f"\n[record] Saved {T} frames ({size_kb:.0f} KB) → {filepath}")
+    return str(filepath)
 
 
 def test_quest_hand_teleop() -> None:
@@ -155,6 +185,22 @@ def test_quest_hand_teleop() -> None:
     # Non-blocking keyboard input for 'q' to quit
     stdin_old = _setup_nonblock_stdin()
 
+    # ── Recording buffers ──────────────────────────────────────────
+    # Collect per-frame data for offline analysis (VR→retarget→hardware).
+    # Saved to <timestamp>_teleop_debug.npz on clean exit.
+    _rec = {
+        "timestamps": [],
+        "landmarks_raw": [],      # (21, 3) VR landmarks (FLU frame)
+        "wrist_rot": [],          # (3, 3) palm frame rotation
+        "mano_landmarks": [],     # (21, 3) MANO-space landmarks
+        "scaled_landmarks": [],   # (21, 3) after adaptive_retargeting_xhand
+        "ref_vectors": [],        # (15, 3) DexPilot reference vectors
+        "projected": [],          # (10,) bool — which finger pairs are in contact projection
+        "target_qpos": [],        # (12,) retargeter output
+        "actual_qpos": [],        # (12,) hardware feedback qpos
+    }
+    _ref_indices = retargeter.indices  # (2, 15) — origin/task landmark indices for ref vectors
+
     print("\n" + "=" * 60)
     print("  Teleop running. Press 'q' to quit, Ctrl+C to abort.")
     print(f"  Control rate: {CONTROL_HZ} Hz")
@@ -209,6 +255,24 @@ def test_quest_hand_teleop() -> None:
             else:
                 retarget_count += 1
                 last_qpos = target_qpos
+
+            # ── Record debug data ──
+            # Reconstruct intermediate values (cheap, avoids modifying XHandRetargeter API).
+            # These mirror XHandRetargeter._build_ref_value() internals.
+            scaled = adaptive_retargeting_xhand(adaptive_retargeting_thumb(mano_landmarks))
+            ref_vecs = scaled[_ref_indices[1], :] - scaled[_ref_indices[0], :]
+            proj_state = retargeter.retargeter.optimizer.projected.copy()
+            actual_qpos = xhand.get_state()["qpos"]
+
+            _rec["timestamps"].append(time.monotonic())
+            _rec["landmarks_raw"].append(landmarks)
+            _rec["wrist_rot"].append(wrist_rot)
+            _rec["mano_landmarks"].append(mano_landmarks)
+            _rec["scaled_landmarks"].append(scaled)
+            _rec["ref_vectors"].append(ref_vecs)
+            _rec["projected"].append(proj_state)
+            _rec["target_qpos"].append(target_qpos)
+            _rec["actual_qpos"].append(actual_qpos)
 
             # ── Send action ──
             ok = xhand.send_action(target_qpos)
@@ -271,6 +335,10 @@ def test_quest_hand_teleop() -> None:
 
     finally:
         _restore_stdin(stdin_old)
+
+        # ── Save recording ──
+        _save_recording(_rec, _ref_indices)
+
         print("[Cleanup] Returning XHand to home...")
         # reset() only sends one frame — delta limit caps it to ~3.6°/step.
         # Loop until all joints are within tolerance of home (or max steps).

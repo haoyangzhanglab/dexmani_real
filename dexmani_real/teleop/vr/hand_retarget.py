@@ -1,15 +1,28 @@
-"""VR-to-XHand retargeting via dex_retargeting + adaptive pinky scaling.
+"""VR-to-XHand retargeting via dex_retargeting + adaptive finger scaling.
 
-Pinky adaptation uses LeFranX's landmark-space approach (adaptive_retargeting_xhand):
-directly scales pinky chain segments (MCP→PIP→DIP→TIP) on MANO-space landmarks
-before computing reference vectors.
+Two landmark-space adaptations compensate for human-robot kinematic mismatches
+before reference vectors are computed:
 
-Ref: LeFranX vr_hand_detector_adapter.py:27-84
+1. adaptive_retargeting_thumb — scales thumb_tip to match XHand mechanical thumb
+   length (~23% longer than MANO model).  Adaptive: more when extended, less
+   when curled — drives rot2 (IP flexion) toward zero in neutral poses while
+   preserving curl range for opposition/grip gestures.
+
+2. adaptive_retargeting_xhand (LeFranX) — scales pinky chain (MCP→PIP→DIP→TIP)
+   based on extension state, compensating for human-robot finger length
+   differences.  Uniform scaling along the kinematic chain.
+
+Both operate on MANO-space landmarks and modify disjoint landmark indices
+(thumb: 4, pinky: 18-20), so order is irrelevant.
+
+Refs:
+  LeFranX vr_hand_detector_adapter.py:27-84 (pinky)
+  CL-20260701 thumb FK analysis: robot wrist→thumb_tip 0.161m vs MANO 0.131m
 """
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]
+__all__ = ["XHandRetargeter", "adaptive_retargeting_thumb", "adaptive_retargeting_xhand"]
 
 import time
 
@@ -26,11 +39,21 @@ _PINKY_PIP = 18
 _PINKY_DIP = 19
 _PINKY_TIP = 20
 
-# LeFranX adaptive scaling parameters (vr_hand_detector_adapter.py:52-60)
-_PINKY_MIN_EXTENSION = 0.03  # fully curled
-_PINKY_MAX_EXTENSION = 0.10  # fully extended
+# Pinky adaptive scaling — calibrated to actual MANO-space pinky
+# MCP→TIP distances observed across 5 teleop recordings (500+ frames).
+# LeFranX original values (_MIN=0.03, _MAX=0.10) were tuned for a
+# different MANO space where the pinky reaches 0.10 m at full extension.
+# Our MANO space maxes out at ~0.073 m, so we calibrate the range to match.
+#
+# Parameters selected via offline grid search on real recording data
+# (20260701_161732, 3431 frames): sweep of max_scale ∈ [2.0, 2.2, 2.4, 2.6]
+# with calibrated _MIN/_MAX.  Chose 2.4 as the best balance between
+# straightening the extended pinky and preserving curl range.
+
+_PINKY_MIN_EXTENSION = 0.030  # P5 of MANO pinky MCP→TIP (fully curled)
+_PINKY_MAX_EXTENSION = 0.073  # P95 of MANO pinky MCP→TIP (fully extended)
 _PINKY_BASE_SCALE = 1.2  # minimum scaling for curled positions
-_PINKY_MAX_SCALE = 2.2  # maximum scaling for extended positions
+_PINKY_MAX_SCALE = 2.4  # maximum scaling for extended positions (calibrated)
 
 
 def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
@@ -81,6 +104,59 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
     return landmarks
 
 
+# ── Thumb adaptive scaling parameters ──
+# XHand thumb mechanical length (wrist→thumb_tip) is ~0.161 m at neutral
+# (bend=0, rot1=0, rot2=0).  The MANO model averages ~0.131 m — a ~23 %
+# mismatch.  Without compensation the DexPilot optimizer uses rot2 (thumb IP
+# flexion) purely to shorten the kinematic chain, keeping it at ~1.1–1.3 rad
+# (63–75°) regardless of the human thumb state.
+#
+# Adaptive scaling: when the human thumb is extended (long wrist→tip),
+# scale the target up toward the robotʼs mechanical length so rot2 can drop
+# toward zero.  When the human thumb is curled, scale conservatively to
+# preserve the optimizerʼs ability to increase rot2 for opposition / grip.
+
+_THUMB_MIN_EXTENSION = 0.117  # P5  of human wrist→thumb_tip (curled)
+_THUMB_MAX_EXTENSION = 0.139  # P95 of human wrist→thumb_tip (extended)
+_THUMB_BASE_SCALE = 1.05  # minimum scaling for curled thumb
+_THUMB_MAX_SCALE = 1.25  # maximum scaling for extended thumb
+
+
+def adaptive_retargeting_thumb(landmarks: np.ndarray) -> np.ndarray:
+    """Scale thumb tip to match XHand mechanical thumb length.
+
+    The DexPilot reference vectors only use thumb_tip (landmark 4) — not
+    the intermediate thumb joints (CMC=1, MCP=2, IP=3).  Scaling just the
+    tip is sufficient to shift the wrist→thumb_tip distance into the
+    robotʼs achievable range at low rot2.
+
+    Operates on MANO-space landmarks.  The pinky scaling
+    (adaptive_retargeting_xhand) operates on landmarks 18–20, so the two
+    are independent and can be composed in any order.
+
+    Args:
+        landmarks: (21, 3) array in MANO coordinate space.
+
+    Returns:
+        (21, 3) array with thumb_tip scaled (new copy, input unchanged).
+    """
+    landmarks = landmarks.copy()
+
+    wrist = landmarks[0]
+    thumb_tip = landmarks[4]
+
+    extension = float(np.linalg.norm(thumb_tip - wrist))
+    extension_ratio = np.clip(
+        (extension - _THUMB_MIN_EXTENSION) / (_THUMB_MAX_EXTENSION - _THUMB_MIN_EXTENSION),
+        0.0,
+        1.0,
+    )
+    scale = _THUMB_BASE_SCALE + (_THUMB_MAX_SCALE - _THUMB_BASE_SCALE) * extension_ratio
+    landmarks[4] = wrist + (thumb_tip - wrist) * scale
+
+    return landmarks
+
+
 class XHandRetargeter:
     def __init__(
         self,
@@ -127,16 +203,25 @@ class XHandRetargeter:
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
         """Build reference value from hand landmarks for retargeting.
 
-        Applies LeFranX-style adaptive pinky scaling on MANO landmarks
-        before computing origin→task difference vectors.
+        Applies two landmark-space adaptations before computing origin→task
+        difference vectors:
+
+        1. adaptive_retargeting_thumb — scale thumb_tip to match robot
+           mechanical length, enabling low rot2 in neutral poses.
+        2. adaptive_retargeting_xhand (LeFranX) — scale pinky chain for
+           human-robot finger length mismatch.
         """
         if self.retargeting_type == "position":
             return hand_joint_pos[self.indices, :]
 
+        # Scale thumb tip to compensate for XHand's ~23% longer mechanical
+        # thumb — drives rot2 toward zero when the human thumb is extended
+        # while preserving curl range for opposition / grip.
+        scaled_landmarks = adaptive_retargeting_thumb(hand_joint_pos)
         # LeFranX: scale pinky chain on landmarks before computing ref vectors.
         # This directly modifies PIP/DIP/TIP positions along the MCP→TIP chain,
         # compensating for human-robot finger length differences.
-        scaled_landmarks = adaptive_retargeting_xhand(hand_joint_pos)
+        scaled_landmarks = adaptive_retargeting_xhand(scaled_landmarks)
 
         origin_indices = self.indices[0, :]
         task_indices = self.indices[1, :]
@@ -162,7 +247,7 @@ class XHandRetargeter:
         if self.debug_adapters:
             self.last_debug = {
                 "retarget_ms": 1000 * (time.time() - start_time),
-                "pinky_method": "LeFranX adaptive_retargeting_xhand (landmark-space)",
+                "adaptives": "thumb(scale_thumb_tip) + pinky(LeFranX chain scaling)",
             }
             logger.info("retarget_debug: %s", self.last_debug)
 
