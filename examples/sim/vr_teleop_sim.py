@@ -446,16 +446,12 @@ def main() -> None:
         ),
         planning_profile=PlanningProfile(
             max_waypoint_delta_deg=360.0,
-            max_ik_delta_deg=(180,) * 7,
-            max_pose_error_rot_rad=np.deg2rad(5.0),
             num_random_ik_seeds=30,
             rrt_time_limit=2.0,
-            num_rrt_attempts=2,
         ),
         teleop_profile=TeleopProfile(
             teleop_dt=CTRL_DT,
-            max_ik_jump_deg=(90, 90, 90, 90, 90, 90, 90),
-            max_pose_error_pos_m=0.05,
+            max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             differential_ik_max_pos_step_m=0.05,
         ),
@@ -497,7 +493,7 @@ def main() -> None:
     # ── TeleopPipeline (shared action computation with real controller) ──
     pipeline = TeleopPipeline(
         arm_mapper, hand_retargeter, planner,
-        ema_alpha_arm=0.3,  # EMA smoothing — low-pass filter in joint space
+        ema_alpha_arm=0.6,  # EMA smoothing — low-pass filter in joint space
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──
