@@ -292,7 +292,7 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
         # ── 读取帧 ──
         t0 = time.perf_counter()
         try:
-            frame = camera.read(timeout_ms=1000)
+            frame = camera.read(timeout_ms=5000)
         except RuntimeError as e:
             print(f"  read() 失败: {e}")
             break
@@ -494,7 +494,12 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
 def run_pcd_variants(camera: RealSense) -> None:
     print("\n── 3. 点云配置变体对比 ──")
 
-    frame = camera.read()
+    try:
+        frame = camera.read()
+    except RuntimeError as e:
+        print(f"  camera.read() 失败: {e}")
+        print("  跳过变体对比（相机不可用）")
+        return
 
     Variant = tuple[str, PointCloudConfig]  # type: ignore[no-redef]
 

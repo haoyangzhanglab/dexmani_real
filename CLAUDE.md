@@ -203,6 +203,10 @@ episode_000.h5
 - `sapien` — physics simulation
 - `numpy` — all array math
 
+## Hardware notes
+
+**Intel RealSense L515** — must be connected to a **direct motherboard USB 3.0 port** (no intermediate hub). Connecting through a USB hub causes isochronous packet loss and pipeline stall (frames stop arriving after ~3 s). Verify with `lsusb -t`: the L515 (8086:0b64) must appear directly under a root hub port, not indented under a `Hub` node.
+
 ## Anti-patterns to avoid
 
 - ❌ Calling XArm7/XHand directly → use `RobotInterface`

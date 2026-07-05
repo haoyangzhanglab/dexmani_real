@@ -374,28 +374,33 @@ class CameraRingBuffer:
             (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
         ).copy()
 
-        # Read RGB — validate size against known maximum to guard against
-        # torn reads where the producer is mid-write and header fields contain
-        # garbage values that would create an out-of-bounds ndarray view.
+        # Read RGB — validate size and shape against known maxima to guard
+        # against torn reads where the producer is mid-write and header fields
+        # contain garbage values that would create an out-of-bounds ndarray view
+        # or cause reshape to fail with mismatched dimensions.
         h = header[0]
         rgb_size = int(h["rgb_size"])
-        if rgb_size > self._max_rgb_bytes or rgb_size <= 0:
+        rgb_h, rgb_w, rgb_c = int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])
+        if rgb_size > self._max_rgb_bytes or rgb_size <= 0 or rgb_h * rgb_w * rgb_c != rgb_size:
             logger.warning(
-                "CameraRingBuffer read_latest: torn or corrupt header (rgb_size=%d, max=%d), discarding",
-                rgb_size, self._max_rgb_bytes,
+                "CameraRingBuffer read_latest: torn or corrupt RGB header "
+                "(rgb_size=%d, shape=%dx%dx%d, max=%d), discarding",
+                rgb_size, rgb_h, rgb_w, rgb_c, self._max_rgb_bytes,
             )
             return None
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
         rgb = np.ndarray(
             (rgb_size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset
-        ).copy().reshape((int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])))
+        ).copy().reshape((rgb_h, rgb_w, rgb_c))
 
-        # Read depth — same torn-read guard
+        # Read depth — same torn-read guard (size + shape consistency)
         depth_size = int(h["depth_size"])
-        if depth_size > self._max_depth_bytes or depth_size <= 0:
+        depth_h, depth_w = int(h["depth_shape_h"]), int(h["depth_shape_w"])
+        if depth_size > self._max_depth_bytes or depth_size <= 0 or depth_h * depth_w * 2 != depth_size:
             logger.warning(
-                "CameraRingBuffer read_latest: torn or corrupt header (depth_size=%d, max=%d), discarding",
-                depth_size, self._max_depth_bytes,
+                "CameraRingBuffer read_latest: torn or corrupt depth header "
+                "(depth_size=%d, shape=%dx%d, max=%d), discarding",
+                depth_size, depth_h, depth_w, self._max_depth_bytes,
             )
             return None
         depth_offset = rgb_offset + self._max_rgb_bytes
@@ -405,7 +410,7 @@ class CameraRingBuffer:
             )
             .copy()
             .view(np.uint16)
-            .reshape((int(h["depth_shape_h"]), int(h["depth_shape_w"])))
+            .reshape((depth_h, depth_w))
         )
 
         return header, rgb, depth, slot_seq

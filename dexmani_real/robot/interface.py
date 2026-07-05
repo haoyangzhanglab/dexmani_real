@@ -74,13 +74,22 @@ class RobotInterface:
         # Table collision geometry — lightweight CollisionModel (no MPlib point cloud penalty)
         if self.planner is not None and config.collision is not None:
             if config.collision.enable_env_collision:
-                self.planner.collision_model.add_table(
-                    table_height=config.collision.table_z_world,
-                    x_center=config.collision.table_x_center,
-                    half_x=config.collision.table_half_x,
-                    half_y=config.collision.table_half_y,
-                    half_z=config.collision.table_half_z,
-                )
+                try:
+                    self.planner.collision_model.add_table(
+                        table_height=config.collision.table_z_world,
+                        x_center=config.collision.table_x_center,
+                        half_x=config.collision.table_half_x,
+                        half_y=config.collision.table_half_y,
+                        half_z=config.collision.table_half_z,
+                    )
+                except RuntimeError:
+                    # FCL bindings unavailable — Tier-2 env collision disabled.
+                    # Desk safety is still fully covered by FingertipDeskSafety (FK-based).
+                    logger.warning(
+                        "Cannot register table obstacle: FCL bindings unavailable. "
+                        "Tier-2 FCL env collision disabled. "
+                        "Desk safety covered by FingertipDeskSafety (FK-based)."
+                    )
 
         # Hand kinematics
         self.hand_kinematics: HandKinematics | None = None

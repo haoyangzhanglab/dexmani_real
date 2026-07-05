@@ -22,9 +22,10 @@
 
 安全:
     - workspace 软墙 (到达边界拒绝移动)
+    - EEF 速度限制 (替代关节空间 bottleneck scaling)
+    - EEF 跟踪误差监控 (位置 + 姿态, target-vs-actual)
     - solve_teleop_ik 迭代 DLS + MPlib 位置 IK 兜底
-    - tracking divergence 监控 (cmd-vs-actual 偏差)
-    - 速度限制 (bottleneck scaling)
+    - 关节跟踪 divergence 监控 (cmd-vs-actual, 安全兜底)
 
 设计参考:
     - keyboard_teleop_real.py (真机版): 按键映射、安全机制
@@ -56,7 +57,7 @@ from dexmani_real.simulation.constructor import add_light, setup_scene
 from dexmani_real.utils.rate_limiter import RateLimiter
 
 from dexmani_real.planning.path_utils import interpolate_waypoints
-from dexmani_real.planning.pose_utils import quat_multiply
+from dexmani_real.planning.pose_utils import angular_dist_rad, compute_pose_error, quat_multiply
 from dexmani_real.simulation import execute_dense_path, settle_at_target
 
 # ═══════════════════════════════════════════════ 配置
@@ -80,8 +81,21 @@ WORKSPACE_BOUNDS = np.array([
 # Home 关节角
 ARM_HOME_QPOS = np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]).astype(np.float64)
 
-# 速度限制 (rad/s)
-MAX_QVEL_RAD_S = np.deg2rad([180, 180, 180, 180, 180, 180, 180])
+# ═══════════════════════════════════════════════ 速度限制
+# EEF 空间速度限制 (替代关节空间限制 — 更贴合遥操作语义)
+# 关节空间安全兜底阈值远高于正常运动，仅在 IK 产生病理解时触发。
+MAX_EEF_LIN_VEL = 0.5                 # m/s  (EEF 最大线速度)
+MAX_EEF_ANG_VEL = np.deg2rad(180.0)  # rad/s (EEF 最大角速度)
+MAX_QVEL_SAFETY_RAD_S = np.deg2rad([360.0] * 7)
+
+# EEF 跟踪误差阈值
+EEF_POS_ERROR_WARN_M = 0.03                # 位置误差告警 (3cm)
+EEF_ROT_ERROR_WARN_RAD = np.deg2rad(10.0)  # 姿态误差告警 (10°)
+EEF_POS_ERROR_CRITICAL_M = 0.08            # 位置误差安全触发 (8cm)
+EEF_ROT_ERROR_CRITICAL_RAD = np.deg2rad(30.0)  # 姿态误差安全触发 (30°)
+MAX_EEF_DIVERGENCE_CONSEC = 5
+
+# 关节跟踪误差阈值 (硬件 PD 跟踪保护)
 TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
 
 # 循环超限告警阈值
@@ -180,20 +194,81 @@ def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     ])
 
 
-# ═══════════════════════════════════════════════ 速度限制
+# ═══════════════════════════════════════════════ EEF 速度限制
 
 
-def velocity_limited_step(
-    target: np.ndarray, prev_cmd: np.ndarray,
+def eef_speed_limited_target(
+    actual_pos: np.ndarray,
+    actual_quat: np.ndarray,
+    desired_pos: np.ndarray,
+    desired_quat: np.ndarray,
+    max_lin_vel: float,
+    max_ang_vel: float,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Clamp desired EEF target so actual EEF velocity limits are respected.
+
+    Uses the current *actual* EEF pose (not the accumulated target) as the
+    reference, so the speed-limited target is always reachable within one
+    control step.  Position is clamped by linear distance; orientation is
+    clamped via SLERP (spherical linear interpolation).
+
+    Returns: (limited_pos, limited_quat) — both in world frame (wxyz quat).
+    """
+    # ── Position: clamp linear displacement ──
+    pos_delta = desired_pos - actual_pos
+    pos_dist = float(np.linalg.norm(pos_delta))
+    max_pos_step = max_lin_vel * dt
+    if pos_dist > max_pos_step:
+        pos_delta = pos_delta / pos_dist * max_pos_step
+    limited_pos = actual_pos + pos_delta
+
+    # ── Orientation: clamp rotation angle via SLERP ──
+    rot_dist = angular_dist_rad(desired_quat, actual_quat)
+    max_rot_step = max_ang_vel * dt
+    if rot_dist > max_rot_step:
+        t = max_rot_step / rot_dist
+        # q_err = actual^{-1} * desired  (rotation from actual to desired)
+        q_actual_conj = np.array(
+            [actual_quat[0], -actual_quat[1], -actual_quat[2], -actual_quat[3]],
+            dtype=np.float64,
+        )
+        q_err = quat_multiply(q_actual_conj, desired_quat)
+        if q_err[0] < 0:  # shortest path
+            q_err = -q_err
+        sin_half = float(np.linalg.norm(q_err[1:]))
+        if sin_half > 1e-12:
+            angle = 2.0 * np.arctan2(sin_half, q_err[0])
+            axis = q_err[1:] / sin_half
+            half = angle * t / 2.0
+            q_partial = np.array(
+                [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)],
+                dtype=np.float64,
+            )
+        else:
+            q_partial = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        limited_quat = quat_multiply(actual_quat, q_partial)
+    else:
+        limited_quat = desired_quat.copy()
+
+    return limited_pos, limited_quat
+
+
+def _joint_safety_clamp(
+    target_qpos: np.ndarray, prev_cmd: np.ndarray,
     max_velocities: np.ndarray, dt: float,
 ) -> np.ndarray:
-    """Bottleneck scaling: limit per-joint step to max_velocities * dt."""
-    step = target - prev_cmd
+    """Joint-space bottleneck scaling — safety backstop only (very permissive).
+
+    Uses 360°/s limits, far above normal teleop speeds.  Only triggers when
+    IK produces a pathological solution (e.g. near singularity).
+    """
+    step = target_qpos - prev_cmd
     max_step = max_velocities * dt
     ratio = np.max(np.abs(step) / np.maximum(max_step, 1e-8))
     if ratio > 1.0:
         return prev_cmd + step / ratio
-    return target
+    return target_qpos
 
 
 # ═══════════════════════════════════════════════ workspace 工具
@@ -267,6 +342,7 @@ def main():
     print("=" * 60)
     print("仿真键盘遥操作 xArm7")
     print(f"  DELTA_POS={DELTA_POS * 1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_HZ={CTRL_HZ}Hz")
+    print(f"  EEF max_lin_vel={MAX_EEF_LIN_VEL:.1f}m/s  max_ang_vel={np.rad2deg(MAX_EEF_ANG_VEL):.0f}deg/s")
     print(f"  workspace: x{WORKSPACE_BOUNDS[0]} y{WORKSPACE_BOUNDS[1]} z{WORKSPACE_BOUNDS[2]}")
     print("=" * 60)
 
@@ -364,6 +440,9 @@ def main():
     start_time = time.perf_counter()
     prev_eef_pos = None
     ik_method = "-"
+    eef_pos_err = 0.0
+    eef_rot_err = 0.0
+    consecutive_eef_divergence = 0
     last_status_time = time.perf_counter()
 
     try:
@@ -420,20 +499,32 @@ def main():
             now = time.perf_counter()
             if now - last_status_time > 2.0:
                 sim_state = sim.get_state()
-                eef = np.round(np.asarray(sim_state["eef_pos"], dtype=np.float64), 3)
+                eef_pos = np.asarray(sim_state["eef_pos"], dtype=np.float64)
+                eef_quat = np.asarray(sim_state["eef_quat_wxyz"], dtype=np.float64)
                 if prev_eef_pos is not None:
-                    vel = np.linalg.norm(np.asarray(sim_state["eef_pos"]) - prev_eef_pos) / max(now - last_status_time, 1e-3)
+                    vel = np.linalg.norm(eef_pos - prev_eef_pos) / max(now - last_status_time, 1e-3)
                 else:
                     vel = 0.0
-                prev_eef_pos = np.asarray(sim_state["eef_pos"], dtype=np.float64).copy()
+                prev_eef_pos = eef_pos.copy()
+
+                # EEF 跟踪误差 (pos + rot)
+                eef_pos_err, eef_rot_err = compute_pose_error(
+                    Pose(p=target_pos, q=target_quat),
+                    Pose(p=eef_pos, q=eef_quat),
+                )
+
                 elapsed = now - start_time
                 status = (
                     f"[T+{elapsed:.1f}s f={loop_count}] "
-                    f"eef={eef}m  target={np.round(target_pos, 3)}  "
+                    f"eef={np.round(eef_pos, 3)}m  target={np.round(target_pos, 3)}  "
                     f"v={vel:.2f}m/s  ik={ik_method}"
+                    f"  err_pos={eef_pos_err*100:.1f}cm err_rot={np.rad2deg(eef_rot_err):.1f}°"
                 )
                 if ik_fail_consecutive > 0:
                     status += f"  IK_fail(consec)={ik_fail_consecutive}"
+                # EEF tracking warning (non-critical)
+                if eef_pos_err > EEF_POS_ERROR_WARN_M or eef_rot_err > EEF_ROT_ERROR_WARN_RAD:
+                    status += "  ⚠ EEF_drift"
                 print(status, flush=True)
                 last_status_time = now
 
@@ -461,30 +552,44 @@ def main():
                     dq = rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
                     target_quat = quat_multiply(dq, target_quat)
 
-                # IK
+                # ── EEF 速度限制 + IK ──
+                # 以当前实际 EEF 姿态为参考，限制目标 EEF 增量，确保 IK
+                # 永远求解一个在单步内可达的姿态（避免全伸展时目标漂移）。
                 sim_state = sim.get_state()
+                actual_pos = np.asarray(sim_state["eef_pos"], dtype=np.float64)
+                actual_quat = np.asarray(sim_state["eef_quat_wxyz"], dtype=np.float64)
+
+                ik_target_pos, ik_target_quat = eef_speed_limited_target(
+                    actual_pos, actual_quat, target_pos, target_quat,
+                    MAX_EEF_LIN_VEL, MAX_EEF_ANG_VEL, CTRL_DT,
+                )
+                # Keep accumulated target synced to the limited pose — no drift.
+                target_pos = ik_target_pos
+                target_quat = ik_target_quat
+
                 current_arm_qpos = sim.get_full_qpos()[:7]
-                target_pose = Pose(p=target_pos, q=target_quat)
+                target_pose = Pose(p=ik_target_pos, q=ik_target_quat)
                 ik_result = planner.solve_teleop_ik(target_pose, current_arm_qpos, prev_arm_cmd)
 
                 if ik_result.success and ik_result.qpos is not None:
                     ik_fail_consecutive = 0
                     ik_method = "diff"
-                    arm_cmd = velocity_limited_step(
-                        ik_result.qpos, prev_arm_cmd, MAX_QVEL_RAD_S, CTRL_DT,
+                    # Joint-space safety backstop (360°/s — catches pathological IK only)
+                    arm_cmd = _joint_safety_clamp(
+                        ik_result.qpos, prev_arm_cmd, MAX_QVEL_SAFETY_RAD_S, CTRL_DT,
                     )
                     prev_arm_cmd = arm_cmd.copy()
                 else:
                     ik_fail_consecutive += 1
-                    target_pos = np.asarray(sim_state["eef_pos"], dtype=np.float64).copy()
-                    target_quat = np.asarray(sim_state["eef_quat_wxyz"], dtype=np.float64).copy()
-                    # Hold current position — don't keep driving toward the last
-                    # successful command that led into collision.
+                    target_pos = actual_pos.copy()
+                    target_quat = actual_quat.copy()
                     arm_cmd = current_arm_qpos.copy()
                     prev_arm_cmd = arm_cmd.copy()
                     ik_method = "held"
             else:
                 # Idle: hold current position via PD
+                ik_method = "idle"
+                ik_fail_consecutive = 0
                 arm_cmd = prev_arm_cmd
 
             # ── 应用动作（每 tick 都执行，确保物理持续推进）──
@@ -493,19 +598,34 @@ def main():
             sim.robot.apply_action(np.concatenate([arm_cmd, hand_qpos]))
             sim._step_physics(n=PHYSICS_STEPS_PER_TICK)
 
-            # ── 追踪安全 ──
+            # ── 追踪安全 (关节空间: PD 跟踪保护) ──
             actual_qpos = sim.get_full_qpos()[:7]
             tracking_err = np.max(np.abs(actual_qpos - arm_cmd))
             if tracking_err > TRACKING_DIVERGENCE_THRESHOLD_RAD:
                 consecutive_divergence += 1
                 if consecutive_divergence == 1:
-                    print(f"  [SAFETY] Tracking divergence: max_err={tracking_err:.1f}rad")
+                    print(f"  [SAFETY] Joint tracking divergence: max_err={tracking_err:.1f}rad")
                 if consecutive_divergence >= 3:
-                    print("  [SAFETY] Persistent tracking divergence — stopping")
+                    print("  [SAFETY] Persistent joint tracking divergence — stopping")
                     running = False
                     break
             else:
                 consecutive_divergence = 0
+
+            # ── EEF 跟踪安全 (姿态空间: target-vs-actual) ──
+            if eef_pos_err > EEF_POS_ERROR_CRITICAL_M or eef_rot_err > EEF_ROT_ERROR_CRITICAL_RAD:
+                consecutive_eef_divergence += 1
+                if consecutive_eef_divergence == 1:
+                    print(
+                        f"  [SAFETY] EEF tracking error: "
+                        f"pos={eef_pos_err*100:.1f}cm rot={np.rad2deg(eef_rot_err):.1f}°"
+                    )
+                if consecutive_eef_divergence >= MAX_EEF_DIVERGENCE_CONSEC:
+                    print("  [SAFETY] Persistent EEF tracking divergence — stopping")
+                    running = False
+                    break
+            else:
+                consecutive_eef_divergence = 0
 
             # ── 渲染（每 tick 都执行，保持 viewer 响应）──
             if viewer is not None:

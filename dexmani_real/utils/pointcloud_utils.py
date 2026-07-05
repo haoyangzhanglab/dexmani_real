@@ -285,12 +285,22 @@ def sample_points(
         try:
             import pytorch3d.ops as torch3d_ops
 
+            # Try GPU path first (if available and points are on CPU).
+            # Fall back to CPU if the pytorch3d extension lacks GPU support.
             if torch.cuda.is_available() and points.device.type == "cpu":
-                pts_gpu = points.cuda()
-                index = torch3d_ops.sample_farthest_points(pts_gpu[None], K=npoints)[1][0]
-                index = index.cpu()
+                try:
+                    pts_gpu = points.cuda()
+                    index = torch3d_ops.sample_farthest_points(pts_gpu[None], K=npoints)[1][0]
+                    index = index.cpu()
+                except RuntimeError:
+                    index = torch3d_ops.sample_farthest_points(points[None], K=npoints)[1][0]
             else:
-                index = torch3d_ops.sample_farthest_points(points[None], K=npoints)[1][0]
+                try:
+                    index = torch3d_ops.sample_farthest_points(points[None], K=npoints)[1][0]
+                except RuntimeError:
+                    # pytorch3d lacks GPU support — move to CPU and retry
+                    pts_cpu = points.cpu()
+                    index = torch3d_ops.sample_farthest_points(pts_cpu[None], K=npoints)[1][0]
         except ImportError:
             index = torch.randperm(count, device=points.device)[:npoints]
     elif count >= npoints:

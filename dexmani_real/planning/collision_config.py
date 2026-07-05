@@ -2,18 +2,11 @@
 
 Replaces the previously scattered DESK_SAFE_Z / HAND_SAFE_MARGIN /
 HAND_EXTENSION_BELOW_EEF constants that were spread across 4 files.
-
-YAML file support (P3.2):
-  Load:  CollisionConfig.from_yaml("config/collision.yaml")
-  Save:  cfg.to_yaml("config/collision.yaml")
 """
 
 from __future__ import annotations
 
-import dataclasses
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass, replace
 
 from dexmani_real.utils.serialization import FromDictMixin
 
@@ -122,32 +115,8 @@ class CollisionConfig(FromDictMixin):
     def with_overrides(self, **kwargs) -> "CollisionConfig":
         """Return a new CollisionConfig with specified fields overridden.
 
-        Uses ``dataclasses.replace()`` (stdlib) instead of manually listing
-        every field name (P3.1).  Automatically stays in sync when new fields
-        are added to the dataclass.
+        Uses ``dataclasses.replace()`` (stdlib). Automatically stays in sync
+        when new fields are added to the dataclass.
         """
-        from dataclasses import replace
         return replace(self, **kwargs)
 
-    # ── YAML / dict serialization ──
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize to a plain dict (tuples → lists for YAML compatibility)."""
-        import dataclasses
-        result = {}
-        for f in dataclasses.fields(self):
-            val = getattr(self, f.name)
-            result[f.name] = list(val) if isinstance(val, tuple) else val
-        return result
-
-    def to_yaml(self, path: str | Path) -> None:
-        """Write this CollisionConfig to a YAML file.
-
-        Uses ``to_dict()`` + ``yaml.dump()``.  Reload with
-        ``CollisionConfig.from_yaml(path)``.
-        """
-        import yaml
-
-        path = Path(path)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)

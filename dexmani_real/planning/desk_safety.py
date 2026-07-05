@@ -61,53 +61,48 @@ class FingertipDeskSafety:
 
     @staticmethod
     def _lookup_fingertip_ids(model, names: tuple[str, ...]) -> list[int]:
-        """Look up fingertip joint indices from a Pinocchio model by link name (A3).
+        """Look up fingertip **frame** IDs from a Pinocchio model (A3).
 
-        Pinocchio URDF frames have names like ``right_hand_thumb_rota_tip`` with
-        ``parentJoint`` pointing to the joint that moves the fingertip.  We match by
-        extracting the finger key (e.g. ``thumb`` from ``thumb_tip``) and looking for
-        frame names that contain the key and end with ``_tip``.
+        Fingertips are URDF ``<frame>`` elements, not joints.  We use
+        ``model.getFrameId()`` to obtain frame indices that index into
+        ``data.oMf`` (frame placements), as opposed to ``data.oMi`` (joint
+        placements).  The matching logic extracts a finger key from the short
+        name (e.g. ``thumb`` from ``thumb_tip``) and searches model frames for
+        a name containing the key and ending with ``_tip``.
 
-        FAIIs back to legacy hardcoded IDs (from 7-DOF collision URDF) if lookup
-        fails.  Note: legacy IDs are from the 7-DOF model and may be out-of-range
-        for 19-DOF models — dynamic lookup is strongly preferred.
+        Falls back to legacy hardcoded joint IDs if frame lookup fails.
         """
-        # Build frame name → parentJoint map
-        frame_map: dict[str, int] = {}
-        if hasattr(model, 'frames'):
-            for frame in model.frames:
-                frame_map[frame.name] = int(frame.parentJoint)
-
-        # Pre-extract finger keys from short names: "thumb_tip" → "thumb", etc.
         def _finger_key(short_name: str) -> str:
             return short_name.replace("_tip", "").replace("_rota", "")
 
         ids: list[int] = []
         for short_name in names:
-            lid: int | None = None
-            key = _finger_key(short_name)  # e.g. "thumb"
+            fid: int | None = None
+            key = _finger_key(short_name)
 
-            # Match frames whose name contains the finger key and ends with "_tip"
-            if hasattr(model, 'frames'):
-                for frame_name, parent_joint in frame_map.items():
-                    if key in frame_name and frame_name.endswith("_tip"):
-                        lid = parent_joint
-                        break
+            for frame in model.frames:
+                if key in frame.name and frame.name.endswith("_tip"):
+                    fid = model.getFrameId(frame.name)
+                    break
 
-            if lid is not None:
-                ids.append(lid)
+            if fid is not None:
+                ids.append(fid)
             else:
-                # Fall back to legacy hardcoded ID (from 7-DOF collision URDF).
-                # WARNING: these IDs may be out-of-range for 19-DOF models.
                 from dexmani_real.utils.log import get_logger
+
                 legacy_ids: dict[str, int] = {
-                    "thumb_tip": 20, "index_tip": 26, "mid_tip": 31, "ring_tip": 36, "pinky_tip": 41,
+                    "thumb_tip": 20,
+                    "index_tip": 26,
+                    "mid_tip": 31,
+                    "ring_tip": 36,
+                    "pinky_tip": 41,
                 }
                 fallback = legacy_ids.get(short_name, -1)
                 get_logger(__name__).warning(
                     "Failed to look up fingertip '%s' in Pinocchio frames — "
-                    "falling back to hardcoded joint ID %d (may be for 7-DOF model).",
-                    short_name, fallback,
+                    "falling back to hardcoded joint ID %d (for 19-DOF model only).",
+                    short_name,
+                    fallback,
                 )
                 ids.append(fallback)
         return ids
@@ -132,8 +127,9 @@ class FingertipDeskSafety:
 
         min_z = float("inf")
         min_name = ""
-        for lid, name in zip(self._fingertip_ids, self._fingertip_names):
-            z = float(data.oMi[lid].translation[2])
+        for fid, name in zip(self._fingertip_ids, self._fingertip_names):
+            # fid is a frame ID → use oMf (frame placements), not oMi (joint placements)
+            z = float(data.oMf[fid].translation[2])
             if z < min_z:
                 min_z = z
                 min_name = name

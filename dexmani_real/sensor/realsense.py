@@ -12,6 +12,7 @@ __all__ = ["RealSense", "RealSenseConfig", "CameraFrame", "L515DepthConfig", "Al
 import numpy as np
 import pyrealsense2 as rs
 
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import (
     PointCloudConfig,
     depth_valid_ratio,
@@ -23,6 +24,8 @@ from dexmani_real.utils.pointcloud_utils import (
     rgbd_to_pointcloud,
     vis_point_cloud,
 )
+
+logger = get_logger(__name__)
 
 
 AlignMode = Literal["depth_to_color", "color_to_depth", "none"]
@@ -44,7 +47,7 @@ class L515DepthConfig:
     D400 cameras such as D435/D455 will not use this config.
     """
 
-    enabled: bool = True
+    enabled: bool = False
 
     visual_preset: int = 5
     depth_units: float = 0.000250000011874363
@@ -226,20 +229,27 @@ class RealSense:
             self.active_serial = self.config.serial or self.find_default_serial()
             device = self.find_device_by_serial(self.active_serial)
             self.load_model_specific_config(device)
-        except (RuntimeError, OSError):
+        except (RuntimeError, OSError) as e:
+            logger.warning("connect() failed at device discovery / config: %s", e)
             return False
 
-        self.pipeline = rs.pipeline()
         rs_config = self.create_rs_config()
 
         try:
-            rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
-            self.profile = self.pipeline.start(rs_config)
-        except RuntimeError:
+            self._start_pipeline(rs_config)
+        except RuntimeError as e:
+            logger.warning("connect() failed at pipeline start: %s", e)
             self.pipeline = None
             self.profile = None
             return False
 
+        self._setup_pipeline_post_start()
+        self._warmup_pipeline()
+
+        return True
+
+    def _setup_pipeline_post_start(self) -> None:
+        """Configure aligner, filters, timestamps, and intrinsics after pipeline start."""
         self.aligner = self.create_aligner()
         self.hole_filling_filter = rs.hole_filling_filter(2) if self.config.depth_hole_filling else None
         self.set_global_time()
@@ -249,10 +259,58 @@ class RealSense:
         self.last_frame = None
         self.rays_cache.clear()
 
-        for _ in range(max(self.config.warmup_frames, 0)):
-            self.pipeline.wait_for_frames()
+    def _start_pipeline(self, rs_config: rs.config) -> None:
+        """Create and start a fresh pipeline with the given config."""
+        self.pipeline = rs.pipeline()
+        rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
+        self.profile = self.pipeline.start(rs_config)
 
-        return True
+    def _warmup_pipeline(self) -> None:
+        """Consume warmup frames.
+
+        On L515 the USB stack may still be releasing resources from a prior
+        session, causing the first few wait_for_frames() calls to time out.
+        When that happens we stop the pipeline, wait with increasing back-off,
+        and restart — up to 3 times."""
+        max_restarts = 3
+        warmup_frames = max(self.config.warmup_frames, 0)
+        for i in range(warmup_frames):
+            try:
+                self.pipeline.wait_for_frames(5000)
+                continue
+            except RuntimeError:
+                pass
+
+            # First frame timed out — try pipeline restarts.
+            if i != 0 or warmup_frames == 0:
+                raise
+
+            for attempt in range(max_restarts):
+                delay = 3.0 * (attempt + 1)
+                logger.warning(
+                    "First warmup frame did not arrive within 5 s — "
+                    "stopping pipeline, waiting %.0f s, then restarting "
+                    "(attempt %d/%d).",
+                    delay,
+                    attempt + 1,
+                    max_restarts,
+                )
+                self.pipeline.stop()
+                time.sleep(delay)
+                self._start_pipeline(self.create_rs_config())
+                self._setup_pipeline_post_start()
+                time.sleep(1.0)
+                try:
+                    self.pipeline.wait_for_frames(5000)
+                    return  # succeeded — consume remaining warmup frames below
+                except RuntimeError:
+                    if attempt == max_restarts - 1:
+                        raise
+
+        # Consume any remaining warmup frames (only reached after a successful
+        # first frame, either direct or after restart).
+        for _ in range(warmup_frames - 1):
+            self.pipeline.wait_for_frames(5000)
 
     def disconnect(self) -> None:
         """Close RealSense pipeline.
@@ -327,7 +385,11 @@ class RealSense:
             serializable_device = rs.serializable_device(device)
             serializable_device.load_json(json_string)
         except (RuntimeError, OSError) as error:
-            raise RuntimeError("Failed to load L515 depth config through load_json().") from error
+            logger.warning(
+                "Failed to load L515 depth preset (firmware may not support all keys). "
+                "Continuing with default depth settings. Error: %s",
+                error,
+            )
 
     @staticmethod
     def is_l515_device(device: rs.device) -> bool:

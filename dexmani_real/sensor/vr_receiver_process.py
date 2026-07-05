@@ -124,6 +124,7 @@ class VRReceiverProcess:
                 self._process.terminate()
                 self._process.join(timeout=1.0)
         self._process = None
+        self.shm.unlink()
         logger.info("VRReceiverProcess stopped.")
 
     # ------------------------------------------------------------------

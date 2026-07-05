@@ -163,7 +163,7 @@ class TeleopController:
             from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
 
             try:
-                self._vr_shm = SharedMemoryFrameManager(create=False)
+                self._vr_shm = SharedMemoryFrameManager(n_cameras=0, create=False)
                 logger.info("VR source: SharedMemory (attached, zero-copy)")
             except FileNotFoundError:
                 logger.warning("VR SHM not found — falling back to ZMQ/tracker")

@@ -123,11 +123,65 @@ class CollisionModel:
         package_dir: str | None = None,
         collision_config: "CollisionConfig | None" = None,
     ) -> None:
-        import coal as fcl
         import pinocchio as pin
 
         self._pin = pin
-        self._fcl = fcl
+
+        # ── FCL Python bindings ──
+        # Prefer coal (hpp-fcl >= 3.0, pybind11).  Fall back to hppfcl
+        # (hpp-fcl 2.x, Boost.Python) via the cmeel .so which must be
+        # loaded directly to bypass a namespace-package shadow.
+        self._fcl = None
+        try:
+            import coal as fcl
+        except ImportError:
+            import importlib.machinery as _imach
+            import importlib.util as _iutil
+            import logging as _logging
+            import os as _os
+            import sys as _sys
+
+            _log = _logging.getLogger(__name__)
+            try:
+                # Remove any stale namespace-only hppfcl cached by pinocchio.
+                for _key in list(_sys.modules):
+                    if _key.startswith("hppfcl"):
+                        del _sys.modules[_key]
+
+                # Locate the cmeel hppfcl .so.
+                _so_path = None
+                for _p in _sys.path:
+                    _d = _os.path.join(_p, "hppfcl")
+                    if _os.path.isdir(_d):
+                        for _f in _os.listdir(_d):
+                            if _f.startswith("hppfcl") and _f.endswith(".so"):
+                                _so_path = _os.path.join(_d, _f)
+                                break
+                    if _so_path:
+                        break
+
+                if _so_path is None:
+                    raise ImportError("hppfcl .so not found in sys.path")
+
+                _spec = _imach.ModuleSpec(
+                    "hppfcl",
+                    _imach.ExtensionFileLoader("hppfcl", _so_path),
+                    origin=_so_path,
+                )
+                _mod = _iutil.module_from_spec(_spec)
+                _sys.modules["hppfcl"] = _mod  # MUST be set before exec_module
+                _spec.loader.exec_module(_mod)
+                fcl = _mod
+                _log.info("hppfcl loaded from cmeel .so (%s)", _so_path)
+            except Exception:
+                _log.info(
+                    "hppfcl unavailable — Tier-2 FCL env collision disabled. "
+                    "Self-collision, Tier-1 Z-min, and FingertipDeskSafety remain active."
+                )
+                fcl = None
+
+        if fcl is not None:
+            self._fcl = fcl
         self._hand_dof = hand_dof
 
         # Tier margins from CollisionConfig (A7), with module-constant fallback
@@ -188,7 +242,9 @@ class CollisionModel:
         # name → (x_min, x_max, y_min, y_max, z_min, z_max) in model base frame
         self._obstacle_geom_ids: dict[str, int] = {}  # name → geometry object index
         self._obs_z_max: float = float('-inf')    # cached max Z of all obstacles (P6)
-        self._fcl_request: "fcl.CollisionRequest" = self._fcl.CollisionRequest()  # reusable (P7)
+        self._fcl_request: "fcl.CollisionRequest | None" = (
+            self._fcl.CollisionRequest() if self._fcl is not None else None
+        )  # reusable FCL request, None when FCL unavailable (P7)
 
         self._nq: int = self._model.nq
         self._link_names: list[str] = (
@@ -421,7 +477,16 @@ class CollisionModel:
         if not self._tier1_z_check(oMg):
             return False
 
-        # ── Tier 2: Z-filtered FCL ──
+        # ── Tier 2: Z-filtered FCL (requires coal / hpp-fcl >= 3.0) ──
+        if self._fcl is None:
+            # Conservative: Tier 1 passed (robot near obstacle), but without FCL
+            # we cannot rule out collision → assume collision.
+            # In practice, this path is only reached during motion planning /
+            # return-to-home (teleop hot path uses check_env_collision_fast,
+            # which is Tier-1-only).  Desk safety is still enforced by
+            # FingertipDeskSafety (FK-based) in the planner's validate_path().
+            return True
+
         result = self._fcl.CollisionResult()
         for name in self._obstacle_names:
             bb = self._obstacle_boxes.get(name)
@@ -430,7 +495,6 @@ class CollisionModel:
             obs_id = self._obstacle_geom_ids.get(name)
             if obs_id is None:
                 continue
-            obs_geom = self._collision_model.geometryObjects[obs_id]
             obs_placement = oMg[obs_id]
             obs_z_max_i = bb[_BB_ZMAX]
             for robot_id in self._robot_geom_ids:
@@ -439,7 +503,8 @@ class CollisionModel:
                 result.clear()
                 try:
                     self._fcl.collide(
-                        obs_geom.geometry, obs_placement,
+                        self._collision_model.geometryObjects[obs_id].geometry,
+                        obs_placement,
                         self._collision_model.geometryObjects[robot_id].geometry,
                         oMg[robot_id],
                         self._fcl_request, result,
@@ -523,11 +588,22 @@ class CollisionModel:
         """
         if name in self._obstacle_names:
             raise ValueError(f"Obstacle '{name}' already exists.")
+
+        if self._fcl is None:
+            raise RuntimeError(
+                f"Cannot add box obstacle '{name}': FCL bindings (coal or hppfcl) unavailable. "
+                f"Tier-2 FCL env collision is disabled. "
+                f"Desk safety is covered by FingertipDeskSafety (FK-based) — "
+                f"set enable_env_collision=False."
+            )
+
         rot = rotation if rotation is not None else np.eye(3)
         # fcl.Box(x, y, z) takes FULL extents (not half), so double them.
         shape = self._fcl.Box(half_extents[0] * 2, half_extents[1] * 2, half_extents[2] * 2)
         pose = self._pin.SE3(rot, np.array(position, dtype=np.float64))
-        obj = self._pin.GeometryObject(name, 0, pose, shape)
+        # NOTE: geometry BEFORE placement (pinocchio 2.x argument order).
+        # pinocchio 3.0+ swapped to placement-first; adjust when upgrading.
+        obj = self._pin.GeometryObject(name, 0, shape, pose)
         geom_id = self._collision_model.addGeometryObject(obj)
         # Do NOT add collision pairs to the main model — env collision uses
         # direct FCL collide() against _robot_geom_ids, keeping the main
