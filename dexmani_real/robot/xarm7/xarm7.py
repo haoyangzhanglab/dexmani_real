@@ -125,12 +125,32 @@ class XArm7(ConnectionStateMixin):
         return False
 
     def clear_error(self) -> bool:
+        """Clear latched error state without changing the control mode.
+
+        Unlike :meth:`robot_init`, this does NOT call ``_set_mode(1)``, so it is
+        safe to call while an :class:`ArmInnerLoop` is running in velocity-control
+        mode (mode 4).  Switching the global arm firmware mode underneath the
+        inner loop would cause its ``vc_set_joint_velocity`` calls to fail,
+        forcing an unnecessary emergency stop.
+
+        After a C31/C32 collision the arm disables motion; ``motion_enable(True)``
+        re-arms it.  Collision sensitivity / TCP load are NOT reset — they persist
+        across error clears.
+        """
         if self.arm is None:
             return False
-        self.robot_init()
+        self.arm.clean_error()
+        self.arm.clean_warn()
+        self.arm.motion_enable(True)
+        self.arm.set_state(0)
+        _, err_warn = self.arm.get_err_warn_code()
+        if err_warn[0] != 0:
+            self.error_state = True
+            self.last_error_message = f"clear_error post-check failed: err_warn={err_warn}"
+            return False
         self.error_state = False
         self.last_error_message = ""
-        return self.arm.error_code == 0
+        return True
 
     def stop(self) -> bool:
         if self.arm is None:

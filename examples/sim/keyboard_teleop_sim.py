@@ -56,6 +56,13 @@ from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, setup_scene
 from dexmani_real.utils.rate_limiter import RateLimiter
 
+try:
+    from pynput import keyboard  # type: ignore[import-untyped]
+except ImportError:
+    raise ImportError(
+        "pynput is required for keyboard input. Install with: pip install pynput"
+    )
+
 from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import angular_dist_rad, compute_pose_error, quat_multiply
 from dexmani_real.simulation import execute_dense_path, settle_at_target
@@ -118,8 +125,6 @@ class GlobalKeyState:
         self._listener: "keyboard.Listener | None" = None  # type: ignore[name-defined]
 
     def _run(self):
-        from pynput import keyboard
-
         def on_press(key):
             try:
                 if hasattr(key, "char") and key.char is not None:
@@ -376,7 +381,6 @@ def main():
             use_position_ik=True,           # MPlib 兜底: DLS 迭代不收敛时接管
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            differential_ik_max_pos_step_m=0.05,
         ),
     )
 

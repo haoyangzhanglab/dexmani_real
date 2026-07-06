@@ -559,7 +559,8 @@ class TeleopIKSolver:
                 break
 
             # DLS solve: dq = J^T (J·J^T + λ²I)^(-1) · error · step
-            # Both Jacobian (local_frame=False) and error are in world/base frame.
+            # J has been rotated to world frame by compute_eef_jacobian_and_pose_world,
+            # so J and error are now in consistent (world) frames.
             # Ref: BunnyVisionPro xarm7_ability.py:136-159 — consistent frame J+error.
             try:
                 dq = self._solve_damped_least_squares(jacobian, error_world, damping)

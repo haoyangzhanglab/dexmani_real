@@ -21,6 +21,7 @@ class ArmWristMapper:
         pos_scale: float = 1.0,
         rot_scale: float = 1.0,
         vr_to_base_rot: np.ndarray | None = None,
+        base_to_world_rot: np.ndarray | None = None,
         eef_delta_bounds: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
     ) -> None:
@@ -28,6 +29,9 @@ class ArmWristMapper:
         self.rot_scale = rot_scale
         # Maps VR-frame deltas into robot-base-frame deltas.
         self.vr_to_base_rot = np.eye(3) if vr_to_base_rot is None else np.asarray(vr_to_base_rot, dtype=np.float64)
+        # Maps base-frame deltas into world-frame deltas (accounts for base_pose_world).
+        # Default identity means base == world (simulation case).
+        self.base_to_world_rot = np.eye(3) if base_to_world_rot is None else np.asarray(base_to_world_rot, dtype=np.float64)
         # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
         self.eef_delta_bounds = None if eef_delta_bounds is None else np.asarray(eef_delta_bounds, dtype=np.float64)
         # Per-frame rotation delta cap (rad). ~57° default — catches VR tracking glitches.
@@ -66,14 +70,19 @@ class ArmWristMapper:
         delta_pos_vr = wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
         delta_pos_base = self.clip_delta_pos(delta_pos_base)
+        # Transform base-frame delta → world-frame delta before adding to
+        # world-frame eef_pos0 (avoids frame mixing when base_pose_world != I).
+        delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
         delta_rot_vr = wrist_rot @ self.wrist_rot0.T
         delta_rot_vr = self.scale_rot(delta_rot_vr)
         delta_rot_vr = self._clip_delta_rot(delta_rot_vr)
         delta_rot_base = self.vr_to_base_rot @ delta_rot_vr @ self.vr_to_base_rot.T
+        # Similarity-transform rotation delta from base frame → world frame.
+        delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
 
-        target_pos = self.eef_pos0 + delta_pos_base
-        target_rot = delta_rot_base @ self.eef_rot0
+        target_pos = self.eef_pos0 + delta_pos_world
+        target_rot = delta_rot_world @ self.eef_rot0
         target_quat_wxyz = self.continuous_quat(mat2quat(target_rot))
 
         return {

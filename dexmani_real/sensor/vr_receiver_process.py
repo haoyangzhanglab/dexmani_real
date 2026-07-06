@@ -29,7 +29,9 @@ Usage:
 from __future__ import annotations
 
 import multiprocessing as mp
+import threading
 import time
+import traceback
 from dataclasses import dataclass
 
 import numpy as np
@@ -84,6 +86,10 @@ class VRReceiverProcess:
         # Stats (accessible from main process)
         self._received_count = mp.Value("Q", 0, lock=False)
         self._error_count = mp.Value("Q", 0, lock=False)
+        self._ignored_count = mp.Value("Q", 0, lock=False)
+        self._sdk_lines_received = mp.Value("Q", 0, lock=False)
+        self._sdk_parse_errors = mp.Value("Q", 0, lock=False)
+        self._sdk_dropped_lines = mp.Value("Q", 0, lock=False)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,6 +155,35 @@ class VRReceiverProcess:
     def error_frames(self) -> int:
         return int(self._error_count.value)
 
+    @property
+    def ignored_events(self) -> int:
+        return int(self._ignored_count.value)
+
+    @property
+    def sdk_lines_received(self) -> int:
+        return int(self._sdk_lines_received.value)
+
+    @property
+    def sdk_parse_errors(self) -> int:
+        return int(self._sdk_parse_errors.value)
+
+    @property
+    def sdk_dropped_lines(self) -> int:
+        return int(self._sdk_dropped_lines.value)
+
+    def get_stats(self) -> dict:
+        """Diagnostic stats (mirrors QuestHandTracker.get_status)."""
+        return {
+            "running": self.running,
+            "crashed": self.crashed,
+            "received_frames": self.received_frames,
+            "error_frames": self.error_frames,
+            "ignored_events": self.ignored_events,
+            "sdk_lines_received": self.sdk_lines_received,
+            "sdk_parse_errors": self.sdk_parse_errors,
+            "sdk_dropped_lines": self.sdk_dropped_lines,
+        }
+
     # ------------------------------------------------------------------
     # Frame access (from main process)
     # ------------------------------------------------------------------
@@ -204,11 +239,59 @@ class VRReceiverProcess:
                 self.config.transport, self.config.host, self.config.port,
             )
 
+            # ── Monitor thread: periodically log HTS SDK stats ──
+            _monitor_stop = threading.Event()
+
+            def _monitor_loop():
+                """Log HTS client stats every 10s for diagnosing no-frame issues."""
+                while not _monitor_stop.wait(10.0):
+                    try:
+                        stats = client.get_stats()
+                        self._sdk_lines_received.value = getattr(stats, "lines_received", -1)
+                        self._sdk_parse_errors.value = getattr(stats, "parse_errors", -1)
+                        self._sdk_dropped_lines.value = getattr(stats, "dropped_lines", -1)
+                        logger.info(
+                            "VRReceiverProcess diag: sdk_lines=%d parse_err=%d dropped=%d "
+                            "frames=%d ignored=%d errors=%d",
+                            self._sdk_lines_received.value,
+                            self._sdk_parse_errors.value,
+                            self._sdk_dropped_lines.value,
+                            self._received_count.value,
+                            self._ignored_count.value,
+                            self._error_count.value,
+                        )
+                    except Exception:
+                        logger.debug("VRReceiverProcess: stat polling failed (client may not support get_stats)")
+
+            monitor = threading.Thread(target=_monitor_loop, daemon=True, name="vr-monitor")
+            monitor.start()
+
+            # ── Event loop ──
+            _first_event = True
+            _logged_event_types: set[str] = set()
+
             for event in client.iter_events():
                 if self._stop_event.is_set():
                     break
 
+                if _first_event:
+                    _first_event = False
+                    logger.info(
+                        "VRReceiverProcess: first event received (type=%s), "
+                        "iter_events is yielding data",
+                        type(event).__name__,
+                    )
+
                 if not isinstance(event, HandFrame):
+                    self._ignored_count.value += 1
+                    # Log the first occurrence of each non-HandFrame event type
+                    etype = type(event).__name__
+                    if etype not in _logged_event_types:
+                        _logged_event_types.add(etype)
+                        logger.info(
+                            "VRReceiverProcess: non-HandFrame event type=%s (x%d total)",
+                            etype, self._ignored_count.value,
+                        )
                     continue
 
                 try:
@@ -222,8 +305,12 @@ class VRReceiverProcess:
                     flu_pos = unity_left_to_flu_position(*pos)
                     flu_quat = unity_left_to_flu_rotation(*quat_xyzw)
 
+                    # Map side string→int for SHM dtype (int32)
+                    _side_str = str(event.side.value).lower()
+                    _side_int = 0 if "right" in _side_str else (1 if "left" in _side_str else -1)
+
                     frame_dict = {
-                        "side": event.side.value,
+                        "side": _side_int,
                         "wrist_pos": np.asarray(flu_pos, dtype=np.float64),
                         "wrist_quat_wxyz": np.asarray(
                             xyzw_to_wxyz(*flu_quat), dtype=np.float64
@@ -246,10 +333,18 @@ class VRReceiverProcess:
 
                 except (ValueError, TypeError, AttributeError) as exc:
                     self._error_count.value += 1
+                    # Log the first 3 errors with full traceback for diagnosis
+                    if self._error_count.value <= 3:
+                        logger.warning(
+                            "VRReceiverProcess: frame conversion error #%d: %s: %s\n%s",
+                            self._error_count.value, type(exc).__name__, exc,
+                            traceback.format_exc(),
+                        )
                     if self.config.strict:
                         raise
                     continue
 
+            _monitor_stop.set()
             logger.info("VRReceiverProcess: receive loop exited cleanly.")
 
         except (ConnectionError, TimeoutError, RuntimeError) as exc:

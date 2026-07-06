@@ -453,7 +453,6 @@ def main() -> None:
             teleop_dt=CTRL_DT,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            differential_ik_max_pos_step_m=0.05,
         ),
     )
 

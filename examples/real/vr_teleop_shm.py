@@ -51,8 +51,10 @@ from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
+from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.core.controller import TeleopController, TeleopControllerConfig
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
@@ -105,7 +107,6 @@ def main():
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            differential_ik_max_pos_step_m=0.05,
         ),
     )
 
@@ -120,17 +121,36 @@ def main():
         planner=planner,
     )
 
-    # ── 4. Mapper + Retargeter ──
+    # ── 4. Connect & Pre-Flight ──
+    print("\n连接硬件...")
+    result = robot.connect()
+    print(f"  arm:  {'OK' if result.get('arm') else 'FAIL'}")
+    print(f"  hand: {'OK' if result.get('hand') else 'FAIL (降级运行)'}")
+
+    if not result.get("arm"):
+        print("arm 连接失败，退出")
+        vr_receiver.stop()
+        return
+
+    report = preflight_check(robot)
+    print_preflight(report)
+    if not report.passed:
+        print("Pre-Flight 检查失败，退出")
+        robot.disconnect()
+        vr_receiver.stop()
+        return
+
+    # ── 5. Mapper + Retargeter ──
     arm_mapper = ArmWristMapper(robot, planner)
     retargeter = XHandRetargeter()
 
-    # ── 5. Recorder (optional) ──
+    # ── 6. Recorder (optional) ──
     recorder = EpisodeRecorder(
         data_dir="episodes",
         max_frames=3000,
     )
 
-    # ── 6. Controller (SharedMemory VR path) ──
+    # ── 7. Controller (SharedMemory VR path) ──
     cfg = TeleopControllerConfig(
         target_hz=50.0,
         ema_alpha_arm=1.0,  # LeFranX-style simple EMA (1.0 = no smoothing, pass-through)
@@ -148,25 +168,37 @@ def main():
         recorder=recorder,
     )
 
-    # ── 7. Run ──
-    print("\n等待 VR 帧...")
-    startup_deadline = time.perf_counter() + 30.0
-    while time.perf_counter() < startup_deadline:
-        frame = vr_receiver.read_latest()
-        if frame is not None:
-            print(f"  收到首帧 seq={frame.get('sequence_id', '?')} — 就绪")
-            break
-        time.sleep(0.1)
-    else:
-        print("  VR 帧超时 — 退出")
-        vr_receiver.stop()
-        robot.disconnect()
-        return
+    # ── 8. Run ──
+    print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
+    print("  Q=退出")
+    kb = KeyboardHandler()
+    kb.start()
+    try:
+        startup_deadline = time.perf_counter() + 120.0
+        while time.perf_counter() < startup_deadline:
+            for sig in kb.poll(timeout=0.0):
+                if sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
+                    print(f"\n{sig.value}: 退出")
+                    vr_receiver.stop()
+                    robot.disconnect()
+                    return
+            frame = vr_receiver.read_latest()
+            if frame is not None:
+                print(f"  收到首帧 seq={frame.get('sequence_id', '?')} — 就绪")
+                break
+            time.sleep(0.5)
+        else:
+            print("  VR 帧超时 (120s) — 退出")
+            vr_receiver.stop()
+            robot.disconnect()
+            return
+    finally:
+        kb.stop()
 
     print("\n控制: B=开始 C=暂停 S=停止 H=归位 Q=退出 ESC=急停\n")
     controller.run()
 
-    # ── 8. Cleanup ──
+    # ── 9. Cleanup ──
     vr_receiver.stop()
     robot.disconnect()
     print("Done.")

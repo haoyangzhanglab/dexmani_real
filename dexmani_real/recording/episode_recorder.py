@@ -201,7 +201,7 @@ class EpisodeRecorder:
             "vr/wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
             "vr/wrist_quat": np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64),
             "vr/landmarks": np.asarray(vr_frame["landmarks"], dtype=np.float64),
-            "vr_timestamps": float(vr_frame.get("local_recv_ns", 0) * 1e-9),
+            "vr_timestamps": float((vr_frame.get("local_recv_ns") or 0) * 1e-9),
         }
 
         self._buffer.add(data, timestamp=ts)
@@ -283,7 +283,7 @@ class EpisodeRecorder:
         else:
             self._resize_append("timestamps", ts_arr)
 
-        vr_ts = np.array([vr_frame.get("local_recv_ns", 0) * 1e-9], dtype=np.float64)
+        vr_ts = np.array([(vr_frame.get("local_recv_ns") or 0) * 1e-9], dtype=np.float64)
         if "vr_timestamps" not in self._datasets:
             self._datasets["vr_timestamps"] = self._file.create_dataset(
                 "vr_timestamps",

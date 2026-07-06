@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from .types import Pose
-from .pose_utils import compose_pose, compute_pose_error, invert_pose
+from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 
 
 class XArm7Kinematics:
@@ -75,13 +75,16 @@ class XArm7Kinematics:
         (e.g. differential IK) to avoid redundant ``compute_forward_kinematics``.
 
         Returns:
-            (jacobian, pose_world) — Jacobian is 6×dof in base frame,
-            pose is in world frame.
+            (jacobian, pose_world) — both in world frame.
+            Jacobian columns map joint velocities to world-frame spatial velocity
+            [v_world; ω_world].  Pose is the world-frame EEF pose.
         """
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
 
-        # Jacobian (base frame)
+        # Jacobian (base frame) — Pinocchio local_frame=False gives
+        # spatial Jacobian expressed in the model's world frame, which
+        # for a fixed-base model is the robot base frame.
         jacobian_full = np.asarray(
             self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False),
             dtype=np.float64,
@@ -90,7 +93,7 @@ class XArm7Kinematics:
             raise RuntimeError(
                 f"Jacobian has {jacobian_full.shape[1]} columns but dof is {self.dof}."
             )
-        jacobian = jacobian_full[:, : self.dof]
+        jacobian_base = jacobian_full[:, : self.dof]
 
         # Pose (base frame) — extracted from already-computed FK, no extra FK call.
         link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)
@@ -98,9 +101,19 @@ class XArm7Kinematics:
             p=np.asarray(link_pose.p, dtype=np.float64),
             q=np.asarray(link_pose.q, dtype=np.float64),
         )
+
+        # Transform Jacobian from base frame → world frame.
+        # Spatial velocity transforms as [v_w; ω_w] = Ad_{R} @ [v_b; ω_b],
+        # where Ad_R = block_diag(R_b2w, R_b2w).  When base_pose_world is identity
+        # (simulation), this is a no-op.
+        R_b2w = quat_wxyz_to_rotmat(self.base_pose_world.q)
+        jacobian_world = np.empty_like(jacobian_base)
+        jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]   # linear part
+        jacobian_world[3:, :] = R_b2w @ jacobian_base[3:, :]   # angular part
+
         pose_world = self.base_to_world_pose(pose_base)
 
-        return jacobian, pose_world
+        return jacobian_world, pose_world
 
     def compute_manipulability(self, qpos: np.ndarray) -> float:
         """Yoshikawa manipulability measure: sqrt(det(J * J^T)).

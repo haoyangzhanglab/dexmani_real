@@ -238,7 +238,7 @@ class TeleopProfile(FromDictMixin):
     # Step limits applied to the FINAL iteration only (not internal iterations).
     # These cap the per-frame Cartesian delta at the solver output, preventing
     # large joint jumps from unconverged DLS.  Set to inf for no limit.
-    differential_ik_max_pos_step_m: float = 0.02
+    differential_ik_max_pos_step_m: float = 0.05
     differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
 
     # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──

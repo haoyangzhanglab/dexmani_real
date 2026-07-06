@@ -53,6 +53,13 @@ from dexmani_real.planning import (
 )
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.robot.inner_loop import ArmInnerLoop
+
+try:
+    from pynput import keyboard  # type: ignore[import-untyped]
+except ImportError:
+    raise ImportError(
+        "pynput is required for keyboard input. Install with: pip install pynput"
+    )
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.rate_limiter import RateLimiter
@@ -97,8 +104,6 @@ class KeyState:
         self._thread: threading.Thread | None = None
 
     def _run(self):
-        from pynput import keyboard
-
         def on_press(key):
             try:
                 with self._lock:
@@ -429,7 +434,6 @@ def main():
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            differential_ik_max_pos_step_m=0.05,
         ),
     )
 

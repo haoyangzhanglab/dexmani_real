@@ -55,6 +55,13 @@ from dexmani_real.utils.rate_limiter import RateLimiter
 
 from dexmani_real.planning.pose_utils import quat_multiply
 
+try:
+    from pynput import keyboard  # type: ignore[import-untyped]
+except ImportError:
+    raise ImportError(
+        "pynput is required for keyboard input. Install with: pip install pynput"
+    )
+
 logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ 配置
@@ -90,8 +97,6 @@ class GlobalKeyState:
         self._listener = None  # pynput keyboard.Listener
 
     def _run(self):
-        from pynput import keyboard
-
         def on_press(key):
             try:
                 if hasattr(key, "char") and key.char is not None:
@@ -229,7 +234,6 @@ def main():
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            differential_ik_max_pos_step_m=0.05,
         ),
     )
 
@@ -547,14 +551,14 @@ def main():
                     consecutive_divergence = 0
 
     finally:
-        keys.stop()
+        # Restore terminal first (pynput uses evdev, not termios — no conflict).
         time.sleep(0.05)
         termios.tcflush(fd, termios.TCIFLUSH)
         termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
 
         print("\n退出主循环")
 
-        # Post-loop: offer return_home
+        # Post-loop: offer return_home (keys listener still alive)
         print("\n按 R 执行 return_home，或按 Q 直接退出...")
         while True:
             if keys.is_pressed("r"):
@@ -563,6 +567,8 @@ def main():
             if keys.is_pressed("q") or keys.is_pressed("esc"):
                 break
             time.sleep(0.1)
+
+        keys.stop()
 
         # ── Cleanup ──
         if arm_inner.is_alive:

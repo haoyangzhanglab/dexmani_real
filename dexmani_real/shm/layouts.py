@@ -85,12 +85,12 @@ def vr_frame_to_array(frame: dict) -> np.ndarray:
     arr["wrist_pos"] = np.asarray(frame["wrist_pos"], dtype=np.float64)
     arr["wrist_quat_wxyz"] = np.asarray(frame["wrist_quat_wxyz"], dtype=np.float64)
     arr["landmarks"] = np.asarray(frame["landmarks"], dtype=np.float64).reshape(21, 3)
-    arr["recv_ts_ns"] = np.uint64(frame.get("recv_ts_ns", 0))
-    arr["source_ts_ns"] = np.uint64(frame.get("source_ts_ns", 0))
-    arr["sequence_id"] = np.uint64(frame.get("sequence_id", 0))
-    arr["source_frame_seq"] = np.uint64(frame.get("source_frame_seq", 0))
-    arr["local_recv_ns"] = np.uint64(frame.get("local_recv_ns", 0))
-    arr["side"] = np.int32(frame.get("side", -1))
+    arr["recv_ts_ns"] = np.uint64(frame.get("recv_ts_ns") or 0)
+    arr["source_ts_ns"] = np.uint64(frame.get("source_ts_ns") or 0)
+    arr["sequence_id"] = np.uint64(frame.get("sequence_id") or 0)
+    arr["source_frame_seq"] = np.uint64(frame.get("source_frame_seq") or 0)
+    arr["local_recv_ns"] = np.uint64(frame.get("local_recv_ns") or 0)
+    arr["side"] = np.int32(frame.get("side") if frame.get("side") is not None else -1)
     return arr
 
 
@@ -126,8 +126,15 @@ def camera_frame_to_bytes(frame: dict) -> tuple[np.ndarray, np.ndarray]:
     header["timestamp"] = np.float64(frame.get("timestamp", 0.0))
     header["frame_number"] = np.uint64(frame.get("frame_id", 0))
 
-    rgb = np.asarray(frame.get("rgb"), dtype=np.uint8)
-    depth = np.asarray(frame.get("depth"), dtype=np.uint16)
+    rgb_raw = frame.get("rgb")
+    depth_raw = frame.get("depth")
+    if rgb_raw is None or depth_raw is None:
+        raise ValueError(
+            "camera_frame_to_bytes: 'rgb' and 'depth' must not be None. "
+            "Check CameraProcess config (enable_color, enable_depth)."
+        )
+    rgb = np.asarray(rgb_raw, dtype=np.uint8)
+    depth = np.asarray(depth_raw, dtype=np.uint16)
 
     header["rgb_size"] = np.uint64(rgb.nbytes)
     header["depth_size"] = np.uint64(depth.nbytes)
