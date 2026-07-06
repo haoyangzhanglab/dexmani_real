@@ -166,8 +166,11 @@ class FingertipDeskSafety:
             step_rad = self._config.desk_safety_step_rad
 
         path = np.asarray(path, dtype=np.float64)
+        # Handle 1D single-waypoint input
+        if path.ndim == 1:
+            path = path.reshape(1, -1)
         # Extract arm-only columns if padded
-        if path.ndim != 2 or path.shape[1] > 7:
+        if path.ndim == 2 and path.shape[1] > 7:
             path = path[:, :7]
 
         if len(path) < 2:

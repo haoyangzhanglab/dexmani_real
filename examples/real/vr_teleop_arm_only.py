@@ -490,6 +490,8 @@ def main():
 
             # ── IK solve ──
             target_pose = Pose(p=target_pos, q=target_quat)
+            if np.all(np.isfinite(state.hand_qpos)):
+                planner.set_hand_qpos(state.hand_qpos)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:

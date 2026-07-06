@@ -531,17 +531,23 @@ def main():
             # ── 有输入则计算 control ──
             has_input = not (np.all(dx == 0) and np.all(drpy == 0))
             if has_input:
-                # 软墙: 逐轴拒绝边界外移动
+                # 软墙: 方向感知 — 允许移回工作空间
                 new_pos = target_pos + dx
                 for axis in range(3):
                     if dx[axis] == 0:
                         continue
                     lo, hi = WORKSPACE_BOUNDS[axis]
-                    if lo <= new_pos[axis] <= hi:
-                        target_pos[axis] = new_pos[axis]
-                        if wall_warned[axis] and lo + 0.01 <= new_pos[axis] <= hi - 0.01:
+                    cur = target_pos[axis]
+                    new = new_pos[axis]
+                    if lo <= new <= hi:
+                        target_pos[axis] = new
+                        if wall_warned[axis] and lo + 0.01 <= new <= hi - 0.01:
                             wall_warned[axis] = False
+                    elif (cur < lo and dx[axis] > 0) or (cur > hi and dx[axis] < 0):
+                        # Moving back toward workspace → allow, clamp to boundary
+                        target_pos[axis] = float(np.clip(new, lo, hi))
                     else:
+                        # Moving further outside → reject
                         if not wall_warned[axis] or now - last_wall_time > 3.0:
                             names = ["x", "y", "z"]
                             print(f"  ⚠ {names[axis]} 轴到达边界 [{lo:.2f}, {hi:.2f}]")
@@ -581,6 +587,9 @@ def main():
                     prev_arm_cmd = arm_cmd.copy()
                 else:
                     ik_fail_consecutive += 1
+                    reason = getattr(ik_result, "reason", "") or "unknown"
+                    if ik_fail_consecutive <= 1 or ik_fail_consecutive % 50 == 0:
+                        print(f"  ⚡ IK fail (#{ik_fail_consecutive}): {reason}", flush=True)
                     target_pos = actual_pos.copy()
                     target_quat = actual_quat.copy()
                     arm_cmd = current_arm_qpos.copy()

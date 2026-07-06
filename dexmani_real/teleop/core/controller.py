@@ -32,6 +32,8 @@ from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
 
+from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
+
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
@@ -67,6 +69,11 @@ class TeleopControllerConfig:
     multi_camera_configs: list | None = None
     multi_camera_auto_restart: bool = True
     vr_disconnect_timeout_s: float = 3.0
+
+    # Two-phase handshake: robot signals execution complete before controller
+    # generates the next action.  Enable for policy inference; keep disabled
+    # (default) for standard teleop.
+    synchronized: bool = False
 
 
 class TeleopController:
@@ -116,14 +123,19 @@ class TeleopController:
 
         # ── Arm inner loop (in-process thread, 250Hz) ──
         self._arm_inner: ArmInnerLoop | None = None
+        self._sync: SharedSyncPrimitives | None = None
         if not self.dry_run:
             inner_cfg = cfg.inner_loop_cfg if cfg.inner_loop_cfg is not None else ArmInnerLoopConfig()
-            self._arm_inner = ArmInnerLoop(cfg=inner_cfg)
+            if cfg.synchronized:
+                self._sync = SharedSyncPrimitives()
+                inner_cfg.synchronized = True
+            self._arm_inner = ArmInnerLoop(cfg=inner_cfg, sync=self._sync)
             self._arm_inner.start()
             mode_label = {4: "velocity control + PID", 1: "position servo"}.get(
                 inner_cfg.control_mode, f"mode {inner_cfg.control_mode}"
             )
-            logger.info("ArmInnerLoop started (mode %d, %s, 250Hz)", inner_cfg.control_mode, mode_label)
+            sync_label = ", sync" if cfg.synchronized else ""
+            logger.info("ArmInnerLoop started (mode %d, %s, 250Hz%s)", inner_cfg.control_mode, mode_label, sync_label)
 
         # Recording with async writer thread (offloads HDF5 I/O from hot path)
         if recorder is not None:
@@ -362,6 +374,12 @@ class TeleopController:
             # Send hand directly
             self.robot.send_action(action)
 
+            # ── Sync handshake: signal policy_ready, wait for robot_ready ──
+            if self._sync is not None:
+                self._sync.policy_ready.set()
+                self._sync.robot_ready.wait()
+                self._sync.robot_ready.clear()
+
         # ── 7. Periodic status ──
         now = time.monotonic()
         if now - self.last_status_ts >= self.status_interval:
@@ -406,8 +424,9 @@ class TeleopController:
             if not np.all(np.isfinite(hq)) or np.any(hq < hand_min) or np.any(hq > hand_max):
                 retarget_ok = False
 
-        if ik_ok and retarget_ok:
+        if ik_ok:
             self._last_good_arm = np.asarray(action.arm_qpos_cmd, dtype=np.float64).copy()
+        if retarget_ok:
             self._last_good_hand = np.asarray(action.hand_qpos_cmd, dtype=np.float64).copy()
 
         if ik_ok:
@@ -505,7 +524,7 @@ class TeleopController:
             self.robot.return_to_home()
 
         self.state = ControllerState.IDLE
-        self.recording = False
+        self._stop_recording(save=False)
         self._last_good_arm = None
         self._last_good_hand = None
         self.limiter.reset()
@@ -621,7 +640,12 @@ class TeleopController:
 
     def _hold_action(self) -> RobotAction:
         arm = self._last_good_arm.copy() if self._last_good_arm is not None else np.zeros(7, dtype=np.float64)
-        hand = self._last_good_hand.copy() if self._last_good_hand is not None else np.zeros(12, dtype=np.float64)
+        if self._last_good_hand is not None:
+            hand = self._last_good_hand.copy()
+        elif not self.dry_run:
+            hand = self.robot.get_state().hand_qpos.copy()
+        else:
+            hand = np.zeros(12, dtype=np.float64)
         return RobotAction(arm_qpos_cmd=arm, hand_qpos_cmd=hand)
 
     # ── Keyboard hints ──

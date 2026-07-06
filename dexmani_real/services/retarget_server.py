@@ -57,10 +57,13 @@ def _shutdown() -> None:
     logger.info("Retarget server stopped.")
 
 
+_shutdown_requested = False
+
+
 def _signal_handler(signum: int, frame: Any) -> None:
+    global _shutdown_requested
     logger.info("Received signal %s, shutting down ...", signal.Signals(signum).name)
-    _shutdown()
-    sys.exit(0)
+    _shutdown_requested = True
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +143,12 @@ def run_server(port: int = 5556, hand_type: str = "right", retargeting_type: str
     _socket.bind(f"tcp://*:{port}")
     logger.info("Retarget server listening on port %d ...", port)
 
-    while True:
+    poller = zmq.Poller()
+    poller.register(_socket, zmq.POLLIN)
+    while not _shutdown_requested:
+        socks = dict(poller.poll(timeout=100))  # 100ms poll interval
+        if _socket not in socks:
+            continue
         try:
             raw = _socket.recv_json()
         except zmq.ZMQError as e:

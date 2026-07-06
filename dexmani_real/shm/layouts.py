@@ -124,7 +124,7 @@ def camera_frame_to_bytes(frame: dict) -> tuple[np.ndarray, np.ndarray]:
     """
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
     header["timestamp"] = np.float64(frame.get("timestamp", 0.0))
-    header["frame_number"] = np.uint64(frame.get("frame_number", 0))
+    header["frame_number"] = np.uint64(frame.get("frame_id", 0))
 
     rgb = np.asarray(frame.get("rgb"), dtype=np.uint8)
     depth = np.asarray(frame.get("depth"), dtype=np.uint16)

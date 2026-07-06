@@ -29,5 +29,12 @@ class CollectionConfig:
     auto_stop_on_max_frames: bool = True
     save_sidecar_json: bool = True
 
+    # When True, all non-camera streams are aligned to a unified dt=20ms time grid
+    # at record time via TimestampAlignedBuffer and flushed to HDF5 in bulk at
+    # episode stop.  Camera frames are stored per-frame as before (too large for
+    # pre-allocation).  When False (default), every frame is appended to HDF5
+    # individually with raw timestamps.
+    use_timestamp_buffer: bool = False
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

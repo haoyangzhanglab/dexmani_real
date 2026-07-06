@@ -311,6 +311,9 @@ def main():
     start_time = time.perf_counter()
     prev_eef_pos: np.ndarray | None = None
     ik_method = "-"
+    ik_fail_count = 0
+    _last_ik_fail_reason = ""
+    _last_ik_fail_time = 0.0
 
     def _emergency_stop():
         """Stop inner loop first, then arm+hand, to avoid SDK error spam."""
@@ -464,17 +467,23 @@ def main():
             if lead > TARGET_LEAD_MAX:
                 target_pos = state.eef_pos + (target_pos - state.eef_pos) * (TARGET_LEAD_MAX / lead)
 
-            # ── Workspace soft-wall ──
+            # ── Workspace soft-wall: directional — allow moving back into workspace ──
             new_pos = target_pos + dx
             for axis in range(3):
                 if dx[axis] == 0:
                     continue
                 lo, hi = WORKSPACE_BOUNDS[axis]
-                if lo <= new_pos[axis] <= hi:
-                    target_pos[axis] = new_pos[axis]
-                    if wall_warned[axis] and lo + 0.01 <= new_pos[axis] <= hi - 0.01:
+                cur = target_pos[axis]
+                new = new_pos[axis]
+                if lo <= new <= hi:
+                    target_pos[axis] = new
+                    if wall_warned[axis] and lo + 0.01 <= new <= hi - 0.01:
                         wall_warned[axis] = False
+                elif (cur < lo and dx[axis] > 0) or (cur > hi and dx[axis] < 0):
+                    # Moving back toward workspace → allow, clamp to boundary
+                    target_pos[axis] = float(np.clip(new, lo, hi))
                 else:
+                    # Moving further outside → reject
                     now = time.perf_counter()
                     if not wall_warned[axis] or now - last_wall_time > 3.0:
                         names = ["x", "y", "z"]
@@ -488,9 +497,18 @@ def main():
 
             # ── IK solve ──
             target_pose = Pose(p=target_pos, q=target_quat)
+            if np.all(np.isfinite(state.hand_qpos)):
+                planner.set_hand_qpos(state.hand_qpos)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:
+                ik_fail_count += 1
+                reason = getattr(ik_result, "reason", "") or "unknown"
+                now = time.perf_counter()
+                if reason != _last_ik_fail_reason or now - _last_ik_fail_time > 1.0:
+                    print(f"  ⚡ IK fail (#{ik_fail_count}): {reason}", flush=True)
+                    _last_ik_fail_reason = reason
+                    _last_ik_fail_time = now
                 target_pos = state.eef_pos.copy()
                 target_quat = state.eef_quat_wxyz.copy()
                 ik_method = "held"

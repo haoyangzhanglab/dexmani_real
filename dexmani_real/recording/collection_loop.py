@@ -83,10 +83,10 @@ class CollectionLoop:
             camera_frames=camera_frames,
         )
 
-        if self.recorder.max_frames_reached:
+        if self.recorder.max_frames_reached and self.config.auto_stop_on_max_frames:
             logger.warning("Auto-stopping at max_frames=%d", self.recorder.max_frames)
             self.stop_episode(success=True, reason="max_frames")
-            return True
+            return False
 
         if recorded:
             self._episode_frame_count += 1

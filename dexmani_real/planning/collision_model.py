@@ -271,6 +271,7 @@ class CollisionModel:
         # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF)
         self._hand_qpos: np.ndarray = np.zeros(_HAND_DOF_COUNT, dtype=np.float64)
         self._hand_qpos_initialized: bool = False
+        self._hand_qpos_warned: bool = False  # throttle warning to once per instance
 
     # ------------------------------------------------------------------
     # qpos handling
@@ -315,11 +316,13 @@ class CollisionModel:
         qpos = np.asarray(qpos, dtype=np.float64)
         if self._hand_dof and qpos.shape == (7,):
             if not self._hand_qpos_initialized:
-                logger.warning(
-                    "hand_qpos not initialized — collision checks use zero (open-hand) pose, "
-                    "which may not match actual hand configuration. "
-                    "Call set_hand_qpos() before collision checks."
-                )
+                if not self._hand_qpos_warned:
+                    logger.warning(
+                        "hand_qpos not initialized — collision checks use zero (open-hand) pose, "
+                        "which may not match actual hand configuration. "
+                        "Call set_hand_qpos() before collision checks."
+                    )
+                    self._hand_qpos_warned = True
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:
             raise ValueError(

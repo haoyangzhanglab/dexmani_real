@@ -194,7 +194,7 @@ class RobotInterface:
         hand_ok = self.hand.send_action(action.hand_qpos_cmd)
         return {
             "hand_ok": hand_ok,
-            "hand_cmd": self.hand.last_qpos_cmd.copy() if hand_ok else None,
+            "hand_cmd": self.hand.last_qpos_cmd.copy() if (hand_ok and self.hand.last_qpos_cmd is not None) else None,
         }
 
     # ── Hand reset ──
@@ -203,6 +203,23 @@ class RobotInterface:
         if not self.hand.is_connected():
             return False
         return self.hand.reset()
+
+    def _sync_hand_collision_model(self) -> None:
+        """Sync CollisionModel hand buffer with current hardware state.
+
+        Non-critical: CollisionModel defaults to open hand on failure.
+        Today the 7-DOF collision URDF ignores hand DOFs entirely, so this
+        is defence-in-depth for future 19-DOF collision mode.
+        """
+        if self.planner is None:
+            return
+        try:
+            hand_state = self.hand.get_state()
+            hand_qpos = np.asarray(hand_state.get("qpos", np.zeros(12)), dtype=np.float64)
+            if hand_qpos.shape == (12,) and np.all(np.isfinite(hand_qpos)):
+                self.planner.set_hand_qpos(hand_qpos)
+        except Exception:
+            pass  # non-critical
 
     # ── Return to home (path-planned) ──
 
@@ -256,7 +273,10 @@ class RobotInterface:
 
             # ── 4. Already at home? ──
             if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(1.0):
-                return self.hand.reset() if self.hand.is_connected() else True
+                hand_ok = self.hand.reset() if self.hand.is_connected() else True
+                # Sync CollisionModel with post-reset hand state
+                self._sync_hand_collision_model()
+                return hand_ok
 
             # ── 5. Pre-flight: reset hand (align FK model to reality) ──
             if self.hand.is_connected():
@@ -265,13 +285,7 @@ class RobotInterface:
                 # Sync CollisionModel hand buffer so env collision checks use
                 # the post-reset hand geometry (defence-in-depth; today the
                 # 7-DOF collision URDF ignores hand DOFs entirely).
-                try:
-                    hand_state = self.hand.get_state()
-                    hand_qpos = np.asarray(hand_state.get("qpos", np.zeros(12)), dtype=np.float64)
-                    if hand_qpos.shape == (12,) and np.all(np.isfinite(hand_qpos)):
-                        self.planner.set_hand_qpos(hand_qpos)
-                except Exception:
-                    pass  # non-critical: CollisionModel defaults to open hand
+                self._sync_hand_collision_model()
             qpos = self._read_arm_qpos()
             if qpos is None:
                 return self._reset_blocking()

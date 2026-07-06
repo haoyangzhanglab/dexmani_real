@@ -212,7 +212,6 @@ class StreamInterpolator:
         idx = np.clip(idx, 1, len(source_ts) - 1)
         gaps = source_ts[idx] - source_ts[idx - 1]
         valid_gap = gaps <= self.config.max_gap_s
-        valid_gap = np.concatenate([[False], valid_gap])
 
         invalid = ~valid_gap
         if not self.config.extrapolate:

@@ -22,11 +22,16 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.signal_utils import limit_jerk
 
 logger = get_logger(__name__)
 
@@ -136,6 +141,10 @@ class ArmInnerLoopConfig:
     smooth_position_alpha: float = 0.0
     target_timeout_s: float = 0.2
 
+    # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
+    # hardware write and waits for policy_ready before the next target dispatch.
+    synchronized: bool = False
+
     def __post_init__(self):
         self.kp = np.asarray(self.kp, dtype=np.float64).ravel()[:7]
         self.ki = np.asarray(self.ki, dtype=np.float64).ravel()[:7]
@@ -170,10 +179,12 @@ class ArmInnerLoop:
         ip: str = "192.168.1.111",
         dt: float = 1.0 / 250.0,
         cfg: ArmInnerLoopConfig | None = None,
+        sync: SharedSyncPrimitives | None = None,
     ) -> None:
         self._ip = ip
         self._dt = float(dt)
         self._cfg = cfg or ArmInnerLoopConfig()
+        self._sync = sync
 
         # ── Shared state (protected by _lock) ──
         self._lock = threading.Lock()
@@ -237,6 +248,22 @@ class ArmInnerLoop:
             if self._thread.is_alive():
                 logger.warning("ArmInnerLoop thread did not exit within %.0fs", timeout)
 
+    # ── Sync handshake ──
+
+    def _signal_ready_and_sync(self) -> None:
+        """Signal robot_ready and wait for policy_ready (two-phase handshake)."""
+        if self._sync is None:
+            return
+        self._sync.robot_ready.set()
+        self._sync.policy_ready.wait()
+        self._sync.policy_ready.clear()
+
+    def _signal_ready_only(self) -> None:
+        """Signal robot_ready without waiting (used in timeout/hold paths)."""
+        if self._sync is None:
+            return
+        self._sync.robot_ready.set()
+
     # ── Inner loop ──
 
     def _run(self) -> None:
@@ -250,12 +277,11 @@ class ArmInnerLoop:
                 self._error_state = True
             return
 
+        mode = self._cfg.control_mode
         try:
             arm.clean_error()
             arm.clean_warn()
             arm.motion_enable(True)
-
-            mode = self._cfg.control_mode
             self._init_mode(arm, mode)
             arm.set_collision_sensitivity(1)
 
@@ -339,8 +365,7 @@ class ArmInnerLoop:
                         self._hold_position(arm)
                     # Reset mode-1 smoothing state on timeout
                     self._mode1_smoothed = None
-                    if target is not None:
-                        last_target_ts = target_ts
+                    self._signal_ready_only()  # avoid deadlock: no new target expected
                     continue
 
                 if target is None:
@@ -399,6 +424,9 @@ class ArmInnerLoop:
                     self._tick_mode4(arm, target, current_qpos, prev_qvel, prev_qacc)
                 else:
                     self._tick_mode1(arm, target)
+
+                # ── 6. Sync handshake (after hardware write) ──
+                self._signal_ready_and_sync()
 
         except Exception:
             logger.exception("ArmInnerLoop: fatal error in main loop")
@@ -486,7 +514,6 @@ class ArmInnerLoop:
 
         # 4. Optional jerk limiting (ref: signal_utils.limit_jerk)
         if self._cfg.max_jerk is not None and prev_qvel is not None:
-            from dexmani_real.utils.signal_utils import limit_jerk
             # Use the non-None prev_qacc tracked by the caller
             qvel, updated_acc = limit_jerk(
                 qvel, prev_qvel, prev_qacc, self._dt,

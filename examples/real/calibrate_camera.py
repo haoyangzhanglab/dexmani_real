@@ -662,14 +662,21 @@ def main():
             if lead > TARGET_LEAD_MAX:
                 target_pos = state.eef_pos + (target_pos - state.eef_pos) * (TARGET_LEAD_MAX / lead)
 
-            # ── Workspace soft-wall ──
+            # ── Workspace soft-wall: directional — allow moving back into workspace ──
             new_pos = target_pos + dx
             for axis in range(3):
                 lo, hi = WORKSPACE_BOUNDS[axis]
-                if lo <= new_pos[axis] <= hi:
-                    if dx[axis] != 0:
-                        target_pos[axis] = new_pos[axis]
+                cur = target_pos[axis]
+                new = new_pos[axis]
+                if dx[axis] == 0:
+                    continue
+                if lo <= new <= hi:
+                    target_pos[axis] = new
+                elif (cur < lo and dx[axis] > 0) or (cur > hi and dx[axis] < 0):
+                    # Moving back toward workspace → allow, clamp to boundary
+                    target_pos[axis] = float(np.clip(new, lo, hi))
                 else:
+                    # Moving further outside → reject
                     now = time.perf_counter()
                     if not wall_warned[axis] or now - last_wall_time > 3.0:
                         names = ["x", "y", "z"]
@@ -683,6 +690,8 @@ def main():
 
             # ── IK ──
             target_pose = Pose(p=target_pos, q=target_quat)
+            if np.all(np.isfinite(state.hand_qpos)):
+                planner.set_hand_qpos(state.hand_qpos)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
             if not ik_result.success or ik_result.qpos is None:
                 target_pos = state.eef_pos.copy()

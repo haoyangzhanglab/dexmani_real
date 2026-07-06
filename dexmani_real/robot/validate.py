@@ -30,11 +30,10 @@ def validate_action(
     Checks (fail-fast order):
       1. SDK error state (arm + hand is_error)
       2. Arm connection
-      3. Workspace FK soft clamp — uses actual_arm_qpos (from inner loop)
-         when available, falls back to action.arm_qpos_cmd (command).
-         Real-time position is preferred because the "hold last command"
-         fallback may drift past workspace bounds if commands progressively
-         diverge from actual positions.
+      3. Workspace FK check — validates the command target position
+         (action.arm_qpos_cmd FK), not the current actual position.
+         This allows recovery commands that move the arm back into
+         workspace when it has drifted outside bounds.
       4. Environment collision (defence in depth, S4) — independent
          second check beyond the IK-layer collision gate.  Uses the
          CollisionModel Tier-1 fast check (~17μs).
@@ -49,18 +48,17 @@ def validate_action(
     if not robot.arm.is_connected():
         return False, "arm not connected"
 
-    # 3. Workspace bounds — prefer actual position over command
-    qpos_for_fk = actual_arm_qpos
-    if qpos_for_fk is None or not np.all(np.isfinite(qpos_for_fk)):
-        qpos_for_fk = action.arm_qpos_cmd
-
-    arm_eef = robot.kinematics.compute_eef_pose_world(qpos_for_fk)
-    if not robot.workspace.check(arm_eef.p):
+    # 3. Workspace bounds — validate the command target position.
+    #    Using command FK (not actual position FK) so that recovery
+    #    commands moving the arm back into workspace are not blocked
+    #    when the arm has drifted outside bounds.
+    cmd_eef = robot.kinematics.compute_eef_pose_world(action.arm_qpos_cmd)
+    if not robot.workspace.check(cmd_eef.p):
         return False, "workspace position violation"
 
     # 4. Environment collision — defence in depth (S4)
     if env_collision_check is not None:
-        qpos_for_col = actual_arm_qpos if actual_arm_qpos is not None else action.arm_qpos_cmd
+        qpos_for_col = actual_arm_qpos if (actual_arm_qpos is not None and np.all(np.isfinite(actual_arm_qpos))) else action.arm_qpos_cmd
         if env_collision_check(qpos_for_col):
             return False, "environment collision (pre-send gate)"
 

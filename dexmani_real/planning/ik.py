@@ -6,12 +6,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from dexmani_real.utils.log import get_logger
+
 if TYPE_CHECKING:
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
 from .types import IKResult, Pose, TeleopProfile
 from .pose_utils import ensure_qpos, pose_error_vector
+
+logger = get_logger(__name__)
 
 
 class TeleopIKSolver:
@@ -325,14 +329,14 @@ class TeleopIKSolver:
         diff_cat = diagnostic["diff_ik"].get("category", "")
         pos_cat = diagnostic["position_ik"].get("category", "")
 
-        if diff_ik_failed and not position_report.get("disabled"):
+        if diff_ik_failed and not diagnostic["position_ik"].get("disabled"):
             if pos_cat == "unreachable":
                 diagnostic["classification"] = "unreachable"
             elif pos_cat == "filtered":
                 diagnostic["classification"] = "all_filtered"
             else:
                 diagnostic["classification"] = "all_methods_exhausted"
-        elif diff_ik_failed and position_report.get("disabled"):
+        elif diff_ik_failed and diagnostic["position_ik"].get("disabled"):
             diagnostic["classification"] = f"diff_ik_failed:{diff_cat}"
         else:
             diagnostic["classification"] = "held"
@@ -430,19 +434,47 @@ class TeleopIKSolver:
             qpos_cmd, profile,
         )
         if collision_reason is not None:
-            qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-            return IKResult(
-                success=False, qpos=previous_qpos_cmd.copy(),
-                reason=collision_reason,
-                report={
-                    **report,
-                    "teleop_ik_method": method,
-                    "held": True,
-                    "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
-                    **collision_extra,
-                },
-                held=True,
-            )
+            # Direction-aware recovery for env collision: when the target EEF
+            # is moving upward (away from the table), allow the command through
+            # to prevent permanent stuck state at low heights where all IK
+            # solutions trigger the collision gate.
+            if "environment collision" in collision_reason:
+                current_eef = self.kin.compute_eef_pose_world(current_qpos)
+                if target_eef_pose_world.p[2] > current_eef.p[2] + 0.001:
+                    # Moving up — allow recovery, skip collision gate.
+                    logger.warning(
+                        "Allowing upward recovery through env collision gate "
+                        "(target_z=%.3f, current_z=%.3f)",
+                        target_eef_pose_world.p[2], current_eef.p[2],
+                    )
+                else:
+                    qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
+                    return IKResult(
+                        success=False, qpos=previous_qpos_cmd.copy(),
+                        reason=collision_reason,
+                        report={
+                            **report,
+                            "teleop_ik_method": method,
+                            "held": True,
+                            "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
+                            **collision_extra,
+                        },
+                        held=True,
+                    )
+            else:
+                qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
+                return IKResult(
+                    success=False, qpos=previous_qpos_cmd.copy(),
+                    reason=collision_reason,
+                    report={
+                        **report,
+                        "teleop_ik_method": method,
+                        "held": True,
+                        "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
+                        **collision_extra,
+                    },
+                    held=True,
+                )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
         cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
@@ -507,6 +539,7 @@ class TeleopIKSolver:
                 )
 
         iterations = 0
+        converged = False
         last_jacobian: np.ndarray | None = None  # P5: reuse in nullspace path
         for iterations in range(max_iter):
             jacobian, current_pose = self.kin.compute_eef_jacobian_and_pose_world(qpos)
@@ -522,6 +555,7 @@ class TeleopIKSolver:
 
             # Convergence check (BVP: norm(err) < 1e-3).
             if np.linalg.norm(error_world) < conv_thresh:
+                converged = True
                 break
 
             # DLS solve: dq = J^T (J·J^T + λ²I)^(-1) · error · step
@@ -541,20 +575,16 @@ class TeleopIKSolver:
 
             qpos = qpos + dq * step
 
-        # Apply step limit to the FINAL delta (safety clamp on total displacement).
-        final_delta = qpos - current_qpos
-        final_normalized = np.abs(final_delta) / (
-            profile.differential_ik_max_pos_step_m if np.max(np.abs(final_delta)) > 0 else 1.0
-        )
         # Per-joint canonicalization: wrap to [-π, π] and prefer the branch
-        # closest to the previous command.
+        # closest to the previous command. Joint-level delta safety is enforced
+        # by the inner loop (velocity/acceleration/jerk limiting at 250 Hz).
         raw_target_qpos = self.ik_mgr.canonicalize_qpos(qpos, previous_qpos_cmd)
 
         diff_report = {
             "differential_ik_status": "success",
             "fallback_method": "differential_ik",
             "iterations": iterations + 1,
-            "converged": iterations + 1 < max_iter,
+            "converged": converged,
         }
         return self.command_from_target_qpos(
             target_eef_pose_world=target_eef_pose_world,

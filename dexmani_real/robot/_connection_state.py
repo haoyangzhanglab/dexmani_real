@@ -35,7 +35,12 @@ class ConnectionStateMixin:
         return self.connected_flag and not self.error_state
 
     def is_error(self) -> bool:
-        """Return True if the device is in an error state.
+        """Return True if the device should NOT receive commands.
+
+        Returns True when the device is not connected (``connected_flag=False``)
+        OR when an explicit error has been flagged (``error_state=True``).
+        This inclusive check is intentional: the safety gate must block commands
+        both before connection and after a hardware fault.
 
         Override in subclasses to add hardware-specific checks
         (e.g. ``self.arm.error_code != 0``).

@@ -515,7 +515,11 @@ class XArm7MotionPlanner:
         eef_positions = np.array(
             [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
         )
+        # Skip waypoint 0 (start position) — the arm may already be outside
+        # workspace; the path is valid as long as subsequent waypoints are safe.
         for i, eef_p in enumerate(eef_positions):
+            if i == 0:
+                continue
             if not self.workspace_safety.check(eef_p):
                 violations = []
                 for ax in range(3):

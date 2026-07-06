@@ -17,6 +17,7 @@ from dexmani_real.shm.layouts import (
     vr_frame_to_array,
 )
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
+from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 
 __all__ = [
     "array_to_vr_frame",
@@ -26,6 +27,7 @@ __all__ = [
     "camera_frame_to_bytes",
     "SharedMemoryFrameManager",
     "SharedMemoryRingBuffer",
+    "SharedSyncPrimitives",
     "VR_FRAME_DTYPE",
     "vr_frame_to_array",
 ]

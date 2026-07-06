@@ -60,9 +60,11 @@ class DataValidator:
         self,
         min_frames: int = 50,
         variance_epsilon: float = 1e-8,
+        duplicate_epsilon: float = 1e-4,
     ) -> None:
         self.min_frames = min_frames
         self.variance_epsilon = variance_epsilon
+        self.duplicate_epsilon = duplicate_epsilon
 
     def validate(self, h5_path: str | Path) -> ValidationReport:
         """Run all 7 checks on a single episode file.
@@ -192,8 +194,8 @@ class DataValidator:
             )
         obs_diff = np.sum(np.abs(np.diff(obs, axis=0)), axis=1)
         act_diff = np.sum(np.abs(np.diff(act, axis=0)), axis=1)
-        n_dup_obs = int(np.sum(obs_diff < self.variance_epsilon))
-        n_dup_act = int(np.sum(act_diff < self.variance_epsilon))
+        n_dup_obs = int(np.sum(obs_diff < self.duplicate_epsilon))
+        n_dup_act = int(np.sum(act_diff < self.duplicate_epsilon))
         total_dup = max(n_dup_obs, n_dup_act)
         ok = total_dup == 0
         return ValidationCheck(
