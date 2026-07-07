@@ -105,14 +105,10 @@ class RobotAction:
     """Action command sent to hardware.
 
     arm_qpos_cmd / hand_qpos_cmd: final command after joint limit + delta limit.
-    target_eef_pos / target_eef_rot6d: EEF target before IK (optional).
     """
 
     arm_qpos_cmd: np.ndarray  # (7,)  float64  rad
     hand_qpos_cmd: np.ndarray  # (12,) float64  rad
-
-    target_eef_pos: np.ndarray | None = None  # (3,)  float64  m
-    target_eef_rot6d: np.ndarray | None = None  # (6,)  float64
 
     def __post_init__(self):
         _validate_field_shapes(

@@ -153,7 +153,7 @@ def main():
     # ── 7. Controller (SharedMemory VR path) ──
     cfg = TeleopControllerConfig(
         target_hz=50.0,
-        ema_alpha_arm=1.0,  # LeFranX-style simple EMA (1.0 = no smoothing, pass-through)
+        ema_alpha=1.0,  # Cartesian EMA (1.0 = pass-through)
         dry_run=False,
         use_shm_vr=True,  # ← 零拷贝 SHM 路径
         collection_config=CollectionConfig(),

@@ -210,9 +210,8 @@ class TeleopProfile(FromDictMixin):
 
     teleop_dt: float = 0.04
     max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
-    # Speed limiting is handled exclusively by XArm7._limit_joint_step()
-    # (hardware driver layer, per BunnyVisionPro architecture).
-    # max_qpos_cmd_speed_deg was removed — IK/planning layer should not clip speed.
+    # Speed limiting is handled by ArmInnerLoop._tick_mode4()
+    # (velocity/accel/jerk clipping at 250 Hz).
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
@@ -234,12 +233,6 @@ class TeleopProfile(FromDictMixin):
     differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
     differential_ik_max_iterations: int = 100  # matches BVP for k in range(100)
     differential_ik_convergence_threshold: float = 1e-3  # matches BVP norm(err) < 1e-3
-
-    # Step limits applied to the FINAL iteration only (not internal iterations).
-    # These cap the per-frame Cartesian delta at the solver output, preventing
-    # large joint jumps from unconverged DLS.  Set to inf for no limit.
-    differential_ik_max_pos_step_m: float = 0.05
-    differential_ik_max_rot_step_rad: float = np.deg2rad(5.0)
 
     # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──
     adaptive_damping: bool = False
@@ -309,7 +302,7 @@ class TeleopProfile(FromDictMixin):
     # ── Cartesian pose interpolation (REMOVED 2026-06-24) ──
     # CartPoseInterpolator (linear + SLERP) was removed because:
     #   1. VR is native 50 Hz = control loop rate → no frequency decoupling needed
-    #   2. EMA smoothing (ema_alpha_arm) already handles frame-to-frame filtering
+    #   2. Cartesian EMA (ema_alpha) already handles frame-to-frame filtering
     #   3. Velocity-limited step provides per-frame delta capping
     #   4. BunnyVisionPro / LeFranX / T-Rex all operate without Cartesian interpolation
     # The interpolator added ~20ms latency without measurable smoothness benefit.

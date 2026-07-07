@@ -39,9 +39,11 @@ import traceback
 import tty
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
+from dexmani_real.planning.pose_utils import wxyz_to_xyzw
 from dexmani_real.planning import (
     PlanningProfile,
     Pose,
@@ -51,7 +53,7 @@ from dexmani_real.planning import (
 )
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.inner_loop import ArmInnerLoop
+from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
 from dexmani_real.robot.xarm7 import XArm7Config
@@ -209,8 +211,20 @@ VR_ROT_SCALE = 1.0          # 旋转缩放 (1.0 = 1:1)
 VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
-# 关节空间 EMA 平滑 (匹配 sim vr_teleop_sim.py TeleopPipeline ema_alpha_arm=0.6)
+# 关节空间 EMA 平滑 (匹配 sim vr_teleop_sim.py TeleopPipeline ema_alpha=0.6)
 EMA_ALPHA_ARM = 0.6  # 1.0 = 不平滑, 0.0 = 完全不动
+
+# Inner loop PID tuning (mode 4 velocity control)
+INNER_LOOP_KP = 10.0
+INNER_LOOP_KI = 0.0
+INNER_LOOP_KD = 0.05
+
+# Shared inner-loop config reused across ArmInnerLoop instances (main + return_home restart)
+_INNER_CFG = ArmInnerLoopConfig(
+    kp=np.full(7, INNER_LOOP_KP),
+    ki=np.full(7, INNER_LOOP_KI),
+    kd=np.full(7, INNER_LOOP_KD),
+)
 
 
 # ═══════════════════════════════════════════════ 归位
@@ -231,7 +245,7 @@ def do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = ArmInnerLoop()
+        new_inner = ArmInnerLoop(cfg=_INNER_CFG)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -259,7 +273,7 @@ def main():
         transport="tcp_server",
         host="0.0.0.0",
         port=8000,
-        hand_side="right",
+        hand_side="both",  # "both" needed for HeadFrame (heading calibration)
         output_frame="flu",
         max_frame_age_s=0.20,
     )
@@ -327,7 +341,7 @@ def main():
         return
 
     # ── 5. ArmInnerLoop (250Hz position servo) ──
-    arm_inner = ArmInnerLoop()
+    arm_inner = ArmInnerLoop(cfg=_INNER_CFG)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()
@@ -441,9 +455,10 @@ def main():
         nonlocal recording_active
         if recording_active:
             if save:
+                n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 path = recorder.stop_episode(success=True)
                 if path:
-                    print(f"  录制已保存: {path}  ({recorder.frame_count} 帧)")
+                    print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
                 recorder.stop_episode(success=False)
             recording_active = False
@@ -543,6 +558,25 @@ def main():
                     recorder.start_episode()
                     recording_active = True
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
+
+                    # Heading calibration: align user's facing direction → robot +X
+                    head_q = frame.get("head_quat_wxyz")
+                    head_p = frame.get("head_pos")
+                    head_ok = (
+                        head_q is not None
+                        and head_p is not None
+                        and np.any(np.isfinite(head_q))
+                        and np.any(np.array(head_p) != 0)  # non-zero = HeadFrame received
+                    )
+                    if head_ok:
+                        arm_mapper.set_heading(head_q)
+                        # Print heading direction for debugging
+                        head_rot = Rotation.from_quat(np.roll(np.asarray(head_q), -1))  # wxyz → xyzw
+                        fwd = head_rot.apply(np.array([1.0, 0.0, 0.0]))
+                        print(f"  heading: forward_2d=[{fwd[0]:.3f}, {fwd[1]:.3f}]")
+                    else:
+                        print("  heading: head pose unavailable, keeping default (I)")
+
                     arm_mapper.reset(
                         wrist_pos=frame["wrist_pos"],
                         wrist_quat_wxyz=frame["wrist_quat_wxyz"],
@@ -647,6 +681,20 @@ def main():
                         flush=True,
                     )
 
+                # ── VR wrist raw pose logging (FLU frame, quat wxyz) ──
+                if vr_frame is not None:
+                    _wp = vr_frame["wrist_pos"]
+                    _wq = vr_frame["wrist_quat_wxyz"]
+                    _w_euler = np.rad2deg(
+                        Rotation.from_quat(wxyz_to_xyzw(_wq)).as_euler("xyz", degrees=False)
+                    )
+                    print(
+                        f"  [VR raw] wrist_pos(FLU)={np.round(_wp, 4)}m  "
+                        f"wrist_quat_wxyz={np.round(_wq, 4)}  "
+                        f"wrist_euler_xyz={np.round(_w_euler, 1)}°",
+                        flush=True,
+                    )
+
             # ── 非遥操作模式: 保持当前位置 ──
             if not teleop_active or vr_stale:
                 if not teleop_active:
@@ -703,7 +751,7 @@ def main():
                 continue
 
             ik_method = "ok"
-            # Joint-space EMA smoothing (matching sim TeleopPipeline ema_alpha_arm=0.6)
+            # Joint-space EMA smoothing (matching sim TeleopPipeline ema_alpha=0.6)
             arm_cmd = ema_smooth(ik_result.qpos, smoothed_arm_cmd, alpha=EMA_ALPHA_ARM)
             smoothed_arm_cmd = arm_cmd.copy()
             prev_qpos_cmd = arm_cmd.copy()  # smoothed cmd as IK seed for next frame
@@ -720,7 +768,6 @@ def main():
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
                 hand_qpos_cmd=hand_cmd,
-                target_eef_pos=target_pos.copy(),
             )
             robot.send_action(action)  # hand only (arm is via inner loop)
 

@@ -32,8 +32,8 @@ class TeleopIKSolver:
          Picks the hardware-closest valid candidate to avoid branch switching.
       3. Both fail → hold previous command.
 
-    Speed limiting is handled by XArm7._limit_joint_step()
-    (driver bottleneck scaling + soft-start).
+    Speed limiting is handled by ArmInnerLoop._tick_mode4()
+    (velocity/accel/jerk clipping at 250 Hz).
     Self-collision checks are done when TeleopProfile.check_self_collision=True.
     
 
@@ -396,8 +396,8 @@ class TeleopIKSolver:
     ) -> IKResult:
         """Canonicalize IK result and compute tracking error.
 
-        Speed limiting is NOT done here — it is handled exclusively by
-        XArm7._limit_joint_step() in the hardware driver layer.
+        Speed limiting is NOT done here — it is handled by
+        ArmInnerLoop._tick_mode4() (velocity/accel/jerk clipping at 250 Hz).
 
         Args:
             jacobian: Optional pre-computed 6×7 EEF Jacobian at ``target_qpos``.

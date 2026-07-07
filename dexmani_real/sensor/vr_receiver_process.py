@@ -48,7 +48,7 @@ class VRReceiverConfig:
     transport: str = "tcp_server"
     host: str = "0.0.0.0"
     port: int = 8000
-    hand_side: str = "right"
+    hand_side: str = "both"  # "both" needed for HeadFrame (heading calibration)
     output_frame: str = "flu"
     max_frame_age_s: float = 0.20
     strict: bool = False
@@ -209,6 +209,7 @@ class VRReceiverProcess:
             from hand_tracking_sdk import (
                 HandFilter,
                 HandFrame,
+                HeadFrame,
                 HTSClient,
                 HTSClientConfig,
                 StreamOutput,
@@ -270,6 +271,11 @@ class VRReceiverProcess:
             _first_event = True
             _logged_event_types: set[str] = set()
 
+            # Head pose cache — updated from HeadFrame events, bundled into each VR frame
+            _latest_head_pos = np.zeros(3, dtype=np.float64)
+            _latest_head_quat_wxyz = np.zeros(4, dtype=np.float64)
+            _latest_head_quat_wxyz[0] = 1.0  # identity quaternion
+
             for event in client.iter_events():
                 if self._stop_event.is_set():
                     break
@@ -281,6 +287,20 @@ class VRReceiverProcess:
                         "iter_events is yielding data",
                         type(event).__name__,
                     )
+
+                # ── HeadFrame: cache latest head pose for heading calibration ──
+                if isinstance(event, HeadFrame):
+                    head_flu_pos = unity_left_to_flu_position(
+                        event.head.x, event.head.y, event.head.z,
+                    )
+                    head_flu_quat = unity_left_to_flu_rotation(
+                        event.head.qx, event.head.qy, event.head.qz, event.head.qw,
+                    )
+                    _latest_head_pos = np.asarray(head_flu_pos, dtype=np.float64)
+                    _latest_head_quat_wxyz = np.asarray(
+                        xyzw_to_wxyz(*head_flu_quat), dtype=np.float64,
+                    )
+                    continue
 
                 if not isinstance(event, HandFrame):
                     self._ignored_count.value += 1
@@ -297,6 +317,12 @@ class VRReceiverProcess:
                 try:
                     # Extract geometry
                     wrist = event.wrist
+
+                    # Skip LEFT hand frames (we only want RIGHT + HEAD)
+                    _side_str = str(event.side.value).lower()
+                    if "left" in _side_str:
+                        continue
+
                     pos = (wrist.x, wrist.y, wrist.z)
                     quat_xyzw = (wrist.qx, wrist.qy, wrist.qz, wrist.qw)
                     landmarks = event.landmarks.points
@@ -319,6 +345,8 @@ class VRReceiverProcess:
                             [unity_left_to_flu_position(*p) for p in landmarks],
                             dtype=np.float64,
                         ).reshape(21, 3),
+                        "head_pos": _latest_head_pos.copy(),
+                        "head_quat_wxyz": _latest_head_quat_wxyz.copy(),
                         "recv_ts_ns": event.recv_ts_ns,
                         "source_ts_ns": event.source_ts_ns,
                         "sequence_id": event.sequence_id,

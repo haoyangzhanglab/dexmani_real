@@ -203,13 +203,12 @@ def build_robot_state(sim_state: dict) -> RobotState:
 
 
 def build_robot_action(
-    arm_cmd: np.ndarray, hand_cmd: np.ndarray, target_eef_pos: np.ndarray | None = None,
+    arm_cmd: np.ndarray, hand_cmd: np.ndarray,
 ) -> RobotAction:
     """从关节命令构造 RobotAction。"""
     return RobotAction(
         arm_qpos_cmd=arm_cmd,
         hand_qpos_cmd=hand_cmd,
-        target_eef_pos=target_eef_pos,
     )
 
 
@@ -492,7 +491,7 @@ def main() -> None:
     # ── TeleopPipeline (shared action computation with real controller) ──
     pipeline = TeleopPipeline(
         arm_mapper, hand_retargeter, planner,
-        ema_alpha_arm=0.6,  # EMA smoothing — low-pass filter in joint space
+        ema_alpha=0.6,  # Cartesian EMA smoothing (position + rotation vector)
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──
@@ -832,11 +831,9 @@ def main() -> None:
                             prev_hand_cmd=prev_hand_cmd,
                             check_workspace=is_in_workspace,
                             clamp_workspace_pos=clamp_to_workspace,
-                            last_arm_cmd=prev_arm_cmd,
                         )
                         arm_cmd = action.arm_qpos_cmd
                         hand_cmd = action.hand_qpos_cmd
-                        target_eef_pos = action.target_eef_pos
 
                         # 更新失败计数（用于状态打印 + episode 元数据）
                         # ik_fail_total/retarget_fail_total: 累计总数，只增不减，用于速率计算
@@ -880,7 +877,7 @@ def main() -> None:
                             try:
                                 robot_state = build_robot_state(sim_state)
                                 robot_action = build_robot_action(
-                                    arm_cmd, hand_cmd, target_eef_pos,
+                                    arm_cmd, hand_cmd,
                                 )
                                 collection.record_frame(
                                     state=robot_state,

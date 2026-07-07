@@ -100,6 +100,60 @@ class ArmWristMapper:
     def is_ready(self) -> bool:
         return self.wrist_pos0 is not None and self.eef_pos0 is not None
 
+    def set_heading(self, head_quat_wxyz: np.ndarray) -> None:
+        """Calibrate ``vr_to_base_rot`` so the user's facing direction → robot +X.
+
+        Extracts the head's forward direction in FLU, projects it to the
+        horizontal (X-Y) plane, computes the yaw angle, and builds a
+        rotation around FLU +Z that aligns the user's "forward" with the
+        robot's +X axis.
+
+        Call once per teleop session (on B-press), before :meth:`reset`.
+        """
+        head_q = np.asarray(head_quat_wxyz, dtype=np.float64)
+        if not np.all(np.isfinite(head_q)):
+            logger.warning("set_heading: head quaternion contains NaN/inf, keeping current heading")
+            return
+        norm = np.linalg.norm(head_q)
+        if norm < 1e-12:
+            logger.warning("set_heading: head quaternion is zero, keeping current heading")
+            return
+        head_q = head_q / norm
+
+        head_rot = quat2mat(head_q)
+        # Head forward in FLU: rotation matrix applied to FLU +X
+        forward_flu = head_rot @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        forward_2d = forward_flu[:2].copy()
+        norm_2d = np.linalg.norm(forward_2d)
+
+        if norm_2d < 1e-6:
+            logger.warning(
+                "set_heading: head forward nearly vertical (norm_2d=%.2e), "
+                "keeping current heading",
+                norm_2d,
+            )
+            return
+
+        forward_2d /= norm_2d
+        theta = np.arctan2(forward_2d[1], forward_2d[0])
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+
+        # R_z(-θ): maps head-forward direction → FLU +X → robot +X
+        self.vr_to_base_rot = np.array(
+            [
+                [cos_t, sin_t, 0.0],
+                [-sin_t, cos_t, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        logger.info(
+            "set_heading: forward_2d=[%.3f, %.3f] theta=%.1f° → vr_to_base_rot set",
+            forward_2d[0], forward_2d[1], np.rad2deg(theta),
+        )
+
     def clip_delta_pos(self, delta_pos: np.ndarray) -> np.ndarray:
         if self.eef_delta_bounds is None:
             return delta_pos

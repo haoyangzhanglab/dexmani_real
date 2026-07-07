@@ -58,7 +58,7 @@ from dataclasses import dataclass
 @dataclass
 class TeleopControllerConfig:
     target_hz: float = 50.0
-    ema_alpha_arm: float = 1.0
+    ema_alpha: float = 0.5
     dry_run: bool = False
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
@@ -96,7 +96,7 @@ class TeleopController:
         tracker: QuestHandTracker | None = None,
         keyboard_queue: object | None = None,
         target_hz: float = 50.0,
-        ema_alpha_arm: float = 1.0,
+        ema_alpha: float = 0.5,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_zmq_vr: bool = False,
@@ -107,7 +107,7 @@ class TeleopController:
         if cfg is None:
             cfg = TeleopControllerConfig(
                 target_hz=target_hz,
-                ema_alpha_arm=ema_alpha_arm,
+                ema_alpha=ema_alpha,
                 dry_run=dry_run,
                 use_zmq_vr=use_zmq_vr,
                 zmq_vr_port=zmq_vr_port,
@@ -154,7 +154,7 @@ class TeleopController:
             self._recording_thread = None
 
         self.limiter = RateLimiter(cfg.target_hz)
-        self.ema_alpha_arm = float(cfg.ema_alpha_arm)
+        self.ema_alpha = float(cfg.ema_alpha)
 
         # Camera
         self._camera_process = camera_process
@@ -197,7 +197,7 @@ class TeleopController:
         self._last_good_hand: np.ndarray | None = None
 
         # Pipeline
-        self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner, ema_alpha_arm=self.ema_alpha_arm)
+        self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner, ema_alpha=self.ema_alpha)
 
         # Keyboard (accepts queue=None for backward compatibility;
         # KeyboardHandler now uses pynput for global key capture)
@@ -353,13 +353,8 @@ class TeleopController:
 
         # ── 6. Pre-send validation ──
         if not self.dry_run:
-            # Defence in depth (S4): pass the CollisionModel fast-check as an
-            # independent second collision gate beyond the IK-layer check.
-            env_col_check = None
-            if self.robot.planner is not None:
-                env_col_check = self.robot.planner.collision_model.check_env_collision_fast
             action_valid, fail_reason = validate_action(
-                self.robot, action, actual_arm_qpos=arm_qpos, env_collision_check=env_col_check,
+                self.robot, action, actual_arm_qpos=arm_qpos,
             )
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
@@ -410,7 +405,6 @@ class TeleopController:
             prev_hand_cmd=prev_hand_cmd,
             check_workspace=self.robot.check_workspace,
             clamp_workspace_pos=self.robot.clamp_workspace_pos,
-            last_arm_cmd=self._last_arm_cmd,
         )
 
         ik_ok = status["ik_ok"]
@@ -625,9 +619,10 @@ class TeleopController:
             eef_pos=state.eef_pos,
             eef_quat_wxyz=state.eef_quat_wxyz,
         )
-        # Reset complementary filter state so the first pose after calibration
+        # Reset Cartesian EMA state so the first pose after calibration
         # passes through unfiltered — avoids mixing old-frame and new-frame data.
-        self.pipeline.reset_filter()
+        self.pipeline._prev_target_pos = None
+        self.pipeline._prev_target_quat = None
         return True
 
     # ── Hold-on-failure ──

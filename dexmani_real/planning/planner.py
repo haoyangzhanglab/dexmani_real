@@ -411,40 +411,69 @@ class XArm7MotionPlanner:
 
         Each check returns None on pass or a failure PathResult.  Checks are
         ordered by cost (cheapest first) to fail fast.
+
+        If the shortcut-smoothed path fails validation, the original unsmoothed
+        path is retried as a fallback.  Shortcut smoothing can create waypoint
+        gaps larger than max_waypoint_delta_deg when the arm is far from the
+        target (e.g. return-to-home from a stretched pose).
         """
         # ── Preprocessing ──
         try:
             path = self.snap_path_to_nearest_equivalent(path, current_qpos)
             path = self.canonicalize_path_to_planning_limits(path, current_qpos, profile)
+            path_before_smooth = path.copy()
             path = self.shortcut_smooth_path(path, current_qpos, profile)
         except ValueError as error:
             return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
 
-        report = self.compute_path_metrics(path, target_eef_pose_world, current_qpos, profile)
-
-        # ── Validation chain (fail-fast, cheapest first) ──
-        for check in (
-            self._check_limit_violation,
-            self._check_elbow_consistency,
-            self._check_start_distance,
-            self._check_waypoint_delta,
-            self._check_terminal_pose,
-            self._check_self_collision,
-            self._check_env_collision,
-            self._check_workspace_bounds,
-            self._check_desk_safety,
+        # ── Try smoothed path first; fall back to unsmoothed on failure ──
+        smoothed_failure_reason: str | None = None
+        for attempt_label, candidate in (
+            ("smoothed", path),
+            ("unsmoothed", path_before_smooth),
         ):
-            failure = check(path, report, source, profile)
-            if failure is not None:
-                return failure
+            if attempt_label == "unsmoothed" and len(candidate) == len(path):
+                # Shortcut smoothing didn't change the path — no point retrying
+                break
 
-        # ── All checks passed ──
-        report["path_score"] = float(
-            _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
-            + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
-            + _PATH_SCORE_EEF_EFFICIENCY_WEIGHT * (1.0 - report.get("eef_efficiency", 1.0))
-        )
-        return PathResult(success=True, qpos_path=path, source=source, report=report)
+            report = self.compute_path_metrics(candidate, target_eef_pose_world, current_qpos, profile)
+            failure = None
+            for check in (
+                self._check_limit_violation,
+                self._check_elbow_consistency,
+                self._check_start_distance,
+                self._check_waypoint_delta,
+                self._check_terminal_pose,
+                self._check_self_collision,
+                self._check_env_collision,
+                self._check_workspace_bounds,
+                self._check_desk_safety,
+            ):
+                failure = check(candidate, report, source, profile)
+                if failure is not None:
+                    break
+
+            if failure is None:
+                # ── All checks passed ──
+                report["path_score"] = float(
+                    _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
+                    + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
+                    + _PATH_SCORE_EEF_EFFICIENCY_WEIGHT * (1.0 - report.get("eef_efficiency", 1.0))
+                )
+                if attempt_label == "unsmoothed":
+                    logger.debug(
+                        "validate_path: smoothed path failed (%s), unsmoothed fallback passed "
+                        "(%d waypoints, max_delta=%.1f°)",
+                        smoothed_failure_reason or "?",
+                        len(candidate),
+                        report.get("max_waypoint_delta_deg", 0),
+                    )
+                return PathResult(success=True, qpos_path=candidate, source=source, report=report)
+
+            if attempt_label == "smoothed":
+                smoothed_failure_reason = failure.reason
+
+        return failure  # type: ignore[return-value]  # both attempts failed
 
     # ── Path validators (each returns None on pass, PathResult on failure) ──
 

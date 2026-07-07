@@ -24,6 +24,9 @@ VR_FRAME_DTYPE = np.dtype(
         ("wrist_quat_wxyz", "<f8", (4,)),  # 4 × 8 = 32 bytes
         # Hand landmarks (21 points × 3 coordinates)
         ("landmarks", "<f8", (21, 3)),  # 21 × 3 × 8 = 504 bytes
+        # Head pose (FLU coordinate frame) — for heading calibration
+        ("head_pos", "<f8", (3,)),  # 3 × 8 = 24 bytes
+        ("head_quat_wxyz", "<f8", (4,)),  # 4 × 8 = 32 bytes
         # Timestamps
         ("recv_ts_ns", "<u8"),  # HTS SDK receive timestamp (ns)
         ("source_ts_ns", "<u8"),  # HTS source timestamp (ns)
@@ -85,6 +88,8 @@ def vr_frame_to_array(frame: dict) -> np.ndarray:
     arr["wrist_pos"] = np.asarray(frame["wrist_pos"], dtype=np.float64)
     arr["wrist_quat_wxyz"] = np.asarray(frame["wrist_quat_wxyz"], dtype=np.float64)
     arr["landmarks"] = np.asarray(frame["landmarks"], dtype=np.float64).reshape(21, 3)
+    arr["head_pos"] = np.asarray(frame.get("head_pos", np.zeros(3)), dtype=np.float64)
+    arr["head_quat_wxyz"] = np.asarray(frame.get("head_quat_wxyz", np.zeros(4)), dtype=np.float64)
     arr["recv_ts_ns"] = np.uint64(frame.get("recv_ts_ns") or 0)
     arr["source_ts_ns"] = np.uint64(frame.get("source_ts_ns") or 0)
     arr["sequence_id"] = np.uint64(frame.get("sequence_id") or 0)
@@ -105,6 +110,8 @@ def array_to_vr_frame(arr: np.ndarray) -> dict:
         "wrist_pos": arr["wrist_pos"].copy(),
         "wrist_quat_wxyz": arr["wrist_quat_wxyz"].copy(),
         "landmarks": arr["landmarks"].copy().reshape(21, 3),
+        "head_pos": arr["head_pos"].copy(),
+        "head_quat_wxyz": arr["head_quat_wxyz"].copy(),
         "recv_ts_ns": int(arr["recv_ts_ns"]),
         "source_ts_ns": int(arr["source_ts_ns"]),
         "sequence_id": int(arr["sequence_id"]),

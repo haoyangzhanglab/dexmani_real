@@ -114,31 +114,28 @@ class ArmInnerLoopConfig:
     Attributes:
         control_mode: 1 = position servo (set_servo_angle_j), 4 = velocity control
                       (vc_set_joint_velocity + user-space PID).
-        kp, ki, kd: Symmetric PID gains (7,) per-joint. All joints share the same
-                   kp/kd for coordinated Cartesian tracking. Only used in mode 4.
+        kp, ki, kd: Per-joint PID gains (7,). Joints 1-2 (base+shoulder) use
+                   higher Kp/Kd to compensate for higher inertia; joints 3-7 use
+                   lower values for lighter wrist joints (ref: BunnyVisionPro).
+                   Only used in mode 4.
         max_velocity: Per-joint max velocity (rad/s). Only used in mode 4 for
                       output clipping + anti-windup bound.
-        max_accel: Per-joint max acceleration (rad/s²). If set, velocity output
-                   is additionally clamped by accel-limited rate-of-change.
-                   Only used in mode 4.
         max_jerk: Per-joint max jerk (rad/s³). If set, acceleration rate-of-change
                   is limited via proportional scaling (ref: limit_jerk in signal_utils).
                   Only used in mode 4. Default: None (disabled).
-        smooth_position_alpha: If > 0, applies EMA smoothing to the target position
-                               before sending (mode 1 only; mode 4 already has PID +
-                               vel/accel/jerk limiting). Reduces raw-target jitter at
-                               the cost of ~1 frame latency. Default: 0.0 (disabled).
+        servo_speed: Max joint speed (rad/s) for mode 1 set_servo_angle_j.
+                     Firmware interpolates all joints to arrive simultaneously
+                     at this speed.  Default 0.8 rad/s (conservative).
         target_timeout_s: Max age of target before auto-stop (0.2s).
     """
 
     control_mode: int = 4
-    kp: np.ndarray = field(default_factory=lambda: np.full(7, 10.0))
+    kp: np.ndarray = field(default_factory=lambda: np.array([10.0, 10.0, 5.0, 5.0, 5.0, 5.0, 5.0]))
     ki: np.ndarray = field(default_factory=lambda: np.zeros(7))
-    kd: np.ndarray = field(default_factory=lambda: np.full(7, 0.04))
-    max_velocity: np.ndarray = field(default_factory=lambda: np.array([1.2, 1.0, 1.2, 1.0, 1.5, 1.0, 1.5]))
-    max_accel: np.ndarray | None = None
+    kd: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 0.25]))
+    max_velocity: np.ndarray = field(default_factory=lambda: np.array([1.2, 1.0, 1.2, 1.5, 1.5, 1.0, 1.5]))
     max_jerk: np.ndarray | None = None
-    smooth_position_alpha: float = 0.0
+    servo_speed: float = 0.8  # rad/s, mode 1 only
     target_timeout_s: float = 0.2
 
     # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
@@ -150,11 +147,8 @@ class ArmInnerLoopConfig:
         self.ki = np.asarray(self.ki, dtype=np.float64).ravel()[:7]
         self.kd = np.asarray(self.kd, dtype=np.float64).ravel()[:7]
         self.max_velocity = np.asarray(self.max_velocity, dtype=np.float64).ravel()[:7]
-        if self.max_accel is not None:
-            self.max_accel = np.asarray(self.max_accel, dtype=np.float64).ravel()[:7]
         if self.max_jerk is not None:
             self.max_jerk = np.asarray(self.max_jerk, dtype=np.float64).ravel()[:7]
-        self.smooth_position_alpha = float(np.clip(self.smooth_position_alpha, 0.0, 1.0))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -326,18 +320,11 @@ class ArmInnerLoop:
             # For mode 4: track previous velocity + acceleration for limiting
             prev_qvel: np.ndarray | None = np.zeros(7, dtype=np.float64) if mode == 4 else None
             prev_qacc: np.ndarray | None = np.zeros(7, dtype=np.float64) if (mode == 4 and self._cfg.max_jerk is not None) else None
-            # For mode 1 position EMA smoothing (mode 4 has PID + vel/accel/jerk limiting)
-            self._mode1_smoothed: np.ndarray | None = None
 
-            # Build mode label with smoothing details
+            # Build mode label
             parts = [{1: "position servo", 4: "velocity control + PID"}.get(mode, f"mode {mode}")]
-            if mode == 1 and self._cfg.smooth_position_alpha > 0:
-                parts.append(f"pos EMA α={self._cfg.smooth_position_alpha}")
-            if mode == 4:
-                if self._cfg.max_accel is not None:
-                    parts.append("accel limit")
-                if self._cfg.max_jerk is not None:
-                    parts.append("jerk limit")
+            if mode == 4 and self._cfg.max_jerk is not None:
+                parts.append("jerk limit")
             mode_label = ", ".join(parts)
             logger.info("ArmInnerLoop: 250Hz started (mode %d: %s)", mode, mode_label)
             self._ready_event.set()
@@ -363,8 +350,6 @@ class ArmInnerLoop:
                         self._send_zero_velocity(arm)
                     else:
                         self._hold_position(arm)
-                    # Reset mode-1 smoothing state on timeout
-                    self._mode1_smoothed = None
                     self._signal_ready_only()  # avoid deadlock: no new target expected
                     continue
 
@@ -382,7 +367,6 @@ class ArmInnerLoop:
                             arm.set_servo_angle_j(angles=last_valid_qpos.tolist(), is_radian=True)
                         except (RuntimeError, OSError):
                             pass
-                    self._mode1_smoothed = None
                     continue
 
                 last_valid_qpos = target[:7].copy()
@@ -453,22 +437,16 @@ class ArmInnerLoop:
     def _tick_mode1(self, arm, target: np.ndarray) -> None:
         """Mode 1: forward target position → set_servo_angle_j().
 
-        Position EMA smoothing is applied here (not in the common path) because
-        mode 4 already has PID + velocity/accel/jerk limiting for implicit
-        smoothing.  Mode 1 has no such downstream filtering, so the optional EMA
-        compensates for that.
+        Firmware interpolates all joints to arrive simultaneously at
+        ``servo_speed`` (rad/s), with built-in acceleration/deceleration.
+        At 50 Hz target updates, the firmware replans each tick for the
+        latest target — no explicit smoothing needed.
         """
-        # ── Position EMA smoothing (mode 1 only) ──
-        if self._cfg.smooth_position_alpha > 0:
-            if self._mode1_smoothed is None:
-                self._mode1_smoothed = target[:7].copy()
-            else:
-                alpha = self._cfg.smooth_position_alpha
-                self._mode1_smoothed = alpha * target[:7] + (1.0 - alpha) * self._mode1_smoothed
-            target = self._mode1_smoothed
-
         try:
-            code = arm.set_servo_angle_j(angles=target[:7].tolist(), is_radian=True)
+            code = arm.set_servo_angle_j(
+                angles=target[:7].tolist(), is_radian=True,
+                speed=self._cfg.servo_speed,
+            )
         except (RuntimeError, OSError) as e:
             logger.error("ArmInnerLoop: set_servo_angle_j failed: %s", e)
             with self._lock:
@@ -490,8 +468,7 @@ class ArmInnerLoop:
         Multi-stage output limiting (in order):
           1. PID: position error → raw velocity
           2. Velocity clipping (per-joint max)
-          3. Acceleration limiting (rate-of-change, optional)
-          4. Jerk limiting (rate-of-change of accel, optional, ref: limit_jerk)
+          3. Jerk limiting (rate-of-change of accel, optional, ref: limit_jerk)
 
         Ref: BunnyVisionPro _internal_control_arm_qpos() lines 223-228.
              LeFranX Ruckig jerk-limited OTG concept.
@@ -503,18 +480,8 @@ class ArmInnerLoop:
         # 2. Clip to max velocity
         qvel = self._clip_velocity(qvel, self._cfg.max_velocity)
 
-        # 3. Optional accel limiting
-        if self._cfg.max_accel is not None and prev_qvel is not None:
-            max_delta = self._cfg.max_accel * self._dt
-            delta = qvel - prev_qvel
-            overshot = np.abs(delta) / max_delta
-            max_overshot = np.max(overshot)
-            if max_overshot > 1.0:
-                qvel = prev_qvel + delta / max_overshot
-
-        # 4. Optional jerk limiting (ref: signal_utils.limit_jerk)
+        # 3. Optional jerk limiting (ref: signal_utils.limit_jerk)
         if self._cfg.max_jerk is not None and prev_qvel is not None:
-            # Use the non-None prev_qacc tracked by the caller
             qvel, updated_acc = limit_jerk(
                 qvel, prev_qvel, prev_qacc, self._dt,
                 max_jerk=float(np.min(self._cfg.max_jerk)),
@@ -571,24 +538,29 @@ class ArmInnerLoop:
 
     @staticmethod
     def _clip_velocity(qvel: np.ndarray, max_vel: np.ndarray) -> np.ndarray:
-        """Clip per-joint velocity to max limits, preserving direction.
+        """Clip each joint independently to its own max velocity.
 
-        Logs the bottleneck joint when clipping occurs (ref: BunnyVisionPro
-        xarm7_ability.py:185-194 — prints which joint limited the velocity).
+        Per-joint clamping (vs proportional scaling): each joint is limited to
+        its own max_vel without slowing down other joints.  Proportional scaling
+        (dividing all joints by max_overshot) couples joint motions — the
+        bottleneck joint drags down every other joint, distorting the Cartesian
+        path because the FK of a scaled joint-space vector is not the same as
+        the FK of the un-scaled vector.  Per-joint clamping preserves the
+        full speed of non-bottleneck joints, producing a Cartesian path closer
+        to the IK-intended straight line.
+
+        Ref: ManiUniCon filter.py:185-188 — per-joint velocity limiting.
         """
-        overshot = np.abs(qvel) / max_vel
-        max_overshot = np.max(overshot)
-        if max_overshot > 1.0 + 1e-4:
-            bottleneck = int(np.argmax(overshot))
+        clipped = np.clip(qvel, -max_vel, max_vel)
+        if not np.array_equal(clipped, qvel):
+            bottleneck = int(np.argmax(np.abs(qvel) - max_vel))
             logger.debug(
-                "Vel clip: joint-%d overshot %.2fx (%.3f / %.3f rad/s)",
+                "Vel clip: joint-%d exceeded limit (%.3f / %.3f rad/s)",
                 bottleneck + 1,
-                max_overshot,
                 float(qvel[bottleneck]),
                 float(max_vel[bottleneck]),
             )
-            return qvel / max_overshot
-        return qvel
+        return clipped
 
     @staticmethod
     def _init_mode(arm, mode: int) -> None:

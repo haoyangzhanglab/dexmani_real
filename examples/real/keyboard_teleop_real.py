@@ -47,13 +47,14 @@ from dexmani_real.planning import (
     XArm7PlannerConfig,
 )
 from dexmani_real.planning.collision_config import CollisionConfig
-from dexmani_real.robot.inner_loop import ArmInnerLoop
+from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.rate_limiter import RateLimiter
 
 from dexmani_real.planning.pose_utils import quat_multiply
+from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
@@ -69,8 +70,16 @@ logger = get_logger(__name__)
 CTRL_DT = 0.02           # 50Hz
 DELTA_POS = 0.005        # 每次按键 EEF 平移量 (m)
 DELTA_RPY = 0.02         # 每次按键 EEF 旋转量 (rad)
-TARGET_LEAD_MAX = 0.03   # target 领先 arm 的最大距离 (m)，超过则限速
+EMA_ALPHA = 0.5          # Cartesian EMA 平滑系数 (1.0=直通, 0.5=默认)
+
+# Mode 1 position servo — firmware coordinates multi-joint motion,
+# eliminates P-controller droop (no steady-state error for constant-speed input).
+INNER_LOOP_CFG = ArmInnerLoopConfig(control_mode=1, servo_speed=0.8)
 HOME_DT = 0.04           # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，减半保安全)
+
+# ── Motion tracing: 追踪纯 +X 运动时的位置变化管线 ──
+TRACE_MOTION = True           # 启用运动追踪
+TRACE_FRAME_INTERVAL = 10     # 每 N 帧打印一次 (避免刷屏)
 
 WORKSPACE_BOUNDS = np.array([
     [0.28, 0.72],    # x [min, max] m
@@ -188,7 +197,7 @@ def do_return_home(
         print(f"  {'OK' if ok else 'FAIL'}")
 
         # Restart inner loop
-        new_inner = ArmInnerLoop()
+        new_inner = ArmInnerLoop(cfg=INNER_LOOP_CFG)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -207,7 +216,7 @@ def do_return_home(
 def main():
     print("=" * 60)
     print("真机键盘遥操作 xArm7")
-    print(f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s")
+    print(f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s  EMA_ALPHA={EMA_ALPHA}")
     print(f"  workspace: x{WORKSPACE_BOUNDS[0]} y{WORKSPACE_BOUNDS[1]} z{WORKSPACE_BOUNDS[2]}")
     print("=" * 60)
 
@@ -266,7 +275,7 @@ def main():
         return
 
     # ── 4. Start ArmInnerLoop (shared: robot/inner_loop.py) ──
-    arm_inner = ArmInnerLoop()
+    arm_inner = ArmInnerLoop(cfg=INNER_LOOP_CFG)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()
@@ -319,6 +328,10 @@ def main():
     _last_ik_fail_reason = ""
     _last_ik_fail_time = 0.0
 
+    # Cartesian EMA state (same smoothing as TeleopPipeline)
+    _prev_ema_pos: np.ndarray | None = None
+    _prev_ema_quat: np.ndarray | None = None
+
     def _emergency_stop():
         """Stop inner loop first, then arm+hand, to avoid SDK error spam."""
         nonlocal running
@@ -363,6 +376,8 @@ def main():
                         prev_qpos_cmd = state.arm_qpos.copy()
                         target_pos = state.eef_pos.copy()
                         target_quat = state.eef_quat_wxyz.copy()
+                        _prev_ema_pos = None
+                        _prev_ema_quat = None
                         consecutive_divergence = 0
                         error_count = 0
                         print("  Arm 内环线程重启就绪")
@@ -373,6 +388,8 @@ def main():
                         prev_qpos_cmd = state.arm_qpos.copy()
                         target_pos = state.eef_pos.copy()
                         target_quat = state.eef_quat_wxyz.copy()
+                        _prev_ema_pos = None
+                        _prev_ema_quat = None
                     consecutive_divergence = 0
                     error_count = 0
                 continue
@@ -459,35 +476,27 @@ def main():
                     flush=True,
                 )
 
-            # No input → snap target to current EEF
+            # No input → snap target to EEF, reset EMA state
             if np.all(dx == 0) and np.all(drpy == 0):
                 target_pos = state.eef_pos.copy()
                 target_quat = state.eef_quat_wxyz.copy()
                 prev_qpos_cmd = state.arm_qpos.copy()
+                _prev_ema_pos = None
+                _prev_ema_quat = None
                 continue
 
-            # ── Target lead limit ──
-            lead = np.linalg.norm(target_pos - state.eef_pos)
-            if lead > TARGET_LEAD_MAX:
-                target_pos = state.eef_pos + (target_pos - state.eef_pos) * (TARGET_LEAD_MAX / lead)
-
-            # ── Workspace soft-wall: directional — allow moving back into workspace ──
-            new_pos = target_pos + dx
+            # ── Incremental target ──
+            # target_pos accumulates keyboard deltas independently.
+            # Uncommanded axes keep their last-set value → no cross-axis drift.
             for axis in range(3):
-                if dx[axis] == 0:
-                    continue
+                if dx[axis] != 0:
+                    target_pos[axis] += dx[axis]
+
+            # Workspace boundary: clamp target to valid range
+            target_pos = np.clip(target_pos, WORKSPACE_BOUNDS[:, 0], WORKSPACE_BOUNDS[:, 1])
+            for axis in range(3):
                 lo, hi = WORKSPACE_BOUNDS[axis]
-                cur = target_pos[axis]
-                new = new_pos[axis]
-                if lo <= new <= hi:
-                    target_pos[axis] = new
-                    if wall_warned[axis] and lo + 0.01 <= new <= hi - 0.01:
-                        wall_warned[axis] = False
-                elif (cur < lo and dx[axis] > 0) or (cur > hi and dx[axis] < 0):
-                    # Moving back toward workspace → allow, clamp to boundary
-                    target_pos[axis] = float(np.clip(new, lo, hi))
-                else:
-                    # Moving further outside → reject
+                if target_pos[axis] <= lo or target_pos[axis] >= hi:
                     now = time.perf_counter()
                     if not wall_warned[axis] or now - last_wall_time > 3.0:
                         names = ["x", "y", "z"]
@@ -499,8 +508,21 @@ def main():
                 dq = rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
                 target_quat = quat_multiply(dq, target_quat)
 
-            # ── IK solve ──
-            target_pose = Pose(p=target_pos, q=target_quat)
+            # ── Cartesian EMA (before IK, same as TeleopPipeline) ──
+            # Bounds per-frame Cartesian step → prevents IK divergence + lead runaway.
+            # P-controller droop: without EMA, arm needs 40-50mm lead to sustain speed
+            # (error = velocity / kp).  EMA limits the effective lead to ~DELTA_POS/alpha.
+            if _prev_ema_pos is not None:
+                ik_target_pos, ik_target_quat = ema_smooth_pose(
+                    target_pos, target_quat, _prev_ema_pos, _prev_ema_quat, EMA_ALPHA,
+                )
+            else:
+                ik_target_pos, ik_target_quat = target_pos.copy(), target_quat.copy()
+            _prev_ema_pos = ik_target_pos.copy()
+            _prev_ema_quat = ik_target_quat.copy()
+
+            # ── IK solve (on EMA-smoothed target) ──
+            target_pose = Pose(p=ik_target_pos, q=ik_target_quat)
             if np.all(np.isfinite(state.hand_qpos)):
                 planner.set_hand_qpos(state.hand_qpos)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
@@ -515,12 +537,52 @@ def main():
                     _last_ik_fail_time = now
                 target_pos = state.eef_pos.copy()
                 target_quat = state.eef_quat_wxyz.copy()
+                _prev_ema_pos = None
+                _prev_ema_quat = None
                 ik_method = "held"
                 continue
 
             ik_method = "diff"
             prev_qpos_cmd = ik_result.qpos.copy()
             arm_cmd = ik_result.qpos
+
+            # ── Motion Trace: 纯轴运动管线诊断 ──
+            if (
+                TRACE_MOTION
+                and loop_count % TRACE_FRAME_INTERVAL == 0
+                and dx[0] != 0 and dx[1] == 0 and dx[2] == 0
+                and np.all(drpy == 0)
+            ):
+                ik_fk_pose = planner.kin.compute_eef_pose_world(ik_result.qpos)
+                ik_fk_pos = ik_fk_pose.p
+                ik_fk_quat = ik_fk_pose.q
+                pos_error_mm = np.linalg.norm(ik_target_pos - ik_fk_pos) * 1000
+                pos_error_per_axis_mm = (ik_target_pos - ik_fk_pos) * 1000
+                dot = float(min(np.abs(np.dot(ik_target_quat, ik_fk_quat)), 1.0))
+                rot_error_deg = np.rad2deg(2.0 * np.arccos(dot))
+                report = getattr(ik_result, "report", {}) or {}
+                raw_lead_mm = (target_pos - state.eef_pos) * 1000
+                ema_lead_mm = (ik_target_pos - state.eef_pos) * 1000
+                z_shift_mm = (ik_fk_pos[2] - ik_target_pos[2]) * 1000
+
+                print(
+                    f"\n{'─'*60}"
+                    f"\n[TRACE #{loop_count}] 纯轴运动 + Cartesian EMA (α={EMA_ALPHA})"
+                    f"\n{'─'*60}"
+                    f"\n  dx:          {np.array2string(dx*1000, precision=1, suppress_small=True)} mm"
+                    f"\n  raw target:  {np.array2string(target_pos*1000, precision=1, suppress_small=True)} mm"
+                    f"\n  EMA→IK:      {np.array2string(ik_target_pos*1000, precision=1, suppress_small=True)} mm"
+                    f"\n  eef:         {np.array2string(state.eef_pos*1000, precision=1, suppress_small=True)} mm"
+                    f"\n  raw lead:    {np.array2string(raw_lead_mm, precision=1, suppress_small=True)} mm"
+                    f"\n  EMA lead:    {np.array2string(ema_lead_mm, precision=1, suppress_small=True)} mm"
+                    f"\n  IK FK:       {np.array2string(ik_fk_pos*1000, precision=1, suppress_small=True)} mm"
+                    f"\n  IK err:      pos={pos_error_mm:.1f}mm  per_axis={np.array2string(pos_error_per_axis_mm, precision=1, suppress_small=True)} mm  rot={rot_error_deg:.2f}deg"
+                    f"\n  IK Z off:    {z_shift_mm:+.1f}mm"
+                    f"\n  IK: {report.get('teleop_ik_method', '?')} iter={report.get('iterations', '?')} conv={report.get('converged', None)}"
+                    f"\n  jnt Δ: {np.array2string(np.rad2deg(ik_result.qpos - state.arm_qpos), precision=2, suppress_small=True)} deg"
+                    f"\n{'─'*60}",
+                    flush=True,
+                )
 
             # ── Send ──
             # Arm: via inner loop (250Hz position servo)
@@ -530,7 +592,6 @@ def main():
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
                 hand_qpos_cmd=state.hand_qpos.copy(),
-                target_eef_pos=target_pos.copy(),
             )
             robot.send_action(action)  # hand only
 

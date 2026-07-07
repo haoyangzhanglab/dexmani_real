@@ -440,11 +440,16 @@ class RobotInterface:
         self._execute_waypoints(path, dt)
 
     def _safe_joint_home_fallback(self, current: np.ndarray, target: np.ndarray, dt: float) -> bool:
-        """Tier 2 fallback: collision-checked joint-space linear interpolation to home.
+        """Tier 2 fallback: collision-checked joint-space interpolation to home.
 
         Used when plan_path fails (e.g. waypoint delta too large after shortcut
         smoothing). Builds a dense 1°-resolution joint-space path, checks
         self/env/desk collisions, and executes if safe.
+
+        When the direct linear path has collisions (common when the arm is
+        stretched out near the table), retries with a two-stage detour:
+          1. Move base/shoulder/elbow (J0-J2) to home first → lifts arm clear
+          2. Then move wrist joints (J3-J6) to home
 
         Returns:
             True if arm is already close enough or the path was safe and executed.
@@ -454,25 +459,61 @@ class RobotInterface:
         if delta < np.deg2rad(0.5):
             return True
 
+        # ── Attempt 1: direct linear interpolation ──
         n = max(2, int(np.ceil(delta / np.deg2rad(1.0))) + 1)
         path = np.array(
             [current + (k / (n - 1)) * (target - current) for k in range(n)],
             dtype=np.float64,
         )
 
-        if not self._check_joint_path_safe(path):
-            logger.warning(
-                "Safe joint fallback: path has collisions (self/env/desk), " "delta=%.1f°",
+        if self._check_joint_path_safe(path):
+            logger.info(
+                "return_to_home safe joint fallback: %d waypoints, delta=%.1f°",
+                n,
                 np.rad2deg(delta),
             )
-            return False
+            return self._execute_waypoints(path, dt)
 
-        logger.info(
-            "return_to_home safe joint fallback: %d waypoints, delta=%.1f°",
-            n,
+        # ── Attempt 2: two-stage detour (lift arm structure first) ──
+        # J0=base, J1=shoulder, J2=elbow → move to home first (lifts arm clear of table)
+        # J3-J6=wrist → keep current during stage 1, move to home in stage 2
+        PROXIMAL_MASK = np.array([True, True, True, False, False, False, False], dtype=bool)
+
+        if np.any(PROXIMAL_MASK):
+            mid = current.copy()
+            mid[PROXIMAL_MASK] = target[PROXIMAL_MASK]
+
+            # Stage 1: proximal joints → home (wrist stays)
+            delta1 = float(np.max(np.abs(mid - current)))
+            n1 = max(2, int(np.ceil(delta1 / np.deg2rad(1.0))) + 1)
+            path1 = np.array(
+                [current + (k / (n1 - 1)) * (mid - current) for k in range(n1)],
+                dtype=np.float64,
+            )
+
+            # Stage 2: wrist joints → home
+            delta2 = float(np.max(np.abs(target - mid)))
+            n2 = max(2, int(np.ceil(delta2 / np.deg2rad(1.0))) + 1)
+            path2 = np.array(
+                [mid + (k / (n2 - 1)) * (target - mid) for k in range(1, n2)],  # skip mid (already at end of path1)
+                dtype=np.float64,
+            )
+
+            staged_path = np.concatenate([path1, path2], axis=0) if len(path2) > 0 else path1
+
+            if self._check_joint_path_safe(staged_path):
+                logger.info(
+                    "return_to_home safe joint fallback (2-stage): "
+                    "stage1=%d wp (proximal), stage2=%d wp (wrist), total_delta=%.1f°",
+                    n1, n2 + 1, np.rad2deg(delta),
+                )
+                return self._execute_waypoints(staged_path, dt)
+
+        logger.warning(
+            "Safe joint fallback: path has collisions (self/env/desk), delta=%.1f°",
             np.rad2deg(delta),
         )
-        return self._execute_waypoints(path, dt)
+        return False
 
     # ── Fingertip FK ──
 
