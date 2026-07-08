@@ -70,11 +70,12 @@ logger = get_logger(__name__)
 CTRL_DT = 0.02           # 50Hz
 DELTA_POS = 0.005        # 每次按键 EEF 平移量 (m)
 DELTA_RPY = 0.02         # 每次按键 EEF 旋转量 (rad)
-EMA_ALPHA = 0.5          # Cartesian EMA 平滑系数 (1.0=直通, 0.5=默认)
+EMA_ALPHA_POS = 0.8      # Cartesian EMA 位置平滑 (1.0=直通, 0.8=低延迟)
+EMA_ALPHA_ROT = 0.4      # Cartesian EMA 姿态平滑 (1.0=直通, 0.4=强滤波去抖动)
 
-# Mode 1 position servo — firmware coordinates multi-joint motion,
-# eliminates P-controller droop (no steady-state error for constant-speed input).
-INNER_LOOP_CFG = ArmInnerLoopConfig(control_mode=1, servo_speed=0.8)
+# Mode 1 position servo (default) — firmware handles trapezoidal velocity profiling
+# with configurable speed/mvacc; inner loop interpolates 50→200Hz for smooth motion.
+INNER_LOOP_CFG = ArmInnerLoopConfig()
 HOME_DT = 0.04           # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，减半保安全)
 
 # ── Motion tracing: 追踪纯 +X 运动时的位置变化管线 ──
@@ -216,7 +217,7 @@ def do_return_home(
 def main():
     print("=" * 60)
     print("真机键盘遥操作 xArm7")
-    print(f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s  EMA_ALPHA={EMA_ALPHA}")
+    print(f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s  EMA_POS={EMA_ALPHA_POS} EMA_ROT={EMA_ALPHA_ROT}")
     print(f"  workspace: x{WORKSPACE_BOUNDS[0]} y{WORKSPACE_BOUNDS[1]} z{WORKSPACE_BOUNDS[2]}")
     print("=" * 60)
 
@@ -514,7 +515,8 @@ def main():
             # (error = velocity / kp).  EMA limits the effective lead to ~DELTA_POS/alpha.
             if _prev_ema_pos is not None:
                 ik_target_pos, ik_target_quat = ema_smooth_pose(
-                    target_pos, target_quat, _prev_ema_pos, _prev_ema_quat, EMA_ALPHA,
+                    target_pos, target_quat, _prev_ema_pos, _prev_ema_quat,
+                    EMA_ALPHA_POS, EMA_ALPHA_ROT,
                 )
             else:
                 ik_target_pos, ik_target_quat = target_pos.copy(), target_quat.copy()
@@ -567,7 +569,7 @@ def main():
 
                 print(
                     f"\n{'─'*60}"
-                    f"\n[TRACE #{loop_count}] 纯轴运动 + Cartesian EMA (α={EMA_ALPHA})"
+                    f"\n[TRACE #{loop_count}] 纯轴运动 + Cartesian EMA (α_pos={EMA_ALPHA_POS} α_rot={EMA_ALPHA_ROT})"
                     f"\n{'─'*60}"
                     f"\n  dx:          {np.array2string(dx*1000, precision=1, suppress_small=True)} mm"
                     f"\n  raw target:  {np.array2string(target_pos*1000, precision=1, suppress_small=True)} mm"

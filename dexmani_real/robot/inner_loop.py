@@ -1,17 +1,18 @@
-"""ArmInnerLoop — 250Hz inner loop thread running in the same process as the controller.
+"""ArmInnerLoop — 200Hz inner loop thread running in the same process as the controller.
 
 Supports two control modes (configurable):
 
-  Mode 4 (default): Velocity control — user-space PID converts position error → velocity,
+  Mode 1 (default): Position servo — time-driven linear interpolation between outer-loop
+    targets (50Hz → 200Hz), then forwards to arm.set_servo_angle_j() with configurable
+    speed/mvacc. Arm firmware handles PID, trapezoidal velocity profiling, and joint
+    limit enforcement internally at kHz rate. This is the recommended mode for teleop.
+
+  Mode 4: Velocity control — user-space PID converts position error → velocity,
     then sends to arm.vc_set_joint_velocity(). Full control over PID gains,
     jerk/accel limiting, anti-windup. Ref: BunnyVisionPro _internal_control_arm_qpos().
 
-  Mode 1: Position servo — forwards target to arm.set_servo_angle_j().
-    Arm firmware handles PID, smoothing, velocity limiting internally (kHz level).
-    Simplest fallback option.
-
 Architecture:
-    Main Thread (50Hz)                     Inner Loop Thread (250Hz)
+    Main Thread (50Hz)                     Inner Loop Thread (200Hz)
     ──────────────────                     ─────────────────────────
     inner.set_target(cmd)    ──Lock──→     self._arm_target
     qpos, err, ts = get_state()  ←──Lock── self._arm_qpos, _error_state
@@ -112,30 +113,40 @@ class ArmInnerLoopConfig:
     """Configuration for ArmInnerLoop.
 
     Attributes:
-        control_mode: 1 = position servo (set_servo_angle_j), 4 = velocity control
-                      (vc_set_joint_velocity + user-space PID).
-        kp, ki, kd: Per-joint PID gains (7,). Joints 1-2 (base+shoulder) use
-                   higher Kp/Kd to compensate for higher inertia; joints 3-7 use
-                   lower values for lighter wrist joints (ref: BunnyVisionPro).
-                   Only used in mode 4.
-        max_velocity: Per-joint max velocity (rad/s). Only used in mode 4 for
-                      output clipping + anti-windup bound.
-        max_jerk: Per-joint max jerk (rad/s³). If set, acceleration rate-of-change
-                  is limited via proportional scaling (ref: limit_jerk in signal_utils).
-                  Only used in mode 4. Default: None (disabled).
+        control_mode: 1 = position servo (set_servo_angle_j, default), 4 = velocity
+                      control (vc_set_joint_velocity + user-space PID).
         servo_speed: Max joint speed (rad/s) for mode 1 set_servo_angle_j.
-                     Firmware interpolates all joints to arrive simultaneously
-                     at this speed.  Default 0.8 rad/s (conservative).
-        target_timeout_s: Max age of target before auto-stop (0.2s).
+                     Safety upper bound; teleop rarely reaches this because
+                     per-tick deltas are small (Δθ ~0.3-1.0°). Default 1.57 rad/s.
+        servo_acc: Max joint acceleration (rad/s²) for mode 1 set_servo_angle_j.
+                   Dominant parameter for responsiveness — the arm is
+                   acceleration-limited for all typical teleop step sizes.
+                   Default 8 rad/s².
+        interpolate: Enable time-driven linear interpolation between outer-loop
+                     targets (50Hz → 150Hz). Splits each 20ms step into ~3 micro-steps
+                     for smoother firmware trajectory replanning. Default True.
+        outer_loop_period: Outer loop period in seconds, used to compute interpolation
+                           alpha (= target_age / outer_loop_period). Default 0.02 (50Hz).
+        dt: Inner loop timestep in seconds. Default 1/150 ≈ 6.67ms (150Hz).
+        kp, ki, kd: Per-joint PID gains (7,). Only used in mode 4.
+        max_velocity: Per-joint max velocity (rad/s). Only used in mode 4.
+        max_jerk: Per-joint max jerk (rad/s³). Only used in mode 4.
+        target_timeout_s: Max age of target before auto-hold (0.2s).
     """
 
-    control_mode: int = 4
+    control_mode: int = 1
+    # Mode 1 parameters
+    servo_speed: float = 1.57
+    servo_acc: float = 8.0
+    interpolate: bool = True
+    outer_loop_period: float = 0.02
+    # Mode 4 parameters (retained for fallback)
     kp: np.ndarray = field(default_factory=lambda: np.array([10.0, 10.0, 5.0, 5.0, 5.0, 5.0, 5.0]))
     ki: np.ndarray = field(default_factory=lambda: np.zeros(7))
     kd: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 0.25]))
     max_velocity: np.ndarray = field(default_factory=lambda: np.array([1.2, 1.0, 1.2, 1.5, 1.5, 1.0, 1.5]))
     max_jerk: np.ndarray | None = None
-    servo_speed: float = 0.8  # rad/s, mode 1 only
+    # Shared
     target_timeout_s: float = 0.2
 
     # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
@@ -157,21 +168,21 @@ class ArmInnerLoopConfig:
 
 
 class ArmInnerLoop:
-    """250Hz inner loop thread — owns the XArmAPI connection.
+    """200Hz inner loop thread — owns the XArmAPI connection.
 
     Runs in the same process as the controller. Communicates via
     Lock-protected shared variables (no SHM/IPC overhead).
 
     Parameters:
         ip: XArm controller IP address.
-        dt: Inner loop period in seconds (default 1/250 = 4ms).
-        cfg: Inner loop configuration (control mode, PID gains, velocity limits).
+        dt: Inner loop period in seconds (default 1/200 = 5ms).
+        cfg: Inner loop configuration (control mode, servo params, PID gains).
     """
 
     def __init__(
         self,
         ip: str = "192.168.1.111",
-        dt: float = 1.0 / 250.0,
+        dt: float = 1.0 / 200.0,
         cfg: ArmInnerLoopConfig | None = None,
         sync: SharedSyncPrimitives | None = None,
     ) -> None:
@@ -294,7 +305,7 @@ class ArmInnerLoop:
                         self._error_state = True
                     return
 
-            # Init PID for mode 4
+            # Init PID for mode 4 only
             if mode == 4:
                 self._pid = PIDController(
                     kp=self._cfg.kp, ki=self._cfg.ki, kd=self._cfg.kd,
@@ -321,12 +332,26 @@ class ArmInnerLoop:
             prev_qvel: np.ndarray | None = np.zeros(7, dtype=np.float64) if mode == 4 else None
             prev_qacc: np.ndarray | None = np.zeros(7, dtype=np.float64) if (mode == 4 and self._cfg.max_jerk is not None) else None
 
+            # Mode 1 interpolation state — time-driven linear interpolation between
+            # consecutive outer-loop targets. Splits each 20ms step into 4 micro-steps
+            # (at 200Hz dt=5ms) for smoother firmware trajectory replanning.
+            prev_target: np.ndarray | None = None
+            curr_target: np.ndarray | None = None
+            target_age: float = float(self._cfg.outer_loop_period)  # > period → first tick sends current target verbatim
+            interpolate = (mode == 1 and self._cfg.interpolate)
+
             # Build mode label
-            parts = [{1: "position servo", 4: "velocity control + PID"}.get(mode, f"mode {mode}")]
-            if mode == 4 and self._cfg.max_jerk is not None:
-                parts.append("jerk limit")
+            freq_hz = int(round(1.0 / self._dt))
+            if mode == 1:
+                parts = ["position servo", f"speed={self._cfg.servo_speed:.1f}rad/s", f"acc={self._cfg.servo_acc:.0f}rad/s²"]
+                if interpolate:
+                    parts.append(f"interp@{freq_hz}Hz")
+            else:
+                parts = ["velocity control + PID"]
+                if self._cfg.max_jerk is not None:
+                    parts.append("jerk limit")
             mode_label = ", ".join(parts)
-            logger.info("ArmInnerLoop: 250Hz started (mode %d: %s)", mode, mode_label)
+            logger.info("ArmInnerLoop: %dHz started (mode %d: %s)", freq_hz, mode, mode_label)
             self._ready_event.set()
 
             while not self._stop_event.is_set():
@@ -339,18 +364,21 @@ class ArmInnerLoop:
 
                 now = time.perf_counter()
 
-                # ── 2. Timeout → stop (both modes) ──
+                # ── 2. Timeout → hold (both modes) ──
                 # Skip timeout during startup: if no target has ever been received
                 # (last_target_ts==0), the main thread is still initializing.
-                # Sending zero velocity every 4ms here would spam the SDK with
-                # code=1 errors before the first real target arrives.
                 no_target_yet = (last_target_ts == 0.0)
                 if not no_target_yet and (target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)):
                     if mode == 4:
                         self._send_zero_velocity(arm)
                     else:
                         self._hold_position(arm)
-                    self._signal_ready_only()  # avoid deadlock: no new target expected
+                    # Reset interpolation on timeout so the next real target
+                    # starts from the current held position.
+                    prev_target = None
+                    curr_target = None
+                    target_age = float(self._cfg.outer_loop_period)
+                    self._signal_ready_only()
                     continue
 
                 if target is None:
@@ -364,7 +392,10 @@ class ArmInnerLoop:
                         self._send_zero_velocity(arm)
                     else:
                         try:
-                            arm.set_servo_angle_j(angles=last_valid_qpos.tolist(), is_radian=True)
+                            arm.set_servo_angle_j(
+                                angles=last_valid_qpos.tolist(), is_radian=True,
+                                speed=self._cfg.servo_speed, mvacc=self._cfg.servo_acc,
+                            )
                         except (RuntimeError, OSError):
                             pass
                     continue
@@ -403,13 +434,40 @@ class ArmInnerLoop:
                             self._arm_qpos = current_qpos
                             self._error_state = False
 
-                # ── 5. Send command ──
+                # ── 5. Interpolation (mode 1) — time-driven linear ──
+                # Linear interpolation: constant-velocity micro-steps between
+                # consecutive outer-loop targets.  The arm NEVER reaches the
+                # micro-step target within one 5ms tick (mvacc-limited: a
+                # 0.0025 rad step takes ~25ms), so the firmware is always in
+                # the acceleration phase, tracking a moving target at near-
+                # constant acceleration → minimal reaction-force oscillation.
+                #
+                # Smoothstep was intentionally REMOVED: its zero-velocity-at-
+                # boundaries forces a decel-reaccel cycle within each 20ms
+                # segment, creating 50Hz jerk that excites desk structural modes.
+                if interpolate:
+                    # Detect target change → advance interpolation window
+                    if curr_target is None or not np.array_equal(target, curr_target):
+                        prev_target = curr_target.copy() if curr_target is not None else target.copy()
+                        curr_target = target.copy()
+                        target_age = 0.0
+
+                    target_age += self._dt
+                    alpha = min(target_age / self._cfg.outer_loop_period, 1.0)
+                    if prev_target is not None:
+                        interp_target = prev_target + alpha * (curr_target - prev_target)
+                    else:
+                        interp_target = curr_target
+                else:
+                    interp_target = target
+
+                # ── 6. Send command ──
                 if mode == 4:
                     self._tick_mode4(arm, target, current_qpos, prev_qvel, prev_qacc)
                 else:
-                    self._tick_mode1(arm, target)
+                    self._tick_mode1(arm, interp_target)
 
-                # ── 6. Sync handshake (after hardware write) ──
+                # ── 7. Sync handshake (after hardware write) ──
                 self._signal_ready_and_sync()
 
         except Exception:
@@ -418,9 +476,8 @@ class ArmInnerLoop:
                 self._error_state = True
         finally:
             self._ready_event.clear()
-            # Send zero velocity before disconnecting (mode 4 safety).
-            # Skip if arm is in error state — vc_set_joint_velocity will be rejected
-            # anyway, and repeatedly calling it floods the SDK log.
+            # Mode 4: send zero velocity before disconnecting.
+            # Mode 1: firmware holds last position, no explicit stop needed.
             try:
                 if mode == 4 and getattr(arm, 'error_code', 0) == 0:
                     arm.vc_set_joint_velocity(np.zeros(7, dtype=np.float64).tolist(), is_radian=True)
@@ -437,15 +494,17 @@ class ArmInnerLoop:
     def _tick_mode1(self, arm, target: np.ndarray) -> None:
         """Mode 1: forward target position → set_servo_angle_j().
 
-        Firmware interpolates all joints to arrive simultaneously at
-        ``servo_speed`` (rad/s), with built-in acceleration/deceleration.
-        At 50 Hz target updates, the firmware replans each tick for the
-        latest target — no explicit smoothing needed.
+        Firmware executes a trapezoidal velocity profile from current encoder
+        position to target, bounded by ``servo_speed`` (max joint velocity) and
+        ``servo_acc`` (max joint acceleration). At 150 Hz with interpolation,
+        per-tick micro-steps are ~0.25-0.5° — well within the acceleration-limited
+        regime, so the arm is always in smooth transient motion.
         """
         try:
             code = arm.set_servo_angle_j(
                 angles=target[:7].tolist(), is_radian=True,
                 speed=self._cfg.servo_speed,
+                mvacc=self._cfg.servo_acc,
             )
         except (RuntimeError, OSError) as e:
             logger.error("ArmInnerLoop: set_servo_angle_j failed: %s", e)
@@ -524,7 +583,10 @@ class ArmInnerLoop:
             if code == 0 and len(states) > 0:
                 hold = np.asarray(states[0], dtype=np.float64)[:7]
                 if np.all(np.isfinite(hold)):
-                    arm.set_servo_angle_j(angles=hold.tolist(), is_radian=True)
+                    arm.set_servo_angle_j(
+                        angles=hold.tolist(), is_radian=True,
+                        speed=self._cfg.servo_speed, mvacc=self._cfg.servo_acc,
+                    )
         except (RuntimeError, OSError):
             pass
 

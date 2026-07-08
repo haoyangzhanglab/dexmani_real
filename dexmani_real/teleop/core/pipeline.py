@@ -26,9 +26,14 @@ logger = get_logger(__name__)
 class TeleopPipeline:
     """Stateless action computation pipeline.
 
-    Smoothing: single Cartesian-space EMA (position R³ + rotation vector so(3))
-    applied BEFORE IK.  One parameter (``ema_alpha``) controls all smoothing.
-    Default alpha=0.5 provides moderate filtering; set to 1.0 for pass-through.
+    Smoothing: Cartesian-space EMA (position R³ + rotation vector so(3))
+    applied BEFORE IK.  Position and rotation use independent α factors
+    because rotation has higher orientation noise and benefits from
+    stronger filtering, while position tolerates lower latency.
+
+    Defaults: alpha_pos=0.8 (light smoothing, low latency), alpha_rot=0.4
+    (heavy smoothing, suppresses orientation jitter).  Set both to 1.0
+    for pass-through.
     """
 
     def __init__(
@@ -37,12 +42,14 @@ class TeleopPipeline:
         retargeter: XHandRetargeter,
         planner: XArm7MotionPlanner,
         *,
-        ema_alpha: float = 0.5,
+        ema_alpha_pos: float = 0.8,
+        ema_alpha_rot: float = 0.4,
     ) -> None:
         self.arm_mapper = arm_mapper
         self.retargeter = retargeter
         self.planner = planner
-        self._ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
+        self._ema_alpha_pos = float(np.clip(ema_alpha_pos, 0.0, 1.0))
+        self._ema_alpha_rot = float(np.clip(ema_alpha_rot, 0.0, 1.0))
 
         # Cartesian EMA state: previous smoothed target pose
         self._prev_target_pos: np.ndarray | None = None
@@ -118,7 +125,8 @@ class TeleopPipeline:
             target_pos, target_quat = ema_smooth_pose(
                 target_pos, target_quat,
                 self._prev_target_pos, self._prev_target_quat,
-                self._ema_alpha,
+                self._ema_alpha_pos,
+                self._ema_alpha_rot,
             )
         self._prev_target_pos = target_pos.copy()
         self._prev_target_quat = target_quat.copy()
@@ -164,9 +172,3 @@ class TeleopPipeline:
 
         return hand_cmd, retarget_ok
 
-    @staticmethod
-    def soft_deceleration(
-        current_arm_qpos: np.ndarray,
-        current_hand_qpos: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return current_arm_qpos.copy(), current_hand_qpos.copy()

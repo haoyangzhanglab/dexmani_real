@@ -491,7 +491,8 @@ def main() -> None:
     # ── TeleopPipeline (shared action computation with real controller) ──
     pipeline = TeleopPipeline(
         arm_mapper, hand_retargeter, planner,
-        ema_alpha=0.6,  # Cartesian EMA smoothing (position + rotation vector)
+        ema_alpha_pos=0.8,
+        ema_alpha_rot=0.4,  # Cartesian EMA (pos=low latency, rot=strong de-jitter)
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──
@@ -804,9 +805,8 @@ def main() -> None:
 
                         # Hold current position
                         sim_state = sim.get_state()
-                        arm_blend, hand_blend = TeleopPipeline.soft_deceleration(
-                            sim_state["arm_qpos"], sim_state["hand_qpos"],
-                        )
+                        arm_blend = sim_state["arm_qpos"].copy()
+                        hand_blend = sim_state["hand_qpos"].copy()
                         full_cmd = np.concatenate([arm_blend, hand_blend])
                         sim.robot.balance_passive_force()
                         sim.robot.apply_action(full_cmd)

@@ -214,17 +214,9 @@ VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 # 关节空间 EMA 平滑 (匹配 sim vr_teleop_sim.py TeleopPipeline ema_alpha=0.6)
 EMA_ALPHA_ARM = 0.6  # 1.0 = 不平滑, 0.0 = 完全不动
 
-# Inner loop PID tuning (mode 4 velocity control)
-INNER_LOOP_KP = 10.0
-INNER_LOOP_KI = 0.0
-INNER_LOOP_KD = 0.05
-
-# Shared inner-loop config reused across ArmInnerLoop instances (main + return_home restart)
-_INNER_CFG = ArmInnerLoopConfig(
-    kp=np.full(7, INNER_LOOP_KP),
-    ki=np.full(7, INNER_LOOP_KI),
-    kd=np.full(7, INNER_LOOP_KD),
-)
+# Mode 1 position servo (default) — inner loop interpolates 50→200Hz,
+# firmware handles trapezoidal velocity profiling with configurable speed/mvacc.
+_INNER_CFG = ArmInnerLoopConfig()
 
 
 # ═══════════════════════════════════════════════ 归位

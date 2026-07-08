@@ -58,7 +58,8 @@ from dataclasses import dataclass
 @dataclass
 class TeleopControllerConfig:
     target_hz: float = 50.0
-    ema_alpha: float = 0.5
+    ema_alpha_pos: float = 0.8
+    ema_alpha_rot: float = 0.4
     dry_run: bool = False
     use_zmq_vr: bool = False
     zmq_vr_port: int = 5555
@@ -96,7 +97,8 @@ class TeleopController:
         tracker: QuestHandTracker | None = None,
         keyboard_queue: object | None = None,
         target_hz: float = 50.0,
-        ema_alpha: float = 0.5,
+        ema_alpha_pos: float = 0.8,
+        ema_alpha_rot: float = 0.4,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_zmq_vr: bool = False,
@@ -107,7 +109,8 @@ class TeleopController:
         if cfg is None:
             cfg = TeleopControllerConfig(
                 target_hz=target_hz,
-                ema_alpha=ema_alpha,
+                ema_alpha_pos=ema_alpha_pos,
+                ema_alpha_rot=ema_alpha_rot,
                 dry_run=dry_run,
                 use_zmq_vr=use_zmq_vr,
                 zmq_vr_port=zmq_vr_port,
@@ -121,7 +124,7 @@ class TeleopController:
         self.tracker = tracker
         self.dry_run = cfg.dry_run
 
-        # ── Arm inner loop (in-process thread, 250Hz) ──
+        # ── Arm inner loop (in-process thread, 200Hz default) ──
         self._arm_inner: ArmInnerLoop | None = None
         self._sync: SharedSyncPrimitives | None = None
         if not self.dry_run:
@@ -135,7 +138,7 @@ class TeleopController:
                 inner_cfg.control_mode, f"mode {inner_cfg.control_mode}"
             )
             sync_label = ", sync" if cfg.synchronized else ""
-            logger.info("ArmInnerLoop started (mode %d, %s, 250Hz%s)", inner_cfg.control_mode, mode_label, sync_label)
+            logger.info("ArmInnerLoop started (mode %d, %s%s)", inner_cfg.control_mode, mode_label, sync_label)
 
         # Recording with async writer thread (offloads HDF5 I/O from hot path)
         if recorder is not None:
@@ -154,7 +157,8 @@ class TeleopController:
             self._recording_thread = None
 
         self.limiter = RateLimiter(cfg.target_hz)
-        self.ema_alpha = float(cfg.ema_alpha)
+        self._ema_alpha_pos = float(cfg.ema_alpha_pos)
+        self._ema_alpha_rot = float(cfg.ema_alpha_rot)
 
         # Camera
         self._camera_process = camera_process
@@ -197,7 +201,9 @@ class TeleopController:
         self._last_good_hand: np.ndarray | None = None
 
         # Pipeline
-        self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner, ema_alpha=self.ema_alpha)
+        self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner,
+                                        ema_alpha_pos=self._ema_alpha_pos,
+                                        ema_alpha_rot=self._ema_alpha_rot)
 
         # Keyboard (accepts queue=None for backward compatibility;
         # KeyboardHandler now uses pynput for global key capture)
@@ -305,7 +311,6 @@ class TeleopController:
             arm_qpos = state.arm_qpos
         else:
             arm_qpos, error_state, _inner_ts = self._arm_inner.get_state()
-            now = time.perf_counter()
             if error_state:
                 self._escalate_to_emergency("Arm inner loop error")
                 return
