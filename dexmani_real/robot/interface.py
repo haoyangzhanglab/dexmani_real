@@ -208,8 +208,10 @@ class RobotInterface:
         """Sync CollisionModel hand buffer with current hardware state.
 
         Non-critical: CollisionModel defaults to open hand on failure.
-        Today the 7-DOF collision URDF ignores hand DOFs entirely, so this
-        is defence-in-depth for future 19-DOF collision mode.
+        The 19-DOF full URDF (xarm7_xhand_right.urdf) includes active hand
+        joints, so hand pose affects all collision checks.  Keeping this
+        buffer current avoids false-positive env collisions when the hand
+        is near the table.
         """
         if self.planner is None:
             return

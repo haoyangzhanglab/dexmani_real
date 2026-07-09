@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""真机 VR 遥操作 xArm7 (仅机械臂，灵巧手可降级跳过)。
+"""真机 VR 遥操作 xArm7 (仅机械臂，灵巧手可降级跳过) + 数据录制。
+
+在 vr_teleop_arm_only 基础上加入最小录制: 只录 5 路 —
+RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
+写入 episodes_arm/episode_NNN.h5 (所有流对齐到固定 50Hz 时间栅格)。
 
 机械臂通过 VR wrist pose 控制 EEF 位姿，灵巧手在不可用时自动降级跳过。
 
@@ -55,11 +59,11 @@ from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
-from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
+from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
+from dexmani_real.sensor.camera_process import CameraProcess, CameraProcessConfig
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
-from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 from dexmani_real.teleop.control.keyboard import ControlSignal  # enum only
@@ -375,7 +379,7 @@ def main():
     )
 
     # ── 7. Recorder ──
-    recorder = EpisodeRecorder(data_dir="episodes", max_frames=4500)
+    recorder = EpisodeRecorder(data_dir="episodes_arm", max_frames=3000)
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
     traj_logger = TrajectoryLogger()
@@ -472,6 +476,16 @@ def main():
         robot.emergency_stop()
         robot.arm.clear_error()
         running = False
+
+    # ── Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
+    # 用 SharedMemory (CameraRingBuffer) 替代 mp.Queue: 无容量上限, 无 queue.Full 风险.
+    # 对标 ManiUniCon SharedMemoryRingBuffer 架构.
+    camera = CameraProcess(CameraProcessConfig(camera_name="realsense", hz=30.0, use_shm=True))
+    if camera.start():
+        print("Camera 进程已启动 (RealSense @30Hz, SHM)")
+    else:
+        print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
+        camera = None
 
     try:
         while running:
@@ -778,14 +792,16 @@ def main():
             )
             robot.send_action(action)  # hand only (arm is via inner loop)
 
+            # ── 相机帧: 从共享内存读取最新帧 (零拷贝, 不区分是否录制) ──
+            cam = camera.poll_latest_frame() if camera is not None else None
+
             # ── 录制帧 ──
             if recording_active:
-                if not recorder.add_frame(state, action, vr_frame):
-                    # max_frames reached or error
-                    if recorder.max_frames_reached:
-                        print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")
-                        _stop_recording(save=True)
-                        teleop_active = False
+                ok = recorder.add_frame(state, action, vr_frame, camera_frame=cam)
+                if not ok and recorder.max_frames_reached:
+                    print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")
+                    _stop_recording(save=True)
+                    teleop_active = False
 
     finally:
         # 确保录制已停止
@@ -819,6 +835,9 @@ def main():
             arm_inner.set_target(None)
             arm_inner.stop()
             print("Arm 内环线程已停止")
+
+        if camera is not None:
+            camera.stop()
 
         robot.disconnect()
         vr_receiver.stop()

@@ -11,6 +11,7 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 from dexmani_real.planning.types import Pose
+from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.robot.types import RobotAction
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.signal_utils import ema_smooth_pose
@@ -72,7 +73,7 @@ class TeleopPipeline:
         """
         self.planner.set_hand_qpos(prev_hand_cmd)
 
-        arm_cmd, ik_ok = self.compute_arm_command(
+        arm_cmd, ik_ok, target_pos, target_quat = self.compute_arm_command(
             vr_frame, current_arm_qpos, prev_arm_cmd,
             check_workspace=check_workspace,
             clamp_workspace_pos=clamp_workspace_pos,
@@ -80,7 +81,12 @@ class TeleopPipeline:
 
         hand_cmd, retarget_ok = self.compute_hand_command(vr_frame, prev_hand_cmd)
 
-        action = RobotAction(arm_qpos_cmd=arm_cmd, hand_qpos_cmd=hand_cmd)
+        action = RobotAction(
+            arm_qpos_cmd=arm_cmd,
+            hand_qpos_cmd=hand_cmd,
+            target_eef_pos=target_pos,
+            target_eef_rot6d=quat_wxyz_to_rot6d(target_quat) if target_quat is not None else None,
+        )
         return action, {"ik_ok": ik_ok, "retarget_ok": retarget_ok}
 
     def compute_arm_command(
@@ -91,23 +97,26 @@ class TeleopPipeline:
         *,
         check_workspace: Callable[[np.ndarray], bool] | None = None,
         clamp_workspace_pos: Callable[[np.ndarray], np.ndarray] | None = None,
-    ) -> tuple[np.ndarray, bool]:
+    ) -> tuple[np.ndarray, bool, np.ndarray | None, np.ndarray | None]:
         """Compute arm IK command from VR wrist pose.
 
         Pipeline: VR wrist → mapper → workspace clamp → Cartesian EMA → IK.
+
+        Returns (arm_cmd, ik_ok, target_pos, target_quat_wxyz) where the target
+        is the smoothed Cartesian EEF pose that IK tracks (None if unavailable).
         """
         wrist_pos = np.asarray(vr_frame["wrist_pos"], dtype=np.float64)
         wrist_quat_wxyz = np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)
 
         if not np.all(np.isfinite(wrist_pos)) or not np.all(np.isfinite(wrist_quat_wxyz)):
-            return prev_arm_cmd.copy(), False
+            return prev_arm_cmd.copy(), False, None, None
 
         if not self.arm_mapper.is_ready():
-            return prev_arm_cmd.copy(), False
+            return prev_arm_cmd.copy(), False, None, None
 
         mapped = self.arm_mapper.map(wrist_pos, wrist_quat_wxyz)
         if mapped is None:
-            return prev_arm_cmd.copy(), False
+            return prev_arm_cmd.copy(), False, None, None
 
         target_pos = np.asarray(mapped["pos"], dtype=np.float64)
         target_quat = np.asarray(mapped["quat_wxyz"], dtype=np.float64)
@@ -117,7 +126,7 @@ class TeleopPipeline:
             if clamp_workspace_pos is not None:
                 target_pos = clamp_workspace_pos(target_pos)
             else:
-                return prev_arm_cmd.copy(), False
+                return prev_arm_cmd.copy(), False, None, None
 
         # ── Cartesian EMA (sole smoothing stage, before IK) ──
         # First frame seeds the filter; subsequent frames apply EMA.
@@ -136,9 +145,9 @@ class TeleopPipeline:
         ik_result = self.planner.solve_teleop_ik(target_pose, arm_qpos, prev_arm_cmd)
 
         if ik_result.success and ik_result.qpos is not None:
-            return np.asarray(ik_result.qpos, dtype=np.float64), True
+            return np.asarray(ik_result.qpos, dtype=np.float64), True, target_pos, target_quat
 
-        return prev_arm_cmd.copy(), False
+        return prev_arm_cmd.copy(), False, target_pos, target_quat
 
     def compute_hand_command(
         self,

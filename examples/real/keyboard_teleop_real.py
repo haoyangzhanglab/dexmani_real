@@ -393,6 +393,9 @@ def main():
                         _prev_ema_quat = None
                     consecutive_divergence = 0
                     error_count = 0
+                prev_eef_pos = None
+                ik_method = "-"
+                limiter.reset()
                 continue
 
             # ── Read state from inner loop ──

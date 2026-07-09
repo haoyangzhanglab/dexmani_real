@@ -168,7 +168,7 @@ class XHandConfig:
     max_qvel: np.ndarray = field(
         default_factory=lambda: np.deg2rad(np.ones(12) * 180.0),
         metadata={
-            "help": "Per-joint max velocity (rad/s). Used with MotorTrajectoryInterpolator.drive_to_waypoint/schedule_waypoint as max_speed."
+            "help": "Per-joint max velocity (rad/s). Used with MotorTrajectoryInterpolator.drive_to_waypoint as max_speed."
         },
     )
 

@@ -1,9 +1,9 @@
-"""ArmInnerLoop — 200Hz inner loop thread running in the same process as the controller.
+"""ArmInnerLoop — 125Hz inner loop thread running in the same process as the controller.
 
 Supports two control modes (configurable):
 
   Mode 1 (default): Position servo — time-driven linear interpolation between outer-loop
-    targets (50Hz → 200Hz), then forwards to arm.set_servo_angle_j() with configurable
+    targets (50Hz → 125Hz), then forwards to arm.set_servo_angle_j() with configurable
     speed/mvacc. Arm firmware handles PID, trapezoidal velocity profiling, and joint
     limit enforcement internally at kHz rate. This is the recommended mode for teleop.
 
@@ -12,7 +12,7 @@ Supports two control modes (configurable):
     jerk/accel limiting, anti-windup. Ref: BunnyVisionPro _internal_control_arm_qpos().
 
 Architecture:
-    Main Thread (50Hz)                     Inner Loop Thread (200Hz)
+    Main Thread (50Hz)                     Inner Loop Thread (125Hz)
     ──────────────────                     ─────────────────────────
     inner.set_target(cmd)    ──Lock──→     self._arm_target
     qpos, err, ts = get_state()  ←──Lock── self._arm_qpos, _error_state
@@ -117,17 +117,17 @@ class ArmInnerLoopConfig:
                       control (vc_set_joint_velocity + user-space PID).
         servo_speed: Max joint speed (rad/s) for mode 1 set_servo_angle_j.
                      Safety upper bound; teleop rarely reaches this because
-                     per-tick deltas are small (Δθ ~0.3-1.0°). Default 1.57 rad/s.
+                     per-tick deltas are small (Δθ ~0.3-1.0°). Default 2.0 rad/s.
         servo_acc: Max joint acceleration (rad/s²) for mode 1 set_servo_angle_j.
                    Dominant parameter for responsiveness — the arm is
                    acceleration-limited for all typical teleop step sizes.
-                   Default 8 rad/s².
+                   Default 12 rad/s².
         interpolate: Enable time-driven linear interpolation between outer-loop
-                     targets (50Hz → 150Hz). Splits each 20ms step into ~3 micro-steps
+                     targets (50Hz → 125Hz). Splits each 20ms step into ~2-3 micro-steps
                      for smoother firmware trajectory replanning. Default True.
         outer_loop_period: Outer loop period in seconds, used to compute interpolation
                            alpha (= target_age / outer_loop_period). Default 0.02 (50Hz).
-        dt: Inner loop timestep in seconds. Default 1/150 ≈ 6.67ms (150Hz).
+        dt: Inner loop timestep in seconds. Default 1/125 = 8ms (125Hz).
         kp, ki, kd: Per-joint PID gains (7,). Only used in mode 4.
         max_velocity: Per-joint max velocity (rad/s). Only used in mode 4.
         max_jerk: Per-joint max jerk (rad/s³). Only used in mode 4.
@@ -136,8 +136,8 @@ class ArmInnerLoopConfig:
 
     control_mode: int = 1
     # Mode 1 parameters
-    servo_speed: float = 1.57
-    servo_acc: float = 8.0
+    servo_speed: float = 2.0
+    servo_acc: float = 12.0
     interpolate: bool = True
     outer_loop_period: float = 0.02
     # Mode 4 parameters (retained for fallback)
@@ -168,21 +168,21 @@ class ArmInnerLoopConfig:
 
 
 class ArmInnerLoop:
-    """200Hz inner loop thread — owns the XArmAPI connection.
+    """125Hz inner loop thread — owns the XArmAPI connection.
 
     Runs in the same process as the controller. Communicates via
     Lock-protected shared variables (no SHM/IPC overhead).
 
     Parameters:
         ip: XArm controller IP address.
-        dt: Inner loop period in seconds (default 1/200 = 5ms).
+        dt: Inner loop period in seconds (default 1/125 = 8ms).
         cfg: Inner loop configuration (control mode, servo params, PID gains).
     """
 
     def __init__(
         self,
         ip: str = "192.168.1.111",
-        dt: float = 1.0 / 200.0,
+        dt: float = 1.0 / 125.0,
         cfg: ArmInnerLoopConfig | None = None,
         sync: SharedSyncPrimitives | None = None,
     ) -> None:
@@ -334,7 +334,7 @@ class ArmInnerLoop:
 
             # Mode 1 interpolation state — time-driven linear interpolation between
             # consecutive outer-loop targets. Splits each 20ms step into 4 micro-steps
-            # (at 200Hz dt=5ms) for smoother firmware trajectory replanning.
+            # (at 125Hz dt=8ms) for smoother firmware trajectory replanning.
             prev_target: np.ndarray | None = None
             curr_target: np.ndarray | None = None
             target_age: float = float(self._cfg.outer_loop_period)  # > period → first tick sends current target verbatim
@@ -437,8 +437,8 @@ class ArmInnerLoop:
                 # ── 5. Interpolation (mode 1) — time-driven linear ──
                 # Linear interpolation: constant-velocity micro-steps between
                 # consecutive outer-loop targets.  The arm NEVER reaches the
-                # micro-step target within one 5ms tick (mvacc-limited: a
-                # 0.0025 rad step takes ~25ms), so the firmware is always in
+                # micro-step target within one 8ms tick (mvacc-limited: a
+                # 0.005 rad step takes ~17ms @ 12 rad/s²), so the firmware is always in
                 # the acceleration phase, tracking a moving target at near-
                 # constant acceleration → minimal reaction-force oscillation.
                 #
@@ -496,8 +496,8 @@ class ArmInnerLoop:
 
         Firmware executes a trapezoidal velocity profile from current encoder
         position to target, bounded by ``servo_speed`` (max joint velocity) and
-        ``servo_acc`` (max joint acceleration). At 150 Hz with interpolation,
-        per-tick micro-steps are ~0.25-0.5° — well within the acceleration-limited
+        ``servo_acc`` (max joint acceleration). At 125 Hz with interpolation,
+        per-tick micro-steps are ~0.5-1.0° — well within the acceleration-limited
         regime, so the arm is always in smooth transient motion.
         """
         try:
@@ -513,7 +513,22 @@ class ArmInnerLoop:
             return
 
         if code != 0:
-            logger.error("ArmInnerLoop: set_servo_angle_j code=%d", code)
+            # Attempt to capture the controller-level error code for diagnostics.
+            # SDK command-response code=1 (ERR_CODE) means "has uncleared error"
+            # but the report-stream error_code may be 0 (race / transient).
+            err_code = -1
+            warn_code = -1
+            try:
+                ret, err_warn = arm.get_err_warn_code()
+                if len(err_warn) >= 2:
+                    err_code = int(err_warn[0])
+                    warn_code = int(err_warn[1])
+            except (RuntimeError, OSError, ValueError, IndexError):
+                pass
+            logger.error(
+                "ArmInnerLoop: set_servo_angle_j code=%d, controller error=%d, warn=%d",
+                code, err_code, warn_code,
+            )
             with self._lock:
                 self._error_state = True
 

@@ -13,8 +13,6 @@ Ref: BunnyVisionPro _internal_control_arm_qpos() thread pattern.
 
 from __future__ import annotations
 
-import queue
-import threading
 import time
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -33,6 +31,7 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
 
 from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
+from dexmani_real.recording.recording_session import RecordingSession
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
@@ -41,6 +40,7 @@ if TYPE_CHECKING:
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
     from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
+    from dexmani_real.config.camera_calib import CameraCalib
 
 logger = get_logger(__name__)
 
@@ -61,8 +61,6 @@ class TeleopControllerConfig:
     ema_alpha_pos: float = 0.8
     ema_alpha_rot: float = 0.4
     dry_run: bool = False
-    use_zmq_vr: bool = False
-    zmq_vr_port: int = 5555
     use_shm_vr: bool = False
     inner_loop_cfg: ArmInnerLoopConfig | None = None
     use_precise_wait: bool = False
@@ -101,10 +99,10 @@ class TeleopController:
         ema_alpha_rot: float = 0.4,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
-        use_zmq_vr: bool = False,
-        zmq_vr_port: int = 5555,
         use_shm_vr: bool = False,
         camera_process: object | None = None,
+        calib: CameraCalib | None = None,
+        camera_name: str | None = None,
     ) -> None:
         if cfg is None:
             cfg = TeleopControllerConfig(
@@ -112,8 +110,6 @@ class TeleopController:
                 ema_alpha_pos=ema_alpha_pos,
                 ema_alpha_rot=ema_alpha_rot,
                 dry_run=dry_run,
-                use_zmq_vr=use_zmq_vr,
-                zmq_vr_port=zmq_vr_port,
                 use_shm_vr=use_shm_vr,
             )
 
@@ -140,21 +136,21 @@ class TeleopController:
             sync_label = ", sync" if cfg.synchronized else ""
             logger.info("ArmInnerLoop started (mode %d, %s%s)", inner_cfg.control_mode, mode_label, sync_label)
 
-        # Recording with async writer thread (offloads HDF5 I/O from hot path)
+        # Recording via decoupled RecordingSession (one thread owns the lifecycle,
+        # so start/record/stop are serialized — no trailing-frame teardown race).
+        self._calib = calib
+        self._camera_name = camera_name
         if recorder is not None:
             coll_cfg = cfg.collection_config or CollectionConfig()
             self._collection_loop = CollectionLoop(recorder, coll_cfg)
             self.recorder = recorder
-            self._recording_queue: queue.Queue[dict | None] = queue.Queue(maxsize=500)
-            self._recording_thread = threading.Thread(
-                target=self._recording_writer, name="recording_writer", daemon=True
+            self._recorder_session: RecordingSession | None = RecordingSession(
+                self._collection_loop, validate=coll_cfg.validate_on_stop
             )
-            self._recording_thread.start()
         else:
             self._collection_loop = None
             self.recorder = None
-            self._recording_queue = None
-            self._recording_thread = None
+            self._recorder_session = None
 
         self.limiter = RateLimiter(cfg.target_hz)
         self._ema_alpha_pos = float(cfg.ema_alpha_pos)
@@ -171,9 +167,8 @@ class TeleopController:
             if camera_process is None:
                 self._multi_camera.start_all()
 
-        # VR data sources (priority: SHM > ZMQ > Tracker)
+        # VR data sources (priority: SHM > Tracker)
         self._vr_shm: object | None = None  # SharedMemoryFrameManager
-        self._vr_subscriber = None
 
         if cfg.use_shm_vr:
             from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
@@ -182,14 +177,8 @@ class TeleopController:
                 self._vr_shm = SharedMemoryFrameManager(n_cameras=0, create=False)
                 logger.info("VR source: SharedMemory (attached, zero-copy)")
             except FileNotFoundError:
-                logger.warning("VR SHM not found — falling back to ZMQ/tracker")
+                logger.warning("VR SHM not found — falling back to tracker")
                 self._vr_shm = None
-        elif cfg.use_zmq_vr:
-            from dexmani_real.teleop.vr.vr_publisher import VRFrameSubscriber
-
-            self._vr_subscriber = VRFrameSubscriber(sub_port=cfg.zmq_vr_port)
-            self._vr_subscriber.connect()
-            logger.info("VR source: ZMQ SUB (tcp://127.0.0.1:%d)", cfg.zmq_vr_port)
 
         # State
         self.state = ControllerState.IDLE
@@ -298,7 +287,7 @@ class TeleopController:
                     "VR disconnected for %.1fs (%d consecutive frames) — auto-stopping",
                     loss_duration_s, self._vr_consecutive_loss,
                 )
-                self._stop_recording()
+                self._stop_recording(save=False)
                 self.state = ControllerState.IDLE
                 self._vr_consecutive_loss = 0
                 logger.info("=== STATE: TELEOP → IDLE (VR timeout) ===")
@@ -324,7 +313,7 @@ class TeleopController:
         if status.get("retarget_ok"):
             self._last_hand_cmd = action.hand_qpos_cmd.copy()
 
-        # ── 5. Record frame ──
+        # ── 5. Read camera (latest) for recording ──
         camera_frame = None
         camera_frames: dict[str, dict] | None = None
 
@@ -341,22 +330,8 @@ class TeleopController:
 
         T_base_eef = self._compute_T_base_eef(state)
 
-        if self.recording and self._collection_loop is not None and self._recording_queue is not None:
-            try:
-                self._recording_queue.put_nowait(
-                    dict(
-                        state=state,
-                        action=action,
-                        vr_frame=vr_frame,
-                        camera_frame=camera_frame,
-                        camera_frames=camera_frames,
-                        T_base_eef=T_base_eef,
-                    )
-                )
-            except queue.Full:
-                logger.warning("Recording queue full — dropping frame")
-
         # ── 6. Pre-send validation ──
+        validate_failed = False
         if not self.dry_run:
             action_valid, fail_reason = validate_action(
                 self.robot, action, actual_arm_qpos=arm_qpos,
@@ -366,6 +341,7 @@ class TeleopController:
                     self._escalate_to_emergency(f"Robot error before send: {fail_reason}")
                     return
                 logger.warning("Pre-send safety: %s — holding", fail_reason)
+                validate_failed = True
                 hold = self._hold_action()
                 action = RobotAction(arm_qpos_cmd=hold.arm_qpos_cmd, hand_qpos_cmd=hold.hand_qpos_cmd)
 
@@ -380,13 +356,32 @@ class TeleopController:
                 self._sync.robot_ready.wait()
                 self._sync.robot_ready.clear()
 
-        # ── 7. Periodic status ──
+        # ── 7. Record the executed frame (after validation → records what was sent) ──
+        if self.recording and self._recorder_session is not None:
+            held = (not status.get("ik_ok")) or (not status.get("retarget_ok")) or validate_failed
+            self._recorder_session.record(
+                dict(
+                    state=state,
+                    action=action,
+                    vr_frame=vr_frame,
+                    camera_frame=camera_frame,
+                    camera_frames=camera_frames,
+                    T_base_eef=T_base_eef,
+                    signals={
+                        "ik_ok": bool(status.get("ik_ok")),
+                        "retarget_ok": bool(status.get("retarget_ok")),
+                        "held": bool(held),
+                    },
+                )
+            )
+
+        # ── 8. Periodic status ──
         now = time.monotonic()
         if now - self.last_status_ts >= self.status_interval:
             self.last_status_ts = now
             self._print_status(vr_frame, now)
 
-        # ── 8. Overrun detection ──
+        # ── 9. Overrun detection ──
         tick_elapsed_ms = (time.perf_counter() - tick_start) * 1000.0
         target_ms = self.limiter.period * 1000.0
         if tick_elapsed_ms > target_ms * 1.5:
@@ -559,38 +554,34 @@ class TeleopController:
         if not self._reset_mapper():
             logger.error("Cannot start recording without VR frame.")
             return
-        if self._collection_loop is not None:
-            try:
-                self._collection_loop.start_episode(task_label="teleop", operator="")
-            except (ValueError, OSError) as e:
-                logger.exception("start_episode failed: %s", e)
+        if self._recorder_session is not None:
+            self._recorder_session.start(
+                dict(
+                    task_label="teleop",
+                    operator="",
+                    calib=self._calib,
+                    camera_name=self._camera_name,
+                )
+            )
         self._last_good_arm = None
         self._last_good_hand = None
         logger.info("Episode recording started.")
 
     def _stop_recording(self, save: bool = True) -> None:
         logger.info("Stopping episode. frames=%s save=%s", self.frame_count, save)
-        if self._collection_loop is not None and self._collection_loop.is_recording:
-            try:
-                if save:
-                    path = self._collection_loop.stop_episode(success=True, reason="manual")
-                    if path:
-                        logger.info("  Saved to %s", path)
-                else:
-                    self._collection_loop.discard_episode()
-            except (ValueError, OSError) as e:
-                logger.exception("stop_episode failed: %s", e)
+        if self._recorder_session is not None and self.recording:
+            path = self._recorder_session.stop(save=save)
+            if save and path:
+                logger.info("  Saved to %s", path)
         self.recording = False
         logger.info("Episode stopped.")
 
     # ── VR ──
 
     def _read_vr_frame(self) -> dict | None:
-        # Priority: SharedMemory (zero-copy, ~1μs) > ZMQ (TCP, ~1-2ms) > Tracker (direct SDK)
+        # Priority: SharedMemory (zero-copy, ~1μs) > Tracker (direct SDK)
         if self._vr_shm is not None:
             return self._vr_shm.read_latest_vr()
-        if self._vr_subscriber is not None:
-            return self._vr_subscriber.recv_latest()
         if self.tracker is not None:
             return self.tracker.get_latest()
         return None
@@ -725,33 +716,16 @@ class TeleopController:
             mu,
         )
 
-    # ── Recording writer thread (offloads HDF5 I/O from 50Hz hot path) ──
-
-    def _recording_writer(self) -> None:
-        """Daemon thread: consume recording frames from queue, write to HDF5."""
-        while True:
-            item = self._recording_queue.get()
-            if item is None:  # sentinel — stop
-                break
-            try:
-                self._collection_loop.record_frame(**item)
-            except (ValueError, OSError) as e:
-                logger.exception("record_frame failed: %s", e)
-
     # ── Shutdown ──
 
     def _shutdown(self) -> None:
         logger.info("Shutting down...")
-        if self.recording and self._collection_loop is not None and self._collection_loop.is_recording:
-            try:
-                self._collection_loop.stop_episode(success=False, reason="shutdown")
-            except (ValueError, RuntimeError, KeyError):
-                pass
-
-        # Stop recording writer thread
-        if self._recording_queue is not None and self._recording_thread is not None:
-            self._recording_queue.put(None)  # sentinel
-            self._recording_thread.join(timeout=5.0)
+        # Finalize any in-progress episode, then stop the recording thread.
+        if self._recorder_session is not None:
+            if self.recording:
+                self._recorder_session.stop(save=False)
+                self.recording = False
+            self._recorder_session.shutdown()
 
         # Stop VR shared memory access (consumer-side only — no cleanup needed)
         self._vr_shm = None

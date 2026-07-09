@@ -17,6 +17,7 @@ from dexmani_real.recording.collection_config import CollectionConfig
 
 if TYPE_CHECKING:
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
+    from dexmani_real.config.camera_calib import CameraCalib
 
 logger = get_logger(__name__)
 
@@ -36,6 +37,7 @@ class CollectionLoop:
         self._last_episode_path: str | None = None
         self._stopped_reason: str = "manual"
         self._classification: str = "success"
+        self._held_count: int = 0
 
     def start_episode(
         self,
@@ -43,6 +45,8 @@ class CollectionLoop:
         operator: str | None = None,
         tags: list[str] | None = None,
         camera_K: np.ndarray | None = None,
+        calib: CameraCalib | None = None,
+        camera_name: str | None = None,
     ) -> bool:
         if self.is_recording:
             logger.warning("Episode already in progress.")
@@ -53,12 +57,14 @@ class CollectionLoop:
         tags_list = tags or self.config.tags
 
         success = self.recorder.start_episode(
-            task_label=task, operator=op, tags=tags_list, camera_K=camera_K,
+            task_label=task, operator=op, tags=tags_list,
+            camera_K=camera_K, calib=calib, camera_name=camera_name,
         )
 
         if success:
             self._episode_start_time = time.perf_counter()
             self._episode_frame_count = 0
+            self._held_count = 0
             self._stopped_reason = "manual"
             self._classification = "success"
             logger.info("Episode started: task=%s operator=%s", task, op)
@@ -73,6 +79,7 @@ class CollectionLoop:
         camera_frame: dict | None = None,
         T_base_eef: np.ndarray | None = None,
         camera_frames: dict[str, dict] | None = None,
+        signals: dict | None = None,
     ) -> bool:
         if not self.is_recording:
             return False
@@ -80,7 +87,7 @@ class CollectionLoop:
         recorded = self.recorder.add_frame(
             state=state, action=action, vr_frame=vr_frame,
             camera_frame=camera_frame, T_base_eef=T_base_eef,
-            camera_frames=camera_frames,
+            camera_frames=camera_frames, signals=signals,
         )
 
         if self.recorder.max_frames_reached and self.config.auto_stop_on_max_frames:
@@ -90,6 +97,8 @@ class CollectionLoop:
 
         if recorded:
             self._episode_frame_count += 1
+            if signals and signals.get("held"):
+                self._held_count += 1
         return recorded
 
     def stop_episode(
@@ -149,6 +158,7 @@ class CollectionLoop:
             "classification": self._classification,
             "stopped_reason": self._stopped_reason,
             "min_frames_met": self._episode_frame_count >= self.config.min_frames,
+            "held_ratio": round(self._held_count / max(1, self._episode_frame_count), 3),
             "h5_file": h5_file.name,
         }
 
@@ -178,4 +188,5 @@ class CollectionLoop:
             "is_recording": self.is_recording,
             "last_path": self._last_episode_path,
             "min_frames_met": self._episode_frame_count >= self.config.min_frames,
+            "held_ratio": round(self._held_count / max(1, self._episode_frame_count), 3),
         }

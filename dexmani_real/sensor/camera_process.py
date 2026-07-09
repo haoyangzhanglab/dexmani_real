@@ -279,15 +279,14 @@ class CameraProcess:
                                 "CameraProcess shm write failed — continuing."
                             )
                     else:
-                        # Queue path: non-blocking put, drops oldest when full
+                        # Queue path: drain then put — always keep the latest frame.
+                        # Drain first (non-blocking) to make room, then put.
+                        # This avoids the double-put_nowait race that can crash the process.
                         try:
-                            self._frame_queue.put_nowait(frame_dict)
-                        except queue.Full:
-                            try:
-                                self._frame_queue.get_nowait()  # drop oldest
-                            except queue.Empty:
-                                pass
-                            self._frame_queue.put_nowait(frame_dict)
+                            self._frame_queue.get_nowait()  # drop oldest (non-blocking)
+                        except queue.Empty:
+                            pass
+                        self._frame_queue.put_nowait(frame_dict)
                 except (RuntimeError, OSError):
                     logger.exception("CameraProcess frame read failed — continuing.")
 

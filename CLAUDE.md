@@ -81,13 +81,13 @@ dexmani_real/          ← Python package root
 │   ├── vr/            ← ArmMapper, HandRetargeter, VRTracker (Quest), DummyTracker
 │   └── control/       ← KeyboardHandler, safety checks (torque/current/temp/comm)
 ├── planning/          ← MPlib motion planner, IK, kinematics, collision detection
-├── recording/         ← HDF5 episode recorder, CollectionLoop, frame buffer, validation
+├── recording/         ← HDF5 episode recorder, RecordingSession, CollectionLoop, aligned buffer, validation
 ├── sensor/            ← RealSense camera driver, multi-camera manager, VR receiver
 ├── simulation/        ← SAPIEN-based simulation mirror of real hardware
 ├── shm/               ← SharedMemoryRingBuffer for cross-process camera data
 ├── config/            ← Camera extrinsics (cameras.json), PipelineConfig (serializable)
 ├── utils/             ← Shared utilities (log, serialization, rate limiting, signal)
-├── tools/             ← CLI utilities (HDF5→Zarr export)
+├── tools/             ← CLI utilities (HDF5 episode viewer, HDF5→Zarr export)
 ├── services/          ← Standalone services (retarget server)
 ├── assets/            ← URDF, SRDF, meshes, retargeting configs
 ├── examples/          ← Real/sim teleop entry points + motion planning tests
@@ -105,19 +105,20 @@ VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compu
                                                       │   → adaptive scaling → NLP optimize
                                                       │   → LPFilter(alpha=0.6) EMA (dex_retargeting built-in)
                                                       │   → delta clip(max_delta_rad=0.3) (XHand E3)
-                                                      ├─ arm: EMA smoothing (cartesian_ema_alpha_teleop, default 0.3)
+                                                      ├─ arm: Cartesian EMA (ema_alpha_pos=0.8, ema_alpha_rot=0.4)
                                                       └─ arm IK anomaly jump-limit (default 90°, planning/ik.py)
                                                                    │
-RobotInterface.validate_action() ← pre-send gate (torque, current, temp, comm, workspace)
-RobotInterface.send_action()    ← joint-limit + delta-limit clipping (arm)
+RobotInterface.validate_action() ← pre-send gate (robot error + arm connection only)
+ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 200Hz inner loop (joint + delta clip)
+RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
         │
-    ┌── XArm7 (SDK C++ binding)
+    ┌── XArm7 (SDK C++ binding)  ← driven by ArmInnerLoop @ 200Hz
     └── XHand (SDK C++ binding)  ← joint-limit + delta clip(E3) + optional EMA(E2)
 ```
 
 ## Core types (robot/types.py)
 
-- **`RobotState`** — complete state: `arm_qpos(7)`, `arm_qvel(7)`, `arm_tau(7)`, `eef_pos(3)`, `eef_quat_wxyz(4)`, `eef_rot6d(6)`, `hand_qpos(12)`, `hand_tactile_sum(5,3)`, `fingertip_pos(5,3)`
+- **`RobotState`** — complete state: `arm_qpos(7)`, `arm_qvel(7)`, `arm_tau(7)`, `eef_pos(3)`, `eef_quat_wxyz(4)`, `eef_rot6d(6)`, `hand_qpos(12)`, `hand_tactile_sum(5,3)`, `hand_tactile_force(5,120,3)`, `fingertip_pos(5,3)`
 - **`RobotAction`** — command: `arm_qpos_cmd(7)`, `hand_qpos_cmd(12)`, optional `target_eef_pos`/`target_eef_rot6d`
 - **`RobotInterfaceConfig`** — arm/hand configs, workspace bounds, collision config, hand URDF transforms
 - **`RobotInterface`** — sole hardware access point; controllers NEVER call XArm7/XHand directly
@@ -125,13 +126,15 @@ RobotInterface.send_action()    ← joint-limit + delta-limit clipping (arm)
 ## State machine (TeleopController)
 
 ```
-IDLE ──T(teleop)──→ TELEOP ──R(record)──→ RECORDING
-  ↑       │   S(stop)→IDLE      │   H(home)→IDLE
-  ├───H(home)─────┘              │
-  └──ESC / timeout: EMERGENCY_STOP
+IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
+  ↑                          │
+  └── S(stop+save) / H(home) ┘
+  ESC / VR-disconnect timeout → EMERGENCY_STOP
 ```
-- **PAUSED** state: freeze IK, hold position (C key / foot pedal)
-- **SAVE_PROMPT** state: confirm save/retry/discard after recording stop
+- States (`ControllerState` enum): **IDLE, TELEOP, PAUSED, EMERGENCY_STOP** only.
+- **Recording is a bool flag, not a state**: set True on BEGIN (starts together with TELEOP),
+  saved on STOP (S) / discarded on QUIT (Q). There is no RECORDING or SAVE_PROMPT state.
+- **PAUSED**: freeze IK, hold position (C key)
 - Return-to-home: 2-phase — Phase 1: EEF Cartesian path, Phase 2: joint-space redundant joint alignment
 
 ## Motion planning (planning/planner.py)
@@ -144,24 +147,32 @@ IDLE ──T(teleop)──→ TELEOP ──R(record)──→ RECORDING
 
 ## HDF5 recording format
 
+All streams are aligned to one `dt=1/50` time grid at record time (`TimestampAlignedBuffer`),
+keyed by `state.timestamp`; camera frames stream per-frame but stay length-aligned to the grid.
+
 ```
-episode_000.h5
-  /meta: task_label, operator, tags, duration, fps, num_frames, success,
-         camera_serial, camera_type, camera_K, T_base/eef_camera, pipeline_snapshot
+episode_NNN.h5
+  /meta: schema_version(=2), task_label, operator, tags, duration, fps, num_frames,
+         success, min_frames_met, has_camera, has_timestamps,
+         camera_serial, camera_type, camera_K, camera_T_base_camera / camera_T_eef_camera
   /obs: arm_qpos(7), arm_qvel(7), arm_tau(7), eef_pos(3), eef_quat(4),
-        hand_qpos(12), hand_tactile_sum(5,3)
-  /action: arm_qpos(7), hand_qpos(12)
+        hand_qpos(12), hand_tactile_sum(5,3), hand_tactile_force(5,120,3)
+  /action: arm_qpos(7), hand_qpos(12), target_eef_pos(3), target_eef_rot6d(6),
+           ik_ok, retarget_ok, held   ← bool intent/validity flags (per-frame)
   /vr: wrist_pos(3), wrist_quat(4), landmarks(21,3)
-  /camera/<serial>/rgb(T,H,W,3), depth(T,H,W), timestamps(T)
+  /camera[/<name>]/rgb(T,H,W,3), depth(T,H,W), timestamps(T); /camera/extrinsics(T,4,4)
   /timestamps(T), /vr_timestamps(T)
 ```
-- **CollectionLoop** orchestrates lifecycle: start/stop, sidecar JSON, file routing (success_dir / failure_dir)
+- **RecordingSession** (`recording/recording_session.py`) — driver-agnostic: one writer thread
+  serializes start/record/stop so the HDF5 file is touched by a single thread (no teardown race).
+- **CollectionLoop** orchestrates lifecycle: start/stop, sidecar JSON, discard (unlink). Single
+  `data_dir` — `success` is a `/meta` attr + sidecar `classification`, **not** directory routing.
 
 ## Conventions
 
 | Aspect | Convention |
 |--------|-----------|
-| Python | 3.10+, **conda env: `real`** |
+| Python | 3.10+, **conda env: `real_robot`** |
 | Formatting | black (line-length 120), isort (black profile), mypy (disallow_untyped_defs=false) |
 | Imports | `from __future__ import annotations`; `TYPE_CHECKING` for circular deps |
 | Data types | `dataclass` for config/state; `numpy` for all math |
@@ -176,22 +187,24 @@ episode_000.h5
 
 | Entry point | Purpose |
 |-------------|---------|
-| `examples/real/test_quest_hand_teleop.py` | Main real-hardware VR teleop |
+| `examples/real/vr_teleop_shm.py` | Main real-hardware VR teleop (TeleopController + SHM VR) |
+| `examples/real/vr_teleop_arm_only.py` | Arm-only VR teleop (direct recorder, no controller) |
 | `examples/real/keyboard_teleop_real.py` | Keyboard-based arm control |
+| `examples/real/test_quest_hand_teleop.py` | Standalone hand-retargeting test (no TeleopController) |
 | `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
 | `dexmani_real/services/retarget_server.py` | Standalone hand retargeting service (ZMQ REP) |
+| `dexmani_real/tools/visualize_episode.py` | Rerun-based HDF5 episode viewer (3D + camera + time series) |
 | `dexmani_real/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
 
 ## Safety architecture
 
-1. **Pre-send gate** (`validate_action()`): robot error, arm connection, arm torque, hand current/temp/comm, workspace bounds
+1. **Pre-send gate** (`validate_action()`): **currently robot error + arm connection only** (2-check stub, `robot/validate.py`). Torque / current / temp / workspace / collision gating is accepted as params but not yet implemented — a hard prerequisite before autonomous policy rollouts.
 2. **IK-level**: workspace clamping, IK anomaly jump-limit (arm: 90° default, `planning/ik.py:140`)
 3. **Hand command-level**: delta clip (E3, `max_delta_rad=0.3` per-step hard gate) + optional EMA (E2, `XHandConfig.ema_alpha`)
 4. **Retargeting-level**: built-in LPFilter EMA (`low_pass_alpha=0.6`, dex_retargeting `SeqRetargeting.retarget()`)
 5. **Path execution**: torque monitoring per waypoint, collision verification (self + env + desk FK)
 6. **Desk safety**: `FingertipDeskSafety` — FK-based fingertip Z check (complements MPlib point cloud)
 7. **Emergency stop**: `RobotInterface.emergency_stop()` → arm.stop() + hand.stop()
-8. **SlidingWindowMonitor**: trend tracking for hand temperature, current, IK miss counts
 
 ## Key dependencies
 
