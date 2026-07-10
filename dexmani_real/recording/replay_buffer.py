@@ -43,14 +43,13 @@ logger = get_logger(__name__)
 
 # Default observation / action keys — must match export_hdf5_to_zarr.py.
 _DEFAULT_OBS_KEYS: list[tuple[str, int]] = [
-    ("obs/arm_qpos", 7),
-    ("obs/eef_pos", 3),
-    ("obs/eef_quat", 4),
-    ("obs/hand_qpos", 12),
+    ("arm_qpos", 7),
+    ("arm_ee", 9),
+    ("hand_qpos", 12),
 ]
 _DEFAULT_ACTION_KEYS: list[tuple[str, int]] = [
-    ("action/arm_qpos", 7),
-    ("action/hand_qpos", 12),
+    ("action_arm_joint", 7),
+    ("action_hand_joint", 12),
 ]
 
 

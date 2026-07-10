@@ -6,8 +6,10 @@ State machine:
       ├───H(home)─────┘              │
       └──ESC / timeout: EMERGENCY_STOP
 
-Arm position servo is handled by ArmInnerLoop (daemon thread, same process).
-Controller sends target qpos via inner.set_target(), reads state via inner.get_state().
+Arm control is handled by ArmInnerLoop (daemon thread, mode 6 online trajectory
+planning @ 50Hz). Controller sends target qpos via inner.set_target(), reads
+state via inner.get_state(). Firmware handles trajectory smoothing with configurable
+speed/accel limits (default: 90°/s, 500°/s²).
 Ref: BunnyVisionPro _internal_control_arm_qpos() thread pattern.
 """
 
@@ -120,7 +122,7 @@ class TeleopController:
         self.tracker = tracker
         self.dry_run = cfg.dry_run
 
-        # ── Arm inner loop (in-process thread, 200Hz default) ──
+        # ── Arm inner loop (in-process thread, 50Hz default, mode 6) ──
         self._arm_inner: ArmInnerLoop | None = None
         self._sync: SharedSyncPrimitives | None = None
         if not self.dry_run:
@@ -130,11 +132,8 @@ class TeleopController:
                 inner_cfg.synchronized = True
             self._arm_inner = ArmInnerLoop(cfg=inner_cfg, sync=self._sync)
             self._arm_inner.start()
-            mode_label = {4: "velocity control + PID", 1: "position servo"}.get(
-                inner_cfg.control_mode, f"mode {inner_cfg.control_mode}"
-            )
             sync_label = ", sync" if cfg.synchronized else ""
-            logger.info("ArmInnerLoop started (mode %d, %s%s)", inner_cfg.control_mode, mode_label, sync_label)
+            logger.info("ArmInnerLoop started (mode 6, online trajectory planning%s)", sync_label)
 
         # Recording via decoupled RecordingSession (one thread owns the lifecycle,
         # so start/record/stop are serialized — no trailing-frame teardown race).

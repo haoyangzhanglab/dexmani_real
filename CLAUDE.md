@@ -109,10 +109,10 @@ VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compu
                                                       └─ arm IK anomaly jump-limit (default 90°, planning/ik.py)
                                                                    │
 RobotInterface.validate_action() ← pre-send gate (robot error + arm connection only)
-ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 200Hz inner loop (joint + delta clip)
+ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 50Hz inner loop (mode 6: passthrough, firmware trajectory planning)
 RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
         │
-    ┌── XArm7 (SDK C++ binding)  ← driven by ArmInnerLoop @ 200Hz
+    ┌── XArm7 (SDK C++ binding)  ← driven by ArmInnerLoop @ 50Hz (mode 6: firmware online trajectory planning)
     └── XHand (SDK C++ binding)  ← joint-limit + delta clip(E3) + optional EMA(E2)
 ```
 
@@ -152,16 +152,29 @@ keyed by `state.timestamp`; camera frames stream per-frame but stay length-align
 
 ```
 episode_NNN.h5
-  /meta: schema_version(=2), task_label, operator, tags, duration, fps, num_frames,
-         success, min_frames_met, has_camera, has_timestamps,
-         camera_serial, camera_type, camera_K, camera_T_base_camera / camera_T_eef_camera
-  /obs: arm_qpos(7), arm_qvel(7), arm_tau(7), eef_pos(3), eef_quat(4),
-        hand_qpos(12), hand_tactile_sum(5,3), hand_tactile_force(5,120,3)
-  /action: arm_qpos(7), hand_qpos(12), target_eef_pos(3), target_eef_rot6d(6),
-           ik_ok, retarget_ok, held   ← bool intent/validity flags (per-frame)
-  /vr: wrist_pos(3), wrist_quat(4), landmarks(21,3)
-  /camera[/<name>]/rgb(T,H,W,3), depth(T,H,W), timestamps(T); /camera/extrinsics(T,4,4)
-  /timestamps(T), /vr_timestamps(T)
+  /meta (group)
+    attrs: schema_version(=2), task_label, operator, tags, duration, fps, num_frames,
+           success, min_frames_met, has_camera, has_timestamps,
+           camera_serial, camera_type, camera_K, camera_T_base_camera
+  /arm_qpos(T,7)           arm joint positions (rad)
+  /arm_ee(T,9)             EEF [pos(3), rot6d(6)]
+  /arm_qvel(T,7)           arm joint velocities (rad/s)
+  /arm_tau(T,7)            arm joint torques (Nm)
+  /hand_qpos(T,12)         hand joint positions (rad)
+  /hand_fingertip(T,5,3)   fingertip positions in base frame
+  /hand_contact(T,5,3)     tactile force sum per finger
+  /action_arm_joint(T,7)   arm joint command
+  /action_arm_ee(T,9)      target EEF [pos(3), rot6d(6)] (NaN if not set)
+  /action_hand_joint(T,12) hand joint command
+  /flag_ik_ok(T,)          bool — IK solved successfully
+  /flag_retarget_ok(T,)    bool — retargeting converged
+  /flag_held(T,)           bool — command held (no fresh VR/IK result)
+  /vr_wrist_pos(T,3)       VR wrist position in base frame
+  /vr_wrist_rot6d(T,6)     VR wrist orientation as 6D rotation
+  /vr_landmarks(T,21,3)    VR hand landmarks (MANO convention)
+  /rgb(T,H,W,3)            uint8 camera frames (forward-filled to grid)
+  /depth(T,H,W)            uint16 Z16 depth (forward-filled to grid)
+  /timestamp(T)            aligned grid timestamps (20ms spacing)
 ```
 - **RecordingSession** (`recording/recording_session.py`) — driver-agnostic: one writer thread
   serializes start/record/stop so the HDF5 file is touched by a single thread (no teardown race).

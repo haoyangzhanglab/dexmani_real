@@ -5,16 +5,7 @@ disconnects, firmware hangs, or frame timeouts don't crash the control loop.
 
 Ref: ManiUniCon Camera Process (main.py:163-170 RobotControlSystem).
 
-Architecture (Queue mode, default):
-    ┌───────────────────────┐  mp.Queue(maxsize=1)  ┌──────────────────────┐
-    │ CameraProcess         │──────────────────────►│ TeleopController     │
-    │ (独立 mp.Process)     │  dict (latest frame)  │ (主进程, 50Hz)       │
-    │                       │                       │                      │
-    │ RealSense.read()      │                       │ poll_latest_frame()  │
-    │ → CameraFrame.to_dict│                       │ → recorder.add_frame│
-    └───────────────────────┘                       └──────────────────────┘
-
-Architecture (Shared Memory mode, use_shm=True):
+Architecture:
     ┌───────────────────────┐   SharedMemory         ┌──────────────────────┐
     │ CameraProcess         │ ── CameraRingBuffer ──►│ TeleopController     │
     │ (独立 mp.Process)     │   (zero-copy)          │ (主进程, 50Hz)       │
@@ -27,11 +18,8 @@ Architecture (Shared Memory mode, use_shm=True):
 from __future__ import annotations
 
 import multiprocessing as mp
-import queue
 import time
 from dataclasses import dataclass
-
-import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
@@ -47,9 +35,7 @@ class CameraProcessConfig:
     hz: float = 30.0
     warmup_frames: int = 10
     timeout_ms: int = 1000
-    # Shared memory: use CameraRingBuffer (zero-copy) instead of mp.Queue
-    use_shm: bool = False
-    shm_name: str = "dexmani_cam_0"  # matches SharedMemoryFrameManager defaults
+    shm_name: str = "dexmani_cam_0"
     rgb_height: int = 480
     rgb_width: int = 640
 
@@ -57,17 +43,10 @@ class CameraProcessConfig:
 class CameraProcess:
     """Captures RealSense frames in a crash-isolated background process.
 
-    Usage (Queue mode):
-        cam = CameraProcess(CameraProcessConfig(serial="...", hz=30.0))
-        cam.start()
-        # In controller loop:
-        frame = cam.poll_latest_frame()
-        if frame is not None:
-            recorder.add_frame(..., camera_frame=frame)
-        cam.stop()
+    Frames are transported via CameraRingBuffer (zero-copy shared memory).
 
-    Usage (Shared Memory mode):
-        cam = CameraProcess(CameraProcessConfig(serial="...", hz=30.0, use_shm=True))
+    Usage:
+        cam = CameraProcess(CameraProcessConfig(serial="...", hz=30.0))
         cam.start()
         frame = cam.poll_latest_frame()  # reads from shm
         cam.stop()
@@ -77,17 +56,7 @@ class CameraProcess:
         self.config = config or CameraProcessConfig()
         self._process: mp.Process | None = None
         self._stop_event = mp.Event()
-
-        # maxsize=1 ensures only the latest frame is queued (old frames
-        # dropped automatically when the queue is full).
-        self._frame_queue: mp.Queue | None = None
-        if not self.config.use_shm:
-            self._frame_queue = mp.Queue(maxsize=1)
-
-        # Shared memory ring buffer (zero-copy path)
         self._shm_buf = None  # CameraRingBuffer instance (lazy init)
-
-        # Crash detection
         self._crashed = mp.Event()
 
     # ------------------------------------------------------------------
@@ -102,14 +71,7 @@ class CameraProcess:
 
         self._stop_event.clear()
         self._crashed.clear()
-
-        # Drain any stale frames from previous run
-        if self._frame_queue is not None:
-            self._drain_queue()
-
-        # Initialize shared memory buffer if using shm mode
-        if self.config.use_shm:
-            self._init_shm()
+        self._init_shm()
 
         self._process = mp.Process(
             target=self._run,
@@ -118,9 +80,9 @@ class CameraProcess:
         )
         self._process.start()
         logger.info(
-            "CameraProcess started (name=%s, serial=%s, hz=%.0f, shm=%s)",
+            "CameraProcess started (name=%s, serial=%s, hz=%.0f)",
             self.config.camera_name, self.config.serial or "default",
-            self.config.hz, self.config.use_shm,
+            self.config.hz,
         )
         return True
 
@@ -136,8 +98,10 @@ class CameraProcess:
                 self._process.terminate()
                 self._process.join(timeout=1.0)
         self._process = None
-        if self._frame_queue is not None:
-            self._drain_queue()
+        if self._shm_buf is not None:
+            self._shm_buf.close()
+            self._shm_buf.unlink()
+            self._shm_buf = None
         logger.info("CameraProcess stopped.")
 
     # ------------------------------------------------------------------
@@ -145,23 +109,8 @@ class CameraProcess:
     # ------------------------------------------------------------------
 
     def poll_latest_frame(self) -> dict | None:
-        """Non-blocking poll for the latest camera frame.
-
-        Returns a dict (CameraFrame.to_dict() format) or None.
-        In queue mode: drains the queue to always return the newest frame.
-        In shm mode: reads the latest frame from the shared memory ring buffer.
-        """
-        if self.config.use_shm:
-            return self._poll_shm()
-
-        # Queue mode
-        latest: dict | None = None
-        while True:
-            try:
-                latest = self._frame_queue.get_nowait()
-            except queue.Empty:
-                break
-        return latest
+        """Non-blocking poll for the latest camera frame via shared memory."""
+        return self._poll_shm()
 
     @property
     def crashed(self) -> bool:
@@ -240,53 +189,35 @@ class CameraProcess:
                 return
 
             logger.info(
-                "CameraProcess capture loop started @ %.0f Hz (shm=%s).",
-                self.config.hz, self.config.use_shm,
+                "CameraProcess capture loop started @ %.0f Hz.",
+                self.config.hz,
             )
 
-            # Setup shm writer if using shared memory mode
-            shm_writer = None
-            if self.config.use_shm:
-                from dexmani_real.shm.layouts import camera_frame_to_bytes
-                from dexmani_real.shm.ring_buffer import CameraRingBuffer
+            from dexmani_real.shm.layouts import camera_frame_to_bytes
+            from dexmani_real.shm.ring_buffer import CameraRingBuffer
 
-                h = self.config.rgb_height
-                w = self.config.rgb_width
-                # Child process: parent already created the shared memory.
-                # Using create=False avoids the unnecessary FileExistsError
-                # fallback path and eliminates a race window.
-                shm_writer = CameraRingBuffer(
-                    name=self.config.shm_name,
-                    rgb_shape=(h, w, 3),
-                    depth_shape=(h, w),
-                    maxlen=5,
-                    create=False,
-                )
+            h = self.config.rgb_height
+            w = self.config.rgb_width
+            shm_writer = CameraRingBuffer(
+                name=self.config.shm_name,
+                rgb_shape=(h, w, 3),
+                depth_shape=(h, w),
+                maxlen=5,
+                create=False,
+            )
 
             last_ts = time.monotonic()
             while not self._stop_event.is_set():
                 try:
                     frame = cam.read(timeout_ms=self.config.timeout_ms)
                     frame_dict = frame.to_dict()
-
-                    if shm_writer is not None:
-                        # Shared memory path: zero-copy write
-                        try:
-                            header, rgb, depth = camera_frame_to_bytes(frame_dict)
-                            shm_writer.write(header, rgb, depth)
-                        except (ValueError, RuntimeError, OSError):
-                            logger.exception(
-                                "CameraProcess shm write failed — continuing."
-                            )
-                    else:
-                        # Queue path: drain then put — always keep the latest frame.
-                        # Drain first (non-blocking) to make room, then put.
-                        # This avoids the double-put_nowait race that can crash the process.
-                        try:
-                            self._frame_queue.get_nowait()  # drop oldest (non-blocking)
-                        except queue.Empty:
-                            pass
-                        self._frame_queue.put_nowait(frame_dict)
+                    try:
+                        header, rgb, depth = camera_frame_to_bytes(frame_dict)
+                        shm_writer.write(header, rgb, depth)
+                    except (ValueError, RuntimeError, OSError):
+                        logger.exception(
+                            "CameraProcess shm write failed — continuing."
+                        )
                 except (RuntimeError, OSError):
                     logger.exception("CameraProcess frame read failed — continuing.")
 
@@ -297,21 +228,10 @@ class CameraProcess:
                     time.sleep(sleep_time)
                 last_ts = time.monotonic()
 
-            if shm_writer is not None:
-                shm_writer.close()
+            shm_writer.close()
             cam.disconnect()
             logger.info("CameraProcess capture loop exited cleanly.")
 
         except (RuntimeError, OSError):
             logger.exception("CameraProcess crashed.")
             self._crashed.set()
-
-    def _drain_queue(self) -> None:
-        """Remove all pending frames from the queue."""
-        if self._frame_queue is None:
-            return
-        while True:
-            try:
-                self._frame_queue.get_nowait()
-            except queue.Empty:
-                break

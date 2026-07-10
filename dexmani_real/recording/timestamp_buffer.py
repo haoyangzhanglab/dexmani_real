@@ -52,6 +52,8 @@ def get_accumulate_timestamp_idxs(
     global_idxs: list[int] = []
 
     for local_idx, ts in enumerate(timestamps):
+        if not np.isfinite(ts):
+            continue
         # eps*dt ensures ts == start_time + k*dt lands exactly in slot k
         global_idx = math.floor((ts - start_time) / dt + eps)
         if global_idx < 0:

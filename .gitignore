@@ -141,5 +141,7 @@ dmypy.json
 
 .vscode/
 .claude/
+
 trajectories/
 episodes_arm/
+episodes/

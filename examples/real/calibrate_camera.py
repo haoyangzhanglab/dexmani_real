@@ -457,7 +457,7 @@ def main():
         print("❌ Arm 内环线程启动超时")
         robot.disconnect()
         return
-    print("  ✓ Arm 内环就绪 (250Hz)")
+    print("  ✓ Arm 内环就绪 (50Hz, mode 6)")
 
     arm_qpos, error_state, _ = arm_inner.get_state()
     state = robot.get_state(arm_qpos=arm_qpos if np.all(np.isfinite(arm_qpos)) else None)

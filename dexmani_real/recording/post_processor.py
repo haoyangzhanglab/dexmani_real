@@ -287,14 +287,14 @@ class TimestampAligner:
     ) -> dict[str, np.ndarray]:
         """Internal: align streams from an open HDF5 file."""
         # Get control timestamps
-        if "timestamps" in f:
-            ctrl_ts = np.asarray(f["timestamps"][:], dtype=np.float64)
+        if "timestamp" in f:
+            ctrl_ts = np.asarray(f["timestamp"][:], dtype=np.float64)
         else:
             # Fall back to synthetic timestamps based on frame count
-            n_frames = f["obs/arm_qpos"].shape[0]
+            n_frames = f["arm_qpos"].shape[0]
             fps = f["meta"].attrs.get("fps", 50.0)
             ctrl_ts = np.arange(n_frames, dtype=np.float64) / fps
-            logger.warning("No /timestamps dataset — using synthetic timestamps @ %.0f Hz", fps)
+            logger.warning("No /timestamp dataset — using synthetic timestamps @ %.0f Hz", fps)
 
         if t_start is None:
             t_start = float(ctrl_ts[0])
@@ -304,29 +304,32 @@ class TimestampAligner:
         target_ts = np.arange(t_start, t_end + dt / 2, dt, dtype=np.float64)
         result: dict[str, np.ndarray] = {}
 
-        # Streams to align (path → source timestamps)
+        # Streams to align (path → source timestamps) — v2 flat schema
         streams: list[tuple[str, np.ndarray, str]] = [
-            ("obs/arm_qpos", ctrl_ts, "linear"),
-            ("obs/arm_qvel", ctrl_ts, "linear"),
-            ("obs/arm_tau", ctrl_ts, "linear"),
-            ("obs/eef_pos", ctrl_ts, "linear"),
-            ("obs/eef_quat", ctrl_ts, "slerp"),  # SLERP for unit quaternion
-            ("obs/hand_qpos", ctrl_ts, "linear"),
-            ("obs/hand_tactile_sum", ctrl_ts, "linear"),
-            ("obs/hand_tactile_force", ctrl_ts, "linear"),
-            ("action/arm_qpos", ctrl_ts, "linear"),
-            ("action/hand_qpos", ctrl_ts, "linear"),
-            ("vr/wrist_pos", ctrl_ts, "linear"),
-            ("vr/wrist_quat", ctrl_ts, "slerp"),
-            ("vr/landmarks", ctrl_ts, "linear"),
+            ("arm_qpos", ctrl_ts, "linear"),
+            ("arm_qvel", ctrl_ts, "linear"),
+            ("arm_tau", ctrl_ts, "linear"),
+            ("arm_ee", ctrl_ts, "linear"),
+            ("hand_qpos", ctrl_ts, "linear"),
+            ("hand_fingertip", ctrl_ts, "linear"),
+            ("hand_contact", ctrl_ts, "linear"),
+            ("action_arm_joint", ctrl_ts, "linear"),
+            ("action_arm_ee", ctrl_ts, "linear"),
+            ("action_hand_joint", ctrl_ts, "linear"),
+            ("vr_wrist_pos", ctrl_ts, "linear"),
+            ("vr_wrist_rot6d", ctrl_ts, "linear"),
+            ("vr_landmarks", ctrl_ts, "linear"),
         ]
 
-        # Add camera streams if available (these have their own timestamps)
-        has_camera = "camera/timestamps" in f
+        # Add camera streams if available (aligned by index — v2 has no camera timestamps)
+        has_camera = "rgb" in f
         if has_camera:
-            cam_ts = np.asarray(f["camera/timestamps"][:], dtype=np.float64)
-            streams.append(("camera/rgb", cam_ts, "nearest"))
-            streams.append(("camera/depth", cam_ts, "nearest"))
+            # Camera frames are forward-filled to match the control grid;
+            # use nearest-neighbor to map camera index → timestamp grid.
+            cam_ts = np.arange(f["rgb"].shape[0], dtype=np.float64) / f["meta"].attrs.get("fps", 50.0)
+            streams.append(("rgb", cam_ts, "nearest"))
+            if "depth" in f:
+                streams.append(("depth", cam_ts, "nearest"))
 
         # Align each stream
         for path, source_ts, method in streams:

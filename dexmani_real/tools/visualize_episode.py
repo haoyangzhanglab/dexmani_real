@@ -19,15 +19,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import h5py
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
-from scipy.spatial.transform import Rotation
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz, wxyz_to_xyzw
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -37,7 +37,7 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _KNOWN_CATEGORIES: dict[str, set[str]] = {
-    "arm": {"arm_qpos", "arm_ee", "arm_qvel", "arm_tau"},
+    "arm": {"arm_qpos", "arm_ee"},
     "hand": {"hand_qpos", "hand_fingertip", "hand_contact"},
     "action": {"action_arm_joint", "action_arm_ee", "action_hand_joint"},
     "vr": {"vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks"},
@@ -132,18 +132,6 @@ def print_episode_info(h5_path: str) -> None:
 class EpisodeVisualizer:
     """Load and stream a DexMani HDF5 episode into Rerun for interactive viewing."""
 
-    # Fixed colors for 5 fingertips (thumb, index, middle, ring, pinky)
-    _FINGERTIP_COLORS = np.array(
-        [
-            [0, 200, 0],    # green  - thumb
-            [200, 0, 0],    # red    - index
-            [0, 0, 200],    # blue   - middle
-            [200, 200, 0],  # yellow - ring
-            [200, 0, 200],  # purple - pinky
-        ],
-        dtype=np.uint8,
-    )
-
     def __init__(self, h5_path: str, max_frames: int | None = None):
         self._h5_path = Path(h5_path)
         self._h5f = h5py.File(h5_path, "r")
@@ -168,9 +156,13 @@ class EpisodeVisualizer:
             else:
                 self._cam_idx = np.arange(self._T, dtype=int)
 
-        # Init Rerun
+        # Init Rerun — app_id includes episode name for the window title;
+        # recording_id is made unique per invocation so re-running the same
+        # file always creates a fresh recording (no stale-data merge).
         self._blueprint = self._build_blueprint()
-        rr.init("DexMani Episode Viewer", spawn=True, default_blueprint=self._blueprint)
+        _app_id = f"DexMani - {self._h5_path.stem}"
+        _rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
+        rr.init(_app_id, recording_id=_rec_id, spawn=True, default_blueprint=self._blueprint)
         self._log_static()
 
     # ------------------------------------------------------------------
@@ -213,6 +205,16 @@ class EpisodeVisualizer:
                 if data.ndim == 0:
                     data = data[()]
                 state[key] = np.asarray(data)
+
+        # ── Derived 2-D time series from 3-D hand data ──
+        # hand_contact (T,5,3) → force magnitude (T,5) + per-finger Fx/Fy/Fz
+        if "hand_contact" in state:
+            contact = state["hand_contact"]  # (T, 5, 3)
+            state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
+            # First two fingers: thumb (0) and index (1) per-axis forces
+            state["hand_force_thumb"] = contact[:, 0, :].copy()   # (T, 3) Fx,Fy,Fz
+            state["hand_force_index"] = contact[:, 1, :].copy()   # (T, 3) Fx,Fy,Fz
+
         return state
 
     # ------------------------------------------------------------------
@@ -225,13 +227,7 @@ class EpisodeVisualizer:
         has_action = bool(self._available.get("action"))
         has_flags = bool(self._available.get("flags"))
 
-        # Left: 3D world view (always)
-        left = rrb.Vertical(
-            rrb.Spatial3DView(origin="world", name="World"),
-            name="3D World",
-        )
-
-        columns = [left]
+        columns: list[rrb.Container] = []
 
         # Camera column
         cam_views = []
@@ -248,10 +244,12 @@ class EpisodeVisualizer:
         if has_state:
             state_views = []
             for key in self._available.get("arm", []) + self._available.get("hand", []):
-                # Only create views for 1-D/2-D data (3-D spatial data like
-                # hand_fingertip is shown in the 3D view instead).
                 if key in self._state and 1 <= self._state[key].ndim <= 2:
                     state_views.append(rrb.TimeSeriesView(origin=f"state/{key}", name=key))
+            # Derived force views (computed from 3-D hand_contact in _preload_state)
+            for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
+                if fkey in self._state:
+                    state_views.append(rrb.TimeSeriesView(origin=f"state/{fkey}", name=fkey))
             if state_views:
                 ts_verticals.append(rrb.Vertical(contents=state_views, name="State"))
 
@@ -276,10 +274,7 @@ class EpisodeVisualizer:
             else:
                 columns.append(rrb.Tabs(contents=ts_verticals, active_tab=0, name="Time Series"))
 
-        # Column shares: 3D gets noticeably more space
-        shares = [3] + [1] * (len(columns) - 1)
-
-        return rrb.Blueprint(rrb.Horizontal(contents=columns, column_shares=shares))
+        return rrb.Blueprint(rrb.Horizontal(contents=columns))
 
     # ------------------------------------------------------------------
     # Static metadata
@@ -294,7 +289,7 @@ class EpisodeVisualizer:
                 if key not in self._state:
                     continue
                 arr = self._state[key]
-                # Skip 3D+ spatial data (logged in _log_3d instead)
+                # Skip 3D+ data (can't display as time series)
                 if arr.ndim > 2:
                     continue
                 base = self._series_origin(category, key)
@@ -321,9 +316,27 @@ class EpisodeVisualizer:
             ), static=True)
             logger.info("Camera pinhole logged (%dx%d)", w, h)
 
+        # ── Derived force series labels ──
+        _force_series = {
+            "hand_contact_mag": ("thumb", "index", "middle", "ring", "pinky"),
+            "hand_force_thumb": ("Fx", "Fy", "Fz"),
+            "hand_force_index": ("Fx", "Fy", "Fz"),
+        }
+        for fkey, labels in _force_series.items():
+            if fkey in self._state:
+                base = f"state/{fkey}"
+                for i, label in enumerate(labels):
+                    rr.log(f"{base}/{i}", rr.SeriesLine(name=label), static=True)
+
     @staticmethod
     def _series_origin(category: str, key: str) -> str:
-        """Entity path for a time-series dataset."""
+        """Entity path for a time-series dataset.
+
+        Arm and hand state are grouped under ``state/`` so the blueprint's
+        single ``TimeSeriesView(origin="state/<key>")`` collects both.
+        """
+        if category in ("arm", "hand"):
+            return f"state/{key}"
         return f"{category}/{key}"
 
     # ------------------------------------------------------------------
@@ -336,95 +349,8 @@ class EpisodeVisualizer:
         # Also set real time if timestamp dataset is available
         if "timestamp" in self._state:
             rr.set_time_seconds("time", float(self._state["timestamp"][step_idx]))
-        self._log_3d(step_idx)
         self._log_camera(step_idx)
         self._log_time_series(step_idx)
-
-    # ------------------------------------------------------------------
-    # 3D spatial logging
-    # ------------------------------------------------------------------
-
-    def _log_3d(self, step_idx: int) -> None:
-        s = self._state
-
-        # --- EEF transform (arm_ee: 9D = pos(3) + rot6d(6)) ---
-        if "arm_ee" in s:
-            ee = s["arm_ee"][step_idx]
-            pos, r6 = ee[:3], ee[3:9]
-            rr.log("world/arm_ee", rr.Transform3D(
-                mat3x3=self._rot6d_to_mat3x3(r6),
-                translation=pos,
-            ))
-
-        # --- VR wrist transform ---
-        if "vr_wrist_pos" in s and "vr_wrist_rot6d" in s:
-            vp = s["vr_wrist_pos"][step_idx]
-            vr6 = s["vr_wrist_rot6d"][step_idx]
-            rr.log("world/vr_wrist", rr.Transform3D(
-                mat3x3=self._rot6d_to_mat3x3(vr6),
-                translation=vp,
-            ))
-
-        # --- VR hand landmarks (21 points) ---
-        if "vr_landmarks" in s:
-            lm = s["vr_landmarks"][step_idx]  # (21, 3)
-            rr.log("world/vr_landmarks", rr.Points3D(
-                positions=lm,
-                radii=0.004,
-                colors=(100, 180, 255),
-            ))
-
-        # --- Fingertip positions ---
-        if "hand_fingertip" in s:
-            ft = s["hand_fingertip"][step_idx]  # (5, 3)
-            rr.log("world/fingertips", rr.Points3D(
-                positions=ft,
-                colors=self._FINGERTIP_COLORS,
-                radii=0.008,
-            ))
-
-        # --- Contact force arrows ---
-        if "hand_contact" in s and "hand_fingertip" in s:
-            ft = s["hand_fingertip"][step_idx]
-            contact = s["hand_contact"][step_idx]
-            rr.log("world/contact_force", rr.Arrows3D(
-                origins=ft,
-                vectors=self._scale_contact_vectors(contact),
-                colors=self._contact_colors(contact),
-                radii=0.002,
-            ))
-
-    @staticmethod
-    def _rot6d_to_mat3x3(r6: np.ndarray) -> np.ndarray:
-        """Convert a (6,) rot6d vector to a (3,3) rotation matrix.
-
-        Uses the project's own rot6d_to_quat_wxyz (which handles degenerate
-        cases) then converts to a matrix for Rerun's Transform3D.
-        """
-        q_wxyz = rot6d_to_quat_wxyz(np.asarray(r6, dtype=float))
-        q_xyzw = wxyz_to_xyzw(q_wxyz)
-        return Rotation.from_quat(q_xyzw).as_matrix()
-
-    @staticmethod
-    def _scale_contact_vectors(contact: np.ndarray) -> np.ndarray:
-        """Scale contact force vectors to fixed-length arrows (6 cm)."""
-        force_arrow_length = 0.06
-        norms = np.linalg.norm(contact, axis=1, keepdims=True)
-        unit = np.divide(contact, norms, out=np.zeros_like(contact, dtype=float), where=norms > 1e-12)
-        return unit * force_arrow_length
-
-    @staticmethod
-    def _contact_colors(contact: np.ndarray) -> np.ndarray:
-        """Color contact arrows by magnitude: green (low) -> red (high)."""
-        force_color_max = 100.0
-        magnitudes = np.linalg.norm(contact, axis=1)
-        t = np.clip(magnitudes / force_color_max, 0.0, 1.0)
-        colors = np.stack([
-            80 + 175 * t,
-            80 * (1.0 - t),
-            80 * (1.0 - t),
-        ], axis=1)
-        return colors.astype(np.uint8)
 
     # ------------------------------------------------------------------
     # Camera logging
@@ -454,7 +380,7 @@ class EpisodeVisualizer:
                 if key not in self._state:
                     continue
                 arr = self._state[key]
-                # Skip 3D+ spatial data (logged in _log_3d instead)
+                # Skip 3D+ data (can't display as time series)
                 if arr.ndim > 2:
                     continue
                 base = self._series_origin(category, key)
@@ -463,6 +389,13 @@ class EpisodeVisualizer:
                 else:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
+
+        # ── Derived force scalars (computed from 3-D hand_contact) ──
+        for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
+            if fkey in self._state:
+                arr = self._state[fkey]
+                for i in range(arr.shape[1]):
+                    rr.log(f"state/{fkey}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -473,10 +406,14 @@ class EpisodeVisualizer:
         return self._T
 
     def close(self) -> None:
-        """Release the HDF5 file handle."""
+        """Release the HDF5 file handle and finalise the Rerun recording."""
         if self._h5f is not None:
             self._h5f.close()
             self._h5f = None  # type: ignore[assignment]
+        try:
+            rr.disconnect()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

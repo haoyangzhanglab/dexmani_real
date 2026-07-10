@@ -57,14 +57,13 @@ from numcodecs import Blosc
 # Default observation / action keys to read from HDF5.
 # Maps HDF5 dataset path → target dimension per frame.
 _OBS_KEYS: list[tuple[str, int]] = [
-    ("obs/arm_qpos", 7),
-    ("obs/eef_pos", 3),
-    ("obs/eef_quat", 4),
-    ("obs/hand_qpos", 12),
+    ("arm_qpos", 7),
+    ("arm_ee", 9),
+    ("hand_qpos", 12),
 ]
 _ACTION_KEYS: list[tuple[str, int]] = [
-    ("action/arm_qpos", 7),
-    ("action/hand_qpos", 12),
+    ("action_arm_joint", 7),
+    ("action_hand_joint", 12),
 ]
 
 
@@ -163,7 +162,7 @@ def load_episodes(
                 continue
 
             with h5py.File(str(h5_path), "r") as f:
-                n_frames = f["obs/arm_qpos"].shape[0]
+                n_frames = f["arm_qpos"].shape[0]
                 valid = np.ones(n_frames, dtype=bool)
 
                 num_kept = int(np.sum(valid))
@@ -210,7 +209,7 @@ def load_episodes(
                 episode_lengths.append(num_kept)
                 episode_paths.append(h5_path)
 
-                total = f["obs/arm_qpos"].shape[0]
+                total = f["arm_qpos"].shape[0]
                 print(f"  {h5_path.name}: {num_kept}/{total} frames kept "
                       f"({100 * num_kept / max(total, 1):.1f}%)")
 

@@ -33,6 +33,8 @@ import sys
 import time
 from pathlib import Path
 
+import atexit
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import select
@@ -219,8 +221,8 @@ VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 EMA_ALPHA_POS = 0.6
 EMA_ALPHA_ROT = 0.3
 
-# Mode 1 position servo (default) — inner loop interpolates 50→125Hz,
-# firmware handles trapezoidal velocity profiling with configurable speed/mvacc.
+# Mode 6 online trajectory planning (default) — no inner-loop interpolation,
+# firmware trajectory planner respects speed/accel limits (90°/s, 500°/s²).
 _INNER_CFG = ArmInnerLoopConfig()
 
 
@@ -337,7 +339,7 @@ def main():
         vr_receiver.stop()
         return
 
-    # ── 5. ArmInnerLoop (250Hz position servo) ──
+    # ── 5. ArmInnerLoop (50Hz online trajectory planning) ──
     arm_inner = ArmInnerLoop(cfg=_INNER_CFG)
     arm_inner.start()
     print("Arm 内环线程启动中...")
@@ -347,7 +349,7 @@ def main():
         print("Arm 内环线程启动超时，降级为直接读取")
         arm_qpos = None
     else:
-        print("Arm 内环线程已就绪 (250Hz position servo)")
+        print("Arm 内环线程已就绪 (50Hz online trajectory planning)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
     if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
@@ -390,6 +392,7 @@ def main():
     # ── 8. Keyboard ──
     kb = TermiosKeyboard()
     kb.start()
+    atexit.register(kb.stop)
 
     # ── 9. 等待 VR 首帧 ──
     print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
@@ -478,9 +481,7 @@ def main():
         running = False
 
     # ── Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
-    # 用 SharedMemory (CameraRingBuffer) 替代 mp.Queue: 无容量上限, 无 queue.Full 风险.
-    # 对标 ManiUniCon SharedMemoryRingBuffer 架构.
-    camera = CameraProcess(CameraProcessConfig(camera_name="realsense", hz=30.0, use_shm=True))
+    camera = CameraProcess(CameraProcessConfig(camera_name="realsense", hz=30.0))
     if camera.start():
         print("Camera 进程已启动 (RealSense @30Hz, SHM)")
     else:

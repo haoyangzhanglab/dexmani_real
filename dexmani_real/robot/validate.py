@@ -30,6 +30,8 @@ def validate_action(
     Checks (fail-fast order):
       1. SDK error state (arm + hand is_error)
       2. Arm connection
+      3. Arm joint-limit clipping (qpos_min/max)
+      4. Hand joint-limit clipping (qpos_min/max)
 
     Returns (ok, reason_string).
     """
@@ -40,5 +42,16 @@ def validate_action(
     # 2. Arm connection
     if not robot.arm.is_connected():
         return False, "arm not connected"
+
+    # 3. Joint-limit clipping (arm)
+    arm_lo = robot.arm.config.qpos_min
+    arm_hi = robot.arm.config.qpos_max
+    action.arm_qpos_cmd[:] = np.clip(action.arm_qpos_cmd, arm_lo, arm_hi)
+
+    # 4. Joint-limit clipping (hand)
+    hand_lo = robot.hand.config.qpos_min
+    hand_hi = robot.hand.config.qpos_max
+    if action.hand_qpos_cmd is not None:
+        action.hand_qpos_cmd[:] = np.clip(action.hand_qpos_cmd, hand_lo, hand_hi)
 
     return True, "ok"

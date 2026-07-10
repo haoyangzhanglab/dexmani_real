@@ -18,7 +18,7 @@
     ESC        急停 (emergency_stop + 退出)
 
 共享组件:
-    ArmInnerLoop   — 250Hz 位置伺服内环线程 (robot/inner_loop.py)
+    ArmInnerLoop   — 内环线程 (robot/inner_loop.py, 50Hz/125Hz by mode)
     PreFlight      — 硬件就绪检查 (robot/preflight.py)
     RateLimiter    — 补偿式频率限制 (utils/rate_limiter.py)
     RobotInterface — arm/hand 统一接口 (robot/interface.py)
@@ -73,8 +73,8 @@ DELTA_RPY = 0.02         # 每次按键 EEF 旋转量 (rad)
 EMA_ALPHA_POS = 0.8      # Cartesian EMA 位置平滑 (1.0=直通, 0.8=低延迟)
 EMA_ALPHA_ROT = 0.4      # Cartesian EMA 姿态平滑 (1.0=直通, 0.4=强滤波去抖动)
 
-# Mode 1 position servo (default) — firmware handles trapezoidal velocity profiling
-# with configurable speed/mvacc; inner loop interpolates 50→200Hz for smooth motion.
+# Mode 6 online trajectory planning — firmware replans trajectory with
+# configurable speed/acc limits. No inner-loop interpolation.
 INNER_LOOP_CFG = ArmInnerLoopConfig()
 HOME_DT = 0.04           # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，减半保安全)
 
@@ -285,7 +285,7 @@ def main():
         print("Arm 内环线程启动超时，降级为直接读取")
         arm_qpos = None
     else:
-        print("Arm 内环线程已就绪 (250Hz position servo)")
+        print("Arm 内环线程已就绪 (50Hz online trajectory planning, passthrough)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
     if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):

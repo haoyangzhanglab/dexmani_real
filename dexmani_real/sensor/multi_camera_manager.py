@@ -55,7 +55,7 @@ class MultiCameraManager:
     """Manages multiple camera processes with shared memory.
 
     Each camera has:
-      - A CameraProcess (with use_shm=True)
+      - A CameraProcess (with shared memory)
       - A named SharedMemoryRingBuffer
       - A health status
     """
@@ -83,7 +83,6 @@ class MultiCameraManager:
             # Ensure shared memory mode is enabled and names are unique
             if isinstance(cam_config, CameraProcessConfig):
                 c = cam_config
-                c.use_shm = True
                 if not c.shm_name or c.shm_name == "dexmani_cam_0":
                     c.shm_name = f"dexmani_cam_{i}"
             else:
@@ -94,7 +93,6 @@ class MultiCameraManager:
                     hz=getattr(cam_config, "hz", 30.0),
                     warmup_frames=getattr(cam_config, "warmup_frames", 10),
                     timeout_ms=getattr(cam_config, "timeout_ms", 1000),
-                    use_shm=True,
                     shm_name=f"dexmani_cam_{i}",
                 )
 

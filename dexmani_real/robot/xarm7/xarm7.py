@@ -1,8 +1,10 @@
 """xArm7 7-DOF robot arm hardware driver — thin wrapper for blocking moves.
 
-Control mode: position servo via set_servo_angle_j (blocking moves only: reset, home).
-Teleop arm position servo is handled by ArmInnerLoop (robot/inner_loop.py), which
-runs as an in-process daemon thread with its own XArmAPI connection.
+Control mode: position servo via set_servo_angle_j (Mode 1) for blocking moves
+(reset, return-to-home waypoints). Teleop arm control uses ArmInnerLoop with
+Mode 6 (joint online trajectory planning, set_servo_angle, firmware trajectory
+planner). The two use independent XArmAPI connections — XArm7 for blocking moves,
+ArmInnerLoop for continuous teleop.
 
 This class is a thin hardware wrapper — no inner threads, no PID, no velocity mode.
 """
@@ -129,8 +131,9 @@ class XArm7(ConnectionStateMixin):
 
         Unlike :meth:`robot_init`, this does NOT call ``_set_mode(1)``, so it is
         safe to call while an :class:`ArmInnerLoop` is running in velocity-control
-        mode (mode 4).  Switching the global arm firmware mode underneath the
-        inner loop would cause its ``vc_set_joint_velocity`` calls to fail,
+        mode (mode 4) or online trajectory planning mode (mode 6).  Switching the
+        global arm firmware mode underneath the inner loop would cause its
+        ``vc_set_joint_velocity`` / ``set_servo_angle`` calls to fail,
         forcing an unnecessary emergency stop.
 
         After a C31/C32 collision the arm disables motion; ``motion_enable(True)``
@@ -258,7 +261,7 @@ class XArm7(ConnectionStateMixin):
             is_radian=True,
             wait=True,
         )
-        self._set_mode(1)  # back to position servo
+        # Mode left at 0 — send_action() will set Mode 1 on first use.
 
         state = self.get_state()
         if np.all(np.isfinite(state["qpos"])):
@@ -290,14 +293,18 @@ class XArm7(ConnectionStateMixin):
     # ── Init ──
 
     def robot_init(self) -> None:
-        """Full initialization sequence for the xArm7 controller."""
+        """Full initialization sequence for the xArm7 controller.
+
+        Does NOT set a control mode — the mode is set on first use by
+        :meth:`send_action` (Mode 1 for blocking moves) or by
+        :class:`ArmInnerLoop` (Mode 6 for teleop).
+        """
         if self.arm is None:
             return
 
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(True)
-        self._set_mode(1)  # position servo mode
         self._configure_collision_params()
 
         _, err_warn = self.arm.get_err_warn_code()

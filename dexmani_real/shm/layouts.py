@@ -134,7 +134,7 @@ def camera_frame_to_bytes(frame: dict) -> tuple[np.ndarray, np.ndarray]:
     header["frame_number"] = np.uint64(frame.get("frame_id", 0))
 
     rgb_raw = frame.get("rgb")
-    depth_raw = frame.get("depth")
+    depth_raw = frame.get("depth_raw")
     if rgb_raw is None or depth_raw is None:
         raise ValueError(
             "camera_frame_to_bytes: 'rgb' and 'depth' must not be None. "

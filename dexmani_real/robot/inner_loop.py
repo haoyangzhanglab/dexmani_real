@@ -1,28 +1,29 @@
-"""ArmInnerLoop — 125Hz inner loop thread running in the same process as the controller.
+"""ArmInnerLoop — in-process inner loop thread (50Hz) for xArm7 control.
 
-Supports two control modes (configurable):
+Default and only control mode is Mode 6 (joint online trajectory planning). The firmware
+performs online trajectory replanning with configurable speed and acceleration limits that
+ARE respected. No inner-loop interpolation is needed — the target is forwarded directly and
+the firmware handles all trajectory smoothing. Effectively dissolves the inner/outer loop
+distinction.
 
-  Mode 1 (default): Position servo — time-driven linear interpolation between outer-loop
-    targets (50Hz → 125Hz), then forwards to arm.set_servo_angle_j() with configurable
-    speed/mvacc. Arm firmware handles PID, trapezoidal velocity profiling, and joint
-    limit enforcement internally at kHz rate. This is the recommended mode for teleop.
-
-  Mode 4: Velocity control — user-space PID converts position error → velocity,
-    then sends to arm.vc_set_joint_velocity(). Full control over PID gains,
-    jerk/accel limiting, anti-windup. Ref: BunnyVisionPro _internal_control_arm_qpos().
+Mode 6: Joint online trajectory planning — forwards targets directly to
+  arm.set_servo_angle(wait=False) at 50Hz. Firmware respects speed/accel limits
+  (default: 90°/s, 500°/s²). Smooth motion, no desk vibration. Requires firmware >= 1.10.0.
 
 Architecture:
-    Main Thread (50Hz)                     Inner Loop Thread (125Hz)
-    ──────────────────                     ─────────────────────────
+    Main Thread (50Hz)                     Inner Loop Thread (50Hz)
+    ──────────────────                     ───────────────────────
     inner.set_target(cmd)    ──Lock──→     self._arm_target
     qpos, err, ts = get_state()  ←──Lock── self._arm_qpos, _error_state
+                                           passthrough → set_servo_angle(wait=False)
+                                           firmware handles all trajectory planning
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,75 +33,8 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
-from dexmani_real.utils.signal_utils import limit_jerk
 
 logger = get_logger(__name__)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PID Controller (ref: BunnyVisionPro xarm7_ability.py:11-36)
-# ═══════════════════════════════════════════════════════════════════
-
-
-class PIDController:
-    """Per-joint independent PID controller with anti-windup.
-
-    Gains are (7,) arrays — one per joint. Integral term is clamped
-    to ``windup_limit`` × max_velocity to prevent unbounded accumulation
-    when velocity output is saturated.
-
-    Ref: BunnyVisionPro PIDController (no anti-windup in original; added here).
-    """
-
-    def __init__(
-        self,
-        kp: np.ndarray,
-        ki: np.ndarray | None = None,
-        kd: np.ndarray | None = None,
-        windup_limit: float = 0.3,
-    ) -> None:
-        self.kp = np.asarray(kp, dtype=np.float64)
-        self.ki = np.asarray(ki, dtype=np.float64) if ki is not None else np.zeros_like(self.kp)
-        self.kd = np.asarray(kd, dtype=np.float64) if kd is not None else np.zeros_like(self.kp)
-        self._windup_limit = float(windup_limit)
-        self._prev_err: np.ndarray | None = None
-        self._cum_err: np.ndarray = np.zeros_like(self.kp)
-
-    def reset(self) -> None:
-        self._prev_err = None
-        self._cum_err = np.zeros_like(self.kp)
-
-    def control(self, err: np.ndarray, dt: float, max_output: np.ndarray | None = None) -> np.ndarray:
-        """Compute PID output from position error.
-
-        Args:
-            err: (7,) position error (target - current) in radians.
-            dt: Time step in seconds.
-            max_output: (7,) per-joint max output magnitude (for anti-windup clamping).
-                        If None, no clamping is applied.
-
-        Returns:
-            (7,) velocity command in rad/s.
-        """
-        err = np.asarray(err, dtype=np.float64)
-        if self._prev_err is None:
-            self._prev_err = err.copy()
-
-        # Proportional + derivative (derivative-on-error)
-        value = (
-            self.kp * err
-            + self.kd * (err - self._prev_err) / dt
-            + self.ki * self._cum_err
-        )
-
-        # Anti-windup: clamp integral when output is near saturation
-        self._cum_err += dt * err
-        if max_output is not None:
-            windup_bound = self._windup_limit * max_output
-            self._cum_err = np.clip(self._cum_err, -windup_bound, windup_bound)
-
-        self._prev_err = err.copy()
-        return value
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -110,56 +44,28 @@ class PIDController:
 
 @dataclass
 class ArmInnerLoopConfig:
-    """Configuration for ArmInnerLoop.
+    """Configuration for ArmInnerLoop (Mode 6: joint online trajectory planning).
 
     Attributes:
-        control_mode: 1 = position servo (set_servo_angle_j, default), 4 = velocity
-                      control (vc_set_joint_velocity + user-space PID).
-        servo_speed: Max joint speed (rad/s) for mode 1 set_servo_angle_j.
-                     Safety upper bound; teleop rarely reaches this because
-                     per-tick deltas are small (Δθ ~0.3-1.0°). Default 2.0 rad/s.
-        servo_acc: Max joint acceleration (rad/s²) for mode 1 set_servo_angle_j.
-                   Dominant parameter for responsiveness — the arm is
-                   acceleration-limited for all typical teleop step sizes.
-                   Default 12 rad/s².
-        interpolate: Enable time-driven linear interpolation between outer-loop
-                     targets (50Hz → 125Hz). Splits each 20ms step into ~2-3 micro-steps
-                     for smoother firmware trajectory replanning. Default True.
-        outer_loop_period: Outer loop period in seconds, used to compute interpolation
-                           alpha (= target_age / outer_loop_period). Default 0.02 (50Hz).
-        dt: Inner loop timestep in seconds. Default 1/125 = 8ms (125Hz).
-        kp, ki, kd: Per-joint PID gains (7,). Only used in mode 4.
-        max_velocity: Per-joint max velocity (rad/s). Only used in mode 4.
-        max_jerk: Per-joint max jerk (rad/s³). Only used in mode 4.
+        joint_max_speed: Max joint speed (rad/s). Respected by firmware trajectory
+                         planner. Default 90°/s (≈1.57 rad/s).
+        joint_max_acc: Max joint acceleration (rad/s²). Respected by firmware
+                       trajectory planner. Default 500°/s² (≈8.73 rad/s²).
+        loop_period: Inner loop period in seconds. Default 0.02 (50Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
+        synchronized: Two-phase handshake for policy inference (default False).
     """
 
-    control_mode: int = 1
-    # Mode 1 parameters
-    servo_speed: float = 2.0
-    servo_acc: float = 12.0
-    interpolate: bool = True
-    outer_loop_period: float = 0.02
-    # Mode 4 parameters (retained for fallback)
-    kp: np.ndarray = field(default_factory=lambda: np.array([10.0, 10.0, 5.0, 5.0, 5.0, 5.0, 5.0]))
-    ki: np.ndarray = field(default_factory=lambda: np.zeros(7))
-    kd: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.5, 0.25, 0.25, 0.25, 0.25, 0.25]))
-    max_velocity: np.ndarray = field(default_factory=lambda: np.array([1.2, 1.0, 1.2, 1.5, 1.5, 1.0, 1.5]))
-    max_jerk: np.ndarray | None = None
+    # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
+    joint_max_speed: float = 1.5708   # 90°/s in rad/s
+    joint_max_acc: float = 8.7266     # 500°/s² in rad/s²
+    loop_period: float = 0.02         # 50Hz
     # Shared
     target_timeout_s: float = 0.2
 
     # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
     # hardware write and waits for policy_ready before the next target dispatch.
     synchronized: bool = False
-
-    def __post_init__(self):
-        self.kp = np.asarray(self.kp, dtype=np.float64).ravel()[:7]
-        self.ki = np.asarray(self.ki, dtype=np.float64).ravel()[:7]
-        self.kd = np.asarray(self.kd, dtype=np.float64).ravel()[:7]
-        self.max_velocity = np.asarray(self.max_velocity, dtype=np.float64).ravel()[:7]
-        if self.max_jerk is not None:
-            self.max_jerk = np.asarray(self.max_jerk, dtype=np.float64).ravel()[:7]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -168,15 +74,19 @@ class ArmInnerLoopConfig:
 
 
 class ArmInnerLoop:
-    """125Hz inner loop thread — owns the XArmAPI connection.
+    """50Hz inner loop thread — owns the XArmAPI connection, runs Mode 6.
 
     Runs in the same process as the controller. Communicates via
     Lock-protected shared variables (no SHM/IPC overhead).
 
+    Mode 6 (joint online trajectory planning): the firmware performs online
+    trajectory replanning with configurable speed/accel limits. The inner loop
+    forwards targets directly — no interpolation, no PID.
+
     Parameters:
         ip: XArm controller IP address.
-        dt: Inner loop period in seconds (default 1/125 = 8ms).
-        cfg: Inner loop configuration (control mode, servo params, PID gains).
+        dt: (deprecated) Inner loop period — unused in Mode 6; kept for API compat.
+        cfg: Inner loop configuration (speed/accel limits, loop period, timeout).
     """
 
     def __init__(
@@ -187,7 +97,7 @@ class ArmInnerLoop:
         sync: SharedSyncPrimitives | None = None,
     ) -> None:
         self._ip = ip
-        self._dt = float(dt)
+        self._dt = float(dt)  # kept for API compat; unused in Mode 6
         self._cfg = cfg or ArmInnerLoopConfig()
         self._sync = sync
 
@@ -197,9 +107,6 @@ class ArmInnerLoop:
         self._target_ts: float = 0.0
         self._arm_qpos: np.ndarray = np.zeros(7, dtype=np.float64)
         self._error_state: bool = False
-
-        # ── Mode 4 PID controller (created on start) ──
-        self._pid: PIDController | None = None
 
         # ── Lifecycle ──
         self._stop_event = threading.Event()
@@ -230,10 +137,6 @@ class ArmInnerLoop:
     @property
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
-
-    @property
-    def control_mode(self) -> int:
-        return self._cfg.control_mode
 
     # ── Lifecycle ──
 
@@ -282,34 +185,26 @@ class ArmInnerLoop:
                 self._error_state = True
             return
 
-        mode = self._cfg.control_mode
         try:
             arm.clean_error()
             arm.clean_warn()
             arm.motion_enable(True)
-            self._init_mode(arm, mode)
+            self._init_mode(arm)
             arm.set_collision_sensitivity(1)
 
-            # Verify arm entered the requested mode
+            # Verify arm entered mode 6
             actual_mode = getattr(arm, 'mode', -1)
-            if actual_mode != mode:
+            if actual_mode != 6:
                 logger.warning(
-                    "ArmInnerLoop: arm mode=%d but expected %d — re-initializing",
-                    actual_mode, mode,
+                    "ArmInnerLoop: arm mode=%d but expected 6 — re-initializing", actual_mode,
                 )
-                self._init_mode(arm, mode)
+                self._init_mode(arm)
                 actual_mode = getattr(arm, 'mode', -1)
-                if actual_mode != mode:
-                    logger.error("ArmInnerLoop: failed to set mode %d (arm mode=%d)", mode, actual_mode)
+                if actual_mode != 6:
+                    logger.error("ArmInnerLoop: failed to set mode 6 (arm mode=%d)", actual_mode)
                     with self._lock:
                         self._error_state = True
                     return
-
-            # Init PID for mode 4 only
-            if mode == 4:
-                self._pid = PIDController(
-                    kp=self._cfg.kp, ki=self._cfg.ki, kd=self._cfg.kd,
-                )
 
             # Read initial position
             code, states = arm.get_joint_states(is_radian=True, num=1)
@@ -326,32 +221,18 @@ class ArmInnerLoop:
 
             last_target_ts: float = 0.0
             last_valid_qpos: np.ndarray = current_qpos.copy()
-            limiter = RateLimiter(1.0 / self._dt)
 
-            # For mode 4: track previous velocity + acceleration for limiting
-            prev_qvel: np.ndarray | None = np.zeros(7, dtype=np.float64) if mode == 4 else None
-            prev_qacc: np.ndarray | None = np.zeros(7, dtype=np.float64) if (mode == 4 and self._cfg.max_jerk is not None) else None
+            inner_dt = self._cfg.loop_period
+            freq_hz = int(round(1.0 / inner_dt))
+            limiter = RateLimiter(float(freq_hz))
 
-            # Mode 1 interpolation state — time-driven linear interpolation between
-            # consecutive outer-loop targets. Splits each 20ms step into 4 micro-steps
-            # (at 125Hz dt=8ms) for smoother firmware trajectory replanning.
-            prev_target: np.ndarray | None = None
-            curr_target: np.ndarray | None = None
-            target_age: float = float(self._cfg.outer_loop_period)  # > period → first tick sends current target verbatim
-            interpolate = (mode == 1 and self._cfg.interpolate)
-
-            # Build mode label
-            freq_hz = int(round(1.0 / self._dt))
-            if mode == 1:
-                parts = ["position servo", f"speed={self._cfg.servo_speed:.1f}rad/s", f"acc={self._cfg.servo_acc:.0f}rad/s²"]
-                if interpolate:
-                    parts.append(f"interp@{freq_hz}Hz")
-            else:
-                parts = ["velocity control + PID"]
-                if self._cfg.max_jerk is not None:
-                    parts.append("jerk limit")
-            mode_label = ", ".join(parts)
-            logger.info("ArmInnerLoop: %dHz started (mode %d: %s)", freq_hz, mode, mode_label)
+            logger.info(
+                "ArmInnerLoop: %dHz started (mode 6: online trajectory planning, "
+                "speed=%.0f°/s, acc=%.0f°/s², no interp — firmware handles planning)",
+                freq_hz,
+                float(np.degrees(self._cfg.joint_max_speed)),
+                float(np.degrees(self._cfg.joint_max_acc)),
+            )
             self._ready_event.set()
 
             while not self._stop_event.is_set():
@@ -364,20 +245,12 @@ class ArmInnerLoop:
 
                 now = time.perf_counter()
 
-                # ── 2. Timeout → hold (both modes) ──
+                # ── 2. Timeout → hold ──
                 # Skip timeout during startup: if no target has ever been received
                 # (last_target_ts==0), the main thread is still initializing.
                 no_target_yet = (last_target_ts == 0.0)
                 if not no_target_yet and (target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)):
-                    if mode == 4:
-                        self._send_zero_velocity(arm)
-                    else:
-                        self._hold_position(arm)
-                    # Reset interpolation on timeout so the next real target
-                    # starts from the current held position.
-                    prev_target = None
-                    curr_target = None
-                    target_age = float(self._cfg.outer_loop_period)
+                    self._hold_position(arm)
                     self._signal_ready_only()
                     continue
 
@@ -386,18 +259,17 @@ class ArmInnerLoop:
 
                 last_target_ts = target_ts
 
-                # ── 3. NaN guard ──
+                # ── 3. NaN guard — hold last valid position ──
                 if not np.all(np.isfinite(target)):
-                    if mode == 4:
-                        self._send_zero_velocity(arm)
-                    else:
-                        try:
-                            arm.set_servo_angle_j(
-                                angles=last_valid_qpos.tolist(), is_radian=True,
-                                speed=self._cfg.servo_speed, mvacc=self._cfg.servo_acc,
-                            )
-                        except (RuntimeError, OSError):
-                            pass
+                    try:
+                        arm.set_servo_angle(
+                            angle=last_valid_qpos.tolist(), is_radian=True,
+                            speed=self._cfg.joint_max_speed,
+                            mvacc=self._cfg.joint_max_acc,
+                            wait=False,
+                        )
+                    except (RuntimeError, OSError):
+                        pass
                     continue
 
                 last_valid_qpos = target[:7].copy()
@@ -434,40 +306,10 @@ class ArmInnerLoop:
                             self._arm_qpos = current_qpos
                             self._error_state = False
 
-                # ── 5. Interpolation (mode 1) — time-driven linear ──
-                # Linear interpolation: constant-velocity micro-steps between
-                # consecutive outer-loop targets.  The arm NEVER reaches the
-                # micro-step target within one 8ms tick (mvacc-limited: a
-                # 0.005 rad step takes ~17ms @ 12 rad/s²), so the firmware is always in
-                # the acceleration phase, tracking a moving target at near-
-                # constant acceleration → minimal reaction-force oscillation.
-                #
-                # Smoothstep was intentionally REMOVED: its zero-velocity-at-
-                # boundaries forces a decel-reaccel cycle within each 20ms
-                # segment, creating 50Hz jerk that excites desk structural modes.
-                if interpolate:
-                    # Detect target change → advance interpolation window
-                    if curr_target is None or not np.array_equal(target, curr_target):
-                        prev_target = curr_target.copy() if curr_target is not None else target.copy()
-                        curr_target = target.copy()
-                        target_age = 0.0
+                # ── 5. Forward target → firmware trajectory planner ──
+                self._send_target(arm, target)
 
-                    target_age += self._dt
-                    alpha = min(target_age / self._cfg.outer_loop_period, 1.0)
-                    if prev_target is not None:
-                        interp_target = prev_target + alpha * (curr_target - prev_target)
-                    else:
-                        interp_target = curr_target
-                else:
-                    interp_target = target
-
-                # ── 6. Send command ──
-                if mode == 4:
-                    self._tick_mode4(arm, target, current_qpos, prev_qvel, prev_qacc)
-                else:
-                    self._tick_mode1(arm, interp_target)
-
-                # ── 7. Sync handshake (after hardware write) ──
+                # ── 6. Sync handshake (after hardware write) ──
                 self._signal_ready_and_sync()
 
         except Exception:
@@ -476,46 +318,39 @@ class ArmInnerLoop:
                 self._error_state = True
         finally:
             self._ready_event.clear()
-            # Mode 4: send zero velocity before disconnecting.
-            # Mode 1: firmware holds last position, no explicit stop needed.
-            try:
-                if mode == 4 and getattr(arm, 'error_code', 0) == 0:
-                    arm.vc_set_joint_velocity(np.zeros(7, dtype=np.float64).tolist(), is_radian=True)
-            except Exception:
-                pass
+            # Mode 6: firmware holds last position on disconnect, no explicit stop needed.
             try:
                 arm.disconnect()
             except Exception:
                 pass
             logger.info("ArmInnerLoop: stopped")
 
-    # ── Mode 1: Position Servo ──
+    # ── Command dispatch ──
 
-    def _tick_mode1(self, arm, target: np.ndarray) -> None:
-        """Mode 1: forward target position → set_servo_angle_j().
+    def _send_target(self, arm, target: np.ndarray) -> None:
+        """Forward target position → set_servo_angle(wait=False).
 
-        Firmware executes a trapezoidal velocity profile from current encoder
-        position to target, bounded by ``servo_speed`` (max joint velocity) and
-        ``servo_acc`` (max joint acceleration). At 125 Hz with interpolation,
-        per-tick micro-steps are ~0.5-1.0° — well within the acceleration-limited
-        regime, so the arm is always in smooth transient motion.
+        Joint online trajectory planning (Mode 6). The firmware performs online
+        trajectory replanning from the current state when each new command arrives.
+        Speed and acceleration limits ARE respected by the firmware trajectory planner.
+
+        No inner-loop interpolation — the target is forwarded directly and the
+        firmware handles all trajectory smoothing.
         """
         try:
-            code = arm.set_servo_angle_j(
-                angles=target[:7].tolist(), is_radian=True,
-                speed=self._cfg.servo_speed,
-                mvacc=self._cfg.servo_acc,
+            code = arm.set_servo_angle(
+                angle=target[:7].tolist(), is_radian=True,
+                speed=self._cfg.joint_max_speed,
+                mvacc=self._cfg.joint_max_acc,
+                wait=False,
             )
         except (RuntimeError, OSError) as e:
-            logger.error("ArmInnerLoop: set_servo_angle_j failed: %s", e)
+            logger.error("ArmInnerLoop: set_servo_angle failed: %s", e)
             with self._lock:
                 self._error_state = True
             return
 
         if code != 0:
-            # Attempt to capture the controller-level error code for diagnostics.
-            # SDK command-response code=1 (ERR_CODE) means "has uncleared error"
-            # but the report-stream error_code may be 0 (race / transient).
             err_code = -1
             warn_code = -1
             try:
@@ -526,126 +361,67 @@ class ArmInnerLoop:
             except (RuntimeError, OSError, ValueError, IndexError):
                 pass
             logger.error(
-                "ArmInnerLoop: set_servo_angle_j code=%d, controller error=%d, warn=%d",
+                "ArmInnerLoop: set_servo_angle code=%d, controller error=%d, warn=%d",
                 code, err_code, warn_code,
             )
             with self._lock:
                 self._error_state = True
 
-    # ── Mode 4: Velocity Control + User-Space PID ──
-
-    def _tick_mode4(
-        self, arm, target: np.ndarray, current_qpos: np.ndarray, prev_qvel: np.ndarray | None, prev_qacc: np.ndarray | None = None
-    ) -> None:
-        """Mode 4: PID(position error) → velocity → vc_set_joint_velocity().
-
-        Multi-stage output limiting (in order):
-          1. PID: position error → raw velocity
-          2. Velocity clipping (per-joint max)
-          3. Jerk limiting (rate-of-change of accel, optional, ref: limit_jerk)
-
-        Ref: BunnyVisionPro _internal_control_arm_qpos() lines 223-228.
-             LeFranX Ruckig jerk-limited OTG concept.
-        """
-        # 1. PID: position error → velocity
-        error = target - current_qpos
-        qvel = self._pid.control(error, self._dt, max_output=self._cfg.max_velocity)
-
-        # 2. Clip to max velocity
-        qvel = self._clip_velocity(qvel, self._cfg.max_velocity)
-
-        # 3. Optional jerk limiting (ref: signal_utils.limit_jerk)
-        if self._cfg.max_jerk is not None and prev_qvel is not None:
-            qvel, updated_acc = limit_jerk(
-                qvel, prev_qvel, prev_qacc, self._dt,
-                max_jerk=float(np.min(self._cfg.max_jerk)),
-            )
-            if prev_qacc is not None:
-                prev_qacc[:] = updated_acc
-
-        # Track previous velocity (after all limiting)
-        if prev_qvel is not None:
-            prev_qvel[:] = qvel
-
-        # Send velocity command
-        try:
-            code = arm.vc_set_joint_velocity(qvel.tolist(), is_radian=True)
-        except (RuntimeError, OSError) as e:
-            logger.error("ArmInnerLoop: vc_set_joint_velocity failed: %s", e)
-            with self._lock:
-                self._error_state = True
-            return
-
-        if code != 0:
-            # code=1 on all-zero speeds is benign (arm already stopped, SDK rejects no-op).
-            # code=1 on non-zero speeds suggests a mode mismatch or transient error.
-            is_zero_vel = bool(np.all(np.abs(qvel) < 1e-9))
-            if code == 1 and is_zero_vel:
-                logger.debug("ArmInnerLoop: vc_set_joint_velocity code=1 (zero vel, benign)")
-            elif code == 1:
-                logger.warning("ArmInnerLoop: vc_set_joint_velocity code=1 (non-zero vel, mode issue?)")
-            else:
-                logger.error("ArmInnerLoop: vc_set_joint_velocity code=%d", code)
-                with self._lock:
-                    self._error_state = True
-
     # ── Helpers ──
 
     def _hold_position(self, arm) -> None:
-        """Read current position and re-send as hold command (mode 1)."""
+        """Read current position and re-send as hold command via set_servo_angle."""
         try:
             code, states = arm.get_joint_states(is_radian=True, num=1)
             if code == 0 and len(states) > 0:
                 hold = np.asarray(states[0], dtype=np.float64)[:7]
                 if np.all(np.isfinite(hold)):
-                    arm.set_servo_angle_j(
-                        angles=hold.tolist(), is_radian=True,
-                        speed=self._cfg.servo_speed, mvacc=self._cfg.servo_acc,
+                    arm.set_servo_angle(
+                        angle=hold.tolist(), is_radian=True,
+                        speed=self._cfg.joint_max_speed,
+                        mvacc=self._cfg.joint_max_acc,
+                        wait=False,
                     )
         except (RuntimeError, OSError):
             pass
 
-    @staticmethod
-    def _send_zero_velocity(arm) -> None:
-        """Send zero velocity to stop arm (mode 4)."""
-        try:
-            arm.vc_set_joint_velocity(np.zeros(7, dtype=np.float64).tolist(), is_radian=True)
-        except (RuntimeError, OSError):
-            pass
+    def _init_mode(self, arm) -> None:
+        """Transition arm to Mode 6 (joint online trajectory planning).
 
-    @staticmethod
-    def _clip_velocity(qvel: np.ndarray, max_vel: np.ndarray) -> np.ndarray:
-        """Clip each joint independently to its own max velocity.
-
-        Per-joint clamping (vs proportional scaling): each joint is limited to
-        its own max_vel without slowing down other joints.  Proportional scaling
-        (dividing all joints by max_overshot) couples joint motions — the
-        bottleneck joint drags down every other joint, distorting the Cartesian
-        path because the FK of a scaled joint-space vector is not the same as
-        the FK of the un-scaled vector.  Per-joint clamping preserves the
-        full speed of non-bottleneck joints, producing a Cartesian path closer
-        to the IK-intended straight line.
-
-        Ref: ManiUniCon filter.py:185-188 — per-joint velocity limiting.
+        Requires firmware >= 1.10.0. Logs a warning if the firmware version
+        cannot be parsed or is below the minimum.
         """
-        clipped = np.clip(qvel, -max_vel, max_vel)
-        if not np.array_equal(clipped, qvel):
-            bottleneck = int(np.argmax(np.abs(qvel) - max_vel))
-            logger.debug(
-                "Vel clip: joint-%d exceeded limit (%.3f / %.3f rad/s)",
-                bottleneck + 1,
-                float(qvel[bottleneck]),
-                float(max_vel[bottleneck]),
-            )
-        return clipped
+        # Check firmware version (Mode 6 requires >= 1.10.0)
+        try:
+            code, ver_str = arm.get_version()
+            if code == 0 and ver_str:
+                # Parse "v1.18.4" or "1.18.4" format
+                ver_clean = ver_str.lstrip("vV")
+                parts = ver_clean.split(".")
+                if len(parts) >= 2:
+                    major, minor = int(parts[0]), int(parts[1])
+                    if major < 1 or (major == 1 and minor < 10):
+                        logger.warning(
+                            "ArmInnerLoop: firmware %s is below Mode 6 minimum (1.10.0). "
+                            "Mode 6 may not work correctly.",
+                            ver_str,
+                        )
+                    else:
+                        logger.info("ArmInnerLoop: firmware %s OK (>= 1.10.0 required)", ver_str)
+        except Exception:
+            logger.warning("ArmInnerLoop: could not check firmware version — assuming >= 1.10.0")
 
-    @staticmethod
-    def _init_mode(arm, mode: int) -> None:
-        """Transition arm to target control mode via idle intermediate state."""
         arm.set_mode(0)
         arm.set_state(0)
         time.sleep(0.05)
-        arm.set_mode(mode)
+        arm.set_mode(6)
         arm.set_state(0)
         time.sleep(0.05)
         arm.set_state(0)
+        # Set firmware-level joint acceleration limit (respected by Mode 6
+        # trajectory planner).
+        arm.set_joint_maxacc(self._cfg.joint_max_acc, is_radian=True)
+        logger.info(
+            "ArmInnerLoop: set_joint_maxacc=%s rad/s² (%.0f°/s²)",
+            self._cfg.joint_max_acc, round(float(np.degrees(self._cfg.joint_max_acc))),
+        )

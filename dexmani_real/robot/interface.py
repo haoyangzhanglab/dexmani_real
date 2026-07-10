@@ -3,7 +3,7 @@
 Controllers operate hardware exclusively through RobotInterface, never calling
 XArm7/XHand directly.
 
-Arm position servo is handled by ArmInnerLoop (in-process 250Hz daemon thread).
+Arm position servo is handled by ArmInnerLoop (in-process 50Hz daemon thread, mode 6).
 interface.py handles hand commands and blocking arm moves (reset, home).
 """
 

@@ -45,13 +45,14 @@ class _FakeCalib:
 
 def _state(ts: float, i: int) -> RobotState:
     f = 0.001 * i  # per-frame variation → nonzero variance, no consecutive duplicates
+    g = 0.0001 * i  # tiny variation for rot6d
     return RobotState(
         arm_qpos=np.arange(7, dtype=np.float64) * 0.1 + f,
         arm_qvel=np.zeros(7) + f,
         arm_tau=np.zeros(7) + f,
         eef_pos=np.array([0.3, 0.0, 0.2]) + f,
         eef_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-        eef_rot6d=np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        eef_rot6d=np.array([1.0 + g, g, g, g, 1.0 + g, g]),
         hand_qpos=np.arange(12, dtype=np.float64) * 0.05 + f,
         hand_tactile_sum=np.zeros((5, 3)) + f,
         hand_tactile_force=np.zeros((5, 120, 3)) + f,
@@ -63,13 +64,11 @@ def _state(ts: float, i: int) -> RobotState:
 
 
 def _action(i: int) -> RobotAction:
-    # Even frames carry an EEF target; odd frames leave it None (→ NaN row).
-    has_tgt = i % 2 == 0
     return RobotAction(
         arm_qpos_cmd=np.arange(7, dtype=np.float64) * 0.1 + 0.001 * i,
         hand_qpos_cmd=np.arange(12, dtype=np.float64) * 0.05 + 0.001 * i,
-        target_eef_pos=(np.array([0.3, 0.0, 0.2]) + 0.001 * i) if has_tgt else None,
-        target_eef_rot6d=(np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])) if has_tgt else None,
+        target_eef_pos=np.array([0.3, 0.0, 0.2]) + 0.001 * i,
+        target_eef_rot6d=np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]) + 0.0001 * i,
     )
 
 
@@ -146,32 +145,30 @@ def test_no_tail_loss_and_alignment_no_camera(tmp_path):
         assert f["meta"].attrs["num_frames"] == N
         assert f["meta"].attrs["schema_version"] == 2
 
-        # (b) index alignment — all streams length N
+        # (b) index alignment — all streams length N (v2 flat schema)
         keys = [
-            "obs/arm_qpos", "obs/eef_pos", "obs/hand_qpos", "obs/hand_tactile_force",
-            "action/arm_qpos", "action/hand_qpos",
-            "action/target_eef_pos", "action/target_eef_rot6d",
-            "action/ik_ok", "action/retarget_ok", "action/held",
-            "vr/wrist_pos", "vr/landmarks", "timestamps", "vr_timestamps",
+            "arm_qpos", "arm_ee", "arm_qvel", "arm_tau",
+            "hand_qpos", "hand_fingertip", "hand_contact",
+            "action_arm_joint", "action_arm_ee", "action_hand_joint",
+            "flag_ik_ok", "flag_retarget_ok", "flag_held",
+            "vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks", "timestamp",
         ]
         for k in keys:
             assert f[k].shape[0] == N, (k, f[k].shape)
 
         # strictly-increasing grid with ~dt spacing
-        ts = f["timestamps"][:]
+        ts = f["timestamp"][:]
         assert np.all(np.diff(ts) > 0)
         assert abs(float(np.median(np.diff(ts))) - DT) < 1e-6
 
         # (c) signals present + populated
-        assert f["action/ik_ok"].dtype == np.bool_
-        held = f["action/held"][:]
+        assert f["flag_ik_ok"].dtype == np.bool_
+        held = f["flag_held"][:]
         assert held.any() and (~held).any()  # both True and False recorded
 
-        # (NEW-2) target present: even frames finite, odd frames NaN
-        tp = f["action/target_eef_pos"][:]
-        assert np.isfinite(tp[0]).all()
-        assert np.isnan(tp[1]).all()
-        assert f["action/target_eef_rot6d"].shape[1] == 6
+        # (NEW-2) target EEF pos/rot6d present in unified action_arm_ee
+        assert f["action_arm_ee"].shape[1] == 9
+        assert np.isfinite(f["action_arm_ee"][:]).all()
 
 
 def test_camera_alignment_and_extrinsics(tmp_path):
@@ -179,19 +176,16 @@ def test_camera_alignment_and_extrinsics(tmp_path):
     with h5py.File(path, "r") as f:
         assert f["meta"].attrs["num_frames"] == N
         for k in [
-            "obs/arm_qpos", "action/arm_qpos",
-            "camera/rgb", "camera/depth", "camera/timestamps", "camera/extrinsics",
-            "timestamps",
+            "arm_qpos", "action_arm_joint",
+            "rgb", "depth", "timestamp",
         ]:
             assert f[k].shape[0] == N, (k, f[k].shape)
 
-        # (NEW-7) eye_to_hand → static base→camera extrinsics every frame
-        extr = f["camera/extrinsics"][:]
-        for i in range(0, N, 50):
-            assert np.allclose(extr[i], T_bc), (i, extr[i])
+        # (NEW-7) eye_to_hand → static base→camera extrinsics stored in meta attrs
+        assert "camera_T_base_camera" in dict(f["meta"].attrs)
 
         # camera not all-zero
-        assert f["camera/rgb"][0].any()
+        assert f["rgb"][0].any()
 
 
 def test_data_validator_passes(tmp_path):

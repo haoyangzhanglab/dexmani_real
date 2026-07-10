@@ -84,17 +84,18 @@ class DataValidator:
                 }
 
                 # ── 1. No NaN in observations ──
-                checks.append(self._check_no_nan(f, "obs/arm_qpos", "no_nan_obs"))
-                checks.append(self._check_no_nan(f, "obs/eef_pos", "no_nan_obs"))
-                checks.append(self._check_no_nan(f, "obs/hand_qpos", "no_nan_obs"))
+                checks.append(self._check_no_nan(f, "arm_qpos", "no_nan_obs"))
+                checks.append(self._check_no_nan(f, "arm_ee", "no_nan_obs"))
+                checks.append(self._check_no_nan(f, "hand_qpos", "no_nan_obs"))
 
                 # ── 2. No NaN in actions ──
-                checks.append(self._check_no_nan(f, "action/arm_qpos", "no_nan_action"))
-                checks.append(self._check_no_nan(f, "action/hand_qpos", "no_nan_action"))
+                checks.append(self._check_no_nan(f, "action_arm_joint", "no_nan_action"))
+                checks.append(self._check_no_nan(f, "action_arm_ee", "no_nan_action"))
+                checks.append(self._check_no_nan(f, "action_hand_joint", "no_nan_action"))
 
                 # ── 3. Non-zero variance ──
-                for key in ("obs/arm_qpos", "obs/eef_pos", "obs/hand_qpos",
-                            "action/arm_qpos", "action/hand_qpos"):
+                for key in ("arm_qpos", "arm_ee", "hand_qpos",
+                            "action_arm_joint", "action_hand_joint"):
                     if key in f:
                         checks.append(self._check_variance(f, key))
 
@@ -106,6 +107,9 @@ class DataValidator:
 
                 # ── 6. No consecutive duplicate frames ──
                 checks.append(self._check_duplicate_frames(f))
+
+                # ── 7. Timestamp monotonicity ──
+                checks.append(self._check_timestamp_monotonicity(f))
 
         except (OSError, KeyError) as e:
             checks.append(ValidationCheck(
@@ -153,12 +157,12 @@ class DataValidator:
         )
 
     def _check_camera(self, f: h5py.File) -> ValidationCheck:
-        if "camera/rgb" not in f:
+        if "rgb" not in f:
             return ValidationCheck(
                 name="camera_fresh", passed=True,
                 detail="No camera data (skipped).",
             )
-        rgb = np.asarray(f["camera/rgb"][:], dtype=np.uint8)
+        rgb = np.asarray(f["rgb"][:], dtype=np.uint8)
         # Check first 10 frames: if any have non-zero pixels, camera is OK
         sample = rgb[:min(10, rgb.shape[0])]
         all_zero = all(np.count_nonzero(frame) == 0 for frame in sample)
@@ -170,7 +174,7 @@ class DataValidator:
         )
 
     def _check_min_frames(self, f: h5py.File) -> ValidationCheck:
-        n_frames = f["obs/arm_qpos"].shape[0] if "obs/arm_qpos" in f else 0
+        n_frames = f["arm_qpos"].shape[0] if "arm_qpos" in f else 0
         ok = n_frames >= self.min_frames
         return ValidationCheck(
             name="min_frames",
@@ -180,13 +184,13 @@ class DataValidator:
 
     def _check_duplicate_frames(self, f: h5py.File) -> ValidationCheck:
         """Check for consecutive identical frames (indicates stuck sensor)."""
-        if "obs/arm_qpos" not in f or "action/arm_qpos" not in f:
+        if "arm_qpos" not in f or "action_arm_joint" not in f:
             return ValidationCheck(
                 name="no_duplicate_frames", passed=True,
                 detail="No obs/action data (skipped).",
             )
-        obs = np.asarray(f["obs/arm_qpos"][:], dtype=np.float64)
-        act = np.asarray(f["action/arm_qpos"][:], dtype=np.float64)
+        obs = np.asarray(f["arm_qpos"][:], dtype=np.float64)
+        act = np.asarray(f["action_arm_joint"][:], dtype=np.float64)
         if len(obs) < 2:
             return ValidationCheck(
                 name="no_duplicate_frames", passed=True,
@@ -203,6 +207,29 @@ class DataValidator:
             passed=ok,
             detail=f"{total_dup} duplicate frames"
             if not ok else "No duplicate frames."
+        )
+
+    def _check_timestamp_monotonicity(self, f: h5py.File) -> ValidationCheck:
+        """Check that timestamps are strictly increasing (no time regressions)."""
+        if "timestamp" not in f:
+            return ValidationCheck(
+                name="timestamp_monotonic", passed=True,
+                detail="No timestamp data (skipped).",
+            )
+        ts = np.asarray(f["timestamp"][:], dtype=np.float64)
+        if len(ts) < 2:
+            return ValidationCheck(
+                name="timestamp_monotonic", passed=True,
+                detail="Too few timestamps for check.",
+            )
+        diffs = np.diff(ts)
+        n_non_increasing = int(np.sum(diffs <= 0))
+        ok = n_non_increasing == 0
+        return ValidationCheck(
+            name="timestamp_monotonic",
+            passed=ok,
+            detail=f"{n_non_increasing} non-increasing timestamps"
+            if not ok else "Timestamps strictly increasing."
         )
 
     # ------------------------------------------------------------------
