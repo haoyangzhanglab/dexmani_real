@@ -32,14 +32,14 @@ DT = 1.0 / 50.0
 class _FakeCalib:
     """Duck-typed CameraCalib: only to_meta_dict(cam_name) is used by the recorder."""
 
-    def __init__(self, T_base_camera: np.ndarray) -> None:
-        self._T = T_base_camera
+    def __init__(self, T_world_camera: np.ndarray) -> None:
+        self._T = T_world_camera
 
-    def to_meta_dict(self, cam_name: str) -> dict:
+    def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
         return {
             "camera_serial": "TEST",
             "camera_type": "eye_to_hand",
-            "camera_T_base_camera": self._T.flatten().tolist(),
+            "camera_T_world_camera": self._T.flatten().tolist(),
         }
 
 
@@ -143,7 +143,7 @@ def test_no_tail_loss_and_alignment_no_camera(tmp_path):
     with h5py.File(path, "r") as f:
         # (a) no tail loss — every enqueued frame landed on the grid
         assert f["meta"].attrs["num_frames"] == N
-        assert f["meta"].attrs["schema_version"] == 2
+        assert f["meta"].attrs["schema_version"] == 3
 
         # (b) index alignment — all streams length N (v2 flat schema)
         keys = [
@@ -181,8 +181,8 @@ def test_camera_alignment_and_extrinsics(tmp_path):
         ]:
             assert f[k].shape[0] == N, (k, f[k].shape)
 
-        # (NEW-7) eye_to_hand → static base→camera extrinsics stored in meta attrs
-        assert "camera_T_base_camera" in dict(f["meta"].attrs)
+        # (NEW-7) eye_to_hand → static world→camera extrinsics stored in meta attrs
+        assert "camera_T_world_camera" in dict(f["meta"].attrs)
 
         # camera not all-zero
         assert f["rgb"][0].any()

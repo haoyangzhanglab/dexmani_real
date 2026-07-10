@@ -25,7 +25,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # v3: /meta camera_T_base_camera → camera_T_world_camera (world frame)
 
 
 class EpisodeRecorder:
@@ -135,11 +135,14 @@ class EpisodeRecorder:
         calib = p.get("calib")
         camera_name = p.get("camera_name")
         if calib is not None and camera_name is not None:
-            calib_meta = calib.to_meta_dict(camera_name)
+            # If the live camera serial was supplied, verify it matches the named
+            # calibration entry — a wrong camera_name would otherwise silently
+            # embed the wrong extrinsics/serial into the dataset.
+            calib_meta = calib.to_meta_dict(camera_name, expected_serial=p.get("camera_serial"))
             meta.attrs["camera_serial"] = calib_meta.get("camera_serial", "")
             meta.attrs["camera_type"] = calib_meta.get("camera_type", "")
-            if "camera_T_base_camera" in calib_meta:
-                meta.attrs["camera_T_base_camera"] = calib_meta["camera_T_base_camera"]
+            if "camera_T_world_camera" in calib_meta:
+                meta.attrs["camera_T_world_camera"] = calib_meta["camera_T_world_camera"]
             if "camera_T_eef_camera" in calib_meta:
                 meta.attrs["camera_T_eef_camera"] = calib_meta["camera_T_eef_camera"]
 

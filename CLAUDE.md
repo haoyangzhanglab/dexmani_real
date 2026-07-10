@@ -153,9 +153,9 @@ keyed by `state.timestamp`; camera frames stream per-frame but stay length-align
 ```
 episode_NNN.h5
   /meta (group)
-    attrs: schema_version(=2), task_label, operator, tags, duration, fps, num_frames,
+    attrs: schema_version(=3), task_label, operator, tags, duration, fps, num_frames,
            success, min_frames_met, has_camera, has_timestamps,
-           camera_serial, camera_type, camera_K, camera_T_base_camera
+           camera_serial, camera_type, camera_K, camera_T_world_camera
   /arm_qpos(T,7)           arm joint positions (rad)
   /arm_ee(T,9)             EEF [pos(3), rot6d(6)]
   /arm_qvel(T,7)           arm joint velocities (rad/s)

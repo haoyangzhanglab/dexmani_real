@@ -37,9 +37,10 @@ self-contained episodes.
 
 Usage:
     calib = CameraCalib()
-    T_base_camera = calib.get_extrinsics("camera_0")                              # eye-to-hand
-    T_base_camera = calib.get_extrinsics("camera_0", T_base_eef=T_base_eef)       # eye-in-hand
-    meta = calib.to_meta_dict("camera_0")  # for HDF5 /meta attributes
+    cam = calib.resolve_name_by_serial(connected_serial)  # robust: pick by serial
+    T_base_camera = calib.get_extrinsics(cam)                                     # eye-to-hand
+    T_base_camera = calib.get_extrinsics(cam, T_base_eef=T_base_eef)              # eye-in-hand
+    meta = calib.to_meta_dict(cam, expected_serial=connected_serial)  # verified /meta
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarr
 class CameraCalibEntry:
     serial: str
     type: str  # "eye_to_hand" | "eye_in_hand"
-    T_base_camera: np.ndarray | None = None  # (4,4) eye-to-hand
+    T_world_camera: np.ndarray | None = None  # (4,4) eye-to-hand, camera in WORLD frame
     T_eef_camera: np.ndarray | None = None  # (4,4) eye-in-hand
 
     def __post_init__(self):
@@ -85,8 +86,8 @@ class CameraCalibEntry:
             raise ValueError(
                 f"camera_type must be 'eye_to_hand' or 'eye_in_hand', got '{self.type}'"
             )
-        if self.type == "eye_to_hand" and self.T_base_camera is None:
-            raise ValueError("eye_to_hand camera requires T_base_camera")
+        if self.type == "eye_to_hand" and self.T_world_camera is None:
+            raise ValueError("eye_to_hand camera requires T_world_camera")
         if self.type == "eye_in_hand" and self.T_eef_camera is None:
             raise ValueError("eye_in_hand camera requires T_eef_camera")
 
@@ -136,7 +137,7 @@ class CameraCalib:
 
         for cam_name, cam in raw.items():
             # Resolve extrinsics: prefer pose format, fall back to legacy matrix format
-            T_base_camera = None
+            T_world_camera = None
             T_eef_camera = None
 
             if "pose" in cam:
@@ -144,20 +145,21 @@ class CameraCalib:
                 pose = cam["pose"]
                 T = _pose_to_matrix(pose["position"], pose["orientation"])
                 if cam["type"] == "eye_to_hand":
-                    T_base_camera = T
+                    T_world_camera = T
                 else:
                     T_eef_camera = T
             else:
-                # Legacy matrix format
-                if cam.get("T_base_camera") is not None:
-                    T_base_camera = np.array(cam["T_base_camera"], dtype=np.float64)
+                # Legacy matrix format (accept new + old key names for eye-to-hand)
+                mat = cam.get("T_world_camera", cam.get("T_base_camera"))
+                if mat is not None:
+                    T_world_camera = np.array(mat, dtype=np.float64)
                 if cam.get("T_eef_camera") is not None:
                     T_eef_camera = np.array(cam["T_eef_camera"], dtype=np.float64)
 
             entry = CameraCalibEntry(
                 serial=cam["serial"],
                 type=cam["type"],
-                T_base_camera=T_base_camera,
+                T_world_camera=T_world_camera,
                 T_eef_camera=T_eef_camera,
             )
             self._entries[cam_name] = entry
@@ -168,39 +170,84 @@ class CameraCalib:
     def camera_names(self) -> list[str]:
         return list(self._entries.keys())
 
+    def resolve_name_by_serial(self, serial: str) -> str:
+        """Return the camera_name whose entry matches ``serial``.
+
+        This is the robust way to pick a calibration entry: select by the
+        actually-connected camera's serial instead of a hard-coded name, so a
+        stale/placeholder entry under a familiar name (e.g. "camera_0") can
+        never be used by mistake.
+
+        Raises:
+            KeyError: if no entry matches, or if more than one does.
+        """
+        matches = [n for n, e in self._entries.items() if e.serial == serial]
+        if not matches:
+            known = {n: e.serial for n, e in self._entries.items()}
+            raise KeyError(
+                f"No camera in {self.calib_path.name} has serial '{serial}'. Known: {known}"
+            )
+        if len(matches) > 1:
+            raise KeyError(f"Multiple cameras share serial '{serial}': {matches}")
+        return matches[0]
+
+    def verify_serial(self, cam_name: str, actual_serial: str) -> None:
+        """Assert entry ``cam_name`` belongs to the connected camera.
+
+        Raises:
+            ValueError: if the entry's serial differs from ``actual_serial``
+                (i.e. the named calibration is for a different physical camera).
+        """
+        entry = self._entries[cam_name]
+        if entry.serial != actual_serial:
+            raise ValueError(
+                f"Camera calibration mismatch: entry '{cam_name}' is for serial "
+                f"'{entry.serial}', but the connected camera is '{actual_serial}'. "
+                f"Fix cameras.json or select by serial (resolve_name_by_serial)."
+            )
+
     def get_extrinsics(
         self, cam_name: str, T_base_eef: np.ndarray | None = None
     ) -> np.ndarray:
-        """Return T_base_camera (4,4).
+        """Return the camera extrinsic (4,4).
 
-        For eye_to_hand: returns the static T_base_camera from config.
-        For eye_in_hand: computes T_base_eef @ T_eef_camera, requires T_base_eef.
+        For eye_to_hand: returns the static T_world_camera from config (WORLD frame,
+            consistent with recorded eef_pos / arm_ee).
+        For eye_in_hand: computes T_base_eef @ T_eef_camera (in the frame of the
+            passed eef pose), requires T_base_eef.
         """
         entry = self._entries[cam_name]
         if entry.type == "eye_to_hand":
-            return entry.T_base_camera.copy()
+            return entry.T_world_camera.copy()
         if T_base_eef is None:
             raise ValueError(
                 f"Camera '{cam_name}' is eye_in_hand; T_base_eef (4,4 FK matrix) is required"
             )
         return T_base_eef @ entry.T_eef_camera
 
-    def to_meta_dict(self, cam_name: str) -> dict:
+    def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
         """Return extrinsics values for HDF5 /meta attributes.
 
         Contains camera_serial, camera_type, and either
-        camera_T_base_camera or camera_T_eef_camera (4x4 flat list).
+        camera_T_world_camera (eye_to_hand, world frame) or camera_T_eef_camera
+        (eye_in_hand) as a 4x4 flat list.
 
         camera_K is not included here — intrinsics are read from the
         RealSense hardware at recording time and written to HDF5 separately.
+
+        If ``expected_serial`` is given, verifies the entry belongs to that
+        physical camera and raises ValueError on mismatch — so a wrong
+        camera_name can never silently poison recorded data.
         """
+        if expected_serial is not None:
+            self.verify_serial(cam_name, expected_serial)
         entry = self._entries[cam_name]
         meta = {
             "camera_serial": entry.serial,
             "camera_type": entry.type,
         }
         if entry.type == "eye_to_hand":
-            meta["camera_T_base_camera"] = entry.T_base_camera.flatten().tolist()
+            meta["camera_T_world_camera"] = entry.T_world_camera.flatten().tolist()
         else:
             meta["camera_T_eef_camera"] = entry.T_eef_camera.flatten().tolist()
         return meta
