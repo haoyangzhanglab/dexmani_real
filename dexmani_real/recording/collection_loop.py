@@ -12,12 +12,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
 from dexmani_real.recording.collection_config import CollectionConfig
+from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.recording.episode_recorder import EpisodeRecorder
     from dexmani_real.config.camera_calib import CameraCalib
+    from dexmani_real.recording.episode_recorder import EpisodeRecorder
 
 logger = get_logger(__name__)
 
@@ -47,6 +47,7 @@ class CollectionLoop:
         camera_K: np.ndarray | None = None,
         calib: CameraCalib | None = None,
         camera_name: str | None = None,
+        record_config: dict | None = None,
     ) -> bool:
         if self.is_recording:
             logger.warning("Episode already in progress.")
@@ -57,8 +58,14 @@ class CollectionLoop:
         tags_list = tags or self.config.tags
 
         success = self.recorder.start_episode(
-            task_label=task, operator=op, tags=tags_list,
-            camera_K=camera_K, calib=calib, camera_name=camera_name,
+            task_label=task,
+            operator=op,
+            tags=tags_list,
+            camera_K=camera_K,
+            calib=calib,
+            camera_name=camera_name,
+            record_config=record_config,
+            skip_initial_frames=self.config.skip_initial_frames,
         )
 
         if success:
@@ -85,9 +92,13 @@ class CollectionLoop:
             return False
 
         recorded = self.recorder.add_frame(
-            state=state, action=action, vr_frame=vr_frame,
-            camera_frame=camera_frame, T_base_eef=T_base_eef,
-            camera_frames=camera_frames, signals=signals,
+            state=state,
+            action=action,
+            vr_frame=vr_frame,
+            camera_frame=camera_frame,
+            T_base_eef=T_base_eef,
+            camera_frames=camera_frames,
+            signals=signals,
         )
 
         if self.recorder.max_frames_reached and self.config.auto_stop_on_max_frames:
@@ -125,7 +136,10 @@ class CollectionLoop:
 
         logger.info(
             "Episode stopped: frames=%d duration=%.1fs reason=%s path=%s",
-            self._episode_frame_count, duration, self._stopped_reason, path,
+            self._episode_frame_count,
+            duration,
+            self._stopped_reason,
+            path,
         )
 
         return path

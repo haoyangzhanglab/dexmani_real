@@ -21,6 +21,10 @@ class CollectionConfig:
     max_frames: int = DEFAULT_MAX_RECORD_FRAMES
     min_frames: int = 50
 
+    # Drop the first N frames of each episode to skip the begin-transition pose
+    # noise (0.2s at 50Hz). Set 0 to record from the first frame.
+    skip_initial_frames: int = 10
+
     camera_enabled: bool = True
     camera_recovery_enabled: bool = True
     camera_max_age_s: float = 0.5

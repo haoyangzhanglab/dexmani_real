@@ -1,10 +1,10 @@
 """Teleoperation controller — simplified state machine with in-process inner loop.
 
 State machine:
-    IDLE ──T(teleop)──→ TELEOP ──R(record)──→ RECORDING
-      ↑       │   S(stop)→IDLE      │   H(home)→IDLE
-      ├───H(home)─────┘              │
-      └──ESC / timeout: EMERGENCY_STOP
+    IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
+      ↑                          │
+      └── S(stop+save) / H(home) ┘
+      ESC / VR-disconnect timeout → EMERGENCY_STOP
 
 Arm control is handled by ArmInnerLoop (daemon thread, mode 6 online trajectory
 planning @ 50Hz). Controller sends target qpos via inner.set_target(), reads
@@ -24,25 +24,24 @@ import numpy as np
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
+from dexmani_real.recording.recording_session import RecordingSession
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.validate import validate_action
+from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate_limiter import RateLimiter
-
-from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
-from dexmani_real.recording.recording_session import RecordingSession
+from dexmani_real.utils.rate_manager import RateManager
 
 if TYPE_CHECKING:
+    from dexmani_real.config.camera_calib import CameraCalib
     from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
     from dexmani_real.sensor.multi_camera_manager import MultiCameraManager
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
     from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
-    from dexmani_real.config.camera_calib import CameraCalib
 
 logger = get_logger(__name__)
 
@@ -151,7 +150,7 @@ class TeleopController:
             self.recorder = None
             self._recorder_session = None
 
-        self.limiter = RateLimiter(cfg.target_hz)
+        self.limiter = RateManager(cfg.target_hz)
         self._ema_alpha_pos = float(cfg.ema_alpha_pos)
         self._ema_alpha_rot = float(cfg.ema_alpha_rot)
 
@@ -189,9 +188,9 @@ class TeleopController:
         self._last_good_hand: np.ndarray | None = None
 
         # Pipeline
-        self.pipeline = TeleopPipeline(arm_mapper, retargeter, planner,
-                                        ema_alpha_pos=self._ema_alpha_pos,
-                                        ema_alpha_rot=self._ema_alpha_rot)
+        self.pipeline = TeleopPipeline(
+            arm_mapper, retargeter, planner, ema_alpha_pos=self._ema_alpha_pos, ema_alpha_rot=self._ema_alpha_rot
+        )
 
         # Keyboard (accepts queue=None for backward compatibility;
         # KeyboardHandler now uses pynput for global key capture)
@@ -284,7 +283,8 @@ class TeleopController:
             if loss_duration_s >= self._vr_disconnect_timeout_s:
                 logger.error(
                     "VR disconnected for %.1fs (%d consecutive frames) — auto-stopping",
-                    loss_duration_s, self._vr_consecutive_loss,
+                    loss_duration_s,
+                    self._vr_consecutive_loss,
                 )
                 self._stop_recording(save=False)
                 self.state = ControllerState.IDLE
@@ -333,7 +333,10 @@ class TeleopController:
         validate_failed = False
         if not self.dry_run:
             action_valid, fail_reason = validate_action(
-                self.robot, action, actual_arm_qpos=arm_qpos,
+                self.robot,
+                action,
+                actual_arm_qpos=arm_qpos,
+                actual_arm_tau=state.arm_tau,
             )
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
@@ -548,6 +551,35 @@ class TeleopController:
 
     # ── Recording ──
 
+    def _build_record_config(self) -> dict:
+        """Snapshot the active collection configuration for HDF5 /meta.
+
+        Fail-safe: each value is read defensively; a missing source falls back
+        to its default rather than raising during recording start.
+        """
+        hand_cfg = getattr(self.robot.hand, "config", None)
+        inner_cfg = getattr(self._arm_inner, "_cfg", None)
+
+        def _f(x: object, default: float) -> float:
+            try:
+                return float(x)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "control_mode": "teleop",
+            "arm_mode": 6,  # hardcoded Mode 6 (joint online trajectory planning)
+            "hand_mode": int(getattr(hand_cfg, "mode", 3)) if hand_cfg is not None else 3,
+            "arm_delta_clip": _f(getattr(inner_cfg, "max_joint_delta", 0.3), 0.3),
+            "hand_delta_clip": (
+                _f(np.max(getattr(hand_cfg, "max_delta_rad", 0.3)), 0.3) if hand_cfg is not None else 0.3
+            ),
+            "hand_ema_alpha": _f(getattr(hand_cfg, "ema_alpha", 0.0), 0.0) if hand_cfg is not None else 0.0,
+            "hand_low_pass_alpha": _f(getattr(self.retargeter, "low_pass_alpha", 0.6), 0.6),
+            "ema_alpha_pos": _f(self._ema_alpha_pos, 0.8),
+            "ema_alpha_rot": _f(self._ema_alpha_rot, 0.4),
+        }
+
     def _start_recording(self) -> None:
         logger.info("Starting episode recording...")
         if not self._reset_mapper():
@@ -560,6 +592,7 @@ class TeleopController:
                     operator="",
                     calib=self._calib,
                     camera_name=self._camera_name,
+                    record_config=self._build_record_config(),
                 )
             )
         self._last_good_arm = None
@@ -694,13 +727,16 @@ class TeleopController:
                 mid = 0.5 * (limits[:, 0] + limits[:, 1])
                 half = 0.5 * (limits[:, 1] - limits[:, 0])
                 jl_pct = float(np.max(np.abs(self._last_arm_cmd - mid) / half) * 100.0)
-                mu = float(self.planner.kin.manipulability_from_jacobian(
-                    self.planner.kin.compute_eef_jacobian(self._last_arm_cmd)
-                ))
+                mu = float(
+                    self.planner.kin.manipulability_from_jacobian(
+                        self.planner.kin.compute_eef_jacobian(self._last_arm_cmd)
+                    )
+                )
             except Exception:
                 pass
+        trkerr = self._arm_inner.tracking_error if self._arm_inner is not None else 0.0
         logger.info(
-            "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms ik=%s/%s retarget=%s/%s jlimit=%.0f%% mu=%.4f",
+            "[t=%.1f] frames=%s state=%s %s vr_seq=%s age=%sms ik=%s/%s retarget=%s/%s jlimit=%.0f%% mu=%.4f trkerr=%.3f",
             now,
             self.frame_count,
             self.state.value,
@@ -713,6 +749,7 @@ class TeleopController:
             self.retarget_fail_count,
             jl_pct,
             mu,
+            trkerr,
         )
 
     # ── Shutdown ──

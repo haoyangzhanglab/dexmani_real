@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
 
@@ -53,15 +53,39 @@ class ArmInnerLoopConfig:
                        trajectory planner. Default 500°/s² (≈8.73 rad/s²).
         loop_period: Inner loop period in seconds. Default 0.02 (50Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
+        max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad/step
+                         (~17°/step, ~15 rad/s ceiling at 50Hz). Mirrors XHand E3.
+                         Set 0 to disable. Complements Mode 6 firmware speed limiting.
+        speed_ramp_frames: Number of frames for soft-start speed ramp. Default 20
+                           frames (0.4s at 50Hz). Speed linearly ramps from
+                           speed_ramp_min → joint_max_speed. Set 0 to disable.
+        speed_ramp_min: Initial speed during soft-start ramp (rad/s). Default 0.2
+                        rad/s (~11°/s). Avoids abrupt motion on teleop engagement.
         synchronized: Two-phase handshake for policy inference (default False).
     """
 
     # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
-    joint_max_speed: float = 1.5708   # 90°/s in rad/s
-    joint_max_acc: float = 8.7266     # 500°/s² in rad/s²
-    loop_period: float = 0.02         # 50Hz
+    joint_max_speed: float = 1.5708  # 90°/s in rad/s
+    joint_max_acc: float = 8.7266  # 500°/s² in rad/s²
+    loop_period: float = 0.02  # 50Hz
     # Shared
     target_timeout_s: float = 0.2
+
+    # Per-step delta clamp — safety ceiling against IK solver anomalies.
+    # Mirrors XHand E3 (XHandConfig.max_delta_rad).  0.3 rad/step gives ~10x
+    # headroom over normal operation (1.57 rad/s / 50 Hz ≈ 0.03 rad/step).
+    max_joint_delta: float = 0.3
+
+    # Soft-start speed ramp — prevents abrupt motion on teleop engagement.
+    # Speed ramps linearly from speed_ramp_min → joint_max_speed over the first
+    # speed_ramp_frames.  Set speed_ramp_frames=0 to disable.
+    speed_ramp_frames: int = 20
+    speed_ramp_min: float = 0.2  # ~11°/s
+
+    # Passive tracking-error monitor — warns when |target - current| exceeds this
+    # on any joint (soft saturation / follow error that arm error codes miss).
+    # Does NOT trigger an error state or alter commands.  Set 0 to disable.
+    tracking_error_warn_rad: float = 0.35
 
     # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
     # hardware write and waits for policy_ready before the next target dispatch.
@@ -107,6 +131,10 @@ class ArmInnerLoop:
         self._target_ts: float = 0.0
         self._arm_qpos: np.ndarray = np.zeros(7, dtype=np.float64)
         self._error_state: bool = False
+        self._last_sent_target: np.ndarray | None = None  # for per-step delta clamp
+        self._ramp_step: int = 0  # for soft-start speed ramp
+        self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
+        self._track_warn_throttle: int = 0  # throttle counter for tracking/mode warnings
 
         # ── Lifecycle ──
         self._stop_event = threading.Event()
@@ -137,6 +165,12 @@ class ArmInnerLoop:
     @property
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def tracking_error(self) -> float:
+        """Last |target - current| L∞ joint error (rad). Passive monitor."""
+        with self._lock:
+            return self._tracking_error
 
     # ── Lifecycle ──
 
@@ -193,13 +227,14 @@ class ArmInnerLoop:
             arm.set_collision_sensitivity(1)
 
             # Verify arm entered mode 6
-            actual_mode = getattr(arm, 'mode', -1)
+            actual_mode = getattr(arm, "mode", -1)
             if actual_mode != 6:
                 logger.warning(
-                    "ArmInnerLoop: arm mode=%d but expected 6 — re-initializing", actual_mode,
+                    "ArmInnerLoop: arm mode=%d but expected 6 — re-initializing",
+                    actual_mode,
                 )
                 self._init_mode(arm)
-                actual_mode = getattr(arm, 'mode', -1)
+                actual_mode = getattr(arm, "mode", -1)
                 if actual_mode != 6:
                     logger.error("ArmInnerLoop: failed to set mode 6 (arm mode=%d)", actual_mode)
                     with self._lock:
@@ -224,7 +259,7 @@ class ArmInnerLoop:
 
             inner_dt = self._cfg.loop_period
             freq_hz = int(round(1.0 / inner_dt))
-            limiter = RateLimiter(float(freq_hz))
+            limiter = RateManager(float(freq_hz))
 
             logger.info(
                 "ArmInnerLoop: %dHz started (mode 6: online trajectory planning, "
@@ -248,8 +283,10 @@ class ArmInnerLoop:
                 # ── 2. Timeout → hold ──
                 # Skip timeout during startup: if no target has ever been received
                 # (last_target_ts==0), the main thread is still initializing.
-                no_target_yet = (last_target_ts == 0.0)
-                if not no_target_yet and (target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)):
+                no_target_yet = last_target_ts == 0.0
+                if not no_target_yet and (
+                    target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
+                ):
                     self._hold_position(arm)
                     self._signal_ready_only()
                     continue
@@ -263,7 +300,8 @@ class ArmInnerLoop:
                 if not np.all(np.isfinite(target)):
                     try:
                         arm.set_servo_angle(
-                            angle=last_valid_qpos.tolist(), is_radian=True,
+                            angle=last_valid_qpos.tolist(),
+                            is_radian=True,
                             speed=self._cfg.joint_max_speed,
                             mvacc=self._cfg.joint_max_acc,
                             wait=False,
@@ -291,7 +329,7 @@ class ArmInnerLoop:
 
                 # Also check arm error flag (C31 collision sets error_code without
                 # necessarily failing get_joint_states)
-                arm_error = getattr(arm, 'error_code', 0)
+                arm_error = getattr(arm, "error_code", 0)
                 if arm_error != 0:
                     logger.error("ArmInnerLoop: arm error_code=%d — stopping inner loop", arm_error)
                     with self._lock:
@@ -305,6 +343,9 @@ class ArmInnerLoop:
                         with self._lock:
                             self._arm_qpos = current_qpos
                             self._error_state = False
+
+                # ── 4b. Passive tracking-error + mode monitor (no command change) ──
+                self._monitor(arm, current_qpos)
 
                 # ── 5. Forward target → firmware trajectory planner ──
                 self._send_target(arm, target)
@@ -327,6 +368,40 @@ class ArmInnerLoop:
 
     # ── Command dispatch ──
 
+    def _monitor(self, arm, current_qpos: np.ndarray) -> None:
+        """Passive health monitor — tracking error (A4) + mode drift (A5).
+
+        Computes |last_sent_target - current| L∞ and, together with a per-frame
+        mode==6 recheck, emits a throttled warning.  Never mutates commands or
+        the error state — soft saturation is not a hard fault.
+        """
+        cfg = self._cfg
+        err = 0.0
+        if self._last_sent_target is not None:
+            err = float(np.max(np.abs(self._last_sent_target - current_qpos[:7])))
+        with self._lock:
+            self._tracking_error = err
+
+        mode_bad = getattr(arm, "mode", 6) != 6
+        track_bad = cfg.tracking_error_warn_rad > 0 and err > cfg.tracking_error_warn_rad
+
+        if self._track_warn_throttle > 0:
+            self._track_warn_throttle -= 1
+            return
+        if track_bad:
+            logger.warning(
+                "ArmInnerLoop: tracking error %.3f rad exceeds %.3f (soft saturation / follow error)",
+                err,
+                cfg.tracking_error_warn_rad,
+            )
+            self._track_warn_throttle = 50  # ~1s at 50Hz
+        if mode_bad:
+            logger.warning(
+                "ArmInnerLoop: arm mode=%s (expected 6) — trajectory planning may be degraded",
+                getattr(arm, "mode", "?"),
+            )
+            self._track_warn_throttle = 50
+
     def _send_target(self, arm, target: np.ndarray) -> None:
         """Forward target position → set_servo_angle(wait=False).
 
@@ -337,10 +412,29 @@ class ArmInnerLoop:
         No inner-loop interpolation — the target is forwarded directly and the
         firmware handles all trajectory smoothing.
         """
+        # ── Per-step joint delta clamp (mirrors XHand E3) ──
+        # Safety ceiling against IK solver anomalies.  Normal per-step delta is
+        # ~0.03 rad (1.57 rad/s ÷ 50 Hz); 0.3 rad default gives ~10x headroom.
+        clamped = target[:7].copy()
+        if self._cfg.max_joint_delta > 0 and self._last_sent_target is not None:
+            delta = clamped - self._last_sent_target
+            delta = np.clip(delta, -self._cfg.max_joint_delta, self._cfg.max_joint_delta)
+            clamped = self._last_sent_target + delta
+
+        # ── Soft-start speed ramp ──
+        # Linearly ramp speed_ramp_min → joint_max_speed over first N frames.
+        # Prevents abrupt motion when teleop engages (e.g. after idle/home).
+        if self._cfg.speed_ramp_frames > 0 and self._ramp_step < self._cfg.speed_ramp_frames:
+            t = self._ramp_step / self._cfg.speed_ramp_frames
+            speed = self._cfg.speed_ramp_min + (self._cfg.joint_max_speed - self._cfg.speed_ramp_min) * t
+        else:
+            speed = self._cfg.joint_max_speed
+
         try:
             code = arm.set_servo_angle(
-                angle=target[:7].tolist(), is_radian=True,
-                speed=self._cfg.joint_max_speed,
+                angle=clamped.tolist(),
+                is_radian=True,
+                speed=speed,
                 mvacc=self._cfg.joint_max_acc,
                 wait=False,
             )
@@ -362,10 +456,15 @@ class ArmInnerLoop:
                 pass
             logger.error(
                 "ArmInnerLoop: set_servo_angle code=%d, controller error=%d, warn=%d",
-                code, err_code, warn_code,
+                code,
+                err_code,
+                warn_code,
             )
             with self._lock:
                 self._error_state = True
+        else:
+            self._last_sent_target = clamped.copy()
+            self._ramp_step += 1
 
     # ── Helpers ──
 
@@ -377,7 +476,8 @@ class ArmInnerLoop:
                 hold = np.asarray(states[0], dtype=np.float64)[:7]
                 if np.all(np.isfinite(hold)):
                     arm.set_servo_angle(
-                        angle=hold.tolist(), is_radian=True,
+                        angle=hold.tolist(),
+                        is_radian=True,
                         speed=self._cfg.joint_max_speed,
                         mvacc=self._cfg.joint_max_acc,
                         wait=False,
@@ -423,5 +523,6 @@ class ArmInnerLoop:
         arm.set_joint_maxacc(self._cfg.joint_max_acc, is_radian=True)
         logger.info(
             "ArmInnerLoop: set_joint_maxacc=%s rad/s² (%.0f°/s²)",
-            self._cfg.joint_max_acc, round(float(np.degrees(self._cfg.joint_max_acc))),
+            self._cfg.joint_max_acc,
+            round(float(np.degrees(self._cfg.joint_max_acc))),
         )
