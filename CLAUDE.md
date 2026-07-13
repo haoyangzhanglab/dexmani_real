@@ -108,7 +108,7 @@ VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compu
                                                       ├─ arm: Cartesian EMA (ema_alpha_pos=0.8, ema_alpha_rot=0.4)
                                                       └─ arm IK anomaly jump-limit (default 90°, planning/ik.py)
                                                                    │
-RobotInterface.validate_action() ← pre-send gate (robot error + arm connection only)
+RobotInterface.validate_action() ← pre-send gate (4 ops: error gate + connection gate + arm clip + hand clip)
 ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 50Hz inner loop (mode 6: passthrough, firmware trajectory planning)
 RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
         │
@@ -153,9 +153,12 @@ keyed by `state.timestamp`; camera frames stream per-frame but stay length-align
 ```
 episode_NNN.h5
   /meta (group)
-    attrs: schema_version(=3), task_label, operator, tags, duration, fps, num_frames,
+    attrs: schema_version(=4), task_label, operator, tags, duration, fps, num_frames,
            success, min_frames_met, has_camera, has_timestamps,
-           camera_serial, camera_type, camera_K, camera_T_world_camera
+           camera_serial, camera_type, camera_K, camera_T_world_camera, camera_T_eef_camera,
+           skip_initial_frames, control_mode, arm_mode, hand_mode,
+           arm_delta_clip, hand_delta_clip, hand_ema_alpha, hand_low_pass_alpha,
+           ema_alpha_pos, ema_alpha_rot
   /arm_qpos(T,7)           arm joint positions (rad)
   /arm_ee(T,9)             EEF [pos(3), rot6d(6)]
   /arm_qvel(T,7)           arm joint velocities (rad/s)
@@ -211,7 +214,10 @@ episode_NNN.h5
 
 ## Safety architecture
 
-1. **Pre-send gate** (`validate_action()`): **currently robot error + arm connection only** (2-check stub, `robot/validate.py`). Torque / current / temp / workspace / collision gating is accepted as params but not yet implemented — a hard prerequisite before autonomous policy rollouts.
+1. **Pre-send gate** (`validate_action()`): **4 operations** — robot error gate, arm connection gate,
+   arm joint-limit clip, hand joint-limit clip.
+   `env_collision_check` and `actual_arm_qpos` params are accepted but **not yet wired**.
+   Torque / current / temp / workspace / collision gating — hard prerequisite before autonomous policy rollouts.
 2. **IK-level**: workspace clamping, IK anomaly jump-limit (arm: 90° default, `planning/ik.py:140`)
 3. **Hand command-level**: delta clip (E3, `max_delta_rad=0.3` per-step hard gate) + optional EMA (E2, `XHandConfig.ema_alpha`)
 4. **Retargeting-level**: built-in LPFilter EMA (`low_pass_alpha=0.6`, dex_retargeting `SeqRetargeting.retarget()`)
