@@ -206,10 +206,21 @@ class CameraProcess:
                 create=False,
             )
 
+            # A read that fails every iteration (align crash, USB drop, or the
+            # L515 "no depth intrinsics" bad state) must not be swallowed forever
+            # — otherwise the process stays alive producing zero frames with no
+            # recovery. Count consecutive failures and, past a threshold, rebuild
+            # the camera; RealSense.connect() self-heals the L515 via
+            # hardware_reset. (MultiCameraManager.auto_restart is wired to no
+            # caller, so recovery must happen here, in-process.)
+            reconnect_after = max(int(self.config.hz), 15)  # ~1 s of dead frames
+            consecutive_failures = 0
+
             last_ts = time.monotonic()
             while not self._stop_event.is_set():
                 try:
                     frame = cam.read(timeout_ms=self.config.timeout_ms)
+                    consecutive_failures = 0
                     frame_dict = frame.to_dict()
                     try:
                         header, rgb, depth = camera_frame_to_bytes(frame_dict)
@@ -219,7 +230,23 @@ class CameraProcess:
                             "CameraProcess shm write failed — continuing."
                         )
                 except (RuntimeError, OSError):
-                    logger.exception("CameraProcess frame read failed — continuing.")
+                    consecutive_failures += 1
+                    if consecutive_failures % reconnect_after != 0:
+                        logger.debug(
+                            "CameraProcess frame read failed (%d) — continuing.",
+                            consecutive_failures,
+                        )
+                    else:
+                        logger.warning(
+                            "CameraProcess: %d consecutive read failures — rebuilding camera.",
+                            consecutive_failures,
+                        )
+                        cam.disconnect()
+                        if cam.connect():
+                            logger.info("CameraProcess camera rebuilt; resuming capture.")
+                            consecutive_failures = 0
+                        else:
+                            logger.error("CameraProcess camera rebuild failed — will retry.")
 
                 # Maintain target rate
                 elapsed = time.monotonic() - last_ts

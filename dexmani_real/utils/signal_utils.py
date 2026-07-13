@@ -6,6 +6,8 @@ __all__ = ["ema_smooth", "ema_smooth_pose", "limit_jerk"]
 
 import numpy as np
 
+from dexmani_real.planning.pose_utils import quat_to_rotvec
+
 
 def ema_smooth(
     new_val: np.ndarray, prev_val: np.ndarray | None, alpha: float
@@ -120,24 +122,8 @@ def ema_smooth_pose(
     pos = alpha_pos * np.asarray(target_pos, dtype=np.float64) + (1.0 - alpha_pos) * np.asarray(prev_pos, dtype=np.float64)
 
     # Orientation: quat → rotvec → EMA → quat
-    def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
-        """Convert wxyz quaternion to rotation vector (always shortest geodesic path).
-
-        Handles quaternion double cover: q and -q represent the same rotation.
-        Forcing w ≥ 0 ensures the rotation vector angle is always ≤ π.
-        """
-        sign = np.asarray(q, dtype=np.float64)
-        if sign[0] < 0:
-            sign = -sign
-        w, x, y, z = sign[0], sign[1], sign[2], sign[3]
-        sin_half = np.sqrt(x * x + y * y + z * z)
-        if sin_half < 1e-12:
-            return np.zeros(3, dtype=np.float64)
-        angle = 2.0 * np.arctan2(sin_half, w)
-        return angle * np.array([x, y, z], dtype=np.float64) / sin_half
-
-    target_rv = _quat_to_rotvec(np.asarray(target_quat_wxyz, dtype=np.float64))
-    prev_rv = _quat_to_rotvec(np.asarray(prev_quat_wxyz, dtype=np.float64))
+    target_rv = quat_to_rotvec(np.asarray(target_quat_wxyz, dtype=np.float64))
+    prev_rv = quat_to_rotvec(np.asarray(prev_quat_wxyz, dtype=np.float64))
     rv = alpha_rot * target_rv + (1.0 - alpha_rot) * prev_rv
 
     angle = float(np.linalg.norm(rv))

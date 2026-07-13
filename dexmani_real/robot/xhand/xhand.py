@@ -20,6 +20,7 @@ from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.robot.xhand.motor_trajectory_interpolator import MotorTrajectoryInterpolator
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.serialization import FromDictMixin
 
 logger = get_logger(__name__)
 
@@ -75,7 +76,7 @@ _CONSECUTIVE_ERROR_RECONNECT_THRESHOLD = 10
 
 
 @dataclass
-class XHandConfig:
+class XHandConfig(FromDictMixin):
     comm_type: str = "EtherCAT"
     device_name: str | None = None
     baudrate: int = 3_000_000
@@ -209,8 +210,9 @@ class XHandConfig:
     # ── E3: Per-step delta jump limit ──
     # Hard-clips the per-frame change in each joint command (rad). Complements
     # dex_retargetingʼs LPFilter — EMA attenuates noise, this safety-gates outliers.
+    # Scalar: same limit for all 12 joints.  (12,) array: per-joint limits.
     # 0.0 = disabled. Recommended: 0.3 rad (~17°/step, ~850°/s at 50 Hz).
-    max_delta_rad: float = 0.3
+    max_delta_rad: float | np.ndarray = 0.3
 
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
@@ -251,6 +253,9 @@ class XHand(ConnectionStateMixin):
         Falls back to stub mode when xhand_controller SDK is unavailable
         (ref: LeFranX xhand.py:158-163).
         """
+        if self.connected_flag:
+            return True  # re-entry guard: already connected
+
         if not _SDK_AVAILABLE:
             logger.warning("XHand SDK unavailable — entering stub mode (ref: LeFranX)")
             self._stub_mode = True
@@ -521,9 +526,11 @@ class XHand(ConnectionStateMixin):
         # ── E3: Delta jump limit ──
         # Hard safety gate: per-step change never exceeds max_delta_rad on any
         # joint, regardless of EMA state.  Complements dex_retargetingʼs LPFilter.
-        if self.config.max_delta_rad > 0 and self.last_qpos_cmd is not None:
+        # Supports per-joint limits: pass a (12,) ndarray for joint-specific caps.
+        limit = np.broadcast_to(np.asarray(self.config.max_delta_rad), (12,))
+        if np.any(limit > 0) and self.last_qpos_cmd is not None:
             delta = qpos_cmd - self.last_qpos_cmd
-            delta = np.clip(delta, -self.config.max_delta_rad, self.config.max_delta_rad)
+            delta = np.clip(delta, -limit, limit)
             qpos_cmd = self.last_qpos_cmd + delta
 
         # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──

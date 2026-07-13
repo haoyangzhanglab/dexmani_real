@@ -151,7 +151,7 @@ All streams are aligned to one `dt=1/50` time grid at record time (`TimestampAli
 keyed by `state.timestamp`; camera frames stream per-frame but stay length-aligned to the grid.
 
 ```
-episode_NNN.h5
+episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collision
   /meta (group)
     attrs: schema_version(=4), task_label, operator, tags, duration, fps, num_frames,
            success, min_frames_met, has_camera, has_timestamps,

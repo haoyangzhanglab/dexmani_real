@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real.config.camera_calib import CameraCalib
 
 
+def _depth_intrinsics_ok(profile: rs.pipeline_profile) -> bool:
+    """The L515 can get stuck in a state where depth intrinsics for VGA/XGA
+    (640x480 / 1024x768) fail to load — only QVGA (320x240) survives — which
+    then makes rs.align throw "intrinsics for resolution 640,480 doesn't exist".
+    The calibration is intact; a hardware_reset() reloads it. Returns whether the
+    started depth stream actually has intrinsics."""
+    try:
+        profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _apply_l515_preset() -> None:
+    """Apply the production L515 depth preset to the device BEFORE streaming,
+    reusing sensor/realsense.py so the diagnostic matches production. On hosts
+    whose kernel blocks the load_json/XU path, this falls back to the UVC-safe
+    options (noise_filtering/confidence/min_distance) via set_option.
+    Single-camera setup: uses the first enumerated device."""
+    from dexmani_real.sensor.realsense import L515DepthConfig, apply_l515_depth_config
+
+    devices = rs.context().query_devices()
+    if len(devices) == 0:
+        print("  L515 preset skipped: no device found.")
+        return
+    status = apply_l515_depth_config(devices[0], L515DepthConfig(), depth_resolution=(640, 480), fps=30)
+    print(
+        {
+            "json": "  L515 preset applied via load_json (short-range).",
+            "fallback": "  L515 preset: load_json blocked by kernel UVC; applied UVC-safe subset "
+            "(noise_filtering/confidence/min_distance) via set_option.",
+            "failed": "  L515 preset could not be applied — using firmware defaults.",
+            "disabled": "  L515 preset disabled.",
+        }.get(status, f"  L515 preset status: {status}")
+    )
+
+
 def main() -> None:
     # ── 1. Connect to RealSense ───────────────────────────────────────────────
     print("Connecting to RealSense...")
@@ -29,7 +67,27 @@ def main() -> None:
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
+    # Apply the production L515 depth preset (short-range visual preset, confidence
+    # threshold, noise filtering, min-distance) at the firmware source — attenuates
+    # edge flying-line *generation*. Must load on the device BEFORE streaming: the
+    # preset's sensor-mode/stream keys can't change mid-stream.
+    USE_L515_PRESET = True
+    if USE_L515_PRESET:
+        _apply_l515_preset()
+
+    # If the L515 is stuck without VGA depth intrinsics, rs.align later throws.
+    # Detect it right after start and recover with a one-shot hardware_reset.
     profile = pipeline.start(config)
+    if not _depth_intrinsics_ok(profile):
+        print("  Depth intrinsics missing (L515 bad state) — hardware_reset() and retry...")
+        profile.get_device().hardware_reset()
+        time.sleep(12)
+        if USE_L515_PRESET:
+            _apply_l515_preset()  # reset reloaded firmware defaults
+        pipeline = rs.pipeline()
+        profile = pipeline.start(config)
+        if not _depth_intrinsics_ok(profile):
+            raise RuntimeError("L515 depth intrinsics still missing after hardware_reset.")
 
     # Device info
     device = profile.get_device()
@@ -56,46 +114,13 @@ def main() -> None:
         pipeline.wait_for_frames()
     print("  Done.")
 
-    # ── 2. Capture frames (with optional post-processing) ─────────────────────
-    # L515 "edge elongation" = ToF flying pixels: a boundary pixel's FoV straddles
-    # foreground + background, so its depth is a blend that bridges object → bg.
-    # SDK filter chain to attenuate it (spatial in disparity space = edge-preserving):
-    #     disparity → spatial → temporal → depth
-    # Temporal is an EMA across frames, so it is a no-op on a single frame — we feed
-    # it a short burst of the (static) scene so both spatial + temporal are effective.
-    USE_SDK_FILTERS = True
-    BURST = 15 if USE_SDK_FILTERS else 1
+    # ── 2. Capture one aligned RGBD frame ─────────────────────────────────────
+    print("\nCapturing one aligned RGBD frame...")
+    frames = pipeline.wait_for_frames()
+    aligned = align.process(frames)
+    aligned_depth_frame = aligned.get_depth_frame()
 
-    to_disparity = rs.disparity_transform(True)
-    to_depth = rs.disparity_transform(False)
-    spatial = rs.spatial_filter()
-    spatial.set_option(rs.option.filter_magnitude, 2)
-    spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
-    spatial.set_option(rs.option.filter_smooth_delta, 20)  # low delta = preserve edges
-    spatial.set_option(rs.option.holes_fill, 0)            # don't invent depth
-    temporal = rs.temporal_filter()
-    temporal.set_option(rs.option.filter_smooth_alpha, 0.3)
-    temporal.set_option(rs.option.filter_smooth_delta, 20)
-
-    def postprocess(df: rs.depth_frame) -> rs.depth_frame:
-        f = to_disparity.process(df)
-        f = spatial.process(f)
-        f = temporal.process(f)
-        f = to_depth.process(f)
-        return f.as_depth_frame()
-
-    print(f"\nCapturing {'a burst of ' + str(BURST) if USE_SDK_FILTERS else 'one'} "
-          f"aligned RGBD frame(s) (SDK filters={'ON' if USE_SDK_FILTERS else 'OFF'})...")
-    frames = None
-    aligned = None
-    aligned_depth_frame = None
-    for _ in range(BURST):
-        frames = pipeline.wait_for_frames()
-        aligned = align.process(frames)
-        df = aligned.get_depth_frame()
-        aligned_depth_frame = postprocess(df) if (USE_SDK_FILTERS and df) else df
-
-    # --- Diagnose raw depth (before alignment, last frame of burst) ---
+    # --- Diagnose raw depth (before alignment) ---
     raw_depth_frame = frames.get_depth_frame()
     if raw_depth_frame:
         raw_depth = np.asanyarray(raw_depth_frame.get_data())
@@ -146,11 +171,98 @@ def main() -> None:
     # RGB: BGR→RGB
     rgb = rgb_bgr[..., ::-1]
     print(f"  RGB:  {rgb.shape} {rgb.dtype}")
-    print(f"  Depth: {depth.shape} {depth.dtype}  nonzero={aligned_valid if 'aligned_valid' in dir() else (depth > 0).sum()}")
+    print(f"  Depth: {depth.shape} {depth.dtype}  nonzero={(depth > 0).sum()}")
 
     # ── 3. Camera-frame point cloud ───────────────────────────────────────────
     print("\nGenerating camera-frame point cloud...")
     depth_m = depth.astype(np.float64) * depth_scale  # raw uint16 → meters
+
+    # Remove ToF flying pixels at depth edges: deletes the 1-3px "ramp" that a
+    # LiDAR spot straddling an object boundary paints between foreground and
+    # background. Conservative — only sets pixels to 0, never fills/interpolates.
+    #
+    # gap=3      : samples each side from k = gap+1, skipping the ramp body so it
+    #              no longer contaminates the clean-surface mean/std (this is the
+    #              fix for the old k=1 sampling ceiling); pair with sample_radius=9
+    #              so enough clean samples remain past the dead-zone.
+    # adaptive   : with beta = 1/fx, edge/noise/margin become dimensionless
+    #              multipliers of the local lateral spacing d·β (η = k·d·β), so one
+    #              setting covers 0.3–2.5 m (≈4mm @0.5m … ≈19mm @2.5m). Set
+    #              USE_ADAPTIVE_THRESHOLDS=False for fixed absolute-meter thresholds.
+    # edge gate  : USE_EDGE_GATE requires an aligned-color edge to co-occur with the
+    #              depth-gradient candidate (experimental; assumes aligned depth).
+    USE_FLYING_PIXEL_REMOVAL = True
+    USE_ADAPTIVE_THRESHOLDS = True  # η = k·d·β (P1-4); False → fixed absolute meters
+    USE_EDGE_GATE = False  # experimental color-edge AND-gate (P1-5)
+    if USE_FLYING_PIXEL_REMOVAL:
+        import cv2
+
+        from dexmani_real.utils import remove_flying_pixels_at_edges
+
+        # Optional edge gate: keep a candidate only where the aligned color image
+        # also shows an edge — an independent second cue against false deletion.
+        edge_gate = None
+        if USE_EDGE_GATE:
+            gray = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2GRAY)
+            sx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+            sy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+            color_edges = np.sqrt(sx**2 + sy**2) > 60.0
+            edge_gate = cv2.dilate(color_edges.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+
+        n_before = int((depth_m > 0).sum())
+        if USE_ADAPTIVE_THRESHOLDS:
+            depth_m = remove_flying_pixels_at_edges(
+                depth_m.astype(np.float32),
+                edge_threshold=4.0,  # ×(d·β) multipliers, not meters
+                noise_threshold=10.0,
+                margin=6.0,
+                sample_radius=9,
+                gap=3,
+                beta=1.0 / float(K[0, 0]),
+                edge_gate_mask=edge_gate,
+            ).astype(np.float64)
+        else:
+            depth_m = remove_flying_pixels_at_edges(
+                depth_m.astype(np.float32),
+                edge_threshold=0.008,
+                noise_threshold=0.008,  # tightened vs old 0.015 now the ramp is skipped
+                margin=0.009,
+                sample_radius=9,
+                gap=3,
+                edge_gate_mask=edge_gate,
+            ).astype(np.float64)
+        n_after = int((depth_m > 0).sum())
+        print(f"  Flying-pixel removal (adaptive={USE_ADAPTIVE_THRESHOLDS}, gate={USE_EDGE_GATE}): "
+              f"{n_before} → {n_after} valid depth px (removed {n_before - n_after} edge flyers)")
+
+    # ── 3.5 RGBD 2D visualization (RGB | depth raw | depth filtered) ──────────
+    # Side-by-side so the flying-pixel removal is visible in 2D: the raw depth
+    # still carries the edge ramps; the filtered depth has them zeroed (black).
+    # Colormap spans the workspace range [0.3, 2.5] m.
+    USE_RGBD_VIS = True
+    if USE_RGBD_VIS:
+        import cv2
+
+        from dexmani_real.utils.pointcloud_utils import make_depth_vis
+
+        raw_depth_m = depth.astype(np.float64) * depth_scale  # pre-filter meters
+        panels = [
+            ("RGB", rgb_bgr),
+            ("Depth raw", make_depth_vis(raw_depth_m, 0.3, 2.5)),
+            ("Depth filtered", make_depth_vis(depth_m, 0.3, 2.5)),
+        ]
+        labeled = []
+        for title, img in panels:
+            img = img.copy()
+            cv2.putText(img, title, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            labeled.append(img)
+        try:
+            print("\nShowing RGBD window (RGB | depth raw | depth filtered) — press any key to continue...")
+            cv2.imshow("RGBD: RGB | depth raw | depth filtered", np.hstack(labeled))
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        except cv2.error as e:
+            print(f"  RGBD window skipped (no display?): {e}")
 
     h, w = depth.shape
     u, v = np.meshgrid(np.arange(w), np.arange(h))
@@ -167,12 +279,12 @@ def main() -> None:
     z_cam = points_flat[:, 2]  # depth = Z in camera frame
     valid = (
         np.isfinite(points_flat).all(axis=1)
-        & (z_cam > 0.05)
-        & (z_cam < 2.0)
+        & (z_cam > 0.3)
+        & (z_cam < 2.5)
     )
     pts_cam = points_flat[valid]
     col_cam = colors_flat[valid]
-    print(f"  Valid depth range [0.05, 2.0]m: {valid.sum()} / {valid.size} points")
+    print(f"  Valid depth range [0.3, 2.5]m: {valid.sum()} / {valid.size} points")
     print(f"  Camera-frame points: {pts_cam.shape[0]}")
 
     if pts_cam.shape[0] == 0:
@@ -182,10 +294,10 @@ def main() -> None:
         z_min, z_max = z_cam.min(), z_cam.max()
         print(f"     depth_m min/max = {z_min:.4f}/{z_max:.4f} m")
         n_neg = (z_cam <= 0).sum()
-        n_lo = ((z_cam > 0) & (z_cam <= 0.05)).sum()
-        n_ok = ((z_cam > 0.05) & (z_cam < 2.0)).sum()
-        n_hi = (z_cam >= 2.0).sum()
-        print(f"     z<=0: {n_neg}, 0<z<=0.05: {n_lo}, 0.05<z<2.0: {n_ok}, z>=2.0: {n_hi}")
+        n_lo = ((z_cam > 0) & (z_cam <= 0.3)).sum()
+        n_ok = ((z_cam > 0.3) & (z_cam < 2.5)).sum()
+        n_hi = (z_cam >= 2.5).sum()
+        print(f"     z<=0: {n_neg}, 0<z<=0.3: {n_lo}, 0.3<z<2.5: {n_ok}, z>=2.5: {n_hi}")
         pipeline.stop()
         return
 
@@ -209,55 +321,44 @@ def main() -> None:
     pts_world = (pts_cam_h @ T_world_camera.T)[:, :3]
     print(f"  World-frame points: {pts_world.shape[0]}")
 
-    # ── 4.1 Spatial crop in world frame ────────────────────────────────────
+    # ── 4.1 Spatial crop (X/Y workspace + loose Z guard) ─────────────────────
+    # X/Y limits the cloud to the workspace footprint so the desk (not the floor
+    # or a wall) is the dominant plane for RANSAC. The Z here is only a loose
+    # guard against gross outliers (ceiling / deep background) — intentionally
+    # wide so it does NOT pre-assume the desk height; the tight desk-anchored Z
+    # crop happens in §6.1 AFTER the plane is fit.
     x_min, x_max = 0.0, 0.8
-    y_min, y_max = -0.5, 0.5
-    z_min, z_max = 0.0, 0.6
+    y_min, y_max = -0.6, 0.6
+    z_guard_lo, z_guard_hi = -0.2, 0.8
     crop_mask = (
         (pts_world[:, 0] >= x_min) & (pts_world[:, 0] <= x_max)
         & (pts_world[:, 1] >= y_min) & (pts_world[:, 1] <= y_max)
-        & (pts_world[:, 2] >= z_min) & (pts_world[:, 2] <= z_max)
+        & (pts_world[:, 2] >= z_guard_lo) & (pts_world[:, 2] <= z_guard_hi)
     )
     pts_world = pts_world[crop_mask]
     col_cam = col_cam[crop_mask]
-    print(f"  After crop (x∈[{x_min},{x_max}], y∈[{y_min},{y_max}], z∈[{z_min},{z_max}]): "
-          f"{pts_world.shape[0]} points")
+    print(f"  After X/Y crop (x∈[{x_min},{x_max}], y∈[{y_min},{y_max}], "
+          f"z guard∈[{z_guard_lo},{z_guard_hi}]): {pts_world.shape[0]} points")
 
-    # ── 5. open3d visualization ───────────────────────────────────────────────
-    print("\nLaunching open3d visualizer (close window to continue)...")
-
+    # ── 5. Build point cloud + clean residual flyers ─────────────────────────
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts_world.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(col_cam.astype(np.float64))
 
-    # ── 4.3 Remove residual flying pixels / edge tails ────────────────────────
-    # SDK spatial/temporal attenuates but does not delete the interpolated edge
-    # tails (they can carry high confidence). Statistical outlier removal drops
-    # points whose mean k-NN distance is an outlier — i.e. the sparse points
-    # bridging foreground → background. (Alternative: remove_radius_outlier.)
-    USE_OUTLIER_REMOVAL = True
+    # ── 5.1 Remove residual flying pixels / edge tails ────────────────────────
+    # The 2D depth-edge filter misses flying lines that are structured in the
+    # depth map but sparse in 3D. In the point cloud those bridging points are
+    # exactly radius-outliers: a surface point has dozens–hundreds of neighbours
+    # within 1cm (full-res spacing ≈ depth/fx ≈ 1mm @0.6m … 3mm @2m), a flying
+    # line point has far fewer. remove_radius_outlier is the targeted tool.
+    USE_OUTLIER_REMOVAL = False
     if USE_OUTLIER_REMOVAL and len(pcd.points) > 0:
         n_before = len(pcd.points)
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        print(f"  Statistical outlier removal: {n_before} → {len(pcd.points)} points "
-              f"(removed {n_before - len(pcd.points)} flying pixels)")
+        pcd, _ = pcd.remove_radius_outlier(nb_points=40, radius=0.01)
+        print(f"  Radius outlier removal: {n_before} → {len(pcd.points)} points "
+              f"(removed {n_before - len(pcd.points)} flying-line points)")
 
-    # Downsample for faster rendering
-    pcd_ds = pcd.voxel_down_sample(voxel_size=0.003)
-    print(f"  Downsampled: {len(pcd_ds.points)} points (3mm voxel)")
-
-    world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-    camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
-    camera_frame.transform(T_world_camera)
-
-    print("  Window 1: world-frame point cloud + coordinate frames")
-    o3d.visualization.draw_geometries(
-        [pcd_ds, world_frame, camera_frame],
-        window_name="World-frame Point Cloud",
-        point_show_normal=False,
-    )
-
-    # ── 6. Fit desk plane (RANSAC on FULL pcd for accuracy) ───────────────────
+    # ── 6. Fit desk plane (RANSAC) — before the tight Z crop ──────────────────
     print("\nFitting desk plane (RANSAC, distance threshold = 1 cm)...")
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=0.01, ransac_n=3, num_iterations=1000
@@ -282,7 +383,35 @@ def main() -> None:
     print(f"  Desk Z (world):   mean={desk_z_mean:.4f} m  std={desk_z_std:.4f} m")
     print(f"  Tilt from horiz:  {angle_deg:.1f}°")
 
-    # ── 7. Color-coded desk segmentation on downsampled pcd ───────────────────
+    # ── 6.1 Tight Z crop anchored at the measured desk plane ──────────────────
+    # Now that the desk height is known, keep a band from just below the desk
+    # surface up to workspace height — no dependence on a pre-assumed desk Z.
+    Z_BELOW_DESK, Z_ABOVE_DESK = 0.03, 0.6
+    z_lo, z_hi = desk_z_mean - Z_BELOW_DESK, desk_z_mean + Z_ABOVE_DESK
+    pts_all = np.asarray(pcd.points)
+    col_all = np.asarray(pcd.colors)
+    zmask = (pts_all[:, 2] >= z_lo) & (pts_all[:, 2] <= z_hi)
+    pcd.points = o3d.utility.Vector3dVector(pts_all[zmask])
+    pcd.colors = o3d.utility.Vector3dVector(col_all[zmask])
+    print(f"  After desk-anchored Z crop (z∈[{z_lo:.3f},{z_hi:.3f}]): {int(zmask.sum())} points")
+
+    # ── 7. Downsample + visualize ─────────────────────────────────────────────
+    pcd_ds = pcd.voxel_down_sample(voxel_size=0.003)
+    print(f"  Downsampled: {len(pcd_ds.points)} points (3mm voxel)")
+
+    world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
+    camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
+    camera_frame.transform(T_world_camera)
+
+    print("\nLaunching open3d visualizer (close window to continue)...")
+    print("  Window 1: world-frame point cloud + coordinate frames")
+    o3d.visualization.draw_geometries(
+        [pcd_ds, world_frame, camera_frame],
+        window_name="World-frame Point Cloud",
+        point_show_normal=False,
+    )
+
+    # ── 8. Color-coded desk segmentation on downsampled pcd ───────────────────
     # Map inlier status from full pcd → downsampled pcd via KD-tree
     inlier_pcd = o3d.geometry.PointCloud()
     inlier_pcd.points = o3d.utility.Vector3dVector(inlier_pts_full.astype(np.float64))

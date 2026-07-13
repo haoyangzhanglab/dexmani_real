@@ -13,7 +13,7 @@
 | 平滑 | 关节空间速度限幅 / Ruckig OTG | 笛卡尔 EMA (pos α=0.8, rot α=0.4) |
 | 碰撞检测 | Pinocchio @ 300Hz | MPlib (`_check_teleop_collision_gate`) |
 | 相机存储 | MP4 (libx264rgb CRF 18) | HDF5 raw `/rgb(T,H,W,3)` |
-| 数据布局 | `episode_NNNN/` 目录, HDF5+MP4+MKV | 单文件 `episode_NNN.h5` |
+| 数据布局 | `episode_NNNN/` 目录, HDF5+MP4+MKV | 单文件 `episode_YYYYMMDD_HHMMSS.h5` |
 | 成功/失败 | 目录移动 (`success/` `failure/`) | HDF5 `/meta` 属性 + JSON |
 | 写入模式 | 阻塞 put, 无界队列, 每100帧 flush | `put_nowait`, 有界队列(2000), 无 flush |
 | 状态机 | INIT→WAITING→IN_EPISODE | IDLE⇄TELEOP⇄PAUSED+EMERGENCY |
@@ -75,7 +75,7 @@
 | 35 | **无 Delta-EEF action 空间** | 策略输出相对于 chunk-start 的 delta EEF + chunk 边界 FK 漂移修正 | `solve_teleop_ik()` 接收绝对姿态 | `solve_delta_eef_ik(delta_pos, delta_rot6d, current_eef, current_qpos)` | 100 |
 | 36 | **Ruckig OTG** | `arm_hand_control.py:760-780` — v/a/jerk 限制在线轨迹生成 | xArm Mode 6 固件已有轨迹规划。Ruckig 增加预测层 | 基准测试：EMA vs EMA+速度限幅 vs Ruckig | 150 |
 | 37 | **ACT 时序聚合** | `eval_trex_async.py:75-96` 指数加权平均多个 chunk 预测 | 无。每帧独立 IK 求解 | `aggregate_chunks()` 纯函数 | 22 |
-| 38 | **单文件 vs 目录结构** | 每 episode 目录 + MP4/MKV + 成功/失败子目录路由 | 单文件 `episode_NNN.h5`，平坦结构 | 每 episode 目录 + 成功/失败子目录 | 200 |
+| 38 | **单文件 vs 目录结构** | 每 episode 目录 + MP4/MKV + 成功/失败子目录路由 | 单文件 `episode_YYYYMMDD_HHMMSS.h5`，平坦结构 | 每 episode 目录 + 成功/失败子目录 | 200 |
 | 39 | **相机 MP4 编码** | libx264rgb CRF 18 (~0.02MB/帧 vs ~0.9MB 原始) | 原始 uint8，无视频编码 | 基准测试驱动：选编码器、调 CRF、测 PSNR/SSIM | 400 |
 | 40 | **_tick_mode4() 过时注释** | N/A（DexMani 特有） | 3 处引用不存在的 `_tick_mode4()`，且错误声称 250Hz | 替换为正确描述（固件 Mode 6 负责限速） | 3 |
 

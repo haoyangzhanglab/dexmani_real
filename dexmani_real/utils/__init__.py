@@ -1,6 +1,6 @@
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
-from dexmani_real.utils.pointcloud_utils import PointCloudConfig, rgbd_to_pointcloud
+from dexmani_real.utils.pointcloud_utils import PointCloudConfig, remove_flying_pixels_at_edges, rgbd_to_pointcloud
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.rate_manager import RateManager, StreamStats
 from dexmani_real.utils.serialization import from_dict_helper
@@ -16,6 +16,7 @@ __all__ = [
     "PointCloudConfig",
     "RateLimiter",
     "RateManager",
+    "remove_flying_pixels_at_edges",
     "rgbd_to_pointcloud",
     "StreamStats",
 ]

@@ -10,7 +10,7 @@ cv2.calibrateHandEye（5 种算法比选）自动求解相机外参。
 结果写入 dexmani_real/config/cameras.json，与 CameraCalib 兼容。
 
 硬件准备:
-  1. 打印 ArUco 7x7_50 标记 (ID=1)，尺寸 80mm×80mm
+  1. 打印 ArUco 7x7_50 标记 (ID=1)，尺寸 98.2mm×98.2mm
   2. 将标记贴在 xArm7 末端（手底座侧面，平整、对相机可见）
   3. RealSense 相机固定在三脚架上，视野覆盖操作空间
   4. 确保 conda 环境已安装: pyrealsense2, opencv-python, scipy
@@ -21,7 +21,7 @@ cv2.calibrateHandEye（5 种算法比选）自动求解相机外参。
   python calibrate_camera.py
 
 操作:
-  WASD / ↑↓←→    移动 EEF（与 keyboard_teleop 一致）
+  WASD / ↑↓       移动 EEF（与 keyboard_teleop 一致）
   ←→             绕 X 轴旋转 (roll)
   I / K          绕 Y 轴旋转 (pitch)
   J / L          绕 Z 轴旋转 (yaw)
@@ -73,7 +73,7 @@ except ImportError:
     raise ImportError(
         "pynput is required for keyboard input. Install with: pip install pynput"
     )
-from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
+from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.rate_limiter import RateLimiter
 
@@ -95,7 +95,7 @@ WORKSPACE_BOUNDS = np.array([
 # ArUco 标记参数
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
-MARKER_SIZE_M = 0.08   # 标记边长 (m)
+MARKER_SIZE_M = 0.0982   # 标记边长 (m)
 MARKER_ID = 1          # 期望的标记 ID（None = 接受任意 ID）
 
 # 相机外参保存路径（包内 config/，与 CameraCalib 默认读取路径一致）
@@ -109,6 +109,10 @@ MIN_SAMPLES = 10
 
 # 标定质量门槛：T_ee_marker 位置一致性 std 超过此值(mm)则拒绝写盘
 MAX_CONSISTENCY_STD_MM = 5.0
+
+# 标定质量门槛(旋转)：T_ee_marker 旋转一致性 std 超过此值(deg)则拒绝写盘。
+# ArUco 单标记朝向本身较嘈杂(平面翻转歧义)，故阈值偏宽松，可按需收紧。
+MAX_CONSISTENCY_ROT_STD_DEG = 3.0
 
 
 # ═══════════════════════════════════════════════ 键盘输入
@@ -252,9 +256,9 @@ def detect_aruco_pose(
     gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
     dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
     params = cv2.aruco.DetectorParameters()
-    # [#3 未启用] 单个 ArUco marker 的角点可开子像素精修以提升位姿精度（对单 marker
-    # 有益；ChArUco 板则相反，应保持 CORNER_REFINE_NONE）。如需启用取消下一行注释：
-    # params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    # 单个 ArUco marker 开启角点子像素精修以提升位姿精度（对单 marker 有益；
+    # ChArUco 板相反，应保持 CORNER_REFINE_NONE）。
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(dictionary, params)
     corners, ids, _ = detector.detectMarkers(gray)
 
@@ -430,16 +434,17 @@ def compute_marker_consistency(
     rpy_ee2base_list: list[np.ndarray],
     rvec_marker2camera_list: list[np.ndarray],
     tvec_marker2camera_list: list[np.ndarray],
-) -> np.ndarray:
-    """计算标定质量指标：各样本 T_ee_marker 位置的一致性偏差 (mm)，返回 (N,)。
+) -> tuple[np.ndarray, np.ndarray]:
+    """计算标定质量指标：各样本 T_ee_marker 的位置/旋转一致性偏差，返回 (residuals_mm, residuals_deg)，均为 (N,)。
 
     注意：这不是像素重投影误差。对于 eye-to-hand:
         T_ee_marker = inv(T_base_ee) * T_base_camera * T_camera_marker
     由于 marker 刚性固定在末端，理论上该量在所有样本间应完全一致；标定越准，
-    各样本的 T_ee_marker 越接近。这里取其位置部分与均值的偏差 (mm) 作为质量指标
-    （旋转部分未纳入）。
+    各样本的 T_ee_marker 越接近。这里取其位置部分与均值的偏差 (mm)，以及旋转部分
+    与平均旋转的夹角 (deg)，作为质量指标。
     """
-    errors = []
+    positions = []
+    rotations = []
     for tvec_ee, rpy_ee, rvec_m2c, tvec_m2c in zip(
         tvec_ee2base_list, rpy_ee2base_list,
         rvec_marker2camera_list, tvec_marker2camera_list,
@@ -454,13 +459,19 @@ def compute_marker_consistency(
 
         # 闭环: T_ee_marker = inv(T_base_ee) * T_base_camera * T_camera_marker
         T_ee_marker = np.linalg.inv(T_base_ee) @ T_base_camera @ T_camera_marker
-        errors.append(T_ee_marker[:3, 3].copy())
+        positions.append(T_ee_marker[:3, 3].copy())
+        rotations.append(T_ee_marker[:3, :3].copy())
 
-    errors = np.array(errors)  # (N, 3)
-    # 每个样本的 T_ee_marker 位置与均值的偏差 (mm)
-    mean_pos = errors.mean(axis=0)
-    residuals_mm = np.linalg.norm(errors - mean_pos, axis=1) * 1000.0
-    return residuals_mm
+    # 位置：每个样本的 T_ee_marker 位置与均值的偏差 (mm)
+    positions = np.array(positions)  # (N, 3)
+    mean_pos = positions.mean(axis=0)
+    residuals_mm = np.linalg.norm(positions - mean_pos, axis=1) * 1000.0
+
+    # 旋转：每个样本的 T_ee_marker 旋转与平均旋转的夹角 (deg)
+    rots = R.from_matrix(np.array(rotations))
+    mean_rot = rots.mean()
+    residuals_deg = np.degrees((mean_rot.inv() * rots).magnitude())
+    return residuals_mm, residuals_deg
 
 
 def calibrate_and_select(
@@ -468,14 +479,14 @@ def calibrate_and_select(
     rpy_ee2base_list: list[np.ndarray],
     rvec_marker2camera_list: list[np.ndarray],
     tvec_marker2camera_list: list[np.ndarray],
-) -> tuple[np.ndarray, str, np.ndarray, list[tuple[str, float]]]:
-    """跑全部 5 种手眼算法，返回一致性 std 最小的那组结果。
+) -> tuple[np.ndarray, str, np.ndarray, np.ndarray, list[tuple[str, float]]]:
+    """跑全部 5 种手眼算法，返回位置一致性 std 最小的那组结果。
 
     Returns:
-        (T_best, name_best, errors_mm_best, table)
+        (T_best, name_best, errors_mm_best, errors_deg_best, table)
         table: [(method_name, std_mm), ...]，供打印对比（失败的算法 std 记为 nan）。
     """
-    best: tuple[float, str, np.ndarray, np.ndarray] | None = None
+    best: tuple[float, str, np.ndarray, np.ndarray, np.ndarray] | None = None
     table: list[tuple[float, float]] = []
     for name, m in HAND_EYE_METHODS.items():
         try:
@@ -483,22 +494,22 @@ def calibrate_and_select(
                 tvec_ee2base_list, rpy_ee2base_list,
                 rvec_marker2camera_list, tvec_marker2camera_list, method=m,
             )
-            errors = compute_marker_consistency(
+            errors_mm, errors_deg = compute_marker_consistency(
                 T, tvec_ee2base_list, rpy_ee2base_list,
                 rvec_marker2camera_list, tvec_marker2camera_list,
             )
-            std_mm = float(errors.std())
+            std_mm = float(errors_mm.std())
         except cv2.error:
             table.append((name, float("nan")))
             continue
         table.append((name, std_mm))
         if best is None or std_mm < best[0]:
-            best = (std_mm, name, T, errors)
+            best = (std_mm, name, T, errors_mm, errors_deg)
 
     if best is None:
         raise RuntimeError("所有手眼算法均失败")
-    _, name_best, T_best, errors_best = best
-    return T_best, name_best, errors_best, table
+    _, name_best, T_best, errors_mm_best, errors_deg_best = best
+    return T_best, name_best, errors_mm_best, errors_deg_best, table
 
 
 # ═══════════════════════════════════════════════ cameras.json 写入
@@ -590,8 +601,8 @@ def do_return_home(
 def main():
     print("=" * 60)
     print("  ArUco 手眼标定 — xArm7 + RealSense (eye-to-hand)")
-    print(f"  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M*1000:.0f}mm")
-    print(f"  移动: WASD/↑↓←→  旋转: ←→(roll) IK(pitch) JL(yaw)")
+    print(f"  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M*1000:.1f}mm")
+    print(f"  移动: WASD/↑↓  旋转: ←→(roll) IK(pitch) JL(yaw)")
     print(f"  采集: SPACE  标定: ENTER(≥10,推荐10~20)  撤销: BACKSPACE  删最差帧: X  归位: R  退出: Q")
     print("=" * 60)
 
@@ -755,25 +766,29 @@ def main():
                 if event == "space":
                     # 采集标定样本
                     print(f"\n  [{len(samples_tvec_ee2base)+1}] 采集 ArUco 位姿...", end=" ", flush=True)
-                    ar_result = detect_aruco_stable(pipeline, INTRINSICS, DISTORTION)
-                    if ar_result is None:
-                        print("❌ 未检测到标记 — 跳过")
-                    else:
-                        rvec, tvec = ar_result
-                        pos_ee, rpy_ee = _get_ee_pose()
-                        if np.any(np.isnan(pos_ee)):
-                            print("❌ 无法读取末端位姿 — 跳过")
+                    try:
+                        ar_result = detect_aruco_stable(pipeline, INTRINSICS, DISTORTION)
+                        if ar_result is None:
+                            print("❌ 未检测到标记 — 跳过")
                         else:
-                            samples_rvec_marker2cam.append(rvec)
-                            samples_tvec_marker2cam.append(tvec)
-                            samples_tvec_ee2base.append(pos_ee)
-                            samples_rpy_ee2base.append(rpy_ee)
-                            last_residuals = None  # 样本变动，作废旧残差
-                            print(
-                                f"✓ (共 {len(samples_tvec_ee2base)} 组) "
-                                f"EE={np.round(pos_ee, 3)}m  "
-                                f"marker_dist={np.linalg.norm(tvec):.3f}m"
-                            )
+                            rvec, tvec = ar_result
+                            pos_ee, rpy_ee = _get_ee_pose()
+                            if np.any(np.isnan(pos_ee)):
+                                print("❌ 无法读取末端位姿 — 跳过")
+                            else:
+                                samples_rvec_marker2cam.append(rvec)
+                                samples_tvec_marker2cam.append(tvec)
+                                samples_tvec_ee2base.append(pos_ee)
+                                samples_rpy_ee2base.append(rpy_ee)
+                                last_residuals = None  # 样本变动，作废旧残差
+                                print(
+                                    f"✓ (共 {len(samples_tvec_ee2base)} 组) "
+                                    f"EE={np.round(pos_ee, 3)}m  "
+                                    f"marker_dist={np.linalg.norm(tvec):.3f}m"
+                                )
+                    except Exception as e:
+                        # 相机取帧异常（如 L515 卡死）——保住会话与已采集样本，不整场崩溃
+                        print(f"❌ 采集异常，跳过本次: {e}")
                 elif event == "backspace":
                     if samples_tvec_ee2base:
                         samples_tvec_ee2base.pop()
@@ -805,7 +820,7 @@ def main():
                         print(f"  ❌ 至少需要 {MIN_SAMPLES} 组样本，当前 {n} 组 — 请继续采集")
                     else:
                         print(f"\n  计算手眼标定 ({n} 组样本, 5 种算法比选)...")
-                        T_candidate, method_best, errors_mm, method_table = calibrate_and_select(
+                        T_candidate, method_best, errors_mm, errors_deg, method_table = calibrate_and_select(
                             samples_tvec_ee2base,
                             samples_rpy_ee2base,
                             samples_rvec_marker2cam,
@@ -819,16 +834,20 @@ def main():
                         )
                         T_candidate = T_world_base @ T_candidate
                         std_mm = float(errors_mm.std())
+                        std_deg = float(errors_deg.std())
                         last_residuals = errors_mm  # 逐帧残差，供 X 键定向删除
                         print(f"  各算法一致性 std (mm, 越小越好):")
                         for name, s in method_table:
                             mark = "  ← 选用" if name == method_best else ""
                             s_txt = "  失败" if np.isnan(s) else f"{s:7.1f}"
                             print(f"    {name:11s} {s_txt}{mark}")
-                        print(f"  标定质量 (选用 {method_best}, T_ee_marker 位置一致性):")
-                        print(f"    mean={errors_mm.mean():.1f}mm  "
+                        print(f"  标定质量 (选用 {method_best}, T_ee_marker 一致性):")
+                        print(f"    位置 mean={errors_mm.mean():.1f}mm  "
                               f"max={errors_mm.max():.1f}mm  "
                               f"std={std_mm:.1f}mm")
+                        print(f"    旋转 mean={errors_deg.mean():.2f}°  "
+                              f"max={errors_deg.max():.2f}°  "
+                              f"std={std_deg:.2f}°")
                         worst = int(np.argmax(errors_mm))
                         print(f"  逐帧残差 (mm, 越大越可疑):")
                         for i, r in enumerate(errors_mm):
@@ -840,14 +859,21 @@ def main():
                         quat_wxyz = R.from_matrix(T_candidate[:3, :3]).as_quat()[[3, 0, 1, 2]]
                         print(f"    quat (wxyz): {np.round(quat_wxyz, 4)}")
 
-                        if std_mm > MAX_CONSISTENCY_STD_MM:
-                            print(f"  ❌ 一致性 std={std_mm:.1f}mm > 阈值 {MAX_CONSISTENCY_STD_MM:.1f}mm — 拒绝写盘")
-                            print(f"     标定质量不达标，请增大末端姿态变化(I/K/J/L、←→)后重采；")
+                        pos_bad = std_mm > MAX_CONSISTENCY_STD_MM
+                        rot_bad = std_deg > MAX_CONSISTENCY_ROT_STD_DEG
+                        if pos_bad or rot_bad:
+                            reasons = []
+                            if pos_bad:
+                                reasons.append(f"位置 std={std_mm:.1f}mm > {MAX_CONSISTENCY_STD_MM:.1f}mm")
+                            if rot_bad:
+                                reasons.append(f"旋转 std={std_deg:.2f}° > {MAX_CONSISTENCY_ROT_STD_DEG:.1f}°")
+                            print(f"  ❌ 一致性不达标（{'；'.join(reasons)}）— 拒绝写盘")
+                            print(f"     请增大末端姿态变化(I/K/J/L、←→)后重采；")
                             print(f"     BACKSPACE 可逐个撤销可疑样本，再按 ENTER 重新计算。")
                         else:
                             T_world_camera = T_candidate
                             save_cameras_json(T_world_camera, serial, CAMERAS_JSON_PATH)
-                            print(f"  ✓ 标定完成 (选用 {method_best}, std={std_mm:.1f}mm)")
+                            print(f"  ✓ 标定完成 (选用 {method_best}, 位置 std={std_mm:.1f}mm, 旋转 std={std_deg:.2f}°)")
                 event = keys.pop_event()
 
             # ── 退出/急停 ──
@@ -967,10 +993,6 @@ def main():
 
             prev_qpos_cmd = ik_result.qpos.copy()
             arm_inner.set_target(ik_result.qpos)
-            robot.send_action(RobotAction(
-                arm_qpos_cmd=ik_result.qpos,
-                hand_qpos_cmd=np.zeros(12),
-            ))
 
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt — 退出")

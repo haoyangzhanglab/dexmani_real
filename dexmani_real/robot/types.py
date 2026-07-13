@@ -21,6 +21,7 @@ from dexmani_real.utils.serialization import from_dict_helper
 # Defined here (robot layer) because these are hardware properties, not teleop policy.
 # Used by both teleop safety checks and RobotInterface path execution.
 _ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
+_ARM_TEMP_LIMIT_C = 70.0  # joint temperature warning threshold (°C)
 
 if TYPE_CHECKING:
     from dexmani_real.planning.collision_config import CollisionConfig

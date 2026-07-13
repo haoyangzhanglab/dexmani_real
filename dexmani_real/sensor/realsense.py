@@ -47,19 +47,22 @@ class L515DepthConfig:
     D400 cameras such as D435/D455 will not use this config.
     """
 
-    enabled: bool = False
+    enabled: bool = True
 
     visual_preset: int = 5
     depth_units: float = 0.000250000011874363
     depth_offset: float = 4.5
     min_distance: int = 190
 
-    laser_power: int = 100
-    receiver_gain: int = 18
-    confidence_threshold: int = 1
+    laser_power: int = 70
+    receiver_gain: int = 12
+    confidence_threshold: int = 2
     digital_gain: int = 2
 
-    noise_filtering: int = 4
+    noise_filtering: int = 50
+    # rs.option.noise_filtering runtime scale is 0-6 (distinct from the JSON
+    # "Noise Filtering" value above); used by the set_option fallback.
+    noise_filtering_runtime: int = 3
     noise_estimation: float = 0.0
     pre_processing_sharpening: float = 0.0
     post_processing_sharpening: int = 1
@@ -116,6 +119,63 @@ class L515DepthConfig:
         return json.dumps(self.to_json_dict(depth_resolution, fps))
 
 
+def apply_l515_depth_config(
+    device: rs.device,
+    l515_config: L515DepthConfig | None,
+    depth_resolution: tuple[int, int],
+    fps: int,
+) -> str:
+    """Apply the L515 depth preset to a device (works before or after streaming).
+
+    Tries the full JSON preset via ``serializable_device.load_json`` first. On
+    hosts whose kernel uvcvideo backend rejects L515 XU controls ("Device or
+    resource busy"), load_json and visual_preset are unavailable — fall back to
+    the depth options that DO work over plain UVC (confidence_threshold,
+    min_distance, noise_filtering, laser_power, receiver_gain). See
+    docs/l515_backend_preset_fix.md.
+
+    Returns "json", "fallback", "failed", or "disabled".
+    """
+    if l515_config is None or not l515_config.enabled:
+        return "disabled"
+
+    try:
+        rs.serializable_device(device).load_json(l515_config.to_json_string(depth_resolution, fps))
+        return "json"
+    except (RuntimeError, OSError) as error:
+        logger.warning(
+            "L515 preset (load_json) not applied (%s); applying the UVC-safe subset "
+            "via set_option. Host UVC limitation, not a config error — see "
+            "docs/l515_backend_preset_fix.md.",
+            error,
+        )
+
+    # Fallback: options that work over plain UVC. noise_filtering uses the runtime
+    # 0-6 scale (noise_filtering_runtime), not the JSON value. visual_preset and
+    # digital_gain need the (blocked/flaky) XU path and are not retried here.
+    try:
+        depth_sensor = device.first_depth_sensor()
+    except (RuntimeError, OSError) as error:
+        logger.warning("L515 set_option fallback skipped (no depth sensor): %s", error)
+        return "failed"
+
+    applied = False
+    for option, value in (
+        (rs.option.confidence_threshold, l515_config.confidence_threshold),
+        (rs.option.min_distance, l515_config.min_distance),
+        (rs.option.noise_filtering, l515_config.noise_filtering_runtime),
+        (rs.option.laser_power, l515_config.laser_power),
+        (rs.option.receiver_gain, l515_config.receiver_gain),
+    ):
+        try:
+            if depth_sensor.supports(option):
+                depth_sensor.set_option(option, float(value))
+                applied = True
+        except (RuntimeError, OSError) as error:
+            logger.warning("L515 set_option(%s) failed: %s", option, error)
+    return "fallback" if applied else "failed"
+
+
 @dataclass(frozen=True)
 class RealSenseConfig:
     camera_name: str = "realsense"
@@ -126,6 +186,7 @@ class RealSenseConfig:
     enable_color: bool = True
     align_mode: AlignMode = "depth_to_color"
     depth_hole_filling: bool = False
+    enable_sdk_spatial_filter: bool = False
     enable_global_time: bool = True
     warmup_frames: int = 10
     frame_name: str | None = None
@@ -204,6 +265,9 @@ class RealSense:
         self.profile: rs.pipeline_profile | None = None
         self.aligner: rs.align | None = None
         self.hole_filling_filter: rs.hole_filling_filter | None = None
+        self.to_disparity: rs.disparity_transform | None = None
+        self.spatial_filter: rs.spatial_filter | None = None
+        self.to_depth: rs.disparity_transform | None = None
 
         self.depth_scale: float | None = None
         self.K: np.ndarray | None = None
@@ -219,12 +283,41 @@ class RealSense:
 
         Canonical lifecycle method per CLAUDE.md Section 2.3.
         Idempotent: calling on an already-connected camera returns True.
-        """
-        import warnings
 
+        On L515 a started pipeline can still fail to expose depth-stream
+        intrinsics (VGA/XGA), which makes rs.align throw on every frame. Only a
+        hardware_reset() reloads them — pipeline stop/start does not — so after
+        opening we verify the depth intrinsics and self-heal with a one-shot
+        reset if they are missing.
+        """
         if self.pipeline is not None:
             return True
 
+        if not self._open_pipeline():
+            return False
+        if self._depth_intrinsics_available():
+            return True
+
+        logger.warning(
+            "Depth stream exposes no intrinsics (L515 bad state) — "
+            "hardware_reset() and reconnecting once."
+        )
+        self._hardware_reset_and_wait()
+        if not self._open_pipeline():
+            return False
+        if not self._depth_intrinsics_available():
+            logger.error("Depth intrinsics still missing after hardware_reset — giving up.")
+            self.disconnect()
+            return False
+        return True
+
+    def _open_pipeline(self) -> bool:
+        """Discover device, apply model config, start + warm up the pipeline.
+
+        Returns True on success. On any failure the pipeline is torn down (via
+        disconnect) so a started-but-unusable pipeline is never left holding the
+        device — otherwise the next open would hit "Device or resource busy".
+        """
         try:
             self.active_serial = self.config.serial or self.find_default_serial()
             device = self.find_device_by_serial(self.active_serial)
@@ -234,24 +327,77 @@ class RealSense:
             return False
 
         rs_config = self.create_rs_config()
-
         try:
             self._start_pipeline(rs_config)
-        except RuntimeError as e:
-            logger.warning("connect() failed at pipeline start: %s", e)
-            self.pipeline = None
-            self.profile = None
+            self._setup_pipeline_post_start()
+            self._warmup_pipeline()
+        except (RuntimeError, OSError) as e:
+            logger.warning("connect() failed at pipeline start / warmup: %s", e)
+            self.disconnect()
+            return False
+        return True
+
+    def _depth_intrinsics_available(self) -> bool:
+        """Whether the started depth stream actually exposes intrinsics.
+
+        The L515 can stream depth yet report "intrinsics for resolution W,H
+        doesn't exist" for VGA/XGA, which breaks rs.align. The calibration is
+        intact; a hardware_reset() reloads it.
+        """
+        if self.profile is None:
+            return False
+        try:
+            self.profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
+            return True
+        except RuntimeError:
             return False
 
-        self._setup_pipeline_post_start()
-        self._warmup_pipeline()
+    def _hardware_reset_and_wait(self, settle_s: float = 12.0) -> None:
+        """Reset the device and wait for it to re-enumerate.
 
-        return True
+        Only a hardware_reset reloads L515 depth intrinsics; pipeline stop/start
+        does not. Captures the device handle before tearing down the pipeline.
+        """
+        device = None
+        if self.profile is not None:
+            try:
+                device = self.profile.get_device()
+            except RuntimeError:
+                device = None
+        self.disconnect()
+        if device is None and self.active_serial:
+            try:
+                device = self.find_device_by_serial(self.active_serial)
+            except RuntimeError:
+                device = None
+        if device is not None:
+            try:
+                device.hardware_reset()
+                logger.info("hardware_reset() issued; waiting %.0fs for re-enumeration.", settle_s)
+            except RuntimeError as e:
+                logger.warning("hardware_reset() failed: %s", e)
+        time.sleep(settle_s)
 
     def _setup_pipeline_post_start(self) -> None:
         """Configure aligner, filters, timestamps, and intrinsics after pipeline start."""
         self.aligner = self.create_aligner()
         self.hole_filling_filter = rs.hole_filling_filter(2) if self.config.depth_hole_filling else None
+
+        # Optional SDK spatial filter chain (disparity domain → edge-preserving).
+        # Attenuates L515 edge flying pixels at negligible CPU cost (C++ SDK).
+        if self.config.enable_sdk_spatial_filter:
+            self.to_disparity = rs.disparity_transform(True)
+            self.spatial_filter = rs.spatial_filter()
+            self.spatial_filter.set_option(rs.option.filter_magnitude, 2)
+            self.spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.5)
+            self.spatial_filter.set_option(rs.option.filter_smooth_delta, 20)
+            self.spatial_filter.set_option(rs.option.holes_fill, 0)  # never invent depth
+            self.to_depth = rs.disparity_transform(False)
+        else:
+            self.to_disparity = None
+            self.spatial_filter = None
+            self.to_depth = None
+
         self.set_global_time()
         self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
         self.update_intrinsics_from_profile()
@@ -322,6 +468,8 @@ class RealSense:
             return
         try:
             self.pipeline.stop()
+        except RuntimeError:
+            pass
         finally:
             self.pipeline = None
             self.profile = None
@@ -373,23 +521,12 @@ class RealSense:
             self.load_l515_depth_config(device)
 
     def load_l515_depth_config(self, device: rs.device) -> None:
-        l515_config = self.config.l515_depth_config
-        if l515_config is None or not l515_config.enabled:
-            return
-
-        json_string = l515_config.to_json_string(
+        apply_l515_depth_config(
+            device,
+            self.config.l515_depth_config,
             depth_resolution=self.config.depth_resolution,
             fps=self.config.fps,
         )
-        try:
-            serializable_device = rs.serializable_device(device)
-            serializable_device.load_json(json_string)
-        except (RuntimeError, OSError) as error:
-            logger.warning(
-                "Failed to load L515 depth preset (firmware may not support all keys). "
-                "Continuing with default depth settings. Error: %s",
-                error,
-            )
 
     @staticmethod
     def is_l515_device(device: rs.device) -> bool:
@@ -433,6 +570,15 @@ class RealSense:
             raise RuntimeError("Failed to get depth frame.")
         if self.config.enable_color and not color_frame:
             raise RuntimeError("Failed to get color frame.")
+
+        # Optional SDK spatial filter (disparity domain, edge-preserving).
+        # Must run *before* hole filling so the hole filler works on
+        # already-cleaned depth.
+        if self.to_disparity is not None:
+            depth_frame = self.to_disparity.process(depth_frame)
+            depth_frame = self.spatial_filter.process(depth_frame)  # type: ignore[union-attr]
+            depth_frame = self.to_depth.process(depth_frame)
+            depth_frame = depth_frame.as_depth_frame()
 
         if self.hole_filling_filter is not None:
             depth_frame = self.hole_filling_filter.process(depth_frame).as_depth_frame()

@@ -72,9 +72,16 @@ def _quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return qv_rot[1:]
 
 
-def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
-    """Convert wxyz quaternion to rotation vector (axis * angle)."""
-    w, x, y, z = q[0], q[1], q[2], q[3]
+def quat_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """Convert wxyz quaternion to rotation vector (axis * angle).
+
+    Handles quaternion double cover: q and -q represent the same rotation.
+    Forcing w ≥ 0 ensures the rotation vector angle is always ≤ π.
+    """
+    sign = np.asarray(q, dtype=np.float64)
+    if sign[0] < 0:
+        sign = -sign
+    w, x, y, z = sign[0], sign[1], sign[2], sign[3]
     sin_half = np.sqrt(x * x + y * y + z * z)
     if sin_half < 1e-12:
         return np.zeros(3, dtype=np.float64)
@@ -108,7 +115,7 @@ def pose_error_vector(target: Pose, actual: Pose, max_pos_step: float, max_rot_s
         position_error = position_error / position_norm * max_pos_step
 
     q_error = _quat_multiply(target.q, _quat_conjugate(actual.q))
-    rotation_vector = _quat_to_rotvec(q_error)
+    rotation_vector = quat_to_rotvec(q_error)
     rotation_norm = np.linalg.norm(rotation_vector)
     if rotation_norm > max_rot_step > 0:
         rotation_vector = rotation_vector / rotation_norm * max_rot_step

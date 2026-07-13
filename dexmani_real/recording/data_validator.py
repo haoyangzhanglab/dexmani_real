@@ -1,12 +1,15 @@
 """DataValidator — automated quality checks for teleop episodes.
 
-5 validation checks run on HDF5 episode files before Zarr export:
+7 validation check categories run on HDF5 episode files before Zarr export:
   1. no_nan_obs     — observations contain no NaN values
   2. no_nan_action  — actions contain no NaN values
   3. non_zero_variance — each dimension has variance > epsilon
   4. camera_fresh   — camera frames are non-all-zero (if camera data present)
   5. min_frames     — episode has >= 50 frames
-  6. no_duplicate_frames — no consecutive identical frames (stuck sensor)
+  6. no_duplicate_frames  — no consecutive identical frames (stuck sensor)
+  7. timestamp_monotonic  — timestamps strictly increasing
+
+The actual total varies per episode depending on which data streams are present.
 
 Ref: data collection loop design — Phase 3 (offline tools).
 """

@@ -13,7 +13,7 @@ from typing import Callable
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
-from dexmani_real.robot.types import RobotAction
+from dexmani_real.robot.types import RobotAction, _ARM_TEMP_LIMIT_C, _ARM_TORQUE_LIMIT_NM
 
 logger = get_logger(__name__)
 
@@ -23,6 +23,8 @@ def validate_action(
     action: RobotAction,
     *,
     actual_arm_qpos: np.ndarray | None = None,
+    actual_arm_tau: np.ndarray | None = None,
+    actual_arm_temps: np.ndarray | None = None,
     env_collision_check: Callable[[np.ndarray], bool] | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
@@ -30,10 +32,15 @@ def validate_action(
     Checks (fail-fast order):
       1. SDK error state (arm + hand is_error)
       2. Arm connection
-      3. Arm joint-limit clipping (qpos_min/max)
-      4. Hand joint-limit clipping (qpos_min/max)
+      3. Torque gating  — per-joint threshold check
+      4. Temperature gating — 70 °C per-joint threshold
+      5. Env collision check — caller-provided predicate (if wired)
+      6. Workspace clamp — per-axis clip (non-fatal)
+      7. Arm joint-limit clipping (qpos_min/max)
+      8. Hand joint-limit clipping (qpos_min/max)
 
-    Returns (ok, reason_string).
+    All new parameters are optional — None skips the check (backward
+    compatible with existing call sites).
     """
     # 1. Hardware error state
     if robot.is_error():
@@ -43,12 +50,40 @@ def validate_action(
     if not robot.arm.is_connected():
         return False, "arm not connected"
 
-    # 3. Joint-limit clipping (arm)
+    # 3. Torque gating (per-joint)
+    if actual_arm_tau is not None:
+        tau = np.asarray(actual_arm_tau, dtype=np.float64)
+        if tau.shape == (7,) and np.all(np.isfinite(tau)):
+            over_idx = np.where(np.abs(tau) > _ARM_TORQUE_LIMIT_NM)[0]
+            if len(over_idx) > 0:
+                return False, f"torque limit exceeded: joints={over_idx.tolist()}"
+
+    # 4. Temperature gating (per-joint)
+    if actual_arm_temps is not None:
+        temps = np.asarray(actual_arm_temps, dtype=np.float64)
+        if temps.shape == (7,) and np.all(np.isfinite(temps)):
+            over_idx = np.where(temps > _ARM_TEMP_LIMIT_C)[0]
+            if len(over_idx) > 0:
+                return False, f"temperature limit exceeded: joints={over_idx.tolist()}"
+
+    # 5. Env collision check (caller-provided predicate)
+    if env_collision_check is not None and actual_arm_qpos is not None:
+        try:
+            if not env_collision_check(actual_arm_qpos):
+                return False, "env collision detected"
+        except Exception as e:
+            logger.warning("env_collision_check raised: %s — skipping", e)
+
+    # 6. Workspace clamp (non-fatal)
+    if action.target_eef_pos is not None:
+        action.target_eef_pos[:] = robot.clamp_workspace_pos(action.target_eef_pos)
+
+    # 7. Joint-limit clipping (arm)
     arm_lo = robot.arm.config.qpos_min
     arm_hi = robot.arm.config.qpos_max
     action.arm_qpos_cmd[:] = np.clip(action.arm_qpos_cmd, arm_lo, arm_hi)
 
-    # 4. Joint-limit clipping (hand)
+    # 8. Joint-limit clipping (hand)
     hand_lo = robot.hand.config.qpos_min
     hand_hi = robot.hand.config.qpos_max
     if action.hand_qpos_cmd is not None:

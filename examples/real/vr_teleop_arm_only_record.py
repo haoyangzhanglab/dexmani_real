@@ -3,7 +3,7 @@
 
 在 vr_teleop_arm_only 基础上加入最小录制: 只录 5 路 —
 RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
-写入 episodes_arm/episode_NNN.h5 (所有流对齐到固定 50Hz 时间栅格)。
+写入 episodes_arm/episode_YYYYMMDD_HHMMSS.h5 (所有流对齐到固定 50Hz 时间栅格)。
 
 机械臂通过 VR wrist pose 控制 EEF 位姿，灵巧手在不可用时自动降级跳过。
 

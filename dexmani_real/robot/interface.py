@@ -102,13 +102,27 @@ class RobotInterface:
 
     def connect(self) -> dict[str, bool]:
         result: dict[str, bool] = {}
-        result["arm"] = self.arm.connect()
-        result["hand"] = self.hand.connect()
+        try:
+            result["arm"] = self.arm.connect()
+        except Exception as e:
+            logger.warning("Arm connect() raised exception: %s", e)
+            result["arm"] = False
+        try:
+            result["hand"] = self.hand.connect()
+        except Exception as e:
+            logger.warning("Hand connect() raised exception: %s", e)
+            result["hand"] = False
         return result
 
     def disconnect(self) -> None:
-        self.arm.disconnect()
-        self.hand.disconnect()
+        try:
+            self.arm.disconnect()
+        except Exception as e:
+            logger.warning("Arm disconnect() exception: %s", e)
+        try:
+            self.hand.disconnect()
+        except Exception as e:
+            logger.warning("Hand disconnect() exception: %s", e)
 
     def is_connected(self) -> bool:
         return self.arm.is_connected()
@@ -123,13 +137,27 @@ class RobotInterface:
         return self.arm.is_error() or self.hand.is_error()
 
     def clear_error(self) -> bool:
-        arm_ok = self.arm.clear_error()
-        hand_ok = self.hand.clear_error()
+        try:
+            arm_ok = self.arm.clear_error()
+        except Exception as e:
+            logger.warning("Arm clear_error() exception: %s", e)
+            arm_ok = False
+        try:
+            hand_ok = self.hand.clear_error()
+        except Exception as e:
+            logger.warning("Hand clear_error() exception: %s", e)
+            hand_ok = False
         return arm_ok and hand_ok
 
     def emergency_stop(self) -> None:
-        self.arm.stop()
-        self.hand.stop()
+        try:
+            self.arm.stop()
+        except Exception as e:
+            logger.warning("Arm emergency_stop() exception: %s", e)
+        try:
+            self.hand.stop()
+        except Exception as e:
+            logger.warning("Hand emergency_stop() exception: %s", e)
 
     # ── State ──
 
@@ -144,15 +172,25 @@ class RobotInterface:
             arm_qvel = nan_array(7)
             arm_tau = nan_array(7)
         else:
-            arm_state = self.arm.get_state()
-            arm_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-            arm_qvel = np.asarray(arm_state["qvel"], dtype=np.float64)
-            arm_tau = np.asarray(arm_state["tau"], dtype=np.float64)
+            try:
+                arm_state = self.arm.get_state()
+                arm_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
+                arm_qvel = np.asarray(arm_state["qvel"], dtype=np.float64)
+                arm_tau = np.asarray(arm_state["tau"], dtype=np.float64)
+            except Exception:
+                arm_qpos = nan_array(7)
+                arm_qvel = nan_array(7)
+                arm_tau = nan_array(7)
 
-        hand_state = self.hand.get_state()  # default mode now includes tactile (ref: DexUMI)
-        hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
-        hand_tactile_sum = np.asarray(hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64)
-        hand_tactile_force = np.asarray(hand_state.get("tactile_force", np.zeros((5, 120, 3))), dtype=np.float64)
+        try:
+            hand_state = self.hand.get_state()  # default mode now includes tactile (ref: DexUMI)
+            hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
+            hand_tactile_sum = np.asarray(hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64)
+            hand_tactile_force = np.asarray(hand_state.get("tactile_force", np.zeros((5, 120, 3))), dtype=np.float64)
+        except Exception:
+            hand_qpos = nan_array(12)
+            hand_tactile_sum = nan_array((5, 3))
+            hand_tactile_force = nan_array((5, 120, 3))
 
         # EEF FK
         if np.all(np.isfinite(arm_qpos)):

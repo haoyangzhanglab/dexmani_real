@@ -96,11 +96,13 @@ class EpisodeRecorder:
         if self._recording:
             return False
 
-        idx = 0
-        while (self.data_dir / f"episode_{idx:03d}.h5").exists():
-            idx += 1
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = self.data_dir / f"episode_{stamp}.h5"
+        dedup = 1
+        while path.exists():  # same-second collision → suffix, never overwrite
+            path = self.data_dir / f"episode_{stamp}_{dedup}.h5"
+            dedup += 1
 
-        path = self.data_dir / f"episode_{idx:03d}.h5"
         self._episode_path = str(path)
         self._frame_count = 0
         self._max_frames_reached = False

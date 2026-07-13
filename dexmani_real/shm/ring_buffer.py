@@ -413,6 +413,14 @@ class CameraRingBuffer:
             .reshape((depth_h, depth_w))
         )
 
+        # ── Seqlock: verify slot wasn't overwritten during our read ──
+        # The writer may wrap around and overwrite this slot between our
+        # initial sequence read and the data copies above.  Re-read the
+        # slot's sequence number; a mismatch means the data is torn.
+        ts_arr_check = np.ndarray((2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base)
+        if int(ts_arr_check[1]) != slot_seq:
+            return None
+
         return header, rgb, depth, slot_seq
 
     def frame_age_ns(self) -> int:

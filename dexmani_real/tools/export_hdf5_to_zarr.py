@@ -9,8 +9,13 @@ Output structure (single zarr):
         data/
           obs      (total_frames, obs_dim)   float32
           action   (total_frames, action_dim) float32
+          rgb      (total_frames, H, W, 3)   uint8    (if camera present)
+          depth    (total_frames, H, W)      uint16   (if camera present)
         meta/
           episode_ends  (num_episodes,) int64
+          camera/                                    (if camera present)
+            K               (3,3) float64
+            T_world_camera  (4,4) float64
           norm_stats/
             obs_mean      (obs_dim,) float32
             obs_std       (obs_dim,) float32
@@ -65,6 +70,41 @@ _ACTION_KEYS: list[tuple[str, int]] = [
     ("action_arm_joint", 7),
     ("action_hand_joint", 12),
 ]
+
+def _detect_camera_keys(f: h5py.File) -> list[tuple[str, str, str]]:
+    """Return list of (rgb_key, depth_key, label) for all cameras in the file.
+
+    ``label`` is "" for single-camera or the serial string for multi-camera.
+    """
+    pairs: list[tuple[str, str, str]] = []
+    if "rgb" in f:
+        pairs.append(("rgb", "depth", ""))
+    for key in sorted(f.keys()):
+        if key.endswith("_rgb") and key != "rgb":
+            label = key[:-4]  # strip "_rgb"
+            depth_key = f"{label}_depth"
+            if depth_key in f:
+                pairs.append((key, depth_key, label))
+    return pairs
+
+
+def _read_camera_meta(f: h5py.File) -> dict | None:
+    """Read camera intrinsics/extrinsics from /meta attrs.  Returns None if absent."""
+    if "meta" not in f:
+        return None
+    meta = dict(f["meta"].attrs)
+    has_cam = meta.get("has_camera", False)
+    if not has_cam:
+        return None
+    try:
+        return {
+            "serial": str(meta.get("camera_serial", "")),
+            "type": str(meta.get("camera_type", "")),
+            "K": np.asarray(meta["camera_K"], dtype=np.float64).reshape(3, 3),
+            "T_world_camera": np.asarray(meta["camera_T_world_camera"], dtype=np.float64).reshape(4, 4),
+        }
+    except (KeyError, ValueError):
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -122,7 +162,8 @@ def load_episodes(
     filter_success: bool | None = None,
     filter_tags: str | None = None,
     min_frames: int | None = None,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[Path]]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[Path],
+           list[np.ndarray | None], list[np.ndarray | None], dict | None]:
     """Load all HDF5 episodes from data_dir with optional metadata filtering.
 
     Args:
@@ -133,7 +174,11 @@ def load_episodes(
         min_frames: Episode-level filter: minimum frame count.
 
     Returns:
-        (obs_list, action_list, episode_lengths, episode_paths).
+        (obs_list, action_list, episode_lengths, episode_paths,
+         rgb_list, depth_list, camera_meta).
+
+        rgb_list / depth_list entries are None when the episode has no camera.
+        camera_meta is from the first episode with camera data (or None).
     """
     data_dir = Path(data_dir)
 
@@ -141,11 +186,14 @@ def load_episodes(
     action_list: list[np.ndarray] = []
     episode_lengths: list[int] = []
     episode_paths: list[Path] = []
+    rgb_list: list[np.ndarray | None] = []
+    depth_list: list[np.ndarray | None] = []
+    camera_meta: dict | None = None
 
     h5_paths = sorted(data_dir.glob("episode_*.h5"))
     if not h5_paths:
         print(f"[WARN] No episode_*.h5 files found in {data_dir}")
-        return [], [], [], []
+        return [], [], [], [], [], [], None
 
     print(f"Found {len(h5_paths)} episode(s) in {data_dir}")
 
@@ -204,10 +252,26 @@ def load_episodes(
                     f"obs ({obs.shape[0]}) and action ({action.shape[0]}) frame count mismatch"
                 )
 
+                # ── Camera frames ──
+                episode_rgb: np.ndarray | None = None
+                episode_depth: np.ndarray | None = None
+                cam_keys = _detect_camera_keys(f)
+                if cam_keys:
+                    # Use first camera only (additional cameras stored under data/{label}_rgb)
+                    rgb_k, depth_k, _label = cam_keys[0]
+                    if rgb_k in f and depth_k in f:
+                        episode_rgb = np.asarray(f[rgb_k][:], dtype=np.uint8)[valid]
+                        episode_depth = np.asarray(f[depth_k][:], dtype=np.uint16)[valid]
+                        # Read camera metadata from first episode that has it
+                        if camera_meta is None:
+                            camera_meta = _read_camera_meta(f)
+
                 obs_list.append(obs)
                 action_list.append(action)
                 episode_lengths.append(num_kept)
                 episode_paths.append(h5_path)
+                rgb_list.append(episode_rgb)
+                depth_list.append(episode_depth)
 
                 total = f["arm_qpos"].shape[0]
                 print(f"  {h5_path.name}: {num_kept}/{total} frames kept "
@@ -219,12 +283,14 @@ def load_episodes(
     if skipped_meta > 0:
         print(f"  Filtered out {skipped_meta} episode(s) by metadata filters")
 
+    has_cam = any(r is not None for r in rgb_list)
     print(f"Loaded {len(obs_list)} episodes, "
           f"{sum(episode_lengths)} total frames "
           f"(obs_dim={obs_list[0].shape[1] if obs_list else '?'}, "
-          f"action_dim={action_list[0].shape[1] if action_list else '?'})")
+          f"action_dim={action_list[0].shape[1] if action_list else '?'}"
+          f"{', camera=yes' if has_cam else ', camera=no'})")
 
-    return obs_list, action_list, episode_lengths, episode_paths
+    return obs_list, action_list, episode_lengths, episode_paths, rgb_list, depth_list, camera_meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -238,24 +304,36 @@ def split_train_val(
     episode_lengths: list[int],
     train_ratio: float = 0.8,
     seed: int = 42,
-) -> tuple[list, list, list, list, list, list]:
+    rgb_list: list[np.ndarray | None] | None = None,
+    depth_list: list[np.ndarray | None] | None = None,
+) -> tuple[list, list, list, list, list, list,
+           list | None, list | None, list | None, list | None]:
     """Split episodes into train/val sets at the episode level.
 
     Args:
         obs_list, action_list, episode_lengths: Per-episode data.
         train_ratio: Fraction of episodes for training (default 0.8).
         seed: Random seed for reproducible splits.
+        rgb_list, depth_list: Optional per-episode camera data.
 
     Returns:
-        (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths).
+        (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths,
+         train_rgb, train_depth, val_rgb, val_depth).
     """
+    if rgb_list is None:
+        rgb_list = []
+    if depth_list is None:
+        depth_list = []
     n = len(obs_list)
     if n == 0:
-        return [], [], [], [], [], []
+        return [], [], [], [], [], [], [], [], [], []
 
     if n == 1:
         print("[WARN] Only 1 episode — placing it in train set.")
-        return obs_list, action_list, episode_lengths, [], [], []
+        return (obs_list, action_list, episode_lengths, [], [], [],
+                rgb_list if rgb_list else None,
+                depth_list if depth_list else None,
+                None, None)
 
     indices = list(range(n))
     rng = random.Random(seed)
@@ -273,13 +351,22 @@ def split_train_val(
     val_act = [action_list[i] for i in val_idx] if val_idx else []
     val_lengths = [episode_lengths[i] for i in val_idx] if val_idx else []
 
+    train_rgb = [rgb_list[i] for i in train_idx] if rgb_list else None
+    train_depth = [depth_list[i] for i in train_idx] if depth_list else None
+    val_rgb = [rgb_list[i] for i in val_idx] if val_idx and rgb_list else None
+    val_depth = [depth_list[i] for i in val_idx] if val_idx and depth_list else None
+
     train_frames = sum(train_lengths)
     val_frames = sum(val_lengths)
+    has_cam = rgb_list and any(r is not None for r in rgb_list)
     print(f"\nTrain/val split (ratio={train_ratio}, seed={seed}):")
-    print(f"  Train: {len(train_obs)} episodes, {train_frames} frames")
-    print(f"  Val:   {len(val_obs)} episodes, {val_frames} frames")
+    print(f"  Train: {len(train_obs)} episodes, {train_frames} frames"
+          f"{', +camera' if has_cam and train_rgb and any(r is not None for r in train_rgb) else ''}")
+    print(f"  Val:   {len(val_obs)} episodes, {val_frames} frames"
+          f"{', +camera' if has_cam and val_rgb and any(r is not None for r in val_rgb) else ''}")
 
-    return train_obs, train_act, train_lengths, val_obs, val_act, val_lengths
+    return (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths,
+            train_rgb, train_depth, val_rgb, val_depth)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -417,6 +504,9 @@ def write_zarr(
     norm_stats: dict[str, np.ndarray],
     name: str = "data",
     compressor: Any | None = None,
+    rgb_list: list[np.ndarray | None] | None = None,
+    depth_list: list[np.ndarray | None] | None = None,
+    camera_meta: dict | None = None,
 ) -> None:
     """Write concatenated data to Zarr format.
 
@@ -426,6 +516,8 @@ def write_zarr(
         norm_stats: Normalization statistics dict.
         name: Zarr store name (e.g. "data", "train", "val").
         compressor: numcodecs compressor (default: Blosc zstd).
+        rgb_list, depth_list: Optional per-episode camera frames.
+        camera_meta: Optional camera intrinsics/extrinsics dict.
     """
     if compressor is None:
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
@@ -473,6 +565,36 @@ def write_zarr(
         for key, val in norm_stats.items():
             stats_grp.create_dataset(key, data=val, dtype=np.float32)
 
+    # ── Camera frames ──
+    has_cam = rgb_list is not None and any(r is not None for r in rgb_list)
+    all_rgb = None
+    all_depth = None
+    if has_cam and rgb_list is not None and depth_list is not None:
+        all_rgb = np.concatenate([r for r in rgb_list if r is not None], axis=0)
+        all_depth = np.concatenate([d for d in depth_list if d is not None], axis=0)
+
+        # Image compressor: zstd without bitshuffle (images don't benefit from it)
+        img_compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.NOSHUFFLE)
+
+        data_grp.create_dataset(
+            "rgb", data=all_rgb,
+            chunks=(1,) + all_rgb.shape[1:],
+            compressor=img_compressor, dtype=np.uint8,
+        )
+        data_grp.create_dataset(
+            "depth", data=all_depth,
+            chunks=(1,) + all_depth.shape[1:],
+            compressor=img_compressor, dtype=np.uint16,
+        )
+
+        # Camera metadata
+        if camera_meta is not None:
+            cam_grp = meta_grp.create_group("camera")
+            cam_grp.create_dataset("K", data=camera_meta["K"], dtype=np.float64)
+            cam_grp.create_dataset("T_world_camera", data=camera_meta["T_world_camera"], dtype=np.float64)
+            cam_grp.attrs["serial"] = camera_meta["serial"]
+            cam_grp.attrs["type"] = camera_meta["type"]
+
     # Summary
     print(f"\n{name}.zarr export complete:")
     print(f"  {store_path}")
@@ -481,6 +603,11 @@ def write_zarr(
     print(f"  meta/episode_ends: {len(episode_ends)} episodes, total={total_frames}")
     if norm_stats:
         print(f"  meta/norm_stats:  obs({obs_dim}d), action({action_dim}d)")
+    if has_cam and all_rgb is not None and all_depth is not None:
+        print(f"  data/rgb:      {all_rgb.shape} {all_rgb.dtype}")
+        print(f"  data/depth:    {all_depth.shape} {all_depth.dtype}")
+        if camera_meta:
+            print(f"  meta/camera:   serial={camera_meta['serial']}")
     print(f"  compression:   Blosc zstd level=3 bitshuffle")
 
 
@@ -570,13 +697,14 @@ def main() -> None:
         DataValidator.save_reports(reports, output_dir / "validation_report.json")
 
     # ── Load episodes ──
-    obs_list, action_list, episode_lengths, episode_paths = load_episodes(
-        data_dir,
-        filter_task=args.filter_task,
-        filter_success=args.filter_success,
-        filter_tags=args.filter_tags,
-        min_frames=args.min_frames,
-    )
+    obs_list, action_list, episode_lengths, episode_paths, rgb_list, depth_list, camera_meta = \
+        load_episodes(
+            data_dir,
+            filter_task=args.filter_task,
+            filter_success=args.filter_success,
+            filter_tags=args.filter_tags,
+            min_frames=args.min_frames,
+        )
 
     if not obs_list:
         print("No valid episodes to export.", file=sys.stderr)
@@ -585,6 +713,10 @@ def main() -> None:
     # ── Timestamp alignment (if requested) ──
     if args.align:
         print(f"\nTimestamp alignment: dt={args.align_dt*1000:.0f}ms method={args.align_method}")
+        if any(r is not None for r in rgb_list):
+            print("[WARN] Camera frames dropped during timestamp alignment (not interpolatable).")
+            rgb_list = [None] * len(rgb_list)
+            depth_list = [None] * len(depth_list)
         obs_list, action_list, episode_lengths = _align_all_episodes(
             episode_paths, obs_list, action_list, episode_lengths,
             dt=args.align_dt, method=args.align_method,
@@ -592,17 +724,24 @@ def main() -> None:
 
     # ── Train/val split ──
     if args.train_val_split is not None:
-        train_obs, train_act, train_lengths, val_obs, val_act, val_lengths = \
-            split_train_val(obs_list, action_list, episode_lengths, args.train_val_split, args.seed)
+        (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths,
+         train_rgb, train_depth, val_rgb, val_depth) = \
+            split_train_val(obs_list, action_list, episode_lengths,
+                            args.train_val_split, args.seed,
+                            rgb_list, depth_list)
 
         # Compute norm_stats from TRAIN ONLY (no leakage)
         norm_stats = compute_norm_stats(train_obs, train_act)
 
         # Write train
-        write_zarr(output_dir, train_obs, train_act, train_lengths, norm_stats, name="train")
+        write_zarr(output_dir, train_obs, train_act, train_lengths, norm_stats,
+                   name="train", rgb_list=train_rgb, depth_list=train_depth,
+                   camera_meta=camera_meta)
 
         # Write val (use train stats — no separate stats for val, prevents leakage)
-        write_zarr(output_dir, val_obs, val_act, val_lengths, norm_stats, name="val")
+        write_zarr(output_dir, val_obs, val_act, val_lengths, norm_stats,
+                   name="val", rgb_list=val_rgb, depth_list=val_depth,
+                   camera_meta=camera_meta)
 
         # Save norm_stats as human-readable JSON
         with open(output_dir / "norm_stats.json", "w") as f:
@@ -613,7 +752,8 @@ def main() -> None:
     else:
         # Single zarr (no split)
         norm_stats = compute_norm_stats(obs_list, action_list)
-        write_zarr(output_dir, obs_list, action_list, episode_lengths, norm_stats)
+        write_zarr(output_dir, obs_list, action_list, episode_lengths, norm_stats,
+                   rgb_list=rgb_list, depth_list=depth_list, camera_meta=camera_meta)
 
         # Save norm_stats
         with open(output_dir / "norm_stats.json", "w") as f:

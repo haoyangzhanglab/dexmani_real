@@ -21,13 +21,13 @@ from xarm.wrapper import XArmAPI
 from dexmani_real.utils.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.utils.array_utils import nan_array, safe_resize
-from dexmani_real.utils.serialization import from_dict_helper
+from dexmani_real.utils.serialization import FromDictMixin, from_dict_helper
 
 logger = get_logger(__name__)
 
 
 @dataclass
-class XArm7Config:
+class XArm7Config(FromDictMixin):
     ip: str = "192.168.1.111"
     dt: float = 1.0 / 50.0
     # Comfortable home posture — joint-safe, high manipulability, EEF low near desk.
@@ -306,11 +306,39 @@ class XArm7(ConnectionStateMixin):
         self.arm.clean_warn()
         self.arm.motion_enable(True)
         self._configure_collision_params()
+        self._set_reduced_joint_limits()
 
         _, err_warn = self.arm.get_err_warn_code()
         if err_warn[0] != 0:
             self.error_state = True
             self.last_error_message = f"robot_init post-check failed: err_warn={err_warn}"
+
+    def _set_reduced_joint_limits(self) -> None:
+        """Push firmware-level joint limits as an independent hardware safety gate.
+
+        Shrinks config qpos_min/qpos_max by a small margin for joints with
+        physical limits (skipping continuous-rotation joints) and pushes them
+        to firmware via the SDK reduced-joint-range API.  This provides a
+        hardware-level backstop independent of software-side joint clipping.
+        """
+        if self.arm is None:
+            return
+
+        margin = np.deg2rad(2.0)
+        q_min = self.config.qpos_min.copy()
+        q_max = self.config.qpos_max.copy()
+
+        full_rot = np.deg2rad(360.0) - 0.01
+        for j in range(7):
+            if q_min[j] <= -full_rot and q_max[j] >= full_rot:
+                continue  # continuous-rotation joint — no physical limit
+            q_min[j] += margin
+            q_max[j] -= margin
+
+        joint_range = np.column_stack([q_min, q_max]).ravel().tolist()
+        self.arm.set_reduced_joint_range(joint_range, is_radian=True)
+        self.arm.set_reduced_mode(True)
+        logger.info("Firmware reduced joint limits applied (margin=2°)")
 
     def _configure_collision_params(self) -> None:
         if self.arm is None:
@@ -334,6 +362,11 @@ class XArm7(ConnectionStateMixin):
         self.arm.set_state(0)
         time.sleep(0.05)
         self.arm.set_state(0)
+        # Verify mode switch succeeded (mirrors robot_init/clear_error pattern)
+        _, err_warn = self.arm.get_err_warn_code()
+        if err_warn[0] != 0:
+            self.error_state = True
+            self.last_error_message = f"_set_mode({mode}) post-check failed: err_warn={err_warn}"
 
     # ── Internal helpers ──
 

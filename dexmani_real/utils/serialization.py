@@ -186,6 +186,16 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
         hints = typing.get_type_hints(cls)
     except Exception:
         hints = {f.name: f.type for f in dataclasses.fields(cls)}
+        # Resolve PEP 563 string annotations (from __future__ import annotations).
+        # typing.get_type_hints() does this automatically, but when it fails we
+        # fall back to dataclasses.fields().type which returns raw strings.
+        _ns = sys.modules[cls.__module__].__dict__
+        for _name, _tp in list(hints.items()):
+            if isinstance(_tp, str):
+                try:
+                    hints[_name] = eval(_tp, _ns)
+                except Exception:
+                    pass
     kw: dict[str, object] = {}
 
     for f in dataclasses.fields(cls):
