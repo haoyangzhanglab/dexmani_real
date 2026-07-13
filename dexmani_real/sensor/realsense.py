@@ -7,7 +7,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-__all__ = ["RealSense", "RealSenseConfig", "CameraFrame", "L515DepthConfig", "AlignMode", "_normalize_align_mode"]
+__all__ = [
+    "RealSense",
+    "RealSenseConfig",
+    "CameraFrame",
+    "L515DepthConfig",
+    "AlignMode",
+    "remove_l515_mixed_edge_depth",
+    "_normalize_align_mode",
+]
 
 import numpy as np
 import pyrealsense2 as rs
@@ -48,6 +56,10 @@ class L515DepthConfig:
     """
 
     enabled: bool = True
+    # Full exported JSON mixes Short Range with many hand-tuned values.
+    # Keep it disabled by default; the active device receives Short Range
+    # again after pipeline.start(), which is the state that actually matters.
+    load_json_before_stream: bool = False
 
     visual_preset: int = 5
     depth_units: float = 0.000250000011874363
@@ -187,6 +199,17 @@ class RealSenseConfig:
     align_mode: AlignMode = "depth_to_color"
     depth_hole_filling: bool = False
     enable_sdk_spatial_filter: bool = False
+    # Conservative L515 edge-ramp filter applied only for point-cloud generation.
+    # It removes intermediate depths between a local foreground/background pair,
+    # while preserving both actual surfaces. No hole filling is performed.
+    enable_l515_flying_pixel_filter: bool = True
+    l515_edge_jump_threshold_m: float = 0.020
+    l515_edge_surface_margin_m: float = 0.004
+    l515_edge_filter_radius: int = 2
+    l515_edge_min_valid_neighbors: int = 6
+    # Safety valve: if the 2-D filter would remove too much valid depth, reject
+    # its output and use the original aligned depth for this frame.
+    l515_edge_max_removed_ratio: float = 0.08
     enable_global_time: bool = True
     warmup_frames: int = 10
     frame_name: str | None = None
@@ -256,10 +279,88 @@ def _normalize_align_mode(mode: str) -> AlignMode:
     return ALIGN_MODE_ALIASES[key]  # type: ignore[return-value]
 
 
+def remove_l515_mixed_edge_depth(
+    depth_m: np.ndarray,
+    *,
+    jump_threshold_m: float = 0.020,
+    surface_margin_m: float = 0.004,
+    radius: int = 2,
+    min_valid_neighbors: int = 6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove L515 mixed-depth ramps at object boundaries.
+
+    A true foreground/background edge contains two valid surfaces. L515 flying
+    pixels typically occupy intermediate depths between those surfaces. This
+    filter keeps values close to the local minimum or maximum and invalidates
+    only intermediate values. It is intentionally conservative and suitable
+    for depth already aligned to RGB.
+
+    Returns:
+        filtered_depth_m: float32 depth in metres; rejected pixels are zero.
+        removed_mask: boolean mask of pixels invalidated by this filter.
+    """
+    if radius < 1:
+        raise ValueError("radius must be >= 1")
+    if jump_threshold_m <= 0:
+        raise ValueError("jump_threshold_m must be > 0")
+    if surface_margin_m < 0:
+        raise ValueError("surface_margin_m must be >= 0")
+    if 2.0 * surface_margin_m >= jump_threshold_m:
+        raise ValueError(
+            "surface_margin_m must be less than half jump_threshold_m"
+        )
+
+    try:
+        import cv2
+    except ImportError as error:
+        raise RuntimeError(
+            "OpenCV is required for L515 mixed-edge filtering."
+        ) from error
+
+    depth = np.ascontiguousarray(depth_m, dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0)
+    if not np.any(valid):
+        return depth.copy(), np.zeros(depth.shape, dtype=bool)
+
+    ksize = 2 * int(radius) + 1
+    kernel = np.ones((ksize, ksize), dtype=np.uint8)
+
+    # Invalid pixels must not become local foreground/background surfaces.
+    min_input = np.where(valid, depth, np.float32(1e6))
+    max_input = np.where(valid, depth, np.float32(-1e6))
+    local_min = cv2.erode(min_input, kernel, borderType=cv2.BORDER_REPLICATE)
+    local_max = cv2.dilate(max_input, kernel, borderType=cv2.BORDER_REPLICATE)
+
+    valid_count = cv2.boxFilter(
+        valid.astype(np.float32),
+        ddepth=-1,
+        ksize=(ksize, ksize),
+        normalize=False,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+
+    local_span = local_max - local_min
+    removed_mask = (
+        valid
+        & (valid_count >= float(min_valid_neighbors))
+        & (local_span > float(jump_threshold_m))
+        & (depth > local_min + float(surface_margin_m))
+        & (depth < local_max - float(surface_margin_m))
+    )
+
+    filtered = depth.copy()
+    filtered[removed_mask] = 0.0
+    return filtered, removed_mask
+
+
 class RealSense:
     def __init__(self, config: RealSenseConfig = RealSenseConfig()) -> None:
         self.config = config
+        # Device discovery, option access, and streaming must share one context.
+        # This avoids competing device handles and intermittent power-state errors.
+        self.context = rs.context()
         self.active_serial: str | None = config.serial
+        self.active_is_l515 = False
 
         self.pipeline: rs.pipeline | None = None
         self.profile: rs.pipeline_profile | None = None
@@ -319,8 +420,9 @@ class RealSense:
         device — otherwise the next open would hit "Device or resource busy".
         """
         try:
-            self.active_serial = self.config.serial or self.find_default_serial()
-            device = self.find_device_by_serial(self.active_serial)
+            self.active_serial = self.config.serial or self._find_default_serial_in_context()
+            device = self._find_device_by_serial_in_context(self.active_serial)
+            self.active_is_l515 = self.is_l515_device(device)
             self.load_model_specific_config(device)
         except (RuntimeError, OSError) as e:
             logger.warning("connect() failed at device discovery / config: %s", e)
@@ -367,7 +469,7 @@ class RealSense:
         self.disconnect()
         if device is None and self.active_serial:
             try:
-                device = self.find_device_by_serial(self.active_serial)
+                device = self._find_device_by_serial_in_context(self.active_serial)
             except RuntimeError:
                 device = None
         if device is not None:
@@ -377,9 +479,52 @@ class RealSense:
             except RuntimeError as e:
                 logger.warning("hardware_reset() failed: %s", e)
         time.sleep(settle_s)
+        # Use a fresh context after USB re-enumeration.
+        self.context = rs.context()
+
+    def _apply_l515_runtime_preset(self) -> None:
+        """Set and verify Short Range on the active streaming device.
+
+        L515 may report that a pre-start JSON load succeeded and still reset the
+        visual preset during ``pipeline.start()``. Therefore the final preset is
+        always applied after start through the active pipeline profile.
+        """
+        if (
+            not self.active_is_l515
+            or self.profile is None
+            or self.config.l515_depth_config is None
+            or not self.config.l515_depth_config.enabled
+        ):
+            return
+
+        sensor = self.profile.get_device().first_depth_sensor()
+        option = rs.option.visual_preset
+        target = float(self.config.l515_depth_config.visual_preset)
+        if not sensor.supports(option):
+            raise RuntimeError("L515 depth sensor does not expose visual_preset.")
+
+        sensor.set_option(option, target)
+        time.sleep(0.5)
+        actual = float(sensor.get_option(option))
+        try:
+            description = sensor.get_option_value_description(option, actual)
+        except RuntimeError:
+            description = "unknown"
+
+        if not np.isclose(actual, target, atol=1e-6):
+            raise RuntimeError(
+                "L515 runtime preset verification failed: "
+                f"requested={target}, actual={actual} ({description})."
+            )
+
+        logger.info("L515 runtime preset verified: %.0f (%s)", actual, description)
 
     def _setup_pipeline_post_start(self) -> None:
-        """Configure aligner, filters, timestamps, and intrinsics after pipeline start."""
+        """Configure active-device options, alignment, filters, and intrinsics."""
+        if self.profile is None:
+            raise RuntimeError("Pipeline profile is unavailable after start.")
+
+        self._apply_l515_runtime_preset()
         self.aligner = self.create_aligner()
         self.hole_filling_filter = rs.hole_filling_filter(2) if self.config.depth_hole_filling else None
 
@@ -406,57 +551,47 @@ class RealSense:
         self.rays_cache.clear()
 
     def _start_pipeline(self, rs_config: rs.config) -> None:
-        """Create and start a fresh pipeline with the given config."""
-        self.pipeline = rs.pipeline()
+        """Create and start a fresh pipeline with the shared context."""
+        self.pipeline = rs.pipeline(self.context)
         rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
         self.profile = self.pipeline.start(rs_config)
 
     def _warmup_pipeline(self) -> None:
-        """Consume warmup frames.
+        """Consume exactly ``warmup_frames`` frames, restarting if necessary."""
+        if self.pipeline is None:
+            raise RuntimeError("Pipeline is unavailable during warmup.")
 
-        On L515 the USB stack may still be releasing resources from a prior
-        session, causing the first few wait_for_frames() calls to time out.
-        When that happens we stop the pipeline, wait with increasing back-off,
-        and restart — up to 3 times."""
+        warmup_frames = max(int(self.config.warmup_frames), 0)
+        if warmup_frames == 0:
+            return
+
         max_restarts = 3
-        warmup_frames = max(self.config.warmup_frames, 0)
-        for i in range(warmup_frames):
+        for attempt in range(max_restarts + 1):
             try:
-                self.pipeline.wait_for_frames(5000)
-                continue
+                for _ in range(warmup_frames):
+                    self.pipeline.wait_for_frames(5000)
+                return
             except RuntimeError:
-                pass
+                if attempt >= max_restarts:
+                    raise
 
-            # First frame timed out — try pipeline restarts.
-            if i != 0 or warmup_frames == 0:
-                raise
-
-            for attempt in range(max_restarts):
                 delay = 3.0 * (attempt + 1)
                 logger.warning(
-                    "First warmup frame did not arrive within 5 s — "
-                    "stopping pipeline, waiting %.0f s, then restarting "
+                    "L515 warmup timed out; restarting pipeline after %.0f s "
                     "(attempt %d/%d).",
                     delay,
                     attempt + 1,
                     max_restarts,
                 )
-                self.pipeline.stop()
+                try:
+                    self.pipeline.stop()
+                except RuntimeError:
+                    pass
                 time.sleep(delay)
                 self._start_pipeline(self.create_rs_config())
+                # Reapply Short Range and rebuild active-profile state after every restart.
                 self._setup_pipeline_post_start()
                 time.sleep(1.0)
-                try:
-                    self.pipeline.wait_for_frames(5000)
-                    return  # succeeded — consume remaining warmup frames below
-                except RuntimeError:
-                    if attempt == max_restarts - 1:
-                        raise
-
-        # Consume any remaining warmup frames (only reached after a successful
-        # first frame, either direct or after restart).
-        for _ in range(warmup_frames - 1):
-            self.pipeline.wait_for_frames(5000)
 
     def disconnect(self) -> None:
         """Close RealSense pipeline.
@@ -517,7 +652,10 @@ class RealSense:
                 pass
 
     def load_model_specific_config(self, device: rs.device) -> None:
-        if self.is_l515_device(device):
+        if not self.is_l515_device(device):
+            return
+        cfg = self.config.l515_depth_config
+        if cfg is not None and cfg.enabled and cfg.load_json_before_stream:
             self.load_l515_depth_config(device)
 
     def load_l515_depth_config(self, device: rs.device) -> None:
@@ -660,6 +798,46 @@ class RealSense:
             )
         return obs
 
+    def _filter_l515_depth_for_pointcloud(
+        self,
+        depth: np.ndarray,
+        K: np.ndarray,
+    ) -> np.ndarray:
+        """Conservatively invalidate L515 mixed-depth edge ramps."""
+        del K  # Kept in the signature for API stability and future models.
+        if not self.active_is_l515 or not self.config.enable_l515_flying_pixel_filter:
+            return depth
+
+        filtered, removed_mask = remove_l515_mixed_edge_depth(
+            depth,
+            jump_threshold_m=self.config.l515_edge_jump_threshold_m,
+            surface_margin_m=self.config.l515_edge_surface_margin_m,
+            radius=self.config.l515_edge_filter_radius,
+            min_valid_neighbors=self.config.l515_edge_min_valid_neighbors,
+        )
+
+        valid_count = int(np.count_nonzero(np.isfinite(depth) & (depth > 0)))
+        removed_count = int(np.count_nonzero(removed_mask))
+        removed_ratio = removed_count / max(valid_count, 1)
+
+        if removed_ratio > self.config.l515_edge_max_removed_ratio:
+            logger.warning(
+                "Rejecting L515 edge filter for this frame: removed %.2f%% "
+                "of valid depth (limit %.2f%%).",
+                100.0 * removed_ratio,
+                100.0 * self.config.l515_edge_max_removed_ratio,
+            )
+            return depth
+
+        if removed_count > 0:
+            logger.debug(
+                "L515 edge filter removed %d/%d valid pixels (%.2f%%).",
+                removed_count,
+                valid_count,
+                100.0 * removed_ratio,
+            )
+        return np.ascontiguousarray(filtered, dtype=np.float32)
+
     def pointcloud_from_frame(
         self,
         frame: CameraFrame,
@@ -667,8 +845,9 @@ class RealSense:
         *,
         T_out_camera: np.ndarray | None = None,
     ) -> np.ndarray:
+        depth_for_pointcloud = self._filter_l515_depth_for_pointcloud(frame.depth, frame.K)
         return rgbd_to_pointcloud(
-            depth=frame.depth,
+            depth=depth_for_pointcloud,
             K=frame.K,
             rgb=frame.rgb if frame.align_mode != "none" else None,
             config=config or PointCloudConfig(),
@@ -723,8 +902,25 @@ class RealSense:
         except RuntimeError:
             return ""
 
+    def _find_device_by_serial_in_context(self, serial: str) -> rs.device:
+        for device in self.context.query_devices():
+            device_serial = self.get_device_info_value(device, rs.camera_info.serial_number)
+            if device_serial == serial:
+                return device
+        raise RuntimeError(f"No RealSense camera found with serial={serial}.")
+
+    def _find_default_serial_in_context(self) -> str:
+        devices = self.context.query_devices()
+        if len(devices) == 0:
+            raise RuntimeError("No RealSense camera found.")
+        serial = self.get_device_info_value(devices[0], rs.camera_info.serial_number)
+        if not serial:
+            raise RuntimeError("The first RealSense camera does not expose a serial number.")
+        return serial
+
     @staticmethod
     def find_device_by_serial(serial: str) -> rs.device:
+        """Backward-compatible one-shot device lookup using a temporary context."""
         context = rs.context()
         for device in context.query_devices():
             device_serial = RealSense.get_device_info_value(device, rs.camera_info.serial_number)
@@ -733,10 +929,8 @@ class RealSense:
         raise RuntimeError(f"No RealSense camera found with serial={serial}.")
 
     def find_default_serial(self) -> str:
-        cameras = self.list_cameras()
-        if len(cameras) == 0:
-            raise RuntimeError("No RealSense camera found.")
-        return cameras[0]["serial"]
+        """Return the first serial visible to this camera's shared context."""
+        return self._find_default_serial_in_context()
 
     @staticmethod
     def list_cameras() -> list[dict[str, str]]:
@@ -756,5 +950,4 @@ class RealSense:
                     item[name] = ""
             cameras.append(item)
         return cameras
-
 
