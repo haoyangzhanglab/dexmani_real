@@ -134,7 +134,8 @@ class ArmInnerLoop:
         self._last_sent_target: np.ndarray | None = None  # for per-step delta clamp
         self._ramp_step: int = 0  # for soft-start speed ramp
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
-        self._track_warn_throttle: int = 0  # throttle counter for tracking/mode warnings
+        self._track_warn_throttle: int = 0  # throttle counter for tracking-error warnings
+        self._mode_warn_throttle: int = 0  # throttle counter for mode-drift warnings (independent)
 
         # ── Lifecycle ──
         self._stop_event = threading.Event()
@@ -385,22 +386,26 @@ class ArmInnerLoop:
         mode_bad = getattr(arm, "mode", 6) != 6
         track_bad = cfg.tracking_error_warn_rad > 0 and err > cfg.tracking_error_warn_rad
 
+        # Independent throttles: a persistent tracking-error warning must not
+        # suppress a transient mode-drift warning (A5), and vice versa.
         if self._track_warn_throttle > 0:
             self._track_warn_throttle -= 1
-            return
-        if track_bad:
+        elif track_bad:
             logger.warning(
                 "ArmInnerLoop: tracking error %.3f rad exceeds %.3f (soft saturation / follow error)",
                 err,
                 cfg.tracking_error_warn_rad,
             )
             self._track_warn_throttle = 50  # ~1s at 50Hz
-        if mode_bad:
+
+        if self._mode_warn_throttle > 0:
+            self._mode_warn_throttle -= 1
+        elif mode_bad:
             logger.warning(
                 "ArmInnerLoop: arm mode=%s (expected 6) — trajectory planning may be degraded",
                 getattr(arm, "mode", "?"),
             )
-            self._track_warn_throttle = 50
+            self._mode_warn_throttle = 50
 
     def _send_target(self, arm, target: np.ndarray) -> None:
         """Forward target position → set_servo_angle(wait=False).
