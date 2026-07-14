@@ -1,4 +1,4 @@
-"""Point cloud utilities — depth-to-pointcloud, FPS sampling, voxel downsampling."""
+"""Point cloud utilities — depth validity masking, depth-to-pointcloud, FPS sampling, voxel downsampling."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, Sequence, Union
 
 import numpy as np
-import numba as _numba
 import torch
 
 
@@ -105,6 +104,170 @@ def depth_to_meters(depth: ArrayLike) -> np.ndarray:
     if np.issubdtype(depth_array.dtype, np.integer):
         return depth_array.astype(np.float32) * 0.001
     return depth_array.astype(np.float32)
+
+
+@dataclass(frozen=True)
+class DepthEdgeConfig:
+    """Depth-discontinuity band zeroing (native depth domain, before alignment).
+
+    Per-pixel threshold: T_edge(z) = clip(n_sigma * sigma_z(z), t_min, t_max),
+    where sigma_z(z) = sigma_poly[0] + sigma_poly[1]*z + ... (meters, low order
+    first) is the planar depth std at distance z — calibrate it from per-pixel
+    TEMPORAL std over a static plane. Defaults reproduce the 8-12 mm
+    experimental window at 0.5-1.0 m and must be calibrated for real use.
+    t_max must stay below the minimum object height the system must keep
+    (~0.8x is a reasonable margin); None disables the clamp.
+    """
+
+    sigma_poly: tuple[float, ...] = (0.0010, 0.0012)  # sigma_z(z) = c0 + c1*z + ... (meters)
+    n_sigma: float = 5.0
+    t_min: float = 0.008  # threshold floor (m)
+    t_max: float | None = None  # threshold ceiling (m), ~0.8x min object height
+    dilate_px: int = 1  # edge-band dilation radius (band width ~= 2 + 2*dilate_px)
+
+    def __post_init__(self) -> None:
+        if len(self.sigma_poly) == 0:
+            raise ValueError("sigma_poly must have at least one coefficient.")
+        if self.t_min <= 0:
+            raise ValueError("t_min must be positive.")
+        if self.t_max is not None and self.t_max < self.t_min:
+            raise ValueError("t_max must be >= t_min.")
+        if self.dilate_px < 0:
+            raise ValueError("dilate_px must be >= 0.")
+
+
+def build_edge_threshold_lut(depth_scale: float, config: DepthEdgeConfig) -> np.ndarray:
+    """Precompute a (65536,) uint16 LUT: raw depth value -> T_edge in raw units.
+
+    Built once per connect (depth_scale = depth_units); per frame the
+    z-dependent threshold is then a single uint16 gather with no float math.
+    """
+    if depth_scale <= 0:
+        raise ValueError("depth_scale must be positive.")
+    z = np.arange(65536, dtype=np.float64) * float(depth_scale)
+    sigma = np.zeros_like(z)
+    for coeff in reversed(config.sigma_poly):  # Horner
+        sigma = sigma * z + float(coeff)
+    t = np.maximum(config.n_sigma * sigma, config.t_min)
+    if config.t_max is not None:
+        t = np.minimum(t, config.t_max)
+    return np.clip(np.rint(t / depth_scale), 1, 65535).astype(np.uint16)
+
+
+def compute_depth_edge_mask(depth_raw: ArrayLike, t_lut: np.ndarray, dilate_px: int = 1) -> np.ndarray:
+    """Depth-discontinuity band mask (True = zero this pixel), native depth domain.
+
+    Exact 8-neighbour max jump via morphology, entirely in uint16 raw units:
+        jump(p) = max_{q in N8(p), q valid} |z(p) - z(q)|
+                = max( dilate3(z)(p) - z(p),  z(p) - erode3(z_sub)(p) )
+    Invalid pixels (raw == 0) are excluded from every neighbourhood — 0 is the
+    neutral element for the max side, and they are substituted with 65535 on the
+    min side — so hole boundaries are NOT flagged as edges. For a valid center
+    the 3x3 window contains the center itself, hence dilate >= z >= erode and
+    the uint16 differences cannot underflow; invalid centers may wrap but are
+    removed by `& valid` BEFORE dilation, so garbage never propagates.
+
+    Call on RAW depth with confidence/IR-rejected pixels already zeroed, and
+    BEFORE any alignment — resampling mixes depth/RGB/occlusion boundaries.
+    """
+    import cv2
+
+    depth_array = to_numpy(depth_raw)
+    if depth_array.ndim != 2 or depth_array.dtype != np.uint16:
+        raise ValueError(f"depth_raw must be (H, W) uint16, got {depth_array.shape} {depth_array.dtype}.")
+    t_lut = np.asarray(t_lut)
+    if t_lut.shape != (65536,) or t_lut.dtype != np.uint16:
+        raise ValueError("t_lut must be the (65536,) uint16 array from build_edge_threshold_lut().")
+
+    valid = depth_array != 0
+    z_min_src = np.where(valid, depth_array, np.uint16(65535))
+    kernel3 = np.ones((3, 3), dtype=np.uint8)
+    local_max = cv2.dilate(depth_array, kernel3)
+    local_min = cv2.erode(z_min_src, kernel3)
+    jump = np.maximum(local_max - depth_array, depth_array - local_min)
+
+    edge = (jump > t_lut[depth_array]) & valid
+    if dilate_px > 0 and edge.any():
+        size = 2 * dilate_px + 1
+        edge = cv2.dilate(edge.astype(np.uint8), np.ones((size, size), dtype=np.uint8)).astype(bool)
+    return edge
+
+
+@dataclass(frozen=True)
+class DepthValidityConfig:
+    """Image-domain depth validity thresholds (confidence / IR gating, L515-oriented).
+
+    Thresholds are sensor-specific — defaults are conservative starting points for
+    the L515 (8-bit IR). Set a field to None to disable that sub-check.
+    """
+
+    confidence_min: int | None = 2  # keep pixels with confidence >= this
+    ir_min: int | None = 2  # reject extremely low IR return (weak echo)
+    ir_saturation: int | None = 250  # reject saturated IR (overexposure / specular)
+    saturation_dilate_px: int = 3  # dilate saturation mask to kill the specular halo
+    edge: DepthEdgeConfig | None = None  # depth-discontinuity band zeroing (None = off)
+
+    def __post_init__(self) -> None:
+        if self.saturation_dilate_px < 0:
+            raise ValueError("saturation_dilate_px must be >= 0.")
+
+
+def compute_depth_valid_mask(
+    depth: ArrayLike,
+    confidence: ArrayLike | None = None,
+    ir: ArrayLike | None = None,
+    config: DepthValidityConfig | None = None,
+) -> np.ndarray:
+    """Per-pixel (H, W) bool validity mask: depth > 0, confidence gate, IR gate.
+
+    The IR gate rejects extremely low return (ir < ir_min) and saturation
+    (ir >= ir_saturation) — the saturation mask is dilated by saturation_dilate_px
+    so the corrupted halo around specular highlights is removed too. IR saturation
+    and specular reflection produce dense, mixed-direction depth spikes that 3-D
+    outlier removal cannot catch, hence this image-space mask.
+
+    `confidence`/`ir` must be pixel-registered with `depth`. On L515 they are
+    registered with the RAW depth frame; when streaming with
+    align_mode="depth_to_color", apply this mask to the raw depth (invalid -> 0)
+    BEFORE rs.align — zeroed pixels do not project through alignment.
+    """
+    if config is None:
+        config = DepthValidityConfig()
+
+    depth_array = to_numpy(depth)
+    if depth_array.ndim != 2:
+        raise ValueError(f"depth must have shape (H, W), got {depth_array.shape}.")
+    valid = depth_array > 0
+
+    if confidence is not None and config.confidence_min is not None:
+        conf = to_numpy(confidence)
+        if conf.shape != depth_array.shape:
+            raise ValueError(
+                f"confidence shape {conf.shape} must match depth shape {depth_array.shape}; "
+                "confidence is registered to the raw depth frame — mask before alignment."
+            )
+        valid &= conf >= config.confidence_min
+
+    if ir is not None:
+        ir_array = to_numpy(ir)
+        if ir_array.shape != depth_array.shape:
+            raise ValueError(
+                f"ir shape {ir_array.shape} must match depth shape {depth_array.shape}; "
+                "IR is registered to the raw depth frame — mask before alignment."
+            )
+        if config.ir_min is not None:
+            valid &= ir_array >= config.ir_min
+        if config.ir_saturation is not None:
+            saturated = ir_array >= config.ir_saturation
+            if config.saturation_dilate_px > 0 and saturated.any():
+                import cv2
+
+                kernel_size = 2 * config.saturation_dilate_px + 1
+                kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+                saturated = cv2.dilate(saturated.astype(np.uint8), kernel).astype(bool)
+            valid &= ~saturated
+
+    return valid
 
 
 def make_rays(height: int, width: int, K: ArrayLike, device: str = "cpu") -> torch.Tensor:
@@ -329,6 +492,9 @@ def rgbd_to_pointcloud(
     rgb: ArrayLike | None = None,
     *,
     rays: ArrayLike | None = None,
+    confidence: ArrayLike | None = None,
+    ir: ArrayLike | None = None,
+    validity: DepthValidityConfig | None = None,
     config: PointCloudConfig | None = None,
     T_out_camera: ArrayLike | None = None,
     workspace: Sequence[float] | None = None,
@@ -364,6 +530,12 @@ def rgbd_to_pointcloud(
     if depth_m.ndim != 2:
         raise ValueError(f"depth must have shape (H, W), got {depth_m.shape}.")
     height, width = int(depth_m.shape[0]), int(depth_m.shape[1])
+
+    if confidence is not None or ir is not None:
+        # Image-domain validity gate (confidence + IR) — invalid pixels -> 0,
+        # dropped by filter_points_by_depth after back-projection.
+        valid = compute_depth_valid_mask(depth_m, confidence=confidence, ir=ir, config=validity)
+        depth_m = np.where(valid, depth_m, np.float32(0.0))
 
     points = depth_to_xyz(depth_m, K, rays=rays, device=config.device)
     colors = image_to_colors(rgb, (height, width), device=config.device) if rgb is not None else None
@@ -402,305 +574,6 @@ def make_depth_vis(depth: ArrayLike, min_depth: float = 0.05, max_depth: float =
     depth_vis = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
     depth_vis[~valid] = 0
     return depth_vis
-
-
-# ---------------------------------------------------------------------------
-# Flying-pixel removal kernel (numba JIT)
-# ---------------------------------------------------------------------------
-
-
-@_numba.njit(cache=True, nogil=True)
-def _remove_flying_pixels_kernel(
-    filtered: np.ndarray,
-    depth: np.ndarray,
-    Gx: np.ndarray,
-    Gy: np.ndarray,
-    edge_ys: np.ndarray,
-    edge_xs: np.ndarray,
-    noise_threshold: float,
-    margin: float,
-    sample_radius: int,
-    min_valid_samples: int,
-    pad: int,
-    gap: int,
-    beta: float,
-    left_buf: np.ndarray,
-    right_buf: np.ndarray,
-) -> None:
-    """Numba-JIT kernel: modify ``filtered`` in-place, setting flying pixels to 0."""
-    H, W = depth.shape
-    max_sr = sample_radius
-
-    for idx in range(len(edge_ys)):
-        y = edge_ys[idx]
-        x = edge_xs[idx]
-
-        if x < pad or x >= W - pad or y < pad or y >= H - pad:
-            continue
-
-        gx = Gx[y, x]
-        gy = Gy[y, x]
-        norm = (gx * gx + gy * gy) ** 0.5
-        if norm == 0.0:
-            continue
-        dx = gx / norm
-        dy = gy / norm
-
-        center = depth[y, x]
-        if center <= 0.0:
-            continue
-
-        # Effective thresholds. beta > 0 → depth-adaptive: interpret noise_threshold
-        # and margin as dimensionless multipliers of the local lateral spacing
-        # (center * beta), so one setting covers the whole depth range. beta == 0 →
-        # absolute meters (original behaviour).
-        if beta > 0.0:
-            eta_c = center * beta
-            noise_thr = noise_threshold * eta_c
-            margin_c = margin * eta_c
-            if margin_c < 0.004:  # near-field floor (m) so margin never vanishes
-                margin_c = 0.004
-        else:
-            noise_thr = noise_threshold
-            margin_c = margin
-
-        n_left = 0
-        n_right = 0
-
-        # Sample from k = gap + 1 so the near-edge ramp body (1..gap px) is skipped
-        # and never contaminates each side's clean-surface statistics.
-        for k in range(gap + 1, max_sr + 1):
-            # --- negative direction (foreground side) ---
-            sx = x - k * dx
-            sy = y - k * dy
-            x0 = int(np.floor(sx))
-            y0 = int(np.floor(sy))
-            x1 = x0 + 1
-            y1 = y0 + 1
-            if x0 >= 0 and x1 < W and y0 >= 0 and y1 < H:
-                fx = sx - x0
-                fy = sy - y0
-                q00 = depth[y0, x0]
-                q10 = depth[y0, x1]
-                q01 = depth[y1, x0]
-                q11 = depth[y1, x1]
-                if q00 > 0.0 and q10 > 0.0 and q01 > 0.0 and q11 > 0.0:
-                    d = (
-                        q00 * (1.0 - fx) * (1.0 - fy)
-                        + q10 * fx * (1.0 - fy)
-                        + q01 * (1.0 - fx) * fy
-                        + q11 * fx * fy
-                    )
-                    if d > 0.0 and n_left < max_sr:
-                        left_buf[n_left] = d
-                        n_left += 1
-
-            # --- positive direction (background side) ---
-            sx = x + k * dx
-            sy = y + k * dy
-            x0 = int(np.floor(sx))
-            y0 = int(np.floor(sy))
-            x1 = x0 + 1
-            y1 = y0 + 1
-            if x0 >= 0 and x1 < W and y0 >= 0 and y1 < H:
-                fx = sx - x0
-                fy = sy - y0
-                q00 = depth[y0, x0]
-                q10 = depth[y0, x1]
-                q01 = depth[y1, x0]
-                q11 = depth[y1, x1]
-                if q00 > 0.0 and q10 > 0.0 and q01 > 0.0 and q11 > 0.0:
-                    d = (
-                        q00 * (1.0 - fx) * (1.0 - fy)
-                        + q10 * fx * (1.0 - fy)
-                        + q01 * (1.0 - fx) * fy
-                        + q11 * fx * fy
-                    )
-                    if d > 0.0 and n_right < max_sr:
-                        right_buf[n_right] = d
-                        n_right += 1
-
-        # --- guard 1: enough samples on both sides ---
-        if n_left < min_valid_samples or n_right < min_valid_samples:
-            continue
-
-        # --- guard 2: each side is a clean surface ---
-        # left stats
-        mean_l = 0.0
-        for i in range(n_left):
-            mean_l += left_buf[i]
-        mean_l /= n_left
-        var_l = 0.0
-        for i in range(n_left):
-            diff = left_buf[i] - mean_l
-            var_l += diff * diff
-        std_l = (var_l / n_left) ** 0.5
-        if std_l > noise_thr:
-            continue
-
-        # right stats
-        mean_r = 0.0
-        for i in range(n_right):
-            mean_r += right_buf[i]
-        mean_r /= n_right
-        var_r = 0.0
-        for i in range(n_right):
-            diff = right_buf[i] - mean_r
-            var_r += diff * diff
-        std_r = (var_r / n_right) ** 0.5
-        if std_r > noise_thr:
-            continue
-
-        # --- guard 3: sides genuinely differ ---
-        diff_sr = mean_l - mean_r
-        if diff_sr < 0.0:
-            diff_sr = -diff_sr
-        if diff_sr < margin_c * 2.0:
-            continue
-
-        # --- flying-pixel test ---
-        dist_l = center - mean_l
-        if dist_l < 0.0:
-            dist_l = -dist_l
-        dist_r = center - mean_r
-        if dist_r < 0.0:
-            dist_r = -dist_r
-
-        if dist_l > margin_c and dist_r > margin_c:
-            filtered[y, x] = 0.0
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def remove_flying_pixels_at_edges(
-    depth: np.ndarray,
-    edge_threshold: float = 0.02,
-    noise_threshold: float = 0.005,
-    margin: float = 0.01,
-    sample_radius: int = 5,
-    min_valid_samples: int = 2,
-    gap: int = 0,
-    beta: float = 0.0,
-    edge_gate_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    """Remove ToF/LiDAR flying pixels at depth edges by gradient-direction consistency.
-
-    Flying pixels (mixed pixels) occur when a finite-size laser spot straddles a
-    depth discontinuity. The returned signal blends foreground and background,
-    producing a "ramp" of 1-3 pixels bridging the two surfaces in the depth map.
-
-    This function detects these ramp pixels by sampling along the depth gradient
-    direction on both sides: if both sides are "clean surfaces" (low variance)
-    and the center pixel depth falls **between** them (neither foreground nor
-    background), it is deleted (set to 0).
-
-    Design constraints:
-    - **Never introduces false depth** — only deletes (sets to 0), never fills or
-      interpolates. A deleted pixel is indistinguishable from an original
-      invalid pixel.
-    - **Minimises false deletion** — three conservative guards must all pass
-      before a pixel is removed; any uncertainty → keep.
-
-    Args:
-        depth: (H, W) float32 depth map in **meters**. 0 = invalid pixel.
-        edge_threshold: Minimum depth gradient magnitude (meters) to consider a
-            pixel as an edge candidate. Default 0.02 (2 cm).
-        noise_threshold: Maximum standard deviation (meters) allowed on either
-            side of the edge for the surfaces to be considered "clean".
-            Default 0.005 (5 mm).
-        margin: Minimum distance (meters) the center pixel must have from BOTH
-            side means to be classified as flying. Larger → more conservative.
-            Default 0.01 (1 cm).
-        sample_radius: Number of pixels to sample along the gradient direction
-            on each side. Default 5.
-        min_valid_samples: Minimum number of valid depth samples required on
-            each side. Default 2.
-        gap: Sampling dead-zone (pixels). Samples are taken from k = gap + 1
-            along the gradient direction, so the 1..gap px ramp body adjacent to
-            the edge does not contaminate each side's clean-surface statistics.
-            Default 0 (sample from k = 1, original behaviour).
-        beta: Per-pixel angular resolution (rad/pixel), typically 1 / fx. When
-            > 0, enables depth-adaptive mode: edge_threshold, noise_threshold and
-            margin are interpreted as dimensionless multipliers of the local
-            lateral spacing (depth * beta) instead of absolute meters, so one
-            setting covers the whole depth range. Default 0.0 (absolute meters,
-            original behaviour).
-        edge_gate_mask: Optional (H, W) bool array. When given, an edge candidate
-            is kept only where the mask is True (logical AND with the depth-gradient
-            candidates) — e.g. a color/IR edge band, so deletion needs a second
-            independent cue. Default None (no gating).
-
-    Returns:
-        filtered: (H, W) float32 depth map, same shape as input. Flying pixels
-            are set to 0; all other pixels are unchanged.
-
-    Performance:
-        ~1-3 ms for 640×480 (numba JIT, real-time ready at 50+ Hz).
-    """
-    import cv2
-
-    H, W = depth.shape
-    filtered = depth.copy()
-
-    # ── Fast path: no valid depth ──────────────────────────────────────
-    valid_mask = depth > 0.0
-    if valid_mask.sum() < min_valid_samples * 2:
-        return filtered
-
-    # ── 1. Depth gradient via Sobel ────────────────────────────────────
-    depth_f32 = np.where(valid_mask, depth.astype(np.float32), 0.0)
-    Gx = cv2.Sobel(depth_f32, cv2.CV_32F, 1, 0, ksize=3)
-    Gy = cv2.Sobel(depth_f32, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = np.sqrt(Gx**2 + Gy**2)
-
-    # Discard pixels where the 3×3 Sobel window touches an invalid pixel.
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    neighbour_count = cv2.filter2D(valid_mask.astype(np.uint8), -1, kernel)
-    grad_mag[neighbour_count != 9] = 0.0
-
-    # ── 2. Edge candidate pixels ───────────────────────────────────────
-    if beta > 0.0:
-        # Depth-adaptive gradient threshold: η(d) = edge_threshold · d · beta.
-        edge_candidates = grad_mag > (edge_threshold * depth_f32 * beta)
-    else:
-        edge_candidates = grad_mag > edge_threshold
-    if edge_gate_mask is not None:
-        edge_candidates &= edge_gate_mask
-    edge_ys, edge_xs = np.where(edge_candidates)
-
-    if len(edge_ys) == 0:
-        return filtered
-
-    pad = sample_radius + 1
-
-    # Pre-allocate reusable per-candidate buffers so the hot loop never
-    # calls malloc.
-    left_buf = np.empty(sample_radius, dtype=np.float64)
-    right_buf = np.empty(sample_radius, dtype=np.float64)
-
-    # ── 3. JIT-compiled per-candidate loop ─────────────────────────────
-    _remove_flying_pixels_kernel(
-        filtered,
-        depth_f32,
-        Gx,
-        Gy,
-        edge_ys.astype(np.int64, copy=False),
-        edge_xs.astype(np.int64, copy=False),
-        float(noise_threshold),
-        float(margin),
-        int(sample_radius),
-        int(min_valid_samples),
-        int(pad),
-        int(gap),
-        float(beta),
-        left_buf,
-        right_buf,
-    )
-
-    return filtered
 
 
 def vis_point_cloud(pointcloud: ArrayLike, voxel_size: float | None = None, point_size: float = 5.0) -> None:

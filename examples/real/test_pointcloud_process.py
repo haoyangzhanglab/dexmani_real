@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """L515 tabletop point-cloud diagnostic.
 
-The script keeps the original acquisition and workspace settings:
   - RGB:   640 x 480 @ 30 FPS
   - Depth: 640 x 480 @ 30 FPS
   - Depth is aligned to RGB
   - Camera-frame valid depth: [0.3, 2.5] m
-  - Original world workspace, desk crop, RANSAC threshold and 3 mm voxel
-
-Compared with the previous version, it uses the production RealSense driver,
-a conservative 5x5 mixed-edge filter, a removal-ratio safety valve, and a
-lightweight 3-D radius filter after voxel downsampling.
+  - Workspace crop, desk RANSAC, 3 mm voxel
 
 Usage:
   conda activate real_robot
@@ -20,7 +15,6 @@ Usage:
 from __future__ import annotations
 
 import sys
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -34,70 +28,31 @@ from dexmani_real.sensor.realsense import (
     L515DepthConfig,
     RealSense,
     RealSenseConfig,
-    remove_l515_mixed_edge_depth,
 )
-from dexmani_real.utils.pointcloud_utils import make_depth_vis
+from dexmani_real.utils.pointcloud_utils import DepthEdgeConfig, DepthValidityConfig, make_depth_vis
 
 
 # Acquisition settings: intentionally unchanged.
 RGB_RESOLUTION = (640, 480)
-DEPTH_RESOLUTION = (640, 480)
+DEPTH_RESOLUTION = (1024, 768)
 FPS = 30
-
-# Static diagnostic only. Set to 1 to disable temporal median.
-TEMPORAL_MEDIAN_FRAMES = 5
-
-# Conservative 2-D L515 mixed-edge filter.
-EDGE_JUMP_THRESHOLD_M = 0.020
-EDGE_SURFACE_MARGIN_M = 0.004
-EDGE_FILTER_RADIUS = 2
-EDGE_MIN_VALID_NEIGHBORS = 6
-EDGE_MAX_REMOVED_RATIO = 0.08
 
 # Conservative residual 3-D tail removal after 3 mm voxelization.
 USE_RADIUS_OUTLIER_REMOVAL = True
 RADIUS_OUTLIER_RADIUS_M = 0.010
 RADIUS_OUTLIER_MIN_NEIGHBORS = 6
-RADIUS_OUTLIER_MAX_REMOVED_RATIO = 0.15
 
 USE_RGBD_VIS = True
 
 
 
-def _median_valid_depth(depth_frames: list[np.ndarray]) -> np.ndarray:
-    """Compute a valid-only temporal median; zero remains invalid."""
-    if not depth_frames:
-        raise ValueError("depth_frames must not be empty")
-
-    stack = np.stack(
-        [
-            np.where(
-                np.isfinite(depth) & (depth > 0),
-                depth,
-                np.nan,
-            )
-            for depth in depth_frames
-        ],
-        axis=0,
-    ).astype(np.float32)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        median = np.nanmedian(stack, axis=0)
-
-    return np.nan_to_num(median, nan=0.0).astype(np.float32)
-
 
 
 def _show_rgbd_panels(
     rgb_bgr: np.ndarray,
-    depth_single_m: np.ndarray,
-    depth_median_m: np.ndarray,
-    depth_filtered_m: np.ndarray,
-    *,
-    filter_accepted: bool,
+    depth_m: np.ndarray,
 ) -> None:
-    """Show the same [0.3, 2.5] m depth visualization range as before."""
+    """Show RGB and depth side by side."""
     if not USE_RGBD_VIS:
         return
 
@@ -107,12 +62,9 @@ def _show_rgbd_panels(
         print("  RGBD visualization skipped: OpenCV is unavailable.")
         return
 
-    status = "accepted" if filter_accepted else "rejected"
     panels = [
         ("RGB", rgb_bgr),
-        ("Depth single", make_depth_vis(depth_single_m, 0.3, 2.5)),
-        ("Depth median", make_depth_vis(depth_median_m, 0.3, 2.5)),
-        (f"Depth edge filter ({status})", make_depth_vis(depth_filtered_m, 0.3, 2.5)),
+        ("Depth", make_depth_vis(depth_m, 0.3, 2.5)),
     ]
 
     labeled: list[np.ndarray] = []
@@ -132,8 +84,7 @@ def _show_rgbd_panels(
 
     try:
         print(
-            "\nShowing RGBD window (RGB | single | median | edge filter) "
-            "— press any key to continue..."
+            "\nShowing RGBD window (RGB | depth) — press any key to continue..."
         )
         cv2.imshow("L515 RGBD diagnostic", np.hstack(labeled))
         cv2.waitKey(0)
@@ -152,17 +103,53 @@ def main() -> None:
             fps=FPS,
             enable_color=True,
             align_mode="depth_to_color",
-            depth_hole_filling=False,
-            enable_sdk_spatial_filter=False,
-            # This test calls the same filter explicitly so it can visualize the
-            # candidate and report whether the safety valve accepted it.
-            enable_l515_flying_pixel_filter=False,
             enable_global_time=True,
             warmup_frames=30,
             l515_depth_config=L515DepthConfig(
                 enabled=True,
-                load_json_before_stream=False,
                 visual_preset=5,
+                depth_units=0.000250000011874363,
+                depth_offset=4.5,
+                min_distance=190,
+                laser_power=100,
+                receiver_gain=18,
+                confidence_threshold=3,
+                digital_gain=2,
+                noise_filtering=4,
+                noise_estimation=0.0,
+                pre_processing_sharpening=0.0,
+                post_processing_sharpening=1,
+                alternate_ir=0.0,
+                enable_ir_reflectivity=0.0,
+                enable_max_usable_range=0.0,
+                error_polling_enabled=1,
+                frames_queue_size=16,
+                freefall_detection_enabled=1,
+                global_time_enabled=0.0,
+                host_performance=0.0,
+                inter_cam_sync_mode=0.0,
+                invalidation_bypass=0.0,
+                reset_camera_accuracy_health=0.0,
+                sensor_mode=0.0,
+                trigger_camera_accuracy_health=0.0,
+            ),
+            # Image-domain validity gate: confidence + IR streams, raw depth
+            # masked before depth_to_color alignment (specular/overexposure spikes
+            # cannot be cleaned by 3-D outlier removal alone).
+            depth_validity=DepthValidityConfig(
+                confidence_min=2,
+                ir_min=2,
+                ir_saturation=250,
+                saturation_dilate_px=3,
+                # Discontinuity band: T(z) = max(5*sigma_z(z), 8mm), sigma_z = 1.0 + 1.2*z mm
+                # -> 8mm @0.5m, 11mm @1.0m. Calibrate sigma_poly from plane temporal std.
+                edge=DepthEdgeConfig(
+                    sigma_poly=(0.0010, 0.0012),
+                    n_sigma=5.0,
+                    t_min=0.008,
+                    t_max=None,
+                    dilate_px=1,
+                ),
             ),
         )
     )
@@ -198,11 +185,31 @@ def main() -> None:
         print(f"  Runtime preset: {preset} {preset_name}")
         print(f"  Depth scale:    {depth_scale:.6f} (raw_uint16 x scale = meters)")
 
-        # Capture several already-aligned RGBD frames. This is a static quality
-        # diagnostic; temporal median is not recommended during fast motion.
-        print(f"\nCapturing {TEMPORAL_MEDIAN_FRAMES} aligned RGBD frame(s)...")
-        frames = [camera.read() for _ in range(TEMPORAL_MEDIAN_FRAMES)]
-        frame = frames[-1]
+        # --- Verify key L515 parameters actually applied ---
+        readable_opts = [
+            ("visual_preset", rs.option.visual_preset),
+            ("laser_power", rs.option.laser_power),
+            ("receiver_gain", rs.option.receiver_gain),
+            ("confidence_threshold", rs.option.confidence_threshold),
+            ("noise_filtering", rs.option.noise_filtering),
+            ("digital_gain", rs.option.digital_gain),
+            ("depth_offset", rs.option.depth_offset),
+            ("min_distance", rs.option.min_distance),
+            ("post_processing_sharpening", rs.option.post_processing_sharpening),
+            ("pre_processing_sharpening", rs.option.pre_processing_sharpening),
+            ("noise_estimation", rs.option.noise_estimation),
+        ]
+        print("\n  --- Sensor read-back ---")
+        for name, opt in readable_opts:
+            try:
+                val = depth_sensor.get_option(opt)
+                print(f"  {name}: {val}")
+            except RuntimeError:
+                print(f"  {name}: <not readable>")
+
+        # Capture a single aligned RGBD frame.
+        print("\nCapturing aligned RGBD frame...")
+        frame = camera.read()
 
         if frame.rgb is None:
             raise RuntimeError("RGB frame is unavailable.")
@@ -211,63 +218,23 @@ def main() -> None:
 
         rgb = np.ascontiguousarray(frame.rgb)
         rgb_bgr = np.ascontiguousarray(rgb[..., ::-1])
-        depth_single_m = np.ascontiguousarray(frame.depth, dtype=np.float32)
-        depth_median_m = _median_valid_depth([item.depth for item in frames])
+        depth_m = np.ascontiguousarray(frame.depth, dtype=np.float32)
         K = np.asarray(frame.K, dtype=np.float64)
 
         print(f"  RGB:            shape={rgb.shape}, dtype={rgb.dtype}")
         print(
-            "  Depth single:   "
-            f"shape={depth_single_m.shape}, valid={int((depth_single_m > 0).sum())}/"
-            f"{depth_single_m.size}"
+            "  Depth:          "
+            f"shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/"
+            f"{depth_m.size}"
         )
         print(
-            "  Depth median:   "
-            f"valid={int((depth_median_m > 0).sum())}/{depth_median_m.size}"
-        )
-        print(
-            f"  Intrinsics:     {depth_single_m.shape[1]}x{depth_single_m.shape[0]} "
+            f"  Intrinsics:     {depth_m.shape[1]}x{depth_m.shape[0]} "
             f"fx={K[0, 0]:.1f} fy={K[1, 1]:.1f}"
         )
 
-        # Conservative edge-ramp candidate.
-        depth_filtered_candidate, removed_mask = remove_l515_mixed_edge_depth(
-            depth_median_m,
-            jump_threshold_m=EDGE_JUMP_THRESHOLD_M,
-            surface_margin_m=EDGE_SURFACE_MARGIN_M,
-            radius=EDGE_FILTER_RADIUS,
-            min_valid_neighbors=EDGE_MIN_VALID_NEIGHBORS,
-        )
+        depth_for_pointcloud = depth_m
 
-        valid_before = int(np.count_nonzero(depth_median_m > 0))
-        removed_count = int(np.count_nonzero(removed_mask))
-        removed_ratio = removed_count / max(valid_before, 1)
-        filter_accepted = removed_ratio <= EDGE_MAX_REMOVED_RATIO
-
-        if filter_accepted:
-            depth_for_pointcloud = depth_filtered_candidate
-        else:
-            depth_for_pointcloud = depth_median_m
-
-        print(
-            "  Mixed-edge filter: "
-            f"removed {removed_count}/{valid_before} valid px "
-            f"({100.0 * removed_ratio:.2f}%), "
-            f"status={'ACCEPTED' if filter_accepted else 'REJECTED'}"
-        )
-        if not filter_accepted:
-            print(
-                "  The candidate exceeded the 8% safety limit; the point cloud "
-                "will use median depth instead."
-            )
-
-        _show_rgbd_panels(
-            rgb_bgr,
-            depth_single_m,
-            depth_median_m,
-            depth_filtered_candidate,
-            filter_accepted=filter_accepted,
-        )
+        _show_rgbd_panels(rgb_bgr, depth_m)
 
         # Camera-frame point cloud. Depth range intentionally unchanged.
         print("\nGenerating camera-frame point cloud...")
@@ -397,26 +364,19 @@ def main() -> None:
         pcd_ds = pcd.voxel_down_sample(voxel_size=0.003)
         print(f"  Downsampled: {len(pcd_ds.points)} points (3mm voxel)")
 
-        if USE_RADIUS_OUTLIER_REMOVAL and len(pcd_ds.points) > 0:
-            before = len(pcd_ds.points)
-            candidate, _ = pcd_ds.remove_radius_outlier(
-                nb_points=RADIUS_OUTLIER_MIN_NEIGHBORS,
-                radius=RADIUS_OUTLIER_RADIUS_M,
-            )
-            removed_3d = before - len(candidate.points)
-            removed_3d_ratio = removed_3d / max(before, 1)
-
-            if removed_3d_ratio <= RADIUS_OUTLIER_MAX_REMOVED_RATIO:
-                pcd_ds = candidate
-                status = "ACCEPTED"
-            else:
-                status = "REJECTED"
-
-            print(
-                "  Radius outlier filter: "
-                f"removed {removed_3d}/{before} points "
-                f"({100.0 * removed_3d_ratio:.2f}%), status={status}"
-            )
+        # Radius outlier filter (disabled).
+        # if USE_RADIUS_OUTLIER_REMOVAL and len(pcd_ds.points) > 0:
+        #     before = len(pcd_ds.points)
+        #     pcd_ds, _ = pcd_ds.remove_radius_outlier(
+        #         nb_points=RADIUS_OUTLIER_MIN_NEIGHBORS,
+        #         radius=RADIUS_OUTLIER_RADIUS_M,
+        #     )
+        #     removed_3d = before - len(pcd_ds.points)
+        #     print(
+        #         "  Radius outlier filter: "
+        #         f"removed {removed_3d}/{before} points "
+        #         f"({100.0 * removed_3d / max(before, 1):.2f}%)"
+        #     )
 
         world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
         camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)

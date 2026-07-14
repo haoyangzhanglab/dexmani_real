@@ -13,7 +13,7 @@ from dexmani_real.shm.layouts import (
     VR_FRAME_DTYPE,
     array_to_vr_frame,
     bytes_to_camera_frame,
-    camera_frame_to_bytes,
+    pack_camera_frame,
     vr_frame_to_array,
 )
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
@@ -24,7 +24,7 @@ __all__ = [
     "bytes_to_camera_frame",
     "CAMERA_FRAME_HEADER_DTYPE",
     "CameraRingBuffer",
-    "camera_frame_to_bytes",
+    "pack_camera_frame",
     "SharedMemoryFrameManager",
     "SharedMemoryRingBuffer",
     "SharedSyncPrimitives",

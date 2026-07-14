@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 __all__ = [
@@ -13,7 +13,6 @@ __all__ = [
     "CameraFrame",
     "L515DepthConfig",
     "AlignMode",
-    "remove_l515_mixed_edge_depth",
     "_normalize_align_mode",
 ]
 
@@ -22,15 +21,13 @@ import pyrealsense2 as rs
 
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import (
-    PointCloudConfig,
-    depth_valid_ratio,
+    DepthValidityConfig,
+    build_edge_threshold_lut,
+    compute_depth_edge_mask,
+    compute_depth_valid_mask,
     intrinsics_to_dict,
     intrinsics_to_matrix,
     intrinsics_to_vector,
-    make_depth_vis,
-    make_rays,
-    rgbd_to_pointcloud,
-    vis_point_cloud,
 )
 
 logger = get_logger(__name__)
@@ -56,11 +53,6 @@ class L515DepthConfig:
     """
 
     enabled: bool = True
-    # Full exported JSON mixes Short Range with many hand-tuned values.
-    # Keep it disabled by default; the active device receives Short Range
-    # again after pipeline.start(), which is the state that actually matters.
-    load_json_before_stream: bool = False
-
     visual_preset: int = 5
     depth_units: float = 0.000250000011874363
     depth_offset: float = 4.5
@@ -68,13 +60,10 @@ class L515DepthConfig:
 
     laser_power: int = 70
     receiver_gain: int = 12
-    confidence_threshold: int = 2
-    digital_gain: int = 2
+    confidence_threshold: int = 3
+    digital_gain: int = 1
 
-    noise_filtering: int = 50
-    # rs.option.noise_filtering runtime scale is 0-6 (distinct from the JSON
-    # "Noise Filtering" value above); used by the set_option fallback.
-    noise_filtering_runtime: int = 3
+    noise_filtering: int = 30
     noise_estimation: float = 0.0
     pre_processing_sharpening: float = 0.0
     post_processing_sharpening: int = 1
@@ -93,7 +82,7 @@ class L515DepthConfig:
     sensor_mode: float = 0.0
     trigger_camera_accuracy_health: float = 0.0
 
-    def to_json_dict(self, depth_resolution: tuple[int, int], fps: int) -> dict[str, Any]:
+    def _to_json_dict(self, depth_resolution: tuple[int, int], fps: int) -> dict[str, Any]:
         depth_width, depth_height = depth_resolution
         return {
             "Alternate IR": self.alternate_ir,
@@ -128,64 +117,8 @@ class L515DepthConfig:
         }
 
     def to_json_string(self, depth_resolution: tuple[int, int], fps: int) -> str:
-        return json.dumps(self.to_json_dict(depth_resolution, fps))
+        return json.dumps(self._to_json_dict(depth_resolution, fps))
 
-
-def apply_l515_depth_config(
-    device: rs.device,
-    l515_config: L515DepthConfig | None,
-    depth_resolution: tuple[int, int],
-    fps: int,
-) -> str:
-    """Apply the L515 depth preset to a device (works before or after streaming).
-
-    Tries the full JSON preset via ``serializable_device.load_json`` first. On
-    hosts whose kernel uvcvideo backend rejects L515 XU controls ("Device or
-    resource busy"), load_json and visual_preset are unavailable — fall back to
-    the depth options that DO work over plain UVC (confidence_threshold,
-    min_distance, noise_filtering, laser_power, receiver_gain). See
-    docs/l515_backend_preset_fix.md.
-
-    Returns "json", "fallback", "failed", or "disabled".
-    """
-    if l515_config is None or not l515_config.enabled:
-        return "disabled"
-
-    try:
-        rs.serializable_device(device).load_json(l515_config.to_json_string(depth_resolution, fps))
-        return "json"
-    except (RuntimeError, OSError) as error:
-        logger.warning(
-            "L515 preset (load_json) not applied (%s); applying the UVC-safe subset "
-            "via set_option. Host UVC limitation, not a config error — see "
-            "docs/l515_backend_preset_fix.md.",
-            error,
-        )
-
-    # Fallback: options that work over plain UVC. noise_filtering uses the runtime
-    # 0-6 scale (noise_filtering_runtime), not the JSON value. visual_preset and
-    # digital_gain need the (blocked/flaky) XU path and are not retried here.
-    try:
-        depth_sensor = device.first_depth_sensor()
-    except (RuntimeError, OSError) as error:
-        logger.warning("L515 set_option fallback skipped (no depth sensor): %s", error)
-        return "failed"
-
-    applied = False
-    for option, value in (
-        (rs.option.confidence_threshold, l515_config.confidence_threshold),
-        (rs.option.min_distance, l515_config.min_distance),
-        (rs.option.noise_filtering, l515_config.noise_filtering_runtime),
-        (rs.option.laser_power, l515_config.laser_power),
-        (rs.option.receiver_gain, l515_config.receiver_gain),
-    ):
-        try:
-            if depth_sensor.supports(option):
-                depth_sensor.set_option(option, float(value))
-                applied = True
-        except (RuntimeError, OSError) as error:
-            logger.warning("L515 set_option(%s) failed: %s", option, error)
-    return "fallback" if applied else "failed"
 
 
 @dataclass(frozen=True)
@@ -197,23 +130,15 @@ class RealSenseConfig:
     fps: int = 30
     enable_color: bool = True
     align_mode: AlignMode = "depth_to_color"
-    depth_hole_filling: bool = False
-    enable_sdk_spatial_filter: bool = False
-    # Conservative L515 edge-ramp filter applied only for point-cloud generation.
-    # It removes intermediate depths between a local foreground/background pair,
-    # while preserving both actual surfaces. No hole filling is performed.
-    enable_l515_flying_pixel_filter: bool = True
-    l515_edge_jump_threshold_m: float = 0.020
-    l515_edge_surface_margin_m: float = 0.004
-    l515_edge_filter_radius: int = 2
-    l515_edge_min_valid_neighbors: int = 6
-    # Safety valve: if the 2-D filter would remove too much valid depth, reject
-    # its output and use the original aligned depth for this frame.
-    l515_edge_max_removed_ratio: float = 0.08
     enable_global_time: bool = True
     warmup_frames: int = 10
     frame_name: str | None = None
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
+    # L515-only image-domain depth validity gate (confidence + IR). When set, the
+    # confidence and IR streams are enabled alongside depth, and invalid raw-depth
+    # pixels are zeroed BEFORE alignment (confidence/IR are registered to the raw
+    # depth frame; rs.align only warps depth). None = disabled (no extra streams).
+    depth_validity: DepthValidityConfig | None = None
 
     def __post_init__(self) -> None:
         # object.__setattr__ bypasses frozen=True in __post_init__ so we can
@@ -279,80 +204,6 @@ def _normalize_align_mode(mode: str) -> AlignMode:
     return ALIGN_MODE_ALIASES[key]  # type: ignore[return-value]
 
 
-def remove_l515_mixed_edge_depth(
-    depth_m: np.ndarray,
-    *,
-    jump_threshold_m: float = 0.020,
-    surface_margin_m: float = 0.004,
-    radius: int = 2,
-    min_valid_neighbors: int = 6,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Remove L515 mixed-depth ramps at object boundaries.
-
-    A true foreground/background edge contains two valid surfaces. L515 flying
-    pixels typically occupy intermediate depths between those surfaces. This
-    filter keeps values close to the local minimum or maximum and invalidates
-    only intermediate values. It is intentionally conservative and suitable
-    for depth already aligned to RGB.
-
-    Returns:
-        filtered_depth_m: float32 depth in metres; rejected pixels are zero.
-        removed_mask: boolean mask of pixels invalidated by this filter.
-    """
-    if radius < 1:
-        raise ValueError("radius must be >= 1")
-    if jump_threshold_m <= 0:
-        raise ValueError("jump_threshold_m must be > 0")
-    if surface_margin_m < 0:
-        raise ValueError("surface_margin_m must be >= 0")
-    if 2.0 * surface_margin_m >= jump_threshold_m:
-        raise ValueError(
-            "surface_margin_m must be less than half jump_threshold_m"
-        )
-
-    try:
-        import cv2
-    except ImportError as error:
-        raise RuntimeError(
-            "OpenCV is required for L515 mixed-edge filtering."
-        ) from error
-
-    depth = np.ascontiguousarray(depth_m, dtype=np.float32)
-    valid = np.isfinite(depth) & (depth > 0)
-    if not np.any(valid):
-        return depth.copy(), np.zeros(depth.shape, dtype=bool)
-
-    ksize = 2 * int(radius) + 1
-    kernel = np.ones((ksize, ksize), dtype=np.uint8)
-
-    # Invalid pixels must not become local foreground/background surfaces.
-    min_input = np.where(valid, depth, np.float32(1e6))
-    max_input = np.where(valid, depth, np.float32(-1e6))
-    local_min = cv2.erode(min_input, kernel, borderType=cv2.BORDER_REPLICATE)
-    local_max = cv2.dilate(max_input, kernel, borderType=cv2.BORDER_REPLICATE)
-
-    valid_count = cv2.boxFilter(
-        valid.astype(np.float32),
-        ddepth=-1,
-        ksize=(ksize, ksize),
-        normalize=False,
-        borderType=cv2.BORDER_CONSTANT,
-    )
-
-    local_span = local_max - local_min
-    removed_mask = (
-        valid
-        & (valid_count >= float(min_valid_neighbors))
-        & (local_span > float(jump_threshold_m))
-        & (depth > local_min + float(surface_margin_m))
-        & (depth < local_max - float(surface_margin_m))
-    )
-
-    filtered = depth.copy()
-    filtered[removed_mask] = 0.0
-    return filtered, removed_mask
-
-
 class RealSense:
     def __init__(self, config: RealSenseConfig = RealSenseConfig()) -> None:
         self.config = config
@@ -365,19 +216,23 @@ class RealSense:
         self.pipeline: rs.pipeline | None = None
         self.profile: rs.pipeline_profile | None = None
         self.aligner: rs.align | None = None
-        self.hole_filling_filter: rs.hole_filling_filter | None = None
-        self.to_disparity: rs.disparity_transform | None = None
-        self.spatial_filter: rs.spatial_filter | None = None
-        self.to_depth: rs.disparity_transform | None = None
 
         self.depth_scale: float | None = None
         self.K: np.ndarray | None = None
         self.intr: np.ndarray | None = None
         self.intrinsics_info: dict | None = None
-        self.rays_cache: dict[tuple[int, int, str], Any] = {}
-
         self.frame_id = 0
         self.last_frame: CameraFrame | None = None
+        self._validity_warned = False
+        # Runtime copy of depth_validity with confidence_min pre-shifted into the
+        # RAW8 upper-nibble domain: the SDK unpacks CNF4 there with a zero lower
+        # nibble, so comparing raw bytes against (min << 4) is exactly equivalent
+        # to unpacking and saves a full-frame shift per read.
+        validity = config.depth_validity
+        if validity is not None and validity.confidence_min is not None:
+            validity = replace(validity, confidence_min=validity.confidence_min << 4)
+        self._validity_rt = validity
+        self._edge_t_lut: np.ndarray | None = None
 
     def connect(self) -> bool:
         """Open RealSense pipeline. Returns True on success.
@@ -413,7 +268,7 @@ class RealSense:
         return True
 
     def _open_pipeline(self) -> bool:
-        """Discover device, apply model config, start + warm up the pipeline.
+        """Discover device, push L515 preset, start + warm up the pipeline.
 
         Returns True on success. On any failure the pipeline is torn down (via
         disconnect) so a started-but-unusable pipeline is never left holding the
@@ -423,7 +278,7 @@ class RealSense:
             self.active_serial = self.config.serial or self._find_default_serial_in_context()
             device = self._find_device_by_serial_in_context(self.active_serial)
             self.active_is_l515 = self.is_l515_device(device)
-            self.load_model_specific_config(device)
+            self._push_l515_json_preset(device)
         except (RuntimeError, OSError) as e:
             logger.warning("connect() failed at device discovery / config: %s", e)
             return False
@@ -482,13 +337,21 @@ class RealSense:
         # Use a fresh context after USB re-enumeration.
         self.context = rs.context()
 
-    def _apply_l515_runtime_preset(self) -> None:
-        """Set and verify Short Range on the active streaming device.
+    def _push_l515_json_preset(self, device: rs.device) -> None:
+        """Push the full L515 JSON preset before streaming (only time load_json works)."""
+        cfg = self.config.l515_depth_config
+        if cfg is None or not cfg.enabled or not self.active_is_l515:
+            return
+        try:
+            rs.serializable_device(device).load_json(
+                cfg.to_json_string(self.config.depth_resolution, self.config.fps)
+            )
+            logger.info("L515 preset (load_json) applied.")
+        except (RuntimeError, OSError) as error:
+            logger.warning("L515 preset (load_json) failed: %s", error)
 
-        L515 may report that a pre-start JSON load succeeded and still reset the
-        visual preset during ``pipeline.start()``. Therefore the final preset is
-        always applied after start through the active pipeline profile.
-        """
+    def _apply_l515_runtime_preset(self) -> None:
+        """Verify and fix visual_preset after pipeline start (the one param start() may reset)."""
         if (
             not self.active_is_l515
             or self.profile is None
@@ -498,16 +361,13 @@ class RealSense:
             return
 
         sensor = self.profile.get_device().first_depth_sensor()
-        option = rs.option.visual_preset
         target = float(self.config.l515_depth_config.visual_preset)
-        if not sensor.supports(option):
-            raise RuntimeError("L515 depth sensor does not expose visual_preset.")
-
-        sensor.set_option(option, target)
+        sensor.set_option(rs.option.visual_preset, target)
         time.sleep(0.5)
-        actual = float(sensor.get_option(option))
+
+        actual = float(sensor.get_option(rs.option.visual_preset))
         try:
-            description = sensor.get_option_value_description(option, actual)
+            description = sensor.get_option_value_description(rs.option.visual_preset, actual)
         except RuntimeError:
             description = "unknown"
 
@@ -526,29 +386,15 @@ class RealSense:
 
         self._apply_l515_runtime_preset()
         self.aligner = self.create_aligner()
-        self.hole_filling_filter = rs.hole_filling_filter(2) if self.config.depth_hole_filling else None
-
-        # Optional SDK spatial filter chain (disparity domain → edge-preserving).
-        # Attenuates L515 edge flying pixels at negligible CPU cost (C++ SDK).
-        if self.config.enable_sdk_spatial_filter:
-            self.to_disparity = rs.disparity_transform(True)
-            self.spatial_filter = rs.spatial_filter()
-            self.spatial_filter.set_option(rs.option.filter_magnitude, 2)
-            self.spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.5)
-            self.spatial_filter.set_option(rs.option.filter_smooth_delta, 20)
-            self.spatial_filter.set_option(rs.option.holes_fill, 0)  # never invent depth
-            self.to_depth = rs.disparity_transform(False)
-        else:
-            self.to_disparity = None
-            self.spatial_filter = None
-            self.to_depth = None
 
         self.set_global_time()
         self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
         self.update_intrinsics_from_profile()
+        if self._validity_rt is not None and self._validity_rt.edge is not None:
+            # Rebuilt on every (re)start — depth_scale is only known here.
+            self._edge_t_lut = build_edge_threshold_lut(self.depth_scale, self._validity_rt.edge)
         self.frame_id = 0
         self.last_frame = None
-        self.rays_cache.clear()
 
     def _start_pipeline(self, rs_config: rs.config) -> None:
         """Create and start a fresh pipeline with the shared context."""
@@ -609,12 +455,10 @@ class RealSense:
             self.pipeline = None
             self.profile = None
             self.aligner = None
-            self.hole_filling_filter = None
             self.depth_scale = None
             self.K = None
             self.intr = None
             self.intrinsics_info = None
-            self.rays_cache.clear()
             self.last_frame = None
 
     def __enter__(self) -> "RealSense":
@@ -633,6 +477,14 @@ class RealSense:
         rs_config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, self.config.fps)
         if self.config.enable_color:
             rs_config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, self.config.fps)
+        if self.active_is_l515 and self.config.depth_validity is not None:
+            validity = self.config.depth_validity
+            # Confidence/IR are pixel-registered to the raw depth stream (same sensor);
+            # only pull the streams the configured sub-checks actually need.
+            if validity.confidence_min is not None:
+                rs_config.enable_stream(rs.stream.confidence, depth_width, depth_height, rs.format.raw8, self.config.fps)
+            if validity.ir_min is not None or validity.ir_saturation is not None:
+                rs_config.enable_stream(rs.stream.infrared, depth_width, depth_height, rs.format.y8, self.config.fps)
         return rs_config
 
     def create_aligner(self) -> rs.align | None:
@@ -650,21 +502,6 @@ class RealSense:
                     sensor.set_option(rs.option.global_time_enabled, 1)
             except RuntimeError:
                 pass
-
-    def load_model_specific_config(self, device: rs.device) -> None:
-        if not self.is_l515_device(device):
-            return
-        cfg = self.config.l515_depth_config
-        if cfg is not None and cfg.enabled and cfg.load_json_before_stream:
-            self.load_l515_depth_config(device)
-
-    def load_l515_depth_config(self, device: rs.device) -> None:
-        apply_l515_depth_config(
-            device,
-            self.config.l515_depth_config,
-            depth_resolution=self.config.depth_resolution,
-            fps=self.config.fps,
-        )
 
     @staticmethod
     def is_l515_device(device: rs.device) -> bool:
@@ -689,15 +526,63 @@ class RealSense:
             self.K = K
             self.intr = intrinsics_to_vector(K)
             self.intrinsics_info = intrinsics_to_dict(intrinsics)
-            self.rays_cache.clear()
 
-    def read(self, timeout_ms: int = 5000) -> CameraFrame:
+    def _apply_depth_validity(self, frames: rs.composite_frame) -> None:
+        """Zero invalid raw-depth pixels (confidence/IR/edge gate) BEFORE alignment.
+
+        L515 confidence/IR frames are pixel-registered to the raw depth frame and
+        rs.align only warps depth, so the whole gate must run pre-align — zeroed
+        pixels do not project through alignment. The discontinuity gate runs after
+        the confidence/IR zeroing, so rejected pixels are already excluded from
+        its neighbourhoods.
+        """
+        validity = self._validity_rt
+        if validity is None or not self.active_is_l515:
+            return
+        depth_frame = frames.get_depth_frame()
+        if not depth_frame:
+            return
+
+        depth = np.asanyarray(depth_frame.get_data())
+        if not depth.flags.writeable:
+            self._warn_validity_once("depth frame buffer is not writable — validity gate skipped.")
+            return
+
+        confidence = self._get_stream_data(frames, rs.stream.confidence, depth.shape)
+        ir = self._get_stream_data(frames, rs.stream.infrared, depth.shape)
+        if confidence is not None or ir is not None:
+            valid = compute_depth_valid_mask(depth, confidence=confidence, ir=ir, config=validity)
+            depth[~valid] = 0
+
+        if validity.edge is not None and self._edge_t_lut is not None:
+            edge = compute_depth_edge_mask(depth, self._edge_t_lut, dilate_px=validity.edge.dilate_px)
+            depth[edge] = 0
+
+    def _get_stream_data(
+        self, frames: rs.composite_frame, stream: rs.stream, depth_shape: tuple[int, ...]
+    ) -> np.ndarray | None:
+        frame = frames.first_or_default(stream)
+        if not frame:
+            return None
+        data = np.asanyarray(frame.get_data())
+        if data.shape != depth_shape:
+            self._warn_validity_once(f"{stream} shape {data.shape} != depth shape {depth_shape} — stream ignored.")
+            return None
+        return data
+
+    def _warn_validity_once(self, message: str) -> None:
+        if not self._validity_warned:
+            self._validity_warned = True
+            logger.warning("Depth validity gate: %s", message)
+
+    def read(self, timeout_ms: int = 5000, *, compute_depth: bool = True) -> CameraFrame:
         if self.pipeline is None:
             raise RuntimeError("RealSense is not connected. Call connect() first.")
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
         frames = self.pipeline.wait_for_frames(timeout_ms)
+        self._apply_depth_validity(frames)
         if self.aligner is not None:
             frames = self.aligner.process(frames)
 
@@ -709,24 +594,15 @@ class RealSense:
         if self.config.enable_color and not color_frame:
             raise RuntimeError("Failed to get color frame.")
 
-        # Optional SDK spatial filter (disparity domain, edge-preserving).
-        # Must run *before* hole filling so the hole filler works on
-        # already-cleaned depth.
-        if self.to_disparity is not None:
-            depth_frame = self.to_disparity.process(depth_frame)
-            depth_frame = self.spatial_filter.process(depth_frame)  # type: ignore[union-attr]
-            depth_frame = self.to_depth.process(depth_frame)
-            depth_frame = depth_frame.as_depth_frame()
-
-        if self.hole_filling_filter is not None:
-            depth_frame = self.hole_filling_filter.process(depth_frame).as_depth_frame()
-
         self.update_intrinsics_from_depth_frame(depth_frame)
         if self.K is None or self.intr is None or self.intrinsics_info is None:
             raise RuntimeError("RealSense intrinsics are unavailable.")
 
         depth_raw = np.ascontiguousarray(np.asanyarray(depth_frame.get_data()))
-        depth = depth_raw.astype(np.float32) * float(self.depth_scale)
+        if compute_depth:
+            depth = depth_raw.astype(np.float32) * float(self.depth_scale)
+        else:
+            depth = depth_raw  # skip float32 allocation (~1.2 MB/frame); SHM path only needs raw
 
         rgb = None
         if color_frame is not None:
@@ -752,107 +628,6 @@ class RealSense:
         )
         self.last_frame = frame
         return frame
-
-    def get_state(
-        self,
-        *,
-        mode: Literal["rgbd", "pointcloud", "full"] = "full",
-        pcd_config: PointCloudConfig | None = None,
-        T_out_camera: np.ndarray | None = None,
-        timeout_ms: int = 5000,
-    ) -> dict:
-        if mode not in ("rgbd", "pointcloud", "full"):
-            raise ValueError("mode must be one of: 'rgbd', 'pointcloud', 'full'.")
-
-        frame = self.read(timeout_ms=timeout_ms)
-        obs = frame.to_dict()
-        config = pcd_config or PointCloudConfig()
-        obs["meta"].update(
-            {
-                "valid_depth_ratio": depth_valid_ratio(frame.depth, config.min_depth, config.max_depth),
-                "pointcloud_frame": "out" if T_out_camera is not None else frame.frame_name,
-            }
-        )
-
-        if mode == "pointcloud":
-            obs.pop("rgb", None)
-            obs.pop("depth", None)
-            obs.pop("depth_raw", None)
-
-        if mode in ("pointcloud", "full"):
-            pointcloud = self.pointcloud_from_frame(frame, config, T_out_camera=T_out_camera)
-            obs["pointcloud"] = pointcloud
-            obs["meta"].update(
-                {
-                    "pointcloud_format": "xyzrgb",
-                    "pointcloud_xyz_unit": "m",
-                    "pointcloud_rgb_range": [0.0, 1.0],
-                    "pointcloud_dtype": "float32",
-                    "point_count": int(pointcloud.shape[0]),
-                    "workspace": list(config.workspace) if config.workspace is not None else None,
-                    "npoints": config.npoints,
-                    "sampling": config.sampling,
-                    "min_depth": config.min_depth,
-                    "max_depth": config.max_depth,
-                }
-            )
-        return obs
-
-    def _filter_l515_depth_for_pointcloud(
-        self,
-        depth: np.ndarray,
-        K: np.ndarray,
-    ) -> np.ndarray:
-        """Conservatively invalidate L515 mixed-depth edge ramps."""
-        del K  # Kept in the signature for API stability and future models.
-        if not self.active_is_l515 or not self.config.enable_l515_flying_pixel_filter:
-            return depth
-
-        filtered, removed_mask = remove_l515_mixed_edge_depth(
-            depth,
-            jump_threshold_m=self.config.l515_edge_jump_threshold_m,
-            surface_margin_m=self.config.l515_edge_surface_margin_m,
-            radius=self.config.l515_edge_filter_radius,
-            min_valid_neighbors=self.config.l515_edge_min_valid_neighbors,
-        )
-
-        valid_count = int(np.count_nonzero(np.isfinite(depth) & (depth > 0)))
-        removed_count = int(np.count_nonzero(removed_mask))
-        removed_ratio = removed_count / max(valid_count, 1)
-
-        if removed_ratio > self.config.l515_edge_max_removed_ratio:
-            logger.warning(
-                "Rejecting L515 edge filter for this frame: removed %.2f%% "
-                "of valid depth (limit %.2f%%).",
-                100.0 * removed_ratio,
-                100.0 * self.config.l515_edge_max_removed_ratio,
-            )
-            return depth
-
-        if removed_count > 0:
-            logger.debug(
-                "L515 edge filter removed %d/%d valid pixels (%.2f%%).",
-                removed_count,
-                valid_count,
-                100.0 * removed_ratio,
-            )
-        return np.ascontiguousarray(filtered, dtype=np.float32)
-
-    def pointcloud_from_frame(
-        self,
-        frame: CameraFrame,
-        config: PointCloudConfig | None = None,
-        *,
-        T_out_camera: np.ndarray | None = None,
-    ) -> np.ndarray:
-        depth_for_pointcloud = self._filter_l515_depth_for_pointcloud(frame.depth, frame.K)
-        return rgbd_to_pointcloud(
-            depth=depth_for_pointcloud,
-            K=frame.K,
-            rgb=frame.rgb if frame.align_mode != "none" else None,
-            config=config or PointCloudConfig(),
-            T_out_camera=T_out_camera,
-        )
 
     def get_intrinsics(self) -> np.ndarray:
         if self.K is None:
@@ -886,15 +661,6 @@ class RealSense:
                 info[name] = ""
         return info
 
-    def get_rays(self, shape: tuple[int, int], device: str = "cpu") -> np.ndarray:
-        if self.K is None:
-            raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
-        height, width = int(shape[0]), int(shape[1])
-        key = (height, width, str(device))
-        if key not in self.rays_cache:
-            self.rays_cache[key] = make_rays(height, width, self.K, device=device)
-        return self.rays_cache[key]
-
     @staticmethod
     def get_device_info_value(device: rs.device, key: rs.camera_info) -> str:
         try:
@@ -917,20 +683,6 @@ class RealSense:
         if not serial:
             raise RuntimeError("The first RealSense camera does not expose a serial number.")
         return serial
-
-    @staticmethod
-    def find_device_by_serial(serial: str) -> rs.device:
-        """Backward-compatible one-shot device lookup using a temporary context."""
-        context = rs.context()
-        for device in context.query_devices():
-            device_serial = RealSense.get_device_info_value(device, rs.camera_info.serial_number)
-            if device_serial == serial:
-                return device
-        raise RuntimeError(f"No RealSense camera found with serial={serial}.")
-
-    def find_default_serial(self) -> str:
-        """Return the first serial visible to this camera's shared context."""
-        return self._find_default_serial_in_context()
 
     @staticmethod
     def list_cameras() -> list[dict[str, str]]:

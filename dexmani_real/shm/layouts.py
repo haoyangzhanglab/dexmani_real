@@ -65,20 +65,6 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     align=True,
 )
 
-# ── Ring buffer slot layout ──
-# Each slot in a ring buffer has a timestamp and the data payload.
-# The write_idx (global atomic counter) is stored at offset 0 of the
-# shared memory block.
-
-RING_SLOT_HEADER_DTYPE = np.dtype(
-    [
-        ("timestamp_ns", "<u8"),  # Monotonic timestamp when written
-        ("sequence", "<u8"),  # Monotonic sequence counter
-    ],
-    align=True,
-)
-
-
 def vr_frame_to_array(frame: dict) -> np.ndarray:
     """Convert a VR frame dict (from QuestHandTracker) to a structured array.
 
@@ -121,37 +107,34 @@ def array_to_vr_frame(arr: np.ndarray) -> dict:
     }
 
 
-def camera_frame_to_bytes(frame: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Convert a camera frame dict to header + raw bytes arrays.
+def pack_camera_frame(
+    rgb: np.ndarray,
+    depth_raw: np.ndarray,
+    timestamp: float,
+    frame_id: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pack camera frame attributes directly into (header, rgb_bytes, depth_bytes).
 
-    Returns (header_array, rgb_bytes, depth_bytes) where:
-      - header_array: 1-d array of CAMERA_FRAME_HEADER_DTYPE (1 element)
-      - rgb_bytes: raw uint8 array of RGB data
-      - depth_bytes: raw uint16 array of depth data
+    Unlike camera_frame_to_bytes(), this accepts individual values instead of a
+    dict — the SHM producer (CameraProcess) can call this directly on
+    CameraFrame attributes, skipping the to_dict() allocation entirely.
     """
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
-    header["timestamp"] = np.float64(frame.get("timestamp", 0.0))
-    header["frame_number"] = np.uint64(frame.get("frame_id", 0))
+    header["timestamp"] = np.float64(timestamp)
+    header["frame_number"] = np.uint64(frame_id)
 
-    rgb_raw = frame.get("rgb")
-    depth_raw = frame.get("depth_raw")
-    if rgb_raw is None or depth_raw is None:
-        raise ValueError(
-            "camera_frame_to_bytes: 'rgb' and 'depth' must not be None. "
-            "Check CameraProcess config (enable_color, enable_depth)."
-        )
-    rgb = np.asarray(rgb_raw, dtype=np.uint8)
-    depth = np.asarray(depth_raw, dtype=np.uint16)
+    rgb_arr = np.asarray(rgb, dtype=np.uint8)
+    depth_arr = np.asarray(depth_raw, dtype=np.uint16)
 
-    header["rgb_size"] = np.uint64(rgb.nbytes)
-    header["depth_size"] = np.uint64(depth.nbytes)
-    header["rgb_shape_h"] = np.uint32(rgb.shape[0])
-    header["rgb_shape_w"] = np.uint32(rgb.shape[1])
-    header["rgb_shape_c"] = np.uint32(rgb.shape[2])
-    header["depth_shape_h"] = np.uint32(depth.shape[0])
-    header["depth_shape_w"] = np.uint32(depth.shape[1])
+    header["rgb_size"] = np.uint64(rgb_arr.nbytes)
+    header["depth_size"] = np.uint64(depth_arr.nbytes)
+    header["rgb_shape_h"] = np.uint32(rgb_arr.shape[0])
+    header["rgb_shape_w"] = np.uint32(rgb_arr.shape[1])
+    header["rgb_shape_c"] = np.uint32(rgb_arr.shape[2])
+    header["depth_shape_h"] = np.uint32(depth_arr.shape[0])
+    header["depth_shape_w"] = np.uint32(depth_arr.shape[1])
 
-    return header, rgb, depth
+    return header, rgb_arr, depth_arr
 
 
 def bytes_to_camera_frame(

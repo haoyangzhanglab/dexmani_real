@@ -30,12 +30,7 @@ Usage:
 
 from __future__ import annotations
 
-import time
-from contextlib import ExitStack
-from dataclasses import dataclass, field
-from typing import Any
-
-import numpy as np
+from dataclasses import dataclass
 
 from dexmani_real.utils.log import get_logger
 
@@ -44,11 +39,13 @@ logger = get_logger(__name__)
 
 @dataclass
 class MultiCameraConfig:
-    """Configuration for MultiCameraManager."""
+    """Configuration for MultiCameraManager.
 
-    cameras: list = field(default_factory=list)  # list of CameraProcessConfig
-    auto_restart: bool = True  # auto-restart crashed camera processes
-    health_check_interval_s: float = 5.0  # how often to check camera health
+    Note: auto_restart is accepted but not yet wired — CameraProcess has its
+    own in-process reconnection logic. (See camera_process.py:216-249.)
+    """
+
+    auto_restart: bool = True
 
 
 class MultiCameraManager:
@@ -74,9 +71,6 @@ class MultiCameraManager:
 
         self._processes: list[CameraProcess] = []
         self._names: list[str] = []
-        self._exit_stack: ExitStack | None = None
-
-        self._last_health_check: float = 0.0
 
         # Build camera processes
         for i, cam_config in enumerate(configs):
@@ -124,7 +118,6 @@ class MultiCameraManager:
                 logger.info("  Camera '%s' started.", name)
             else:
                 logger.warning("  Camera '%s' failed to start.", name)
-        self._last_health_check = time.perf_counter()
         return results
 
     def stop_all(self, timeout: float = 3.0) -> None:
@@ -135,33 +128,6 @@ class MultiCameraManager:
                 logger.info("  Camera '%s' stopped.", name)
             except (ValueError, RuntimeError) as e:
                 logger.warning("  Camera '%s' stop error: %s", name, e)
-
-    # ------------------------------------------------------------------
-    # Context manager (ExitStack — auto-cleanup on scope exit)
-    # ------------------------------------------------------------------
-
-    def __enter__(self) -> MultiCameraManager:
-        """Start all cameras and register cleanup via ExitStack.
-
-        Usage:
-            with MultiCameraManager(configs) as mgr:
-                frames = mgr.read_all_latest()
-                ...
-            # All cameras auto-stopped on scope exit, even on exception.
-        """
-        self._exit_stack = ExitStack()
-        self._exit_stack.callback(self.stop_all)
-        self.start_all()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Stop all cameras and release ExitStack resources."""
-        if hasattr(self, "_exit_stack") and self._exit_stack is not None:
-            self._exit_stack.close()
-            self._exit_stack = None
-        else:
-            self.stop_all()
-        return False  # don't suppress exceptions
 
     # ------------------------------------------------------------------
     # Frame access
@@ -180,73 +146,3 @@ class MultiCameraManager:
                 logger.debug("Camera '%s' poll failed.", name)
                 frames[name] = None
         return frames
-
-    def read_latest(self, camera_name: str) -> dict | None:
-        """Read the latest frame from a specific camera by name."""
-        for name, proc in zip(self._names, self._processes):
-            if name == camera_name:
-                try:
-                    return proc.poll_latest_frame()
-                except (ValueError, RuntimeError, OSError):
-                    return None
-        return None
-
-    # ------------------------------------------------------------------
-    # Health
-    # ------------------------------------------------------------------
-
-    def check_health(self) -> dict[str, bool]:
-        """Check health status of all cameras.
-
-        Returns a dict mapping camera name → healthy (bool).
-        """
-        now = time.perf_counter()
-        self._last_health_check = now
-
-        health: dict[str, bool] = {}
-        for name, proc in zip(self._names, self._processes):
-            healthy = proc.running and not proc.crashed
-            health[name] = healthy
-            if not healthy and self._cfg.auto_restart:
-                self._try_restart(name, proc)
-        return health
-
-    def _try_restart(self, name: str, proc) -> None:
-        """Attempt to restart a crashed camera process."""
-        logger.warning("Camera '%s' unhealthy — attempting restart.", name)
-        try:
-            proc.stop(timeout=1.0)
-        except (ValueError, RuntimeError):
-            pass
-        time.sleep(0.5)
-        if proc.start():
-            logger.info("Camera '%s' restarted successfully.", name)
-        else:
-            logger.error("Camera '%s' restart failed.", name)
-
-    @property
-    def health_ok(self) -> bool:
-        """True if all cameras are healthy."""
-        return all(self.check_health().values())
-
-    @property
-    def camera_names(self) -> list[str]:
-        return list(self._names)
-
-    @property
-    def n_cameras(self) -> int:
-        return len(self._processes)
-
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
-
-    def get_status(self) -> dict[str, Any]:
-        """Get detailed status for all cameras."""
-        status: dict[str, Any] = {}
-        for name, proc in zip(self._names, self._processes):
-            status[name] = {
-                "running": proc.running,
-                "crashed": proc.crashed,
-            }
-        return status

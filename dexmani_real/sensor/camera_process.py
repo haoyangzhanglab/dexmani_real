@@ -193,7 +193,7 @@ class CameraProcess:
                 self.config.hz,
             )
 
-            from dexmani_real.shm.layouts import camera_frame_to_bytes
+            from dexmani_real.shm.layouts import pack_camera_frame
             from dexmani_real.shm.ring_buffer import CameraRingBuffer
 
             h = self.config.rgb_height
@@ -211,19 +211,20 @@ class CameraProcess:
             # — otherwise the process stays alive producing zero frames with no
             # recovery. Count consecutive failures and, past a threshold, rebuild
             # the camera; RealSense.connect() self-heals the L515 via
-            # hardware_reset. (MultiCameraManager.auto_restart is wired to no
-            # caller, so recovery must happen here, in-process.)
+            # hardware_reset, so recovery must happen here, in-process.
             reconnect_after = max(int(self.config.hz), 15)  # ~1 s of dead frames
             consecutive_failures = 0
 
             last_ts = time.monotonic()
             while not self._stop_event.is_set():
                 try:
-                    frame = cam.read(timeout_ms=self.config.timeout_ms)
+                    frame = cam.read(timeout_ms=self.config.timeout_ms, compute_depth=False)
                     consecutive_failures = 0
-                    frame_dict = frame.to_dict()
                     try:
-                        header, rgb, depth = camera_frame_to_bytes(frame_dict)
+                        header, rgb, depth = pack_camera_frame(
+                            frame.rgb, frame.depth_raw,
+                            frame.timestamp, frame.frame_id,
+                        )
                         shm_writer.write(header, rgb, depth)
                     except (ValueError, RuntimeError, OSError):
                         logger.exception(

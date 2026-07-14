@@ -1,37 +1,29 @@
-"""SharedMemoryFrameManager — one-stop access to all shared memory blocks.
+"""SharedMemoryFrameManager — centralized access to VR shared memory ring buffers.
 
-Provides typed read/write access to VR and camera ring buffers across
-process boundaries. The main process uses this as the central hub for
-all sensor data; sensor processes write into the same named blocks.
+Provides typed read/write access to VR ring buffers across process boundaries.
+The main process uses this as the central hub for VR sensor data; the VR
+process writes into the same named blocks.
+
+Camera frames are handled directly by CameraProcess/CameraRingBuffer — this
+manager only manages the camera SHM lifecycle (create/close/unlink), not
+per-frame read/write.
 
 Usage:
     # Main process (creator)
     mgr = SharedMemoryFrameManager(camera_hw=(480, 640), n_cameras=1)
     vr_frame = mgr.read_latest_vr()
-    cam_frame = mgr.read_latest_camera(0)
 
     # VR process (attacher)
     mgr = SharedMemoryFrameManager(create=False)
     mgr.write_vr_frame(vr_array)
-
-    # Camera process (attacher)
-    mgr = SharedMemoryFrameManager(create=False)
-    mgr.write_camera_frame(0, header, rgb, depth)
 """
 
 from __future__ import annotations
-
-import time
-from typing import Any
-
-import numpy as np
 
 from dexmani_real.utils.log import get_logger
 from dexmani_real.shm.layouts import (
     VR_FRAME_DTYPE,
     array_to_vr_frame,
-    bytes_to_camera_frame,
-    camera_frame_to_bytes,
     vr_frame_to_array,
 )
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
@@ -154,62 +146,6 @@ class SharedMemoryFrameManager:
         frame = self.read_latest_vr()
         return frame, age_ns * 1e-9
 
-    @property
-    def vr_sequence(self) -> int:
-        if self._vr_buf is None:
-            return 0
-        return self._vr_buf.latest_sequence
-
-    # ------------------------------------------------------------------
-    # Camera frame access
-    # ------------------------------------------------------------------
-
-    def write_camera_frame(
-        self, camera_idx: int, camera_dict: dict
-    ) -> int:
-        """Write a camera frame dict to shared memory (producer-side).
-
-        Args:
-            camera_idx: Which camera (0..n_cameras-1).
-            camera_dict: Dict matching CameraFrame.to_dict() format.
-
-        Returns the sequence number.
-        """
-        if camera_idx >= len(self._cam_bufs) or self._cam_bufs[camera_idx] is None:
-            raise IndexError(f"Camera {camera_idx} not available")
-        header, rgb, depth = camera_frame_to_bytes(camera_dict)
-        return self._cam_bufs[camera_idx].write(header, rgb, depth)
-
-    def read_latest_camera(self, camera_idx: int = 0) -> dict | None:
-        """Read the latest camera frame as a dict (consumer-side).
-
-        Returns a dict matching CameraFrame.to_dict() format,
-        or None if no frame is available.
-        """
-        if camera_idx >= len(self._cam_bufs) or self._cam_bufs[camera_idx] is None:
-            return None
-        result = self._cam_bufs[camera_idx].read_latest()
-        if result is None:
-            return None
-        header, rgb, depth, seq = result
-        return bytes_to_camera_frame(header, rgb, depth)
-
-    def read_latest_camera_with_age(
-        self, camera_idx: int = 0
-    ) -> tuple[dict | None, float]:
-        """Read latest camera frame with age in seconds."""
-        if camera_idx >= len(self._cam_bufs) or self._cam_bufs[camera_idx] is None:
-            return None, float("inf")
-        age_ns = self._cam_bufs[camera_idx].frame_age_ns()
-        if age_ns < 0:
-            return None, float("inf")
-        frame = self.read_latest_camera(camera_idx)
-        return frame, age_ns * 1e-9
-
-    @property
-    def n_cameras(self) -> int:
-        return self._n_cameras
-
     # ------------------------------------------------------------------
     # Health
     # ------------------------------------------------------------------
@@ -218,14 +154,6 @@ class SharedMemoryFrameManager:
         if self._vr_buf is None:
             return float("inf")
         age_ns = self._vr_buf.frame_age_ns()
-        if age_ns < 0:
-            return float("inf")
-        return age_ns * 1e-9
-
-    def camera_age_s(self, camera_idx: int = 0) -> float:
-        if camera_idx >= len(self._cam_bufs) or self._cam_bufs[camera_idx] is None:
-            return float("inf")
-        age_ns = self._cam_bufs[camera_idx].frame_age_ns()
         if age_ns < 0:
             return float("inf")
         return age_ns * 1e-9
