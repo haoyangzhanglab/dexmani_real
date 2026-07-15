@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-import numpy as np
 import sapien.core as sapien
 
 __all__ = ["PhysxConfig", "setup_scene", "create_viewer", "add_light", "add_base_components"]

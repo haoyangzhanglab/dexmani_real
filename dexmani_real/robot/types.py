@@ -6,8 +6,6 @@ They are independent of the RobotInterface orchestration class to avoid circular
 
 from __future__ import annotations
 
-import dataclasses
-import typing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -15,8 +13,6 @@ import numpy as np
 
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.robot.xhand import XHandConfig
-from dexmani_real.utils.serialization import from_dict_helper
-
 # Per-joint arm torque limits from URDF: J1-J2=50, J3-J5=30, J6-J7=20 Nm.
 # Defined here (robot layer) because these are hardware properties, not teleop policy.
 # Used by both teleop safety checks and RobotInterface path execution.
@@ -158,9 +154,3 @@ class RobotInterfaceConfig:
     # Unified collision configuration.
     # When set, desk safety uses geometric FK (FingertipDeskSafety).
     collision: CollisionConfig | None = None
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "RobotInterfaceConfig":
-        """Reconstruct from a serialized dict (reverse of PipelineConfig.to_dict())."""
-        kw = from_dict_helper(cls, d)
-        return cls(**kw)

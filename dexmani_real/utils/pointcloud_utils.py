@@ -99,10 +99,17 @@ def check_workspace(workspace: Sequence[float] | None) -> tuple[float, float, fl
     return x_min, y_min, z_min, x_max, y_max, z_max
 
 
-def depth_to_meters(depth: ArrayLike) -> np.ndarray:
+def depth_to_meters(depth: ArrayLike, depth_scale: float | None = None) -> np.ndarray:
+    """Convert depth to meters. Float input is assumed metric (passthrough).
+
+    Integer (raw uint16) input is multiplied by ``depth_scale`` — the sensor's
+    depth units in meters (L515: 0.00025, from episode /meta ``depth_scale``).
+    Defaults to 0.001 (1 mm) when not given, for backward compatibility.
+    """
     depth_array = to_numpy(depth)
     if np.issubdtype(depth_array.dtype, np.integer):
-        return depth_array.astype(np.float32) * 0.001
+        scale = 0.001 if depth_scale is None else float(depth_scale)
+        return depth_array.astype(np.float32) * scale
     return depth_array.astype(np.float32)
 
 
@@ -154,18 +161,29 @@ def build_edge_threshold_lut(depth_scale: float, config: DepthEdgeConfig) -> np.
     return np.clip(np.rint(t / depth_scale), 1, 65535).astype(np.uint16)
 
 
-def compute_depth_edge_mask(depth_raw: ArrayLike, t_lut: np.ndarray, dilate_px: int = 1) -> np.ndarray:
+def compute_depth_edge_mask(
+    depth_raw: ArrayLike,
+    t_lut: np.ndarray,
+    dilate_px: int = 1,
+    scratch: dict | None = None,
+) -> np.ndarray:
     """Depth-discontinuity band mask (True = zero this pixel), native depth domain.
 
     Exact 8-neighbour max jump via morphology, entirely in uint16 raw units:
         jump(p) = max_{q in N8(p), q valid} |z(p) - z(q)|
-                = max( dilate3(z)(p) - z(p),  z(p) - erode3(z_sub)(p) )
-    Invalid pixels (raw == 0) are excluded from every neighbourhood — 0 is the
-    neutral element for the max side, and they are substituted with 65535 on the
-    min side — so hole boundaries are NOT flagged as edges. For a valid center
-    the 3x3 window contains the center itself, hence dilate >= z >= erode and
-    the uint16 differences cannot underflow; invalid centers may wrap but are
-    removed by `& valid` BEFORE dilation, so garbage never propagates.
+                = max( dilate3(z)(p) - z(p),  z(p) - erode3(z - 1)(p) - 1 )
+    The min side erodes (z - 1): the uint16 wrap sends invalid pixels (raw 0)
+    to 65535 — the neutral element for min — and shifts valid values by -1,
+    which the trailing -1 subtracts back, so the result is exactly the min
+    over valid neighbours and hole boundaries are NOT flagged as edges. For a
+    valid center the 3x3 window contains the center itself, hence
+    dilate >= z and erode(z-1) <= z-1, so the uint16 differences cannot
+    underflow; invalid centers may wrap but are removed by ``& valid``.
+
+    ``scratch``: optional dict reused across calls to avoid per-frame temp
+    allocations (~2x faster at XGA). Pass a dict owned by the caller — one
+    per camera/thread, NOT shared — it is (re)populated lazily on shape
+    change. None keeps the allocate-per-call behavior.
 
     Call on RAW depth with confidence/IR-rejected pixels already zeroed, and
     BEFORE any alignment — resampling mixes depth/RGB/occlusion boundaries.
@@ -179,14 +197,24 @@ def compute_depth_edge_mask(depth_raw: ArrayLike, t_lut: np.ndarray, dilate_px: 
     if t_lut.shape != (65536,) or t_lut.dtype != np.uint16:
         raise ValueError("t_lut must be the (65536,) uint16 array from build_edge_threshold_lut().")
 
-    valid = depth_array != 0
-    z_min_src = np.where(valid, depth_array, np.uint16(65535))
-    kernel3 = np.ones((3, 3), dtype=np.uint8)
-    local_max = cv2.dilate(depth_array, kernel3)
-    local_min = cv2.erode(z_min_src, kernel3)
-    jump = np.maximum(local_max - depth_array, depth_array - local_min)
+    if scratch is None:
+        scratch = {}
+    if scratch.get("max") is None or scratch["max"].shape != depth_array.shape:
+        for name in ("zmin", "max", "min", "a", "b", "t"):
+            scratch[name] = np.empty_like(depth_array)
 
-    edge = (jump > t_lut[depth_array]) & valid
+    valid = depth_array != 0
+    np.subtract(depth_array, np.uint16(1), out=scratch["zmin"])
+    kernel3 = np.ones((3, 3), dtype=np.uint8)
+    cv2.dilate(depth_array, kernel3, dst=scratch["max"])
+    cv2.erode(scratch["zmin"], kernel3, dst=scratch["min"])
+    np.subtract(scratch["max"], depth_array, out=scratch["a"])
+    np.subtract(depth_array, scratch["min"], out=scratch["b"])
+    np.subtract(scratch["b"], np.uint16(1), out=scratch["b"])
+    np.maximum(scratch["a"], scratch["b"], out=scratch["a"])
+    np.take(t_lut, depth_array, out=scratch["t"])
+
+    edge = (scratch["a"] > scratch["t"]) & valid
     if dilate_px > 0 and edge.any():
         size = 2 * dilate_px + 1
         edge = cv2.dilate(edge.astype(np.uint8), np.ones((size, size), dtype=np.uint8)).astype(bool)
@@ -505,6 +533,7 @@ def rgbd_to_pointcloud(
     voxel_size: float | None = None,
     device: str | None = None,
     return_tensor: bool | None = None,
+    depth_scale: float | None = None,
 ) -> Union[torch.Tensor, np.ndarray]:
     if config is None:
         config = PointCloudConfig()
@@ -526,7 +555,7 @@ def rgbd_to_pointcloud(
     if return_tensor is not None:
         config = replace(config, return_tensor=return_tensor)
 
-    depth_m = depth_to_meters(depth)
+    depth_m = depth_to_meters(depth, depth_scale=depth_scale)
     if depth_m.ndim != 2:
         raise ValueError(f"depth must have shape (H, W), got {depth_m.shape}.")
     height, width = int(depth_m.shape[0]), int(depth_m.shape[1])
@@ -574,32 +603,3 @@ def make_depth_vis(depth: ArrayLike, min_depth: float = 0.05, max_depth: float =
     depth_vis = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
     depth_vis[~valid] = 0
     return depth_vis
-
-
-def vis_point_cloud(pointcloud: ArrayLike, voxel_size: float | None = None, point_size: float = 5.0) -> None:
-    import open3d as o3d
-
-    pointcloud_array = to_numpy(pointcloud).astype(np.float32)
-    if pointcloud_array.ndim != 2 or pointcloud_array.shape[1] not in (3, 6):
-        raise ValueError("pointcloud must have shape (N, 3) or (N, 6).")
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pointcloud_array[:, :3].astype(np.float64))
-
-    if pointcloud_array.shape[1] == 6:
-        colors = pointcloud_array[:, 3:].astype(np.float64)
-        if colors.size and colors.max() > 1.0:
-            colors = colors / 255.0
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-
-    if voxel_size is not None:
-        pcd = pcd.voxel_down_sample(float(voxel_size))
-
-    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="point cloud viewer")
-    vis.add_geometry(pcd)
-    vis.add_geometry(frame)
-    vis.get_render_option().point_size = float(point_size)
-    vis.run()
-    vis.destroy_window()

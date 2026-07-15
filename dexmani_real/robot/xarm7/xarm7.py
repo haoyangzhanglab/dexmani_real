@@ -18,12 +18,34 @@ from typing import Any
 import numpy as np
 from xarm.wrapper import XArmAPI
 
-from dexmani_real.utils.log import get_logger
 from dexmani_real.robot._connection_state import ConnectionStateMixin
+from dexmani_real.robot.xarm7.error_codes import decode_error
 from dexmani_real.utils.array_utils import nan_array, safe_resize
-from dexmani_real.utils.serialization import FromDictMixin, from_dict_helper
+from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.serialization import FromDictMixin
 
 logger = get_logger(__name__)
+
+# Joint-limit insets. The firmware reduced range is a hardware backstop; the
+# software clip must sit STRICTLY INSIDE it so boundary-pinned commands (e.g.
+# EEF dragged past a workspace edge) never trip a reduced-mode fault.
+_FIRMWARE_LIMIT_MARGIN_RAD = np.deg2rad(2.0)
+_SOFT_LIMIT_MARGIN_RAD = np.deg2rad(2.5)
+
+
+def _inset_joint_limits(
+    q_min: np.ndarray, q_max: np.ndarray, margin: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inset joint limits by ``margin``, skipping full-rotation (±360°) joints."""
+    q_min = q_min.copy()
+    q_max = q_max.copy()
+    full_rot = np.deg2rad(360.0) - 0.01
+    for j in range(len(q_min)):
+        if q_min[j] <= -full_rot and q_max[j] >= full_rot:
+            continue  # full-rotation joint — no limit to inset
+        q_min[j] += margin
+        q_max[j] -= margin
+    return q_min, q_max
 
 
 @dataclass
@@ -41,9 +63,6 @@ class XArm7Config(FromDictMixin):
     )
     qpos_max: np.ndarray = field(
         default_factory=lambda: np.deg2rad([360, 120, 360, 225, 360, 180, 360])
-    )
-    max_qvel: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([180, 180, 180, 180, 180, 180, 180])
     )
     reset_speed: float = np.deg2rad(20)
     reset_acc: float = np.deg2rad(180)
@@ -70,6 +89,12 @@ class XArm7(ConnectionStateMixin):
         super().__init__()
         self.config = config
         self.arm: XArmAPI | None = None
+
+        # Software clip limits — strictly inside the firmware reduced range
+        # (see _inset_joint_limits) so clipped commands never violate it.
+        self.qpos_min_soft, self.qpos_max_soft = _inset_joint_limits(
+            config.qpos_min, config.qpos_max, _SOFT_LIMIT_MARGIN_RAD
+        )
 
         self.last_sdk_error_code: int = 0
         self.last_qpos_cmd: np.ndarray | None = None
@@ -149,7 +174,9 @@ class XArm7(ConnectionStateMixin):
         _, err_warn = self.arm.get_err_warn_code()
         if err_warn[0] != 0:
             self.error_state = True
-            self.last_error_message = f"clear_error post-check failed: err_warn={err_warn}"
+            self.last_error_message = (
+                f"clear_error post-check failed: err_warn={err_warn} ({decode_error(err_warn[0])})"
+            )
             return False
         self.error_state = False
         self.last_error_message = ""
@@ -223,7 +250,9 @@ class XArm7(ConnectionStateMixin):
         if self.arm.error_code != 0:
             self.last_sdk_error_code = self.arm.error_code
             self.error_state = True
-            self.last_error_message = f"SDK error code: {self.arm.error_code}"
+            self.last_error_message = (
+                f"SDK error code: {self.last_sdk_error_code} ({decode_error(self.last_sdk_error_code)})"
+            )
             return False
 
         target_qpos = np.asarray(action, dtype=np.float64).reshape(7)
@@ -248,7 +277,7 @@ class XArm7(ConnectionStateMixin):
 
         self.last_sdk_error_code = int(sdk_err)
         self.error_state = True
-        self.last_error_message = f"set_servo_angle_j failed: code={code}, sdk_err={sdk_err}"
+        self.last_error_message = f"set_servo_angle_j failed: code={code}, sdk_err={sdk_err} ({decode_error(sdk_err)})"
         return False
 
     def reset(self, target: np.ndarray | None = None) -> bool:
@@ -311,7 +340,7 @@ class XArm7(ConnectionStateMixin):
         _, err_warn = self.arm.get_err_warn_code()
         if err_warn[0] != 0:
             self.error_state = True
-            self.last_error_message = f"robot_init post-check failed: err_warn={err_warn}"
+            self.last_error_message = f"robot_init post-check failed: err_warn={err_warn} ({decode_error(err_warn[0])})"
 
     def _set_reduced_joint_limits(self) -> None:
         """Push firmware-level joint limits as an independent hardware safety gate.
@@ -324,21 +353,17 @@ class XArm7(ConnectionStateMixin):
         if self.arm is None:
             return
 
-        margin = np.deg2rad(2.0)
-        q_min = self.config.qpos_min.copy()
-        q_max = self.config.qpos_max.copy()
-
-        full_rot = np.deg2rad(360.0) - 0.01
-        for j in range(7):
-            if q_min[j] <= -full_rot and q_max[j] >= full_rot:
-                continue  # continuous-rotation joint — no physical limit
-            q_min[j] += margin
-            q_max[j] -= margin
+        q_min, q_max = _inset_joint_limits(
+            self.config.qpos_min, self.config.qpos_max, _FIRMWARE_LIMIT_MARGIN_RAD
+        )
 
         joint_range = np.column_stack([q_min, q_max]).ravel().tolist()
         self.arm.set_reduced_joint_range(joint_range, is_radian=True)
         self.arm.set_reduced_mode(True)
-        logger.info("Firmware reduced joint limits applied (margin=2°)")
+        logger.info(
+            "Firmware reduced joint limits applied (margin=%.1f°)",
+            float(np.degrees(_FIRMWARE_LIMIT_MARGIN_RAD)),
+        )
 
     def _configure_collision_params(self) -> None:
         if self.arm is None:
@@ -366,7 +391,9 @@ class XArm7(ConnectionStateMixin):
         _, err_warn = self.arm.get_err_warn_code()
         if err_warn[0] != 0:
             self.error_state = True
-            self.last_error_message = f"_set_mode({mode}) post-check failed: err_warn={err_warn}"
+            self.last_error_message = (
+                f"_set_mode({mode}) post-check failed: err_warn={err_warn} ({decode_error(err_warn[0])})"
+            )
 
     # ── Internal helpers ──
 
@@ -380,7 +407,7 @@ class XArm7(ConnectionStateMixin):
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
-        clipped = np.clip(qpos, self.config.qpos_min, self.config.qpos_max)
+        clipped = np.clip(qpos, self.qpos_min_soft, self.qpos_max_soft)
         self.last_joint_limit_clipped = not np.allclose(qpos, clipped)
         return clipped
 

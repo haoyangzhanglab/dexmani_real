@@ -16,6 +16,7 @@ poll() on the main thread.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import deque
 from enum import Enum
@@ -84,6 +85,15 @@ class KeyboardHandler:
         """
         if self._running:
             return
+
+        # Headless guard: without a display, pynput's Listener dies with an
+        # obscure Xlib/uinput error deep in its backend. Fail fast and clear.
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            raise RuntimeError(
+                "KeyboardHandler requires a graphical session (pynput global "
+                "capture uses X11/Wayland). No DISPLAY/WAYLAND_DISPLAY set — "
+                "headless/SSH is not supported; run on the workstation desktop."
+            )
 
         try:
             from pynput import keyboard  # type: ignore[import-untyped]

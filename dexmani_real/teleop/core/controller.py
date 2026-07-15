@@ -26,7 +26,7 @@ from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
 from dexmani_real.recording.recording_session import RecordingSession
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
-from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig, RobotState
+from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotState
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
@@ -64,7 +64,6 @@ class TeleopControllerConfig:
     dry_run: bool = False
     use_shm_vr: bool = False
     inner_loop_cfg: ArmInnerLoopConfig | None = None
-    use_precise_wait: bool = False
     collection_config: CollectionConfig | None = None
     multi_camera_configs: list | None = None
     multi_camera_auto_restart: bool = True
@@ -535,7 +534,9 @@ class TeleopController:
         logger.info("Restarting arm inner loop...")
         # Preserve the same inner loop config (mode, PID gains, etc.)
         inner_cfg = getattr(self._arm_inner, "_cfg", ArmInnerLoopConfig())
-        self._arm_inner = ArmInnerLoop(cfg=inner_cfg)
+        if self._sync is not None:
+            self._sync.policy_ready.clear()  # drop stale handshake state from the previous loop
+        self._arm_inner = ArmInnerLoop(cfg=inner_cfg, sync=self._sync)
         self._arm_inner.start()
         logger.info("Arm inner loop restarted")
 
@@ -586,12 +587,13 @@ class TeleopController:
             logger.error("Cannot start recording without VR frame.")
             return
         if self._recorder_session is not None:
+            # task_label/operator/tags are omitted so CollectionLoop falls back
+            # to its CollectionConfig — the single source of truth.
             self._recorder_session.start(
                 dict(
-                    task_label="teleop",
-                    operator="",
                     calib=self._calib,
                     camera_name=self._camera_name,
+                    depth_scale=getattr(self._camera_process, "depth_scale", None),
                     record_config=self._build_record_config(),
                 )
             )

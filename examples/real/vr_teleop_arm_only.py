@@ -269,8 +269,6 @@ def main():
         host="0.0.0.0",
         port=8000,
         hand_side="both",  # "both" needed for HeadFrame (heading calibration)
-        output_frame="flu",
-        max_frame_age_s=0.20,
     )
     vr_receiver = VRReceiverProcess(config=vr_config)
     vr_receiver.start()

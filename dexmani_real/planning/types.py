@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
-from dexmani_real.utils.serialization import FromDictMixin, from_dict_helper
+from dexmani_real.utils.serialization import FromDictMixin
 
 if TYPE_CHECKING:
     from .collision_config import CollisionConfig
@@ -208,10 +208,9 @@ class PlanningProfile(FromDictMixin):
 class TeleopProfile(FromDictMixin):
     """Online teleoperation IK/servo configuration."""
 
-    teleop_dt: float = 0.04
     max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
-    # Speed limiting is handled by ArmInnerLoop._tick_mode4()
-    # (velocity/accel/jerk clipping at 250 Hz).
+    # Speed limiting is handled by ArmInnerLoop (50 Hz, Mode 6): per-step joint
+    # delta clamp + firmware online trajectory planning (joint_max_speed/acc).
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
@@ -246,18 +245,6 @@ class TeleopProfile(FromDictMixin):
     # Manipulability threshold below which damping begins to ramp up.
     # Typical XArm7 values: ~0.01 (far from singularity), ~0.001 (near elbow singularity).
     manipulability_threshold: float = 0.005
-
-    # Minimum manipulability for IK acceptance.
-    # qpos solutions with manipulability below this value are rejected.
-    # Retries with heavier damping (singularity_damping_scale × damping)
-    # before falling through to position IK.
-    # 0.001 is near-elbow-singularity for XArm7 (far-from-singularity ≈ 0.01).
-    # Set to 0.0 to disable (backward compatible).
-    # Ref: LeFranX weighted_ik.cpp:71-76 Yoshikawa manipulability scoring.
-    min_manipulability: float = 0.001
-
-    # Damping multiplier when manipulability falls below min_manipulability.
-    singularity_damping_scale: float = 10.0
 
     # ── Joint-specific IK scoring weights (ref: LeFranX weighted_ik.cpp:62-69) ──
     # Higher weight → solver penalises moving that joint away from its current
@@ -298,20 +285,6 @@ class TeleopProfile(FromDictMixin):
     #   J2(0.289) > J1(0.239) > J6(0.166) > J4(0.121)
     #   > J3(0.080) > J5(0.040) > J7(0.024)
     joint_weights: tuple[float, ...] = (3.0, 1.2, 1.0, 0.5, 0.5, 0.8, 0.3)
-
-    # ── Cartesian pose interpolation (REMOVED 2026-06-24) ──
-    # CartPoseInterpolator (linear + SLERP) was removed because:
-    #   1. VR is native 50 Hz = control loop rate → no frequency decoupling needed
-    #   2. Cartesian EMA (ema_alpha) already handles frame-to-frame filtering
-    #   3. Velocity-limited step provides per-frame delta capping
-    #   4. BunnyVisionPro / LeFranX / T-Rex all operate without Cartesian interpolation
-    # The interpolator added ~20ms latency without measurable smoothness benefit.
-    use_cartesian_interpolation: bool = False
-
-    # Speed limits for interpolator (DEPRECATED — no longer used).
-    # Kept for backward-compatible config deserialization.
-    interpolation_max_pos_speed: float = 0.4  # m/s
-    interpolation_max_rot_speed: float = 0.8  # rad/s
 
     # ── Null-space optimization ──
     # Post-IK null-space projection that adjusts the redundant DOF to repel

@@ -28,6 +28,8 @@ import rerun as rr
 import rerun.blueprint as rrb
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dexmani_real.utils.pointcloud_utils import depth_to_meters
+
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -132,13 +134,68 @@ def print_episode_info(h5_path: str) -> None:
 class EpisodeVisualizer:
     """Load and stream a DexMani HDF5 episode into Rerun for interactive viewing."""
 
-    def __init__(self, h5_path: str, max_frames: int | None = None):
+    def __init__(
+        self,
+        h5_path: str,
+        max_frames: int | None = None,
+        depth_scale: float | None = None,
+        point_cloud: bool = True,
+        pc_stride: int = 4,
+        pc_min_depth: float = 0.1,
+        pc_max_depth: float = 2.0,
+    ):
         self._h5_path = Path(h5_path)
         self._h5f = h5py.File(h5_path, "r")
 
         # Discover datasets
         self._available = _classify_datasets(self._h5f)
         logger.info("Detected %d categories: %s", len(self._available), sorted(self._available.keys()))
+
+        # Depth units in meters: CLI override > /meta depth_scale > 1mm legacy default.
+        # Episodes recorded before depth_scale was persisted carry L515 raw depth
+        # in 0.25mm units — pass --depth-scale 0.00025 for those.
+        if depth_scale is None:
+            meta = self._h5f.get("meta")
+            if meta is not None and "depth_scale" in meta.attrs:
+                depth_scale = float(meta.attrs["depth_scale"])
+            elif "depth" in self._h5f:
+                logger.warning(
+                    "/meta has no depth_scale — assuming 1mm units. "
+                    "Legacy L515 episodes need --depth-scale 0.00025."
+                )
+        self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
+        self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
+
+        # ── Point cloud config ──
+        self._pc_enabled = point_cloud and "depth" in (self._available.get("camera") or [])
+        self._pc_stride = max(1, pc_stride)
+        self._pc_min_depth = pc_min_depth
+        self._pc_max_depth = pc_max_depth
+        self._pc_cache: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}  # cam_idx -> (points, colors)
+
+        # Precompute pixel grid for back-projection (once per depth resolution)
+        self._pc_K: np.ndarray | None = None
+        self._pc_rays: tuple[np.ndarray, np.ndarray] | None = None  # (u_strided, v_strided)
+        if self._pc_enabled:
+            meta = self._h5f.get("meta")
+            if meta is not None and "camera_K" in meta.attrs:
+                self._pc_K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
+                depth_shape = self._h5f["depth"].shape
+                h, w = depth_shape[1], depth_shape[2]
+                self._pc_h, self._pc_w = h, w
+                # Precompute strided pixel coordinates
+                v, u = np.mgrid[0:h:self._pc_stride, 0:w:self._pc_stride]
+                self._pc_rays = (u.astype(np.float32), v.astype(np.float32))
+                logger.info(
+                    "Point cloud enabled: stride=%d → ~%d points/frame, depth=[%.2f, %.2f]m",
+                    self._pc_stride,
+                    u.size,
+                    self._pc_min_depth,
+                    self._pc_max_depth,
+                )
+            else:
+                logger.warning("Point cloud disabled: no camera_K in /meta")
+                self._pc_enabled = False
 
         # Determine T (state frames) and C (camera frames)
         self._T = self._resolve_frame_count(max_frames)
@@ -218,6 +275,53 @@ class EpisodeVisualizer:
         return state
 
     # ------------------------------------------------------------------
+    # Point cloud generation (numpy-only, no torch dep)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _depth_to_pointcloud(
+        depth: np.ndarray,
+        K: np.ndarray,
+        u_strided: np.ndarray,
+        v_strided: np.ndarray,
+        rgb: np.ndarray | None,
+        depth_scale: float,
+        stride: int,
+        min_depth: float,
+        max_depth: float,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Convert a single depth frame to a strided point cloud (camera frame).
+
+        Returns (N,3) positions and optional (N,3) uint8 colors (0-255).
+        """
+        # Convert to meters (handles uint16 raw and float passthrough)
+        depth_m = depth_to_meters(depth, depth_scale=depth_scale)
+
+        # Stride
+        depth_strided = depth_m[::stride, ::stride]
+        z = depth_strided.astype(np.float32)
+
+        # Back-project
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        x = (u_strided - cx) * z / fx
+        y = (v_strided - cy) * z / fy
+
+        # Mask: depth range + finite
+        valid = (z > min_depth) & (z < max_depth) & np.isfinite(z)
+        if not valid.any():
+            return np.zeros((0, 3), dtype=np.float32), None
+
+        points = np.stack([x[valid], y[valid], z[valid]], axis=-1).astype(np.float32)
+
+        colors = None
+        if rgb is not None:
+            rgb_strided = rgb[::stride, ::stride]
+            colors = rgb_strided[valid]  # uint8 (0-255), Rerun accepts this natively
+
+        return points, colors
+
+    # ------------------------------------------------------------------
     # Blueprint
     # ------------------------------------------------------------------
 
@@ -237,6 +341,16 @@ class EpisodeVisualizer:
             cam_views.append(rrb.Spatial2DView(origin="camera/depth", name="Depth"))
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
+
+        # 3D point cloud view (when enabled and K is available)
+        if self._pc_enabled:
+            columns.append(
+                rrb.Spatial3DView(
+                    origin="camera/pcd",
+                    name="Point Cloud",
+                    background=[0.12, 0.12, 0.14],
+                )
+            )
 
         # Time-series column
         ts_verticals = []
@@ -366,7 +480,28 @@ class EpisodeVisualizer:
         if "rgb" in camera_keys:
             rr.log("camera/rgb", rr.Image(self._h5f["rgb"][cam_idx]))
         if "depth" in camera_keys:
-            rr.log("camera/depth", rr.DepthImage(self._h5f["depth"][cam_idx], meter=1000.0))
+            rr.log("camera/depth", rr.DepthImage(self._h5f["depth"][cam_idx], meter=self._depth_meter))
+
+        # ── 3D point cloud (cached per camera frame) ──
+        if self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
+            if cam_idx not in self._pc_cache:
+                depth = self._h5f["depth"][cam_idx]
+                rgb = self._h5f["rgb"][cam_idx] if "rgb" in camera_keys else None
+                u_strided, v_strided = self._pc_rays
+                self._pc_cache[cam_idx] = self._depth_to_pointcloud(
+                    depth=depth,
+                    K=self._pc_K,
+                    u_strided=u_strided,
+                    v_strided=v_strided,
+                    rgb=rgb,
+                    depth_scale=self._depth_scale,
+                    stride=self._pc_stride,
+                    min_depth=self._pc_min_depth,
+                    max_depth=self._pc_max_depth,
+                )
+            points, colors = self._pc_cache[cam_idx]
+            if points.shape[0] > 0:
+                rr.log("camera/pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
 
     # ------------------------------------------------------------------
     # Time series logging
@@ -437,9 +572,39 @@ def main() -> None:
         help="Limit number of state frames to load.",
     )
     parser.add_argument(
+        "--depth-scale",
+        type=float,
+        default=None,
+        help="Raw depth units in meters (overrides /meta depth_scale; L515 legacy: 0.00025).",
+    )
+    parser.add_argument(
         "--info",
         action="store_true",
         help="Print HDF5 structure summary and exit (no Rerun needed).",
+    )
+    parser.add_argument(
+        "--point-cloud",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable 3D point cloud from depth (default: on when depth+K available).",
+    )
+    parser.add_argument(
+        "--pc-stride",
+        type=int,
+        default=4,
+        help="Pixel stride for point cloud downsampling (default: 4; 1=full res).",
+    )
+    parser.add_argument(
+        "--pc-min-depth",
+        type=float,
+        default=0.1,
+        help="Min depth for point cloud filtering in meters (default: 0.1).",
+    )
+    parser.add_argument(
+        "--pc-max-depth",
+        type=float,
+        default=2.0,
+        help="Max depth for point cloud filtering in meters (default: 2.0).",
     )
     args = parser.parse_args()
 
@@ -452,7 +617,15 @@ def main() -> None:
         print_episode_info(str(h5_path))
         return
 
-    viz = EpisodeVisualizer(str(h5_path), max_frames=args.max_frames)
+    viz = EpisodeVisualizer(
+        str(h5_path),
+        max_frames=args.max_frames,
+        depth_scale=args.depth_scale,
+        point_cloud=args.point_cloud,
+        pc_stride=args.pc_stride,
+        pc_min_depth=args.pc_min_depth,
+        pc_max_depth=args.pc_max_depth,
+    )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)
         for step in range(viz.num_steps):

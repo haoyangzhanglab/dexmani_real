@@ -67,14 +67,17 @@ def main():
     print("VR 遥操作 (SharedMemory 通道)")
     print("=" * 60)
 
+    # ── 0. 任务标签 (写入 HDF5 /meta 与 sidecar, 供多任务数据集过滤) ──
+    task_label = input("任务标签 task_label (回车=teleop): ").strip() or "teleop"
+    operator = input("操作者 operator (回车=空): ").strip()
+    print(f"  task_label={task_label!r} operator={operator!r}")
+
     # ── 1. VR Receiver (独立进程, SharedMemory 写入端) ──
     vr_config = VRReceiverConfig(
         transport="tcp_server",
         host="0.0.0.0",
         port=8000,
         hand_side="right",
-        output_frame="flu",
-        max_frame_age_s=0.20,
     )
     vr_receiver = VRReceiverProcess(config=vr_config)
     vr_receiver.start()
@@ -141,7 +144,7 @@ def main():
         return
 
     # ── 5. Mapper + Retargeter ──
-    arm_mapper = ArmWristMapper(robot, planner)
+    arm_mapper = ArmWristMapper()
     retargeter = XHandRetargeter()
 
     # ── 6. Recorder (optional) ──
@@ -157,7 +160,7 @@ def main():
         ema_alpha_rot=1.0,  # Cartesian EMA pass-through for SHM raw path
         dry_run=False,
         use_shm_vr=True,  # ← 零拷贝 SHM 路径
-        collection_config=CollectionConfig(),
+        collection_config=CollectionConfig(task_label=task_label, operator=operator),
     )
 
     controller = TeleopController(

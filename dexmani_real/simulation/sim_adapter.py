@@ -23,7 +23,6 @@ from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 
 @dataclass
 class SimRobotConfig:
-    dt: float = 1.0 / 50.0
     time_step: float = 1.0 / 240.0      # SAPIEN physics step (typically > control rate)
     headless: bool = True
     arm_home_qpos: np.ndarray = field(

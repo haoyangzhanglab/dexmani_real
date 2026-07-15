@@ -49,10 +49,7 @@ class VRReceiverConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     hand_side: str = "both"  # "both" needed for HeadFrame (heading calibration)
-    output_frame: str = "flu"
-    max_frame_age_s: float = 0.20
     strict: bool = False
-    verbose: bool = False
 
 
 class VRReceiverProcess:

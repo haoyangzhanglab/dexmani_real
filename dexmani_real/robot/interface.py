@@ -344,7 +344,11 @@ class RobotInterface:
                         result.source,
                         result.report.get("path_score", float("nan")),
                     )
-                    self._execute_waypoints(result.qpos_path, dt)
+                    if not self._execute_waypoints(result.qpos_path, dt):
+                        logger.warning(
+                            "return_to_home Phase 1 execution aborted mid-path: %s",
+                            self.arm.last_error_message,
+                        )
                 else:
                     plan_reason = result.reason or "unknown"
             except Exception:
@@ -477,7 +481,11 @@ class RobotInterface:
             return
 
         logger.info("return_to_home Phase 2: %d joint waypoints, delta=%.1f°", n, np.rad2deg(delta))
-        self._execute_waypoints(path, dt)
+        if not self._execute_waypoints(path, dt):
+            logger.warning(
+                "return_to_home Phase 2 execution aborted mid-path: %s",
+                self.arm.last_error_message,
+            )
 
     def _safe_joint_home_fallback(self, current: np.ndarray, target: np.ndarray, dt: float) -> bool:
         """Tier 2 fallback: collision-checked joint-space interpolation to home.

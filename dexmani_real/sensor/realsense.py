@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -28,6 +27,7 @@ from dexmani_real.utils.pointcloud_utils import (
     intrinsics_to_dict,
     intrinsics_to_matrix,
     intrinsics_to_vector,
+    make_rays,
 )
 
 logger = get_logger(__name__)
@@ -45,80 +45,23 @@ ALIGN_MODE_ALIASES = {
 
 @dataclass(frozen=True)
 class L515DepthConfig:
-    """
-    L515-only depth preset converted from the previous exported JSON.
+    """L515-only depth settings, applied via set_option after pipeline start.
 
-    It is applied through rs.serializable_device(...).load_json(...).
-    D400 cameras such as D435/D455 will not use this config.
+    Exactly the subset settable over plain UVC. load_json (XU control path)
+    fails silently on the stock uvcvideo kernel — no error, hardware reads
+    back preset defaults — so it is not used. JSON-only parameters
+    (digital_gain, depth_units, depth_offset, ...) stay at hardware defaults.
+    Defaults below were validated on SN f1382055 (2026-07-15): Low Ambient
+    base + conf=2 + gain=12 -> 95% valid depth. D400 cameras ignore this.
     """
 
     enabled: bool = True
-    visual_preset: int = 5
-    depth_units: float = 0.000250000011874363
-    depth_offset: float = 4.5
-    min_distance: int = 190
-
-    laser_power: int = 70
-    receiver_gain: int = 12
-    confidence_threshold: int = 3
-    digital_gain: int = 1
-
-    noise_filtering: int = 30
-    noise_estimation: float = 0.0
-    pre_processing_sharpening: float = 0.0
-    post_processing_sharpening: int = 1
-
-    alternate_ir: float = 0.0
-    enable_ir_reflectivity: float = 0.0
-    enable_max_usable_range: float = 0.0
-    error_polling_enabled: int = 1
-    frames_queue_size: int = 16
-    freefall_detection_enabled: int = 1
-    global_time_enabled: float = 0.0
-    host_performance: float = 0.0
-    inter_cam_sync_mode: float = 0.0
-    invalidation_bypass: float = 0.0
-    reset_camera_accuracy_health: float = 0.0
-    sensor_mode: float = 0.0
-    trigger_camera_accuracy_health: float = 0.0
-
-    def _to_json_dict(self, depth_resolution: tuple[int, int], fps: int) -> dict[str, Any]:
-        depth_width, depth_height = depth_resolution
-        return {
-            "Alternate IR": self.alternate_ir,
-            "Confidence Threshold": self.confidence_threshold,
-            "Depth Offset": self.depth_offset,
-            "Depth Units": self.depth_units,
-            "Digital Gain": self.digital_gain,
-            "Enable IR Reflectivity": self.enable_ir_reflectivity,
-            "Enable Max Usable Range": self.enable_max_usable_range,
-            "Error Polling Enabled": self.error_polling_enabled,
-            "Frames Queue Size": self.frames_queue_size,
-            "Freefall Detection Enabled": self.freefall_detection_enabled,
-            "Global Time Enabled": self.global_time_enabled,
-            "Host Performance": self.host_performance,
-            "Inter Cam Sync Mode": self.inter_cam_sync_mode,
-            "Invalidation Bypass": self.invalidation_bypass,
-            "Laser Power": self.laser_power,
-            "Min Distance": self.min_distance,
-            "Noise Estimation": self.noise_estimation,
-            "Noise Filtering": self.noise_filtering,
-            "Post Processing Sharpening": self.post_processing_sharpening,
-            "Pre Processing Sharpening": self.pre_processing_sharpening,
-            "Receiver Gain": self.receiver_gain,
-            "Reset Camera Accuracy Health": self.reset_camera_accuracy_health,
-            "Sensor Mode": self.sensor_mode,
-            "Trigger Camera Accuracy Health": self.trigger_camera_accuracy_health,
-            "Visual Preset": self.visual_preset,
-            "stream-depth-format": "Z16",
-            "stream-fps": str(int(fps)),
-            "stream-height": str(int(depth_height)),
-            "stream-width": str(int(depth_width)),
-        }
-
-    def to_json_string(self, depth_resolution: tuple[int, int], fps: int) -> str:
-        return json.dumps(self._to_json_dict(depth_resolution, fps))
-
+    visual_preset: int = 3  # L500 runtime enum: 3 = Low Ambient Light (base)
+    min_distance: int = 190  # mm
+    laser_power: int = 100
+    receiver_gain: int = 12  # 8-18; numerically higher = lower actual gain
+    confidence_threshold: int = 2  # firmware confidence cull, 0-3
+    noise_filtering: int = 2  # runtime scale 0-6
 
 
 @dataclass(frozen=True)
@@ -221,6 +164,7 @@ class RealSense:
         self.K: np.ndarray | None = None
         self.intr: np.ndarray | None = None
         self.intrinsics_info: dict | None = None
+        self.rays: np.ndarray | None = None
         self.frame_id = 0
         self.last_frame: CameraFrame | None = None
         self._validity_warned = False
@@ -233,6 +177,9 @@ class RealSense:
             validity = replace(validity, confidence_min=validity.confidence_min << 4)
         self._validity_rt = validity
         self._edge_t_lut: np.ndarray | None = None
+        # Per-instance scratch buffers for compute_depth_edge_mask (avoids
+        # per-frame temp allocations; populated lazily on first frame).
+        self._edge_scratch: dict = {}
 
     def connect(self) -> bool:
         """Open RealSense pipeline. Returns True on success.
@@ -240,24 +187,30 @@ class RealSense:
         Canonical lifecycle method per CLAUDE.md Section 2.3.
         Idempotent: calling on an already-connected camera returns True.
 
-        On L515 a started pipeline can still fail to expose depth-stream
-        intrinsics (VGA/XGA), which makes rs.align throw on every frame. Only a
-        hardware_reset() reloads them — pipeline stop/start does not — so after
-        opening we verify the depth intrinsics and self-heal with a one-shot
-        reset if they are missing.
+        On L515 two classes of bad device state are self-healed with a one-shot
+        hardware reset:
+
+        1. Depth stream exposes no intrinsics (VGA/XGA) — rs.align throws on
+           every frame. Pipeline stop/start does not reload them.
+        2. Pipeline start fails — the device stream engine may be stuck.
         """
         if self.pipeline is not None:
             return True
 
-        if not self._open_pipeline():
+        if self._open_pipeline():
+            if self._depth_intrinsics_available():
+                return True
+            logger.warning(
+                "Depth stream exposes no intrinsics (L515 bad state) — "
+                "hardware_reset() and reconnecting once."
+            )
+        elif self.active_is_l515:
+            logger.warning(
+                "Pipeline start failed on L515 — hardware_reset() and retrying once."
+            )
+        else:
             return False
-        if self._depth_intrinsics_available():
-            return True
 
-        logger.warning(
-            "Depth stream exposes no intrinsics (L515 bad state) — "
-            "hardware_reset() and reconnecting once."
-        )
         self._hardware_reset_and_wait()
         if not self._open_pipeline():
             return False
@@ -268,7 +221,7 @@ class RealSense:
         return True
 
     def _open_pipeline(self) -> bool:
-        """Discover device, push L515 preset, start + warm up the pipeline.
+        """Discover device, start + warm up the pipeline.
 
         Returns True on success. On any failure the pipeline is torn down (via
         disconnect) so a started-but-unusable pipeline is never left holding the
@@ -278,7 +231,6 @@ class RealSense:
             self.active_serial = self.config.serial or self._find_default_serial_in_context()
             device = self._find_device_by_serial_in_context(self.active_serial)
             self.active_is_l515 = self.is_l515_device(device)
-            self._push_l515_json_preset(device)
         except (RuntimeError, OSError) as e:
             logger.warning("connect() failed at device discovery / config: %s", e)
             return False
@@ -286,10 +238,20 @@ class RealSense:
         rs_config = self.create_rs_config()
         try:
             self._start_pipeline(rs_config)
+        except (RuntimeError, OSError) as e:
+            logger.warning("connect() failed at pipeline start: %s", e)
+            self.disconnect()
+            return False
+        try:
             self._setup_pipeline_post_start()
+        except (RuntimeError, OSError) as e:
+            logger.warning("connect() failed at post-start setup: %s", e)
+            self.disconnect()
+            return False
+        try:
             self._warmup_pipeline()
         except (RuntimeError, OSError) as e:
-            logger.warning("connect() failed at pipeline start / warmup: %s", e)
+            logger.warning("connect() failed at warmup: %s", e)
             self.disconnect()
             return False
         return True
@@ -337,54 +299,71 @@ class RealSense:
         # Use a fresh context after USB re-enumeration.
         self.context = rs.context()
 
-    def _push_l515_json_preset(self, device: rs.device) -> None:
-        """Push the full L515 JSON preset before streaming (only time load_json works)."""
-        cfg = self.config.l515_depth_config
-        if cfg is None or not cfg.enabled or not self.active_is_l515:
-            return
-        try:
-            rs.serializable_device(device).load_json(
-                cfg.to_json_string(self.config.depth_resolution, self.config.fps)
-            )
-            logger.info("L515 preset (load_json) applied.")
-        except (RuntimeError, OSError) as error:
-            logger.warning("L515 preset (load_json) failed: %s", error)
+    def _apply_l515_depth_config(self) -> None:
+        """Apply L515 depth settings via set_option after pipeline start.
 
-    def _apply_l515_runtime_preset(self) -> None:
-        """Verify and fix visual_preset after pipeline start (the one param start() may reset)."""
+        The only config path: load_json (XU controls) fails silently on the
+        stock uvcvideo kernel — no error, but hardware reads back preset
+        defaults. set_option is reliable. Order matters: visual_preset first
+        (loads the factory base parameter set, including internals with no
+        corresponding rs.option), then the explicit overrides — which flips
+        the preset label to 0 (Custom); that is the expected final state.
+        """
+        cfg = self.config.l515_depth_config
         if (
             not self.active_is_l515
             or self.profile is None
-            or self.config.l515_depth_config is None
-            or not self.config.l515_depth_config.enabled
+            or cfg is None
+            or not cfg.enabled
         ):
             return
 
         sensor = self.profile.get_device().first_depth_sensor()
-        target = float(self.config.l515_depth_config.visual_preset)
-        sensor.set_option(rs.option.visual_preset, target)
+
+        options: list[tuple[rs.option, float]] = [
+            (rs.option.visual_preset, float(cfg.visual_preset)),
+            (rs.option.laser_power, float(cfg.laser_power)),
+            (rs.option.receiver_gain, float(cfg.receiver_gain)),
+            (rs.option.confidence_threshold, float(cfg.confidence_threshold)),
+            (rs.option.min_distance, float(cfg.min_distance)),
+            (rs.option.noise_filtering, float(cfg.noise_filtering)),
+        ]
+
+        for option, value in options:
+            try:
+                if sensor.supports(option):
+                    sensor.set_option(option, value)
+            except (RuntimeError, OSError) as error:
+                logger.warning("L515 set_option(%s) failed: %s", option, error)
+
+        # Verify with a read-back sentinel. The preset label itself always
+        # flips to 0 (Custom) once individual options are overridden, so
+        # receiver_gain is checked instead.
         time.sleep(0.5)
-
-        actual = float(sensor.get_option(rs.option.visual_preset))
-        try:
-            description = sensor.get_option_value_description(rs.option.visual_preset, actual)
-        except RuntimeError:
-            description = "unknown"
-
-        if not np.isclose(actual, target, atol=1e-6):
-            raise RuntimeError(
-                "L515 runtime preset verification failed: "
-                f"requested={target}, actual={actual} ({description})."
+        actual_gain = float(sensor.get_option(rs.option.receiver_gain))
+        logger.info(
+            "L515 depth config applied (set_option): preset_base=%d, laser=%d, "
+            "gain=%d, conf=%d, noise=%d, min_dist=%d",
+            int(cfg.visual_preset),
+            int(cfg.laser_power),
+            int(actual_gain),
+            int(cfg.confidence_threshold),
+            int(cfg.noise_filtering),
+            int(cfg.min_distance),
+        )
+        if not np.isclose(actual_gain, float(cfg.receiver_gain), atol=1e-6):
+            logger.warning(
+                "L515 receiver_gain read-back mismatch: requested=%d, actual=%.0f.",
+                int(cfg.receiver_gain),
+                actual_gain,
             )
-
-        logger.info("L515 runtime preset verified: %.0f (%s)", actual, description)
 
     def _setup_pipeline_post_start(self) -> None:
         """Configure active-device options, alignment, filters, and intrinsics."""
         if self.profile is None:
             raise RuntimeError("Pipeline profile is unavailable after start.")
 
-        self._apply_l515_runtime_preset()
+        self._apply_l515_depth_config()
         self.aligner = self.create_aligner()
 
         self.set_global_time()
@@ -397,8 +376,14 @@ class RealSense:
         self.last_frame = None
 
     def _start_pipeline(self, rs_config: rs.config) -> None:
-        """Create and start a fresh pipeline with the shared context."""
-        self.pipeline = rs.pipeline(self.context)
+        """Create and start a fresh pipeline.
+
+        Uses its own internal context (rs.pipeline() without argument) — sharing
+        the discovery context via rs.pipeline(self.context) causes "Couldn't
+        resolve requests" on L515 when the context still holds device handles
+        from the earlier query_devices() calls.
+        """
+        self.pipeline = rs.pipeline()
         rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
         self.profile = self.pipeline.start(rs_config)
 
@@ -526,6 +511,16 @@ class RealSense:
             self.K = K
             self.intr = intrinsics_to_vector(K)
             self.intrinsics_info = intrinsics_to_dict(intrinsics)
+            # Unit rays precomputed once per intrinsics change (edge-LUT
+            # pattern): per-frame deprojection is then a single multiply,
+            # points_cam = rays * depth_m[..., None].
+            self.rays = make_rays(int(intrinsics.height), int(intrinsics.width), K).numpy()
+
+    def get_rays(self) -> np.ndarray:
+        """(H, W, 3) float32 unit rays matching the output frame geometry."""
+        if self.rays is None:
+            raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
+        return self.rays
 
     def _apply_depth_validity(self, frames: rs.composite_frame) -> None:
         """Zero invalid raw-depth pixels (confidence/IR/edge gate) BEFORE alignment.
@@ -552,11 +547,18 @@ class RealSense:
         ir = self._get_stream_data(frames, rs.stream.infrared, depth.shape)
         if confidence is not None or ir is not None:
             valid = compute_depth_valid_mask(depth, confidence=confidence, ir=ir, config=validity)
-            depth[~valid] = 0
+            # In-place multiply by the bool mask instead of fancy-index zeroing
+            # (~50x faster on XGA: vectorized multiply vs scatter write).
+            np.multiply(depth, valid, out=depth, casting="unsafe")
 
         if validity.edge is not None and self._edge_t_lut is not None:
-            edge = compute_depth_edge_mask(depth, self._edge_t_lut, dilate_px=validity.edge.dilate_px)
-            depth[edge] = 0
+            edge = compute_depth_edge_mask(
+                depth,
+                self._edge_t_lut,
+                dilate_px=validity.edge.dilate_px,
+                scratch=self._edge_scratch,
+            )
+            np.multiply(depth, ~edge, out=depth, casting="unsafe")
 
     def _get_stream_data(
         self, frames: rs.composite_frame, stream: rs.stream, depth_shape: tuple[int, ...]

@@ -3,7 +3,7 @@
 Provides type-introspection helpers and value-conversion functions that
 replace the duplicated ``_is_ndarray_annotation``, ``_is_tuple_annotation``,
 ``_convert_field_value``, and inline ``from_dict`` logic previously copied
-across ``planning/types.py``, ``config/pipeline_config.py``, ``robot/types.py``,
+across ``planning/types.py``, ``robot/types.py``,
 ``robot/xarm7/xarm7.py``, and ``robot/xhand/xhand.py``.
 
 All functions in this module are PUBLIC (no underscore prefix) so the
@@ -163,8 +163,7 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
 
     This is the shared implementation behind all ``from_dict(cls, d)``
     classmethods in the codebase (``PlanningProfile``, ``TeleopProfile``,
-    ``PipelineConfig``, ``RobotInterfaceConfig``, ``XArm7Config``,
-    ``XHandConfig``).
+    ``RobotInterfaceConfig``, ``XArm7Config``, ``XHandConfig``).
 
     Fields that are not present in *d* are skipped (they keep their
     dataclass defaults). Extra keys in *d* that have no matching field

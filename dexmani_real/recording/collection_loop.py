@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -38,6 +38,11 @@ class CollectionLoop:
         self._stopped_reason: str = "manual"
         self._classification: str = "success"
         self._held_count: int = 0
+        # Effective per-episode metadata (resolved at start_episode) — the
+        # sidecar must record what the HDF5 /meta got, not the config defaults.
+        self._task: str = self.config.task_label
+        self._operator: str = self.config.operator
+        self._tags: list[str] = self.config.tags
 
     def start_episode(
         self,
@@ -47,6 +52,7 @@ class CollectionLoop:
         camera_K: np.ndarray | None = None,
         calib: CameraCalib | None = None,
         camera_name: str | None = None,
+        depth_scale: float | None = None,
         record_config: dict | None = None,
     ) -> bool:
         if self.is_recording:
@@ -56,6 +62,9 @@ class CollectionLoop:
         task = task_label or self.config.task_label
         op = operator or self.config.operator
         tags_list = tags or self.config.tags
+        self._task = task
+        self._operator = op
+        self._tags = tags_list
 
         success = self.recorder.start_episode(
             task_label=task,
@@ -64,6 +73,7 @@ class CollectionLoop:
             camera_K=camera_K,
             calib=calib,
             camera_name=camera_name,
+            depth_scale=depth_scale,
             record_config=record_config,
             skip_initial_frames=self.config.skip_initial_frames,
         )
@@ -166,9 +176,9 @@ class CollectionLoop:
         metadata = {
             "frame_count": self._episode_frame_count,
             "duration_s": round(duration_s, 2),
-            "task_label": self.config.task_label,
-            "operator": self.config.operator,
-            "tags": self.config.tags,
+            "task_label": self._task,
+            "operator": self._operator,
+            "tags": self._tags,
             "classification": self._classification,
             "stopped_reason": self._stopped_reason,
             "min_frames_met": self._episode_frame_count >= self.config.min_frames,

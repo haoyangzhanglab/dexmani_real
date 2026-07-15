@@ -27,8 +27,6 @@ __all__ = ["XHandRetargeter", "adaptive_retargeting_thumb", "adaptive_retargetin
 import os
 import tempfile
 import time
-from typing import List, Optional
-
 import numpy as np
 import torch
 import yaml

@@ -78,9 +78,11 @@ def validate_action(
     if action.target_eef_pos is not None:
         action.target_eef_pos[:] = robot.clamp_workspace_pos(action.target_eef_pos)
 
-    # 7. Joint-limit clipping (arm)
-    arm_lo = robot.arm.config.qpos_min
-    arm_hi = robot.arm.config.qpos_max
+    # 7. Joint-limit clipping (arm) — soft limits, strictly inside the firmware
+    #    reduced range so boundary-clipped commands never trip a reduced-mode
+    #    fault (see xarm7._inset_joint_limits)
+    arm_lo = robot.arm.qpos_min_soft
+    arm_hi = robot.arm.qpos_max_soft
     action.arm_qpos_cmd[:] = np.clip(action.arm_qpos_cmd, arm_lo, arm_hi)
 
     # 8. Joint-limit clipping (hand)

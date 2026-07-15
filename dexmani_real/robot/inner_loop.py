@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+from dexmani_real.robot.xarm7.error_codes import decode_error, decode_warn
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
@@ -186,6 +187,10 @@ class ArmInnerLoop:
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()
+        # Unblock a loop thread stuck in the sync handshake (policy_ready.wait()
+        # has no timeout) — it wakes, sees _stop_event, and exits cleanly.
+        if self._sync is not None:
+            self._sync.policy_ready.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
@@ -288,6 +293,10 @@ class ArmInnerLoop:
                 if not no_target_yet and (
                     target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
                 ):
+                    # Re-arm the soft-start ramp: any hold (PAUSED, idle, VR loss,
+                    # main-thread stall) counts as disengagement, so the next
+                    # engagement ramps up again as the docstring promises.
+                    self._ramp_step = 0
                     self._hold_position(arm)
                     self._signal_ready_only()
                     continue
@@ -332,7 +341,11 @@ class ArmInnerLoop:
                 # necessarily failing get_joint_states)
                 arm_error = getattr(arm, "error_code", 0)
                 if arm_error != 0:
-                    logger.error("ArmInnerLoop: arm error_code=%d — stopping inner loop", arm_error)
+                    logger.error(
+                        "ArmInnerLoop: arm error_code=%d (%s) — stopping inner loop",
+                        arm_error,
+                        decode_error(arm_error),
+                    )
                     with self._lock:
                         self._error_state = True
                     break
@@ -360,6 +373,10 @@ class ArmInnerLoop:
                 self._error_state = True
         finally:
             self._ready_event.clear()
+            # Wake a controller blocked on robot_ready.wait() so it can observe
+            # the error/exit state instead of hanging (error exits never reach
+            # the normal per-frame handshake).
+            self._signal_ready_only()
             # Mode 6: firmware holds last position on disconnect, no explicit stop needed.
             try:
                 arm.disconnect()
@@ -460,10 +477,12 @@ class ArmInnerLoop:
             except (RuntimeError, OSError, ValueError, IndexError):
                 pass
             logger.error(
-                "ArmInnerLoop: set_servo_angle code=%d, controller error=%d, warn=%d",
+                "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s), warn=%d (%s)",
                 code,
                 err_code,
+                decode_error(err_code),
                 warn_code,
+                decode_warn(warn_code),
             )
             with self._lock:
                 self._error_state = True

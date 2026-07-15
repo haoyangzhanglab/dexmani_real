@@ -1256,7 +1256,7 @@ def _run_desk_test(
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision_19dof.srdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
             base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
             workspace_bounds=np.array([[0.0, 0.75], [-0.5, 0.5], [0.0, 0.6]], dtype=np.float64),
             collision=collision_cfg,

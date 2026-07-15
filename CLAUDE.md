@@ -85,10 +85,9 @@ dexmani_real/          ← Python package root
 ├── sensor/            ← RealSense camera driver, multi-camera manager, VR receiver
 ├── simulation/        ← SAPIEN-based simulation mirror of real hardware
 ├── shm/               ← SharedMemoryRingBuffer for cross-process camera data
-├── config/            ← Camera extrinsics (cameras.json), PipelineConfig (serializable)
+├── config/            ← Camera extrinsics (cameras.json, CameraCalib)
 ├── utils/             ← Shared utilities (log, serialization, rate limiting, signal)
 ├── tools/             ← CLI utilities (HDF5 episode viewer, HDF5→Zarr export)
-├── services/          ← Standalone services (retarget server)
 ├── assets/            ← URDF, SRDF, meshes, retargeting configs
 ├── examples/          ← Real/sim teleop entry points + motion planning tests
 │   ├── real/          ← Real-hardware examples (keyboard_teleop, test_motion, quest_teleop)
@@ -208,7 +207,6 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
 | `examples/real/keyboard_teleop_real.py` | Keyboard-based arm control |
 | `examples/real/test_quest_hand_teleop.py` | Standalone hand-retargeting test (no TeleopController) |
 | `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
-| `dexmani_real/services/retarget_server.py` | Standalone hand retargeting service (ZMQ REP) |
 | `dexmani_real/tools/visualize_episode.py` | Rerun-based HDF5 episode viewer (3D + camera + time series) |
 | `dexmani_real/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
 

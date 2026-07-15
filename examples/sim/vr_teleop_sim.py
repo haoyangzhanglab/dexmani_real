@@ -659,10 +659,10 @@ def main() -> None:
                                     eef_pos=sim_state["eef_pos"],
                                     eef_quat_wxyz=sim_state["eef_quat_wxyz"],
                                 )
-                                # 开始录制 episode（CollectionLoop 管理）
+                                # 开始录制 episode（CollectionLoop 管理，
+                                # task_label/operator 由 CollectionConfig 提供）
                                 episode_idx += 1
                                 collection.start_episode(
-                                    task_label="teleop", operator="",
                                     camera_K=camera_K,
                                 )
                                 state = "TELEOP_RECORDING"

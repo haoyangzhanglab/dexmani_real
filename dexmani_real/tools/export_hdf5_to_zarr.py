@@ -100,6 +100,7 @@ def _read_camera_meta(f: h5py.File) -> dict | None:
         return {
             "serial": str(meta.get("camera_serial", "")),
             "type": str(meta.get("camera_type", "")),
+            "depth_scale": float(meta["depth_scale"]) if "depth_scale" in meta else None,
             "K": np.asarray(meta["camera_K"], dtype=np.float64).reshape(3, 3),
             "T_world_camera": np.asarray(meta["camera_T_world_camera"], dtype=np.float64).reshape(4, 4),
         }
@@ -113,12 +114,21 @@ def _read_camera_meta(f: h5py.File) -> dict | None:
 
 
 def _read_episode_meta(h5_path: Path) -> dict:
-    """Read metadata attributes from an HDF5 episode file."""
+    """Read metadata attributes from an HDF5 episode file.
+
+    Adds a derived ``held_ratio`` key (fraction of frames where the command
+    was held — no fresh VR/IK result) computed from /flag_held when present.
+    """
     try:
         with h5py.File(str(h5_path), "r") as f:
             if "meta" not in f:
                 return {}
-            return dict(f["meta"].attrs)
+            meta = dict(f["meta"].attrs)
+            if "flag_held" in f:
+                held = np.asarray(f["flag_held"][:], dtype=bool)
+                if held.size > 0:
+                    meta["held_ratio"] = float(held.mean())
+            return meta
     except (OSError, KeyError):
         return {}
 
@@ -129,6 +139,7 @@ def _episode_passes_filters(
     filter_success: bool | None = None,
     filter_tags: str | None = None,
     min_frames: int | None = None,
+    max_held_ratio: float | None = None,
 ) -> bool:
     """Check if episode metadata passes all filter criteria."""
     if filter_task is not None:
@@ -153,6 +164,11 @@ def _episode_passes_filters(
         if nf < min_frames:
             return False
 
+    if max_held_ratio is not None:
+        held_ratio = meta.get("held_ratio", None)
+        if held_ratio is not None and float(held_ratio) > max_held_ratio:
+            return False
+
     return True
 
 
@@ -162,6 +178,7 @@ def load_episodes(
     filter_success: bool | None = None,
     filter_tags: str | None = None,
     min_frames: int | None = None,
+    max_held_ratio: float | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[Path],
            list[np.ndarray | None], list[np.ndarray | None], dict | None]:
     """Load all HDF5 episodes from data_dir with optional metadata filtering.
@@ -172,6 +189,8 @@ def load_episodes(
         filter_success: Episode-level filter: exact match on success flag.
         filter_tags: Episode-level filter: substring match on tags.
         min_frames: Episode-level filter: minimum frame count.
+        max_held_ratio: Episode-level filter: exclude episodes whose fraction
+            of held frames (/flag_held) exceeds this value.
 
     Returns:
         (obs_list, action_list, episode_lengths, episode_paths,
@@ -204,7 +223,7 @@ def load_episodes(
             meta = _read_episode_meta(h5_path)
             if not _episode_passes_filters(
                 meta, filter_task, filter_success, filter_tags,
-                min_frames,
+                min_frames, max_held_ratio,
             ):
                 skipped_meta += 1
                 continue
@@ -594,6 +613,8 @@ def write_zarr(
             cam_grp.create_dataset("T_world_camera", data=camera_meta["T_world_camera"], dtype=np.float64)
             cam_grp.attrs["serial"] = camera_meta["serial"]
             cam_grp.attrs["type"] = camera_meta["type"]
+            if camera_meta.get("depth_scale") is not None:
+                cam_grp.attrs["depth_scale"] = camera_meta["depth_scale"]
 
     # Summary
     print(f"\n{name}.zarr export complete:")
@@ -655,6 +676,10 @@ def main() -> None:
         "--min_frames", type=int, default=None,
         help="Minimum frame count per episode.",
     )
+    parser.add_argument(
+        "--max_held_ratio", type=float, default=None,
+        help="Exclude episodes whose held-frame ratio (/flag_held mean) exceeds this value (e.g. 0.2).",
+    )
     # ── Validation ──
     parser.add_argument(
         "--validate", action="store_true",
@@ -704,6 +729,7 @@ def main() -> None:
             filter_success=args.filter_success,
             filter_tags=args.filter_tags,
             min_frames=args.min_frames,
+            max_held_ratio=args.max_held_ratio,
         )
 
     if not obs_list:

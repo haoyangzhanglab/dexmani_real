@@ -40,7 +40,7 @@ JOINT_NAMES = [
     "little_joint2",
 ]
 
-SENSOR_IDS = [0x11, 0x12, 0x13, 0x14, 0x15]
+
 SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
 
 # Known non-critical sensor error patterns (ref: LeFranX xhand.py:230-241).
@@ -56,7 +56,6 @@ _KNOWN_SENSOR_ERROR_PATTERNS = [
 ]
 
 # XHand SDK error codes (xhand_controller)
-ERR_OK = 0
 ERR_CRC = 1501070  # Communication data CRC error (RS485 transient)
 ERR_BOOT_CMD = 1501036  # Error running CMD during boot, non-existent CMD (hand re-initializing)
 
@@ -68,12 +67,6 @@ _RECOVERY_DELAY: dict[int, float] = {
     ERR_CRC: 0.05,  # 50 ms — transient, retry quickly
     ERR_BOOT_CMD: 0.5,  # 500 ms — hand needs time to finish boot sequence
 }
-
-# Threshold for consecutive send errors before triggering a full reconnect.
-# After this many failures in a row, the hand connection is likely in an
-# unrecoverable state and needs a hardware-level reset.
-_CONSECUTIVE_ERROR_RECONNECT_THRESHOLD = 10
-
 
 @dataclass
 class XHandConfig(FromDictMixin):
@@ -87,7 +80,6 @@ class XHandConfig(FromDictMixin):
     open_serial_retry_delay_s: float = 2.0
 
     dt: float = 1.0 / 30.0  # 30 Hz (ref: LeFranX, DexUMI)
-    num_joints: int = 12
 
     # Important:
     # True  -> force SDK to refresh state from hardware.

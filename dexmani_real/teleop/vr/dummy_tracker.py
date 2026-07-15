@@ -14,7 +14,7 @@ class DummyTracker:
     """Fake VR tracker that emits static frames for dry-run / testing.
 
     Each call to get_latest() bumps the sequence_id and refreshes local_recv_ns
-    so that TrackingQuality._frame_age() always reports a fresh frame.
+    so that frame-age staleness checks (inlined in controller.py) always report a fresh frame.
     """
 
     def __init__(self, wrist_pos: np.ndarray | None = None) -> None:

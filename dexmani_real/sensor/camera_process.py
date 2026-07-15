@@ -58,6 +58,9 @@ class CameraProcess:
         self._stop_event = mp.Event()
         self._shm_buf = None  # CameraRingBuffer instance (lazy init)
         self._crashed = mp.Event()
+        # Depth units in meters (L515: 0.00025) — set by the child after
+        # camera connect; 0.0 means "not yet known".
+        self._depth_scale = mp.Value("d", 0.0)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -123,6 +126,12 @@ class CameraProcess:
     def running(self) -> bool:
         return self._process is not None and self._process.is_alive()
 
+    @property
+    def depth_scale(self) -> float | None:
+        """Raw uint16 depth units in meters, or None if not yet known."""
+        v = self._depth_scale.value
+        return v if v > 0 else None
+
     # ------------------------------------------------------------------
     # Shared memory helpers
     # ------------------------------------------------------------------
@@ -187,6 +196,7 @@ class CameraProcess:
                 logger.error("CameraProcess: RealSense connect failed.")
                 self._crashed.set()
                 return
+            self._depth_scale.value = cam.get_depth_scale()
 
             logger.info(
                 "CameraProcess capture loop started @ %.0f Hz.",
@@ -245,6 +255,7 @@ class CameraProcess:
                         cam.disconnect()
                         if cam.connect():
                             logger.info("CameraProcess camera rebuilt; resuming capture.")
+                            self._depth_scale.value = cam.get_depth_scale()
                             consecutive_failures = 0
                         else:
                             logger.error("CameraProcess camera rebuild failed — will retry.")

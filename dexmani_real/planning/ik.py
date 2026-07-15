@@ -32,8 +32,8 @@ class TeleopIKSolver:
          Picks the hardware-closest valid candidate to avoid branch switching.
       3. Both fail → hold previous command.
 
-    Speed limiting is handled by ArmInnerLoop._tick_mode4()
-    (velocity/accel/jerk clipping at 250 Hz).
+    Speed limiting is handled by ArmInnerLoop (50 Hz, Mode 6): per-step joint
+    delta clamp + firmware online trajectory planning.
     Self-collision checks are done when TeleopProfile.check_self_collision=True.
     
 
@@ -396,8 +396,8 @@ class TeleopIKSolver:
     ) -> IKResult:
         """Canonicalize IK result and compute tracking error.
 
-        Speed limiting is NOT done here — it is handled by
-        ArmInnerLoop._tick_mode4() (velocity/accel/jerk clipping at 250 Hz).
+        Speed limiting is NOT done here — it is handled by ArmInnerLoop
+        (per-step joint delta clamp + Mode 6 firmware trajectory planning).
 
         Args:
             jacobian: Optional pre-computed 6×7 EEF Jacobian at ``target_qpos``.
@@ -578,7 +578,7 @@ class TeleopIKSolver:
 
         # Per-joint canonicalization: wrap to [-π, π] and prefer the branch
         # closest to the previous command. Joint-level delta safety is enforced
-        # by the inner loop (velocity/acceleration/jerk limiting at 250 Hz).
+        # by the inner loop (per-step delta clamp + Mode 6 firmware limits).
         raw_target_qpos = self.ik_mgr.canonicalize_qpos(qpos, previous_qpos_cmd)
 
         diff_report = {

@@ -2,10 +2,9 @@
 """L515 tabletop point-cloud diagnostic.
 
   - RGB:   640 x 480 @ 30 FPS
-  - Depth: 640 x 480 @ 30 FPS
-  - Depth is aligned to RGB
-  - Camera-frame valid depth: [0.3, 2.5] m
-  - Workspace crop, desk RANSAC, 3 mm voxel
+  - Depth: 1024 x 768 @ 30 FPS, aligned to RGB (output 640 x 480)
+  - Camera-frame valid depth: [0.3, 1.5] m
+  - Workspace crop, desk RANSAC, 5 mm voxel, cluster outlier removal, FPS to 2048
 
 Usage:
   conda activate real_robot
@@ -15,11 +14,14 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 import pyrealsense2 as rs
+import torch
+from pytorch3d.ops import sample_farthest_points
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -37,15 +39,24 @@ RGB_RESOLUTION = (640, 480)
 DEPTH_RESOLUTION = (1024, 768)
 FPS = 30
 
-# Conservative residual 3-D tail removal after 3 mm voxelization.
-USE_RADIUS_OUTLIER_REMOVAL = True
-RADIUS_OUTLIER_RADIUS_M = 0.010
-RADIUS_OUTLIER_MIN_NEIGHBORS = 6
-
 USE_RGBD_VIS = True
 
+# Single-pass outlier removal (policy-inference latency budget): Euclidean
+# clustering at eps = 2 x voxel, then drop connected components smaller than
+# CLUSTER_MIN_SIZE points (~7.5 cm^2 of surface at 5 mm voxel). One pass covers
+# every artifact class — isolated specks/strings become tiny clusters, dense
+# clumps stay below the size threshold — while anything resting on / touching
+# another structure merges into that structure's cluster, so on-desk objects
+# survive (verified: 2x2 cm on-desk object kept 16/16; 300 specks, 10-pt
+# string, 8-pt clump all removed; ~1.2 ms @ 3k post-voxel points).
+CLUSTER_EPS_M = 0.010
+CLUSTER_MIN_SIZE = 30
 
-
+# Fixed-size policy input. >= TARGET points: farthest point sampling
+# (pytorch3d GPU ~9 ms @ 5.3k pts — B=1 underutilizes the GPU but keeps the
+# CPU free; open3d CPU FPS is ~7 ms if no CUDA). < TARGET: random duplicate
+# padding of existing points.
+TARGET_POINTS = 2048
 
 
 def _show_rgbd_panels(
@@ -107,31 +118,18 @@ def main() -> None:
             warmup_frames=30,
             l515_depth_config=L515DepthConfig(
                 enabled=True,
-                visual_preset=5,
-                depth_units=0.000250000011874363,
-                depth_offset=4.5,
+                # Low Ambient Light (runtime enum 3) — dense indoor base preset.
+                # 2026-07-15 A/B on this scene: Low-Ambient base + conf=1 gave
+                # 95% valid depth; Short-Range base (5) + conf=3 gave 48%.
+                visual_preset=3,
                 min_distance=190,
                 laser_power=100,
-                receiver_gain=18,
-                confidence_threshold=3,
-                digital_gain=2,
-                noise_filtering=4,
-                noise_estimation=0.0,
-                pre_processing_sharpening=0.0,
-                post_processing_sharpening=1,
-                alternate_ir=0.0,
-                enable_ir_reflectivity=0.0,
-                enable_max_usable_range=0.0,
-                error_polling_enabled=1,
-                frames_queue_size=16,
-                freefall_detection_enabled=1,
-                global_time_enabled=0.0,
-                host_performance=0.0,
-                inter_cam_sync_mode=0.0,
-                invalidation_bypass=0.0,
-                reset_camera_accuracy_health=0.0,
-                sensor_mode=0.0,
-                trigger_camera_accuracy_health=0.0,
+                receiver_gain=12,
+                # Firmware confidence cull (0-3). At 3 (max) roughly half the
+                # image was invalidated; 2 keeps marginal pixels for the
+                # driver's image-domain gate + cluster filter to judge.
+                confidence_threshold=2,
+                noise_filtering=2,  # runtime scale 0-6
             ),
             # Image-domain validity gate: confidence + IR streams, raw depth
             # masked before depth_to_color alignment (specular/overexposure spikes
@@ -141,14 +139,17 @@ def main() -> None:
                 ir_min=2,
                 ir_saturation=250,
                 saturation_dilate_px=3,
-                # Discontinuity band: T(z) = max(5*sigma_z(z), 8mm), sigma_z = 1.0 + 1.2*z mm
-                # -> 8mm @0.5m, 11mm @1.0m. Calibrate sigma_poly from plane temporal std.
+                # Discontinuity band: T(z) = max(5*sigma_z(z), 10mm).
+                # sigma_poly calibrated 2026-07-15 (SN f1382055, warm camera, via
+                # calibrate_l515_depth.py): sigma_z = -0.94 + 2.93*z mm. Negative
+                # below z~0.32m is clamped by t_min; within the workspace the
+                # 10mm floor dominates up to ~1.0m. Cold-run confirmation pending.
                 edge=DepthEdgeConfig(
-                    sigma_poly=(0.0010, 0.0012),
+                    sigma_poly=(-0.00094, 0.00293),
                     n_sigma=5.0,
-                    t_min=0.008,
+                    t_min=0.010,
                     t_max=None,
-                    dilate_px=1,
+                    dilate_px=0,
                 ),
             ),
         )
@@ -236,27 +237,38 @@ def main() -> None:
 
         _show_rgbd_panels(rgb_bgr, depth_m)
 
-        # Camera-frame point cloud. Depth range intentionally unchanged.
+        # Camera-frame point cloud.
         print("\nGenerating camera-frame point cloud...")
-        height, width = depth_for_pointcloud.shape
-        u, v = np.meshgrid(np.arange(width), np.arange(height))
-        pixels_h = np.stack([u, v, np.ones_like(u)], axis=-1)
-        rays_cam = pixels_h @ np.linalg.inv(K).T
+        # Unit rays precomputed by the driver at connect (edge-LUT pattern):
+        # per-frame deprojection is a single multiply — ~10x cheaper than
+        # rebuilding meshgrid + inv(K) every frame.
+        rays_cam = camera.get_rays()
+        if rays_cam.shape[:2] != depth_for_pointcloud.shape:
+            raise RuntimeError(
+                f"rays shape {rays_cam.shape[:2]} does not match depth {depth_for_pointcloud.shape}."
+            )
         points_cam = rays_cam * depth_for_pointcloud[..., None]
 
         points_flat = points_cam.reshape(-1, 3)
         colors_flat = (rgb.astype(np.float64) / 255.0).reshape(-1, 3)
         z_cam = points_flat[:, 2]
 
+        # Camera-frame depth gate.
+        # Lower bound 0.3 m: sensor physics — L515 spec min-Z is 0.25 m (+ margin);
+        # closer returns are unreliable ToF data regardless of workspace.
+        # Upper bound 1.5 m: workspace geometry — farthest workspace-crop corner is
+        # z_cam = 1.34 m under current cameras.json extrinsics (+ ~0.15 m margin);
+        # points beyond can never survive the world-frame crop. Re-derive if the
+        # camera pose or crop box changes.
         valid = (
             np.isfinite(points_flat).all(axis=1)
             & (z_cam > 0.3)
-            & (z_cam < 2.5)
+            & (z_cam < 1.5)
         )
         pts_cam = points_flat[valid]
         col_cam = colors_flat[valid]
 
-        print(f"  Valid depth range [0.3, 2.5]m: {int(valid.sum())} / {valid.size} points")
+        print(f"  Valid depth range [0.3, 1.5]m: {int(valid.sum())} / {valid.size} points")
         print(f"  Camera-frame points: {pts_cam.shape[0]}")
         if pts_cam.shape[0] == 0:
             raise RuntimeError("No valid camera-frame points remain.")
@@ -345,10 +357,8 @@ def main() -> None:
         print(f"  Desk Z (world):   mean={desk_z_mean:.4f} m  std={desk_z_std:.4f} m")
         print(f"  Tilt from horiz:  {angle_deg:.1f} deg")
 
-        # Tight Z crop: intentionally unchanged.
-        z_below_desk, z_above_desk = 0.03, 0.6
-        z_lo = desk_z_mean - z_below_desk
-        z_hi = desk_z_mean + z_above_desk
+        # Fixed Z crop.
+        z_lo, z_hi = 0.0, 0.8
         pts_all = np.asarray(pcd.points)
         col_all = np.asarray(pcd.colors)
         z_mask = (pts_all[:, 2] >= z_lo) & (pts_all[:, 2] <= z_hi)
@@ -356,64 +366,88 @@ def main() -> None:
         pcd.points = o3d.utility.Vector3dVector(pts_all[z_mask])
         pcd.colors = o3d.utility.Vector3dVector(col_all[z_mask])
         print(
-            f"  After desk-anchored Z crop (z in [{z_lo:.3f},{z_hi:.3f}]): "
+            f"  After fixed Z crop (z in [{z_lo},{z_hi}]): "
             f"{int(z_mask.sum())} points"
         )
 
-        # Original 3 mm voxel retained.
-        pcd_ds = pcd.voxel_down_sample(voxel_size=0.003)
-        print(f"  Downsampled: {len(pcd_ds.points)} points (3mm voxel)")
+        # 5 mm voxel downsample.
+        pcd_ds = pcd.voxel_down_sample(voxel_size=0.005)
+        print(f"  Downsampled: {len(pcd_ds.points)} points (5mm voxel)")
 
-        # Radius outlier filter (disabled).
-        # if USE_RADIUS_OUTLIER_REMOVAL and len(pcd_ds.points) > 0:
-        #     before = len(pcd_ds.points)
-        #     pcd_ds, _ = pcd_ds.remove_radius_outlier(
-        #         nb_points=RADIUS_OUTLIER_MIN_NEIGHBORS,
-        #         radius=RADIUS_OUTLIER_RADIUS_M,
-        #     )
-        #     removed_3d = before - len(pcd_ds.points)
-        #     print(
-        #         "  Radius outlier filter: "
-        #         f"removed {removed_3d}/{before} points "
-        #         f"({100.0 * removed_3d / max(before, 1):.2f}%)"
-        #     )
+        # Single-pass outlier removal (see constants at top).
+        n_before = len(pcd_ds.points)
+        t_start = time.perf_counter()
+        labels = np.asarray(pcd_ds.cluster_dbscan(eps=CLUSTER_EPS_M, min_points=1))
+        cluster_sizes = np.bincount(labels)
+        keep_idx = np.flatnonzero(cluster_sizes[labels] >= CLUSTER_MIN_SIZE)
+        pcd_ds = pcd_ds.select_by_index(keep_idx)
+        elapsed_ms = (time.perf_counter() - t_start) * 1e3
+        print(
+            f"  Cluster outlier removal (eps={CLUSTER_EPS_M * 1000:.0f}mm, "
+            f"min_size={CLUSTER_MIN_SIZE}): "
+            f"removed {n_before - len(pcd_ds.points)}, kept {len(pcd_ds.points)} "
+            f"in {int((cluster_sizes >= CLUSTER_MIN_SIZE).sum())}/{len(cluster_sizes)} "
+            f"clusters ({elapsed_ms:.1f} ms)"
+        )
+
+        # Fixed-size downsample for policy input (see constants at top).
+        pts_in = np.asarray(pcd_ds.points, dtype=np.float32)
+        col_in = np.asarray(pcd_ds.colors)
+        n_in = pts_in.shape[0]
+        if n_in == 0:
+            raise RuntimeError("No points left before fixed-size downsampling.")
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            # Warm up CUDA so the timing below reflects steady state.
+            sample_farthest_points(torch.zeros((1, 8, 3), device="cuda"), K=2)
+        t_start = time.perf_counter()
+        if n_in >= TARGET_POINTS:
+            pts_t = torch.from_numpy(pts_in)[None].to("cuda" if use_cuda else "cpu")
+            _, idx_t = sample_farthest_points(pts_t, K=TARGET_POINTS)
+            idx = idx_t[0].cpu().numpy()
+            method = "FPS/" + ("cuda" if use_cuda else "cpu")
+        else:
+            pad = np.random.default_rng().integers(0, n_in, TARGET_POINTS - n_in)
+            idx = np.concatenate([np.arange(n_in), pad])
+            method = "random pad"
+        elapsed_ms = (time.perf_counter() - t_start) * 1e3
+        pcd_ds = o3d.geometry.PointCloud()
+        pcd_ds.points = o3d.utility.Vector3dVector(pts_in[idx].astype(np.float64))
+        pcd_ds.colors = o3d.utility.Vector3dVector(col_in[idx])
+        print(
+            f"  Fixed-size downsample ({method}): {n_in} -> {len(idx)} points "
+            f"({elapsed_ms:.1f} ms)"
+        )
 
         world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
         camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
         camera_frame.transform(T_world_camera)
 
+        # Workspace crop box wireframe (effective bounds after all crop stages).
+        crop_corners = np.array([
+            [x_min, y_min, z_lo], [x_max, y_min, z_lo],
+            [x_max, y_max, z_lo], [x_min, y_max, z_lo],
+            [x_min, y_min, z_hi], [x_max, y_min, z_hi],
+            [x_max, y_max, z_hi], [x_min, y_max, z_hi],
+        ])
+        crop_edges = [
+            [0, 1], [1, 2], [2, 3], [3, 0],
+            [4, 5], [5, 6], [6, 7], [7, 4],
+            [0, 4], [1, 5], [2, 6], [3, 7],
+        ]
+        crop_box = o3d.geometry.LineSet()
+        crop_box.points = o3d.utility.Vector3dVector(crop_corners)
+        crop_box.lines = o3d.utility.Vector2iVector(crop_edges)
+        crop_box.colors = o3d.utility.Vector3dVector([[0.0, 1.0, 0.0] for _ in crop_edges])
+
         print("\nLaunching open3d visualizer (close window to continue)...")
-        print("  Window 1: cleaned world-frame point cloud + coordinate frames")
+        print(
+            "  World-frame point cloud (RGB) + workspace crop box (green) + "
+            "coordinate frames (world=large, camera=small)"
+        )
         o3d.visualization.draw_geometries(
-            [pcd_ds, world_frame, camera_frame],
+            [pcd_ds, crop_box, world_frame, camera_frame],
             window_name="World-frame Point Cloud",
-            point_show_normal=False,
-        )
-
-        # Desk color coding on the cleaned/downsampled point cloud.
-        inlier_pcd = o3d.geometry.PointCloud()
-        inlier_pcd.points = o3d.utility.Vector3dVector(
-            inlier_pts_full.astype(np.float64)
-        )
-        inlier_tree = o3d.geometry.KDTreeFlann(inlier_pcd)
-
-        ds_pts = np.asarray(pcd_ds.points)
-        colors_viz = np.zeros((len(ds_pts), 3), dtype=np.float64)
-        for index, point in enumerate(ds_pts):
-            _, nearest, _ = inlier_tree.search_knn_vector_3d(point, 1)
-            if (
-                len(nearest) > 0
-                and np.linalg.norm(point - inlier_pts_full[nearest[0]]) < 0.005
-            ):
-                colors_viz[index] = [0.0, 1.0, 0.0]
-            else:
-                colors_viz[index] = [1.0, 0.0, 0.0]
-        pcd_ds.colors = o3d.utility.Vector3dVector(colors_viz)
-
-        print("\n  Window 2: desk segmentation (green=desk, red=other)")
-        o3d.visualization.draw_geometries(
-            [pcd_ds, world_frame, camera_frame],
-            window_name="Desk Segmentation: green=desk, red=other",
             point_show_normal=False,
         )
 

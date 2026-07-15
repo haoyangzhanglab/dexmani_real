@@ -50,12 +50,7 @@ class CollisionConfig(FromDictMixin):
     hand_safe_margin: float = 0.03
     """Minimum fingertip-to-table clearance (meters)."""
 
-    # ── Fingertip link identification (from collision URDF) ──
-    # xarm7_xhand_collision.urdf link order (0-indexed):
-    #   0-11: arm (link_base..custom_eef_link)
-    #   12-41: hand (right_hand_link..pinky_tip)
-    #   20=thumb_rota_tip, 26=index_rota_tip, 31=mid_tip, 36=ring_tip, 41=pinky_tip
-    fingertip_link_ids: tuple[int, ...] = (20, 26, 31, 36, 41)
+    # ── Fingertip link identification ──
     fingertip_link_names: tuple[str, ...] = (
         "thumb_tip", "index_tip", "mid_tip", "ring_tip", "pinky_tip",
     )
@@ -68,10 +63,6 @@ class CollisionConfig(FromDictMixin):
     + path validation) and activates FK fingertip Z desk safety checks.  Set to
     False to disable all environment collision layers.
     """
-
-    collision_step_size: float = 0.02
-    """Joint-space step size [rad] for dense segment collision interpolation.
-    Default 0.02 rad ~1.15° (ref: dimos collision_step_size)."""
 
     desk_safety_step_rad: float = 0.05
     """Joint-space step size [rad] for fingertip desk safety path checks.

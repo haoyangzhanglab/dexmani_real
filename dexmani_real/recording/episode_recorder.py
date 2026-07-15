@@ -18,7 +18,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
-from dexmani_real.config.pipeline_config import DEFAULT_MAX_RECORD_FRAMES
+from dexmani_real.recording.collection_config import DEFAULT_MAX_RECORD_FRAMES
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.utils.log import get_logger
@@ -90,6 +90,7 @@ class EpisodeRecorder:
         calib: CameraCalib | None = None,
         camera_K: np.ndarray | None = None,
         camera_name: str | None = None,
+        depth_scale: float | None = None,
         record_config: dict | None = None,
         skip_initial_frames: int = 0,
     ) -> bool:
@@ -128,6 +129,7 @@ class EpisodeRecorder:
             "calib": calib,
             "camera_K": camera_K,
             "camera_name": camera_name,
+            "depth_scale": depth_scale,
             "record_config": record_config,
             "skip_initial_frames": self._skip_initial_frames,
         }
@@ -170,6 +172,12 @@ class EpisodeRecorder:
         camera_K = p.get("camera_K")
         if camera_K is not None:
             meta.attrs["camera_K"] = camera_K.flatten().tolist()
+
+        # Raw uint16 depth units in meters (L515: 0.00025) — without this,
+        # offline consumers cannot convert /depth correctly.
+        depth_scale = p.get("depth_scale")
+        if depth_scale is not None:
+            meta.attrs["depth_scale"] = float(depth_scale)
 
         # Collection-config snapshot (control mode, EMA alphas, delta clips) —
         # essential for downstream reproducibility.  Values are pre-sanitized to
@@ -406,6 +414,10 @@ class EpisodeRecorder:
             ts_ds[new_start:buf_size] = ts[new_start:buf_size]
 
         self._flushed_frames = buf_size
+
+        # Push HDF5 metadata (chunk B-tree, resized shapes) to disk so a hard
+        # crash (SIGKILL/segfault) loses at most one flush interval.
+        self._file.flush()
 
     def stop_episode(self, success: bool = True) -> str | None:
         if not self._recording:

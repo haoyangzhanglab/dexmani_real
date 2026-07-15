@@ -273,8 +273,6 @@ def main():
         host="0.0.0.0",
         port=8000,
         hand_side="both",  # "both" needed for HeadFrame (heading calibration)
-        output_frame="flu",
-        max_frame_age_s=0.20,
     )
     vr_receiver = VRReceiverProcess(config=vr_config)
     vr_receiver.start()
@@ -564,7 +562,9 @@ def main():
                         continue
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
-                    recorder.start_episode()
+                    recorder.start_episode(
+                        depth_scale=camera.depth_scale if camera is not None else None,
+                    )
                     recording_active = True
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
