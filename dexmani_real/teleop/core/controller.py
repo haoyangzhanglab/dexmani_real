@@ -485,6 +485,14 @@ class TeleopController:
                 self._print_available_keys()
             return
 
+        if signal == ControlSignal.DISCARD:
+            if self.state in (ControllerState.TELEOP, ControllerState.PAUSED):
+                self._stop_recording(save=False)  # D = Discard
+                self.state = ControllerState.IDLE
+                logger.info("=== STATE: → IDLE (discarded) ===")
+                self._print_available_keys()
+            return
+
         if signal == ControlSignal.PAUSE:
             if self.state == ControllerState.TELEOP:
                 self.state = ControllerState.PAUSED
@@ -589,12 +597,17 @@ class TeleopController:
         if self._recorder_session is not None:
             # task_label/operator/tags are omitted so CollectionLoop falls back
             # to its CollectionConfig — the single source of truth.
+            record_config = self._build_record_config()
+            # Pointcloud processor params (pc_*) when the injected CameraProcess
+            # computes the /pointcloud stream — reproducibility metadata.
+            record_config.update(getattr(self._camera_process, "pointcloud_meta", None) or {})
             self._recorder_session.start(
                 dict(
                     calib=self._calib,
                     camera_name=self._camera_name,
+                    camera_K=getattr(self._camera_process, "camera_K", None),
                     depth_scale=getattr(self._camera_process, "depth_scale", None),
-                    record_config=self._build_record_config(),
+                    record_config=record_config,
                 )
             )
         self._last_good_arm = None
@@ -677,8 +690,8 @@ class TeleopController:
 
     _KEY_HINTS: dict[ControllerState, str] = {
         ControllerState.IDLE: "[B] Begin  [H] Home  [Q] Quit",
-        ControllerState.TELEOP: "[C] Pause  [S] Save  [H] Home  [Q] Quit",
-        ControllerState.PAUSED: "[C] Resume  [S] Save  [H] Home  [Q] Quit",
+        ControllerState.TELEOP: "[C] Pause  [S] Save  [D] Discard  [H] Home  [Q] Quit",
+        ControllerState.PAUSED: "[C] Resume  [S] Save  [D] Discard  [H] Home  [Q] Quit",
         ControllerState.EMERGENCY_STOP: "[H] Home  [Q] Quit",
     }
 

@@ -51,7 +51,7 @@ VR_FRAME_DTYPE = np.dtype(
 
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
-        ("timestamp", "<f8"),  # Camera frame timestamp (perf_counter)
+        ("timestamp", "<f8"),  # Camera frame timestamp (RealSense global-time epoch seconds)
         ("frame_number", "<u8"),  # Monotonic frame counter
         ("rgb_size", "<u8"),  # Number of bytes in RGB array
         ("depth_size", "<u8"),  # Number of bytes in Depth array
@@ -60,7 +60,8 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("rgb_shape_c", "<u4"),  # RGB channels (always 3)
         ("depth_shape_h", "<u4"),  # Depth height
         ("depth_shape_w", "<u4"),  # Depth width
-        ("pad", "<u4", (3,)),  # Padding to 64-byte alignment
+        ("pc_num_points", "<u4"),  # Valid pointcloud rows in the slot (0 = none)
+        ("pad", "<u4", (2,)),  # Padding to 64-byte alignment
     ],
     align=True,
 )
@@ -112,16 +113,22 @@ def pack_camera_frame(
     depth_raw: np.ndarray,
     timestamp: float,
     frame_id: int,
+    pc_num_points: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pack camera frame attributes directly into (header, rgb_bytes, depth_bytes).
 
     Unlike camera_frame_to_bytes(), this accepts individual values instead of a
     dict — the SHM producer (CameraProcess) can call this directly on
     CameraFrame attributes, skipping the to_dict() allocation entirely.
+
+    ``pc_num_points`` marks how many rows of the slot's pointcloud block are
+    valid (0 = no valid pointcloud); the block itself is passed separately to
+    ``CameraRingBuffer.write``.
     """
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
     header["timestamp"] = np.float64(timestamp)
     header["frame_number"] = np.uint64(frame_id)
+    header["pc_num_points"] = np.uint32(pc_num_points)
 
     rgb_arr = np.asarray(rgb, dtype=np.uint8)
     depth_arr = np.asarray(depth_raw, dtype=np.uint16)
@@ -138,11 +145,17 @@ def pack_camera_frame(
 
 
 def bytes_to_camera_frame(
-    header: np.ndarray, rgb_bytes: np.ndarray, depth_bytes: np.ndarray
+    header: np.ndarray,
+    rgb_bytes: np.ndarray,
+    depth_bytes: np.ndarray,
+    pointcloud: np.ndarray | None = None,
 ) -> dict:
     """Reconstruct a camera frame dict from raw bytes.
 
     Returns a dict matching CameraProcess.poll_latest_frame() output format.
+    When ``pointcloud`` is given (already a shaped (N, 6) float32 copy from the
+    ring buffer), the dict gains ``pointcloud`` and ``pointcloud_valid``
+    (False = zeros placeholder, no valid cloud since producer start).
     """
     h = header[0]
     rgb = rgb_bytes.reshape(
@@ -151,9 +164,13 @@ def bytes_to_camera_frame(
     depth = depth_bytes.reshape(
         (int(h["depth_shape_h"]), int(h["depth_shape_w"]))
     ).copy()
-    return {
+    frame = {
         "rgb": rgb,
         "depth": depth,
         "timestamp": float(h["timestamp"]),
         "frame_number": int(h["frame_number"]),
     }
+    if pointcloud is not None:
+        frame["pointcloud"] = pointcloud
+        frame["pointcloud_valid"] = int(h["pc_num_points"]) > 0
+    return frame

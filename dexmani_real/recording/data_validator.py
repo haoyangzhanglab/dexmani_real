@@ -1,6 +1,6 @@
 """DataValidator — automated quality checks for teleop episodes.
 
-7 validation check categories run on HDF5 episode files before Zarr export:
+8 validation check categories run on HDF5 episode files before Zarr export:
   1. no_nan_obs     — observations contain no NaN values
   2. no_nan_action  — actions contain no NaN values
   3. non_zero_variance — each dimension has variance > epsilon
@@ -8,6 +8,7 @@
   5. min_frames     — episode has >= 50 frames
   6. no_duplicate_frames  — no consecutive identical frames (stuck sensor)
   7. timestamp_monotonic  — timestamps strictly increasing
+  8. camera_stall   — <=10% of frames with stale (frozen) camera data
 
 The actual total varies per episode depending on which data streams are present.
 
@@ -70,7 +71,7 @@ class DataValidator:
         self.duplicate_epsilon = duplicate_epsilon
 
     def validate(self, h5_path: str | Path) -> ValidationReport:
-        """Run all 7 checks on a single episode file.
+        """Run all 8 checks on a single episode file.
 
         Returns a ValidationReport with pass/fail per check.
         """
@@ -113,6 +114,9 @@ class DataValidator:
 
                 # ── 7. Timestamp monotonicity ──
                 checks.append(self._check_timestamp_monotonicity(f))
+
+                # ── 8. Camera stall (frozen frames, schema v6+) ──
+                checks.append(self._check_camera_stall(f))
 
         except (OSError, KeyError) as e:
             checks.append(ValidationCheck(
@@ -233,6 +237,23 @@ class DataValidator:
             passed=ok,
             detail=f"{n_non_increasing} non-increasing timestamps"
             if not ok else "Timestamps strictly increasing."
+        )
+
+    def _check_camera_stall(self, f: h5py.File) -> ValidationCheck:
+        """Check /flag_camera_fresh (schema v6+): frozen/forward-filled camera data."""
+        if "flag_camera_fresh" not in f or "rgb" not in f:
+            return ValidationCheck(
+                name="camera_stall", passed=True,
+                detail="No freshness flag / camera data (skipped).",
+            )
+        fresh = np.asarray(f["flag_camera_fresh"][:], dtype=bool)
+        stale_frac = 1.0 - float(fresh.mean()) if fresh.size else 0.0
+        ok = stale_frac <= 0.10
+        return ValidationCheck(
+            name="camera_stall",
+            passed=ok,
+            detail=f"{stale_frac:.1%} of frames have stale camera data"
+            + ("" if ok else " (>10% — camera stalled mid-episode)"),
         )
 
     # ------------------------------------------------------------------

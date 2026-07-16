@@ -44,7 +44,7 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "action": {"action_arm_joint", "action_arm_ee", "action_hand_joint"},
     "vr": {"vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks"},
     "camera": {"rgb", "depth"},
-    "flags": {"flag_ik_ok", "flag_retarget_ok", "flag_held"},
+    "flags": {"flag_ik_ok", "flag_retarget_ok", "flag_held", "flag_camera_fresh"},
     "meta": {"timestamp"},
 }
 
@@ -124,6 +124,9 @@ def print_episode_info(h5_path: str) -> None:
         if "flag_held" in f:
             held = f["flag_held"][:]
             print(f"flag_held  engaged rate: {held.mean():.2%}")
+        if "flag_camera_fresh" in f:
+            fresh = f["flag_camera_fresh"][:]
+            print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +199,24 @@ class EpisodeVisualizer:
             else:
                 logger.warning("Point cloud disabled: no camera_K in /meta")
                 self._pc_enabled = False
+
+        # ── Pre-computed pointcloud (/pointcloud dataset from CameraProcess) ──
+        # When available, this is preferred over the depth→pointcloud fallback:
+        # points are already in world frame with baked-in extrinsics, filtered,
+        # clustered, and FPS-downsampled to a fixed cardinality (2048).
+        self._has_precomputed_pc = (
+            point_cloud
+            and "pointcloud" in self._h5f
+            and isinstance(self._h5f["pointcloud"], h5py.Dataset)
+        )
+        if self._has_precomputed_pc:
+            pc_shape = self._h5f["pointcloud"].shape
+            logger.info(
+                "Pre-computed /pointcloud: shape=%s, dtype=%s (world-frame, skip back-projection)",
+                pc_shape, self._h5f["pointcloud"].dtype,
+            )
+        elif self._pc_enabled:
+            logger.info("No /pointcloud — falling back to depth back-projection + camera_K.")
 
         # Determine T (state frames) and C (camera frames)
         self._T = self._resolve_frame_count(max_frames)
@@ -342,8 +363,8 @@ class EpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        # 3D point cloud view (when enabled and K is available)
-        if self._pc_enabled:
+        # 3D point cloud view (when enabled: pre-computed /pointcloud or depth→PC fallback)
+        if self._pc_enabled or self._has_precomputed_pc:
             columns.append(
                 rrb.Spatial3DView(
                     origin="camera/pcd",
@@ -482,8 +503,16 @@ class EpisodeVisualizer:
         if "depth" in camera_keys:
             rr.log("camera/depth", rr.DepthImage(self._h5f["depth"][cam_idx], meter=self._depth_meter))
 
-        # ── 3D point cloud (cached per camera frame) ──
-        if self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
+        # ── 3D point cloud ──
+        # Pre-computed world-frame /pointcloud (from CameraProcess) takes priority
+        # over the depth back-projection fallback.  /pointcloud is grid-aligned
+        # (same T as state), so use step_idx directly — no cam_idx mapping needed.
+        if self._has_precomputed_pc:
+            pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6) float32
+            positions = pc_frame[:, :3]  # world-frame xyz
+            colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)  # float rgb → uint8
+            rr.log("camera/pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
+        elif self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
                 depth = self._h5f["depth"][cam_idx]
                 rgb = self._h5f["rgb"][cam_idx] if "rgb" in camera_keys else None

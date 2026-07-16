@@ -24,21 +24,13 @@
 
 from __future__ import annotations
 
-import os
-import sys
-import time
-from pathlib import Path
-
 import atexit
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import select
 import sys
-import termios
 import time
 import traceback
-import tty
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -62,59 +54,13 @@ from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.signal_utils import ema_smooth_pose
-from dexmani_real.teleop.control.keyboard import ControlSignal  # enum only
 
 logger = get_logger(__name__)
 
-# ═══════════════════════════════════════════════ stdin 键盘 (termios cbreak + select)
-# 不用 pynput: evdev 后端会在某些系统上读到来自其他输入设备的虚假事件
-
-
-class TermiosKeyboard:
-    """从 stdin 读取按键 (cbreak 模式, 非阻塞 poll). 可靠, 无外部依赖."""
-
-    _CHAR_MAP: dict[str, ControlSignal] = {
-        "\x1b": ControlSignal.EMERGENCY_STOP,  # ESC
-        "b": ControlSignal.BEGIN,
-        "c": ControlSignal.PAUSE,
-        "s": ControlSignal.STOP,
-        "h": ControlSignal.HOME,
-        "q": ControlSignal.QUIT,
-    }
-
-    def __init__(self) -> None:
-        self._fd = sys.stdin.fileno()
-        self._old: list | None = None
-
-    def start(self) -> None:
-        self._old = termios.tcgetattr(self._fd)
-        tty.setcbreak(self._fd)
-        termios.tcflush(self._fd, termios.TCIFLUSH)  # 清空 stdin 残留
-
-    def poll(self, timeout: float = 0.0) -> list[ControlSignal]:
-        signals: list[ControlSignal] = []
-        while True:
-            r, _, _ = select.select([self._fd], [], [], timeout)
-            if not r:
-                break
-            raw = os.read(self._fd, 1)
-            if not raw:
-                break
-            ch = raw.decode("utf-8", errors="replace")
-            # DEBUG: print raw bytes to identify the source of spurious ESC
-            print(f"[KB] raw={raw.hex()} ch={repr(ch)}", flush=True)
-            sig = self._CHAR_MAP.get(ch)
-            if sig is not None:
-                signals.append(sig)
-            timeout = 0.0  # drain remaining chars without blocking
-        return signals
-
-    def stop(self) -> None:
-        if self._old is not None:
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
-            self._old = None
+# ═══════════════════════════════════════════════ Keyboard (pynput, 全局捕获)
 
 
 # ═══════════════════════════════════════════════ 轨迹记录
@@ -291,7 +237,6 @@ def main():
         ),
         planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
-            teleop_dt=CTRL_DT,
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
@@ -384,7 +329,7 @@ def main():
     _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
 
     # ── 8. Keyboard ──
-    kb = TermiosKeyboard()
+    kb = KeyboardHandler()
     kb.start()
     atexit.register(kb.stop)
 
@@ -428,7 +373,7 @@ def main():
         vr_receiver.stop()
         return
 
-    # ── 10. 键盘就绪 (cbreak 模式已在 TermiosKeyboard.start() 中设置) ──
+    # ── 10. 键盘就绪 (pynput 全局捕获) ──
 
     print("\n控制: B=开始遥操作+录制 C=暂停 S=停止录制 H=归位 Q=退出 ESC=急停")
     print("等待按键 B 开始遥操作...\n")

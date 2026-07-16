@@ -243,25 +243,29 @@ class CameraRingBuffer:
       - Header: CAMERA_FRAME_HEADER_DTYPE (metadata)
       - RGB raw bytes
       - Depth raw bytes
+      - Optional pointcloud block (fixed-size float32 (N, 6), pc_shape != None)
 
     Layout of shared memory:
         [0:8)     write_idx  (uint64, atomic)
         [8:16)    sequence   (uint64)
         [16:24)   max_rgb_bytes (uint64, max RGB bytes per frame)
         [24:32)   max_depth_bytes (uint64, max depth bytes per frame)
-        [32:64)   padding
+        [32:40)   max_pc_bytes (uint64, pointcloud bytes per frame, 0 = none)
+        [40:64)   padding
         [64:)     N slots, each of:
                     [0:8)   timestamp_ns (uint64)
                     [8:16)  sequence (uint64)
                     [16:80) CAMERA_FRAME_HEADER_DTYPE (64 bytes)
                     [80:80+max_rgb_bytes) RGB data
-                    [80+max_rgb_bytes:80+max_rgb_bytes+max_depth_bytes) Depth data
+                    [80+max_rgb_bytes:...+max_depth_bytes) Depth data
+                    [...:...+max_pc_bytes) Pointcloud data (float32)
     """
 
     _OFF_WRITE_IDX = 0
     _OFF_SEQUENCE = 8
     _OFF_MAX_RGB = 16
     _OFF_MAX_DEPTH = 24
+    _OFF_MAX_PC = 32
     _HEADER_SIZE = 64  # cache-line aligned
 
     def __init__(
@@ -271,18 +275,23 @@ class CameraRingBuffer:
         depth_shape: tuple[int, int] = (480, 640),
         maxlen: int = 5,
         create: bool = True,
+        pc_shape: tuple[int, int] | None = None,
     ) -> None:
         self.name = name
         self.maxlen = maxlen
 
         self._rgb_shape = rgb_shape
         self._depth_shape = depth_shape
+        self._pc_shape = pc_shape
         self._max_rgb_bytes = rgb_shape[0] * rgb_shape[1] * rgb_shape[2]  # uint8
         self._max_depth_bytes = depth_shape[0] * depth_shape[1] * 2  # uint16
+        self._max_pc_bytes = pc_shape[0] * pc_shape[1] * 4 if pc_shape else 0  # float32
 
         # Per-slot layout
         self._slot_header_size = 8 + 8 + CAMERA_FRAME_HEADER_DTYPE.itemsize
-        self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
+        self._slot_size = (
+            self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
+        )
 
         self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
 
@@ -303,13 +312,22 @@ class CameraRingBuffer:
             name, self._slot_size, maxlen, self._total_size / (1024 * 1024), create,
         )
 
-    def write(self, header: np.ndarray, rgb: np.ndarray, depth: np.ndarray) -> int:
+    def write(
+        self,
+        header: np.ndarray,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        pointcloud: np.ndarray | None = None,
+    ) -> int:
         """Write a camera frame into the ring buffer.
 
         Args:
             header: 1-d array of CAMERA_FRAME_HEADER_DTYPE (1 element).
             rgb: Raw RGB bytes (uint8 array, flattened).
             depth: Raw depth bytes (uint16 array, flattened).
+            pointcloud: Contiguous float32 array matching pc_shape (pass a
+                zeros block when no valid cloud); ignored when the buffer was
+                created without pc_shape.
         Returns:
             New sequence number.
         """
@@ -348,14 +366,27 @@ class CameraRingBuffer:
         )
         depth_dest[:] = depth.view(np.uint8).ravel()[:depth_len]
 
+        # Write pointcloud bytes (fixed-size block; validity is header-flagged)
+        if self._max_pc_bytes > 0 and pointcloud is not None:
+            pc_offset = depth_offset + self._max_depth_bytes
+            pc_len = min(pointcloud.nbytes, self._max_pc_bytes)
+            pc_dest = np.ndarray(
+                (pc_len,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset
+            )
+            pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
+
         self._write_idx_view()[0] = np.uint64(idx)
         return seq
 
-    def read_latest(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
+    def read_latest(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, int] | None:
         """Read the latest camera frame.
 
-        Returns (header, rgb, depth, sequence) or None if no frame available.
-        All returned arrays are copies.
+        Returns (header, rgb, depth, pointcloud, sequence) or None if no frame
+        available. ``pointcloud`` is a shaped float32 copy (pc_shape), or None
+        when the buffer was created without pc_shape. All returned arrays are
+        copies.
         """
         idx = int(self._write_idx_view()[0])
 
@@ -413,6 +444,20 @@ class CameraRingBuffer:
             .reshape((depth_h, depth_w))
         )
 
+        # Read pointcloud block — fixed size, so no torn-read size guard needed
+        # beyond the seqlock re-check below.
+        pointcloud = None
+        if self._max_pc_bytes > 0 and self._pc_shape is not None:
+            pc_offset = depth_offset + self._max_depth_bytes
+            pointcloud = (
+                np.ndarray(
+                    (self._max_pc_bytes,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset
+                )
+                .copy()
+                .view(np.float32)
+                .reshape(self._pc_shape)
+            )
+
         # ── Seqlock: verify slot wasn't overwritten during our read ──
         # The writer may wrap around and overwrite this slot between our
         # initial sequence read and the data copies above.  Re-read the
@@ -421,7 +466,7 @@ class CameraRingBuffer:
         if int(ts_arr_check[1]) != slot_seq:
             return None
 
-        return header, rgb, depth, slot_seq
+        return header, rgb, depth, pointcloud, slot_seq
 
     def frame_age_ns(self) -> int:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""
@@ -451,6 +496,9 @@ class CameraRingBuffer:
         np.ndarray(
             (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH
         )[0] = np.uint64(self._max_depth_bytes)
+        np.ndarray(
+            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_PC
+        )[0] = np.uint64(self._max_pc_bytes)
 
     def _write_idx_view(self) -> np.ndarray:
         return np.ndarray(

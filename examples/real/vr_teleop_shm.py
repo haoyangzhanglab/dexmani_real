@@ -106,7 +106,6 @@ def main():
         ),
         planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
-            teleop_dt=0.02,
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),

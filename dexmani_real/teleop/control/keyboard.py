@@ -5,10 +5,11 @@ running in a daemon thread.  Key events are captured globally (even when the
 terminal window is NOT focused), stored in a thread-safe buffer, and drained by
 poll() on the main thread.
 
-6-key mapping:
+7-key mapping:
     B  → BEGIN             (IDLE → TELEOP + auto-recording)
     C  → PAUSE             (TELEOP ⇄ PAUSED)
     S  → STOP              (stop recording → auto-save → IDLE)
+    D  → DISCARD           (stop recording → discard → IDLE)
     H  → HOME              (stop recording → return to home → IDLE)
     Q  → QUIT              (always quit; auto-save if recording)
     ESC → EMERGENCY_STOP
@@ -26,6 +27,7 @@ class ControlSignal(Enum):
     BEGIN = "BEGIN"
     PAUSE = "PAUSE"
     STOP = "STOP"
+    DISCARD = "DISCARD"
     HOME = "HOME"
     EMERGENCY_STOP = "EMERGENCY_STOP"
     QUIT = "QUIT"
@@ -36,6 +38,7 @@ _KEY_MAP: dict[str, ControlSignal] = {
     "b": ControlSignal.BEGIN,
     "c": ControlSignal.PAUSE,
     "s": ControlSignal.STOP,
+    "d": ControlSignal.DISCARD,
     "h": ControlSignal.HOME,
     "q": ControlSignal.QUIT,
 }

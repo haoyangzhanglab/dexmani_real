@@ -510,15 +510,20 @@ class TeleopIKSolver:
         """Iterative damped least-squares differential IK.
 
         Ref: BunnyVisionPro xarm7_ability.py:136-159 compute_ik()
+        - Seeded from previous_qpos_cmd: the previous command already reached the
+          previous target, so the new target is only ~20ms of hand motion away —
+          converges in a few iterations instead of iterating from the (lagging)
+          hardware pose.  Also keeps the command stream branch-continuous.
         - Up to max_iterations DLS steps per solve
         - Fixed damping λ²=1e-5 (no adaptive)
-        - Converges when ||error|| < convergence_threshold (1e-3)
+        - Early-exit at 50% of the teleop acceptance thresholds
+          (max_pose_error_pos_m / max_pose_error_rot_rad) — iterating further is
+          wasted work the acceptance gate in solve() cannot distinguish
         - Step size 0.05 per iteration
         """
-        qpos = current_qpos.copy()
+        qpos = previous_qpos_cmd.copy()
         damping = float(profile.differential_ik_damping)
         max_iter = profile.differential_ik_max_iterations
-        conv_thresh = profile.differential_ik_convergence_threshold
         step = profile.differential_ik_gain
 
         # Adaptive damping (optional, disabled by default — aligned with BVP).
@@ -553,8 +558,14 @@ class TeleopIKSolver:
                 max_rot_step=float("inf"),
             )
 
-            # Convergence check (BVP: norm(err) < 1e-3).
-            if np.linalg.norm(error_world) < conv_thresh:
+            # Convergence: within 50% of the teleop acceptance thresholds.
+            # The 50% margin keeps the post-hoc pose check in solve() (which
+            # re-evaluates after canonicalization + nullspace adjustment) from
+            # flapping a boundary result into the expensive mplib fallback.
+            if (
+                np.linalg.norm(error_world[:3]) <= 0.5 * profile.max_pose_error_pos_m
+                and np.linalg.norm(error_world[3:]) <= 0.5 * profile.max_pose_error_rot_rad
+            ):
                 converged = True
                 break
 

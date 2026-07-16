@@ -178,7 +178,6 @@ def create_planner(seed: int = DEFAULT_SEED) -> XArm7MotionPlanner:
             random_seed=seed,
         ),
         teleop_profile=TeleopProfile(
-            teleop_dt=0.02,
             max_ik_jump_deg=(30, 30, 30, 30, 45, 45, 60),
             max_pose_error_pos_m=0.01,
             max_pose_error_rot_rad=np.deg2rad(5.0),

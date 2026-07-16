@@ -226,12 +226,12 @@ class TeleopProfile(FromDictMixin):
     use_differential_ik_fallback: bool = True
 
     # ── Iterative DLS (ref: BunnyVisionPro xarm7_ability.py:136-159 compute_ik) ──
-    # Each iteration: FK → Jacobian → DLS solve → integrate.  Converges when
-    # ||error|| < convergence_threshold or max_iterations reached.
+    # Each iteration: FK → Jacobian → DLS solve → integrate.  Early-exits at 50%
+    # of max_pose_error_pos_m/rot_rad or when max_iterations reached.
     differential_ik_gain: float = 0.05  # step size per iteration (matches BVP v*0.05)
     differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
     differential_ik_max_iterations: int = 100  # matches BVP for k in range(100)
-    differential_ik_convergence_threshold: float = 1e-3  # matches BVP norm(err) < 1e-3
+    differential_ik_convergence_threshold: float = 1e-3  # unused since 2026-07-16 IK speedup — superseded by early-exit at 50% of max_pose_error_pos_m/rot_rad
 
     # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──
     adaptive_damping: bool = False

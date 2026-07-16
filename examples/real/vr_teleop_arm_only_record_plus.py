@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""真机 VR 遥操作 xArm7 (仅机械臂，灵巧手可降级跳过) + 数据录制。
+"""真机 VR 遥操作 xArm7 (仅机械臂，灵巧手可降级跳过) + 数据录制 + 语音播报。
 
 在 vr_teleop_arm_only 基础上加入最小录制: 只录 5 路 —
 RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
 写入 episodes_arm/episode_YYYYMMDD_HHMMSS.h5 (所有流对齐到固定 50Hz 时间栅格)。
+
+plus 变体额外集成 assets/audio/ 下的预录制中文 TTS 语音提示，
+每个状态转换（开始/暂停/恢复/保存/丢弃/归位/急停/标定）均有语音反馈。
+操作员戴 VR 头显时无需看终端即可感知系统状态。
 
 机械臂通过 VR wrist pose 控制 EEF 位姿，灵巧手在不可用时自动降级跳过。
 
@@ -15,12 +19,13 @@ RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
     # 1. Quest USB 有线: adb reverse tcp:8000 tcp:8000
     # 2. 启动:
     source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real
-    python examples/real/vr_teleop_arm_only.py
+    python examples/real/vr_teleop_arm_only_record_plus.py
 
 控制:
     B    开始遥操作 + 录制 (记录当前 wrist→EEF 映射)
     C    暂停/恢复 (toggle, 保持当前位置, 录制继续)
     S    停止录制 (自动保存)
+    D    丢弃录制 (Discard, 不保存)
     H    return_home (归位, 自动保存)
     Q    退出
     ESC  急停
@@ -29,7 +34,6 @@ RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
 from __future__ import annotations
 
 import atexit
-import gc
 import sys
 import time
 import traceback
@@ -61,9 +65,10 @@ from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.sensor.camera_process import CameraProcess, CameraProcessConfig
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
-from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.signal_utils import ema_smooth_pose
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.teleop.control.audio_feedback import AudioFeedback
 
 logger = get_logger(__name__)
 
@@ -343,6 +348,9 @@ def main():
     kb.start()
     atexit.register(kb.stop)
 
+    # ── 8b. Audio feedback (voice prompts for headset-blind operator) ──
+    audio = AudioFeedback()
+
     # ── 9. 等待 VR 首帧 ──
     print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
     print("  Q=退出")
@@ -385,7 +393,7 @@ def main():
 
     # ── 10. 键盘就绪 (pynput 全局捕获) ──
 
-    print("\n控制: B=开始遥操作+录制 C=暂停 S=停止录制 H=归位 Q=退出 ESC=急停")
+    print("\n控制: B=开始遥操作+录制 C=暂停 S=保存 D=丢弃 H=归位 Q=退出 ESC=急停")
     print("等待按键 B 开始遥操作...\n")
 
     # ── 11. Main loop ──
@@ -413,11 +421,6 @@ def main():
             else:
                 recorder.stop_episode(success=False)
             recording_active = False
-            # 清空保存期间用户狂按积压的按键，避免 H/Q 等信号重复触发
-            kb.poll(timeout=0.0)
-        # 手动回收循环引用，弥补 gc.disable() 期间的累积
-        gc.collect()
-        gc.enable()
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
@@ -444,9 +447,8 @@ def main():
     else:
         print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
         camera = None
-    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯。
-    # camera_name 按实际连接相机的 serial 解析（而非硬编码 "camera_0"），
-    # 但 serial 由子进程 connect 后才写入 → 在 B 键开始录制时才 resolve。
+    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯
+    # （单相机 rig：cameras.json 唯一条目 camera_0）。
     calib = None
     if camera is not None:
         try:
@@ -454,27 +456,9 @@ def main():
         except (OSError, ValueError, KeyError):
             print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
 
-    _camera_name_cache: str | None = None
-
     # 相机停帧检测: frame_number 不再变化 >1s → 限频告警 (数据可能冻结)
     cam_last_fn = None
     cam_last_change_t: float | None = None
-
-    def _resolve_camera_name() -> str | None:
-        """serial → cameras.json 条目名，成功后缓存（子进程 connect 后 serial 才可用）."""
-        nonlocal _camera_name_cache
-        if _camera_name_cache is not None or calib is None or camera is None:
-            return _camera_name_cache
-        ser = camera.camera_serial
-        if not ser:
-            print("  ⚠ camera serial 尚不可用 — /meta 本次将缺少外参")
-            return None
-        try:
-            _camera_name_cache = calib.resolve_name_by_serial(ser)
-            print(f"  camera resolved: serial={ser} name={_camera_name_cache}")
-        except KeyError as e:
-            print(f"  ⚠ cameras.json 无 serial={ser} 的条目 — /meta 将缺少外参: {e}")
-        return _camera_name_cache
 
     try:
         while running:
@@ -490,6 +474,7 @@ def main():
             for sig in kb.poll(timeout=0.0):
                 if sig == ControlSignal.EMERGENCY_STOP:
                     print("\nESC: emergency_stop")
+                    audio.play("emergency")
                     print("[TRACE] emergency_stop triggered from keyboard handler:", flush=True)
                     traceback.print_stack()
                     _emergency_stop()
@@ -497,12 +482,47 @@ def main():
 
                 elif sig == ControlSignal.QUIT:
                     print("\nQ: 退出")
-                    _stop_recording(save=False)
+                    audio.play("quit")
+
+                    if recording_active:
+                        # Two-step confirmation: reuse S=Save, D=Discard muscle memory
+                        audio.play("quit_save_prompt")
+                        print("  [S] 保存并退出  [D] 丢弃并退出 (30s 超时默认丢弃)")
+
+                        decision: bool | None = None
+                        deadline = time.perf_counter() + 30.0
+                        while time.perf_counter() < deadline:
+                            for post_sig in kb.poll(timeout=0.1):
+                                if post_sig == ControlSignal.STOP:
+                                    decision = True
+                                    break
+                                if post_sig == ControlSignal.DISCARD:
+                                    decision = False
+                                    break
+                            if decision is not None:
+                                break
+
+                        if decision is True:
+                            audio.play("save")
+                            _stop_recording(save=True)
+                            print("  已保存")
+                        elif decision is False:
+                            audio.play("discard")
+                            _stop_recording(save=False)
+                            print("  已丢弃")
+                        else:
+                            audio.play("discard")
+                            _stop_recording(save=False)
+                            print("  超时，默认丢弃")
+                    else:
+                        _stop_recording(save=False)
+
                     running = False
                     break
 
                 elif sig == ControlSignal.HOME:
                     print("\nH: return_home")
+                    audio.play("home")
                     _stop_recording(save=True)
                     arm_inner = do_return_home(robot, planner, arm_inner)
                     teleop_active = False
@@ -526,7 +546,15 @@ def main():
 
                 elif sig == ControlSignal.STOP:
                     print("\nS: 停止录制")
+                    audio.play("save")
                     _stop_recording(save=True)
+                    teleop_active = False
+                    skip_rest = True
+
+                elif sig == ControlSignal.DISCARD:
+                    print("\nD: 丢弃录制")
+                    audio.play("discard")
+                    _stop_recording(save=False)
                     teleop_active = False
                     skip_rest = True
 
@@ -535,6 +563,7 @@ def main():
                     state_str = "暂停" if not teleop_active else "恢复"
                     print(f"\nC: {state_str}遥操作 (录制{'继续' if recording_active else '已停止'})")
                     if teleop_active:
+                        audio.play("resume")
                         # 恢复时重新建立 wrist→EEF 映射，避免跳跃
                         frame = vr_receiver.read_latest()
                         if frame is not None:
@@ -545,10 +574,9 @@ def main():
                                 eef_pos=state.eef_pos,
                                 eef_quat_wxyz=state.eef_quat_wxyz,
                             )
-                        gc.disable()  # 恢复遥操作，重新禁用自动 GC
+                            audio.play("calibrated")
                     else:
-                        gc.collect()
-                        gc.enable()  # 暂停期间让 Python GC 正常工作
+                        audio.play("pause")
                     skip_rest = True
 
                 elif sig == ControlSignal.BEGIN:
@@ -563,8 +591,7 @@ def main():
                     recorder.start_episode(
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
-                        camera_name=_resolve_camera_name(),
-                        camera_K=camera.camera_K if camera is not None else None,
+                        camera_name="camera_0" if calib is not None else None,
                         record_config=camera.pointcloud_meta if camera is not None else None,
                     )
                     recording_active = True
@@ -594,9 +621,10 @@ def main():
                         eef_pos=state.eef_pos,
                         eef_quat_wxyz=state.eef_quat_wxyz,
                     )
+                    audio.play("calibrated")
                     teleop_active = True
                     error_count = 0
-                    gc.disable()  # 禁用自动 GC，避免 50Hz 热路径上触发 full GC 暂停
+                    audio.play("begin")
                     print(f"\nB: 遥操作+录制开始 (wrist→EEF 映射已记录)  episode={recorder.frame_count}")
                     print(f"  wrist_ref={np.round(frame['wrist_pos'], 3)}")
                     print(f"  eef_ref=  {np.round(state.eef_pos, 3)}")
@@ -616,6 +644,7 @@ def main():
                     error_count += 1
                     if error_count > 3:
                         print("Arm 内环连续异常，急停退出")
+                        audio.play("emergency")
                         _emergency_stop()
                         break
                     continue
@@ -626,6 +655,7 @@ def main():
                 print(f"  get_state 异常: {e}")
                 if error_count > max_consecutive_errors:
                     print("连续错误过多，急停退出")
+                    audio.play("emergency")
                     _emergency_stop()
                     break
                 continue
@@ -641,6 +671,7 @@ def main():
                     recover_count += 1
                     if recover_count > 5:
                         print(f"  C{code} 连续恢复超过 5 次，急停退出")
+                        audio.play("emergency")
                         _emergency_stop()
                         break
                     print(f"  ⚠ ControllerError {code} ({'自碰撞' if code == 22 else '速度超限'})，清除错误并保持位置", flush=True)
@@ -652,6 +683,7 @@ def main():
                     error_count = 0
                     continue
                 print(f"arm 错误: C{arm_code}")
+                audio.play("emergency")
                 _emergency_stop()
                 break
 
@@ -827,15 +859,12 @@ def main():
                 ok = recorder.add_frame(state, action, vr_frame, camera_frame=cam, signals=sig)
                 if not ok and recorder.max_frames_reached:
                     print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")
+                    audio.play("save")
                     _stop_recording(save=True)
                     teleop_active = False
-                    print("  录制已停止。H=归位  Q=退出  B=开始新录制")
             stage_timer.mark("rec")
 
     finally:
-        # 安全兜底：确保退出时 GC 恢复正常
-        gc.enable()
-
         # 确保录制已停止
         if recording_active:
             recorder.stop_episode(success=False)

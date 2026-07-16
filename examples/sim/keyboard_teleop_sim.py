@@ -377,7 +377,6 @@ def main():
             check_self_collision=True,
         ),
         teleop_profile=TeleopProfile(
-            teleop_dt=CTRL_DT,
             use_position_ik=True,           # MPlib 兜底: DLS 迭代不收敛时接管
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),

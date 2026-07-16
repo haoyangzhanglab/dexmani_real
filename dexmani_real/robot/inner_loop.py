@@ -93,6 +93,16 @@ class ArmInnerLoopConfig:
     synchronized: bool = False
 
 
+# Controller errors that indicate a problematic target rather than a hardware fault.
+# When the firmware rejects a target with one of these codes, we skip the target and
+# hold position — the outer loop will clear the latch and supply a fresh IK solution.
+# Errors NOT in this set are treated as hard faults that stop the inner loop.
+_RECOVERABLE_ERRORS: frozenset[int] = frozenset({
+    22,  # Self-Collision Error — IK solver produced unsafe joint angles
+    24,  # Speed Exceeds Limit — commanded motion too fast
+})
+
+
 # ═══════════════════════════════════════════════════════════════════
 # ArmInnerLoop
 # ═══════════════════════════════════════════════════════════════════
@@ -134,6 +144,7 @@ class ArmInnerLoop:
         self._error_state: bool = False
         self._last_sent_target: np.ndarray | None = None  # for per-step delta clamp
         self._ramp_step: int = 0  # for soft-start speed ramp
+        self._qvel_inf: float = 0.0  # last |qvel| L∞ — inner-loop thread only
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
         self._track_warn_throttle: int = 0  # throttle counter for tracking-error warnings
         self._mode_warn_throttle: int = 0  # throttle counter for mode-drift warnings (independent)
@@ -324,7 +335,7 @@ class ArmInnerLoop:
 
                 # ── 4. Read current joint state ──
                 try:
-                    code, states = arm.get_joint_states(is_radian=True, num=1)
+                    code, states = arm.get_joint_states(is_radian=True, num=2)
                 except (RuntimeError, OSError) as e:
                     logger.error("ArmInnerLoop: get_joint_states failed: %s", e)
                     with self._lock:
@@ -341,6 +352,20 @@ class ArmInnerLoop:
                 # necessarily failing get_joint_states)
                 arm_error = getattr(arm, "error_code", 0)
                 if arm_error != 0:
+                    if arm_error in _RECOVERABLE_ERRORS:
+                        # Recoverable — outer loop will clear the latch and supply
+                        # a fresh target.  Hold position until then.
+                        logger.warning(
+                            "ArmInnerLoop: arm error_code=%d (%s) — recoverable, holding position",
+                            arm_error,
+                            decode_error(arm_error),
+                        )
+                        with self._lock:
+                            self._arm_target = None
+                        # Fall through to position-hold logic below
+                        self._hold_position(arm)
+                        self._signal_ready_only()
+                        continue
                     logger.error(
                         "ArmInnerLoop: arm error_code=%d (%s) — stopping inner loop",
                         arm_error,
@@ -357,6 +382,10 @@ class ArmInnerLoop:
                         with self._lock:
                             self._arm_qpos = current_qpos
                             self._error_state = False
+                if len(states) > 1:
+                    v = np.asarray(states[1], dtype=np.float64)
+                    if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
+                        self._qvel_inf = float(np.max(np.abs(v[:7])))
 
                 # ── 4b. Passive tracking-error + mode monitor (no command change) ──
                 self._monitor(arm, current_qpos)
@@ -449,6 +478,10 @@ class ArmInnerLoop:
         if self._cfg.speed_ramp_frames > 0 and self._ramp_step < self._cfg.speed_ramp_frames:
             t = self._ramp_step / self._cfg.speed_ramp_frames
             speed = self._cfg.speed_ramp_min + (self._cfg.joint_max_speed - self._cfg.speed_ramp_min) * t
+            # Ramp re-armed mid-motion (main-thread stall → hold → fresh target) must
+            # never command a speed cap below the arm's actual joint speed — Mode 6
+            # firmware rejects that with C24 (Speed Exceeds Limit).
+            speed = min(self._cfg.joint_max_speed, max(speed, 1.25 * self._qvel_inf))
         else:
             speed = self._cfg.joint_max_speed
 
@@ -476,16 +509,36 @@ class ArmInnerLoop:
                     warn_code = int(err_warn[1])
             except (RuntimeError, OSError, ValueError, IndexError):
                 pass
-            logger.error(
-                "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s), warn=%d (%s)",
-                code,
-                err_code,
-                decode_error(err_code),
-                warn_code,
-                decode_warn(warn_code),
-            )
-            with self._lock:
-                self._error_state = True
+
+            if err_code in _RECOVERABLE_ERRORS:
+                # Target rejected by firmware (e.g. self-collision, overspeed).
+                # This is NOT a hardware fault — clear the pending target so we
+                # hold position instead of retrying the same bad target at 50 Hz.
+                # The outer loop will detect the error via robot.arm.is_error(),
+                # clear the latch, and supply a fresh IK solution.
+                # Do NOT set error_state=True, do NOT update _last_sent_target
+                # (delta clamp keeps using the last good target).
+                logger.warning(
+                    "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s) — "
+                    "target skipped, waiting for next valid command",
+                    code,
+                    err_code,
+                    decode_error(err_code),
+                )
+                with self._lock:
+                    self._arm_target = None
+                return
+            else:
+                logger.error(
+                    "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s), warn=%d (%s)",
+                    code,
+                    err_code,
+                    decode_error(err_code),
+                    warn_code,
+                    decode_warn(warn_code),
+                )
+                with self._lock:
+                    self._error_state = True
         else:
             self._last_sent_target = clamped.copy()
             self._ramp_step += 1
@@ -493,7 +546,11 @@ class ArmInnerLoop:
     # ── Helpers ──
 
     def _hold_position(self, arm) -> None:
-        """Read current position and re-send as hold command via set_servo_angle."""
+        """Read current position and re-send as hold command via set_servo_angle.
+
+        Updates ``_last_sent_target`` so the per-step delta clamp and tracking
+        error monitor use a meaningful baseline when targets resume after a hold.
+        """
         try:
             code, states = arm.get_joint_states(is_radian=True, num=1)
             if code == 0 and len(states) > 0:
@@ -506,6 +563,7 @@ class ArmInnerLoop:
                         mvacc=self._cfg.joint_max_acc,
                         wait=False,
                     )
+                    self._last_sent_target = hold.copy()
         except (RuntimeError, OSError):
             pass
 

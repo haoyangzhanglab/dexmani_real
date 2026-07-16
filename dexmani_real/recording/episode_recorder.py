@@ -10,6 +10,8 @@ from __future__ import annotations
 
 __all__ = ["EpisodeRecorder"]
 
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,9 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 4  # v4: /meta record_config (control/EMA/delta-clip snapshot) + skip_initial_frames
+SCHEMA_VERSION = 6  # v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
+
+CAMERA_FRESH_TIMEOUT_S = 0.5  # flag_camera_fresh: max age of the last *new* camera frame
 
 
 class EpisodeRecorder:
@@ -70,6 +74,32 @@ class EpisodeRecorder:
         self._last_camera_frames: dict[str, dict[str, Any]] | None = None
         self._last_T_base_eef: np.ndarray | None = None
 
+        # Camera freshness: last seen frame_number (tuple for multi-cam) and the
+        # state.timestamp at which it last changed — drives /flag_camera_fresh.
+        # A stalled camera keeps re-serving the same shm frame, so an unchanged
+        # frame_number (not a missing frame) is the stall signal.
+        self._cam_last_frame_number: object | None = None
+        self._cam_last_change_ts: float = 0.0
+
+        # Background camera writer: queue → thread → HDF5.
+        # Keeps the 50 Hz hot path at queue-push cost (~µs) instead of
+        # HDF5 resize + lzf compression (~2–3 ms).
+        self._cam_queue: queue.Queue = queue.Queue(maxsize=200)
+        self._cam_writer: threading.Thread | None = None
+        self._cam_writer_stop: threading.Event = threading.Event()
+        self._cam_written: int = 0
+        self._hdf5_lock: threading.Lock = threading.Lock()
+
+        # Deferred flush: when True the background writer thread will call
+        # _flush_buffered() on its next iteration instead of blocking the
+        # 50 Hz hot path with HDF5 gzip + resize + fsync.
+        self._flush_pending: bool = False
+
+        # Pending async stop_episode thread (None = no pending stop).
+        # Guarded by start_episode() to prevent overlapping episodes.
+        self._stop_thread: threading.Thread | None = None
+
+
     @property
     def is_recording(self) -> bool:
         return self._recording
@@ -94,6 +124,12 @@ class EpisodeRecorder:
         record_config: dict | None = None,
         skip_initial_frames: int = 0,
     ) -> bool:
+        # Wait for any pending async stop_episode to finish — it owns
+        # _file, _buffer, _datasets and will reset them on completion.
+        if self._stop_thread is not None and self._stop_thread.is_alive():
+            self._stop_thread.join(timeout=10.0)
+            self._stop_thread = None
+
         if self._recording:
             return False
 
@@ -111,10 +147,13 @@ class EpisodeRecorder:
         self._recording = True
         self._datasets = {}
         self._flushed_frames = 0
+        self._flush_pending = False
         self._cam_seen = False
         self._last_camera_frame = None
         self._last_camera_frames = None
         self._last_T_base_eef = None
+        self._cam_last_frame_number = None
+        self._cam_last_change_ts = 0.0
 
         # Skip-initial-frames gate — clamp below max_frames so we never drop all.
         self._skip_initial_frames = max(0, min(int(skip_initial_frames), self.max_frames - 1))
@@ -144,6 +183,7 @@ class EpisodeRecorder:
             max_record_steps=buffer_steps,
         )
         self._file = None
+        self._start_cam_writer()
         return True
 
     def _write_meta_attrs(self, meta: h5py.Group) -> None:
@@ -224,6 +264,27 @@ class EpisodeRecorder:
         # ── Non-camera streams → record-time aligned buffer ──
         sig = signals or {}
 
+        # ── Camera freshness (recorder-side; no per-script signal plumbing) ──
+        # frame_number is monotonic per camera (shm/layouts.py header); a stall
+        # keeps re-serving the same shm frame, so an unchanged number means no
+        # new data. Multi-cam: any camera advancing counts as fresh.
+        ts = float(state.timestamp)
+        if camera_frame is not None:
+            fresh_token = camera_frame.get("frame_number")
+        elif camera_frames:
+            fresh_token = tuple(
+                f.get("frame_number") if f is not None else None for f in camera_frames.values()
+            )
+        else:
+            fresh_token = None
+        if fresh_token is not None and fresh_token != self._cam_last_frame_number:
+            self._cam_last_frame_number = fresh_token
+            self._cam_last_change_ts = ts
+        flag_camera_fresh = (
+            self._cam_last_frame_number is not None
+            and (ts - self._cam_last_change_ts) <= CAMERA_FRESH_TIMEOUT_S
+        )
+
         def _make_action_ee() -> np.ndarray:
             pos = action.target_eef_pos
             rot6d = action.target_eef_rot6d
@@ -248,6 +309,7 @@ class EpisodeRecorder:
             "flag_ik_ok": bool(sig.get("ik_ok", False)),
             "flag_retarget_ok": bool(sig.get("retarget_ok", False)),
             "flag_held": bool(sig.get("held", False)),
+            "flag_camera_fresh": flag_camera_fresh,
             # ── VR ──
             "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
             "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
@@ -264,11 +326,15 @@ class EpisodeRecorder:
         self._frame_count = self._buffer.size
         k = self._buffer.size - prev_size  # grid slots advanced (usually 1; 0 = dup bucket)
 
-        # ── Periodic flush: protect buffered data against crashes ──
+        # ── Periodic flush: signal background writer thread instead of
+        # blocking the 50 Hz hot path with HDF5 gzip + resize + fsync.
         if self._buffer.size - self._flushed_frames >= self._flush_interval:
-            self._flush_buffered()
+            self._flush_pending = True
 
-        # ── Camera streams → per-frame HDF5, forward-filled to stay length-aligned ──
+        # ── Camera streams → background writer thread ──
+        # Queue push (~µs) keeps the hot path fast; HDF5 compression +
+        # resize run in a daemon thread.  Forward-fill at stop_episode
+        # handles minor k>1 jitter.
         has_camera_now = camera_frame is not None or bool(camera_frames)
         if has_camera_now:
             self._cam_seen = True
@@ -278,12 +344,22 @@ class EpisodeRecorder:
 
         if self._cam_seen and k > 0:
             self._ensure_hdf5()
-            self._append_camera(
-                self._last_camera_frame,
-                self._last_T_base_eef,
-                self._last_camera_frames,
-                repeat=k,
-            )
+            # camera.poll_latest_frame() returns fresh dicts each call —
+            # no deep copy needed; the queue reference keeps arrays alive
+            # until the writer thread consumes them.
+            if self._cam_queue.qsize() < self._cam_queue.maxsize - 1:
+                # target_len = grid length after this add: the writer fills every
+                # camera dataset up to it, so dropped/backlogged slots self-heal
+                # and dataset index == grid index at all times.
+                item = (
+                    self._last_camera_frame,
+                    self._last_camera_frames,
+                    self._buffer.size,
+                )
+                try:
+                    self._cam_queue.put_nowait(item)
+                except queue.Full:
+                    pass  # writer can't keep up — drop frame rather than block loop
         return True
 
     def _ensure_hdf5(self) -> None:
@@ -294,79 +370,167 @@ class EpisodeRecorder:
         self._file = h5py.File(str(self._episode_path), "w")
         self._write_meta_attrs(self._file.create_group("meta"))
 
+    # ── Background camera writer ──────────────────────────────────────────
+
+    def _start_cam_writer(self) -> None:
+        self._cam_writer_stop.clear()
+        self._cam_written = 0
+        self._cam_writer = threading.Thread(
+            target=self._cam_writer_loop, daemon=True, name="episode-cam-writer"
+        )
+        self._cam_writer.start()
+
+    def _cam_writer_loop(self) -> None:
+        """Background thread: pop camera frames from queue, write to HDF5.
+
+        Also handles deferred buffer flushes (signalled by the hot path via
+        ``_flush_pending``) so HDF5 gzip + resize + fsync never blocks the
+        50 Hz control loop.
+        """
+        _hdf5_flush_every_n = 100  # HDF5 metadata flush (cheap)
+        while not self._cam_writer_stop.is_set():
+            # ── Deferred buffer flush (gzip + resize + fsync) ──
+            # _flush_buffered() manages its own _hdf5_lock internally —
+            # do NOT wrap it in another lock acquisition (threading.Lock
+            # is non-reentrant; nesting would deadlock the writer thread).
+            if self._flush_pending or (
+                self._buffer is not None
+                and self._buffer.size - self._flushed_frames >= self._flush_interval
+            ):
+                self._flush_buffered()
+                self._flush_pending = False
+
+            try:
+                item = self._cam_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:  # sentinel
+                break
+            with self._hdf5_lock:
+                self._append_camera(*item)
+                self._cam_written += 1
+                if self._cam_written % _hdf5_flush_every_n == 0:
+                    self._file.flush()
+
+        # Final flush before draining (buffer is static during drain).
+        # _flush_buffered() manages its own _hdf5_lock internally.
+        if self._buffer is not None and self._buffer.size > self._flushed_frames:
+            self._flush_buffered()
+
+        # Drain remaining camera items after stop signal
+        while True:
+            try:
+                item = self._cam_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            with self._hdf5_lock:
+                self._append_camera(*item)
+                self._cam_written += 1
+
+    # ── Camera HDF5 write (called from background writer OR inline at stop) ─
+
     def _append_camera(
         self,
         camera_frame: dict[str, Any] | None,
-        T_base_eef: np.ndarray | None,
         camera_frames: dict[str, dict[str, Any]] | None,
-        repeat: int = 1,
+        target_len: int,
     ) -> None:
-        """Append camera frame(s) `repeat` times (forward-fill on gaps)."""
+        """Fill every camera dataset up to ``target_len`` grid slots.
+
+        ``target_len`` is the aligned-grid length at enqueue time, so dataset
+        index == grid index: loop slower than the grid (k>1), dropped queue
+        items, a camera appearing mid-episode, or per-dataset slot skips all
+        show up as "dataset shorter than target" and are healed by the next
+        item — backfilled slots repeat the current frame, matching the
+        TimestampAlignedBuffer forward-fill convention for non-camera streams.
+
+        Called from the background writer thread (normal operation) or inline
+        (drain at stop).  Caller must hold ``self._hdf5_lock``.
+        """
         assert self._file is not None
-        for _ in range(max(1, repeat)):
-            # Single-camera
-            if camera_frame is not None:
-                rgb = camera_frame.get("rgb")
-                depth = camera_frame.get("depth")
+        # Single-camera
+        if camera_frame is not None:
+            rgb = camera_frame.get("rgb")
+            depth = camera_frame.get("depth")
+            if rgb is not None:
                 if "rgb" not in self._datasets:
-                    if rgb is not None:
-                        self._datasets["rgb"] = self._file.create_dataset(
-                            "rgb",
+                    self._datasets["rgb"] = self._file.create_dataset(
+                        "rgb",
+                        data=rgb[np.newaxis, ...],
+                        maxshape=(None,) + rgb.shape,
+                        chunks=True,
+                        dtype=rgb.dtype,
+                        compression="gzip",
+                        compression_opts=1,
+                    )
+                self._fill_to("rgb", rgb, target_len)
+            if depth is not None:
+                if "depth" not in self._datasets:
+                    self._datasets["depth"] = self._file.create_dataset(
+                        "depth",
+                        data=depth[np.newaxis, ...],
+                        maxshape=(None,) + depth.shape,
+                        chunks=True,
+                        dtype=depth.dtype,
+                        compression="gzip",
+                        compression_opts=1,
+                    )
+                self._fill_to("depth", depth, target_len)
+
+            # Fixed-size world-frame pointcloud (xyz + rgb), computed online
+            # in the CameraProcess child — see sensor/pointcloud_processor.py.
+            # gzip level 1: float32 FPS-downsampled coords compress ~2-3x,
+            # fast enough for the background writer thread.
+            pc = camera_frame.get("pointcloud")
+            if pc is not None and camera_frame.get("pointcloud_valid", True):
+                if "pointcloud" not in self._datasets:
+                    self._datasets["pointcloud"] = self._file.create_dataset(
+                        "pointcloud",
+                        data=pc[np.newaxis, ...],
+                        maxshape=(None,) + pc.shape,
+                        chunks=(1,) + pc.shape,
+                        dtype=np.float32,
+                        compression="gzip",
+                        compression_opts=1,
+                    )
+                self._fill_to("pointcloud", pc, target_len)
+
+        # Multi-camera
+        if camera_frames:
+            for cam_name, cam_frame in camera_frames.items():
+                if cam_frame is None:
+                    continue
+                safe = str(cam_name).replace("/", "_").replace("\\", "_")
+                rgb = cam_frame.get("rgb")
+                depth = cam_frame.get("depth")
+                rgb_key = f"{safe}_rgb"
+                depth_key = f"{safe}_depth"
+                if rgb is not None and hasattr(rgb, "shape"):
+                    if rgb_key not in self._datasets:
+                        self._datasets[rgb_key] = self._file.create_dataset(
+                            rgb_key,
                             data=rgb[np.newaxis, ...],
                             maxshape=(None,) + rgb.shape,
                             chunks=True,
-                            dtype=rgb.dtype,
+                            dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
                             compression="gzip",
+                            compression_opts=1,
                         )
-                    if depth is not None:
-                        self._datasets["depth"] = self._file.create_dataset(
-                            "depth",
+                    self._fill_to(rgb_key, rgb, target_len)
+                if depth is not None and hasattr(depth, "shape"):
+                    if depth_key not in self._datasets:
+                        self._datasets[depth_key] = self._file.create_dataset(
+                            depth_key,
                             data=depth[np.newaxis, ...],
                             maxshape=(None,) + depth.shape,
                             chunks=True,
-                            dtype=depth.dtype,
+                            dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
                             compression="gzip",
+                            compression_opts=1,
                         )
-                else:
-                    if rgb is not None:
-                        self._resize_append("rgb", rgb)
-                    if depth is not None:
-                        self._resize_append("depth", depth)
-
-            # Multi-camera
-            if camera_frames:
-                for cam_name, cam_frame in camera_frames.items():
-                    if cam_frame is None:
-                        continue
-                    safe = str(cam_name).replace("/", "_").replace("\\", "_")
-                    rgb = cam_frame.get("rgb")
-                    depth = cam_frame.get("depth")
-                    rgb_key = f"{safe}_rgb"
-                    depth_key = f"{safe}_depth"
-                    if rgb_key not in self._datasets:
-                        if rgb is not None and hasattr(rgb, "shape"):
-                            self._datasets[rgb_key] = self._file.create_dataset(
-                                rgb_key,
-                                data=rgb[np.newaxis, ...],
-                                maxshape=(None,) + rgb.shape,
-                                chunks=True,
-                                dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
-                                compression="gzip",
-                            )
-                        if depth is not None and hasattr(depth, "shape"):
-                            self._datasets[depth_key] = self._file.create_dataset(
-                                depth_key,
-                                data=depth[np.newaxis, ...],
-                                maxshape=(None,) + depth.shape,
-                                chunks=True,
-                                dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
-                                compression="gzip",
-                            )
-                    else:
-                        if rgb is not None and hasattr(rgb, "shape"):
-                            self._resize_append(rgb_key, rgb)
-                        if depth is not None and hasattr(depth, "shape"):
-                            self._resize_append(depth_key, depth)
+                    self._fill_to(depth_key, depth, target_len)
 
     def _flush_buffered(self) -> None:
         """Write buffered non-camera streams to HDF5, keeping datasets resizable.
@@ -379,84 +543,148 @@ class EpisodeRecorder:
         if self._buffer is None or self._buffer.size == self._flushed_frames:
             return
 
-        self._ensure_hdf5()
-        buf_data = self._buffer.data
-        buf_size = self._buffer.size
-        new_start = self._flushed_frames
+        with self._hdf5_lock:
+            self._ensure_hdf5()
+            buf_data = self._buffer.data
+            buf_size = self._buffer.size
+            new_start = self._flushed_frames
 
-        for h5_key, arr in buf_data.items():
-            if h5_key not in self._datasets:
-                self._datasets[h5_key] = self._file.create_dataset(
-                    h5_key,
-                    data=arr[:buf_size].copy(),
-                    maxshape=(None,) + arr.shape[1:],
-                    dtype=arr.dtype,
+            for h5_key, arr in buf_data.items():
+                if h5_key not in self._datasets:
+                    self._datasets[h5_key] = self._file.create_dataset(
+                        h5_key,
+                        data=arr[:buf_size].copy(),
+                        maxshape=(None,) + arr.shape[1:],
+                        dtype=arr.dtype,
+                        compression="gzip",
+                    )
+                else:
+                    ds = self._datasets[h5_key]
+                    ds.resize(buf_size, axis=0)
+                    ds[new_start:buf_size] = arr[new_start:buf_size]
+
+            # Timestamp (stored separately from buf_data)
+            ts = self._buffer.timestamps
+            if "timestamp" not in self._datasets:
+                self._datasets["timestamp"] = self._file.create_dataset(
+                    "timestamp",
+                    data=ts[:buf_size].copy(),
+                    maxshape=(None,),
+                    dtype=np.float64,
                     compression="gzip",
                 )
             else:
-                ds = self._datasets[h5_key]
-                ds.resize(buf_size, axis=0)
-                ds[new_start:buf_size] = arr[new_start:buf_size]
+                ts_ds = self._datasets["timestamp"]
+                ts_ds.resize(buf_size, axis=0)
+                ts_ds[new_start:buf_size] = ts[new_start:buf_size]
 
-        # Timestamp (stored separately from buf_data)
-        ts = self._buffer.timestamps
-        if "timestamp" not in self._datasets:
-            self._datasets["timestamp"] = self._file.create_dataset(
-                "timestamp",
-                data=ts[:buf_size].copy(),
-                maxshape=(None,),
-                dtype=np.float64,
-                compression="gzip",
-            )
-        else:
-            ts_ds = self._datasets["timestamp"]
-            ts_ds.resize(buf_size, axis=0)
-            ts_ds[new_start:buf_size] = ts[new_start:buf_size]
+            self._flushed_frames = buf_size
 
-        self._flushed_frames = buf_size
-
-        # Push HDF5 metadata (chunk B-tree, resized shapes) to disk so a hard
-        # crash (SIGKILL/segfault) loses at most one flush interval.
-        self._file.flush()
+            # Push HDF5 metadata (chunk B-tree, resized shapes) to disk so a hard
+            # crash (SIGKILL/segfault) loses at most one flush interval.
+            self._file.flush()
 
     def stop_episode(self, success: bool = True) -> str | None:
+        """Signal end of episode; return path immediately, flush in background.
+
+        The heavy HDF5 work (buffer flush, camera forward-fill, gzip
+        compression, metadata write, file close) runs on a daemon thread
+        so the 50 Hz control loop stays responsive.
+        """
         if not self._recording:
             return None
 
+        # Mark as stopped *before* spawning the thread — add_frame() must
+        # reject new frames immediately.  All data is already in _buffer
+        # and _cam_queue; the background thread will drain both.
+        self._recording = False
+        self._max_frames_reached = False
+        path = self._episode_path
+
+        t = threading.Thread(
+            target=self._stop_episode_impl,
+            args=(success,),
+            daemon=True,
+            name="episode-stop",
+        )
+        t.start()
+        self._stop_thread = t
+        return path
+
+    def _stop_episode_impl(self, success: bool) -> None:
+        """Background: flush buffers, forward-fill cameras, write meta, close HDF5."""
         duration = time.perf_counter() - (self._start_time or 0.0)
+
+        # ── Stop background camera writer ──
+        # 1. Signal stop + push sentinel so the thread exits its loop.
+        self._cam_writer_stop.set()
+        try:
+            self._cam_queue.put_nowait(None)
+        except queue.Full:
+            pass  # queue is full; sentinel won't fit — drain below instead
+
+        # 2. Join the writer thread.
+        if self._cam_writer is not None and self._cam_writer.is_alive():
+            self._cam_writer.join(timeout=5.0)
+            if self._cam_writer.is_alive():
+                logger.warning("Camera writer thread did not exit within 5s")
+
+        # 3. Safety drain: pick up anything the writer may have missed.
+        while True:
+            try:
+                leftover = self._cam_queue.get_nowait()
+            except queue.Empty:
+                break
+            if leftover is None:
+                continue
+            with self._hdf5_lock:
+                self._append_camera(*leftover)
 
         # ── Flush remaining buffered non-camera streams ──
         self._flush_buffered()
         buf_size = self._buffer.size if self._buffer is not None else 0
 
-        # Camera streams are forward-filled; warn on drift.
-        if self._file is not None and self._buffer is not None:
-            for key in ("rgb", "depth"):
-                ds = self._datasets.get(key)
-                if ds is not None and ds.shape[0] != buf_size:
-                    logger.warning(
-                        "%s length %d != grid length %d (alignment drift)",
-                        key,
-                        ds.shape[0],
-                        buf_size,
-                    )
+        # ── Camera forward-fill: pad camera datasets to match grid length ──
+        # Camera frames are written by the background thread at ~50 Hz cadence,
+        # but when k > 1 (minor timing jitter) the camera dataset falls slightly
+        # behind the non-camera grid.  Forward-fill the last frame to keep every
+        # dataset index-aligned.
+        if self._file is not None and buf_size > 0:
+            with self._hdf5_lock:
+                for key in list(self._datasets.keys()):
+                    if not (
+                        key in ("rgb", "depth", "pointcloud")
+                        or key.endswith("_rgb")
+                        or key.endswith("_depth")
+                    ):
+                        continue
+                    ds = self._datasets[key]
+                    cam_len = ds.shape[0]
+                    if 0 < cam_len < buf_size:
+                        gap = buf_size - cam_len
+                        logger.debug("camera tail-pad %s: +%d slots", key, gap)
+                        last_frame = ds[cam_len - 1 : cam_len]  # keep dims: (1, ...)
+                        repeats = np.repeat(last_frame, gap, axis=0)
+                        ds.resize(buf_size, axis=0)
+                        ds[cam_len:buf_size] = repeats
 
         self._buffer = None
         self._frame_count = buf_size
 
         # ── Write final metadata ──
         if self._file is not None:
-            meta = self._file["meta"]
-            meta.attrs["schema_version"] = SCHEMA_VERSION
-            meta.attrs["duration"] = duration
-            meta.attrs["num_frames"] = self._frame_count
-            meta.attrs["success"] = success
-            meta.attrs["fps"] = self._frame_count / duration if duration > 0 else 50.0
-            meta.attrs["min_frames_met"] = self._frame_count >= 50
-            meta.attrs["has_camera"] = "rgb" in self._file
-            meta.attrs["has_timestamps"] = "timestamp" in self._file
+            with self._hdf5_lock:
+                meta = self._file["meta"]
+                meta.attrs["schema_version"] = SCHEMA_VERSION
+                meta.attrs["duration"] = duration
+                meta.attrs["num_frames"] = self._frame_count
+                meta.attrs["success"] = success
+                meta.attrs["fps"] = self._frame_count / duration if duration > 0 else 50.0
+                meta.attrs["min_frames_met"] = self._frame_count >= 50
+                meta.attrs["has_camera"] = "rgb" in self._file
+                meta.attrs["has_pointcloud"] = "pointcloud" in self._file
+                meta.attrs["has_timestamps"] = "timestamp" in self._file
 
-        path = self._episode_path
         if self._file is not None:
             self._file.close()
         self._file = None
@@ -472,10 +700,19 @@ class EpisodeRecorder:
         self._last_camera_frame = None
         self._last_camera_frames = None
         self._last_T_base_eef = None
-        return path
+        self._cam_last_frame_number = None
+        self._cam_last_change_ts = 0.0
+        self._cam_writer = None
+        self._cam_written = 0
 
-    def _resize_append(self, key: str, data: np.ndarray) -> None:
+    def _fill_to(self, key: str, data: np.ndarray, target_len: int) -> None:
+        """Fill dataset ``key`` up to ``target_len`` rows with ``data`` (broadcast).
+
+        No-op when already at/past target — idempotent across the stop-time
+        drain where queued items carry non-decreasing targets.
+        """
         ds = self._datasets[key]
         n = ds.shape[0]
-        ds.resize(n + 1, axis=0)
-        ds[n] = data
+        if n < target_len:
+            ds.resize(target_len, axis=0)
+            ds[n:target_len] = data

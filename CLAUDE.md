@@ -147,17 +147,19 @@ IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
 ## HDF5 recording format
 
 All streams are aligned to one `dt=1/50` time grid at record time (`TimestampAlignedBuffer`),
-keyed by `state.timestamp`; camera frames stream per-frame but stay length-aligned to the grid.
+keyed by `state.timestamp`; camera frames stream per-frame, index-aligned to the grid (per-slot forward-fill).
 
 ```
 episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collision
   /meta (group)
-    attrs: schema_version(=4), task_label, operator, tags, duration, fps, num_frames,
-           success, min_frames_met, has_camera, has_timestamps,
+    attrs: schema_version(=6), task_label, operator, tags, duration, fps, num_frames,
+           success, min_frames_met, has_camera, has_pointcloud, has_timestamps,
            camera_serial, camera_type, camera_K, camera_T_world_camera, camera_T_eef_camera,
            skip_initial_frames, control_mode, arm_mode, hand_mode,
            arm_delta_clip, hand_delta_clip, hand_ema_alpha, hand_low_pass_alpha,
-           ema_alpha_pos, ema_alpha_rot
+           ema_alpha_pos, ema_alpha_rot,
+           pc_num_points, pc_depth_min_m, pc_depth_max_m, pc_workspace, pc_voxel_size,
+           pc_radius_outlier_min_points, pc_radius_outlier_radius, pc_fps_backend
   /arm_qpos(T,7)           arm joint positions (rad)
   /arm_ee(T,9)             EEF [pos(3), rot6d(6)]
   /arm_qvel(T,7)           arm joint velocities (rad/s)
@@ -171,11 +173,14 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
   /flag_ik_ok(T,)          bool — IK solved successfully
   /flag_retarget_ok(T,)    bool — retargeting converged
   /flag_held(T,)           bool — command held (no fresh VR/IK result)
+  /flag_camera_fresh(T,)   bool — a new camera frame arrived within 0.5s (False = frozen/forward-filled)
   /vr_wrist_pos(T,3)       VR wrist position in base frame
   /vr_wrist_rot6d(T,6)     VR wrist orientation as 6D rotation
   /vr_landmarks(T,21,3)    VR hand landmarks (MANO convention)
   /rgb(T,H,W,3)            uint8 camera frames (forward-filled to grid)
-  /depth(T,H,W)            uint16 Z16 depth (forward-filled to grid)
+  /depth(T,H,W)            uint16 Z16 depth, L515 validity-gated (forward-filled to grid)
+  /pointcloud(T,2048,6)    float32 world-frame [xyz, rgb 0-1] — computed online @30Hz in
+                           CameraProcess (sensor/pointcloud_processor.py), forward-filled
   /timestamp(T)            aligned grid timestamps (20ms spacing)
 ```
 - **RecordingSession** (`recording/recording_session.py`) — driver-agnostic: one writer thread

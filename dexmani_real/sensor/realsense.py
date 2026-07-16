@@ -11,6 +11,7 @@ __all__ = [
     "RealSenseConfig",
     "CameraFrame",
     "L515DepthConfig",
+    "L515_CALIBRATED_DEPTH_VALIDITY",
     "AlignMode",
     "_normalize_align_mode",
 ]
@@ -20,6 +21,7 @@ import pyrealsense2 as rs
 
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import (
+    DepthEdgeConfig,
     DepthValidityConfig,
     build_edge_threshold_lut,
     compute_depth_edge_mask,
@@ -62,6 +64,25 @@ class L515DepthConfig:
     receiver_gain: int = 12  # 8-18; numerically higher = lower actual gain
     confidence_threshold: int = 2  # firmware confidence cull, 0-3
     noise_filtering: int = 2  # runtime scale 0-6
+
+
+# Calibrated production depth-validity gate (SN f1382055, 2026-07-15, warm camera,
+# via examples/real/calibrate_l515_depth.py): sigma_z = -0.94 + 2.93*z mm, edge
+# threshold T(z) = max(5*sigma_z, 10 mm). Single source of truth for the SHM /
+# recording path (the diagnostic script inlines the same values).
+L515_CALIBRATED_DEPTH_VALIDITY = DepthValidityConfig(
+    confidence_min=2,
+    ir_min=2,
+    ir_saturation=250,
+    saturation_dilate_px=3,
+    edge=DepthEdgeConfig(
+        sigma_poly=(-0.00094, 0.00293),
+        n_sigma=5.0,
+        t_min=0.010,
+        t_max=None,
+        dilate_px=0,
+    ),
+)
 
 
 @dataclass(frozen=True)
