@@ -488,10 +488,17 @@ def main() -> None:
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──
-    recorder = EpisodeRecorder(data_dir=args.data_dir)
+    # control_hz 必须匹配主循环 CTRL_HZ — 否则 16Hz 循环喂 50Hz 栅格，
+    # 每拍回填 ~3 个重复槽位 (num_frames ≈ 3x 实际 tick 数)。
+    recorder = EpisodeRecorder(
+        data_dir=args.data_dir,
+        control_hz=CTRL_HZ,
+        min_frames=int(round(1.0 * CTRL_HZ)),
+    )
     collection_config = CollectionConfig(
         task_label="teleop",
         operator="",
+        min_frames=int(round(1.0 * CTRL_HZ)),
         save_sidecar_json=True,
     )
     collection = CollectionLoop(recorder, collection_config)

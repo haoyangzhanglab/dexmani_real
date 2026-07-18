@@ -1,0 +1,43 @@
+{
+  "h5_path": "episodes_arm/episode_20260718_212454.h5",
+  "task_label": "",
+  "speed_factor": 1.0,
+  "original_frames": 960,
+  "replayed_frames": 960,
+  "matching_frames": 960,
+  "arm_joint": {
+    "mae_per_joint_deg": [
+      0.1681,
+      0.2809,
+      0.1289,
+      0.305,
+      0.3814,
+      0.2822,
+      0.396
+    ],
+    "rmse_per_joint_deg": [
+      0.2773,
+      0.459,
+      0.2198,
+      0.5314,
+      0.806,
+      0.6694,
+      1.2992
+    ],
+    "mae_overall_deg": 0.2775,
+    "rmse_overall_deg": 0.6089
+  },
+  "eef_position": {
+    "mean_error_mm": 3.06,
+    "max_error_mm": 23.82,
+    "rmse_error_mm": 4.31
+  },
+  "eef_orientation": {
+    "mean_error_deg": 0.6,
+    "max_error_deg": 9.35
+  },
+  "tracking_lag": {
+    "peak_lag_frames": 0,
+    "peak_lag_seconds": 0.0
+  }
+}

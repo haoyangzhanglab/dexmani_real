@@ -180,6 +180,9 @@ class TeleopController:
         # State
         self.state = ControllerState.IDLE
         self.recording = False
+        # Latch: recorder observed active since the last BEGIN — distinguishes
+        # a writer-side auto-stop (max_frames) from the START-enqueue window.
+        self._recorder_seen_active = False
         self.running = False
         self._last_arm_cmd: np.ndarray | None = None
         self._last_hand_cmd: np.ndarray | None = None
@@ -250,6 +253,10 @@ class TeleopController:
     def _tick(self) -> None:
         if self.state == ControllerState.EMERGENCY_STOP:
             return
+
+        # Writer-side auto-stop (max_frames) leaves self.recording stale —
+        # sync before the PAUSED branch so held ticks stop enqueuing too.
+        self._sync_recording_flag()
 
         tick_start = time.perf_counter()
         self.frame_count += 1
@@ -641,6 +648,7 @@ class TeleopController:
 
     def _start_recording(self) -> None:
         logger.info("Starting episode recording...")
+        self._recorder_seen_active = False  # re-arm the auto-stop latch for this episode
         if not self._reset_mapper():
             logger.error("Cannot start recording without VR frame.")
             return
@@ -672,6 +680,25 @@ class TeleopController:
                 logger.info("  Saved to %s", path)
         self.recording = False
         logger.info("Episode stopped.")
+
+    def _sync_recording_flag(self) -> None:
+        """Detect writer-side auto-stop (max_frames) and reset the stale REC flag.
+
+        CollectionLoop.record_frame auto-stops inside the RecordingSession
+        writer thread, so self.recording would stay True forever: REC keeps
+        displaying and every later tick enqueues frames the recorder rejects.
+        """
+        if not self.recording or self._collection_loop is None:
+            return
+        if self._collection_loop.is_recording:
+            self._recorder_seen_active = True
+        elif self._recorder_seen_active:
+            self.recording = False
+            self._recorder_seen_active = False
+            logger.warning(
+                "Recording auto-stopped at max_frames — saved: %s ; press B for a new episode",
+                self._collection_loop.get_episode_summary()["last_path"],
+            )
 
     # ── VR ──
 

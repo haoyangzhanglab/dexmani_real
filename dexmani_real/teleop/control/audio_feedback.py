@@ -99,7 +99,6 @@ class AudioFeedback:
         if proc is not None:
             try:
                 proc.kill()
-                proc.wait(timeout=2.0)
             except Exception:
                 pass
 

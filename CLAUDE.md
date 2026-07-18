@@ -112,7 +112,8 @@ VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compu
                                                                    │
 RobotInterface.validate_action() ← pre-send gate (error + connection + torque + temp + workspace clamp
                                     + arm clip + hand clip; env_collision accepted but not wired)
-ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 50Hz inner loop (mode 6: passthrough, firmware trajectory planning)
+ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 50Hz inner loop (mode 6: passthrough, firmware trajectory
+                                        planning; teleop 采集入口覆写 joint_max_speed 90→120°/s, 库默认仍 90)
 RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
         │
     ┌── XArm7 (SDK C++ binding)  ← driven by ArmInnerLoop @ 50Hz (mode 6: firmware online trajectory planning)
@@ -151,14 +152,15 @@ IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
 ## HDF5 recording format
 
 All streams are aligned to one `dt=1/control_hz` time grid at record time (`TimestampAlignedBuffer`,
-16 Hz in production entry points; library default 50), keyed by `state.timestamp`; camera frames
+16 Hz in all recording entry points; library default 50), keyed by `state.timestamp`; camera frames
 stream per-frame, index-aligned to the grid (per-slot forward-fill).
 
 ```
 episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collision
   /meta (group)
-    attrs: schema_version(=7), control_hz, task_label, operator, tags, duration, fps, num_frames,
+    attrs: schema_version(=8), control_hz, task_label, operator, tags, duration, fps, num_frames,
            success, min_frames_met, has_camera, has_pointcloud, has_timestamps,
+           truncated, stop_reason, cam_frames_dropped, cam_items_written,
            camera_serial, camera_type, camera_K, camera_T_world_camera, camera_T_eef_camera,
            skip_initial_frames, control_mode, arm_mode, hand_mode,
            arm_delta_clip, hand_delta_clip, hand_max_qvel_deg_s, hand_ema_alpha, hand_low_pass_alpha,
@@ -182,8 +184,8 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
   /vr_wrist_pos(T,3)       VR wrist position in base frame
   /vr_wrist_rot6d(T,6)     VR wrist orientation as 6D rotation
   /vr_landmarks(T,21,3)    VR hand landmarks (MANO convention)
-  /rgb(T,H,W,3)            uint8 camera frames (forward-filled to grid)
-  /depth(T,H,W)            uint16 Z16 depth, L515 validity-gated (forward-filled to grid)
+  /rgb(T,H,W,3)            uint8 camera frames (forward-filled to grid; lzf — 写线程须跟上栅格速率)
+  /depth(T,H,W)            uint16 Z16 depth, L515 validity-gated (forward-filled to grid; lzf)
   /pointcloud(T,2048,6)    float32 world-frame [xyz, rgb 0-1] — computed online @30Hz in
                            CameraProcess (sensor/pointcloud_processor.py), forward-filled
   /timestamp(T)            raw sample timestamps on the dt grid (62.5ms spacing @16Hz;
@@ -219,6 +221,7 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
 | `examples/real/test_quest_hand_teleop.py` | Standalone hand-retargeting test (no TeleopController) |
 | `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
 | `dexmani_real/tools/visualize_episode.py` | Rerun-based HDF5 episode viewer (3D + camera + time series) |
+| `dexmani_real/tools/check_episode_health.py` | Episode 健康检查（栅格填充/相机内容重复/跟踪误差；有 WARN 时 exit 1） |
 | `dexmani_real/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
 
 ## Safety architecture

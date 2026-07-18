@@ -51,6 +51,7 @@ from dexmani_real.planning import (
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.xarm7 import XArm7Config
@@ -71,6 +72,10 @@ HAND_MAX_QVEL_DEG_S = 90.0  # 手关节限速 → per-send delta clip = deg2rad(
 # 回退注意: 这是"再语义化"而非纯换算 —— 旧默认 XHandConfig.max_delta_rad=0.3 rad/step
 # (@50Hz ≙ 859°/s 防尖峰门)。CTRL_HZ 改回 50 会得到 0.031 rad (紧 9.6x)，
 # 完整回退需同时删除下方 XHandConfig(max_delta_rad=...) 派生行恢复库默认。
+
+# mode6 固件速度上限: 采集入口覆写库默认 90°/s → 120°/s，降低快速操作下的
+# cmd-state 饱和滞后 (实测 p95 40°)。首次上机需低速验收 (C22/C24/tracking 告警频次)。
+ARM_MAX_SPEED_DEG_S = 120.0
 
 
 def main():
@@ -177,6 +182,7 @@ def main():
         ema_alpha_rot=1.0,  # Cartesian EMA pass-through for SHM raw path
         dry_run=False,
         use_shm_vr=True,  # ← 零拷贝 SHM 路径
+        inner_loop_cfg=ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S))),
         collection_config=CollectionConfig(
             task_label=task_label,
             operator=operator,

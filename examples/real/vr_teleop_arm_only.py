@@ -5,7 +5,7 @@
 
 架构:
     Meta Quest (HTS app) ──TCP──→ VRReceiverProcess ──SharedMemory──→ 主循环
-                                     (独立进程, 隔离 HTS SDK)          (主进程, 50Hz)
+                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 50Hz)
 
 用法:
     # 1. Quest USB 有线: adb reverse tcp:8000 tcp:8000
@@ -56,8 +56,8 @@ from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiver
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
-from dexmani_real.utils.rate_limiter import RateLimiter
-from dexmani_real.utils.signal_utils import ema_smooth_pose
+from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.signal_utils import alpha_from_tau, ema_smooth_pose, tau_from_alpha
 
 logger = get_logger(__name__)
 
@@ -139,7 +139,12 @@ class TrajectoryLogger:
 
 # ═══════════════════════════════════════════════ 配置
 
-CTRL_DT = 0.02           # 50Hz
+# ── 控制频率: 单点定义, 其余常量全部由此派生 ──
+# 决策/录制 @ CTRL_HZ; 臂内环保持 50Hz (Mode 6 固件在线规划, 直发无插值)。
+CTRL_HZ = 16.0
+CTRL_DT = 1.0 / CTRL_HZ
+REF_HZ = 50.0            # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
+STATUS_EVERY = int(round(1.0 * CTRL_HZ))  # 状态打印节流 (~1Hz)
 HOME_DT = 0.04           # 归位 waypoint 间隔 (s)
 
 WORKSPACE_BOUNDS = np.array([
@@ -161,12 +166,16 @@ VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
 # 笛卡尔位姿 EMA 平滑 (IK 前, 唯一平滑级, 匹配 sim TeleopPipeline)
-EMA_ALPHA_POS = 0.6
-EMA_ALPHA_ROT = 0.3
+# 0.6/0.3 @50Hz 调参 → τ 不变换算到 CTRL_HZ (≈0.94/0.67 @16Hz)
+EMA_ALPHA_POS = alpha_from_tau(tau_from_alpha(0.6, 1.0 / REF_HZ), CTRL_DT)
+EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 
 # Mode 6 online trajectory planning (default) — no inner-loop interpolation,
-# firmware trajectory planner respects speed/accel limits (90°/s, 500°/s²).
-_INNER_CFG = ArmInnerLoopConfig()
+# firmware trajectory planner respects speed/accel limits (120°/s, 500°/s²).
+# 采集入口覆写库默认 90°/s → 120°/s: 降低快速操作下的 cmd-state 饱和滞后
+# (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
+ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
+_INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
 
 
 # ═══════════════════════════════════════════════ 归位
@@ -254,6 +263,8 @@ def main():
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
+            # 1°/frame @50Hz — 换算保持 °/s 不变
+            nullspace_step_size_deg=1.0 * (REF_HZ / CTRL_HZ),
         ),
     )
 
@@ -334,7 +345,12 @@ def main():
     )
 
     # ── 7. Recorder ──
-    recorder = EpisodeRecorder(data_dir="episodes", max_frames=4500)
+    recorder = EpisodeRecorder(
+        data_dir="episodes",
+        max_frames=int(round(90.0 * CTRL_HZ)),  # 90s 上限
+        control_hz=CTRL_HZ,
+        min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
+    )
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
     traj_logger = TrajectoryLogger()
@@ -393,7 +409,7 @@ def main():
     print("等待按键 B 开始遥操作...\n")
 
     # ── 11. Main loop ──
-    limiter = RateLimiter(1.0 / CTRL_DT)
+    limiter = RateManager(CTRL_HZ)  # 绝对期限调度 — tick 锁定录制时间栅格
     running = True
     teleop_active = False
     recording_active = False
@@ -410,11 +426,16 @@ def main():
         if recording_active:
             if save:
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
+                print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
+                recorder.join_stop(timeout=60.0)  # 落盘完成后才报"已保存"
                 if path:
                     print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
                 recorder.stop_episode(success=False)
+                # 注意: 与 record/record_plus 不同，此入口丢弃不删除文件 —
+                # h5 以 success=False 留盘。join 确保文件完整关闭。
+                recorder.join_stop(timeout=60.0)
             recording_active = False
 
     def _emergency_stop():
@@ -509,7 +530,10 @@ def main():
                         continue
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
-                    recorder.start_episode()
+                    if not recorder.start_episode():
+                        print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
+                        skip_rest = True
+                        continue
                     recording_active = True
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
@@ -603,10 +627,10 @@ def main():
             vr_stale = vr_frame is None or (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > VR_STALE_THRESHOLD_S * 1e9
 
             # ── Periodic status ──
-            if loop_count % 50 == 0:
+            if loop_count % STATUS_EVERY == 0:
                 elapsed = time.perf_counter() - start_time
                 if prev_eef_pos is not None:
-                    vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (50 * CTRL_DT)
+                    vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (STATUS_EVERY * CTRL_DT)
                 else:
                     vel = 0.0
                 prev_eef_pos = state.eef_pos.copy()
@@ -657,7 +681,7 @@ def main():
                     # No action needed — hold current arm position via inner loop
                     pass
                 elif vr_stale:
-                    if loop_count % 50 == 0:
+                    if loop_count % STATUS_EVERY == 0:
                         print("  ⚠ VR 帧过期，保持当前位置")
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None  # 重置笛卡尔 EMA, 恢复时无跳变
@@ -778,6 +802,9 @@ def main():
         # 确保录制已停止
         if recording_active:
             recorder.stop_episode(success=False)
+        # 无条件等待后台 flush 完成（急停/H 保存的 stop 线程也在此收口）。
+        # 必须在交互 prompt 之前 — 否则 flush 被 prompt 劫持、二次 Ctrl-C 可截断 h5。
+        recorder.join_stop(timeout=60.0)
 
         # ── 保存轨迹 debug 数据 ──
         if len(traj_logger) > 0:

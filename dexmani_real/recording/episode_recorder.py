@@ -10,9 +10,11 @@ from __future__ import annotations
 
 __all__ = ["EpisodeRecorder"]
 
+import atexit
 import queue
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +29,29 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 7  # v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
+SCHEMA_VERSION = 8  # v8: +truncated/stop_reason/cam_frames_dropped/cam_items_written meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
 
 CAMERA_FRESH_TIMEOUT_S = 0.2  # flag_camera_fresh: max age of the last *new* camera frame (~6 frames @30fps)
+
+# ── atexit safety net ──
+# The episode-stop / cam-writer threads are daemons: if an entry point exits
+# without join_stop() (estop path, second Ctrl-C inside a finally prompt),
+# the interpreter kills them mid-flush and truncates the HDF5.  One hook
+# joins every live recorder at interpreter exit.  No-op on SIGTERM/SIGKILL.
+_LIVE_RECORDERS: weakref.WeakSet = weakref.WeakSet()
+
+
+def _flush_all_recorders() -> None:
+    for rec in list(_LIVE_RECORDERS):  # snapshot — WeakSet may mutate under GC
+        try:
+            if rec._recording:
+                rec.stop_episode(success=False, reason="atexit")
+            rec.join_stop(timeout=60.0)
+        except Exception:
+            pass  # never raise during interpreter shutdown
+
+
+atexit.register(_flush_all_recorders)
 
 
 class EpisodeRecorder:
@@ -94,6 +116,7 @@ class EpisodeRecorder:
         self._cam_writer: threading.Thread | None = None
         self._cam_writer_stop: threading.Event = threading.Event()
         self._cam_written: int = 0
+        self._cam_dropped: int = 0  # enqueue-side drops (writer backlog) — see add_frame
         self._hdf5_lock: threading.Lock = threading.Lock()
 
         # Deferred flush: when True the background writer thread will call
@@ -104,6 +127,8 @@ class EpisodeRecorder:
         # Pending async stop_episode thread (None = no pending stop).
         # Guarded by start_episode() to prevent overlapping episodes.
         self._stop_thread: threading.Thread | None = None
+
+        _LIVE_RECORDERS.add(self)  # atexit flush net
 
     @property
     def is_recording(self) -> bool:
@@ -130,10 +155,12 @@ class EpisodeRecorder:
         skip_initial_frames: int = 0,
     ) -> bool:
         # Wait for any pending async stop_episode to finish — it owns
-        # _file, _buffer, _datasets and will reset them on completion.
-        if self._stop_thread is not None and self._stop_thread.is_alive():
-            self._stop_thread.join(timeout=10.0)
-            self._stop_thread = None
+        # _file, _buffer, _datasets, _pending_meta and will reset them on
+        # completion.  Refuse to start while it is still alive: proceeding
+        # would let the old stop thread clobber the new episode's state.
+        if not self.join_stop(timeout=10.0):
+            logger.error("Previous episode still flushing — refusing to start a new one")
+            return False
 
         if self._recording:
             return False
@@ -369,9 +396,23 @@ class EpisodeRecorder:
                 )
                 try:
                     self._cam_queue.put_nowait(item)
-                except queue.Full:
-                    pass  # writer can't keep up — drop frame rather than block loop
+                except queue.Full:  # defensive — headroom check above keeps ≥2 slots free
+                    self._count_cam_drop()
+            else:
+                # Writer backlog: drop rather than block the control loop.  The
+                # next accepted item backfills the gap with *its* frame, so the
+                # dataset stays index-aligned but this content is lost — count it.
+                self._count_cam_drop()
         return True
+
+    def _count_cam_drop(self) -> None:
+        """Count a camera frame dropped at enqueue; warn on the first and every 100th."""
+        self._cam_dropped += 1
+        if self._cam_dropped == 1 or self._cam_dropped % 100 == 0:
+            logger.warning(
+                "Camera writer backlog — dropped %d camera frame(s) so far",
+                self._cam_dropped,
+            )
 
     def _ensure_hdf5(self) -> None:
         """Lazily create the HDF5 file (flat schema — no groups)."""
@@ -386,6 +427,7 @@ class EpisodeRecorder:
     def _start_cam_writer(self) -> None:
         self._cam_writer_stop.clear()
         self._cam_written = 0
+        self._cam_dropped = 0
         self._cam_writer = threading.Thread(
             target=self._cam_writer_loop, daemon=True, name="episode-cam-writer"
         )
@@ -467,14 +509,16 @@ class EpisodeRecorder:
             depth = camera_frame.get("depth")
             if rgb is not None:
                 if "rgb" not in self._datasets:
+                    # lzf (h5py built-in): ~5x faster than gzip-1 — the single
+                    # writer thread must sustain the full grid rate or frames
+                    # drop silently (gzip-1 measured ~12 items/s ceiling, v8).
                     self._datasets["rgb"] = self._file.create_dataset(
                         "rgb",
                         data=rgb[np.newaxis, ...],
                         maxshape=(None,) + rgb.shape,
                         chunks=True,
                         dtype=rgb.dtype,
-                        compression="gzip",
-                        compression_opts=1,
+                        compression="lzf",
                     )
                 self._fill_to("rgb", rgb, target_len)
             if depth is not None:
@@ -485,8 +529,7 @@ class EpisodeRecorder:
                         maxshape=(None,) + depth.shape,
                         chunks=True,
                         dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,  # Z16 guard
-                        compression="gzip",
-                        compression_opts=1,
+                        compression="lzf",
                     )
                 self._fill_to("depth", depth, target_len)
 
@@ -526,8 +569,7 @@ class EpisodeRecorder:
                             maxshape=(None,) + rgb.shape,
                             chunks=True,
                             dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
-                            compression="gzip",
-                            compression_opts=1,
+                            compression="lzf",
                         )
                     self._fill_to(rgb_key, rgb, target_len)
                 if depth is not None and hasattr(depth, "shape"):
@@ -538,8 +580,7 @@ class EpisodeRecorder:
                             maxshape=(None,) + depth.shape,
                             chunks=True,
                             dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
-                            compression="gzip",
-                            compression_opts=1,
+                            compression="lzf",
                         )
                     self._fill_to(depth_key, depth, target_len)
 
@@ -595,15 +636,24 @@ class EpisodeRecorder:
             # crash (SIGKILL/segfault) loses at most one flush interval.
             self._file.flush()
 
-    def stop_episode(self, success: bool = True) -> str | None:
+    def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
         """Signal end of episode; return path immediately, flush in background.
 
-        The heavy HDF5 work (buffer flush, camera forward-fill, gzip
-        compression, metadata write, file close) runs on a daemon thread
-        so the 50 Hz control loop stays responsive.
+        The heavy HDF5 work (buffer flush, camera forward-fill, compression,
+        metadata write, file close) runs on a daemon thread so the control
+        loop stays responsive.  Callers must join_stop() before relying on
+        the file (or before process exit).
+
+        Args:
+            success: stored as /meta success.
+            reason: stored as /meta stop_reason; empty → "max_frames" when
+                    the episode hit the frame cap, else "manual".
         """
         if not self._recording:
             return None
+
+        # Capture the truncation flag before the reset below — drives /meta truncated.
+        truncated = self._max_frames_reached
 
         # Mark as stopped *before* spawning the thread — add_frame() must
         # reject new frames immediately.  All data is already in _buffer
@@ -614,7 +664,7 @@ class EpisodeRecorder:
 
         t = threading.Thread(
             target=self._stop_episode_impl,
-            args=(success,),
+            args=(success, reason, truncated),
             daemon=True,
             name="episode-stop",
         )
@@ -622,13 +672,25 @@ class EpisodeRecorder:
         self._stop_thread = t
         return path
 
-    def join_stop(self, timeout: float = 10.0) -> None:
-        """Wait for the background stop daemon to finish (HDF5 fully written + closed)."""
-        if self._stop_thread is not None and self._stop_thread.is_alive():
-            self._stop_thread.join(timeout=timeout)
-            self._stop_thread = None
+    def join_stop(self, timeout: float = 30.0) -> bool:
+        """Wait for the background stop daemon (HDF5 fully written + closed).
 
-    def _stop_episode_impl(self, success: bool) -> None:
+        Returns True when no flush is pending anymore.  On timeout the thread
+        handle is KEPT so start_episode() keeps refusing to overlap — dropping
+        it would let a late-finishing flush clobber a new episode's state.
+        """
+        t = self._stop_thread
+        if t is None:
+            return True
+        if t.is_alive():
+            t.join(timeout=timeout)
+            if t.is_alive():
+                logger.warning("episode-stop still flushing after %.0fs — keeping handle", timeout)
+                return False
+        self._stop_thread = None
+        return True
+
+    def _stop_episode_impl(self, success: bool, reason: str, truncated: bool) -> None:
         """Background: flush buffers, forward-fill cameras, write meta, close HDF5."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
@@ -656,6 +718,7 @@ class EpisodeRecorder:
                 continue
             with self._hdf5_lock:
                 self._append_camera(*leftover)
+                self._cam_written += 1
 
         # ── Flush remaining buffered non-camera streams ──
         self._flush_buffered()
@@ -701,6 +764,23 @@ class EpisodeRecorder:
                 meta.attrs["has_camera"] = "rgb" in self._file
                 meta.attrs["has_pointcloud"] = "pointcloud" in self._file
                 meta.attrs["has_timestamps"] = "timestamp" in self._file
+                meta.attrs["truncated"] = bool(truncated)
+                meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
+                # Enqueue-side camera drops (writer backlog): the target_len
+                # backfill keeps datasets index-aligned, so these counters are
+                # the only disk-side record that camera content was lost.
+                meta.attrs["cam_frames_dropped"] = int(self._cam_dropped)
+                meta.attrs["cam_items_written"] = int(self._cam_written)
+
+        if self._cam_dropped > 0:
+            total = self._cam_dropped + self._cam_written
+            logger.warning(
+                "Episode dropped %d/%d camera frames (%.1f%%) at the writer queue — "
+                "rgb/depth content is forward-filled at those slots",
+                self._cam_dropped,
+                total,
+                100.0 * self._cam_dropped / max(1, total),
+            )
 
         if self._file is not None:
             self._file.close()
@@ -721,6 +801,7 @@ class EpisodeRecorder:
         self._cam_last_change_ts = 0.0
         self._cam_writer = None
         self._cam_written = 0
+        self._cam_dropped = 0
 
     def _fill_to(self, key: str, data: np.ndarray, target_len: int) -> None:
         """Fill dataset ``key`` up to ``target_len`` rows with ``data`` (broadcast).

@@ -136,10 +136,16 @@ class CollectionLoop:
         if classification is not None:
             self._classification = classification
 
-        path = self.recorder.stop_episode(success=success)
+        path = self.recorder.stop_episode(success=success, reason=self._stopped_reason)
         self._last_episode_path = path
 
         duration = time.perf_counter() - (self._episode_start_time or 0.0)
+
+        # Block until the HDF5 is fully written + closed — the sidecar and log
+        # below must describe a durable file.  Runs on the RecordingSession
+        # writer thread (or the caller's thread for direct CollectionLoop users).
+        if not self.recorder.join_stop():
+            logger.warning("Episode flush still running after join timeout: %s", path)
 
         if self.config.save_sidecar_json and path is not None:
             self._write_sidecar_json(path, duration)

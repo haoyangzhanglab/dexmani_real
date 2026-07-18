@@ -42,7 +42,7 @@ class RecordingSession:
         *,
         validate: bool = False,
         max_queue: int = 2000,
-        stop_timeout_s: float = 10.0,
+        stop_timeout_s: float = 35.0,
     ) -> None:
         self._loop = collection_loop
         self._validate = validate

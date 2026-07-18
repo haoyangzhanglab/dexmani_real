@@ -183,8 +183,11 @@ EMA_ALPHA_POS = alpha_from_tau(tau_from_alpha(0.6, 1.0 / REF_HZ), CTRL_DT)
 EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 
 # Mode 6 online trajectory planning (default) — no inner-loop interpolation,
-# firmware trajectory planner respects speed/accel limits (90°/s, 500°/s²).
-_INNER_CFG = ArmInnerLoopConfig()
+# firmware trajectory planner respects speed/accel limits (120°/s, 500°/s²).
+# 采集入口覆写库默认 90°/s → 120°/s: 降低快速操作下的 cmd-state 饱和滞后
+# (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
+ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
+_INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
 
 
 # ═══════════════════════════════════════════════ 归位
@@ -444,7 +447,9 @@ def main():
         if recording_active:
             if save:
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
+                print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
+                recorder.join_stop(timeout=60.0)  # 落盘完成后才报"已保存"
                 if path:
                     print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
@@ -524,9 +529,10 @@ def main():
                     if recording_active:
                         # Two-step confirmation: reuse S=Save, D=Discard muscle memory
                         audio.play("quit_save_prompt")
-                        print("  [S] 保存并退出  [D] 丢弃并退出 (30s 超时默认丢弃)")
+                        print("  [S] 保存并退出  [D] 丢弃并退出  [H] 保存并归位 (30s 超时默认丢弃)")
 
                         decision: bool | None = None
+                        do_home: bool = False  # H pressed → save + return_home
                         deadline = time.perf_counter() + 30.0
                         while time.perf_counter() < deadline:
                             for post_sig in kb.poll(timeout=0.1):
@@ -535,6 +541,10 @@ def main():
                                     break
                                 if post_sig == ControlSignal.DISCARD:
                                     decision = False
+                                    break
+                                if post_sig == ControlSignal.HOME:
+                                    decision = True
+                                    do_home = True
                                     break
                                 if post_sig == ControlSignal.EMERGENCY_STOP:
                                     audio.play("emergency")
@@ -561,6 +571,26 @@ def main():
                             audio.play("discard")
                             _stop_recording(save=False)
                             print("  超时，默认丢弃")
+
+                        # H 在确认期间: 已保存, 继续执行归位
+                        if do_home and running:
+                            audio.play("home")
+                            arm_inner = do_return_home(robot, planner, arm_inner)
+                            teleop_active = False
+                            arm_mapper.clear()
+                            if arm_inner.wait_ready(timeout=30.0):
+                                arm_qpos, error_state, _ = arm_inner.get_state()
+                                if not error_state and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                                    state = robot.get_state(arm_qpos=arm_qpos)
+                                    prev_qpos_cmd = state.arm_qpos.copy()
+                                    ema_prev_pos = ema_prev_quat = None
+                                    error_count = 0
+                            else:
+                                state = robot.get_state()
+                                if np.all(np.isfinite(state.arm_qpos)):
+                                    prev_qpos_cmd = state.arm_qpos.copy()
+                                    ema_prev_pos = ema_prev_quat = None
+                                error_count = 0
                         # else: 急停已接管，跳过二次处理
                     else:
                         _stop_recording(save=False)
@@ -636,13 +666,16 @@ def main():
                         continue
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
-                    recorder.start_episode(
+                    if not recorder.start_episode(
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
                         camera_name="camera_0" if calib is not None else None,
                         camera_K=camera.camera_K if camera is not None else None,
                         record_config=camera.pointcloud_meta if camera is not None else None,
-                    )
+                    ):
+                        print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
+                        skip_rest = True
+                        continue
                     recording_active = True
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
@@ -944,6 +977,9 @@ def main():
         # 确保录制已停止
         if recording_active:
             recorder.stop_episode(success=False)
+        # 无条件等待后台 flush 完成（急停/H 保存的 stop 线程也在此收口）。
+        # 必须在交互 prompt 之前 — 否则 flush 被 prompt 劫持、二次 Ctrl-C 可截断 h5。
+        recorder.join_stop(timeout=60.0)
 
         # ── 保存轨迹 debug 数据 ──
         if len(traj_logger) > 0:
@@ -960,6 +996,8 @@ def main():
         while True:
             post_sigs = {s for s in kb.poll(timeout=0.1)}
             if ControlSignal.HOME in post_sigs:
+                print("\nH: return_home")
+                audio.play("home")
                 arm_inner = do_return_home(robot, planner, arm_inner)
                 print("按 Q 退出...")
             if ControlSignal.QUIT in post_sigs or ControlSignal.EMERGENCY_STOP in post_sigs:

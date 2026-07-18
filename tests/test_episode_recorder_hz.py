@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import queue
+import threading
+import time
 from types import SimpleNamespace
 
 import h5py
@@ -69,7 +72,7 @@ def test_grid_dt_and_meta(tmp_path):
     path = _record_episode(tmp_path, n_frames=40)
     with h5py.File(path, "r") as f:
         meta = f["meta"].attrs
-        assert meta["schema_version"] == 7
+        assert meta["schema_version"] == 8
         assert meta["control_hz"] == pytest.approx(HZ)
         assert meta["num_frames"] == 40
         assert bool(meta["min_frames_met"])  # 40 >= 16
@@ -99,3 +102,85 @@ def test_min_frames_not_met(tmp_path):
     path = _record_episode(tmp_path, n_frames=10)  # < 16
     with h5py.File(path, "r") as f:
         assert not bool(f["meta"].attrs["min_frames_met"])
+
+
+def test_stop_reason_truncated(tmp_path):
+    """max_frames auto-stop must be visible in /meta (truncated + stop_reason)."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=8, control_hz=HZ, min_frames=4)
+    assert rec.start_episode()
+    t0 = 1000.0
+    for k in range(10):
+        ok = rec.add_frame(_fake_state(t0 + k * DT), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+        assert ok == (k < 8)  # 9th/10th rejected at the cap
+    assert rec.max_frames_reached
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        meta = f["meta"].attrs
+        assert bool(meta["truncated"])
+        assert meta["stop_reason"] == "max_frames"
+        assert meta["num_frames"] == 8
+
+
+def test_stop_reason_manual_and_explicit(tmp_path):
+    path = _record_episode(tmp_path, n_frames=20)
+    with h5py.File(path, "r") as f:
+        assert not bool(f["meta"].attrs["truncated"])
+        assert f["meta"].attrs["stop_reason"] == "manual"
+
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ)
+    assert rec.start_episode()
+    for k in range(5):
+        rec.add_frame(_fake_state(2000.0 + k * DT), _fake_action(), _fake_vr())
+    path2 = rec.stop_episode(success=False, reason="estop")
+    assert rec.join_stop()
+    with h5py.File(path2, "r") as f:
+        assert f["meta"].attrs["stop_reason"] == "estop"
+        assert not bool(f["meta"].attrs["success"])
+
+
+def test_cam_drop_counter_and_lzf(tmp_path):
+    """Enqueue-side camera drops are counted in /meta; rgb dataset is lzf.
+
+    No cam-writer thread + a tiny queue → deterministic backlog: the headroom
+    check (qsize < maxsize-1) admits only the first frame, drops the other 9;
+    the stop-time safety drain writes the one queued item and the tail-pad
+    heals the dataset length — exactly the masking the counters must expose.
+    """
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4)
+    rec._start_cam_writer = lambda: None  # no consumer
+    assert rec.start_episode()
+    rec._cam_queue = queue.Queue(maxsize=2)
+    t0 = 3000.0
+    for k in range(10):
+        cam = {"rgb": np.zeros((8, 8, 3), dtype=np.uint8), "frame_number": k}
+        assert rec.add_frame(_fake_state(t0 + k * DT), _fake_action(), _fake_vr(), camera_frame=cam)
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        meta = f["meta"].attrs
+        assert meta["cam_frames_dropped"] == 9
+        assert meta["cam_items_written"] == 1  # safety-drain accounting
+        assert f["rgb"].shape == (10, 8, 8, 3)  # length healed by tail-pad, content lost
+        assert f["rgb"].compression == "lzf"
+        assert f["rgb"][:].shape == (10, 8, 8, 3)  # decompresses cleanly
+
+
+def test_join_stop_keep_handle(tmp_path):
+    """join_stop keeps the handle on timeout so the overlap guard stays armed."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path))
+    t = threading.Thread(target=time.sleep, args=(0.5,), daemon=True)
+    t.start()
+    rec._stop_thread = t
+    assert rec.join_stop(timeout=0.05) is False
+    assert rec._stop_thread is t
+    assert rec.join_stop(timeout=2.0) is True
+    assert rec._stop_thread is None
+    assert rec.join_stop() is True  # reentrant no-op
+
+
+def test_start_refuses_pending_stop(tmp_path):
+    rec = EpisodeRecorder(data_dir=str(tmp_path))
+    rec.join_stop = lambda timeout=10.0: False  # pending flush that never finishes
+    assert rec.start_episode() is False
+    assert not rec.is_recording
