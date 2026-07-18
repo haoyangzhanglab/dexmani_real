@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import os
 import sys
 import time
 import traceback
@@ -44,11 +45,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
-from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
+from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.types import RobotState
+from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
@@ -129,7 +131,14 @@ def load_trajectory(h5_path: str, max_frames: int | None = None) -> TrajectoryDa
             logger.warning("HDF5 schema v%d < 3 — some datasets may be missing", schema)
 
         num_frames_orig = meta.attrs.get("num_frames", 0) if meta else 0
-        fps = meta.attrs.get("fps", 50.0) if meta else 50.0
+        # Nominal grid rate: schema v7 stores control_hz; fps is the achieved
+        # rate recomputed at stop (frame_count/duration) — prefer the nominal.
+        fps = meta.attrs.get("control_hz", meta.attrs.get("fps", 50.0)) if meta else 50.0
+        # Clamp: replay_hz drives the real arm — a diluted fps from an old
+        # paused episode (or fps=0) must not set the physical replay rate.
+        if not (1.0 <= float(fps) <= 100.0):
+            logger.warning("Implausible meta rate %.3f Hz — falling back to 50 Hz for replay", float(fps))
+            fps = 50.0
         task_label = meta.attrs.get("task_label", "") if meta else ""
 
         # ── Required datasets ──
@@ -533,6 +542,7 @@ def _do_return_home(
     robot: RobotInterface,
     planner: XArm7MotionPlanner,
     arm_inner: ArmInnerLoop,
+    arm_ip: str = "192.168.1.111",
 ) -> ArmInnerLoop:
     """Return arm to home position: stop inner loop → plan+execute → restart."""
     print("return_home ...", flush=True)
@@ -544,7 +554,7 @@ def _do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = ArmInnerLoop(cfg=_INNER_CFG)
+        new_inner = ArmInnerLoop(cfg=_INNER_CFG, ip=arm_ip)
         new_inner.start()
         print("  Arm inner loop restarted")
         return new_inner
@@ -579,7 +589,7 @@ class TrajectoryReplayer:
         self.no_hand = no_hand
         self.arm_ip = arm_ip
 
-        self.replay_hz = 50.0 * speed
+        self.replay_hz = trajectory.fps * speed  # follow the episode's recorded grid rate
         self._rate_mgr = RateManager(self.replay_hz)
 
         self.planner: XArm7MotionPlanner | None = None
@@ -627,7 +637,7 @@ class TrajectoryReplayer:
             raise RuntimeError("Pre-flight check failed")
 
         # ArmInnerLoop
-        self._arm_inner = ArmInnerLoop(cfg=self._inner_cfg)
+        self._arm_inner = ArmInnerLoop(cfg=self._inner_cfg, ip=self.arm_ip)
         self._arm_inner.start()
         print("Arm inner loop starting...", flush=True)
 
@@ -635,6 +645,91 @@ class TrajectoryReplayer:
             print("Arm inner loop start timed out, falling back to direct read")
         else:
             print("Arm inner loop ready (50Hz online trajectory planning)")
+
+    # ── Start alignment ──
+
+    JOINT_ALIGN_MAX_DEG = 5.0  # max per-joint deviation before requiring planned approach
+
+    def _align_to_start(self, first_cmd: np.ndarray, current_qpos: np.ndarray) -> np.ndarray | None:
+        """Check proximity to trajectory start and plan a safe approach if needed.
+
+        Args:
+            first_cmd: Trajectory first-frame arm joint command (7,).
+            current_qpos: Current arm joint positions from inner loop / SDK read (7,).
+
+        Returns:
+            Updated arm_qpos after approach, or None if alignment failed
+            (caller should abort replay).
+        """
+        joint_diff_deg = np.rad2deg(np.abs(current_qpos - first_cmd))
+        max_dev = float(np.max(joint_diff_deg))
+
+        if max_dev <= self.JOINT_ALIGN_MAX_DEG:
+            return current_qpos  # close enough — inner loop delta clamp handles the rest
+
+        assert self.planner is not None
+        assert self._arm_inner is not None
+
+        print(
+            f"\nArm is {max_dev:.1f}° from trajectory start (threshold: {self.JOINT_ALIGN_MAX_DEG}°)"
+        )
+        print("Planning collision-checked approach to trajectory start ...")
+
+        # ── Target EEF pose: prefer recorded arm_ee, fallback to FK ──
+        if self.traj.arm_ee is not None and self.traj.arm_ee.shape[0] > 0:
+            ee = self.traj.arm_ee[0]
+            target_pos = ee[:3].copy()
+            target_quat = rot6d_to_quat_wxyz(ee[3:9])
+        else:
+            pose = self.planner.compute_eef_pose_world(first_cmd)
+            target_pos = pose.p.copy()
+            target_quat = pose.q.copy()
+
+        target_pose = Pose(p=target_pos, q=target_quat)
+
+        # ── Plan ──
+        try:
+            path_result = self.planner.plan_path(
+                target_eef_pose_world=target_pose,
+                current_qpos=current_qpos.copy(),
+            )
+        except Exception as e:
+            logger.error("plan_path raised exception during start alignment: %s", e)
+            print(f"\nApproach planning failed: {e}")
+            print("Aborting replay for safety. Manually return the arm near the trajectory start and retry.")
+            return None
+
+        if not path_result.success or path_result.qpos_path is None:
+            print(f"\nApproach planning failed: {path_result.reason}")
+            print("Aborting replay for safety. Manually return the arm near the trajectory start and retry.")
+            return None
+
+        qpos_path = path_result.qpos_path
+        print(
+            f"Approach path planned: {qpos_path.shape[0]} waypoints "
+            f"(source={path_result.source})"
+        )
+        print(f"Executing approach at ~{np.rad2deg(0.035) / HOME_DT:.0f}°/s ...")
+
+        # ── Execute approach waypoints through inner loop ──
+        for i, waypoint in enumerate(qpos_path):
+            self._arm_inner.set_target(waypoint)
+            time.sleep(HOME_DT)
+
+        # Settle briefly
+        time.sleep(0.1)
+
+        # ── Read final position ──
+        arm_qpos, error_state, _ = self._arm_inner.get_state()
+        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+            assert self.robot is not None
+            arm_qpos = self.robot.get_state().arm_qpos
+
+        if arm_qpos is not None and np.all(np.isfinite(arm_qpos)):
+            final_dev = np.rad2deg(np.max(np.abs(arm_qpos - first_cmd)))
+            print(f"Approach complete. Remaining deviation: {final_dev:.2f}°")
+
+        return arm_qpos
 
     # ── Run ──
 
@@ -666,18 +761,34 @@ class TrajectoryReplayer:
             arm_qpos = self.robot.get_state().arm_qpos
         state = self.robot.get_state(arm_qpos=arm_qpos)
 
+        # ── Start alignment: plan + execute collision-checked approach if
+        #     the arm is not already near the trajectory start ──
+        first_cmd = self.traj.action_arm_joint[0].copy()
+        aligned_qpos = self._align_to_start(first_cmd, state.arm_qpos.copy())
+        if aligned_qpos is None:
+            print("Aborting replay: failed to align to trajectory start.")
+            if self._recorder is not None:
+                return self._recorder.to_dict()
+            return None
+
+        # Re-read state after alignment (inner loop may have settled)
+        arm_qpos, error_state, _ = self._arm_inner.get_state()
+        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+            arm_qpos = self.robot.get_state().arm_qpos
+        state = self.robot.get_state(arm_qpos=arm_qpos)
+
         # Keyboard
         kb = KeyboardHandler()
         kb.start()
         atexit.register(kb.stop)
 
         # Send the first target BEFORE the rate limiter to pre-warm the inner loop
-        first_cmd = self.traj.action_arm_joint[0].copy()
         self._arm_inner.set_target(first_cmd)
         self._rate_mgr = RateManager(self.replay_hz)  # reset timer after first send
 
         self._running = True
         error_count = 0
+        validate_fail_count = 0
         max_consecutive_errors = 10
         start_time = time.perf_counter()
         last_arm_cmd: np.ndarray | None = None
@@ -722,7 +833,9 @@ class TrajectoryReplayer:
                             self._emergency_stop()
                             break
                         continue
-                    state = self.robot.get_state(arm_qpos=arm_qpos)
+                    # Dynamics from inner-loop 50Hz readback → torque/temp gates
+                    arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()
+                    state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
                 except Exception as e:
                     error_count += 1
                     logger.warning("get_state exception at frame %d: %s", frame_idx, e)
@@ -752,11 +865,7 @@ class TrajectoryReplayer:
 
                 error_count = 0
 
-                # ── Send arm command ──
-                self._arm_inner.set_target(arm_cmd)
-                last_arm_cmd = arm_cmd
-
-                # ── Send hand command ──
+                # ── Build action ──
                 if self._hand_available and hand_cmd is not None:
                     action = RobotAction(
                         arm_qpos_cmd=arm_cmd,
@@ -767,6 +876,31 @@ class TrajectoryReplayer:
                         arm_qpos_cmd=arm_cmd,
                         hand_qpos_cmd=np.zeros(12, dtype=np.float64),
                     )
+
+                # ── Pre-send gate: torque/temp/soft-limit (autonomous replay →
+                #     repeated failures abort instead of pressing on) ──
+                action_valid, fail_reason = validate_action(
+                    self.robot,
+                    action,
+                    actual_arm_qpos=arm_qpos,
+                    actual_arm_tau=state.arm_tau,
+                    actual_arm_temps=arm_temps,
+                )
+                if not action_valid:
+                    validate_fail_count += 1
+                    print(f"  [SAFETY] Pre-send gate: {fail_reason} — skip frame ({validate_fail_count}/3)", flush=True)
+                    if validate_fail_count > 3:
+                        print("Pre-send gate failed repeatedly, emergency_stop")
+                        self._emergency_stop()
+                        break
+                    continue
+                validate_fail_count = 0
+
+                # ── Send arm command ──
+                self._arm_inner.set_target(action.arm_qpos_cmd)
+                last_arm_cmd = arm_cmd
+
+                # ── Send hand command ──
                 self.robot.send_action(action)
 
                 # ── Record ──
@@ -1002,7 +1136,7 @@ Examples:
                             p = _make_planner(args.arm_ip)
                             r = _make_robot(p, args.arm_ip)
                             if r.connect().get("arm"):
-                                new_inner = _do_return_home(r, p, replayer._arm_inner)
+                                new_inner = _do_return_home(r, p, replayer._arm_inner, arm_ip=args.arm_ip)
                                 replayer._arm_inner = new_inner
                             r.disconnect()
                         except Exception as exc:

@@ -296,6 +296,7 @@ class XHandRetargeter:
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
+        low_pass_alpha: float | None = None,
     ):
         self.hand_type = hand_type
         self.retargeting_type = retargeting_type
@@ -319,6 +320,11 @@ class XHandRetargeter:
         ]
 
         self.load_retargeter()
+
+        # Override the YAML low_pass_alpha (tuned at 50Hz) — callers running at a
+        # different control rate pass a tau-preserving value (utils.signal_utils).
+        if low_pass_alpha is not None:
+            self.low_pass_alpha = low_pass_alpha
 
     def load_retargeter(self):
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
@@ -387,7 +393,7 @@ class XHandRetargeter:
 
     @property
     def low_pass_alpha(self) -> float:
-        """Current LPFilter alpha (0.0 = disabled, 1.0 = no smoothing)."""
+        """Current LPFilter alpha (new-value weight: 1.0 = pass-through, →0 = freeze)."""
         return float(self.retargeter.filter.alpha)
 
     @low_pass_alpha.setter
@@ -395,12 +401,12 @@ class XHandRetargeter:
         """Tune the built-in EMA smoothing strength at runtime.
 
         dex_retargeting applies LPFilter after NLP optimisation, before returning
-        qpos.  Default from YAML config: 0.6 (new-value weight, i.e. 60 % new +
-        40 % old per frame at 50 Hz).
+        qpos: ``y += alpha * (x - y)`` — alpha is the NEW-value weight.
+        Default from YAML config: 0.6 (60 % new + 40 % old per frame at 50 Hz).
 
-        0.0 = pass-through (raw optimizer output)
+        1.0 = pass-through (raw optimizer output, no smoothing)
         0.6 = default (moderate smoothing)
-        1.0 = no smoothing (always use latest — equivalent to 0.0)
+        →0  = ever-stronger smoothing; 0.0 freezes the output entirely
         """
         self.retargeter.filter.alpha = float(value)
 

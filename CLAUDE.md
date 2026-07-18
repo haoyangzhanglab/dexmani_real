@@ -95,19 +95,23 @@ dexmani_real/          ← Python package root
 ├── docs/              ← Architecture docs, analysis notes
 ```
 
-## Key data flow (teleop loop @ 50 Hz)
+## Key data flow (decision/recording loop @ 16 Hz; ArmInnerLoop stays @ 50 Hz)
 
 ```
 VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compute_action()
             XHandRetargeter (landmarks→12-DOF) ──┘   ├─ arm: wrist pose → solve_teleop_ik
                                                       ├─ hand: MANO skeleton retargeting
                                                       │   → adaptive scaling → NLP optimize
-                                                      │   → LPFilter(alpha=0.6) EMA (dex_retargeting built-in)
-                                                      │   → delta clip(max_delta_rad=0.3) (XHand E3)
-                                                      ├─ arm: Cartesian EMA (ema_alpha_pos=0.8, ema_alpha_rot=0.4)
+                                                      │   → LPFilter EMA (dex_retargeting built-in; τ-invariant:
+                                                      │     0.6@50Hz → 0.943@16Hz, set via XHandRetargeter ctor)
+                                                      │   → delta clip (XHand E3; entry point derives
+                                                      │     deg2rad(90)/CTRL_HZ ≈ 0.098 rad/send @16Hz)
+                                                      ├─ arm: Cartesian EMA (production SHM path: 1.0/1.0
+                                                      │   pass-through — smoothing is Mode 6 firmware's job)
                                                       └─ arm IK anomaly jump-limit (default 90°, planning/ik.py)
                                                                    │
-RobotInterface.validate_action() ← pre-send gate (4 ops: error gate + connection gate + arm clip + hand clip)
+RobotInterface.validate_action() ← pre-send gate (error + connection + torque + temp + workspace clamp
+                                    + arm clip + hand clip; env_collision accepted but not wired)
 ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 50Hz inner loop (mode 6: passthrough, firmware trajectory planning)
 RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
         │
@@ -146,17 +150,18 @@ IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
 
 ## HDF5 recording format
 
-All streams are aligned to one `dt=1/50` time grid at record time (`TimestampAlignedBuffer`),
-keyed by `state.timestamp`; camera frames stream per-frame, index-aligned to the grid (per-slot forward-fill).
+All streams are aligned to one `dt=1/control_hz` time grid at record time (`TimestampAlignedBuffer`,
+16 Hz in production entry points; library default 50), keyed by `state.timestamp`; camera frames
+stream per-frame, index-aligned to the grid (per-slot forward-fill).
 
 ```
 episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collision
   /meta (group)
-    attrs: schema_version(=6), task_label, operator, tags, duration, fps, num_frames,
+    attrs: schema_version(=7), control_hz, task_label, operator, tags, duration, fps, num_frames,
            success, min_frames_met, has_camera, has_pointcloud, has_timestamps,
            camera_serial, camera_type, camera_K, camera_T_world_camera, camera_T_eef_camera,
            skip_initial_frames, control_mode, arm_mode, hand_mode,
-           arm_delta_clip, hand_delta_clip, hand_ema_alpha, hand_low_pass_alpha,
+           arm_delta_clip, hand_delta_clip, hand_max_qvel_deg_s, hand_ema_alpha, hand_low_pass_alpha,
            ema_alpha_pos, ema_alpha_rot,
            pc_num_points, pc_depth_min_m, pc_depth_max_m, pc_workspace, pc_voxel_size,
            pc_radius_outlier_min_points, pc_radius_outlier_radius, pc_fps_backend
@@ -173,7 +178,7 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
   /flag_ik_ok(T,)          bool — IK solved successfully
   /flag_retarget_ok(T,)    bool — retargeting converged
   /flag_held(T,)           bool — command held (no fresh VR/IK result)
-  /flag_camera_fresh(T,)   bool — a new camera frame arrived within 0.5s (False = frozen/forward-filled)
+  /flag_camera_fresh(T,)   bool — a new camera frame arrived within 0.2s (False = frozen/forward-filled)
   /vr_wrist_pos(T,3)       VR wrist position in base frame
   /vr_wrist_rot6d(T,6)     VR wrist orientation as 6D rotation
   /vr_landmarks(T,21,3)    VR hand landmarks (MANO convention)
@@ -181,7 +186,8 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
   /depth(T,H,W)            uint16 Z16 depth, L515 validity-gated (forward-filled to grid)
   /pointcloud(T,2048,6)    float32 world-frame [xyz, rgb 0-1] — computed online @30Hz in
                            CameraProcess (sensor/pointcloud_processor.py), forward-filled
-  /timestamp(T)            aligned grid timestamps (20ms spacing)
+  /timestamp(T)            raw sample timestamps on the dt grid (62.5ms spacing @16Hz;
+                           forward-filled slots repeat the previous raw value)
 ```
 - **RecordingSession** (`recording/recording_session.py`) — driver-agnostic: one writer thread
   serializes start/record/stop so the HDF5 file is touched by a single thread (no teardown race).
@@ -217,13 +223,16 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
 
 ## Safety architecture
 
-1. **Pre-send gate** (`validate_action()`): **4 operations** — robot error gate, arm connection gate,
-   arm joint-limit clip, hand joint-limit clip.
-   `env_collision_check` and `actual_arm_qpos` params are accepted but **not yet wired**.
-   Torque / current / temp / workspace / collision gating — hard prerequisite before autonomous policy rollouts.
+1. **Pre-send gate** (`validate_action()`): robot error gate, arm connection gate, **torque gate**,
+   **temperature gate** (both fed from ArmInnerLoop's 50Hz dynamics readback via `get_dynamics()`),
+   workspace clamp, arm joint-limit clip, hand joint-limit clip.
+   `env_collision_check` param is accepted but **not yet wired** — hard prerequisite before
+   autonomous policy rollouts.
 2. **IK-level**: workspace clamping, IK anomaly jump-limit (arm: 90° default, `planning/ik.py:140`)
-3. **Hand command-level**: delta clip (E3, `max_delta_rad=0.3` per-step hard gate) + optional EMA (E2, `XHandConfig.ema_alpha`)
-4. **Retargeting-level**: built-in LPFilter EMA (`low_pass_alpha=0.6`, dex_retargeting `SeqRetargeting.retarget()`)
+3. **Hand command-level**: delta clip (E3 per-send hard gate; production entry derives
+   `deg2rad(90)/CTRL_HZ` ≈ 0.098 rad @16Hz, library default 0.3) + optional EMA (E2, `XHandConfig.ema_alpha`)
+4. **Retargeting-level**: built-in LPFilter EMA (dex_retargeting `SeqRetargeting.retarget()`;
+   τ-invariant `low_pass_alpha` 0.6@50Hz → 0.943@16Hz via ctor)
 5. **Path execution**: torque monitoring per waypoint, collision verification (self + env + desk FK)
 6. **Desk safety**: `FingertipDeskSafety` — FK-based fingertip Z check (complements MPlib point cloud)
 7. **Emergency stop**: `RobotInterface.emergency_stop()` → arm.stop() + hand.stop()

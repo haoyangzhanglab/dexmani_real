@@ -50,6 +50,7 @@ from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
+from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
@@ -200,6 +201,19 @@ def do_return_home(
 
 
 # ═══════════════════════════════════════════════ 主循环
+
+
+def record_held_frame(recorder, state, hold_arm, vr_frame, *, ik_ok: bool) -> None:
+    """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags (防止回填伪造 ik_ok/held)."""
+    if vr_frame is None:  # VR 过期/丢失 — NaN 位姿如实标记无数据
+        vr_frame = {
+            "wrist_pos": np.full(3, np.nan),
+            "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+            "landmarks": np.full((21, 3), np.nan),
+        }
+    hand = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
+    action = RobotAction(arm_qpos_cmd=hold_arm, hand_qpos_cmd=hand)
+    recorder.add_frame(state, action, vr_frame, signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True})
 
 
 def main():
@@ -548,7 +562,9 @@ def main():
                         break
                     continue
 
-                state = robot.get_state(arm_qpos=arm_qpos)
+                # 内环 50Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
+                arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
+                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -645,12 +661,17 @@ def main():
                         print("  ⚠ VR 帧过期，保持当前位置")
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None  # 重置笛卡尔 EMA, 恢复时无跳变
+                if recording_active:
+                    record_held_frame(recorder, state, prev_qpos_cmd.copy(), vr_frame, ik_ok=True)
                 continue
 
             # ── VR wrist → EEF target pose ──
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
                 ik_method = "no_map"
+                if recording_active:
+                    hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    record_held_frame(recorder, state, hold_arm, vr_frame, ik_ok=True)
                 continue
 
             target_pos = mapped["pos"]
@@ -700,15 +721,14 @@ def main():
 
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
+                if recording_active:
+                    hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    record_held_frame(recorder, state, hold_arm, vr_frame, ik_ok=False)
                 continue
 
             ik_method = "ok"
             # 平滑已在 IK 前 (笛卡尔 EMA) 完成, IK 输出直接下发
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
-            prev_qpos_cmd = arm_cmd.copy()
-
-            # ── Send to ArmInnerLoop ──
-            arm_inner.set_target(arm_cmd)
 
             # ── Hand: hold position (skip if hand unavailable) ──
             if hand_available:
@@ -722,11 +742,32 @@ def main():
                 target_eef_pos=target_pos.copy(),
                 target_eef_rot6d=quat_wxyz_to_rot6d(target_quat),
             )
+
+            # ── Pre-send gate: 力矩/温度/软限位 (与 controller.py:346 一致) ──
+            action_valid, fail_reason = validate_action(
+                robot,
+                action,
+                actual_arm_qpos=arm_qpos,
+                actual_arm_tau=state.arm_tau,
+                actual_arm_temps=arm_temps,
+            )
+            if not action_valid:
+                print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
+                if recording_active:
+                    hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    record_held_frame(recorder, state, hold_arm, vr_frame, ik_ok=True)
+                continue
+
+            prev_qpos_cmd = arm_cmd.copy()  # only after gate passes (held frames use last-good command)
+
+            # ── Send to ArmInnerLoop ──
+            arm_inner.set_target(action.arm_qpos_cmd)
             robot.send_action(action)  # hand only (arm is via inner loop)
 
             # ── 录制帧 ──
             if recording_active:
-                if not recorder.add_frame(state, action, vr_frame):
+                sig = {"ik_ok": True, "retarget_ok": True, "held": False}
+                if not recorder.add_frame(state, action, vr_frame, signals=sig):
                     # max_frames reached or error
                     if recorder.max_frames_reached:
                         print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")

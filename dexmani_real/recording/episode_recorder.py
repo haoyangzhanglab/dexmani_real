@@ -1,7 +1,7 @@
 """EpisodeRecorder — HDF5-based teleoperation data recorder.
 
-Single write path: state/action/vr streams are aligned to a fixed dt=20ms time
-grid at record time (TimestampAlignedBuffer) and flushed to HDF5 in bulk at
+Single write path: state/action/vr streams are aligned to a fixed dt=1/control_hz
+time grid at record time (TimestampAlignedBuffer) and flushed to HDF5 in bulk at
 stop_episode(); camera frames are streamed per-frame but kept length-aligned to
 the same grid, so every dataset is index-aligned by construction.
 """
@@ -27,9 +27,9 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 6  # v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
+SCHEMA_VERSION = 7  # v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
 
-CAMERA_FRESH_TIMEOUT_S = 0.5  # flag_camera_fresh: max age of the last *new* camera frame
+CAMERA_FRESH_TIMEOUT_S = 0.2  # flag_camera_fresh: max age of the last *new* camera frame (~6 frames @30fps)
 
 
 class EpisodeRecorder:
@@ -42,10 +42,16 @@ class EpisodeRecorder:
         self,
         data_dir: str,
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
+        control_hz: float = 50.0,
+        min_frames: int = 50,
     ) -> None:
+        if control_hz <= 0:
+            raise ValueError(f"control_hz must be positive, got {control_hz}")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.max_frames = max_frames
+        self.control_hz = float(control_hz)
+        self.min_frames = int(min_frames)
 
         self._file: h5py.File | None = None
         self._frame_count: int = 0
@@ -57,7 +63,7 @@ class EpisodeRecorder:
 
         # Record-time aligned buffer for non-camera streams + periodic flush.
         self._buffer: TimestampAlignedBuffer | None = None
-        self._flush_interval: int = 500  # frames (~10s at 50Hz)
+        self._flush_interval: int = max(1, int(round(10.0 * self.control_hz)))  # frames (~10s)
         self._flushed_frames: int = 0
 
         # Skip the first N add_frame() calls per episode (begin-transition noise).
@@ -98,7 +104,6 @@ class EpisodeRecorder:
         # Pending async stop_episode thread (None = no pending stop).
         # Guarded by start_episode() to prevent overlapping episodes.
         self._stop_thread: threading.Thread | None = None
-
 
     @property
     def is_recording(self) -> bool:
@@ -175,12 +180,17 @@ class EpisodeRecorder:
 
         # Defer HDF5 creation to the first camera frame / stop_episode();
         # start the record-time aligned buffer for non-camera streams.
-        dt = 1.0 / 50.0
+        dt = 1.0 / self.control_hz
         buffer_steps = self.max_frames + 100  # margin for grid-boundary alignment
         self._buffer = TimestampAlignedBuffer(
             start_time=self._start_time,
             dt=dt,
             max_record_steps=buffer_steps,
+            # Ticks fire on slot boundaries (absolute-deadline RateManager), so
+            # samples land at k*dt ± scheduling jitter relative to the first-frame
+            # anchor.  eps=0.5 → round-to-nearest slot: absorbs ±dt/2 jitter
+            # instead of dup-dropping samples that land marginally early.
+            eps=0.5,
         )
         self._file = None
         self._start_cam_writer()
@@ -193,7 +203,8 @@ class EpisodeRecorder:
         meta.attrs["operator"] = p.get("operator", "")
         tags = p.get("tags")
         meta.attrs["tags"] = ",".join(tags) if tags else ""
-        meta.attrs["fps"] = 50.0
+        meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
+        meta.attrs["fps"] = self.control_hz
 
         calib = p.get("calib")
         camera_name = p.get("camera_name")
@@ -473,7 +484,7 @@ class EpisodeRecorder:
                         data=depth[np.newaxis, ...],
                         maxshape=(None,) + depth.shape,
                         chunks=True,
-                        dtype=depth.dtype,
+                        dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,  # Z16 guard
                         compression="gzip",
                         compression_opts=1,
                     )
@@ -611,6 +622,12 @@ class EpisodeRecorder:
         self._stop_thread = t
         return path
 
+    def join_stop(self, timeout: float = 10.0) -> None:
+        """Wait for the background stop daemon to finish (HDF5 fully written + closed)."""
+        if self._stop_thread is not None and self._stop_thread.is_alive():
+            self._stop_thread.join(timeout=timeout)
+            self._stop_thread = None
+
     def _stop_episode_impl(self, success: bool) -> None:
         """Background: flush buffers, forward-fill cameras, write meta, close HDF5."""
         duration = time.perf_counter() - (self._start_time or 0.0)
@@ -679,8 +696,8 @@ class EpisodeRecorder:
                 meta.attrs["duration"] = duration
                 meta.attrs["num_frames"] = self._frame_count
                 meta.attrs["success"] = success
-                meta.attrs["fps"] = self._frame_count / duration if duration > 0 else 50.0
-                meta.attrs["min_frames_met"] = self._frame_count >= 50
+                meta.attrs["fps"] = self._frame_count / duration if duration > 0 else self.control_hz
+                meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
                 meta.attrs["has_camera"] = "rgb" in self._file
                 meta.attrs["has_pointcloud"] = "pointcloud" in self._file
                 meta.attrs["has_timestamps"] = "timestamp" in self._file

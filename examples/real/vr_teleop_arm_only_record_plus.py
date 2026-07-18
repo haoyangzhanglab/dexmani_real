@@ -3,7 +3,7 @@
 
 在 vr_teleop_arm_only 基础上加入最小录制: 只录 5 路 —
 RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
-写入 episodes_arm/episode_YYYYMMDD_HHMMSS.h5 (所有流对齐到固定 50Hz 时间栅格)。
+写入 episodes_arm/episode_YYYYMMDD_HHMMSS.h5 (所有流对齐到固定 CTRL_HZ 时间栅格)。
 
 plus 变体额外集成 assets/audio/ 下的预录制中文 TTS 语音提示，
 每个状态转换（开始/暂停/恢复/保存/丢弃/归位/急停/标定）均有语音反馈。
@@ -13,7 +13,7 @@ plus 变体额外集成 assets/audio/ 下的预录制中文 TTS 语音提示，
 
 架构:
     Meta Quest (HTS app) ──TCP──→ VRReceiverProcess ──SharedMemory──→ 主循环
-                                     (独立进程, 隔离 HTS SDK)          (主进程, 50Hz)
+                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 50Hz)
 
 用法:
     # 1. Quest USB 有线: adb reverse tcp:8000 tcp:8000
@@ -61,12 +61,13 @@ from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
+from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.sensor.camera_process import CameraProcess, CameraProcessConfig
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
-from dexmani_real.utils.rate_limiter import RateLimiter
-from dexmani_real.utils.signal_utils import ema_smooth_pose
+from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.signal_utils import alpha_from_tau, ema_smooth_pose, tau_from_alpha
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.control.audio_feedback import AudioFeedback
 
@@ -150,7 +151,12 @@ class TrajectoryLogger:
 
 # ═══════════════════════════════════════════════ 配置
 
-CTRL_DT = 0.02           # 50Hz
+# ── 控制频率: 单点定义, 其余常量全部由此派生 ──
+# 决策/录制 @ CTRL_HZ; 臂内环保持 50Hz (Mode 6 固件在线规划, 直发无插值)。
+CTRL_HZ = 16.0
+CTRL_DT = 1.0 / CTRL_HZ
+REF_HZ = 50.0            # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
+STATUS_EVERY = int(round(1.0 * CTRL_HZ))  # 状态打印节流 (~1Hz)
 HOME_DT = 0.04           # 归位 waypoint 间隔 (s)
 
 WORKSPACE_BOUNDS = np.array([
@@ -172,8 +178,9 @@ VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
 # 笛卡尔位姿 EMA 平滑 (IK 前, 唯一平滑级, 匹配 sim TeleopPipeline)
-EMA_ALPHA_POS = 0.6
-EMA_ALPHA_ROT = 0.3
+# 0.6/0.3 @50Hz 调参 → τ 不变换算到 CTRL_HZ (≈0.94/0.67 @16Hz)
+EMA_ALPHA_POS = alpha_from_tau(tau_from_alpha(0.6, 1.0 / REF_HZ), CTRL_DT)
+EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 
 # Mode 6 online trajectory planning (default) — no inner-loop interpolation,
 # firmware trajectory planner respects speed/accel limits (90°/s, 500°/s²).
@@ -214,6 +221,21 @@ def do_return_home(
 # ═══════════════════════════════════════════════ 主循环
 
 
+def record_held_frame(recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool) -> None:
+    """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags (防止回填伪造 ik_ok/held)."""
+    if vr_frame is None:  # VR 过期/丢失 — NaN 位姿如实标记无数据
+        vr_frame = {
+            "wrist_pos": np.full(3, np.nan),
+            "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+            "landmarks": np.full((21, 3), np.nan),
+        }
+    hand = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
+    action = RobotAction(arm_qpos_cmd=hold_arm, hand_qpos_cmd=hand)
+    recorder.add_frame(
+        state, action, vr_frame, camera_frame=cam, signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True}
+    )
+
+
 def main():
     print("=" * 60)
     print("VR 遥操作 xArm7 (仅机械臂)")
@@ -252,6 +274,8 @@ def main():
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
+            # 1°/frame @50Hz — 换算保持 °/s 不变
+            nullspace_step_size_deg=1.0 * (REF_HZ / CTRL_HZ),
         ),
     )
 
@@ -332,7 +356,12 @@ def main():
     )
 
     # ── 7. Recorder ──
-    recorder = EpisodeRecorder(data_dir="episodes_arm", max_frames=3000)
+    recorder = EpisodeRecorder(
+        data_dir="episodes_arm",
+        max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
+        control_hz=CTRL_HZ,
+        min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
+    )
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
     traj_logger = TrajectoryLogger()
@@ -341,7 +370,7 @@ def main():
     _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
 
     # ── 7c. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
-    stage_timer = StageTimer(window=50)
+    stage_timer = StageTimer(window=STATUS_EVERY)
 
     # ── 8. Keyboard ──
     kb = KeyboardHandler()
@@ -397,7 +426,7 @@ def main():
     print("等待按键 B 开始遥操作...\n")
 
     # ── 11. Main loop ──
-    limiter = RateLimiter(1.0 / CTRL_DT)
+    limiter = RateManager(CTRL_HZ)  # 绝对期限调度 — tick 锁定录制时间栅格
     running = True
     teleop_active = False
     recording_active = False
@@ -419,7 +448,15 @@ def main():
                 if path:
                     print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
-                recorder.stop_episode(success=False)
+                path = recorder.stop_episode(success=False)
+                recorder.join_stop()
+                if path:
+                    h5 = Path(path)
+                    h5.unlink(missing_ok=True)
+                    # 同时清理侧车文件 (trajectory .npz, sidecar .json)
+                    h5.with_suffix(".npz").unlink(missing_ok=True)
+                    h5.with_suffix(".json").unlink(missing_ok=True)
+                    print(f"  录制已丢弃: {h5.name}")
             recording_active = False
 
     def _emergency_stop():
@@ -499,7 +536,16 @@ def main():
                                 if post_sig == ControlSignal.DISCARD:
                                     decision = False
                                     break
+                                if post_sig == ControlSignal.EMERGENCY_STOP:
+                                    audio.play("emergency")
+                                    _emergency_stop()
+                                    running = False
+                                    decision = None  # 跳过后续保存/丢弃逻辑
+                                    break
                             if decision is not None:
+                                break
+                            # 如果急停已触发, 退出确认循环
+                            if not running:
                                 break
 
                         if decision is True:
@@ -510,10 +556,12 @@ def main():
                             audio.play("discard")
                             _stop_recording(save=False)
                             print("  已丢弃")
-                        else:
+                        elif running:
+                            # 超时（非急停中断），默认丢弃
                             audio.play("discard")
                             _stop_recording(save=False)
                             print("  超时，默认丢弃")
+                        # else: 急停已接管，跳过二次处理
                     else:
                         _stop_recording(save=False)
 
@@ -592,6 +640,7 @@ def main():
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
                         camera_name="camera_0" if calib is not None else None,
+                        camera_K=camera.camera_K if camera is not None else None,
                         record_config=camera.pointcloud_meta if camera is not None else None,
                     )
                     recording_active = True
@@ -649,7 +698,9 @@ def main():
                         break
                     continue
 
-                state = robot.get_state(arm_qpos=arm_qpos)
+                # 内环 50Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
+                arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
+                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -699,11 +750,24 @@ def main():
             vr_stale = vr_frame is None or (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > VR_STALE_THRESHOLD_S * 1e9
             stage_timer.mark("vr")
 
+            # ── 相机帧: 从共享内存读取最新帧 (零拷贝, 不区分是否录制) ──
+            # 提前到 held 帧录制点之前, 暂停/失败帧也带真实相机数据.
+            cam = camera.poll_latest_frame() if camera is not None else None
+            if cam is not None:
+                now_mono = time.monotonic()
+                if cam["frame_number"] != cam_last_fn:
+                    cam_last_fn = cam["frame_number"]
+                    cam_last_change_t = now_mono
+                elif cam_last_change_t is not None and now_mono - cam_last_change_t > 1.0:
+                    if loop_count % STATUS_EVERY == 0:  # 1 Hz, 与 VR 过期告警一致
+                        print(f"  ⚠ 相机帧已停止更新 {now_mono - cam_last_change_t:.1f}s — 数据可能冻结")
+            stage_timer.mark("cam")
+
             # ── Periodic status ──
-            if loop_count % 50 == 0:
+            if loop_count % STATUS_EVERY == 0:
                 elapsed = time.perf_counter() - start_time
                 if prev_eef_pos is not None:
-                    vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (50 * CTRL_DT)
+                    vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (STATUS_EVERY * CTRL_DT)
                 else:
                     vel = 0.0
                 prev_eef_pos = state.eef_pos.copy()
@@ -755,16 +819,21 @@ def main():
                     # No action needed — hold current arm position via inner loop
                     pass
                 elif vr_stale:
-                    if loop_count % 50 == 0:
+                    if loop_count % STATUS_EVERY == 0:
                         print("  ⚠ VR 帧过期，保持当前位置")
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None  # 重置笛卡尔 EMA, 恢复时无跳变
+                if recording_active:
+                    record_held_frame(recorder, state, prev_qpos_cmd.copy(), vr_frame, cam, ik_ok=True)
                 continue
 
             # ── VR wrist → EEF target pose ──
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
                 ik_method = "no_map"
+                if recording_active:
+                    hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    record_held_frame(recorder, state, hold_arm, vr_frame, cam, ik_ok=True)
                 continue
 
             target_pos = mapped["pos"]
@@ -816,15 +885,14 @@ def main():
 
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
+                if recording_active:
+                    hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    record_held_frame(recorder, state, hold_arm, vr_frame, cam, ik_ok=False)
                 continue
 
             ik_method = "ok"
             # 平滑已在 IK 前 (笛卡尔 EMA) 完成, IK 输出直接下发
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
-            prev_qpos_cmd = arm_cmd.copy()
-
-            # ── Send to ArmInnerLoop ──
-            arm_inner.set_target(arm_cmd)
 
             # ── Hand: hold position (skip if hand unavailable) ──
             if hand_available:
@@ -838,20 +906,28 @@ def main():
                 target_eef_pos=target_pos.copy(),
                 target_eef_rot6d=quat_wxyz_to_rot6d(target_quat),
             )
+
+            # ── Pre-send gate: 力矩/温度/软限位 (与 controller.py:346 一致) ──
+            action_valid, fail_reason = validate_action(
+                robot,
+                action,
+                actual_arm_qpos=arm_qpos,
+                actual_arm_tau=state.arm_tau,
+                actual_arm_temps=arm_temps,
+            )
+            if not action_valid:
+                print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
+                if recording_active:
+                    hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    record_held_frame(recorder, state, hold_arm, vr_frame, cam, ik_ok=True)
+                continue
+
+            prev_qpos_cmd = arm_cmd.copy()  # only after gate passes (held frames use last-good command)
+
+            # ── Send to ArmInnerLoop ──
+            arm_inner.set_target(action.arm_qpos_cmd)
             robot.send_action(action)  # hand only (arm is via inner loop)
             stage_timer.mark("send")
-
-            # ── 相机帧: 从共享内存读取最新帧 (零拷贝, 不区分是否录制) ──
-            cam = camera.poll_latest_frame() if camera is not None else None
-            if cam is not None:
-                now_mono = time.monotonic()
-                if cam["frame_number"] != cam_last_fn:
-                    cam_last_fn = cam["frame_number"]
-                    cam_last_change_t = now_mono
-                elif cam_last_change_t is not None and now_mono - cam_last_change_t > 1.0:
-                    if loop_count % 50 == 0:  # 1 Hz, 与 VR 过期告警一致
-                        print(f"  ⚠ 相机帧已停止更新 {now_mono - cam_last_change_t:.1f}s — 数据可能冻结")
-            stage_timer.mark("cam")
 
             # ── 录制帧 ──
             if recording_active:

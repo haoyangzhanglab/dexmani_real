@@ -5,9 +5,9 @@
   2. no_nan_action  — actions contain no NaN values
   3. non_zero_variance — each dimension has variance > epsilon
   4. camera_fresh   — camera frames are non-all-zero (if camera data present)
-  5. min_frames     — episode has >= 50 frames
+  5. min_frames     — episode has >= min_frames frames (default 50 ≙ 1s @50Hz)
   6. no_duplicate_frames  — no consecutive identical frames (stuck sensor)
-  7. timestamp_monotonic  — timestamps strictly increasing
+  7. timestamp_monotonic  — timestamps non-decreasing (duplicates = forward-fill)
   8. camera_stall   — <=10% of frames with stale (frozen) camera data
 
 The actual total varies per episode depending on which data streams are present.
@@ -217,7 +217,11 @@ class DataValidator:
         )
 
     def _check_timestamp_monotonicity(self, f: h5py.File) -> ValidationCheck:
-        """Check that timestamps are strictly increasing (no time regressions)."""
+        """Check that timestamps never regress (non-decreasing).
+
+        Duplicates are allowed: forward-filled grid slots (overrun ticks) share
+        the previous raw timestamp by design — only a backwards jump is a fault.
+        """
         if "timestamp" not in f:
             return ValidationCheck(
                 name="timestamp_monotonic", passed=True,
@@ -230,13 +234,14 @@ class DataValidator:
                 detail="Too few timestamps for check.",
             )
         diffs = np.diff(ts)
-        n_non_increasing = int(np.sum(diffs <= 0))
-        ok = n_non_increasing == 0
+        n_regressions = int(np.sum(diffs < 0))
+        n_duplicates = int(np.sum(diffs == 0))
+        ok = n_regressions == 0
         return ValidationCheck(
             name="timestamp_monotonic",
             passed=ok,
-            detail=f"{n_non_increasing} non-increasing timestamps"
-            if not ok else "Timestamps strictly increasing."
+            detail=f"{n_regressions} backwards timestamps"
+            if not ok else f"Timestamps non-decreasing ({n_duplicates} forward-filled duplicates)."
         )
 
     def _check_camera_stall(self, f: h5py.File) -> ValidationCheck:

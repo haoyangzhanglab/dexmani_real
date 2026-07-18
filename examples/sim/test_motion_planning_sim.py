@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Workspace 随机采样 — 测试 Planner 路径规划（仿真模型 + SAPIEN 可视化）。
+"""Pick-and-Place episode loop (仿真模型 + SAPIEN 可视化) — sim-to-real 验证。
+
+通过随机目标物位姿的连续抓取-放置 episode 验证规划/IK/碰撞检测管线的
+端到端可靠性与 sim-to-real 一致性。
 
 用法:
     conda activate real
-    python examples/sim/test_motion_planning_sim.py
+    python examples/sim/test_motion_planning_sim.py [--headless] [--seed SEED] [--episodes N]
 
-修改顶部常量控制测试。
+本文件还保留了 ~1000 行未被 main() 调用的参考代码 (ik_test, plan_and_execute,
+return_to_home_sim, sweep_z_min 等) — 这些函数提供 IK 成功率统计、单路径规划
+执行、归位测试、z_min 扫描等独立测试能力, 可供手动调用或重组。
 
-测试流程:
-    1. 随机采样 N 个 EEF 位姿（位置+姿态），plan_path → 执行 → 验证
-    2. return_home: plan_path(home_eef) + 关节归位（含碰撞检测）
-    3. IK 独立测试：solve_ik() 成功率 + FK 往返误差
+真机对应入口: examples/real/test_motion_planning_real.py (按序跑 Test1-Test5:
+solve_ik, solve_teleop_ik, plan_path, 硬件执行, IK 自碰撞)
 """
 
 from __future__ import annotations

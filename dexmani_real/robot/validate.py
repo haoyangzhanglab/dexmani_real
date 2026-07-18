@@ -42,9 +42,14 @@ def validate_action(
     All new parameters are optional — None skips the check (backward
     compatible with existing call sites).
     """
-    # 1. Hardware error state
-    if robot.is_error():
-        return False, "robot error state"
+    # 1. Hardware error state — hand errors gate only when the hand is connected:
+    #    arm-only / degraded mode must not fail because XHand.is_error() is True
+    #    for a merely-absent hand (xhand.py:395).  connected_flag (not
+    #    is_connected()) so a connected-then-errored hand is still caught.
+    if robot.arm.is_error():
+        return False, "arm error state"
+    if robot.hand.connected_flag and robot.hand.error_state:
+        return False, "hand error state"
 
     # 2. Arm connection
     if not robot.arm.is_connected():

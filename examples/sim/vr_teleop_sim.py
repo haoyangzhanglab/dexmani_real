@@ -102,19 +102,19 @@ from dexmani_real.simulation import execute_dense_path, settle_at_target
 # 模块常量
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CTRL_HZ = 50.0                     # 与 TeleopControllerConfig.target_hz 一致
+CTRL_HZ = 16.0                     # 与真机 vr_teleop_shm.py 一致 (16Hz 直通 EMA)
 CTRL_DT = 1.0 / CTRL_HZ
 PHYSICS_STEPS_PER_WP = 20
-PHYSICS_STEPS_PER_TICK = 5          # 240Hz → 48Hz effective
+PHYSICS_STEPS_PER_TICK = 15          # 240Hz / 16Hz ≈ 15
 INTERP_MAX_STEP_RAD = np.deg2rad(2.0)
 VR_FRAME_MAX_AGE_S = 0.2            # 仿真容忍度高于真机（0.1s）：dummy VR 无网络延迟
 DEFAULT_DATA_DIR = "./episodes"
 
-# 工作空间边界（world frame，与 RobotInterfaceConfig 默认值保持一致）
+# 工作空间边界（world frame，与 RobotInterfaceConfig 默认值严格一致: types.py:136-138）
 WORKSPACE_BOUNDS = np.array([
-    [0.27, 0.70],   # x [min, max] m
-    [-0.40, 0.40],  # y [min, max] m
-    [0.02, 0.55],   # z [min, max] m
+    [0.28, 0.72],   # x [min, max] m
+    [-0.45, 0.45],  # y [min, max] m
+    [0.05, 0.50],   # z [min, max] m
 ])
 
 # ArmWristMapper EEF delta 边界（robot base frame）
@@ -292,29 +292,21 @@ def capture_camera_frame(
             return None
         rgb = (color[..., :3].clip(0, 1) * 255).astype(np.uint8)
 
-        pos = cam.get_picture("Position")  # (H, W, 4) float32
+        pos = cam.get_picture("Position")  # (H, W, 4) float32, camera-frame (OpenGL: cam looks along -Z)
         if pos is None:
             return None
 
-        cam_entity = cam.get_entity()
-        if cam_entity is None:
-            return None
-        cam_pose = cam_entity.get_pose()
-        cam_pos_world = np.asarray(cam_pose.p, dtype=np.float64)
-        cam_rot_world = np.asarray(
-            cam_pose.to_transformation_matrix()[:3, :3], dtype=np.float64,
-        )
-
-        world_xyz = np.asarray(pos[..., :3], dtype=np.float64)
-        cam_rel = world_xyz - cam_pos_world
-        cam_z_axis = cam_rot_world[:, 2]
-        depth = np.abs(np.dot(cam_rel, cam_z_axis))
-        depth = np.where(np.all(world_xyz == 0, axis=-1), np.nan, depth)
-        depth = depth.astype(np.float32)
+        # SAPIEN "Position" texture is in camera/view space, not world space.
+        # OpenGL convention: camera looks along -Z → positive depth = -pos_z.
+        pos_xyz = np.asarray(pos[..., :3], dtype=np.float64)
+        depth_m = np.float64(0.0) - pos_xyz[..., 2]  # camera-frame depth in meters
+        # Background pixels: SAPIEN returns (0,0,0,1); mask them to 0.
+        depth_m = np.where(np.all(pos_xyz == 0.0, axis=-1), 0.0, depth_m)
+        depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)  # Z16 mm (matches L515)
 
         return {
             "rgb": rgb,
-            "depth": depth,
+            "depth": depth_mm,
             "timestamp": time.perf_counter(),
         }
     except (RuntimeError, ValueError, AttributeError) as e:
@@ -451,6 +443,7 @@ def main() -> None:
         teleop_profile=TeleopProfile(
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
+            nullspace_step_size_deg=1.0 * (50.0 / CTRL_HZ),  # 保持 °/s 不变: 1°/frame@50Hz → 3.125°/frame@16Hz
         ),
     )
 
@@ -490,8 +483,8 @@ def main() -> None:
     # ── TeleopPipeline (shared action computation with real controller) ──
     pipeline = TeleopPipeline(
         arm_mapper, hand_retargeter, planner,
-        ema_alpha_pos=0.8,
-        ema_alpha_rot=0.4,  # Cartesian EMA (pos=low latency, rot=strong de-jitter)
+        ema_alpha_pos=1.0,
+        ema_alpha_rot=1.0,  # Cartesian EMA passthrough (与真机一致; 平滑由 Mode 6 固件负责)
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──
@@ -663,6 +656,7 @@ def main() -> None:
                                 episode_idx += 1
                                 collection.start_episode(
                                     camera_K=camera_K,
+                                    depth_scale=0.001,  # sim Z16 = 1mm/LSB (vs L515's 0.00025)
                                 )
                                 state = "TELEOP_RECORDING"
                                 ik_fail_total = 0
@@ -878,12 +872,15 @@ def main() -> None:
                                 robot_action = build_robot_action(
                                     arm_cmd, hand_cmd,
                                 )
+                                ik = bool(status["ik_ok"])
+                                rt_ok = bool(status["retarget_ok"])
                                 collection.record_frame(
                                     state=robot_state,
                                     action=robot_action,
                                     vr_frame=frame,
                                     camera_frame=camera_frame,
                                     T_base_eef=T_base_eef,
+                                    signals={"ik_ok": ik, "retarget_ok": rt_ok, "held": not (ik and rt_ok)},
                                 )
                             except (ValueError, OSError) as e:
                                 print(f"[Recorder] record_frame 失败: {e}")

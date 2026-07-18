@@ -54,9 +54,11 @@ class ArmInnerLoopConfig:
                        trajectory planner. Default 500°/s² (≈8.73 rad/s²).
         loop_period: Inner loop period in seconds. Default 0.02 (50Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
-        max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad/step
-                         (~17°/step, ~15 rad/s ceiling at 50Hz). Mirrors XHand E3.
-                         Set 0 to disable. Complements Mode 6 firmware speed limiting.
+        max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad per
+                         inner-loop step (~17°, ~15 rad/s ceiling at 50Hz). Mirrors
+                         XHand E3. Set 0 to disable. Headroom over a normal target
+                         step depends on the OUTER loop rate (see max_joint_delta
+                         comment below).
         speed_ramp_frames: Number of frames for soft-start speed ramp. Default 20
                            frames (0.4s at 50Hz). Speed linearly ramps from
                            speed_ramp_min → joint_max_speed. Set 0 to disable.
@@ -73,8 +75,11 @@ class ArmInnerLoopConfig:
     target_timeout_s: float = 0.2
 
     # Per-step delta clamp — safety ceiling against IK solver anomalies.
-    # Mirrors XHand E3 (XHandConfig.max_delta_rad).  0.3 rad/step gives ~10x
-    # headroom over normal operation (1.57 rad/s / 50 Hz ≈ 0.03 rad/step).
+    # Mirrors XHand E3 (XHandConfig.max_delta_rad).  A normal target step is
+    # joint_max_speed / outer_loop_hz: ≈0.03 rad @50Hz outer (~10x headroom),
+    # ≈0.098 rad @16Hz outer (~3x headroom).  Note the inner loop re-sends the
+    # same target every 20ms, so a single anomalous target is chased at up to
+    # 0.3 rad per inner step until it times out (target_timeout_s).
     max_joint_delta: float = 0.3
 
     # Soft-start speed ramp — prevents abrupt motion on teleop engagement.
@@ -141,6 +146,11 @@ class ArmInnerLoop:
         self._arm_target: np.ndarray | None = None
         self._target_ts: float = 0.0
         self._arm_qpos: np.ndarray = np.zeros(7, dtype=np.float64)
+        # Dynamics from the 50Hz readback (NaN until first valid read) — consumed
+        # by the outer loop for recording + torque/temperature pre-send gates.
+        self._arm_qvel: np.ndarray = np.full(7, np.nan, dtype=np.float64)
+        self._arm_tau: np.ndarray = np.full(7, np.nan, dtype=np.float64)
+        self._arm_temps: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._error_state: bool = False
         self._last_sent_target: np.ndarray | None = None  # for per-step delta clamp
         self._ramp_step: int = 0  # for soft-start speed ramp
@@ -167,6 +177,15 @@ class ArmInnerLoop:
     def get_state(self) -> tuple[np.ndarray, bool, float]:
         with self._lock:
             return self._arm_qpos.copy(), self._error_state, self._target_ts
+
+    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Latest (qvel, tau, temps) from the 50Hz readback — NaN until first valid read.
+
+        The inner loop owns the sole XArmAPI connection, so the outer loop must
+        source dynamics here instead of calling the SDK (avoids connection contention).
+        """
+        with self._lock:
+            return self._arm_qvel.copy(), self._arm_tau.copy(), self._arm_temps.copy()
 
     @property
     def is_ready(self) -> bool:
@@ -335,7 +354,7 @@ class ArmInnerLoop:
 
                 # ── 4. Read current joint state ──
                 try:
-                    code, states = arm.get_joint_states(is_radian=True, num=2)
+                    code, states = arm.get_joint_states(is_radian=True, num=3)
                 except (RuntimeError, OSError) as e:
                     logger.error("ArmInnerLoop: get_joint_states failed: %s", e)
                     with self._lock:
@@ -386,6 +405,19 @@ class ArmInnerLoop:
                     v = np.asarray(states[1], dtype=np.float64)
                     if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
                         self._qvel_inf = float(np.max(np.abs(v[:7])))
+                        with self._lock:
+                            self._arm_qvel = v[:7].copy()
+                if len(states) > 2:
+                    tau = np.asarray(states[2], dtype=np.float64)
+                    if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
+                        with self._lock:
+                            self._arm_tau = tau[:7].copy()
+                temps = getattr(arm, "temperatures", None)
+                if temps is not None:
+                    t = np.asarray(temps, dtype=np.float64).ravel()
+                    if t.shape[0] >= 7 and np.all(np.isfinite(t[:7])):
+                        with self._lock:
+                            self._arm_temps = t[:7].copy()
 
                 # ── 4b. Passive tracking-error + mode monitor (no command change) ──
                 self._monitor(arm, current_qpos)
@@ -464,8 +496,9 @@ class ArmInnerLoop:
         firmware handles all trajectory smoothing.
         """
         # ── Per-step joint delta clamp (mirrors XHand E3) ──
-        # Safety ceiling against IK solver anomalies.  Normal per-step delta is
-        # ~0.03 rad (1.57 rad/s ÷ 50 Hz); 0.3 rad default gives ~10x headroom.
+        # Safety ceiling against IK solver anomalies.  A normal target step is
+        # joint_max_speed ÷ outer_loop_hz (≈0.03 rad @50Hz outer, ≈0.098 rad
+        # @16Hz outer); the 0.3 rad default gives ~10x / ~3x headroom respectively.
         clamped = target[:7].copy()
         if self._cfg.max_joint_delta > 0 and self._last_sent_target is not None:
             delta = clamped - self._last_sent_target

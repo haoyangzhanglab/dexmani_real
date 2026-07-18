@@ -105,14 +105,18 @@ class RecordingSession:
         try:
             if save:
                 path = self._loop.stop_episode(success=True, reason="manual")
+                self._loop.recorder.join_stop()
                 if path and self._validate:
-                    report = DataValidator().validate(path)
+                    # min_frames follows the collection config (rate-derived at
+                    # the entry point) instead of the validator's 50Hz default.
+                    report = DataValidator(min_frames=self._loop.config.min_frames).validate(path)
                     if not report.is_valid:
                         logger.warning("Episode failed validation: %s", path)
                 box["path"] = path
             else:
                 # stop first (closes the file), then unlink — avoids deleting an open file.
                 self._loop.stop_episode(success=False, reason="discard")
+                self._loop.recorder.join_stop()
                 self._loop.discard_episode()
         finally:
             done.set()

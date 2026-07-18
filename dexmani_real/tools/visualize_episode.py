@@ -169,6 +169,20 @@ class EpisodeVisualizer:
         self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
         self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
 
+        # ── Camera extrinsics ──
+        # camera_T_world_camera = T_world_camera: 4x4 that maps camera-frame → world-frame.
+        # Stored row-major (16,) in /meta; absent in legacy episodes without calibration.
+        self._cam_R: np.ndarray | None = None
+        self._cam_t: np.ndarray | None = None
+        meta = self._h5f.get("meta")
+        if meta is not None and "camera_T_world_camera" in meta.attrs:
+            T_cw = np.asarray(meta.attrs["camera_T_world_camera"], dtype=float).reshape(4, 4)
+            self._cam_R = T_cw[:3, :3].copy()
+            self._cam_t = T_cw[:3, 3].copy()
+            logger.info("Camera extrinsics loaded: t=[%.3f, %.3f, %.3f]", *self._cam_t)
+        else:
+            logger.info("No camera extrinsics in /meta — camera frame = world frame (identity)")
+
         # ── Point cloud config ──
         self._pc_enabled = point_cloud and "depth" in (self._available.get("camera") or [])
         self._pc_stride = max(1, pc_stride)
@@ -367,7 +381,7 @@ class EpisodeVisualizer:
         if self._pc_enabled or self._has_precomputed_pc:
             columns.append(
                 rrb.Spatial3DView(
-                    origin="camera/pcd",
+                    origin="/",
                     name="Point Cloud",
                     background=[0.12, 0.12, 0.14],
                 )
@@ -451,6 +465,12 @@ class EpisodeVisualizer:
             ), static=True)
             logger.info("Camera pinhole logged (%dx%d)", w, h)
 
+        # Camera extrinsics: position the camera entity in world space.
+        # Without this the Pinhole sits at the world origin, and the 3D view
+        # shows points offset from the camera frustum.
+        if self._cam_R is not None and self._cam_t is not None:
+            rr.log("camera", rr.Transform3D(translation=self._cam_t, mat3x3=self._cam_R), static=True)
+
         # ── Derived force series labels ──
         _force_series = {
             "hand_contact_mag": ("thumb", "index", "middle", "ring", "pinky"),
@@ -511,7 +531,7 @@ class EpisodeVisualizer:
             pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6) float32
             positions = pc_frame[:, :3]  # world-frame xyz
             colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)  # float rgb → uint8
-            rr.log("camera/pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
+            rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
         elif self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
                 depth = self._h5f["depth"][cam_idx]
@@ -530,7 +550,9 @@ class EpisodeVisualizer:
                 )
             points, colors = self._pc_cache[cam_idx]
             if points.shape[0] > 0:
-                rr.log("camera/pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
+                if self._cam_R is not None:
+                    points = points @ self._cam_R.T + self._cam_t
+                rr.log("pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
 
     # ------------------------------------------------------------------
     # Time series logging

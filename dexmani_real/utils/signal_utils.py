@@ -2,11 +2,52 @@
 
 from __future__ import annotations
 
-__all__ = ["ema_smooth_pose"]
+__all__ = ["alpha_from_tau", "ema_smooth_pose", "tau_from_alpha"]
 
 import numpy as np
 
 from dexmani_real.planning.pose_utils import quat_to_rotvec
+
+
+def alpha_from_tau(tau_s: float, dt: float) -> float:
+    """Discrete EMA coefficient preserving a continuous time constant.
+
+    For the new-sample-weighted EMA ``y += alpha * (x - y)`` running at
+    period ``dt``, ``alpha = 1 - exp(-dt / tau_s)`` yields the same
+    smoothing time constant ``tau_s`` regardless of loop rate.  Use this
+    when changing the control rate so filters keep identical dynamics
+    (e.g. alpha=0.6 @ 50Hz ↔ tau=21.8ms ↔ alpha=0.94 @ 16Hz).
+
+    Args:
+        tau_s: Filter time constant in seconds (<= 0 → no smoothing).
+        dt: Loop period in seconds.
+
+    Returns:
+        alpha in (0, 1] for ``y += alpha * (x - y)``.
+    """
+    if tau_s <= 0:
+        return 1.0
+    return float(1.0 - np.exp(-dt / tau_s))
+
+
+def tau_from_alpha(alpha: float, dt: float) -> float:
+    """Inverse of :func:`alpha_from_tau`: time constant of an EMA coefficient.
+
+    Use to convert a filter constant tuned at one loop rate to another:
+    ``alpha_from_tau(tau_from_alpha(0.6, 1/50), 1/16) ≈ 0.94``.
+
+    Args:
+        alpha: EMA coefficient in [0, 1] for ``y += alpha * (x - y)``.
+        dt: Loop period in seconds the coefficient was tuned at.
+
+    Returns:
+        Time constant in seconds (0.0 for alpha >= 1, inf for alpha <= 0).
+    """
+    if alpha >= 1.0:
+        return 0.0
+    if alpha <= 0.0:
+        return float("inf")
+    return float(-dt / np.log(1.0 - alpha))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -51,7 +92,9 @@ def ema_smooth_pose(
     alpha_rot = float(np.clip(alpha_rot, 0.0, 1.0))
 
     # Position: standard EMA in R³
-    pos = alpha_pos * np.asarray(target_pos, dtype=np.float64) + (1.0 - alpha_pos) * np.asarray(prev_pos, dtype=np.float64)
+    pos = alpha_pos * np.asarray(target_pos, dtype=np.float64) + (1.0 - alpha_pos) * np.asarray(
+        prev_pos, dtype=np.float64
+    )
 
     # Orientation: quat → rotvec → EMA → quat
     target_rv = quat_to_rotvec(np.asarray(target_quat_wxyz, dtype=np.float64))
@@ -64,9 +107,8 @@ def ema_smooth_pose(
     else:
         axis = rv / angle
         half = angle / 2.0
-        quat = np.array([np.cos(half), axis[0] * np.sin(half),
-                         axis[1] * np.sin(half), axis[2] * np.sin(half)], dtype=np.float64)
+        quat = np.array(
+            [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)], dtype=np.float64
+        )
 
     return pos, quat
-
-

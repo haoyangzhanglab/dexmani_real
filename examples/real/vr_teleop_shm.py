@@ -3,7 +3,7 @@
 
 架构:
     Meta Quest (HTS app) ──TCP──→ VRReceiverProcess ──SharedMemory──→ TeleopController
-                                     (独立进程, 隔离 HTS SDK)          (主进程, 50Hz)
+                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 50Hz)
                                          │                                │
                                    shm.write_vr_frame()            _vr_shm.read_latest_vr()
 
@@ -40,6 +40,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.signal_utils import alpha_from_tau, tau_from_alpha
 from dexmani_real.planning import (
     PlanningProfile,
     Pose,
@@ -53,6 +54,7 @@ from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.robot.xhand import XHandConfig
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.core.controller import TeleopController, TeleopControllerConfig
@@ -60,6 +62,15 @@ from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 
 logger = get_logger(__name__)
+
+# ── 控制频率: 单点定义, 其余常量全部由此派生 ──
+# 决策/录制 @ CTRL_HZ; 臂内环保持 50Hz (Mode 6 固件在线规划, 16Hz 直发无插值)。
+CTRL_HZ = 16.0
+REF_HZ = 50.0  # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
+HAND_MAX_QVEL_DEG_S = 90.0  # 手关节限速 → per-send delta clip = deg2rad(90)/CTRL_HZ ≈ 0.098 rad
+# 回退注意: 这是"再语义化"而非纯换算 —— 旧默认 XHandConfig.max_delta_rad=0.3 rad/step
+# (@50Hz ≙ 859°/s 防尖峰门)。CTRL_HZ 改回 50 会得到 0.031 rad (紧 9.6x)，
+# 完整回退需同时删除下方 XHandConfig(max_delta_rad=...) 派生行恢复库默认。
 
 
 def main():
@@ -109,6 +120,8 @@ def main():
             use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
+            # 1°/frame @50Hz — 换算保持 °/s 不变
+            nullspace_step_size_deg=1.0 * (REF_HZ / CTRL_HZ),
         ),
     )
 
@@ -116,6 +129,8 @@ def main():
     robot = RobotInterface(
         RobotInterfaceConfig(
             arm=arm_config,
+            # 手限速 90°/s 的速度语义: per-send clip 随 CTRL_HZ 派生 (E3)
+            hand=XHandConfig(max_delta_rad=float(np.deg2rad(HAND_MAX_QVEL_DEG_S)) / CTRL_HZ),
             collision=collision,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
         ),
@@ -144,22 +159,30 @@ def main():
 
     # ── 5. Mapper + Retargeter ──
     arm_mapper = ArmWristMapper()
-    retargeter = XHandRetargeter()
+    # LPFilter α=0.6 @50Hz (τ≈22ms) → τ 不变换算到 CTRL_HZ (≈0.94 @16Hz)
+    retargeter = XHandRetargeter(low_pass_alpha=alpha_from_tau(tau_from_alpha(0.6, 1.0 / REF_HZ), 1.0 / CTRL_HZ))
 
     # ── 6. Recorder (optional) ──
     recorder = EpisodeRecorder(
         data_dir="episodes",
-        max_frames=3000,
+        max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
+        control_hz=CTRL_HZ,
+        min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
     )
 
     # ── 7. Controller (SharedMemory VR path) ──
     cfg = TeleopControllerConfig(
-        target_hz=50.0,
+        target_hz=CTRL_HZ,
         ema_alpha_pos=1.0,
         ema_alpha_rot=1.0,  # Cartesian EMA pass-through for SHM raw path
         dry_run=False,
         use_shm_vr=True,  # ← 零拷贝 SHM 路径
-        collection_config=CollectionConfig(task_label=task_label, operator=operator),
+        collection_config=CollectionConfig(
+            task_label=task_label,
+            operator=operator,
+            min_frames=int(round(1.0 * CTRL_HZ)),
+            skip_initial_frames=int(np.ceil(0.2 * CTRL_HZ)),  # 跳过 begin 过渡 ≥0.2s (ceil: 16Hz→4 帧)
+        ),
     )
 
     controller = TeleopController(

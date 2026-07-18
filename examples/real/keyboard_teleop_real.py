@@ -50,6 +50,7 @@ from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
+from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.rate_limiter import RateLimiter
 
@@ -410,7 +411,9 @@ def main():
                     error_count += 1
                     continue
 
-                state = robot.get_state(arm_qpos=arm_qpos)
+                # 内环 50Hz 回读的动力学 → 力矩/温度门 (validate_action)
+                arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
+                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -591,12 +594,24 @@ def main():
             # ── Send ──
             # Arm: via inner loop (250Hz position servo)
             # Hand: via robot.send_action() (hold position)
-            arm_inner.set_target(arm_cmd)
-
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
                 hand_qpos_cmd=state.hand_qpos.copy(),
             )
+
+            # ── Pre-send gate: 力矩/温度/软限位 (与 controller.py:346 一致) ──
+            action_valid, fail_reason = validate_action(
+                robot,
+                action,
+                actual_arm_qpos=arm_qpos,
+                actual_arm_tau=state.arm_tau,
+                actual_arm_temps=arm_temps,
+            )
+            if not action_valid:
+                print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
+                continue
+
+            arm_inner.set_target(action.arm_qpos_cmd)
             robot.send_action(action)  # hand only
 
             # ── Tracking safety ──

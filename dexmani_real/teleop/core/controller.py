@@ -203,6 +203,7 @@ class TeleopController:
         self.retarget_fail_count: int = 0
         self.last_status_ts: float = 0.0
         self.status_interval: float = 2.0
+        self._tau_nan_warn_ts: float = 0.0  # throttle for "torque gate inactive" warnings
 
         # VR disconnect auto-stop (ref: LeFranX franka_server.cpp COMMAND_TIMEOUT_SEC=0.5)
         self._vr_disconnect_timeout_s: float = float(cfg.vr_disconnect_timeout_s)
@@ -253,10 +254,13 @@ class TeleopController:
         tick_start = time.perf_counter()
         self.frame_count += 1
 
-        # PAUSED: send None-sentinel → inner loop holds position
+        # PAUSED: send None-sentinel → inner loop holds position.
+        # Record held frames while paused (self.recording stays True) so
+        # the grid isn't back-filled with resume-frame data on un-pause.
         if self.state == ControllerState.PAUSED:
             if not self.dry_run and self._arm_inner is not None:
                 self._arm_inner.set_target(None)
+            self._record_held_tick()
             return
 
         # IDLE: no pipeline
@@ -279,6 +283,11 @@ class TeleopController:
                 self._arm_inner.set_target(None)  # hold position
             # Check cumulative timeout
             loss_duration_s = self._vr_consecutive_loss / self.limiter.target_hz
+            # Record held frame before checking the cumulative timeout — if
+            # we auto-stop here, the final frame before the transition is
+            # still part of the episode.
+            self._record_held_tick()
+
             if loss_duration_s >= self._vr_disconnect_timeout_s:
                 logger.error(
                     "VR disconnected for %.1fs (%d consecutive frames) — auto-stopping",
@@ -296,12 +305,16 @@ class TeleopController:
         if self.dry_run:
             state = self._dummy_state()
             arm_qpos = state.arm_qpos
+            arm_temps = None
         else:
             arm_qpos, error_state, _inner_ts = self._arm_inner.get_state()
             if error_state:
                 self._escalate_to_emergency("Arm inner loop error")
                 return
-            state = self.robot.get_state(arm_qpos=arm_qpos)
+            # Dynamics from the inner loop's 50Hz readback (single SDK connection) —
+            # recorded into /arm_qvel + /arm_tau and feeds the torque/temp gates.
+            arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()
+            state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
 
         # ── 4. Compute action ──
         action, status = self._compute_action(vr_frame, state)
@@ -330,12 +343,20 @@ class TeleopController:
 
         # ── 6. Pre-send validation ──
         validate_failed = False
+        hand_ok = True
         if not self.dry_run:
+            # Torque gate silently degrades to a no-op on NaN tau — make that visible.
+            if not np.any(np.isfinite(state.arm_tau)):
+                now_m = time.monotonic()
+                if now_m - self._tau_nan_warn_ts >= 5.0:
+                    self._tau_nan_warn_ts = now_m
+                    logger.warning("arm_tau all-NaN — torque gate inactive (inner-loop dynamics readback missing)")
             action_valid, fail_reason = validate_action(
                 self.robot,
                 action,
                 actual_arm_qpos=arm_qpos,
                 actual_arm_tau=state.arm_tau,
+                actual_arm_temps=arm_temps,
             )
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
@@ -348,8 +369,22 @@ class TeleopController:
 
             # Send arm target to inner loop
             self._arm_inner.set_target(action.arm_qpos_cmd)
-            # Send hand directly
-            self.robot.send_action(action)
+            # Send hand directly.  Degraded mode (hand not connected) is expected —
+            # only a failed send on a connected hand marks the frame as held.
+            send_result = self.robot.send_action(action)
+            hand_ok = bool(send_result.get("hand_ok", False)) or not self.robot.hand.is_connected()
+
+            # Hand write-back: XHand applies delta clip (E3) + optional EMA (E2)
+            # + joint-limit clip inside send_action, so hand_cmd is the command
+            # actually sent — record that, not the pre-clip request.  The hold /
+            # continuity baselines follow the sent pose too: with the per-send
+            # clip saturating at 16Hz, a hold must not keep driving the hand
+            # toward a stale pre-clip target.
+            sent_hand = send_result.get("hand_cmd")
+            if sent_hand is not None:
+                action.hand_qpos_cmd = sent_hand.copy()
+                self._last_hand_cmd = sent_hand.copy()
+                self._last_good_hand = sent_hand.copy()
 
             # ── Sync handshake: signal policy_ready, wait for robot_ready ──
             if self._sync is not None:
@@ -359,7 +394,7 @@ class TeleopController:
 
         # ── 7. Record the executed frame (after validation → records what was sent) ──
         if self.recording and self._recorder_session is not None:
-            held = (not status.get("ik_ok")) or (not status.get("retarget_ok")) or validate_failed
+            held = (not status.get("ik_ok")) or (not status.get("retarget_ok")) or validate_failed or (not hand_ok)
             self._recorder_session.record(
                 dict(
                     state=state,
@@ -440,7 +475,9 @@ class TeleopController:
     def _handle_keyboard(self) -> None:
         if self.keyboard is None:
             return
-        for sig in self.keyboard.poll():
+        # timeout=0: non-blocking drain — the default (0.05s) would block the
+        # control loop for up to 50ms per tick when no key is pending.
+        for sig in self.keyboard.poll(timeout=0):
             self._transition(sig)
 
     def _transition(self, signal: ControlSignal) -> None:
@@ -467,8 +504,9 @@ class TeleopController:
 
         if signal == ControlSignal.BEGIN:
             if self.state == ControllerState.IDLE:
-                if not self.dry_run:
-                    self._ensure_inner_running()
+                if not self.dry_run and not self._ensure_inner_running():
+                    logger.error("Cannot begin teleop: arm inner loop not ready — staying IDLE (press B to retry)")
+                    return
                 self._reset_mapper()
                 self._start_recording()
                 self.state = ControllerState.TELEOP
@@ -533,20 +571,31 @@ class TeleopController:
         self.limiter.reset()
         logger.info("=== STATE: HOME → IDLE ===")
 
-    def _ensure_inner_running(self) -> None:
-        """Restart the inner loop thread if it has been stopped (e.g. after return-to-home)."""
+    def _ensure_inner_running(self) -> bool:
+        """(Re)start the inner loop thread and wait until it is ready.
+
+        Returns False when the loop failed to come up — the caller must refuse
+        to enter TELEOP: get_state() would otherwise return the zeros placeholder
+        qpos and the mapper would anchor to FK(zeros), tens of cm off the real
+        pose (the arm then physically moves toward that wrong pose).
+        """
         if self._arm_inner is None:
-            return
-        if self._arm_inner.is_alive:
-            return
-        logger.info("Restarting arm inner loop...")
-        # Preserve the same inner loop config (mode, PID gains, etc.)
-        inner_cfg = getattr(self._arm_inner, "_cfg", ArmInnerLoopConfig())
-        if self._sync is not None:
-            self._sync.policy_ready.clear()  # drop stale handshake state from the previous loop
-        self._arm_inner = ArmInnerLoop(cfg=inner_cfg, sync=self._sync)
-        self._arm_inner.start()
-        logger.info("Arm inner loop restarted")
+            return False
+        if not self._arm_inner.is_alive:
+            logger.info("Restarting arm inner loop...")
+            # Preserve the same inner loop config (mode, PID gains, etc.)
+            inner_cfg = getattr(self._arm_inner, "_cfg", ArmInnerLoopConfig())
+            if self._sync is not None:
+                self._sync.policy_ready.clear()  # drop stale handshake state from the previous loop
+            self._arm_inner = ArmInnerLoop(cfg=inner_cfg, sync=self._sync)
+            self._arm_inner.start()
+            logger.info("Arm inner loop restarted")
+        # Also covers the __init__-started loop still connecting when B is
+        # pressed early — ready means the first real qpos readback has landed.
+        if not self._arm_inner.wait_ready(timeout=10.0):
+            logger.error("Arm inner loop not ready within 10s (arm connection?)")
+            return False
+        return True
 
     def _escalate_to_emergency(self, reason: str) -> None:
         logger.error("=== STATE: → EMERGENCY_STOP: %s ===", reason)
@@ -575,14 +624,15 @@ class TeleopController:
             except (TypeError, ValueError):
                 return default
 
+        hand_delta_clip = _f(np.max(getattr(hand_cfg, "max_delta_rad", 0.3)), 0.3) if hand_cfg is not None else 0.3
         return {
             "control_mode": "teleop",
             "arm_mode": 6,  # hardcoded Mode 6 (joint online trajectory planning)
             "hand_mode": int(getattr(hand_cfg, "mode", 3)) if hand_cfg is not None else 3,
             "arm_delta_clip": _f(getattr(inner_cfg, "max_joint_delta", 0.3), 0.3),
-            "hand_delta_clip": (
-                _f(np.max(getattr(hand_cfg, "max_delta_rad", 0.3)), 0.3) if hand_cfg is not None else 0.3
-            ),
+            "hand_delta_clip": hand_delta_clip,
+            # Velocity semantics of the per-send hand clip at this control rate
+            "hand_max_qvel_deg_s": float(np.degrees(hand_delta_clip)) * float(self.limiter.target_hz),
             "hand_ema_alpha": _f(getattr(hand_cfg, "ema_alpha", 0.0), 0.0) if hand_cfg is not None else 0.0,
             "hand_low_pass_alpha": _f(getattr(self.retargeter, "low_pass_alpha", 0.6), 0.6),
             "ema_alpha_pos": _f(self._ema_alpha_pos, 0.8),
@@ -685,6 +735,59 @@ class TeleopController:
         else:
             hand = np.zeros(12, dtype=np.float64)
         return RobotAction(arm_qpos_cmd=arm, hand_qpos_cmd=hand)
+
+    def _record_held_tick(self) -> None:
+        """Record a held frame when no action is computed (PAUSED / VR stale).
+
+        Without this, paused/stale grid slots are back-filled by the next
+        success frame, forging flag_ik_ok=True / flag_held=False for frames
+        that are actually held.
+        """
+        if not self.recording or self._recorder_session is None:
+            return
+        if self.dry_run or self._arm_inner is None:
+            return
+        try:
+            arm_qpos, error_state, _ = self._arm_inner.get_state()
+            if error_state or not np.all(np.isfinite(arm_qpos)):
+                return
+            arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()
+        except Exception:
+            return
+
+        state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
+        action = self._hold_action()
+
+        camera_frame = None
+        camera_frames = None
+        if self._multi_camera is not None:
+            try:
+                camera_frames = self._multi_camera.read_all_latest()
+            except (ValueError, RuntimeError, KeyError):
+                pass
+        elif self._camera_process is not None:
+            try:
+                camera_frame = self._camera_process.poll_latest_frame()
+            except (ValueError, RuntimeError, KeyError):
+                pass
+
+        T_base_eef = self._compute_T_base_eef(state)
+        nan_vr = {
+            "wrist_pos": np.full(3, np.nan, dtype=np.float64),
+            "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+            "landmarks": np.full((21, 3), np.nan, dtype=np.float64),
+        }
+        self._recorder_session.record(
+            dict(
+                state=state,
+                action=action,
+                vr_frame=nan_vr,
+                camera_frame=camera_frame,
+                camera_frames=camera_frames,
+                T_base_eef=T_base_eef,
+                signals={"ik_ok": True, "retarget_ok": True, "held": True},
+            )
+        )
 
     # ── Keyboard hints ──
 

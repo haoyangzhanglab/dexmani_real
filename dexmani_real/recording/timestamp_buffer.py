@@ -30,8 +30,9 @@ def get_accumulate_timestamp_idxs(
     """Map raw timestamps to discrete grid indices.
 
     For each dt window [start_time + k*dt, start_time + (k+1)*dt), assigns the
-    first timestamp falling into that window.  When a window has no timestamp
-    (dropped frame), the last known timestamp is repeated.
+    first timestamp falling into that window (later samples in the same window
+    are dropped — first wins).  When a window has no timestamp (dropped frame),
+    it is back-filled by the NEXT arriving sample's index.
 
     Args:
         timestamps: Sorted list of timestamps (or a single float).
@@ -75,8 +76,9 @@ class TimestampAlignedBuffer:
     ``add()`` inspects the data dict to determine shapes and dtypes, then
     pre-allocates numpy arrays of shape ``(max_record_steps,) + value.shape``.
 
-    When the data source is slower than 1/dt, the most recent value is held.
-    When faster, the latest value within each window wins.
+    When the data source is slower than 1/dt, missed slots are back-filled by
+    the next arriving sample.  When faster, the first value in each window wins
+    (later ones are dropped).
 
     Camera frames should NOT be routed through this buffer (they are too large
     for pre-allocation); use the existing per-frame HDF5 path instead.

@@ -39,47 +39,56 @@ class RateManager:
             raise ValueError(f"target_hz must be positive, got {target_hz}")
         self.target_hz = float(target_hz)
         self.period = 1.0 / target_hz
-        self._last_wake = time.perf_counter()
+        self._next_deadline = time.perf_counter() + self.period
         self._overdue_throttle: int = 0
 
     def wait(self) -> None:
-        """Sleep until the next control cycle boundary with precision.
+        """Sleep until the next absolute cycle deadline with precision.
+
+        Deadlines advance by exactly one period per call (absolute schedule),
+        so per-tick jitter does NOT accumulate as long-term drift — ticks stay
+        locked to the recording time grid.
 
         Hybrid strategy:
-          1. Compute remaining time
+          1. Compute remaining time to the deadline
           2. If > 2ms: time.sleep(remaining - 1ms)
           3. Busy-wait for the final precision window
         """
-        elapsed = time.perf_counter() - self._last_wake
-        remaining = self.period - elapsed
+        now = time.perf_counter()
+        remaining = self._next_deadline - now
 
-        if remaining > 0.002:  # > 2ms: sleep for bulk
-            time.sleep(remaining - 0.001)
-            while time.perf_counter() - self._last_wake < self.period:
+        if remaining > 0:
+            if remaining > 0.002:  # > 2ms: sleep for bulk
+                time.sleep(remaining - 0.001)
+            while time.perf_counter() < self._next_deadline:
                 pass  # spin
-        elif remaining > 0:
-            while time.perf_counter() - self._last_wake < self.period:
-                pass  # spin
+            self._next_deadline += self.period
+            return
+
+        # Overdue: emit throttled warning (every ~50 occurrences)
+        if self._overdue_throttle <= 0:
+            logger.warning(
+                "Control loop over budget: actual=%.1fms target=%.1fms",
+                (self.period - remaining) * 1000,
+                self.period * 1000,
+            )
+            self._overdue_throttle = 50
         else:
-            # Overdue: emit throttled warning (every ~50 occurrences)
-            if self._overdue_throttle <= 0:
-                logger.warning(
-                    "Control loop over budget: actual=%.1fms target=%.1fms",
-                    elapsed * 1000, self.period * 1000,
-                )
-                self._overdue_throttle = 50
-            else:
-                self._overdue_throttle -= 1
+            self._overdue_throttle -= 1
 
-        self._last_wake = time.perf_counter()
+        if -remaining >= self.period:
+            # Missed a full slot or more: re-anchor to now (no catch-up burst)
+            self._next_deadline = now + self.period
+        else:
+            # Small overrun: keep the absolute grid, next tick absorbs it
+            self._next_deadline += self.period
 
     def reset(self) -> None:
-        """Reset the timer and overdue throttle to the current time.
+        """Reset the deadline and overdue throttle to the current time.
 
         Call after a long blocking operation (e.g. return-to-home) so the
-        next wait() does not see a stale wake time and log a spurious
+        next wait() does not see a stale deadline and log a spurious
         over-budget warning.
         """
-        self._last_wake = time.perf_counter()
+        self._next_deadline = time.perf_counter() + self.period
         self._overdue_throttle = 0
-

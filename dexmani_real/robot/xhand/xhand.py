@@ -507,6 +507,10 @@ class XHand(ConnectionStateMixin):
 
     def send_action(self, action: np.ndarray) -> bool:
         if self._stub_mode:
+            # Track the (joint-limited) request so last_qpos_cmd follows the
+            # action stream instead of freezing at home_qpos — recorded actions
+            # would otherwise be silently replaced by a constant.
+            self.last_qpos_cmd = self._limit_joint_range(self._array12(action))
             return True
 
         if self.control is None or self.hand_command is None:

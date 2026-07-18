@@ -161,16 +161,25 @@ class RobotInterface:
 
     # ── State ──
 
-    def get_state(self, arm_qpos: np.ndarray | None = None) -> RobotState:
+    def get_state(
+        self,
+        arm_qpos: np.ndarray | None = None,
+        arm_qvel: np.ndarray | None = None,
+        arm_tau: np.ndarray | None = None,
+    ) -> RobotState:
         """Read arm + hand state with FK computation.
 
         Args:
             arm_qpos: Optional arm joint positions from ArmInnerLoop.get_state().
                       When provided, skips arm SDK call (used in teleop loop).
+            arm_qvel: Optional joint velocities from ArmInnerLoop.get_dynamics().
+                      Only used together with arm_qpos; NaN placeholder if omitted.
+            arm_tau: Optional joint torques from ArmInnerLoop.get_dynamics().
+                     Only used together with arm_qpos; NaN placeholder if omitted.
         """
         if arm_qpos is not None:
-            arm_qvel = nan_array(7)
-            arm_tau = nan_array(7)
+            arm_qvel = nan_array(7) if arm_qvel is None else np.asarray(arm_qvel, dtype=np.float64)
+            arm_tau = nan_array(7) if arm_tau is None else np.asarray(arm_tau, dtype=np.float64)
         else:
             try:
                 arm_state = self.arm.get_state()

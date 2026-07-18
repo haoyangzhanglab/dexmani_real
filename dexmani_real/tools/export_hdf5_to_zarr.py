@@ -407,7 +407,7 @@ def _align_all_episodes(
     """
     from dexmani_real.recording.post_processor import TimestampAligner
 
-    aligner = TimestampAligner(dt=dt, method=method)
+    aligner = TimestampAligner(dt=dt, method=method, max_gap_s=2.5 * dt)  # gap threshold scales with grid rate
 
     new_obs_list: list[np.ndarray] = []
     new_action_list: list[np.ndarray] = []
@@ -515,6 +515,19 @@ def compute_norm_stats(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _episode_control_rates(paths: list) -> list[float]:
+    """Nominal grid rate per episode (schema v7: control_hz; older files: fps; 50.0 if absent)."""
+    rates: list[float] = []
+    for p in paths:
+        try:
+            with h5py.File(p, "r") as f:
+                meta = f.get("meta")
+                rates.append(float(meta.attrs.get("control_hz", meta.attrs.get("fps", 50.0))) if meta else 50.0)
+        except OSError:
+            rates.append(50.0)
+    return rates
+
+
 def write_zarr(
     output_dir: Path,
     obs_list: list[np.ndarray],
@@ -526,6 +539,7 @@ def write_zarr(
     rgb_list: list[np.ndarray | None] | None = None,
     depth_list: list[np.ndarray | None] | None = None,
     camera_meta: dict | None = None,
+    control_hz: float | None = None,
 ) -> None:
     """Write concatenated data to Zarr format.
 
@@ -537,6 +551,8 @@ def write_zarr(
         compressor: numcodecs compressor (default: Blosc zstd).
         rgb_list, depth_list: Optional per-episode camera frames.
         camera_meta: Optional camera intrinsics/extrinsics dict.
+        control_hz: Uniform nominal grid rate of all episodes (written to
+            meta attrs for downstream dt derivation); None when mixed/unknown.
     """
     if compressor is None:
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
@@ -578,6 +594,9 @@ def write_zarr(
     meta_grp.create_dataset(
         "episode_ends", data=episode_ends, dtype=np.int64,
     )
+    if control_hz is not None:
+        # Nominal grid rate — downstream consumers derive dt = 1/control_hz
+        meta_grp.attrs["control_hz"] = float(control_hz)
 
     if norm_stats:
         stats_grp = meta_grp.create_group("norm_stats")
@@ -622,6 +641,8 @@ def write_zarr(
     print(f"  data/obs:      {all_obs.shape} {all_obs.dtype}")
     print(f"  data/action:   {all_act.shape} {all_act.dtype}")
     print(f"  meta/episode_ends: {len(episode_ends)} episodes, total={total_frames}")
+    if control_hz is not None:
+        print(f"  meta/control_hz:  {control_hz:g} Hz")
     if norm_stats:
         print(f"  meta/norm_stats:  obs({obs_dim}d), action({action_dim}d)")
     if has_cam and all_rgb is not None and all_depth is not None:
@@ -691,8 +712,9 @@ def main() -> None:
         help="Post-process timestamp alignment: interpolate all streams to a unified time grid.",
     )
     parser.add_argument(
-        "--align_dt", type=float, default=0.020,
-        help="Target dt for aligned grid in seconds (default: 0.020 = 20ms).",
+        "--align_dt", type=float, default=None,
+        help="Target dt for aligned grid in seconds (default: derived from each "
+             "episode's /meta control_hz|fps; 0.020 if absent).",
     )
     parser.add_argument(
         "--align_method", type=str, default="linear",
@@ -708,12 +730,19 @@ def main() -> None:
 
     output_dir = Path(args.output).expanduser().resolve()
 
+    # ── Per-episode nominal rates (schema v7: control_hz; older: fps) ──
+    # Mixed 50/16Hz directories are the post-migration reality — never concatenate
+    # frames of different dt without either aligning or telling the user.
+    dir_rates = _episode_control_rates(sorted(data_dir.glob("episode_*.h5")))
+
     # ── Validation (if requested) ──
     if args.validate:
         from dexmani_real.recording.data_validator import DataValidator
 
+        # Default min_frames = 1s at the slowest nominal rate in the directory
+        # (a fixed 50 would mean 3.125s for 16Hz episodes).
         validator = DataValidator(
-            min_frames=args.min_frames or 50,
+            min_frames=args.min_frames if args.min_frames is not None else int(round(min(dir_rates, default=50.0))),
         )
         print("Running DataValidator...")
         reports = validator.validate_directory(data_dir)
@@ -736,9 +765,23 @@ def main() -> None:
         print("No valid episodes to export.", file=sys.stderr)
         sys.exit(1)
 
+    # ── Rate consistency across the selected episodes ──
+    rates = _episode_control_rates(episode_paths)
+    unique_rates = sorted({round(r, 3) for r in rates})
+    control_hz: float | None = unique_rates[0] if len(unique_rates) == 1 else None
+
     # ── Timestamp alignment (if requested) ──
     if args.align:
-        print(f"\nTimestamp alignment: dt={args.align_dt*1000:.0f}ms method={args.align_method}")
+        if args.align_dt is None:
+            if control_hz is None:
+                print(f"ERROR: mixed control rates {unique_rates} Hz across episodes — "
+                      f"pass an explicit --align_dt to choose the target grid.", file=sys.stderr)
+                sys.exit(1)
+            # Nominal grid rate shared by all selected episodes (schema v7:
+            # control_hz; older files: fps attr).
+            args.align_dt = 1.0 / control_hz
+        control_hz = 1.0 / args.align_dt
+        print(f"\nTimestamp alignment: dt={args.align_dt*1000:.1f}ms method={args.align_method}")
         if any(r is not None for r in rgb_list):
             print("[WARN] Camera frames dropped during timestamp alignment (not interpolatable).")
             rgb_list = [None] * len(rgb_list)
@@ -747,6 +790,10 @@ def main() -> None:
             episode_paths, obs_list, action_list, episode_lengths,
             dt=args.align_dt, method=args.align_method,
         )
+    elif control_hz is None:
+        print(f"[WARN] Mixed control rates {unique_rates} Hz concatenated WITHOUT alignment — "
+              f"per-step action magnitudes differ across episodes and the zarr carries "
+              f"no control_hz. Use --align (with --align_dt) to unify the grid.")
 
     # ── Train/val split ──
     if args.train_val_split is not None:
@@ -762,12 +809,12 @@ def main() -> None:
         # Write train
         write_zarr(output_dir, train_obs, train_act, train_lengths, norm_stats,
                    name="train", rgb_list=train_rgb, depth_list=train_depth,
-                   camera_meta=camera_meta)
+                   camera_meta=camera_meta, control_hz=control_hz)
 
         # Write val (use train stats — no separate stats for val, prevents leakage)
         write_zarr(output_dir, val_obs, val_act, val_lengths, norm_stats,
                    name="val", rgb_list=val_rgb, depth_list=val_depth,
-                   camera_meta=camera_meta)
+                   camera_meta=camera_meta, control_hz=control_hz)
 
         # Save norm_stats as human-readable JSON
         with open(output_dir / "norm_stats.json", "w") as f:
@@ -779,7 +826,8 @@ def main() -> None:
         # Single zarr (no split)
         norm_stats = compute_norm_stats(obs_list, action_list)
         write_zarr(output_dir, obs_list, action_list, episode_lengths, norm_stats,
-                   rgb_list=rgb_list, depth_list=depth_list, camera_meta=camera_meta)
+                   rgb_list=rgb_list, depth_list=depth_list, camera_meta=camera_meta,
+                   control_hz=control_hz)
 
         # Save norm_stats
         with open(output_dir / "norm_stats.json", "w") as f:
