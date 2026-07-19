@@ -188,6 +188,7 @@ EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 # (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
 ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
 _INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
+ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
 
 
 # ═══════════════════════════════════════════════ 归位
@@ -383,6 +384,30 @@ def main():
     # ── 8b. Audio feedback (voice prompts for headset-blind operator) ──
     audio = AudioFeedback()
 
+    # ── 8c. Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
+    # 提早到 VR 等待之前启动: 子进程 connect 需 2-4s (hardware_reset 坏路径 15s+),
+    # 与 VR 首帧等待重叠, 按 B 时 serial/K/depth_scale 通常已就绪 (残余由 B gate 兜底)。
+    camera = CameraProcess(
+        CameraProcessConfig(camera_name="realsense", hz=30.0, enable_pointcloud=True)
+    )
+    if camera.start():
+        print("Camera 进程已启动 (RealSense @30Hz, SHM, pointcloud)")
+    else:
+        print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
+        camera = None
+    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯
+    # （单相机 rig：cameras.json 唯一条目 camera_0）。
+    calib = None
+    if camera is not None:
+        try:
+            calib = CameraCalib()
+        except (OSError, ValueError, KeyError):
+            print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
+
+    # 相机停帧检测: frame_number 不再变化 >1s → 限频告警 (数据可能冻结)
+    cam_last_fn = None
+    cam_last_change_t: float | None = None
+
     # ── 9. 等待 VR 首帧 ──
     print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
     print("  Q=退出")
@@ -396,6 +421,8 @@ def main():
             arm_inner.stop()
             robot.disconnect()
             vr_receiver.stop()
+            if camera is not None:
+                camera.stop()
             return
         frame = vr_receiver.read_latest()
         if frame is not None:
@@ -421,6 +448,8 @@ def main():
         arm_inner.stop()
         robot.disconnect()
         vr_receiver.stop()
+        if camera is not None:
+            camera.stop()
         return
 
     # ── 10. 键盘就绪 (pynput 全局捕获) ──
@@ -446,12 +475,24 @@ def main():
         nonlocal recording_active
         if recording_active:
             if save:
+                # 迟到相机元数据回填: B 早于相机 connect 时 start_episode 快照为 None,
+                # 相机中途就绪则在 stop 前补齐 (外参 / K / depth_scale)。
+                if camera is not None and camera.camera_serial:
+                    recorder.backfill_camera_meta(
+                        depth_scale=camera.depth_scale,
+                        calib=calib,
+                        camera_name="camera_0" if calib is not None else None,
+                        camera_K=camera.camera_K,
+                    )
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
-                recorder.join_stop(timeout=60.0)  # 落盘完成后才报"已保存"
+                recorder.join_stop(timeout=60.0)  # 落盘完成后才报结果
                 if path:
-                    print(f"  录制已保存: {path}  ({n_frames} 帧)")
+                    if recorder.stop_error:
+                        print(f"  ⚠ 保存失败 ({recorder.stop_error}): {path}  — 文件可能不完整")
+                    else:
+                        print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
                 path = recorder.stop_episode(success=False)
                 recorder.join_stop()
@@ -481,26 +522,7 @@ def main():
         running = False
 
     # ── Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
-    camera = CameraProcess(
-        CameraProcessConfig(camera_name="realsense", hz=30.0, enable_pointcloud=True)
-    )
-    if camera.start():
-        print("Camera 进程已启动 (RealSense @30Hz, SHM, pointcloud)")
-    else:
-        print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
-        camera = None
-    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯
-    # （单相机 rig：cameras.json 唯一条目 camera_0）。
-    calib = None
-    if camera is not None:
-        try:
-            calib = CameraCalib()
-        except (OSError, ValueError, KeyError):
-            print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
-
-    # 相机停帧检测: frame_number 不再变化 >1s → 限频告警 (数据可能冻结)
-    cam_last_fn = None
-    cam_last_change_t: float | None = None
+    # (已提早到 8c, VR 等待之前启动)
 
     try:
         while running:
@@ -664,6 +686,26 @@ def main():
                         print("\nB: 无 VR 帧，无法开始遥操作")
                         skip_rest = True
                         continue
+                    # 相机就绪 gate: serial 由子进程 connect 完成后才写入 SHM (快乐路径
+                    # 2-4s, hardware_reset 坏路径 15s+)。B 早于就绪 → /meta 缺外参/
+                    # depth_scale + 前导栅格槽冻结帧。最多等 5s, 仍未就绪拒绝本次 B。
+                    if camera is not None and not camera.camera_serial and not camera.crashed:
+                        print("  相机连接中, 等待就绪…", end="", flush=True)
+                        _gate_deadline = time.perf_counter() + 5.0
+                        while (
+                            not camera.camera_serial
+                            and not camera.crashed
+                            and time.perf_counter() < _gate_deadline
+                        ):
+                            time.sleep(0.5)
+                            print(".", end="", flush=True)
+                        print(" 就绪" if camera.camera_serial else "")
+                        if not camera.camera_serial and not camera.crashed:
+                            print("  ⚠ 相机 5s 内未就绪 — 本次 B 忽略, 请稍后重按")
+                            skip_rest = True
+                            continue
+                    if camera is not None and camera.crashed:
+                        print("  ⚠ 相机进程已退出 — 本集降级为只录关节/EEF")
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
                     if not recorder.start_episode(
@@ -924,8 +966,10 @@ def main():
                 continue
 
             ik_method = "ok"
-            # 平滑已在 IK 前 (笛卡尔 EMA) 完成, IK 输出直接下发
+            # 平滑已在 IK 前 (笛卡尔 EMA) 完成; IK 输出按 joint_max_speed×dt 截步长后下发 —
+            # 快腕旋时 IK 目标可超前可达状态 >50° (实测 max 57.5°), 截步长使 action 标签保持动力学可达
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
+            arm_cmd = prev_qpos_cmd + np.clip(arm_cmd - prev_qpos_cmd, -ARM_CMD_MAX_STEP_RAD, ARM_CMD_MAX_STEP_RAD)
 
             # ── Hand: hold position (skip if hand unavailable) ──
             if hand_available:
@@ -979,7 +1023,18 @@ def main():
             recorder.stop_episode(success=False)
         # 无条件等待后台 flush 完成（急停/H 保存的 stop 线程也在此收口）。
         # 必须在交互 prompt 之前 — 否则 flush 被 prompt 劫持、二次 Ctrl-C 可截断 h5。
-        recorder.join_stop(timeout=60.0)
+        _join_deadline = time.perf_counter() + 60.0
+        while True:
+            try:
+                recorder.join_stop(timeout=max(1.0, _join_deadline - time.perf_counter()))
+                break
+            except KeyboardInterrupt:
+                if time.perf_counter() > _join_deadline:
+                    print("\n  ⚠ 写盘超时", flush=True)
+                    break
+                print("\n  ⚠ 正在等待写盘完成，请勿中断…", flush=True)
+        if recorder.stop_error:
+            print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
 
         # ── 保存轨迹 debug 数据 ──
         if len(traj_logger) > 0:
@@ -1016,6 +1071,11 @@ def main():
 
         robot.disconnect()
         vr_receiver.stop()
+
+        # 播放结束提示音（阻塞，确保播放完毕再退出）
+        audio.play("end")
+        time.sleep(2.0)
+
         print("Done.")
 
 

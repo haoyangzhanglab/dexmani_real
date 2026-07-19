@@ -178,7 +178,7 @@ class PlanningProfile(FromDictMixin):
     path_dt: float = 1 / 15
     planning_limits_deg: tuple[tuple[float, float], ...] | None = None
     max_ik_delta_deg: tuple[float, ...] = (120, 135, 120, 120, 180, 150, 180)
-    max_waypoint_delta_deg: float = 8.0
+    max_waypoint_delta_deg: float = 15.0  # relaxed from 8° — execution always interpolates at 1° resolution anyway
     max_pose_error_pos_m: float = 0.005
     max_pose_error_rot_rad: float = 0.05
 
@@ -230,7 +230,7 @@ class TeleopProfile(FromDictMixin):
     # of max_pose_error_pos_m/rot_rad or when max_iterations reached.
     differential_ik_gain: float = 0.05  # step size per iteration (matches BVP v*0.05)
     differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
-    differential_ik_max_iterations: int = 100  # matches BVP for k in range(100)
+    differential_ik_max_iterations: int = 25  # cap at 25 (normal ops converge ≤5 iters; 25 has ample headroom)
     differential_ik_convergence_threshold: float = 1e-3  # unused since 2026-07-16 IK speedup — superseded by early-exit at 50% of max_pose_error_pos_m/rot_rad
 
     # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──

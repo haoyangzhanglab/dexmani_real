@@ -1,133 +1,101 @@
 # CLAUDE.md — DexMani Real
 
-Dexterous manipulation teleoperation & data collection for **xArm7 (7-DOF arm) + XHand (12-DOF hand)** with VR control.
+Dexterous manipulation teleop & data collection for **xArm7 (7-DOF arm) + XHand (12-DOF hand)** with VR control.
 
 ---
 
-## LLM 行为准则 (Andrej Karpathy Skills)
+## Quick Reference
 
-以下准则偏向谨慎而非速度。对于简单任务，自行判断是否适用。
+| Task | Key File(s) |
+|------|------------|
+| Modify arm control / servo loop | `dexmani_real/robot/inner_loop.py` |
+| Modify hand control | `dexmani_real/robot/xhand/xhand.py` |
+| Modify IK / retargeting pipeline | `dexmani_real/teleop/core/pipeline.py` |
+| Modify IK solver | `dexmani_real/planning/ik.py` |
+| Modify safety checks (validate) | `dexmani_real/robot/validate.py` |
+| Modify state machine | `dexmani_real/teleop/core/controller.py` |
+| Modify HDF5 recording format | `dexmani_real/recording/episode_recorder.py` |
+| Modify recording lifecycle | `dexmani_real/recording/collection_loop.py` |
+| Modify VR arm mapping | `dexmani_real/teleop/vr/arm_mapper.py` |
+| Modify VR hand retargeting | `dexmani_real/teleop/vr/hand_retarget.py` |
+| Modify camera pipeline | `dexmani_real/sensor/camera_process.py` |
+| Modify point cloud processing | `dexmani_real/sensor/pointcloud_processor.py` |
+| Modify shared memory / SHM | `dexmani_real/shm/` |
+| Add a new entry point | `examples/real/` (real) or `examples/sim/` (sim) |
+| Add a CLI tool | `dexmani_real/tools/` |
+| Visualize an episode | `dexmani_real/tools/visualize_episode.py` |
+| Health-check an episode | `dexmani_real/tools/check_episode_health.py` |
+| Run tests | `conda run -n real_robot python -m pytest tests/ -v` |
+| Type-check | `conda run -n real_robot mypy dexmani_real/` |
 
-### 1. 先思考，再编码
-
-**不假设。不隐藏困惑。明确权衡。**
-
-- 明确陈述你的假设；如果不确定，主动询问。
-- 如果存在多种解释，把它们都列出来，而不是默默选择一种。
-- 如果存在更简单的方法，指出来，并在有充分理由时提出异议。
-- 如果某些东西不清楚，停下来，明确指出困惑点，然后提问。
-
-### 2. 简洁优先
-
-**解决问题的代码越少越好。不要做推测性开发。**
-
-- 不要添加超出需求的功能。
-- 不要为单次使用的代码创建抽象层。
-- 不要添加未被要求的"灵活性"或"可配置性"。
-- 不要为不可能发生的场景添加错误处理。
-- 如果 200 行可以变成 50 行，重写它。
-- 自检：资深工程师会觉得这过度复杂吗？如果是，简化它。
-
-### 3. 手术级修改
-
-**只动必须动的。只清理你自己造成的混乱。**
-
-编辑已有代码的规则：
-- 不要"顺便"改进相邻代码、注释或格式。
-- 不要重构没有坏的东西。
-- 匹配现有风格，即使你的做法不同。
-- 如果你注意到无关的死代码，提出来但不要删除。
-
-针对你的修改产生的孤立产物的规则：
-- 删除因你的修改而不再使用的 import/变量/函数。
-- 不要删除已有的死代码，除非被要求。
-
-测试：每一行改动都应直接追溯到用户的需求。
-
-### 4. 目标驱动执行
-
-**定义成功标准。循环直到验证通过。**
-
-将任务转化为可验证的目标：
-- "添加验证" → 先为无效输入编写测试，然后让它们通过
-- "修复 bug" → 先写可复现的测试，然后让它通过
-- "重构" → 确保重构前后测试都通过
-- "实现功能 X" → 找到或编写测试，循环直到通过
-
-多步骤任务使用编号计划 + 验证检查点。
-
-强大的成功标准让你能独立循环迭代；模糊的标准（"让它跑起来"）需要不断向用户确认。
+**Environment:** conda env `real_robot` (Python 3.10). All scripts run with `PYTHONPATH=.` from repo root.
+Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_robot`
 
 ---
 
-这些准则正在生效的标志：
-- diff 中没有不必要的改动
-- 没有因过度复杂而被要求重写
-- 澄清性问题出现在实现之前，而非错误之后
+## Karpathy Guidelines (always active)
+
+Before coding: **state assumptions, surface tradeoffs, ask if unclear.**
+When coding: **minimum code, no speculative features, match existing style.**
+When done: **verify with a test/run, not just "looks right."**
+
+Full guidelines: invoke `/karpathy-guidelines` skill or see `.claude/skills/karpathy-guidelines/SKILL.md`.
 
 ---
 
-## 调研规则
-
-当用户说"调研某个项目"时，先在 `~/Desktop/Reference/` 目录下查找对应项目的代码仓库，基于实际代码进行分析，而非依赖记忆或猜测。
-
-## Project overview
+## Project Structure
 
 ```
-dexmani_real/          ← Python package root
-├── robot/             ← Hardware drivers (XArm7, XHand) + unified RobotInterface
-├── teleop/            ← VR teleop controller, state machine, pipeline, retargeting
-│   ├── core/          ← TeleopController (state machine), TeleopPipeline, error handler
-│   ├── vr/            ← ArmMapper, HandRetargeter, VRTracker (Quest), DummyTracker
-│   └── control/       ← KeyboardHandler, safety checks (torque/current/temp/comm)
-├── planning/          ← MPlib motion planner, IK, kinematics, collision detection
-├── recording/         ← HDF5 episode recorder, RecordingSession, CollectionLoop, aligned buffer, validation
-├── sensor/            ← RealSense camera driver, multi-camera manager, VR receiver
-├── simulation/        ← SAPIEN-based simulation mirror of real hardware
-├── shm/               ← SharedMemoryRingBuffer for cross-process camera data
-├── config/            ← Camera extrinsics (cameras.json, CameraCalib)
-├── utils/             ← Shared utilities (log, serialization, rate limiting, signal)
-├── tools/             ← CLI utilities (HDF5 episode viewer, HDF5→Zarr export)
-├── assets/            ← URDF, SRDF, meshes, retargeting configs
-├── examples/          ← Real/sim teleop entry points + motion planning tests
-│   ├── real/          ← Real-hardware examples (keyboard_teleop, test_motion, quest_teleop)
-│   └── sim/           ← Simulation examples (vr_teleop_sim, test_motion)
-├── docs/              ← Architecture docs, analysis notes
+./
+├── dexmani_real/          ← Python package
+│   ├── robot/             ← XArm7 + XHand drivers, inner loop, validation, interface
+│   │   ├── xarm7/         ← XArm7 SDK wrapper (xarm7.py, error_codes.py)
+│   │   └── xhand/         ← XHand SDK wrapper (xhand.py, motor_trajectory_interpolator.py)
+│   ├── teleop/            ← VR teleop controller + pipeline + retargeting
+│   │   ├── core/          ← TeleopController (state machine), TeleopPipeline
+│   │   ├── vr/            ← ArmWristMapper, XHandRetargeter, QuestHandTracker, DummyTracker
+│   │   └── control/       ← KeyboardHandler, safety checks, audio feedback
+│   ├── planning/          ← MPlib planner, IK, FK kinematics, collision, desk safety
+│   ├── recording/         ← HDF5 recorder, RecordingSession, CollectionLoop, aligned buffer
+│   ├── sensor/            ← RealSense driver, multi-camera manager, point cloud, VR receiver
+│   ├── simulation/        ← SAPIEN simulation mirror of real hardware
+│   ├── shm/               ← SharedMemoryRingBuffer for cross-process data
+│   ├── config/            ← Camera extrinsics (CameraCalib)
+│   ├── utils/             ← Logging, signal utils, rate limiting, array utils
+│   └── tools/             ← CLI tools: episode viewer, health check, HDF5→Zarr export
+├── examples/
+│   ├── real/              ← Real-hardware entry points
+│   └── sim/               ← Simulation entry points
+├── tests/                 ← pytest test suite
+├── docs/                  ← Architecture docs, analysis reports
+├── assets/                ← URDF, SRDF, meshes, retargeting configs, audio
+└── .claude/               ← Claude Code config (settings, skills, workflows)
 ```
 
-## Key data flow (decision/recording loop @ 16 Hz; ArmInnerLoop stays @ 50 Hz)
+---
+
+## Architecture
+
+### Data Flow (recording loop @ 16 Hz; ArmInnerLoop @ 50 Hz)
 
 ```
-VR Tracker → ArmWristMapper (wrist→EEF pose)  ──→ TeleopPipeline.compute_action()
-            XHandRetargeter (landmarks→12-DOF) ──┘   ├─ arm: wrist pose → solve_teleop_ik
-                                                      ├─ hand: MANO skeleton retargeting
-                                                      │   → adaptive scaling → NLP optimize
-                                                      │   → LPFilter EMA (dex_retargeting built-in; τ-invariant:
-                                                      │     0.6@50Hz → 0.943@16Hz, set via XHandRetargeter ctor)
-                                                      │   → delta clip (XHand E3; entry point derives
-                                                      │     deg2rad(90)/CTRL_HZ ≈ 0.098 rad/send @16Hz)
-                                                      ├─ arm: Cartesian EMA (production SHM path: 1.0/1.0
-                                                      │   pass-through — smoothing is Mode 6 firmware's job)
-                                                      └─ arm IK anomaly jump-limit (default 90°, planning/ik.py)
-                                                                   │
-RobotInterface.validate_action() ← pre-send gate (error + connection + torque + temp + workspace clamp
-                                    + arm clip + hand clip; env_collision accepted but not wired)
-ArmInnerLoop.set_target(arm_qpos_cmd) ← arm cmd → 50Hz inner loop (mode 6: passthrough, firmware trajectory
-                                        planning; teleop 采集入口覆写 joint_max_speed 90→120°/s, 库默认仍 90)
+VR Tracker ──→ ArmWristMapper (wrist → EEF pose)  ──→ TeleopPipeline.compute_action()
+              XHandRetargeter (landmarks → 12-DOF) ──┘   ├─ arm:  wrist pose → solve_teleop_ik
+                                                          ├─ hand: MANO → NLP optimize → LPFilter EMA
+                                                          │        → delta clip (≈0.098 rad/send @16Hz)
+                                                          ├─ arm:  Cartesian EMA (TeleopPipeline default: pos α=0.8, rot α=0.4; check actual entry point overrides)
+                                                          └─ arm:  IK anomaly jump-limit (default 90°)
+                                                                       │
+RobotInterface.validate_action() ← pre-send gate (error + connection + torque + temp
+                                    + workspace clamp + joint-limit clip)
+ArmInnerLoop.set_target(arm_qpos_cmd) ← arm → 50Hz inner loop (mode 6: firmware trajectory planning)
 RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
-        │
-    ┌── XArm7 (SDK C++ binding)  ← driven by ArmInnerLoop @ 50Hz (mode 6: firmware online trajectory planning)
-    └── XHand (SDK C++ binding)  ← joint-limit + delta clip(E3) + optional EMA(E2)
 ```
 
-## Core types (robot/types.py)
+**Key rates:** Control loop 16 Hz, ArmInnerLoop 50 Hz (mode 6 — firmware handles trajectory smoothing).
+ArmInnerLoop provides per-step joint delta clamp + dynamics readback (torque, temperature) to validate_action.
 
-- **`RobotState`** — complete state: `arm_qpos(7)`, `arm_qvel(7)`, `arm_tau(7)`, `eef_pos(3)`, `eef_quat_wxyz(4)`, `eef_rot6d(6)`, `hand_qpos(12)`, `hand_tactile_sum(5,3)`, `hand_tactile_force(5,120,3)`, `fingertip_pos(5,3)`
-- **`RobotAction`** — command: `arm_qpos_cmd(7)`, `hand_qpos_cmd(12)`, optional `target_eef_pos`/`target_eef_rot6d`
-- **`RobotInterfaceConfig`** — arm/hand configs, workspace bounds, collision config, hand URDF transforms
-- **`RobotInterface`** — sole hardware access point; controllers NEVER call XArm7/XHand directly
-
-## State machine (TeleopController)
+### State Machine (TeleopController)
 
 ```
 IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
@@ -135,66 +103,67 @@ IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
   └── S(stop+save) / H(home) ┘
   ESC / VR-disconnect timeout → EMERGENCY_STOP
 ```
-- States (`ControllerState` enum): **IDLE, TELEOP, PAUSED, EMERGENCY_STOP** only.
-- **Recording is a bool flag, not a state**: set True on BEGIN (starts together with TELEOP),
-  saved on STOP (S) / discarded on QUIT (Q). There is no RECORDING or SAVE_PROMPT state.
-- **PAUSED**: freeze IK, hold position (C key)
-- Return-to-home: 2-phase — Phase 1: EEF Cartesian path, Phase 2: joint-space redundant joint alignment
 
-## Motion planning (planning/planner.py)
+States (`ControllerState` enum): **IDLE, TELEOP, PAUSED, EMERGENCY_STOP** only.
+Recording is a bool flag (not a state): set True on B, saved on S, discarded on Q.
 
-- **XArm7MotionPlanner** — MPlib backend, delegates to `kin` (FK/Jacobian), `ik_mgr` (IK candidate gen), `mp_planner` (raw MPlib calls) via `__getattr__` proxy
-- **`plan_path()`** — screw → multi-RRT fallback, validated through 8 checks (limits, elbow consistency, start depth, waypoint delta, terminal pose, self/env collision, workspace, desk safety)
-- **`solve_teleop_ik()`** — teleop-optimized IK (seed from prev qpos, elbow consistency, desk safety preferred)
-- **Collision modes**: `geometric_fk` (FK fingertip Z vs desk, zero-cost) or `mplib_pointcloud` (octree point cloud)
-- **Path scoring**: joint_length * 1.0 + waypoint_delta * 2.0 + eef_inefficiency * 3.0
+### Core Types (`dexmani_real/robot/types.py`)
 
-## HDF5 recording format
+- **`RobotState`** — `arm_qpos(7)`, `arm_qvel(7)`, `arm_tau(7)`, `eef_pos(3)`, `eef_quat_wxyz(4)`, `eef_rot6d(6)`, `hand_qpos(12)`, `hand_tactile_sum(5,3)`, `hand_tactile_force(5,120,3)`, `fingertip_pos(5,3)`, `arm_connected`, `hand_connected`, `timestamp`
+- **`RobotAction`** — `arm_qpos_cmd(7)`, `hand_qpos_cmd(12)`, optional `target_eef_pos`/`target_eef_rot6d`
+- **`RobotInterfaceConfig`** — arm/hand configs, workspace bounds, collision config, hand URDF transforms
+- **`RobotInterface`** — sole hardware access point; controllers NEVER call XArm7/XHand directly
 
-All streams are aligned to one `dt=1/control_hz` time grid at record time (`TimestampAlignedBuffer`,
-16 Hz in all recording entry points; library default 50), keyed by `state.timestamp`; camera frames
-stream per-frame, index-aligned to the grid (per-slot forward-fill).
+### Safety Architecture
 
-```
-episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collision
-  /meta (group)
-    attrs: schema_version(=8), control_hz, task_label, operator, tags, duration, fps, num_frames,
-           success, min_frames_met, has_camera, has_pointcloud, has_timestamps,
-           truncated, stop_reason, cam_frames_dropped, cam_items_written,
-           camera_serial, camera_type, camera_K, camera_T_world_camera, camera_T_eef_camera,
-           skip_initial_frames, control_mode, arm_mode, hand_mode,
-           arm_delta_clip, hand_delta_clip, hand_max_qvel_deg_s, hand_ema_alpha, hand_low_pass_alpha,
-           ema_alpha_pos, ema_alpha_rot,
-           pc_num_points, pc_depth_min_m, pc_depth_max_m, pc_workspace, pc_voxel_size,
-           pc_radius_outlier_min_points, pc_radius_outlier_radius, pc_fps_backend
-  /arm_qpos(T,7)           arm joint positions (rad)
-  /arm_ee(T,9)             EEF [pos(3), rot6d(6)]
-  /arm_qvel(T,7)           arm joint velocities (rad/s)
-  /arm_tau(T,7)            arm joint torques (Nm)
-  /hand_qpos(T,12)         hand joint positions (rad)
-  /hand_fingertip(T,5,3)   fingertip positions in base frame
-  /hand_contact(T,5,3)     tactile force sum per finger
-  /action_arm_joint(T,7)   arm joint command
-  /action_arm_ee(T,9)      target EEF [pos(3), rot6d(6)] (NaN if not set)
-  /action_hand_joint(T,12) hand joint command
-  /flag_ik_ok(T,)          bool — IK solved successfully
-  /flag_retarget_ok(T,)    bool — retargeting converged
-  /flag_held(T,)           bool — command held (no fresh VR/IK result)
-  /flag_camera_fresh(T,)   bool — a new camera frame arrived within 0.2s (False = frozen/forward-filled)
-  /vr_wrist_pos(T,3)       VR wrist position in base frame
-  /vr_wrist_rot6d(T,6)     VR wrist orientation as 6D rotation
-  /vr_landmarks(T,21,3)    VR hand landmarks (MANO convention)
-  /rgb(T,H,W,3)            uint8 camera frames (forward-filled to grid; lzf — 写线程须跟上栅格速率)
-  /depth(T,H,W)            uint16 Z16 depth, L515 validity-gated (forward-filled to grid; lzf)
-  /pointcloud(T,2048,6)    float32 world-frame [xyz, rgb 0-1] — computed online @30Hz in
-                           CameraProcess (sensor/pointcloud_processor.py), forward-filled
-  /timestamp(T)            raw sample timestamps on the dt grid (62.5ms spacing @16Hz;
-                           forward-filled slots repeat the previous raw value)
-```
-- **RecordingSession** (`recording/recording_session.py`) — driver-agnostic: one writer thread
-  serializes start/record/stop so the HDF5 file is touched by a single thread (no teardown race).
-- **CollectionLoop** orchestrates lifecycle: start/stop, sidecar JSON, discard (unlink). Single
-  `data_dir` — `success` is a `/meta` attr + sidecar `classification`, **not** directory routing.
+1. **Pre-send gate** (`validate_action()`): error gate → connection gate → torque gate → temperature gate → workspace clamp → arm clip → hand clip
+2. **IK-level**: workspace clamping, IK anomaly jump-limit (arm: 90° default)
+3. **Hand command-level**: delta clip (≈0.098 rad/send @16Hz) + optional EMA
+4. **Path execution**: torque monitoring per waypoint, collision verification
+5. **Desk safety**: `FingertipDeskSafety` — FK-based fingertip Z check (zero-cost, complements MPlib point cloud)
+6. **Emergency stop**: `RobotInterface.emergency_stop()` → arm.stop() + hand.stop()
+
+Torque limits: J1-J2=50, J3-J5=30, J6-J7=20 Nm. Temperature limit: 70°C per joint.
+
+---
+
+## Recording Format (HDF5)
+
+Schema version **8**. All streams aligned to `dt=1/control_hz` time grid at record time (16 Hz).
+Camera frames stream per-frame, index-aligned to grid (per-slot forward-fill).
+
+**Key datasets:** `/arm_qpos(T,7)`, `/arm_ee(T,9)`, `/arm_qvel(T,7)`, `/arm_tau(T,7)`, `/hand_qpos(T,12)`, `/hand_fingertip(T,5,3)`, `/hand_contact(T,5,3)`, `/action_arm_joint(T,7)`, `/action_arm_ee(T,9)`, `/action_hand_joint(T,12)`, `/flag_ik_ok(T,)`, `/flag_retarget_ok(T,)`, `/flag_held(T,)`, `/flag_camera_fresh(T,)`, `/vr_wrist_pos(T,3)`, `/vr_wrist_rot6d(T,6)`, `/vr_landmarks(T,21,3)`, `/rgb(T,H,W,3)`, `/depth(T,H,W)`, `/pointcloud(T,2048,6)`, `/timestamp(T)`
+
+**Meta attrs:** schema_version, control_hz, task_label, operator, tags, duration, fps, num_frames, success, stop_reason, camera_* (serial, type, K, extrinsics), pc_* (num_points, depth range, voxel_size), hand_* (delta_clip, ema_alpha, low_pass_alpha), ema_alpha_pos/rot, truncated, cam_frames_dropped
+
+**Recording pipeline:** `EpisodeRecorder` (HDF5 I/O) → `CollectionLoop` (lifecycle) → `RecordingSession` (single writer thread, queue-based). Driver feeds `start()` / `record()` / `stop()`.
+
+---
+
+## Entry Points
+
+| Entry Point | Purpose |
+|-------------|---------|
+| `examples/real/vr_teleop_shm.py` | **Main** real-hardware VR teleop (TeleopController + SHM VR) |
+| `examples/real/vr_teleop_arm_only.py` | Arm-only VR teleop (direct recorder, no controller) |
+| `examples/real/vr_teleop_arm_only_record.py` | Arm-only with recording |
+| `examples/real/vr_teleop_arm_only_record_plus.py` | Arm-only extended recording |
+| `examples/real/keyboard_teleop_real.py` | Keyboard-based arm control |
+| `examples/real/test_quest_hand_teleop.py` | Standalone hand-retargeting test |
+| `examples/real/test_motion_planning_real.py` | Motion planning test on hardware |
+| `examples/real/test_pointcloud_process.py` | Point cloud processing test |
+| `examples/real/test_pointcloud_stream.py` | Point cloud streaming test |
+| `examples/real/replay_traj.py` | Replay a recorded trajectory |
+| `examples/real/calibrate_camera.py` | Camera extrinsic calibration |
+| `examples/real/calibrate_l515_depth.py` | L515 depth calibration (sigma_poly) |
+| `examples/real/test_realsense.py` | RealSense camera connection test |
+| `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
+| `examples/sim/test_motion_planning_sim.py` | Motion planning in simulation |
+| `dexmani_real/tools/visualize_episode.py` | 3D + camera + time-series HDF5 viewer |
+| `dexmani_real/tools/check_episode_health.py` | Episode health check (grid fill, camera freeze, tracking error) |
+| `dexmani_real/tools/export_hdf5_to_zarr.py` | HDF5→Zarr converter |
+
+---
 
 ## Conventions
 
@@ -208,57 +177,32 @@ episode_YYYYMMDD_HHMMSS.h5   # timestamp-named; +_N suffix on same-second collis
 | Logging | `from dexmani_real.utils.log import get_logger` → `logger = get_logger(__name__)` |
 | Error handling | fail-safe (NaN→neutral, errors→warning+fallback); try/except with `logger.warning` |
 | Hardware access | ONLY via `RobotInterface`; never call XArm7/XHand directly |
-| Thread safety | `threading.Event` for cancellation; `ExitStack` for cleanup; GIL-protected numpy ops |
+| Thread safety | `threading.Lock` for shared state; `threading.Event` for cancellation; GIL-protected numpy ops |
 | Cross-process | `SharedMemoryRingBuffer` (shm/) — camera/VR processes ↔ controller |
+| Git | `feat/` branches off `main`; commit messages in English |
+| PR body | End with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)` |
 
-## Entry points
+---
 
-| Entry point | Purpose |
-|-------------|---------|
-| `examples/real/vr_teleop_shm.py` | Main real-hardware VR teleop (TeleopController + SHM VR) |
-| `examples/real/vr_teleop_arm_only.py` | Arm-only VR teleop (direct recorder, no controller) |
-| `examples/real/keyboard_teleop_real.py` | Keyboard-based arm control |
-| `examples/real/test_quest_hand_teleop.py` | Standalone hand-retargeting test (no TeleopController) |
-| `examples/sim/vr_teleop_sim.py` | VR teleop in SAPIEN simulation |
-| `dexmani_real/tools/visualize_episode.py` | Rerun-based HDF5 episode viewer (3D + camera + time series) |
-| `dexmani_real/tools/check_episode_health.py` | Episode 健康检查（栅格填充/相机内容重复/跟踪误差；有 WARN 时 exit 1） |
-| `dexmani_real/tools/export_hdf5_to_zarr.py` | HDF5→Zarr format converter |
-
-## Safety architecture
-
-1. **Pre-send gate** (`validate_action()`): robot error gate, arm connection gate, **torque gate**,
-   **temperature gate** (both fed from ArmInnerLoop's 50Hz dynamics readback via `get_dynamics()`),
-   workspace clamp, arm joint-limit clip, hand joint-limit clip.
-   `env_collision_check` param is accepted but **not yet wired** — hard prerequisite before
-   autonomous policy rollouts.
-2. **IK-level**: workspace clamping, IK anomaly jump-limit (arm: 90° default, `planning/ik.py:140`)
-3. **Hand command-level**: delta clip (E3 per-send hard gate; production entry derives
-   `deg2rad(90)/CTRL_HZ` ≈ 0.098 rad @16Hz, library default 0.3) + optional EMA (E2, `XHandConfig.ema_alpha`)
-4. **Retargeting-level**: built-in LPFilter EMA (dex_retargeting `SeqRetargeting.retarget()`;
-   τ-invariant `low_pass_alpha` 0.6@50Hz → 0.943@16Hz via ctor)
-5. **Path execution**: torque monitoring per waypoint, collision verification (self + env + desk FK)
-6. **Desk safety**: `FingertipDeskSafety` — FK-based fingertip Z check (complements MPlib point cloud)
-7. **Emergency stop**: `RobotInterface.emergency_stop()` → arm.stop() + hand.stop()
-
-## Key dependencies
-
-- `mplib` — motion planning library (IK, screw/RRT planning, collision detection)
-- `pinocchio` — rigid body dynamics (FK, Jacobian)
-- `h5py` — HDF5 serialization
-- RealSense SDK — camera capture
-- XArm7/XHand SDKs — hardware communication (C++ bindings)
-- `sapien` — physics simulation
-- `numpy` — all array math
-
-## Hardware notes
-
-**Intel RealSense L515** — must be connected to a **direct motherboard USB 3.0 port** (no intermediate hub). Connecting through a USB hub causes isochronous packet loss and pipeline stall (frames stop arriving after ~3 s). Verify with `lsusb -t`: the L515 (8086:0b64) must appear directly under a root hub port, not indented under a `Hub` node.
-
-## Anti-patterns to avoid
+## Anti-Patterns
 
 - ❌ Calling XArm7/XHand directly → use `RobotInterface`
 - ❌ Blocking calls in 50Hz loop → use async patterns or offload to separate processes
 - ❌ Ignoring validate_action() → always call before send_action()
 - ❌ Circular imports → use `TYPE_CHECKING` + lazy imports
 - ❌ Mutable defaults in dataclass fields → use `field(default_factory=...)`
-- ❌ Skipping `__init__.py` re-exports → each subpackage has explicit `__all__`
+- ❌ Skipping `__init__.py` — new subpackages must have a docstring; `planning/`, `recording/`, and `simulation/` define `__all__` (match their pattern when adding public API)
+- ❌ Hardcoding 50Hz assumptions → use `control_hz` from config (recording is 16 Hz)
+- ❌ Adding state enum variants → Recording is a bool, not a ControllerState; no RECORDING/SAVE_PROMPT state
+
+---
+
+## Hardware Notes
+
+**Intel RealSense L515** — must connect to a **direct motherboard USB 3.0 port** (no hub). Connecting through a hub causes isochronous packet loss and pipeline stall (~3s until frames stop). Verify: `lsusb -t` — L515 (8086:0b64) must be under a root hub port, not indented under `Hub`.
+
+**L515 known issues:** Depth intrinsics can enter a bad state (missing VGA/XGA parameters → `rs.align` crash); `hardware_reset()` fixes it (not a calibration defect). See memory: [[l515-depth-intrinsics-bad-state]], [[l515-midrun-stream-stall]].
+
+**xArm7 Mode 6:** Firmware online trajectory planning — arm target is forwarded directly at 50Hz. Firmware respects speed/accel limits (default: 90°/s, 500°/s²). No inner-loop interpolation needed.
+
+**Key dependencies:** `mplib` (motion planning), `pinocchio` (rigid body dynamics), `h5py` (HDF5), RealSense SDK, XArm7/XHand SDKs (C++ bindings), `sapien` (simulation), `numpy`.

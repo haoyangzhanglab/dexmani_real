@@ -366,7 +366,7 @@ class RobotInterface:
 
             if not plan_ok:
                 # ── Tier 2: Safe joint-space fallback (collision-checked) ──
-                logger.warning(
+                logger.info(
                     "plan_path failed: %s, trying safe joint-space fallback",
                     plan_reason,
                 )

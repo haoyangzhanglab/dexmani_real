@@ -60,7 +60,6 @@ logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ Constants
 
-CTRL_DT = 0.02  # 50Hz
 HOME_DT = 0.04  # homing waypoint interval (s)
 
 WORKSPACE_BOUNDS = np.array(
@@ -73,7 +72,8 @@ COLLISION_CONFIG = CollisionConfig(
     hand_safe_margin=0.03,
 )
 
-_INNER_CFG = ArmInnerLoopConfig()
+ARM_MAX_SPEED_DEG_S = 120.0  # 对齐采集入口 (vr_teleop_arm_only_record*.py) — 回放与采集同速
+_INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 
@@ -604,8 +604,9 @@ class TrajectoryReplayer:
             effective_T = min(effective_T, max_frames)
         self._T = effective_T
 
-        # ArmInnerLoop: extend timeout for slow replay speeds
+        # ArmInnerLoop: extend timeout for slow replay speeds; speed aligned with capture (120°/s)
         self._inner_cfg = ArmInnerLoopConfig(
+            joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
             target_timeout_s=max(0.2, 1.0 / max(self.replay_hz, 1.0) + 0.1),
         )
 

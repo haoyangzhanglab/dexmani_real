@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import time
+
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
@@ -55,10 +57,17 @@ class TeleopIKSolver:
     _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)    # above this → elbow-down branch
     _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)     # minimum J4 change to count as flip
 
+    # F3: Wall-clock budget for teleop IK solve.  At 16 Hz (62.5 ms/frame),
+    # 10 ms leaves ample headroom for the rest of the pipeline (mapper, retargeting,
+    # validate_action, send).  Exceeding this budget means the solver is stuck on a
+    # near-singular or ill-conditioned pose — better to hold and try next frame.
+    _IK_TIMEOUT_S: float = 0.010
+
     def __init__(self, kin: XArm7Kinematics, ik_mgr: IKCandidateManager, teleop_profile: TeleopProfile) -> None:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
+        self._ik_timing_log_throttle: int = 0  # countdown for ~5s throttled timing log
 
     # Public API
 
@@ -72,6 +81,8 @@ class TeleopIKSolver:
              errors or near-singularity where diff IK fails.
           3. Both fail → hold previous command.
         """
+        t_start = time.perf_counter()
+
         profile = self.profile
         current_qpos = ensure_qpos(current_qpos, self.kin.dof, "current_qpos")
         previous_qpos_cmd = ensure_qpos(previous_qpos_cmd, self.kin.dof, "previous_qpos_cmd")
@@ -79,16 +90,19 @@ class TeleopIKSolver:
         # ── Step 1: Differential IK (deterministic, primary) ──
         diff_ik_failed = False
         diff_ik_reason = ""
+        dt_diff_s: float = 0.0
         if profile.use_differential_ik_fallback:
             diff_result = self.solve_differential_ik(
                 target_eef_pose_world, current_qpos, previous_qpos_cmd, profile,
             )
+            dt_diff_s = time.perf_counter() - t_start
             if diff_result.success:
                 # Verify the diff IK result actually reaches the target.
                 pos_err, rot_err = self.kin.compute_world_pose_error(
                     target_eef_pose_world, diff_result.qpos,
                 )
                 if pos_err <= profile.max_pose_error_pos_m and rot_err <= profile.max_pose_error_rot_rad:
+                    self._maybe_log_ik_timing(dt_diff_s, 0.0, diff_result.report.get("iterations", 0))
                     return diff_result
                 # Diff IK converged but pose error too large → fall through to position IK.
                 diff_ik_failed = True
@@ -98,23 +112,38 @@ class TeleopIKSolver:
                 diff_ik_reason = diff_result.reason
 
         # ── Step 2: Position IK (stochastic fallback) ──
+        dt_pos_s: float = 0.0
         position_report: dict[str, Any] = {}
         if profile.use_position_ik:
-            qpos, position_report = self.solve_position_ik(
-                target_eef_pose_world, current_qpos, previous_qpos_cmd, profile,
-            )
-            if qpos is not None:
-                return self.command_from_target_qpos(
-                    target_eef_pose_world=target_eef_pose_world,
-                    current_qpos=current_qpos,
-                    previous_qpos_cmd=previous_qpos_cmd,
-                    target_qpos=qpos,
-                    profile=profile,
-                    report=position_report,
-                    method="position_ik",
+            # F3: skip the expensive MPlib position-IK fallback if diff IK
+            # already exhausted the time budget — better to hold one frame
+            # than to blow the 62.5 ms pipeline window.
+            if time.perf_counter() - t_start > self._IK_TIMEOUT_S:
+                logger.warning(
+                    "IK timeout: diff IK took %.1fms, skipping position IK fallback",
+                    dt_diff_s * 1000,
                 )
+                position_report = {"teleop_ik_method": "position_ik", "failure_reason": "timeout_skipped"}
+            else:
+                qpos, position_report = self.solve_position_ik(
+                    target_eef_pose_world, current_qpos, previous_qpos_cmd, profile,
+                )
+                dt_pos_s = time.perf_counter() - t_start - dt_diff_s
+                if qpos is not None:
+                    self._maybe_log_ik_timing(dt_diff_s, dt_pos_s, 0)
+                    return self.command_from_target_qpos(
+                        target_eef_pose_world=target_eef_pose_world,
+                        current_qpos=current_qpos,
+                        previous_qpos_cmd=previous_qpos_cmd,
+                        target_qpos=qpos,
+                        profile=profile,
+                        report=position_report,
+                        method="position_ik",
+                    )
 
         # ── All strategies failed → hold ──
+        dt_total_s = time.perf_counter() - t_start
+        self._maybe_log_ik_timing(dt_diff_s, dt_pos_s, 0)
         diagnostic = self._build_ik_diagnostic(
             diff_ik_failed=diff_ik_failed,
             diff_ik_reason=diff_ik_reason if diff_ik_failed else "",
@@ -123,8 +152,31 @@ class TeleopIKSolver:
         return IKResult(
             success=False, qpos=previous_qpos_cmd.copy(),
             reason=diagnostic["summary"],
-            report={"held": True, "diagnostic": diagnostic}, held=True,
+            report={"held": True, "diagnostic": diagnostic, "ik_timing_ms": round(dt_total_s * 1000, 1)},
         )
+
+    # IK timing diagnostic (throttled ~5s or on threshold exceed)
+
+    def _maybe_log_ik_timing(self, dt_diff_s: float, dt_pos_s: float, diff_iters: int) -> None:
+        """Log IK timing diagnostic, throttled to ~once per 5s or on >10ms total."""
+        dt_total_ms = (dt_diff_s + dt_pos_s) * 1000
+        threshold_exceeded = dt_total_ms > 10.0
+
+        if self._ik_timing_log_throttle > 0 and not threshold_exceeded:
+            self._ik_timing_log_throttle -= 1
+            return
+
+        if threshold_exceeded:
+            logger.warning(
+                "IK timing: diff=%.1fms (iters=%d) + pos=%.1fms = total=%.1fms (>10ms budget!)",
+                dt_diff_s * 1000, diff_iters, dt_pos_s * 1000, dt_total_ms,
+            )
+        else:
+            logger.debug(
+                "IK timing: diff=%.1fms (iters=%d) + pos=%.1fms = total=%.1fms",
+                dt_diff_s * 1000, diff_iters, dt_pos_s * 1000, dt_total_ms,
+            )
+        self._ik_timing_log_throttle = 80  # ~5s at 16Hz
 
     # Position IK — simplified single-seed with fallback
 
@@ -546,7 +598,17 @@ class TeleopIKSolver:
         iterations = 0
         converged = False
         last_jacobian: np.ndarray | None = None  # P5: reuse in nullspace path
+        _tik_start = time.perf_counter()  # F3: wall-clock budget for this diff-IK call
         for iterations in range(max_iter):
+            # F3: abort diff IK if we've blown the time budget.  Skip the check
+            # on iteration 0 so at least one FK+Jacobian (needed for nullspace)
+            # always completes — the first iteration is always cheap (~0.3 ms).
+            if iterations > 0 and time.perf_counter() - _tik_start > self._IK_TIMEOUT_S:
+                logger.warning(
+                    "Diff IK timeout: %d iterations in %.1fms, aborting",
+                    iterations, (time.perf_counter() - _tik_start) * 1000,
+                )
+                break
             jacobian, current_pose = self.kin.compute_eef_jacobian_and_pose_world(qpos)
             last_jacobian = jacobian  # cache for nullspace FK reuse (P5)
 

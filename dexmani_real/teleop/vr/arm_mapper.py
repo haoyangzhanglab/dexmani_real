@@ -24,6 +24,7 @@ class ArmWristMapper:
         base_to_world_rot: np.ndarray | None = None,
         eef_delta_bounds: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
+        max_per_frame_rot_rad: float = 0.52,  # ~30°/frame @ 16 Hz — VR glitch gate
     ) -> None:
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
@@ -34,14 +35,19 @@ class ArmWristMapper:
         self.base_to_world_rot = np.eye(3) if base_to_world_rot is None else np.asarray(base_to_world_rot, dtype=np.float64)
         # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
         self.eef_delta_bounds = None if eef_delta_bounds is None else np.asarray(eef_delta_bounds, dtype=np.float64)
-        # Per-frame rotation delta cap (rad). ~57° default — catches VR tracking glitches.
+        # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
+        # drift from the reset pose before it reaches IK.
         self.max_delta_rot_rad = max_delta_rot_rad
+        # Per-frame rotation delta cap (rad). ~30°/frame default — catches single-frame
+        # VR tracking glitches (spike-and-recover) that the total-delta cap misses.
+        self.max_per_frame_rot_rad = max_per_frame_rot_rad
 
         self.wrist_pos0 = None
         self.wrist_rot0 = None
         self.eef_pos0 = None
         self.eef_rot0 = None
         self.last_quat_wxyz = None
+        self._last_wrist_rot: np.ndarray | None = None  # F2: per-frame rotation delta gate
 
     def reset(
         self,
@@ -55,6 +61,7 @@ class ArmWristMapper:
         self.eef_pos0 = np.asarray(eef_pos, dtype=np.float64).copy()
         self.eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz))
         self.last_quat_wxyz = normalize_quat_wxyz(eef_quat_wxyz)
+        self._last_wrist_rot = self.wrist_rot0.copy()
 
     def map(
         self,
@@ -67,6 +74,22 @@ class ArmWristMapper:
         wrist_pos = np.asarray(wrist_pos, dtype=np.float64)
         wrist_rot = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
 
+        # F2: Per-frame rotation delta gate — catches single-frame VR tracking
+        # glitches (spike-and-recover) that the total-from-reset clip misses.
+        # Normal human wrist rotation is < 20°/frame at 16 Hz; the 30°/frame
+        # default (~480°/s) is ~2× the fastest plausible motion.
+        if self._last_wrist_rot is not None:
+            frame_delta = wrist_rot @ self._last_wrist_rot.T
+            _axis, frame_angle = mat2axangle(frame_delta)
+            if frame_angle > self.max_per_frame_rot_rad:
+                logger.warning(
+                    "Per-frame rotation spike: %.1f° -> clamped to %.1f°",
+                    np.rad2deg(frame_angle), np.rad2deg(self.max_per_frame_rot_rad),
+                )
+                frame_delta_clamped = axangle2mat(_axis, self.max_per_frame_rot_rad, is_normalized=True)
+                wrist_rot = frame_delta_clamped @ self._last_wrist_rot
+        self._last_wrist_rot = wrist_rot.copy()
+
         delta_pos_vr = wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
         delta_pos_base = self.clip_delta_pos(delta_pos_base)
@@ -76,7 +99,7 @@ class ArmWristMapper:
 
         delta_rot_vr = wrist_rot @ self.wrist_rot0.T
         delta_rot_vr = self.scale_rot(delta_rot_vr)
-        delta_rot_vr = self._clip_delta_rot(delta_rot_vr)
+        delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
         delta_rot_base = self.vr_to_base_rot @ delta_rot_vr @ self.vr_to_base_rot.T
         # Similarity-transform rotation delta from base frame → world frame.
         delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
@@ -96,6 +119,7 @@ class ArmWristMapper:
         self.eef_pos0 = None
         self.eef_rot0 = None
         self.last_quat_wxyz = None
+        self._last_wrist_rot = None
 
     def is_ready(self) -> bool:
         return self.wrist_pos0 is not None and self.eef_pos0 is not None
@@ -165,16 +189,17 @@ class ArmWristMapper:
         axis, angle = mat2axangle(rot)
         return axangle2mat(axis, self.rot_scale * angle, is_normalized=True)
 
-    def _clip_delta_rot(self, delta_rot: np.ndarray) -> np.ndarray:
-        """Clamp per-frame rotation delta to prevent VR tracking glitches.
+    def _clip_total_delta_rot(self, delta_rot: np.ndarray) -> np.ndarray:
+        """Clamp total-from-reset rotation delta to prevent VR tracking glitches.
 
         Ref: ManiUniCon max_delta_rot=1.0rad (~57°).
-        Catches transient VR jumps before they reach IK.
+        Catches accumulated drift from the reset pose before it reaches IK.
+        Note: this is NOT per-frame — it clips the total rotation since reset().
         """
         axis, angle = mat2axangle(delta_rot)
         if angle > self.max_delta_rot_rad:
             logger.debug(
-                "clip_delta_rot: clamping %.3f rad -> %.3f rad",
+                "clip_total_delta_rot: clamping %.3f rad -> %.3f rad",
                 angle, self.max_delta_rot_rad,
             )
             return axangle2mat(axis, self.max_delta_rot_rad, is_normalized=True)

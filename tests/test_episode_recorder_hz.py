@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
@@ -184,3 +185,75 @@ def test_start_refuses_pending_stop(tmp_path):
     rec.join_stop = lambda timeout=10.0: False  # pending flush that never finishes
     assert rec.start_episode() is False
     assert not rec.is_recording
+
+
+def test_backfill_camera_meta_after_lazy_write(tmp_path):
+    """B-before-camera-connect: camera attrs missing at the initial lazy meta
+    write are re-written at stop from backfill_camera_meta() values."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4)
+    assert rec.start_episode()  # camera child not connected → K/depth_scale snapshot None
+    t0 = 2000.0
+    for k in range(8):
+        assert rec.add_frame(_fake_state(t0 + k * DT), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+    rec._ensure_hdf5()  # initial meta write happens with camera keys still None
+    rec.backfill_camera_meta(depth_scale=0.00025, camera_K=np.arange(9, dtype=np.float64).reshape(3, 3))
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        meta = f["meta"].attrs
+        assert meta["depth_scale"] == pytest.approx(0.00025)
+        assert np.allclose(meta["camera_K"], np.arange(9.0))
+
+
+def test_backfill_does_not_override_start_values(tmp_path):
+    """Keys already supplied at start_episode() win over late backfill."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4)
+    assert rec.start_episode(depth_scale=0.001)
+    assert rec.add_frame(_fake_state(2000.0), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+    rec.backfill_camera_meta(depth_scale=0.00025)
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        assert f["meta"].attrs["depth_scale"] == pytest.approx(0.001)
+
+
+def test_stop_impl_enospc_sets_stop_error(tmp_path):
+    """ENOSPC mid-flush → stop_error set, join_stop False, state reset for restart."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4)
+    assert rec.start_episode()
+    for k in range(8):
+        assert rec.add_frame(_fake_state(2000.0 + k * DT), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+    # Inject disk-full error into the flush path called by _stop_episode_impl_inner.
+    def _raise_enospc():
+        raise OSError(28, "No space left on device")
+    rec._flush_buffered = _raise_enospc
+    path = rec.stop_episode(success=True)
+    assert path is not None
+    ok = rec.join_stop(timeout=5.0)
+    assert not ok, "join_stop must return False when stop thread crashed"
+    assert rec.stop_error is not None
+    assert "OSError" in rec.stop_error
+    assert "No space" in rec.stop_error
+    assert not rec.is_recording
+
+
+def test_restart_after_stop_error(tmp_path):
+    """State is clean after a crashed stop — a new episode can start."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4)
+    assert rec.start_episode()
+    assert rec.add_frame(_fake_state(2000.0), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+    _orig_flush = rec._flush_buffered
+    rec._flush_buffered = lambda: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+    rec.stop_episode(success=True)
+    rec.join_stop(timeout=5.0)
+    assert rec.stop_error is not None
+    # Restore the real _flush_buffered so the second episode writes cleanly.
+    rec._flush_buffered = _orig_flush
+    # start_episode must succeed — state was reset by the wrapper's except block.
+    assert rec.start_episode()
+    assert rec.is_recording
+    assert rec.add_frame(_fake_state(3000.0), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    assert rec.stop_error is None  # clean this time
+    assert Path(path).exists()

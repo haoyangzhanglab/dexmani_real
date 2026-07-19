@@ -34,6 +34,7 @@ _EVENT_MAP: dict[str, str] = {
     "quit": "准备退出遥操作.wav",
     "quit_save_prompt": "已退出，是否需要保存轨迹.wav",
     "calibrated": "轴向已标定.wav",
+    "end": "操作结束.wav",
 }
 
 

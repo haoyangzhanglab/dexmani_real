@@ -128,6 +128,10 @@ class EpisodeRecorder:
         # Guarded by start_episode() to prevent overlapping episodes.
         self._stop_thread: threading.Thread | None = None
 
+        # Error from the last _stop_episode_impl (ENOSPC, etc.) — set inside
+        # the daemon thread; callers poll via stop_error after join_stop().
+        self._stop_error: str | None = None
+
         _LIVE_RECORDERS.add(self)  # atexit flush net
 
     @property
@@ -141,6 +145,11 @@ class EpisodeRecorder:
     @property
     def max_frames_reached(self) -> bool:
         return self._max_frames_reached
+
+    @property
+    def stop_error(self) -> str | None:
+        """Error message from the last _stop_episode_impl, or None if clean."""
+        return self._stop_error
 
     def start_episode(
         self,
@@ -158,9 +167,18 @@ class EpisodeRecorder:
         # _file, _buffer, _datasets, _pending_meta and will reset them on
         # completion.  Refuse to start while it is still alive: proceeding
         # would let the old stop thread clobber the new episode's state.
+        # A crashed stop (ENOSPC, etc.) has already reset state — allow
+        # a new start after logging the error.
         if not self.join_stop(timeout=10.0):
-            logger.error("Previous episode still flushing — refusing to start a new one")
-            return False
+            if self._stop_error is not None:
+                logger.warning(
+                    "Previous stop crashed (%s) — state was reset, allowing new start",
+                    self._stop_error,
+                )
+                self._stop_thread = None
+            else:
+                logger.error("Previous episode still flushing — refusing to start a new one")
+                return False
 
         if self._recording:
             return False
@@ -177,6 +195,7 @@ class EpisodeRecorder:
         self._max_frames_reached = False
         self._start_time = time.perf_counter()
         self._recording = True
+        self._stop_error = None
         self._datasets = {}
         self._flushed_frames = 0
         self._flush_pending = False
@@ -233,6 +252,23 @@ class EpisodeRecorder:
         meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
 
+        self._write_camera_meta_attrs(meta)
+
+        # Collection-config snapshot (control mode, EMA alphas, delta clips) —
+        # essential for downstream reproducibility.  Values are pre-sanitized to
+        # h5py-compatible scalars/strings by the controller.
+        meta.attrs["skip_initial_frames"] = int(p.get("skip_initial_frames", 0))
+        record_config = p.get("record_config") or {}
+        for key, val in record_config.items():
+            meta.attrs[key] = val
+
+    def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
+        """Camera identity/geometry attrs from _pending_meta (None entries skipped).
+
+        Idempotent — _stop_episode_impl re-runs it so values supplied late via
+        backfill_camera_meta() still reach /meta after the initial lazy write.
+        """
+        p = self._pending_meta
         calib = p.get("calib")
         camera_name = p.get("camera_name")
         if calib is not None and camera_name is not None:
@@ -257,13 +293,33 @@ class EpisodeRecorder:
         if depth_scale is not None:
             meta.attrs["depth_scale"] = float(depth_scale)
 
-        # Collection-config snapshot (control mode, EMA alphas, delta clips) —
-        # essential for downstream reproducibility.  Values are pre-sanitized to
-        # h5py-compatible scalars/strings by the controller.
-        meta.attrs["skip_initial_frames"] = int(p.get("skip_initial_frames", 0))
-        record_config = p.get("record_config") or {}
-        for key, val in record_config.items():
-            meta.attrs[key] = val
+    def backfill_camera_meta(
+        self,
+        *,
+        calib: CameraCalib | None = None,
+        camera_name: str | None = None,
+        camera_K: np.ndarray | None = None,
+        depth_scale: float | None = None,
+    ) -> None:
+        """Late-fill camera meta that was unavailable at start_episode().
+
+        Covers the B-before-camera-connect race: the child process publishes
+        serial/K/depth_scale only after connect, so the start_episode() snapshot
+        can be None.  Only keys still None are filled (start values win); the
+        stop thread re-writes the camera attrs, so calling this any time before
+        stop_episode() is enough.
+        """
+        if not self._recording:
+            return
+        p = self._pending_meta
+        for key, val in (
+            ("calib", calib),
+            ("camera_name", camera_name),
+            ("camera_K", camera_K),
+            ("depth_scale", depth_scale),
+        ):
+            if val is not None and p.get(key) is None:
+                p[key] = val
 
     def add_frame(
         self,
@@ -675,23 +731,73 @@ class EpisodeRecorder:
     def join_stop(self, timeout: float = 30.0) -> bool:
         """Wait for the background stop daemon (HDF5 fully written + closed).
 
-        Returns True when no flush is pending anymore.  On timeout the thread
-        handle is KEPT so start_episode() keeps refusing to overlap — dropping
-        it would let a late-finishing flush clobber a new episode's state.
+        Returns True when the flush completed cleanly.  Returns False on timeout
+        (thread still alive — handle KEPT so start_episode() keeps refusing) OR
+        when the stop thread crashed (handle cleared, _stop_error set — caller
+        must inspect stop_error to distinguish).
+
+        The entry MUST consult stop_error after a join_stop() that returned True:
+        a True from a crashed thread means "no pending flush" (the daemon is dead
+        and can't be re-joined), NOT "file written successfully".
         """
         t = self._stop_thread
         if t is None:
+            if self._stop_error is not None:
+                # Thread already joined (dead from crash) in a prior call.
+                return False
             return True
         if t.is_alive():
             t.join(timeout=timeout)
             if t.is_alive():
                 logger.warning("episode-stop still flushing after %.0fs — keeping handle", timeout)
                 return False
+        # Thread finished — check whether it crashed.
+        ok = self._stop_error is None
+        if self._stop_error is not None:
+            logger.error("episode-stop failed: %s", self._stop_error)
         self._stop_thread = None
-        return True
+        return ok
 
     def _stop_episode_impl(self, success: bool, reason: str, truncated: bool) -> None:
-        """Background: flush buffers, forward-fill cameras, write meta, close HDF5."""
+        """Background: flush buffers, forward-fill cameras, write meta, close HDF5.
+
+        ENOSPC / OSError at any h5py call site kills this daemon thread silently.
+        The try/except captures the error into _stop_error so join_stop() and the
+        entry can report failure instead of printing "已保存" for a truncated file.
+        """
+        try:
+            self._stop_episode_impl_inner(success, reason, truncated)
+        except Exception as exc:
+            self._stop_error = f"{type(exc).__name__}: {exc}"
+            logger.error("stop_episode failed: %s — HDF5 may be truncated", self._stop_error)
+            # Best-effort close: metadata may flush partial B-tree updates.
+            try:
+                if self._file is not None:
+                    self._file.close()
+            except Exception:
+                pass
+            self._file = None
+            self._datasets.clear()
+            self._recording = False
+            self._max_frames_reached = False
+            self._frame_count = 0
+            self._start_time = None
+            self._episode_path = None
+            self._buffer = None
+            self._flushed_frames = 0
+            self._cam_seen = False
+            self._last_camera_frame = None
+            self._last_camera_frames = None
+            self._last_T_base_eef = None
+            self._cam_last_frame_number = None
+            self._cam_last_change_ts = 0.0
+            self._cam_writer = None
+            self._cam_written = 0
+            self._cam_dropped = 0
+
+    def _stop_episode_impl_inner(self, success: bool, reason: str, truncated: bool) -> None:
+        """Inner body of _stop_episode_impl — extracted so the try/except wrapper
+        can reset state on any exception without duplicating the reset list."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
         # ── Stop background camera writer ──
@@ -771,6 +877,10 @@ class EpisodeRecorder:
                 # the only disk-side record that camera content was lost.
                 meta.attrs["cam_frames_dropped"] = int(self._cam_dropped)
                 meta.attrs["cam_items_written"] = int(self._cam_written)
+                # Camera meta backfill: the initial lazy write may have run
+                # before the camera child finished connect — re-write so values
+                # supplied via backfill_camera_meta() land in the file.
+                self._write_camera_meta_attrs(meta)
 
         if self._cam_dropped > 0:
             total = self._cam_dropped + self._cam_written

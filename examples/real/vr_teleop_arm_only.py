@@ -176,6 +176,7 @@ EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 # (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
 ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
 _INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
+ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
 
 
 # ═══════════════════════════════════════════════ 归位
@@ -428,9 +429,12 @@ def main():
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
-                recorder.join_stop(timeout=60.0)  # 落盘完成后才报"已保存"
+                recorder.join_stop(timeout=60.0)  # 落盘完成后才报结果
                 if path:
-                    print(f"  录制已保存: {path}  ({n_frames} 帧)")
+                    if recorder.stop_error:
+                        print(f"  ⚠ 保存失败 ({recorder.stop_error}): {path}  — 文件可能不完整")
+                    else:
+                        print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
                 recorder.stop_episode(success=False)
                 # 注意: 与 record/record_plus 不同，此入口丢弃不删除文件 —
@@ -751,8 +755,10 @@ def main():
                 continue
 
             ik_method = "ok"
-            # 平滑已在 IK 前 (笛卡尔 EMA) 完成, IK 输出直接下发
+            # 平滑已在 IK 前 (笛卡尔 EMA) 完成; IK 输出按 joint_max_speed×dt 截步长后下发 —
+            # 快腕旋时 IK 目标可超前可达状态 >50° (实测 max 57.5°), 截步长使 action 标签保持动力学可达
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
+            arm_cmd = prev_qpos_cmd + np.clip(arm_cmd - prev_qpos_cmd, -ARM_CMD_MAX_STEP_RAD, ARM_CMD_MAX_STEP_RAD)
 
             # ── Hand: hold position (skip if hand unavailable) ──
             if hand_available:
@@ -804,7 +810,18 @@ def main():
             recorder.stop_episode(success=False)
         # 无条件等待后台 flush 完成（急停/H 保存的 stop 线程也在此收口）。
         # 必须在交互 prompt 之前 — 否则 flush 被 prompt 劫持、二次 Ctrl-C 可截断 h5。
-        recorder.join_stop(timeout=60.0)
+        _join_deadline = time.perf_counter() + 60.0
+        while True:
+            try:
+                recorder.join_stop(timeout=max(1.0, _join_deadline - time.perf_counter()))
+                break
+            except KeyboardInterrupt:
+                if time.perf_counter() > _join_deadline:
+                    print("\n  ⚠ 写盘超时", flush=True)
+                    break
+                print("\n  ⚠ 正在等待写盘完成，请勿中断…", flush=True)
+        if recorder.stop_error:
+            print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
 
         # ── 保存轨迹 debug 数据 ──
         if len(traj_logger) > 0:

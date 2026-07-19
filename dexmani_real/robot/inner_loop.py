@@ -99,9 +99,10 @@ class ArmInnerLoopConfig:
 
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
-# When the firmware rejects a target with one of these codes, we skip the target and
-# hold position — the outer loop will clear the latch and supply a fresh IK solution.
-# Errors NOT in this set are treated as hard faults that stop the inner loop.
+# When the firmware rejects a target with one of these codes, we clear the latch
+# immediately so the inner loop can continue holding position, and the outer loop's
+# validate_action() does not see a stale error and trigger an unnecessary emergency
+# stop.  Errors NOT in this set are treated as hard faults that stop the inner loop.
 _RECOVERABLE_ERRORS: frozenset[int] = frozenset({
     22,  # Self-Collision Error — IK solver produced unsafe joint angles
     24,  # Speed Exceeds Limit — commanded motion too fast
@@ -372,8 +373,9 @@ class ArmInnerLoop:
                 arm_error = getattr(arm, "error_code", 0)
                 if arm_error != 0:
                     if arm_error in _RECOVERABLE_ERRORS:
-                        # Recoverable — outer loop will clear the latch and supply
-                        # a fresh target.  Hold position until then.
+                        # Recoverable — clear the latch so _hold_position can
+                        # send set_servo_angle and the outer loop's
+                        # validate_action() does not see a stale error.
                         logger.warning(
                             "ArmInnerLoop: arm error_code=%d (%s) — recoverable, holding position",
                             arm_error,
@@ -381,7 +383,9 @@ class ArmInnerLoop:
                         )
                         with self._lock:
                             self._arm_target = None
-                        # Fall through to position-hold logic below
+                        arm.clean_error()
+                        arm.clean_warn()
+                        arm.set_state(0)
                         self._hold_position(arm)
                         self._signal_ready_only()
                         continue
@@ -545,12 +549,11 @@ class ArmInnerLoop:
 
             if err_code in _RECOVERABLE_ERRORS:
                 # Target rejected by firmware (e.g. self-collision, overspeed).
-                # This is NOT a hardware fault — clear the pending target so we
-                # hold position instead of retrying the same bad target at 50 Hz.
-                # The outer loop will detect the error via robot.arm.is_error(),
-                # clear the latch, and supply a fresh IK solution.
-                # Do NOT set error_state=True, do NOT update _last_sent_target
-                # (delta clamp keeps using the last good target).
+                # This is NOT a hardware fault — clear the latch so the inner
+                # loop can hold position and the outer loop's validate_action()
+                # does not see a stale error.  Do NOT set error_state=True, do
+                # NOT update _last_sent_target (delta clamp keeps using the last
+                # good target).
                 logger.warning(
                     "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s) — "
                     "target skipped, waiting for next valid command",
@@ -560,6 +563,9 @@ class ArmInnerLoop:
                 )
                 with self._lock:
                     self._arm_target = None
+                arm.clean_error()
+                arm.clean_warn()
+                arm.set_state(0)
                 return
             else:
                 logger.error(
