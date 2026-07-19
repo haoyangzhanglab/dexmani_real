@@ -34,6 +34,7 @@ plus 变体额外集成 assets/audio/ 下的预录制中文 TTS 语音提示，
 from __future__ import annotations
 
 import atexit
+import gc
 import sys
 import time
 import traceback
@@ -187,7 +188,10 @@ EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 # 采集入口覆写库默认 90°/s → 120°/s: 降低快速操作下的 cmd-state 饱和滞后
 # (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
 ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
-_INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
+_INNER_CFG = ArmInnerLoopConfig(
+    joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
+    loop_period=0.04,  # 25Hz (was 50Hz) — Mode 6 firmware handles interpolation; halves SDK calls + GC pressure
+)
 ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
 
 
@@ -487,6 +491,7 @@ def main():
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
+                gc.collect()  # drain cyclic garbage after recording
                 recorder.join_stop(timeout=60.0)  # 落盘完成后才报结果
                 if path:
                     if recorder.stop_error:
@@ -495,6 +500,7 @@ def main():
                         print(f"  录制已保存: {path}  ({n_frames} 帧)")
             else:
                 path = recorder.stop_episode(success=False)
+                gc.collect()  # drain cyclic garbage after discarded recording
                 recorder.join_stop()
                 if path:
                     h5 = Path(path)
@@ -524,6 +530,16 @@ def main():
     # ── Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
     # (已提早到 8c, VR 等待之前启动)
 
+    # Self-collision safety predicate for the pre-send gate.
+    # The IK pipeline checks self-collision at solution time; this is a
+    # defense-in-depth second check just before the command reaches the arm.
+    # Returns True when the arm command qpos is collision-safe.
+    _self_collision_safe = lambda q: not planner.has_self_collision(q)
+
+    # Disable cyclic GC during teleop to eliminate stop-the-world pauses
+    # in the IK hot path (5-20ms).  Numpy-heavy code has negligible cyclic
+    # garbage — we collect explicitly at episode boundaries instead.
+    gc.disable()
     try:
         while running:
             _timing_line = stage_timer.tick()
@@ -708,6 +724,7 @@ def main():
                         print("  ⚠ 相机进程已退出 — 本集降级为只录关节/EEF")
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
+                    gc.collect()  # drain cyclic garbage before a new episode
                     if not recorder.start_episode(
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
@@ -991,6 +1008,7 @@ def main():
                 actual_arm_qpos=arm_qpos,
                 actual_arm_tau=state.arm_tau,
                 actual_arm_temps=arm_temps,
+                self_collision_check=_self_collision_safe,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
@@ -1018,6 +1036,7 @@ def main():
             stage_timer.mark("rec")
 
     finally:
+        gc.enable()
         # 确保录制已停止
         if recording_active:
             recorder.stop_episode(success=False)

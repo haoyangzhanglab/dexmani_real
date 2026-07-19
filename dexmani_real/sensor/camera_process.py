@@ -417,7 +417,9 @@ class CameraProcess:
                 last_ts = time.monotonic()
 
             shm_writer.close()
-            cam.disconnect()
+            # cam.disconnect() intentionally skipped — parent's terminate() handles USB cleanup.
+            # pipeline.stop() is a known librealsense2 deadlock risk on L515 + Linux USB.
+            # Refs: librealsense#9184, librealsense#13006
             logger.info("CameraProcess capture loop exited cleanly.")
 
         except (RuntimeError, OSError):

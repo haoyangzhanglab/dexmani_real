@@ -26,6 +26,7 @@ def validate_action(
     actual_arm_tau: np.ndarray | None = None,
     actual_arm_temps: np.ndarray | None = None,
     env_collision_check: Callable[[np.ndarray], bool] | None = None,
+    self_collision_check: Callable[[np.ndarray], bool] | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
 
@@ -35,6 +36,7 @@ def validate_action(
       3. Torque gating  — per-joint threshold check
       4. Temperature gating — 70 °C per-joint threshold
       5. Env collision check — caller-provided predicate (if wired)
+      5b. Self-collision check — caller-provided predicate (if wired)
       6. Workspace clamp — per-axis clip (non-fatal)
       7. Arm joint-limit clipping (qpos_min/max)
       8. Hand joint-limit clipping (qpos_min/max)
@@ -78,6 +80,18 @@ def validate_action(
                 return False, "env collision detected"
         except Exception as e:
             logger.warning("env_collision_check raised: %s — skipping", e)
+
+    # 5b. Self-collision check (caller-provided predicate).
+    # Defense-in-depth: the IK pipeline checks self-collision at solution time;
+    # this gate catches any code path that bypasses the IK check, a stale
+    # collision model, or step-clipped commands that drift into collision.
+    # The predicate returns True when the command qpos is collision-safe.
+    if self_collision_check is not None and action.arm_qpos_cmd is not None:
+        try:
+            if not self_collision_check(action.arm_qpos_cmd):
+                return False, "self-collision detected"
+        except Exception as e:
+            logger.warning("self_collision_check raised: %s — skipping", e)
 
     # 6. Workspace clamp (non-fatal)
     if action.target_eef_pos is not None:

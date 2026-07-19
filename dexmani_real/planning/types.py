@@ -230,7 +230,7 @@ class TeleopProfile(FromDictMixin):
     # of max_pose_error_pos_m/rot_rad or when max_iterations reached.
     differential_ik_gain: float = 0.05  # step size per iteration (matches BVP v*0.05)
     differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
-    differential_ik_max_iterations: int = 25  # cap at 25 (normal ops converge ≤5 iters; 25 has ample headroom)
+    differential_ik_max_iterations: int = 10  # cap at 10 (normal ops converge ≤5 iters; extra iters near singularity don't help)
     differential_ik_convergence_threshold: float = 1e-3  # unused since 2026-07-16 IK speedup — superseded by early-exit at 50% of max_pose_error_pos_m/rot_rad
 
     # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──

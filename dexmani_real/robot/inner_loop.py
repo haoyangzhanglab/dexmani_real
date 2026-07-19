@@ -52,7 +52,7 @@ class ArmInnerLoopConfig:
                          planner. Default 90°/s (≈1.57 rad/s).
         joint_max_acc: Max joint acceleration (rad/s²). Respected by firmware
                        trajectory planner. Default 500°/s² (≈8.73 rad/s²).
-        loop_period: Inner loop period in seconds. Default 0.02 (50Hz).
+        loop_period: Inner loop period in seconds. Default 0.04 (25Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
         max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad per
                          inner-loop step (~17°, ~15 rad/s ceiling at 50Hz). Mirrors
@@ -70,7 +70,7 @@ class ArmInnerLoopConfig:
     # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
     joint_max_speed: float = 1.5708  # 90°/s in rad/s
     joint_max_acc: float = 8.7266  # 500°/s² in rad/s²
-    loop_period: float = 0.02  # 50Hz
+    loop_period: float = 0.04  # 25Hz (was 50Hz) — halves GIL contention from SDK socket I/O; Mode 6 firmware handles interpolation between commands
     # Shared
     target_timeout_s: float = 0.2
 
@@ -361,6 +361,7 @@ class ArmInnerLoop:
                     with self._lock:
                         self._error_state = True
                     continue
+                time.sleep(0)  # explicit GIL yield — unblocks main-thread numpy ops
 
                 if code != 0:
                     logger.error("ArmInnerLoop: arm error code=%d — stopping inner loop", code)
@@ -373,19 +374,18 @@ class ArmInnerLoop:
                 arm_error = getattr(arm, "error_code", 0)
                 if arm_error != 0:
                     if arm_error in _RECOVERABLE_ERRORS:
-                        # Recoverable — clear the latch so _hold_position can
-                        # send set_servo_angle and the outer loop's
-                        # validate_action() does not see a stale error.
+                        # Recoverable — clear the latch, re-init Mode 6 (firmware
+                        # drops to Mode 0 on reject), then hold position and
+                        # re-arm the soft-start ramp for a clean re-engagement.
                         logger.warning(
-                            "ArmInnerLoop: arm error_code=%d (%s) — recoverable, holding position",
+                            "ArmInnerLoop: arm error_code=%d (%s) — recoverable, re-initialising mode",
                             arm_error,
                             decode_error(arm_error),
                         )
                         with self._lock:
                             self._arm_target = None
-                        arm.clean_error()
-                        arm.clean_warn()
-                        arm.set_state(0)
+                        self._recover_mode(arm)
+                        self._ramp_step = 0  # re-arm soft-start ramp
                         self._hold_position(arm)
                         self._signal_ready_only()
                         continue
@@ -530,6 +530,7 @@ class ArmInnerLoop:
                 mvacc=self._cfg.joint_max_acc,
                 wait=False,
             )
+            time.sleep(0)  # explicit GIL yield — unblocks main-thread numpy ops
         except (RuntimeError, OSError) as e:
             logger.error("ArmInnerLoop: set_servo_angle failed: %s", e)
             with self._lock:
@@ -549,23 +550,22 @@ class ArmInnerLoop:
 
             if err_code in _RECOVERABLE_ERRORS:
                 # Target rejected by firmware (e.g. self-collision, overspeed).
-                # This is NOT a hardware fault — clear the latch so the inner
-                # loop can hold position and the outer loop's validate_action()
-                # does not see a stale error.  Do NOT set error_state=True, do
-                # NOT update _last_sent_target (delta clamp keeps using the last
-                # good target).
+                # This is NOT a hardware fault — clear the latch, re-init Mode 6
+                # (firmware drops to Mode 0 on reject), and wait for the next
+                # valid command from the outer loop.  Do NOT set error_state=True,
+                # do NOT update _last_sent_target (delta clamp keeps using the
+                # last good target).
                 logger.warning(
                     "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s) — "
-                    "target skipped, waiting for next valid command",
+                    "target skipped, re-initialising mode",
                     code,
                     err_code,
                     decode_error(err_code),
                 )
                 with self._lock:
                     self._arm_target = None
-                arm.clean_error()
-                arm.clean_warn()
-                arm.set_state(0)
+                self._recover_mode(arm)
+                self._ramp_step = 0  # re-arm soft-start ramp
                 return
             else:
                 logger.error(
@@ -583,6 +583,48 @@ class ArmInnerLoop:
             self._ramp_step += 1
 
     # ── Helpers ──
+
+    def _recover_mode(self, arm) -> bool:
+        """Clear error latch and re-init Mode 6 after a recoverable error.
+
+        After firmware rejects a command (e.g. error 22 self-collision), the arm
+        drops from Mode 6 to Mode 0.  ``clean_error`` + ``set_state(0)`` clears
+        the latch but does NOT restore the control mode — without Mode 6,
+        subsequent ``set_servo_angle`` calls use the wrong protocol and the arm
+        is effectively dead (observed as ``set_mode(1)`` returning code 10
+        repeatedly during return_home).
+
+        Returns ``True`` on success, ``False`` if all re-init attempts fail.
+        """
+        arm.clean_error()
+        arm.clean_warn()
+        arm.set_state(0)
+
+        # Re-init Mode 6 with retries (firmware may reject the transition
+        # while internal error state is still settling).
+        for attempt in range(3):
+            try:
+                arm.set_mode(0)
+                arm.set_state(0)
+                time.sleep(0.05)
+                arm.set_mode(6)
+                arm.set_state(0)
+                time.sleep(0.05)
+                arm.set_state(0)
+                actual_mode = getattr(arm, "mode", -1)
+                if actual_mode == 6:
+                    logger.info("ArmInnerLoop: Mode 6 re-initialised (attempt %d)", attempt + 1)
+                    return True
+                logger.warning(
+                    "ArmInnerLoop: set_mode(6) returned but mode=%d (attempt %d/3)",
+                    actual_mode, attempt + 1,
+                )
+            except (RuntimeError, OSError) as e:
+                logger.warning("ArmInnerLoop: Mode 6 re-init attempt %d failed: %s", attempt + 1, e)
+            time.sleep(0.1)
+
+        logger.error("ArmInnerLoop: failed to re-init Mode 6 after 3 attempts — arm may be in degraded mode")
+        return False
 
     def _hold_position(self, arm) -> None:
         """Read current position and re-send as hold command via set_servo_angle.

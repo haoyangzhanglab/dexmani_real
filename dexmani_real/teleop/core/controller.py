@@ -15,6 +15,7 @@ Ref: BunnyVisionPro _internal_control_arm_qpos() thread pattern.
 
 from __future__ import annotations
 
+import gc
 import time
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -236,6 +237,10 @@ class TeleopController:
 
         self.last_status_ts = time.monotonic()
 
+        # Disable cyclic GC during teleop to eliminate stop-the-world pauses
+        # (5-20ms) in the IK hot path.  Numpy-heavy code has negligible cyclic
+        # garbage — we collect explicitly at episode boundaries instead.
+        gc.disable()
         try:
             while self.running:
                 self._handle_keyboard()
@@ -246,6 +251,7 @@ class TeleopController:
         except (RuntimeError, ConnectionError, ValueError) as e:
             logger.exception("Unhandled exception in main loop: %s", e)
         finally:
+            gc.enable()
             self._shutdown()
 
     # ── Main tick ──
@@ -364,6 +370,7 @@ class TeleopController:
                 actual_arm_qpos=arm_qpos,
                 actual_arm_tau=state.arm_tau,
                 actual_arm_temps=arm_temps,
+                self_collision_check=lambda q: not self.planner.has_self_collision(q),
             )
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
@@ -647,6 +654,7 @@ class TeleopController:
         }
 
     def _start_recording(self) -> None:
+        gc.collect()  # drain cyclic garbage before a new episode (GC disabled during teleop)
         logger.info("Starting episode recording...")
         self._recorder_seen_active = False  # re-arm the auto-stop latch for this episode
         if not self._reset_mapper():
@@ -679,6 +687,7 @@ class TeleopController:
             if save and path:
                 logger.info("  Saved to %s", path)
         self.recording = False
+        gc.collect()  # drain cyclic garbage after episode (GC disabled during teleop)
         logger.info("Episode stopped.")
 
     def _sync_recording_flag(self) -> None:

@@ -182,7 +182,10 @@ def main():
         ema_alpha_rot=1.0,  # Cartesian EMA pass-through for SHM raw path
         dry_run=False,
         use_shm_vr=True,  # ← 零拷贝 SHM 路径
-        inner_loop_cfg=ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S))),
+        inner_loop_cfg=ArmInnerLoopConfig(
+            joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
+            loop_period=0.04,  # 25Hz (was 50Hz) — Mode 6 firmware handles interpolation
+        ),
         collection_config=CollectionConfig(
             task_label=task_label,
             operator=operator,
