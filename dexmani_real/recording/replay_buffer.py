@@ -115,11 +115,10 @@ class ReplayBuffer:
         _export_mod._OBS_KEYS = cfg.obs_keys
         _export_mod._ACTION_KEYS = cfg.action_keys
         try:
-            # LATENT BUG (ignore below): load_episodes() returns a 7-tuple
-            # (obs, action, lengths, paths, rgb_list, depth_list, camera_meta) but only
-            # 4 names are unpacked here, so from_hdf5() raises ValueError at runtime.
-            # Fixing requires a logic change (unpack 7); out of scope for typing sweep.
-            obs_list, action_list, episode_lengths, episode_paths = load_episodes(  # type: ignore[misc]
+            # load_episodes() returns a 7-tuple (obs, action, lengths, paths,
+            # rgb_list, depth_list, camera_meta); ReplayBuffer is obs/action-only
+            # by design, so the camera triple is intentionally discarded.
+            obs_list, action_list, episode_lengths, episode_paths, _rgb, _depth, _camera_meta = load_episodes(
                 data_dir,
                 filter_task=cfg.filter_task,
                 filter_success=cfg.filter_success,

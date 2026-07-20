@@ -47,7 +47,7 @@ class HandKinematics:
             self._data = self._model.createData()
         except ImportError:
             return
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             logger.warning("HandKinematics: URDF loading failed for %s: %s", hand_urdf_path, e)
             return
 
