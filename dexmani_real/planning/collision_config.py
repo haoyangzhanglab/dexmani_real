@@ -52,7 +52,11 @@ class CollisionConfig(FromDictMixin):
 
     # ── Fingertip link identification ──
     fingertip_link_names: tuple[str, ...] = (
-        "thumb_tip", "index_tip", "mid_tip", "ring_tip", "pinky_tip",
+        "thumb_tip",
+        "index_tip",
+        "mid_tip",
+        "ring_tip",
+        "pinky_tip",
     )
 
     # ── Environment collision ──
@@ -110,4 +114,3 @@ class CollisionConfig(FromDictMixin):
         when new fields are added to the dataclass.
         """
         return replace(self, **kwargs)
-

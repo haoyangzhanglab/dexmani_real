@@ -57,22 +57,14 @@ from scipy.spatial.transform import Rotation as R
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import ASSET_DIR, PACKAGE_DIR
-from dexmani_real.planning import (
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.robot.inner_loop import ArmInnerLoop
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
 except ImportError:
-    raise ImportError(
-        "pynput is required for keyboard input. Install with: pip install pynput"
-    )
+    raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
 from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.rate_limiter import RateLimiter
@@ -81,22 +73,25 @@ from dexmani_real.utils.rate_limiter import RateLimiter
 
 CTRL_HZ = 50.0
 CTRL_DT = 1.0 / CTRL_HZ
-DELTA_POS = 0.005        # 每次按键平移量 (m)
-DELTA_RPY = 0.02         # 每次按键旋转量 (rad)
-TARGET_LEAD_MAX = 0.03   # target 领先 arm 的最大距离 (m)
-HOME_DT = 0.04           # 归位 waypoint 间隔 (s): ~25°/s（保守，避免归位过快）
+DELTA_POS = 0.005  # 每次按键平移量 (m)
+DELTA_RPY = 0.02  # 每次按键旋转量 (rad)
+TARGET_LEAD_MAX = 0.03  # target 领先 arm 的最大距离 (m)
+HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s（保守，避免归位过快）
 
-WORKSPACE_BOUNDS = np.array([
-    [0.28, 0.72],    # x [min, max] m
-    [-0.45, 0.45],   # y [min, max] m
-    [0.05, 0.5],     # z [min, max] m
-], dtype=np.float64)
+WORKSPACE_BOUNDS = np.array(
+    [
+        [0.28, 0.72],  # x [min, max] m
+        [-0.45, 0.45],  # y [min, max] m
+        [0.05, 0.5],  # z [min, max] m
+    ],
+    dtype=np.float64,
+)
 
 # ArUco 标记参数
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
-MARKER_SIZE_M = 0.0982   # 标记边长 (m)
-MARKER_ID = 1          # 期望的标记 ID（None = 接受任意 ID）
+MARKER_SIZE_M = 0.0982  # 标记边长 (m)
+MARKER_ID = 1  # 期望的标记 ID（None = 接受任意 ID）
 
 # 相机外参保存路径（包内 config/，与 CameraCalib 默认读取路径一致）
 CAMERAS_JSON_PATH = PACKAGE_DIR / "config" / "cameras.json"
@@ -222,12 +217,14 @@ def _rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     cr, sr = np.cos(roll / 2), np.sin(roll / 2)
     cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
     cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
-    return np.array([
-        cr * cp * cy + sr * sp * sy,
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-    ])
+    return np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ]
+    )
 
 
 def _pose_wxyz_to_matrix(p: np.ndarray, q_wxyz: np.ndarray) -> np.ndarray:
@@ -272,18 +269,24 @@ def detect_aruco_pose(
             return None
         corners = [c for c, m in zip(corners, mask) if m]
 
-    marker_points = np.array([
-        [-marker_size / 2,  marker_size / 2, 0],
-        [ marker_size / 2,  marker_size / 2, 0],
-        [ marker_size / 2, -marker_size / 2, 0],
-        [-marker_size / 2, -marker_size / 2, 0],
-    ], dtype=np.float32)
+    marker_points = np.array(
+        [
+            [-marker_size / 2, marker_size / 2, 0],
+            [marker_size / 2, marker_size / 2, 0],
+            [marker_size / 2, -marker_size / 2, 0],
+            [-marker_size / 2, -marker_size / 2, 0],
+        ],
+        dtype=np.float32,
+    )
 
     rvecs = []
     tvecs = []
     for c in corners:
         _, rv, tv = cv2.solvePnP(
-            marker_points, c, intrinsics, distortion,
+            marker_points,
+            c,
+            intrinsics,
+            distortion,
             flags=cv2.SOLVEPNP_IPPE_SQUARE,
         )
         rvecs.append(rv)
@@ -322,12 +325,15 @@ def detect_aruco_stable(
 
 
 # marker 四角在标记坐标系下的 3D 坐标（用于预览时画坐标轴）
-_MARKER_CORNERS_3D = np.array([
-    [-MARKER_SIZE_M / 2,  MARKER_SIZE_M / 2, 0],
-    [ MARKER_SIZE_M / 2,  MARKER_SIZE_M / 2, 0],
-    [ MARKER_SIZE_M / 2, -MARKER_SIZE_M / 2, 0],
-    [-MARKER_SIZE_M / 2, -MARKER_SIZE_M / 2, 0],
-], dtype=np.float32)
+_MARKER_CORNERS_3D = np.array(
+    [
+        [-MARKER_SIZE_M / 2, MARKER_SIZE_M / 2, 0],
+        [MARKER_SIZE_M / 2, MARKER_SIZE_M / 2, 0],
+        [MARKER_SIZE_M / 2, -MARKER_SIZE_M / 2, 0],
+        [-MARKER_SIZE_M / 2, -MARKER_SIZE_M / 2, 0],
+    ],
+    dtype=np.float32,
+)
 
 
 def draw_overlay(
@@ -352,7 +358,10 @@ def draw_overlay(
             if target_id is not None and mid != target_id:
                 continue
             ok, rv, tv = cv2.solvePnP(
-                _MARKER_CORNERS_3D, c, intrinsics, distortion,
+                _MARKER_CORNERS_3D,
+                c,
+                intrinsics,
+                distortion,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE,
             )
             if ok:
@@ -383,8 +392,8 @@ HAND_EYE_METHODS = {
 
 
 def calibrate_eye_to_hand(
-    tvec_ee2base_list: list[np.ndarray],   # (N, 3)  EE 位置 (m) base 系
-    rpy_ee2base_list: list[np.ndarray],    # (N, 3)  EE RPY (rad) base 系
+    tvec_ee2base_list: list[np.ndarray],  # (N, 3)  EE 位置 (m) base 系
+    rpy_ee2base_list: list[np.ndarray],  # (N, 3)  EE RPY (rad) base 系
     rvec_marker2camera_list: list[np.ndarray],  # (N, 3)  Rodrigues
     tvec_marker2camera_list: list[np.ndarray],  # (N, 3)  m
     method: int = cv2.CALIB_HAND_EYE_PARK,
@@ -446,8 +455,10 @@ def compute_marker_consistency(
     positions = []
     rotations = []
     for tvec_ee, rpy_ee, rvec_m2c, tvec_m2c in zip(
-        tvec_ee2base_list, rpy_ee2base_list,
-        rvec_marker2camera_list, tvec_marker2camera_list,
+        tvec_ee2base_list,
+        rpy_ee2base_list,
+        rvec_marker2camera_list,
+        tvec_marker2camera_list,
     ):
         T_base_ee = np.eye(4)
         T_base_ee[:3, :3] = R.from_euler("xyz", rpy_ee, degrees=False).as_matrix()
@@ -491,12 +502,18 @@ def calibrate_and_select(
     for name, m in HAND_EYE_METHODS.items():
         try:
             T = calibrate_eye_to_hand(
-                tvec_ee2base_list, rpy_ee2base_list,
-                rvec_marker2camera_list, tvec_marker2camera_list, method=m,
+                tvec_ee2base_list,
+                rpy_ee2base_list,
+                rvec_marker2camera_list,
+                tvec_marker2camera_list,
+                method=m,
             )
             errors_mm, errors_deg = compute_marker_consistency(
-                T, tvec_ee2base_list, rpy_ee2base_list,
-                rvec_marker2camera_list, tvec_marker2camera_list,
+                T,
+                tvec_ee2base_list,
+                rpy_ee2base_list,
+                rvec_marker2camera_list,
+                tvec_marker2camera_list,
             )
             std_mm = float(errors_mm.std())
         except cv2.error:
@@ -530,8 +547,12 @@ def save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) 
         "type": "eye_to_hand",
         "pose": {
             "position": [round(float(pos[0]), 6), round(float(pos[1]), 6), round(float(pos[2]), 6)],
-            "orientation": [round(float(quat_wxyz[0]), 6), round(float(quat_wxyz[1]), 6),
-                            round(float(quat_wxyz[2]), 6), round(float(quat_wxyz[3]), 6)],
+            "orientation": [
+                round(float(quat_wxyz[0]), 6),
+                round(float(quat_wxyz[1]), 6),
+                round(float(quat_wxyz[2]), 6),
+                round(float(quat_wxyz[3]), 6),
+            ],
         },
     }
 
@@ -680,11 +701,13 @@ def main():
     # 获取内参
     color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
     intr = color_profile.get_intrinsics()
-    INTRINSICS = np.array([
-        [intr.fx, 0, intr.ppx],
-        [0, intr.fy, intr.ppy],
-        [0, 0, 1],
-    ])
+    INTRINSICS = np.array(
+        [
+            [intr.fx, 0, intr.ppx],
+            [0, intr.fy, intr.ppy],
+            [0, 0, 1],
+        ]
+    )
     DISTORTION = np.array(intr.coeffs)
     print(f"  内参 fx={intr.fx:.1f} fy={intr.fy:.1f} ({intr.width}x{intr.height})")
 
@@ -752,9 +775,7 @@ def main():
             color_frame = frames.get_color_frame() if frames else None
             if color_frame:
                 img = np.asanyarray(color_frame.get_data()).copy()
-                display_img, _ = draw_overlay(
-                    img, preview_detector, INTRINSICS, DISTORTION, len(samples_tvec_ee2base)
-                )
+                display_img, _ = draw_overlay(img, preview_detector, INTRINSICS, DISTORTION, len(samples_tvec_ee2base))
             if display_img is not None:
                 cv2.imshow("ArUco Calibration", display_img)
             cv2.waitKey(1)  # 泵 GUI 事件；键盘输入仍由 pynput 处理
@@ -807,12 +828,18 @@ def main():
                     else:
                         worst = int(np.argmax(last_residuals))
                         r = float(last_residuals[worst])
-                        for lst in (samples_tvec_ee2base, samples_rpy_ee2base,
-                                    samples_rvec_marker2cam, samples_tvec_marker2cam):
+                        for lst in (
+                            samples_tvec_ee2base,
+                            samples_rpy_ee2base,
+                            samples_rvec_marker2cam,
+                            samples_tvec_marker2cam,
+                        ):
                             lst.pop(worst)
                         last_residuals = None  # 样本变动，作废
-                        print(f"  ✂ 删除最差帧 #{worst+1} (残差 {r:.1f}mm)，"
-                              f"剩余 {len(samples_tvec_ee2base)} 组 — 按 ENTER 复算")
+                        print(
+                            f"  ✂ 删除最差帧 #{worst+1} (残差 {r:.1f}mm)，"
+                            f"剩余 {len(samples_tvec_ee2base)} 组 — 按 ENTER 复算"
+                        )
                 elif event == "enter":
                     n = len(samples_tvec_ee2base)
                     if n < MIN_SAMPLES:
@@ -841,12 +868,16 @@ def main():
                             s_txt = "  失败" if np.isnan(s) else f"{s:7.1f}"
                             print(f"    {name:11s} {s_txt}{mark}")
                         print(f"  标定质量 (选用 {method_best}, T_ee_marker 一致性):")
-                        print(f"    位置 mean={errors_mm.mean():.1f}mm  "
-                              f"max={errors_mm.max():.1f}mm  "
-                              f"std={std_mm:.1f}mm")
-                        print(f"    旋转 mean={errors_deg.mean():.2f}°  "
-                              f"max={errors_deg.max():.2f}°  "
-                              f"std={std_deg:.2f}°")
+                        print(
+                            f"    位置 mean={errors_mm.mean():.1f}mm  "
+                            f"max={errors_mm.max():.1f}mm  "
+                            f"std={std_mm:.1f}mm"
+                        )
+                        print(
+                            f"    旋转 mean={errors_deg.mean():.2f}°  "
+                            f"max={errors_deg.max():.2f}°  "
+                            f"std={std_deg:.2f}°"
+                        )
                         worst = int(np.argmax(errors_mm))
                         print(f"  逐帧残差 (mm, 越大越可疑):")
                         for i, r in enumerate(errors_mm):
@@ -872,7 +903,9 @@ def main():
                         else:
                             T_world_camera = T_candidate
                             save_cameras_json(T_world_camera, serial, CAMERAS_JSON_PATH)
-                            print(f"  ✓ 标定完成 (选用 {method_best}, 位置 std={std_mm:.1f}mm, 旋转 std={std_deg:.2f}°)")
+                            print(
+                                f"  ✓ 标定完成 (选用 {method_best}, 位置 std={std_mm:.1f}mm, 旋转 std={std_deg:.2f}°)"
+                            )
                 event = keys.pop_event()
 
             # ── 退出/急停 ──
@@ -916,20 +949,32 @@ def main():
 
             # ── EEF target delta from keys ──
             dx = np.zeros(3)
-            if keys.is_pressed("w"):     dx[0] += DELTA_POS
-            if keys.is_pressed("s"):     dx[0] -= DELTA_POS
-            if keys.is_pressed("a"):     dx[1] -= DELTA_POS
-            if keys.is_pressed("d"):     dx[1] += DELTA_POS
-            if keys.is_pressed("up"):    dx[2] += DELTA_POS
-            if keys.is_pressed("down"):  dx[2] -= DELTA_POS
+            if keys.is_pressed("w"):
+                dx[0] += DELTA_POS
+            if keys.is_pressed("s"):
+                dx[0] -= DELTA_POS
+            if keys.is_pressed("a"):
+                dx[1] -= DELTA_POS
+            if keys.is_pressed("d"):
+                dx[1] += DELTA_POS
+            if keys.is_pressed("up"):
+                dx[2] += DELTA_POS
+            if keys.is_pressed("down"):
+                dx[2] -= DELTA_POS
 
             drpy = np.zeros(3)
-            if keys.is_pressed("left"):   drpy[0] += DELTA_RPY
-            if keys.is_pressed("right"):  drpy[0] -= DELTA_RPY
-            if keys.is_pressed("i"):      drpy[1] += DELTA_RPY
-            if keys.is_pressed("k"):      drpy[1] -= DELTA_RPY
-            if keys.is_pressed("j"):      drpy[2] -= DELTA_RPY
-            if keys.is_pressed("l"):      drpy[2] += DELTA_RPY
+            if keys.is_pressed("left"):
+                drpy[0] += DELTA_RPY
+            if keys.is_pressed("right"):
+                drpy[0] -= DELTA_RPY
+            if keys.is_pressed("i"):
+                drpy[1] += DELTA_RPY
+            if keys.is_pressed("k"):
+                drpy[1] -= DELTA_RPY
+            if keys.is_pressed("j"):
+                drpy[2] -= DELTA_RPY
+            if keys.is_pressed("l"):
+                drpy[2] += DELTA_RPY
 
             # 周期性状态打印
             if loop_count % 50 == 0:

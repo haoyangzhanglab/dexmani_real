@@ -21,9 +21,7 @@ class DummyTracker:
         self._seq = 0
         self.started = True
         self._base_wrist = (
-            np.asarray(wrist_pos, dtype=np.float64)
-            if wrist_pos is not None
-            else np.zeros(3, dtype=np.float64)
+            np.asarray(wrist_pos, dtype=np.float64) if wrist_pos is not None else np.zeros(3, dtype=np.float64)
         )
 
     def get_latest(self, max_age_s: float | None = None) -> dict[str, Any]:

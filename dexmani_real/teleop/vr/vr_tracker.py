@@ -9,9 +9,6 @@ import time
 from typing import Any
 
 import numpy as np
-
-from dexmani_real.utils.log import get_logger
-from dexmani_real.planning.pose_utils import xyzw_to_wxyz
 from hand_tracking_sdk import (
     ErrorPolicy,
     HandFilter,
@@ -25,6 +22,9 @@ from hand_tracking_sdk import (
     unity_left_to_rfu_position,
     unity_left_to_rfu_rotation,
 )
+
+from dexmani_real.planning.pose_utils import xyzw_to_wxyz
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
@@ -300,10 +300,7 @@ class QuestHandTracker:
         Automatically handles new keys added to the frame dict without
         requiring code changes here.
         """
-        return {
-            k: v.copy() if isinstance(v, np.ndarray) else v
-            for k, v in frame.items()
-        }
+        return {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in frame.items()}
 
     def __enter__(self) -> "QuestHandTracker":
         if not self.connect():
@@ -408,33 +405,33 @@ class VRFrameSimulator:
         pts[0] = [0.00, 0.00, 0.00]
 
         # Thumb: extends sideways (positive X in FLU = left)
-        pts[1]  = [0.025, -0.010, -0.020]  # THUMB_CMC
-        pts[2]  = [0.045, -0.005, -0.030]  # THUMB_MCP
-        pts[3]  = [0.060,  0.000, -0.035]  # THUMB_IP
-        pts[4]  = [0.070,  0.005, -0.038]  # THUMB_TIP
+        pts[1] = [0.025, -0.010, -0.020]  # THUMB_CMC
+        pts[2] = [0.045, -0.005, -0.030]  # THUMB_MCP
+        pts[3] = [0.060, 0.000, -0.035]  # THUMB_IP
+        pts[4] = [0.070, 0.005, -0.038]  # THUMB_TIP
 
         # Index finger
-        pts[5]  = [-0.020,  0.010, -0.070]  # INDEX_FINGER_MCP
-        pts[6]  = [-0.018,  0.010, -0.095]  # INDEX_FINGER_PIP
-        pts[7]  = [-0.015,  0.010, -0.115]  # INDEX_FINGER_DIP
-        pts[8]  = [-0.013,  0.010, -0.130]  # INDEX_FINGER_TIP
+        pts[5] = [-0.020, 0.010, -0.070]  # INDEX_FINGER_MCP
+        pts[6] = [-0.018, 0.010, -0.095]  # INDEX_FINGER_PIP
+        pts[7] = [-0.015, 0.010, -0.115]  # INDEX_FINGER_DIP
+        pts[8] = [-0.013, 0.010, -0.130]  # INDEX_FINGER_TIP
 
         # Middle finger
-        pts[9]  = [0.000,  0.005, -0.072]   # MIDDLE_FINGER_MCP
-        pts[10] = [0.000,  0.005, -0.100]   # MIDDLE_FINGER_PIP
-        pts[11] = [0.000,  0.005, -0.120]   # MIDDLE_FINGER_DIP
-        pts[12] = [0.000,  0.005, -0.138]   # MIDDLE_FINGER_TIP
+        pts[9] = [0.000, 0.005, -0.072]  # MIDDLE_FINGER_MCP
+        pts[10] = [0.000, 0.005, -0.100]  # MIDDLE_FINGER_PIP
+        pts[11] = [0.000, 0.005, -0.120]  # MIDDLE_FINGER_DIP
+        pts[12] = [0.000, 0.005, -0.138]  # MIDDLE_FINGER_TIP
 
         # Ring finger
-        pts[13] = [0.015,  0.000, -0.068]   # RING_FINGER_MCP
-        pts[14] = [0.015,  0.000, -0.090]   # RING_FINGER_PIP
-        pts[15] = [0.015,  0.000, -0.108]   # RING_FINGER_DIP
-        pts[16] = [0.015,  0.000, -0.120]   # RING_FINGER_TIP
+        pts[13] = [0.015, 0.000, -0.068]  # RING_FINGER_MCP
+        pts[14] = [0.015, 0.000, -0.090]  # RING_FINGER_PIP
+        pts[15] = [0.015, 0.000, -0.108]  # RING_FINGER_DIP
+        pts[16] = [0.015, 0.000, -0.120]  # RING_FINGER_TIP
 
         # Pinky
-        pts[17] = [0.028, -0.008, -0.060]   # PINKY_MCP
-        pts[18] = [0.030, -0.008, -0.078]   # PINKY_PIP
-        pts[19] = [0.030, -0.008, -0.092]   # PINKY_DIP
-        pts[20] = [0.030, -0.008, -0.102]   # PINKY_TIP
+        pts[17] = [0.028, -0.008, -0.060]  # PINKY_MCP
+        pts[18] = [0.030, -0.008, -0.078]  # PINKY_PIP
+        pts[19] = [0.030, -0.008, -0.092]  # PINKY_DIP
+        pts[20] = [0.030, -0.008, -0.102]  # PINKY_TIP
 
         return pts

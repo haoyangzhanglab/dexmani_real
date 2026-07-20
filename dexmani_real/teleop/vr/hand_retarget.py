@@ -27,16 +27,18 @@ __all__ = ["XHandRetargeter", "adaptive_retargeting_thumb", "adaptive_retargetin
 import os
 import tempfile
 import time
+
 import numpy as np
 import torch
 import yaml
 from dex_retargeting import yourdfpy as urdf
+from dex_retargeting.kinematics_adaptor import MimicJointKinematicAdaptor
 from dex_retargeting.optimizer import DexPilotOptimizer
 from dex_retargeting.optimizer_utils import LPFilter
 from dex_retargeting.retargeting_config import RetargetingConfig, parse_mimic_joint
 from dex_retargeting.robot_wrapper import RobotWrapper
 from dex_retargeting.seq_retarget import SeqRetargeting
-from dex_retargeting.kinematics_adaptor import MimicJointKinematicAdaptor
+
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
 

@@ -46,15 +46,15 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
+from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.types import RobotState
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 
 logger = get_logger(__name__)
 
@@ -62,9 +62,7 @@ logger = get_logger(__name__)
 
 HOME_DT = 0.04  # homing waypoint interval (s)
 
-WORKSPACE_BOUNDS = np.array(
-    [[0.24, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np.float64
-)
+WORKSPACE_BOUNDS = np.array([[0.24, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np.float64)
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
@@ -427,8 +425,9 @@ def compute_metrics(
             # Trim to equal length
             L = min(len(dist_orig), len(dist_rep))
             if L >= 10:
-                xcorr = np.correlate(dist_orig[:L] - np.mean(dist_orig[:L]),
-                                     dist_rep[:L] - np.mean(dist_rep[:L]), mode="full")
+                xcorr = np.correlate(
+                    dist_orig[:L] - np.mean(dist_orig[:L]), dist_rep[:L] - np.mean(dist_rep[:L]), mode="full"
+                )
                 peak_lag = int(np.argmax(xcorr)) - (L - 1)
                 # Clamp to reasonable range (±5 frames = ±100ms)
                 peak_lag = max(-5, min(5, peak_lag))
@@ -671,9 +670,7 @@ class TrajectoryReplayer:
         assert self.planner is not None
         assert self._arm_inner is not None
 
-        print(
-            f"\nArm is {max_dev:.1f}° from trajectory start (threshold: {self.JOINT_ALIGN_MAX_DEG}°)"
-        )
+        print(f"\nArm is {max_dev:.1f}° from trajectory start (threshold: {self.JOINT_ALIGN_MAX_DEG}°)")
         print("Planning collision-checked approach to trajectory start ...")
 
         # ── Target EEF pose: prefer recorded arm_ee, fallback to FK ──
@@ -706,10 +703,7 @@ class TrajectoryReplayer:
             return None
 
         qpos_path = path_result.qpos_path
-        print(
-            f"Approach path planned: {qpos_path.shape[0]} waypoints "
-            f"(source={path_result.source})"
-        )
+        print(f"Approach path planned: {qpos_path.shape[0]} waypoints " f"(source={path_result.source})")
         print(f"Executing approach at ~{np.rad2deg(0.035) / HOME_DT:.0f}°/s ...")
 
         # ── Execute approach waypoints through inner loop ──
@@ -993,27 +987,37 @@ Examples:
     )
     parser.add_argument("--h5", required=True, type=str, help="Path to HDF5 episode file (.h5).")
     parser.add_argument(
-        "--speed", type=float, default=1.0,
+        "--speed",
+        type=float,
+        default=1.0,
         help="Replay speed factor (1.0=50Hz real-time, 0.5=half-speed).",
     )
     parser.add_argument(
-        "--max-frames", type=int, default=None,
+        "--max-frames",
+        type=int,
+        default=None,
         help="Maximum number of frames to replay (default: all).",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Load and validate trajectory without connecting to robot.",
     )
     parser.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="Output directory for replay data + metrics. Default: replay_results/<episode>_replay/",
     )
     parser.add_argument(
-        "--no-hand", action="store_true",
+        "--no-hand",
+        action="store_true",
         help="Skip hand commands even if hand data is present in HDF5.",
     )
     parser.add_argument(
-        "--arm-ip", type=str, default="192.168.1.111",
+        "--arm-ip",
+        type=str,
+        default="192.168.1.111",
         help="XArm controller IP address.",
     )
     args = parser.parse_args()
@@ -1092,12 +1096,20 @@ Examples:
             print("Consistency Evaluation")
             print("=" * 60)
             print(f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original")
-            print(f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  (overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)")
-            print(f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  (overall: {metrics.arm_joint_rmse_overall_deg:.3f} deg)")
+            print(
+                f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  (overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
+            )
+            print(
+                f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  (overall: {metrics.arm_joint_rmse_overall_deg:.3f} deg)"
+            )
             if metrics.eef_pos_error_mean_mm > 0:
-                print(f"  EEF pos error:  mean={metrics.eef_pos_error_mean_mm:.1f}mm  max={metrics.eef_pos_error_max_mm:.1f}mm  rmse={metrics.eef_pos_error_rmse_mm:.1f}mm")
+                print(
+                    f"  EEF pos error:  mean={metrics.eef_pos_error_mean_mm:.1f}mm  max={metrics.eef_pos_error_max_mm:.1f}mm  rmse={metrics.eef_pos_error_rmse_mm:.1f}mm"
+                )
             if metrics.eef_rot_error_mean_deg > 0:
-                print(f"  EEF rot error:  mean={metrics.eef_rot_error_mean_deg:.2f}°  max={metrics.eef_rot_error_max_deg:.2f}°")
+                print(
+                    f"  EEF rot error:  mean={metrics.eef_rot_error_mean_deg:.2f}°  max={metrics.eef_rot_error_max_deg:.2f}°"
+                )
             if metrics.hand_joint_mae_overall_deg is not None:
                 print(f"  Hand joint MAE: {metrics.hand_joint_mae_overall_deg:.3f} deg")
             print(f"  Tracking lag:  {metrics.tracking_lag_frames} frames ({metrics.tracking_lag_seconds:.3f}s)")

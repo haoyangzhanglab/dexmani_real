@@ -111,7 +111,8 @@ class VRReceiverProcess:
         self._process.start()
         logger.info(
             "VRReceiverProcess started (transport=%s, port=%d)",
-            self.config.transport, self.config.port,
+            self.config.transport,
+            self.config.port,
         )
         return True
 
@@ -121,9 +122,7 @@ class VRReceiverProcess:
         if self._process is not None and self._process.is_alive():
             self._process.join(timeout=timeout)
             if self._process.is_alive():
-                logger.warning(
-                    "VRReceiverProcess did not exit within %.1fs, terminating.", timeout
-                )
+                logger.warning("VRReceiverProcess did not exit within %.1fs, terminating.", timeout)
                 self._process.terminate()
                 self._process.join(timeout=1.0)
         self._process = None
@@ -235,7 +234,9 @@ class VRReceiverProcess:
 
             logger.info(
                 "VRReceiverProcess: connected to HTS @ %s://%s:%d",
-                self.config.transport, self.config.host, self.config.port,
+                self.config.transport,
+                self.config.host,
+                self.config.port,
             )
 
             # ── Monitor thread: periodically log HTS SDK stats ──
@@ -281,22 +282,27 @@ class VRReceiverProcess:
                 if _first_event:
                     _first_event = False
                     logger.info(
-                        "VRReceiverProcess: first event received (type=%s), "
-                        "iter_events is yielding data",
+                        "VRReceiverProcess: first event received (type=%s), " "iter_events is yielding data",
                         type(event).__name__,
                     )
 
                 # ── HeadFrame: cache latest head pose for heading calibration ──
                 if isinstance(event, HeadFrame):
                     head_flu_pos = unity_left_to_flu_position(
-                        event.head.x, event.head.y, event.head.z,
+                        event.head.x,
+                        event.head.y,
+                        event.head.z,
                     )
                     head_flu_quat = unity_left_to_flu_rotation(
-                        event.head.qx, event.head.qy, event.head.qz, event.head.qw,
+                        event.head.qx,
+                        event.head.qy,
+                        event.head.qz,
+                        event.head.qw,
                     )
                     _latest_head_pos = np.asarray(head_flu_pos, dtype=np.float64)
                     _latest_head_quat_wxyz = np.asarray(
-                        xyzw_to_wxyz(*head_flu_quat), dtype=np.float64,
+                        xyzw_to_wxyz(*head_flu_quat),
+                        dtype=np.float64,
                     )
                     continue
 
@@ -308,7 +314,8 @@ class VRReceiverProcess:
                         _logged_event_types.add(etype)
                         logger.info(
                             "VRReceiverProcess: non-HandFrame event type=%s (x%d total)",
-                            etype, self._ignored_count.value,
+                            etype,
+                            self._ignored_count.value,
                         )
                     continue
 
@@ -336,9 +343,7 @@ class VRReceiverProcess:
                     frame_dict = {
                         "side": _side_int,
                         "wrist_pos": np.asarray(flu_pos, dtype=np.float64),
-                        "wrist_quat_wxyz": np.asarray(
-                            xyzw_to_wxyz(*flu_quat), dtype=np.float64
-                        ),
+                        "wrist_quat_wxyz": np.asarray(xyzw_to_wxyz(*flu_quat), dtype=np.float64),
                         "landmarks": np.asarray(
                             [unity_left_to_flu_position(*p) for p in landmarks],
                             dtype=np.float64,
@@ -363,7 +368,9 @@ class VRReceiverProcess:
                     if self._error_count.value <= 3:
                         logger.warning(
                             "VRReceiverProcess: frame conversion error #%d: %s: %s\n%s",
-                            self._error_count.value, type(exc).__name__, exc,
+                            self._error_count.value,
+                            type(exc).__name__,
+                            exc,
                             traceback.format_exc(),
                         )
                     if self.config.strict:

@@ -17,30 +17,32 @@ import numpy as np
 
 from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.simulation.constructor import add_base_components, setup_scene
-from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.simulation.xarm7_xhand import XArm7XHand
+from dexmani_real.utils.array_utils import nan_array
 
 
 @dataclass
 class SimRobotConfig:
-    time_step: float = 1.0 / 240.0      # SAPIEN physics step (typically > control rate)
+    time_step: float = 1.0 / 240.0  # SAPIEN physics step (typically > control rate)
     headless: bool = True
-    arm_home_qpos: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0])
-    )
+    arm_home_qpos: np.ndarray = field(default_factory=lambda: np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]))
     # SAPIEN PD gains for the implicit joint-level position controller.
     # stiffness=1000, damping=100 → default SAPIEN values for bare xArm7
     # (no payload).  Increase damping if oscillation appears under load.
-    arm_pd_gains: dict | None = field(default_factory=lambda: {
-        "stiffness": 1000,
-        "damping": 120,
-        "force_limit": 200,
-    })
-    hand_pd_gains: dict | None = field(default_factory=lambda: {
-        "stiffness": 500,
-        "damping": 100,
-        "force_limit": 80,
-    })
+    arm_pd_gains: dict | None = field(
+        default_factory=lambda: {
+            "stiffness": 1000,
+            "damping": 120,
+            "force_limit": 200,
+        }
+    )
+    hand_pd_gains: dict | None = field(
+        default_factory=lambda: {
+            "stiffness": 500,
+            "damping": 100,
+            "force_limit": 80,
+        }
+    )
 
 
 class SimRobotInterface(ConnectionStateMixin):
@@ -132,27 +134,29 @@ class SimRobotInterface(ConnectionStateMixin):
                 "timestamp": time.time(),
             }
 
-        qpos = self.robot.get_qpos()          # (19,) [arm7 + hand12]
+        qpos = self.robot.get_qpos()  # (19,) [arm7 + hand12]
         eef_pose = self.robot.get_eef_pose()  # sapien.Pose
 
         state: dict[str, Any] = {
-            "arm_qpos": qpos[:7].copy(),       # rad
-            "hand_qpos": qpos[7:].copy(),      # rad
-            "eef_pos": np.array(eef_pose.p, dtype=np.float64),   # m
+            "arm_qpos": qpos[:7].copy(),  # rad
+            "hand_qpos": qpos[7:].copy(),  # rad
+            "eef_pos": np.array(eef_pose.p, dtype=np.float64),  # m
             "eef_quat_wxyz": np.array(eef_pose.q, dtype=np.float64),  # w,x,y,z
             "qvel": np.zeros(19, dtype=np.float64),
             "timestamp": time.time(),
         }
 
         if full:
-            state.update({
-                "qpos_full": qpos.copy(),
-                "qlimits": self.robot.qlimits.copy() if self.robot.qlimits is not None else None,
-                "connected_flag": self.connected_flag,
-                "error_state": self.error_state,
-                "last_error_message": self.last_error_message,
-                "step_count": self.step_count,
-            })
+            state.update(
+                {
+                    "qpos_full": qpos.copy(),
+                    "qlimits": self.robot.qlimits.copy() if self.robot.qlimits is not None else None,
+                    "connected_flag": self.connected_flag,
+                    "error_state": self.error_state,
+                    "last_error_message": self.last_error_message,
+                    "step_count": self.step_count,
+                }
+            )
         return state
 
     # ------------------------------------------------------------------
@@ -257,4 +261,3 @@ class SimRobotInterface(ConnectionStateMixin):
                 return {"ok": False, "error": f"IK failed at test {i}"}
 
         return {"ok": max_err < 0.1, "max_error": float(max_err), "n_tests": n_tests}
-

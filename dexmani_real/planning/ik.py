@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-
 import time
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -14,8 +13,8 @@ if TYPE_CHECKING:
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
-from .types import IKResult, Pose, TeleopProfile
 from .pose_utils import ensure_qpos, pose_error_vector
+from .types import IKResult, Pose, TeleopProfile
 
 logger = get_logger(__name__)
 
@@ -37,7 +36,7 @@ class TeleopIKSolver:
     Speed limiting is handled by ArmInnerLoop (50 Hz, Mode 6): per-step joint
     delta clamp + firmware online trajectory planning.
     Self-collision checks are done when TeleopProfile.check_self_collision=True.
-    
+
 
     References:
       - BunnyVisionPro DLS + LeFranX scoring)
@@ -53,9 +52,9 @@ class TeleopIKSolver:
     _ELBOW_JOINT_INDEX: int = 3
 
     # Elbow flip detection thresholds (ref: planner.py check_elbow_consistency).
-    _ELBOW_FLIP_NEG_THRESH_RAD: float = np.deg2rad(-5.0)   # below this → elbow-up branch
-    _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)    # above this → elbow-down branch
-    _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)     # minimum J4 change to count as flip
+    _ELBOW_FLIP_NEG_THRESH_RAD: float = np.deg2rad(-5.0)  # below this → elbow-up branch
+    _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)  # above this → elbow-down branch
+    _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)  # minimum J4 change to count as flip
 
     # F3: Wall-clock budget for teleop IK solve.  At 16 Hz (62.5 ms/frame),
     # 10 ms leaves ample headroom for the rest of the pipeline (mapper, retargeting,
@@ -96,13 +95,17 @@ class TeleopIKSolver:
         dt_diff_s: float = 0.0
         if profile.use_differential_ik_fallback:
             diff_result = self.solve_differential_ik(
-                target_eef_pose_world, current_qpos, previous_qpos_cmd, profile,
+                target_eef_pose_world,
+                current_qpos,
+                previous_qpos_cmd,
+                profile,
             )
             dt_diff_s = time.perf_counter() - t_start
             if diff_result.success:
                 # Verify the diff IK result actually reaches the target.
                 pos_err, rot_err = self.kin.compute_world_pose_error(
-                    target_eef_pose_world, diff_result.qpos,
+                    target_eef_pose_world,
+                    diff_result.qpos,
                 )
                 if pos_err <= profile.max_pose_error_pos_m and rot_err <= profile.max_pose_error_rot_rad:
                     self._maybe_log_ik_timing(dt_diff_s, 0.0, diff_result.report.get("iterations", 0))
@@ -129,7 +132,10 @@ class TeleopIKSolver:
                 position_report = {"teleop_ik_method": "position_ik", "failure_reason": "timeout_skipped"}
             else:
                 qpos, position_report = self.solve_position_ik(
-                    target_eef_pose_world, current_qpos, previous_qpos_cmd, profile,
+                    target_eef_pose_world,
+                    current_qpos,
+                    previous_qpos_cmd,
+                    profile,
                 )
                 dt_pos_s = time.perf_counter() - t_start - dt_diff_s
                 if qpos is not None:
@@ -153,7 +159,8 @@ class TeleopIKSolver:
             position_report=position_report,
         )
         return IKResult(
-            success=False, qpos=previous_qpos_cmd.copy(),
+            success=False,
+            qpos=previous_qpos_cmd.copy(),
             reason=diagnostic["summary"],
             report={"held": True, "diagnostic": diagnostic, "ik_timing_ms": round(dt_total_s * 1000, 1)},
         )
@@ -172,12 +179,18 @@ class TeleopIKSolver:
         if threshold_exceeded:
             logger.warning(
                 "IK timing: diff=%.1fms (iters=%d) + pos=%.1fms = total=%.1fms (>10ms budget!)",
-                dt_diff_s * 1000, diff_iters, dt_pos_s * 1000, dt_total_ms,
+                dt_diff_s * 1000,
+                diff_iters,
+                dt_pos_s * 1000,
+                dt_total_ms,
             )
         else:
             logger.debug(
                 "IK timing: diff=%.1fms (iters=%d) + pos=%.1fms = total=%.1fms",
-                dt_diff_s * 1000, diff_iters, dt_pos_s * 1000, dt_total_ms,
+                dt_diff_s * 1000,
+                diff_iters,
+                dt_pos_s * 1000,
+                dt_total_ms,
             )
         self._ik_timing_log_throttle = 80  # ~5s at 16Hz
 
@@ -210,7 +223,10 @@ class TeleopIKSolver:
 
         for seed_name, seed, n_init in seeds:
             status, raw_qpos = self.ik_mgr.call_mplib_ik(
-                target_pose_base, seed, n_init_qpos=n_init, return_closest=True,
+                target_pose_base,
+                seed,
+                n_init_qpos=n_init,
+                return_closest=True,
             )
 
             if not status.lower().startswith("success") or raw_qpos is None:
@@ -270,8 +286,12 @@ class TeleopIKSolver:
             quality_rot = rot_err < profile.max_pose_error_rot_rad * 0.3
             quality_delta = hw_dist < fast_accept_rad * 0.5
             if quality_pos and quality_rot and quality_delta:
-                return qpos, {"teleop_ik_method": "position_ik", "seed": seed_name,
-                              "attempts": attempts, "early_exit": "excellent_quality"}
+                return qpos, {
+                    "teleop_ik_method": "position_ik",
+                    "seed": seed_name,
+                    "attempts": attempts,
+                    "early_exit": "excellent_quality",
+                }
 
         if best is not None:
             qpos, seed_name, _ = best
@@ -409,7 +429,9 @@ class TeleopIKSolver:
     # Command assembly
 
     def _check_teleop_collision_gate(
-        self, qpos_cmd: np.ndarray, profile: TeleopProfile,
+        self,
+        qpos_cmd: np.ndarray,
+        profile: TeleopProfile,
     ) -> tuple[str | None, dict[str, Any]]:
         """Self + env collision gate for teleop IK result validation.
 
@@ -486,7 +508,8 @@ class TeleopIKSolver:
         # Self: FCL (stop_at_first=True for fast gate, detail on hit).
         # Env: full two-tier (Tier1 Z-min + Tier2 FCL mesh-mesh).
         collision_reason, collision_extra = self._check_teleop_collision_gate(
-            qpos_cmd, profile,
+            qpos_cmd,
+            profile,
         )
         if collision_reason is not None:
             # Direction-aware recovery for env collision: when the target EEF
@@ -498,14 +521,15 @@ class TeleopIKSolver:
                 if target_eef_pose_world.p[2] > current_eef.p[2] + 0.001:
                     # Moving up — allow recovery, skip collision gate.
                     logger.warning(
-                        "Allowing upward recovery through env collision gate "
-                        "(target_z=%.3f, current_z=%.3f)",
-                        target_eef_pose_world.p[2], current_eef.p[2],
+                        "Allowing upward recovery through env collision gate " "(target_z=%.3f, current_z=%.3f)",
+                        target_eef_pose_world.p[2],
+                        current_eef.p[2],
                     )
                 else:
                     qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
                     return IKResult(
-                        success=False, qpos=previous_qpos_cmd.copy(),
+                        success=False,
+                        qpos=previous_qpos_cmd.copy(),
                         reason=collision_reason,
                         report={
                             **report,
@@ -519,7 +543,8 @@ class TeleopIKSolver:
             else:
                 qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
                 return IKResult(
-                    success=False, qpos=previous_qpos_cmd.copy(),
+                    success=False,
+                    qpos=previous_qpos_cmd.copy(),
                     reason=collision_reason,
                     report={
                         **report,
@@ -546,7 +571,10 @@ class TeleopIKSolver:
     # Differential IK helpers
 
     def _solve_damped_least_squares(
-        self, jacobian: np.ndarray, error: np.ndarray, damping: float,
+        self,
+        jacobian: np.ndarray,
+        error: np.ndarray,
+        damping: float,
     ) -> np.ndarray:
         """Damped least-squares: dq = J^T (J J^T + λ² I)^{-1} error.
 
@@ -597,11 +625,9 @@ class TeleopIKSolver:
                 damping = profile.differential_ik_max_damping
             else:
                 ratio = mu / threshold
-                damping = (
-                    profile.differential_ik_min_damping
-                    + (profile.differential_ik_max_damping - profile.differential_ik_min_damping)
-                    * (1.0 - ratio)
-                )
+                damping = profile.differential_ik_min_damping + (
+                    profile.differential_ik_max_damping - profile.differential_ik_min_damping
+                ) * (1.0 - ratio)
 
         iterations = 0
         converged = False
@@ -618,7 +644,8 @@ class TeleopIKSolver:
             if iterations > 0 and time.perf_counter() - _tik_start > self._IK_TIMEOUT_S:
                 logger.warning(
                     "Diff IK timeout: %d iterations in %.1fms, aborting",
-                    iterations, (time.perf_counter() - _tik_start) * 1000,
+                    iterations,
+                    (time.perf_counter() - _tik_start) * 1000,
                 )
                 break
             _t_fk = time.perf_counter()
@@ -628,7 +655,9 @@ class TeleopIKSolver:
             if _dt_fk > 0.002:  # >2ms — abnormal (baseline ~0.3ms); signals GC/thermal/GIL
                 logger.warning(
                     "Slow FK+J: %.1fms (iter %d/%d, total=%.1fms)",
-                    _dt_fk * 1000, iterations + 1, max_iter,
+                    _dt_fk * 1000,
+                    iterations + 1,
+                    max_iter,
                     (time.perf_counter() - _tik_start) * 1000,
                 )
             last_jacobian = jacobian  # cache for nullspace FK reuse (P5)
@@ -709,10 +738,13 @@ class TeleopIKSolver:
             logger.warning(
                 "IK detail: fk=%.1f err=%.1f dls=%.1f post=%.1fms "
                 "| %d iters | total=%.1fms (fk/iter=%.2f dls/iter=%.2f)",
-                _t_fk_acc * 1000, _t_err_acc * 1000, _t_dls_acc * 1000,
+                _t_fk_acc * 1000,
+                _t_err_acc * 1000,
+                _t_dls_acc * 1000,
                 _dt_post * 1000,
-                n, _t_diff_total * 1000,
-                _t_fk_acc / n * 1000, _t_dls_acc / n * 1000,
+                n,
+                _t_diff_total * 1000,
+                _t_fk_acc / n * 1000,
+                _t_dls_acc / n * 1000,
             )
         return result
-

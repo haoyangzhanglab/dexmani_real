@@ -1,7 +1,7 @@
 from .collision_config import CollisionConfig
 from .planner import XArm7MotionPlanner
-from .workspace_safety import WorkspaceSafety
 from .types import PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
+from .workspace_safety import WorkspaceSafety
 
 __all__ = [
     "CollisionConfig",

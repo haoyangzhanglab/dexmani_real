@@ -12,8 +12,8 @@ from typing import Callable
 
 import numpy as np
 
+from dexmani_real.robot.types import _ARM_TEMP_LIMIT_C, _ARM_TORQUE_LIMIT_NM, RobotAction
 from dexmani_real.utils.log import get_logger
-from dexmani_real.robot.types import RobotAction, _ARM_TEMP_LIMIT_C, _ARM_TORQUE_LIMIT_NM
 
 logger = get_logger(__name__)
 

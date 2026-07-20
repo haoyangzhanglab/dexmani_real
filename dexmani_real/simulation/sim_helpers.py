@@ -12,6 +12,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     import sapien.core as sapien
+
     from dexmani_real.simulation import SimRobotInterface
 
 

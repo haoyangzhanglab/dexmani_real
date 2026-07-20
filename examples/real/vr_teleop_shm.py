@@ -39,15 +39,7 @@ import time
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.signal_utils import alpha_from_tau, tau_from_alpha
-from dexmani_real.planning import (
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
@@ -61,6 +53,8 @@ from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.core.controller import TeleopController, TeleopControllerConfig
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.signal_utils import alpha_from_tau, tau_from_alpha
 
 logger = get_logger(__name__)
 

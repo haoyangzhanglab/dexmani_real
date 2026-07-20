@@ -50,10 +50,11 @@ class RateLimiter:
         elif self._overdue_throttle <= 0:
             self._overdue_cycles += 1
             logger.warning(
-                "Control loop over budget: actual=%.1fms target=%.1fms "
-                "(overdue %s/%s cycles)",
-                elapsed * 1000, self.dt * 1000,
-                self._overdue_cycles, self._total_cycles + 1,
+                "Control loop over budget: actual=%.1fms target=%.1fms " "(overdue %s/%s cycles)",
+                elapsed * 1000,
+                self.dt * 1000,
+                self._overdue_cycles,
+                self._total_cycles + 1,
             )
             self._overdue_throttle = 50  # throttle: ~1 warning/s at 50 Hz
         else:

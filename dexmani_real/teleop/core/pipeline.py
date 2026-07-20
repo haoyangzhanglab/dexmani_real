@@ -9,17 +9,17 @@ from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
-from dexmani_real.planning.types import Pose
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
+from dexmani_real.planning.types import Pose
 from dexmani_real.robot.types import RobotAction
 from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 if TYPE_CHECKING:
+    from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
-    from dexmani_real.planning.planner import XArm7MotionPlanner
 
 logger = get_logger(__name__)
 
@@ -74,7 +74,9 @@ class TeleopPipeline:
         self.planner.set_hand_qpos(prev_hand_cmd)
 
         arm_cmd, ik_ok, target_pos, target_quat = self.compute_arm_command(
-            vr_frame, current_arm_qpos, prev_arm_cmd,
+            vr_frame,
+            current_arm_qpos,
+            prev_arm_cmd,
             check_workspace=check_workspace,
             clamp_workspace_pos=clamp_workspace_pos,
         )
@@ -132,8 +134,10 @@ class TeleopPipeline:
         # First frame seeds the filter; subsequent frames apply EMA.
         if self._prev_target_pos is not None:
             target_pos, target_quat = ema_smooth_pose(
-                target_pos, target_quat,
-                self._prev_target_pos, self._prev_target_quat,
+                target_pos,
+                target_quat,
+                self._prev_target_pos,
+                self._prev_target_quat,
                 self._ema_alpha_pos,
                 self._ema_alpha_rot,
             )
@@ -180,4 +184,3 @@ class TeleopPipeline:
             pass
 
         return hand_cmd, retarget_ok
-

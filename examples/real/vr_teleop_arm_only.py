@@ -36,16 +36,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.log import get_logger
-from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
-from dexmani_real.planning import (
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
+from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
@@ -53,9 +46,10 @@ from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.utils.array_utils import nan_array
-from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import alpha_from_tau, ema_smooth_pose, tau_from_alpha
 
@@ -92,32 +86,34 @@ class TrajectoryLogger:
         eef_delta: np.ndarray | None = None,
         target_pos_before_clamp: np.ndarray | None = None,
     ) -> None:
-        self._records.append({
-            "t": float(t),
-            "wrist_pos": np.asarray(wrist_pos, dtype=np.float64).copy(),
-            "wrist_quat_wxyz": np.asarray(wrist_quat_wxyz, dtype=np.float64).copy(),
-            "target_pos": np.asarray(target_pos, dtype=np.float64).copy(),
-            "target_quat_wxyz": np.asarray(target_quat_wxyz, dtype=np.float64).copy(),
-            "actual_eef_pos": np.asarray(actual_eef_pos, dtype=np.float64).copy(),
-            "actual_eef_quat_wxyz": np.asarray(actual_eef_quat_wxyz, dtype=np.float64).copy(),
-            "arm_qpos_actual": np.asarray(arm_qpos_actual, dtype=np.float64).copy(),
-            "ik_ok": bool(ik_ok),
-            "wrist_delta": (
-                np.asarray(wrist_delta, dtype=np.float64).copy()
-                if wrist_delta is not None
-                else np.full(3, np.nan, dtype=np.float64)
-            ),
-            "eef_delta": (
-                np.asarray(eef_delta, dtype=np.float64).copy()
-                if eef_delta is not None
-                else np.full(3, np.nan, dtype=np.float64)
-            ),
-            "target_pos_before_clamp": (
-                np.asarray(target_pos_before_clamp, dtype=np.float64).copy()
-                if target_pos_before_clamp is not None
-                else np.full(3, np.nan, dtype=np.float64)
-            ),
-        })
+        self._records.append(
+            {
+                "t": float(t),
+                "wrist_pos": np.asarray(wrist_pos, dtype=np.float64).copy(),
+                "wrist_quat_wxyz": np.asarray(wrist_quat_wxyz, dtype=np.float64).copy(),
+                "target_pos": np.asarray(target_pos, dtype=np.float64).copy(),
+                "target_quat_wxyz": np.asarray(target_quat_wxyz, dtype=np.float64).copy(),
+                "actual_eef_pos": np.asarray(actual_eef_pos, dtype=np.float64).copy(),
+                "actual_eef_quat_wxyz": np.asarray(actual_eef_quat_wxyz, dtype=np.float64).copy(),
+                "arm_qpos_actual": np.asarray(arm_qpos_actual, dtype=np.float64).copy(),
+                "ik_ok": bool(ik_ok),
+                "wrist_delta": (
+                    np.asarray(wrist_delta, dtype=np.float64).copy()
+                    if wrist_delta is not None
+                    else np.full(3, np.nan, dtype=np.float64)
+                ),
+                "eef_delta": (
+                    np.asarray(eef_delta, dtype=np.float64).copy()
+                    if eef_delta is not None
+                    else np.full(3, np.nan, dtype=np.float64)
+                ),
+                "target_pos_before_clamp": (
+                    np.asarray(target_pos_before_clamp, dtype=np.float64).copy()
+                    if target_pos_before_clamp is not None
+                    else np.full(3, np.nan, dtype=np.float64)
+                ),
+            }
+        )
 
     def __len__(self) -> int:
         return len(self._records)
@@ -143,15 +139,18 @@ class TrajectoryLogger:
 # 决策/录制 @ CTRL_HZ; 臂内环保持 50Hz (Mode 6 固件在线规划, 直发无插值)。
 CTRL_HZ = 16.0
 CTRL_DT = 1.0 / CTRL_HZ
-REF_HZ = 50.0            # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
+REF_HZ = 50.0  # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
 STATUS_EVERY = int(round(1.0 * CTRL_HZ))  # 状态打印节流 (~1Hz)
-HOME_DT = 0.04           # 归位 waypoint 间隔 (s)
+HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
-WORKSPACE_BOUNDS = np.array([
-    [0.24, 0.72],    # x [min, max] m
-    [-0.50, 0.50],   # y [min, max] m
-    [0.05, 0.5],     # z [min, max] m
-], dtype=np.float64)
+WORKSPACE_BOUNDS = np.array(
+    [
+        [0.24, 0.72],  # x [min, max] m
+        [-0.50, 0.50],  # y [min, max] m
+        [0.05, 0.5],  # z [min, max] m
+    ],
+    dtype=np.float64,
+)
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
@@ -160,8 +159,8 @@ COLLISION_CONFIG = CollisionConfig(
 )
 
 # VR wrist → EEF 映射参数
-VR_POS_SCALE = 1.0          # 位置缩放 (1.0 = 1:1)
-VR_ROT_SCALE = 1.0          # 旋转缩放 (1.0 = 1:1)
+VR_POS_SCALE = 1.0  # 位置缩放 (1.0 = 1:1)
+VR_ROT_SCALE = 1.0  # 旋转缩放 (1.0 = 1:1)
 VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
@@ -328,7 +327,7 @@ def main():
         print("当前关节角度无效，使用 init_qpos")
         prev_qpos_cmd = home_qpos.copy()
 
-    ema_prev_pos: np.ndarray | None = None   # 笛卡尔 EMA 状态 (IK 前)
+    ema_prev_pos: np.ndarray | None = None  # 笛卡尔 EMA 状态 (IK 前)
     ema_prev_quat: np.ndarray | None = None
 
     print(f"\n初始状态:")
@@ -628,7 +627,10 @@ def main():
 
             # ── 读取 VR 帧 ──
             vr_frame = vr_receiver.read_latest()
-            vr_stale = vr_frame is None or (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > VR_STALE_THRESHOLD_S * 1e9
+            vr_stale = (
+                vr_frame is None
+                or (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > VR_STALE_THRESHOLD_S * 1e9
+            )
 
             # ── Periodic status ──
             if loop_count % STATUS_EVERY == 0:
@@ -669,9 +671,7 @@ def main():
                 if vr_frame is not None:
                     _wp = vr_frame["wrist_pos"]
                     _wq = vr_frame["wrist_quat_wxyz"]
-                    _w_euler = np.rad2deg(
-                        Rotation.from_quat(wxyz_to_xyzw(_wq)).as_euler("xyz", degrees=False)
-                    )
+                    _w_euler = np.rad2deg(Rotation.from_quat(wxyz_to_xyzw(_wq)).as_euler("xyz", degrees=False))
                     print(
                         f"  [VR raw] wrist_pos(FLU)={np.round(_wp, 4)}m  "
                         f"wrist_quat_wxyz={np.round(_wq, 4)}  "
@@ -710,9 +710,12 @@ def main():
             # 故恢复时目标渐进追赶而非跳变.
             if ema_prev_pos is not None:
                 target_pos, target_quat = ema_smooth_pose(
-                    target_pos, target_quat,
-                    ema_prev_pos, ema_prev_quat,
-                    EMA_ALPHA_POS, EMA_ALPHA_ROT,
+                    target_pos,
+                    target_quat,
+                    ema_prev_pos,
+                    ema_prev_quat,
+                    EMA_ALPHA_POS,
+                    EMA_ALPHA_ROT,
                 )
             ema_prev_pos = target_pos.copy()
             ema_prev_quat = target_quat.copy()
@@ -762,7 +765,9 @@ def main():
 
             # ── Hand: hold position (skip if hand unavailable) ──
             if hand_available:
-                hand_cmd = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
+                hand_cmd = (
+                    state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
+                )
             else:
                 hand_cmd = np.zeros(12, dtype=np.float64)
 

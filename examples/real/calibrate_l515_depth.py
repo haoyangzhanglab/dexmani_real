@@ -199,8 +199,10 @@ def fit_sigma_poly(pixel_stats: dict, depth_scale: float) -> dict | None:
 
 
 def run_drift_phase(camera: RealSense, lut: np.ndarray, depth_scale: float, args: argparse.Namespace) -> dict:
-    print("\n=== Phase 1: thermal drift + sigma_z(z) "
-          f"({args.duration_min:.0f} min, burst every {args.interval_s:.0f} s) ===")
+    print(
+        "\n=== Phase 1: thermal drift + sigma_z(z) "
+        f"({args.duration_min:.0f} min, burst every {args.interval_s:.0f} s) ==="
+    )
     print("    t+min   median depth      fill(ROI)   latency med/p95")
     n_bursts = int(args.duration_min * 60 / args.interval_s) + 1
     t0 = time.monotonic()
@@ -235,8 +237,10 @@ def run_drift_phase(camera: RealSense, lut: np.ndarray, depth_scale: float, args
             f"{100 * burst['fill_roi']:8.1f}%   {burst['lat_med_ms']:.0f}/{burst['lat_p95_ms']:.0f} ms"
         )
 
-    result: dict = {"bursts": [{k: v for k, v in b.items() if k != "pixel_stats"} for b in bursts],
-                    "reconnects_at_min": reconnects}
+    result: dict = {
+        "bursts": [{k: v for k, v in b.items() if k != "pixel_stats"} for b in bursts],
+        "reconnects_at_min": reconnects,
+    }
     if len(bursts) >= 5:
         meds = np.array([b["median_depth_m"] for b in bursts])
         times = np.array([b["t_min"] for b in bursts])
@@ -252,8 +256,10 @@ def run_drift_phase(camera: RealSense, lut: np.ndarray, depth_scale: float, args
         canary_mm = max(1.0, 3.0 * resid_mm) if resid_mm is not None else None
         result.update({"total_drift_mm": total_drift_mm, "t_settle_min": t_settle, "canary_mm": canary_mm})
         print(f"\n  Total drift (first -> settled): {total_drift_mm:+.2f} mm (depth-ray direction)")
-        print(f"  Settle time (within 1 mm of final): "
-              f"{'not reached in session' if t_settle is None else f'{t_settle:.0f} min'}")
+        print(
+            f"  Settle time (within 1 mm of final): "
+            f"{'not reached in session' if t_settle is None else f'{t_settle:.0f} min'}"
+        )
         if canary_mm is not None:
             print(f"  Suggested desk-depth canary threshold: {canary_mm:.1f} mm (3x post-settle std, floor 1 mm)")
             print("  (world-z canary ~= this x cos(view angle); re-derive if used on RANSAC desk z)")
@@ -263,16 +269,20 @@ def run_drift_phase(camera: RealSense, lut: np.ndarray, depth_scale: float, args
     fit = fit_sigma_poly(sigma_burst["pixel_stats"], depth_scale)
     result["sigma_fit"] = fit
     if fit is not None:
-        print(f"  Fitted:  sigma_poly=({fit['c0']:.5f}, {fit['c1']:.5f})   "
-              f"[current {tuple(round(c, 5) for c in EDGE_CFG.sigma_poly)}]")
+        print(
+            f"  Fitted:  sigma_poly=({fit['c0']:.5f}, {fit['c1']:.5f})   "
+            f"[current {tuple(round(c, 5) for c in EDGE_CFG.sigma_poly)}]"
+        )
         print("    z      sigma fit   sigma cur   T_edge fit   T_edge cur")
         for z_val in (0.5, 0.75, 1.0, 1.25):
             s_fit = fit["c0"] + fit["c1"] * z_val
             s_cur = EDGE_CFG.sigma_poly[0] + EDGE_CFG.sigma_poly[1] * z_val
             t_fit = max(EDGE_CFG.n_sigma * s_fit, EDGE_CFG.t_min)
             t_cur = max(EDGE_CFG.n_sigma * s_cur, EDGE_CFG.t_min)
-            print(f"    {z_val:.2f}m  {s_fit * 1e3:7.2f} mm  {s_cur * 1e3:7.2f} mm  "
-                  f"{t_fit * 1e3:8.1f} mm  {t_cur * 1e3:8.1f} mm")
+            print(
+                f"    {z_val:.2f}m  {s_fit * 1e3:7.2f} mm  {s_cur * 1e3:7.2f} mm  "
+                f"{t_fit * 1e3:8.1f} mm  {t_cur * 1e3:8.1f} mm"
+            )
     return result
 
 
@@ -295,11 +305,21 @@ def run_ab_phase(camera: RealSense, lut: np.ndarray, depth_scale: float, args: a
                 "preset": sensor.get_option(rs.option.visual_preset),
             }
             ps = burst.pop("pixel_stats")
-            in_range = ps["full"] & (ps["mean_raw"] * depth_scale > DEPTH_RANGE_M[0]) \
+            in_range = (
+                ps["full"]
+                & (ps["mean_raw"] * depth_scale > DEPTH_RANGE_M[0])
                 & (ps["mean_raw"] * depth_scale < DEPTH_RANGE_M[1])
+            )
             noise_mm = float(np.median(ps["std_raw"][in_range]) * depth_scale * 1e3) if in_range.any() else None
-            rows.append({"label": label, "requested": {"laser": laser, "gain": gain},
-                         "actual": actual, "noise_mm": noise_mm, **burst})
+            rows.append(
+                {
+                    "label": label,
+                    "requested": {"laser": laser, "gain": gain},
+                    "actual": actual,
+                    "noise_mm": noise_mm,
+                    **burst,
+                }
+            )
     finally:
         sensor.set_option(rs.option.laser_power, orig_laser)
         sensor.set_option(rs.option.receiver_gain, orig_gain)
@@ -313,12 +333,18 @@ def run_ab_phase(camera: RealSense, lut: np.ndarray, depth_scale: float, args: a
 
     for r in rows:
         noise_str = "n/a" if r["noise_mm"] is None else f"{r['noise_mm']:.2f} mm"
-        print(f"  {r['label']:<22} {pct(r['fill_roi'])}   {pct(r['conf_low'])}  {pct(r['ir_low'])}  "
-              f"{pct(r['ir_sat'])}  {pct(r['edge'])}   {noise_str}")
-        if abs(r["actual"]["laser"] - r["requested"]["laser"]) > 0.5 \
-                or abs(r["actual"]["gain"] - r["requested"]["gain"]) > 0.5:
-            print(f"    WARNING: read-back mismatch, actual laser={r['actual']['laser']:.0f} "
-                  f"gain={r['actual']['gain']:.0f} (preset={r['actual']['preset']:.0f})")
+        print(
+            f"  {r['label']:<22} {pct(r['fill_roi'])}   {pct(r['conf_low'])}  {pct(r['ir_low'])}  "
+            f"{pct(r['ir_sat'])}  {pct(r['edge'])}   {noise_str}"
+        )
+        if (
+            abs(r["actual"]["laser"] - r["requested"]["laser"]) > 0.5
+            or abs(r["actual"]["gain"] - r["requested"]["gain"]) > 0.5
+        ):
+            print(
+                f"    WARNING: read-back mismatch, actual laser={r['actual']['laser']:.0f} "
+                f"gain={r['actual']['gain']:.0f} (preset={r['actual']['preset']:.0f})"
+            )
     print("\n  读法：ir_sat 与 noise 同降 → 采纳该档；ir_sat 降但 noise/conf_low 明显升 → 权衡填充率。")
     return {"rows": rows}
 

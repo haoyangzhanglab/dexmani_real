@@ -93,9 +93,7 @@ class PointCloudProcessor:
         """
         cfg = self.config
         if rays.shape[:2] != depth_m.shape or rgb.shape[:2] != depth_m.shape:
-            raise ValueError(
-                f"Shape mismatch: depth {depth_m.shape}, rgb {rgb.shape[:2]}, rays {rays.shape[:2]}."
-            )
+            raise ValueError(f"Shape mismatch: depth {depth_m.shape}, rgb {rgb.shape[:2]}, rays {rays.shape[:2]}.")
 
         import time as _time
 
@@ -116,9 +114,12 @@ class PointCloudProcessor:
         pts = pts_cam @ self._R.T + self._t
         x_min, y_min, z_min, x_max, y_max, z_max = cfg.workspace
         crop = (
-            (pts[:, 0] >= x_min) & (pts[:, 0] <= x_max)
-            & (pts[:, 1] >= y_min) & (pts[:, 1] <= y_max)
-            & (pts[:, 2] >= z_min) & (pts[:, 2] <= z_max)
+            (pts[:, 0] >= x_min)
+            & (pts[:, 0] <= x_max)
+            & (pts[:, 1] >= y_min)
+            & (pts[:, 1] <= y_max)
+            & (pts[:, 2] >= z_min)
+            & (pts[:, 2] <= z_max)
         )
         pts = pts[crop]
         if pts.shape[0] == 0:
@@ -142,9 +143,7 @@ class PointCloudProcessor:
         _t1 = _time.monotonic()
 
         # Radius outlier removal: drop specks (0-1 neighbours in the 5 mm grid).
-        pcd, _ = pcd.remove_radius_outlier(
-            nb_points=cfg.radius_outlier_min_points, radius=cfg.radius_outlier_radius
-        )
+        pcd, _ = pcd.remove_radius_outlier(nb_points=cfg.radius_outlier_min_points, radius=cfg.radius_outlier_radius)
         if len(pcd.points) == 0:
             return None
         n_radius = len(pcd.points)
@@ -179,6 +178,7 @@ class PointCloudProcessor:
         self._t_n += 1
         if self._t_n >= self._timing_log_every:
             from dexmani_real.utils.log import get_logger
+
             _log = get_logger(__name__)
             _log.debug(
                 "PointCloudProcessor [%d frames]: numpy=%.1fms in=%.0fk pts "
@@ -187,17 +187,21 @@ class PointCloudProcessor:
                 self._t_n,
                 self._t_numpy / self._t_n,
                 self._t_in_n / self._t_n / 1000,
-                self._t_voxel / self._t_n, self._t_in_n / self._t_n / 1000, self._t_voxel_n / self._t_n / 1000,
-                self._t_radius / self._t_n, self._t_voxel_n / self._t_n / 1000, self._t_radius_n / self._t_n / 1000,
-                self._t_fps / self._t_n, self._t_radius_n / self._t_n / 1000, cfg.num_points,
+                self._t_voxel / self._t_n,
+                self._t_in_n / self._t_n / 1000,
+                self._t_voxel_n / self._t_n / 1000,
+                self._t_radius / self._t_n,
+                self._t_voxel_n / self._t_n / 1000,
+                self._t_radius_n / self._t_n / 1000,
+                self._t_fps / self._t_n,
+                self._t_radius_n / self._t_n / 1000,
+                cfg.num_points,
             )
             self._t_numpy = self._t_voxel = self._t_radius = self._t_fps = 0.0
             self._t_in_n = self._t_voxel_n = self._t_radius_n = 0
             self._t_n = 0
 
-        return np.ascontiguousarray(
-            np.concatenate([pts_out, cols_out], axis=1), dtype=np.float32
-        )
+        return np.ascontiguousarray(np.concatenate([pts_out, cols_out], axis=1), dtype=np.float32)
 
     def _fps_pytorch3d(self, pcd) -> tuple[np.ndarray, np.ndarray]:
         import torch  # lazy: only when the pytorch3d backend is selected

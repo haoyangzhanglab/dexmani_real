@@ -283,8 +283,10 @@ class ReplayBuffer:
         all episodes that fall within the requested range.
         """
         if len(self._episode_ends) == 0:
-            return {"obs": np.empty((0, self._obs_dim), dtype=np.float32),
-                    "action": np.empty((0, self._action_dim), dtype=np.float32)}
+            return {
+                "obs": np.empty((0, self._obs_dim), dtype=np.float32),
+                "action": np.empty((0, self._action_dim), dtype=np.float32),
+            }
 
         total = int(self._episode_ends[-1])
         if start < 0:
@@ -294,8 +296,10 @@ class ReplayBuffer:
         start = max(0, min(start, total))
         stop = max(0, min(stop, total))
         if start >= stop:
-            return {"obs": np.empty((0, self._obs_dim), dtype=np.float32),
-                    "action": np.empty((0, self._action_dim), dtype=np.float32)}
+            return {
+                "obs": np.empty((0, self._obs_dim), dtype=np.float32),
+                "action": np.empty((0, self._action_dim), dtype=np.float32),
+            }
 
         first_ep = int(np.searchsorted(self._episode_ends, start, side="right"))
         last_ep = int(np.searchsorted(self._episode_ends, stop, side="right"))
@@ -314,8 +318,10 @@ class ReplayBuffer:
             ep_start_global = ep_end_global
 
         if not obs_parts:
-            return {"obs": np.empty((0, self._obs_dim), dtype=np.float32),
-                    "action": np.empty((0, self._action_dim), dtype=np.float32)}
+            return {
+                "obs": np.empty((0, self._obs_dim), dtype=np.float32),
+                "action": np.empty((0, self._action_dim), dtype=np.float32),
+            }
 
         return {
             "obs": np.concatenate(obs_parts, axis=0),

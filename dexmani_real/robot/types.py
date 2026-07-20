@@ -13,6 +13,7 @@ import numpy as np
 
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.robot.xhand import XHandConfig
+
 # Per-joint arm torque limits from URDF: J1-J2=50, J3-J5=30, J6-J7=20 Nm.
 # Defined here (robot layer) because these are hardware properties, not teleop policy.
 # Used by both teleop safety checks and RobotInterface path execution.

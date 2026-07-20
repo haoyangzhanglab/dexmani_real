@@ -8,7 +8,6 @@ from typing import Any, Literal, Sequence, Union
 import numpy as np
 import torch
 
-
 ArrayLike = Union[np.ndarray, torch.Tensor]
 SamplingMode = Literal["none", "random", "fps", "first"]
 
@@ -309,7 +308,9 @@ def make_rays(height: int, width: int, K: ArrayLike, device: str = "cpu") -> tor
     return pixels @ torch.linalg.inv(K_tensor).T
 
 
-def depth_to_xyz(depth: ArrayLike, K: ArrayLike | None = None, *, rays: ArrayLike | None = None, device: str = "cpu") -> torch.Tensor:
+def depth_to_xyz(
+    depth: ArrayLike, K: ArrayLike | None = None, *, rays: ArrayLike | None = None, device: str = "cpu"
+) -> torch.Tensor:
     depth_tensor = torch.as_tensor(depth_to_meters(depth), dtype=torch.float32, device=device)
     if depth_tensor.ndim != 2:
         raise ValueError(f"depth must have shape (H, W), got {tuple(depth_tensor.shape)}.")
@@ -322,7 +323,9 @@ def depth_to_xyz(depth: ArrayLike, K: ArrayLike | None = None, *, rays: ArrayLik
 
     rays_tensor = torch.as_tensor(rays, dtype=torch.float32, device=device)
     if rays_tensor.shape[:2] != depth_tensor.shape or rays_tensor.shape[-1] != 3:
-        raise ValueError(f"rays shape {tuple(rays_tensor.shape)} does not match depth shape {tuple(depth_tensor.shape)}.")
+        raise ValueError(
+            f"rays shape {tuple(rays_tensor.shape)} does not match depth shape {tuple(depth_tensor.shape)}."
+        )
     return (rays_tensor * depth_tensor[..., None]).reshape(-1, 3)
 
 

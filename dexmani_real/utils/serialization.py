@@ -236,8 +236,9 @@ class FromDictMixin:
         which handles tuple/list/ndarray conversion, Enum lookup, and nested
         FromDictMixin dataclasses.
         """
-        import yaml
         from pathlib import Path
+
+        import yaml
 
         with open(Path(path), "r", encoding="utf-8") as f:
             d = yaml.safe_load(f)

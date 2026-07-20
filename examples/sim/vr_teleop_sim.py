@@ -73,56 +73,53 @@ import numpy as np
 import sapien.core as sapien
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planning import (
-    PlanningProfile,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import PlanningProfile, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.planning.types import Pose  # used in workspace clamp wrapper
 from dexmani_real.recording import EpisodeRecorder
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
+from dexmani_real.simulation import SimRobotConfig, SimRobotInterface, execute_dense_path, settle_at_target
 from dexmani_real.simulation.constructor import add_light, create_viewer
+from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.core.pipeline import TeleopPipeline
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.vr.dummy_tracker import DummyTracker
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
-from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker, VRFrameSimulator
 from dexmani_real.utils.rate_limiter import RateLimiter
-
-from dexmani_real.planning.path_utils import interpolate_waypoints
-from dexmani_real.simulation import execute_dense_path, settle_at_target
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 模块常量
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CTRL_HZ = 16.0                     # 与真机 vr_teleop_shm.py 一致 (16Hz 直通 EMA)
+CTRL_HZ = 16.0  # 与真机 vr_teleop_shm.py 一致 (16Hz 直通 EMA)
 CTRL_DT = 1.0 / CTRL_HZ
 PHYSICS_STEPS_PER_WP = 20
-PHYSICS_STEPS_PER_TICK = 15          # 240Hz / 16Hz ≈ 15
+PHYSICS_STEPS_PER_TICK = 15  # 240Hz / 16Hz ≈ 15
 INTERP_MAX_STEP_RAD = np.deg2rad(2.0)
-VR_FRAME_MAX_AGE_S = 0.2            # 仿真容忍度高于真机（0.1s）：dummy VR 无网络延迟
+VR_FRAME_MAX_AGE_S = 0.2  # 仿真容忍度高于真机（0.1s）：dummy VR 无网络延迟
 DEFAULT_DATA_DIR = "./episodes"
 
 # 工作空间边界（world frame，与 RobotInterfaceConfig 默认值严格一致: types.py:136-138）
-WORKSPACE_BOUNDS = np.array([
-    [0.28, 0.72],   # x [min, max] m
-    [-0.45, 0.45],  # y [min, max] m
-    [0.05, 0.50],   # z [min, max] m
-])
+WORKSPACE_BOUNDS = np.array(
+    [
+        [0.28, 0.72],  # x [min, max] m
+        [-0.45, 0.45],  # y [min, max] m
+        [0.05, 0.50],  # z [min, max] m
+    ]
+)
 
 # ArmWristMapper EEF delta 边界（robot base frame）
-EEF_DELTA_BOUNDS = np.array([
-    [-0.30, 0.30],
-    [-0.30, 0.30],
-    [-0.30, 0.30],
-])
+EEF_DELTA_BOUNDS = np.array(
+    [
+        [-0.30, 0.30],
+        [-0.30, 0.30],
+        [-0.30, 0.30],
+    ]
+)
 
 # VR → robot base 旋转矩阵（FLU → FLU-aligned）
 VR_TO_BASE_ROT = np.eye(3)
@@ -155,7 +152,6 @@ CAMERA_EEF_OFFSET_QUAT_WXYZ = np.array([0.966, 0.0, 0.259, 0.0], dtype=np.float6
 # ═══════════════════════════════════════════════════════════════════════════════
 # cbreak 键盘输入（与 KeyboardHandler 同技术栈: termios + select）
 # ═══════════════════════════════════════════════════════════════════════════════
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -203,7 +199,8 @@ def build_robot_state(sim_state: dict) -> RobotState:
 
 
 def build_robot_action(
-    arm_cmd: np.ndarray, hand_cmd: np.ndarray,
+    arm_cmd: np.ndarray,
+    hand_cmd: np.ndarray,
 ) -> RobotAction:
     """从关节命令构造 RobotAction。"""
     return RobotAction(
@@ -271,11 +268,14 @@ def setup_ee_camera(
         far=far,
     )
 
-    K = np.array([
-        [cam.fx, 0, cam.cx],
-        [0, cam.fy, cam.cy],
-        [0, 0, 1],
-    ], dtype=np.float64)
+    K = np.array(
+        [
+            [cam.fx, 0, cam.cx],
+            [0, cam.fy, cam.cy],
+            [0, 0, 1],
+        ],
+        dtype=np.float64,
+    )
 
     return cam, K
 
@@ -342,8 +342,11 @@ def execute_return_home(
     hand_qpos = sim.get_full_qpos()[7:]
     execute_dense_path(sim, dense, viewer, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
     settle_at_target(
-        sim, dense[-1, :7], hand_qpos,
-        max_iter=3, physics_steps_per_wp=PHYSICS_STEPS_PER_WP,
+        sim,
+        dense[-1, :7],
+        hand_qpos,
+        max_iter=3,
+        physics_steps_per_wp=PHYSICS_STEPS_PER_WP,
     )
 
     final_qpos = sim.get_full_qpos()[:7]
@@ -362,31 +365,41 @@ def main() -> None:
         description="VR Teleop — xArm7+XHand SAPIEN 仿真 + HDF5 数据录制",
     )
     parser.add_argument(
-        "--dummy", action="store_true",
+        "--dummy",
+        action="store_true",
         help="使用 DummyTracker（无需 VR 头显即可测试）",
     )
     parser.add_argument(
-        "--dummy-vr-sinusoidal", action="store_true",
+        "--dummy-vr-sinusoidal",
+        action="store_true",
         help="使用 VRFrameSimulator 正弦手腕轨迹（Phase 3.3，无需 Quest 设备）",
     )
     parser.add_argument(
-        "--headless", action="store_true",
+        "--headless",
+        action="store_true",
         help="无头模式（不创建 viewer 窗口）",
     )
     parser.add_argument(
-        "--data-dir", type=str, default=DEFAULT_DATA_DIR,
+        "--data-dir",
+        type=str,
+        default=DEFAULT_DATA_DIR,
         help=f"episode 数据输出目录（默认: {DEFAULT_DATA_DIR}）",
     )
     parser.add_argument(
-        "--no-camera", action="store_true",
+        "--no-camera",
+        action="store_true",
         help="禁用 EEF RGBD 相机（默认启用，headless 模式下自动禁用）",
     )
     parser.add_argument(
-        "--camera-width", type=int, default=CAMERA_WIDTH,
+        "--camera-width",
+        type=int,
+        default=CAMERA_WIDTH,
         help=f"相机图像宽度（默认: {CAMERA_WIDTH}）",
     )
     parser.add_argument(
-        "--camera-height", type=int, default=CAMERA_HEIGHT,
+        "--camera-height",
+        type=int,
+        default=CAMERA_HEIGHT,
         help=f"相机图像高度（默认: {CAMERA_HEIGHT}）",
     )
     args = parser.parse_args()
@@ -482,7 +495,9 @@ def main() -> None:
 
     # ── TeleopPipeline (shared action computation with real controller) ──
     pipeline = TeleopPipeline(
-        arm_mapper, hand_retargeter, planner,
+        arm_mapper,
+        hand_retargeter,
+        planner,
         ema_alpha_pos=1.0,
         ema_alpha_rot=1.0,  # Cartesian EMA passthrough (与真机一致; 平滑由 Mode 6 固件负责)
     )
@@ -507,10 +522,13 @@ def main() -> None:
     viewer: sapien.Viewer | None = None
     if not args.headless:
         add_light(sim.scene)
-        viewer = create_viewer(sim.scene, sapien.Pose(
-            [0.784, 0.027, 0.630],
-            [0.005, -0.233, 0.001, 0.973],
-        ))
+        viewer = create_viewer(
+            sim.scene,
+            sapien.Pose(
+                [0.784, 0.027, 0.630],
+                [0.005, -0.233, 0.001, 0.973],
+            ),
+        )
 
     # ── 仿真 RGBD 相机（默认启用，headless 或 --no-camera 时禁用）──
     ee_camera: sapien.render.RenderCameraComponent | None = None
@@ -519,7 +537,8 @@ def main() -> None:
     if camera_enabled:
         try:
             ee_camera, camera_K = setup_ee_camera(
-                sim.scene, sim.robot.model,
+                sim.scene,
+                sim.robot.model,
                 width=args.camera_width,
                 height=args.camera_height,
             )
@@ -534,16 +553,16 @@ def main() -> None:
         print("[Camera] 已通过 --no-camera 禁用")
 
     # ── 控制状态变量 ──
-    state = "IDLE"               # IDLE | TELEOP_RECORDING | PAUSED
+    state = "IDLE"  # IDLE | TELEOP_RECORDING | PAUSED
     rate_limiter = RateLimiter(CTRL_HZ)
     prev_arm_cmd = sim.get_full_qpos()[:7].copy()
     prev_hand_cmd = sim.get_full_qpos()[7:].copy()
-    ik_fail_total = 0          # 累计 IK 失败次数（只增不减，用于 ik_rate 计算）
-    ik_fail_consecutive = 0    # 连续 IK 失败次数（成功时重置，用于诊断）
+    ik_fail_total = 0  # 累计 IK 失败次数（只增不减，用于 ik_rate 计算）
+    ik_fail_consecutive = 0  # 连续 IK 失败次数（成功时重置，用于诊断）
     retarget_fail_total = 0
     retarget_fail_consecutive = 0
     stale_frame_count = 0
-    episode_tick_count = 0       # Phase 1.2: 当前 episode 内的 tick 计数
+    episode_tick_count = 0  # Phase 1.2: 当前 episode 内的 tick 计数
     episode_idx = 0
     last_status_time = time.perf_counter()
     last_overrun_warn_ts = 0.0
@@ -556,7 +575,9 @@ def main() -> None:
 
     print("=" * 60)
     print("VR Teleop — xArm7+XHand SAPIEN 仿真 + 数据录制")
-    print(f"  Mode:       {'VRFrameSimulator' if args.dummy_vr_sinusoidal else ('Dummy (no headset)' if args.dummy else 'Quest VR')}")
+    print(
+        f"  Mode:       {'VRFrameSimulator' if args.dummy_vr_sinusoidal else ('Dummy (no headset)' if args.dummy else 'Quest VR')}"
+    )
     print(f"  Data dir:   {args.data_dir}")
     print(f"  Home EEF:   pos={np.round(home_eef.p, 3)}")
     print("  B: 开始遥操作+录制  |  C: 暂停/恢复  |  H: 回 home")
@@ -590,7 +611,8 @@ def main() -> None:
                             print("[ESC] Emergency stop — 冻结运动，仅 Q 可退出")
                             if collection.is_recording:
                                 collection.stop_episode(
-                                    success=False, reason="emergency_stop",
+                                    success=False,
+                                    reason="emergency_stop",
                                     classification="failure",
                                 )
                             state = "ESTOP"
@@ -610,7 +632,8 @@ def main() -> None:
                         if state in ("TELEOP_RECORDING", "PAUSED"):
                             # Auto-save → IDLE (matches TeleopController behavior)
                             ik_rate = 1.0 - min(
-                                ik_fail_total / max(episode_tick_count, 1), 1.0,
+                                ik_fail_total / max(episode_tick_count, 1),
+                                1.0,
                             )
                             vr_drop = stale_frame_count / max(episode_tick_count, 1)
                             # Rate-based classification: 绝对帧数阈值在超长/short
@@ -618,11 +641,7 @@ def main() -> None:
                             #   failure  — 超过 10% 帧 IK 失败（运动学问题严重）
                             #   partial  — 1%~10% 帧失败（偶发不可达，数据仍可用）
                             #   success  — <1% 帧失败（几乎完美跟踪）
-                            classification = (
-                                "failure" if ik_rate < 0.90
-                                else "partial" if ik_rate < 0.99
-                                else "success"
-                            )
+                            classification = "failure" if ik_rate < 0.90 else "partial" if ik_rate < 0.99 else "success"
                             path = collection.stop_episode(
                                 success=(classification != "failure"),
                                 classification=classification,
@@ -689,8 +708,7 @@ def main() -> None:
                             print("[Home] 规划回 home...")
                             # Stop recording if active (discard for home)
                             if collection.is_recording:
-                                collection.stop_episode(success=False, reason="home",
-                                                        classification="failure")
+                                collection.stop_episode(success=False, reason="home", classification="failure")
                             execute_return_home(sim, planner, home_eef, viewer)
                             prev_arm_cmd = sim.get_full_qpos()[:7].copy()
                             prev_hand_cmd = sim.get_full_qpos()[7:].copy()
@@ -759,15 +777,12 @@ def main() -> None:
                         if state in ("TELEOP_RECORDING", "PAUSED"):
                             # Auto-save → IDLE (matches TeleopController behavior)
                             ik_rate = 1.0 - min(
-                                ik_fail_total / max(episode_tick_count, 1), 1.0,
+                                ik_fail_total / max(episode_tick_count, 1),
+                                1.0,
                             )
                             vr_drop = stale_frame_count / max(episode_tick_count, 1)
                             # Rate-based classification (same as QUIT handler above)
-                            classification = (
-                                "failure" if ik_rate < 0.90
-                                else "partial" if ik_rate < 0.99
-                                else "success"
-                            )
+                            classification = "failure" if ik_rate < 0.90 else "partial" if ik_rate < 0.99 else "success"
                             path = collection.stop_episode(
                                 success=(classification != "failure"),
                                 classification=classification,
@@ -800,8 +815,7 @@ def main() -> None:
                         lost_duration_s = (now_ns - lost_since_ns) * 1e-9
 
                         if stale_frame_count == 1:
-                            print(f"[VR] 帧过期或不可用 (age > {VR_FRAME_MAX_AGE_S}s)，"
-                                  f"软减速中...")
+                            print(f"[VR] 帧过期或不可用 (age > {VR_FRAME_MAX_AGE_S}s)，" f"软减速中...")
 
                         # Hold current position
                         sim_state = sim.get_state()
@@ -818,7 +832,7 @@ def main() -> None:
 
                     else:
                         # ── VR 帧有效：正常控制 ──
-                        lost_since_ns = None      # 重置丢帧计时
+                        lost_since_ns = None  # 重置丢帧计时
                         stale_frame_count = 0
                         sim_state = sim.get_state()
 
@@ -851,7 +865,10 @@ def main() -> None:
 
                         # ── 速度限制（Phase 2.1 — bottleneck scaling）──
                         arm_cmd = velocity_limited_step(
-                            arm_cmd, prev_arm_cmd, MAX_QVEL_RAD_S, CTRL_DT,
+                            arm_cmd,
+                            prev_arm_cmd,
+                            MAX_QVEL_RAD_S,
+                            CTRL_DT,
                         )
 
                         # 3. 仿真相机帧捕获（可选）
@@ -877,7 +894,8 @@ def main() -> None:
                             try:
                                 robot_state = build_robot_state(sim_state)
                                 robot_action = build_robot_action(
-                                    arm_cmd, hand_cmd,
+                                    arm_cmd,
+                                    hand_cmd,
                                 )
                                 ik = bool(status["ik_ok"])
                                 rt_ok = bool(status["retarget_ok"])
@@ -1021,7 +1039,8 @@ def main() -> None:
         if collection.is_recording:
             try:
                 path = collection.stop_episode(
-                    success=False, reason="abnormal_exit",
+                    success=False,
+                    reason="abnormal_exit",
                     classification="failure",
                 )
                 if path:
@@ -1029,7 +1048,7 @@ def main() -> None:
             except (ValueError, OSError):
                 pass
 
-        tracker.disconnect() if hasattr(tracker, 'disconnect') else None
+        tracker.disconnect() if hasattr(tracker, "disconnect") else None
         sim.disconnect()
         print("Done.")
 

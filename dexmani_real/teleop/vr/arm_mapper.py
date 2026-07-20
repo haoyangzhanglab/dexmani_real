@@ -5,10 +5,11 @@ from __future__ import annotations
 __all__ = ["ArmWristMapper"]
 
 import numpy as np
-from dexmani_real.utils.log import get_logger
-from dexmani_real.planning.pose_utils import normalize_quat_wxyz
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
+
+from dexmani_real.planning.pose_utils import normalize_quat_wxyz
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
@@ -32,7 +33,9 @@ class ArmWristMapper:
         self.vr_to_base_rot = np.eye(3) if vr_to_base_rot is None else np.asarray(vr_to_base_rot, dtype=np.float64)
         # Maps base-frame deltas into world-frame deltas (accounts for base_pose_world).
         # Default identity means base == world (simulation case).
-        self.base_to_world_rot = np.eye(3) if base_to_world_rot is None else np.asarray(base_to_world_rot, dtype=np.float64)
+        self.base_to_world_rot = (
+            np.eye(3) if base_to_world_rot is None else np.asarray(base_to_world_rot, dtype=np.float64)
+        )
         # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
         self.eef_delta_bounds = None if eef_delta_bounds is None else np.asarray(eef_delta_bounds, dtype=np.float64)
         # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
@@ -84,7 +87,8 @@ class ArmWristMapper:
             if frame_angle > self.max_per_frame_rot_rad:
                 logger.warning(
                     "Per-frame rotation spike: %.1f° -> clamped to %.1f°",
-                    np.rad2deg(frame_angle), np.rad2deg(self.max_per_frame_rot_rad),
+                    np.rad2deg(frame_angle),
+                    np.rad2deg(self.max_per_frame_rot_rad),
                 )
                 frame_delta_clamped = axangle2mat(_axis, self.max_per_frame_rot_rad, is_normalized=True)
                 wrist_rot = frame_delta_clamped @ self._last_wrist_rot
@@ -152,8 +156,7 @@ class ArmWristMapper:
 
         if norm_2d < 1e-6:
             logger.warning(
-                "set_heading: head forward nearly vertical (norm_2d=%.2e), "
-                "keeping current heading",
+                "set_heading: head forward nearly vertical (norm_2d=%.2e), " "keeping current heading",
                 norm_2d,
             )
             return
@@ -175,7 +178,9 @@ class ArmWristMapper:
 
         logger.info(
             "set_heading: forward_2d=[%.3f, %.3f] theta=%.1f° → vr_to_base_rot set",
-            forward_2d[0], forward_2d[1], np.rad2deg(theta),
+            forward_2d[0],
+            forward_2d[1],
+            np.rad2deg(theta),
         )
 
     def clip_delta_pos(self, delta_pos: np.ndarray) -> np.ndarray:
@@ -200,7 +205,8 @@ class ArmWristMapper:
         if angle > self.max_delta_rot_rad:
             logger.debug(
                 "clip_total_delta_rot: clamping %.3f rad -> %.3f rad",
-                angle, self.max_delta_rot_rad,
+                angle,
+                self.max_delta_rot_rad,
             )
             return axangle2mat(axis, self.max_delta_rot_rad, is_normalized=True)
         return delta_rot
@@ -211,5 +217,3 @@ class ArmWristMapper:
             quat_wxyz = -quat_wxyz
         self.last_quat_wxyz = quat_wxyz.copy()
         return quat_wxyz
-
-

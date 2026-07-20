@@ -214,7 +214,7 @@ class TeleopProfile(FromDictMixin):
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
-    check_env_collision: bool = True   # env (table/obstacle) collision gate; holds on contact
+    check_env_collision: bool = True  # env (table/obstacle) collision gate; holds on contact
 
     # Fast-accept threshold for position IK fallback (ref: ssik seed_tolerance).
     # A candidate is accepted immediately without trying additional seeds when
@@ -230,8 +230,12 @@ class TeleopProfile(FromDictMixin):
     # of max_pose_error_pos_m/rot_rad or when max_iterations reached.
     differential_ik_gain: float = 0.05  # step size per iteration (matches BVP v*0.05)
     differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
-    differential_ik_max_iterations: int = 10  # cap at 10 (normal ops converge ≤5 iters; extra iters near singularity don't help)
-    differential_ik_convergence_threshold: float = 1e-3  # unused since 2026-07-16 IK speedup — superseded by early-exit at 50% of max_pose_error_pos_m/rot_rad
+    differential_ik_max_iterations: int = (
+        10  # cap at 10 (normal ops converge ≤5 iters; extra iters near singularity don't help)
+    )
+    differential_ik_convergence_threshold: float = (
+        1e-3  # unused since 2026-07-16 IK speedup — superseded by early-exit at 50% of max_pose_error_pos_m/rot_rad
+    )
 
     # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──
     adaptive_damping: bool = False
@@ -293,5 +297,5 @@ class TeleopProfile(FromDictMixin):
     # safety gates (collision, pre-send, step-limit) run after this step,
     # and it cannot degrade EEF tracking by construction.
     enable_nullspace_optimization: bool = True
-    nullspace_step_size_deg: float = 1.0       # max null-space joint step per frame [deg]
+    nullspace_step_size_deg: float = 1.0  # max null-space joint step per frame [deg]
     nullspace_joint_limit_margin_deg: float = 15.0  # repulsion margin from limits [deg]

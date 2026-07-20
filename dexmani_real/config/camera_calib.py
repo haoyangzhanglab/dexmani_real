@@ -83,9 +83,7 @@ class CameraCalibEntry:
 
     def __post_init__(self):
         if self.type not in ("eye_to_hand", "eye_in_hand"):
-            raise ValueError(
-                f"camera_type must be 'eye_to_hand' or 'eye_in_hand', got '{self.type}'"
-            )
+            raise ValueError(f"camera_type must be 'eye_to_hand' or 'eye_in_hand', got '{self.type}'")
         if self.type == "eye_to_hand" and self.T_world_camera is None:
             raise ValueError("eye_to_hand camera requires T_world_camera")
         if self.type == "eye_in_hand" and self.T_eef_camera is None:
@@ -113,9 +111,9 @@ class CameraCalib:
         project_root = pkg_dir.parent.parent
 
         candidates = [
-            pkg_dir / "cameras.json",                       # in-package (recommended)
-            project_root / "configs" / "cameras.json",      # legacy top-level
-            pkg_dir / "calib" / "cameras.json",             # legacy in-package
+            pkg_dir / "cameras.json",  # in-package (recommended)
+            project_root / "configs" / "cameras.json",  # legacy top-level
+            pkg_dir / "calib" / "cameras.json",  # legacy in-package
         ]
         for cand in candidates:
             if cand.exists():
@@ -184,9 +182,7 @@ class CameraCalib:
         matches = [n for n, e in self._entries.items() if e.serial == serial]
         if not matches:
             known = {n: e.serial for n, e in self._entries.items()}
-            raise KeyError(
-                f"No camera in {self.calib_path.name} has serial '{serial}'. Known: {known}"
-            )
+            raise KeyError(f"No camera in {self.calib_path.name} has serial '{serial}'. Known: {known}")
         if len(matches) > 1:
             raise KeyError(f"Multiple cameras share serial '{serial}': {matches}")
         return matches[0]
@@ -206,9 +202,7 @@ class CameraCalib:
                 f"Fix cameras.json or select by serial (resolve_name_by_serial)."
             )
 
-    def get_extrinsics(
-        self, cam_name: str, T_base_eef: np.ndarray | None = None
-    ) -> np.ndarray:
+    def get_extrinsics(self, cam_name: str, T_base_eef: np.ndarray | None = None) -> np.ndarray:
         """Return the camera extrinsic (4,4).
 
         For eye_to_hand: returns the static T_world_camera from config (WORLD frame,
@@ -220,9 +214,7 @@ class CameraCalib:
         if entry.type == "eye_to_hand":
             return entry.T_world_camera.copy()
         if T_base_eef is None:
-            raise ValueError(
-                f"Camera '{cam_name}' is eye_in_hand; T_base_eef (4,4 FK matrix) is required"
-            )
+            raise ValueError(f"Camera '{cam_name}' is eye_in_hand; T_base_eef (4,4 FK matrix) is required")
         return T_base_eef @ entry.T_eef_camera
 
     def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
@@ -253,8 +245,5 @@ class CameraCalib:
         return meta
 
     def __repr__(self) -> str:
-        cameras = ", ".join(
-            f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items()
-        )
+        cameras = ", ".join(f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items())
         return f"CameraCalib({cameras})"
-

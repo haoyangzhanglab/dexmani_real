@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
@@ -86,7 +87,7 @@ def _restore_stdin(old):
 def _check_quit():
     if select.select([sys.stdin], [], [], 0)[0]:
         c = sys.stdin.read(1)
-        return c.lower() == 'q'
+        return c.lower() == "q"
     return False
 
 
@@ -105,8 +106,16 @@ def _save_recording(rec: dict, ref_indices: np.ndarray, output_dir: str | None =
     filepath = out_dir / f"{stamp}_teleop_debug.npz"
 
     arrays: dict[str, np.ndarray] = {}
-    for key in ("landmarks_raw", "wrist_rot", "mano_landmarks", "scaled_landmarks",
-                "ref_vectors", "projected", "target_qpos", "actual_qpos"):
+    for key in (
+        "landmarks_raw",
+        "wrist_rot",
+        "mano_landmarks",
+        "scaled_landmarks",
+        "ref_vectors",
+        "projected",
+        "target_qpos",
+        "actual_qpos",
+    ):
         arrays[key] = np.stack(rec[key], axis=0)  # (T, ...)
     arrays["timestamps"] = np.array(rec["timestamps"], dtype=np.float64)
     arrays["ref_indices"] = np.asarray(ref_indices, dtype=np.int32)
@@ -191,14 +200,14 @@ def test_quest_hand_teleop() -> None:
     # Saved to <timestamp>_teleop_debug.npz on clean exit.
     _rec = {
         "timestamps": [],
-        "landmarks_raw": [],      # (21, 3) VR landmarks (FLU frame)
-        "wrist_rot": [],          # (3, 3) palm frame rotation
-        "mano_landmarks": [],     # (21, 3) MANO-space landmarks
-        "scaled_landmarks": [],   # (21, 3) after adaptive_retargeting_xhand
-        "ref_vectors": [],        # (15, 3) DexPilot reference vectors
-        "projected": [],          # (10,) bool — which finger pairs are in contact projection
-        "target_qpos": [],        # (12,) retargeter output
-        "actual_qpos": [],        # (12,) hardware feedback qpos
+        "landmarks_raw": [],  # (21, 3) VR landmarks (FLU frame)
+        "wrist_rot": [],  # (3, 3) palm frame rotation
+        "mano_landmarks": [],  # (21, 3) MANO-space landmarks
+        "scaled_landmarks": [],  # (21, 3) after adaptive_retargeting_xhand
+        "ref_vectors": [],  # (15, 3) DexPilot reference vectors
+        "projected": [],  # (10,) bool — which finger pairs are in contact projection
+        "target_qpos": [],  # (12,) retargeter output
+        "actual_qpos": [],  # (12,) hardware feedback qpos
     }
     _ref_indices = retargeter.indices  # (2, 15) — origin/task landmark indices for ref vectors
 

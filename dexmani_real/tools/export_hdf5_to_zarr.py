@@ -71,6 +71,7 @@ _ACTION_KEYS: list[tuple[str, int]] = [
     ("action_hand_joint", 12),
 ]
 
+
 def _detect_camera_keys(f: h5py.File) -> list[tuple[str, str, str]]:
     """Return list of (rgb_key, depth_key, label) for all cameras in the file.
 
@@ -179,8 +180,15 @@ def load_episodes(
     filter_tags: str | None = None,
     min_frames: int | None = None,
     max_held_ratio: float | None = None,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[int], list[Path],
-           list[np.ndarray | None], list[np.ndarray | None], dict | None]:
+) -> tuple[
+    list[np.ndarray],
+    list[np.ndarray],
+    list[int],
+    list[Path],
+    list[np.ndarray | None],
+    list[np.ndarray | None],
+    dict | None,
+]:
     """Load all HDF5 episodes from data_dir with optional metadata filtering.
 
     Args:
@@ -222,8 +230,12 @@ def load_episodes(
             # ── Episode-level metadata filtering ──
             meta = _read_episode_meta(h5_path)
             if not _episode_passes_filters(
-                meta, filter_task, filter_success, filter_tags,
-                min_frames, max_held_ratio,
+                meta,
+                filter_task,
+                filter_success,
+                filter_tags,
+                min_frames,
+                max_held_ratio,
             ):
                 skipped_meta += 1
                 continue
@@ -244,9 +256,7 @@ def load_episodes(
                         arr = np.asarray(f[key][:], dtype=np.float32)
                         if arr.ndim == 1:
                             arr = arr[:, np.newaxis]
-                        assert arr.shape[1] == dim, (
-                            f"{h5_path.name}/{key}: expected dim={dim}, got {arr.shape[1]}"
-                        )
+                        assert arr.shape[1] == dim, f"{h5_path.name}/{key}: expected dim={dim}, got {arr.shape[1]}"
                         obs_parts.append(arr[valid])
                     else:
                         print(f"  [WARN] {h5_path.name}/{key} not found — skipping")
@@ -259,17 +269,15 @@ def load_episodes(
                         arr = np.asarray(f[key][:], dtype=np.float32)
                         if arr.ndim == 1:
                             arr = arr[:, np.newaxis]
-                        assert arr.shape[1] == dim, (
-                            f"{h5_path.name}/{key}: expected dim={dim}, got {arr.shape[1]}"
-                        )
+                        assert arr.shape[1] == dim, f"{h5_path.name}/{key}: expected dim={dim}, got {arr.shape[1]}"
                         act_parts.append(arr[valid])
                     else:
                         print(f"  [WARN] {h5_path.name}/{key} not found — skipping")
                 action = np.concatenate(act_parts, axis=1)
 
-                assert obs.shape[0] == action.shape[0], (
-                    f"obs ({obs.shape[0]}) and action ({action.shape[0]}) frame count mismatch"
-                )
+                assert (
+                    obs.shape[0] == action.shape[0]
+                ), f"obs ({obs.shape[0]}) and action ({action.shape[0]}) frame count mismatch"
 
                 # ── Camera frames ──
                 episode_rgb: np.ndarray | None = None
@@ -293,8 +301,7 @@ def load_episodes(
                 depth_list.append(episode_depth)
 
                 total = f["arm_qpos"].shape[0]
-                print(f"  {h5_path.name}: {num_kept}/{total} frames kept "
-                      f"({100 * num_kept / max(total, 1):.1f}%)")
+                print(f"  {h5_path.name}: {num_kept}/{total} frames kept " f"({100 * num_kept / max(total, 1):.1f}%)")
 
         except (OSError, KeyError, AssertionError) as e:
             print(f"  [ERROR] {h5_path.name}: {e}")
@@ -303,11 +310,13 @@ def load_episodes(
         print(f"  Filtered out {skipped_meta} episode(s) by metadata filters")
 
     has_cam = any(r is not None for r in rgb_list)
-    print(f"Loaded {len(obs_list)} episodes, "
-          f"{sum(episode_lengths)} total frames "
-          f"(obs_dim={obs_list[0].shape[1] if obs_list else '?'}, "
-          f"action_dim={action_list[0].shape[1] if action_list else '?'}"
-          f"{', camera=yes' if has_cam else ', camera=no'})")
+    print(
+        f"Loaded {len(obs_list)} episodes, "
+        f"{sum(episode_lengths)} total frames "
+        f"(obs_dim={obs_list[0].shape[1] if obs_list else '?'}, "
+        f"action_dim={action_list[0].shape[1] if action_list else '?'}"
+        f"{', camera=yes' if has_cam else ', camera=no'})"
+    )
 
     return obs_list, action_list, episode_lengths, episode_paths, rgb_list, depth_list, camera_meta
 
@@ -325,8 +334,7 @@ def split_train_val(
     seed: int = 42,
     rgb_list: list[np.ndarray | None] | None = None,
     depth_list: list[np.ndarray | None] | None = None,
-) -> tuple[list, list, list, list, list, list,
-           list | None, list | None, list | None, list | None]:
+) -> tuple[list, list, list, list, list, list, list | None, list | None, list | None, list | None]:
     """Split episodes into train/val sets at the episode level.
 
     Args:
@@ -349,10 +357,18 @@ def split_train_val(
 
     if n == 1:
         print("[WARN] Only 1 episode — placing it in train set.")
-        return (obs_list, action_list, episode_lengths, [], [], [],
-                rgb_list if rgb_list else None,
-                depth_list if depth_list else None,
-                None, None)
+        return (
+            obs_list,
+            action_list,
+            episode_lengths,
+            [],
+            [],
+            [],
+            rgb_list if rgb_list else None,
+            depth_list if depth_list else None,
+            None,
+            None,
+        )
 
     indices = list(range(n))
     rng = random.Random(seed)
@@ -379,13 +395,27 @@ def split_train_val(
     val_frames = sum(val_lengths)
     has_cam = rgb_list and any(r is not None for r in rgb_list)
     print(f"\nTrain/val split (ratio={train_ratio}, seed={seed}):")
-    print(f"  Train: {len(train_obs)} episodes, {train_frames} frames"
-          f"{', +camera' if has_cam and train_rgb and any(r is not None for r in train_rgb) else ''}")
-    print(f"  Val:   {len(val_obs)} episodes, {val_frames} frames"
-          f"{', +camera' if has_cam and val_rgb and any(r is not None for r in val_rgb) else ''}")
+    print(
+        f"  Train: {len(train_obs)} episodes, {train_frames} frames"
+        f"{', +camera' if has_cam and train_rgb and any(r is not None for r in train_rgb) else ''}"
+    )
+    print(
+        f"  Val:   {len(val_obs)} episodes, {val_frames} frames"
+        f"{', +camera' if has_cam and val_rgb and any(r is not None for r in val_rgb) else ''}"
+    )
 
-    return (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths,
-            train_rgb, train_depth, val_rgb, val_depth)
+    return (
+        train_obs,
+        train_act,
+        train_lengths,
+        val_obs,
+        val_act,
+        val_lengths,
+        train_rgb,
+        train_depth,
+        val_rgb,
+        val_depth,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -579,20 +609,26 @@ def write_zarr(
     # Write data arrays
     data_grp = root.create_group("data")
     data_grp.create_dataset(
-        "obs", data=all_obs,
+        "obs",
+        data=all_obs,
         chunks=(min(1000, total_frames), obs_dim),
-        compressor=compressor, dtype=np.float32,
+        compressor=compressor,
+        dtype=np.float32,
     )
     data_grp.create_dataset(
-        "action", data=all_act,
+        "action",
+        data=all_act,
         chunks=(min(1000, total_frames), action_dim),
-        compressor=compressor, dtype=np.float32,
+        compressor=compressor,
+        dtype=np.float32,
     )
 
     # Write meta
     meta_grp = root.create_group("meta")
     meta_grp.create_dataset(
-        "episode_ends", data=episode_ends, dtype=np.int64,
+        "episode_ends",
+        data=episode_ends,
+        dtype=np.int64,
     )
     if control_hz is not None:
         # Nominal grid rate — downstream consumers derive dt = 1/control_hz
@@ -615,14 +651,18 @@ def write_zarr(
         img_compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.NOSHUFFLE)
 
         data_grp.create_dataset(
-            "rgb", data=all_rgb,
+            "rgb",
+            data=all_rgb,
             chunks=(1,) + all_rgb.shape[1:],
-            compressor=img_compressor, dtype=np.uint8,
+            compressor=img_compressor,
+            dtype=np.uint8,
         )
         data_grp.create_dataset(
-            "depth", data=all_depth,
+            "depth",
+            data=all_depth,
             chunks=(1,) + all_depth.shape[1:],
-            compressor=img_compressor, dtype=np.uint16,
+            compressor=img_compressor,
+            dtype=np.uint16,
         )
 
         # Camera metadata
@@ -659,65 +699,84 @@ def write_zarr(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Export HDF5 teleop episodes to Zarr (Diffusion Policy compatible)."
-    )
+    parser = argparse.ArgumentParser(description="Export HDF5 teleop episodes to Zarr (Diffusion Policy compatible).")
     parser.add_argument(
-        "--data_dir", required=True,
+        "--data_dir",
+        required=True,
         help="Directory containing episode_*.h5 files.",
     )
     parser.add_argument(
-        "--output", required=True,
+        "--output",
+        required=True,
         help="Output directory (zarr files will be created inside).",
     )
     # ── Train/val split ──
     parser.add_argument(
-        "--train_val_split", type=float, default=None,
+        "--train_val_split",
+        type=float,
+        default=None,
         help="Train ratio for episode-level split (e.g. 0.8 = 80%% train, 20%% val).",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Random seed for train/val split (default: 42).",
     )
     # ── Episode metadata filters ──
     parser.add_argument(
-        "--filter_task", type=str, default=None,
+        "--filter_task",
+        type=str,
+        default=None,
         help="Only include episodes whose task_label contains this string.",
     )
     parser.add_argument(
-        "--filter_success", type=lambda x: x.lower() == "true" if x.lower() in ("true", "false") else None,
+        "--filter_success",
+        type=lambda x: x.lower() == "true" if x.lower() in ("true", "false") else None,
         default=None,
         help="Only include episodes with success=true or success=false.",
     )
     parser.add_argument(
-        "--filter_tags", type=str, default=None,
+        "--filter_tags",
+        type=str,
+        default=None,
         help="Only include episodes whose tags contain this string.",
     )
     parser.add_argument(
-        "--min_frames", type=int, default=None,
+        "--min_frames",
+        type=int,
+        default=None,
         help="Minimum frame count per episode.",
     )
     parser.add_argument(
-        "--max_held_ratio", type=float, default=None,
+        "--max_held_ratio",
+        type=float,
+        default=None,
         help="Exclude episodes whose held-frame ratio (/flag_held mean) exceeds this value (e.g. 0.2).",
     )
     # ── Validation ──
     parser.add_argument(
-        "--validate", action="store_true",
+        "--validate",
+        action="store_true",
         help="Run DataValidator on episodes before export.",
     )
     # ── Timestamp alignment ──
     parser.add_argument(
-        "--align", action="store_true",
+        "--align",
+        action="store_true",
         help="Post-process timestamp alignment: interpolate all streams to a unified time grid.",
     )
     parser.add_argument(
-        "--align_dt", type=float, default=None,
+        "--align_dt",
+        type=float,
+        default=None,
         help="Target dt for aligned grid in seconds (default: derived from each "
-             "episode's /meta control_hz|fps; 0.020 if absent).",
+        "episode's /meta control_hz|fps; 0.020 if absent).",
     )
     parser.add_argument(
-        "--align_method", type=str, default="linear",
+        "--align_method",
+        type=str,
+        default="linear",
         choices=["linear", "nearest"],
         help="Interpolation method for alignment (default: linear).",
     )
@@ -751,15 +810,14 @@ def main() -> None:
         DataValidator.save_reports(reports, output_dir / "validation_report.json")
 
     # ── Load episodes ──
-    obs_list, action_list, episode_lengths, episode_paths, rgb_list, depth_list, camera_meta = \
-        load_episodes(
-            data_dir,
-            filter_task=args.filter_task,
-            filter_success=args.filter_success,
-            filter_tags=args.filter_tags,
-            min_frames=args.min_frames,
-            max_held_ratio=args.max_held_ratio,
-        )
+    obs_list, action_list, episode_lengths, episode_paths, rgb_list, depth_list, camera_meta = load_episodes(
+        data_dir,
+        filter_task=args.filter_task,
+        filter_success=args.filter_success,
+        filter_tags=args.filter_tags,
+        min_frames=args.min_frames,
+        max_held_ratio=args.max_held_ratio,
+    )
 
     if not obs_list:
         print("No valid episodes to export.", file=sys.stderr)
@@ -774,8 +832,11 @@ def main() -> None:
     if args.align:
         if args.align_dt is None:
             if control_hz is None:
-                print(f"ERROR: mixed control rates {unique_rates} Hz across episodes — "
-                      f"pass an explicit --align_dt to choose the target grid.", file=sys.stderr)
+                print(
+                    f"ERROR: mixed control rates {unique_rates} Hz across episodes — "
+                    f"pass an explicit --align_dt to choose the target grid.",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             # Nominal grid rate shared by all selected episodes (schema v7:
             # control_hz; older files: fps attr).
@@ -787,34 +848,67 @@ def main() -> None:
             rgb_list = [None] * len(rgb_list)
             depth_list = [None] * len(depth_list)
         obs_list, action_list, episode_lengths = _align_all_episodes(
-            episode_paths, obs_list, action_list, episode_lengths,
-            dt=args.align_dt, method=args.align_method,
+            episode_paths,
+            obs_list,
+            action_list,
+            episode_lengths,
+            dt=args.align_dt,
+            method=args.align_method,
         )
     elif control_hz is None:
-        print(f"[WARN] Mixed control rates {unique_rates} Hz concatenated WITHOUT alignment — "
-              f"per-step action magnitudes differ across episodes and the zarr carries "
-              f"no control_hz. Use --align (with --align_dt) to unify the grid.")
+        print(
+            f"[WARN] Mixed control rates {unique_rates} Hz concatenated WITHOUT alignment — "
+            f"per-step action magnitudes differ across episodes and the zarr carries "
+            f"no control_hz. Use --align (with --align_dt) to unify the grid."
+        )
 
     # ── Train/val split ──
     if args.train_val_split is not None:
-        (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths,
-         train_rgb, train_depth, val_rgb, val_depth) = \
-            split_train_val(obs_list, action_list, episode_lengths,
-                            args.train_val_split, args.seed,
-                            rgb_list, depth_list)
+        (
+            train_obs,
+            train_act,
+            train_lengths,
+            val_obs,
+            val_act,
+            val_lengths,
+            train_rgb,
+            train_depth,
+            val_rgb,
+            val_depth,
+        ) = split_train_val(
+            obs_list, action_list, episode_lengths, args.train_val_split, args.seed, rgb_list, depth_list
+        )
 
         # Compute norm_stats from TRAIN ONLY (no leakage)
         norm_stats = compute_norm_stats(train_obs, train_act)
 
         # Write train
-        write_zarr(output_dir, train_obs, train_act, train_lengths, norm_stats,
-                   name="train", rgb_list=train_rgb, depth_list=train_depth,
-                   camera_meta=camera_meta, control_hz=control_hz)
+        write_zarr(
+            output_dir,
+            train_obs,
+            train_act,
+            train_lengths,
+            norm_stats,
+            name="train",
+            rgb_list=train_rgb,
+            depth_list=train_depth,
+            camera_meta=camera_meta,
+            control_hz=control_hz,
+        )
 
         # Write val (use train stats — no separate stats for val, prevents leakage)
-        write_zarr(output_dir, val_obs, val_act, val_lengths, norm_stats,
-                   name="val", rgb_list=val_rgb, depth_list=val_depth,
-                   camera_meta=camera_meta, control_hz=control_hz)
+        write_zarr(
+            output_dir,
+            val_obs,
+            val_act,
+            val_lengths,
+            norm_stats,
+            name="val",
+            rgb_list=val_rgb,
+            depth_list=val_depth,
+            camera_meta=camera_meta,
+            control_hz=control_hz,
+        )
 
         # Save norm_stats as human-readable JSON
         with open(output_dir / "norm_stats.json", "w") as f:
@@ -825,9 +919,17 @@ def main() -> None:
     else:
         # Single zarr (no split)
         norm_stats = compute_norm_stats(obs_list, action_list)
-        write_zarr(output_dir, obs_list, action_list, episode_lengths, norm_stats,
-                   rgb_list=rgb_list, depth_list=depth_list, camera_meta=camera_meta,
-                   control_hz=control_hz)
+        write_zarr(
+            output_dir,
+            obs_list,
+            action_list,
+            episode_lengths,
+            norm_stats,
+            rgb_list=rgb_list,
+            depth_list=depth_list,
+            camera_meta=camera_meta,
+            control_hz=control_hz,
+        )
 
         # Save norm_stats
         with open(output_dir / "norm_stats.json", "w") as f:

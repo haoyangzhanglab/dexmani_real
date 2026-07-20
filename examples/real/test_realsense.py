@@ -28,22 +28,18 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import time
 from collections import deque
 from dataclasses import dataclass
 
 import cv2
-import open3d as o3d
 import numpy as np
+import open3d as o3d
 
 from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
-from dexmani_real.utils.pointcloud_utils import (
-    PointCloudConfig,
-    depth_valid_ratio,
-    make_depth_vis,
-    rgbd_to_pointcloud,
-)
+from dexmani_real.utils.pointcloud_utils import PointCloudConfig, depth_valid_ratio, make_depth_vis, rgbd_to_pointcloud
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -58,8 +54,12 @@ DEFAULT_PCD_MIN_DEPTH = 0.05
 DEFAULT_PCD_MAX_DEPTH = 1.5
 DEFAULT_PCD_SAMPLING: str = "random"
 DEFAULT_PCD_WORKSPACE: tuple[float, float, float, float, float, float] = (
-    -0.3, -1.0, -0.5,   # x_min, y_min, z_min
-     2.0,  1.0,  1.5,   # x_max, y_max, z_max
+    -0.3,
+    -1.0,
+    -0.5,  # x_min, y_min, z_min
+    2.0,
+    1.0,
+    1.5,  # x_max, y_max, z_max
 )
 
 # 显示
@@ -68,6 +68,7 @@ STATS_WINDOW_SIZE = 100
 
 
 # ═══════════════════════════════════════════════ open3d 非阻塞点云窗口
+
 
 class NonBlockingPCDViewer:
     """open3d 非阻塞点云窗口 — 首帧创建窗口，后续帧更新几何体。
@@ -141,8 +142,7 @@ class NonBlockingPCDViewer:
 
 def overlay_text(img: np.ndarray, lines: list[str], x: int = 10, y_start: int = 22, step: int = 22) -> None:
     for i, line in enumerate(lines):
-        cv2.putText(img, line, (x, y_start + i * step), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(img, line, (x, y_start + i * step), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════ 步骤 0: 枚举相机
@@ -166,10 +166,12 @@ def list_available_cameras() -> list[dict[str, str]]:
         return []
     print(f"检测到 {len(cameras)} 个 RealSense 相机:")
     for i, cam in enumerate(cameras):
-        print(f"  [{i}] {cam.get('name', 'unknown'):28s} "
-              f"SN={cam.get('serial', ''):16s} "
-              f"FW={cam.get('firmware', '')} "
-              f"PL={cam.get('product_line', '')}")
+        print(
+            f"  [{i}] {cam.get('name', 'unknown'):28s} "
+            f"SN={cam.get('serial', ''):16s} "
+            f"FW={cam.get('firmware', '')} "
+            f"PL={cam.get('product_line', '')}"
+        )
     return cameras
 
 
@@ -206,9 +208,11 @@ def test_lifecycle() -> bool:
     print(f"  K =\n{K}")
     print(f"  depth_scale = {camera.get_depth_scale()}")
     info = camera.get_intrinsics_info()
-    print(f"  resolution = {info.get('width')}x{info.get('height')}  "
-          f"fx={info.get('fx'):.1f} fy={info.get('fy'):.1f} "
-          f"cx={info.get('cx'):.1f} cy={info.get('cy'):.1f}")
+    print(
+        f"  resolution = {info.get('width')}x{info.get('height')}  "
+        f"fx={info.get('fx'):.1f} fy={info.get('fy'):.1f} "
+        f"cx={info.get('cx'):.1f} cy={info.get('cy'):.1f}"
+    )
 
     camera.disconnect()
     print("  disconnect() → OK")
@@ -243,8 +247,9 @@ def _make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.nd
     return vis
 
 
-def _build_pcd_config(base: PointCloudConfig, *, workspace: tuple | None,
-                      sampling: str, voxel_size: float | None) -> PointCloudConfig:
+def _build_pcd_config(
+    base: PointCloudConfig, *, workspace: tuple | None, sampling: str, voxel_size: float | None
+) -> PointCloudConfig:
     return PointCloudConfig(
         npoints=base.npoints,
         min_depth=base.min_depth,
@@ -280,11 +285,13 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
         voxel_size=vox_size,
     )
 
-    print(f"  起始: npoints={current_pcd_config.npoints}  "
-          f"sampling={current_pcd_config.sampling}  "
-          f"depth=[{current_pcd_config.min_depth}, {current_pcd_config.max_depth}]  "
-          f"voxel={current_pcd_config.voxel_size}  "
-          f"workspace={workspace_on}")
+    print(
+        f"  起始: npoints={current_pcd_config.npoints}  "
+        f"sampling={current_pcd_config.sampling}  "
+        f"depth=[{current_pcd_config.min_depth}, {current_pcd_config.max_depth}]  "
+        f"voxel={current_pcd_config.voxel_size}  "
+        f"workspace={workspace_on}"
+    )
 
     while True:
         loop_start = time.perf_counter()
@@ -307,7 +314,9 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
             t0 = time.perf_counter()
             try:
                 pcd_array = rgbd_to_pointcloud(
-                    depth=frame.depth, K=frame.K, rgb=frame.rgb,
+                    depth=frame.depth,
+                    K=frame.K,
+                    rgb=frame.rgb,
                     config=current_pcd_config,
                 )
                 point_count = pcd_array.shape[0]
@@ -337,11 +346,15 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
             panel = depth_vis
 
         total_ms = (time.perf_counter() - loop_start) * 1000.0
-        stats_history.append(FrameStats(
-            read_ms=read_ms, pcd_ms=pcd_ms,
-            valid_ratio=valid_ratio, point_count=point_count,
-            total_ms=total_ms,
-        ))
+        stats_history.append(
+            FrameStats(
+                read_ms=read_ms,
+                pcd_ms=pcd_ms,
+                valid_ratio=valid_ratio,
+                point_count=point_count,
+                total_ms=total_ms,
+            )
+        )
 
         # ── 滑动统计 ──
         avg_read = float(np.mean([s.read_ms for s in stats_history])) if stats_history else 0.0
@@ -349,7 +362,9 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
         avg_total = float(np.mean([s.total_ms for s in stats_history])) if stats_history else 0.0
         avg_fps = 1000.0 / avg_total if avg_total > 0 else 0.0
         avg_valid = float(np.mean([s.valid_ratio for s in stats_history])) if stats_history else 0.0
-        avg_points = float(np.mean([s.point_count for s in stats_history])) if (stats_history and show_pointcloud) else 0.0
+        avg_points = (
+            float(np.mean([s.point_count for s in stats_history])) if (stats_history and show_pointcloud) else 0.0
+        )
 
         # ── HUD ──
         lines = [
@@ -359,13 +374,14 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
             f"{frame.K[0,2]:.0f},{frame.K[1,2]:.0f}]",
         ]
         if show_pointcloud:
-            lines.append(f"PCD ON  n={avg_points:.0f}  vox={current_pcd_config.voxel_size}  "
-                         f"ws={workspace_on}  samp={current_pcd_config.sampling}  "
-                         f"drop={total_dropped}")
+            lines.append(
+                f"PCD ON  n={avg_points:.0f}  vox={current_pcd_config.voxel_size}  "
+                f"ws={workspace_on}  samp={current_pcd_config.sampling}  "
+                f"drop={total_dropped}"
+            )
         else:
             lines.append("PCD OFF  [p]toggle [v]voxel [w]workspace [s]sampling [r]reset")
-        lines.append(f"cmap={colormap}  "
-                     f"depth=[{min_d:.2f},{max_d:.2f}]")
+        lines.append(f"cmap={colormap}  " f"depth=[{min_d:.2f},{max_d:.2f}]")
         overlay_text(panel, lines)
 
         cv2.imshow(WINDOW_NAME, panel)
@@ -442,12 +458,14 @@ def run_rgbd_test(camera: RealSense, pcd_config: PointCloudConfig) -> dict:
             print("  配置已重置为默认值")
 
         elif key == ord("c"):
-            print(f"  npoints={current_pcd_config.npoints}  "
-                  f"sampling={current_pcd_config.sampling}  "
-                  f"voxel={current_pcd_config.voxel_size}  "
-                  f"depth=[{current_pcd_config.min_depth},{current_pcd_config.max_depth}]  "
-                  f"workspace={current_pcd_config.workspace}  "
-                  f"pcd={'ON' if show_pointcloud else 'OFF'}")
+            print(
+                f"  npoints={current_pcd_config.npoints}  "
+                f"sampling={current_pcd_config.sampling}  "
+                f"voxel={current_pcd_config.voxel_size}  "
+                f"depth=[{current_pcd_config.min_depth},{current_pcd_config.max_depth}]  "
+                f"workspace={current_pcd_config.workspace}  "
+                f"pcd={'ON' if show_pointcloud else 'OFF'}"
+            )
 
         elif key == ord("d"):
             colormap = "gray" if colormap == "jet" else "jet"
@@ -504,40 +522,60 @@ def run_pcd_variants(camera: RealSense) -> None:
     Variant = tuple[str, PointCloudConfig]  # type: ignore[no-redef]
 
     variants = [
-    ("random 1024 (default)", PointCloudConfig(
-        npoints=1024, sampling="random", min_depth=0.05, max_depth=1.5,
-        return_tensor=False)),
-    ("voxel 5mm + fps 1024", PointCloudConfig(
-        npoints=1024, sampling="fps", voxel_size=0.005,
-        min_depth=0.05, max_depth=1.5, return_tensor=False)),
-    ("voxel 10mm + fps 1024", PointCloudConfig(
-        npoints=1024, sampling="fps", voxel_size=0.01,
-        min_depth=0.05, max_depth=1.5, return_tensor=False)),
-    ("no sampling (full)", PointCloudConfig(
-        sampling="none", min_depth=0.05, max_depth=1.5,
-        return_tensor=False)),
-    ("fps 2048 (no voxel)", PointCloudConfig(
-        npoints=2048, sampling="fps", min_depth=0.05, max_depth=1.5,
-        return_tensor=False)),
-    ("narrow depth [0.1, 0.8]m", PointCloudConfig(
-        npoints=1024, sampling="random", min_depth=0.1, max_depth=0.8,
-        return_tensor=False)),
-    ("far depth [0.5, 2.0]m", PointCloudConfig(
-        npoints=1024, sampling="random", min_depth=0.5, max_depth=2.0,
-        return_tensor=False)),
-    ("with workspace crop", PointCloudConfig(
-        npoints=1024, sampling="random", min_depth=0.05, max_depth=1.5,
-        workspace=DEFAULT_PCD_WORKSPACE, return_tensor=False)),
-    ("dense random 4096", PointCloudConfig(
-        npoints=4096, sampling="random", min_depth=0.05, max_depth=1.5,
-        return_tensor=False)),
-]
+        (
+            "random 1024 (default)",
+            PointCloudConfig(npoints=1024, sampling="random", min_depth=0.05, max_depth=1.5, return_tensor=False),
+        ),
+        (
+            "voxel 5mm + fps 1024",
+            PointCloudConfig(
+                npoints=1024, sampling="fps", voxel_size=0.005, min_depth=0.05, max_depth=1.5, return_tensor=False
+            ),
+        ),
+        (
+            "voxel 10mm + fps 1024",
+            PointCloudConfig(
+                npoints=1024, sampling="fps", voxel_size=0.01, min_depth=0.05, max_depth=1.5, return_tensor=False
+            ),
+        ),
+        ("no sampling (full)", PointCloudConfig(sampling="none", min_depth=0.05, max_depth=1.5, return_tensor=False)),
+        (
+            "fps 2048 (no voxel)",
+            PointCloudConfig(npoints=2048, sampling="fps", min_depth=0.05, max_depth=1.5, return_tensor=False),
+        ),
+        (
+            "narrow depth [0.1, 0.8]m",
+            PointCloudConfig(npoints=1024, sampling="random", min_depth=0.1, max_depth=0.8, return_tensor=False),
+        ),
+        (
+            "far depth [0.5, 2.0]m",
+            PointCloudConfig(npoints=1024, sampling="random", min_depth=0.5, max_depth=2.0, return_tensor=False),
+        ),
+        (
+            "with workspace crop",
+            PointCloudConfig(
+                npoints=1024,
+                sampling="random",
+                min_depth=0.05,
+                max_depth=1.5,
+                workspace=DEFAULT_PCD_WORKSPACE,
+                return_tensor=False,
+            ),
+        ),
+        (
+            "dense random 4096",
+            PointCloudConfig(npoints=4096, sampling="random", min_depth=0.05, max_depth=1.5, return_tensor=False),
+        ),
+    ]
 
     for label, cfg in variants:
         t0 = time.perf_counter()
         try:
             pcd = rgbd_to_pointcloud(
-                depth=frame.depth, K=frame.K, rgb=frame.rgb, config=cfg,
+                depth=frame.depth,
+                K=frame.K,
+                rgb=frame.rgb,
+                config=cfg,
             )
             elapsed = (time.perf_counter() - t0) * 1000.0
             print(f"  {label:30s} → {pcd.shape[0]:6d} pts  {elapsed:.1f}ms")
@@ -558,6 +596,7 @@ def main() -> None:
     print(f"NumPy        : {np.__version__}")
     try:
         import pyrealsense2 as rs  # noqa: F401
+
         print("pyrealsense2 : installed")
     except ImportError:
         print("pyrealsense2 : NOT INSTALLED")

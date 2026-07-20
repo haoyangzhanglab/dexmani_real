@@ -66,6 +66,7 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     align=True,
 )
 
+
 def vr_frame_to_array(frame: dict) -> np.ndarray:
     """Convert a VR frame dict (from QuestHandTracker) to a structured array.
 
@@ -158,12 +159,8 @@ def bytes_to_camera_frame(
     (False = zeros placeholder, no valid cloud since producer start).
     """
     h = header[0]
-    rgb = rgb_bytes.reshape(
-        (int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"]))
-    ).copy()
-    depth = depth_bytes.reshape(
-        (int(h["depth_shape_h"]), int(h["depth_shape_w"]))
-    ).copy()
+    rgb = rgb_bytes.reshape((int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"]))).copy()
+    depth = depth_bytes.reshape((int(h["depth_shape_h"]), int(h["depth_shape_w"]))).copy()
     frame = {
         "rgb": rgb,
         "depth": depth,

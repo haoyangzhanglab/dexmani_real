@@ -222,13 +222,10 @@ class RealSense:
             if self._depth_intrinsics_available():
                 return True
             logger.warning(
-                "Depth stream exposes no intrinsics (L515 bad state) — "
-                "hardware_reset() and reconnecting once."
+                "Depth stream exposes no intrinsics (L515 bad state) — " "hardware_reset() and reconnecting once."
             )
         elif self.active_is_l515:
-            logger.warning(
-                "Pipeline start failed on L515 — hardware_reset() and retrying once."
-            )
+            logger.warning("Pipeline start failed on L515 — hardware_reset() and retrying once.")
         else:
             return False
 
@@ -331,12 +328,7 @@ class RealSense:
         the preset label to 0 (Custom); that is the expected final state.
         """
         cfg = self.config.l515_depth_config
-        if (
-            not self.active_is_l515
-            or self.profile is None
-            or cfg is None
-            or not cfg.enabled
-        ):
+        if not self.active_is_l515 or self.profile is None or cfg is None or not cfg.enabled:
             return
 
         sensor = self.profile.get_device().first_depth_sensor()
@@ -429,8 +421,7 @@ class RealSense:
 
                 delay = 3.0 * (attempt + 1)
                 logger.warning(
-                    "L515 warmup timed out; restarting pipeline after %.0f s "
-                    "(attempt %d/%d).",
+                    "L515 warmup timed out; restarting pipeline after %.0f s " "(attempt %d/%d).",
                     delay,
                     attempt + 1,
                     max_restarts,
@@ -488,7 +479,9 @@ class RealSense:
             # Confidence/IR are pixel-registered to the raw depth stream (same sensor);
             # only pull the streams the configured sub-checks actually need.
             if validity.confidence_min is not None:
-                rs_config.enable_stream(rs.stream.confidence, depth_width, depth_height, rs.format.raw8, self.config.fps)
+                rs_config.enable_stream(
+                    rs.stream.confidence, depth_width, depth_height, rs.format.raw8, self.config.fps
+                )
             if validity.ir_min is not None or validity.ir_saturation is not None:
                 rs_config.enable_stream(rs.stream.infrared, depth_width, depth_height, rs.format.y8, self.config.fps)
         return rs_config
@@ -725,4 +718,3 @@ class RealSense:
                     item[name] = ""
             cameras.append(item)
         return cameras
-

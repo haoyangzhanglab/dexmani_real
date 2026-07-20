@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import termios
@@ -38,56 +39,50 @@ import traceback
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.log import get_logger
-from dexmani_real.planning import (
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
+from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
-
-from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
 except ImportError:
-    raise ImportError(
-        "pynput is required for keyboard input. Install with: pip install pynput"
-    )
+    raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
 
 logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ 配置
 
-CTRL_DT = 0.02           # 50Hz
-DELTA_POS = 0.005        # 每次按键 EEF 平移量 (m)
-DELTA_RPY = 0.02         # 每次按键 EEF 旋转量 (rad)
-EMA_ALPHA_POS = 0.8      # Cartesian EMA 位置平滑 (1.0=直通, 0.8=低延迟)
-EMA_ALPHA_ROT = 0.4      # Cartesian EMA 姿态平滑 (1.0=直通, 0.4=强滤波去抖动)
+CTRL_DT = 0.02  # 50Hz
+DELTA_POS = 0.005  # 每次按键 EEF 平移量 (m)
+DELTA_RPY = 0.02  # 每次按键 EEF 旋转量 (rad)
+EMA_ALPHA_POS = 0.8  # Cartesian EMA 位置平滑 (1.0=直通, 0.8=低延迟)
+EMA_ALPHA_ROT = 0.4  # Cartesian EMA 姿态平滑 (1.0=直通, 0.4=强滤波去抖动)
 
 # Mode 6 online trajectory planning — firmware replans trajectory with
 # configurable speed/acc limits. No inner-loop interpolation.
 INNER_LOOP_CFG = ArmInnerLoopConfig()
-HOME_DT = 0.04           # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，减半保安全)
+HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，减半保安全)
 
 # ── Motion tracing: 追踪纯 +X 运动时的位置变化管线 ──
-TRACE_MOTION = True           # 启用运动追踪
-TRACE_FRAME_INTERVAL = 10     # 每 N 帧打印一次 (避免刷屏)
+TRACE_MOTION = True  # 启用运动追踪
+TRACE_FRAME_INTERVAL = 10  # 每 N 帧打印一次 (避免刷屏)
 
-WORKSPACE_BOUNDS = np.array([
-    [0.28, 0.72],    # x [min, max] m
-    [-0.45, 0.45],   # y [min, max] m
-    [0.05, 0.5],     # z [min, max] m
-], dtype=np.float64)
+WORKSPACE_BOUNDS = np.array(
+    [
+        [0.28, 0.72],  # x [min, max] m
+        [-0.45, 0.45],  # y [min, max] m
+        [0.05, 0.5],  # z [min, max] m
+    ],
+    dtype=np.float64,
+)
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
@@ -166,17 +161,20 @@ class GlobalKeyState:
 
 # ═══════════════════════════════════════════════ 姿态工具
 
+
 def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     """RPY (rad) → wxyz 四元数。"""
     cr, sr = np.cos(roll / 2), np.sin(roll / 2)
     cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
     cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
-    return np.array([
-        cr * cp * cy + sr * sp * sy,
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-    ])
+    return np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ]
+    )
 
 
 # ═══════════════════════════════════════════════ Return-to-Home
@@ -218,7 +216,9 @@ def do_return_home(
 def main():
     print("=" * 60)
     print("真机键盘遥操作 xArm7")
-    print(f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s  EMA_POS={EMA_ALPHA_POS} EMA_ROT={EMA_ALPHA_ROT}")
+    print(
+        f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s  EMA_POS={EMA_ALPHA_POS} EMA_ROT={EMA_ALPHA_ROT}"
+    )
     print(f"  workspace: x{WORKSPACE_BOUNDS[0]} y{WORKSPACE_BOUNDS[1]} z{WORKSPACE_BOUNDS[2]}")
     print("=" * 60)
 
@@ -451,20 +451,32 @@ def main():
 
             # ── EEF target delta from keys ──
             dx = np.zeros(3, dtype=np.float64)
-            if keys.is_pressed("w"):  dx[0] += DELTA_POS
-            if keys.is_pressed("s"):  dx[0] -= DELTA_POS
-            if keys.is_pressed("a"):  dx[1] -= DELTA_POS
-            if keys.is_pressed("d"):  dx[1] += DELTA_POS
-            if keys.is_pressed("up"):    dx[2] += DELTA_POS
-            if keys.is_pressed("down"):  dx[2] -= DELTA_POS
+            if keys.is_pressed("w"):
+                dx[0] += DELTA_POS
+            if keys.is_pressed("s"):
+                dx[0] -= DELTA_POS
+            if keys.is_pressed("a"):
+                dx[1] -= DELTA_POS
+            if keys.is_pressed("d"):
+                dx[1] += DELTA_POS
+            if keys.is_pressed("up"):
+                dx[2] += DELTA_POS
+            if keys.is_pressed("down"):
+                dx[2] -= DELTA_POS
 
             drpy = np.zeros(3, dtype=np.float64)
-            if keys.is_pressed("left"):  drpy[0] += DELTA_RPY
-            if keys.is_pressed("right"): drpy[0] -= DELTA_RPY
-            if keys.is_pressed("i"):     drpy[1] += DELTA_RPY
-            if keys.is_pressed("k"):     drpy[1] -= DELTA_RPY
-            if keys.is_pressed("j"):     drpy[2] -= DELTA_RPY
-            if keys.is_pressed("l"):     drpy[2] += DELTA_RPY
+            if keys.is_pressed("left"):
+                drpy[0] += DELTA_RPY
+            if keys.is_pressed("right"):
+                drpy[0] -= DELTA_RPY
+            if keys.is_pressed("i"):
+                drpy[1] += DELTA_RPY
+            if keys.is_pressed("k"):
+                drpy[1] -= DELTA_RPY
+            if keys.is_pressed("j"):
+                drpy[2] -= DELTA_RPY
+            if keys.is_pressed("l"):
+                drpy[2] += DELTA_RPY
 
             # ── Periodic status ──
             if loop_count % 50 == 0:
@@ -520,8 +532,12 @@ def main():
             # (error = velocity / kp).  EMA limits the effective lead to ~DELTA_POS/alpha.
             if _prev_ema_pos is not None:
                 ik_target_pos, ik_target_quat = ema_smooth_pose(
-                    target_pos, target_quat, _prev_ema_pos, _prev_ema_quat,
-                    EMA_ALPHA_POS, EMA_ALPHA_ROT,
+                    target_pos,
+                    target_quat,
+                    _prev_ema_pos,
+                    _prev_ema_quat,
+                    EMA_ALPHA_POS,
+                    EMA_ALPHA_ROT,
                 )
             else:
                 ik_target_pos, ik_target_quat = target_pos.copy(), target_quat.copy()
@@ -557,7 +573,9 @@ def main():
             if (
                 TRACE_MOTION
                 and loop_count % TRACE_FRAME_INTERVAL == 0
-                and dx[0] != 0 and dx[1] == 0 and dx[2] == 0
+                and dx[0] != 0
+                and dx[1] == 0
+                and dx[2] == 0
                 and np.all(drpy == 0)
             ):
                 ik_fk_pose = planner.kin.compute_eef_pose_world(ik_result.qpos)

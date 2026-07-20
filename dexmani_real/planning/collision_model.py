@@ -38,6 +38,7 @@ Usage::
 """
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -55,8 +56,8 @@ logger = get_logger(__name__)
 # Collision URDF / SRDF paths
 # ---------------------------------------------------------------------------
 _XHAND_DIR = ASSET_DIR / "robots" / "xhand"
-_COLLISION_URDF = str(_XHAND_DIR / "xarm7_xhand_collision.urdf")       # 7-DOF (hand fixed)
-_FULL_URDF = str(_XHAND_DIR / "xarm7_xhand_right.urdf")                # 19-DOF (7 arm + 12 hand)
+_COLLISION_URDF = str(_XHAND_DIR / "xarm7_xhand_collision.urdf")  # 7-DOF (hand fixed)
+_FULL_URDF = str(_XHAND_DIR / "xarm7_xhand_right.urdf")  # 19-DOF (7 arm + 12 hand)
 _COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand.srdf")  # unified SRDF (single source)
 
 _HAND_DOF_COUNT = 12  # number of active hand joints
@@ -209,6 +210,7 @@ class CollisionModel:
         # 7-DOF:  34²/2 = 561 → after SRDF: ~0–141  (collision URDF)
         # 19-DOF: 40²/2 = 780 → after SRDF: 255      (full URDF)
         import itertools
+
         n = self._collision_model.ngeoms
         for i, j in itertools.combinations(range(n), 2):
             self._collision_model.addCollisionPair(pin.CollisionPair(i, j))
@@ -235,11 +237,11 @@ class CollisionModel:
 
         # --- Obstacle tracking ---
         self._obstacle_names: set[str] = set()
-        self._robot_geom_ids: list[int] = []      # robot geometry IDs (cached for env checks)
+        self._robot_geom_ids: list[int] = []  # robot geometry IDs (cached for env checks)
         self._obstacle_boxes: dict[str, tuple[float, float, float, float, float, float]] = {}
         # name → (x_min, x_max, y_min, y_max, z_min, z_max) in model base frame
         self._obstacle_geom_ids: dict[str, int] = {}  # name → geometry object index
-        self._obs_z_max: float = float('-inf')    # cached max Z of all obstacles (P6)
+        self._obs_z_max: float = float("-inf")  # cached max Z of all obstacles (P6)
         self._fcl_request: "fcl.CollisionRequest | None" = (
             self._fcl.CollisionRequest() if self._fcl is not None else None
         )  # reusable FCL request, None when FCL unavailable (P7)
@@ -251,8 +253,7 @@ class CollisionModel:
 
         # Cache non-static robot geometry IDs for env collision queries.
         self._robot_geom_ids = [
-            i for i in range(self._collision_model.ngeoms)
-            if self._collision_model.geometryObjects[i].parentJoint != 0
+            i for i in range(self._collision_model.ngeoms) if self._collision_model.geometryObjects[i].parentJoint != 0
         ]
 
         logger.info(
@@ -341,9 +342,7 @@ class CollisionModel:
         """
         qpos = self._to_full_qpos(qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos)
-        self._pin.updateGeometryPlacements(
-            self._model, self._data, self._collision_model, self._collision_data
-        )
+        self._pin.updateGeometryPlacements(self._model, self._data, self._collision_model, self._collision_data)
         has_any = self._pin.computeCollisions(
             self._model, self._data, self._collision_model, self._collision_data, qpos, stop_at_first
         )
@@ -358,7 +357,10 @@ class CollisionModel:
         qpos = self._to_full_qpos(qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos)
         self._pin.updateGeometryPlacements(
-            self._model, self._data, self._collision_model, self._collision_data,
+            self._model,
+            self._data,
+            self._collision_model,
+            self._collision_data,
         )
         return qpos
 
@@ -411,7 +413,10 @@ class CollisionModel:
     # ------------------------------------------------------------------
 
     def _check_segment_free(
-        self, q1: np.ndarray, q2: np.ndarray, step_size: float,
+        self,
+        q1: np.ndarray,
+        q2: np.ndarray,
+        step_size: float,
         check_fn,
     ) -> bool:
         """Generic dense segment interpolation with early exit on collision.
@@ -432,13 +437,19 @@ class CollisionModel:
         return True
 
     def check_segment_collision_free(
-        self, q1: np.ndarray, q2: np.ndarray, step_size: float = 0.02,
+        self,
+        q1: np.ndarray,
+        q2: np.ndarray,
+        step_size: float = 0.02,
     ) -> bool:
         """Check if the linear joint-space segment q1→q2 is self-collision-free."""
         return self._check_segment_free(q1, q2, step_size, self.check_self_collision)
 
     def check_segment_env_collision_free(
-        self, q1: np.ndarray, q2: np.ndarray, step_size: float = 0.02,
+        self,
+        q1: np.ndarray,
+        q2: np.ndarray,
+        step_size: float = 0.02,
     ) -> bool:
         """Check if the linear joint-space segment q1→q2 is env-collision-free.
 
@@ -508,7 +519,8 @@ class CollisionModel:
                         obs_placement,
                         self._collision_model.geometryObjects[robot_id].geometry,
                         oMg[robot_id],
-                        self._fcl_request, result,
+                        self._fcl_request,
+                        result,
                     )
                 except Exception:
                     logger.warning("FCL collide() failed — treating as collision (conservative)", exc_info=True)
@@ -547,21 +559,24 @@ class CollisionModel:
         qpos_full = self._to_full_qpos(qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos_full)
         self._pin.updateGeometryPlacements(
-            self._model, self._data, self._collision_model, self._collision_data,
+            self._model,
+            self._data,
+            self._collision_model,
+            self._collision_data,
         )
 
         # Self-collision: full FCL with early exit on first contact
         has_self = self._pin.computeCollisions(
-            self._model, self._data, self._collision_model, self._collision_data,
-            qpos_full, True,
+            self._model,
+            self._data,
+            self._collision_model,
+            self._collision_data,
+            qpos_full,
+            True,
         )
 
         # Env collision: Tier-1 Z-min on the SAME placements (zero extra FK)
-        has_env = bool(
-            self._obstacle_names
-            and self._robot_geom_ids
-            and self._tier1_z_check(self._collision_data.oMg)
-        )
+        has_env = bool(self._obstacle_names and self._robot_geom_ids and self._tier1_z_check(self._collision_data.oMg))
 
         return has_self, has_env
 
@@ -620,17 +635,29 @@ class CollisionModel:
         cx, cy, cz = position
         if rotation is None or np.allclose(rot, np.eye(3)):
             self._obstacle_boxes[name] = (
-                cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz,
+                cx - hx,
+                cx + hx,
+                cy - hy,
+                cy + hy,
+                cz - hz,
+                cz + hz,
             )
         else:
             # Conservative: sphere radius = box half-diagonal
             r = float(np.sqrt(hx * hx + hy * hy + hz * hz))
             self._obstacle_boxes[name] = (
-                cx - r, cx + r, cy - r, cy + r, cz - r, cz + r,
+                cx - r,
+                cx + r,
+                cy - r,
+                cy + r,
+                cz - r,
+                cz + r,
             )
 
         # Update cached obstacle Z-max (P6)
-        self._obs_z_max = max(box[_BB_ZMAX] for box in self._obstacle_boxes.values()) if self._obstacle_boxes else float('-inf')
+        self._obs_z_max = (
+            max(box[_BB_ZMAX] for box in self._obstacle_boxes.values()) if self._obstacle_boxes else float("-inf")
+        )
         self._collision_data = self._collision_model.createData()
         logger.info("Added box obstacle '%s' at (%s) half_extents=%s", name, position, half_extents)
 
@@ -670,7 +697,7 @@ class CollisionModel:
         # Update cached Z-max
         self._obs_z_max = max(
             (box[_BB_ZMAX] for box in self._obstacle_boxes.values()),
-            default=float('-inf'),
+            default=float("-inf"),
         )
         self._collision_data = self._collision_model.createData()
         logger.info("Removed obstacle '%s'", name)
@@ -684,7 +711,7 @@ class CollisionModel:
         self._obstacle_names.clear()
         self._obstacle_boxes.clear()
         self._obstacle_geom_ids.clear()
-        self._obs_z_max = float('-inf')
+        self._obs_z_max = float("-inf")
         self._collision_data = self._collision_model.createData()
         logger.info("Cleared %d obstacle(s)", count)
         return count

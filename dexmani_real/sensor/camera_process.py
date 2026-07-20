@@ -107,7 +107,8 @@ class CameraProcess:
         self._process.start()
         logger.info(
             "CameraProcess started (name=%s, serial=%s, hz=%.0f)",
-            self.config.camera_name, self.config.serial or "default",
+            self.config.camera_name,
+            self.config.serial or "default",
             self.config.hz,
         )
         return True
@@ -118,9 +119,7 @@ class CameraProcess:
         if self._process is not None and self._process.is_alive():
             self._process.join(timeout=timeout)
             if self._process.is_alive():
-                logger.warning(
-                    "CameraProcess did not exit within %.1fs, terminating.", timeout
-                )
+                logger.warning("CameraProcess did not exit within %.1fs, terminating.", timeout)
                 self._process.terminate()
                 self._process.join(timeout=1.0)
         self._process = None
@@ -206,8 +205,8 @@ class CameraProcess:
             # geometry may differ (old layout / different pc_shape) and
             # attaching would silently corrupt frames — drop it and recreate.
             logger.warning(
-                "CameraRingBuffer '%s' already exists (stale from a previous run) "
-                "— unlinking and recreating.", self.config.shm_name,
+                "CameraRingBuffer '%s' already exists (stale from a previous run) " "— unlinking and recreating.",
+                self.config.shm_name,
             )
             from multiprocessing import shared_memory
 
@@ -246,11 +245,7 @@ class CameraProcess:
         interval = 1.0 / self.config.hz
 
         try:
-            from dexmani_real.sensor.realsense import (
-                L515_CALIBRATED_DEPTH_VALIDITY,
-                RealSense,
-                RealSenseConfig,
-            )
+            from dexmani_real.sensor.realsense import L515_CALIBRATED_DEPTH_VALIDITY, RealSense, RealSenseConfig
 
             rs_config = RealSenseConfig(
                 camera_name=self.config.camera_name,
@@ -348,25 +343,27 @@ class CameraProcess:
                             empty_streak += 1
                             if empty_streak == 1 or empty_streak % empty_warn_every == 0:
                                 logger.warning(
-                                    "CameraProcess: empty pointcloud (%d consecutive) — "
-                                    "%s.", empty_streak,
+                                    "CameraProcess: empty pointcloud (%d consecutive) — " "%s.",
+                                    empty_streak,
                                     "re-sending last valid" if pc is not None else "sending zeros",
                                 )
                     t2 = time.monotonic()
                     try:
                         header, rgb, depth = pack_camera_frame(
-                            frame.rgb, frame.depth_raw,
-                            frame.timestamp, frame.frame_id,
+                            frame.rgb,
+                            frame.depth_raw,
+                            frame.timestamp,
+                            frame.frame_id,
                             pc_num_points=pc.shape[0] if pc is not None else 0,
                         )
                         shm_writer.write(
-                            header, rgb, depth,
+                            header,
+                            rgb,
+                            depth,
                             pointcloud=pc if pc is not None else zero_pc,
                         )
                     except (ValueError, RuntimeError, OSError):
-                        logger.exception(
-                            "CameraProcess shm write failed — continuing."
-                        )
+                        logger.exception("CameraProcess shm write failed — continuing.")
                     t3 = time.monotonic()
 
                     # Accumulate timing for periodic breakdown log
@@ -376,9 +373,11 @@ class CameraProcess:
                     timing_n += 1
                     if timing_n >= timing_window:
                         logger.debug(
-                            "CameraProcess timing [%d frames]: "
-                            "read=%.1fms pc=%.1fms pack+shm=%.1fms total=%.0fms",
-                            timing_n, t_read / timing_n, t_pc / timing_n, t_pack / timing_n,
+                            "CameraProcess timing [%d frames]: " "read=%.1fms pc=%.1fms pack+shm=%.1fms total=%.0fms",
+                            timing_n,
+                            t_read / timing_n,
+                            t_pc / timing_n,
+                            t_pack / timing_n,
                             (t_read + t_pc + t_pack) / timing_n,
                         )
                         t_read = t_pc = t_pack = 0.0
@@ -444,7 +443,8 @@ class CameraProcess:
             processor = PointCloudProcessor(T_world_camera, self.config.pointcloud)
             logger.info(
                 "CameraProcess pointcloud enabled: %s (eye-to-hand), T pos=%s",
-                cam_name, T_world_camera[:3, 3].round(3).tolist(),
+                cam_name,
+                T_world_camera[:3, 3].round(3).tolist(),
             )
             return processor
         except (KeyError, ValueError, FileNotFoundError, OSError):

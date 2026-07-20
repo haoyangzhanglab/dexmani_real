@@ -26,11 +26,11 @@ import h5py
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real.utils.pointcloud_utils import depth_to_meters
-
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.pointcloud_utils import depth_to_meters
 
 logger = get_logger(__name__)
 
@@ -112,7 +112,9 @@ def print_episode_info(h5_path: str) -> None:
             print(f"                    [{np.array2string(q.max(axis=0), precision=3, suppress_small=True)}]")
         if "arm_ee" in f:
             ee = f["arm_ee"][:]
-            print(f"arm_ee    pos range (m):  [{np.array2string(ee[:, :3].min(axis=0), precision=3, suppress_small=True)}]")
+            print(
+                f"arm_ee    pos range (m):  [{np.array2string(ee[:, :3].min(axis=0), precision=3, suppress_small=True)}]"
+            )
             print(f"                    [{np.array2string(ee[:, :3].max(axis=0), precision=3, suppress_small=True)}]")
         if "hand_qpos" in f:
             hq = f["hand_qpos"][:]
@@ -163,8 +165,7 @@ class EpisodeVisualizer:
                 depth_scale = float(meta.attrs["depth_scale"])
             elif "depth" in self._h5f:
                 logger.warning(
-                    "/meta has no depth_scale — assuming 1mm units. "
-                    "Legacy L515 episodes need --depth-scale 0.00025."
+                    "/meta has no depth_scale — assuming 1mm units. " "Legacy L515 episodes need --depth-scale 0.00025."
                 )
         self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
         self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
@@ -201,7 +202,7 @@ class EpisodeVisualizer:
                 h, w = depth_shape[1], depth_shape[2]
                 self._pc_h, self._pc_w = h, w
                 # Precompute strided pixel coordinates
-                v, u = np.mgrid[0:h:self._pc_stride, 0:w:self._pc_stride]
+                v, u = np.mgrid[0 : h : self._pc_stride, 0 : w : self._pc_stride]
                 self._pc_rays = (u.astype(np.float32), v.astype(np.float32))
                 logger.info(
                     "Point cloud enabled: stride=%d → ~%d points/frame, depth=[%.2f, %.2f]m",
@@ -219,15 +220,14 @@ class EpisodeVisualizer:
         # points are already in world frame with baked-in extrinsics, filtered,
         # clustered, and FPS-downsampled to a fixed cardinality (2048).
         self._has_precomputed_pc = (
-            point_cloud
-            and "pointcloud" in self._h5f
-            and isinstance(self._h5f["pointcloud"], h5py.Dataset)
+            point_cloud and "pointcloud" in self._h5f and isinstance(self._h5f["pointcloud"], h5py.Dataset)
         )
         if self._has_precomputed_pc:
             pc_shape = self._h5f["pointcloud"].shape
             logger.info(
                 "Pre-computed /pointcloud: shape=%s, dtype=%s (world-frame, skip back-projection)",
-                pc_shape, self._h5f["pointcloud"].dtype,
+                pc_shape,
+                self._h5f["pointcloud"].dtype,
             )
         elif self._pc_enabled:
             logger.info("No /pointcloud — falling back to depth back-projection + camera_K.")
@@ -304,8 +304,8 @@ class EpisodeVisualizer:
             contact = state["hand_contact"]  # (T, 5, 3)
             state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
             # First two fingers: thumb (0) and index (1) per-axis forces
-            state["hand_force_thumb"] = contact[:, 0, :].copy()   # (T, 3) Fx,Fy,Fz
-            state["hand_force_index"] = contact[:, 1, :].copy()   # (T, 3) Fx,Fy,Fz
+            state["hand_force_thumb"] = contact[:, 0, :].copy()  # (T, 3) Fx,Fy,Fz
+            state["hand_force_index"] = contact[:, 1, :].copy()  # (T, 3) Fx,Fy,Fz
 
         return state
 
@@ -412,8 +412,7 @@ class EpisodeVisualizer:
 
         if has_flags:
             flag_views = [
-                rrb.TimeSeriesView(origin=f"flags/{key}", name=key)
-                for key in self._available.get("flags", [])
+                rrb.TimeSeriesView(origin=f"flags/{key}", name=key) for key in self._available.get("flags", [])
             ]
             ts_verticals.append(rrb.Vertical(contents=flag_views, name="Flags"))
 
@@ -457,12 +456,16 @@ class EpisodeVisualizer:
             K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
             rgb_shape = self._h5f["rgb"].shape
             h, w = rgb_shape[1], rgb_shape[2]
-            rr.log("camera", rr.Pinhole(
-                image_from_camera=K,
-                resolution=[w, h],
-                camera_xyz=rr.ViewCoordinates.RDF,
-                image_plane_distance=1.25,
-            ), static=True)
+            rr.log(
+                "camera",
+                rr.Pinhole(
+                    image_from_camera=K,
+                    resolution=[w, h],
+                    camera_xyz=rr.ViewCoordinates.RDF,
+                    image_plane_distance=1.25,
+                ),
+                static=True,
+            )
             logger.info("Camera pinhole logged (%dx%d)", w, h)
 
         # Camera extrinsics: position the camera entity in world space.
@@ -608,9 +611,7 @@ class EpisodeVisualizer:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Visualize a DexMani HDF5 teleop episode with Rerun."
-    )
+    parser = argparse.ArgumentParser(description="Visualize a DexMani HDF5 teleop episode with Rerun.")
     parser.add_argument(
         "episode",
         type=str,

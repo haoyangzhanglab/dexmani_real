@@ -45,13 +45,7 @@ import numpy as np
 import sapien.core as sapien
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planning import (
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, setup_scene
 from dexmani_real.utils.rate_limiter import RateLimiter
@@ -59,9 +53,7 @@ from dexmani_real.utils.rate_limiter import RateLimiter
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
 except ImportError:
-    raise ImportError(
-        "pynput is required for keyboard input. Install with: pip install pynput"
-    )
+    raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
 
 from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import angular_dist_rad, compute_pose_error, quat_multiply
@@ -71,19 +63,22 @@ from dexmani_real.simulation import execute_dense_path, settle_at_target
 
 CTRL_HZ = 50.0
 CTRL_DT = 1.0 / CTRL_HZ
-DELTA_POS = 0.005     # 每次按键 EEF 平移量 (m)
-DELTA_RPY = 0.02      # 每次按键 EEF 旋转量 (rad)
+DELTA_POS = 0.005  # 每次按键 EEF 平移量 (m)
+DELTA_RPY = 0.02  # 每次按键 EEF 旋转量 (rad)
 INTERP_MAX_STEP_RAD = np.deg2rad(2.0)
-PHYSICS_STEPS_PER_TICK = 5        # 240Hz → ~48Hz effective
+PHYSICS_STEPS_PER_TICK = 5  # 240Hz → ~48Hz effective
 PHYSICS_STEPS_PER_WP = 20
 CONVERGE_THRESHOLD_RAD = np.deg2rad(0.05)
 
 # 工作空间边界（world frame）
-WORKSPACE_BOUNDS = np.array([
-    [0.28, 0.72],    # x [min, max] m
-    [-0.45, 0.45],   # y [min, max] m
-    [0.05, 0.55],    # z [min, max] m
-], dtype=np.float64)
+WORKSPACE_BOUNDS = np.array(
+    [
+        [0.28, 0.72],  # x [min, max] m
+        [-0.45, 0.45],  # y [min, max] m
+        [0.05, 0.55],  # z [min, max] m
+    ],
+    dtype=np.float64,
+)
 
 # Home 关节角
 ARM_HOME_QPOS = np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]).astype(np.float64)
@@ -91,14 +86,14 @@ ARM_HOME_QPOS = np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]).astype(n
 # ═══════════════════════════════════════════════ 速度限制
 # EEF 空间速度限制 (替代关节空间限制 — 更贴合遥操作语义)
 # 关节空间安全兜底阈值远高于正常运动，仅在 IK 产生病理解时触发。
-MAX_EEF_LIN_VEL = 0.5                 # m/s  (EEF 最大线速度)
+MAX_EEF_LIN_VEL = 0.5  # m/s  (EEF 最大线速度)
 MAX_EEF_ANG_VEL = np.deg2rad(180.0)  # rad/s (EEF 最大角速度)
 MAX_QVEL_SAFETY_RAD_S = np.deg2rad([360.0] * 7)
 
 # EEF 跟踪误差阈值
-EEF_POS_ERROR_WARN_M = 0.03                # 位置误差告警 (3cm)
+EEF_POS_ERROR_WARN_M = 0.03  # 位置误差告警 (3cm)
 EEF_ROT_ERROR_WARN_RAD = np.deg2rad(10.0)  # 姿态误差告警 (10°)
-EEF_POS_ERROR_CRITICAL_M = 0.08            # 位置误差安全触发 (8cm)
+EEF_POS_ERROR_CRITICAL_M = 0.08  # 位置误差安全触发 (8cm)
 EEF_ROT_ERROR_CRITICAL_RAD = np.deg2rad(30.0)  # 姿态误差安全触发 (30°)
 MAX_EEF_DIVERGENCE_CONSEC = 5
 
@@ -191,12 +186,14 @@ def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     cr, sr = np.cos(roll / 2), np.sin(roll / 2)
     cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
     cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
-    return np.array([
-        cr * cp * cy + sr * sp * sy,
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-    ])
+    return np.array(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ]
+    )
 
 
 # ═══════════════════════════════════════════════ EEF 速度限制
@@ -260,8 +257,10 @@ def eef_speed_limited_target(
 
 
 def _joint_safety_clamp(
-    target_qpos: np.ndarray, prev_cmd: np.ndarray,
-    max_velocities: np.ndarray, dt: float,
+    target_qpos: np.ndarray,
+    prev_cmd: np.ndarray,
+    max_velocities: np.ndarray,
+    dt: float,
 ) -> np.ndarray:
     """Joint-space bottleneck scaling — safety backstop only (very permissive).
 
@@ -323,8 +322,11 @@ def do_return_home(
 
     execute_dense_path(sim, dense, viewer, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
     err = settle_at_target(
-        sim, home_qpos, np.zeros(12),
-        max_iter=15, converge_threshold_rad=CONVERGE_THRESHOLD_RAD,
+        sim,
+        home_qpos,
+        np.zeros(12),
+        max_iter=15,
+        converge_threshold_rad=CONVERGE_THRESHOLD_RAD,
         physics_steps_per_wp=PHYSICS_STEPS_PER_WP,
     )
 
@@ -377,7 +379,7 @@ def main():
             check_self_collision=True,
         ),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,           # MPlib 兜底: DLS 迭代不收敛时接管
+            use_position_ik=True,  # MPlib 兜底: DLS 迭代不收敛时接管
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
@@ -409,10 +411,13 @@ def main():
         add_light(sim.scene)
         from dexmani_real.simulation.constructor import create_viewer
 
-        viewer = create_viewer(sim.scene, sapien.Pose(
-            [0.784, 0.027, 0.630],
-            [0.005, -0.233, 0.001, 0.973],
-        ))
+        viewer = create_viewer(
+            sim.scene,
+            sapien.Pose(
+                [0.784, 0.027, 0.630],
+                [0.005, -0.233, 0.001, 0.973],
+            ),
+        )
 
     # ── 3. 当前状态 ──
     sim_state = sim.get_state()
@@ -483,20 +488,32 @@ def main():
 
             # ── EEF 目标增量 ──
             dx = np.zeros(3, dtype=np.float64)
-            if keys.is_pressed("w"):    dx[0] += DELTA_POS
-            if keys.is_pressed("s"):    dx[0] -= DELTA_POS
-            if keys.is_pressed("a"):    dx[1] -= DELTA_POS
-            if keys.is_pressed("d"):    dx[1] += DELTA_POS
-            if keys.is_pressed("up"):   dx[2] += DELTA_POS
-            if keys.is_pressed("down"): dx[2] -= DELTA_POS
+            if keys.is_pressed("w"):
+                dx[0] += DELTA_POS
+            if keys.is_pressed("s"):
+                dx[0] -= DELTA_POS
+            if keys.is_pressed("a"):
+                dx[1] -= DELTA_POS
+            if keys.is_pressed("d"):
+                dx[1] += DELTA_POS
+            if keys.is_pressed("up"):
+                dx[2] += DELTA_POS
+            if keys.is_pressed("down"):
+                dx[2] -= DELTA_POS
 
             drpy = np.zeros(3, dtype=np.float64)
-            if keys.is_pressed("left"):  drpy[0] += DELTA_RPY
-            if keys.is_pressed("right"): drpy[0] -= DELTA_RPY
-            if keys.is_pressed("i"):     drpy[1] += DELTA_RPY
-            if keys.is_pressed("k"):     drpy[1] -= DELTA_RPY
-            if keys.is_pressed("j"):     drpy[2] -= DELTA_RPY
-            if keys.is_pressed("l"):     drpy[2] += DELTA_RPY
+            if keys.is_pressed("left"):
+                drpy[0] += DELTA_RPY
+            if keys.is_pressed("right"):
+                drpy[0] -= DELTA_RPY
+            if keys.is_pressed("i"):
+                drpy[1] += DELTA_RPY
+            if keys.is_pressed("k"):
+                drpy[1] -= DELTA_RPY
+            if keys.is_pressed("j"):
+                drpy[2] -= DELTA_RPY
+            if keys.is_pressed("l"):
+                drpy[2] += DELTA_RPY
 
             # ── 周期性状态打印 ──
             now = time.perf_counter()
@@ -569,8 +586,13 @@ def main():
                 actual_quat = np.asarray(sim_state["eef_quat_wxyz"], dtype=np.float64)
 
                 ik_target_pos, ik_target_quat = eef_speed_limited_target(
-                    actual_pos, actual_quat, target_pos, target_quat,
-                    MAX_EEF_LIN_VEL, MAX_EEF_ANG_VEL, CTRL_DT,
+                    actual_pos,
+                    actual_quat,
+                    target_pos,
+                    target_quat,
+                    MAX_EEF_LIN_VEL,
+                    MAX_EEF_ANG_VEL,
+                    CTRL_DT,
                 )
                 # Keep accumulated target synced to the limited pose — no drift.
                 target_pos = ik_target_pos
@@ -585,7 +607,10 @@ def main():
                     ik_method = "diff"
                     # Joint-space safety backstop (360°/s — catches pathological IK only)
                     arm_cmd = _joint_safety_clamp(
-                        ik_result.qpos, prev_arm_cmd, MAX_QVEL_SAFETY_RAD_S, CTRL_DT,
+                        ik_result.qpos,
+                        prev_arm_cmd,
+                        MAX_QVEL_SAFETY_RAD_S,
+                        CTRL_DT,
                     )
                     prev_arm_cmd = arm_cmd.copy()
                 else:

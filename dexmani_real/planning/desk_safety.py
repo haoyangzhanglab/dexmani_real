@@ -72,6 +72,7 @@ class FingertipDeskSafety:
 
         Falls back to legacy hardcoded joint IDs if frame lookup fails.
         """
+
         def _finger_key(short_name: str) -> str:
             return short_name.replace("_tip", "").replace("_rota", "")
 
@@ -122,6 +123,7 @@ class FingertipDeskSafety:
         model = self._cm.pinocchio_model
         data = self._cm.pinocchio_data
         import pinocchio as pin
+
         pin.forwardKinematics(model, data, full_qpos)
         pin.updateFramePlacements(model, data)
 
@@ -144,9 +146,7 @@ class FingertipDeskSafety:
         safe = min_z >= self._threshold - self._epsilon
         return safe, min_z, min_name
 
-    def check_path_desk_safety(
-        self, path: np.ndarray, step_rad: float | None = None
-    ) -> tuple[bool, float, int]:
+    def check_path_desk_safety(self, path: np.ndarray, step_rad: float | None = None) -> tuple[bool, float, int]:
         """Dense-sampled fingertip desk safety check along a joint path.
 
         Interpolates between consecutive waypoints at step_rad resolution

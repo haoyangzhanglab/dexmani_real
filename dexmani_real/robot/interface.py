@@ -562,7 +562,9 @@ class RobotInterface:
                 logger.info(
                     "return_to_home safe joint fallback (2-stage): "
                     "stage1=%d wp (proximal), stage2=%d wp (wrist), total_delta=%.1f°",
-                    n1, n2 + 1, np.rad2deg(delta),
+                    n1,
+                    n2 + 1,
+                    np.rad2deg(delta),
                 )
                 return self._execute_waypoints(staged_path, dt)
 

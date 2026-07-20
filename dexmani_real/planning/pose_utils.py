@@ -52,12 +52,15 @@ def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Multiply two wxyz quaternions."""
     w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
     w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
-    return np.array([
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-    ], dtype=np.float64)
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float64,
+    )
 
 
 def _quat_conjugate(q: np.ndarray) -> np.ndarray:
@@ -220,8 +223,7 @@ def random_quat_within_angle(rng: np.random.RandomState, max_deg: float) -> np.n
     axis /= np.linalg.norm(axis)
     angle = rng.uniform(0, np.deg2rad(max_deg))
     half = angle / 2
-    return np.array([np.cos(half), axis[0] * np.sin(half),
-                     axis[1] * np.sin(half), axis[2] * np.sin(half)])
+    return np.array([np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)])
 
 
 def random_quat_full_so3(rng: np.random.RandomState) -> np.ndarray:
@@ -230,18 +232,22 @@ def random_quat_full_so3(rng: np.random.RandomState) -> np.ndarray:
     Uses the Marsaglia method (uniform distribution on the unit sphere in S³).
     """
     u = rng.uniform(0, 1, 3)
-    q = np.array([
-        np.sqrt(1 - u[0]) * np.sin(2 * np.pi * u[1]),
-        np.sqrt(1 - u[0]) * np.cos(2 * np.pi * u[1]),
-        np.sqrt(u[0]) * np.sin(2 * np.pi * u[2]),
-        np.sqrt(u[0]) * np.cos(2 * np.pi * u[2]),
-    ])
+    q = np.array(
+        [
+            np.sqrt(1 - u[0]) * np.sin(2 * np.pi * u[1]),
+            np.sqrt(1 - u[0]) * np.cos(2 * np.pi * u[1]),
+            np.sqrt(u[0]) * np.sin(2 * np.pi * u[2]),
+            np.sqrt(u[0]) * np.cos(2 * np.pi * u[2]),
+        ]
+    )
     q /= np.linalg.norm(q)
     return q
 
 
 def random_quat_multi_axis(
-    rng: np.random.RandomState, max_deg1: float = 45.0, max_deg2: float = 30.0,
+    rng: np.random.RandomState,
+    max_deg1: float = 45.0,
+    max_deg2: float = 30.0,
 ) -> np.ndarray:
     """Two successive rotations around independent random axes.
 
@@ -261,8 +267,7 @@ def random_quat_multi_axis(
     a1 /= np.linalg.norm(a1)
     angle1 = rng.uniform(0, np.deg2rad(max_deg1))
     half1 = angle1 / 2
-    q1 = np.array([np.cos(half1), a1[0] * np.sin(half1),
-                   a1[1] * np.sin(half1), a1[2] * np.sin(half1)])
+    q1 = np.array([np.cos(half1), a1[0] * np.sin(half1), a1[1] * np.sin(half1), a1[2] * np.sin(half1)])
 
     # Axis 2: orthogonal to axis 1
     a2 = rng.randn(3)
@@ -274,7 +279,6 @@ def random_quat_multi_axis(
     a2 /= np.linalg.norm(a2)
     angle2 = rng.uniform(0, np.deg2rad(max_deg2))
     half2 = angle2 / 2
-    q2 = np.array([np.cos(half2), a2[0] * np.sin(half2),
-                   a2[1] * np.sin(half2), a2[2] * np.sin(half2)])
+    q2 = np.array([np.cos(half2), a2[0] * np.sin(half2), a2[1] * np.sin(half2), a2[2] * np.sin(half2)])
 
     return quat_multiply(q2, q1)  # R₂ * R₁

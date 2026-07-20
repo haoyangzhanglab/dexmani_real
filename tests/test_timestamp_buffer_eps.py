@@ -24,9 +24,7 @@ def test_eps_half_absorbs_negative_jitter():
 
 def test_eps_half_rounds_beyond_half_period_to_next_slot():
     """eps=0.5: a sample more than dt/2 late belongs to the next slot."""
-    local, global_, nxt = get_accumulate_timestamp_idxs(
-        [0.0, 1 * DT + 0.6 * DT], start_time=0.0, dt=DT, eps=0.5
-    )
+    local, global_, nxt = get_accumulate_timestamp_idxs([0.0, 1 * DT + 0.6 * DT], start_time=0.0, dt=DT, eps=0.5)
     # Second sample (t=1.6*dt) rounds to slot 2; slot 1 is back-filled by it.
     assert global_ == [0, 1, 2]
     assert local == [0, 1, 1]
@@ -46,9 +44,7 @@ def test_legacy_eps_floor_shifts_on_negative_jitter():
 
 def test_fast_source_same_window_first_wins():
     """Two samples in one window: the first is kept, the later one is dropped."""
-    local, global_, nxt = get_accumulate_timestamp_idxs(
-        [0.0, 0.01], start_time=0.0, dt=DT, eps=0.5
-    )
+    local, global_, nxt = get_accumulate_timestamp_idxs([0.0, 0.01], start_time=0.0, dt=DT, eps=0.5)
     assert global_ == [0]
     assert local == [0]
     assert nxt == 1
@@ -56,9 +52,7 @@ def test_fast_source_same_window_first_wins():
 
 def test_missed_slot_backfilled_by_next_sample():
     """A skipped window is back-filled by the NEXT arriving sample (not held)."""
-    local, global_, nxt = get_accumulate_timestamp_idxs(
-        [0.0, 2 * DT], start_time=0.0, dt=DT, eps=0.5
-    )
+    local, global_, nxt = get_accumulate_timestamp_idxs([0.0, 2 * DT], start_time=0.0, dt=DT, eps=0.5)
     assert global_ == [0, 1, 2]
     assert local == [0, 1, 1]  # slot 1 carries sample 1 (the later one)
     assert nxt == 3

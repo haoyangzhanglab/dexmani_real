@@ -6,8 +6,8 @@ from typing import Any
 
 import numpy as np
 
-from .types import Pose
 from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
+from .types import Pose
 
 
 class XArm7Kinematics:
@@ -90,9 +90,7 @@ class XArm7Kinematics:
             dtype=np.float64,
         )
         if jacobian_full.shape[1] < self.dof:
-            raise RuntimeError(
-                f"Jacobian has {jacobian_full.shape[1]} columns but dof is {self.dof}."
-            )
+            raise RuntimeError(f"Jacobian has {jacobian_full.shape[1]} columns but dof is {self.dof}.")
         jacobian_base = jacobian_full[:, : self.dof]
 
         # Pose (base frame) — extracted from already-computed FK, no extra FK call.
@@ -108,8 +106,8 @@ class XArm7Kinematics:
         # (simulation), this is a no-op.
         R_b2w = quat_wxyz_to_rotmat(self.base_pose_world.q)
         jacobian_world = np.empty_like(jacobian_base)
-        jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]   # linear part
-        jacobian_world[3:, :] = R_b2w @ jacobian_base[3:, :]   # angular part
+        jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]  # linear part
+        jacobian_world[3:, :] = R_b2w @ jacobian_base[3:, :]  # angular part
 
         pose_world = self.base_to_world_pose(pose_base)
 

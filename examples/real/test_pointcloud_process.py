@@ -26,13 +26,8 @@ from pytorch3d.ops import sample_farthest_points
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real.config.camera_calib import CameraCalib
-from dexmani_real.sensor.realsense import (
-    L515DepthConfig,
-    RealSense,
-    RealSenseConfig,
-)
+from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
 from dexmani_real.utils.pointcloud_utils import DepthEdgeConfig, DepthValidityConfig, make_depth_vis
-
 
 # Acquisition settings: intentionally unchanged.
 RGB_RESOLUTION = (640, 480)
@@ -94,15 +89,12 @@ def _show_rgbd_panels(
         labeled.append(canvas)
 
     try:
-        print(
-            "\nShowing RGBD window (RGB | depth) — press any key to continue..."
-        )
+        print("\nShowing RGBD window (RGB | depth) — press any key to continue...")
         cv2.imshow("L515 RGBD diagnostic", np.hstack(labeled))
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     except cv2.error as error:
         print(f"  RGBD window skipped (no display?): {error}")
-
 
 
 def main() -> None:
@@ -223,15 +215,8 @@ def main() -> None:
         K = np.asarray(frame.K, dtype=np.float64)
 
         print(f"  RGB:            shape={rgb.shape}, dtype={rgb.dtype}")
-        print(
-            "  Depth:          "
-            f"shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/"
-            f"{depth_m.size}"
-        )
-        print(
-            f"  Intrinsics:     {depth_m.shape[1]}x{depth_m.shape[0]} "
-            f"fx={K[0, 0]:.1f} fy={K[1, 1]:.1f}"
-        )
+        print("  Depth:          " f"shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/" f"{depth_m.size}")
+        print(f"  Intrinsics:     {depth_m.shape[1]}x{depth_m.shape[0]} " f"fx={K[0, 0]:.1f} fy={K[1, 1]:.1f}")
 
         depth_for_pointcloud = depth_m
 
@@ -244,9 +229,7 @@ def main() -> None:
         # rebuilding meshgrid + inv(K) every frame.
         rays_cam = camera.get_rays()
         if rays_cam.shape[:2] != depth_for_pointcloud.shape:
-            raise RuntimeError(
-                f"rays shape {rays_cam.shape[:2]} does not match depth {depth_for_pointcloud.shape}."
-            )
+            raise RuntimeError(f"rays shape {rays_cam.shape[:2]} does not match depth {depth_for_pointcloud.shape}.")
         points_cam = rays_cam * depth_for_pointcloud[..., None]
 
         points_flat = points_cam.reshape(-1, 3)
@@ -260,11 +243,7 @@ def main() -> None:
         # z_cam = 1.34 m under current cameras.json extrinsics (+ ~0.15 m margin);
         # points beyond can never survive the world-frame crop. Re-derive if the
         # camera pose or crop box changes.
-        valid = (
-            np.isfinite(points_flat).all(axis=1)
-            & (z_cam > 0.3)
-            & (z_cam < 1.5)
-        )
+        valid = np.isfinite(points_flat).all(axis=1) & (z_cam > 0.3) & (z_cam < 1.5)
         pts_cam = points_flat[valid]
         col_cam = colors_flat[valid]
 
@@ -294,9 +273,7 @@ def main() -> None:
         print(f"  T_world_camera quat (xyzw): {np.round(quat_xyzw, 4)}")
 
         ones = np.ones((pts_cam.shape[0], 1), dtype=np.float64)
-        pts_world = (
-            np.concatenate([pts_cam, ones], axis=1) @ T_world_camera.T
-        )[:, :3]
+        pts_world = (np.concatenate([pts_cam, ones], axis=1) @ T_world_camera.T)[:, :3]
         print(f"  World-frame points: {pts_world.shape[0]}")
 
         # Spatial crop: intentionally unchanged.
@@ -343,13 +320,7 @@ def main() -> None:
         desk_z_std = float(inlier_pts_full[:, 2].std())
         normal = np.asarray([a, b, c], dtype=np.float64)
         normal /= max(np.linalg.norm(normal), 1e-12)
-        angle_deg = float(
-            np.degrees(
-                np.arccos(
-                    np.clip(np.dot(normal, [0.0, 0.0, 1.0]), -1.0, 1.0)
-                )
-            )
-        )
+        angle_deg = float(np.degrees(np.arccos(np.clip(np.dot(normal, [0.0, 0.0, 1.0]), -1.0, 1.0))))
 
         print(f"  Plane equation:   {a:.4f}x + {b:.4f}y + {c:.4f}z + {d:.4f} = 0")
         print(f"  Plane normal:     [{a:.4f}, {b:.4f}, {c:.4f}]")
@@ -365,10 +336,7 @@ def main() -> None:
 
         pcd.points = o3d.utility.Vector3dVector(pts_all[z_mask])
         pcd.colors = o3d.utility.Vector3dVector(col_all[z_mask])
-        print(
-            f"  After fixed Z crop (z in [{z_lo},{z_hi}]): "
-            f"{int(z_mask.sum())} points"
-        )
+        print(f"  After fixed Z crop (z in [{z_lo},{z_hi}]): " f"{int(z_mask.sum())} points")
 
         # 5 mm voxel downsample.
         pcd_ds = pcd.voxel_down_sample(voxel_size=0.005)
@@ -414,26 +382,38 @@ def main() -> None:
         pcd_ds = o3d.geometry.PointCloud()
         pcd_ds.points = o3d.utility.Vector3dVector(pts_in[idx].astype(np.float64))
         pcd_ds.colors = o3d.utility.Vector3dVector(col_in[idx])
-        print(
-            f"  Fixed-size downsample ({method}): {n_in} -> {len(idx)} points "
-            f"({elapsed_ms:.1f} ms)"
-        )
+        print(f"  Fixed-size downsample ({method}): {n_in} -> {len(idx)} points " f"({elapsed_ms:.1f} ms)")
 
         world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
         camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
         camera_frame.transform(T_world_camera)
 
         # Workspace crop box wireframe (effective bounds after all crop stages).
-        crop_corners = np.array([
-            [x_min, y_min, z_lo], [x_max, y_min, z_lo],
-            [x_max, y_max, z_lo], [x_min, y_max, z_lo],
-            [x_min, y_min, z_hi], [x_max, y_min, z_hi],
-            [x_max, y_max, z_hi], [x_min, y_max, z_hi],
-        ])
+        crop_corners = np.array(
+            [
+                [x_min, y_min, z_lo],
+                [x_max, y_min, z_lo],
+                [x_max, y_max, z_lo],
+                [x_min, y_max, z_lo],
+                [x_min, y_min, z_hi],
+                [x_max, y_min, z_hi],
+                [x_max, y_max, z_hi],
+                [x_min, y_max, z_hi],
+            ]
+        )
         crop_edges = [
-            [0, 1], [1, 2], [2, 3], [3, 0],
-            [4, 5], [5, 6], [6, 7], [7, 4],
-            [0, 4], [1, 5], [2, 6], [3, 7],
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [7, 4],
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
         ]
         crop_box = o3d.geometry.LineSet()
         crop_box.points = o3d.utility.Vector3dVector(crop_corners)

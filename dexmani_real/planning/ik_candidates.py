@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -10,9 +10,8 @@ if TYPE_CHECKING:
     from .kinematics import XArm7Kinematics
     from .collision_model import CollisionModel
 
-from .types import CollisionInfo, PlanningProfile, Pose
 from .pose_utils import ensure_qpos
-
+from .types import CollisionInfo, PlanningProfile, Pose
 
 # Map freeform reject reason strings → structured diagnostic categories.
 # Used in collect_ik_candidates() to produce reject_by_category summary.
@@ -52,7 +51,6 @@ class IKCandidateManager:
         self.mp_planner = kinematics.mp_planner
         self._cm = collision_model
 
-
     def call_mplib_ik(
         self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
     ) -> tuple[str, Any]:
@@ -64,7 +62,6 @@ class IKCandidateManager:
             threshold=1e-3,
             return_closest=return_closest,
         )
-
 
     def generate_ik_seeds(self, current_qpos: np.ndarray, profile: PlanningProfile) -> list[np.ndarray]:
         limits = self.resolve_planning_limits(profile, current_qpos)
@@ -78,7 +75,6 @@ class IKCandidateManager:
             seed = self.canonicalize_qpos(seed, current, limits)
             seeds.append(seed)
         return self.unique_qpos_list(seeds)
-
 
     def collect_ik_candidates(
         self,
@@ -134,7 +130,6 @@ class IKCandidateManager:
         if reject_examples:
             summary["reject_examples"] = reject_examples
         return candidates[: profile.num_ik_candidates], summary
-
 
     def filter_ik_candidate(
         self,
@@ -203,7 +198,6 @@ class IKCandidateManager:
 
         return True, report
 
-
     def score_ik_candidate(
         self, qpos: np.ndarray, current_qpos: np.ndarray, report: dict[str, Any], profile: PlanningProfile
     ) -> float:
@@ -227,10 +221,7 @@ class IKCandidateManager:
 
         return float(score)
 
-
-    def resolve_planning_limits(
-        self, profile: PlanningProfile, reference_qpos: np.ndarray | None = None
-    ) -> np.ndarray:
+    def resolve_planning_limits(self, profile: PlanningProfile, reference_qpos: np.ndarray | None = None) -> np.ndarray:
         if profile.planning_limits_deg is not None:
             limits = np.deg2rad(np.asarray(profile.planning_limits_deg, dtype=np.float64))
             if limits.shape != self.joint_limits.shape:
@@ -314,9 +305,10 @@ class IKCandidateManager:
         delta = qpos - reference_qpos
         periods = self._periods()
         half = periods[self.equivalent_joint_mask] / 2.0
-        delta[self.equivalent_joint_mask] = (delta[self.equivalent_joint_mask] + half) % periods[self.equivalent_joint_mask] - half
+        delta[self.equivalent_joint_mask] = (delta[self.equivalent_joint_mask] + half) % periods[
+            self.equivalent_joint_mask
+        ] - half
         return delta
-
 
     def limit_violation(
         self, qpos: np.ndarray, limits: np.ndarray, limit_tol: float = 1e-5
@@ -338,7 +330,6 @@ class IKCandidateManager:
         upper = np.maximum(path - limits[None, :, 1], 0.0)
         return outside, np.maximum(lower, upper)
 
-
     # ── Collision check wrappers (delegate to CollisionModel) ──
 
     def has_self_collision(self, qpos: np.ndarray) -> bool:
@@ -351,7 +342,9 @@ class IKCandidateManager:
         return self._cm.check_env_collision(qpos)
 
     def check_path_collisions(
-        self, path: np.ndarray, collision_step_size: float = 0.02,
+        self,
+        path: np.ndarray,
+        collision_step_size: float = 0.02,
     ) -> dict[str, Any]:
         """Check self-collision along path with dense interpolation (ref: dimos).
 
@@ -363,11 +356,15 @@ class IKCandidateManager:
         for i in range(len(path) - 1):
             # Dense segment check — fast bool path for most points.
             if not self._cm.check_segment_collision_free(
-                path[i], path[i + 1], collision_step_size,
+                path[i],
+                path[i + 1],
+                collision_step_size,
             ):
                 # Pinpoint the exact violating configuration and get full details.
                 collision_info = self._find_collision_in_segment(
-                    path[i], path[i + 1], collision_step_size,
+                    path[i],
+                    path[i + 1],
+                    collision_step_size,
                 )
                 return {
                     "path_self_collision": True,
@@ -379,7 +376,10 @@ class IKCandidateManager:
         return {"path_self_collision": False}
 
     def _find_collision_in_segment(
-        self, start: np.ndarray, end: np.ndarray, step_size: float,
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+        step_size: float,
     ) -> CollisionInfo | None:
         """Locate the first self-colliding configuration in segment [start, end].
 
@@ -401,12 +401,16 @@ class IKCandidateManager:
         return None
 
     def check_path_env_collisions(
-        self, path: np.ndarray, collision_step_size: float = 0.02,
+        self,
+        path: np.ndarray,
+        collision_step_size: float = 0.02,
     ) -> dict[str, Any]:
         """Check environment collision along path with dense interpolation."""
         for i in range(len(path) - 1):
             if not self._cm.check_segment_env_collision_free(
-                path[i], path[i + 1], collision_step_size,
+                path[i],
+                path[i + 1],
+                collision_step_size,
             ):
                 return {
                     "path_env_collision": True,
@@ -416,7 +420,6 @@ class IKCandidateManager:
                 }
         return {"path_env_collision": False}
 
-
     def normalized_joint_distance(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> float:
         """Per-joint-range normalized Euclidean distance (ref: LeFranX weighted_ik.cpp)."""
         qpos = ensure_qpos(qpos, self.dof, "qpos")
@@ -424,10 +427,13 @@ class IKCandidateManager:
         joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
         joint_ranges = np.maximum(joint_ranges, 1e-6)
         normalized_diff = (qpos - reference_qpos) / joint_ranges
-        return float(np.sqrt(np.sum(normalized_diff ** 2)))
+        return float(np.sqrt(np.sum(normalized_diff**2)))
 
     def weighted_joint_distance(
-        self, qpos: np.ndarray, reference_qpos: np.ndarray, weights: tuple[float, ...] | np.ndarray,
+        self,
+        qpos: np.ndarray,
+        reference_qpos: np.ndarray,
+        weights: tuple[float, ...] | np.ndarray,
     ) -> float:
         """Per-joint weighted, range-normalised L2 distance (ref: LeFranX weighted_ik.cpp:62-69).
 
@@ -450,13 +456,12 @@ class IKCandidateManager:
         joint_ranges = np.maximum(joint_ranges, 1e-6)
         weights_arr = self.profile_array(weights, "joint_weights")
         normalized = delta / joint_ranges
-        return float(np.sqrt(np.sum(weights_arr * normalized ** 2)))
+        return float(np.sqrt(np.sum(weights_arr * normalized**2)))
 
     def joint_limit_penalty(self, qpos: np.ndarray, limits: np.ndarray) -> float:
         center = 0.5 * (limits[:, 0] + limits[:, 1])
         half_range = np.maximum(0.5 * (limits[:, 1] - limits[:, 0]), 1e-6)
         return float(np.sum(((qpos - center) / half_range) ** 2))
-
 
     def profile_array(self, values: tuple[float, ...], name: str) -> np.ndarray:
         array = np.asarray(values, dtype=np.float64).reshape(-1)

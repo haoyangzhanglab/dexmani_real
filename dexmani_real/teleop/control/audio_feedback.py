@@ -76,9 +76,7 @@ class AudioFeedback:
         self._cancel_current()
 
         cancel = threading.Event()
-        t = threading.Thread(
-            target=self._play_thread, args=(path, cancel), daemon=True, name=f"audio-{event}"
-        )
+        t = threading.Thread(target=self._play_thread, args=(path, cancel), daemon=True, name=f"audio-{event}")
         with self._lock:
             self._cancel_flag = cancel
         t.start()

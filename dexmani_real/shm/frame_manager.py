@@ -20,13 +20,9 @@ Usage:
 
 from __future__ import annotations
 
-from dexmani_real.utils.log import get_logger
-from dexmani_real.shm.layouts import (
-    VR_FRAME_DTYPE,
-    array_to_vr_frame,
-    vr_frame_to_array,
-)
+from dexmani_real.shm.layouts import VR_FRAME_DTYPE, array_to_vr_frame, vr_frame_to_array
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
@@ -61,18 +57,12 @@ class SharedMemoryFrameManager:
         self._vr_buf: SharedMemoryRingBuffer | None = None
         if create:
             try:
-                self._vr_buf = SharedMemoryRingBuffer(
-                    vr_name, VR_FRAME_DTYPE, maxlen=vr_maxlen, create=True
-                )
+                self._vr_buf = SharedMemoryRingBuffer(vr_name, VR_FRAME_DTYPE, maxlen=vr_maxlen, create=True)
             except FileExistsError:
                 # Already created by another process — attach
-                self._vr_buf = SharedMemoryRingBuffer(
-                    vr_name, VR_FRAME_DTYPE, maxlen=vr_maxlen, create=False
-                )
+                self._vr_buf = SharedMemoryRingBuffer(vr_name, VR_FRAME_DTYPE, maxlen=vr_maxlen, create=False)
         else:
-            self._vr_buf = SharedMemoryRingBuffer(
-                vr_name, VR_FRAME_DTYPE, maxlen=vr_maxlen, create=False
-            )
+            self._vr_buf = SharedMemoryRingBuffer(vr_name, VR_FRAME_DTYPE, maxlen=vr_maxlen, create=False)
 
         # Camera ring buffers (large, ~1.5MB per slot)
         h, w = camera_hw

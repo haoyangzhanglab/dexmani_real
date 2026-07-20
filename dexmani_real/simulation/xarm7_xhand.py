@@ -15,6 +15,7 @@ class XArm7XHand:
     Formerly XArm7_XHand (PEP 8 compliance — underscores in class names
     are reserved for leading/trailing double underscores).
     """
+
     def __init__(
         self,
         scene: sapien.Scene,
@@ -268,5 +269,3 @@ class XArm7XHand:
         self.model.set_qvel(np.zeros(self.dof))
         self.balance_passive_force()
         self.apply_action(reset_qpos)
-
-

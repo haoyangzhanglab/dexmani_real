@@ -79,9 +79,7 @@ class HandKinematics:
     def is_ready(self) -> bool:
         return self._ready
 
-    def compute_tip_positions_in_handbase(
-        self, hand_qpos: np.ndarray
-    ) -> np.ndarray:
+    def compute_tip_positions_in_handbase(self, hand_qpos: np.ndarray) -> np.ndarray:
         """Returns (5, 3) fingertip positions in hand_base frame."""
         if not self._ready:
             return nan_array((5, 3))

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
@@ -29,15 +30,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planning import (
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
-from dexmani_real.robot.xarm7 import XArm7, XArm7Config
-
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import (
     angular_dist_rad,
@@ -46,7 +39,7 @@ from dexmani_real.planning.pose_utils import (
     random_quat_multi_axis,
     random_quat_within_angle,
 )
-
+from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 
 # ═══════════════════════════════════════════════════════════════════
 # Local test utilities (lightweight — not worth a shared module)
@@ -56,6 +49,7 @@ from dexmani_real.planning.pose_utils import (
 @dataclass
 class IKStats:
     """Aggregate IK test statistics."""
+
     ok: int
     total: int = 0
     pos_errs_mm: list[float] = field(default_factory=list)
@@ -106,36 +100,28 @@ SAMPLE_Z = (0.02, 0.55)
 SIMULATE_PATHS = False  # Set True to validate paths in SAPIEN before real-arm exec
 
 SAFE_WAYPOINTS = [
-    {"pos": (0.45,  0.00, 0.33), "label": "center"},
-    {"pos": (0.30,  0.00, 0.35), "label": "near_center"},
-    {"pos": (0.65,  0.00, 0.30), "label": "far_center"},
-    {"pos": (0.45,  0.30, 0.30), "label": "right"},
+    {"pos": (0.45, 0.00, 0.33), "label": "center"},
+    {"pos": (0.30, 0.00, 0.35), "label": "near_center"},
+    {"pos": (0.65, 0.00, 0.30), "label": "far_center"},
+    {"pos": (0.45, 0.30, 0.30), "label": "right"},
     {"pos": (0.45, -0.30, 0.30), "label": "left"},
-    {"pos": (0.45,  0.00, 0.53), "label": "high_center"},
-    {"pos": (0.45,  0.00, 0.13), "label": "low_center"},
-    {"pos": (0.60,  0.25, 0.45), "label": "far_right_high"},
+    {"pos": (0.45, 0.00, 0.53), "label": "high_center"},
+    {"pos": (0.45, 0.00, 0.13), "label": "low_center"},
+    {"pos": (0.60, 0.25, 0.45), "label": "far_right_high"},
     {"pos": (0.60, -0.25, 0.15), "label": "far_left_low"},
-    {"pos": (0.30,  0.20, 0.15), "label": "near_right_low"},
+    {"pos": (0.30, 0.20, 0.15), "label": "near_right_low"},
 ]
 
 INTERP_MAX_STEP_RAD = np.deg2rad(1.0)
 ARM_DT = 1.0 / 30.0
-CONVERGE_THRESHOLD_RAD = np.deg2rad(3.0)       # Phase 1 收敛阈值
-HOME_AT_THRESHOLD_RAD = np.deg2rad(1.0)        # 视为已归位的关节偏差
-PHASE2_MIN_DELTA_RAD = np.deg2rad(0.5)         # Phase 2 跳过的关节偏差下限
-PHASE2_MAX_STEP_RAD = np.deg2rad(2.0)          # Phase 2 关节空间最大步长
-POS_ERR_THRESHOLD_M = 0.03                     # waypoint 终点位置误差阈值 (m)
+CONVERGE_THRESHOLD_RAD = np.deg2rad(3.0)  # Phase 1 收敛阈值
+HOME_AT_THRESHOLD_RAD = np.deg2rad(1.0)  # 视为已归位的关节偏差
+PHASE2_MIN_DELTA_RAD = np.deg2rad(0.5)  # Phase 2 跳过的关节偏差下限
+PHASE2_MAX_STEP_RAD = np.deg2rad(2.0)  # Phase 2 关节空间最大步长
+POS_ERR_THRESHOLD_M = 0.03  # waypoint 终点位置误差阈值 (m)
 
 
 # ═══════════════════════════════════════════════ 数学工具
-
-
-
-
-
-
-
-
 
 
 # ═══════════════════════════════════════════════ 数据结构
@@ -152,8 +138,6 @@ class PathPlanStats:
     reasons: list[str]
 
 
-
-
 # ═══════════════════════════════════════════════ Planner
 
 
@@ -166,7 +150,7 @@ def create_planner(seed: int = DEFAULT_SEED) -> XArm7MotionPlanner:
             urdf_path=urdf_path,
             srdf_path=srdf_path,
             # 30° yaw offset: robot base → world (quat: w=cos(15°), x=0, y=0, z=sin(15°))
-            base_pose_world=Pose(p=[0,0,0], q=[np.cos(np.pi/12), 0, 0, np.sin(np.pi/12)]),
+            base_pose_world=Pose(p=[0, 0, 0], q=[np.cos(np.pi / 12), 0, 0, np.sin(np.pi / 12)]),
         ),
         planning_profile=PlanningProfile(
             max_waypoint_delta_deg=360.0,
@@ -228,11 +212,13 @@ def test_solve_ik(
 ) -> dict[str, IKStats]:
     """solve_ik() 批量 FK 往返验证 (不移动硬件)。"""
     home_eef = planner.compute_eef_pose_world(home_qpos)
-    positions = np.column_stack([
-        rng.uniform(*SAMPLE_X, num_samples),
-        rng.uniform(*SAMPLE_Y, num_samples),
-        rng.uniform(*SAMPLE_Z, num_samples),
-    ])
+    positions = np.column_stack(
+        [
+            rng.uniform(*SAMPLE_X, num_samples),
+            rng.uniform(*SAMPLE_Y, num_samples),
+            rng.uniform(*SAMPLE_Z, num_samples),
+        ]
+    )
     targets = [build_target_pose(positions[i], home_eef.q, rng, rot_max_deg=RANDOM_ROT_DEG) for i in range(num_samples)]
 
     fresh = ik_stats_empty()
@@ -280,8 +266,7 @@ def test_solve_teleop_ik(
     for _ in range(num_samples):
         step = rng.uniform(-0.05, 0.05, 3)
         new_pos = current + step
-        new_pos = np.clip(new_pos, [SAMPLE_X[0], SAMPLE_Y[0], SAMPLE_Z[0]],
-                          [SAMPLE_X[1], SAMPLE_Y[1], SAMPLE_Z[1]])
+        new_pos = np.clip(new_pos, [SAMPLE_X[0], SAMPLE_Y[0], SAMPLE_Z[0]], [SAMPLE_X[1], SAMPLE_Y[1], SAMPLE_Z[1]])
         positions.append(new_pos)
         current = new_pos
 
@@ -316,16 +301,23 @@ def test_plan_path(
 ) -> PathPlanStats:
     """plan_path() 规划成功率 (不执行)。"""
     stats = PathPlanStats(
-        ok=0, total=num_samples, pos_errs_mm=[], rot_errs_deg=[],
-        path_lengths_rad=[], num_waypoints=[], reasons=[],
+        ok=0,
+        total=num_samples,
+        pos_errs_mm=[],
+        rot_errs_deg=[],
+        path_lengths_rad=[],
+        num_waypoints=[],
+        reasons=[],
     )
 
     home_eef = planner.compute_eef_pose_world(home_qpos)
-    positions = np.column_stack([
-        rng.uniform(*SAMPLE_X, num_samples),
-        rng.uniform(*SAMPLE_Y, num_samples),
-        rng.uniform(*SAMPLE_Z, num_samples),
-    ])
+    positions = np.column_stack(
+        [
+            rng.uniform(*SAMPLE_X, num_samples),
+            rng.uniform(*SAMPLE_Y, num_samples),
+            rng.uniform(*SAMPLE_Z, num_samples),
+        ]
+    )
 
     for i in range(num_samples):
         target = build_target_pose(positions[i], home_eef.q, rng, rot_max_deg=RANDOM_ROT_DEG)
@@ -489,8 +481,8 @@ def execute_path_on_arm(arm: XArm7, path: np.ndarray) -> tuple[bool, np.ndarray 
     if not actual_samples:
         return True, None, {}
 
-    actual_arr = np.array(actual_samples)      # (S, 7)
-    planned_arr = np.array(planned_samples)     # (S, 7)
+    actual_arr = np.array(actual_samples)  # (S, 7)
+    planned_arr = np.array(planned_samples)  # (S, 7)
     joint_errs_deg = np.rad2deg(np.abs(actual_arr - planned_arr))  # (S, 7)
     per_joint_mean = joint_errs_deg.mean(axis=0)
     per_joint_max = joint_errs_deg.max(axis=0)
@@ -498,14 +490,18 @@ def execute_path_on_arm(arm: XArm7, path: np.ndarray) -> tuple[bool, np.ndarray 
     overall_max = float(joint_errs_deg.max())
     worst_joint = int(np.argmax(per_joint_max))
 
-    return True, actual_arr, {
-        "joint_mean_deg": overall_mean,
-        "joint_max_deg": overall_max,
-        "per_joint_mean": per_joint_mean,
-        "per_joint_max": per_joint_max,
-        "worst_joint": worst_joint,
-        "num_samples": len(actual_samples),
-    }
+    return (
+        True,
+        actual_arr,
+        {
+            "joint_mean_deg": overall_mean,
+            "joint_max_deg": overall_max,
+            "per_joint_mean": per_joint_mean,
+            "per_joint_max": per_joint_max,
+            "worst_joint": worst_joint,
+            "num_samples": len(actual_samples),
+        },
+    )
 
 
 def run_waypoint_test(
@@ -539,8 +535,7 @@ def run_waypoint_test(
     num_waypoints = r.get("num_waypoints", "?")
     path_len = r.get("joint_path_length", 0)
     plan_t = time.perf_counter() - t0
-    print(f"  [{label}] plan: src={result.source}  wp={num_waypoints}  "
-          f"len={path_len:.2f}rad  t={plan_t:.3f}s")
+    print(f"  [{label}] plan: src={result.source}  wp={num_waypoints}  " f"len={path_len:.2f}rad  t={plan_t:.3f}s")
 
     # 碰撞检测验证（使用 planner 内置 FCL）
     collision_report = validate_path_collisions(planner, result.qpos_path)
@@ -568,8 +563,7 @@ def run_waypoint_test(
         pjx = track["per_joint_max"]
         wj = track["worst_joint"]
         ns = track["num_samples"]
-        print(f"  [{label}] track ({ns} samples): "
-              f"joint_mean={jm:.2f}deg  joint_max={jx:.2f}deg")
+        print(f"  [{label}] track ({ns} samples): " f"joint_mean={jm:.2f}deg  joint_max={jx:.2f}deg")
         print(f"           per_joint_mean: {np.round(pjm, 2)}")
         print(f"           per_joint_max : {np.round(pjx, 2)}  worst=J{wj}")
 
@@ -582,15 +576,15 @@ def run_waypoint_test(
     max_joint_err = float(np.max(np.abs(final_qpos - result.qpos_path[-1])))
     ok = pos_err < POS_ERR_THRESHOLD_M and max_joint_err < CONVERGE_THRESHOLD_RAD
 
-    print(f"  [{label}] final: pos_err={pos_err:.4f}m  rot_err={np.rad2deg(rot_err):.2f}deg  "
-          f"joint_err={np.rad2deg(max_joint_err):.2f}deg  [{'OK' if ok else 'FAIL'}]")
+    print(
+        f"  [{label}] final: pos_err={pos_err:.4f}m  rot_err={np.rad2deg(rot_err):.2f}deg  "
+        f"joint_err={np.rad2deg(max_joint_err):.2f}deg  [{'OK' if ok else 'FAIL'}]"
+    )
 
     return ok
 
 
-def validate_path_collisions(
-    planner: XArm7MotionPlanner, qpos_path: np.ndarray
-) -> dict:
+def validate_path_collisions(planner: XArm7MotionPlanner, qpos_path: np.ndarray) -> dict:
     """Validate a planned joint path for self- and environment collisions.
 
     Returns dict with:
@@ -611,9 +605,7 @@ def validate_path_collisions(
     return {"ok": len(errors) == 0, "errors": errors, "checked": checked}
 
 
-def simulate_path_in_sapien(
-    qpos_path: np.ndarray, home_qpos: np.ndarray
-) -> dict:
+def simulate_path_in_sapien(qpos_path: np.ndarray, home_qpos: np.ndarray) -> dict:
     """Validate a planned joint path in SAPIEN simulation.
 
     NOTE: Heavy dependency (sapien). Only call when full physics verification
@@ -625,6 +617,7 @@ def simulate_path_in_sapien(
         warnings: list[str]
     """
     import sapien.core as sapien
+
     from dexmani_real.simulation.constructor import setup_scene
     from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 
@@ -645,10 +638,12 @@ def simulate_path_in_sapien(
     try:
         qlimits = robot.qlimits
         for i, qpos_arm7 in enumerate(qpos_path):
-            full_qpos = np.concatenate([
-                np.asarray(qpos_arm7, dtype=np.float64).ravel()[:7],
-                np.zeros(12, dtype=np.float64),
-            ])
+            full_qpos = np.concatenate(
+                [
+                    np.asarray(qpos_arm7, dtype=np.float64).ravel()[:7],
+                    np.zeros(12, dtype=np.float64),
+                ]
+            )
 
             # Joint limit check
             if np.any(full_qpos[:7] < qlimits[:7, 0]) or np.any(full_qpos[:7] > qlimits[:7, 1]):
@@ -704,8 +699,9 @@ def _fallback_reset(arm: XArm7, home_qpos: np.ndarray) -> float:
     return err
 
 
-def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndarray,
-                     home_eef: Pose, dt: float = ARM_DT) -> float:
+def safe_return_home(
+    arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndarray, home_eef: Pose, dt: float = ARM_DT
+) -> float:
     """安全归位：plan_path 碰撞预警 + check_path_collisions + 阻塞式 arm.reset()。
 
     设计原则：
@@ -732,8 +728,7 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
         if result.qpos_path is not None:
             seg_check = planner.check_path_collisions(result.qpos_path)
             if seg_check.get("path_self_collision"):
-                print(f"  [safe_return_home] plan OK but segment collision detected — "
-                      f"falling back to direct reset")
+                print(f"  [safe_return_home] plan OK but segment collision detected — " f"falling back to direct reset")
                 arm.clear_error()
                 ok = arm.reset(home_qpos)
                 time.sleep(0.3)
@@ -770,6 +765,7 @@ def safe_return_home(arm: XArm7, planner: XArm7MotionPlanner, home_qpos: np.ndar
 
 
 # ═══════════════════════════════════════════════ Test 5: Teleop IK 自碰撞检测
+
 
 def test_teleop_ik_collision(
     planner: XArm7MotionPlanner,
@@ -960,13 +956,17 @@ def main():
         # ══ Summary ══
         print(f"\n{'='*60}")
         print("Summary:")
-        print(f"  solve_ik       : {ik_results['fresh'].ok}/{ik_results['fresh'].total} "
-              f"fresh, {ik_results['chained'].ok}/{ik_results['chained'].total} chained")
+        print(
+            f"  solve_ik       : {ik_results['fresh'].ok}/{ik_results['fresh'].total} "
+            f"fresh, {ik_results['chained'].ok}/{ik_results['chained'].total} chained"
+        )
         print(f"  solve_teleop_ik: {teleop_stats.ok}/{teleop_stats.total}")
         print(f"  plan_path      : {path_stats.ok}/{path_stats.total}")
         print(f"  live_waypoints : {ok_count}/{len(safe_waypoints)}")
-        print(f"  ik_collision   : profile_default={teleop_ik_collision['profile_default']}  "
-              f"collision_held={teleop_ik_collision['collision_held']}")
+        print(
+            f"  ik_collision   : profile_default={teleop_ik_collision['profile_default']}  "
+            f"collision_held={teleop_ik_collision['collision_held']}"
+        )
         print("Done.")
 
     finally:

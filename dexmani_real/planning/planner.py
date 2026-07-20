@@ -13,12 +13,12 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 from .collision_model import CollisionModel
+from .desk_safety import FingertipDeskSafety
 from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager
 from .kinematics import XArm7Kinematics
-from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
-from .desk_safety import FingertipDeskSafety
 from .pose_utils import compute_pose_error, ensure_qpos
+from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
 from .workspace_safety import WorkspaceSafety
 
 __all__ = [
@@ -89,9 +89,7 @@ class XArm7MotionPlanner:
 
         base_pose_world = config.base_pose_world.copy()
         self.workspace_safety: WorkspaceSafety | None = (
-            WorkspaceSafety(config.workspace_bounds)
-            if config.workspace_bounds is not None
-            else None
+            WorkspaceSafety(config.workspace_bounds) if config.workspace_bounds is not None else None
         )
 
         self.kin = XArm7Kinematics(
@@ -142,9 +140,7 @@ class XArm7MotionPlanner:
         for delegate in (self.kin, self.ik_mgr, self.mplib_planner):
             if hasattr(delegate, name):
                 return getattr(delegate, name)
-        raise AttributeError(
-            f"{type(self).__name__!r} object has no attribute {name!r}"
-        )
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         """Set current hand joint configuration for 19-DOF collision detection.
@@ -338,9 +334,7 @@ class XArm7MotionPlanner:
 
     # ── Path validation (internal) ──
 
-    def shortcut_smooth_path(
-        self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile
-    ) -> np.ndarray:
+    def shortcut_smooth_path(self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile) -> np.ndarray:
         limits = self.resolve_planning_limits(profile, current_qpos)
         path = np.asarray(path, dtype=np.float64).copy()
         if len(path) <= 2:
@@ -362,7 +356,11 @@ class XArm7MotionPlanner:
         return path
 
     def _is_shortcut_valid(
-        self, prev: np.ndarray, nxt: np.ndarray, limits: np.ndarray, profile: PlanningProfile,
+        self,
+        prev: np.ndarray,
+        nxt: np.ndarray,
+        limits: np.ndarray,
+        profile: PlanningProfile,
     ) -> bool:
         """Check if the direct prev→nxt shortcut segment is collision-free.
 
@@ -541,9 +539,7 @@ class XArm7MotionPlanner:
     def _check_workspace_bounds(self, path, report, source, _profile):
         if self.workspace_safety is None:
             return None
-        eef_positions = np.array(
-            [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
-        )
+        eef_positions = np.array([self.compute_eef_pose_world(q).p for q in path], dtype=np.float64)
         # Skip waypoint 0 (start position) — the arm may already be outside
         # workspace; the path is valid as long as subsequent waypoints are safe.
         for i, eef_p in enumerate(eef_positions):
@@ -564,7 +560,8 @@ class XArm7MotionPlanner:
                 report["workspace_violation_summary"] = "; ".join(violations)
                 return self._make_failure(
                     f"Path contains workspace violations: waypoint[{i}] ({'; '.join(violations)})",
-                    source, report,
+                    source,
+                    report,
                 )
         return None
 
@@ -578,7 +575,8 @@ class XArm7MotionPlanner:
             return self._make_failure(
                 f"Path contains desk collision (fingertip z_min={min_z:.3f}m < "
                 f"safe={self.desk_safety.config.fingertip_threshold:.3f}m, segment {viol_idx})",
-                source, report,
+                source,
+                report,
             )
         return None
 
@@ -592,9 +590,7 @@ class XArm7MotionPlanner:
 
         eef_efficiency = 1.0
         if len(path) >= 3:
-            eef_positions = np.array(
-                [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
-            )
+            eef_positions = np.array([self.compute_eef_pose_world(q).p for q in path], dtype=np.float64)
             eef_deltas = np.diff(eef_positions, axis=0)
             eef_path_len = float(np.sum(np.linalg.norm(eef_deltas, axis=1)))
             eef_straight = float(np.linalg.norm(eef_positions[-1] - eef_positions[0]))
