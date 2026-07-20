@@ -22,14 +22,15 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
-from dexmani_real.recording.collection_config import DEFAULT_MAX_RECORD_FRAMES
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
+from dexmani_real.recording.collection_config import DEFAULT_MAX_RECORD_FRAMES
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
 SCHEMA_VERSION = 8  # v8: +truncated/stop_reason/cam_frames_dropped/cam_items_written meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
+SCHEMA_VERSION_ARM_SENT = 9  # v9: +/action_arm_joint_sent(T,7) opt-in stream (ctor flag arm_sent_stream=True)
 
 CAMERA_FRESH_TIMEOUT_S = 0.2  # flag_camera_fresh: max age of the last *new* camera frame (~6 frames @30fps)
 
@@ -66,6 +67,7 @@ class EpisodeRecorder:
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
         control_hz: float = 50.0,
         min_frames: int = 50,
+        arm_sent_stream: bool = False,
     ) -> None:
         if control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
@@ -74,6 +76,12 @@ class EpisodeRecorder:
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
         self.min_frames = int(min_frames)
+
+        # Opt-in additive stream (schema v9): the delta-clipped arm joint command
+        # actually forwarded to the SDK each tick, as opposed to action_arm_joint
+        # (the IK target).  Off → byte-identical v8 behavior; nothing is wired to
+        # pass the kwarg yet, so the flag alone is inert.
+        self.arm_sent_stream: bool = bool(arm_sent_stream)
 
         self._file: h5py.File | None = None
         self._frame_count: int = 0
@@ -252,6 +260,11 @@ class EpisodeRecorder:
         meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
 
+        # Opt-in schema v9 marker — written only when enabled so the default
+        # v8 file keeps its exact meta layout.
+        if self.arm_sent_stream:
+            meta.attrs["arm_sent_stream"] = True
+
         self._write_camera_meta_attrs(meta)
 
         # Collection-config snapshot (control mode, EMA alphas, delta clips) —
@@ -330,6 +343,7 @@ class EpisodeRecorder:
         T_base_eef: np.ndarray | None = None,
         camera_frames: dict[str, dict[str, Any]] | None = None,
         signals: dict[str, Any] | None = None,
+        arm_qpos_sent: np.ndarray | None = None,
     ) -> bool:
         if not self._recording or self._buffer is None:
             return False
@@ -366,17 +380,14 @@ class EpisodeRecorder:
         if camera_frame is not None:
             fresh_token = camera_frame.get("frame_number")
         elif camera_frames:
-            fresh_token = tuple(
-                f.get("frame_number") if f is not None else None for f in camera_frames.values()
-            )
+            fresh_token = tuple(f.get("frame_number") if f is not None else None for f in camera_frames.values())
         else:
             fresh_token = None
         if fresh_token is not None and fresh_token != self._cam_last_frame_number:
             self._cam_last_frame_number = fresh_token
             self._cam_last_change_ts = ts
         flag_camera_fresh = (
-            self._cam_last_frame_number is not None
-            and (ts - self._cam_last_change_ts) <= CAMERA_FRESH_TIMEOUT_S
+            self._cam_last_frame_number is not None and (ts - self._cam_last_change_ts) <= CAMERA_FRESH_TIMEOUT_S
         )
 
         def _make_action_ee() -> np.ndarray:
@@ -409,6 +420,14 @@ class EpisodeRecorder:
             "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
             "vr_landmarks": np.asarray(vr_frame["landmarks"], dtype=np.float64),
         }
+        # ── Opt-in sent-command stream (schema v9) ──
+        # None (kwarg unset) → zeros: the TimestampAlignedBuffer forward-fills
+        # the slot from this row, consistent with the action_arm_ee NaN-on-missing
+        # convention for optional action streams.  Gated on the constructor flag so
+        # an accidental kwarg can never add a dataset to a default (v8) recording.
+        if self.arm_sent_stream:
+            sent = np.asarray(arm_qpos_sent, dtype=np.float64) if arm_qpos_sent is not None else np.zeros(7)
+            data["action_arm_joint_sent"] = sent
 
         prev_size = self._buffer.size
         self._buffer.add(data, timestamp=float(state.timestamp))
@@ -484,9 +503,7 @@ class EpisodeRecorder:
         self._cam_writer_stop.clear()
         self._cam_written = 0
         self._cam_dropped = 0
-        self._cam_writer = threading.Thread(
-            target=self._cam_writer_loop, daemon=True, name="episode-cam-writer"
-        )
+        self._cam_writer = threading.Thread(target=self._cam_writer_loop, daemon=True, name="episode-cam-writer")
         self._cam_writer.start()
 
     def _cam_writer_loop(self) -> None:
@@ -503,8 +520,7 @@ class EpisodeRecorder:
             # do NOT wrap it in another lock acquisition (threading.Lock
             # is non-reentrant; nesting would deadlock the writer thread).
             if self._flush_pending or (
-                self._buffer is not None
-                and self._buffer.size - self._flushed_frames >= self._flush_interval
+                self._buffer is not None and self._buffer.size - self._flushed_frames >= self._flush_interval
             ):
                 self._flush_buffered()
                 self._flush_pending = False
@@ -838,11 +854,7 @@ class EpisodeRecorder:
         if self._file is not None and buf_size > 0:
             with self._hdf5_lock:
                 for key in list(self._datasets.keys()):
-                    if not (
-                        key in ("rgb", "depth", "pointcloud")
-                        or key.endswith("_rgb")
-                        or key.endswith("_depth")
-                    ):
+                    if not (key in ("rgb", "depth", "pointcloud") or key.endswith("_rgb") or key.endswith("_depth")):
                         continue
                     ds = self._datasets[key]
                     cam_len = ds.shape[0]
@@ -862,6 +874,10 @@ class EpisodeRecorder:
             with self._hdf5_lock:
                 meta = self._file["meta"]
                 meta.attrs["schema_version"] = SCHEMA_VERSION
+                # Opt-in schema v9: bump only when the sent-command stream was
+                # enabled — the default path keeps the exact v8 meta layout.
+                if self.arm_sent_stream:
+                    meta.attrs["schema_version"] = SCHEMA_VERSION_ARM_SENT
                 meta.attrs["duration"] = duration
                 meta.attrs["num_frames"] = self._frame_count
                 meta.attrs["success"] = success

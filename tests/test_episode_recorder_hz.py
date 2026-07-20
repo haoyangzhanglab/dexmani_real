@@ -223,9 +223,11 @@ def test_stop_impl_enospc_sets_stop_error(tmp_path):
     assert rec.start_episode()
     for k in range(8):
         assert rec.add_frame(_fake_state(2000.0 + k * DT), _fake_action(), _fake_vr(), signals={"ik_ok": True})
+
     # Inject disk-full error into the flush path called by _stop_episode_impl_inner.
     def _raise_enospc():
         raise OSError(28, "No space left on device")
+
     rec._flush_buffered = _raise_enospc
     path = rec.stop_episode(success=True)
     assert path is not None
@@ -235,6 +237,60 @@ def test_stop_impl_enospc_sets_stop_error(tmp_path):
     assert "OSError" in rec.stop_error
     assert "No space" in rec.stop_error
     assert not rec.is_recording
+
+
+def test_arm_sent_stream_opt_in(tmp_path):
+    """arm_sent_stream=True → /action_arm_joint_sent(T,7) + schema v9 + meta flag."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4, arm_sent_stream=True)
+    assert rec.start_episode()
+    t0 = 1000.0
+    for k in range(20):
+        sent = np.full(7, float(k + 1))
+        assert rec.add_frame(_fake_state(t0 + k * DT), _fake_action(), _fake_vr(), arm_qpos_sent=sent)
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        meta = f["meta"].attrs
+        assert meta["schema_version"] == 9
+        assert bool(meta["arm_sent_stream"])
+        sent_ds = f["action_arm_joint_sent"]
+        assert sent_ds.shape == (20, 7)
+        assert sent_ds.dtype == np.float64
+        expected = np.stack([np.full(7, float(k + 1)) for k in range(20)])
+        assert np.array_equal(sent_ds[:], expected)
+
+
+def test_arm_sent_stream_none_rows_are_zeros(tmp_path):
+    """Unset kwarg rows (None) record zeros, consistent with optional action streams."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4, arm_sent_stream=True)
+    assert rec.start_episode()
+    t0 = 1000.0
+    for k in range(10):
+        sent = None if k % 2 == 0 else np.full(7, float(k))
+        assert rec.add_frame(_fake_state(t0 + k * DT), _fake_action(), _fake_vr(), arm_qpos_sent=sent)
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        sent_ds = f["action_arm_joint_sent"][:]
+        for k in range(10):
+            expected = np.zeros(7) if k % 2 == 0 else np.full(7, float(k))
+            assert np.array_equal(sent_ds[k], expected), f"row {k}"
+
+
+def test_arm_sent_stream_off_default_unchanged(tmp_path):
+    """Default (flag off): kwarg is inert — no dataset, no meta attr, schema stays 8."""
+    rec = EpisodeRecorder(data_dir=str(tmp_path), max_frames=960, control_hz=HZ, min_frames=4)
+    assert rec.start_episode()
+    t0 = 1000.0
+    for k in range(8):
+        # Even an explicitly supplied kwarg must NOT create the dataset when the flag is off.
+        assert rec.add_frame(_fake_state(t0 + k * DT), _fake_action(), _fake_vr(), arm_qpos_sent=np.full(7, 3.0))
+    path = rec.stop_episode(success=True)
+    assert rec.join_stop()
+    with h5py.File(path, "r") as f:
+        assert "action_arm_joint_sent" not in f
+        assert "arm_sent_stream" not in f["meta"].attrs
+        assert f["meta"].attrs["schema_version"] == 8
 
 
 def test_restart_after_stop_error(tmp_path):
