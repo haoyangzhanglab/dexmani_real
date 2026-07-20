@@ -212,7 +212,7 @@ class CameraCalib:
         """
         entry = self._entries[cam_name]
         if entry.type == "eye_to_hand":
-            return entry.T_world_camera.copy()
+            return entry.T_world_camera.copy()  # type: ignore[union-attr]  # __post_init__ guarantees non-None for eye_to_hand
         if T_base_eef is None:
             raise ValueError(f"Camera '{cam_name}' is eye_in_hand; T_base_eef (4,4 FK matrix) is required")
         return T_base_eef @ entry.T_eef_camera
@@ -239,9 +239,9 @@ class CameraCalib:
             "camera_type": entry.type,
         }
         if entry.type == "eye_to_hand":
-            meta["camera_T_world_camera"] = entry.T_world_camera.flatten().tolist()
+            meta["camera_T_world_camera"] = entry.T_world_camera.flatten().tolist()  # type: ignore[union-attr]  # __post_init__ guarantees non-None for eye_to_hand
         else:
-            meta["camera_T_eef_camera"] = entry.T_eef_camera.flatten().tolist()
+            meta["camera_T_eef_camera"] = entry.T_eef_camera.flatten().tolist()  # type: ignore[union-attr]  # __post_init__ guarantees non-None for eye_in_hand
         return meta
 
     def __repr__(self) -> str:

@@ -39,7 +39,7 @@ Usage::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -162,7 +162,9 @@ class CollisionModel:
                 if _so_path is None:
                     raise ImportError("hppfcl .so not found in sys.path")
 
-                _spec = _imach.ModuleSpec(
+                # Any: ModuleSpec.loader is typed Loader | None, but here it is exactly
+                # the ExtensionFileLoader constructed inline below (never None).
+                _spec: Any = _imach.ModuleSpec(
                     "hppfcl",
                     _imach.ExtensionFileLoader("hppfcl", _so_path),
                     origin=_so_path,

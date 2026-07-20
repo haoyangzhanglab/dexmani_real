@@ -366,7 +366,7 @@ class EpisodeVisualizer:
         has_action = bool(self._available.get("action"))
         has_flags = bool(self._available.get("flags"))
 
-        columns: list[rrb.Container] = []
+        columns: list[rrb.Container | rrb.View] = []
 
         # Camera column
         cam_views = []

@@ -137,7 +137,10 @@ class TeleopPipeline:
                 target_pos,
                 target_quat,
                 self._prev_target_pos,
-                self._prev_target_quat,
+                # _prev_target_quat is non-None whenever _prev_target_pos is: both start None
+                # and are only ever assigned together (see .copy() pair below) — a coupled
+                # two-attribute invariant mypy cannot track without a runtime narrowing statement.
+                self._prev_target_quat,  # type: ignore[arg-type]
                 self._ema_alpha_pos,
                 self._ema_alpha_rot,
             )

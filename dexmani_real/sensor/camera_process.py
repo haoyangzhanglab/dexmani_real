@@ -20,9 +20,17 @@ from __future__ import annotations
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from dexmani_real.sensor.pointcloud_processor import PointCloudProcessorConfig
 from dexmani_real.utils.log import get_logger
+
+if TYPE_CHECKING:
+    from multiprocessing.sharedctypes import SynchronizedString
+
+    import numpy as np
+
+    from dexmani_real.shm.ring_buffer import CameraRingBuffer
 
 logger = get_logger(__name__)
 
@@ -75,14 +83,16 @@ class CameraProcess:
         self.config = config or CameraProcessConfig()
         self._process: mp.Process | None = None
         self._stop_event = mp.Event()
-        self._shm_buf = None  # CameraRingBuffer instance (lazy init)
+        self._shm_buf: CameraRingBuffer | None = None  # CameraRingBuffer instance (lazy init)
         self._crashed = mp.Event()
         # Depth units in meters (L515: 0.00025) — set by the child after
         # camera connect; 0.0 means "not yet known".
         self._depth_scale = mp.Value("d", 0.0)
         # Hardware identity + intrinsics, set by the child after camera connect
         # so /meta is self-contained per episode (same pattern as depth_scale).
-        self._camera_serial = mp.Array("c", 32)
+        # mp.Array("c", ...) is SynchronizedString at runtime (has .value/.raw);
+        # typeshed's str overload yields SynchronizedArray[Any] (no .value) — hence the ignore.
+        self._camera_serial: SynchronizedString = mp.Array("c", 32)  # type: ignore[assignment]  # typeshed gap: str overload -> SynchronizedArray[Any], runtime type is SynchronizedString
         self._camera_K = mp.Array("d", 9)  # 3×3 intrinsics, flattened
 
     # ------------------------------------------------------------------
@@ -350,7 +360,10 @@ class CameraProcess:
                     t2 = time.monotonic()
                     try:
                         header, rgb, depth = pack_camera_frame(
-                            frame.rgb,
+                            # frame.rgb is never None here: RealSenseConfig.enable_color defaults True
+                            # and read() raises on a missing color frame (CameraFrame.rgb is Optional
+                            # only for enable_color=False configs).
+                            frame.rgb,  # type: ignore[arg-type]  # Optional only for enable_color=False; guaranteed non-None with this config
                             frame.depth_raw,
                             frame.timestamp,
                             frame.frame_id,

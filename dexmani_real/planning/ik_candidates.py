@@ -333,13 +333,13 @@ class IKCandidateManager:
     # ── Collision check wrappers (delegate to CollisionModel) ──
 
     def has_self_collision(self, qpos: np.ndarray) -> bool:
-        return self._cm.check_self_collision(qpos)
+        return self._cm.check_self_collision(qpos)  # type: ignore[union-attr]  # wrappers require a configured CollisionModel (planner always builds one)
 
     def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
-        return self._cm.check_self_collision_details(qpos)
+        return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]  # see has_self_collision
 
     def has_env_collision(self, qpos: np.ndarray) -> bool:
-        return self._cm.check_env_collision(qpos)
+        return self._cm.check_env_collision(qpos)  # type: ignore[union-attr]  # see has_self_collision
 
     def check_path_collisions(
         self,
@@ -355,7 +355,7 @@ class IKCandidateManager:
         """
         for i in range(len(path) - 1):
             # Dense segment check — fast bool path for most points.
-            if not self._cm.check_segment_collision_free(
+            if not self._cm.check_segment_collision_free(  # type: ignore[union-attr]  # requires a configured CollisionModel (planner always builds one)
                 path[i],
                 path[i + 1],
                 collision_step_size,
@@ -407,7 +407,7 @@ class IKCandidateManager:
     ) -> dict[str, Any]:
         """Check environment collision along path with dense interpolation."""
         for i in range(len(path) - 1):
-            if not self._cm.check_segment_env_collision_free(
+            if not self._cm.check_segment_env_collision_free(  # type: ignore[union-attr]  # requires a configured CollisionModel (planner always builds one)
                 path[i],
                 path[i + 1],
                 collision_step_size,
@@ -463,7 +463,7 @@ class IKCandidateManager:
         half_range = np.maximum(0.5 * (limits[:, 1] - limits[:, 0]), 1e-6)
         return float(np.sum(((qpos - center) / half_range) ** 2))
 
-    def profile_array(self, values: tuple[float, ...], name: str) -> np.ndarray:
+    def profile_array(self, values: tuple[float, ...] | np.ndarray, name: str) -> np.ndarray:
         array = np.asarray(values, dtype=np.float64).reshape(-1)
         if array.shape == (1,):
             return np.repeat(array, self.dof)

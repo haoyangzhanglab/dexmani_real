@@ -83,7 +83,7 @@ class EpisodeRecorder:
         # pass the kwarg yet, so the flag alone is inert.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
-        self._file: h5py.File | None = None
+        self._file: Any = None  # h5py.File | None at runtime; h5py ships no type stubs (File is Any)
         self._frame_count: int = 0
         self._recording: bool = False
         self._max_frames_reached: bool = False

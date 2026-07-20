@@ -21,6 +21,7 @@ import os
 import threading
 from collections import deque
 from enum import Enum
+from typing import Any
 
 
 class ControlSignal(Enum):
@@ -74,7 +75,7 @@ class KeyboardHandler:
         """
         self._buffer: deque[ControlSignal] = deque()
         self._lock = threading.Lock()
-        self._listener: object = None  # pynput.keyboard.Listener
+        self._listener: Any = None  # pynput.keyboard.Listener
         self._running: bool = False
 
     # ------------------------------------------------------------------
@@ -118,7 +119,7 @@ class KeyboardHandler:
                 pass
 
         self._listener = keyboard.Listener(on_press=on_press)
-        self._listener.start()  # type: ignore[union-attr]
+        self._listener.start()
         self._running = True
 
     def stop(self) -> None:
@@ -131,7 +132,7 @@ class KeyboardHandler:
             return
         try:
             if self._listener is not None:
-                self._listener.stop()  # type: ignore[union-attr]
+                self._listener.stop()
                 self._listener = None
         except Exception:
             pass

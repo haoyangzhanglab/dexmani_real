@@ -65,7 +65,7 @@ class QuestHandTracker:
         self.latest_frame: dict[str, Any] | None = None
         self.lock = threading.Lock()
         self.event = threading.Event()
-        self.last_read_key = None
+        self.last_read_key: tuple[Any, Any] | None = None
 
         self.received_frames = 0
         self.ignored_events = 0
@@ -268,7 +268,7 @@ class QuestHandTracker:
     def extract_geometry(self, frame: HandFrame):
         wrist = frame.wrist
         pos = (wrist.x, wrist.y, wrist.z)
-        quat_xyzw = (wrist.qx, wrist.qy, wrist.qz, wrist.qw)
+        quat_xyzw: Any = (wrist.qx, wrist.qy, wrist.qz, wrist.qw)
         landmarks = frame.landmarks.points
 
         if self.output_frame == "unity":

@@ -256,7 +256,7 @@ class TimestampAligner:
         t_start: float | None = None,
         t_end: float | None = None,
         dt: float | None = None,
-    ) -> dict[str, np.ndarray] | None:
+    ) -> dict[str, Any] | None:
         """Align all streams in an HDF5 episode to a unified time grid.
 
         Args:
@@ -283,7 +283,7 @@ class TimestampAligner:
         t_start: float | None,
         t_end: float | None,
         dt: float,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, Any]:
         """Internal: align streams from an open HDF5 file."""
         # Get control timestamps
         if "timestamp" in f:
@@ -301,7 +301,9 @@ class TimestampAligner:
             t_end = float(ctrl_ts[-1])
 
         target_ts = np.arange(t_start, t_end + dt / 2, dt, dtype=np.float64)
-        result: dict[str, np.ndarray] = {}
+        # Values are ndarrays for all streams, plus a np.float64 scalar for
+        # "aligned_fps" — hence Any rather than ndarray.
+        result: dict[str, Any] = {}
 
         # Streams to align (path → source timestamps) — v2 flat schema
         streams: list[tuple[str, np.ndarray, str]] = [
@@ -357,7 +359,7 @@ class TimestampAligner:
 
         return result
 
-    def validate_alignment(self, aligned: dict[str, np.ndarray]) -> dict[str, Any]:
+    def validate_alignment(self, aligned: dict[str, Any]) -> dict[str, Any]:
         """Validate aligned data for NaN gaps and consistency.
 
         Returns a validation report dict.
@@ -400,7 +402,7 @@ def align_and_validate(
     dt: float = 0.020,
     method: str = "linear",
     max_gap_s: float = 0.1,
-) -> tuple[dict[str, np.ndarray] | None, dict[str, Any]]:
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Align an episode and validate the result.
 
     Returns (aligned_data, validation_report).

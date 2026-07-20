@@ -42,7 +42,7 @@ def to_numpy(value: Any) -> Any:
     return np.asarray(value)
 
 
-def intrinsics_to_matrix(intrinsics: Any, dtype: np.dtype = np.float32) -> np.ndarray:
+def intrinsics_to_matrix(intrinsics: Any, dtype: np.typing.DTypeLike = np.float32) -> np.ndarray:
     return np.array(
         [
             [intrinsics.fx, 0.0, intrinsics.ppx],

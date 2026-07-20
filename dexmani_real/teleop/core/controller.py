@@ -39,7 +39,9 @@ if TYPE_CHECKING:
     from dexmani_real.config.camera_calib import CameraCalib
     from dexmani_real.planning.planner import XArm7MotionPlanner
     from dexmani_real.recording.episode_recorder import EpisodeRecorder
+    from dexmani_real.sensor.camera_process import CameraProcess
     from dexmani_real.sensor.multi_camera_manager import MultiCameraManager
+    from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
     from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
     from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
     from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
@@ -101,7 +103,7 @@ class TeleopController:
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_shm_vr: bool = False,
-        camera_process: object | None = None,
+        camera_process: CameraProcess | None = None,
         calib: CameraCalib | None = None,
         camera_name: str | None = None,
     ) -> None:
@@ -140,8 +142,8 @@ class TeleopController:
         self._camera_name = camera_name
         if recorder is not None:
             coll_cfg = cfg.collection_config or CollectionConfig()
-            self._collection_loop = CollectionLoop(recorder, coll_cfg)
-            self.recorder = recorder
+            self._collection_loop: CollectionLoop | None = CollectionLoop(recorder, coll_cfg)
+            self.recorder: EpisodeRecorder | None = recorder
             self._recorder_session: RecordingSession | None = RecordingSession(
                 self._collection_loop, validate=coll_cfg.validate_on_stop
             )
@@ -166,7 +168,7 @@ class TeleopController:
                 self._multi_camera.start_all()
 
         # VR data sources (priority: SHM > Tracker)
-        self._vr_shm: object | None = None  # SharedMemoryFrameManager
+        self._vr_shm: SharedMemoryFrameManager | None = None
 
         if cfg.use_shm_vr:
             from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
@@ -320,13 +322,15 @@ class TeleopController:
             arm_qpos = state.arm_qpos
             arm_temps = None
         else:
-            arm_qpos, error_state, _inner_ts = self._arm_inner.get_state()
+            # _arm_inner is non-None whenever dry_run is False (created in __init__) —
+            # mypy cannot correlate the two attributes, hence the ignores.
+            arm_qpos, error_state, _inner_ts = self._arm_inner.get_state()  # type: ignore[union-attr]  # non-None: not dry_run
             if error_state:
                 self._escalate_to_emergency("Arm inner loop error")
                 return
             # Dynamics from the inner loop's 50Hz readback (single SDK connection) —
             # recorded into /arm_qvel + /arm_tau and feeds the torque/temp gates.
-            arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()
+            arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()  # type: ignore[union-attr]  # non-None: not dry_run
             state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
 
         # ── 4. Compute action ──
@@ -339,7 +343,7 @@ class TeleopController:
 
         # ── 5. Read camera (latest) for recording ──
         camera_frame = None
-        camera_frames: dict[str, dict] | None = None
+        camera_frames: dict[str, dict | None] | None = None
 
         if self._multi_camera is not None:
             try:
@@ -382,7 +386,7 @@ class TeleopController:
                 action = RobotAction(arm_qpos_cmd=hold.arm_qpos_cmd, hand_qpos_cmd=hold.hand_qpos_cmd)
 
             # Send arm target to inner loop
-            self._arm_inner.set_target(action.arm_qpos_cmd)
+            self._arm_inner.set_target(action.arm_qpos_cmd)  # type: ignore[union-attr]  # non-None: not dry_run
             # Send hand directly.  Degraded mode (hand not connected) is expected —
             # only a failed send on a connected hand marks the frame as held.
             send_result = self.robot.send_action(action)

@@ -105,7 +105,7 @@ class TeleopIKSolver:
                 # Verify the diff IK result actually reaches the target.
                 pos_err, rot_err = self.kin.compute_world_pose_error(
                     target_eef_pose_world,
-                    diff_result.qpos,
+                    diff_result.qpos,  # type: ignore[arg-type]  # IKResult.qpos is Optional, but success=True ⇒ non-None
                 )
                 if pos_err <= profile.max_pose_error_pos_m and rot_err <= profile.max_pose_error_rot_rad:
                     self._maybe_log_ik_timing(dt_diff_s, 0.0, diff_result.report.get("iterations", 0))

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 from multiprocessing import shared_memory
+from typing import Any
 
 import numpy as np
 
@@ -90,15 +91,21 @@ class SharedMemoryRingBuffer:
             self._shm = shared_memory.SharedMemory(name=name)
 
         # Map the header first (needed by _init_header)
-        self._header = np.ndarray((self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0)
+        self._header: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
+            (self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0
+        )
 
         # Map the data region as a numpy array
-        self._data_buf = np.ndarray((maxlen,), dtype=self._slot_dtype, buffer=self._shm.buf, offset=self._HEADER_SIZE)
+        self._data_buf: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
+            (maxlen,), dtype=self._slot_dtype, buffer=self._shm.buf, offset=self._HEADER_SIZE
+        )
 
         if create:
             self._init_header()
 
-        self._write_seq = np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE)
+        self._write_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE
+        )
 
         logger.debug(
             "SharedMemoryRingBuffer(name=%s, slot_size=%d, maxlen=%d, total=%d, create=%s)",
@@ -289,7 +296,9 @@ class CameraRingBuffer:
         else:
             self._shm = shared_memory.SharedMemory(name=name)
 
-        self._write_seq = np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE)
+        self._write_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE
+        )
 
         logger.debug(
             "CameraRingBuffer(name=%s, slot_size=%d, maxlen=%d, total=%dMB, create=%s)",
@@ -327,32 +336,42 @@ class CameraRingBuffer:
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
         # Write timestamp + sequence (16 bytes)
-        ts_arr = np.ndarray((2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base)
+        ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
+        )
         ts_arr[0] = np.uint64(now_ns)
         ts_arr[1] = np.uint64(seq)
 
         # Write camera header (64 bytes)
         header_offset = slot_base + 16
-        header_dest = np.ndarray((1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset)
+        header_dest: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
+            (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
+        )
         header_dest[0] = header[0]
 
         # Write RGB bytes
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
         rgb_len = min(rgb.nbytes, self._max_rgb_bytes)
-        rgb_dest = np.ndarray((rgb_len,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset)
+        rgb_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
+            (rgb_len,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset
+        )
         rgb_dest[:] = rgb.ravel()[:rgb_len]
 
         # Write depth bytes
         depth_offset = rgb_offset + self._max_rgb_bytes
         depth_len = min(depth.nbytes, self._max_depth_bytes)
-        depth_dest = np.ndarray((depth_len,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset)
+        depth_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
+            (depth_len,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset
+        )
         depth_dest[:] = depth.view(np.uint8).ravel()[:depth_len]
 
         # Write pointcloud bytes (fixed-size block; validity is header-flagged)
         if self._max_pc_bytes > 0 and pointcloud is not None:
             pc_offset = depth_offset + self._max_depth_bytes
             pc_len = min(pointcloud.nbytes, self._max_pc_bytes)
-            pc_dest = np.ndarray((pc_len,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset)
+            pc_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
+                (pc_len,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset
+            )
             pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
 
         self._write_idx_view()[0] = np.uint64(idx)
@@ -373,7 +392,9 @@ class CameraRingBuffer:
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
         # Read timestamp + sequence
-        ts_arr = np.ndarray((2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base)
+        ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
+        )
         slot_seq = int(ts_arr[1])
 
         if slot_seq == 0 and idx == 0 and int(self._write_seq[0]) == 0:
@@ -381,7 +402,9 @@ class CameraRingBuffer:
 
         # Read header
         header_offset = slot_base + 16
-        header = np.ndarray((1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset).copy()
+        header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
+            (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
+        ).copy()
 
         # Read RGB — validate size and shape against known maxima to guard
         # against torn reads where the producer is mid-write and header fields
@@ -402,7 +425,7 @@ class CameraRingBuffer:
             )
             return None
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
-        rgb = (
+        rgb: np.ndarray[Any, np.dtype[np.uint8]] = (
             np.ndarray((rgb_size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset)
             .copy()
             .reshape((rgb_h, rgb_w, rgb_c))
@@ -445,7 +468,9 @@ class CameraRingBuffer:
         # The writer may wrap around and overwrite this slot between our
         # initial sequence read and the data copies above.  Re-read the
         # slot's sequence number; a mismatch means the data is torn.
-        ts_arr_check = np.ndarray((2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base)
+        ts_arr_check: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
+        )
         if int(ts_arr_check[1]) != slot_seq:
             return None
 
@@ -455,7 +480,9 @@ class CameraRingBuffer:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""
         idx = int(self._write_idx_view()[0])
         slot_base = self._HEADER_SIZE + idx * self._slot_size
-        ts_arr = np.ndarray((2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base)
+        ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
+        )
         slot_seq = int(ts_arr[1])
         if slot_seq == 0 and idx == 0 and int(self._write_seq[0]) == 0:
             return -1
@@ -469,7 +496,9 @@ class CameraRingBuffer:
 
     def _init_header(self) -> None:
         """Zero-initialize the header region and write metadata."""
-        header_view = np.ndarray((self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0)
+        header_view: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
+            (self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0
+        )
         header_view[:] = 0
         np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_RGB)[0] = np.uint64(
             self._max_rgb_bytes

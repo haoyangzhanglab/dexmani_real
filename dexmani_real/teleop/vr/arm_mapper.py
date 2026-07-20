@@ -45,11 +45,11 @@ class ArmWristMapper:
         # VR tracking glitches (spike-and-recover) that the total-delta cap misses.
         self.max_per_frame_rot_rad = max_per_frame_rot_rad
 
-        self.wrist_pos0 = None
-        self.wrist_rot0 = None
-        self.eef_pos0 = None
-        self.eef_rot0 = None
-        self.last_quat_wxyz = None
+        self.wrist_pos0: np.ndarray | None = None
+        self.wrist_rot0: np.ndarray | None = None
+        self.eef_pos0: np.ndarray | None = None
+        self.eef_rot0: np.ndarray | None = None
+        self.last_quat_wxyz: np.ndarray | None = None
         self._last_wrist_rot: np.ndarray | None = None  # F2: per-frame rotation delta gate
 
     def reset(
@@ -101,7 +101,7 @@ class ArmWristMapper:
         # world-frame eef_pos0 (avoids frame mixing when base_pose_world != I).
         delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
-        delta_rot_vr = wrist_rot @ self.wrist_rot0.T
+        delta_rot_vr = wrist_rot @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
         delta_rot_vr = self.scale_rot(delta_rot_vr)
         delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
         delta_rot_base = self.vr_to_base_rot @ delta_rot_vr @ self.vr_to_base_rot.T

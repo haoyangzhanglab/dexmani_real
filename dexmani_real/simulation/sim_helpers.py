@@ -40,8 +40,8 @@ def execute_dense_path(
     for wp in dense:
         if viewer is not None and viewer.closed:
             return False
-        sim.robot.balance_passive_force()
-        sim.robot.apply_action(np.concatenate([wp, hand]))
+        sim.robot.balance_passive_force()  # type: ignore[union-attr]  # precondition: sim connected (module docstring); robot non-None at all call sites
+        sim.robot.apply_action(np.concatenate([wp, hand]))  # type: ignore[union-attr]  # precondition: sim connected; robot non-None at all call sites
         sim._step_physics(n=physics_steps_per_wp)
         if viewer is not None:
             sim.scene.update_render()
@@ -74,8 +74,8 @@ def settle_at_target(
         Final max joint error (radians).
     """
     for _ in range(max_iter):
-        sim.robot.balance_passive_force()
-        sim.robot.apply_action(np.concatenate([target_arm, hand_qpos]))
+        sim.robot.balance_passive_force()  # type: ignore[union-attr]  # precondition: sim connected (module docstring); robot non-None at all call sites
+        sim.robot.apply_action(np.concatenate([target_arm, hand_qpos]))  # type: ignore[union-attr]  # precondition: sim connected; robot non-None at all call sites
         sim._step_physics(n=physics_steps_per_wp)
         current = sim.get_full_qpos()[:7]
         err = float(np.max(np.abs(current - target_arm)))

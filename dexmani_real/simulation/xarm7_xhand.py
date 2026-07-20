@@ -197,7 +197,7 @@ class XArm7XHand:
         return np.asarray(target_link_poses)
 
     def _try_inverse_kinematics(
-        self, eef_pose: sapien.Pose, full_qpos_init: np.ndarray = None
+        self, eef_pose: sapien.Pose, full_qpos_init: np.ndarray | None = None
     ) -> tuple[np.ndarray | None, bool, float]:
         eef_local_pose = self.model.get_root_pose().inv() * eef_pose
         eef_link_idx = self.link_names.index("custom_eef_link")
@@ -229,7 +229,7 @@ class XArm7XHand:
             return None, False, float(error)
         return ik_qpos_sapien[self.inv_mapping], True, float(error)
 
-    def inverse_kinematics(self, eef_pose: sapien.Pose, full_qpos_init: np.ndarray = None):
+    def inverse_kinematics(self, eef_pose: sapien.Pose, full_qpos_init: np.ndarray | None = None):
         qpos, converged, error = self._try_inverse_kinematics(eef_pose, full_qpos_init)
         if not converged:
             raise RuntimeError(f"IK did not converge, final error: {error}")

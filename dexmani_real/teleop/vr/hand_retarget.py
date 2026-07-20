@@ -211,7 +211,7 @@ class XHandDexPilotOptimizer(DexPilotOptimizer):
         # Update weight vector
         normal_weight = np.ones(len_proj, dtype=np.float32) * 1
         high_weight = np.array([200] * len_s1 + [400] * len_s2, dtype=np.float32)
-        weight = np.where(self.projected, high_weight, normal_weight)
+        weight: np.ndarray | torch.Tensor = np.where(self.projected, high_weight, normal_weight)
 
         # ── KEY CHANGE: balanced wrist→fingertip weight ──
         # Original: wrist weight = len_proj + n_fingers ≈ 15 (dominates between-finger weight 1)
@@ -272,7 +272,7 @@ class XHandDexPilotOptimizer(DexPilotOptimizer):
 
                 jacobians = np.stack(jacobians, axis=0)
                 huber_distance.backward()
-                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]
+                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]  # type: ignore[union-attr]  # huber_distance.backward() above populates .grad (requires_grad leaf)
 
                 if self.adaptor is not None:
                     jacobians = self.adaptor.backward_jacobian(jacobians)
@@ -304,7 +304,7 @@ class XHandRetargeter:
         self.retargeting_type = retargeting_type
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
-        self.last_debug = {}
+        self.last_debug: dict[str, float | str] = {}
 
         self.sapien_joint_names = [
             "right_hand_thumb_bend_joint",

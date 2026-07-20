@@ -56,7 +56,11 @@ class SimRobotInterface(ConnectionStateMixin):
     def __init__(self, config: SimRobotConfig | None = None):
         super().__init__()
         self.config = config or SimRobotConfig()
-        self.scene = None
+        # Runtime type is sapien.Scene | None; annotated Any because scene is always
+        # set/unset together with self.robot (connect/disconnect), but _step_physics
+        # relies on the caller's robot-None guard, which mypy cannot see. The precise
+        # Optional type would require type:ignore at every unguarded use site.
+        self.scene: Any = None
         self.robot: XArm7XHand | None = None
         self.step_count = 0
 

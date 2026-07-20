@@ -9,9 +9,14 @@ Chain:
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from dexmani_real.utils.array_utils import nan_array
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class HandKinematics:
@@ -26,8 +31,8 @@ class HandKinematics:
         hand_urdf_path: str,
         fingertip_link_names: list[str] | None = None,
     ) -> None:
-        self._model = None
-        self._data = None
+        self._model: Any = None
+        self._data: Any = None
         self._fingertip_link_ids: list[int] = []
         self._fingertip_link_names: list[str] = []
         self._ready = False

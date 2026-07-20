@@ -83,7 +83,9 @@ def vr_frame_to_array(frame: dict) -> np.ndarray:
     arr["sequence_id"] = np.uint64(frame.get("sequence_id") or 0)
     arr["source_frame_seq"] = np.uint64(frame.get("source_frame_seq") or 0)
     arr["local_recv_ns"] = np.uint64(frame.get("local_recv_ns") or 0)
-    arr["side"] = np.int32(frame.get("side") if frame.get("side") is not None else -1)
+    # Runtime value is always int (the conditional None-guards to -1); mypy cannot
+    # correlate the two separate frame.get() calls, so the arg types as Any|int|None.
+    arr["side"] = np.int32(frame.get("side") if frame.get("side") is not None else -1)  # type: ignore[arg-type]
     return arr
 
 
