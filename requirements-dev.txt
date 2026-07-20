@@ -1,0 +1,7 @@
+# Dev toolchain pins — exact versions installed in the real_robot conda env.
+# Prevents formatting-drift like the 2026-07-20 repo-wide reformat (black version
+# drift made 53 files non-compliant). Matches CLAUDE.md black/isort/mypy conventions.
+black==26.5.1
+isort==5.13.2
+mypy==2.3.0
+pytest==9.1.1

@@ -6,7 +6,6 @@ Ref: DexUMI dexumi/real_env/common/motor_trajectory_interpolator.py
 from __future__ import annotations
 
 import numbers
-from typing import Union
 
 import numpy as np
 import scipy.interpolate as si
@@ -157,7 +156,7 @@ class MotorTrajectoryInterpolator:
 
     # ── Interpolation call ──
 
-    def __call__(self, t: Union[numbers.Number, np.ndarray]) -> np.ndarray:
+    def __call__(self, t: float | np.ndarray) -> np.ndarray:
         """Interpolate motor values at time t.
 
         Args:

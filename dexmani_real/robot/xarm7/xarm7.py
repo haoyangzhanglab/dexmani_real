@@ -33,9 +33,7 @@ _FIRMWARE_LIMIT_MARGIN_RAD = np.deg2rad(2.0)
 _SOFT_LIMIT_MARGIN_RAD = np.deg2rad(2.5)
 
 
-def _inset_joint_limits(
-    q_min: np.ndarray, q_max: np.ndarray, margin: float
-) -> tuple[np.ndarray, np.ndarray]:
+def _inset_joint_limits(q_min: np.ndarray, q_max: np.ndarray, margin: float) -> tuple[np.ndarray, np.ndarray]:
     """Inset joint limits by ``margin``, skipping full-rotation (±360°) joints."""
     q_min = q_min.copy()
     q_max = q_max.copy()
@@ -55,15 +53,9 @@ class XArm7Config(FromDictMixin):
     # Comfortable home posture — joint-safe, high manipulability, EEF low near desk.
     # J4=13.5deg (24.5deg above flip boundary), J6=74.7deg (mid-range, 105deg from limit).
     # EEF world pos ~ [0.305, 0.0, 0.176] m (with 30deg Z base rotation).
-    init_qpos: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0])
-    )
-    qpos_min: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([-360, -118, -360, -11, -360, -97, -360])
-    )
-    qpos_max: np.ndarray = field(
-        default_factory=lambda: np.deg2rad([360, 120, 360, 225, 360, 180, 360])
-    )
+    init_qpos: np.ndarray = field(default_factory=lambda: np.deg2rad([-30.0, -1.9, 0.0, 13.5, -180.0, 74.7, 0.0]))
+    qpos_min: np.ndarray = field(default_factory=lambda: np.deg2rad([-360, -118, -360, -11, -360, -97, -360]))
+    qpos_max: np.ndarray = field(default_factory=lambda: np.deg2rad([360, 120, 360, 225, 360, 180, 360]))
     reset_speed: float = np.deg2rad(20)
     reset_acc: float = np.deg2rad(180)
     clip_joint_limit: bool = True
@@ -88,7 +80,7 @@ class XArm7(ConnectionStateMixin):
     def __init__(self, config: XArm7Config):
         super().__init__()
         self.config = config
-        self.arm: XArmAPI | None = None
+        self.arm: Any = None
 
         # Software clip limits — strictly inside the firmware reduced range
         # (see _inset_joint_limits) so clipped commands never violate it.
@@ -208,28 +200,30 @@ class XArm7(ConnectionStateMixin):
         }
 
         if full:
-            state.update({
-                "mode": self.arm.mode,
-                "state": self.arm.state,
-                "connected": self.arm.connected,
-                "error_code": self.arm.error_code,
-                "warn_code": self.arm.warn_code,
-                "cartesian_position": self.get_position(),
-                "cartesian_position_aa": self.get_position_aa(),
-                "cmd_num": self.arm.cmd_num,
-                "servo_codes": getattr(self.arm, "servo_codes", None),
-                "temperatures": self._array7(getattr(self.arm, "temperatures", None)),
-                "currents": self._array7(getattr(self.arm, "currents", None)),
-                "voltages": self._array7(getattr(self.arm, "voltages", None)),
-                "motor_enable_states": self._array7(getattr(self.arm, "motor_enable_states", None)),
-                "motor_brake_states": self._array7(getattr(self.arm, "motor_brake_states", None)),
-                "connected_flag": self.connected_flag,
-                "error_state": self.error_state,
-                "last_error_message": self.last_error_message,
-                "last_action_code": self.last_action_code,
-                "last_sdk_error_code": self.last_sdk_error_code,
-                "last_joint_limit_clipped": self.last_joint_limit_clipped,
-            })
+            state.update(
+                {
+                    "mode": self.arm.mode,
+                    "state": self.arm.state,
+                    "connected": self.arm.connected,
+                    "error_code": self.arm.error_code,
+                    "warn_code": self.arm.warn_code,
+                    "cartesian_position": self.get_position(),
+                    "cartesian_position_aa": self.get_position_aa(),
+                    "cmd_num": self.arm.cmd_num,
+                    "servo_codes": getattr(self.arm, "servo_codes", None),
+                    "temperatures": self._array7(getattr(self.arm, "temperatures", None)),
+                    "currents": self._array7(getattr(self.arm, "currents", None)),
+                    "voltages": self._array7(getattr(self.arm, "voltages", None)),
+                    "motor_enable_states": self._array7(getattr(self.arm, "motor_enable_states", None)),
+                    "motor_brake_states": self._array7(getattr(self.arm, "motor_brake_states", None)),
+                    "connected_flag": self.connected_flag,
+                    "error_state": self.error_state,
+                    "last_error_message": self.last_error_message,
+                    "last_action_code": self.last_action_code,
+                    "last_sdk_error_code": self.last_sdk_error_code,
+                    "last_joint_limit_clipped": self.last_joint_limit_clipped,
+                }
+            )
         return state
 
     def send_action(self, action: np.ndarray) -> bool:
@@ -353,9 +347,7 @@ class XArm7(ConnectionStateMixin):
         if self.arm is None:
             return
 
-        q_min, q_max = _inset_joint_limits(
-            self.config.qpos_min, self.config.qpos_max, _FIRMWARE_LIMIT_MARGIN_RAD
-        )
+        q_min, q_max = _inset_joint_limits(self.config.qpos_min, self.config.qpos_max, _FIRMWARE_LIMIT_MARGIN_RAD)
 
         joint_range = np.column_stack([q_min, q_max]).ravel().tolist()
         self.arm.set_reduced_joint_range(joint_range, is_radian=True)

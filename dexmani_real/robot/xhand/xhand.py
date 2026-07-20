@@ -68,6 +68,7 @@ _RECOVERY_DELAY: dict[int, float] = {
     ERR_BOOT_CMD: 0.5,  # 500 ms — hand needs time to finish boot sequence
 }
 
+
 @dataclass
 class XHandConfig(FromDictMixin):
     comm_type: str = "EtherCAT"
@@ -123,13 +124,13 @@ class XHandConfig(FromDictMixin):
                     10.0,  # thumb_j2:   prevent mechanical clogging (ref: LeFranX)
                     -10.0,
                     0.0,
-                    5.0,   # index_j2:  prevent mechanical clogging (ref: LeFranX)
+                    5.0,  # index_j2:  prevent mechanical clogging (ref: LeFranX)
                     0.0,
-                    5.0,   # middle_j2: prevent mechanical clogging (ref: LeFranX)
+                    5.0,  # middle_j2: prevent mechanical clogging (ref: LeFranX)
                     0.0,
-                    5.0,   # ring_j2:   prevent mechanical clogging (ref: LeFranX)
+                    5.0,  # ring_j2:   prevent mechanical clogging (ref: LeFranX)
                     0.0,
-                    5.0,   # little_j2: prevent mechanical clogging (ref: LeFranX)
+                    5.0,  # little_j2: prevent mechanical clogging (ref: LeFranX)
                 ],
                 dtype=np.float64,
             )
@@ -215,9 +216,9 @@ class XHand(ConnectionStateMixin):
     def __init__(self, config: XHandConfig):
         super().__init__()
         self.config = config
-        self.control = None
+        self.control: Any = None
         self.device_name: str | None = None
-        self.hand_command = None
+        self.hand_command: Any = None
 
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
@@ -579,6 +580,7 @@ class XHand(ConnectionStateMixin):
         waypoints: np.ndarray,
         duration_s: float,
         max_speed: float | None = None,
+        abort_event: Any | None = None,
     ) -> bool:
         """Execute a joint-space trajectory with scipy-based linear interpolation.
 
@@ -594,6 +596,12 @@ class XHand(ConnectionStateMixin):
                        uses MotorTrajectoryInterpolator.drive_to_waypoint which
                        auto-extends duration to respect the speed limit.
                        Default: config.max_qvel.min().
+            abort_event: Optional object with an ``is_set()`` method (e.g.
+                       threading.Event / mp.Event). Checked between steps; when
+                       set, the trajectory aborts at the next step boundary and
+                       returns False — lets the hand control child preempt a
+                       long trajectory on e-stop (plan §4.8). None (default)
+                       preserves the original run-to-completion behavior.
 
         Returns:
             True if all waypoints were reached.
@@ -633,6 +641,10 @@ class XHand(ConnectionStateMixin):
 
         ok = True
         for i in range(n_steps):
+            if abort_event is not None and abort_event.is_set():
+                logger.info("XHand.send_trajectory: aborted at step %d/%d (abort event set).", i, n_steps)
+                ok = False
+                break
             interp_qpos = interp(t_exec[i])
             if not self.send_action(interp_qpos):
                 ok = False
@@ -807,7 +819,7 @@ class XHand(ConnectionStateMixin):
         self.last_joint_limit_clipped = max_deviation > self.config.clip_report_tolerance
         return clipped
 
-    def is_valid_qpos_state(self, state: dict[str, Any]) -> bool:
+    def is_valid_qpos_state(self, state: dict[str, Any]) -> bool | np.bool_:
         qpos = state.get("qpos", None)
         if qpos is None:
             return False
