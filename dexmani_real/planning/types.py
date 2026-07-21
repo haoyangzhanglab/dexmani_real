@@ -223,32 +223,16 @@ class TeleopProfile(FromDictMixin):
     position_ik_fast_accept_rad: float = np.deg2rad(15.0)
 
     use_position_ik: bool = True
-    use_differential_ik_fallback: bool = True
 
-    # ── Iterative DLS (ref: BunnyVisionPro xarm7_ability.py:136-159 compute_ik) ──
-    # Each iteration: FK → Jacobian → DLS solve → integrate.  Early-exits at 50%
-    # of max_pose_error_pos_m/rot_rad or when max_iterations reached.
-    differential_ik_gain: float = 0.05  # step size per iteration (matches BVP v*0.05)
-    differential_ik_damping: float = 0.003162  # λ = √(1e-5), matches BVP λ²=1e-5
-    differential_ik_max_iterations: int = (
-        10  # cap at 10 (normal ops converge ≤5 iters; extra iters near singularity don't help)
-    )
-    differential_ik_convergence_threshold: float = (
-        1e-3  # unused since 2026-07-16 IK speedup — superseded by early-exit at 50% of max_pose_error_pos_m/rot_rad
-    )
-
-    # ── Adaptive damping (disabled by default — aligned with BVP fixed damping) ──
-    adaptive_damping: bool = False
-
-    # Min damping in non-singular regions (near-zero to minimize tracking bias).
-    differential_ik_min_damping: float = 0.001
-
-    # Max damping near singularities (prevents unsafe joint velocities).
-    differential_ik_max_damping: float = 0.05
-
-    # Manipulability threshold below which damping begins to ramp up.
-    # Typical XArm7 values: ~0.01 (far from singularity), ~0.001 (near elbow singularity).
-    manipulability_threshold: float = 0.005
+    # ── Multi-candidate scoring (Phase 2, dexterous manipulation) ──
+    # When the fast-accept path (prev_cmd seed within 15°) doesn't trigger,
+    # multiple seeds are tried and candidates are scored by:
+    #   score = weighted_joint_distance - manipulability_weight * μ + limit_penalty_weight * penalty
+    # Lower score = better.  μ is the Yoshikawa manipulability measure.
+    position_ik_num_random_seeds: int = 3  # extra random seeds around prev_cmd
+    position_ik_seed_offset_deg: float = 5.0  # ±offset per joint for random seeds
+    position_ik_manipulability_weight: float = 0.05  # higher → prefer dexterous configs
+    position_ik_limit_penalty_weight: float = 0.01  # higher → prefer configs farther from limits
 
     # ── Joint-specific IK scoring weights (ref: LeFranX weighted_ik.cpp:62-69) ──
     # Higher weight → solver penalises moving that joint away from its current
