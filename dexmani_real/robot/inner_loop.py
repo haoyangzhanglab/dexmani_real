@@ -52,7 +52,7 @@ class ArmInnerLoopConfig:
                          planner. Default 90°/s (≈1.57 rad/s).
         joint_max_acc: Max joint acceleration (rad/s²). Respected by firmware
                        trajectory planner. Default 500°/s² (≈8.73 rad/s²).
-        loop_period: Inner loop period in seconds. Default 0.04 (25Hz).
+        loop_period: Inner loop period in seconds. Default 1/30 (30Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
         max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad per
                          inner-loop step (~17°, ~15 rad/s ceiling at 50Hz). Mirrors
@@ -71,7 +71,7 @@ class ArmInnerLoopConfig:
     joint_max_speed: float = 1.5708  # 90°/s in rad/s
     joint_max_acc: float = 8.7266  # 500°/s² in rad/s²
     loop_period: float = (
-        0.04  # 25Hz (was 50Hz) — halves GIL contention from SDK socket I/O; Mode 6 firmware handles interpolation between commands
+        1.0 / 30.0  # 30Hz (was 25Hz) — Mode 6 firmware handles interpolation; 30Hz improves tracking fidelity vs 25Hz
     )
     # Shared
     target_timeout_s: float = 0.2

@@ -66,85 +66,14 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import alpha_from_tau, ema_smooth_pose, tau_from_alpha
+from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ Keyboard (pynput, 全局捕获)
 
 
-# ═══════════════════════════════════════════════ 轨迹记录
-class TrajectoryLogger:
-    """Record VR wrist + EEF trajectories per-frame for offline debug.
-
-    Stores per-tick data in append lists, flushes to an .npz file on save().
-    Frame data is recorded regardless of teleop/recording state so the full
-    session motion can be analysed.
-    """
-
-    def __init__(self) -> None:
-        self._records: list[dict[str, object]] = []
-
-    def append(
-        self,
-        t: float,
-        wrist_pos: np.ndarray,
-        wrist_quat_wxyz: np.ndarray,
-        target_pos: np.ndarray,
-        target_quat_wxyz: np.ndarray,
-        actual_eef_pos: np.ndarray,
-        actual_eef_quat_wxyz: np.ndarray,
-        arm_qpos_actual: np.ndarray,
-        ik_ok: bool,
-        *,
-        wrist_delta: np.ndarray | None = None,
-        eef_delta: np.ndarray | None = None,
-        target_pos_before_clamp: np.ndarray | None = None,
-    ) -> None:
-        self._records.append(
-            {
-                "t": float(t),
-                "wrist_pos": np.asarray(wrist_pos, dtype=np.float64).copy(),
-                "wrist_quat_wxyz": np.asarray(wrist_quat_wxyz, dtype=np.float64).copy(),
-                "target_pos": np.asarray(target_pos, dtype=np.float64).copy(),
-                "target_quat_wxyz": np.asarray(target_quat_wxyz, dtype=np.float64).copy(),
-                "actual_eef_pos": np.asarray(actual_eef_pos, dtype=np.float64).copy(),
-                "actual_eef_quat_wxyz": np.asarray(actual_eef_quat_wxyz, dtype=np.float64).copy(),
-                "arm_qpos_actual": np.asarray(arm_qpos_actual, dtype=np.float64).copy(),
-                "ik_ok": bool(ik_ok),
-                "wrist_delta": (
-                    np.asarray(wrist_delta, dtype=np.float64).copy()
-                    if wrist_delta is not None
-                    else np.full(3, np.nan, dtype=np.float64)
-                ),
-                "eef_delta": (
-                    np.asarray(eef_delta, dtype=np.float64).copy()
-                    if eef_delta is not None
-                    else np.full(3, np.nan, dtype=np.float64)
-                ),
-                "target_pos_before_clamp": (
-                    np.asarray(target_pos_before_clamp, dtype=np.float64).copy()
-                    if target_pos_before_clamp is not None
-                    else np.full(3, np.nan, dtype=np.float64)
-                ),
-            }
-        )
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-    def save(self, path: str) -> str:
-        """Stack all records into arrays and write to .npz. Returns path."""
-        if not self._records:
-            raise ValueError("No trajectory data to save")
-
-        data: dict[str, np.ndarray] = {}
-        keys = list(self._records[0].keys())
-        for key in keys:
-            stacked = np.stack([r[key] for r in self._records])  # type: ignore[arg-type]
-            data[key] = stacked
-
-        np.savez_compressed(path, **data)
-        return path
+# ═══════════════════════════════════════════════ TrajectoryLogger 已提取至 dexmani_real.utils.trajectory_logger
 
 
 # ═══════════════════════════════════════════════ 配置
@@ -190,7 +119,7 @@ EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
 ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
 _INNER_CFG = ArmInnerLoopConfig(
     joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
-    loop_period=0.04,  # 25Hz (was 50Hz) — Mode 6 firmware handles interpolation; halves SDK calls + GC pressure
+    loop_period=1.0 / 30.0,  # 30Hz — Mode 6 firmware handles interpolation
 )
 ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
 
@@ -213,7 +142,7 @@ def do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = make_arm_servo(cfg=_INNER_CFG)
+        new_inner = make_arm_servo(cfg=_INNER_CFG, use_arm_isolation=True)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -304,6 +233,7 @@ def main():
             arm=arm_config,
             collision=COLLISION_CONFIG,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
+            use_hand_process_isolation=True,
         ),
         kinematics=planner.kin,
         planner=planner,
@@ -333,8 +263,8 @@ def main():
         vr_receiver.stop()
         return
 
-    # ── 5. ArmInnerLoop (50Hz online trajectory planning) ──
-    arm_inner = make_arm_servo(cfg=_INNER_CFG)
+    # ── 5. ArmInnerLoop (25Hz online trajectory planning, crash-isolated subprocess) ──
+    arm_inner = make_arm_servo(cfg=_INNER_CFG, use_arm_isolation=True)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()
@@ -409,8 +339,9 @@ def main():
     else:
         print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
         camera = None
-    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯
-    # （单相机 rig：cameras.json 唯一条目 camera_0）。
+    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯。
+    # camera_name 按实际连接相机的 serial 解析（而非硬编码 "camera_0"），
+    # 但 serial 由子进程 connect 后才写入 → 在 B 键开始录制时才 resolve。
     calib = None
     if camera is not None:
         try:
@@ -418,9 +349,27 @@ def main():
         except (OSError, ValueError, KeyError):
             print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
 
+    _camera_name_cache: str | None = None
+
     # 相机停帧检测: frame_number 不再变化 >1s → 限频告警 (数据可能冻结)
     cam_last_fn = None
     cam_last_change_t: float | None = None
+
+    def _resolve_camera_name() -> str | None:
+        """serial → cameras.json 条目名，成功后缓存（子进程 connect 后 serial 才可用）."""
+        nonlocal _camera_name_cache
+        if _camera_name_cache is not None or calib is None or camera is None:
+            return _camera_name_cache
+        ser = camera.camera_serial
+        if not ser:
+            print("  ⚠ camera serial 尚不可用 — /meta 本次将缺少外参")
+            return None
+        try:
+            _camera_name_cache = calib.resolve_name_by_serial(ser)
+            print(f"  camera resolved: serial={ser} name={_camera_name_cache}")
+        except KeyError as e:
+            print(f"  ⚠ cameras.json 无 serial={ser} 的条目 — /meta 将缺少外参: {e}")
+        return _camera_name_cache
 
     # ── 9. 等待 VR 首帧 ──
     print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
@@ -490,12 +439,12 @@ def main():
         if recording_active:
             if save:
                 # 迟到相机元数据回填: B 早于相机 connect 时 start_episode 快照为 None,
-                # 相机中途就绪则在 stop 前补齐 (外参 / K / depth_scale)。
+                # 相机中途就绪则在 stop 前补齐 (serial→外参 / K / depth_scale)。
                 if camera is not None and camera.camera_serial:
                     recorder.backfill_camera_meta(
                         depth_scale=camera.depth_scale,
                         calib=calib,
-                        camera_name="camera_0" if calib is not None else None,
+                        camera_name=_resolve_camera_name(),
                         camera_K=camera.camera_K,
                     )
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
@@ -511,7 +460,7 @@ def main():
             else:
                 path = recorder.stop_episode(success=False)
                 gc.collect()  # drain cyclic garbage after discarded recording
-                recorder.join_stop()
+                recorder.join_stop(timeout=60.0)
                 if path:
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
@@ -520,6 +469,8 @@ def main():
                     h5.with_suffix(".json").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
+            # 清空保存/丢弃期间用户狂按积压的按键，避免 H/Q 等信号重复触发
+            kb.poll(timeout=0.0)
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
@@ -734,7 +685,7 @@ def main():
                     if not recorder.start_episode(
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
-                        camera_name="camera_0" if calib is not None else None,
+                        camera_name=_resolve_camera_name(),
                         camera_K=camera.camera_K if camera is not None else None,
                         record_config=camera.pointcloud_meta if camera is not None else None,
                     ):
@@ -1103,7 +1054,11 @@ def main():
             if ControlSignal.HOME in post_sigs:
                 print("\nH: return_home")
                 audio.play("home")
-                arm_inner = do_return_home(robot, planner, arm_inner)
+                try:
+                    arm_inner = do_return_home(robot, planner, arm_inner)
+                except Exception:
+                    traceback.print_exc()
+                    print("  return_home 失败，继续退出")
                 print("按 Q 退出...")
             if ControlSignal.QUIT in post_sigs or ControlSignal.EMERGENCY_STOP in post_sigs:
                 if ControlSignal.EMERGENCY_STOP in post_sigs:

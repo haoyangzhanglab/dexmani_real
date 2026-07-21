@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from dexmani_real.utils.ik_profiler import IKProfiler
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -17,6 +18,11 @@ from .pose_utils import ensure_qpos, pose_error_vector
 from .types import IKResult, Pose, TeleopProfile
 
 logger = get_logger(__name__)
+
+# Opt-in py-spy profiler for DLS timing anomaly diagnosis.
+# Enable with DEXMANI_IK_PROFILE=1.  Triggers when DLS > 5 ms/iter
+# (normal: ~16 μs; production baseline: 0.6–2.8 ms).
+_ik_profiler = IKProfiler(dls_threshold_ms=5.0, cooldown_s=30.0)
 
 
 class TeleopIKSolver:
@@ -168,9 +174,14 @@ class TeleopIKSolver:
     # IK timing diagnostic (throttled ~5s or on threshold exceed)
 
     def _maybe_log_ik_timing(self, dt_diff_s: float, dt_pos_s: float, diff_iters: int) -> None:
-        """Log IK timing diagnostic, throttled to ~once per 5s or on >10ms total."""
+        """Log IK timing diagnostic, throttled to ~once per 5s or on >15ms total.
+
+        The warning threshold (15ms) sits below the diff-IK timeout budget
+        (``_IK_TIMEOUT_S`` = 20ms) so we get a heads-up before the solver
+        actually aborts.
+        """
         dt_total_ms = (dt_diff_s + dt_pos_s) * 1000
-        threshold_exceeded = dt_total_ms > 10.0
+        threshold_exceeded = dt_total_ms > 15.0
 
         if self._ik_timing_log_throttle > 0 and not threshold_exceeded:
             self._ik_timing_log_throttle -= 1
@@ -178,7 +189,7 @@ class TeleopIKSolver:
 
         if threshold_exceeded:
             logger.warning(
-                "IK timing: diff=%.1fms (iters=%d) + pos=%.1fms = total=%.1fms (>10ms budget!)",
+                "IK timing: diff=%.1fms (iters=%d) + pos=%.1fms = total=%.1fms (>15ms, budget=20ms)",
                 dt_diff_s * 1000,
                 diff_iters,
                 dt_pos_s * 1000,
@@ -732,6 +743,8 @@ class TeleopIKSolver:
         # Per-iteration phase breakdown when diff IK is slow (>10ms).
         # Complements the top-level "IK timing" log in _maybe_log_ik_timing
         # by showing where time went inside the iteration loop.
+        # Threshold is intentionally lower than _IK_TIMEOUT_S (20ms) to
+        # capture the per-phase breakdown before the solver hits the budget.
         _t_diff_total = time.perf_counter() - _tik_start
         if _t_diff_total > 0.010:
             n = max(iterations + 1, 1)
@@ -746,5 +759,11 @@ class TeleopIKSolver:
                 _t_diff_total * 1000,
                 _t_fk_acc / n * 1000,
                 _t_dls_acc / n * 1000,
+            )
+            # Trigger background py-spy profiling when DLS/iter is abnormally
+            # slow (opt-in: DEXMANI_IK_PROFILE=1, threshold=3ms/iter).
+            _ik_profiler.maybe_profile(
+                _t_dls_acc / n * 1000,
+                _t_fk_acc / n * 1000,
             )
         return result

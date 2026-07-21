@@ -519,6 +519,7 @@ class ArmSHMFaçade:
         self._rpc_client: RpcClient | None = None
         self._last_good: np.ndarray | None = None  # last range-valid state record
         self._last_warn_monotonic: float = 0.0  # warning throttle (<=1/5s)
+        self._startup_grace_remaining: int = 0  # ticks to suppress no-frame error after restart
 
     # ── Lifecycle ──
 
@@ -533,6 +534,10 @@ class ArmSHMFaçade:
             logger.exception("ArmSHMFaçade: ring creation failed — not starting child")
             return False
         self._proc.start()
+        # Suppress no-frame fabricated error for the first few get_state()
+        # calls — the child may need a few ticks to publish its first state
+        # frame after the inner loop thread starts (plan §11.3).
+        self._startup_grace_remaining = 5
         return True
 
     def stop(self, timeout: float = 3.0) -> None:
@@ -574,6 +579,12 @@ class ArmSHMFaçade:
         if not self.wait_ready(timeout=10.0):
             logger.error("ArmSHMFaçade: child not ready within 10s (arm connection?)")
             return False
+        # Suppress no-frame fabricated error for a few ticks after restart:
+        # wait_ready() only guarantees the child is alive, not that the inner
+        # loop has published its first state frame.  Without this grace period
+        # the teleop loop sees error_state=True and may emergency-stop on a
+        # transient timing race (plan §4.7 / §11.3).
+        self._startup_grace_remaining = 5  # ~312ms at 16Hz — ample for 50Hz poller
         return True
 
     # ── State (freshness gate + range sanity, plan §4.7) ──
@@ -592,8 +603,24 @@ class ArmSHMFaçade:
             return None, -1
         latest = self._state_ring.read_latest()
         if latest is None:
+            if self._startup_grace_remaining > 0:
+                self._startup_grace_remaining -= 1
+                # Startup grace period: child is alive but hasn't published its
+                # first state frame yet.  Return last-good or None instead of
+                # fabricating an error — prevents the teleop loop from seeing a
+                # false error_state=True and potentially emergency-stopping
+                # (plan §11.3).
+                if self._last_good is not None:
+                    return self._last_good.copy(), -1
+                # Fresh instance (e.g. after return_home): no last-good yet,
+                # but we must still suppress the error_state=True that the
+                # adapter would derive from a None return.  Fabricate a safe
+                # empty record so the teleop loop sees error_state=False
+                # while the child publishes its first real frame.
+                return new_frame(ARM_STATE_DTYPE), -1
             self._throttled_warn("ArmSHMFaçade: no arm_state frame yet — fabricated error record")
             return self._fabricate_error_state(), -1
+        self._startup_grace_remaining = 0  # first real frame → end grace period
         data, ts_ns, _seq = latest
         age_ns = max(0, time.monotonic_ns() - ts_ns)
 
