@@ -43,10 +43,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 import numpy as np
 
+from dexmani_real.robot.isolation import arm_isolation_enabled
 from dexmani_real.shm.robot_layouts import (
     ARM_CMD_CLEAR_ERROR,
     ARM_CMD_DTYPE,
@@ -63,10 +64,12 @@ from dexmani_real.shm.robot_layouts import (
 )
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer, is_fresh
 from dexmani_real.shm.robot_rpc import RpcClient, RpcServer
+from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
 if TYPE_CHECKING:
+    from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
     from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 
 logger = get_logger(__name__)
@@ -770,3 +773,177 @@ class ArmSHMFaçade:
         if now - self._last_warn_monotonic >= _WARN_THROTTLE_S:
             self._last_warn_monotonic = now
             logger.warning(msg, *args)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P1 wiring — ArmInnerLoop-compatible surface over the SHM façade
+# ═══════════════════════════════════════════════════════════════════
+
+
+class ArmServo(Protocol):
+    """Structural surface entry points drive the arm servo through (plan §6 P1).
+
+    Satisfied by both the in-process ``ArmInnerLoop`` (today's path) and
+    ``ArmInnerLoopSHMAdapter`` (crash-isolated subprocess path), so an entry
+    point swaps only its construction site (``make_arm_servo``) — the teleop /
+    replay hot loop is byte-identical on both paths.
+    """
+
+    def set_target(self, target: np.ndarray | None) -> None: ...
+    def get_state(self) -> tuple[np.ndarray, bool, float]: ...
+    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def start(self) -> None: ...
+    def stop(self, timeout: float = 3.0) -> None: ...
+    def wait_ready(self, timeout: float = 30.0) -> bool: ...
+    def emergency_stop(self, settle_timeout: float | None = None) -> bool: ...
+
+    @property
+    def is_alive(self) -> bool: ...
+    @property
+    def last_sent_cmd(self) -> np.ndarray: ...
+    @property
+    def mode(self) -> int: ...
+    @property
+    def connected(self) -> bool: ...
+
+
+class ArmInnerLoopSHMAdapter:
+    """Present the ``ArmInnerLoop`` surface over an ``ArmSHMFaçade`` (plan §6 P1).
+
+    Unpacks the façade's policy-shaped ``get_state() -> (record, age_ns)`` into
+    ``ArmInnerLoop``'s ``get_state() -> (qpos, error, ts)`` and
+    ``get_dynamics() -> (qvel, tau, temps)`` shapes that the entry points
+    destructure. ``emergency_stop`` uses the shared estop event (fast path:
+    child issues ``set_state(4)`` on its own live connection within ≤1 tick —
+    plan §4.8/A5), mirroring ``ArmInnerLoop.emergency_stop``.
+    """
+
+    def __init__(self, facade: ArmSHMFaçade, estop_event: Any) -> None:
+        self._facade = facade
+        self._estop_event = estop_event
+
+    # ── Lifecycle (mirror ArmInnerLoop) ──
+
+    def start(self) -> None:
+        self._facade.start()
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self._facade.stop(timeout=timeout)
+
+    def wait_ready(self, timeout: float = 30.0) -> bool:
+        return self._facade.wait_ready(timeout)
+
+    def ensure_running(self) -> bool:
+        return self._facade.ensure_running()
+
+    @property
+    def is_alive(self) -> bool:
+        return self._facade.running
+
+    # ── Command (main → child) ──
+
+    def set_target(self, target: np.ndarray | None) -> None:
+        self._facade.set_target(target)
+
+    def emergency_stop(self, settle_timeout: float | None = None) -> bool:
+        try:
+            self._estop_event.set()
+            return True
+        except Exception:
+            logger.exception("ArmInnerLoopSHMAdapter: estop_event.set failed")
+            return False
+
+    # ── State readback (unpack policy record → ArmInnerLoop shapes) ──
+
+    def get_state(self) -> tuple[np.ndarray, bool, float]:
+        rec, _age_ns = self._facade.get_state()
+        if rec is None:
+            return nan_array(7), True, time.perf_counter()
+        return (
+            np.asarray(rec["qpos"][0], dtype=np.float64).copy(),
+            bool(rec["error_state"][0]),
+            time.perf_counter(),
+        )
+
+    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rec, _age_ns = self._facade.get_state()
+        if rec is None:
+            return nan_array(7), nan_array(7), nan_array(7)
+        return (
+            np.asarray(rec["qvel"][0], dtype=np.float64).copy(),
+            np.asarray(rec["tau"][0], dtype=np.float64).copy(),
+            np.asarray(rec["temps"][0], dtype=np.float64).copy(),
+        )
+
+    @property
+    def last_sent_cmd(self) -> np.ndarray:
+        rec, _ = self._facade.get_state()
+        if rec is None:
+            return np.zeros(7, dtype=np.float64)
+        return np.asarray(rec["last_sent"][0], dtype=np.float64).copy()
+
+    @property
+    def mode(self) -> int:
+        rec, _ = self._facade.get_state()
+        return int(rec["mode"][0]) if rec is not None else 0
+
+    @property
+    def connected(self) -> bool:
+        rec, _ = self._facade.get_state()
+        return bool(rec["connected"][0]) if rec is not None else False
+
+
+def make_arm_servo(
+    cfg: ArmInnerLoopConfig,
+    ip: str | None = None,
+    *,
+    use_arm_isolation: bool = False,
+    arm_joint_bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    process_config: ArmProcessConfig | None = None,
+    inner_factory: Callable[[ArmProcessConfig], Any] | None = None,
+) -> ArmServo:
+    """Build the arm servo: in-process ``ArmInnerLoop`` or isolated subprocess.
+
+    Behind the arm transition flag (``use_arm_isolation`` or env
+    ``DEXMANI_PROCESS_ISOLATION=1`` / ``DEXMANI_ARM_PROCESS_ISOLATION=1``)
+    returns an ``ArmInnerLoopSHMAdapter`` over an ``ArmSHMFaçade`` (arm inner
+    loop runs in a fork child owning the sole XArmAPI connection); otherwise
+    the proven in-process ``ArmInnerLoop``. Both satisfy ``ArmServo``, so
+    callers swap only this construction site.
+
+    Args:
+        cfg: Inner-loop config (forwarded to the child's ArmInnerLoop).
+        ip: Arm IP; ``None`` → ArmInnerLoop/XArm7Config default.
+        use_arm_isolation: Config half of the arm transition flag (env overrides).
+        arm_joint_bounds: (qpos_min_soft, qpos_max_soft) for the façade's
+            range-sanity gate; ``None`` → wide ±4π torn-read window.
+        process_config: Full override for the subprocess config; when ``None``
+            one is built from ``cfg``/``ip`` via ``inner_kwargs``.
+        inner_factory: Test injection for the child's inner loop (no hardware).
+    """
+    if not arm_isolation_enabled(use_arm_isolation):
+        from dexmani_real.robot.inner_loop import ArmInnerLoop
+
+        if ip is not None:
+            return ArmInnerLoop(cfg=cfg, ip=ip)
+        return ArmInnerLoop(cfg=cfg)
+
+    if process_config is None:
+        inner_kwargs: dict[str, Any] = {"cfg": cfg}
+        if ip is not None:
+            inner_kwargs["ip"] = ip
+        # Propagate the inner loop's target timeout to the child's target-ring
+        # freshness gate — a SECOND independent gate that would otherwise silently
+        # override it at the 0.2 s default (slow replays <~5 Hz would then have
+        # every arm target dropped as stale and freeze on the subprocess path).
+        target_timeout_s = max(float(getattr(cfg, "target_timeout_s", 0.2)), 0.2)
+        process_config = ArmProcessConfig(target_timeout_s=target_timeout_s, inner_kwargs=inner_kwargs)
+    estop_event = mp.get_context("fork").Event()
+    facade = ArmSHMFaçade(
+        process_config,
+        sync=None,
+        estop_event=estop_event,
+        inner_factory=inner_factory,
+        arm_joint_bounds=arm_joint_bounds,
+    )
+    return ArmInnerLoopSHMAdapter(facade, estop_event)

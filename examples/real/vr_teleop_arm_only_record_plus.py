@@ -51,7 +51,8 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
+from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.validate import validate_action
@@ -200,8 +201,8 @@ ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命�
 def do_return_home(
     robot: RobotInterface,
     planner: XArm7MotionPlanner,
-    arm_inner: ArmInnerLoop,
-) -> ArmInnerLoop:
+    arm_inner: ArmServo,
+) -> ArmServo:
     """归位: 停止内环 → 规划+执行 → 重启内环."""
     print("return_home ...", flush=True)
     try:
@@ -212,7 +213,7 @@ def do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = ArmInnerLoop(cfg=_INNER_CFG)
+        new_inner = make_arm_servo(cfg=_INNER_CFG)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -228,8 +229,14 @@ def do_return_home(
 # ═══════════════════════════════════════════════ 主循环
 
 
-def record_held_frame(recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool) -> None:
-    """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags (防止回填伪造 ik_ok/held)."""
+def record_held_frame(
+    recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool, arm_qpos_sent: np.ndarray | None = None
+) -> None:
+    """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags (防止回填伪造 ik_ok/held).
+
+    arm_qpos_sent: 上一帧实发值 (arm_inner.last_sent_cmd) — held 帧不发送新目标,
+    但记录侧应反映"上一帧实发值"而非零, 否则 --source=sent replay 会发送错误指令。
+    """
     if vr_frame is None:  # VR 过期/丢失 — NaN 位姿如实标记无数据
         vr_frame = {
             "wrist_pos": np.full(3, np.nan),
@@ -239,7 +246,12 @@ def record_held_frame(recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool) 
     hand = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
     action = RobotAction(arm_qpos_cmd=hold_arm, hand_qpos_cmd=hand)
     recorder.add_frame(
-        state, action, vr_frame, camera_frame=cam, signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True}
+        state,
+        action,
+        vr_frame,
+        camera_frame=cam,
+        arm_qpos_sent=arm_qpos_sent,
+        signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True},
     )
 
 
@@ -322,7 +334,7 @@ def main():
         return
 
     # ── 5. ArmInnerLoop (50Hz online trajectory planning) ──
-    arm_inner = ArmInnerLoop(cfg=_INNER_CFG)
+    arm_inner = make_arm_servo(cfg=_INNER_CFG)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()
@@ -368,6 +380,7 @@ def main():
         max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
+        arm_sent_stream=True,  # schema v9: 记录实发的 arm 指令 (plan §6 P1)
     )
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
@@ -913,7 +926,15 @@ def main():
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None  # 重置笛卡尔 EMA, 恢复时无跳变
                 if recording_active:
-                    record_held_frame(recorder, state, prev_qpos_cmd.copy(), vr_frame, cam, ik_ok=True)
+                    record_held_frame(
+                        recorder,
+                        state,
+                        prev_qpos_cmd.copy(),
+                        vr_frame,
+                        cam,
+                        ik_ok=True,
+                        arm_qpos_sent=arm_inner.last_sent_cmd,
+                    )
                 continue
 
             # ── VR wrist → EEF target pose ──
@@ -922,7 +943,9 @@ def main():
                 ik_method = "no_map"
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                    record_held_frame(recorder, state, hold_arm, vr_frame, cam, ik_ok=True)
+                    record_held_frame(
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True, arm_qpos_sent=arm_inner.last_sent_cmd
+                    )
                 continue
 
             target_pos = mapped["pos"]
@@ -979,7 +1002,9 @@ def main():
                 ik_method = "fail"
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                    record_held_frame(recorder, state, hold_arm, vr_frame, cam, ik_ok=False)
+                    record_held_frame(
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=False, arm_qpos_sent=arm_inner.last_sent_cmd
+                    )
                 continue
 
             ik_method = "ok"
@@ -1016,7 +1041,9 @@ def main():
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                    record_held_frame(recorder, state, hold_arm, vr_frame, cam, ik_ok=True)
+                    record_held_frame(
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True, arm_qpos_sent=arm_inner.last_sent_cmd
+                    )
                 continue
 
             prev_qpos_cmd = arm_cmd.copy()  # only after gate passes (held frames use last-good command)
@@ -1029,7 +1056,9 @@ def main():
             # ── 录制帧 ──
             if recording_active:
                 sig = {"ik_ok": ik_result.success and ik_result.qpos is not None, "retarget_ok": True, "held": False}
-                ok = recorder.add_frame(state, action, vr_frame, camera_frame=cam, signals=sig)
+                ok = recorder.add_frame(
+                    state, action, vr_frame, camera_frame=cam, signals=sig, arm_qpos_sent=arm_inner.last_sent_cmd
+                )
                 if not ok and recorder.max_frames_reached:
                     print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")
                     audio.play("save")
@@ -1077,6 +1106,9 @@ def main():
                 arm_inner = do_return_home(robot, planner, arm_inner)
                 print("按 Q 退出...")
             if ControlSignal.QUIT in post_sigs or ControlSignal.EMERGENCY_STOP in post_sigs:
+                if ControlSignal.EMERGENCY_STOP in post_sigs:
+                    arm_inner.emergency_stop()
+                    robot.emergency_stop()
                 break
 
         kb.stop()

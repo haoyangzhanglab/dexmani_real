@@ -46,7 +46,8 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
+from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.types import RobotState
@@ -104,12 +105,16 @@ class TrajectoryData:
         return self.action_hand_joint is not None
 
 
-def load_trajectory(h5_path: str, max_frames: int | None = None) -> TrajectoryData:
+def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "cmd") -> TrajectoryData:
     """Load and validate an HDF5 episode for replay.
 
     Args:
         h5_path: Path to the HDF5 episode file.
         max_frames: Truncate to first N frames (None = all).
+        source: Which arm action stream to replay: "cmd" (default) reads
+            ``/action_arm_joint`` (policy output); "sent" reads
+            ``/action_arm_joint_sent`` (schema v9, the delta-clamped value
+            actually sent). Falls back to cmd with a warning if sent is absent.
 
     Returns:
         TrajectoryData with all arrays preloaded.
@@ -139,13 +144,20 @@ def load_trajectory(h5_path: str, max_frames: int | None = None) -> TrajectoryDa
             fps = 50.0
         task_label = meta.attrs.get("task_label", "") if meta else ""
 
+        # ── Source: which arm action stream to replay ──
+        arm_action_key = "action_arm_joint_sent" if source == "sent" else "action_arm_joint"
+        if arm_action_key not in f:
+            if source == "sent":
+                logger.warning("/action_arm_joint_sent not found (pre-v9 HDF5) — falling back to /action_arm_joint")
+                arm_action_key = "action_arm_joint"
+
         # ── Required datasets ──
-        for key in ["action_arm_joint", "arm_qpos"]:
+        for key in [arm_action_key, "arm_qpos"]:
             if key not in f:
                 raise ValueError(f"HDF5 missing required dataset: /{key}")
 
-        # ── Determine frame count ──
-        T_raw = f["action_arm_joint"].shape[0]
+        # ── Determine frame count from the source dataset ──
+        T_raw = f[arm_action_key].shape[0]
         if num_frames_orig == 0:
             num_frames_orig = T_raw
         T = min(T_raw, num_frames_orig)
@@ -153,7 +165,7 @@ def load_trajectory(h5_path: str, max_frames: int | None = None) -> TrajectoryDa
             T = min(T, max_frames)
 
         # ── Load command trajectory ──
-        action_arm_joint = np.asarray(f["action_arm_joint"][:T], dtype=np.float64)
+        action_arm_joint = np.asarray(f[arm_action_key][:T], dtype=np.float64)
         action_hand_joint = None
         if "action_hand_joint" in f:
             action_hand_joint = np.asarray(f["action_hand_joint"][:T], dtype=np.float64)
@@ -523,7 +535,9 @@ def _make_planner(arm_ip: str) -> XArm7MotionPlanner:
     )
 
 
-def _make_robot(planner: XArm7MotionPlanner, arm_ip: str) -> RobotInterface:
+def _make_robot(
+    planner: XArm7MotionPlanner, arm_ip: str, *, use_hand_process_isolation: bool = False
+) -> RobotInterface:
     """Create and return RobotInterface (not connected)."""
     arm_cfg = XArm7Config(ip=arm_ip)
     return RobotInterface(
@@ -531,6 +545,7 @@ def _make_robot(planner: XArm7MotionPlanner, arm_ip: str) -> RobotInterface:
             arm=arm_cfg,
             collision=COLLISION_CONFIG,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
+            use_hand_process_isolation=use_hand_process_isolation,
         ),
         kinematics=planner.kin,
         planner=planner,
@@ -540,10 +555,20 @@ def _make_robot(planner: XArm7MotionPlanner, arm_ip: str) -> RobotInterface:
 def _do_return_home(
     robot: RobotInterface,
     planner: XArm7MotionPlanner,
-    arm_inner: ArmInnerLoop,
+    arm_inner: ArmServo,
     arm_ip: str = "192.168.1.111",
-) -> ArmInnerLoop:
-    """Return arm to home position: stop inner loop → plan+execute → restart."""
+    *,
+    inner_cfg: ArmInnerLoopConfig = _INNER_CFG,
+    use_arm_isolation: bool = False,
+) -> ArmServo:
+    """Return arm to home position: stop inner loop → plan+execute → restart.
+
+    Args:
+        inner_cfg: Per-run inner-loop config (e.g. with extended target_timeout_s
+                   for slow replays). Defaults to the module-level _INNER_CFG but
+                   the caller MUST pass the replayer's per-run cfg to avoid
+                   timeout loss (plan §6 P1 slow-replay risk).
+    """
     print("return_home ...", flush=True)
     try:
         arm_inner.set_target(None)
@@ -553,7 +578,7 @@ def _do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = ArmInnerLoop(cfg=_INNER_CFG, ip=arm_ip)
+        new_inner = make_arm_servo(cfg=inner_cfg, ip=arm_ip, use_arm_isolation=use_arm_isolation)
         new_inner.start()
         print("  Arm inner loop restarted")
         return new_inner
@@ -593,7 +618,7 @@ class TrajectoryReplayer:
 
         self.planner: XArm7MotionPlanner | None = None
         self.robot: RobotInterface | None = None
-        self._arm_inner: ArmInnerLoop | None = None
+        self._arm_inner: ArmServo | None = None
         self._recorder: ReplayRecorder | None = None
         self._running = False
 
@@ -637,7 +662,7 @@ class TrajectoryReplayer:
             raise RuntimeError("Pre-flight check failed")
 
         # ArmInnerLoop
-        self._arm_inner = ArmInnerLoop(cfg=self._inner_cfg, ip=self.arm_ip)
+        self._arm_inner = make_arm_servo(cfg=self._inner_cfg, ip=self.arm_ip)
         self._arm_inner.start()
         print("Arm inner loop starting...", flush=True)
 
@@ -932,6 +957,7 @@ class TrajectoryReplayer:
         """Stop inner loop + emergency stop robot."""
         self._running = False
         if self._arm_inner is not None and self._arm_inner.is_alive:
+            self._arm_inner.emergency_stop()  # plan §8 A5: hard-stop child within ≤1 tick
             self._arm_inner.set_target(None)
             self._arm_inner.stop()
         if self.robot is not None:
@@ -1020,6 +1046,13 @@ Examples:
         default="192.168.1.111",
         help="XArm controller IP address.",
     )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="cmd",
+        choices=["cmd", "sent"],
+        help="Which arm action stream to replay: cmd (action_arm_joint, default) or sent (action_arm_joint_sent, schema v9+).",
+    )
     args = parser.parse_args()
 
     # ── Validate args ──
@@ -1031,7 +1064,7 @@ Examples:
 
     # ── Load trajectory ──
     try:
-        traj = load_trajectory(args.h5, max_frames=args.max_frames)
+        traj = load_trajectory(args.h5, max_frames=args.max_frames, source=args.source)
     except (FileNotFoundError, ValueError, OSError) as e:
         print(f"Error loading HDF5: {e}")
         sys.exit(1)
@@ -1149,7 +1182,9 @@ Examples:
                             p = _make_planner(args.arm_ip)
                             r = _make_robot(p, args.arm_ip)
                             if r.connect().get("arm"):
-                                new_inner = _do_return_home(r, p, replayer._arm_inner, arm_ip=args.arm_ip)
+                                new_inner = _do_return_home(
+                                    r, p, replayer._arm_inner, arm_ip=args.arm_ip, inner_cfg=replayer._inner_cfg
+                                )
                                 replayer._arm_inner = new_inner
                             r.disconnect()
                         except Exception as exc:

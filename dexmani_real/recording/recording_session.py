@@ -54,8 +54,14 @@ class RecordingSession:
     # ── Public API (called by any driver) ──
 
     def start(self, meta: dict[str, Any]) -> None:
-        """Begin a new episode; ``meta`` is forwarded as start_episode(**meta)."""
-        self._queue.put((_START, meta))
+        """Begin a new episode; blocks until the writer thread opens the HDF5 file.
+
+        ``meta`` is forwarded as start_episode(**meta).
+        """
+        done = threading.Event()
+        self._queue.put((_START, (meta, done)))
+        if not done.wait(timeout=5.0):
+            raise RuntimeError("RecordingSession start timed out")
 
     def record(self, bundle: dict[str, Any]) -> None:
         """Enqueue one frame bundle (forwarded as record_frame(**bundle))."""
@@ -92,7 +98,13 @@ class RecordingSession:
                 break
             try:
                 if kind == _START:
-                    self._loop.start_episode(**payload)
+                    meta, done = payload
+                    try:
+                        self._loop.start_episode(**meta)
+                    except Exception:
+                        logger.exception("RecordingSession start failed")
+                    finally:
+                        done.set()
                 elif kind == _FRAME:
                     self._loop.record_frame(**payload)
                 elif kind == _STOP:

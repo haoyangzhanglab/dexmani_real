@@ -182,10 +182,6 @@ class TeleopController:
 
         # State
         self.state = ControllerState.IDLE
-        self.recording = False
-        # Latch: recorder observed active since the last BEGIN — distinguishes
-        # a writer-side auto-stop (max_frames) from the START-enqueue window.
-        self._recorder_seen_active = False
         self.running = False
         self._last_arm_cmd: np.ndarray | None = None
         self._last_hand_cmd: np.ndarray | None = None
@@ -262,16 +258,12 @@ class TeleopController:
         if self.state == ControllerState.EMERGENCY_STOP:
             return
 
-        # Writer-side auto-stop (max_frames) leaves self.recording stale —
-        # sync before the PAUSED branch so held ticks stop enqueuing too.
-        self._sync_recording_flag()
-
         tick_start = time.perf_counter()
         self.frame_count += 1
 
         # PAUSED: send None-sentinel → inner loop holds position.
-        # Record held frames while paused (self.recording stays True) so
-        # the grid isn't back-filled with resume-frame data on un-pause.
+        # Record held frames while paused so the grid isn't back-filled with
+        # resume-frame data on un-pause.
         if self.state == ControllerState.PAUSED:
             if not self.dry_run and self._arm_inner is not None:
                 self._arm_inner.set_target(None)
@@ -411,7 +403,7 @@ class TeleopController:
                 self._sync.robot_ready.clear()
 
         # ── 7. Record the executed frame (after validation → records what was sent) ──
-        if self.recording and self._recorder_session is not None:
+        if self.is_recording and self._recorder_session is not None:
             held = (not status.get("ik_ok")) or (not status.get("retarget_ok")) or validate_failed or (not hand_ok)
             self._recorder_session.record(
                 dict(
@@ -514,7 +506,7 @@ class TeleopController:
 
         # Q = quit without saving
         if signal == ControlSignal.QUIT:
-            if self.recording:
+            if self.is_recording:
                 self._stop_recording(save=False)
             self.running = False
             logger.info("=== QUIT ===")
@@ -528,7 +520,6 @@ class TeleopController:
                 self._reset_mapper()
                 self._start_recording()
                 self.state = ControllerState.TELEOP
-                self.recording = True
                 logger.info("=== STATE: IDLE → TELEOP ===")
                 self._print_available_keys()
             return
@@ -660,7 +651,6 @@ class TeleopController:
     def _start_recording(self) -> None:
         gc.collect()  # drain cyclic garbage before a new episode (GC disabled during teleop)
         logger.info("Starting episode recording...")
-        self._recorder_seen_active = False  # re-arm the auto-stop latch for this episode
         if not self._reset_mapper():
             logger.error("Cannot start recording without VR frame.")
             return
@@ -686,32 +676,12 @@ class TeleopController:
 
     def _stop_recording(self, save: bool = True) -> None:
         logger.info("Stopping episode. frames=%s save=%s", self.frame_count, save)
-        if self._recorder_session is not None and self.recording:
+        if self._recorder_session is not None and self.is_recording:
             path = self._recorder_session.stop(save=save)
             if save and path:
                 logger.info("  Saved to %s", path)
-        self.recording = False
         gc.collect()  # drain cyclic garbage after episode (GC disabled during teleop)
         logger.info("Episode stopped.")
-
-    def _sync_recording_flag(self) -> None:
-        """Detect writer-side auto-stop (max_frames) and reset the stale REC flag.
-
-        CollectionLoop.record_frame auto-stops inside the RecordingSession
-        writer thread, so self.recording would stay True forever: REC keeps
-        displaying and every later tick enqueues frames the recorder rejects.
-        """
-        if not self.recording or self._collection_loop is None:
-            return
-        if self._collection_loop.is_recording:
-            self._recorder_seen_active = True
-        elif self._recorder_seen_active:
-            self.recording = False
-            self._recorder_seen_active = False
-            logger.warning(
-                "Recording auto-stopped at max_frames — saved: %s ; press B for a new episode",
-                self._collection_loop.get_episode_summary()["last_path"],
-            )
 
     # ── VR ──
 
@@ -783,7 +753,7 @@ class TeleopController:
         success frame, forging flag_ik_ok=True / flag_held=False for frames
         that are actually held.
         """
-        if not self.recording or self._recorder_session is None:
+        if not self.is_recording or self._recorder_session is None:
             return
         if self.dry_run or self._arm_inner is None:
             return
@@ -843,6 +813,11 @@ class TeleopController:
         if hint:
             logger.info("  Keys: %s", hint)
 
+    @property
+    def is_recording(self) -> bool:
+        """Single source of truth — delegates to the writer thread's recording flag."""
+        return self._collection_loop is not None and self._collection_loop.is_recording
+
     # ── EEF ──
 
     def _compute_T_base_eef(self, state: RobotState) -> np.ndarray | None:
@@ -876,7 +851,7 @@ class TeleopController:
     def _print_status(self, vr_frame: dict | None, now: float) -> None:
         age_s = self._frame_age(vr_frame) if vr_frame is not None else float("inf")
         seq = vr_frame.get("sequence_id", "?") if vr_frame else "?"
-        rec = "REC" if self.recording else "   "
+        rec = "REC" if self.is_recording else "   "
         # Posture quality metrics (null-space health indicators)
         jl_pct, mu = 0.0, 0.0
         if self._last_arm_cmd is not None and hasattr(self.planner, "kin"):
@@ -916,9 +891,8 @@ class TeleopController:
         logger.info("Shutting down...")
         # Finalize any in-progress episode, then stop the recording thread.
         if self._recorder_session is not None:
-            if self.recording:
+            if self.is_recording:
                 self._recorder_session.stop(save=False)
-                self.recording = False
             self._recorder_session.shutdown()
 
         # Stop VR shared memory access (consumer-side only — no cleanup needed)

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
@@ -20,14 +20,16 @@ from dexmani_real.planning.kinematics import XArm7Kinematics
 from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
 from dexmani_real.planning.types import Pose
 from dexmani_real.robot.hand_kinematics import HandKinematics
+from dexmani_real.robot.hand_process import make_hand_servo
 from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.xarm7 import XArm7
-from dexmani_real.robot.xhand import XHand
+from dexmani_real.robot.xhand import XHand, XHandConfig
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
+    from dexmani_real.robot.hand_process import HandSHMAdapter
 
 logger = get_logger(__name__)
 
@@ -49,6 +51,7 @@ class RobotInterface:
         kinematics: XArm7Kinematics,
         *,
         planner: XArm7MotionPlanner | None = None,
+        hand_factory: Callable[[XHandConfig], Any] | None = None,
     ) -> None:
         self.config = config
         self.kinematics = kinematics
@@ -56,7 +59,15 @@ class RobotInterface:
         self.workspace = WorkspaceSafety(config.workspace_bounds)
 
         self.arm = XArm7(config.arm)
-        self.hand = XHand(config.hand)
+        # Hand: in-process XHand (today) or crash-isolated HandSHMAdapter
+        # subprocess when the hand transition flag is on (plan §6 P1). Both
+        # satisfy the XHand duck-type this class + validate_action use, so no
+        # hand call site changes. hand_factory: test seam (no hardware).
+        self.hand: XHand | HandSHMAdapter = make_hand_servo(
+            config.hand,
+            use_hand_isolation=config.use_hand_process_isolation,
+            hand_factory=hand_factory,
+        )
 
         # Validate home EEF is within workspace
         home_pose = self.kinematics.compute_eef_pose_world(self.arm.config.init_qpos)

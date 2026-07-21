@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
+from dexmani_real.robot.isolation import hand_isolation_enabled
 from dexmani_real.shm.robot_layouts import (
     HAND_CMD_DTYPE,
     HAND_MACRO_CLEAR_ERROR,
@@ -95,11 +96,11 @@ from dexmani_real.shm.robot_layouts import (
 )
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer, is_fresh
 from dexmani_real.shm.robot_rpc import RpcClient
-from dexmani_real.utils.array_utils import safe_resize
+from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.robot.xhand.xhand import XHandConfig
+    from dexmani_real.robot.xhand.xhand import XHand, XHandConfig
 
 logger = get_logger(__name__)
 
@@ -1009,3 +1010,214 @@ def _hand_child_main(
             except (BufferError, OSError):
                 pass
         logger.info("hand child exited (prefix=%s).", prefix)
+
+
+# ----------------------------------------------------------------------
+# P1/P2 wiring — XHand-compatible surface over the SHM façade
+# ----------------------------------------------------------------------
+
+
+class HandSHMAdapter:
+    """Present the ``XHand`` duck-type over a ``HandSHMFaçade`` (plan §6 P1/P2).
+
+    Lets ``RobotInterface`` swap in-process ``XHand`` for the crash-isolated
+    hand subprocess without changing any hand call site: it exposes the exact
+    surface ``RobotInterface`` + ``validate_action`` touch —
+    ``connect/disconnect/is_connected/is_error/clear_error/stop(detorque)/
+    reset(no-arg)/get_state(dict)/send_action(->bool)`` plus the
+    ``connected_flag`` / ``error_state`` / ``last_qpos_cmd`` / ``config``
+    attributes ``validate_action`` reads directly.
+
+    Command-side E2 EMA / E3 delta clip live in the façade (main process); the
+    child XHand is built stateless (``ema_alpha=0``, ``max_delta_rad=0``) and
+    echoes what it actually sent. ``fingertip_pos`` is NOT carried by the SHM
+    hand state — it stays main-side FK in ``RobotInterface`` (needs arm EEF pose).
+
+    Semantics preserved vs ``XHand``:
+      * ``stop()`` is the deliberate detorque (mirrors ``XHand.stop`` —
+        de-energize + set ``error_state=True`` so ``is_connected()`` goes False
+        until ``clear_error``); lifecycle shutdown is ``disconnect()`` (hold,
+        never detorque).
+      * ``get_state()`` returns the XHand dict shape (``qpos`` required key,
+        ``tactile_force_sum`` / ``tactile_force`` optional); a stale/missing SHM
+        record yields NaN qpos + zero tactile, matching XHand's read-error
+        contract that ``RobotInterface.get_state`` wraps in try/except.
+    """
+
+    def __init__(self, facade: HandSHMFaçade, hand_config: XHandConfig, estop_event: Any) -> None:
+        self._facade = facade
+        self.config = hand_config  # validate_action reads config.qpos_min / qpos_max
+        self._estop_event = estop_event
+        self.last_qpos_cmd: np.ndarray | None = None
+        # Live status attributes read directly by validate_action — refreshed
+        # from the SHM record on every status query / get_state / send_action.
+        self.connected_flag: bool = False
+        self.error_state: bool = False
+
+    # ── internal ──
+
+    def _refresh_status(self, rec: np.ndarray | None) -> None:
+        if rec is None:
+            self.connected_flag = False
+            self.error_state = True
+            return
+        self.connected_flag = bool(rec["connected"][0])
+        self.error_state = bool(rec["error_state"][0])
+        self.last_qpos_cmd = np.asarray(rec["last_qpos_cmd"][0], dtype=np.float64).copy()
+
+    # ── Lifecycle ──
+
+    def connect(self) -> bool:
+        try:
+            self._estop_event.clear()  # fresh session — drop any prior detorque latch
+            if not self._facade.start():
+                return False
+            ready = self._facade.wait_ready()
+            rec, _age = self._facade.get_state()
+            self._refresh_status(rec)
+            return bool(ready)
+        except Exception as e:
+            logger.warning("HandSHMAdapter.connect exception: %s", e)
+            return False
+
+    def disconnect(self) -> None:
+        try:
+            self._facade.stop()  # lifecycle hold; never detorques (plan §5.2)
+        except Exception as e:
+            logger.warning("HandSHMAdapter.disconnect exception: %s", e)
+
+    def is_connected(self) -> bool:
+        rec, _age = self._facade.get_state()
+        self._refresh_status(rec)
+        return self.connected_flag and not self.error_state
+
+    def is_error(self) -> bool:
+        rec, _age = self._facade.get_state()
+        self._refresh_status(rec)
+        return (not self.connected_flag) or self.error_state
+
+    def clear_error(self) -> bool:
+        try:
+            # Release the detorque latch FIRST — otherwise the child re-detorques
+            # within ≤1 tick and undoes the clear (R1: stop()->clear_error()->resume).
+            self._estop_event.clear()
+            res = self._facade.clear_error()
+            ok = bool(res["ok"][0])
+        except Exception as e:
+            logger.warning("HandSHMAdapter.clear_error exception: %s", e)
+            return False
+        rec, _age = self._facade.get_state()
+        self._refresh_status(rec)
+        return ok
+
+    def stop(self) -> bool:
+        """Deliberate detorque — mirrors ``XHand.stop()`` (de-energize + set
+        ``error_state=True``). Sets the shared estop event: the child calls
+        ``hand.stop()`` exactly once within ≤1 tick (plan §4.8).
+        """
+        try:
+            self._estop_event.set()
+            self.error_state = True
+            self.connected_flag = False
+            return True
+        except Exception as e:
+            logger.warning("HandSHMAdapter.stop exception: %s", e)
+            return False
+
+    def reset(self, qpos: np.ndarray | None = None) -> bool:
+        target = (
+            np.asarray(qpos, dtype=np.float64)
+            if qpos is not None
+            else np.asarray(self.config.home_qpos, dtype=np.float64)
+        )
+        try:
+            res = self._facade.reset(target)
+            ok = bool(res["ok"][0])
+        except Exception as e:
+            logger.warning("HandSHMAdapter.reset exception: %s", e)
+            return False
+        rec, _age = self._facade.get_state()
+        self._refresh_status(rec)
+        return ok
+
+    # ── State (XHand dict shape) ──
+
+    def get_state(self, full: bool = False, force_update: bool | None = None) -> dict:
+        rec, _age = self._facade.get_state()
+        self._refresh_status(rec)
+        if rec is None or not np.all(np.isfinite(np.asarray(rec["qpos"][0], dtype=np.float64))):
+            # Match XHand's read-error contract: NaN qpos, zero tactile.
+            return {
+                "qpos": nan_array(12),
+                "current": np.zeros(12, dtype=np.float64),
+                "timestamp": time.time(),
+                "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
+                "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
+                "tactile_contact": np.zeros(5, dtype=bool),
+            }
+        return {
+            "qpos": np.asarray(rec["qpos"][0], dtype=np.float64).copy(),
+            "current": np.zeros(12, dtype=np.float64),
+            "timestamp": time.time(),
+            "tactile_force": np.asarray(rec["tactile_force"][0], dtype=np.float64).copy(),
+            # SHM field is tactile_sum; XHand dict key is tactile_force_sum.
+            "tactile_force_sum": np.asarray(rec["tactile_sum"][0], dtype=np.float64).copy(),
+            "tactile_contact": np.zeros(5, dtype=bool),  # not carried by SHM; derive main-side if needed
+        }
+
+    # ── Command (main → child) ──
+
+    def send_action(self, action: np.ndarray) -> bool:
+        try:
+            ok, expected_cmd = self._facade.send_action(action)
+        except Exception as e:
+            logger.warning("HandSHMAdapter.send_action exception: %s", e)
+            return False
+        if ok:
+            self.last_qpos_cmd = np.asarray(expected_cmd, dtype=np.float64).copy()
+        rec, _age = self._facade.get_state()
+        self._refresh_status(rec)
+        return bool(ok)
+
+
+def make_hand_servo(
+    hand_config: XHandConfig,
+    *,
+    use_hand_isolation: bool = False,
+    process_config: HandProcessConfig | None = None,
+    hand_factory: Callable[[XHandConfig], Any] | None = None,
+) -> XHand | HandSHMAdapter:
+    """Build the hand servo: in-process ``XHand`` or isolated subprocess.
+
+    Behind the hand transition flag (``use_hand_isolation`` or env
+    ``DEXMANI_PROCESS_ISOLATION=1`` / ``DEXMANI_HAND_PROCESS_ISOLATION=1``)
+    returns a ``HandSHMAdapter`` over a ``HandSHMFaçade`` (XHand runs in a fork
+    child owning the sole hand SDK connection); otherwise the proven in-process
+    ``XHand``. Both satisfy the XHand duck-type ``RobotInterface`` uses
+    (connect/disconnect/is_connected/is_error/clear_error/stop/reset/get_state/
+    send_action/last_qpos_cmd/config), so ``RobotInterface`` swaps only its
+    ``__init__`` construction site.
+
+    Args:
+        hand_config: XHand config (forwarded to the child's XHand).
+        use_hand_isolation: Config half of the hand transition flag (env overrides).
+        process_config: Full override for the subprocess config; when ``None``
+            one is built with ``HandProcessConfig`` defaults (``dexmani_hand`` prefix).
+        hand_factory: Test injection for the child's XHand (no hardware).
+    """
+    if not hand_isolation_enabled(use_hand_isolation):
+        from dexmani_real.robot.xhand.xhand import XHand
+
+        return XHand(hand_config)
+
+    if process_config is None:
+        process_config = HandProcessConfig()
+    estop_event = mp.get_context("fork").Event()
+    facade = HandSHMFaçade(
+        process_config,
+        sync=None,
+        estop_event=estop_event,
+        hand_config=hand_config,
+        hand_factory=hand_factory,
+    )
+    return HandSHMAdapter(facade, hand_config, estop_event)
