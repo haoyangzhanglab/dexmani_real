@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
-__all__ = ["alpha_from_tau", "ema_smooth_pose", "tau_from_alpha"]
+__all__ = ["alpha_from_tau", "ema_smooth_pose", "tau_from_alpha", "EMA_ALPHA_POS", "EMA_ALPHA_ROT"]
 
 import numpy as np
 
 from dexmani_real.planning.pose_utils import quat_to_rotvec
+
+# ── Canonical EMA alpha values (tuned at 16Hz, dt=62.5ms) ──
+# 2026-07-22 调整: 配合 joint_max_acc 500→900°/s²，双通道加重平滑，
+# 降低腕部(J5/J6/J7)跟踪误差。位置/姿态突变是腕关节跟踪滞后的主因 —
+# EMA 平缓 IK 输入 → 关节目标步长缩小 → 固件加速度瓶颈冲击减轻。
+# 旧值: POS=0.8(τ≈39ms) ROT=0.4(τ≈122ms)
+# 新值: POS=0.65(τ≈60ms) ROT=0.3(τ≈175ms)
+EMA_ALPHA_POS = 0.65  # Cartesian position: moderate smoothing
+EMA_ALPHA_ROT = 0.3   # Cartesian rotation: heavier smoothing
 
 
 def alpha_from_tau(tau_s: float, dt: float) -> float:

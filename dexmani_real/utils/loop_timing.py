@@ -1,4 +1,4 @@
-"""Per-stage timing for the 50 Hz teleop main loop.
+"""Per-stage timing for the 16 Hz teleop main loop.
 
 Usage (one ``tick()`` at the loop top, ``mark()`` after each stage):
 

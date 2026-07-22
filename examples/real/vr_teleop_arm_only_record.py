@@ -9,7 +9,7 @@ RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
 
 架构:
     Meta Quest (HTS app) ──TCP──→ VRReceiverProcess ──SharedMemory──→ 主循环
-                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 50Hz)
+                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 30Hz)
 
 用法:
     # 1. Quest USB 有线: adb reverse tcp:8000 tcp:8000
@@ -58,7 +58,7 @@ from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.utils.signal_utils import alpha_from_tau, ema_smooth_pose, tau_from_alpha
+from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
 from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
@@ -72,10 +72,10 @@ logger = get_logger(__name__)
 # ═══════════════════════════════════════════════ 配置
 
 # ── 控制频率: 单点定义, 其余常量全部由此派生 ──
-# 决策/录制 @ CTRL_HZ; 臂内环保持 50Hz (Mode 6 固件在线规划, 直发无插值)。
+# 决策/录制 @ CTRL_HZ; 臂内环保持 30Hz (Mode 6 固件在线规划, 直发无插值)。
 CTRL_HZ = 16.0
 CTRL_DT = 1.0 / CTRL_HZ
-REF_HZ = 50.0  # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
+REF_HZ = 50.0  # 零空间步长参数的原调参频率
 STATUS_EVERY = int(round(1.0 * CTRL_HZ))  # 状态打印节流 (~1Hz)
 HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
@@ -101,14 +101,9 @@ VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
 # 笛卡尔位姿 EMA 平滑 (IK 前, 唯一平滑级, 匹配 sim TeleopPipeline)
-# 0.6/0.3 @50Hz 调参 → τ 不变换算到 CTRL_HZ (≈0.94/0.67 @16Hz)
-EMA_ALPHA_POS = alpha_from_tau(tau_from_alpha(0.6, 1.0 / REF_HZ), CTRL_DT)
-EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
+# 参数定义在 dexmani_real.utils.signal_utils (EMA_ALPHA_POS/EMA_ALPHA_ROT)
 
-# Mode 6 online trajectory planning (default) — no inner-loop interpolation,
-# firmware trajectory planner respects speed/accel limits (120°/s, 500°/s²).
-# 采集入口覆写库默认 90°/s → 120°/s: 降低快速操作下的 cmd-state 饱和滞后
-# (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
+# Mode 6 online trajectory planning — firmware respects speed/accel limits (120°/s, 500°/s²).
 ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
 _INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
 ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
@@ -241,7 +236,7 @@ def main():
         vr_receiver.stop()
         return
 
-    # ── 5. ArmInnerLoop (50Hz online trajectory planning) ──
+    # ── 5. ArmInnerLoop (30Hz online trajectory planning) ──
     arm_inner = ArmInnerLoop(cfg=_INNER_CFG)
     arm_inner.start()
     print("Arm 内环线程启动中...")
@@ -251,7 +246,7 @@ def main():
         print("Arm 内环线程启动超时，降级为直接读取")
         arm_qpos = None
     else:
-        print("Arm 内环线程已就绪 (50Hz online trajectory planning)")
+        print("Arm 内环线程已就绪 (30Hz online trajectory planning)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
     if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
@@ -288,6 +283,7 @@ def main():
         max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
+        use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
@@ -604,7 +600,7 @@ def main():
                     )
                     teleop_active = True
                     error_count = 0
-                    gc.disable()  # 禁用自动 GC，避免 50Hz 热路径上触发 full GC 暂停
+                    gc.disable()  # 禁用自动 GC，避免 30Hz 热路径上触发 full GC 暂停
                     print(f"\nB: 遥操作+录制开始 (wrist→EEF 映射已记录)  episode={recorder.frame_count}")
                     print(f"  wrist_ref={np.round(frame['wrist_pos'], 3)}")
                     print(f"  eef_ref=  {np.round(state.eef_pos, 3)}")
@@ -628,7 +624,7 @@ def main():
                         break
                     continue
 
-                # 内环 50Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
+                # 内环 30Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
                 arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
                 state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:

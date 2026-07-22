@@ -76,7 +76,7 @@ Full guidelines: invoke `/karpathy-guidelines` skill or see `.claude/skills/karp
 
 ## Architecture
 
-### Data Flow (recording loop @ 16 Hz; ArmInnerLoop @ 50 Hz)
+### Data Flow (recording loop @ 16 Hz; ArmInnerLoop @ 30 Hz)
 
 ```
 VR Tracker ──→ ArmWristMapper (wrist → EEF pose)  ──→ TeleopPipeline.compute_action()
@@ -88,11 +88,11 @@ VR Tracker ──→ ArmWristMapper (wrist → EEF pose)  ──→ TeleopPipeli
                                                                        │
 RobotInterface.validate_action() ← pre-send gate (error + connection + torque + temp
                                     + workspace clamp + joint-limit clip)
-ArmInnerLoop.set_target(arm_qpos_cmd) ← arm → 50Hz inner loop (mode 6: firmware trajectory planning)
+ArmInnerLoop.set_target(arm_qpos_cmd) ← arm → 30Hz inner loop (mode 6: firmware trajectory planning)
 RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop)
 ```
 
-**Key rates:** Control loop 16 Hz, ArmInnerLoop 50 Hz (mode 6 — firmware handles trajectory smoothing).
+**Key rates:** Control loop 16 Hz, ArmInnerLoop 30 Hz (mode 6 — firmware handles trajectory smoothing).
 ArmInnerLoop provides per-step joint delta clamp + dynamics readback (torque, temperature) to validate_action.
 
 ### State Machine (TeleopController)
@@ -144,7 +144,7 @@ Camera frames stream per-frame, index-aligned to grid (per-slot forward-fill).
 
 | Entry Point | Purpose |
 |-------------|---------|
-| `examples/real/vr_teleop_shm.py` | **Main** real-hardware VR teleop (TeleopController + SHM VR) |
+| `examples/real/vr_teleop_arm_only_record_plus.py` | **Main** real-hardware VR teleop (arm-only, recording) |
 | `examples/real/vr_teleop_arm_only.py` | Arm-only VR teleop (direct recorder, no controller) |
 | `examples/real/vr_teleop_arm_only_record.py` | Arm-only with recording |
 | `examples/real/vr_teleop_arm_only_record_plus.py` | Arm-only extended recording |
@@ -187,12 +187,12 @@ Camera frames stream per-frame, index-aligned to grid (per-slot forward-fill).
 ## Anti-Patterns
 
 - ❌ Calling XArm7/XHand directly → use `RobotInterface`
-- ❌ Blocking calls in 50Hz loop → use async patterns or offload to separate processes
+- ❌ Blocking calls in 30Hz loop → use async patterns or offload to separate processes
 - ❌ Ignoring validate_action() → always call before send_action()
 - ❌ Circular imports → use `TYPE_CHECKING` + lazy imports
 - ❌ Mutable defaults in dataclass fields → use `field(default_factory=...)`
 - ❌ Skipping `__init__.py` — new subpackages must have a docstring; `planning/`, `recording/`, and `simulation/` define `__all__` (match their pattern when adding public API)
-- ❌ Hardcoding 50Hz assumptions → use `control_hz` from config (recording is 16 Hz)
+- ❌ Hardcoding 50Hz assumptions → use `control_hz` from config (recording is 16 Hz; inner loop is 30 Hz)
 - ❌ Adding state enum variants → Recording is a bool, not a ControllerState; no RECORDING/SAVE_PROMPT state
 
 ---
@@ -203,6 +203,6 @@ Camera frames stream per-frame, index-aligned to grid (per-slot forward-fill).
 
 **L515 known issues:** Depth intrinsics can enter a bad state (missing VGA/XGA parameters → `rs.align` crash); `hardware_reset()` fixes it (not a calibration defect). See memory: [[l515-depth-intrinsics-bad-state]], [[l515-midrun-stream-stall]].
 
-**xArm7 Mode 6:** Firmware online trajectory planning — arm target is forwarded directly at 50Hz. Firmware respects speed/accel limits (default: 90°/s, 500°/s²). No inner-loop interpolation needed.
+**xArm7 Mode 6:** Firmware online trajectory planning — arm target is forwarded directly at 30Hz. Firmware respects speed/accel limits (default: 90°/s, 500°/s²). No inner-loop interpolation needed.
 
 **Key dependencies:** `mplib` (motion planning), `pinocchio` (rigid body dynamics), `h5py` (HDF5), RealSense SDK, XArm7/XHand SDKs (C++ bindings), `sapien` (simulation), `numpy`.

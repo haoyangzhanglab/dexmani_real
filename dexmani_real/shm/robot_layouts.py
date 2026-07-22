@@ -54,7 +54,6 @@ ARM_STATE_DTYPE = np.dtype(
         ("mode", "i4"),
         ("tracking_err", "<f8"),
         ("last_sent", "<f8", (7,)),  # inner-loop actual send (post delta-clip) → §4.9 sent stream
-        ("ramp_step", "i4"),
     ]
 )
 
@@ -106,10 +105,10 @@ HAND_STATE_DTYPE = np.dtype(
     ]
 )
 
-# ── hand_cmd (main → child, maxlen=2) — plan §4.5 (F1: clip/EMA applied main-side) ──
+# ── hand_cmd (main → child, maxlen=2) — plan §4.5 (F1: clip applied main-side) ──
 HAND_CMD_DTYPE = np.dtype(
     [
-        ("qpos_cmd", "<f8", (12,)),  # already E3 delta + E2 EMA processed by the façade
+        ("qpos_cmd", "<f8", (12,)),  # already E3 delta processed by the façade
         ("producer_id", "u4"),
     ]
 )

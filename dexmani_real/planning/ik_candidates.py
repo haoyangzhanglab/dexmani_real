@@ -35,6 +35,17 @@ def _categorize_rejects(reject_counts: dict[str, int]) -> dict[str, int]:
     return categorized
 
 
+def is_mplib_success(status: str) -> bool:
+    """Canonical MPlib IK status check — True when MPlib reports success.
+
+    Centralised here because MPlib's status string format (``"Success"``,
+    ``"Success (closest)"``, etc.) is an implementation detail that could
+    change across MPlib versions.  Three call sites in ik.py, ik_candidates.py,
+    and planner.py previously duplicated ``status.lower().startswith("success")``.
+    """
+    return status.lower().startswith("success")
+
+
 class IKCandidateManager:
     """IK candidate generation, filtering, scoring, and joint canonicalization.
 
@@ -94,7 +105,7 @@ class IKCandidateManager:
             status, raw_qpos = self.call_mplib_ik(
                 target_pose_base, seed, n_init_qpos=profile.n_init_qpos, return_closest=True
             )
-            if not status.lower().startswith("success") or raw_qpos is None:
+            if not is_mplib_success(status) or raw_qpos is None:
                 reason = "mplib_ik_failed"
                 reject_counts[reason] = reject_counts.get(reason, 0) + 1
                 continue

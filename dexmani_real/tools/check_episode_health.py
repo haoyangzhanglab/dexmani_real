@@ -31,6 +31,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -79,18 +80,21 @@ def _check_grid(f: h5py.File, control_hz: float) -> float:
     return fill_pct
 
 
-def _check_camera(f: h5py.File, key: str, stride: int, control_hz: float) -> tuple[float, float]:
+def _check_camera(data: np.ndarray | h5py.Dataset, key: str, stride: int, control_hz: float) -> tuple[float, float]:
     """Print content-duplication stats for one camera dataset.
 
-    Returns (dup_pct, expected_pct). Frames are hashed one at a time on a
-    ``::stride`` ROI — never ``[:]`` (episodes are multi-GB).
+    Returns (dup_pct, expected_pct).  ``data`` may be a pre-decoded numpy
+    array (video sidecar path) or an ``h5py.Dataset`` (legacy HDF5 path) —
+    both support ``[t, ::stride, ::stride]`` indexing and ``.tobytes()``.
+
+    Frames are hashed one at a time on a ``::stride`` ROI — never ``[:]``
+    (episodes are multi-GB on the legacy path).
     """
-    ds = f[key]
-    T = ds.shape[0]
+    T = data.shape[0]
     dup = np.zeros(T, dtype=bool)
     prev: int | None = None
     for t in range(T):
-        h = hash(ds[t, ::stride, ::stride].tobytes())
+        h = hash(data[t, ::stride, ::stride].tobytes())
         dup[t] = prev is not None and h == prev
         prev = h
         if T > 1000 and t > 0 and t % 1000 == 0:
@@ -133,15 +137,18 @@ def _check_tracking(f: h5py.File, thresh_rad: float) -> float | None:
 def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[str]:
     """Run all checks on one episode; return the WARN lines."""
     warns: list[str] = []
-    with h5py.File(path, "r") as f:
+    with EpisodeReader(path) as reader:
+        f = reader.h5f
         meta = dict(f["meta"].attrs) if "meta" in f else {}
         control_hz = float(meta.get("control_hz", 0.0) or 0.0)
 
+        video_codec = str(meta.get("video_codec", ""))
         print(f"\n=== {path} ===")
         print(
             f"  meta: schema={meta.get('schema_version', '-')}  control_hz={control_hz:g}  "
             f"frames={meta.get('num_frames', '-')}  dur={meta.get('duration', float('nan')):.1f}s  "
             f"success={meta.get('success', '-')}  min_frames_met={meta.get('min_frames_met', '-')}"
+            f"{'  video=' + video_codec if video_codec else ''}"
         )
         print(
             f"        truncated={meta.get('truncated', '-')}  stop_reason={meta.get('stop_reason', '-')}  "
@@ -153,8 +160,14 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
             warns.append(f"栅格填充 {fill_pct:.1f}% > {FILL_WARN_PCT:.0f}% — 决策循环跟不上 control_hz")
 
         cam_keys = [k for k in f.keys() if k == "rgb" or k.endswith("_rgb")]
+        if not cam_keys and reader.has_video("rgb"):
+            cam_keys = ["rgb"]  # video-only: no HDF5 dataset, but sidecar exists
         for key in cam_keys:
-            dup_pct, expected_pct = _check_camera(f, key, roi_stride, control_hz)
+            if reader.has_video(key):
+                data = reader.read_camera_all(key)
+            else:
+                data = f[key]
+            dup_pct, expected_pct = _check_camera(data, key, roi_stride, control_hz)
             if dup_pct > expected_pct + CAM_DUP_WARN_MARGIN_PCT:
                 warns.append(f"{key} 内容重复 {dup_pct:.1f}% 超基线 {expected_pct:.0f}% — cam-writer 丢帧/相机停流")
         if not cam_keys:

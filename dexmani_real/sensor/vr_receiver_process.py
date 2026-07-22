@@ -12,7 +12,7 @@ Ref: ManiUniCon process isolation pattern.
 Architecture:
     ┌───────────────────────────┐       SharedMemory        ┌──────────────────┐
     │ VRReceiverProcess        │ ──── RingBuffer(FILO) ───► │ TeleopController │
-    │ (独立 mp.Process)        │                             │ (主进程, 50Hz)   │
+    │ (独立 mp.Process)        │                             │ (主进程, 16Hz)   │
     │                           │                             │                  │
     │ HTS SDK iter_events()    │                             │ read_latest_vr() │
     │ → shm.write()            │                             │                  │

@@ -81,6 +81,12 @@ class ArmWristMapper:
         # glitches (spike-and-recover) that the total-from-reset clip misses.
         # Normal human wrist rotation is < 20°/frame at 16 Hz; the 30°/frame
         # default (~480°/s) is ~2× the fastest plausible motion.
+        #
+        # _last_wrist_rot tracks the RAW wrist orientation as the delta reference
+        # for the next frame.  Using the clamped output as reference caused the
+        # baseline to drift after a spike, distorting recovery-frame deltas
+        # (ref: arm-ik-adversarial-review §3.2 F8).
+        wrist_rot_gated = wrist_rot
         if self._last_wrist_rot is not None:
             frame_delta = wrist_rot @ self._last_wrist_rot.T
             _axis, frame_angle = mat2axangle(frame_delta)
@@ -91,7 +97,7 @@ class ArmWristMapper:
                     np.rad2deg(self.max_per_frame_rot_rad),
                 )
                 frame_delta_clamped = axangle2mat(_axis, self.max_per_frame_rot_rad, is_normalized=True)
-                wrist_rot = frame_delta_clamped @ self._last_wrist_rot
+                wrist_rot_gated = frame_delta_clamped @ self._last_wrist_rot
         self._last_wrist_rot = wrist_rot.copy()
 
         delta_pos_vr = wrist_pos - self.wrist_pos0
@@ -101,7 +107,7 @@ class ArmWristMapper:
         # world-frame eef_pos0 (avoids frame mixing when base_pose_world != I).
         delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
-        delta_rot_vr = wrist_rot @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
+        delta_rot_vr = wrist_rot_gated @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
         delta_rot_vr = self.scale_rot(delta_rot_vr)
         delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
         delta_rot_base = self.vr_to_base_rot @ delta_rot_vr @ self.vr_to_base_rot.T

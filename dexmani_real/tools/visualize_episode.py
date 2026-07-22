@@ -29,6 +29,7 @@ import rerun.blueprint as rrb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters
 
@@ -74,7 +75,8 @@ def _classify_datasets(h5f: h5py.File) -> dict[str, list[str]]:
 
 def print_episode_info(h5_path: str) -> None:
     """Print a human-readable summary of the episode structure without opening Rerun."""
-    with h5py.File(h5_path, "r") as f:
+    with EpisodeReader(h5_path) as reader:
+        f = reader.h5f
         keys = sorted(k for k in f.keys() if isinstance(f[k], h5py.Dataset))
         groups = sorted(k for k in f.keys() if not isinstance(f[k], h5py.Dataset))
 
@@ -82,8 +84,14 @@ def print_episode_info(h5_path: str) -> None:
         t_key = next((k for k in keys if k == "arm_qpos"), None)
         t_key = t_key or next((k for k in keys if k == "timestamp"), keys[0])
         t_frames = f[t_key].shape[0]
-        c_key = "rgb" if "rgb" in f else ("depth" if "depth" in f else None)
-        c_frames = f[c_key].shape[0] if c_key else None
+        c_key = "rgb" if ("rgb" in f or reader.has_video("rgb")) else ("depth" if ("depth" in f or reader.has_video("depth")) else None)
+        if c_key:
+            if reader.has_video(c_key):
+                c_frames = reader.video_frame_count(c_key)
+            else:
+                c_frames = f[c_key].shape[0]
+        else:
+            c_frames = None
 
         print(f"File:       {h5_path}")
         print(f"State frames (T): {t_frames}")
@@ -150,7 +158,20 @@ class EpisodeVisualizer:
         pc_max_depth: float = 2.0,
     ):
         self._h5_path = Path(h5_path)
-        self._h5f = h5py.File(h5_path, "r")
+        self._reader = EpisodeReader(h5_path)
+        self._h5f = self._reader.h5f
+
+        # Pre-decode camera frames when video sidecars are present
+        # (~50 MB for 960 frames @ 640×480 — acceptable for interactive use).
+        self._rgb_cache: np.ndarray | None = None
+        self._depth_cache: np.ndarray | None = None
+        if self._reader.has_video("rgb"):
+            logger.info("Video sidecar detected — pre-decoding rgb frames...")
+            self._rgb_cache = self._reader.read_camera_all("rgb")
+            logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
+        if self._reader.has_video("depth"):
+            self._depth_cache = self._reader.read_camera_all("depth")
+            logger.info("Pre-decoded %d depth frames", self._depth_cache.shape[0])
 
         # Discover datasets
         self._available = _classify_datasets(self._h5f)
@@ -198,7 +219,7 @@ class EpisodeVisualizer:
             meta = self._h5f.get("meta")
             if meta is not None and "camera_K" in meta.attrs:
                 self._pc_K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
-                depth_shape = self._h5f["depth"].shape
+                depth_shape = self._depth_cache.shape if self._depth_cache is not None else self._h5f["depth"].shape
                 h, w = depth_shape[1], depth_shape[2]
                 self._pc_h, self._pc_w = h, w
                 # Precompute strided pixel coordinates
@@ -280,7 +301,11 @@ class EpisodeVisualizer:
         return raw
 
     def _resolve_camera_count(self) -> int | None:
-        """Determine C from rgb or depth dataset."""
+        """Determine C from rgb or depth dataset (pre-decoded cache or HDF5)."""
+        if self._rgb_cache is not None:
+            return self._rgb_cache.shape[0]
+        if self._depth_cache is not None:
+            return self._depth_cache.shape[0]
         for cam_key in self._available.get("camera", []):
             return self._h5f[cam_key].shape[0]
         return None
@@ -452,9 +477,10 @@ class EpisodeVisualizer:
 
         # Camera pinhole from /meta attrs (optional)
         meta = self._h5f.get("meta")
-        if meta is not None and "camera_K" in meta.attrs and "rgb" in self._h5f:
+        has_rgb = "rgb" in self._h5f or self._rgb_cache is not None
+        if meta is not None and "camera_K" in meta.attrs and has_rgb:
             K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
-            rgb_shape = self._h5f["rgb"].shape
+            rgb_shape = self._rgb_cache.shape if self._rgb_cache is not None else self._h5f["rgb"].shape
             h, w = rgb_shape[1], rgb_shape[2]
             rr.log(
                 "camera",
@@ -522,9 +548,11 @@ class EpisodeVisualizer:
         cam_idx = int(self._cam_idx[step_idx]) if self._cam_idx is not None else step_idx
 
         if "rgb" in camera_keys:
-            rr.log("camera/rgb", rr.Image(self._h5f["rgb"][cam_idx]))
+            rgb = self._rgb_cache[cam_idx] if self._rgb_cache is not None else self._h5f["rgb"][cam_idx]
+            rr.log("camera/rgb", rr.Image(rgb))
         if "depth" in camera_keys:
-            rr.log("camera/depth", rr.DepthImage(self._h5f["depth"][cam_idx], meter=self._depth_meter))
+            depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
+            rr.log("camera/depth", rr.DepthImage(depth, meter=self._depth_meter))
 
         # ── 3D point cloud ──
         # Pre-computed world-frame /pointcloud (from CameraProcess) takes priority
@@ -537,8 +565,11 @@ class EpisodeVisualizer:
             rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
         elif self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
-                depth = self._h5f["depth"][cam_idx]
-                rgb = self._h5f["rgb"][cam_idx] if "rgb" in camera_keys else None
+                depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
+                rgb = (
+                    self._rgb_cache[cam_idx] if self._rgb_cache is not None
+                    else (self._h5f["rgb"][cam_idx] if "rgb" in camera_keys else None)
+                )
                 u_strided, v_strided = self._pc_rays
                 self._pc_cache[cam_idx] = self._depth_to_pointcloud(
                     depth=depth,
@@ -595,9 +626,10 @@ class EpisodeVisualizer:
         return self._T
 
     def close(self) -> None:
-        """Release the HDF5 file handle and finalise the Rerun recording."""
-        if self._h5f is not None:
-            self._h5f.close()
+        """Release the HDF5 file / video decoders and finalise the Rerun recording."""
+        if hasattr(self, "_reader") and self._reader is not None:
+            self._reader.close()
+            self._reader = None  # type: ignore[assignment]
             self._h5f = None  # type: ignore[assignment]
         try:
             rr.disconnect()

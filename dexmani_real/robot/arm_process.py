@@ -4,7 +4,7 @@ Runs ArmInnerLoop in a separate fork process that owns the sole XArmAPI
 connection; the main process (and future policy processes) talk to it through
 seqlock SHM rings:
 
-    Main process (16Hz)                      Arm control child (50Hz)
+    Main process (16Hz)                      Arm control child (30Hz)
     ───────────────────                      ────────────────────────
     ArmSHMFaçade.set_target(cmd)  ──arm_target──►  inner.set_target(cmd|None)
     ArmSHMFaçade.get_state()      ◄──arm_state───  publish every child tick
@@ -70,7 +70,6 @@ from dexmani_real.utils.rate_manager import RateManager
 
 if TYPE_CHECKING:
     from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
-    from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 
 logger = get_logger(__name__)
 
@@ -174,7 +173,6 @@ def _publish_arm_state(state_ring: SeqlockRingBuffer, inner: Any) -> None:
         frame["mode"][0] = int(inner.mode)
         frame["tracking_err"][0] = float(inner.tracking_error)
         frame["last_sent"][0] = np.asarray(inner.last_sent_cmd, dtype=np.float64)[:7]
-        frame["ramp_step"][0] = int(inner.ramp_step)
         state_ring.write(frame)
     except Exception:
         logger.exception("ArmControlProcess: arm_state publish failed")
@@ -182,7 +180,6 @@ def _publish_arm_state(state_ring: SeqlockRingBuffer, inner: Any) -> None:
 
 def _arm_child_main(
     config: ArmProcessConfig,
-    sync: SharedSyncPrimitives | None,
     estop_event: Any,
     stop_event: Any,
     ready_event: Any,
@@ -221,14 +218,6 @@ def _arm_child_main(
     try:
         factory = inner_factory if inner_factory is not None else _default_inner_factory
         inner = factory(config)
-
-        # Two-phase handshake wiring (plan §10.3). Only inject when the inner
-        # config asks for synchronized mode: _signal_ready_and_sync blocks on
-        # policy_ready every tick, so injecting sync into an async loop would
-        # deadlock teleop.
-        inner_cfg = getattr(inner, "_cfg", None)
-        if sync is not None and getattr(inner, "_sync", None) is None and getattr(inner_cfg, "synchronized", False):
-            inner._sync = sync
 
         # Attach the rings the parent created (create=False).
         prefix = config.shm_prefix
@@ -402,12 +391,10 @@ class ArmControlProcess:
     def __init__(
         self,
         config: ArmProcessConfig,
-        sync: SharedSyncPrimitives | None,
         estop_event: Any,
         inner_factory: Callable[[ArmProcessConfig], Any] | None = None,
     ) -> None:
         self._config = config
-        self._sync = sync
         self._estop_event = estop_event
         self._inner_factory = inner_factory
         # Plan A2: fork explicitly for robot control processes.
@@ -431,7 +418,6 @@ class ArmControlProcess:
             target=_arm_child_main,
             args=(
                 self._config,
-                self._sync,
                 self._estop_event,
                 self._stop_event,
                 self._ready_event,
@@ -494,14 +480,12 @@ class ArmSHMFaçade:
     def __init__(
         self,
         config: ArmProcessConfig,
-        sync: SharedSyncPrimitives | None,
         estop_event: Any,
         inner_factory: Callable[[ArmProcessConfig], Any] | None = None,
         arm_joint_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> None:
         self._config = config
-        self._sync = sync
-        self._proc = ArmControlProcess(config, sync, estop_event, inner_factory)
+        self._proc = ArmControlProcess(config, estop_event, inner_factory)
         # Range sanity window = soft limits ± 0.05 rad (plan §4.7); P1 wiring
         # passes the real XArm7 qpos_min_soft/qpos_max_soft here.
         if arm_joint_bounds is None:
@@ -566,8 +550,6 @@ class ArmSHMFaçade:
                 return False
             return True
         logger.info("ArmSHMFaçade: child not running — recreating rings and restarting")
-        if self._sync is not None:
-            self._sync.policy_ready.clear()  # drop stale handshake from the previous child
         self._unlink_rings()
         self._last_good = None
         try:
@@ -584,7 +566,7 @@ class ArmSHMFaçade:
         # loop has published its first state frame.  Without this grace period
         # the teleop loop sees error_state=True and may emergency-stop on a
         # transient timing race (plan §4.7 / §11.3).
-        self._startup_grace_remaining = 5  # ~312ms at 16Hz — ample for 50Hz poller
+        self._startup_grace_remaining = 5  # ~312ms at 16Hz — ample for 30Hz poller
         return True
 
     # ── State (freshness gate + range sanity, plan §4.7) ──
@@ -968,7 +950,6 @@ def make_arm_servo(
     estop_event = mp.get_context("fork").Event()
     facade = ArmSHMFaçade(
         process_config,
-        sync=None,
         estop_event=estop_event,
         inner_factory=inner_factory,
         arm_joint_bounds=arm_joint_bounds,

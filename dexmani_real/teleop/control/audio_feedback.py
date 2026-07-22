@@ -1,7 +1,7 @@
 """Non-blocking voice prompt player for teleop state transitions.
 
 Plays pre-recorded .wav files via system audio (aplay/paplay) in a daemon
-thread so the 50 Hz control loop is never blocked.  Only one prompt plays at
+thread so the 16 Hz control loop is never blocked.  Only one prompt plays at
 a time — a new play() call cancels any in-progress playback.
 
 Events are short keys (e.g. "begin", "save") that map to filenames under
@@ -57,6 +57,12 @@ class AudioFeedback:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def is_playing(self) -> bool:
+        """True if a voice prompt is currently playing."""
+        with self._lock:
+            return self._current_proc is not None and self._current_proc.poll() is None
 
     def play(self, event: str) -> None:
         """Play the voice prompt for *event* (non-blocking).

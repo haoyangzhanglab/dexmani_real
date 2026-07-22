@@ -13,7 +13,7 @@ plus 变体额外集成 assets/audio/ 下的预录制中文 TTS 语音提示，
 
 架构:
     Meta Quest (HTS app) ──TCP──→ VRReceiverProcess ──SharedMemory──→ 主循环
-                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 50Hz)
+                                     (独立进程, 隔离 HTS SDK)          (主进程, CTRL_HZ 决策; 臂内环 30Hz)
 
 用法:
     # 1. Quest USB 有线: adb reverse tcp:8000 tcp:8000
@@ -65,7 +65,7 @@ from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.utils.signal_utils import alpha_from_tau, ema_smooth_pose, tau_from_alpha
+from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
 from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
@@ -79,10 +79,10 @@ logger = get_logger(__name__)
 # ═══════════════════════════════════════════════ 配置
 
 # ── 控制频率: 单点定义, 其余常量全部由此派生 ──
-# 决策/录制 @ CTRL_HZ; 臂内环保持 50Hz (Mode 6 固件在线规划, 直发无插值)。
+# 决策/录制 @ CTRL_HZ; 臂内环保持 30Hz (Mode 6 固件在线规划, 直发无插值)。
 CTRL_HZ = 16.0
 CTRL_DT = 1.0 / CTRL_HZ
-REF_HZ = 50.0  # 滤波/步长参数的原调参频率 (换算保持时间常数/每秒速率不变)
+REF_HZ = 50.0  # 零空间步长参数的原调参频率
 STATUS_EVERY = int(round(1.0 * CTRL_HZ))  # 状态打印节流 (~1Hz)
 HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
@@ -108,17 +108,15 @@ VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
 # 笛卡尔位姿 EMA 平滑 (IK 前, 唯一平滑级, 匹配 sim TeleopPipeline)
-# 0.6/0.3 @50Hz 调参 → τ 不变换算到 CTRL_HZ (≈0.94/0.67 @16Hz)
-EMA_ALPHA_POS = alpha_from_tau(tau_from_alpha(0.6, 1.0 / REF_HZ), CTRL_DT)
-EMA_ALPHA_ROT = alpha_from_tau(tau_from_alpha(0.3, 1.0 / REF_HZ), CTRL_DT)
+# 参数定义在 dexmani_real.utils.signal_utils (EMA_ALPHA_POS/EMA_ALPHA_ROT)
 
-# Mode 6 online trajectory planning (default) — no inner-loop interpolation,
-# firmware trajectory planner respects speed/accel limits (120°/s, 500°/s²).
-# 采集入口覆写库默认 90°/s → 120°/s: 降低快速操作下的 cmd-state 饱和滞后
-# (实测 p95 40°)。不提库默认 — replay_traj 首发全速扫掠问题未修会被恶化。
-ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking 告警频次)
+# Mode 6 online trajectory planning — firmware respects speed/accel limits.
+# acc 900°/s²: 从默认 500 提升以降低跟踪误差 (sim 验证 acc→1146 改善 32%; 真机 900 保守步进)
+ARM_MAX_SPEED_DEG_S = 120.0
+ARM_MAX_ACC_DEG_S2 = 900.0
 _INNER_CFG = ArmInnerLoopConfig(
     joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
+    joint_max_acc=float(np.deg2rad(ARM_MAX_ACC_DEG_S2)),
     loop_period=1.0 / 30.0,  # 30Hz — Mode 6 firmware handles interpolation
 )
 ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
@@ -263,7 +261,7 @@ def main():
         vr_receiver.stop()
         return
 
-    # ── 5. ArmInnerLoop (25Hz online trajectory planning, crash-isolated subprocess) ──
+    # ── 5. ArmInnerLoop (30Hz online trajectory planning, crash-isolated subprocess) ──
     arm_inner = make_arm_servo(cfg=_INNER_CFG, use_arm_isolation=True)
     arm_inner.start()
     print("Arm 内环线程启动中...")
@@ -273,7 +271,7 @@ def main():
         print("Arm 内环线程启动超时，降级为直接读取")
         arm_qpos = None
     else:
-        print("Arm 内环线程已就绪 (50Hz online trajectory planning)")
+        print("Arm 内环线程已就绪 (30Hz online trajectory planning)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
     if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
@@ -311,6 +309,7 @@ def main():
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
         arm_sent_stream=True,  # schema v9: 记录实发的 arm 指令 (plan §6 P1)
+        use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
@@ -425,6 +424,7 @@ def main():
     running = True
     teleop_active = False
     recording_active = False
+    teleop_hold_for_audio = False  # B 按下后等待 begin 音频播完才允许运动
     loop_count = 0
     error_count = 0
     max_consecutive_errors = 10
@@ -492,11 +492,6 @@ def main():
     # (已提早到 8c, VR 等待之前启动)
 
     # Self-collision safety predicate for the pre-send gate.
-    # The IK pipeline checks self-collision at solution time; this is a
-    # defense-in-depth second check just before the command reaches the arm.
-    # Returns True when the arm command qpos is collision-safe.
-    _self_collision_safe = lambda q: not planner.has_self_collision(q)
-
     # Disable cyclic GC during teleop to eliminate stop-the-world pauses
     # in the IK hot path (5-20ms).  Numpy-heavy code has negligible cyclic
     # garbage — we collect explicitly at episode boundaries instead.
@@ -723,6 +718,7 @@ def main():
                     teleop_active = True
                     error_count = 0
                     audio.play("begin")
+                    teleop_hold_for_audio = True  # 等待 begin 音频播完再响应运动
                     print(f"\nB: 遥操作+录制开始 (wrist→EEF 映射已记录)  episode={recorder.frame_count}")
                     print(f"  wrist_ref={np.round(frame['wrist_pos'], 3)}")
                     print(f"  eef_ref=  {np.round(state.eef_pos, 3)}")
@@ -747,7 +743,7 @@ def main():
                         break
                     continue
 
-                # 内环 50Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
+                # 内环 30Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
                 arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
                 state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
@@ -888,6 +884,17 @@ def main():
                     )
                 continue
 
+            # ── 音频等待: B 按下后等待 begin 音频播完再响应运动 ──
+            # 此期间不记录数据 — 操作者还未开始运动，静止帧无采集价值。
+            if teleop_hold_for_audio:
+                if audio.is_playing:
+                    prev_qpos_cmd = state.arm_qpos.copy()
+                    continue
+                # 音频结束 → 重置 EMA (避免 hold 期间 VR 漂移累积跳变)，
+                # 下一帧 seed 后正式开始录制+遥操作。
+                ema_prev_pos = ema_prev_quat = None
+                teleop_hold_for_audio = False
+
             # ── VR wrist → EEF target pose ──
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
@@ -932,22 +939,27 @@ def main():
             stage_timer.mark("ik")
 
             # ── Trajectory debug record (before continue on fail) ──
+            # 与 HDF5 录制严格对齐: 仅当 HDF5 本帧会成功写入时才记录。
+            # max_frames_reached 在上一帧 add_frame() 成功后已置位,
+            # 本帧 recording_active 仍为 True 但 add_frame() 会拒绝 —
+            # 必须同时检查 max_frames_reached 避免多写一帧 (NPZ vs HDF5 差 1)。
             _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
             _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            traj_logger.append(
-                t=time.perf_counter() - start_time,
-                wrist_pos=vr_frame["wrist_pos"],
-                wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                target_pos=target_pos,
-                target_quat_wxyz=target_quat,
-                actual_eef_pos=state.eef_pos,
-                actual_eef_quat_wxyz=state.eef_quat_wxyz,
-                arm_qpos_actual=state.arm_qpos,
-                ik_ok=ik_result.success and ik_result.qpos is not None,
-                wrist_delta=_wrist_d,
-                eef_delta=_eef_d,
-                target_pos_before_clamp=target_pos_before_clamp,
-            )
+            if recording_active and not recorder.max_frames_reached:
+                traj_logger.append(
+                    t=time.perf_counter() - start_time,
+                    wrist_pos=vr_frame["wrist_pos"],
+                    wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
+                    target_pos=target_pos,
+                    target_quat_wxyz=target_quat,
+                    actual_eef_pos=state.eef_pos,
+                    actual_eef_quat_wxyz=state.eef_quat_wxyz,
+                    arm_qpos_actual=state.arm_qpos,
+                    ik_ok=ik_result.success and ik_result.qpos is not None,
+                    wrist_delta=_wrist_d,
+                    eef_delta=_eef_d,
+                    target_pos_before_clamp=target_pos_before_clamp,
+                )
 
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
@@ -986,7 +998,6 @@ def main():
                 actual_arm_qpos=arm_qpos,
                 actual_arm_tau=state.arm_tau,
                 actual_arm_temps=arm_temps,
-                self_collision_check=_self_collision_safe,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

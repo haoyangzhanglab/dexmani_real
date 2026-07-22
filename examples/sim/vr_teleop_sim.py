@@ -456,7 +456,7 @@ def main() -> None:
         teleop_profile=TeleopProfile(
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
-            nullspace_step_size_deg=1.0 * (50.0 / CTRL_HZ),  # 保持 °/s 不变: 1°/frame@50Hz → 3.125°/frame@16Hz
+            nullspace_step_size_deg=1.0 * (50.0 / CTRL_HZ),  # 保持 °/s 不变: 3.125°/frame@16Hz (scaling from original 50Hz-era value)
         ),
     )
 
@@ -503,8 +503,7 @@ def main() -> None:
     )
 
     # ── Episode Recorder + CollectionLoop 初始化 ──
-    # control_hz 必须匹配主循环 CTRL_HZ — 否则 16Hz 循环喂 50Hz 栅格，
-    # 每拍回填 ~3 个重复槽位 (num_frames ≈ 3x 实际 tick 数)。
+    # control_hz 必须匹配主循环 CTRL_HZ — 否则栅格对齐错误会导致帧重复或丢失。
     recorder = EpisodeRecorder(
         data_dir=args.data_dir,
         control_hz=CTRL_HZ,
@@ -873,21 +872,8 @@ def main() -> None:
 
                         # 3. 仿真相机帧捕获（可选）
                         camera_frame = None
-                        T_base_eef = None
                         if ee_camera is not None:
                             camera_frame = capture_camera_frame(ee_camera)
-                            try:
-                                eef_link = sim.robot.model.find_link_by_name("custom_eef_link")
-                                if eef_link is not None:
-                                    eef_pose = eef_link.get_entity_pose()
-                                    T_base_eef = np.eye(4, dtype=np.float64)
-                                    T_base_eef[:3, 3] = np.asarray(eef_pose.p, dtype=np.float64)
-                                    T_base_eef[:3, :3] = np.asarray(
-                                        eef_pose.to_transformation_matrix()[:3, :3],
-                                        dtype=np.float64,
-                                    )
-                            except (RuntimeError, AttributeError) as e:
-                                print(f"[Camera] T_base_eef 计算失败: {e}")
 
                         # 4. 录制帧（使用 CollectionLoop）
                         if collection.is_recording:
@@ -904,7 +890,6 @@ def main() -> None:
                                     action=robot_action,
                                     vr_frame=frame,
                                     camera_frame=camera_frame,
-                                    T_base_eef=T_base_eef,
                                     signals={"ik_ok": ik, "retarget_ok": rt_ok, "held": not (ik and rt_ok)},
                                 )
                             except (ValueError, OSError) as e:
@@ -1025,7 +1010,7 @@ def main() -> None:
                         )
                         last_overrun_warn_ts = now_ov
 
-                # ── 频率限制 (50Hz) ──
+                # ── 频率限制 (16Hz) ──
                 rate_limiter.wait()
 
     except KeyboardInterrupt:

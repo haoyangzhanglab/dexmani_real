@@ -8,7 +8,7 @@ Ref: ManiUniCon Camera Process (main.py:163-170 RobotControlSystem).
 Architecture:
     ┌───────────────────────┐   SharedMemory         ┌──────────────────────┐
     │ CameraProcess         │ ── CameraRingBuffer ──►│ TeleopController     │
-    │ (独立 mp.Process)     │   (zero-copy)          │ (主进程, 50Hz)       │
+    │ (独立 mp.Process)     │   (zero-copy)          │ (主进程, 16Hz)       │
     │                       │                        │                      │
     │ RealSense.read()      │                        │ poll_latest_frame()  │
     │ → shm.write()         │                        │ → shm.read_latest()  │

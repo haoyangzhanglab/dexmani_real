@@ -1,13 +1,13 @@
 """Hand control process + SHM façade (F1 design — plan §4.4-4.7, §5.2).
 
-Architecture (F1: the clip/EMA state machine lives in the FAÇADE; the child is
+Architecture (F1: the clip state machine lives in the FAÇADE; the child is
 a stateless executor):
 
     ┌─────────── main process (16 Hz) ───────────┐
     │ HandSHMFaçade.send_action(qpos_cmd)        │
-    │   limit → E3 delta → E2 EMA  ←─ state      │   hand_cmd ring
+    │   limit → E3 delta  ←─ state               │   hand_cmd ring
     │   (lifted VERBATIM from XHand.send_action; │ ────────────────► ┌─────────────────────┐
-    │    _last_qpos_cmd / _ema_qpos live HERE)   │                   │ HandControlProcess  │
+    │    _last_qpos_cmd lives HERE)              │                   │ HandControlProcess  │
     │   → returns (ok, expected_cmd) with ZERO   │   hand_state ring │ 30 Hz, sole XHand   │
     │     wait — record-what-was-sent, zero race │ ◄──────────────── │ connection;         │
     │ HandSHMFaçade.check_echo()                 │  (echo: seq +     │ stateless:          │
@@ -19,13 +19,9 @@ a stateless executor):
                                              ◄──────────────────────►│    child-side)      │
                                                                      └─────────────────────┘
 
-Child E2/E3 no-op selection (verified against xhand.py — NO modification made):
+Child E3 no-op selection (verified against xhand.py — NO modification made):
     The child's XHand is built with ``dataclasses.replace(hand_config,
-    ema_alpha=0.0, max_delta_rad=0.0)``. Both are clean no-ops in
-    ``XHand.send_action``:
-      - E2: the EMA block is guarded by ``if self.config.ema_alpha > 0 and
-        self._ema_qpos is not None:`` — alpha=0.0 leaves the command unchanged
-        (only internal ``_ema_qpos`` bookkeeping runs).
+    max_delta_rad=0.0)``. The delta clip is a clean no-op:
       - E3: the delta clip is guarded by ``if np.any(limit > 0) and
         self.last_qpos_cmd is not None:`` — max_delta_rad=0.0 skips the clip
         entirely (XHandConfig docstring: "0.0 = disabled").
@@ -64,8 +60,7 @@ Contract deviations (kept minimal, documented per convention):
       §4.1-4.5 + §4.10 only).
     - ``get_state()`` never returns None: a stale/missing state yields a
       fabricated ``connected=0`` record (degraded mode, NO escalation — §4.7).
-    - ``sync`` (SharedSyncPrimitives) is accepted for API symmetry with the arm
-      process but is unused by the hand child.
+
 
 Ref: docs/arm-hand-process-isolation-plan.md §4.4-4.7 (SHM layouts, F1/F2),
      §4.6 (macros), §5.2 (D4 lifecycle), §7 D1 (clip/EMA in main process).
@@ -339,8 +334,8 @@ class HandControlProcess:
 class HandSHMFaçade:
     """Main-process façade for the hand control child (F1).
 
-    Owns the E2/E3 clip/EMA state machine lifted verbatim from
-    ``XHand.send_action`` (``_last_qpos_cmd`` / ``_ema_qpos`` live here).
+    Owns the E3 clip state machine lifted verbatim from
+    ``XHand.send_action`` (``_last_qpos_cmd`` lives here).
     ``send_action()`` returns ``(ok, expected_cmd)`` with ZERO wait —
     ``expected_cmd`` is exactly what recording stores and what the hold
     baseline follows (record-what-was-sent, zero race). The child echoes
@@ -360,9 +355,8 @@ class HandSHMFaçade:
         self._hand_config = hand_config
         self._proc = HandControlProcess(config, sync, estop_event, hand_config, hand_factory)
 
-        # ── E2/E3 state machine (verbatim from XHand.send_action) ──
+        # ── E3 state machine (verbatim from XHand.send_action) ──
         self._last_qpos_cmd: np.ndarray | None = None  # E3 delta baseline; hold baseline; record-what-was-sent
-        self._ema_qpos: np.ndarray | None = None  # E2 EMA state — None until the first command (verbatim)
         self._last_joint_limit_clipped = False
 
         # ── echo verification (F1) ──
@@ -380,7 +374,6 @@ class HandSHMFaçade:
         """Create rings (stale cleanup) + start the child. Returns True on success."""
         # Fresh session state so a restart never reuses a stale baseline/ack.
         self._last_qpos_cmd = None
-        self._ema_qpos = None
         self._last_joint_limit_clipped = False
         self._last_acked_seq = 0
         self._expected_by_seq.clear()
@@ -397,8 +390,6 @@ class HandSHMFaçade:
         Seeding mirrors ``XHand.connect`` → ``_init_hand_state``: the baseline
         anchors to the child's initial hardware read (fallback home_qpos) so
         the first delta clip is relative to the actual hand position.
-        ``_ema_qpos`` stays None — verbatim XHand semantics: EMA skips the
-        first command and seeds from it.
         """
         ok = self._proc.wait_ready(timeout if timeout is not None else _READY_TIMEOUT_S)
         if ok:
@@ -463,12 +454,12 @@ class HandSHMFaçade:
     # ------------------------------------------------------------------
 
     def send_action(self, qpos_cmd: np.ndarray, producer_id: int = PRODUCER_TELEOP) -> tuple[bool, np.ndarray]:
-        """Apply limit → E3 delta → E2 EMA and publish to the hand_cmd ring.
+        """Apply limit → E3 delta and publish to the hand_cmd ring.
 
-        The clip/EMA state machine below is lifted VERBATIM from
+        The clip state machine below is lifted VERBATIM from
         ``XHand.send_action`` (xhand.py), including first-command semantics:
-        E3 skips while ``_last_qpos_cmd`` is None; EMA skips (and seeds) on
-        the first command. Writes HAND_CMD(expected_cmd, producer_id) and
+        E3 skips while ``_last_qpos_cmd`` is None.
+        Writes HAND_CMD(expected_cmd, producer_id) and
         returns ``(ok, expected_cmd)`` immediately — zero wait, zero race.
         ``expected_cmd`` is what recording and the hold baseline use
         (record-what-was-sent).
@@ -478,20 +469,13 @@ class HandSHMFaçade:
 
         # ── E3: Delta jump limit ──
         # Hard safety gate: per-step change never exceeds max_delta_rad on any
-        # joint, regardless of EMA state.  Complements dex_retargetingʼs LPFilter.
+        # joint.  Complements dex_retargetingʼs LPFilter.
         # Supports per-joint limits: pass a (12,) ndarray for joint-specific caps.
         limit = np.broadcast_to(np.asarray(self._hand_config.max_delta_rad), (12,))
         if np.any(limit > 0) and self._last_qpos_cmd is not None:
             delta = expected_cmd - self._last_qpos_cmd
             delta = np.clip(delta, -limit, limit)
             expected_cmd = self._last_qpos_cmd + delta
-
-        # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
-        if self._hand_config.ema_alpha > 0 and self._ema_qpos is not None:
-            expected_cmd = (
-                1.0 - self._hand_config.ema_alpha
-            ) * self._ema_qpos + self._hand_config.ema_alpha * expected_cmd
-        self._ema_qpos = expected_cmd.copy()
 
         ok = False
         ring = self._proc.cmd_ring
@@ -543,7 +527,7 @@ class HandSHMFaçade:
         or a value mismatch (tolerance 0 — the child re-clips with identical
         joint limits, so a healthy echo equals the written expected_cmd
         bit-for-bit) → throttled warning + baseline resync
-        (``_last_qpos_cmd`` / ``_ema_qpos`` ← echo value). All anomalies
+        (``_last_qpos_cmd`` ← echo value). All anomalies
         converge into a single detectable event.
         """
         ring = self._proc.state_ring
@@ -580,7 +564,6 @@ class HandSHMFaçade:
 
         if anomaly:
             self._last_qpos_cmd = echo_val.copy()
-            self._ema_qpos = echo_val.copy()
 
         self._last_acked_seq = echo_seq
         if self._expected_by_seq:
@@ -597,7 +580,7 @@ class HandSHMFaçade:
         Mirrors ``XHand._init_hand_state``: poll briefly for the first
         HAND_STATE (published within one child tick of ready); fall back to
         home_qpos exactly like XHand does when no valid hardware read exists.
-        ``_ema_qpos`` is left untouched (None ⇒ EMA skips the first command —
+        ``_last_qpos_cmd`` is left untouched (None ⇒ delta clip skips the first command —
         verbatim XHand first-command semantics).
         """
         if self._last_qpos_cmd is not None:
@@ -622,7 +605,7 @@ class HandSHMFaçade:
 
         A macro (reset/trajectory) moved the hand child-side, outside the
         façade's state machine; wait for the child's post-macro state
-        publication and resync the E3/EMA baseline so the next teleop delta
+        publication and resync the E3 baseline so the next teleop delta
         clip anchors to the actual position.
         """
         ring = self._proc.state_ring
@@ -636,7 +619,6 @@ class HandSHMFaçade:
                 echo_val = np.array(result[0]["last_qpos_cmd"][0], dtype=np.float64)
                 if np.all(np.isfinite(echo_val)):
                     self._last_qpos_cmd = echo_val.copy()
-                    self._ema_qpos = echo_val.copy()
                 return
             time.sleep(0.005)
         logger.warning(
@@ -759,7 +741,7 @@ def _hand_child_main(
     """Hand control child main loop (runs in the forked process).
 
     Stateless executor (F1): on a NEW hand_cmd seq only → joint-limit
-    safety-net clip (XHand._limit_joint_range; E2/E3 disabled — see module
+    safety-net clip (XHand._limit_joint_range; E3 disabled — see module
     docstring) → hardware send → publish HAND_STATE with echo
     (last_cmd_seq = ring seq processed, last_qpos_cmd = value actually sent,
     limit_clipped) + full-bandwidth tactile. Stale cmd ring → hold position,
@@ -801,11 +783,11 @@ def _hand_child_main(
             f"{prefix}_macro_result", HAND_MACRO_RESULT_DTYPE, maxlen=_MACRO_MAXLEN, create=False
         )
 
-        # Child XHand with E2/E3 DISABLED — the façade owns the clip/EMA state
-        # machine (F1). ema_alpha=0.0 / max_delta_rad=0.0 are verified clean
-        # no-ops in XHand.send_action (module docstring); the joint-limit clip
+        # Child XHand with E3 DISABLED — the façade owns the clip state
+        # machine (F1). max_delta_rad=0.0 is a verified clean no-op in
+        # XHand.send_action (module docstring); the joint-limit clip
         # stays enabled as the safety net.
-        child_cfg = dataclasses.replace(hand_config, ema_alpha=0.0, max_delta_rad=0.0)
+        child_cfg = dataclasses.replace(hand_config, max_delta_rad=0.0)
         hand = hand_factory(child_cfg) if hand_factory is not None else XHand(child_cfg)
 
         if not hand.connect():
@@ -942,7 +924,7 @@ def _hand_child_main(
                                 with macro_lock:
                                     try:
                                         # Joint-limit safety-net clip inside
-                                        # send_action (E2/E3 disabled — no-ops).
+                                        # send_action (E3 disabled — no-op).
                                         hand.send_action(qpos_cmd)
                                     except Exception:
                                         logger.warning("hand child: send_action failed.", exc_info=True)
@@ -1028,8 +1010,8 @@ class HandSHMAdapter:
     ``connected_flag`` / ``error_state`` / ``last_qpos_cmd`` / ``config``
     attributes ``validate_action`` reads directly.
 
-    Command-side E2 EMA / E3 delta clip live in the façade (main process); the
-    child XHand is built stateless (``ema_alpha=0``, ``max_delta_rad=0``) and
+    Command-side E3 delta clip lives in the façade (main process); the
+    child XHand is built stateless (``max_delta_rad=0``) and
     echoes what it actually sent. ``fingertip_pos`` is NOT carried by the SHM
     hand state — it stays main-side FK in ``RobotInterface`` (needs arm EEF pose).
 

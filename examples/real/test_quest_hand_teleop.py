@@ -44,9 +44,8 @@ from datetime import datetime
 import numpy as np
 
 from dexmani_real.robot.xhand import JOINT_NAMES, XHand, XHandConfig
-from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter, adaptive_retargeting_thumb, adaptive_retargeting_xhand
+from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
-from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.rate_limiter import RateLimiter
 
 np.set_printoptions(precision=3, suppress=True, linewidth=120)
@@ -69,7 +68,7 @@ XHAND_DEVICE = None  # None = auto-discover; set to e.g. "enp1s0" for specific E
 
 # ── 控制参数 ───────────────────────────────────────────────────
 
-CONTROL_HZ = 50.0
+CONTROL_HZ = 16.0
 STATUS_INTERVAL = 2.0  # print status every N seconds
 
 
@@ -91,7 +90,7 @@ def _check_quit():
     return False
 
 
-def _save_recording(rec: dict, ref_indices: np.ndarray, output_dir: str | None = None) -> str | None:
+def _save_recording(rec: dict, output_dir: str | None = None) -> str | None:
     """Save recorded teleop debug data to NPZ file.
 
     Returns the file path on success, None if no data to save.
@@ -106,19 +105,9 @@ def _save_recording(rec: dict, ref_indices: np.ndarray, output_dir: str | None =
     filepath = out_dir / f"{stamp}_teleop_debug.npz"
 
     arrays: dict[str, np.ndarray] = {}
-    for key in (
-        "landmarks_raw",
-        "wrist_rot",
-        "mano_landmarks",
-        "scaled_landmarks",
-        "ref_vectors",
-        "projected",
-        "target_qpos",
-        "actual_qpos",
-    ):
+    for key in ("landmarks_raw", "target_qpos", "actual_qpos"):
         arrays[key] = np.stack(rec[key], axis=0)  # (T, ...)
     arrays["timestamps"] = np.array(rec["timestamps"], dtype=np.float64)
-    arrays["ref_indices"] = np.asarray(ref_indices, dtype=np.int32)
 
     np.savez_compressed(str(filepath), **arrays)
 
@@ -129,6 +118,11 @@ def _save_recording(rec: dict, ref_indices: np.ndarray, output_dir: str | None =
 
 
 def test_quest_hand_teleop() -> None:
+    raise DeprecationWarning(
+        "test_quest_hand_teleop is deprecated. "
+        "Use TeleopPipeline.compute_hand_command() (real hardware) or vr_teleop_sim.py (simulation)."
+    )
+
     print("=" * 60)
     print("  Quest VR → XHand Teleop Test")
     print("=" * 60)
@@ -201,15 +195,9 @@ def test_quest_hand_teleop() -> None:
     _rec = {
         "timestamps": [],
         "landmarks_raw": [],  # (21, 3) VR landmarks (FLU frame)
-        "wrist_rot": [],  # (3, 3) palm frame rotation
-        "mano_landmarks": [],  # (21, 3) MANO-space landmarks
-        "scaled_landmarks": [],  # (21, 3) after adaptive_retargeting_xhand
-        "ref_vectors": [],  # (15, 3) DexPilot reference vectors
-        "projected": [],  # (10,) bool — which finger pairs are in contact projection
         "target_qpos": [],  # (12,) retargeter output
         "actual_qpos": [],  # (12,) hardware feedback qpos
     }
-    _ref_indices = retargeter.indices  # (2, 15) — origin/task landmark indices for ref vectors
 
     print("\n" + "=" * 60)
     print("  Teleop running. Press 'q' to quit, Ctrl+C to abort.")
@@ -251,12 +239,9 @@ def test_quest_hand_teleop() -> None:
                 print(f"[VR] First frame received (seq={frame['sequence_id']}). Starting teleop.")
             frame_count += 1
 
-            # ── Retarget ──
+            # ── Retarget (new API: accepts raw VR landmarks, handles coordinate transform internally) ──
             landmarks = frame["landmarks"]  # (21, 3)
-            wrist_rot = estimate_frame_from_hand_points(landmarks)  # (3, 3)
-            mano_landmarks = landmarks @ wrist_rot @ OPERATOR2MANO_RIGHT  # (21, 3)
-
-            target_qpos = retargeter.retarget(mano_landmarks)
+            target_qpos = retargeter.retarget(landmarks)
 
             if target_qpos is None:
                 retarget_fail_count += 1
@@ -267,20 +252,10 @@ def test_quest_hand_teleop() -> None:
                 last_qpos = target_qpos
 
             # ── Record debug data ──
-            # Reconstruct intermediate values (cheap, avoids modifying XHandRetargeter API).
-            # These mirror XHandRetargeter._build_ref_value() internals.
-            scaled = adaptive_retargeting_xhand(adaptive_retargeting_thumb(mano_landmarks))
-            ref_vecs = scaled[_ref_indices[1], :] - scaled[_ref_indices[0], :]
-            proj_state = retargeter.retargeter.optimizer.projected.copy()
             actual_qpos = xhand.get_state()["qpos"]
 
             _rec["timestamps"].append(time.monotonic())
             _rec["landmarks_raw"].append(landmarks)
-            _rec["wrist_rot"].append(wrist_rot)
-            _rec["mano_landmarks"].append(mano_landmarks)
-            _rec["scaled_landmarks"].append(scaled)
-            _rec["ref_vectors"].append(ref_vecs)
-            _rec["projected"].append(proj_state)
             _rec["target_qpos"].append(target_qpos)
             _rec["actual_qpos"].append(actual_qpos)
 
@@ -347,13 +322,13 @@ def test_quest_hand_teleop() -> None:
         _restore_stdin(stdin_old)
 
         # ── Save recording ──
-        _save_recording(_rec, _ref_indices)
+        _save_recording(_rec)
 
         print("[Cleanup] Returning XHand to home...")
         # reset() only sends one frame — delta limit caps it to ~3.6°/step.
         # Loop until all joints are within tolerance of home (or max steps).
         home = xhand.config.home_qpos
-        for i in range(120):  # up to ~2.4s at 50Hz
+        for i in range(120):  # up to ~7.5s at 16Hz
             xhand.send_action(home)
             qpos = xhand.get_state()["qpos"]
             if np.allclose(qpos, home, atol=0.05):

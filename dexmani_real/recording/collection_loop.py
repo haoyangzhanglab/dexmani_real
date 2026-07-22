@@ -94,9 +94,9 @@ class CollectionLoop:
         action: object,
         vr_frame: dict,
         camera_frame: dict | None = None,
-        T_base_eef: np.ndarray | None = None,
         camera_frames: dict[str, dict] | None = None,
         signals: dict | None = None,
+        arm_qpos_sent: np.ndarray | None = None,
     ) -> bool:
         if not self.is_recording:
             return False
@@ -106,9 +106,9 @@ class CollectionLoop:
             action=action,
             vr_frame=vr_frame,
             camera_frame=camera_frame,
-            T_base_eef=T_base_eef,
             camera_frames=camera_frames,
             signals=signals,
+            arm_qpos_sent=arm_qpos_sent,
         )
 
         if self.recorder.max_frames_reached and self.config.auto_stop_on_max_frames:
@@ -142,7 +142,7 @@ class CollectionLoop:
         duration = time.perf_counter() - (self._episode_start_time or 0.0)
 
         # Block until the HDF5 is fully written + closed — the sidecar and log
-        # below must describe a durable file.  Runs on the RecordingSession
+        # below must describe a durable file.  Runs on the EpisodeRecorder
         # writer thread (or the caller's thread for direct CollectionLoop users).
         if not self.recorder.join_stop():
             logger.warning("Episode flush still running after join timeout: %s", path)

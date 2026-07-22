@@ -21,6 +21,7 @@ from typing import Any
 import h5py
 import numpy as np
 
+from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -231,8 +232,8 @@ class StreamInterpolator:
 class TimestampAligner:
     """Post-process all sensor streams onto a unified timestamp grid.
 
-    Handles the common case where control loop runs at 50Hz, camera at 30Hz,
-    and VR tracking at 72-120Hz — aligning everything to a single 20ms grid.
+    Handles the common case where control loop runs at 16Hz, camera at 30Hz,
+    and VR tracking at 72-120Hz — aligning everything to a single 62.5ms grid.
 
     Usage:
         aligner = TimestampAligner()
@@ -271,20 +272,21 @@ class TimestampAligner:
         dt = dt or self.dt
 
         try:
-            with h5py.File(h5_path, "r") as f:
-                return self._align_from_file(f, t_start, t_end, dt)
+            with EpisodeReader(h5_path) as reader:
+                return self._align_from_file(reader, t_start, t_end, dt)
         except (OSError, KeyError) as e:
             logger.error("TimestampAligner failed on %s: %s", h5_path, e)
             return None
 
     def _align_from_file(
         self,
-        f: h5py.File,
+        reader: EpisodeReader,
         t_start: float | None,
         t_end: float | None,
         dt: float,
     ) -> dict[str, Any]:
-        """Internal: align streams from an open HDF5 file."""
+        """Internal: align streams from an open HDF5 episode (with optional video sidecar)."""
+        f = reader.h5f
         # Get control timestamps
         if "timestamp" in f:
             ctrl_ts = np.asarray(f["timestamp"][:], dtype=np.float64)
@@ -323,21 +325,30 @@ class TimestampAligner:
         ]
 
         # Add camera streams if available (aligned by index — v2 has no camera timestamps)
-        has_camera = "rgb" in f
+        has_camera = "rgb" in f or reader.has_video("rgb")
         if has_camera:
             # Camera frames are forward-filled to match the control grid;
             # use nearest-neighbor to map camera index → timestamp grid.
-            cam_ts = np.arange(f["rgb"].shape[0], dtype=np.float64) / f["meta"].attrs.get("fps", 50.0)
+            # Frame count: prefer video sidecar, fall back to HDF5 dataset.
+            cam_n = reader.video_frame_count("rgb") or ("rgb" in f and f["rgb"].shape[0]) or 0
+            cam_ts = np.arange(cam_n, dtype=np.float64) / f["meta"].attrs.get("fps", 50.0)
             streams.append(("rgb", cam_ts, "nearest"))
-            if "depth" in f:
+            if "depth" in f or reader.has_video("depth"):
                 streams.append(("depth", cam_ts, "nearest"))
 
+        _CAM_KEYS = {"rgb", "depth"}
         # Align each stream
         for path, source_ts, method in streams:
-            if path not in f:
+            if path not in f and path not in _CAM_KEYS:
                 continue
 
-            source_data = np.asarray(f[path][:])
+            # Camera streams: read via EpisodeReader (handles video sidecar).
+            if path in _CAM_KEYS and reader.has_video(path):
+                source_data = reader.read_camera_all(path)
+            elif path in f:
+                source_data = np.asarray(f[path][:])
+            else:
+                continue
             if len(source_data) == 0:
                 continue
 

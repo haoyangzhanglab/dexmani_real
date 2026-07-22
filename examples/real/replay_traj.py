@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay a recorded robot trajectory from HDF5 and evaluate consistency.
 
-Reads an HDF5 episode (schema v5, 50Hz aligned grid) collected by VR teleop,
+Reads an HDF5 episode (schema v3+, aligned recording grid) collected by VR teleop,
 replays the recorded joint commands on the real robot, records the actual robot
 state during replay, and evaluates how closely the replayed motion matches the
 original recording.
@@ -136,12 +136,12 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
         num_frames_orig = meta.attrs.get("num_frames", 0) if meta else 0
         # Nominal grid rate: schema v7 stores control_hz; fps is the achieved
         # rate recomputed at stop (frame_count/duration) — prefer the nominal.
-        fps = meta.attrs.get("control_hz", meta.attrs.get("fps", 50.0)) if meta else 50.0
+        fps = meta.attrs.get("control_hz", meta.attrs.get("fps", 16.0)) if meta else 16.0
         # Clamp: replay_hz drives the real arm — a diluted fps from an old
         # paused episode (or fps=0) must not set the physical replay rate.
         if not (1.0 <= float(fps) <= 100.0):
-            logger.warning("Implausible meta rate %.3f Hz — falling back to 50 Hz for replay", float(fps))
-            fps = 50.0
+            logger.warning("Implausible meta rate %.3f Hz — falling back to 16 Hz for replay", float(fps))
+            fps = 16.0
         task_label = meta.attrs.get("task_label", "") if meta else ""
 
         # ── Source: which arm action stream to replay ──
@@ -669,7 +669,7 @@ class TrajectoryReplayer:
         if not self._arm_inner.wait_ready(timeout=30.0):
             print("Arm inner loop start timed out, falling back to direct read")
         else:
-            print("Arm inner loop ready (50Hz online trajectory planning)")
+            print("Arm inner loop ready (30Hz online trajectory planning)")
 
     # ── Start alignment ──
 
@@ -853,7 +853,7 @@ class TrajectoryReplayer:
                             self._emergency_stop()
                             break
                         continue
-                    # Dynamics from inner-loop 50Hz readback → torque/temp gates
+                    # Dynamics from inner-loop 30Hz readback → torque/temp gates
                     arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()
                     state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
                 except Exception as e:
@@ -1016,7 +1016,7 @@ Examples:
         "--speed",
         type=float,
         default=1.0,
-        help="Replay speed factor (1.0=50Hz real-time, 0.5=half-speed).",
+        help="Replay speed factor (1.0=original recording speed, 0.5=half-speed).",
     )
     parser.add_argument(
         "--max-frames",
@@ -1060,7 +1060,7 @@ Examples:
         print("Error: --speed must be positive")
         sys.exit(1)
     if args.speed > 1.5:
-        print(f"Warning: --speed={args.speed}x may exceed hardware limits (inner loop runs at 50Hz)")
+        print(f"Warning: --speed={args.speed}x may exceed hardware limits (inner loop runs at 30Hz)")
 
     # ── Load trajectory ──
     try:

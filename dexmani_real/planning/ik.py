@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
-from .pose_utils import ensure_qpos
+from .ik_candidates import is_mplib_success
+from .pose_utils import compute_pose_error, ensure_qpos
 from .types import IKResult, Pose, TeleopProfile
 
 logger = get_logger(__name__)
@@ -47,6 +48,9 @@ class TeleopIKSolver:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
+        self._nullspace_warn_throttle: int = 0
+        self._hold_start: float | None = None
+        self._hold_warned: bool = False
 
     # ── Public API ──
 
@@ -67,7 +71,7 @@ class TeleopIKSolver:
         qpos, report = self._solve_position_ik(target_eef_pose_world, current_qpos, previous_qpos_cmd, profile)
 
         if qpos is not None:
-            return self._command_from_target_qpos(
+            result = self._command_from_target_qpos(
                 target_eef_pose_world=target_eef_pose_world,
                 current_qpos=current_qpos,
                 previous_qpos_cmd=previous_qpos_cmd,
@@ -75,16 +79,38 @@ class TeleopIKSolver:
                 profile=profile,
                 report=report,
             )
+        else:
+            # ── Hold ──
+            dt_total_ms = (time.perf_counter() - t_start) * 1000
+            diagnostic = self._build_diagnostic(report)
+            result = IKResult(
+                success=False,
+                qpos=previous_qpos_cmd.copy(),
+                reason=diagnostic["summary"],
+                report={
+                    **report,
+                    "held": True,
+                    "diagnostic": diagnostic,
+                    "ik_timing_ms": round(dt_total_ms, 1),
+                },
+            )
 
-        # ── Hold ──
-        dt_total_ms = (time.perf_counter() - t_start) * 1000
-        diagnostic = self._build_diagnostic(report)
-        return IKResult(
-            success=False,
-            qpos=previous_qpos_cmd.copy(),
-            reason=diagnostic["summary"],
-            report={"held": True, "diagnostic": diagnostic, "ik_timing_ms": round(dt_total_ms, 1)},
-        )
+        # ── Hold timeout tracking ──
+        if not result.success or result.held:
+            if self._hold_start is None:
+                self._hold_start = time.time()
+            elif time.time() - self._hold_start > 2.0 and not self._hold_warned:
+                logger.warning(
+                    "IK holding for %.1fs — arm frozen (reason: %s)",
+                    time.time() - self._hold_start,
+                    result.reason,
+                )
+                self._hold_warned = True
+        else:
+            self._hold_start = None
+            self._hold_warned = False
+
+        return result
 
     # ── Position IK ──
 
@@ -116,7 +142,7 @@ class TeleopIKSolver:
                 target_pose_base, seed, n_init_qpos=n_init, return_closest=True,
             )
 
-            if not status.lower().startswith("success") or raw_qpos is None:
+            if not is_mplib_success(status) or raw_qpos is None:
                 attempts.append(f"{seed_name}:mplib_failed")
                 continue
 
@@ -137,6 +163,14 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:elbow_flip")
                 continue
 
+            # L2 catch-all for unexpected multi-joint branch jumps (shoulder
+            # reconfiguration, wrist singularity flips) that the J4-only elbow
+            # check misses.  120° L2 is 4-8× normal frame-to-frame motion at
+            # 16 Hz (< 30°), conservative against any single-frame discontinuity.
+            if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
+                attempts.append(f"{seed_name}:branch_jump_l2")
+                continue
+
             hw_dist = float(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, current_qpos))))
             weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights)
 
@@ -155,6 +189,7 @@ class TeleopIKSolver:
                 weighted_dist=weighted_dist,
                 manipulability=mu,
                 qpos=qpos,
+                previous_qpos_cmd=previous_qpos_cmd,
                 profile=profile,
             )
             candidates.append((qpos.copy(), seed_name, score, mu))
@@ -187,7 +222,8 @@ class TeleopIKSolver:
             ("prev_cmd", prev_cmd.copy(), 3),
             ("current_qpos", current_qpos.copy(), 1),
         ]
-        rng = np.random.default_rng()
+        seed = profile.teleop_ik_seed
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         offsets_rad = np.deg2rad(profile.position_ik_seed_offset_deg)
         for i in range(profile.position_ik_num_random_seeds):
             seed = prev_cmd + rng.uniform(-offsets_rad, offsets_rad, self.kin.dof)
@@ -199,21 +235,34 @@ class TeleopIKSolver:
         weighted_dist: float,
         manipulability: float,
         qpos: np.ndarray,
+        previous_qpos_cmd: np.ndarray,
         profile: TeleopProfile,
     ) -> float:
         """Score an IK candidate. Lower is better.
 
-        score = weighted_joint_distance (smoothness)
-              - manipulability_weight * manipulability (dexterity)
-              + limit_penalty_weight * joint_limit_penalty (adjustment room)
+        score = weighted_joint_distance               (smoothness vs hardware)
+              + velocity_weight * velocity_dist       (temporal coherence vs prev cmd)
+              - manipulability_weight * mu            (dexterity)
+              + limit_penalty_weight * penalty        (adjustment room)
+
+        The velocity term uses dedicated velocity_joint_weights (tuned for
+        inertia/responsiveness) when set, falling back to joint_weights.
         """
         limits = self.ik_mgr.joint_limits
         center = 0.5 * (limits[:, 0] + limits[:, 1])
         half_range = np.maximum(0.5 * (limits[:, 1] - limits[:, 0]), 1e-6)
         limit_penalty = float(np.sum(((qpos - center) / half_range) ** 2))
 
+        vel_weights = (
+            profile.velocity_joint_weights
+            if profile.velocity_joint_weights is not None
+            else profile.joint_weights
+        )
+        velocity_dist = self.ik_mgr.weighted_joint_distance(qpos, previous_qpos_cmd, vel_weights)
+
         return (
             weighted_dist
+            + profile.position_ik_velocity_weight * velocity_dist
             - profile.position_ik_manipulability_weight * manipulability
             + profile.position_ik_limit_penalty_weight * limit_penalty
         )
@@ -294,13 +343,24 @@ class TeleopIKSolver:
         profile: TeleopProfile,
         report: dict[str, Any],
     ) -> IKResult:
-        """Canonicalize, nullspace-optimize, collision-check, and assemble IKResult."""
-        qpos_cmd = self.ik_mgr.canonicalize_qpos(target_qpos, previous_qpos_cmd)
+        """Nullspace-optimize, collision-check, and assemble IKResult.
+
+        canonicalize_qpos already applied at ik.py:124 to each raw MPlib result;
+        nullspace optimization perturbs by <1° so a second wrap is a no-op.
+        """
+        qpos_cmd = target_qpos.copy()
+
+        # EEF pose at qpos_cmd — computed once, reused for tracking error below.
+        # When nullspace is enabled, compute_eef_jacobian_and_pose_world returns
+        # both Jacobian and world-frame pose in a single FK call.  Nullspace
+        # preserves EEF pose by construction (J · dq_null = 0), so the original
+        # pose_world is still valid after nullspace adjustment.
+        eef_pose_world: Pose | None = None
 
         # Null-space joint-limit repulsion (zero EEF error by construction).
         if profile.enable_nullspace_optimization:
             try:
-                jacobian, _ = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
+                jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
                 from .nullspace import apply_nullspace_optimization
 
                 qpos_cmd = apply_nullspace_optimization(
@@ -310,8 +370,15 @@ class TeleopIKSolver:
                     step_size_rad=np.deg2rad(profile.nullspace_step_size_deg),
                     margin_deg=profile.nullspace_joint_limit_margin_deg,
                 )
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                if not self._nullspace_warn_throttle:
+                    logger.warning(
+                        "Nullspace optimization failed — joint-limit repulsion degraded",
+                        exc_info=True,
+                    )
+                    self._nullspace_warn_throttle = 80  # ~5s at 16Hz
+                if self._nullspace_warn_throttle > 0:
+                    self._nullspace_warn_throttle -= 1
 
         # ── Collision safety gates ──
         collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)
@@ -353,7 +420,10 @@ class TeleopIKSolver:
                 )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-        cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
+        if eef_pose_world is not None:
+            cmd_pos_error, cmd_rot_error = compute_pose_error(target_eef_pose_world, eef_pose_world)
+        else:
+            cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
         result_report = {
             **report,
             "cmd_tracking_error_pos_m": cmd_pos_error,

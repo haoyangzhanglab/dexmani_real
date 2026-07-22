@@ -36,7 +36,7 @@ accept an odd (mid-write) sequence — robot-ring consumers must attach with
 SeqlockRingBuffer (plan §10.4: every reader does its own seqlock re-check).
 
 The seqlock requirement mirrors CameraRingBuffer.read_latest (ring_buffer.py:
-461-467); maxlen=3 @50Hz covers only ~60 ms, so a single IK spike in the main
+461-467); maxlen=3 @30Hz covers only ~100 ms, so a single IK spike in the main
 loop can wrap the writer around mid-read — protection is a requirement, not
 insurance.
 

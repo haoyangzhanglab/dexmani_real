@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 from .collision_model import CollisionModel
 from .desk_safety import FingertipDeskSafety
 from .ik import TeleopIKSolver
-from .ik_candidates import IKCandidateManager
+from .ik_candidates import IKCandidateManager, is_mplib_success
 from .kinematics import XArm7Kinematics
 from .pose_utils import compute_pose_error, ensure_qpos
 from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
@@ -85,7 +85,7 @@ class XArm7MotionPlanner:
         self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
         joint_limits = np.asarray(self.mplib_planner.joint_limits, dtype=np.float64)
         dof = int(joint_limits.shape[0])
-        equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) >= np.pi
+        equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) > 2 * np.pi
 
         base_pose_world = config.base_pose_world.copy()
         self.workspace_safety: WorkspaceSafety | None = (
@@ -315,7 +315,7 @@ class XArm7MotionPlanner:
                 report={"mplib_status": "Invalid"},
             )
         status = str(result.get("status", ""))
-        if not status.lower().startswith("success"):
+        if not is_mplib_success(status):
             return PathResult(
                 success=False,
                 qpos_path=None,

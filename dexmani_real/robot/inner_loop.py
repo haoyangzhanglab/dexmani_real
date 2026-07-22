@@ -1,4 +1,4 @@
-"""ArmInnerLoop — in-process inner loop thread (50Hz) for xArm7 control.
+"""ArmInnerLoop — in-process inner loop thread (30Hz) for xArm7 control.
 
 Default and only control mode is Mode 6 (joint online trajectory planning). The firmware
 performs online trajectory replanning with configurable speed and acceleration limits that
@@ -7,11 +7,11 @@ the firmware handles all trajectory smoothing. Effectively dissolves the inner/o
 distinction.
 
 Mode 6: Joint online trajectory planning — forwards targets directly to
-  arm.set_servo_angle(wait=False) at 50Hz. Firmware respects speed/accel limits
-  (default: 90°/s, 500°/s²). Smooth motion, no desk vibration. Requires firmware >= 1.10.0.
+  arm.set_servo_angle(wait=False) at 30Hz. Firmware respects speed/accel limits
+  (default: 120°/s, 500°/s²). Smooth motion, no desk vibration. Requires firmware >= 1.10.0.
 
 Architecture:
-    Main Thread (50Hz)                     Inner Loop Thread (50Hz)
+    Main Thread (16Hz)                     Inner Loop Thread (30Hz)
     ──────────────────                     ───────────────────────
     inner.set_target(cmd)    ──Lock──→     self._arm_target
     qpos, err, ts = get_state()  ←──Lock── self._arm_qpos, _error_state
@@ -49,26 +49,21 @@ class ArmInnerLoopConfig:
 
     Attributes:
         joint_max_speed: Max joint speed (rad/s). Respected by firmware trajectory
-                         planner. Default 90°/s (≈1.57 rad/s).
+                         planner. Default 120°/s (≈2.09 rad/s).
         joint_max_acc: Max joint acceleration (rad/s²). Respected by firmware
                        trajectory planner. Default 500°/s² (≈8.73 rad/s²).
         loop_period: Inner loop period in seconds. Default 1/30 (30Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
         max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad per
-                         inner-loop step (~17°, ~15 rad/s ceiling at 50Hz). Mirrors
+                         inner-loop step (~17°, ~9 rad/s ceiling at 30Hz). Mirrors
                          XHand E3. Set 0 to disable. Headroom over a normal target
                          step depends on the OUTER loop rate (see max_joint_delta
                          comment below).
-        speed_ramp_frames: Number of frames for soft-start speed ramp. Default 20
-                           frames (0.4s at 50Hz). Speed linearly ramps from
-                           speed_ramp_min → joint_max_speed. Set 0 to disable.
-        speed_ramp_min: Initial speed during soft-start ramp (rad/s). Default 0.2
-                        rad/s (~11°/s). Avoids abrupt motion on teleop engagement.
         synchronized: Two-phase handshake for policy inference (default False).
     """
 
     # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
-    joint_max_speed: float = 1.5708  # 90°/s in rad/s
+    joint_max_speed: float = 2.0944  # 120°/s in rad/s
     joint_max_acc: float = 8.7266  # 500°/s² in rad/s²
     loop_period: float = (
         1.0 / 30.0  # 30Hz (was 25Hz) — Mode 6 firmware handles interpolation; 30Hz improves tracking fidelity vs 25Hz
@@ -78,17 +73,11 @@ class ArmInnerLoopConfig:
 
     # Per-step delta clamp — safety ceiling against IK solver anomalies.
     # Mirrors XHand E3 (XHandConfig.max_delta_rad).  A normal target step is
-    # joint_max_speed / outer_loop_hz: ≈0.03 rad @50Hz outer (~10x headroom),
-    # ≈0.098 rad @16Hz outer (~3x headroom).  Note the inner loop re-sends the
+    # joint_max_speed / outer_loop_hz: ≈0.131 rad @16Hz outer (~2.3x headroom).
+    # Note the inner loop re-sends the
     # same target every 20ms, so a single anomalous target is chased at up to
     # 0.3 rad per inner step until it times out (target_timeout_s).
     max_joint_delta: float = 0.3
-
-    # Soft-start speed ramp — prevents abrupt motion on teleop engagement.
-    # Speed ramps linearly from speed_ramp_min → joint_max_speed over the first
-    # speed_ramp_frames.  Set speed_ramp_frames=0 to disable.
-    speed_ramp_frames: int = 20
-    speed_ramp_min: float = 0.2  # ~11°/s
 
     # Passive tracking-error monitor — warns when |target - current| exceeds this
     # on any joint (soft saturation / follow error that arm error codes miss).
@@ -119,7 +108,7 @@ _RECOVERABLE_ERRORS: frozenset[int] = frozenset(
 
 
 class ArmInnerLoop:
-    """50Hz inner loop thread — owns the XArmAPI connection, runs Mode 6.
+    """30Hz inner loop thread — owns the XArmAPI connection, runs Mode 6.
 
     Runs in the same process as the controller. Communicates via
     Lock-protected shared variables (no SHM/IPC overhead).
@@ -151,7 +140,7 @@ class ArmInnerLoop:
         self._arm_target: np.ndarray | None = None
         self._target_ts: float = 0.0
         self._arm_qpos: np.ndarray = np.zeros(7, dtype=np.float64)
-        # Dynamics from the 50Hz readback (NaN until first valid read) — consumed
+        # Dynamics from the 30Hz readback (NaN until first valid read) — consumed
         # by the outer loop for recording + torque/temperature pre-send gates.
         self._arm_qvel: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._arm_tau: np.ndarray = np.full(7, np.nan, dtype=np.float64)
@@ -161,9 +150,7 @@ class ArmInnerLoop:
         # The delta-clamped value actually forwarded to the SDK each tick
         # (hold position during holds) — the inner-loop "sent" stream (plan §4.9).
         self._last_sent_cmd: np.ndarray = np.zeros(7, dtype=np.float64)
-        self._ramp_step: int = 0  # for soft-start speed ramp
         self._arm = None  # live XArmAPI handle of the loop thread (mode/connected queries)
-        self._qvel_inf: float = 0.0  # last |qvel| L∞ — inner-loop thread only
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
         self._track_warn_throttle: int = 0  # throttle counter for tracking-error warnings
         self._mode_warn_throttle: int = 0  # throttle counter for mode-drift warnings (independent)
@@ -194,7 +181,7 @@ class ArmInnerLoop:
             return self._arm_qpos.copy(), self._error_state, self._target_ts
 
     def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Latest (qvel, tau, temps) from the 50Hz readback — NaN until first valid read.
+        """Latest (qvel, tau, temps) from the 30Hz readback — NaN until first valid read.
 
         The inner loop owns the sole XArmAPI connection, so the outer loop must
         source dynamics here instead of calling the SDK (avoids connection contention).
@@ -229,12 +216,6 @@ class ArmInnerLoop:
         """
         with self._lock:
             return self._last_sent_cmd.copy()
-
-    @property
-    def ramp_step(self) -> int:
-        """Current soft-start speed-ramp step counter (0 = ramp re-armed)."""
-        with self._lock:
-            return self._ramp_step
 
     @property
     def mode(self) -> int:
@@ -284,7 +265,7 @@ class ArmInnerLoop:
                 logger.warning("ArmInnerLoop thread did not exit within %.0fs", timeout)
 
     def emergency_stop(self, settle_timeout: float | None = None) -> bool:
-        """Fast ``set_state(4)`` emergency stop (plan §4.8 ≤1 tick, A5 <60ms @50Hz).
+        """Fast ``set_state(4)`` emergency stop (plan §4.8 ≤1 tick, A5 <60ms @30Hz).
 
         Two paths, neither requires the macro lock:
 
@@ -446,10 +427,6 @@ class ArmInnerLoop:
                 if not no_target_yet and (
                     target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
                 ):
-                    # Re-arm the soft-start ramp: any hold (PAUSED, idle, VR loss,
-                    # main-thread stall) counts as disengagement, so the next
-                    # engagement ramps up again as the docstring promises.
-                    self._ramp_step = 0
                     self._hold_position(arm)
                     self._signal_ready_only()
                     continue
@@ -507,7 +484,6 @@ class ArmInnerLoop:
                         with self._lock:
                             self._arm_target = None
                         self._recover_mode(arm)
-                        self._ramp_step = 0  # re-arm soft-start ramp
                         self._hold_position(arm)
                         self._signal_ready_only()
                         continue
@@ -530,7 +506,6 @@ class ArmInnerLoop:
                 if len(states) > 1:
                     v = np.asarray(states[1], dtype=np.float64)
                     if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
-                        self._qvel_inf = float(np.max(np.abs(v[:7])))
                         with self._lock:
                             self._arm_qvel = v[:7].copy()
                 if len(states) > 2:
@@ -601,7 +576,7 @@ class ArmInnerLoop:
                 err,
                 cfg.tracking_error_warn_rad,
             )
-            self._track_warn_throttle = 50  # ~1s at 50Hz
+            self._track_warn_throttle = 50  # ~1.67s at 30Hz
 
         if self._mode_warn_throttle > 0:
             self._mode_warn_throttle -= 1
@@ -624,26 +599,14 @@ class ArmInnerLoop:
         """
         # ── Per-step joint delta clamp (mirrors XHand E3) ──
         # Safety ceiling against IK solver anomalies.  A normal target step is
-        # joint_max_speed ÷ outer_loop_hz (≈0.03 rad @50Hz outer, ≈0.098 rad
-        # @16Hz outer); the 0.3 rad default gives ~10x / ~3x headroom respectively.
+        # joint_max_speed ÷ outer_loop_hz: ≈0.098 rad @16Hz outer (~3x headroom).
         clamped = target[:7].copy()
         if self._cfg.max_joint_delta > 0 and self._last_sent_target is not None:
             delta = clamped - self._last_sent_target
             delta = np.clip(delta, -self._cfg.max_joint_delta, self._cfg.max_joint_delta)
             clamped = self._last_sent_target + delta
 
-        # ── Soft-start speed ramp ──
-        # Linearly ramp speed_ramp_min → joint_max_speed over first N frames.
-        # Prevents abrupt motion when teleop engages (e.g. after idle/home).
-        if self._cfg.speed_ramp_frames > 0 and self._ramp_step < self._cfg.speed_ramp_frames:
-            t = self._ramp_step / self._cfg.speed_ramp_frames
-            speed = self._cfg.speed_ramp_min + (self._cfg.joint_max_speed - self._cfg.speed_ramp_min) * t
-            # Ramp re-armed mid-motion (main-thread stall → hold → fresh target) must
-            # never command a speed cap below the arm's actual joint speed — Mode 6
-            # firmware rejects that with C24 (Speed Exceeds Limit).
-            speed = min(self._cfg.joint_max_speed, max(speed, 1.25 * self._qvel_inf))
-        else:
-            speed = self._cfg.joint_max_speed
+        speed = self._cfg.joint_max_speed
 
         try:
             code = arm.set_servo_angle(
@@ -688,7 +651,6 @@ class ArmInnerLoop:
                 with self._lock:
                     self._arm_target = None
                 self._recover_mode(arm)
-                self._ramp_step = 0  # re-arm soft-start ramp
                 return
             else:
                 logger.error(
@@ -704,7 +666,6 @@ class ArmInnerLoop:
         else:
             self._last_sent_target = clamped.copy()
             self._last_sent_cmd = clamped.copy()  # sent stream (plan §4.9)
-            self._ramp_step += 1
 
     # ── Helpers ──
 
@@ -718,37 +679,36 @@ class ArmInnerLoop:
         is effectively dead (observed as ``set_mode(1)`` returning code 10
         repeatedly during return_home).
 
-        Returns ``True`` on success, ``False`` if all re-init attempts fail.
+        Returns ``True`` on success, ``False`` if the re-init attempt fails.
         """
         arm.clean_error()
         arm.clean_warn()
         arm.set_state(0)
 
-        # Re-init Mode 6 with retries (firmware may reject the transition
-        # while internal error state is still settling).
-        for attempt in range(3):
-            try:
-                arm.set_mode(0)
-                arm.set_state(0)
-                time.sleep(0.05)
-                arm.set_mode(6)
-                arm.set_state(0)
-                time.sleep(0.05)
-                arm.set_state(0)
-                actual_mode = getattr(arm, "mode", -1)
-                if actual_mode == 6:
-                    logger.info("ArmInnerLoop: Mode 6 re-initialised (attempt %d)", attempt + 1)
-                    return True
-                logger.warning(
-                    "ArmInnerLoop: set_mode(6) returned but mode=%d (attempt %d/3)",
-                    actual_mode,
-                    attempt + 1,
-                )
-            except (RuntimeError, OSError) as e:
-                logger.warning("ArmInnerLoop: Mode 6 re-init attempt %d failed: %s", attempt + 1, e)
-            time.sleep(0.1)
+        # Re-init Mode 6 — single attempt.  The XArm SDK's own ``_set_mode``
+        # uses a single attempt with no retry loop.  The 3-retry loop added
+        # ~600 ms worst-case blocking (~18 inner-loop ticks at 30Hz) without
+        # evidence that retries improve firmware recovery.
+        try:
+            arm.set_mode(0)
+            arm.set_state(0)
+            time.sleep(0.05)
+            arm.set_mode(6)
+            arm.set_state(0)
+            time.sleep(0.05)
+            arm.set_state(0)
+            actual_mode = getattr(arm, "mode", -1)
+            if actual_mode == 6:
+                logger.info("ArmInnerLoop: Mode 6 re-initialised")
+                return True
+            logger.warning(
+                "ArmInnerLoop: set_mode(6) returned but mode=%d",
+                actual_mode,
+            )
+        except (RuntimeError, OSError) as e:
+            logger.warning("ArmInnerLoop: Mode 6 re-init failed: %s", e)
 
-        logger.error("ArmInnerLoop: failed to re-init Mode 6 after 3 attempts — arm may be in degraded mode")
+        logger.error("ArmInnerLoop: failed to re-init Mode 6 — arm may be in degraded mode")
         return False
 
     def _hold_position(self, arm) -> None:

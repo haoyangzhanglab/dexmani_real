@@ -5,7 +5,7 @@
   2. no_nan_action  — actions contain no NaN values
   3. non_zero_variance — each dimension has variance > epsilon
   4. camera_fresh   — camera frames are non-all-zero (if camera data present)
-  5. min_frames     — episode has >= min_frames frames (default 50 ≙ 1s @50Hz)
+  5. min_frames     — episode has >= min_frames frames (default 16 ≙ 1s @16Hz)
   6. no_duplicate_frames  — no consecutive identical frames (stuck sensor)
   7. timestamp_monotonic  — timestamps non-decreasing (duplicates = forward-fill)
   8. camera_stall   — <=10% of frames with stale (frozen) camera data
@@ -24,6 +24,8 @@ from typing import Any
 
 import h5py
 import numpy as np
+
+from dexmani_real.recording.episode_reader import EpisodeReader
 
 __all__ = ["DataValidator", "ValidationReport", "ValidationCheck"]
 
@@ -82,7 +84,8 @@ class DataValidator:
         checks: list[ValidationCheck] = []
 
         try:
-            with h5py.File(str(h5_path), "r") as f:
+            with EpisodeReader(h5_path) as reader:
+                f = reader.h5f  # shorthand for non-camera HDF5 access
                 meta = dict(f["meta"].attrs) if "meta" in f else {}
                 report.episode_metadata = {k: v for k, v in meta.items() if not isinstance(v, (np.ndarray, bytes))}
 
@@ -102,7 +105,7 @@ class DataValidator:
                         checks.append(self._check_variance(f, key))
 
                 # ── 4. Camera freshness ──
-                checks.append(self._check_camera(f))
+                checks.append(self._check_camera(reader))
 
                 # ── 5. Minimum frames ──
                 checks.append(self._check_min_frames(f))
@@ -114,7 +117,7 @@ class DataValidator:
                 checks.append(self._check_timestamp_monotonicity(f))
 
                 # ── 8. Camera stall (frozen frames, schema v6+) ──
-                checks.append(self._check_camera_stall(f))
+                checks.append(self._check_camera_stall(reader))
 
         except (OSError, KeyError) as e:
             checks.append(
@@ -165,14 +168,15 @@ class DataValidator:
             detail=f"{key}: {zero_var}/{var.shape[0]} dims with zero variance" if zero_var > 0 else f"{key}: OK",
         )
 
-    def _check_camera(self, f: h5py.File) -> ValidationCheck:
-        if "rgb" not in f:
+    def _check_camera(self, reader: EpisodeReader) -> ValidationCheck:
+        f = reader.h5f
+        if "rgb" not in f and not reader.has_video("rgb"):
             return ValidationCheck(
                 name="camera_fresh",
                 passed=True,
                 detail="No camera data (skipped).",
             )
-        rgb = np.asarray(f["rgb"][:], dtype=np.uint8)
+        rgb = reader.read_camera_all("rgb")
         # Check first 10 frames: if any have non-zero pixels, camera is OK
         sample = rgb[: min(10, rgb.shape[0])]
         all_zero = all(np.count_nonzero(frame) == 0 for frame in sample)
@@ -248,9 +252,10 @@ class DataValidator:
             ),
         )
 
-    def _check_camera_stall(self, f: h5py.File) -> ValidationCheck:
+    def _check_camera_stall(self, reader: EpisodeReader) -> ValidationCheck:
         """Check /flag_camera_fresh (schema v6+): frozen/forward-filled camera data."""
-        if "flag_camera_fresh" not in f or "rgb" not in f:
+        f = reader.h5f
+        if "flag_camera_fresh" not in f or ("rgb" not in f and not reader.has_video("rgb")):
             return ValidationCheck(
                 name="camera_stall",
                 passed=True,

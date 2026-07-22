@@ -28,7 +28,7 @@ class RateManager:
     PREEMPT_RT or standard kernels.
 
     Usage:
-        rm = RateManager(50.0)  # 50 Hz
+        rm = RateManager(50.0)  # e.g. 50 Hz
         while running:
             do_work()
             rm.wait()

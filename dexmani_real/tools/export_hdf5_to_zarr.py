@@ -59,6 +59,8 @@ import numpy as np
 import zarr
 from numcodecs import Blosc
 
+from dexmani_real.recording.episode_reader import EpisodeReader
+
 # Default observation / action keys to read from HDF5.
 # Maps HDF5 dataset path → target dimension per frame.
 _OBS_KEYS: list[tuple[str, int]] = [
@@ -72,13 +74,15 @@ _ACTION_KEYS: list[tuple[str, int]] = [
 ]
 
 
-def _detect_camera_keys(f: h5py.File) -> list[tuple[str, str, str]]:
+def _detect_camera_keys(reader: EpisodeReader) -> list[tuple[str, str, str]]:
     """Return list of (rgb_key, depth_key, label) for all cameras in the file.
 
     ``label`` is "" for single-camera or the serial string for multi-camera.
+    Detects both legacy HDF5 datasets and video sidecars.
     """
+    f = reader.h5f
     pairs: list[tuple[str, str, str]] = []
-    if "rgb" in f:
+    if "rgb" in f or reader.has_video("rgb"):
         pairs.append(("rgb", "depth", ""))
     for key in sorted(f.keys()):
         if key.endswith("_rgb") and key != "rgb":
@@ -240,7 +244,8 @@ def load_episodes(
                 skipped_meta += 1
                 continue
 
-            with h5py.File(str(h5_path), "r") as f:
+            with EpisodeReader(h5_path) as reader:
+                f = reader.h5f
                 n_frames = f["arm_qpos"].shape[0]
                 valid = np.ones(n_frames, dtype=bool)
 
@@ -282,13 +287,15 @@ def load_episodes(
                 # ── Camera frames ──
                 episode_rgb: np.ndarray | None = None
                 episode_depth: np.ndarray | None = None
-                cam_keys = _detect_camera_keys(f)
+                cam_keys = _detect_camera_keys(reader)
                 if cam_keys:
                     # Use first camera only (additional cameras stored under data/{label}_rgb)
                     rgb_k, depth_k, _label = cam_keys[0]
-                    if rgb_k in f and depth_k in f:
-                        episode_rgb = np.asarray(f[rgb_k][:], dtype=np.uint8)[valid]
-                        episode_depth = np.asarray(f[depth_k][:], dtype=np.uint16)[valid]
+                    has_rgb = "rgb" in f or reader.has_video(rgb_k)
+                    has_depth = "depth" in f or reader.has_video(depth_k)
+                    if has_rgb and has_depth:
+                        episode_rgb = reader.read_camera_all(rgb_k)[valid]
+                        episode_depth = reader.read_camera_all(depth_k)[valid]
                         # Read camera metadata from first episode that has it
                         if camera_meta is None:
                             camera_meta = _read_camera_meta(f)

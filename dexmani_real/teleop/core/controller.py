@@ -7,9 +7,9 @@ State machine:
       ESC / VR-disconnect timeout → EMERGENCY_STOP
 
 Arm control is handled by ArmInnerLoop (daemon thread, mode 6 online trajectory
-planning @ 50Hz). Controller sends target qpos via inner.set_target(), reads
+planning @ 30Hz). Controller sends target qpos via inner.set_target(), reads
 state via inner.get_state(). Firmware handles trajectory smoothing with configurable
-speed/accel limits (default: 90°/s, 500°/s²).
+speed/accel limits (default: 120°/s, 500°/s²).
 Ref: BunnyVisionPro _internal_control_arm_qpos() thread pattern.
 """
 
@@ -123,7 +123,7 @@ class TeleopController:
         self.tracker = tracker
         self.dry_run = cfg.dry_run
 
-        # ── Arm inner loop (in-process thread, 50Hz default, mode 6) ──
+        # ── Arm inner loop (in-process thread, 30Hz default, mode 6) ──
         self._arm_inner: ArmInnerLoop | None = None
         self._sync: SharedSyncPrimitives | None = None
         if not self.dry_run:
@@ -210,6 +210,7 @@ class TeleopController:
         # VR disconnect auto-stop (ref: LeFranX franka_server.cpp COMMAND_TIMEOUT_SEC=0.5)
         self._vr_disconnect_timeout_s: float = float(cfg.vr_disconnect_timeout_s)
         self._vr_consecutive_loss: int = 0
+        self._vr_first_loss_ts: float = 0.0  # wall-clock timestamp of first lost frame
 
     # ── Lifecycle ──
 
@@ -283,13 +284,17 @@ class TeleopController:
         # Cumulative timeout (vr_disconnect_timeout_s, default 3.0s):
         #   auto-stop recording and transition to IDLE to prevent the robot
         #   from holding a stale pose indefinitely.
+        # Uses wall-clock time (not frame count) — remains accurate when the
+        # control loop overruns its period (IK spikes, GC pauses).
         # Ref: LeFranX franka_server.cpp:58 COMMAND_TIMEOUT_SEC = 0.5
         if age_s > self._VR_STALE_THRESHOLD_S or vr_frame is None:
             self._vr_consecutive_loss += 1
+            if self._vr_first_loss_ts == 0.0:
+                self._vr_first_loss_ts = time.perf_counter()
             if not self.dry_run and self._arm_inner is not None:
                 self._arm_inner.set_target(None)  # hold position
-            # Check cumulative timeout
-            loss_duration_s = self._vr_consecutive_loss / self.limiter.target_hz
+            # Cumulative timeout: wall-clock elapsed since first lost frame.
+            loss_duration_s = time.perf_counter() - self._vr_first_loss_ts
             # Record held frame before checking the cumulative timeout — if
             # we auto-stop here, the final frame before the transition is
             # still part of the episode.
@@ -304,9 +309,11 @@ class TeleopController:
                 self._stop_recording(save=False)
                 self.state = ControllerState.IDLE
                 self._vr_consecutive_loss = 0
+                self._vr_first_loss_ts = 0.0
                 logger.info("=== STATE: TELEOP → IDLE (VR timeout) ===")
             return
         self._vr_consecutive_loss = 0  # reset on valid frame
+        self._vr_first_loss_ts = 0.0
 
         # ── 3. Read arm state from PID process ──
         if self.dry_run:
@@ -320,7 +327,7 @@ class TeleopController:
             if error_state:
                 self._escalate_to_emergency("Arm inner loop error")
                 return
-            # Dynamics from the inner loop's 50Hz readback (single SDK connection) —
+            # Dynamics from the inner loop's 30Hz readback (single SDK connection) —
             # recorded into /arm_qvel + /arm_tau and feeds the torque/temp gates.
             arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()  # type: ignore[union-attr]  # non-None: not dry_run
             state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)

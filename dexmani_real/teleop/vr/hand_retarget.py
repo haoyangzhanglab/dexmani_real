@@ -40,6 +40,7 @@ from dex_retargeting.robot_wrapper import RobotWrapper
 from dex_retargeting.seq_retarget import SeqRetargeting
 
 from dexmani_real import ASSET_DIR
+from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -298,7 +299,6 @@ class XHandRetargeter:
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
-        low_pass_alpha: float | None = None,
     ):
         self.hand_type = hand_type
         self.retargeting_type = retargeting_type
@@ -322,11 +322,6 @@ class XHandRetargeter:
         ]
 
         self.load_retargeter()
-
-        # Override the YAML low_pass_alpha (tuned at 50Hz) — callers running at a
-        # different control rate pass a tau-preserving value (utils.signal_utils).
-        if low_pass_alpha is not None:
-            self.low_pass_alpha = low_pass_alpha
 
     def load_retargeter(self):
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
@@ -400,16 +395,7 @@ class XHandRetargeter:
 
     @low_pass_alpha.setter
     def low_pass_alpha(self, value: float) -> None:
-        """Tune the built-in EMA smoothing strength at runtime.
-
-        dex_retargeting applies LPFilter after NLP optimisation, before returning
-        qpos: ``y += alpha * (x - y)`` — alpha is the NEW-value weight.
-        Default from YAML config: 0.6 (60 % new + 40 % old per frame at 50 Hz).
-
-        1.0 = pass-through (raw optimizer output, no smoothing)
-        0.6 = default (moderate smoothing)
-        →0  = ever-stronger smoothing; 0.0 freezes the output entirely
-        """
+        """Tune the LPFilter smoothing strength at runtime (default from YAML: 0.6)."""
         self.retargeter.filter.alpha = float(value)
 
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
@@ -441,13 +427,32 @@ class XHandRetargeter:
         ref_value = scaled_landmarks[task_indices, :] - scaled_landmarks[origin_indices, :]
         return ref_value
 
-    def retarget(self, hand_joint_pos: np.ndarray | None) -> np.ndarray | None:
-        if hand_joint_pos is None:
+    def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
+        """Retarget raw VR landmarks (operator-frame, 21x3) to XHand joint qpos.
+
+        Handles coordinate transform (operator → MANO), input validation,
+        and NLP optimization.  Returns None on any failure; caller falls
+        back to the previous hand command.
+        """
+        if landmarks is None:
+            return None
+        if landmarks.shape != (21, 3):
+            return None
+        if not np.all(np.isfinite(landmarks)):
+            logger.warning("VR landmarks contain NaN/Inf — holding hand position")
+            return None
+
+        # ── Coordinate transform: operator → MANO ──
+        try:
+            wrist_rot = estimate_frame_from_hand_points(landmarks)
+            mano_landmarks = landmarks @ wrist_rot @ OPERATOR2MANO_RIGHT
+        except (ValueError, TypeError, np.linalg.LinAlgError):
+            logger.warning("Coordinate transform failed — holding hand position")
             return None
 
         start_time = time.time()
 
-        ref_value = self._build_ref_value(hand_joint_pos)
+        ref_value = self._build_ref_value(mano_landmarks)
         qpos = self.retargeter.retarget(ref_value, fixed_qpos=self.fixed_joint_values)
 
         if qpos is None:
@@ -464,3 +469,14 @@ class XHandRetargeter:
             logger.info("retarget_debug: %s", self.last_debug)
 
         return qpos
+
+    def reset(self) -> None:
+        """Reset retargeter state for a clean episode start.
+
+        Resets the SLSQP warm-start seed, the LPFilter EMA accumulator,
+        and the DexPilot projection indicators.
+        """
+        self.retargeter.reset()  # SeqRetargeting: resets last_qpos + counters
+        if self.retargeter.filter is not None:
+            self.retargeter.filter.reset()  # LPFilter: clears EMA accumulator
+        self.retargeter.optimizer.projected[:] = False  # DexPilot: clears projection state

@@ -76,8 +76,9 @@ class XHandConfig(FromDictMixin):
     baudrate: int = 3_000_000
     device_id: int = 0
 
-    # Connection retry (RS485 may need several attempts after cold start)
-    open_serial_retries: int = 3  # ref: LeFranX (no retry, but RS485 needs a few attempts)
+    # Connection retry (single attempt — C++ SDK already retries internally;
+    # extra Python-level retries only multiply the "No socket connection" noise)
+    open_serial_retries: int = 1
     open_serial_retry_delay_s: float = 2.0
 
     dt: float = 1.0 / 30.0  # 30 Hz (ref: LeFranX, DexUMI)
@@ -192,19 +193,11 @@ class XHandConfig(FromDictMixin):
     # unsupported-force-mode warnings) are logged but do NOT trigger error_state.
     filter_known_sensor_errors: bool = True
 
-    # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
-    # 0.0 = disabled (default, backward compatible). 0.3 = LeFranX recommended.
-    # Exponential Moving Average filters high-frequency jitter from position commands,
-    # producing smoother finger motion.
-    # NOTE: dex_retargetingʼs LPFilter(alpha=0.6) already applies EMA post-optimization.
-    # Enable this only if additional hardware-level smoothing is needed.
-    ema_alpha: float = 0.0
-
     # ── E3: Per-step delta jump limit ──
-    # Hard-clips the per-frame change in each joint command (rad). Complements
-    # dex_retargetingʼs LPFilter — EMA attenuates noise, this safety-gates outliers.
+    # Hard-clips the per-frame change in each joint command (rad).
+    # Safety-gates outliers from dex_retargetingʼs LPFilter output.
     # Scalar: same limit for all 12 joints.  (12,) array: per-joint limits.
-    # 0.0 = disabled. Recommended: 0.3 rad (~17°/step, ~850°/s at 50 Hz).
+    # 0.0 = disabled. Recommended: 0.3 rad (~17°/step, ~255°/s at 16 Hz).
     max_delta_rad: float | np.ndarray = 0.3
 
     # ── F1: Tactile contact detection ──
@@ -231,9 +224,6 @@ class XHand(ConnectionStateMixin):
         self._stub_mode = False  # True when xhand_controller SDK unavailable (ref: LeFranX)
         self.last_hand_ids: list[int] = []
         self.cached_comm_type = self._resolve_comm_type()
-
-        # ── E2: EMA filtering ──
-        self._ema_qpos: np.ndarray | None = None
 
     # ── Connect lifecycle ──
 
@@ -518,11 +508,19 @@ class XHand(ConnectionStateMixin):
             return False
 
         target_qpos = self._array12(action)
+        # NaN/Inf sanitize — a downstream NaN propagates through the hand
+        # firmware undetected, potentially leaving fingers at unknown positions.
+        if not np.all(np.isfinite(target_qpos)):
+            logger.warning("XHand.send_action: NaN/Inf in target qpos — holding last valid command")
+            if self.last_qpos_cmd is not None:
+                target_qpos = self.last_qpos_cmd.copy()
+            else:
+                return False
         qpos_cmd = self._limit_joint_range(target_qpos)
 
         # ── E3: Delta jump limit ──
         # Hard safety gate: per-step change never exceeds max_delta_rad on any
-        # joint, regardless of EMA state.  Complements dex_retargetingʼs LPFilter.
+        # joint.  Complements dex_retargetingʼs LPFilter.
         # Supports per-joint limits: pass a (12,) ndarray for joint-specific caps.
         limit = np.broadcast_to(np.asarray(self.config.max_delta_rad), (12,))
         if np.any(limit > 0) and self.last_qpos_cmd is not None:
@@ -530,10 +528,14 @@ class XHand(ConnectionStateMixin):
             delta = np.clip(delta, -limit, limit)
             qpos_cmd = self.last_qpos_cmd + delta
 
-        # ── E2: EMA smoothing (ref: LeFranX xhand_vr_teleoperator.py:306-308) ──
-        if self.config.ema_alpha > 0 and self._ema_qpos is not None:
-            qpos_cmd = (1.0 - self.config.ema_alpha) * self._ema_qpos + self.config.ema_alpha * qpos_cmd
-        self._ema_qpos = qpos_cmd.copy()
+        # ── Deadband throttle: skip redundant sends for sub-noise changes ──
+        # At 16Hz, retargeting tremor produces sub-degree jitter that generates
+        # redundant RS485 commands. Skip sends when max joint delta is below
+        # the deadband (0.001 rad ≈ 0.06°). Firmware holds position on no command.
+        if self.last_qpos_cmd is not None:
+            delta = np.max(np.abs(qpos_cmd - self.last_qpos_cmd))
+            if delta < 0.001:
+                return True
 
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)

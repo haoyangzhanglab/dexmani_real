@@ -20,7 +20,7 @@ class RateLimiter:
     """Rate limiter that compensates for computation time.
 
     Usage:
-        limiter = RateLimiter(50.0)  # 50 Hz
+        limiter = RateLimiter(50.0)  # e.g. 50 Hz
         while True:
             do_work()
             limiter.wait()  # sleeps only the remaining time in this cycle
@@ -56,7 +56,7 @@ class RateLimiter:
                 self._overdue_cycles,
                 self._total_cycles + 1,
             )
-            self._overdue_throttle = 50  # throttle: ~1 warning/s at 50 Hz
+            self._overdue_throttle = 50  # throttle: ~1 warning/s at the target rate
         else:
             self._overdue_cycles += 1
             self._overdue_throttle -= 1

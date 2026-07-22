@@ -209,7 +209,7 @@ class TeleopProfile(FromDictMixin):
     """Online teleoperation IK/servo configuration."""
 
     max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
-    # Speed limiting is handled by ArmInnerLoop (50 Hz, Mode 6): per-step joint
+    # Speed limiting is handled by ArmInnerLoop (30 Hz, Mode 6): per-step joint
     # delta clamp + firmware online trajectory planning (joint_max_speed/acc).
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
@@ -231,8 +231,34 @@ class TeleopProfile(FromDictMixin):
     # Lower score = better.  μ is the Yoshikawa manipulability measure.
     position_ik_num_random_seeds: int = 3  # extra random seeds around prev_cmd
     position_ik_seed_offset_deg: float = 5.0  # ±offset per joint for random seeds
+    teleop_ik_seed: int | None = 42  # deterministic RNG seed (set None for non-det legacy behavior)
     position_ik_manipulability_weight: float = 0.05  # higher → prefer dexterous configs
     position_ik_limit_penalty_weight: float = 0.01  # higher → prefer configs farther from limits
+    # Soft velocity tiebreaker: prefer candidates close to the previous command.
+    # This is NOT a hard ceiling (the 90° jump guard already handles that) — it is a
+    # lightweight preference that breaks ties between equally-valid IK solutions by
+    # penalising frame-to-frame oscillation.  Set to 0.0 to disable.
+    position_ik_velocity_weight: float = 0.03
+    # Per-joint weights for the velocity term.  Unlike joint_weights (which penalise
+    # static displacement from hardware position), velocity weights penalise frame-to-frame
+    # command changes and are tuned for joint INERTIA and RESPONSIVENESS rather than range:
+    #
+    #   J1 base (high inertia):       5.0 — heavy, resist oscillation aggressively
+    #   J2 shoulder (highest inertia): 1.5 — heaviest joint, moderate extra damping
+    #   J3 elbow:                      0.8 — neutral, slight relaxation vs position
+    #   J4 wrist pitch:                0.5 — small range provides natural penalty
+    #   J5 wrist roll (dexterity):     0.2 — primary manipulation axis, high freedom
+    #   J6 wrist yaw (dexterity):      0.3 — secondary orientation axis, high freedom
+    #   J7 tool flange (negligible):   0.1 — negligible inertia, near-zero resistance
+    #
+    # Effective velocity cost per radian (weight ÷ joint_range):
+    #   J1(0.398) > J2(0.361) > J4(0.121) > J3(0.064)
+    #   > J6(0.062) > J5(0.016) > J7(0.005)
+    #
+    # Contrast with position cost: J1 rises from #2→#1 (now most damped),
+    # J6 drops #3→#5 (2.7× freer), J5/J7 get 3-5× more freedom.
+    # Set to None to fall back to joint_weights (backward compatible).
+    velocity_joint_weights: tuple[float, ...] | None = (5.0, 1.5, 0.8, 0.5, 0.2, 0.3, 0.1)
 
     # ── Joint-specific IK scoring weights (ref: LeFranX weighted_ik.cpp:62-69) ──
     # Higher weight → solver penalises moving that joint away from its current
@@ -277,7 +303,7 @@ class TeleopProfile(FromDictMixin):
     # ── Null-space optimization ──
     # Post-IK null-space projection that adjusts the redundant DOF to repel
     # joints from their limits without altering the EEF pose (J · dq_null = 0).
-    # Enabled by default: the ~130 us overhead is negligible at 50 Hz, all
+    # Enabled by default: the ~130 us overhead is negligible at 30 Hz, all
     # safety gates (collision, pre-send, step-limit) run after this step,
     # and it cannot degrade EEF tracking by construction.
     enable_nullspace_optimization: bool = True

@@ -25,6 +25,7 @@ from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.collection_config import DEFAULT_MAX_RECORD_FRAMES
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
+from dexmani_real.recording.video_codec import VideoEncoder, VideoEncoderConfig
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -68,6 +69,7 @@ class EpisodeRecorder:
         control_hz: float = 50.0,
         min_frames: int = 50,
         arm_sent_stream: bool = False,
+        use_video: bool = False,
     ) -> None:
         if control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
@@ -82,6 +84,12 @@ class EpisodeRecorder:
         # (the IK target).  Off → byte-identical v8 behavior; nothing is wired to
         # pass the kwarg yet, so the flag alone is inert.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
+
+        # Opt-in H.264 video encoding (Phase 1): when True, rgb frames are
+        # written to a sidecar .rgb.mp4 file instead of (or in addition to)
+        # the HDF5 dataset.  Depth stays as HDF5+gzip — 16-bit depth requires
+        # HEVC 10-bit which is deferred to a later phase.
+        self._use_video: bool = bool(use_video)
 
         self._file: Any = None  # h5py.File | None at runtime; h5py ships no type stubs (File is Any)
         self._frame_count: int = 0
@@ -108,7 +116,6 @@ class EpisodeRecorder:
         self._cam_seen: bool = False
         self._last_camera_frame: dict[str, Any] | None = None
         self._last_camera_frames: dict[str, dict[str, Any]] | None = None
-        self._last_T_base_eef: np.ndarray | None = None
 
         # Camera freshness: last seen frame_number (tuple for multi-cam) and the
         # state.timestamp at which it last changed — drives /flag_camera_fresh.
@@ -118,7 +125,7 @@ class EpisodeRecorder:
         self._cam_last_change_ts: float = 0.0
 
         # Background camera writer: queue → thread → HDF5.
-        # Keeps the 50 Hz hot path at queue-push cost (~µs) instead of
+        # Keeps the 16 Hz hot path at queue-push cost (~µs) instead of
         # HDF5 resize + lzf compression (~2–3 ms).
         self._cam_queue: queue.Queue = queue.Queue(maxsize=200)
         self._cam_writer: threading.Thread | None = None
@@ -127,9 +134,14 @@ class EpisodeRecorder:
         self._cam_dropped: int = 0  # enqueue-side drops (writer backlog) — see add_frame
         self._hdf5_lock: threading.Lock = threading.Lock()
 
+        # Video sidecar encoders (opt-in, use_video=True).
+        # Created lazily on first camera frame, closed at stop_episode.
+        self._video_enc_rgb: VideoEncoder | None = None
+        self._video_enc_depth: VideoEncoder | None = None  # reserved for depth (future)
+
         # Deferred flush: when True the background writer thread will call
         # _flush_buffered() on its next iteration instead of blocking the
-        # 50 Hz hot path with HDF5 gzip + resize + fsync.
+        # 16 Hz hot path with HDF5 gzip + resize + fsync.
         self._flush_pending: bool = False
 
         # Pending async stop_episode thread (None = no pending stop).
@@ -210,7 +222,7 @@ class EpisodeRecorder:
         self._cam_seen = False
         self._last_camera_frame = None
         self._last_camera_frames = None
-        self._last_T_base_eef = None
+
         self._cam_last_frame_number = None
         self._cam_last_change_ts = 0.0
 
@@ -340,7 +352,6 @@ class EpisodeRecorder:
         action,
         vr_frame: dict[str, Any],
         camera_frame: dict[str, Any] | None = None,
-        T_base_eef: np.ndarray | None = None,
         camera_frames: dict[str, dict[str, Any]] | None = None,
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
@@ -440,7 +451,7 @@ class EpisodeRecorder:
         k = self._buffer.size - prev_size  # grid slots advanced (usually 1; 0 = dup bucket)
 
         # ── Periodic flush: signal background writer thread instead of
-        # blocking the 50 Hz hot path with HDF5 gzip + resize + fsync.
+        # blocking the 16 Hz hot path with HDF5 gzip + resize + fsync.
         if self._buffer.size - self._flushed_frames >= self._flush_interval:
             self._flush_pending = True
 
@@ -453,7 +464,6 @@ class EpisodeRecorder:
             self._cam_seen = True
             self._last_camera_frame = camera_frame
             self._last_camera_frames = camera_frames
-            self._last_T_base_eef = T_base_eef
 
         if self._cam_seen and k > 0:
             self._ensure_hdf5()
@@ -511,7 +521,7 @@ class EpisodeRecorder:
 
         Also handles deferred buffer flushes (signalled by the hot path via
         ``_flush_pending``) so HDF5 gzip + resize + fsync never blocks the
-        50 Hz control loop.
+        16 Hz control loop.
         """
         _hdf5_flush_every_n = 100  # HDF5 metadata flush (cheap)
         while not self._cam_writer_stop.is_set():
@@ -593,6 +603,24 @@ class EpisodeRecorder:
                         compression="lzf",
                     )
                 self._fill_to("rgb", rgb, target_len)
+
+                # ── Video sidecar (opt-in, use_video=True) ──
+                # Write duplicate frames for forward-filled grid slots so
+                # video frame count == HDF5 dataset length at all times.
+                # H.264 encodes identical consecutive frames as near-zero-cost
+                # skip blocks, so the storage overhead is negligible.
+                if self._use_video:
+                    if self._video_enc_rgb is None:
+                        h, w = rgb.shape[:2]
+                        self._video_enc_rgb = VideoEncoder(
+                            path=Path(self._episode_path).with_suffix(".rgb.mp4"),  # type: ignore[arg-type]
+                            fps=self.control_hz,
+                            width=w,
+                            height=h,
+                        )
+                    for _ in range(self._video_enc_rgb.frame_count, target_len):
+                        self._video_enc_rgb.write_frame(rgb)
+
             if depth is not None:
                 if "depth" not in self._datasets:
                     self._datasets["depth"] = self._file.create_dataset(
@@ -804,12 +832,25 @@ class EpisodeRecorder:
             self._cam_seen = False
             self._last_camera_frame = None
             self._last_camera_frames = None
-            self._last_T_base_eef = None
+
             self._cam_last_frame_number = None
             self._cam_last_change_ts = 0.0
             self._cam_writer = None
             self._cam_written = 0
             self._cam_dropped = 0
+            # Video sidecar encoders — close best-effort on error.
+            if self._video_enc_rgb is not None:
+                try:
+                    self._video_enc_rgb.close()
+                except Exception:
+                    pass
+                self._video_enc_rgb = None
+            if self._video_enc_depth is not None:
+                try:
+                    self._video_enc_depth.close()
+                except Exception:
+                    pass
+                self._video_enc_depth = None
 
     def _stop_episode_impl_inner(self, success: bool, reason: str, truncated: bool) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
@@ -847,7 +888,7 @@ class EpisodeRecorder:
         buf_size = self._buffer.size if self._buffer is not None else 0
 
         # ── Camera forward-fill: pad camera datasets to match grid length ──
-        # Camera frames are written by the background thread at ~50 Hz cadence,
+        # Camera frames are written by the background thread at ~30 Hz cadence,
         # but when k > 1 (minor timing jitter) the camera dataset falls slightly
         # behind the non-camera grid.  Forward-fill the last frame to keep every
         # dataset index-aligned.
@@ -869,6 +910,26 @@ class EpisodeRecorder:
         self._buffer = None
         self._frame_count = buf_size
 
+        # ── Video forward-fill: pad to match grid length ──
+        # The HDF5 forward-fill above ensures every camera dataset has exactly
+        # buf_size rows.  Do the same for the video sidecar so video frame count
+        # == grid frame count (trivial index alignment at read time).
+        if self._video_enc_rgb is not None:
+            vn = self._video_enc_rgb.frame_count
+            if 0 < vn < buf_size:
+                gap = buf_size - vn
+                last_frame = self._datasets.get("rgb")
+                if last_frame is not None:
+                    pad = np.asarray(last_frame[vn - 1])
+                    for _ in range(gap):
+                        self._video_enc_rgb.write_frame(pad)
+
+        # ── Finalise video sidecar encoders ──
+        if self._video_enc_rgb is not None:
+            self._video_enc_rgb.close()
+        if self._video_enc_depth is not None:
+            self._video_enc_depth.close()
+
         # ── Write final metadata ──
         if self._file is not None:
             with self._hdf5_lock:
@@ -888,6 +949,14 @@ class EpisodeRecorder:
                 meta.attrs["has_timestamps"] = "timestamp" in self._file
                 meta.attrs["truncated"] = bool(truncated)
                 meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
+                # Video codec (opt-in): non-empty → sidecar .rgb.mp4 present.
+                # Empty → legacy LZF-only episode.
+                if self._video_enc_rgb is not None:
+                    meta.attrs["video_codec"] = "libx264rgb"
+                    meta.attrs["video_crf"] = 18
+                else:
+                    meta.attrs["video_codec"] = ""
+                    meta.attrs["video_crf"] = 0
                 # Enqueue-side camera drops (writer backlog): the target_len
                 # backfill keeps datasets index-aligned, so these counters are
                 # the only disk-side record that camera content was lost.
@@ -922,12 +991,15 @@ class EpisodeRecorder:
         self._cam_seen = False
         self._last_camera_frame = None
         self._last_camera_frames = None
-        self._last_T_base_eef = None
+
         self._cam_last_frame_number = None
         self._cam_last_change_ts = 0.0
         self._cam_writer = None
         self._cam_written = 0
         self._cam_dropped = 0
+        # Video sidecar encoders (closed above; drop references).
+        self._video_enc_rgb = None
+        self._video_enc_depth = None
 
     def _fill_to(self, key: str, data: np.ndarray, target_len: int) -> None:
         """Fill dataset ``key`` up to ``target_len`` rows with ``data`` (broadcast).

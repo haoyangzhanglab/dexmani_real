@@ -8,14 +8,9 @@ Ref: ManiUniCon validate_action pattern.
 
 from __future__ import annotations
 
-from typing import Callable
-
 import numpy as np
 
 from dexmani_real.robot.types import _ARM_TEMP_LIMIT_C, _ARM_TORQUE_LIMIT_NM, RobotAction
-from dexmani_real.utils.log import get_logger
-
-logger = get_logger(__name__)
 
 
 def validate_action(
@@ -25,8 +20,6 @@ def validate_action(
     actual_arm_qpos: np.ndarray | None = None,
     actual_arm_tau: np.ndarray | None = None,
     actual_arm_temps: np.ndarray | None = None,
-    env_collision_check: Callable[[np.ndarray], bool] | None = None,
-    self_collision_check: Callable[[np.ndarray], bool] | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
 
@@ -35,14 +28,15 @@ def validate_action(
       2. Arm connection
       3. Torque gating  — per-joint threshold check
       4. Temperature gating — 70 °C per-joint threshold
-      5. Env collision check — caller-provided predicate (if wired)
-      5b. Self-collision check — caller-provided predicate (if wired)
-      6. Workspace clamp — per-axis clip (non-fatal)
-      7. Arm joint-limit clipping (qpos_min/max)
-      8. Hand joint-limit clipping (qpos_min/max)
+      5. Arm joint-limit clipping — moved to ArmInnerLoop._send_target
 
-    All new parameters are optional — None skips the check (backward
-    compatible with existing call sites).
+    Removed from this gate (covered elsewhere):
+      - Workspace clamp → TeleopPipeline Stage 3 (before IK)
+      - Hand joint-limit clip → XHand.send_action() internal _limit_joint_range
+      - Self-collision check → IK Stage (_check_teleop_collision_gate) + firmware error 22
+      - Env collision check → IK Stage (_check_teleop_collision_gate)
+
+    All optional parameters — None skips the check (backward compatible).
     """
     # 1. Hardware error state — hand errors gate only when the hand is connected:
     #    arm-only / degraded mode must not fail because XHand.is_error() is True
@@ -73,41 +67,8 @@ def validate_action(
             if len(over_idx) > 0:
                 return False, f"temperature limit exceeded: joints={over_idx.tolist()}"
 
-    # 5. Env collision check (caller-provided predicate)
-    if env_collision_check is not None and actual_arm_qpos is not None:
-        try:
-            if not env_collision_check(actual_arm_qpos):
-                return False, "env collision detected"
-        except Exception as e:
-            logger.warning("env_collision_check raised: %s — skipping", e)
-
-    # 5b. Self-collision check (caller-provided predicate).
-    # Defense-in-depth: the IK pipeline checks self-collision at solution time;
-    # this gate catches any code path that bypasses the IK check, a stale
-    # collision model, or step-clipped commands that drift into collision.
-    # The predicate returns True when the command qpos is collision-safe.
-    if self_collision_check is not None and action.arm_qpos_cmd is not None:
-        try:
-            if not self_collision_check(action.arm_qpos_cmd):
-                return False, "self-collision detected"
-        except Exception as e:
-            logger.warning("self_collision_check raised: %s — skipping", e)
-
-    # 6. Workspace clamp (non-fatal)
-    if action.target_eef_pos is not None:
-        action.target_eef_pos[:] = robot.clamp_workspace_pos(action.target_eef_pos)
-
-    # 7. Joint-limit clipping (arm) — soft limits, strictly inside the firmware
-    #    reduced range so boundary-clipped commands never trip a reduced-mode
-    #    fault (see xarm7._inset_joint_limits)
-    arm_lo = robot.arm.qpos_min_soft
-    arm_hi = robot.arm.qpos_max_soft
-    action.arm_qpos_cmd[:] = np.clip(action.arm_qpos_cmd, arm_lo, arm_hi)
-
-    # 8. Joint-limit clipping (hand)
-    hand_lo = robot.hand.config.qpos_min
-    hand_hi = robot.hand.config.qpos_max
-    if action.hand_qpos_cmd is not None:
-        action.hand_qpos_cmd[:] = np.clip(action.hand_qpos_cmd, hand_lo, hand_hi)
+    # 5. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
+    #    Absolute clip is applied there, before the per-step delta clamp,
+    #    consolidating all joint-safety mechanics in one place.
 
     return True, "ok"
