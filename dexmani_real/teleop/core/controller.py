@@ -62,8 +62,8 @@ from dataclasses import dataclass
 @dataclass
 class TeleopControllerConfig:
     target_hz: float = 50.0
-    ema_alpha_pos: float = 0.8
-    ema_alpha_rot: float = 0.4
+    ema_alpha_pos: float = 0.5
+    ema_alpha_rot: float = 0.25
     dry_run: bool = False
     use_shm_vr: bool = False
     inner_loop_cfg: ArmInnerLoopConfig | None = None
@@ -98,8 +98,8 @@ class TeleopController:
         tracker: QuestHandTracker | None = None,
         keyboard_queue: object | None = None,
         target_hz: float = 50.0,
-        ema_alpha_pos: float = 0.8,
-        ema_alpha_rot: float = 0.4,
+        ema_alpha_pos: float = 0.5,
+        ema_alpha_rot: float = 0.25,
         dry_run: bool = False,
         recorder: EpisodeRecorder | None = None,
         use_shm_vr: bool = False,
@@ -651,8 +651,9 @@ class TeleopController:
             "hand_max_qvel_deg_s": float(np.degrees(hand_delta_clip)) * float(self.limiter.target_hz),
             "hand_ema_alpha": _f(getattr(hand_cfg, "ema_alpha", 0.0), 0.0) if hand_cfg is not None else 0.0,
             "hand_low_pass_alpha": _f(getattr(self.retargeter, "low_pass_alpha", 0.6), 0.6),
-            "ema_alpha_pos": _f(self._ema_alpha_pos, 0.8),
-            "ema_alpha_rot": _f(self._ema_alpha_rot, 0.4),
+            "ema_alpha_pos": _f(self._ema_alpha_pos, 0.5),
+            "ema_alpha_rot": _f(self._ema_alpha_rot, 0.25),
+            "joint_max_acc": float(np.degrees(_f(getattr(inner_cfg, "joint_max_acc", 8.7266), 8.7266))),
         }
 
     def _start_recording(self) -> None:

@@ -677,12 +677,18 @@ def main():
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
                     gc.collect()  # drain cyclic garbage before a new episode
+                    _record_cfg = dict(camera.pointcloud_meta) if camera is not None and camera.pointcloud_meta else {}
+                    _record_cfg.update({
+                        "ema_alpha_pos": EMA_ALPHA_POS,
+                        "ema_alpha_rot": EMA_ALPHA_ROT,
+                        "joint_max_acc": float(ARM_MAX_ACC_DEG_S2),
+                    })
                     if not recorder.start_episode(
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
                         camera_name=_resolve_camera_name(),
                         camera_K=camera.camera_K if camera is not None else None,
-                        record_config=camera.pointcloud_meta if camera is not None else None,
+                        record_config=_record_cfg,
                     ):
                         print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
                         skip_rest = True
@@ -940,12 +946,12 @@ def main():
 
             # ── Trajectory debug record (before continue on fail) ──
             # 与 HDF5 录制严格对齐: 仅当 HDF5 本帧会成功写入时才记录。
-            # max_frames_reached 在上一帧 add_frame() 成功后已置位,
-            # 本帧 recording_active 仍为 True 但 add_frame() 会拒绝 —
-            # 必须同时检查 max_frames_reached 避免多写一帧 (NPZ vs HDF5 差 1)。
+            # max_frames_reached 标志在 add_frame() 内部检测到 _frame_count>=max
+            # 时才置位, 滞后 1 个迭代 — 必须用 frame_count (即时更新) 而非
+            # max_frames_reached (滞后标志) 做 guard, 避免多写一帧 (NPZ vs HDF5 差 1)。
             _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
             _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            if recording_active and not recorder.max_frames_reached:
+            if recording_active and recorder.frame_count < recorder.max_frames:
                 traj_logger.append(
                     t=time.perf_counter() - start_time,
                     wrist_pos=vr_frame["wrist_pos"],

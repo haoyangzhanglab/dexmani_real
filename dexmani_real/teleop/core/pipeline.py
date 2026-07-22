@@ -32,9 +32,9 @@ class TeleopPipeline:
     because rotation has higher orientation noise and benefits from
     stronger filtering, while position tolerates lower latency.
 
-    Defaults: alpha_pos=0.8 (light smoothing, low latency), alpha_rot=0.4
-    (heavy smoothing, suppresses orientation jitter).  Set both to 1.0
-    for pass-through.
+    Defaults: alpha_pos=0.5 (heavier smoothing, τ≈90ms@16Hz), alpha_rot=0.25
+    (heaviest smoothing, τ≈223ms@16Hz, suppresses wrist orientation jitter).
+    Set both to 1.0 for pass-through.
     """
 
     def __init__(
@@ -43,8 +43,8 @@ class TeleopPipeline:
         retargeter: XHandRetargeter,
         planner: XArm7MotionPlanner,
         *,
-        ema_alpha_pos: float = 0.8,
-        ema_alpha_rot: float = 0.4,
+        ema_alpha_pos: float = 0.5,
+        ema_alpha_rot: float = 0.25,
     ) -> None:
         self.arm_mapper = arm_mapper
         self.retargeter = retargeter

@@ -72,7 +72,11 @@ COLLISION_CONFIG = CollisionConfig(
 )
 
 ARM_MAX_SPEED_DEG_S = 120.0  # 对齐采集入口 (vr_teleop_arm_only_record*.py) — 回放与采集同速
-_INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
+ARM_MAX_ACC_DEG_S2 = 500.0  # 回放默认加速度: 保守值(避免回放超速); 用 --acc 覆盖匹配采集条件
+_INNER_CFG = ArmInnerLoopConfig(
+    joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
+    joint_max_acc=float(np.deg2rad(ARM_MAX_ACC_DEG_S2)),
+)
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 
@@ -99,6 +103,9 @@ class TrajectoryData:
     arm_qpos: np.ndarray  # (T, 7) float64
     hand_qpos: np.ndarray | None  # (T, 12) float64 or None
     arm_ee: np.ndarray | None  # (T, 9) float64 — [pos(3), rot6d(6)]
+
+    # Recording parameters (from /meta, for matching replay conditions)
+    joint_max_acc: float | None = None  # °/s², read from HDF5 meta; None if absent (legacy)
 
     @property
     def has_hand(self) -> bool:
@@ -143,6 +150,16 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
             logger.warning("Implausible meta rate %.3f Hz — falling back to 16 Hz for replay", float(fps))
             fps = 16.0
         task_label = meta.attrs.get("task_label", "") if meta else ""
+
+        # ── Recording parameters for matching replay conditions ──
+        _joint_max_acc = None
+        if meta is not None:
+            _raw = meta.attrs.get("joint_max_acc")
+            if _raw is not None:
+                try:
+                    _joint_max_acc = float(_raw)
+                except (TypeError, ValueError):
+                    pass
 
         # ── Source: which arm action stream to replay ──
         arm_action_key = "action_arm_joint_sent" if source == "sent" else "action_arm_joint"
@@ -190,6 +207,7 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
         arm_qpos=arm_qpos,
         hand_qpos=hand_qpos,
         arm_ee=arm_ee,
+        joint_max_acc=_joint_max_acc,
     )
 
     logger.info(
@@ -429,22 +447,40 @@ def compute_metrics(
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
                 metrics.hand_joint_rmse_overall_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
 
-    # ── Tracking lag via cross-correlation on joint L2 distances ──
+    # ── Tracking lag: per-joint RMSE-minimizing shift → median consensus ──
+    # Cross-correlating *velocity* diff-norms (the old approach) only captures
+    # motion-pattern similarity, which is always aligned when replaying the same
+    # commands.  To detect actual physical following lag, we shift the replay
+    # position signal relative to the original and find the lag that minimises
+    # per-joint RMSE, then take the median across joints (robust to outliers).
     if T >= 20:
         try:
-            dist_orig = np.linalg.norm(np.diff(orig_q, axis=0), axis=1)
-            dist_rep = np.linalg.norm(np.diff(rep_q, axis=0), axis=1)
-            # Trim to equal length
-            L = min(len(dist_orig), len(dist_rep))
-            if L >= 10:
-                xcorr = np.correlate(
-                    dist_orig[:L] - np.mean(dist_orig[:L]), dist_rep[:L] - np.mean(dist_rep[:L]), mode="full"
-                )
-                peak_lag = int(np.argmax(xcorr)) - (L - 1)
-                # Clamp to reasonable range (±5 frames = ±100ms)
-                peak_lag = max(-5, min(5, peak_lag))
-                metrics.tracking_lag_frames = peak_lag
-                metrics.tracking_lag_seconds = float(peak_lag) / fps
+            MAX_LAG = int(np.ceil(fps * 0.4))  # ±400 ms search window
+            MAX_LAG = max(MAX_LAG, 6)          # at least ±6 frames
+            joint_lags: list[int] = []
+            for j in range(7):
+                best_lag, best_rmse = 0, float("inf")
+                for lag in range(-MAX_LAG, MAX_LAG + 1):
+                    if lag < 0:
+                        a = orig_q[-lag:, j]
+                        b = rep_q[:lag, j]
+                    elif lag > 0:
+                        a = orig_q[:-lag, j]
+                        b = rep_q[lag:, j]
+                    else:
+                        a = orig_q[:, j]
+                        b = rep_q[:, j]
+                    if len(a) < 10:
+                        continue
+                    rmse = float(np.sqrt(np.mean((a - b) ** 2)))
+                    if rmse < best_rmse:
+                        best_rmse = rmse
+                        best_lag = lag
+                joint_lags.append(best_lag)
+            # Median consensus — robust even if one joint gives a spurious value
+            peak_lag = int(np.median(joint_lags))
+            metrics.tracking_lag_frames = peak_lag
+            metrics.tracking_lag_seconds = float(peak_lag) / fps
         except Exception:
             metrics.tracking_lag_frames = 0
             metrics.tracking_lag_seconds = 0.0
@@ -606,6 +642,7 @@ class TrajectoryReplayer:
         no_hand: bool = False,
         arm_ip: str = "192.168.1.111",
         max_frames: int | None = None,
+        joint_max_acc: float | None = None,
     ) -> None:
         self.traj = trajectory
         self.speed = speed
@@ -629,8 +666,10 @@ class TrajectoryReplayer:
         self._T = effective_T
 
         # ArmInnerLoop: extend timeout for slow replay speeds; speed aligned with capture (120°/s)
+        _acc = float(np.deg2rad(joint_max_acc if joint_max_acc is not None else ARM_MAX_ACC_DEG_S2))
         self._inner_cfg = ArmInnerLoopConfig(
             joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
+            joint_max_acc=_acc,
             target_timeout_s=max(0.2, 1.0 / max(self.replay_hz, 1.0) + 0.1),
         )
 
@@ -1053,6 +1092,16 @@ Examples:
         choices=["cmd", "sent"],
         help="Which arm action stream to replay: cmd (action_arm_joint, default) or sent (action_arm_joint_sent, schema v9+).",
     )
+    parser.add_argument(
+        "--acc",
+        type=float,
+        default=None,
+        metavar="DEG_S2",
+        help=f"Joint max acceleration in °/s². "
+        "Default: auto-detect from HDF5 /meta/joint_max_acc, "
+        f"fallback {ARM_MAX_ACC_DEG_S2:.0f} for legacy files. "
+        "Use this flag to override (e.g. --acc 900).",
+    )
     args = parser.parse_args()
 
     # ── Validate args ──
@@ -1074,11 +1123,25 @@ Examples:
         sys.exit(1)
 
     # ── Print trajectory info ──
+    # Resolve joint_max_acc: CLI override > HDF5 metadata > default
+    _auto_acc = traj.joint_max_acc
+    _acc_source = ""
+    if args.acc is not None:
+        _replay_acc = args.acc
+        _acc_source = " (--acc override)"
+    elif _auto_acc is not None:
+        _replay_acc = _auto_acc
+        _acc_source = " (from HDF5 meta)"
+    else:
+        _replay_acc = ARM_MAX_ACC_DEG_S2
+        _acc_source = " (default, no HDF5 meta)"
+
     print(f"Trajectory: {traj.h5_path}")
     print(f"  Frames: {traj.num_frames}  FPS: {traj.fps:.1f}  Duration: {traj.num_frames/traj.fps:.1f}s")
     print(f"  Task: {traj.task_label or '(none)'}")
     print(f"  Hand data: {'yes' if traj.has_hand else 'no'}")
     print(f"  EE data: {'yes' if traj.arm_ee is not None else 'no'}")
+    print(f"  Acc: {_replay_acc:.0f}°/s²{_acc_source}")
 
     # ── Warn about missing evaluation data ──
     eval_available = traj.arm_qpos is not None and np.all(np.isfinite(traj.arm_qpos))
@@ -1101,6 +1164,7 @@ Examples:
         no_hand=args.no_hand,
         arm_ip=args.arm_ip,
         max_frames=args.max_frames,
+        joint_max_acc=_replay_acc,
     )
 
     try:

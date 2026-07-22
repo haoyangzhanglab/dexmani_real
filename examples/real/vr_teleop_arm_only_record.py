@@ -561,12 +561,18 @@ def main():
                         print("  ⚠ 相机进程已退出 — 本集降级为只录关节/EEF")
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
+                    _record_cfg = dict(camera.pointcloud_meta) if camera is not None and camera.pointcloud_meta else {}
+                    _record_cfg.update({
+                        "ema_alpha_pos": EMA_ALPHA_POS,
+                        "ema_alpha_rot": EMA_ALPHA_ROT,
+                        "joint_max_acc": float(np.degrees(_INNER_CFG.joint_max_acc)),
+                    })
                     if not recorder.start_episode(
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
                         camera_name=_resolve_camera_name(),
                         camera_K=camera.camera_K if camera is not None else None,
-                        record_config=camera.pointcloud_meta if camera is not None else None,
+                        record_config=_record_cfg,
                     ):
                         print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
                         skip_rest = True
@@ -796,9 +802,12 @@ def main():
             stage_timer.mark("ik")
 
             # ── Trajectory debug record (before continue on fail) ──
+            # 与 HDF5 录制严格对齐: 仅当 HDF5 本帧会成功写入时才记录。
+            # 用 frame_count (即时更新) 而非 max_frames_reached (滞后标志) 做 guard。
             _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
             _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            traj_logger.append(
+            if recording_active and recorder.frame_count < recorder.max_frames:
+                traj_logger.append(
                 t=time.perf_counter() - start_time,
                 wrist_pos=vr_frame["wrist_pos"],
                 wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],

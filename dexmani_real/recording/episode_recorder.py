@@ -951,9 +951,11 @@ class EpisodeRecorder:
                 meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
                 # Video codec (opt-in): non-empty → sidecar .rgb.mp4 present.
                 # Empty → legacy LZF-only episode.
+                # Read from VideoEncoderConfig defaults (single source of truth).
                 if self._video_enc_rgb is not None:
-                    meta.attrs["video_codec"] = "libx264rgb"
-                    meta.attrs["video_crf"] = 18
+                    _vc = VideoEncoderConfig()
+                    meta.attrs["video_codec"] = f"{_vc.codec} ({_vc.pixel_format})"
+                    meta.attrs["video_crf"] = _vc.crf
                 else:
                     meta.attrs["video_codec"] = ""
                     meta.attrs["video_crf"] = 0
