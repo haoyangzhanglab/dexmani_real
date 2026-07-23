@@ -83,7 +83,7 @@ VR Tracker ──→ ArmWristMapper (wrist → EEF pose)  ──→ TeleopPipeli
               XHandRetargeter (landmarks → 12-DOF) ──┘   ├─ arm:  wrist pose → solve_teleop_ik
                                                           ├─ hand: MANO → NLP optimize → LPFilter EMA
                                                           │        → delta clip (≈0.098 rad/send @16Hz)
-                                                          ├─ arm:  Cartesian EMA (TeleopPipeline default: pos α=0.8, rot α=0.4; check actual entry point overrides)
+                                                          ├─ arm:  Cartesian EMA (TeleopPipeline default: pos α=0.5, rot α=0.25)
                                                           └─ arm:  IK anomaly jump-limit (default 90°)
                                                                        │
 RobotInterface.validate_action() ← pre-send gate (error + connection + torque + temp

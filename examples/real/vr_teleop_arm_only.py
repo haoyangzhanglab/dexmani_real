@@ -90,7 +90,7 @@ COLLISION_CONFIG = CollisionConfig(
 # VR wrist → EEF 映射参数
 VR_POS_SCALE = 1.0  # 位置缩放 (1.0 = 1:1)
 VR_ROT_SCALE = 1.0  # 旋转缩放 (1.0 = 1:1)
-VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
+VR_MAX_DELTA_ROT_RAD = 3.0  # 距复位点总旋转增量上限 (~172°, 由 ArmWristMapper.max_delta_rot_rad 使用)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
 # 笛卡尔位姿 EMA 平滑 (IK 前, 唯一平滑级, 匹配 sim TeleopPipeline)

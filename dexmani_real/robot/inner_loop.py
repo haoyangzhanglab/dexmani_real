@@ -79,9 +79,11 @@ class ArmInnerLoopConfig:
     # 0.3 rad per inner step until it times out (target_timeout_s).
     max_joint_delta: float = 0.3
 
-    # Passive tracking-error monitor — warns when |target - current| exceeds this
-    # on any joint (soft saturation / follow error that arm error codes miss).
-    # Does NOT trigger an error state or alter commands.  Set 0 to disable.
+    # Passive tracking-error monitor — enables velocity-adaptive thresholding
+    # when > 0 (recommended: 0.35).  The actual warn threshold scales with
+    # commanded joint speed: tighter at rest (~0.15 rad), relaxed at max speed
+    # (~0.38 rad @120°/s).  Anomalous (>2× adaptive or >0.50 rad) always warns.
+    # Set 0 to disable.  Does NOT alter commands or trigger error state.
     tracking_error_warn_rad: float = 0.35
 
     # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
@@ -152,8 +154,13 @@ class ArmInnerLoop:
         self._last_sent_cmd: np.ndarray = np.zeros(7, dtype=np.float64)
         self._arm = None  # live XArmAPI handle of the loop thread (mode/connected queries)
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
-        self._track_warn_throttle: int = 0  # throttle counter for tracking-error warnings
+        self._track_warn_throttle: int = 0  # throttle counter for anomalous tracking-error warnings
+        self._track_info_throttle: int = 0  # throttle counter for elevated tracking-error info logs
         self._mode_warn_throttle: int = 0  # throttle counter for mode-drift warnings (independent)
+        # Adaptive tracking-error threshold: EMA of commanded joint velocity (rad/s)
+        # and previous sent target for delta computation.
+        self._cmd_vel_ema: float = 0.0
+        self._prev_monitor_target: np.ndarray | None = None
 
         # ── Lifecycle ──
         self._stop_event = threading.Event()
@@ -378,6 +385,9 @@ class ArmInnerLoop:
             with self._lock:
                 self._arm_qpos = current_qpos.copy()
                 self._error_state = False
+                # Seed the sent stream with the actual initial position so
+                # frame 0 records a physically valid value (not zeros).
+                self._last_sent_cmd = current_qpos.copy()
 
             last_target_ts: float = 0.0
             last_valid_qpos: np.ndarray = current_qpos.copy()
@@ -552,9 +562,17 @@ class ArmInnerLoop:
     def _monitor(self, arm, current_qpos: np.ndarray) -> None:
         """Passive health monitor — tracking error (A4) + mode drift (A5).
 
-        Computes |last_sent_target - current| L∞ and, together with a per-frame
-        mode==6 recheck, emits a throttled warning.  Never mutates commands or
-        the error state — soft saturation is not a hard fault.
+        Tracking error threshold is **velocity-adaptive**: the expected
+        tracking error grows with commanded joint speed because the firmware
+        acceleration limit (joint_max_acc) physcally limits how fast the arm
+        can respond to target changes, especially during direction reversals.
+
+        * ``logger.info`` — elevated but commensurate with current speed
+          (arm at its limit, not a fault).
+        * ``logger.warning`` — anomalously high for the current speed
+          (possible firmware degradation, increased friction, or collision).
+
+        Never mutates commands or the error state.
         """
         cfg = self._cfg
         err = 0.0
@@ -563,21 +581,66 @@ class ArmInnerLoop:
         with self._lock:
             self._tracking_error = err
 
-        mode_bad = getattr(arm, "mode", 6) != 6
-        track_bad = cfg.tracking_error_warn_rad > 0 and err > cfg.tracking_error_warn_rad
+        # ── Estimate commanded joint velocity (EMA of sent-target deltas) ──
+        cmd_vel = 0.0
+        if self._last_sent_target is not None and self._prev_monitor_target is not None:
+            raw_delta = float(np.max(np.abs(self._last_sent_target - self._prev_monitor_target)))
+            raw_vel = raw_delta / cfg.loop_period
+            # α=0.15 → τ≈0.2s @30Hz: fast enough for direction changes,
+            # slow enough to filter per-tick jitter from the 16Hz outer loop.
+            self._cmd_vel_ema = 0.15 * raw_vel + 0.85 * self._cmd_vel_ema
+            cmd_vel = self._cmd_vel_ema
+        if self._last_sent_target is not None:
+            self._prev_monitor_target = self._last_sent_target.copy()
 
-        # Independent throttles: a persistent tracking-error warning must not
-        # suppress a transient mode-drift warning (A5), and vice versa.
+        # ── Adaptive threshold (physics-based) ──
+        #   expected = steady_state_lag + accel_lag
+        #   steady_state_lag ≈ cmd_vel / inner_loop_rate
+        #   accel_lag ≈ cmd_vel² / (2·joint_max_acc)   (one-sided; margin covers reversal)
+        #   adaptive  = 1.8 × expected                  (50% model headroom + reversal)
+        # Clamped to [0.15, 0.60] rad — below 0.15 is sensor noise;
+        # above 0.60 is anomalous at any speed.
+        adaptive: float = 0.0
+        if cfg.tracking_error_warn_rad > 0 and cfg.joint_max_acc > 0:
+            inner_rate = 1.0 / cfg.loop_period  # 30 Hz
+            steady = cmd_vel / inner_rate
+            accel = cmd_vel * cmd_vel / (2.0 * cfg.joint_max_acc)
+            expected = steady + accel
+            adaptive = float(np.clip(expected * 1.8, 0.15, 0.60))
+
+        mode_bad = getattr(arm, "mode", 6) != 6
+        track_elevated = adaptive > 0 and err > adaptive
+        track_anomalous = adaptive > 0 and (err > 2.0 * adaptive or err > 0.50)
+
+        # ── Independent throttles ──
+        # Anomalous warning: genuinely unexpected → always warn (throttled).
         if self._track_warn_throttle > 0:
             self._track_warn_throttle -= 1
-        elif track_bad:
+        elif track_anomalous:
             logger.warning(
-                "ArmInnerLoop: tracking error %.3f rad exceeds %.3f (soft saturation / follow error)",
+                "ArmInnerLoop: anomalous tracking error %.3f rad "
+                "(adaptive threshold %.3f rad, cmd_vel=%.0f°/s) — "
+                "possible degradation",
                 err,
-                cfg.tracking_error_warn_rad,
+                adaptive,
+                np.degrees(cmd_vel),
             )
             self._track_warn_throttle = 50  # ~1.67s at 30Hz
 
+        # Elevated info: expected at current speed → throttled info log.
+        if self._track_info_throttle > 0:
+            self._track_info_throttle -= 1
+        elif track_elevated and not track_anomalous:
+            logger.info(
+                "ArmInnerLoop: elevated tracking error %.3f rad "
+                "(adaptive threshold %.3f rad, cmd_vel=%.0f°/s)",
+                err,
+                adaptive,
+                np.degrees(cmd_vel),
+            )
+            self._track_info_throttle = 150  # ~5s at 30Hz
+
+        # Mode-drift check (independent throttle from tracking error).
         if self._mode_warn_throttle > 0:
             self._mode_warn_throttle -= 1
         elif mode_bad:

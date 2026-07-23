@@ -209,10 +209,13 @@ class ArmWristMapper:
         """
         axis, angle = mat2axangle(delta_rot)
         if angle > self.max_delta_rot_rad:
-            logger.debug(
-                "clip_total_delta_rot: clamping %.3f rad -> %.3f rad",
-                angle,
-                self.max_delta_rot_rad,
+            logger.warning(
+                "Total-from-reset rotation clamped: %.1f° -> %.1f° "
+                "(max_delta_rot_rad=%.1f°).  EEF orientation will not track "
+                "wrist beyond this limit.  Press B to re-calibrate at new pose.",
+                np.rad2deg(angle),
+                np.rad2deg(self.max_delta_rot_rad),
+                np.rad2deg(self.max_delta_rot_rad),
             )
             return axangle2mat(axis, self.max_delta_rot_rad, is_normalized=True)
         return delta_rot

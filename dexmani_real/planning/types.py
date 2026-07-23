@@ -239,6 +239,18 @@ class TeleopProfile(FromDictMixin):
     # lightweight preference that breaks ties between equally-valid IK solutions by
     # penalising frame-to-frame oscillation.  Set to 0.0 to disable.
     position_ik_velocity_weight: float = 0.03
+    # EEF pose accuracy in multi-candidate scoring.  Within the acceptable range
+    # (≤ max_pose_error_pos_m / max_pose_error_rot_rad), some candidates match
+    # the target pose more precisely than others.  This weight adds pos_err + rot_err
+    # (both normalised to their respective max thresholds) to the score.
+    # Set to 0.0 to disable (backward compatible).
+    position_ik_pose_accuracy_weight: float = 0.05
+    # Minimum Yoshikawa manipulability μ = sqrt(det(J·Jᵀ)) for IK candidates.
+    # Candidates below this threshold are rejected in validation (before scoring),
+    # preventing large joint motions near kinematic singularities.
+    # 0.0 = disabled (backward compatible).  For xArm7, μ ≈ 0.02–0.15 in normal
+    # operation; values below 0.002 indicate near-singular configurations.
+    position_ik_min_manipulability: float = 0.0
     # Per-joint weights for the velocity term.  Unlike joint_weights (which penalise
     # static displacement from hardware position), velocity weights penalise frame-to-frame
     # command changes and are tuned for joint INERTIA and RESPONSIVENESS rather than range:

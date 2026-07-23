@@ -104,11 +104,15 @@ COLLISION_CONFIG = CollisionConfig(
 # VR wrist → EEF 映射参数
 VR_POS_SCALE = 1.0  # 位置缩放 (1.0 = 1:1)
 VR_ROT_SCALE = 1.0  # 旋转缩放 (1.0 = 1:1)
-VR_MAX_DELTA_ROT_RAD = 1.0  # 每帧旋转增量上限 (~57°)
+VR_MAX_DELTA_ROT_RAD = 3.0  # 距复位点总旋转增量上限 (~172°, 由 ArmWristMapper.max_delta_rot_rad 使用)
 VR_STALE_THRESHOLD_S = 0.5  # VR 帧超时阈值 (过期则保持当前位置)
 
 # 笛卡尔位姿 EMA 平滑 (IK 前, 唯一平滑级, 匹配 sim TeleopPipeline)
 # 参数定义在 dexmani_real.utils.signal_utils (EMA_ALPHA_POS/EMA_ALPHA_ROT)
+
+# ── 元数据 (写入 HDF5 /meta, 用于下游数据集管理) ──
+TASK_LABEL = ""
+OPERATOR = ""
 
 # Mode 6 online trajectory planning — firmware respects speed/accel limits.
 # acc 900°/s²: 从默认 500 提升以降低跟踪误差 (sim 验证 acc→1146 改善 32%; 真机 900 保守步进)
@@ -157,7 +161,8 @@ def do_return_home(
 
 
 def record_held_frame(
-    recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool, arm_qpos_sent: np.ndarray | None = None
+    recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool, arm_qpos_sent: np.ndarray | None = None,
+    safety_reject: bool = False, diagnostics: dict | None = None,
 ) -> None:
     """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags (防止回填伪造 ik_ok/held).
 
@@ -178,7 +183,8 @@ def record_held_frame(
         vr_frame,
         camera_frame=cam,
         arm_qpos_sent=arm_qpos_sent,
-        signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True},
+        signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True, "flag_safety_reject": safety_reject},
+        diagnostics=diagnostics,
     )
 
 
@@ -314,9 +320,7 @@ def main():
 
     # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
     traj_logger = TrajectoryLogger()
-    _traj_save_dir = Path("trajectories")
-    _traj_save_dir.mkdir(parents=True, exist_ok=True)
-    _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
+    _traj_path: str | None = None  # set per-episode at B key
 
     # ── 7c. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
     stage_timer = StageTimer(window=STATUS_EVERY)
@@ -469,6 +473,7 @@ def main():
                     h5.with_suffix(".json").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
+            limiter.reset()  # 清除阻塞期间累积的 deadline 债务, 避免下次 wait() 误报超预算
             # 清空保存/丢弃期间用户狂按积压的按键，避免 H/Q 等信号重复触发
             kb.poll(timeout=0.0)
 
@@ -481,6 +486,7 @@ def main():
         if recording_active:
             recorder.stop_episode(success=False)
             recording_active = False
+            limiter.reset()  # 清除阻塞期间累积的 deadline 债务, 避免下次 wait() 误报超预算
         if arm_inner.is_alive:
             arm_inner.set_target(None)
             arm_inner.stop()
@@ -684,6 +690,8 @@ def main():
                         "joint_max_acc": float(ARM_MAX_ACC_DEG_S2),
                     })
                     if not recorder.start_episode(
+                        task_label=TASK_LABEL,
+                        operator=OPERATOR,
                         depth_scale=camera.depth_scale if camera is not None else None,
                         calib=calib,
                         camera_name=_resolve_camera_name(),
@@ -694,6 +702,11 @@ def main():
                         skip_rest = True
                         continue
                     recording_active = True
+                    # Per-episode NPZ filename (aligns with HDF5 timestamp)
+                    _traj_save_dir = Path("trajectories")
+                    _traj_save_dir.mkdir(parents=True, exist_ok=True)
+                    _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
+                    traj_logger.clear()
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
                     # Heading calibration: align user's facing direction → robot +X
@@ -879,6 +892,14 @@ def main():
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None  # 重置笛卡尔 EMA, 恢复时无跳变
                 if recording_active:
+                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+                    _diag = {
+                        "arm_temps": arm_temps,
+                        "tracking_error": arm_inner.tracking_error,
+                        "ik_solve_time_ms": 0.0,
+                        "target_pos_before_clamp": np.full(3, np.nan),
+                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
+                    }
                     record_held_frame(
                         recorder,
                         state,
@@ -887,6 +908,7 @@ def main():
                         cam,
                         ik_ok=True,
                         arm_qpos_sent=arm_inner.last_sent_cmd,
+                        diagnostics=_diag,
                     )
                 continue
 
@@ -907,9 +929,21 @@ def main():
                 ik_method = "no_map"
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+                    _diag = {
+                        "arm_temps": arm_temps,
+                        "tracking_error": arm_inner.tracking_error,
+                        "ik_solve_time_ms": 0.0,
+                        "target_pos_before_clamp": np.full(3, np.nan),
+                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
+                    }
                     record_held_frame(
-                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True, arm_qpos_sent=arm_inner.last_sent_cmd
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, diagnostics=_diag,
                     )
+                # Keep feeding last-good to prevent inner-loop timeout (which would
+                # reset _last_sent_cmd to held-current, losing the actual sent baseline).
+                arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
                 continue
 
             target_pos = mapped["pos"]
@@ -941,7 +975,9 @@ def main():
             target_pose = Pose(p=target_pos, q=target_quat)
             if np.all(np.isfinite(state.hand_qpos)):
                 planner.set_hand_qpos(state.hand_qpos)
+            _ik_t0 = time.perf_counter()
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
+            ik_solve_time_ms = (time.perf_counter() - _ik_t0) * 1000.0
             stage_timer.mark("ik")
 
             # ── Trajectory debug record (before continue on fail) ──
@@ -971,9 +1007,21 @@ def main():
                 ik_method = "fail"
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+                    _diag = {
+                        "arm_temps": arm_temps,
+                        "tracking_error": arm_inner.tracking_error,
+                        "ik_solve_time_ms": ik_solve_time_ms,
+                        "target_pos_before_clamp": target_pos_before_clamp,
+                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
+                    }
                     record_held_frame(
-                        recorder, state, hold_arm, vr_frame, cam, ik_ok=False, arm_qpos_sent=arm_inner.last_sent_cmd
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=False,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, diagnostics=_diag,
                     )
+                # Keep feeding last-good to prevent inner-loop timeout (which would
+                # reset _last_sent_cmd to held-current, losing the actual sent baseline).
+                arm_inner.set_target(prev_qpos_cmd.copy())
                 continue
 
             ik_method = "ok"
@@ -1009,12 +1057,29 @@ def main():
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+                    _diag = {
+                        "arm_temps": arm_temps,
+                        "tracking_error": arm_inner.tracking_error,
+                        "ik_solve_time_ms": ik_solve_time_ms,
+                        "target_pos_before_clamp": target_pos_before_clamp,
+                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
+                    }
                     record_held_frame(
-                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True, arm_qpos_sent=arm_inner.last_sent_cmd
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, safety_reject=True, diagnostics=_diag,
                     )
+                # Keep feeding last-good to prevent inner-loop timeout (which would
+                # reset _last_sent_cmd to held-current, losing the actual sent baseline).
+                arm_inner.set_target(prev_qpos_cmd.copy())
                 continue
 
             prev_qpos_cmd = arm_cmd.copy()  # only after gate passes (held frames use last-good command)
+
+            # Snapshot sent command BEFORE posting new target — inner loop owns
+            # sent truth; reading after set_target captures the previous tick's
+            # result, which is the correct temporal alignment (plan §4.9).
+            sent_cmd = arm_inner.last_sent_cmd
 
             # ── Send to ArmInnerLoop ──
             arm_inner.set_target(action.arm_qpos_cmd)
@@ -1023,9 +1088,23 @@ def main():
 
             # ── 录制帧 ──
             if recording_active:
-                sig = {"ik_ok": ik_result.success and ik_result.qpos is not None, "retarget_ok": True, "held": False}
+                sig = {
+                    "ik_ok": ik_result.success and ik_result.qpos is not None,
+                    "retarget_ok": True,
+                    "held": False,
+                    "flag_safety_reject": False,
+                }
+                head_quat = vr_frame.get("head_quat_wxyz")
+                diagnostics = {
+                    "arm_temps": arm_temps,
+                    "tracking_error": arm_inner.tracking_error,
+                    "ik_solve_time_ms": ik_solve_time_ms,
+                    "target_pos_before_clamp": target_pos_before_clamp,
+                    "head_quat_wxyz": head_quat if head_quat is not None else np.full(4, np.nan),
+                }
                 ok = recorder.add_frame(
-                    state, action, vr_frame, camera_frame=cam, signals=sig, arm_qpos_sent=arm_inner.last_sent_cmd
+                    state, action, vr_frame, camera_frame=cam, signals=sig, arm_qpos_sent=sent_cmd,
+                    diagnostics=diagnostics,
                 )
                 if not ok and recorder.max_frames_reached:
                     print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")
@@ -1055,7 +1134,7 @@ def main():
             print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
 
         # ── 保存轨迹 debug 数据 ──
-        if len(traj_logger) > 0:
+        if _traj_path is not None and len(traj_logger) > 0:
             try:
                 saved = traj_logger.save(_traj_path)
                 print(f"\n轨迹已保存: {saved}  ({len(traj_logger)} 帧)")

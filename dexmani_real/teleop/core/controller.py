@@ -25,7 +25,7 @@ import numpy as np
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat
 from dexmani_real.recording.collection_config import CollectionConfig
 from dexmani_real.recording.collection_loop import CollectionLoop
-from dexmani_real.recording.recording_session import RecordingSession
+
 from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotState
 from dexmani_real.robot.validate import validate_action
@@ -136,21 +136,16 @@ class TeleopController:
             sync_label = ", sync" if cfg.synchronized else ""
             logger.info("ArmInnerLoop started (mode 6, online trajectory planning%s)", sync_label)
 
-        # Recording via decoupled RecordingSession (one thread owns the lifecycle,
-        # so start/record/stop are serialized — no trailing-frame teardown race).
+        # Recording via CollectionLoop (lifecycle orchestrator around EpisodeRecorder).
         self._calib = calib
         self._camera_name = camera_name
         if recorder is not None:
             coll_cfg = cfg.collection_config or CollectionConfig()
             self._collection_loop: CollectionLoop | None = CollectionLoop(recorder, coll_cfg)
             self.recorder: EpisodeRecorder | None = recorder
-            self._recorder_session: RecordingSession | None = RecordingSession(
-                self._collection_loop, validate=coll_cfg.validate_on_stop
-            )
         else:
             self._collection_loop = None
             self.recorder = None
-            self._recorder_session = None
 
         self.limiter = RateManager(cfg.target_hz)
         self._ema_alpha_pos = float(cfg.ema_alpha_pos)
@@ -355,11 +350,10 @@ class TeleopController:
             except (ValueError, RuntimeError, KeyError):
                 pass
 
-        T_base_eef = self._compute_T_base_eef(state)
-
         # ── 6. Pre-send validation ──
         validate_failed = False
         hand_ok = True
+        sent_cmd: np.ndarray | None = None
         if not self.dry_run:
             # Torque gate silently degrades to a no-op on NaN tau — make that visible.
             if not np.any(np.isfinite(state.arm_tau)):
@@ -373,7 +367,6 @@ class TeleopController:
                 actual_arm_qpos=arm_qpos,
                 actual_arm_tau=state.arm_tau,
                 actual_arm_temps=arm_temps,
-                self_collision_check=lambda q: not self.planner.has_self_collision(q),
             )
             if not action_valid:
                 if "error state" in fail_reason or "not connected" in fail_reason:
@@ -383,6 +376,11 @@ class TeleopController:
                 validate_failed = True
                 hold = self._hold_action()
                 action = RobotAction(arm_qpos_cmd=hold.arm_qpos_cmd, hand_qpos_cmd=hold.hand_qpos_cmd)
+
+            # Snapshot sent command BEFORE posting new target — inner loop owns
+            # sent truth; reading after set_target captures the previous tick's
+            # result, which is the correct temporal alignment (plan §4.9).
+            sent_cmd = self._arm_inner.last_sent_cmd  # type: ignore[union-attr]  # non-None: not dry_run
 
             # Send arm target to inner loop
             self._arm_inner.set_target(action.arm_qpos_cmd)  # type: ignore[union-attr]  # non-None: not dry_run
@@ -410,22 +408,22 @@ class TeleopController:
                 self._sync.robot_ready.clear()
 
         # ── 7. Record the executed frame (after validation → records what was sent) ──
-        if self.is_recording and self._recorder_session is not None:
+        if self.is_recording and self._collection_loop is not None:
             held = (not status.get("ik_ok")) or (not status.get("retarget_ok")) or validate_failed or (not hand_ok)
-            self._recorder_session.record(
-                dict(
-                    state=state,
-                    action=action,
-                    vr_frame=vr_frame,
-                    camera_frame=camera_frame,
-                    camera_frames=camera_frames,
-                    T_base_eef=T_base_eef,
-                    signals={
-                        "ik_ok": bool(status.get("ik_ok")),
-                        "retarget_ok": bool(status.get("retarget_ok")),
-                        "held": bool(held),
-                    },
-                )
+            # When dry_run, sent_cmd is unavailable — fall back to action.arm_qpos_cmd.
+            arm_qpos_sent = sent_cmd if sent_cmd is not None else action.arm_qpos_cmd.copy()
+            self._collection_loop.record_frame(
+                state=state,
+                action=action,
+                vr_frame=vr_frame,
+                camera_frame=camera_frame,
+                camera_frames=camera_frames,
+                signals={
+                    "ik_ok": bool(status.get("ik_ok")),
+                    "retarget_ok": bool(status.get("retarget_ok")),
+                    "held": bool(held),
+                },
+                arm_qpos_sent=arm_qpos_sent,
             )
 
         # ── 8. Periodic status ──
@@ -472,6 +470,14 @@ class TeleopController:
                 retarget_ok = False
 
         if ik_ok:
+            # Post-IK joint delta clamp: IK solver can produce targets far from the
+            # current state during fast wrist rotations (observed up to 57°).
+            # Clamp per-step delta so the action_arm_joint label remains kinematically
+            # plausible. The inner loop's own per-step clamp protects hardware.
+            max_delta = self._arm_inner._cfg.max_joint_delta if self._arm_inner is not None else 0.3
+            delta = action.arm_qpos_cmd - prev_arm_cmd
+            delta = np.clip(delta, -max_delta, max_delta)
+            action.arm_qpos_cmd = prev_arm_cmd + delta
             self._last_good_arm = np.asarray(action.arm_qpos_cmd, dtype=np.float64).copy()
         if retarget_ok:
             self._last_good_hand = np.asarray(action.hand_qpos_cmd, dtype=np.float64).copy()
@@ -662,21 +668,19 @@ class TeleopController:
         if not self._reset_mapper():
             logger.error("Cannot start recording without VR frame.")
             return
-        if self._recorder_session is not None:
+        if self._collection_loop is not None:
             # task_label/operator/tags are omitted so CollectionLoop falls back
             # to its CollectionConfig — the single source of truth.
             record_config = self._build_record_config()
             # Pointcloud processor params (pc_*) when the injected CameraProcess
             # computes the /pointcloud stream — reproducibility metadata.
             record_config.update(getattr(self._camera_process, "pointcloud_meta", None) or {})
-            self._recorder_session.start(
-                dict(
-                    calib=self._calib,
-                    camera_name=self._camera_name,
-                    camera_K=getattr(self._camera_process, "camera_K", None),
-                    depth_scale=getattr(self._camera_process, "depth_scale", None),
-                    record_config=record_config,
-                )
+            self._collection_loop.start_episode(
+                calib=self._calib,
+                camera_name=self._camera_name,
+                camera_K=getattr(self._camera_process, "camera_K", None),
+                depth_scale=getattr(self._camera_process, "depth_scale", None),
+                record_config=record_config,
             )
         self._last_good_arm = None
         self._last_good_hand = None
@@ -684,8 +688,9 @@ class TeleopController:
 
     def _stop_recording(self, save: bool = True) -> None:
         logger.info("Stopping episode. frames=%s save=%s", self.frame_count, save)
-        if self._recorder_session is not None and self.is_recording:
-            path = self._recorder_session.stop(save=save)
+        if self._collection_loop is not None and self.is_recording:
+            reason = "manual" if save else "discarded"
+            path = self._collection_loop.stop_episode(success=save, reason=reason)
             if save and path:
                 logger.info("  Saved to %s", path)
         gc.collect()  # drain cyclic garbage after episode (GC disabled during teleop)
@@ -761,7 +766,7 @@ class TeleopController:
         success frame, forging flag_ik_ok=True / flag_held=False for frames
         that are actually held.
         """
-        if not self.is_recording or self._recorder_session is None:
+        if not self.is_recording or self._collection_loop is None:
             return
         if self.dry_run or self._arm_inner is None:
             return
@@ -789,22 +794,18 @@ class TeleopController:
             except (ValueError, RuntimeError, KeyError):
                 pass
 
-        T_base_eef = self._compute_T_base_eef(state)
         nan_vr = {
             "wrist_pos": np.full(3, np.nan, dtype=np.float64),
             "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
             "landmarks": np.full((21, 3), np.nan, dtype=np.float64),
         }
-        self._recorder_session.record(
-            dict(
-                state=state,
-                action=action,
-                vr_frame=nan_vr,
-                camera_frame=camera_frame,
-                camera_frames=camera_frames,
-                T_base_eef=T_base_eef,
-                signals={"ik_ok": True, "retarget_ok": True, "held": True},
-            )
+        self._collection_loop.record_frame(
+            state=state,
+            action=action,
+            vr_frame=nan_vr,
+            camera_frame=camera_frame,
+            camera_frames=camera_frames,
+            signals={"ik_ok": True, "retarget_ok": True, "held": True},
         )
 
     # ── Keyboard hints ──
@@ -897,11 +898,9 @@ class TeleopController:
 
     def _shutdown(self) -> None:
         logger.info("Shutting down...")
-        # Finalize any in-progress episode, then stop the recording thread.
-        if self._recorder_session is not None:
-            if self.is_recording:
-                self._recorder_session.stop(save=False)
-            self._recorder_session.shutdown()
+        # Finalize any in-progress episode.
+        if self._collection_loop is not None and self.is_recording:
+            self._collection_loop.stop_episode(success=False, reason="shutdown")
 
         # Stop VR shared memory access (consumer-side only — no cleanup needed)
         self._vr_shm = None

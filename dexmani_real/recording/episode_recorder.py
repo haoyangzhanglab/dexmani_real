@@ -32,6 +32,7 @@ logger = get_logger(__name__)
 
 SCHEMA_VERSION = 8  # v8: +truncated/stop_reason/cam_frames_dropped/cam_items_written meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
 SCHEMA_VERSION_ARM_SENT = 9  # v9: +/action_arm_joint_sent(T,7) opt-in stream (ctor flag arm_sent_stream=True)
+SCHEMA_VERSION_DIAGNOSTICS = 10  # v10: +diagnostics (arm_temps/tracking_error/ik_solve_time_ms/target_pos_before_clamp/head_quat_wxyz) + flag_safety_reject
 
 CAMERA_FRESH_TIMEOUT_S = 0.2  # flag_camera_fresh: max age of the last *new* camera frame (~6 frames @30fps)
 
@@ -355,6 +356,7 @@ class EpisodeRecorder:
         camera_frames: dict[str, dict[str, Any]] | None = None,
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         if not self._recording or self._buffer is None:
             return False
@@ -425,6 +427,7 @@ class EpisodeRecorder:
             "flag_ik_ok": bool(sig.get("ik_ok", False)),
             "flag_retarget_ok": bool(sig.get("retarget_ok", False)),
             "flag_held": bool(sig.get("held", False)),
+            "flag_safety_reject": bool(sig.get("flag_safety_reject", False)),
             "flag_camera_fresh": flag_camera_fresh,
             # ── VR ──
             "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
@@ -439,6 +442,11 @@ class EpisodeRecorder:
         if self.arm_sent_stream:
             sent = np.asarray(arm_qpos_sent, dtype=np.float64) if arm_qpos_sent is not None else np.zeros(7)
             data["action_arm_joint_sent"] = sent
+
+        # ── Diagnostics (v10): continuous telemetry — auto-discovered by _flush_buffered ──
+        if diagnostics:
+            for key, val in diagnostics.items():
+                data[key] = np.asarray(val, dtype=np.float64)
 
         prev_size = self._buffer.size
         self._buffer.add(data, timestamp=float(state.timestamp))
@@ -934,11 +942,7 @@ class EpisodeRecorder:
         if self._file is not None:
             with self._hdf5_lock:
                 meta = self._file["meta"]
-                meta.attrs["schema_version"] = SCHEMA_VERSION
-                # Opt-in schema v9: bump only when the sent-command stream was
-                # enabled — the default path keeps the exact v8 meta layout.
-                if self.arm_sent_stream:
-                    meta.attrs["schema_version"] = SCHEMA_VERSION_ARM_SENT
+                meta.attrs["schema_version"] = SCHEMA_VERSION_DIAGNOSTICS  # v10
                 meta.attrs["duration"] = duration
                 meta.attrs["num_frames"] = self._frame_count
                 meta.attrs["success"] = success

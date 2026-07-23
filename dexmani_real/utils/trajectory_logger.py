@@ -69,6 +69,10 @@ class TrajectoryLogger:
     def __len__(self) -> int:
         return len(self._records)
 
+    def clear(self) -> None:
+        """Discard all buffered records (called at episode boundaries)."""
+        self._records.clear()
+
     def save(self, path: str) -> str:
         """Stack all records into arrays and write to .npz. Returns path."""
         if not self._records:

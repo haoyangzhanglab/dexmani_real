@@ -24,9 +24,9 @@ class TeleopIKSolver:
     """Teleoperation IK — MPlib position IK with prev_cmd seeding.
 
     Priority:
-      1. Position IK (MPlib) — seeded from previous_qpos_cmd,
-         return_closest=True, n_init_qpos=3. Branch-stable via elbow flip
-         check + fast-accept within 15°.
+      1. Position IK (MPlib) — seeded from previous_qpos_cmd (n_init_qpos=1
+         for speed on the common path), fast-accept within 15°.  Falls back
+         to current_qpos + random seeds when prev_cmd misses.
       2. Fail → hold previous command.
 
     Speed limiting is handled by ArmInnerLoop (Mode 6): per-step joint
@@ -59,8 +59,9 @@ class TeleopIKSolver:
     ) -> IKResult:
         """Teleop IK — MPlib position IK, hold on failure.
 
-        Tries prev_cmd seed (n_init_qpos=3) → current_qpos seed (n_init_qpos=1).
-        Both use return_closest=True for deterministic, branch-stable results.
+        Tries prev_cmd seed (n_init_qpos=1, fast path) then current_qpos
+        and random seeds.  All use return_closest=True for deterministic,
+        branch-stable results.
         """
         t_start = time.perf_counter()
 
@@ -135,40 +136,34 @@ class TeleopIKSolver:
 
         attempts: list[str] = []
         candidates: list[tuple[np.ndarray, str, float, float]] = []  # (qpos, seed_name, score, manipulability)
-        best_fallback: tuple[np.ndarray, str, float] | None = None  # fallback: (qpos, seed_name, weighted_dist)
+        best_fallback: tuple[np.ndarray, str, float] | None = None  # (qpos, seed_name, weighted_dist)
 
         for seed_name, seed, n_init in seeds:
             status, raw_qpos = self.ik_mgr.call_mplib_ik(
                 target_pose_base, seed, n_init_qpos=n_init, return_closest=True,
             )
-
             if not is_mplib_success(status) or raw_qpos is None:
                 attempts.append(f"{seed_name}:mplib_failed")
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
             qpos = self.ik_mgr.canonicalize_qpos(raw_qpos, previous_qpos_cmd)
-            pos_err, rot_err = self.kin.compute_world_pose_error(target_eef_pose_world, qpos)
-            delta_prev = self.ik_mgr.compute_qpos_delta(qpos, previous_qpos_cmd)
 
-            if pos_err > profile.max_pose_error_pos_m or rot_err > profile.max_pose_error_rot_rad:
-                attempts.append(f"{seed_name}:pose_err")
-                continue
+            # ── Single FK per candidate: Jacobian + world-frame EEF pose ──
+            # compute_eef_jacobian_and_pose_world does one Pinocchio FK call
+            # and returns both Jacobian and world-frame pose.  From these we
+            # extract pose error (for validation + scoring) and manipulability
+            # (for hard-gate + scoring), replacing the 3-4 separate FK calls
+            # that the old code made for the same qpos.
+            jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos)
+            pos_err, rot_err = compute_pose_error(target_eef_pose_world, eef_pose_world)
+            mu = self.kin.manipulability_from_jacobian(jacobian)
 
-            if np.any(np.abs(delta_prev) > jump_limit):
-                attempts.append(f"{seed_name}:jump")
-                continue
-
-            if self._has_elbow_flip(qpos, previous_qpos_cmd):
-                attempts.append(f"{seed_name}:elbow_flip")
-                continue
-
-            # L2 catch-all for unexpected multi-joint branch jumps (shoulder
-            # reconfiguration, wrist singularity flips) that the J4-only elbow
-            # check misses.  120° L2 is 4-8× normal frame-to-frame motion at
-            # 16 Hz (< 30°), conservative against any single-frame discontinuity.
-            if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
-                attempts.append(f"{seed_name}:branch_jump_l2")
+            passed, tag = self._validate_ik_candidate(
+                qpos, pos_err, rot_err, mu, previous_qpos_cmd, jump_limit, profile,
+            )
+            if not passed:
+                attempts.append(f"{seed_name}:{tag}")
                 continue
 
             hw_dist = float(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, current_qpos))))
@@ -184,10 +179,11 @@ class TeleopIKSolver:
                 return qpos, {"method": "position_ik", "seed": seed_name, "attempts": attempts}
 
             # Phase 2: collect candidates for scoring.
-            mu = self.kin.compute_manipulability(qpos)
             score = self._score_candidate(
                 weighted_dist=weighted_dist,
                 manipulability=mu,
+                pos_err=pos_err,
+                rot_err=rot_err,
                 qpos=qpos,
                 previous_qpos_cmd=previous_qpos_cmd,
                 profile=profile,
@@ -214,12 +210,61 @@ class TeleopIKSolver:
 
         return None, {"method": "position_ik", "failure_reason": f"all failed: {attempts}"}
 
+    def _validate_ik_candidate(
+        self,
+        qpos: np.ndarray,
+        pos_err: float,
+        rot_err: float,
+        mu: float,
+        previous_qpos_cmd: np.ndarray,
+        jump_limit: np.ndarray,
+        profile: TeleopProfile,
+    ) -> tuple[bool, str]:
+        """Gate an IK result through pose-error, joint-jump, and branch-consistency checks.
+
+        All FK-derived values (pos_err, rot_err, mu) are pre-computed by the
+        caller via a single ``compute_eef_jacobian_and_pose_world`` call —
+        this method does zero FK.
+
+        Returns (passed, tag) where *tag* names the first failing check
+        (``pose_err``, ``manipulability``, ``jump``, ``elbow_flip``, ``branch_jump_l2``) or ``ok``.
+        """
+        if pos_err > profile.max_pose_error_pos_m or rot_err > profile.max_pose_error_rot_rad:
+            return False, "pose_err"
+
+        if profile.position_ik_min_manipulability > 0 and mu < profile.position_ik_min_manipulability:
+            return False, "manipulability"
+
+        delta_prev = self.ik_mgr.compute_qpos_delta(qpos, previous_qpos_cmd)
+        if np.any(np.abs(delta_prev) > jump_limit):
+            return False, "jump"
+
+        if self._has_elbow_flip(qpos, previous_qpos_cmd):
+            return False, "elbow_flip"
+
+        # L2 catch-all for unexpected multi-joint branch jumps (shoulder
+        # reconfiguration, wrist singularity flips) that the J4-only elbow
+        # check misses.  120° L2 is 4-8× normal frame-to-frame motion at
+        # 16 Hz (< 30°), conservative against any single-frame discontinuity.
+        if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
+            return False, "branch_jump_l2"
+
+        return True, "ok"
+
     def _make_teleop_seeds(
         self, prev_cmd: np.ndarray, current_qpos: np.ndarray, profile: TeleopProfile,
     ) -> list[tuple[str, np.ndarray, int]]:
-        """Generate teleop IK seeds: prev_cmd, current_qpos, + random around prev_cmd."""
+        """Generate teleop IK seeds ordered by expected quality.
+
+        prev_cmd (n_init_qpos=1) is the strongest seed — the previous frame's
+        command is almost always close to the current target.  The lean call
+        avoids the 3× MPlib perturbation overhead (~18 ms → ~6 ms).
+
+        If prev_cmd misses, current_qpos and random perturbations around
+        prev_cmd provide fallback coverage.
+        """
         seeds: list[tuple[str, np.ndarray, int]] = [
-            ("prev_cmd", prev_cmd.copy(), 3),
+            ("prev_cmd", prev_cmd.copy(), 1),
             ("current_qpos", current_qpos.copy(), 1),
         ]
         seed = profile.teleop_ik_seed
@@ -234,6 +279,8 @@ class TeleopIKSolver:
         self,
         weighted_dist: float,
         manipulability: float,
+        pos_err: float,
+        rot_err: float,
         qpos: np.ndarray,
         previous_qpos_cmd: np.ndarray,
         profile: TeleopProfile,
@@ -244,9 +291,18 @@ class TeleopIKSolver:
               + velocity_weight * velocity_dist       (temporal coherence vs prev cmd)
               - manipulability_weight * mu            (dexterity)
               + limit_penalty_weight * penalty        (adjustment room)
+              + pose_accuracy_weight * pose_cost      (EEF tracking precision)
+
+        All FK-derived values (pos_err, rot_err, manipulability) are
+        pre-computed by the caller — this method does zero FK.
 
         The velocity term uses dedicated velocity_joint_weights (tuned for
         inertia/responsiveness) when set, falling back to joint_weights.
+
+        The pose accuracy term normalises position and rotation errors by
+        their respective max thresholds, making them commensurate (~1.0 at
+        the rejection boundary).  Within the accepted range, this breaks
+        ties toward the candidate that best matches the VR target.
         """
         limits = self.ik_mgr.joint_limits
         center = 0.5 * (limits[:, 0] + limits[:, 1])
@@ -260,11 +316,14 @@ class TeleopIKSolver:
         )
         velocity_dist = self.ik_mgr.weighted_joint_distance(qpos, previous_qpos_cmd, vel_weights)
 
+        pose_cost = pos_err / max(profile.max_pose_error_pos_m, 1e-6) + rot_err / max(profile.max_pose_error_rot_rad, 1e-6)
+
         return (
             weighted_dist
             + profile.position_ik_velocity_weight * velocity_dist
             - profile.position_ik_manipulability_weight * manipulability
             + profile.position_ik_limit_penalty_weight * limit_penalty
+            + profile.position_ik_pose_accuracy_weight * pose_cost
         )
 
     # ── Elbow branch flip detection ──

@@ -65,7 +65,16 @@ class RateManager:
             self._next_deadline += self.period
             return
 
-        # Overdue: emit throttled warning (every ~50 occurrences)
+        # Overdue.
+        #
+        # Long block (>1 s): deliberate blocking operation (e.g. return-to-home,
+        # episode save).  Re-anchor silently — this is not a performance problem.
+        if -remaining > 1.0:
+            self._next_deadline = now + self.period
+            self._overdue_throttle = 0
+            return
+
+        # Short overrun: emit throttled warning (every ~50 occurrences)
         if self._overdue_throttle <= 0:
             logger.warning(
                 "Control loop over budget: actual=%.1fms target=%.1fms",

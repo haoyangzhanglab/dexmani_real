@@ -813,6 +813,8 @@ class ArmServo(Protocol):
     @property
     def mode(self) -> int: ...
     @property
+    def tracking_error(self) -> float: ...
+    @property
     def connected(self) -> bool: ...
 
 
@@ -895,6 +897,11 @@ class ArmInnerLoopSHMAdapter:
     def mode(self) -> int:
         rec, _ = self._facade.get_state()
         return int(rec["mode"][0]) if rec is not None else 0
+
+    @property
+    def tracking_error(self) -> float:
+        rec, _ = self._facade.get_state()
+        return float(rec["tracking_err"][0]) if rec is not None else 0.0
 
     @property
     def connected(self) -> bool:
