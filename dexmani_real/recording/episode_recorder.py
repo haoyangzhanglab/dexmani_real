@@ -11,7 +11,9 @@ from __future__ import annotations
 __all__ = ["EpisodeRecorder"]
 
 import atexit
+import os
 import queue
+import shutil
 import threading
 import time
 import weakref
@@ -76,7 +78,7 @@ class EpisodeRecorder:
         self,
         data_dir: str,
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
-        control_hz: float = 50.0,
+        control_hz: float = 16.0,
         min_frames: int = 50,
         arm_sent_stream: bool = False,
         use_video: bool = False,
@@ -110,6 +112,7 @@ class EpisodeRecorder:
         self._max_frames_reached: bool = False
         self._start_time: float | None = None
         self._episode_path: str | None = None
+        self._temp_path: str | None = None  # .tmp_* path; renamed → _episode_path on save, unlinked on discard
         self._datasets: dict[str, Any] = {}
 
         # Record-time aligned buffer for non-camera streams + periodic flush.
@@ -218,12 +221,15 @@ class EpisodeRecorder:
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
         path = self.data_dir / f"episode_{stamp}.h5"
+        temp_path = self.data_dir / f".tmp_episode_{stamp}.h5"
         dedup = 1
-        while path.exists():  # same-second collision → suffix, never overwrite
+        while path.exists() or temp_path.exists():  # same-second collision → suffix; also avoid clobbering orphaned temp files
             path = self.data_dir / f"episode_{stamp}_{dedup}.h5"
+            temp_path = self.data_dir / f".tmp_episode_{stamp}_{dedup}.h5"
             dedup += 1
 
         self._episode_path = str(path)
+        self._temp_path = str(temp_path)
         self._frame_count = 0
         self._max_frames_reached = False
         self._start_time = time.perf_counter()
@@ -521,11 +527,16 @@ class EpisodeRecorder:
             )
 
     def _ensure_hdf5(self) -> None:
-        """Lazily create the HDF5 file (flat schema — no groups)."""
+        """Lazily create the HDF5 file (flat schema — no groups).
+
+        The file is written to a ``.tmp_*`` path and atomically renamed
+        to the final ``episode_*.h5`` path in ``_stop_episode_impl_inner``
+        on success, or unlinked on discard / error.
+        """
         if self._file is not None:
             return
-        assert self._episode_path is not None
-        self._file = h5py.File(str(self._episode_path), "w")
+        assert self._temp_path is not None
+        self._file = h5py.File(str(self._temp_path), "w")
         self._write_meta_attrs(self._file.create_group("meta"))
 
     # ── Background camera writer ──────────────────────────────────────────
@@ -634,7 +645,7 @@ class EpisodeRecorder:
                     if self._video_enc_rgb is None:
                         h, w = rgb.shape[:2]
                         self._video_enc_rgb = VideoEncoder(
-                            path=Path(self._episode_path).with_suffix(".rgb.mp4"),  # type: ignore[arg-type]
+                            path=Path(self._temp_path).with_suffix(".rgb.mp4"),  # type: ignore[arg-type]
                             fps=self.control_hz,
                             width=w,
                             height=h,
@@ -842,12 +853,21 @@ class EpisodeRecorder:
             except Exception:
                 pass
             self._file = None
+            # Clean up temp file if the crash happened before the atomic rename
+            # (temp still exists → rename didn't run → unlink it to avoid orphan).
+            # If temp is already gone (rename succeeded), this is a no-op.
+            _tmp = self._temp_path
+            if _tmp is not None:
+                self._try_unlink(_tmp)
+                _tmp_rgb = str(Path(_tmp).with_suffix(".rgb.mp4"))
+                self._try_unlink(_tmp_rgb)
             self._datasets.clear()
             self._recording = False
             self._max_frames_reached = False
             self._frame_count = 0
             self._start_time = None
             self._episode_path = None
+            self._temp_path = None
             self._buffer = None
             self._flushed_frames = 0
             self._cam_seen = False
@@ -1001,12 +1021,24 @@ class EpisodeRecorder:
         if self._file is not None:
             self._file.close()
         self._file = None
+
+        # ── Atomic finalise: rename temp → final ──
+        # The rename runs for both success and failure — the ``success`` attr
+        # in /meta already records the outcome; callers that want to discard
+        # unlink the final path after join_stop() as before.
+        # Captured before _episode_path / _temp_path are cleared below.
+        _final = self._episode_path
+        _tmp = self._temp_path
+        if _tmp is not None and _final is not None:
+            self._rename_temp_to_final(_tmp, _final)
+
         self._datasets.clear()
         self._recording = False
         self._max_frames_reached = False
         self._frame_count = 0
         self._start_time = None
         self._episode_path = None
+        self._temp_path = None
         self._buffer = None
         self._flushed_frames = 0
         self._cam_seen = False
@@ -1021,6 +1053,35 @@ class EpisodeRecorder:
         # Video sidecar encoders (closed above; drop references).
         self._video_enc_rgb = None
         self._video_enc_depth = None
+
+    # ── Atomic file finalisation ──────────────────────────────────────
+
+    @staticmethod
+    def _try_rename(src: str, dst: str) -> None:
+        """Rename *src* → *dst*; fall back to copy+unlink on cross-device error."""
+        try:
+            os.rename(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+            os.unlink(src)
+
+    @staticmethod
+    def _try_unlink(path: str) -> None:
+        """Best-effort unlink — never raises."""
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _rename_temp_to_final(self, tmp: str, final: str) -> None:
+        """Rename the .h5 temp file and .rgb.mp4 sidecar (if any) to their final paths."""
+        self._try_rename(tmp, final)
+        tmp_rgb = str(Path(tmp).with_suffix(".rgb.mp4"))
+        if os.path.exists(tmp_rgb):
+            final_rgb = str(Path(final).with_suffix(".rgb.mp4"))
+            self._try_rename(tmp_rgb, final_rgb)
+
+    # ── Dataset helpers ───────────────────────────────────────────────
 
     def _fill_to(self, key: str, data: np.ndarray, target_len: int) -> None:
         """Fill dataset ``key`` up to ``target_len`` rows with ``data`` (broadcast).

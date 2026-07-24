@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import deque
 from enum import Enum
 from typing import Any
@@ -67,16 +68,20 @@ class KeyboardHandler:
     with callers that still pass a multiprocessing.Queue.
     """
 
-    def __init__(self, queue: object = None) -> None:
+    def __init__(self, queue: object = None, debounce_s: float = 0.5) -> None:
         """Initialize keyboard handler.
 
         Args:
             queue: Ignored (backward compat with multiprocessing.Queue pattern).
+            debounce_s: Per-signal debounce interval in seconds (default 0.5).
+                        Suppresses X11/Wayland auto-repeat for the same key.
         """
         self._buffer: deque[ControlSignal] = deque()
         self._lock = threading.Lock()
         self._listener: Any = None  # pynput.keyboard.Listener
         self._running: bool = False
+        self._debounce_s = float(debounce_s)
+        self._last_signal_time: dict[ControlSignal, float] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -113,6 +118,15 @@ class KeyboardHandler:
                 else:
                     return
                 if sig is not None:
+                    # Per-signal debounce — suppress X11/Wayland auto-repeat
+                    # (holding a key fires repeated press events at ~30-60 Hz).
+                    # ESC always bypasses debounce (emergency stop).
+                    if sig != ControlSignal.EMERGENCY_STOP:
+                        now = time.perf_counter()
+                        last = self._last_signal_time.get(sig, 0.0)
+                        if now - last < self._debounce_s:
+                            return
+                        self._last_signal_time[sig] = now
                     with self._lock:
                         self._buffer.append(sig)
             except Exception:
@@ -140,6 +154,7 @@ class KeyboardHandler:
             self._running = False
             with self._lock:
                 self._buffer.clear()
+            self._last_signal_time.clear()
 
     # ------------------------------------------------------------------
     # Context manager protocol

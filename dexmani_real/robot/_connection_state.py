@@ -32,7 +32,7 @@ class ConnectionStateMixin:
         Override in subclasses to add hardware-specific checks
         (e.g. ``self.arm is not None``).
         """
-        return self.connected_flag and not self.error_state
+        raise NotImplementedError
 
     def is_error(self) -> bool:
         """Return True if the device should NOT receive commands.
@@ -45,13 +45,11 @@ class ConnectionStateMixin:
         Override in subclasses to add hardware-specific checks
         (e.g. ``self.arm.error_code != 0``).
         """
-        return not self.connected_flag or self.error_state
+        raise NotImplementedError
 
     def clear_error(self) -> bool:
         """Clear the error state. Returns current connection status.
 
         Override in subclasses to also clear hardware-level errors.
         """
-        self.error_state = False
-        self.last_error_message = ""
-        return self.is_connected()
+        raise NotImplementedError

@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 import numpy as np
 
-from dexmani_real.robot.isolation import arm_isolation_enabled
+
 from dexmani_real.shm.robot_layouts import (
     ARM_CMD_CLEAR_ERROR,
     ARM_CMD_DTYPE,
@@ -804,6 +804,7 @@ class ArmServo(Protocol):
     def start(self) -> None: ...
     def stop(self, timeout: float = 3.0) -> None: ...
     def wait_ready(self, timeout: float = 30.0) -> bool: ...
+    def ensure_running(self) -> bool: ...
     def emergency_stop(self, settle_timeout: float | None = None) -> bool: ...
 
     @property
@@ -913,45 +914,28 @@ def make_arm_servo(
     cfg: ArmInnerLoopConfig,
     ip: str | None = None,
     *,
-    use_arm_isolation: bool = False,
     arm_joint_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     process_config: ArmProcessConfig | None = None,
     inner_factory: Callable[[ArmProcessConfig], Any] | None = None,
 ) -> ArmServo:
-    """Build the arm servo: in-process ``ArmInnerLoop`` or isolated subprocess.
+    """Build the arm servo: crash-isolated subprocess via ArmSHMFaçade.
 
-    Behind the arm transition flag (``use_arm_isolation`` or env
-    ``DEXMANI_PROCESS_ISOLATION=1`` / ``DEXMANI_ARM_PROCESS_ISOLATION=1``)
-    returns an ``ArmInnerLoopSHMAdapter`` over an ``ArmSHMFaçade`` (arm inner
-    loop runs in a fork child owning the sole XArmAPI connection); otherwise
-    the proven in-process ``ArmInnerLoop``. Both satisfy ``ArmServo``, so
-    callers swap only this construction site.
+    Arm inner loop runs in a fork child owning the sole XArmAPI connection.
+    Satisfies ``ArmServo``.
 
     Args:
         cfg: Inner-loop config (forwarded to the child's ArmInnerLoop).
         ip: Arm IP; ``None`` → ArmInnerLoop/XArm7Config default.
-        use_arm_isolation: Config half of the arm transition flag (env overrides).
         arm_joint_bounds: (qpos_min_soft, qpos_max_soft) for the façade's
             range-sanity gate; ``None`` → wide ±4π torn-read window.
         process_config: Full override for the subprocess config; when ``None``
             one is built from ``cfg``/``ip`` via ``inner_kwargs``.
         inner_factory: Test injection for the child's inner loop (no hardware).
     """
-    if not arm_isolation_enabled(use_arm_isolation):
-        from dexmani_real.robot.inner_loop import ArmInnerLoop
-
-        if ip is not None:
-            return ArmInnerLoop(cfg=cfg, ip=ip)
-        return ArmInnerLoop(cfg=cfg)
-
     if process_config is None:
         inner_kwargs: dict[str, Any] = {"cfg": cfg}
         if ip is not None:
             inner_kwargs["ip"] = ip
-        # Propagate the inner loop's target timeout to the child's target-ring
-        # freshness gate — a SECOND independent gate that would otherwise silently
-        # override it at the 0.2 s default (slow replays <~5 Hz would then have
-        # every arm target dropped as stale and freeze on the subprocess path).
         target_timeout_s = max(float(getattr(cfg, "target_timeout_s", 0.2)), 0.2)
         process_config = ArmProcessConfig(target_timeout_s=target_timeout_s, inner_kwargs=inner_kwargs)
     estop_event = mp.get_context("fork").Event()

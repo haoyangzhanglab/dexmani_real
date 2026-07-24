@@ -234,34 +234,3 @@ class SimRobotInterface(ConnectionStateMixin):
     # ------------------------------------------------------------------
     # Simulation-specific validation
     # ------------------------------------------------------------------
-
-    def validate_fk_consistency(self) -> dict[str, Any]:
-        """Validate FK consistency: link poses vs forward_kinematics."""
-        if self.robot is None:
-            return {"ok": False, "error": "not connected"}
-
-        qpos = self.robot.get_qpos()
-        link_poses_real = self.robot.get_link_poses(self.robot.fingertip_link_names)
-        link_poses_fk = self.robot.forward_kinematics(qpos, self.robot.fingertip_link_names)
-
-        max_err = np.max(np.abs(link_poses_real - link_poses_fk))
-        return {"ok": max_err < 1e-4, "max_error": float(max_err)}
-
-    def validate_ik_roundtrip(self, n_tests: int = 20) -> dict[str, Any]:
-        """Validate IK roundtrip consistency: IK(FK(q)) ≈ q."""
-        if self.robot is None:
-            return {"ok": False, "error": "not connected"}
-
-        max_err = 0.0
-        qpos = self.robot.get_qpos()
-        eef_pose = self.robot.get_eef_pose()
-
-        for i in range(n_tests):
-            try:
-                ik_qpos = self.robot.inverse_kinematics(eef_pose, full_qpos_init=qpos)
-                err = np.max(np.abs(ik_qpos[:7] - qpos[:7]))  # compare arm joints only
-                max_err = max(max_err, err)
-            except RuntimeError:
-                return {"ok": False, "error": f"IK failed at test {i}"}
-
-        return {"ok": max_err < 0.1, "max_error": float(max_err), "n_tests": n_tests}

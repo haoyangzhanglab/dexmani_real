@@ -119,6 +119,8 @@ class VideoEncoder:
         # _write_frame_impl does the lock dance so the public method
         # signature stays clean.
         with self._lock:
+            if self._closed:
+                raise RuntimeError("VideoEncoder is closed")
             self._write_frame_impl(frame)
 
     def close(self) -> None:

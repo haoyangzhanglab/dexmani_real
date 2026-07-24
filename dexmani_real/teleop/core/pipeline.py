@@ -12,7 +12,6 @@ import numpy as np
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.planning.types import Pose
 from dexmani_real.robot.types import RobotAction
-from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 
@@ -177,9 +176,7 @@ class TeleopPipeline:
         self._nan_warned_landmarks = False
 
         try:
-            wrist_rot = estimate_frame_from_hand_points(landmarks)
-            mano_landmarks = landmarks @ wrist_rot @ OPERATOR2MANO_RIGHT
-            target_hand = self.retargeter.retarget(mano_landmarks)
+            target_hand = self.retargeter.retarget(landmarks)
             if target_hand is not None and len(target_hand) == 12:
                 retarget_ok = True
                 hand_cmd = np.asarray(target_hand, dtype=np.float64)

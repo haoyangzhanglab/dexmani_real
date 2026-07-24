@@ -156,18 +156,4 @@ class RobotInterfaceConfig:
     # When set, desk safety uses geometric FK (FingertipDeskSafety).
     collision: CollisionConfig | None = None
 
-    # Process isolation transition flags (plan §6 P1), SPLIT into arm/hand
-    # halves so hardware bring-up can validate the arm subprocess first (lower
-    # risk: Mode-6 firmware holds position) before the hand subprocess
-    # (batch-G hold-position / detorque, untested post-repair).
-    #
-    # When True — or the matching env var — RobotInterface builds the hand as a
-    # HandSHMFaçade-backed adapter (crash-isolated subprocess) instead of
-    # in-process XHand, and entry points build the arm servo via
-    # make_arm_servo() (ArmSHMFaçade subprocess) instead of ArmInnerLoop.
-    # Default False = today's proven in-process behaviour. Transitional (A3/D6);
-    # resolved via dexmani_real.robot.isolation.{arm,hand}_isolation_enabled().
-    # Env: DEXMANI_PROCESS_ISOLATION=1 (master, both) or the per-half
-    # DEXMANI_ARM_PROCESS_ISOLATION / DEXMANI_HAND_PROCESS_ISOLATION.
-    use_arm_process_isolation: bool = False
-    use_hand_process_isolation: bool = False
+    # Both arm and hand run in crash-isolated subprocesses via SHM.

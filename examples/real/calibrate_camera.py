@@ -212,19 +212,6 @@ class KeyState:
 # ═══════════════════════════════════════════════ 姿态工具
 
 
-def _rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    """RPY (rad) → WXYZ 四元数。"""
-    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
-    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
-    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
-    return np.array(
-        [
-            cr * cp * cy + sr * sp * sy,
-            sr * cp * cy - cr * sp * sy,
-            cr * sp * cy + sr * cp * sy,
-            cr * cp * sy - sr * sp * cy,
-        ]
-    )
 
 
 def _pose_wxyz_to_matrix(p: np.ndarray, q_wxyz: np.ndarray) -> np.ndarray:
@@ -1022,7 +1009,7 @@ def main():
                         last_wall_time = now
 
             if np.any(drpy != 0):
-                dq = _rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
+                dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)
                 target_quat = quat_multiply(dq, target_quat)
 
             # ── IK ──

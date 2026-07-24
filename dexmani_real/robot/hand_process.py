@@ -77,7 +77,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
-from dexmani_real.robot.isolation import hand_isolation_enabled
+
 from dexmani_real.shm.robot_layouts import (
     HAND_CMD_DTYPE,
     HAND_MACRO_CLEAR_ERROR,
@@ -1165,33 +1165,21 @@ class HandSHMAdapter:
 def make_hand_servo(
     hand_config: XHandConfig,
     *,
-    use_hand_isolation: bool = False,
     process_config: HandProcessConfig | None = None,
     hand_factory: Callable[[XHandConfig], Any] | None = None,
 ) -> XHand | HandSHMAdapter:
-    """Build the hand servo: in-process ``XHand`` or isolated subprocess.
+    """Build the hand servo: crash-isolated subprocess via HandSHMAdapter.
 
-    Behind the hand transition flag (``use_hand_isolation`` or env
-    ``DEXMANI_PROCESS_ISOLATION=1`` / ``DEXMANI_HAND_PROCESS_ISOLATION=1``)
-    returns a ``HandSHMAdapter`` over a ``HandSHMFaçade`` (XHand runs in a fork
-    child owning the sole hand SDK connection); otherwise the proven in-process
-    ``XHand``. Both satisfy the XHand duck-type ``RobotInterface`` uses
-    (connect/disconnect/is_connected/is_error/clear_error/stop/reset/get_state/
-    send_action/last_qpos_cmd/config), so ``RobotInterface`` swaps only its
-    ``__init__`` construction site.
+    XHand runs in a fork child owning the sole hand SDK connection.
+    Satisfies the XHand duck-type (connect/disconnect/is_connected/is_error/
+    clear_error/stop/reset/get_state/send_action/last_qpos_cmd/config).
 
     Args:
         hand_config: XHand config (forwarded to the child's XHand).
-        use_hand_isolation: Config half of the hand transition flag (env overrides).
         process_config: Full override for the subprocess config; when ``None``
-            one is built with ``HandProcessConfig`` defaults (``dexmani_hand`` prefix).
+            one is built with ``HandProcessConfig`` defaults.
         hand_factory: Test injection for the child's XHand (no hardware).
     """
-    if not hand_isolation_enabled(use_hand_isolation):
-        from dexmani_real.robot.xhand.xhand import XHand
-
-        return XHand(hand_config)
-
     if process_config is None:
         process_config = HandProcessConfig()
     estop_event = mp.get_context("fork").Event()

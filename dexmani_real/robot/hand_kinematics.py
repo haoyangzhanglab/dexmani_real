@@ -45,9 +45,7 @@ class HandKinematics:
         try:
             self._model = pinocchio.buildModelFromUrdf(hand_urdf_path)
             self._data = self._model.createData()
-        except ImportError:
-            return
-        except (RuntimeError, ValueError) as e:
+        except Exception as e:
             logger.warning("HandKinematics: URDF loading failed for %s: %s", hand_urdf_path, e)
             return
 

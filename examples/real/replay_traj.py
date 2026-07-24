@@ -572,7 +572,7 @@ def _make_planner(arm_ip: str) -> XArm7MotionPlanner:
 
 
 def _make_robot(
-    planner: XArm7MotionPlanner, arm_ip: str, *, use_hand_process_isolation: bool = False
+    planner: XArm7MotionPlanner, arm_ip: str,
 ) -> RobotInterface:
     """Create and return RobotInterface (not connected)."""
     arm_cfg = XArm7Config(ip=arm_ip)
@@ -581,7 +581,6 @@ def _make_robot(
             arm=arm_cfg,
             collision=COLLISION_CONFIG,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
-            use_hand_process_isolation=use_hand_process_isolation,
         ),
         kinematics=planner.kin,
         planner=planner,
@@ -595,7 +594,6 @@ def _do_return_home(
     arm_ip: str = "192.168.1.111",
     *,
     inner_cfg: ArmInnerLoopConfig = _INNER_CFG,
-    use_arm_isolation: bool = False,
 ) -> ArmServo:
     """Return arm to home position: stop inner loop → plan+execute → restart.
 
@@ -614,7 +612,8 @@ def _do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = make_arm_servo(cfg=inner_cfg, ip=arm_ip, use_arm_isolation=use_arm_isolation)
+        new_inner = make_arm_servo(cfg=inner_cfg, ip=arm_ip)
+        robot.set_arm_servo(new_inner)
         new_inner.start()
         print("  Arm inner loop restarted")
         return new_inner
@@ -701,7 +700,10 @@ class TrajectoryReplayer:
             raise RuntimeError("Pre-flight check failed")
 
         # ArmInnerLoop
-        self._arm_inner = make_arm_servo(cfg=self._inner_cfg, ip=self.arm_ip)
+        self._arm_inner = make_arm_servo(
+            cfg=self._inner_cfg, ip=self.arm_ip,
+        )
+        self.robot.set_arm_servo(self._arm_inner)
         self._arm_inner.start()
         print("Arm inner loop starting...", flush=True)
 
@@ -1247,7 +1249,7 @@ Examples:
                             r = _make_robot(p, args.arm_ip)
                             if r.connect().get("arm"):
                                 new_inner = _do_return_home(
-                                    r, p, replayer._arm_inner, arm_ip=args.arm_ip, inner_cfg=replayer._inner_cfg
+                                    r, p, replayer._arm_inner, arm_ip=args.arm_ip, inner_cfg=replayer._inner_cfg,
                                 )
                                 replayer._arm_inner = new_inner
                             r.disconnect()

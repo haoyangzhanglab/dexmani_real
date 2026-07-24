@@ -49,6 +49,7 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, setup_scene
 from dexmani_real.utils.rate_limiter import RateLimiter
+from scipy.spatial.transform import Rotation as R
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
@@ -181,19 +182,6 @@ class GlobalKeyState:
 # ═══════════════════════════════════════════════ 姿态工具
 
 
-def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    """RPY (rad) → wxyz 四元数。"""
-    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
-    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
-    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
-    return np.array(
-        [
-            cr * cp * cy + sr * sp * sy,
-            sr * cp * cy - cr * sp * sy,
-            cr * sp * cy + sr * cp * sy,
-            cr * cp * sy - sr * sp * cy,
-        ]
-    )
 
 
 # ═══════════════════════════════════════════════ EEF 速度限制
@@ -575,7 +563,7 @@ def main():
                             last_wall_time = now
 
                 if np.any(drpy != 0):
-                    dq = rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
+                    dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)
                     target_quat = quat_multiply(dq, target_quat)
 
                 # ── EEF 速度限制 + IK ──

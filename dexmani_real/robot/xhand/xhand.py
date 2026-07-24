@@ -767,8 +767,8 @@ class XHand(ConnectionStateMixin):
 
     def _iter_sensors(self, hand_state):
         sensor_data = getattr(hand_state, "sensor_data", None)
-        if sensor_data is None:
-            sensor_data = getattr(hand_state, "sensor_data", [])
+        if not sensor_data:
+            return enumerate([])
         return enumerate(list(sensor_data)[:5])
 
     def parse_tactile(self, hand_state) -> np.ndarray:

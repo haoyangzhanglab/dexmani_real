@@ -335,12 +335,14 @@ class CameraRingBuffer:
         idx = seq % self.maxlen
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
-        # Write timestamp + sequence (16 bytes)
+        # ── Seqlock write protocol: odd→data→even ──
+        # Write an odd marker before the payload so concurrent readers see
+        # "writer active" and bail out rather than consuming torn data.
         ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
         )
         ts_arr[0] = np.uint64(now_ns)
-        ts_arr[1] = np.uint64(seq)
+        ts_arr[1] = np.uint64(seq | 1)  # odd: writer active
 
         # Write camera header (64 bytes)
         header_offset = slot_base + 16
@@ -373,6 +375,9 @@ class CameraRingBuffer:
                 (pc_len,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset
             )
             pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
+
+        # ── Seqlock: write even marker — payload is now consistent ──
+        ts_arr[1] = np.uint64(seq)  # even: writer done
 
         self._write_idx_view()[0] = np.uint64(idx)
         return seq
@@ -464,10 +469,10 @@ class CameraRingBuffer:
                 .reshape(self._pc_shape)
             )
 
-        # ── Seqlock: verify slot wasn't overwritten during our read ──
-        # The writer may wrap around and overwrite this slot between our
-        # initial sequence read and the data copies above.  Re-read the
-        # slot's sequence number; a mismatch means the data is torn.
+        # ── Seqlock: reject writer-active or torn reads ──
+        # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
+        if (slot_seq & 1) == 1:
+            return None
         ts_arr_check: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
         )

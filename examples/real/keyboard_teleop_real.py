@@ -42,7 +42,8 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
+from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
 from dexmani_real.robot.validate import validate_action
@@ -50,6 +51,7 @@ from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_limiter import RateLimiter
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
+from scipy.spatial.transform import Rotation as R
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
@@ -168,19 +170,6 @@ class GlobalKeyState:
 # ═══════════════════════════════════════════════ 姿态工具
 
 
-def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    """RPY (rad) → wxyz 四元数。"""
-    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
-    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
-    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
-    return np.array(
-        [
-            cr * cp * cy + sr * sp * sy,
-            sr * cp * cy - cr * sp * sy,
-            cr * sp * cy + sr * cp * sy,
-            cr * cp * sy - sr * sp * cy,
-        ]
-    )
 
 
 # ═══════════════════════════════════════════════ Return-to-Home
@@ -189,8 +178,8 @@ def rpy_to_quat_wxyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
 def do_return_home(
     robot: RobotInterface,
     planner: XArm7MotionPlanner,
-    arm_inner: ArmInnerLoop,
-) -> ArmInnerLoop:
+    arm_inner: ArmServo,
+) -> ArmServo:
     """执行 return_home（停止内环线程 → 归位 → 重启内环线程）。"""
     print("return_home ...", flush=True)
     try:
@@ -203,7 +192,8 @@ def do_return_home(
         print(f"  {'OK' if ok else 'FAIL'}")
 
         # Restart inner loop
-        new_inner = ArmInnerLoop(cfg=INNER_LOOP_CFG)
+        new_inner = make_arm_servo(cfg=INNER_LOOP_CFG)
+        robot.set_arm_servo(new_inner)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -344,7 +334,8 @@ def main():
         return
 
     # ── 4. Start ArmInnerLoop (shared: robot/inner_loop.py) ──
-    arm_inner = ArmInnerLoop(cfg=INNER_LOOP_CFG)
+    arm_inner = make_arm_servo(cfg=INNER_LOOP_CFG)
+    robot.set_arm_servo(arm_inner)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()
@@ -580,7 +571,7 @@ def main():
                 _wall_check(axis, target_pos, WORKSPACE_BOUNDS, wall_warned, wall_timers)
 
             if np.any(drpy != 0):
-                dq = rpy_to_quat_wxyz(drpy[0], drpy[1], drpy[2])
+                dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)
                 target_quat = quat_multiply(dq, target_quat)
 
             # ── Cartesian EMA (before IK, same as TeleopPipeline) ──

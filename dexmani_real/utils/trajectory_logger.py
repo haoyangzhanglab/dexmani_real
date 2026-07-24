@@ -14,11 +14,12 @@ class TrajectoryLogger:
     """Record VR wrist + EEF trajectories per-frame for offline debug.
 
     Stores per-tick data in append lists, flushes to an .npz file on save().
-    Frame data is recorded regardless of teleop/recording state so the full
-    session motion can be analysed.
+    When *enabled* is False (the default), ``append()`` is a no-op so the hot
+    path pays only a single bool branch instead of 11 numpy copies + dict alloc.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = False) -> None:
+        self._enabled = enabled
         self._records: list[dict[str, object]] = []
 
     def append(
@@ -37,6 +38,8 @@ class TrajectoryLogger:
         eef_delta: np.ndarray | None = None,
         target_pos_before_clamp: np.ndarray | None = None,
     ) -> None:
+        if not self._enabled:
+            return
         self._records.append(
             {
                 "t": float(t),

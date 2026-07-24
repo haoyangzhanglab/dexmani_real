@@ -23,6 +23,9 @@ from dexmani_real.robot.hand_kinematics import HandKinematics
 from dexmani_real.robot.hand_process import make_hand_servo
 from dexmani_real.robot.types import RobotAction, RobotInterfaceConfig, RobotState
 from dexmani_real.robot.xarm7 import XArm7
+
+if TYPE_CHECKING:
+    from dexmani_real.robot.arm_process import ArmServo
 from dexmani_real.robot.xhand import XHand, XHandConfig
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
@@ -59,13 +62,13 @@ class RobotInterface:
         self.workspace = WorkspaceSafety(config.workspace_bounds)
 
         self.arm = XArm7(config.arm)
+        self._arm_servo: ArmServo | None = None  # registered by entry point via set_arm_servo()
         # Hand: in-process XHand (today) or crash-isolated HandSHMAdapter
         # subprocess when the hand transition flag is on (plan §6 P1). Both
         # satisfy the XHand duck-type this class + validate_action use, so no
         # hand call site changes. hand_factory: test seam (no hardware).
         self.hand: XHand | HandSHMAdapter = make_hand_servo(
             config.hand,
-            use_hand_isolation=config.use_hand_process_isolation,
             hand_factory=hand_factory,
         )
 
@@ -160,7 +163,18 @@ class RobotInterface:
             hand_ok = False
         return arm_ok and hand_ok
 
+    def set_arm_servo(self, servo: ArmServo) -> None:
+        """Register the position servo so :meth:`emergency_stop` can coordinate it."""
+        self._arm_servo = servo
+
     def emergency_stop(self) -> None:
+        # Fast-path estop through the isolated servo first (≤1 tick),
+        # then fall back to direct SDK stop for the blocking connection.
+        if self._arm_servo is not None:
+            try:
+                self._arm_servo.emergency_stop()
+            except Exception as e:
+                logger.warning("ArmServo emergency_stop() exception: %s", e)
         try:
             self.arm.stop()
         except Exception as e:

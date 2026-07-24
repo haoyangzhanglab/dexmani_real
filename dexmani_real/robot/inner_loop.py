@@ -208,6 +208,10 @@ class ArmInnerLoop:
     def wait_ready(self, timeout: float = 30.0) -> bool:
         return self._ready_event.wait(timeout=timeout)
 
+    def ensure_running(self) -> bool:
+        """In-process threads can't crash independently — always running."""
+        return True
+
     @property
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()

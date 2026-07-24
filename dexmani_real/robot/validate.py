@@ -68,7 +68,8 @@ def validate_action(
             if len(over_idx) > 0:
                 return False, f"torque limit exceeded: joints={over_idx.tolist()}"
         else:
-            logger.warning("Torque data shape mismatch or contains NaN — torque gate inactive")
+            logger.error("Torque data shape mismatch or contains NaN — rejecting action")
+            return False, "torque data invalid"
 
     # 4. Temperature gating (per-joint)
     if actual_arm_temps is not None:
@@ -78,7 +79,8 @@ def validate_action(
             if len(over_idx) > 0:
                 return False, f"temperature limit exceeded: joints={over_idx.tolist()}"
         else:
-            logger.warning("Temperature data shape mismatch or contains NaN — temperature gate inactive")
+            logger.error("Temperature data shape mismatch or contains NaN — rejecting action")
+            return False, "temperature data invalid"
 
     # 5. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
     #    Absolute clip is applied there, before the per-step delta clamp,

@@ -46,7 +46,8 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
+from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.validate import validate_action
@@ -115,8 +116,8 @@ ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命�
 def do_return_home(
     robot: RobotInterface,
     planner: XArm7MotionPlanner,
-    arm_inner: ArmInnerLoop,
-) -> ArmInnerLoop:
+    arm_inner: ArmServo,
+) -> ArmServo:
     """归位: 停止内环 → 规划+执行 → 重启内环."""
     print("return_home ...", flush=True)
     try:
@@ -127,7 +128,8 @@ def do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = ArmInnerLoop(cfg=_INNER_CFG)
+        new_inner = make_arm_servo(cfg=_INNER_CFG)
+        robot.set_arm_servo(new_inner)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -237,7 +239,8 @@ def main():
         return
 
     # ── 5. ArmInnerLoop (30Hz online trajectory planning) ──
-    arm_inner = ArmInnerLoop(cfg=_INNER_CFG)
+    arm_inner = make_arm_servo(cfg=_INNER_CFG)
+    robot.set_arm_servo(arm_inner)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()

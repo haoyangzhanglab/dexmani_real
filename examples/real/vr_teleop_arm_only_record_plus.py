@@ -144,7 +144,8 @@ def do_return_home(
         ok = robot.return_to_home(home_dt=HOME_DT)
         print(f"  {'OK' if ok else 'FAIL'}")
 
-        new_inner = make_arm_servo(cfg=_INNER_CFG, use_arm_isolation=True)
+        new_inner = make_arm_servo(cfg=_INNER_CFG)
+        robot.set_arm_servo(new_inner)
         new_inner.start()
         print("  Arm 内环线程已重启")
         return new_inner
@@ -237,7 +238,6 @@ def main():
             arm=arm_config,
             collision=COLLISION_CONFIG,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
-            use_hand_process_isolation=True,
         ),
         kinematics=planner.kin,
         planner=planner,
@@ -268,7 +268,8 @@ def main():
         return
 
     # ── 5. ArmInnerLoop (30Hz online trajectory planning, crash-isolated subprocess) ──
-    arm_inner = make_arm_servo(cfg=_INNER_CFG, use_arm_isolation=True)
+    arm_inner = make_arm_servo(cfg=_INNER_CFG)
+    robot.set_arm_servo(arm_inner)
     arm_inner.start()
     print("Arm 内环线程启动中...")
     sys.stdout.flush()
