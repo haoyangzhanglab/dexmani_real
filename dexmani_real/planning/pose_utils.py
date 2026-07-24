@@ -16,7 +16,6 @@ __all__ = [
     "compute_pose_error",
     "invert_pose",
     "normalize_quat_wxyz",
-    "pose_error_vector",
     "quat_multiply",
     "quat_wxyz_to_rot6d",
     "quat_wxyz_to_rotmat",
@@ -109,21 +108,6 @@ def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
     q_dot = abs(float(np.dot(target.q, actual.q)))
     rotation_error = 2.0 * np.arccos(min(1.0, q_dot))
     return position_error, rotation_error
-
-
-def pose_error_vector(target: Pose, actual: Pose, max_pos_step: float, max_rot_step: float) -> np.ndarray:
-    position_error = target.p - actual.p
-    position_norm = np.linalg.norm(position_error)
-    if position_norm > max_pos_step > 0:
-        position_error = position_error / position_norm * max_pos_step
-
-    q_error = _quat_multiply(target.q, _quat_conjugate(actual.q))
-    rotation_vector = quat_to_rotvec(q_error)
-    rotation_norm = np.linalg.norm(rotation_vector)
-    if rotation_norm > max_rot_step > 0:
-        rotation_vector = rotation_vector / rotation_norm * max_rot_step
-
-    return np.concatenate([position_error, rotation_vector])
 
 
 def normalize_quat_wxyz(q: np.ndarray) -> np.ndarray:

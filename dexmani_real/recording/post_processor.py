@@ -18,7 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import h5py
 import numpy as np
 
 from dexmani_real.recording.episode_reader import EpisodeReader
@@ -405,22 +404,3 @@ class TimestampAligner:
         return report
 
 
-# ── Convenience function ──
-
-
-def align_and_validate(
-    h5_path: str,
-    dt: float = 0.020,
-    method: str = "linear",
-    max_gap_s: float = 0.1,
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Align an episode and validate the result.
-
-    Returns (aligned_data, validation_report).
-    """
-    aligner = TimestampAligner(dt=dt, method=method, max_gap_s=max_gap_s)
-    aligned = aligner.align(h5_path, dt=dt)
-    if aligned is None:
-        return None, {"error": "Alignment failed", "ok": False}
-    report = aligner.validate_alignment(aligned)
-    return aligned, report

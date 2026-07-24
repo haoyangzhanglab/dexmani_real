@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
+
 
 class WorkspaceSafety:
     """EEF workspace position bounds checking and clamping.
@@ -22,6 +26,9 @@ class WorkspaceSafety:
     def check(self, eef_pos: np.ndarray) -> bool:
         """Check whether EEF position is within workspace bounds."""
         eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(eef_pos)):
+            logger.warning("WorkspaceSafety: NaN/Inf EEF position — treating as out-of-bounds")
+            return False
         return bool(
             (eef_pos[0] >= self.bounds[0, 0])
             and (eef_pos[0] <= self.bounds[0, 1])

@@ -34,6 +34,15 @@ SCHEMA_VERSION = 8  # v8: +truncated/stop_reason/cam_frames_dropped/cam_items_wr
 SCHEMA_VERSION_ARM_SENT = 9  # v9: +/action_arm_joint_sent(T,7) opt-in stream (ctor flag arm_sent_stream=True)
 SCHEMA_VERSION_DIAGNOSTICS = 10  # v10: +diagnostics (arm_temps/tracking_error/ik_solve_time_ms/target_pos_before_clamp/head_quat_wxyz) + flag_safety_reject
 
+
+def _compute_schema_version(arm_sent_stream: bool, diagnostics_recorded: bool) -> int:
+    """Return the actual schema version based on recorded features."""
+    if diagnostics_recorded:
+        return SCHEMA_VERSION_DIAGNOSTICS  # v10
+    if arm_sent_stream:
+        return SCHEMA_VERSION_ARM_SENT  # v9
+    return SCHEMA_VERSION  # v8
+
 CAMERA_FRESH_TIMEOUT_S = 0.2  # flag_camera_fresh: max age of the last *new* camera frame (~6 frames @30fps)
 
 # ── atexit safety net ──
@@ -86,6 +95,9 @@ class EpisodeRecorder:
         # pass the kwarg yet, so the flag alone is inert.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
+        # Track whether v10 diagnostics were recorded (for conditional schema_version).
+        self._diagnostics_recorded: bool = False
+
         # Opt-in H.264 video encoding (Phase 1): when True, rgb frames are
         # written to a sidecar .rgb.mp4 file instead of (or in addition to)
         # the HDF5 dataset.  Depth stays as HDF5+gzip — 16-bit depth requires
@@ -133,7 +145,7 @@ class EpisodeRecorder:
         self._cam_writer_stop: threading.Event = threading.Event()
         self._cam_written: int = 0
         self._cam_dropped: int = 0  # enqueue-side drops (writer backlog) — see add_frame
-        self._hdf5_lock: threading.Lock = threading.Lock()
+        self._hdf5_lock: threading.RLock = threading.RLock()
 
         # Video sidecar encoders (opt-in, use_video=True).
         # Created lazily on first camera frame, closed at stop_episode.
@@ -440,11 +452,12 @@ class EpisodeRecorder:
         # convention for optional action streams.  Gated on the constructor flag so
         # an accidental kwarg can never add a dataset to a default (v8) recording.
         if self.arm_sent_stream:
-            sent = np.asarray(arm_qpos_sent, dtype=np.float64) if arm_qpos_sent is not None else np.zeros(7)
+            sent = np.asarray(arm_qpos_sent, dtype=np.float64) if arm_qpos_sent is not None else np.full(7, np.nan)
             data["action_arm_joint_sent"] = sent
 
         # ── Diagnostics (v10): continuous telemetry — auto-discovered by _flush_buffered ──
         if diagnostics:
+            self._diagnostics_recorded = True
             for key, val in diagnostics.items():
                 data[key] = np.asarray(val, dtype=np.float64)
 
@@ -534,14 +547,14 @@ class EpisodeRecorder:
         _hdf5_flush_every_n = 100  # HDF5 metadata flush (cheap)
         while not self._cam_writer_stop.is_set():
             # ── Deferred buffer flush (gzip + resize + fsync) ──
-            # _flush_buffered() manages its own _hdf5_lock internally —
-            # do NOT wrap it in another lock acquisition (threading.Lock
-            # is non-reentrant; nesting would deadlock the writer thread).
-            if self._flush_pending or (
-                self._buffer is not None and self._buffer.size - self._flushed_frames >= self._flush_interval
-            ):
-                self._flush_buffered()
-                self._flush_pending = False
+            # _hdf5_lock is a reentrant lock (RLock); wrapping the check+flush
+            # protects against the TOCTOU race on self._buffer from the stop path.
+            with self._hdf5_lock:
+                if self._flush_pending or (
+                    self._buffer is not None and self._buffer.size - self._flushed_frames >= self._flush_interval
+                ):
+                    self._flush_buffered()
+                    self._flush_pending = False
 
             try:
                 item = self._cam_queue.get(timeout=0.1)
@@ -942,7 +955,9 @@ class EpisodeRecorder:
         if self._file is not None:
             with self._hdf5_lock:
                 meta = self._file["meta"]
-                meta.attrs["schema_version"] = SCHEMA_VERSION_DIAGNOSTICS  # v10
+                meta.attrs["schema_version"] = _compute_schema_version(
+                    self.arm_sent_stream, self._diagnostics_recorded
+                )
                 meta.attrs["duration"] = duration
                 meta.attrs["num_frames"] = self._frame_count
                 meta.attrs["success"] = success

@@ -13,7 +13,7 @@ Dexterous manipulation teleop & data collection for **xArm7 (7-DOF arm) + XHand 
 | Modify IK / retargeting pipeline | `dexmani_real/teleop/core/pipeline.py` |
 | Modify IK solver | `dexmani_real/planning/ik.py` |
 | Modify safety checks (validate) | `dexmani_real/robot/validate.py` |
-| Modify state machine | `dexmani_real/teleop/core/controller.py` |
+| Modify state machine | `examples/real/vr_teleop_arm_only_record_plus.py` (inline boolean flags) |
 | Modify HDF5 recording format | `dexmani_real/recording/episode_recorder.py` |
 | Modify recording lifecycle | `dexmani_real/recording/collection_loop.py` |
 | Modify VR arm mapping | `dexmani_real/teleop/vr/arm_mapper.py` |
@@ -52,7 +52,7 @@ Full guidelines: invoke `/karpathy-guidelines` skill or see `.claude/skills/karp
 │   │   ├── xarm7/         ← XArm7 SDK wrapper (xarm7.py, error_codes.py)
 │   │   └── xhand/         ← XHand SDK wrapper (xhand.py, motor_trajectory_interpolator.py)
 │   ├── teleop/            ← VR teleop controller + pipeline + retargeting
-│   │   ├── core/          ← TeleopController (state machine), TeleopPipeline
+│   │   ├── core/          ← TeleopPipeline
 │   │   ├── vr/            ← ArmWristMapper, XHandRetargeter, QuestHandTracker, DummyTracker
 │   │   └── control/       ← KeyboardHandler, safety checks, audio feedback
 │   ├── planning/          ← MPlib planner, IK, FK kinematics, collision, desk safety
@@ -95,7 +95,10 @@ RobotInterface.send_action(action)    ← hand only (arm handled by ArmInnerLoop
 **Key rates:** Control loop 16 Hz, ArmInnerLoop 30 Hz (mode 6 — firmware handles trajectory smoothing).
 ArmInnerLoop provides per-step joint delta clamp + dynamics readback (torque, temperature) to validate_action.
 
-### State Machine (TeleopController)
+### State Machine
+
+The state machine is implemented inline in each entry point (e.g. `vr_teleop_arm_only_record_plus.py`)
+using boolean flags rather than a centralized ControllerState enum.
 
 ```
 IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
@@ -104,7 +107,7 @@ IDLE ──B(begin+record)──→ TELEOP ⇄ C(pause) ⇄ PAUSED
   ESC / VR-disconnect timeout → EMERGENCY_STOP
 ```
 
-States (`ControllerState` enum): **IDLE, TELEOP, PAUSED, EMERGENCY_STOP** only.
+States: **IDLE, TELEOP, PAUSED, EMERGENCY_STOP** only.
 Recording is a bool flag (not a state): set True on B, saved on S, discarded on Q.
 
 ### Core Types (`dexmani_real/robot/types.py`)
@@ -193,7 +196,7 @@ Camera frames stream per-frame, index-aligned to grid (per-slot forward-fill).
 - ❌ Mutable defaults in dataclass fields → use `field(default_factory=...)`
 - ❌ Skipping `__init__.py` — new subpackages must have a docstring; `planning/`, `recording/`, and `simulation/` define `__all__` (match their pattern when adding public API)
 - ❌ Hardcoding 50Hz assumptions → use `control_hz` from config (recording is 16 Hz; inner loop is 30 Hz)
-- ❌ Adding state enum variants → Recording is a bool, not a ControllerState; no RECORDING/SAVE_PROMPT state
+- ❌ Adding state enum variants → Recording is a bool, not a separate state; no RECORDING/SAVE_PROMPT state
 
 ---
 

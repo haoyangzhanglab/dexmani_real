@@ -66,7 +66,7 @@ class ArmInnerLoopConfig:
     joint_max_speed: float = 2.0944  # 120°/s in rad/s
     joint_max_acc: float = 8.7266  # 500°/s² in rad/s²
     loop_period: float = (
-        1.0 / 30.0  # 30Hz (was 25Hz) — Mode 6 firmware handles interpolation; 30Hz improves tracking fidelity vs 25Hz
+        1.0 / 30.0  # 30Hz — Mode 6 firmware handles interpolation
     )
     # Shared
     target_timeout_s: float = 0.2
@@ -78,6 +78,13 @@ class ArmInnerLoopConfig:
     # same target every 20ms, so a single anomalous target is chased at up to
     # 0.3 rad per inner step until it times out (target_timeout_s).
     max_joint_delta: float = 0.3
+
+    # Absolute joint limit clip — hardware safety bounds applied before the
+    # per-step delta clamp (mirrors xArm7 physical limits in radians).
+    # J1=±360°, J2=-118°/+120°, J3=±360°, J4=-11°/+225°, J5=±360°,
+    # J6=-97°/+180°, J7=±360°.
+    joint_limit_lower: tuple[float, ...] = (-6.283, -2.059, -6.283, -0.192, -6.283, -1.693, -6.283)
+    joint_limit_upper: tuple[float, ...] = (6.283, 2.094, 6.283, 3.927, 6.283, 3.142, 6.283)
 
     # Passive tracking-error monitor — enables velocity-adaptive thresholding
     # when > 0 (recommended: 0.35).  The actual warn threshold scales with
@@ -128,12 +135,10 @@ class ArmInnerLoop:
     def __init__(
         self,
         ip: str = "192.168.1.111",
-        dt: float = 1.0 / 125.0,
         cfg: ArmInnerLoopConfig | None = None,
         sync: SharedSyncPrimitives | None = None,
     ) -> None:
         self._ip = ip
-        self._dt = float(dt)  # kept for API compat; unused in Mode 6
         self._cfg = cfg or ArmInnerLoopConfig()
         self._sync = sync
 
@@ -378,9 +383,15 @@ class ArmInnerLoop:
             if code == 0 and len(states) > 0:
                 current_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
                 if not np.all(np.isfinite(current_qpos)):
-                    current_qpos = np.zeros(7, dtype=np.float64)
+                    logger.error("ArmInnerLoop: initial qpos contains NaN/Inf — refusing to start")
+                    with self._lock:
+                        self._error_state = True
+                    return
             else:
-                current_qpos = np.zeros(7, dtype=np.float64)
+                logger.error("ArmInnerLoop: failed to read initial qpos (code=%d)", code)
+                with self._lock:
+                    self._error_state = True
+                return
 
             with self._lock:
                 self._arm_qpos = current_qpos.copy()
@@ -664,6 +675,8 @@ class ArmInnerLoop:
         # Safety ceiling against IK solver anomalies.  A normal target step is
         # joint_max_speed ÷ outer_loop_hz: ≈0.098 rad @16Hz outer (~3x headroom).
         clamped = target[:7].copy()
+        # Absolute joint limit clip (before per-step delta clamp, per validate.py §5)
+        np.clip(clamped, self._cfg.joint_limit_lower, self._cfg.joint_limit_upper, out=clamped)
         if self._cfg.max_joint_delta > 0 and self._last_sent_target is not None:
             delta = clamped - self._last_sent_target
             delta = np.clip(delta, -self._cfg.max_joint_delta, self._cfg.max_joint_delta)

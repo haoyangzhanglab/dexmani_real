@@ -11,6 +11,9 @@ from __future__ import annotations
 import numpy as np
 
 from dexmani_real.robot.types import _ARM_TEMP_LIMIT_C, _ARM_TORQUE_LIMIT_NM, RobotAction
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 def validate_action(
@@ -51,6 +54,12 @@ def validate_action(
     if not robot.arm.is_connected():
         return False, "arm not connected"
 
+    # 2.5. Action NaN guard — reject NaN/Inf joint commands before any dispatch
+    if not np.all(np.isfinite(action.arm_qpos_cmd)):
+        return False, "action arm_qpos_cmd NaN/Inf"
+    if not np.all(np.isfinite(action.hand_qpos_cmd)):
+        return False, "action hand_qpos_cmd NaN/Inf"
+
     # 3. Torque gating (per-joint)
     if actual_arm_tau is not None:
         tau = np.asarray(actual_arm_tau, dtype=np.float64)
@@ -58,6 +67,8 @@ def validate_action(
             over_idx = np.where(np.abs(tau) > _ARM_TORQUE_LIMIT_NM)[0]
             if len(over_idx) > 0:
                 return False, f"torque limit exceeded: joints={over_idx.tolist()}"
+        else:
+            logger.warning("Torque data shape mismatch or contains NaN — torque gate inactive")
 
     # 4. Temperature gating (per-joint)
     if actual_arm_temps is not None:
@@ -66,6 +77,8 @@ def validate_action(
             over_idx = np.where(temps > _ARM_TEMP_LIMIT_C)[0]
             if len(over_idx) > 0:
                 return False, f"temperature limit exceeded: joints={over_idx.tolist()}"
+        else:
+            logger.warning("Temperature data shape mismatch or contains NaN — temperature gate inactive")
 
     # 5. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
     #    Absolute clip is applied there, before the per-step delta clamp,

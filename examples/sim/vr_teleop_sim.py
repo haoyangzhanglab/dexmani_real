@@ -407,7 +407,6 @@ def main() -> None:
     # ── VR Tracker 初始化 ──
     if args.dummy_vr_sinusoidal:
         tracker: DummyTracker | QuestHandTracker | VRFrameSimulator = VRFrameSimulator(
-            hz=CTRL_HZ,
             amplitude_m=0.15,
             center_pos=(0.45, 0.0, 0.30),
         )

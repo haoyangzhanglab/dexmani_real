@@ -99,11 +99,11 @@ class TeleopIKSolver:
         # ── Hold timeout tracking ──
         if not result.success or result.held:
             if self._hold_start is None:
-                self._hold_start = time.time()
-            elif time.time() - self._hold_start > 2.0 and not self._hold_warned:
+                self._hold_start = time.monotonic()
+            elif time.monotonic() - self._hold_start > 2.0 and not self._hold_warned:
                 logger.warning(
                     "IK holding for %.1fs — arm frozen (reason: %s)",
-                    time.time() - self._hold_start,
+                    time.monotonic() - self._hold_start,
                     result.reason,
                 )
                 self._hold_warned = True
@@ -393,6 +393,30 @@ class TeleopIKSolver:
             )
         return None, {}
 
+    def _make_collision_held(
+        self,
+        qpos_cmd: np.ndarray,
+        current_qpos: np.ndarray,
+        previous_qpos_cmd: np.ndarray,
+        reason: str,
+        report: dict[str, Any],
+        **extra: Any,
+    ) -> IKResult:
+        """Build a held IKResult for collision-gate rejection."""
+        qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
+        return IKResult(
+            success=False,
+            qpos=previous_qpos_cmd.copy(),
+            reason=reason,
+            report={
+                **report,
+                "held": True,
+                "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
+                **extra,
+            },
+            held=True,
+        )
+
     def _command_from_target_qpos(
         self,
         target_eef_pose_world: Pose,
@@ -450,32 +474,14 @@ class TeleopIKSolver:
                         target_eef_pose_world.p[2], current_eef.p[2],
                     )
                 else:
-                    qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-                    return IKResult(
-                        success=False,
-                        qpos=previous_qpos_cmd.copy(),
-                        reason=collision_reason,
-                        report={
-                            **report,
-                            "held": True,
-                            "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
-                            **collision_extra,
-                        },
-                        held=True,
+                    return self._make_collision_held(
+                        qpos_cmd, current_qpos, previous_qpos_cmd,
+                        collision_reason, report, **collision_extra,
                     )
             else:
-                qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-                return IKResult(
-                    success=False,
-                    qpos=previous_qpos_cmd.copy(),
-                    reason=collision_reason,
-                    report={
-                        **report,
-                        "held": True,
-                        "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
-                        **collision_extra,
-                    },
-                    held=True,
+                return self._make_collision_held(
+                    qpos_cmd, current_qpos, previous_qpos_cmd,
+                    collision_reason, report, **collision_extra,
                 )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)

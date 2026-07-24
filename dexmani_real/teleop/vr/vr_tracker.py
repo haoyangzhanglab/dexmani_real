@@ -322,7 +322,7 @@ class VRFrameSimulator:
     so it can be dropped into any code that expects a tracker.
 
     Usage:
-        sim = VRFrameSimulator(hz=50.0)
+        sim = VRFrameSimulator()
         while loop:
             frame = sim.get_latest()
             ... use frame just like a real VR frame ...
@@ -332,12 +332,10 @@ class VRFrameSimulator:
 
     def __init__(
         self,
-        hz: float = 50.0,
         amplitude_m: float = 0.15,
         center_pos: tuple[float, float, float] = (0.45, 0.0, 0.30),
         hand_side: str = "right",
     ) -> None:
-        self._hz = float(hz)
         self._amplitude = float(amplitude_m)
         self._center = np.asarray(center_pos, dtype=np.float64)
         self._hand_side = hand_side
