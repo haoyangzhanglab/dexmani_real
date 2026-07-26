@@ -219,10 +219,12 @@ class RobotInterface:
         try:
             hand_state = self.hand.get_state()  # default mode now includes tactile (ref: DexUMI)
             hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
+            hand_current = np.asarray(hand_state.get("current", np.zeros(12)), dtype=np.float64)
             hand_tactile_sum = np.asarray(hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64)
             hand_tactile_force = np.asarray(hand_state.get("tactile_force", np.zeros((5, 120, 3))), dtype=np.float64)
         except Exception:
             hand_qpos = nan_array(12)
+            hand_current = nan_array(12)
             hand_tactile_sum = nan_array((5, 3))
             hand_tactile_force = nan_array((5, 120, 3))
 
@@ -247,6 +249,7 @@ class RobotInterface:
             eef_quat_wxyz=eef_quat_wxyz,
             eef_rot6d=eef_rot6d,
             hand_qpos=hand_qpos,
+            hand_current=hand_current,
             hand_tactile_sum=hand_tactile_sum,
             hand_tactile_force=hand_tactile_force,
             fingertip_pos=fingertip_pos,

@@ -10,6 +10,7 @@ import numpy as np
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
+    from .desk_safety import FingertipDeskSafety
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
@@ -44,10 +45,17 @@ class TeleopIKSolver:
     _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)
     _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)
 
-    def __init__(self, kin: XArm7Kinematics, ik_mgr: IKCandidateManager, teleop_profile: TeleopProfile) -> None:
+    def __init__(
+        self,
+        kin: XArm7Kinematics,
+        ik_mgr: IKCandidateManager,
+        teleop_profile: TeleopProfile,
+        desk_safety: "FingertipDeskSafety | None" = None,
+    ) -> None:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
+        self.desk_safety = desk_safety
         self._nullspace_warn_throttle: int = 0
         self._hold_start: float | None = None
         self._hold_warned: bool = False
@@ -80,6 +88,8 @@ class TeleopIKSolver:
                 profile=profile,
                 report=report,
             )
+            # Propagate total solve time to success path (failure path already has it at line 103).
+            result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
         else:
             # ── Hold ──
             dt_total_ms = (time.perf_counter() - t_start) * 1000
@@ -139,11 +149,13 @@ class TeleopIKSolver:
         best_fallback: tuple[np.ndarray, str, float] | None = None  # (qpos, seed_name, weighted_dist)
 
         for seed_name, seed, n_init in seeds:
+            _tik0 = time.perf_counter()
             status, raw_qpos = self.ik_mgr.call_mplib_ik(
                 target_pose_base, seed, n_init_qpos=n_init, return_closest=True,
             )
+            _solve_ms = (time.perf_counter() - _tik0) * 1000.0
             if not is_mplib_success(status) or raw_qpos is None:
-                attempts.append(f"{seed_name}:mplib_failed")
+                attempts.append(f"{seed_name}:mplib_failed({_solve_ms:.1f}ms)")
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
@@ -163,7 +175,7 @@ class TeleopIKSolver:
                 qpos, pos_err, rot_err, mu, previous_qpos_cmd, jump_limit, profile,
             )
             if not passed:
-                attempts.append(f"{seed_name}:{tag}")
+                attempts.append(f"{seed_name}:{tag}({_solve_ms:.1f}ms)")
                 continue
 
             hw_dist = float(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, current_qpos))))
@@ -172,7 +184,7 @@ class TeleopIKSolver:
             # Track best fallback (closest to current by weighted distance).
             if best_fallback is None or weighted_dist < best_fallback[2]:
                 best_fallback = (qpos.copy(), seed_name, weighted_dist)
-            attempts.append(f"{seed_name}:ok")
+            attempts.append(f"{seed_name}:ok({_solve_ms:.1f}ms)")
 
             # Fast path: prev_cmd seed, close to hardware → accept immediately.
             if seed_name == "prev_cmd" and hw_dist <= fast_accept_rad:
@@ -373,7 +385,7 @@ class TeleopIKSolver:
     def _check_teleop_collision_gate(
         self, qpos_cmd: np.ndarray, profile: TeleopProfile,
     ) -> tuple[str | None, dict[str, Any]]:
-        """Self + env collision gate. Returns (reason, extra_report) or (None, {})."""
+        """Self + env collision + FK desk safety gate. Returns (reason, extra_report) or (None, {})."""
         if not profile.check_self_collision and not profile.check_env_collision:
             return None, {}
 
@@ -386,11 +398,20 @@ class TeleopIKSolver:
                         {"collision": info.to_dict()},
                     )
 
-        if profile.check_env_collision and self.ik_mgr.has_env_collision(qpos_cmd):
-            return (
-                "IK result in environment collision (table/obstacle), holding.",
-                {"env_collision": True},
-            )
+        if profile.check_env_collision:
+            if self.ik_mgr.has_env_collision(qpos_cmd):
+                return (
+                    "IK result in environment collision (table/obstacle), holding.",
+                    {"env_collision": True},
+                )
+            if self.desk_safety is not None:
+                desk_safe, min_z, min_name = self.desk_safety.check_hand_desk_clearance(qpos_cmd)
+                if not desk_safe:
+                    threshold = self.desk_safety.config.fingertip_threshold
+                    return (
+                        f"IK result in desk collision ({min_name} z={min_z:.3f}m < safe={threshold:.3f}m), holding.",
+                        {"desk_collision": True, "min_fingertip_z": float(min_z), "min_fingertip_name": min_name},
+                    )
         return None, {}
 
     def _make_collision_held(

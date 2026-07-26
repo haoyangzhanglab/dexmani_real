@@ -8,8 +8,10 @@ collection failures:
 - Camera content duplication: per-frame ROI hash over /rgb — cam-writer
   backlog drops repeat frames on disk while flag_camera_fresh stays True
   (it only tracks SHM arrival, not what reached the file).
-- Tracking error: max|/action_arm_joint - /arm_qpos| per frame — mode-6
+- Arm tracking error: max|/action_arm_joint - /arm_qpos| per frame — mode-6
   speed-saturation lag between commanded and actual joints.
+	- Hand tracking error: max|/action_hand_joint - /hand_qpos| per frame —
+	  commanded vs actual hand joint positions.
 - Flags summary + /meta echo (v8 attrs: truncated, stop_reason,
   cam_frames_dropped, cam_items_written; schema <= 7 files print "-").
 
@@ -43,6 +45,7 @@ FILL_WARN_PCT = 10.0  # forward-filled grid slots
 CAM_DUP_WARN_MARGIN_PCT = 15.0  # camera dup% above the rate-derived baseline
 TRACK_P95_WARN_DEG = 20.0
 FREEZE_REPORT_MIN_S = 0.2  # only list camera freeze runs at least this long
+HAND_TRACK_P95_WARN_DEG = 20.0
 
 
 def _runs_of(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -134,6 +137,26 @@ def _check_tracking(f: h5py.File, thresh_rad: float) -> float | None:
     return float(np.degrees(p95))
 
 
+def _check_hand_tracking(f: h5py.File, thresh_rad: float) -> float | None:
+    """Print hand cmd-state tracking-error stats; return p95 in degrees."""
+    if "action_hand_joint" not in f or "hand_qpos" not in f:
+        print("  手跟踪误差: action_hand_joint/hand_qpos 缺失 — 跳过")
+        return None
+    err = np.max(np.abs(f["action_hand_joint"][:] - f["hand_qpos"][:]), axis=1)
+    err = err[np.isfinite(err)]
+    if err.size == 0:
+        print("  手跟踪误差: 全 NaN — 跳过")
+        return None
+    p95 = float(np.percentile(err, 95))
+    over = 100.0 * float(np.mean(err > thresh_rad))
+    print(
+        f"  手跟踪误差 |cmd-state|∞: mean {np.degrees(err.mean()):.1f}°  "
+        f"p95 {np.degrees(p95):.1f}°  max {np.degrees(err.max()):.1f}°  "
+        f">{np.degrees(thresh_rad):.0f}°: {over:.1f}% 帧"
+    )
+    return float(np.degrees(p95))
+
+
 def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[str]:
     """Run all checks on one episode; return the WARN lines."""
     warns: list[str] = []
@@ -142,18 +165,15 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
         meta = dict(f["meta"].attrs) if "meta" in f else {}
         control_hz = float(meta.get("control_hz", 0.0) or 0.0)
 
-        video_codec = str(meta.get("video_codec", ""))
         print(f"\n=== {path} ===")
-        print(
-            f"  meta: schema={meta.get('schema_version', '-')}  control_hz={control_hz:g}  "
-            f"frames={meta.get('num_frames', '-')}  dur={meta.get('duration', float('nan')):.1f}s  "
-            f"success={meta.get('success', '-')}  min_frames_met={meta.get('min_frames_met', '-')}"
-            f"{'  video=' + video_codec if video_codec else ''}"
-        )
-        print(
-            f"        truncated={meta.get('truncated', '-')}  stop_reason={meta.get('stop_reason', '-')}  "
-            f"cam_dropped={meta.get('cam_frames_dropped', '-')}  cam_written={meta.get('cam_items_written', '-')}"
-        )
+        for k in sorted(meta):
+            v = meta[k]
+            if isinstance(v, np.ndarray):
+                continue
+            if isinstance(v, float):
+                print(f"  meta  {k}={v:.1f}")
+            else:
+                print(f"  meta  {k}={v}")
 
         fill_pct = _check_grid(f, control_hz)
         if fill_pct > FILL_WARN_PCT:
@@ -181,6 +201,10 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
         if p95_deg is not None and p95_deg > TRACK_P95_WARN_DEG:
             warns.append(f"跟踪误差 p95 {p95_deg:.1f}° > {TRACK_P95_WARN_DEG:.0f}° — 臂速度饱和，动作标签失真")
 
+        hand_p95_deg = _check_hand_tracking(f, track_thresh_rad)
+        if hand_p95_deg is not None and hand_p95_deg > HAND_TRACK_P95_WARN_DEG:
+            warns.append(f"手跟踪误差 p95 {hand_p95_deg:.1f}° > {HAND_TRACK_P95_WARN_DEG:.0f}° — 手跟踪滞后")
+
         flags = [k for k in ("flag_ik_ok", "flag_held", "flag_camera_fresh", "flag_retarget_ok") if k in f]
         if flags:
             print("  flags: " + "  ".join(f"{k}={100.0 * float(np.mean(f[k][:])):.1f}%" for k in flags))
@@ -205,6 +229,11 @@ def main() -> None:
         default=0.35,
         help="Tracking-error threshold in rad for the over-threshold ratio (default: 0.35 = inner-loop warn).",
     )
+    parser.add_argument(
+        "--quality",
+        action="store_true",
+        help="Run trajectory quality assessment (adaptive-threshold classification) alongside health checks.",
+    )
     args = parser.parse_args()
 
     total_warns = 0
@@ -219,6 +248,23 @@ def main() -> None:
         except (OSError, KeyError, ValueError) as e:
             logger.error("Failed to check %s: %s", path, e)
             total_warns += 1
+
+        # ── Optional quality assessment ──
+        if args.quality:
+            from dexmani_real.tools.assess_trajectory_quality import assess_episode
+
+            qr = assess_episode(str(path))
+            if qr is not None:
+                print(
+                    f"\n  [quality] {qr.classification:>9s}  "
+                    f"{qr.anomaly_ratio*100:.1f}% anomalous  "
+                    f"p95={qr.overall_p95_deg:.1f}°  max={qr.overall_max_deg:.1f}°  "
+                    f"J{qr.worst_joint} worst"
+                )
+                if qr.classification == "DEGRADED":
+                    total_warns += 1
+            else:
+                print(f"\n  [quality] SKIP — could not assess")
 
     if len(args.episodes) > 1:
         print(f"\n共 {len(args.episodes)} 个文件, {total_warns} 项警告")

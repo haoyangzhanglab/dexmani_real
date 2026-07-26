@@ -704,12 +704,14 @@ class HandSHMFaçade:
 def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuffer, last_cmd_seq: int) -> None:
     """Publish one HAND_STATE frame: state + tactile + echo (child-side)."""
     try:
-        st = hand.get_state(force_update=True)
+        st = hand.get_state(full=True, force_update=True)
     except Exception:
         logger.warning("hand child: get_state failed.", exc_info=True)
         st = None
     if st is not None:
         frame["qpos"][0] = np.asarray(st["qpos"], dtype=np.float64)
+        frame["current"][0] = np.asarray(st["current"], dtype=np.float64)
+        frame["temperature"][0] = np.full(12, np.nan, dtype=np.float64)
         frame["tactile_sum"][0] = np.asarray(st["tactile_force_sum"], dtype=np.float64)
         frame["tactile_force"][0] = np.asarray(st["tactile_force"], dtype=np.float64)
 
@@ -1139,7 +1141,8 @@ class HandSHMAdapter:
             }
         return {
             "qpos": np.asarray(rec["qpos"][0], dtype=np.float64).copy(),
-            "current": np.zeros(12, dtype=np.float64),
+            "current": np.asarray(rec["current"][0], dtype=np.float64).copy(),
+            "temperature": np.asarray(rec["temperature"][0], dtype=np.float64).copy(),
             "timestamp": time.time(),
             "tactile_force": np.asarray(rec["tactile_force"][0], dtype=np.float64).copy(),
             # SHM field is tactile_sum; XHand dict key is tactile_force_sum.
@@ -1152,6 +1155,7 @@ class HandSHMAdapter:
     def send_action(self, action: np.ndarray) -> bool:
         try:
             ok, expected_cmd = self._facade.send_action(action)
+            self._facade.check_echo()
         except Exception as e:
             logger.warning("HandSHMAdapter.send_action exception: %s", e)
             return False

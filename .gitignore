@@ -144,5 +144,6 @@ dmypy.json
 
 trajectories/
 episodes_arm/
+episodes_hand/
 episodes/
 replay_results/

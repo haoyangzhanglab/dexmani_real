@@ -49,7 +49,7 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
-from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
+from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
@@ -125,6 +125,26 @@ _INNER_CFG = ArmInnerLoopConfig(
 )
 ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
 
+# IK output safety gate: reject IK solutions with joint-space delta from physical
+# arm position exceeding this threshold.  Must be > ARM_CMD_MAX_STEP_RAD (0.131)
+# to allow normal tracking lag, < anomalous hard cap (0.50 rad).
+# Default disabled — enable after empirical validation (no false rejects in normal teleop).
+IK_OUTPUT_SAFETY_THRESHOLD_RAD = 0.45
+IK_OUTPUT_GATE_ENABLED = False
+
+# VR wrist quaternion continuity gate: reject frames where the angular distance
+# between consecutive wrist quaternions exceeds this threshold.  Human wrist max
+# is ~500°/s (31°/frame @ 16 Hz) for elite athletes; 45°/frame (~720°/s) gives
+# 45% margin and catches VR tracking glitches (typically 100°+/frame).
+VR_WRIST_QUAT_JUMP_THRESHOLD_RAD: float = np.deg2rad(45)
+
+# Frame quality codes for HDF5 flag_frame_status field (schema v11).
+# Written alongside the legacy flags for backward-compatible filtering.
+_FRAME_OK = 0
+_FRAME_HELD = 1
+_FRAME_IK_FAIL = 2
+_FRAME_SAFETY_REJECT = 3
+
 
 # ═══════════════════════════════════════════════ 归位
 
@@ -163,12 +183,22 @@ def do_return_home(
 
 def record_held_frame(
     recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool, arm_qpos_sent: np.ndarray | None = None,
+    hold_hand: np.ndarray | None = None,
     safety_reject: bool = False, diagnostics: dict | None = None,
+    frame_status: int = _FRAME_HELD,
+    ik_attempted: bool = False,
 ) -> None:
     """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags (防止回填伪造 ik_ok/held).
 
     arm_qpos_sent: 上一帧实发值 (arm_inner.last_sent_cmd) — held 帧不发送新目标,
     但记录侧应反映"上一帧实发值"而非零, 否则 --source=sent replay 会发送错误指令。
+
+    frame_status: _FRAME_HELD (default), _FRAME_IK_FAIL, or _FRAME_SAFETY_REJECT —
+    stored as flag_frame_status in HDF5 for downstream quality filtering.
+
+    ik_attempted: True when IK was actually run before the hold decision
+    (IK failure, output gate, safety reject), False when IK was skipped
+    entirely (teleop inactive, VR stale, quat jump, mapper failure).
     """
     if vr_frame is None:  # VR 过期/丢失 — NaN 位姿如实标记无数据
         vr_frame = {
@@ -176,7 +206,7 @@ def record_held_frame(
             "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
             "landmarks": np.full((21, 3), np.nan),
         }
-    hand = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
+    hand = hold_hand.copy() if hold_hand is not None else (state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64))
     action = RobotAction(arm_qpos_cmd=hold_arm, hand_qpos_cmd=hand)
     recorder.add_frame(
         state,
@@ -184,7 +214,9 @@ def record_held_frame(
         vr_frame,
         camera_frame=cam,
         arm_qpos_sent=arm_qpos_sent,
-        signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True, "flag_safety_reject": safety_reject},
+        signals={"ik_ok": ik_ok, "ik_attempted": ik_attempted, "retarget_ok": False,  # hand retargeting not wired (arm-only teleop)
+                 "held": True,
+                 "flag_safety_reject": safety_reject, "frame_status": frame_status},
         diagnostics=diagnostics,
     )
 
@@ -281,7 +313,7 @@ def main():
         print("Arm 内环线程已就绪 (30Hz online trajectory planning)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
-    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
         arm_qpos = None
 
     state = robot.get_state(arm_qpos=arm_qpos)
@@ -291,6 +323,8 @@ def main():
     if not np.all(np.isfinite(prev_qpos_cmd)):
         print("当前关节角度无效，使用 init_qpos")
         prev_qpos_cmd = home_qpos.copy()
+
+    prev_hand_qpos = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
 
     ema_prev_pos: np.ndarray | None = None  # 笛卡尔 EMA 状态 (IK 前)
     ema_prev_quat: np.ndarray | None = None
@@ -437,6 +471,7 @@ def main():
     start_time = time.perf_counter()
     prev_eef_pos: np.ndarray | None = None
     ik_method = "-"
+    _last_vr_wrist_quat: np.ndarray | None = None  # VR quat continuity tracking
 
     def _stop_recording(save: bool):
         """停止录制. save=True 保存, save=False 丢弃."""
@@ -581,7 +616,7 @@ def main():
                             arm_mapper.clear()
                             if arm_inner.wait_ready(timeout=30.0):
                                 arm_qpos, error_state, _ = arm_inner.get_state()
-                                if not error_state and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                                if not error_state and np.all(np.isfinite(arm_qpos)):
                                     state = robot.get_state(arm_qpos=arm_qpos)
                                     prev_qpos_cmd = state.arm_qpos.copy()
                                     ema_prev_pos = ema_prev_quat = None
@@ -608,7 +643,7 @@ def main():
                     arm_mapper.clear()
                     if arm_inner.wait_ready(timeout=30.0):
                         arm_qpos, error_state, _ = arm_inner.get_state()
-                        if not error_state and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                        if not error_state and np.all(np.isfinite(arm_qpos)):
                             state = robot.get_state(arm_qpos=arm_qpos)
                             prev_qpos_cmd = state.arm_qpos.copy()
                             ema_prev_pos = ema_prev_quat = None
@@ -689,6 +724,11 @@ def main():
                         "ema_alpha_pos": EMA_ALPHA_POS,
                         "ema_alpha_rot": EMA_ALPHA_ROT,
                         "joint_max_acc": float(ARM_MAX_ACC_DEG_S2),
+                        "joint_max_speed": ARM_MAX_SPEED_DEG_S,
+                        "inner_loop_hz": float(1.0 / _INNER_CFG.loop_period),
+                        "tracking_error_adaptive_max_rad": _INNER_CFG.tracking_error_adaptive_max_rad,
+                        "tracking_error_anomaly_cap_rad": _INNER_CFG.tracking_error_anomaly_cap_rad,
+                        "hand_available": hand_available,
                     })
                     if not recorder.start_episode(
                         task_label=TASK_LABEL,
@@ -737,6 +777,10 @@ def main():
                     audio.play("calibrated")
                     teleop_active = True
                     error_count = 0
+                    # Seed continuity gate from B-press frame so the first real
+                    # teleop frame is also gated (P0-2).  Operator is stationary
+                    # at B-press; 45°/frame far exceeds any legitimate first motion.
+                    _last_vr_wrist_quat = normalize_quat_wxyz(np.asarray(frame["wrist_quat_wxyz"], dtype=np.float64))
                     audio.play("begin")
                     teleop_hold_for_audio = True  # 等待 begin 音频播完再响应运动
                     print(f"\nB: 遥操作+录制开始 (wrist→EEF 映射已记录)  episode={recorder.frame_count}")
@@ -749,9 +793,10 @@ def main():
             if skip_rest:
                 continue
 
-            # ── 读取 ArmInnerLoop 状态 ──
+            # ── 读取 ArmInnerLoop 状态 (一次加锁, 避免 qpos vs qvel/tau 偏差) ──
             try:
-                arm_qpos, error_state, _inner_ts = arm_inner.get_state()
+                arm_qpos, error_state, _inner_ts, arm_qvel, arm_tau = arm_inner.get_state_and_dynamics()
+                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
 
                 if error_state:
                     print(f"  Arm 内环异常: error_state=True")
@@ -762,10 +807,6 @@ def main():
                         _emergency_stop()
                         break
                     continue
-
-                # 内环 30Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
-                arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
-                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -895,7 +936,7 @@ def main():
                 if recording_active:
                     _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
                     _diag = {
-                        "arm_temps": arm_temps,
+
                         "tracking_error": arm_inner.tracking_error,
                         "ik_solve_time_ms": 0.0,
                         "target_pos_before_clamp": np.full(3, np.nan),
@@ -907,8 +948,9 @@ def main():
                         prev_qpos_cmd.copy(),
                         vr_frame,
                         cam,
-                        ik_ok=True,
+                        ik_ok=False,
                         arm_qpos_sent=arm_inner.last_sent_cmd,
+                        hold_hand=prev_hand_qpos.copy(),
                         diagnostics=_diag,
                     )
                 continue
@@ -924,6 +966,45 @@ def main():
                 ema_prev_pos = ema_prev_quat = None
                 teleop_hold_for_audio = False
 
+            # ── VR wrist quaternion continuity gate ──
+            # Reject frames with implausibly large orientation jumps before they
+            # reach the mapper.  The mapper's 30°/frame clamp reduces spike
+            # amplitude but still produces a moving target — during multi-frame
+            # oscillations the arm chases the clamped output and accumulates
+            # tracking error.  This gate drops the frame entirely, holding
+            # position until valid data resumes.
+            _vr_wrist_quat = normalize_quat_wxyz(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64))
+            if _last_vr_wrist_quat is not None:
+                _qd = min(np.abs(np.dot(_vr_wrist_quat, _last_vr_wrist_quat)), 1.0)
+                _angle = 2.0 * np.arccos(_qd)
+                if _angle > VR_WRIST_QUAT_JUMP_THRESHOLD_RAD:
+                    logger.warning(
+                        "VR wrist quaternion spike: %.1f°/frame > %.1f°/frame "
+                        "threshold — holding position",
+                        np.rad2deg(_angle),
+                        np.rad2deg(VR_WRIST_QUAT_JUMP_THRESHOLD_RAD),
+                    )
+                    if recording_active:
+                        hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                        _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+                        _diag = {
+    
+                            "tracking_error": arm_inner.tracking_error,
+                            "ik_solve_time_ms": 0.0,
+                            "target_pos_before_clamp": np.full(3, np.nan),
+                            "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
+                            "vr_quat_jump_rejected": _angle,
+                        }
+                        record_held_frame(
+                            recorder, state, hold_arm, vr_frame, cam, ik_ok=False,
+                            arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_qpos.copy(),
+                            diagnostics=_diag,
+                        )
+                    arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
+                    ik_method = "vr_jump"
+                    continue
+            _last_vr_wrist_quat = _vr_wrist_quat.copy()
+
             # ── VR wrist → EEF target pose ──
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
@@ -932,15 +1013,15 @@ def main():
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
                     _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
                     _diag = {
-                        "arm_temps": arm_temps,
+
                         "tracking_error": arm_inner.tracking_error,
                         "ik_solve_time_ms": 0.0,
                         "target_pos_before_clamp": np.full(3, np.nan),
                         "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
                     }
                     record_held_frame(
-                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True,
-                        arm_qpos_sent=arm_inner.last_sent_cmd, diagnostics=_diag,
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=False,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_qpos.copy(), diagnostics=_diag,
                     )
                 # Keep feeding last-good to prevent inner-loop timeout (which would
                 # reset _last_sent_cmd to held-current, losing the actual sent baseline).
@@ -951,8 +1032,8 @@ def main():
             target_quat = mapped["quat_wxyz"]
 
             # ── Cartesian pose EMA (IK 前, 唯一平滑级) ──
-            # 首帧 seed, 后续帧 EMA. IK 失败时 ema_prev 仍每帧推进,
-            # 故恢复时目标渐进追赶而非跳变.
+            # 首帧 seed, 后续帧 EMA. IK 失败时冻结 EMA 状态,
+            # 防止向不可达目标累积漂移 (恢复首帧的 target_eef 会包含 overshoot).
             if ema_prev_pos is not None:
                 target_pos, target_quat = ema_smooth_pose(
                     target_pos,
@@ -962,8 +1043,6 @@ def main():
                     EMA_ALPHA_POS,
                     EMA_ALPHA_ROT,
                 )
-            ema_prev_pos = target_pos.copy()
-            ema_prev_quat = target_quat.copy()
 
             # ── Workspace clamp (EMA 之后, 作为最终安全门) ──
             target_pos_before_clamp = target_pos.copy()
@@ -1010,7 +1089,7 @@ def main():
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
                     _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
                     _diag = {
-                        "arm_temps": arm_temps,
+
                         "tracking_error": arm_inner.tracking_error,
                         "ik_solve_time_ms": ik_solve_time_ms,
                         "target_pos_before_clamp": target_pos_before_clamp,
@@ -1018,7 +1097,8 @@ def main():
                     }
                     record_held_frame(
                         recorder, state, hold_arm, vr_frame, cam, ik_ok=False,
-                        arm_qpos_sent=arm_inner.last_sent_cmd, diagnostics=_diag,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_qpos.copy(), diagnostics=_diag,
+                        frame_status=_FRAME_IK_FAIL, ik_attempted=True,
                     )
                 # Keep feeding last-good to prevent inner-loop timeout (which would
                 # reset _last_sent_cmd to held-current, losing the actual sent baseline).
@@ -1026,18 +1106,62 @@ def main():
                 continue
 
             ik_method = "ok"
+            # Joint-space IK output gate: reject IK solutions pathologically far
+            # from the IK seed (prev_qpos_cmd).  Using state.arm_qpos (physical arm
+            # position) would conflate tracking lag with IK quality — at high speed
+            # the arm lags the command by 0.3-0.4 rad, causing false positives.
+            # Default disabled — enable after collecting ik_delta distribution in normal teleop.
+            if IK_OUTPUT_GATE_ENABLED:
+                # Compare to the IK seed (prev_qpos_cmd), NOT physical arm position.
+                # Using state.arm_qpos conflates tracking lag with IK quality: at high
+                # speed the arm lags the command by 0.3-0.4 rad, which would falsely
+                # trigger the gate during normal teleop.  Normal IK delta from seed is
+                # <0.2 rad; pathological IK (distant local minima, near-singularity)
+                # can exceed 0.4 rad.
+                _seed = prev_qpos_cmd if prev_qpos_cmd is not None else state.arm_qpos
+                _ik_joint_delta = float(np.max(np.abs(ik_result.qpos - _seed)))
+                if _ik_joint_delta > IK_OUTPUT_SAFETY_THRESHOLD_RAD:
+                    logger.warning(
+                        "IK output rejected: joint delta %.3f rad > threshold %.3f rad "
+                        "(seed vs ik_result.qpos) — holding position",
+                        _ik_joint_delta,
+                        IK_OUTPUT_SAFETY_THRESHOLD_RAD,
+                    )
+                    if recording_active:
+                        hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
+                        _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+                        _diag = {
+    
+                            "tracking_error": arm_inner.tracking_error,
+                            "ik_solve_time_ms": ik_solve_time_ms,
+                            "target_pos_before_clamp": target_pos_before_clamp,
+                            "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
+                            "ik_joint_delta_rejected": _ik_joint_delta,
+                        }
+                        record_held_frame(
+                            recorder, state, hold_arm, vr_frame, cam, ik_ok=False,
+                            arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_qpos.copy(),
+                            diagnostics=_diag, ik_attempted=True,
+                        )
+                    arm_inner.set_target(prev_qpos_cmd.copy())
+                    continue
+            # IK success + gate passed: update EMA state so the next frame's
+            # smoothing starts from a reachable target.  Freezing during failures
+            # prevents progressive drift toward unreachable poses.
+            ema_prev_pos = target_pos.copy()
+            ema_prev_quat = target_quat.copy()
             # 平滑已在 IK 前 (笛卡尔 EMA) 完成; IK 输出按 joint_max_speed×dt 截步长后下发 —
             # 快腕旋时 IK 目标可超前可达状态 >50° (实测 max 57.5°), 截步长使 action 标签保持动力学可达
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
             arm_cmd = prev_qpos_cmd + np.clip(arm_cmd - prev_qpos_cmd, -ARM_CMD_MAX_STEP_RAD, ARM_CMD_MAX_STEP_RAD)
 
-            # ── Hand: hold position (skip if hand unavailable) ──
+            # ── Hand: hold position (hold last-good on NaN, mirrors prev_qpos_cmd) ──
             if hand_available:
                 hand_cmd = (
-                    state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
+                    state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else prev_hand_qpos.copy()
                 )
             else:
-                hand_cmd = np.zeros(12, dtype=np.float64)
+                hand_cmd = prev_hand_qpos.copy()
 
             action = RobotAction(
                 arm_qpos_cmd=arm_cmd,
@@ -1051,8 +1175,9 @@ def main():
                 robot,
                 action,
                 actual_arm_qpos=arm_qpos,
+                actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_arm_temps=arm_temps,
+                actual_hand_current=state.hand_current,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
@@ -1060,15 +1185,16 @@ def main():
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
                     _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
                     _diag = {
-                        "arm_temps": arm_temps,
+
                         "tracking_error": arm_inner.tracking_error,
                         "ik_solve_time_ms": ik_solve_time_ms,
                         "target_pos_before_clamp": target_pos_before_clamp,
                         "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
                     }
                     record_held_frame(
-                        recorder, state, hold_arm, vr_frame, cam, ik_ok=True,
-                        arm_qpos_sent=arm_inner.last_sent_cmd, safety_reject=True, diagnostics=_diag,
+                        recorder, state, hold_arm, vr_frame, cam, ik_ok=False,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_qpos.copy(), safety_reject=True, diagnostics=_diag,
+                        frame_status=_FRAME_SAFETY_REJECT, ik_attempted=True,
                     )
                 # Keep feeding last-good to prevent inner-loop timeout (which would
                 # reset _last_sent_cmd to held-current, losing the actual sent baseline).
@@ -1076,11 +1202,15 @@ def main():
                 continue
 
             prev_qpos_cmd = arm_cmd.copy()  # only after gate passes (held frames use last-good command)
+            prev_hand_qpos = hand_cmd.copy()  # only after gate passes (mirrors prev_qpos_cmd)
 
-            # Snapshot sent command BEFORE posting new target — inner loop owns
-            # sent truth; reading after set_target captures the previous tick's
-            # result, which is the correct temporal alignment (plan §4.9).
-            sent_cmd = arm_inner.last_sent_cmd
+            # Snapshot sent command from arm_cmd — the value that will be
+            # dispatched this tick.  arm_cmd already passed the outer-loop
+            # delta clamp (ARM_CMD_MAX_STEP_RAD=0.131 rad), which is stricter
+            # than the inner loop's clamp (0.3 rad), so the inner loop will
+            # forward it unchanged.  This gives correct temporal alignment:
+            # action_arm_joint_sent[t] corresponds to cmd[t], not cmd[t-1].
+            sent_cmd = arm_cmd.copy()
 
             # ── Send to ArmInnerLoop ──
             arm_inner.set_target(action.arm_qpos_cmd)
@@ -1091,13 +1221,15 @@ def main():
             if recording_active:
                 sig = {
                     "ik_ok": ik_result.success and ik_result.qpos is not None,
-                    "retarget_ok": True,
+                    "ik_attempted": True,
+                    "retarget_ok": False,  # hand retargeting not wired (arm-only teleop)
                     "held": False,
                     "flag_safety_reject": False,
+                    "frame_status": _FRAME_OK,
                 }
                 head_quat = vr_frame.get("head_quat_wxyz")
                 diagnostics = {
-                    "arm_temps": arm_temps,
+
                     "tracking_error": arm_inner.tracking_error,
                     "ik_solve_time_ms": ik_solve_time_ms,
                     "target_pos_before_clamp": target_pos_before_clamp,

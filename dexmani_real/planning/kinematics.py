@@ -54,7 +54,13 @@ class XArm7Kinematics:
         return Pose(p=np.asarray(link_pose.p, dtype=np.float64), q=np.asarray(link_pose.q, dtype=np.float64))
 
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
-        return self.base_to_world_pose(self.compute_eef_pose_base(qpos))
+        pose_base = self.compute_eef_pose_base(qpos)
+        pose_world = self.base_to_world_pose(pose_base)
+        # Defense-in-depth: NaN guard symmetric with fingertip FK (interface.py:615-616).
+        # Pinocchio FK is robust, but guard against model corruption or numerical anomalies.
+        if not np.all(np.isfinite(pose_world.p)) or not np.all(np.isfinite(pose_world.q)):
+            return Pose(p=np.full(3, np.nan), q=np.full(4, np.nan))
+        return pose_world
 
     def compute_eef_jacobian(self, qpos: np.ndarray) -> np.ndarray:
         # Hot-path: ensure_qpos validation is done at entry points.

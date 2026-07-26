@@ -347,7 +347,7 @@ def main():
         print("Arm 内环线程已就绪 (30Hz online trajectory planning, passthrough)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
-    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
         arm_qpos = None
 
     state = robot.get_state(arm_qpos=arm_qpos)
@@ -431,7 +431,7 @@ def main():
                 # Wait for new inner loop to be ready
                 if arm_inner.wait_ready(timeout=30.0):
                     arm_qpos, error_state, _ = arm_inner.get_state()
-                    if not error_state and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                    if not error_state and np.all(np.isfinite(arm_qpos)):
                         state = robot.get_state(arm_qpos=arm_qpos)
                         prev_qpos_cmd = state.arm_qpos.copy()
                         target_pos = state.eef_pos.copy()
@@ -457,7 +457,8 @@ def main():
 
             # ── Read state from inner loop ──
             try:
-                arm_qpos, error_state, _inner_ts = arm_inner.get_state()
+                arm_qpos, error_state, _inner_ts, arm_qvel, arm_tau = arm_inner.get_state_and_dynamics()
+                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
 
                 if error_state:
                     print(f"  Arm 内环异常: error_state=True")
@@ -467,10 +468,6 @@ def main():
                         break
                     error_count += 1
                     continue
-
-                # 内环 30Hz 回读的动力学 → 力矩/温度门 (validate_action)
-                arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
-                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -670,8 +667,9 @@ def main():
                 robot,
                 action,
                 actual_arm_qpos=arm_qpos,
+                actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_arm_temps=arm_temps,
+                actual_hand_current=state.hand_current,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

@@ -910,7 +910,7 @@ def main():
                 arm_inner = do_return_home(robot, arm_inner)
                 if arm_inner.wait_ready(timeout=30.0):
                     arm_qpos, error_state, _ = arm_inner.get_state()
-                    if not error_state and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                    if not error_state and np.all(np.isfinite(arm_qpos)):
                         state = robot.get_state(arm_qpos=arm_qpos)
                         prev_qpos_cmd = state.arm_qpos.copy()
                         target_pos = state.eef_pos.copy()

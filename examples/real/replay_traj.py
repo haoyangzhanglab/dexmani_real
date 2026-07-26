@@ -241,6 +241,8 @@ class ReplayRecorder:
         self.eef_quat_wxyz = np.full((max_frames, 4), np.nan, dtype=np.float64)
         self.eef_rot6d = np.full((max_frames, 6), np.nan, dtype=np.float64)
         self.arm_cmd = np.full((max_frames, 7), np.nan, dtype=np.float64)
+        self.arm_sent_cmd = np.full((max_frames, 7), np.nan, dtype=np.float64)
+        self.arm_tracking_error = np.full((max_frames,), np.nan, dtype=np.float64)
         self.timestamps = np.full((max_frames,), np.nan, dtype=np.float64)
 
         if has_hand:
@@ -257,6 +259,8 @@ class ReplayRecorder:
         arm_cmd: np.ndarray,
         hand_cmd: np.ndarray | None,
         ts: float,
+        arm_sent_cmd: np.ndarray | None = None,
+        arm_tracking_error: float | None = None,
     ) -> None:
         """Record one frame of replay state."""
         if idx >= self.max_frames:
@@ -267,6 +271,10 @@ class ReplayRecorder:
         self.eef_rot6d[idx] = state.eef_rot6d
         self.arm_cmd[idx] = arm_cmd
         self.timestamps[idx] = ts
+        if arm_sent_cmd is not None:
+            self.arm_sent_cmd[idx] = arm_sent_cmd
+        if arm_tracking_error is not None:
+            self.arm_tracking_error[idx] = arm_tracking_error
         if self.has_hand and self.hand_qpos is not None:
             self.hand_qpos[idx] = state.hand_qpos
         if self.has_hand and self.hand_cmd is not None and hand_cmd is not None:
@@ -286,6 +294,8 @@ class ReplayRecorder:
             "eef_quat_wxyz": self.eef_quat_wxyz[:n].copy(),
             "eef_rot6d": self.eef_rot6d[:n].copy(),
             "arm_cmd": self.arm_cmd[:n].copy(),
+            "arm_sent_cmd": self.arm_sent_cmd[:n].copy(),
+            "arm_tracking_error": self.arm_tracking_error[:n].copy(),
             "timestamp": self.timestamps[:n].copy(),
         }
         if self.hand_qpos is not None:
@@ -336,6 +346,11 @@ class ReplayMetrics:
     # Tracking lag
     tracking_lag_frames: int = 0
     tracking_lag_seconds: float = 0.0
+
+    # Tracking error during replay (replay cmd vs actual, from inner-loop monitor)
+    arm_tracking_error_mean_deg: float = 0.0
+    arm_tracking_error_p95_deg: float = 0.0
+    arm_tracking_error_max_deg: float = 0.0
 
 
 def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
@@ -528,6 +543,12 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
             "peak_lag_seconds": round(metrics.tracking_lag_seconds, 3),
         },
     }
+    if metrics.arm_tracking_error_mean_deg > 0:
+        metrics_dict["tracking_error"] = {
+            "mean_deg": round(metrics.arm_tracking_error_mean_deg, 2),
+            "p95_deg": round(metrics.arm_tracking_error_p95_deg, 2),
+            "max_deg": round(metrics.arm_tracking_error_max_deg, 2),
+        }
     if metrics.hand_joint_mae_overall_deg is not None:
         metrics_dict["hand_joint"] = {
             "mae_overall_deg": round(metrics.hand_joint_mae_overall_deg, 4),
@@ -604,18 +625,25 @@ def _do_return_home(
                    timeout loss (plan §6 P1 slow-replay risk).
     """
     print("return_home ...", flush=True)
+    t0 = time.perf_counter()
     try:
         arm_inner.set_target(None)
         arm_inner.stop()
-        print("  Arm inner loop stopped")
+        t1 = time.perf_counter()
+        print(f"  Arm inner loop stopped ({t1 - t0:.1f}s)")
 
         ok = robot.return_to_home(home_dt=HOME_DT)
-        print(f"  {'OK' if ok else 'FAIL'}")
+        t2 = time.perf_counter()
+        print(f"  {'OK' if ok else 'FAIL'} (homing {t2 - t1:.1f}s)")
 
         new_inner = make_arm_servo(cfg=inner_cfg, ip=arm_ip)
         robot.set_arm_servo(new_inner)
         new_inner.start()
-        print("  Arm inner loop restarted")
+        if not new_inner.wait_ready(timeout=30.0):
+            print("  Arm inner loop restart timed out")
+        else:
+            t3 = time.perf_counter()
+            print(f"  Arm inner loop restarted ({t3 - t2:.1f}s)")
         return new_inner
     except Exception:
         traceback.print_exc()
@@ -782,7 +810,7 @@ class TrajectoryReplayer:
 
         # ── Read final position ──
         arm_qpos, error_state, _ = self._arm_inner.get_state()
-        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
             assert self.robot is not None
             arm_qpos = self.robot.get_state().arm_qpos
 
@@ -818,7 +846,7 @@ class TrajectoryReplayer:
 
         # Read initial state
         arm_qpos, error_state, _ = self._arm_inner.get_state()
-        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
             arm_qpos = self.robot.get_state().arm_qpos
         state = self.robot.get_state(arm_qpos=arm_qpos)
 
@@ -834,7 +862,7 @@ class TrajectoryReplayer:
 
         # Re-read state after alignment (inner loop may have settled)
         arm_qpos, error_state, _ = self._arm_inner.get_state()
-        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
             arm_qpos = self.robot.get_state().arm_qpos
         state = self.robot.get_state(arm_qpos=arm_qpos)
 
@@ -895,7 +923,7 @@ class TrajectoryReplayer:
                             break
                         continue
                     # Dynamics from inner-loop 30Hz readback → torque/temp gates
-                    arm_qvel, arm_tau, arm_temps = self._arm_inner.get_dynamics()
+                    arm_qvel, arm_tau = self._arm_inner.get_dynamics()
                     state = self.robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
                 except Exception as e:
                     error_count += 1
@@ -944,8 +972,9 @@ class TrajectoryReplayer:
                     self.robot,
                     action,
                     actual_arm_qpos=arm_qpos,
+                    actual_arm_qvel=state.arm_qvel,
                     actual_arm_tau=state.arm_tau,
-                    actual_arm_temps=arm_temps,
+                    actual_hand_current=state.hand_current,
                 )
                 if not action_valid:
                     validate_fail_count += 1
@@ -967,7 +996,11 @@ class TrajectoryReplayer:
                 # ── Record ──
                 ts = time.perf_counter()
                 if self._recorder is not None:
-                    self._recorder.record(frame_idx, state, arm_cmd, hand_cmd, ts)
+                    self._recorder.record(
+                        frame_idx, state, arm_cmd, hand_cmd, ts,
+                        arm_sent_cmd=self._arm_inner.last_sent_cmd,
+                        arm_tracking_error=self._arm_inner.tracking_error,
+                    )
 
                 # ── Periodic log ──
                 if (frame_idx + 1) % 50 == 0 or frame_idx == 0:
@@ -1190,6 +1223,15 @@ Examples:
                 speed_factor=args.speed,
             )
 
+            # ── Compute tracking error stats from replay data (R4) ──
+            if "arm_tracking_error" in replay_data:
+                track_err = replay_data["arm_tracking_error"]
+                valid = track_err[np.isfinite(track_err)]
+                if len(valid) > 0:
+                    metrics.arm_tracking_error_mean_deg = float(np.rad2deg(np.mean(valid)))
+                    metrics.arm_tracking_error_p95_deg = float(np.rad2deg(np.percentile(valid, 95)))
+                    metrics.arm_tracking_error_max_deg = float(np.rad2deg(np.max(valid)))
+
             # ── Print summary ──
             print("\n" + "=" * 60)
             print("Consistency Evaluation")
@@ -1212,6 +1254,13 @@ Examples:
             if metrics.hand_joint_mae_overall_deg is not None:
                 print(f"  Hand joint MAE: {metrics.hand_joint_mae_overall_deg:.3f} deg")
             print(f"  Tracking lag:  {metrics.tracking_lag_frames} frames ({metrics.tracking_lag_seconds:.3f}s)")
+            if metrics.arm_tracking_error_mean_deg > 0:
+                print(
+                    f"  Replay tracking error (cmd vs actual): "
+                    f"mean={metrics.arm_tracking_error_mean_deg:.2f}°  "
+                    f"p95={metrics.arm_tracking_error_p95_deg:.2f}°  "
+                    f"max={metrics.arm_tracking_error_max_deg:.2f}°"
+                )
             print("=" * 60)
 
             # ── Save ──
@@ -1243,21 +1292,37 @@ Examples:
                         break
                     if ControlSignal.HOME in sigs:
                         print("\nH: return_home")
-                        # Need to re-create planner+robot since they may have been disconnected
+                        # Reuse existing planner+robot (shutdown() only closed TCP transport;
+                        # CollisionModel, kinematics, IK solver all remain valid).
+                        # A fresh _make_planner()+_make_robot() would redundantly reload URDF,
+                        # rebuild 40 collision geometries, and re-scan FCL .so (~multi-second).
                         try:
-                            p = _make_planner(args.arm_ip)
-                            r = _make_robot(p, args.arm_ip)
-                            if r.connect().get("arm"):
-                                new_inner = _do_return_home(
-                                    r, p, replayer._arm_inner, arm_ip=args.arm_ip, inner_cfg=replayer._inner_cfg,
-                                )
-                                replayer._arm_inner = new_inner
-                            r.disconnect()
+                            if replayer.robot is not None and replayer.planner is not None:
+                                if replayer.robot.connect().get("arm"):
+                                    new_inner = _do_return_home(
+                                        replayer.robot,
+                                        replayer.planner,
+                                        replayer._arm_inner,
+                                        arm_ip=args.arm_ip,
+                                        inner_cfg=replayer._inner_cfg,
+                                    )
+                                    replayer._arm_inner = new_inner
+                                    replayer.robot.disconnect()
+                            else:
+                                print("  Planner/robot not available — cannot return_home")
                         except Exception as exc:
                             print(f"return_home failed: {exc}")
                         print("Press Q to exit...")
             finally:
                 kb.stop()
+
+        # Clean up any restarted arm inner loop from return_to_home above.
+        # shutdown() only cleans the original arm_inner; _do_return_home creates
+        # a fresh one whose SHM rings would otherwise leak (resource_tracker
+        # "leaked shared_memory objects" warning at process exit).
+        if replayer._arm_inner is not None and replayer._arm_inner.is_alive:
+            replayer._arm_inner.set_target(None)
+            replayer._arm_inner.stop()
 
     print("Done.")
 

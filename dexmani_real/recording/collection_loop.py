@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -97,6 +97,7 @@ class CollectionLoop:
         camera_frames: dict[str, dict] | None = None,
         signals: dict | None = None,
         arm_qpos_sent: np.ndarray | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> bool:
         if not self.is_recording:
             return False
@@ -109,6 +110,7 @@ class CollectionLoop:
             camera_frames=camera_frames,
             signals=signals,
             arm_qpos_sent=arm_qpos_sent,
+            diagnostics=diagnostics,
         )
 
         if self.recorder.max_frames_reached and self.config.auto_stop_on_max_frames:

@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.robot.types import _ARM_TEMP_LIMIT_C, _ARM_TORQUE_LIMIT_NM, RobotAction
+from dexmani_real.robot.types import _ARM_TORQUE_LIMIT_NM, RobotAction
 from dexmani_real.utils.log import get_logger
+
+# Per-motor hand current limit — defense-in-depth for seized/stalled finger motors.
+# Matches XHand firmware tor_max (xhand.py:180).
+_HAND_CURRENT_LIMIT_MA = 300.0
 
 logger = get_logger(__name__)
 
@@ -21,8 +25,9 @@ def validate_action(
     action: RobotAction,
     *,
     actual_arm_qpos: np.ndarray | None = None,
+    actual_arm_qvel: np.ndarray | None = None,
     actual_arm_tau: np.ndarray | None = None,
-    actual_arm_temps: np.ndarray | None = None,
+    actual_hand_current: np.ndarray | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
 
@@ -30,7 +35,7 @@ def validate_action(
       1. SDK error state (arm + hand is_error)
       2. Arm connection
       3. Torque gating  — per-joint threshold check
-      4. Temperature gating — 70 °C per-joint threshold
+      4. Hand current gating — per-motor threshold check
       5. Arm joint-limit clipping — moved to ArmInnerLoop._send_target
 
     Removed from this gate (covered elsewhere):
@@ -71,18 +76,31 @@ def validate_action(
             logger.error("Torque data shape mismatch or contains NaN — rejecting action")
             return False, "torque data invalid"
 
-    # 4. Temperature gating (per-joint)
-    if actual_arm_temps is not None:
-        temps = np.asarray(actual_arm_temps, dtype=np.float64)
-        if temps.shape == (7,) and np.all(np.isfinite(temps)):
-            over_idx = np.where(temps > _ARM_TEMP_LIMIT_C)[0]
-            if len(over_idx) > 0:
-                return False, f"temperature limit exceeded: joints={over_idx.tolist()}"
+    # 4. Arm velocity NaN guard — arm_qvel was previously unchecked (arm_qpos/arm_tau
+    #    were gated but velocity NaN could silently propagate into HDF5 recordings).
+    #    Symmetric with torque check: reject on NaN/Inf, skip when None.
+    if actual_arm_qvel is not None:
+        qvel = np.asarray(actual_arm_qvel, dtype=np.float64)
+        if qvel.shape == (7,) and np.all(np.isfinite(qvel)):
+            pass  # nominal
         else:
-            logger.error("Temperature data shape mismatch or contains NaN — rejecting action")
-            return False, "temperature data invalid"
+            logger.error("Arm velocity data shape mismatch or contains NaN — rejecting action")
+            return False, "arm velocity data invalid"
 
-    # 5. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
+    # 4.5. Hand current gating (per-motor) — defense-in-depth for
+    # seized/stalled finger motors; complements XHand firmware overcurrent
+    # protection (tor_max=300 mA).
+    if actual_hand_current is not None:
+        hc = np.asarray(actual_hand_current, dtype=np.float64)
+        if hc.shape == (12,) and np.all(np.isfinite(hc)):
+            over_idx = np.where(np.abs(hc) > _HAND_CURRENT_LIMIT_MA)[0]
+            if len(over_idx) > 0:
+                return False, f"hand current limit exceeded: motors={over_idx.tolist()}"
+        else:
+            logger.error("Hand current data shape mismatch or contains NaN — rejecting action")
+            return False, "hand current data invalid"
+
+    # 4. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
     #    Absolute clip is applied there, before the per-step delta clamp,
     #    consolidating all joint-safety mechanics in one place.
 

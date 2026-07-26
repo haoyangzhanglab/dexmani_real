@@ -37,6 +37,14 @@ from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
 
+# Additive noise floor for adaptive tracking-error threshold (rad).
+# Unmodeled sources (encoder quantization, L∞ max across 7 joints, Mode 6
+# smoothing trade-off) do not scale with joint speed — they are constant offsets.
+# This bias is added to the physics-based model (steady-state lag + reversal
+# distance) so the threshold doesn't collapse to an over-sensitive constant at
+# low speeds where the physics term alone is too small.
+_TRACKING_NOISE_RAD: float = 0.07
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Configuration
@@ -89,9 +97,20 @@ class ArmInnerLoopConfig:
     # Passive tracking-error monitor — enables velocity-adaptive thresholding
     # when > 0 (recommended: 0.35).  The actual warn threshold scales with
     # commanded joint speed: tighter at rest (~0.15 rad), relaxed at max speed
-    # (~0.38 rad @120°/s).  Anomalous (>2× adaptive or >0.50 rad) always warns.
+    # (~0.38 rad @120°/s).  Anomalous (>2× adaptive or > anomaly_cap) always warns.
     # Set 0 to disable.  Does NOT alter commands or trigger error state.
     tracking_error_warn_rad: float = 0.35
+
+    # Absolute ceiling for anomalous tracking error (rad).  Hard cap that flags
+    # errors as anomalous regardless of the 2×-adaptive multiplier.  Calibrated
+    # for joint_max_acc=500°/s²; retune when changing joint_max_acc.  Formula:
+    # anomaly_cap should be k * adaptive_max where k ∈ [1.0, 1.5].
+    tracking_error_anomaly_cap_rad: float = 0.50
+
+    # Upper clamp for the velocity-adaptive threshold (rad).  Prevents the
+    # physics formula from producing thresholds that would make the anomalous
+    # cap trivially unreachable at high speed.
+    tracking_error_adaptive_max_rad: float = 0.60
 
     # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
     # hardware write and waits for policy_ready before the next target dispatch.
@@ -146,12 +165,11 @@ class ArmInnerLoop:
         self._lock = threading.Lock()
         self._arm_target: np.ndarray | None = None
         self._target_ts: float = 0.0
-        self._arm_qpos: np.ndarray = np.zeros(7, dtype=np.float64)
+        self._arm_qpos: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         # Dynamics from the 30Hz readback (NaN until first valid read) — consumed
-        # by the outer loop for recording + torque/temperature pre-send gates.
+        # by the outer loop for recording + torque pre-send gates.
         self._arm_qvel: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._arm_tau: np.ndarray = np.full(7, np.nan, dtype=np.float64)
-        self._arm_temps: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._error_state: bool = False
         self._last_sent_target: np.ndarray | None = None  # for per-step delta clamp
         # The delta-clamped value actually forwarded to the SDK each tick
@@ -162,9 +180,9 @@ class ArmInnerLoop:
         self._track_warn_throttle: int = 0  # throttle counter for anomalous tracking-error warnings
         self._track_info_throttle: int = 0  # throttle counter for elevated tracking-error info logs
         self._mode_warn_throttle: int = 0  # throttle counter for mode-drift warnings (independent)
-        # Adaptive tracking-error threshold: EMA of commanded joint velocity (rad/s)
-        # and previous sent target for delta computation.
-        self._cmd_vel_ema: float = 0.0
+        # Adaptive tracking-error threshold: peak-hold envelope of commanded joint
+        # velocity (rad/s) — instant attack, exponential decay for noise rejection.
+        self._cmd_vel_env: float = 0.0
         self._prev_monitor_target: np.ndarray | None = None
 
         # ── Lifecycle ──
@@ -192,14 +210,30 @@ class ArmInnerLoop:
         with self._lock:
             return self._arm_qpos.copy(), self._error_state, self._target_ts
 
-    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Latest (qvel, tau, temps) from the 30Hz readback — NaN until first valid read.
+    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray]:
+        """Latest (qvel, tau) from the 30Hz readback — NaN until first valid read.
 
         The inner loop owns the sole XArmAPI connection, so the outer loop must
         source dynamics here instead of calling the SDK (avoids connection contention).
         """
         with self._lock:
-            return self._arm_qvel.copy(), self._arm_tau.copy(), self._arm_temps.copy()
+            return self._arm_qvel.copy(), self._arm_tau.copy()
+
+    def get_state_and_dynamics(self) -> tuple[np.ndarray, bool, float, np.ndarray, np.ndarray]:
+        """Atomic read of (qpos, error_state, target_ts, qvel, tau) in one lock.
+
+        Single lock acquisition guarantees all five fields are from the same
+        inner-loop tick — eliminates the one-tick (≈33ms) temporal skew between
+        ``get_state()`` + ``get_dynamics()`` in the outer loop.
+        """
+        with self._lock:
+            return (
+                self._arm_qpos.copy(),
+                self._error_state,
+                self._target_ts,
+                self._arm_qvel.copy(),
+                self._arm_tau.copy(),
+            )
 
     @property
     def is_ready(self) -> bool:
@@ -404,6 +438,25 @@ class ArmInnerLoop:
                 # frame 0 records a physically valid value (not zeros).
                 self._last_sent_cmd = current_qpos.copy()
 
+            # ── Init dynamics: read velocity/torque once at startup ──
+            # The idle loop (target is None: continue) never calls get_joint_states,
+            # so _arm_qvel/_arm_tau stay NaN until the first set_target().
+            # A single num=3 read here populates them, eliminating the 1-2 tick NaN
+            # window that causes validate_action() torque rejections at teleop start.
+            try:
+                _dyn_code, _dyn_states = arm.get_joint_states(is_radian=True, num=3)
+                if _dyn_code == 0:
+                    if len(_dyn_states) > 1:
+                        _v = np.asarray(_dyn_states[1], dtype=np.float64)
+                        if _v.shape[0] >= 7 and np.all(np.isfinite(_v[:7])):
+                            self._arm_qvel = _v[:7].copy()
+                    if len(_dyn_states) > 2:
+                        _tau = np.asarray(_dyn_states[2], dtype=np.float64)
+                        if _tau.shape[0] >= 7 and np.all(np.isfinite(_tau[:7])):
+                            self._arm_tau = _tau[:7].copy()
+            except (RuntimeError, OSError):
+                pass  # best-effort: if HW read fails, dynamics stay NaN (safe — validate_action rejects NaN)
+
             last_target_ts: float = 0.0
             last_valid_qpos: np.ndarray = current_qpos.copy()
 
@@ -538,12 +591,6 @@ class ArmInnerLoop:
                     if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
                         with self._lock:
                             self._arm_tau = tau[:7].copy()
-                temps = getattr(arm, "temperatures", None)
-                if temps is not None:
-                    t = np.asarray(temps, dtype=np.float64).ravel()
-                    if t.shape[0] >= 7 and np.all(np.isfinite(t[:7])):
-                        with self._lock:
-                            self._arm_temps = t[:7].copy()
 
                 # ── 4b. Passive tracking-error + mode monitor (no command change) ──
                 self._monitor(arm, current_qpos)
@@ -596,36 +643,44 @@ class ArmInnerLoop:
         with self._lock:
             self._tracking_error = err
 
-        # ── Estimate commanded joint velocity (EMA of sent-target deltas) ──
+        # ── Estimate commanded joint velocity (peak-hold envelope) ──
+        # Peak-hold (instant attack, exponential decay) replaces the old EMA
+        # (α=0.15, τ≈0.22s) which caused ~0.2s threshold lag during transients.
+        # The envelope responds instantly to velocity increases and decays slowly
+        # (α=0.15) for noise rejection during steady state.
         cmd_vel = 0.0
         if self._last_sent_target is not None and self._prev_monitor_target is not None:
             raw_delta = float(np.max(np.abs(self._last_sent_target - self._prev_monitor_target)))
             raw_vel = raw_delta / cfg.loop_period
-            # α=0.15 → τ≈0.2s @30Hz: fast enough for direction changes,
-            # slow enough to filter per-tick jitter from the 16Hz outer loop.
-            self._cmd_vel_ema = 0.15 * raw_vel + 0.85 * self._cmd_vel_ema
-            cmd_vel = self._cmd_vel_ema
+            # Clamp to firmware speed limit: prevents idle→teleop first-tick spike
+            # (delta accumulated during idle can produce raw_vel > 225°/s).
+            raw_vel = min(raw_vel, cfg.joint_max_speed)
+            self._cmd_vel_env = max(raw_vel, 0.85 * self._cmd_vel_env)
+            cmd_vel = self._cmd_vel_env
         if self._last_sent_target is not None:
             self._prev_monitor_target = self._last_sent_target.copy()
 
         # ── Adaptive threshold (physics-based) ──
-        #   expected = steady_state_lag + accel_lag
+        #   expected = steady_state_lag + reversal_distance + noise_bias
         #   steady_state_lag ≈ cmd_vel / inner_loop_rate
-        #   accel_lag ≈ cmd_vel² / (2·joint_max_acc)   (one-sided; margin covers reversal)
-        #   adaptive  = 1.8 × expected                  (50% model headroom + reversal)
-        # Clamped to [0.15, 0.60] rad — below 0.15 is sensor noise;
-        # above 0.60 is anomalous at any speed.
+        #   reversal_distance ≈ cmd_vel² / joint_max_acc  (full decel+accel, v²/a)
+        #   noise_bias = additive (not multiplicative) — encoder quant, L∞ max,
+        #                Mode 6 smoothing artefacts don't scale with speed.
+        # Clamped to [0.18, 0.60] rad — 0.18 floor covers unmodeled noise at
+        # low speed (was 0.15 with old multiplicative 1.25×, which collapsed to
+        # a constant below ~66°/s and produced false positives).
         adaptive: float = 0.0
         if cfg.tracking_error_warn_rad > 0 and cfg.joint_max_acc > 0:
             inner_rate = 1.0 / cfg.loop_period  # 30 Hz
             steady = cmd_vel / inner_rate
-            accel = cmd_vel * cmd_vel / (2.0 * cfg.joint_max_acc)
-            expected = steady + accel
-            adaptive = float(np.clip(expected * 1.8, 0.15, 0.60))
+            # Full reversal distance: decelerate to zero + accelerate to cmd_vel
+            accel = cmd_vel * cmd_vel / cfg.joint_max_acc
+            expected = steady + accel + _TRACKING_NOISE_RAD
+            adaptive = float(np.clip(expected, 0.18, cfg.tracking_error_adaptive_max_rad))
 
         mode_bad = getattr(arm, "mode", 6) != 6
         track_elevated = adaptive > 0 and err > adaptive
-        track_anomalous = adaptive > 0 and (err > 2.0 * adaptive or err > 0.50)
+        track_anomalous = adaptive > 0 and (err > 2.0 * adaptive or err >= cfg.tracking_error_anomaly_cap_rad)
 
         # ── Independent throttles ──
         # Anomalous warning: genuinely unexpected → always warn (throttled).
@@ -798,7 +853,7 @@ class ArmInnerLoop:
         error monitor use a meaningful baseline when targets resume after a hold.
         """
         try:
-            code, states = arm.get_joint_states(is_radian=True, num=1)
+            code, states = arm.get_joint_states(is_radian=True, num=3)
             if code == 0 and len(states) > 0:
                 hold = np.asarray(states[0], dtype=np.float64)[:7]
                 if np.all(np.isfinite(hold)):
@@ -810,6 +865,22 @@ class ArmInnerLoop:
                         wait=False,
                     )
                     self._last_sent_target = hold.copy()
+            # Refresh dynamics during hold so torque gates are meaningful
+            # when teleop resumes (num=3 above returns velocity + torque alongside position).
+            if code == 0:
+                if len(states) > 1:
+                    v = np.asarray(states[1], dtype=np.float64)
+                    if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
+                        with self._lock:
+                            self._arm_qvel = v[:7].copy()
+                if len(states) > 2:
+                    tau = np.asarray(states[2], dtype=np.float64)
+                    if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
+                        with self._lock:
+                            self._arm_tau = tau[:7].copy()
+            # Lock-protected: last_sent_cmd is read from another thread via last_sent_cmd property.
+            if code == 0 and len(states) > 0 and np.all(np.isfinite(hold)):
+                with self._lock:
                     self._last_sent_cmd = hold.copy()  # sent stream = hold position (plan §4.9)
         except (RuntimeError, OSError):
             pass

@@ -93,6 +93,8 @@ ARM_CMD_RESULT_DTYPE = np.dtype(
 HAND_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", (12,)),
+        ("current", "<f8", (12,)),  # motor current (mA); named 'torque' in SDK but carries mA
+        ("temperature", "<f8", (12,)),  # motor temperature (°C); mirrors ARM_STATE_DTYPE temps
         ("last_qpos_cmd", "<f8", (12,)),  # value actually sent to hardware (post joint-limit net)
         ("last_cmd_seq", "u8"),  # echoes the hand_cmd ring sequence processed
         ("tactile_sum", "<f8", (5, 3)),

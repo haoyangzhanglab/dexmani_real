@@ -106,13 +106,6 @@ class XArm7MotionPlanner:
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
-        self.teleop_solver = TeleopIKSolver(self.kin, self.ik_mgr, self.teleop_profile)
-
-        # Convenience aliases (used by teleop_solver and external code)
-        self.dof = dof
-        self.joint_limits = joint_limits
-        self.equivalent_joint_mask = equivalent_joint_mask
-
         # Geometric FK desk safety — fingertip Z vs desk
         self.desk_safety: FingertipDeskSafety | None = None
         if config.collision is not None:
@@ -124,6 +117,15 @@ class XArm7MotionPlanner:
             except (ValueError, RuntimeError, IndexError):
                 logger.warning("FingertipDeskSafety init failed — desk FK checks disabled.", exc_info=True)
                 # desk_safety remains None — desk FK checks skipped
+
+        self.teleop_solver = TeleopIKSolver(
+            self.kin, self.ik_mgr, self.teleop_profile, desk_safety=self.desk_safety
+        )
+
+        # Convenience aliases (used by teleop_solver and external code)
+        self.dof = dof
+        self.joint_limits = joint_limits
+        self.equivalent_joint_mask = equivalent_joint_mask
 
     def __getattr__(self, name: str):
         """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mplib_planner.

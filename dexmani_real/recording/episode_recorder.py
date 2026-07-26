@@ -34,11 +34,14 @@ logger = get_logger(__name__)
 
 SCHEMA_VERSION = 8  # v8: +truncated/stop_reason/cam_frames_dropped/cam_items_written meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
 SCHEMA_VERSION_ARM_SENT = 9  # v9: +/action_arm_joint_sent(T,7) opt-in stream (ctor flag arm_sent_stream=True)
-SCHEMA_VERSION_DIAGNOSTICS = 10  # v10: +diagnostics (arm_temps/tracking_error/ik_solve_time_ms/target_pos_before_clamp/head_quat_wxyz) + flag_safety_reject
+SCHEMA_VERSION_DIAGNOSTICS = 10  # v10: +diagnostics (tracking_error/ik_solve_time_ms/target_pos_before_clamp/head_quat_wxyz) + flag_safety_reject
+SCHEMA_VERSION_V11 = 11  # v11: +flag_ik_attempted +flag_frame_status (always recorded)
 
 
-def _compute_schema_version(arm_sent_stream: bool, diagnostics_recorded: bool) -> int:
+def _compute_schema_version(arm_sent_stream: bool, diagnostics_recorded: bool, v11_frame_status: bool = False) -> int:
     """Return the actual schema version based on recorded features."""
+    if v11_frame_status:
+        return SCHEMA_VERSION_V11  # v11: supersedes all prior versions
     if diagnostics_recorded:
         return SCHEMA_VERSION_DIAGNOSTICS  # v10
     if arm_sent_stream:
@@ -99,6 +102,10 @@ class EpisodeRecorder:
 
         # Track whether v10 diagnostics were recorded (for conditional schema_version).
         self._diagnostics_recorded: bool = False
+
+        # v11 frame-status fields (flag_ik_attempted, flag_frame_status) are always
+        # written by add_frame(), so any episode recorded with this code is v11+.
+        self._v11_frame_status: bool = True
 
         # Opt-in H.264 video encoding (Phase 1): when True, rgb frames are
         # written to a sidecar .rgb.mp4 file instead of (or in addition to)
@@ -362,7 +369,7 @@ class EpisodeRecorder:
             ("camera_K", camera_K),
             ("depth_scale", depth_scale),
         ):
-            if val is not None and p.get(key) is None:
+            if val is not None and (p.get(key) is None or (isinstance(p.get(key), (int, float)) and p.get(key) == 0)):
                 p[key] = val
 
     def add_frame(
@@ -437,16 +444,27 @@ class EpisodeRecorder:
             "hand_qpos": np.asarray(state.hand_qpos, dtype=np.float64),
             "hand_fingertip": np.asarray(state.fingertip_pos, dtype=np.float64),
             "hand_contact": np.asarray(state.hand_tactile_sum, dtype=np.float64),
+            "hand_tactile_force": np.asarray(state.hand_tactile_force, dtype=np.float64),
+            "hand_current": np.asarray(state.hand_current, dtype=np.float64) if state.hand_current is not None else np.full(12, np.nan),
+            # ── Connection status ──
+            # Distinguishes "physically disconnected (NaN qpos + connected=False)"
+            # from "connected but read failed (NaN qpos + connected=True)".
+            "arm_connected": bool(state.arm_connected),
+            "hand_connected": bool(state.hand_connected),
             # ── Actions ──
             "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
             "action_arm_ee": _make_action_ee(),
             "action_hand_joint": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
             # ── Flags ──
             "flag_ik_ok": bool(sig.get("ik_ok", False)),
+            "flag_ik_attempted": bool(sig.get("ik_attempted", True)),  # default True: normal frames
             "flag_retarget_ok": bool(sig.get("retarget_ok", False)),
             "flag_held": bool(sig.get("held", False)),
             "flag_safety_reject": bool(sig.get("flag_safety_reject", False)),
             "flag_camera_fresh": flag_camera_fresh,
+            # ── Frame quality (schema v11) ──
+            # 0=ok, 1=held (gate reject), 2=ik_fail, 3=safety_reject
+            "flag_frame_status": int(sig.get("frame_status", 0)),
             # ── VR ──
             "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
             "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
@@ -976,7 +994,7 @@ class EpisodeRecorder:
             with self._hdf5_lock:
                 meta = self._file["meta"]
                 meta.attrs["schema_version"] = _compute_schema_version(
-                    self.arm_sent_stream, self._diagnostics_recorded
+                    self.arm_sent_stream, self._diagnostics_recorded, self._v11_frame_status
                 )
                 meta.attrs["duration"] = duration
                 meta.attrs["num_frames"] = self._frame_count

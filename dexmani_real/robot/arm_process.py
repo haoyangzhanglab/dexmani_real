@@ -162,12 +162,12 @@ def _publish_arm_state(state_ring: SeqlockRingBuffer, inner: Any) -> None:
     """
     try:
         qpos, error_state, _target_ts = inner.get_state()
-        qvel, tau, temps = inner.get_dynamics()
+        qvel, tau = inner.get_dynamics()
         frame = new_frame(ARM_STATE_DTYPE)
         frame["qpos"][0] = np.asarray(qpos, dtype=np.float64)[:7]
         frame["qvel"][0] = np.asarray(qvel, dtype=np.float64)[:7]
         frame["tau"][0] = np.asarray(tau, dtype=np.float64)[:7]
-        frame["temps"][0] = np.asarray(temps, dtype=np.float64)[:7]
+        frame["temps"][0] = np.full(7, np.nan, dtype=np.float64)
         frame["error_state"][0] = 1 if error_state else 0
         frame["connected"][0] = 1 if inner.connected else 0
         frame["mode"][0] = int(inner.mode)
@@ -577,7 +577,7 @@ class ArmSHMFaçade:
         * age > state_stale_mult/loop_hz → fabricated error record
           (error_state=1, connected=0, qpos=last-good or zeros) + throttled
           warning, so validate_action trips instead of gating on stale
-          tau/temps (the [[l515-midrun-stream-stall]] lesson).
+          tau (the [[l515-midrun-stream-stall]] lesson).
         * non-finite qpos or outside [soft_min-0.05, soft_max+0.05] is treated
           as a torn read → last-good record (or None if none).
         """
@@ -800,7 +800,8 @@ class ArmServo(Protocol):
 
     def set_target(self, target: np.ndarray | None) -> None: ...
     def get_state(self) -> tuple[np.ndarray, bool, float]: ...
-    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray]: ...
+    def get_state_and_dynamics(self) -> tuple[np.ndarray, bool, float, np.ndarray, np.ndarray]: ...
     def start(self) -> None: ...
     def stop(self, timeout: float = 3.0) -> None: ...
     def wait_ready(self, timeout: float = 30.0) -> bool: ...
@@ -824,7 +825,7 @@ class ArmInnerLoopSHMAdapter:
 
     Unpacks the façade's policy-shaped ``get_state() -> (record, age_ns)`` into
     ``ArmInnerLoop``'s ``get_state() -> (qpos, error, ts)`` and
-    ``get_dynamics() -> (qvel, tau, temps)`` shapes that the entry points
+    ``get_dynamics() -> (qvel, tau)`` shapes that the entry points
     destructure. ``emergency_stop`` uses the shared estop event (fast path:
     child issues ``set_state(4)`` on its own live connection within ≤1 tick —
     plan §4.8/A5), mirroring ``ArmInnerLoop.emergency_stop``.
@@ -877,14 +878,31 @@ class ArmInnerLoopSHMAdapter:
             time.perf_counter(),
         )
 
-    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_state_and_dynamics(self) -> tuple[np.ndarray, bool, float, np.ndarray, np.ndarray]:
+        """Atomic read of (qpos, error_state, target_ts, qvel, tau) from one SHM frame.
+
+        Matches ``ArmInnerLoop.get_state_and_dynamics()`` so entry points that
+        destructure all five fields in one call work on both the in-process and
+        subprocess paths without change.
+        """
         rec, _age_ns = self._facade.get_state()
         if rec is None:
-            return nan_array(7), nan_array(7), nan_array(7)
+            return nan_array(7), True, time.perf_counter(), nan_array(7), nan_array(7)
+        return (
+            np.asarray(rec["qpos"][0], dtype=np.float64).copy(),
+            bool(rec["error_state"][0]),
+            time.perf_counter(),
+            np.asarray(rec["qvel"][0], dtype=np.float64).copy(),
+            np.asarray(rec["tau"][0], dtype=np.float64).copy(),
+        )
+
+    def get_dynamics(self) -> tuple[np.ndarray, np.ndarray]:
+        rec, _age_ns = self._facade.get_state()
+        if rec is None:
+            return nan_array(7), nan_array(7)
         return (
             np.asarray(rec["qvel"][0], dtype=np.float64).copy(),
             np.asarray(rec["tau"][0], dtype=np.float64).copy(),
-            np.asarray(rec["temps"][0], dtype=np.float64).copy(),
         )
 
     @property

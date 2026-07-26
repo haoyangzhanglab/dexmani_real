@@ -148,7 +148,7 @@ def record_held_frame(recorder, state, hold_arm, vr_frame, *, ik_ok: bool) -> No
         }
     hand = state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64)
     action = RobotAction(arm_qpos_cmd=hold_arm, hand_qpos_cmd=hand)
-    recorder.add_frame(state, action, vr_frame, signals={"ik_ok": ik_ok, "retarget_ok": True, "held": True})
+    recorder.add_frame(state, action, vr_frame, signals={"ik_ok": ik_ok, "retarget_ok": False, "held": True})  # retarget_ok=False: hand retargeting not wired
 
 
 def main():
@@ -243,7 +243,7 @@ def main():
         print("Arm 内环线程已就绪 (30Hz online trajectory planning)")
         arm_qpos, error_state, _ = arm_inner.get_state()
 
-    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)) or np.all(arm_qpos == 0):
+    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
         arm_qpos = None
 
     state = robot.get_state(arm_qpos=arm_qpos)
@@ -413,7 +413,7 @@ def main():
                     arm_mapper.clear()
                     if arm_inner.wait_ready(timeout=30.0):
                         arm_qpos, error_state, _ = arm_inner.get_state()
-                        if not error_state and np.all(np.isfinite(arm_qpos)) and not np.all(arm_qpos == 0):
+                        if not error_state and np.all(np.isfinite(arm_qpos)):
                             state = robot.get_state(arm_qpos=arm_qpos)
                             prev_qpos_cmd = state.arm_qpos.copy()
                             ema_prev_pos = ema_prev_quat = None
@@ -505,7 +505,8 @@ def main():
 
             # ── 读取 ArmInnerLoop 状态 ──
             try:
-                arm_qpos, error_state, _inner_ts = arm_inner.get_state()
+                arm_qpos, error_state, _inner_ts, arm_qvel, arm_tau = arm_inner.get_state_and_dynamics()
+                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
 
                 if error_state:
                     print(f"  Arm 内环异常: error_state=True")
@@ -515,10 +516,6 @@ def main():
                         _emergency_stop()
                         break
                     continue
-
-                # 内环 30Hz 回读的动力学 → 录入 /arm_qvel /arm_tau (非 NaN) + 力矩/温度门
-                arm_qvel, arm_tau, arm_temps = arm_inner.get_dynamics()
-                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
             except Exception as e:
                 error_count += 1
                 print(f"  get_state 异常: {e}")
@@ -633,8 +630,8 @@ def main():
             target_quat = mapped["quat_wxyz"]
 
             # ── Cartesian pose EMA (IK 前, 唯一平滑级) ──
-            # 首帧 seed, 后续帧 EMA. IK 失败时 ema_prev 仍每帧推进,
-            # 故恢复时目标渐进追赶而非跳变.
+            # 首帧 seed, 后续帧 EMA. IK 失败时冻结 EMA 状态,
+            # 防止向不可达目标累积漂移.
             if ema_prev_pos is not None:
                 target_pos, target_quat = ema_smooth_pose(
                     target_pos,
@@ -644,8 +641,6 @@ def main():
                     EMA_ALPHA_POS,
                     EMA_ALPHA_ROT,
                 )
-            ema_prev_pos = target_pos.copy()
-            ema_prev_quat = target_quat.copy()
 
             # ── Workspace clamp (EMA 之后, 作为最终安全门) ──
             target_pos_before_clamp = target_pos.copy()
@@ -685,6 +680,10 @@ def main():
                 continue
 
             ik_method = "ok"
+            # IK success: update EMA state so the next frame's smoothing starts
+            # from a reachable target.  Freezing during failures prevents drift.
+            ema_prev_pos = target_pos.copy()
+            ema_prev_quat = target_quat.copy()
             # 平滑已在 IK 前 (笛卡尔 EMA) 完成; IK 输出按 joint_max_speed×dt 截步长后下发 —
             # 快腕旋时 IK 目标可超前可达状态 >50° (实测 max 57.5°), 截步长使 action 标签保持动力学可达
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
@@ -710,8 +709,9 @@ def main():
                 robot,
                 action,
                 actual_arm_qpos=arm_qpos,
+                actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_arm_temps=arm_temps,
+                actual_hand_current=state.hand_current,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
@@ -728,7 +728,7 @@ def main():
 
             # ── 录制帧 ──
             if recording_active:
-                sig = {"ik_ok": True, "retarget_ok": True, "held": False}
+                sig = {"ik_ok": True, "retarget_ok": False, "held": False}  # retarget_ok=False: hand retargeting not wired (arm-only teleop)
                 if not recorder.add_frame(state, action, vr_frame, signals=sig):
                     # max_frames reached or error
                     if recorder.max_frames_reached:

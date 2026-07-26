@@ -364,7 +364,16 @@ class XHand(ConnectionStateMixin):
         self.connected_flag = False
 
     def _diagnose_connection_failure(self) -> None:
-        logger.warning("XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions")
+        if self.cached_comm_type == "EtherCAT":
+            logger.warning(
+                "XHand connection failed — check power, EtherCAT cable, "
+                "and eno1 link status; EtherCAT raw socket requires "
+                "CAP_NET_RAW (sudo setcap cap_net_raw+ep python) or root"
+            )
+        else:
+            logger.warning(
+                "XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions"
+            )
 
     def _stub_state(self, full: bool = False) -> dict[str, Any]:
         """Return zero state for stub mode (ref: LeFranX xhand.py:219-223)."""
@@ -494,6 +503,13 @@ class XHand(ConnectionStateMixin):
         state = self.parse_state(hand_state, full=full)
         self.last_error_code = 0
         self.last_error_message = ""
+        # Bridge board-status (Layer 2) into safety gate: per-joint hardware
+        # board error registers must set error_state so validate_action()
+        # can gate commands on hardware-level faults.
+        if (np.any(np.asarray(state["commboard_err"], dtype=np.int32))
+                or np.any(np.asarray(state["jointboard_err"], dtype=np.int32))
+                or np.any(np.asarray(state["tipboard_err"], dtype=np.int32))):
+            self.error_state = True
         return state
 
     def send_action(self, action: np.ndarray) -> bool:
@@ -705,7 +721,6 @@ class XHand(ConnectionStateMixin):
         finger_ids = np.full(12, -1, dtype=np.int32)
         sensor_ids = np.full(12, -1, dtype=np.int32)
         raw_position = nan_array(12)
-        temperature = nan_array(12)
         commboard_err = np.zeros(12, dtype=np.int32)
         jointboard_err = np.zeros(12, dtype=np.int32)
         tipboard_err = np.zeros(12, dtype=np.int32)
@@ -721,7 +736,6 @@ class XHand(ConnectionStateMixin):
             qpos[idx] = float(getattr(item, "position", np.nan))
             current[idx] = float(getattr(item, "torque", np.nan))
             raw_position[idx] = float(getattr(item, "raw_position", np.nan))
-            temperature[idx] = float(getattr(item, "temperature", np.nan))
             commboard_err[idx] = int(getattr(item, "commboard_err", 0))
             # SDK misspelling: "jonitboard_err" for "jointboard_err".
             jointboard_err[idx] = int(getattr(item, "jonitboard_err", getattr(item, "jointboard_err", 0)))
@@ -737,6 +751,9 @@ class XHand(ConnectionStateMixin):
             "tactile_force": self.parse_tactile(hand_state),
             "tactile_force_sum": tactile_force_sum,
             "tactile_contact": self.detect_contact(force_sum=tactile_force_sum),
+            "commboard_err": commboard_err,
+            "jointboard_err": jointboard_err,
+            "tipboard_err": tipboard_err,
         }
 
         if full:
@@ -745,11 +762,6 @@ class XHand(ConnectionStateMixin):
                     "finger_ids": finger_ids,
                     "sensor_ids": sensor_ids,
                     "raw_position": raw_position,
-                    "temperature": temperature,
-                    "commboard_err": commboard_err,
-                    "jointboard_err": jointboard_err,
-                    "tipboard_err": tipboard_err,
-                    "tactile_temperature": self.parse_tactile_temperature(hand_state),
                     "connected_flag": self.connected_flag,
                     "error_state": self.error_state,
                     "last_action_code": self.last_action_code,
@@ -800,14 +812,6 @@ class XHand(ConnectionStateMixin):
             force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0))
         return force_sum
 
-    def parse_tactile_temperature(self, hand_state) -> np.ndarray:
-        temperature = nan_array((5, 20))
-        for i, sensor in self._iter_sensors(hand_state):
-            temp = np.asarray(getattr(sensor, "temperature", []), dtype=np.float64).reshape(-1)
-            if temp.size > 0:
-                temperature[i, : min(20, temp.size)] = temp[:20]
-        return temperature
-
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
         # XHand variant: same np.clip logic as XArm7._limit_joint_range (xarm7.py:855)
         # but with different clipping targets (hand finger ranges vs arm joint ranges).
@@ -836,13 +840,11 @@ class XHand(ConnectionStateMixin):
             "finger_ids": np.full(12, -1, dtype=np.int32),
             "sensor_ids": np.full(12, -1, dtype=np.int32),
             "raw_position": nan_array(12),
-            "temperature": nan_array(12),
             "commboard_err": np.zeros(12, dtype=np.int32),
             "jointboard_err": np.zeros(12, dtype=np.int32),
             "tipboard_err": np.zeros(12, dtype=np.int32),
             "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
             "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
-            "tactile_temperature": nan_array((5, 20)),
             "connected_flag": self.connected_flag,
             "error_state": self.error_state,
             "last_action_code": self.last_action_code,

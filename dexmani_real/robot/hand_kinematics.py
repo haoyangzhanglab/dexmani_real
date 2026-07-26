@@ -33,8 +33,8 @@ class HandKinematics:
     ) -> None:
         self._model: Any = None
         self._data: Any = None
-        self._fingertip_link_ids: list[int] = []
-        self._fingertip_link_names: list[str] = []
+        self._fingertip_frame_ids: list[int] = []
+        self._fingertip_frame_names: list[str] = []
         self._ready = False
 
         try:
@@ -58,26 +58,31 @@ class HandKinematics:
                 "right_hand_pinky_tip",
             ]
 
-        all_links = list(self._model.names) if hasattr(self._model, "names") else []
-        try:
-            from pinocchio import FrameType
-
-            for i, frame in enumerate(self._model.frames):
-                if frame.type == FrameType.BODY:
-                    all_links.append(frame.name)
-        except (ImportError, RuntimeError):
-            pass
-
+        # Fingertips are URDF <frame> elements, not joints.
+        # Use getFrameId() → oMf (frame placements), NOT getJointId() → oMi (joint placements).
+        # desk_safety.py uses the same pattern and is verified correct on hardware.
+        EXPECTED_COUNT = 5
         for name in fingertip_link_names:
             try:
-                idx = self._model.getJointId(name)
-                if idx < len(self._model.names):
-                    self._fingertip_link_ids.append(idx)
-                    self._fingertip_link_names.append(name)
+                fid = self._model.getFrameId(name)
+                self._fingertip_frame_ids.append(fid)
+                self._fingertip_frame_names.append(name)
             except (ValueError, RuntimeError):
-                pass
+                logger.warning(
+                    "HandKinematics: fingertip frame '%s' not found in URDF — FK will be incomplete",
+                    name,
+                )
 
-        self._ready = len(self._fingertip_link_ids) >= 5
+        matched = len(self._fingertip_frame_ids)
+        if matched < EXPECTED_COUNT:
+            logger.warning(
+                "HandKinematics: only %d/%d fingertip frames matched (expected %d) — "
+                "fingertip FK is DISABLED. Check URDF frame names against fingertip_link_names.",
+                matched,
+                EXPECTED_COUNT,
+                EXPECTED_COUNT,
+            )
+        self._ready = matched == EXPECTED_COUNT
 
     def is_ready(self) -> bool:
         return self._ready
@@ -97,7 +102,9 @@ class HandKinematics:
         pinocchio.updateFramePlacements(self._model, self._data)
 
         tips = np.zeros((5, 3), dtype=np.float64)
-        for i, link_id in enumerate(self._fingertip_link_ids[:5]):
-            placement = self._data.oMi[link_id]
+        for i, fid in enumerate(self._fingertip_frame_ids):
+            # fid is a frame ID from getFrameId() → use oMf (frame placements),
+            # NOT oMi (joint placements).  Same pattern as desk_safety.py:134.
+            placement = self._data.oMf[fid]
             tips[i] = placement.translation.copy()
         return tips

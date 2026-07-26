@@ -18,7 +18,6 @@ from dexmani_real.robot.xhand import XHandConfig
 # Defined here (robot layer) because these are hardware properties, not teleop policy.
 # Used by both teleop safety checks and RobotInterface path execution.
 _ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
-_ARM_TEMP_LIMIT_C = 70.0  # joint temperature warning threshold (°C)
 
 if TYPE_CHECKING:
     from dexmani_real.planning.collision_config import CollisionConfig
@@ -80,6 +79,9 @@ class RobotState:
     hand_connected: bool
     timestamp: float  # seconds
 
+    # ── Hand motor current (optional, for safety gating) ──
+    hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
+
     def __post_init__(self):
         _validate_field_shapes(
             self,
@@ -91,6 +93,7 @@ class RobotState:
                 ("eef_quat_wxyz", (4,)),
                 ("eef_rot6d", (6,)),
                 ("hand_qpos", (12,)),
+                ("hand_current", (12,)),
                 ("hand_tactile_sum", (5, 3)),
                 ("hand_tactile_force", (5, 120, 3)),
                 ("fingertip_pos", (5, 3)),

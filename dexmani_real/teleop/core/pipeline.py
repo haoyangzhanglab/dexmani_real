@@ -131,6 +131,8 @@ class TeleopPipeline:
 
         # ── Cartesian EMA (sole smoothing stage, before IK) ──
         # First frame seeds the filter; subsequent frames apply EMA.
+        # EMA state is only updated on IK success — freezing it during
+        # failures prevents progressive drift toward unreachable targets.
         if self._prev_target_pos is not None:
             target_pos, target_quat = ema_smooth_pose(
                 target_pos,
@@ -143,14 +145,14 @@ class TeleopPipeline:
                 self._ema_alpha_pos,
                 self._ema_alpha_rot,
             )
-        self._prev_target_pos = target_pos.copy()
-        self._prev_target_quat = target_quat.copy()
 
         # ── IK ──
         target_pose = Pose(p=target_pos, q=target_quat)
         ik_result = self.planner.solve_teleop_ik(target_pose, arm_qpos, prev_arm_cmd)
 
         if ik_result.success and ik_result.qpos is not None:
+            self._prev_target_pos = target_pos.copy()
+            self._prev_target_quat = target_quat.copy()
             return np.asarray(ik_result.qpos, dtype=np.float64), True, target_pos, target_quat
 
         return prev_arm_cmd.copy(), False, target_pos, target_quat
