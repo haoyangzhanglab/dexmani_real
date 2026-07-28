@@ -43,6 +43,10 @@ class PointCloudProcessorConfig:
     # original DBSCAN but without the clustering/bincount overhead.
     radius_outlier_min_points: int = 3
     radius_outlier_radius: float = 0.01
+    # The open3d pipeline (voxel → radius → FPS) is O(N); limiting input to
+    # a fixed ceiling keeps point-cloud latency predictable regardless of scene
+    # complexity. 8 000 is enough for a dense 5 mm grid across the workspace.
+    max_open3d_input: int = 8000
     # "o3d": open3d CPU farthest_point_down_sample (~6.6 ms @ 5.3k -> 2048,
     # colors preserved — verified on open3d 0.19). "pytorch3d": GPU
     # sample_farthest_points (~9 ms, B=1 underutilizes the GPU); only safe in the
@@ -125,6 +129,15 @@ class PointCloudProcessor:
         if pts.shape[0] == 0:
             return None
         cols = cols[crop]
+
+        # Cap open3d input so the pipeline stays fast regardless of scene
+        # complexity.  Uniform random subsample preserves spatial coverage
+        # without bias; the subsequent voxel grid + FPS are the definitive
+        # quality gates.
+        if pts.shape[0] > cfg.max_open3d_input:
+            idx = self._rng.choice(pts.shape[0], cfg.max_open3d_input, replace=False)
+            pts = pts[idx]
+            cols = cols[idx]
 
         import open3d as o3d  # lazy: keep parent-process imports light
 

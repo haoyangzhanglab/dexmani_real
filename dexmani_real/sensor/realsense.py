@@ -103,6 +103,26 @@ class RealSenseConfig:
     # pixels are zeroed BEFORE alignment (confidence/IR are registered to the raw
     # depth frame; rs.align only warps depth). None = disabled (no extra streams).
     depth_validity: DepthValidityConfig | None = None
+    # ── L515 colour-sensor exposure ──
+    # When auto_exposure=True (default), the firmware adjusts exposure + gain
+    # dynamically for bright images in indoor lighting.  The L515 colour sensor
+    # (1.12 µm pixel) fundamentally needs AE for usable indoor images — fixed
+    # exposure at 30 fps cannot gather enough light at typical ~300 lx.
+    #
+    # AE may trigger firmware frame duplication (new timestamps on old pixel
+    # data).  Content-hash dedup in read() filters these correctly, so the
+    # effective unique-frame rate is ~8 fps rather than the 30 fps hardware
+    # pace.  Recordings at 16 Hz will show ~50 % duplicate frames — this is a
+    # known L515 firmware limitation, not a code bug.  Duplicate frames are
+    # harmless for ML training (same data, different timestamps).
+    #
+    # Set auto_exposure=False only for outdoor / high-illuminance use:
+    #   color_auto_exposure=False, color_exposure_us=3000, color_gain=128
+    # NOTE: rs.option.exposure on L515 is in 100 µs units, not µs — the code
+    #       divides by 100 before calling set_option.
+    color_auto_exposure: bool = True
+    color_exposure_us: int = 3000  # only used when auto_exposure=False
+    color_gain: float = 128.0  # analog gain (L515 range ~16–248)
 
     def __post_init__(self) -> None:
         # object.__setattr__ bypasses frozen=True in __post_init__ so we can
@@ -187,8 +207,17 @@ class RealSense:
         self.intrinsics_info: dict | None = None
         self.rays: np.ndarray | None = None
         self.frame_id = 0
+        self._last_rgb_sample_hash: int = -1  # content-based duplicate detection (pixel-sample hash)
         self.last_frame: CameraFrame | None = None
         self._validity_warned = False
+        # ── read() timing instrumentation: log breakdown every ~30 frames ──
+        self._t_wait = self._t_align = self._t_extract = self._t_hash = 0.0
+        self._timing_n = 0
+        self._timing_window = 30
+        # ── L515 effective-fps diagnostic: track consecutive colour hw timestamps ──
+        self._last_color_hw_ts: float | None = None
+        self._color_dt_sum = 0.0
+        self._color_dt_count = 0
         # Runtime copy of depth_validity with confidence_min pre-shifted into the
         # RAW8 upper-nibble domain: the SDK unpacks CNF4 there with a zero lower
         # nibble, so comparing raw bytes against (min << 4) is exactly equivalent
@@ -317,6 +346,21 @@ class RealSense:
         # Use a fresh context after USB re-enumeration.
         self.context = rs.context()
 
+    def _apply_depth_config(self) -> None:
+        """Apply depth settings via set_option at pipeline post-start.
+
+        Device-type dispatch: L515 gets the calibrated preset (visual_preset,
+        laser, gain, confidence, noise, min_distance); D400 gets emitter
+        enabled and High Accuracy preset.
+        """
+        if self.profile is None:
+            return
+
+        if self.active_is_l515:
+            self._apply_l515_depth_config()
+        else:
+            self._apply_d400_depth_config()
+
     def _apply_l515_depth_config(self) -> None:
         """Apply L515 depth settings via set_option after pipeline start.
 
@@ -328,9 +372,10 @@ class RealSense:
         the preset label to 0 (Custom); that is the expected final state.
         """
         cfg = self.config.l515_depth_config
-        if not self.active_is_l515 or self.profile is None or cfg is None or not cfg.enabled:
+        if cfg is None or not cfg.enabled:
             return
 
+        assert self.profile is not None  # _apply_depth_config dispatcher guards this
         sensor = self.profile.get_device().first_depth_sensor()
 
         options: list[tuple[rs.option, float]] = [
@@ -371,12 +416,127 @@ class RealSense:
                 actual_gain,
             )
 
+    def _apply_l515_color_config(self) -> None:
+        """Configure L515 colour-sensor exposure.
+
+        Two modes, controlled by ``color_auto_exposure``:
+
+        *Auto-exposure ON (default for bright indoor images):*
+        The firmware adjusts exposure + gain per-frame.  Produces well-exposed
+        images, but the AE algorithm may cause the firmware to repeat pixel
+        data with new timestamps — content-hash dedup in ``read()`` filters
+        these, but the effective unique-frame rate can drop to ~8 fps.
+
+        *Fixed exposure (color_auto_exposure=False):*
+        Disables AE and sets a fixed exposure + gain.  Prevents firmware frame
+        duplication entirely because the sensor runs at a constant, predictable
+        pace.  Defaults to 3 000 μs / gain 128 — tuned for ~300 lx lab
+        lighting with the L515 colour sensor.
+
+        Depth exposure is managed independently by the laser projector and is
+        not affected by colour-sensor settings.
+        """
+        if not self.active_is_l515 or self.profile is None:
+            return
+
+        try:
+            sensor = self.profile.get_device().first_color_sensor()
+        except RuntimeError:
+            return
+
+        if sensor is None:
+            return
+
+        cfg = self.config
+
+        # 1. Auto-exposure toggle
+        try:
+            if sensor.supports(rs.option.enable_auto_exposure):
+                sensor.set_option(rs.option.enable_auto_exposure, 1.0 if cfg.color_auto_exposure else 0.0)
+        except (RuntimeError, OSError) as error:
+            logger.warning("L515 color: enable_auto_exposure failed: %s", error)
+
+        if not cfg.color_auto_exposure:
+            # 2a. Fixed-exposure mode: set exposure + gain explicitly.
+            #     The order matters: set exposure first so gain doesn't
+            #     fight a transient AE decision.
+            try:
+                if sensor.supports(rs.option.exposure):
+                    # L515 rs.option.exposure is in 100 µs units (not µs).
+                    sensor.set_option(rs.option.exposure, float(cfg.color_exposure_us) / 100.0)
+            except (RuntimeError, OSError) as error:
+                logger.warning("L515 color: set exposure failed: %s", error)
+
+            try:
+                if sensor.supports(rs.option.gain):
+                    sensor.set_option(rs.option.gain, float(cfg.color_gain))
+            except (RuntimeError, OSError) as error:
+                logger.warning("L515 color: set gain failed: %s", error)
+
+            logger.info(
+                "L515 color: auto-exposure OFF — fixed exposure=%d μs, gain=%.0f",
+                cfg.color_exposure_us,
+                cfg.color_gain,
+            )
+        else:
+            # 2b. Auto-exposure mode: boost gain so AE converges to shorter
+            #     exposures, keeping the sensor within the 30-fps budget.
+            try:
+                if sensor.supports(rs.option.gain):
+                    sensor.set_option(rs.option.gain, 128.0)
+            except (RuntimeError, OSError) as error:
+                logger.warning("L515 color: gain failed (harmless — AE still active): %s", error)
+
+            # Tell the firmware to favour frame rate over brightness.
+            try:
+                if sensor.supports(rs.option.auto_exposure_priority):
+                    sensor.set_option(rs.option.auto_exposure_priority, 0.0)
+            except (RuntimeError, OSError) as error:
+                logger.warning("L515 color: auto_exposure_priority failed (harmless): %s", error)
+
+            logger.info(
+                "L515 color: auto-exposure ON (gain/priority optional, see warnings above if any)",
+            )
+
+    def _apply_d400_depth_config(self) -> None:
+        """Apply D400 depth settings after pipeline start.
+
+        D400 (D415/D435/D455): enable the IR emitter (stereo dot projector)
+        for robust depth on textureless surfaces, and set the High Accuracy
+        visual preset when available.
+        """
+        if self.profile is None:
+            return
+        try:
+            sensor = self.profile.get_device().first_depth_sensor()
+        except RuntimeError:
+            return
+        if sensor is None:
+            return
+
+        options: list[tuple[rs.option, float]] = []
+        if sensor.supports(rs.option.emitter_enabled):
+            options.append((rs.option.emitter_enabled, 1.0))
+        if sensor.supports(rs.option.visual_preset):
+            # RS2_RS400_VISUAL_PRESET_HIGH_ACCURACY = 3
+            options.append((rs.option.visual_preset, 3.0))
+
+        for option, value in options:
+            try:
+                sensor.set_option(option, value)
+            except (RuntimeError, OSError) as error:
+                logger.warning("D400 set_option(%s) failed: %s", option, error)
+
+        if options:
+            logger.info("D400 depth config applied: %s", [o.name for o, _ in options])
+
     def _setup_pipeline_post_start(self) -> None:
         """Configure active-device options, alignment, filters, and intrinsics."""
         if self.profile is None:
             raise RuntimeError("Pipeline profile is unavailable after start.")
 
-        self._apply_l515_depth_config()
+        self._apply_depth_config()
+        self._apply_l515_color_config()
         self.aligner = self.create_aligner()
 
         self.set_global_time()
@@ -386,7 +546,13 @@ class RealSense:
             # Rebuilt on every (re)start — depth_scale is only known here.
             self._edge_t_lut = build_edge_threshold_lut(self.depth_scale, self._validity_rt.edge)
         self.frame_id = 0
+        self._last_rgb_sample_hash = -1
         self.last_frame = None
+        self._t_wait = self._t_align = self._t_extract = self._t_hash = 0.0
+        self._timing_n = 0
+        self._last_color_hw_ts = None
+        self._color_dt_sum = 0.0
+        self._color_dt_count = 0
 
     def _start_pipeline(self, rs_config: rs.config) -> None:
         """Create and start a fresh pipeline.
@@ -597,10 +763,16 @@ class RealSense:
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
+        import time as _time
+
+        _t0 = _time.perf_counter()
+
         frames = self.pipeline.wait_for_frames(timeout_ms)
+        _t_wait = _time.perf_counter()
         self._apply_depth_validity(frames)
         if self.aligner is not None:
             frames = self.aligner.process(frames)
+        _t_align = _time.perf_counter()
 
         host_time = time.time()
         depth_frame = frames.get_depth_frame()
@@ -625,7 +797,27 @@ class RealSense:
             bgr = np.asanyarray(color_frame.get_data())
             rgb = np.ascontiguousarray(bgr[..., ::-1])
 
-        self.frame_id += 1
+        _t_extract = _time.perf_counter()
+
+        # Content-based duplicate detection: hash a uniformly subsampled
+        # grid of the RGB frame to identify real hardware frames vs firmware
+        # duplicates.  get_timestamp() is unreliable — L515 firmware may
+        # deliver *different* timestamps for pixel-identical frames when the
+        # stream engine falls behind the configured fps.
+        # ::4 stride → ~19 200 sample points (120×160 for 480×640 image);
+        # small arm movements always change enough samples to flip the hash.
+        # Python hash() on ~57 KB is ~60 µs — negligible vs 33 ms frame gap.
+        if rgb is not None and rgb.size > 0:
+            _SAMPLE_STRIDE = 4
+            sample_hash = hash(rgb[::_SAMPLE_STRIDE, ::_SAMPLE_STRIDE, :].tobytes())
+        else:
+            sample_hash = -1
+        if sample_hash != self._last_rgb_sample_hash:
+            self.frame_id += 1
+            self._last_rgb_sample_hash = sample_hash
+
+        _t_hash = _time.perf_counter()
+
         frame = CameraFrame(
             rgb=rgb,
             depth=depth,
@@ -643,6 +835,51 @@ class RealSense:
             frame_name=str(self.config.frame_name),
         )
         self.last_frame = frame
+
+        # ── Accumulate read() timing + colour-frame pacing ──
+        self._t_wait += (_t_wait - _t0) * 1000
+        self._t_align += (_t_align - _t_wait) * 1000
+        self._t_extract += (_t_extract - _t_align) * 1000
+        self._t_hash += (_t_hash - _t_extract) * 1000
+        # Colour-frame hardware-timestamp pacing (L515 effective fps)
+        if color_frame is not None:
+            col_hw_ts = float(color_frame.get_timestamp()) * 1e-3
+            if self._last_color_hw_ts is not None:
+                dt = col_hw_ts - self._last_color_hw_ts
+                if dt > 0:
+                    self._color_dt_sum += dt
+                    self._color_dt_count += 1
+            self._last_color_hw_ts = col_hw_ts
+        self._timing_n += 1
+
+        if self._timing_n >= self._timing_window:
+            from dexmani_real.utils.log import get_logger
+
+            _log = get_logger(__name__)
+            wait_ms = self._t_wait / self._timing_n
+            align_ms = self._t_align / self._timing_n
+            extract_ms = self._t_extract / self._timing_n
+            hash_ms = self._t_hash / self._timing_n
+            total_ms = wait_ms + align_ms + extract_ms + hash_ms
+            lines = [
+                f"RealSense.read() [%d frames, %.1fms total]: "
+                f"wait=%.1fms align=%.1fms extract=%.1fms hash=%.2fms"
+                % (self._timing_n, total_ms, wait_ms, align_ms, extract_ms, hash_ms),
+            ]
+            if self._color_dt_count > 0:
+                mean_dt = self._color_dt_sum / self._color_dt_count
+                eff_fps = 1.0 / mean_dt if mean_dt > 0 else 0.0
+                lines.append(
+                    "  colour hw pacing: mean_dt=%.1fms effective_fps=%.1f "
+                    "(samples=%d)" % (mean_dt * 1000, eff_fps, self._color_dt_count)
+                )
+            _log.info(" ".join(lines))
+            self._t_wait = self._t_align = self._t_extract = self._t_hash = 0.0
+            self._timing_n = 0
+            self._last_color_hw_ts = None
+            self._color_dt_sum = 0.0
+            self._color_dt_count = 0
+
         return frame
 
     def get_intrinsics(self) -> np.ndarray:

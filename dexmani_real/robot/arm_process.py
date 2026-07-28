@@ -239,6 +239,13 @@ def _arm_child_main(
             _publish_arm_state(state_ring, inner)  # best-effort error record for the façade
             crashed_event.set()
             return
+        # Publish the first arm_state frame BEFORE signalling ready so the
+        # façade's read_latest() always observes a real frame when
+        # wait_ready() returns — eliminates a one-tick SHM race window
+        # where get_state() returned a fabricated all-zeros frame, causing
+        # replay_traj.py to report "Arm is 180.0° from trajectory start"
+        # (plan §4.7 / replay start-alignment race).
+        _publish_arm_state(state_ring, inner)
         ready_event.set()
 
         # ── RPC executor on its own thread: long macros (waypoints / blocking

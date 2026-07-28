@@ -392,22 +392,40 @@ class XHand(ConnectionStateMixin):
         Per SDK documentation, some usage scenarios require an explicit sensor
         reset before data is reported.  This is called once at connect time;
         individual sensor failures are logged but are non-fatal.
+
+        The C++ SDK (libxhand_control.so) prints "Unknow Cmd!" to stdout for
+        each ``reset_sensor()`` call when the hand firmware does not recognise
+        the command.  The error codes are handled in Python regardless; the
+        messages are pure noise.  We redirect fd 1 (C stdout) to /dev/null
+        during the calls, preserving fd 2 (stderr → Python logging).
         """
         if self._stub_mode:
             return
         device_id = self.config.device_id
-        for sensor_id in range(17, 22):  # 17=thumb, 18=index, 19=middle, 20=ring, 21=little
-            try:
-                err = self.control.reset_sensor(device_id, sensor_id)
-                if not self.error_ok(err):
-                    logger.warning(
-                        "Tactile sensor %d reset failed: code=%s msg=%s",
-                        sensor_id,
-                        self.error_code(err),
-                        str(getattr(err, "error_message", "")),
-                    )
-            except Exception:
-                logger.warning("Tactile sensor %d reset raised exception", sensor_id, exc_info=True)
+
+        # Redirect C stdout (fd 1) → /dev/null during reset_sensor() calls.
+        # Python logging writes to stderr (fd 2), which is left untouched.
+        import os as _os
+        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
+        _saved_stdout = _os.dup(1)
+        try:
+            _os.dup2(_devnull, 1)
+            for sensor_id in range(17, 22):  # 17=thumb, 18=index, 19=middle, 20=ring, 21=little
+                try:
+                    err = self.control.reset_sensor(device_id, sensor_id)
+                    if not self.error_ok(err):
+                        logger.warning(
+                            "Tactile sensor %d reset failed: code=%s msg=%s",
+                            sensor_id,
+                            self.error_code(err),
+                            str(getattr(err, "error_message", "")),
+                        )
+                except Exception:
+                    logger.warning("Tactile sensor %d reset raised exception", sensor_id, exc_info=True)
+        finally:
+            _os.dup2(_saved_stdout, 1)
+            _os.close(_saved_stdout)
+            _os.close(_devnull)
 
     def _verify_device(self) -> None:
         """Log hardware identity for diagnostics (non-fatal — never blocks connect).

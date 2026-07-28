@@ -20,7 +20,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from dexmani_real.sensor.pointcloud_processor import PointCloudProcessorConfig
 from dexmani_real.utils.log import get_logger
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
     import numpy as np
 
+    from dexmani_real.sensor.protocols import CameraDriver
     from dexmani_real.shm.ring_buffer import CameraRingBuffer
 
 logger = get_logger(__name__)
@@ -79,8 +80,13 @@ class CameraProcess:
         cam.stop()
     """
 
-    def __init__(self, config: CameraProcessConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: CameraProcessConfig | None = None,
+        camera_factory: Callable[[CameraProcessConfig], CameraDriver] | None = None,
+    ) -> None:
         self.config = config or CameraProcessConfig()
+        self._camera_factory = camera_factory  # None → use RealSense default
         self._process: mp.Process | None = None
         self._stop_event = mp.Event()
         self._shm_buf: CameraRingBuffer | None = None  # CameraRingBuffer instance (lazy init)
@@ -138,6 +144,48 @@ class CameraProcess:
             self._shm_buf.unlink()
             self._shm_buf = None
         logger.info("CameraProcess stopped.")
+
+    def restart(self, max_attempts: int = 3) -> bool:
+        """Stop (if alive) and restart the camera process.
+
+        Returns True when the process started successfully.  Internally tracks
+        ``restart_attempts`` — callers can read it to decide when to give up.
+        """
+        if not hasattr(self, "_restart_attempts"):
+            self._restart_attempts = 0  # type: ignore[attr-defined]
+
+        if self._restart_attempts >= max_attempts:
+            logger.error(
+                "CameraProcess: restart limit reached (%d/%d) — refusing to restart.",
+                self._restart_attempts,
+                max_attempts,
+            )
+            return False
+
+        self._restart_attempts += 1
+        logger.warning(
+            "CameraProcess: restarting (attempt %d/%d)…",
+            self._restart_attempts,
+            max_attempts,
+        )
+
+        # Tear down the old process (idempotent — stop() handles None/already-dead).
+        self.stop()
+
+        # Clear crash flag so start() can proceed without the latch blocking it.
+        self._crashed.clear()
+
+        ok = self.start()
+        if ok:
+            logger.info("CameraProcess restarted successfully (attempt %d).", self._restart_attempts)
+        else:
+            logger.error("CameraProcess restart failed (attempt %d).", self._restart_attempts)
+        return ok
+
+    @property
+    def restart_attempts(self) -> int:
+        """Number of restart attempts in the current session."""
+        return getattr(self, "_restart_attempts", 0)
 
     # ------------------------------------------------------------------
     # Frame access (called from main process)
@@ -252,21 +300,50 @@ class CameraProcess:
 
     def _run(self) -> None:
         """Main capture loop (runs in child process)."""
-        interval = 1.0 / self.config.hz
+        # Overspeed gate: allow frames delivered slightly faster than the
+        # configured FPS (normal L515 firmware jitter is 32.6–33.2 ms for a
+        # 30 fps pipeline — a strict 1/hz gate rejects legitimate frames).
+        # 0.85× interval (~28.3 ms @ 30 fps) passes normal jitter while
+        # still catching true overspeed bursts (<20 ms delivery).
+        _OVERSPEED_MARGIN = 0.85
+        interval = _OVERSPEED_MARGIN / self.config.hz
+
+        # ── 线程池限制 ──
+        # CameraProcess 作为独立子进程, OpenCV/NumPy 在多数核心机器上默认
+        # 各自派生子线程, 争抢 16Hz 控制循环的 CPU 时间片。每个库限制为单
+        # 线程, 依赖进程级并行 (arm/hand/camera 各自独立进程) 而非每库内部
+        # 的多线程展开。
+        try:
+            import cv2
+
+            cv2.setNumThreads(1)
+        except ImportError:
+            pass
+        try:
+            from threadpoolctl import threadpool_limits
+
+            # Acquire a never-released thread limit — the camera process exits
+            # via os._exit(0) so the context-manager cleanup never runs anyway.
+            threadpool_limits(1).__enter__()  # type: ignore[func-returns-value]
+        except ImportError:
+            pass
 
         try:
-            from dexmani_real.sensor.realsense import L515_CALIBRATED_DEPTH_VALIDITY, RealSense, RealSenseConfig
+            if self._camera_factory is not None:
+                cam = self._camera_factory(self.config)
+            else:
+                from dexmani_real.sensor.realsense import L515_CALIBRATED_DEPTH_VALIDITY, RealSense, RealSenseConfig
 
-            rs_config = RealSenseConfig(
-                camera_name=self.config.camera_name,
-                serial=self.config.serial,
-                depth_resolution=(self.config.depth_width, self.config.depth_height),
-                fps=int(self.config.hz),
-                warmup_frames=self.config.warmup_frames,
-                depth_validity=L515_CALIBRATED_DEPTH_VALIDITY if self.config.depth_validity else None,
-            )
+                rs_config = RealSenseConfig(
+                    camera_name=self.config.camera_name,
+                    serial=self.config.serial,
+                    depth_resolution=(self.config.depth_width, self.config.depth_height),
+                    fps=int(self.config.hz),
+                    warmup_frames=self.config.warmup_frames,
+                    depth_validity=L515_CALIBRATED_DEPTH_VALIDITY if self.config.depth_validity else None,
+                )
+                cam = RealSense(rs_config)
 
-            cam = RealSense(rs_config)
             if not cam.connect():
                 logger.error("CameraProcess: RealSense connect failed.")
                 self._crashed.set()
@@ -324,6 +401,9 @@ class CameraProcess:
             # here, in-process.
             stall_rebuild_s = 4.0
             last_ok = time.monotonic()
+            last_written_frame_id = -1
+            last_shm_write_ts = 0.0  # monotonic — hard cap on SHM write rate
+            overspeed_drops = 0
 
             last_ts = time.monotonic()
             # ── timing instrumentation: log step breakdown every ~1s ──
@@ -358,25 +438,55 @@ class CameraProcess:
                                     "re-sending last valid" if pc is not None else "sending zeros",
                                 )
                     t2 = time.monotonic()
-                    try:
-                        header, rgb, depth = pack_camera_frame(
-                            # frame.rgb is never None here: RealSenseConfig.enable_color defaults True
-                            # and read() raises on a missing color frame (CameraFrame.rgb is Optional
-                            # only for enable_color=False configs).
-                            frame.rgb,  # type: ignore[arg-type]  # Optional only for enable_color=False; guaranteed non-None with this config
-                            frame.depth_raw,
-                            frame.timestamp,
-                            frame.frame_id,
-                            pc_num_points=pc.shape[0] if pc is not None else 0,
-                        )
-                        shm_writer.write(
-                            header,
-                            rgb,
-                            depth,
-                            pointcloud=pc if pc is not None else zero_pc,
-                        )
-                    except (ValueError, RuntimeError, OSError):
-                        logger.exception("CameraProcess shm write failed — continuing.")
+                    # Skip SHM write when the frame content hasn't changed (L515
+                    # firmware duplicates).  RealSense.read() already gate-keeps
+                    # frame_id on content-hash, so a repeating frame_id means
+                    # pixel-identical data — writing it would waste ~1.5 MB of
+                    # SHM bandwidth per duplicate.
+                    if frame.frame_id != last_written_frame_id:
+                        # ── SHM 写入速率硬限制 ──
+                        # 名义上 wait_for_frames() 按配置 FPS 阻塞, 但异常场景
+                        # (L515 固件超速、管道配置漂移) 可能产出比 interval 更密
+                        # 的唯一帧。用时间门防止 SHM 写入超过配置速率。
+                        now_ts = time.monotonic()
+                        if now_ts - last_shm_write_ts >= interval:
+                            # Propagate camera health to cross-process consumers:
+                            # 0=ok, 1=stale (>2s since last successful read), 2=crashed.
+                            # The EpisodeRecorder checks this before forward-filling.
+                            _health: int = 1 if (now_ts - last_ok) > 2.0 else 0
+                            try:
+                                header, rgb, depth = pack_camera_frame(
+                                    # frame.rgb is never None here: RealSenseConfig.enable_color defaults True
+                                    # and read() raises on a missing color frame (CameraFrame.rgb is Optional
+                                    # only for enable_color=False configs).
+                                    frame.rgb,  # type: ignore[arg-type]  # Optional only for enable_color=False; guaranteed non-None with this config
+                                    frame.depth_raw,
+                                    frame.timestamp,
+                                    frame.frame_id,
+                                    pc_num_points=pc.shape[0] if pc is not None else 0,
+                                    camera_health=_health,
+                                )
+                                shm_writer.write(
+                                    header,
+                                    rgb,
+                                    depth,
+                                    pointcloud=pc if pc is not None else zero_pc,
+                                )
+                                last_written_frame_id = frame.frame_id
+                                last_shm_write_ts = now_ts
+                            except (ValueError, RuntimeError, OSError):
+                                logger.exception("CameraProcess shm write failed — continuing.")
+                        else:
+                            overspeed_drops += 1
+                            if overspeed_drops == 1 or overspeed_drops % 100 == 0:
+                                logger.warning(
+                                    "CameraProcess: overspeed SHM write dropped "
+                                    "(%.1fms since last write, interval=%.1fms, "
+                                    "%d total)",
+                                    (now_ts - last_shm_write_ts) * 1000,
+                                    interval * 1000,
+                                    overspeed_drops,
+                                )
                     t3 = time.monotonic()
 
                     # Accumulate timing for periodic breakdown log
@@ -385,13 +495,19 @@ class CameraProcess:
                     t_pack += (t3 - t2) * 1000
                     timing_n += 1
                     if timing_n >= timing_window:
-                        logger.debug(
-                            "CameraProcess timing [%d frames]: " "read=%.1fms pc=%.1fms pack+shm=%.1fms total=%.0fms",
+                        total_ms = (t_read + t_pc + t_pack) / timing_n
+                        loop_hz = 1000.0 / total_ms if total_ms > 0 else 0.0
+                        logger.info(
+                            "CameraProcess timing [%d frames, %.0fms/loop ≈ %.1fHz]: "
+                            "read=%.1fms pc=%.1fms pack+shm=%.1fms "
+                            "(target interval=%.1fms)",
                             timing_n,
+                            total_ms,
+                            loop_hz,
                             t_read / timing_n,
                             t_pc / timing_n,
                             t_pack / timing_n,
-                            (t_read + t_pc + t_pack) / timing_n,
+                            interval * 1000,
                         )
                         t_read = t_pc = t_pack = 0.0
                         timing_n = 0
@@ -429,10 +545,18 @@ class CameraProcess:
                 last_ts = time.monotonic()
 
             shm_writer.close()
-            # cam.disconnect() intentionally skipped — parent's terminate() handles USB cleanup.
-            # pipeline.stop() is a known librealsense2 deadlock risk on L515 + Linux USB.
-            # Refs: librealsense#9184, librealsense#13006
             logger.info("CameraProcess capture loop exited cleanly.")
+
+            # Force-exit without Python / C++ cleanup: pipeline.stop() is a
+            # known deadlock risk on L515 + Linux USB (librealsense2#9184,
+            # #13006), and pyrealsense2's background threads block the process
+            # from exiting for 3-4 s after the loop.  The parent's stop()
+            # already terminates us as a fallback; this just makes it
+            # instant.  SHM is closed; the parent unlinks the rings.  OS
+            # reclaims USB resources when the process exits.
+            import os as _os
+
+            _os._exit(0)
 
         except (RuntimeError, OSError):
             logger.exception("CameraProcess crashed.")

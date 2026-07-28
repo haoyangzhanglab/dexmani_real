@@ -61,7 +61,8 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("depth_shape_h", "<u4"),  # Depth height
         ("depth_shape_w", "<u4"),  # Depth width
         ("pc_num_points", "<u4"),  # Valid pointcloud rows in the slot (0 = none)
-        ("pad", "<u4", (2,)),  # Padding to 64-byte alignment
+        ("camera_health", "<u1"),  # 0=ok, 1=stale>2s, 2=crashed
+        ("pad", "<u1", (7,)),  # Padding to 64-byte alignment
     ],
     align=True,
 )
@@ -117,6 +118,7 @@ def pack_camera_frame(
     timestamp: float,
     frame_id: int,
     pc_num_points: int = 0,
+    camera_health: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pack camera frame attributes directly into (header, rgb_bytes, depth_bytes).
 
@@ -127,11 +129,15 @@ def pack_camera_frame(
     ``pc_num_points`` marks how many rows of the slot's pointcloud block are
     valid (0 = no valid pointcloud); the block itself is passed separately to
     ``CameraRingBuffer.write``.
+
+    ``camera_health`` propagates the producer's health to cross-process
+    consumers: 0=ok, 1=stale>2s, 2=crashed.
     """
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
     header["timestamp"] = np.float64(timestamp)
     header["frame_number"] = np.uint64(frame_id)
     header["pc_num_points"] = np.uint32(pc_num_points)
+    header["camera_health"] = np.uint8(camera_health)
 
     rgb_arr = np.asarray(rgb, dtype=np.uint8)
     depth_arr = np.asarray(depth_raw, dtype=np.uint16)
@@ -168,6 +174,7 @@ def bytes_to_camera_frame(
         "depth": depth,
         "timestamp": float(h["timestamp"]),
         "frame_number": int(h["frame_number"]),
+        "camera_health": int(h["camera_health"]),
     }
     if pointcloud is not None:
         frame["pointcloud"] = pointcloud

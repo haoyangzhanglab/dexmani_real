@@ -214,6 +214,7 @@ def record_held_frame(
                  "held": True,
                  "flag_safety_reject": safety_reject, "frame_status": frame_status},
         diagnostics=diagnostics,
+        camera_crashed=False,  # camera var not in scope here; held-frame path
     )
 
 
@@ -381,9 +382,13 @@ def main():
 
     _camera_name_cache: str | None = None
 
-    # 相机停帧检测: frame_number 不再变化 >1s → 限频告警 (数据可能冻结)
+    # 相机停帧检测: frame_number 不再变化时跟踪停滞时长, 超过阈值自动
+    # 停止录制并报错, 避免产出充满 forward-fill 冻结帧的无效 episode。
+    CAMERA_STALE_STOP_S = 3.0  # 连续停滞超过此秒数 → 自动停止录制
     cam_last_fn = None
-    cam_last_change_t: float | None = None
+    cam_stale_start: float | None = None  # 本次停滞的开始时刻 (monotonic)
+    cam_stale_stopped = False  # 本次停滞已触发 auto-stop, 帧号恢复前抑制重复触发
+    cam_crash_handled = False  # 进程崩溃已处理 (重启成功后重置)
 
     def _resolve_camera_name() -> str | None:
         """serial → cameras.json 条目名，成功后缓存（子进程 connect 后 serial 才可用）."""
@@ -497,6 +502,7 @@ def main():
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
                     h5.with_suffix(".json").unlink(missing_ok=True)
+                    h5.with_suffix(".rgb.mp4").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
             limiter.reset()  # 清除阻塞期间累积的 deadline 债务, 避免下次 wait() 误报超预算
@@ -706,6 +712,32 @@ def main():
                             continue
                     if camera is not None and camera.crashed:
                         print("  ⚠ 相机进程已退出 — 本集降级为只录关节/EEF")
+                    # ── 相机流健康检查: serial 就绪后验证帧真正在推送 ──
+                    # serial 可读只说明子进程 connect() 完成; 仍需确认
+                    # (a) frame_number 在递增 (有新帧产出),
+                    # (b) 最新帧时间戳是近期的 (非停滞残留).
+                    if camera is not None and camera.camera_serial and not camera.crashed:
+                        _stream_deadline = time.perf_counter() + 2.0
+                        _prev_fn = None
+                        _stream_ok = False
+                        while time.perf_counter() < _stream_deadline:
+                            _f = camera.poll_latest_frame()
+                            if _f is not None:
+                                _fn = _f["frame_number"]
+                                _ts = _f["timestamp"]
+                                _age = time.time() - _ts
+                                if _prev_fn is not None and _fn != _prev_fn and _age < 0.5:
+                                    _stream_ok = True
+                                    break
+                                _prev_fn = _fn
+                            time.sleep(0.1)
+                        if not _stream_ok:
+                            print(
+                                "  ⚠ 相机流未就绪 (2s 内无新帧或帧过期)"
+                                " — 本次 B 忽略, 请检查相机并重试"
+                            )
+                            skip_rest = True
+                            continue
                     # 如果已在录制，先停止旧 episode
                     _stop_recording(save=recording_active)
                     gc.collect()  # drain cyclic garbage before a new episode
@@ -849,15 +881,68 @@ def main():
 
             # ── 相机帧: 从共享内存读取最新帧 (零拷贝, 不区分是否录制) ──
             # 提前到 held 帧录制点之前, 暂停/失败帧也带真实相机数据.
+            #
+            # 先检查进程级崩溃 (硬故障) — 与 GAP-03 的软停滞互补.
+            # crashed 是单向 latch: 子进程退出后 is_alive() 返回 False,
+            # _crashed Event 被置位且永不自动清除.
+            if camera is not None and camera.crashed and not cam_crash_handled:
+                logger.error("相机进程已崩溃 — 自动停止录制并丢弃当前 episode")
+                print(
+                    f"\n{'=' * 60}\n"
+                    f"  ❌ 相机进程崩溃! 当前 episode 已自动丢弃\n"
+                    f"{'=' * 60}\n",
+                    flush=True,
+                )
+                _stop_recording(save=False)
+
+                # 尝试自动重启 (最多 3 次, 含 stall_rebuild_s 内建
+                # disconnect/connect 自愈后仍失败的情况).
+                if camera.restart(max_attempts=3):
+                    print(
+                        f"  ✓ 相机进程已自动重启 (第 {camera.restart_attempts} 次)\n",
+                        flush=True,
+                    )
+                    cam_crash_handled = False  # 重置 — 允许检测后续崩溃
+                    cam_last_fn = None
+                    cam_stale_start = None
+                    cam_stale_stopped = False
+                else:
+                    print(
+                        f"  ✗ 相机进程重启失败 (已尝试 {camera.restart_attempts} 次) — 请重启程序\n",
+                        flush=True,
+                    )
+                    cam_crash_handled = True
+
             cam = camera.poll_latest_frame() if camera is not None else None
             if cam is not None:
                 now_mono = time.monotonic()
                 if cam["frame_number"] != cam_last_fn:
                     cam_last_fn = cam["frame_number"]
-                    cam_last_change_t = now_mono
-                elif cam_last_change_t is not None and now_mono - cam_last_change_t > 1.0:
-                    if loop_count % STATUS_EVERY == 0:  # 1 Hz, 与 VR 过期告警一致
-                        print(f"  ⚠ 相机帧已停止更新 {now_mono - cam_last_change_t:.1f}s — 数据可能冻结")
+                    cam_stale_start = None  # 帧号变化 → 停滞结束
+                    cam_stale_stopped = False
+                elif cam_stale_start is None:
+                    cam_stale_start = now_mono  # 首次检测到停滞
+                elif not cam_stale_stopped and now_mono - cam_stale_start > CAMERA_STALE_STOP_S:
+                    stale_s = now_mono - cam_stale_start
+                    logger.error(
+                        "相机帧已停滞 %.1fs (frame_number=%s 未变化) — 自动停止录制并丢弃当前 episode",
+                        stale_s,
+                        cam_last_fn,
+                    )
+                    print(
+                        f"\n{'=' * 60}\n"
+                        f"  ❌ 相机数据冻结! 帧已停滞 {stale_s:.1f}s\n"
+                        f"     当前 episode 已自动丢弃, 请检查相机连接后重新开始录制\n"
+                        f"{'=' * 60}\n",
+                        flush=True,
+                    )
+                    _stop_recording(save=False)
+                    cam_stale_stopped = True  # 帧号恢复前抑制重复触发
+                elif not cam_stale_stopped and loop_count % STATUS_EVERY == 0:  # 1 Hz 限频告警
+                    print(
+                        f"  ⚠ 相机帧已停止更新 {now_mono - cam_stale_start:.1f}s "
+                        f"— 将在 {CAMERA_STALE_STOP_S:.0f}s 后自动停止录制"
+                    )
             stage_timer.mark("cam")
 
             # ── Periodic status ──
@@ -1221,6 +1306,7 @@ def main():
                 ok = recorder.add_frame(
                     state, action, vr_frame, camera_frame=cam, signals=sig, arm_qpos_sent=sent_cmd,
                     diagnostics=diagnostics,
+                    camera_crashed=(camera is not None and camera.crashed),
                 )
                 if not ok and recorder.max_frames_reached:
                     print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")

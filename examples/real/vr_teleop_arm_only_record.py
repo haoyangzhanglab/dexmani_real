@@ -439,6 +439,7 @@ def main():
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
                     h5.with_suffix(".json").unlink(missing_ok=True)
+                    h5.with_suffix(".rgb.mp4").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
             # 清空保存期间用户狂按积压的按键，避免 H/Q 等信号重复触发

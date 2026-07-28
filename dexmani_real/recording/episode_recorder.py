@@ -382,6 +382,7 @@ class EpisodeRecorder:
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
         diagnostics: dict[str, Any] | None = None,
+        camera_crashed: bool = False,
     ) -> bool:
         if not self._recording or self._buffer is None:
             return False
@@ -464,6 +465,11 @@ class EpisodeRecorder:
             "flag_held": bool(sig.get("held", False)),
             "flag_safety_reject": bool(sig.get("flag_safety_reject", False)),
             "flag_camera_fresh": flag_camera_fresh,
+            "flag_camera_crashed": camera_crashed,
+            "camera_health": int(camera_frame.get("camera_health", 0) if camera_frame is not None else (
+                next((f.get("camera_health", 0) for f in camera_frames.values() if f is not None), 0)
+                if camera_frames else 0
+            )),
             # ── Frame quality (schema v11) ──
             # 0=ok, 1=held (gate reject), 2=ik_fail, 3=safety_reject
             "flag_frame_status": int(sig.get("frame_status", 0)),
@@ -873,14 +879,27 @@ class EpisodeRecorder:
             except Exception:
                 pass
             self._file = None
-            # Clean up temp file if the crash happened before the atomic rename
-            # (temp still exists → rename didn't run → unlink it to avoid orphan).
-            # If temp is already gone (rename succeeded), this is a no-op.
+            # Close video encoders BEFORE unlinking their files —
+            # otherwise the encoder's file handle may still be writing.
+            if self._video_enc_rgb is not None:
+                try:
+                    self._video_enc_rgb.close()
+                except Exception:
+                    pass
+                self._video_enc_rgb = None
+            if self._video_enc_depth is not None:
+                try:
+                    self._video_enc_depth.close()
+                except Exception:
+                    pass
+                self._video_enc_depth = None
+            # Clean up temp files if the crash happened before the atomic
+            # finalise step (temp still exists → discard, avoid orphans).
+            # If temp is already gone (rename succeeded before the crash),
+            # this is a no-op.
             _tmp = self._temp_path
             if _tmp is not None:
-                self._try_unlink(_tmp)
-                _tmp_rgb = str(Path(_tmp).with_suffix(".rgb.mp4"))
-                self._try_unlink(_tmp_rgb)
+                self._discard_temp_files(_tmp)
             self._datasets.clear()
             self._recording = False
             self._max_frames_reached = False
@@ -899,19 +918,6 @@ class EpisodeRecorder:
             self._cam_writer = None
             self._cam_written = 0
             self._cam_dropped = 0
-            # Video sidecar encoders — close best-effort on error.
-            if self._video_enc_rgb is not None:
-                try:
-                    self._video_enc_rgb.close()
-                except Exception:
-                    pass
-                self._video_enc_rgb = None
-            if self._video_enc_depth is not None:
-                try:
-                    self._video_enc_depth.close()
-                except Exception:
-                    pass
-                self._video_enc_depth = None
 
     def _stop_episode_impl_inner(self, success: bool, reason: str, truncated: bool) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
@@ -1042,15 +1048,17 @@ class EpisodeRecorder:
             self._file.close()
         self._file = None
 
-        # ── Atomic finalise: rename temp → final ──
-        # The rename runs for both success and failure — the ``success`` attr
-        # in /meta already records the outcome; callers that want to discard
-        # unlink the final path after join_stop() as before.
+        # ── Atomic finalise ──
+        # success: rename temp → final (both .h5 and all sidecars).
+        # discard:  unlink temp files directly — no rename, no orphans.
         # Captured before _episode_path / _temp_path are cleared below.
         _final = self._episode_path
         _tmp = self._temp_path
         if _tmp is not None and _final is not None:
-            self._rename_temp_to_final(_tmp, _final)
+            if success:
+                self._rename_temp_to_final(_tmp, _final)
+            else:
+                self._discard_temp_files(_tmp)
 
         self._datasets.clear()
         self._recording = False
@@ -1076,6 +1084,12 @@ class EpisodeRecorder:
 
     # ── Atomic file finalisation ──────────────────────────────────────
 
+    # Sidecar file extensions that MUST be cleaned up together with the .h5.
+    # Every suffix here is automatically deleted on discard and renamed on save.
+    # Add new sidecar formats (e.g. ".depth.mp4") here — all call sites,
+    # CollectionLoop, and the atexit error path pick them up automatically.
+    _SIDECAR_SUFFIXES: tuple[str, ...] = (".rgb.mp4",)
+
     @staticmethod
     def _try_rename(src: str, dst: str) -> None:
         """Rename *src* → *dst*; fall back to copy+unlink on cross-device error."""
@@ -1093,13 +1107,25 @@ class EpisodeRecorder:
         except OSError:
             pass
 
+    @classmethod
+    def _discard_temp_files(cls, tmp: str) -> None:
+        """Unlink temp .h5 and all known sidecar files (discard path).
+
+        Called from _stop_episode_impl_inner (normal discard) and
+        _stop_episode_impl (error path).  Never raises.
+        """
+        cls._try_unlink(tmp)
+        for suffix in cls._SIDECAR_SUFFIXES:
+            cls._try_unlink(str(Path(tmp).with_suffix(suffix)))
+
     def _rename_temp_to_final(self, tmp: str, final: str) -> None:
-        """Rename the .h5 temp file and .rgb.mp4 sidecar (if any) to their final paths."""
+        """Rename the .h5 temp file and all known sidecars to their final paths."""
         self._try_rename(tmp, final)
-        tmp_rgb = str(Path(tmp).with_suffix(".rgb.mp4"))
-        if os.path.exists(tmp_rgb):
-            final_rgb = str(Path(final).with_suffix(".rgb.mp4"))
-            self._try_rename(tmp_rgb, final_rgb)
+        for suffix in self._SIDECAR_SUFFIXES:
+            tmp_sidecar = str(Path(tmp).with_suffix(suffix))
+            if os.path.exists(tmp_sidecar):
+                final_sidecar = str(Path(final).with_suffix(suffix))
+                self._try_rename(tmp_sidecar, final_sidecar)
 
     # ── Dataset helpers ───────────────────────────────────────────────
 

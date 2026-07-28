@@ -245,6 +245,13 @@ class ReplayRecorder:
         self.arm_tracking_error = np.full((max_frames,), np.nan, dtype=np.float64)
         self.timestamps = np.full((max_frames,), np.nan, dtype=np.float64)
 
+        # Safety-reject diagnostics: preserves observability on skipped frames
+        # so downstream analysis can distinguish "safety gate fired" (valid
+        # state + cmd, sent_cmd=NaN, flag_safety_reject=True) from "data
+        # missing" (all NaN).
+        self.flag_safety_reject = np.zeros(max_frames, dtype=bool)
+        self.safety_reject_reason: list[str | None] = [None] * max_frames
+
         if has_hand:
             self.hand_qpos = np.full((max_frames, 12), np.nan, dtype=np.float64)
             self.hand_cmd = np.full((max_frames, 12), np.nan, dtype=np.float64)
@@ -261,8 +268,16 @@ class ReplayRecorder:
         ts: float,
         arm_sent_cmd: np.ndarray | None = None,
         arm_tracking_error: float | None = None,
+        safety_reject_reason: str | None = None,
     ) -> None:
-        """Record one frame of replay state."""
+        """Record one frame of replay state.
+
+        When *safety_reject_reason* is set the frame is marked as a safety
+        gate rejection: observables + cmd are preserved (the action that was
+        *attempted*), but ``arm_sent_cmd`` is left at its pre-allocated NaN
+        (nothing was sent to the robot).  Downstream scripts can filter on
+        ``flag_safety_reject`` or ``safety_reject_reason``.
+        """
         if idx >= self.max_frames:
             return
         self.arm_qpos[idx] = state.arm_qpos
@@ -279,6 +294,9 @@ class ReplayRecorder:
             self.hand_qpos[idx] = state.hand_qpos
         if self.has_hand and self.hand_cmd is not None and hand_cmd is not None:
             self.hand_cmd[idx] = hand_cmd
+        if safety_reject_reason is not None:
+            self.flag_safety_reject[idx] = True
+            self.safety_reject_reason[idx] = safety_reject_reason
         self._count = idx + 1
 
     @property
@@ -288,6 +306,13 @@ class ReplayRecorder:
     def to_dict(self) -> dict[str, np.ndarray]:
         """Return truncated arrays as a dict."""
         n = self._count
+        # Encode as fixed-length bytes so the NPZ can be loaded without
+        # allow_pickle=True (object arrays require pickle, which np.load
+        # blocks by default for security).
+        reasons = np.array(
+            [r.encode() if r else b"" for r in self.safety_reject_reason[:n]],
+            dtype="S256",
+        )
         result: dict[str, np.ndarray] = {
             "arm_qpos": self.arm_qpos[:n].copy(),
             "eef_pos": self.eef_pos[:n].copy(),
@@ -297,6 +322,8 @@ class ReplayRecorder:
             "arm_sent_cmd": self.arm_sent_cmd[:n].copy(),
             "arm_tracking_error": self.arm_tracking_error[:n].copy(),
             "timestamp": self.timestamps[:n].copy(),
+            "flag_safety_reject": self.flag_safety_reject[:n].copy(),
+            "safety_reject_reason": reasons,
         }
         if self.hand_qpos is not None:
             result["hand_qpos"] = self.hand_qpos[:n].copy()
@@ -861,7 +888,15 @@ class TrajectoryReplayer:
 
         # Read initial state
         arm_qpos, error_state, _ = self._arm_inner.get_state()
-        if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
+        # Defend against all-zeros qpos from SHM startup race (arm_process.py
+        # may return a fabricated frame before the child publishes its first
+        # real state).  Also reject NaN/Inf and explicit error states.
+        if (
+            arm_qpos is None
+            or not np.all(np.isfinite(arm_qpos))
+            or np.all(arm_qpos == 0)
+            or error_state
+        ):
             arm_qpos = self.robot.get_state().arm_qpos
         state = self.robot.get_state(arm_qpos=arm_qpos)
 
@@ -995,12 +1030,34 @@ class TrajectoryReplayer:
                 if not action_valid:
                     validate_fail_count += 1
                     print(f"  [SAFETY] Pre-send gate: {fail_reason} — skip frame ({validate_fail_count}/3)", flush=True)
+                    # Record observables + attempted cmd even on reject.
+                    # arm_sent_cmd stays NaN (nothing was sent to the robot);
+                    # flag_safety_reject + safety_reject_reason let downstream
+                    # scripts distinguish "gate fired" from "data missing".
+                    ts = time.perf_counter()
+                    if self._recorder is not None:
+                        self._recorder.record(
+                            frame_idx, state, arm_cmd, hand_cmd, ts,
+                            arm_sent_cmd=None,
+                            arm_tracking_error=self._arm_inner.tracking_error,
+                            safety_reject_reason=fail_reason,
+                        )
                     if validate_fail_count > 3:
                         print("Pre-send gate failed repeatedly, emergency_stop")
                         self._emergency_stop()
                         break
                     continue
                 validate_fail_count = 0
+
+                # ── Snapshot sent command ──
+                # Mirror the original recording's pattern (vr_teleop_arm_only_record_plus.py
+                # §"Snapshot sent command from arm_cmd"): the outer-loop step clamp (0.131 rad)
+                # is stricter than the inner loop's delta clamp (0.3 rad), so the inner loop
+                # forwards arm_cmd unchanged.  Snapshotting BEFORE set_target() avoids a
+                # read-before-write race: reading last_sent_cmd immediately after set_target()
+                # catches the PREVIOUS tick's value (inner loop runs asynchronously at 30 Hz),
+                # producing a 1-frame-off shifted sent stream.
+                sent_cmd = arm_cmd.copy()
 
                 # ── Send arm command ──
                 self._arm_inner.set_target(action.arm_qpos_cmd)
@@ -1014,7 +1071,7 @@ class TrajectoryReplayer:
                 if self._recorder is not None:
                     self._recorder.record(
                         frame_idx, state, arm_cmd, hand_cmd, ts,
-                        arm_sent_cmd=self._arm_inner.last_sent_cmd,
+                        arm_sent_cmd=sent_cmd,
                         arm_tracking_error=self._arm_inner.tracking_error,
                     )
 

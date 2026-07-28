@@ -191,16 +191,17 @@ def record_held_frame(
     diagnostics: dict | None = None,
     frame_status: int = _FRAME_HELD,
     ik_attempted: bool = False,
+    target_eef_pos: np.ndarray | None = None,
+    target_eef_rot6d: np.ndarray | None = None,
 ) -> None:
     """录制 held 帧: 跳过发送的帧仍占用栅格槽位, 如实标记 flags.
 
     arm_qpos_sent: 上一帧实发值 (arm_inner.last_sent_cmd) — held 帧不发送新目标,
     但记录侧应反映"上一帧实发值"而非零, 否则 --source=sent replay 会发送错误指令。
 
-    frame_status: _FRAME_HELD (default), _FRAME_IK_FAIL, _FRAME_SAFETY_REJECT, or
-    _FRAME_RETARGET_FAIL — stored as flag_frame_status in HDF5.
-
-    ik_attempted: True when IK was actually run before the hold decision.
+    target_eef_pos / target_eef_rot6d: 最后有效目标位姿 — held 帧无新目标,
+    但记录此值可保持 action_arm_ee 列的连续性, 避免 replay 遇到 NaN。
+    调用方传入上一帧成功 solve 的值 (或 None, 写 NaN)。
     """
     if vr_frame is None:  # VR 过期/丢失 — NaN 位姿如实标记无数据
         vr_frame = {
@@ -213,7 +214,12 @@ def record_held_frame(
         if hold_hand is not None
         else (state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos)) else np.zeros(12, dtype=np.float64))
     )
-    action = RobotAction(arm_qpos_cmd=hold_arm, hand_qpos_cmd=hand)
+    action = RobotAction(
+        arm_qpos_cmd=hold_arm,
+        hand_qpos_cmd=hand,
+        target_eef_pos=target_eef_pos.copy() if target_eef_pos is not None else None,
+        target_eef_rot6d=target_eef_rot6d.copy() if target_eef_rot6d is not None else None,
+    )
     recorder.add_frame(
         state,
         action,
@@ -404,6 +410,8 @@ def main():
 
     ema_prev_pos: np.ndarray | None = None  # 笛卡尔 EMA 状态 (IK 前)
     ema_prev_quat: np.ndarray | None = None
+    _last_target_eef_pos = np.full(3, np.nan)  # 最后有效目标位姿 (held 帧写此值)
+    _last_target_eef_rot6d = np.full(6, np.nan)
 
     print(f"\n初始状态:")
     print(f"  arm_qpos:  {np.round(np.rad2deg(state.arm_qpos), 1)} deg")
@@ -570,6 +578,7 @@ def main():
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
                     h5.with_suffix(".json").unlink(missing_ok=True)
+                    h5.with_suffix(".rgb.mp4").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
             limiter.reset()
@@ -1025,7 +1034,19 @@ def main():
                         arm_qpos_sent=arm_inner.last_sent_cmd,
                         hold_hand=prev_hand_cmd.copy(),
                         diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
                     )
+                # Keep the hand cmd ring fresh during pause / VR stale —
+                # the arm inner loop holds position on its own, but the hand
+                # child's cmd_stale_hold_s (500 ms) fires noisy warnings if
+                # we stop sending entirely.  Sending the current hand position
+                # as an explicit hold matches the IK-fail path (:1130-1137).
+                if hand_available:
+                    robot.send_action(RobotAction(
+                        arm_qpos_cmd=prev_qpos_cmd.copy(),
+                        hand_qpos_cmd=prev_hand_cmd.copy(),
+                    ))
                 continue
 
             # ── 音频等待: B 按下后等待 begin 音频播完再响应运动 ──
@@ -1055,6 +1076,8 @@ def main():
                             arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_cmd.copy(),
                             diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame,
                                                     vr_quat_jump_rejected=_angle),
+                            target_eef_pos=_last_target_eef_pos,
+                            target_eef_rot6d=_last_target_eef_rot6d,
                         )
                     arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
                     ik_method = "vr_jump"
@@ -1071,6 +1094,8 @@ def main():
                         recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=False,
                         arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_cmd.copy(),
                         diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
                     )
                 arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
                 continue
@@ -1123,6 +1148,8 @@ def main():
                         arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=hand_cmd.copy(),
                         diagnostics=_build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame),
                         frame_status=_FRAME_IK_FAIL, ik_attempted=True,
+                        target_eef_pos=target_pos.copy(),
+                        target_eef_rot6d=quat_wxyz_to_rot6d(target_quat),
                     )
                 arm_inner.set_target(prev_qpos_cmd.copy())
                 # Hand retargeting is independent of arm IK — send hand
@@ -1155,6 +1182,8 @@ def main():
                             diagnostics=_build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame,
                                                     ik_joint_delta_rejected=_ik_joint_delta),
                             ik_attempted=True,
+                            target_eef_pos=target_pos.copy(),
+                            target_eef_rot6d=quat_wxyz_to_rot6d(target_quat),
                         )
                     arm_inner.set_target(prev_qpos_cmd.copy())
                     # IK output rejected (joint delta too large) — arm holds
@@ -1172,6 +1201,8 @@ def main():
             # Update EMA state on IK success
             ema_prev_pos = target_pos.copy()
             ema_prev_quat = target_quat.copy()
+            _last_target_eef_pos = target_pos.copy()
+            _last_target_eef_rot6d = quat_wxyz_to_rot6d(target_quat)
 
             arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
             arm_cmd = prev_qpos_cmd + np.clip(arm_cmd - prev_qpos_cmd, -ARM_CMD_MAX_STEP_RAD, ARM_CMD_MAX_STEP_RAD)
@@ -1203,6 +1234,8 @@ def main():
                         safety_reject=True,
                         diagnostics=_build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame),
                         frame_status=_FRAME_SAFETY_REJECT, ik_attempted=True,
+                        target_eef_pos=target_pos.copy(),
+                        target_eef_rot6d=quat_wxyz_to_rot6d(target_quat),
                     )
                 # NOTE: 安全拒绝不发送 hand 命令。与 IK 失败路径不同，
                 # 安全拒绝表示硬件异常（力矩/温度/错误状态），此时应停止

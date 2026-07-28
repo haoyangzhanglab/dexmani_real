@@ -174,7 +174,13 @@ class TimestampAlignedBuffer:
                 self._data_buffer[key][global_idxs] = value  # type: ignore[index]
 
         if self._timestamp_buffer is not None:
-            self._timestamp_buffer[global_idxs] = timestamp
+            # Assign grid-aligned synthetic timestamps so every slot gets
+            # a unique, strictly-monotonic value even when the data source
+            # back-fills or stalls.  Without this, back-filled slots all
+            # share the original timestamp → duplicate timestamps in the
+            # HDF5 → broken temporal alignment for downstream training.
+            for gidx in global_idxs:
+                self._timestamp_buffer[gidx] = self.start_time + gidx * self.dt
 
         self._size = max_required
 

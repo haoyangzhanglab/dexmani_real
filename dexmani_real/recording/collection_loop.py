@@ -168,8 +168,15 @@ class CollectionLoop:
         try:
             h5_path = Path(self._last_episode_path)
             h5_path.unlink(missing_ok=True)
-            json_path = h5_path.with_suffix(".json")
-            json_path.unlink(missing_ok=True)
+            h5_path.with_suffix(".json").unlink(missing_ok=True)
+            # Sidecar video files (.rgb.mp4, etc.) — EpisodeRecorder's
+            # _stop_episode_impl_inner already discards them from the temp
+            # path when success=False; this is belt-and-suspenders for any
+            # code path where the final-path file may still exist.
+            from dexmani_real.recording.episode_recorder import EpisodeRecorder
+
+            for suffix in EpisodeRecorder._SIDECAR_SUFFIXES:
+                h5_path.with_suffix(suffix).unlink(missing_ok=True)
             logger.info("Episode discarded: %s", self._last_episode_path)
             self._last_episode_path = None
             return True

@@ -48,7 +48,7 @@ servo, firmware holds position without command refresh):
     - watchdog: consecutive send errors → ``XHand.reset_connection()``.
 
 Rings (``SeqlockRingBuffer``, names from ``HandProcessConfig.shm_prefix``):
-    {prefix}_state (maxlen=3, child→main), {prefix}_cmd (maxlen=2, main→child),
+    {prefix}_state (maxlen=3, child→main), {prefix}_cmd (maxlen=8, main→child),
     {prefix}_macro_cmd / {prefix}_macro_result (maxlen=2 each, RPC).
 
 Contract deviations (kept minimal, documented per convention):
@@ -124,7 +124,14 @@ HAND_MACRO_RESULT_DTYPE = np.dtype(
 
 # ── ring geometry (plan §4.4-4.6) ──
 _STATE_MAXLEN = 3
-_CMD_MAXLEN = 2
+# Cmd ring size.  2 slots (~125 ms at 16 Hz) was too tight: startup jitter
+# (e.g. a 123 ms over-budget iteration) let the main process write 2+
+# commands between child reads, causing FILO drops and echo seq gaps.
+# 8 slots (~500 ms) absorbs any plausible transient without silently
+# masking a persistent consumer stall (the hand child's 30 Hz loop
+# would need to stall for >250 ms to overflow this — a pathological
+# condition that the stale-hold watchdog already catches).
+_CMD_MAXLEN = 8
 _MACRO_MAXLEN = 2
 # Echo mismatch tolerance (rad) — the façade's joint-limit clip and the
 # child's safety-net clip are numerically identical (same np.clip), but

@@ -109,7 +109,7 @@ HAND_STATE_DTYPE = np.dtype(
     ]
 )
 
-# ── hand_cmd (main → child, maxlen=2) — plan §4.5 (F1: clip applied main-side) ──
+# ── hand_cmd (main → child, maxlen=8) — plan §4.5 (F1: clip applied main-side) ──
 HAND_CMD_DTYPE = np.dtype(
     [
         ("qpos_cmd", "<f8", (12,)),  # already E3 delta processed by the façade
