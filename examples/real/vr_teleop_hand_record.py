@@ -64,7 +64,6 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
-from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
 
@@ -80,7 +79,7 @@ HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
 WORKSPACE_BOUNDS = np.array(
     [
-        [0.24, 0.72],  # x [min, max] m
+        [0.28, 0.72],  # x [min, max] m
         [-0.50, 0.50],  # y [min, max] m
         [0.05, 0.5],  # z [min, max] m
     ],
@@ -237,7 +236,7 @@ def record_held_frame(
 
 
 def compute_hand_command(
-    retargeter: XHandRetargeter,
+    retargeter: XHandRetargeter | None,
     vr_frame: dict,
     prev_hand_cmd: np.ndarray,
     hand_available: bool,
@@ -250,6 +249,9 @@ def compute_hand_command(
     if not hand_available:
         return prev_hand_cmd.copy(), False
 
+    if retargeter is None:
+        return prev_hand_cmd.copy(), False
+
     landmarks = vr_frame.get("landmarks") if vr_frame is not None else None
     if landmarks is None or landmarks.shape != (21, 3):
         return prev_hand_cmd.copy(), False
@@ -260,8 +262,8 @@ def compute_hand_command(
         target = retargeter.retarget(landmarks)
         if target is not None and len(target) == 12:
             return np.asarray(target, dtype=np.float64), True
-    except (ValueError, TypeError, np.linalg.LinAlgError):
-        pass
+    except Exception:
+        logger.warning("Hand retargeting failed — holding position", exc_info=True)
 
     return prev_hand_cmd.copy(), False
 
@@ -419,7 +421,7 @@ def main():
 
     # ── 7. Recorder ──
     recorder = EpisodeRecorder(
-        data_dir="episodes_hand",
+        data_dir="episodes",
         max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
@@ -427,11 +429,7 @@ def main():
         use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
-    # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
-    traj_logger = TrajectoryLogger()
-    _traj_path: str | None = None  # set per-episode at B key
-
-    # ── 7c. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
+    # ── 7b. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
     stage_timer = StageTimer(window=STATUS_EVERY)
 
     # ── 8. Keyboard ──
@@ -571,7 +569,6 @@ def main():
                 if path:
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
-                    h5.with_suffix(".npz").unlink(missing_ok=True)
                     h5.with_suffix(".json").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
@@ -580,6 +577,8 @@ def main():
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
+        print("[TRACE] _emergency_stop() called from:", flush=True)
+        traceback.print_stack()
         nonlocal running, teleop_active, recording_active
         teleop_active = False
         if recording_active:
@@ -592,6 +591,18 @@ def main():
         robot.emergency_stop()
         robot.arm.clear_error()
         running = False
+
+    def _build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame, **extra):
+        """构建 held/fail 帧的诊断字典，消除 6 处重复."""
+        hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
+        diag = {
+            "tracking_error": arm_inner.tracking_error,
+            "ik_solve_time_ms": ik_solve_time_ms,
+            "target_pos_before_clamp": target_pos_before_clamp,
+            "head_quat_wxyz": hq if hq is not None else np.full(4, np.nan),
+        }
+        diag.update(extra)
+        return diag
 
     gc.disable()
     try:
@@ -609,6 +620,8 @@ def main():
                 if sig == ControlSignal.EMERGENCY_STOP:
                     print("\nESC: emergency_stop")
                     audio.play("emergency")
+                    print("[TRACE] emergency_stop triggered from keyboard handler:", flush=True)
+                    traceback.print_stack()
                     _emergency_stop()
                     break
 
@@ -807,11 +820,6 @@ def main():
                         skip_rest = True
                         continue
                     recording_active = True
-                    # Per-episode NPZ filename
-                    _traj_save_dir = Path("trajectories")
-                    _traj_save_dir.mkdir(parents=True, exist_ok=True)
-                    _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
-                    traj_logger.clear()
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
                     # Heading calibration
@@ -1006,13 +1014,6 @@ def main():
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None
                 if recording_active:
-                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-                    _diag = {
-                        "tracking_error": arm_inner.tracking_error,
-                        "ik_solve_time_ms": 0.0,
-                        "target_pos_before_clamp": np.full(3, np.nan),
-                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
-                    }
                     record_held_frame(
                         recorder,
                         state,
@@ -1023,7 +1024,7 @@ def main():
                         retarget_ok=False,
                         arm_qpos_sent=arm_inner.last_sent_cmd,
                         hold_hand=prev_hand_cmd.copy(),
-                        diagnostics=_diag,
+                        diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame),
                     )
                 continue
 
@@ -1049,18 +1050,11 @@ def main():
                     )
                     if recording_active:
                         hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                        _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-                        _diag = {
-                            "tracking_error": arm_inner.tracking_error,
-                            "ik_solve_time_ms": 0.0,
-                            "target_pos_before_clamp": np.full(3, np.nan),
-                            "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
-                            "vr_quat_jump_rejected": _angle,
-                        }
                         record_held_frame(
                             recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=False,
                             arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_cmd.copy(),
-                            diagnostics=_diag,
+                            diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame,
+                                                    vr_quat_jump_rejected=_angle),
                         )
                     arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
                     ik_method = "vr_jump"
@@ -1073,16 +1067,10 @@ def main():
                 ik_method = "no_map"
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-                    _diag = {
-                        "tracking_error": arm_inner.tracking_error,
-                        "ik_solve_time_ms": 0.0,
-                        "target_pos_before_clamp": np.full(3, np.nan),
-                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
-                    }
                     record_held_frame(
                         recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=False,
-                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_cmd.copy(), diagnostics=_diag,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_cmd.copy(),
+                        diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame),
                     )
                 arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
                 continue
@@ -1119,49 +1107,33 @@ def main():
 
             # ── Hand: compute via retargeting from VR landmarks ──
             hand_cmd, retarget_ok = compute_hand_command(
-                hand_retargeter if hand_retargeter is not None else None,  # type: ignore[arg-type]
+                hand_retargeter,
                 vr_frame,
                 prev_hand_cmd,
                 hand_available,
             )
             stage_timer.mark("hand")
 
-            # ── Trajectory debug record ──
-            _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
-            _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            if recording_active and recorder.frame_count < recorder.max_frames:
-                traj_logger.append(
-                    t=time.perf_counter() - start_time,
-                    wrist_pos=vr_frame["wrist_pos"],
-                    wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                    target_pos=target_pos,
-                    target_quat_wxyz=target_quat,
-                    actual_eef_pos=state.eef_pos,
-                    actual_eef_quat_wxyz=state.eef_quat_wxyz,
-                    arm_qpos_actual=state.arm_qpos,
-                    ik_ok=ik_result.success and ik_result.qpos is not None,
-                    wrist_delta=_wrist_d,
-                    eef_delta=_eef_d,
-                    target_pos_before_clamp=target_pos_before_clamp,
-                )
-
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-                    _diag = {
-                        "tracking_error": arm_inner.tracking_error,
-                        "ik_solve_time_ms": ik_solve_time_ms,
-                        "target_pos_before_clamp": target_pos_before_clamp,
-                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
-                    }
                     record_held_frame(
                         recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=retarget_ok,
-                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=hand_cmd.copy(), diagnostics=_diag,
+                        arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=hand_cmd.copy(),
+                        diagnostics=_build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame),
                         frame_status=_FRAME_IK_FAIL, ik_attempted=True,
                     )
                 arm_inner.set_target(prev_qpos_cmd.copy())
+                # Hand retargeting is independent of arm IK — send hand
+                # even when IK fails so the hand cmd ring doesn't go stale.
+                if hand_available:
+                    robot.send_action(RobotAction(
+                        arm_qpos_cmd=prev_qpos_cmd.copy(),
+                        hand_qpos_cmd=hand_cmd,
+                    ))
+                    prev_hand_cmd = hand_cmd.copy()
+                stage_timer.mark("send")
                 continue
 
             # ── IK output safety gate ──
@@ -1177,20 +1149,23 @@ def main():
                     )
                     if recording_active:
                         hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                        _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-                        _diag = {
-                            "tracking_error": arm_inner.tracking_error,
-                            "ik_solve_time_ms": ik_solve_time_ms,
-                            "target_pos_before_clamp": target_pos_before_clamp,
-                            "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
-                            "ik_joint_delta_rejected": _ik_joint_delta,
-                        }
                         record_held_frame(
                             recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=retarget_ok,
                             arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=hand_cmd.copy(),
-                            diagnostics=_diag, ik_attempted=True,
+                            diagnostics=_build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame,
+                                                    ik_joint_delta_rejected=_ik_joint_delta),
+                            ik_attempted=True,
                         )
                     arm_inner.set_target(prev_qpos_cmd.copy())
+                    # IK output rejected (joint delta too large) — arm holds
+                    # but hand retargeting is independent and should still send.
+                    if hand_available:
+                        robot.send_action(RobotAction(
+                            arm_qpos_cmd=prev_qpos_cmd.copy(),
+                            hand_qpos_cmd=hand_cmd,
+                        ))
+                        prev_hand_cmd = hand_cmd.copy()
+                    stage_timer.mark("send")
                     continue
 
             ik_method = "ok"
@@ -1216,25 +1191,25 @@ def main():
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
                 actual_hand_current=state.hand_current,
+                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
                 if recording_active:
                     hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                    _hq = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-                    _diag = {
-                        "tracking_error": arm_inner.tracking_error,
-                        "ik_solve_time_ms": ik_solve_time_ms,
-                        "target_pos_before_clamp": target_pos_before_clamp,
-                        "head_quat_wxyz": _hq if _hq is not None else np.full(4, np.nan),
-                    }
                     record_held_frame(
                         recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=retarget_ok,
                         arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=hand_cmd.copy(),
-                        safety_reject=True, diagnostics=_diag,
+                        safety_reject=True,
+                        diagnostics=_build_diag(ik_solve_time_ms, target_pos_before_clamp, vr_frame),
                         frame_status=_FRAME_SAFETY_REJECT, ik_attempted=True,
                     )
+                # NOTE: 安全拒绝不发送 hand 命令。与 IK 失败路径不同，
+                # 安全拒绝表示硬件异常（力矩/温度/错误状态），此时应停止
+                # 所有命令发送。IK 失败仅是规划问题，手部 retargeting
+                # 独立于臂部 IK，故继续发送手部命令。
                 arm_inner.set_target(prev_qpos_cmd.copy())
+                stage_timer.mark("send")
                 continue
 
             prev_qpos_cmd = arm_cmd.copy()
@@ -1298,13 +1273,6 @@ def main():
                 print("\n  ⚠ 正在等待写盘完成，请勿中断…", flush=True)
         if recorder.stop_error:
             print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
-
-        if _traj_path is not None and len(traj_logger) > 0:
-            try:
-                saved = traj_logger.save(_traj_path)
-                print(f"\n轨迹已保存: {saved}  ({len(traj_logger)} 帧)")
-            except (OSError, ValueError) as e:
-                print(f"\n轨迹保存失败: {e}")
 
         print("\n退出主循环")
 

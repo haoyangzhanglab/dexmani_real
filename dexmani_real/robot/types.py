@@ -70,6 +70,8 @@ class RobotState:
     # ── Tactile (ref: DexUMI — both combined force and raw array in default mode) ──
     hand_tactile_sum: np.ndarray  # (5,3)     float64  N — per-finger combined force
     hand_tactile_force: np.ndarray  # (5,120,3) float64  N — per-finger raw force array
+    hand_tactile_contact: np.ndarray  # (5,) bool — per-finger contact detection (from detect_contact)
+    hand_tipboard_err: np.ndarray  # (12,) int32 — tip board error registers per joint
 
     # ── Derived (chained FK) ──
     fingertip_pos: np.ndarray  # (5,3) float64  m (world frame)
@@ -96,6 +98,8 @@ class RobotState:
                 ("hand_current", (12,)),
                 ("hand_tactile_sum", (5, 3)),
                 ("hand_tactile_force", (5, 120, 3)),
+                ("hand_tactile_contact", (5,)),
+                ("hand_tipboard_err", (12,)),
                 ("fingertip_pos", (5, 3)),
             ],
         )
@@ -149,10 +153,38 @@ class RobotInterfaceConfig:
     hand_urdf_path: str = ""
     fingertip_link_names: list[str] = field(default_factory=list)
 
-    # Static transform from EEF to hand base
-    T_eef_handbase_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    # Static transform from planning EEF (custom_eef_link) to hand base
+    # (right_hand_link), both defined in xarm7_xhand_right.urdf (the combined
+    # URDF whose arm kinematics match the MPlib planner's collision URDF).
+    #
+    # Chain (all fixed joints in xarm7_xhand_right.urdf):
+    #   link_eef → calibration_mount (+0.0025 m Z)
+    #            → flange_link (+0.0025 m Z)
+    #            → custom_eef_link (+0.043 m Z, RotY(-π/2))
+    #            → right_hand_link (-0.005 m X, RotY(+π/2))
+    #
+    # custom_eef_link = link_eef + (0, 0, 0.048) m, RotY(-π/2)  (URDF)
+    # right_hand_link  = link_eef + (0, 0, 0.043) m, identity rel. link_eef  (URDF)
+    #
+    # T_eef_handbase = right_hand_mount_joint origin (from URDF):
+    #   pos = (-0.005, 0, 0) m in custom_eef_link frame
+    #   quat = RotY(+π/2) = [cos(π/4), 0, sin(π/4), 0]
+    #
+    # T_eef_handbase_pos breakdown:
+    #   URDF 原始值   = -0.005 m  (right_hand_mount_joint origin in custom_eef_link)
+    #   物理 flange 修正 = -0.010 m  (URDF 0.043 m → 实测 0.033 m，短 10 mm;
+    #                              link_eef -Z = custom_eef_link +X，故补在 X)
+    #   合计           = -0.015 m
+    #
+    #   inv(T_urdf_ee) ⊗ T_phys_handbase = Pose((-0.015, 0, 0), RotY(+π/2))
+    #
+    # Verified 2026-07-28: URDF-vs-simulation FK = 0.00 mm;
+    # physical correction = -10 mm (0.043→0.033 m, measured on hardware).
+    T_eef_handbase_pos: np.ndarray = field(
+        default_factory=lambda: np.array([-0.015, 0.0, 0.0], dtype=np.float64)
+    )
     T_eef_handbase_quat_wxyz: np.ndarray = field(
-        default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        default_factory=lambda: np.array([0.707107, 0.0, 0.707107, 0.0], dtype=np.float64)
     )
 
     # Unified collision configuration.

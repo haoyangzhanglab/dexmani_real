@@ -66,14 +66,10 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
-from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ Keyboard (pynput, 全局捕获)
-
-
-# ═══════════════════════════════════════════════ TrajectoryLogger 已提取至 dexmani_real.utils.trajectory_logger
 
 
 # ═══════════════════════════════════════════════ 配置
@@ -88,7 +84,7 @@ HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
 WORKSPACE_BOUNDS = np.array(
     [
-        [0.24, 0.72],  # x [min, max] m
+        [0.28, 0.72],  # x [min, max] m
         [-0.50, 0.50],  # y [min, max] m
         [0.05, 0.5],  # z [min, max] m
     ],
@@ -353,11 +349,7 @@ def main():
         use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
-    # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
-    traj_logger = TrajectoryLogger()
-    _traj_path: str | None = None  # set per-episode at B key
-
-    # ── 7c. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
+    # ── 7b. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
     stage_timer = StageTimer(window=STATUS_EVERY)
 
     # ── 8. Keyboard ──
@@ -504,8 +496,6 @@ def main():
                 if path:
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
-                    # 同时清理侧车文件 (trajectory .npz, sidecar .json)
-                    h5.with_suffix(".npz").unlink(missing_ok=True)
                     h5.with_suffix(".json").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
@@ -743,11 +733,6 @@ def main():
                         skip_rest = True
                         continue
                     recording_active = True
-                    # Per-episode NPZ filename (aligns with HDF5 timestamp)
-                    _traj_save_dir = Path("trajectories")
-                    _traj_save_dir.mkdir(parents=True, exist_ok=True)
-                    _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
-                    traj_logger.clear()
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
                     # Heading calibration: align user's facing direction → robot +X
@@ -1060,29 +1045,6 @@ def main():
             ik_solve_time_ms = (time.perf_counter() - _ik_t0) * 1000.0
             stage_timer.mark("ik")
 
-            # ── Trajectory debug record (before continue on fail) ──
-            # 与 HDF5 录制严格对齐: 仅当 HDF5 本帧会成功写入时才记录。
-            # max_frames_reached 标志在 add_frame() 内部检测到 _frame_count>=max
-            # 时才置位, 滞后 1 个迭代 — 必须用 frame_count (即时更新) 而非
-            # max_frames_reached (滞后标志) 做 guard, 避免多写一帧 (NPZ vs HDF5 差 1)。
-            _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
-            _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            if recording_active and recorder.frame_count < recorder.max_frames:
-                traj_logger.append(
-                    t=time.perf_counter() - start_time,
-                    wrist_pos=vr_frame["wrist_pos"],
-                    wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                    target_pos=target_pos,
-                    target_quat_wxyz=target_quat,
-                    actual_eef_pos=state.eef_pos,
-                    actual_eef_quat_wxyz=state.eef_quat_wxyz,
-                    arm_qpos_actual=state.arm_qpos,
-                    ik_ok=ik_result.success and ik_result.qpos is not None,
-                    wrist_delta=_wrist_d,
-                    eef_delta=_eef_d,
-                    target_pos_before_clamp=target_pos_before_clamp,
-                )
-
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
                 if recording_active:
@@ -1103,9 +1065,18 @@ def main():
                 # Keep feeding last-good to prevent inner-loop timeout (which would
                 # reset _last_sent_cmd to held-current, losing the actual sent baseline).
                 arm_inner.set_target(prev_qpos_cmd.copy())
+                # Send hand hold position even when IK fails — prevents cmd ring stale.
+                if hand_available:
+                    _hold_hand = (
+                        state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos))
+                        else prev_hand_qpos.copy()
+                    )
+                    robot.send_action(RobotAction(
+                        arm_qpos_cmd=prev_qpos_cmd.copy(),
+                        hand_qpos_cmd=_hold_hand,
+                    ))
+                    prev_hand_qpos = _hold_hand.copy()
                 continue
-
-            ik_method = "ok"
             # Joint-space IK output gate: reject IK solutions pathologically far
             # from the IK seed (prev_qpos_cmd).  Using state.arm_qpos (physical arm
             # position) would conflate tracking lag with IK quality — at high speed
@@ -1144,6 +1115,17 @@ def main():
                             diagnostics=_diag, ik_attempted=True,
                         )
                     arm_inner.set_target(prev_qpos_cmd.copy())
+                    # IK output rejected — send hand hold position to prevent cmd ring stale.
+                    if hand_available:
+                        _hold_hand = (
+                            state.hand_qpos.copy() if np.all(np.isfinite(state.hand_qpos))
+                            else prev_hand_qpos.copy()
+                        )
+                        robot.send_action(RobotAction(
+                            arm_qpos_cmd=prev_qpos_cmd.copy(),
+                            hand_qpos_cmd=_hold_hand,
+                        ))
+                        prev_hand_qpos = _hold_hand.copy()
                     continue
             # IK success + gate passed: update EMA state so the next frame's
             # smoothing starts from a reachable target.  Freezing during failures
@@ -1178,6 +1160,7 @@ def main():
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
                 actual_hand_current=state.hand_current,
+                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
@@ -1265,14 +1248,6 @@ def main():
                 print("\n  ⚠ 正在等待写盘完成，请勿中断…", flush=True)
         if recorder.stop_error:
             print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
-
-        # ── 保存轨迹 debug 数据 ──
-        if _traj_path is not None and len(traj_logger) > 0:
-            try:
-                saved = traj_logger.save(_traj_path)
-                print(f"\n轨迹已保存: {saved}  ({len(traj_logger)} 帧)")
-            except (OSError, ValueError) as e:
-                print(f"\n轨迹保存失败: {e}")
 
         print("\n退出主循环")
 

@@ -63,7 +63,7 @@ logger = get_logger(__name__)
 
 HOME_DT = 0.04  # homing waypoint interval (s)
 
-WORKSPACE_BOUNDS = np.array([[0.24, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np.float64)
+WORKSPACE_BOUNDS = np.array([[0.28, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np.float64)
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
@@ -779,6 +779,21 @@ class TrajectoryReplayer:
 
         target_pose = Pose(p=target_pos, q=target_quat)
 
+        # ── Sync hand qpos for accurate 19-DOF collision checks ──
+        # CollisionModel (hand_dof=True) uses hand geometry in env/self
+        # collision checks.  Without this sync it falls back to all-zero
+        # (open-hand) pose — fingers maximally extended, ~7.6 cm below EEF
+        # — which can cause phantom table collisions during path validation.
+        # Pattern matches _sync_hand_collision_model() in interface.py.
+        if self._hand_available and self.robot is not None:
+            try:
+                hand_state = self.robot.get_state()
+                hq = hand_state.hand_qpos
+                if hq is not None and np.all(np.isfinite(hq)):
+                    self.planner.set_hand_qpos(hq)
+            except Exception:
+                pass  # non-critical: planning proceeds with open-hand fallback
+
         # ── Plan ──
         try:
             path_result = self.planner.plan_path(
@@ -975,6 +990,7 @@ class TrajectoryReplayer:
                     actual_arm_qvel=state.arm_qvel,
                     actual_arm_tau=state.arm_tau,
                     actual_hand_current=state.hand_current,
+                    actual_hand_tactile_sum=state.hand_tactile_sum,
                 )
                 if not action_valid:
                     validate_fail_count += 1

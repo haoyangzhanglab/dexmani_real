@@ -46,6 +46,8 @@ CAM_DUP_WARN_MARGIN_PCT = 15.0  # camera dup% above the rate-derived baseline
 TRACK_P95_WARN_DEG = 20.0
 FREEZE_REPORT_MIN_S = 0.2  # only list camera freeze runs at least this long
 HAND_TRACK_P95_WARN_DEG = 20.0
+TACTILE_ALLZERO_WARN_PCT = 90.0  # warn if >X% of frames have zero force on a finger
+TACTILE_TIPBOARD_ERR_WARN = 1  # warn if any tipboard_err non-zero
 
 
 def _runs_of(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -157,6 +159,83 @@ def _check_hand_tracking(f: h5py.File, thresh_rad: float) -> float | None:
     return float(np.degrees(p95))
 
 
+def _check_tactile(f: h5py.File) -> dict[str, float | None]:
+    """Print tactile data health stats; return per-finger zero-force percentages.
+
+    Checks:
+      - Whether tactile datasets exist (hand_tactile_force, hand_contact)
+      - Per-finger force all-zero ratio (inactive sensor warning)
+      - NaN contamination
+      - tipboard_err non-zero presence (hardware sensor fault flag)
+    """
+    SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
+
+    result: dict[str, float | None] = {name: None for name in SENSOR_NAMES}
+
+    # ── Per-finger force from hand_contact (5,3) ──
+    if "hand_contact" not in f:
+        print("  触觉: hand_contact 缺失 — 跳过")
+        return result
+
+    force_sum = f["hand_contact"][:]  # (T,5,3)
+    if force_sum.size == 0:
+        print("  触觉: hand_contact 为空 — 跳过")
+        return result
+
+    T = force_sum.shape[0]
+    has_nan = not np.all(np.isfinite(force_sum))
+    nan_pct = 100.0 * float(np.mean(~np.isfinite(force_sum))) if has_nan else 0.0
+
+    # Per-finger L2 norm → zero ratio
+    force_mag = np.linalg.norm(force_sum, axis=2)  # (T,5)
+    zero_pcts = {}
+    for i, name in enumerate(SENSOR_NAMES):
+        zero_pct = 100.0 * float(np.mean(force_mag[:, i] == 0.0))
+        zero_pcts[name] = zero_pct
+        result[name] = zero_pct
+
+    zero_desc = "  ".join(f"{name}={zero_pcts[name]:.1f}%" for name in SENSOR_NAMES)
+    print(f"  触觉力零值率: {zero_desc}")
+    if has_nan:
+        print(f"  触觉 NaN 比例: {nan_pct:.2f}%")
+
+    # ── Per-taxel force from hand_tactile_force (5,120,3) ──
+    if "hand_tactile_force" in f:
+        tactile_force = f["hand_tactile_force"][:]  # (T,5,120,3)
+        if tactile_force.size > 0:
+            taxel_mag = np.linalg.norm(tactile_force, axis=3)  # (T,5,120)
+            # Aggregate across time: mean per taxel
+            mean_taxel_mag = np.mean(taxel_mag, axis=0)  # (5,120)
+            active_taxels_per_finger = np.sum(mean_taxel_mag > 0.0, axis=1)  # (5,)
+            for i, name in enumerate(SENSOR_NAMES):
+                print(f"    {name}: {active_taxels_per_finger[i]}/120 active taxels  "
+                      f"max_taxel_mag={np.max(mean_taxel_mag[i]):.3f} N")
+    else:
+        print("  触觉: hand_tactile_force 缺失 — 跳过细粒度 taxel 检查")
+
+    # ── Contact boolean (hand_tactile_contact) ──
+    if "hand_tactile_contact" in f:
+        contact = f["hand_tactile_contact"][:]  # (T,5) bool
+        contact_pcts = {}
+        for i, name in enumerate(SENSOR_NAMES):
+            contact_pcts[name] = 100.0 * float(np.mean(contact[:, i])) if contact.shape[0] > 0 else 0.0
+        contact_desc = "  ".join(f"{name}={contact_pcts[name]:.1f}%" for name in SENSOR_NAMES)
+        print(f"  触觉接触率: {contact_desc}")
+
+    # ── Tipboard errors ──
+    if "hand_tipboard_err" in f:
+        tipboard = f["hand_tipboard_err"][:]  # (T,12) int32
+        n_errs = int(np.sum(tipboard != 0))
+        if n_errs > 0:
+            # Which joints had errors
+            err_joints = np.where(np.any(tipboard != 0, axis=0))[0]
+            print(f"  tipboard_err: {n_errs} non-zero entries  affected_joints={err_joints.tolist()}")
+        else:
+            print("  tipboard_err: 全部为 0 (ok)")
+
+    return result
+
+
 def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[str]:
     """Run all checks on one episode; return the WARN lines."""
     warns: list[str] = []
@@ -204,6 +283,17 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
         hand_p95_deg = _check_hand_tracking(f, track_thresh_rad)
         if hand_p95_deg is not None and hand_p95_deg > HAND_TRACK_P95_WARN_DEG:
             warns.append(f"手跟踪误差 p95 {hand_p95_deg:.1f}° > {HAND_TRACK_P95_WARN_DEG:.0f}° — 手跟踪滞后")
+
+        tactile_zero_pcts = _check_tactile(f)
+        for finger_name, zero_pct in tactile_zero_pcts.items():
+            if zero_pct is not None and zero_pct > TACTILE_ALLZERO_WARN_PCT:
+                warns.append(f"触觉 {finger_name} 零值率 {zero_pct:.1f}% > {TACTILE_ALLZERO_WARN_PCT:.0f}% — 传感器可能未初始化(需reset_sensor)或硬件故障")
+
+        # Check tipboard_err for non-zero entries (hardware sensor faults)
+        if "hand_tipboard_err" in f:
+            tipboard = f["hand_tipboard_err"][:]
+            if int(np.sum(tipboard != 0)) > TACTILE_TIPBOARD_ERR_WARN:
+                warns.append(f"hand_tipboard_err 存在非零项 — 指尖 PCB 板级传感器故障")
 
         flags = [k for k in ("flag_ik_ok", "flag_held", "flag_camera_fresh", "flag_retarget_ok") if k in f]
         if flags:

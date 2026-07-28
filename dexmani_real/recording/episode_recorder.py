@@ -445,6 +445,8 @@ class EpisodeRecorder:
             "hand_fingertip": np.asarray(state.fingertip_pos, dtype=np.float64),
             "hand_contact": np.asarray(state.hand_tactile_sum, dtype=np.float64),
             "hand_tactile_force": np.asarray(state.hand_tactile_force, dtype=np.float64),
+            "hand_tactile_contact": np.asarray(state.hand_tactile_contact, dtype=bool),
+            "hand_tipboard_err": np.asarray(state.hand_tipboard_err, dtype=np.int32),
             "hand_current": np.asarray(state.hand_current, dtype=np.float64) if state.hand_current is not None else np.full(12, np.nan),
             # ── Connection status ──
             # Distinguishes "physically disconnected (NaN qpos + connected=False)"

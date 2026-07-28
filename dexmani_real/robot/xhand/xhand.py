@@ -98,18 +98,18 @@ class XHandConfig(FromDictMixin):
         default_factory=lambda: np.deg2rad(
             np.array(
                 [
-                    0.0,
-                    45.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
+                    0.0,   # J0  thumb_abd     min  0° (straight)
+                    45.0,  # J1  thumb_j1      min -40°, home at 45° (half-flexed)
+                    10.0,  # J2  thumb_j2      min 10° (prevent mechanical clogging)
+                    0.0,   # J3  index_abd     min -10°, home at 0° (straight)
+                    0.0,   # J4  index_j1      min  0° (straight)
+                    5.0,   # J5  index_j2      min  5° (prevent mechanical clogging)
+                    0.0,   # J6  middle_j1     min  0° (straight)
+                    5.0,   # J7  middle_j2     min  5° (prevent mechanical clogging)
+                    0.0,   # J8  ring_j1       min  0° (straight)
+                    5.0,   # J9  ring_j2       min  5° (prevent mechanical clogging)
+                    0.0,   # J10 little_j1     min  0° (straight)
+                    5.0,   # J11 little_j2     min  5° (prevent mechanical clogging)
                 ],
                 dtype=np.float64,
             )
@@ -167,7 +167,7 @@ class XHandConfig(FromDictMixin):
         },
     )
 
-    kp: int = 80  # ref: LeFranX xhand_config.py:22
+    kp: int = 100  # ref: LeFranX xhand_config.py:22
     ki: int = 0  # ref: LeFranX xhand_config.py:23
     kd: int = 0  # ref: LeFranX xhand_config.py:24
     # Per-joint gain overrides (ref: DexUMI hand_api_cls.py:317-319).
@@ -178,7 +178,7 @@ class XHandConfig(FromDictMixin):
     ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
     kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
     tor_max: int = (
-        300  # max 320mA; ref: LeFranX xhand_config.py:25 (400), DexUMI hand_api_cls.py:289 (400). Reduced to 300 for safety margin per XHand spec.
+        320  # max 320mA; ref: LeFranX xhand_config.py:25 (400), DexUMI hand_api_cls.py:289 (400). Set to 320 per XHand hardware spec limit.
     )
     mode: int = 3
 
@@ -202,7 +202,9 @@ class XHandConfig(FromDictMixin):
 
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
-    tactile_contact_threshold: float = 10.0  # raw sensor units (ref: DexUMI eval_xhand.py:72 binary_cutoff=[10,10,10])
+    # Values are in Newtons (parse_tactile_sum divides SDK raw readings by 10).
+    # 1.0 N ≈ light touch; ref: DexUMI eval_xhand.py:72 binary_cutoff=[10,10,10] (raw).
+    tactile_contact_threshold: float = 1.0
 
 
 class XHand(ConnectionStateMixin):
@@ -254,11 +256,28 @@ class XHand(ConnectionStateMixin):
         try:
             self.last_hand_ids = list(self.control.list_hands_id())
         except (OSError, RuntimeError):
+            logger.warning("XHand list_hands_id() failed — no hands enumerated", exc_info=True)
             self.last_hand_ids = []
+
+        if self.config.device_id not in self.last_hand_ids:
+            logger.error(
+                "Configured device_id=%d not found in enumerated hands %s",
+                self.config.device_id,
+                self.last_hand_ids,
+            )
+            self.error_state = True
+            try:
+                self.control.close_device()
+            except (OSError, RuntimeError):
+                pass
+            return False
 
         self.connected_flag = True
         self.error_state = False
         self._consecutive_send_errors = 0
+
+        self._verify_device()
+
         self.hand_command = self.make_command(self._array12(self.config.home_qpos))
 
         self._init_hand_state()
@@ -320,7 +339,11 @@ class XHand(ConnectionStateMixin):
                 self.control = xhc.XHandControl()
                 time.sleep(delay)
 
-        # All retries exhausted
+        # All retries exhausted — close the last failed device handle
+        try:
+            self.control.close_device()
+        except (OSError, RuntimeError):
+            pass
         self.error_state = True
         logger.error(
             "XHand connect failed after %s attempts: %s",
@@ -355,6 +378,77 @@ class XHand(ConnectionStateMixin):
             self.last_qpos_cmd = self._array12(self.config.home_qpos)
             logger.info("Using home_qpos as initial qpos: %s", self.last_qpos_cmd)
 
+        # ── Tactile sensor initialisation ──
+        # Reset all five fingertip sensors after power-on.  The SDK documents
+        # that some sensors may need an explicit reset before they begin
+        # reporting data (sensor IDs 17–21: thumb, index, middle, ring, little).
+        # Failures are logged but do not block operation — a dead sensor is
+        # less harmful than a refused connection.
+        self._reset_tactile_sensors()
+
+    def _reset_tactile_sensors(self) -> None:
+        """Reset all five fingertip tactile sensors (sensor IDs 17–21).
+
+        Per SDK documentation, some usage scenarios require an explicit sensor
+        reset before data is reported.  This is called once at connect time;
+        individual sensor failures are logged but are non-fatal.
+        """
+        if self._stub_mode:
+            return
+        device_id = self.config.device_id
+        for sensor_id in range(17, 22):  # 17=thumb, 18=index, 19=middle, 20=ring, 21=little
+            try:
+                err = self.control.reset_sensor(device_id, sensor_id)
+                if not self.error_ok(err):
+                    logger.warning(
+                        "Tactile sensor %d reset failed: code=%s msg=%s",
+                        sensor_id,
+                        self.error_code(err),
+                        str(getattr(err, "error_message", "")),
+                    )
+            except Exception:
+                logger.warning("Tactile sensor %d reset raised exception", sensor_id, exc_info=True)
+
+    def _verify_device(self) -> None:
+        """Log hardware identity for diagnostics (non-fatal — never blocks connect).
+
+        Calls SDK introspection methods: SDK version, hand type (left/right),
+        and serial number.  Failures are logged at WARNING level but do not
+        set error_state or prevent operation.
+        """
+        device_id = self.config.device_id
+
+        # SDK version
+        try:
+            ver = self.control.get_sdk_version()
+            logger.info("XHand SDK version: %s", ver)
+        except Exception:
+            logger.warning("XHand SDK version: unavailable", exc_info=True)
+
+        # Hand type (left / right)
+        try:
+            err, hand_type = self.control.get_hand_type(device_id)
+            if self.error_ok(err):
+                logger.info("XHand hand type: %s (device_id=%d)", hand_type, device_id)
+            else:
+                code = self.error_code(err)
+                msg = str(getattr(err, "error_message", ""))
+                logger.warning("XHand get_hand_type failed: code=%s msg=%s", code, msg)
+        except Exception:
+            logger.warning("XHand get_hand_type: unavailable", exc_info=True)
+
+        # Serial number
+        try:
+            err, serial = self.control.get_serial_number(device_id)
+            if self.error_ok(err):
+                logger.info("XHand serial: %s", serial)
+            else:
+                code = self.error_code(err)
+                msg = str(getattr(err, "error_message", ""))
+                logger.warning("XHand get_serial_number failed: code=%s msg=%s", code, msg)
+        except Exception:
+            logger.warning("XHand get_serial_number: unavailable", exc_info=True)
+
     def disconnect(self):
         if self._stub_mode:
             self.connected_flag = False
@@ -384,6 +478,7 @@ class XHand(ConnectionStateMixin):
             "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
             "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
             "tactile_contact": np.zeros(5, dtype=bool),
+            "tipboard_err": np.zeros(12, dtype=np.int32),
         }
         if full:
             state.update(self._empty_state())
@@ -435,6 +530,7 @@ class XHand(ConnectionStateMixin):
             self._consecutive_send_errors,
             self.last_error_code,
         )
+        self._consecutive_send_errors = 0  # explicit reset, not relying on connect() side effect
         try:
             self.disconnect()
         except Exception:
@@ -495,6 +591,7 @@ class XHand(ConnectionStateMixin):
                 "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
                 "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
                 "tactile_contact": np.zeros(5, dtype=bool),
+                "tipboard_err": np.zeros(12, dtype=np.int32),
             }
             if full:
                 state.update(self._empty_state())
@@ -504,12 +601,16 @@ class XHand(ConnectionStateMixin):
         self.last_error_code = 0
         self.last_error_message = ""
         # Bridge board-status (Layer 2) into safety gate: per-joint hardware
-        # board error registers must set error_state so validate_action()
-        # can gate commands on hardware-level faults.
-        if (np.any(np.asarray(state["commboard_err"], dtype=np.int32))
-                or np.any(np.asarray(state["jointboard_err"], dtype=np.int32))
-                or np.any(np.asarray(state["tipboard_err"], dtype=np.int32))):
-            self.error_state = True
+        # board error registers gate commands on hardware-level faults.
+        # Unlike send/read errors (tracked via _record_error +
+        # _consecutive_send_errors watchdog), board errors are transient —
+        # auto-clear when hardware status returns to normal (no manual
+        # clear_error() needed after an RS485 glitch).
+        self.error_state = bool(
+            np.any(np.asarray(state["commboard_err"], dtype=np.int32))
+            or np.any(np.asarray(state["jointboard_err"], dtype=np.int32))
+            or np.any(np.asarray(state["tipboard_err"], dtype=np.int32))
+        )
         return state
 
     def send_action(self, action: np.ndarray) -> bool:
@@ -659,7 +760,7 @@ class XHand(ConnectionStateMixin):
 
         ok = True
         for i in range(n_steps):
-            if abort_event is not None and abort_event.is_set():
+            if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
                 logger.info("XHand.send_trajectory: aborted at step %d/%d (abort event set).", i, n_steps)
                 ok = False
                 break
@@ -777,39 +878,73 @@ class XHand(ConnectionStateMixin):
             )
         return state
 
+    # Sensor-to-finger mapping: _SENSOR_FINGER_IDS maps each sensor_data
+    # positional index to its expected finger ID (from the C struct layout:
+    # thumb_sensor_data first, then other_sensor_data[4]).
+    # See xhand_controller data_type.py SenserData struct.
+    _SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)  # thumb, index, middle, ring, little
+
     def _iter_sensors(self, hand_state):
         sensor_data = getattr(hand_state, "sensor_data", None)
         if not sensor_data:
-            return enumerate([])
-        return enumerate(list(sensor_data)[:5])
+            return
+        count = 0
+        for i, sensor in enumerate(sensor_data):
+            if i >= len(self._SENSOR_FINGER_IDS):
+                break
+            count += 1
+            # If the SDK exposes a sensor-level id, validate it against the
+            # expected finger ID; if not (pybind11 may omit it), skip silently.
+            sid = getattr(sensor, "id", None)
+            if sid is not None and int(sid) != self._SENSOR_FINGER_IDS[i]:
+                logger.warning(
+                    "Sensor %d: expected finger id %d, got %d — tactile finger mapping may be wrong",
+                    i,
+                    self._SENSOR_FINGER_IDS[i],
+                    int(sid),
+                )
+            yield i, sensor
+        if count != len(self._SENSOR_FINGER_IDS):
+            logger.warning(
+                "Expected %d sensor_data entries, got %d — tactile may be misaligned",
+                len(self._SENSOR_FINGER_IDS),
+                count,
+            )
 
     def parse_tactile(self, hand_state) -> np.ndarray:
-        """Parse raw tactile force array (5 fingers × 120 points × 3 axes).
+        """Parse tactile force array (5 fingers × 120 points × 3 axes).
 
-        Returns raw sensor values without scaling (ref: DexUMI, skill-teleop).
+        Returns force values in Newtons.  The SDK returns raw integer readings
+        at 10 LSB/N (sensitivity spec); we divide by 10 to obtain physical units.
         """
         tactile = np.zeros((5, 120, 3), dtype=np.float64)
         for i, sensor in self._iter_sensors(hand_state):
-            raw_force = getattr(sensor, "raw_force", [])
-            for j, force in enumerate(list(raw_force)[:120]):
-                tactile[i, j, 0] = float(getattr(force, "fx", 0.0))
-                tactile[i, j, 1] = float(getattr(force, "fy", 0.0))
-                tactile[i, j, 2] = float(getattr(force, "fz", 0.0))
+            raw_force = getattr(sensor, "raw_force", None)
+            if raw_force is None:
+                continue
+            for j, force in enumerate(raw_force):
+                if j >= 120:
+                    break
+                tactile[i, j, 0] = float(getattr(force, "fx", 0.0)) * 0.1
+                tactile[i, j, 1] = float(getattr(force, "fy", 0.0)) * 0.1
+                tactile[i, j, 2] = float(getattr(force, "fz", 0.0)) * 0.1
         return tactile
 
     def parse_tactile_sum(self, hand_state) -> np.ndarray:
         """Parse combined force per finger (5 × 3 axes).
 
-        Returns raw sensor values without scaling (ref: DexUMI, skill-teleop).
+        Returns force values in Newtons.  The SDK returns raw integer readings
+        at 10 LSB/N (sensitivity spec); we divide by 10 to obtain physical units.
         """
         force_sum = np.zeros((5, 3), dtype=np.float64)
         for i, sensor in self._iter_sensors(hand_state):
             calc_force = getattr(sensor, "calc_force", None)
             if calc_force is None:
                 continue
-            force_sum[i, 0] = float(getattr(calc_force, "fx", 0.0))
-            force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0))
-            force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0))
+            force_sum[i, 0] = float(getattr(calc_force, "fx", 0.0)) * 0.1
+            force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0)) * 0.1
+            force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0)) * 0.1
+        return force_sum
         return force_sum
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
@@ -845,6 +980,7 @@ class XHand(ConnectionStateMixin):
             "tipboard_err": np.zeros(12, dtype=np.int32),
             "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
             "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
+            "tactile_contact": np.zeros(5, dtype=bool),
             "connected_flag": self.connected_flag,
             "error_state": self.error_state,
             "last_action_code": self.last_action_code,
@@ -867,21 +1003,18 @@ class XHand(ConnectionStateMixin):
         return self.config.comm_type
 
     def _unpack_result(self, result):
-        if isinstance(result, (tuple, list)):
-            if len(result) >= 2:
-                return result[0], result[1]
-
-        if isinstance(result, dict):
-            items = list(result.items())
-            if len(items) > 0:
-                return items[0][0], items[0][1]
-
+        # The SDK always returns tuple[ErrorStruct, HandState_t].
+        if isinstance(result, (tuple, list)) and len(result) >= 2:
+            return result[0], result[1]
         return None, None
 
     def error_code(self, err) -> int | None:
         if err is None:
             return None
-        return int(getattr(err, "error_code", -1))
+        code = getattr(err, "error_code", -1)
+        if code is None:
+            code = -1
+        return int(code)
 
     def error_ok(self, err) -> bool:
         return err is not None and self.error_code(err) == 0

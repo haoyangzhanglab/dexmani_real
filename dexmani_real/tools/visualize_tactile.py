@@ -6,13 +6,13 @@ Reads /hand_tactile_force (T, 5, 120, 3) from an HDF5 episode and produces:
   plot force_timeline  — per-finger total force (L2-norm) over time
   plot force_heatmap   — force magnitude heatmap for a single frame (5 fingers × 120 sensors)
   plot force_3axis     — fx/fy/fz breakdown for one finger over time
-  dump contact_frames  — list frames where per-finger force exceeds a threshold
+  plot contact_frames  — list frames where per-finger force exceeds a threshold
 
 Usage:
   python tools/visualize_tactile.py episodes/episode_20260725_120000.h5 force_timeline
   python tools/visualize_tactile.py episodes/episode_20260725_120000.h5 force_heatmap --frame 100
   python tools/visualize_tactile.py episodes/episode_20260725_120000.h5 force_3axis --finger thumb
-  python tools/visualize_tactile.py episodes/episode_20260725_120000.h5 contact_frames --threshold 5.0
+  python tools/visualize_tactile.py episodes/episode_20260725_120000.h5 contact_frames --threshold 1.0
 """
 
 from __future__ import annotations
@@ -57,14 +57,14 @@ def cmd_timeline(args: argparse.Namespace) -> None:
         ax.plot(t, total[:, i], label=name, linewidth=0.8)
 
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Total force (raw sensor units)")
+    ax.set_ylabel("Total force (Newtons)")
     ax.set_title(f"Per-finger Tactile Force — {Path(args.episode).name}")
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
 
     # Mark frames with significant contact
     if args.mark_contacts:
-        threshold = args.threshold if args.threshold > 0 else np.percentile(total[total > 0], 50) if np.any(total > 0) else 10.0
+        threshold = args.threshold if args.threshold > 0 else np.percentile(total[total > 0], 50) if np.any(total > 0) else 1.0
         for i in range(5):
             contact = total[:, i] > threshold
             changes = np.diff(contact.astype(int))
@@ -102,7 +102,7 @@ def cmd_heatmap(args: argparse.Namespace) -> None:
 
     axes[-1].set_xlabel("Sensor index (0–119)")
     fig.suptitle(f"Tactile Force Heatmap — frame {frame} — {Path(args.episode).name}", fontsize=11)
-    fig.colorbar(im, ax=axes, label="Force magnitude (raw units)", shrink=0.6)
+    fig.colorbar(im, ax=axes, label="Force magnitude (N)", shrink=0.6)
 
     plt.tight_layout()
     if args.output:
@@ -149,7 +149,7 @@ def cmd_contact_frames(args: argparse.Namespace) -> None:
     mag = _force_magnitude(tactile)  # (T, 5, 120)
     total = mag.sum(axis=-1)  # (T, 5)
 
-    threshold = args.threshold if args.threshold > 0 else 5.0
+    threshold = args.threshold if args.threshold > 0 else 1.0
     fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
 
     print(f"{'frame':>6s}  {'time_s':>8s}  " + "  ".join(f"{n:>8s}" for n in FINGER_NAMES))
@@ -177,7 +177,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p1 = sub.add_parser("force_timeline", help="Per-finger total force over time")
-    p1.add_argument("--threshold", type=float, default=0.0, help="Contact threshold (raw units; default=auto)")
+    p1.add_argument("--threshold", type=float, default=0.0, help="Contact threshold (Newtons; default=auto)")
     p1.add_argument("--mark-contacts", action="store_true", help="Mark contact start frames")
     p1.add_argument("-o", "--output", help="Save to file instead of showing")
 
@@ -190,7 +190,7 @@ def main() -> None:
     p3.add_argument("-o", "--output", help="Save to file instead of showing")
 
     p4 = sub.add_parser("contact_frames", help="List contact events")
-    p4.add_argument("--threshold", type=float, default=5.0, help="Contact threshold (raw units)")
+    p4.add_argument("--threshold", type=float, default=1.0, help="Contact threshold (Newtons)")
 
     args = parser.parse_args()
     {"force_timeline": cmd_timeline, "force_heatmap": cmd_heatmap, "force_3axis": cmd_3axis, "contact_frames": cmd_contact_frames}[args.command](args)

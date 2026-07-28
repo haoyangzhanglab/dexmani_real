@@ -99,7 +99,9 @@ HAND_STATE_DTYPE = np.dtype(
         ("last_cmd_seq", "u8"),  # echoes the hand_cmd ring sequence processed
         ("tactile_sum", "<f8", (5, 3)),
         ("tactile_force", "<f8", (5, 120, 3)),  # 14.4KB/frame, full recording bandwidth (D3)
-        ("connected", "u1"),
+        ("tactile_contact", "u1", (5,)),  # per-finger contact boolean (from detect_contact)
+        ("tipboard_err", "<i4", (12,)),  # tip board error registers per joint
+        ("connected_flag", "u1"),  # raw SDK flag (not composited with error_state)
         ("error_state", "u1"),
         ("consecutive_errs", "u4"),
         ("last_error_code", "i8"),

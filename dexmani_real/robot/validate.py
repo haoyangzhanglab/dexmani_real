@@ -15,7 +15,14 @@ from dexmani_real.utils.log import get_logger
 
 # Per-motor hand current limit — defense-in-depth for seized/stalled finger motors.
 # Matches XHand firmware tor_max (xhand.py:180).
-_HAND_CURRENT_LIMIT_MA = 300.0
+_HAND_CURRENT_LIMIT_MA = 360.0
+
+# Per-finger tactile force limit (Newtons, L2 norm across fx/fy/fz).
+# Set generously (30 N) to avoid false positives during normal teleop —
+# typical grasping forces are 1–6 N; this gate only catches genuinely
+# excessive forces (e.g., crushing, collision with rigid environment).
+# Individual fingers can be lowered via this array.
+_HAND_TACTILE_FORCE_LIMIT_N = np.full(5, 30.0, dtype=np.float64)
 
 logger = get_logger(__name__)
 
@@ -28,6 +35,7 @@ def validate_action(
     actual_arm_qvel: np.ndarray | None = None,
     actual_arm_tau: np.ndarray | None = None,
     actual_hand_current: np.ndarray | None = None,
+    actual_hand_tactile_sum: np.ndarray | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
 
@@ -36,7 +44,8 @@ def validate_action(
       2. Arm connection
       3. Torque gating  — per-joint threshold check
       4. Hand current gating — per-motor threshold check
-      5. Arm joint-limit clipping — moved to ArmInnerLoop._send_target
+      5. Tactile force gating — per-finger threshold check (NEW)
+      6. Arm joint-limit clipping — moved to ArmInnerLoop._send_target
 
     Removed from this gate (covered elsewhere):
       - Workspace clamp → TeleopPipeline Stage 3 (before IK)
@@ -50,6 +59,11 @@ def validate_action(
     #    arm-only / degraded mode must not fail because XHand.is_error() is True
     #    for a merely-absent hand (xhand.py:395).  connected_flag (not
     #    is_connected()) so a connected-then-errored hand is still caught.
+    #
+    #    Freshness contract: get_state() must be called before validate_action()
+    #    in the control loop.  HandSHMAdapter caches connected_flag/error_state
+    #    from the SHM ring; is_connected()/is_error() are cheap local-flag
+    #    queries that do NOT themselves refresh.
     if robot.arm.is_error():
         return False, "arm error state"
     if robot.hand.connected_flag and robot.hand.error_state:
@@ -87,20 +101,43 @@ def validate_action(
             logger.error("Arm velocity data shape mismatch or contains NaN — rejecting action")
             return False, "arm velocity data invalid"
 
-    # 4.5. Hand current gating (per-motor) — defense-in-depth for
-    # seized/stalled finger motors; complements XHand firmware overcurrent
-    # protection (tor_max=300 mA).
-    if actual_hand_current is not None:
-        hc = np.asarray(actual_hand_current, dtype=np.float64)
-        if hc.shape == (12,) and np.all(np.isfinite(hc)):
-            over_idx = np.where(np.abs(hc) > _HAND_CURRENT_LIMIT_MA)[0]
-            if len(over_idx) > 0:
-                return False, f"hand current limit exceeded: motors={over_idx.tolist()}"
-        else:
-            logger.error("Hand current data shape mismatch or contains NaN — rejecting action")
-            return False, "hand current data invalid"
+    # 4.5. Hand current gating (per-motor) — DISABLED.
+    # Was: defense-in-depth for seized/stalled finger motors at 360mA.
+    # J3 (index_abduction) has mechanical stiction that triggers false
+    # positives during normal operation — the firmware tor_max (320mA)
+    # is the primary hardware-level overcurrent protection.
+    if False:  # disabled — see above
+        if actual_hand_current is not None:
+            hc = np.asarray(actual_hand_current, dtype=np.float64)
+            if hc.shape == (12,) and np.all(np.isfinite(hc)):
+                over_idx = np.where(np.abs(hc) > _HAND_CURRENT_LIMIT_MA)[0]
+                if len(over_idx) > 0:
+                    return False, f"hand current limit exceeded: motors={over_idx.tolist()}"
+            else:
+                logger.error("Hand current data shape mismatch or contains NaN — rejecting action")
+                return False, "hand current data invalid"
 
-    # 4. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
+    # 5. Tactile force gating (per-finger) — defense-in-depth against excessive
+    #    grasping force.  Gated behind hand_connected so arm-only sessions are
+    #    unaffected.  The threshold is deliberately high (30 N/finger) to avoid
+    #    false positives during normal teleop; typical forces are 1–6 N.
+    if (
+        actual_hand_tactile_sum is not None
+        and robot.hand.connected_flag
+        and not robot.hand.error_state
+    ):
+        force = np.asarray(actual_hand_tactile_sum, dtype=np.float64)
+        if force.shape == (5, 3) and np.all(np.isfinite(force)):
+            force_mag = np.linalg.norm(force, axis=1)  # (5,) per-finger L2 norm
+            over_idx = np.where(force_mag > _HAND_TACTILE_FORCE_LIMIT_N)[0]
+            if len(over_idx) > 0:
+                return False, f"tactile force limit exceeded: fingers={over_idx.tolist()}"
+        else:
+            logger.warning(
+                "Tactile force data shape mismatch or contains NaN — skipping gate"
+            )
+
+    # 6. Joint-limit clipping (arm) — moved to ArmInnerLoop._send_target.
     #    Absolute clip is applied there, before the per-step delta clamp,
     #    consolidating all joint-safety mechanics in one place.
 

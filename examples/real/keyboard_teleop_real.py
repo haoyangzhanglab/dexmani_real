@@ -670,6 +670,7 @@ def main():
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
                 actual_hand_current=state.hand_current,
+                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

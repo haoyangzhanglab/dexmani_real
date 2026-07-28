@@ -126,6 +126,12 @@ HAND_MACRO_RESULT_DTYPE = np.dtype(
 _STATE_MAXLEN = 3
 _CMD_MAXLEN = 2
 _MACRO_MAXLEN = 2
+# Echo mismatch tolerance (rad) — the façade's joint-limit clip and the
+# child's safety-net clip are numerically identical (same np.clip), but
+# floating-point round-trip through the SHM ring produces ~1e-4 rad
+# differences.  1e-3 rad ≈ 0.057° is well below the hand's encoder
+# resolution and filters out false positives without masking real anomalies.
+_ECHO_MISMATCH_TOLERANCE_RAD: float = 1e-3
 
 # Plan §5.1: hand ready wait 15 s; failure → degraded mode (connected=False).
 _READY_TIMEOUT_S = 15.0
@@ -445,7 +451,7 @@ class HandSHMFaçade:
         if self._last_good_state is not None:
             rec["qpos"] = self._last_good_state["qpos"]
             rec["last_qpos_cmd"] = self._last_good_state["last_qpos_cmd"]
-        rec["connected"] = 0
+        rec["connected_flag"] = 0
         rec["error_state"] = 1
         return rec
 
@@ -524,9 +530,10 @@ class HandSHMFaçade:
         """Non-blocking echo verification against the child's HAND_STATE.
 
         Tracks ``last_acked_seq``; a child echo seq gap (FILO dropped commands)
-        or a value mismatch (tolerance 0 — the child re-clips with identical
-        joint limits, so a healthy echo equals the written expected_cmd
-        bit-for-bit) → throttled warning + baseline resync
+        or a value mismatch (tolerance 1e-3 rad — the child re-clips with
+        identical joint limits, but floating-point round-trip through the
+        SHM ring produces ~1e-4 rad differences) → throttled warning +
+        baseline resync
         (``_last_qpos_cmd`` ← echo value). All anomalies
         converge into a single detectable event.
         """
@@ -554,13 +561,16 @@ class HandSHMFaçade:
             anomaly = True
 
         expected = self._expected_by_seq.get(echo_seq)
-        if expected is not None and not np.array_equal(expected, echo_val):
-            self._echo_warn(
-                "HandSHMFaçade: echo value mismatch at seq=%d (max diff %.3g) — resyncing baseline.",
-                echo_seq,
-                float(np.max(np.abs(expected - echo_val))),
-            )
-            anomaly = True
+        if expected is not None:
+            max_diff = float(np.max(np.abs(expected - echo_val)))
+            if max_diff > _ECHO_MISMATCH_TOLERANCE_RAD:
+                self._echo_warn(
+                    "HandSHMFaçade: echo value mismatch at seq=%d (max diff %.3g > %.3g rad) — resyncing baseline.",
+                    echo_seq,
+                    max_diff,
+                    _ECHO_MISMATCH_TOLERANCE_RAD,
+                )
+                anomaly = True
 
         if anomaly:
             self._last_qpos_cmd = echo_val.copy()
@@ -714,12 +724,14 @@ def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuf
         frame["temperature"][0] = np.full(12, np.nan, dtype=np.float64)
         frame["tactile_sum"][0] = np.asarray(st["tactile_force_sum"], dtype=np.float64)
         frame["tactile_force"][0] = np.asarray(st["tactile_force"], dtype=np.float64)
+        frame["tactile_contact"][0] = np.asarray(st.get("tactile_contact", np.zeros(5, dtype=bool)), dtype=bool)
+        frame["tipboard_err"][0] = np.asarray(st.get("tipboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
 
     lqc = hand.last_qpos_cmd
     if lqc is not None:
         frame["last_qpos_cmd"][0] = np.asarray(lqc, dtype=np.float64)
     frame["last_cmd_seq"][0] = last_cmd_seq
-    frame["connected"][0] = int(bool(hand.connected_flag))
+    frame["connected_flag"][0] = int(bool(hand.connected_flag))
     frame["error_state"][0] = int(bool(hand.error_state))
     frame["consecutive_errs"][0] = int(hand.consecutive_send_errors)
     frame["last_error_code"][0] = int(hand.last_error_code if hand.last_error_code is not None else 0)
@@ -796,6 +808,43 @@ def _hand_child_main(
             logger.error("hand child: XHand connect failed — degraded mode (hand offline).")
             crashed_event.set()
             return
+
+        # ── Move hand to home_qpos after connection ──
+        # After connect(), the hand holds whatever position it was at.
+        # Explicitly drive it to home_qpos and wait for it to settle before
+        # signalling ready — no teleop commands should arrive while the hand
+        # is still in transit from an arbitrary starting pose.
+        #
+        # Compare against last_qpos_cmd (the actual post-clip command sent
+        # by send_action) rather than raw home_qpos: send_action applies
+        # _limit_joint_range internally, so a future config change that puts
+        # home_qpos outside joint limits won't silently break the settle
+        # check with a false-positive timeout.
+        logger.info("hand child: resetting to home_qpos...")
+        if not hand.reset():
+            logger.warning("hand child: reset() to home_qpos failed — proceeding anyway.")
+        else:
+            # reset() succeeded → last_qpos_cmd is the post-clip target.
+            _home = hand.last_qpos_cmd.copy() if hand.last_qpos_cmd is not None else np.asarray(hand_config.home_qpos, dtype=np.float64)
+            _settle_deadline = time.monotonic() + 3.0
+            _settled = False
+            _max_err = float("nan")
+            while time.monotonic() < _settle_deadline:
+                _st = hand.get_state(force_update=True)
+                _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
+                if np.all(np.isfinite(_qpos)):
+                    _max_err = float(np.max(np.abs(_qpos - _home)))
+                    if _max_err < 0.10:  # ~5.7° — close enough to home
+                        logger.info("hand child: reached home_qpos (max_err=%.3f rad).", _max_err)
+                        _settled = True
+                        break
+                time.sleep(0.05)
+            if not _settled:
+                logger.warning(
+                    "hand child: home_qpos settle timeout (%.1f s, max_err=%.3f rad) — proceeding anyway.",
+                    3.0,
+                    _max_err,
+                )
 
         # Serializes XHand access between the tick loop (send/stop/publish)
         # and the RPC thread (macros). A macro can never hold it for more
@@ -1045,7 +1094,7 @@ class HandSHMAdapter:
             self.connected_flag = False
             self.error_state = True
             return
-        self.connected_flag = bool(rec["connected"][0])
+        self.connected_flag = bool(rec["connected_flag"][0])
         self.error_state = bool(rec["error_state"][0])
         self.last_qpos_cmd = np.asarray(rec["last_qpos_cmd"][0], dtype=np.float64).copy()
 
@@ -1071,13 +1120,13 @@ class HandSHMAdapter:
             logger.warning("HandSHMAdapter.disconnect exception: %s", e)
 
     def is_connected(self) -> bool:
-        rec, _age = self._facade.get_state()
-        self._refresh_status(rec)
+        # Return cached flags — they are refreshed by get_state() (every
+        # control loop tick) and send_action().  Avoids a full SHM ring
+        # read (~14 KB including tactile) on every status query.
         return self.connected_flag and not self.error_state
 
     def is_error(self) -> bool:
-        rec, _age = self._facade.get_state()
-        self._refresh_status(rec)
+        # Same rationale as is_connected() above.
         return (not self.connected_flag) or self.error_state
 
     def clear_error(self) -> bool:
@@ -1127,28 +1176,51 @@ class HandSHMAdapter:
     # ── State (XHand dict shape) ──
 
     def get_state(self, full: bool = False, force_update: bool | None = None) -> dict:
+        """Return hand state dict duck-typed to XHand.get_state().
+
+        Parameters
+        ----------
+        full:
+            When True, also includes connected_flag, error_state, and error
+            fields available in the SHM ring.  Diagnostic fields that only
+            exist in the real SDK (finger_ids, sensor_ids, raw_position,
+            joint_names, etc.) are omitted — SHM carries a fixed subset.
+        force_update:
+            Ignored in SHM mode — the child process always reads hardware
+            at 30 Hz regardless of this flag.
+        """
         rec, _age = self._facade.get_state()
         self._refresh_status(rec)
         if rec is None or not np.all(np.isfinite(np.asarray(rec["qpos"][0], dtype=np.float64))):
-            # Match XHand's read-error contract: NaN qpos, zero tactile.
-            return {
+            state: dict[str, Any] = {
                 "qpos": nan_array(12),
                 "current": np.zeros(12, dtype=np.float64),
                 "timestamp": time.time(),
                 "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
                 "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
                 "tactile_contact": np.zeros(5, dtype=bool),
+                "tipboard_err": np.zeros(12, dtype=np.int32),
             }
-        return {
-            "qpos": np.asarray(rec["qpos"][0], dtype=np.float64).copy(),
-            "current": np.asarray(rec["current"][0], dtype=np.float64).copy(),
-            "temperature": np.asarray(rec["temperature"][0], dtype=np.float64).copy(),
-            "timestamp": time.time(),
-            "tactile_force": np.asarray(rec["tactile_force"][0], dtype=np.float64).copy(),
-            # SHM field is tactile_sum; XHand dict key is tactile_force_sum.
-            "tactile_force_sum": np.asarray(rec["tactile_sum"][0], dtype=np.float64).copy(),
-            "tactile_contact": np.zeros(5, dtype=bool),  # not carried by SHM; derive main-side if needed
-        }
+        else:
+            state = {
+                "qpos": np.asarray(rec["qpos"][0], dtype=np.float64).copy(),
+                "current": np.asarray(rec["current"][0], dtype=np.float64).copy(),
+                "temperature": np.asarray(rec["temperature"][0], dtype=np.float64).copy(),
+                "timestamp": time.time(),
+                "tactile_force": np.asarray(rec["tactile_force"][0], dtype=np.float64).copy(),
+                "tactile_force_sum": np.asarray(rec["tactile_sum"][0], dtype=np.float64).copy(),
+                "tactile_contact": np.asarray(rec["tactile_contact"][0], dtype=bool).copy(),
+                "tipboard_err": np.asarray(rec["tipboard_err"][0], dtype=np.int32).copy(),
+            }
+        if full:
+            state.update({
+                "connected_flag": self.connected_flag,
+                "error_state": self.error_state,
+                "consecutive_errors": int(rec["consecutive_errs"][0]) if rec is not None else 0,
+                "last_error_code": int(rec["last_error_code"][0]) if rec is not None else 0,
+                "limit_clipped": bool(rec["limit_clipped"][0]) if rec is not None else False,
+            })
+        return state
 
     # ── Command (main → child) ──
 

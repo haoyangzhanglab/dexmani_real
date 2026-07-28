@@ -222,11 +222,15 @@ class RobotInterface:
             hand_current = np.asarray(hand_state.get("current", np.zeros(12)), dtype=np.float64)
             hand_tactile_sum = np.asarray(hand_state.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64)
             hand_tactile_force = np.asarray(hand_state.get("tactile_force", np.zeros((5, 120, 3))), dtype=np.float64)
+            hand_tactile_contact = np.asarray(hand_state.get("tactile_contact", np.zeros(5, dtype=bool)), dtype=bool)
+            hand_tipboard_err = np.asarray(hand_state.get("tipboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
         except Exception:
             hand_qpos = nan_array(12)
             hand_current = nan_array(12)
             hand_tactile_sum = nan_array((5, 3))
             hand_tactile_force = nan_array((5, 120, 3))
+            hand_tactile_contact = np.zeros(5, dtype=bool)
+            hand_tipboard_err = np.zeros(12, dtype=np.int32)
 
         # EEF FK
         if np.all(np.isfinite(arm_qpos)):
@@ -252,6 +256,8 @@ class RobotInterface:
             hand_current=hand_current,
             hand_tactile_sum=hand_tactile_sum,
             hand_tactile_force=hand_tactile_force,
+            hand_tactile_contact=hand_tactile_contact,
+            hand_tipboard_err=hand_tipboard_err,
             fingertip_pos=fingertip_pos,
             arm_connected=self.arm.is_connected(),
             hand_connected=self.hand.is_connected(),

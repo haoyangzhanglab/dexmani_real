@@ -60,14 +60,10 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
-from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ Keyboard (pynput, 全局捕获)
-
-
-# ═══════════════════════════════════════════════ TrajectoryLogger 已提取至 dexmani_real.utils.trajectory_logger
 
 
 # ═══════════════════════════════════════════════ 配置
@@ -82,7 +78,7 @@ HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
 WORKSPACE_BOUNDS = np.array(
     [
-        [0.24, 0.72],  # x [min, max] m
+        [0.28, 0.72],  # x [min, max] m
         [-0.50, 0.50],  # y [min, max] m
         [0.05, 0.5],  # z [min, max] m
     ],
@@ -302,13 +298,7 @@ def main():
         use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
-    # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
-    traj_logger = TrajectoryLogger()
-    _traj_save_dir = Path("trajectories")
-    _traj_save_dir.mkdir(parents=True, exist_ok=True)
-    _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
-
-    # ── 7c. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
+    # ── 7b. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
     stage_timer = StageTimer(window=STATUS_EVERY)
 
     # ── 8. Keyboard ──
@@ -448,7 +438,6 @@ def main():
                 if path:
                     h5 = Path(path)
                     h5.unlink(missing_ok=True)
-                    h5.with_suffix(".npz").unlink(missing_ok=True)
                     h5.with_suffix(".json").unlink(missing_ok=True)
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
@@ -817,27 +806,6 @@ def main():
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
             stage_timer.mark("ik")
 
-            # ── Trajectory debug record (before continue on fail) ──
-            # 与 HDF5 录制严格对齐: 仅当 HDF5 本帧会成功写入时才记录。
-            # 用 frame_count (即时更新) 而非 max_frames_reached (滞后标志) 做 guard。
-            _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
-            _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            if recording_active and recorder.frame_count < recorder.max_frames:
-                traj_logger.append(
-                t=time.perf_counter() - start_time,
-                wrist_pos=vr_frame["wrist_pos"],
-                wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                target_pos=target_pos,
-                target_quat_wxyz=target_quat,
-                actual_eef_pos=state.eef_pos,
-                actual_eef_quat_wxyz=state.eef_quat_wxyz,
-                arm_qpos_actual=state.arm_qpos,
-                ik_ok=ik_result.success and ik_result.qpos is not None,
-                wrist_delta=_wrist_d,
-                eef_delta=_eef_d,
-                target_pos_before_clamp=target_pos_before_clamp,
-            )
-
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
                 if recording_active:
@@ -878,6 +846,7 @@ def main():
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
                 actual_hand_current=state.hand_current,
+                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
@@ -926,14 +895,6 @@ def main():
                 print("\n  ⚠ 正在等待写盘完成，请勿中断…", flush=True)
         if recorder.stop_error:
             print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
-
-        # ── 保存轨迹 debug 数据 ──
-        if len(traj_logger) > 0:
-            try:
-                saved = traj_logger.save(_traj_path)
-                print(f"\n轨迹已保存: {saved}  ({len(traj_logger)} 帧)")
-            except (OSError, ValueError) as e:
-                print(f"\n轨迹保存失败: {e}")
 
         print("\n退出主循环")
 

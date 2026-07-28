@@ -53,14 +53,10 @@ from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
-from dexmani_real.utils.trajectory_logger import TrajectoryLogger
 
 logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ Keyboard (pynput, 全局捕获)
-
-
-# ═══════════════════════════════════════════════ TrajectoryLogger 已提取至 dexmani_real.utils.trajectory_logger
 
 
 # ═══════════════════════════════════════════════ 配置
@@ -75,7 +71,7 @@ HOME_DT = 0.04  # 归位 waypoint 间隔 (s)
 
 WORKSPACE_BOUNDS = np.array(
     [
-        [0.24, 0.72],  # x [min, max] m
+        [0.28, 0.72],  # x [min, max] m
         [-0.50, 0.50],  # y [min, max] m
         [0.05, 0.5],  # z [min, max] m
     ],
@@ -278,12 +274,6 @@ def main():
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
     )
-
-    # ── 7b. Trajectory logger (wrist + EEF motion debug) ──
-    traj_logger = TrajectoryLogger()
-    _traj_save_dir = Path("trajectories")
-    _traj_save_dir.mkdir(parents=True, exist_ok=True)
-    _traj_path = str(_traj_save_dir / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.npz")
 
     # ── 8. Keyboard ──
     kb = KeyboardHandler()
@@ -654,24 +644,6 @@ def main():
                 planner.set_hand_qpos(state.hand_qpos)
             ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
 
-            # ── Trajectory debug record (before continue on fail) ──
-            _wrist_d = vr_frame["wrist_pos"] - arm_mapper.wrist_pos0 if arm_mapper.is_ready() else None
-            _eef_d = state.eef_pos - arm_mapper.eef_pos0 if arm_mapper.is_ready() else None
-            traj_logger.append(
-                t=time.perf_counter() - start_time,
-                wrist_pos=vr_frame["wrist_pos"],
-                wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                target_pos=target_pos,
-                target_quat_wxyz=target_quat,
-                actual_eef_pos=state.eef_pos,
-                actual_eef_quat_wxyz=state.eef_quat_wxyz,
-                arm_qpos_actual=state.arm_qpos,
-                ik_ok=ik_result.success and ik_result.qpos is not None,
-                wrist_delta=_wrist_d,
-                eef_delta=_eef_d,
-                target_pos_before_clamp=target_pos_before_clamp,
-            )
-
             if not ik_result.success or ik_result.qpos is None:
                 ik_method = "fail"
                 if recording_active:
@@ -712,6 +684,7 @@ def main():
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
                 actual_hand_current=state.hand_current,
+                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
@@ -754,14 +727,6 @@ def main():
                 print("\n  ⚠ 正在等待写盘完成，请勿中断…", flush=True)
         if recorder.stop_error:
             print(f"  ⚠ 后台写盘失败: {recorder.stop_error}", flush=True)
-
-        # ── 保存轨迹 debug 数据 ──
-        if len(traj_logger) > 0:
-            try:
-                saved = traj_logger.save(_traj_path)
-                print(f"\n轨迹已保存: {saved}  ({len(traj_logger)} 帧)")
-            except (OSError, ValueError) as e:
-                print(f"\n轨迹保存失败: {e}")
 
         print("\n退出主循环")
 

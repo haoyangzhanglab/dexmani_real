@@ -49,6 +49,17 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "meta": {"timestamp"},
 }
 
+# Per-finger colors for hand_fingertip keypoints (thumb, index, middle, ring, pinky).
+_FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
+    (255, 60, 60),   # thumb  — red
+    (60, 255, 60),   # index  — green
+    (60, 120, 255),  # middle — blue
+    (255, 200, 40),  # ring   — gold
+    (220, 60, 255),  # pinky  — magenta
+)
+
+_FINGERTIP_LABELS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
+
 
 def _classify_datasets(h5f: h5py.File) -> dict[str, list[str]]:
     """Scan top-level HDF5 datasets and group them by category.
@@ -402,8 +413,9 @@ class EpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        # 3D point cloud view (when enabled: pre-computed /pointcloud or depth→PC fallback)
-        if self._pc_enabled or self._has_precomputed_pc:
+        # 3D view: point cloud and/or fingertip keypoints
+        _has_3d = self._pc_enabled or self._has_precomputed_pc or "hand_fingertip" in self._state
+        if _has_3d:
             columns.append(
                 rrb.Spatial3DView(
                     origin="/",
@@ -502,9 +514,9 @@ class EpisodeVisualizer:
 
         # ── Derived force series labels ──
         _force_series = {
-            "hand_contact_mag": ("thumb", "index", "middle", "ring", "pinky"),
-            "hand_force_thumb": ("Fx", "Fy", "Fz"),
-            "hand_force_index": ("Fx", "Fy", "Fz"),
+            "hand_contact_mag": ("thumb (N)", "index (N)", "middle (N)", "ring (N)", "pinky (N)"),
+            "hand_force_thumb": ("Fx (N)", "Fy (N)", "Fz (N)"),
+            "hand_force_index": ("Fx (N)", "Fy (N)", "Fz (N)"),
         }
         for fkey, labels in _force_series.items():
             if fkey in self._state:
@@ -534,6 +546,7 @@ class EpisodeVisualizer:
         if "timestamp" in self._state:
             rr.set_time_seconds("time", float(self._state["timestamp"][step_idx]))
         self._log_camera(step_idx)
+        self._log_fingertips(step_idx)
         self._log_time_series(step_idx)
 
     # ------------------------------------------------------------------
@@ -587,6 +600,36 @@ class EpisodeVisualizer:
                 if self._cam_R is not None:
                     points = points @ self._cam_R.T + self._cam_t
                 rr.log("pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
+
+    # ------------------------------------------------------------------
+    # Fingertip keypoints
+    # ------------------------------------------------------------------
+
+    def _log_fingertips(self, step_idx: int) -> None:
+        """Render hand_fingertip as colored keypoints in the 3D view.
+
+        FK-computed positions are in world frame, matching the pre-computed
+        /pointcloud coordinate space.  Five distinct colours identify individual
+        fingers without needing text labels (which require Rerun ≥0.23 for
+        stable Points3D label support).
+        """
+        fp_data = self._state.get("hand_fingertip")
+        if fp_data is None:
+            return
+        fp = np.asarray(fp_data[step_idx], dtype=np.float32)
+        if fp.ndim != 2 or fp.shape != (5, 3):
+            return
+        if not np.all(np.isfinite(fp)):
+            return
+
+        rr.log(
+            "fingertips",
+            rr.Points3D(
+                positions=fp,
+                colors=np.array(_FINGERTIP_COLORS, dtype=np.uint8),
+                radii=0.012,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Time series logging

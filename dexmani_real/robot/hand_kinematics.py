@@ -5,6 +5,13 @@ returning the 3D positions of five fingertips in the hand_base frame.
 
 Chain:
   hand_qpos -> (hand URDF via Pinocchio) -> fingertip positions in hand_base
+
+IMPORTANT — Joint ordering:
+  The XHand SDK returns qpos in finger-grouped order:
+    [thumb(3), index(3), mid(2), ring(2), pinky(2)]
+  The standalone hand URDF (xhand_right.urdf) has joints in a different order:
+    [index(3), mid(2), pinky(2), ring(2), thumb(3)]
+  _SDK_TO_URDF_IDX remaps from SDK order to URDF order before calling Pinocchio FK.
 """
 
 from __future__ import annotations
@@ -17,6 +24,25 @@ from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+# Remap from XHand SDK qpos order to standalone hand URDF joint order.
+#
+# SDK (JOINT_NAMES from xhand.py):
+#   0:thumb_abduction  1:thumb_joint1  2:thumb_joint2
+#   3:index_abduction  4:index_joint1  5:index_joint2
+#   6:middle_joint1    7:middle_joint2
+#   8:ring_joint1      9:ring_joint2
+#  10:little_joint1   11:little_joint2
+#
+# Standalone URDF (xhand_right.urdf, Pinocchio model.names order):
+#   0:index_bend   1:index_joint1   2:index_joint2
+#   3:mid_joint1   4:mid_joint2
+#   5:pinky_joint1 6:pinky_joint2
+#   7:ring_joint1  8:ring_joint2
+#   9:thumb_bend  10:thumb_rota1   11:thumb_rota2
+#
+# Verified 2026-07-28 against SAPIEN XArm7XHand simulation FK.
+_SDK_TO_URDF_IDX = np.array([3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2], dtype=np.intp)
 
 
 class HandKinematics:
@@ -98,7 +124,8 @@ class HandKinematics:
             return nan_array((5, 3))
 
         q = np.asarray(hand_qpos, dtype=np.float64).reshape(12)
-        pinocchio.forwardKinematics(self._model, self._data, q)
+        q_urdf = q[_SDK_TO_URDF_IDX]  # remap SDK order → URDF order
+        pinocchio.forwardKinematics(self._model, self._data, q_urdf)
         pinocchio.updateFramePlacements(self._model, self._data)
 
         tips = np.zeros((5, 3), dtype=np.float64)
