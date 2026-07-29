@@ -63,16 +63,12 @@ class KeyboardHandler:
             ...
             for sig in kb.poll(timeout=0.0):
                 ...
-
-    The ``queue`` parameter is accepted (and ignored) for backward compatibility
-    with callers that still pass a multiprocessing.Queue.
     """
 
-    def __init__(self, queue: object = None, debounce_s: float = 0.5) -> None:
+    def __init__(self, debounce_s: float = 0.5) -> None:
         """Initialize keyboard handler.
 
         Args:
-            queue: Ignored (backward compat with multiprocessing.Queue pattern).
             debounce_s: Per-signal debounce interval in seconds (default 0.5).
                         Suppresses X11/Wayland auto-repeat for the same key.
         """
@@ -201,3 +197,107 @@ class KeyboardHandler:
                         return signals
                 time.sleep(0.005)  # 5 ms polling granularity
         return []
+
+    def drain_signal(self, target: ControlSignal | None) -> int:
+        """Remove all occurrences of *target* from the buffer, preserving others.
+
+        Use to suppress auto-repeat of a trigger signal after a blocking
+        operation, without discarding unrelated signals the user may have
+        pressed during the block.
+
+        Args:
+            target: The signal to remove.  ``None`` is a no-op (returns 0).
+
+        Returns:
+            Number of signals removed.
+        """
+        if target is None:
+            return 0
+        with self._lock:
+            old_len = len(self._buffer)
+            self._buffer = deque(s for s in self._buffer if s != target)
+            return old_len - len(self._buffer)
+
+
+class GlobalKeyState:
+    """Non-blocking key-hold tracker (pynput, thread-safe).
+
+    Tracks which keys are **currently held down** via on_press/on_release.
+    Use for continuous key detection (WASD / arrow keys) where polling
+    "is this key down right now?" matters, as opposed to the event-queue
+    model of :class:`KeyboardHandler`.
+
+    Usage::
+
+        keys = GlobalKeyState()
+        keys.start()
+        ...
+        if keys.is_pressed("w"):
+            move_forward()
+        ...
+        keys.stop()
+    """
+
+    def __init__(self) -> None:
+        self._keys: set[str] = set()
+        self._running = True
+        self._thread: threading.Thread | None = None
+        self._listener: Any = None  # pynput keyboard.Listener
+
+    def _run(self) -> None:
+        from pynput import keyboard
+
+        def on_press(key: object) -> None:
+            try:
+                if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
+                    self._keys.add(key.char.lower())  # type: ignore[union-attr]
+                elif key == keyboard.Key.esc:
+                    self._keys.add("esc")
+                elif key == keyboard.Key.up:
+                    self._keys.add("up")
+                elif key == keyboard.Key.down:
+                    self._keys.add("down")
+                elif key == keyboard.Key.left:
+                    self._keys.add("left")
+                elif key == keyboard.Key.right:
+                    self._keys.add("right")
+            except Exception:
+                pass
+
+        def on_release(key: object) -> None:
+            try:
+                if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
+                    self._keys.discard(key.char.lower())  # type: ignore[union-attr]
+                elif key == keyboard.Key.esc:
+                    self._keys.discard("esc")
+                elif key == keyboard.Key.up:
+                    self._keys.discard("up")
+                elif key == keyboard.Key.down:
+                    self._keys.discard("down")
+                elif key == keyboard.Key.left:
+                    self._keys.discard("left")
+                elif key == keyboard.Key.right:
+                    self._keys.discard("right")
+            except Exception:
+                pass
+
+        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._listener.start()
+        while self._running:
+            time.sleep(0.1)
+        self._listener.stop()
+        self._listener = None
+
+    def stop(self) -> None:
+        self._running = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def is_pressed(self, key: str) -> bool:
+        return key in self._keys
+
+    @property
+    def any_pressed(self) -> bool:
+        return len(self._keys) > 0

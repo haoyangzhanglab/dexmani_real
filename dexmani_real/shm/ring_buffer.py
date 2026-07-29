@@ -27,6 +27,8 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
+from dexmani_real.shm.seqlock import seqlock_even, seqlock_is_complete, seqlock_odd, seqlock_to_logical
+
 logger = get_logger(__name__)
 
 
@@ -265,11 +267,14 @@ class CameraRingBuffer:
     _OFF_MAX_PC = 32
     _HEADER_SIZE = 64  # cache-line aligned
 
+    # Torn-read warning throttle: ≤1 / 5 s (matching SeqlockRingBuffer).
+    _TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
+
     def __init__(
         self,
         name: str,
-        rgb_shape: tuple[int, int, int] = (480, 640, 3),
-        depth_shape: tuple[int, int] = (480, 640),
+        rgb_shape: tuple[int, int, int] | None = None,
+        depth_shape: tuple[int, int] | None = None,
         maxlen: int = 5,
         create: bool = True,
         pc_shape: tuple[int, int] | None = None,
@@ -277,24 +282,43 @@ class CameraRingBuffer:
         self.name = name
         self.maxlen = maxlen
 
-        self._rgb_shape = rgb_shape
-        self._depth_shape = depth_shape
-        self._pc_shape = pc_shape
-        self._max_rgb_bytes = rgb_shape[0] * rgb_shape[1] * rgb_shape[2]  # uint8
-        self._max_depth_bytes = depth_shape[0] * depth_shape[1] * 2  # uint16
-        self._max_pc_bytes = pc_shape[0] * pc_shape[1] * 4 if pc_shape else 0  # float32
-
         # Per-slot layout
         self._slot_header_size = 8 + 8 + CAMERA_FRAME_HEADER_DTYPE.itemsize
-        self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
-
-        self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
 
         if create:
+            if rgb_shape is None or depth_shape is None:
+                raise ValueError("rgb_shape and depth_shape are required when create=True")
+            self._rgb_shape: tuple[int, int, int] | None = rgb_shape
+            self._depth_shape: tuple[int, int] | None = depth_shape
+            self._pc_shape: tuple[int, int] | None = pc_shape
+            self._max_rgb_bytes = rgb_shape[0] * rgb_shape[1] * rgb_shape[2]
+            self._max_depth_bytes = depth_shape[0] * depth_shape[1] * 2
+            self._max_pc_bytes = pc_shape[0] * pc_shape[1] * 4 if pc_shape else 0
+            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
+            self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
+
             self._shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_size)
             self._init_header()
         else:
+            # Attach to existing SHM — read dimensions from the header.
             self._shm = shared_memory.SharedMemory(name=name)
+            self._max_rgb_bytes = int(
+                np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_RGB)[0]
+            )
+            self._max_depth_bytes = int(
+                np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH)[0]
+            )
+            self._max_pc_bytes = int(
+                np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_PC)[0]
+            )
+            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
+            self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
+            # Reconstruct shapes from byte counts (used only for logging).
+            self._rgb_shape = None
+            self._depth_shape = None
+            self._pc_shape = None
+
+        self._last_torn_warn_ns = 0
 
         self._write_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE
@@ -308,6 +332,15 @@ class CameraRingBuffer:
             self._total_size / (1024 * 1024),
             create,
         )
+
+    @classmethod
+    def attach(cls, name: str) -> "CameraRingBuffer":
+        """Attach to an existing CameraRingBuffer by name (no shape params needed).
+
+        Reads max byte sizes from the existing SHM header, so the attach-mode
+        caller does not need to duplicate the shapes used at create time.
+        """
+        return cls(name=name, create=False)
 
     def write(
         self,
@@ -342,7 +375,7 @@ class CameraRingBuffer:
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
         )
         ts_arr[0] = np.uint64(now_ns)
-        ts_arr[1] = np.uint64(seq | 1)  # odd: writer active
+        ts_arr[1] = np.uint64(seqlock_odd(seq))  # odd: writer active
 
         # Write camera header (64 bytes)
         header_offset = slot_base + 16
@@ -377,7 +410,7 @@ class CameraRingBuffer:
             pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
 
         # ── Seqlock: write even marker — payload is now consistent ──
-        ts_arr[1] = np.uint64(seq)  # even: writer done
+        ts_arr[1] = np.uint64(seqlock_even(seq))  # even: writer done
 
         self._write_idx_view()[0] = np.uint64(idx)
         return seq
@@ -419,15 +452,18 @@ class CameraRingBuffer:
         rgb_size = int(h["rgb_size"])
         rgb_h, rgb_w, rgb_c = int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])
         if rgb_size > self._max_rgb_bytes or rgb_size <= 0 or rgb_h * rgb_w * rgb_c != rgb_size:
-            logger.warning(
-                "CameraRingBuffer read_latest: torn or corrupt RGB header "
-                "(rgb_size=%d, shape=%dx%dx%d, max=%d), discarding",
-                rgb_size,
-                rgb_h,
-                rgb_w,
-                rgb_c,
-                self._max_rgb_bytes,
-            )
+            now_ns = time.monotonic_ns()
+            if now_ns - self._last_torn_warn_ns >= self._TORN_WARN_INTERVAL_NS:
+                self._last_torn_warn_ns = now_ns
+                logger.warning(
+                    "CameraRingBuffer read_latest: torn or corrupt RGB header "
+                    "(rgb_size=%d, shape=%dx%dx%d, max=%d), discarding",
+                    rgb_size,
+                    rgb_h,
+                    rgb_w,
+                    rgb_c,
+                    self._max_rgb_bytes,
+                )
             return None
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
         rgb: np.ndarray[Any, np.dtype[np.uint8]] = (
@@ -440,14 +476,17 @@ class CameraRingBuffer:
         depth_size = int(h["depth_size"])
         depth_h, depth_w = int(h["depth_shape_h"]), int(h["depth_shape_w"])
         if depth_size > self._max_depth_bytes or depth_size <= 0 or depth_h * depth_w * 2 != depth_size:
-            logger.warning(
-                "CameraRingBuffer read_latest: torn or corrupt depth header "
-                "(depth_size=%d, shape=%dx%d, max=%d), discarding",
-                depth_size,
-                depth_h,
-                depth_w,
-                self._max_depth_bytes,
-            )
+            now_ns = time.monotonic_ns()
+            if now_ns - self._last_torn_warn_ns >= self._TORN_WARN_INTERVAL_NS:
+                self._last_torn_warn_ns = now_ns
+                logger.warning(
+                    "CameraRingBuffer read_latest: torn or corrupt depth header "
+                    "(depth_size=%d, shape=%dx%d, max=%d), discarding",
+                    depth_size,
+                    depth_h,
+                    depth_w,
+                    self._max_depth_bytes,
+                )
             return None
         depth_offset = rgb_offset + self._max_rgb_bytes
         depth = (
@@ -471,7 +510,7 @@ class CameraRingBuffer:
 
         # ── Seqlock: reject writer-active or torn reads ──
         # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
-        if (slot_seq & 1) == 1:
+        if not seqlock_is_complete(slot_seq):
             return None
         ts_arr_check: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
@@ -479,7 +518,7 @@ class CameraRingBuffer:
         if int(ts_arr_check[1]) != slot_seq:
             return None
 
-        return header, rgb, depth, pointcloud, slot_seq
+        return header, rgb, depth, pointcloud, seqlock_to_logical(slot_seq)
 
     def frame_age_ns(self) -> int:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""

@@ -13,7 +13,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 from .collision_model import CollisionModel
-from .desk_safety import FingertipDeskSafety
 from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager, is_mplib_success
 from .kinematics import XArm7Kinematics
@@ -106,20 +105,8 @@ class XArm7MotionPlanner:
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
-        # Geometric FK desk safety — fingertip Z vs desk
-        self.desk_safety: FingertipDeskSafety | None = None
-        if config.collision is not None:
-            try:
-                self.desk_safety = FingertipDeskSafety(
-                    collision_model=self.collision_model,
-                    collision_config=config.collision,
-                )
-            except (ValueError, RuntimeError, IndexError):
-                logger.warning("FingertipDeskSafety init failed — desk FK checks disabled.", exc_info=True)
-                # desk_safety remains None — desk FK checks skipped
-
         self.teleop_solver = TeleopIKSolver(
-            self.kin, self.ik_mgr, self.teleop_profile, desk_safety=self.desk_safety
+            self.kin, self.ik_mgr, self.teleop_profile
         )
 
         # Convenience aliases (used by teleop_solver and external code)
@@ -183,7 +170,7 @@ class XArm7MotionPlanner:
         # Diagnostic: when hand_dof=True, CollisionModel auto-expands arm qpos
         # with _hand_qpos.  Warn if the buffer was never initialized — all-zero
         # is ambiguous (could be a valid home pose), so use the dedicated flag.
-        if self.collision_model.hand_dof and not self.collision_model._hand_qpos_initialized:
+        if self.collision_model.hand_dof and self.collision_model._hand_qpos is None:
             logger.warning(
                 "plan_path: _hand_qpos was never set — "
                 "CollisionModel env/self checks use zero (open-hand) pose.  "
@@ -391,12 +378,6 @@ class XArm7MotionPlanner:
             for q in samples:
                 if self.ik_mgr.has_env_collision(q):
                     return False
-        # Geometric FK desk safety — check the segment endpoints
-        if self.desk_safety is not None and profile.check_env_collision:
-            seg = np.array([prev, nxt], dtype=np.float64)
-            desk_safe, _min_z, _viol_idx = self.desk_safety.check_path_desk_safety(seg)
-            if not desk_safe:
-                return False
         return True
 
     def validate_path(
@@ -424,6 +405,7 @@ class XArm7MotionPlanner:
             path_before_smooth = path.copy()
             path = self.shortcut_smooth_path(path, current_qpos, profile)
         except ValueError as error:
+            logger.debug("validate_path preprocessing failed: %s", error, exc_info=True)
             return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
 
         # ── Try smoothed path first; fall back to unsmoothed on failure ──
@@ -447,7 +429,6 @@ class XArm7MotionPlanner:
                 self._check_self_collision,
                 self._check_env_collision,
                 self._check_workspace_bounds,
-                self._check_desk_safety,
             ):
                 failure = check(candidate, report, source, profile)
                 if failure is not None:
@@ -565,21 +546,6 @@ class XArm7MotionPlanner:
                     source,
                     report,
                 )
-        return None
-
-    def _check_desk_safety(self, path, report, source, profile):
-        if self.desk_safety is None or not profile.check_env_collision:
-            return None
-        desk_safe, min_z, viol_idx = self.desk_safety.check_path_desk_safety(path)
-        report["desk_safety_min_fingertip_z"] = float(min_z)
-        report["desk_safety_violation_index"] = int(viol_idx)
-        if not desk_safe:
-            return self._make_failure(
-                f"Path contains desk collision (fingertip z_min={min_z:.3f}m < "
-                f"safe={self.desk_safety.config.fingertip_threshold:.3f}m, segment {viol_idx})",
-                source,
-                report,
-            )
         return None
 
     def compute_path_metrics(

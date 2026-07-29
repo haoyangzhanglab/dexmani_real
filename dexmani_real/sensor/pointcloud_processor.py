@@ -1,7 +1,6 @@
 """Fixed-size world-frame point cloud from aligned RGB-D — production pipeline.
 
-Online pipeline validated in examples/real/test_pointcloud_process.py (2026-07-15,
-L515 SN f1382055): driver-precomputed rays deprojection -> camera-frame depth gate
+Driver-precomputed rays deprojection -> camera-frame depth gate
 -> world transform -> single workspace crop -> 5 mm voxel -> radius outlier removal
 -> fixed-size sample.
 
@@ -29,7 +28,7 @@ class PointCloudProcessorConfig:
     """Parameters of the depth->pointcloud pipeline (validated 2026-07-15)."""
 
     num_points: int = 2048
-    # Camera-frame z gate: 0.3 m = L515 min-Z (0.25 m) + margin; 1.5 m = farthest
+    # Camera-frame z gate: 0.3 m near (min-Z + margin), 1.5 m far (workspace corner)
     # workspace corner under the current cameras.json extrinsics + ~0.15 m margin.
     depth_min_m: float = 0.3
     depth_max_m: float = 1.5

@@ -22,13 +22,16 @@ import sys
 from pathlib import Path
 
 import h5py
+
+from dexmani_real.recording.episode_reader import EpisodeReader
 import numpy as np
 
 FINGER_NAMES = ["thumb", "index", "middle", "ring", "little"]
 
 
 def _load_tactile(path: str) -> tuple[np.ndarray, dict]:
-    with h5py.File(path, "r") as f:
+    with EpisodeReader(path) as reader:
+        f = reader.h5f
         if "hand_tactile_force" not in f:
             raise KeyError("hand_tactile_force dataset not found — episode recorded before tactile was saved")
         tactile = f["hand_tactile_force"][:]  # (T, 5, 120, 3)

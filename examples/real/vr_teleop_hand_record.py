@@ -43,18 +43,18 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.sensor.camera_process import create_camera_session
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
-from dexmani_real.sensor.camera_process import CameraProcess, CameraProcessConfig
+
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.teleop.control.audio_feedback import AudioFeedback
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
@@ -88,8 +88,6 @@ WORKSPACE_BOUNDS = np.array(
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
-    hand_extension_below_eef=0.076,
-    hand_safe_margin=0.03,
 )
 
 # VR wrist → EEF 映射参数
@@ -140,37 +138,6 @@ _FRAME_IK_FAIL = 2
 _FRAME_SAFETY_REJECT = 3
 _FRAME_RETARGET_FAIL = 4  # IK succeeded but hand retargeting failed
 
-
-# ═══════════════════════════════════════════════ 归位
-
-
-def do_return_home(
-    robot: RobotInterface,
-    planner: XArm7MotionPlanner,
-    arm_inner: ArmServo,
-) -> ArmServo:
-    """归位: 停止内环 → 规划+执行 → 重启内环."""
-    print("return_home ...", flush=True)
-    try:
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        print("  Arm 内环线程已停止")
-
-        ok = robot.return_to_home(home_dt=HOME_DT)
-        print(f"  {'OK' if ok else 'FAIL'}")
-
-        new_inner = make_arm_servo(cfg=_INNER_CFG)
-        robot.set_arm_servo(new_inner)
-        new_inner.start()
-        print("  Arm 内环线程已重启")
-        return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home 异常，尝试 emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
 
 
 # ═══════════════════════════════════════════════ 录制辅助函数
@@ -434,7 +401,6 @@ def main():
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
         arm_sent_stream=True,  # schema v9: 记录实发的 arm 指令 (plan §6 P1)
-        use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
     # ── 7b. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
@@ -449,41 +415,7 @@ def main():
     audio = AudioFeedback()
 
     # ── 8c. Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
-    camera = CameraProcess(CameraProcessConfig(camera_name="realsense", hz=30.0, enable_pointcloud=True))
-    if camera.start():
-        print("Camera 进程已启动 (RealSense @30Hz, SHM, pointcloud)")
-    else:
-        print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
-        camera = None
-
-    calib = None
-    if camera is not None:
-        try:
-            calib = CameraCalib()
-        except (OSError, ValueError, KeyError):
-            print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
-
-    _camera_name_cache: str | None = None
-
-    # 相机停帧检测
-    cam_last_fn = None
-    cam_last_change_t: float | None = None
-
-    def _resolve_camera_name() -> str | None:
-        """serial → cameras.json 条目名，成功后缓存（子进程 connect 后 serial 才可用）."""
-        nonlocal _camera_name_cache
-        if _camera_name_cache is not None or calib is None or camera is None:
-            return _camera_name_cache
-        ser = camera.camera_serial
-        if not ser:
-            print("  ⚠ camera serial 尚不可用 — /meta 本次将缺少外参")
-            return None
-        try:
-            _camera_name_cache = calib.resolve_name_by_serial(ser)
-            print(f"  camera resolved: serial={ser} name={_camera_name_cache}")
-        except KeyError as e:
-            print(f"  ⚠ cameras.json 无 serial={ser} 的条目 — /meta 将缺少外参: {e}")
-        return _camera_name_cache
+    session = create_camera_session()
 
     # ── 9. 等待 VR 首帧 ──
     print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
@@ -498,8 +430,7 @@ def main():
             arm_inner.stop()
             robot.disconnect()
             vr_receiver.stop()
-            if camera is not None:
-                camera.stop()
+            session.stop()
             return
         frame = vr_receiver.read_latest()
         if frame is not None:
@@ -524,8 +455,7 @@ def main():
         arm_inner.stop()
         robot.disconnect()
         vr_receiver.stop()
-        if camera is not None:
-            camera.stop()
+        session.stop()
         return
 
     # ── 10. 键盘就绪 ──
@@ -548,18 +478,19 @@ def main():
     ik_method = "-"
     _last_vr_wrist_quat: np.ndarray | None = None  # VR quat continuity tracking
 
-    def _stop_recording(save: bool):
-        """停止录制. save=True 保存, save=False 丢弃."""
+    def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
+        """停止录制. save=True 保存, save=False 丢弃.
+
+        Args:
+            save: True 保存, False 丢弃.
+            triggered_by: The ControlSignal that triggered this stop.
+                Only auto-repeat copies of this signal are drained from the
+                keyboard buffer after the blocking save; unrelated signals
+                (e.g. HOME pressed during a STOP-triggered save) survive.
+        """
         nonlocal recording_active
         if recording_active:
             if save:
-                if camera is not None and camera.camera_serial:
-                    recorder.backfill_camera_meta(
-                        depth_scale=camera.depth_scale,
-                        calib=calib,
-                        camera_name=_resolve_camera_name(),
-                        camera_K=camera.camera_K,
-                    )
                 n_frames = recorder.frame_count
                 print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
@@ -582,7 +513,11 @@ def main():
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
             limiter.reset()
-            kb.poll(timeout=0.0)
+            # Drain auto-repeat of the trigger signal accumulated during the
+            # blocking join_stop().  Other signals (e.g. HOME pressed during a
+            # STOP-triggered save) are preserved for the next main-loop poll.
+            if triggered_by is not None:
+                kb.drain_signal(triggered_by)
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
@@ -670,11 +605,11 @@ def main():
 
                         if decision is True:
                             audio.play("save")
-                            _stop_recording(save=True)
+                            _stop_recording(save=True, triggered_by=ControlSignal.STOP)
                             print("  已保存")
                         elif decision is False:
                             audio.play("discard")
-                            _stop_recording(save=False)
+                            _stop_recording(save=False, triggered_by=ControlSignal.DISCARD)
                             print("  已丢弃")
                         elif running:
                             audio.play("discard")
@@ -683,7 +618,7 @@ def main():
 
                         if do_home and running:
                             audio.play("home")
-                            arm_inner = do_return_home(robot, planner, arm_inner)
+                            arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                             teleop_active = False
                             arm_mapper.clear()
                             _reset_hand_retargeter()
@@ -705,8 +640,11 @@ def main():
                                     prev_qpos_cmd = state.arm_qpos.copy()
                                     ema_prev_pos = ema_prev_quat = None
                                 error_count = 0
+                            # Drain HOME auto-repeat accumulated during
+                            # do_return_home.
+                            kb.poll(timeout=0.0)
                     else:
-                        _stop_recording(save=False)
+                        _stop_recording(save=False, triggered_by=ControlSignal.QUIT)
 
                     running = False
                     break
@@ -714,8 +652,19 @@ def main():
                 elif sig == ControlSignal.HOME:
                     print("\nH: return_home")
                     audio.play("home")
-                    _stop_recording(save=True)
-                    arm_inner = do_return_home(robot, planner, arm_inner)
+
+                    # If already at home, skip expensive do_return_home
+                    # (defense-in-depth against auto-repeat HOME leaking past
+                    # the post-home drain).
+                    if arm_qpos is not None and np.all(np.isfinite(arm_qpos)):
+                        if np.max(np.abs(arm_qpos - home_qpos)) < np.deg2rad(2.0):
+                            print("  已在 home 位置，跳过归位")
+                            _stop_recording(save=True, triggered_by=ControlSignal.HOME)
+                            skip_rest = True
+                            continue
+
+                    _stop_recording(save=True, triggered_by=ControlSignal.HOME)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                     teleop_active = False
                     arm_mapper.clear()
                     _reset_hand_retargeter()
@@ -739,19 +688,24 @@ def main():
                             prev_qpos_cmd = state.arm_qpos.copy()
                             ema_prev_pos = ema_prev_quat = None
                         error_count = 0
+                    # Drain HOME auto-repeat accumulated during do_return_home
+                    # (3-4s blocking).  Blanket drain is safe here: HOME
+                    # auto-repeat is unwanted (arm already home), ESC bypasses
+                    # debounce at ~60Hz, and any other signal can be re-pressed.
+                    kb.poll(timeout=0.0)
                     skip_rest = True
 
                 elif sig == ControlSignal.STOP:
                     print("\nS: 停止录制")
                     audio.play("save")
-                    _stop_recording(save=True)
+                    _stop_recording(save=True, triggered_by=ControlSignal.STOP)
                     teleop_active = False
                     skip_rest = True
 
                 elif sig == ControlSignal.DISCARD:
                     print("\nD: 丢弃录制")
                     audio.play("discard")
-                    _stop_recording(save=False)
+                    _stop_recording(save=False, triggered_by=ControlSignal.DISCARD)
                     teleop_active = False
                     skip_rest = True
 
@@ -787,24 +741,12 @@ def main():
                         print("\nB: 无 VR 帧，无法开始遥操作")
                         skip_rest = True
                         continue
-                    # 相机就绪 gate
-                    if camera is not None and not camera.camera_serial and not camera.crashed:
-                        print("  相机连接中, 等待就绪…", end="", flush=True)
-                        _gate_deadline = time.perf_counter() + 5.0
-                        while not camera.camera_serial and not camera.crashed and time.perf_counter() < _gate_deadline:
-                            time.sleep(0.5)
-                            print(".", end="", flush=True)
-                        print(" 就绪" if camera.camera_serial else "")
-                        if not camera.camera_serial and not camera.crashed:
-                            print("  ⚠ 相机 5s 内未就绪 — 本次 B 忽略, 请稍后重按")
-                            skip_rest = True
-                            continue
-                    if camera is not None and camera.crashed:
+                    if session.crashed:
                         print("  ⚠ 相机进程已退出 — 本集降级为只录关节/EEF")
                     # 如果已在录制，先停止旧 episode
-                    _stop_recording(save=recording_active)
+                    _stop_recording(save=recording_active, triggered_by=ControlSignal.BEGIN)
                     gc.collect()
-                    _record_cfg = dict(camera.pointcloud_meta) if camera is not None and camera.pointcloud_meta else {}
+                    _record_cfg = session.pointcloud_meta
                     _record_cfg.update({
                         "ema_alpha_pos": EMA_ALPHA_POS,
                         "ema_alpha_rot": EMA_ALPHA_ROT,
@@ -819,10 +761,10 @@ def main():
                     if not recorder.start_episode(
                         task_label=TASK_LABEL,
                         operator=OPERATOR,
-                        depth_scale=camera.depth_scale if camera is not None else None,
-                        calib=calib,
-                        camera_name=_resolve_camera_name(),
-                        camera_K=camera.camera_K if camera is not None else None,
+                        depth_scale=session.depth_scale,
+                        calib=session.calib,
+                        camera_name=session.resolve_name(),
+                        camera_K=session.camera_K,
                         record_config=_record_cfg,
                     ):
                         print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
@@ -956,15 +898,7 @@ def main():
             stage_timer.mark("vr")
 
             # ── 相机帧 ──
-            cam = camera.poll_latest_frame() if camera is not None else None
-            if cam is not None:
-                now_mono = time.monotonic()
-                if cam["frame_number"] != cam_last_fn:
-                    cam_last_fn = cam["frame_number"]
-                    cam_last_change_t = now_mono
-                elif cam_last_change_t is not None and now_mono - cam_last_change_t > 1.0:
-                    if loop_count % STATUS_EVERY == 0:
-                        print(f"  ⚠ 相机帧已停止更新 {now_mono - cam_last_change_t:.1f}s — 数据可能冻结")
+            cam = session.poll_latest_frame()
             stage_timer.mark("cam")
 
             # ── Periodic status ──
@@ -1218,10 +1152,8 @@ def main():
             action_valid, fail_reason = validate_action(
                 robot,
                 action,
-                actual_arm_qpos=arm_qpos,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_current=state.hand_current,
                 actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
@@ -1316,7 +1248,7 @@ def main():
                 print("\nH: return_home")
                 audio.play("home")
                 try:
-                    arm_inner = do_return_home(robot, planner, arm_inner)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")
@@ -1334,8 +1266,7 @@ def main():
             arm_inner.stop()
             print("Arm 内环线程已停止")
 
-        if camera is not None:
-            camera.stop()
+        session.stop()
 
         robot.disconnect()
         vr_receiver.stop()

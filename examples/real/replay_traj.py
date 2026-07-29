@@ -36,7 +36,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import h5py
+from dexmani_real.recording.episode_reader import EpisodeReader
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -67,8 +67,6 @@ WORKSPACE_BOUNDS = np.array([[0.28, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
-    hand_extension_below_eef=0.076,
-    hand_safe_margin=0.03,
 )
 
 ARM_MAX_SPEED_DEG_S = 120.0  # 对齐采集入口 (vr_teleop_arm_only_record*.py) — 回放与采集同速
@@ -130,12 +128,16 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
         FileNotFoundError: h5_path does not exist.
         ValueError: Missing required datasets or schema version mismatch.
     """
-    if not os.path.isfile(h5_path):
-        raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(f"Episode not found: {h5_path}")
 
-    with h5py.File(h5_path, "r") as f:
+    with EpisodeReader(h5_path) as reader:
+        f = reader.h5f
         # ── Validate schema ──
-        meta = f.get("/meta", {})
+        # f.get("/meta") returns None when the group is missing (safe h5py idiom).
+        # Using a dict default (f.get("/meta", {})) causes an AttributeError crash
+        # on meta.attrs because the returned dict has no .attrs member.
+        meta = f.get("/meta")
         schema = meta.attrs.get("schema_version", None) if meta else None
         if schema is not None and schema < 3:
             logger.warning("HDF5 schema v%d < 3 — some datasets may be missing", schema)
@@ -1021,10 +1023,8 @@ class TrajectoryReplayer:
                 action_valid, fail_reason = validate_action(
                     self.robot,
                     action,
-                    actual_arm_qpos=arm_qpos,
                     actual_arm_qvel=state.arm_qvel,
                     actual_arm_tau=state.arm_tau,
-                    actual_hand_current=state.hand_current,
                     actual_hand_tactile_sum=state.hand_tactile_sum,
                 )
                 if not action_valid:

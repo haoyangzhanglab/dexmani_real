@@ -32,9 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import termios
-import threading
 import time
-import traceback
 
 import numpy as np
 
@@ -42,7 +40,8 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
+from dexmani_real.teleop.control.keyboard import GlobalKeyState
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
@@ -94,116 +93,12 @@ WORKSPACE_BOUNDS = np.array(
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
-    hand_extension_below_eef=0.076,
-    hand_safe_margin=0.03,
 )
-
-# ═══════════════════════════════════════════════ 键盘输入
-
-
-class GlobalKeyState:
-    """非阻塞键盘状态追踪 (pynput, 线程安全) — 用于连续键位检测 (WASD/↑↓/←→)."""
-
-    def __init__(self):
-        self._keys: set[str] = set()
-        self._running = True
-        self._thread: threading.Thread | None = None
-        self._listener = None  # pynput keyboard.Listener
-
-    def _run(self):
-        def on_press(key):
-            try:
-                if hasattr(key, "char") and key.char is not None:
-                    self._keys.add(key.char.lower())
-                elif key == keyboard.Key.esc:
-                    self._keys.add("esc")
-                elif key == keyboard.Key.up:
-                    self._keys.add("up")
-                elif key == keyboard.Key.down:
-                    self._keys.add("down")
-                elif key == keyboard.Key.left:
-                    self._keys.add("left")
-                elif key == keyboard.Key.right:
-                    self._keys.add("right")
-            except Exception:
-                pass
-
-        def on_release(key):
-            try:
-                if hasattr(key, "char") and key.char is not None:
-                    self._keys.discard(key.char.lower())
-                elif key == keyboard.Key.esc:
-                    self._keys.discard("esc")
-                elif key == keyboard.Key.up:
-                    self._keys.discard("up")
-                elif key == keyboard.Key.down:
-                    self._keys.discard("down")
-                elif key == keyboard.Key.left:
-                    self._keys.discard("left")
-                elif key == keyboard.Key.right:
-                    self._keys.discard("right")
-            except Exception:
-                pass
-
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
-        while self._running:
-            time.sleep(0.1)
-        self._listener.stop()
-        self._listener = None
-
-    def stop(self):
-        self._running = False
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def is_pressed(self, key: str) -> bool:
-        return key in self._keys
-
-    @property
-    def any_pressed(self) -> bool:
-        return len(self._keys) > 0
-
 
 # ═══════════════════════════════════════════════ 姿态工具
 
 
 
-
-# ═══════════════════════════════════════════════ Return-to-Home
-
-
-def do_return_home(
-    robot: RobotInterface,
-    planner: XArm7MotionPlanner,
-    arm_inner: ArmServo,
-) -> ArmServo:
-    """执行 return_home（停止内环线程 → 归位 → 重启内环线程）。"""
-    print("return_home ...", flush=True)
-    try:
-        # Stop inner loop to avoid dual XArmAPI connections
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        print("  Arm 内环线程已停止")
-
-        ok = robot.return_to_home(home_dt=HOME_DT)
-        print(f"  {'OK' if ok else 'FAIL'}")
-
-        # Restart inner loop
-        new_inner = make_arm_servo(cfg=INNER_LOOP_CFG)
-        robot.set_arm_servo(new_inner)
-        new_inner.start()
-        print("  Arm 内环线程已重启")
-        return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home 异常，尝试 emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
 
 # ═══════════════════════════════════════════════ 辅助函数
 
@@ -427,7 +322,7 @@ def main():
 
             if keys.is_pressed("r"):
                 print("\nR: return_home")
-                arm_inner = do_return_home(robot, planner, arm_inner)
+                arm_inner = do_return_home(robot, arm_inner, INNER_LOOP_CFG)
                 # Wait for new inner loop to be ready
                 if arm_inner.wait_ready(timeout=30.0):
                     arm_qpos, error_state, _ = arm_inner.get_state()
@@ -666,10 +561,8 @@ def main():
             action_valid, fail_reason = validate_action(
                 robot,
                 action,
-                actual_arm_qpos=arm_qpos,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_current=state.hand_current,
                 actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
@@ -711,7 +604,7 @@ def main():
         print("\n按 R 执行 return_home，或按 Q 直接退出...")
         while True:
             if keys.is_pressed("r"):
-                arm_inner = do_return_home(robot, planner, arm_inner)
+                arm_inner = do_return_home(robot, arm_inner, INNER_LOOP_CFG)
                 print("按 Q 退出...")
             if keys.is_pressed("q") or keys.is_pressed("esc"):
                 break

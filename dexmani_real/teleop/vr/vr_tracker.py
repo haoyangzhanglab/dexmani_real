@@ -149,30 +149,6 @@ class QuestHandTracker:
                 return None
             return self.copy_frame(self.latest_frame)
 
-    def read(self, timeout_s: float = 1.0) -> dict[str, Any]:
-        start = time.monotonic()
-
-        while True:
-            frame = self.get_latest()
-            if frame is not None:
-                key = (frame["sequence_id"], frame["recv_ts_ns"])
-                if key != self.last_read_key:
-                    self.last_read_key = key
-                    return frame
-
-            remain = timeout_s - (time.monotonic() - start)
-            if remain <= 0:
-                raise TimeoutError("No new VR frame received.")
-
-            self.event.wait(timeout=remain)
-            self.event.clear()
-
-    def clear(self) -> None:
-        with self.lock:
-            self.latest_frame = None
-        self.last_read_key = None
-        self.event.set()
-
     def get_status(self) -> dict[str, Any]:
         age = None
         sequence_id = None

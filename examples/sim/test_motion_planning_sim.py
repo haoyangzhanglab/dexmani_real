@@ -9,8 +9,8 @@
     python examples/sim/test_motion_planning_sim.py [--headless] [--seed SEED] [--episodes N]
 
 本文件还保留了 ~1000 行未被 main() 调用的参考代码 (ik_test, plan_and_execute,
-return_to_home_sim, sweep_z_min 等) — 这些函数提供 IK 成功率统计、单路径规划
-执行、归位测试、z_min 扫描等独立测试能力, 可供手动调用或重组。
+return_to_home_sim 等) — 这些函数提供 IK 成功率统计、单路径规划
+执行、归位测试等独立测试能力, 可供手动调用或重组。
 
 真机对应入口: examples/real/test_motion_planning_real.py (按序跑 Test1-Test5:
 solve_ik, solve_teleop_ik, plan_path, 硬件执行, IK 自碰撞)
@@ -31,6 +31,7 @@ import sapien.core as sapien
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import (
     CollisionConfig,
+    IKStats,
     PlanningProfile,
     Pose,
     TeleopProfile,
@@ -39,7 +40,7 @@ from dexmani_real.planning import (
 )
 from dexmani_real.planning.collision_model import CollisionModel
 from dexmani_real.planning.path_utils import interpolate_waypoints
-from dexmani_real.planning.pose_utils import angular_dist_rad, quat_multiply
+from dexmani_real.planning.pose_utils import angular_dist_rad, build_target_pose, quat_multiply
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat as quat_to_rotmat
 from dexmani_real.planning.pose_utils import random_quat_full_so3, random_quat_multi_axis, random_quat_within_angle
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface, execute_dense_path, settle_at_target
@@ -47,44 +48,6 @@ from dexmani_real.simulation.constructor import add_light, create_viewer
 
 # ═══════════════════════════════════════════════════════════════════
 # Local test utilities (lightweight — not worth a shared module)
-# ═══════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class IKStats:
-    """Aggregate IK test statistics."""
-
-    ok: int
-    total: int = 0
-    pos_errs_mm: list[float] = field(default_factory=list)
-    rot_errs_deg: list[float] = field(default_factory=list)
-    max_dq_deg: list[float] = field(default_factory=list)
-
-
-def build_target_pose(
-    pos: np.ndarray,
-    home_quat: np.ndarray,
-    rng: "np.random.RandomState | None" = None,
-    *,
-    rot_mode: str = "single_axis",
-    rot_max_deg: float = 30.0,
-    rot_axis1_deg: float = 45.0,
-    rot_axis2_deg: float = 30.0,
-) -> Pose:
-    """Build a target EEF pose with optional random rotation."""
-    quat = home_quat
-    if rng is None:
-        return Pose(p=pos, q=quat)
-    if rot_mode == "full_so3":
-        quat = random_quat_full_so3(rng)
-    elif rot_mode == "multi_axis":
-        delta_q = random_quat_multi_axis(rng, rot_axis1_deg, rot_axis2_deg)
-        quat = quat_multiply(delta_q, home_quat)
-    elif rot_mode == "single_axis" and rot_max_deg > 0:
-        quat = quat_multiply(random_quat_within_angle(rng, rot_max_deg), home_quat)
-    return Pose(p=pos, q=quat)
-
-
 # ═══════════════════════════════════════════════ 配置
 
 NUM_SAMPLES = 90  # 默认路径规划采样点（stratified 15 区域）
@@ -120,19 +83,10 @@ TABLE_TOP_Z = TABLE_CENTER[2] + TABLE_HALF[2]  # = 0.0 桌面上表面
 # 桌面碰撞检测使用 Pinocchio FK 直接计算五指指尖世界坐标。
 # home 手型下 pinky_tip 比 EEF 低 7.6cm（不是拇指的 11.3cm — 旧值是中间关节 ID 39 的 pinky_link2）。
 
-# ── 统一碰撞配置（通过 CollisionConfig 管理，替代之前分散的常量）──
-# 旧常量映射（仅作参考，不与 CollisionConfig 重复赋值）：
-#   HAND_EXTENSION_BELOW_EEF → collision_config.hand_extension_below_eef (0.076)
-#   HAND_SAFE_MARGIN         → collision_config.hand_safe_margin (0.03)
-#   DESK_SAFE_Z              → collision_config.desk_safe_z (0.106)
-#   REJECT_EPSILON           → FingertipDeskSafety._epsilon (0.001)
+# ── 统一碰撞配置（通过 CollisionConfig 管理）──
 collision_config = CollisionConfig(
     table_z_world=TABLE_TOP_Z,
-    hand_extension_below_eef=0.076,
-    hand_safe_margin=0.03,
 )
-# ── 统一碰撞模型（CollisionModel FCL 替代 DESK_SAFE_Z + FingertipDeskSafety）──
-# 不再使用 EEF 级固定阈值或 FK 指尖 Z 检测。
 # CollisionModel 支持 19-DOF 全模型 + table box obstacle 的 mesh 级碰撞检测。
 _env_cm: "CollisionModel | None" = None  # set by main()
 
@@ -142,59 +96,6 @@ def _get_cm() -> CollisionModel:
     return _env_cm
 
 
-# ═══════════════════════════════════════════════ CollisionModel 桌面碰撞 wrapper
-# 以下函数保持原有签名（兼容所有调用者），内部委托给 CollisionModel FCL。
-
-
-def check_path_desk_safety(
-    _planner,
-    path: np.ndarray,
-    step_rad: float = 0.02,
-) -> tuple[bool, float, int]:
-    """Check env collision along arm path using CollisionModel FCL (replaces FK Z)."""
-    cm = _get_cm()
-    path_arm = path[:, :7] if path.ndim == 2 and path.shape[1] > 7 else path
-    for i in range(len(path_arm) - 1):
-        if not cm.check_segment_env_collision_free(path_arm[i], path_arm[i + 1], step_rad):
-            return False, 0.0, i
-    return True, float("inf"), -1
-
-
-def check_hand_desk_clearance(
-    _planner,
-    qpos: np.ndarray,
-) -> tuple[bool, float, str]:
-    """Check env collision at single qpos using CollisionModel FCL (replaces FK Z)."""
-    cm = _get_cm()
-    q = np.asarray(qpos, dtype=np.float64)
-    in_collision = cm.check_env_collision(q)
-    return not in_collision, 0.0, "fcl" if in_collision else "ok"
-
-
-def check_hand_desk_clearance_sim(sim: SimRobotInterface) -> tuple[bool, float, str]:
-    """Sim FK → CollisionModel: check current sim arm qpos against table.
-
-    Uses planner's 7-DOF CollisionModel (collision URDF, hand fixed at home).
-    Home hand (open, max extension) is the most conservative check.
-    """
-    cm = _get_cm()
-    arm = sim.get_full_qpos()[:7]  # planner cm is 7-DOF
-    in_collision = cm.check_env_collision(arm)
-    return not in_collision, 0.0, "fcl" if in_collision else "ok"
-
-
-def check_path_desk_safety_sim(
-    _sim,
-    arm_path: np.ndarray,
-    step_rad: float = 0.02,
-) -> tuple[bool, float, int]:
-    """CollisionModel segment check using current sim hand (replaces FK Z)."""
-    cm = _get_cm()
-    path_arm = arm_path[:, :7] if arm_path.ndim == 2 and arm_path.shape[1] > 7 else arm_path
-    for i in range(len(path_arm) - 1):
-        if not cm.check_segment_env_collision_free(path_arm[i], path_arm[i + 1], step_rad):
-            return False, 0.0, i
-    return True, float("inf"), -1
 
 
 RANDOMIZE_HAND = True  # 是否随机化手部关节（默认开启，测试不同手型下的桌面碰撞）
@@ -257,11 +158,6 @@ GRASP_TYPES = {
 }
 GRASP_TYPE_NAMES = list(GRASP_TYPES.keys())
 
-# --test-desk 模式配置（聚焦桌面碰撞测试）
-TEST_DESK_NUM_SAMPLES = 30
-TEST_DESK_Z_RANGE = (0.02, 0.18)  # 桌面附近 Z 范围
-TEST_DESK_X_RANGE = (0.28, 0.70)
-TEST_DESK_Y_RANGE = (-0.35, 0.35)
 
 # 分层采样区域（Z低区重点覆盖：超低/很低/低 三档共 9 个子区域 vs 原来的 6 个）
 STRATIFIED_REGIONS = [
@@ -366,17 +262,8 @@ def animated_reset_to_home(
     n = max(2, int(np.ceil(dist / max_step_rad)) + 1)
     joint_path = np.array([current_qpos + (k / (n - 1)) * (home_qpos - current_qpos) for k in range(n)])
 
-    # ── Desk safety check: if direct joint path dips below desk, use 2-step safe path ──
+    # ── Build joint path ──
     effective_path = joint_path
-    if planner is not None:
-        desk_safe, min_z, _ = check_path_desk_safety(planner, joint_path)
-        if not desk_safe:
-            # Direct joint path would dip below desk — try two-step: lift → home
-            home_ik = _safe_two_step_home(sim, planner, home_qpos, viewer, max_step_rad)
-            if home_ik is not None:
-                err = settle_at_target(sim, home_qpos, hand_qpos)
-                return err
-            # Two-step failed too — fall through with original path (last resort)
 
     for wp in effective_path:
         if viewer is not None and viewer.closed:
@@ -540,10 +427,6 @@ def _safe_joint_path_sim(
         result = planner.check_path_collisions(path)
         if result.get("path_self_collision"):
             return None
-    # Desk safety: geometric Z check (no MPlib point cloud needed)
-    desk_safe, min_z, _ = check_path_desk_safety(planner, path)
-    if not desk_safe:
-        return None
     return path
 
 
@@ -575,11 +458,6 @@ def _lift_eef_z_safe_sim(
     lift_result = planner.solve_teleop_ik(lift_pose, current_qpos, current_qpos)
     if not lift_result.success or lift_result.qpos is None:
         print(f"  [_lift_eef_z_safe] Safety lift IK failed: {lift_result.reason}")
-        return False
-    # Verify lift target with hand FK (not just EEF Z)
-    lift_safe, lift_z, lift_name = check_hand_desk_clearance(planner, lift_result.qpos)
-    if not lift_safe:
-        print(f"  [_lift_eef_z_safe] Lift result {lift_name} z={lift_z:.3f}m < desk, skipping")
         return False
 
     # Execute lift in sim
@@ -649,33 +527,9 @@ def return_to_home_sim(
             "final_pos_err_mm": 0.0,
         }
 
-    # ── Pre-check: fingertip Z desk clearance ──
-    # Check actual fingertip positions (FK), not just EEF position.
-    # Hand extends 7.6cm below EEF (pinky tip) — EEF Z check alone misses hand-desk collision.
-    start_env_ok = True
-    start_safe, start_z, start_name = check_hand_desk_clearance(planner, current_qpos)
-    if not start_safe:
-        start_env_ok = False
-        print(f"  [return_to_home_sim] {start_name} z={start_z:.3f}m < desk+margin, " f"forcing safety lift")
-    else:
-        # Check joint path to home for fingertip Z violations
-        joint_delta = float(np.max(np.abs(current_qpos - home_qpos)))
-        if joint_delta > np.deg2rad(5.0):
-            test_n = min(10, int(np.ceil(joint_delta / np.deg2rad(5.0))) + 1)
-            for k in range(1, test_n):
-                alpha = k / test_n
-                test_q = current_qpos + alpha * (home_qpos - current_qpos)
-                safe, z, name = check_hand_desk_clearance(planner, test_q)
-                if not safe:
-                    start_env_ok = False
-                    print(
-                        f"  [return_to_home_sim] Joint path to home: {name} dips below desk "
-                        f"(α={alpha:.2f}, z={z:.3f}m), forcing safety lift"
-                    )
-                    break
-
     # ── Phase 1: EEF Cartesian path ──
     phase1_completed = False
+    start_env_ok = True
     if start_env_ok:
         try:
             result = planner.plan_path(home_eef, current_qpos)
@@ -686,16 +540,10 @@ def return_to_home_sim(
         result = None
 
     if result is not None and result.success and result.qpos_path is not None and len(result.qpos_path) > 0:
-        # Segment-based collision verification: self (MPlib FCL) + desk (geometric Z)
+        # Segment-based collision verification: self (MPlib FCL)
         self_check = planner.check_path_collisions(result.qpos_path)
-        desk_safe, min_z, viol_idx = check_path_desk_safety(planner, result.qpos_path)
         if self_check.get("path_self_collision"):
             print(f"  [return_to_home_sim] Phase 1 path has self-collision, falling back")
-        elif not desk_safe:
-            print(
-                f"  [return_to_home_sim] Phase 1 path dips below desk "
-                f"(fingertip_z_min={min_z:.3f}m, waypoint {viol_idx}), falling back"
-            )
         else:
             # Dense interpolation (1° step, mirrors interface._dense_interpolate)
             dense_path = _dense_interpolate_sim(result.qpos_path)
@@ -939,7 +787,7 @@ def plan_safe_descent(
     hand_qpos = sim.get_full_qpos()[7:].copy()
 
     # Stage 1: plan to waypoint above target (same XY, safe Z)
-    safe_z = max(target_eef.p[2] + 0.10, TABLE_TOP_Z + collision_config.hand_safe_margin + 0.05)
+    safe_z = max(target_eef.p[2] + 0.10, TABLE_TOP_Z + 0.08)
     safe_z = min(safe_z, 0.55)
     above_pose = Pose(
         p=np.array([target_eef.p[0], target_eef.p[1], safe_z], dtype=np.float64),
@@ -955,11 +803,6 @@ def plan_safe_descent(
     if stage1_result is None or not stage1_result.success or stage1_result.qpos_path is None:
         return None, f"stage1 plan failed: {stage1_result.reason if stage1_result else 'None'}"
 
-    # Verify stage1 path is desk-safe
-    desk_safe, min_z, _ = check_path_desk_safety(planner, stage1_result.qpos_path)
-    if not desk_safe:
-        return None, f"stage1 path dips below desk (z_min={min_z:.3f}m)"
-
     # Stage 2: plan from above to target (short vertical descent)
     stage1_end = stage1_result.qpos_path[-1]
     try:
@@ -969,11 +812,6 @@ def plan_safe_descent(
 
     if stage2_result is None or not stage2_result.success or stage2_result.qpos_path is None:
         return None, f"stage2 plan failed: {stage2_result.reason if stage2_result else 'None'}"
-
-    # Verify stage2 path is also desk-safe (should be a short vertical motion)
-    desk_safe2, min_z2, _ = check_path_desk_safety(planner, stage2_result.qpos_path)
-    if not desk_safe2:
-        return None, f"stage2 path dips below desk (z_min={min_z2:.3f}m)"
 
     # Combine paths: stage1 (excluding last wp which overlaps with stage2 start)
     full_path = np.vstack([stage1_result.qpos_path[:-1], stage2_result.qpos_path])
@@ -1008,14 +846,8 @@ def plan_and_execute(
     viewer: sapien.Viewer | None = None,
     label: str = "",
     joint_goal: np.ndarray | None = None,
-    check_desk_with_sim: bool = False,
 ) -> bool:
-    """plan_path(target_eef) → 执行 → 验证 EEF 精度 + 指尖正确性。
-
-    Args:
-        check_desk_with_sim: 若 True，执行后用 sim FK 做精确指尖碰撞检测
-                            （用于手部随机化场景，planner FK 预检仍保留作快速筛选）
-    """
+    """plan_path(target_eef) → 执行 → 验证 EEF 精度 + 指尖正确性。"""
     current_qpos = sim.get_full_qpos()[:7]
     current_eef = planner.compute_eef_pose_world(current_qpos)
     dist = float(np.linalg.norm(target_eef.p - current_eef.p))
@@ -1040,52 +872,17 @@ def plan_and_execute(
         f"len={r.get('joint_path_length',0):.2f}rad  t={time.perf_counter()-t0:.3f}s"
     )
 
-    # ── 桌面安全预检查（planner FK，固定手型保守估计）──
-    # 如果手部已随机化 (check_desk_with_sim=True)，planner FK 预检可能偏保守
-    # （collision URDF 手型可能比实际手型更低），保留作快速筛选但不作为最终依据。
-    desk_safe, min_z, viol_idx = check_path_desk_safety(planner, path)
-    used_safe_descent = False
-
-    if not desk_safe:
-        # ── 路径有桌面碰撞 → 尝试安全下降（模拟真机遥操作）──
-        print(f"  [{label}] 🔽 path has env collision → trying safe descent")
-        descent_path, descent_desc = plan_safe_descent(planner, sim, target_eef, viewer)
-        if descent_path is not None:
-            print(f"  [{label}] ✅ safe descent: {descent_desc}")
-            path = descent_path
-            used_safe_descent = True
-            desk_safe = True  # override: path is now safe
-
-        if not desk_safe and not check_desk_with_sim:
-            print(f"  [{label}] ❌ DESK COLLISION (CollisionModel FCL): waypoint {viol_idx}")
-            return False
-        elif not desk_safe:
-            print(f"  [{label}] ⚠️  CollisionModel预检不安全 → 执行后用 sim FK 确认")
-
-    if not used_safe_descent:
-        if joint_goal is not None:
-            path = append_joint_goal(planner, path, joint_goal)
+    if joint_goal is not None:
+        path = append_joint_goal(planner, path, joint_goal)
 
     dense = interpolate_waypoints(path, INTERP_MAX_STEP_RAD)
     print(f"  [{label}] exec {len(dense)} wp")
 
-    if not used_safe_descent:
-        # Normal execution (safe_descent already executed the path)
-        tips_before = check_fingertips(sim)
-        hand_qpos = sim.get_full_qpos()[7:]
-        execute_dense_path(sim, dense, viewer, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
-        settle_at_target(sim, dense[-1, :7], hand_qpos)
-
-    if used_safe_descent:
-        # safe_descent already executed the path; need tips_before for drift check
-        tips_before = check_fingertips(sim)
-    # ── CollisionModel 桌面碰撞确认（用于手部随机化场景）──
-    desk_ok = True
-    if check_desk_with_sim:
-        sim_desk_safe, _sim_z, sim_viol = check_path_desk_safety_sim(sim, path)
-        if not sim_desk_safe:
-            print(f"  [{label}] ❌ DESK COLLISION (CollisionModel FCL): waypoint {sim_viol}")
-            desk_ok = False
+    # Normal execution
+    tips_before = check_fingertips(sim)
+    hand_qpos = sim.get_full_qpos()[7:]
+    execute_dense_path(sim, dense, viewer, physics_steps_per_wp=PHYSICS_STEPS_PER_WP)
+    settle_at_target(sim, dense[-1, :7], hand_qpos)
 
     # 验证
     final_qpos = sim.get_full_qpos()[:7]
@@ -1103,12 +900,11 @@ def plan_and_execute(
     tips_after = check_fingertips(sim)
     tip_drift_mm = float(np.max(np.abs(tips_after.tip_eef_local - tips_before.tip_eef_local))) * 1000
     tip_ok = tips_after.sapien_fk_delta_mm < 1.0 and tip_drift_mm < 2.0
-    ok = ok and tip_ok and desk_ok
+    ok = ok and tip_ok
 
     print(
         f"  [{label}] pos_err={pos_err:.4f}m  rot_err={np.rad2deg(rot_err):.2f}deg{joint_str}  "
         f"tip_s2fk={tips_after.sapien_fk_delta_mm:.2f}mm tip_drift={tip_drift_mm:.2f}mm  "
-        f"{'desk!' if not desk_ok else ''}  "
         f"[{'OK' if ok else 'FAIL'}]"
     )
     return ok
@@ -1245,182 +1041,6 @@ def _setup_viewer(sim: SimRobotInterface) -> sapien.Viewer | None:
     )
 
 
-# ═══════════════════════════════════════════════ z_min 网格搜索
-
-
-def sweep_z_min(
-    sim_config: dict,
-    headless: bool = True,
-    num_samples: int = 30,
-    seed: int = SEED,
-    with_objects: bool = False,
-) -> None:
-    """网格搜索最优 hand_safe_margin，平衡安全性与可达性。
-
-    对 margin ∈ [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06] m 逐值测试：
-      - 运行 --test-desk 模式（30 个低 Z 目标）
-      - 统计：碰撞次数、可达目标数、IK 成功率
-
-    输出 trade-off 表格，帮助选择最佳 z_min。
-    """
-    margins = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
-    results = []
-
-    for margin in margins:
-        # Build a CollisionConfig with this margin
-        cfg = collision_config.with_overrides(hand_safe_margin=margin)
-        desk_safe_z = cfg.desk_safe_z
-
-        print(f"\n{'='*60}")
-        print(
-            f"Sweep: margin={margin:.2f}m  desk_safe_z={desk_safe_z:.3f}m  "
-            f"fingertip_threshold={cfg.fingertip_threshold:.3f}m"
-        )
-        print(f"{'='*60}")
-
-        # Run single test with this config
-        stat = _run_desk_test(
-            collision_cfg=cfg,
-            headless=headless,
-            num_samples=num_samples,
-            seed=seed,
-            with_objects=with_objects,
-        )
-        results.append((margin, desk_safe_z, stat))
-
-    # Print summary table
-    print(f"\n{'='*70}")
-    print(f"{'margin(m)':<10} {'desk_safe_z(m)':<15} {'collisions':<12} " f"{'reachable':<12} {'rate':<8}")
-    print(f"{'-'*10} {'-'*15} {'-'*12} {'-'*12} {'-'*8}")
-    for margin, desk_safe_z, stat in results:
-        collisions_str = f"{stat['desk_collisions']}/{stat['total']}"
-        reachable_str = f"{stat['reachable']}/{stat['total']}"
-        rate_str = f"{stat['rate']:.0f}%"
-        print(f"{margin:<10.2f} {desk_safe_z:<15.3f} {collisions_str:<12} " f"{reachable_str:<12} {rate_str:<8}")
-    print(f"{'='*70}")
-    print("  collisions = sim FK detected fingertip-desk collisions")
-    print("  reachable = successfully planned and executed targets")
-    print("  rate = reachable / total * 100%")
-
-
-def _run_desk_test(
-    collision_cfg: CollisionConfig,
-    headless: bool = True,
-    num_samples: int = 30,
-    seed: int = SEED,
-    with_objects: bool = False,
-) -> dict:
-    """Run a single --test-desk configuration and return statistics."""
-    rng = np.random.RandomState(seed)
-
-    sim = SimRobotInterface(SimRobotConfig(headless=headless))
-    if not sim.connect():
-        return {"desk_collisions": 0, "reachable": 0, "total": 0, "rate": 0.0}
-
-    root_pose = sim.robot.model.get_root_pose()
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
-            base_pose_world=Pose(p=np.array(root_pose.p), q=np.array(root_pose.q)),
-            workspace_bounds=np.array([[0.0, 0.75], [-0.5, 0.5], [0.0, 0.6]], dtype=np.float64),
-            collision=collision_cfg,
-        ),
-        planning_profile=PlanningProfile(
-            max_waypoint_delta_deg=360.0,
-            max_ik_delta_deg=(180,) * 7,
-            max_pose_error_rot_rad=np.deg2rad(5.0),
-            num_random_ik_seeds=30,
-            rrt_time_limit=2.0,
-            num_rrt_attempts=2,
-            random_seed=seed,
-            check_env_collision=True,  # enable FK desk safety in validate_path
-        ),
-        teleop_profile=TeleopProfile(
-            check_self_collision=True,
-            max_pose_error_pos_m=0.01,
-            max_pose_error_rot_rad=np.deg2rad(5.0),
-        ),
-    )
-
-    home_qpos = sim.config.arm_home_qpos.copy()
-    home_eef = planner.compute_eef_pose_world(home_qpos)
-    home_quat = home_eef.q.copy()
-
-    # Add table-top objects if requested
-    table_objects = []
-    if with_objects:
-        table_objects = _spawn_table_objects(sim, rng, n_objects=3)
-
-    sim.reset()
-    for _ in range(5):
-        sim._step_physics(n=10)
-
-    # Desk test targets: low Z range
-    target_positions = np.column_stack(
-        [
-            rng.uniform(*TEST_DESK_X_RANGE, num_samples),
-            rng.uniform(*TEST_DESK_Y_RANGE, num_samples),
-            rng.uniform(*TEST_DESK_Z_RANGE, num_samples),
-        ]
-    )
-
-    reachable = 0
-    desk_collisions = 0
-
-    for i, pos in enumerate(target_positions):
-        # Randomize hand
-        hand_qpos, _grasp_type = hand_grasp_pose(rng)
-        target_full = np.concatenate([sim.get_full_qpos()[:7], hand_qpos])
-        smooth_drive_to_target(sim, target_full, None, max_iter=30, label=f"sweep_{i+1}")
-
-        target_pose = build_target_pose(
-            pos,
-            home_quat,
-            rng,
-            rot_mode=ROT_MODE,
-            rot_max_deg=ROT_MAX_DEG,
-            rot_axis1_deg=ROT_AXIS1_DEG,
-            rot_axis2_deg=ROT_AXIS2_DEG,
-        )
-        current_qpos = sim.get_full_qpos()[:7]
-
-        result = planner.plan_path(target_pose, current_qpos)
-        if not result.success or result.qpos_path is None:
-            continue
-
-        # Execute path
-        path = result.qpos_path
-        hand = sim.get_full_qpos()[7:]
-        for wp in path:
-            sim.robot.balance_passive_force()
-            sim.robot.apply_action(np.concatenate([wp, hand]))
-            sim._step_physics(n=PHYSICS_STEPS_PER_WP)
-
-        settle_at_target(sim, path[-1, :7], hand)
-
-        # CollisionModel desk check
-        desk_safe, _, _ = check_hand_desk_clearance_sim(sim)
-        if not desk_safe:
-            desk_collisions += 1
-            continue
-
-        reachable += 1
-
-    # Clean up table objects
-    for obj in table_objects:
-        sim.scene.remove_actor(obj)
-
-    sim.disconnect()
-
-    total = num_samples
-    rate = (reachable / total * 100) if total > 0 else 0.0
-    return {
-        "desk_collisions": desk_collisions,
-        "reachable": reachable,
-        "total": total,
-        "rate": rate,
-    }
 
 
 def _spawn_table_objects(
@@ -1559,7 +1179,7 @@ def execute_path_with_collision_hold(
     """执行 arm 关节路径，逐 waypoint 碰撞检测 + HOLD 行为。
 
     先检查再执行（与遥操作 HOLD 模式一致）：
-      1. cm.check_teleop_collision(wp) → 碰撞检测
+      1. cm.check_self_collision / check_env_collision → 碰撞检测
       2. 碰撞 → [HOLD] sleep → retry 同一 waypoint
       3. 连续 > MAX_CONSECUTIVE_HOLDS → [SKIP]
       4. 总计 > MAX_TOTAL_HOLDS → [ABORT]
@@ -1578,7 +1198,8 @@ def execute_path_with_collision_hold(
         # ── 碰撞检测：先检查后执行 ──
         # True: self+env → HOLD; "warn": self→HOLD, env→日志; False: self-only
         if check_env is True:
-            has_self, has_env = cm.check_teleop_collision(wp)
+            has_self = cm.check_self_collision(wp)
+            has_env = cm.check_env_collision(wp)
         elif check_env == "warn":
             has_self = cm.check_self_collision(wp)
             has_env = cm.check_env_collision(wp)  # Tier2 FCL, 比 Tier1 更精确
@@ -1691,7 +1312,8 @@ def pick_and_place_episode(
         candidate_type = rng.choice(GRASP_TYPES_ALL) if rng else "hook"
         candidate_qpos, _ = hand_grasp_pose(rng, grasp_type=candidate_type)
         cm.set_hand_qpos(candidate_qpos)
-        has_self, has_env = cm.check_teleop_collision(arm_at_home)
+        has_self = cm.check_self_collision(arm_at_home)
+        has_env = cm.check_env_collision(arm_at_home)
         if not has_self and not has_env:
             grasp_hand_qpos = candidate_qpos
             grasp_type = candidate_type
@@ -1977,7 +1599,7 @@ def main():
         half_z=TABLE_HALF[2],
     )
     print(
-        f"  CollisionModel: {cm.nq}-DOF, {cm._collision_model.ngeoms} geometries, "
+        f"  CollisionModel: {cm._nq}-DOF, {cm._collision_model.ngeoms} geometries, "
         f"{len(cm._collision_model.collisionPairs)} pairs"
     )
     print(f"  桌面障碍物: table @ z_top={TABLE_TOP_Z:.1f}m")
@@ -2084,7 +1706,6 @@ def main():
             f"{r.total_holds:>5d}  {r.duration_s:>5.1f}s  {status}"
         )
 
-    cm.clear_obstacles()
     if viewer and not viewer.closed:
         print("\nClose viewer to exit...")
         while not viewer.closed:

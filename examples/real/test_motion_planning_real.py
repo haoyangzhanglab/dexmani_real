@@ -30,10 +30,11 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning import IKStats, PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import (
     angular_dist_rad,
+    build_target_pose,
     quat_multiply,
     random_quat_full_so3,
     random_quat_multi_axis,
@@ -43,49 +44,6 @@ from dexmani_real.robot.xarm7 import XArm7, XArm7Config
 
 # ═══════════════════════════════════════════════════════════════════
 # Local test utilities (lightweight — not worth a shared module)
-# ═══════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class IKStats:
-    """Aggregate IK test statistics."""
-
-    ok: int
-    total: int = 0
-    pos_errs_mm: list[float] = field(default_factory=list)
-    rot_errs_deg: list[float] = field(default_factory=list)
-    max_dq_deg: list[float] = field(default_factory=list)
-
-
-def ik_stats_empty() -> IKStats:
-    """Return a zeroed IKStats instance."""
-    return IKStats(ok=0, total=0, pos_errs_mm=[], rot_errs_deg=[], max_dq_deg=[])
-
-
-def build_target_pose(
-    pos: np.ndarray,
-    home_quat: np.ndarray,
-    rng: "np.random.RandomState | None" = None,
-    *,
-    rot_mode: str = "single_axis",
-    rot_max_deg: float = 30.0,
-    rot_axis1_deg: float = 45.0,
-    rot_axis2_deg: float = 30.0,
-) -> Pose:
-    """Build a target EEF pose with optional random rotation."""
-    quat = home_quat
-    if rng is None:
-        return Pose(p=pos, q=quat)
-    if rot_mode == "full_so3":
-        quat = random_quat_full_so3(rng)
-    elif rot_mode == "multi_axis":
-        delta_q = random_quat_multi_axis(rng, rot_axis1_deg, rot_axis2_deg)
-        quat = quat_multiply(delta_q, home_quat)
-    elif rot_mode == "single_axis" and rot_max_deg > 0:
-        quat = quat_multiply(random_quat_within_angle(rng, rot_max_deg), home_quat)
-    return Pose(p=pos, q=quat)
-
-
 # ═══════════════════════════════════════════════ 配置
 
 DEFAULT_NUM_SAMPLES = 8
@@ -221,7 +179,7 @@ def test_solve_ik(
     )
     targets = [build_target_pose(positions[i], home_eef.q, rng, rot_max_deg=RANDOM_ROT_DEG) for i in range(num_samples)]
 
-    fresh = ik_stats_empty()
+    fresh = IKStats(ok=0)
     fresh.total = num_samples
     for target in targets:
         r = planner.solve_ik(target, home_qpos)
@@ -232,7 +190,7 @@ def test_solve_ik(
             fresh.rot_errs_deg.append(np.rad2deg(angular_dist_rad(eef.q, target.q)))
             fresh.max_dq_deg.append(float(np.max(np.abs(np.rad2deg(r.qpos - home_qpos)))))
 
-    chained = ik_stats_empty()
+    chained = IKStats(ok=0)
     chained.total = num_samples
     seed = home_qpos.copy()
     for target in targets:
@@ -258,7 +216,7 @@ def test_solve_teleop_ik(
     rng: np.random.RandomState,
 ) -> IKStats:
     """solve_teleop_ik() 批量随机游走验证 (不移动硬件)。"""
-    stats = ik_stats_empty()
+    stats = IKStats(ok=0)
     home_eef = planner.compute_eef_pose_world(home_qpos)
 
     positions = [home_eef.p.copy()]

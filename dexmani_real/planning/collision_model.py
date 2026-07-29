@@ -31,15 +31,11 @@ Usage::
     cm.check_self_collision_details(qpos)   # CollisionInfo (from types.py)
     cm.add_box_obstacle("table", [1.0,2.0,0.04], [0.5, 0.0, -0.04])
     cm.check_env_collision(qpos)            # bool — full two-tier (path planning)
-    cm.check_env_collision_fast(qpos)       # bool — Tier 1 only (teleop hot path)
-    cm.check_teleop_collision(qpos)         # (has_self, has_env) — single-FK (teleop)
-    cm.remove_obstacle("table")             # remove a single obstacle
-    cm.clear_obstacles()                    # remove all obstacles
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -126,60 +122,16 @@ class CollisionModel:
 
         self._pin = pin
 
-        # ── FCL Python bindings ──
-        # Prefer coal (hpp-fcl >= 3.0, pybind11).  Fall back to hppfcl
-        # (hpp-fcl 2.x, Boost.Python) via the cmeel .so which must be
-        # loaded directly to bypass a namespace-package shadow.
+        # ── FCL Python bindings (coal, hpp-fcl >= 3.0) ──
         self._fcl = None
         try:
             import coal as fcl
         except ImportError:
-            import importlib.machinery as _imach
-            import importlib.util as _iutil
-            import logging as _logging
-            import os as _os
-            import sys as _sys
-
-            _log = _logging.getLogger(__name__)
-            try:
-                # Remove any stale namespace-only hppfcl cached by pinocchio.
-                for _key in list(_sys.modules):
-                    if _key.startswith("hppfcl"):
-                        del _sys.modules[_key]
-
-                # Locate the cmeel hppfcl .so.
-                _so_path = None
-                for _p in _sys.path:
-                    _d = _os.path.join(_p, "hppfcl")
-                    if _os.path.isdir(_d):
-                        for _f in _os.listdir(_d):
-                            if _f.startswith("hppfcl") and _f.endswith(".so"):
-                                _so_path = _os.path.join(_d, _f)
-                                break
-                    if _so_path:
-                        break
-
-                if _so_path is None:
-                    raise ImportError("hppfcl .so not found in sys.path")
-
-                # Any: ModuleSpec.loader is typed Loader | None, but here it is exactly
-                # the ExtensionFileLoader constructed inline below (never None).
-                _spec: Any = _imach.ModuleSpec(
-                    "hppfcl",
-                    _imach.ExtensionFileLoader("hppfcl", _so_path),
-                    origin=_so_path,
-                )
-                _mod = _iutil.module_from_spec(_spec)
-                _sys.modules["hppfcl"] = _mod  # MUST be set before exec_module
-                _spec.loader.exec_module(_mod)
-                fcl = _mod
-                _log.info("hppfcl loaded from cmeel .so (%s)", _so_path)
-            except Exception:
-                _log.info(
-                    "hppfcl unavailable — Tier-2 FCL env collision disabled. "
-                    "Self-collision, Tier-1 Z-min, and FingertipDeskSafety remain active."
-                )
-                fcl = None
+            logger.info(
+                "hppfcl unavailable — Tier-2 FCL env collision disabled. "
+                "Self-collision and Tier-1 Z-min remain active."
+            )
+            fcl = None
 
         if fcl is not None:
             self._fcl = fcl
@@ -269,10 +221,9 @@ class CollisionModel:
         # --- qpos shape cache for validation ---
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
 
-        # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF)
-        self._hand_qpos: np.ndarray = np.zeros(_HAND_DOF_COUNT, dtype=np.float64)
-        self._hand_qpos_initialized: bool = False
-        self._hand_qpos_warned: bool = False  # throttle warning to once per instance
+        # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF).
+        # None = not yet set by caller; set_hand_qpos() assigns a real array.
+        self._hand_qpos: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # qpos handling
@@ -305,7 +256,6 @@ class CollisionModel:
             raise ValueError("hand_qpos contains NaN or Inf — FK would silently fail")
         # Reorder user→URDF: _hand_user_to_urdf[i] = which user index maps to URDF slot i
         self._hand_qpos = hand_qpos[list(_HAND_USER_TO_URDF)]
-        self._hand_qpos_initialized = True
 
     def _to_full_qpos(self, qpos: np.ndarray) -> np.ndarray:
         """Normalize qpos for internal use, auto-expanding arm→full in hand_dof mode.
@@ -316,14 +266,13 @@ class CollisionModel:
         """
         qpos = np.asarray(qpos, dtype=np.float64)
         if self._hand_dof and qpos.shape == (7,):
-            if not self._hand_qpos_initialized:
-                if not self._hand_qpos_warned:
-                    logger.warning(
-                        "hand_qpos not initialized — collision checks use zero (open-hand) pose, "
-                        "which may not match actual hand configuration. "
-                        "Call set_hand_qpos() before collision checks."
-                    )
-                    self._hand_qpos_warned = True
+            if self._hand_qpos is None:
+                logger.warning(
+                    "hand_qpos not initialized — collision checks use zero (open-hand) pose, "
+                    "which may not match actual hand configuration. "
+                    "Call set_hand_qpos() before collision checks."
+                )
+                return np.concatenate([qpos, np.zeros(_HAND_DOF_COUNT, dtype=np.float64)])
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:
             raise ValueError(
@@ -496,9 +445,7 @@ class CollisionModel:
             # Conservative: Tier 1 passed (robot near obstacle), but without FCL
             # we cannot rule out collision → assume collision.
             # In practice, this path is only reached during motion planning /
-            # return-to-home (teleop hot path uses check_env_collision_fast,
-            # which is Tier-1-only).  Desk safety is still enforced by
-            # FingertipDeskSafety (FK-based) in the planner's validate_path().
+            # return-to-home.
             return True
 
         result = self._fcl.CollisionResult()
@@ -531,56 +478,6 @@ class CollisionModel:
                     return True
         return False
 
-    def check_env_collision_fast(self, qpos: np.ndarray) -> bool:
-        """Tier-1-only env collision check for the teleop hot path (~17 μs, zero FCL).
-
-        Conservative: returns True when Z-min cannot rule out a collision
-        (i.e. some robot geometry is within ``_Z_TIER1_MARGIN`` of an obstacle).
-        The full ``check_env_collision()`` with Tier 2 FCL is reserved for path
-        planning and return-to-home, where the 2–8 ms penalty is acceptable.
-
-        In practice, teleop operators keep the hand visibly above the table, so
-        Tier 1 almost always passes and this returns False.
-        """
-        if not self._obstacle_names or not self._robot_geom_ids:
-            return False
-        qpos = self._update_placements(qpos)
-        oMg = self._collision_data.oMg
-        return self._tier1_z_check(oMg)
-
-    def check_teleop_collision(self, qpos: np.ndarray) -> tuple[bool, bool]:
-        """Single-FK self + env Tier-1 collision check for teleop hot path (~35 μs).
-
-        Replaces two separate FK calls (``check_self_collision`` + ``check_env_collision_fast``,
-        ~52 μs total) with a single FK+placements pass.  Self-collision uses
-        ``computeCollisions(stop_at_first=True)``; env collision uses the Tier-1
-        Z-min pre-filter on the same FK result (zero extra cost).
-
-        Returns ``(has_self_collision, has_env_collision)``.
-        """
-        qpos_full = self._to_full_qpos(qpos)
-        self._pin.forwardKinematics(self._model, self._data, qpos_full)
-        self._pin.updateGeometryPlacements(
-            self._model,
-            self._data,
-            self._collision_model,
-            self._collision_data,
-        )
-
-        # Self-collision: full FCL with early exit on first contact
-        has_self = self._pin.computeCollisions(
-            self._model,
-            self._data,
-            self._collision_model,
-            self._collision_data,
-            qpos_full,
-            True,
-        )
-
-        # Env collision: Tier-1 Z-min on the SAME placements (zero extra FK)
-        has_env = bool(self._obstacle_names and self._robot_geom_ids and self._tier1_z_check(self._collision_data.oMg))
-
-        return has_self, has_env
 
     # ------------------------------------------------------------------
     # Obstacle management (T-Rex add_env_obstacles pattern)
@@ -611,8 +508,7 @@ class CollisionModel:
             raise RuntimeError(
                 f"Cannot add box obstacle '{name}': FCL bindings (coal or hppfcl) unavailable. "
                 f"Tier-2 FCL env collision is disabled. "
-                f"Desk safety is covered by FingertipDeskSafety (FK-based) — "
-                f"set enable_env_collision=False."
+                f"Set enable_env_collision=False to bypass."
             )
 
         rot = rotation if rotation is not None else np.eye(3)
@@ -683,41 +579,6 @@ class CollisionModel:
             position=(x_center, 0.0, table_height - half_z),
         )
 
-    def remove_obstacle(self, name: str) -> bool:
-        """Remove a box obstacle by name.
-
-        Returns True if the obstacle was found and removed, False otherwise.
-        After removal, the collision data is refreshed and the Z-max cache
-        is updated.
-        """
-        if name not in self._obstacle_names:
-            return False
-        self._collision_model.removeGeometryObject(name)
-        self._obstacle_names.discard(name)
-        self._obstacle_boxes.pop(name, None)
-        self._obstacle_geom_ids.pop(name, None)
-        # Update cached Z-max
-        self._obs_z_max = max(
-            (box[_BB_ZMAX] for box in self._obstacle_boxes.values()),
-            default=float("-inf"),
-        )
-        self._collision_data = self._collision_model.createData()
-        logger.info("Removed obstacle '%s'", name)
-        return True
-
-    def clear_obstacles(self) -> int:
-        """Remove all box obstacles.  Returns the number of obstacles cleared."""
-        count = len(self._obstacle_names)
-        for name in list(self._obstacle_names):
-            self._collision_model.removeGeometryObject(name)
-        self._obstacle_names.clear()
-        self._obstacle_boxes.clear()
-        self._obstacle_geom_ids.clear()
-        self._obs_z_max = float("-inf")
-        self._collision_data = self._collision_model.createData()
-        logger.info("Cleared %d obstacle(s)", count)
-        return count
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -744,49 +605,11 @@ class CollisionModel:
             return self._link_names[parent_joint]
         return geom.name
 
-    def pad_arm_for_fk(self, qpos_arm: np.ndarray) -> np.ndarray:
-        """Pad 7-DOF arm qpos to full model dimension for FK queries.
-
-        Used by external FK consumers (e.g. FingertipDeskSafety) that need
-        a full qpos for the Pinocchio model.  In 7-DOF mode the model already
-        has hand joints fixed at home, so arm qpos is returned as-is.  In
-        19-DOF mode the hand DOFs are taken from the ``_hand_qpos`` buffer
-        (set via ``set_hand_qpos()``), falling back to zeros when the buffer
-        has not been initialized.
-
-        Args:
-            qpos_arm: 7-DOF arm joint angles [rad].
-
-        Returns:
-            Full qpos of shape ``(self._nq,)`` suitable for FK.
-        """
-        qpos = np.asarray(qpos_arm, dtype=np.float64)
-        if qpos.shape != (7,):
-            raise ValueError(f"Expected arm qpos shape (7,), got {qpos.shape}")
-        if not self._hand_dof:
-            return qpos
-        hand = self._hand_qpos if self._hand_qpos_initialized else np.zeros(_HAND_DOF_COUNT, dtype=np.float64)
-        return np.concatenate([qpos, hand])
-
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
     @property
-    def nq(self) -> int:
-        return self._nq
-
-    @property
     def hand_dof(self) -> bool:
         """Whether this model includes active hand joints (19-DOF vs 7-DOF)."""
         return self._hand_dof
-
-    @property
-    def pinocchio_model(self):
-        """The underlying Pinocchio model (read-only)."""
-        return self._model
-
-    @property
-    def pinocchio_data(self):
-        """The underlying Pinocchio data (read-only)."""
-        return self._data

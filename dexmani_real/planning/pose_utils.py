@@ -214,9 +214,11 @@ def random_quat_full_so3(rng: np.random.RandomState) -> np.ndarray:
     """Uniformly sample SO(3) full-space random quaternion (wxyz).
 
     Uses the Marsaglia method (uniform distribution on the unit sphere in S³).
+    The raw Marsaglia output is xyzw; we convert to wxyz for consistency with
+    every other quaternion function in this module.
     """
     u = rng.uniform(0, 1, 3)
-    q = np.array(
+    q_xyzw = np.array(
         [
             np.sqrt(1 - u[0]) * np.sin(2 * np.pi * u[1]),
             np.sqrt(1 - u[0]) * np.cos(2 * np.pi * u[1]),
@@ -224,8 +226,8 @@ def random_quat_full_so3(rng: np.random.RandomState) -> np.ndarray:
             np.sqrt(u[0]) * np.cos(2 * np.pi * u[2]),
         ]
     )
-    q /= np.linalg.norm(q)
-    return q
+    q_xyzw /= np.linalg.norm(q_xyzw)
+    return xyzw_to_wxyz(q_xyzw)
 
 
 def random_quat_multi_axis(
@@ -266,3 +268,33 @@ def random_quat_multi_axis(
     q2 = np.array([np.cos(half2), a2[0] * np.sin(half2), a2[1] * np.sin(half2), a2[2] * np.sin(half2)])
 
     return quat_multiply(q2, q1)  # R₂ * R₁
+
+
+def build_target_pose(
+    pos: np.ndarray,
+    home_quat: np.ndarray,
+    rng: "np.random.RandomState | None" = None,
+    *,
+    rot_mode: str = "single_axis",
+    rot_max_deg: float = 30.0,
+    rot_axis1_deg: float = 45.0,
+    rot_axis2_deg: float = 30.0,
+) -> "Pose":
+    """Build a target EEF pose with optional random rotation.
+
+    Used in motion planning benchmarks to generate target poses with
+    controlled orientation perturbation.
+    """
+    from .types import Pose
+
+    quat = home_quat
+    if rng is None:
+        return Pose(p=pos, q=quat)
+    if rot_mode == "full_so3":
+        quat = random_quat_full_so3(rng)
+    elif rot_mode == "multi_axis":
+        delta_q = random_quat_multi_axis(rng, rot_axis1_deg, rot_axis2_deg)
+        quat = quat_multiply(delta_q, home_quat)
+    elif rot_mode == "single_axis" and rot_max_deg > 0:
+        quat = quat_multiply(random_quat_within_angle(rng, rot_max_deg), home_quat)
+    return Pose(p=pos, q=quat)

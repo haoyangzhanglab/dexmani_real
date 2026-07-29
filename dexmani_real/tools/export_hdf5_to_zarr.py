@@ -77,12 +77,11 @@ _ACTION_KEYS: list[tuple[str, int]] = [
 def _detect_camera_keys(reader: EpisodeReader) -> list[tuple[str, str, str]]:
     """Return list of (rgb_key, depth_key, label) for all cameras in the file.
 
-    ``label`` is "" for single-camera or the serial string for multi-camera.
-    Detects both legacy HDF5 datasets and video sidecars.
+    Detects HDF5 datasets.
     """
     f = reader.h5f
     pairs: list[tuple[str, str, str]] = []
-    if "rgb" in f or reader.has_video("rgb"):
+    if "rgb" in f:
         pairs.append(("rgb", "depth", ""))
     for key in sorted(f.keys()):
         if key.endswith("_rgb") and key != "rgb":
@@ -125,7 +124,8 @@ def _read_episode_meta(h5_path: Path) -> dict:
     was held — no fresh VR/IK result) computed from /flag_held when present.
     """
     try:
-        with h5py.File(str(h5_path), "r") as f:
+        with EpisodeReader(h5_path) as reader:
+            f = reader.h5f
             if "meta" not in f:
                 return {}
             meta = dict(f["meta"].attrs)
@@ -291,8 +291,8 @@ def load_episodes(
                 if cam_keys:
                     # Use first camera only (additional cameras stored under data/{label}_rgb)
                     rgb_k, depth_k, _label = cam_keys[0]
-                    has_rgb = "rgb" in f or reader.has_video(rgb_k)
-                    has_depth = "depth" in f or reader.has_video(depth_k)
+                    has_rgb = "rgb" in f
+                    has_depth = "depth" in f
                     if has_rgb and has_depth:
                         episode_rgb = reader.read_camera_all(rgb_k)[valid]
                         episode_depth = reader.read_camera_all(depth_k)[valid]
@@ -557,7 +557,8 @@ def _episode_control_rates(paths: list) -> list[float]:
     rates: list[float] = []
     for p in paths:
         try:
-            with h5py.File(p, "r") as f:
+            with EpisodeReader(p) as reader:
+                f = reader.h5f
                 meta = f.get("meta")
                 rates.append(float(meta.attrs.get("control_hz", meta.attrs.get("fps", 50.0))) if meta else 50.0)
         except OSError:
@@ -796,19 +797,12 @@ def main() -> None:
 
     output_dir = Path(args.output).expanduser().resolve()
 
-    # ── Per-episode nominal rates (schema v7: control_hz; older: fps) ──
-    # Mixed 50/16Hz directories are the post-migration reality — never concatenate
-    # frames of different dt without either aligning or telling the user.
-    dir_rates = _episode_control_rates(sorted(data_dir.glob("episode_*.h5")))
-
     # ── Validation (if requested) ──
     if args.validate:
         from dexmani_real.recording.data_validator import DataValidator
 
-        # Default min_frames = 1s at the slowest nominal rate in the directory
-        # (a fixed 50 would mean 3.125s for 16Hz episodes).
         validator = DataValidator(
-            min_frames=args.min_frames if args.min_frames is not None else int(round(min(dir_rates, default=50.0))),
+            min_frames=args.min_frames if args.min_frames is not None else 50,
         )
         print("Running DataValidator...")
         reports = validator.validate_directory(data_dir)

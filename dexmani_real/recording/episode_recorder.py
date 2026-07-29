@@ -2,8 +2,11 @@
 
 Single write path: state/action/vr streams are aligned to a fixed dt=1/control_hz
 time grid at record time (TimestampAlignedBuffer) and flushed to HDF5 in bulk at
-stop_episode(); camera frames are streamed per-frame but kept length-aligned to
-the same grid, so every dataset is index-aligned by construction.
+stop_episode(); camera frames are accumulated in memory and written to HDF5 in
+periodic batches (~10 s), then tail-padded to grid length at stop — every dataset
+is index-aligned by construction.
+
+Ref: ManiUniCon accumulate-then-dump pattern (replay_buffer.py).
 """
 
 from __future__ import annotations
@@ -12,7 +15,6 @@ __all__ = ["EpisodeRecorder"]
 
 import atexit
 import os
-import queue
 import shutil
 import threading
 import time
@@ -25,36 +27,31 @@ import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
-from dexmani_real.recording.collection_config import DEFAULT_MAX_RECORD_FRAMES
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
-from dexmani_real.recording.video_codec import VideoEncoder, VideoEncoderConfig
+from dexmani_real.recording.video_codec import VideoEncoder
+
+DEFAULT_MAX_RECORD_FRAMES: int = 10000
+
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 8  # v8: +truncated/stop_reason/cam_frames_dropped/cam_items_written meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); v6: +/flag_camera_fresh (camera stall marker); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta; /depth gated by L515 validity
+SCHEMA_VERSION = 8  # v8: +truncated/stop_reason meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta
 SCHEMA_VERSION_ARM_SENT = 9  # v9: +/action_arm_joint_sent(T,7) opt-in stream (ctor flag arm_sent_stream=True)
 SCHEMA_VERSION_DIAGNOSTICS = 10  # v10: +diagnostics (tracking_error/ik_solve_time_ms/target_pos_before_clamp/head_quat_wxyz) + flag_safety_reject
 SCHEMA_VERSION_V11 = 11  # v11: +flag_ik_attempted +flag_frame_status (always recorded)
 
 
-def _compute_schema_version(arm_sent_stream: bool, diagnostics_recorded: bool, v11_frame_status: bool = False) -> int:
-    """Return the actual schema version based on recorded features."""
-    if v11_frame_status:
-        return SCHEMA_VERSION_V11  # v11: supersedes all prior versions
-    if diagnostics_recorded:
-        return SCHEMA_VERSION_DIAGNOSTICS  # v10
-    if arm_sent_stream:
-        return SCHEMA_VERSION_ARM_SENT  # v9
-    return SCHEMA_VERSION  # v8
+def _compute_schema_version() -> int:
+    """Return the schema version — always v11 (frame_status fields are always recorded)."""
+    return SCHEMA_VERSION_V11
 
-CAMERA_FRESH_TIMEOUT_S = 0.2  # flag_camera_fresh: max age of the last *new* camera frame (~6 frames @30fps)
 
 # ── atexit safety net ──
-# The episode-stop / cam-writer threads are daemons: if an entry point exits
-# without join_stop() (estop path, second Ctrl-C inside a finally prompt),
-# the interpreter kills them mid-flush and truncates the HDF5.  One hook
-# joins every live recorder at interpreter exit.  No-op on SIGTERM/SIGKILL.
+# The episode-stop thread is a daemon: if an entry point exits without
+# join_stop() (estop path, second Ctrl-C inside a finally prompt), the
+# interpreter kills it mid-flush and truncates the HDF5.  One hook joins
+# every live recorder at interpreter exit.  No-op on SIGTERM/SIGKILL.
 _LIVE_RECORDERS: weakref.WeakSet = weakref.WeakSet()
 
 
@@ -84,7 +81,6 @@ class EpisodeRecorder:
         control_hz: float = 16.0,
         min_frames: int = 50,
         arm_sent_stream: bool = False,
-        use_video: bool = False,
     ) -> None:
         if control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
@@ -103,24 +99,18 @@ class EpisodeRecorder:
         # Track whether v10 diagnostics were recorded (for conditional schema_version).
         self._diagnostics_recorded: bool = False
 
-        # v11 frame-status fields (flag_ik_attempted, flag_frame_status) are always
-        # written by add_frame(), so any episode recorded with this code is v11+.
-        self._v11_frame_status: bool = True
 
-        # Opt-in H.264 video encoding (Phase 1): when True, rgb frames are
-        # written to a sidecar .rgb.mp4 file instead of (or in addition to)
-        # the HDF5 dataset.  Depth stays as HDF5+gzip — 16-bit depth requires
-        # HEVC 10-bit which is deferred to a later phase.
-        self._use_video: bool = bool(use_video)
-
-        self._file: Any = None  # h5py.File | None at runtime; h5py ships no type stubs (File is Any)
+        self._file: Any = None  # h5py.File | None — data.h5 (non-camera + pointcloud)
+        self._depth_file: Any = None  # h5py.File | None — depth.h5 (uint16, gzip-1)
+        self._rgb_encoder: VideoEncoder | None = None  # MP4 streaming encoder for RGB
         self._frame_count: int = 0
         self._recording: bool = False
         self._max_frames_reached: bool = False
         self._start_time: float | None = None
-        self._episode_path: str | None = None
-        self._temp_path: str | None = None  # .tmp_* path; renamed → _episode_path on save, unlinked on discard
+        self._episode_dir: str | None = None  # episode_XXX/ directory
+        self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._datasets: dict[str, Any] = {}
+        self._datasets_depth: dict[str, Any] = {}  # depth-only datasets in _depth_file
 
         # Record-time aligned buffer for non-camera streams + periodic flush.
         self._buffer: TimestampAlignedBuffer | None = None
@@ -134,38 +124,12 @@ class EpisodeRecorder:
         self._skipped_so_far: int = 0
         self._grid_anchored: bool = False
 
-        # Camera length-alignment: cache last frame to forward-fill on None reads
-        # / dropped grid slots so camera datasets stay index-aligned with the grid.
-        self._cam_seen: bool = False
-        self._last_camera_frame: dict[str, Any] | None = None
-        self._last_camera_frames: dict[str, dict[str, Any]] | None = None
-
-        # Camera freshness: last seen frame_number (tuple for multi-cam) and the
-        # state.timestamp at which it last changed — drives /flag_camera_fresh.
-        # A stalled camera keeps re-serving the same shm frame, so an unchanged
-        # frame_number (not a missing frame) is the stall signal.
-        self._cam_last_frame_number: object | None = None
-        self._cam_last_change_ts: float = 0.0
-
-        # Background camera writer: queue → thread → HDF5.
-        # Keeps the 16 Hz hot path at queue-push cost (~µs) instead of
-        # HDF5 resize + lzf compression (~2–3 ms).
-        self._cam_queue: queue.Queue = queue.Queue(maxsize=200)
-        self._cam_writer: threading.Thread | None = None
-        self._cam_writer_stop: threading.Event = threading.Event()
-        self._cam_written: int = 0
-        self._cam_dropped: int = 0  # enqueue-side drops (writer backlog) — see add_frame
-        self._hdf5_lock: threading.RLock = threading.RLock()
-
-        # Video sidecar encoders (opt-in, use_video=True).
-        # Created lazily on first camera frame, closed at stop_episode.
-        self._video_enc_rgb: VideoEncoder | None = None
-        self._video_enc_depth: VideoEncoder | None = None  # reserved for depth (future)
-
-        # Deferred flush: when True the background writer thread will call
-        # _flush_buffered() on its next iteration instead of blocking the
-        # 16 Hz hot path with HDF5 gzip + resize + fsync.
-        self._flush_pending: bool = False
+        # Camera frame accumulation: unique frames are collected in memory and
+        # written to HDF5 in periodic batches (~every _flush_interval grid slots).
+        # Forward-fill is deferred to stop_episode() — each frame is stored once
+        # with its grid-end index in _cam_grid_end (accumulated across flushes).
+        self._cam_frames: list[dict[str, Any]] = []
+        self._cam_grid_end: list[int] = []
 
         # Pending async stop_episode thread (None = no pending stop).
         # Guarded by start_episode() to prevent overlapping episodes.
@@ -227,30 +191,27 @@ class EpisodeRecorder:
             return False
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        path = self.data_dir / f"episode_{stamp}.h5"
-        temp_path = self.data_dir / f".tmp_episode_{stamp}.h5"
+        ep_dir = self.data_dir / f"episode_{stamp}"
+        tmp_dir = self.data_dir / f".tmp_episode_{stamp}"
         dedup = 1
-        while path.exists() or temp_path.exists():  # same-second collision → suffix; also avoid clobbering orphaned temp files
-            path = self.data_dir / f"episode_{stamp}_{dedup}.h5"
-            temp_path = self.data_dir / f".tmp_episode_{stamp}_{dedup}.h5"
+        while ep_dir.exists() or tmp_dir.exists():  # same-second collision → suffix
+            ep_dir = self.data_dir / f"episode_{stamp}_{dedup}"
+            tmp_dir = self.data_dir / f".tmp_episode_{stamp}_{dedup}"
             dedup += 1
 
-        self._episode_path = str(path)
-        self._temp_path = str(temp_path)
+        self._episode_dir = str(ep_dir)
+        self._temp_dir = str(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=False)
         self._frame_count = 0
         self._max_frames_reached = False
         self._start_time = time.perf_counter()
         self._recording = True
         self._stop_error = None
         self._datasets = {}
+        self._datasets_depth = {}
         self._flushed_frames = 0
-        self._flush_pending = False
-        self._cam_seen = False
-        self._last_camera_frame = None
-        self._last_camera_frames = None
-
-        self._cam_last_frame_number = None
-        self._cam_last_change_ts = 0.0
+        self._cam_frames = []
+        self._cam_grid_end = []
 
         # Skip-initial-frames gate — clamp below max_frames so we never drop all.
         self._skip_initial_frames = max(0, min(int(skip_initial_frames), self.max_frames - 1))
@@ -285,7 +246,8 @@ class EpisodeRecorder:
             eps=0.5,
         )
         self._file = None
-        self._start_cam_writer()
+        self._depth_file = None
+        self._rgb_encoder = None
         return True
 
     def _write_meta_attrs(self, meta: h5py.Group) -> None:
@@ -316,8 +278,8 @@ class EpisodeRecorder:
     def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
         """Camera identity/geometry attrs from _pending_meta (None entries skipped).
 
-        Idempotent — _stop_episode_impl re-runs it so values supplied late via
-        backfill_camera_meta() still reach /meta after the initial lazy write.
+        Idempotent — _stop_episode_impl re-runs it so values supplied late
+        still reach /meta after the initial lazy write.
         """
         p = self._pending_meta
         calib = p.get("calib")
@@ -344,45 +306,15 @@ class EpisodeRecorder:
         if depth_scale is not None:
             meta.attrs["depth_scale"] = float(depth_scale)
 
-    def backfill_camera_meta(
-        self,
-        *,
-        calib: CameraCalib | None = None,
-        camera_name: str | None = None,
-        camera_K: np.ndarray | None = None,
-        depth_scale: float | None = None,
-    ) -> None:
-        """Late-fill camera meta that was unavailable at start_episode().
-
-        Covers the B-before-camera-connect race: the child process publishes
-        serial/K/depth_scale only after connect, so the start_episode() snapshot
-        can be None.  Only keys still None are filled (start values win); the
-        stop thread re-writes the camera attrs, so calling this any time before
-        stop_episode() is enough.
-        """
-        if not self._recording:
-            return
-        p = self._pending_meta
-        for key, val in (
-            ("calib", calib),
-            ("camera_name", camera_name),
-            ("camera_K", camera_K),
-            ("depth_scale", depth_scale),
-        ):
-            if val is not None and (p.get(key) is None or (isinstance(p.get(key), (int, float)) and p.get(key) == 0)):
-                p[key] = val
-
     def add_frame(
         self,
         state,
         action,
         vr_frame: dict[str, Any],
         camera_frame: dict[str, Any] | None = None,
-        camera_frames: dict[str, dict[str, Any]] | None = None,
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
         diagnostics: dict[str, Any] | None = None,
-        camera_crashed: bool = False,
     ) -> bool:
         if not self._recording or self._buffer is None:
             return False
@@ -393,7 +325,7 @@ class EpisodeRecorder:
             return False
 
         # ── Skip initial frames (begin-transition pose noise) ──
-        # Return False (not recorded) so CollectionLoop's frame counter stays
+        # Return False (not recorded) so the caller's frame counter stays
         # consistent with the HDF5 num_frames — skipped frames touch no buffer.
         if self._skipped_so_far < self._skip_initial_frames:
             self._skipped_so_far += 1
@@ -414,20 +346,7 @@ class EpisodeRecorder:
         # ── Camera freshness (recorder-side; no per-script signal plumbing) ──
         # frame_number is monotonic per camera (shm/layouts.py header); a stall
         # keeps re-serving the same shm frame, so an unchanged number means no
-        # new data. Multi-cam: any camera advancing counts as fresh.
         ts = float(state.timestamp)
-        if camera_frame is not None:
-            fresh_token = camera_frame.get("frame_number")
-        elif camera_frames:
-            fresh_token = tuple(f.get("frame_number") if f is not None else None for f in camera_frames.values())
-        else:
-            fresh_token = None
-        if fresh_token is not None and fresh_token != self._cam_last_frame_number:
-            self._cam_last_frame_number = fresh_token
-            self._cam_last_change_ts = ts
-        flag_camera_fresh = (
-            self._cam_last_frame_number is not None and (ts - self._cam_last_change_ts) <= CAMERA_FRESH_TIMEOUT_S
-        )
 
         def _make_action_ee() -> np.ndarray:
             pos = action.target_eef_pos
@@ -464,12 +383,7 @@ class EpisodeRecorder:
             "flag_retarget_ok": bool(sig.get("retarget_ok", False)),
             "flag_held": bool(sig.get("held", False)),
             "flag_safety_reject": bool(sig.get("flag_safety_reject", False)),
-            "flag_camera_fresh": flag_camera_fresh,
-            "flag_camera_crashed": camera_crashed,
-            "camera_health": int(camera_frame.get("camera_health", 0) if camera_frame is not None else (
-                next((f.get("camera_health", 0) for f in camera_frames.values() if f is not None), 0)
-                if camera_frames else 0
-            )),
+            "camera_health": int(camera_frame.get("camera_health", 0) if camera_frame is not None else 0),
             # ── Frame quality (schema v11) ──
             # 0=ok, 1=held (gate reject), 2=ik_fail, 3=safety_reject
             "flag_frame_status": int(sig.get("frame_status", 0)),
@@ -503,198 +417,51 @@ class EpisodeRecorder:
         self._frame_count = self._buffer.size
         k = self._buffer.size - prev_size  # grid slots advanced (usually 1; 0 = dup bucket)
 
-        # ── Periodic flush: signal background writer thread instead of
-        # blocking the 16 Hz hot path with HDF5 gzip + resize + fsync.
+        # ── Periodic non-camera flush: write buffered streams to HDF5 ──
         if self._buffer.size - self._flushed_frames >= self._flush_interval:
-            self._flush_pending = True
-
-        # ── Camera streams → background writer thread ──
-        # Queue push (~µs) keeps the hot path fast; HDF5 compression +
-        # resize run in a daemon thread.  Forward-fill at stop_episode
-        # handles minor k>1 jitter.
-        has_camera_now = camera_frame is not None or bool(camera_frames)
-        if has_camera_now:
-            self._cam_seen = True
-            self._last_camera_frame = camera_frame
-            self._last_camera_frames = camera_frames
-
-        if self._cam_seen and k > 0:
             self._ensure_hdf5()
-            # camera.poll_latest_frame() returns fresh dicts each call —
-            # no deep copy needed; the queue reference keeps arrays alive
-            # until the writer thread consumes them.
-            if self._cam_queue.qsize() < self._cam_queue.maxsize - 1:
-                # target_len = grid length after this add: the writer fills every
-                # camera dataset up to it, so dropped/backlogged slots self-heal
-                # and dataset index == grid index at all times.
-                item = (
-                    self._last_camera_frame,
-                    self._last_camera_frames,
-                    self._buffer.size,
-                )
-                try:
-                    self._cam_queue.put_nowait(item)
-                except queue.Full:  # defensive — headroom check above keeps ≥2 slots free
-                    self._count_cam_drop()
-            else:
-                # Writer backlog: drop rather than block the control loop.  The
-                # next accepted item backfills the gap with *its* frame, so the
-                # dataset stays index-aligned but this content is lost — count it.
-                self._count_cam_drop()
-        return True
-
-    def _count_cam_drop(self) -> None:
-        """Count a camera frame dropped at enqueue; warn on the first and every 100th."""
-        self._cam_dropped += 1
-        if self._cam_dropped == 1 or self._cam_dropped % 100 == 0:
-            logger.warning(
-                "Camera writer backlog — dropped %d camera frame(s) so far",
-                self._cam_dropped,
-            )
-
-    def _ensure_hdf5(self) -> None:
-        """Lazily create the HDF5 file (flat schema — no groups).
-
-        The file is written to a ``.tmp_*`` path and atomically renamed
-        to the final ``episode_*.h5`` path in ``_stop_episode_impl_inner``
-        on success, or unlinked on discard / error.
-        """
-        if self._file is not None:
-            return
-        assert self._temp_path is not None
-        self._file = h5py.File(str(self._temp_path), "w")
-        self._write_meta_attrs(self._file.create_group("meta"))
-
-    # ── Background camera writer ──────────────────────────────────────────
-
-    def _start_cam_writer(self) -> None:
-        self._cam_writer_stop.clear()
-        self._cam_written = 0
-        self._cam_dropped = 0
-        self._cam_writer = threading.Thread(target=self._cam_writer_loop, daemon=True, name="episode-cam-writer")
-        self._cam_writer.start()
-
-    def _cam_writer_loop(self) -> None:
-        """Background thread: pop camera frames from queue, write to HDF5.
-
-        Also handles deferred buffer flushes (signalled by the hot path via
-        ``_flush_pending``) so HDF5 gzip + resize + fsync never blocks the
-        16 Hz control loop.
-        """
-        _hdf5_flush_every_n = 100  # HDF5 metadata flush (cheap)
-        while not self._cam_writer_stop.is_set():
-            # ── Deferred buffer flush (gzip + resize + fsync) ──
-            # _hdf5_lock is a reentrant lock (RLock); wrapping the check+flush
-            # protects against the TOCTOU race on self._buffer from the stop path.
-            with self._hdf5_lock:
-                if self._flush_pending or (
-                    self._buffer is not None and self._buffer.size - self._flushed_frames >= self._flush_interval
-                ):
-                    self._flush_buffered()
-                    self._flush_pending = False
-
-            try:
-                item = self._cam_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if item is None:  # sentinel
-                break
-            with self._hdf5_lock:
-                self._append_camera(*item)
-                self._cam_written += 1
-                if self._cam_written % _hdf5_flush_every_n == 0:
-                    self._file.flush()
-
-        # Final flush before draining (buffer is static during drain).
-        # _flush_buffered() manages its own _hdf5_lock internally.
-        if self._buffer is not None and self._buffer.size > self._flushed_frames:
             self._flush_buffered()
 
-        # Drain remaining camera items after stop signal
-        while True:
-            try:
-                item = self._cam_queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is None:
-                break
-            with self._hdf5_lock:
-                self._append_camera(*item)
-                self._cam_written += 1
-
-    # ── Camera HDF5 write (called from background writer OR inline at stop) ─
-
-    def _append_camera(
-        self,
-        camera_frame: dict[str, Any] | None,
-        camera_frames: dict[str, dict[str, Any]] | None,
-        target_len: int,
-    ) -> None:
-        """Fill every camera dataset up to ``target_len`` grid slots.
-
-        ``target_len`` is the aligned-grid length at enqueue time, so dataset
-        index == grid index: loop slower than the grid (k>1), dropped queue
-        items, a camera appearing mid-episode, or per-dataset slot skips all
-        show up as "dataset shorter than target" and are healed by the next
-        item — backfilled slots repeat the current frame, matching the
-        TimestampAlignedBuffer forward-fill convention for non-camera streams.
-
-        Called from the background writer thread (normal operation) or inline
-        (drain at stop).  Caller must hold ``self._hdf5_lock``.
-        """
-        assert self._file is not None
-        # Single-camera
-        if camera_frame is not None:
+        # ── Camera streams → accumulate in memory (ManiUniCon pattern) ──
+        # Depth + pointcloud: collected in memory, written at stop time.
+        # RGB: streamed to MP4 encoder during recording (no stop-time dump).
+        if camera_frame is not None and k > 0:
+            self._cam_frames.append(camera_frame)
+            self._cam_grid_end.append(self._buffer.size)
+            # ── RGB → MP4 streaming encode (lazy encoder init on first frame) ──
             rgb = camera_frame.get("rgb")
-            depth = camera_frame.get("depth")
             if rgb is not None:
-                if "rgb" not in self._datasets:
-                    # lzf (h5py built-in): ~5x faster than gzip-1 — the single
-                    # writer thread must sustain the full grid rate or frames
-                    # drop silently (gzip-1 measured ~12 items/s ceiling, v8).
-                    self._datasets["rgb"] = self._file.create_dataset(
-                        "rgb",
-                        data=rgb[np.newaxis, ...],
-                        maxshape=(None,) + rgb.shape,
-                        chunks=True,
-                        dtype=rgb.dtype,
-                        compression="lzf",
-                    )
-                self._fill_to("rgb", rgb, target_len)
+                if self._rgb_encoder is None:
+                    assert self._temp_dir is not None
+                    h, w = rgb.shape[:2]
+                    mp4_path = Path(self._temp_dir) / "rgb.mp4"
+                    self._rgb_encoder = VideoEncoder(mp4_path, fps=self.control_hz, width=w, height=h)
+                self._rgb_encoder.write_frame(rgb)
+        elif self._cam_grid_end and k > 0:
+            self._cam_grid_end[-1] = self._buffer.size
 
-                # ── Video sidecar (opt-in, use_video=True) ──
-                # Write duplicate frames for forward-filled grid slots so
-                # video frame count == HDF5 dataset length at all times.
-                # H.264 encodes identical consecutive frames as near-zero-cost
-                # skip blocks, so the storage overhead is negligible.
-                if self._use_video:
-                    if self._video_enc_rgb is None:
-                        h, w = rgb.shape[:2]
-                        self._video_enc_rgb = VideoEncoder(
-                            path=Path(self._temp_path).with_suffix(".rgb.mp4"),  # type: ignore[arg-type]
-                            fps=self.control_hz,
-                            width=w,
-                            height=h,
-                        )
-                    for _ in range(self._video_enc_rgb.frame_count, target_len):
-                        self._video_enc_rgb.write_frame(rgb)
+        return True
 
+    # ── Camera batch write (stop-time only) ────────────────────────────
+
+    def _write_all_camera_frames(self) -> None:
+        """Write depth + pointcloud to HDF5 in one pass at stop time.
+
+        RGB is streamed to MP4 during recording via ``_rgb_encoder`` —
+        no stop-time bulk write needed.  Depth goes to ``depth.h5``
+        (gzip-1, pre-allocated); pointcloud stays in ``data.h5``.
+        """
+        if not self._cam_frames:
+            return
+        self._ensure_hdf5()
+
+        # ── Collect depth frames for pre-allocated batch write ──
+        depth_frames: list[np.ndarray] = []
+        for camera_frame in self._cam_frames:
+            depth = camera_frame.get("depth")
             if depth is not None:
-                if "depth" not in self._datasets:
-                    self._datasets["depth"] = self._file.create_dataset(
-                        "depth",
-                        data=depth[np.newaxis, ...],
-                        maxshape=(None,) + depth.shape,
-                        chunks=True,
-                        dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,  # Z16 guard
-                        compression="lzf",
-                    )
-                self._fill_to("depth", depth, target_len)
+                depth_frames.append(np.asarray(depth, dtype=np.uint16))
 
-            # Fixed-size world-frame pointcloud (xyz + rgb), computed online
-            # in the CameraProcess child — see sensor/pointcloud_processor.py.
-            # gzip level 1: float32 FPS-downsampled coords compress ~2-3x,
-            # fast enough for the background writer thread.
             pc = camera_frame.get("pointcloud")
             if pc is not None and camera_frame.get("pointcloud_valid", True):
                 if "pointcloud" not in self._datasets:
@@ -707,40 +474,91 @@ class EpisodeRecorder:
                         compression="gzip",
                         compression_opts=1,
                     )
-                self._fill_to("pointcloud", pc, target_len)
+                else:
+                    ds_pc = self._datasets["pointcloud"]
+                    n = ds_pc.shape[0]
+                    ds_pc.resize(n + 1, axis=0)
+                    ds_pc[n] = pc
 
-        # Multi-camera
-        if camera_frames:
-            for cam_name, cam_frame in camera_frames.items():
-                if cam_frame is None:
-                    continue
-                safe = str(cam_name).replace("/", "_").replace("\\", "_")
-                rgb = cam_frame.get("rgb")
-                depth = cam_frame.get("depth")
-                rgb_key = f"{safe}_rgb"
-                depth_key = f"{safe}_depth"
-                if rgb is not None and hasattr(rgb, "shape"):
-                    if rgb_key not in self._datasets:
-                        self._datasets[rgb_key] = self._file.create_dataset(
-                            rgb_key,
-                            data=rgb[np.newaxis, ...],
-                            maxshape=(None,) + rgb.shape,
-                            chunks=True,
-                            dtype=rgb.dtype if rgb.dtype == np.uint8 else np.uint8,
-                            compression="lzf",
-                        )
-                    self._fill_to(rgb_key, rgb, target_len)
-                if depth is not None and hasattr(depth, "shape"):
-                    if depth_key not in self._datasets:
-                        self._datasets[depth_key] = self._file.create_dataset(
-                            depth_key,
-                            data=depth[np.newaxis, ...],
-                            maxshape=(None,) + depth.shape,
-                            chunks=True,
-                            dtype=depth.dtype if depth.dtype == np.uint16 else np.uint16,
-                            compression="lzf",
-                        )
-                    self._fill_to(depth_key, depth, target_len)
+        # ── Depth → depth.h5: pre-allocate + batch write (gzip-1, ~32% smaller than lzf) ──
+        if depth_frames:
+            depth_shape = (len(depth_frames),) + depth_frames[0].shape
+            ds = self._depth_file.create_dataset(
+                "depth",
+                shape=depth_shape,
+                maxshape=(None,) + depth_frames[0].shape,
+                dtype=np.uint16,
+                chunks=(1,) + depth_frames[0].shape,
+                compression="gzip",
+                compression_opts=1,
+            )
+            for i, frame in enumerate(depth_frames):
+                ds[i] = frame
+            self._datasets_depth["depth"] = ds
+
+    def _forward_fill_cameras(self, buf_size: int) -> None:
+        """Forward-fill camera datasets to match the grid length.
+
+        Each camera frame was stored as a single row during recording (one
+        per unique frame).  ``_cam_grid_end`` maps each frame index to its
+        grid span: frame *i* covers grid slots ``[start_i, end_i)`` where
+        ``start_i`` is ``_cam_grid_end[i-1]`` (or 0) and ``end_i`` is
+        ``_cam_grid_end[i]``.  The last frame also covers the tail
+        ``[_cam_grid_end[-1], buf_size)``.
+
+        Fills right-to-left so source rows are never overwritten before they
+        are read.
+
+        A dataset may have fewer rows than ``_cam_grid_end`` entries when a
+        modality is missing for the first few frames (e.g. pointcloud before
+        the first valid cloud).  The mapping ``i → max(0, i - offset)``
+        handles this: early frames without data forward-fill from the first
+        available row.
+        """
+        if not self._cam_grid_end or buf_size == 0 or self._file is None:
+            return
+
+        M = len(self._cam_grid_end)
+        # RGB is in MP4 (no forward-fill needed — encoder writes every grid slot).
+        for key in ("depth", "pointcloud"):
+            datasets = self._datasets_depth if key == "depth" else self._datasets
+            if key not in datasets:
+                continue
+            ds = datasets[key]
+            cam_len = ds.shape[0]
+            if cam_len == 0:
+                continue
+
+            ds.resize(buf_size, axis=0)
+            offset = M - cam_len  # frames at the start without this modality
+
+            # Fill right-to-left: _cam_grid_end[i] >= i guarantees source
+            # row i (at dataset position i) sits to the left of the span
+            # it fills, so later frames' writes never corrupt it.
+            for i in range(M - 1, -1, -1):
+                start = self._cam_grid_end[i - 1] if i > 0 else 0
+                end = self._cam_grid_end[i]
+                if end > start:
+                    src = max(0, i - offset)
+                    ds[start:end] = ds[src]
+
+            # Tail: last frame covers the remainder of the grid.
+            tail_start = self._cam_grid_end[-1]
+            if tail_start < buf_size:
+                ds[tail_start:buf_size] = ds[cam_len - 1]
+
+    def _ensure_hdf5(self) -> None:
+        """Lazily create ``data.h5`` + ``depth.h5`` in the temp directory.
+
+        The data file carries all non-camera streams + pointcloud + /meta;
+        the depth file holds only uint16 depth frames (gzip-1 compression).
+        """
+        if self._file is not None:
+            return
+        assert self._temp_dir is not None
+        self._file = h5py.File(str(Path(self._temp_dir) / "data.h5"), "w")
+        self._write_meta_attrs(self._file.create_group("meta"))
+        self._depth_file = h5py.File(str(Path(self._temp_dir) / "depth.h5"), "w")
 
     def _flush_buffered(self) -> None:
         """Write buffered non-camera streams to HDF5, keeping datasets resizable.
@@ -753,46 +571,41 @@ class EpisodeRecorder:
         if self._buffer is None or self._buffer.size == self._flushed_frames:
             return
 
-        with self._hdf5_lock:
-            self._ensure_hdf5()
-            buf_data = self._buffer.data
-            buf_size = self._buffer.size
-            new_start = self._flushed_frames
+        self._ensure_hdf5()
+        buf_data = self._buffer.data
+        buf_size = self._buffer.size
+        new_start = self._flushed_frames
 
-            for h5_key, arr in buf_data.items():
-                if h5_key not in self._datasets:
-                    self._datasets[h5_key] = self._file.create_dataset(
-                        h5_key,
-                        data=arr[:buf_size].copy(),
-                        maxshape=(None,) + arr.shape[1:],
-                        dtype=arr.dtype,
-                        compression="gzip",
-                    )
-                else:
-                    ds = self._datasets[h5_key]
-                    ds.resize(buf_size, axis=0)
-                    ds[new_start:buf_size] = arr[new_start:buf_size]
-
-            # Timestamp (stored separately from buf_data)
-            ts = self._buffer.timestamps
-            if "timestamp" not in self._datasets:
-                self._datasets["timestamp"] = self._file.create_dataset(
-                    "timestamp",
-                    data=ts[:buf_size].copy(),
-                    maxshape=(None,),
-                    dtype=np.float64,
+        for h5_key, arr in buf_data.items():
+            if h5_key not in self._datasets:
+                self._datasets[h5_key] = self._file.create_dataset(
+                    h5_key,
+                    data=arr[:buf_size].copy(),
+                    maxshape=(None,) + arr.shape[1:],
+                    dtype=arr.dtype,
                     compression="gzip",
                 )
             else:
-                ts_ds = self._datasets["timestamp"]
-                ts_ds.resize(buf_size, axis=0)
-                ts_ds[new_start:buf_size] = ts[new_start:buf_size]
+                ds = self._datasets[h5_key]
+                ds.resize(buf_size, axis=0)
+                ds[new_start:buf_size] = arr[new_start:buf_size]
 
-            self._flushed_frames = buf_size
+        # Timestamp (stored separately from buf_data)
+        ts = self._buffer.timestamps
+        if "timestamp" not in self._datasets:
+            self._datasets["timestamp"] = self._file.create_dataset(
+                "timestamp",
+                data=ts[:buf_size].copy(),
+                maxshape=(None,),
+                dtype=np.float64,
+                compression="gzip",
+            )
+        else:
+            ts_ds = self._datasets["timestamp"]
+            ts_ds.resize(buf_size, axis=0)
+            ts_ds[new_start:buf_size] = ts[new_start:buf_size]
 
-            # Push HDF5 metadata (chunk B-tree, resized shapes) to disk so a hard
-            # crash (SIGKILL/segfault) loses at most one flush interval.
-            self._file.flush()
+        self._flushed_frames = buf_size
 
     def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
         """Signal end of episode; return path immediately, flush in background.
@@ -815,10 +628,10 @@ class EpisodeRecorder:
 
         # Mark as stopped *before* spawning the thread — add_frame() must
         # reject new frames immediately.  All data is already in _buffer
-        # and _cam_queue; the background thread will drain both.
+        # and _cam_frames; the stop daemon will flush both.
         self._recording = False
         self._max_frames_reached = False
-        path = self._episode_path
+        path = self._episode_dir
 
         t = threading.Thread(
             target=self._stop_episode_impl,
@@ -874,186 +687,100 @@ class EpisodeRecorder:
             logger.error("stop_episode failed: %s — HDF5 may be truncated", self._stop_error)
             # Best-effort close: metadata may flush partial B-tree updates.
             try:
+                if self._rgb_encoder is not None:
+                    self._rgb_encoder.close()
+            except Exception:
+                pass
+            self._rgb_encoder = None
+            try:
                 if self._file is not None:
                     self._file.close()
             except Exception:
                 pass
             self._file = None
-            # Close video encoders BEFORE unlinking their files —
-            # otherwise the encoder's file handle may still be writing.
-            if self._video_enc_rgb is not None:
-                try:
-                    self._video_enc_rgb.close()
-                except Exception:
-                    pass
-                self._video_enc_rgb = None
-            if self._video_enc_depth is not None:
-                try:
-                    self._video_enc_depth.close()
-                except Exception:
-                    pass
-                self._video_enc_depth = None
-            # Clean up temp files if the crash happened before the atomic
-            # finalise step (temp still exists → discard, avoid orphans).
-            # If temp is already gone (rename succeeded before the crash),
-            # this is a no-op.
-            _tmp = self._temp_path
+            try:
+                if self._depth_file is not None:
+                    self._depth_file.close()
+            except Exception:
+                pass
+            self._depth_file = None
+            # Clean up temp directory if it still exists.
+            _tmp = self._temp_dir
             if _tmp is not None:
                 self._discard_temp_files(_tmp)
             self._datasets.clear()
+            self._datasets_depth.clear()
             self._recording = False
             self._max_frames_reached = False
             self._frame_count = 0
             self._start_time = None
-            self._episode_path = None
-            self._temp_path = None
+            self._episode_dir = None
+            self._temp_dir = None
             self._buffer = None
             self._flushed_frames = 0
-            self._cam_seen = False
-            self._last_camera_frame = None
-            self._last_camera_frames = None
-
-            self._cam_last_frame_number = None
-            self._cam_last_change_ts = 0.0
-            self._cam_writer = None
-            self._cam_written = 0
-            self._cam_dropped = 0
+            self._cam_frames = []
+            self._cam_grid_end = []
 
     def _stop_episode_impl_inner(self, success: bool, reason: str, truncated: bool) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
         can reset state on any exception without duplicating the reset list."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
-        # ── Stop background camera writer ──
-        # 1. Signal stop + push sentinel so the thread exits its loop.
-        self._cam_writer_stop.set()
-        try:
-            self._cam_queue.put_nowait(None)
-        except queue.Full:
-            pass  # queue is full; sentinel won't fit — drain below instead
-
-        # 2. Join the writer thread.
-        if self._cam_writer is not None and self._cam_writer.is_alive():
-            self._cam_writer.join(timeout=5.0)
-            if self._cam_writer.is_alive():
-                logger.warning("Camera writer thread did not exit within 5s")
-
-        # 3. Safety drain: pick up anything the writer may have missed.
-        while True:
-            try:
-                leftover = self._cam_queue.get_nowait()
-            except queue.Empty:
-                break
-            if leftover is None:
-                continue
-            with self._hdf5_lock:
-                self._append_camera(*leftover)
-                self._cam_written += 1
+        # ── Write all accumulated camera frames (accumulate-then-dump) ──
+        # Frames were collected in memory during recording with zero disk I/O
+        # on the 16 Hz hot path.  Written once here at episode end.
+        self._write_all_camera_frames()
 
         # ── Flush remaining buffered non-camera streams ──
         self._flush_buffered()
         buf_size = self._buffer.size if self._buffer is not None else 0
 
-        # ── Camera forward-fill: pad camera datasets to match grid length ──
-        # Camera frames are written by the background thread at ~30 Hz cadence,
-        # but when k > 1 (minor timing jitter) the camera dataset falls slightly
-        # behind the non-camera grid.  Forward-fill the last frame to keep every
-        # dataset index-aligned.
-        if self._file is not None and buf_size > 0:
-            with self._hdf5_lock:
-                for key in list(self._datasets.keys()):
-                    if not (key in ("rgb", "depth", "pointcloud") or key.endswith("_rgb") or key.endswith("_depth")):
-                        continue
-                    ds = self._datasets[key]
-                    cam_len = ds.shape[0]
-                    if 0 < cam_len < buf_size:
-                        gap = buf_size - cam_len
-                        logger.debug("camera tail-pad %s: +%d slots", key, gap)
-                        last_frame = ds[cam_len - 1 : cam_len]  # keep dims: (1, ...)
-                        repeats = np.repeat(last_frame, gap, axis=0)
-                        ds.resize(buf_size, axis=0)
-                        ds[cam_len:buf_size] = repeats
+        # ── Camera forward-fill: broadcast unique frames across the grid ──
+        # Each camera frame was stored as a single row during recording;
+        # _cam_grid_end maps rows → grid spans.  One pass at stop time
+        # replaces the per-batch _fill_to() + tail-pad online machinery.
+        self._forward_fill_cameras(buf_size)
 
         self._buffer = None
         self._frame_count = buf_size
 
-        # ── Video forward-fill: pad to match grid length ──
-        # The HDF5 forward-fill above ensures every camera dataset has exactly
-        # buf_size rows.  Do the same for the video sidecar so video frame count
-        # == grid frame count (trivial index alignment at read time).
-        if self._video_enc_rgb is not None:
-            vn = self._video_enc_rgb.frame_count
-            if 0 < vn < buf_size:
-                gap = buf_size - vn
-                last_frame = self._datasets.get("rgb")
-                if last_frame is not None:
-                    pad = np.asarray(last_frame[vn - 1])
-                    for _ in range(gap):
-                        self._video_enc_rgb.write_frame(pad)
-
-        # ── Finalise video sidecar encoders ──
-        if self._video_enc_rgb is not None:
-            self._video_enc_rgb.close()
-        if self._video_enc_depth is not None:
-            self._video_enc_depth.close()
+        # ── Close RGB encoder (streaming MP4) ──
+        _had_rgb = self._rgb_encoder is not None
+        if self._rgb_encoder is not None:
+            self._rgb_encoder.close()
+            self._rgb_encoder = None
 
         # ── Write final metadata ──
         if self._file is not None:
-            with self._hdf5_lock:
-                meta = self._file["meta"]
-                meta.attrs["schema_version"] = _compute_schema_version(
-                    self.arm_sent_stream, self._diagnostics_recorded, self._v11_frame_status
-                )
-                meta.attrs["duration"] = duration
-                meta.attrs["num_frames"] = self._frame_count
-                meta.attrs["success"] = success
-                meta.attrs["fps"] = self._frame_count / duration if duration > 0 else self.control_hz
-                meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
-                meta.attrs["has_camera"] = "rgb" in self._file
-                meta.attrs["has_pointcloud"] = "pointcloud" in self._file
-                meta.attrs["has_timestamps"] = "timestamp" in self._file
-                meta.attrs["truncated"] = bool(truncated)
-                meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
-                # Video codec (opt-in): non-empty → sidecar .rgb.mp4 present.
-                # Empty → legacy LZF-only episode.
-                # Read from VideoEncoderConfig defaults (single source of truth).
-                if self._video_enc_rgb is not None:
-                    _vc = VideoEncoderConfig()
-                    meta.attrs["video_codec"] = f"{_vc.codec} ({_vc.pixel_format})"
-                    meta.attrs["video_crf"] = _vc.crf
-                else:
-                    meta.attrs["video_codec"] = ""
-                    meta.attrs["video_crf"] = 0
-                # Enqueue-side camera drops (writer backlog): the target_len
-                # backfill keeps datasets index-aligned, so these counters are
-                # the only disk-side record that camera content was lost.
-                meta.attrs["cam_frames_dropped"] = int(self._cam_dropped)
-                meta.attrs["cam_items_written"] = int(self._cam_written)
-                # Camera meta backfill: the initial lazy write may have run
-                # before the camera child finished connect — re-write so values
-                # supplied via backfill_camera_meta() land in the file.
-                self._write_camera_meta_attrs(meta)
-
-        if self._cam_dropped > 0:
-            total = self._cam_dropped + self._cam_written
-            logger.warning(
-                "Episode dropped %d/%d camera frames (%.1f%%) at the writer queue — "
-                "rgb/depth content is forward-filled at those slots",
-                self._cam_dropped,
-                total,
-                100.0 * self._cam_dropped / max(1, total),
-            )
+            meta = self._file["meta"]
+            meta.attrs["schema_version"] = _compute_schema_version()
+            meta.attrs["duration"] = duration
+            meta.attrs["num_frames"] = self._frame_count
+            meta.attrs["success"] = success
+            meta.attrs["fps"] = self._frame_count / duration if duration > 0 else self.control_hz
+            meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
+            meta.attrs["has_camera"] = _had_rgb
+            meta.attrs["has_pointcloud"] = "pointcloud" in self._datasets
+            meta.attrs["has_timestamps"] = "timestamp" in self._datasets
+            meta.attrs["truncated"] = bool(truncated)
+            meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
+            # Camera meta backfill: the initial lazy write may have run
+            # before the camera child finished connect — re-write so late
+            # values land in the file.
+            self._write_camera_meta_attrs(meta)
 
         if self._file is not None:
             self._file.close()
         self._file = None
+        if self._depth_file is not None:
+            self._depth_file.close()
+            self._depth_file = None
 
         # ── Atomic finalise ──
-        # success: rename temp → final (both .h5 and all sidecars).
-        # discard:  unlink temp files directly — no rename, no orphans.
-        # Captured before _episode_path / _temp_path are cleared below.
-        _final = self._episode_path
-        _tmp = self._temp_path
+        # success: rename temp dir → final dir.
+        # discard:  remove temp dir.
+        _final = self._episode_dir
+        _tmp = self._temp_dir
         if _tmp is not None and _final is not None:
             if success:
                 self._rename_temp_to_final(_tmp, _final)
@@ -1061,34 +788,18 @@ class EpisodeRecorder:
                 self._discard_temp_files(_tmp)
 
         self._datasets.clear()
+        self._datasets_depth.clear()
         self._recording = False
         self._max_frames_reached = False
         self._frame_count = 0
         self._start_time = None
-        self._episode_path = None
-        self._temp_path = None
+        self._episode_dir = None
+        self._temp_dir = None
         self._buffer = None
         self._flushed_frames = 0
-        self._cam_seen = False
-        self._last_camera_frame = None
-        self._last_camera_frames = None
-
-        self._cam_last_frame_number = None
-        self._cam_last_change_ts = 0.0
-        self._cam_writer = None
-        self._cam_written = 0
-        self._cam_dropped = 0
-        # Video sidecar encoders (closed above; drop references).
-        self._video_enc_rgb = None
-        self._video_enc_depth = None
-
+        self._cam_frames = []
+        self._cam_grid_end = []
     # ── Atomic file finalisation ──────────────────────────────────────
-
-    # Sidecar file extensions that MUST be cleaned up together with the .h5.
-    # Every suffix here is automatically deleted on discard and renamed on save.
-    # Add new sidecar formats (e.g. ".depth.mp4") here — all call sites,
-    # CollectionLoop, and the atexit error path pick them up automatically.
-    _SIDECAR_SUFFIXES: tuple[str, ...] = (".rgb.mp4",)
 
     @staticmethod
     def _try_rename(src: str, dst: str) -> None:
@@ -1109,34 +820,15 @@ class EpisodeRecorder:
 
     @classmethod
     def _discard_temp_files(cls, tmp: str) -> None:
-        """Unlink temp .h5 and all known sidecar files (discard path).
-
-        Called from _stop_episode_impl_inner (normal discard) and
-        _stop_episode_impl (error path).  Never raises.
-        """
-        cls._try_unlink(tmp)
-        for suffix in cls._SIDECAR_SUFFIXES:
-            cls._try_unlink(str(Path(tmp).with_suffix(suffix)))
+        """Remove temp directory and all contents. Never raises."""
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+        except OSError:
+            pass
 
     def _rename_temp_to_final(self, tmp: str, final: str) -> None:
-        """Rename the .h5 temp file and all known sidecars to their final paths."""
+        """Rename temp directory to final episode directory."""
         self._try_rename(tmp, final)
-        for suffix in self._SIDECAR_SUFFIXES:
-            tmp_sidecar = str(Path(tmp).with_suffix(suffix))
-            if os.path.exists(tmp_sidecar):
-                final_sidecar = str(Path(final).with_suffix(suffix))
-                self._try_rename(tmp_sidecar, final_sidecar)
 
-    # ── Dataset helpers ───────────────────────────────────────────────
 
-    def _fill_to(self, key: str, data: np.ndarray, target_len: int) -> None:
-        """Fill dataset ``key`` up to ``target_len`` rows with ``data`` (broadcast).
 
-        No-op when already at/past target — idempotent across the stop-time
-        drain where queued items carry non-decreasing targets.
-        """
-        ds = self._datasets[key]
-        n = ds.shape[0]
-        if n < target_len:
-            ds.resize(target_len, axis=0)
-            ds[n:target_len] = data

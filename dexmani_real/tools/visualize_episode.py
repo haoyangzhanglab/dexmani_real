@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Rerun-based HDF5 episode visualizer for DexMani teleop data.
+"""Rerun-based episode visualizer for DexMani teleop data.
+
+Supports both legacy (single ``.h5``) and new (directory with ``data.h5`` +
+``depth.h5`` + ``rgb.mp4``) episode formats.  RGB is decoded from MP4
+on-the-fly; depth routes through the merged HDF5 view automatically.
 
 Auto-detects available datasets in flat-key HDF5 episodes:
   State:   arm_qpos(7), arm_ee(9), arm_qvel(7), arm_tau(7),
@@ -11,6 +15,7 @@ Auto-detects available datasets in flat-key HDF5 episodes:
 
 Usage:
   python -m dexmani_real.tools.visualize_episode episode.h5
+  python -m dexmani_real.tools.visualize_episode episode_dir/
   python -m dexmani_real.tools.visualize_episode episode.h5 --info
   python -m dexmani_real.tools.visualize_episode episode.h5 --max-frames 500
 """
@@ -29,7 +34,7 @@ import rerun.blueprint as rrb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real.recording.episode_reader import EpisodeReader
+from dexmani_real.recording.episode_reader import EpisodeReader, _MergedH5File
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters
 
@@ -61,7 +66,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 _FINGERTIP_LABELS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
 
-def _classify_datasets(h5f: h5py.File) -> dict[str, list[str]]:
+def _classify_datasets(h5f: _MergedH5File) -> dict[str, list[str]]:
     """Scan top-level HDF5 datasets and group them by category.
 
     Returns:
@@ -95,16 +100,13 @@ def print_episode_info(h5_path: str) -> None:
         t_key = next((k for k in keys if k == "arm_qpos"), None)
         t_key = t_key or next((k for k in keys if k == "timestamp"), keys[0])
         t_frames = f[t_key].shape[0]
-        c_key = "rgb" if ("rgb" in f or reader.has_video("rgb")) else ("depth" if ("depth" in f or reader.has_video("depth")) else None)
+        c_key = "rgb" if "rgb" in f else ("depth" if "depth" in f else None)
         if c_key:
-            if reader.has_video(c_key):
-                c_frames = reader.video_frame_count(c_key)
-            else:
-                c_frames = f[c_key].shape[0]
+            c_frames = f[c_key].shape[0]
         else:
             c_frames = None
 
-        print(f"File:       {h5_path}")
+        print(f"Episode:    {h5_path}")
         print(f"State frames (T): {t_frames}")
         if c_frames is not None:
             print(f"Camera frames (C): {c_frames}  (ratio={c_frames / t_frames:.2f})")
@@ -176,16 +178,23 @@ class EpisodeVisualizer:
         # (~50 MB for 960 frames @ 640×480 — acceptable for interactive use).
         self._rgb_cache: np.ndarray | None = None
         self._depth_cache: np.ndarray | None = None
-        if self._reader.has_video("rgb"):
-            logger.info("Video sidecar detected — pre-decoding rgb frames...")
+        # RGB may come from HDF5 (legacy) or MP4 (new format).  _MergedH5File
+        # only knows about HDF5 keys, so check the reader directly for MP4.
+        try:
             self._rgb_cache = self._reader.read_camera_all("rgb")
             logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
-        if self._reader.has_video("depth"):
+        except KeyError:
+            pass
+        if "depth" in self._h5f:
             self._depth_cache = self._reader.read_camera_all("depth")
             logger.info("Pre-decoded %d depth frames", self._depth_cache.shape[0])
 
         # Discover datasets
         self._available = _classify_datasets(self._h5f)
+        # MP4 RGB sidecar: _classify_datasets only scans HDF5 keys, so "rgb"
+        # is missed in the new format.  Inject it manually when available.
+        if self._rgb_cache is not None and "rgb" not in self._available.get("camera", []):
+            self._available.setdefault("camera", []).append("rgb")
         logger.info("Detected %d categories: %s", len(self._available), sorted(self._available.keys()))
 
         # Depth units in meters: CLI override > /meta depth_scale > 1mm legacy default.
@@ -287,6 +296,7 @@ class EpisodeVisualizer:
         _app_id = f"DexMani - {self._h5_path.stem}"
         _rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
         rr.init(_app_id, recording_id=_rec_id, spawn=True, default_blueprint=self._blueprint)
+        rr.send_blueprint(blueprint=self._blueprint)  # force-override any cached blueprint for this app_id
         self._log_static()
 
     # ------------------------------------------------------------------
@@ -565,7 +575,7 @@ class EpisodeVisualizer:
             rr.log("camera/rgb", rr.Image(rgb))
         if "depth" in camera_keys:
             depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
-            rr.log("camera/depth", rr.DepthImage(depth, meter=self._depth_meter))
+            rr.log("camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)))  # clamp outliers to stabilize colormap
 
         # ── 3D point cloud ──
         # Pre-computed world-frame /pointcloud (from CameraProcess) takes priority
@@ -690,7 +700,7 @@ def main() -> None:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to HDF5 episode file (.h5)",
+        help="Path to episode (.h5 file or directory with data.h5 + depth.h5 + rgb.mp4).",
     )
     parser.add_argument(
         "--max-frames",
@@ -736,8 +746,8 @@ def main() -> None:
     args = parser.parse_args()
 
     h5_path = Path(args.episode).expanduser().resolve()
-    if not h5_path.is_file():
-        logger.error("File not found: %s", h5_path)
+    if not h5_path.exists():
+        logger.error("Episode not found: %s", h5_path)
         sys.exit(1)
 
     if args.info:

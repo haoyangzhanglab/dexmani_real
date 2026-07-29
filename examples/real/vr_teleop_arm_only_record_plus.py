@@ -46,18 +46,18 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.sensor.camera_process import create_camera_session
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
-from dexmani_real.sensor.camera_process import CameraProcess, CameraProcessConfig
+
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
 from dexmani_real.teleop.control.audio_feedback import AudioFeedback
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
@@ -93,8 +93,6 @@ WORKSPACE_BOUNDS = np.array(
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
-    hand_extension_below_eef=0.076,
-    hand_safe_margin=0.03,
 )
 
 # VR wrist → EEF 映射参数
@@ -142,37 +140,6 @@ _FRAME_IK_FAIL = 2
 _FRAME_SAFETY_REJECT = 3
 
 
-# ═══════════════════════════════════════════════ 归位
-
-
-def do_return_home(
-    robot: RobotInterface,
-    planner: XArm7MotionPlanner,
-    arm_inner: ArmServo,
-) -> ArmServo:
-    """归位: 停止内环 → 规划+执行 → 重启内环."""
-    print("return_home ...", flush=True)
-    try:
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        print("  Arm 内环线程已停止")
-
-        ok = robot.return_to_home(home_dt=HOME_DT)
-        print(f"  {'OK' if ok else 'FAIL'}")
-
-        new_inner = make_arm_servo(cfg=_INNER_CFG)
-        robot.set_arm_servo(new_inner)
-        new_inner.start()
-        print("  Arm 内环线程已重启")
-        return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home 异常，尝试 emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
-
 
 # ═══════════════════════════════════════════════ 主循环
 
@@ -214,7 +181,6 @@ def record_held_frame(
                  "held": True,
                  "flag_safety_reject": safety_reject, "frame_status": frame_status},
         diagnostics=diagnostics,
-        camera_crashed=False,  # camera var not in scope here; held-frame path
     )
 
 
@@ -347,7 +313,6 @@ def main():
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
         arm_sent_stream=True,  # schema v9: 记录实发的 arm 指令 (plan §6 P1)
-        use_video=True,  # H.264 sidecar → ~54% storage savings
     )
 
     # ── 7b. 主循环分段计时 (1Hz 聚合打印, 定位超预算去向) ──
@@ -362,49 +327,8 @@ def main():
     audio = AudioFeedback()
 
     # ── 8c. Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
-    # 提早到 VR 等待之前启动: 子进程 connect 需 2-4s (hardware_reset 坏路径 15s+),
-    # 与 VR 首帧等待重叠, 按 B 时 serial/K/depth_scale 通常已就绪 (残余由 B gate 兜底)。
-    camera = CameraProcess(CameraProcessConfig(camera_name="realsense", hz=30.0, enable_pointcloud=True))
-    if camera.start():
-        print("Camera 进程已启动 (RealSense @30Hz, SHM, pointcloud)")
-    else:
-        print("Camera 启动失败 (降级: 只录关节/EEF, 不录图像)")
-        camera = None
-    # 世界系点云烘焙了外参 → 把 T_world_camera 落盘到 /meta 以便追溯。
-    # camera_name 按实际连接相机的 serial 解析（而非硬编码 "camera_0"），
-    # 但 serial 由子进程 connect 后才写入 → 在 B 键开始录制时才 resolve。
-    calib = None
-    if camera is not None:
-        try:
-            calib = CameraCalib()
-        except (OSError, ValueError, KeyError):
-            print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
-
-    _camera_name_cache: str | None = None
-
-    # 相机停帧检测: frame_number 不再变化时跟踪停滞时长, 超过阈值自动
-    # 停止录制并报错, 避免产出充满 forward-fill 冻结帧的无效 episode。
-    CAMERA_STALE_STOP_S = 3.0  # 连续停滞超过此秒数 → 自动停止录制
-    cam_last_fn = None
-    cam_stale_start: float | None = None  # 本次停滞的开始时刻 (monotonic)
-    cam_stale_stopped = False  # 本次停滞已触发 auto-stop, 帧号恢复前抑制重复触发
-    cam_crash_handled = False  # 进程崩溃已处理 (重启成功后重置)
-
-    def _resolve_camera_name() -> str | None:
-        """serial → cameras.json 条目名，成功后缓存（子进程 connect 后 serial 才可用）."""
-        nonlocal _camera_name_cache
-        if _camera_name_cache is not None or calib is None or camera is None:
-            return _camera_name_cache
-        ser = camera.camera_serial
-        if not ser:
-            print("  ⚠ camera serial 尚不可用 — /meta 本次将缺少外参")
-            return None
-        try:
-            _camera_name_cache = calib.resolve_name_by_serial(ser)
-            print(f"  camera resolved: serial={ser} name={_camera_name_cache}")
-        except KeyError as e:
-            print(f"  ⚠ cameras.json 无 serial={ser} 的条目 — /meta 将缺少外参: {e}")
-        return _camera_name_cache
+    # 提早到 VR 等待之前启动: 子进程 connect 需 2-4s, 与 VR 首帧等待重叠。
+    session = create_camera_session()
 
     # ── 9. 等待 VR 首帧 ──
     print("\n等待 VR 帧... (确保 Quest 已连接并启动 HTS App)")
@@ -419,8 +343,7 @@ def main():
             arm_inner.stop()
             robot.disconnect()
             vr_receiver.stop()
-            if camera is not None:
-                camera.stop()
+            session.stop()
             return
         frame = vr_receiver.read_latest()
         if frame is not None:
@@ -446,8 +369,7 @@ def main():
         arm_inner.stop()
         robot.disconnect()
         vr_receiver.stop()
-        if camera is not None:
-            camera.stop()
+        session.stop()
         return
 
     # ── 10. 键盘就绪 (pynput 全局捕获) ──
@@ -470,20 +392,19 @@ def main():
     ik_method = "-"
     _last_vr_wrist_quat: np.ndarray | None = None  # VR quat continuity tracking
 
-    def _stop_recording(save: bool):
-        """停止录制. save=True 保存, save=False 丢弃."""
+    def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
+        """停止录制. save=True 保存, save=False 丢弃.
+
+        Args:
+            save: True 保存, False 丢弃.
+            triggered_by: The ControlSignal that triggered this stop.
+                Only auto-repeat copies of this signal are drained from the
+                keyboard buffer after the blocking save; unrelated signals
+                (e.g. HOME pressed during a STOP-triggered save) survive.
+        """
         nonlocal recording_active
         if recording_active:
             if save:
-                # 迟到相机元数据回填: B 早于相机 connect 时 start_episode 快照为 None,
-                # 相机中途就绪则在 stop 前补齐 (serial→外参 / K / depth_scale)。
-                if camera is not None and camera.camera_serial:
-                    recorder.backfill_camera_meta(
-                        depth_scale=camera.depth_scale,
-                        calib=calib,
-                        camera_name=_resolve_camera_name(),
-                        camera_K=camera.camera_K,
-                    )
                 n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 print("  保存中…", flush=True)
                 path = recorder.stop_episode(success=True)
@@ -506,8 +427,11 @@ def main():
                     print(f"  录制已丢弃: {h5.name}")
             recording_active = False
             limiter.reset()  # 清除阻塞期间累积的 deadline 债务, 避免下次 wait() 误报超预算
-            # 清空保存/丢弃期间用户狂按积压的按键，避免 H/Q 等信号重复触发
-            kb.poll(timeout=0.0)
+            # Drain auto-repeat of the trigger signal accumulated during the
+            # blocking join_stop().  Other signals (e.g. HOME pressed during a
+            # STOP-triggered save) are preserved for the next main-loop poll.
+            if triggered_by is not None:
+                kb.drain_signal(triggered_by)
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
@@ -592,11 +516,11 @@ def main():
 
                         if decision is True:
                             audio.play("save")
-                            _stop_recording(save=True)
+                            _stop_recording(save=True, triggered_by=ControlSignal.STOP)
                             print("  已保存")
                         elif decision is False:
                             audio.play("discard")
-                            _stop_recording(save=False)
+                            _stop_recording(save=False, triggered_by=ControlSignal.DISCARD)
                             print("  已丢弃")
                         elif running:
                             # 超时（非急停中断），默认丢弃
@@ -607,7 +531,7 @@ def main():
                         # H 在确认期间: 已保存, 继续执行归位
                         if do_home and running:
                             audio.play("home")
-                            arm_inner = do_return_home(robot, planner, arm_inner)
+                            arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                             teleop_active = False
                             arm_mapper.clear()
                             if arm_inner.wait_ready(timeout=30.0):
@@ -623,9 +547,12 @@ def main():
                                     prev_qpos_cmd = state.arm_qpos.copy()
                                     ema_prev_pos = ema_prev_quat = None
                                 error_count = 0
+                            # Drain HOME auto-repeat accumulated during
+                            # do_return_home.
+                            kb.poll(timeout=0.0)
                         # else: 急停已接管，跳过二次处理
                     else:
-                        _stop_recording(save=False)
+                        _stop_recording(save=False, triggered_by=ControlSignal.QUIT)
 
                     running = False
                     break
@@ -633,8 +560,19 @@ def main():
                 elif sig == ControlSignal.HOME:
                     print("\nH: return_home")
                     audio.play("home")
-                    _stop_recording(save=True)
-                    arm_inner = do_return_home(robot, planner, arm_inner)
+
+                    # If already at home, skip expensive do_return_home
+                    # (defense-in-depth against auto-repeat HOME leaking past
+                    # the post-home drain).
+                    if arm_qpos is not None and np.all(np.isfinite(arm_qpos)):
+                        if np.max(np.abs(arm_qpos - home_qpos)) < np.deg2rad(2.0):
+                            print("  已在 home 位置，跳过归位")
+                            _stop_recording(save=True, triggered_by=ControlSignal.HOME)
+                            skip_rest = True
+                            continue
+
+                    _stop_recording(save=True, triggered_by=ControlSignal.HOME)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                     teleop_active = False
                     arm_mapper.clear()
                     if arm_inner.wait_ready(timeout=30.0):
@@ -652,19 +590,24 @@ def main():
                             prev_qpos_cmd = state.arm_qpos.copy()
                             ema_prev_pos = ema_prev_quat = None
                         error_count = 0
+                    # Drain HOME auto-repeat accumulated during do_return_home
+                    # (3-4s blocking).  Blanket drain is safe here: HOME
+                    # auto-repeat is unwanted (arm already home), ESC bypasses
+                    # debounce at ~60Hz, and any other signal can be re-pressed.
+                    kb.poll(timeout=0.0)
                     skip_rest = True
 
                 elif sig == ControlSignal.STOP:
                     print("\nS: 停止录制")
                     audio.play("save")
-                    _stop_recording(save=True)
+                    _stop_recording(save=True, triggered_by=ControlSignal.STOP)
                     teleop_active = False
                     skip_rest = True
 
                 elif sig == ControlSignal.DISCARD:
                     print("\nD: 丢弃录制")
                     audio.play("discard")
-                    _stop_recording(save=False)
+                    _stop_recording(save=False, triggered_by=ControlSignal.DISCARD)
                     teleop_active = False
                     skip_rest = True
 
@@ -696,52 +639,12 @@ def main():
                         print("\nB: 无 VR 帧，无法开始遥操作")
                         skip_rest = True
                         continue
-                    # 相机就绪 gate: serial 由子进程 connect 完成后才写入 SHM (快乐路径
-                    # 2-4s, hardware_reset 坏路径 15s+)。B 早于就绪 → /meta 缺外参/
-                    # depth_scale + 前导栅格槽冻结帧。最多等 5s, 仍未就绪拒绝本次 B。
-                    if camera is not None and not camera.camera_serial and not camera.crashed:
-                        print("  相机连接中, 等待就绪…", end="", flush=True)
-                        _gate_deadline = time.perf_counter() + 5.0
-                        while not camera.camera_serial and not camera.crashed and time.perf_counter() < _gate_deadline:
-                            time.sleep(0.5)
-                            print(".", end="", flush=True)
-                        print(" 就绪" if camera.camera_serial else "")
-                        if not camera.camera_serial and not camera.crashed:
-                            print("  ⚠ 相机 5s 内未就绪 — 本次 B 忽略, 请稍后重按")
-                            skip_rest = True
-                            continue
-                    if camera is not None and camera.crashed:
+                    if session.crashed:
                         print("  ⚠ 相机进程已退出 — 本集降级为只录关节/EEF")
-                    # ── 相机流健康检查: serial 就绪后验证帧真正在推送 ──
-                    # serial 可读只说明子进程 connect() 完成; 仍需确认
-                    # (a) frame_number 在递增 (有新帧产出),
-                    # (b) 最新帧时间戳是近期的 (非停滞残留).
-                    if camera is not None and camera.camera_serial and not camera.crashed:
-                        _stream_deadline = time.perf_counter() + 2.0
-                        _prev_fn = None
-                        _stream_ok = False
-                        while time.perf_counter() < _stream_deadline:
-                            _f = camera.poll_latest_frame()
-                            if _f is not None:
-                                _fn = _f["frame_number"]
-                                _ts = _f["timestamp"]
-                                _age = time.time() - _ts
-                                if _prev_fn is not None and _fn != _prev_fn and _age < 0.5:
-                                    _stream_ok = True
-                                    break
-                                _prev_fn = _fn
-                            time.sleep(0.1)
-                        if not _stream_ok:
-                            print(
-                                "  ⚠ 相机流未就绪 (2s 内无新帧或帧过期)"
-                                " — 本次 B 忽略, 请检查相机并重试"
-                            )
-                            skip_rest = True
-                            continue
                     # 如果已在录制，先停止旧 episode
-                    _stop_recording(save=recording_active)
+                    _stop_recording(save=recording_active, triggered_by=ControlSignal.BEGIN)
                     gc.collect()  # drain cyclic garbage before a new episode
-                    _record_cfg = dict(camera.pointcloud_meta) if camera is not None and camera.pointcloud_meta else {}
+                    _record_cfg = session.pointcloud_meta
                     _record_cfg.update({
                         "ema_alpha_pos": EMA_ALPHA_POS,
                         "ema_alpha_rot": EMA_ALPHA_ROT,
@@ -755,10 +658,10 @@ def main():
                     if not recorder.start_episode(
                         task_label=TASK_LABEL,
                         operator=OPERATOR,
-                        depth_scale=camera.depth_scale if camera is not None else None,
-                        calib=calib,
-                        camera_name=_resolve_camera_name(),
-                        camera_K=camera.camera_K if camera is not None else None,
+                        depth_scale=session.depth_scale,
+                        calib=session.calib,
+                        camera_name=session.resolve_name(),
+                        camera_K=session.camera_K,
                         record_config=_record_cfg,
                     ):
                         print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
@@ -882,67 +785,12 @@ def main():
             # ── 相机帧: 从共享内存读取最新帧 (零拷贝, 不区分是否录制) ──
             # 提前到 held 帧录制点之前, 暂停/失败帧也带真实相机数据.
             #
-            # 先检查进程级崩溃 (硬故障) — 与 GAP-03 的软停滞互补.
-            # crashed 是单向 latch: 子进程退出后 is_alive() 返回 False,
-            # _crashed Event 被置位且永不自动清除.
-            if camera is not None and camera.crashed and not cam_crash_handled:
-                logger.error("相机进程已崩溃 — 自动停止录制并丢弃当前 episode")
-                print(
-                    f"\n{'=' * 60}\n"
-                    f"  ❌ 相机进程崩溃! 当前 episode 已自动丢弃\n"
-                    f"{'=' * 60}\n",
-                    flush=True,
-                )
-                _stop_recording(save=False)
+            # 检查进程级崩溃: crashed 是单向 latch,
+            # 子进程退出后 is_alive() 返回 False, _crashed Event 被置位且永不自动清除.
+            if session.crashed:
+                logger.warning("相机进程已崩溃 — 本集降级为只录关节/EEF")
 
-                # 尝试自动重启 (最多 3 次, 含 stall_rebuild_s 内建
-                # disconnect/connect 自愈后仍失败的情况).
-                if camera.restart(max_attempts=3):
-                    print(
-                        f"  ✓ 相机进程已自动重启 (第 {camera.restart_attempts} 次)\n",
-                        flush=True,
-                    )
-                    cam_crash_handled = False  # 重置 — 允许检测后续崩溃
-                    cam_last_fn = None
-                    cam_stale_start = None
-                    cam_stale_stopped = False
-                else:
-                    print(
-                        f"  ✗ 相机进程重启失败 (已尝试 {camera.restart_attempts} 次) — 请重启程序\n",
-                        flush=True,
-                    )
-                    cam_crash_handled = True
-
-            cam = camera.poll_latest_frame() if camera is not None else None
-            if cam is not None:
-                now_mono = time.monotonic()
-                if cam["frame_number"] != cam_last_fn:
-                    cam_last_fn = cam["frame_number"]
-                    cam_stale_start = None  # 帧号变化 → 停滞结束
-                    cam_stale_stopped = False
-                elif cam_stale_start is None:
-                    cam_stale_start = now_mono  # 首次检测到停滞
-                elif not cam_stale_stopped and now_mono - cam_stale_start > CAMERA_STALE_STOP_S:
-                    stale_s = now_mono - cam_stale_start
-                    logger.error(
-                        "相机帧已停滞 %.1fs (frame_number=%s 未变化) — 自动停止录制并丢弃当前 episode",
-                        stale_s,
-                        cam_last_fn,
-                    )
-                    print(
-                        f"\n{'=' * 60}\n"
-                        f"  ❌ 相机数据冻结! 帧已停滞 {stale_s:.1f}s\n"
-                        f"     当前 episode 已自动丢弃, 请检查相机连接后重新开始录制\n"
-                        f"{'=' * 60}\n",
-                        flush=True,
-                    )
-                    _stop_recording(save=False)
-                    cam_stale_stopped = True  # 帧号恢复前抑制重复触发
-                elif not cam_stale_stopped and loop_count % STATUS_EVERY == 0:  # 1 Hz 限频告警
-                    print(
-                        f"  ⚠ 相机帧已停止更新 {now_mono - cam_stale_start:.1f}s "
-                        f"— 将在 {CAMERA_STALE_STOP_S:.0f}s 后自动停止录制"
-                    )
+            cam = session.poll_latest_frame()
             stage_timer.mark("cam")
 
             # ── Periodic status ──
@@ -1241,10 +1089,8 @@ def main():
             action_valid, fail_reason = validate_action(
                 robot,
                 action,
-                actual_arm_qpos=arm_qpos,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_current=state.hand_current,
                 actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
@@ -1306,7 +1152,6 @@ def main():
                 ok = recorder.add_frame(
                     state, action, vr_frame, camera_frame=cam, signals=sig, arm_qpos_sent=sent_cmd,
                     diagnostics=diagnostics,
-                    camera_crashed=(camera is not None and camera.crashed),
                 )
                 if not ok and recorder.max_frames_reached:
                     print(f"\n  达到 max_frames={recorder.max_frames}，自动停止录制")
@@ -1345,7 +1190,7 @@ def main():
                 print("\nH: return_home")
                 audio.play("home")
                 try:
-                    arm_inner = do_return_home(robot, planner, arm_inner)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")
@@ -1364,8 +1209,7 @@ def main():
             arm_inner.stop()
             print("Arm 内环线程已停止")
 
-        if camera is not None:
-            camera.stop()
+        session.stop()
 
         robot.disconnect()
         vr_receiver.stop()

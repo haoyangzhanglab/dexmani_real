@@ -29,6 +29,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -131,12 +132,13 @@ def assess_episode(
         QualityReport, or None if the file cannot be read or is missing
         required datasets.
     """
-    if not os.path.isfile(h5_path):
-        logger.error("File not found: %s", h5_path)
+    if not os.path.exists(h5_path):
+        logger.error("Episode not found: %s", h5_path)
         return None
 
     try:
-        with h5py.File(h5_path, "r") as f:
+        with EpisodeReader(h5_path) as reader:
+            f = reader.h5f
             # ── Validate required datasets ──
             if "action_arm_joint" not in f or "arm_qpos" not in f:
                 logger.error("%s: missing action_arm_joint or arm_qpos", h5_path)

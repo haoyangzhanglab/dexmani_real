@@ -80,8 +80,6 @@ class StreamInterpolator:
             return self._interpolate_nearest(source_ts, source_data, target_ts)
         elif self.config.method == "linear":
             return self._interpolate_linear(source_ts, source_data, target_ts)
-        elif self.config.method == "slerp":
-            return self._interpolate_slerp(source_ts, source_data, target_ts)
         elif self.config.method == "none":
             # No interpolation — return raw data aligned by index
             return source_data[: len(target_ts)]
@@ -173,56 +171,6 @@ class StreamInterpolator:
                 result[invalid] = np.nan
 
         return result
-
-    def _interpolate_slerp(
-        self,
-        source_ts: np.ndarray,
-        source_data: np.ndarray,
-        target_ts: np.ndarray,
-    ) -> np.ndarray:
-        """Spherical linear interpolation for quaternion data (WXYZ order).
-
-        Uses scipy.spatial.transform.Slerp for correct unit-quaternion
-        interpolation.  Falls back to linear+L2-normalize if scipy is
-        unavailable.
-        """
-        from scipy.spatial.transform import Rotation as R
-        from scipy.spatial.transform import Slerp
-
-        source_data = np.asarray(source_data)
-        if source_data.shape[-1] != 4:
-            raise ValueError(f"SLERP requires quaternion data (last dim=4), got shape {source_data.shape}")
-
-        # Build rotation objects from WXYZ quaternions
-        source_rots = R.from_quat(source_data[..., [1, 2, 3, 0]])  # WXYZ → xyzw
-        slerp = Slerp(source_ts, source_rots)
-
-        # Interpolate at target timestamps
-        target_rots = slerp(target_ts)
-        result = target_rots.as_quat()  # xyzw
-
-        # Convert back to WXYZ order
-        result_wxyz = np.zeros_like(result)
-        result_wxyz[..., 0] = result[..., 3]  # w
-        result_wxyz[..., 1:] = result[..., :3]  # xyz
-
-        # Invalidate gaps and extrapolation
-        idx = np.searchsorted(source_ts, target_ts)
-        idx = np.clip(idx, 1, len(source_ts) - 1)
-        gaps = source_ts[idx] - source_ts[idx - 1]
-        valid_gap = gaps <= self.config.max_gap_s
-
-        invalid = ~valid_gap
-        if not self.config.extrapolate:
-            invalid = invalid | (target_ts < source_ts[0]) | (target_ts > source_ts[-1])
-
-        if invalid.any():
-            invalid_expanded = invalid
-            while invalid_expanded.ndim < result_wxyz.ndim:
-                invalid_expanded = invalid_expanded[..., np.newaxis]
-            result_wxyz = np.where(invalid_expanded, np.nan, result_wxyz)
-
-        return result_wxyz
 
 
 # ── Timestamp Aligner ──
@@ -324,15 +272,14 @@ class TimestampAligner:
         ]
 
         # Add camera streams if available (aligned by index — v2 has no camera timestamps)
-        has_camera = "rgb" in f or reader.has_video("rgb")
+        has_camera = "rgb" in f
         if has_camera:
             # Camera frames are forward-filled to match the control grid;
             # use nearest-neighbor to map camera index → timestamp grid.
-            # Frame count: prefer video sidecar, fall back to HDF5 dataset.
-            cam_n = reader.video_frame_count("rgb") or ("rgb" in f and f["rgb"].shape[0]) or 0
+            cam_n = f["rgb"].shape[0] if "rgb" in f else 0
             cam_ts = np.arange(cam_n, dtype=np.float64) / f["meta"].attrs.get("fps", 50.0)
             streams.append(("rgb", cam_ts, "nearest"))
-            if "depth" in f or reader.has_video("depth"):
+            if "depth" in f:
                 streams.append(("depth", cam_ts, "nearest"))
 
         _CAM_KEYS = {"rgb", "depth"}
@@ -341,10 +288,8 @@ class TimestampAligner:
             if path not in f and path not in _CAM_KEYS:
                 continue
 
-            # Camera streams: read via EpisodeReader (handles video sidecar).
-            if path in _CAM_KEYS and reader.has_video(path):
-                source_data = reader.read_camera_all(path)
-            elif path in f:
+            # Camera streams: read via HDF5.
+            if path in _CAM_KEYS and path in f:
                 source_data = np.asarray(f[path][:])
             else:
                 continue

@@ -65,25 +65,6 @@ class CollisionInfo:
         """Return the cached no-collision singleton (zero allocation)."""
         return cls._NO_COLLISION
 
-    @classmethod
-    def from_mplib_results(cls, results: list[Any]) -> CollisionInfo:
-        """Build ``CollisionInfo`` from a list of MPlib ``WorldCollisionResult``.
-
-        ``results`` is the raw list returned by
-        ``mp_planner.check_for_self_collision(qpos)``.
-        """
-        pairs = tuple(
-            CollisionPair(
-                link_name1=str(r.link_name1),
-                link_name2=str(r.link_name2),
-                object_name1=str(r.object_name1),
-                object_name2=str(r.object_name2),
-                collision_type=str(r.collision_type),
-            )
-            for r in results
-        )
-        return cls(in_collision=True, collision_pairs=pairs, num_contacts=len(pairs))
-
     def __bool__(self) -> bool:
         return self.in_collision
 
@@ -150,6 +131,17 @@ class PathResult:
     report: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class IKStats:
+    """Aggregate IK test statistics (motion planning benchmarks)."""
+
+    ok: int
+    total: int = 0
+    pos_errs_mm: list[float] = field(default_factory=list)
+    rot_errs_deg: list[float] = field(default_factory=list)
+    max_dq_deg: list[float] = field(default_factory=list)
+
+
 @dataclass(kw_only=True)
 class XArm7PlannerConfig:
     urdf_path: str
@@ -166,8 +158,8 @@ class XArm7PlannerConfig:
     # default. These are independent config paths — keep them in sync when tuning workspace.
     workspace_bounds: np.ndarray | None = None
 
-    # Unified collision configuration (desk safety, hand margins, fingertip FK).
-    # None disables geometric FK desk safety checks (backward compatible).
+    # Unified collision configuration (FCL table obstacle, tier margins).
+    # None disables environment collision detection (backward compatible).
     collision: CollisionConfig | None = None
 
 

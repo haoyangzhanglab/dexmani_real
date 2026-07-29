@@ -16,7 +16,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | IK / retargeting pipeline | `teleop/core/pipeline.py`, `planning/ik.py` |
 | Safety checks (validate) | `robot/validate.py` |
 | State machine | `examples/real/vr_teleop_arm_only_record_plus.py` (inline bool flags, not enum) |
-| Recording format / lifecycle | `recording/episode_recorder.py`, `collection_loop.py`, `collection_config.py` |
+| Recording format / lifecycle | `recording/episode_recorder.py` |
 | VR arm/hand mapping | `teleop/vr/arm_mapper.py`, `hand_retarget.py` |
 | Camera / point cloud | `sensor/camera_process.py`, `pointcloud_processor.py` |
 | Shared memory / SHM | `shm/robot_ring.py`, `robot_layouts.py`, `robot_rpc.py` |
@@ -79,7 +79,7 @@ State machine: inline bool flags per entry point. IDLE, TELEOP, PAUSED, EMERGENC
 
 ## Recording Format
 
-HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Video sidecar: opt-in MP4. Pipeline: `TimestampAlignedBuffer` -> `EpisodeRecorder` (async writer) -> `CollectionLoop` -> `CollectionConfig`. Field catalog: `episode_recorder.py` docstring.
+HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `TimestampAlignedBuffer` -> `EpisodeRecorder` (async writer). Field catalog: `episode_recorder.py` docstring.
 
 ---
 
@@ -89,7 +89,7 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Video sidecar: op
 2. **ArmInnerLoop:** delta clamp (0.3 rad/step) + velocity-adaptive tracking + mode-drift + reco (22=self-collision, 24=overspeed)
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure
 4. **Pre-flight:** `preflight_check(robot)` before every entry point
-5. **Desk safety + E-stop:** `FingertipDeskSafety` (FK-based Z check); `emergency_stop()` -> arm.stop() + hand.stop()
+5. **E-stop:** `emergency_stop()` -> arm.stop() + hand.stop()
 
 ---
 

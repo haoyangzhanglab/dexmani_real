@@ -1,22 +1,25 @@
-"""Episode health check — offline data-quality report for recorded HDF5 episodes.
+"""Episode health check — offline data-quality report for recorded episodes.
 
 Scans one or more episodes and reports the metrics that expose silent
 collection failures:
 
 - Grid fill: consecutive-duplicate /timestamp values = forward-filled slots
   (decision-loop overruns; meta fps only reflects the grid rate).
-- Camera content duplication: per-frame ROI hash over /rgb — cam-writer
-  backlog drops repeat frames on disk while flag_camera_fresh stays True
-  (it only tracks SHM arrival, not what reached the file).
+- Camera content duplication: per-frame ROI hash over /rgb — detects
+  repeated pixel data from cam-writer backlog drops.
 - Arm tracking error: max|/action_arm_joint - /arm_qpos| per frame — mode-6
   speed-saturation lag between commanded and actual joints.
-	- Hand tracking error: max|/action_hand_joint - /hand_qpos| per frame —
-	  commanded vs actual hand joint positions.
+- Hand tracking error: max|/action_hand_joint - /hand_qpos| per frame —
+  commanded vs actual hand joint positions.
 - Flags summary + /meta echo (v8 attrs: truncated, stop_reason,
   cam_frames_dropped, cam_items_written; schema <= 7 files print "-").
 
+Supports both legacy (single ``.h5``) and new (directory with ``data.h5`` +
+``depth.h5`` + ``rgb.mp4``) episode formats.
+
 Usage:
     python -m dexmani_real.tools.check_episode_health episodes/episode_*.h5
+    python -m dexmani_real.tools.check_episode_health episodes/episode_dir/
     python -m dexmani_real.tools.check_episode_health ep.h5 --roi-stride 8 --track-thresh-rad 0.35
 
 Read-only. Camera frames are read one at a time (never loaded whole) so
@@ -259,11 +262,18 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
             warns.append(f"栅格填充 {fill_pct:.1f}% > {FILL_WARN_PCT:.0f}% — 决策循环跟不上 control_hz")
 
         cam_keys = [k for k in f.keys() if k == "rgb" or k.endswith("_rgb")]
-        if not cam_keys and reader.has_video("rgb"):
-            cam_keys = ["rgb"]  # video-only: no HDF5 dataset, but sidecar exists
+        # New format: RGB is an MP4 sidecar, not an HDF5 dataset.
+        # _MergedH5File.keys() won't include it — try the reader directly.
+        if not cam_keys:
+            try:
+                rgb_data = reader.read_camera_all("rgb")  # decodes MP4 → (T,H,W,3) uint8
+                cam_keys.append("rgb")
+                # Stash the decoded array so the loop below can find it.
+            except KeyError:
+                pass
         for key in cam_keys:
-            if reader.has_video(key):
-                data = reader.read_camera_all(key)
+            if key == "rgb" and "rgb" not in f:
+                data = rgb_data  # pre-decoded numpy array from MP4
             else:
                 data = f[key]
             dup_pct, expected_pct = _check_camera(data, key, roi_stride, control_hz)
@@ -295,7 +305,7 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
             if int(np.sum(tipboard != 0)) > TACTILE_TIPBOARD_ERR_WARN:
                 warns.append(f"hand_tipboard_err 存在非零项 — 指尖 PCB 板级传感器故障")
 
-        flags = [k for k in ("flag_ik_ok", "flag_held", "flag_camera_fresh", "flag_retarget_ok") if k in f]
+        flags = [k for k in ("flag_ik_ok", "flag_held", "flag_retarget_ok") if k in f]
         if flags:
             print("  flags: " + "  ".join(f"{k}={100.0 * float(np.mean(f[k][:])):.1f}%" for k in flags))
 
@@ -311,7 +321,7 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DexMani episode health check (read-only)")
-    parser.add_argument("episodes", nargs="+", help="HDF5 episode file(s)")
+    parser.add_argument("episodes", nargs="+", help="Episode path(s) — .h5 file or directory with data.h5 + depth.h5 + rgb.mp4.")
     parser.add_argument("--roi-stride", type=int, default=8, help="Pixel stride for the rgb content hash (default: 8).")
     parser.add_argument(
         "--track-thresh-rad",
@@ -329,8 +339,8 @@ def main() -> None:
     total_warns = 0
     for ep in args.episodes:
         path = Path(ep).expanduser().resolve()
-        if not path.is_file():
-            logger.error("File not found: %s", path)
+        if not path.exists():
+            logger.error("Episode not found: %s", path)
             total_warns += 1
             continue
         try:

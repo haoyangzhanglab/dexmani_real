@@ -1,23 +1,24 @@
-"""Unified HDF5 episode reader with transparent MP4 sidecar support.
+"""Unified HDF5 episode reader.
 
-Reads camera frames from DexMani HDF5 episodes, auto-detecting video
-sidecar files (``.rgb.mp4``, ``.depth.mp4``) written by the opt-in
-H.264 encoding path.  When a sidecar is present camera frames are
-decoded from video; otherwise they fall back to the HDF5 dataset
-(legacy LZF-compressed path).
+Reads camera frames from DexMani episodes. Non-camera datasets
+(arm_qpos, hand_qpos, flags, etc.) are accessed directly through
+:attr:`h5f` — a merged view of ``data.h5`` + ``depth.h5``.
 
-Non-camera datasets (arm_qpos, hand_qpos, flags, etc.) are accessed
-directly through :attr:`h5f` — the underlying ``h5py.File``.
+Supports two formats:
+
+- **Legacy** (single ``.h5`` file): everything in one flat HDF5.
+- **New** (directory): ``data.h5`` (non-camera + pointcloud),
+  ``depth.h5`` (depth frames), ``rgb.mp4`` (RGB video).
 
 Usage::
 
-    with EpisodeReader("episode_001.h5") as reader:
-        # Non-camera data — direct h5py access
+    with EpisodeReader("episode_001") as reader:
+        # Non-camera data — direct merged-h5py access
         arm_qpos = reader.h5f["arm_qpos"][:]
 
-        # Camera data — transparent video/HDF5
+        # Camera data
         rgb_frame  = reader.read_camera_frame("rgb", 42)
-        all_frames = reader.read_camera_all("rgb")
+        all_depth  = reader.read_camera_all("depth")
 """
 
 from __future__ import annotations
@@ -33,35 +34,86 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# Camera dataset keys that may have video sidecars.
-_VIDEO_KEYS = ("rgb", "depth")
+# Camera dataset keys routed to depth.h5 (new format) or read via
+# VideoDecoder for "rgb" (MP4 sidecar).
+_CAM_KEYS = {"rgb", "depth"}
+
+
+class _MergedH5File:
+    """Transparent merged view of ``data.h5`` + ``depth.h5``.
+
+    Camera keys (``"depth"``) are routed to the depth file; everything
+    else goes to the data file.  ``"rgb"`` is handled by
+    :class:`VideoDecoder` and is **not** present in either file.
+    """
+
+    __slots__ = ("_data", "_depth")
+
+    def __init__(self, data_h5f: h5py.File, depth_h5f: h5py.File | None) -> None:
+        self._data = data_h5f
+        self._depth = depth_h5f
+
+    def __getitem__(self, key: str) -> Any:
+        if self._depth is not None and key in _CAM_KEYS and key in self._depth:
+            return self._depth[key]
+        return self._data[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data or (self._depth is not None and key in self._depth)
+
+    def keys(self) -> list[str]:
+        ks = list(self._data.keys())
+        if self._depth is not None:
+            ks.extend(k for k in self._depth.keys() if k not in ks)
+        return ks
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def close(self) -> None:
+        self._data.close()
+        if self._depth is not None:
+            self._depth.close()
 
 
 class EpisodeReader:
-    """Read camera frames from HDF5 episodes with optional MP4 sidecar support.
+    """Read camera frames from DexMani episodes.
 
-    Auto-detects ``.rgb.mp4`` / ``.depth.mp4`` files alongside the ``.h5``
-    episode.  When present, :meth:`read_camera_frame` and :meth:`read_camera_all`
-    decode from video; otherwise they read from the HDF5 dataset (legacy LZF).
-
-    :attr:`h5f` gives direct access to the underlying ``h5py.File`` for all
-    non-camera datasets (arm state, actions, flags, timestamps, metadata, etc.).
+    :attr:`h5f` returns a merged dict-like view over ``data.h5`` and
+    ``depth.h5`` so downstream code that accesses datasets by key
+    (``f["arm_qpos"]``, ``f["depth"]``, ``f["pointcloud"]``) works
+    transparently across both old (single ``.h5``) and new (directory)
+    formats.
     """
 
     def __init__(self, h5_path: str | Path) -> None:
-        self._h5_path = Path(h5_path)
-        if not self._h5_path.is_file():
-            raise FileNotFoundError(f"Episode not found: {self._h5_path}")
-
-        self._h5f: h5py.File = h5py.File(self._h5_path, "r")
-
-        # Auto-detect video sidecars — one decoder per camera key.
-        self._video: dict[str, VideoDecoder] = {}
-        for key in _VIDEO_KEYS:
-            mp4 = self._h5_path.with_suffix(f".{key}.mp4")
-            if mp4.is_file():
-                self._video[key] = VideoDecoder(mp4)
-                logger.debug("Video sidecar detected: %s", mp4.name)
+        self._path = Path(h5_path)
+        self._is_legacy = self._path.is_file()
+        if self._is_legacy:
+            # Old format: single episode_XXX.h5 file.
+            self._data_h5f: h5py.File = h5py.File(self._path, "r")
+            self._h5f = _MergedH5File(self._data_h5f, None)
+            self._rgb_decoder: VideoDecoder | None = None
+        elif self._path.is_dir():
+            # New format: episode_XXX/ directory.
+            data_path = self._path / "data.h5"
+            if not data_path.is_file():
+                raise FileNotFoundError(f"data.h5 not found in {self._path}")
+            depth_path = self._path / "depth.h5"
+            self._data_h5f = h5py.File(str(data_path), "r")
+            depth_h5f = h5py.File(str(depth_path), "r") if depth_path.is_file() else None
+            self._h5f = _MergedH5File(self._data_h5f, depth_h5f)
+            # RGB sidecar (optional).
+            rgb_mp4 = self._path / "rgb.mp4"
+            self._rgb_decoder = VideoDecoder(rgb_mp4) if rgb_mp4.is_file() else None
+        else:
+            raise FileNotFoundError(f"Episode not found: {self._path}")
 
         # Lazy pre-decode cache for read_camera_all().
         self._cache: dict[str, np.ndarray] = {}
@@ -69,57 +121,54 @@ class EpisodeReader:
     # -- public properties ------------------------------------------------
 
     @property
-    def h5f(self) -> h5py.File:
-        """Underlying ``h5py.File`` for direct dataset access."""
+    def h5f(self) -> _MergedH5File:
+        """Merged view of ``data.h5`` + ``depth.h5``.
+
+        ``f["rgb"]`` raises ``KeyError`` — use :meth:`read_camera_frame`
+        or :meth:`read_camera_all` for RGB frames (MP4 decoding).
+        """
         return self._h5f
 
     @property
     def h5_path(self) -> Path:
-        return self._h5_path
+        return self._path
 
     # -- camera queries ---------------------------------------------------
-
-    def has_video(self, key: str) -> bool:
-        """Return True if *key* has an MP4 sidecar (vs legacy HDF5 dataset)."""
-        return key in self._video
-
-    def video_frame_count(self, key: str) -> int | None:
-        """Number of frames in the video sidecar, or None if no sidecar."""
-        dec = self._video.get(key)
-        return dec.frame_count if dec is not None else None
-
-    # -- single-frame read ------------------------------------------------
 
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
         """Read a single camera frame by index.
 
-        Legacy HDF5 path: O(1) random access.
-        Video path: O(index) — seeks to nearest keyframe, decodes forward.
-        For repeated random access prefer :meth:`read_camera_all` + index.
+        For MP4 RGB frames, tail indices beyond the unique frame count
+        are clamped to the last available frame (forward-fill).
         """
-        if key in self._video:
-            return self._video[key].read_frame(index)
+        if key == "rgb" and self._rgb_decoder is not None:
+            n = self._rgb_decoder.frame_count
+            return self._rgb_decoder.read_frame(min(index, n - 1))
         if key in self._h5f:
             return np.asarray(self._h5f[key][index])
-        raise KeyError(f"Camera dataset '{key}' not found in {self._h5_path}")
-
-    # -- bulk read --------------------------------------------------------
+        raise KeyError(f"Camera dataset '{key}' not found in {self._path}")
 
     def read_camera_all(self, key: str) -> np.ndarray:
-        """Read all camera frames.  Cached after the first call.
+        """Read all camera frames. Cached after the first call.
 
-        Returns a ``(T, ...)`` array with the same dtype as the source
-        (``uint8`` for RGB, ``uint16`` for depth).
+        Returns a ``(T, ...)`` array (``uint8`` for RGB, ``uint16`` for depth).
+        RGB frames from MP4 are forward-filled to match the grid length
+        (``num_frames`` in ``/meta``) so all streams have the same ``T``.
         """
         if key in self._cache:
             return self._cache[key]
 
-        if key in self._video:
-            data = self._video[key].read_all()
+        if key == "rgb" and self._rgb_decoder is not None:
+            data = self._rgb_decoder.read_all()
+            # Forward-fill RGB to match grid length (MP4 stores unique frames only).
+            grid_len = self._h5f["meta"].attrs.get("num_frames", 0)
+            if grid_len > data.shape[0]:
+                pad = np.repeat(data[-1:], grid_len - data.shape[0], axis=0)
+                data = np.concatenate([data, pad], axis=0)
         elif key in self._h5f:
             data = np.asarray(self._h5f[key][:])
         else:
-            raise KeyError(f"Camera dataset '{key}' not found in {self._h5_path}")
+            raise KeyError(f"Camera dataset '{key}' not found in {self._path}")
 
         self._cache[key] = data
         return data
@@ -127,14 +176,14 @@ class EpisodeReader:
     # -- context manager --------------------------------------------------
 
     def close(self) -> None:
-        """Close video decoders and the HDF5 file.  Idempotent."""
-        for dec in self._video.values():
-            dec.close()
-        self._video.clear()
+        """Close all files and decoders. Idempotent."""
         self._cache.clear()
-        if self._h5f is not None:
+        if self._rgb_decoder is not None:
+            self._rgb_decoder.close()
+            self._rgb_decoder = None
+        if hasattr(self, "_h5f"):
             self._h5f.close()
-            self._h5f = None  # type: ignore[assignment]
+        super().__setattr__("_h5f", None)  # type: ignore[assignment]
 
     def __enter__(self) -> "EpisodeReader":
         return self

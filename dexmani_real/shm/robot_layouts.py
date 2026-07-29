@@ -39,7 +39,6 @@ PRODUCER_POLICY = 3
 # ── Capacity limits ──
 MAX_ARM_WAYPOINTS = 2048  # ARM_CMD_DTYPE waypoint rows (plan §4.3)
 MAX_HAND_WAYPOINTS = 256  # SEND_TRAJECTORY waypoint rows (plan §4.6)
-POLICY_CHUNK_MAX_STEPS = 16  # K ≤ 16 steps per chunk (plan §4.10)
 
 # ── arm_state (child → main / policy read-only, maxlen=3) — plan §4.1 ──
 # Written every inner-loop tick after get_joint_states.
@@ -117,15 +116,6 @@ HAND_CMD_DTYPE = np.dtype(
     ]
 )
 
-# ── policy_chunk (future policy process → main, consumer stub) — plan §4.10 ──
-POLICY_CHUNK_DTYPE = np.dtype(
-    [
-        ("n_steps", "u4"),  # valid rows in arm_qpos/hand_qpos (≤ POLICY_CHUNK_MAX_STEPS)
-        ("arm_qpos", "<f8", (POLICY_CHUNK_MAX_STEPS, 7)),
-        ("hand_qpos", "<f8", (POLICY_CHUNK_MAX_STEPS, 12)),
-        ("target_dt", "<f8"),  # step size (default 1/16Hz grid)
-    ]
-)
 
 
 def new_frame(dtype: np.dtype) -> np.ndarray:

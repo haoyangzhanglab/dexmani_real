@@ -93,6 +93,7 @@ from dexmani_real.shm.robot_ring import SeqlockRingBuffer, is_fresh
 from dexmani_real.shm.robot_rpc import RpcClient
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.throttle import ThrottledWarner
 
 if TYPE_CHECKING:
     from dexmani_real.robot.xhand.xhand import XHand, XHandConfig
@@ -142,8 +143,6 @@ _ECHO_MISMATCH_TOLERANCE_RAD: float = 1e-3
 
 # Plan §5.1: hand ready wait 15 s; failure → degraded mode (connected=False).
 _READY_TIMEOUT_S = 15.0
-# Throttled-warning interval (same cadence as SeqlockRingBuffer torn-read warns).
-_WARN_INTERVAL_S = 5.0
 # Baseline seeding / post-macro resync poll budgets.
 _SEED_TIMEOUT_S = 0.5
 _MACRO_RESYNC_TIMEOUT_S = 0.5
@@ -170,21 +169,6 @@ class HandProcessConfig:
     # position (firmware holds, A4) and exits cleanly — never detorques.
     # 0 disables the budget (hold forever).
     orphan_exit_s: float = 60.0
-
-
-class _ThrottledWarn:
-    """Logger.warning throttled to at most once per interval (≤1 / 5 s pattern)."""
-
-    def __init__(self, interval_s: float = _WARN_INTERVAL_S) -> None:
-        self._interval_ns = int(interval_s * 1e9)
-        self._last_ns = 0
-
-    def __call__(self, msg: str, *args: Any) -> None:
-        now_ns = time.monotonic_ns()
-        if now_ns - self._last_ns < self._interval_ns:
-            return
-        self._last_ns = now_ns
-        logger.warning(msg, *args)
 
 
 class HandControlProcess:
@@ -244,13 +228,13 @@ class HandControlProcess:
         self._crashed.clear()
 
         prefix = self._config.shm_prefix
-        self._state_ring = SeqlockRingBuffer(f"{prefix}_state", HAND_STATE_DTYPE, maxlen=_STATE_MAXLEN, create=True)
-        self._cmd_ring = SeqlockRingBuffer(f"{prefix}_cmd", HAND_CMD_DTYPE, maxlen=_CMD_MAXLEN, create=True)
-        self._macro_cmd_ring = SeqlockRingBuffer(
-            f"{prefix}_macro_cmd", HAND_MACRO_CMD_DTYPE, maxlen=_MACRO_MAXLEN, create=True
+        self._state_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_state", HAND_STATE_DTYPE, maxlen=_STATE_MAXLEN)
+        self._cmd_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_cmd", HAND_CMD_DTYPE, maxlen=_CMD_MAXLEN)
+        self._macro_cmd_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_macro_cmd", HAND_MACRO_CMD_DTYPE, maxlen=_MACRO_MAXLEN
         )
-        self._macro_result_ring = SeqlockRingBuffer(
-            f"{prefix}_macro_result", HAND_MACRO_RESULT_DTYPE, maxlen=_MACRO_MAXLEN, create=True
+        self._macro_result_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_macro_result", HAND_MACRO_RESULT_DTYPE, maxlen=_MACRO_MAXLEN
         )
         self._rpc_client = RpcClient(
             self._macro_cmd_ring, self._macro_result_ring, timeout_s=self._config.rpc_timeout_s
@@ -375,8 +359,8 @@ class HandSHMFaçade:
         # ── echo verification (F1) ──
         self._last_acked_seq = 0
         self._expected_by_seq: dict[int, np.ndarray] = {}
-        self._echo_warn = _ThrottledWarn()
-        self._stale_warn = _ThrottledWarn()
+        self._echo_warn = ThrottledWarner()
+        self._stale_warn = ThrottledWarner()
         self._last_good_state: np.ndarray | None = None
 
     # ------------------------------------------------------------------
@@ -901,9 +885,9 @@ def _hand_child_main(
         frame = new_frame(HAND_STATE_DTYPE)
         last_processed_seq = 0
         estopped = False
-        stale_warn = _ThrottledWarn()
-        producer_warn = _ThrottledWarn()
-        watchdog_warn = _ThrottledWarn()
+        stale_warn = ThrottledWarner()
+        producer_warn = ThrottledWarner()
+        watchdog_warn = ThrottledWarner()
         stale_budget_ns = int(config.cmd_stale_hold_s * 1e9)
         last_ts = time.monotonic()
         # Orphan budget (F4): last time ANY new hand_cmd seq was observed.

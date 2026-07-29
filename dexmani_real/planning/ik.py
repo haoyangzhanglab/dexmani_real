@@ -10,7 +10,6 @@ import numpy as np
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from .desk_safety import FingertipDeskSafety
     from .ik_candidates import IKCandidateManager
     from .kinematics import XArm7Kinematics
 
@@ -50,12 +49,10 @@ class TeleopIKSolver:
         kin: XArm7Kinematics,
         ik_mgr: IKCandidateManager,
         teleop_profile: TeleopProfile,
-        desk_safety: "FingertipDeskSafety | None" = None,
     ) -> None:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
-        self.desk_safety = desk_safety
         self._nullspace_warn_throttle: int = 0
         self._hold_start: float | None = None
         self._hold_warned: bool = False
@@ -385,7 +382,7 @@ class TeleopIKSolver:
     def _check_teleop_collision_gate(
         self, qpos_cmd: np.ndarray, profile: TeleopProfile,
     ) -> tuple[str | None, dict[str, Any]]:
-        """Self + env collision + FK desk safety gate. Returns (reason, extra_report) or (None, {})."""
+        """Self + env collision gate. Returns (reason, extra_report) or (None, {})."""
         if not profile.check_self_collision and not profile.check_env_collision:
             return None, {}
 
@@ -395,23 +392,15 @@ class TeleopIKSolver:
                 if info:
                     return (
                         f"IK result in self-collision ({info.summary}), holding.",
-                        {"collision": info.to_dict()},
+                        {"collision_type": "self", "collision": info.to_dict()},
                     )
 
         if profile.check_env_collision:
             if self.ik_mgr.has_env_collision(qpos_cmd):
                 return (
                     "IK result in environment collision (table/obstacle), holding.",
-                    {"env_collision": True},
+                    {"collision_type": "env", "env_collision": True},
                 )
-            if self.desk_safety is not None:
-                desk_safe, min_z, min_name = self.desk_safety.check_hand_desk_clearance(qpos_cmd)
-                if not desk_safe:
-                    threshold = self.desk_safety.config.fingertip_threshold
-                    return (
-                        f"IK result in desk collision ({min_name} z={min_z:.3f}m < safe={threshold:.3f}m), holding.",
-                        {"desk_collision": True, "min_fingertip_z": float(min_z), "min_fingertip_name": min_name},
-                    )
         return None, {}
 
     def _make_collision_held(
@@ -487,7 +476,7 @@ class TeleopIKSolver:
         # ── Collision safety gates ──
         collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)
         if collision_reason is not None:
-            if "environment collision" in collision_reason:
+            if collision_extra.get("collision_type") == "env":
                 current_eef = self.kin.compute_eef_pose_world(current_qpos)
                 if target_eef_pose_world.p[2] > current_eef.p[2] + 0.001:
                     logger.warning(

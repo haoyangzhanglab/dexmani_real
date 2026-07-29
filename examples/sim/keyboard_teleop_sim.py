@@ -48,6 +48,7 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, setup_scene
+from dexmani_real.teleop.control.keyboard import GlobalKeyState
 from dexmani_real.utils.rate_limiter import RateLimiter
 from scipy.spatial.transform import Rotation as R
 
@@ -103,80 +104,6 @@ TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
 
 # 循环超限告警阈值
 OVERRUN_WARN_RATIO = 1.5
-
-
-# ═══════════════════════════════════════════════ 键盘输入 (pynput)
-
-
-class GlobalKeyState:
-    """非阻塞键盘状态追踪 (pynput, 线程安全)。
-
-    与 keyboard_teleop_real.py 中的实现一致。
-    """
-
-    def __init__(self):
-        self._keys: set[str] = set()
-        self._running = True
-        self._thread = None
-        self._listener: "keyboard.Listener | None" = None  # type: ignore[name-defined]
-
-    def _run(self):
-        def on_press(key):
-            try:
-                if hasattr(key, "char") and key.char is not None:
-                    self._keys.add(key.char.lower())
-                elif key == keyboard.Key.esc:
-                    self._keys.add("esc")
-                elif key == keyboard.Key.up:
-                    self._keys.add("up")
-                elif key == keyboard.Key.down:
-                    self._keys.add("down")
-                elif key == keyboard.Key.left:
-                    self._keys.add("left")
-                elif key == keyboard.Key.right:
-                    self._keys.add("right")
-            except Exception:
-                pass
-
-        def on_release(key):
-            try:
-                if hasattr(key, "char") and key.char is not None:
-                    self._keys.discard(key.char.lower())
-                elif key == keyboard.Key.esc:
-                    self._keys.discard("esc")
-                elif key == keyboard.Key.up:
-                    self._keys.discard("up")
-                elif key == keyboard.Key.down:
-                    self._keys.discard("down")
-                elif key == keyboard.Key.left:
-                    self._keys.discard("left")
-                elif key == keyboard.Key.right:
-                    self._keys.discard("right")
-            except Exception:
-                pass
-
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
-        while self._running:
-            time.sleep(0.1)
-        self._listener.stop()
-        self._listener = None
-
-    def stop(self):
-        self._running = False
-
-    def start(self):
-        import threading
-
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def is_pressed(self, key: str) -> bool:
-        return key in self._keys
-
-    @property
-    def any_pressed(self) -> bool:
-        return len(self._keys) > 0
 
 
 # ═══════════════════════════════════════════════ 姿态工具

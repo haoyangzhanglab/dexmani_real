@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
-from dexmani_real.utils.pointcloud_utils import DepthEdgeConfig, DepthValidityConfig, make_depth_vis
+from dexmani_real.utils.pointcloud_utils import make_depth_vis
 
 # Acquisition settings: intentionally unchanged.
 RGB_RESOLUTION = (640, 480)
@@ -122,27 +122,6 @@ def main() -> None:
                 # driver's image-domain gate + cluster filter to judge.
                 confidence_threshold=2,
                 noise_filtering=2,  # runtime scale 0-6
-            ),
-            # Image-domain validity gate: confidence + IR streams, raw depth
-            # masked before depth_to_color alignment (specular/overexposure spikes
-            # cannot be cleaned by 3-D outlier removal alone).
-            depth_validity=DepthValidityConfig(
-                confidence_min=2,
-                ir_min=2,
-                ir_saturation=250,
-                saturation_dilate_px=3,
-                # Discontinuity band: T(z) = max(5*sigma_z(z), 10mm).
-                # sigma_poly calibrated 2026-07-15 (SN f1382055, warm camera, via
-                # calibrate_l515_depth.py): sigma_z = -0.94 + 2.93*z mm. Negative
-                # below z~0.32m is clamped by t_min; within the workspace the
-                # 10mm floor dominates up to ~1.0m. Cold-run confirmation pending.
-                edge=DepthEdgeConfig(
-                    sigma_poly=(-0.00094, 0.00293),
-                    n_sigma=5.0,
-                    t_min=0.010,
-                    t_max=None,
-                    dilate_px=0,
-                ),
             ),
         )
     )

@@ -59,6 +59,7 @@ from multiprocessing import shared_memory
 import numpy as np
 
 from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer
+from dexmani_real.shm.seqlock import seqlock_even, seqlock_is_complete, seqlock_odd, seqlock_to_logical
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -105,7 +106,6 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
         dtype: np.dtype,
         maxlen: int = 3,
         create: bool = True,
-        stale_cleanup: bool = True,
     ) -> None:
         """Initialize or attach to a named shared memory ring buffer.
 
@@ -114,30 +114,10 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             dtype: Numpy dtype for each slot's data payload.
             maxlen: Number of slots in the ring buffer.
             create: If True, create the shared memory block; if False, attach
-                    to an existing one.
-            stale_cleanup: If True and ``create`` hits FileExistsError, unlink
-                    the leftover block from a crashed run and recreate
-                    (camera_process.py stale-SHM pattern, plan §5.1 — a stale
-                    arm_target is an immediate-motion hazard). If False,
-                    FileExistsError propagates.
+                    to an existing one.  For creation with automatic stale-block
+                    recovery, use :meth:`create_or_replace`.
         """
-        if create and stale_cleanup:
-            try:
-                super().__init__(name, dtype, maxlen=maxlen, create=True)
-            except FileExistsError:
-                # Leftover block from a run that died without unlink. Stale
-                # targets/commands are worse than stale camera frames — drop
-                # and recreate (plan §5.1, D5).
-                logger.warning(
-                    "SeqlockRingBuffer '%s' already exists (stale from a previous run) " "— unlinking and recreating.",
-                    name,
-                )
-                stale = shared_memory.SharedMemory(name=name)
-                stale.close()
-                stale.unlink()
-                super().__init__(name, dtype, maxlen=maxlen, create=True)
-        else:
-            super().__init__(name, dtype, maxlen=maxlen, create=create)
+        super().__init__(name, dtype, maxlen=maxlen, create=create)
 
         # Last-good frame cache for torn-read fallback (plan §4.7).
         self._last_good: tuple[np.ndarray, int, int] | None = None
@@ -151,6 +131,27 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             self._total_size,
             create,
         )
+
+    @classmethod
+    def create_or_replace(cls, name: str, dtype: np.dtype, maxlen: int = 3) -> "SeqlockRingBuffer":
+        """Create a ring, replacing any stale leftover from a crashed run.
+
+        Stale arm_target / arm_cmd blocks are an immediate-motion hazard
+        (plan §5.1, D5) — if the previous run died mid-motion, a surviving
+        ring still holds the last commanded target.
+        """
+        try:
+            return cls(name, dtype, maxlen=maxlen, create=True)
+        except FileExistsError:
+            logger.warning(
+                "SeqlockRingBuffer '%s' already exists "
+                "(stale from a previous run) — unlinking and recreating.",
+                name,
+            )
+            stale = shared_memory.SharedMemory(name=name)
+            stale.close()
+            stale.unlink()
+            return cls(name, dtype, maxlen=maxlen, create=True)
 
     # ------------------------------------------------------------------
     # Producer API (odd/even seqlock around the data)
@@ -182,10 +183,10 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
 
         # Write to slot: ODD marker → ts + data → EVEN marker.
         slot = self._data_buf[idx]
-        slot["sequence"] = np.uint64(2 * seq - 1)  # odd: write in progress
+        slot["sequence"] = np.uint64(seqlock_odd(seq))  # odd: write in progress
         slot["timestamp_ns"] = np.uint64(now_ns)
         slot["data"] = data
-        slot["sequence"] = np.uint64(2 * seq)  # even: frame complete
+        slot["sequence"] = np.uint64(seqlock_even(seq))  # even: frame complete
 
         # Atomic write of write_idx (aligned uint64 store on x86_64)
         self._write_idx_view()[0] = np.uint64(idx)
@@ -234,8 +235,8 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             # observing it on the first sample guarantees all of that frame's
             # data stores are visible; agreement on the second sample
             # guarantees no later overwrite disturbed the copy.
-            if seq1 == seq2 and seq1 != 0 and (seq1 & 1) == 0:
-                self._last_good = (data, ts, seq1 // 2)
+            if seq1 == seq2 and seqlock_is_complete(seq1):
+                self._last_good = (data, ts, seqlock_to_logical(seq1))
                 return self._last_good
             # Torn (writer mid-overwrite: odd or mismatched) or unwritten
             # slot — retry with a fresh write_idx; the writer may have

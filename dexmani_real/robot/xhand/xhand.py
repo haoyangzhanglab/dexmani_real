@@ -963,7 +963,6 @@ class XHand(ConnectionStateMixin):
             force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0)) * 0.1
             force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0)) * 0.1
         return force_sum
-        return force_sum
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
         # XHand variant: same np.clip logic as XArm7._limit_joint_range (xarm7.py:855)

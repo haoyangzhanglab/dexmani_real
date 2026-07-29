@@ -59,7 +59,6 @@ class TeleopPipeline:
         self,
         vr_frame: dict,
         current_arm_qpos: np.ndarray,
-        current_hand_qpos: np.ndarray,
         prev_arm_cmd: np.ndarray,
         prev_hand_cmd: np.ndarray,
         *,
@@ -106,49 +105,28 @@ class TeleopPipeline:
         Returns (arm_cmd, ik_ok, target_pos, target_quat_wxyz) where the target
         is the smoothed Cartesian EEF pose that IK tracks (None if unavailable).
         """
-        wrist_pos = np.asarray(vr_frame["wrist_pos"], dtype=np.float64)
-        wrist_quat_wxyz = np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)
-
-        if not np.all(np.isfinite(wrist_pos)) or not np.all(np.isfinite(wrist_quat_wxyz)):
+        wrist_pose = self._extract_vr_pose(vr_frame)
+        if wrist_pose is None:
             return prev_arm_cmd.copy(), False, None, None
 
-        if not self.arm_mapper.is_ready():
+        target_pose = self._map_vr_to_world(*wrist_pose)
+        if target_pose is None:
             return prev_arm_cmd.copy(), False, None, None
 
-        mapped = self.arm_mapper.map(wrist_pos, wrist_quat_wxyz)
-        if mapped is None:
+        target_pos = self._clamp_workspace(target_pose[0], check_workspace, clamp_workspace_pos)
+        if target_pos is None:
             return prev_arm_cmd.copy(), False, None, None
 
-        target_pos = np.asarray(mapped["pos"], dtype=np.float64)
-        target_quat = np.asarray(mapped["quat_wxyz"], dtype=np.float64)
+        # Cartesian EMA — freeze on IK failure (prev state only updated below)
+        target_pos, target_quat = self._apply_cartesian_ema(
+            target_pos, target_pose[1],
+            self._prev_target_pos, self._prev_target_quat,
+        )
 
-        # ── Workspace clamp ──
-        if check_workspace is not None and not check_workspace(target_pos):
-            if clamp_workspace_pos is not None:
-                target_pos = clamp_workspace_pos(target_pos)
-            else:
-                return prev_arm_cmd.copy(), False, None, None
-
-        # ── Cartesian EMA (sole smoothing stage, before IK) ──
-        # First frame seeds the filter; subsequent frames apply EMA.
-        # EMA state is only updated on IK success — freezing it during
-        # failures prevents progressive drift toward unreachable targets.
-        if self._prev_target_pos is not None:
-            target_pos, target_quat = ema_smooth_pose(
-                target_pos,
-                target_quat,
-                self._prev_target_pos,
-                # _prev_target_quat is non-None whenever _prev_target_pos is: both start None
-                # and are only ever assigned together (see .copy() pair below) — a coupled
-                # two-attribute invariant mypy cannot track without a runtime narrowing statement.
-                self._prev_target_quat,  # type: ignore[arg-type]
-                self._ema_alpha_pos,
-                self._ema_alpha_rot,
-            )
-
-        # ── IK ──
-        target_pose = Pose(p=target_pos, q=target_quat)
-        ik_result = self.planner.solve_teleop_ik(target_pose, arm_qpos, prev_arm_cmd)
+        # IK solve
+        ik_result = self.planner.solve_teleop_ik(
+            Pose(p=target_pos, q=target_quat), arm_qpos, prev_arm_cmd,
+        )
 
         if ik_result.success and ik_result.qpos is not None:
             self._prev_target_pos = target_pos.copy()
@@ -156,6 +134,67 @@ class TeleopPipeline:
             return np.asarray(ik_result.qpos, dtype=np.float64), True, target_pos, target_quat
 
         return prev_arm_cmd.copy(), False, target_pos, target_quat
+
+    # ── Pipeline stages (extracted for testability) ──
+
+    @staticmethod
+    def _extract_vr_pose(vr_frame: dict) -> tuple[np.ndarray, np.ndarray] | None:
+        """Extract and validate wrist pose from VR frame. Returns None on NaN."""
+        wrist_pos = np.asarray(vr_frame["wrist_pos"], dtype=np.float64)
+        wrist_quat_wxyz = np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)
+        if not np.all(np.isfinite(wrist_pos)) or not np.all(np.isfinite(wrist_quat_wxyz)):
+            return None
+        return wrist_pos, wrist_quat_wxyz
+
+    def _map_vr_to_world(
+        self, wrist_pos: np.ndarray, wrist_quat_wxyz: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Map VR wrist pose to world frame. Returns None if mapper not ready or
+        mapping fails."""
+        if not self.arm_mapper.is_ready():
+            return None
+        mapped = self.arm_mapper.map(wrist_pos, wrist_quat_wxyz)
+        if mapped is None:
+            return None
+        return (
+            np.asarray(mapped["pos"], dtype=np.float64),
+            np.asarray(mapped["quat_wxyz"], dtype=np.float64),
+        )
+
+    @staticmethod
+    def _clamp_workspace(
+        pos: np.ndarray,
+        check_fn: Callable[[np.ndarray], bool] | None,
+        clamp_fn: Callable[[np.ndarray], np.ndarray] | None,
+    ) -> np.ndarray | None:
+        """Clamp target position to workspace. Returns None if out-of-bounds
+        and no clamp function is available (hard failure)."""
+        if check_fn is None or check_fn(pos):
+            return pos
+        if clamp_fn is not None:
+            return clamp_fn(pos)
+        return None
+
+    def _apply_cartesian_ema(
+        self,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+        prev_pos: np.ndarray | None,
+        prev_quat: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply Cartesian EMA smoothing. First frame seeds the filter;
+        subsequent frames smooth toward target using per-axis alpha factors.
+
+        EMA state update is the **caller's** responsibility — this method
+        is a pure function over its inputs.
+        """
+        if prev_pos is None:
+            return target_pos.copy(), target_quat.copy()
+        return ema_smooth_pose(
+            target_pos, target_quat,
+            prev_pos, prev_quat,  # type: ignore[arg-type]
+            self._ema_alpha_pos, self._ema_alpha_rot,
+        )
 
     def compute_hand_command(
         self,
@@ -183,6 +222,6 @@ class TeleopPipeline:
                 retarget_ok = True
                 hand_cmd = np.asarray(target_hand, dtype=np.float64)
         except (ValueError, TypeError, np.linalg.LinAlgError):
-            pass
+            pass  # hand holds last-good position; not spam-worthy (retry next frame)
 
         return hand_cmd, retarget_ok

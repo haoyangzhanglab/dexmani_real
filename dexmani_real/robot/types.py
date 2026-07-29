@@ -18,6 +18,7 @@ from dexmani_real.robot.xhand import XHandConfig
 # Defined here (robot layer) because these are hardware properties, not teleop policy.
 # Used by both teleop safety checks and RobotInterface path execution.
 _ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
+_ARM_TORQUE_LIMIT_NM.flags.writeable = False
 
 if TYPE_CHECKING:
     from dexmani_real.planning.collision_config import CollisionConfig
@@ -188,7 +189,6 @@ class RobotInterfaceConfig:
     )
 
     # Unified collision configuration.
-    # When set, desk safety uses geometric FK (FingertipDeskSafety).
     collision: CollisionConfig | None = None
 
     # Both arm and hand run in crash-isolated subprocesses via SHM.

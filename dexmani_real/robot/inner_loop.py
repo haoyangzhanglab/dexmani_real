@@ -382,80 +382,180 @@ class ArmInnerLoop:
 
     # ── Inner loop ──
 
-    def _run(self) -> None:
+    # ── Initialisation sub-steps (extracted from _run for testability) ──
+
+    @staticmethod
+    def _connect_arm(ip: str):
+        """Create XArmAPI connection. Returns (arm, None) on success, (None, None) on failure."""
         from xarm.wrapper import XArmAPI
 
         try:
-            arm = XArmAPI(self._ip, is_radian=True)
+            return XArmAPI(ip, is_radian=True)
         except (OSError, ConnectionError, RuntimeError) as e:
             logger.error("ArmInnerLoop: XArmAPI init failed: %s", e)
+            return None
+
+    def _init_mode_6(self, arm) -> bool:
+        """Initialise Mode 6 (online trajectory planning). Returns True on success."""
+        arm.clean_error()
+        arm.clean_warn()
+        arm.motion_enable(True)
+        self._init_mode(arm)
+        arm.set_collision_sensitivity(1)
+
+        actual_mode = getattr(arm, "mode", -1)
+        if actual_mode != 6:
+            logger.warning(
+                "ArmInnerLoop: arm mode=%d but expected 6 — re-initializing",
+                actual_mode,
+            )
+            self._init_mode(arm)
+            actual_mode = getattr(arm, "mode", -1)
+            if actual_mode != 6:
+                logger.error("ArmInnerLoop: failed to set mode 6 (arm mode=%d)", actual_mode)
+                return False
+        return True
+
+    def _bootstrap_state(self, arm) -> np.ndarray | None:
+        """Read initial joint position and seed shared state. Returns current_qpos or None."""
+        code, states = arm.get_joint_states(is_radian=True, num=1)
+        if code != 0 or len(states) == 0:
+            logger.error("ArmInnerLoop: failed to read initial qpos (code=%d)", code)
+            return None
+
+        current_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
+        if not np.all(np.isfinite(current_qpos)):
+            logger.error("ArmInnerLoop: initial qpos contains NaN/Inf — refusing to start")
+            return None
+
+        with self._lock:
+            self._arm_qpos = current_qpos.copy()
+            self._error_state = False
+            self._last_sent_cmd = current_qpos.copy()
+        return current_qpos
+
+    def _init_dynamics(self, arm) -> None:
+        """One-shot velocity/torque read to avoid NaN window at teleop start.
+
+        Best-effort: if hardware read fails, dynamics stay NaN (safe —
+        validate_action rejects NaN).
+        """
+        try:
+            _dyn_code, _dyn_states = arm.get_joint_states(is_radian=True, num=3)
+            if _dyn_code == 0:
+                if len(_dyn_states) > 1:
+                    _v = np.asarray(_dyn_states[1], dtype=np.float64)
+                    if _v.shape[0] >= 7 and np.all(np.isfinite(_v[:7])):
+                        self._arm_qvel = _v[:7].copy()
+                if len(_dyn_states) > 2:
+                    _tau = np.asarray(_dyn_states[2], dtype=np.float64)
+                    if _tau.shape[0] >= 7 and np.all(np.isfinite(_tau[:7])):
+                        self._arm_tau = _tau[:7].copy()
+        except (RuntimeError, OSError):
+            pass
+
+    def _handle_arm_error(self, arm, arm_error: int) -> str:
+        """Respond to a non-zero arm error code.
+
+        Returns one of ``"continue"``, ``"break"``, or ``"ok"`` (no error).
+        ``"continue"`` means the caller should hold and re-arm — the error was
+        recoverable.
+        """
+        if arm_error == 0:
+            return "ok"
+
+        if arm_error in _RECOVERABLE_ERRORS:
+            logger.warning(
+                "ArmInnerLoop: arm error_code=%d (%s) — recoverable, re-initialising mode",
+                arm_error,
+                decode_error(arm_error),
+            )
+            with self._lock:
+                self._arm_target = None
+            self._recover_mode(arm)
+            self._hold_position(arm)
+            self._signal_ready_only()
+            return "continue"
+
+        logger.error(
+            "ArmInnerLoop: arm error_code=%d (%s) — stopping inner loop",
+            arm_error,
+            decode_error(arm_error),
+        )
+        with self._lock:
+            self._error_state = True
+        return "break"
+
+    def _read_and_update_state(self, arm) -> np.ndarray | None:
+        """Read joint states from hardware and update shared state under lock.
+
+        Returns current_qpos on success, or ``None`` if the read failed
+        (caller should break or continue based on context).
+        """
+        try:
+            code, states = arm.get_joint_states(is_radian=True, num=3)
+        except (RuntimeError, OSError) as e:
+            logger.error("ArmInnerLoop: get_joint_states failed: %s", e)
+            with self._lock:
+                self._error_state = True
+            return None
+        time.sleep(0)  # explicit GIL yield — unblocks main-thread numpy ops
+
+        if code != 0:
+            logger.error("ArmInnerLoop: arm error code=%d — stopping inner loop", code)
+            with self._lock:
+                self._error_state = True
+            return None
+
+        # Parse state arrays (best-effort per field)
+        current_qpos = None
+        if len(states) > 0:
+            q = np.asarray(states[0], dtype=np.float64)
+            if q.shape[0] >= 7 and np.all(np.isfinite(q[:7])):
+                current_qpos = q[:7].copy()
+                with self._lock:
+                    self._arm_qpos = current_qpos
+                    self._error_state = False
+        if len(states) > 1:
+            v = np.asarray(states[1], dtype=np.float64)
+            if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
+                with self._lock:
+                    self._arm_qvel = v[:7].copy()
+        if len(states) > 2:
+            tau = np.asarray(states[2], dtype=np.float64)
+            if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
+                with self._lock:
+                    self._arm_tau = tau[:7].copy()
+
+        return current_qpos
+
+    # ── Main loop ──
+
+    def _run(self) -> None:
+        # ── Phase 1: Connect ──
+        arm = self._connect_arm(self._ip)
+        if arm is None:
             with self._lock:
                 self._error_state = True
             return
-        self._arm = arm  # expose to mode/connected properties (read-only queries)
+        self._arm = arm
 
         try:
-            arm.clean_error()
-            arm.clean_warn()
-            arm.motion_enable(True)
-            self._init_mode(arm)
-            arm.set_collision_sensitivity(1)
-
-            # Verify arm entered mode 6
-            actual_mode = getattr(arm, "mode", -1)
-            if actual_mode != 6:
-                logger.warning(
-                    "ArmInnerLoop: arm mode=%d but expected 6 — re-initializing",
-                    actual_mode,
-                )
-                self._init_mode(arm)
-                actual_mode = getattr(arm, "mode", -1)
-                if actual_mode != 6:
-                    logger.error("ArmInnerLoop: failed to set mode 6 (arm mode=%d)", actual_mode)
-                    with self._lock:
-                        self._error_state = True
-                    return
-
-            # Read initial position
-            code, states = arm.get_joint_states(is_radian=True, num=1)
-            if code == 0 and len(states) > 0:
-                current_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
-                if not np.all(np.isfinite(current_qpos)):
-                    logger.error("ArmInnerLoop: initial qpos contains NaN/Inf — refusing to start")
-                    with self._lock:
-                        self._error_state = True
-                    return
-            else:
-                logger.error("ArmInnerLoop: failed to read initial qpos (code=%d)", code)
+            # ── Phase 2: Mode 6 initialisation ──
+            if not self._init_mode_6(arm):
                 with self._lock:
                     self._error_state = True
                 return
 
-            with self._lock:
-                self._arm_qpos = current_qpos.copy()
-                self._error_state = False
-                # Seed the sent stream with the actual initial position so
-                # frame 0 records a physically valid value (not zeros).
-                self._last_sent_cmd = current_qpos.copy()
+            # ── Phase 3: Bootstrap state ──
+            current_qpos = self._bootstrap_state(arm)
+            if current_qpos is None:
+                with self._lock:
+                    self._error_state = True
+                return
 
-            # ── Init dynamics: read velocity/torque once at startup ──
-            # The idle loop (target is None: continue) never calls get_joint_states,
-            # so _arm_qvel/_arm_tau stay NaN until the first set_target().
-            # A single num=3 read here populates them, eliminating the 1-2 tick NaN
-            # window that causes validate_action() torque rejections at teleop start.
-            try:
-                _dyn_code, _dyn_states = arm.get_joint_states(is_radian=True, num=3)
-                if _dyn_code == 0:
-                    if len(_dyn_states) > 1:
-                        _v = np.asarray(_dyn_states[1], dtype=np.float64)
-                        if _v.shape[0] >= 7 and np.all(np.isfinite(_v[:7])):
-                            self._arm_qvel = _v[:7].copy()
-                    if len(_dyn_states) > 2:
-                        _tau = np.asarray(_dyn_states[2], dtype=np.float64)
-                        if _tau.shape[0] >= 7 and np.all(np.isfinite(_tau[:7])):
-                            self._arm_tau = _tau[:7].copy()
-            except (RuntimeError, OSError):
-                pass  # best-effort: if HW read fails, dynamics stay NaN (safe — validate_action rejects NaN)
+            # ── Phase 4: Init dynamics ──
+            self._init_dynamics(arm)
 
             last_target_ts: float = 0.0
             last_valid_qpos: np.ndarray = current_qpos.copy()
@@ -473,14 +573,11 @@ class ArmInnerLoop:
             )
             self._ready_event.set()
 
+            # ── Phase 5: Main loop ──
             while not self._stop_event.is_set():
                 limiter.wait()
 
-                # ── 0. Emergency-stop request (plan §4.8 fast path) ──
-                # set_state(4) on the loop's OWN live connection — one SDK
-                # call, ≤1 tick, no reconnect — then exit (_run's finally
-                # disconnects; the firmware stays in state 4 until a
-                # deliberate REINIT_MODE6 clears it).
+                # Emergency stop
                 if self._emergency_event.is_set():
                     try:
                         arm.set_state(4)
@@ -491,16 +588,14 @@ class ArmInnerLoop:
                     logger.info("ArmInnerLoop: emergency stop — set_state(4) issued, loop exiting")
                     break
 
-                # ── 1. Read target ──
+                # Read target under lock
                 with self._lock:
                     target = self._arm_target.copy() if self._arm_target is not None else None
                     target_ts = self._target_ts
 
                 now = time.perf_counter()
 
-                # ── 2. Timeout → hold ──
-                # Skip timeout during startup: if no target has ever been received
-                # (last_target_ts==0), the main thread is still initializing.
+                # Timeout → hold (skip during startup)
                 no_target_yet = last_target_ts == 0.0
                 if not no_target_yet and (
                     target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
@@ -510,11 +605,11 @@ class ArmInnerLoop:
                     continue
 
                 if target is None:
-                    continue  # startup: no target yet, silently skip
+                    continue  # startup: no target yet
 
                 last_target_ts = target_ts
 
-                # ── 3. NaN guard — hold last valid position ──
+                # NaN guard — hold last valid position
                 if not np.all(np.isfinite(target)):
                     try:
                         arm.set_servo_angle(
@@ -530,75 +625,27 @@ class ArmInnerLoop:
 
                 last_valid_qpos = target[:7].copy()
 
-                # ── 4. Read current joint state ──
-                try:
-                    code, states = arm.get_joint_states(is_radian=True, num=3)
-                except (RuntimeError, OSError) as e:
-                    logger.error("ArmInnerLoop: get_joint_states failed: %s", e)
-                    with self._lock:
-                        self._error_state = True
+                # Read hardware state
+                current_qpos = self._read_and_update_state(arm)
+                if current_qpos is None:
                     continue
-                time.sleep(0)  # explicit GIL yield — unblocks main-thread numpy ops
 
-                if code != 0:
-                    logger.error("ArmInnerLoop: arm error code=%d — stopping inner loop", code)
-                    with self._lock:
-                        self._error_state = True
-                    break
-
-                # Also check arm error flag (C31 collision sets error_code without
+                # Check arm error flag (C31 collision: error_code set without
                 # necessarily failing get_joint_states)
                 arm_error = getattr(arm, "error_code", 0)
-                if arm_error != 0:
-                    if arm_error in _RECOVERABLE_ERRORS:
-                        # Recoverable — clear the latch, re-init Mode 6 (firmware
-                        # drops to Mode 0 on reject), then hold position and
-                        # re-arm the soft-start ramp for a clean re-engagement.
-                        logger.warning(
-                            "ArmInnerLoop: arm error_code=%d (%s) — recoverable, re-initialising mode",
-                            arm_error,
-                            decode_error(arm_error),
-                        )
-                        with self._lock:
-                            self._arm_target = None
-                        self._recover_mode(arm)
-                        self._hold_position(arm)
-                        self._signal_ready_only()
-                        continue
-                    logger.error(
-                        "ArmInnerLoop: arm error_code=%d (%s) — stopping inner loop",
-                        arm_error,
-                        decode_error(arm_error),
-                    )
-                    with self._lock:
-                        self._error_state = True
+                action = self._handle_arm_error(arm, arm_error)
+                if action == "break":
                     break
+                if action == "continue":
+                    continue
 
-                if len(states) > 0:
-                    q = np.asarray(states[0], dtype=np.float64)
-                    if q.shape[0] >= 7 and np.all(np.isfinite(q[:7])):
-                        current_qpos = q[:7].copy()
-                        with self._lock:
-                            self._arm_qpos = current_qpos
-                            self._error_state = False
-                if len(states) > 1:
-                    v = np.asarray(states[1], dtype=np.float64)
-                    if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
-                        with self._lock:
-                            self._arm_qvel = v[:7].copy()
-                if len(states) > 2:
-                    tau = np.asarray(states[2], dtype=np.float64)
-                    if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
-                        with self._lock:
-                            self._arm_tau = tau[:7].copy()
-
-                # ── 4b. Passive tracking-error + mode monitor (no command change) ──
+                # Passive tracking-error + mode monitor
                 self._monitor(arm, current_qpos)
 
-                # ── 5. Forward target → firmware trajectory planner ──
+                # Forward target → firmware trajectory planner
                 self._send_target(arm, target)
 
-                # ── 6. Sync handshake (after hardware write) ──
+                # Sync handshake (after hardware write)
                 self._signal_ready_and_sync()
 
         except Exception:

@@ -8,9 +8,7 @@
   5. min_frames     — episode has >= min_frames frames (default 16 ≙ 1s @16Hz)
   6. no_duplicate_frames  — no consecutive identical frames (stuck sensor)
   7. timestamp_monotonic  — timestamps non-decreasing (duplicates = forward-fill)
-  8. camera_stall   — <=10% of frames with stale (frozen) camera data
-
-The actual total varies per episode depending on which data streams are present.
+ The actual total varies per episode depending on which data streams are present.
 
 Ref: data collection loop design — Phase 3 (offline tools).
 """
@@ -117,8 +115,7 @@ class DataValidator:
                 checks.append(self._check_timestamp_monotonicity(f))
 
                 # ── 8. Camera stall (frozen frames, schema v6+) ──
-                checks.append(self._check_camera_stall(reader))
-
+    
         except (OSError, KeyError) as e:
             checks.append(
                 ValidationCheck(
@@ -170,7 +167,7 @@ class DataValidator:
 
     def _check_camera(self, reader: EpisodeReader) -> ValidationCheck:
         f = reader.h5f
-        if "rgb" not in f and not reader.has_video("rgb"):
+        if "rgb" not in f:
             return ValidationCheck(
                 name="camera_fresh",
                 passed=True,
@@ -250,25 +247,6 @@ class DataValidator:
                 if not ok
                 else f"Timestamps non-decreasing ({n_duplicates} forward-filled duplicates)."
             ),
-        )
-
-    def _check_camera_stall(self, reader: EpisodeReader) -> ValidationCheck:
-        """Check /flag_camera_fresh (schema v6+): frozen/forward-filled camera data."""
-        f = reader.h5f
-        if "flag_camera_fresh" not in f or ("rgb" not in f and not reader.has_video("rgb")):
-            return ValidationCheck(
-                name="camera_stall",
-                passed=True,
-                detail="No freshness flag / camera data (skipped).",
-            )
-        fresh = np.asarray(f["flag_camera_fresh"][:], dtype=bool)
-        stale_frac = 1.0 - float(fresh.mean()) if fresh.size else 0.0
-        ok = stale_frac <= 0.10
-        return ValidationCheck(
-            name="camera_stall",
-            passed=ok,
-            detail=f"{stale_frac:.1%} of frames have stale camera data"
-            + ("" if ok else " (>10% — camera stalled mid-episode)"),
         )
 
     # ------------------------------------------------------------------

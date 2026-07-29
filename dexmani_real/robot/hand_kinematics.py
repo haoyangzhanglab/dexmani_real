@@ -86,7 +86,6 @@ class HandKinematics:
 
         # Fingertips are URDF <frame> elements, not joints.
         # Use getFrameId() → oMf (frame placements), NOT getJointId() → oMi (joint placements).
-        # desk_safety.py uses the same pattern and is verified correct on hardware.
         EXPECTED_COUNT = 5
         for name in fingertip_link_names:
             try:
@@ -131,7 +130,7 @@ class HandKinematics:
         tips = np.zeros((5, 3), dtype=np.float64)
         for i, fid in enumerate(self._fingertip_frame_ids):
             # fid is a frame ID from getFrameId() → use oMf (frame placements),
-            # NOT oMi (joint placements).  Same pattern as desk_safety.py:134.
+            # NOT oMi (joint placements).
             placement = self._data.oMf[fid]
             tips[i] = placement.translation.copy()
         return tips

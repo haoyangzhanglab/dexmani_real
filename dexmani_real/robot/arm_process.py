@@ -67,9 +67,11 @@ from dexmani_real.shm.robot_rpc import RpcClient, RpcServer
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.throttle import ThrottledWarner
 
 if TYPE_CHECKING:
     from dexmani_real.robot.inner_loop import ArmInnerLoop, ArmInnerLoopConfig
+    from dexmani_real.robot.interface import RobotInterface
 
 logger = get_logger(__name__)
 
@@ -124,9 +126,6 @@ class ArmProcessConfig:
 # ±2π·2 = ±4π per joint — catches torn/garbage qpos; P1 wiring passes the real
 # XArm7 qpos_min_soft/qpos_max_soft via the arm_joint_bounds ctor argument.
 _DEFAULT_JOINT_BOUND = 2.0 * np.pi * 2.0
-
-# Façade warning throttle (s) — matches SeqlockRingBuffer's <=1/5s cadence.
-_WARN_THROTTLE_S = 5.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -221,13 +220,13 @@ def _arm_child_main(
 
         # Attach the rings the parent created (create=False).
         prefix = config.shm_prefix
-        state_ring = SeqlockRingBuffer(f"{prefix}_state", ARM_STATE_DTYPE, maxlen=3, create=False, stale_cleanup=False)
+        state_ring = SeqlockRingBuffer(f"{prefix}_state", ARM_STATE_DTYPE, maxlen=3, create=False)
         target_ring = SeqlockRingBuffer(
-            f"{prefix}_target", ARM_TARGET_DTYPE, maxlen=2, create=False, stale_cleanup=False
+            f"{prefix}_target", ARM_TARGET_DTYPE, maxlen=2, create=False
         )
-        cmd_ring = SeqlockRingBuffer(f"{prefix}_cmd", ARM_CMD_DTYPE, maxlen=2, create=False, stale_cleanup=False)
+        cmd_ring = SeqlockRingBuffer(f"{prefix}_cmd", ARM_CMD_DTYPE, maxlen=2, create=False)
         result_ring = SeqlockRingBuffer(
-            f"{prefix}_cmd_result", ARM_CMD_RESULT_DTYPE, maxlen=2, create=False, stale_cleanup=False
+            f"{prefix}_cmd_result", ARM_CMD_RESULT_DTYPE, maxlen=2, create=False
         )
 
         inner.start()
@@ -292,7 +291,7 @@ def _arm_child_main(
         rpc_thread.start()
 
         limiter = RateManager(config.loop_hz)
-        estop_done = False
+        _estop_issued = False
         producer_throttle = 0
         logger.info("ArmControlProcess: child loop started @ %.0f Hz", config.loop_hz)
 
@@ -302,8 +301,8 @@ def _arm_child_main(
             # ── 1. estop FIRST ──
             if estop_event.is_set():
                 inner.set_target(None)
-                if not estop_done:
-                    estop_done = True
+                if not _estop_issued:
+                    _estop_issued = True
                     try:
                         fast_estop = getattr(inner, "emergency_stop", None)
                         if callable(fast_estop):
@@ -509,7 +508,7 @@ class ArmSHMFaçade:
         self._result_ring: SeqlockRingBuffer | None = None
         self._rpc_client: RpcClient | None = None
         self._last_good: np.ndarray | None = None  # last range-valid state record
-        self._last_warn_monotonic: float = 0.0  # warning throttle (<=1/5s)
+        self._throttled_warn = ThrottledWarner()  # warning throttle (≤1/5s)
         self._startup_grace_remaining: int = 0  # ticks to suppress no-frame error after restart
 
     # ── Lifecycle ──
@@ -740,15 +739,15 @@ class ArmSHMFaçade:
         # stale_cleanup=True: a leftover arm_target from a dead run would be
         # chased as a fresh target on restart — far more dangerous than stale
         # camera frames (camera_process.py:204 pattern, plan §5.1 / D5).
-        self._state_ring = SeqlockRingBuffer(
-            f"{prefix}_state", ARM_STATE_DTYPE, maxlen=3, create=True, stale_cleanup=True
+        self._state_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_state", ARM_STATE_DTYPE, maxlen=3
         )
-        self._target_ring = SeqlockRingBuffer(
-            f"{prefix}_target", ARM_TARGET_DTYPE, maxlen=2, create=True, stale_cleanup=True
+        self._target_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_target", ARM_TARGET_DTYPE, maxlen=2
         )
-        self._cmd_ring = SeqlockRingBuffer(f"{prefix}_cmd", ARM_CMD_DTYPE, maxlen=2, create=True, stale_cleanup=True)
-        self._result_ring = SeqlockRingBuffer(
-            f"{prefix}_cmd_result", ARM_CMD_RESULT_DTYPE, maxlen=2, create=True, stale_cleanup=True
+        self._cmd_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_cmd", ARM_CMD_DTYPE, maxlen=2)
+        self._result_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_cmd_result", ARM_CMD_RESULT_DTYPE, maxlen=2
         )
         self._rpc_client = RpcClient(self._cmd_ring, self._result_ring, timeout_s=self._config.rpc_timeout_s)
 
@@ -784,11 +783,6 @@ class ArmSHMFaçade:
         frame["connected"][0] = 0
         return frame
 
-    def _throttled_warn(self, msg: str, *args: Any) -> None:
-        now = time.monotonic()
-        if now - self._last_warn_monotonic >= _WARN_THROTTLE_S:
-            self._last_warn_monotonic = now
-            logger.warning(msg, *args)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -971,3 +965,40 @@ def make_arm_servo(
         arm_joint_bounds=arm_joint_bounds,
     )
     return ArmInnerLoopSHMAdapter(facade, estop_event)
+
+
+def do_return_home(
+    robot: "RobotInterface",
+    arm_inner: "ArmServo",
+    inner_cfg: "ArmInnerLoopConfig",
+    *,
+    home_dt: float = 0.04,
+) -> "ArmServo":
+    """Stop inner loop, return home, restart with *inner_cfg*.
+
+    Returns the new ``ArmServo`` instance — callers must replace their
+    reference.  On failure, triggers ``emergency_stop()`` and re-raises.
+    """
+    import traceback
+
+    print("return_home ...", flush=True)
+    try:
+        arm_inner.set_target(None)
+        arm_inner.stop()
+        print("  Arm 内环线程已停止")
+
+        ok = robot.return_to_home(home_dt=home_dt)
+        print(f"  {'OK' if ok else 'FAIL'}")
+
+        new_inner = make_arm_servo(cfg=inner_cfg)
+        robot.set_arm_servo(new_inner)
+        new_inner.start()
+        print("  Arm 内环线程已重启")
+        return new_inner
+    except Exception:
+        traceback.print_exc()
+        print("  return_to_home 异常，尝试 emergency_stop")
+        arm_inner.set_target(None)
+        arm_inner.stop()
+        robot.emergency_stop()
+        raise

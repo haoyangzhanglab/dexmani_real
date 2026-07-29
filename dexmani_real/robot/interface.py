@@ -17,6 +17,7 @@ import numpy as np
 
 from dexmani_real.planning import WorkspaceSafety
 from dexmani_real.planning.kinematics import XArm7Kinematics
+from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import compose_pose, quat_wxyz_to_rot6d
 from dexmani_real.planning.types import Pose
 from dexmani_real.robot.hand_kinematics import HandKinematics
@@ -85,7 +86,7 @@ class RobotInterface:
             else:
                 warnings.warn(f"Cannot validate home EEF workspace (NaN FK): {msg}")
 
-        # Table collision geometry — lightweight CollisionModel (no MPlib point cloud penalty)
+        # Table collision geometry — CollisionModel FCL
         if self.planner is not None and config.collision is not None:
             if config.collision.enable_env_collision:
                 try:
@@ -97,12 +98,9 @@ class RobotInterface:
                         half_z=config.collision.table_half_z,
                     )
                 except RuntimeError:
-                    # FCL bindings unavailable — Tier-2 env collision disabled.
-                    # Desk safety is still fully covered by FingertipDeskSafety (FK-based).
                     logger.warning(
                         "Cannot register table obstacle: FCL bindings unavailable. "
-                        "Tier-2 FCL env collision disabled. "
-                        "Desk safety covered by FingertipDeskSafety (FK-based)."
+                        "Tier-2 FCL env collision disabled."
                     )
 
         # Hand kinematics
@@ -215,6 +213,7 @@ class RobotInterface:
                 arm_qpos = nan_array(7)
                 arm_qvel = nan_array(7)
                 arm_tau = nan_array(7)
+                logger.warning("arm get_state failed", exc_info=True)
 
         try:
             hand_state = self.hand.get_state()  # default mode now includes tactile (ref: DexUMI)
@@ -231,6 +230,7 @@ class RobotInterface:
             hand_tactile_force = nan_array((5, 120, 3))
             hand_tactile_contact = np.zeros(5, dtype=bool)
             hand_tipboard_err = np.zeros(12, dtype=np.int32)
+            logger.warning("hand get_state failed", exc_info=True)
 
         # EEF FK
         if np.all(np.isfinite(arm_qpos)):
@@ -288,13 +288,12 @@ class RobotInterface:
     def _sync_hand_collision_model(self) -> None:
         """Sync CollisionModel hand buffer with current hardware state.
 
-        Non-critical: CollisionModel defaults to open hand on failure.
-        The 19-DOF full URDF (xarm7_xhand_right.urdf) includes active hand
-        joints, so hand pose affects all collision checks.  Keeping this
-        buffer current avoids false-positive env collisions when the hand
-        is near the table.
+        Only active in 19-DOF mode where the collision URDF includes hand DOFs.
+        In 7-DOF mode (current production), the URDF ignores hand DOFs entirely.
         """
         if self.planner is None:
+            return
+        if not self.planner.collision_model.hand_dof:
             return
         try:
             hand_state = self.hand.get_state()
@@ -302,16 +301,48 @@ class RobotInterface:
             if hand_qpos.shape == (12,) and np.all(np.isfinite(hand_qpos)):
                 self.planner.set_hand_qpos(hand_qpos)
         except Exception:
-            pass  # non-critical
+            pass  # non-critical; hand FK model is defence-in-depth only
 
     # ── Return to home (path-planned) ──
+
+    def _try_cartesian_home(
+        self, qpos: np.ndarray, home_qpos: np.ndarray, home_eef: "Pose", dt: float
+    ) -> bool:
+        """Tier 1: plan + execute a cartesian path to home EEF pose.
+
+        Returns:
+            True if a path was planned (execution is best-effort — partial
+            execution does not fail this method). False if plan_path itself
+            returned no valid path, so the caller should escalate to Tier 2.
+        """
+        assert self.planner is not None  # caller guarantees planner is set
+        try:
+            result = self.planner.plan_path(home_eef, qpos)
+            if result.success and result.qpos_path is not None and len(result.qpos_path) > 0:
+                logger.info(
+                    "return_to_home Phase 1: %d waypoints, source=%s, score=%.3f",
+                    len(result.qpos_path),
+                    result.source,
+                    result.report.get("path_score", float("nan")),
+                )
+                if not self._execute_waypoints(result.qpos_path, dt):
+                    logger.warning(
+                        "return_to_home Phase 1 execution aborted mid-path: %s",
+                        self.arm.last_error_message,
+                    )
+                # Path was planned — Tier 1 is "ok" even if execution aborted.
+                return True
+            return False
+        except Exception:
+            logger.warning("plan_path exception", exc_info=True)
+            return False
 
     def return_to_home(self, *, home_dt: float | None = None) -> bool:
         """Path-planned return-to-home with collision avoidance.
 
         Three-tier execution (in priority order):
           Tier 1: plan_path(home EEF) — screw/RRT Cartesian path with full
-                  collision checking (self + env + desk + workspace).
+                  collision checking (self + env + workspace).
           Tier 2: Safe joint-space interpolation — dense linear joint-space
                   path at 1° resolution, collision-checked. Used when
                   plan_path fails (e.g. waypoint delta too large).
@@ -375,35 +406,9 @@ class RobotInterface:
 
             # ── 6. Tier 1: Plan + execute EEF Cartesian path ──
             home_eef = self.kinematics.compute_eef_pose_world(home_qpos)
-            plan_ok = False
-            plan_reason = ""
-            try:
-                result = self.planner.plan_path(home_eef, qpos)
-                if result.success and result.qpos_path is not None and len(result.qpos_path) > 0:
-                    plan_ok = True
-                    logger.info(
-                        "return_to_home Phase 1: %d waypoints, source=%s, score=%.3f",
-                        len(result.qpos_path),
-                        result.source,
-                        result.report.get("path_score", float("nan")),
-                    )
-                    if not self._execute_waypoints(result.qpos_path, dt):
-                        logger.warning(
-                            "return_to_home Phase 1 execution aborted mid-path: %s",
-                            self.arm.last_error_message,
-                        )
-                else:
-                    plan_reason = result.reason or "unknown"
-            except Exception:
-                logger.warning("plan_path exception", exc_info=True)
-                plan_reason = "exception"
-
-            if not plan_ok:
+            if not self._try_cartesian_home(qpos, home_qpos, home_eef, dt):
                 # ── Tier 2: Safe joint-space fallback (collision-checked) ──
-                logger.info(
-                    "plan_path failed: %s, trying safe joint-space fallback",
-                    plan_reason,
-                )
+                logger.info("plan_path failed, trying safe joint-space fallback")
                 if not self.arm.is_error() and not self._safe_joint_home_fallback(qpos, home_qpos, dt):
                     logger.warning("Safe joint fallback also failed, falling back to arm.reset()")
                     return self._reset_blocking()
@@ -445,6 +450,7 @@ class RobotInterface:
                 return qpos
         except Exception:
             pass
+        # Best-effort: caller falls back to _reset_blocking() on None
         return None
 
     def _reset_blocking(self) -> bool:
@@ -464,15 +470,7 @@ class RobotInterface:
         if len(path) == 1:
             return self.arm.send_action(path[0]) if not self.arm.is_error() else False
 
-        # Build dense path: linear interpolation at max_step_rad resolution
-        dense: list[np.ndarray] = [path[0]]
-        for i in range(len(path) - 1):
-            seg_dist = float(np.max(np.abs(path[i + 1] - path[i])))
-            n = max(1, int(np.ceil(seg_dist / max_step_rad)))
-            for k in range(1, n + 1):
-                alpha = k / n
-                dense.append(path[i] + alpha * (path[i + 1] - path[i]))
-
+        dense = interpolate_waypoints(path, max_step_rad)
         for waypoint in dense:
             if self.arm.is_error():
                 return False
@@ -482,7 +480,7 @@ class RobotInterface:
         return True
 
     def _check_joint_path_safe(self, path: np.ndarray) -> bool:
-        """Check self-collision + env-collision + FK desk safety for a joint path.
+        """Check self-collision + env-collision for a joint path.
 
         Returns True if all checks pass or planner unavailable (can't verify).
         """
@@ -498,10 +496,6 @@ class RobotInterface:
             result = self.planner.check_path_env_collisions(path)
             if result.get("path_env_collision"):
                 return False
-        if profile.check_env_collision and self.planner.desk_safety is not None:
-            desk_safe, _min_z, _idx = self.planner.desk_safety.check_path_desk_safety(path)
-            if not desk_safe:
-                return False
         return True
 
     def _execute_joint_homing(self, current: np.ndarray, target: np.ndarray, dt: float) -> None:
@@ -513,17 +507,13 @@ class RobotInterface:
         if delta < np.deg2rad(0.5):
             return
 
-        n = max(2, int(np.ceil(delta / np.deg2rad(1.0))) + 1)
-        path = np.array(
-            [current + (k / (n - 1)) * (target - current) for k in range(n)],
-            dtype=np.float64,
-        )
+        path = interpolate_waypoints(np.stack([current, target]), np.deg2rad(1.0))
 
         if not self._check_joint_path_safe(path):
             logger.warning("Phase 2 joint path has collisions, skipping " "(EEF already at home from Phase 1)")
             return
 
-        logger.info("return_to_home Phase 2: %d joint waypoints, delta=%.1f°", n, np.rad2deg(delta))
+        logger.info("return_to_home Phase 2: %d joint waypoints, delta=%.1f°", len(path), np.rad2deg(delta))
         if not self._execute_waypoints(path, dt):
             logger.warning(
                 "return_to_home Phase 2 execution aborted mid-path: %s",
@@ -535,7 +525,7 @@ class RobotInterface:
 
         Used when plan_path fails (e.g. waypoint delta too large after shortcut
         smoothing). Builds a dense 1°-resolution joint-space path, checks
-        self/env/desk collisions, and executes if safe.
+        self/env collisions, and executes if safe.
 
         When the direct linear path has collisions (common when the arm is
         stretched out near the table), retries with a two-stage detour:
@@ -551,16 +541,12 @@ class RobotInterface:
             return True
 
         # ── Attempt 1: direct linear interpolation ──
-        n = max(2, int(np.ceil(delta / np.deg2rad(1.0))) + 1)
-        path = np.array(
-            [current + (k / (n - 1)) * (target - current) for k in range(n)],
-            dtype=np.float64,
-        )
+        path = interpolate_waypoints(np.stack([current, target]), np.deg2rad(1.0))
 
         if self._check_joint_path_safe(path):
             logger.info(
                 "return_to_home safe joint fallback: %d waypoints, delta=%.1f°",
-                n,
+                len(path),
                 np.rad2deg(delta),
             )
             return self._execute_waypoints(path, dt)
@@ -575,20 +561,11 @@ class RobotInterface:
             mid[PROXIMAL_MASK] = target[PROXIMAL_MASK]
 
             # Stage 1: proximal joints → home (wrist stays)
-            delta1 = float(np.max(np.abs(mid - current)))
-            n1 = max(2, int(np.ceil(delta1 / np.deg2rad(1.0))) + 1)
-            path1 = np.array(
-                [current + (k / (n1 - 1)) * (mid - current) for k in range(n1)],
-                dtype=np.float64,
-            )
+            path1 = interpolate_waypoints(np.stack([current, mid]), np.deg2rad(1.0))
 
             # Stage 2: wrist joints → home
-            delta2 = float(np.max(np.abs(target - mid)))
-            n2 = max(2, int(np.ceil(delta2 / np.deg2rad(1.0))) + 1)
-            path2 = np.array(
-                [mid + (k / (n2 - 1)) * (target - mid) for k in range(1, n2)],  # skip mid (already at end of path1)
-                dtype=np.float64,
-            )
+            path2_full = interpolate_waypoints(np.stack([mid, target]), np.deg2rad(1.0))
+            path2 = path2_full[1:]  # skip mid (already at end of path1)
 
             staged_path = np.concatenate([path1, path2], axis=0) if len(path2) > 0 else path1
 
@@ -596,14 +573,14 @@ class RobotInterface:
                 logger.info(
                     "return_to_home safe joint fallback (2-stage): "
                     "stage1=%d wp (proximal), stage2=%d wp (wrist), total_delta=%.1f°",
-                    n1,
-                    n2 + 1,
+                    len(path1),
+                    len(path2_full),
                     np.rad2deg(delta),
                 )
                 return self._execute_waypoints(staged_path, dt)
 
         logger.warning(
-            "Safe joint fallback: path has collisions (self/env/desk), delta=%.1f°",
+            "Safe joint fallback: path has collisions (self/env), delta=%.1f°",
             np.rad2deg(delta),
         )
         return False

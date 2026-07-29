@@ -40,7 +40,7 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
@@ -80,8 +80,6 @@ WORKSPACE_BOUNDS = np.array(
 
 COLLISION_CONFIG = CollisionConfig(
     table_z_world=0.0,
-    hand_extension_below_eef=0.076,
-    hand_safe_margin=0.03,
 )
 
 # VR wrist → EEF 映射参数
@@ -98,37 +96,6 @@ ARM_MAX_SPEED_DEG_S = 120.0  # 首次上机需低速验收 (C22/C24 与 tracking
 _INNER_CFG = ArmInnerLoopConfig(joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)))
 ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命令级限速步长 (0.131 rad/拍 @120°/s,16Hz)
 
-
-# ═══════════════════════════════════════════════ 归位
-
-
-def do_return_home(
-    robot: RobotInterface,
-    planner: XArm7MotionPlanner,
-    arm_inner: ArmServo,
-) -> ArmServo:
-    """归位: 停止内环 → 规划+执行 → 重启内环."""
-    print("return_home ...", flush=True)
-    try:
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        print("  Arm 内环线程已停止")
-
-        ok = robot.return_to_home(home_dt=HOME_DT)
-        print(f"  {'OK' if ok else 'FAIL'}")
-
-        new_inner = make_arm_servo(cfg=_INNER_CFG)
-        robot.set_arm_servo(new_inner)
-        new_inner.start()
-        print("  Arm 内环线程已重启")
-        return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home 异常，尝试 emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
 
 
 # ═══════════════════════════════════════════════ 主循环
@@ -337,8 +304,15 @@ def main():
     prev_eef_pos: np.ndarray | None = None
     ik_method = "-"
 
-    def _stop_recording(save: bool):
-        """停止录制. save=True 保存, save=False 丢弃."""
+    def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
+        """停止录制. save=True 保存, save=False 丢弃.
+
+        Args:
+            save: True 保存, False 丢弃.
+            triggered_by: The ControlSignal that triggered this stop.
+                Only auto-repeat copies of this signal are drained after the
+                blocking save; unrelated signals survive to the next poll.
+        """
         nonlocal recording_active
         if recording_active:
             if save:
@@ -357,6 +331,10 @@ def main():
                 # h5 以 success=False 留盘。join 确保文件完整关闭。
                 recorder.join_stop(timeout=60.0)
             recording_active = False
+            # Drain auto-repeat of the trigger signal accumulated during the
+            # blocking join_stop().  Other signals survive to the next poll.
+            if triggered_by is not None:
+                kb.drain_signal(triggered_by)
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
@@ -391,14 +369,25 @@ def main():
 
                 elif sig == ControlSignal.QUIT:
                     print("\nQ: 退出")
-                    _stop_recording(save=False)
+                    _stop_recording(save=False, triggered_by=ControlSignal.QUIT)
                     running = False
                     break
 
                 elif sig == ControlSignal.HOME:
                     print("\nH: return_home")
-                    _stop_recording(save=True)
-                    arm_inner = do_return_home(robot, planner, arm_inner)
+
+                    # If already at home, skip expensive do_return_home
+                    # (defense-in-depth against auto-repeat HOME leaking past
+                    # the post-home drain).
+                    if arm_qpos is not None and np.all(np.isfinite(arm_qpos)):
+                        if np.max(np.abs(arm_qpos - home_qpos)) < np.deg2rad(2.0):
+                            print("  已在 home 位置，跳过归位")
+                            _stop_recording(save=True, triggered_by=ControlSignal.HOME)
+                            skip_rest = True
+                            continue
+
+                    _stop_recording(save=True, triggered_by=ControlSignal.HOME)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                     teleop_active = False
                     arm_mapper.clear()
                     if arm_inner.wait_ready(timeout=30.0):
@@ -416,11 +405,16 @@ def main():
                             prev_qpos_cmd = state.arm_qpos.copy()
                             ema_prev_pos = ema_prev_quat = None
                         error_count = 0
+                    # Drain HOME auto-repeat accumulated during do_return_home
+                    # (3-4s blocking).  Blanket drain is safe here: HOME
+                    # auto-repeat is unwanted (arm already home), ESC bypasses
+                    # debounce at ~60Hz, and any other signal can be re-pressed.
+                    kb.poll(timeout=0.0)
                     skip_rest = True
 
                 elif sig == ControlSignal.STOP:
                     print("\nS: 停止录制")
-                    _stop_recording(save=True)
+                    _stop_recording(save=True, triggered_by=ControlSignal.STOP)
                     teleop_active = False
                     skip_rest = True
 
@@ -449,7 +443,7 @@ def main():
                         skip_rest = True
                         continue
                     # 如果已在录制，先停止旧 episode
-                    _stop_recording(save=recording_active)
+                    _stop_recording(save=recording_active, triggered_by=ControlSignal.BEGIN)
                     if not recorder.start_episode():
                         print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
                         skip_rest = True
@@ -680,10 +674,8 @@ def main():
             action_valid, fail_reason = validate_action(
                 robot,
                 action,
-                actual_arm_qpos=arm_qpos,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_current=state.hand_current,
                 actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
@@ -736,7 +728,7 @@ def main():
             post_sigs = {s for s in kb.poll(timeout=0.1)}
             if ControlSignal.HOME in post_sigs:
                 try:
-                    arm_inner = do_return_home(robot, planner, arm_inner)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")

@@ -48,7 +48,6 @@
     ESC (any) ──→ ESTOP (仅 Q 可退出)
 
 Phase 7 新增特性:
-    - CollectionLoop: sidecar JSON
     - VRFrameSimulator: --dummy-vr-sinusoidal 正弦手腕轨迹
     - cbreak 键盘: termios + select 替代 pynput（与 KeyboardHandler 同技术栈）
     - 追踪安全: |q_actual - q_cmd| 偏差监控
@@ -57,7 +56,7 @@ Phase 7 新增特性:
 设计参考:
     - TeleopController (teleop/core/controller.py): 状态机、_compute_action
     - keyboard_teleop_sim.py: SAPIEN viewer、execute_return_home
-    - EpisodeRecorder + CollectionLoop: HDF5 录制生命周期
+    - EpisodeRecorder: HDF5 录制生命周期
 """
 
 from __future__ import annotations
@@ -78,8 +77,6 @@ from dexmani_real.planning.path_utils import interpolate_waypoints
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.planning.types import Pose  # used in workspace clamp wrapper
 from dexmani_real.recording import EpisodeRecorder
-from dexmani_real.recording.collection_config import CollectionConfig
-from dexmani_real.recording.collection_loop import CollectionLoop
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface, execute_dense_path, settle_at_target
 from dexmani_real.simulation.constructor import add_light, create_viewer
@@ -174,7 +171,7 @@ def clamp_to_workspace(pos: np.ndarray) -> np.ndarray:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 仿真状态 → RobotState/RobotAction 构造（供 CollectionLoop / EpisodeRecorder 使用）
+# 仿真状态 → RobotState/RobotAction 构造（供 EpisodeRecorder 使用）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -501,20 +498,13 @@ def main() -> None:
         ema_alpha_rot=1.0,  # Cartesian EMA passthrough (与真机一致; 平滑由 Mode 6 固件负责)
     )
 
-    # ── Episode Recorder + CollectionLoop 初始化 ──
+    # ── EpisodeRecorder 初始化 ──
     # control_hz 必须匹配主循环 CTRL_HZ — 否则栅格对齐错误会导致帧重复或丢失。
     recorder = EpisodeRecorder(
         data_dir=args.data_dir,
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),
     )
-    collection_config = CollectionConfig(
-        task_label="teleop",
-        operator="",
-        min_frames=int(round(1.0 * CTRL_HZ)),
-        save_sidecar_json=True,
-    )
-    collection = CollectionLoop(recorder, collection_config)
 
     # ── Viewer ──
     viewer: sapien.Viewer | None = None
@@ -607,11 +597,10 @@ def main() -> None:
                         if state != "ESTOP":
                             print("\n=== STATE: → EMERGENCY_STOP ===")
                             print("[ESC] Emergency stop — 冻结运动，仅 Q 可退出")
-                            if collection.is_recording:
-                                collection.stop_episode(
+                            if recorder.is_recording:
+                                recorder.stop_episode(
                                     success=False,
                                     reason="emergency_stop",
-                                    classification="failure",
                                 )
                             state = "ESTOP"
                         continue
@@ -640,16 +629,15 @@ def main() -> None:
                             #   partial  — 1%~10% 帧失败（偶发不可达，数据仍可用）
                             #   success  — <1% 帧失败（几乎完美跟踪）
                             classification = "failure" if ik_rate < 0.90 else "partial" if ik_rate < 0.99 else "success"
-                            path = collection.stop_episode(
+                            path = recorder.stop_episode(
                                 success=(classification != "failure"),
-                                classification=classification,
                             )
                             old_state = state
                             state = "IDLE"
                             if path:
                                 print(f"[Save] Episode saved to {path}")
                             print(f"\n=== STATE: {old_state} → IDLE (auto-saved) ===")
-                            print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
+                            print(f"[Recorder] 录制已停止 ({recorder.frame_count} 帧)")
                             print(f"  classification={classification} ik_rate={ik_rate:.2%} vr_drop={vr_drop:.2%}")
                             print("[State] IDLE — 按 B 开始新的遥操作")
                         else:
@@ -675,10 +663,9 @@ def main() -> None:
                                     eef_pos=sim_state["eef_pos"],
                                     eef_quat_wxyz=sim_state["eef_quat_wxyz"],
                                 )
-                                # 开始录制 episode（CollectionLoop 管理，
-                                # task_label/operator 由 CollectionConfig 提供）
+                                # 开始录制 episode
                                 episode_idx += 1
-                                collection.start_episode(
+                                recorder.start_episode(
                                     camera_K=camera_K,
                                     depth_scale=0.001,  # sim Z16 = 1mm/LSB (vs L515's 0.00025)
                                 )
@@ -705,8 +692,8 @@ def main() -> None:
                             print(f"\n=== STATE: {state} → HOME ===")
                             print("[Home] 规划回 home...")
                             # Stop recording if active (discard for home)
-                            if collection.is_recording:
-                                collection.stop_episode(success=False, reason="home", classification="failure")
+                            if recorder.is_recording:
+                                recorder.stop_episode(success=False, reason="home")
                             execute_return_home(sim, planner, home_eef, viewer)
                             prev_arm_cmd = sim.get_full_qpos()[:7].copy()
                             prev_hand_cmd = sim.get_full_qpos()[7:].copy()
@@ -736,7 +723,7 @@ def main() -> None:
                             print(
                                 f"\n=== STATE: TELEOP_RECORDING → PAUSED ==="
                                 f"\n[Pause] 遥操作已暂停  |  EEF 冻结  |  "
-                                f"录制暂停 ({collection.frame_count} 帧)"
+                                f"录制暂停 ({recorder.frame_count} 帧)"
                                 f"\n        按 C 恢复，按 H 回 home，按 Q 退出"
                             )
                         elif state == "PAUSED":
@@ -781,16 +768,15 @@ def main() -> None:
                             vr_drop = stale_frame_count / max(episode_tick_count, 1)
                             # Rate-based classification (same as QUIT handler above)
                             classification = "failure" if ik_rate < 0.90 else "partial" if ik_rate < 0.99 else "success"
-                            path = collection.stop_episode(
+                            path = recorder.stop_episode(
                                 success=(classification != "failure"),
-                                classification=classification,
                             )
                             old_state = state
                             state = "IDLE"
                             if path:
                                 print(f"[Save] Episode saved to {path}")
                             print(f"\n=== STATE: {old_state} → IDLE (auto-saved) ===")
-                            print(f"[Recorder] 录制已停止 ({collection.frame_count} 帧)")
+                            print(f"[Recorder] 录制已停止 ({recorder.frame_count} 帧)")
                             print(f"  classification={classification} ik_rate={ik_rate:.2%} vr_drop={vr_drop:.2%}")
                             print("[State] IDLE — 按 B 开始新的遥操作")
 
@@ -838,7 +824,6 @@ def main() -> None:
                         action, status = pipeline.compute_action(
                             vr_frame=frame,
                             current_arm_qpos=sim_state["arm_qpos"],
-                            current_hand_qpos=sim_state["hand_qpos"],
                             prev_arm_cmd=prev_arm_cmd,
                             prev_hand_cmd=prev_hand_cmd,
                             check_workspace=is_in_workspace,
@@ -874,8 +859,8 @@ def main() -> None:
                         if ee_camera is not None:
                             camera_frame = capture_camera_frame(ee_camera)
 
-                        # 4. 录制帧（使用 CollectionLoop）
-                        if collection.is_recording:
+                        # 4. 录制帧
+                        if recorder.is_recording:
                             try:
                                 robot_state = build_robot_state(sim_state)
                                 robot_action = build_robot_action(
@@ -884,7 +869,7 @@ def main() -> None:
                                 )
                                 ik = bool(status["ik_ok"])
                                 rt_ok = bool(status["retarget_ok"])
-                                collection.record_frame(
+                                recorder.add_frame(
                                     state=robot_state,
                                     action=robot_action,
                                     vr_frame=frame,
@@ -952,7 +937,7 @@ def main() -> None:
                 if now - last_status_time > 2.0:
                     sim_state = sim.get_state()
                     if state == "TELEOP_RECORDING":
-                        rec_frames = collection.frame_count
+                        rec_frames = recorder.frame_count
                         ep_elapsed = now - tick_start + episode_tick_count * CTRL_DT  # approximate
                         # Use actual episode duration based on tick count
                         ep_dur = episode_tick_count * CTRL_DT
@@ -970,7 +955,7 @@ def main() -> None:
                             lost_s = (time.perf_counter_ns() - (lost_since_ns or 0)) * 1e-9
                             status += f"  stale={stale_frame_count} (lost={lost_s:.1f}s)"
                     elif state == "PAUSED":
-                        rec_frames = collection.frame_count
+                        rec_frames = recorder.frame_count
                         ep_dur = episode_tick_count * CTRL_DT
                         # VR health info
                         frame = tracker.get_latest()
@@ -1020,12 +1005,11 @@ def main() -> None:
         print("\nCleaning up...")
 
         # 如果还在录制中（异常退出），尝试保存
-        if collection.is_recording:
+        if recorder.is_recording:
             try:
-                path = collection.stop_episode(
+                path = recorder.stop_episode(
                     success=False,
                     reason="abnormal_exit",
-                    classification="failure",
                 )
                 if path:
                     print(f"[Recorder] 异常退出，episode 已保存至 {path}")
