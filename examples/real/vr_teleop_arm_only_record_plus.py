@@ -111,7 +111,7 @@ OPERATOR = ""
 # Mode 6 online trajectory planning — firmware respects speed/accel limits.
 # acc 900°/s²: 从默认 500 提升以降低跟踪误差 (sim 验证 acc→1146 改善 32%; 真机 900 保守步进)
 ARM_MAX_SPEED_DEG_S = 120.0
-ARM_MAX_ACC_DEG_S2 = 900.0
+ARM_MAX_ACC_DEG_S2 = 1050.0
 _INNER_CFG = ArmInnerLoopConfig(
     joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
     joint_max_acc=float(np.deg2rad(ARM_MAX_ACC_DEG_S2)),
@@ -395,41 +395,19 @@ def main():
     def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
         """停止录制. save=True 保存, save=False 丢弃.
 
-        Args:
-            save: True 保存, False 丢弃.
-            triggered_by: The ControlSignal that triggered this stop.
-                Only auto-repeat copies of this signal are drained from the
-                keyboard buffer after the blocking save; unrelated signals
-                (e.g. HOME pressed during a STOP-triggered save) survive.
+        Non-blocking: spawns the stop daemon and returns immediately.
+        Completion (save/discard result) is reported by the poll block in
+        the main loop via recorder.poll_stop().
         """
         nonlocal recording_active
         if recording_active:
             if save:
-                n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 print("  保存中…", flush=True)
-                path = recorder.stop_episode(success=True)
-                gc.collect()  # drain cyclic garbage after recording
-                recorder.join_stop(timeout=60.0)  # 落盘完成后才报结果
-                if path:
-                    if recorder.stop_error:
-                        print(f"  ⚠ 保存失败 ({recorder.stop_error}): {path}  — 文件可能不完整")
-                    else:
-                        print(f"  录制已保存: {path}  ({n_frames} 帧)")
+                recorder.stop_episode(success=True)
             else:
-                path = recorder.stop_episode(success=False)
-                gc.collect()  # drain cyclic garbage after discarded recording
-                recorder.join_stop(timeout=60.0)
-                if path:
-                    h5 = Path(path)
-                    h5.unlink(missing_ok=True)
-                    h5.with_suffix(".json").unlink(missing_ok=True)
-                    h5.with_suffix(".rgb.mp4").unlink(missing_ok=True)
-                    print(f"  录制已丢弃: {h5.name}")
+                recorder.stop_episode(success=False)
             recording_active = False
-            limiter.reset()  # 清除阻塞期间累积的 deadline 债务, 避免下次 wait() 误报超预算
-            # Drain auto-repeat of the trigger signal accumulated during the
-            # blocking join_stop().  Other signals (e.g. HOME pressed during a
-            # STOP-triggered save) are preserved for the next main-loop poll.
+            limiter.reset()
             if triggered_by is not None:
                 kb.drain_signal(triggered_by)
 
@@ -465,6 +443,16 @@ def main():
                 print(f"  [timing] {_timing_line}")
             limiter.wait()
             stage_timer.mark("wait")
+
+            # ── Non-blocking save completion poll (16 Hz) ──
+            _stop_result = recorder.poll_stop()
+            if _stop_result.done and _stop_result.path is not None:
+                if _stop_result.error:
+                    print(f"  ⚠ 保存失败 ({_stop_result.error}): {_stop_result.path}  — 文件可能不完整")
+                elif _stop_result.success:
+                    print(f"  录制已保存: {_stop_result.path}  ({_stop_result.frame_count} 帧)")
+                gc.collect()
+
             loop_count += 1
 
             # ── 按键处理 (KeyboardHandler, 与 sim 一致) ──
@@ -668,6 +656,9 @@ def main():
                         skip_rest = True
                         continue
                     recording_active = True
+                    # Drain B auto-repeat accumulated during start_episode's
+                    # join_stop (previous save daemon may still be flushing).
+                    kb.drain_signal(ControlSignal.BEGIN)
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
                     # Heading calibration: align user's facing direction → robot +X
@@ -1091,7 +1082,6 @@ def main():
                 action,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

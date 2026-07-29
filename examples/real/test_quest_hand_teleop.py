@@ -265,7 +265,6 @@ def test_quest_hand_teleop() -> None:
                 err_code = xhand.last_error_code
                 err_msg = xhand.last_error_message
                 consecutive = xhand.consecutive_send_errors
-                delay = xhand.get_recovery_delay(err_code)
 
                 xhand.clear_error()
 
@@ -284,9 +283,9 @@ def test_quest_hand_teleop() -> None:
                 else:
                     print(
                         f"[XHand] send_action failed (x{consecutive}): "
-                        f"code={err_code} msg='{err_msg}' — waiting {delay*1000:.0f}ms"
+                        f"code={err_code} msg='{err_msg}' — waiting 10ms"
                     )
-                    time.sleep(delay)
+                    time.sleep(0.01)
 
                 # Sync last command to current position after recovery
                 qpos_now = xhand.get_state()["qpos"]

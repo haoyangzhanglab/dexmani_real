@@ -1,26 +1,47 @@
 #!/usr/bin/env python3
-"""Replay a recorded robot trajectory from HDF5 and evaluate consistency.
+"""Replay a recorded robot trajectory and evaluate consistency.
 
-Reads an HDF5 episode (schema v3+, aligned recording grid) collected by VR teleop,
-replays the recorded joint commands on the real robot, records the actual robot
-state during replay, and evaluates how closely the replayed motion matches the
+Reads a DexMani episode (schema v8+) — either a **directory** (``data.h5``,
+``depth.h5``, ``rgb.mp4``) or a **legacy single ``.h5`` file** — replays
+the recorded joint commands on the real robot, captures the actual robot state
+during replay, and evaluates how closely the replayed motion matches the
 original recording.
 
 Architecture:
-    HDF5 file → load_trajectory() → TrajectoryReplayer (robot control loop)
-                                         │
-                                   ReplayRecorder (capture replay state)
-                                         │
-                                   compute_metrics() → metrics.json + replay_data.npz
+    Episode dir / legacy .h5 → load_trajectory() → TrajectoryReplayer (robot control loop)
+                                                        │
+                                                  ReplayRecorder (capture replay state)
+                                                        │
+                                                  compute_metrics() → metrics.json + replay_data.npz
 
 Usage:
+    # Basic replay (new directory-format episode)
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332
+
+    # Legacy single-file episode
     python examples/real/replay_traj.py --h5 episodes/episode_20260716_120000.h5
-    python examples/real/replay_traj.py --h5 episode.h5 --speed 0.5 --max-frames 200
-    python examples/real/replay_traj.py --h5 episode.h5 --dry-run
-    python examples/real/replay_traj.py --h5 episode.h5 --no-hand --output results/
+
+    # Slow motion (half-speed) with frame limit
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --speed 0.5 --max-frames 200
+
+    # Dry-run: validate trajectory without connecting to hardware
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --dry-run
+
+    # Arm-only replay (ignore hand data even if present)
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --no-hand
+
+    # Replay the delta-clamped "sent" stream (schema v9+) instead of raw cmd
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent
+
+    # Override acceleration from HDF5 meta (e.g. match the collection condition)
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --acc 900
+
+    # Custom output directory (default: replay_results/<episode>_replay/)
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --output results/my_replay/
 
 Control:
     Q     clean exit (stop replay, save partial results)
+    H     return arm to home position (post-replay prompt)
     ESC   emergency stop
 """
 
@@ -36,14 +57,15 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dexmani_real.recording.episode_reader import EpisodeReader
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+# Ensure repo root is on sys.path (belt-and-suspenders for runs without PYTHONPATH=.)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.planning.collision_config import CollisionConfig
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
@@ -78,9 +100,6 @@ _INNER_CFG = ArmInnerLoopConfig(
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 
-# ═══════════════════════════════════════════════ Keyboard (pynput, 全局捕获)
-
-
 # ═══════════════════════════════════════════════ HDF5 Loading
 
 
@@ -110,28 +129,68 @@ class TrajectoryData:
         return self.action_hand_joint is not None
 
 
+def _resolve_episode_path(raw_path: str) -> tuple[str, str]:
+    """Normalise an episode path and extract the episode name.
+
+    Accepts three forms::
+
+        episodes/episode_20260729_213332/          → (dir,      "episode_20260729_213332")
+        episodes/episode_20260729_213332/data.h5   → (dir,      "episode_20260729_213332")
+        episodes/episode_20260716_120000.h5         → (file.h5,  "episode_20260716_120000")
+
+    When the path points at a ``data.h5`` inside a new-format episode
+    directory the parent directory is returned so :class:`EpisodeReader`
+    can open it in merged mode (with ``depth.h5`` + ``rgb.mp4`` sidecars
+    available).  All other paths are passed through unchanged.
+
+    Returns:
+        (resolved_path, episode_name) — *resolved_path* is the path to
+        pass to :class:`EpisodeReader`; *episode_name* is a human-readable
+        label derived from the directory/file name (no extension).
+    """
+    p = Path(raw_path)
+    # data.h5 inside a new-format episode dir → resolve to the parent dir
+    if p.is_file() and p.name == "data.h5":
+        parent = p.parent
+        # Heuristic: parent looks like an episode dir (contains depth.h5 or rgb.mp4)
+        if (parent / "depth.h5").exists() or (parent / "rgb.mp4").exists():
+            return (str(parent), parent.name)
+    # Episode directory (new format)
+    if p.is_dir():
+        return (str(p), p.name)
+    # Legacy single .h5 file (or unknown)
+    return (str(p), p.stem)
+
+
 def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "cmd") -> TrajectoryData:
-    """Load and validate an HDF5 episode for replay.
+    """Load and validate an episode for replay.
+
+    Supports both new directory-format episodes (``data.h5`` + ``depth.h5``
+    + ``rgb.mp4``) and legacy single ``.h5`` files.  If *h5_path* points at
+    a ``data.h5`` inside a new-format episode directory it is automatically
+    resolved to the parent directory so the merged view is available.
 
     Args:
-        h5_path: Path to the HDF5 episode file.
+        h5_path: Path to the episode — directory, ``data.h5``, or legacy
+            ``.h5`` file (all three accepted).
         max_frames: Truncate to first N frames (None = all).
         source: Which arm action stream to replay: "cmd" (default) reads
             ``/action_arm_joint`` (policy output); "sent" reads
-            ``/action_arm_joint_sent`` (schema v9, the delta-clamped value
+            ``/action_arm_joint_sent`` (schema v9+, the delta-clamped value
             actually sent). Falls back to cmd with a warning if sent is absent.
 
     Returns:
         TrajectoryData with all arrays preloaded.
 
     Raises:
-        FileNotFoundError: h5_path does not exist.
+        FileNotFoundError: Episode does not exist.
         ValueError: Missing required datasets or schema version mismatch.
     """
-    if not os.path.exists(h5_path):
+    resolved_path, _episode_name = _resolve_episode_path(h5_path)
+    if not os.path.exists(resolved_path):
         raise FileNotFoundError(f"Episode not found: {h5_path}")
 
-    with EpisodeReader(h5_path) as reader:
+    with EpisodeReader(resolved_path) as reader:
         f = reader.h5f
         # ── Validate schema ──
         # f.get("/meta") returns None when the group is missing (safe h5py idiom).
@@ -200,7 +259,7 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
             arm_ee = np.asarray(f["arm_ee"][:T], dtype=np.float64)
 
     traj = TrajectoryData(
-        h5_path=h5_path,
+        h5_path=resolved_path,
         num_frames=T,
         fps=float(fps),
         task_label=str(task_label),
@@ -1025,7 +1084,6 @@ class TrajectoryReplayer:
                     action,
                     actual_arm_qvel=state.arm_qvel,
                     actual_arm_tau=state.arm_tau,
-                    actual_hand_tactile_sum=state.hand_tactile_sum,
                 )
                 if not action_valid:
                     validate_fail_count += 1
@@ -1152,13 +1210,42 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Directory-format episode (data.h5 + depth.h5 + rgb.mp4)
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332
+
+  # Legacy single-file episode
   python examples/real/replay_traj.py --h5 episodes/episode_20260716_120000.h5
-  python examples/real/replay_traj.py --h5 episode.h5 --speed 0.5 --max-frames 200
-  python examples/real/replay_traj.py --h5 episode.h5 --dry-run
-  python examples/real/replay_traj.py --h5 episode.h5 --no-hand --output results/
+
+  # Slow motion with frame limit
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --speed 0.5 --max-frames 200
+
+  # Validate trajectory without hardware (dry-run)
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --dry-run
+
+  # Arm-only (skip hand even if episode has hand data)
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --no-hand
+
+  # Replay "sent" stream (delta-clamped, schema v9+)
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent
+
+  # Override acceleration (e.g. match collection conditions)
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --acc 900
+
+  # Custom output directory (default: replay_results/<episode>_replay/)
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --output results/my_replay/
+
+Control keys:
+  Q     clean exit (save partial results)
+  H     return arm to home (post-replay prompt)
+  ESC   emergency stop
         """,
     )
-    parser.add_argument("--h5", required=True, type=str, help="Path to HDF5 episode file (.h5).")
+    parser.add_argument(
+        "--h5",
+        required=True,
+        type=str,
+        help="Path to episode: directory (episode_XXX/), data.h5, or legacy .h5 file.",
+    )
     parser.add_argument(
         "--speed",
         type=float,
@@ -1223,7 +1310,7 @@ Examples:
     try:
         traj = load_trajectory(args.h5, max_frames=args.max_frames, source=args.source)
     except (FileNotFoundError, ValueError, OSError) as e:
-        print(f"Error loading HDF5: {e}")
+        print(f"Error loading episode: {e}")
         sys.exit(1)
 
     if traj.num_frames == 0:
@@ -1260,7 +1347,7 @@ Examples:
     if args.output is not None:
         output_dir = args.output
     else:
-        episode_name = Path(args.h5).stem
+        _, episode_name = _resolve_episode_path(args.h5)
         output_dir = os.path.join(DEFAULT_OUTPUT_DIR, f"{episode_name}_replay")
     print(f"Output: {output_dir}")
 

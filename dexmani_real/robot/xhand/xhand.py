@@ -43,30 +43,6 @@ JOINT_NAMES = [
 
 SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
 
-# Known non-critical sensor error patterns (ref: LeFranX xhand.py:230-241).
-# These are hardware-level warnings that do not affect joint position reading
-# or motion control — filtering them prevents spurious error_state triggers
-# during normal teleoperation.
-_KNOWN_SENSOR_ERROR_PATTERNS = [
-    "sensor fails to read the combined force",
-    "sensor fails to read the distributed force",
-    "sensor fails to read temperature",
-    "communication data crc error",
-    "this hardware version does not support force control mode",
-]
-
-# XHand SDK error codes (xhand_controller)
-ERR_CRC = 1501070  # Communication data CRC error (RS485 transient)
-ERR_BOOT_CMD = 1501036  # Error running CMD during boot, non-existent CMD (hand re-initializing)
-
-# Recovery delays per error type (seconds).
-# - CRC errors are transient and clear immediately — short delay suffices.
-# - Boot CMD errors mean the hand controller is re-initializing after a
-#   communication fault — needs longer for firmware to complete boot.
-_RECOVERY_DELAY: dict[int, float] = {
-    ERR_CRC: 0.05,  # 50 ms — transient, retry quickly
-    ERR_BOOT_CMD: 0.5,  # 500 ms — hand needs time to finish boot sequence
-}
 
 
 @dataclass
@@ -98,18 +74,18 @@ class XHandConfig(FromDictMixin):
         default_factory=lambda: np.deg2rad(
             np.array(
                 [
-                    0.0,   # J0  thumb_abd     min  0° (straight)
-                    45.0,  # J1  thumb_j1      min -40°, home at 45° (half-flexed)
-                    10.0,  # J2  thumb_j2      min 10° (prevent mechanical clogging)
-                    0.0,   # J3  index_abd     min -10°, home at 0° (straight)
-                    0.0,   # J4  index_j1      min  0° (straight)
-                    5.0,   # J5  index_j2      min  5° (prevent mechanical clogging)
-                    0.0,   # J6  middle_j1     min  0° (straight)
-                    5.0,   # J7  middle_j2     min  5° (prevent mechanical clogging)
-                    0.0,   # J8  ring_j1       min  0° (straight)
-                    5.0,   # J9  ring_j2       min  5° (prevent mechanical clogging)
-                    0.0,   # J10 little_j1     min  0° (straight)
-                    5.0,   # J11 little_j2     min  5° (prevent mechanical clogging)
+                    0.0,    # J0  thumb_abd
+                    80.66,  # J1  thumb_j1      (ref: LeFranX)
+                    33.2,   # J2  thumb_j2      (ref: LeFranX)
+                    0.0,    # J3  index_abd
+                    5.11,   # J4  index_j1      (ref: LeFranX)
+                    5.0,    # J5  index_j2      min 5° (prevent mechanical clogging)
+                    6.53,   # J6  middle_j1     (ref: LeFranX)
+                    5.0,    # J7  middle_j2     min 5° (prevent mechanical clogging)
+                    6.76,   # J8  ring_j1       (ref: LeFranX)
+                    5.0,    # J9  ring_j2       min 5° (prevent mechanical clogging)
+                    10.13,  # J10 little_j1     (ref: LeFranX)
+                    5.0,    # J11 little_j2     min 5° (prevent mechanical clogging)
                 ],
                 dtype=np.float64,
             )
@@ -167,7 +143,7 @@ class XHandConfig(FromDictMixin):
         },
     )
 
-    kp: int = 100  # ref: LeFranX xhand_config.py:22
+    kp: int = 100
     ki: int = 0  # ref: LeFranX xhand_config.py:23
     kd: int = 0  # ref: LeFranX xhand_config.py:24
     # Per-joint gain overrides (ref: DexUMI hand_api_cls.py:317-319).
@@ -177,9 +153,7 @@ class XHandConfig(FromDictMixin):
     kp_per_joint: np.ndarray | None = None  # (12,) per-joint kp overrides
     ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
     kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
-    tor_max: int = (
-        320  # max 320mA; ref: LeFranX xhand_config.py:25 (400), DexUMI hand_api_cls.py:289 (400). Set to 320 per XHand hardware spec limit.
-    )
+    tor_max: int = 320  # max 320mA
     mode: int = 3
 
     clip_joint_limit: bool = True
@@ -187,11 +161,6 @@ class XHandConfig(FromDictMixin):
     # Prevents logspam from sub-degree retargeting imprecision (≈0.57° = 0.01 rad).
     # Actual np.clip is always enforced regardless of this threshold.
     clip_report_tolerance: float = 0.01
-
-    # Known non-critical sensor error filtering (ref: LeFranX xhand.py:230-241).
-    # When True, errors matching known patterns (sensor read failures, CRC errors,
-    # unsupported-force-mode warnings) are logged but do NOT trigger error_state.
-    filter_known_sensor_errors: bool = True
 
     # ── E3: Per-step delta jump limit ──
     # Hard-clips the per-frame change in each joint command (rad).
@@ -519,47 +488,19 @@ class XHand(ConnectionStateMixin):
         """Number of consecutive send_action() failures (circuit breaker counter)."""
         return self._consecutive_send_errors
 
-    @staticmethod
-    def get_recovery_delay(error_code: int | None = None) -> float:
-        """Recommended recovery delay (seconds) for a send error code.
-
-        Different errors need different recovery times:
-        - ERR_CRC (1501070): transient RS485 corruption → 50ms
-        - ERR_BOOT_CMD (1501036): hand controller re-initializing → 500ms
-        - Unknown: conservative 100ms
-
-        Callers should sleep this duration before retrying send_action().
-        """
-        if error_code is not None and error_code in _RECOVERY_DELAY:
-            return _RECOVERY_DELAY[error_code]
-        return 0.1  # conservative default for unknown errors
-
     def reset_connection(self) -> bool:
         """Full hardware reconnect after persistent send errors.
 
         Disconnects, waits 1s for hardware to stabilize, then reconnects.
         Resets consecutive error counter on success.
-
-        Returns:
-            True if reconnection succeeded.
         """
-        logger.warning(
-            "XHand: resetting connection after %d consecutive send errors (last code=%d)",
-            self._consecutive_send_errors,
-            self.last_error_code,
-        )
-        self._consecutive_send_errors = 0  # explicit reset, not relying on connect() side effect
+        self._consecutive_send_errors = 0
         try:
             self.disconnect()
         except Exception:
             pass
         time.sleep(1.0)
-        ok = self.connect()
-        if ok:
-            logger.info("XHand: reconnection succeeded")
-        else:
-            logger.error("XHand: reconnection failed")
-        return ok
+        return self.connect()
 
     def stop(self) -> bool:
         if self._stub_mode:
@@ -896,38 +837,17 @@ class XHand(ConnectionStateMixin):
             )
         return state
 
-    # Sensor-to-finger mapping: _SENSOR_FINGER_IDS maps each sensor_data
-    # positional index to its expected finger ID (from the C struct layout:
-    # thumb_sensor_data first, then other_sensor_data[4]).
-    # See xhand_controller data_type.py SenserData struct.
-    _SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)  # thumb, index, middle, ring, little
+    _MAX_SENSORS: int = 5  # thumb, index, middle, ring, little
 
     def _iter_sensors(self, hand_state):
+        """Iterate sensor data entries by positional index (0-4 → thumb..little)."""
         sensor_data = getattr(hand_state, "sensor_data", None)
         if not sensor_data:
             return
-        count = 0
         for i, sensor in enumerate(sensor_data):
-            if i >= len(self._SENSOR_FINGER_IDS):
+            if i >= self._MAX_SENSORS:
                 break
-            count += 1
-            # If the SDK exposes a sensor-level id, validate it against the
-            # expected finger ID; if not (pybind11 may omit it), skip silently.
-            sid = getattr(sensor, "id", None)
-            if sid is not None and int(sid) != self._SENSOR_FINGER_IDS[i]:
-                logger.warning(
-                    "Sensor %d: expected finger id %d, got %d — tactile finger mapping may be wrong",
-                    i,
-                    self._SENSOR_FINGER_IDS[i],
-                    int(sid),
-                )
             yield i, sensor
-        if count != len(self._SENSOR_FINGER_IDS):
-            logger.warning(
-                "Expected %d sensor_data entries, got %d — tactile may be misaligned",
-                len(self._SENSOR_FINGER_IDS),
-                count,
-            )
 
     def parse_tactile(self, hand_state) -> np.ndarray:
         """Parse tactile force array (5 fingers × 120 points × 3 axes).
@@ -1046,15 +966,5 @@ class XHand(ConnectionStateMixin):
         msg = str(getattr(err, "error_message", ""))
         self.last_error_code = code
         self.last_error_message = msg
-
-        # D1: Filter known non-critical sensor errors (ref: LeFranX xhand.py:230-241).
-        # These hardware-level warnings do not affect position reading or motion
-        # control — log them but don't trigger error_state.
-        if self.config.filter_known_sensor_errors and code != 0 and msg:
-            msg_lower = msg.lower()
-            for pattern in _KNOWN_SENSOR_ERROR_PATTERNS:
-                if pattern in msg_lower:
-                    logger.debug("XHand filtered known sensor error (code=%d): %s", code, msg)
-                    return  # do NOT set error_state for known non-critical errors
 
         self.error_state = True

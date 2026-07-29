@@ -1,63 +1,30 @@
-"""Hand control process + SHM façade (F1 design — plan §4.4-4.7, §5.2).
+"""Hand control process + SHM façade.
 
-Architecture (F1: the clip state machine lives in the FAÇADE; the child is
-a stateless executor):
+Architecture (simplified: all safety clipping runs in the child's XHand driver):
 
     ┌─────────── main process (16 Hz) ───────────┐
     │ HandSHMFaçade.send_action(qpos_cmd)        │
-    │   limit → E3 delta  ←─ state               │   hand_cmd ring
-    │   (lifted VERBATIM from XHand.send_action; │ ────────────────► ┌─────────────────────┐
-    │    _last_qpos_cmd lives HERE)              │                   │ HandControlProcess  │
-    │   → returns (ok, expected_cmd) with ZERO   │   hand_state ring │ 30 Hz, sole XHand   │
-    │     wait — record-what-was-sent, zero race │ ◄──────────────── │ connection;         │
-    │ HandSHMFaçade.check_echo()                 │  (echo: seq +     │ stateless:          │
-    │   seq gap / value mismatch → warn + resync │   value sent)     │ joint-limit net     │
-    └────────────────────────────────────────────┘                   │ → hardware send     │
-                                                                     │ → state/tactile/echo│
-                                             macro RPC (reset/stop/  │ + macro executor    │
-                                             clear_error/trajectory) │   (interpolator     │
-                                             ◄──────────────────────►│    child-side)      │
+    │   → ring-write proxy (no clipping)         │   hand_cmd ring
+    │   → returns (ok, target_qpos)              │ ────────────────► ┌─────────────────────┐
+    │ HandSHMFaçade.get_state()                  │   hand_state ring │ HandControlProcess  │
+    │   freshness gate → connected/error flags   │ ◄──────────────── │ 30 Hz, sole XHand   │
+    └────────────────────────────────────────────┘                   │ connection;          │
+                                                                     │ safety clips + send  │
+                                             macro RPC (reset/stop/  │ → state/tactile      │
+                                             clear_error/trajectory) │ + macro executor     │
+                                             ◄──────────────────────►│   (interpolator)     │
                                                                      └─────────────────────┘
 
-Child E3 no-op selection (verified against xhand.py — NO modification made):
-    The child's XHand is built with ``dataclasses.replace(hand_config,
-    max_delta_rad=0.0)``. The delta clip is a clean no-op:
-      - E3: the delta clip is guarded by ``if np.any(limit > 0) and
-        self.last_qpos_cmd is not None:`` — max_delta_rad=0.0 skips the clip
-        entirely (XHandConfig docstring: "0.0 = disabled").
-    The joint-limit ``np.clip`` (``_limit_joint_range``) stays ENABLED in the
-    child as the safety net; it echoes the value actually sent. Since xhand.py
-    already has the required no-op semantics, it was NOT modified.
-
-Lifecycle (plan §5.2, D4 — worst-case assumption A4: mode 3 + kp=80 position
-servo, firmware holds position without command refresh):
+Lifecycle:
     - ``daemon=False`` — the child survives main-process death; firmware holds.
-    - cmd ring stale > ``cmd_stale_hold_s`` (main dead) → child stops sending
-      (hold position); NEVER zeros torque.
-    - orphan exit: ``orphan_exit_s`` with zero new cmd seqs → the main process
-      died or exited without calling ``stop()`` (multiprocessing's atexit
-      would join this non-daemon child forever) — hold position and exit
-      cleanly; firmware holds (A4). NEVER zeros torque.
-    - SIGINT (Ctrl-C reaches the process group) → hold and exit; NEVER
-      ``tor_max=0`` (``XHand.stop()`` is only called via the estop_event per
-      plan §4.8 or an explicit STOP macro — the deliberate detorque actions).
-    - estop preemption: macro RPC runs on a dedicated thread under a lock (as
-      in the arm child), so a long macro can never defer the tick-loop estop
-      check; SEND_TRAJECTORY checks the estop event between steps and aborts
-      at the next step boundary (plan §4.8).
-    - watchdog: consecutive send errors → ``XHand.reset_connection()``.
+    - cmd ring stale > ``cmd_stale_hold_s`` → child stops sending (hold); NEVER zeros torque.
+    - orphan exit: ``orphan_exit_s`` with zero new cmd seqs → hold and exit cleanly.
+    - SIGINT → hold and exit; NEVER detorque.
+    - estop preemption: tick-loop estop check + SEND_TRAJECTORY step-boundary abort.
 
 Rings (``SeqlockRingBuffer``, names from ``HandProcessConfig.shm_prefix``):
     {prefix}_state (maxlen=3, child→main), {prefix}_cmd (maxlen=8, main→child),
     {prefix}_macro_cmd / {prefix}_macro_result (maxlen=2 each, RPC).
-
-Contract deviations (kept minimal, documented per convention):
-    - Macro STOP is exposed as ``HandSHMFaçade.stop_rpc()`` — ``stop(timeout)``
-      is the lifecycle method (same precedent as ArmSHMFaçade.emergency_stop_rpc).
-      ``rpc(HAND_MACRO_STOP)`` also works.
-    - ``HAND_MACRO_CMD_DTYPE`` / ``HAND_MACRO_RESULT_DTYPE`` are defined here
-      (plan §4.6 specifies the fields; the shared robot_layouts contract covers
-      §4.1-4.5 + §4.10 only).
     - ``get_state()`` never returns None: a stale/missing state yields a
       fabricated ``connected=0`` record (degraded mode, NO escalation — §4.7).
 
@@ -68,7 +35,6 @@ Ref: docs/arm-hand-process-isolation-plan.md §4.4-4.7 (SHM layouts, F1/F2),
 
 from __future__ import annotations
 
-import dataclasses
 import multiprocessing as mp
 import time
 from dataclasses import dataclass
@@ -136,17 +102,9 @@ _CMD_MAXLEN = 8
 _MACRO_MAXLEN = 2
 # Echo mismatch tolerance (rad) — the façade's joint-limit clip and the
 # child's safety-net clip are numerically identical (same np.clip), but
-# floating-point round-trip through the SHM ring produces ~1e-4 rad
-# differences.  1e-3 rad ≈ 0.057° is well below the hand's encoder
-# resolution and filters out false positives without masking real anomalies.
-_ECHO_MISMATCH_TOLERANCE_RAD: float = 1e-3
-
 # Plan §5.1: hand ready wait 15 s; failure → degraded mode (connected=False).
 _READY_TIMEOUT_S = 15.0
-# Baseline seeding / post-macro resync poll budgets.
-_SEED_TIMEOUT_S = 0.5
-_MACRO_RESYNC_TIMEOUT_S = 0.5
-# Watchdog (plan §5.2): persistent send errors → three-stage reconnect.
+# Watchdog: persistent send errors → reconnect.
 _WATCHDOG_RECONNECT_AFTER = 30
 
 
@@ -329,15 +287,11 @@ class HandControlProcess:
 
 
 class HandSHMFaçade:
-    """Main-process façade for the hand control child (F1).
+    """Main-process façade for the hand control child.
 
-    Owns the E3 clip state machine lifted verbatim from
-    ``XHand.send_action`` (``_last_qpos_cmd`` lives here).
-    ``send_action()`` returns ``(ok, expected_cmd)`` with ZERO wait —
-    ``expected_cmd`` is exactly what recording stores and what the hold
-    baseline follows (record-what-was-sent, zero race). The child echoes
-    ``(last_cmd_seq, value actually sent)``; ``check_echo()`` verifies it and
-    resyncs the baseline on anomalies.
+    ``send_action()`` writes the raw target to the hand_cmd ring — all
+    safety clipping (joint limits, E3 delta, deadband) runs exclusively in
+    the child's ``XHand.send_action()``.
     """
 
     def __init__(
@@ -351,15 +305,6 @@ class HandSHMFaçade:
         self._config = config
         self._hand_config = hand_config
         self._proc = HandControlProcess(config, sync, estop_event, hand_config, hand_factory)
-
-        # ── E3 state machine (verbatim from XHand.send_action) ──
-        self._last_qpos_cmd: np.ndarray | None = None  # E3 delta baseline; hold baseline; record-what-was-sent
-        self._last_joint_limit_clipped = False
-
-        # ── echo verification (F1) ──
-        self._last_acked_seq = 0
-        self._expected_by_seq: dict[int, np.ndarray] = {}
-        self._echo_warn = ThrottledWarner()
         self._stale_warn = ThrottledWarner()
         self._last_good_state: np.ndarray | None = None
 
@@ -368,12 +313,7 @@ class HandSHMFaçade:
     # ------------------------------------------------------------------
 
     def start(self) -> bool:
-        """Create rings (stale cleanup) + start the child. Returns True on success."""
-        # Fresh session state so a restart never reuses a stale baseline/ack.
-        self._last_qpos_cmd = None
-        self._last_joint_limit_clipped = False
-        self._last_acked_seq = 0
-        self._expected_by_seq.clear()
+        """Create rings + start the child. Returns True on success."""
         self._last_good_state = None
         return self._proc.start()
 
@@ -382,16 +322,8 @@ class HandSHMFaçade:
         self._proc.stop(timeout)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
-        """Wait for the child to connect; on success seed the E3 baseline.
-
-        Seeding mirrors ``XHand.connect`` → ``_init_hand_state``: the baseline
-        anchors to the child's initial hardware read (fallback home_qpos) so
-        the first delta clip is relative to the actual hand position.
-        """
-        ok = self._proc.wait_ready(timeout if timeout is not None else _READY_TIMEOUT_S)
-        if ok:
-            self._seed_baseline()
-        return ok
+        """Wait for the child to connect and settle at home_qpos."""
+        return self._proc.wait_ready(timeout if timeout is not None else _READY_TIMEOUT_S)
 
     @property
     def running(self) -> bool:
@@ -441,190 +373,33 @@ class HandSHMFaçade:
         rec = new_frame(HAND_STATE_DTYPE)
         if self._last_good_state is not None:
             rec["qpos"] = self._last_good_state["qpos"]
-            rec["last_qpos_cmd"] = self._last_good_state["last_qpos_cmd"]
         rec["connected_flag"] = 0
         rec["error_state"] = 1
         return rec
 
     # ------------------------------------------------------------------
-    # Command (main → child) — F1 core
+    # Command (main → child)
     # ------------------------------------------------------------------
 
     def send_action(self, qpos_cmd: np.ndarray, producer_id: int = PRODUCER_TELEOP) -> tuple[bool, np.ndarray]:
-        """Apply limit → E3 delta and publish to the hand_cmd ring.
+        """Write the raw target to the hand_cmd ring — no clipping.
 
-        The clip state machine below is lifted VERBATIM from
-        ``XHand.send_action`` (xhand.py), including first-command semantics:
-        E3 skips while ``_last_qpos_cmd`` is None.
-        Writes HAND_CMD(expected_cmd, producer_id) and
-        returns ``(ok, expected_cmd)`` immediately — zero wait, zero race.
-        ``expected_cmd`` is what recording and the hold baseline use
-        (record-what-was-sent).
+        All safety clipping (joint limits, E3 delta, deadband) runs
+        exclusively in the child's ``XHand.send_action()``.
         """
         target_qpos = safe_resize(qpos_cmd, 12)
-        expected_cmd = self._limit_joint_range(target_qpos)
-
-        # ── E3: Delta jump limit ──
-        # Hard safety gate: per-step change never exceeds max_delta_rad on any
-        # joint.  Complements dex_retargetingʼs LPFilter.
-        # Supports per-joint limits: pass a (12,) ndarray for joint-specific caps.
-        limit = np.broadcast_to(np.asarray(self._hand_config.max_delta_rad), (12,))
-        if np.any(limit > 0) and self._last_qpos_cmd is not None:
-            delta = expected_cmd - self._last_qpos_cmd
-            delta = np.clip(delta, -limit, limit)
-            expected_cmd = self._last_qpos_cmd + delta
-
         ok = False
         ring = self._proc.cmd_ring
         if ring is not None and self._proc.running:
             try:
                 frame = new_frame(HAND_CMD_DTYPE)
-                frame["qpos_cmd"] = expected_cmd
+                frame["qpos_cmd"] = target_qpos
                 frame["producer_id"] = producer_id
-                seq = ring.write(frame)
-                self._expected_by_seq[seq] = expected_cmd.copy()
-                # Keep the pending map bounded (FILO: only the latest few can be acked).
-                stale = [s for s in self._expected_by_seq if s < seq - 16]
-                for s in stale:
-                    del self._expected_by_seq[s]
+                ring.write(frame)
                 ok = True
             except (OSError, ValueError):
                 logger.warning("HandSHMFaçade: hand_cmd ring write failed.", exc_info=True)
-
-        # Verbatim XHand semantics: last_qpos_cmd advances only on a successful
-        # send; the EMA bookkeeping above advances regardless.
-        if ok:
-            self._last_qpos_cmd = expected_cmd.copy()
-        return ok, expected_cmd
-
-    @property
-    def last_qpos_cmd(self) -> np.ndarray | None:
-        """The clip/EMA-processed value last sent (hold baseline / record-what-was-sent)."""
-        return None if self._last_qpos_cmd is None else self._last_qpos_cmd.copy()
-
-    def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
-        """Verbatim lift of ``XHand._limit_joint_range`` (xhand.py)."""
-        if not self._hand_config.clip_joint_limit:
-            self._last_joint_limit_clipped = False
-            return qpos
-
-        clipped = np.clip(qpos, self._hand_config.qpos_min, self._hand_config.qpos_max)
-        max_deviation = float(np.max(np.abs(qpos - clipped)))
-        self._last_joint_limit_clipped = max_deviation > self._hand_config.clip_report_tolerance
-        return clipped
-
-    # ------------------------------------------------------------------
-    # Echo verification (F1)
-    # ------------------------------------------------------------------
-
-    def check_echo(self) -> None:
-        """Non-blocking echo verification against the child's HAND_STATE.
-
-        Tracks ``last_acked_seq``; a child echo seq gap (FILO dropped commands)
-        or a value mismatch (tolerance 1e-3 rad — the child re-clips with
-        identical joint limits, but floating-point round-trip through the
-        SHM ring produces ~1e-4 rad differences) → throttled warning +
-        baseline resync
-        (``_last_qpos_cmd`` ← echo value). All anomalies
-        converge into a single detectable event.
-        """
-        ring = self._proc.state_ring
-        if ring is None:
-            return
-        result = ring.read_latest()
-        if result is None:
-            return
-        data, _ts_ns, _seq = result
-        echo_seq = int(data["last_cmd_seq"][0])
-        if echo_seq <= self._last_acked_seq:
-            return  # no new echo (or ring recycled after a restart)
-
-        echo_val = np.array(data["last_qpos_cmd"][0], dtype=np.float64)
-        anomaly = False
-
-        if self._last_acked_seq > 0 and echo_seq > self._last_acked_seq + 1:
-            self._echo_warn(
-                "HandSHMFaçade: echo seq gap %d → %d (FILO dropped %d cmd(s)) — resyncing baseline.",
-                self._last_acked_seq,
-                echo_seq,
-                echo_seq - self._last_acked_seq - 1,
-            )
-            anomaly = True
-
-        expected = self._expected_by_seq.get(echo_seq)
-        if expected is not None:
-            max_diff = float(np.max(np.abs(expected - echo_val)))
-            if max_diff > _ECHO_MISMATCH_TOLERANCE_RAD:
-                self._echo_warn(
-                    "HandSHMFaçade: echo value mismatch at seq=%d (max diff %.3g > %.3g rad) — resyncing baseline.",
-                    echo_seq,
-                    max_diff,
-                    _ECHO_MISMATCH_TOLERANCE_RAD,
-                )
-                anomaly = True
-
-        if anomaly:
-            self._last_qpos_cmd = echo_val.copy()
-
-        self._last_acked_seq = echo_seq
-        if self._expected_by_seq:
-            for s in [s for s in self._expected_by_seq if s <= echo_seq]:
-                del self._expected_by_seq[s]
-
-    # ------------------------------------------------------------------
-    # Baseline seeding / macro handover
-    # ------------------------------------------------------------------
-
-    def _seed_baseline(self) -> None:
-        """Anchor the E3 baseline to the child's initial echo (plan §4.5).
-
-        Mirrors ``XHand._init_hand_state``: poll briefly for the first
-        HAND_STATE (published within one child tick of ready); fall back to
-        home_qpos exactly like XHand does when no valid hardware read exists.
-        ``_last_qpos_cmd`` is left untouched (None ⇒ delta clip skips the first command —
-        verbatim XHand first-command semantics).
-        """
-        if self._last_qpos_cmd is not None:
-            return
-        ring = self._proc.state_ring
-        if ring is not None:
-            deadline = time.monotonic() + _SEED_TIMEOUT_S
-            while time.monotonic() < deadline and self._proc.running:
-                result = ring.read_latest()
-                if result is not None:
-                    echo_val = np.array(result[0]["last_qpos_cmd"][0], dtype=np.float64)
-                    if np.all(np.isfinite(echo_val)):
-                        self._last_qpos_cmd = echo_val.copy()
-                        logger.info("HandSHMFaçade: E3 baseline seeded from child echo.")
-                        return
-                time.sleep(0.01)
-        self._last_qpos_cmd = safe_resize(self._hand_config.home_qpos, 12).copy()
-        logger.warning("HandSHMFaçade: no child echo at ready — E3 baseline seeded from home_qpos.")
-
-    def _resync_baseline_after_macro(self) -> None:
-        """State-machine handover at macro end (plan §4.5).
-
-        A macro (reset/trajectory) moved the hand child-side, outside the
-        façade's state machine; wait for the child's post-macro state
-        publication and resync the E3 baseline so the next teleop delta
-        clip anchors to the actual position.
-        """
-        ring = self._proc.state_ring
-        if ring is None:
-            return
-        ts_floor = time.monotonic_ns()  # the RPC already returned ⇒ macro complete; next publish is post-macro
-        deadline = time.monotonic() + _MACRO_RESYNC_TIMEOUT_S
-        while time.monotonic() < deadline:
-            result = ring.read_latest()
-            if result is not None and result[1] >= ts_floor:
-                echo_val = np.array(result[0]["last_qpos_cmd"][0], dtype=np.float64)
-                if np.all(np.isfinite(echo_val)):
-                    self._last_qpos_cmd = echo_val.copy()
-                return
-            time.sleep(0.005)
-        logger.warning(
-            "HandSHMFaçade: no post-macro state within %.1fs — baseline resync skipped.", _MACRO_RESYNC_TIMEOUT_S
-        )
+        return ok, target_qpos
 
     # ------------------------------------------------------------------
     # Macro RPC (plan §4.6)
@@ -663,10 +438,8 @@ class HandSHMFaçade:
         return client.call(frame)
 
     def reset(self, qpos: np.ndarray) -> np.ndarray:
-        """RESET macro — drive to ``qpos`` (child-side, then baseline resync)."""
-        result = self.rpc(HAND_MACRO_RESET, qpos=qpos)
-        self._resync_baseline_after_macro()
-        return result
+        """RESET macro — drive hand to ``qpos``."""
+        return self.rpc(HAND_MACRO_RESET, qpos=qpos)
 
     def stop_rpc(self) -> np.ndarray:
         """STOP macro — the deliberate detorque (mirrors RobotInterface.stop).
@@ -687,14 +460,12 @@ class HandSHMFaçade:
         max_speed: float | None = None,
     ) -> np.ndarray:
         """SEND_TRAJECTORY macro — interpolated child-side (MotorTrajectoryInterpolator)."""
-        result = self.rpc(
+        return self.rpc(
             HAND_MACRO_SEND_TRAJECTORY,
             waypoints=waypoints,
             duration_s=duration_s,
             max_speed=max_speed,
         )
-        self._resync_baseline_after_macro()
-        return result
 
 
 # ----------------------------------------------------------------------
@@ -745,14 +516,11 @@ def _hand_child_main(
 ) -> None:
     """Hand control child main loop (runs in the forked process).
 
-    Stateless executor (F1): on a NEW hand_cmd seq only → joint-limit
-    safety-net clip (XHand._limit_joint_range; E3 disabled — see module
-    docstring) → hardware send → publish HAND_STATE with echo
-    (last_cmd_seq = ring seq processed, last_qpos_cmd = value actually sent,
-    limit_clipped) + full-bandwidth tactile. Stale cmd ring → hold position,
-    NEVER detorque. SIGINT → hold + exit, never tor_max=0. Macros execute via
-    RpcServer on a DEDICATED thread (like the arm child) under ``macro_lock``
-    — a long macro can never defer the tick loop's estop check;
+    On a NEW hand_cmd seq → joint-limit + E3 delta clip (via
+    XHand.send_action) → hardware send → publish HAND_STATE with echo
+    (last_cmd_seq, last_qpos_cmd) + full-bandwidth tactile. Stale cmd ring →
+    hold position, NEVER detorque. SIGINT → hold + exit, never tor_max=0.
+    Macros execute via RpcServer on a dedicated thread under ``macro_lock``.
     SEND_TRAJECTORY aborts at the next step boundary on estop (plan §4.8).
     """
     import inspect
@@ -788,12 +556,10 @@ def _hand_child_main(
             f"{prefix}_macro_result", HAND_MACRO_RESULT_DTYPE, maxlen=_MACRO_MAXLEN, create=False
         )
 
-        # Child XHand with E3 DISABLED — the façade owns the clip state
-        # machine (F1). max_delta_rad=0.0 is a verified clean no-op in
-        # XHand.send_action (module docstring); the joint-limit clip
-        # stays enabled as the safety net.
-        child_cfg = dataclasses.replace(hand_config, max_delta_rad=0.0)
-        hand = hand_factory(child_cfg) if hand_factory is not None else XHand(child_cfg)
+        # All safety clipping (joint limits, E3 delta, deadband) runs in
+        # the child's XHand.send_action() — the façade is a simple ring-write
+        # proxy with no state.
+        hand = hand_factory(hand_config) if hand_factory is not None else XHand(hand_config)
 
         if not hand.connect():
             logger.error("hand child: XHand connect failed — degraded mode (hand offline).")
@@ -812,30 +578,27 @@ def _hand_child_main(
         # home_qpos outside joint limits won't silently break the settle
         # check with a false-positive timeout.
         logger.info("hand child: resetting to home_qpos...")
-        if not hand.reset():
-            logger.warning("hand child: reset() to home_qpos failed — proceeding anyway.")
-        else:
-            # reset() succeeded → last_qpos_cmd is the post-clip target.
-            _home = hand.last_qpos_cmd.copy() if hand.last_qpos_cmd is not None else np.asarray(hand_config.home_qpos, dtype=np.float64)
-            _settle_deadline = time.monotonic() + 3.0
-            _settled = False
-            _max_err = float("nan")
-            while time.monotonic() < _settle_deadline:
-                _st = hand.get_state(force_update=True)
-                _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
-                if np.all(np.isfinite(_qpos)):
-                    _max_err = float(np.max(np.abs(_qpos - _home)))
-                    if _max_err < 0.10:  # ~5.7° — close enough to home
-                        logger.info("hand child: reached home_qpos (max_err=%.3f rad).", _max_err)
-                        _settled = True
-                        break
-                time.sleep(0.05)
-            if not _settled:
-                logger.warning(
-                    "hand child: home_qpos settle timeout (%.1f s, max_err=%.3f rad) — proceeding anyway.",
-                    3.0,
-                    _max_err,
-                )
+        _home = np.asarray(hand_config.home_qpos, dtype=np.float64)
+        _settle_deadline = time.monotonic() + 3.0
+        _settled = False
+        _max_err = float("nan")
+        while time.monotonic() < _settle_deadline:
+            hand.send_action(_home)
+            _st = hand.get_state(force_update=True)
+            _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
+            if np.all(np.isfinite(_qpos)):
+                _max_err = float(np.max(np.abs(_qpos - _home)))
+                if _max_err < 0.10:  # ~5.7° — close enough to home
+                    logger.info("hand child: reached home_qpos (max_err=%.3f rad).", _max_err)
+                    _settled = True
+                    break
+            time.sleep(0.05)
+        if not _settled:
+            logger.warning(
+                "hand child: home_qpos settle timeout (%.1f s, max_err=%.3f rad) — proceeding anyway.",
+                3.0,
+                _max_err,
+            )
 
         # Serializes XHand access between the tick loop (send/stop/publish)
         # and the RPC thread (macros). A macro can never hold it for more
@@ -886,11 +649,8 @@ def _hand_child_main(
         last_processed_seq = 0
         estopped = False
         stale_warn = ThrottledWarner()
-        producer_warn = ThrottledWarner()
-        watchdog_warn = ThrottledWarner()
         stale_budget_ns = int(config.cmd_stale_hold_s * 1e9)
         last_ts = time.monotonic()
-        # Orphan budget (F4): last time ANY new hand_cmd seq was observed.
         last_new_cmd_monotonic = time.monotonic()
 
         # RPC macros on their own thread (exactly like the arm child): a
@@ -912,6 +672,12 @@ def _hand_child_main(
 
         rpc_thread = threading.Thread(target=_rpc_loop, name="hand_rpc", daemon=True)
         rpc_thread.start()
+
+        # Publish one bootstrap state frame BEFORE signalling ready so the
+        # façade's connect() path (wait_ready → get_state → _refresh_status)
+        # sees real connected_flag / error_state instead of a fabricated
+        # disconnected record from an empty ring.
+        _publish_hand_state(hand, frame, state_ring, last_processed_seq)
 
         ready_event.set()
         logger.info("hand child ready @ %.0f Hz (prefix=%s).", config.hz, prefix)
@@ -941,41 +707,23 @@ def _hand_child_main(
                         config.cmd_stale_hold_s * 1e3,
                     )
 
-                # 3. hand_cmd — send on NEW seq only (position servo needs no
-                #    refresh to hold).
+                # 3. hand_cmd — send on NEW seq only.
                 res = cmd_ring.read_latest()
                 if res is not None:
                     data, ts_ns, seq = res
                     if seq != last_processed_seq:
-                        # Any new seq proves the main process is alive —
-                        # refresh the orphan budget (even if rejected below).
                         last_new_cmd_monotonic = time.monotonic()
-                        if not is_fresh(ts_ns, config.cmd_stale_hold_s):
-                            stale_warn("hand child: new cmd seq=%d is stale — holding position (never detorque).", seq)
-                        else:
-                            pid = int(data["producer_id"][0])
-                            if pid != 0 and pid != config.expected_producer_id:
-                                producer_warn(
-                                    "hand child: rejecting cmd seq=%d from producer %d (expected %d).",
-                                    seq,
-                                    pid,
-                                    config.expected_producer_id,
-                                )
-                            else:
-                                qpos_cmd = np.array(data["qpos_cmd"][0], dtype=np.float64)
-                                with macro_lock:
-                                    try:
-                                        # Joint-limit safety-net clip inside
-                                        # send_action (E3 disabled — no-op).
-                                        hand.send_action(qpos_cmd)
-                                    except Exception:
-                                        logger.warning("hand child: send_action failed.", exc_info=True)
+                        qpos_cmd = np.array(data["qpos_cmd"][0], dtype=np.float64)
+                        with macro_lock:
+                            try:
+                                hand.send_action(qpos_cmd)
+                            except Exception:
+                                logger.warning("hand child: send_action failed.", exc_info=True)
                         last_processed_seq = seq
 
-                # 4. Watchdog (plan §5.2): persistent send errors → three-stage
-                #    reconnect (XHand.reset_connection).
+                # 4. Watchdog: persistent send errors → reconnect.
                 if hand.consecutive_send_errors >= _WATCHDOG_RECONNECT_AFTER:
-                    watchdog_warn(
+                    logger.warning(
                         "hand child: %d consecutive send errors — resetting connection.",
                         hand.consecutive_send_errors,
                     )
@@ -1042,30 +790,13 @@ def _hand_child_main(
 
 
 class HandSHMAdapter:
-    """Present the ``XHand`` duck-type over a ``HandSHMFaçade`` (plan §6 P1/P2).
+    """Present the ``XHand`` duck-type over a ``HandSHMFaçade``.
 
     Lets ``RobotInterface`` swap in-process ``XHand`` for the crash-isolated
-    hand subprocess without changing any hand call site: it exposes the exact
-    surface ``RobotInterface`` + ``validate_action`` touch —
-    ``connect/disconnect/is_connected/is_error/clear_error/stop(detorque)/
-    reset(no-arg)/get_state(dict)/send_action(->bool)`` plus the
-    ``connected_flag`` / ``error_state`` / ``last_qpos_cmd`` / ``config``
-    attributes ``validate_action`` reads directly.
+    hand subprocess without changing any hand call site.
 
-    Command-side E3 delta clip lives in the façade (main process); the
-    child XHand is built stateless (``max_delta_rad=0``) and
-    echoes what it actually sent. ``fingertip_pos`` is NOT carried by the SHM
-    hand state — it stays main-side FK in ``RobotInterface`` (needs arm EEF pose).
-
-    Semantics preserved vs ``XHand``:
-      * ``stop()`` is the deliberate detorque (mirrors ``XHand.stop`` —
-        de-energize + set ``error_state=True`` so ``is_connected()`` goes False
-        until ``clear_error``); lifecycle shutdown is ``disconnect()`` (hold,
-        never detorque).
-      * ``get_state()`` returns the XHand dict shape (``qpos`` required key,
-        ``tactile_force_sum`` / ``tactile_force`` optional); a stale/missing SHM
-        record yields NaN qpos + zero tactile, matching XHand's read-error
-        contract that ``RobotInterface.get_state`` wraps in try/except.
+    All safety clipping (joint limits, E3 delta, deadband) runs in the
+    child's ``XHand.send_action()``. The façade is a simple ring-write proxy.
     """
 
     def __init__(self, facade: HandSHMFaçade, hand_config: XHandConfig, estop_event: Any) -> None:
@@ -1218,7 +949,6 @@ class HandSHMAdapter:
     def send_action(self, action: np.ndarray) -> bool:
         try:
             ok, expected_cmd = self._facade.send_action(action)
-            self._facade.check_echo()
         except Exception as e:
             logger.warning("HandSHMAdapter.send_action exception: %s", e)
             return False

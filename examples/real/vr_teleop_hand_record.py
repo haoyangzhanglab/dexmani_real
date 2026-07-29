@@ -481,41 +481,19 @@ def main():
     def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
         """停止录制. save=True 保存, save=False 丢弃.
 
-        Args:
-            save: True 保存, False 丢弃.
-            triggered_by: The ControlSignal that triggered this stop.
-                Only auto-repeat copies of this signal are drained from the
-                keyboard buffer after the blocking save; unrelated signals
-                (e.g. HOME pressed during a STOP-triggered save) survive.
+        Non-blocking: spawns the stop daemon and returns immediately.
+        Completion (save/discard result) is reported by the poll block in
+        the main loop via recorder.poll_stop().
         """
         nonlocal recording_active
         if recording_active:
             if save:
-                n_frames = recorder.frame_count
                 print("  保存中…", flush=True)
-                path = recorder.stop_episode(success=True)
-                gc.collect()
-                recorder.join_stop(timeout=60.0)
-                if path:
-                    if recorder.stop_error:
-                        print(f"  ⚠ 保存失败 ({recorder.stop_error}): {path}  — 文件可能不完整")
-                    else:
-                        print(f"  录制已保存: {path}  ({n_frames} 帧)")
+                recorder.stop_episode(success=True)
             else:
-                path = recorder.stop_episode(success=False)
-                gc.collect()
-                recorder.join_stop(timeout=60.0)
-                if path:
-                    h5 = Path(path)
-                    h5.unlink(missing_ok=True)
-                    h5.with_suffix(".json").unlink(missing_ok=True)
-                    h5.with_suffix(".rgb.mp4").unlink(missing_ok=True)
-                    print(f"  录制已丢弃: {h5.name}")
+                recorder.stop_episode(success=False)
             recording_active = False
             limiter.reset()
-            # Drain auto-repeat of the trigger signal accumulated during the
-            # blocking join_stop().  Other signals (e.g. HOME pressed during a
-            # STOP-triggered save) are preserved for the next main-loop poll.
             if triggered_by is not None:
                 kb.drain_signal(triggered_by)
 
@@ -556,6 +534,16 @@ def main():
                 print(f"  [timing] {_timing_line}")
             limiter.wait()
             stage_timer.mark("wait")
+
+            # ── Non-blocking save completion poll (16 Hz) ──
+            _stop_result = recorder.poll_stop()
+            if _stop_result.done and _stop_result.path is not None:
+                if _stop_result.error:
+                    print(f"  ⚠ 保存失败 ({_stop_result.error}): {_stop_result.path}  — 文件可能不完整")
+                elif _stop_result.success:
+                    print(f"  录制已保存: {_stop_result.path}  ({_stop_result.frame_count} 帧)")
+                gc.collect()
+
             loop_count += 1
 
             # ── 按键处理 ──
@@ -770,6 +758,9 @@ def main():
                         print("  ⚠ 无法开始录制（上一 episode 仍在写盘）")
                         skip_rest = True
                         continue
+                    # Drain B auto-repeat accumulated during start_episode's
+                    # join_stop (previous save daemon may still be flushing).
+                    kb.drain_signal(ControlSignal.BEGIN)
                     recording_active = True
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
@@ -1154,7 +1145,6 @@ def main():
                 action,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

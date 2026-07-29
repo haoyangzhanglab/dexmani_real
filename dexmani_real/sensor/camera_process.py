@@ -44,7 +44,11 @@ class CameraProcessConfig:
     serial: str | None = None
     hz: float = 30.0
     warmup_frames: int = 10
-    timeout_ms: int = 1000
+    # Per-frame wait_for_frames timeout (ms).  L515 @ 30 Hz delivers every ~33 ms;
+    # 300 ms allows 9 consecutive misses before a timeout exception — generous for
+    # transient glitches while keeping shutdown detection responsive (< 0.3 s worst
+    # case vs the parent's 3.0 s join deadline).
+    timeout_ms: int = 300
     shm_name: str = "dexmani_cam_0"
     rgb_height: int = 480
     rgb_width: int = 640
@@ -323,6 +327,12 @@ class CameraProcess:
                         timeout_ms=self.config.timeout_ms,
                         compute_depth=processor is not None,
                     )
+                    # Mid-iteration stop check: after a potentially blocking
+                    # cam.read() (up to timeout_ms ms), re-check the stop event
+                    # before spending time on pointcloud computation and SHM
+                    # writes that will be thrown away.
+                    if self._stop_event.is_set():
+                        break
                     pc = None
                     if processor is not None:
                         try:
@@ -368,8 +378,17 @@ class CameraProcess:
                     time.sleep(sleep_time)
                 last_ts = time.monotonic()
 
-            cam.disconnect()
+            # Close SHM writer before camera disconnect — shm_writer.close()
+            # is a fast kernel call that never blocks, whereas cam.disconnect()
+            # (→ pipeline.stop()) can block indefinitely when the L515 USB
+            # device is in a bad state (mid-run stream stall, USB starvation).
+            # Releasing the child's SHM handle first ensures the parent's
+            # unlink() sees zero open handles regardless of disconnect timing.
             shm_writer.close()
+            try:
+                cam.disconnect()
+            except Exception:
+                pass
             logger.info("CameraProcess capture loop exited cleanly.")
 
         except (RuntimeError, OSError):

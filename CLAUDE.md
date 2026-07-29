@@ -148,3 +148,18 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 **L515:** Direct motherboard USB 3.0 only (no hub; verify `lsusb -t`, 8086:0b64 under root hub). Depth intrinsics bad state: `hardware_reset()`. Mid-run stream stall ~35-60s. XU flaky: use `set_option` fallback.
 
 **Deps:** `mplib`, `pinocchio`, `h5py`, RealSense SDK, XArm7/XHand SDKs, `sapien`, `numpy`, `pyav`.
+
+---
+
+## ToDo
+
+- **P0 — 采集入口加 task_label 参数**: 当前 `task_label` 硬编码为空串，所有 episode 无任务标签，无法训练 task-conditioned policy。
+  - 在 `vr_teleop_arm_only_record_plus.py` 加 `--task` CLI 参数，传入 `recorder.start_episode(task_label=args.task)`
+  - 可考虑在 VR 中按 B 开始录制时弹出输入提示，或从命令行预填
+  - 同时考虑加 `--operator` 参数（当前 operator 也为空）
+  - 关联: `EpisodeRecorder.start_episode()` 已接受 `task_label` 参数 → 只需接线  [[arm-only-record-session-2026-07-18]]
+- **P1 — held 帧过滤工具**: 9.1% 的帧是 held（VR 用户不动），直接用于策略学习会教 policy 输出恒等动作。
+  - 训练前按 `flag_held == True` 过滤（`data.h5` 中已有此字段）
+  - 可写一个简单的 `tools/filter_training_frames.py` 做批量过滤+统计
+- **P2 — 跟踪误差过滤阈值**: Mode 6 高加速度段 tracking error 5-10°，这些帧的 (state, action) 对有标签噪声。
+  - 考虑训练时按 `tracking_error > 5°` 过滤，或用 `action_arm_joint_sent` 作为 action target（消除 cmd→executed 差距）

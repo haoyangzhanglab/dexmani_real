@@ -340,43 +340,20 @@ def main():
     def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
         """停止录制. save=True 保存, save=False 丢弃.
 
-        Args:
-            save: True 保存, False 丢弃.
-            triggered_by: The ControlSignal that triggered this stop.
-                Only auto-repeat copies of this signal are drained from the
-                keyboard buffer after the blocking save; unrelated signals
-                (e.g. HOME pressed during a STOP-triggered save) survive.
+        Non-blocking: spawns the stop daemon and returns immediately.
+        Completion (save/discard result) is reported by the poll block in
+        the main loop via recorder.poll_stop().
         """
         nonlocal recording_active
         if recording_active:
             if save:
-                n_frames = recorder.frame_count  # capture before stop_episode() resets it
                 print("  保存中…", flush=True)
-                path = recorder.stop_episode(success=True)
-                recorder.join_stop(timeout=60.0)  # 落盘完成后才报结果
-                if path:
-                    if recorder.stop_error:
-                        print(f"  ⚠ 保存失败 ({recorder.stop_error}): {path}  — 文件可能不完整")
-                    else:
-                        print(f"  录制已保存: {path}  ({n_frames} 帧)")
+                recorder.stop_episode(success=True)
             else:
-                path = recorder.stop_episode(success=False)
-                recorder.join_stop(timeout=60.0)
-                if path:
-                    h5 = Path(path)
-                    h5.unlink(missing_ok=True)
-                    h5.with_suffix(".json").unlink(missing_ok=True)
-                    h5.with_suffix(".rgb.mp4").unlink(missing_ok=True)
-                    print(f"  录制已丢弃: {h5.name}")
+                recorder.stop_episode(success=False)
             recording_active = False
-            # Drain auto-repeat of the trigger signal accumulated during the
-            # blocking join_stop().  Other signals (e.g. HOME pressed during a
-            # STOP-triggered save) are preserved for the next main-loop poll.
             if triggered_by is not None:
                 kb.drain_signal(triggered_by)
-        # 手动回收循环引用，弥补 gc.disable() 期间的累积
-        gc.collect()
-        gc.enable()
 
     def _emergency_stop():
         """停止内环 + 停止录制 + 急停."""
@@ -404,6 +381,17 @@ def main():
                 print(f"  [timing] {_timing_line}")
             limiter.wait()
             stage_timer.mark("wait")
+
+            # ── Non-blocking save completion poll (16 Hz) ──
+            _stop_result = recorder.poll_stop()
+            if _stop_result.done and _stop_result.path is not None:
+                if _stop_result.error:
+                    print(f"  ⚠ 保存失败 ({_stop_result.error}): {_stop_result.path}  — 文件可能不完整")
+                elif _stop_result.success:
+                    print(f"  录制已保存: {_stop_result.path}  ({_stop_result.frame_count} 帧)")
+                gc.collect()
+                gc.enable()
+
             loop_count += 1
 
             # ── 按键处理 (KeyboardHandler, 与 sim 一致) ──
@@ -521,6 +509,9 @@ def main():
                         skip_rest = True
                         continue
                     recording_active = True
+                    # Drain B auto-repeat accumulated during start_episode's
+                    # join_stop (previous save daemon may still be flushing).
+                    kb.drain_signal(ControlSignal.BEGIN)
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
                     # Heading calibration: align user's facing direction → robot +X
@@ -769,7 +760,6 @@ def main():
                 action,
                 actual_arm_qvel=state.arm_qvel,
                 actual_arm_tau=state.arm_tau,
-                actual_hand_tactile_sum=state.hand_tactile_sum,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

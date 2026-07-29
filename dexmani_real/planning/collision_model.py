@@ -162,7 +162,7 @@ class CollisionModel:
         # Both modes: URDFs have 0 default collision pairs.  Add all N*(N-1)/2
         # possible pairs, then let the SRDF remove Adjacent + Never pairs.
         # 7-DOF:  34²/2 = 561 → after SRDF: ~0–141  (collision URDF)
-        # 19-DOF: 40²/2 = 780 → after SRDF: 255      (full URDF)
+        # 19-DOF: 40²/2 = 780 → after SRDF: ~254      (full URDF, no hand self-collision)
         import itertools
 
         n = self._collision_model.ngeoms
@@ -170,23 +170,9 @@ class CollisionModel:
             self._collision_model.addCollisionPair(pin.CollisionPair(i, j))
         pin.removeCollisionPairs(self._model, self._collision_model, _srdf)
 
-        # Selectively re-enable high-risk cross-finger collision pairs (G1).
-        # SRDF Never rules disable ALL hand self-collision (483 rules) to avoid
-        # the 66 finger-to-finger pair explosion.  We explicitly re-enable only
-        # the thumb_tip ↔ index_tip pair — the most common pinch-contact risk.
-        # Other cross-finger pairs remain disabled (hardware torque limits +
-        # low collision risk in normal operation).
-        if hand_dof:
-            tip_geom_map: dict[str, int] = {}
-            for i in range(self._collision_model.ngeoms):
-                tip_geom_map[self._collision_model.geometryObjects[i].name] = i
-            thumb_key = "right_hand_thumb_rota_tip_0"
-            index_key = "right_hand_index_rota_tip_0"
-            if thumb_key in tip_geom_map and index_key in tip_geom_map:
-                self._collision_model.addCollisionPair(
-                    pin.CollisionPair(tip_geom_map[thumb_key], tip_geom_map[index_key])
-                )
-
+        # Hand self-collision is NOT checked — the SRDF Never rules disable
+        # all 483 inter-finger pairs, and we intentionally do NOT re-enable any.
+        # Arm↔hand collisions (e.g., wrist hitting fingers) remain active.
         self._collision_data = self._collision_model.createData()
 
         # --- Obstacle tracking ---
@@ -340,21 +326,30 @@ class CollisionModel:
         _qpos, has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo.no_collision()
-        results = self._collision_data.collisionResults
-        pairs: list[CollisionPair] = []
-        for i in range(len(results)):
-            cr = results[i]
-            if cr.isCollision():
-                cp = self._collision_model.collisionPairs[i]
-                pairs.append(
-                    CollisionPair(
-                        link_name1=self._get_geom_link_name(cp.first),
-                        link_name2=self._get_geom_link_name(cp.second),
-                        object_name1=self._collision_model.geometryObjects[cp.first].name,
-                        object_name2=self._collision_model.geometryObjects[cp.second].name,
-                        collision_type="pinocchio",
+        # self._collision_data.collisionResults returns a C++ std::vector that
+        # can fail pybind11 type conversion on some hpp-fcl builds.  Fall back
+        # to a generic "collision detected" result when individual access isn't
+        # available.
+        try:
+            results = self._collision_data.collisionResults
+            pairs: list[CollisionPair] = []
+            for i in range(len(results)):
+                cr = results[i]
+                if cr.isCollision():
+                    cp = self._collision_model.collisionPairs[i]
+                    pairs.append(
+                        CollisionPair(
+                            link_name1=self._get_geom_link_name(cp.first),
+                            link_name2=self._get_geom_link_name(cp.second),
+                            object_name1=self._collision_model.geometryObjects[cp.first].name,
+                            object_name2=self._collision_model.geometryObjects[cp.second].name,
+                            collision_type="pinocchio",
+                        )
                     )
-                )
+        except TypeError:
+            # pybind11 type conversion failure — the collision is real but we
+            # can't enumerate which pair(s) triggered it.
+            return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         if not pairs:
             return CollisionInfo.no_collision()
         return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))

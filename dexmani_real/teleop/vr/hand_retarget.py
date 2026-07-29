@@ -22,7 +22,7 @@ Refs:
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "adaptive_retargeting_thumb", "adaptive_retargeting_xhand"]
+__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]
 
 import os
 import tempfile
@@ -51,21 +51,13 @@ _PINKY_PIP = 18
 _PINKY_DIP = 19
 _PINKY_TIP = 20
 
-# Pinky adaptive scaling — calibrated to actual MANO-space pinky
-# MCP→TIP distances observed across 5 teleop recordings (500+ frames).
-# LeFranX original values (_MIN=0.03, _MAX=0.10) were tuned for a
-# different MANO space where the pinky reaches 0.10 m at full extension.
-# Our MANO space maxes out at ~0.073 m, so we calibrate the range to match.
-#
-# Parameters selected via offline grid search on real recording data
-# (20260701_161732, 3431 frames): sweep of max_scale ∈ [2.0, 2.2, 2.4, 2.6]
-# with calibrated _MIN/_MAX.  Chose 2.4 as the best balance between
-# straightening the extended pinky and preserving curl range.
+# Pinky adaptive scaling — 1:1 match with LeFranX reference values.
+# Ref: LeFranX vr_hand_detector_adapter.py:27-84
 
-_PINKY_MIN_EXTENSION = 0.0280  # P2 of MANO pinky MCP→TIP (fully curled)
-_PINKY_MAX_EXTENSION = 0.074  # P98 of MANO pinky MCP→TIP (fully extended)
-_PINKY_BASE_SCALE = 1.15  # minimum scaling for curled: enough push so J11 can reach
-_PINKY_MAX_SCALE = 2.40  # maximum scaling: match robot pinky length when extended
+_PINKY_MIN_EXTENSION = 0.03  # fully curled pinky MCP→TIP distance
+_PINKY_MAX_EXTENSION = 0.10  # fully extended pinky MCP→TIP distance
+_PINKY_BASE_SCALE = 1.2  # minimum scaling for curled state
+_PINKY_MAX_SCALE = 2.2  # maximum scaling for extended state
 
 
 def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
@@ -112,59 +104,6 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
 
     dip_to_tip = landmarks[_PINKY_TIP] - landmarks[_PINKY_DIP]
     landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * adaptive_scale
-
-    return landmarks
-
-
-# ── Thumb adaptive scaling parameters ──
-# XHand thumb mechanical length (wrist→thumb_tip) is ~0.161 m at neutral
-# (bend=0, rot1=0, rot2=0).  The MANO model averages ~0.131 m — a ~23 %
-# mismatch.  Without compensation the DexPilot optimizer uses rot2 (thumb IP
-# flexion) purely to shorten the kinematic chain, keeping it at ~1.1–1.3 rad
-# (63–75°) regardless of the human thumb state.
-#
-# Adaptive scaling: when the human thumb is extended (long wrist→tip),
-# scale the target up toward the robotʼs mechanical length so rot2 can drop
-# toward zero.  When the human thumb is curled, scale conservatively to
-# preserve the optimizerʼs ability to increase rot2 for opposition / grip.
-
-_THUMB_MIN_EXTENSION = 0.105  # P3  of human wrist→thumb_tip (curled)
-_THUMB_MAX_EXTENSION = 0.140  # P97 of human wrist→thumb_tip (extended)
-_THUMB_BASE_SCALE = 1.02  # minimum scaling: slight push for baseline J2 engagement
-_THUMB_MAX_SCALE = 1.35  # maximum scaling: balanced approach to robot 0.161m length
-
-
-def adaptive_retargeting_thumb(landmarks: np.ndarray) -> np.ndarray:
-    """Scale thumb tip to match XHand mechanical thumb length.
-
-    The DexPilot reference vectors only use thumb_tip (landmark 4) — not
-    the intermediate thumb joints (CMC=1, MCP=2, IP=3).  Scaling just the
-    tip is sufficient to shift the wrist→thumb_tip distance into the
-    robotʼs achievable range at low rot2.
-
-    Operates on MANO-space landmarks.  The pinky scaling
-    (adaptive_retargeting_xhand) operates on landmarks 18–20, so the two
-    are independent and can be composed in any order.
-
-    Args:
-        landmarks: (21, 3) array in MANO coordinate space.
-
-    Returns:
-        (21, 3) array with thumb_tip scaled (new copy, input unchanged).
-    """
-    landmarks = landmarks.copy()
-
-    wrist = landmarks[0]
-    thumb_tip = landmarks[4]
-
-    extension = float(np.linalg.norm(thumb_tip - wrist))
-    extension_ratio = np.clip(
-        (extension - _THUMB_MIN_EXTENSION) / (_THUMB_MAX_EXTENSION - _THUMB_MIN_EXTENSION),
-        0.0,
-        1.0,
-    )
-    scale = _THUMB_BASE_SCALE + (_THUMB_MAX_SCALE - _THUMB_BASE_SCALE) * extension_ratio
-    landmarks[4] = wrist + (thumb_tip - wrist) * scale
 
     return landmarks
 
@@ -299,12 +238,15 @@ class XHandRetargeter:
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
+        smoothing_alpha: float = 0.3,
     ):
         self.hand_type = hand_type
         self.retargeting_type = retargeting_type
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
         self.last_debug: dict[str, float | str] = {}
+        self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        self._hand_ema_state: np.ndarray | None = None
 
         self.sapien_joint_names = [
             "right_hand_thumb_bend_joint",
@@ -376,12 +318,15 @@ class XHandRetargeter:
             )
             optimizer.set_kinematic_adaptor(adaptor)
 
-        # Low-pass filter
-        alpha = float(cfg.get("low_pass_alpha", 0.6))
+        # Low-pass filter (ref: LeFranX low_pass_alpha=0.1)
+        alpha = float(cfg.get("low_pass_alpha", 0.1))
         lp_filter = LPFilter(alpha) if 0 <= alpha <= 1 else None
 
         self.retargeter = SeqRetargeting(optimizer, has_joint_limits=True, lp_filter=lp_filter)
         self.indices = self.retargeter.optimizer.target_link_human_indices
+
+        # Teleoperator-level EMA smoothing (second layer, ref: LeFranX smoothing_alpha=0.3)
+        self._smoothing_alpha = float(cfg.get("smoothing_alpha", 0.3))
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
         self.retargeted_joint_order = np.array(
@@ -401,25 +346,16 @@ class XHandRetargeter:
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
         """Build reference value from hand landmarks for retargeting.
 
-        Applies two landmark-space adaptations before computing origin→task
-        difference vectors:
-
-        1. adaptive_retargeting_thumb — scale thumb_tip to match robot
-           mechanical length, enabling low rot2 in neutral poses.
-        2. adaptive_retargeting_xhand (LeFranX) — scale pinky chain for
-           human-robot finger length mismatch.
+        Applies adaptive_retargeting_xhand (LeFranX pinky chain scaling)
+        before computing origin→task difference vectors.
         """
         if self.retargeting_type == "position":
             return hand_joint_pos[self.indices, :]
 
-        # Scale thumb tip to compensate for XHand's ~23% longer mechanical
-        # thumb — drives rot2 toward zero when the human thumb is extended
-        # while preserving curl range for opposition / grip.
-        scaled_landmarks = adaptive_retargeting_thumb(hand_joint_pos)
         # LeFranX: scale pinky chain on landmarks before computing ref vectors.
         # This directly modifies PIP/DIP/TIP positions along the MCP→TIP chain,
         # compensating for human-robot finger length differences.
-        scaled_landmarks = adaptive_retargeting_xhand(scaled_landmarks)
+        scaled_landmarks = adaptive_retargeting_xhand(hand_joint_pos)
 
         origin_indices = self.indices[0, :]
         task_indices = self.indices[1, :]
@@ -459,24 +395,33 @@ class XHandRetargeter:
             logger.warning("Retargeting returned None.")
             return None
 
-        qpos = np.asarray(qpos, dtype=float)[self.retargeted_joint_order]
+        # ── Teleoperator-level EMA smoothing (ref: LeFranX smoothing_alpha=0.3) ──
+        # Applied AFTER SeqRetargeting LPFilter (alpha=0.1) for two-layer smoothing.
+        qpos_arr = np.asarray(qpos, dtype=float)
+        if self._hand_ema_state is not None:
+            qpos_arr = self._smoothing_alpha * qpos_arr + (1.0 - self._smoothing_alpha) * self._hand_ema_state
+        self._hand_ema_state = qpos_arr.copy()
+
+        # Joint order remap
+        qpos_arr = qpos_arr[self.retargeted_joint_order]
 
         if self.debug_adapters:
             self.last_debug = {
                 "retarget_ms": 1000 * (time.time() - start_time),
-                "adaptives": "thumb(scale_thumb_tip) + pinky(LeFranX chain scaling)",
+                "adaptives": "pinky(LeFranX chain scaling)",
             }
             logger.info("retarget_debug: %s", self.last_debug)
 
-        return qpos
+        return qpos_arr
 
     def reset(self) -> None:
         """Reset retargeter state for a clean episode start.
 
         Resets the SLSQP warm-start seed, the LPFilter EMA accumulator,
-        and the DexPilot projection indicators.
+        the teleoperator EMA state, and the DexPilot projection indicators.
         """
         self.retargeter.reset()  # SeqRetargeting: resets last_qpos + counters
         if self.retargeter.filter is not None:
             self.retargeter.filter.reset()  # LPFilter: clears EMA accumulator
         self.retargeter.optimizer.projected[:] = False  # DexPilot: clears projection state
+        self._hand_ema_state = None  # Teleoperator EMA: clear for fresh episode

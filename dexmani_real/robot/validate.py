@@ -18,13 +18,6 @@ from dexmani_real.utils.log import get_logger
 if TYPE_CHECKING:
     pass
 
-# Per-finger tactile force limit (Newtons, L2 norm across fx/fy/fz).
-# Set generously (30 N) to avoid false positives during normal teleop —
-# typical grasping forces are 1–6 N; this gate only catches genuinely
-# excessive forces (e.g., crushing, collision with rigid environment).
-# Individual fingers can be lowered via this array.
-_HAND_TACTILE_FORCE_LIMIT_N = np.full(5, 30.0, dtype=np.float64)
-
 logger = get_logger(__name__)
 
 
@@ -115,29 +108,6 @@ def _check_velocity_nan(actual_arm_qvel: np.ndarray | None) -> Optional[str]:
     return None
 
 
-def _check_tactile_force(
-    actual_hand_tactile_sum: np.ndarray | None,
-    hand_connected: bool,
-    hand_is_error: bool,
-) -> Optional[str]:
-    """Reject if any finger force exceeds the tactile limit.
-
-    Gated behind ``hand_connected`` so arm-only sessions are unaffected.
-    """
-    if actual_hand_tactile_sum is None or not hand_connected or hand_is_error:
-        return None
-    reason = _validate_sensor_array(actual_hand_tactile_sum, (5, 3), "tactile force")
-    if reason is not None:
-        logger.warning("Tactile force data shape mismatch or contains NaN — skipping gate")
-        return None  # fail-open: skip gate on bad data (asymmetric with torque)
-    force = np.asarray(actual_hand_tactile_sum, dtype=np.float64)
-    force_mag = np.linalg.norm(force, axis=1)  # (5,) per-finger L2 norm
-    over_idx = np.where(force_mag > _HAND_TACTILE_FORCE_LIMIT_N)[0]
-    if len(over_idx) > 0:
-        return f"tactile force limit exceeded: fingers={over_idx.tolist()}"
-    return None
-
-
 # ── Public API ──
 
 
@@ -147,7 +117,6 @@ def validate_action(
     *,
     actual_arm_qvel: np.ndarray | None = None,
     actual_arm_tau: np.ndarray | None = None,
-    actual_hand_tactile_sum: np.ndarray | None = None,
 ) -> tuple[bool, str]:
     """Centralized pre-send validation.
 
@@ -157,7 +126,6 @@ def validate_action(
       3. Action NaN guard (arm + hand joint commands)
       4. Torque gating — per-joint threshold check
       5. Arm velocity NaN guard
-      6. Tactile force gating — per-finger threshold check
 
     Removed from this gate (covered elsewhere):
       - Workspace clamp → TeleopPipeline Stage 3 (before IK)
@@ -182,9 +150,6 @@ def validate_action(
         lambda: _check_action_nan(action),
         lambda: _check_torque(actual_arm_tau),
         lambda: _check_velocity_nan(actual_arm_qvel),
-        lambda: _check_tactile_force(
-            actual_hand_tactile_sum, robot.hand.connected_flag, robot.hand.error_state
-        ),
     ):
         reason = gate()
         if reason is not None:

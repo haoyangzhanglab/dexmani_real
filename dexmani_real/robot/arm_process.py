@@ -974,14 +974,34 @@ def do_return_home(
     *,
     home_dt: float = 0.04,
 ) -> "ArmServo":
-    """Stop inner loop, return home, restart with *inner_cfg*.
+    """Return arm to home via path-planned ``robot.return_to_home()``.
 
-    Returns the new ``ArmServo`` instance — callers must replace their
-    reference.  On failure, triggers ``emergency_stop()`` and re-raises.
+    Stops the inner loop, calls ``robot.return_to_home()`` (collision-checked
+    waypoint interpolation at ``home_dt`` resolution), then forks a new
+    ArmControlProcess.  ~9 s total.
+
+    Returns a freshly constructed ``ArmServo`` instance.
     """
     import traceback
 
+    import numpy as np
+
     print("return_home ...", flush=True)
+
+    home_qpos = robot.arm.config.init_qpos.copy()
+
+    # ── Read current position through the running inner loop ──
+    try:
+        qpos, error_state, _ = arm_inner.get_state()
+    except Exception:
+        qpos, error_state = None, True
+
+    if qpos is not None and not error_state and np.all(np.isfinite(qpos)):
+        if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(2.0):
+            print("  已在 home 位置，跳过归位", flush=True)
+            return arm_inner
+
+    # ── Stop inner loop → path-planned home → restart inner loop ──
     try:
         arm_inner.set_target(None)
         arm_inner.stop()

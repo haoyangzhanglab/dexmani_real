@@ -72,7 +72,7 @@ class ArmInnerLoopConfig:
 
     # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
     joint_max_speed: float = 2.0944  # 120°/s in rad/s
-    joint_max_acc: float = 8.7266  # 500°/s² in rad/s²
+    joint_max_acc: float = 15.708  # 900°/s² in rad/s²
     loop_period: float = (
         1.0 / 30.0  # 30Hz — Mode 6 firmware handles interpolation
     )

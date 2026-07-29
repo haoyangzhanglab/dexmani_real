@@ -14,8 +14,8 @@ from dexmani_real.planning.pose_utils import quat_to_rotvec
 # EMA 平缓 IK 输入 → 关节目标步长缩小 → 固件加速度瓶颈冲击减轻。
 # 旧值: POS=0.8(τ≈39ms) ROT=0.4(τ≈122ms)
 # 上一版: POS=0.65(τ≈60ms) ROT=0.3(τ≈175ms) — p95 24.8°, 角速度 r=0.35 仍偏高
-# 当前: POS=0.5(τ≈90ms) ROT=0.25(τ≈223ms) — 进一步加重腕部平滑, 降低 J4/J5 峰值
-EMA_ALPHA_POS = 0.5  # Cartesian position: heavier smoothing
+# 当前: POS=0.6(τ≈65ms) ROT=0.25(τ≈223ms) — POS 回调，配合 joint_max_acc 900→1050
+EMA_ALPHA_POS = 0.6  # Cartesian position: moderate smoothing (was 0.5)
 EMA_ALPHA_ROT = 0.25  # Cartesian rotation: heaviest smoothing
 
 

@@ -11,7 +11,7 @@ Ref: ManiUniCon accumulate-then-dump pattern (replay_buffer.py).
 
 from __future__ import annotations
 
-__all__ = ["EpisodeRecorder"]
+__all__ = ["EpisodeRecorder", "StopResult"]
 
 import atexit
 import os
@@ -19,6 +19,7 @@ import shutil
 import threading
 import time
 import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,22 @@ def _flush_all_recorders() -> None:
 
 
 atexit.register(_flush_all_recorders)
+
+
+@dataclass
+class StopResult:
+    """Outcome of a background stop_episode daemon, returned by poll_stop()."""
+
+    done: bool
+    """True when the daemon finished (success or crash)."""
+    error: str | None = None
+    """Error message if the daemon crashed, None otherwise."""
+    success: bool = False
+    """Whether stop_episode was called with success=True (save vs discard)."""
+    path: str | None = None
+    """Episode directory path, or None if no stop was pending."""
+    frame_count: int = 0
+    """Frame count at the moment stop_episode was called."""
 
 
 class EpisodeRecorder:
@@ -139,6 +156,11 @@ class EpisodeRecorder:
         # the daemon thread; callers poll via stop_error after join_stop().
         self._stop_error: str | None = None
 
+        # Non-blocking stop tracking (harvested by poll_stop()).
+        self._stop_success: bool = False
+        self._stop_path: str | None = None
+        self._stop_frame_count: int = 0
+
         _LIVE_RECORDERS.add(self)  # atexit flush net
 
     @property
@@ -176,7 +198,7 @@ class EpisodeRecorder:
         # would let the old stop thread clobber the new episode's state.
         # A crashed stop (ENOSPC, etc.) has already reset state — allow
         # a new start after logging the error.
-        if not self.join_stop(timeout=10.0):
+        if not self.join_stop(timeout=15.0):
             if self._stop_error is not None:
                 logger.warning(
                     "Previous stop crashed (%s) — state was reset, allowing new start",
@@ -633,6 +655,12 @@ class EpisodeRecorder:
         self._max_frames_reached = False
         path = self._episode_dir
 
+        # Snapshot stop metadata BEFORE spawning daemon (daemon overwrites
+        # self._frame_count during _stop_episode_impl_inner).
+        self._stop_success = success
+        self._stop_path = path
+        self._stop_frame_count = self._frame_count
+
         t = threading.Thread(
             target=self._stop_episode_impl,
             args=(success, reason, truncated),
@@ -672,6 +700,38 @@ class EpisodeRecorder:
             logger.error("episode-stop failed: %s", self._stop_error)
         self._stop_thread = None
         return ok
+
+    def poll_stop(self) -> StopResult:
+        """Non-blocking check: has the background stop daemon finished?
+
+        Safe to call at 16 Hz from the main control loop.  Returns immediately
+        — never blocks on I/O.  After the first call that returns
+        ``done=True``, the internal state is reset and subsequent calls
+        return a clean sentinel (``done=True, path=None``) until the next
+        ``stop_episode()``.
+
+        Idempotent: once a stop completes, repeated calls return the same
+        result (cached in the first returned ``StopResult``, then cleared).
+        """
+        t = self._stop_thread
+        if t is None:
+            return StopResult(done=True)
+        if t.is_alive():
+            return StopResult(done=False)
+        # Thread finished — harvest result and reset for the next stop.
+        result = StopResult(
+            done=True,
+            error=self._stop_error,
+            success=self._stop_success,
+            path=self._stop_path,
+            frame_count=self._stop_frame_count,
+        )
+        self._stop_thread = None
+        self._stop_error = None
+        self._stop_success = False
+        self._stop_path = None
+        self._stop_frame_count = 0
+        return result
 
     def _stop_episode_impl(self, success: bool, reason: str, truncated: bool) -> None:
         """Background: flush buffers, forward-fill cameras, write meta, close HDF5.
