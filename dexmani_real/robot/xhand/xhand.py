@@ -162,13 +162,6 @@ class XHandConfig(FromDictMixin):
     # Actual np.clip is always enforced regardless of this threshold.
     clip_report_tolerance: float = 0.01
 
-    # ── E3: Per-step delta jump limit ──
-    # Hard-clips the per-frame change in each joint command (rad).
-    # Safety-gates outliers from dex_retargetingʼs LPFilter output.
-    # Scalar: same limit for all 12 joints.  (12,) array: per-joint limits.
-    # 0.0 = disabled. Recommended: 0.3 rad (~17°/step, ~255°/s at 16 Hz).
-    max_delta_rad: float | np.ndarray = 0.3
-
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
     # Values are in Newtons (parse_tactile_sum divides SDK raw readings by 10).
@@ -593,16 +586,6 @@ class XHand(ConnectionStateMixin):
             else:
                 return False
         qpos_cmd = self._limit_joint_range(target_qpos)
-
-        # ── E3: Delta jump limit ──
-        # Hard safety gate: per-step change never exceeds max_delta_rad on any
-        # joint.  Complements dex_retargetingʼs LPFilter.
-        # Supports per-joint limits: pass a (12,) ndarray for joint-specific caps.
-        limit = np.broadcast_to(np.asarray(self.config.max_delta_rad), (12,))
-        if np.any(limit > 0) and self.last_qpos_cmd is not None:
-            delta = qpos_cmd - self.last_qpos_cmd
-            delta = np.clip(delta, -limit, limit)
-            qpos_cmd = self.last_qpos_cmd + delta
 
         # ── Deadband throttle: skip redundant sends for sub-noise changes ──
         # At 16Hz, retargeting tremor produces sub-degree jitter that generates

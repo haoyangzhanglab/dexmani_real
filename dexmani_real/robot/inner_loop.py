@@ -63,10 +63,9 @@ class ArmInnerLoopConfig:
         loop_period: Inner loop period in seconds. Default 1/30 (30Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
         max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad per
-                         inner-loop step (~17°, ~9 rad/s ceiling at 30Hz). Mirrors
-                         XHand E3. Set 0 to disable. Headroom over a normal target
-                         step depends on the OUTER loop rate (see max_joint_delta
-                         comment below).
+                         inner-loop step (~17°, ~9 rad/s ceiling at 30Hz). Set 0 to
+                         disable. Headroom over a normal target step depends on the
+                         OUTER loop rate (see max_joint_delta comment below).
         synchronized: Two-phase handshake for policy inference (default False).
     """
 
@@ -80,9 +79,8 @@ class ArmInnerLoopConfig:
     target_timeout_s: float = 0.2
 
     # Per-step delta clamp — safety ceiling against IK solver anomalies.
-    # Mirrors XHand E3 (XHandConfig.max_delta_rad).  A normal target step is
-    # joint_max_speed / outer_loop_hz: ≈0.131 rad @16Hz outer (~2.3x headroom).
-    # Note the inner loop re-sends the
+    # A normal target step is joint_max_speed / outer_loop_hz: ≈0.131 rad @16Hz
+    # outer (~2.3x headroom).  Note the inner loop re-sends the
     # same target every 20ms, so a single anomalous target is chased at up to
     # 0.3 rad per inner step until it times out (target_timeout_s).
     max_joint_delta: float = 0.3
@@ -777,7 +775,7 @@ class ArmInnerLoop:
         No inner-loop interpolation — the target is forwarded directly and the
         firmware handles all trajectory smoothing.
         """
-        # ── Per-step joint delta clamp (mirrors XHand E3) ──
+        # ── Per-step joint delta clamp ──
         # Safety ceiling against IK solver anomalies.  A normal target step is
         # joint_max_speed ÷ outer_loop_hz: ≈0.098 rad @16Hz outer (~3x headroom).
         clamped = target[:7].copy()

@@ -290,7 +290,7 @@ class HandSHMFaçade:
     """Main-process façade for the hand control child.
 
     ``send_action()`` writes the raw target to the hand_cmd ring — all
-    safety clipping (joint limits, E3 delta, deadband) runs exclusively in
+    safety clipping (joint limits, deadband) runs exclusively in
     the child's ``XHand.send_action()``.
     """
 
@@ -384,7 +384,7 @@ class HandSHMFaçade:
     def send_action(self, qpos_cmd: np.ndarray, producer_id: int = PRODUCER_TELEOP) -> tuple[bool, np.ndarray]:
         """Write the raw target to the hand_cmd ring — no clipping.
 
-        All safety clipping (joint limits, E3 delta, deadband) runs
+        All safety clipping (joint limits, deadband) runs
         exclusively in the child's ``XHand.send_action()``.
         """
         target_qpos = safe_resize(qpos_cmd, 12)
@@ -516,7 +516,7 @@ def _hand_child_main(
 ) -> None:
     """Hand control child main loop (runs in the forked process).
 
-    On a NEW hand_cmd seq → joint-limit + E3 delta clip (via
+    On a NEW hand_cmd seq → joint-limit clip (via
     XHand.send_action) → hardware send → publish HAND_STATE with echo
     (last_cmd_seq, last_qpos_cmd) + full-bandwidth tactile. Stale cmd ring →
     hold position, NEVER detorque. SIGINT → hold + exit, never tor_max=0.
@@ -556,7 +556,7 @@ def _hand_child_main(
             f"{prefix}_macro_result", HAND_MACRO_RESULT_DTYPE, maxlen=_MACRO_MAXLEN, create=False
         )
 
-        # All safety clipping (joint limits, E3 delta, deadband) runs in
+        # All safety clipping (joint limits, deadband) runs in
         # the child's XHand.send_action() — the façade is a simple ring-write
         # proxy with no state.
         hand = hand_factory(hand_config) if hand_factory is not None else XHand(hand_config)
@@ -618,7 +618,19 @@ def _hand_child_main(
             # handover at macro start/end).
             with macro_lock:
                 if code == HAND_MACRO_RESET:
-                    ok = hand.reset(np.array(request["qpos"][0], dtype=np.float64))
+                    _target = np.array(request["qpos"][0], dtype=np.float64)
+                    _deadline = time.monotonic() + 3.0
+                    while time.monotonic() < _deadline:
+                        hand.send_action(_target)
+                        _st = hand.get_state(force_update=True)
+                        _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
+                        if np.all(np.isfinite(_qpos)):
+                            if float(np.max(np.abs(_qpos - _target))) < 0.10:
+                                ok = True
+                                break
+                        time.sleep(0.05)
+                    else:
+                        ok = False
                 elif code == HAND_MACRO_STOP:
                     ok = hand.stop()  # deliberate detorque (explicit macro only)
                 elif code == HAND_MACRO_CLEAR_ERROR:
@@ -795,7 +807,7 @@ class HandSHMAdapter:
     Lets ``RobotInterface`` swap in-process ``XHand`` for the crash-isolated
     hand subprocess without changing any hand call site.
 
-    All safety clipping (joint limits, E3 delta, deadband) runs in the
+    All safety clipping (joint limits, deadband) runs in the
     child's ``XHand.send_action()``. The façade is a simple ring-write proxy.
     """
 
