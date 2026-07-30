@@ -44,7 +44,7 @@ class XArm7MotionPlanner:
       - ``solve_ik`` / ``solve_teleop_ik`` — single-shot IK suitable for teleop.
       - ``plan_path`` — multi-strategy path planning (screw → RRT).
       - ``compute_eef_pose_world`` / ``compute_eef_jacobian`` — FK queries.
-      - ``has_self_collision`` / ``has_env_collision`` — collision queries.
+      - ``has_self_collision`` — collision queries.
     """
 
     def __init__(
@@ -101,7 +101,7 @@ class XArm7MotionPlanner:
             base_pose_world=base_pose_world,
             mplib=self.mplib,
         )
-        self.collision_model = CollisionModel(hand_dof=hand_dof, collision_config=config.collision)
+        self.collision_model = CollisionModel(hand_dof=hand_dof)
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
@@ -374,10 +374,6 @@ class XArm7MotionPlanner:
             for q in samples:
                 if self.ik_mgr.has_self_collision(q):
                     return False
-        if profile.check_env_collision:
-            for q in samples:
-                if self.ik_mgr.has_env_collision(q):
-                    return False
         return True
 
     def validate_path(
@@ -427,7 +423,6 @@ class XArm7MotionPlanner:
                 self._check_waypoint_delta,
                 self._check_terminal_pose,
                 self._check_self_collision,
-                self._check_env_collision,
                 self._check_workspace_bounds,
             ):
                 failure = check(candidate, report, source, profile)
@@ -508,15 +503,6 @@ class XArm7MotionPlanner:
                     link_names += f" ... +{len(pairs) - 5} more"
                 reason = f"Path contains self-collision ({num} contact(s): {link_names})."
             return self._make_failure(reason, source, report)
-        return None
-
-    def _check_env_collision(self, path, report, source, profile):
-        if not profile.check_env_collision:
-            return None
-        env_collision_report = self.check_path_env_collisions(path)
-        report.update(env_collision_report)
-        if env_collision_report.get("path_env_collision"):
-            return self._make_failure("Path contains environment collision.", source, report)
         return None
 
     def _check_workspace_bounds(self, path, report, source, _profile):

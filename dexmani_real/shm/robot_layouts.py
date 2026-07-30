@@ -100,6 +100,8 @@ HAND_STATE_DTYPE = np.dtype(
         ("tactile_force", "<f8", (5, 120, 3)),  # 14.4KB/frame, full recording bandwidth (D3)
         ("tactile_contact", "u1", (5,)),  # per-finger contact boolean (from detect_contact)
         ("tipboard_err", "<i4", (12,)),  # tip board error registers per joint
+        ("commboard_err", "<i4", (12,)),  # communication board error registers per joint
+        ("jointboard_err", "<i4", (12,)),  # joint motor-driver board error registers per joint
         ("connected_flag", "u1"),  # raw SDK flag (not composited with error_state)
         ("error_state", "u1"),
         ("consecutive_errs", "u4"),

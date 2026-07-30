@@ -382,24 +382,16 @@ class TeleopIKSolver:
     def _check_teleop_collision_gate(
         self, qpos_cmd: np.ndarray, profile: TeleopProfile,
     ) -> tuple[str | None, dict[str, Any]]:
-        """Self + env collision gate. Returns (reason, extra_report) or (None, {})."""
-        if not profile.check_self_collision and not profile.check_env_collision:
+        """Self-collision gate. Returns (reason, extra_report) or (None, {})."""
+        if not profile.check_self_collision:
             return None, {}
 
-        if profile.check_self_collision:
-            if self.ik_mgr.has_self_collision(qpos_cmd):
-                info = self.ik_mgr.check_self_collision(qpos_cmd)
-                if info:
-                    return (
-                        f"IK result in self-collision ({info.summary}), holding.",
-                        {"collision_type": "self", "collision": info.to_dict()},
-                    )
-
-        if profile.check_env_collision:
-            if self.ik_mgr.has_env_collision(qpos_cmd):
+        if self.ik_mgr.has_self_collision(qpos_cmd):
+            info = self.ik_mgr.check_self_collision(qpos_cmd)
+            if info:
                 return (
-                    "IK result in environment collision (table/obstacle), holding.",
-                    {"collision_type": "env", "env_collision": True},
+                    f"IK result in self-collision ({info.summary}), holding.",
+                    {"collision_type": "self", "collision": info.to_dict()},
                 )
         return None, {}
 
@@ -476,23 +468,10 @@ class TeleopIKSolver:
         # ── Collision safety gates ──
         collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)
         if collision_reason is not None:
-            if collision_extra.get("collision_type") == "env":
-                current_eef = self.kin.compute_eef_pose_world(current_qpos)
-                if target_eef_pose_world.p[2] > current_eef.p[2] + 0.001:
-                    logger.warning(
-                        "Allowing upward recovery through env collision gate (target_z=%.3f, current_z=%.3f)",
-                        target_eef_pose_world.p[2], current_eef.p[2],
-                    )
-                else:
-                    return self._make_collision_held(
-                        qpos_cmd, current_qpos, previous_qpos_cmd,
-                        collision_reason, report, **collision_extra,
-                    )
-            else:
-                return self._make_collision_held(
-                    qpos_cmd, current_qpos, previous_qpos_cmd,
-                    collision_reason, report, **collision_extra,
-                )
+            return self._make_collision_held(
+                qpos_cmd, current_qpos, previous_qpos_cmd,
+                collision_reason, report, **collision_extra,
+            )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
         if eef_pose_world is not None:

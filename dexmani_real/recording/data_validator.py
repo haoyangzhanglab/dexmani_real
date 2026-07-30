@@ -116,7 +116,7 @@ class DataValidator:
 
                 # ── 8. Camera stall (frozen frames, schema v6+) ──
     
-        except (OSError, KeyError) as e:
+        except Exception as e:
             checks.append(
                 ValidationCheck(
                     name="file_open",
@@ -166,8 +166,10 @@ class DataValidator:
         )
 
     def _check_camera(self, reader: EpisodeReader) -> ValidationCheck:
-        f = reader.h5f
-        if "rgb" not in f:
+        # New-format episodes store RGB as MP4 sidecar (not in HDF5).
+        # Legacy episodes have RGB as an HDF5 dataset in data.h5.
+        has_rgb = "rgb" in reader.h5f or reader._rgb_decoder is not None
+        if not has_rgb:
             return ValidationCheck(
                 name="camera_fresh",
                 passed=True,
@@ -189,7 +191,13 @@ class DataValidator:
         return ValidationCheck(name="min_frames", passed=ok, detail=f"{n_frames} frames (min={self.min_frames})")
 
     def _check_duplicate_frames(self, f: h5py.File) -> ValidationCheck:
-        """Check for consecutive identical frames (indicates stuck sensor)."""
+        """Check for consecutive identical frames (indicates stuck sensor).
+
+        Forward-filled grid slots (from timestamp-alignment back-fill) produce
+        identical consecutive rows by design — these are filtered out by checking
+        ``flag_held`` / ``flag_frame_status`` so idle periods don't trigger false
+        positives.
+        """
         if "arm_qpos" not in f or "action_arm_joint" not in f:
             return ValidationCheck(
                 name="no_duplicate_frames",
@@ -204,8 +212,21 @@ class DataValidator:
                 passed=True,
                 detail="Too few frames for duplicate check.",
             )
-        obs_diff = np.sum(np.abs(np.diff(obs, axis=0)), axis=1)
-        act_diff = np.sum(np.abs(np.diff(act, axis=0)), axis=1)
+        # Exclude held/idle frames (forward-fill produces identical rows).
+        if "flag_held" in f:
+            mask = ~np.asarray(f["flag_held"][:], dtype=bool)
+        elif "flag_frame_status" in f:
+            mask = np.asarray(f["flag_frame_status"][:], dtype=np.int32) != 1
+        else:
+            mask = np.ones(len(obs), dtype=bool)
+        if mask.sum() < 2:
+            return ValidationCheck(
+                name="no_duplicate_frames",
+                passed=True,
+                detail="Too few active (non-held) frames for duplicate check.",
+            )
+        obs_diff = np.sum(np.abs(np.diff(obs[mask], axis=0)), axis=1)
+        act_diff = np.sum(np.abs(np.diff(act[mask], axis=0)), axis=1)
         n_dup_obs = int(np.sum(obs_diff < self.duplicate_epsilon))
         n_dup_act = int(np.sum(act_diff < self.duplicate_epsilon))
         total_dup = max(n_dup_obs, n_dup_act)

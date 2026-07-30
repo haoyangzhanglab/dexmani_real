@@ -22,7 +22,6 @@ _REJECT_CATEGORY_MAP: dict[str, str] = {
     "IK candidate exceeds max_ik_delta_deg.": "delta",
     "IK candidate pose error exceeds threshold.": "pose_error",
     "IK candidate in self-collision.": "collision",
-    "IK candidate in environment collision.": "env_collision",
 }
 
 
@@ -202,11 +201,6 @@ class IKCandidateManager:
                 report["collision"] = collision_info.to_dict()
                 return False, report
 
-        if profile.check_env_collision and self._cm is not None:
-            if self._cm.check_env_collision(qpos):
-                report["reason"] = "IK candidate in environment collision."
-                return False, report
-
         return True, report
 
     def score_ik_candidate(
@@ -349,9 +343,6 @@ class IKCandidateManager:
     def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
         return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]  # see has_self_collision
 
-    def has_env_collision(self, qpos: np.ndarray) -> bool:
-        return self._cm.check_env_collision(qpos)  # type: ignore[union-attr]  # see has_self_collision
-
     def check_path_collisions(
         self,
         path: np.ndarray,
@@ -410,26 +401,6 @@ class IKCandidateManager:
             if info:
                 return info
         return None
-
-    def check_path_env_collisions(
-        self,
-        path: np.ndarray,
-        collision_step_size: float = 0.02,
-    ) -> dict[str, Any]:
-        """Check environment collision along path with dense interpolation."""
-        for i in range(len(path) - 1):
-            if not self._cm.check_segment_env_collision_free(  # type: ignore[union-attr]  # requires a configured CollisionModel (planner always builds one)
-                path[i],
-                path[i + 1],
-                collision_step_size,
-            ):
-                return {
-                    "path_env_collision": True,
-                    "collision_waypoint_index": i,
-                    "collision_waypoint_count": len(path),
-                    "collision_step_size": collision_step_size,
-                }
-        return {"path_env_collision": False}
 
     def normalized_joint_distance(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> float:
         """Per-joint-range normalized Euclidean distance (ref: LeFranX weighted_ik.cpp)."""

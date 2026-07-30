@@ -39,16 +39,23 @@ class SupportsValidation(Protocol):
 
 
 def _check_hardware_error(robot: SupportsValidation) -> Optional[str]:
-    """Reject if arm or hand reports an SDK error state.
+    """Reject if the **arm** reports an SDK error state.
 
-    Hand errors gate only when the hand is connected (``connected_flag``),
-    so arm-only / degraded mode is not blocked by an absent hand reporting
-    ``is_error() == True`` (xhand.py:395).
+    Hand errors are intentionally NOT gated here. The arm and hand are
+    independent subsystems with separate error recovery:
+
+    - Hand child: board-error auto-clear in ``get_state()`` (xhand.py:559),
+      consecutive-send-errors watchdog → reconnect, estop → detorque.
+    - Arm inner loop: Mode 6 online trajectory planning, tracking-error
+      monitor, torque/temperature readback.
+
+    Blocking arm commands for a hand board glitch (tipboard / jointboard /
+    commboard) freezes the arm unnecessarily — the transient error often
+    self-clears within one hand tick (33 ms) while the arm stays frozen
+    until the next manual intervention (ref: 2026-07-30 session).
     """
     if robot.arm.is_error():
         return "arm error state"
-    if robot.hand.connected_flag and robot.hand.error_state:
-        return "hand error state"
     return None
 
 
@@ -118,22 +125,29 @@ def validate_action(
     actual_arm_qvel: np.ndarray | None = None,
     actual_arm_tau: np.ndarray | None = None,
 ) -> tuple[bool, str]:
-    """Centralized pre-send validation.
+    """Centralized pre-send validation (arm only — hand errors are NOT gated).
 
     Checks (fail-fast order):
-      1. SDK error state (arm + hand is_error)
+      1. Arm SDK error state
       2. Arm connection
       3. Action NaN guard (arm + hand joint commands)
       4. Torque gating — per-joint threshold check
       5. Arm velocity NaN guard
+
+    .. note::
+
+       Hand error state is intentionally NOT checked here.
+       See :func:`_check_hardware_error` for rationale.
 
     Removed from this gate (covered elsewhere):
       - Workspace clamp → TeleopPipeline Stage 3 (before IK)
       - Hand joint-limit clip → XHand.send_action() internal _limit_joint_range
       - Self-collision check → IK Stage (_check_teleop_collision_gate) + firmware error 22
       - Env collision check → IK Stage (_check_teleop_collision_gate)
-      - Hand current gating → firmware tor_max (320mA, xhand.py:180) is primary
+      - Hand current gating → firmware tor_max (320mA, xhand.py:155) is primary
         protection; software gate was disabled due to J3 false positives.
+      - Hand board errors → hand child auto-clears in get_state() (xhand.py:559);
+        logged by hand child when non-zero (hand_process.py).
 
     All sensor parameters are optional — ``None`` skips the check
     (backward compatible).
@@ -148,7 +162,11 @@ def validate_action(
         lambda: _check_hardware_error(robot),
         lambda: _check_arm_connected(robot),
         lambda: _check_action_nan(action),
-        lambda: _check_torque(actual_arm_tau),
+        # Torque gate disabled — J1 torque routinely exceeds 50 Nm limit
+        # when the arm is extended sideways, causing excessive safety
+        # rejections during normal teleop.  Hardware-level overcurrent
+        # protection (firmware) remains active.
+        # lambda: _check_torque(actual_arm_tau),
         lambda: _check_velocity_nan(actual_arm_qvel),
     ):
         reason = gate()

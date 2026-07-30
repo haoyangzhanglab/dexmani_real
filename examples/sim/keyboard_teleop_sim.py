@@ -294,7 +294,6 @@ def main():
             check_self_collision=True,
         ),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,  # MPlib 兜底: DLS 迭代不收敛时接管
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
@@ -309,16 +308,6 @@ def main():
 
     # 初始化碰撞模型手部姿态（消除 set_hand_qpos 未调用警告）
     planner.collision_model.set_hand_qpos(sim.get_full_qpos()[7:])
-
-    # 注册桌面障碍物 — 匹配 SAPIEN 场景中 constructor.py 的 table actor
-    # (中心 [0.4, 0, -0.5], half_size [0.5, 1.0, 0.5] → 桌面顶部 z=0)
-    planner.collision_model.add_table(
-        table_height=0.0,
-        x_center=0.4,
-        half_x=0.5,
-        half_y=1.0,
-        half_z=0.04,
-    )
 
     # ── 2. Viewer ──
     viewer: sapien.Viewer | None = None

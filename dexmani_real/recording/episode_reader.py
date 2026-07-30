@@ -177,13 +177,16 @@ class EpisodeReader:
 
     def close(self) -> None:
         """Close all files and decoders. Idempotent."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         self._cache.clear()
         if self._rgb_decoder is not None:
             self._rgb_decoder.close()
             self._rgb_decoder = None
-        if hasattr(self, "_h5f"):
+        if hasattr(self, "_h5f") and self._h5f is not None:
             self._h5f.close()
-        super().__setattr__("_h5f", None)  # type: ignore[assignment]
+            self._h5f = None  # type: ignore[assignment]
 
     def __enter__(self) -> "EpisodeReader":
         return self

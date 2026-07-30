@@ -24,26 +24,15 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from dexmani_real.shm.sync_primitives import SharedSyncPrimitives
 
 import numpy as np
 
 from dexmani_real.robot.xarm7.error_codes import decode_error, decode_warn
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.throttle import ThrottledWarner
 
 logger = get_logger(__name__)
-
-# Additive noise floor for adaptive tracking-error threshold (rad).
-# Unmodeled sources (encoder quantization, L∞ max across 7 joints, Mode 6
-# smoothing trade-off) do not scale with joint speed — they are constant offsets.
-# This bias is added to the physics-based model (steady-state lag + reversal
-# distance) so the threshold doesn't collapse to an over-sensitive constant at
-# low speeds where the physics term alone is too small.
-_TRACKING_NOISE_RAD: float = 0.07
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -79,11 +68,12 @@ class ArmInnerLoopConfig:
     target_timeout_s: float = 0.2
 
     # Per-step delta clamp — safety ceiling against IK solver anomalies.
-    # A normal target step is joint_max_speed / outer_loop_hz: ≈0.131 rad @16Hz
-    # outer (~2.3x headroom).  Note the inner loop re-sends the
-    # same target every 20ms, so a single anomalous target is chased at up to
-    # 0.3 rad per inner step until it times out (target_timeout_s).
-    max_joint_delta: float = 0.3
+    # Disabled (0): the outer-loop ARM_CMD_MAX_STEP_RAD clamp at 16 Hz provides
+    # the primary command-rate limit (120°/s = firmware speed limit).  The
+    # inner-loop clamp was a second, looser backstop (0.15 rad @ 30 Hz = 258°/s)
+    # that never fired in normal teleop and added a redundant code path.
+    # Joint-limit clip (below) is still active as the absolute position guard.
+    max_joint_delta: float = 0.0
 
     # Absolute joint limit clip — hardware safety bounds applied before the
     # per-step delta clamp (mirrors xArm7 physical limits in radians).
@@ -92,27 +82,21 @@ class ArmInnerLoopConfig:
     joint_limit_lower: tuple[float, ...] = (-6.283, -2.059, -6.283, -0.192, -6.283, -1.693, -6.283)
     joint_limit_upper: tuple[float, ...] = (6.283, 2.094, 6.283, 3.927, 6.283, 3.142, 6.283)
 
-    # Passive tracking-error monitor — enables velocity-adaptive thresholding
-    # when > 0 (recommended: 0.35).  The actual warn threshold scales with
-    # commanded joint speed: tighter at rest (~0.15 rad), relaxed at max speed
-    # (~0.38 rad @120°/s).  Anomalous (>2× adaptive or > anomaly_cap) always warns.
-    # Set 0 to disable.  Does NOT alter commands or trigger error state.
+    # Fixed-threshold tracking error warning (rad).  When the L∞ tracking error
+    # exceeds this value, a warning is logged.  Does NOT alter commands or trigger
+    # error state — purely diagnostic.
     tracking_error_warn_rad: float = 0.35
 
-    # Absolute ceiling for anomalous tracking error (rad).  Hard cap that flags
-    # errors as anomalous regardless of the 2×-adaptive multiplier.  Calibrated
-    # for joint_max_acc=500°/s²; retune when changing joint_max_acc.  Formula:
-    # anomaly_cap should be k * adaptive_max where k ∈ [1.0, 1.5].
-    tracking_error_anomaly_cap_rad: float = 0.50
-
-    # Upper clamp for the velocity-adaptive threshold (rad).  Prevents the
-    # physics formula from producing thresholds that would make the anomalous
-    # cap trivially unreachable at high speed.
+    # Upper clamp for the velocity-adaptive tracking error threshold (rad).
+    # Used by the offline assess_trajectory_quality tool to reconstruct per-frame
+    # thresholds from recorded joint velocities.  Default 0.60 rad (~34°).
     tracking_error_adaptive_max_rad: float = 0.60
 
-    # Two-phase handshake: when True, ArmInnerLoop sets robot_ready after each
-    # hardware write and waits for policy_ready before the next target dispatch.
-    synchronized: bool = False
+    # Absolute ceiling for anomalous-frame classification (rad).  Any frame whose
+    # L∞ tracking error exceeds this value is flagged as anomalous regardless of
+    # the adaptive threshold.  Default 0.50 rad (~29°).
+    tracking_error_anomaly_cap_rad: float = 0.50
+
 
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
@@ -124,6 +108,7 @@ _RECOVERABLE_ERRORS: frozenset[int] = frozenset(
     {
         22,  # Self-Collision Error — IK solver produced unsafe joint angles
         24,  # Speed Exceeds Limit — commanded motion too fast
+        31,  # C31: Collision Caused Abnormal Current — arm already stopped by firmware
     }
 )
 
@@ -153,11 +138,9 @@ class ArmInnerLoop:
         self,
         ip: str = "192.168.1.111",
         cfg: ArmInnerLoopConfig | None = None,
-        sync: SharedSyncPrimitives | None = None,
     ) -> None:
         self._ip = ip
         self._cfg = cfg or ArmInnerLoopConfig()
-        self._sync = sync
 
         # ── Shared state (protected by _lock) ──
         self._lock = threading.Lock()
@@ -175,13 +158,8 @@ class ArmInnerLoop:
         self._last_sent_cmd: np.ndarray = np.zeros(7, dtype=np.float64)
         self._arm = None  # live XArmAPI handle of the loop thread (mode/connected queries)
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
-        self._track_warn_throttle: int = 0  # throttle counter for anomalous tracking-error warnings
-        self._track_info_throttle: int = 0  # throttle counter for elevated tracking-error info logs
-        self._mode_warn_throttle: int = 0  # throttle counter for mode-drift warnings (independent)
-        # Adaptive tracking-error threshold: peak-hold envelope of commanded joint
-        # velocity (rad/s) — instant attack, exponential decay for noise rejection.
-        self._cmd_vel_env: float = 0.0
-        self._prev_monitor_target: np.ndarray | None = None
+        self._mode_warn = ThrottledWarner(interval_s=2.0)
+        self._tracking_warn = ThrottledWarner(interval_s=2.0)
 
         # ── Lifecycle ──
         self._stop_event = threading.Event()
@@ -303,10 +281,6 @@ class ArmInnerLoop:
 
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()
-        # Unblock a loop thread stuck in the sync handshake (policy_ready.wait()
-        # has no timeout) — it wakes, sees _stop_event, and exits cleanly.
-        if self._sync is not None:
-            self._sync.policy_ready.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
@@ -362,22 +336,6 @@ class ArmInnerLoop:
             except Exception:
                 pass
 
-    # ── Sync handshake ──
-
-    def _signal_ready_and_sync(self) -> None:
-        """Signal robot_ready and wait for policy_ready (two-phase handshake)."""
-        if self._sync is None:
-            return
-        self._sync.robot_ready.set()
-        self._sync.policy_ready.wait()
-        self._sync.policy_ready.clear()
-
-    def _signal_ready_only(self) -> None:
-        """Signal robot_ready without waiting (used in timeout/hold paths)."""
-        if self._sync is None:
-            return
-        self._sync.robot_ready.set()
-
     # ── Inner loop ──
 
     # ── Initialisation sub-steps (extracted from _run for testability) ──
@@ -416,7 +374,7 @@ class ArmInnerLoop:
 
     def _bootstrap_state(self, arm) -> np.ndarray | None:
         """Read initial joint position and seed shared state. Returns current_qpos or None."""
-        code, states = arm.get_joint_states(is_radian=True, num=1)
+        code, states = arm.get_joint_states(is_radian=True, num=3)
         if code != 0 or len(states) == 0:
             logger.error("ArmInnerLoop: failed to read initial qpos (code=%d)", code)
             return None
@@ -430,27 +388,30 @@ class ArmInnerLoop:
             self._arm_qpos = current_qpos.copy()
             self._error_state = False
             self._last_sent_cmd = current_qpos.copy()
+            # Seed _last_sent_target so the per-step delta clamp has a baseline
+            # from the very first _send_target call after restart.  Without this,
+            # the first target (e.g. home_qpos after return_home) may be 30°+
+            # away, forwarded to the firmware in a single step without clamping,
+            # causing violent motion and massive tracking errors.
+            # See: 2026-07-30 session — 32.82° coarse residual → 0.573 rad
+            # tracking error after restart.
+            self._last_sent_target = current_qpos.copy()
+
+        # Populate dynamics during bootstrap so the first SHM frame carries
+        # real qvel/tau — eliminates the 1-2 frame NaN torque rejection at
+        # teleop start (ref: 2026-07-30 session).
+        if len(states) > 1:
+            v = np.asarray(states[1], dtype=np.float64)
+            if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
+                with self._lock:
+                    self._arm_qvel = v[:7].copy()
+        if len(states) > 2:
+            tau = np.asarray(states[2], dtype=np.float64)
+            if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
+                with self._lock:
+                    self._arm_tau = tau[:7].copy()
+
         return current_qpos
-
-    def _init_dynamics(self, arm) -> None:
-        """One-shot velocity/torque read to avoid NaN window at teleop start.
-
-        Best-effort: if hardware read fails, dynamics stay NaN (safe —
-        validate_action rejects NaN).
-        """
-        try:
-            _dyn_code, _dyn_states = arm.get_joint_states(is_radian=True, num=3)
-            if _dyn_code == 0:
-                if len(_dyn_states) > 1:
-                    _v = np.asarray(_dyn_states[1], dtype=np.float64)
-                    if _v.shape[0] >= 7 and np.all(np.isfinite(_v[:7])):
-                        self._arm_qvel = _v[:7].copy()
-                if len(_dyn_states) > 2:
-                    _tau = np.asarray(_dyn_states[2], dtype=np.float64)
-                    if _tau.shape[0] >= 7 and np.all(np.isfinite(_tau[:7])):
-                        self._arm_tau = _tau[:7].copy()
-        except (RuntimeError, OSError):
-            pass
 
     def _handle_arm_error(self, arm, arm_error: int) -> str:
         """Respond to a non-zero arm error code.
@@ -472,7 +433,6 @@ class ArmInnerLoop:
                 self._arm_target = None
             self._recover_mode(arm)
             self._hold_position(arm)
-            self._signal_ready_only()
             return "continue"
 
         logger.error(
@@ -552,9 +512,6 @@ class ArmInnerLoop:
                     self._error_state = True
                 return
 
-            # ── Phase 4: Init dynamics ──
-            self._init_dynamics(arm)
-
             last_target_ts: float = 0.0
             last_valid_qpos: np.ndarray = current_qpos.copy()
 
@@ -571,7 +528,7 @@ class ArmInnerLoop:
             )
             self._ready_event.set()
 
-            # ── Phase 5: Main loop ──
+            # ── Phase 4: Main loop ──
             while not self._stop_event.is_set():
                 limiter.wait()
 
@@ -599,7 +556,6 @@ class ArmInnerLoop:
                     target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
                 ):
                     self._hold_position(arm)
-                    self._signal_ready_only()
                     continue
 
                 if target is None:
@@ -643,19 +599,12 @@ class ArmInnerLoop:
                 # Forward target → firmware trajectory planner
                 self._send_target(arm, target)
 
-                # Sync handshake (after hardware write)
-                self._signal_ready_and_sync()
-
         except Exception:
             logger.exception("ArmInnerLoop: fatal error in main loop")
             with self._lock:
                 self._error_state = True
         finally:
             self._ready_event.clear()
-            # Wake a controller blocked on robot_ready.wait() so it can observe
-            # the error/exit state instead of hanging (error exits never reach
-            # the normal per-frame handshake).
-            self._signal_ready_only()
             # Mode 6: firmware holds last position on disconnect, no explicit stop needed.
             try:
                 arm.disconnect()
@@ -667,103 +616,37 @@ class ArmInnerLoop:
     # ── Command dispatch ──
 
     def _monitor(self, arm, current_qpos: np.ndarray) -> None:
-        """Passive health monitor — tracking error (A4) + mode drift (A5).
+        """Health monitor — tracking error + mode drift.
 
-        Tracking error threshold is **velocity-adaptive**: the expected
-        tracking error grows with commanded joint speed because the firmware
-        acceleration limit (joint_max_acc) physcally limits how fast the arm
-        can respond to target changes, especially during direction reversals.
-
-        * ``logger.info`` — elevated but commensurate with current speed
-          (arm at its limit, not a fault).
-        * ``logger.warning`` — anomalously high for the current speed
-          (possible firmware degradation, increased friction, or collision).
-
-        Never mutates commands or the error state.
+        Proactively re-initialises Mode 6 when the firmware drops out of
+        trajectory planning mode (e.g. after a collision detection or
+        overspeed rejection).  This recovers at the earliest detection
+        point, before ``_send_target`` has a chance to fail with code=9
+        and set ``_error_state`` spuriously.
         """
-        cfg = self._cfg
         err = 0.0
         if self._last_sent_target is not None:
             err = float(np.max(np.abs(self._last_sent_target - current_qpos[:7])))
         with self._lock:
             self._tracking_error = err
 
-        # ── Estimate commanded joint velocity (peak-hold envelope) ──
-        # Peak-hold (instant attack, exponential decay) replaces the old EMA
-        # (α=0.15, τ≈0.22s) which caused ~0.2s threshold lag during transients.
-        # The envelope responds instantly to velocity increases and decays slowly
-        # (α=0.15) for noise rejection during steady state.
-        cmd_vel = 0.0
-        if self._last_sent_target is not None and self._prev_monitor_target is not None:
-            raw_delta = float(np.max(np.abs(self._last_sent_target - self._prev_monitor_target)))
-            raw_vel = raw_delta / cfg.loop_period
-            # Clamp to firmware speed limit: prevents idle→teleop first-tick spike
-            # (delta accumulated during idle can produce raw_vel > 225°/s).
-            raw_vel = min(raw_vel, cfg.joint_max_speed)
-            self._cmd_vel_env = max(raw_vel, 0.85 * self._cmd_vel_env)
-            cmd_vel = self._cmd_vel_env
-        if self._last_sent_target is not None:
-            self._prev_monitor_target = self._last_sent_target.copy()
-
-        # ── Adaptive threshold (physics-based) ──
-        #   expected = steady_state_lag + reversal_distance + noise_bias
-        #   steady_state_lag ≈ cmd_vel / inner_loop_rate
-        #   reversal_distance ≈ cmd_vel² / joint_max_acc  (full decel+accel, v²/a)
-        #   noise_bias = additive (not multiplicative) — encoder quant, L∞ max,
-        #                Mode 6 smoothing artefacts don't scale with speed.
-        # Clamped to [0.18, 0.60] rad — 0.18 floor covers unmodeled noise at
-        # low speed (was 0.15 with old multiplicative 1.25×, which collapsed to
-        # a constant below ~66°/s and produced false positives).
-        adaptive: float = 0.0
-        if cfg.tracking_error_warn_rad > 0 and cfg.joint_max_acc > 0:
-            inner_rate = 1.0 / cfg.loop_period  # 30 Hz
-            steady = cmd_vel / inner_rate
-            # Full reversal distance: decelerate to zero + accelerate to cmd_vel
-            accel = cmd_vel * cmd_vel / cfg.joint_max_acc
-            expected = steady + accel + _TRACKING_NOISE_RAD
-            adaptive = float(np.clip(expected, 0.18, cfg.tracking_error_adaptive_max_rad))
-
-        mode_bad = getattr(arm, "mode", 6) != 6
-        track_elevated = adaptive > 0 and err > adaptive
-        track_anomalous = adaptive > 0 and (err > 2.0 * adaptive or err >= cfg.tracking_error_anomaly_cap_rad)
-
-        # ── Independent throttles ──
-        # Anomalous warning: genuinely unexpected → always warn (throttled).
-        if self._track_warn_throttle > 0:
-            self._track_warn_throttle -= 1
-        elif track_anomalous:
-            logger.warning(
-                "ArmInnerLoop: anomalous tracking error %.3f rad "
-                "(adaptive threshold %.3f rad, cmd_vel=%.0f°/s) — "
-                "possible degradation",
+        # Tracking error warning — throttled to avoid log spam at 30 Hz.
+        if err > self._cfg.tracking_error_warn_rad:
+            self._tracking_warn(
+                "ArmInnerLoop: tracking error %.3f rad > threshold %.3f rad",
                 err,
-                adaptive,
-                np.degrees(cmd_vel),
+                self._cfg.tracking_error_warn_rad,
             )
-            self._track_warn_throttle = 50  # ~1.67s at 30Hz
 
-        # Elevated info: expected at current speed → throttled info log.
-        if self._track_info_throttle > 0:
-            self._track_info_throttle -= 1
-        elif track_elevated and not track_anomalous:
-            logger.info(
-                "ArmInnerLoop: elevated tracking error %.3f rad "
-                "(adaptive threshold %.3f rad, cmd_vel=%.0f°/s)",
-                err,
-                adaptive,
-                np.degrees(cmd_vel),
+        # Mode-drift check — recover immediately instead of waiting for
+        # _send_target to fail with code=9.
+        if getattr(arm, "mode", 6) != 6:
+            actual = getattr(arm, "mode", "?")
+            self._mode_warn(
+                "ArmInnerLoop: arm mode=%s (expected 6) — re-initialising",
+                actual,
             )
-            self._track_info_throttle = 150  # ~5s at 30Hz
-
-        # Mode-drift check (independent throttle from tracking error).
-        if self._mode_warn_throttle > 0:
-            self._mode_warn_throttle -= 1
-        elif mode_bad:
-            logger.warning(
-                "ArmInnerLoop: arm mode=%s (expected 6) — trajectory planning may be degraded",
-                getattr(arm, "mode", "?"),
-            )
-            self._mode_warn_throttle = 50
+            self._recover_mode(arm)
 
     def _send_target(self, arm, target: np.ndarray) -> None:
         """Forward target position → set_servo_angle(wait=False).
@@ -775,16 +658,9 @@ class ArmInnerLoop:
         No inner-loop interpolation — the target is forwarded directly and the
         firmware handles all trajectory smoothing.
         """
-        # ── Per-step joint delta clamp ──
-        # Safety ceiling against IK solver anomalies.  A normal target step is
-        # joint_max_speed ÷ outer_loop_hz: ≈0.098 rad @16Hz outer (~3x headroom).
+        # Absolute joint limit clip (hardware safety bounds)
         clamped = target[:7].copy()
-        # Absolute joint limit clip (before per-step delta clamp, per validate.py §5)
         np.clip(clamped, self._cfg.joint_limit_lower, self._cfg.joint_limit_upper, out=clamped)
-        if self._cfg.max_joint_delta > 0 and self._last_sent_target is not None:
-            delta = clamped - self._last_sent_target
-            delta = np.clip(delta, -self._cfg.max_joint_delta, self._cfg.max_joint_delta)
-            clamped = self._last_sent_target + delta
 
         speed = self._cfg.joint_max_speed
 
@@ -827,6 +703,20 @@ class ArmInnerLoop:
                     code,
                     err_code,
                     decode_error(err_code),
+                )
+                with self._lock:
+                    self._arm_target = None
+                self._recover_mode(arm)
+                return
+            elif code == 9 and err_code <= 0:
+                # Mode dropped without a latched controller error (timing race:
+                # firmware transitions mode→0 before latching the error code).
+                # Re-init Mode 6 — treat as recoverable, do NOT set error_state.
+                self._mode_warn(
+                    "ArmInnerLoop: set_servo_angle code=%d err=%d — "
+                    "mode drop without error latch, re-initialising",
+                    code,
+                    err_code,
                 )
                 with self._lock:
                     self._arm_target = None
@@ -954,7 +844,7 @@ class ArmInnerLoop:
                     else:
                         logger.info("ArmInnerLoop: firmware %s OK (>= 1.10.0 required)", ver_str)
         except Exception:
-            logger.warning("ArmInnerLoop: could not check firmware version — assuming >= 1.10.0")
+            pass
 
         arm.set_mode(0)
         arm.set_state(0)

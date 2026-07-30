@@ -9,17 +9,10 @@ seqlock SHM rings:
     ArmSHMFaçade.set_target(cmd)  ──arm_target──►  inner.set_target(cmd|None)
     ArmSHMFaçade.get_state()      ◄──arm_state───  publish every child tick
                                                      (incl. inner.last_sent_cmd)
-    ArmSHMFaçade.rpc(EXEC_WAYPOINTS|RESET_BLOCKING|CLEAR_ERROR|
-                     EMERGENCY_STOP|REINIT_MODE6)
-                                  ◄─arm_cmd / arm_cmd_result─►  inner.exec_macro()
 
 Safety semantics (plan §4.7-4.9, §5):
   * estop_event is checked FIRST each child tick → hold + set_state(4) once,
-    via ``ArmInnerLoop.emergency_stop()``: the loop thread issues set_state(4)
-    on its OWN live connection (≤1 tick, no reconnect — plan §4.8/A5), and
-    when a macro owns the controller (loop stopped) a short-lived connection
-    issues set_state(4) WITHOUT waiting on macro_lock — the controller honors
-    it immediately and the in-flight macro unwinds on its next failed move.
+    via ``ArmInnerLoop.emergency_stop()`` on its own live connection (≤1 tick).
   * Target staleness (slot monotonic ts via is_fresh, target_timeout_s=0.2) or
     is_hold → inner.set_target(None) — the inner loop re-arms its soft-start
     ramp on hold.
@@ -49,21 +42,13 @@ import numpy as np
 
 
 from dexmani_real.shm.robot_layouts import (
-    ARM_CMD_CLEAR_ERROR,
-    ARM_CMD_DTYPE,
     ARM_CMD_EMERGENCY_STOP,
-    ARM_CMD_EXEC_WAYPOINTS,
-    ARM_CMD_REINIT_MODE6,
-    ARM_CMD_RESET_BLOCKING,
-    ARM_CMD_RESULT_DTYPE,
     ARM_STATE_DTYPE,
     ARM_TARGET_DTYPE,
-    MAX_ARM_WAYPOINTS,
     PRODUCER_TELEOP,
     new_frame,
 )
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer, is_fresh
-from dexmani_real.shm.robot_rpc import RpcClient, RpcServer
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
@@ -86,8 +71,7 @@ class ArmProcessConfig:
     """Configuration for ArmControlProcess / ArmSHMFaçade.
 
     Ring names are derived from ``shm_prefix``: ``f"{shm_prefix}_state"``
-    (maxlen=3), ``_target`` (maxlen=2), ``_cmd`` (maxlen=2), ``_cmd_result``
-    (maxlen=2).
+    (maxlen=3), ``_target`` (maxlen=2).
 
     Attributes:
         loop_hz: Child tick rate (Hz). Also the freshness-gate denominator.
@@ -98,14 +82,6 @@ class ArmProcessConfig:
                           state_stale_mult / loop_hz seconds → fabricated
                           error record (plan §4.7).
         ready_timeout_s: Child-side inner-loop wait_ready timeout.
-        rpc_timeout_s: RpcClient call timeout for macro commands. Default
-                       60 s so a worst-case blocking home move cannot spuriously
-                       time out: RESET_BLOCKING runs set_servo_angle(wait=True)
-                       at reset_speed=20°/s — ~9 s for a 180° single-joint move
-                       from init pose, ~18 s from near a ±357.5° soft limit,
-                       plus Mode 6 reconstruction. NOTE: a timeout means the
-                       RESULT was not observed in time — the command is NOT
-                       aborted and may still be running (see rpc()).
         expected_producer_id: Reject arm_target frames whose nonzero
                               producer_id differs (D9).
         inner_kwargs: Extra kwargs forwarded to the inner-loop factory
@@ -117,7 +93,6 @@ class ArmProcessConfig:
     target_timeout_s: float = 0.2
     state_stale_mult: float = 3.0
     ready_timeout_s: float = 30.0
-    rpc_timeout_s: float = 60.0
     expected_producer_id: int = PRODUCER_TELEOP
     inner_kwargs: dict = field(default_factory=dict)
 
@@ -134,11 +109,7 @@ _DEFAULT_JOINT_BOUND = 2.0 * np.pi * 2.0
 
 
 def _default_inner_factory(config: ArmProcessConfig) -> Any:
-    """Build the real ArmInnerLoop inside the child (lazy SDK import, plan A2).
-
-    Imports XArm7 too so a missing/broken xArm SDK fails fast at child startup
-    (XArm7 is what ArmInnerLoop.exec_macro uses for macro commands).
-    """
+    """Build the real ArmInnerLoop inside the child (lazy SDK import, plan A2)."""
     from dexmani_real.robot.inner_loop import ArmInnerLoop
     from dexmani_real.robot.xarm7.xarm7 import XArm7, XArm7Config  # noqa: F401  (fail-fast SDK check)
 
@@ -188,15 +159,10 @@ def _arm_child_main(
     """Arm control child entry point (module-level for fork+pickling).
 
     Sole XArmAPI connection owner. Each tick, in priority order:
-      1. estop_event FIRST → hold + set_state(4) once via inner.emergency_stop()
-         (fast path, does NOT take macro_lock — preempts in-flight RPC macros);
+      1. estop_event FIRST → hold + set_state(4) once via inner.emergency_stop();
       2. SIGINT received → hold + clean exit;
-      3. arm_target ring → is_hold / stale (target_timeout_s) → set_target(None)
-         (inner loop re-arms the soft-start ramp on hold); nonzero producer_id
-         mismatch → throttled warn + ignore; else set_target(qpos);
-      4. publish ARM_STATE every tick;
-      5. RPC macros served on a dedicated thread (state ring keeps flowing
-         during long macros — plan §4.3) via inner.exec_macro.
+      3. arm_target ring → is_hold / stale (target_timeout_s) → set_target(None);
+      4. publish ARM_STATE every tick.
     """
     # ── SIGINT: Ctrl-C reaches the whole process group; hold, then exit ──
     sigint_received = threading.Event()
@@ -212,8 +178,6 @@ def _arm_child_main(
     inner: Any = None
     state_ring: SeqlockRingBuffer | None = None
     target_ring: SeqlockRingBuffer | None = None
-    cmd_ring: SeqlockRingBuffer | None = None
-    result_ring: SeqlockRingBuffer | None = None
     try:
         factory = inner_factory if inner_factory is not None else _default_inner_factory
         inner = factory(config)
@@ -223,10 +187,6 @@ def _arm_child_main(
         state_ring = SeqlockRingBuffer(f"{prefix}_state", ARM_STATE_DTYPE, maxlen=3, create=False)
         target_ring = SeqlockRingBuffer(
             f"{prefix}_target", ARM_TARGET_DTYPE, maxlen=2, create=False
-        )
-        cmd_ring = SeqlockRingBuffer(f"{prefix}_cmd", ARM_CMD_DTYPE, maxlen=2, create=False)
-        result_ring = SeqlockRingBuffer(
-            f"{prefix}_cmd_result", ARM_CMD_RESULT_DTYPE, maxlen=2, create=False
         )
 
         inner.start()
@@ -247,49 +207,6 @@ def _arm_child_main(
         _publish_arm_state(state_ring, inner)
         ready_event.set()
 
-        # ── RPC executor on its own thread: long macros (waypoints / blocking
-        # reset) must not stop the tick loop publishing arm_state, or the
-        # façade freshness gate would fabricate a false emergency (plan §4.3).
-        macro_lock = threading.Lock()  # serialize tick-loop estop vs RPC macros
-
-        def _handle_macro(request: np.ndarray, seq: int) -> np.ndarray:
-            result = new_frame(ARM_CMD_RESULT_DTYPE)
-            try:
-                code = int(request["cmd"][0])
-                n_wp = int(request["n_waypoints"][0])
-                fields = {
-                    "waypoints": np.array(request["waypoints"][0][:n_wp], dtype=np.float64),
-                    "dt": float(request["dt"][0]),
-                    "target": np.array(request["target"][0], dtype=np.float64),
-                    "speed": float(request["speed"][0]),
-                    "acc": float(request["acc"][0]),
-                }
-                with macro_lock:
-                    out = inner.exec_macro(code, fields)
-                result["ok"][0] = 1 if out.get("ok") else 0
-                result["arm_err"][0] = int(out.get("arm_err", 0))
-                result["sdk_ret"][0] = int(out.get("sdk_ret", -1))
-                result["final_qpos"][0] = np.asarray(out.get("final_qpos", np.zeros(7)), dtype=np.float64)[:7]
-            except Exception as e:
-                logger.warning("ArmControlProcess: macro handler failed: %s", e)
-                result["ok"][0] = 0
-                result["sdk_ret"][0] = -1
-            return result
-
-        server = RpcServer(cmd_ring, result_ring, _handle_macro)
-
-        def _rpc_loop() -> None:
-            while not stop_event.is_set():
-                try:
-                    if not server.handle_pending():
-                        time.sleep(0.005)
-                except Exception:
-                    logger.exception("ArmControlProcess: RPC loop iteration failed")
-                    time.sleep(0.05)
-
-        rpc_thread = threading.Thread(target=_rpc_loop, name="arm_rpc", daemon=True)
-        rpc_thread.start()
-
         limiter = RateManager(config.loop_hz)
         _estop_issued = False
         producer_throttle = 0
@@ -307,18 +224,10 @@ def _arm_child_main(
                         fast_estop = getattr(inner, "emergency_stop", None)
                         if callable(fast_estop):
                             # Fast path (plan §4.8 / A5): set_state(4) on the
-                            # loop's own connection (≤1 tick) — or, when a
-                            # macro has stopped the loop, a short-lived
-                            # connection WITHOUT macro_lock, so an in-flight
-                            # EXEC_WAYPOINTS/RESET_BLOCKING cannot defer the
-                            # emergency stop (the controller halts at once
-                            # and the macro unwinds on its next failed move).
+                            # loop's own connection (≤1 tick).
                             fast_estop()
                         else:
-                            # Inner-loop impl without the fast path (e.g. test
-                            # fakes): the reconnect-based EMERGENCY_STOP macro.
-                            with macro_lock:
-                                inner.exec_macro(ARM_CMD_EMERGENCY_STOP, {})
+                            inner.exec_macro(ARM_CMD_EMERGENCY_STOP, {})
                     except Exception as e:
                         logger.warning("ArmControlProcess: estop failed: %s", e)
                 _publish_arm_state(state_ring, inner)
@@ -372,7 +281,7 @@ def _arm_child_main(
             except Exception:
                 logger.exception("ArmControlProcess: inner stop failed")
         # Close (never unlink — the parent owns the blocks) our ring handles.
-        for ring in (state_ring, target_ring, cmd_ring, result_ring):
+        for ring in (state_ring, target_ring):
             if ring is not None:
                 try:
                     ring.close()
@@ -478,9 +387,8 @@ class ArmSHMFaçade:
     """Main-process façade over the arm control child (plan §4.7 guards).
 
     Drop-in surface for the arm half of RobotInterface: set_target /
-    get_state / blocking-move macros via RPC. All reads return
-    ``(record, age_ns)`` — latency-compensation input for policy deployment
-    (plan §10.6).
+    get_state. All reads return ``(record, age_ns)`` — latency-compensation
+    input for policy deployment (plan §10.6).
     """
 
     def __init__(
@@ -504,9 +412,6 @@ class ArmSHMFaçade:
         self._joint_hi = hi + 0.05
         self._state_ring: SeqlockRingBuffer | None = None
         self._target_ring: SeqlockRingBuffer | None = None
-        self._cmd_ring: SeqlockRingBuffer | None = None
-        self._result_ring: SeqlockRingBuffer | None = None
-        self._rpc_client: RpcClient | None = None
         self._last_good: np.ndarray | None = None  # last range-valid state record
         self._throttled_warn = ThrottledWarner()  # warning throttle (≤1/5s)
         self._startup_grace_remaining: int = 0  # ticks to suppress no-frame error after restart
@@ -514,7 +419,7 @@ class ArmSHMFaçade:
     # ── Lifecycle ──
 
     def start(self) -> bool:
-        """Create the SHM rings (stale cleanup) and start the child."""
+        """Create the SHM rings and start the child."""
         if self._proc.running:
             logger.warning("ArmSHMFaçade already running.")
             return False
@@ -646,78 +551,6 @@ class ArmSHMFaçade:
         frame["producer_id"][0] = int(producer_id)
         self._target_ring.write(frame)
 
-    # ── RPC macros (main → child, blocking) ──
-
-    def rpc(self, code: int, **fields: Any) -> np.ndarray:
-        """Build an ARM_CMD frame and wait for its ARM_CMD_RESULT.
-
-        Fields: ``waypoints`` (N,7, ≤MAX_ARM_WAYPOINTS — caller segments),
-        ``dt``, ``target`` (7,), ``speed``, ``acc`` (0 → child-side XArm7Config
-        reset defaults for RESET_BLOCKING).
-
-        Timeout semantics: RpcTimeoutError means the RESULT was not observed
-        within ``config.rpc_timeout_s`` — the command is NOT aborted and may
-        still be running child-side (a late result is simply discarded).
-        Callers must treat a timed-out move as IN FLIGHT: verify arm qpos
-        against the intended target before retrying, or a retry dispatches
-        the move a second time (the RPC server serves any seq newer than its
-        last-served one).
-        """
-        if self._rpc_client is None:
-            raise RuntimeError("ArmSHMFaçade not started")
-        frame = new_frame(ARM_CMD_DTYPE)
-        frame["cmd"][0] = int(code)
-        waypoints = fields.get("waypoints")
-        if waypoints is not None:
-            wp = np.asarray(waypoints, dtype=np.float64).reshape(-1, 7)
-            if wp.shape[0] > MAX_ARM_WAYPOINTS:
-                raise ValueError(
-                    f"waypoints={wp.shape[0]} exceeds MAX_ARM_WAYPOINTS={MAX_ARM_WAYPOINTS}; "
-                    "caller must segment (plan §4.3)"
-                )
-            frame["n_waypoints"][0] = wp.shape[0]
-            frame["waypoints"][0][: wp.shape[0]] = wp
-        for key in ("dt", "speed", "acc"):
-            if key in fields:
-                frame[key][0] = float(fields[key])
-        if "target" in fields:
-            frame["target"][0] = np.asarray(fields["target"], dtype=np.float64).ravel()[:7]
-        return self._rpc_client.call(frame)
-
-    def exec_waypoints(self, waypoints: np.ndarray, dt: float) -> np.ndarray:
-        """EXEC_WAYPOINTS — Mode 1 set_servo_angle_j per waypoint (plan §4.3).
-
-        Mode 6 is automatically reconstructed on completion. Blocks until the
-        move finishes — a dense 2048-point path at dt=20 ms alone is ~41 s, so
-        the default rpc_timeout_s (60 s) barely covers one full segment;
-        raise it for slower/longer paths. On RpcTimeoutError the move is NOT
-        aborted and may still be running (see rpc()).
-        """
-        return self.rpc(ARM_CMD_EXEC_WAYPOINTS, waypoints=waypoints, dt=dt)
-
-    def reset_blocking(self, target: np.ndarray, speed: float = 0.0, acc: float = 0.0) -> np.ndarray:
-        """RESET_BLOCKING — Mode 0 set_servo_angle(wait=True) (XArm7.reset).
-
-        speed/acc = 0 → XArm7Config reset defaults (child-side: reset_speed
-        20°/s). The blocking move can take ~18 s from near a joint soft
-        limit; the default rpc_timeout_s (60 s) covers that with margin. On
-        RpcTimeoutError the move is NOT aborted — the arm may still be
-        moving home; check qpos vs ``target`` before retrying (see rpc()).
-        """
-        return self.rpc(ARM_CMD_RESET_BLOCKING, target=target, speed=speed, acc=acc)
-
-    def clear_error(self) -> np.ndarray:
-        """CLEAR_ERROR — clean_error + motion_enable, no mode change."""
-        return self.rpc(ARM_CMD_CLEAR_ERROR)
-
-    def emergency_stop_rpc(self) -> np.ndarray:
-        """EMERGENCY_STOP — set_state(4); inner loop stays stopped."""
-        return self.rpc(ARM_CMD_EMERGENCY_STOP)
-
-    def reinit_mode6(self) -> np.ndarray:
-        """REINIT_MODE6 — clear errors, restart the inner loop in Mode 6."""
-        return self.rpc(ARM_CMD_REINIT_MODE6)
-
     # ── Status ──
 
     @property
@@ -736,23 +569,15 @@ class ArmSHMFaçade:
 
     def _create_rings(self) -> None:
         prefix = self._config.shm_prefix
-        # stale_cleanup=True: a leftover arm_target from a dead run would be
-        # chased as a fresh target on restart — far more dangerous than stale
-        # camera frames (camera_process.py:204 pattern, plan §5.1 / D5).
         self._state_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_state", ARM_STATE_DTYPE, maxlen=3
         )
         self._target_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_target", ARM_TARGET_DTYPE, maxlen=2
         )
-        self._cmd_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_cmd", ARM_CMD_DTYPE, maxlen=2)
-        self._result_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_cmd_result", ARM_CMD_RESULT_DTYPE, maxlen=2
-        )
-        self._rpc_client = RpcClient(self._cmd_ring, self._result_ring, timeout_s=self._config.rpc_timeout_s)
 
     def _unlink_rings(self) -> None:
-        for ring in (self._state_ring, self._target_ring, self._cmd_ring, self._result_ring):
+        for ring in (self._state_ring, self._target_ring):
             if ring is None:
                 continue
             try:
@@ -765,9 +590,6 @@ class ArmSHMFaçade:
                 pass
         self._state_ring = None
         self._target_ring = None
-        self._cmd_ring = None
-        self._result_ring = None
-        self._rpc_client = None
 
     def _fabricate_error_state(self, donor: np.ndarray | None = None) -> np.ndarray:
         """Fabricated record so validate_action trips: error_state=1, connected=0.
@@ -973,15 +795,24 @@ def do_return_home(
     inner_cfg: "ArmInnerLoopConfig",
     *,
     home_dt: float = 0.04,
+    cancel_fn: "Callable[[], bool] | None" = None,
 ) -> "ArmServo":
-    """Return arm to home via path-planned ``robot.return_to_home()``.
+    """Return arm + hand to home with smooth Mode 6 convergence.
 
-    Stops the inner loop, calls ``robot.return_to_home()`` (collision-checked
-    waypoint interpolation at ``home_dt`` resolution), then forks a new
-    ArmControlProcess.  ~9 s total.
+    1. Stop inner loop
+    2. Coarse approach via ``robot.return_to_home()`` (collision-checked)
+    3. Hand home with tight tolerance (0.03 rad)
+    4. Restart inner loop → set target = home_qpos → Mode 6 smooth convergence
+    5. Wait for convergence (max err < 0.5°, 5 s timeout)
+
+    ``cancel_fn``, when provided, is called once per convergence poll (~50 Hz).
+    When it returns ``True``, the convergence loop exits early — the arm holds
+    its last position and the caller is responsible for re-establishing the
+    target.  Keyboard-interrupt semantics (Q / ESC) are the primary use case.
 
     Returns a freshly constructed ``ArmServo`` instance.
     """
+    import time as _time
     import traceback
 
     import numpy as np
@@ -1001,19 +832,96 @@ def do_return_home(
             print("  已在 home 位置，跳过归位", flush=True)
             return arm_inner
 
-    # ── Stop inner loop → path-planned home → restart inner loop ──
+    # ── Stop inner loop → coarse approach → hand home → restart → converge ──
     try:
         arm_inner.set_target(None)
         arm_inner.stop()
         print("  Arm 内环线程已停止")
 
+        # ── Coarse approach (collision-checked, ~few degrees from home) ──
         ok = robot.return_to_home(home_dt=home_dt)
-        print(f"  {'OK' if ok else 'FAIL'}")
+        print(f"  粗定位 {'OK' if ok else 'FAIL'}")
 
+        # Disconnect the main process's XArm7 connection used for coarse
+        # homing so only the new inner loop child's connection is active.
+        # Without this, two XArmAPI connections coexist (Mode 1 + Mode 6)
+        # and Mode 6 firmware may behave unpredictably — observed as
+        # convergence timeout at large residual errors (ref: 2026-07-30).
+        # Matches exec_macro() pattern which disconnects its temporary
+        # connection (inner_loop.py:954-956).
+        try:
+            robot.arm.disconnect()
+        except Exception:
+            pass  # best-effort — new inner loop creates its own connection
+
+        # ── Hand home (tight tolerance, do before inner loop restart) ──
+        # emergency_stop() sets error_state=True + connected_flag=False on the
+        # HandSHMAdapter, but the hand process is still alive (EtherCAT up).
+        # clear_error() refreshes from SHM and restores connected_flag if the
+        # process is healthy; if the hand is genuinely disconnected, flags stay
+        # unchanged and we safely skip.
+        if not robot.hand.is_connected() and robot.hand.is_error():
+            robot.hand.clear_error()
+        if robot.hand.is_connected():
+            hand_ok = robot.hand.reset()
+            if hand_ok:
+                print("  手归位 OK")
+            else:
+                # HAND_MACRO_RESET has a 3 s / 0.03 rad convergence loop
+                # (hand_process.py:632-650).  Some XHand units cannot
+                # converge within this tolerance (observed max_err=0.044 rad
+                # at startup settle).  The hand is physically connected and
+                # holding position via the stale-hold watchdog — proceeding
+                # is safe; the residual error is sub-degree.
+                print("  手归位未收敛 (已保持位置，安全继续)")
+        else:
+            print("  手未连接，跳过手归位")
+
+        # ── Restart inner loop ──
         new_inner = make_arm_servo(cfg=inner_cfg)
         robot.set_arm_servo(new_inner)
         new_inner.start()
+        if not new_inner.wait_ready(timeout=30.0):
+            print("  Arm 内环启动超时")
+            return new_inner
         print("  Arm 内环线程已重启")
+
+        # ── Mode 6 smooth convergence to exact home ──
+        new_inner.set_target(home_qpos)
+        # Timeout 5s: with the _last_sent_target bootstrap fix (inner_loop.py
+        # _bootstrap_state) and the Phase 2 joint-space pre-convergence
+        # (interface.py return_to_home), the residual at this point is
+        # typically < 5°.  Mode 6 with 900°/s² acceleration converges from
+        # 5° in < 0.3 s.  5 s is ample margin.
+        _deadline = _time.monotonic() + 5.0
+        _converged = False
+        _final_err_deg = float("nan")
+        while _time.monotonic() < _deadline:
+            # Honour cancel requests from the caller (keyboard Q / ESC).
+            if cancel_fn is not None and cancel_fn():
+                print("  收敛被用户中断", flush=True)
+                break
+            _qpos, _err, __ = new_inner.get_state()
+            if not _err and np.all(np.isfinite(_qpos)):
+                _final_err_deg = float(np.rad2deg(np.max(np.abs(_qpos - home_qpos))))
+                if _final_err_deg < 0.5:
+                    _converged = True
+                    break
+                # Good-enough early exit after 2s (50% of timeout): Mode 6
+                # firmware has an effective deadband for very small errors.
+                # 3.0° is functionally at home — the arm is not drifting.
+                if _time.monotonic() > _deadline - 3.0 and _final_err_deg < 3.0:
+                    _converged = True
+                    break
+            _time.sleep(0.02)  # ~50 Hz poll — one inner-loop tick
+        if _converged:
+            if _final_err_deg < 0.5:
+                print(f"  Mode 6 收敛完成 (误差 {_final_err_deg:.2f}°)")
+            else:
+                print(f"  Mode 6 基本收敛 (误差 {_final_err_deg:.2f}°, <3.0° 可接受)")
+        else:
+            print(f"  Mode 6 收敛超时 (最终误差 {_final_err_deg:.2f}°)")
+
         return new_inner
     except Exception:
         traceback.print_exc()

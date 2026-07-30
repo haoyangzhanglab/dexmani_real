@@ -557,8 +557,6 @@ def validate_path_collisions(planner: XArm7MotionPlanner, qpos_path: np.ndarray)
         q_7 = np.asarray(q, dtype=np.float64).ravel()[:7]
         if profile.check_self_collision and planner.has_self_collision(q_7):
             errors.append(f"waypoint {i}: self-collision")
-        if profile.check_env_collision and planner.has_env_collision(q_7):
-            errors.append(f"waypoint {i}: env-collision")
         checked += 1
     return {"ok": len(errors) == 0, "errors": errors, "checked": checked}
 

@@ -369,13 +369,13 @@ class CameraRingBuffer:
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
         # ── Seqlock write protocol: odd→data→even ──
-        # Write an odd marker before the payload so concurrent readers see
-        # "writer active" and bail out rather than consuming torn data.
+        # Write an odd marker BEFORE the payload (including timestamp) so
+        # concurrent readers see "writer active" and bail out.
         ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
         )
+        ts_arr[1] = np.uint64(seqlock_odd(seq))  # odd: writer active — MUST be first
         ts_arr[0] = np.uint64(now_ns)
-        ts_arr[1] = np.uint64(seqlock_odd(seq))  # odd: writer active
 
         # Write camera header (64 bytes)
         header_offset = slot_base + 16

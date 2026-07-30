@@ -38,7 +38,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.collision_config import CollisionConfig
+
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
 from dexmani_real.teleop.control.keyboard import GlobalKeyState
@@ -91,9 +91,6 @@ WORKSPACE_BOUNDS = np.array(
     dtype=np.float64,
 )
 
-COLLISION_CONFIG = CollisionConfig(
-    table_z_world=0.0,
-)
 
 # ═══════════════════════════════════════════════ 姿态工具
 
@@ -188,13 +185,12 @@ def main():
                 p=np.array([0.0, 0.0, 0.0]),
                 q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
             ),
-            collision=COLLISION_CONFIG,
+
         ),
         planning_profile=PlanningProfile(
             max_waypoint_delta_deg=360.0,
         ),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
@@ -204,7 +200,7 @@ def main():
     robot = RobotInterface(
         RobotInterfaceConfig(
             arm=arm_config,
-            collision=COLLISION_CONFIG,
+
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
         ),
         kinematics=planner.kin,
@@ -375,7 +371,7 @@ def main():
             error_count = 0
 
             # ── Safety: arm error ──
-            if robot.arm.is_error():
+            if robot.arm.is_connected() and robot.arm.is_error():
                 arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
                 sdk_code = robot.arm.last_sdk_error_code
 

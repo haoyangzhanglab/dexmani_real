@@ -43,7 +43,7 @@ from scipy.spatial.transform import Rotation
 from dexmani_real import ASSET_DIR
 from dexmani_real.sensor.camera_process import create_camera_session
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.collision_config import CollisionConfig
+
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
@@ -85,9 +85,6 @@ WORKSPACE_BOUNDS = np.array(
     dtype=np.float64,
 )
 
-COLLISION_CONFIG = CollisionConfig(
-    table_z_world=0.0,
-)
 
 # VR wrist → EEF 映射参数
 VR_POS_SCALE = 1.0  # 位置缩放 (1.0 = 1:1)
@@ -163,11 +160,10 @@ def main():
                 p=np.array([0.0, 0.0, 0.0]),
                 q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
             ),
-            collision=COLLISION_CONFIG,
+
         ),
         planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             # 1°/frame @50Hz — 换算保持 °/s 不变
@@ -179,7 +175,7 @@ def main():
     robot = RobotInterface(
         RobotInterfaceConfig(
             arm=arm_config,
-            collision=COLLISION_CONFIG,
+
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
         ),
         kinematics=planner.kin,
@@ -257,8 +253,9 @@ def main():
     )
 
     # ── 7. Recorder ──
+    _repo_root = Path(__file__).resolve().parents[2]
     recorder = EpisodeRecorder(
-        data_dir="episodes_arm",
+        data_dir=str(_repo_root / "episodes_arm"),
         max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
@@ -329,6 +326,7 @@ def main():
     running = True
     teleop_active = False
     recording_active = False
+    recording_paused = False  # C 暂停时置 True，暂停期间不写 held 帧
     loop_count = 0
     error_count = 0
     max_consecutive_errors = 10
@@ -373,6 +371,11 @@ def main():
 
     # ── Camera (RealSense, 独立进程, 共享内存零拷贝, 可降级) ──
     # (已提早到 8b, VR 等待之前启动)
+
+    # Cancel function for do_return_home's convergence loop.
+    def _return_home_cancel_fn() -> bool:
+        sigs = kb.poll(timeout=0.0)
+        return any(s in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP) for s in sigs)
 
     try:
         while running:
@@ -424,7 +427,7 @@ def main():
                             continue
 
                     _stop_recording(save=True, triggered_by=ControlSignal.HOME)
-                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
                     teleop_active = False
                     arm_mapper.clear()
                     if arm_inner.wait_ready(timeout=30.0):
@@ -457,8 +460,9 @@ def main():
 
                 elif sig == ControlSignal.PAUSE:
                     teleop_active = not teleop_active
+                    recording_paused = not teleop_active  # 同步暂停/恢复录制
                     state_str = "暂停" if not teleop_active else "恢复"
-                    print(f"\nC: {state_str}遥操作 (录制{'继续' if recording_active else '已停止'})")
+                    print(f"\nC: {state_str}遥操作 (录制{'暂停' if recording_paused else '继续'})")
                     if teleop_active:
                         # 恢复时重新建立 wrist→EEF 映射，避免跳跃
                         frame = vr_receiver.read_latest()
@@ -539,6 +543,7 @@ def main():
                         eef_quat_wxyz=state.eef_quat_wxyz,
                     )
                     teleop_active = True
+                    recording_paused = False
                     error_count = 0
                     gc.disable()  # 禁用自动 GC，避免 30Hz 热路径上触发 full GC 暂停
                     print(f"\nB: 遥操作+录制开始 (wrist→EEF 映射已记录)  episode={recorder.frame_count}")
@@ -575,7 +580,7 @@ def main():
             stage_timer.mark("state")
 
             # ── Arm error check ──
-            if robot.arm.is_error():
+            if robot.arm.is_connected() and robot.arm.is_error():
                 arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
                 sdk_code = robot.arm.last_sdk_error_code
 
@@ -679,7 +684,7 @@ def main():
                         print("  ⚠ VR 帧过期，保持当前位置")
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None  # 重置笛卡尔 EMA, 恢复时无跳变
-                if recording_active:
+                if recording_active and not recording_paused:
                     record_held_frame(recorder, state, prev_qpos_cmd.copy(), vr_frame, cam, ik_ok=False, hold_hand=prev_hand_qpos.copy())
                 continue
 
@@ -817,7 +822,7 @@ def main():
             post_sigs = {s for s in kb.poll(timeout=0.1)}
             if ControlSignal.HOME in post_sigs:
                 try:
-                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")

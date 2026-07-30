@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
 from dexmani_real.utils.serialization import FromDictMixin
-
-if TYPE_CHECKING:
-    from .collision_config import CollisionConfig
-
 
 @dataclass(frozen=True, slots=True)
 class CollisionPair:
@@ -158,9 +154,6 @@ class XArm7PlannerConfig:
     # default. These are independent config paths — keep them in sync when tuning workspace.
     workspace_bounds: np.ndarray | None = None
 
-    # Unified collision configuration (FCL table obstacle, tier margins).
-    # None disables environment collision detection (backward compatible).
-    collision: CollisionConfig | None = None
 
 
 @dataclass(kw_only=True)
@@ -175,8 +168,8 @@ class PlanningProfile(FromDictMixin):
     max_pose_error_rot_rad: float = 0.05
 
     rrt_time_limit: float = 2.0
-    rrt_range_options: tuple[float, ...] = (0.05, 0.08, 0.12)
-    num_rrt_attempts: int = 4
+    rrt_range_options: tuple[float, ...] = (0.05, 0.12)
+    num_rrt_attempts: int = 2
     simplify_path: bool = True
     screw_qpos_step: float = 0.02
 
@@ -186,7 +179,6 @@ class PlanningProfile(FromDictMixin):
     n_init_qpos: int = 3
     random_seed: int | None = None
     check_self_collision: bool = True
-    check_env_collision: bool = True
 
     neutral_qpos: np.ndarray | None = None
     ik_score_manipulability_weight: float = 1.0
@@ -206,15 +198,12 @@ class TeleopProfile(FromDictMixin):
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
-    check_env_collision: bool = True  # env (table/obstacle) collision gate; holds on contact
 
     # Fast-accept threshold for position IK fallback (ref: ssik seed_tolerance).
     # A candidate is accepted immediately without trying additional seeds when
     # max single-joint delta from current hardware position is below this value.
     # 15° default: accept quickly if the solution is close to where we already are.
     position_ik_fast_accept_rad: float = np.deg2rad(15.0)
-
-    use_position_ik: bool = True
 
     # ── Multi-candidate scoring (Phase 2, dexterous manipulation) ──
     # When the fast-accept path (prev_cmd seed within 15°) doesn't trigger,

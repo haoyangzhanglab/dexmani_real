@@ -45,7 +45,6 @@ import sys
 import termios
 import threading
 import time
-import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -59,7 +58,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real import ASSET_DIR, PACKAGE_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.robot.inner_loop import ArmInnerLoop
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
+from dexmani_real.robot.arm_process import do_return_home, make_arm_servo
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
@@ -578,34 +578,6 @@ def save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) 
 # ═══════════════════════════════════════════════ 主程序
 
 
-def do_return_home(
-    robot: RobotInterface,
-    arm_inner: ArmInnerLoop,
-) -> ArmInnerLoop:
-    """执行 return_home（停止内环线程 → 归位 → 重启内环线程）。返回新的内环实例。"""
-    print("\nR: return_home ...", flush=True)
-    try:
-        # 停止内环，避免与 return_to_home 双重 XArmAPI 连接
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        print("  Arm 内环线程已停止")
-
-        ok = robot.return_to_home(home_dt=HOME_DT)
-        print(f"  {'OK' if ok else 'FAIL'}")
-
-        new_inner = ArmInnerLoop()
-        new_inner.start()
-        print("  Arm 内环线程已重启")
-        return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home 异常，尝试 emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
-
-
 def main():
     print("=" * 60)
     print("  ArUco 手眼标定 — xArm7 + RealSense (eye-to-hand)")
@@ -634,7 +606,6 @@ def main():
         ),
         planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
@@ -654,7 +625,9 @@ def main():
     print("  ✓ arm 已连接")
 
     # ── 2. 启动 ArmInnerLoop ──
-    arm_inner = ArmInnerLoop()
+    inner_cfg = ArmInnerLoopConfig()
+    arm_inner = make_arm_servo(cfg=inner_cfg)
+    robot.set_arm_servo(arm_inner)
     arm_inner.start()
     if not arm_inner.wait_ready(timeout=30.0):
         print("❌ Arm 内环线程启动超时")
@@ -907,7 +880,7 @@ def main():
 
             # ── R: 归位 ──
             if keys.is_pressed("r"):
-                arm_inner = do_return_home(robot, arm_inner)
+                arm_inner = do_return_home(robot, arm_inner, inner_cfg, home_dt=HOME_DT)
                 if arm_inner.wait_ready(timeout=30.0):
                     arm_qpos, error_state, _ = arm_inner.get_state()
                     if not error_state and np.all(np.isfinite(arm_qpos)):

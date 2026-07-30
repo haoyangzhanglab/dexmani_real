@@ -16,7 +16,6 @@ except ImportError:
     xhc = None  # type: ignore[assignment]
     _SDK_AVAILABLE = False
 
-from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.robot.xhand.motor_trajectory_interpolator import MotorTrajectoryInterpolator
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
@@ -52,9 +51,12 @@ class XHandConfig(FromDictMixin):
     baudrate: int = 3_000_000
     device_id: int = 0
 
-    # Connection retry (single attempt — C++ SDK already retries internally;
-    # extra Python-level retries only multiply the "No socket connection" noise)
-    open_serial_retries: int = 1
+    # Connection retry.  The C++ SDK retries some internal steps, but SDO
+    # configuration writes (e.g. "write sdo failed 1,0,13") are surfaced as
+    # hard failures from open_ethercat() without SDK-level retry.  A fresh
+    # XHandControl + re-open_ethercat() resolves most transient SDO glitches,
+    # so we retry at the Python level (matching the arm's 3-attempt pattern).
+    open_serial_retries: int = 3
     open_serial_retry_delay_s: float = 2.0
 
     dt: float = 1.0 / 30.0  # 30 Hz (ref: LeFranX, DexUMI)
@@ -169,9 +171,12 @@ class XHandConfig(FromDictMixin):
     tactile_contact_threshold: float = 1.0
 
 
-class XHand(ConnectionStateMixin):
+class XHand:
     def __init__(self, config: XHandConfig):
-        super().__init__()
+        self.connected_flag: bool = False
+        self.error_state: bool = False
+        self.last_error_message: str = ""
+        self.last_action_code: int | None = None
         self.config = config
         self.control: Any = None
         self.device_name: str | None = None
@@ -253,10 +258,26 @@ class XHand(ConnectionStateMixin):
 
         RS485 may need several attempts after cold start (C++ SDK retries
         internally, but may still fail intermittently).
+
+        Enumeration and open use SEPARATE XHandControl instances.  The
+        enumeration pass opens raw sockets on every interface to scan for
+        slaves; those sockets must be fully released before open_ethercat
+        creates its own socket on the target interface.  Reusing the same
+        control instance can leave duplicate raw sockets on the same
+        interface, causing SDO responses to route to the stale socket while
+        the open path waits on the new one — producing "write sdo failed"
+        errors observed in forked child processes.
         """
-        self.control = xhc.XHandControl()
+        # ── Phase 1: device discovery (temporary control, closed after) ──
         if self.config.device_name is None:
-            devices = self.control.enumerate_devices(comm_type)
+            temp_control = xhc.XHandControl()
+            try:
+                devices = temp_control.enumerate_devices(comm_type)
+            finally:
+                try:
+                    temp_control.close_device()
+                except (OSError, RuntimeError):
+                    pass
             if devices is None or len(devices) == 0:
                 self.error_state = True
                 self.last_error_code = -2
@@ -267,10 +288,12 @@ class XHand(ConnectionStateMixin):
         else:
             self.device_name = self.config.device_name
 
+        # ── Phase 2: open on a FRESH control (never reuse the enumerate control) ──
         retries = max(1, int(self.config.open_serial_retries))
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
         for attempt in range(1, retries + 1):
+            self.control = xhc.XHandControl()
             if comm_type == "RS485":
                 err = self.control.open_serial(self.device_name, int(self.config.baudrate))
             elif comm_type == "EtherCAT":
@@ -285,6 +308,11 @@ class XHand(ConnectionStateMixin):
                 return True
 
             self._record_error(err)
+            # Close the failed control before retry
+            try:
+                self.control.close_device()
+            except (OSError, RuntimeError):
+                pass
             if attempt < retries:
                 logger.warning(
                     "XHand connect attempt %s/%s failed: %s, retrying in %.1fs...",
@@ -293,19 +321,9 @@ class XHand(ConnectionStateMixin):
                     self.last_error_message,
                     delay,
                 )
-                # Close and recreate control for clean retry
-                try:
-                    self.control.close_device()
-                except (OSError, RuntimeError):
-                    pass
-                self.control = xhc.XHandControl()
                 time.sleep(delay)
 
-        # All retries exhausted — close the last failed device handle
-        try:
-            self.control.close_device()
-        except (OSError, RuntimeError):
-            pass
+        # All retries exhausted
         self.error_state = True
         logger.error(
             "XHand connect failed after %s attempts: %s",
@@ -536,14 +554,10 @@ class XHand(ConnectionStateMixin):
 
         if not self.error_ok(err) or hand_state is None:
             self._record_error(err)
-            state = {
+            state: dict[str, Any] = {
                 "qpos": nan_array(12),
                 "current": nan_array(12),
                 "timestamp": time.time(),
-                "tactile_force": np.zeros((5, 120, 3), dtype=np.float64),
-                "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
-                "tactile_contact": np.zeros(5, dtype=bool),
-                "tipboard_err": np.zeros(12, dtype=np.int32),
             }
             if full:
                 state.update(self._empty_state())
@@ -574,6 +588,9 @@ class XHand(ConnectionStateMixin):
             return True
 
         if self.control is None or self.hand_command is None:
+            if self.hand_command is None:
+                self.error_state = True
+                self.last_error_message = "hand_command is None (not initialized)"
             return False
 
         target_qpos = self._array12(action)
@@ -629,7 +646,7 @@ class XHand(ConnectionStateMixin):
         """
         thresh = threshold if threshold is not None else self.config.tactile_contact_threshold
         if force_sum is None:
-            state = self.get_state(full=True)
+            state = self.get_state(full=False)
             force_sum = np.asarray(state.get("tactile_force_sum", np.zeros((5, 3))))
         norm = np.linalg.norm(force_sum, axis=1)  # (5,) L2 per finger
         return norm > thresh

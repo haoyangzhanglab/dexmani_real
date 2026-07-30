@@ -66,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.recording.episode_reader import EpisodeReader
-from dexmani_real.planning.collision_config import CollisionConfig
+
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
@@ -86,10 +86,6 @@ logger = get_logger(__name__)
 HOME_DT = 0.04  # homing waypoint interval (s)
 
 WORKSPACE_BOUNDS = np.array([[0.28, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np.float64)
-
-COLLISION_CONFIG = CollisionConfig(
-    table_z_world=0.0,
-)
 
 ARM_MAX_SPEED_DEG_S = 120.0  # 对齐采集入口 (vr_teleop_arm_only_record*.py) — 回放与采集同速
 ARM_MAX_ACC_DEG_S2 = 500.0  # 回放默认加速度: 保守值(避免回放超速); 用 --acc 覆盖匹配采集条件
@@ -313,12 +309,11 @@ class ReplayRecorder:
         self.flag_safety_reject = np.zeros(max_frames, dtype=bool)
         self.safety_reject_reason: list[str | None] = [None] * max_frames
 
+        self.hand_qpos: np.ndarray | None = None
+        self.hand_cmd: np.ndarray | None = None
         if has_hand:
             self.hand_qpos = np.full((max_frames, 12), np.nan, dtype=np.float64)
             self.hand_cmd = np.full((max_frames, 12), np.nan, dtype=np.float64)
-        else:
-            self.hand_qpos = None
-            self.hand_cmd = None
 
     def record(
         self,
@@ -637,7 +632,7 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
             "p95_deg": round(metrics.arm_tracking_error_p95_deg, 2),
             "max_deg": round(metrics.arm_tracking_error_max_deg, 2),
         }
-    if metrics.hand_joint_mae_overall_deg is not None:
+    if metrics.hand_joint_mae_overall_deg is not None and metrics.hand_joint_rmse_overall_deg is not None:
         metrics_dict["hand_joint"] = {
             "mae_overall_deg": round(metrics.hand_joint_mae_overall_deg, 4),
             "rmse_overall_deg": round(metrics.hand_joint_rmse_overall_deg, 4),
@@ -669,11 +664,9 @@ def _make_planner(arm_ip: str) -> XArm7MotionPlanner:
                 p=np.array([0.0, 0.0, 0.0]),
                 q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
             ),
-            collision=COLLISION_CONFIG,
         ),
         planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
@@ -688,7 +681,6 @@ def _make_robot(
     return RobotInterface(
         RobotInterfaceConfig(
             arm=arm_cfg,
-            collision=COLLISION_CONFIG,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
         ),
         kinematics=planner.kin,
@@ -921,6 +913,29 @@ class TrajectoryReplayer:
             final_dev = np.rad2deg(np.max(np.abs(arm_qpos - first_cmd)))
             print(f"Approach complete. Remaining deviation: {final_dev:.2f}°")
 
+            # ── Joint-space fallback ──
+            # plan_path's "hold" fast path returns 1 waypoint (current qpos) when
+            # EEF is already close — but the arm may be at a different IK solution
+            # with the same EEF pose, leaving a large joint-space gap.  Mode 6 would
+            # close it on frame 1, but at the cost of high initial tracking error.
+            # Interpolate directly in joint space instead (~5°/step; inner loop
+            # delta clamp provides a hard ceiling).
+            if final_dev > self.JOINT_ALIGN_MAX_DEG:
+                n_steps = max(1, int(np.ceil(final_dev / 5.0)))
+                print(f"Joint-space interpolation: {n_steps} step(s) ...")
+                for alpha in np.linspace(0, 1, n_steps + 1)[1:]:
+                    self._arm_inner.set_target(arm_qpos + alpha * (first_cmd - arm_qpos))
+                    time.sleep(HOME_DT)
+                time.sleep(0.1)  # settle
+
+                arm_qpos, error_state, _ = self._arm_inner.get_state()
+                if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
+                    assert self.robot is not None
+                    arm_qpos = self.robot.get_state().arm_qpos
+                if arm_qpos is not None and np.all(np.isfinite(arm_qpos)):
+                    final_dev = np.rad2deg(np.max(np.abs(arm_qpos - first_cmd)))
+                    print(f"Joint-space approach done. Remaining deviation: {final_dev:.2f}°")
+
         return arm_qpos
 
     # ── Run ──
@@ -1046,7 +1061,7 @@ class TrajectoryReplayer:
                     continue
 
                 # ── Robot error check ──
-                if self.robot.arm.is_error():
+                if self.robot.arm.is_connected() and self.robot.arm.is_error():
                     arm_code = self.robot.arm.arm.error_code if self.robot.arm.arm else 0
                     sdk_code = self.robot.arm.last_sdk_error_code
                     if arm_code == 22 or sdk_code == 22:

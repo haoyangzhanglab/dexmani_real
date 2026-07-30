@@ -18,7 +18,6 @@ from typing import Any
 import numpy as np
 from xarm.wrapper import XArmAPI
 
-from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.robot.xarm7.error_codes import decode_error
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
@@ -30,7 +29,7 @@ logger = get_logger(__name__)
 # software clip must sit STRICTLY INSIDE it so boundary-pinned commands (e.g.
 # EEF dragged past a workspace edge) never trip a reduced-mode fault.
 _FIRMWARE_LIMIT_MARGIN_RAD = np.deg2rad(2.0)
-_SOFT_LIMIT_MARGIN_RAD = np.deg2rad(2.5)
+_SOFT_LIMIT_MARGIN_RAD = _FIRMWARE_LIMIT_MARGIN_RAD + np.deg2rad(0.5)
 
 
 def _inset_joint_limits(q_min: np.ndarray, q_max: np.ndarray, margin: float) -> tuple[np.ndarray, np.ndarray]:
@@ -69,7 +68,7 @@ class XArm7Config(FromDictMixin):
     tcp_load_cog_mm: list[float] = field(default_factory=lambda: [0.0, 0.0, 80.0])
 
 
-class XArm7(ConnectionStateMixin):
+class XArm7:
     """Thin xArm7 hardware wrapper — blocking moves only (reset, home).
 
     Velocity PID control is owned by ArmInnerLoop in a separate process.
@@ -78,9 +77,12 @@ class XArm7(ConnectionStateMixin):
     """
 
     def __init__(self, config: XArm7Config):
-        super().__init__()
         self.config = config
         self.arm: Any = None
+        self.connected_flag: bool = False
+        self.error_state: bool = False
+        self.last_error_message: str = ""
+        self.last_action_code: int | None = None
 
         # Software clip limits — strictly inside the firmware reduced range
         # (see _inset_joint_limits) so clipped commands never violate it.
@@ -90,7 +92,6 @@ class XArm7(ConnectionStateMixin):
 
         self.last_sdk_error_code: int = 0
         self.last_qpos_cmd: np.ndarray | None = None
-        self.last_cmd_time: float | None = None
         self.last_joint_limit_clipped = False
 
     def connect(self) -> bool:
@@ -114,8 +115,6 @@ class XArm7(ConnectionStateMixin):
             self.last_qpos_cmd = state["qpos"].copy()
         else:
             self.last_qpos_cmd = self.config.init_qpos.copy()
-        self.last_cmd_time = time.time()
-
         if not self.error_state:
             self.connected_flag = True
         else:
@@ -157,7 +156,7 @@ class XArm7(ConnectionStateMixin):
         re-arms it.  Collision sensitivity / TCP load are NOT reset — they persist
         across error clears.
         """
-        if self.arm is None:
+        if self.arm is None or not self.connected_flag:
             return False
         self.arm.clean_error()
         self.arm.clean_warn()
@@ -175,13 +174,13 @@ class XArm7(ConnectionStateMixin):
         return True
 
     def stop(self) -> bool:
-        if self.arm is None:
+        if self.arm is None or not self.connected_flag:
             return False
         code = self.arm.set_state(4)
         self.error_state = True
         return code == 0
 
-    def get_state(self, full: bool = False) -> dict[str, Any]:
+    def get_state(self) -> dict[str, Any]:
         code, states = self.arm.get_joint_states(is_radian=True, num=3)
         if code == 0:
             qpos = self._array7(states[0])
@@ -192,39 +191,12 @@ class XArm7(ConnectionStateMixin):
             qvel = nan_array(7)
             tau = nan_array(7)
 
-        state: dict[str, Any] = {
+        return {
             "qpos": qpos,
             "qvel": qvel,
             "tau": tau,
             "timestamp": time.time(),
         }
-
-        if full:
-            state.update(
-                {
-                    "mode": self.arm.mode,
-                    "state": self.arm.state,
-                    "connected": self.arm.connected,
-                    "error_code": self.arm.error_code,
-                    "warn_code": self.arm.warn_code,
-                    "cartesian_position": self.get_position(),
-                    "cartesian_position_aa": self.get_position_aa(),
-                    "cmd_num": self.arm.cmd_num,
-                    "servo_codes": getattr(self.arm, "servo_codes", None),
-                    "temperatures": self._array7(getattr(self.arm, "temperatures", None)),
-                    "currents": self._array7(getattr(self.arm, "currents", None)),
-                    "voltages": self._array7(getattr(self.arm, "voltages", None)),
-                    "motor_enable_states": self._array7(getattr(self.arm, "motor_enable_states", None)),
-                    "motor_brake_states": self._array7(getattr(self.arm, "motor_brake_states", None)),
-                    "connected_flag": self.connected_flag,
-                    "error_state": self.error_state,
-                    "last_error_message": self.last_error_message,
-                    "last_action_code": self.last_action_code,
-                    "last_sdk_error_code": self.last_sdk_error_code,
-                    "last_joint_limit_clipped": self.last_joint_limit_clipped,
-                }
-            )
-        return state
 
     def send_action(self, action: np.ndarray) -> bool:
         """Send joint position command for blocking moves (reset).
@@ -260,7 +232,6 @@ class XArm7(ConnectionStateMixin):
 
         if code == 0:
             self.last_qpos_cmd = target_qpos.copy()
-            self.last_cmd_time = time.time()
             return True
 
         try:
@@ -291,27 +262,8 @@ class XArm7(ConnectionStateMixin):
             self.last_qpos_cmd = state["qpos"].copy()
         else:
             self.last_qpos_cmd = qpos.copy()
-        self.last_cmd_time = time.time()
         self.last_action_code = code
         return code == 0
-
-    # ── Cartesian pose queries ──
-
-    def get_position(self) -> np.ndarray:
-        if self.arm is None:
-            return nan_array(6)
-        code, pos = self.arm.get_position(is_radian=True)
-        if code != 0:
-            return nan_array(6)
-        return np.asarray(pos, dtype=np.float64)
-
-    def get_position_aa(self) -> np.ndarray:
-        if self.arm is None:
-            return nan_array(6)
-        code, pos = self.arm.get_position_aa(is_radian=True)
-        if code != 0:
-            return nan_array(6)
-        return np.asarray(pos, dtype=np.float64)
 
     # ── Init ──
 

@@ -45,7 +45,7 @@ from scipy.spatial.transform import Rotation
 from dexmani_real import ASSET_DIR
 from dexmani_real.sensor.camera_process import create_camera_session
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.collision_config import CollisionConfig
+
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, wxyz_to_xyzw
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
@@ -84,10 +84,6 @@ WORKSPACE_BOUNDS = np.array(
         [0.05, 0.5],  # z [min, max] m
     ],
     dtype=np.float64,
-)
-
-COLLISION_CONFIG = CollisionConfig(
-    table_z_world=0.0,
 )
 
 # VR wrist → EEF 映射参数
@@ -276,11 +272,9 @@ def main():
                 p=np.array([0.0, 0.0, 0.0]),
                 q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
             ),
-            collision=COLLISION_CONFIG,
         ),
         planning_profile=PlanningProfile(),
         teleop_profile=TeleopProfile(
-            use_position_ik=True,
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
             # 1°/frame @50Hz — 换算保持 °/s 不变
@@ -292,7 +286,6 @@ def main():
     robot = RobotInterface(
         RobotInterfaceConfig(
             arm=arm_config,
-            collision=COLLISION_CONFIG,
             hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
         ),
         kinematics=planner.kin,
@@ -395,8 +388,11 @@ def main():
     )
 
     # ── 7. Recorder ──
+    # Resolve data_dir relative to repo root (not CWD) so episodes always land
+    # under the repository regardless of where the script was launched from.
+    _repo_root = Path(__file__).resolve().parents[2]
     recorder = EpisodeRecorder(
-        data_dir="episodes",
+        data_dir=str(_repo_root / "episodes"),
         max_frames=int(round(60.0 * CTRL_HZ)),  # 60s 上限
         control_hz=CTRL_HZ,
         min_frames=int(round(1.0 * CTRL_HZ)),  # ≥1s 才算有效 episode
@@ -468,6 +464,7 @@ def main():
     running = True
     teleop_active = False
     recording_active = False
+    recording_paused = False  # C 暂停时置 True，暂停期间不写 held 帧
     teleop_hold_for_audio = False  # B 按下后等待 begin 音频播完才允许运动
     loop_count = 0
     error_count = 0
@@ -477,6 +474,7 @@ def main():
     prev_eef_pos: np.ndarray | None = None
     ik_method = "-"
     _last_vr_wrist_quat: np.ndarray | None = None  # VR quat continuity tracking
+    _vr_raw_printed = False  # suppress [VR raw] after first status tick
 
     def _stop_recording(save: bool, *, triggered_by: ControlSignal | None = None):
         """停止录制. save=True 保存, save=False 丢弃.
@@ -525,6 +523,16 @@ def main():
         }
         diag.update(extra)
         return diag
+
+    # Cancel function for do_return_home's convergence loop.
+    # Drains the keyboard buffer without blocking; returns True when
+    # QUIT or EMERGENCY_STOP is pending so do_return_home can abort
+    # its convergence wait early.  Non-cancel signals (B/C/D/S/H) are
+    # silently consumed — the user can re-press after return_home
+    # completes (these keys are meaningless during homing anyway).
+    def _return_home_cancel_fn() -> bool:
+        sigs = kb.poll(timeout=0.0)
+        return any(s in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP) for s in sigs)
 
     gc.disable()
     try:
@@ -606,7 +614,7 @@ def main():
 
                         if do_home and running:
                             audio.play("home")
-                            arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
+                            arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
                             teleop_active = False
                             arm_mapper.clear()
                             _reset_hand_retargeter()
@@ -652,7 +660,7 @@ def main():
                             continue
 
                     _stop_recording(save=True, triggered_by=ControlSignal.HOME)
-                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
                     teleop_active = False
                     arm_mapper.clear()
                     _reset_hand_retargeter()
@@ -699,8 +707,9 @@ def main():
 
                 elif sig == ControlSignal.PAUSE:
                     teleop_active = not teleop_active
+                    recording_paused = not teleop_active  # 同步暂停/恢复录制
                     state_str = "暂停" if not teleop_active else "恢复"
-                    print(f"\nC: {state_str}遥操作 (录制{'继续' if recording_active else '已停止'})")
+                    print(f"\nC: {state_str}遥操作 (录制{'暂停' if recording_paused else '继续'})")
                     if teleop_active:
                         audio.play("resume")
                         # 恢复时重新建立 wrist→EEF 映射，避免跳跃
@@ -791,6 +800,7 @@ def main():
                     _reset_hand_retargeter()
                     audio.play("calibrated")
                     teleop_active = True
+                    recording_paused = False
                     error_count = 0
                     # Seed continuity gate from B-press frame
                     _last_vr_wrist_quat = normalize_quat_wxyz(
@@ -840,7 +850,7 @@ def main():
             stage_timer.mark("state")
 
             # ── Arm error check ──
-            if robot.arm.is_error():
+            if robot.arm.is_connected() and robot.arm.is_error():
                 arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
                 sdk_code = robot.arm.last_sdk_error_code
 
@@ -926,7 +936,7 @@ def main():
                         flush=True,
                     )
 
-                if vr_frame is not None:
+                if vr_frame is not None and not _vr_raw_printed:
                     _wp = vr_frame["wrist_pos"]
                     _wq = vr_frame["wrist_quat_wxyz"]
                     _w_euler = np.rad2deg(Rotation.from_quat(wxyz_to_xyzw(_wq)).as_euler("xyz", degrees=False))
@@ -936,6 +946,7 @@ def main():
                         f"wrist_euler_xyz={np.round(_w_euler, 1)}°",
                         flush=True,
                     )
+                    _vr_raw_printed = True
             stage_timer.mark("print")
 
             # ── 非遥操作模式: 保持当前位置 ──
@@ -947,7 +958,7 @@ def main():
                         print("  ⚠ VR 帧过期，保持当前位置")
                 prev_qpos_cmd = state.arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None
-                if recording_active:
+                if recording_active and not recording_paused:
                     record_held_frame(
                         recorder,
                         state,
@@ -978,6 +989,15 @@ def main():
             if teleop_hold_for_audio:
                 if audio.is_playing:
                     prev_qpos_cmd = state.arm_qpos.copy()
+                    # Keep the hand cmd ring fresh during audio hold —
+                    # the hand child's cmd_stale_hold_s (500ms) fires
+                    # false-positive warnings if we stop sending entirely.
+                    # Match the pattern in the pause/VR-stale path (L969-973).
+                    if hand_available:
+                        robot.send_action(RobotAction(
+                            arm_qpos_cmd=prev_qpos_cmd.copy(),
+                            hand_qpos_cmd=prev_hand_cmd.copy(),
+                        ))
                     continue
                 ema_prev_pos = ema_prev_quat = None
                 teleop_hold_for_audio = False
@@ -1232,13 +1252,23 @@ def main():
         print("\n退出主循环")
 
         print("\n按 H 执行 return_home，或按 Q 直接退出...")
-        while True:
+        _post_deadline = time.perf_counter() + 60.0
+        while time.perf_counter() < _post_deadline:
             post_sigs = {s for s in kb.poll(timeout=0.1)}
             if ControlSignal.HOME in post_sigs:
+                # Early return: skip do_return_home if already at home
+                # (matches main-loop H handler guard at line 646-651).
+                if arm_inner.is_alive:
+                    _qpos, _err, __ = arm_inner.get_state()
+                    if _qpos is not None and not _err and np.all(np.isfinite(_qpos)):
+                        if np.max(np.abs(_qpos - home_qpos)) < np.deg2rad(2.0):
+                            print("  已在 home 位置，跳过归位")
+                            print("按 Q 退出...")
+                            continue
                 print("\nH: return_home")
                 audio.play("home")
                 try:
-                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG)
+                    arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")
@@ -1248,6 +1278,8 @@ def main():
                     arm_inner.emergency_stop()
                     robot.emergency_stop()
                 break
+        else:
+            print("\n  超时，自动退出")
 
         kb.stop()
 

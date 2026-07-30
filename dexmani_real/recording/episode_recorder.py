@@ -37,15 +37,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 8  # v8: +truncated/stop_reason meta; rgb/depth codec lzf; v7: rate-parameterized grid (control_hz meta attr; dt/fps derived, no 50Hz hardcode); camera streams grid-index-aligned; v5: /pointcloud (T,N,6) + has_pointcloud + pc_* meta
-SCHEMA_VERSION_ARM_SENT = 9  # v9: +/action_arm_joint_sent(T,7) opt-in stream (ctor flag arm_sent_stream=True)
-SCHEMA_VERSION_DIAGNOSTICS = 10  # v10: +diagnostics (tracking_error/ik_solve_time_ms/target_pos_before_clamp/head_quat_wxyz) + flag_safety_reject
 SCHEMA_VERSION_V11 = 11  # v11: +flag_ik_attempted +flag_frame_status (always recorded)
-
-
-def _compute_schema_version() -> int:
-    """Return the schema version — always v11 (frame_status fields are always recorded)."""
-    return SCHEMA_VERSION_V11
 
 
 # ── atexit safety net ──
@@ -113,8 +105,6 @@ class EpisodeRecorder:
         # pass the kwarg yet, so the flag alone is inert.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
-        # Track whether v10 diagnostics were recorded (for conditional schema_version).
-        self._diagnostics_recorded: bool = False
 
 
         self._file: Any = None  # h5py.File | None — data.h5 (non-camera + pointcloud)
@@ -389,6 +379,8 @@ class EpisodeRecorder:
             "hand_tactile_force": np.asarray(state.hand_tactile_force, dtype=np.float64),
             "hand_tactile_contact": np.asarray(state.hand_tactile_contact, dtype=bool),
             "hand_tipboard_err": np.asarray(state.hand_tipboard_err, dtype=np.int32),
+            "hand_commboard_err": np.asarray(state.hand_commboard_err, dtype=np.int32),
+            "hand_jointboard_err": np.asarray(state.hand_jointboard_err, dtype=np.int32),
             "hand_current": np.asarray(state.hand_current, dtype=np.float64) if state.hand_current is not None else np.full(12, np.nan),
             # ── Connection status ──
             # Distinguishes "physically disconnected (NaN qpos + connected=False)"
@@ -425,7 +417,6 @@ class EpisodeRecorder:
 
         # ── Diagnostics (v10): continuous telemetry — auto-discovered by _flush_buffered ──
         if diagnostics:
-            self._diagnostics_recorded = True
             for key, val in diagnostics.items():
                 data[key] = np.asarray(val, dtype=np.float64)
 
@@ -699,6 +690,9 @@ class EpisodeRecorder:
         if self._stop_error is not None:
             logger.error("episode-stop failed: %s", self._stop_error)
         self._stop_thread = None
+        self._stop_success = False
+        self._stop_path = None
+        self._stop_frame_count = 0
         return ok
 
     def poll_stop(self) -> StopResult:
@@ -715,7 +709,13 @@ class EpisodeRecorder:
         """
         t = self._stop_thread
         if t is None:
-            return StopResult(done=True)
+            return StopResult(
+                done=True,
+                error=self._stop_error,
+                success=self._stop_success,
+                path=self._stop_path,
+                frame_count=self._stop_frame_count,
+            )
         if t.is_alive():
             return StopResult(done=False)
         # Thread finished — harvest result and reset for the next stop.
@@ -768,18 +768,7 @@ class EpisodeRecorder:
             _tmp = self._temp_dir
             if _tmp is not None:
                 self._discard_temp_files(_tmp)
-            self._datasets.clear()
-            self._datasets_depth.clear()
-            self._recording = False
-            self._max_frames_reached = False
-            self._frame_count = 0
-            self._start_time = None
-            self._episode_dir = None
-            self._temp_dir = None
-            self._buffer = None
-            self._flushed_frames = 0
-            self._cam_frames = []
-            self._cam_grid_end = []
+            self._reset_episode_state()
 
     def _stop_episode_impl_inner(self, success: bool, reason: str, truncated: bool) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
@@ -813,7 +802,7 @@ class EpisodeRecorder:
         # ── Write final metadata ──
         if self._file is not None:
             meta = self._file["meta"]
-            meta.attrs["schema_version"] = _compute_schema_version()
+            meta.attrs["schema_version"] = SCHEMA_VERSION_V11
             meta.attrs["duration"] = duration
             meta.attrs["num_frames"] = self._frame_count
             meta.attrs["success"] = success
@@ -847,6 +836,10 @@ class EpisodeRecorder:
             else:
                 self._discard_temp_files(_tmp)
 
+        self._reset_episode_state()
+    def _reset_episode_state(self) -> None:
+        """Reset all mutable episode state to defaults (called from both the
+        success path and the crash-handler in _stop_episode_impl)."""
         self._datasets.clear()
         self._datasets_depth.clear()
         self._recording = False
@@ -859,24 +852,21 @@ class EpisodeRecorder:
         self._flushed_frames = 0
         self._cam_frames = []
         self._cam_grid_end = []
+
     # ── Atomic file finalisation ──────────────────────────────────────
 
     @staticmethod
     def _try_rename(src: str, dst: str) -> None:
-        """Rename *src* → *dst*; fall back to copy+unlink on cross-device error."""
+        """Rename *src* → *dst*; fall back to copy+remove on cross-device error."""
         try:
             os.rename(src, dst)
         except OSError:
-            shutil.copy2(src, dst)
-            os.unlink(src)
-
-    @staticmethod
-    def _try_unlink(path: str) -> None:
-        """Best-effort unlink — never raises."""
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+                shutil.rmtree(src)
+            else:
+                shutil.copy2(src, dst)
+                os.unlink(src)
 
     @classmethod
     def _discard_temp_files(cls, tmp: str) -> None:

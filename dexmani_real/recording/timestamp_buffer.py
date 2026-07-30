@@ -154,15 +154,25 @@ class TimestampAlignedBuffer:
         if len(global_idxs) == 0:
             return
 
-        # Check capacity
+        # Check capacity — truncate to valid slots if last index overflows.
         max_required = global_idxs[-1] + 1
         if max_required > self.max_record_steps:
+            # Keep only the indices that fit within the pre-allocated arrays.
+            keep = [i for i, g in enumerate(global_idxs) if g < self.max_record_steps]
+            if not keep:
+                self._recording_stopped = True
+                return
+            n_dropped = len(global_idxs) - len(keep)
+            global_idxs = [global_idxs[i] for i in keep]
+            max_required = global_idxs[-1] + 1
             logger.warning(
-                "TimestampAlignedBuffer: reached max_record_steps=%d — stopping",
+                "TimestampAlignedBuffer: reached max_record_steps=%d — "
+                "truncated %d/%d slots, stopping after this batch",
                 self.max_record_steps,
+                n_dropped,
+                n_dropped + len(keep),
             )
             self._recording_stopped = True
-            return
 
         # Lazy allocation on first call
         if self._data_buffer is None:

@@ -20,12 +20,6 @@ from dexmani_real.robot.xhand import XHandConfig
 _ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
 _ARM_TORQUE_LIMIT_NM.flags.writeable = False
 
-if TYPE_CHECKING:
-    from dexmani_real.planning.collision_config import CollisionConfig
-else:
-    CollisionConfig = None  # resolved lazily when needed
-
-
 def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
     """Validate ndarray field shapes for a dataclass instance.
 
@@ -73,6 +67,8 @@ class RobotState:
     hand_tactile_force: np.ndarray  # (5,120,3) float64  N — per-finger raw force array
     hand_tactile_contact: np.ndarray  # (5,) bool — per-finger contact detection (from detect_contact)
     hand_tipboard_err: np.ndarray  # (12,) int32 — tip board error registers per joint
+    hand_commboard_err: np.ndarray  # (12,) int32 — comm board error registers per joint
+    hand_jointboard_err: np.ndarray  # (12,) int32 — joint motor-driver board error registers per joint
 
     # ── Derived (chained FK) ──
     fingertip_pos: np.ndarray  # (5,3) float64  m (world frame)
@@ -101,6 +97,8 @@ class RobotState:
                 ("hand_tactile_force", (5, 120, 3)),
                 ("hand_tactile_contact", (5,)),
                 ("hand_tipboard_err", (12,)),
+                ("hand_commboard_err", (12,)),
+                ("hand_jointboard_err", (12,)),
                 ("fingertip_pos", (5, 3)),
             ],
         )
@@ -187,8 +185,5 @@ class RobotInterfaceConfig:
     T_eef_handbase_quat_wxyz: np.ndarray = field(
         default_factory=lambda: np.array([0.707107, 0.0, 0.707107, 0.0], dtype=np.float64)
     )
-
-    # Unified collision configuration.
-    collision: CollisionConfig | None = None
 
     # Both arm and hand run in crash-isolated subprocesses via SHM.

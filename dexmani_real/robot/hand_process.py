@@ -66,6 +66,10 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Throttled warning for board errors — fires at most once per 5 s so a
+# persistent hardware fault doesn't flood the log at 30 Hz.
+_board_err_warn = ThrottledWarner(interval_s=5.0)
+
 
 # ── hand macro RPC frames (plan §4.6) ──
 # RESET(qpos[12]) / STOP / CLEAR_ERROR / SEND_TRAJECTORY(waypoints[256,12],
@@ -104,6 +108,10 @@ _MACRO_MAXLEN = 2
 # child's safety-net clip are numerically identical (same np.clip), but
 # Plan §5.1: hand ready wait 15 s; failure → degraded mode (connected=False).
 _READY_TIMEOUT_S = 15.0
+# Hand joint settle parameters — shared by connection-time homing and the
+# HAND_MACRO_RESET RPC handler.
+_HAND_SETTLE_TIMEOUT_S = 5.0  # max time for 12-DOF hand to converge to target
+_HAND_SETTLE_TOL_RAD = 0.03   # ~1.7° — tight convergence
 # Watchdog: persistent send errors → reconnect.
 _WATCHDOG_RECONNECT_AFTER = 30
 
@@ -145,13 +153,11 @@ class HandControlProcess:
     def __init__(
         self,
         config: HandProcessConfig,
-        sync: Any,
         estop_event: Any,
         hand_config: "XHandConfig",
         hand_factory: Callable[[Any], Any] | None = None,
     ) -> None:
         self._config = config
-        self._sync = sync  # API symmetry with the arm process; unused by the hand child
         self._estop_event = estop_event
         self._hand_config = hand_config
         self._hand_factory = hand_factory
@@ -204,7 +210,6 @@ class HandControlProcess:
             daemon=self._config.daemon,
             args=(
                 self._config,
-                self._sync,
                 self._estop_event,
                 self._hand_config,
                 self._stop_event,
@@ -297,14 +302,13 @@ class HandSHMFaçade:
     def __init__(
         self,
         config: HandProcessConfig,
-        sync: Any,
         estop_event: Any,
         hand_config: "XHandConfig",
         hand_factory: Callable[[Any], Any] | None = None,
     ) -> None:
         self._config = config
         self._hand_config = hand_config
-        self._proc = HandControlProcess(config, sync, estop_event, hand_config, hand_factory)
+        self._proc = HandControlProcess(config, estop_event, hand_config, hand_factory)
         self._stale_warn = ThrottledWarner()
         self._last_good_state: np.ndarray | None = None
 
@@ -441,31 +445,9 @@ class HandSHMFaçade:
         """RESET macro — drive hand to ``qpos``."""
         return self.rpc(HAND_MACRO_RESET, qpos=qpos)
 
-    def stop_rpc(self) -> np.ndarray:
-        """STOP macro — the deliberate detorque (mirrors RobotInterface.stop).
-
-        Named ``stop_rpc`` because ``stop(timeout)`` is the lifecycle method
-        (same precedent as ArmSHMFaçade.emergency_stop_rpc).
-        """
-        return self.rpc(HAND_MACRO_STOP)
-
     def clear_error(self) -> np.ndarray:
         """CLEAR_ERROR macro."""
         return self.rpc(HAND_MACRO_CLEAR_ERROR)
-
-    def send_trajectory(
-        self,
-        waypoints: np.ndarray,
-        duration_s: float,
-        max_speed: float | None = None,
-    ) -> np.ndarray:
-        """SEND_TRAJECTORY macro — interpolated child-side (MotorTrajectoryInterpolator)."""
-        return self.rpc(
-            HAND_MACRO_SEND_TRAJECTORY,
-            waypoints=waypoints,
-            duration_s=duration_s,
-            max_speed=max_speed,
-        )
 
 
 # ----------------------------------------------------------------------
@@ -476,7 +458,7 @@ class HandSHMFaçade:
 def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuffer, last_cmd_seq: int) -> None:
     """Publish one HAND_STATE frame: state + tactile + echo (child-side)."""
     try:
-        st = hand.get_state(full=True, force_update=True)
+        st = hand.get_state(full=False, force_update=True)
     except Exception:
         logger.warning("hand child: get_state failed.", exc_info=True)
         st = None
@@ -487,14 +469,49 @@ def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuf
         frame["tactile_sum"][0] = np.asarray(st["tactile_force_sum"], dtype=np.float64)
         frame["tactile_force"][0] = np.asarray(st["tactile_force"], dtype=np.float64)
         frame["tactile_contact"][0] = np.asarray(st.get("tactile_contact", np.zeros(5, dtype=bool)), dtype=bool)
-        frame["tipboard_err"][0] = np.asarray(st.get("tipboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
+
+        # ── Board error data (see xhand.py:parse_state for field origin) ──
+        # These are transient hardware-level fault registers (RS485/EtherCAT
+        # glitches, motor driver faults, tactile sensor comm errors). They
+        # self-clear in the next get_state() when hardware returns to normal,
+        # but when they are non-zero the hand error_state is set to True and
+        # the main process pre-send gate used to block arm commands until the
+        # 2026-07-30 fix removed hand gating from validate_action.
+        _comm = np.asarray(st.get("commboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
+        _joint = np.asarray(st.get("jointboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
+        _tip = np.asarray(st.get("tipboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
+
+        frame["tipboard_err"][0] = _tip
+        frame["commboard_err"][0] = _comm
+        frame["jointboard_err"][0] = _joint
+        frame["connected_flag"][0] = int(bool(hand.connected_flag))
+        frame["error_state"][0] = int(bool(hand.error_state))
+
+        if np.any(_comm) or np.any(_joint) or np.any(_tip):
+            _comm_idx = np.nonzero(_comm)[0]
+            _joint_idx = np.nonzero(_joint)[0]
+            _tip_idx = np.nonzero(_tip)[0]
+            _board_err_warn(
+                "hand child: board errors detected — comm_joints=%s joint_joints=%s tip_joints=%s",
+                _comm_idx.tolist() if len(_comm_idx) else "[]",
+                _joint_idx.tolist() if len(_joint_idx) else "[]",
+                _tip_idx.tolist() if len(_tip_idx) else "[]",
+            )
+    else:
+        # get_state failed — publish NaN qpos + disconnected flag so the main
+        # process sees a clean degraded-mode signal instead of stale qpos.
+        frame["qpos"][0] = np.full(12, np.nan, dtype=np.float64)
+        frame["current"][0] = np.full(12, np.nan, dtype=np.float64)
+        frame["connected_flag"][0] = 0
+        frame["error_state"][0] = 1
+        frame["tipboard_err"][0] = np.zeros(12, dtype=np.int32)
+        frame["commboard_err"][0] = np.zeros(12, dtype=np.int32)
+        frame["jointboard_err"][0] = np.zeros(12, dtype=np.int32)
 
     lqc = hand.last_qpos_cmd
     if lqc is not None:
         frame["last_qpos_cmd"][0] = np.asarray(lqc, dtype=np.float64)
     frame["last_cmd_seq"][0] = last_cmd_seq
-    frame["connected_flag"][0] = int(bool(hand.connected_flag))
-    frame["error_state"][0] = int(bool(hand.error_state))
     frame["consecutive_errs"][0] = int(hand.consecutive_send_errors)
     frame["last_error_code"][0] = int(hand.last_error_code if hand.last_error_code is not None else 0)
     frame["limit_clipped"][0] = int(bool(hand.last_joint_limit_clipped))
@@ -506,7 +523,6 @@ def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuf
 
 def _hand_child_main(
     config: HandProcessConfig,
-    sync: Any,  # noqa: ARG001 — API symmetry with the arm child; unused here
     estop_event: Any,
     hand_config: "XHandConfig",
     stop_event: Any,
@@ -579,7 +595,7 @@ def _hand_child_main(
         # check with a false-positive timeout.
         logger.info("hand child: resetting to home_qpos...")
         _home = np.asarray(hand_config.home_qpos, dtype=np.float64)
-        _settle_deadline = time.monotonic() + 3.0
+        _settle_deadline = time.monotonic() + _HAND_SETTLE_TIMEOUT_S
         _settled = False
         _max_err = float("nan")
         while time.monotonic() < _settle_deadline:
@@ -588,16 +604,17 @@ def _hand_child_main(
             _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
             if np.all(np.isfinite(_qpos)):
                 _max_err = float(np.max(np.abs(_qpos - _home)))
-                if _max_err < 0.10:  # ~5.7° — close enough to home
+                if _max_err < _HAND_SETTLE_TOL_RAD:
                     logger.info("hand child: reached home_qpos (max_err=%.3f rad).", _max_err)
                     _settled = True
                     break
             time.sleep(0.05)
         if not _settled:
             logger.warning(
-                "hand child: home_qpos settle timeout (%.1f s, max_err=%.3f rad) — proceeding anyway.",
-                3.0,
+                "hand child: home_qpos settle timeout (%.1f s, max_err=%.3f rad, tol=%.3f rad) — proceeding anyway.",
+                _HAND_SETTLE_TIMEOUT_S,
                 _max_err,
+                _HAND_SETTLE_TOL_RAD,
             )
 
         # Serializes XHand access between the tick loop (send/stop/publish)
@@ -619,13 +636,18 @@ def _hand_child_main(
             with macro_lock:
                 if code == HAND_MACRO_RESET:
                     _target = np.array(request["qpos"][0], dtype=np.float64)
-                    _deadline = time.monotonic() + 3.0
+                    _deadline = time.monotonic() + _HAND_SETTLE_TIMEOUT_S
                     while time.monotonic() < _deadline:
+                        # Abort on estop — prevents the tick loop from blocking
+                        # on macro_lock for up to 3 s (same pattern as
+                        # SEND_TRAJECTORY abort_event).
+                        if estop_event.is_set():
+                            break
                         hand.send_action(_target)
                         _st = hand.get_state(force_update=True)
                         _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
                         if np.all(np.isfinite(_qpos)):
-                            if float(np.max(np.abs(_qpos - _target))) < 0.10:
+                            if float(np.max(np.abs(_qpos - _target))) < _HAND_SETTLE_TOL_RAD:
                                 ok = True
                                 break
                         time.sleep(0.05)
@@ -709,10 +731,11 @@ def _hand_child_main(
                         estopped = True
                     _publish_hand_state(hand, frame, state_ring, last_processed_seq)
             else:
-                estopped = False
-
-                # 2. Stale cmd ring (main dead/stalled) → hold; NEVER detorque.
-                if cmd_ring.latest_sequence > 0 and cmd_ring.frame_age_ns() > stale_budget_ns:
+                # ── 2. Stale cmd ring (main dead/stalled) → hold; NEVER detorque.
+                # Suppressed while estopped (post-estop recovery window: the main
+                # process cleared the estop event but has not yet resumed sending
+                # hand commands — e.g. during do_return_home).
+                if not estopped and cmd_ring.latest_sequence > 0 and cmd_ring.frame_age_ns() > stale_budget_ns:
                     stale_warn(
                         "hand child: cmd ring stale (%.0f ms > %.0f ms) — holding position (never detorque).",
                         cmd_ring.frame_age_ns() / 1e6,
@@ -725,13 +748,24 @@ def _hand_child_main(
                     data, ts_ns, seq = res
                     if seq != last_processed_seq:
                         last_new_cmd_monotonic = time.monotonic()
-                        qpos_cmd = np.array(data["qpos_cmd"][0], dtype=np.float64)
-                        with macro_lock:
-                            try:
-                                hand.send_action(qpos_cmd)
-                            except Exception:
-                                logger.warning("hand child: send_action failed.", exc_info=True)
+                        # D9: reject commands from unexpected producers (ref: arm child arm_process.py:252-260)
+                        pid = int(data["producer_id"][0])
+                        if pid != 0 and pid != config.expected_producer_id:
+                            stale_warn(
+                                "hand child: producer_id=%d != expected %d — ignoring command (seq=%d).",
+                                pid,
+                                config.expected_producer_id,
+                                seq,
+                            )
+                        else:
+                            qpos_cmd = np.array(data["qpos_cmd"][0], dtype=np.float64)
+                            with macro_lock:
+                                try:
+                                    hand.send_action(qpos_cmd)
+                                except Exception:
+                                    logger.warning("hand child: send_action failed.", exc_info=True)
                         last_processed_seq = seq
+                        estopped = False  # fresh command → estop recovery complete
 
                 # 4. Watchdog: persistent send errors → reconnect.
                 if hand.consecutive_send_errors >= _WATCHDOG_RECONNECT_AFTER:
@@ -781,9 +815,20 @@ def _hand_child_main(
         crashed_event.set()
     finally:
         # Hold semantics: exit without detorque — hand.stop() is NEVER called
-        # here (plan §5.2). Drain the RPC thread (bounded — a macro without
-        # estop may still be running; it is a daemon and dies with us), then
-        # close the ring handles; the parent unlinks.
+        # here (plan §5.2).  But we MUST disconnect from the EtherCAT device
+        # so the next session can reconnect without a power cycle.
+        # hand.disconnect() → control.close_device() releases the kernel-level
+        # EtherCAT handle and slave state (OP → SAFE_OP transition).  Without
+        # this, the slave stays in OP and subsequent ec_init/connect() calls
+        # fail until the hand is power-cycled.
+        if hand is not None:
+            try:
+                hand.disconnect()
+            except Exception:
+                logger.warning("hand child: disconnect() failed during exit.", exc_info=True)
+        # Drain the RPC thread (bounded — a macro without estop may still be
+        # running; it is a daemon and dies with us), then close the ring
+        # handles; the parent unlinks.
         if rpc_thread is not None:
             rpc_thread.join(timeout=0.5)
         for ring in (state_ring, cmd_ring, macro_cmd_ring, macro_result_ring):
@@ -934,6 +979,8 @@ class HandSHMAdapter:
                 "tactile_force_sum": np.zeros((5, 3), dtype=np.float64),
                 "tactile_contact": np.zeros(5, dtype=bool),
                 "tipboard_err": np.zeros(12, dtype=np.int32),
+                "commboard_err": np.zeros(12, dtype=np.int32),
+                "jointboard_err": np.zeros(12, dtype=np.int32),
             }
         else:
             state = {
@@ -945,6 +992,8 @@ class HandSHMAdapter:
                 "tactile_force_sum": np.asarray(rec["tactile_sum"][0], dtype=np.float64).copy(),
                 "tactile_contact": np.asarray(rec["tactile_contact"][0], dtype=bool).copy(),
                 "tipboard_err": np.asarray(rec["tipboard_err"][0], dtype=np.int32).copy(),
+                "commboard_err": np.asarray(rec["commboard_err"][0], dtype=np.int32).copy(),
+                "jointboard_err": np.asarray(rec["jointboard_err"][0], dtype=np.int32).copy(),
             }
         if full:
             state.update({
@@ -994,7 +1043,6 @@ def make_hand_servo(
     estop_event = mp.get_context("fork").Event()
     facade = HandSHMFaçade(
         process_config,
-        sync=None,
         estop_event=estop_event,
         hand_config=hand_config,
         hand_factory=hand_factory,

@@ -30,7 +30,6 @@ import sapien.core as sapien
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import (
-    CollisionConfig,
     IKStats,
     PlanningProfile,
     Pose,
@@ -83,10 +82,6 @@ TABLE_TOP_Z = TABLE_CENTER[2] + TABLE_HALF[2]  # = 0.0 桌面上表面
 # 桌面碰撞检测使用 Pinocchio FK 直接计算五指指尖世界坐标。
 # home 手型下 pinky_tip 比 EEF 低 7.6cm（不是拇指的 11.3cm — 旧值是中间关节 ID 39 的 pinky_link2）。
 
-# ── 统一碰撞配置（通过 CollisionConfig 管理）──
-collision_config = CollisionConfig(
-    table_z_world=TABLE_TOP_Z,
-)
 # CollisionModel 支持 19-DOF 全模型 + table box obstacle 的 mesh 级碰撞检测。
 _env_cm: "CollisionModel | None" = None  # set by main()
 
@@ -1174,12 +1169,12 @@ def execute_path_with_collision_hold(
     cube_actor: sapien.Actor | None = None,
     is_grasping: bool = False,
     eef_to_cube_offset: np.ndarray | None = None,
-    check_env: bool | str = True,  # True=full HOLD, "warn"=env→warn-only, False=self-only
+    check_env: bool | str = True,  # deprecated, kept for backward compat
 ) -> tuple[bool, int, int]:
     """执行 arm 关节路径，逐 waypoint 碰撞检测 + HOLD 行为。
 
     先检查再执行（与遥操作 HOLD 模式一致）：
-      1. cm.check_self_collision / check_env_collision → 碰撞检测
+      1. cm.check_self_collision → 碰撞检测
       2. 碰撞 → [HOLD] sleep → retry 同一 waypoint
       3. 连续 > MAX_CONSECUTIVE_HOLDS → [SKIP]
       4. 总计 > MAX_TOTAL_HOLDS → [ABORT]
@@ -1196,44 +1191,15 @@ def execute_path_with_collision_hold(
         wp = path_arm[wp_idx]
 
         # ── 碰撞检测：先检查后执行 ──
-        # True: self+env → HOLD; "warn": self→HOLD, env→日志; False: self-only
-        if check_env is True:
-            has_self = cm.check_self_collision(wp)
-            has_env = cm.check_env_collision(wp)
-        elif check_env == "warn":
-            has_self = cm.check_self_collision(wp)
-            has_env = cm.check_env_collision(wp)  # Tier2 FCL, 比 Tier1 更精确
-        else:
-            has_self = cm.check_self_collision(wp)
-            has_env = False
+        has_self = cm.check_self_collision(wp)
 
-        if has_self or has_env:
-            parts = []
-            if has_self:
-                parts.append("self")
-            if has_env:
-                parts.append("env")
-            reason = "+".join(parts)
-            collision_warnings += 1
-
-            # ── warn 模式：仅 env → 日志警告，非阻塞 ──
-            if check_env == "warn" and has_env and not has_self:
-                print(
-                    f"  ⚠️  ep={episode_idx} {label} wp={wp_idx+1}/{len(path_arm)} "
-                    f"env near table (expected, non-blocking)"
-                )
-                collision_warnings -= 1  # 不计入 collision counter
-                consecutive_holds = 0
-                # 继续执行（fall through to execution below — 不 sleep/continue）
-
-            # ── self / strict env → HOLD ──
-            elif has_self or (check_env is True and has_env):
+        if has_self:
                 total_holds += 1
                 consecutive_holds += 1
 
                 print(
                     f"  [HOLD] ep={episode_idx} {label} wp={wp_idx+1}/{len(path_arm)} "
-                    f"reason={reason:<6s} consecutive={consecutive_holds} total={total_holds}"
+                    f"reason=self   consecutive={consecutive_holds} total={total_holds}"
                 )
 
                 if total_holds > MAX_TOTAL_HOLDS:
@@ -1313,8 +1279,7 @@ def pick_and_place_episode(
         candidate_qpos, _ = hand_grasp_pose(rng, grasp_type=candidate_type)
         cm.set_hand_qpos(candidate_qpos)
         has_self = cm.check_self_collision(arm_at_home)
-        has_env = cm.check_env_collision(arm_at_home)
-        if not has_self and not has_env:
+        if not has_self:
             grasp_hand_qpos = candidate_qpos
             grasp_type = candidate_type
             break
@@ -1409,9 +1374,6 @@ def pick_and_place_episode(
 
         dense = interpolate_waypoints(path, INTERP_MAX_STEP_RAD)
 
-        # 桌面是已知静态障碍物，各阶段有意接近/远离它。
-        # 自碰撞 → HOLD（危险），环境碰撞 → WARNING 日志（非阻塞）。
-        _check_env = "warn"
         completed, holds, warnings = execute_path_with_collision_hold(
             sim,
             dense,
@@ -1423,7 +1385,6 @@ def pick_and_place_episode(
             cube_actor=cube_actor if is_grasping else None,
             is_grasping=is_grasping,
             eef_to_cube_offset=eef_to_cube_offset if is_grasping else None,
-            check_env=_check_env,
         )
 
         result.total_holds += holds
@@ -1589,20 +1550,10 @@ def main():
     _env_cm = planner.collision_model
     cm = _env_cm
 
-    table_world = np.array([TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z], dtype=np.float64)
-    table_in_urdf = root_pose.inv() * sapien.Pose(table_world)
-    cm.add_table(
-        table_height=float(table_in_urdf.p[2]),
-        x_center=float(table_in_urdf.p[0]),
-        half_x=TABLE_HALF[0],
-        half_y=TABLE_HALF[1],
-        half_z=TABLE_HALF[2],
-    )
     print(
         f"  CollisionModel: {cm._nq}-DOF, {cm._collision_model.ngeoms} geometries, "
         f"{len(cm._collision_model.collisionPairs)} pairs"
     )
-    print(f"  桌面障碍物: table @ z_top={TABLE_TOP_Z:.1f}m")
 
     sim.reset()
     for _ in range(5):

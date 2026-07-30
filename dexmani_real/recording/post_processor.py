@@ -282,17 +282,12 @@ class TimestampAligner:
             if "depth" in f:
                 streams.append(("depth", cam_ts, "nearest"))
 
-        _CAM_KEYS = {"rgb", "depth"}
         # Align each stream
         for path, source_ts, method in streams:
-            if path not in f and path not in _CAM_KEYS:
+            if path not in f:
                 continue
 
-            # Camera streams: read via HDF5.
-            if path in _CAM_KEYS and path in f:
-                source_data = np.asarray(f[path][:])
-            else:
-                continue
+            source_data = np.asarray(f[path][:])
             if len(source_data) == 0:
                 continue
 

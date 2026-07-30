@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot._connection_state import ConnectionStateMixin
 from dexmani_real.simulation.constructor import add_base_components, setup_scene
 from dexmani_real.simulation.xarm7_xhand import XArm7XHand
 from dexmani_real.utils.array_utils import nan_array
@@ -45,7 +44,7 @@ class SimRobotConfig:
     )
 
 
-class SimRobotInterface(ConnectionStateMixin):
+class SimRobotInterface:
     """SAPIEN simulation interface for independent testing.
 
     Provides get_state()/send_action()/reset() for simulation-internal
@@ -54,7 +53,10 @@ class SimRobotInterface(ConnectionStateMixin):
     """
 
     def __init__(self, config: SimRobotConfig | None = None):
-        super().__init__()
+        self.connected_flag: bool = False
+        self.error_state: bool = False
+        self.last_error_message: str = ""
+        self.last_action_code: int | None = None
         self.config = config or SimRobotConfig()
         # Runtime type is sapien.Scene | None; annotated Any because scene is always
         # set/unset together with self.robot (connect/disconnect), but _step_physics
