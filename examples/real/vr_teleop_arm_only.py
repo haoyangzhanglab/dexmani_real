@@ -222,15 +222,24 @@ def main():
     print(f"  eef_quat:  {np.round(state.eef_quat_wxyz, 4)}")
 
     # ── 6. VR Arm Mapper ──
-    # vr_to_base_rot = I: FLU delta 直接当 world delta 用
-    # base_to_world_rot = R_z(30°): 匹配 planner 的 base_pose_world, 转换 base-frame delta 到 world-frame
+    # Load fixed VR→robot transform from calibration config.
+    # Run `python tools/calibrate_vr_heading.py` to regenerate.
+    _vr_cfg_path = Path(__file__).resolve().parents[2] / "dexmani_real" / "config" / "vr_transform.json"
+    if _vr_cfg_path.exists():
+        import json as _json
+        with open(_vr_cfg_path) as _f:
+            _vr_cfg = _json.load(_f)
+        _T_vr_fixed = np.array(_vr_cfg["T_vr_to_robot"], dtype=np.float64)
+        print(f"  VR transform loaded: theta={_vr_cfg.get('theta_deg', '?')}°")
+    else:
+        _T_vr_fixed = np.eye(3, dtype=np.float64)
+        print("  VR transform: config not found, using I (run tools/calibrate_vr_heading.py)")
     arm_mapper = ArmWristMapper(
         pos_scale=VR_POS_SCALE,
         rot_scale=VR_ROT_SCALE,
+        vr_to_base_rot=_T_vr_fixed,
+        T_vr_to_robot=_T_vr_fixed,
         max_delta_rot_rad=VR_MAX_DELTA_ROT_RAD,
-        base_to_world_rot=Rotation.from_quat(
-            [0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]
-        ).as_matrix(),
     )
 
     # ── 7. Recorder ──
@@ -450,23 +459,7 @@ def main():
                     recording_active = True
                     state = robot.get_state(arm_qpos=arm_inner.get_state()[0] if arm_inner.is_alive else None)
 
-                    # Heading calibration: align user's facing direction → robot +X
-                    head_q = frame.get("head_quat_wxyz")
-                    head_p = frame.get("head_pos")
-                    head_ok = (
-                        head_q is not None
-                        and head_p is not None
-                        and np.any(np.isfinite(head_q))
-                        and np.any(np.array(head_p) != 0)  # non-zero = HeadFrame received
-                    )
-                    if head_ok:
-                        arm_mapper.set_heading(head_q)
-                        # Print heading direction for debugging
-                        head_rot = Rotation.from_quat(np.roll(np.asarray(head_q), -1))  # wxyz → xyzw
-                        fwd = head_rot.apply(np.array([1.0, 0.0, 0.0]))
-                        print(f"  heading: forward_2d=[{fwd[0]:.3f}, {fwd[1]:.3f}]")
-                    else:
-                        print("  heading: head pose unavailable, keeping default (I)")
+                    # Heading: loaded from config/vr_transform.json (run calibrate_vr_heading.py)
 
                     arm_mapper.reset(
                         wrist_pos=frame["wrist_pos"],

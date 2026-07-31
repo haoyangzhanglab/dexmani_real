@@ -23,19 +23,23 @@ class ArmWristMapper:
         rot_scale: float = 1.0,
         vr_to_base_rot: np.ndarray | None = None,
         base_to_world_rot: np.ndarray | None = None,
+        T_vr_to_robot: np.ndarray | None = None,
         eef_delta_bounds: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
         max_per_frame_rot_rad: float = 0.52,  # ~30°/frame @ 16 Hz — VR glitch gate
     ) -> None:
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
-        # Maps VR-frame deltas into robot-base-frame deltas.
+        # ── Position: heading-dependent (set by set_heading) ──
         self.vr_to_base_rot = np.eye(3) if vr_to_base_rot is None else np.asarray(vr_to_base_rot, dtype=np.float64)
-        # Maps base-frame deltas into world-frame deltas (accounts for base_pose_world).
-        # Default identity means base == world (simulation case).
+        # ── Position + Rotation: base → world ──
         self.base_to_world_rot = (
             np.eye(3) if base_to_world_rot is None else np.asarray(base_to_world_rot, dtype=np.float64)
         )
+        # ── Rotation: fixed VR→robot axis mapping (heading-INDEPENDENT) ──
+        # LeFranX-style: a constant similarity transform mapping VR hand axes to
+        # robot base axes.  Identity means VR FLU axes = robot base axes.
+        self.T_vr_to_robot = np.eye(3) if T_vr_to_robot is None else np.asarray(T_vr_to_robot, dtype=np.float64)
         # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
         self.eef_delta_bounds = None if eef_delta_bounds is None else np.asarray(eef_delta_bounds, dtype=np.float64)
         # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
@@ -110,7 +114,9 @@ class ArmWristMapper:
         delta_rot_vr = wrist_rot_gated @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
         delta_rot_vr = self.scale_rot(delta_rot_vr)
         delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
-        delta_rot_base = self.vr_to_base_rot @ delta_rot_vr @ self.vr_to_base_rot.T
+        # Rotation: fixed VR→robot axis mapping (heading-INDEPENDENT, LeFranX-style).
+        # Similarity transform re-expresses the VR-frame rotation delta in robot-base axes.
+        delta_rot_base = self.T_vr_to_robot @ delta_rot_vr @ self.T_vr_to_robot.T
         # Similarity-transform rotation delta from base frame → world frame.
         delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
 
@@ -137,10 +143,8 @@ class ArmWristMapper:
     def set_heading(self, head_quat_wxyz: np.ndarray) -> None:
         """Calibrate ``vr_to_base_rot`` so the user's facing direction → robot +X.
 
-        Extracts the head's forward direction in FLU, projects it to the
-        horizontal (X-Y) plane, computes the yaw angle, and builds a
-        rotation around FLU +Z that aligns the user's "forward" with the
-        robot's +X axis.
+        **Only affects position mapping.** Rotation uses the fixed
+        ``T_vr_to_robot`` transform (heading-independent, LeFranX-style).
 
         Call once per teleop session (on B-press), before :meth:`reset`.
         """

@@ -166,6 +166,11 @@ def _arm_child_main(
       4. publish ARM_STATE every tick.
     """
     # ── SIGINT: Ctrl-C reaches the whole process group; hold, then exit ──
+    # ── SIGTERM: sent by ArmControlProcess.stop()'s terminate() fallback;
+    #     without a handler the finally block is bypassed → Mode 6 firmware
+    #     still holds on disconnect, so there is no safety risk, but the
+    #     inner_loop.stop() cleanup (disconnect, graceful state transition)
+    #     is desirable for cleanliness. ──
     sigint_received = threading.Event()
 
     def _on_sigint(signum: int, frame: Any) -> None:
@@ -173,6 +178,7 @@ def _arm_child_main(
 
     try:
         signal.signal(signal.SIGINT, _on_sigint)
+        signal.signal(signal.SIGTERM, _on_sigint)
     except (ValueError, OSError):
         pass  # not in the main thread — should not happen for the fork child
 
@@ -234,7 +240,7 @@ def _arm_child_main(
                 _publish_arm_state(state_ring, inner)
                 continue
 
-            # ── 2. SIGINT → hold + exit (Mode 6 firmware holds on disconnect) ──
+            # ── 2. SIGINT/SIGTERM → hold + exit (Mode 6 firmware holds on disconnect) ──
             if sigint_received.is_set():
                 logger.info("ArmControlProcess: SIGINT received — holding last position and exiting")
                 break

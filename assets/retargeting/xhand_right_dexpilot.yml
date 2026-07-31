@@ -18,8 +18,3 @@ retargeting:
 
   project_dist: 0.03
   escape_dist: 0.03
-
-  # ── XHand custom: wrist→fingertip weight (per finger) ──
-  # 3.0 = original DexPilot behavior (total wrist weight = 15 vs finger weight 1)
-  # Lower values reduce length compensation but may cause NLP convergence issues.
-  wrist_weight: 3.0

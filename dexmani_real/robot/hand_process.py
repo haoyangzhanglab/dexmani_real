@@ -466,7 +466,7 @@ class HandSHMFaçade:
 def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuffer, last_cmd_seq: int) -> None:
     """Publish one HAND_STATE frame: state + tactile + echo (child-side)."""
     try:
-        st = hand.get_state(full=False, force_update=True)
+        st = hand.get_state(full=True, force_update=True)
     except Exception:
         logger.warning("hand child: get_state failed.", exc_info=True)
         st = None
@@ -594,6 +594,13 @@ def _hand_child_main(
 
     try:
         signal.signal(signal.SIGINT, lambda *_: sigint_received.set())
+        # SIGTERM is sent by HandControlProcess.stop()'s terminate() fallback
+        # when the child doesn't exit within the join timeout.  Without a handler,
+        # SIGTERM kills the process immediately, bypassing the finally block's
+        # hand.disconnect() cleanup → EtherCAT slave stays in OP → next session
+        # fails until power-cycled.  Reusing the same sigint_received flag is
+        # safe: it triggers a clean loop break → finally → disconnect().
+        signal.signal(signal.SIGTERM, lambda *_: sigint_received.set())
     except (ValueError, OSError):
         pass  # not in the main thread — should not happen for the fork child
 
@@ -904,7 +911,7 @@ def _hand_child_main(
                 # reset timer so we don't re-check getppid() every tick.
                 last_new_cmd_monotonic = time.monotonic()
 
-            # SIGINT → hold last position and exit cleanly — NEVER detorque
+            # SIGINT/SIGTERM → hold last position and exit cleanly — NEVER detorque
             # (plan §5.2; the finally block does not call hand.stop()).
             if sigint_received.is_set():
                 logger.info("hand child: SIGINT received — holding last position and exiting.")
@@ -922,13 +929,18 @@ def _hand_child_main(
         crashed_event.set()
     finally:
         # Hold semantics: exit without detorque — hand.stop() is NEVER called
-        # here (plan §5.2).  But we MUST disconnect from the EtherCAT device
-        # so the next session can reconnect without a power cycle.
-        # hand.disconnect() → control.close_device() releases the kernel-level
-        # EtherCAT handle and slave state (OP → SAFE_OP transition).  Without
-        # this, the slave stays in OP and subsequent ec_init/connect() calls
-        # fail until the hand is power-cycled.
-        if hand is not None:
+        # here (plan §5.2).  When we successfully connected, we MUST disconnect
+        # from the EtherCAT device so the next session can reconnect without a
+        # power cycle.  hand.disconnect() → control.close_device() releases the
+        # kernel-level EtherCAT handle and slave state (OP → SAFE_OP transition).
+        # Without this, the slave stays in OP and subsequent ec_init/connect()
+        # calls fail until the hand is power-cycled.
+        #
+        # When connect() FAILED, skip disconnect(): the control is already
+        # close_device()'d inside _retry_open_device, and calling
+        # _request_slave_init() or close_device() again on it risks undefined
+        # behaviour in the C++ SDK.
+        if hand is not None and hand.connected_flag:
             try:
                 hand.disconnect()
             except Exception:

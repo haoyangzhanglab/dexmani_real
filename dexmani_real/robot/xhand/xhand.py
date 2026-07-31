@@ -57,6 +57,14 @@ class XHandConfig(FromDictMixin):
     # XHandControl + re-open_ethercat() resolves most transient SDO glitches,
     # so we retry at the Python level (matching the arm's 3-attempt pattern).
     open_serial_retries: int = 3
+    # EtherCAT retries (separate from RS485).  Each failed open_ethercat() call
+    # transitions the slave to OP even on error — the SDK's internal ec_init →
+    # PRE_OP → SAFE_OP → OP sequence runs to completion regardless of PDO/SDO
+    # outcome.  Repeated retries multiply slave-state corruption without recovery
+    # value when the failure is persistent (CoE dictionary lock).  One retry
+    # after the stale-OP wait covers transient SDO glitches; beyond that the
+    # failure requires a power cycle.
+    open_ethercat_retries: int = 2
     open_serial_retry_delay_s: float = 2.0
 
     dt: float = 1.0 / 30.0  # 30 Hz (ref: LeFranX, DexUMI)
@@ -289,7 +297,11 @@ class XHand:
             self.device_name = self.config.device_name
 
         # ── Phase 2: open on a FRESH control (never reuse the enumerate control) ──
-        retries = max(1, int(self.config.open_serial_retries))
+        # RS485 may need several attempts after cold start; EtherCAT uses a
+        # lower retry cap because each failed open_ethercat() transitions the
+        # slave to OP regardless of PDO/SDO outcome, and repeated transitions
+        # compound state corruption without recovery value.
+        retries = max(1, int(self.config.open_ethercat_retries if comm_type == "EtherCAT" else self.config.open_serial_retries))
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
         for attempt in range(1, retries + 1):
@@ -323,14 +335,33 @@ class XHand:
             except (OSError, RuntimeError):
                 pass
             if attempt < retries:
-                logger.warning(
-                    "XHand connect attempt %s/%s failed: %s, retrying in %.1fs...",
-                    attempt,
-                    retries,
-                    self.last_error_message,
-                    delay,
-                )
-                time.sleep(delay)
+                # On EtherCAT, the first failure may be a stale-slave-state
+                # condition (previous session exited without clean disconnect,
+                # leaving the slave in OP).  A longer wait gives the slave's
+                # SM-watchdog time to expire so the retry sees a clean INIT
+                # slave.  On later attempts the standard retry delay is
+                # sufficient — if the slave was in OP, the first retry's wait
+                # already handled it; if not, it's a different error class.
+                _retry_delay = delay
+                if comm_type == "EtherCAT" and attempt == 1:
+                    _retry_delay = max(delay, self._STALE_OP_RECOVERY_WAIT_S)
+                    logger.warning(
+                        "XHand connect attempt %d/%d failed: %s — "
+                        "waiting %.1fs for potential stale-slave recovery before retry...",
+                        attempt,
+                        retries,
+                        self.last_error_message,
+                        _retry_delay,
+                    )
+                else:
+                    logger.warning(
+                        "XHand connect attempt %s/%s failed: %s, retrying in %.1fs...",
+                        attempt,
+                        retries,
+                        self.last_error_message,
+                        _retry_delay,
+                    )
+                time.sleep(_retry_delay)
 
         # All retries exhausted
         self.error_state = True
@@ -480,12 +511,88 @@ class XHand:
         except Exception:
             logger.warning("XHand get_serial_number: unavailable", exc_info=True)
 
+    # ── EtherCAT slave state management ──
+
+    # AL state constants (EtherCAT standard / SOEM convention).
+    _EC_STATE_INIT = 1
+    _EC_STATE_PRE_OP = 2
+    _EC_STATE_SAFE_OP = 4
+    _EC_STATE_OP = 8
+
+    # Post-disconnect watchdog wait (seconds).  After close_device() the slave
+    # firmware has no more master frames; its internal SM-watchdog must expire
+    # before it auto-transitions to SAFE_OP+Error and then INIT.  Typical
+    # EtherCAT watchdogs are 100–1000 ms; 2.0 s gives a comfortable margin.
+    _POST_DISCONNECT_WATCHDOG_WAIT_S = 2.0
+
+    # Extra wait on the first EtherCAT connect retry when the slave may still be
+    # in OP from a previous session whose disconnect path was skipped (kill -9,
+    # power blip, SDK crash, etc.).  Combine with the standard retry delay.
+    _STALE_OP_RECOVERY_WAIT_S = 3.0
+
+    def _request_slave_init(self) -> bool:
+        """Request the EtherCAT slave to transition to INIT via the SDK.
+
+        Uses ``set_firmware_state(device_id, slave_pos, state, timeout_us)``
+        when available.  On success the slave releases its Operational state so
+        the next ``open_ethercat()`` can reconfigure PDOs from scratch.
+
+        Returns True if the SDK acknowledged the transition request.
+        """
+        if self._stub_mode or self.control is None:
+            return False
+        if self.cached_comm_type != "EtherCAT":
+            return False  # RS485 has no slave state machine
+        try:
+            err, _prev_state = self.control.set_firmware_state(
+                self.config.device_id,
+                1,  # slave position (first EtherCAT slave on the bus)
+                self._EC_STATE_INIT,
+                500_000,  # timeout (µs) for the AL state transition
+            )
+            if self.error_ok(err):
+                logger.info("XHand: EtherCAT slave transitioned to INIT before disconnect.")
+                time.sleep(0.2)  # let the AL state transition propagate
+                return True
+            code = self.error_code(err)
+            msg = str(getattr(err, "error_message", ""))
+            logger.debug(
+                "XHand: set_firmware_state(INIT) returned code=%s msg=%r — "
+                "falling back to post-disconnect watchdog wait.",
+                code,
+                msg,
+            )
+        except Exception:
+            logger.debug(
+                "XHand: set_firmware_state() unavailable — "
+                "falling back to post-disconnect watchdog wait.",
+                exc_info=True,
+            )
+        return False
+
     def disconnect(self):
+        """Release the hardware connection.
+
+        Two-stage cleanup so the EtherCAT slave is left in a state that
+        permits reconnection without a power cycle:
+
+        1.  Request INIT via the SDK's ``set_firmware_state`` (best-effort).
+        2.  Call ``close_device()``.
+        3.  Wait for the slave's internal SM-watchdog to expire so it
+            auto-transitions out of OP before the next session starts.
+        """
         if self._stub_mode:
             self.connected_flag = False
             return
-        if self.control is not None:
+        # Only perform EtherCAT cleanup when we actually connected successfully.
+        # After a failed connect(), self.control may still reference a
+        # close_device()'d handle from _retry_open_device — calling
+        # _request_slave_init() or close_device() on it again is at best a no-op
+        # and at worst triggers undefined behaviour in the C++ SDK.
+        if self.control is not None and self.connected_flag:
+            self._request_slave_init()
             self.control.close_device()
+            time.sleep(self._POST_DISCONNECT_WATCHDOG_WAIT_S)
         self.connected_flag = False
 
     def _diagnose_connection_failure(self) -> None:
@@ -497,14 +604,18 @@ class XHand:
             )
             # SDO write failures during open_ethercat (e.g. "write sdo failed
             # 1,0,13") indicate the slave's CoE object dictionary is in an
-            # inconsistent state — close_device() only releases the host-side
-            # socket; the slave firmware retains the corrupted registers.
-            # A power cycle forces a cold boot that clears all volatile state.
+            # inconsistent state — typically the slave was left in OP by a
+            # previous session that didn't cleanly transition to INIT.
+            # disconnect() now calls set_firmware_state(INIT) + a watchdog
+            # wait; if this error still appears, the previous exit path may
+            # have been kill -9 or an SDK-level crash that bypassed
+            # disconnect().  A power cycle forces a cold boot that clears
+            # all volatile state.
             logger.error(
-                "If SDO errors appeared above: power-cycle the XHand "
-                "(disconnect + reconnect 24V power, wait ≥5 s for the "
-                "EtherCAT slave to cold-boot), then retry.  Software-level "
-                "retries cannot clear a corrupted object dictionary."
+                "If SDO errors appeared above: the previous session may not "
+                "have called disconnect() cleanly (e.g. kill -9 or SDK crash). "
+                "Power-cycle the XHand (disconnect + reconnect 24V power, "
+                "wait ≥5 s), then retry."
             )
         else:
             logger.warning(
