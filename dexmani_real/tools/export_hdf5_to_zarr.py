@@ -51,6 +51,7 @@ import argparse
 import json
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -333,6 +334,22 @@ def load_episodes(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@dataclass
+class SplitResult:
+    """Result of episode-level train/val split."""
+
+    train_obs: list[np.ndarray]
+    train_act: list[np.ndarray]
+    train_lengths: list[int]
+    val_obs: list[np.ndarray]
+    val_act: list[np.ndarray]
+    val_lengths: list[int]
+    train_rgb: list[np.ndarray | None] | None = None
+    train_depth: list[np.ndarray | None] | None = None
+    val_rgb: list[np.ndarray | None] | None = None
+    val_depth: list[np.ndarray | None] | None = None
+
+
 def split_train_val(
     obs_list: list[np.ndarray],
     action_list: list[np.ndarray],
@@ -341,7 +358,7 @@ def split_train_val(
     seed: int = 42,
     rgb_list: list[np.ndarray | None] | None = None,
     depth_list: list[np.ndarray | None] | None = None,
-) -> tuple[list, list, list, list, list, list, list | None, list | None, list | None, list | None]:
+) -> SplitResult:
     """Split episodes into train/val sets at the episode level.
 
     Args:
@@ -351,8 +368,7 @@ def split_train_val(
         rgb_list, depth_list: Optional per-episode camera data.
 
     Returns:
-        (train_obs, train_act, train_lengths, val_obs, val_act, val_lengths,
-         train_rgb, train_depth, val_rgb, val_depth).
+        SplitResult with train/val obs, actions, lengths, and optional camera data.
     """
     if rgb_list is None:
         rgb_list = []
@@ -360,21 +376,14 @@ def split_train_val(
         depth_list = []
     n = len(obs_list)
     if n == 0:
-        return [], [], [], [], [], [], [], [], [], []
+        return SplitResult([], [], [], [], [], [])
 
     if n == 1:
         print("[WARN] Only 1 episode — placing it in train set.")
-        return (
-            obs_list,
-            action_list,
-            episode_lengths,
-            [],
-            [],
-            [],
-            rgb_list if rgb_list else None,
-            depth_list if depth_list else None,
-            None,
-            None,
+        return SplitResult(
+            obs_list, action_list, episode_lengths, [], [], [],
+            train_rgb=rgb_list if rgb_list else None,
+            train_depth=depth_list if depth_list else None,
         )
 
     indices = list(range(n))
@@ -411,17 +420,11 @@ def split_train_val(
         f"{', +camera' if has_cam and val_rgb and any(r is not None for r in val_rgb) else ''}"
     )
 
-    return (
-        train_obs,
-        train_act,
-        train_lengths,
-        val_obs,
-        val_act,
-        val_lengths,
-        train_rgb,
-        train_depth,
-        val_rgb,
-        val_depth,
+    return SplitResult(
+        train_obs, train_act, train_lengths,
+        val_obs, val_act, val_lengths,
+        train_rgb=train_rgb, train_depth=train_depth,
+        val_rgb=val_rgb, val_depth=val_depth,
     )
 
 
@@ -865,34 +868,23 @@ def main() -> None:
 
     # ── Train/val split ──
     if args.train_val_split is not None:
-        (
-            train_obs,
-            train_act,
-            train_lengths,
-            val_obs,
-            val_act,
-            val_lengths,
-            train_rgb,
-            train_depth,
-            val_rgb,
-            val_depth,
-        ) = split_train_val(
+        result = split_train_val(
             obs_list, action_list, episode_lengths, args.train_val_split, args.seed, rgb_list, depth_list
         )
 
         # Compute norm_stats from TRAIN ONLY (no leakage)
-        norm_stats = compute_norm_stats(train_obs, train_act)
+        norm_stats = compute_norm_stats(result.train_obs, result.train_act)
 
         # Write train
         write_zarr(
             output_dir,
-            train_obs,
-            train_act,
-            train_lengths,
+            result.train_obs,
+            result.train_act,
+            result.train_lengths,
             norm_stats,
             name="train",
-            rgb_list=train_rgb,
-            depth_list=train_depth,
+            rgb_list=result.train_rgb,
+            depth_list=result.train_depth,
             camera_meta=camera_meta,
             control_hz=control_hz,
         )
@@ -900,13 +892,13 @@ def main() -> None:
         # Write val (use train stats — no separate stats for val, prevents leakage)
         write_zarr(
             output_dir,
-            val_obs,
-            val_act,
-            val_lengths,
+            result.val_obs,
+            result.val_act,
+            result.val_lengths,
             norm_stats,
             name="val",
-            rgb_list=val_rgb,
-            depth_list=val_depth,
+            rgb_list=result.val_rgb,
+            depth_list=result.val_depth,
             camera_meta=camera_meta,
             control_hz=control_hz,
         )

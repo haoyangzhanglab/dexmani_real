@@ -70,6 +70,15 @@ logger = get_logger(__name__)
 # persistent hardware fault doesn't flood the log at 30 Hz.
 _board_err_warn = ThrottledWarner(interval_s=5.0)
 
+# Board error persistence tracking.  A single-frame glitch is throttled; when
+# the same board(s) report errors for _BOARD_ERR_ESCALATE_FRAMES consecutive
+# frames (~333 ms at 30 Hz), the fault is treated as persistent and an
+# un-throttled WARNING is emitted.  Recovery (clear for >=1 frame after
+# escalation) also logs at INFO so the duration is recorded.
+_BOARD_ERR_ESCALATE_FRAMES = 10
+_consecutive_board_err_frames = 0
+_board_err_escalated = False
+
 
 # ── hand macro RPC frames (plan §4.6) ──
 # RESET(qpos[12]) / STOP / CLEAR_ERROR / SEND_TRAJECTORY(waypoints[256,12],
@@ -110,8 +119,9 @@ _MACRO_MAXLEN = 2
 _READY_TIMEOUT_S = 15.0
 # Hand joint settle parameters — shared by connection-time homing and the
 # HAND_MACRO_RESET RPC handler.
-_HAND_SETTLE_TIMEOUT_S = 5.0  # max time for 12-DOF hand to converge to target
-_HAND_SETTLE_TOL_RAD = 0.03   # ~1.7° — tight convergence
+_HAND_SETTLE_TIMEOUT_S = 2.0  # max time for 12-DOF hand to converge to target
+_HAND_SETTLE_TOL_RAD = 0.03   # ~1.7° — tight convergence (preferred)
+_HAND_SETTLE_GOOD_ENOUGH_RAD = 0.05  # ~2.9° — acceptable if 0.03 unreachable
 # Watchdog: persistent send errors → reconnect.
 _WATCHDOG_RECONNECT_AFTER = 30
 
@@ -473,10 +483,15 @@ def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuf
         # ── Board error data (see xhand.py:parse_state for field origin) ──
         # These are transient hardware-level fault registers (RS485/EtherCAT
         # glitches, motor driver faults, tactile sensor comm errors). They
-        # self-clear in the next get_state() when hardware returns to normal,
-        # but when they are non-zero the hand error_state is set to True and
-        # the main process pre-send gate used to block arm commands until the
-        # 2026-07-30 fix removed hand gating from validate_action.
+        # self-clear in the next get_state() when hardware returns to normal.
+        # xhand.py:get_state() sets error_state=True when any board error is
+        # non-zero; this propagates to the SHM error_state field.  The main
+        # process pre-send gate (validate_action) historically blocked arm
+        # commands on hand error_state, but this gating was intentionally
+        # removed (2026-07-30) so board errors no longer gate teleop — the
+        # hand's send_action() does not check error_state either.
+        # Persistent board errors are tracked and escalated by the module-level
+        # _consecutive_board_err_frames counter.
         _comm = np.asarray(st.get("commboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
         _joint = np.asarray(st.get("jointboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
         _tip = np.asarray(st.get("tipboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
@@ -487,16 +502,41 @@ def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuf
         frame["connected_flag"][0] = int(bool(hand.connected_flag))
         frame["error_state"][0] = int(bool(hand.error_state))
 
+        global _consecutive_board_err_frames, _board_err_escalated
+
         if np.any(_comm) or np.any(_joint) or np.any(_tip):
+            _consecutive_board_err_frames += 1
             _comm_idx = np.nonzero(_comm)[0]
             _joint_idx = np.nonzero(_joint)[0]
             _tip_idx = np.nonzero(_tip)[0]
-            _board_err_warn(
-                "hand child: board errors detected — comm_joints=%s joint_joints=%s tip_joints=%s",
-                _comm_idx.tolist() if len(_comm_idx) else "[]",
-                _joint_idx.tolist() if len(_joint_idx) else "[]",
-                _tip_idx.tolist() if len(_tip_idx) else "[]",
-            )
+            if _consecutive_board_err_frames >= _BOARD_ERR_ESCALATE_FRAMES:
+                if not _board_err_escalated:
+                    logger.warning(
+                        "hand child: persistent board errors for %d consecutive frames — "
+                        "hand may be in degraded state (comm=%s joint=%s tip=%s)",
+                        _consecutive_board_err_frames,
+                        _comm_idx.tolist() if len(_comm_idx) else "[]",
+                        _joint_idx.tolist() if len(_joint_idx) else "[]",
+                        _tip_idx.tolist() if len(_tip_idx) else "[]",
+                    )
+                    _board_err_escalated = True
+                # After escalation, stay silent — the persistent warning was
+                # already emitted; further repetition adds no signal.
+            else:
+                _board_err_warn(
+                    "hand child: board errors detected — comm_joints=%s joint_joints=%s tip_joints=%s",
+                    _comm_idx.tolist() if len(_comm_idx) else "[]",
+                    _joint_idx.tolist() if len(_joint_idx) else "[]",
+                    _tip_idx.tolist() if len(_tip_idx) else "[]",
+                )
+        else:
+            if _board_err_escalated:
+                logger.info(
+                    "hand child: board errors cleared after %d consecutive frames",
+                    _consecutive_board_err_frames,
+                )
+                _board_err_escalated = False
+            _consecutive_board_err_frames = 0
     else:
         # get_state failed — publish NaN qpos + disconnected flag so the main
         # process sees a clean degraded-mode signal instead of stale qpos.
@@ -608,6 +648,14 @@ def _hand_child_main(
                     logger.info("hand child: reached home_qpos (max_err=%.3f rad).", _max_err)
                     _settled = True
                     break
+                if _max_err < _HAND_SETTLE_GOOD_ENOUGH_RAD:
+                    logger.info(
+                        "hand child: home_qpos good-enough (max_err=%.3f rad < %.3f rad).",
+                        _max_err,
+                        _HAND_SETTLE_GOOD_ENOUGH_RAD,
+                    )
+                    _settled = True
+                    break
             time.sleep(0.05)
         if not _settled:
             logger.warning(
@@ -626,7 +674,17 @@ def _hand_child_main(
         # minimal test fakes may not — detect once, stay compatible with both.
         _traj_accepts_abort = "abort_event" in inspect.signature(hand.send_trajectory).parameters
 
+        # Shared timestamp of the last time a hand command was actually sent to
+        # hardware — updated under macro_lock by both the tick loop and the RPC
+        # thread.  Used for stale detection instead of cmd_ring.frame_age_ns()
+        # so that RPC-driven hand activity (HAND_MACRO_RESET settle loop, etc.)
+        # suppresses the stale-hold warning even though the cmd ring is not being
+        # written by the (blocked) main process.  MUST be initialised before
+        # handle_macro (which references it via nonlocal).
+        _last_hand_command_time = time.monotonic()
+
         def handle_macro(request: np.ndarray, seq: int) -> np.ndarray:
+            nonlocal _last_hand_command_time
             result = new_frame(HAND_MACRO_RESULT_DTYPE)
             code = int(request["cmd"][0])
             ok = False
@@ -644,19 +702,40 @@ def _hand_child_main(
                         if estop_event.is_set():
                             break
                         hand.send_action(_target)
+                        _last_hand_command_time = time.monotonic()
                         _st = hand.get_state(force_update=True)
                         _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
                         if np.all(np.isfinite(_qpos)):
-                            if float(np.max(np.abs(_qpos - _target))) < _HAND_SETTLE_TOL_RAD:
+                            _err = float(np.max(np.abs(_qpos - _target)))
+                            if _err < _HAND_SETTLE_TOL_RAD:
+                                ok = True
+                                break
+                            if _err < _HAND_SETTLE_GOOD_ENOUGH_RAD:
                                 ok = True
                                 break
                         time.sleep(0.05)
                     else:
                         ok = False
+                        # Convergence diagnostics: log which joint failed so
+                        # future occurrences can be correlated with board errors
+                        # or mechanical issues.
+                        if np.all(np.isfinite(_qpos)):
+                            _errs = np.abs(_qpos - _target)
+                            _worst = int(np.argmax(_errs))
+                            logger.warning(
+                                "hand child: HAND_MACRO_RESET settle timeout (%.1f s) — "
+                                "max_err=%.3f rad (joint %d), tol=%.3f rad",
+                                _HAND_SETTLE_TIMEOUT_S,
+                                float(np.max(_errs)),
+                                _worst,
+                                _HAND_SETTLE_TOL_RAD,
+                            )
                 elif code == HAND_MACRO_STOP:
                     ok = hand.stop()  # deliberate detorque (explicit macro only)
+                    _last_hand_command_time = time.monotonic()
                 elif code == HAND_MACRO_CLEAR_ERROR:
                     ok = hand.clear_error()
+                    _last_hand_command_time = time.monotonic()
                 elif code == HAND_MACRO_SEND_TRAJECTORY:
                     n = max(0, min(int(request["n_waypoints"][0]), MAX_HAND_WAYPOINTS))
                     duration_s = float(request["duration_s"][0])
@@ -670,6 +749,7 @@ def _hand_child_main(
                             ok = hand.send_trajectory(wps, duration_s, max_speed=ms, abort_event=estop_event)
                         else:
                             ok = hand.send_trajectory(wps, duration_s, max_speed=ms)
+                        _last_hand_command_time = time.monotonic()
                 else:
                     logger.warning("hand child: unknown macro cmd=%d (seq=%d).", code, seq)
             result["ok"][0] = int(bool(ok))
@@ -683,7 +763,6 @@ def _hand_child_main(
         last_processed_seq = 0
         estopped = False
         stale_warn = ThrottledWarner()
-        stale_budget_ns = int(config.cmd_stale_hold_s * 1e9)
         last_ts = time.monotonic()
         last_new_cmd_monotonic = time.monotonic()
 
@@ -732,13 +811,18 @@ def _hand_child_main(
                     _publish_hand_state(hand, frame, state_ring, last_processed_seq)
             else:
                 # ── 2. Stale cmd ring (main dead/stalled) → hold; NEVER detorque.
-                # Suppressed while estopped (post-estop recovery window: the main
-                # process cleared the estop event but has not yet resumed sending
-                # hand commands — e.g. during do_return_home).
-                if not estopped and cmd_ring.latest_sequence > 0 and cmd_ring.frame_age_ns() > stale_budget_ns:
+                # Uses _last_hand_command_time instead of cmd_ring.frame_age_ns()
+                # so that RPC-driven hand activity (HAND_MACRO_RESET settle loop,
+                # send_trajectory, etc.) suppresses the warning even though the
+                # cmd ring is not being written by the (blocked) main process.
+                # Also suppressed while estopped (post-estop recovery window: the
+                # main process cleared the estop event but has not yet resumed
+                # sending hand commands — e.g. during do_return_home).
+                _time_since_last_cmd = time.monotonic() - _last_hand_command_time
+                if not estopped and cmd_ring.latest_sequence > 0 and _time_since_last_cmd > config.cmd_stale_hold_s:
                     stale_warn(
                         "hand child: cmd ring stale (%.0f ms > %.0f ms) — holding position (never detorque).",
-                        cmd_ring.frame_age_ns() / 1e6,
+                        _time_since_last_cmd * 1e3,
                         config.cmd_stale_hold_s * 1e3,
                     )
 
@@ -762,6 +846,7 @@ def _hand_child_main(
                             with macro_lock:
                                 try:
                                     hand.send_action(qpos_cmd)
+                                    _last_hand_command_time = time.monotonic()
                                 except Exception:
                                     logger.warning("hand child: send_action failed.", exc_info=True)
                         last_processed_seq = seq

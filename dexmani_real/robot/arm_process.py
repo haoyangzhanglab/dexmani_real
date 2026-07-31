@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 import numpy as np
 
+from dexmani_real.planning.path_utils import interpolate_waypoints
 
 from dexmani_real.shm.robot_layouts import (
     ARM_CMD_EMERGENCY_STOP,
@@ -789,6 +790,63 @@ def make_arm_servo(
     return ArmInnerLoopSHMAdapter(facade, estop_event)
 
 
+# ── Home path planning (pure — no arm connection needed) ──
+
+# Joint indices for two-stage homing detour.
+# J0=base, J1=shoulder, J2=elbow → move proximal structure first (lifts arm
+# clear of table), then J3-J6=wrist joints follow.  Matches the strategy in
+# interface.py:_safe_joint_home_fallback.
+_PROXIMAL_MASK = np.array([True, True, True, False, False, False, False], dtype=bool)
+
+
+def _plan_joint_home_path(
+    qpos: np.ndarray,
+    home_qpos: np.ndarray,
+    planner: Any | None,
+) -> np.ndarray | None:
+    """Plan a collision-safe joint-space path from *qpos* to *home_qpos*.
+
+    Returns a dense (D×7) waypoint array, or ``None`` when the arm is already
+    close enough that no waypoints are needed.  Raises no exceptions — on any
+    failure to plan, returns ``None`` (caller falls back to direct Mode 6
+    convergence).
+
+    This function only reads the collision model — it does NOT need a live
+    XArm7 connection.
+    """
+    delta = float(np.max(np.abs(qpos - home_qpos)))
+    if delta < np.deg2rad(0.5):
+        return None  # caller can send home_qpos directly
+
+    _check_safe = (
+        lambda path: not planner
+        or not planner.planning_profile.check_self_collision
+        or not planner.check_path_collisions(path).get("path_self_collision")
+    )
+
+    # ── Attempt 1: direct linear joint-space interpolation ──
+    path = interpolate_waypoints(np.stack([qpos, home_qpos]), np.deg2rad(1.0))
+    if _check_safe(path):
+        return path
+
+    if planner is None:
+        return None
+
+    # ── Attempt 2: two-stage detour (proximal → wrist) ──
+    mid = qpos.copy()
+    mid[_PROXIMAL_MASK] = home_qpos[_PROXIMAL_MASK]
+
+    path1 = interpolate_waypoints(np.stack([qpos, mid]), np.deg2rad(1.0))
+    path2_full = interpolate_waypoints(np.stack([mid, home_qpos]), np.deg2rad(1.0))
+    path2 = path2_full[1:]  # skip mid (already at end of path1)
+
+    staged = np.concatenate([path1, path2], axis=0) if len(path2) > 0 else path1
+    if _check_safe(staged):
+        return staged
+
+    return None  # no safe path — caller falls back to direct Mode 6 convergence
+
+
 def do_return_home(
     robot: "RobotInterface",
     arm_inner: "ArmServo",
@@ -796,24 +854,31 @@ def do_return_home(
     *,
     home_dt: float = 0.04,
     cancel_fn: "Callable[[], bool] | None" = None,
+    arm_ip: str | None = None,
 ) -> "ArmServo":
-    """Return arm + hand to home with smooth Mode 6 convergence.
+    """Return arm + hand to home using only Mode 6 (no Mode 1, no reconnect).
 
-    1. Stop inner loop
-    2. Coarse approach via ``robot.return_to_home()`` (collision-checked)
-    3. Hand home with tight tolerance (0.03 rad)
-    4. Restart inner loop → set target = home_qpos → Mode 6 smooth convergence
-    5. Wait for convergence (max err < 0.5°, 5 s timeout)
+    1. Hold current position (inner loop keeps running in Mode 6)
+    2. Hand home via RPC (tight tolerance)
+    3. Plan collision-safe joint path (no arm connection needed)
+    4. Feed waypoints to the inner loop → Mode 6 firmware follows
+    5. Convergence to exact home_qpos
+
+    The inner loop is NEVER stopped — Mode 6 runs throughout.  This eliminates
+    the stop → Mode 1 coarse approach → disconnect → restart cycle, cutting
+    total wall-clock time roughly in half and removing ~60 lines of connection-
+    management code.
 
     ``cancel_fn``, when provided, is called once per convergence poll (~50 Hz).
-    When it returns ``True``, the convergence loop exits early — the arm holds
-    its last position and the caller is responsible for re-establishing the
-    target.  Keyboard-interrupt semantics (Q / ESC) are the primary use case.
+    When it returns ``True``, the convergence loop exits early.
 
-    Returns a freshly constructed ``ArmServo`` instance.
+    ``arm_ip`` is forwarded to ``make_arm_servo`` if a restart is needed (edge
+    case: inner loop in error state); ``None`` uses the XArm7Config default.
+
+    Returns the same ``arm_inner`` instance (or a replacement if the inner
+    loop was in an unrecoverable error state).
     """
     import time as _time
-    import traceback
 
     import numpy as np
 
@@ -821,112 +886,115 @@ def do_return_home(
 
     home_qpos = robot.arm.config.init_qpos.copy()
 
-    # ── Read current position through the running inner loop ──
+    # ── 1. Read current position through the RUNNING inner loop ──
     try:
         qpos, error_state, _ = arm_inner.get_state()
     except Exception:
         qpos, error_state = None, True
 
-    if qpos is not None and not error_state and np.all(np.isfinite(qpos)):
-        if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(2.0):
-            print("  已在 home 位置，跳过归位", flush=True)
-            return arm_inner
+    # Inner loop error → restart is the only case where we still need a fresh
+    # child process (the inner loop's XArm7 connection may be wedged).
+    if error_state or qpos is None or not np.all(np.isfinite(qpos)):
+        import traceback
 
-    # ── Stop inner loop → coarse approach → hand home → restart → converge ──
-    try:
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        print("  Arm 内环线程已停止")
-
-        # ── Coarse approach (collision-checked, ~few degrees from home) ──
-        ok = robot.return_to_home(home_dt=home_dt)
-        print(f"  粗定位 {'OK' if ok else 'FAIL'}")
-
-        # Disconnect the main process's XArm7 connection used for coarse
-        # homing so only the new inner loop child's connection is active.
-        # Without this, two XArmAPI connections coexist (Mode 1 + Mode 6)
-        # and Mode 6 firmware may behave unpredictably — observed as
-        # convergence timeout at large residual errors (ref: 2026-07-30).
-        # Matches exec_macro() pattern which disconnects its temporary
-        # connection (inner_loop.py:954-956).
+        try:
+            arm_inner.set_target(None)
+            arm_inner.stop()
+        except Exception:
+            pass
         try:
             robot.arm.disconnect()
         except Exception:
-            pass  # best-effort — new inner loop creates its own connection
-
-        # ── Hand home (tight tolerance, do before inner loop restart) ──
-        # emergency_stop() sets error_state=True + connected_flag=False on the
-        # HandSHMAdapter, but the hand process is still alive (EtherCAT up).
-        # clear_error() refreshes from SHM and restores connected_flag if the
-        # process is healthy; if the hand is genuinely disconnected, flags stay
-        # unchanged and we safely skip.
-        if not robot.hand.is_connected() and robot.hand.is_error():
-            robot.hand.clear_error()
-        if robot.hand.is_connected():
-            hand_ok = robot.hand.reset()
-            if hand_ok:
-                print("  手归位 OK")
-            else:
-                # HAND_MACRO_RESET has a 3 s / 0.03 rad convergence loop
-                # (hand_process.py:632-650).  Some XHand units cannot
-                # converge within this tolerance (observed max_err=0.044 rad
-                # at startup settle).  The hand is physically connected and
-                # holding position via the stale-hold watchdog — proceeding
-                # is safe; the residual error is sub-degree.
-                print("  手归位未收敛 (已保持位置，安全继续)")
-        else:
-            print("  手未连接，跳过手归位")
-
-        # ── Restart inner loop ──
-        new_inner = make_arm_servo(cfg=inner_cfg)
+            pass
+        print("  内环异常，重启中...", flush=True)
+        new_inner = make_arm_servo(cfg=inner_cfg, ip=arm_ip)
         robot.set_arm_servo(new_inner)
         new_inner.start()
         if not new_inner.wait_ready(timeout=30.0):
             print("  Arm 内环启动超时")
             return new_inner
         print("  Arm 内环线程已重启")
-
-        # ── Mode 6 smooth convergence to exact home ──
         new_inner.set_target(home_qpos)
-        # Timeout 5s: with the _last_sent_target bootstrap fix (inner_loop.py
-        # _bootstrap_state) and the Phase 2 joint-space pre-convergence
-        # (interface.py return_to_home), the residual at this point is
-        # typically < 5°.  Mode 6 with 900°/s² acceleration converges from
-        # 5° in < 0.3 s.  5 s is ample margin.
-        _deadline = _time.monotonic() + 5.0
-        _converged = False
-        _final_err_deg = float("nan")
-        while _time.monotonic() < _deadline:
-            # Honour cancel requests from the caller (keyboard Q / ESC).
-            if cancel_fn is not None and cancel_fn():
-                print("  收敛被用户中断", flush=True)
-                break
-            _qpos, _err, __ = new_inner.get_state()
-            if not _err and np.all(np.isfinite(_qpos)):
-                _final_err_deg = float(np.rad2deg(np.max(np.abs(_qpos - home_qpos))))
-                if _final_err_deg < 0.5:
-                    _converged = True
-                    break
-                # Good-enough early exit after 2s (50% of timeout): Mode 6
-                # firmware has an effective deadband for very small errors.
-                # 3.0° is functionally at home — the arm is not drifting.
-                if _time.monotonic() > _deadline - 3.0 and _final_err_deg < 3.0:
-                    _converged = True
-                    break
-            _time.sleep(0.02)  # ~50 Hz poll — one inner-loop tick
-        if _converged:
-            if _final_err_deg < 0.5:
-                print(f"  Mode 6 收敛完成 (误差 {_final_err_deg:.2f}°)")
-            else:
-                print(f"  Mode 6 基本收敛 (误差 {_final_err_deg:.2f}°, <3.0° 可接受)")
-        else:
-            print(f"  Mode 6 收敛超时 (最终误差 {_final_err_deg:.2f}°)")
-
+        _time.sleep(0.5)
         return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home 异常，尝试 emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
+
+    # Already at home?
+    if float(np.max(np.abs(qpos - home_qpos))) < np.deg2rad(2.0):
+        print("  已在 home 位置，跳过归位", flush=True)
+        return arm_inner
+
+    # ── 2. Hold current position (inner loop STAYS in Mode 6) ──
+    arm_inner.set_target(None)
+    _time.sleep(0.05)  # one tick for hold to take effect
+
+    # ── 3. Hand home (independent RPC — runs while arm holds) ──
+    if not robot.hand.is_connected() and robot.hand.is_error():
+        robot.hand.clear_error()
+    if robot.hand.is_connected():
+        hand_ok = robot.hand.reset()
+        if hand_ok:
+            print("  手归位 OK")
+        else:
+            print("  手归位未收敛 (已保持位置，安全继续)")
+    else:
+        print("  手未连接，跳过手归位")
+
+    # ── 4. Plan collision-safe path (planner only, no arm connection) ──
+    _planner = getattr(robot, "planner", None)
+    if _planner is not None:
+        try:
+            qpos_unwrapped = _planner.nearest_equivalent_qpos(qpos, home_qpos)
+        except Exception:
+            qpos_unwrapped = qpos
+    else:
+        qpos_unwrapped = qpos
+
+    waypoints = _plan_joint_home_path(qpos_unwrapped, home_qpos, _planner)
+
+    # ── 5. Feed waypoints to Mode 6 inner loop ──
+    if waypoints is not None and len(waypoints) > 0:
+        _waypoint_count = len(waypoints)
+        _waypoint_interval = max(home_dt, 0.02)
+        _t0 = _time.monotonic()
+        for _i, _wp in enumerate(waypoints):
+            if cancel_fn is not None and cancel_fn():
+                print("  路径执行被用户中断", flush=True)
+                break
+            arm_inner.set_target(_wp)
+            _time.sleep(_waypoint_interval)
+        _dt = _time.monotonic() - _t0
+        if _i == _waypoint_count - 1:
+            print(f"  路径执行完成 ({_waypoint_count} waypoints, {_dt:.1f}s)", flush=True)
+
+    # ── 6. Mode 6 smooth convergence to exact home ──
+    arm_inner.set_target(home_qpos)
+    _deadline = _time.monotonic() + 5.0
+    _converged = False
+    _cancelled = False
+    _final_err_deg = float("nan")
+    while _time.monotonic() < _deadline:
+        if cancel_fn is not None and cancel_fn():
+            print("  收敛被用户中断", flush=True)
+            _cancelled = True
+            break
+        _qpos, _err, __ = arm_inner.get_state()
+        if not _err and np.all(np.isfinite(_qpos)):
+            _final_err_deg = float(np.rad2deg(np.max(np.abs(_qpos - home_qpos))))
+            if _final_err_deg < 0.5:
+                _converged = True
+                break
+            if _time.monotonic() > _deadline - 3.0 and _final_err_deg < 3.0:
+                _converged = True
+                break
+        _time.sleep(0.02)
+    if _cancelled:
+        pass
+    elif _converged:
+        if _final_err_deg < 0.5:
+            print(f"  Mode 6 收敛完成 (误差 {_final_err_deg:.2f}°)")
+        else:
+            print(f"  Mode 6 基本收敛 (误差 {_final_err_deg:.2f}°, <3.0° 可接受)")
+    else:
+        print(f"  Mode 6 收敛超时 (最终误差 {_final_err_deg:.2f}°)")
+
+    return arm_inner

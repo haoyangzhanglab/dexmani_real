@@ -51,11 +51,6 @@ class ArmInnerLoopConfig:
                        trajectory planner. Default 500°/s² (≈8.73 rad/s²).
         loop_period: Inner loop period in seconds. Default 1/30 (30Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
-        max_joint_delta: Per-step L∞ joint delta clamp (rad). Default 0.3 rad per
-                         inner-loop step (~17°, ~9 rad/s ceiling at 30Hz). Set 0 to
-                         disable. Headroom over a normal target step depends on the
-                         OUTER loop rate (see max_joint_delta comment below).
-        synchronized: Two-phase handshake for policy inference (default False).
     """
 
     # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
@@ -67,16 +62,8 @@ class ArmInnerLoopConfig:
     # Shared
     target_timeout_s: float = 0.2
 
-    # Per-step delta clamp — safety ceiling against IK solver anomalies.
-    # Disabled (0): the outer-loop ARM_CMD_MAX_STEP_RAD clamp at 16 Hz provides
-    # the primary command-rate limit (120°/s = firmware speed limit).  The
-    # inner-loop clamp was a second, looser backstop (0.15 rad @ 30 Hz = 258°/s)
-    # that never fired in normal teleop and added a redundant code path.
-    # Joint-limit clip (below) is still active as the absolute position guard.
-    max_joint_delta: float = 0.0
-
-    # Absolute joint limit clip — hardware safety bounds applied before the
-    # per-step delta clamp (mirrors xArm7 physical limits in radians).
+    # Absolute joint limit clip — hardware safety bounds applied before
+    # forwarding to the firmware (mirrors xArm7 physical limits in radians).
     # J1=±360°, J2=-118°/+120°, J3=±360°, J4=-11°/+225°, J5=±360°,
     # J6=-97°/+180°, J7=±360°.
     joint_limit_lower: tuple[float, ...] = (-6.283, -2.059, -6.283, -0.192, -6.283, -1.693, -6.283)
@@ -152,9 +139,9 @@ class ArmInnerLoop:
         self._arm_qvel: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._arm_tau: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._error_state: bool = False
-        self._last_sent_target: np.ndarray | None = None  # for per-step delta clamp
-        # The delta-clamped value actually forwarded to the SDK each tick
-        # (hold position during holds) — the inner-loop "sent" stream (plan §4.9).
+        self._last_sent_target: np.ndarray | None = None  # tracking error baseline
+        # Value actually forwarded to the SDK each tick (hold position during
+        # holds) — the inner-loop "sent" stream (plan §4.9).
         self._last_sent_cmd: np.ndarray = np.zeros(7, dtype=np.float64)
         self._arm = None  # live XArmAPI handle of the loop thread (mode/connected queries)
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
@@ -694,9 +681,7 @@ class ArmInnerLoop:
                 # Target rejected by firmware (e.g. self-collision, overspeed).
                 # This is NOT a hardware fault — clear the latch, re-init Mode 6
                 # (firmware drops to Mode 0 on reject), and wait for the next
-                # valid command from the outer loop.  Do NOT set error_state=True,
-                # do NOT update _last_sent_target (delta clamp keeps using the
-                # last good target).
+                # valid command from the outer loop.  Do NOT set error_state=True.
                 logger.warning(
                     "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s) — "
                     "target skipped, re-initialising mode",
@@ -744,41 +729,20 @@ class ArmInnerLoop:
 
         After firmware rejects a command (e.g. error 22 self-collision), the arm
         drops from Mode 6 to Mode 0.  ``clean_error`` + ``set_state(0)`` clears
-        the latch but does NOT restore the control mode — without Mode 6,
-        subsequent ``set_servo_angle`` calls use the wrong protocol and the arm
-        is effectively dead (observed as ``set_mode(1)`` returning code 10
-        repeatedly during return_home).
+        the latch but does NOT restore the control mode.
 
         Returns ``True`` on success, ``False`` if the re-init attempt fails.
         """
         arm.clean_error()
         arm.clean_warn()
         arm.set_state(0)
-
-        # Re-init Mode 6 — single attempt.  The XArm SDK's own ``_set_mode``
-        # uses a single attempt with no retry loop.  The 3-retry loop added
-        # ~600 ms worst-case blocking (~18 inner-loop ticks at 30Hz) without
-        # evidence that retries improve firmware recovery.
-        try:
-            arm.set_mode(0)
-            arm.set_state(0)
-            time.sleep(0.05)
-            arm.set_mode(6)
-            arm.set_state(0)
-            time.sleep(0.05)
-            arm.set_state(0)
-            actual_mode = getattr(arm, "mode", -1)
-            if actual_mode == 6:
-                logger.info("ArmInnerLoop: Mode 6 re-initialised")
-                return True
-            logger.warning(
-                "ArmInnerLoop: set_mode(6) returned but mode=%d",
-                actual_mode,
-            )
-        except (RuntimeError, OSError) as e:
-            logger.warning("ArmInnerLoop: Mode 6 re-init failed: %s", e)
-
-        logger.error("ArmInnerLoop: failed to re-init Mode 6 — arm may be in degraded mode")
+        arm.set_mode(6)
+        arm.set_state(0)
+        actual_mode = getattr(arm, "mode", -1)
+        if actual_mode == 6:
+            logger.info("ArmInnerLoop: Mode 6 re-initialised")
+            return True
+        logger.warning("ArmInnerLoop: set_mode(6) returned but mode=%d", actual_mode)
         return False
 
     def _hold_position(self, arm) -> None:
@@ -821,31 +785,7 @@ class ArmInnerLoop:
             pass
 
     def _init_mode(self, arm) -> None:
-        """Transition arm to Mode 6 (joint online trajectory planning).
-
-        Requires firmware >= 1.10.0. Logs a warning if the firmware version
-        cannot be parsed or is below the minimum.
-        """
-        # Check firmware version (Mode 6 requires >= 1.10.0)
-        try:
-            code, ver_str = arm.get_version()
-            if code == 0 and ver_str:
-                # Parse "v1.18.4" or "1.18.4" format
-                ver_clean = ver_str.lstrip("vV")
-                parts = ver_clean.split(".")
-                if len(parts) >= 2:
-                    major, minor = int(parts[0]), int(parts[1])
-                    if major < 1 or (major == 1 and minor < 10):
-                        logger.warning(
-                            "ArmInnerLoop: firmware %s is below Mode 6 minimum (1.10.0). "
-                            "Mode 6 may not work correctly.",
-                            ver_str,
-                        )
-                    else:
-                        logger.info("ArmInnerLoop: firmware %s OK (>= 1.10.0 required)", ver_str)
-        except Exception:
-            pass
-
+        """Transition arm to Mode 6 (joint online trajectory planning)."""
         arm.set_mode(0)
         arm.set_state(0)
         time.sleep(0.05)

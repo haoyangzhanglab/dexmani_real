@@ -193,12 +193,11 @@ def assess_episode(
     # Pad: frame 0 gets velocity from frames 0→1
     cmd_vels = np.concatenate([[cmd_vels[0]], cmd_vels])  # (T,) rad/s
 
-    # ── Per-frame adaptive threshold ──
-    per_frame_adaptive = np.array(
-        [_compute_adaptive_threshold(v, joint_max_acc, inner_loop_hz, adaptive_max_rad)
-         for v in cmd_vels],
-        dtype=np.float64,
-    )
+    # ── Per-frame adaptive threshold (vectorized — avoids per-frame Python call) ──
+    steady = cmd_vels / inner_loop_hz
+    accel = cmd_vels * cmd_vels / joint_max_acc
+    expected = steady + accel + _TRACKING_NOISE_RAD
+    per_frame_adaptive = np.clip(expected, _ADAPTIVE_MIN_RAD, adaptive_max_rad)
 
     # ── Classify each frame ──
     anomalous_mask = (per_frame_error > 2.0 * per_frame_adaptive) | (

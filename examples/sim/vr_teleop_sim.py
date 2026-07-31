@@ -86,7 +86,7 @@ from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.vr.dummy_tracker import DummyTracker
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker, VRFrameSimulator
-from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 模块常量
@@ -533,7 +533,7 @@ def main() -> None:
 
     # ── 控制状态变量 ──
     state = "IDLE"  # IDLE | TELEOP_RECORDING | PAUSED
-    rate_limiter = RateLimiter(CTRL_HZ)
+    rate_limiter = RateManager(CTRL_HZ)
     prev_arm_cmd = sim.get_full_qpos()[:7].copy()
     prev_hand_cmd = sim.get_full_qpos()[7:].copy()
     ik_fail_total = 0  # 累计 IK 失败次数（只增不减，用于 ik_rate 计算）

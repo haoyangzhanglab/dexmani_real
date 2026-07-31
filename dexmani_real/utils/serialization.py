@@ -13,7 +13,6 @@ dependent modules can import them directly.
 from __future__ import annotations
 
 import dataclasses
-import sys
 import types as _types
 import typing
 from typing import Any, get_args, get_origin
@@ -61,8 +60,8 @@ def is_ndarray_annotation(tp: object) -> bool:
         # typing.Optional, typing.Union, etc.
         return any(is_ndarray_annotation(a) for a in get_args(tp))
 
-    # Python 3.10+ PEP 604 UnionType (X | Y)
-    if sys.version_info >= (3, 10) and isinstance(tp, _types.UnionType):
+    # Python 3.10+ PEP 604 UnionType (X | Y) — project requires 3.10+
+    if isinstance(tp, _types.UnionType):
         return any(is_ndarray_annotation(a) for a in get_args(tp))
 
     return False
@@ -204,10 +203,6 @@ class FromDictMixin:
             field1: float = 0.0
 
         cfg = MyConfig.from_dict({"field1": 1.5})
-
-        # Hot-reload from file (P3.2):
-        cfg = MyConfig.from_yaml("configs/profile.yaml")
-        cfg = MyConfig.from_json("configs/profile.json")
     """
 
     @classmethod
@@ -215,35 +210,3 @@ class FromDictMixin:
         """Reconstruct from a serialized dict."""
         return cls(**from_dict_helper(cls, d))
 
-    @classmethod
-    def from_yaml(cls, path: str) -> Any:
-        """Load configuration from a YAML file (hot-reload, P3.2).
-
-        Supports nested dataclass fields — uses from_dict_helper internally
-        which handles tuple/list/ndarray conversion, Enum lookup, and nested
-        FromDictMixin dataclasses.
-        """
-        from pathlib import Path
-
-        import yaml
-
-        with open(Path(path), "r", encoding="utf-8") as f:
-            d = yaml.safe_load(f)
-        if not isinstance(d, dict):
-            raise TypeError(f"YAML file {path} must contain a mapping at the top level, " f"got {type(d).__name__}")
-        return cls.from_dict(d)
-
-    @classmethod
-    def from_json(cls, path: str) -> Any:
-        """Load configuration from a JSON file (hot-reload, P3.2).
-
-        Same semantics as from_yaml but for JSON format.
-        """
-        import json
-        from pathlib import Path
-
-        with open(Path(path), "r", encoding="utf-8") as f:
-            d = json.load(f)
-        if not isinstance(d, dict):
-            raise TypeError(f"JSON file {path} must contain a mapping at the top level, " f"got {type(d).__name__}")
-        return cls.from_dict(d)

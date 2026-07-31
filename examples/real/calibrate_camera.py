@@ -67,7 +67,7 @@ except ImportError:
     raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
 from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.xarm7 import XArm7Config
-from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -695,7 +695,7 @@ def main():
     print("  预览窗口已打开（绿=已检测，红=未检测）")
 
     # ── 6. 主循环 ──
-    limiter = RateLimiter(CTRL_HZ)
+    limiter = RateManager(CTRL_HZ)
     running = True
     loop_count = 0
     wall_warned = [False, False, False]

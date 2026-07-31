@@ -22,8 +22,7 @@ logger = get_logger(__name__)
 class RateManager:
     """High-precision rate limiter with hybrid busy-wait + sleep.
 
-    Unlike RateLimiter (which uses time.sleep()), RateManager uses a
-    hybrid approach: sleep for 95% of the remaining time, then busy-wait
+    Uses a hybrid approach: sleep for 95% of the remaining time, then busy-wait
     for the final ~1ms. This achieves < 1ms target error on Linux with
     PREEMPT_RT or standard kernels.
 

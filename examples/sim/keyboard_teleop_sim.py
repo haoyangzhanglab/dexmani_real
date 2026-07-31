@@ -49,7 +49,7 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.simulation import SimRobotConfig, SimRobotInterface
 from dexmani_real.simulation.constructor import add_light, setup_scene
 from dexmani_real.teleop.control.keyboard import GlobalKeyState
-from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager
 from scipy.spatial.transform import Rotation as R
 
 try:
@@ -341,7 +341,7 @@ def main():
     print("\n键盘控制已启动，按 Q 退出\n")
 
     # ── 5. 状态变量 ──
-    limiter = RateLimiter(CTRL_HZ)
+    limiter = RateManager(CTRL_HZ)
     running = True
     wall_warned = [False, False, False]
     last_wall_time = 0.0

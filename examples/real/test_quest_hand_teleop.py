@@ -46,7 +46,7 @@ import numpy as np
 from dexmani_real.robot.xhand import JOINT_NAMES, XHand, XHandConfig
 from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
 from dexmani_real.teleop.vr.vr_tracker import QuestHandTracker
-from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager
 
 np.set_printoptions(precision=3, suppress=True, linewidth=120)
 
@@ -177,7 +177,7 @@ def test_quest_hand_teleop() -> None:
     print("  Ready.")
 
     # ── Main loop ───────────────────────────────────────────────
-    limiter = RateLimiter(CONTROL_HZ)
+    limiter = RateManager(CONTROL_HZ)
     last_status_ts = time.monotonic()
     frame_count = 0
     retarget_count = 0

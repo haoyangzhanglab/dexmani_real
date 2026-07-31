@@ -53,7 +53,6 @@ import json
 import os
 import sys
 import time
-import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,7 +67,7 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.recording.episode_reader import EpisodeReader
 
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.robot.arm_process import ArmServo, make_arm_servo
+from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
 from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
 from dexmani_real.robot.preflight import preflight_check, print_preflight
@@ -89,10 +88,6 @@ WORKSPACE_BOUNDS = np.array([[0.28, 0.72], [-0.50, 0.50], [0.05, 0.5]], dtype=np
 
 ARM_MAX_SPEED_DEG_S = 120.0  # 对齐采集入口 (vr_teleop_arm_only_record*.py) — 回放与采集同速
 ARM_MAX_ACC_DEG_S2 = 500.0  # 回放默认加速度: 保守值(避免回放超速); 用 --acc 覆盖匹配采集条件
-_INNER_CFG = ArmInnerLoopConfig(
-    joint_max_speed=float(np.deg2rad(ARM_MAX_SPEED_DEG_S)),
-    joint_max_acc=float(np.deg2rad(ARM_MAX_ACC_DEG_S2)),
-)
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 
@@ -686,52 +681,6 @@ def _make_robot(
         kinematics=planner.kin,
         planner=planner,
     )
-
-
-def _do_return_home(
-    robot: RobotInterface,
-    planner: XArm7MotionPlanner,
-    arm_inner: ArmServo,
-    arm_ip: str = "192.168.1.111",
-    *,
-    inner_cfg: ArmInnerLoopConfig = _INNER_CFG,
-) -> ArmServo:
-    """Return arm to home position: stop inner loop → plan+execute → restart.
-
-    Args:
-        inner_cfg: Per-run inner-loop config (e.g. with extended target_timeout_s
-                   for slow replays). Defaults to the module-level _INNER_CFG but
-                   the caller MUST pass the replayer's per-run cfg to avoid
-                   timeout loss (plan §6 P1 slow-replay risk).
-    """
-    print("return_home ...", flush=True)
-    t0 = time.perf_counter()
-    try:
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        t1 = time.perf_counter()
-        print(f"  Arm inner loop stopped ({t1 - t0:.1f}s)")
-
-        ok = robot.return_to_home(home_dt=HOME_DT)
-        t2 = time.perf_counter()
-        print(f"  {'OK' if ok else 'FAIL'} (homing {t2 - t1:.1f}s)")
-
-        new_inner = make_arm_servo(cfg=inner_cfg, ip=arm_ip)
-        robot.set_arm_servo(new_inner)
-        new_inner.start()
-        if not new_inner.wait_ready(timeout=30.0):
-            print("  Arm inner loop restart timed out")
-        else:
-            t3 = time.perf_counter()
-            print(f"  Arm inner loop restarted ({t3 - t2:.1f}s)")
-        return new_inner
-    except Exception:
-        traceback.print_exc()
-        print("  return_to_home failed, attempting emergency_stop")
-        arm_inner.set_target(None)
-        arm_inner.stop()
-        robot.emergency_stop()
-        raise
 
 
 # ═══════════════════════════════════════════════ Main Replayer
@@ -1474,12 +1423,16 @@ Control keys:
                         try:
                             if replayer.robot is not None and replayer.planner is not None:
                                 if replayer.robot.connect().get("arm"):
-                                    new_inner = _do_return_home(
+                                    new_inner = do_return_home(
                                         replayer.robot,
-                                        replayer.planner,
                                         replayer._arm_inner,
+                                        replayer._inner_cfg,
+                                        home_dt=HOME_DT,
                                         arm_ip=args.arm_ip,
-                                        inner_cfg=replayer._inner_cfg,
+                                        cancel_fn=lambda: any(
+                                            s in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP)
+                                            for s in kb.poll(timeout=0.0)
+                                        ),
                                     )
                                     replayer._arm_inner = new_inner
                                     replayer.robot.disconnect()
@@ -1491,8 +1444,8 @@ Control keys:
             finally:
                 kb.stop()
 
-        # Clean up any restarted arm inner loop from return_to_home above.
-        # shutdown() only cleans the original arm_inner; _do_return_home creates
+        # Clean up any restarted arm inner loop from do_return_home above.
+        # shutdown() only cleans the original arm_inner; do_return_home creates
         # a fresh one whose SHM rings would otherwise leak (resource_tracker
         # "leaked shared_memory objects" warning at process exit).
         if replayer._arm_inner is not None and replayer._arm_inner.is_alive:

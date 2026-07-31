@@ -20,7 +20,7 @@
 共享组件:
     ArmInnerLoop   — 内环线程 (robot/inner_loop.py, 30Hz, mode 6 — firmware trajectory planning)
     PreFlight      — 硬件就绪检查 (robot/preflight.py)
-    RateLimiter    — 补偿式频率限制 (utils/rate_limiter.py)
+    RateManager   — 高精度频率限制 (utils/rate_manager.py)
     RobotInterface — arm/hand 统一接口 (robot/interface.py)
 """
 
@@ -48,7 +48,7 @@ from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print
 from dexmani_real.robot.validate import validate_action
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate_limiter import RateLimiter
+from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
 from scipy.spatial.transform import Rotation as R
 
@@ -263,7 +263,7 @@ def main():
     print("\n键盘控制已启动，按 Q 退出")
 
     # ── 6. Main loop ──
-    limiter = RateLimiter(1.0 / CTRL_DT)  # shared: utils/rate_limiter.py
+    limiter = RateManager(1.0 / CTRL_DT)
     running = True
     wall_warned = [False, False, False]
     wall_timers = [0.0, 0.0, 0.0]  # per-axis debounce (independent 3 s cooldown)
