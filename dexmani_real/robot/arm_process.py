@@ -939,6 +939,11 @@ def do_return_home(
     else:
         print("  手未连接，跳过手归位")
 
+    # Sync collision model hand buffer after reset so path collision checks
+    # don't spam "hand_qpos not initialized" warnings (the URDF ignores hand
+    # DOFs today, but the 19-DOF model still warns on every unchecked waypoint).
+    robot._sync_hand_collision_model()
+
     # ── 4. Plan collision-safe path (planner only, no arm connection) ──
     _planner = getattr(robot, "planner", None)
     if _planner is not None:

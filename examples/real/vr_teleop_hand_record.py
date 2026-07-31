@@ -64,6 +64,7 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
+from dexmani_real.utils.throttle import ThrottledWarner
 
 logger = get_logger(__name__)
 
@@ -204,6 +205,18 @@ def record_held_frame(
 # ═══════════════════════════════════════════════ 手部命令计算
 
 
+_retarget_fail_warn = ThrottledWarner()
+_send_hand_fail_warn = ThrottledWarner()
+
+
+def _warn_hand_retarget_fail(reason: str) -> None:
+    _retarget_fail_warn("Hand retargeting: %s — holding position", reason)
+
+
+def _warn_send_hand_fail(reason: str) -> None:
+    _send_hand_fail_warn("Hand send: %s", reason)
+
+
 def compute_hand_command(
     retargeter: XHandRetargeter | None,
     vr_frame: dict,
@@ -222,15 +235,23 @@ def compute_hand_command(
         return prev_hand_cmd.copy(), False
 
     landmarks = vr_frame.get("landmarks") if vr_frame is not None else None
-    if landmarks is None or landmarks.shape != (21, 3):
+    if landmarks is None:
+        _warn_hand_retarget_fail("landmarks missing from VR frame")
+        return prev_hand_cmd.copy(), False
+    if landmarks.shape != (21, 3):
+        _warn_hand_retarget_fail(f"landmarks shape={landmarks.shape}, expected (21, 3)")
         return prev_hand_cmd.copy(), False
     if not np.all(np.isfinite(landmarks)):
+        _warn_hand_retarget_fail("landmarks contain NaN/Inf")
         return prev_hand_cmd.copy(), False
 
     try:
         target = retargeter.retarget(landmarks)
         if target is not None and len(target) == 12:
             return np.asarray(target, dtype=np.float64), True
+        _warn_hand_retarget_fail(
+            f"retargeter.retarget() returned {'None' if target is None else f'len={len(target)}'}"
+        )
     except Exception:
         logger.warning("Hand retargeting failed — holding position", exc_info=True)
 
@@ -385,6 +406,12 @@ def main():
         pos_scale=VR_POS_SCALE,
         rot_scale=VR_ROT_SCALE,
         max_delta_rot_rad=VR_MAX_DELTA_ROT_RAD,
+        # Match planner's base_pose_world = R_z(30°):
+        # Without this, mapper computes targets in base frame but IK solver
+        # treats them as world frame → systematic position error.
+        base_to_world_rot=Rotation.from_quat(
+            [0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]
+        ).as_matrix(),
     )
 
     # ── 7. Recorder ──
@@ -615,6 +642,7 @@ def main():
                         if do_home and running:
                             audio.play("home")
                             arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
+                            audio.play("home_done")
                             teleop_active = False
                             arm_mapper.clear()
                             _reset_hand_retargeter()
@@ -661,6 +689,7 @@ def main():
 
                     _stop_recording(save=True, triggered_by=ControlSignal.HOME)
                     arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
+                    audio.play("home_done")
                     teleop_active = False
                     arm_mapper.clear()
                     _reset_hand_retargeter()
@@ -849,6 +878,12 @@ def main():
                 continue
             stage_timer.mark("state")
 
+            # ── Hand liveness monitor (D11): detect silent child process crash ──
+            if hand_available and not state.hand_connected:
+                logger.warning("Hand disconnected mid-session (hand_connected=False) — disabling hand control")
+                hand_available = False
+                print("  ⚠ 手部连接丢失！降级为 hold-position", flush=True)
+
             # ── Arm error check ──
             if robot.arm.is_connected() and robot.arm.is_error():
                 arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
@@ -929,7 +964,7 @@ def main():
                         f"eef={np.round(state.eef_pos, 3)}m  "
                         f"v={vel:.2f}m/s  "
                         f"teleop={'ON' if teleop_active else 'OFF'}  "
-                        f"rec={'ON' if recording_active else 'OFF'}  "
+                        f"rec={'PAUSED' if recording_paused else ('ON' if recording_active else 'OFF')}  "
                         f"vr_age={vr_age:.3f}s  "
                         f"ik={ik_method}  "
                         f"err={error_count}",
@@ -973,31 +1008,12 @@ def main():
                         target_eef_pos=_last_target_eef_pos,
                         target_eef_rot6d=_last_target_eef_rot6d,
                     )
-                # Keep the hand cmd ring fresh during pause / VR stale —
-                # the arm inner loop holds position on its own, but the hand
-                # child's cmd_stale_hold_s (500 ms) fires noisy warnings if
-                # we stop sending entirely.  Sending the current hand position
-                # as an explicit hold matches the IK-fail path (:1130-1137).
-                if hand_available:
-                    robot.send_action(RobotAction(
-                        arm_qpos_cmd=prev_qpos_cmd.copy(),
-                        hand_qpos_cmd=prev_hand_cmd.copy(),
-                    ))
                 continue
 
             # ── 音频等待: B 按下后等待 begin 音频播完再响应运动 ──
             if teleop_hold_for_audio:
                 if audio.is_playing:
                     prev_qpos_cmd = state.arm_qpos.copy()
-                    # Keep the hand cmd ring fresh during audio hold —
-                    # the hand child's cmd_stale_hold_s (500ms) fires
-                    # false-positive warnings if we stop sending entirely.
-                    # Match the pattern in the pause/VR-stale path (L969-973).
-                    if hand_available:
-                        robot.send_action(RobotAction(
-                            arm_qpos_cmd=prev_qpos_cmd.copy(),
-                            hand_qpos_cmd=prev_hand_cmd.copy(),
-                        ))
                     continue
                 ema_prev_pos = ema_prev_quat = None
                 teleop_hold_for_audio = False
@@ -1100,10 +1116,12 @@ def main():
                 # Hand retargeting is independent of arm IK — send hand
                 # even when IK fails so the hand cmd ring doesn't go stale.
                 if hand_available:
-                    robot.send_action(RobotAction(
+                    _sr = robot.send_action(RobotAction(
                         arm_qpos_cmd=prev_qpos_cmd.copy(),
                         hand_qpos_cmd=hand_cmd,
                     ))
+                    if not _sr.get("hand_ok", True):
+                        _warn_send_hand_fail("IK-fail path: robot.send_action returned hand_ok=False")
                     prev_hand_cmd = hand_cmd.copy()
                 stage_timer.mark("send")
                 continue
@@ -1134,10 +1152,12 @@ def main():
                     # IK output rejected (joint delta too large) — arm holds
                     # but hand retargeting is independent and should still send.
                     if hand_available:
-                        robot.send_action(RobotAction(
+                        _sr = robot.send_action(RobotAction(
                             arm_qpos_cmd=prev_qpos_cmd.copy(),
                             hand_qpos_cmd=hand_cmd,
                         ))
+                        if not _sr.get("hand_ok", True):
+                            _warn_send_hand_fail("IK-gate-reject path: robot.send_action returned hand_ok=False")
                         prev_hand_cmd = hand_cmd.copy()
                     stage_timer.mark("send")
                     continue
@@ -1195,7 +1215,9 @@ def main():
 
             # ── Send ──
             arm_inner.set_target(action.arm_qpos_cmd)
-            robot.send_action(action)  # hand via SHM subprocess (or direct XHand)
+            send_result = robot.send_action(action)  # hand via SHM subprocess (or direct XHand)
+            if not send_result.get("hand_ok", True) and hand_available:
+                _warn_send_hand_fail("robot.send_action returned hand_ok=False")
             stage_timer.mark("send")
 
             # ── 录制帧 ──
@@ -1269,6 +1291,7 @@ def main():
                 audio.play("home")
                 try:
                     arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
+                    audio.play("home_done")
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")
@@ -1281,8 +1304,6 @@ def main():
         else:
             print("\n  超时，自动退出")
 
-        kb.stop()
-
         if arm_inner.is_alive:
             arm_inner.set_target(None)
             arm_inner.stop()
@@ -1292,6 +1313,12 @@ def main():
 
         robot.disconnect()
         vr_receiver.stop()
+
+        # Restore terminal echo LAST — the shutdown steps above take ~7 s
+        # collectively; if echo is restored earlier, stray keypresses (Q to
+        # confirm quit, etc.) appear as garbage characters interleaved with
+        # the shutdown log lines.
+        kb.stop()
 
         audio.play("end")
         time.sleep(2.0)

@@ -223,11 +223,14 @@ def main():
 
     # ── 6. VR Arm Mapper ──
     # vr_to_base_rot = I: FLU delta 直接当 world delta 用
-    # base_to_world_rot = I: 不做额外旋转
+    # base_to_world_rot = R_z(30°): 匹配 planner 的 base_pose_world, 转换 base-frame delta 到 world-frame
     arm_mapper = ArmWristMapper(
         pos_scale=VR_POS_SCALE,
         rot_scale=VR_ROT_SCALE,
         max_delta_rot_rad=VR_MAX_DELTA_ROT_RAD,
+        base_to_world_rot=Rotation.from_quat(
+            [0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]
+        ).as_matrix(),
     )
 
     # ── 7. Recorder ──
@@ -731,8 +734,6 @@ def main():
             if ControlSignal.QUIT in post_sigs or ControlSignal.EMERGENCY_STOP in post_sigs:
                 break
 
-        kb.stop()
-
         # ── Cleanup ──
         if arm_inner.is_alive:
             arm_inner.set_target(None)
@@ -741,6 +742,9 @@ def main():
 
         robot.disconnect()
         vr_receiver.stop()
+
+        kb.stop()
+
         print("Done.")
 
 

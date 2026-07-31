@@ -295,11 +295,14 @@ def main():
 
     # ── 6. VR Arm Mapper ──
     # vr_to_base_rot = I: FLU delta 直接当 world delta 用
-    # base_to_world_rot = I: 不做额外旋转
+    # base_to_world_rot = R_z(30°): 匹配 planner 的 base_pose_world, 转换 base-frame delta 到 world-frame
     arm_mapper = ArmWristMapper(
         pos_scale=VR_POS_SCALE,
         rot_scale=VR_ROT_SCALE,
         max_delta_rot_rad=VR_MAX_DELTA_ROT_RAD,
+        base_to_world_rot=Rotation.from_quat(
+            [0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]
+        ).as_matrix(),
     )
 
     # ── 7. Recorder ──
@@ -528,6 +531,7 @@ def main():
                         if do_home and running:
                             audio.play("home")
                             arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
+                            audio.play("home_done")
                             teleop_active = False
                             arm_mapper.clear()
                             if arm_inner.wait_ready(timeout=30.0):
@@ -569,6 +573,7 @@ def main():
 
                     _stop_recording(save=True, triggered_by=ControlSignal.HOME)
                     arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
+                    audio.play("home_done")
                     teleop_active = False
                     arm_mapper.clear()
                     if arm_inner.wait_ready(timeout=30.0):
@@ -1191,6 +1196,7 @@ def main():
                 audio.play("home")
                 try:
                     arm_inner = do_return_home(robot, arm_inner, _INNER_CFG, cancel_fn=_return_home_cancel_fn)
+                    audio.play("home_done")
                 except Exception:
                     traceback.print_exc()
                     print("  return_home 失败，继续退出")
@@ -1200,8 +1206,6 @@ def main():
                     arm_inner.emergency_stop()
                     robot.emergency_stop()
                 break
-
-        kb.stop()
 
         # ── Cleanup ──
         if arm_inner.is_alive:
@@ -1217,6 +1221,8 @@ def main():
         # 播放结束提示音（阻塞，确保播放完毕再退出）
         audio.play("end")
         time.sleep(2.0)
+
+        kb.stop()
 
         print("Done.")
 

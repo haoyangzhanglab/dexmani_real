@@ -140,13 +140,12 @@ class ArmInnerLoop:
         self._arm_tau: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._error_state: bool = False
         self._last_sent_target: np.ndarray | None = None  # tracking error baseline
-        # Value actually forwarded to the SDK each tick (hold position during
-        # holds) — the inner-loop "sent" stream (plan §4.9).
+        # Value forwarded to the SDK each tick — the inner-loop "sent" stream (plan §4.9).
         self._last_sent_cmd: np.ndarray = np.zeros(7, dtype=np.float64)
         self._arm = None  # live XArmAPI handle of the loop thread (mode/connected queries)
         self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
         self._mode_warn = ThrottledWarner(interval_s=2.0)
-        self._tracking_warn = ThrottledWarner(interval_s=2.0)
+        self._tracking_warn = ThrottledWarner(interval_s=5.0)
 
         # ── Lifecycle ──
         self._stop_event = threading.Event()
@@ -221,11 +220,11 @@ class ArmInnerLoop:
 
     @property
     def last_sent_cmd(self) -> np.ndarray:
-        """The delta-clamped target actually forwarded to the SDK last tick (7,).
+        """The target forwarded to the SDK last tick (7,).
 
-        Updated at the two hardware write sites only: ``_send_target`` (normal
-        dispatch, post delta-clamp) and ``_hold_position`` (hold position).
-        During holds this equals the held position (plan §4.9 "sent" stream).
+        Updated at ``_send_target`` (normal dispatch) and in ``_bootstrap_state``
+        (startup seed).  During holds no new command is sent — the property stays
+        at the last dispatched value (plan §4.9 "sent" stream).
         """
         with self._lock:
             return self._last_sent_cmd.copy()
@@ -360,10 +359,19 @@ class ArmInnerLoop:
         return True
 
     def _bootstrap_state(self, arm) -> np.ndarray | None:
-        """Read initial joint position and seed shared state. Returns current_qpos or None."""
+        """Read initial joint state and seed shared state (qpos, qvel, tau).
+
+        Returns current_qpos or None.
+
+        ``get_joint_states(num=3)`` fetches (qpos, qvel, tau) in one SDK call.
+        All three fields are seeded here so that ``get_state_and_dynamics()``
+        returns valid data immediately — even during idle periods when the main
+        loop hasn't issued a target yet and ``_read_and_update_state`` hasn't
+        been called.
+        """
         code, states = arm.get_joint_states(is_radian=True, num=3)
         if code != 0 or len(states) == 0:
-            logger.error("ArmInnerLoop: failed to read initial qpos (code=%d)", code)
+            logger.error("ArmInnerLoop: failed to read initial state (code=%d)", code)
             return None
 
         current_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
@@ -375,18 +383,16 @@ class ArmInnerLoop:
             self._arm_qpos = current_qpos.copy()
             self._error_state = False
             self._last_sent_cmd = current_qpos.copy()
-            # Seed _last_sent_target so the per-step delta clamp has a baseline
-            # from the very first _send_target call after restart.  Without this,
-            # the first target (e.g. home_qpos after return_home) may be 30°+
-            # away, forwarded to the firmware in a single step without clamping,
-            # causing violent motion and massive tracking errors.
-            # See: 2026-07-30 session — 32.82° coarse residual → 0.573 rad
-            # tracking error after restart.
+            # Seed _last_sent_target from current position so the tracking
+            # error monitor uses a meaningful baseline from the very first
+            # target after startup.  Without this, the first target (e.g.
+            # home_qpos after return_home) can be 30°+ away, producing a
+            # spurious tracking error spike.
             self._last_sent_target = current_qpos.copy()
 
-        # Populate dynamics during bootstrap so the first SHM frame carries
-        # real qvel/tau — eliminates the 1-2 frame NaN torque rejection at
-        # teleop start (ref: 2026-07-30 session).
+        # Seed velocity and torque from the same SDK call so
+        # validate_action's velocity-NaN gate doesn't reject the first few
+        # frames after teleop start (before _read_and_update_state runs).
         if len(states) > 1:
             v = np.asarray(states[1], dtype=np.float64)
             if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
@@ -419,7 +425,6 @@ class ArmInnerLoop:
             with self._lock:
                 self._arm_target = None
             self._recover_mode(arm)
-            self._hold_position(arm)
             return "continue"
 
         logger.error(
@@ -537,12 +542,14 @@ class ArmInnerLoop:
 
                 now = time.perf_counter()
 
-                # Timeout → hold (skip during startup)
+                # Timeout → hold (skip during startup).
+                # Mode 6 firmware holds the last target position when no new
+                # commands arrive — no explicit hold command needed (verified
+                # by lerobot_ufactory in hundreds of hours of operation).
                 no_target_yet = last_target_ts == 0.0
                 if not no_target_yet and (
                     target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
                 ):
-                    self._hold_position(arm)
                     continue
 
                 if target is None:
@@ -745,53 +752,14 @@ class ArmInnerLoop:
         logger.warning("ArmInnerLoop: set_mode(6) returned but mode=%d", actual_mode)
         return False
 
-    def _hold_position(self, arm) -> None:
-        """Read current position and re-send as hold command via set_servo_angle.
-
-        Updates ``_last_sent_target`` so the per-step delta clamp and tracking
-        error monitor use a meaningful baseline when targets resume after a hold.
-        """
-        try:
-            code, states = arm.get_joint_states(is_radian=True, num=3)
-            if code == 0 and len(states) > 0:
-                hold = np.asarray(states[0], dtype=np.float64)[:7]
-                if np.all(np.isfinite(hold)):
-                    arm.set_servo_angle(
-                        angle=hold.tolist(),
-                        is_radian=True,
-                        speed=self._cfg.joint_max_speed,
-                        mvacc=self._cfg.joint_max_acc,
-                        wait=False,
-                    )
-                    self._last_sent_target = hold.copy()
-            # Refresh dynamics during hold so torque gates are meaningful
-            # when teleop resumes (num=3 above returns velocity + torque alongside position).
-            if code == 0:
-                if len(states) > 1:
-                    v = np.asarray(states[1], dtype=np.float64)
-                    if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
-                        with self._lock:
-                            self._arm_qvel = v[:7].copy()
-                if len(states) > 2:
-                    tau = np.asarray(states[2], dtype=np.float64)
-                    if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
-                        with self._lock:
-                            self._arm_tau = tau[:7].copy()
-            # Lock-protected: last_sent_cmd is read from another thread via last_sent_cmd property.
-            if code == 0 and len(states) > 0 and np.all(np.isfinite(hold)):
-                with self._lock:
-                    self._last_sent_cmd = hold.copy()  # sent stream = hold position (plan §4.9)
-        except (RuntimeError, OSError):
-            pass
-
     def _init_mode(self, arm) -> None:
-        """Transition arm to Mode 6 (joint online trajectory planning)."""
-        arm.set_mode(0)
-        arm.set_state(0)
-        time.sleep(0.05)
+        """Transition arm to Mode 6 (joint online trajectory planning).
+
+        Caller (``_init_mode_6``) has already run ``clean_error()``,
+        ``clean_warn()``, and ``motion_enable(True)`` — no need for a
+        ``set_mode(0)`` prelude or sleep delays.
+        """
         arm.set_mode(6)
-        arm.set_state(0)
-        time.sleep(0.05)
         arm.set_state(0)
         # Set firmware-level joint acceleration limit (respected by Mode 6
         # trajectory planner).

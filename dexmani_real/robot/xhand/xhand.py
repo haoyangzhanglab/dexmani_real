@@ -305,6 +305,15 @@ class XHand:
                 return False
 
             if self.error_ok(err):
+                if attempt > 1:
+                    logger.warning(
+                        "XHand connect succeeded on attempt %d/%d "
+                        "(retries indicate SDO/communication glitch) — "
+                        "adding 1.0s post-recovery stabilisation delay.",
+                        attempt,
+                        retries,
+                    )
+                    time.sleep(1.0)
                 return True
 
             self._record_error(err)
@@ -357,6 +366,30 @@ class XHand:
         else:
             self.last_qpos_cmd = self._array12(self.config.home_qpos)
             logger.info("Using home_qpos as initial qpos: %s", self.last_qpos_cmd)
+
+        # ── Deadband safety verify (D11): readback actual qpos and compare ──
+        # If _init_hand_state set last_qpos_cmd to a wrong value (SDK cache
+        # zeroes, hardware glitch, mechanical jam during home settle), every
+        # subsequent send_action hits the 0.001-rad deadband and returns True
+        # without writing to hardware → hand frozen indefinitely.
+        try:
+            _verify_state = self.get_state(full=False, force_update=True)
+            _verify_qpos = np.asarray(_verify_state.get("qpos", np.zeros(12)), dtype=np.float64)
+            if _verify_qpos.shape == (12,) and np.all(np.isfinite(_verify_qpos)):
+                _delta = float(np.max(np.abs(self.last_qpos_cmd - _verify_qpos)))
+                if _delta > 0.05:  # ~3° — hardware readback disagrees with cached cmd
+                    logger.warning(
+                        "XHand: last_qpos_cmd disagrees with hardware readback by %.3f rad (%.2f°) "
+                        "— correcting last_qpos_cmd to actual position to prevent deadband stuck. "
+                        "cmd=[%s] actual=[%s]",
+                        _delta,
+                        np.rad2deg(_delta),
+                        np.array2string(self.last_qpos_cmd, precision=3, suppress_small=True),
+                        np.array2string(_verify_qpos, precision=3, suppress_small=True),
+                    )
+                    self.last_qpos_cmd = _verify_qpos.copy()
+        except Exception:
+            pass  # non-critical — if verify fails, proceed with whatever last_qpos_cmd we have
 
         # ── Tactile sensor initialisation ──
         # Reset all five fingertip sensors after power-on.  The SDK documents
@@ -461,6 +494,17 @@ class XHand:
                 "XHand connection failed — check power, EtherCAT cable, "
                 "and eno1 link status; EtherCAT raw socket requires "
                 "CAP_NET_RAW (sudo setcap cap_net_raw+ep python) or root"
+            )
+            # SDO write failures during open_ethercat (e.g. "write sdo failed
+            # 1,0,13") indicate the slave's CoE object dictionary is in an
+            # inconsistent state — close_device() only releases the host-side
+            # socket; the slave firmware retains the corrupted registers.
+            # A power cycle forces a cold boot that clears all volatile state.
+            logger.error(
+                "If SDO errors appeared above: power-cycle the XHand "
+                "(disconnect + reconnect 24V power, wait ≥5 s for the "
+                "EtherCAT slave to cold-boot), then retry.  Software-level "
+                "retries cannot clear a corrupted object dictionary."
             )
         else:
             logger.warning(

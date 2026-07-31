@@ -18,6 +18,7 @@ poll() on the main thread.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -78,6 +79,7 @@ class KeyboardHandler:
         self._running: bool = False
         self._debounce_s = float(debounce_s)
         self._last_signal_time: dict[ControlSignal, float] = {}
+        self._saved_termios: list | None = None  # saved terminal attributes for echo restore
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -105,6 +107,13 @@ class KeyboardHandler:
         except ImportError:
             raise ImportError("pynput is required for global keyboard capture. " "Install with: pip install pynput")
 
+        # Suppress terminal echo so keys captured by pynput don't also
+        # appear as stray characters on stdout (interleaving with print()
+        # output).  pynput's ``suppress=True`` requires the uinput kernel
+        # module + write access to /dev/uinput on Linux; termios is more
+        # portable (no extra permissions) and equally effective.
+        self._suppress_terminal_echo()
+
         def on_press(key: object) -> None:
             try:
                 if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
@@ -128,8 +137,13 @@ class KeyboardHandler:
             except Exception:
                 pass
 
-        self._listener = keyboard.Listener(on_press=on_press)
-        self._listener.start()
+        try:
+            self._listener = keyboard.Listener(on_press=on_press)
+            self._listener.start()
+        except Exception:
+            self._restore_terminal_echo()  # roll back echo suppression on failure
+            raise
+
         self._running = True
 
     def stop(self) -> None:
@@ -151,6 +165,52 @@ class KeyboardHandler:
             with self._lock:
                 self._buffer.clear()
             self._last_signal_time.clear()
+            self._restore_terminal_echo()
+
+    # ------------------------------------------------------------------
+    # Terminal echo suppression
+    # ------------------------------------------------------------------
+
+    def _suppress_terminal_echo(self) -> None:
+        """Disable terminal ECHO so pynput-captured keys don't echo to stdout.
+
+        pynput captures at the X11/Wayland level but does not suppress the
+        event from also reaching the terminal driver.  In cooked mode the
+        TTY echoes every character, which interleaves with ``print()``
+        output — particularly visible during blocking operations like
+        ``do_return_home`` where the user holds H and gets dozens of stray
+        'h' characters mixed with progress lines.
+
+        Only ECHO and ECHONL are cleared; canonical mode (line editing,
+        backspace) is preserved.  Falls back silently when stdin is not a
+        TTY (e.g. piped input or headless SSH).
+        """
+        if not sys.stdin.isatty():
+            return
+        try:
+            import termios
+
+            fd = sys.stdin.fileno()
+            self._saved_termios = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            # lflags[3]: clear ECHO (character echo) and ECHONL (echo
+            # newline in canonical mode when ICANON is off).
+            new[3] = new[3] & ~(termios.ECHO | termios.ECHONL)
+            termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        except (termios.error, OSError):
+            self._saved_termios = None  # permission denied or not a TTY
+
+    def _restore_terminal_echo(self) -> None:
+        """Restore terminal attributes saved by :meth:`_suppress_terminal_echo`."""
+        if self._saved_termios is None:
+            return
+        try:
+            import termios
+
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved_termios)
+        except (termios.error, OSError):
+            pass
+        self._saved_termios = None
 
     # ------------------------------------------------------------------
     # Context manager protocol

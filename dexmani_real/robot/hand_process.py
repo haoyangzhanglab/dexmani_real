@@ -17,7 +17,6 @@ Architecture (simplified: all safety clipping runs in the child's XHand driver):
 
 Lifecycle:
     - ``daemon=False`` — the child survives main-process death; firmware holds.
-    - cmd ring stale > ``cmd_stale_hold_s`` → child stops sending (hold); NEVER zeros torque.
     - orphan exit: ``orphan_exit_s`` with zero new cmd seqs → hold and exit cleanly.
     - SIGINT → hold and exit; NEVER detorque.
     - estop preemption: tick-loop estop check + SEND_TRAJECTORY step-boundary abort.
@@ -36,6 +35,7 @@ Ref: docs/arm-hand-process-isolation-plan.md §4.4-4.7 (SHM layouts, F1/F2),
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import time
 from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
@@ -119,9 +119,8 @@ _MACRO_MAXLEN = 2
 _READY_TIMEOUT_S = 15.0
 # Hand joint settle parameters — shared by connection-time homing and the
 # HAND_MACRO_RESET RPC handler.
-_HAND_SETTLE_TIMEOUT_S = 2.0  # max time for 12-DOF hand to converge to target
-_HAND_SETTLE_TOL_RAD = 0.03   # ~1.7° — tight convergence (preferred)
-_HAND_SETTLE_GOOD_ENOUGH_RAD = 0.05  # ~2.9° — acceptable if 0.03 unreachable
+_HAND_SETTLE_TIMEOUT_S = 3.0  # max time for 12-DOF hand to converge to target
+_HAND_SETTLE_TOL_RAD = 0.06   # ~3.4° max joint error at settle
 # Watchdog: persistent send errors → reconnect.
 _WATCHDOG_RECONNECT_AFTER = 30
 
@@ -132,7 +131,6 @@ class HandProcessConfig:
 
     hz: float = 30.0  # child loop rate (XHand control rate)
     shm_prefix: str = "dexmani_hand"  # rings: {prefix}_state/_cmd/_macro_cmd/_macro_result
-    cmd_stale_hold_s: float = 0.5  # child: cmd ring stale → hold position, NEVER detorque (§5.2)
     state_stale_s: float = 0.1  # façade freshness gate: 3 × hand_dt (§4.7); stale → degraded, no escalation
     rpc_timeout_s: float = 10.0  # macro RPC client timeout
     expected_producer_id: int = PRODUCER_TELEOP  # nonzero mismatch on hand_cmd → reject + warn (D9)
@@ -602,6 +600,7 @@ def _hand_child_main(
     prefix = config.shm_prefix
     state_ring = cmd_ring = macro_cmd_ring = macro_result_ring = None
     rpc_thread = None
+    hand = None  # pre-initialised so finally block is safe on pre-line-616 exceptions
     try:
         state_ring = SeqlockRingBuffer(f"{prefix}_state", HAND_STATE_DTYPE, maxlen=_STATE_MAXLEN, create=False)
         cmd_ring = SeqlockRingBuffer(f"{prefix}_cmd", HAND_CMD_DTYPE, maxlen=_CMD_MAXLEN, create=False)
@@ -648,14 +647,6 @@ def _hand_child_main(
                     logger.info("hand child: reached home_qpos (max_err=%.3f rad).", _max_err)
                     _settled = True
                     break
-                if _max_err < _HAND_SETTLE_GOOD_ENOUGH_RAD:
-                    logger.info(
-                        "hand child: home_qpos good-enough (max_err=%.3f rad < %.3f rad).",
-                        _max_err,
-                        _HAND_SETTLE_GOOD_ENOUGH_RAD,
-                    )
-                    _settled = True
-                    break
             time.sleep(0.05)
         if not _settled:
             logger.warning(
@@ -674,17 +665,7 @@ def _hand_child_main(
         # minimal test fakes may not — detect once, stay compatible with both.
         _traj_accepts_abort = "abort_event" in inspect.signature(hand.send_trajectory).parameters
 
-        # Shared timestamp of the last time a hand command was actually sent to
-        # hardware — updated under macro_lock by both the tick loop and the RPC
-        # thread.  Used for stale detection instead of cmd_ring.frame_age_ns()
-        # so that RPC-driven hand activity (HAND_MACRO_RESET settle loop, etc.)
-        # suppresses the stale-hold warning even though the cmd ring is not being
-        # written by the (blocked) main process.  MUST be initialised before
-        # handle_macro (which references it via nonlocal).
-        _last_hand_command_time = time.monotonic()
-
         def handle_macro(request: np.ndarray, seq: int) -> np.ndarray:
-            nonlocal _last_hand_command_time
             result = new_frame(HAND_MACRO_RESULT_DTYPE)
             code = int(request["cmd"][0])
             ok = False
@@ -695,22 +676,40 @@ def _hand_child_main(
                 if code == HAND_MACRO_RESET:
                     _target = np.array(request["qpos"][0], dtype=np.float64)
                     _deadline = time.monotonic() + _HAND_SETTLE_TIMEOUT_S
+                    _consecutive_send_fails = 0
                     while time.monotonic() < _deadline:
                         # Abort on estop — prevents the tick loop from blocking
                         # on macro_lock for up to 3 s (same pattern as
                         # SEND_TRAJECTORY abort_event).
                         if estop_event.is_set():
                             break
-                        hand.send_action(_target)
-                        _last_hand_command_time = time.monotonic()
+                        _send_ok = hand.send_action(_target)
+                        if not _send_ok:
+                            _consecutive_send_fails += 1
+                        else:
+                            _consecutive_send_fails = 0
+                        # Ghost-communication guard: if send_action() fails
+                        # repeatedly at the SDK level (EtherCAT fault, SDO
+                        # timeout), get_state(force_update=True) may still
+                        # return stale/cached qpos from the ESC.  Without
+                        # this guard the convergence check passes with ghost
+                        # data → "手归位 OK" printed despite hand not moving
+                        # → on next connect, the EtherCAT slave is stuck in
+                        # OP and requires a power cycle.
+                        if _consecutive_send_fails >= 5:
+                            logger.error(
+                                "hand child: HAND_MACRO_RESET aborting — "
+                                "%d consecutive send_action failures "
+                                "(EtherCAT communication likely broken, "
+                                "slave may require power cycle).",
+                                _consecutive_send_fails,
+                            )
+                            break
                         _st = hand.get_state(force_update=True)
                         _qpos = np.asarray(_st.get("qpos", np.zeros(12)), dtype=np.float64)
                         if np.all(np.isfinite(_qpos)):
                             _err = float(np.max(np.abs(_qpos - _target)))
                             if _err < _HAND_SETTLE_TOL_RAD:
-                                ok = True
-                                break
-                            if _err < _HAND_SETTLE_GOOD_ENOUGH_RAD:
                                 ok = True
                                 break
                         time.sleep(0.05)
@@ -732,10 +731,8 @@ def _hand_child_main(
                             )
                 elif code == HAND_MACRO_STOP:
                     ok = hand.stop()  # deliberate detorque (explicit macro only)
-                    _last_hand_command_time = time.monotonic()
                 elif code == HAND_MACRO_CLEAR_ERROR:
                     ok = hand.clear_error()
-                    _last_hand_command_time = time.monotonic()
                 elif code == HAND_MACRO_SEND_TRAJECTORY:
                     n = max(0, min(int(request["n_waypoints"][0]), MAX_HAND_WAYPOINTS))
                     duration_s = float(request["duration_s"][0])
@@ -749,7 +746,6 @@ def _hand_child_main(
                             ok = hand.send_trajectory(wps, duration_s, max_speed=ms, abort_event=estop_event)
                         else:
                             ok = hand.send_trajectory(wps, duration_s, max_speed=ms)
-                        _last_hand_command_time = time.monotonic()
                 else:
                     logger.warning("hand child: unknown macro cmd=%d (seq=%d).", code, seq)
             result["ok"][0] = int(bool(ok))
@@ -765,6 +761,16 @@ def _hand_child_main(
         stale_warn = ThrottledWarner()
         last_ts = time.monotonic()
         last_new_cmd_monotonic = time.monotonic()
+        _first_cmd_logged = False
+        # Snapshot current qpos after reset so first-cmd delta is meaningful.
+        _last_cmd_qpos: np.ndarray = np.zeros(12, dtype=np.float64)
+        try:
+            _init_state = hand.get_state(full=False)
+            _q = np.asarray(_init_state.get("qpos", np.zeros(12)), dtype=np.float64)
+            if _q.shape == (12,) and np.all(np.isfinite(_q)):
+                _last_cmd_qpos = _q.copy()
+        except Exception:
+            pass
 
         # RPC macros on their own thread (exactly like the arm child): a
         # blocking macro (SEND_TRAJECTORY runs for its full duration) must
@@ -810,23 +816,7 @@ def _hand_child_main(
                         estopped = True
                     _publish_hand_state(hand, frame, state_ring, last_processed_seq)
             else:
-                # ── 2. Stale cmd ring (main dead/stalled) → hold; NEVER detorque.
-                # Uses _last_hand_command_time instead of cmd_ring.frame_age_ns()
-                # so that RPC-driven hand activity (HAND_MACRO_RESET settle loop,
-                # send_trajectory, etc.) suppresses the warning even though the
-                # cmd ring is not being written by the (blocked) main process.
-                # Also suppressed while estopped (post-estop recovery window: the
-                # main process cleared the estop event but has not yet resumed
-                # sending hand commands — e.g. during do_return_home).
-                _time_since_last_cmd = time.monotonic() - _last_hand_command_time
-                if not estopped and cmd_ring.latest_sequence > 0 and _time_since_last_cmd > config.cmd_stale_hold_s:
-                    stale_warn(
-                        "hand child: cmd ring stale (%.0f ms > %.0f ms) — holding position (never detorque).",
-                        _time_since_last_cmd * 1e3,
-                        config.cmd_stale_hold_s * 1e3,
-                    )
-
-                # 3. hand_cmd — send on NEW seq only.
+                # 2. hand_cmd — send on NEW seq only.
                 res = cmd_ring.read_latest()
                 if res is not None:
                     data, ts_ns, seq = res
@@ -843,16 +833,45 @@ def _hand_child_main(
                             )
                         else:
                             qpos_cmd = np.array(data["qpos_cmd"][0], dtype=np.float64)
+                            # D11: one-shot diagnostic — log the first command from
+                            # teleop so we can confirm it arrived in the child and
+                            # differs from the home position.
+                            if not _first_cmd_logged:
+                                _first_cmd_logged = True
+                                _cmd_delta = np.abs(qpos_cmd - _last_cmd_qpos)
+                                _max_joint = int(np.argmax(_cmd_delta))
+                                logger.info(
+                                    "hand child: first teleop cmd (seq=%d) max_delta=%.4f rad (%.2f°) @j%d\n"
+                                    "  cmd=[%s]\n"
+                                    "  cur=[%s]\n"
+                                    "  del=[%s]",
+                                    seq,
+                                    float(_cmd_delta[_max_joint]),
+                                    np.rad2deg(float(_cmd_delta[_max_joint])),
+                                    _max_joint,
+                                    " ".join(f"{x:7.3f}" for x in qpos_cmd),
+                                    " ".join(f"{x:7.3f}" for x in _last_cmd_qpos),
+                                    " ".join(f"{x:+7.3f}" for x in _cmd_delta),
+                                )
+                            _send_ok = False
                             with macro_lock:
                                 try:
-                                    hand.send_action(qpos_cmd)
-                                    _last_hand_command_time = time.monotonic()
+                                    _send_ok = hand.send_action(qpos_cmd)
                                 except Exception:
-                                    logger.warning("hand child: send_action failed.", exc_info=True)
+                                    logger.warning("hand child: send_action exception.", exc_info=True)
+                            if not _send_ok:
+                                # Throttled (≤1/5s): the unthrottled watchdog at
+                                # 30 consecutive errors already fires for persistent
+                                # faults; this log covers intermittent drops.
+                                stale_warn(
+                                    "hand child: send_action failed (consecutive_send_errors=%d) — "
+                                    "command may not have reached hardware.",
+                                    hand.consecutive_send_errors,
+                                )
                         last_processed_seq = seq
                         estopped = False  # fresh command → estop recovery complete
 
-                # 4. Watchdog: persistent send errors → reconnect.
+                # 3. Watchdog: persistent send errors → reconnect.
                 if hand.consecutive_send_errors >= _WATCHDOG_RECONNECT_AFTER:
                     logger.warning(
                         "hand child: %d consecutive send errors — resetting connection.",
@@ -864,23 +883,26 @@ def _hand_child_main(
                         except Exception:
                             logger.warning("hand child: reset_connection failed.", exc_info=True)
 
-                # 5. Publish state + echo + tactile every tick.
+                # 4. Publish state + echo + tactile every tick.
                 with macro_lock:
                     _publish_hand_state(hand, frame, state_ring, last_processed_seq)
 
-            # 6. Orphan exit (daemon=False, plan §5.2 / D4): no new cmd seqs
-            #    for orphan_exit_s → the main process died or exited without
-            #    calling stop(). multiprocessing's atexit joins non-daemon
-            #    children, so without this the interpreter shutdown would hang
-            #    forever on this loop. Hold position (firmware holds, A4) and
-            #    exit cleanly — NEVER detorque.
+            # 5. Orphan exit (daemon=False, plan §5.2 / D4): no new cmd seqs
+            #    for orphan_exit_s AND the parent process is actually dead
+            #    (ppid == 1 → adopted by init).  Idle periods where the main
+            #    loop is waiting for user input (no hand commands sent) must
+            #    NOT trigger this — the parent is alive, just not sending.
             if config.orphan_exit_s > 0 and time.monotonic() - last_new_cmd_monotonic > config.orphan_exit_s:
-                logger.info(
-                    "hand child: no new cmd seqs for %.0f s — main process exited without stop(); "
-                    "holding position (firmware, A4) and exiting cleanly (never detorque).",
-                    config.orphan_exit_s,
-                )
-                break
+                if os.getppid() == 1:
+                    logger.info(
+                        "hand child: no new cmd seqs for %.0f s — main process exited without stop(); "
+                        "holding position (firmware, A4) and exiting cleanly (never detorque).",
+                        config.orphan_exit_s,
+                    )
+                    break
+                # Parent still alive (e.g. idle waiting for teleop start) —
+                # reset timer so we don't re-check getppid() every tick.
+                last_new_cmd_monotonic = time.monotonic()
 
             # SIGINT → hold last position and exit cleanly — NEVER detorque
             # (plan §5.2; the finally block does not call hand.stop()).
