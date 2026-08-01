@@ -64,6 +64,7 @@ class RobotState:
     hand_tipboard_err: np.ndarray  # (12,) int32 — tip board error registers per joint
     hand_commboard_err: np.ndarray  # (12,) int32 — comm board error registers per joint
     hand_jointboard_err: np.ndarray  # (12,) int32 — joint motor-driver board error registers per joint
+    hand_qpos_stale: bool  # True when hand_qpos frozen despite active cmd (driver board lockout)
 
     # ── Derived (chained FK) ──
     fingertip_pos: np.ndarray  # (5,3) float64  m (world frame)

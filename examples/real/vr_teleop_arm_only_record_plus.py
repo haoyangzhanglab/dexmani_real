@@ -241,6 +241,7 @@ def main():
 
     if not result.get("arm"):
         print("arm 连接失败，退出")
+        robot.disconnect()
         vr_receiver.stop()
         return
 

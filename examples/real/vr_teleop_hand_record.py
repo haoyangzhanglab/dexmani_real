@@ -121,11 +121,16 @@ ARM_CMD_MAX_STEP_RAD = float(np.deg2rad(ARM_MAX_SPEED_DEG_S)) * CTRL_DT  # 命�
 IK_OUTPUT_SAFETY_THRESHOLD_RAD = 0.45
 IK_OUTPUT_GATE_ENABLED = False
 
-# VR wrist quaternion continuity gate: reject frames where the angular distance
-# between consecutive wrist quaternions exceeds this threshold.  Human wrist max
-# is ~500°/s (31°/frame @ 16 Hz) for elite athletes; 45°/frame (~720°/s) gives
-# 45% margin and catches VR tracking glitches (typically 100°+/frame).
-VR_WRIST_QUAT_JUMP_THRESHOLD_RAD: float = np.deg2rad(45)
+# VR wrist quaternion diagnostic threshold: log a warning when the angular
+# distance between consecutive wrist quaternions exceeds this value.
+# This is a PURELY DIAGNOSTIC threshold — it does NOT block or hold motion.
+# Downstream safety layers (ARM_CMD_MAX_STEP_RAD, inner-loop delta clamp,
+# Mode 6 firmware speed/accel limits) already protect against any single-
+# frame anomaly that a bad quaternion could cause.
+#
+# Set high enough (180°/frame ≈ 2880°/s) to never fire on real human motion;
+# only VR tracking glitches (instantaneous 90°+ flips) should trigger it.
+VR_WRIST_QUAT_DIAG_THRESHOLD_RAD: float = np.deg2rad(180)
 
 # Frame quality codes for HDF5 flag_frame_status field (schema v11).
 # Written alongside the legacy flags for backward-compatible filtering.
@@ -320,6 +325,7 @@ def main():
 
     if not result.get("arm"):
         print("arm 连接失败，退出")
+        robot.disconnect()
         vr_receiver.stop()
         return
 
@@ -335,6 +341,8 @@ def main():
     _hand_reconnect_count = 0
     _HAND_DISCONNECT_DEBOUNCE = 5   # ~312 ms @ 16 Hz
     _HAND_RECONNECT_DEBOUNCE = 10   # ~625 ms @ 16 Hz — slightly longer to avoid flapping
+    _hand_ramp_start: np.ndarray | None = None  # hand smoothstep-ramp origin (B-press qpos → VR)
+    _hand_ramp_frames = 0  # remaining ramp frames (16 → 0, ~1s @16Hz)
     if not hand_available:
         print("  ⚠ 手部不可用 — 本集手部命令将 hold-position (不控制手指运动)")
 
@@ -361,11 +369,14 @@ def main():
                 converges from the actual hardware pose instead of the neutral
                 midpoint — eliminating the first-frame NLP convergence cost.
         """
+        nonlocal _hand_ramp_start, _hand_ramp_frames
         if hand_retargeter is not None:
             try:
                 hand_retargeter.reset(initial_qpos=hand_qpos)
             except Exception:
                 pass
+        _hand_ramp_start = None
+        _hand_ramp_frames = 0
 
     # ── 4. Pre-Flight ──
     report = preflight_check(robot)
@@ -1060,38 +1071,54 @@ def main():
                 continue
 
             # ── 音频等待: B 按下后等待 begin 音频播完再响应运动 ──
+            # During audio, write held frames to keep the recording grid
+            # aligned — skipping frames with bare continue breaks the
+            # dt=1/CTRL_HZ time-axis contract.  Also refresh prev_hand_cmd
+            # from the current hardware state so the hand ramp starts from
+            # the actual joint position, not a stale buffer.
             if teleop_hold_for_audio:
                 if audio.is_playing:
                     prev_qpos_cmd = state.arm_qpos.copy()
+                    arm_inner.set_target(prev_qpos_cmd)
+                    if hand_available and np.all(np.isfinite(state.hand_qpos)):
+                        prev_hand_cmd = state.hand_qpos.copy()
+                    if recording_active:
+                        record_held_frame(
+                            recorder, state, prev_qpos_cmd.copy(), vr_frame, cam,
+                            ik_ok=False, retarget_ok=False,
+                            arm_qpos_sent=arm_inner.last_sent_cmd,
+                            hold_hand=prev_hand_cmd.copy(),
+                            diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame,
+                                                    audio_hold=True),
+                            target_eef_pos=_last_target_eef_pos,
+                            target_eef_rot6d=_last_target_eef_rot6d,
+                        )
                     continue
+                # Audio just ended — seed the hand ramp origin from the
+                # current hardware pose so retargeting transitions smoothly
+                # from home_qpos to the VR target.
                 ema_prev_pos = ema_prev_quat = None
+                _hand_ramp_start = prev_hand_cmd.copy() if hand_available else None
+                _hand_ramp_frames = 16  # ~1s @ 16 Hz
                 teleop_hold_for_audio = False
 
-            # ── VR wrist quaternion continuity gate ──
+            # ── VR wrist quaternion: track + diagnostic-only spike warning ──
+            # Fast wrist rotations can legitimately exceed 45°/frame (user-
+            # verified: peak 134.5°/frame during rapid reverse rotation).
+            # Downstream safety (ARM_CMD_MAX_STEP_RAD, inner-loop delta clamp,
+            # Mode 6 firmware) handles any single-frame anomaly, so we do NOT
+            # block motion here — a hard gate causes 1+ second arm freezes
+            # during valid fast teleop.
             _vr_wrist_quat = normalize_quat_wxyz(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64))
             if _last_vr_wrist_quat is not None:
                 _qd = min(np.abs(np.dot(_vr_wrist_quat, _last_vr_wrist_quat)), 1.0)
                 _angle = 2.0 * np.arccos(_qd)
-                if _angle > VR_WRIST_QUAT_JUMP_THRESHOLD_RAD:
+                if _angle > VR_WRIST_QUAT_DIAG_THRESHOLD_RAD:
                     logger.warning(
-                        "VR wrist quaternion spike: %.1f°/frame > %.1f°/frame "
-                        "threshold — holding position",
+                        "VR wrist quaternion large delta: %.1f°/frame "
+                        "(diagnostic only — motion NOT blocked)",
                         np.rad2deg(_angle),
-                        np.rad2deg(VR_WRIST_QUAT_JUMP_THRESHOLD_RAD),
                     )
-                    if recording_active:
-                        hold_arm = prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy()
-                        record_held_frame(
-                            recorder, state, hold_arm, vr_frame, cam, ik_ok=False, retarget_ok=False,
-                            arm_qpos_sent=arm_inner.last_sent_cmd, hold_hand=prev_hand_cmd.copy(),
-                            diagnostics=_build_diag(0.0, np.full(3, np.nan), vr_frame,
-                                                    vr_quat_jump_rejected=_angle),
-                            target_eef_pos=_last_target_eef_pos,
-                            target_eef_rot6d=_last_target_eef_rot6d,
-                        )
-                    arm_inner.set_target(prev_qpos_cmd.copy() if prev_qpos_cmd is not None else state.arm_qpos.copy())
-                    ik_method = "vr_jump"
-                    continue
             _last_vr_wrist_quat = _vr_wrist_quat.copy()
 
             # ── VR wrist → EEF target pose ──
@@ -1147,6 +1174,19 @@ def main():
                 prev_hand_cmd,
                 hand_available,
             )
+            # Smoothstep ramp: ease from home_qpos (captured at B-press
+            # audio end) to the VR retargeting target over 1 s (16 frames).
+            # Prevents the ~56° first-frame jump when the VR hand pose
+            # differs from the reset home_qpos.  Smoothstep has zero
+            # derivative at t=0 — the first few frames barely move,
+            # giving the NLP warm-start time to converge.
+            if _hand_ramp_frames > 0 and _hand_ramp_start is not None:
+                t = 1.0 - (_hand_ramp_frames / 16.0)
+                t_smooth = t * t * (3.0 - 2.0 * t)
+                hand_cmd = _hand_ramp_start + t_smooth * (hand_cmd - _hand_ramp_start)
+                _hand_ramp_frames -= 1
+            elif _hand_ramp_frames == 0:
+                _hand_ramp_start = None  # ramp complete, release reference
             stage_timer.mark("hand")
 
             if not ik_result.success or ik_result.qpos is None:

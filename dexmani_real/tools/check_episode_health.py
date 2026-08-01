@@ -162,6 +162,47 @@ def _check_hand_tracking(f: h5py.File, thresh_rad: float) -> float | None:
     return float(np.degrees(p95))
 
 
+def _check_hand_freeze(f: h5py.File, control_hz: float) -> list[tuple[int, int, float]]:
+    """Detect hand qpos freeze runs (driver board lockout).
+
+    A freeze run is a span where hand_qpos is constant (max joint delta
+    < 1e-4 rad) for >= *min_frames* while action_hand_joint is actively
+    changing (max joint delta >= 0.05 rad), indicating that commands are
+    being sent but the hand is not executing them.
+
+    Returns list of (start_frame, length, max_cmd_gap_deg).
+    """
+    if "hand_qpos" not in f or "action_hand_joint" not in f:
+        return []
+
+    hq = f["hand_qpos"][:]  # (T, 12)
+    cmd = f["action_hand_joint"][:]  # (T, 12)
+    min_frames = max(8, int(control_hz * 0.5))  # 0.5 s
+    cmd_active_thresh_rad = 0.05  # ~2.9°
+
+    hq_step = np.max(np.abs(np.diff(hq, axis=0)), axis=1)  # (T-1,)
+    cmd_step = np.max(np.abs(np.diff(cmd, axis=0)), axis=1)  # (T-1,)
+
+    # A frame is "frozen" if qpos didn't change from the previous frame
+    frozen_mask = np.concatenate([[False], hq_step < 1e-4])  # (T,)
+
+    freeze_runs: list[tuple[int, int, float]] = []
+    for start, length in _runs_of(frozen_mask):
+        if length < min_frames:
+            continue
+        end = start + length
+        # Check if cmd was active during this freeze
+        cmd_slice = cmd_step[max(0, start - 1):min(len(cmd_step), end)]
+        cmd_active = bool(np.any(cmd_slice >= cmd_active_thresh_rad))
+        if not cmd_active:
+            continue
+        # Compute max cmd-qpos gap during the freeze
+        gap = np.max(np.abs(cmd[start:end] - hq[start:end]))
+        freeze_runs.append((start, length, float(np.rad2deg(gap))))
+
+    return freeze_runs
+
+
 def _check_tactile(f: h5py.File) -> dict[str, float | None]:
     """Print tactile data health stats; return per-finger zero-force percentages.
 
@@ -293,6 +334,26 @@ def check_episode(path: str, roi_stride: int, track_thresh_rad: float) -> list[s
         hand_p95_deg = _check_hand_tracking(f, track_thresh_rad)
         if hand_p95_deg is not None and hand_p95_deg > HAND_TRACK_P95_WARN_DEG:
             warns.append(f"手跟踪误差 p95 {hand_p95_deg:.1f}° > {HAND_TRACK_P95_WARN_DEG:.0f}° — 手跟踪滞后")
+
+        freeze_runs = _check_hand_freeze(f, control_hz)
+        if freeze_runs:
+            dt = 1.0 / control_hz if control_hz > 0 else float("nan")
+            total_frozen = sum(length for _, length, _ in freeze_runs)
+            total_frames = int(f["hand_qpos"].shape[0])
+            freeze_desc = "  ".join(
+                f"{length * dt:.1f}s@t={start * dt:.1f}s(gap={gap:.0f}°)"
+                for start, length, gap in freeze_runs[:3]
+            )
+            print(
+                f"  手部冻结: {len(freeze_runs)} 段, 共 {total_frozen}/{total_frames} 帧 "
+                f"({100.0 * total_frozen / total_frames:.1f}%)  {freeze_desc}"
+            )
+            warns.append(
+                f"手部冻结 {len(freeze_runs)} 段 / {100.0 * total_frozen / total_frames:.1f}% 帧 — "
+                f"电机驱动板锁死，CMD 在执行但 qpos 不动"
+            )
+        else:
+            print("  手部冻结: 无")
 
         tactile_zero_pcts = _check_tactile(f)
         for finger_name, zero_pct in tactile_zero_pcts.items():

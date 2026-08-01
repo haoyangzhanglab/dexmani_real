@@ -207,6 +207,7 @@ class RobotInterface:
             hand_tipboard_err = np.asarray(hand_state.get("tipboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
             hand_commboard_err = np.asarray(hand_state.get("commboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
             hand_jointboard_err = np.asarray(hand_state.get("jointboard_err", np.zeros(12, dtype=np.int32)), dtype=np.int32)
+            hand_qpos_stale = bool(hand_state.get("qpos_stale", 0))
         except Exception:
             hand_qpos = nan_array(12)
             hand_current = nan_array(12)
@@ -216,6 +217,7 @@ class RobotInterface:
             hand_tipboard_err = np.zeros(12, dtype=np.int32)
             hand_commboard_err = np.zeros(12, dtype=np.int32)
             hand_jointboard_err = np.zeros(12, dtype=np.int32)
+            hand_qpos_stale = False
             logger.warning("hand get_state failed", exc_info=True)
 
         # EEF FK
@@ -246,6 +248,7 @@ class RobotInterface:
             hand_tipboard_err=hand_tipboard_err,
             hand_commboard_err=hand_commboard_err,
             hand_jointboard_err=hand_jointboard_err,
+            hand_qpos_stale=hand_qpos_stale,
             fingertip_pos=fingertip_pos,
             arm_connected=self.arm.is_connected(),
             hand_connected=self.hand.is_connected(),

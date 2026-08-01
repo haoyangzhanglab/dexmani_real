@@ -80,6 +80,20 @@ _BOARD_ERR_ESCALATE_FRAMES = 10
 _consecutive_board_err_frames = 0
 _board_err_escalated = False
 
+# ── Qpos freshness (stale detection) — plan §4.9 ──
+# Detects the silent failure mode where motor driver boards enter protection
+# lockout: send_action() returns success (PDO frames delivered to ESC) but
+# get_state() returns stale/cached qpos (ESC cache not refreshed by drivers).
+#   Tier 1 (0.5 s): clear_error() — software reset, may wake drivers.
+#   Tier 2 (3.0 s): reset_connection() — full EtherCAT reconnect (OP→INIT→OP).
+_STALE_QPOS_THRESHOLD = 15  # 0.5 s at 30 Hz — mark frame qpos_stale=1
+_STALE_QPOS_CLEAR_AFTER = 15  # 0.5 s — tier 1: clear_error()
+_STALE_QPOS_RECONNECT_AFTER = 90  # 3.0 s — tier 2: reset_connection()
+_STALE_QPOS_CMD_GAP_RAD = 0.05  # ~2.9° — cmd must differ from qpos by this much to count as "active"
+_consecutive_stale_frames = 0
+_last_non_stale_qpos: np.ndarray | None = None  # type: ignore[assignment]
+_stale_recovery_cooldown_until = 0.0  # monotonic; 0 = no active cooldown
+
 
 # ── hand macro RPC frames (plan §4.6) ──
 # RESET(qpos[12]) / STOP / CLEAR_ERROR / SEND_TRAJECTORY(waypoints[256,12],
@@ -579,6 +593,30 @@ def _publish_hand_state(hand: Any, frame: np.ndarray, state_ring: SeqlockRingBuf
                 )
                 _board_err_escalated = False
             _consecutive_board_err_frames = 0
+
+        # ── Qpos freshness detection (plan §4.9) ──
+        # Detect silent motor driver board lockout: qpos frozen despite active
+        # commands.  send_action() returns success (PDO frames reach the ESC)
+        # but get_state() returns stale/cached qpos from the ESC.
+        global _consecutive_stale_frames, _last_non_stale_qpos
+        _qpos = np.asarray(st["qpos"], dtype=np.float64)
+        _lqc = hand.last_qpos_cmd
+        if _last_non_stale_qpos is not None and _lqc is not None:
+            _qpos_delta = np.max(np.abs(_qpos - _last_non_stale_qpos))
+            _cmd_gap = np.max(np.abs(_lqc - _qpos))
+            if _qpos_delta < 1e-4 and _cmd_gap > _STALE_QPOS_CMD_GAP_RAD:
+                _consecutive_stale_frames += 1
+            else:
+                if _consecutive_stale_frames >= _STALE_QPOS_THRESHOLD:
+                    logger.info(
+                        "hand child: qpos frozen state cleared after %d frames.",
+                        _consecutive_stale_frames,
+                    )
+                _consecutive_stale_frames = 0
+                _last_non_stale_qpos = _qpos.copy()
+        else:
+            _last_non_stale_qpos = _qpos.copy()
+        frame["qpos_stale"][0] = int(_consecutive_stale_frames >= _STALE_QPOS_THRESHOLD)
     else:
         # get_state failed — publish NaN qpos + disconnected flag so the main
         # process sees a clean degraded-mode signal instead of stale qpos.
@@ -950,7 +988,48 @@ def _hand_child_main(
                 with macro_lock:
                     _publish_hand_state(hand, frame, state_ring, last_processed_seq)
 
-            # 5. Orphan exit (daemon=False, plan §5.2 / D4): no new cmd seqs
+                # 5. Qpos stale watchdog: graduated response to frozen qpos
+                #    (driver board lockout — plan §4.9).
+                #    Unlike the send-error watchdog (which watches
+                #    send_action() return codes), this detects the silent
+                #    failure mode where send_action() succeeds (PDO frames
+                #    reach the ESC) but get_state() returns stale/cached
+                #    qpos because the motor driver boards have stopped
+                #    refreshing the ESC cache.
+                #      Tier 1 (0.5 s): clear_error() — software reset.
+                #      Tier 2 (3.0 s): reset_connection() — full reconnect.
+                global _consecutive_stale_frames, _last_non_stale_qpos, _stale_recovery_cooldown_until
+                if (
+                    _consecutive_stale_frames >= _STALE_QPOS_RECONNECT_AFTER
+                    and time.monotonic() >= _stale_recovery_cooldown_until
+                ):
+                    logger.warning(
+                        "hand child: qpos frozen for %d consecutive frames (%.1f s) — "
+                        "resetting connection (tier 2).",
+                        _consecutive_stale_frames,
+                        _consecutive_stale_frames / config.hz,
+                    )
+                    with macro_lock:
+                        try:
+                            hand.reset_connection()
+                        except Exception:
+                            logger.warning("hand child: reset_connection failed.", exc_info=True)
+                    _consecutive_stale_frames = 0
+                    _last_non_stale_qpos = None
+                    _stale_recovery_cooldown_until = time.monotonic() + _WATCHDOG_RECONNECT_COOLDOWN_S
+                elif _consecutive_stale_frames >= _STALE_QPOS_CLEAR_AFTER:
+                    _now = time.monotonic()
+                    if _now - _last_clear_error_time > 2.0:
+                        logger.warning(
+                            "hand child: qpos frozen for %d consecutive frames (%.1f s) — "
+                            "trying clear_error() (tier 1).",
+                            _consecutive_stale_frames,
+                            _consecutive_stale_frames / config.hz,
+                        )
+                        hand.clear_error()
+                        _last_clear_error_time = _now
+
+            # 6. Orphan exit (daemon=False, plan §5.2 / D4): no new cmd seqs
             #    for orphan_exit_s AND the parent process is actually dead
             #    (ppid == 1 → adopted by init).  Idle periods where the main
             #    loop is waiting for user input (no hand commands sent) must

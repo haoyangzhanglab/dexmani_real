@@ -107,6 +107,7 @@ HAND_STATE_DTYPE = np.dtype(
         ("consecutive_errs", "u4"),
         ("last_error_code", "i8"),
         ("limit_clipped", "u1"),
+        ("qpos_stale", "u1"),  # 1 if hand_qpos frozen despite active cmd (driver board lockout)
     ]
 )
 
