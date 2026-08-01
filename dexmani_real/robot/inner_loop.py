@@ -99,6 +99,16 @@ _RECOVERABLE_ERRORS: frozenset[int] = frozenset(
     }
 )
 
+# In-process arm reconnection watchdog — mirrors hand child's
+# reset_connection() at 30 consecutive send errors
+# (hand_process.py:883).  A single transient SDK I/O glitch
+# must NOT cascade into a full 12-15s process restart.
+# After _RECONNECT_AFTER_FAILS consecutive non-recoverable
+# error_code latches, the loop attempts a disconnect+reconnect
+# on the same process/thread before giving up.
+_RECONNECT_AFTER_FAILS: int = 5   # consecutive non-recov errors → reconnect
+_MAX_RECONNECT_ATTEMPTS: int = 3  # give up after N reconnects in one run
+
 
 # ═══════════════════════════════════════════════════════════════════
 # ArmInnerLoop
@@ -507,6 +517,10 @@ class ArmInnerLoop:
             last_target_ts: float = 0.0
             last_valid_qpos: np.ndarray = current_qpos.copy()
 
+            # Reconnection watchdog state (reset per run session)
+            _consecutive_nonrecov: int = 0
+            _reconnect_attempts: int = 0
+
             inner_dt = self._cfg.loop_period
             freq_hz = int(round(1.0 / inner_dt))
             limiter = RateManager(float(freq_hz))
@@ -583,7 +597,45 @@ class ArmInnerLoop:
                 arm_error = getattr(arm, "error_code", 0)
                 action = self._handle_arm_error(arm, arm_error)
                 if action == "break":
-                    break
+                    # In-process reconnection watchdog — before killing the
+                    # thread (and cascading into a full 12-15s process
+                    # restart, A1), attempt a disconnect+reconnect within
+                    # the same child process.  Mirrors the hand child's
+                    # reset_connection() at 30 consecutive send errors
+                    # (hand_process.py:883).
+                    _consecutive_nonrecov += 1
+                    if _consecutive_nonrecov >= _RECONNECT_AFTER_FAILS:
+                        if _reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
+                            logger.warning(
+                                "ArmInnerLoop: %d consecutive non-recoverable errors — "
+                                "attempting in-process reconnect (%d/%d)",
+                                _consecutive_nonrecov,
+                                _reconnect_attempts + 1,
+                                _MAX_RECONNECT_ATTEMPTS,
+                            )
+                            _reconnect_attempts += 1
+                            _consecutive_nonrecov = 0
+                            new_arm = self._reconnect_arm()
+                            if new_arm is not None:
+                                # Update the arm local so subsequent
+                                # _read_and_update_state / _monitor /
+                                # _send_target and the finally block all
+                                # operate on the new connection.
+                                arm = new_arm
+                                continue
+                            logger.error(
+                                "ArmInnerLoop: in-process reconnect %d/%d failed",
+                                _reconnect_attempts,
+                                _MAX_RECONNECT_ATTEMPTS,
+                            )
+                        # Reconnect attempts exhausted — escalate.
+                        break
+                    # Below threshold: skip send this tick, let
+                    # _read_and_update_state self-heal next iteration.
+                    continue
+                else:
+                    # Ok or recoverable-continue resets the counter.
+                    _consecutive_nonrecov = 0
                 if action == "continue":
                     continue
 
@@ -751,6 +803,57 @@ class ArmInnerLoop:
             return True
         logger.warning("ArmInnerLoop: set_mode(6) returned but mode=%d", actual_mode)
         return False
+
+    def _reconnect_arm(self):
+        """Disconnect + reconnect arm in-process, re-init Mode 6, seed state.
+
+        Never raises.  Returns the new arm handle, or ``None`` on failure.
+        Intended for transient-recovery callers inside ``_run``; the
+        ``arm`` local in ``_run`` must be reassigned to the return value.
+
+        The old handle is unconditionally ``disconnect()``\ ed first —
+        calling this on an already-closed connection is safe.
+        """
+        old = self._arm
+        if old is not None:
+            try:
+                old.disconnect()
+            except Exception:
+                pass
+        self._arm = None
+
+        new_arm = self._connect_arm(self._ip)
+        if new_arm is None:
+            logger.error("ArmInnerLoop: in-process reconnect failed — XArmAPI init failed")
+            with self._lock:
+                self._error_state = True
+            return None
+
+        if not self._init_mode_6(new_arm):
+            logger.error("ArmInnerLoop: in-process reconnect failed — Mode 6 init")
+            try:
+                new_arm.disconnect()
+            except Exception:
+                pass
+            with self._lock:
+                self._error_state = True
+            return None
+
+        self._arm = new_arm
+        qpos = self._bootstrap_state(new_arm)
+        if qpos is None:
+            logger.error("ArmInnerLoop: in-process reconnect failed — bootstrap state")
+            try:
+                new_arm.disconnect()
+            except Exception:
+                pass
+            self._arm = None
+            with self._lock:
+                self._error_state = True
+            return None
+
+        logger.info("ArmInnerLoop: in-process reconnect successful — Mode 6 restored")
+        return new_arm
 
     def _init_mode(self, arm) -> None:
         """Transition arm to Mode 6 (joint online trajectory planning).

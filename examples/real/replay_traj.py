@@ -1402,10 +1402,13 @@ Control keys:
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     finally:
-        replayer.shutdown()
-
-        # Post-loop: offer return-to-home
-        if not args.dry_run and replayer._arm_inner is not None:
+        # ── Post-loop: offer return-to-home BEFORE shutdown ──
+        # The inner loop is still alive after replay, so do_return_home takes
+        # the happy path (pure Mode 6 homing, ~5 s, hand homing included).
+        # Running this AFTER shutdown() forces the error-recovery path which
+        # wastes ~5 s on a full inner-loop restart AND silently skips hand homing
+        # (the error-recovery branch returns before reaching hand.reset()).
+        if not args.dry_run and replayer._arm_inner is not None and replayer._arm_inner.is_alive:
             print("\nPress H to return_home, or Q to exit...")
             kb = KeyboardHandler()
             kb.start()
@@ -1416,26 +1419,20 @@ Control keys:
                         break
                     if ControlSignal.HOME in sigs:
                         print("\nH: return_home")
-                        # Reuse existing planner+robot (shutdown() only closed TCP transport;
-                        # CollisionModel, kinematics, IK solver all remain valid).
-                        # A fresh _make_planner()+_make_robot() would redundantly reload URDF,
-                        # rebuild 40 collision geometries, and re-scan FCL .so (~multi-second).
                         try:
                             if replayer.robot is not None and replayer.planner is not None:
-                                if replayer.robot.connect().get("arm"):
-                                    new_inner = do_return_home(
-                                        replayer.robot,
-                                        replayer._arm_inner,
-                                        replayer._inner_cfg,
-                                        home_dt=HOME_DT,
-                                        arm_ip=args.arm_ip,
-                                        cancel_fn=lambda: any(
-                                            s in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP)
-                                            for s in kb.poll(timeout=0.0)
-                                        ),
-                                    )
-                                    replayer._arm_inner = new_inner
-                                    replayer.robot.disconnect()
+                                new_inner = do_return_home(
+                                    replayer.robot,
+                                    replayer._arm_inner,
+                                    replayer._inner_cfg,
+                                    home_dt=HOME_DT,
+                                    arm_ip=args.arm_ip,
+                                    cancel_fn=lambda: any(
+                                        s in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP)
+                                        for s in kb.poll(timeout=0.0)
+                                    ),
+                                )
+                                replayer._arm_inner = new_inner
                             else:
                                 print("  Planner/robot not available — cannot return_home")
                         except Exception as exc:
@@ -1444,13 +1441,10 @@ Control keys:
             finally:
                 kb.stop()
 
-        # Clean up any restarted arm inner loop from do_return_home above.
-        # shutdown() only cleans the original arm_inner; do_return_home creates
-        # a fresh one whose SHM rings would otherwise leak (resource_tracker
-        # "leaked shared_memory objects" warning at process exit).
-        if replayer._arm_inner is not None and replayer._arm_inner.is_alive:
-            replayer._arm_inner.set_target(None)
-            replayer._arm_inner.stop()
+        # shutdown() cleans up the current arm_inner regardless of whether it
+        # is the original (happy path: do_return_home returns the same instance)
+        # or a freshly restarted one (error-recovery path).
+        replayer.shutdown()
 
     print("Done.")
 

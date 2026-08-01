@@ -73,12 +73,7 @@ class VRReceiverProcess:
         # attached in child process via shared name).
         from dexmani_real.shm.frame_manager import SharedMemoryFrameManager
 
-        self.shm = SharedMemoryFrameManager(
-            camera_hw=(480, 640),
-            n_cameras=0,  # VR-only; no cameras
-            vr_maxlen=3,
-            create=True,
-        )
+        self.shm = SharedMemoryFrameManager(vr_maxlen=3, create=True)
 
         # Stats (accessible from main process)
         self._received_count = mp.Value("Q", 0, lock=False)

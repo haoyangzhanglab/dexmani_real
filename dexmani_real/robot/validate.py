@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import numpy as np
 
-from dexmani_real.robot.types import _ARM_TORQUE_LIMIT_NM, RobotAction
+from dexmani_real.robot.types import RobotAction
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -91,19 +91,6 @@ def _validate_sensor_array(
     return None
 
 
-def _check_torque(actual_arm_tau: np.ndarray | None) -> Optional[str]:
-    """Reject if any joint torque exceeds per-joint limits."""
-    if actual_arm_tau is None:
-        return None
-    reason = _validate_sensor_array(actual_arm_tau, (7,), "torque")
-    if reason is not None:
-        return reason
-    tau = np.asarray(actual_arm_tau, dtype=np.float64)
-    over_idx = np.where(np.abs(tau) > _ARM_TORQUE_LIMIT_NM)[0]
-    if len(over_idx) > 0:
-        return f"torque limit exceeded: joints={over_idx.tolist()}"
-    return None
-
 
 def _check_velocity_nan(actual_arm_qvel: np.ndarray | None) -> Optional[str]:
     """Reject if arm velocity data is NaN/Inf or wrong shape."""
@@ -162,11 +149,6 @@ def validate_action(
         lambda: _check_hardware_error(robot),
         lambda: _check_arm_connected(robot),
         lambda: _check_action_nan(action),
-        # Torque gate disabled — J1 torque routinely exceeds 50 Nm limit
-        # when the arm is extended sideways, causing excessive safety
-        # rejections during normal teleop.  Hardware-level overcurrent
-        # protection (firmware) remains active.
-        # lambda: _check_torque(actual_arm_tau),
         lambda: _check_velocity_nan(actual_arm_qvel),
     ):
         reason = gate()

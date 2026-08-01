@@ -14,11 +14,6 @@ import numpy as np
 from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.robot.xhand import XHandConfig
 
-# Per-joint arm torque limits from URDF: J1-J2=50, J3-J5=30, J6-J7=20 Nm.
-# Defined here (robot layer) because these are hardware properties, not teleop policy.
-# Used by both teleop safety checks and RobotInterface path execution.
-_ARM_TORQUE_LIMIT_NM = np.array([50.0, 50.0, 30.0, 30.0, 30.0, 20.0, 20.0])
-_ARM_TORQUE_LIMIT_NM.flags.writeable = False
 
 def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
     """Validate ndarray field shapes for a dataclass instance.

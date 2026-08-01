@@ -21,7 +21,7 @@ from xarm.wrapper import XArmAPI
 from dexmani_real.robot.xarm7.error_codes import decode_error
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.serialization import FromDictMixin
+from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
@@ -46,7 +46,7 @@ def _inset_joint_limits(q_min: np.ndarray, q_max: np.ndarray, margin: float) -> 
 
 
 @dataclass
-class XArm7Config(FromDictMixin):
+class XArm7Config:
     ip: str = "192.168.1.111"
     dt: float = 1.0 / 50.0
     # Comfortable home posture — joint-safe, high manipulability, EEF low near desk.
@@ -66,6 +66,11 @@ class XArm7Config(FromDictMixin):
     # TCP load for correct dynamics torque estimation
     tcp_load_kg: float = 1.2
     tcp_load_cog_mm: list[float] = field(default_factory=lambda: [0.0, 0.0, 80.0])
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "XArm7Config":
+        """Reconstruct from a serialized dict."""
+        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
 
 class XArm7:

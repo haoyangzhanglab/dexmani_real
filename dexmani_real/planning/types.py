@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from dexmani_real.utils.serialization import FromDictMixin
+from dexmani_real.utils.serialization import from_dict_helper
 
 @dataclass(frozen=True, slots=True)
 class CollisionPair:
@@ -157,7 +157,7 @@ class XArm7PlannerConfig:
 
 
 @dataclass(kw_only=True)
-class PlanningProfile(FromDictMixin):
+class PlanningProfile:
     """Offline path planning configuration."""
 
     path_dt: float = 1 / 15
@@ -187,9 +187,14 @@ class PlanningProfile(FromDictMixin):
     ik_score_pose_error_weight: float = 0.2
     ik_score_joint_limit_weight: float = 0.2
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PlanningProfile":
+        """Reconstruct from a serialized dict."""
+        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
+
 
 @dataclass(kw_only=True)
-class TeleopProfile(FromDictMixin):
+class TeleopProfile:
     """Online teleoperation IK/servo configuration."""
 
     max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
@@ -252,6 +257,11 @@ class TeleopProfile(FromDictMixin):
     # J6 drops #3→#5 (2.7× freer), J5/J7 get 3-5× more freedom.
     # Set to None to fall back to joint_weights (backward compatible).
     velocity_joint_weights: tuple[float, ...] | None = (5.0, 1.5, 0.8, 0.5, 0.2, 0.3, 0.1)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TeleopProfile":
+        """Reconstruct from a serialized dict."""
+        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
     # ── Joint-specific IK scoring weights (ref: LeFranX weighted_ik.cpp:62-69) ──
     # Higher weight → solver penalises moving that joint away from its current

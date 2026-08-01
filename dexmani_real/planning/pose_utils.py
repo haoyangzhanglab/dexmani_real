@@ -75,17 +75,6 @@ def _quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return qv_rot[1:]
 
 
-def quat_to_rotvec(q: np.ndarray) -> np.ndarray:
-    """Convert wxyz quaternion to rotation vector (axis * angle).
-
-    Re-exported from :mod:`dexmani_real.utils.signal_utils` to keep the
-    public API stable while avoiding a utils → planning reverse dependency.
-    """
-    from dexmani_real.utils.signal_utils import _quat_to_rotvec
-
-    return _quat_to_rotvec(q)
-
-
 def compose_pose(parent: Pose, child: Pose) -> Pose:
     p = parent.p + _quat_rotate_vector(parent.q, child.p)
     q = _quat_multiply(parent.q, child.q)

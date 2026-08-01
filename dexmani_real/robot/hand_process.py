@@ -55,6 +55,7 @@ from dexmani_real.shm.robot_layouts import (
     PRODUCER_TELEOP,
     new_frame,
 )
+from dexmani_real.shm.process_helpers import close_rings, install_sigint_handler
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer, is_fresh
 from dexmani_real.shm.robot_rpc import RpcClient
 from dexmani_real.utils.array_utils import nan_array, safe_resize
@@ -121,8 +122,20 @@ _READY_TIMEOUT_S = 15.0
 # HAND_MACRO_RESET RPC handler.
 _HAND_SETTLE_TIMEOUT_S = 3.0  # max time for 12-DOF hand to converge to target
 _HAND_SETTLE_TOL_RAD = 0.06   # ~3.4° max joint error at settle
-# Watchdog: persistent send errors → reconnect.
-_WATCHDOG_RECONNECT_AFTER = 30
+# Watchdog: graduated response to persistent send errors.
+# RS485/EtherCAT errors are documented as "frequent intermittent noise" that
+# must be tolerated (xhand.py line 61).  The graduated response gives transient
+# glitches time to self-recover before the expensive full reconnect.
+#   Tier 1 (1.0 s): clear_error() — resets software error state, no disconnect.
+#   Tier 2 (3.0 s): reset_connection() — full hardware reconnect.
+_WATCHDOG_CLEAR_AFTER = 30     # 1.0 s at 30 Hz — tier 1 threshold
+_WATCHDOG_RECONNECT_AFTER = 90  # 3.0 s at 30 Hz — tier 2 threshold
+_last_clear_error_time = 0.0    # monotonic timestamp of last tier-1 clear_error call
+# Post-reconnect cooldown (seconds): gate the tier-2 watchdog for this duration
+# after reset_connection() returns, whether it succeeds or fails.  Prevents
+# transient post-reconnect stabilisation jitter on noisy RS485/EtherCAT
+# channels from cascading into another disconnect cycle.
+_WATCHDOG_RECONNECT_COOLDOWN_S = 3.0
 
 
 @dataclass
@@ -348,6 +361,37 @@ class HandSHMFaçade:
     @property
     def config(self) -> HandProcessConfig:
         return self._config
+
+    def ensure_running(self) -> bool:
+        """Restart a dead child — mirrors ``ArmSHMFaçade.ensure_running``.
+
+        Recreates the rings (a leftover hand_cmd from the dead child would
+        otherwise be processed after restart — plan D5), clears stale
+        two-phase handshake, restarts the child and waits for readiness.
+        Hand reconnect includes home_qpos settle (~3-15 s), so the timeout
+        uses the module-level ``_READY_TIMEOUT_S`` constant.
+        """
+        if self._proc.running:
+            if not self.wait_ready(timeout=10.0):
+                logger.error("HandSHMFaçade: child not ready within 10 s (hand connection?)")
+                return False
+            return True
+        logger.info("HandSHMFaçade: child not running — recreating rings and restarting")
+        self._last_good_state = None
+        try:
+            self._proc.stop(timeout=3.0)
+        except Exception:
+            pass
+        if not self._proc.start():
+            logger.error("HandSHMFaçade: failed to restart child process")
+            return False
+        if not self.wait_ready(timeout=_READY_TIMEOUT_S):
+            logger.error(
+                "HandSHMFaçade: child not ready within %.0f s (hand connection?)",
+                _READY_TIMEOUT_S,
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # State (child → main)
@@ -578,7 +622,6 @@ def _hand_child_main(
     SEND_TRAJECTORY aborts at the next step boundary on estop (plan §4.8).
     """
     import inspect
-    import signal
     import threading
 
     from dexmani_real.robot.xhand.xhand import XHand
@@ -590,19 +633,7 @@ def _hand_child_main(
     # threading.Event (RLock-based) is signal-handler safe — the mp semaphore
     # behind stop_event is not reentrant if the handler interrupts a blocked
     # is_set()/wait() on the same thread (same pattern as _arm_child_main).
-    sigint_received = threading.Event()
-
-    try:
-        signal.signal(signal.SIGINT, lambda *_: sigint_received.set())
-        # SIGTERM is sent by HandControlProcess.stop()'s terminate() fallback
-        # when the child doesn't exit within the join timeout.  Without a handler,
-        # SIGTERM kills the process immediately, bypassing the finally block's
-        # hand.disconnect() cleanup → EtherCAT slave stays in OP → next session
-        # fails until power-cycled.  Reusing the same sigint_received flag is
-        # safe: it triggers a clean loop break → finally → disconnect().
-        signal.signal(signal.SIGTERM, lambda *_: sigint_received.set())
-    except (ValueError, OSError):
-        pass  # not in the main thread — should not happen for the fork child
+    sigint_received = install_sigint_handler()
 
     prefix = config.shm_prefix
     state_ring = cmd_ring = macro_cmd_ring = macro_result_ring = None
@@ -808,6 +839,8 @@ def _hand_child_main(
         ready_event.set()
         logger.info("hand child ready @ %.0f Hz (prefix=%s).", config.hz, prefix)
 
+        _watchdog_cooldown_until = 0.0  # monotonic; 0 = no active cooldown
+
         while not stop_event.is_set():
             # 1. E-stop checked FIRST (plan §4.8): hand → stop() once (the
             #    deliberate detorque), then keep publishing state. The RPC
@@ -867,9 +900,10 @@ def _hand_child_main(
                                 except Exception:
                                     logger.warning("hand child: send_action exception.", exc_info=True)
                             if not _send_ok:
-                                # Throttled (≤1/5s): the unthrottled watchdog at
-                                # 30 consecutive errors already fires for persistent
-                                # faults; this log covers intermittent drops.
+                                # Throttled (≤1/5s): the graduated watchdog
+                                # (30→clear_error / 90→reconnect) already fires
+                                # for persistent faults; this log covers
+                                # intermittent drops.
                                 stale_warn(
                                     "hand child: send_action failed (consecutive_send_errors=%d) — "
                                     "command may not have reached hardware.",
@@ -878,17 +912,39 @@ def _hand_child_main(
                         last_processed_seq = seq
                         estopped = False  # fresh command → estop recovery complete
 
-                # 3. Watchdog: persistent send errors → reconnect.
-                if hand.consecutive_send_errors >= _WATCHDOG_RECONNECT_AFTER:
+                # 3. Watchdog: graduated response to persistent send errors.
+                # RS485/EtherCAT glitches are documented as "frequent
+                # intermittent noise" (xhand.py line 61) — the system must
+                # tolerate transient faults.
+                #   Tier 1 (1 s): clear_error() only — no disconnect.
+                #   Tier 2 (3 s): full reset_connection().
+                _errs = hand.consecutive_send_errors
+                if (
+                    _errs >= _WATCHDOG_RECONNECT_AFTER
+                    and time.monotonic() >= _watchdog_cooldown_until
+                ):
                     logger.warning(
-                        "hand child: %d consecutive send errors — resetting connection.",
-                        hand.consecutive_send_errors,
+                        "hand child: %d consecutive send errors — resetting connection (tier 2).",
+                        _errs,
                     )
                     with macro_lock:
                         try:
                             hand.reset_connection()
                         except Exception:
                             logger.warning("hand child: reset_connection failed.", exc_info=True)
+                    # Prevent rapid re-triggering: cooldown applies regardless
+                    # of success/failure to avoid hammering the hardware.
+                    _watchdog_cooldown_until = time.monotonic() + _WATCHDOG_RECONNECT_COOLDOWN_S
+                elif _errs >= _WATCHDOG_CLEAR_AFTER:
+                    global _last_clear_error_time
+                    _now = time.monotonic()
+                    if _now - _last_clear_error_time > 2.0:
+                        logger.warning(
+                            "hand child: %d consecutive send errors — trying clear_error() (tier 1).",
+                            _errs,
+                        )
+                        hand.clear_error()
+                        _last_clear_error_time = _now
 
                 # 4. Publish state + echo + tactile every tick.
                 with macro_lock:
@@ -950,13 +1006,7 @@ def _hand_child_main(
         # handles; the parent unlinks.
         if rpc_thread is not None:
             rpc_thread.join(timeout=0.5)
-        for ring in (state_ring, cmd_ring, macro_cmd_ring, macro_result_ring):
-            if ring is None:
-                continue
-            try:
-                ring.close()
-            except (BufferError, OSError):
-                pass
+        close_rings(state_ring, cmd_ring, macro_cmd_ring, macro_result_ring)
         logger.info("hand child exited (prefix=%s).", prefix)
 
 

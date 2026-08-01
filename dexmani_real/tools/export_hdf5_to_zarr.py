@@ -445,7 +445,7 @@ def _align_all_episodes(
 
     Returns updated (obs_list, action_list, episode_lengths).
     """
-    from dexmani_real.recording.post_processor import TimestampAligner
+    from dexmani_real.tools.post_processor import TimestampAligner
 
     aligner = TimestampAligner(dt=dt, method=method, max_gap_s=2.5 * dt)  # gap threshold scales with grid rate
 
@@ -802,7 +802,7 @@ def main() -> None:
 
     # ── Validation (if requested) ──
     if args.validate:
-        from dexmani_real.recording.data_validator import DataValidator
+        from dexmani_real.tools.data_validator import DataValidator
 
         validator = DataValidator(
             min_frames=args.min_frames if args.min_frames is not None else 50,

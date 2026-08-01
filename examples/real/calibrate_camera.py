@@ -66,7 +66,6 @@ try:
 except ImportError:
     raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
 from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
-from dexmani_real.robot.xarm7 import XArm7Config
 from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
@@ -591,7 +590,6 @@ def main():
     tty_attrs = termios.tcgetattr(tty_fd) if tty_fd is not None else None
 
     # ── 1. 连接 xArm7 ──
-    arm_config = XArm7Config()
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
     srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
 
@@ -612,7 +610,7 @@ def main():
     )
 
     robot = RobotInterface(
-        RobotInterfaceConfig(arm=arm_config),
+        RobotInterfaceConfig(),
         kinematics=planner.kin,
         planner=planner,
     )

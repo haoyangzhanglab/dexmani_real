@@ -19,7 +19,7 @@ except ImportError:
 from dexmani_real.robot.xhand.motor_trajectory_interpolator import MotorTrajectoryInterpolator
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.serialization import FromDictMixin
+from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
@@ -45,7 +45,7 @@ SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
 
 
 @dataclass
-class XHandConfig(FromDictMixin):
+class XHandConfig:
     comm_type: str = "EtherCAT"
     device_name: str | None = None
     baudrate: int = 3_000_000
@@ -172,11 +172,27 @@ class XHandConfig(FromDictMixin):
     # Actual np.clip is always enforced regardless of this threshold.
     clip_report_tolerance: float = 0.01
 
+    # ── Per-step delta clamp (safety net, not motion planner) ──
+    # Mode 3 PID has no firmware trajectory planning (unlike arm Mode 6).
+    # A large instantaneous target jump — e.g. home_qpos → first VR teleop pose —
+    # is forwarded directly to the motor PID, which drives at full torque.
+    # This clamp limits the per-step joint delta.  It is a safety backstop, not
+    # a motion planner: normal teleop should rarely trigger it.
+    #   - scalar: applied to all 12 joints
+    #   - (12,) array: per-joint limits
+    #   - None: disabled (legacy behaviour)
+    max_delta_rad: float | np.ndarray | None = 0.3
+
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
     # Values are in Newtons (parse_tactile_sum divides SDK raw readings by 10).
     # 1.0 N ≈ light touch; ref: DexUMI eval_xhand.py:72 binary_cutoff=[10,10,10] (raw).
     tactile_contact_threshold: float = 1.0
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "XHandConfig":
+        """Reconstruct from a serialized dict."""
+        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
 
 class XHand:
@@ -767,6 +783,17 @@ class XHand:
             delta = np.max(np.abs(qpos_cmd - self.last_qpos_cmd))
             if delta < 0.001:
                 return True
+
+        # ── Per-step delta clamp ──
+        # Mode 3 PID has no firmware trajectory planning.  Large instantaneous
+        # jumps (e.g. home_qpos → first VR pose) are forwarded directly to the
+        # motor PID at full torque.  This clamp is a safety backstop — normal
+        # teleop should rarely trigger it.
+        if self.config.max_delta_rad is not None and self.last_qpos_cmd is not None:
+            limit = np.broadcast_to(self.config.max_delta_rad, 12)
+            delta = qpos_cmd - self.last_qpos_cmd
+            clipped_delta = np.clip(delta, -limit, limit)
+            qpos_cmd = self.last_qpos_cmd + clipped_delta
 
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)

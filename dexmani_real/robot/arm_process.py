@@ -31,8 +31,6 @@ process never imports xarm.wrapper through this module.
 from __future__ import annotations
 
 import multiprocessing as mp
-import signal
-import threading
 import time
 from dataclasses import dataclass, field
 from multiprocessing.process import BaseProcess
@@ -49,6 +47,7 @@ from dexmani_real.shm.robot_layouts import (
     PRODUCER_TELEOP,
     new_frame,
 )
+from dexmani_real.shm.process_helpers import close_rings, install_sigint_handler
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer, is_fresh
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
@@ -171,16 +170,7 @@ def _arm_child_main(
     #     still holds on disconnect, so there is no safety risk, but the
     #     inner_loop.stop() cleanup (disconnect, graceful state transition)
     #     is desirable for cleanliness. ──
-    sigint_received = threading.Event()
-
-    def _on_sigint(signum: int, frame: Any) -> None:
-        sigint_received.set()
-
-    try:
-        signal.signal(signal.SIGINT, _on_sigint)
-        signal.signal(signal.SIGTERM, _on_sigint)
-    except (ValueError, OSError):
-        pass  # not in the main thread — should not happen for the fork child
+    sigint_received = install_sigint_handler()
 
     inner: Any = None
     state_ring: SeqlockRingBuffer | None = None
@@ -288,12 +278,7 @@ def _arm_child_main(
             except Exception:
                 logger.exception("ArmControlProcess: inner stop failed")
         # Close (never unlink — the parent owns the blocks) our ring handles.
-        for ring in (state_ring, target_ring):
-            if ring is not None:
-                try:
-                    ring.close()
-                except Exception:
-                    pass
+        close_rings(state_ring, target_ring)
         logger.info("ArmControlProcess: child exited")
 
 
@@ -893,10 +878,19 @@ def do_return_home(
     home_qpos = robot.arm.config.init_qpos.copy()
 
     # ── 1. Read current position through the RUNNING inner loop ──
-    try:
-        qpos, error_state, _ = arm_inner.get_state()
-    except Exception:
-        qpos, error_state = None, True
+    # Retry up to 3× to tolerate transient SHM staleness (trigger A2):
+    # the façade fabricates error_state=1 when the arm_state frame is >60ms
+    # stale, but the child process + Mode 6 firmware are still healthy.
+    # Genuine hardware errors persist across ticks → restart still triggered.
+    for _retry in range(3):
+        try:
+            qpos, error_state, _ = arm_inner.get_state()
+        except Exception:
+            qpos, error_state = None, True
+        if not error_state and qpos is not None and np.all(np.isfinite(qpos)):
+            break  # fresh read succeeded — child is healthy
+        if _retry < 2:
+            _time.sleep(0.1)  # 100ms ≫ child publish period (20ms)
 
     # Inner loop error → restart is the only case where we still need a fresh
     # child process (the inner loop's XArm7 connection may be wedged).

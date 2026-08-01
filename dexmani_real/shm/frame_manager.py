@@ -42,13 +42,9 @@ class SharedMemoryFrameManager:
 
     def __init__(
         self,
-        camera_hw: tuple[int, int] | None = None,  # ignored; kept for call-site compat
-        n_cameras: int = 0,  # ignored; kept for call-site compat
         vr_maxlen: int = 3,
-        cam_maxlen: int = 5,  # ignored; kept for call-site compat
         create: bool = True,
         vr_name: str = _VR_SHM_NAME,
-        cam_prefix: str = "",  # ignored; kept for call-site compat
     ) -> None:
         self._create = create
 

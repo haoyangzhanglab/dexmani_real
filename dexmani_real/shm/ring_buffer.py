@@ -27,7 +27,31 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
-from dexmani_real.shm.seqlock import seqlock_even, seqlock_is_complete, seqlock_odd, seqlock_to_logical
+
+# ---------------------------------------------------------------------------
+# Seqlock protocol helpers (odd/even markers for lock-free torn-read defence)
+# ---------------------------------------------------------------------------
+
+
+def _seqlock_odd(seq: int) -> int:
+    """Encode logical *seq* as the odd (write-in-progress) marker: ``2*seq - 1``."""
+    return 2 * seq - 1
+
+
+def _seqlock_even(seq: int) -> int:
+    """Encode logical *seq* as the even (frame-complete) marker: ``2*seq``."""
+    return 2 * seq
+
+
+def _seqlock_is_complete(marker: int) -> bool:
+    """True when *marker* represents a complete (nonzero, even) frame."""
+    return marker != 0 and (marker & 1) == 0
+
+
+def _seqlock_to_logical(marker: int) -> int:
+    """Decode an even seqlock marker back to the logical sequence number."""
+    return marker // 2
+
 
 logger = get_logger(__name__)
 
@@ -374,7 +398,7 @@ class CameraRingBuffer:
         ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
         )
-        ts_arr[1] = np.uint64(seqlock_odd(seq))  # odd: writer active — MUST be first
+        ts_arr[1] = np.uint64(_seqlock_odd(seq))  # odd: writer active — MUST be first
         ts_arr[0] = np.uint64(now_ns)
 
         # Write camera header (64 bytes)
@@ -410,7 +434,7 @@ class CameraRingBuffer:
             pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
 
         # ── Seqlock: write even marker — payload is now consistent ──
-        ts_arr[1] = np.uint64(seqlock_even(seq))  # even: writer done
+        ts_arr[1] = np.uint64(_seqlock_even(seq))  # even: writer done
 
         self._write_idx_view()[0] = np.uint64(idx)
         return seq
@@ -510,7 +534,7 @@ class CameraRingBuffer:
 
         # ── Seqlock: reject writer-active or torn reads ──
         # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
-        if not seqlock_is_complete(slot_seq):
+        if not _seqlock_is_complete(slot_seq):
             return None
         ts_arr_check: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
@@ -518,7 +542,7 @@ class CameraRingBuffer:
         if int(ts_arr_check[1]) != slot_seq:
             return None
 
-        return header, rgb, depth, pointcloud, seqlock_to_logical(slot_seq)
+        return header, rgb, depth, pointcloud, _seqlock_to_logical(slot_seq)
 
     def frame_age_ns(self) -> int:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""

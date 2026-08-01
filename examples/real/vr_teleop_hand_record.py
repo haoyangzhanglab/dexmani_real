@@ -327,6 +327,14 @@ def main():
     robot.arm.clear_error()
 
     hand_available = bool(result.get("hand"))
+    # Debounce counters: RS485/EtherCAT glitches are transient normal noise —
+    # don't latch on a single bad frame. Require N consecutive disconnect frames
+    # before disabling hand control, and M consecutive healthy frames before
+    # re-enabling (symmetric hysteresis).
+    _hand_disconnect_count = 0
+    _hand_reconnect_count = 0
+    _HAND_DISCONNECT_DEBOUNCE = 5   # ~312 ms @ 16 Hz
+    _HAND_RECONNECT_DEBOUNCE = 10   # ~625 ms @ 16 Hz — slightly longer to avoid flapping
     if not hand_available:
         print("  ⚠ 手部不可用 — 本集手部命令将 hold-position (不控制手指运动)")
 
@@ -344,10 +352,18 @@ def main():
             hand_available = False
             hand_retargeter = None
 
-    def _reset_hand_retargeter() -> None:
+    def _reset_hand_retargeter(hand_qpos: np.ndarray | None = None) -> None:
+        """Reset hand retargeter state for a clean teleop start.
+
+        Args:
+            hand_qpos: Optional (12,) current hand joint positions for SLSQP
+                warm-start seeding.  When provided, the first retarget() call
+                converges from the actual hardware pose instead of the neutral
+                midpoint — eliminating the first-frame NLP convergence cost.
+        """
         if hand_retargeter is not None:
             try:
-                hand_retargeter.reset()
+                hand_retargeter.reset(initial_qpos=hand_qpos)
             except Exception:
                 pass
 
@@ -819,11 +835,15 @@ def main():
                         eef_quat_wxyz=state.eef_quat_wxyz,
                     )
                     # 手部: 重置 retargeter (SLSQP warm-start seed, LPFilter EMA, DexPilot projection)
-                    _reset_hand_retargeter()
+                    # Seed with actual hardware pose so the first retarget() frame
+                    # converges from near-optimum instead of the neutral midpoint.
+                    _reset_hand_retargeter(state.hand_qpos)
                     audio.play("calibrated")
                     teleop_active = True
                     recording_paused = False
                     error_count = 0
+                    _hand_disconnect_count = 0
+                    _hand_reconnect_count = 0
                     # Seed continuity gate from B-press frame
                     _last_vr_wrist_quat = normalize_quat_wxyz(
                         np.asarray(frame["wrist_quat_wxyz"], dtype=np.float64)
@@ -871,11 +891,47 @@ def main():
                 continue
             stage_timer.mark("state")
 
-            # ── Hand liveness monitor (D11): detect silent child process crash ──
+            # ── Hand liveness monitor: debounced disconnect + symmetric recovery ──
+            # RS485/EtherCAT glitches produce transient board errors that self-clear
+            # on the next get_state().  A single bad frame must NOT permanently latch
+            # hand_available=False.  Use hysteresis: require N consecutive bad frames
+            # before degrading, M consecutive good frames before re-enabling.
             if hand_available and not state.hand_connected:
-                logger.warning("Hand disconnected mid-session (hand_connected=False) — disabling hand control")
-                hand_available = False
-                print("  ⚠ 手部连接丢失！降级为 hold-position", flush=True)
+                _hand_disconnect_count += 1
+                if _hand_disconnect_count >= _HAND_DISCONNECT_DEBOUNCE:
+                    logger.warning(
+                        "Hand disconnected for %d consecutive frames — disabling hand control",
+                        _hand_disconnect_count,
+                    )
+                    hand_available = False
+                    _hand_reconnect_count = 0
+                    print("  ⚠ 手部连接丢失！降级为 hold-position", flush=True)
+            elif hand_available:
+                _hand_disconnect_count = 0
+
+            # Symmetric recovery: if hand was previously degraded but the child
+            # process (or hardware) has recovered, re-enable after a stable window.
+            if not hand_available and state.hand_connected:
+                _hand_reconnect_count += 1
+                if _hand_reconnect_count >= _HAND_RECONNECT_DEBOUNCE:
+                    logger.info(
+                        "Hand recovered — %d consecutive healthy frames, re-enabling hand control",
+                        _hand_reconnect_count,
+                    )
+                    hand_available = True
+                    _hand_disconnect_count = 0
+                    # Seed retargeter with current hardware pose so recovery
+                    # resumption doesn't pay the neutral→actual convergence cost.
+                    _reset_hand_retargeter(state.hand_qpos)
+                    # Seed prev_hand_cmd from current state so first frame delta is zero.
+                    prev_hand_cmd = (
+                        state.hand_qpos.copy()
+                        if np.all(np.isfinite(state.hand_qpos))
+                        else prev_hand_cmd
+                    )
+                    print("  ✅ 手部已恢复！重试中...", flush=True)
+            elif not hand_available:
+                _hand_reconnect_count = 0
 
             # ── Arm error check ──
             if robot.arm.is_connected() and robot.arm.is_error():

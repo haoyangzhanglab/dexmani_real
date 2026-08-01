@@ -10,7 +10,6 @@ interface.py handles hand commands and blocking arm moves (reset, home).
 from __future__ import annotations
 
 import time
-import warnings
 from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
@@ -84,7 +83,7 @@ class RobotInterface:
             if np.all(np.isfinite(home_pose.p)):
                 raise ValueError(msg)
             else:
-                warnings.warn(f"Cannot validate home EEF workspace (NaN FK): {msg}")
+                logger.warning(f"Cannot validate home EEF workspace (NaN FK): {msg}")
 
         # Hand kinematics
         self.hand_kinematics: HandKinematics | None = None

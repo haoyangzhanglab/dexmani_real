@@ -58,8 +58,7 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer
-from dexmani_real.shm.seqlock import seqlock_even, seqlock_is_complete, seqlock_odd, seqlock_to_logical
+from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer, _seqlock_even, _seqlock_is_complete, _seqlock_odd, _seqlock_to_logical
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -183,10 +182,10 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
 
         # Write to slot: ODD marker → ts + data → EVEN marker.
         slot = self._data_buf[idx]
-        slot["sequence"] = np.uint64(seqlock_odd(seq))  # odd: write in progress
+        slot["sequence"] = np.uint64(_seqlock_odd(seq))  # odd: write in progress
         slot["timestamp_ns"] = np.uint64(now_ns)
         slot["data"] = data
-        slot["sequence"] = np.uint64(seqlock_even(seq))  # even: frame complete
+        slot["sequence"] = np.uint64(_seqlock_even(seq))  # even: frame complete
 
         # Atomic write of write_idx (aligned uint64 store on x86_64)
         self._write_idx_view()[0] = np.uint64(idx)
@@ -235,8 +234,8 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             # observing it on the first sample guarantees all of that frame's
             # data stores are visible; agreement on the second sample
             # guarantees no later overwrite disturbed the copy.
-            if seq1 == seq2 and seqlock_is_complete(seq1):
-                self._last_good = (data, ts, seqlock_to_logical(seq1))
+            if seq1 == seq2 and _seqlock_is_complete(seq1):
+                self._last_good = (data, ts, _seqlock_to_logical(seq1))
                 return self._last_good
             # Torn (writer mid-overwrite: odd or mismatched) or unwritten
             # slot — retry with a fresh write_idx; the writer may have
