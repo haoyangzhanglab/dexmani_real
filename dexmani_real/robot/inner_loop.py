@@ -1,22 +1,15 @@
-"""ArmInnerLoop — in-process inner loop thread (30Hz) for xArm7 control.
+"""Arm servo loop — Mode 6 joint online trajectory planning for xArm7.
 
-Default and only control mode is Mode 6 (joint online trajectory planning). The firmware
-performs online trajectory replanning with configurable speed and acceleration limits that
-ARE respected. No inner-loop interpolation is needed — the target is forwarded directly and
-the firmware handles all trajectory smoothing. Effectively dissolves the inner/outer loop
-distinction.
+Primary entry point: ``arm_loop(shared)`` — mp.Process target, reads
+SharedStorage.arm_action_q, writes arm_state_ring. Communicates exclusively
+through SharedStorage (no direct SDK access from other processes).
 
-Mode 6: Joint online trajectory planning — forwards targets directly to
-  arm.set_servo_angle(wait=False) at 30Hz. Firmware respects speed/accel limits
-  (default: 120°/s, 500°/s²). Smooth motion, no desk vibration. Requires firmware >= 1.10.0.
+``ArmInnerLoop`` (class) is a legacy threading-based implementation retained
+only for deprecated entry points (vr_teleop_arm_only*.py).
 
-Architecture:
-    Main Thread (16Hz)                     Inner Loop Thread (30Hz)
-    ──────────────────                     ───────────────────────
-    inner.set_target(cmd)    ──Lock──→     self._arm_target
-    qpos, err, ts = get_state()  ←──Lock── self._arm_qpos, _error_state
-                                           passthrough → set_servo_angle(wait=False)
-                                           firmware handles all trajectory planning
+Mode 6: firmware performs online trajectory replanning with configurable
+speed/acceleration limits. No inner-loop interpolation — commands forwarded
+directly and firmware handles all trajectory smoothing.
 """
 
 from __future__ import annotations
@@ -27,7 +20,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.robot.xarm7.error_codes import decode_error, decode_warn
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.throttle import ThrottledWarner
@@ -45,73 +37,53 @@ class ArmInnerLoopConfig:
     """Configuration for ArmInnerLoop (Mode 6: joint online trajectory planning).
 
     Attributes:
-        joint_max_speed: Max joint speed (rad/s). Respected by firmware trajectory
-                         planner. Default 120°/s (≈2.09 rad/s).
+        joint_max_speed: Max joint speed (rad/s). Respected by firmware
+                         trajectory planner. Default 120°/s.
         joint_max_acc: Max joint acceleration (rad/s²). Respected by firmware
-                       trajectory planner. Default 500°/s² (≈8.73 rad/s²).
+                       trajectory planner. Default 900°/s².
         loop_period: Inner loop period in seconds. Default 1/30 (30Hz).
         target_timeout_s: Max age of target before auto-hold (0.2s).
     """
 
-    # Mode 6 parameters (speed/accel ARE respected by firmware trajectory planner)
     joint_max_speed: float = 2.0944  # 120°/s in rad/s
     joint_max_acc: float = 15.708  # 900°/s² in rad/s²
-    loop_period: float = (
-        1.0 / 30.0  # 30Hz — Mode 6 firmware handles interpolation
-    )
-    # Shared
+    loop_period: float = 1.0 / 30.0  # 30Hz
     target_timeout_s: float = 0.2
 
-    # Absolute joint limit clip — hardware safety bounds applied before
-    # forwarding to the firmware (mirrors xArm7 physical limits in radians).
-    # J1=±360°, J2=-118°/+120°, J3=±360°, J4=-11°/+225°, J5=±360°,
-    # J6=-97°/+180°, J7=±360°.
-    joint_limit_lower: tuple[float, ...] = (-6.283, -2.059, -6.283, -0.192, -6.283, -1.693, -6.283)
-    joint_limit_upper: tuple[float, ...] = (6.283, 2.094, 6.283, 3.927, 6.283, 3.142, 6.283)
+    # Absolute joint limit clip — mirrors xarm7 URDF joint limits exactly.
+    # URDF source: assets/robots/xhand/xarm7_xhand_collision.urdf
+    joint_limit_lower: tuple[float, ...] = (-6.28318530718, -2.059, -6.28318530718, -0.19198, -6.28318530718, -1.69297, -6.28318530718)
+    joint_limit_upper: tuple[float, ...] = (6.28318530718, 2.0944, 6.28318530718, 3.927, 6.28318530718, 3.14159265359, 6.28318530718)
 
-    # Fixed-threshold tracking error warning (rad).  When the L∞ tracking error
-    # exceeds this value, a warning is logged.  Does NOT alter commands or trigger
-    # error state — purely diagnostic.
+    # Tracking error warning threshold (rad). Diagnostic only — does not
+    # alter commands or trigger error state.
     tracking_error_warn_rad: float = 0.35
 
-    # Upper clamp for the velocity-adaptive tracking error threshold (rad).
-    # Used by the offline assess_trajectory_quality tool to reconstruct per-frame
-    # thresholds from recorded joint velocities.  Default 0.60 rad (~34°).
-    tracking_error_adaptive_max_rad: float = 0.60
+    # Arm connection (single source of truth for IP).
+    arm_ip: str = "192.168.1.215"
 
-    # Absolute ceiling for anomalous-frame classification (rad).  Any frame whose
-    # L∞ tracking error exceeds this value is flagged as anomalous regardless of
-    # the adaptive threshold.  Default 0.50 rad (~29°).
-    tracking_error_anomaly_cap_rad: float = 0.50
+    # Home position — single source of truth for all homing paths.
+    home_qpos: tuple[float, ...] = (0.0, -0.349, 0.0, 1.571, 0.0, 1.047, 0.0)
 
+    # Collision sensitivity level (0-5, 1 = most sensitive).
+    collision_sensitivity: int = 1
+
+    # Homing parameters for _simple_homing.
+    homing_convergence_rad: float = 0.0174533  # ~1 degree
+    homing_steps: int = 50
+    homing_step_interval_s: float = 0.04
+
+    # Arm loop control rate (Hz). State published at this rate regardless of
+    # action arrival cadence. Non-blocking queue reads ensure timely state updates.
+    arm_loop_hz: float = 30.0
 
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
-# When the firmware rejects a target with one of these codes, we clear the latch
-# immediately so the inner loop can continue holding position, and the outer loop's
-# validate_action() does not see a stale error and trigger an unnecessary emergency
-# stop.  Errors NOT in this set are treated as hard faults that stop the inner loop.
-_RECOVERABLE_ERRORS: frozenset[int] = frozenset(
-    {
-        22,  # Self-Collision Error — IK solver produced unsafe joint angles
-        24,  # Speed Exceeds Limit — commanded motion too fast
-        31,  # C31: Collision Caused Abnormal Current — arm already stopped by firmware
-    }
-)
-
-# In-process arm reconnection watchdog — mirrors hand child's
-# reset_connection() at 30 consecutive send errors
-# (hand_process.py:883).  A single transient SDK I/O glitch
-# must NOT cascade into a full 12-15s process restart.
-# After _RECONNECT_AFTER_FAILS consecutive non-recoverable
-# error_code latches, the loop attempts a disconnect+reconnect
-# on the same process/thread before giving up.
-_RECONNECT_AFTER_FAILS: int = 5   # consecutive non-recov errors → reconnect
-_MAX_RECONNECT_ATTEMPTS: int = 3  # give up after N reconnects in one run
+_RECOVERABLE_ERRORS: frozenset[int] = frozenset({22, 24, 31})
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ArmInnerLoop
+# ArmInnerLoop (legacy — for replay_traj.py)
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -120,53 +92,29 @@ class ArmInnerLoop:
 
     Runs in the same process as the controller. Communicates via
     Lock-protected shared variables (no SHM/IPC overhead).
-
-    Mode 6 (joint online trajectory planning): the firmware performs online
-    trajectory replanning with configurable speed/accel limits. The inner loop
-    forwards targets directly — no interpolation, no PID.
-
-    Parameters:
-        ip: XArm controller IP address.
-        dt: (deprecated) Inner loop period — unused in Mode 6; kept for API compat.
-        cfg: Inner loop configuration (speed/accel limits, loop period, timeout).
     """
 
-    def __init__(
-        self,
-        ip: str = "192.168.1.111",
-        cfg: ArmInnerLoopConfig | None = None,
-    ) -> None:
+    def __init__(self, ip: str = "192.168.1.111", cfg: ArmInnerLoopConfig | None = None) -> None:
         self._ip = ip
         self._cfg = cfg or ArmInnerLoopConfig()
 
-        # ── Shared state (protected by _lock) ──
         self._lock = threading.Lock()
         self._arm_target: np.ndarray | None = None
         self._target_ts: float = 0.0
         self._arm_qpos: np.ndarray = np.full(7, np.nan, dtype=np.float64)
-        # Dynamics from the 30Hz readback (NaN until first valid read) — consumed
-        # by the outer loop for recording + torque pre-send gates.
         self._arm_qvel: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._arm_tau: np.ndarray = np.full(7, np.nan, dtype=np.float64)
         self._error_state: bool = False
-        self._last_sent_target: np.ndarray | None = None  # tracking error baseline
-        # Value forwarded to the SDK each tick — the inner-loop "sent" stream (plan §4.9).
+        self._last_sent_target: np.ndarray | None = None
         self._last_sent_cmd: np.ndarray = np.zeros(7, dtype=np.float64)
-        self._arm = None  # live XArmAPI handle of the loop thread (mode/connected queries)
-        self._tracking_error: float = 0.0  # last |target-current| L∞ (passive monitor)
+        self._arm = None
+        self._tracking_error: float = 0.0
         self._mode_warn = ThrottledWarner(interval_s=2.0)
         self._tracking_warn = ThrottledWarner(interval_s=5.0)
 
-        # ── Lifecycle ──
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._ready_event = threading.Event()
-        # Emergency-stop request flag (plan §4.8 fast path): honored by the
-        # loop thread at the top of each tick — set_state(4) on its OWN live
-        # connection (no reconnect, ≤1 tick) — and by exec_macro's finally to
-        # suppress the Mode 6 reconstruction after an emergency stop. Nothing
-        # in the pre-existing control paths ever sets it.
-        self._emergency_event = threading.Event()
 
     # ── Public API ──
 
@@ -183,28 +131,14 @@ class ArmInnerLoop:
             return self._arm_qpos.copy(), self._error_state, self._target_ts
 
     def get_dynamics(self) -> tuple[np.ndarray, np.ndarray]:
-        """Latest (qvel, tau) from the 30Hz readback — NaN until first valid read.
-
-        The inner loop owns the sole XArmAPI connection, so the outer loop must
-        source dynamics here instead of calling the SDK (avoids connection contention).
-        """
         with self._lock:
             return self._arm_qvel.copy(), self._arm_tau.copy()
 
     def get_state_and_dynamics(self) -> tuple[np.ndarray, bool, float, np.ndarray, np.ndarray]:
-        """Atomic read of (qpos, error_state, target_ts, qvel, tau) in one lock.
-
-        Single lock acquisition guarantees all five fields are from the same
-        inner-loop tick — eliminates the one-tick (≈33ms) temporal skew between
-        ``get_state()`` + ``get_dynamics()`` in the outer loop.
-        """
         with self._lock:
             return (
-                self._arm_qpos.copy(),
-                self._error_state,
-                self._target_ts,
-                self._arm_qvel.copy(),
-                self._arm_tau.copy(),
+                self._arm_qpos.copy(), self._error_state, self._target_ts,
+                self._arm_qvel.copy(), self._arm_tau.copy(),
             )
 
     @property
@@ -215,8 +149,9 @@ class ArmInnerLoop:
         return self._ready_event.wait(timeout=timeout)
 
     def ensure_running(self) -> bool:
-        """In-process threads can't crash independently — always running."""
-        return True
+        if not self.is_alive:
+            self.start()
+        return self.wait_ready(timeout=30.0)
 
     @property
     def is_alive(self) -> bool:
@@ -224,123 +159,77 @@ class ArmInnerLoop:
 
     @property
     def tracking_error(self) -> float:
-        """Last |target - current| L∞ joint error (rad). Passive monitor."""
         with self._lock:
             return self._tracking_error
 
     @property
     def last_sent_cmd(self) -> np.ndarray:
-        """The target forwarded to the SDK last tick (7,).
-
-        Updated at ``_send_target`` (normal dispatch) and in ``_bootstrap_state``
-        (startup seed).  During holds no new command is sent — the property stays
-        at the last dispatched value (plan §4.9 "sent" stream).
-        """
         with self._lock:
             return self._last_sent_cmd.copy()
 
     @property
     def mode(self) -> int:
-        """Current xArm control mode via the live connection (6 during teleop).
-
-        Returns -1 when the loop thread has no connection (not started / exited).
-        """
         arm = self._arm
-        if arm is None:
-            return -1
-        try:
-            return int(getattr(arm, "mode", -1))
-        except Exception:
-            return -1
+        if arm is not None:
+            try:
+                return int(getattr(arm, "mode", -1) or -1)
+            except Exception:
+                return -1
+        return -1
 
     @property
     def connected(self) -> bool:
-        """Whether the inner loop's XArmAPI connection reports connected."""
         arm = self._arm
-        if arm is None:
-            return False
-        try:
-            return bool(getattr(arm, "connected", False))
-        except Exception:
-            return False
+        if arm is not None:
+            try:
+                return bool(arm.connected)
+            except Exception:
+                return False
+        return False
 
     # ── Lifecycle ──
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            logger.warning("ArmInnerLoop already running")
+        if self.is_alive:
             return
         self._stop_event.clear()
         self._ready_event.clear()
-        self._thread = threading.Thread(target=self._run, name="arm_inner_loop", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="arm-inner-loop", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 3.0) -> None:
+        if not self.is_alive:
+            return
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            if self._thread.is_alive():
-                logger.warning("ArmInnerLoop thread did not exit within %.0fs", timeout)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning("ArmInnerLoop: stop timed out after %.1fs", timeout)
+        self._thread = None
 
     def emergency_stop(self, settle_timeout: float | None = None) -> bool:
-        """Fast ``set_state(4)`` emergency stop (plan §4.8 ≤1 tick, A5 <60ms @30Hz).
-
-        Two paths, neither requires the macro lock:
-
-        * Loop thread alive → flag it (``_emergency_event``) to issue
-          ``set_state(4)`` on its OWN live connection at the top of its next
-          tick and exit (one SDK call, no disconnect/reconnect round-trip —
-          unlike the ``exec_macro(ARM_CMD_EMERGENCY_STOP)`` path). Waits up
-          to ~3 loop periods for the thread to honor the request.
-        * Loop thread stopped (a mode-changing RPC macro is in flight and
-          owns the controller) → ``set_state(4)`` via a short-lived XArm7
-          connection. The controller honors it immediately regardless of the
-          in-flight Mode 1 waypoint stream; the macro's next
-          ``set_servo_angle_j`` / blocking ``wait`` then fails and the macro
-          unwinds without reconstructing Mode 6 (its finally checks
-          ``_emergency_event``).
-
-        Returns True if ``set_state(4)`` was issued (loop honored the request
-        or the fallback connection reported success). Never raises.
-        """
-        self._emergency_event.set()
-        self.set_target(None)  # drop any live target immediately
+        """Issue set_state(4) on the live connection, then stop the thread."""
+        self._stop_event.set()
+        arm = self._arm
+        if arm is not None:
+            try:
+                arm.set_state(4)
+            except Exception:
+                pass
         if self.is_alive:
             budget = 3.0 * self._cfg.loop_period if settle_timeout is None else float(settle_timeout)
             thread = self._thread
             if thread is not None:
                 thread.join(timeout=max(budget, 0.05))
-            if not self.is_alive:
-                return True
-            logger.warning("ArmInnerLoop.emergency_stop: loop thread did not exit in budget — reconnect fallback")
-        # Loop stopped or unresponsive: set_state(4) on a short-lived connection.
-        try:
-            macro_arm = self._connect_macro_arm()
-        except Exception as e:
-            logger.warning("ArmInnerLoop.emergency_stop: fallback connection failed: %s", e)
-            return False
-        if macro_arm is None:
-            return False
-        try:
-            return bool(macro_arm.stop())  # XArm7.stop → set_state(4)
-        except Exception as e:
-            logger.warning("ArmInnerLoop.emergency_stop: set_state(4) failed: %s", e)
-            return False
-        finally:
-            try:
-                macro_arm.disconnect()
-            except Exception:
-                pass
+        self._thread = None
+        return True
 
-    # ── Inner loop ──
-
-    # ── Initialisation sub-steps (extracted from _run for testability) ──
+    # ── Initialization ──
 
     @staticmethod
     def _connect_arm(ip: str):
-        """Create XArmAPI connection. Returns (arm, None) on success, (None, None) on failure."""
         from xarm.wrapper import XArmAPI
-
         try:
             return XArmAPI(ip, is_radian=True)
         except (OSError, ConnectionError, RuntimeError) as e:
@@ -348,450 +237,77 @@ class ArmInnerLoop:
             return None
 
     def _init_mode_6(self, arm) -> bool:
-        """Initialise Mode 6 (online trajectory planning). Returns True on success."""
         arm.clean_error()
         arm.clean_warn()
         arm.motion_enable(True)
-        self._init_mode(arm)
-        arm.set_collision_sensitivity(1)
-
+        arm.set_mode(6)
+        arm.set_state(0)
+        arm.set_collision_sensitivity(self._cfg.collision_sensitivity)
+        arm.set_joint_maxacc(self._cfg.joint_max_acc, is_radian=True)
         actual_mode = getattr(arm, "mode", -1)
         if actual_mode != 6:
-            logger.warning(
-                "ArmInnerLoop: arm mode=%d but expected 6 — re-initializing",
-                actual_mode,
-            )
-            self._init_mode(arm)
-            actual_mode = getattr(arm, "mode", -1)
-            if actual_mode != 6:
-                logger.error("ArmInnerLoop: failed to set mode 6 (arm mode=%d)", actual_mode)
-                return False
+            logger.error("ArmInnerLoop: failed to set mode 6 (arm mode=%d)", actual_mode)
+            return False
         return True
 
     def _bootstrap_state(self, arm) -> np.ndarray | None:
-        """Read initial joint state and seed shared state (qpos, qvel, tau).
-
-        Returns current_qpos or None.
-
-        ``get_joint_states(num=3)`` fetches (qpos, qvel, tau) in one SDK call.
-        All three fields are seeded here so that ``get_state_and_dynamics()``
-        returns valid data immediately — even during idle periods when the main
-        loop hasn't issued a target yet and ``_read_and_update_state`` hasn't
-        been called.
-        """
         code, states = arm.get_joint_states(is_radian=True, num=3)
         if code != 0 or len(states) == 0:
             logger.error("ArmInnerLoop: failed to read initial state (code=%d)", code)
             return None
-
         current_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
         if not np.all(np.isfinite(current_qpos)):
-            logger.error("ArmInnerLoop: initial qpos contains NaN/Inf — refusing to start")
+            logger.error("ArmInnerLoop: initial qpos contains NaN/Inf")
             return None
-
         with self._lock:
             self._arm_qpos = current_qpos.copy()
             self._error_state = False
             self._last_sent_cmd = current_qpos.copy()
-            # Seed _last_sent_target from current position so the tracking
-            # error monitor uses a meaningful baseline from the very first
-            # target after startup.  Without this, the first target (e.g.
-            # home_qpos after return_home) can be 30°+ away, producing a
-            # spurious tracking error spike.
             self._last_sent_target = current_qpos.copy()
-
-        # Seed velocity and torque from the same SDK call so
-        # validate_action's velocity-NaN gate doesn't reject the first few
-        # frames after teleop start (before _read_and_update_state runs).
         if len(states) > 1:
-            v = np.asarray(states[1], dtype=np.float64)
-            if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
-                with self._lock:
-                    self._arm_qvel = v[:7].copy()
+            self._arm_qvel = np.asarray(states[1], dtype=np.float64)[:7].copy()
         if len(states) > 2:
-            tau = np.asarray(states[2], dtype=np.float64)
-            if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
-                with self._lock:
-                    self._arm_tau = tau[:7].copy()
-
+            self._arm_tau = np.asarray(states[2], dtype=np.float64)[:7].copy()
         return current_qpos
 
-    def _handle_arm_error(self, arm, arm_error: int) -> str:
-        """Respond to a non-zero arm error code.
+    # ── Error handling ──
 
-        Returns one of ``"continue"``, ``"break"``, or ``"ok"`` (no error).
-        ``"continue"`` means the caller should hold and re-arm — the error was
-        recoverable.
-        """
+    def _handle_arm_error(self, arm, arm_error: int) -> str:
+        """Return 'break' for non-recoverable, 'continue' for recoverable, 'ok' otherwise."""
         if arm_error == 0:
             return "ok"
-
         if arm_error in _RECOVERABLE_ERRORS:
-            logger.warning(
-                "ArmInnerLoop: arm error_code=%d (%s) — recoverable, re-initialising mode",
-                arm_error,
-                decode_error(arm_error),
-            )
-            with self._lock:
-                self._arm_target = None
-            self._recover_mode(arm)
+            logger.warning("ArmInnerLoop: recoverable error C%d — clearing", arm_error)
+            arm.clean_error()
+            arm.set_mode(6)
+            arm.set_state(0)
             return "continue"
-
-        logger.error(
-            "ArmInnerLoop: arm error_code=%d (%s) — stopping inner loop",
-            arm_error,
-            decode_error(arm_error),
-        )
+        logger.error("ArmInnerLoop: non-recoverable error C%d", arm_error)
         with self._lock:
             self._error_state = True
         return "break"
 
     def _read_and_update_state(self, arm) -> np.ndarray | None:
-        """Read joint states from hardware and update shared state under lock.
-
-        Returns current_qpos on success, or ``None`` if the read failed
-        (caller should break or continue based on context).
-        """
         try:
             code, states = arm.get_joint_states(is_radian=True, num=3)
         except (RuntimeError, OSError) as e:
             logger.error("ArmInnerLoop: get_joint_states failed: %s", e)
-            with self._lock:
-                self._error_state = True
             return None
-        time.sleep(0)  # explicit GIL yield — unblocks main-thread numpy ops
-
-        if code != 0:
-            logger.error("ArmInnerLoop: arm error code=%d — stopping inner loop", code)
-            with self._lock:
-                self._error_state = True
+        if code != 0 or len(states) == 0:
             return None
-
-        # Parse state arrays (best-effort per field)
-        current_qpos = None
-        if len(states) > 0:
-            q = np.asarray(states[0], dtype=np.float64)
-            if q.shape[0] >= 7 and np.all(np.isfinite(q[:7])):
-                current_qpos = q[:7].copy()
-                with self._lock:
-                    self._arm_qpos = current_qpos
-                    self._error_state = False
-        if len(states) > 1:
-            v = np.asarray(states[1], dtype=np.float64)
-            if v.shape[0] >= 7 and np.all(np.isfinite(v[:7])):
-                with self._lock:
-                    self._arm_qvel = v[:7].copy()
-        if len(states) > 2:
-            tau = np.asarray(states[2], dtype=np.float64)
-            if tau.shape[0] >= 7 and np.all(np.isfinite(tau[:7])):
-                with self._lock:
-                    self._arm_tau = tau[:7].copy()
-
+        current_qpos = np.asarray(states[0], dtype=np.float64)[:7]
+        if not np.all(np.isfinite(current_qpos)):
+            return None
+        with self._lock:
+            self._arm_qpos = current_qpos.copy()
+            if len(states) > 1:
+                self._arm_qvel = np.asarray(states[1], dtype=np.float64)[:7].copy()
+            if len(states) > 2:
+                self._arm_tau = np.asarray(states[2], dtype=np.float64)[:7].copy()
         return current_qpos
 
-    # ── Main loop ──
-
-    def _run(self) -> None:
-        # ── Phase 1: Connect ──
-        arm = self._connect_arm(self._ip)
-        if arm is None:
-            with self._lock:
-                self._error_state = True
-            return
-        self._arm = arm
-
-        try:
-            # ── Phase 2: Mode 6 initialisation ──
-            if not self._init_mode_6(arm):
-                with self._lock:
-                    self._error_state = True
-                return
-
-            # ── Phase 3: Bootstrap state ──
-            current_qpos = self._bootstrap_state(arm)
-            if current_qpos is None:
-                with self._lock:
-                    self._error_state = True
-                return
-
-            last_target_ts: float = 0.0
-            last_valid_qpos: np.ndarray = current_qpos.copy()
-
-            # Reconnection watchdog state (reset per run session)
-            _consecutive_nonrecov: int = 0
-            _reconnect_attempts: int = 0
-
-            inner_dt = self._cfg.loop_period
-            freq_hz = int(round(1.0 / inner_dt))
-            limiter = RateManager(float(freq_hz))
-
-            logger.info(
-                "ArmInnerLoop: %dHz started (mode 6: online trajectory planning, "
-                "speed=%.0f°/s, acc=%.0f°/s², no interp — firmware handles planning)",
-                freq_hz,
-                float(np.degrees(self._cfg.joint_max_speed)),
-                float(np.degrees(self._cfg.joint_max_acc)),
-            )
-            self._ready_event.set()
-
-            # ── Phase 4: Main loop ──
-            while not self._stop_event.is_set():
-                limiter.wait()
-
-                # Emergency stop
-                if self._emergency_event.is_set():
-                    try:
-                        arm.set_state(4)
-                    except (RuntimeError, OSError):
-                        pass
-                    with self._lock:
-                        self._error_state = True
-                    logger.info("ArmInnerLoop: emergency stop — set_state(4) issued, loop exiting")
-                    break
-
-                # Read target under lock
-                with self._lock:
-                    target = self._arm_target.copy() if self._arm_target is not None else None
-                    target_ts = self._target_ts
-
-                now = time.perf_counter()
-
-                # Timeout → hold (skip during startup).
-                # Mode 6 firmware holds the last target position when no new
-                # commands arrive — no explicit hold command needed (verified
-                # by lerobot_ufactory in hundreds of hours of operation).
-                no_target_yet = last_target_ts == 0.0
-                if not no_target_yet and (
-                    target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
-                ):
-                    continue
-
-                if target is None:
-                    continue  # startup: no target yet
-
-                last_target_ts = target_ts
-
-                # NaN guard — hold last valid position
-                if not np.all(np.isfinite(target)):
-                    try:
-                        arm.set_servo_angle(
-                            angle=last_valid_qpos.tolist(),
-                            is_radian=True,
-                            speed=self._cfg.joint_max_speed,
-                            mvacc=self._cfg.joint_max_acc,
-                            wait=False,
-                        )
-                    except (RuntimeError, OSError):
-                        pass
-                    continue
-
-                last_valid_qpos = target[:7].copy()
-
-                # Read hardware state
-                current_qpos = self._read_and_update_state(arm)
-                if current_qpos is None:
-                    continue
-
-                # Check arm error flag (C31 collision: error_code set without
-                # necessarily failing get_joint_states)
-                arm_error = getattr(arm, "error_code", 0)
-                action = self._handle_arm_error(arm, arm_error)
-                if action == "break":
-                    # In-process reconnection watchdog — before killing the
-                    # thread (and cascading into a full 12-15s process
-                    # restart, A1), attempt a disconnect+reconnect within
-                    # the same child process.  Mirrors the hand child's
-                    # reset_connection() at 30 consecutive send errors
-                    # (hand_process.py:883).
-                    _consecutive_nonrecov += 1
-                    if _consecutive_nonrecov >= _RECONNECT_AFTER_FAILS:
-                        if _reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
-                            logger.warning(
-                                "ArmInnerLoop: %d consecutive non-recoverable errors — "
-                                "attempting in-process reconnect (%d/%d)",
-                                _consecutive_nonrecov,
-                                _reconnect_attempts + 1,
-                                _MAX_RECONNECT_ATTEMPTS,
-                            )
-                            _reconnect_attempts += 1
-                            _consecutive_nonrecov = 0
-                            new_arm = self._reconnect_arm()
-                            if new_arm is not None:
-                                # Update the arm local so subsequent
-                                # _read_and_update_state / _monitor /
-                                # _send_target and the finally block all
-                                # operate on the new connection.
-                                arm = new_arm
-                                continue
-                            logger.error(
-                                "ArmInnerLoop: in-process reconnect %d/%d failed",
-                                _reconnect_attempts,
-                                _MAX_RECONNECT_ATTEMPTS,
-                            )
-                        # Reconnect attempts exhausted — escalate.
-                        break
-                    # Below threshold: skip send this tick, let
-                    # _read_and_update_state self-heal next iteration.
-                    continue
-                else:
-                    # Ok or recoverable-continue resets the counter.
-                    _consecutive_nonrecov = 0
-                if action == "continue":
-                    continue
-
-                # Passive tracking-error + mode monitor
-                self._monitor(arm, current_qpos)
-
-                # Forward target → firmware trajectory planner
-                self._send_target(arm, target)
-
-        except Exception:
-            logger.exception("ArmInnerLoop: fatal error in main loop")
-            with self._lock:
-                self._error_state = True
-        finally:
-            self._ready_event.clear()
-            # Mode 6: firmware holds last position on disconnect, no explicit stop needed.
-            try:
-                arm.disconnect()
-            except Exception:
-                pass
-            self._arm = None  # connection closed — mode/connected queries report unknown
-            logger.info("ArmInnerLoop: stopped")
-
-    # ── Command dispatch ──
-
-    def _monitor(self, arm, current_qpos: np.ndarray) -> None:
-        """Health monitor — tracking error + mode drift.
-
-        Proactively re-initialises Mode 6 when the firmware drops out of
-        trajectory planning mode (e.g. after a collision detection or
-        overspeed rejection).  This recovers at the earliest detection
-        point, before ``_send_target`` has a chance to fail with code=9
-        and set ``_error_state`` spuriously.
-        """
-        err = 0.0
-        if self._last_sent_target is not None:
-            err = float(np.max(np.abs(self._last_sent_target - current_qpos[:7])))
-        with self._lock:
-            self._tracking_error = err
-
-        # Tracking error warning — throttled to avoid log spam at 30 Hz.
-        if err > self._cfg.tracking_error_warn_rad:
-            self._tracking_warn(
-                "ArmInnerLoop: tracking error %.3f rad > threshold %.3f rad",
-                err,
-                self._cfg.tracking_error_warn_rad,
-            )
-
-        # Mode-drift check — recover immediately instead of waiting for
-        # _send_target to fail with code=9.
-        if getattr(arm, "mode", 6) != 6:
-            actual = getattr(arm, "mode", "?")
-            self._mode_warn(
-                "ArmInnerLoop: arm mode=%s (expected 6) — re-initialising",
-                actual,
-            )
-            self._recover_mode(arm)
-
-    def _send_target(self, arm, target: np.ndarray) -> None:
-        """Forward target position → set_servo_angle(wait=False).
-
-        Joint online trajectory planning (Mode 6). The firmware performs online
-        trajectory replanning from the current state when each new command arrives.
-        Speed and acceleration limits ARE respected by the firmware trajectory planner.
-
-        No inner-loop interpolation — the target is forwarded directly and the
-        firmware handles all trajectory smoothing.
-        """
-        # Absolute joint limit clip (hardware safety bounds)
-        clamped = target[:7].copy()
-        np.clip(clamped, self._cfg.joint_limit_lower, self._cfg.joint_limit_upper, out=clamped)
-
-        speed = self._cfg.joint_max_speed
-
-        try:
-            code = arm.set_servo_angle(
-                angle=clamped.tolist(),
-                is_radian=True,
-                speed=speed,
-                mvacc=self._cfg.joint_max_acc,
-                wait=False,
-            )
-            time.sleep(0)  # explicit GIL yield — unblocks main-thread numpy ops
-        except (RuntimeError, OSError) as e:
-            logger.error("ArmInnerLoop: set_servo_angle failed: %s", e)
-            with self._lock:
-                self._error_state = True
-            return
-
-        if code != 0:
-            err_code = -1
-            warn_code = -1
-            try:
-                ret, err_warn = arm.get_err_warn_code()
-                if len(err_warn) >= 2:
-                    err_code = int(err_warn[0])
-                    warn_code = int(err_warn[1])
-            except (RuntimeError, OSError, ValueError, IndexError):
-                pass
-
-            if err_code in _RECOVERABLE_ERRORS:
-                # Target rejected by firmware (e.g. self-collision, overspeed).
-                # This is NOT a hardware fault — clear the latch, re-init Mode 6
-                # (firmware drops to Mode 0 on reject), and wait for the next
-                # valid command from the outer loop.  Do NOT set error_state=True.
-                logger.warning(
-                    "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s) — "
-                    "target skipped, re-initialising mode",
-                    code,
-                    err_code,
-                    decode_error(err_code),
-                )
-                with self._lock:
-                    self._arm_target = None
-                self._recover_mode(arm)
-                return
-            elif code == 9 and err_code <= 0:
-                # Mode dropped without a latched controller error (timing race:
-                # firmware transitions mode→0 before latching the error code).
-                # Re-init Mode 6 — treat as recoverable, do NOT set error_state.
-                self._mode_warn(
-                    "ArmInnerLoop: set_servo_angle code=%d err=%d — "
-                    "mode drop without error latch, re-initialising",
-                    code,
-                    err_code,
-                )
-                with self._lock:
-                    self._arm_target = None
-                self._recover_mode(arm)
-                return
-            else:
-                logger.error(
-                    "ArmInnerLoop: set_servo_angle code=%d, controller error=%d (%s), warn=%d (%s)",
-                    code,
-                    err_code,
-                    decode_error(err_code),
-                    warn_code,
-                    decode_warn(warn_code),
-                )
-                with self._lock:
-                    self._error_state = True
-        else:
-            self._last_sent_target = clamped.copy()
-            self._last_sent_cmd = clamped.copy()  # sent stream (plan §4.9)
-
-    # ── Helpers ──
-
     def _recover_mode(self, arm) -> bool:
-        """Clear error latch and re-init Mode 6 after a recoverable error.
-
-        After firmware rejects a command (e.g. error 22 self-collision), the arm
-        drops from Mode 6 to Mode 0.  ``clean_error`` + ``set_state(0)`` clears
-        the latch but does NOT restore the control mode.
-
-        Returns ``True`` on success, ``False`` if the re-init attempt fails.
-        """
+        """Clear error latch and re-init Mode 6 after a recoverable error."""
         arm.clean_error()
         arm.clean_warn()
         arm.set_state(0)
@@ -804,240 +320,413 @@ class ArmInnerLoop:
         logger.warning("ArmInnerLoop: set_mode(6) returned but mode=%d", actual_mode)
         return False
 
-    def _reconnect_arm(self):
-        """Disconnect + reconnect arm in-process, re-init Mode 6, seed state.
+    # ── Monitor + Send ──
 
-        Never raises.  Returns the new arm handle, or ``None`` on failure.
-        Intended for transient-recovery callers inside ``_run``; the
-        ``arm`` local in ``_run`` must be reassigned to the return value.
+    def _monitor(self, arm, current_qpos: np.ndarray) -> None:
+        """Tracking error + mode drift monitor (passive, diagnostic only)."""
+        err = 0.0
+        if self._last_sent_target is not None:
+            err = float(np.max(np.abs(self._last_sent_target - current_qpos[:7])))
+        with self._lock:
+            self._tracking_error = err
+        if err > self._cfg.tracking_error_warn_rad:
+            self._tracking_warn(
+                "ArmInnerLoop: tracking error %.3f rad > threshold %.3f rad",
+                err, self._cfg.tracking_error_warn_rad,
+            )
+        if getattr(arm, "mode", 6) != 6:
+            self._mode_warn("ArmInnerLoop: arm mode=%s (expected 6) — re-initialising",
+                            getattr(arm, "mode", "?"))
+            self._recover_mode(arm)
 
-        The old handle is unconditionally ``disconnect()``\ ed first —
-        calling this on an already-closed connection is safe.
-        """
-        old = self._arm
-        if old is not None:
-            try:
-                old.disconnect()
-            except Exception:
-                pass
-        self._arm = None
-
-        new_arm = self._connect_arm(self._ip)
-        if new_arm is None:
-            logger.error("ArmInnerLoop: in-process reconnect failed — XArmAPI init failed")
+    def _send_target(self, arm, target: np.ndarray) -> None:
+        """Forward target → set_servo_angle(wait=False). Firmware handles smoothing."""
+        clamped = target[:7].copy()
+        np.clip(clamped, self._cfg.joint_limit_lower, self._cfg.joint_limit_upper, out=clamped)
+        try:
+            code = arm.set_servo_angle(
+                angle=clamped.tolist(), is_radian=True,
+                speed=self._cfg.joint_max_speed, mvacc=self._cfg.joint_max_acc, wait=False,
+            )
+        except (RuntimeError, OSError) as e:
+            logger.error("ArmInnerLoop: set_servo_angle failed: %s", e)
             with self._lock:
                 self._error_state = True
-            return None
+            return
+        if code != 0:
+            if hasattr(arm, 'get_err_warn_code'):
+                try:
+                    ret, err_warn = arm.get_err_warn_code()
+                    err_code = int(err_warn[0]) if len(err_warn) >= 1 else -1
+                except Exception:
+                    err_code = -1
+            else:
+                err_code = -1
+            if err_code in _RECOVERABLE_ERRORS:
+                logger.warning("ArmInnerLoop: set_servo_angle code=%d err=%d — recoverable, re-initing", code, err_code)
+                with self._lock:
+                    self._arm_target = None
+                self._recover_mode(arm)
+                return
+            elif code == 9 and err_code <= 0:
+                self._mode_warn("ArmInnerLoop: code=%d err=%d — mode drop, re-initing", code, err_code)
+                with self._lock:
+                    self._arm_target = None
+                self._recover_mode(arm)
+                return
+            else:
+                logger.error("ArmInnerLoop: set_servo_angle code=%d err=%d", code, err_code)
+                with self._lock:
+                    self._error_state = True
+        else:
+            self._last_sent_target = clamped.copy()
+            self._last_sent_cmd = clamped.copy()
 
-        if not self._init_mode_6(new_arm):
-            logger.error("ArmInnerLoop: in-process reconnect failed — Mode 6 init")
-            try:
-                new_arm.disconnect()
-            except Exception:
-                pass
+    # ── Main loop ──
+
+    def _run(self) -> None:
+        arm = self._connect_arm(self._ip)
+        if arm is None:
             with self._lock:
                 self._error_state = True
-            return None
+            return
+        self._arm = arm
 
-        self._arm = new_arm
-        qpos = self._bootstrap_state(new_arm)
-        if qpos is None:
-            logger.error("ArmInnerLoop: in-process reconnect failed — bootstrap state")
+        try:
+            if not self._init_mode_6(arm):
+                with self._lock:
+                    self._error_state = True
+                return
+
+            current_qpos = self._bootstrap_state(arm)
+            if current_qpos is None:
+                with self._lock:
+                    self._error_state = True
+                return
+
+            last_target_ts: float = 0.0
+            last_valid_qpos: np.ndarray = current_qpos.copy()
+            inner_dt = self._cfg.loop_period
+            freq_hz = int(round(1.0 / inner_dt))
+            limiter = RateManager(float(freq_hz))
+
+            logger.info("ArmInnerLoop: %dHz Mode 6 (speed=%.0f°/s, acc=%.0f°/s²)",
+                        freq_hz, float(np.degrees(self._cfg.joint_max_speed)),
+                        float(np.degrees(self._cfg.joint_max_acc)))
+            self._ready_event.set()
+
+            while not self._stop_event.is_set():
+                limiter.wait()
+
+                # Read target
+                with self._lock:
+                    target = self._arm_target.copy() if self._arm_target is not None else None
+                    target_ts = self._target_ts
+
+                now = time.perf_counter()
+
+                # Timeout → hold
+                no_target_yet = last_target_ts == 0.0
+                if not no_target_yet and (
+                    target is None or (now - max(target_ts, last_target_ts) > self._cfg.target_timeout_s)
+                ):
+                    continue
+                if target is None:
+                    continue
+
+                last_target_ts = target_ts
+
+                # NaN guard
+                if not np.all(np.isfinite(target)):
+                    try:
+                        arm.set_servo_angle(angle=last_valid_qpos.tolist(), is_radian=True,
+                                           speed=self._cfg.joint_max_speed,
+                                           mvacc=self._cfg.joint_max_acc, wait=False)
+                    except (RuntimeError, OSError):
+                        logger.warning("ArmInnerLoop: NaN-recovery set_servo_angle failed", exc_info=True)
+                    continue
+
+                last_valid_qpos = target[:7].copy()
+
+                # Read hardware state
+                current_qpos = self._read_and_update_state(arm)
+                if current_qpos is None:
+                    continue
+
+                # Error check
+                arm_error = getattr(arm, "error_code", 0)
+                action = self._handle_arm_error(arm, arm_error)
+                if action == "break":
+                    break
+                elif action == "continue":
+                    continue
+
+                # Monitor + send
+                self._monitor(arm, current_qpos)
+                self._send_target(arm, target)
+
+        except Exception:
+            logger.exception("ArmInnerLoop: fatal error in main loop")
+            with self._lock:
+                self._error_state = True
+        finally:
+            self._ready_event.clear()
             try:
-                new_arm.disconnect()
+                arm.disconnect()
             except Exception:
                 pass
             self._arm = None
-            with self._lock:
-                self._error_state = True
-            return None
+            logger.info("ArmInnerLoop: stopped")
 
-        logger.info("ArmInnerLoop: in-process reconnect successful — Mode 6 restored")
-        return new_arm
 
-    def _init_mode(self, arm) -> None:
-        """Transition arm to Mode 6 (joint online trajectory planning).
+# ═══════════════════════════════════════════════════════════════════
+# New architecture: arm_loop (mp.Process target)
+# ═══════════════════════════════════════════════════════════════════
 
-        Caller (``_init_mode_6``) has already run ``clean_error()``,
-        ``clean_warn()``, and ``motion_enable(True)`` — no need for a
-        ``set_mode(0)`` prelude or sleep delays.
-        """
+
+def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
+    """Arm process entry point — reads SharedStorage.arm_action_q, servos arm.
+
+    Designed as an mp.Process target. Communicates exclusively through
+    SharedStorage (no RPC, no side channels).
+    """
+    from queue import Empty
+
+    from scipy.spatial.transform import Rotation
+
+    from dexmani_real.shm.shared_storage import HOME_SENTINEL, ARM_STATE_DTYPE, new_frame
+    from dexmani_real.robot.safety import SafetyState, transition
+
+    _tracking_warn = ThrottledWarner(interval_s=5.0)
+    _fk_warn = ThrottledWarner(interval_s=5.0)
+    cfg = config or ArmInnerLoopConfig()
+
+    HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
+
+    try:
+        from xarm.wrapper import XArmAPI
+        arm = XArmAPI(cfg.arm_ip, is_radian=True)
+    except Exception as e:
+        logger.error("arm_loop: connect failed: %s", e)
+        return
+
+    try:
+        arm.clean_error()
+        arm.clean_warn()
+        arm.motion_enable(True)
         arm.set_mode(6)
         arm.set_state(0)
-        # Set firmware-level joint acceleration limit (respected by Mode 6
-        # trajectory planner).
-        arm.set_joint_maxacc(self._cfg.joint_max_acc, is_radian=True)
-        logger.info(
-            "ArmInnerLoop: set_joint_maxacc=%s rad/s² (%.0f°/s²)",
-            self._cfg.joint_max_acc,
-            round(float(np.degrees(self._cfg.joint_max_acc))),
-        )
+        arm.set_collision_sensitivity(cfg.collision_sensitivity)
+        arm.set_joint_maxacc(cfg.joint_max_acc, is_radian=True)
+        if getattr(arm, "mode", -1) != 6:
+            logger.error("arm_loop: failed to set mode 6")
+            _disconnect_arm(arm)
+            return
+    except Exception as e:
+        logger.error("arm_loop: init failed: %s", e)
+        _disconnect_arm(arm)
+        return
 
-    # ── Macro commands (RPC executor — plan §4.3) ──
+    # Seed last_qpos — FAIL if initial state unreadable (safety: never cmd HOME_QPOS blind).
+    try:
+        code, states = arm.get_joint_states(is_radian=True, num=1)
+        if code == 0 and len(states) > 0:
+            last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
+        else:
+            logger.error("arm_loop: cannot read initial joint states (code=%d)", code)
+            _disconnect_arm(arm)
+            return
+    except Exception as e:
+        logger.error("arm_loop: joint states read failed: %s", e)
+        _disconnect_arm(arm)
+        return
+    last_target = last_qpos.copy()
 
-    def exec_macro(self, code: int, fields: dict) -> dict:
-        """Execute a blocking macro command against the controller.
+    shared.arm_ready.set()
+    logger.info("arm_loop: ready (Mode 6, ip=%s, hz=%.0f)", cfg.arm_ip, cfg.arm_loop_hz)
 
-        Mirrors ``RobotInterface.return_to_home``'s exact call sequence: the
-        mode-changing macros (EXEC_WAYPOINTS / RESET_BLOCKING / REINIT_MODE6)
-        first stop the inner-loop thread — the sole Mode 6 command source, so
-        no concurrent SDK traffic fights the macro on the controller — then run
-        the move through a short-lived ``XArm7`` connection:
+    _interval = 1.0 / cfg.arm_loop_hz
+    _last_tick = time.monotonic()
+    while shared.is_running.value:
+        # Heartbeat — written even when holding position (proves we're alive)
+        shared.arm_heartbeat_s.value = time.monotonic()
 
-          * EXEC_WAYPOINTS — Mode 1 ``set_servo_angle_j`` per waypoint with a
-            ``dt`` sleep, exactly as ``XArm7.send_action`` inside
-            ``RobotInterface._execute_waypoints`` (caller segments >2048 points).
-          * RESET_BLOCKING — Mode 0 ``set_servo_angle(wait=True)``, exactly as
-            ``XArm7.reset`` (``speed``/``acc`` fields override the config
-            reset defaults when > 0).
-          * CLEAR_ERROR — ``XArm7.clear_error`` semantics; does NOT change the
-            control mode, safe while the inner loop is running.
-          * EMERGENCY_STOP — ``set_state(4)`` (``XArm7.stop``); the inner loop
-            stays stopped afterwards.
-          * REINIT_MODE6 — stop + ``XArm7.connect`` (robot_init: clean_error +
-            motion_enable + collision/TCP params + reduced limits) + restart.
+        if shared.estop_request.value:
+            try:
+                arm.set_state(4)
+            except Exception:
+                logger.warning("arm_loop: estop set_state(4) failed", exc_info=True)
+            break
 
-        After EXEC_WAYPOINTS / RESET_BLOCKING / REINIT_MODE6 the inner loop is
-        restarted (its ``_run`` re-connects, verifies Mode 6 and re-arms the
-        ramp) — Mode 6 is automatically reconstructed on completion (plan §4.3).
+        # Safety state gate — only process commands in ARMED or RUNNING.
+        # When gated (DISARMED or FAULT), skip action read + servo but continue
+        # to publish state (for monitoring) and rate-limit normally.
+        _safety = shared.safety_state.value
+        if _safety in (SafetyState.ARMED, SafetyState.RUNNING):
 
-        Returns ``{"ok": bool, "arm_err": int, "sdk_ret": int,
-        "final_qpos": ndarray(7,)}``.  Never raises — failures land in the
-        result record so the RPC server can always answer.
-        """
-        from dexmani_real.shm.robot_layouts import (
-            ARM_CMD_CLEAR_ERROR,
-            ARM_CMD_EMERGENCY_STOP,
-            ARM_CMD_EXEC_WAYPOINTS,
-            ARM_CMD_REINIT_MODE6,
-            ARM_CMD_RESET_BLOCKING,
-        )
+            # Read action from queue (non-blocking — rate limiter controls cadence)
+            try:
+                action = shared.arm_action_q.get(timeout=0.0)
+            except Empty:
+                action = None
 
-        result: dict = {
-            "ok": False,
-            "arm_err": 0,
-            "sdk_ret": -1,
-            "final_qpos": np.zeros(7, dtype=np.float64),
-        }
-        macro_arm = None
-        restart_after = False
+            # HOME sentinel → homing
+            if action == HOME_SENTINEL:
+                logger.info("arm_loop: HOME sentinel — executing homing")
+                _simple_homing(arm, HOME_QPOS, cfg, shared=shared)
+                last_qpos = HOME_QPOS.copy()
+                last_target = HOME_QPOS.copy()
+                continue
+
+            # Servo
+            if action is not None and isinstance(action, dict):
+                target = np.asarray(action.get("qpos", last_target), dtype=np.float64).ravel()[:7]
+                if np.all(np.isfinite(target)):
+                    last_target = target.copy()
+
+            try:
+                code = arm.set_servo_angle(angle=last_target, is_radian=True,
+                                           speed=cfg.joint_max_speed, mvacc=cfg.joint_max_acc, wait=False)
+                if code != 0:
+                    err_code = getattr(arm, "error_code", 0)
+                    if err_code in (22, 24, 31):
+                        arm.clean_error()
+                        arm.set_mode(6)
+                        arm.set_state(0)
+                    elif err_code != 0:
+                        logger.error("arm_loop: set_servo_angle code=%d err=%d", code, err_code)
+            except Exception:
+                logger.warning("arm_loop: set_servo_angle failed", exc_info=True)
+
+        # Read state
+        arm_connected = True
         try:
-            if code == ARM_CMD_CLEAR_ERROR:
-                # Mode-safe: no mode switch, inner loop may keep running.
-                macro_arm = self._connect_macro_arm()
-                if macro_arm is not None:
-                    result["ok"] = macro_arm.clear_error()
-
-            elif code == ARM_CMD_EMERGENCY_STOP:
-                # Also raise the emergency flag so any concurrently finishing
-                # macro skips its Mode 6 reconstruction (the arm must stay in
-                # state 4 until a deliberate REINIT_MODE6 clears it).
-                self._emergency_event.set()
-                if self.is_alive:
-                    self.stop()
-                macro_arm = self._connect_macro_arm()
-                if macro_arm is not None:
-                    result["ok"] = macro_arm.stop()  # set_state(4); stays stopped
-
-            elif code == ARM_CMD_EXEC_WAYPOINTS:
-                if self.is_alive:
-                    self.stop()  # silence Mode 6 dispatch before Mode 1 moves
-                macro_arm = self._connect_macro_arm()
-                if macro_arm is not None:
-                    waypoints = np.asarray(
-                        fields.get("waypoints", np.zeros((0, 7), dtype=np.float64)),
-                        dtype=np.float64,
-                    ).reshape(-1, 7)
-                    dt = float(fields.get("dt") or macro_arm.config.dt)
-                    ok = True
-                    for wp in waypoints:
-                        if macro_arm.is_error() or not macro_arm.send_action(wp):
-                            ok = False
-                            break
-                        time.sleep(dt)
-                    result["ok"] = ok
-                restart_after = True  # auto-reconstruct Mode 6 (plan §4.3)
-
-            elif code == ARM_CMD_RESET_BLOCKING:
-                if self.is_alive:
-                    self.stop()
-                macro_arm = self._connect_macro_arm()
-                if macro_arm is not None:
-                    target = fields.get("target", None)
-                    qpos = None if target is None else np.asarray(target, dtype=np.float64).reshape(7)
-                    speed = float(fields.get("speed") or 0.0)
-                    acc = float(fields.get("acc") or 0.0)
-                    if speed > 0:
-                        macro_arm.config.reset_speed = speed
-                    if acc > 0:
-                        macro_arm.config.reset_acc = acc
-                    result["ok"] = macro_arm.reset(qpos)
-                restart_after = True
-
-            elif code == ARM_CMD_REINIT_MODE6:
-                # Deliberate re-enable after an emergency stop: clear the
-                # emergency flag so the finally-block reconstruction runs.
-                self._emergency_event.clear()
-                if self.is_alive:
-                    self.stop()
-                macro_arm = self._connect_macro_arm()  # robot_init clears errors + re-enables
-                if macro_arm is not None:
-                    result["ok"] = not macro_arm.error_state
-                restart_after = True
-
+            code, states = arm.get_joint_states(is_radian=True, num=3)
+            if code == 0 and len(states) > 0:
+                qpos = np.asarray(states[0], dtype=np.float64)[:7]
+                qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.zeros(7)
+                tau = np.asarray(states[2], dtype=np.float64)[:7] if len(states) > 2 else np.zeros(7)
+                last_qpos = qpos.copy()
             else:
-                logger.warning("ArmInnerLoop.exec_macro: unknown code=%d", code)
+                qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
+                arm_connected = False
+        except Exception:
+            logger.warning("arm_loop: get_joint_states failed", exc_info=True)
+            qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
+            arm_connected = False
 
-            if macro_arm is not None:
-                sdk_ret = getattr(macro_arm, "last_action_code", None)
-                result["sdk_ret"] = -1 if sdk_ret is None else int(sdk_ret)
-                try:
-                    result["arm_err"] = int(getattr(macro_arm.arm, "error_code", 0) or 0)
-                except Exception:
-                    result["arm_err"] = 0
-                try:
-                    final = np.asarray(macro_arm.get_state()["qpos"], dtype=np.float64)
-                    if final.shape == (7,) and np.all(np.isfinite(final)):
-                        result["final_qpos"] = final
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning("ArmInnerLoop.exec_macro(code=%d) exception: %s", code, e)
-            result["ok"] = False
-        finally:
-            if macro_arm is not None:
-                try:
-                    macro_arm.disconnect()
-                except Exception:
-                    pass
-            if restart_after and not self._emergency_event.is_set():
-                # Mode 6 reconstruction: _run re-connects, re-inits and verifies
-                # Mode 6 before setting the ready event. Skipped when an
-                # emergency stop was raised mid-macro — the arm must stay in
-                # state 4 until a deliberate REINIT_MODE6 (plan §4.8).
-                self.start()
-                if not self.wait_ready(timeout=10.0):
-                    logger.error(
-                        "ArmInnerLoop.exec_macro(code=%d): Mode 6 not restored within 10s",
-                        code,
-                    )
-                    result["ok"] = False
-        return result
+        # FK: read actual EEF pose from arm controller
+        try:
+            fk_code, fk_pose = arm.get_position_aa(is_radian=True)
+            if fk_code == 0 and len(fk_pose) >= 6:
+                eef_pos = np.asarray(fk_pose[:3], dtype=np.float64) / 1000.0  # mm → m
+                rx, ry, rz = float(fk_pose[3]), float(fk_pose[4]), float(fk_pose[5])
+                R = Rotation.from_rotvec([rx, ry, rz]).as_matrix()
+                eef_rot6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
+            else:
+                _fk_warn("arm_loop: FK failed code=%d — publishing zero EEF", fk_code)
+                eef_pos = np.zeros(3, dtype=np.float64)
+                eef_rot6d = np.zeros(6, dtype=np.float64)
+        except Exception:
+            _fk_warn("arm_loop: FK failed — publishing zero EEF")
+            eef_pos = np.zeros(3, dtype=np.float64)
+            eef_rot6d = np.zeros(6, dtype=np.float64)
 
-    def _connect_macro_arm(self):
-        """Short-lived XArm7 connection for macro commands (plan A2 lazy import).
+        # Compute tracking error
+        tracking_err = float(np.max(np.abs(qpos - last_target)))
 
-        Separate socket from the inner-loop connection, mirroring today's
-        RobotInterface.XArm7 ↔ ArmInnerLoop split; only ever used while the
-        inner-loop thread is stopped (or for mode-safe CLEAR_ERROR).
-        """
-        from dexmani_real.robot.xarm7.xarm7 import XArm7, XArm7Config
+        if tracking_err > cfg.tracking_error_warn_rad:
+            _tracking_warn("arm_loop: tracking error %.3f rad > threshold %.3f rad", tracking_err, cfg.tracking_error_warn_rad)
 
-        arm = XArm7(XArm7Config(ip=self._ip))
-        if not arm.connect():
-            logger.error(
-                "ArmInnerLoop.exec_macro: XArm7 macro connection failed: %s",
-                arm.last_error_message,
-            )
-            return None
-        return arm
+        # Error handling
+        try:
+            error_code = arm.error_code
+        except Exception:
+            error_code = 0
+            arm_connected = False
+
+        if error_code in (22, 24, 31):
+            try:
+                arm.clean_error()
+                arm.set_mode(6)
+                arm.set_state(0)
+            except Exception:
+                pass
+        elif error_code != 0:
+            shared.error_state.value = True
+            transition(shared, SafetyState.FAULT)
+            break
+
+        # Publish state
+        frame = new_frame(ARM_STATE_DTYPE)
+        frame["qpos"][0] = qpos
+        frame["qvel"][0] = qvel
+        frame["tau"][0] = tau
+        frame["eef_pos"][0] = eef_pos
+        frame["eef_rot6d"][0] = eef_rot6d
+        frame["error_code"][0] = int(error_code)
+        frame["connected"][0] = 1 if arm_connected else 0
+        frame["mode"][0] = 6
+        frame["tracking_err"][0] = tracking_err
+        frame["timestamp"][0] = time.monotonic()
+        shared.arm_state_ring.write(frame)
+
+        # Rate limit
+        _elapsed = time.monotonic() - _last_tick
+        _sleep = _interval - _elapsed
+        if _sleep > 0:
+            time.sleep(_sleep)
+        _last_tick = time.monotonic()
+
+    # Cleanup
+    try:
+        arm.set_state(4)
+        arm.disconnect()
+    except Exception:
+        logger.warning("arm_loop: cleanup failed", exc_info=True)
+    logger.info("arm_loop: exited")
+
+
+def _disconnect_arm(arm) -> None:
+    """Disconnect arm safely, ignoring errors."""
+    try:
+        arm.disconnect()
+    except Exception:
+        pass
+
+
+def _simple_homing(arm, home_qpos: np.ndarray, cfg: ArmInnerLoopConfig | None = None, *, shared=None) -> None:
+    """Simple joint-space linear interpolation to home.
+
+    Writes heartbeat to ``shared.arm_heartbeat_s`` during execution so that
+    the 2 s homing sequence does not trigger a false FAULT timeout (1 s).
+    """
+    _cfg = cfg or ArmInnerLoopConfig()
+
+    try:
+        code, states = arm.get_joint_states(is_radian=True, num=1)
+        if code == 0 and len(states) > 0:
+            current = np.asarray(states[0], dtype=np.float64)[:7]
+        else:
+            return
+    except Exception:
+        return
+
+    if np.max(np.abs(current - home_qpos)) < _cfg.homing_convergence_rad:
+        return
+
+    steps = _cfg.homing_steps
+    for i in range(1, steps + 1):
+        if shared is not None:
+            shared.arm_heartbeat_s.value = time.monotonic()
+        wp = current + (i / steps) * (home_qpos - current)
+        try:
+            arm.set_servo_angle(angle=wp, is_radian=True, wait=False)
+        except Exception:
+            break
+        time.sleep(_cfg.homing_step_interval_s)
+
+    try:
+        arm.set_servo_angle(angle=home_qpos, is_radian=True, wait=False)
+    except Exception:
+        pass

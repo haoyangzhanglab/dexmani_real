@@ -582,5 +582,21 @@ class CameraRingBuffer:
         return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
 
 
-# Re-import CAMERA_FRAME_HEADER_DTYPE for this module
-from dexmani_real.shm.layouts import CAMERA_FRAME_HEADER_DTYPE  # noqa: E402
+# Camera frame header dtype (moved from layouts.py — Phase 2.7)
+CAMERA_FRAME_HEADER_DTYPE = np.dtype(
+    [
+        ("timestamp", "<f8"),
+        ("frame_number", "<u8"),
+        ("rgb_size", "<u8"),
+        ("depth_size", "<u8"),
+        ("rgb_shape_h", "<u4"),
+        ("rgb_shape_w", "<u4"),
+        ("rgb_shape_c", "<u4"),
+        ("depth_shape_h", "<u4"),
+        ("depth_shape_w", "<u4"),
+        ("pc_num_points", "<u4"),
+        ("camera_health", "<u1"),
+        ("pad", "<u1", (7,)),
+    ],
+    align=True,
+)

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """真机 VR 遥操作 xArm7 (仅机械臂，灵巧手可降级跳过) + 数据录制。
 
+.. attention::
+   **LEGACY ARCHITECTURE** — 使用 RobotInterface + ArmServo 线程 (单进程)。
+   不含 SafetyState 状态机与心跳监控。
+
+   新采集请用 **vr_teleop_arm_only_record_plus.py** (多进程架构,
+   DISARMED/ARMED/RUNNING/FAULT 状态机, 5 路心跳监控)。
+
+   本入口保留用于对照验证与旧 episode 回放, P4 计划迁移至新架构。
+
 在 vr_teleop_arm_only 基础上加入最小录制: 只录 5 路 —
 RGB / Depth / 机械臂关节角(obs) / action_joint / action_ee(pos+rot6d)，
 写入 episodes_arm/episode_YYYYMMDD_HHMMSS.h5 (所有流对齐到固定 CTRL_HZ 时间栅格)。
@@ -130,6 +139,14 @@ def record_held_frame(recorder, state, hold_arm, vr_frame, cam, *, ik_ok: bool, 
 
 
 def main():
+    print("=" * 60)
+    print("⚠️  DEPRECATED — 本入口已由 vr_teleop_arm_only_record_plus.py 取代")
+    print("⚠️  新入口提供: SafetyState 状态机 + 5路心跳 + 多进程隔离")
+    print("⚠️  本脚本仍可运行但不再维护，建议立即迁移到 _plus.py")
+    print("⚠️  继续运行将在 3 秒后开始...")
+    print("=" * 60)
+    time.sleep(3)
+
     print("=" * 60)
     print("VR 遥操作 xArm7 (仅机械臂)")
     print(f"  VR scale: pos={VR_POS_SCALE}  rot={VR_ROT_SCALE}")
@@ -511,8 +528,6 @@ def main():
                         "joint_max_acc": float(np.degrees(_INNER_CFG.joint_max_acc)),
                         "joint_max_speed": float(np.degrees(_INNER_CFG.joint_max_speed)),
                         "inner_loop_hz": float(1.0 / _INNER_CFG.loop_period),
-                        "tracking_error_adaptive_max_rad": _INNER_CFG.tracking_error_adaptive_max_rad,
-                        "tracking_error_anomaly_cap_rad": _INNER_CFG.tracking_error_anomaly_cap_rad,
                         "hand_available": hand_available,
                     })
                     if not recorder.start_episode(
@@ -760,8 +775,6 @@ def main():
             action_valid, fail_reason = validate_action(
                 robot,
                 action,
-                actual_arm_qvel=state.arm_qvel,
-                actual_arm_tau=state.arm_tau,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

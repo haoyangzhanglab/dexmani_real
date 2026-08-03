@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """真机 VR 遥操作 xArm7 (仅机械臂，灵巧手可降级跳过)。
 
+.. attention::
+   **LEGACY ARCHITECTURE** — 使用 RobotInterface + ArmServo 线程 (单进程)。
+   不含 SafetyState 状态机与心跳监控。
+
+   新采集请用 **vr_teleop_arm_only_record_plus.py** (多进程架构,
+   DISARMED/ARMED/RUNNING/FAULT 状态机, 5 路心跳监控)。
+
+   本入口保留用于无录制快速测试, P4 计划迁移至新架构。
+
 机械臂通过 VR wrist pose 控制 EEF 位姿，灵巧手在不可用时自动降级跳过。
 
 架构:
@@ -112,6 +121,14 @@ def record_held_frame(recorder, state, hold_arm, vr_frame, *, ik_ok: bool) -> No
 
 
 def main():
+    print("=" * 60)
+    print("⚠️  DEPRECATED — 本入口已由 vr_teleop_arm_only_record_plus.py 取代")
+    print("⚠️  新入口提供: SafetyState 状态机 + 5路心跳 + 多进程隔离")
+    print("⚠️  本脚本仍可运行但不再维护，建议立即迁移到 _plus.py")
+    print("⚠️  继续运行将在 3 秒后开始...")
+    print("=" * 60)
+    time.sleep(3)
+
     print("=" * 60)
     print("VR 遥操作 xArm7 (仅机械臂)")
     print(f"  VR scale: pos={VR_POS_SCALE}  rot={VR_ROT_SCALE}")
@@ -667,8 +684,6 @@ def main():
             action_valid, fail_reason = validate_action(
                 robot,
                 action,
-                actual_arm_qvel=state.arm_qvel,
-                actual_arm_tau=state.arm_tau,
             )
             if not action_valid:
                 print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)

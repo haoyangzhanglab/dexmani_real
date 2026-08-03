@@ -320,12 +320,14 @@ class XArm7:
         cfg = self.config
         try:
             self.arm.set_tcp_load(cfg.tcp_load_kg, list(cfg.tcp_load_cog_mm))
-        except RuntimeError as e:
-            self.last_error_message = f"set_tcp_load exception: {e}"
+        except RuntimeError:
+            logger.warning("XArm7: set_tcp_load failed", exc_info=True)
+            self.last_error_message = "set_tcp_load exception"
         try:
             self.arm.set_collision_sensitivity(cfg.collision_sensitivity)
-        except RuntimeError as e:
-            self.last_error_message = f"set_collision_sensitivity exception: {e}"
+        except RuntimeError:
+            logger.warning("XArm7: set_collision_sensitivity failed", exc_info=True)
+            self.last_error_message = "set_collision_sensitivity exception"
 
     def _set_mode(self, mode: int):
         """Transition arm to target control mode via idle intermediate state."""

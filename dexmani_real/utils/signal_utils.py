@@ -29,6 +29,9 @@ def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
     return angle * np.array([x, y, z], dtype=np.float64) / sin_half
 
 # ── Canonical EMA alpha values (tuned at 16Hz, dt=62.5ms) ──
+# Primary source of truth: PolicyConfig.ema_alpha_pos / ema_alpha_rot.
+# These module-level constants are retained for legacy import compatibility;
+# new code should read from PolicyConfig.ema_alpha_pos / ema_alpha_rot.
 # 2026-07-22 调整: 配合 joint_max_acc 500→900°/s²，双通道加重平滑，
 # 降低腕部(J4/J5)跟踪误差。位置/姿态突变是腕关节跟踪滞后的主因 —
 # EMA 平缓 IK 输入 → 关节目标步长缩小 → 固件加速度瓶颈冲击减轻。

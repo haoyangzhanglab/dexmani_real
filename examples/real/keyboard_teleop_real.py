@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
-"""真机键盘遥操作 xArm7 — 复用 ArmInnerLoop + PreFlight + RobotInterface。
+"""Keyboard teleop xArm7 — SharedStorage-based architecture.
 
-用法:
-    source /home/zhy/anaconda3/etc/profile.d/conda.sh && conda activate real
-    python keyboard_teleop_real.py
+Uses arm_loop process (Mode 6, 30Hz) for arm control via SharedStorage.
+No RobotInterface, no ArmServo thread, no preflight_check.
 
-控制:
-    移动 EEF (base 坐标系):
-      W/S       X 前后
-      A/D       Y 左右
-      ↑/↓       Z 上下
-      I/K       Pitch (Y 旋转)
-      ←/→       Roll  (X 旋转)
-      J/L       Yaw   (Z 旋转)
-    Q          退出主循环 (不归位，退出后可继续按 R 归位)
-    R          return_home (保持循环)
-    ESC        急停 (emergency_stop + 退出)
+Usage:
+    source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_robot
+    python examples/real/keyboard_teleop_real.py
 
-共享组件:
-    ArmInnerLoop   — 内环线程 (robot/inner_loop.py, 30Hz, mode 6 — firmware trajectory planning)
-    PreFlight      — 硬件就绪检查 (robot/preflight.py)
-    RateManager   — 高精度频率限制 (utils/rate_manager.py)
-    RobotInterface — arm/hand 统一接口 (robot/interface.py)
+Controls:
+    Move EEF (base frame):
+      W/S       X forward/back
+      A/D       Y left/right
+      ↑/↓       Z up/down
+      I/K       Pitch (Y rotation)
+      ←/→       Roll  (X rotation)
+      J/L       Yaw   (Z rotation)
+    Q          quit
+    R          return_home
+    ESC        emergency stop
 """
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import sys
 from pathlib import Path
 
@@ -35,22 +33,19 @@ import termios
 import time
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-
 from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.robot.arm_process import ArmServo, do_return_home, make_arm_servo
 from dexmani_real.teleop.control.keyboard import GlobalKeyState
-from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
-from dexmani_real.robot.interface import RobotAction, RobotInterface, RobotInterfaceConfig
-from dexmani_real.robot.preflight import PreFlightReport, preflight_check, print_preflight
-from dexmani_real.robot.validate import validate_action
-from dexmani_real.robot.xarm7 import XArm7Config
+from dexmani_real.robot.inner_loop import arm_loop as _arm_loop, ArmInnerLoopConfig
+from dexmani_real.robot.hand_process import hand_loop as _hand_loop
+from dexmani_real.shm.shared_storage import SharedStorage, HOME_SENTINEL
+from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
-from scipy.spatial.transform import Rotation as R
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
@@ -173,7 +168,6 @@ def main():
     print("=" * 60)
 
     # ── 1. Planner ──
-    arm_config = XArm7Config()
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
     srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
 
@@ -196,66 +190,51 @@ def main():
         ),
     )
 
-    # ── 2. Robot connection ──
-    robot = RobotInterface(
-        RobotInterfaceConfig(
-            arm=arm_config,
+    # ── 2. SharedStorage + subprocesses ──
+    shared = SharedStorage.create(prefix="dexmani_kb")
+    arm_proc = mp.Process(target=_arm_loop, args=(shared, INNER_LOOP_CFG), name="arm-kb", daemon=True)
+    hand_proc = mp.Process(target=_hand_loop, args=(shared,), name="hand-kb", daemon=True)
+    arm_proc.start()
+    hand_proc.start()
 
-            hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
-        ),
-        kinematics=planner.kin,
-        planner=planner,
-    )
+    if not shared.arm_ready.wait(timeout=15):
+        print("Arm 进程启动超时，退出")
+        shared.is_running.value = False
+        arm_proc.join(timeout=5)
+        hand_proc.join(timeout=5)
+        shared.close()
+        return
+    shared.hand_ready.wait(timeout=15)  # optional — degrade gracefully
 
-    print("\n连接硬件...")
-    result = robot.connect()
-    print(f"  arm:  {'OK' if result.get('arm') else 'FAIL'}")
-    print(f"  hand: {'OK' if result.get('hand') else 'FAIL (降级运行)'}")
+    transition(shared, SafetyState.ARMED)
 
-    if not result.get("arm"):
-        print("arm 连接失败，退出")
+    # Read initial state from rings.
+    _arm_result = shared.arm_state_ring.read_latest()
+    if _arm_result is None:
+        print("无法读取 arm 状态，退出")
+        _shutdown_kb(shared, arm_proc, hand_proc)
+        return
+    _arm_data, _, _ = _arm_result
+    arm_qpos = np.asarray(_arm_data["qpos"][0], dtype=np.float64)
+    eef_pos = np.asarray(_arm_data["eef_pos"][0], dtype=np.float64)
+    eef_rot6d = np.asarray(_arm_data["eef_rot6d"][0], dtype=np.float64)
+    arm_connected = bool(_arm_data["connected"][0])
+    if not arm_connected or not np.all(np.isfinite(arm_qpos)):
+        print(f"Arm 状态无效: connected={arm_connected}, qpos_finite={np.all(np.isfinite(arm_qpos))}")
+        _shutdown_kb(shared, arm_proc, hand_proc)
         return
 
-    # ── 3. Pre-Flight ── (shared: robot/preflight.py)
-    report = preflight_check(robot)
-    print_preflight(report)
-    if not report.passed:
-        print("Pre-Flight 检查失败，退出")
-        robot.disconnect()
-        return
+    prev_qpos_cmd = arm_qpos.copy()
+    target_pos = eef_pos.copy()
+    # Convert rot6d → quat for the main loop.
+    from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+    target_quat = rot6d_to_quat_wxyz(eef_rot6d)
 
-    # ── 4. Start ArmInnerLoop (shared: robot/inner_loop.py) ──
-    arm_inner = make_arm_servo(cfg=INNER_LOOP_CFG)
-    robot.set_arm_servo(arm_inner)
-    arm_inner.start()
-    print("Arm 内环线程启动中...")
-    sys.stdout.flush()
-
-    if not arm_inner.wait_ready(timeout=30.0):
-        print("Arm 内环线程启动超时，降级为直接读取")
-        arm_qpos = None
-    else:
-        print("Arm 内环线程已就绪 (30Hz online trajectory planning, passthrough)")
-        arm_qpos, error_state, _ = arm_inner.get_state()
-
-    if arm_qpos is None or not np.all(np.isfinite(arm_qpos)):
-        arm_qpos = None
-
-    state = robot.get_state(arm_qpos=arm_qpos)
-    home_qpos = arm_config.init_qpos.copy()
-    prev_qpos_cmd = state.arm_qpos.copy()
-
-    if not np.all(np.isfinite(prev_qpos_cmd)):
-        print("当前关节角度无效，使用 init_qpos")
-        prev_qpos_cmd = home_qpos.copy()
-
-    target_pos = state.eef_pos.copy()
-    target_quat = state.eef_quat_wxyz.copy()
-
+    print(f"  arm:  OK  connected={arm_connected}")
     print(f"\n初始状态:")
-    print(f"  arm_qpos:  {np.round(np.rad2deg(state.arm_qpos), 1)} deg")
-    print(f"  eef_pos:   {np.round(state.eef_pos, 4)} m")
-    print(f"  eef_quat:  {np.round(state.eef_quat_wxyz, 4)}")
+    print(f"  arm_qpos:  {np.round(np.rad2deg(arm_qpos), 1)} deg")
+    print(f"  eef_pos:   {np.round(eef_pos, 4)} m")
+    print(f"  eef_quat:  {np.round(target_quat, 4)}")
 
     # ── 5. Keyboard input ──
     keys = GlobalKeyState()
@@ -284,12 +263,10 @@ def main():
     _prev_ema_quat: np.ndarray | None = None
 
     def _emergency_stop():
-        """Stop inner loop first, then arm+hand, to avoid SDK error spam."""
+        """Set estop flag — arm_loop detects and stops."""
         nonlocal running
-        if arm_inner.is_alive:
-            arm_inner.set_target(None)
-            arm_inner.stop()
-        robot.emergency_stop()
+        shared.estop_request.value = True
+        shared.is_running.value = False
         running = False
 
     print("\n进入遥操作循环...\n")
@@ -318,52 +295,45 @@ def main():
 
             if keys.is_pressed("r"):
                 print("\nR: return_home")
-                arm_inner = do_return_home(robot, arm_inner, INNER_LOOP_CFG)
-                # Wait for new inner loop to be ready
-                if arm_inner.wait_ready(timeout=30.0):
-                    arm_qpos, error_state, _ = arm_inner.get_state()
-                    if not error_state and np.all(np.isfinite(arm_qpos)):
-                        state = robot.get_state(arm_qpos=arm_qpos)
-                        prev_qpos_cmd = state.arm_qpos.copy()
-                        target_pos = state.eef_pos.copy()
-                        target_quat = state.eef_quat_wxyz.copy()
-                        _prev_ema_pos = _prev_ema_quat = None  # reset EMA on re-engage
-                        consecutive_divergence = 0
-                        error_count = 0
-                        print("  Arm 内环线程重启就绪")
-                else:
-                    print("  Arm 内环重启超时，降级为直接读取")
-                    state = robot.get_state()
-                    if np.all(np.isfinite(state.arm_qpos)):
-                        prev_qpos_cmd = state.arm_qpos.copy()
-                        target_pos = state.eef_pos.copy()
-                        target_quat = state.eef_quat_wxyz.copy()
-                        _prev_ema_pos = _prev_ema_quat = None  # reset EMA on re-engage
-                    consecutive_divergence = 0
-                    error_count = 0
+                shared.arm_action_q.put(HOME_SENTINEL)
+                _prev_ema_pos = _prev_ema_quat = None
+                consecutive_divergence = 0
+                error_count = 0
+                # Wait for homing to complete, then refresh state from ring.
+                time.sleep(5.0)  # generous — arm_loop homing takes ~3-4s
+                _arm_result = shared.arm_state_ring.read_latest()
+                if _arm_result is not None:
+                    _ad, _, _ = _arm_result
+                    prev_qpos_cmd = np.asarray(_ad["qpos"][0], dtype=np.float64).copy()
+                    target_pos = np.asarray(_ad["eef_pos"][0], dtype=np.float64).copy()
+                    from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+                    target_quat = rot6d_to_quat_wxyz(np.asarray(_ad["eef_rot6d"][0], dtype=np.float64))
                 prev_eef_pos = None
                 ik_outcome = "-"
                 limiter.reset()
                 continue
 
-            # ── Read state from inner loop ──
-            try:
-                arm_qpos, error_state, _inner_ts, arm_qvel, arm_tau = arm_inner.get_state_and_dynamics()
-                state = robot.get_state(arm_qpos=arm_qpos, arm_qvel=arm_qvel, arm_tau=arm_tau)
-
-                if error_state:
-                    print(f"  Arm 内环异常: error_state=True")
-                    if error_count > 3:
-                        print("Arm 内环连续异常，急停退出")
-                        _emergency_stop()
-                        break
-                    error_count += 1
-                    continue
-            except Exception as e:
+            # ── Read state from arm_state_ring ──
+            _arm_result = shared.arm_state_ring.read_latest()
+            if _arm_result is None:
                 error_count += 1
-                print(f"  get_state 异常: {e}")
                 if error_count > max_consecutive_errors:
-                    print("连续错误过多，急停退出")
+                    print("连续arm state丢失，急停退出")
+                    _emergency_stop()
+                    break
+                continue
+            _arm_data, _, _ = _arm_result
+            arm_qpos = np.asarray(_arm_data["qpos"][0], dtype=np.float64)
+            arm_qvel = np.asarray(_arm_data["qvel"][0], dtype=np.float64)
+            arm_connected = bool(_arm_data["connected"][0])
+            arm_error_code = int(_arm_data["error_code"][0])
+            eef_pos = np.asarray(_arm_data["eef_pos"][0], dtype=np.float64)
+            eef_rot6d = np.asarray(_arm_data["eef_rot6d"][0], dtype=np.float64)
+
+            if not arm_connected:
+                error_count += 1
+                if error_count > 3:
+                    print("Arm disconnected, 急停退出")
                     _emergency_stop()
                     break
                 continue
@@ -371,25 +341,17 @@ def main():
             error_count = 0
 
             # ── Safety: arm error ──
-            if robot.arm.is_connected() and robot.arm.is_error():
-                arm_code = robot.arm.arm.error_code if robot.arm.arm else 0
-                sdk_code = robot.arm.last_sdk_error_code
+            if arm_error_code != 0:
+                if arm_error_code in (22, 24, 31):
+                    # arm_loop auto-clears these — just log and continue
+                    if loop_count % 50 == 0:
+                        print(f"  ⚠ Arm error C{arm_error_code} (arm_loop auto-recovering)", flush=True)
+                else:
+                    print(f"arm 非可恢复错误: C{arm_error_code}")
+                    _emergency_stop()
+                    break
 
-                if arm_code == 22 or sdk_code == 22:
-                    print("  ⚠ ControllerError 22 (C31/C32)，清除错误并保持位置", flush=True)
-                    robot.arm.clear_error()
-                    state = robot.get_state()
-                    if np.all(np.isfinite(state.arm_qpos)):
-                        target_pos = state.eef_pos.copy()
-                        target_quat = state.eef_quat_wxyz.copy()
-                        prev_qpos_cmd = state.arm_qpos.copy()
-                    error_count = 0
-                    continue
-                print(f"arm 错误: C{arm_code}")
-                _emergency_stop()
-                break
-
-            if not np.all(np.isfinite(state.arm_qpos)):
+            if not np.all(np.isfinite(arm_qpos)):
                 error_count += 1
                 continue
 
@@ -426,13 +388,13 @@ def main():
             if loop_count % 50 == 0:
                 elapsed = time.perf_counter() - start_time
                 if prev_eef_pos is not None:
-                    vel = np.linalg.norm(state.eef_pos - prev_eef_pos) / (50 * CTRL_DT)
+                    vel = np.linalg.norm(eef_pos - prev_eef_pos) / (50 * CTRL_DT)
                 else:
                     vel = 0.0
-                prev_eef_pos = state.eef_pos.copy()
+                prev_eef_pos = eef_pos.copy()
                 print(
                     f"[T+{elapsed:.1f}s f={loop_count}] "
-                    f"eef={np.round(state.eef_pos, 3)}m  "
+                    f"eef={np.round(eef_pos, 3)}m  "
                     f"target={np.round(target_pos, 3)}  "
                     f"v={vel:.2f}m/s  ik={ik_outcome}  err={error_count}",
                     flush=True,
@@ -440,9 +402,9 @@ def main():
 
             # No input → snap target to EEF, reset EMA state
             if np.all(dx == 0) and np.all(drpy == 0):
-                target_pos = state.eef_pos.copy()
-                target_quat = state.eef_quat_wxyz.copy()
-                prev_qpos_cmd = state.arm_qpos.copy()
+                target_pos = eef_pos.copy()
+                target_quat = target_quat.copy()
+                prev_qpos_cmd = arm_qpos.copy()
                 _prev_ema_pos = _prev_ema_quat = None  # reset EMA on re-engage
                 continue
 
@@ -490,7 +452,7 @@ def main():
             #   Kp=0.5 → ~33 mm (−33 %)   Kp=1.0 → ~25 mm (−50 %)
             # Also counteracts Z-axis coupling during pure-X motion.
             if CARTESIAN_KP > 0:
-                pos_error = target_pos - state.eef_pos
+                pos_error = target_pos - eef_pos
                 if float(np.linalg.norm(pos_error)) > 0.003:  # 3 mm deadband
                     ik_target_pos = ik_target_pos + CARTESIAN_KP * pos_error
                     ik_target_pos = np.clip(
@@ -499,9 +461,14 @@ def main():
 
             # ── IK solve (on EMA-smoothed target) ──
             target_pose = Pose(p=ik_target_pos, q=ik_target_quat)
-            if np.all(np.isfinite(state.hand_qpos)):
-                planner.set_hand_qpos(state.hand_qpos)
-            ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
+            # Hand qpos from ring (if available — keyboard teleop doesn't need hand)
+            _hand_result = shared.hand_state_ring.read_latest()
+            if _hand_result is not None:
+                _hd, _, _ = _hand_result
+                _hand_qpos = np.asarray(_hd["qpos"][0], dtype=np.float64)
+                if np.all(np.isfinite(_hand_qpos)):
+                    planner.set_hand_qpos(_hand_qpos)
+            ik_result = planner.solve_teleop_ik(target_pose, arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:
                 ik_fail_count += 1
@@ -511,8 +478,8 @@ def main():
                     print(f"  ⚡ IK fail (#{ik_fail_count}): {reason}", flush=True)
                     _last_ik_fail_reason = reason
                     _last_ik_fail_time = now
-                target_pos = state.eef_pos.copy()
-                target_quat = state.eef_quat_wxyz.copy()
+                target_pos = eef_pos.copy()
+                target_quat = target_quat.copy()
                 _prev_ema_pos = _prev_ema_quat = None  # reset EMA on IK failure
                 ik_outcome = "held"
                 continue
@@ -536,44 +503,29 @@ def main():
                     dx=dx,
                     target_pos=target_pos,
                     ik_target_pos=ik_target_pos,
-                    eef_pos=state.eef_pos,
+                    eef_pos=eef_pos,
                     ik_fk_pos=ik_fk_pose.p,
                     ik_fk_quat=ik_fk_pose.q,
                     ik_target_quat=ik_target_quat,
                     ik_result=ik_result,
-                    arm_qpos=state.arm_qpos,
+                    arm_qpos=arm_qpos,
                     report=getattr(ik_result, "report", {}) or {},
                 )
 
-            # ── Send ──
-            # Arm: via inner loop (30Hz, mode 6 — firmware trajectory planning)
-            # Hand: via robot.send_action() (hold position)
-            action = RobotAction(
-                arm_qpos_cmd=arm_cmd,
-                hand_qpos_cmd=state.hand_qpos.copy(),
-            )
-
-            # ── Pre-send gate: 力矩/温度/软限位 (与 controller.py:346 一致) ──
-            action_valid, fail_reason = validate_action(
-                robot,
-                action,
-                actual_arm_qvel=state.arm_qvel,
-                actual_arm_tau=state.arm_tau,
-            )
-            if not action_valid:
-                print(f"  [SAFETY] Pre-send gate: {fail_reason} — 跳过本帧", flush=True)
+            # ── Send via SharedStorage ──
+            # Arm: via arm_action_q (arm_loop reads and servos)
+            # NaN gate (inline — same as policy_loop)
+            if not np.all(np.isfinite(arm_cmd)):
+                continue
+            if shared.safety_state.value == SafetyState.FAULT:
                 continue
 
-            arm_inner.set_target(action.arm_qpos_cmd)
-            robot.send_action(action)  # hand only
+            shared.arm_action_q.put({"qpos": arm_cmd.copy()})
 
             # ── Tracking safety ──
-            # Compare actual position against the delta-clamped command the inner
-            # loop actually sent to the SDK (not the raw IK output, which may
-            # have been clamped by ArmInnerLoop's per-step delta limit).
-            if np.all(np.isfinite(state.arm_qpos)):
-                sent_cmd = arm_inner.last_sent_cmd
-                tracking_err = np.max(np.abs(state.arm_qpos - sent_cmd)) if sent_cmd is not None else 0.0
+            if np.all(np.isfinite(arm_qpos)):
+                sent_cmd = arm_cmd.copy()
+                tracking_err = np.max(np.abs(arm_qpos - sent_cmd))
                 if tracking_err > TRACKING_DIVERGENCE_THRESHOLD_RAD:
                     consecutive_divergence += 1
                     print(
@@ -599,7 +551,8 @@ def main():
         print("\n按 R 执行 return_home，或按 Q 直接退出...")
         while True:
             if keys.is_pressed("r"):
-                arm_inner = do_return_home(robot, arm_inner, INNER_LOOP_CFG)
+                shared.arm_action_q.put(HOME_SENTINEL)
+                time.sleep(5.0)
                 print("按 Q 退出...")
             if keys.is_pressed("q") or keys.is_pressed("esc"):
                 break
@@ -608,13 +561,19 @@ def main():
         keys.stop()
 
         # ── Cleanup ──
-        if arm_inner.is_alive:
-            arm_inner.set_target(None)
-            arm_inner.stop()
-            print("Arm 内环线程已停止")
-
-        robot.disconnect()
+        _shutdown_kb(shared, arm_proc, hand_proc)
         print("Done.")
+
+
+def _shutdown_kb(shared: SharedStorage, arm_proc: mp.Process, hand_proc: mp.Process) -> None:
+    """Graceful shutdown for keyboard teleop."""
+    shared.is_running.value = False
+    for p in (arm_proc, hand_proc):
+        p.join(timeout=5)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=1)
+    shared.close()
 
 
 if __name__ == "__main__":

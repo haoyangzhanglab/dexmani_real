@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
     from dexmani_real.sensor.protocols import CameraDriver
     from dexmani_real.shm.ring_buffer import CameraRingBuffer
+    from dexmani_real.shm.shared_storage import SharedStorage
 
 logger = get_logger(__name__)
 
@@ -239,8 +240,6 @@ class CameraProcess:
             self._init_shm()
         if self._shm_buf is None:
             return None
-        from dexmani_real.shm.layouts import bytes_to_camera_frame
-
         result = self._shm_buf.read_latest()
         if result is None:
             return None
@@ -304,7 +303,6 @@ class CameraProcess:
 
             import numpy as np
 
-            from dexmani_real.shm.layouts import pack_camera_frame
             from dexmani_real.shm.ring_buffer import CameraRingBuffer
 
             shm_writer = CameraRingBuffer.attach(self.config.shm_name)
@@ -516,3 +514,120 @@ def create_camera_session(enable_pointcloud: bool = True, hz: float = 30.0) -> C
         print("cameras.json 加载失败 — /meta 将缺少外参（点云不受影响，子进程独立解析）")
 
     return CameraSession(camera=camera, calib=calib)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Camera frame packing helpers (moved from shm/layouts.py — Phase 2.7)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def pack_camera_frame(
+    rgb: "np.ndarray",
+    depth_raw: "np.ndarray",
+    timestamp: float,
+    frame_id: int,
+    pc_num_points: int = 0,
+    camera_health: int = 0,
+) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+    """Pack camera frame attributes into (header, rgb_bytes, depth_bytes)."""
+    import numpy as np
+
+    from dexmani_real.shm.ring_buffer import CAMERA_FRAME_HEADER_DTYPE
+
+    header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
+    header["timestamp"] = np.float64(timestamp)
+    header["frame_number"] = np.uint64(frame_id)
+    header["pc_num_points"] = np.uint32(pc_num_points)
+    header["camera_health"] = np.uint8(camera_health)
+
+    rgb_arr = np.asarray(rgb, dtype=np.uint8)
+    depth_arr = np.asarray(depth_raw, dtype=np.uint16)
+
+    header["rgb_size"] = np.uint64(rgb_arr.nbytes)
+    header["depth_size"] = np.uint64(depth_arr.nbytes)
+    header["rgb_shape_h"] = np.uint32(rgb_arr.shape[0])
+    header["rgb_shape_w"] = np.uint32(rgb_arr.shape[1])
+    header["rgb_shape_c"] = np.uint32(rgb_arr.shape[2])
+    header["depth_shape_h"] = np.uint32(depth_arr.shape[0])
+    header["depth_shape_w"] = np.uint32(depth_arr.shape[1])
+
+    return header, rgb_arr, depth_arr
+
+
+def bytes_to_camera_frame(
+    header: "np.ndarray",
+    rgb_bytes: "np.ndarray",
+    depth_bytes: "np.ndarray",
+    pointcloud: "np.ndarray | None" = None,
+) -> dict:
+    """Reconstruct a camera frame dict from raw bytes."""
+    h = header[0]
+    rgb = rgb_bytes.reshape((int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"]))).copy()
+    depth = depth_bytes.reshape((int(h["depth_shape_h"]), int(h["depth_shape_w"]))).copy()
+    frame = {
+        "rgb": rgb,
+        "depth": depth,
+        "timestamp": float(h["timestamp"]),
+        "frame_number": int(h["frame_number"]),
+        "camera_health": int(h["camera_health"]),
+    }
+    if pointcloud is not None:
+        frame["pointcloud"] = pointcloud
+        frame["pointcloud_valid"] = int(h["pc_num_points"]) > 0
+    return frame
+
+
+# ═══════════════════════════════════════════════════════════════════
+# New architecture: camera_loop (mp.Process target)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def camera_loop(shared: "SharedStorage") -> None:
+    """Run RealSense camera → bridge frames to shared.camera_ring.
+
+    Designed as an mp.Process target. Uses :func:`create_camera_session` for
+    lifecycle and :func:`pack_camera_frame` for SHM encoding.
+
+    On init failure, logs the error and returns without setting
+    ``shared.camera_ready`` — Main detects this via ready-event timeout.
+    """
+    _logger = get_logger("camera_loop")
+
+    session = create_camera_session()
+    if session.camera is None:
+        _logger.error("camera_loop: camera init failed")
+        return
+
+    # Publish camera metadata for Policy to read before recording starts.
+    _ds = session.depth_scale
+    if _ds is not None:
+        shared.camera_depth_scale.value = float(_ds)
+    _K = session.camera_K
+    if _K is not None and _K.shape == (3, 3):
+        shared.camera_K[:] = _K.flatten().tolist()
+    _serial = getattr(session.camera, "camera_serial", "")
+    if _serial:
+        shared.camera_serial.value = _serial.encode()[:31].ljust(32, b"\x00")
+
+    shared.camera_ready.set()
+    _logger.info("Camera loop ready")
+
+    while shared.is_running.value:
+        shared.camera_heartbeat_s.value = time.monotonic()
+        frame = session.poll_latest_frame()
+        if frame is not None and shared.is_recording.value:
+            try:
+                pc = frame.get("pointcloud")
+                pc_num = pc.shape[0] if pc is not None and frame.get("pointcloud_valid", False) else 0
+                header, rgb, depth = pack_camera_frame(
+                    frame["rgb"], frame["depth"], frame["timestamp"],
+                    frame["frame_number"], pc_num,
+                    frame.get("camera_health", 0),
+                )
+                shared.camera_ring.write(header, rgb, depth, pc)
+            except Exception:
+                _logger.warning("camera_loop: bridge write failed", exc_info=True)
+        time.sleep(0.03)  # ~30Hz
+
+    session.stop()
+    _logger.info("Camera loop exited")

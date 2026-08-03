@@ -58,14 +58,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real import ASSET_DIR, PACKAGE_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.robot.inner_loop import ArmInnerLoopConfig
-from dexmani_real.robot.arm_process import do_return_home, make_arm_servo
+from dexmani_real.robot.inner_loop import ArmInnerLoopConfig, arm_loop as _arm_loop
 
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
 except ImportError:
     raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
-from dexmani_real.robot.interface import RobotInterface, RobotInterfaceConfig
+from dexmani_real.robot.safety import SafetyState, transition
+from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage, SharedStorageConfig, read_arm_state
 from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
@@ -77,14 +77,14 @@ DELTA_RPY = 0.02  # 每次按键旋转量 (rad)
 TARGET_LEAD_MAX = 0.03  # target 领先 arm 的最大距离 (m)
 HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s（保守，避免归位过快）
 
-WORKSPACE_BOUNDS = np.array(
-    [
-        [0.28, 0.72],  # x [min, max] m
-        [-0.45, 0.45],  # y [min, max] m
-        [0.05, 0.5],  # z [min, max] m
-    ],
-    dtype=np.float64,
-)
+# Workspace bounds — derived from SharedStorageConfig for consistency with
+# the data-collection entry points.  The Y bounds are slightly tighter than
+# the default config (-0.45 vs -0.50) because the calibration rig (ArUco
+# marker on end-effector + fixed tripod camera) has a narrower useful range.
+_shm_defaults = SharedStorageConfig()
+WORKSPACE_BOUNDS = _shm_defaults.workspace_bounds.copy()
+WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
+WORKSPACE_BOUNDS[1, 1] = 0.45   # y_max: tighter for calibration rig
 
 # ArUco 标记参数
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
@@ -589,7 +589,7 @@ def main():
     tty_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
     tty_attrs = termios.tcgetattr(tty_fd) if tty_fd is not None else None
 
-    # ── 1. 连接 xArm7 ──
+    # ── 1. Planner (for IK in main loop) ──
     urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
     srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
 
@@ -609,35 +609,55 @@ def main():
         ),
     )
 
-    robot = RobotInterface(
-        RobotInterfaceConfig(),
-        kinematics=planner.kin,
-        planner=planner,
-    )
+    # ── 2. SharedStorage + arm_loop (new architecture) ──
+    import multiprocessing as mp
 
-    print("\n连接 xArm7...")
-    result = robot.connect()
-    if not result.get("arm"):
-        print("❌ arm 连接失败，退出")
+    shm_cfg = SharedStorageConfig()
+    shared = SharedStorage.create(prefix="dexmani_calib", config=shm_cfg)
+    arm_cfg = ArmInnerLoopConfig()
+    arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm-calib", daemon=True)
+    arm_proc.start()
+
+    transition(shared, SafetyState.DISARMED)
+    if not shared.arm_ready.wait(timeout=30):
+        print("❌ arm_loop 启动超时")
+        shared.is_running.value = False
+        arm_proc.join(timeout=5)
+        shared.close()
         return
-    print("  ✓ arm 已连接")
+    transition(shared, SafetyState.ARMED)
+    print("  ✓ arm_loop 就绪 (SharedStorage, Mode 6, 30Hz)")
 
-    # ── 2. 启动 ArmInnerLoop ──
-    inner_cfg = ArmInnerLoopConfig()
-    arm_inner = make_arm_servo(cfg=inner_cfg)
-    robot.set_arm_servo(arm_inner)
-    arm_inner.start()
-    if not arm_inner.wait_ready(timeout=30.0):
-        print("❌ Arm 内环线程启动超时")
-        robot.disconnect()
+    # ── Read initial state from ring ──
+
+    def _read_arm_state_ring():
+        """Read latest arm state from ring, return (qpos, eef_pos, eef_rot6d) or (None,)*3."""
+        data = read_arm_state(shared)
+        if data is None:
+            return None, None, None
+        qpos = np.asarray(data["qpos"][0], dtype=np.float64)
+        eef_pos = np.asarray(data["eef_pos"][0], dtype=np.float64)
+        eef_rot6d = np.asarray(data["eef_rot6d"][0], dtype=np.float64)
+        if not np.all(np.isfinite(qpos)):
+            return None, None, None
+        return qpos, eef_pos, eef_rot6d
+
+    arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
+    if arm_qpos is None:
+        print("❌ 无法从 arm_state_ring 读取初始状态")
+        shared.is_running.value = False
+        arm_proc.join(timeout=5)
+        shared.close()
         return
-    print("  ✓ Arm 内环就绪 (30Hz, mode 6)")
 
-    arm_qpos, error_state, _ = arm_inner.get_state()
-    state = robot.get_state(arm_qpos=arm_qpos if np.all(np.isfinite(arm_qpos)) else None)
-    prev_qpos_cmd = state.arm_qpos.copy()
-    target_pos = state.eef_pos.copy()
-    target_quat = state.eef_quat_wxyz.copy()
+    prev_qpos_cmd = arm_qpos.copy()
+    target_pos = eef_pos.copy()
+    # Derive target quat from rot6d (stored in ring).
+    try:
+        from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+        target_quat = rot6d_to_quat_wxyz(_eef_rot6d)
+    except Exception:
+        target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
     print(f"\n  当前 EEF: pos={np.round(target_pos, 4)}m  q={np.round(target_quat, 4)}")
 
@@ -705,22 +725,39 @@ def main():
     def _get_ee_pose() -> tuple[np.ndarray, np.ndarray]:
         """获取当前末端位姿 (pos_m, rpy_rad)。
 
-        必须用 is_radian=True: xArm Python SDK 默认返回角度(度)，仅此参数下返回弧度。
-        本函数的 rpy 单位(弧度)必须与 calibrate_eye_to_hand 中 R.from_euler(..., degrees=False)
-        保持一致——两处耦合，改动其一务必同步，否则会引入 ~57x 的角度错误。
+        Under the SharedStorage architecture the EE pose is read from
+        ``arm_state_ring`` (eef_pos + eef_rot6d), then rot6d is converted
+        to RPY via scipy.  RPY unit is radians — must match
+        ``calibrate_eye_to_hand`` (``R.from_euler(..., degrees=False)``).
         """
-        code, pos_list = robot.arm.arm.get_position(is_radian=True)
-        if code != 0:
+        qpos, eef_pos, eef_rot6d = _read_arm_state_ring()
+        if qpos is None or eef_pos is None or eef_rot6d is None:
             return np.full(3, np.nan), np.full(3, np.nan)
-        pos_arr = np.asarray(pos_list, dtype=np.float64)
-        return pos_arr[:3] / 1000.0, pos_arr[3:]  # mm→m
+        try:
+            # Convert rot6d → rotation matrix → RPY
+            # rot6d = [col1_x, col1_y, col1_z, col2_x, col2_y, col2_z]
+            a1 = eef_rot6d[:3]
+            a2 = eef_rot6d[3:6]
+            norm_a1 = float(np.linalg.norm(a1))
+            if norm_a1 < 1e-12:
+                return np.full(3, np.nan), np.full(3, np.nan)
+            b1 = a1 / norm_a1
+            b2 = a2 - np.dot(b1, a2) * b1
+            norm_b2 = float(np.linalg.norm(b2))
+            if norm_b2 < 1e-12:
+                return np.full(3, np.nan), np.full(3, np.nan)
+            b2 = b2 / norm_b2
+            b3 = np.cross(b1, b2)
+            r_mat = np.column_stack([b1, b2, b3])
+            rpy = R.from_matrix(r_mat).as_euler("xyz", degrees=False)
+            return eef_pos.copy(), np.asarray(rpy, dtype=np.float64)
+        except Exception:
+            return np.full(3, np.nan), np.full(3, np.nan)
 
     def _emergency_stop():
         nonlocal running
-        if arm_inner.is_alive:
-            arm_inner.set_target(None)
-            arm_inner.stop()
-        robot.emergency_stop()
+        shared.estop_request.value = True
+        shared.is_running.value = False
         running = False
 
     try:
@@ -876,33 +913,45 @@ def main():
                 running = False
                 break
 
-            # ── R: 归位 ──
+            # ── R: 归位 (HOME_SENTINEL through arm_action_q) ──
             if keys.is_pressed("r"):
-                arm_inner = do_return_home(robot, arm_inner, inner_cfg, home_dt=HOME_DT)
-                if arm_inner.wait_ready(timeout=30.0):
-                    arm_qpos, error_state, _ = arm_inner.get_state()
-                    if not error_state and np.all(np.isfinite(arm_qpos)):
-                        state = robot.get_state(arm_qpos=arm_qpos)
-                        prev_qpos_cmd = state.arm_qpos.copy()
-                        target_pos = state.eef_pos.copy()
-                        target_quat = state.eef_quat_wxyz.copy()
-                        print("  Arm 内环线程重启就绪")
+                print("\n  R: return_home (HOME_SENTINEL → arm_action_q)")
+                shared.arm_action_q.put(HOME_SENTINEL)
+                # Poll arm_state_ring qpos for homing completion.
+                _home_wait = time.perf_counter() + 15.0
+                _last_hb = shared.arm_heartbeat_s.value
+                while time.perf_counter() < _home_wait:
+                    time.sleep(0.5)
+                    _cur_hb = shared.arm_heartbeat_s.value
+                    if _cur_hb == _last_hb:
+                        break  # heartbeat stalled → arm_loop likely dead
+                    _last_hb = _cur_hb
+                # Re-sync after homing
+                arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
+                if arm_qpos is not None:
+                    prev_qpos_cmd = arm_qpos.copy()
+                    target_pos = eef_pos.copy()
+                    try:
+                        target_quat = rot6d_to_quat_wxyz(_eef_rot6d)
+                    except Exception:
+                        pass
+                    print("  Arm 归位完成，状态已同步")
                 else:
-                    print("  ⚠ Arm 内环重启超时")
+                    print("  ⚠ 归位后无法读取状态")
                 continue
 
-            # ── 读取状态 ──
+            # ── 读取状态 (from arm_state_ring) ──
             try:
-                arm_qpos, error_state, _ = arm_inner.get_state()
-                if error_state:
-                    print("  ⚠ Arm 内环异常")
+                arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
+                if arm_qpos is None:
                     continue
-                state = robot.get_state(arm_qpos=arm_qpos)
+                # Derive eef_quat from rot6d for target tracking
+                try:
+                    eef_quat = rot6d_to_quat_wxyz(_eef_rot6d)
+                except Exception:
+                    eef_quat = target_quat.copy()
             except Exception as e:
-                print(f"  ⚠ get_state 异常: {e}")
-                continue
-
-            if not np.all(np.isfinite(state.arm_qpos)):
+                print(f"  ⚠ 状态读取异常: {e}")
                 continue
 
             # ── EEF target delta from keys ──
@@ -939,7 +988,7 @@ def main():
                 n = len(samples_tvec_ee2base)
                 print(
                     f"[{loop_count:5d}] "
-                    f"eef={np.round(state.eef_pos, 3)}m  "
+                    f"eef={np.round(eef_pos, 3)}m  "
                     f"samples={n}  "
                     f"{'← 按 SPACE 采集' if n < MIN_SAMPLES else '← 按 ENTER 标定'}",
                     flush=True,
@@ -947,15 +996,15 @@ def main():
 
             # 无输入 → snap target
             if np.all(dx == 0) and np.all(drpy == 0):
-                target_pos = state.eef_pos.copy()
-                target_quat = state.eef_quat_wxyz.copy()
-                prev_qpos_cmd = state.arm_qpos.copy()
+                target_pos = eef_pos.copy()
+                target_quat = eef_quat.copy()
+                prev_qpos_cmd = arm_qpos.copy()
                 continue
 
             # ── Target lead limit ──
-            lead = np.linalg.norm(target_pos - state.eef_pos)
+            lead = np.linalg.norm(target_pos - eef_pos)
             if lead > TARGET_LEAD_MAX:
-                target_pos = state.eef_pos + (target_pos - state.eef_pos) * (TARGET_LEAD_MAX / lead)
+                target_pos = eef_pos + (target_pos - eef_pos) * (TARGET_LEAD_MAX / lead)
 
             # ── Workspace soft-wall: directional — allow moving back into workspace ──
             new_pos = target_pos + dx
@@ -985,16 +1034,16 @@ def main():
 
             # ── IK ──
             target_pose = Pose(p=target_pos, q=target_quat)
-            if np.all(np.isfinite(state.hand_qpos)):
-                planner.set_hand_qpos(state.hand_qpos)
-            ik_result = planner.solve_teleop_ik(target_pose, state.arm_qpos, prev_qpos_cmd)
+            # Calibration tool doesn't connect hand hardware → no hand_qpos to sync.
+            # (Collision model falls back to open-hand pose — acceptable for calib.)
+            ik_result = planner.solve_teleop_ik(target_pose, arm_qpos, prev_qpos_cmd)
             if not ik_result.success or ik_result.qpos is None:
-                target_pos = state.eef_pos.copy()
-                target_quat = state.eef_quat_wxyz.copy()
+                target_pos = eef_pos.copy()
+                target_quat = eef_quat.copy()
                 continue
 
             prev_qpos_cmd = ik_result.qpos.copy()
-            arm_inner.set_target(ik_result.qpos)
+            shared.arm_action_q.put({"qpos": ik_result.qpos})
 
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt — 退出")
@@ -1011,10 +1060,13 @@ def main():
             except Exception:
                 pass
 
-        if arm_inner.is_alive:
-            arm_inner.set_target(None)
-            arm_inner.stop()
-        robot.disconnect()
+        # ── SharedStorage cleanup ──
+        shared.is_running.value = False
+        arm_proc.join(timeout=5)
+        if arm_proc.is_alive():
+            arm_proc.terminate()
+            arm_proc.join(timeout=1)
+        shared.close()
 
         n = len(samples_tvec_ee2base)
         if n >= MIN_SAMPLES and T_world_camera is None:

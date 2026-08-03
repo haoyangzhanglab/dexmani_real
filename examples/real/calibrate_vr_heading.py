@@ -39,7 +39,8 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz
-from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, VRReceiverProcess
+from dexmani_real.sensor.vr_receiver_process import vr_loop
+from dexmani_real.shm.shared_storage import SharedStorage, vr_frame_dtype as _vr_frame_dtype
 
 CONFIG_DIR = _repo_root / "dexmani_real" / "config"
 OUTPUT_PATH = CONFIG_DIR / "vr_transform.json"
@@ -137,18 +138,18 @@ def main() -> None:
     print(f"  端口:   {args.port}")
     print("=" * 55)
 
-    # ── Start VR receiver ──
-    vr_config = VRReceiverConfig(
-        transport="tcp_server", host="0.0.0.0", port=args.port,
-        hand_side="both",
-    )
-    receiver = VRReceiverProcess(config=vr_config)
-    receiver.start()
-    time.sleep(1.0)
+    # ── Start VR receiver (new architecture: SharedStorage + vr_loop) ──
+    import multiprocessing as mp
 
-    if not receiver.running:
-        print("ERROR: VR receiver 启动失败")
-        receiver.stop()
+    shared = SharedStorage.create(prefix="dexmani_vr_calib")
+    vr_proc = mp.Process(target=vr_loop, args=(shared,), name="vr-calib", daemon=True)
+    vr_proc.start()
+
+    if not shared.vr_ready.wait(timeout=15):
+        print("ERROR: VR receiver 启动失败 (ready timeout)")
+        shared.is_running.value = False
+        vr_proc.join(timeout=5)
+        shared.close()
         sys.exit(1)
 
     print("\nVR receiver 已启动, 等待数据...")
@@ -157,10 +158,11 @@ def main() -> None:
     deadline = time.monotonic() + 120.0
     last_print = 0.0
     while time.monotonic() < deadline:
-        frame = receiver.read_latest()
-        if frame is not None:
-            hp = frame.get("head_pos")
-            if hp is not None and np.any(np.asarray(hp) != 0):
+        result = shared.vr_ring.read_latest()
+        if result is not None:
+            data, _ts, _seq = result
+            hp = np.asarray(data["head_pos"][0], dtype=np.float64)
+            if np.any(hp != 0):
                 print("  已收到数据\n")
                 break
         now = time.monotonic()
@@ -170,7 +172,9 @@ def main() -> None:
         time.sleep(0.1)
     else:
         print("ERROR: 120s内未收到数据, 请确认VR已连接且Quest app正在运行")
-        receiver.stop()
+        shared.is_running.value = False
+        vr_proc.join(timeout=5)
+        shared.close()
         sys.exit(1)
 
     # ── Countdown ──
@@ -190,22 +194,26 @@ def main() -> None:
 
     print(f"  采集 {args.duration}s (保持静止)...")
     while time.monotonic() < deadline:
-        frame = receiver.read_latest()
-        if frame is None:
+        result = shared.vr_ring.read_latest()
+        if result is None:
             time.sleep(0.01)
             continue
 
-        q = frame.get(quat_key)
-        if q is None:
-            continue
-        q = np.asarray(q, dtype=np.float64)
+        data, _ts, _seq = result
+
+        # Extract quaternion from structured array field.
+        if args.ref == "wrist":
+            q = np.asarray(data["wrist_quat_wxyz"][0], dtype=np.float64)
+        else:
+            q = np.asarray(data["head_quat_wxyz"][0], dtype=np.float64)
+
         if not np.all(np.isfinite(q)):
             continue
 
         # For head mode: skip frames without valid head position
         if args.ref == "head":
-            hp = frame.get("head_pos")
-            if hp is None or not np.any(np.asarray(hp) != 0):
+            hp = np.asarray(data["head_pos"][0], dtype=np.float64)
+            if not np.any(hp != 0):
                 continue
 
         q = normalize_quat_wxyz(q)
@@ -217,7 +225,9 @@ def main() -> None:
             last_print = now
         time.sleep(0.01)
 
-    receiver.stop()
+    shared.is_running.value = False
+    vr_proc.join(timeout=5)
+    shared.close()
 
     if len(forwards) < 30:
         print(f"ERROR: 只采集到 {len(forwards)} 帧 ({args.ref} quat 不可用?), 样本不足 (需 ≥30)")

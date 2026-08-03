@@ -172,16 +172,18 @@ class XHandConfig:
     # Actual np.clip is always enforced regardless of this threshold.
     clip_report_tolerance: float = 0.01
 
-    # ── Per-step delta clamp (safety net, not motion planner) ──
+    # ── Per-step delta clamp (off by default) ──
     # Mode 3 PID has no firmware trajectory planning (unlike arm Mode 6).
-    # A large instantaneous target jump — e.g. home_qpos → first VR teleop pose —
-    # is forwarded directly to the motor PID, which drives at full torque.
-    # This clamp limits the per-step joint delta.  It is a safety backstop, not
-    # a motion planner: normal teleop should rarely trigger it.
+    # A large instantaneous target jump is forwarded directly to the motor PID.
+    # When enabled, this clamp limits the per-step joint delta as a safety
+    # backstop.  Disabled by default: the five reference projects (LeFranX,
+    # DexUMI, Dexora, pi-r2-flow, DexScrew) all operate without per-step
+    # delta clamping — teleop data is naturally smooth, and the firmware
+    # tor_max provides hardware-level overcurrent protection.
     #   - scalar: applied to all 12 joints
     #   - (12,) array: per-joint limits
-    #   - None: disabled (legacy behaviour)
-    max_delta_rad: float | np.ndarray | None = 0.3
+    #   - None: disabled (default)
+    max_delta_rad: float | np.ndarray | None = None
 
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
@@ -213,6 +215,14 @@ class XHand:
 
         # Error recovery: track consecutive send failures for circuit breaker
         self._consecutive_send_errors: int = 0
+
+        # Tactile sensor bias (ref: pi-r2-flow xhand_robot.py:285-299)
+        # The vendor's reset_sensor() leaves residual offsets (~5-30 N).
+        # We take 5 fresh readings after reset and store the average as a
+        # software bias; parse_tactile() and parse_tactile_sum() subtract
+        # it to zero the no-contact baseline.
+        self._tactile_bias_ft: np.ndarray | None = None   # (5, 3)   — calc_force bias
+        self._tactile_bias_raw: np.ndarray | None = None  # (5, 120, 3) — raw_force bias
 
         self._stub_mode = False  # True when xhand_controller SDK unavailable (ref: LeFranX)
         self.last_hand_ids: list[int] = []
@@ -291,6 +301,12 @@ class XHand:
         interface, causing SDO responses to route to the stale socket while
         the open path waits on the new one — producing "write sdo failed"
         errors observed in forked child processes.
+
+        TODO: This two-phase pattern is an architecture tax from fork-based
+        process isolation.  pi-r2-flow and DexScrew use single-instance
+        enumerate→open in the main thread without issue.  If hand control
+        moves to the main thread, this ~100-line workaround can be removed.
+        Ref: docs/xhand-cross-project-reference.md §12.3.1, §12.9.
         """
         # ── Phase 1: device discovery (temporary control, closed after) ──
         if self.config.device_name is None:
@@ -414,30 +430,6 @@ class XHand:
             self.last_qpos_cmd = self._array12(self.config.home_qpos)
             logger.info("Using home_qpos as initial qpos: %s", self.last_qpos_cmd)
 
-        # ── Deadband safety verify (D11): readback actual qpos and compare ──
-        # If _init_hand_state set last_qpos_cmd to a wrong value (SDK cache
-        # zeroes, hardware glitch, mechanical jam during home settle), every
-        # subsequent send_action hits the 0.001-rad deadband and returns True
-        # without writing to hardware → hand frozen indefinitely.
-        try:
-            _verify_state = self.get_state(full=False, force_update=True)
-            _verify_qpos = np.asarray(_verify_state.get("qpos", np.zeros(12)), dtype=np.float64)
-            if _verify_qpos.shape == (12,) and np.all(np.isfinite(_verify_qpos)):
-                _delta = float(np.max(np.abs(self.last_qpos_cmd - _verify_qpos)))
-                if _delta > 0.05:  # ~3° — hardware readback disagrees with cached cmd
-                    logger.warning(
-                        "XHand: last_qpos_cmd disagrees with hardware readback by %.3f rad (%.2f°) "
-                        "— correcting last_qpos_cmd to actual position to prevent deadband stuck. "
-                        "cmd=[%s] actual=[%s]",
-                        _delta,
-                        np.rad2deg(_delta),
-                        np.array2string(self.last_qpos_cmd, precision=3, suppress_small=True),
-                        np.array2string(_verify_qpos, precision=3, suppress_small=True),
-                    )
-                    self.last_qpos_cmd = _verify_qpos.copy()
-        except Exception:
-            pass  # non-critical — if verify fails, proceed with whatever last_qpos_cmd we have
-
         # ── Tactile sensor initialisation ──
         # Reset all five fingertip sensors after power-on.  The SDK documents
         # that some sensors may need an explicit reset before they begin
@@ -447,45 +439,111 @@ class XHand:
         self._reset_tactile_sensors()
 
     def _reset_tactile_sensors(self) -> None:
-        """Reset all five fingertip tactile sensors (sensor IDs 17–21).
+        """Reset all five fingertip tactile sensors (sensor IDs 17--21).
 
         Per SDK documentation, some usage scenarios require an explicit sensor
         reset before data is reported.  This is called once at connect time;
         individual sensor failures are logged but are non-fatal.
 
+        After hardware reset, computes a software bias from 5 fresh readings
+        (ref: pi-r2-flow xhand_robot.py:285-299) to compensate for the vendor's
+        residual offset (~5--30 N).  The bias is stored on the instance and
+        subtracted in ``parse_tactile()`` / ``parse_tactile_sum()`` so that
+        no-contact readings are zeroed.
+
         The C++ SDK (libxhand_control.so) prints "Unknow Cmd!" to stdout for
         each ``reset_sensor()`` call when the hand firmware does not recognise
-        the command.  The error codes are handled in Python regardless; the
-        messages are pure noise.  We redirect fd 1 (C stdout) to /dev/null
-        during the calls, preserving fd 2 (stderr → Python logging).
+        the command.  The error codes are handled in Python regardless.
         """
         if self._stub_mode:
             return
         device_id = self.config.device_id
 
-        # Redirect C stdout (fd 1) → /dev/null during reset_sensor() calls.
-        # Python logging writes to stderr (fd 2), which is left untouched.
-        import os as _os
-        _devnull = _os.open(_os.devnull, _os.O_WRONLY)
-        _saved_stdout = _os.dup(1)
+        for sensor_id in range(17, 22):  # 17=thumb, 18=index, 19=middle, 20=ring, 21=little
+            try:
+                err = self.control.reset_sensor(device_id, sensor_id)
+                if not self.error_ok(err):
+                    logger.warning(
+                        "Tactile sensor %d reset failed: code=%s msg=%s",
+                        sensor_id,
+                        self.error_code(err),
+                        str(getattr(err, "error_message", "")),
+                    )
+            except Exception:
+                logger.warning("Tactile sensor %d reset raised exception", sensor_id, exc_info=True)
+
+        # ── Software bias computation (ref: pi-r2-flow xhand_robot.py:285-299) ──
+        # The vendor's reset_sensor() alone leaves a residual offset of ~5-30 N
+        # on some sensors.  Take 5 fresh readings, average them, and store as a
+        # bias that is subtracted in parse_tactile() / parse_tactile_sum().
         try:
-            _os.dup2(_devnull, 1)
-            for sensor_id in range(17, 22):  # 17=thumb, 18=index, 19=middle, 20=ring, 21=little
-                try:
-                    err = self.control.reset_sensor(device_id, sensor_id)
-                    if not self.error_ok(err):
-                        logger.warning(
-                            "Tactile sensor %d reset failed: code=%s msg=%s",
-                            sensor_id,
-                            self.error_code(err),
-                            str(getattr(err, "error_message", "")),
-                        )
-                except Exception:
-                    logger.warning("Tactile sensor %d reset raised exception", sensor_id, exc_info=True)
-        finally:
-            _os.dup2(_saved_stdout, 1)
-            _os.close(_saved_stdout)
-            _os.close(_devnull)
+            self._compute_tactile_bias(device_id)
+        except Exception:
+            logger.warning(
+                "Tactile bias computation failed — bias will be zero (no correction).",
+                exc_info=True,
+            )
+            self._tactile_bias_ft = np.zeros((5, 3), dtype=np.float64)
+            self._tactile_bias_raw = np.zeros((5, 120, 3), dtype=np.float64)
+
+    def _compute_tactile_bias(self, device_id: int, n_samples: int = 5) -> None:
+        """Average *n_samples* fresh tactile readings as the no-contact bias.
+
+        Stores ``self._tactile_bias_ft`` (5,3) and ``self._tactile_bias_raw``
+        (5,120,3).  Called once after ``reset_sensor()`` at connect time.
+
+        The hand must NOT be in contact with any object during bias capture.
+        If ``read_state`` returns an error on any sample, bias is set to zeros
+        (no correction) and a warning is logged.
+        """
+        if self._stub_mode or self.control is None:
+            self._tactile_bias_ft = np.zeros((5, 3), dtype=np.float64)
+            self._tactile_bias_raw = np.zeros((5, 120, 3), dtype=np.float64)
+            return
+
+        ft_samples: list[np.ndarray] = []
+        raw_samples: list[np.ndarray] = []
+
+        for _ in range(n_samples):
+            err, hand_state = self._unpack_result(
+                self.control.read_state(device_id, True)  # force_update=True
+            )
+            if not self.error_ok(err):
+                logger.warning(
+                    "Tactile bias sample read failed (code=%s) — "
+                    "bias will be zero (no correction).  "
+                    "Ensure the hand is not in contact with any object during init.",
+                    self.error_code(err),
+                )
+                self._tactile_bias_ft = np.zeros((5, 3), dtype=np.float64)
+                self._tactile_bias_raw = np.zeros((5, 120, 3), dtype=np.float64)
+                return
+
+            ft_samples.append(self.parse_tactile_sum(hand_state))
+            raw_samples.append(self.parse_tactile(hand_state))
+
+        self._tactile_bias_ft = np.mean(np.stack(ft_samples, axis=0), axis=0)
+        self._tactile_bias_raw = np.mean(np.stack(raw_samples, axis=0), axis=0)
+
+        # Log which fingers have significant bias
+        ft_mag = np.linalg.norm(self._tactile_bias_ft, axis=1)
+        for i, mag in enumerate(ft_mag):
+            if mag > 0.5:  # N — lower threshold than pi-r2-flow's verify_thresh (2.0 N)
+                logger.info(
+                    "Tactile sensor %d bias: |F|=%.2f N (%.2f, %.2f, %.2f)",
+                    i + 1,
+                    mag,
+                    self._tactile_bias_ft[i, 0],
+                    self._tactile_bias_ft[i, 1],
+                    self._tactile_bias_ft[i, 2],
+                )
+
+        max_bias = float(np.max(np.abs(self._tactile_bias_raw)))
+        logger.info(
+            "Tactile bias computed from %d samples — max bias %.2f N",
+            n_samples,
+            max_bias,
+        )
 
     def _verify_device(self) -> None:
         """Log hardware identity for diagnostics (non-fatal — never blocks connect).
@@ -670,20 +728,6 @@ class XHand:
         """Number of consecutive send_action() failures (circuit breaker counter)."""
         return self._consecutive_send_errors
 
-    def reset_connection(self) -> bool:
-        """Full hardware reconnect after persistent send errors.
-
-        Disconnects, waits 1s for hardware to stabilize, then reconnects.
-        Resets consecutive error counter on success.
-        """
-        self._consecutive_send_errors = 0
-        try:
-            self.disconnect()
-        except Exception:
-            pass
-        time.sleep(1.0)
-        return self.connect()
-
     def stop(self) -> bool:
         if self._stub_mode:
             self.error_state = True
@@ -774,15 +818,6 @@ class XHand:
             else:
                 return False
         qpos_cmd = self._limit_joint_range(target_qpos)
-
-        # ── Deadband throttle: skip redundant sends for sub-noise changes ──
-        # At 16Hz, retargeting tremor produces sub-degree jitter that generates
-        # redundant RS485 commands. Skip sends when max joint delta is below
-        # the deadband (0.001 rad ≈ 0.06°). Firmware holds position on no command.
-        if self.last_qpos_cmd is not None:
-            delta = np.max(np.abs(qpos_cmd - self.last_qpos_cmd))
-            if delta < 0.001:
-                return True
 
         # ── Per-step delta clamp ──
         # Mode 3 PID has no firmware trajectory planning.  Large instantaneous
@@ -1036,6 +1071,10 @@ class XHand:
 
         Returns force values in Newtons.  The SDK returns raw integer readings
         at 10 LSB/N (sensitivity spec); we divide by 10 to obtain physical units.
+
+        Software bias (ref: pi-r2-flow xhand_robot.py:285-299) is subtracted
+        when available, zeroing the no-contact baseline that the vendor's
+        ``reset_sensor()`` leaves at ~5-30 N residual.
         """
         tactile = np.zeros((5, 120, 3), dtype=np.float64)
         for i, sensor in self._iter_sensors(hand_state):
@@ -1048,6 +1087,8 @@ class XHand:
                 tactile[i, j, 0] = float(getattr(force, "fx", 0.0)) * 0.1
                 tactile[i, j, 1] = float(getattr(force, "fy", 0.0)) * 0.1
                 tactile[i, j, 2] = float(getattr(force, "fz", 0.0)) * 0.1
+        if self._tactile_bias_raw is not None:
+            tactile -= self._tactile_bias_raw
         return tactile
 
     def parse_tactile_sum(self, hand_state) -> np.ndarray:
@@ -1055,6 +1096,9 @@ class XHand:
 
         Returns force values in Newtons.  The SDK returns raw integer readings
         at 10 LSB/N (sensitivity spec); we divide by 10 to obtain physical units.
+
+        Software bias (ref: pi-r2-flow xhand_robot.py:285-299) is subtracted
+        when available, zeroing the no-contact baseline.
         """
         force_sum = np.zeros((5, 3), dtype=np.float64)
         for i, sensor in self._iter_sensors(hand_state):
@@ -1064,6 +1108,8 @@ class XHand:
             force_sum[i, 0] = float(getattr(calc_force, "fx", 0.0)) * 0.1
             force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0)) * 0.1
             force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0)) * 0.1
+        if self._tactile_bias_ft is not None:
+            force_sum -= self._tactile_bias_ft
         return force_sum
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:

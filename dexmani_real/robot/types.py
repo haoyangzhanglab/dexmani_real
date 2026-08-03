@@ -1,18 +1,10 @@
-"""Core robot data types — RobotState, RobotAction, RobotInterfaceConfig.
-
-These types are shared across controller, recording, config, and other modules.
-They are independent of the RobotInterface orchestration class to avoid circular imports.
-"""
+"""Core robot data types — RobotState, RobotAction, ArmState, HandState, HandTactile."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import numpy as np
-
-from dexmani_real.robot.xarm7 import XArm7Config
-from dexmani_real.robot.xhand import XHandConfig
 
 
 def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
@@ -127,59 +119,95 @@ class RobotAction:
         )
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Per-process state types (Phase 2.9 — new architecture)
+# ═══════════════════════════════════════════════════════════════════
+#
+# These dataclasses replace the monolithic RobotState for intra-process
+# communication. Each process writes only the fields it owns.
+# RobotState is retained for recording compatibility (Policy assembles
+# it from ArmState + HandState + HandTactile).
+
+
 @dataclass
-class RobotInterfaceConfig:
-    arm: XArm7Config = field(default_factory=XArm7Config)
-    hand: XHandConfig = field(default_factory=XHandConfig)
+class ArmState:
+    """Arm process state — published to arm_state_ring every tick (~265 bytes).
 
-    # Workspace safety
-    workspace_bounds: np.ndarray = field(
-        default_factory=lambda: np.array(
-            [
-                [0.28, 0.72],  # x [min, max] m
-                [-0.45, 0.45],  # y [min, max] m
-                [0.05, 0.5],  # z [min, max] m
-            ],
-            dtype=np.float64,
+    Matches ARM_STATE_DTYPE in shm/shared_storage.py.
+    """
+
+    qpos: np.ndarray  # (7,)  float64  rad
+    qvel: np.ndarray  # (7,)  float64  rad/s
+    tau: np.ndarray  # (7,)  float64  N·m
+    eef_pos: np.ndarray  # (3,)  float64  m  (FK placeholder — Policy owns FK)
+    eef_rot6d: np.ndarray  # (6,)  float64
+    error_code: int
+    connected: bool
+    mode: int
+    tracking_err: float
+    timestamp: float
+
+    @classmethod
+    def from_ring(cls, data: np.ndarray) -> "ArmState":
+        """Build from a SeqlockRingBuffer read (1-element structured array)."""
+        r = data[0]
+        return cls(
+            qpos=np.asarray(r["qpos"], dtype=np.float64),
+            qvel=np.asarray(r["qvel"], dtype=np.float64),
+            tau=np.asarray(r["tau"], dtype=np.float64),
+            eef_pos=np.asarray(r["eef_pos"], dtype=np.float64),
+            eef_rot6d=np.asarray(r["eef_rot6d"], dtype=np.float64),
+            error_code=int(r["error_code"]),
+            connected=bool(r["connected"]),
+            mode=int(r["mode"]),
+            tracking_err=float(r["tracking_err"]),
+            timestamp=float(r["timestamp"]),
         )
-    )
 
-    # Hand FK
-    hand_urdf_path: str = ""
-    fingertip_link_names: list[str] = field(default_factory=list)
 
-    # Static transform from planning EEF (custom_eef_link) to hand base
-    # (right_hand_link), both defined in xarm7_xhand_right.urdf (the combined
-    # URDF whose arm kinematics match the MPlib planner's collision URDF).
-    #
-    # Chain (all fixed joints in xarm7_xhand_right.urdf):
-    #   link_eef → calibration_mount (+0.0025 m Z)
-    #            → flange_link (+0.0025 m Z)
-    #            → custom_eef_link (+0.043 m Z, RotY(-π/2))
-    #            → right_hand_link (-0.005 m X, RotY(+π/2))
-    #
-    # custom_eef_link = link_eef + (0, 0, 0.048) m, RotY(-π/2)  (URDF)
-    # right_hand_link  = link_eef + (0, 0, 0.043) m, identity rel. link_eef  (URDF)
-    #
-    # T_eef_handbase = right_hand_mount_joint origin (from URDF):
-    #   pos = (-0.005, 0, 0) m in custom_eef_link frame
-    #   quat = RotY(+π/2) = [cos(π/4), 0, sin(π/4), 0]
-    #
-    # T_eef_handbase_pos breakdown:
-    #   URDF 原始值   = -0.005 m  (right_hand_mount_joint origin in custom_eef_link)
-    #   物理 flange 修正 = -0.010 m  (URDF 0.043 m → 实测 0.033 m，短 10 mm;
-    #                              link_eef -Z = custom_eef_link +X，故补在 X)
-    #   合计           = -0.015 m
-    #
-    #   inv(T_urdf_ee) ⊗ T_phys_handbase = Pose((-0.015, 0, 0), RotY(+π/2))
-    #
-    # Verified 2026-07-28: URDF-vs-simulation FK = 0.00 mm;
-    # physical correction = -10 mm (0.043→0.033 m, measured on hardware).
-    T_eef_handbase_pos: np.ndarray = field(
-        default_factory=lambda: np.array([-0.015, 0.0, 0.0], dtype=np.float64)
-    )
-    T_eef_handbase_quat_wxyz: np.ndarray = field(
-        default_factory=lambda: np.array([0.707107, 0.0, 0.707107, 0.0], dtype=np.float64)
-    )
+@dataclass
+class HandState:
+    """Hand process state — published to hand_state_ring every tick (~328 bytes).
 
-    # Both arm and hand run in crash-isolated subprocesses via SHM.
+    Does NOT include tactile_force — that's in HandTactile on a separate ring.
+    Matches HAND_STATE_DTYPE in shm/shared_storage.py.
+    """
+
+    qpos: np.ndarray  # (12,) float64  rad
+    current: np.ndarray  # (12,) float64  mA
+    tactile_sum: np.ndarray  # (5,3) float64  N
+    tactile_contact: np.ndarray  # (5,) bool
+    error_state: bool
+    connected: bool
+    qpos_stale: bool
+    timestamp: float
+
+    @classmethod
+    def from_ring(cls, data: np.ndarray) -> "HandState":
+        """Build from a SeqlockRingBuffer read (1-element structured array)."""
+        r = data[0]
+        return cls(
+            qpos=np.asarray(r["qpos"], dtype=np.float64),
+            current=np.asarray(r["current"], dtype=np.float64),
+            tactile_sum=np.asarray(r["tactile_sum"], dtype=np.float64),
+            tactile_contact=np.asarray(r["tactile_contact"], dtype=bool),
+            error_state=bool(r["error_state"]),
+            connected=bool(r["connected"]),
+            qpos_stale=bool(r["qpos_stale"]) if "qpos_stale" in r.dtype.names else False,
+            timestamp=float(r["timestamp"]),
+        )
+
+
+@dataclass
+class HandTactile:
+    """Hand tactile force — published to hand_tactile_ring (sparse, ~14.4KB).
+
+    Only written when tactile_contact[finger] is nonzero.
+    """
+
+    tactile_force: np.ndarray  # (5,120,3) float64  N
+
+    @classmethod
+    def from_ring(cls, data: np.ndarray) -> "HandTactile":
+        """Build from a SeqlockRingBuffer read."""
+        return cls(tactile_force=np.asarray(data[0]["tactile_force"], dtype=np.float64))

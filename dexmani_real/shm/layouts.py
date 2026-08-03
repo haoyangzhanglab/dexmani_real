@@ -1,78 +1,34 @@
-"""Numpy dtype definitions for shared memory data structures.
+"""VR Frame dtype definition — shared by frame_manager.py (legacy VRReceiverProcess).
 
-All dtypes use fixed-size fields — no objects, no variable-length strings —
-so they are safe for placement in multiprocessing.shared_memory.SharedMemory.
-
-Layout principles:
-  - Little-endian (<) for x86_64 compatibility
-  - All arrays are flat (no sub-dtypes with object refs)
-  - Timestamps in uint64 nanoseconds
+Camera frame dtypes moved to ring_buffer.py (Phase 2.7).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# ── VR Frame Layout ──
-# Matches QuestHandTracker.convert_frame() output dict.
-# Total size: ~600 bytes per frame
+# ── VR Frame Layout (~600 bytes) ──
 
 VR_FRAME_DTYPE = np.dtype(
     [
-        # Wrist pose (FLU coordinate frame)
-        ("wrist_pos", "<f8", (3,)),  # 3 × 8 = 24 bytes
-        ("wrist_quat_wxyz", "<f8", (4,)),  # 4 × 8 = 32 bytes
-        # Hand landmarks (21 points × 3 coordinates)
-        ("landmarks", "<f8", (21, 3)),  # 21 × 3 × 8 = 504 bytes
-        # Head pose (FLU coordinate frame) — for heading calibration
-        ("head_pos", "<f8", (3,)),  # 3 × 8 = 24 bytes
-        ("head_quat_wxyz", "<f8", (4,)),  # 4 × 8 = 32 bytes
-        # Timestamps
-        ("recv_ts_ns", "<u8"),  # HTS SDK receive timestamp (ns)
-        ("source_ts_ns", "<u8"),  # HTS source timestamp (ns)
-        ("sequence_id", "<u8"),  # Frame sequence ID
-        ("source_frame_seq", "<u8"),  # Source frame sequence
-        ("local_recv_ns", "<u8"),  # Local monotonic_ns at receive time
-        # Metadata
-        ("side", "<i4"),  # Hand side enum value
-    ],
-    align=True,
-)
-
-# ── Camera Frame Layout (per camera) ──
-# RGB + Depth for a standard RealSense frame.
-# RGB:  H×W×3 uint8
-# Depth: H×W uint16
-# Timestamps: float64
-#
-# Note: Camera frames are LARGE (~1.5MB each). The SharedMemoryRingBuffer
-# stores N slots of raw camera bytes. We use a header struct for metadata
-# and a raw byte array for the actual image data.
-
-CAMERA_FRAME_HEADER_DTYPE = np.dtype(
-    [
-        ("timestamp", "<f8"),  # Camera frame timestamp (RealSense global-time epoch seconds)
-        ("frame_number", "<u8"),  # Monotonic frame counter
-        ("rgb_size", "<u8"),  # Number of bytes in RGB array
-        ("depth_size", "<u8"),  # Number of bytes in Depth array
-        ("rgb_shape_h", "<u4"),  # RGB height
-        ("rgb_shape_w", "<u4"),  # RGB width
-        ("rgb_shape_c", "<u4"),  # RGB channels (always 3)
-        ("depth_shape_h", "<u4"),  # Depth height
-        ("depth_shape_w", "<u4"),  # Depth width
-        ("pc_num_points", "<u4"),  # Valid pointcloud rows in the slot (0 = none)
-        ("camera_health", "<u1"),  # 0=ok, 1=stale>2s, 2=crashed
-        ("pad", "<u1", (7,)),  # Padding to 64-byte alignment
+        ("wrist_pos", "<f8", (3,)),
+        ("wrist_quat_wxyz", "<f8", (4,)),
+        ("landmarks", "<f8", (21, 3)),
+        ("head_pos", "<f8", (3,)),
+        ("head_quat_wxyz", "<f8", (4,)),
+        ("recv_ts_ns", "<u8"),
+        ("source_ts_ns", "<u8"),
+        ("sequence_id", "<u8"),
+        ("source_frame_seq", "<u8"),
+        ("local_recv_ns", "<u8"),
+        ("side", "<i4"),
     ],
     align=True,
 )
 
 
 def vr_frame_to_array(frame: dict) -> np.ndarray:
-    """Convert a VR frame dict (from QuestHandTracker) to a structured array.
-
-    Returns a 0-d array (scalar) of VR_FRAME_DTYPE.
-    """
+    """Convert a VR frame dict to a structured array (0-d scalar)."""
     arr = np.zeros((), dtype=VR_FRAME_DTYPE)
     arr["wrist_pos"] = np.asarray(frame["wrist_pos"], dtype=np.float64)
     arr["wrist_quat_wxyz"] = np.asarray(frame["wrist_quat_wxyz"], dtype=np.float64)
@@ -84,18 +40,12 @@ def vr_frame_to_array(frame: dict) -> np.ndarray:
     arr["sequence_id"] = np.uint64(frame.get("sequence_id") or 0)
     arr["source_frame_seq"] = np.uint64(frame.get("source_frame_seq") or 0)
     arr["local_recv_ns"] = np.uint64(frame.get("local_recv_ns") or 0)
-    # Runtime value is always int (the conditional None-guards to -1); mypy cannot
-    # correlate the two separate frame.get() calls, so the arg types as Any|int|None.
     arr["side"] = np.int32(frame.get("side") if frame.get("side") is not None else -1)  # type: ignore[arg-type]
     return arr
 
 
 def array_to_vr_frame(arr: np.ndarray) -> dict:
-    """Convert a structured array back to a VR frame dict.
-
-    Returns a dict matching QuestHandTracker.get_latest() output format
-    (copying numpy arrays by value for thread safety).
-    """
+    """Convert a structured array back to a VR frame dict."""
     return {
         "side": int(arr["side"]),
         "wrist_pos": arr["wrist_pos"].copy(),
@@ -107,76 +57,6 @@ def array_to_vr_frame(arr: np.ndarray) -> dict:
         "source_ts_ns": int(arr["source_ts_ns"]),
         "sequence_id": int(arr["sequence_id"]),
         "source_frame_seq": int(arr["source_frame_seq"]),
-        "coordinate_frame": "flu",  # default
+        "coordinate_frame": "flu",
         "local_recv_ns": int(arr["local_recv_ns"]),
     }
-
-
-def pack_camera_frame(
-    rgb: np.ndarray,
-    depth_raw: np.ndarray,
-    timestamp: float,
-    frame_id: int,
-    pc_num_points: int = 0,
-    camera_health: int = 0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pack camera frame attributes directly into (header, rgb_bytes, depth_bytes).
-
-    Unlike camera_frame_to_bytes(), this accepts individual values instead of a
-    dict — the SHM producer (CameraProcess) can call this directly on
-    CameraFrame attributes, skipping the to_dict() allocation entirely.
-
-    ``pc_num_points`` marks how many rows of the slot's pointcloud block are
-    valid (0 = no valid pointcloud); the block itself is passed separately to
-    ``CameraRingBuffer.write``.
-
-    ``camera_health`` propagates the producer's health to cross-process
-    consumers: 0=ok, 1=stale>2s, 2=crashed.
-    """
-    header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
-    header["timestamp"] = np.float64(timestamp)
-    header["frame_number"] = np.uint64(frame_id)
-    header["pc_num_points"] = np.uint32(pc_num_points)
-    header["camera_health"] = np.uint8(camera_health)
-
-    rgb_arr = np.asarray(rgb, dtype=np.uint8)
-    depth_arr = np.asarray(depth_raw, dtype=np.uint16)
-
-    header["rgb_size"] = np.uint64(rgb_arr.nbytes)
-    header["depth_size"] = np.uint64(depth_arr.nbytes)
-    header["rgb_shape_h"] = np.uint32(rgb_arr.shape[0])
-    header["rgb_shape_w"] = np.uint32(rgb_arr.shape[1])
-    header["rgb_shape_c"] = np.uint32(rgb_arr.shape[2])
-    header["depth_shape_h"] = np.uint32(depth_arr.shape[0])
-    header["depth_shape_w"] = np.uint32(depth_arr.shape[1])
-
-    return header, rgb_arr, depth_arr
-
-
-def bytes_to_camera_frame(
-    header: np.ndarray,
-    rgb_bytes: np.ndarray,
-    depth_bytes: np.ndarray,
-    pointcloud: np.ndarray | None = None,
-) -> dict:
-    """Reconstruct a camera frame dict from raw bytes.
-
-    Returns a dict matching CameraProcess.poll_latest_frame() output format.
-    When ``pointcloud`` is given (already a shaped (N, 6) float32 copy from the
-    ring buffer), the dict gains ``pointcloud`` and ``pointcloud_valid``
-    (False = zeros placeholder, no valid cloud since producer start).
-    """
-    h = header[0]
-    rgb = rgb_bytes.reshape((int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"]))).copy()
-    depth = depth_bytes.reshape((int(h["depth_shape_h"]), int(h["depth_shape_w"]))).copy()
-    frame = {
-        "rgb": rgb,
-        "depth": depth,
-        "timestamp": float(h["timestamp"]),
-        "frame_number": int(h["frame_number"]),
-        "camera_health": int(h["camera_health"]),
-    }
-    if pointcloud is not None:
-        frame["pointcloud"] = pointcloud
-        frame["pointcloud_valid"] = int(h["pc_num_points"]) > 0
-    return frame

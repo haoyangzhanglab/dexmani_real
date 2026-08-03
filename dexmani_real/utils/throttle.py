@@ -24,9 +24,9 @@ class ThrottledWarner:
         self._interval_ns = int(interval_s * 1e9)
         self._last_ns = 0
 
-    def __call__(self, msg: str, *args: Any) -> None:
+    def __call__(self, msg: str, *args: Any, **kwargs: Any) -> None:
         now_ns = time.monotonic_ns()
         if now_ns - self._last_ns < self._interval_ns:
             return
         self._last_ns = now_ns
-        logger.warning(msg, *args)
+        logger.warning(msg, *args, **kwargs)
