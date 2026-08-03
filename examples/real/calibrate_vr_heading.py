@@ -142,7 +142,9 @@ def main() -> None:
     import multiprocessing as mp
 
     shared = SharedStorage.create(prefix="dexmani_vr_calib")
-    vr_proc = mp.Process(target=vr_loop, args=(shared,), name="vr-calib", daemon=True)
+    from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig
+    vr_cfg = VRReceiverConfig(port=args.port)
+    vr_proc = mp.Process(target=vr_loop, args=(shared, vr_cfg), name="vr-calib", daemon=True)
     vr_proc.start()
 
     if not shared.vr_ready.wait(timeout=15):
@@ -227,6 +229,9 @@ def main() -> None:
 
     shared.is_running.value = False
     vr_proc.join(timeout=5)
+    if vr_proc.is_alive():
+        vr_proc.terminate()
+        vr_proc.join(timeout=1)
     shared.close()
 
     if len(forwards) < 30:

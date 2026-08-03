@@ -285,10 +285,10 @@ class XHandRetargeter:
 
         robot_urdf = urdf.URDF.load(urdf_path, add_dummy_free_joints=False, build_scene_graph=False)
         urdf_name = os.path.basename(urdf_path)
-        temp_dir = tempfile.mkdtemp(prefix="dex_retargeting-")
-        temp_path = os.path.join(temp_dir, urdf_name)
-        robot_urdf.write_xml_file(temp_path)
-        robot = RobotWrapper(temp_path)
+        with tempfile.TemporaryDirectory(prefix="dex_retargeting-") as temp_dir:
+            temp_path = os.path.join(temp_dir, urdf_name)
+            robot_urdf.write_xml_file(temp_path)
+            robot = RobotWrapper(temp_path)
 
         joint_names = robot.dof_joint_names
         target_joint_names = cfg.get("target_joint_names", joint_names)

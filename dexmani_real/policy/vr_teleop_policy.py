@@ -1,7 +1,6 @@
 """Policy process — VR→IK pipeline, state machine, recording.
 
-Extracted from vr_teleop_arm_only_record_plus.py's main loop. Runs as an
-independent mp.Process, exchanging data exclusively through SharedStorage.
+Runs as an independent mp.Process, exchanging data exclusively through SharedStorage.
 
 Ref: ManiUniCon Policy process pattern.
 """
@@ -11,7 +10,7 @@ from __future__ import annotations
 import gc
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -20,9 +19,15 @@ from scipy.spatial.transform import Rotation
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
+from dexmani_real.config.defaults import arm, hand, policy
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import HOME_SENTINEL, HAND_CMD_DTYPE, SharedStorage
+from dexmani_real.shm.shared_storage import (
+    HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage,
+    read_arm_state as _read_arm_state,
+    read_hand_state as _read_hand_state,
+    write_hand_cmd as _write_hand_cmd,
+)
 from dexmani_real.teleop.control.audio_feedback import AudioFeedback
 from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
@@ -51,59 +56,54 @@ _FRAME_RETARGET_FAIL = 4
 
 @dataclass
 class PolicyConfig:
-    """Policy process configuration — all tuning knobs in one place."""
+    """Policy process configuration — defaults from arm/hand/policy singletons."""
 
     # Control rate
-    control_hz: float = 16.0
+    control_hz: float = field(default_factory=lambda: policy.control_hz)
 
-    # Mode 6 firmware parameters
-    joint_max_speed_deg_s: float = 120.0
-    joint_max_acc_deg_s2: float = 900.0  # matches ArmInnerLoopConfig.joint_max_acc (15.708 rad/s²)
-    inner_loop_hz: float = 30.0
+    # Mode 6 firmware parameters (deg — matches CLI convention)
+    joint_max_speed_deg_s: float = field(default_factory=lambda: arm.max_joint_velocity_deg_per_s)
+    joint_max_acc_deg_s2: float = field(default_factory=lambda: arm.max_joint_acceleration_deg_per_s2)
+    inner_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
 
     # VR mapping
-    vr_pos_scale: float = 1.0
-    vr_rot_scale: float = 1.0
-    vr_max_delta_rot_rad: float = 3.0  # ~172°, total-from-reset rotation cap
-    vr_stale_threshold_s: float = 0.5
+    vr_pos_scale: float = field(default_factory=lambda: policy.vr_mapping.pos_scale)
+    vr_rot_scale: float = field(default_factory=lambda: policy.vr_mapping.rot_scale)
+    vr_max_delta_rot_rad: float = field(default_factory=lambda: policy.vr_mapping.max_delta_rot_rad)
+    vr_stale_threshold_s: float = field(default_factory=lambda: policy.vr_mapping.stale_threshold_s)
     # Workspace bounds: [[x_min, x_max], [y_min, y_max], [z_min, z_max]] (m)
-    workspace_bounds: tuple = (
-        (0.28, 0.72),
-        (-0.50, 0.50),
-        (0.05, 0.5),
-    )
+    workspace_bounds: tuple = field(default_factory=lambda: policy.workspace.as_tuple())
 
-    # Cartesian EMA smoothing (canonical values tuned at 16Hz)
-    ema_alpha_pos: float = 0.6
-    ema_alpha_rot: float = 0.25
+    # Cartesian EMA smoothing (tuned at 16Hz)
+    ema_alpha_pos: float = field(default_factory=lambda: policy.ema.alpha_pos)
+    ema_alpha_rot: float = field(default_factory=lambda: policy.ema.alpha_rot)
 
     # Recording
-    max_record_seconds: float = 60.0
-    min_record_seconds: float = 1.0
-    episodes_dir: str = "episodes_arm"
+    max_record_seconds: float = field(default_factory=lambda: policy.max_record_duration_s)
+    min_record_seconds: float = field(default_factory=lambda: policy.min_record_duration_s)
+    episodes_dir: str = field(default_factory=lambda: policy.episodes_dir)
     task_label: str = ""
     operator: str = ""
 
     # Status print interval (in control ticks)
-    status_every: int = 16  # ~1 Hz
+    status_every: int = field(default_factory=lambda: policy.status_print_interval)
 
     # Error tolerance
-    max_consecutive_errors: int = 10
+    max_consecutive_errors: int = field(default_factory=lambda: policy.max_consecutive_errors)
 
     # Hand retargeting
-    hand_enabled: bool = True  # Set False for arm-only collection (--no-hand)
-    hand_retargeting_type: str = "dexpilot"  # DexPilot NLP (YAML: assets/retargeting/xhand_right_dexpilot.yml)
-    hand_ramp_frames: int = 16  # smoothstep ramp duration (~1s @ 16Hz)
-    hand_disconnect_timeout_s: float = 1.0  # persistent disconnect before degrading to hold-position
+    hand_enabled: bool = field(default_factory=lambda: policy.hand_enabled)
+    hand_retargeting_type: str = field(default_factory=lambda: policy.hand_retargeting_type)
+    hand_ramp_frames: int = field(default_factory=lambda: policy.hand_ramp_frame_count)
+    hand_disconnect_timeout_s: float = field(default_factory=lambda: policy.hand_disconnect_timeout_s)
 
 
-    # Joint-space hard limits — mirrors xarm7 URDF exactly.
-    # URDF source: assets/robots/xhand/xarm7_xhand_collision.urdf
-    joint_limit_lower: tuple[float, ...] = (-6.28318530718, -2.059, -6.28318530718, -0.19198, -6.28318530718, -1.69297, -6.28318530718)
-    joint_limit_upper: tuple[float, ...] = (6.28318530718, 2.0944, 6.28318530718, 3.927, 6.28318530718, 3.14159265359, 6.28318530718)
+    # Joint-space hard limits — sourced from arm singleton via shared_storage.
+    joint_limit_lower: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_lower)
+    joint_limit_upper: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_upper)
 
-    # Hand home position (mirrors XHandConfig.home_qpos — XHand 12-DOF default pose).
-    hand_home_qpos: tuple[float, ...] = (0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0)
+    # Hand home position — sourced from hand singleton.
+    hand_home_qpos_deg: tuple[float, ...] = field(default_factory=lambda: hand.home_qpos_deg)
 
     # VR transform config path (relative to repo root)
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
@@ -127,7 +127,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     arm_cmd_max_step_rad = float(np.deg2rad(cfg.joint_max_speed_deg_s)) * ctrl_dt
     JOINT_LO = np.array(cfg.joint_limit_lower, dtype=np.float64)
     JOINT_HI = np.array(cfg.joint_limit_upper, dtype=np.float64)
-    HAND_HOME_QPOS = np.deg2rad(np.array(cfg.hand_home_qpos, dtype=np.float64))
+    HAND_HOME_QPOS = np.deg2rad(np.array(cfg.hand_home_qpos_deg, dtype=np.float64))
 
     # ── 1. Planner (MPlib + collision checking) ──
     try:
@@ -240,8 +240,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     logger.info("Policy: all subsystems ready")
 
     # ── 6. Initial state ──
-    from dexmani_real.shm.shared_storage import ARM_HOME_QPOS
-    home_qpos = np.array(ARM_HOME_QPOS, dtype=np.float64)
+    home_qpos = np.array(arm.home_qpos, dtype=np.float64)
     arm_state = _read_arm_state(shared)
     hand_state = _read_hand_state(shared)
     if arm_state is None:
@@ -371,9 +370,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             ema_prev_pos = ema_prev_quat = None
                             _reset_hand_retargeter(hand_retargeter)
                             # Give arm process time to pick up HOME_SENTINEL and home (~8s)
-                            _home_deadline = time.perf_counter() + 15.0
-                            while time.perf_counter() < _home_deadline:
-                                if shared.arm_heartbeat_s.value > 0:
+                            _home_deadline = time.monotonic() + 15.0
+                            while time.monotonic() < _home_deadline:
+                                _hb = shared.arm_heartbeat_s.value
+                                if _hb > 0 and time.monotonic() - _hb < 3.0:
                                     time.sleep(0.5)
                                 else:
                                     break
@@ -490,7 +490,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         arm_qpos = arm_state["qpos"][0].copy()
                         eef_pos = arm_state["eef_pos"][0].copy()
                         eef_rot6d = arm_state["eef_rot6d"][0].copy()
-                        eef_quat_wxyz = _rot6d_to_quat_wxyz(eef_rot6d)
+                        eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
                     else:
                         eef_pos = np.zeros(3)
                         eef_quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0])
@@ -829,19 +829,6 @@ def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.5) 
         return False
 
 
-from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state
-from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
-
-
-def _read_arm_state_with_age(shared: SharedStorage, max_age_s: float = 0.5) -> tuple[np.ndarray | None, float]:
-    """Read latest arm state and its age in seconds. Returns (None, inf) if no data."""
-    result = shared.arm_state_ring.read_latest()
-    if result is None:
-        return None, float("inf")
-    data, ts_ns, _seq = result
-    age_s = (time.monotonic_ns() - int(ts_ns)) / 1e9
-    return data, age_s
-
 
 def _read_vr_frame(shared: SharedStorage) -> dict | None:
     """Read latest VR frame from ring, return as dict or None."""
@@ -885,8 +872,6 @@ def _read_camera_frame(shared: SharedStorage) -> dict | None:
     return None
 
 
-from dexmani_real.shm.shared_storage import write_hand_cmd as _write_hand_cmd
-
 
 def _try_reset_mapper(shared: SharedStorage, arm_mapper: ArmWristMapper) -> bool:
     """Re-establish wrist→EEF mapping on resume. Returns True on success."""
@@ -898,7 +883,7 @@ def _try_reset_mapper(shared: SharedStorage, arm_mapper: ArmWristMapper) -> bool
         return False
     eef_pos = arm_state["eef_pos"][0].copy()
     eef_rot6d = arm_state["eef_rot6d"][0].copy()
-    eef_quat_wxyz = _rot6d_to_quat_wxyz(eef_rot6d)
+    eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
     if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(eef_quat_wxyz)):
         return False
     assert vr_frame is not None and arm_state is not None  # checked above
@@ -1084,15 +1069,12 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
     )
 
 
-_rot6d_to_quat_wxyz = rot6d_to_quat_wxyz  # authoritative impl in pose_utils
-
 
 # ═══════════════════════════════════════════════════════════════════
 # Hand retargeting helpers (P4 Step 1 — ported from vr_teleop_hand_record.py)
 # ═══════════════════════════════════════════════════════════════════
 
 _retarget_fail_warn = ThrottledWarner()
-_send_hand_fail_warn = ThrottledWarner()
 
 
 def _compute_hand_command(
@@ -1114,17 +1096,10 @@ def _compute_hand_command(
 
     landmarks = vr_frame.get("landmarks") if vr_frame is not None else None
     if landmarks is None:
-        _retarget_fail_warn("Hand retargeting: landmarks missing from VR frame")
-        return prev_hand_cmd.copy(), False
-    if landmarks.shape != (21, 3):
-        _retarget_fail_warn("Hand retargeting: landmarks shape=%s, expected (21, 3)", landmarks.shape)
-        return prev_hand_cmd.copy(), False
-    if not np.all(np.isfinite(landmarks)):
-        _retarget_fail_warn("Hand retargeting: landmarks contain NaN/Inf")
         return prev_hand_cmd.copy(), False
 
     try:
-        target = retargeter.retarget(landmarks)
+        target = retargeter.retarget(landmarks)  # validates shape + finiteness internally
         if target is not None and len(target) == 12:
             return np.asarray(target, dtype=np.float64), True
         _retarget_fail_warn(

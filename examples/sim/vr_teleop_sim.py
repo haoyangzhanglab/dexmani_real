@@ -100,7 +100,7 @@ INTERP_MAX_STEP_RAD = np.deg2rad(2.0)
 VR_FRAME_MAX_AGE_S = 0.2  # 仿真容忍度高于真机（0.1s）：dummy VR 无网络延迟
 DEFAULT_DATA_DIR = "./episodes"
 
-# 工作空间边界（world frame，与 RobotInterfaceConfig 默认值严格一致: types.py:136-138）
+# 工作空间边界（world frame，与 dexmani_real.config.defaults.policy.workspace 对齐）
 WORKSPACE_BOUNDS = np.array(
     [
         [0.28, 0.72],  # x [min, max] m

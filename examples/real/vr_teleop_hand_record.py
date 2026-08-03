@@ -17,13 +17,13 @@ Architecture:
       ├─ CameraProcess ──camera_ring──┐
       ├─ VRProcess ──────vr_ring─────┤
       │                               ▼
-      ├─ PolicyProcess ──arm_action_q──→ ArmProcess
-      │                ──hand_cmd_ring─→ HandProcess
+      ├─ PolicyProcess ──arm_action_q──→ arm_loop
+      │                ──hand_cmd_ring─→ hand_loop
       │                ◄──arm_state_ring, hand_state_ring, hand_tactile_ring
       │                owns EpisodeRecorder (single-clock recording)
       │
-      ├─ ArmProcess (Mode 6, 30Hz) — reads arm_action_q, servos xArm7
-      └─ HandProcess (30Hz) — reads hand_cmd_ring, servos XHand
+      ├─ arm_loop (Mode 6, 30Hz) — reads arm_action_q, servos xArm7
+      └─ hand_loop (30Hz) — reads hand_cmd_ring, servos XHand
 
 Usage:
     source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_robot
@@ -49,12 +49,13 @@ import numpy as np
 # Ensure repo root is on sys.path before imports.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dexmani_real.config.defaults import arm, safety
 from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig, arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
-from dexmani_real.shm.shared_storage import HEARTBEAT_TIMEOUTS, HOME_SENTINEL, SharedStorage
+from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.utils.log import get_logger
 
@@ -101,8 +102,8 @@ def main() -> None:
 
     # ── 2b. Arm config (must match PolicyConfig speed/acc) ──
     arm_cfg = ArmInnerLoopConfig(
-        joint_max_speed=float(np.deg2rad(args.speed)),
-        joint_max_acc=float(np.deg2rad(args.acc)),
+        joint_max_speed_rad_per_s=float(np.deg2rad(args.speed)),
+        joint_max_acc_rad_per_s2=float(np.deg2rad(args.acc)),
     )
 
     # ── 3. Spawn ──
@@ -188,7 +189,7 @@ def main() -> None:
             for name in PROC_NAMES:
                 last_hb = float(HEARTBEAT_FIELDS[name].value)
                 age_s = now - last_hb if last_hb > 0 else float("inf")
-                timeout_s = float(HEARTBEAT_TIMEOUTS[name])
+                timeout_s = float(safety.heartbeat_timeouts[name])
                 if age_s > timeout_s:
                     logger.error("%s heartbeat timeout: %.1fs > %.1fs — FAULT", name, age_s, timeout_s)
                     transition(shared, SafetyState.FAULT)
@@ -283,11 +284,16 @@ def _post_loop_home(shared: SharedStorage) -> None:
             for sig in kb.poll(timeout=0.1):
                 if sig == ControlSignal.HOME:
                     print("\nH: return_home")
-                    shared.arm_action_q.put(HOME_SENTINEL)
-                    # Wait for arm to pick up and execute homing (~15s typical).
-                    _home_wait = time.perf_counter() + 30.0
-                    while time.perf_counter() < _home_wait:
-                        if shared.arm_heartbeat_s.value > 0:
+                    try:
+                        shared.arm_action_q.put(HOME_SENTINEL, timeout=2.0)
+                    except Exception:
+                        print("  ⚠ Arm queue full — arm may have already exited")
+                        break
+                    # Wait for arm to pick up and execute homing (~8s typical).
+                    _home_wait = time.monotonic() + 30.0
+                    while time.monotonic() < _home_wait:
+                        _hb = shared.arm_heartbeat_s.value
+                        if _hb > 0 and time.monotonic() - _hb < 3.0:
                             time.sleep(0.5)
                         else:
                             break

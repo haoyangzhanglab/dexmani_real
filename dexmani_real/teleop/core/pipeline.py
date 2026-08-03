@@ -55,6 +55,9 @@ class TeleopPipeline:
         self._prev_target_pos: np.ndarray | None = None
         self._prev_target_quat: np.ndarray | None = None
 
+        # One-shot warn flag (reset per episode in compute_hand_command)
+        self._nan_warned_landmarks: bool = False
+
     def compute_action(
         self,
         vr_frame: dict,

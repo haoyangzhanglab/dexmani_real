@@ -10,11 +10,12 @@ Single entry point: hand_loop(shared) — mp.Process target, uses SharedStorage 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.config.defaults import hand
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -30,21 +31,21 @@ logger = get_logger(__name__)
 
 @dataclass
 class HandProcessConfig:
-    """Configuration for hand_loop."""
+    """Configuration for hand_loop — defaults from hand singleton."""
 
-    hz: float = 30.0
+    loop_hz: float = field(default_factory=lambda: hand.loop_hz)
 
     # Homing convergence
-    home_settle_timeout_s: float = 3.0
-    home_settle_tol_rad: float = 0.06
+    home_settle_timeout_s: float = field(default_factory=lambda: hand.home_settle_timeout_s)
+    home_settle_tol_rad: float = field(default_factory=lambda: hand.home_settle_tol_rad)
 
     # Qpos freshness detection (driver board lockout guard)
-    stale_qpos_frame_limit: int = 15  # frames @ 30Hz -> 0.5s
-    stale_qpos_cmd_gap_rad: float = 0.05
-    stale_qpos_delta_rad: float = 1e-4
+    stale_qpos_frame_limit: int = field(default_factory=lambda: hand.stale.frame_count)
+    stale_qpos_cmd_gap_rad: float = field(default_factory=lambda: hand.stale.cmd_gap_rad)
+    stale_qpos_delta_rad: float = field(default_factory=lambda: hand.stale.qpos_delta_rad)
 
     # Send-error watchdog: auto clear_error() after N consecutive send failures
-    send_err_watchdog_frames: int = 30  # 1s @ 30Hz
+    send_err_watchdog_frames: int = field(default_factory=lambda: hand.send_err_watchdog_count)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -101,10 +102,15 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 pass
             return
 
+    # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
+    # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
+    # after all ready events; if this process hasn't entered its main loop yet,
+    # heartbeat=0 → age=inf → spurious FAULT.
+    shared.hand_heartbeat_s.value = time.monotonic()
     shared.hand_ready.set()
     logger.info("hand_loop: ready")
 
-    interval = 1.0 / cfg.hz
+    interval = 1.0 / cfg.loop_hz
     last_ts = time.monotonic()
     last_cmd_seq = 0
     consecutive_send_errors = 0
@@ -175,7 +181,12 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             error_state = False  # transient comm glitch — do NOT fabricate error_state
 
         # Detect stale qpos (driver board lockout)
-        if connected and _last_fresh_qpos is not None:
+        if not connected:
+            # Reset on disconnect — prevents false stale-positive on reconnect
+            # when hand moved while limp (pre-disconnect qpos ≠ post-reconnect qpos).
+            _last_fresh_qpos = None
+            _stale_frames = 0
+        elif connected and _last_fresh_qpos is not None:
             if np.max(np.abs(qpos - _last_fresh_qpos)) < cfg.stale_qpos_delta_rad:
                 _stale_frames += 1
             else:

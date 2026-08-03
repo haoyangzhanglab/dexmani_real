@@ -9,11 +9,12 @@ Ref: ManiUniCon SharedStorage pattern.
 from __future__ import annotations
 
 import multiprocessing as mp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
+from dexmani_real.config.defaults import camera, policy
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.ring_buffer import CameraRingBuffer
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer
@@ -50,51 +51,19 @@ class SharedStorageConfig:
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
 
-    # ── Camera defaults ──
-    camera_rgb_shape: tuple[int, int, int] = (480, 848, 3)
-    camera_depth_shape: tuple[int, int] = (480, 848)
+    # ── Camera defaults — sourced from camera singleton ──
+    camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
+    camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
 
     # ── Queue sizes ──
     arm_action_q_maxsize: int = 2
 
-    # ── Workspace bounds (arm base frame, meters) ──
-    workspace_x_min: float = 0.28
-    workspace_x_max: float = 0.72
-    workspace_y_min: float = -0.50
-    workspace_y_max: float = 0.50
-    workspace_z_min: float = 0.05
-    workspace_z_max: float = 0.50
+    # ── Workspace bounds (arm base frame, meters) — sourced from policy singleton ──
+    workspace_bounds: "np.ndarray" = field(default_factory=lambda: policy.workspace.as_array())
 
-    @property
-    def workspace_bounds(self) -> "np.ndarray":
-        """(3, 2) array [[x_min,x_max],[y_min,y_max],[z_min,z_max]]."""
-        return np.array(
-            [
-                [self.workspace_x_min, self.workspace_x_max],
-                [self.workspace_y_min, self.workspace_y_max],
-                [self.workspace_z_min, self.workspace_z_max],
-            ],
-            dtype=np.float64,
-        )
-
-
-# ── Heartbeat timeout thresholds (seconds) ──
-# Conservative values: arm/hand cover Mode 6 re-init (~0.5s), policy covers
-# IK spikes, vr is generous (Quest UDP can drop), camera tolerates L515 stalls.
-HEARTBEAT_TIMEOUTS: dict[str, float] = {
-    "arm": 1.0,
-    "hand": 1.0,
-    "policy": 1.0,
-    "vr": 5.0,
-    "camera": 2.0,
-}
-
-# ── Arm home position (radians) — single source of truth ──
-# Mirrors ArmInnerLoopConfig.home_qpos. 7-DOF xArm7 neutral pose.
-ARM_HOME_QPOS: tuple[float, ...] = (0.0, -0.349, 0.0, 1.571, 0.0, 1.047, 0.0)
 
 # ── Home sentinel for arm_action_q ──
-# Policy puts this sentinel to request homing; ArmProcess detects and executes.
+# Policy puts this sentinel to request homing; arm_loop detects and executes.
 # Using a string sentinel (not None — None means "no action / hold").
 HOME_SENTINEL = "__HOME__"
 
@@ -165,13 +134,13 @@ class SharedStorage:
     # ---- Rings: continuous streams, read-latest ----
     camera_ring: CameraRingBuffer  # CameraProcess  -> PolicyProcess
     vr_ring: SeqlockRingBuffer  # VRProcess      -> PolicyProcess
-    arm_state_ring: SeqlockRingBuffer  # ArmProcess     -> PolicyProcess
-    hand_state_ring: SeqlockRingBuffer  # HandProcess    -> PolicyProcess
-    hand_tactile_ring: SeqlockRingBuffer  # HandProcess    -> PolicyProcess (sparse)
-    hand_cmd_ring: SeqlockRingBuffer  # PolicyProcess  -> HandProcess (latest-wins)
+    arm_state_ring: SeqlockRingBuffer  # arm_loop     -> PolicyProcess
+    hand_state_ring: SeqlockRingBuffer  # hand_loop    -> PolicyProcess
+    hand_tactile_ring: SeqlockRingBuffer  # hand_loop    -> PolicyProcess (sparse)
+    hand_cmd_ring: SeqlockRingBuffer  # PolicyProcess  -> hand_loop (latest-wins)
 
     # ---- Queue: ordered actions (arm only — Mode 6 needs ordering) ----
-    arm_action_q: mp.Queue  # PolicyProcess -> ArmProcess, maxsize=2
+    arm_action_q: mp.Queue  # PolicyProcess -> arm_loop, maxsize=2
 
     # ---- Flags ----
     is_running: Any  # mp.Value('b') — Main -> all processes (sole writer)
@@ -190,10 +159,10 @@ class SharedStorage:
     camera_heartbeat_s: Any  # mp.Value('d') — camera_loop writes time.monotonic()
 
     # ---- Events ----
-    arm_ready: Any  # mp.Event — ArmProcess -> Main
-    hand_ready: Any  # mp.Event — HandProcess -> Main
-    camera_ready: Any  # mp.Event — CameraProcess -> Main
-    vr_ready: Any  # mp.Event — VRProcess -> Main
+    arm_ready: Any  # mp.Event — arm_loop -> Main
+    hand_ready: Any  # mp.Event — hand_loop -> Main
+    camera_ready: Any  # mp.Event — camera_loop -> Main
+    vr_ready: Any  # mp.Event — vr_loop -> Main
 
     # ---- Diagnostics ----
 

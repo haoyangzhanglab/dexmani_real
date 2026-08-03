@@ -162,7 +162,7 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
 
     This is the shared implementation behind all ``from_dict(cls, d)``
     classmethods in the codebase (``PlanningProfile``, ``TeleopProfile``,
-    ``RobotInterfaceConfig``, ``XArm7Config``, ``XHandConfig``).
+    ``XArm7Config``, ``XHandConfig``).
 
     Fields that are not present in *d* are skipped (they keep their
     dataclass defaults). Extra keys in *d* that have no matching field

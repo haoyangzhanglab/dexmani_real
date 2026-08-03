@@ -48,7 +48,7 @@ Usage:
     # Consumer (main process façade)
     ring = SeqlockRingBuffer("dexmani_arm_state", ARM_STATE_DTYPE, maxlen=3, create=False)
     latest = ring.read_latest()  # (data copy shaped (1,), timestamp_ns, seq) or None
-    if latest is not None and is_fresh(latest[1], timeout_s=0.06): ...
+    if latest is not None: ...
 """
 
 from __future__ import annotations
@@ -261,21 +261,3 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             self.name,
             "last-good cached frame" if self._last_good is not None else "None",
         )
-
-
-def is_fresh(ts_ns: int, timeout_s: float, now_ns: int | None = None) -> bool:
-    """Return True if a frame timestamp is within ``timeout_s`` of ``now_ns``.
-
-    Args:
-        ts_ns: Frame timestamp in ``time.monotonic_ns()`` units (slot timestamp_ns).
-        timeout_s: Freshness budget in seconds.
-        now_ns: Current monotonic time; defaults to ``time.monotonic_ns()``.
-                Injectable for fake-clock tests.
-
-    Invalid timestamps (ts_ns <= 0, i.e. never written) are never fresh.
-    """
-    if ts_ns <= 0:
-        return False
-    if now_ns is None:
-        now_ns = time.monotonic_ns()
-    return (now_ns - ts_ns) <= int(timeout_s * 1e9)

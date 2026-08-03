@@ -222,18 +222,6 @@ class CollisionModel:
         )
         return qpos, has_any
 
-    def _update_placements(self, qpos: np.ndarray) -> np.ndarray:
-        """FK + update geometry placements only — no collision computation."""
-        qpos = self._to_full_qpos(qpos)
-        self._pin.forwardKinematics(self._model, self._data, qpos)
-        self._pin.updateGeometryPlacements(
-            self._model,
-            self._data,
-            self._collision_model,
-            self._collision_data,
-        )
-        return qpos
-
     # ------------------------------------------------------------------
     # Self-collision
     # ------------------------------------------------------------------

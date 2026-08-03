@@ -149,9 +149,6 @@ class XArm7PlannerConfig:
     joint_acc_scale: float = 2.0
     # Cartesian workspace bounds (world frame). (3,2) [[x_min,x_max],[y_min,y_max],[z_min,z_max]].
     # None disables the check (backward compatible).
-    #
-    # NOTE: robot/types.py RobotInterfaceConfig also has workspace_bounds with a hardcoded
-    # default. These are independent config paths — keep them in sync when tuning workspace.
     workspace_bounds: np.ndarray | None = None
 
 
@@ -198,7 +195,7 @@ class TeleopProfile:
     """Online teleoperation IK/servo configuration."""
 
     max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
-    # Speed limiting is handled by ArmInnerLoop (30 Hz, Mode 6): per-step joint
+    # Speed limiting is handled by arm_loop (30 Hz, Mode 6): per-step joint
     # delta clamp + firmware online trajectory planning (joint_max_speed/acc).
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08

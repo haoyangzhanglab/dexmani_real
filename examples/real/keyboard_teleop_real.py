@@ -45,6 +45,7 @@ from dexmani_real.shm.shared_storage import SharedStorage, HOME_SENTINEL
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.config.defaults import policy
 from dexmani_real.utils.signal_utils import EMA_ALPHA_POS, EMA_ALPHA_ROT, ema_smooth_pose
 
 try:
@@ -77,14 +78,7 @@ HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，�
 TRACE_MOTION = True  # 启用运动追踪
 TRACE_FRAME_INTERVAL = 10  # 每 N 帧打印一次 (避免刷屏)
 
-WORKSPACE_BOUNDS = np.array(
-    [
-        [0.28, 0.72],  # x [min, max] m
-        [-0.45, 0.45],  # y [min, max] m
-        [0.05, 0.5],  # z [min, max] m
-    ],
-    dtype=np.float64,
-)
+WORKSPACE_BOUNDS = policy.workspace.as_array()
 
 
 # ═══════════════════════════════════════════════ 姿态工具

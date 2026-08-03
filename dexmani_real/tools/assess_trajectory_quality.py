@@ -2,7 +2,7 @@
 """Assess recorded trajectory quality by classifying physical feasibility.
 
 Replicates the velocity-adaptive tracking error threshold from
-``ArmInnerLoop._monitor()`` (inner_loop.py:659-675) to classify each frame
+``arm_loop`` (inner_loop.py) to classify each frame
 as normal, elevated, or anomalous based on how well the arm tracked the
 commanded joint positions during recording.
 
@@ -96,7 +96,7 @@ def _compute_adaptive_threshold(
     inner_loop_hz: float = 30.0,
     adaptive_max_rad: float = 0.60,
 ) -> float:
-    """Replicate ArmInnerLoop._monitor adaptive threshold formula.
+    """Replicate arm_loop adaptive tracking error threshold formula.
 
     Args:
         cmd_vel_rad_s: L-infinity commanded joint velocity (rad/s),

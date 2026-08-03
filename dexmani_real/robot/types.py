@@ -31,7 +31,7 @@ def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
 
 @dataclass
 class RobotState:
-    """Complete robot state — from RobotInterface.get_state().
+    """Complete robot state — assembled from arm_state_ring + hand_state_ring.
 
     All physical quantities annotated with units in comments.
     """

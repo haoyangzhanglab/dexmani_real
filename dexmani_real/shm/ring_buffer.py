@@ -197,23 +197,6 @@ class SharedMemoryRingBuffer:
         # Return a copy of the data (safe for consumer to hold)
         return slot["data"].copy()
 
-    def read_latest_ts(self) -> tuple[np.ndarray | None, int, int]:
-        """Read latest frame with timestamp and sequence.
-
-        Returns (data_copy, timestamp_ns, sequence) or (None, 0, 0).
-        """
-        idx = int(self._write_idx_view()[0])
-        slot = self._data_buf[idx]
-
-        if slot["sequence"] == 0 and idx == 0 and int(self._write_seq[0]) == 0:
-            return None, 0, 0
-
-        return (
-            slot["data"].copy(),
-            int(slot["timestamp_ns"]),
-            int(slot["sequence"]),
-        )
-
     def frame_age_ns(self) -> int:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""
         idx = int(self._write_idx_view()[0])

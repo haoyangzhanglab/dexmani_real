@@ -77,12 +77,12 @@ DELTA_RPY = 0.02  # 每次按键旋转量 (rad)
 TARGET_LEAD_MAX = 0.03  # target 领先 arm 的最大距离 (m)
 HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s（保守，避免归位过快）
 
-# Workspace bounds — derived from SharedStorageConfig for consistency with
+# Workspace bounds — derived from policy.workspace for consistency with
 # the data-collection entry points.  The Y bounds are slightly tighter than
 # the default config (-0.45 vs -0.50) because the calibration rig (ArUco
 # marker on end-effector + fixed tripod camera) has a narrower useful range.
-_shm_defaults = SharedStorageConfig()
-WORKSPACE_BOUNDS = _shm_defaults.workspace_bounds.copy()
+from dexmani_real.config.defaults import policy
+WORKSPACE_BOUNDS = policy.workspace.as_array()
 WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
 WORKSPACE_BOUNDS[1, 1] = 0.45   # y_max: tighter for calibration rig
 
@@ -717,7 +717,7 @@ def main():
     running = True
     loop_count = 0
     wall_warned = [False, False, False]
-    last_wall_time = 0.0
+    last_wall_time = [0.0, 0.0, 0.0]  # per-axis debounce
     T_world_camera: np.ndarray | None = None
     # 最近一次 ENTER 计算出的逐帧残差 (mm)，与样本列表同序；样本变动即作废
     last_residuals: np.ndarray | None = None
@@ -1022,11 +1022,11 @@ def main():
                 else:
                     # Moving further outside → reject
                     now = time.perf_counter()
-                    if not wall_warned[axis] or now - last_wall_time > 3.0:
+                    if not wall_warned[axis] or now - last_wall_time[axis] > 3.0:
                         names = ["x", "y", "z"]
                         print(f"  ⚠ {names[axis]} 边界 [{lo:.2f}, {hi:.2f}]")
                         wall_warned[axis] = True
-                        last_wall_time = now
+                        last_wall_time[axis] = now
 
             if np.any(drpy != 0):
                 dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)

@@ -29,7 +29,7 @@ class TeleopIKSolver:
          to current_qpos + random seeds when prev_cmd misses.
       2. Fail → hold previous command.
 
-    Speed limiting is handled by ArmInnerLoop (Mode 6): per-step joint
+    Speed limiting is handled by arm_loop (Mode 6): per-step joint
     delta clamp + firmware online trajectory planning.
     Self-collision checks are done when TeleopProfile.check_self_collision=True.
 
@@ -53,7 +53,7 @@ class TeleopIKSolver:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
-        self._nullspace_warn_throttle: int = 0
+        self._nullspace_warn_last_s: float = 0.0
         self._hold_start: float | None = None
         self._hold_warned: bool = False
 
@@ -456,14 +456,13 @@ class TeleopIKSolver:
                     margin_deg=profile.nullspace_joint_limit_margin_deg,
                 )
             except (ValueError, RuntimeError):
-                if not self._nullspace_warn_throttle:
+                _now = time.monotonic()
+                if _now - self._nullspace_warn_last_s > 5.0:
                     logger.warning(
                         "Nullspace optimization failed — joint-limit repulsion degraded",
                         exc_info=True,
                     )
-                    self._nullspace_warn_throttle = 80  # ~5s at 16Hz
-                if self._nullspace_warn_throttle > 0:
-                    self._nullspace_warn_throttle -= 1
+                    self._nullspace_warn_last_s = _now
 
         # ── Collision safety gates ──
         collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)

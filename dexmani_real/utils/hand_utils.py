@@ -23,7 +23,8 @@ def estimate_frame_from_hand_points(keypoint_3d_array: np.ndarray) -> np.ndarray
     Ref: LeFranX vr_hand_detector_adapter.py:293-342
     """
     keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
-    assert keypoint_3d_array.shape == (21, 3)
+    if keypoint_3d_array.shape != (21, 3):
+        raise ValueError(f"keypoint_3d_array must have shape (21, 3), got {keypoint_3d_array.shape}")
 
     eps = 1e-8
 

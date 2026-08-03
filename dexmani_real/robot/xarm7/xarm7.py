@@ -1,10 +1,10 @@
 """xArm7 7-DOF robot arm hardware driver — thin wrapper for blocking moves.
 
 Control mode: position servo via set_servo_angle_j (Mode 1) for blocking moves
-(reset, return-to-home waypoints). Teleop arm control uses ArmInnerLoop with
+(reset, return-to-home waypoints). Teleop arm control uses arm_loop with
 Mode 6 (joint online trajectory planning, set_servo_angle, firmware trajectory
 planner). The two use independent XArmAPI connections — XArm7 for blocking moves,
-ArmInnerLoop for continuous teleop.
+arm_loop for continuous teleop.
 
 This class is a thin hardware wrapper — no inner threads, no PID, no velocity mode.
 """
@@ -60,7 +60,7 @@ class XArm7Config:
     clip_joint_limit: bool = True
 
     # Collision detection — set to 1 (least sensitive) to prevent false C31 during teleop.
-    # ArmInnerLoop manages its own collision params independently.
+    # arm_loop manages its own collision params independently.
     collision_sensitivity: int = 1
 
     # TCP load for correct dynamics torque estimation
@@ -76,7 +76,7 @@ class XArm7Config:
 class XArm7:
     """Thin xArm7 hardware wrapper — blocking moves only (reset, home).
 
-    Velocity PID control is owned by ArmInnerLoop in a separate process.
+    Velocity PID control is owned by arm_loop in a separate process.
     This class only handles: connect, disconnect, reset, stop, get_state,
     and blocking position moves via set_servo_angle_j.
     """
@@ -151,7 +151,7 @@ class XArm7:
         """Clear latched error state without changing the control mode.
 
         Unlike :meth:`robot_init`, this does NOT call ``_set_mode(1)``, so it is
-        safe to call while an :class:`ArmInnerLoop` is running in velocity-control
+        safe to call while the arm_loop process is running in velocity-control
         mode (mode 4) or online trajectory planning mode (mode 6).  Switching the
         global arm firmware mode underneath the inner loop would cause its
         ``vc_set_joint_velocity`` / ``set_servo_angle`` calls to fail,
@@ -207,7 +207,7 @@ class XArm7:
         """Send joint position command for blocking moves (reset).
 
         Simple position servo — clips joint limits, then set_servo_angle_j.
-        For teleop position servo, use ArmInnerLoop.
+        For teleop position servo, use arm_loop.
         """
         if self.arm is None:
             self.error_state = True
@@ -277,7 +277,7 @@ class XArm7:
 
         Does NOT set a control mode — the mode is set on first use by
         :meth:`send_action` (Mode 1 for blocking moves) or by
-        :class:`ArmInnerLoop` (Mode 6 for teleop).
+        :func:`arm_loop` (Mode 6 for teleop).
         """
         if self.arm is None:
             return

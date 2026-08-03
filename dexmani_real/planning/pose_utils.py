@@ -14,7 +14,6 @@ __all__ = [
     "angular_dist_rad",
     "compose_pose",
     "compute_pose_error",
-    "continuous_rotvec",
     "invert_pose",
     "normalize_quat_wxyz",
     "quat_multiply",
@@ -253,33 +252,6 @@ def random_quat_multi_axis(
 
     return quat_multiply(q2, q1)  # R₂ * R₁
 
-
-def continuous_rotvec(new_rv: np.ndarray, prev_rv: np.ndarray) -> np.ndarray:
-    """Keep rotvec in the same sign-hemisphere as *prev_rv* to avoid ±π flips.
-
-    When accumulated rotation crosses π, ``as_rotvec()`` can flip the axis sign
-    (e.g. rx jumps 3.14 → -3.13), causing the robot to make a large motion.
-    This re-maps the equivalent rotation to stay consistent with *prev_rv*.
-
-    Args:
-        new_rv: (3,) rotation vector in axis-angle format (rx, ry, rz) [rad].
-        prev_rv: (3,) previous rotation vector for continuity reference.
-
-    Returns:
-        (3,) rotation vector with sign chosen for continuity with *prev_rv*.
-
-    Example:
-        >>> continuous_rotvec(np.array([-3.13, 0, 0]), np.array([3.14, 0, 0]))
-        array([ 3.153, 0., 0.])  # same direction as prev, not flipped
-    """
-    new_rv = np.asarray(new_rv, dtype=np.float64)
-    prev_rv = np.asarray(prev_rv, dtype=np.float64)
-    if np.dot(new_rv, prev_rv) < 0:
-        angle = np.linalg.norm(new_rv)
-        if angle > 1e-6:
-            axis = new_rv / angle
-            new_rv = -(2 * np.pi - angle) * axis
-    return new_rv
 
 
 def build_target_pose(
