@@ -69,7 +69,6 @@ class SimRobotInterface:
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
         self.last_joint_limit_clipped = False
-        self.last_delta_limited = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -107,13 +106,7 @@ class SimRobotInterface:
         return self.robot is not None and self.connected_flag and not self.error_state
 
     def is_error(self) -> bool:
-        if self.robot is None:
-            return True
-        if not self.connected_flag:
-            return True
-        if self.error_state:
-            return True
-        return False
+        return self.robot is None or not self.connected_flag or self.error_state
 
     def clear_error(self) -> bool:
         self.error_state = False
@@ -179,7 +172,7 @@ class SimRobotInterface:
         if self.robot.qlimits is not None:
             qmin = self.robot.qlimits[:, 0]
             qmax = self.robot.qlimits[:, 1]
-            clipped = np.clip(target_qpos, qmin, qmax)
+            clipped = np.clip(np.nan_to_num(target_qpos, nan=0.0), qmin, qmax)
             self.last_joint_limit_clipped = not np.allclose(target_qpos, clipped)
             target_qpos = clipped
 

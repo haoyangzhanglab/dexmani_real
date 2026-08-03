@@ -300,7 +300,7 @@ class GlobalKeyState:
 
     def __init__(self) -> None:
         self._keys: set[str] = set()
-        self._running = True
+        self._running = False
         self._thread: threading.Thread | None = None
         self._listener: Any = None  # pynput keyboard.Listener
 
@@ -352,6 +352,7 @@ class GlobalKeyState:
         self._running = False
 
     def start(self) -> None:
+        self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 

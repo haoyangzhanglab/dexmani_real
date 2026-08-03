@@ -8,6 +8,10 @@ from typing import Any, Literal, Sequence, Union
 import numpy as np
 import torch
 
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
+
 ArrayLike = Union[np.ndarray, torch.Tensor]
 SamplingMode = Literal["none", "random", "fps", "first"]
 
@@ -497,6 +501,7 @@ def sample_points(
                     pts_cpu = points.cpu()
                     index = torch3d_ops.sample_farthest_points(pts_cpu[None], K=npoints)[1][0]
         except ImportError:
+            logger.warning("pytorch3d not available — falling back to random sampling instead of FPS")
             index = torch.randperm(count, device=points.device)[:npoints]
     elif count >= npoints:
         index = torch.randperm(count, device=points.device)[:npoints]

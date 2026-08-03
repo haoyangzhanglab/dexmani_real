@@ -461,13 +461,15 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         _cam_K = np.array(_cam_K_flat, dtype=np.float64).reshape(3, 3)
                     _depth_scale = float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
                     _cam_serial_bytes = bytes(shared.camera_serial).rstrip(b"\x00")
-                    _cam_name = _cam_serial_bytes.decode() if _cam_serial_bytes else None
+                    _cam_serial = _cam_serial_bytes.decode() if _cam_serial_bytes else None
+                    _cam_name = _cam_serial
 
                     if not recorder.start_episode(
                         task_label=cfg.task_label,
                         operator=cfg.operator,
                         camera_K=_cam_K,
                         camera_name=_cam_name,
+                        camera_serial=_cam_serial,
                         depth_scale=_depth_scale,
                         record_config={
                             "ema_alpha_pos": cfg.ema_alpha_pos,

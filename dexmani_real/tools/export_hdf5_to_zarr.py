@@ -848,9 +848,10 @@ def main() -> None:
         control_hz = 1.0 / args.align_dt
         print(f"\nTimestamp alignment: dt={args.align_dt*1000:.1f}ms method={args.align_method}")
         if any(r is not None for r in rgb_list):
-            print("[WARN] Camera frames dropped during timestamp alignment (not interpolatable).")
-            rgb_list = [None] * len(rgb_list)
-            depth_list = [None] * len(depth_list)
+            print("ERROR: Camera data cannot be timestamp-aligned (not interpolatable). "
+                  "Use grid-aligned format or pass --no-camera to skip camera frames.",
+                  file=sys.stderr)
+            sys.exit(1)
         obs_list, action_list, episode_lengths = _align_all_episodes(
             episode_paths,
             obs_list,

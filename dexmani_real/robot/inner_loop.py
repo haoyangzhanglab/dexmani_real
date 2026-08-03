@@ -66,6 +66,7 @@ class ArmInnerLoopConfig:
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
 _RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
+_RECOVERY_MAX: int = 30  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -87,6 +88,7 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
     _consecutive_recoveries = 0
+    _consecutive_state_errors = 0
     cfg = config or ArmInnerLoopConfig()
 
     HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
@@ -185,7 +187,7 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
                         arm.set_mode(6)
                         arm.set_state(0)
                         _consecutive_recoveries += 1
-                        if _consecutive_recoveries > 30:  # 1s @ 30Hz
+                        if _consecutive_recoveries > _RECOVERY_MAX:
                             logger.error("arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries)
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
@@ -203,7 +205,7 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
                         arm.set_mode(6)
                         arm.set_state(0)
                         _consecutive_recoveries += 1
-                        if _consecutive_recoveries > 30:
+                        if _consecutive_recoveries > _RECOVERY_MAX:
                             logger.error("arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries)
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
@@ -216,6 +218,11 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
             except Exception:
                 logger.warning("arm_loop: set_servo_angle failed", exc_info=True)
                 _consecutive_recoveries += 1
+                if _consecutive_recoveries > _RECOVERY_MAX:
+                    logger.error("arm_loop: %d consecutive exceptions — escalating to FAULT", _consecutive_recoveries)
+                    shared.error_state.value = True
+                    transition(shared, SafetyState.FAULT)
+                    break
             else:
                 # code == 0: successful send — reset recovery streak
                 _consecutive_recoveries = 0
@@ -269,6 +276,12 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
             arm_connected = False
 
         if error_code in _RECOVERABLE_ERRORS:
+            _consecutive_state_errors += 1
+            if _consecutive_state_errors > _RECOVERY_MAX:
+                logger.error("arm_loop: %d consecutive state-read errors — escalating to FAULT", _consecutive_state_errors)
+                shared.error_state.value = True
+                transition(shared, SafetyState.FAULT)
+                break
             try:
                 arm.clean_error()
                 arm.set_mode(6)
@@ -279,6 +292,8 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
             shared.error_state.value = True
             transition(shared, SafetyState.FAULT)
             break
+        else:
+            _consecutive_state_errors = 0
 
         # Publish state
         frame = new_frame(ARM_STATE_DTYPE)

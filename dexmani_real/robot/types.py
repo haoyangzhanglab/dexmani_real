@@ -26,7 +26,7 @@ def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
             continue
         arr = np.asarray(val)
         if arr.shape != expected_shape:
-            raise ValueError(f"{cls_name}.{field_name} shape mismatch: " f"expected {expected_shape}, got {arr.shape}")
+            raise ValueError(f"{cls_name}.{field_name} shape mismatch: expected {expected_shape}, got {arr.shape}")
 
 
 @dataclass

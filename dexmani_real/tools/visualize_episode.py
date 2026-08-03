@@ -32,8 +32,6 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from dexmani_real.recording.episode_reader import EpisodeReader, _MergedH5File
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters

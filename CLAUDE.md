@@ -159,7 +159,9 @@ already catches.
 ### Layers (single-writer, no defense-in-depth redundancy)
 
 1. **Arm-level:** NaN guard (protects `last_target`) + Mode 6 error handling (C22/C24/C31
-   auto-recover → `clean_error+set_mode+set_state`; non-recoverable → FAULT)
+   auto-recover → `clean_error+set_mode+set_state`; consecutive recoveries > `_RECOVERY_MAX`
+   (30) → FAULT; non-recoverable → immediate FAULT) + `except Exception` path
+   also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
 2. **Policy-level:** arm connected gate + NaN guard for arm/hand + workspace clamp +
    safety_state gate (ARMED required for B, FAULT blocks send) + hand_qpos_stale hold
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure + delta clamp
@@ -189,6 +191,14 @@ already catches.
   recovery, marks frames for offline filtering
 - **Hand cmd NaN ring guard:** Policy no longer pushes NaN-rejected hand commands into
   hand_cmd_ring (hand_loop NaN guard retained as zero-cost backstop)
+- **Recovery counter FAULT escalation (2026-08-03 ultracode review):** arm_loop's
+  `except Exception` path and state-read C22/C24/C31 recovery path now share
+  `_RECOVERY_MAX=30` escalation — persistent servo exceptions or state-read errors
+  trigger FAULT instead of silent infinite retry. Separate counters
+  (`_consecutive_recoveries` for servo, `_consecutive_state_errors` for state-read)
+  prevent cross-contamination. Hand send-error watchdog intentionally excluded —
+  hand comm errors are frequently intermittent and self-recovering; the clear_error()
+  retry loop is correct.
 
 ### Earlier removals (pre-2026-08-03)
 
@@ -299,3 +309,4 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 - **Dead code cleanup (2026-08-03)**: ✅ 删除 robot/interface.py、robot/validate.py、robot/preflight.py、robot/arm_process.py；✅ hand_process.py 移除所有 legacy 类（HandControlProcess/HandSHMFaçade/HandSHMAdapter 等）；✅ types.py 移除 RobotInterfaceConfig；✅ (2026-08-03 后续) 删除 defaults.py 6 个 _Deprecated* 类 + TeleopDefaults；✅ 删除 planning/collision_config.py；✅ 删除 test_quest_hand_teleop.py；✅ shared_storage.py 移除 4 个 re-export；✅ 清理所有过期注释/docstring 中的 RobotInterface/RobotInterfaceConfig/ArmProcess 引用；✅ 更新 CLAUDE.md 架构图。
 - **Code review bugfixes (2026-08-03)**: ✅ calibrate_camera.py CRITICAL NameError 修复（_get_ee_pose 中未定义的 Rotation）；✅ replay_traj.py queue.put 死锁修复（error_state 门控 + estopped 守卫）；✅ 多处 heartbeat wait loop 修复。
 - **Code review round 2 (2026-08-03)**: ✅ CRITICAL: keyboard_teleop NameError 修复（XArm7Config 未导入）；✅ CRITICAL: `--acc`/`--speed` CLI 参数传递到 arm_loop（hand_record + keyboard_teleop）；✅ CRITICAL: arm_action_q blocking put() 改为 timeout-protected（policy_loop）；✅ HIGH: `--no-hand` 标志修复（hand_enabled 字段 +hand_loop 跳过）；✅ HIGH: arm_loop/hand_loop 资源泄漏修复（init 失败时 disconnect）；✅ HIGH: 重复辅助函数提取（read_arm_state/read_hand_state/write_hand_cmd → shared_storage.py）；✅ HIGH: 重复 rot6d 转换函数去重；✅ vm_loop 心跳竞态修复；✅ _simple_homing 心跳阻塞修复；✅ HandState.from_ring() 添加 qpos_stale；✅ arm.home_qpos 常量集中；✅ 死配置字段/无用导入/过时 docstring 清理。
+- **Ultracode 全库审查修复 (2026-08-03)**: ✅ M1: arm_loop 恢复路径 FAULT 升级（`_RECOVERY_MAX=30` 常量 + `except Exception` 路径 + state-read C22/C24/C31 独立计数器）；✅ F#15: ArmWristMapper.reset() NaN 守卫；✅ F#3: camera_loop 元数据轮询；✅ F#13: camera_serial 校验接通；✅ F#14: 相机帧读取错误日志 DEBUG→WARNING；✅ F#4: smoothing_alpha 死参数修复（默认 None，YAML 仅在未指定时覆盖）；✅ F#18: HandRetarget.reset() 关节顺序重映射；✅ F#23: 仿真 np.clip NaN 守卫；✅ F#17: GlobalKeyState stop-before-start 修复；✅ F#12: 空 MP4 守卫；✅ F#8: align 丢弃相机→报错；✅ 死代码清理（vr_tracker event/last_read_key, sim_adapter last_delta_limited, xarm7_xhand 3 dead methods, serialization 不可达分支, log.py _loggers 冗余, visualize sys.path hack）；✅ 代码质量（audio bare except, pointcloud FPS warning, is_error 简化, types string concat）。Hand 发送错误看门狗**保留现状**（通信错误偶发可恢复，clear_error 重试是正确策略）。

@@ -63,6 +63,11 @@ class ArmWristMapper:
         eef_pos: np.ndarray,
         eef_quat_wxyz: np.ndarray,
     ) -> None:
+        # NaN/Inf guard — a single contaminated reference frame poisons
+        # every subsequent map() call for the entire episode.
+        if not all(np.isfinite(x) for x in (*wrist_pos, *wrist_quat_wxyz, *eef_pos, *eef_quat_wxyz)):
+            logger.warning("ArmWristMapper.reset: NaN/Inf in inputs — reset rejected")
+            return
         self.wrist_pos0 = np.asarray(wrist_pos, dtype=np.float64).copy()
         self.wrist_rot0 = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
         self.eef_pos0 = np.asarray(eef_pos, dtype=np.float64).copy()

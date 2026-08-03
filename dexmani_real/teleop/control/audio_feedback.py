@@ -106,7 +106,7 @@ class AudioFeedback:
             try:
                 proc.kill()
             except Exception:
-                pass
+                logger.warning("Audio cancel: process kill failed", exc_info=True)
 
     def _play_thread(self, path: str, cancel: threading.Event) -> None:
         player = _find_player()
@@ -132,7 +132,7 @@ class AudioFeedback:
                     proc.wait()
                     return
         except Exception:
-            pass
+            logger.warning("Audio playback failed for %s", path, exc_info=True)
         finally:
             with self._lock:
                 if self._current_proc is proc:

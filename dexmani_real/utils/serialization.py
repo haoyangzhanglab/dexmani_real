@@ -13,7 +13,6 @@ dependent modules can import them directly.
 from __future__ import annotations
 
 import dataclasses
-import types as _types
 import typing
 from typing import Any, get_args, get_origin
 
@@ -58,10 +57,6 @@ def is_ndarray_annotation(tp: object) -> bool:
     origin = get_origin(tp)
     if origin is not None:
         # typing.Optional, typing.Union, etc.
-        return any(is_ndarray_annotation(a) for a in get_args(tp))
-
-    # Python 3.10+ PEP 604 UnionType (X | Y) — project requires 3.10+
-    if isinstance(tp, _types.UnionType):
         return any(is_ndarray_annotation(a) for a in get_args(tp))
 
     return False

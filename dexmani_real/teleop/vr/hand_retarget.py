@@ -238,14 +238,14 @@ class XHandRetargeter:
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
-        smoothing_alpha: float = 0.3,
+        smoothing_alpha: float | None = None,
     ):
         self.hand_type = hand_type
         self.retargeting_type = retargeting_type
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
         self.last_debug: dict[str, float | str] = {}
-        self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
         self._hand_ema_state: np.ndarray | None = None
 
         self.sapien_joint_names = [
@@ -326,7 +326,8 @@ class XHandRetargeter:
         self.indices = self.retargeter.optimizer.target_link_human_indices
 
         # Teleoperator-level EMA smoothing (second layer, ref: LeFranX smoothing_alpha=0.3)
-        self._smoothing_alpha = float(cfg.get("smoothing_alpha", 0.3))
+        if self._smoothing_alpha is None:
+            self._smoothing_alpha = float(cfg.get("smoothing_alpha", 0.3))
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
         self.retargeted_joint_order = np.array(
@@ -399,6 +400,7 @@ class XHandRetargeter:
         # Applied AFTER SeqRetargeting LPFilter (alpha=0.1) for two-layer smoothing.
         qpos_arr = np.asarray(qpos, dtype=float)
         if self._hand_ema_state is not None:
+            assert self._smoothing_alpha is not None  # set by load_retargeter() in __init__
             qpos_arr = self._smoothing_alpha * qpos_arr + (1.0 - self._smoothing_alpha) * self._hand_ema_state
         self._hand_ema_state = qpos_arr.copy()
 
@@ -444,7 +446,10 @@ class XHandRetargeter:
         if initial_qpos is not None and initial_qpos.shape == (12,):
             qpos = np.asarray(initial_qpos, dtype=np.float32)
             if np.all(np.isfinite(qpos)):
+                # Remap from hardware joint order (sapien_joint_names) to
+                # retargeter internal order before subsetting by pin2target.
+                qpos_retargeter = qpos[self.retargeted_joint_order]
                 idx = self.retargeter.optimizer.idx_pin2target
-                self.retargeter.last_qpos = qpos[idx]
+                self.retargeter.last_qpos = qpos_retargeter[idx]
             else:
                 logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")

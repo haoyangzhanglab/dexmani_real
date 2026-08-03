@@ -10,8 +10,6 @@ import sys
 import time
 from pathlib import Path
 
-_loggers: dict[str, logging.Logger] = {}
-
 _FORMATTER = logging.Formatter(
     "[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
@@ -46,9 +44,8 @@ def _get_file_handler() -> logging.FileHandler | None:
 
 
 def get_logger(name: str) -> logging.Logger:
-    if name not in _loggers:
-        logger = logging.getLogger(name)
-        if not logger.handlers:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
             handler = logging.StreamHandler(sys.stdout)
             handler.setFormatter(_FORMATTER)
             logger.addHandler(handler)
@@ -56,5 +53,4 @@ def get_logger(name: str) -> logging.Logger:
             if file_handler is not None:
                 logger.addHandler(file_handler)
             logger.setLevel(logging.INFO)
-        _loggers[name] = logger
-    return _loggers[name]
+    return logger

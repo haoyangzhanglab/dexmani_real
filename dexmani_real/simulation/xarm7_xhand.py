@@ -165,19 +165,6 @@ class XArm7XHand:
     def get_eef_pose(self):
         return self.model.find_link_by_name("custom_eef_link").get_entity_pose()
 
-    def get_palm_pose(self):
-        return self.model.find_link_by_name("right_hand_ee_link").get_entity_pose()
-
-    def get_palm_pose_from_qpos(self, qpos: np.ndarray):
-        result = self.forward_kinematics(qpos, ["right_hand_ee_link"])[0]
-        return sapien.Pose(p=result[:3], q=result[3:])
-
-    def get_palm2eef_transform(self):
-        palm_pose = self.get_palm_pose()
-        eef_pose = self.get_eef_pose()
-        palm2eef_transform = palm_pose.inv() * eef_pose
-        return palm2eef_transform
-
     def get_link_poses(self, link_names: list[str]):
         link_poses = []
         for name in link_names:
@@ -247,7 +234,7 @@ class XArm7XHand:
 
     def clip_action(self, action: np.ndarray):
         qlimits = self.qlimits
-        action = np.clip(action, qlimits[:, 0], qlimits[:, 1])
+        action = np.clip(np.nan_to_num(action, nan=0.0), qlimits[:, 0], qlimits[:, 1])
         return action
 
     def apply_action(self, target_qpos: np.ndarray):

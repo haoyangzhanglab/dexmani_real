@@ -143,6 +143,8 @@ class EpisodeReader:
         """
         if key == "rgb" and self._rgb_decoder is not None:
             n = self._rgb_decoder.frame_count
+            if n == 0:
+                raise ValueError(f"MP4 file contains no frames: {self._path}")
             return self._rgb_decoder.read_frame(min(index, n - 1))
         if key in self._h5f:
             return np.asarray(self._h5f[key][index])

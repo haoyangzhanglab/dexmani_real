@@ -367,7 +367,7 @@ class CameraProcess:
                     except (ValueError, RuntimeError, OSError):
                         logger.exception("CameraProcess shm write failed — continuing.")
                 except (RuntimeError, OSError):
-                    logger.debug("CameraProcess frame read failed — continuing.")
+                    logger.warning("CameraProcess frame read failed — continuing.", exc_info=True)
 
                 # Maintain target rate
                 elapsed = time.monotonic() - last_ts
@@ -597,6 +597,18 @@ def camera_loop(shared: "SharedStorage") -> None:
     if session.camera is None:
         _logger.error("camera_loop: camera init failed")
         return
+
+    # Wait for camera child to finish connect() so metadata is populated
+    # before camera_ready is set.  depth_scale starts at 0.0, set non-zero
+    # by the child after successful connect.  Timeout 5s (generous for L515).
+    _deadline = time.monotonic() + 5.0
+    while time.monotonic() < _deadline:
+        _ds_probe = session.depth_scale
+        if _ds_probe is not None and _ds_probe > 0.0:
+            break
+        time.sleep(0.1)
+    else:
+        _logger.warning("camera_loop: child did not populate metadata within 5s")
 
     # Publish camera metadata for Policy to read before recording starts.
     _ds = session.depth_scale

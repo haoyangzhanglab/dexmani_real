@@ -64,8 +64,6 @@ class QuestHandTracker:
 
         self.latest_frame: dict[str, Any] | None = None
         self.lock = threading.Lock()
-        self.event = threading.Event()
-        self.last_read_key: tuple[Any, Any] | None = None
 
         self.received_frames = 0
         self.ignored_events = 0
@@ -112,7 +110,6 @@ class QuestHandTracker:
 
         # Client mode timed out — server unreachable.
         self.running = False
-        self.event.set()
         if self.thread.is_alive():
             self.thread.join(timeout=_THREAD_JOIN_CLIENT_TIMEOUT_S)
         self.started = False
@@ -127,7 +124,6 @@ class QuestHandTracker:
 
     def disconnect(self) -> None:
         self.running = False
-        self.event.set()
 
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=_THREAD_JOIN_SERVER_TIMEOUT_S)
@@ -217,7 +213,6 @@ class QuestHandTracker:
                 with self.lock:
                     self.latest_frame = frame
                     self.received_frames += 1
-                self.event.set()
 
         except (ConnectionError, TimeoutError, RuntimeError) as exc:
             self.last_error = str(exc)
