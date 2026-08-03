@@ -2,18 +2,9 @@
 
 from __future__ import annotations
 
-__all__ = ["ema_smooth_pose", "EMA_ALPHA_POS", "EMA_ALPHA_ROT"]
+__all__ = ["ema_smooth_pose"]
 
 import numpy as np
-
-from dexmani_real.config.defaults import policy
-
-# ── Canonical EMA alpha values (tuned at 16Hz, dt=62.5ms) ──
-# Primary source of truth: dexmani_real.config.defaults.policy.ema.
-# These module-level re-exports provide convenient access for entry points.
-# Tuning history: POS 0.8→0.65→0.6, ROT 0.4→0.3→0.25.
-EMA_ALPHA_POS: float = policy.ema.alpha_pos
-EMA_ALPHA_ROT: float = policy.ema.alpha_rot
 
 
 # ═══════════════════════════════════════════════════════════════════════════

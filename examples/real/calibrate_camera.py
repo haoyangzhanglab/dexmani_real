@@ -10,7 +10,7 @@ cv2.calibrateHandEye（5 种算法比选）自动求解相机外参。
 结果写入 dexmani_real/config/cameras.json，与 CameraCalib 兼容。
 
 硬件准备:
-  1. 打印 ArUco 7x7_50 标记 (ID=1)，尺寸 98.2mm×98.2mm
+  1. 打印 ArUco 7x7_50 标记 (ID=1)，尺寸 122.8mm×122.8mm
   2. 将标记贴在 xArm7 末端（手底座侧面，平整、对相机可见）
   3. RealSense 相机固定在三脚架上，视野覆盖操作空间
   4. 确保 conda 环境已安装: pyrealsense2, opencv-python, scipy
@@ -57,7 +57,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import ASSET_DIR, PACKAGE_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.pose_utils import quat_multiply
+from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
+from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.robot.inner_loop import ArmInnerLoopConfig, arm_loop as _arm_loop
 
 try:
@@ -70,10 +71,10 @@ from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
 
-CTRL_HZ = 50.0
+CTRL_HZ = 30.0  # 30Hz — matches arm_loop rate, avoids queue backpressure
 CTRL_DT = 1.0 / CTRL_HZ
-DELTA_POS = 0.005  # 每次按键平移量 (m)
-DELTA_RPY = 0.02  # 每次按键旋转量 (rad)
+DELTA_POS = 0.008  # 每次按键平移量 (m) → 240 mm/s @ 30Hz
+DELTA_RPY = 0.03  # 每次按键旋转量 (rad) → 1.7°/frame, 51°/s @ 30Hz
 TARGET_LEAD_MAX = 0.03  # target 领先 arm 的最大距离 (m)
 HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s（保守，避免归位过快）
 
@@ -89,7 +90,7 @@ WORKSPACE_BOUNDS[1, 1] = 0.45   # y_max: tighter for calibration rig
 # ArUco 标记参数
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
-MARKER_SIZE_M = 0.0982  # 标记边长 (m)
+MARKER_SIZE_M = 0.1228  # 标记边长 (m) — 12.28cm
 MARKER_ID = 1  # 期望的标记 ID（None = 接受任意 ID）
 
 # 相机外参保存路径（包内 config/，与 CameraCalib 默认读取路径一致）
@@ -457,12 +458,19 @@ def compute_marker_consistency(
         # 闭环: T_ee_marker = inv(T_base_ee) * T_base_camera * T_camera_marker
         T_ee_marker = np.linalg.inv(T_base_ee) @ T_base_camera @ T_camera_marker
         positions.append(T_ee_marker[:3, 3].copy())
-        rotations.append(T_ee_marker[:3, :3].copy())
+        R_ee_marker = T_ee_marker[:3, :3]
+        # Reject degenerate rotation matrices (NaN / singular).
+        # A degenerate T_base_camera from calibrate_eye_to_hand can produce
+        # invalid SO(3) in T_ee_marker, which crashes R.from_matrix (SVD).
+        _det = float(np.linalg.det(R_ee_marker))
+        if not np.isfinite(_det) or abs(_det - 1.0) > 0.01:
+            raise ValueError(f"degenerate rotation matrix in T_ee_marker (det={_det:.3f})")
+        rotations.append(R_ee_marker.copy())
 
     # 位置：每个样本的 T_ee_marker 位置与均值的偏差 (mm)
-    positions = np.array(positions)  # (N, 3)
-    mean_pos = positions.mean(axis=0)
-    residuals_mm = np.linalg.norm(positions - mean_pos, axis=1) * 1000.0
+    positions_arr = np.array(positions)  # (N, 3)
+    mean_pos = positions_arr.mean(axis=0)
+    residuals_mm = np.linalg.norm(positions_arr - mean_pos, axis=1) * 1000.0
 
     # 旋转：每个样本的 T_ee_marker 旋转与平均旋转的夹角 (deg)
     rots = R.from_matrix(np.array(rotations))
@@ -484,7 +492,7 @@ def calibrate_and_select(
         table: [(method_name, std_mm), ...]，供打印对比（失败的算法 std 记为 nan）。
     """
     best: tuple[float, str, np.ndarray, np.ndarray, np.ndarray] | None = None
-    table: list[tuple[float, float]] = []
+    table: list[tuple[str, float]] = []
     for name, m in HAND_EYE_METHODS.items():
         try:
             T = calibrate_eye_to_hand(
@@ -502,7 +510,9 @@ def calibrate_and_select(
                 tvec_marker2camera_list,
             )
             std_mm = float(errors_mm.std())
-        except cv2.error:
+        except Exception:
+            # cv2.error (calibrate_eye_to_hand) or LinAlgError / RuntimeWarning
+            # (compute_marker_consistency: degenerate rotation → SVD failure)
             table.append((name, float("nan")))
             continue
         table.append((name, std_mm))
@@ -628,7 +638,7 @@ def main():
     transition(shared, SafetyState.ARMED)
     print("  ✓ arm_loop 就绪 (SharedStorage, Mode 6, 30Hz)")
 
-    # ── Read initial state from ring ──
+    # ── Read initial state from ring (retry: arm_loop sets arm_ready before first write) ──
 
     def _read_arm_state_ring():
         """Read latest arm state from ring, return (qpos, eef_pos, eef_rot6d) or (None,)*3."""
@@ -642,7 +652,12 @@ def main():
             return None, None, None
         return qpos, eef_pos, eef_rot6d
 
-    arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
+    arm_qpos = eef_pos = _eef_rot6d = None
+    for _ in range(30):  # up to ~1s
+        arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
+        if arm_qpos is not None:
+            break
+        time.sleep(0.05)
     if arm_qpos is None:
         print("❌ 无法从 arm_state_ring 读取初始状态")
         shared.is_running.value = False
@@ -651,15 +666,14 @@ def main():
         return
 
     prev_qpos_cmd = arm_qpos.copy()
-    target_pos = eef_pos.copy()
-    # Derive target quat from rot6d (stored in ring).
-    try:
-        from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-        target_quat = rot6d_to_quat_wxyz(_eef_rot6d)
-    except Exception:
-        target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    # Initialize target in WORLD frame (consistent with keyboard_teleop).
+    # eef_pos/rot6d from the ring are base-frame (Pinocchio FK); convert to world.
+    _eef_quat_base_init = rot6d_to_quat_wxyz(_eef_rot6d)
+    _eef_world_init = planner.base_to_world_pose(Pose(p=eef_pos, q=_eef_quat_base_init))
+    target_pos = _eef_world_init.p.copy()
+    target_quat = _eef_world_init.q.copy()
 
-    print(f"\n  当前 EEF: pos={np.round(target_pos, 4)}m  q={np.round(target_quat, 4)}")
+    print(f"\n  当前 EEF (world): pos={np.round(target_pos, 4)}m  q={np.round(target_quat, 4)}")
 
     # ── 3. 启动 RealSense ──
     print("\n启动 RealSense 相机...")
@@ -913,11 +927,19 @@ def main():
                 running = False
                 break
 
-            # ── R: 归位 (HOME_SENTINEL through arm_action_q) ──
+            # ── R: 归位 (collision-safe path via plan_joint_home_path) ──
             if keys.is_pressed("r"):
-                print("\n  R: return_home (HOME_SENTINEL → arm_action_q)")
-                shared.arm_action_q.put(HOME_SENTINEL)
-                # Poll arm_state_ring qpos for homing completion.
+                print("\n  R: return_home")
+                _home_qpos = np.array(ArmInnerLoopConfig().home_qpos, dtype=np.float64)
+                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                if _waypoints is not None and len(_waypoints) > 0:
+                    print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
+                elif _waypoints is not None and len(_waypoints) == 0:
+                    print(f"  planned homing: already close to home, skipping")
+                else:
+                    print(f"  plan_joint_home_path returned None — falling back to joint-space interpolation")
+                shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
+                # Wait for homing to complete (arm_loop heartbeat stays alive).
                 _home_wait = time.perf_counter() + 15.0
                 _last_hb = shared.arm_heartbeat_s.value
                 while time.perf_counter() < _home_wait:
@@ -930,11 +952,11 @@ def main():
                 arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
                 if arm_qpos is not None:
                     prev_qpos_cmd = arm_qpos.copy()
-                    target_pos = eef_pos.copy()
-                    try:
-                        target_quat = rot6d_to_quat_wxyz(_eef_rot6d)
-                    except Exception:
-                        pass
+                    # World-frame target at home position
+                    _eef_quat_base = rot6d_to_quat_wxyz(_eef_rot6d)
+                    _eef_world = planner.base_to_world_pose(Pose(p=eef_pos, q=_eef_quat_base))
+                    target_pos = _eef_world.p.copy()
+                    target_quat = _eef_world.q.copy()
                     print("  Arm 归位完成，状态已同步")
                 else:
                     print("  ⚠ 归位后无法读取状态")
@@ -945,16 +967,23 @@ def main():
                 arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
                 if arm_qpos is None:
                     continue
-                # Derive eef_quat from rot6d for target tracking
+                # Derive eef_quat from rot6d, then convert to world frame.
+                # eef_pos/rot6d from the ring are base-frame (Pinocchio FK);
+                # keyboard deltas (WASD) are world-frame — both must be in
+                # the same frame before arithmetic.
                 try:
-                    eef_quat = rot6d_to_quat_wxyz(_eef_rot6d)
+                    eef_quat_base = rot6d_to_quat_wxyz(_eef_rot6d)
+                    _eef_world = planner.base_to_world_pose(Pose(p=eef_pos, q=eef_quat_base))
+                    eef_pos_world = _eef_world.p
+                    eef_quat_world = _eef_world.q
                 except Exception:
-                    eef_quat = target_quat.copy()
+                    eef_pos_world = target_pos.copy()
+                    eef_quat_world = target_quat.copy()
             except Exception as e:
                 print(f"  ⚠ 状态读取异常: {e}")
                 continue
 
-            # ── EEF target delta from keys ──
+            # ── EEF target delta from keys (world frame) ──
             dx = np.zeros(3)
             if keys.is_pressed("w"):
                 dx[0] += DELTA_POS
@@ -983,28 +1012,28 @@ def main():
             if keys.is_pressed("l"):
                 drpy[2] += DELTA_RPY
 
-            # 周期性状态打印
+            # 周期性状态打印 (world frame)
             if loop_count % 50 == 0:
                 n = len(samples_tvec_ee2base)
                 print(
                     f"[{loop_count:5d}] "
-                    f"eef={np.round(eef_pos, 3)}m  "
+                    f"eef_w={np.round(eef_pos_world, 3)}m  "
                     f"samples={n}  "
                     f"{'← 按 SPACE 采集' if n < MIN_SAMPLES else '← 按 ENTER 标定'}",
                     flush=True,
                 )
 
-            # 无输入 → snap target
+            # 无输入 → snap target to current world-frame EEF
             if np.all(dx == 0) and np.all(drpy == 0):
-                target_pos = eef_pos.copy()
-                target_quat = eef_quat.copy()
+                target_pos = eef_pos_world.copy()
+                target_quat = eef_quat_world.copy()
                 prev_qpos_cmd = arm_qpos.copy()
                 continue
 
-            # ── Target lead limit ──
-            lead = np.linalg.norm(target_pos - eef_pos)
+            # ── Target lead limit (world frame) ──
+            lead = np.linalg.norm(target_pos - eef_pos_world)
             if lead > TARGET_LEAD_MAX:
-                target_pos = eef_pos + (target_pos - eef_pos) * (TARGET_LEAD_MAX / lead)
+                target_pos = eef_pos_world + (target_pos - eef_pos_world) * (TARGET_LEAD_MAX / lead)
 
             # ── Workspace soft-wall: directional — allow moving back into workspace ──
             new_pos = target_pos + dx
@@ -1032,14 +1061,14 @@ def main():
                 dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)
                 target_quat = quat_multiply(dq, target_quat)
 
-            # ── IK ──
+            # ── IK (target in world frame, same as keyboard_teleop) ──
             target_pose = Pose(p=target_pos, q=target_quat)
             # Calibration tool doesn't connect hand hardware → no hand_qpos to sync.
             # (Collision model falls back to open-hand pose — acceptable for calib.)
             ik_result = planner.solve_teleop_ik(target_pose, arm_qpos, prev_qpos_cmd)
             if not ik_result.success or ik_result.qpos is None:
-                target_pos = eef_pos.copy()
-                target_quat = eef_quat.copy()
+                target_pos = eef_pos_world.copy()
+                target_quat = eef_quat_world.copy()
                 continue
 
             prev_qpos_cmd = ik_result.qpos.copy()

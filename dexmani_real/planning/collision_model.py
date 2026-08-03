@@ -52,7 +52,7 @@ _COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand.srdf")  # unified SRDF (single s
 _HAND_DOF_COUNT = 12  # number of active hand joints
 
 # User→URDF reorder map for set_hand_qpos().
-# Hardware and simulation return hand qpos in user order:
+# Hardware returns hand qpos in user order:
 #   [thumb_bend, thumb_rota1, thumb_rota2, index_bend, index_j1, index_j2,
 #    mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2]
 # But the URDF (and thus Pinocchio) expects:
@@ -159,7 +159,7 @@ class CollisionModel:
         and automatically concatenate with this buffer to form a full 19-DOF
         qpos.  Call this each frame before arm collision checks.
 
-        Accepts hand qpos in **user order** (hardware / simulation native):
+        Accepts hand qpos in **user order** (native hardware order):
         ``[thumb_bend, thumb_rota1, thumb_rota2, index_bend, index_j1, index_j2,
         mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2]``.
 
@@ -190,11 +190,6 @@ class CollisionModel:
         qpos = np.asarray(qpos, dtype=np.float64)
         if self._hand_dof and qpos.shape == (7,):
             if self._hand_qpos is None:
-                logger.warning(
-                    "hand_qpos not initialized — collision checks use zero (open-hand) pose, "
-                    "which may not match actual hand configuration. "
-                    "Call set_hand_qpos() before collision checks."
-                )
                 return np.concatenate([qpos, np.zeros(_HAND_DOF_COUNT, dtype=np.float64)])
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:

@@ -85,7 +85,7 @@ from dexmani_real.shm.shared_storage import (
     read_hand_state,
     write_hand_cmd,
 )
-from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
@@ -1400,7 +1400,7 @@ Control keys:
                         break
                     if ControlSignal.HOME in sigs:
                         print("\nH: return_home (HOME_SENTINEL → arm_action_q)")
-                        shared.arm_action_q.put(HOME_SENTINEL)
+                        shared.arm_action_q.put((HOME_SENTINEL, None))
                         # Wait for arm to execute homing — detect heartbeat stall.
                         _home_wait = time.perf_counter() + 20.0
                         _last_hb = shared.arm_heartbeat_s.value

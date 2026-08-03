@@ -14,7 +14,7 @@
 Architecture:
     Main (~200 lines) — spawns 5 processes, monitors is_running + heartbeats
       │
-      ├─ CameraProcess ──camera_ring──┐
+      ├─ camera_loop ──camera_ring──┐
       ├─ VRProcess ──────vr_ring─────┤
       │                               ▼
       ├─ PolicyProcess ──arm_action_q──→ arm_loop
@@ -119,12 +119,15 @@ def main() -> None:
         p.start()
 
     # ── 4. Wait for ready ──
+    # vr_loop defers vr_ready until the first HTS event arrives (not just TCP
+    # connect), so the 120 s timeout here doubles as the "put on headset" grace
+    # period.  Arm/camera/hand are ready within seconds.
     transition(shared, SafetyState.DISARMED)
 
     _ready_checks: list[tuple[str, object, float]] = [
         ("arm", shared.arm_ready, 15),
         ("camera", shared.camera_ready, 15),
-        ("vr", shared.vr_ready, 15),
+        ("vr", shared.vr_ready, 120),
     ]
     if not args.no_hand:
         _ready_checks.append(("hand", shared.hand_ready, 15))
@@ -259,7 +262,7 @@ def _print_health_summary(shared: SharedStorage) -> None:
         print("  vr:   (no data yet)")
 
     # Camera
-    cam_serial_bytes = bytes(shared.camera_serial).rstrip(b"\x00")
+    cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
     if cam_serial_bytes:
         print(f"  cam:  OK  serial={cam_serial_bytes.decode()}")
     elif shared.camera_heartbeat_s.value > 0:
@@ -273,7 +276,7 @@ def _print_health_summary(shared: SharedStorage) -> None:
 
 def _post_loop_home(shared: SharedStorage) -> None:
     """Offer return_home via HOME_SENTINEL after normal exit."""
-    from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
+    from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 
     kb = KeyboardHandler()
     kb.start()
@@ -285,7 +288,7 @@ def _post_loop_home(shared: SharedStorage) -> None:
                 if sig == ControlSignal.HOME:
                     print("\nH: return_home")
                     try:
-                        shared.arm_action_q.put(HOME_SENTINEL, timeout=2.0)
+                        shared.arm_action_q.put((HOME_SENTINEL, None), timeout=2.0)
                     except Exception:
                         print("  ⚠ Arm queue full — arm may have already exited")
                         break

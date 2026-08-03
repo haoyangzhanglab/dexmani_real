@@ -85,6 +85,13 @@ class TeleopIKSolver:
                 profile=profile,
                 report=report,
             )
+            # Re-canonicalize to current_qpos after nullspace optimization.
+            # Nullspace perturbs by <1°, but defense-in-depth: ensure Mode 6
+            # always receives a target on the shortest angular path from the
+            # physical joint position.  (Root fix is in _solve_position_ik
+            # where canonicalize_qpos now uses current_qpos as reference.)
+            if result.success and result.qpos is not None:
+                result.qpos = self.ik_mgr.canonicalize_qpos(result.qpos, current_qpos)
             # Propagate total solve time to success path (failure path already has it at line 103).
             result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
         else:
@@ -156,7 +163,15 @@ class TeleopIKSolver:
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
-            qpos = self.ik_mgr.canonicalize_qpos(raw_qpos, previous_qpos_cmd)
+            # Canonicalize relative to current_qpos (physical arm position), NOT
+            # previous_qpos_cmd.  previous_qpos_cmd can drift into a different
+            # equivalent band than the arm's actual joint encoders over many
+            # frames, causing Mode 6 to take the "long way" around (e.g. J5
+            # rotating 355° instead of 5°).  current_qpos always reflects the
+            # physical encoder position — wrapping relative to it guarantees the
+            # command sent to Mode 6 is on the shortest path from the current
+            # physical configuration.
+            qpos = self.ik_mgr.canonicalize_qpos(raw_qpos, current_qpos)
 
             # ── Single FK per candidate: Jacobian + world-frame EEF pose ──
             # compute_eef_jacobian_and_pose_world does one Pinocchio FK call
@@ -175,8 +190,37 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:{tag}({_solve_ms:.1f}ms)")
                 continue
 
+            hw_dist_raw = float(np.max(np.abs(qpos - current_qpos)))
             hw_dist = float(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, current_qpos))))
             weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights)
+
+            # ── Band-mismatch gate: detect when the IK result is on a
+            # different 2π band than the physical arm position.  Equivalent
+            # joints (J1/J3/J5/J7) have 720° range with 2π wrapping;
+            # canonicalize_qpos should always pick the correct band, but
+            # joint-limit boundaries can defeat it (see the k-bounds fix
+            # in ik_candidates.py:canonicalize_qpos).  This gate catches
+            # any remaining mismatch:
+            #   raw delta ≈ 328° (arm at +6.0, candidate at +0.28)
+            #   wrapped delta ≈ 32° (compute_qpos_delta wraps to [-π, π])
+            #   → band mismatch = 296° > 90° threshold → REJECT
+            # Without this, the wrapped hw_dist (32°) passes all checks
+            # and the arm physically rotates ~328° to track the target.
+            _hw_band_mismatch = hw_dist_raw - hw_dist
+            _hw_band_limit_rad = np.deg2rad(90.0)
+            if _hw_band_mismatch > _hw_band_limit_rad:
+                attempts.append(f"{seed_name}:band_switch(raw={np.rad2deg(hw_dist_raw):.0f}deg, wrapped={np.rad2deg(hw_dist):.0f}deg)")
+                continue
+
+            # ── Hardware-distance gate: reject candidates too far from the
+            # physical arm position (genuine tracking lag, not band mismatch).
+            # Threshold: 150° — generous enough to allow normal tracking lag
+            # but blocks extreme branch-switch discontinuities (~172° elbow flip
+            # on non-equivalent joints like J4).
+            _hw_limit_rad = np.deg2rad(150.0)
+            if hw_dist > _hw_limit_rad:
+                attempts.append(f"{seed_name}:hw_dist({_solve_ms:.1f}ms, {np.rad2deg(hw_dist):.0f}deg)")
+                continue
 
             # Track best fallback (closest to current by weighted distance).
             if best_fallback is None or weighted_dist < best_fallback[2]:

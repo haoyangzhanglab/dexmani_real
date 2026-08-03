@@ -69,11 +69,10 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
     _latest_head_quat_wxyz = np.zeros(4, dtype=np.float64)
     _latest_head_quat_wxyz[0] = 1.0
 
-    # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
-    # (Main's supervisor checks heartbeats immediately after ready events).
-    shared.vr_heartbeat_s.value = time.monotonic()
-    shared.vr_ready.set()
-    logger.info("vr_loop: ready")
+    # vr_ready is deferred to the first event (HeadFrame or HandFrame).
+    # TCP connect alone is not enough — data must actually be flowing before
+    # Main considers VR "ready", otherwise the 5 s heartbeat timeout fires
+    # before the operator has time to put on the headset.
 
     dtype = vr_frame_dtype()
 
@@ -81,8 +80,14 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         if not shared.is_running.value:
             break
 
-        # Heartbeat — written on every event to prove VR process is alive + receiving data
+        # Heartbeat on every event — proves VR process is alive + receiving data.
+        # Written *before* vr_ready so the supervisor sees a fresh heartbeat
+        # immediately (avoids false FAULT on the first check).
         shared.vr_heartbeat_s.value = time.monotonic()
+
+        if not shared.vr_ready.is_set():
+            shared.vr_ready.set()
+            logger.info("vr_loop: ready (first event received)")
 
         if isinstance(event, HeadFrame):
             head_flu_pos = unity_left_to_flu_position(event.head.x, event.head.y, event.head.z)
@@ -113,7 +118,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             frame["head_pos"][0] = _latest_head_pos.copy()
             frame["head_quat_wxyz"][0] = _latest_head_quat_wxyz.copy()
             frame["recv_ts_ns"][0] = np.uint64(event.recv_ts_ns)
-            frame["source_ts_ns"][0] = np.uint64(event.source_ts_ns)
+            frame["source_ts_ns"][0] = np.uint64(event.source_ts_ns or 0)
             frame["sequence_id"][0] = np.uint64(event.sequence_id)
             frame["source_frame_seq"][0] = np.uint64(event.source_frame_seq)
             frame["local_recv_ns"][0] = np.uint64(time.monotonic_ns())

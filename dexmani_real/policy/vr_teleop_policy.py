@@ -18,6 +18,7 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.config.defaults import arm, hand, policy
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
@@ -28,16 +29,15 @@ from dexmani_real.shm.shared_storage import (
     read_hand_state as _read_hand_state,
     write_hand_cmd as _write_hand_cmd,
 )
-from dexmani_real.teleop.control.audio_feedback import AudioFeedback
-from dexmani_real.teleop.control.keyboard import ControlSignal, KeyboardHandler
-from dexmani_real.teleop.vr.arm_mapper import ArmWristMapper
-from dexmani_real.teleop.vr.hand_retarget import XHandRetargeter
+from dexmani_real.teleop.audio_feedback import AudioFeedback
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.teleop.arm_mapper import ArmWristMapper
+from dexmani_real.teleop.hand_retarget import XHandRetargeter
 from dexmani_real.utils.array_utils import nan_array
-from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.loop_timing import StageTimer
+from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import ema_smooth_pose
-from dexmani_real.utils.throttle import ThrottledWarner
 
 logger = get_logger(__name__)
 
@@ -239,6 +239,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             return
     logger.info("Policy: all subsystems ready")
 
+    # Write heartbeat NOW — Main unblocks from vr_ready at the same moment and
+    # enters the supervisor, which checks policy_heartbeat_s immediately.
+    # Without this, the ~40 lines of init below race the first supervisor tick.
+    shared.policy_heartbeat_s.value = time.monotonic()
+
     # ── 6. Initial state ──
     home_qpos = np.array(arm.home_qpos, dtype=np.float64)
     arm_state = _read_arm_state(shared)
@@ -363,7 +368,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
                         if do_home and shared.is_running.value:
                             audio.play("home")
-                            _safe_arm_queue_put(shared, HOME_SENTINEL)
+                            _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                            _home_wp = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                            _safe_arm_queue_put(shared, (HOME_SENTINEL, _home_wp))
                             teleop_active = False
                             transition(shared, SafetyState.ARMED)
                             arm_mapper.clear()
@@ -393,7 +400,12 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     # Hand home (send before arm HOME_SENTINEL — hand is independent)
                     _write_hand_cmd(shared, HAND_HOME_QPOS)
                     prev_hand_qpos = HAND_HOME_QPOS.copy()
-                    _safe_arm_queue_put(shared, HOME_SENTINEL)
+
+                    # Plan collision-safe path (uses policy's CollisionModel).
+                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                    _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                    _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
+
                     teleop_active = False
                     transition(shared, SafetyState.ARMED)
                     arm_mapper.clear()
@@ -434,8 +446,23 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         audio.play("resume")
                         arm_mapper_reset = _try_reset_mapper(shared, arm_mapper)
                         if arm_mapper_reset:
-                            _reset_hand_retargeter(hand_retargeter)
+                            # Warm-start hand retargeter NLP from current hardware
+                            # pose so the first retarget() converges from near-optimum
+                            # (matching B-press pattern at lines 527-531).
+                            _hs = _read_hand_state(shared)
+                            _reset_hand_retargeter(
+                                hand_retargeter,
+                                _hs["qpos"][0].copy()
+                                if _hs is not None and np.all(np.isfinite(_hs["qpos"][0]))
+                                else None,
+                            )
+                            if _hs is not None and np.all(np.isfinite(_hs["qpos"][0])):
+                                prev_hand_qpos = _hs["qpos"][0].copy()
                             audio.play("calibrated")
+                            # Trigger audio-hold gate — when audio finishes, the
+                            # existing hold-exit path (lines 641-642) seeds the
+                            # smoothstep ramp from hardware pose and clears EMA state.
+                            teleop_hold_for_audio = True
                     else:
                         audio.play("pause")
                     skip_rest = True
@@ -460,7 +487,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     if any(v != 0.0 for v in _cam_K_flat):
                         _cam_K = np.array(_cam_K_flat, dtype=np.float64).reshape(3, 3)
                     _depth_scale = float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
-                    _cam_serial_bytes = bytes(shared.camera_serial).rstrip(b"\x00")
+                    _cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
                     _cam_serial = _cam_serial_bytes.decode() if _cam_serial_bytes else None
                     _cam_name = _cam_serial
 

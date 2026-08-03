@@ -10,6 +10,8 @@ assets/audio/.  Missing player or file degrades silently to a log warning.
 
 from __future__ import annotations
 
+__all__ = ["AudioFeedback"]
+
 import os
 import shutil
 import subprocess

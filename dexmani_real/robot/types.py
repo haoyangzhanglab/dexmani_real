@@ -103,7 +103,7 @@ class RobotAction:
     hand_qpos_cmd: np.ndarray  # (12,) float64  rad
 
     # ── Intent (pre-IK Cartesian EEF target the arm command tracks) ──
-    # Populated by TeleopPipeline; recorded so EE-space policies can train.
+    # Populated by the teleop pipeline (vr_teleop_policy); recorded so EE-space policies can train.
     target_eef_pos: np.ndarray | None = field(default=None)  # (3,)  float64  m
     target_eef_rot6d: np.ndarray | None = field(default=None)  # (6,)  float64
 

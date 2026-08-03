@@ -17,6 +17,8 @@ poll() on the main thread.
 
 from __future__ import annotations
 
+__all__ = ["ControlSignal", "KeyboardHandler", "GlobalKeyState"]
+
 import os
 import sys
 import threading
@@ -51,7 +53,7 @@ class KeyboardHandler:
     """Global keyboard handler using pynput.
 
     Captures keystrokes globally — works even when the terminal window
-    does not have focus (e.g. user interacting with the SAPIEN viewer).
+    does not have focus.
 
     Compatible with the existing API:
         handler = KeyboardHandler()
@@ -246,8 +248,6 @@ class KeyboardHandler:
 
         # Slow path: buffer empty, wait briefly for events
         if timeout > 0:
-            import time
-
             deadline = time.perf_counter() + timeout
             while time.perf_counter() < deadline:
                 with self._lock:

@@ -299,5 +299,15 @@ if __name__ == "__main__":
         xhand_exam.exam_send_command()
         time.sleep(1)
 
+    # Return to home_qpos (same as defaults.py hand.home_qpos_deg)
+    home_qpos_deg = [0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0]
+    print("\n//================================")
+    print("//Return to home_qpos")
+    print("//================================")
+    for i in range(12):
+        xhand_exam._hand_command.finger_command[i].position = home_qpos_deg[i] * math.pi / 180
+    xhand_exam.exam_send_command()
+    time.sleep(1)
+
     # Close device
     xhand_exam.exam_close_device()

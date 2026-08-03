@@ -1,13 +1,8 @@
 """Shared serialization utilities for dataclass round-trips.
 
-Provides type-introspection helpers and value-conversion functions that
-replace the duplicated ``_is_ndarray_annotation``, ``_is_tuple_annotation``,
-``_convert_field_value``, and inline ``from_dict`` logic previously copied
-across ``planning/types.py``, ``robot/types.py``,
-``robot/xarm7/xarm7.py``, and ``robot/xhand/xhand.py``.
-
-All functions in this module are PUBLIC (no underscore prefix) so the
-dependent modules can import them directly.
+The only public API is ``from_dict_helper`` — the type-introspection
+helpers (``_is_ndarray_annotation``, ``_is_tuple_annotation``,
+``_convert_field_value``) are internal implementation details.
 """
 
 from __future__ import annotations
@@ -23,7 +18,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 
-def is_ndarray_annotation(tp: object) -> bool:
+def _is_ndarray_annotation(tp: object) -> bool:
     """Check whether a type annotation represents ``np.ndarray``.
 
     Returns ``True`` for:
@@ -44,11 +39,11 @@ def is_ndarray_annotation(tp: object) -> bool:
         (possibly wrapped in Optional/Union), ``False`` otherwise.
 
     Examples:
-        >>> is_ndarray_annotation(np.ndarray)
+        >>> _is_ndarray_annotation(np.ndarray)
         True
-        >>> is_ndarray_annotation(np.ndarray | None)
+        >>> _is_ndarray_annotation(np.ndarray | None)
         True
-        >>> is_ndarray_annotation(tuple[float, ...])
+        >>> _is_ndarray_annotation(tuple[float, ...])
         False
     """
     if tp is np.ndarray:
@@ -57,12 +52,12 @@ def is_ndarray_annotation(tp: object) -> bool:
     origin = get_origin(tp)
     if origin is not None:
         # typing.Optional, typing.Union, etc.
-        return any(is_ndarray_annotation(a) for a in get_args(tp))
+        return any(_is_ndarray_annotation(a) for a in get_args(tp))
 
     return False
 
 
-def is_tuple_annotation(tp: object) -> bool:
+def _is_tuple_annotation(tp: object) -> bool:
     """Check whether a type annotation represents a ``tuple`` type.
 
     Matches ``tuple``, ``tuple[T, ...]``, and ``tuple[T1, T2, ...]``.
@@ -74,11 +69,11 @@ def is_tuple_annotation(tp: object) -> bool:
         ``True`` if ``get_origin(tp) is tuple``, ``False`` otherwise.
 
     Examples:
-        >>> is_tuple_annotation(tuple[float, ...])
+        >>> _is_tuple_annotation(tuple[float, ...])
         True
-        >>> is_tuple_annotation(tuple[int, int])
+        >>> _is_tuple_annotation(tuple[int, int])
         True
-        >>> is_tuple_annotation(list[float])
+        >>> _is_tuple_annotation(list[float])
         False
     """
     return get_origin(tp) is tuple
@@ -89,16 +84,16 @@ def is_tuple_annotation(tp: object) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def convert_field_value(val: object, target_tp: object) -> object:
+def _convert_field_value(val: object, target_tp: object) -> object:
     """Convert a serialized value back to the field's declared type.
 
     Handles three canonical conversions:
 
     1. **list → np.ndarray** — when the field annotation represents
-       ``np.ndarray`` (see :func:`is_ndarray_annotation`), the list is
+       ``np.ndarray`` (see :func:`_is_ndarray_annotation`), the list is
        converted via ``np.array(val, dtype=np.float64)``.
     2. **list → tuple** — when the field annotation represents ``tuple``
-       (see :func:`is_tuple_annotation`), the list is converted via
+       (see :func:`_is_tuple_annotation`), the list is converted via
        ``tuple(val)``.
     3. **dict → dataclass** — when the target type has a ``from_dict``
        classmethod, ``target_tp.from_dict(val)`` is called recursively.
@@ -118,22 +113,22 @@ def convert_field_value(val: object, target_tp: object) -> object:
         The value converted to the declared type.
 
     Examples:
-        >>> convert_field_value([1.0, 2.0, 3.0], np.ndarray)
+        >>> _convert_field_value([1.0, 2.0, 3.0], np.ndarray)
         array([1., 2., 3.])
 
-        >>> convert_field_value([15.0, 8.0], tuple[float, ...])
+        >>> _convert_field_value([15.0, 8.0], tuple[float, ...])
         (15.0, 8.0)
 
-        >>> convert_field_value({"path_dt": 0.066}, PlanningProfile)
+        >>> _convert_field_value({"path_dt": 0.066}, PlanningProfile)
         PlanningProfile(path_dt=0.066, ...)
     """
     if val is None:
         return None
 
     if isinstance(val, list):
-        if is_ndarray_annotation(target_tp):
+        if _is_ndarray_annotation(target_tp):
             return np.array(val, dtype=np.float64)
-        if is_tuple_annotation(target_tp):
+        if _is_tuple_annotation(target_tp):
             return tuple(val)
 
     if isinstance(val, dict) and hasattr(target_tp, "from_dict"):
@@ -152,7 +147,7 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
 
     Iterates over every ``dataclasses.field()`` of *cls*, looks up the
     corresponding key in *d*, converts the value via
-    :func:`convert_field_value` using the resolved type hint, and returns
+    :func:`_convert_field_value` using the resolved type hint, and returns
     a ``dict[str, object]`` suitable for ``cls(**kwargs)``.
 
     This is the shared implementation behind all ``from_dict(cls, d)``
@@ -183,7 +178,7 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
             continue
         val = d[f.name]
         target = hints.get(f.name, f.type)
-        kw[f.name] = convert_field_value(val, target)
+        kw[f.name] = _convert_field_value(val, target)
 
     return kw
 

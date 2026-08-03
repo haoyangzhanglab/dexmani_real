@@ -22,7 +22,7 @@ Refs:
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]
+__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]  # adaptive_retargeting_xhand: public for external pinky scaling
 
 import os
 import tempfile
@@ -40,7 +40,6 @@ from dex_retargeting.robot_wrapper import RobotWrapper
 from dex_retargeting.seq_retarget import SeqRetargeting
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.hand_utils import OPERATOR2MANO_RIGHT, estimate_frame_from_hand_points
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -58,6 +57,73 @@ _PINKY_MIN_EXTENSION = 0.03  # fully curled pinky MCP→TIP distance
 _PINKY_MAX_EXTENSION = 0.10  # fully extended pinky MCP→TIP distance
 _PINKY_BASE_SCALE = 1.2  # minimum scaling for curled state
 _PINKY_MAX_SCALE = 2.2  # maximum scaling for extended state
+
+# ── Operator-to-MANO coordinate transform ──
+# (inlined from utils/hand_utils.py — sole caller is retarget() below)
+
+# Operator→MANO coordinate transform (right hand).
+# det = -1: improper rotation includes a reflection for left→right hand chirality flip.
+_OPERATOR2MANO_RIGHT = np.array(
+    [
+        [0, 0, -1],
+        [-1, 0, 0],
+        [0, 1, 0],
+    ]
+)
+
+
+def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
+    """Estimate a palm coordinate frame (3×3 rotation matrix) from 21 hand landmarks.
+
+    Uses wrist + index MCP + middle MCP to fit a palm plane via SVD, then
+    constructs a right-handed orthonormal frame with x pointing from middle
+    MCP to wrist.  Returns the identity on any numerical failure.
+
+    Ref: LeFranX vr_hand_detector_adapter.py:293-342
+    """
+    keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
+    if keypoint_3d_array.shape != (21, 3):
+        raise ValueError(f"keypoint_3d_array must have shape (21, 3), got {keypoint_3d_array.shape}")
+
+    eps = 1e-8
+    points = keypoint_3d_array[[0, 5, 9], :].copy()
+
+    if not np.all(np.isfinite(points)):
+        return np.eye(3, dtype=np.float64)
+
+    x_vector = points[0] - points[2]  # wrist → middle MCP
+    points_centered = points - np.mean(points, axis=0, keepdims=True)
+
+    try:
+        _, _, v = np.linalg.svd(points_centered)
+    except np.linalg.LinAlgError:
+        return np.eye(3, dtype=np.float64)
+
+    normal = v[2, :]
+    normal_norm = np.linalg.norm(normal)
+    if normal_norm < eps:
+        return np.eye(3, dtype=np.float64)
+    normal = normal / normal_norm
+
+    # Gram-Schmidt
+    x = x_vector - np.sum(x_vector * normal) * normal
+    x_norm = np.linalg.norm(x)
+    if x_norm < eps:
+        return np.eye(3, dtype=np.float64)
+    x = x / x_norm
+
+    z = np.cross(x, normal)
+    z_norm = np.linalg.norm(z)
+    if z_norm < eps:
+        return np.eye(3, dtype=np.float64)
+    z = z / z_norm
+
+    # LeFranX: use index_mcp → middle_mcp as lateral reference
+    if np.sum(z * (points[1] - points[2])) < 0:
+        normal *= -1.0
+        z *= -1.0
+
+    return np.stack([x, normal, z], axis=1)
 
 
 def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
@@ -248,7 +314,7 @@ class XHandRetargeter:
         self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
         self._hand_ema_state: np.ndarray | None = None
 
-        self.sapien_joint_names = [
+        self.urdf_joint_names = [
             "right_hand_thumb_bend_joint",
             "right_hand_thumb_rota_joint1",
             "right_hand_thumb_rota_joint2",
@@ -331,12 +397,14 @@ class XHandRetargeter:
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
         self.retargeted_joint_order = np.array(
-            [retargeter_joint_names.index(name) for name in self.sapien_joint_names]
+            [retargeter_joint_names.index(name) for name in self.urdf_joint_names]
         ).astype(int)
 
     @property
     def low_pass_alpha(self) -> float:
-        """Current LPFilter alpha (new-value weight: 1.0 = pass-through, →0 = freeze)."""
+        """Current LPFilter alpha (new-value weight: 1.0 = pass-through, →0 = freeze).
+
+        Default from YAML config (low_pass_alpha: 0.1)."""
         return float(self.retargeter.filter.alpha)
 
     @low_pass_alpha.setter
@@ -381,8 +449,8 @@ class XHandRetargeter:
 
         # ── Coordinate transform: operator → MANO ──
         try:
-            wrist_rot = estimate_frame_from_hand_points(landmarks)
-            mano_landmarks = landmarks @ wrist_rot @ OPERATOR2MANO_RIGHT
+            wrist_rot = _estimate_palm_frame(landmarks)
+            mano_landmarks = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
         except (ValueError, TypeError, np.linalg.LinAlgError):
             logger.warning("Coordinate transform failed — holding hand position")
             return None
@@ -446,7 +514,7 @@ class XHandRetargeter:
         if initial_qpos is not None and initial_qpos.shape == (12,):
             qpos = np.asarray(initial_qpos, dtype=np.float32)
             if np.all(np.isfinite(qpos)):
-                # Remap from hardware joint order (sapien_joint_names) to
+                # Remap from hardware joint order (urdf_joint_names) to
                 # retargeter internal order before subsetting by pin2target.
                 qpos_retargeter = qpos[self.retargeted_joint_order]
                 idx = self.retargeter.optimizer.idx_pin2target

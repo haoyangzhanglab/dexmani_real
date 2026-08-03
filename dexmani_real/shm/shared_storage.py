@@ -132,7 +132,7 @@ class SharedStorage:
     """
 
     # ---- Rings: continuous streams, read-latest ----
-    camera_ring: CameraRingBuffer  # CameraProcess  -> PolicyProcess
+    camera_ring: CameraRingBuffer  # camera_loop  -> policy_loop
     vr_ring: SeqlockRingBuffer  # VRProcess      -> PolicyProcess
     arm_state_ring: SeqlockRingBuffer  # arm_loop     -> PolicyProcess
     hand_state_ring: SeqlockRingBuffer  # hand_loop    -> PolicyProcess
@@ -273,7 +273,15 @@ class SharedStorage:
         return storage
 
     def close(self) -> None:
-        """Release all shared memory and multiprocessing primitives."""
+        """Release all shared memory and multiprocessing primitives.
+
+        Calls ``close()`` (release fd) then ``unlink()`` (destroy the POSIX
+        shared-memory segment) on every ring.  ``unlink()`` is required to avoid
+        the "leaked shared_memory objects" warning from Python's resource tracker;
+        *close* alone only releases the local file descriptor — the kernel
+        segment (and the tracker registration) survives until ``unlink()`` is
+        called by the creating process.
+        """
         for ring in (
             self.camera_ring,
             self.vr_ring,
@@ -284,6 +292,7 @@ class SharedStorage:
         ):
             try:
                 ring.close()  # type: ignore[attr-defined]
+                ring.unlink()  # type: ignore[attr-defined]
             except Exception:
                 pass
 
@@ -297,7 +306,7 @@ class SharedStorage:
 
 
 def vr_frame_dtype() -> np.dtype:
-    """VR frame dtype — mirrors QuestHandTracker.convert_frame() output."""
+    """VR frame dtype — mirrors vr_receiver_process frame output."""
     return np.dtype(
         [
             ("wrist_pos", "<f8", (3,)),

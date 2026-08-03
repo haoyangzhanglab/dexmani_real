@@ -1,12 +1,12 @@
 """Fixed-size world-frame point cloud from aligned RGB-D — production pipeline.
 
 Driver-precomputed rays deprojection -> camera-frame depth gate
--> world transform -> single workspace crop -> 5 mm voxel -> radius outlier removal
--> fixed-size sample.
+-> depth edge filter (2-D gradient) -> world transform -> single workspace crop
+-> 5 mm voxel -> radius outlier removal -> fixed-size sample.
 
-Runs inside the CameraProcess child at 30 Hz; the same (num_points, 6) float32
-output is recorded to HDF5 (/pointcloud) and consumed by the policy loop, so
-training data and deployment observations are byte-identical by construction.
+Runs inside ``camera_loop`` at 30 Hz; the same (num_points, 6) float32 output is
+recorded to HDF5 (/pointcloud) and consumed by the policy loop, so training data
+and deployment observations are byte-identical by construction.
 
 Module-level imports are numpy-only (open3d / torch imported lazily inside
 methods, same pattern as pointcloud_utils._voxel_down_sample_o3d) so importing
@@ -48,9 +48,16 @@ class PointCloudProcessorConfig:
     max_open3d_input: int = 8000
     # "o3d": open3d CPU farthest_point_down_sample (~6.6 ms @ 5.3k -> 2048,
     # colors preserved — verified on open3d 0.19). "pytorch3d": GPU
-    # sample_farthest_points (~9 ms, B=1 underutilizes the GPU); only safe in the
-    # forked CameraProcess child if the parent never initialized CUDA pre-fork.
+    # sample_farthest_points (~9 ms, B=1 underutilizes the GPU); only safe in
+    # camera_loop if the parent never initialized CUDA pre-fork.
     fps_backend: Literal["o3d", "pytorch3d"] = "o3d"
+    # Depth edge filter: remove pixels at depth discontinuities before
+    # deprojection.  A pixel is on an edge when the magnitude of the depth
+    # gradient exceeds depth_edge_threshold_m.  The edge mask is dilated by
+    # depth_edge_dilate_px to widen the rejection band.
+    # Set threshold <= 0 to disable.
+    depth_edge_threshold_m: float = 0.020
+    depth_edge_dilate_px: int = 1
 
     def to_meta_dict(self) -> dict:
         """h5py-safe snapshot for /meta persistence (pc_* prefixed)."""
@@ -63,13 +70,15 @@ class PointCloudProcessorConfig:
             "pc_radius_outlier_min_points": int(self.radius_outlier_min_points),
             "pc_radius_outlier_radius": float(self.radius_outlier_radius),
             "pc_fps_backend": str(self.fps_backend),
+            "pc_depth_edge_threshold_m": float(self.depth_edge_threshold_m),
+            "pc_depth_edge_dilate_px": int(self.depth_edge_dilate_px),
         }
 
 
 class PointCloudProcessor:
     """Stateless-per-frame processor; extrinsics and RNG precomputed once."""
 
-    _timing_log_every: int = 30
+    _timing_log_every: int = 16
 
     def __init__(self, T_world_camera: np.ndarray, config: PointCloudProcessorConfig | None = None) -> None:
         T = np.asarray(T_world_camera, dtype=np.float64)
@@ -106,6 +115,26 @@ class PointCloudProcessor:
         # instead of deprojecting all 307k then throwing most away.
         z_flat = depth_m.ravel()
         mask = np.isfinite(z_flat) & (z_flat > cfg.depth_min_m) & (z_flat < cfg.depth_max_m)
+        if not np.any(mask):
+            return None
+
+        # Depth edge filter: remove pixels near depth discontinuities.
+        # Pixels straddling object boundaries mix foreground/background depth
+        # and produce 3-D points with large systematic error.  Gradient
+        # magnitude on the 2-D depth image reliably finds these edges.
+        if cfg.depth_edge_threshold_m > 0:
+            with np.errstate(invalid="ignore"):
+                gy, gx = np.gradient(depth_m)
+                grad_mag = np.sqrt(gx.astype(np.float64) ** 2 + gy.astype(np.float64) ** 2)
+            edge_2d = grad_mag > cfg.depth_edge_threshold_m  # NaN > thresh → False
+            if cfg.depth_edge_dilate_px > 0:
+                import cv2
+
+                k = 2 * cfg.depth_edge_dilate_px + 1
+                kernel = np.ones((k, k), dtype=np.uint8)
+                edge_2d = cv2.dilate(edge_2d.astype(np.uint8), kernel).astype(bool)
+            mask = mask & ~edge_2d.ravel()
+
         if not np.any(mask):
             return None
         # Deproject only valid pixels (rays precomputed by the driver).

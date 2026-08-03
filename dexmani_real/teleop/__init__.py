@@ -1,1 +1,1 @@
-"""VR teleoperation — controller state machine, pipeline, VR mappers, keyboard handler."""
+"""VR teleoperation — arm/hand mapping, keyboard handler, audio feedback."""

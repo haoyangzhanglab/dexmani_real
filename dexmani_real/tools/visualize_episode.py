@@ -254,7 +254,7 @@ class EpisodeVisualizer:
                 logger.warning("Point cloud disabled: no camera_K in /meta")
                 self._pc_enabled = False
 
-        # ── Pre-computed pointcloud (/pointcloud dataset from CameraProcess) ──
+        # ── Pre-computed pointcloud (/pointcloud dataset from camera_loop) ──
         # When available, this is preferred over the depth→pointcloud fallback:
         # points are already in world frame with baked-in extrinsics, filtered,
         # clustered, and FPS-downsampled to a fixed cardinality (2048).
@@ -576,7 +576,7 @@ class EpisodeVisualizer:
             rr.log("camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)))  # clamp outliers to stabilize colormap
 
         # ── 3D point cloud ──
-        # Pre-computed world-frame /pointcloud (from CameraProcess) takes priority
+        # Pre-computed world-frame /pointcloud (from camera_loop) takes priority
         # over the depth back-projection fallback.  /pointcloud is grid-aligned
         # (same T as state), so use step_idx directly — no cam_idx mapping needed.
         if self._has_precomputed_pc:
@@ -689,60 +689,210 @@ class EpisodeVisualizer:
 
 
 # ---------------------------------------------------------------------------
+# Tactile visualization (merged from visualize_tactile.py)
+# ---------------------------------------------------------------------------
+
+FINGER_NAMES = ["thumb", "index", "middle", "ring", "little"]
+
+
+def _load_tactile(path: str) -> tuple[np.ndarray, dict]:
+    with EpisodeReader(path) as reader:
+        f = reader.h5f
+        if "hand_tactile_force" not in f:
+            raise KeyError("hand_tactile_force dataset not found — episode recorded before tactile was saved")
+        tactile = f["hand_tactile_force"][:]  # (T, 5, 120, 3)
+        meta = dict(f["meta"].attrs)
+    return tactile, meta
+
+
+def _force_magnitude(tactile: np.ndarray) -> np.ndarray:
+    """L2 norm across 3 force axes → (T, 5, 120)."""
+    return np.linalg.norm(tactile, axis=-1)
+
+
+def _tactile_force_timeline(args: argparse.Namespace) -> None:
+    import matplotlib.pyplot as plt
+
+    tactile, meta = _load_tactile(args.episode)
+    mag = _force_magnitude(tactile)
+    total = mag.sum(axis=-1)  # (T, 5)
+
+    fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
+    t = np.arange(len(total)) / fps
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for i, name in enumerate(FINGER_NAMES):
+        ax.plot(t, total[:, i], label=name, linewidth=0.8)
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Total force (Newtons)")
+    ax.set_title(f"Per-finger Tactile Force — {Path(args.episode).name}")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    if args.mark_contacts:
+        threshold = args.threshold if args.threshold > 0 else np.percentile(total[total > 0], 50) if np.any(total > 0) else 1.0
+        for i in range(5):
+            contact = total[:, i] > threshold
+            changes = np.diff(contact.astype(int))
+            starts = np.where(changes == 1)[0] + 1
+            for s in starts:
+                ax.axvline(t[s], color=f"C{i}", alpha=0.15, linewidth=0.5)
+
+    plt.tight_layout()
+    if args.output:
+        plt.savefig(args.output, dpi=150)
+        print(f"Saved {args.output}")
+    else:
+        plt.show()
+
+
+def _tactile_force_heatmap(args: argparse.Namespace) -> None:
+    import matplotlib.pyplot as plt
+
+    tactile, meta = _load_tactile(args.episode)
+    mag = _force_magnitude(tactile)
+
+    frame = args.frame if args.frame is not None else len(mag) // 2
+    if frame < 0 or frame >= len(mag):
+        raise ValueError(f"frame {frame} out of range [0, {len(mag) - 1}]")
+    frame_data = mag[frame]  # (5, 120)
+
+    fig, axes = plt.subplots(5, 1, figsize=(14, 8), sharex=True)
+    vmax = max(np.percentile(frame_data[frame_data > 0], 95) if np.any(frame_data > 0) else 1.0, 1.0)
+
+    for i, (ax, name) in enumerate(zip(axes, FINGER_NAMES)):
+        row = frame_data[i].reshape(1, -1)
+        im = ax.imshow(row, aspect="auto", cmap="YlOrRd", vmin=0, vmax=vmax)
+        ax.set_ylabel(name, rotation=0, labelpad=25, va="center")
+
+    axes[-1].set_xlabel("Sensor index (0–119)")
+    fig.suptitle(f"Tactile Force Heatmap — frame {frame} — {Path(args.episode).name}", fontsize=11)
+    fig.colorbar(im, ax=axes, label="Force magnitude (N)", shrink=0.6)
+
+    plt.tight_layout()
+    if args.output:
+        plt.savefig(args.output, dpi=150)
+        print(f"Saved {args.output}")
+    else:
+        plt.show()
+
+
+def _tactile_force_3axis(args: argparse.Namespace) -> None:
+    import matplotlib.pyplot as plt
+
+    tactile, meta = _load_tactile(args.episode)
+    finger = args.finger if args.finger in FINGER_NAMES else "thumb"
+    idx = FINGER_NAMES.index(finger)
+    fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
+
+    finger_total = tactile[:, idx, :, :].sum(axis=1)  # (T, 3)
+    t = np.arange(len(finger_total)) / fps
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
+    for ax, axis_name, color in zip(axes, ["fx", "fy", "fz"], ["#d62728", "#2ca02c", "#1f77b4"]):
+        ax.plot(t, finger_total[:, ["fx", "fy", "fz"].index(axis_name)], color=color, linewidth=0.6)
+        ax.set_ylabel(axis_name)
+        ax.grid(True, alpha=0.3)
+        ax.axhline(y=0, color="gray", linewidth=0.5)
+
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle(f"3-Axis Force — {finger} — {Path(args.episode).name}", fontsize=11)
+
+    plt.tight_layout()
+    if args.output:
+        plt.savefig(args.output, dpi=150)
+        print(f"Saved {args.output}")
+    else:
+        plt.show()
+
+
+def _tactile_contact_frames(args: argparse.Namespace) -> None:
+    tactile, meta = _load_tactile(args.episode)
+    mag = _force_magnitude(tactile)
+    total = mag.sum(axis=-1)  # (T, 5)
+
+    threshold = args.threshold if args.threshold > 0 else 1.0
+    fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
+
+    print(f"{'frame':>6s}  {'time_s':>8s}  " + "  ".join(f"{n:>8s}" for n in FINGER_NAMES))
+    print("-" * (6 + 1 + 8 + 1 + 5 * 9))
+
+    in_contact = np.any(total > threshold, axis=1)
+    transitions = np.diff(in_contact.astype(int))
+    starts = np.where(transitions == 1)[0] + 1
+    ends = np.where(transitions == -1)[0] + 1
+
+    if len(starts) == 0:
+        print(f"(no contact detected at threshold {threshold:.1f})")
+        return
+
+    print(f"Contact events (threshold={threshold:.1f}):")
+    for i, (s, e) in enumerate(zip(starts, ends[:len(starts)])):
+        duration = (e - s) / fps
+        fingers_in_contact = [FINGER_NAMES[j] for j in range(5) if np.any(total[s:e, j] > threshold)]
+        print(f"  #{i+1}: frame {s:>5d}–{e:>5d}  ({duration:.1f}s)  fingers: {', '.join(fingers_in_contact)}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize a DexMani HDF5 teleop episode with Rerun.")
-    parser.add_argument(
-        "episode",
-        type=str,
-        help="Path to episode (.h5 file or directory with data.h5 + depth.h5 + rgb.mp4).",
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Limit number of state frames to load.",
-    )
-    parser.add_argument(
-        "--depth-scale",
-        type=float,
-        default=None,
-        help="Raw depth units in meters (overrides /meta depth_scale; L515 legacy: 0.00025).",
-    )
-    parser.add_argument(
-        "--info",
-        action="store_true",
-        help="Print HDF5 structure summary and exit (no Rerun needed).",
-    )
-    parser.add_argument(
-        "--point-cloud",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable 3D point cloud from depth (default: on when depth+K available).",
-    )
-    parser.add_argument(
-        "--pc-stride",
-        type=int,
-        default=4,
-        help="Pixel stride for point cloud downsampling (default: 4; 1=full res).",
-    )
-    parser.add_argument(
-        "--pc-min-depth",
-        type=float,
-        default=0.1,
-        help="Min depth for point cloud filtering in meters (default: 0.1).",
-    )
-    parser.add_argument(
-        "--pc-max-depth",
-        type=float,
-        default=2.0,
-        help="Max depth for point cloud filtering in meters (default: 2.0).",
-    )
+    parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes (Rerun 3D + tactile plots).")
+    sub = parser.add_subparsers(dest="command")
+
+    # ── visualize (default: Rerun 3D) ──
+    vis = sub.add_parser("visualize", help="Rerun-based 3D interactive viewer")
+    vis.add_argument("episode", type=str, help="Path to episode (.h5 file or directory).")
+    vis.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
+    vis.add_argument("--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale).")
+    vis.add_argument("--info", action="store_true", help="Print HDF5 structure summary and exit (no Rerun needed).")
+    vis.add_argument("--point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Enable 3D point cloud from depth.")
+    vis.add_argument("--pc-stride", type=int, default=4, help="Pixel stride for point cloud downsampling (default: 4).")
+    vis.add_argument("--pc-min-depth", type=float, default=0.1, help="Min depth for point cloud filtering in meters (default: 0.1).")
+    vis.add_argument("--pc-max-depth", type=float, default=2.0, help="Max depth for point cloud filtering in meters (default: 2.0).")
+
+    # ── tactile ──
+    tac = sub.add_parser("tactile", help="Matplotlib tactile force plots")
+    tac.add_argument("episode", type=str, help="Path to .h5 episode file")
+    tac_sub = tac.add_subparsers(dest="tactile_command", required=True)
+
+    t1 = tac_sub.add_parser("force_timeline", help="Per-finger total force over time")
+    t1.add_argument("--threshold", type=float, default=0.0, help="Contact threshold (Newtons; default=auto)")
+    t1.add_argument("--mark-contacts", action="store_true", help="Mark contact start frames")
+    t1.add_argument("-o", "--output", help="Save to file instead of showing")
+
+    t2 = tac_sub.add_parser("force_heatmap", help="Force magnitude heatmap for one frame")
+    t2.add_argument("--frame", type=int, help="Frame index (default=midpoint)")
+    t2.add_argument("-o", "--output", help="Save to file instead of showing")
+
+    t3 = tac_sub.add_parser("force_3axis", help="fx/fy/fz breakdown for one finger")
+    t3.add_argument("--finger", choices=FINGER_NAMES, default="thumb")
+    t3.add_argument("-o", "--output", help="Save to file instead of showing")
+
+    t4 = tac_sub.add_parser("contact_frames", help="List contact events")
+    t4.add_argument("--threshold", type=float, default=1.0, help="Contact threshold (Newtons)")
+
     args = parser.parse_args()
 
+    # ── Backward compat: if no subcommand given, default to visualize ──
+    if args.command is None:
+        logger.warning("No subcommand given — defaulting to 'visualize'. Use 'visualize' or 'tactile'.")
+        args.command = "visualize"
+
+    if args.command == "tactile":
+        _TACTILE_DISPATCH = {
+            "force_timeline": _tactile_force_timeline,
+            "force_heatmap": _tactile_force_heatmap,
+            "force_3axis": _tactile_force_3axis,
+            "contact_frames": _tactile_contact_frames,
+        }
+        _TACTILE_DISPATCH[args.tactile_command](args)
+        return
+
+    # visualize
     h5_path = Path(args.episode).expanduser().resolve()
     if not h5_path.exists():
         logger.error("Episode not found: %s", h5_path)

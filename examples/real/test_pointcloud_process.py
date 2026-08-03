@@ -53,12 +53,20 @@ CLUSTER_MIN_SIZE = 30
 # padding of existing points.
 TARGET_POINTS = 2048
 
+# Depth edge filter: pixels at depth discontinuities have large systematic
+# error.  Gradient magnitude > EDGE_THRESHOLD_M on the 2-D depth image marks
+# an edge; the mask is dilated by EDGE_DILATE_PX to widen the rejection band.
+# Set EDGE_THRESHOLD_M <= 0 to disable.
+EDGE_THRESHOLD_M = 0.020
+EDGE_DILATE_PX = 1
+
 
 def _show_rgbd_panels(
     rgb_bgr: np.ndarray,
     depth_m: np.ndarray,
+    edge_vis: np.ndarray | None = None,
 ) -> None:
-    """Show RGB and depth side by side."""
+    """Show RGB, depth, and optional edge mask side by side."""
     if not USE_RGBD_VIS:
         return
 
@@ -68,10 +76,12 @@ def _show_rgbd_panels(
         print("  RGBD visualization skipped: OpenCV is unavailable.")
         return
 
-    panels = [
+    panels: list[tuple[str, np.ndarray]] = [
         ("RGB", rgb_bgr),
         ("Depth", make_depth_vis(depth_m, 0.3, 2.5)),
     ]
+    if edge_vis is not None:
+        panels.append(("Edge mask (red=core, yellow=dilated)", edge_vis))
 
     labeled: list[np.ndarray] = []
     for title, image in panels:
@@ -89,7 +99,7 @@ def _show_rgbd_panels(
         labeled.append(canvas)
 
     try:
-        print("\nShowing RGBD window (RGB | depth) — press any key to continue...")
+        print("\nShowing RGBD window — press any key to continue...")
         cv2.imshow("L515 RGBD diagnostic", np.hstack(labeled))
         cv2.waitKey(0)
         cv2.destroyAllWindows()
@@ -199,37 +209,64 @@ def main() -> None:
 
         depth_for_pointcloud = depth_m
 
-        _show_rgbd_panels(rgb_bgr, depth_m)
-
-        # Camera-frame point cloud.
+        # Camera-frame point cloud — gate in 2-D before deprojection.
+        # Production pipeline order (PointCloudProcessor.process):
+        #   depth gate → depth edge filter → deproject → world transform → crop
         print("\nGenerating camera-frame point cloud...")
-        # Unit rays precomputed by the driver at connect (edge-LUT pattern):
-        # per-frame deprojection is a single multiply — ~10x cheaper than
-        # rebuilding meshgrid + inv(K) every frame.
         rays_cam = camera.get_rays()
         if rays_cam.shape[:2] != depth_for_pointcloud.shape:
             raise RuntimeError(f"rays shape {rays_cam.shape[:2]} does not match depth {depth_for_pointcloud.shape}.")
-        points_cam = rays_cam * depth_for_pointcloud[..., None]
 
-        points_flat = points_cam.reshape(-1, 3)
-        colors_flat = (rgb.astype(np.float64) / 255.0).reshape(-1, 3)
-        z_cam = points_flat[:, 2]
+        total_pixels = depth_for_pointcloud.size
 
-        # Camera-frame depth gate.
-        # Lower bound 0.3 m: sensor physics — L515 spec min-Z is 0.25 m (+ margin);
-        # closer returns are unreliable ToF data regardless of workspace.
-        # Upper bound 1.5 m: workspace geometry — farthest workspace-crop corner is
-        # z_cam = 1.34 m under current cameras.json extrinsics (+ ~0.15 m margin);
-        # points beyond can never survive the world-frame crop. Re-derive if the
-        # camera pose or crop box changes.
-        valid = np.isfinite(points_flat).all(axis=1) & (z_cam > 0.3) & (z_cam < 1.5)
-        pts_cam = points_flat[valid]
-        col_cam = colors_flat[valid]
+        # --- 1. Depth range gate (2-D, before deprojection) ---
+        z_flat = depth_for_pointcloud.ravel()
+        mask = np.isfinite(z_flat) & (z_flat > 0.3) & (z_flat < 1.5)
+        n_depth_gate = int(mask.sum())
+        print(f"  Depth gate [0.3, 1.5]m:       {n_depth_gate:6d} / {total_pixels} pixels")
 
-        print(f"  Valid depth range [0.3, 1.5]m: {int(valid.sum())} / {valid.size} points")
-        print(f"  Camera-frame points: {pts_cam.shape[0]}")
-        if pts_cam.shape[0] == 0:
-            raise RuntimeError("No valid camera-frame points remain.")
+        # --- 2. Depth edge filter (2-D, before deprojection) ---
+        edge_vis: np.ndarray | None = None  # for diagnostic overlay
+        if EDGE_THRESHOLD_M > 0:
+            with np.errstate(invalid="ignore"):
+                gy, gx = np.gradient(depth_for_pointcloud)
+                grad_mag = np.sqrt(gx.astype(np.float64) ** 2 + gy.astype(np.float64) ** 2)
+            edge_2d = grad_mag > EDGE_THRESHOLD_M
+            n_edge = int(edge_2d.sum())
+            # Save undilated edge mask for visualization (before dilation widens it).
+            edge_raw_vis = edge_2d.copy()
+            if EDGE_DILATE_PX > 0:
+                import cv2
+
+                k = 2 * EDGE_DILATE_PX + 1
+                kernel = np.ones((k, k), dtype=np.uint8)
+                edge_2d = cv2.dilate(edge_2d.astype(np.uint8), kernel).astype(bool)
+            n_before_edge = int(mask.sum())
+            mask = mask & ~edge_2d.ravel()
+            n_after_edge = int(mask.sum())
+            n_edge_dilated = int(edge_2d.sum())
+            print(
+                f"  Depth edge filter (>{EDGE_THRESHOLD_M*1000:.0f}mm, dilate={EDGE_DILATE_PX}): "
+                f"{n_before_edge - n_after_edge:6d} removed "
+                f"(raw edges={n_edge}, dilated={n_edge_dilated}), "
+                f"{n_after_edge:6d} survive"
+            )
+            # Build edge overlay: grey = kept, red = raw edge, yellow = dilated-only
+            edge_vis = np.full((*depth_for_pointcloud.shape, 3), 128, dtype=np.uint8)
+            edge_vis[edge_raw_vis] = [0, 0, 255]  # red: raw edge core
+            edge_vis[edge_2d & ~edge_raw_vis] = [0, 255, 255]  # yellow: dilation band
+        else:
+            print("  Depth edge filter:              DISABLED")
+
+        _show_rgbd_panels(rgb_bgr, depth_m, edge_vis)
+
+        if not np.any(mask):
+            raise RuntimeError("No pixels survived 2-D gates — check depth range or edge threshold.")
+
+        # --- 3. Deproject surviving pixels ---
+        pts_cam = (rays_cam.reshape(-1, 3)[mask] * z_flat[mask, None]).astype(np.float64)
+        col_cam = (rgb.astype(np.float64) / 255.0).reshape(-1, 3)[mask]
+        print(f"  Camera-frame points:            {pts_cam.shape[0]:6d}")
 
         # Transform to world frame.
         print("\nLoading extrinsics from cameras.json...")

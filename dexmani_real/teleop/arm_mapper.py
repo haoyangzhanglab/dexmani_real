@@ -171,7 +171,7 @@ class ArmWristMapper:
 
         if norm_2d < 1e-6:
             logger.warning(
-                "set_heading: head forward nearly vertical (norm_2d=%.2e), " "keeping current heading",
+                "set_heading: head forward nearly vertical (norm_2d=%.2e), keeping current heading",
                 norm_2d,
             )
             return

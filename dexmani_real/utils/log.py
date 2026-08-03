@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-__all__ = ["get_logger"]
+__all__ = ["get_logger", "ThrottledWarner"]
 
 import logging
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 _FORMATTER = logging.Formatter(
     "[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
@@ -19,6 +20,9 @@ _FORMATTER = logging.Formatter(
 # failed — logging then falls back to stdout only.
 _file_handler: logging.FileHandler | None = None
 _file_handler_init = False
+
+# Module-level logger — used by ThrottledWarner.
+_logger = logging.getLogger(__name__)
 
 
 def _get_file_handler() -> logging.FileHandler | None:
@@ -54,3 +58,22 @@ def get_logger(name: str) -> logging.Logger:
                 logger.addHandler(file_handler)
             logger.setLevel(logging.INFO)
     return logger
+
+
+class ThrottledWarner:
+    """Callable that forwards to ``logger.warning`` at most once per *interval_s*.
+
+    Used in hot-path loops to avoid log spam from per-tick conditions
+    (torn reads, stale state, producer mismatch).  Default interval: 5.0 s.
+    """
+
+    def __init__(self, interval_s: float = 5.0) -> None:
+        self._interval_ns = int(interval_s * 1e9)
+        self._last_ns = 0
+
+    def __call__(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        now_ns = time.monotonic_ns()
+        if now_ns - self._last_ns < self._interval_ns:
+            return
+        self._last_ns = now_ns
+        _logger.warning(msg, *args, **kwargs)

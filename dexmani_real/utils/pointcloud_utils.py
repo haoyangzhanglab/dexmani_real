@@ -1,4 +1,4 @@
-"""Point cloud utilities — depth validity masking, depth-to-pointcloud, FPS sampling, voxel downsampling."""
+"""Point cloud utilities — intrinsics helpers, depth-to-pointcloud pipeline, FPS sampling, voxel downsampling."""
 
 from __future__ import annotations
 
@@ -28,14 +28,12 @@ class PointCloudConfig:
     return_tensor: bool = True
 
     def __post_init__(self) -> None:
-        # object.__setattr__ bypasses frozen=True in __post_init__ to normalize
-        # the workspace tuple after construction.
         if self.sampling not in ("none", "random", "fps", "first"):
             raise ValueError("sampling must be one of: 'none', 'random', 'fps', 'first'.")
         if self.voxel_size is not None and self.voxel_size <= 0:
             raise ValueError("voxel_size must be positive or None.")
         if self.workspace is not None:
-            object.__setattr__(self, "workspace", check_workspace(self.workspace))
+            object.__setattr__(self, "workspace", check_workspace(self.workspace))  # bypass frozen
 
 
 def to_numpy(value: Any) -> Any:
@@ -103,202 +101,12 @@ def check_workspace(workspace: Sequence[float] | None) -> tuple[float, float, fl
 
 
 def depth_to_meters(depth: ArrayLike, depth_scale: float | None = None) -> np.ndarray:
-    """Convert depth to meters. Float input is assumed metric (passthrough).
-
-    Integer (raw uint16) input is multiplied by ``depth_scale`` — the sensor's
-    depth units in meters (L515: 0.00025, from episode /meta ``depth_scale``).
-    Defaults to 0.001 (1 mm) when not given, for backward compatibility.
-    """
+    """Convert depth to float32 meters. Integer input × depth_scale (default 0.001); float input passthrough."""
     depth_array = to_numpy(depth)
     if np.issubdtype(depth_array.dtype, np.integer):
         scale = 0.001 if depth_scale is None else float(depth_scale)
         return depth_array.astype(np.float32) * scale
     return depth_array.astype(np.float32)
-
-
-@dataclass(frozen=True)
-class DepthEdgeConfig:
-    """Depth-discontinuity band zeroing (native depth domain, before alignment).
-
-    Per-pixel threshold: T_edge(z) = clip(n_sigma * sigma_z(z), t_min, t_max),
-    where sigma_z(z) = sigma_poly[0] + sigma_poly[1]*z + ... (meters, low order
-    first) is the planar depth std at distance z — calibrate it from per-pixel
-    TEMPORAL std over a static plane. Defaults reproduce the 8-12 mm
-    experimental window at 0.5-1.0 m and must be calibrated for real use.
-    t_max must stay below the minimum object height the system must keep
-    (~0.8x is a reasonable margin); None disables the clamp.
-    """
-
-    sigma_poly: tuple[float, ...] = (0.0010, 0.0012)  # sigma_z(z) = c0 + c1*z + ... (meters)
-    n_sigma: float = 5.0
-    t_min: float = 0.008  # threshold floor (m)
-    t_max: float | None = None  # threshold ceiling (m), ~0.8x min object height
-    dilate_px: int = 1  # edge-band dilation radius (band width ~= 2 + 2*dilate_px)
-
-    def __post_init__(self) -> None:
-        if len(self.sigma_poly) == 0:
-            raise ValueError("sigma_poly must have at least one coefficient.")
-        if self.t_min <= 0:
-            raise ValueError("t_min must be positive.")
-        if self.t_max is not None and self.t_max < self.t_min:
-            raise ValueError("t_max must be >= t_min.")
-        if self.dilate_px < 0:
-            raise ValueError("dilate_px must be >= 0.")
-
-
-def build_edge_threshold_lut(depth_scale: float, config: DepthEdgeConfig) -> np.ndarray:
-    """Precompute a (65536,) uint16 LUT: raw depth value -> T_edge in raw units.
-
-    Built once per connect (depth_scale = depth_units); per frame the
-    z-dependent threshold is then a single uint16 gather with no float math.
-    """
-    if depth_scale <= 0:
-        raise ValueError("depth_scale must be positive.")
-    z = np.arange(65536, dtype=np.float64) * float(depth_scale)
-    sigma = np.zeros_like(z)
-    for coeff in reversed(config.sigma_poly):  # Horner
-        sigma = sigma * z + float(coeff)
-    t = np.maximum(config.n_sigma * sigma, config.t_min)
-    if config.t_max is not None:
-        t = np.minimum(t, config.t_max)
-    return np.clip(np.rint(t / depth_scale), 1, 65535).astype(np.uint16)
-
-
-def compute_depth_edge_mask(
-    depth_raw: ArrayLike,
-    t_lut: np.ndarray,
-    dilate_px: int = 1,
-    scratch: dict | None = None,
-) -> np.ndarray:
-    """Depth-discontinuity band mask (True = zero this pixel), native depth domain.
-
-    Exact 8-neighbour max jump via morphology, entirely in uint16 raw units:
-        jump(p) = max_{q in N8(p), q valid} |z(p) - z(q)|
-                = max( dilate3(z)(p) - z(p),  z(p) - erode3(z - 1)(p) - 1 )
-    The min side erodes (z - 1): the uint16 wrap sends invalid pixels (raw 0)
-    to 65535 — the neutral element for min — and shifts valid values by -1,
-    which the trailing -1 subtracts back, so the result is exactly the min
-    over valid neighbours and hole boundaries are NOT flagged as edges. For a
-    valid center the 3x3 window contains the center itself, hence
-    dilate >= z and erode(z-1) <= z-1, so the uint16 differences cannot
-    underflow; invalid centers may wrap but are removed by ``& valid``.
-
-    ``scratch``: optional dict reused across calls to avoid per-frame temp
-    allocations (~2x faster at XGA). Pass a dict owned by the caller — one
-    per camera/thread, NOT shared — it is (re)populated lazily on shape
-    change. None keeps the allocate-per-call behavior.
-
-    Call on RAW depth with confidence/IR-rejected pixels already zeroed, and
-    BEFORE any alignment — resampling mixes depth/RGB/occlusion boundaries.
-    """
-    import cv2
-
-    depth_array = to_numpy(depth_raw)
-    if depth_array.ndim != 2 or depth_array.dtype != np.uint16:
-        raise ValueError(f"depth_raw must be (H, W) uint16, got {depth_array.shape} {depth_array.dtype}.")
-    t_lut = np.asarray(t_lut)
-    if t_lut.shape != (65536,) or t_lut.dtype != np.uint16:
-        raise ValueError("t_lut must be the (65536,) uint16 array from build_edge_threshold_lut().")
-
-    if scratch is None:
-        scratch = {}
-    if scratch.get("max") is None or scratch["max"].shape != depth_array.shape:
-        for name in ("zmin", "max", "min", "a", "b", "t"):
-            scratch[name] = np.empty_like(depth_array)
-
-    valid = depth_array != 0
-    np.subtract(depth_array, np.uint16(1), out=scratch["zmin"])
-    kernel3 = np.ones((3, 3), dtype=np.uint8)
-    cv2.dilate(depth_array, kernel3, dst=scratch["max"])
-    cv2.erode(scratch["zmin"], kernel3, dst=scratch["min"])
-    np.subtract(scratch["max"], depth_array, out=scratch["a"])
-    np.subtract(depth_array, scratch["min"], out=scratch["b"])
-    np.subtract(scratch["b"], np.uint16(1), out=scratch["b"])
-    np.maximum(scratch["a"], scratch["b"], out=scratch["a"])
-    np.take(t_lut, depth_array, out=scratch["t"])
-
-    edge = (scratch["a"] > scratch["t"]) & valid
-    if dilate_px > 0 and edge.any():
-        size = 2 * dilate_px + 1
-        edge = cv2.dilate(edge.astype(np.uint8), np.ones((size, size), dtype=np.uint8)).astype(bool)
-    return edge
-
-
-@dataclass(frozen=True)
-class DepthValidityConfig:
-    """Image-domain depth validity thresholds (confidence / IR gating, L515-oriented).
-
-    Thresholds are sensor-specific — defaults are conservative starting points for
-    the L515 (8-bit IR). Set a field to None to disable that sub-check.
-    """
-
-    confidence_min: int | None = 2  # keep pixels with confidence >= this
-    ir_min: int | None = 2  # reject extremely low IR return (weak echo)
-    ir_saturation: int | None = 250  # reject saturated IR (overexposure / specular)
-    saturation_dilate_px: int = 3  # dilate saturation mask to kill the specular halo
-    edge: DepthEdgeConfig | None = None  # depth-discontinuity band zeroing (None = off)
-
-    def __post_init__(self) -> None:
-        if self.saturation_dilate_px < 0:
-            raise ValueError("saturation_dilate_px must be >= 0.")
-
-
-def compute_depth_valid_mask(
-    depth: ArrayLike,
-    confidence: ArrayLike | None = None,
-    ir: ArrayLike | None = None,
-    config: DepthValidityConfig | None = None,
-) -> np.ndarray:
-    """Per-pixel (H, W) bool validity mask: depth > 0, confidence gate, IR gate.
-
-    The IR gate rejects extremely low return (ir < ir_min) and saturation
-    (ir >= ir_saturation) — the saturation mask is dilated by saturation_dilate_px
-    so the corrupted halo around specular highlights is removed too. IR saturation
-    and specular reflection produce dense, mixed-direction depth spikes that 3-D
-    outlier removal cannot catch, hence this image-space mask.
-
-    `confidence`/`ir` must be pixel-registered with `depth`. On L515 they are
-    registered with the RAW depth frame; when streaming with
-    align_mode="depth_to_color", apply this mask to the raw depth (invalid -> 0)
-    BEFORE rs.align — zeroed pixels do not project through alignment.
-    """
-    if config is None:
-        config = DepthValidityConfig()
-
-    depth_array = to_numpy(depth)
-    if depth_array.ndim != 2:
-        raise ValueError(f"depth must have shape (H, W), got {depth_array.shape}.")
-    valid = depth_array > 0
-
-    if confidence is not None and config.confidence_min is not None:
-        conf = to_numpy(confidence)
-        if conf.shape != depth_array.shape:
-            raise ValueError(
-                f"confidence shape {conf.shape} must match depth shape {depth_array.shape}; "
-                "confidence is registered to the raw depth frame — mask before alignment."
-            )
-        valid &= conf >= config.confidence_min
-
-    if ir is not None:
-        ir_array = to_numpy(ir)
-        if ir_array.shape != depth_array.shape:
-            raise ValueError(
-                f"ir shape {ir_array.shape} must match depth shape {depth_array.shape}; "
-                "IR is registered to the raw depth frame — mask before alignment."
-            )
-        if config.ir_min is not None:
-            valid &= ir_array >= config.ir_min
-        if config.ir_saturation is not None:
-            saturated = ir_array >= config.ir_saturation
-            if config.saturation_dilate_px > 0 and saturated.any():
-                import cv2
-
-                kernel_size = 2 * config.saturation_dilate_px + 1
-                kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-                saturated = cv2.dilate(saturated.astype(np.uint8), kernel).astype(bool)
-            valid &= ~saturated
-
-    return valid
 
 
 def make_rays(height: int, width: int, K: ArrayLike, device: str = "cpu") -> torch.Tensor:
@@ -393,19 +201,10 @@ def voxel_down_sample(
     colors: torch.Tensor | None = None,
     voxel_size: float = 0.005,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Voxel downsampling — average points within each voxel. Returns (points, colors).
-
-    Should be called before sample_points so that subsequent FPS selects from
-    spatially uniform voxel centers. Prefers open3d C++ (~1ms) over torch (~300ms/250k points).
-    """
+    """Voxel-average downsampling via Open3D."""
     if points.shape[0] == 0 or voxel_size <= 0:
         return points, colors
-
-    # Prefer open3d (100x+ faster than torch scatter on CPU)
-    try:
-        return _voxel_down_sample_o3d(points, colors, voxel_size)
-    except ImportError:
-        return _voxel_down_sample_torch(points, colors, voxel_size)
+    return _voxel_down_sample_o3d(points, colors, voxel_size)
 
 
 def _voxel_down_sample_o3d(
@@ -429,32 +228,6 @@ def _voxel_down_sample_o3d(
     new_colors = None
     if colors is not None and pcd.has_colors():
         new_colors = torch.as_tensor(np.asarray(pcd.colors), dtype=colors.dtype, device=colors.device)
-
-    return new_points, new_colors
-
-
-def _voxel_down_sample_torch(
-    points: torch.Tensor,
-    colors: torch.Tensor | None,
-    voxel_size: float,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    voxel_ijk = (points / voxel_size).floor().long()
-    unique_voxels, inverse = voxel_ijk.unique(dim=0, return_inverse=True)
-    n_voxels = unique_voxels.shape[0]
-
-    new_points = torch.zeros(n_voxels, 3, device=points.device, dtype=torch.float32)
-    new_points.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, 3), points.float())
-    count = torch.zeros(n_voxels, device=points.device, dtype=torch.float32)
-    count.scatter_add_(0, inverse, torch.ones(points.shape[0], device=points.device, dtype=torch.float32))
-    new_points /= count.unsqueeze(-1)
-    new_points = new_points.to(points.dtype)
-
-    new_colors = None
-    if colors is not None:
-        new_colors = torch.zeros(n_voxels, 3, device=colors.device, dtype=torch.float32)
-        new_colors.scatter_add_(0, inverse.unsqueeze(-1).expand(-1, 3), colors.float())
-        new_colors /= count.unsqueeze(-1)
-        new_colors = new_colors.to(colors.dtype)
 
     return new_points, new_colors
 
@@ -484,8 +257,6 @@ def sample_points(
         try:
             import pytorch3d.ops as torch3d_ops
 
-            # Try GPU path first (if available and points are on CPU).
-            # Fall back to CPU if the pytorch3d extension lacks GPU support.
             if torch.cuda.is_available() and points.device.type == "cpu":
                 try:
                     pts_gpu = points.cuda()
@@ -497,7 +268,6 @@ def sample_points(
                 try:
                     index = torch3d_ops.sample_farthest_points(points[None], K=npoints)[1][0]
                 except RuntimeError:
-                    # pytorch3d lacks GPU support — move to CPU and retry
                     pts_cpu = points.cpu()
                     index = torch3d_ops.sample_farthest_points(pts_cpu[None], K=npoints)[1][0]
         except ImportError:
@@ -528,9 +298,6 @@ def rgbd_to_pointcloud(
     rgb: ArrayLike | None = None,
     *,
     rays: ArrayLike | None = None,
-    confidence: ArrayLike | None = None,
-    ir: ArrayLike | None = None,
-    validity: DepthValidityConfig | None = None,
     config: PointCloudConfig | None = None,
     T_out_camera: ArrayLike | None = None,
     workspace: Sequence[float] | None = None,
@@ -546,33 +313,30 @@ def rgbd_to_pointcloud(
     if config is None:
         config = PointCloudConfig()
 
+    overrides: dict[str, Any] = {}
     if workspace is not None:
-        config = replace(config, workspace=check_workspace(workspace))
+        overrides["workspace"] = check_workspace(workspace)
     if npoints is not None:
-        config = replace(config, npoints=npoints)
+        overrides["npoints"] = npoints
     if min_depth is not None:
-        config = replace(config, min_depth=min_depth)
+        overrides["min_depth"] = min_depth
     if max_depth is not None:
-        config = replace(config, max_depth=max_depth)
+        overrides["max_depth"] = max_depth
     if sampling is not None:
-        config = replace(config, sampling=sampling)
+        overrides["sampling"] = sampling
     if voxel_size is not None:
-        config = replace(config, voxel_size=voxel_size)
+        overrides["voxel_size"] = voxel_size
     if device is not None:
-        config = replace(config, device=device)
+        overrides["device"] = device
     if return_tensor is not None:
-        config = replace(config, return_tensor=return_tensor)
+        overrides["return_tensor"] = return_tensor
+    if overrides:
+        config = replace(config, **overrides)
 
     depth_m = depth_to_meters(depth, depth_scale=depth_scale)
     if depth_m.ndim != 2:
         raise ValueError(f"depth must have shape (H, W), got {depth_m.shape}.")
     height, width = int(depth_m.shape[0]), int(depth_m.shape[1])
-
-    if confidence is not None or ir is not None:
-        # Image-domain validity gate (confidence + IR) — invalid pixels -> 0,
-        # dropped by filter_points_by_depth after back-projection.
-        valid = compute_depth_valid_mask(depth_m, confidence=confidence, ir=ir, config=validity)
-        depth_m = np.where(valid, depth_m, np.float32(0.0))
 
     points = depth_to_xyz(depth_m, K, rays=rays, device=config.device)
     colors = image_to_colors(rgb, (height, width), device=config.device) if rgb is not None else None

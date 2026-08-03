@@ -56,6 +56,8 @@ class StageTimer:
 
     def mark(self, name: str) -> None:
         """Attribute the time since the previous mark (or tick) to ``name``."""
+        if self._tick_t is None:
+            return  # tick() must be called before mark()
         now = time.perf_counter()
         self._stage_sums[name] = self._stage_sums.get(name, 0.0) + (now - self._mark_t)
         self._mark_t = now

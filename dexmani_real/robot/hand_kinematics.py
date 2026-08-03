@@ -41,7 +41,7 @@ logger = get_logger(__name__)
 #   7:ring_joint1  8:ring_joint2
 #   9:thumb_bend  10:thumb_rota1   11:thumb_rota2
 #
-# Verified 2026-07-28 against SAPIEN XArm7XHand simulation FK.
+# Verified 2026-07-28 against URDF FK (xarm7_xhand_right.urdf).
 _SDK_TO_URDF_IDX = np.array([3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2], dtype=np.intp)
 
 

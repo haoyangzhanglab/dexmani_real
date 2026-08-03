@@ -4,7 +4,7 @@ Subsystems:
     robot/      — Hardware drivers (XArm7 7-DOF arm, XHand 12-DOF hand)
     teleop/     — VR teleoperation (tracking, retargeting, control, safety)
     planning/   — Motion planning (IK, kinematics, collision detection)
-    simulation/ — SAPIEN physics simulation
+
     recording/  — HDF5 episode recording
     sensor/     — RealSense camera driver
     config/     — Camera calibration, pipeline config

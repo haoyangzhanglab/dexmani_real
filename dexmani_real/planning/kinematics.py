@@ -109,7 +109,7 @@ class XArm7Kinematics:
         # Transform Jacobian from base frame → world frame.
         # Spatial velocity transforms as [v_w; ω_w] = Ad_{R} @ [v_b; ω_b],
         # where Ad_R = block_diag(R_b2w, R_b2w).  When base_pose_world is identity
-        # (simulation), this is a no-op.
+        # When base_pose_world is identity, this is a no-op.
         R_b2w = quat_wxyz_to_rotmat(self.base_pose_world.q)
         jacobian_world = np.empty_like(jacobian_base)
         jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]  # linear part

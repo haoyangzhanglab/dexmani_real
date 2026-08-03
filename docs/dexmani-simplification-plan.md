@@ -552,7 +552,7 @@ def validate_action(arm_qpos: np.ndarray, hand_qpos: np.ndarray,
 
 **`replay_traj.py`（1447 行）**：回放不需要多进程架构（从 HDF5 文件读取，无 VR，无 live recording）。保留当前单进程模式，使用精简后的 `RobotInterface` + `ArmInnerLoop`。**不在本次简化范围内，单独处理。**
 
-**`examples/sim/`**：仿真路径使用 `TeleopPipeline`（共享 arm_mapper、IK planner），但 `SimRobotInterface` API 不同。仿真路径保留 `TeleopPipeline` 作为可复用的纯函数管道。Policy 进程也可以 import `TeleopPipeline`，减少重复。
+**`examples/sim/`**：已删除（2026-08-03 架构迁移）。`TeleopPipeline`（原 `teleop/core/pipeline.py`，231 行）也已在 2026-08-04 teleop 扁平化中删除——其管线逻辑由 `vr_teleop_policy.py` 内联实现（arm_mapper → workspace clamp → EMA → IK → assemble）。若未来恢复仿真路径，直接复用 `teleop/arm_mapper.py` + `planning/ik.py`，无需中间 Pipeline 抽象。
 
 ---
 

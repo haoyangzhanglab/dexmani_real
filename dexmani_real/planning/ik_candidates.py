@@ -275,8 +275,18 @@ class IKCandidateManager:
         k_min = np.ceil((low[mask] - result[mask] - limit_tol) / periods[mask])
         k_max = np.floor((high[mask] - result[mask] + limit_tol) / periods[mask])
         k = np.round((reference_qpos[mask] - result[mask]) / periods[mask])
+        # Expand k bounds by 1 period on each side — when the physical arm
+        # is near a joint-limit boundary (e.g. +2π) and the raw IK result
+        # lands near the opposite limit (e.g. -2π), the ideal wrapping
+        # factor k may push result slightly past the limit; the final
+        # np.clip will snap it back.  Without this expansion, k_max clips
+        # the wrapping factor and the canonicalised target ends up ~2π
+        # away from current qpos → large tracking-error spike / "joint
+        # turning a full circle" during teleop.
+        # Ref: "关节转了大圈" in calibrate_camera keyboard teleop —
+        # canonicalize_qpos chose the wrong 2π band for J1/J3/J5/J7.
         valid = k_min <= k_max
-        k = np.where(valid, np.clip(k, k_min, k_max), 0.0)
+        k = np.where(valid, np.clip(k, k_min - 1, k_max + 1), 0.0)
         result[mask] += k * periods[mask]
         np.clip(result, low, high, out=result)
         return result

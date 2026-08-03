@@ -40,8 +40,8 @@ class HomingParams:
     """Joint-space linear-interpolation homing parameters."""
 
     convergence_rad: float = 0.0174533  # ~1°
-    step_count: int = 50
     step_interval_s: float = 0.04
+    max_speed_deg_s: float = 30.0  # linear-interpolation fallback speed
     target_timeout_s: float = 0.2
 
 
@@ -49,7 +49,7 @@ class HomingParams:
 class WorkspaceBounds:
     """EEF workspace bounds in arm-base frame (meters)."""
 
-    x_min: float = 0.28
+    x_min: float = 0.25
     x_max: float = 0.72
     y_min: float = -0.50
     y_max: float = 0.50
@@ -112,7 +112,15 @@ class ArmParams:
     """xArm7 hardware parameters — single source of truth."""
 
     # ── Home position (rad) — neutral pose ──
-    home_qpos: tuple[float, ...] = (0.0, -0.349, 0.0, 1.571, 0.0, 1.047, 0.0)
+    home_qpos: tuple[float, ...] = (
+        -0.523599,  # J1: -30.0°
+        -0.033161,  # J2: -1.9°
+        0.0,        # J3: 0.0°
+        0.235619,   # J4: 13.5°
+        -3.141593,  # J5: -180.0°
+        1.303762,   # J6: 74.7°
+        0.0,        # J7: 0.0°
+    )
 
     # ── Joint limits (rad) — mirrors xarm7 URDF ──
     # URDF source: assets/robots/xhand/xarm7_xhand_collision.urdf
@@ -129,7 +137,7 @@ class ArmParams:
     loop_hz: float = 30.0  # arm_loop servo rate
 
     # ── Connection ──
-    ip: str = "192.168.1.215"
+    ip: str = "192.168.1.111"
 
     # ── Safety ──
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
@@ -199,7 +207,7 @@ class PolicyParams:
     # ── Recording ──
     max_record_duration_s: float = 60.0
     min_record_duration_s: float = 1.0
-    episodes_dir: str = "episodes_arm"
+    episodes_dir: str = "episodes"
 
     # ── Diagnostics ──
     status_print_interval: int = 16  # status print interval (ticks)
