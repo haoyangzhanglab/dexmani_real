@@ -18,7 +18,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | **Policy process** | `policy/vr_teleop_policy.py` — `policy_loop(shared, config)`, reads rings, writes actions, owns recording |
 | Planner factory | `planning/planner.py` — `XArm7MotionPlanner.create_default()` canonical setup |
 | **SharedStorage (data plane)** | `shm/shared_storage.py` — all rings, queues, flags in one place |
-| Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical) |
+| Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical), Mode 6, velocity feedforward |
 | Hand control | `robot/hand_process.py` — `hand_loop(shared)` (canonical) |
 | VR receiver | `sensor/vr_receiver_process.py` — `vr_loop(shared)` writes to `vr_ring` |
 | Camera | `sensor/camera_process.py` — independent process, unchanged |
@@ -162,10 +162,11 @@ already catches.
 
 ### Layers (single-writer, no defense-in-depth redundancy)
 
-1. **Arm-level:** NaN guard (protects `last_target`) + Mode 6 error handling (C22/C24/C31
-   auto-recover → `clean_error+set_mode+set_state`; consecutive recoveries > `_RECOVERY_MAX`
-   (30) → FAULT; non-recoverable → immediate FAULT) + `except Exception` path
-   also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
+1. **Arm-level:** NaN guard (protects `last_target`) + velocity feedforward (``cmd_vel * lead_gain``
+   lead-term compensator, per-joint direction guard, joint-limit clip, ``_FF_SKIP_TICKS`` warm-up)
+   + Mode 6 error handling (C22/C24/C31 auto-recover → `clean_error+set_mode+set_state`;
+   consecutive recoveries > `_RECOVERY_MAX` (30) → FAULT; non-recoverable → immediate FAULT)
+   + `except Exception` path also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
 2. **Policy-level:** arm connected gate + NaN guard for arm/hand + workspace clamp +
    safety_state gate (ARMED required for B, FAULT blocks send) + hand_qpos_stale hold
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure + delta clamp
@@ -310,6 +311,7 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 - **Phase 3~7 — 入口点全量迁移 (2026-08-03)**: ✅ vr_teleop_hand_record.py (canonical)、keyboard_teleop_real.py、calibrate_vr_heading.py、replay_traj.py、calibrate_camera.py 全部迁移至 SharedStorage 架构。
 - **Phase 9b — SharedStorageConfig 常量整合 (2026-08-03)**: ✅ SharedStorageConfig dataclass 集中 ring maxlen、camera 默认分辨率、workspace bounds。
 - **Dead code cleanup (2026-08-03)**: ✅ 删除 robot/interface.py、robot/validate.py、robot/preflight.py、robot/arm_process.py；✅ hand_process.py 移除所有 legacy 类（HandControlProcess/HandSHMFaçade/HandSHMAdapter 等）；✅ types.py 移除 RobotInterfaceConfig；✅ (2026-08-03 后续) 删除 defaults.py 6 个 _Deprecated* 类 + TeleopDefaults；✅ 删除 planning/collision_config.py；✅ 删除 test_quest_hand_teleop.py；✅ shared_storage.py 移除 4 个 re-export；✅ 清理所有过期注释/docstring 中的 RobotInterface/RobotInterfaceConfig/ArmProcess 引用；✅ 更新 CLAUDE.md 架构图。
+- **Velocity feedforward (2026-08-05)**: ✅ `arm_loop.py` 新增速度前馈补偿 — `cmd_vel * lead_gain` 加在 Mode 6 G7 位置命令上，逐关节方向守卫，`_current_raw_target` 防 hold-tick 累积，关节限位 clamp 防 C31。`ArmLoopConfig.feedforward_lead_gain` 可控（None=禁用）。Ref: `memory/arm-velocity-feedforward.md`。
 - **Teleop 扁平化 (2026-08-04)**: ✅ 移除 control/core/vr 三个子目录，所有文件直置于 teleop/；✅ 删除 core/pipeline.py (TeleopPipeline 未使用)、vr/vr_tracker.py (QuestHandTracker 未使用)、vr/dummy_tracker.py (零引用)；✅ 更新所有 import 路径 (teleop.{control,vr}.* → teleop.*)；✅ 清理 stale 注释和 pycache。
 - **Code review bugfixes (2026-08-03)**: ✅ calibrate_camera.py CRITICAL NameError 修复（_get_ee_pose 中未定义的 Rotation）；✅ replay_traj.py queue.put 死锁修复（error_state 门控 + estopped 守卫）；✅ 多处 heartbeat wait loop 修复。
 - **Code review round 2 (2026-08-03)**: ✅ CRITICAL: keyboard_teleop NameError 修复（XArm7Config 未导入）；✅ CRITICAL: `--acc`/`--speed` CLI 参数传递到 arm_loop（hand_record + keyboard_teleop）；✅ CRITICAL: arm_action_q blocking put() 改为 timeout-protected（policy_loop）；✅ HIGH: `--no-hand` 标志修复（hand_enabled 字段 +hand_loop 跳过）；✅ HIGH: arm_loop/hand_loop 资源泄漏修复（init 失败时 disconnect）；✅ HIGH: 重复辅助函数提取（read_arm_state/read_hand_state/write_hand_cmd → shared_storage.py）；✅ HIGH: 重复 rot6d 转换函数去重；✅ vm_loop 心跳竞态修复；✅ _simple_homing 心跳阻塞修复；✅ HandState.from_ring() 添加 qpos_stale；✅ arm.home_qpos 常量集中；✅ 死配置字段/无用导入/过时 docstring 清理。

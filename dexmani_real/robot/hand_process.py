@@ -142,6 +142,13 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _last_fresh_qpos: np.ndarray | None = None
     last_known_qpos: np.ndarray = np.zeros(12, dtype=np.float64)
 
+    # Error-state retry: hand comm errors are frequently intermittent and
+    # self-recovering (same design rationale as send-error watchdog).
+    # Try clear_error() up to N times before escalating to global error_state.
+    _consecutive_error_states = 0
+    _ERROR_STATE_RETRY_MAX = 5
+    _last_error_clear_s = 0.0
+
     while shared.is_running.value:
         # Heartbeat — written even when gated (proves we're alive)
         shared.hand_heartbeat_s.value = time.monotonic()
@@ -225,11 +232,35 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             _last_fresh_qpos = qpos.copy()
         qpos_stale = _stale_frames >= cfg.stale_qpos_frame_limit
 
-        # Propagate hand error to global error_state (H6)
+        # Error-state retry: hand comm errors are frequently intermittent and
+        # self-recovering.  Try clear_error() up to _ERROR_STATE_RETRY_MAX times
+        # before escalating to global error_state + FAULT.
+        # (Same design rationale as send-error watchdog — ref: Hand Comm Error
+        # Handling Policy memory.)
         if error_state and not shared.error_state.value:
-            shared.error_state.value = True
-            transition(shared, SafetyState.FAULT)
-            logger.error("hand_loop: hand error state — setting global error_state + FAULT")
+            _consecutive_error_states += 1
+            _now_err = time.monotonic()
+            if _now_err - _last_error_clear_s > 1.0:
+                logger.warning(
+                    "hand_loop: hand error_state — clear_error() (%d/%d consecutive)",
+                    _consecutive_error_states,
+                    _ERROR_STATE_RETRY_MAX,
+                )
+                try:
+                    hand.clear_error()
+                except Exception:
+                    logger.warning("hand_loop: clear_error() failed", exc_info=True)
+                _last_error_clear_s = _now_err
+            if _consecutive_error_states >= _ERROR_STATE_RETRY_MAX:
+                shared.error_state.value = True
+                transition(shared, SafetyState.FAULT)
+                logger.error(
+                    "hand_loop: hand error_state persisted after %d retries — "
+                    "setting global error_state + FAULT",
+                    _ERROR_STATE_RETRY_MAX,
+                )
+        elif not error_state:
+            _consecutive_error_states = 0
 
         # Publish state
         frame = _nf(_HS_STATE)
@@ -255,6 +286,19 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         if sleep_time > 0:
             time.sleep(sleep_time)
         last_ts = time.monotonic()
+
+    # ── Pre-disconnect home: drive hand to home_qpos before releasing the
+    # EtherCAT bus.  If the hand driver board is in a degraded state
+    # (qpos_stale / comm errors), a clean disconnect is more likely when
+    # the board is idle at a known position rather than mid-grasp.
+    _cleanup_home_qpos = home_qpos  # captured at init (line 79)
+    if _cleanup_home_qpos is not None and np.all(np.isfinite(_cleanup_home_qpos)):
+        try:
+            for _ in range(40):  # ~2s at 30 Hz (generous settle window)
+                hand.send_action(_cleanup_home_qpos)
+                time.sleep(0.05)
+        except Exception:
+            pass
 
     try:
         hand.stop()

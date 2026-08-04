@@ -182,6 +182,28 @@ class HandParams:
     # ── Send-error watchdog ──
     send_err_watchdog_count: int = 30  # 1s @ 30Hz
 
+    # ── Hand FK (fingertip positions in world frame) ──
+    hand_urdf_path: str = ""
+    fingertip_link_names: tuple[str, ...] = (
+        "right_hand_thumb_rota_tip",
+        "right_hand_index_rota_tip",
+        "right_hand_mid_tip",
+        "right_hand_ring_tip",
+        "right_hand_pinky_tip",
+    )
+    # Static transform from planning EEF (custom_eef_link) to hand base (right_hand_link).
+    # quat = RotY(+π/2) — hand_base Z points palm-forward in URDF; EEF X is link_eef Z.
+    #
+    # T_eef_handbase_pos breakdown:
+    #   URDF 原始值   = -0.005 m  (right_hand_mount_joint origin in custom_eef_link)
+    #   物理 flange 修正 = -0.010 m  (URDF 0.043 m → 实测 0.033 m，短 10 mm;
+    #                              link_eef -Z = custom_eef_link +X，故补在 -X)
+    #   合计           = -0.015 m
+    #
+    # Verified 2026-07-28: URDF-vs-simulation FK = 0.00 mm.
+    T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
+    T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (0.707107, 0.0, 0.707107, 0.0)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Policy / teleop parameters

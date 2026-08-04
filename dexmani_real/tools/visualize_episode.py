@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """Rerun-based episode visualizer for DexMani teleop data.
 
-Supports both legacy (single ``.h5``) and new (directory with ``data.h5`` +
-``depth.h5`` + ``rgb.mp4``) episode formats.  RGB is decoded from MP4
-on-the-fly; depth routes through the merged HDF5 view automatically.
-
-Auto-detects available datasets in flat-key HDF5 episodes:
-  State:   arm_qpos(7), arm_ee(9), arm_qvel(7), arm_tau(7),
-           hand_qpos(12), hand_fingertip(5,3), hand_contact(5,3)
-  Action:  action_arm_joint(7), action_arm_ee(9), action_hand_joint(12)
-  VR:      vr_wrist_pos(3), vr_wrist_rot6d(6), vr_landmarks(21,3)
-  Flags:   flag_ik_ok, flag_retarget_ok, flag_held
-  Camera:  rgb(C,H,W,3), depth(C,H,W)  -- C may be < T (forward-filled)
+Supports legacy (single ``.h5``) and current (directory with ``data.h5`` +
+``depth.h5`` + ``rgb.mp4``) episode formats.
 
 Usage:
   python -m dexmani_real.tools.visualize_episode episode.h5
@@ -23,8 +14,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+
+# Suppress Rerun's wgpu/Vulkan backend diagnostics (noisy on Linux).
+os.environ["RUST_LOG"] = "error"
 from pathlib import Path
 
 import h5py
@@ -65,12 +60,7 @@ _FINGERTIP_LABELS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky
 
 
 def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
-    """Scan top-level HDF5 datasets and group them by category.
-
-    Returns:
-        Dict mapping category name -> list of available keys.
-        Categories with no matches are omitted.
-    """
+    """Group top-level HDF5 datasets by category (arm, hand, action, vr, camera, flags, meta)."""
     available_keys = {k for k in h5f.keys() if isinstance(h5f[k], h5py.Dataset)}
     classified: dict[str, list[str]] = {}
 
@@ -156,7 +146,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class EpisodeVisualizer:
-    """Load and stream a DexMani HDF5 episode into Rerun for interactive viewing."""
+    """Load an HDF5 episode and stream it into Rerun for interactive 3D viewing."""
 
     def __init__(
         self,
@@ -172,12 +162,11 @@ class EpisodeVisualizer:
         self._reader = EpisodeReader(h5_path)
         self._h5f = self._reader.h5f
 
-        # Pre-decode camera frames when video sidecars are present
-        # (~50 MB for 960 frames @ 640×480 — acceptable for interactive use).
+        # Pre-decode camera frames (~50 MB for 960 frames @ 640×480).
         self._rgb_cache: np.ndarray | None = None
         self._depth_cache: np.ndarray | None = None
-        # RGB may come from HDF5 (legacy) or MP4 (new format).  _MergedH5File
-        # only knows about HDF5 keys, so check the reader directly for MP4.
+        # RGB: HDF5 (legacy) or MP4 sidecar (current). _MergedH5File only
+        # knows HDF5 keys — query the reader for MP4.
         try:
             self._rgb_cache = self._reader.read_camera_all("rgb")
             logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
@@ -187,17 +176,14 @@ class EpisodeVisualizer:
             self._depth_cache = self._reader.read_camera_all("depth")
             logger.info("Pre-decoded %d depth frames", self._depth_cache.shape[0])
 
-        # Discover datasets
         self._available = _classify_datasets(self._h5f)
-        # MP4 RGB sidecar: _classify_datasets only scans HDF5 keys, so "rgb"
-        # is missed in the new format.  Inject it manually when available.
+        # _classify_datasets only scans HDF5 keys — inject MP4 RGB when present.
         if self._rgb_cache is not None and "rgb" not in self._available.get("camera", []):
             self._available.setdefault("camera", []).append("rgb")
         logger.info("Detected %d categories: %s", len(self._available), sorted(self._available.keys()))
 
-        # Depth units in meters: CLI override > /meta depth_scale > 1mm legacy default.
-        # Episodes recorded before depth_scale was persisted carry L515 raw depth
-        # in 0.25mm units — pass --depth-scale 0.00025 for those.
+        # Depth units: CLI > /meta depth_scale > 1mm default.
+        # Pre-depth_scale episodes (L515 0.25mm raw) need --depth-scale 0.00025.
         if depth_scale is None:
             meta = self._h5f.get("meta")
             if meta is not None and "depth_scale" in meta.attrs:
@@ -209,9 +195,7 @@ class EpisodeVisualizer:
         self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
         self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
 
-        # ── Camera extrinsics ──
-        # camera_T_world_camera = T_world_camera: 4x4 that maps camera-frame → world-frame.
-        # Stored row-major (16,) in /meta; absent in legacy episodes without calibration.
+        # Camera extrinsics: camera_T_world_camera (4x4 row-major) maps camera → world.
         self._cam_R: np.ndarray | None = None
         self._cam_t: np.ndarray | None = None
         meta = self._h5f.get("meta")
@@ -228,9 +212,8 @@ class EpisodeVisualizer:
         self._pc_stride = max(1, pc_stride)
         self._pc_min_depth = pc_min_depth
         self._pc_max_depth = pc_max_depth
-        self._pc_cache: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}  # cam_idx -> (points, colors)
+        self._pc_cache: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
 
-        # Precompute pixel grid for back-projection (once per depth resolution)
         self._pc_K: np.ndarray | None = None
         self._pc_rays: tuple[np.ndarray, np.ndarray] | None = None  # (u_strided, v_strided)
         if self._pc_enabled:
@@ -254,10 +237,7 @@ class EpisodeVisualizer:
                 logger.warning("Point cloud disabled: no camera_K in /meta")
                 self._pc_enabled = False
 
-        # ── Pre-computed pointcloud (/pointcloud dataset from camera_loop) ──
-        # When available, this is preferred over the depth→pointcloud fallback:
-        # points are already in world frame with baked-in extrinsics, filtered,
-        # clustered, and FPS-downsampled to a fixed cardinality (2048).
+        # Pre-computed world-frame /pointcloud (preferred over depth back-projection).
         self._has_precomputed_pc = (
             point_cloud and "pointcloud" in self._h5f and isinstance(self._h5f["pointcloud"], h5py.Dataset)
         )
@@ -271,7 +251,6 @@ class EpisodeVisualizer:
         elif self._pc_enabled:
             logger.info("No /pointcloud — falling back to depth back-projection + camera_K.")
 
-        # Determine T (state frames) and C (camera frames)
         self._T = self._resolve_frame_count(max_frames)
         self._C = self._resolve_camera_count()
         logger.info("State frames=%d, Camera frames=%d", self._T, self._C or 0)
@@ -279,7 +258,7 @@ class EpisodeVisualizer:
         # Preload non-camera data (small, fits in memory)
         self._state = self._preload_state()
 
-        # Camera forward-fill index: for each state step t, which camera frame to show
+        # state step → camera frame mapping
         self._cam_idx: np.ndarray | None = None
         if self._C is not None and self._C > 0:
             if self._C < self._T:
@@ -287,9 +266,7 @@ class EpisodeVisualizer:
             else:
                 self._cam_idx = np.arange(self._T, dtype=int)
 
-        # Init Rerun — app_id includes episode name for the window title;
-        # recording_id is made unique per invocation so re-running the same
-        # file always creates a fresh recording (no stale-data merge).
+        # Unique recording_id per invocation avoids stale-data merge on re-run.
         self._blueprint = self._build_blueprint()
         _app_id = f"DexMani - {self._h5_path.stem}"
         _rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
@@ -298,16 +275,15 @@ class EpisodeVisualizer:
         self._log_static()
 
     # ------------------------------------------------------------------
-    # Initialisation helpers
+    # Init helpers
     # ------------------------------------------------------------------
 
     def _resolve_frame_count(self, max_frames: int | None) -> int:
-        """Determine T from the first available arm or meta key."""
+        """Return T = min(arm_qpos.shape[0], max_frames) falling back through meta keys."""
         arm_keys = self._available.get("arm", [])
         meta_keys = self._available.get("meta", [])
         ref_key = next(iter(arm_keys), None) or next(iter(meta_keys), None)
         if ref_key is None:
-            # Fallback: pick any dataset
             all_keys = [k for v in self._available.values() for k in v]
             ref_key = all_keys[0] if all_keys else None
         if ref_key is None:
@@ -320,7 +296,7 @@ class EpisodeVisualizer:
         return raw
 
     def _resolve_camera_count(self) -> int | None:
-        """Determine C from rgb or depth dataset (pre-decoded cache or HDF5)."""
+        """Return C from pre-decoded cache or first camera dataset in HDF5."""
         if self._rgb_cache is not None:
             return self._rgb_cache.shape[0]
         if self._depth_cache is not None:
@@ -330,31 +306,28 @@ class EpisodeVisualizer:
         return None
 
     def _preload_state(self) -> dict[str, np.ndarray]:
-        """Read all non-camera datasets into a dict, truncated to T frames."""
+        """Read all non-camera datasets into memory, truncated to T frames."""
         state: dict[str, np.ndarray] = {}
         for _category, keys in self._available.items():
             if _category == "camera":
                 continue
             for key in keys:
                 data = self._h5f[key][: self._T]
-                # HDF5 scalars may return shape (); ensure at least 1-d for flags
                 if data.ndim == 0:
                     data = data[()]
                 state[key] = np.asarray(data)
 
-        # ── Derived 2-D time series from 3-D hand data ──
-        # hand_contact (T,5,3) → force magnitude (T,5) + per-finger Fx/Fy/Fz
+        # Derived 2-D series from hand_contact (T,5,3)
         if "hand_contact" in state:
-            contact = state["hand_contact"]  # (T, 5, 3)
+            contact = state["hand_contact"]
             state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
-            # First two fingers: thumb (0) and index (1) per-axis forces
-            state["hand_force_thumb"] = contact[:, 0, :].copy()  # (T, 3) Fx,Fy,Fz
-            state["hand_force_index"] = contact[:, 1, :].copy()  # (T, 3) Fx,Fy,Fz
+            state["hand_force_thumb"] = contact[:, 0, :].copy()  # (T, 3)
+            state["hand_force_index"] = contact[:, 1, :].copy()  # (T, 3)
 
         return state
 
     # ------------------------------------------------------------------
-    # Point cloud generation (numpy-only, no torch dep)
+    # Point cloud generation
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -369,24 +342,16 @@ class EpisodeVisualizer:
         min_depth: float,
         max_depth: float,
     ) -> tuple[np.ndarray, np.ndarray | None]:
-        """Convert a single depth frame to a strided point cloud (camera frame).
-
-        Returns (N,3) positions and optional (N,3) uint8 colors (0-255).
-        """
-        # Convert to meters (handles uint16 raw and float passthrough)
+        """Back-project a strided depth frame to camera-frame points (N,3) + optional colors (N,3)."""
         depth_m = depth_to_meters(depth, depth_scale=depth_scale)
-
-        # Stride
         depth_strided = depth_m[::stride, ::stride]
         z = depth_strided.astype(np.float32)
 
-        # Back-project
         fx, fy = float(K[0, 0]), float(K[1, 1])
         cx, cy = float(K[0, 2]), float(K[1, 2])
         x = (u_strided - cx) * z / fx
         y = (v_strided - cy) * z / fy
 
-        # Mask: depth range + finite
         valid = (z > min_depth) & (z < max_depth) & np.isfinite(z)
         if not valid.any():
             return np.zeros((0, 3), dtype=np.float32), None
@@ -395,8 +360,7 @@ class EpisodeVisualizer:
 
         colors = None
         if rgb is not None:
-            rgb_strided = rgb[::stride, ::stride]
-            colors = rgb_strided[valid]  # uint8 (0-255), Rerun accepts this natively
+            colors = rgb[::stride, ::stride][valid]
 
         return points, colors
 
@@ -405,7 +369,7 @@ class EpisodeVisualizer:
     # ------------------------------------------------------------------
 
     def _build_blueprint(self) -> rrb.Blueprint:
-        """Build a dynamic layout based on available data categories."""
+        """Build Rerun view layout from detected data categories."""
         has_state = bool(self._available.get("arm") or self._available.get("hand"))
         has_action = bool(self._available.get("action"))
         has_flags = bool(self._available.get("flags"))
@@ -474,7 +438,7 @@ class EpisodeVisualizer:
     # ------------------------------------------------------------------
 
     def _log_static(self) -> None:
-        """Log series-line labels and camera intrinsics (if available)."""
+        """Log per-series labels, camera pinhole, and extrinsics once."""
         for category, keys in self._available.items():
             if category == "camera":
                 continue
@@ -482,20 +446,16 @@ class EpisodeVisualizer:
                 if key not in self._state:
                     continue
                 arr = self._state[key]
-                # Skip 3D+ data (can't display as time series)
                 if arr.ndim > 2:
-                    continue
+                    continue  # skip 3D+ arrays
                 base = self._series_origin(category, key)
                 if arr.ndim <= 1:
-                    # Single series (scalar flag, 1-D timestamp, etc.)
                     rr.log(base, rr.SeriesLine(name=key), static=True)
                 else:
-                    # Multi-dimensional: one entity path per dimension.
-                    # TimeSeriesView(origin="state/arm_qpos") collects children.
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        # Camera pinhole from /meta attrs (optional)
+        # Camera pinhole
         meta = self._h5f.get("meta")
         has_rgb = "rgb" in self._h5f or self._rgb_cache is not None
         if meta is not None and "camera_K" in meta.attrs and has_rgb:
@@ -514,13 +474,11 @@ class EpisodeVisualizer:
             )
             logger.info("Camera pinhole logged (%dx%d)", w, h)
 
-        # Camera extrinsics: position the camera entity in world space.
-        # Without this the Pinhole sits at the world origin, and the 3D view
-        # shows points offset from the camera frustum.
+        # Camera extrinsics
         if self._cam_R is not None and self._cam_t is not None:
             rr.log("camera", rr.Transform3D(translation=self._cam_t, mat3x3=self._cam_R), static=True)
 
-        # ── Derived force series labels ──
+        # Derived force series labels
         _force_series = {
             "hand_contact_mag": ("thumb (N)", "index (N)", "middle (N)", "ring (N)", "pinky (N)"),
             "hand_force_thumb": ("Fx (N)", "Fy (N)", "Fz (N)"),
@@ -534,11 +492,7 @@ class EpisodeVisualizer:
 
     @staticmethod
     def _series_origin(category: str, key: str) -> str:
-        """Entity path for a time-series dataset.
-
-        Arm and hand state are grouped under ``state/`` so the blueprint's
-        single ``TimeSeriesView(origin="state/<key>")`` collects both.
-        """
+        """Entity path: arm/hand → state/<key>, others → <category>/<key>."""
         if category in ("arm", "hand"):
             return f"state/{key}"
         return f"{category}/{key}"
@@ -548,9 +502,8 @@ class EpisodeVisualizer:
     # ------------------------------------------------------------------
 
     def log_step(self, step_idx: int) -> None:
-        """Log all data for one timestep."""
+        """Log camera, fingertips, and time series for one timestep."""
         rr.set_time_sequence("step", step_idx)
-        # Also set real time if timestamp dataset is available
         if "timestamp" in self._state:
             rr.set_time_seconds("time", float(self._state["timestamp"][step_idx]))
         self._log_camera(step_idx)
@@ -558,7 +511,7 @@ class EpisodeVisualizer:
         self._log_time_series(step_idx)
 
     # ------------------------------------------------------------------
-    # Camera logging
+    # Camera + point cloud
     # ------------------------------------------------------------------
 
     def _log_camera(self, step_idx: int) -> None:
@@ -575,14 +528,11 @@ class EpisodeVisualizer:
             depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
             rr.log("camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)))  # clamp outliers to stabilize colormap
 
-        # ── 3D point cloud ──
-        # Pre-computed world-frame /pointcloud (from camera_loop) takes priority
-        # over the depth back-projection fallback.  /pointcloud is grid-aligned
-        # (same T as state), so use step_idx directly — no cam_idx mapping needed.
+        # 3D point cloud: /pointcloud (world-frame, grid-aligned) > depth back-projection.
         if self._has_precomputed_pc:
-            pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6) float32
-            positions = pc_frame[:, :3]  # world-frame xyz
-            colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)  # float rgb → uint8
+            pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6): xyz + float rgb
+            positions = pc_frame[:, :3]
+            colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)
             rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
         elif self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
@@ -614,13 +564,7 @@ class EpisodeVisualizer:
     # ------------------------------------------------------------------
 
     def _log_fingertips(self, step_idx: int) -> None:
-        """Render hand_fingertip as colored keypoints in the 3D view.
-
-        FK-computed positions are in world frame, matching the pre-computed
-        /pointcloud coordinate space.  Five distinct colours identify individual
-        fingers without needing text labels (which require Rerun ≥0.23 for
-        stable Points3D label support).
-        """
+        """Render hand_fingertip FK positions as per-finger colored keypoints."""
         fp_data = self._state.get("hand_fingertip")
         if fp_data is None:
             return
@@ -651,9 +595,8 @@ class EpisodeVisualizer:
                 if key not in self._state:
                     continue
                 arr = self._state[key]
-                # Skip 3D+ data (can't display as time series)
                 if arr.ndim > 2:
-                    continue
+                    continue  # skip 3D+ arrays
                 base = self._series_origin(category, key)
                 if arr.ndim <= 1:
                     rr.log(base, rr.Scalar(float(arr[step_idx])))
@@ -661,7 +604,7 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-        # ── Derived force scalars (computed from 3-D hand_contact) ──
+        # Derived force scalars
         for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
             if fkey in self._state:
                 arr = self._state[fkey]
@@ -677,7 +620,7 @@ class EpisodeVisualizer:
         return self._T
 
     def close(self) -> None:
-        """Release the HDF5 file / video decoders and finalise the Rerun recording."""
+        """Release HDF5/video resources and disconnect from Rerun."""
         if hasattr(self, "_reader") and self._reader is not None:
             self._reader.close()
             self._reader = None  # type: ignore[assignment]
@@ -689,210 +632,22 @@ class EpisodeVisualizer:
 
 
 # ---------------------------------------------------------------------------
-# Tactile visualization (merged from visualize_tactile.py)
-# ---------------------------------------------------------------------------
-
-FINGER_NAMES = ["thumb", "index", "middle", "ring", "little"]
-
-
-def _load_tactile(path: str) -> tuple[np.ndarray, dict]:
-    with EpisodeReader(path) as reader:
-        f = reader.h5f
-        if "hand_tactile_force" not in f:
-            raise KeyError("hand_tactile_force dataset not found — episode recorded before tactile was saved")
-        tactile = f["hand_tactile_force"][:]  # (T, 5, 120, 3)
-        meta = dict(f["meta"].attrs)
-    return tactile, meta
-
-
-def _force_magnitude(tactile: np.ndarray) -> np.ndarray:
-    """L2 norm across 3 force axes → (T, 5, 120)."""
-    return np.linalg.norm(tactile, axis=-1)
-
-
-def _tactile_force_timeline(args: argparse.Namespace) -> None:
-    import matplotlib.pyplot as plt
-
-    tactile, meta = _load_tactile(args.episode)
-    mag = _force_magnitude(tactile)
-    total = mag.sum(axis=-1)  # (T, 5)
-
-    fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
-    t = np.arange(len(total)) / fps
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for i, name in enumerate(FINGER_NAMES):
-        ax.plot(t, total[:, i], label=name, linewidth=0.8)
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Total force (Newtons)")
-    ax.set_title(f"Per-finger Tactile Force — {Path(args.episode).name}")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-
-    if args.mark_contacts:
-        threshold = args.threshold if args.threshold > 0 else np.percentile(total[total > 0], 50) if np.any(total > 0) else 1.0
-        for i in range(5):
-            contact = total[:, i] > threshold
-            changes = np.diff(contact.astype(int))
-            starts = np.where(changes == 1)[0] + 1
-            for s in starts:
-                ax.axvline(t[s], color=f"C{i}", alpha=0.15, linewidth=0.5)
-
-    plt.tight_layout()
-    if args.output:
-        plt.savefig(args.output, dpi=150)
-        print(f"Saved {args.output}")
-    else:
-        plt.show()
-
-
-def _tactile_force_heatmap(args: argparse.Namespace) -> None:
-    import matplotlib.pyplot as plt
-
-    tactile, meta = _load_tactile(args.episode)
-    mag = _force_magnitude(tactile)
-
-    frame = args.frame if args.frame is not None else len(mag) // 2
-    if frame < 0 or frame >= len(mag):
-        raise ValueError(f"frame {frame} out of range [0, {len(mag) - 1}]")
-    frame_data = mag[frame]  # (5, 120)
-
-    fig, axes = plt.subplots(5, 1, figsize=(14, 8), sharex=True)
-    vmax = max(np.percentile(frame_data[frame_data > 0], 95) if np.any(frame_data > 0) else 1.0, 1.0)
-
-    for i, (ax, name) in enumerate(zip(axes, FINGER_NAMES)):
-        row = frame_data[i].reshape(1, -1)
-        im = ax.imshow(row, aspect="auto", cmap="YlOrRd", vmin=0, vmax=vmax)
-        ax.set_ylabel(name, rotation=0, labelpad=25, va="center")
-
-    axes[-1].set_xlabel("Sensor index (0–119)")
-    fig.suptitle(f"Tactile Force Heatmap — frame {frame} — {Path(args.episode).name}", fontsize=11)
-    fig.colorbar(im, ax=axes, label="Force magnitude (N)", shrink=0.6)
-
-    plt.tight_layout()
-    if args.output:
-        plt.savefig(args.output, dpi=150)
-        print(f"Saved {args.output}")
-    else:
-        plt.show()
-
-
-def _tactile_force_3axis(args: argparse.Namespace) -> None:
-    import matplotlib.pyplot as plt
-
-    tactile, meta = _load_tactile(args.episode)
-    finger = args.finger if args.finger in FINGER_NAMES else "thumb"
-    idx = FINGER_NAMES.index(finger)
-    fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
-
-    finger_total = tactile[:, idx, :, :].sum(axis=1)  # (T, 3)
-    t = np.arange(len(finger_total)) / fps
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
-    for ax, axis_name, color in zip(axes, ["fx", "fy", "fz"], ["#d62728", "#2ca02c", "#1f77b4"]):
-        ax.plot(t, finger_total[:, ["fx", "fy", "fz"].index(axis_name)], color=color, linewidth=0.6)
-        ax.set_ylabel(axis_name)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(y=0, color="gray", linewidth=0.5)
-
-    axes[-1].set_xlabel("Time (s)")
-    fig.suptitle(f"3-Axis Force — {finger} — {Path(args.episode).name}", fontsize=11)
-
-    plt.tight_layout()
-    if args.output:
-        plt.savefig(args.output, dpi=150)
-        print(f"Saved {args.output}")
-    else:
-        plt.show()
-
-
-def _tactile_contact_frames(args: argparse.Namespace) -> None:
-    tactile, meta = _load_tactile(args.episode)
-    mag = _force_magnitude(tactile)
-    total = mag.sum(axis=-1)  # (T, 5)
-
-    threshold = args.threshold if args.threshold > 0 else 1.0
-    fps = float(meta.get("fps", meta.get("control_hz", 16.0)))
-
-    print(f"{'frame':>6s}  {'time_s':>8s}  " + "  ".join(f"{n:>8s}" for n in FINGER_NAMES))
-    print("-" * (6 + 1 + 8 + 1 + 5 * 9))
-
-    in_contact = np.any(total > threshold, axis=1)
-    transitions = np.diff(in_contact.astype(int))
-    starts = np.where(transitions == 1)[0] + 1
-    ends = np.where(transitions == -1)[0] + 1
-
-    if len(starts) == 0:
-        print(f"(no contact detected at threshold {threshold:.1f})")
-        return
-
-    print(f"Contact events (threshold={threshold:.1f}):")
-    for i, (s, e) in enumerate(zip(starts, ends[:len(starts)])):
-        duration = (e - s) / fps
-        fingers_in_contact = [FINGER_NAMES[j] for j in range(5) if np.any(total[s:e, j] > threshold)]
-        print(f"  #{i+1}: frame {s:>5d}–{e:>5d}  ({duration:.1f}s)  fingers: {', '.join(fingers_in_contact)}")
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes (Rerun 3D + tactile plots).")
-    sub = parser.add_subparsers(dest="command")
-
-    # ── visualize (default: Rerun 3D) ──
-    vis = sub.add_parser("visualize", help="Rerun-based 3D interactive viewer")
-    vis.add_argument("episode", type=str, help="Path to episode (.h5 file or directory).")
-    vis.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
-    vis.add_argument("--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale).")
-    vis.add_argument("--info", action="store_true", help="Print HDF5 structure summary and exit (no Rerun needed).")
-    vis.add_argument("--point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Enable 3D point cloud from depth.")
-    vis.add_argument("--pc-stride", type=int, default=4, help="Pixel stride for point cloud downsampling (default: 4).")
-    vis.add_argument("--pc-min-depth", type=float, default=0.1, help="Min depth for point cloud filtering in meters (default: 0.1).")
-    vis.add_argument("--pc-max-depth", type=float, default=2.0, help="Max depth for point cloud filtering in meters (default: 2.0).")
-
-    # ── tactile ──
-    tac = sub.add_parser("tactile", help="Matplotlib tactile force plots")
-    tac.add_argument("episode", type=str, help="Path to .h5 episode file")
-    tac_sub = tac.add_subparsers(dest="tactile_command", required=True)
-
-    t1 = tac_sub.add_parser("force_timeline", help="Per-finger total force over time")
-    t1.add_argument("--threshold", type=float, default=0.0, help="Contact threshold (Newtons; default=auto)")
-    t1.add_argument("--mark-contacts", action="store_true", help="Mark contact start frames")
-    t1.add_argument("-o", "--output", help="Save to file instead of showing")
-
-    t2 = tac_sub.add_parser("force_heatmap", help="Force magnitude heatmap for one frame")
-    t2.add_argument("--frame", type=int, help="Frame index (default=midpoint)")
-    t2.add_argument("-o", "--output", help="Save to file instead of showing")
-
-    t3 = tac_sub.add_parser("force_3axis", help="fx/fy/fz breakdown for one finger")
-    t3.add_argument("--finger", choices=FINGER_NAMES, default="thumb")
-    t3.add_argument("-o", "--output", help="Save to file instead of showing")
-
-    t4 = tac_sub.add_parser("contact_frames", help="List contact events")
-    t4.add_argument("--threshold", type=float, default=1.0, help="Contact threshold (Newtons)")
+    parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes with Rerun 3D.")
+    parser.add_argument("episode", type=str, help="Path to episode (.h5 file or directory).")
+    parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
+    parser.add_argument("--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale).")
+    parser.add_argument("--info", action="store_true", help="Print HDF5 structure summary and exit (no Rerun needed).")
+    parser.add_argument("--point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Enable 3D point cloud from depth.")
+    parser.add_argument("--pc-stride", type=int, default=4, help="Pixel stride for point cloud downsampling (default: 4).")
+    parser.add_argument("--pc-min-depth", type=float, default=0.1, help="Min depth for point cloud filtering in meters (default: 0.1).")
+    parser.add_argument("--pc-max-depth", type=float, default=2.0, help="Max depth for point cloud filtering in meters (default: 2.0).")
 
     args = parser.parse_args()
-
-    # ── Backward compat: if no subcommand given, default to visualize ──
-    if args.command is None:
-        logger.warning("No subcommand given — defaulting to 'visualize'. Use 'visualize' or 'tactile'.")
-        args.command = "visualize"
-
-    if args.command == "tactile":
-        _TACTILE_DISPATCH = {
-            "force_timeline": _tactile_force_timeline,
-            "force_heatmap": _tactile_force_heatmap,
-            "force_3axis": _tactile_force_3axis,
-            "contact_frames": _tactile_contact_frames,
-        }
-        _TACTILE_DISPATCH[args.tactile_command](args)
-        return
-
-    # visualize
     h5_path = Path(args.episode).expanduser().resolve()
     if not h5_path.exists():
         logger.error("Episode not found: %s", h5_path)

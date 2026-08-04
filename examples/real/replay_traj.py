@@ -820,6 +820,10 @@ class TrajectoryReplayer:
             if self.shared.error_state.value:
                 print("  Approach aborted: error_state detected")
                 return None
+            if not np.all(np.isfinite(waypoint)):
+                continue
+            if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
+                return None
             self.shared.arm_action_q.put({"qpos": waypoint})
             time.sleep(HOME_DT)
 
@@ -844,7 +848,12 @@ class TrajectoryReplayer:
                 if self.shared.error_state.value:
                     print("  Joint-space fallback aborted: error_state detected")
                     return None
-                self.shared.arm_action_q.put({"qpos": arm_qpos + alpha * (first_cmd - arm_qpos)})
+                _js_cmd = arm_qpos + alpha * (first_cmd - arm_qpos)
+                if not np.all(np.isfinite(_js_cmd)):
+                    continue
+                if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
+                    return None
+                self.shared.arm_action_q.put({"qpos": _js_cmd})
                 time.sleep(HOME_DT)
             time.sleep(0.15)
 
@@ -896,7 +905,8 @@ class TrajectoryReplayer:
         atexit.register(kb.stop)
 
         # ── Pre-warm: send first target before rate limiter ──
-        self.shared.arm_action_q.put({"qpos": first_cmd})
+        if np.all(np.isfinite(first_cmd)) and int(self.shared.safety_state.value) != int(SafetyState.FAULT):
+            self.shared.arm_action_q.put({"qpos": first_cmd})
         if has_hand and self.traj.action_hand_joint is not None:
             write_hand_cmd(self.shared, self.traj.action_hand_joint[0])
         self._rate_mgr = RateManager(self.replay_hz)
@@ -999,6 +1009,9 @@ class TrajectoryReplayer:
                 sent_cmd = arm_cmd.copy()
                 if self.shared.error_state.value:
                     logger.warning("Frame %d: error_state set — stopping replay", frame_idx)
+                    break
+                if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
+                    logger.warning("Frame %d: safety FAULT — stopping replay", frame_idx)
                     break
                 self.shared.arm_action_q.put({"qpos": arm_cmd})
 
@@ -1150,7 +1163,7 @@ Control keys:
     parser.add_argument(
         "--arm-ip",
         type=str,
-        default="192.168.1.215",
+        default="192.168.1.111",
         help="XArm controller IP address (passed to ArmLoopConfig).",
     )
     parser.add_argument(
@@ -1271,8 +1284,26 @@ Control keys:
         ready_checks.append(("hand", shared.hand_ready, 30))
 
     for name, ev, timeout in ready_checks:
-        if not ev.wait(timeout=timeout):
+        _ready_deadline = time.monotonic() + timeout
+        _ready_ok = False
+        _already_logged = False
+        while time.monotonic() < _ready_deadline:
+            if ev.is_set():
+                _ready_ok = True
+                break
+            if shared.error_state.value:
+                logger.error("%s startup failed: error_state set by %s process", name, name)
+                _already_logged = True
+                break
+            # Check if the corresponding process exited prematurely
+            if not any(p.name == name and p.is_alive() for p in procs):
+                logger.error("%s startup failed: %s process exited", name, name)
+                _already_logged = True
+                break
+            time.sleep(0.2)
+        if not _ready_ok and not _already_logged:
             logger.error("%s startup failed: ready-event timeout after %ds", name, timeout)
+        if not _ready_ok:
             shared.is_running.value = False
             _shutdown_replay(procs, shared)
             return
@@ -1378,17 +1409,44 @@ Control keys:
                     if ControlSignal.QUIT in sigs or ControlSignal.EMERGENCY_STOP in sigs:
                         break
                     if ControlSignal.HOME in sigs:
-                        print("\nH: return_home (HOME_SENTINEL → arm_action_q)")
+                        print("\nH: return_home")
+
+                        # ── Step 1: Hand home first (before arm moves) ──
+                        if hand_available:
+                            from dexmani_real.config.defaults import hand as _hand_defaults
+
+                            _HAND_HOME = np.deg2rad(np.array(_hand_defaults.home_qpos_deg, dtype=np.float64))
+                            _hand_tol = np.deg2rad(5.0)
+                            _hand_deadline = time.monotonic() + 5.0
+                            _hand_reached = False
+                            while time.monotonic() < _hand_deadline:
+                                write_hand_cmd(shared, _HAND_HOME)
+                                _hs = _read_hand_state_dict(shared)
+                                if _hs is not None and np.all(np.isfinite(_hs["qpos"])):
+                                    if float(np.max(np.abs(_hs["qpos"] - _HAND_HOME))) < _hand_tol:
+                                        _hand_reached = True
+                                        break
+                                time.sleep(0.05)
+                            if _hand_reached:
+                                print("  hand: home reached", flush=True)
+                            else:
+                                print("  hand: home settle timeout — proceeding", flush=True)
+
+                        # ── Step 2: Arm home ──
                         shared.arm_action_q.put((HOME_SENTINEL, None))
-                        # Wait for arm to execute homing — detect heartbeat stall.
-                        _home_wait = time.perf_counter() + 20.0
-                        _last_hb = shared.arm_heartbeat_s.value
-                        while time.perf_counter() < _home_wait:
-                            time.sleep(0.5)
-                            _cur_hb = shared.arm_heartbeat_s.value
-                            if _cur_hb == _last_hb:
-                                break  # heartbeat stalled → arm_loop likely dead
-                            _last_hb = _cur_hb
+                        # Wait for qpos to converge to home (poll, up to 20s).
+                        _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
+                        _home_deadline = time.perf_counter() + 20.0
+                        _home_reached = False
+                        while time.perf_counter() < _home_deadline:
+                            _as = _read_arm_state_dict(shared)
+                            if _as is not None and np.all(np.isfinite(_as["qpos"])):
+                                if float(np.max(np.abs(_as["qpos"] - _home_arr))) < 0.03:
+                                    _home_reached = True
+                                    break
+                            time.sleep(0.2)
+                        if _home_reached:
+                            print("  arm: home reached", flush=True)
                         print("Press Q to exit...")
             finally:
                 kb.stop()

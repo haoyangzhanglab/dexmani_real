@@ -56,6 +56,11 @@ class AudioFeedback:
         self._lock = threading.Lock()
         self._current_proc: subprocess.Popen | None = None
         self._cancel_flag: threading.Event | None = None
+        # Queue support: sequential playback
+        self._queue: list[str] = []  # list of file paths
+        self._queue_lock = threading.Lock()
+        self._queue_cancel: threading.Event | None = None
+        self._queue_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -63,14 +68,22 @@ class AudioFeedback:
 
     @property
     def is_playing(self) -> bool:
-        """True if a voice prompt is currently playing."""
+        """True if a voice prompt is currently playing or queued."""
         with self._lock:
-            return self._current_proc is not None and self._current_proc.poll() is None
+            if self._current_proc is not None and self._current_proc.poll() is None:
+                return True
+        with self._queue_lock:
+            if self._queue:
+                return True
+            if self._queue_thread is not None and self._queue_thread.is_alive():
+                return True
+        return False
 
     def play(self, event: str) -> None:
         """Play the voice prompt for *event* (non-blocking).
 
         If a previous prompt is still playing it is cancelled first.
+        Any pending queued events are also cleared.
         Unknown events and missing audio files are logged and skipped.
         """
         filename = _EVENT_MAP.get(event)
@@ -82,6 +95,12 @@ class AudioFeedback:
             logger.warning("Audio file not found: %s", path)
             return
 
+        # Cancel any queued playback — play() takes priority.
+        with self._queue_lock:
+            self._queue.clear()
+            if self._queue_cancel is not None:
+                self._queue_cancel.set()
+
         self._cancel_current()
 
         cancel = threading.Event()
@@ -89,6 +108,39 @@ class AudioFeedback:
         with self._lock:
             self._cancel_flag = cancel
         t.start()
+
+    def queue(self, event: str) -> None:
+        """Queue a voice prompt to play after the current one finishes.
+
+        Unlike :meth:`play`, which cancels any in-progress playback and
+        plays immediately, ``queue`` appends the event to a sequential
+        playback queue.  If nothing is currently playing, the queued
+        event starts immediately.
+
+        Usage::
+
+            audio.play("calibrated")   # starts playing immediately
+            audio.queue("begin")       # plays after "calibrated" finishes
+        """
+        filename = _EVENT_MAP.get(event)
+        if filename is None:
+            logger.warning("Unknown audio event: %s", event)
+            return
+        path = os.path.join(self._audio_dir, filename)
+        if not os.path.isfile(path):
+            logger.warning("Audio file not found: %s", path)
+            return
+
+        with self._queue_lock:
+            self._queue.append(path)
+            if self._queue_thread is None or not self._queue_thread.is_alive():
+                cancel = threading.Event()
+                self._queue_cancel = cancel
+                self._queue_thread = threading.Thread(
+                    target=self._queue_worker, args=(cancel,),
+                    daemon=True, name="audio-queue",
+                )
+                self._queue_thread.start()
 
     # ------------------------------------------------------------------
     # Internal
@@ -135,6 +187,49 @@ class AudioFeedback:
                     return
         except Exception:
             logger.warning("Audio playback failed for %s", path, exc_info=True)
+        finally:
+            with self._lock:
+                if self._current_proc is proc:
+                    self._current_proc = None
+
+    def _queue_worker(self, cancel: threading.Event) -> None:
+        """Process the audio queue sequentially."""
+        while not cancel.is_set():
+            path: str | None = None
+            with self._queue_lock:
+                if self._queue:
+                    path = self._queue.pop(0)
+            if path is None:
+                break
+            self._play_blocking(path, cancel)
+
+        with self._queue_lock:
+            self._queue_thread = None
+
+    def _play_blocking(self, path: str, cancel: threading.Event) -> None:
+        """Play a single audio file, blocking until done or cancelled."""
+        player = _find_player()
+        if player is None:
+            return
+
+        cmd = [player, "-q", path] if player == "aplay" else [player, path]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            with self._lock:
+                if cancel.is_set():
+                    proc.kill()
+                    proc.wait()
+                    return
+                self._current_proc = proc
+
+            while proc.poll() is None:
+                if cancel.wait(timeout=0.1):
+                    proc.kill()
+                    proc.wait()
+                    return
+        except Exception:
+            logger.warning("Audio queue playback failed for %s", path, exc_info=True)
         finally:
             with self._lock:
                 if self._current_proc is proc:

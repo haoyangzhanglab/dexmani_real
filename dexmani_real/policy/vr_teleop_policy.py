@@ -19,9 +19,11 @@ from scipy.spatial.transform import Rotation
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.path_utils import plan_joint_home_path
-from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
+from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
+from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import arm, hand, policy
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
+from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.shm.shared_storage import (
     HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage,
@@ -97,6 +99,14 @@ class PolicyConfig:
     hand_ramp_frames: int = field(default_factory=lambda: policy.hand_ramp_frame_count)
     hand_disconnect_timeout_s: float = field(default_factory=lambda: policy.hand_disconnect_timeout_s)
 
+    # Hand FK (fingertip positions)
+    hand_urdf_path: str = field(
+        default_factory=lambda: str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf")
+    )
+    fingertip_link_names: tuple[str, ...] = field(default_factory=lambda: hand.fingertip_link_names)
+    T_eef_handbase_pos_xyz: tuple[float, float, float] = field(default_factory=lambda: hand.T_eef_handbase_pos_xyz)
+    T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = field(default_factory=lambda: hand.T_eef_handbase_quat_wxyz)
+
 
     # Joint-space hard limits — sourced from arm singleton via shared_storage.
     joint_limit_lower: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_lower)
@@ -148,6 +158,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 max_pose_error_rot_rad=np.deg2rad(5.0),
                 nullspace_step_size_deg=1.0 * (50.0 / cfg.control_hz),
             ),
+            hand_dof=False,  # hand qpos never set → collision always at default pose
         )
 
         # ── 2. VR Arm Mapper ──
@@ -198,19 +209,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     _hand_ramp_start: np.ndarray | None = None
     _hand_ramp_frames = 0
 
-    # Check if hand is connected by reading state ring (non-blocking peek).
-    # Gate on config: --no-hand sets hand_enabled=False → skip entirely.
-    if not cfg.hand_enabled:
-        hand_available = False
-        logger.info("Hand disabled (hand_enabled=False) — hold-position only")
-    else:
-        _init_hand_state = _read_hand_state(shared)
-        if _init_hand_state is not None:
-            hand_available = bool(_init_hand_state["connected"][0])
-        else:
-            hand_available = False
-
-    if hand_available:
+    def _try_init_hand_retargeter() -> None:
+        """Lazily initialize hand_retargeter if not already created."""
+        nonlocal hand_retargeter, hand_available
+        if hand_retargeter is not None:
+            return
         try:
             hand_retargeter = XHandRetargeter(
                 hand_type="right",
@@ -221,8 +224,20 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             logger.warning("Hand retargeter init failed: %s — degraded to hold-position", e)
             hand_available = False
             hand_retargeter = None
-    else:
-        logger.info("Hand not connected — hold-position only")
+
+    # ── 4b. Hand FK (fingertip positions in world frame) ──
+    _hand_fk: HandKinematics | None = None
+    _T_eef_handbase_pos = np.array(cfg.T_eef_handbase_pos_xyz, dtype=np.float64)
+    _T_eef_handbase_quat_wxyz = np.array(cfg.T_eef_handbase_quat_wxyz, dtype=np.float64)
+    if cfg.hand_urdf_path:
+        try:
+            _hand_fk = HandKinematics(cfg.hand_urdf_path, list(cfg.fingertip_link_names))
+            if _hand_fk.is_ready():
+                logger.info("Hand FK ready")
+            else:
+                logger.warning("Hand FK not ready — fingertips will be NaN")
+        except Exception as e:
+            logger.warning("Hand FK init failed: %s", e)
 
     # ── 5. Wait for subsystems ──
     logger.info("Policy: waiting for arm/hand/camera/vr ready...")
@@ -238,6 +253,23 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             kb.stop()
             return
     logger.info("Policy: all subsystems ready")
+
+    # ── 5b. Hand connectivity check (MUST run after hand_ready —
+    # hand_loop publishes initial state BEFORE setting the event,
+    # so the ring is guaranteed populated by now.)
+    if not cfg.hand_enabled:
+        hand_available = False
+        logger.info("Hand disabled (hand_enabled=False) — hold-position only")
+    else:
+        _init_hand_state = _read_hand_state(shared)
+        if _init_hand_state is not None:
+            hand_available = bool(_init_hand_state["connected"][0])
+        else:
+            hand_available = False
+        if hand_available:
+            _try_init_hand_retargeter()
+        else:
+            logger.info("Hand not connected — hold-position only")
 
     # Write heartbeat NOW — Main unblocks from vr_ready at the same moment and
     # enters the supervisor, which checks policy_heartbeat_s immediately.
@@ -263,7 +295,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     teleop_active = False
     recording_active = False
     recording_paused = False
-    teleop_hold_for_audio = False
+    _prev_audio_playing = False
+
+    # Post-teleop quit prompt (two-stage Q: first Q stops teleop, second Q exits)
+    quit_pending = False
+    post_teleop_deadline = 0.0
 
     # ── 8. EMA state ──
     ema_prev_pos: np.ndarray | None = None
@@ -282,7 +318,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     _last_target_eef_rot6d = np.full(6, np.nan)
 
     logger.info("Policy: entering main loop @ %.0f Hz", cfg.control_hz)
-    print("\n控制: B=开始遥操作+录制 C=暂停 S=保存 D=丢弃 H=归位 Q=退出 ESC=急停")
 
     gc.disable()
     try:
@@ -303,6 +338,80 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
             loop_count += 1
 
+            # ── Post-teleop quit prompt (two-stage Q) ──
+            # Entered after Q key stops teleop.  Policy loop stays alive with
+            # heartbeats ticking so arm/hand/vr continue running — H (return_home)
+            # can still queue HOME_SENTINEL and wait for convergence.
+            if quit_pending:
+                # Show prompt once per entry; re-shown after H completes.
+                for _sig in kb.poll(timeout=0.1):
+                    if _sig == ControlSignal.HOME:
+                        print("  H: return_home")
+                        # ── Hand home first (blocking with heartbeat) ──
+                        _hand_home_done = True
+                        if hand_available and not shared.error_state.value:
+                            _hand_home_tol = np.deg2rad(5.0)
+                            _hand_home_deadline = time.monotonic() + 5.0
+                            _hand_home_reached = False
+                            _hand_home_first = True
+                            while time.monotonic() < _hand_home_deadline and shared.is_running.value:
+                                shared.policy_heartbeat_s.value = time.monotonic()
+                                _write_hand_cmd(shared, HAND_HOME_QPOS)
+                                prev_hand_qpos = HAND_HOME_QPOS.copy()
+                                _hs = _read_hand_state(shared)
+                                if _hs is not None:
+                                    _current = np.asarray(_hs["qpos"][0], dtype=np.float64)
+                                    if np.all(np.isfinite(_current)):
+                                        _err = float(np.max(np.abs(_current - HAND_HOME_QPOS)))
+                                        if _err < _hand_home_tol:
+                                            _hand_home_reached = True
+                                            break
+                                        if _hand_home_first:
+                                            print(f"  hand: homing... (max_err={np.rad2deg(_err):.0f}°)", flush=True)
+                                            _hand_home_first = False
+                                time.sleep(0.05)
+                            if _hand_home_reached:
+                                print("  hand: home reached", flush=True)
+                            else:
+                                logger.warning("hand home settle timeout after 5s — proceeding")
+                                _hand_home_done = False
+                        elif not hand_available:
+                            print("  hand: not connected — skipping hand home", flush=True)
+
+                        # ── Arm home ──
+                        _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                        # Read current arm position for path planning.
+                        _cur_as = _read_arm_state(shared)
+                        _cur_qpos = _home_qpos.copy()
+                        if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
+                            _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
+                        _waypoints = plan_joint_home_path(_cur_qpos, _home_qpos, planner)
+                        _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
+                        _arm_home_ok = _wait_arm_home_convergence(shared, _home_qpos)
+                        if _arm_home_ok:
+                            audio.play("home_done")
+                            print("  arm: home reached", flush=True)
+                        else:
+                            logger.warning("arm home convergence timeout after 15s")
+                        limiter.reset()  # prevent over-budget warning after blocking hand home
+                        print("  [Q] quit", flush=True)
+
+                    elif _sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
+                        if _sig == ControlSignal.EMERGENCY_STOP:
+                            shared.estop_request.value = True
+                        shared.is_running.value = False
+                        break
+
+                if not shared.is_running.value:
+                    break
+
+                if time.perf_counter() > post_teleop_deadline:
+                    print("  timeout — auto exit")
+                    shared.is_running.value = False
+                    break
+
+                continue  # stay in quit_pending, don't process normal teleop
+
             # ── Keyboard ──
             skip_rest = False
             for sig in kb.poll(timeout=0.0):
@@ -320,13 +429,14 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     audio.play("quit")
 
                     if recording_active:
-                        audio.play("quit_save_prompt")
+                        audio.queue("quit_save_prompt")  # queue: plays after "quit" finishes
                         print("  [S] 保存并退出  [D] 丢弃并退出  [H] 保存并归位 (30s 超时默认丢弃)")
 
                         decision: bool | None = None
                         do_home: bool = False
                         deadline = time.perf_counter() + 30.0
                         while time.perf_counter() < deadline:
+                            shared.policy_heartbeat_s.value = time.monotonic()
                             for post_sig in kb.poll(timeout=0.1):
                                 if post_sig == ControlSignal.STOP:
                                     decision = True
@@ -368,50 +478,119 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
                         if do_home and shared.is_running.value:
                             audio.play("home")
-                            _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                            _home_wp = plan_joint_home_path(arm_qpos, _home_qpos, planner)
-                            _safe_arm_queue_put(shared, (HOME_SENTINEL, _home_wp))
                             teleop_active = False
                             transition(shared, SafetyState.ARMED)
                             arm_mapper.clear()
                             ema_prev_pos = ema_prev_quat = None
                             _reset_hand_retargeter(hand_retargeter)
-                            # Give arm process time to pick up HOME_SENTINEL and home (~8s)
-                            _home_deadline = time.monotonic() + 15.0
-                            while time.monotonic() < _home_deadline:
-                                _hb = shared.arm_heartbeat_s.value
-                                if _hb > 0 and time.monotonic() - _hb < 3.0:
-                                    time.sleep(0.5)
-                                else:
-                                    break
-                            audio.play("home_done")
-                    else:
-                        _stop_recording(recorder, recording_active, save=False, shared=shared)
-                        recording_active = False
 
-                    shared.is_running.value = False
-                    break
+                            # ── Step 1: Hand home first (before arm moves) ──
+                            if hand_available and not shared.error_state.value:
+                                _hand_home_tol = np.deg2rad(5.0)
+                                _hand_home_deadline = time.monotonic() + 5.0
+                                _hand_home_first = True
+                                while time.monotonic() < _hand_home_deadline and shared.is_running.value:
+                                    shared.policy_heartbeat_s.value = time.monotonic()
+                                    _write_hand_cmd(shared, HAND_HOME_QPOS)
+                                    prev_hand_qpos = HAND_HOME_QPOS.copy()
+                                    _hs = _read_hand_state(shared)
+                                    if _hs is not None:
+                                        _current = np.asarray(_hs["qpos"][0], dtype=np.float64)
+                                        if np.all(np.isfinite(_current)):
+                                            _err = float(np.max(np.abs(_current - HAND_HOME_QPOS)))
+                                            if _err < _hand_home_tol:
+                                                break
+                                            if _hand_home_first:
+                                                print(f"  hand: homing... (max_err={np.rad2deg(_err):.0f}°)", flush=True)
+                                                _hand_home_first = False
+                                    time.sleep(0.05)
+
+                            # ── Step 2: Arm home ──
+                            _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                            _home_wp = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                            _safe_arm_queue_put(shared, (HOME_SENTINEL, _home_wp))
+                            _arm_home_converged = _wait_arm_home_convergence(shared, _home_qpos)
+                            if _arm_home_converged:
+                                audio.play("home_done")
+                                print("  arm: home reached", flush=True)
+
+                    # Enter post-teleop state (two-stage Q) instead of immediate exit.
+                    # Policy loop stays alive with heartbeats ticking; arm/hand/vr
+                    # continue running so H (return_home) still works.
+                    teleop_active = False
+                    transition(shared, SafetyState.ARMED)
+                    shared.quit_requested.value = True
+                    quit_pending = True
+                    post_teleop_deadline = time.perf_counter() + 60.0
+                    print("\n[H] return_home  [Q] quit  (60s timeout)", flush=True)
+                    skip_rest = True
+                    break  # break from for-sig loop, re-enter main loop in quit_pending state
 
                 elif sig == ControlSignal.HOME:
                     print("\nH: return_home")
                     audio.play("home")
                     _stop_recording(recorder, recording_active, save=True, shared=shared)
                     recording_active = False
-                    # Hand home (send before arm HOME_SENTINEL — hand is independent)
-                    _write_hand_cmd(shared, HAND_HOME_QPOS)
-                    prev_hand_qpos = HAND_HOME_QPOS.copy()
-
-                    # Plan collision-safe path (uses policy's CollisionModel).
-                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                    _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
-                    _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
-
                     teleop_active = False
                     transition(shared, SafetyState.ARMED)
                     arm_mapper.clear()
                     ema_prev_pos = ema_prev_quat = None
                     _reset_hand_retargeter(hand_retargeter)
-                    audio.play("home_done")
+
+                    # ── Step 1: Hand home first ──
+                    # Poll hand_state_ring until the hand converges to home_qpos.
+                    # Prevents the arm from sweeping across the workspace while
+                    # the hand is still in a grasp pose (collision risk), and
+                    # ensures the hand driver receives persistent commands —
+                    # a single write is unreliable when the hand is in qpos_stale.
+                    _hand_home_done = True
+                    if hand_available and not shared.error_state.value:
+                        _hand_home_tol = np.deg2rad(5.0)
+                        _hand_home_deadline = time.monotonic() + 5.0
+                        _hand_home_reached = False
+                        _hand_home_first = True
+                        while time.monotonic() < _hand_home_deadline and shared.is_running.value:
+                            shared.policy_heartbeat_s.value = time.monotonic()
+                            _write_hand_cmd(shared, HAND_HOME_QPOS)
+                            prev_hand_qpos = HAND_HOME_QPOS.copy()
+
+                            _hs = _read_hand_state(shared)
+                            if _hs is not None:
+                                _current = np.asarray(_hs["qpos"][0], dtype=np.float64)
+                                if np.all(np.isfinite(_current)):
+                                    _err = float(np.max(np.abs(_current - HAND_HOME_QPOS)))
+                                    if _err < _hand_home_tol:
+                                        _hand_home_reached = True
+                                        break
+                                    if _hand_home_first:
+                                        print(f"  hand: homing... (max_err={np.rad2deg(_err):.0f}°)", flush=True)
+                                        _hand_home_first = False
+                            time.sleep(0.05)
+                        if _hand_home_reached:
+                            print("  hand: home reached", flush=True)
+                        else:
+                            logger.warning("hand home settle timeout after 5s — proceeding")
+                            _hand_home_done = False
+                    elif not hand_available:
+                        print("  hand: not connected — skipping hand home", flush=True)
+
+                    # ── Step 2: Arm home (after hand is at home) ──
+                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                    _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                    _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
+
+                    # Wait for arm to actually converge to home_qpos before
+                    # playing "home_done".  arm_loop executes waypoints
+                    # synchronously in _planned_homing (~1s for 31 waypoints
+                    # at 30Hz).  We poll arm_state_ring with heartbeat ticks.
+                    _arm_home_ok = _wait_arm_home_convergence(shared, _home_qpos)
+                    if _arm_home_ok:
+                        audio.play("home_done")
+                        print("  arm: home reached", flush=True)
+                    else:
+                        logger.warning("arm home convergence timeout after 15s")
+
+                    limiter.reset()  # prevent over-budget warning after blocking home
                     skip_rest = True
 
                 elif sig == ControlSignal.STOP:
@@ -444,11 +623,12 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     print(f"\nC: {state_str}遥操作")
                     if teleop_active:
                         audio.play("resume")
-                        arm_mapper_reset = _try_reset_mapper(shared, arm_mapper)
+                        arm_mapper_reset = _try_reset_mapper(shared)
                         if arm_mapper_reset:
                             # Warm-start hand retargeter NLP from current hardware
                             # pose so the first retarget() converges from near-optimum
-                            # (matching B-press pattern at lines 527-531).
+                            # (matching B-press pattern).
+                            _try_init_hand_retargeter()
                             _hs = _read_hand_state(shared)
                             _reset_hand_retargeter(
                                 hand_retargeter,
@@ -458,11 +638,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             )
                             if _hs is not None and np.all(np.isfinite(_hs["qpos"][0])):
                                 prev_hand_qpos = _hs["qpos"][0].copy()
-                            audio.play("calibrated")
-                            # Trigger audio-hold gate — when audio finishes, the
-                            # existing hold-exit path (lines 641-642) seeds the
-                            # smoothstep ramp from hardware pose and clears EMA state.
-                            teleop_hold_for_audio = True
                     else:
                         audio.play("pause")
                     skip_rest = True
@@ -489,11 +664,19 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _depth_scale = float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
                     _cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
                     _cam_serial = _cam_serial_bytes.decode() if _cam_serial_bytes else None
-                    _cam_name = _cam_serial
+
+                    # Resolve camera extrinsics from cameras.json by serial.
+                    _calib = CameraCalib()
+                    try:
+                        _cam_name = _calib.resolve_name_by_serial(_cam_serial) if _cam_serial else None
+                    except (KeyError, FileNotFoundError):
+                        _cam_name = None
+                        logger.warning("Camera serial %s not found in cameras.json — no extrinsics in /meta", _cam_serial)
 
                     if not recorder.start_episode(
                         task_label=cfg.task_label,
                         operator=cfg.operator,
+                        calib=_calib,
                         camera_K=_cam_K,
                         camera_name=_cam_name,
                         camera_serial=_cam_serial,
@@ -514,22 +697,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     recording_active = True
                     shared.is_recording.value = True
                     kb.drain_signal(ControlSignal.BEGIN)
-                    arm_state = _read_arm_state(shared)
-                    if arm_state is not None and np.all(np.isfinite(arm_state["qpos"][0])):
-                        arm_qpos = arm_state["qpos"][0].copy()
-                        eef_pos = arm_state["eef_pos"][0].copy()
-                        eef_rot6d = arm_state["eef_rot6d"][0].copy()
-                        eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
-                    else:
-                        eef_pos = np.zeros(3)
-                        eef_quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0])
-                    arm_mapper.reset(
-                        wrist_pos=vr_frame["wrist_pos"],
-                        wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                        eef_pos=eef_pos,
-                        eef_quat_wxyz=eef_quat_wxyz,
-                    )
-                    audio.play("calibrated")
                     teleop_active = True
                     transition(shared, SafetyState.RUNNING)
                     recording_paused = False
@@ -537,6 +704,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _hand_disconnected_at = None
                     # Reset hand retargeter and seed with current hardware pose
                     # so the first retarget() frame converges from near-optimum.
+                    _try_init_hand_retargeter()
                     _hand_state_for_reset = _read_hand_state(shared)
                     _reset_hand_retargeter(
                         hand_retargeter,
@@ -548,7 +716,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     if _hand_state_for_reset is not None and np.all(np.isfinite(_hand_state_for_reset["qpos"][0])):
                         prev_hand_qpos = _hand_state_for_reset["qpos"][0].copy()
                     audio.play("begin")
-                    teleop_hold_for_audio = True
                     print(f"\nB: 遥操作+录制开始  episode={recorder.frame_count}")
                     skip_rest = True
 
@@ -599,17 +766,26 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             # a persistent disconnect exceeding hand_disconnect_timeout_s.
             _hand_connected = bool(hand_state["connected"][0]) if hand_state is not None else False
             if _hand_connected:
-                if not hand_available and _hand_disconnected_at is not None:
-                    _dt = time.monotonic() - _hand_disconnected_at
-                    logger.info("Hand recovered after %.1fs — re-enabling hand control", _dt)
+                if not hand_available:
+                    # Recovery: hand was unavailable but is now connected.
+                    # Two scenarios: (a) was True→False→True (runtime glitch,
+                    # _hand_disconnected_at is set), or (b) was False from init
+                    # (_hand_disconnected_at is None — cold-start connect).
+                    if _hand_disconnected_at is not None:
+                        _dt = time.monotonic() - _hand_disconnected_at
+                        logger.info("Hand recovered after %.1fs — re-enabling hand control", _dt)
+                    else:
+                        logger.info("Hand connected — enabling hand control (cold-start)")
                     hand_available = True
-                    _reset_hand_retargeter(hand_retargeter, (
-                        hand_state["qpos"][0].copy()
-                        if hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0]))
-                        else None
-                    ))
-                    if hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
-                        prev_hand_qpos = hand_state["qpos"][0].copy()
+                    _try_init_hand_retargeter()
+                    if hand_available:
+                        _reset_hand_retargeter(hand_retargeter, (
+                            hand_state["qpos"][0].copy()
+                            if hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0]))
+                            else None
+                        ))
+                        if hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
+                            prev_hand_qpos = hand_state["qpos"][0].copy()
                 _hand_disconnected_at = None
             elif hand_available:
                 if _hand_disconnected_at is None:
@@ -635,26 +811,61 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                  hand_state=hand_state, hand_tactile=hand_tactile,
                                  arm_qpos_sent=prev_qpos_cmd.copy(),
                                  target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d)
+                                 target_eef_rot6d=_last_target_eef_rot6d,
+                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
+                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
                 prev_qpos_cmd = arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None
                 continue
 
-            # ── Audio hold ──
-            if teleop_hold_for_audio:
-                if audio.is_playing:
-                    prev_qpos_cmd = arm_qpos.copy()
-                    # Refresh prev_hand_qpos from current hardware state so
-                    # the hand ramp starts from the actual joint position.
-                    if hand_available and hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
-                        prev_hand_qpos = hand_state["qpos"][0].copy()
-                    continue
-                # Audio just ended — seed the hand ramp origin from current
-                # hardware pose so retargeting transitions smoothly.
+            # ── Audio hold (falling-edge detection) ──
+            # Hold arm position while voice prompts play, then run hold-exit
+            # (mapper reset + EMA clear + hand ramp) on the falling edge.
+            if audio.is_playing:
+                prev_qpos_cmd = arm_qpos.copy()
+                # Refresh prev_hand_qpos from current hardware state so
+                # the hand ramp starts from the actual joint position.
+                if hand_available and hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
+                    prev_hand_qpos = hand_state["qpos"][0].copy()
+                _prev_audio_playing = True
+                continue
+
+            if _prev_audio_playing:
+                # Audio just ended — re-establish wrist→EEF mapping from the
+                # current pose to prevent a jump.  The user's VR hand naturally
+                # moves during the ~2s audio playback; resetting the mapper
+                # captures the current offset, so the first map() produces a
+                # near-zero delta (same pattern as C-resume handler).
+                if arm_state is not None and vr_frame is not None:
+                    _eef_pos = arm_state["eef_pos"][0].copy()
+                    _eef_rot6d = arm_state["eef_rot6d"][0].copy()
+                    if np.all(np.isfinite(_eef_pos)) and np.all(np.isfinite(_eef_rot6d)):
+                        arm_mapper.reset(
+                            wrist_pos=vr_frame["wrist_pos"],
+                            wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
+                            eef_pos=_eef_pos,
+                            eef_quat_wxyz=rot6d_to_quat_wxyz(_eef_rot6d),
+                        )
+                # Clear EMA state: the mapper was just reset above so
+                # the first post-audio map() produces a near-zero delta.
+                # Letting EMA start from None causes the first frame to
+                # skip smoothing (no prior to interpolate against), which
+                # is correct — the re-reset mapper output IS the current
+                # arm pose in world frame.
+                # IMPORTANT: do NOT seed from arm_state["eef_pos"] — that
+                # value is in base frame (Pinocchio FK), while mapper
+                # output is in world frame.  Mixing the two in EMA would
+                # produce a garbage pose and arm jump.
                 ema_prev_pos = ema_prev_quat = None
                 _hand_ramp_start = prev_hand_qpos.copy() if hand_available else None
                 _hand_ramp_frames = cfg.hand_ramp_frames
-                teleop_hold_for_audio = False
+                # Re-seed hand retargeter NLP warm-start from current hardware
+                # pose (mirrors the arm_mapper reset above).  Without this, the
+                # SLSQP initial guess is the qpos from B-press time (~2s stale).
+                # Smoothstep ramp + one-frame SLSQP self-correction make this
+                # harmless in practice, but re-seeding is symmetric and clear.
+                _reset_hand_retargeter(hand_retargeter, prev_hand_qpos.copy() if hand_available else None)
+                _prev_audio_playing = False
 
             # ── VR→EEF mapping ──
             assert vr_frame is not None  # guaranteed by vr_stale check above
@@ -665,7 +876,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                  hand_state=hand_state, hand_tactile=hand_tactile,
                                  arm_qpos_sent=prev_qpos_cmd.copy(),
                                  target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d)
+                                 target_eef_rot6d=_last_target_eef_rot6d,
+                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
+                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
                 if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
                     shared.is_running.value = False
                     break
@@ -732,7 +945,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                  frame_status=_FRAME_IK_FAIL, retarget_ok=retarget_ok,
                                  arm_qpos_sent=prev_qpos_cmd.copy(),
                                  target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d)
+                                 target_eef_rot6d=_last_target_eef_rot6d,
+                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
+                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
                 if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
                     shared.is_running.value = False
                     break
@@ -775,7 +990,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                  frame_status=_FRAME_SAFETY_REJECT, retarget_ok=retarget_ok,
                                  arm_qpos_sent=prev_qpos_cmd.copy(),
                                  target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d)
+                                 target_eef_rot6d=_last_target_eef_rot6d,
+                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
+                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
                 if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
                     shared.is_running.value = False
                     break
@@ -794,7 +1011,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                  hand_state=hand_state, hand_tactile=hand_tactile,
                                  arm_qpos_sent=prev_qpos_cmd.copy(),
                                  target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d)
+                                 target_eef_rot6d=_last_target_eef_rot6d,
+                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
+                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
                 continue
             if not _safe_arm_queue_put(shared, {"qpos": arm_cmd.copy()}):
                 logger.error("policy_loop: arm_action_q full on main send — arm unresponsive")
@@ -821,7 +1040,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 _record_frame(recorder, arm_state, hand_state, arm_cmd, hand_cmd,
                               target_pos, target_quat, vr_frame, cam, ik_solve_time_ms,
                               target_pos_before_clamp,
-                              hand_tactile, retarget_ok=retarget_ok, frame_status=_f_status)
+                              hand_tactile, retarget_ok=retarget_ok, frame_status=_f_status,
+                              hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
+                              T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
             stage_timer.mark("rec")
 
     finally:
@@ -856,6 +1077,31 @@ def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.5) 
     except Full:
         logger.warning("policy_loop: arm_action_q full (timeout=%.1fs) — arm unresponsive", timeout)
         return False
+
+
+def _wait_arm_home_convergence(shared: SharedStorage, home_qpos: np.ndarray, *, timeout_s: float = 15.0) -> bool:
+    """Wait for the arm to converge to home_qpos after queuing HOME_SENTINEL.
+
+    Polls ``arm_state_ring`` at ~10 Hz, ticking ``policy_heartbeat_s`` so the
+    supervisor doesn't FAULT.  Returns True when all joints are within 2° of
+    *home_qpos*, False on timeout.
+
+    This replaces the old heartbeat-staleness check which was a no-op: arm_loop
+    ticks ``arm_heartbeat_s`` every ~33 ms during normal operation, so
+    ``now - arm_heartbeat_s > 3.0`` never fires while the arm is alive.
+    """
+    _home_tol = np.deg2rad(2.0)
+    _deadline = time.monotonic() + timeout_s
+    while time.monotonic() < _deadline and shared.is_running.value:
+        shared.policy_heartbeat_s.value = time.monotonic()
+        _as = _read_arm_state(shared)
+        if _as is not None:
+            _q = np.asarray(_as["qpos"][0], dtype=np.float64)
+            if np.all(np.isfinite(_q)):
+                if float(np.max(np.abs(_q - home_qpos))) < _home_tol:
+                    return True
+        time.sleep(0.1)
+    return False
 
 
 
@@ -902,8 +1148,8 @@ def _read_camera_frame(shared: SharedStorage) -> dict | None:
 
 
 
-def _try_reset_mapper(shared: SharedStorage, arm_mapper: ArmWristMapper) -> bool:
-    """Re-establish wrist→EEF mapping on resume. Returns True on success."""
+def _try_reset_mapper(shared: SharedStorage) -> bool:
+    """Validate that arm and VR state are available for resume-calibrate initiation. Returns True on success."""
     vr_frame = _read_vr_frame(shared)
     if vr_frame is None:
         return False
@@ -915,13 +1161,6 @@ def _try_reset_mapper(shared: SharedStorage, arm_mapper: ArmWristMapper) -> bool
     eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
     if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(eef_quat_wxyz)):
         return False
-    assert vr_frame is not None and arm_state is not None  # checked above
-    arm_mapper.reset(
-        wrist_pos=vr_frame["wrist_pos"],
-        wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-        eef_pos=eef_pos,
-        eef_quat_wxyz=eef_quat_wxyz,
-    )
     return True
 
 
@@ -949,6 +1188,9 @@ def _record_held(
     diagnostics: dict | None = None,
     target_eef_pos: np.ndarray | None = None,
     target_eef_rot6d: np.ndarray | None = None,
+    hand_fk = None,
+    T_eef_handbase_pos: np.ndarray | None = None,
+    T_eef_handbase_quat_wxyz: np.ndarray | None = None,
 ) -> None:
     """Record a held frame (no new action sent).
 
@@ -971,7 +1213,12 @@ def _record_held(
         target_eef_pos=target_eef_pos.copy() if target_eef_pos is not None else None,
         target_eef_rot6d=target_eef_rot6d.copy() if target_eef_rot6d is not None else None,
     )
-    state = _build_robot_state(arm_state, hand_state, hand_tactile)
+    state = _build_robot_state(
+        arm_state, hand_state, hand_tactile,
+        hk=hand_fk,
+        T_eef_handbase_pos=T_eef_handbase_pos,
+        T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
+    )
     recorder.add_frame(
         state, action, vr_frame, camera_frame=cam,
         signals={"ik_ok": False, "ik_attempted": frame_status != _FRAME_HELD,
@@ -999,6 +1246,9 @@ def _record_frame(
     *,
     retarget_ok: bool = False,
     frame_status: int = _FRAME_OK,
+    hand_fk = None,
+    T_eef_handbase_pos: np.ndarray | None = None,
+    T_eef_handbase_quat_wxyz: np.ndarray | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
 
@@ -1012,7 +1262,12 @@ def _record_frame(
         target_eef_pos=target_pos.copy(),
         target_eef_rot6d=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat)),
     )
-    state = _build_robot_state(arm_state, hand_state, hand_tactile)
+    state = _build_robot_state(
+        arm_state, hand_state, hand_tactile,
+        hk=hand_fk,
+        T_eef_handbase_pos=T_eef_handbase_pos,
+        T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
+    )
     head_quat = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
     _vr = vr_frame if vr_frame is not None else {
         "wrist_pos": np.full(3, np.nan),
@@ -1035,7 +1290,10 @@ def _record_frame(
 
 
 def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | None,
-                       hand_tactile: np.ndarray | None = None) -> RobotState:
+                       hand_tactile: np.ndarray | None = None,
+                       hk: HandKinematics | None = None,
+                       T_eef_handbase_pos: np.ndarray | None = None,
+                       T_eef_handbase_quat_wxyz: np.ndarray | None = None) -> RobotState:
     """Build a RobotState from ring data for recording compatibility."""
     if arm_state is not None:
         r = arm_state[0]
@@ -1075,6 +1333,25 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
     else:
         hand_tactile_force = np.zeros((5, 120, 3), dtype=np.float64)
 
+    # Compute world-frame fingertip positions via hand FK.
+    fingertip_pos = nan_array((5, 3))
+    if hk is not None and hk.is_ready() and hand_connected and np.all(np.isfinite(hand_qpos)):
+        tips_in_handbase = hk.compute_tip_positions_in_handbase(hand_qpos)
+        if np.all(np.isfinite(tips_in_handbase)) and np.all(np.isfinite(eef_pos)):
+            eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
+            T_world_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
+            T_eef_handbase = Pose(
+                p=T_eef_handbase_pos if T_eef_handbase_pos is not None else np.zeros(3),
+                q=T_eef_handbase_quat_wxyz if T_eef_handbase_quat_wxyz is not None else np.array([1.0, 0.0, 0.0, 0.0]),
+            )
+            identity_quat = np.array([1.0, 0.0, 0.0, 0.0])
+            tips_world = np.zeros((5, 3), dtype=np.float64)
+            for i in range(5):
+                tip_in_handbase = Pose(p=tips_in_handbase[i], q=identity_quat)
+                T_world_tip = compose_pose(compose_pose(T_world_eef, T_eef_handbase), tip_in_handbase)
+                tips_world[i] = T_world_tip.p
+            fingertip_pos = tips_world
+
     return RobotState(
         arm_qpos=arm_qpos,
         arm_qvel=arm_qvel,
@@ -1091,7 +1368,7 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
         hand_commboard_err=np.zeros(12, dtype=np.int32),
         hand_jointboard_err=np.zeros(12, dtype=np.int32),
         hand_qpos_stale=hand_qpos_stale,
-        fingertip_pos=nan_array((5, 3)),
+        fingertip_pos=fingertip_pos,
         arm_connected=arm_connected,
         hand_connected=hand_connected,
         timestamp=time.perf_counter(),
@@ -1169,20 +1446,21 @@ def _print_status(
 ) -> None:
     """Periodic status print (~1 Hz)."""
     if arm_state is not None:
-        eef_pos = np.round(arm_state["eef_pos"][0], 3)
+        _e = arm_state["eef_pos"][0]
+        eef_str = f"eef={_e[0]:.3f},{_e[1]:.3f},{_e[2]:.3f}"
     else:
-        eef_pos = np.full(3, np.nan)
-    vr_age = (
-        (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) / 1e9
-        if vr_frame is not None
-        else -1
-    )
+        eef_str = "eef=?,?,?"
+    if vr_frame is not None:
+        vr_age_ms = (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) / 1e6
+        vr_str = f"vr={vr_age_ms:.0f}ms"
+    else:
+        vr_str = "vr=?ms"
     parts = [
-        f"[f={loop_count}]",
-        f"eef={eef_pos}m",
-        f"teleop={'ON' if teleop_active else 'OFF'}",
-        f"rec={'ON' if recording_active else 'OFF'}",
-        f"vr_age={vr_age:.3f}s",
+        f"f={loop_count:>5d}",
+        eef_str,
+        f"T={'1' if teleop_active else '0'}",
+        f"R={'1' if recording_active else '0'}",
+        vr_str,
         f"err={error_count}",
     ]
     if arm_q_depth >= 0:

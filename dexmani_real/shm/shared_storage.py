@@ -148,6 +148,7 @@ class SharedStorage:
     is_recording: Any  # mp.Value('b') — PolicyProcess -> Arm/Hand/Camera
     error_state: Any  # mp.Value('b') — Arm/Hand -> all (sticky latch, set-only)
     estop_request: Any  # mp.Value('b') — PolicyProcess -> Arm/Hand
+    quit_requested: Any  # mp.Value('b') — Policy -> Main (Policy handled post-teleop)
 
     # ---- Safety state machine (ManiUniCon P0) ----
     safety_state: Any  # mp.Value('i') — SafetyState enum (0-3), Main + Policy write
@@ -243,6 +244,7 @@ class SharedStorage:
         storage.is_recording = mp.Value("b", False)
         storage.error_state = mp.Value("b", False)
         storage.estop_request = mp.Value("b", False)
+        storage.quit_requested = mp.Value("b", False)
 
         # ---- Safety state machine ----
         storage.safety_state = mp.Value("i", int(SafetyState.DISARMED))

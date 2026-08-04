@@ -2,13 +2,13 @@
   "description": "Fixed VR-to-robot transform (LeFranX/ManiUniCon style)",
   "T_vr_to_robot": [
     [
-      0.22460031681901083,
-      0.9744509724377106,
+      0.26803058462841634,
+      0.9634104035683595,
       0.0
     ],
     [
-      -0.9744509724377106,
-      0.22460031681901083,
+      -0.9634104035683595,
+      0.26803058462841634,
       0.0
     ],
     [
@@ -17,9 +17,9 @@
       1.0
     ]
   ],
-  "theta_deg": 77.02062352498275,
+  "theta_deg": 74.45289129060068,
   "convention": "R_z(-theta) maps VR FLU forward -> robot base +X",
   "ref": "head",
-  "quality": "excellent (\u03c3=0.5\u00b0, max=1.2\u00b0)",
-  "frames": 987
+  "quality": "excellent (\u03c3=0.5\u00b0, max=1.0\u00b0)",
+  "frames": 988
 }

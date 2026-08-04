@@ -509,8 +509,25 @@ def main():
     arm_proc.start()
 
     transition(shared, SafetyState.DISARMED)
-    if not shared.arm_ready.wait(timeout=30):
+    _arm_ready_ok = False
+    _already_logged = False
+    _arm_deadline = time.monotonic() + 30
+    while time.monotonic() < _arm_deadline:
+        if shared.arm_ready.is_set():
+            _arm_ready_ok = True
+            break
+        if shared.error_state.value:
+            print("❌ arm_loop init failed: error_state set")
+            _already_logged = True
+            break
+        if not arm_proc.is_alive():
+            print("❌ arm_loop init failed: process exited")
+            _already_logged = True
+            break
+        time.sleep(0.2)
+    if not _arm_ready_ok and not _already_logged:
         print("❌ arm_loop 启动超时")
+    if not _arm_ready_ok:
         shared.is_running.value = False
         arm_proc.join(timeout=5)
         shared.close()
@@ -807,15 +824,19 @@ def main():
                 else:
                     print(f"  plan_joint_home_path returned None — falling back to joint-space interpolation")
                 shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
-                # Wait for homing to complete (arm_loop heartbeat stays alive).
-                _home_wait = time.perf_counter() + 15.0
-                _last_hb = shared.arm_heartbeat_s.value
-                while time.perf_counter() < _home_wait:
-                    time.sleep(0.5)
-                    _cur_hb = shared.arm_heartbeat_s.value
-                    if _cur_hb == _last_hb:
-                        break  # heartbeat stalled → arm_loop likely dead
-                    _last_hb = _cur_hb
+                # Wait for qpos to converge to home (arm stays there after homing).
+                _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
+                _home_deadline = time.perf_counter() + 20.0
+                _home_ok = False
+                while time.perf_counter() < _home_deadline:
+                    _qpos_h, _, _ = _read_arm_state_ring()
+                    if _qpos_h is not None:
+                        if float(np.max(np.abs(_qpos_h - _home_arr))) < 0.03:
+                            _home_ok = True
+                            break
+                    time.sleep(0.2)
+                if not _home_ok:
+                    print("  home wait timeout — continuing", flush=True)
                 # Re-sync after homing
                 arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
                 if arm_qpos is not None:
@@ -940,7 +961,14 @@ def main():
                 continue
 
             prev_qpos_cmd = ik_result.qpos.copy()
-            shared.arm_action_q.put({"qpos": ik_result.qpos})
+
+            # ── Safety gates (same as keyboard_teleop / policy_loop) ──
+            if not np.all(np.isfinite(ik_result.qpos)):
+                continue
+            if shared.safety_state.value == int(SafetyState.FAULT):
+                continue
+
+            shared.arm_action_q.put({"qpos": ik_result.qpos.copy()})
 
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt — 退出")

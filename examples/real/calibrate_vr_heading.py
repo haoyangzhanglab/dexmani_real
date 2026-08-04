@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """One-shot VR heading calibration: compute the fixed T_vr_to_robot matrix.
 
-Starts a VR receiver, collects wrist (or head) orientation data, computes
+Starts a VR receiver, collects head (or wrist) orientation data, computes
 the mean forward direction, and writes ``vr_transform.json`` to
 ``dexmani_real/config/``.
 
 Usage::
 
-    python examples/real/calibrate_vr_heading.py [--duration 10] [--ref wrist]
+    python examples/real/calibrate_vr_heading.py [--duration 10] [--ref head]
 
-By default, uses **wrist** orientation — the operator extends their arm and
-points their fingers toward robot +X.  The wrist forward direction directly
-reflects the hand motion that controls the robot, and is unaffected by head
-tilt.  Pass ``--ref head`` to use head orientation instead.
+By default, uses **head** orientation — the operator faces the robot +X
+direction.  Pass ``--ref wrist`` to use wrist orientation instead
+(extend arm, fingers pointing toward robot +X).
 
 Accuracy improvements over v1:
-- Wrist-based (default): directly measures the hand's forward direction
+- Head-based (default): simple — just face the robot
 - Countdown (3-2-1): allows operator to settle into position
 - Outlier rejection: >3σ from circular mean are discarded
 - Quality grading: excellent (σ<2°) / good (σ<5°) / poor (σ>5°)
@@ -129,12 +128,12 @@ def main() -> None:
     parser.add_argument(
         "--ref",
         choices=["wrist", "head"],
-        default="wrist",
+        default="head",
         help="标定参考: wrist=手腕指向机器人+X (默认), head=头部面朝机器人+X",
     )
     args = parser.parse_args()
 
-    ref_label = "手腕 (伸出右臂, 手指指向机器人 +X)" if args.ref == "wrist" else "头部 (面朝机器人 +X)"
+    ref_label = "头部 (面朝机器人 +X)" if args.ref == "head" else "手腕 (伸出右臂, 手指指向机器人 +X)"
 
     print("=" * 55)
     print("VR Heading 标定")
@@ -152,17 +151,20 @@ def main() -> None:
     vr_proc = mp.Process(target=vr_loop, args=(shared, vr_cfg), name="vr-calib", daemon=True)
     vr_proc.start()
 
-    if not shared.vr_ready.wait(timeout=15):
-        print("ERROR: VR receiver 启动失败 (ready timeout)")
+    # vr_ready is set on the first HTS event (headset-on), not just TCP connect.
+    # 120 s timeout = "put on headset" grace period (same as vr_teleop_hand_record).
+    print("\n  Waiting for VR connection (up to 120s) — put on Quest headset...", flush=True)
+    if not shared.vr_ready.wait(timeout=120):
+        print("  ERROR: VR receiver startup timeout (120s)", flush=True)
         shared.is_running.value = False
         vr_proc.join(timeout=5)
         shared.close()
         sys.exit(1)
+    print("  VR connected", flush=True)
 
-    print("\nVR receiver 已启动, 等待数据...")
-
-    # Wait for first valid frame (up to 120s)
-    deadline = time.monotonic() + 120.0
+    # After vr_ready, tracking data arrives quickly (headset already on).
+    print("  Waiting for VR tracking data (up to 15s)...", flush=True)
+    deadline = time.monotonic() + 15.0
     last_print = 0.0
     while time.monotonic() < deadline:
         result = shared.vr_ring.read_latest()
@@ -170,25 +172,31 @@ def main() -> None:
             data, _ts, _seq = result
             hp = np.asarray(data["head_pos"][0], dtype=np.float64)
             if np.any(hp != 0):
-                print("  已收到数据\n")
+                print("  VR tracking active\n", flush=True)
                 break
         now = time.monotonic()
         if now - last_print >= 5.0:
-            print(f"  等待中... ({int(now - (deadline - 120.0))}s, 请确认Quest app正在运行)")
+            elapsed = int(now - (deadline - 15.0))
+            print(f"    waiting... ({elapsed}s elapsed)", flush=True)
             last_print = now
         time.sleep(0.1)
     else:
-        print("ERROR: 120s内未收到数据, 请确认VR已连接且Quest app正在运行")
+        print("  ERROR: no VR tracking data after 15s", flush=True)
         shared.is_running.value = False
         vr_proc.join(timeout=5)
         shared.close()
         sys.exit(1)
 
+    # ── Settle period: first 3 s after the headset is on are discarded so the
+    # operator can fine-tune head/hand pose before collection starts.
+    print("  Settling (3s) — fine-tune your pose...", flush=True)
+    time.sleep(3.0)
+
     # ── Countdown ──
-    if args.ref == "wrist":
-        print("  请伸出右臂, 手指指向机器人 +X 方向, 保持稳定...")
-    else:
+    if args.ref == "head":
         print("  请面朝机器人 +X 方向, 保持头部静止...")
+    else:
+        print("  请伸出右臂, 手指指向机器人 +X 方向, 保持稳定...")
     for i in [3, 2, 1]:
         print(f"  {i}...")
         time.sleep(1.0)

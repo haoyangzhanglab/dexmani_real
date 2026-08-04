@@ -72,7 +72,11 @@ class ArmWristMapper:
         self.wrist_rot0 = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
         self.eef_pos0 = np.asarray(eef_pos, dtype=np.float64).copy()
         self.eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz))
-        self.last_quat_wxyz = normalize_quat_wxyz(eef_quat_wxyz)
+        # Seed continuous_quat in WORLD frame so the first map() dot-product
+        # compares quaternions in the same coordinate system.
+        # (base_to_world_rot is R_z(30°) — pure Z rotation, zero translation.)
+        _eef_rot0_world = self.base_to_world_rot @ self.eef_rot0
+        self.last_quat_wxyz = mat2quat(_eef_rot0_world)
         self._last_wrist_rot = self.wrist_rot0.copy()
 
     def map(
@@ -112,8 +116,9 @@ class ArmWristMapper:
         delta_pos_vr = wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
         delta_pos_base = self.clip_delta_pos(delta_pos_base)
-        # Transform base-frame delta → world-frame delta before adding to
-        # world-frame eef_pos0 (avoids frame mixing when base_pose_world != I).
+        # Transform base-frame delta → world frame before adding to
+        # world-frame eef_pos0.  eef_pos0 comes from ArmFK (base frame),
+        # so it must also be rotated to world frame for a consistent sum.
         delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
         delta_rot_vr = wrist_rot_gated @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
@@ -125,8 +130,14 @@ class ArmWristMapper:
         # Similarity-transform rotation delta from base frame → world frame.
         delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
 
-        target_pos = self.eef_pos0 + delta_pos_world
-        target_rot = delta_rot_world @ self.eef_rot0
+        # Convert eef reference from base frame → world frame so both
+        # terms are in the same coordinate system before adding.
+        # (is_ready() gate above guarantees eef_pos0/eef_rot0 are set.)
+        eef_pos0_world = self.base_to_world_rot @ self.eef_pos0  # type: ignore[operator]  # is_ready() gate
+        eef_rot0_world = self.base_to_world_rot @ self.eef_rot0  # type: ignore[operator]  # is_ready() gate
+
+        target_pos = eef_pos0_world + delta_pos_world
+        target_rot = delta_rot_world @ eef_rot0_world
         target_quat_wxyz = self.continuous_quat(mat2quat(target_rot))
 
         return {

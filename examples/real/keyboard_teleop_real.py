@@ -36,7 +36,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.path_utils import plan_joint_home_path
+from dexmani_real.planning.path_utils import plan_joint_home_path, wrap_nearest_equivalent
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.teleop.keyboard import GlobalKeyState
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop, ArmLoopConfig
@@ -55,7 +55,7 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-# ═══════════════════════════════════════════════ 配置
+# ═══════════════════════════════════════════════ Config
 
 
 @dataclass
@@ -73,9 +73,7 @@ class KeyboardTeleopConfig:
     # overshoot on direction reversals.  Set 0.0 for pure open-loop behaviour.
     cartesian_kp: float = 0.0  # conservative default; try 0.3–0.5 for less lag
 
-    home_dt: float = 0.04  # homing waypoint interval (s): ~25°/s
-
-    # ── Motion tracing: 追踪纯 +X 运动时的位置变化管线 ──
+    # ── Motion tracing: track position pipeline during pure-axis motion ──
     trace_motion: bool = True
     trace_frame_interval: int = 10  # print every N frames
 
@@ -88,7 +86,7 @@ _cfg = KeyboardTeleopConfig()
 WORKSPACE_BOUNDS = policy.workspace.as_array()
 
 
-# ═══════════════════════════════════════════════ 辅助函数
+# ═══════════════════════════════════════════════ Helpers
 
 
 def _print_motion_trace(
@@ -100,36 +98,25 @@ def _print_motion_trace(
     ik_fk_pos: np.ndarray,
     ik_fk_quat: np.ndarray,
     ik_target_quat: np.ndarray,
-    ik_result,
-    arm_qpos: np.ndarray,
     report: dict,
 ) -> None:
     """Print pure-axis (+X or -X) motion trace — target → EMA → IK → FK pipeline."""
     pos_error_mm = float(np.linalg.norm(ik_target_pos - ik_fk_pos) * 1000)
-    pos_error_per_axis_mm = (ik_target_pos - ik_fk_pos) * 1000
     dot = float(min(np.abs(np.dot(ik_target_quat, ik_fk_quat)), 1.0))
     rot_error_deg = float(np.rad2deg(2.0 * np.arccos(dot)))
-    raw_lead_mm = (target_pos - eef_pos) * 1000
-    ema_lead_mm = (ik_target_pos - eef_pos) * 1000
-    z_shift_mm_raw = float((ik_fk_pos[2] - ik_target_pos[2]) * 1000)
-    z_shift_mm = 0.0 if abs(z_shift_mm_raw) < 0.05 else z_shift_mm_raw  # suppress -0.0/+0.0 flip
+    raw_lead_mm = float(np.linalg.norm(target_pos - eef_pos) * 1000)
+    ema_lead_mm = float(np.linalg.norm(ik_target_pos - eef_pos) * 1000)
+    z_shift_mm = float((ik_fk_pos[2] - ik_target_pos[2]) * 1000)
 
+    _fmt_vec = lambda v: f"({v[0]:+.0f},{v[1]:+.0f},{v[2]:+.0f})"
     print(
-        f"\n{'─'*60}"
-        f"\n[TRACE #{loop_count}] 纯轴运动 + Cartesian EMA + P-term (Kp={_cfg.cartesian_kp})"
-        f"\n{'─'*60}"
-        f"\n  dx:          {np.array2string(dx * 1000, precision=1, suppress_small=True)} mm"
-        f"\n  raw target:  {np.array2string(target_pos * 1000, precision=1, suppress_small=True)} mm"
-        f"\n  EMA→IK:      {np.array2string(ik_target_pos * 1000, precision=1, suppress_small=True)} mm"
-        f"\n  eef:         {np.array2string(eef_pos * 1000, precision=1, suppress_small=True)} mm"
-        f"\n  raw lead:    {np.array2string(raw_lead_mm, precision=1, suppress_small=True)} mm"
-        f"\n  EMA lead:    {np.array2string(ema_lead_mm, precision=1, suppress_small=True)} mm"
-        f"\n  IK FK:       {np.array2string(ik_fk_pos * 1000, precision=1, suppress_small=True)} mm"
-        f"\n  IK err:      pos={pos_error_mm:.1f}mm  per_axis={np.array2string(pos_error_per_axis_mm, precision=1, suppress_small=True)} mm  rot={rot_error_deg:.2f}deg"
-        f"\n  IK Z off:    {z_shift_mm:+.1f}mm"
-        f"\n  IK: {report.get('method', '?')} seed={report.get('seed', '?')} attempts={report.get('attempts', '?')}"
-        f"\n  jnt Δ: {np.array2string(np.rad2deg(ik_result.qpos - arm_qpos), precision=2, suppress_small=True)} deg"
-        f"\n{'─'*60}",
+        f"[TRACE f={loop_count}] "
+        f"dx={_fmt_vec(dx * 1000)} mm  "
+        f"raw={_fmt_vec(target_pos * 1000)}  EMA={_fmt_vec(ik_target_pos * 1000)}  eef={_fmt_vec(eef_pos * 1000)} mm  "
+        f"lead raw={raw_lead_mm:.0f} EMA={ema_lead_mm:.0f} mm  "
+        f"err pos={pos_error_mm:.1f} rot={rot_error_deg:.2f} deg  "
+        f"Z-off={z_shift_mm:+.1f} mm  "
+        f"IK={report.get('method', '?')} att={', '.join(report.get('attempts', ['?']))}",
         flush=True,
     )
 
@@ -147,21 +134,49 @@ def _wall_check(
         now = time.perf_counter()
         if not wall_warned[axis] or now - wall_timers[axis] > 3.0:
             names = ["x", "y", "z"]
-            print(f"  ⚠ {names[axis]} 轴到达边界 [{lo:.2f}, {hi:.2f}]")
+            print(f"  [WARN] {names[axis]}-axis at boundary [{lo:.2f}, {hi:.2f}] m", flush=True)
             wall_warned[axis] = True
             wall_timers[axis] = now
 
 
-# ═══════════════════════════════════════════════ 主循环
+def _wait_for_home(
+    shared: SharedStorage,
+    home_qpos_arr: np.ndarray,
+    joint_limit_lower: tuple[float, ...],
+    joint_limit_upper: tuple[float, ...],
+    timeout_s: float = 20.0,
+    tol_rad: float = 0.03,
+) -> bool:
+    """Poll arm_state_ring until qpos converges to home_qpos or timeout."""
+    _deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < _deadline:
+        _res = shared.arm_state_ring.read_latest()
+        if _res is not None:
+            _ad, _, _ = _res
+            _q = np.asarray(_ad["qpos"][0], dtype=np.float64)
+            if np.all(np.isfinite(_q)):
+                # Wrap home_qpos to the nearest equivalent band for comparison
+                # (J1/J3/J5/J7 may report on any ±360° band).
+                _wrapped_home = wrap_nearest_equivalent(
+                    home_qpos_arr, _q, joint_limit_lower, joint_limit_upper,
+                )
+                if float(np.max(np.abs(_q - _wrapped_home))) < tol_rad:
+                    return True
+        time.sleep(0.2)
+    return False
+
+
+# ═══════════════════════════════════════════════ Main Loop
 
 
 def main():
+    _dt = 1.0 / _cfg.ctrl_hz
     print("=" * 60)
-    print("真机键盘遥操作 xArm7")
-    print(
-        f"  _cfg.delta_pos={_cfg.delta_pos*1000:.0f}mm  _cfg.delta_rpy={np.rad2deg(_cfg.delta_rpy):.1f}deg  (1.0 / _cfg.ctrl_hz)={(1.0 / _cfg.ctrl_hz)}s  EMA_POS={policy.ema.alpha_pos} EMA_ROT={policy.ema.alpha_rot}"
-    )
-    print(f"  workspace (world): x{WORKSPACE_BOUNDS[0]} y{WORKSPACE_BOUNDS[1]} z{WORKSPACE_BOUNDS[2]}")
+    print("  Keyboard Teleop — xArm7 (SharedStorage)")
+    print(f"  step  pos={_cfg.delta_pos*1000:.0f} mm  rot={np.rad2deg(_cfg.delta_rpy):.1f} deg  dt={_dt*1000:.0f} ms  rate={_cfg.ctrl_hz:.0f} Hz")
+    print(f"  EMA   pos={policy.ema.alpha_pos:.2f}  rot={policy.ema.alpha_rot:.2f}")
+    print(f"  Kp    cartesian={_cfg.cartesian_kp:.1f}")
+    print(f"  WS    x{WORKSPACE_BOUNDS[0]}  y{WORKSPACE_BOUNDS[1]}  z{WORKSPACE_BOUNDS[2]}")
     print("=" * 60)
 
     # ── 1. Planner ──
@@ -181,8 +196,25 @@ def main():
     arm_proc.start()
     hand_proc.start()
 
-    if not shared.arm_ready.wait(timeout=15):
-        print("Arm 进程启动超时，退出")
+    _arm_ready_ok = False
+    _already_logged = False
+    _arm_deadline = time.monotonic() + 15
+    while time.monotonic() < _arm_deadline:
+        if shared.arm_ready.is_set():
+            _arm_ready_ok = True
+            break
+        if shared.error_state.value:
+            logger.error("Arm init failed: error_state set")
+            _already_logged = True
+            break
+        if not arm_proc.is_alive():
+            logger.error("Arm init failed: arm process exited")
+            _already_logged = True
+            break
+        time.sleep(0.2)
+    if not _arm_ready_ok and not _already_logged:
+        logger.error("Arm process startup timeout (15s) — exiting")
+    if not _arm_ready_ok:
         _shutdown_kb(shared, arm_proc, hand_proc)
         return
     shared.hand_ready.wait(timeout=15)  # optional — degrade gracefully
@@ -192,7 +224,7 @@ def main():
     # Read initial state from rings.
     _arm_result = shared.arm_state_ring.read_latest()
     if _arm_result is None:
-        print("无法读取 arm 状态，退出")
+        logger.error("Cannot read initial arm state from ring — exiting")
         _shutdown_kb(shared, arm_proc, hand_proc)
         return
     _arm_data, _, _ = _arm_result
@@ -201,7 +233,7 @@ def main():
     eef_rot6d = np.asarray(_arm_data["eef_rot6d"][0], dtype=np.float64)
     arm_connected = bool(_arm_data["connected"][0])
     if not arm_connected or not np.all(np.isfinite(arm_qpos)):
-        print(f"Arm 状态无效: connected={arm_connected}, qpos_finite={np.all(np.isfinite(arm_qpos))}")
+        logger.error("Arm state invalid: connected=%s, qpos_finite=%s", arm_connected, np.all(np.isfinite(arm_qpos)))
         _shutdown_kb(shared, arm_proc, hand_proc)
         return
 
@@ -213,17 +245,15 @@ def main():
     target_pos = _eef_world.p.copy()
     target_quat = _eef_world.q.copy()
 
-    print(f"  arm:  OK  connected={arm_connected}")
-    print(f"\n初始状态:")
-    print(f"  arm_qpos:  {np.round(np.rad2deg(arm_qpos), 1)} deg")
-    print(f"  EEF (base):  {np.round(eef_pos, 4)} m")
-    print(f"  EEF (world): {np.round(target_pos, 4)} m  ← IK target (Pinocchio FK → world)")
-    print(f"  eef_quat:  {np.round(target_quat, 4)}")
+    print(f"  arm     connected  qpos={np.round(np.rad2deg(arm_qpos), 1)} deg")
+    print(f"  EEF     base=({eef_pos[0]:.3f},{eef_pos[1]:.3f},{eef_pos[2]:.3f}) m")
+    print(f"  target  world=({target_pos[0]:.3f},{target_pos[1]:.3f},{target_pos[2]:.3f}) m  (Pinocchio FK -> world)")
+    print(f"  quat    wx={target_quat[0]:.4f}  xyz=({target_quat[1]:.4f},{target_quat[2]:.4f},{target_quat[3]:.4f})")
 
     # ── 5. Keyboard input ──
     keys = GlobalKeyState()
     keys.start()
-    print("\n键盘控制已启动，按 Q 退出")
+    print("\nKeyboard control active — [Q] quit")
 
     # ── 6. Main loop ──
     limiter = RateManager(1.0 / (1.0 / _cfg.ctrl_hz))
@@ -232,7 +262,10 @@ def main():
     wall_timers = [0.0, 0.0, 0.0]  # per-axis debounce (independent 3 s cooldown)
     loop_count = 0
     error_count = 0
+    total_state_errors = 0  # cumulative arm state read failures
     max_consecutive_errors = 10
+    _status_interval = 50   # frames between active status prints
+    _idle_interval = 150    # frames between idle heartbeat prints
     consecutive_divergence = 0
     TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
     start_time = time.perf_counter()
@@ -241,6 +274,7 @@ def main():
     ik_fail_count = 0
     _last_ik_fail_reason = ""
     _last_ik_fail_time = 0.0
+    _homed_during_session = False  # skip redundant post-loop home prompt
 
     # Cartesian EMA state (same smoothing as vr_teleop_policy)
     _prev_ema_pos: np.ndarray | None = None
@@ -253,7 +287,7 @@ def main():
         shared.is_running.value = False
         running = False
 
-    print("\n进入遥操作循环...\n")
+    print("\nEntering teleop loop...\n")
 
     fd = sys.stdin.fileno()
     old_termios = termios.tcgetattr(fd)
@@ -266,36 +300,41 @@ def main():
             limiter.wait()
             loop_count += 1
 
-            # ── 退出/急停 ──
+            # ── Exit / estop ──
             if keys.is_pressed("esc"):
-                print("\nESC: emergency_stop")
+                print("\n[ESC] emergency stop", flush=True)
                 _emergency_stop()
                 break
 
             if keys.is_pressed("q"):
-                print("\nQ: 退出")
+                print("\n[Q] quit", flush=True)
                 running = False
                 break
 
             if keys.is_pressed("r"):
-                print("\nR: return_home")
+                _homed_during_session = True
+                elapsed = time.perf_counter() - start_time
+                print(f"\n[T+{elapsed:.0f}s f={loop_count}] [R] return_home", flush=True)
                 # Plan collision-safe path to home (same as VR policy)
                 _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
                 _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
                 if _waypoints is not None and len(_waypoints) > 0:
-                    print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
+                    print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
                 elif _waypoints is not None and len(_waypoints) == 0:
                     # Should not happen (plan_joint_home_path returns None when at home),
                     # but guard defensively.
-                    print(f"  planned homing: already close to home, skipping")
+                    print(f"  home  already close to home, skipping", flush=True)
                 else:
-                    print(f"  plan_joint_home_path returned None — falling back to joint-space interpolation")
+                    print(f"  home  plan returned None, falling back to joint-space interpolation", flush=True)
                 shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                 _prev_ema_pos = _prev_ema_quat = None
                 consecutive_divergence = 0
                 error_count = 0
-                # Wait for homing to complete, then refresh state from ring.
-                time.sleep(5.0)  # generous — arm_loop homing takes ~3-4s
+                # Wait for homing to converge, then refresh state from ring.
+                _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
+                _converged = _wait_for_home(shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0)
+                if not _converged:
+                    print("  home  wait timeout — continuing", flush=True)
                 _arm_result = shared.arm_state_ring.read_latest()
                 if _arm_result is not None:
                     _ad, _, _ = _arm_result
@@ -315,8 +354,9 @@ def main():
             _arm_result = shared.arm_state_ring.read_latest()
             if _arm_result is None:
                 error_count += 1
+                total_state_errors += 1
                 if error_count > max_consecutive_errors:
-                    print("连续arm state丢失，急停退出")
+                    logger.error("Consecutive arm state read failures — emergency stop")
                     _emergency_stop()
                     break
                 continue
@@ -330,8 +370,9 @@ def main():
 
             if not arm_connected:
                 error_count += 1
+                total_state_errors += 1
                 if error_count > 3:
-                    print("Arm disconnected, 急停退出")
+                    logger.error("Arm disconnected — emergency stop")
                     _emergency_stop()
                     break
                 continue
@@ -342,15 +383,16 @@ def main():
             if arm_error_code != 0:
                 if arm_error_code in (22, 24, 31):
                     # arm_loop auto-clears these — just log and continue
-                    if loop_count % 50 == 0:
-                        print(f"  ⚠ Arm error C{arm_error_code} (arm_loop auto-recovering)", flush=True)
+                    if loop_count % _status_interval == 0:
+                        logger.warning("Arm error C%d (arm_loop auto-recovering)", arm_error_code)
                 else:
-                    print(f"arm 非可恢复错误: C{arm_error_code}")
+                    logger.error("Arm unrecoverable error C%d — emergency stop", arm_error_code)
                     _emergency_stop()
                     break
 
             if not np.all(np.isfinite(arm_qpos)):
                 error_count += 1
+                total_state_errors += 1
                 continue
 
             # ── EEF target delta from keys ──
@@ -384,22 +426,23 @@ def main():
 
             # ── Periodic status (suppressed when idle — no keys pressed) ──
             _is_idle = np.all(dx == 0) and np.all(drpy == 0)
-            if loop_count % 50 == 0:
+            if loop_count % _status_interval == 0:
                 # Always track velocity baseline (even when idle) so the first
                 # non-idle status line gets an accurate speed estimate.
                 if prev_eef_pos is not None:
-                    vel = np.linalg.norm(eef_pos - prev_eef_pos) / (50 * (1.0 / _cfg.ctrl_hz))
+                    vel = np.linalg.norm(eef_pos - prev_eef_pos) / (_status_interval * _dt)
                 else:
                     vel = 0.0
                 prev_eef_pos = eef_pos.copy()
                 if not _is_idle:
                     elapsed = time.perf_counter() - start_time
                     _eef_world_status = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.,0.,0.,0.])))
+                    _tw = _eef_world_status.p
                     print(
-                        f"[T+{elapsed:.1f}s f={loop_count}] "
-                        f"eef_w={np.round(_eef_world_status.p, 3)}m  "
-                        f"target_w={np.round(target_pos, 3)}  "
-                        f"v={vel:.2f}m/s  ik={ik_outcome}  err={error_count}",
+                        f"[T+{elapsed:.0f}s f={loop_count}] "
+                        f"eef_w=({_tw[0]:.3f},{_tw[1]:.3f},{_tw[2]:.3f}) m  "
+                        f"target_w=({target_pos[0]:.3f},{target_pos[1]:.3f},{target_pos[2]:.3f}) m  "
+                        f"v={vel:.3f} m/s  ik={ik_outcome}",
                         flush=True,
                     )
 
@@ -411,6 +454,9 @@ def main():
                 target_quat = _eef_world.q.copy()
                 prev_qpos_cmd = arm_qpos.copy()
                 _prev_ema_pos = _prev_ema_quat = None  # reset EMA on re-engage
+                if loop_count % _idle_interval == 0:
+                    elapsed = time.perf_counter() - start_time
+                    print(f"[idle T+{elapsed:.0f}s]  eef_w=({target_pos[0]:.3f},{target_pos[1]:.3f},{target_pos[2]:.3f}) m", flush=True)
                 continue
 
             # ── Incremental target (world frame) ──
@@ -482,7 +528,7 @@ def main():
                 reason = getattr(ik_result, "reason", "") or "unknown"
                 now = time.perf_counter()
                 if reason != _last_ik_fail_reason or now - _last_ik_fail_time > 1.0:
-                    print(f"  ⚡ IK fail (#{ik_fail_count}): {reason}", flush=True)
+                    logger.warning("IK fail #%d: %s", ik_fail_count, reason)
                     _last_ik_fail_reason = reason
                     _last_ik_fail_time = now
                 # Snap target to current world-frame EEF
@@ -498,7 +544,7 @@ def main():
             prev_qpos_cmd = ik_result.qpos.copy()
             arm_cmd = ik_result.qpos
 
-            # ── Motion Trace: 纯轴运动管线诊断 ──
+            # ── Motion Trace: pure-axis pipeline diagnostics ──
             if (
                 _cfg.trace_motion
                 and loop_count % _cfg.trace_frame_interval == 0
@@ -518,8 +564,6 @@ def main():
                     ik_fk_pos=ik_fk_pose_world.p,
                     ik_fk_quat=ik_fk_pose_world.q,
                     ik_target_quat=ik_target_quat,
-                    ik_result=ik_result,
-                    arm_qpos=arm_qpos,
                     report=getattr(ik_result, "report", {}) or {},
                 )
 
@@ -539,12 +583,12 @@ def main():
                 tracking_err = np.max(np.abs(arm_qpos - sent_cmd))
                 if tracking_err > TRACKING_DIVERGENCE_THRESHOLD_RAD:
                     consecutive_divergence += 1
-                    print(
-                        f"  [SAFETY] Tracking divergence: max_err={tracking_err:.1f}rad "
-                        f"(frame {consecutive_divergence}/3)"
+                    logger.warning(
+                        "Tracking divergence: max_err=%.1f rad  frame=%d/3",
+                        tracking_err, consecutive_divergence,
                     )
                     if consecutive_divergence >= 3:
-                        print("  [SAFETY] Emergency stop — persistent tracking divergence")
+                        logger.error("Persistent tracking divergence — emergency stop")
                         _emergency_stop()
                         break
                 else:
@@ -556,39 +600,74 @@ def main():
         termios.tcflush(fd, termios.TCIFLUSH)
         termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
 
-        print("\n退出主循环")
+        # ── Exit summary ──
+        elapsed_total = time.perf_counter() - start_time
+        ik_ok_count = loop_count - ik_fail_count
+        print()
+        print("=" * 60)
+        print(f"  Session ended  elapsed={elapsed_total:.0f}s  frames={loop_count}  "
+              f"ik_ok={ik_ok_count}  ik_fail={ik_fail_count}  state_errs={total_state_errors}")
+        print("=" * 60)
 
-        # Post-loop: offer return_home (keys listener still alive)
-        print("\n按 R 执行 return_home，或按 Q 直接退出...")
-        while True:
-            if keys.is_pressed("r"):
-                # Read current arm state for path planning
-                _arm_result = shared.arm_state_ring.read_latest()
-                if _arm_result is not None:
-                    _ad, _, _ = _arm_result
-                    _arm_qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
-                    _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                    _waypoints = plan_joint_home_path(_arm_qpos, _home_qpos, planner)
-                    if _waypoints is not None and len(_waypoints) > 0:
-                        print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
-                    elif _waypoints is not None and len(_waypoints) == 0:
-                        print(f"  planned homing: already close to home, skipping")
+        # Post-loop: offer return_home (keys listener still alive).
+        # Skip the prompt if the arm was already homed during the session and is
+        # still near home — avoids confusing the operator with a redundant prompt.
+        _near_home = False
+        if _homed_during_session:
+            _arm_result = shared.arm_state_ring.read_latest()
+            if _arm_result is not None:
+                _ad, _, _ = _arm_result
+                _qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
+                _home_qpos_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
+                if np.all(np.isfinite(_qpos)):
+                    # Wrap home_qpos to nearest equivalent band before comparing
+                    # (J1/J3/J5/J7 have 720° range; encoder may report on any band).
+                    _wrapped_home = wrap_nearest_equivalent(
+                        _home_qpos_arr, _qpos,
+                        arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper,
+                    )
+                    _near_home = float(np.max(np.abs(_qpos - _wrapped_home))) < 0.05  # ~3°
+
+        if _near_home:
+            print("\nAlready at home — [Q] quit")
+            while True:
+                if keys.is_pressed("q") or keys.is_pressed("esc"):
+                    break
+                time.sleep(0.1)
+        else:
+            print("\n[R] return_home  [Q] quit")
+            while True:
+                if keys.is_pressed("r"):
+                    # Read current arm state for path planning
+                    _arm_result = shared.arm_state_ring.read_latest()
+                    if _arm_result is not None:
+                        _ad, _, _ = _arm_result
+                        _arm_qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
+                        _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
+                        _waypoints = plan_joint_home_path(_arm_qpos, _home_qpos, planner)
+                        if _waypoints is not None and len(_waypoints) > 0:
+                            print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
+                        elif _waypoints is not None and len(_waypoints) == 0:
+                            print(f"  home  already close to home, skipping", flush=True)
+                        else:
+                            print(f"  home  plan returned None, falling back to joint-space interpolation", flush=True)
+                        shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                     else:
-                        print(f"  plan_joint_home_path returned None — falling back to joint-space interpolation")
-                    shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
-                else:
-                    shared.arm_action_q.put((HOME_SENTINEL, None))
-                time.sleep(5.0)
-                print("按 Q 退出...")
-            if keys.is_pressed("q") or keys.is_pressed("esc"):
-                break
-            time.sleep(0.1)
+                        shared.arm_action_q.put((HOME_SENTINEL, None))
+                    _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
+                    _converged = _wait_for_home(shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0)
+                    if not _converged:
+                        print("  home  wait timeout — continuing", flush=True)
+                    print("[Q] quit")
+                if keys.is_pressed("q") or keys.is_pressed("esc"):
+                    break
+                time.sleep(0.1)
 
         keys.stop()
 
         # ── Cleanup ──
         _shutdown_kb(shared, arm_proc, hand_proc)
-        print("Done.")
+        print("Shutdown complete.")
 
 
 def _shutdown_kb(shared: SharedStorage, arm_proc: mp.Process, hand_proc: mp.Process) -> None:

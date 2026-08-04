@@ -54,7 +54,7 @@ _KEY_MAP: dict[str, ControlSignal] = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _suppress_terminal_echo() -> tuple | None:
+def _suppress_terminal_echo() -> list[Any] | None:
     """Disable terminal ECHO so captured keys don't echo to stdout.
 
     Returns the saved termios attributes, or None on failure / non-TTY.
@@ -74,7 +74,7 @@ def _suppress_terminal_echo() -> tuple | None:
         return None
 
 
-def _restore_terminal_echo(saved: tuple | None) -> None:
+def _restore_terminal_echo(saved: list[Any] | None) -> None:
     """Restore terminal attributes saved by :func:`_suppress_terminal_echo`."""
     if saved is None:
         return
@@ -310,7 +310,7 @@ class GlobalKeyState:
         self._thread: threading.Thread | None = None
         self._listener: Any = None  # pynput keyboard.Listener
         self._suppress_echo = suppress_echo
-        self._saved_termios: tuple | None = None
+        self._saved_termios: list[Any] | None = None
 
     def _run(self) -> None:
         from pynput import keyboard

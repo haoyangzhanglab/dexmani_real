@@ -21,8 +21,7 @@ _FORMATTER = logging.Formatter(
 _file_handler: logging.FileHandler | None = None
 _file_handler_init = False
 
-# Module-level logger — used by ThrottledWarner.
-_logger = logging.getLogger(__name__)
+# Module-level logger — used by ThrottledWarner (initialized after get_logger below).
 
 
 def _get_file_handler() -> logging.FileHandler | None:
@@ -58,6 +57,12 @@ def get_logger(name: str) -> logging.Logger:
                 logger.addHandler(file_handler)
             logger.setLevel(logging.INFO)
     return logger
+
+
+# Module-level logger for ThrottledWarner — goes through get_logger so
+# throttled warnings share the same [timestamp] [level] [name] format as
+# every other log message in the project.
+_logger = get_logger(__name__)
 
 
 class ThrottledWarner:

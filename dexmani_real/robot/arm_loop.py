@@ -63,10 +63,37 @@ class ArmLoopConfig:
     homing_max_speed_rad_per_s: float = field(default_factory=lambda: np.deg2rad(arm.homing.max_speed_deg_s))
     homing_target_timeout_s: float = field(default_factory=lambda: arm.homing.target_timeout_s)
 
+    # ── Velocity feedforward (application-level compensation for Mode 6 servo lag) ──
+    # Per-joint lead gain (seconds).  Adds cmd_vel * lead_gain to the position
+    # command — the anticipatory target gives Mode 6's trajectory planner a
+    # "head start" that compensates for its lack of velocity feedforward.
+    #   J5 (wrist roll, highest inertia):        0.06 s  (~2 servo ticks @30Hz)
+    #   J2 (shoulder lift), J6 (wrist pitch):    0.04 s
+    #   J1/J3/J4/J7 (lighter joints):            0.03 s  (~1 servo tick @30Hz)
+    # Set to None to disable feedforward entirely.
+    feedforward_lead_gain: tuple[float, ...] | None = field(default_factory=lambda: (
+        0.03,  # J1
+        0.04,  # J2
+        0.03,  # J3
+        0.03,  # J4
+        0.06,  # J5
+        0.04,  # J6
+        0.03,  # J7
+    ))
+
+    # Max absolute correction per joint (rad).  Clamps the feedforward term to
+    # prevent overshoot on noisy velocity estimates.  0.05 rad ≈ 2.9°.
+    feedforward_max_correction_rad: float = 0.05
+
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
 _RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
 _RECOVERY_MAX: int = 30  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
+
+# Velocity feedforward: number of ticks to skip after startup or HOME before
+# enabling compensation.  3 ticks @ 30 Hz ≈ 100 ms — enough for the arm state
+# ring to be populated and any homing transient to settle.
+_FF_SKIP_TICKS: int = 3
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -79,6 +106,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     Designed as an mp.Process target. Communicates exclusively through
     SharedStorage (no RPC, no side channels).
+
+    Features velocity feedforward compensation (configurable via
+    ``ArmLoopConfig.feedforward_lead_gain``): adds ``cmd_vel * lead_gain``
+    to the position command to compensate for Mode 6 servo lag.  Per-joint
+    direction guard prevents overshoot; joint-limit clip after feedforward
+    is defense-in-depth against C31 triggers.
     """
     from queue import Empty
 
@@ -95,6 +128,26 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
 
+    # ── Velocity feedforward state ──
+    _ff_enabled = (
+        cfg.feedforward_lead_gain is not None
+        and any(g != 0.0 for g in cfg.feedforward_lead_gain)
+    )
+    _ff_lead_gain = (
+        np.array(cfg.feedforward_lead_gain, dtype=np.float64)
+        if cfg.feedforward_lead_gain is not None
+        else np.zeros(7, dtype=np.float64)
+    )
+    _current_raw_target: np.ndarray | None = None  # uncompensated target, updated on new-action ticks only
+    _prev_raw_target: np.ndarray | None = None  # previous new-action target, for velocity estimation
+    _prev_target_time: float | None = None
+    _last_cmd_vel: np.ndarray | None = None  # 7-DOF (rad/s), reused on hold ticks
+    _ff_skip_count: int = _FF_SKIP_TICKS  # skip first N frames after startup/HOME
+
+    # Pre-convert joint limits for fast clamping (feedforward safety net).
+    _joint_lo = np.array(cfg.joint_limit_lower, dtype=np.float64)
+    _joint_hi = np.array(cfg.joint_limit_upper, dtype=np.float64)
+
     # ── URDF-consistent FK (replaces arm.get_position_aa) ──
     # xArm firmware uses a different EEF coordinate definition than our URDF.
     # Using Pinocchio FK ensures all downstream consumers (IK, recording,
@@ -107,6 +160,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         arm = XArmAPI(cfg.arm_ip, is_radian=True)
     except Exception as e:
         logger.error("arm_loop: connect failed: %s", e)
+        shared.error_state.value = True
         return
 
     try:
@@ -119,10 +173,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True)
         if getattr(arm, "mode", -1) != 6:
             logger.error("arm_loop: failed to set mode 6")
+            shared.error_state.value = True
             _disconnect_arm(arm)
             return
     except Exception as e:
         logger.error("arm_loop: init failed: %s", e)
+        shared.error_state.value = True
         _disconnect_arm(arm)
         return
 
@@ -133,10 +189,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
         else:
             logger.error("arm_loop: cannot read initial joint states (code=%d)", code)
+            shared.error_state.value = True
             _disconnect_arm(arm)
             return
     except Exception as e:
         logger.error("arm_loop: joint states read failed: %s", e)
+        shared.error_state.value = True
         _disconnect_arm(arm)
         return
     last_target = last_qpos.copy()
@@ -201,10 +259,18 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 _planned_homing(arm, _waypoints, HOME_QPOS, cfg, shared=shared)
                 last_qpos = HOME_QPOS.copy()
                 last_target = HOME_QPOS.copy()
+                # Reset feedforward state — skip first N frames after home
+                # to avoid transient compensation from the jump to home_qpos.
+                _current_raw_target = None
+                _prev_raw_target = None
+                _prev_target_time = None
+                _last_cmd_vel = None
+                _ff_skip_count = _FF_SKIP_TICKS
                 continue
 
             # Servo
-            if action is not None and isinstance(action, dict):
+            _new_action = action is not None and isinstance(action, dict)
+            if _new_action:
                 target = np.asarray(action.get("qpos", last_target), dtype=np.float64).ravel()[:7]
                 if np.all(np.isfinite(target)):
                     # Wrap equivalent joints (J1/J3/J5/J7) to the same 2π band
@@ -222,15 +288,78 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     )
                     last_target = target.copy()
 
+            # ── Velocity feedforward compensation ──
+            # Compute command velocity from successive targets and add a lead
+            # term to the position command: compensated = target + cmd_vel × lead_gain.
+            # Mode 6 lacks velocity feedforward — the anticipatory position target
+            # gives the firmware's trajectory planner a "head start".
+            #
+            # arm_loop runs at 30Hz but new targets arrive at 16Hz.  On hold ticks
+            # (no new action) we reuse the last velocity estimate AND the last
+            # uncompensated target (_current_raw_target).  Critically, we do NOT
+            # snapshot last_target as the base — it carries compensation from the
+            # previous tick, and using it would accumulate lead on every hold tick
+            # (verified: 5 hold ticks → +28.7° drift).
+            _loop_time = time.monotonic()
+
+            if _new_action:
+                _current_raw_target = last_target.copy()  # uncompensated snapshot
+
+            if _ff_enabled and _ff_skip_count <= 0 and _current_raw_target is not None:
+                if _new_action and _prev_raw_target is not None and _prev_target_time is not None:
+                    _dt = max(_loop_time - _prev_target_time, 1e-6)
+                    _cmd_vel = (_current_raw_target - _prev_raw_target) / _dt  # 7-DOF (rad/s)
+                    _last_cmd_vel = _cmd_vel
+                # else: hold tick — reuse _last_cmd_vel from previous new-action tick
+
+                if _last_cmd_vel is not None:
+                    _pos_err = _current_raw_target - last_qpos  # shrinks as arm approaches target
+                    # Per-joint guard: only compensate joints where the arm is
+                    # chasing the target in the same direction as cmd velocity.
+                    # Prevents overshoot when a joint has passed the target while
+                    # others are still catching up.
+                    _guard = (_last_cmd_vel * _pos_err) > 0  # shape (7,) bool
+                    _lead = np.where(
+                        _guard,
+                        _last_cmd_vel * _ff_lead_gain,
+                        np.float64(0.0),
+                    )
+                    _lead = np.clip(
+                        _lead,
+                        -cfg.feedforward_max_correction_rad,
+                        cfg.feedforward_max_correction_rad,
+                    )
+                    # mypy narrows _current_raw_target correctly but np.where
+                    # dtype inference interacts poorly with the type guard.
+                    _compensated: np.ndarray = _current_raw_target + _lead.astype(np.float64)
+                    last_target = _compensated
+
+            # ── Joint-limit safety clamp (defense-in-depth) ──
+            # Feedforward can push last_target up to ±0.05 rad beyond the
+            # IK target.  Clamp to hardware limits so we never trigger C31
+            # (joint limit) on a compensated command.
+            last_target = np.clip(last_target, _joint_lo, _joint_hi)
+
+            if _new_action:
+                _prev_raw_target = _current_raw_target  # for next velocity estimate
+                _prev_target_time = _loop_time
+
+            if _ff_skip_count > 0:
+                _ff_skip_count -= 1
+
             try:
                 code = arm.set_servo_angle(angle=last_target, is_radian=True,
                                            speed=cfg.joint_max_speed_rad_per_s, mvacc=cfg.joint_max_acc_rad_per_s2, wait=False)
                 if code != 0:
                     err_code = getattr(arm, "error_code", 0)
                     if err_code in _RECOVERABLE_ERRORS:
+                        # C22/C24/C31 — recoverable arm errors.
+                        # Standard recovery: clean error → ready state → re-enter Mode 6.
+                        # set_state(0) MUST come before set_mode(6) — the arm needs to
+                        # be in ready state before the mode change is accepted.
                         arm.clean_error()
-                        arm.set_mode(6)
                         arm.set_state(0)
+                        arm.set_mode(6)
                         _consecutive_recoveries += 1
                         if _consecutive_recoveries > _RECOVERY_MAX:
                             logger.error("arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries)
@@ -243,20 +372,17 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                         transition(shared, SafetyState.FAULT)
                         break
                     else:
-                        # code != 0 but no arm error (e.g. mode drop, code 9).
-                        # Attempt mode recovery; if it fails, escalate to FAULT.
+                        # code != 0 but err_code == 0 (e.g. ERR_CODE=1 transient error,
+                        # mode drop).  Same recovery as above; do NOT FAULT on a
+                        # single failure — transient comm glitches can self-resolve.
+                        # The _RECOVERY_MAX counter gates escalation.
                         logger.warning("arm_loop: set_servo_angle code=%d (no arm error) — attempting mode recovery", code)
                         arm.clean_error()
-                        arm.set_mode(6)
                         arm.set_state(0)
+                        arm.set_mode(6)
                         _consecutive_recoveries += 1
                         if _consecutive_recoveries > _RECOVERY_MAX:
                             logger.error("arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries)
-                            shared.error_state.value = True
-                            transition(shared, SafetyState.FAULT)
-                            break
-                        if getattr(arm, "mode", -1) != 6:
-                            logger.error("arm_loop: mode recovery failed (mode=%d)", getattr(arm, "mode", -1))
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
                             break
@@ -304,7 +430,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         tracking_err = float(np.max(np.abs(qpos - last_target)))
 
         if tracking_err > cfg.tracking_error_warn_rad:
-            _tracking_warn("arm_loop: tracking error %.3f rad > threshold %.3f rad", tracking_err, cfg.tracking_error_warn_rad)
+            _tracking_warn("arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad)
 
         # Error handling
         try:
