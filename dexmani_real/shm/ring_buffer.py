@@ -55,6 +55,10 @@ def _seqlock_to_logical(marker: int) -> int:
 
 logger = get_logger(__name__)
 
+# Torn-read warning throttle: at most one warning per 5 s per buffer.
+# Shared by CameraRingBuffer and SeqlockRingBuffer.
+TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
+
 
 class SharedMemoryRingBuffer:
     """Lock-free FILO ring buffer in shared memory.
@@ -274,9 +278,6 @@ class CameraRingBuffer:
     _OFF_MAX_PC = 32
     _HEADER_SIZE = 64  # cache-line aligned
 
-    # Torn-read warning throttle: ≤1 / 5 s (matching SeqlockRingBuffer).
-    _TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
-
     def __init__(
         self,
         name: str,
@@ -320,10 +321,10 @@ class CameraRingBuffer:
             )
             self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
             self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
-            # Reconstruct shapes from byte counts (used only for logging).
+            # Reconstruct shapes from byte counts for attach-mode consumers.
             self._rgb_shape = None
             self._depth_shape = None
-            self._pc_shape = None
+            self._pc_shape = (self._max_pc_bytes // (6 * 4), 6) if self._max_pc_bytes > 0 else None
 
         self._last_torn_warn_ns = 0
 
@@ -339,15 +340,6 @@ class CameraRingBuffer:
             self._total_size / (1024 * 1024),
             create,
         )
-
-    @classmethod
-    def attach(cls, name: str) -> "CameraRingBuffer":
-        """Attach to an existing CameraRingBuffer by name (no shape params needed).
-
-        Reads max byte sizes from the existing SHM header, so the attach-mode
-        caller does not need to duplicate the shapes used at create time.
-        """
-        return cls(name=name, create=False)
 
     def write(
         self,
@@ -460,7 +452,7 @@ class CameraRingBuffer:
         rgb_h, rgb_w, rgb_c = int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])
         if rgb_size > self._max_rgb_bytes or rgb_size <= 0 or rgb_h * rgb_w * rgb_c != rgb_size:
             now_ns = time.monotonic_ns()
-            if now_ns - self._last_torn_warn_ns >= self._TORN_WARN_INTERVAL_NS:
+            if now_ns - self._last_torn_warn_ns >= TORN_WARN_INTERVAL_NS:
                 self._last_torn_warn_ns = now_ns
                 logger.warning(
                     "CameraRingBuffer read_latest: torn or corrupt RGB header "
@@ -484,7 +476,7 @@ class CameraRingBuffer:
         depth_h, depth_w = int(h["depth_shape_h"]), int(h["depth_shape_w"])
         if depth_size > self._max_depth_bytes or depth_size <= 0 or depth_h * depth_w * 2 != depth_size:
             now_ns = time.monotonic_ns()
-            if now_ns - self._last_torn_warn_ns >= self._TORN_WARN_INTERVAL_NS:
+            if now_ns - self._last_torn_warn_ns >= TORN_WARN_INTERVAL_NS:
                 self._last_torn_warn_ns = now_ns
                 logger.warning(
                     "CameraRingBuffer read_latest: torn or corrupt depth header "
@@ -565,7 +557,7 @@ class CameraRingBuffer:
         return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
 
 
-# Camera frame header dtype (moved from layouts.py — Phase 2.7)
+# Camera frame header dtype
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
         ("timestamp", "<f8"),

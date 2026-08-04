@@ -32,7 +32,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.recording.episode_reader import EpisodeReader, _MergedH5File
+from dexmani_real.recording.episode_reader import EpisodeReader, MergedH5File
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters
 
@@ -64,7 +64,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 _FINGERTIP_LABELS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
 
-def _classify_datasets(h5f: _MergedH5File) -> dict[str, list[str]]:
+def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
     """Scan top-level HDF5 datasets and group them by category.
 
     Returns:

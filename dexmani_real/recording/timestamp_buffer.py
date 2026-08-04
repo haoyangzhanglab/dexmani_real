@@ -17,10 +17,10 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["TimestampAlignedBuffer", "get_accumulate_timestamp_idxs"]
+__all__ = ["TimestampAlignedBuffer"]
 
 
-def get_accumulate_timestamp_idxs(
+def _get_accumulate_timestamp_idxs(
     timestamps: list[float] | float,
     start_time: float,
     dt: float,
@@ -142,7 +142,7 @@ class TimestampAlignedBuffer:
         if self._recording_stopped:
             return
 
-        _, global_idxs, next_global_idx = get_accumulate_timestamp_idxs(
+        _, global_idxs, next_global_idx = _get_accumulate_timestamp_idxs(
             timestamps=timestamp,
             start_time=self.start_time,
             dt=self.dt,

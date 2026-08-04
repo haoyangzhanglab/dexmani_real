@@ -59,7 +59,7 @@ _PINKY_BASE_SCALE = 1.2  # minimum scaling for curled state
 _PINKY_MAX_SCALE = 2.2  # maximum scaling for extended state
 
 # ── Operator-to-MANO coordinate transform ──
-# (inlined from utils/hand_utils.py — sole caller is retarget() below)
+# (originally from deleted utils/hand_utils.py — sole caller is retarget() below)
 
 # Operator→MANO coordinate transform (right hand).
 # det = -1: improper rotation includes a reflection for left→right hand chirality flip.

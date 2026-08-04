@@ -817,7 +817,7 @@ class EpisodeQuality:
 
             with h5py.File(out_h5_path, "w") as out_f:
                 if "meta" in self._h5f:
-                    # _MergedH5File.copy doesn't exist — copy attrs manually
+                    # MergedH5File.copy doesn't exist — copy attrs manually
                     meta_src = self._h5f["meta"]
                     out_meta = out_f.create_group("meta")
                     for k, v in meta_src.attrs.items():

@@ -895,7 +895,7 @@ def _read_camera_frame(shared: SharedStorage) -> dict | None:
     try:
         result = shared.camera_ring.read_latest()
         if result is not None:
-            return {"header": result[0], "rgb": result[1], "depth": result[2]}
+            return {"header": result[0], "rgb": result[1], "depth": result[2], "pointcloud": result[3]}
     except Exception:
         logger.warning("policy_loop: camera ring read failed", exc_info=True)
     return None

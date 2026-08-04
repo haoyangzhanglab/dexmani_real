@@ -529,7 +529,7 @@ class TeleopIKSolver:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Null-space optimization helpers (inlined from planning/nullspace.py)
+# Null-space optimization helpers (originally from deleted planning/nullspace.py)
 # ═══════════════════════════════════════════════════════════════════════
 
 

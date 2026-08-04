@@ -54,6 +54,7 @@ class SharedStorageConfig:
     # ── Camera defaults — sourced from camera singleton ──
     camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
     camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
+    camera_pc_shape: tuple[int, int] = (2048, 6)  # matches PointCloudProcessorConfig.num_points default
 
     # ── Queue sizes ──
     arm_action_q_maxsize: int = 2
@@ -164,16 +165,10 @@ class SharedStorage:
     camera_ready: Any  # mp.Event — camera_loop -> Main
     vr_ready: Any  # mp.Event — vr_loop -> Main
 
-    # ---- Diagnostics ----
-
     # ---- Camera metadata (set by camera_loop, read by policy_loop) ----
     camera_depth_scale: Any  # mp.Value('d') — depth scale (mm to meters)
     camera_K: Any  # mp.Array('d', 9) — 3x3 intrinsics matrix (row-major)
     camera_serial: Any  # mp.Array('c', 32) — camera serial number string
-
-    # ---- Recording metadata (Policy writes) ----
-    record_dir: str | None = None
-    record_dt: float = 1.0 / 16.0
 
     @classmethod
     def create(
@@ -210,6 +205,7 @@ class SharedStorage:
             name=f"{prefix}_camera",
             rgb_shape=_rgb_shape,
             depth_shape=_depth_shape,
+            pc_shape=cfg.camera_pc_shape,
             maxlen=cfg.camera_ring_maxlen,
             create=True,
         )

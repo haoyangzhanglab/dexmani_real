@@ -15,9 +15,9 @@ Architecture:
     Main (~200 lines) — spawns 5 processes, monitors is_running + heartbeats
       │
       ├─ camera_loop ──camera_ring──┐
-      ├─ VRProcess ──────vr_ring─────┤
+      ├─ vr_loop ────────vr_ring─────┤
       │                               ▼
-      ├─ PolicyProcess ──arm_action_q──→ arm_loop
+      ├─ policy_loop ───arm_action_q──→ arm_loop
       │                ──hand_cmd_ring─→ hand_loop
       │                ◄──arm_state_ring, hand_state_ring, hand_tactile_ring
       │                owns EpisodeRecorder (single-clock recording)

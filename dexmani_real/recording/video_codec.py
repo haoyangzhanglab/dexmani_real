@@ -128,8 +128,6 @@ class VideoEncoder:
             if self._closed:
                 return
             self._closed = True
-
-        with self._lock:
             if self._container is None:
                 return
             # Flush any buffered frames still inside the encoder.
@@ -161,6 +159,11 @@ class VideoEncoder:
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError(
                 f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}"
+            )
+        if frame.shape[0] != self._height or frame.shape[1] != self._width:
+            raise ValueError(
+                f"Frame shape {(frame.shape[0], frame.shape[1])} does not match "
+                f"encoder size ({self._height}, {self._width})"
             )
 
         if self._container is None:

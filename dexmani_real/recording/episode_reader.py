@@ -34,12 +34,12 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# Camera dataset keys routed to depth.h5 (new format) or read via
-# VideoDecoder for "rgb" (MP4 sidecar).
-_CAM_KEYS = {"rgb", "depth"}
+# Camera dataset keys routed to depth.h5 (new format).
+# "rgb" is handled by VideoDecoder (MP4 sidecar) — not in either HDF5 file.
+_CAM_KEYS = {"depth"}
 
 
-class _MergedH5File:
+class MergedH5File:
     """Transparent merged view of ``data.h5`` + ``depth.h5``.
 
     Camera keys (``"depth"``) are routed to the depth file; everything
@@ -95,10 +95,11 @@ class EpisodeReader:
     def __init__(self, h5_path: str | Path) -> None:
         self._path = Path(h5_path)
         self._is_legacy = self._path.is_file()
+        self._closed = False
         if self._is_legacy:
             # Old format: single episode_XXX.h5 file.
             self._data_h5f: h5py.File = h5py.File(self._path, "r")
-            self._h5f = _MergedH5File(self._data_h5f, None)
+            self._h5f = MergedH5File(self._data_h5f, None)
             self._rgb_decoder: VideoDecoder | None = None
         elif self._path.is_dir():
             # New format: episode_XXX/ directory.
@@ -108,7 +109,7 @@ class EpisodeReader:
             depth_path = self._path / "depth.h5"
             self._data_h5f = h5py.File(str(data_path), "r")
             depth_h5f = h5py.File(str(depth_path), "r") if depth_path.is_file() else None
-            self._h5f = _MergedH5File(self._data_h5f, depth_h5f)
+            self._h5f = MergedH5File(self._data_h5f, depth_h5f)
             # RGB sidecar (optional).
             rgb_mp4 = self._path / "rgb.mp4"
             self._rgb_decoder = VideoDecoder(rgb_mp4) if rgb_mp4.is_file() else None
@@ -121,7 +122,7 @@ class EpisodeReader:
     # -- public properties ------------------------------------------------
 
     @property
-    def h5f(self) -> _MergedH5File:
+    def h5f(self) -> MergedH5File:
         """Merged view of ``data.h5`` + ``depth.h5``.
 
         ``f["rgb"]`` raises ``KeyError`` — use :meth:`read_camera_frame`

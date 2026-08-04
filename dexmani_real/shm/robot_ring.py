@@ -58,7 +58,7 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer, _seqlock_even, _seqlock_is_complete, _seqlock_odd, _seqlock_to_logical
+from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer, TORN_WARN_INTERVAL_NS, _seqlock_even, _seqlock_is_complete, _seqlock_odd, _seqlock_to_logical
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -95,9 +95,6 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
            otherwise None; a throttled warning is logged (≤1 / 5 s).
     Half-written data is never returned.
     """
-
-    # Torn-read warning throttle: at most one warning per 5 s per buffer.
-    _TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
     def __init__(
         self,
@@ -253,7 +250,7 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
     def _warn_torn_read(self) -> None:
         """Log a torn-read fallback warning, throttled to ≤1 / 5 s."""
         now_ns = time.monotonic_ns()
-        if now_ns - self._last_torn_warn_ns < self._TORN_WARN_INTERVAL_NS:
+        if now_ns - self._last_torn_warn_ns < TORN_WARN_INTERVAL_NS:
             return
         self._last_torn_warn_ns = now_ns
         logger.warning(

@@ -30,12 +30,11 @@ from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.recording.video_codec import VideoEncoder
-
-DEFAULT_MAX_RECORD_FRAMES: int = 10000
-
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_MAX_RECORD_FRAMES: int = 10000
 
 SCHEMA_VERSION_V11 = 11  # v11: +flag_ik_attempted +flag_frame_status (always recorded)
 
@@ -101,8 +100,7 @@ class EpisodeRecorder:
 
         # Opt-in additive stream (schema v9): the delta-clipped arm joint command
         # actually forwarded to the SDK each tick, as opposed to action_arm_joint
-        # (the IK target).  Off → byte-identical v8 behavior; nothing is wired to
-        # pass the kwarg yet, so the flag alone is inert.
+        # (the IK target).  Set by vr_teleop_policy.py.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
 
@@ -118,6 +116,7 @@ class EpisodeRecorder:
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._datasets: dict[str, Any] = {}
         self._datasets_depth: dict[str, Any] = {}  # depth-only datasets in _depth_file
+        self._pending_meta: dict[str, Any] = {}  # deferred metadata until HDF5 created
 
         # Record-time aligned buffer for non-camera streams + periodic flush.
         self._buffer: TimestampAlignedBuffer | None = None
@@ -169,6 +168,15 @@ class EpisodeRecorder:
     def stop_error(self) -> str | None:
         """Error message from the last _stop_episode_impl, or None if clean."""
         return self._stop_error
+
+    @staticmethod
+    def _build_action_ee(action) -> "np.ndarray":
+        """Build a (9,) array [eef_pos(3), eef_rot6d(6)] from a RobotAction."""
+        pos = action.target_eef_pos
+        rot6d = action.target_eef_rot6d
+        p = np.asarray(pos, dtype=np.float64) if pos is not None else np.full(3, np.nan)
+        r = np.asarray(rot6d, dtype=np.float64) if rot6d is not None else np.full(6, np.nan)
+        return np.concatenate([p, r])
 
     def start_episode(
         self,
@@ -232,7 +240,7 @@ class EpisodeRecorder:
         self._grid_anchored = False
 
         # Store metadata for deferred write (HDF5 is created lazily).
-        self._pending_meta: dict[str, Any] = {
+        self._pending_meta = {
             "task_label": task_label,
             "operator": operator,
             "tags": tags,
@@ -358,16 +366,9 @@ class EpisodeRecorder:
         sig = signals or {}
 
         # ── Camera freshness (recorder-side; no per-script signal plumbing) ──
-        # frame_number is monotonic per camera (shm/layouts.py header); a stall
+        # frame_number is monotonic per camera (ring_buffer.py header); a stall
         # keeps re-serving the same shm frame, so an unchanged number means no
         ts = float(state.timestamp)
-
-        def _make_action_ee() -> np.ndarray:
-            pos = action.target_eef_pos
-            rot6d = action.target_eef_rot6d
-            p = np.asarray(pos, dtype=np.float64) if pos is not None else np.full(3, np.nan)
-            r = np.asarray(rot6d, dtype=np.float64) if rot6d is not None else np.full(6, np.nan)
-            return np.concatenate([p, r])
 
         data: dict[str, np.ndarray | float] = {
             # ── Observables ──
@@ -391,7 +392,7 @@ class EpisodeRecorder:
             "hand_connected": bool(state.hand_connected),
             # ── Actions ──
             "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
-            "action_arm_ee": _make_action_ee(),
+            "action_arm_ee": self._build_action_ee(action),
             "action_hand_joint": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
             # ── Flags ──
             "flag_ik_ok": bool(sig.get("ik_ok", False)),

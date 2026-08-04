@@ -8,7 +8,7 @@ Subsystems:
     recording/  — HDF5 episode recording
     sensor/     — RealSense camera driver
     config/     — Camera calibration, pipeline config
-    utils/      — Shared utilities (arrays, signals, hand geometry, point clouds)
+    utils/      — Shared utilities (arrays, signals, coordinate transforms, point clouds)
 """
 
 from pathlib import Path
