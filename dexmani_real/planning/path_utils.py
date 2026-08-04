@@ -70,8 +70,26 @@ def wrap_nearest_equivalent(
         return result
 
     ref = np.asarray(reference, dtype=np.float64)
-    k = np.round((ref[is_equiv] - result[is_equiv]) / (2.0 * np.pi))
-    result[is_equiv] += k * (2.0 * np.pi)
+    period = 2.0 * np.pi
+
+    # ── k-bounds expansion (backported from ik_candidates.canonicalize_qpos) ──
+    # When the physical arm is near a joint-limit boundary (e.g. +2π) and the
+    # raw value is near the opposite limit (e.g. -2π), the ideal wrapping factor
+    # k may push the result slightly past the limit; the final np.clip snaps it
+    # back.  Without the ±1 expansion, k_max clips the wrapping factor and the
+    # wrapped result ends up ~2π away from reference → "joint turning a full
+    # circle" during teleop.
+    lo_equiv = lo[is_equiv]
+    hi_equiv = hi[is_equiv]
+    res_equiv = result[is_equiv]
+    ref_equiv = ref[is_equiv]
+    k_min = np.ceil((lo_equiv - res_equiv) / period)
+    k_max = np.floor((hi_equiv - res_equiv) / period)
+    k = np.round((ref_equiv - res_equiv) / period)
+    valid = k_min <= k_max
+    k = np.where(valid, np.clip(k, k_min - 1, k_max + 1), 0.0)
+
+    result[is_equiv] += k * period
     np.clip(result, lo, hi, out=result)
     return result
 
@@ -96,7 +114,6 @@ def plan_joint_home_path(
     # Wrapping home→qpos (not qpos→home) keeps all waypoints in the arm's
     # current encoder band — critical because Mode 6 firmware plans from the
     # physical encoder position to each waypoint target.
-    _home = home_qpos.copy()
     if planner is not None:
         _home = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
         delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(_home, qpos))))

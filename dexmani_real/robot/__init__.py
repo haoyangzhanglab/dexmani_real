@@ -1,1 +1,1 @@
-"""Robot hardware — xArm7 + XHand drivers, inner loop."""
+"""Robot hardware — xArm7 + XHand drivers, arm loop."""

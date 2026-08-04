@@ -18,7 +18,6 @@ from .ik_candidates import IKCandidateManager, is_mplib_success
 from .kinematics import XArm7Kinematics
 from .pose_utils import compute_pose_error, ensure_qpos
 from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
-from .workspace_safety import WorkspaceSafety
 
 __all__ = [
     "XArm7MotionPlanner",
@@ -28,6 +27,35 @@ __all__ = [
 _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
+
+
+class WorkspaceSafety:
+    """EEF workspace position bounds checking and clamping.
+
+    workspace_bounds: (3, 2) array [[x_min, x_max], [y_min, y_max], [z_min, z_max]] in meters.
+    """
+
+    def __init__(
+        self,
+        workspace_bounds: np.ndarray,
+    ) -> None:
+        self.bounds = np.asarray(workspace_bounds, dtype=np.float64)
+        if self.bounds.shape != (3, 2):
+            raise ValueError(f"workspace_bounds must have shape (3, 2), got {self.bounds.shape}.")
+
+    def check(self, eef_pos: np.ndarray) -> bool:
+        """Check whether EEF position is within workspace bounds."""
+        eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(eef_pos)):
+            logger.warning("WorkspaceSafety: NaN/Inf EEF position — treating as out-of-bounds")
+            return False
+        return bool(np.all((eef_pos >= self.bounds[:, 0]) & (eef_pos <= self.bounds[:, 1])))
+
+    def clamp(self, target_pos: np.ndarray) -> np.ndarray:
+        """Clip target position to workspace bounds."""
+        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3).copy()
+        np.clip(target_pos, self.bounds[:, 0], self.bounds[:, 1], out=target_pos)
+        return target_pos
 
 
 class XArm7MotionPlanner:
@@ -106,13 +134,46 @@ class XArm7MotionPlanner:
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
         self.teleop_solver = TeleopIKSolver(
-            self.kin, self.ik_mgr, self.teleop_profile
+            self.kin, self.ik_mgr, self.teleop_profile,
+            elbow_joint_index=self._elbow_joint_index,
         )
 
         # Convenience aliases (used by teleop_solver and external code)
         self.dof = dof
         self.joint_limits = joint_limits
         self.equivalent_joint_mask = equivalent_joint_mask
+
+    @classmethod
+    def create_default(
+        cls,
+        planning_profile: PlanningProfile | None = None,
+        teleop_profile: TeleopProfile | None = None,
+    ) -> "XArm7MotionPlanner":
+        """Factory with canonical URDF/SRDF and base_pose_world (30° Z rotation).
+
+        Centralises the invariant planner setup shared by keyboard_teleop,
+        calibrate_camera, and replay_traj.  Callers pass their own
+        *planning_profile* / *teleop_profile* to match their use case (teleop
+        tolerances are intentionally looser than the dataclass defaults).
+        """
+        from pathlib import Path
+
+        _ASSET_DIR = Path(__file__).parent.parent.parent / "assets"
+        urdf_path = str(_ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
+        srdf_path = str(_ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
+        cfg = XArm7PlannerConfig(
+            urdf_path=urdf_path,
+            srdf_path=srdf_path,
+            base_pose_world=Pose(
+                p=np.array([0.0, 0.0, 0.0]),
+                q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
+            ),
+        )
+        return cls(
+            cfg,
+            planning_profile=planning_profile or PlanningProfile(),
+            teleop_profile=teleop_profile or TeleopProfile(),
+        )
 
     def __getattr__(self, name: str):
         """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mplib_planner.
@@ -514,6 +575,10 @@ class XArm7MotionPlanner:
         for i, eef_p in enumerate(eef_positions):
             if i == 0:
                 continue
+            if not np.all(np.isfinite(eef_p)):
+                report["workspace_violation_index"] = i
+                report["workspace_violation_summary"] = "FK returned NaN/Inf"
+                return self._make_failure(f"Path contains NaN/Inf EEF position at waypoint[{i}]", source, report)
             if not self.workspace_safety.check(eef_p):
                 violations = []
                 for ax in range(3):
@@ -571,11 +636,20 @@ class XArm7MotionPlanner:
             report["limit_violation_qpos_deg"] = np.rad2deg(path[waypoint_indices[0]].copy())
         return report
 
+    # Elbow branch-flip detection thresholds (path-wide min/max check).
+    # The -5°/15° band boundaries are shared with TeleopIKSolver; the span
+    # threshold (45°) is deliberately larger than the single-step check (40°)
+    # — a path can have a legitimate elbow crossing without any single frame
+    # being a "flip."
+    _ELBOW_NEG_BAND_RAD: float = np.deg2rad(-5.0)
+    _ELBOW_POS_BAND_RAD: float = np.deg2rad(15.0)
+    _ELBOW_MIN_SPAN_RAD: float = np.deg2rad(45.0)
+
     def check_elbow_consistency(self, path: np.ndarray) -> tuple[bool, dict[str, Any]]:
         values = path[:, self._elbow_joint_index]
         v_min, v_max = float(np.min(values)), float(np.max(values))
         span = v_max - v_min
-        if v_min < np.deg2rad(-5) and v_max > np.deg2rad(15) and span > np.deg2rad(45):
+        if v_min < self._ELBOW_NEG_BAND_RAD and v_max > self._ELBOW_POS_BAND_RAD and span > self._ELBOW_MIN_SPAN_RAD:
             return True, {
                 "elbow_branch_flip": True,
                 "elbow_min_deg": float(np.rad2deg(v_min)),
@@ -584,4 +658,3 @@ class XArm7MotionPlanner:
             }
         return False, {}
 
-    # ── Elbow consistency check (internal) ──

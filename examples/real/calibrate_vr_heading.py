@@ -40,7 +40,7 @@ if str(_repo_root) not in sys.path:
 
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz
 from dexmani_real.sensor.vr_receiver_process import vr_loop
-from dexmani_real.shm.shared_storage import SharedStorage, vr_frame_dtype as _vr_frame_dtype
+from dexmani_real.shm.shared_storage import SharedStorage
 
 CONFIG_DIR = _repo_root / "dexmani_real" / "config"
 OUTPUT_PATH = CONFIG_DIR / "vr_transform.json"
@@ -91,7 +91,12 @@ def _circular_mean(forwards: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]
     mean_fwd = np.mean(fwd_inlier, axis=0)
     mean_fwd /= np.linalg.norm(mean_fwd)
     theta = float(np.arctan2(mean_fwd[1], mean_fwd[0]))
-    return theta, mean_fwd, inlier
+
+    # Remap M-length inlier back to N-length array so callers can index
+    # against the original forwards array without shape mismatch.
+    full_inlier = np.zeros(len(forwards), dtype=bool)
+    full_inlier[mask] = inlier
+    return theta, mean_fwd, full_inlier
 
 
 def _quality_grade(forwards: np.ndarray, theta_mean: float, inlier: np.ndarray) -> str:
@@ -124,8 +129,8 @@ def main() -> None:
     parser.add_argument(
         "--ref",
         choices=["wrist", "head"],
-        default="head",
-        help="标定参考: head=头部面朝机器人+X (默认), wrist=手腕指向机器人+X",
+        default="wrist",
+        help="标定参考: wrist=手腕指向机器人+X (默认), head=头部面朝机器人+X",
     )
     args = parser.parse_args()
 

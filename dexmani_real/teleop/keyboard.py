@@ -49,6 +49,43 @@ _KEY_MAP: dict[str, ControlSignal] = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Terminal echo suppression (shared by KeyboardHandler and GlobalKeyState)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _suppress_terminal_echo() -> tuple | None:
+    """Disable terminal ECHO so captured keys don't echo to stdout.
+
+    Returns the saved termios attributes, or None on failure / non-TTY.
+    """
+    if not sys.stdin.isatty():
+        return None
+    try:
+        import termios
+
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] = new[3] & ~(termios.ECHO | termios.ECHONL)
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        return saved
+    except (termios.error, OSError):
+        return None
+
+
+def _restore_terminal_echo(saved: tuple | None) -> None:
+    """Restore terminal attributes saved by :func:`_suppress_terminal_echo`."""
+    if saved is None:
+        return
+    try:
+        import termios
+
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+    except (termios.error, OSError):
+        pass
+
+
 class KeyboardHandler:
     """Global keyboard handler using pynput.
 
@@ -174,44 +211,12 @@ class KeyboardHandler:
     # ------------------------------------------------------------------
 
     def _suppress_terminal_echo(self) -> None:
-        """Disable terminal ECHO so pynput-captured keys don't echo to stdout.
-
-        pynput captures at the X11/Wayland level but does not suppress the
-        event from also reaching the terminal driver.  In cooked mode the
-        TTY echoes every character, which interleaves with ``print()``
-        output — particularly visible during blocking operations like
-        ``do_return_home`` where the user holds H and gets dozens of stray
-        'h' characters mixed with progress lines.
-
-        Only ECHO and ECHONL are cleared; canonical mode (line editing,
-        backspace) is preserved.  Falls back silently when stdin is not a
-        TTY (e.g. piped input or headless SSH).
-        """
-        if not sys.stdin.isatty():
-            return
-        try:
-            import termios
-
-            fd = sys.stdin.fileno()
-            self._saved_termios = termios.tcgetattr(fd)
-            new = termios.tcgetattr(fd)
-            # lflags[3]: clear ECHO (character echo) and ECHONL (echo
-            # newline in canonical mode when ICANON is off).
-            new[3] = new[3] & ~(termios.ECHO | termios.ECHONL)
-            termios.tcsetattr(fd, termios.TCSADRAIN, new)
-        except (termios.error, OSError):
-            self._saved_termios = None  # permission denied or not a TTY
+        """Disable terminal ECHO (delegates to module-level helper)."""
+        self._saved_termios = _suppress_terminal_echo()
 
     def _restore_terminal_echo(self) -> None:
-        """Restore terminal attributes saved by :meth:`_suppress_terminal_echo`."""
-        if self._saved_termios is None:
-            return
-        try:
-            import termios
-
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved_termios)
-        except (termios.error, OSError):
-            pass
+        """Restore terminal attributes (delegates to module-level helper)."""
+        _restore_terminal_echo(self._saved_termios)
         self._saved_termios = None
 
     # ------------------------------------------------------------------
@@ -298,11 +303,14 @@ class GlobalKeyState:
         keys.stop()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, suppress_echo: bool = False) -> None:
         self._keys: set[str] = set()
+        self._events: list[str] = []  # one-shot event queue
         self._running = False
         self._thread: threading.Thread | None = None
         self._listener: Any = None  # pynput keyboard.Listener
+        self._suppress_echo = suppress_echo
+        self._saved_termios: tuple | None = None
 
     def _run(self) -> None:
         from pynput import keyboard
@@ -321,6 +329,12 @@ class GlobalKeyState:
                     self._keys.add("left")
                 elif key == keyboard.Key.right:
                     self._keys.add("right")
+                elif key == keyboard.Key.space:
+                    self._events.append("space")
+                elif key == keyboard.Key.enter:
+                    self._events.append("enter")
+                elif key == keyboard.Key.backspace:
+                    self._events.append("backspace")
             except Exception:
                 pass
 
@@ -350,14 +364,25 @@ class GlobalKeyState:
 
     def stop(self) -> None:
         self._running = False
+        if self._suppress_echo:
+            _restore_terminal_echo(self._saved_termios)
+            self._saved_termios = None
 
     def start(self) -> None:
+        if self._suppress_echo:
+            self._saved_termios = _suppress_terminal_echo()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def is_pressed(self, key: str) -> bool:
         return key in self._keys
+
+    def pop_event(self) -> str | None:
+        """Pop the next one-shot event (space/enter/backspace), or None."""
+        if self._events:
+            return self._events.pop(0)
+        return None
 
     @property
     def any_pressed(self) -> bool:

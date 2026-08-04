@@ -2,7 +2,6 @@
 """Keyboard teleop xArm7 — SharedStorage-based architecture.
 
 Uses arm_loop process (Mode 6, 30Hz) for arm control via SharedStorage.
-No RobotInterface, no ArmServo thread, no preflight_check.
 
 Usage:
     source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_robot
@@ -31,16 +30,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import termios
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real import ASSET_DIR
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.teleop.keyboard import GlobalKeyState
-from dexmani_real.robot.inner_loop import arm_loop as _arm_loop, ArmInnerLoopConfig
+from dexmani_real.robot.arm_loop import arm_loop as _arm_loop, ArmLoopConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.shm.shared_storage import SharedStorage, HOME_SENTINEL
 from dexmani_real.robot.safety import SafetyState, transition
@@ -58,35 +57,35 @@ logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ 配置
 
-CTRL_DT = 1.0 / 30.0  # 30Hz — matches arm_loop rate, avoids queue backpressure
-DELTA_POS = 0.008  # 每次按键 EEF 平移量 (m) → 240 mm/s @ 30Hz
-DELTA_RPY = 0.03  # 每次按键 EEF 旋转量 (rad) → 1.7°/frame, 51°/s @ 30Hz
-# EMA alpha values from config.defaults.policy.ema
 
-# Cartesian P-term: amplifies position error before IK to reduce steady-state
-# tracking lag.  At Kp=0.0 the arm lags ~50mm behind the target at 250 mm/s
-# (open-loop time constant τ ≈ 0.2 s).  Kp=0.3 reduces the steady-state error
-# by ~23 % (to ~38 mm); Kp=0.5 by ~33 % (to ~33 mm).  Higher values risk
-# overshoot on direction reversals.  Set 0.0 for pure open-loop behaviour.
-CARTESIAN_KP = 0.0  # conservative default; try 0.3–0.5 for less lag
+@dataclass
+class KeyboardTeleopConfig:
+    """Keyboard teleop tuning parameters. Edit defaults here — no CLI needed."""
 
-# Mode 6 online trajectory planning — firmware replans trajectory with
-# configurable speed/acc limits. No inner-loop interpolation.
-INNER_LOOP_CFG = ArmInnerLoopConfig()
-HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s (默认 0.02→~50°/s，减半保安全)
+    ctrl_hz: float = 30.0  # control loop rate, matches arm_loop to avoid queue backpressure
+    delta_pos: float = 0.008  # EEF translation per keypress (m) → 240 mm/s @ 30Hz
+    delta_rpy: float = 0.03  # EEF rotation per keypress (rad) → 1.7°/frame, 51°/s @ 30Hz
 
-# ── Motion tracing: 追踪纯 +X 运动时的位置变化管线 ──
-TRACE_MOTION = True  # 启用运动追踪
-TRACE_FRAME_INTERVAL = 10  # 每 N 帧打印一次 (避免刷屏)
+    # Cartesian P-term: amplifies position error before IK to reduce steady-state
+    # tracking lag.  At Kp=0.0 the arm lags ~50mm behind the target at 250 mm/s
+    # (open-loop time constant τ ≈ 0.2 s).  Kp=0.3 reduces the steady-state error
+    # by ~23 % (to ~38 mm); Kp=0.5 by ~33 % (to ~33 mm).  Higher values risk
+    # overshoot on direction reversals.  Set 0.0 for pure open-loop behaviour.
+    cartesian_kp: float = 0.0  # conservative default; try 0.3–0.5 for less lag
+
+    home_dt: float = 0.04  # homing waypoint interval (s): ~25°/s
+
+    # ── Motion tracing: 追踪纯 +X 运动时的位置变化管线 ──
+    trace_motion: bool = True
+    trace_frame_interval: int = 10  # print every N frames
+
+
+# Singleton config (edit defaults in the dataclass above).
+_cfg = KeyboardTeleopConfig()
 
 # Workspace bounds in WORLD frame (defined in defaults.py as world-frame coordinates).
 # The robot base sits at base_pose_world (30° Z rotation) within this world.
 WORKSPACE_BOUNDS = policy.workspace.as_array()
-
-
-# ═══════════════════════════════════════════════ 姿态工具
-
-
 
 
 # ═══════════════════════════════════════════════ 辅助函数
@@ -117,7 +116,7 @@ def _print_motion_trace(
 
     print(
         f"\n{'─'*60}"
-        f"\n[TRACE #{loop_count}] 纯轴运动 + Cartesian EMA + P-term (Kp={CARTESIAN_KP})"
+        f"\n[TRACE #{loop_count}] 纯轴运动 + Cartesian EMA + P-term (Kp={_cfg.cartesian_kp})"
         f"\n{'─'*60}"
         f"\n  dx:          {np.array2string(dx * 1000, precision=1, suppress_small=True)} mm"
         f"\n  raw target:  {np.array2string(target_pos * 1000, precision=1, suppress_small=True)} mm"
@@ -160,28 +159,14 @@ def main():
     print("=" * 60)
     print("真机键盘遥操作 xArm7")
     print(
-        f"  DELTA_POS={DELTA_POS*1000:.0f}mm  DELTA_RPY={np.rad2deg(DELTA_RPY):.1f}deg  CTRL_DT={CTRL_DT}s  EMA_POS={policy.ema.alpha_pos} EMA_ROT={policy.ema.alpha_rot}"
+        f"  _cfg.delta_pos={_cfg.delta_pos*1000:.0f}mm  _cfg.delta_rpy={np.rad2deg(_cfg.delta_rpy):.1f}deg  (1.0 / _cfg.ctrl_hz)={(1.0 / _cfg.ctrl_hz)}s  EMA_POS={policy.ema.alpha_pos} EMA_ROT={policy.ema.alpha_rot}"
     )
     print(f"  workspace (world): x{WORKSPACE_BOUNDS[0]} y{WORKSPACE_BOUNDS[1]} z{WORKSPACE_BOUNDS[2]}")
     print("=" * 60)
 
     # ── 1. Planner ──
-    urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
-
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=urdf_path,
-            srdf_path=srdf_path,
-            base_pose_world=Pose(
-                p=np.array([0.0, 0.0, 0.0]),
-                q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
-            ),
-
-        ),
-        planning_profile=PlanningProfile(
-            max_waypoint_delta_deg=360.0,
-        ),
+    planner = XArm7MotionPlanner.create_default(
+        planning_profile=PlanningProfile(max_waypoint_delta_deg=360.0),
         teleop_profile=TeleopProfile(
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
@@ -190,7 +175,8 @@ def main():
 
     # ── 2. SharedStorage + subprocesses ──
     shared = SharedStorage.create(prefix="dexmani_kb")
-    arm_proc = mp.Process(target=_arm_loop, args=(shared, INNER_LOOP_CFG), name="arm-kb", daemon=True)
+    arm_loop_cfg = ArmLoopConfig()
+    arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_loop_cfg), name="arm-kb", daemon=True)
     hand_proc = mp.Process(target=_hand_loop, args=(shared,), name="hand-kb", daemon=True)
     arm_proc.start()
     hand_proc.start()
@@ -240,7 +226,7 @@ def main():
     print("\n键盘控制已启动，按 Q 退出")
 
     # ── 6. Main loop ──
-    limiter = RateManager(1.0 / CTRL_DT)
+    limiter = RateManager(1.0 / (1.0 / _cfg.ctrl_hz))
     running = True
     wall_warned = [False, False, False]
     wall_timers = [0.0, 0.0, 0.0]  # per-axis debounce (independent 3 s cooldown)
@@ -294,7 +280,7 @@ def main():
             if keys.is_pressed("r"):
                 print("\nR: return_home")
                 # Plan collision-safe path to home (same as VR policy)
-                _home_qpos = np.array(INNER_LOOP_CFG.home_qpos, dtype=np.float64)
+                _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
                 _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
                 if _waypoints is not None and len(_waypoints) > 0:
                     print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
@@ -370,31 +356,31 @@ def main():
             # ── EEF target delta from keys ──
             dx = np.zeros(3, dtype=np.float64)
             if keys.is_pressed("w"):
-                dx[0] += DELTA_POS
+                dx[0] += _cfg.delta_pos
             if keys.is_pressed("s"):
-                dx[0] -= DELTA_POS
+                dx[0] -= _cfg.delta_pos
             if keys.is_pressed("a"):
-                dx[1] -= DELTA_POS
+                dx[1] -= _cfg.delta_pos
             if keys.is_pressed("d"):
-                dx[1] += DELTA_POS
+                dx[1] += _cfg.delta_pos
             if keys.is_pressed("up"):
-                dx[2] += DELTA_POS
+                dx[2] += _cfg.delta_pos
             if keys.is_pressed("down"):
-                dx[2] -= DELTA_POS
+                dx[2] -= _cfg.delta_pos
 
             drpy = np.zeros(3, dtype=np.float64)
             if keys.is_pressed("left"):
-                drpy[0] += DELTA_RPY
+                drpy[0] += _cfg.delta_rpy
             if keys.is_pressed("right"):
-                drpy[0] -= DELTA_RPY
+                drpy[0] -= _cfg.delta_rpy
             if keys.is_pressed("i"):
-                drpy[1] += DELTA_RPY
+                drpy[1] += _cfg.delta_rpy
             if keys.is_pressed("k"):
-                drpy[1] -= DELTA_RPY
+                drpy[1] -= _cfg.delta_rpy
             if keys.is_pressed("j"):
-                drpy[2] -= DELTA_RPY
+                drpy[2] -= _cfg.delta_rpy
             if keys.is_pressed("l"):
-                drpy[2] += DELTA_RPY
+                drpy[2] += _cfg.delta_rpy
 
             # ── Periodic status (suppressed when idle — no keys pressed) ──
             _is_idle = np.all(dx == 0) and np.all(drpy == 0)
@@ -402,7 +388,7 @@ def main():
                 # Always track velocity baseline (even when idle) so the first
                 # non-idle status line gets an accurate speed estimate.
                 if prev_eef_pos is not None:
-                    vel = np.linalg.norm(eef_pos - prev_eef_pos) / (50 * CTRL_DT)
+                    vel = np.linalg.norm(eef_pos - prev_eef_pos) / (50 * (1.0 / _cfg.ctrl_hz))
                 else:
                     vel = 0.0
                 prev_eef_pos = eef_pos.copy()
@@ -449,7 +435,7 @@ def main():
             # abrupt keypress changes.  At α=0.8 the EMA steady-state lag
             # is ~(1-α)/α × Δ ≈ 1.25 mm — negligible; the dominant 50 mm
             # lead comes from arm tracking dynamics, which the EMA does not
-            # address (see CARTESIAN_KP below for that).
+            # address (see _cfg.cartesian_kp below for that).
             if _prev_ema_pos is not None:
                 ik_target_pos, ik_target_quat = ema_smooth_pose(
                     target_pos,
@@ -471,11 +457,11 @@ def main():
             #   Kp=0.0 → 50 mm lag   Kp=0.3 → ~38 mm (−23 %)
             #   Kp=0.5 → ~33 mm (−33 %)   Kp=1.0 → ~25 mm (−50 %)
             # Also counteracts Z-axis coupling during pure-X motion.
-            if CARTESIAN_KP > 0:
+            if _cfg.cartesian_kp > 0:
                 _eef_world_p = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.,0.,0.,0.]))).p
                 pos_error = target_pos - _eef_world_p
                 if float(np.linalg.norm(pos_error)) > 0.003:  # 3 mm deadband
-                    ik_target_pos = ik_target_pos + CARTESIAN_KP * pos_error
+                    ik_target_pos = ik_target_pos + _cfg.cartesian_kp * pos_error
                     ik_target_pos = np.clip(
                         ik_target_pos, WORKSPACE_BOUNDS[:, 0], WORKSPACE_BOUNDS[:, 1],
                     )
@@ -514,8 +500,8 @@ def main():
 
             # ── Motion Trace: 纯轴运动管线诊断 ──
             if (
-                TRACE_MOTION
-                and loop_count % TRACE_FRAME_INTERVAL == 0
+                _cfg.trace_motion
+                and loop_count % _cfg.trace_frame_interval == 0
                 and dx[0] != 0
                 and dx[1] == 0
                 and dx[2] == 0
@@ -581,7 +567,7 @@ def main():
                 if _arm_result is not None:
                     _ad, _, _ = _arm_result
                     _arm_qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
-                    _home_qpos = np.array(INNER_LOOP_CFG.home_qpos, dtype=np.float64)
+                    _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
                     _waypoints = plan_joint_home_path(_arm_qpos, _home_qpos, planner)
                     if _waypoints is not None and len(_waypoints) > 0:
                         print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")

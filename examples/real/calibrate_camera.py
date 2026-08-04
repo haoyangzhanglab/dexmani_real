@@ -43,8 +43,8 @@ from __future__ import annotations
 import json
 import sys
 import termios
-import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -55,28 +55,41 @@ from scipy.spatial.transform import Rotation as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real import ASSET_DIR, PACKAGE_DIR
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real import PACKAGE_DIR
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.planning.path_utils import plan_joint_home_path
-from dexmani_real.robot.inner_loop import ArmInnerLoopConfig, arm_loop as _arm_loop
-
-try:
-    from pynput import keyboard  # type: ignore[import-untyped]
-except ImportError:
-    raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
+from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
+from dexmani_real.teleop.keyboard import GlobalKeyState
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage, SharedStorageConfig, read_arm_state
 from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
 
-CTRL_HZ = 30.0  # 30Hz — matches arm_loop rate, avoids queue backpressure
-CTRL_DT = 1.0 / CTRL_HZ
-DELTA_POS = 0.008  # 每次按键平移量 (m) → 240 mm/s @ 30Hz
-DELTA_RPY = 0.03  # 每次按键旋转量 (rad) → 1.7°/frame, 51°/s @ 30Hz
-TARGET_LEAD_MAX = 0.03  # target 领先 arm 的最大距离 (m)
-HOME_DT = 0.04  # 归位 waypoint 间隔 (s): ~25°/s（保守，避免归位过快）
+
+@dataclass
+class CameraCalibConfig:
+    """Camera calibration tuning parameters. Edit defaults here — no CLI needed."""
+
+    ctrl_hz: float = 30.0  # control loop rate, matches arm_loop
+    delta_pos: float = 0.008  # EEF translation per keypress (m)
+    delta_rpy: float = 0.03  # EEF rotation per keypress (rad)
+    target_lead_max: float = 0.03  # max target-to-arm lead distance (m)
+    home_dt: float = 0.04  # homing waypoint interval (s)
+
+    # ArUco
+    marker_size_m: float = 0.1228  # marker side length (m) — 12.28cm
+    marker_id: int = 1  # expected marker ID (None = accept any)
+    aruco_capture_frames: int = 5  # frames for median-stable detection
+
+    # Quality gates
+    min_samples: int = 10  # minimum samples before calibration
+    max_consistency_std_mm: float = 5.0  # T_ee_marker position std threshold
+    max_consistency_rot_std_deg: float = 3.0  # T_ee_marker rotation std threshold
+
+
+_cfg = CameraCalibConfig()
 
 # Workspace bounds — derived from policy.workspace for consistency with
 # the data-collection entry points.  The Y bounds are slightly tighter than
@@ -87,139 +100,18 @@ WORKSPACE_BOUNDS = policy.workspace.as_array()
 WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
 WORKSPACE_BOUNDS[1, 1] = 0.45   # y_max: tighter for calibration rig
 
-# ArUco 标记参数
+# ArUco dictionary (fixed — not tunable per-session)
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
-MARKER_SIZE_M = 0.1228  # 标记边长 (m) — 12.28cm
-MARKER_ID = 1  # 期望的标记 ID（None = 接受任意 ID）
 
 # 相机外参保存路径（包内 config/，与 CameraCalib 默认读取路径一致）
 CAMERAS_JSON_PATH = PACKAGE_DIR / "config" / "cameras.json"
 
-# 用于位姿采集的 ArUco 检测帧数（取中值以提高稳定性）
-ARUCO_CAPTURE_FRAMES = 5
-
-# 进入标定计算所需的最少样本数
-MIN_SAMPLES = 10
-
-# 标定质量门槛：T_ee_marker 位置一致性 std 超过此值(mm)则拒绝写盘
-MAX_CONSISTENCY_STD_MM = 5.0
-
-# 标定质量门槛(旋转)：T_ee_marker 旋转一致性 std 超过此值(deg)则拒绝写盘。
-# ArUco 单标记朝向本身较嘈杂(平面翻转歧义)，故阈值偏宽松，可按需收紧。
-MAX_CONSISTENCY_ROT_STD_DEG = 3.0
-
 
 # ═══════════════════════════════════════════════ 键盘输入
-
-
-class KeyState:
-    """非阻塞键盘状态追踪（pynput, 线程安全）。"""
-
-    def __init__(self):
-        self._keys: set[str] = set()
-        self._events: list[str] = []  # 一次性事件: 'space', 'enter', 'backspace'
-        self._lock = threading.Lock()
-        self._running = True
-        self._thread: threading.Thread | None = None
-
-    def _run(self):
-        def on_press(key):
-            try:
-                with self._lock:
-                    if hasattr(key, "char") and key.char is not None:
-                        ch = key.char.lower()
-                        if ch == "x":
-                            # X = 一次性事件（删除残差最大的最差帧），不作为按住键
-                            if "x" not in self._events:
-                                self._events.append("x")
-                        else:
-                            self._keys.add(ch)
-                    elif key == keyboard.Key.esc:
-                        self._keys.add("esc")
-                    elif key == keyboard.Key.up:
-                        self._keys.add("up")
-                    elif key == keyboard.Key.down:
-                        self._keys.add("down")
-                    elif key == keyboard.Key.left:
-                        self._keys.add("left")
-                    elif key == keyboard.Key.right:
-                        self._keys.add("right")
-                    elif key == keyboard.Key.space:
-                        if "space" not in self._events:
-                            self._events.append("space")
-                    elif key == keyboard.Key.enter:
-                        if "enter" not in self._events:
-                            self._events.append("enter")
-                    elif key == keyboard.Key.backspace:
-                        if "backspace" not in self._events:
-                            self._events.append("backspace")
-            except Exception:
-                pass
-
-        def on_release(key):
-            try:
-                with self._lock:
-                    if hasattr(key, "char") and key.char is not None:
-                        self._keys.discard(key.char.lower())
-                    elif key == keyboard.Key.esc:
-                        self._keys.discard("esc")
-                    elif key == keyboard.Key.up:
-                        self._keys.discard("up")
-                    elif key == keyboard.Key.down:
-                        self._keys.discard("down")
-                    elif key == keyboard.Key.left:
-                        self._keys.discard("left")
-                    elif key == keyboard.Key.right:
-                        self._keys.discard("right")
-            except Exception:
-                pass
-
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
-        while self._running:
-            time.sleep(0.1)
-        self._listener.stop()
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        # 立即停止监听器并 join 线程，避免退出后仍捕获按键、污染终端
-        listener = getattr(self, "_listener", None)
-        if listener is not None:
-            try:
-                listener.stop()
-            except Exception:
-                pass
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-
-    def is_pressed(self, key: str) -> bool:
-        with self._lock:
-            return key in self._keys
-
-    def pop_event(self) -> str | None:
-        """取走一个一次性事件，没有则返回 None。"""
-        with self._lock:
-            if self._events:
-                return self._events.pop(0)
-            return None
-
-
-# ═══════════════════════════════════════════════ 姿态工具
-
-
-
-
-def _pose_wxyz_to_matrix(p: np.ndarray, q_wxyz: np.ndarray) -> np.ndarray:
-    """(position, WXYZ 四元数) → 4x4 齐次矩阵。"""
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]]).as_matrix()
-    T[:3, 3] = p
-    return T
+# Uses GlobalKeyState from dexmani_real.teleop.keyboard for held-key detection
+# (WASD / arrows).  One-shot events (space, enter, backspace) come from
+# GlobalKeyState.pop_event(); the 'x' key uses edge detection.
 
 
 # ═══════════════════════════════════════════════ ArUco 检测
@@ -229,8 +121,8 @@ def detect_aruco_pose(
     color_image: np.ndarray,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-    marker_size: float = MARKER_SIZE_M,
-    target_id: int | None = MARKER_ID,
+    marker_size: float = _cfg.marker_size_m,
+    target_id: int | None = _cfg.marker_id,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """检测 ArUco 标记，返回相机系下的 (rvec, tvec) 或 None。
 
@@ -287,7 +179,7 @@ def detect_aruco_stable(
     pipeline: rs.pipeline,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-    n_frames: int = ARUCO_CAPTURE_FRAMES,
+    n_frames: int = _cfg.aruco_capture_frames,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """连续采集 n_frames 帧，返回 ArUco 位姿的中值（更稳定）。"""
     rvecs_all = []
@@ -314,10 +206,10 @@ def detect_aruco_stable(
 # marker 四角在标记坐标系下的 3D 坐标（用于预览时画坐标轴）
 _MARKER_CORNERS_3D = np.array(
     [
-        [-MARKER_SIZE_M / 2, MARKER_SIZE_M / 2, 0],
-        [MARKER_SIZE_M / 2, MARKER_SIZE_M / 2, 0],
-        [MARKER_SIZE_M / 2, -MARKER_SIZE_M / 2, 0],
-        [-MARKER_SIZE_M / 2, -MARKER_SIZE_M / 2, 0],
+        [-_cfg.marker_size_m / 2, _cfg.marker_size_m / 2, 0],
+        [_cfg.marker_size_m / 2, _cfg.marker_size_m / 2, 0],
+        [_cfg.marker_size_m / 2, -_cfg.marker_size_m / 2, 0],
+        [-_cfg.marker_size_m / 2, -_cfg.marker_size_m / 2, 0],
     ],
     dtype=np.float32,
 )
@@ -329,7 +221,7 @@ def draw_overlay(
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     n_samples: int,
-    target_id: int | None = MARKER_ID,
+    target_id: int | None = _cfg.marker_id,
 ) -> tuple[np.ndarray, bool]:
     """在彩色帧上叠加 ArUco 检测框/坐标轴与状态文字（原地绘制）。
 
@@ -352,14 +244,14 @@ def draw_overlay(
                 flags=cv2.SOLVEPNP_IPPE_SQUARE,
             )
             if ok:
-                cv2.drawFrameAxes(image, intrinsics, distortion, rv, tv, MARKER_SIZE_M * 0.5)
+                cv2.drawFrameAxes(image, intrinsics, distortion, rv, tv, _cfg.marker_size_m * 0.5)
                 detected = True
 
     color = (0, 200, 0) if detected else (0, 0, 255)
     status = f"MARKER {'OK' if detected else 'NOT FOUND'}"
     cv2.putText(image, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    hint = f"samples={n_samples}/{MIN_SAMPLES}  " + (
-        "ENTER=calibrate" if n_samples >= MIN_SAMPLES else f"SPACE=capture (need >={MIN_SAMPLES})"
+    hint = f"samples={n_samples}/{_cfg.min_samples}  " + (
+        "ENTER=calibrate" if n_samples >= _cfg.min_samples else f"SPACE=capture (need >={_cfg.min_samples})"
     )
     cv2.putText(image, hint, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return image, detected
@@ -590,7 +482,7 @@ def save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) 
 def main():
     print("=" * 60)
     print("  ArUco 手眼标定 — xArm7 + RealSense (eye-to-hand)")
-    print(f"  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M*1000:.1f}mm")
+    print(f"  ArUco: {ARUCO_DICT_NAME} ID={_cfg.marker_id} size={_cfg.marker_size_m*1000:.1f}mm")
     print(f"  移动: WASD/↑↓  旋转: ←→(roll) IK(pitch) JL(yaw)")
     print(f"  采集: SPACE  标定: ENTER(≥10,推荐10~20)  撤销: BACKSPACE  删最差帧: X  归位: R  退出: Q")
     print("=" * 60)
@@ -600,19 +492,7 @@ def main():
     tty_attrs = termios.tcgetattr(tty_fd) if tty_fd is not None else None
 
     # ── 1. Planner (for IK in main loop) ──
-    urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
-
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=urdf_path,
-            srdf_path=srdf_path,
-            base_pose_world=Pose(
-                p=np.array([0.0, 0.0, 0.0]),
-                q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
-            ),
-        ),
-        planning_profile=PlanningProfile(),
+    planner = XArm7MotionPlanner.create_default(
         teleop_profile=TeleopProfile(
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
@@ -624,7 +504,7 @@ def main():
 
     shm_cfg = SharedStorageConfig()
     shared = SharedStorage.create(prefix="dexmani_calib", config=shm_cfg)
-    arm_cfg = ArmInnerLoopConfig()
+    arm_cfg = ArmLoopConfig()
     arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm-calib", daemon=True)
     arm_proc.start()
 
@@ -708,7 +588,7 @@ def main():
         pipeline.wait_for_frames()
 
     # ── 4. 键盘输入 ──
-    keys = KeyState()
+    keys = GlobalKeyState(suppress_echo=True)
     keys.start()
     print("\n  键盘控制就绪 ←")
 
@@ -727,7 +607,7 @@ def main():
     print("  预览窗口已打开（绿=已检测，红=未检测）")
 
     # ── 6. 主循环 ──
-    limiter = RateManager(CTRL_HZ)
+    limiter = RateManager(_cfg.ctrl_hz)
     running = True
     loop_count = 0
     wall_warned = [False, False, False]
@@ -735,35 +615,16 @@ def main():
     T_world_camera: np.ndarray | None = None
     # 最近一次 ENTER 计算出的逐帧残差 (mm)，与样本列表同序；样本变动即作废
     last_residuals: np.ndarray | None = None
+    prev_x_pressed = False  # edge detection for 'x' one-shot key
 
     def _get_ee_pose() -> tuple[np.ndarray, np.ndarray]:
-        """获取当前末端位姿 (pos_m, rpy_rad)。
-
-        Under the SharedStorage architecture the EE pose is read from
-        ``arm_state_ring`` (eef_pos + eef_rot6d), then rot6d is converted
-        to RPY via scipy.  RPY unit is radians — must match
-        ``calibrate_eye_to_hand`` (``R.from_euler(..., degrees=False)``).
-        """
+        """获取当前末端位姿 (pos_m, rpy_rad)。Rot6d→RPY via canonical library path."""
         qpos, eef_pos, eef_rot6d = _read_arm_state_ring()
         if qpos is None or eef_pos is None or eef_rot6d is None:
             return np.full(3, np.nan), np.full(3, np.nan)
         try:
-            # Convert rot6d → rotation matrix → RPY
-            # rot6d = [col1_x, col1_y, col1_z, col2_x, col2_y, col2_z]
-            a1 = eef_rot6d[:3]
-            a2 = eef_rot6d[3:6]
-            norm_a1 = float(np.linalg.norm(a1))
-            if norm_a1 < 1e-12:
-                return np.full(3, np.nan), np.full(3, np.nan)
-            b1 = a1 / norm_a1
-            b2 = a2 - np.dot(b1, a2) * b1
-            norm_b2 = float(np.linalg.norm(b2))
-            if norm_b2 < 1e-12:
-                return np.full(3, np.nan), np.full(3, np.nan)
-            b2 = b2 / norm_b2
-            b3 = np.cross(b1, b2)
-            r_mat = np.column_stack([b1, b2, b3])
-            rpy = R.from_matrix(r_mat).as_euler("xyz", degrees=False)
+            q_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
+            rpy = R.from_quat(np.roll(q_wxyz, -1)).as_euler("xyz", degrees=False)
             return eef_pos.copy(), np.asarray(rpy, dtype=np.float64)
         except Exception:
             return np.full(3, np.nan), np.full(3, np.nan)
@@ -791,6 +652,11 @@ def main():
 
             # ── 事件处理 ──
             event = keys.pop_event()
+            # Edge-detect 'x' for one-shot delete action (held key in GlobalKeyState)
+            cur_x = keys.is_pressed("x")
+            if event is None and cur_x and not prev_x_pressed:
+                event = "x"
+            prev_x_pressed = cur_x
             while event is not None:
                 if event == "space":
                     # 采集标定样本
@@ -851,8 +717,8 @@ def main():
                         )
                 elif event == "enter":
                     n = len(samples_tvec_ee2base)
-                    if n < MIN_SAMPLES:
-                        print(f"  ❌ 至少需要 {MIN_SAMPLES} 组样本，当前 {n} 组 — 请继续采集")
+                    if n < _cfg.min_samples:
+                        print(f"  ❌ 至少需要 {_cfg.min_samples} 组样本，当前 {n} 组 — 请继续采集")
                     else:
                         print(f"\n  计算手眼标定 ({n} 组样本, 5 种算法比选)...")
                         T_candidate, method_best, errors_mm, errors_deg, method_table = calibrate_and_select(
@@ -864,9 +730,11 @@ def main():
                         # 手眼解出的是 xArm 基座系 T_base_camera（末端位姿取自 get_position）。
                         # 转到 world 系，与下游 eef_pos/arm_ee(compute_eef_pose_world) 一致：
                         #   T_world_camera = T_world_base @ T_base_camera
-                        T_world_base = _pose_wxyz_to_matrix(
-                            planner.kin.base_pose_world.p, planner.kin.base_pose_world.q
-                        )
+                        T_world_base = np.eye(4, dtype=np.float64)
+                        T_world_base[:3, :3] = R.from_quat(
+                            np.roll(planner.kin.base_pose_world.q, -1)
+                        ).as_matrix()
+                        T_world_base[:3, 3] = planner.kin.base_pose_world.p
                         T_candidate = T_world_base @ T_candidate
                         std_mm = float(errors_mm.std())
                         std_deg = float(errors_deg.std())
@@ -898,14 +766,14 @@ def main():
                         quat_wxyz = R.from_matrix(T_candidate[:3, :3]).as_quat()[[3, 0, 1, 2]]
                         print(f"    quat (wxyz): {np.round(quat_wxyz, 4)}")
 
-                        pos_bad = std_mm > MAX_CONSISTENCY_STD_MM
-                        rot_bad = std_deg > MAX_CONSISTENCY_ROT_STD_DEG
+                        pos_bad = std_mm > _cfg.max_consistency_std_mm
+                        rot_bad = std_deg > _cfg.max_consistency_rot_std_deg
                         if pos_bad or rot_bad:
                             reasons = []
                             if pos_bad:
-                                reasons.append(f"位置 std={std_mm:.1f}mm > {MAX_CONSISTENCY_STD_MM:.1f}mm")
+                                reasons.append(f"位置 std={std_mm:.1f}mm > {_cfg.max_consistency_std_mm:.1f}mm")
                             if rot_bad:
-                                reasons.append(f"旋转 std={std_deg:.2f}° > {MAX_CONSISTENCY_ROT_STD_DEG:.1f}°")
+                                reasons.append(f"旋转 std={std_deg:.2f}° > {_cfg.max_consistency_rot_std_deg:.1f}°")
                             print(f"  ❌ 一致性不达标（{'；'.join(reasons)}）— 拒绝写盘")
                             print(f"     请增大末端姿态变化(I/K/J/L、←→)后重采；")
                             print(f"     BACKSPACE 可逐个撤销可疑样本，再按 ENTER 重新计算。")
@@ -930,7 +798,7 @@ def main():
             # ── R: 归位 (collision-safe path via plan_joint_home_path) ──
             if keys.is_pressed("r"):
                 print("\n  R: return_home")
-                _home_qpos = np.array(ArmInnerLoopConfig().home_qpos, dtype=np.float64)
+                _home_qpos = np.array(ArmLoopConfig().home_qpos, dtype=np.float64)
                 _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
                 if _waypoints is not None and len(_waypoints) > 0:
                     print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
@@ -986,31 +854,31 @@ def main():
             # ── EEF target delta from keys (world frame) ──
             dx = np.zeros(3)
             if keys.is_pressed("w"):
-                dx[0] += DELTA_POS
+                dx[0] += _cfg.delta_pos
             if keys.is_pressed("s"):
-                dx[0] -= DELTA_POS
+                dx[0] -= _cfg.delta_pos
             if keys.is_pressed("a"):
-                dx[1] -= DELTA_POS
+                dx[1] -= _cfg.delta_pos
             if keys.is_pressed("d"):
-                dx[1] += DELTA_POS
+                dx[1] += _cfg.delta_pos
             if keys.is_pressed("up"):
-                dx[2] += DELTA_POS
+                dx[2] += _cfg.delta_pos
             if keys.is_pressed("down"):
-                dx[2] -= DELTA_POS
+                dx[2] -= _cfg.delta_pos
 
             drpy = np.zeros(3)
             if keys.is_pressed("left"):
-                drpy[0] += DELTA_RPY
+                drpy[0] += _cfg.delta_rpy
             if keys.is_pressed("right"):
-                drpy[0] -= DELTA_RPY
+                drpy[0] -= _cfg.delta_rpy
             if keys.is_pressed("i"):
-                drpy[1] += DELTA_RPY
+                drpy[1] += _cfg.delta_rpy
             if keys.is_pressed("k"):
-                drpy[1] -= DELTA_RPY
+                drpy[1] -= _cfg.delta_rpy
             if keys.is_pressed("j"):
-                drpy[2] -= DELTA_RPY
+                drpy[2] -= _cfg.delta_rpy
             if keys.is_pressed("l"):
-                drpy[2] += DELTA_RPY
+                drpy[2] += _cfg.delta_rpy
 
             # 周期性状态打印 (world frame)
             if loop_count % 50 == 0:
@@ -1019,7 +887,7 @@ def main():
                     f"[{loop_count:5d}] "
                     f"eef_w={np.round(eef_pos_world, 3)}m  "
                     f"samples={n}  "
-                    f"{'← 按 SPACE 采集' if n < MIN_SAMPLES else '← 按 ENTER 标定'}",
+                    f"{'← 按 SPACE 采集' if n < _cfg.min_samples else '← 按 ENTER 标定'}",
                     flush=True,
                 )
 
@@ -1032,8 +900,8 @@ def main():
 
             # ── Target lead limit (world frame) ──
             lead = np.linalg.norm(target_pos - eef_pos_world)
-            if lead > TARGET_LEAD_MAX:
-                target_pos = eef_pos_world + (target_pos - eef_pos_world) * (TARGET_LEAD_MAX / lead)
+            if lead > _cfg.target_lead_max:
+                target_pos = eef_pos_world + (target_pos - eef_pos_world) * (_cfg.target_lead_max / lead)
 
             # ── Workspace soft-wall: directional — allow moving back into workspace ──
             new_pos = target_pos + dx
@@ -1098,7 +966,7 @@ def main():
         shared.close()
 
         n = len(samples_tvec_ee2base)
-        if n >= MIN_SAMPLES and T_world_camera is None:
+        if n >= _cfg.min_samples and T_world_camera is None:
             print(f"\n  已采集 {n} 组样本但未执行标定。")
             print("  按 ENTER 可在退出前完成标定，或重新运行脚本。")
         elif T_world_camera is not None:

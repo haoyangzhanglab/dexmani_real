@@ -64,7 +64,7 @@ class PolicyConfig:
     # Mode 6 firmware parameters (deg — matches CLI convention)
     joint_max_speed_deg_s: float = field(default_factory=lambda: arm.max_joint_velocity_deg_per_s)
     joint_max_acc_deg_s2: float = field(default_factory=lambda: arm.max_joint_acceleration_deg_per_s2)
-    inner_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
+    arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
 
     # VR mapping
     vr_pos_scale: float = field(default_factory=lambda: policy.vr_mapping.pos_scale)
@@ -503,7 +503,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             "ema_alpha_rot": cfg.ema_alpha_rot,
                             "joint_max_acc": cfg.joint_max_acc_deg_s2,
                             "joint_max_speed": cfg.joint_max_speed_deg_s,
-                            "inner_loop_hz": cfg.inner_loop_hz,
+                            "arm_loop_hz": cfg.arm_loop_hz,
                             "hand_available": hand_available,
                             "hand_retargeting_type": cfg.hand_retargeting_type,
                         },

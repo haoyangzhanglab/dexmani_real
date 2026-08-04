@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -30,8 +31,8 @@ logger = get_logger(__name__)
 
 
 @dataclass
-class ArmInnerLoopConfig:
-    """Configuration for ArmInnerLoop (Mode 6: joint online trajectory planning).
+class ArmLoopConfig:
+    """Configuration for arm_loop (Mode 6: joint online trajectory planning).
 
     Defaults sourced from :data:`~dexmani_real.config.defaults.arm` singleton.
     """
@@ -73,7 +74,7 @@ _RECOVERY_MAX: int = 30  # consecutive recoveries before FAULT escalation (1s @ 
 # ═══════════════════════════════════════════════════════════════════
 
 
-def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
+def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     """Arm process entry point — reads SharedStorage.arm_action_q, servos arm.
 
     Designed as an mp.Process target. Communicates exclusively through
@@ -83,14 +84,14 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
 
     from dexmani_real.shm.shared_storage import HOME_SENTINEL, ARM_STATE_DTYPE, new_frame
     from dexmani_real.robot.safety import SafetyState, transition
-    from dexmani_real.planning.arm_fk import ArmFK
+    from dexmani_real.planning.kinematics import ArmFK
     from dexmani_real import ASSET_DIR
 
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
     _consecutive_recoveries = 0
     _consecutive_state_errors = 0
-    cfg = config or ArmInnerLoopConfig()
+    cfg = config or ArmLoopConfig()
 
     HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
 
@@ -358,7 +359,7 @@ def arm_loop(shared, config: ArmInnerLoopConfig | None = None) -> None:
     logger.info("arm_loop: exited")
 
 
-def _disconnect_arm(arm) -> None:
+def _disconnect_arm(arm: Any) -> None:
     """Disconnect arm safely, ignoring errors."""
     try:
         arm.disconnect()
@@ -366,8 +367,8 @@ def _disconnect_arm(arm) -> None:
         pass
 
 
-def _planned_homing(arm, waypoints: np.ndarray | None, home_qpos: np.ndarray,
-                    cfg: ArmInnerLoopConfig | None = None, *, shared=None) -> None:
+def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarray,
+                    cfg: ArmLoopConfig | None = None, *, shared: Any = None) -> None:
     """Execute planned waypoints, then converge to exact home_qpos.
 
     When *waypoints* is ``None`` or empty, falls back to joint-space linear
@@ -376,7 +377,7 @@ def _planned_homing(arm, waypoints: np.ndarray | None, home_qpos: np.ndarray,
     Writes heartbeat to ``shared.arm_heartbeat_s`` during execution so that
     the homing sequence does not trigger a false FAULT timeout.
     """
-    _cfg = cfg or ArmInnerLoopConfig()
+    _cfg = cfg or ArmLoopConfig()
 
     try:
         code, states = arm.get_joint_states(is_radian=True, num=1)

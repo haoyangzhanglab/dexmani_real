@@ -36,9 +36,6 @@ class TeleopIKSolver:
     ref: LeFranX current_distance penalty, ssik seed_tolerance.
     """
 
-    # xArm7 joint4 (elbow) — distinguishes elbow-up vs elbow-down IK branches.
-    _ELBOW_JOINT_INDEX: int = 3
-
     # Elbow flip detection thresholds (ref: planner.py check_elbow_consistency).
     _ELBOW_FLIP_NEG_THRESH_RAD: float = np.deg2rad(-5.0)
     _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)
@@ -49,10 +46,12 @@ class TeleopIKSolver:
         kin: XArm7Kinematics,
         ik_mgr: IKCandidateManager,
         teleop_profile: TeleopProfile,
+        elbow_joint_index: int = 3,
     ) -> None:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
+        self._elbow_joint_index = elbow_joint_index
         self._nullspace_warn_last_s: float = 0.0
         self._hold_start: float | None = None
         self._hold_warned: bool = False
@@ -102,6 +101,7 @@ class TeleopIKSolver:
                 success=False,
                 qpos=previous_qpos_cmd.copy(),
                 reason=diagnostic["summary"],
+                held=True,
                 report={
                     **report,
                     "held": True,
@@ -190,8 +190,9 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:{tag}({_solve_ms:.1f}ms)")
                 continue
 
+            delta_current = self.ik_mgr.compute_qpos_delta(qpos, current_qpos)
             hw_dist_raw = float(np.max(np.abs(qpos - current_qpos)))
-            hw_dist = float(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, current_qpos))))
+            hw_dist = float(np.max(np.abs(delta_current)))
             weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights)
 
             # ── Band-mismatch gate: detect when the IK result is on a
@@ -357,10 +358,7 @@ class TeleopIKSolver:
         the rejection boundary).  Within the accepted range, this breaks
         ties toward the candidate that best matches the VR target.
         """
-        limits = self.ik_mgr.joint_limits
-        center = 0.5 * (limits[:, 0] + limits[:, 1])
-        half_range = np.maximum(0.5 * (limits[:, 1] - limits[:, 0]), 1e-6)
-        limit_penalty = float(np.sum(((qpos - center) / half_range) ** 2))
+        limit_penalty = self.ik_mgr.joint_limit_penalty(qpos, self.ik_mgr.joint_limits)
 
         vel_weights = (
             profile.velocity_joint_weights
@@ -383,8 +381,8 @@ class TeleopIKSolver:
 
     def _has_elbow_flip(self, candidate_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> bool:
         """Return True if candidate would cause an elbow branch flip vs previous command."""
-        prev_j4 = float(previous_qpos_cmd[self._ELBOW_JOINT_INDEX])
-        cand_j4 = float(candidate_qpos[self._ELBOW_JOINT_INDEX])
+        prev_j4 = float(previous_qpos_cmd[self._elbow_joint_index])
+        cand_j4 = float(candidate_qpos[self._elbow_joint_index])
         delta_j4 = abs(cand_j4 - prev_j4)
 
         if prev_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and cand_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
@@ -490,7 +488,6 @@ class TeleopIKSolver:
         if profile.enable_nullspace_optimization:
             try:
                 jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
-                from .nullspace import apply_nullspace_optimization
 
                 qpos_cmd = apply_nullspace_optimization(
                     qpos_cmd,
@@ -529,3 +526,108 @@ class TeleopIKSolver:
             "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
         }
         return IKResult(success=True, qpos=qpos_cmd, report=result_report)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Null-space optimization helpers (inlined from planning/nullspace.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def nullspace_projector(J: np.ndarray) -> np.ndarray:
+    """Compute null-space projector N = I - J⁺J via SVD.
+
+    For the xArm7 6×7 Jacobian (rank 6): N is 7×7, symmetric, idempotent,
+    with one eigenvalue ≈ 1 (null-space direction) and six ≈ 0 (range-space).
+
+    Args:
+        J: 6×dof end-effector Jacobian.  Must have full row rank (6).
+
+    Returns:
+        7×7 null-space projector matrix.
+    """
+    U, S, Vt = np.linalg.svd(J, full_matrices=False)
+    V = Vt.T  # 7×6
+    return np.eye(J.shape[1]) - V @ V.T
+
+
+def joint_limit_gradient(
+    qpos: np.ndarray,
+    joint_limits: np.ndarray,
+    margin_deg: float = 15.0,
+) -> np.ndarray:
+    """Quadratic repulsive gradient from joint limits.
+
+    Gradient is zero when distance ≥ margin (joint is safely away from limit).
+    Within the margin, the gradient increases linearly, pushing the joint
+    toward centre.  C¹ continuous — no discontinuous joint motion at the
+    margin boundary.
+
+    Potential: V(q) = ((margin - d) / margin)²  for d < margin, else 0.
+    Gradient: ∂V/∂q = -2(margin - d)/margin² · sign(direction).
+
+    Args:
+        qpos: current joint positions [rad], shape (dof,).
+        joint_limits: (dof, 2) array [low, high] per joint [rad].
+        margin_deg: distance from limit [deg] below which repulsion activates.
+
+    Returns:
+        Gradient vector ∇V(q), shape (dof,).  NaN-safe: returns zeros on
+        non-finite input.
+    """
+    if not np.all(np.isfinite(qpos)):
+        return np.zeros_like(qpos)
+
+    margin = np.deg2rad(margin_deg)
+    low = joint_limits[:, 0]
+    high = joint_limits[:, 1]
+    grad = np.zeros(qpos.shape[0], dtype=np.float64)
+
+    for i in range(qpos.shape[0]):
+        d_low = qpos[i] - low[i]
+        d_high = high[i] - qpos[i]
+
+        if d_low < margin:
+            grad[i] = 2.0 * (margin - d_low) / (margin * margin)
+        elif d_high < margin:
+            grad[i] = -2.0 * (margin - d_high) / (margin * margin)
+
+    return grad
+
+
+def apply_nullspace_optimization(
+    qpos: np.ndarray,
+    jacobian: np.ndarray,
+    joint_limits: np.ndarray,
+    step_size_rad: float = np.deg2rad(1.0),
+    margin_deg: float = 15.0,
+) -> np.ndarray:
+    """Apply null-space joint-limit repulsion to an IK solution.
+
+    Computes the null-space projector from the Jacobian, projects the
+    joint-limit repulsive gradient into the self-motion manifold, clips
+    the step to ``step_size_rad``, and returns the adjusted qpos.
+
+    The EEF pose is unchanged by construction: J @ (qpos' - qpos) ≈ 0.
+
+    Args:
+        qpos: IK solution to refine [rad], shape (7,).
+        jacobian: 6×7 EEF Jacobian at qpos.
+        joint_limits: (7, 2) array [low, high] per joint [rad].
+        step_size_rad: max per-frame null-space step [rad] (default 1°).
+        margin_deg: joint-limit margin for repulsion [deg].
+
+    Returns:
+        Refined qpos with null-space adjustment applied.
+    """
+    grad = joint_limit_gradient(qpos, joint_limits, margin_deg)
+    if not np.any(grad):
+        return qpos  # no joint near limit — skip SVD (~0.13 ms saved)
+
+    N = nullspace_projector(jacobian)
+    dq = N @ grad
+    dq_max = float(np.max(np.abs(dq)))
+
+    if dq_max > step_size_rad and dq_max > 1e-12:
+        dq *= step_size_rad / dq_max
+
+    return qpos + dq

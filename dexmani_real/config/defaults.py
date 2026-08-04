@@ -9,11 +9,11 @@ Module-level singletons (``arm``, ``hand``, ``policy``, ``vr``, ``safety``,
     from dexmani_real.config.defaults import arm, hand, policy
 
     @dataclass
-    class ArmInnerLoopConfig:
+    class ArmLoopConfig:
         joint_max_speed_rad_per_s: float = field(
             default_factory=lambda: arm.max_joint_velocity_rad_per_s
         )
-        homing_step_count: int = field(default_factory=lambda: arm.homing.step_count)
+        homing_convergence_rad: float = field(default_factory=lambda: arm.homing.convergence_rad)
 
 Conventions:
     - All angles in **radians** unless suffixed ``_deg``.
@@ -77,7 +77,6 @@ class StaleDetectionParams:
     """Qpos freshness detection (driver board lockout guard)."""
 
     frame_count: int = 15  # frames @ 30Hz → 0.5s
-    cmd_gap_rad: float = 0.05
     qpos_delta_rad: float = 1e-4
 
 

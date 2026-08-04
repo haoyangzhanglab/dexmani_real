@@ -16,7 +16,7 @@ except ImportError:
     xhc = None  # type: ignore[assignment]
     _SDK_AVAILABLE = False
 
-from dexmani_real.robot.xhand.motor_trajectory_interpolator import MotorTrajectoryInterpolator
+
 from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.serialization import from_dict_helper
@@ -149,7 +149,7 @@ class XHandConfig:
     max_qvel: np.ndarray = field(
         default_factory=lambda: np.deg2rad(np.ones(12) * 180.0),
         metadata={
-            "help": "Per-joint max velocity (rad/s). Used with MotorTrajectoryInterpolator.drive_to_waypoint as max_speed."
+            "help": "Per-joint max velocity (rad/s) — soft speed limit for joint-space moves."
         },
     )
 
@@ -522,8 +522,8 @@ class XHand:
             ft_samples.append(self.parse_tactile_sum(hand_state))
             raw_samples.append(self.parse_tactile(hand_state))
 
-        self._tactile_bias_ft = np.mean(np.stack(ft_samples, axis=0), axis=0)
-        self._tactile_bias_raw = np.mean(np.stack(raw_samples, axis=0), axis=0)
+        self._tactile_bias_ft = np.nanmean(np.stack(ft_samples, axis=0), axis=0)
+        self._tactile_bias_raw = np.nanmean(np.stack(raw_samples, axis=0), axis=0)
 
         # Log which fingers have significant bias
         ft_mag = np.linalg.norm(self._tactile_bias_ft, axis=1)
@@ -868,87 +868,6 @@ class XHand:
         norm = np.linalg.norm(force_sum, axis=1)  # (5,) L2 per finger
         return norm > thresh
 
-    # F3: Trajectory interpolation (ref: DexUMI MotorTrajectoryInterpolator)
-
-    def send_trajectory(
-        self,
-        waypoints: np.ndarray,
-        duration_s: float,
-        max_speed: float | None = None,
-        abort_event: Any | None = None,
-    ) -> bool:
-        """Execute a joint-space trajectory with scipy-based linear interpolation.
-
-        Uses MotorTrajectoryInterpolator (ref: DexUMI) for smooth interp1d-based
-        interpolation. When max_speed is provided, speed-limited waypoint driving
-        is used — duration is automatically extended if the required speed exceeds
-        the limit.
-
-        Args:
-            waypoints: (N, 12) array of joint positions in radians.
-            duration_s: Desired total duration in seconds.
-            max_speed: Optional scalar speed limit (L2 norm). When provided,
-                       uses MotorTrajectoryInterpolator.drive_to_waypoint which
-                       auto-extends duration to respect the speed limit.
-                       Default: config.max_qvel.min().
-            abort_event: Optional object with an ``is_set()`` method (e.g.
-                       threading.Event / mp.Event). Checked between steps; when
-                       set, the trajectory aborts at the next step boundary and
-                       returns False — lets the hand control child preempt a
-                       long trajectory on e-stop (plan §4.8). None (default)
-                       preserves the original run-to-completion behavior.
-
-        Returns:
-            True if all waypoints were reached.
-        """
-        waypoints = np.asarray(waypoints, dtype=np.float64)
-        if waypoints.ndim == 1:
-            waypoints = waypoints.reshape(1, 12)
-
-        n_waypoints = waypoints.shape[0]
-        if n_waypoints == 1:
-            return self.send_action(waypoints[0])
-
-        duration_s = max(duration_s, 0.0)
-
-        # Resolve max_speed
-        speed_limit = max_speed if max_speed is not None else float(np.min(self.config.max_qvel))
-
-        if np.isfinite(speed_limit) and speed_limit > 0:
-            # Speed-limited: build interpolator from start, drive to final waypoint
-            interp = MotorTrajectoryInterpolator(times=np.array([0.0]), values=waypoints[0:1]).drive_to_waypoint(
-                value=waypoints[-1],
-                time=duration_s,
-                curr_time=0.0,
-                max_speed=speed_limit,
-            )
-        else:
-            # No speed limit: interpolate all waypoints directly
-            times = np.linspace(0.0, duration_s, n_waypoints)
-            interp = MotorTrajectoryInterpolator(times, waypoints)
-
-        # Execute at control rate
-        start_t = float(interp.times[0])
-        end_t = float(interp.times[-1])
-        exec_duration = end_t - start_t
-        n_steps = max(2, int(exec_duration / self.config.dt))
-        t_exec = np.linspace(start_t, end_t, n_steps)
-
-        ok = True
-        for i in range(n_steps):
-            if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
-                logger.info("XHand.send_trajectory: aborted at step %d/%d (abort event set).", i, n_steps)
-                ok = False
-                break
-            interp_qpos = interp(t_exec[i])
-            if not self.send_action(interp_qpos):
-                ok = False
-                break
-            if i < n_steps - 1:
-                time.sleep(self.config.dt)
-
-        return ok
-
     def make_command(
         self,
         qpos: np.ndarray,
@@ -957,7 +876,7 @@ class XHand:
         kp: int | None = None,
         ki: int | None = None,
         kd: int | None = None,
-    ):
+    ) -> Any:
         command = xhc.HandCommand_t()
         mode = self.config.mode if mode is None else mode
         tor_max = self.config.tor_max if tor_max is None else tor_max
@@ -982,7 +901,7 @@ class XHand:
             cmd.res3 = 0
         return command
 
-    def write_command_positions(self, qpos: np.ndarray):
+    def write_command_positions(self, qpos: np.ndarray) -> None:
         for i in range(12):
             self.hand_command.finger_command[i].position = float(qpos[i])
 
@@ -1113,7 +1032,7 @@ class XHand:
         return force_sum
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
-        # XHand variant: same np.clip logic as XArm7._limit_joint_range (xarm7.py:855)
+        # XHand variant: per-joint CLIP flag with tolerance (0.01 rad) for noise suppression.
         # but with different clipping targets (hand finger ranges vs arm joint ranges).
         # clip_report_tolerance suppresses false CLIP flags from sub-degree retargeting noise.
         if not self.config.clip_joint_limit:
@@ -1125,12 +1044,12 @@ class XHand:
         self.last_joint_limit_clipped = max_deviation > self.config.clip_report_tolerance
         return clipped
 
-    def is_valid_qpos_state(self, state: dict[str, Any]) -> bool | np.bool_:
+    def is_valid_qpos_state(self, state: dict[str, Any]) -> bool:
         qpos = state.get("qpos", None)
         if qpos is None:
             return False
         qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
-        return qpos.size == 12 and np.all(np.isfinite(qpos))
+        return qpos.size == 12 and bool(np.all(np.isfinite(qpos)))
 
     def _array12(self, value) -> np.ndarray:
         return safe_resize(value, 12)

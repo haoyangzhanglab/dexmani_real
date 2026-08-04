@@ -58,7 +58,7 @@ logger = get_logger(__name__)
 _TRACKING_NOISE_RAD: float = 0.07
 _DEFAULT_JOINT_MAX_ACC_DEG_S2: float = 500.0
 _DEFAULT_JOINT_MAX_SPEED_DEG_S: float = 120.0
-_INNER_RATE: float = 30.0
+_ARM_RATE: float = 30.0
 _ADAPTIVE_MIN_RAD: float = 0.18
 _ADAPTIVE_MAX_RAD: float = 0.60
 _DEFAULT_ANOMALY_CAP_RAD: float = 0.50
@@ -107,13 +107,13 @@ def _runs_of(mask: np.ndarray) -> list[tuple[int, int]]:
 def _compute_adaptive_threshold(
     cmd_vel_rad_s: float,
     joint_max_acc_rad_s2: float,
-    inner_loop_hz: float = 30.0,
+    arm_loop_hz: float = 30.0,
     adaptive_max_rad: float = 0.60,
 ) -> float:
     """Replicate arm_loop adaptive tracking error threshold formula."""
     if joint_max_acc_rad_s2 <= 0:
         return adaptive_max_rad
-    steady = cmd_vel_rad_s / inner_loop_hz
+    steady = cmd_vel_rad_s / arm_loop_hz
     accel = cmd_vel_rad_s * cmd_vel_rad_s / joint_max_acc_rad_s2
     expected = steady + accel + _TRACKING_NOISE_RAD
     return float(np.clip(expected, _ADAPTIVE_MIN_RAD, adaptive_max_rad))
@@ -127,14 +127,14 @@ def _read_meta_defaults(f: h5py.File) -> dict:
             "joint_max_acc": float(np.deg2rad(_DEFAULT_JOINT_MAX_ACC_DEG_S2)),
             "joint_max_speed": float(np.deg2rad(_DEFAULT_JOINT_MAX_SPEED_DEG_S)),
             "control_hz": 16.0,
-            "inner_loop_hz": _INNER_RATE,
+            "arm_loop_hz": _ARM_RATE,
             "adaptive_max_rad": _ADAPTIVE_MAX_RAD,
         }
     return {
         "joint_max_acc": float(np.deg2rad(meta.attrs.get("joint_max_acc", _DEFAULT_JOINT_MAX_ACC_DEG_S2))),
         "joint_max_speed": float(np.deg2rad(meta.attrs.get("joint_max_speed", _DEFAULT_JOINT_MAX_SPEED_DEG_S))),
         "control_hz": float(meta.attrs.get("control_hz", 16.0)),
-        "inner_loop_hz": float(meta.attrs.get("inner_loop_hz", _INNER_RATE)),
+        "arm_loop_hz": float(meta.attrs.get("arm_loop_hz", _ARM_RATE)),
         "adaptive_max_rad": float(meta.attrs.get("tracking_error_adaptive_max_rad", _ADAPTIVE_MAX_RAD)),
     }
 
@@ -407,7 +407,7 @@ class EpisodeQuality:
         cmd_vels = np.clip(cmd_vels, 0.0, self._params["joint_max_speed"])
         cmd_vels = np.concatenate([[cmd_vels[0]], cmd_vels])
 
-        steady = cmd_vels / self._params["inner_loop_hz"]
+        steady = cmd_vels / self._params["arm_loop_hz"]
         accel = cmd_vels * cmd_vels / self._params["joint_max_acc"]
         expected = steady + accel + _TRACKING_NOISE_RAD
         per_frame_adaptive = np.clip(expected, _ADAPTIVE_MIN_RAD, self._params["adaptive_max_rad"])

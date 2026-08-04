@@ -127,17 +127,6 @@ class PathResult:
     report: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class IKStats:
-    """Aggregate IK test statistics (motion planning benchmarks)."""
-
-    ok: int
-    total: int = 0
-    pos_errs_mm: list[float] = field(default_factory=list)
-    rot_errs_deg: list[float] = field(default_factory=list)
-    max_dq_deg: list[float] = field(default_factory=list)
-
-
 @dataclass(kw_only=True)
 class XArm7PlannerConfig:
     urdf_path: str

@@ -63,6 +63,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -70,11 +71,10 @@ from scipy.spatial.transform import Rotation
 # Ensure repo root is on sys.path (belt-and-suspenders for runs without PYTHONPATH=.)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real import ASSET_DIR
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
-from dexmani_real.robot.inner_loop import ArmInnerLoopConfig, arm_loop as _arm_loop
+from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
@@ -663,32 +663,6 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
 # ═══════════════════════════════════════════════ Helpers
 
 
-def _make_planner() -> XArm7MotionPlanner:
-    """Create XArm7MotionPlanner with standard teleop config.
-
-    Under the SharedStorage architecture the planner is only used for
-    start-alignment (collision-checked approach to trajectory start);
-    the arm IP and servo loop are managed by ``arm_loop``.
-    """
-    urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-    srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
-    return XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=urdf_path,
-            srdf_path=srdf_path,
-            base_pose_world=Pose(
-                p=np.array([0.0, 0.0, 0.0]),
-                q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
-            ),
-        ),
-        planning_profile=PlanningProfile(),
-        teleop_profile=TeleopProfile(
-            max_pose_error_pos_m=0.02,
-            max_pose_error_rot_rad=np.deg2rad(5.0),
-        ),
-    )
-
-
 def _read_arm_state_dict(shared: SharedStorage) -> dict | None:
     """Read latest arm state from ring, return as dict of numpy arrays or None."""
     data = read_arm_state(shared)
@@ -767,7 +741,12 @@ class TrajectoryReplayer:
         """Create planner for start-alignment (no hardware connect — arm_loop owns the SDK)."""
         if self.dry_run:
             return
-        self._planner = _make_planner()
+        self._planner = XArm7MotionPlanner.create_default(
+            teleop_profile=TeleopProfile(
+                max_pose_error_pos_m=0.02,
+                max_pose_error_rot_rad=np.deg2rad(5.0),
+            ),
+        )
         self._hand_available = self.traj.has_hand and not self.no_hand
         print("Planner ready for start-alignment (arm_loop/hand_loop already running)")
 
@@ -1172,7 +1151,7 @@ Control keys:
         "--arm-ip",
         type=str,
         default="192.168.1.215",
-        help="XArm controller IP address (passed to ArmInnerLoopConfig).",
+        help="XArm controller IP address (passed to ArmLoopConfig).",
     )
     parser.add_argument(
         "--source",
@@ -1264,11 +1243,11 @@ Control keys:
     shm_cfg = SharedStorageConfig()
     shared = SharedStorage.create(prefix="dexmani_replay", config=shm_cfg)
 
-    # ── ArmInnerLoop config: match replay acceleration ──
+    # ── ArmLoop config: match replay acceleration ──
     _joint_max_acc_rad = float(np.deg2rad(_replay_acc))
-    arm_cfg = ArmInnerLoopConfig(
+    arm_cfg = ArmLoopConfig(
         arm_ip=args.arm_ip,
-        joint_max_acc=_joint_max_acc_rad,
+        joint_max_acc_rad_per_s2=_joint_max_acc_rad,
     )
     hand_available = traj.has_hand and not args.no_hand
 

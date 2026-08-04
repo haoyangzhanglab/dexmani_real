@@ -1,4 +1,9 @@
-"""xArm7 kinematics via Pinocchio — FK, Jacobian, pose transforms."""
+"""xArm7 kinematics via Pinocchio — FK, Jacobian, pose transforms.
+
+Two FK classes:
+  - ``ArmFK`` — standalone Pinocchio FK for arm_loop (no MPlib dependency).
+  - ``XArm7Kinematics`` — full kinematics with MPlib integration for planning.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,57 @@ import numpy as np
 
 from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 from .types import Pose
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ArmFK — standalone Pinocchio FK (no MPlib dependency)
+# Used by arm_loop to replace xArm SDK get_position_aa() with
+# URDF-consistent FK.  The xArm firmware uses a different EEF coordinate
+# frame than the URDF; this ensures all consumers share one system.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class ArmFK:
+    """Pinocchio FK for the 7-DOF xArm7 URDF, base-frame output.
+
+    The Pinocchio model + data are constructed once at init (~50 ms) and then
+    ``compute()`` is a cheap FK call (~0.05 ms).
+    """
+
+    def __init__(self, urdf_path: str, eef_frame_name: str = "custom_eef_link") -> None:
+        import pinocchio
+
+        self._model = pinocchio.buildModelFromUrdf(str(urdf_path))
+        self._data = self._model.createData()
+        self._eef_frame_id = self._model.getFrameId(eef_frame_name)
+
+    def compute(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Compute EEF pose in arm base frame.
+
+        Args:
+            qpos: Joint positions (7,) in **radians**.
+
+        Returns:
+            (eef_pos, eef_rot6d):
+            - *eef_pos*  — (3,)  float64  metres
+            - *eef_rot6d* — (6,)  float64  first two columns of rotation matrix
+        """
+        qpos = np.asarray(qpos, dtype=np.float64).ravel()[:7]
+        import pinocchio
+
+        pinocchio.forwardKinematics(self._model, self._data, qpos)
+        pinocchio.updateFramePlacements(self._model, self._data)
+        pose = self._data.oMf[self._eef_frame_id]
+
+        R = pose.rotation  # 3×3
+        eef_pos = np.asarray(pose.translation, dtype=np.float64).copy()
+        eef_rot6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
+        return eef_pos, eef_rot6d
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# XArm7Kinematics — full kinematics with MPlib integration
+# ═══════════════════════════════════════════════════════════════════════
 
 
 class XArm7Kinematics:
@@ -56,7 +112,7 @@ class XArm7Kinematics:
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
         pose_base = self.compute_eef_pose_base(qpos)
         pose_world = self.base_to_world_pose(pose_base)
-        # Defense-in-depth: NaN guard symmetric with fingertip FK (interface.py:615-616).
+        # Defense-in-depth: NaN guard symmetric with fingertip FK.
         # Pinocchio FK is robust, but guard against model corruption or numerical anomalies.
         if not np.all(np.isfinite(pose_world.p)) or not np.all(np.isfinite(pose_world.q)):
             return Pose(p=np.full(3, np.nan), q=np.full(4, np.nan))
@@ -108,8 +164,8 @@ class XArm7Kinematics:
 
         # Transform Jacobian from base frame → world frame.
         # Spatial velocity transforms as [v_w; ω_w] = Ad_{R} @ [v_b; ω_b],
-        # where Ad_R = block_diag(R_b2w, R_b2w).  When base_pose_world is identity
-        # When base_pose_world is identity, this is a no-op.
+        # where Ad_R = block_diag(R_b2w, R_b2w).  When base_pose_world is
+        # identity, this is a no-op.
         R_b2w = quat_wxyz_to_rotmat(self.base_pose_world.q)
         jacobian_world = np.empty_like(jacobian_base)
         jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]  # linear part

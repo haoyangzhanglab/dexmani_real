@@ -1,13 +1,12 @@
+"""Motion planning — IK, path planning, collision checking, kinematics."""
+
 from .planner import XArm7MotionPlanner
-from .types import IKStats, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
-from .workspace_safety import WorkspaceSafety
+from .types import PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
 
 __all__ = [
-    "IKStats",
     "PlanningProfile",
     "Pose",
     "TeleopProfile",
-    "WorkspaceSafety",
     "XArm7MotionPlanner",
     "XArm7PlannerConfig",
 ]

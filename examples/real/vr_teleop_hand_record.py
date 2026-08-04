@@ -49,9 +49,9 @@ import numpy as np
 # Ensure repo root is on sys.path before imports.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real.config.defaults import arm, safety
+from dexmani_real.config.defaults import safety
 from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
-from dexmani_real.robot.inner_loop import ArmInnerLoopConfig, arm_loop as _arm_loop
+from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
@@ -101,7 +101,7 @@ def main() -> None:
         policy_cfg.hand_enabled = False
 
     # ── 2b. Arm config (must match PolicyConfig speed/acc) ──
-    arm_cfg = ArmInnerLoopConfig(
+    arm_cfg = ArmLoopConfig(
         joint_max_speed_rad_per_s=float(np.deg2rad(args.speed)),
         joint_max_acc_rad_per_s2=float(np.deg2rad(args.acc)),
     )
@@ -147,7 +147,7 @@ def main() -> None:
     print("Controls: B=teleop+record C=pause S=save D=discard H=home Q=quit ESC=estop\n")
 
     # ── 5. Supervisor (heartbeat + process monitor) ──
-    _all_names = ["arm", "policy", "vr", "camera"]
+    _all_names = ["camera", "vr", "policy", "arm"]
     if not args.no_hand:
         _all_names.append("hand")
     PROC_NAMES = _all_names

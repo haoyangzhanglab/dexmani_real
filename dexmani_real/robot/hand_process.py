@@ -11,15 +11,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dexmani_real.config.defaults import hand
 from dexmani_real.utils.log import get_logger
-
-if TYPE_CHECKING:
-    from dexmani_real.robot.xhand.xhand import XHand, XHandConfig
 
 logger = get_logger(__name__)
 
@@ -41,7 +37,6 @@ class HandProcessConfig:
 
     # Qpos freshness detection (driver board lockout guard)
     stale_qpos_frame_limit: int = field(default_factory=lambda: hand.stale.frame_count)
-    stale_qpos_cmd_gap_rad: float = field(default_factory=lambda: hand.stale.cmd_gap_rad)
     stale_qpos_delta_rad: float = field(default_factory=lambda: hand.stale.qpos_delta_rad)
 
     # Send-error watchdog: auto clear_error() after N consecutive send failures
@@ -66,7 +61,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     cfg = config or HandProcessConfig()
 
     try:
-        from dexmani_real.robot.xhand.xhand import XHand, XHandConfig
+        from dexmani_real.robot.xhand import XHand, XHandConfig
         hand = XHand(XHandConfig())
         if not hand.connect():
             logger.error("hand_loop: connect failed")
@@ -107,6 +102,26 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             shared.hand_ready.set()
             shared.error_state.value = True
             return
+
+    # Publish initial state BEFORE hand_ready — consumers wait on hand_ready and
+    # expect the ring to already contain a valid frame.  Without this, there is
+    # a one-tick window where hand_ready is set but hand_state_ring is empty.
+    # (Same pattern as arm_loop arm_ready.)
+    try:
+        st = hand.get_state()
+        _init_qpos = np.asarray(st.get("qpos", np.zeros(12)), dtype=np.float64) if st is not None else np.zeros(12)
+    except Exception:
+        _init_qpos = np.zeros(12, dtype=np.float64)
+    _frame0 = _nf(_HS_STATE)
+    _frame0["qpos"][0] = _init_qpos
+    _frame0["current"][0] = np.zeros(12, dtype=np.float64)
+    _frame0["tactile_sum"][0] = np.zeros((5, 3), dtype=np.float64)
+    _frame0["tactile_contact"][0] = np.zeros(5, dtype=bool)
+    _frame0["error_state"][0] = 0
+    _frame0["connected"][0] = 1
+    _frame0["qpos_stale"][0] = 0
+    _frame0["timestamp"][0] = time.monotonic()
+    shared.hand_state_ring.write(_frame0)
 
     # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
     # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
@@ -168,11 +183,19 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         # Read state (always — even when safety-gated)
         try:
             st = hand.get_state(full=True, force_update=True)
-            qpos = np.asarray(st.get("qpos", np.zeros(12)), dtype=np.float64)
-            current = np.asarray(st.get("current", np.zeros(12)), dtype=np.float64)
-            tactile_sum = np.asarray(st.get("tactile_force_sum", np.zeros((5, 3))), dtype=np.float64)
-            tactile_force = np.asarray(st.get("tactile_force", np.zeros((5, 120, 3))), dtype=np.float64)
-            tactile_contact = np.asarray(st.get("tactile_contact", np.zeros(5, dtype=bool)), dtype=bool)
+            # Use sentinel-based .get() to avoid eager fallback allocation.
+            # dict.get(key, default) evaluates `default` unconditionally,
+            # wasting ~14.5 KB per tick (30 Hz) on large tactile arrays.
+            _raw_qpos = st.get("qpos")
+            qpos = np.asarray(_raw_qpos if _raw_qpos is not None else np.zeros(12), dtype=np.float64)
+            _raw_current = st.get("current")
+            current = np.asarray(_raw_current if _raw_current is not None else np.zeros(12), dtype=np.float64)
+            _raw_ts = st.get("tactile_force_sum")
+            tactile_sum = np.asarray(_raw_ts if _raw_ts is not None else np.zeros((5, 3)), dtype=np.float64)
+            _raw_tf = st.get("tactile_force")
+            tactile_force = np.asarray(_raw_tf if _raw_tf is not None else np.zeros((5, 120, 3)), dtype=np.float64)
+            _raw_tc = st.get("tactile_contact")
+            tactile_contact = np.asarray(_raw_tc if _raw_tc is not None else np.zeros(5, dtype=bool), dtype=bool)
             connected = hand.connected_flag
             error_state = hand.error_state
             last_known_qpos = qpos.copy()

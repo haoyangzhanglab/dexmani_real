@@ -1,7 +1,8 @@
+# Standalone vendor diagnostic — uses raw xhand_controller SDK, not dexmani_real architecture.
 from xhand_controller import xhand_control
-import time
 import math
 import sys
+import time
 
 class XHandControlExample:
     def __init__(self, hand_id=0, position=0.1, mode=3):
@@ -10,11 +11,11 @@ class XHandControlExample:
         self._hand_command = xhand_control.HandCommand_t()
         for i in range(12):
             self._hand_command.finger_command[i].id = i
-            self._hand_command.finger_command[i].kp = 100
+            self._hand_command.finger_command[i].kp = 120
             self._hand_command.finger_command[i].ki = 0
             self._hand_command.finger_command[i].kd = 0
             self._hand_command.finger_command[i].position = position
-            self._hand_command.finger_command[i].tor_max = 300
+            self._hand_command.finger_command[i].tor_max = 380
             self._hand_command.finger_command[i].mode = mode
 
     def exam_enumerate_devices(self, protocol: str):
@@ -29,6 +30,7 @@ class XHandControlExample:
         print("//================================")
         print("//Open hand device")
         print("//================================")
+        rsp = None
         # RS485
         if device_identifier["protocol"] == "RS485":
             device_identifier["baud_rate"] = int(device_identifier["baud_rate"])
@@ -43,10 +45,12 @@ class XHandControlExample:
             print(f"enumerate_devices_ethercat ether_cat= {ether_cat}\n")
             if ether_cat is None or not ether_cat:
                 print("enumerate_devices_ethercat get empty \n")
+                return False
             rsp = self._device.open_ethercat(ether_cat[0])
             print(f"=@= open EtherCAT result: {rsp.error_code == 0}\n")
-        if rsp.error_code != 0:
-            print(f"=@= open device error: {rsp.error_message}. Please check serial_port and connection\n")
+        if rsp is None or rsp.error_code != 0:
+            err_msg = rsp.error_message if rsp is not None else "no response"
+            print(f"=@= open device error: {err_msg}. Please check serial_port and connection\n")
             return False
         else:
             return True
@@ -127,7 +131,7 @@ class XHandControlExample:
         print(f"=@= xhand send_command result: { error_struct.error_code == 0}, message: {error_struct.error_message}\n")
         time.sleep(1)
 
-    def exam_read_state(self, fingure_id=2, force_update=True):
+    def exam_read_state(self, finger_id=2, force_update=True):
         print("//================================")
         print("//Read various hand states")
         print("//================================")
@@ -136,7 +140,7 @@ class XHandControlExample:
             print(f"=@= xhand read_state error: {error_struct.error_message}\n")
             return
         
-        finger_1 = state.finger_state[fingure_id]
+        finger_1 = state.finger_state[finger_id]
         print(f"|+| finger.id = {finger_1.id}, finger.temperature = {finger_1.temperature} ")
         print(f"|+| finger.id = {finger_1.id}, finger.temperature & 0xFF = {finger_1.temperature & 0xFF} ")
         print(f"|+| finger.id = {finger_1.id}, finger.commboard_err = {finger_1.commboard_err} ")
@@ -158,9 +162,10 @@ class XHandControlExample:
             ]
             fingertip_state["sensor_temperature"] = sensor_data.calc_temperature
 
-        print(f"|+| finger.id = {finger_1.id}, fingertip calc_pressure = {fingertip_state['calc_pressure']}")
-        print(f"|+| finger.id = {finger_1.id}, fingertip raw_pressure = {fingertip_state['raw_pressure']}")
-        print(f"|+| finger.id = {finger_1.id}, fingertip sensor_temperature = {fingertip_state['sensor_temperature']}\n")
+        if fingertip_state:
+            print(f"|+| finger.id = {finger_1.id}, fingertip calc_pressure = {fingertip_state.get('calc_pressure')}")
+            print(f"|+| finger.id = {finger_1.id}, fingertip raw_pressure = {fingertip_state.get('raw_pressure')}")
+            print(f"|+| finger.id = {finger_1.id}, fingertip sensor_temperature = {fingertip_state.get('sensor_temperature')}\n")
         print(f"=@= xhand read state result: {error_struct.error_code == 0} | error_struct.error_code={error_struct.error_code} error_msg={error_struct.error_message}\n")
     
     def exam_reset_sensor(self):
@@ -246,7 +251,7 @@ if __name__ == "__main__":
     # Read various hand states
     # {2, 5, 7, 9, 11} are fingertip sensors
     # if not use send_command func, let force_update value to True to force update state
-    xhand_exam.exam_read_state(fingure_id=5, force_update=True)
+    xhand_exam.exam_read_state(finger_id=5, force_update=True)
 
     # Reset fingertip sensor
     # xhand_exam.exam_reset_sensor()

@@ -11,17 +11,22 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | Task | Key File(s) |
 |------|------------|
 | **Main entry point** | `examples/real/vr_teleop_hand_record.py` (canonical, 5-process arch) |
+| Keyboard teleop | `examples/real/keyboard_teleop_real.py` — arm-only, SharedStorage, `KeyboardTeleopConfig` |
+| Camera calibration | `examples/real/calibrate_camera.py` — ArUco eye-to-hand, `CameraCalibConfig` |
+| Trajectory replay | `examples/real/replay_traj.py` — episode replay + consistency metrics |
+| VR heading calib | `examples/real/calibrate_vr_heading.py` — one-shot T_vr_to_robot |
 | **Policy process** | `policy/vr_teleop_policy.py` — `policy_loop(shared, config)`, reads rings, writes actions, owns recording |
+| Planner factory | `planning/planner.py` — `XArm7MotionPlanner.create_default()` canonical setup |
 | **SharedStorage (data plane)** | `shm/shared_storage.py` — all rings, queues, flags in one place |
-| Arm servo loop | `robot/inner_loop.py` — `arm_loop(shared)` (canonical) |
+| Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical) |
 | Hand control | `robot/hand_process.py` — `hand_loop(shared)` (canonical) |
 | VR receiver | `sensor/vr_receiver_process.py` — `vr_loop(shared)` writes to `vr_ring` |
 | Camera | `sensor/camera_process.py` — independent process, unchanged |
-| IK / retargeting | `planning/ik.py`, `planning/arm_fk.py`, `teleop/arm_mapper.py`, `teleop/hand_retarget.py` |
+| IK / retargeting | `planning/ik.py`, `planning/kinematics.py`, `teleop/arm_mapper.py`, `teleop/hand_retarget.py` |
 | Safety state machine | `robot/safety.py` — SafetyState enum (DISARMED/ARMED/RUNNING/FAULT) + transition helpers |
 | Recording format / lifecycle | `recording/episode_recorder.py` |
 | SHM primitives | `shm/ring_buffer.py` (CameraRingBuffer + SeqlockRingBuffer base), `shm/robot_ring.py` (SeqlockRingBuffer) |
-| Core types | `robot/types.py` — RobotState, RobotAction, ArmState, HandState, HandTactile |
+| Core types | `robot/types.py` — RobotState, RobotAction + ArmState/HandState/HandTactile (doc-only dataclasses; authoritative format = `*_DTYPE` in `shm/shared_storage.py`) |
 | Episode tools (quality/viz) | `dexmani_real/tools/` — `episode_quality.py` (filter/health/assess/validate), `visualize_episode.py` (3D + tactile) |
 | Type-check | `conda run -n real_robot mypy dexmani_real/` |
 
@@ -63,7 +68,7 @@ VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik →
                                          shared.hand_cmd_ring.write(HandCmd)
 ```
 
-**Rates:** Policy loop 16 Hz. Arm/Hand inner loops 30 Hz. Mode 6 firmware handles all trajectory smoothing (120 deg/s, acc configurable). No inner-loop interpolation.
+**Rates:** Policy loop 16 Hz. Arm/Hand servo loops 30 Hz. Mode 6 firmware handles all trajectory smoothing (120 deg/s, acc configurable). No arm-side interpolation.
 
 ### SharedStorage Data Plane (`shm/shared_storage.py`, ~340 lines)
 
@@ -91,7 +96,7 @@ VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik →
 
 ```python
 # Each function is an mp.Process target, accepting SharedStorage + optional config:
-arm_loop(shared, config)    # robot/inner_loop.py — Mode 6 servo, FK, tracking error
+arm_loop(shared, config)    # robot/arm_loop.py — Mode 6 servo, FK, tracking error
 hand_loop(shared, config)   # robot/hand_process.py — XHand position servo, sets error_state
 policy_loop(shared, config) # policy/vr_teleop_policy.py — VR→IK + recording, sets is_recording
 vr_loop(shared)             # sensor/vr_receiver_process.py — HTS TCP
@@ -100,7 +105,7 @@ camera_loop(shared)         # Main — bridges frames from CameraSession → sha
 
 ### Core Types (`robot/types.py`)
 
-- **`ArmState`** — `qpos(7) qvel(7) tau(7) eef_pos(3) eef_rot6d(6) error_code connected mode tracking_err timestamp` (~294B, from arm_state_ring; eef via `get_position_aa`, tracking_err = max|qpos - last_target|)
+- **`ArmState`** — `qpos(7) qvel(7) tau(7) eef_pos(3) eef_rot6d(6) error_code connected mode tracking_err timestamp` (~294B, from arm_state_ring; eef via Pinocchio ArmFK in arm_loop, tracking_err = max|qpos - last_target|)
 - **`HandState`** — `qpos(12) current(12) tactile_sum(5,3) tactile_contact(5) error_state connected timestamp` (328B, from hand_state_ring)
 - **`HandTactile`** — `tactile_force(5,120,3)` (14.4KB, from hand_tactile_ring, sparse)
 - **`RobotState`** — legacy 22-field monolithic state (Policy assembles from ArmState+HandState+HandTactile for recording)
@@ -265,7 +270,7 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 | Change IK solver | `planning/ik.py` + `policy/vr_teleop_policy.py` |
 | Add a new ring to SharedStorage | `shared_storage.py` + producer process + consumer process |
 | New entry point (new architecture) | Follow Main pattern: `SharedStorage.create()` → spawn `*_loop(shared)` → monitor |
-| Tune arm dynamics | `inner_loop.py` (ArmInnerLoopConfig) + Mode 6 acc/jerk; velocity alone has near-zero impact |
+| Tune arm dynamics | `arm_loop.py` (ArmLoopConfig) + Mode 6 acc/jerk; velocity alone has near-zero impact |
 
 ---
 
@@ -279,7 +284,7 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 
 ## Hardware Notes
 
-**xArm7 Mode 6:** Firmware trajectory planning, targets at 16 Hz. No inner-loop interpolation. Tracking error bottleneck is acc/jerk, not velocity. Default: 120°/s, acc adjustable via `ArmInnerLoopConfig.joint_max_acc_rad_per_s2`.
+**xArm7 Mode 6:** Firmware trajectory planning, targets at 16 Hz. No arm-side interpolation. Tracking error bottleneck is acc/jerk, not velocity. Default: 120°/s, acc adjustable via `ArmLoopConfig.joint_max_acc_rad_per_s2`.
 
 **XHand:** 12-DOF EtherCAT position servo. Latest-wins semantics (hand_cmd_ring). Tactile: 5 fingers × 120 taxels × 3 axes. Board errors auto-logged.
 

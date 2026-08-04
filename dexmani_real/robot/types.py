@@ -120,13 +120,13 @@ class RobotAction:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Per-process state types (Phase 2.9 — new architecture)
+# Per-process state type specifications
 # ═══════════════════════════════════════════════════════════════════
 #
-# These dataclasses replace the monolithic RobotState for intra-process
-# communication. Each process writes only the fields it owns.
-# RobotState is retained for recording compatibility (Policy assembles
-# it from ArmState + HandState + HandTactile).
+# These dataclasses document the field layout of each ring buffer.
+# The authoritative data format is defined by *_DTYPE in shm/shared_storage.py.
+# At runtime, processes read/write raw structured arrays; these classes
+# are NOT instantiated — they serve as human-readable format specs.
 
 
 @dataclass
@@ -139,7 +139,7 @@ class ArmState:
     qpos: np.ndarray  # (7,)  float64  rad
     qvel: np.ndarray  # (7,)  float64  rad/s
     tau: np.ndarray  # (7,)  float64  N·m
-    eef_pos: np.ndarray  # (3,)  float64  m  (FK placeholder — Policy owns FK)
+    eef_pos: np.ndarray  # (3,)  float64  m  (FK computed by arm_loop via Pinocchio ArmFK)
     eef_rot6d: np.ndarray  # (6,)  float64
     error_code: int
     connected: bool
@@ -147,22 +147,6 @@ class ArmState:
     tracking_err: float
     timestamp: float
 
-    @classmethod
-    def from_ring(cls, data: np.ndarray) -> "ArmState":
-        """Build from a SeqlockRingBuffer read (1-element structured array)."""
-        r = data[0]
-        return cls(
-            qpos=np.asarray(r["qpos"], dtype=np.float64),
-            qvel=np.asarray(r["qvel"], dtype=np.float64),
-            tau=np.asarray(r["tau"], dtype=np.float64),
-            eef_pos=np.asarray(r["eef_pos"], dtype=np.float64),
-            eef_rot6d=np.asarray(r["eef_rot6d"], dtype=np.float64),
-            error_code=int(r["error_code"]),
-            connected=bool(r["connected"]),
-            mode=int(r["mode"]),
-            tracking_err=float(r["tracking_err"]),
-            timestamp=float(r["timestamp"]),
-        )
 
 
 @dataclass
@@ -182,20 +166,6 @@ class HandState:
     qpos_stale: bool
     timestamp: float
 
-    @classmethod
-    def from_ring(cls, data: np.ndarray) -> "HandState":
-        """Build from a SeqlockRingBuffer read (1-element structured array)."""
-        r = data[0]
-        return cls(
-            qpos=np.asarray(r["qpos"], dtype=np.float64),
-            current=np.asarray(r["current"], dtype=np.float64),
-            tactile_sum=np.asarray(r["tactile_sum"], dtype=np.float64),
-            tactile_contact=np.asarray(r["tactile_contact"], dtype=bool),
-            error_state=bool(r["error_state"]),
-            connected=bool(r["connected"]),
-            qpos_stale=bool(r["qpos_stale"]) if "qpos_stale" in r.dtype.names else False,
-            timestamp=float(r["timestamp"]),
-        )
 
 
 @dataclass
@@ -207,7 +177,3 @@ class HandTactile:
 
     tactile_force: np.ndarray  # (5,120,3) float64  N
 
-    @classmethod
-    def from_ring(cls, data: np.ndarray) -> "HandTactile":
-        """Build from a SeqlockRingBuffer read."""
-        return cls(tactile_force=np.asarray(data[0]["tactile_force"], dtype=np.float64))
