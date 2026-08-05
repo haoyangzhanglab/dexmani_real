@@ -47,7 +47,8 @@ logger = get_logger(__name__)
 _HAND_HOME_QPOS: np.ndarray = np.deg2rad(
     np.array([0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0], dtype=np.float64)
 )
-_warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # once per session
+_warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # warn every 30s if hand_qpos never set
+_collision_detail_warn = ThrottledWarner(interval_s=60.0)
 
 # ---------------------------------------------------------------------------
 # Collision URDF / SRDF paths
@@ -134,6 +135,7 @@ class CollisionModel:
         # Hand self-collision is NOT checked — the SRDF Never rules disable
         # all 483 inter-finger pairs, and we intentionally do NOT re-enable any.
         # Arm↔hand collisions (e.g., wrist hitting fingers) remain active.
+
         self._collision_data = self._collision_model.createData()
 
         self._nq: int = self._model.nq
@@ -272,6 +274,10 @@ class CollisionModel:
         except TypeError:
             # pybind11 type conversion failure — the collision is real but we
             # can't enumerate which pair(s) triggered it.
+            _collision_detail_warn(
+                "collisionResults type conversion failed — collision detected "
+                "but pair details unavailable (hpp-fcl build limitation)"
+            )
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         if not pairs:
             return CollisionInfo.no_collision()

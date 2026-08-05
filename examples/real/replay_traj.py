@@ -72,6 +72,7 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
+from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
@@ -1432,10 +1433,21 @@ Control keys:
                             else:
                                 print("  hand: home settle timeout — proceeding", flush=True)
 
-                        # ── Step 2: Arm home ──
-                        shared.arm_action_q.put((HOME_SENTINEL, None))
-                        # Wait for qpos to converge to home (poll, up to 20s).
+                        # ── Step 2: Arm home (collision-checked path) ──
                         _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
+                        _cur_as = read_arm_state(shared)
+                        _cur_qpos = _home_arr.copy()
+                        if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
+                            _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
+                        from dexmani_real.config.defaults import arm as _arm_defaults
+                        _waypoints = plan_joint_home_path(
+                            _cur_qpos, _home_arr, replayer._planner,
+                            table_z_surface_m=_arm_defaults.table_z_surface_m,
+                        )
+                        if _waypoints is not None and len(_waypoints) == 0:
+                            print("  arm: NO SAFE PATH to home — holding position", flush=True)
+                        shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
+                        # Wait for qpos to converge to home (poll, up to 20s).
                         _home_deadline = time.perf_counter() + 20.0
                         _home_reached = False
                         while time.perf_counter() < _home_deadline:

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from dexmani_real.config.defaults import policy
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.rate_manager import RateManager
 
 if TYPE_CHECKING:
     import numpy as np
@@ -146,8 +147,7 @@ def camera_loop(shared: "SharedStorage") -> None:
         _logger.info("camera_loop: ready @ %.1f Hz (from policy.control_hz)", policy.control_hz)
 
         # ── Main capture loop ──
-        interval: float = 1.0 / policy.control_hz
-        last_ts: float = time.monotonic()
+        rate_mgr = RateManager(policy.control_hz)
 
         # Forward-fill cache: when is_recording transitions False→True, the
         # first ring write uses the most recently computed pointcloud so the
@@ -165,11 +165,7 @@ def camera_loop(shared: "SharedStorage") -> None:
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
                 # Maintain target rate even on read failure so a persistent
                 # error doesn't turn into a tight loop.
-                _elapsed = time.monotonic() - last_ts
-                _sleep = interval - _elapsed
-                if _sleep > 0:
-                    time.sleep(_sleep)
-                last_ts = time.monotonic()
+                rate_mgr.wait()
                 continue
 
             # --- pointcloud (only when recording) ---
@@ -222,12 +218,8 @@ def camera_loop(shared: "SharedStorage") -> None:
 
             _was_recording = _recording_now
 
-            # --- maintain target rate ---
-            elapsed = time.monotonic() - last_ts
-            sleep_time = interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            last_ts = time.monotonic()
+            # --- maintain target rate (absolute-deadline scheduling, consistent with other loops) ---
+            rate_mgr.wait()
 
     except Exception:
         _logger.exception("camera_loop: crashed")

@@ -18,14 +18,14 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | **Policy process** | `policy/vr_teleop_policy.py` — `policy_loop(shared, config)`, reads rings, writes actions, owns recording |
 | Planner factory | `planning/planner.py` — `XArm7MotionPlanner.create_default()` canonical setup |
 | **SharedStorage (data plane)** | `shm/shared_storage.py` — all rings, queues, flags in one place |
-| Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical), Mode 6, velocity feedforward |
+| Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical), Mode 6 |
 | Hand control | `robot/hand_process.py` — `hand_loop(shared)` (canonical) |
 | VR receiver | `sensor/vr_receiver_process.py` — `vr_loop(shared)` writes to `vr_ring` |
 | Camera | `sensor/camera_process.py` — independent process, unchanged |
 | IK / retargeting | `planning/ik.py`, `planning/kinematics.py`, `teleop/arm_mapper.py`, `teleop/hand_retarget.py` |
 | Safety state machine | `robot/safety.py` — SafetyState enum (DISARMED/ARMED/RUNNING/FAULT) + transition helpers |
 | Recording format / lifecycle | `recording/episode_recorder.py` |
-| SHM primitives | `shm/ring_buffer.py` (CameraRingBuffer + SeqlockRingBuffer base), `shm/robot_ring.py` (SeqlockRingBuffer) |
+| SHM primitives | `shm/ring_buffer.py` (CameraRingBuffer + SeqlockRingBuffer base), `shm/robot_ring.py` (SeqlockRingBuffer + `get_last_k(k)` multi-frame read) |
 | Core types | `robot/types.py` — RobotState, RobotAction + ArmState/HandState/HandTactile (doc-only dataclasses; authoritative format = `*_DTYPE` in `shm/shared_storage.py`) |
 | Episode tools (quality/viz) | `dexmani_real/tools/` — `episode_quality.py` (filter/health/assess/validate), `visualize_episode.py` (3D + tactile) |
 | Type-check | `conda run -n real_robot mypy dexmani_real/` |
@@ -76,8 +76,8 @@ VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik →
 |-----------|------|-----------|-----------|
 | `arm_action_q` | mp.Queue(maxsize=2) | Policy → Arm | Ordered, bounded backpressure |
 | `hand_cmd_ring` | SeqlockRingBuffer(8) | Policy → Hand | Latest-wins (position servo) |
-| `arm_state_ring` | SeqlockRingBuffer(3) | Arm → Policy | Read-latest (~265B) |
-| `hand_state_ring` | SeqlockRingBuffer(3) | Hand → Policy | Read-latest (~328B, no tactile_force) |
+| `arm_state_ring` | SeqlockRingBuffer(8) | Arm → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~265B) |
+| `hand_state_ring` | SeqlockRingBuffer(8) | Hand → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~328B, no tactile_force) |
 | `hand_tactile_ring` | SeqlockRingBuffer(8) | Hand → Policy | Sparse writes (~14.4KB, only on contact) |
 | `vr_ring` | SeqlockRingBuffer(8) | VR → Policy | ~600B/frame |
 | `camera_ring` | CameraRingBuffer(5) | Camera → Policy | ~1.5MB/frame |
@@ -123,6 +123,7 @@ camera_loop(shared)         # Main — bridges frames from CameraSession → sha
 6. **Recording grid-aligned to 16 Hz** (`dt=1/control_hz`) — breaking alignment corrupts downstream
 7. **State = bool flags, recording = bool** — not an enum. **Safety state IS an enum** (SafetyState, 0-3), stored in `shared.safety_state`
 8. **Seqlock on all control rings** — torn-read protection for arm_state and hand_cmd
+9. **`get_last_k(k)` returns oldest-first, ≤k frames** — callers must handle `len(result) < k`; k > maxlen raises ValueError; each frame independently seqlock-verified; overwritten frames silently dropped
 
 ---
 
@@ -162,8 +163,7 @@ already catches.
 
 ### Layers (single-writer, no defense-in-depth redundancy)
 
-1. **Arm-level:** NaN guard (protects `last_target`) + velocity feedforward (``cmd_vel * lead_gain``
-   lead-term compensator, per-joint direction guard, joint-limit clip, ``_FF_SKIP_TICKS`` warm-up)
+1. **Arm-level:** NaN guard (protects `last_target`)
    + Mode 6 error handling (C22/C24/C31 auto-recover → `clean_error+set_mode+set_state`;
    consecutive recoveries > `_RECOVERY_MAX` (30) → FAULT; non-recoverable → immediate FAULT)
    + `except Exception` path also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
@@ -300,7 +300,9 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 ## ToDo
 
 - **P0 — 采集入口加 task_label 参数**: ✅ `--task`/`--operator` CLI 已在 `vr_teleop_hand_record.py`（主入口）接入。
+- **P0 — M05 RingBuffer get_last_k(k)** (2026-08-05): ✅ `SeqlockRingBuffer.get_last_k(k)` 已实现（独立 seqlock + 严格序列匹配 + 覆盖早停）；+`read_arm_state_k`/`read_hand_state_k` 便捷封装；state ring maxlen 3→8；16 单元测试。
 - **P1 — held 帧过滤工具**: ✅ `dexmani_real/tools/episode_quality.py filter` 已实现 (2026-08-03)。训练前按 `flag_held == True` 过滤（`data.h5` 已有此字段）。
+- **P1 — 代码去重 D01+D02+D03** (2026-08-05): ✅ `hand_home_converge()` 提取到 shared_storage.py；✅ `_seed_hand_retargeter()` 提取到 vr_teleop_policy.py；消除 ~80 行重复代码。
 - **P2 — 跟踪误差过滤阈值**: ✅ tracking error 已由 arm_loop 计算并发布到 arm_state_ring，Policy 记录到 HDF5。episode_quality.py filter 支持 `--max-tracking-error`。
 - **P3 — camera_loop 独立模块**: ✅ camera_loop 已提取到 `sensor/camera_process.py`。
 - **P4 — 旧入口点迁移**: ✅ 全部完成 (2026-08-03)。旧入口点已删除，所有功能已迁移至 SharedStorage 架构。
@@ -311,7 +313,6 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 - **Phase 3~7 — 入口点全量迁移 (2026-08-03)**: ✅ vr_teleop_hand_record.py (canonical)、keyboard_teleop_real.py、calibrate_vr_heading.py、replay_traj.py、calibrate_camera.py 全部迁移至 SharedStorage 架构。
 - **Phase 9b — SharedStorageConfig 常量整合 (2026-08-03)**: ✅ SharedStorageConfig dataclass 集中 ring maxlen、camera 默认分辨率、workspace bounds。
 - **Dead code cleanup (2026-08-03)**: ✅ 删除 robot/interface.py、robot/validate.py、robot/preflight.py、robot/arm_process.py；✅ hand_process.py 移除所有 legacy 类（HandControlProcess/HandSHMFaçade/HandSHMAdapter 等）；✅ types.py 移除 RobotInterfaceConfig；✅ (2026-08-03 后续) 删除 defaults.py 6 个 _Deprecated* 类 + TeleopDefaults；✅ 删除 planning/collision_config.py；✅ 删除 test_quest_hand_teleop.py；✅ shared_storage.py 移除 4 个 re-export；✅ 清理所有过期注释/docstring 中的 RobotInterface/RobotInterfaceConfig/ArmProcess 引用；✅ 更新 CLAUDE.md 架构图。
-- **Velocity feedforward (2026-08-05)**: ✅ `arm_loop.py` 新增速度前馈补偿 — `cmd_vel * lead_gain` 加在 Mode 6 G7 位置命令上，逐关节方向守卫，`_current_raw_target` 防 hold-tick 累积，关节限位 clamp 防 C31。`ArmLoopConfig.feedforward_lead_gain` 可控（None=禁用）。Ref: `memory/arm-velocity-feedforward.md`。
 - **Teleop 扁平化 (2026-08-04)**: ✅ 移除 control/core/vr 三个子目录，所有文件直置于 teleop/；✅ 删除 core/pipeline.py (TeleopPipeline 未使用)、vr/vr_tracker.py (QuestHandTracker 未使用)、vr/dummy_tracker.py (零引用)；✅ 更新所有 import 路径 (teleop.{control,vr}.* → teleop.*)；✅ 清理 stale 注释和 pycache。
 - **Code review bugfixes (2026-08-03)**: ✅ calibrate_camera.py CRITICAL NameError 修复（_get_ee_pose 中未定义的 Rotation）；✅ replay_traj.py queue.put 死锁修复（error_state 门控 + estopped 守卫）；✅ 多处 heartbeat wait loop 修复。
 - **Code review round 2 (2026-08-03)**: ✅ CRITICAL: keyboard_teleop NameError 修复（XArm7Config 未导入）；✅ CRITICAL: `--acc`/`--speed` CLI 参数传递到 arm_loop（hand_record + keyboard_teleop）；✅ CRITICAL: arm_action_q blocking put() 改为 timeout-protected（policy_loop）；✅ HIGH: `--no-hand` 标志修复（hand_enabled 字段 +hand_loop 跳过）；✅ HIGH: arm_loop/hand_loop 资源泄漏修复（init 失败时 disconnect）；✅ HIGH: 重复辅助函数提取（read_arm_state/read_hand_state/write_hand_cmd → shared_storage.py）；✅ HIGH: 重复 rot6d 转换函数去重；✅ vm_loop 心跳竞态修复；✅ _simple_homing 心跳阻塞修复；✅ HandState.from_ring() 添加 qpos_stale；✅ arm.home_qpos 常量集中；✅ 死配置字段/无用导入/过时 docstring 清理。

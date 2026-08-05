@@ -118,6 +118,7 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
         # Last-good frame cache for torn-read fallback (plan §4.7).
         self._last_good: tuple[np.ndarray, int, int] | None = None
         self._last_torn_warn_ns = 0
+        self._last_torn_warn_k_ns = 0  # throttled warning for get_last_k()
 
         logger.debug(
             "SeqlockRingBuffer(name=%s, slot_size=%d, maxlen=%d, total=%d, create=%s)",
@@ -244,6 +245,129 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
         return self._last_good
 
     # ------------------------------------------------------------------
+    # Multi-frame Consumer API (k-frame history for observation windows)
+    # ------------------------------------------------------------------
+
+    def get_last_k(self, k: int) -> "list[tuple[np.ndarray, int, int]]":
+        """Read up to *k* most recent frames, each independently seqlock-verified.
+
+        Returns an **oldest-first** list of ``(data_copy, timestamp_ns,
+        logical_seq)`` tuples.  *data_copy* has shape ``(1,)`` (matching
+        :func:`new_frame`).  The list may be shorter than *k* when the ring
+        hasn't accumulated enough frames or when a concurrent writer
+        overwrites a slot mid-read.  Returns an empty list only when nothing
+        has ever been written (``write_seq == 0``).
+
+        Each frame is independently verified using the odd/even seqlock
+        protocol from :meth:`read_latest`: sample the slot's sequence marker
+        before and after copying; accept only ``seq1 == seq2 != 0 and EVEN``
+        **and** the decoded logical sequence must equal *target_seq* (strict
+        match — the slot must still hold the frame we asked for, not a newer
+        one from a writer that wrapped around).  A per-slot retry (one extra
+        attempt) absorbs transient mid-write races.  Frames that fail both
+        attempts are omitted — torn data is **never** returned.  Dropped
+        frames trigger a throttled warning (≤1 / 5 s).
+
+        Iterates **newest-to-first**: the writer always overwrites the
+        oldest slot (``(latest_seq+1) % maxlen``), so starting at the newest
+        frame minimises the window in which the writer can clobber a slot we
+        haven't visited yet.  When a slot's logical sequence no longer
+        matches *target_seq*, the slot has been overwritten — because the
+        writer increments ``seq`` monotonically, every older frame is also
+        gone, so the walk stops early.  Results are reversed to oldest-first
+        before returning.
+
+        Does **not** interact with :attr:`_last_good` (the
+        :meth:`read_latest` torn-read fallback cache).
+
+        Args:
+            k: Desired frame count.  ``k <= 0`` returns an empty list.
+               ``k > maxlen`` raises :class:`ValueError`.
+
+        Returns:
+            ``[(data_copy, timestamp_ns, logical_seq), ...]``, oldest-first.
+
+        Raises:
+            ValueError: If *k* > *maxlen*.
+
+        Complexity: O(min(*k*, *maxlen*)) seqlock reads; worst case
+        2 attempts per slot.
+        """
+        if k <= 0:
+            return []
+
+        if k > self.maxlen:
+            raise ValueError(
+                f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})"
+            )
+
+        latest_seq = int(self._write_seq[0])
+        if latest_seq == 0:
+            return []  # nothing written yet
+
+        k = min(k, latest_seq)
+        frames: list[tuple[np.ndarray, int, int]] = []
+        dropped = False
+
+        # Newest-first: writer's next overwrite target is the oldest slot
+        # ((latest_seq+1) % maxlen).  Starting at the newest frame (slot
+        # latest_seq % maxlen) gives the oldest frames the shortest
+        # exposure — the writer would need to complete a full ring cycle
+        # before reaching them.
+        for i in range(k):
+            target_seq = latest_seq - i  # newest → oldest
+            if target_seq <= 0:
+                break
+
+            slot_idx = target_seq % self.maxlen
+            slot = self._data_buf[slot_idx]
+
+            accepted = False
+            for _attempt in range(2):
+                seq1 = int(slot["sequence"])
+
+                # Not a complete frame (odd / zero) — writer may be mid-write.
+                if not _seqlock_is_complete(seq1):
+                    continue
+
+                # Strict match: the slot must still hold *target_seq*, not a
+                # newer frame from a writer that wrapped around.  Because the
+                # writer increments seq monotonically, once one slot is
+                # overwritten every older target_seq is also gone — stop the
+                # entire walk.
+                if _seqlock_to_logical(seq1) != target_seq:
+                    # Slot was overwritten — no older frames remain valid.
+                    frames.reverse()
+                    if dropped:
+                        self._warn_torn_read_k(k, len(frames))
+                    return frames
+
+                ts = int(slot["timestamp_ns"])
+                data = slot["data"].copy().reshape(1)
+                seq2 = int(slot["sequence"])
+
+                # Accept: both samples agree, nonzero, EVEN, and still the
+                # same logical sequence (no mid-copy overwrite).
+                if (
+                    seq1 == seq2
+                    and _seqlock_is_complete(seq2)
+                    and _seqlock_to_logical(seq2) == target_seq
+                ):
+                    frames.append((data, ts, target_seq))
+                    accepted = True
+                    break
+                # Torn mid-copy — retry once.
+
+            if not accepted:
+                dropped = True
+
+        frames.reverse()  # newest-first → oldest-first
+        if dropped:
+            self._warn_torn_read_k(k, len(frames))
+
+        return frames
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
@@ -257,4 +381,19 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             "SeqlockRingBuffer '%s': torn read persisted after retry; returning %s.",
             self.name,
             "last-good cached frame" if self._last_good is not None else "None",
+        )
+
+    def _warn_torn_read_k(self, k: int, recovered: int) -> None:
+        """Log a torn-read warning for :meth:`get_last_k`, throttled ≤1 / 5 s."""
+        now_ns = time.monotonic_ns()
+        if now_ns - self._last_torn_warn_k_ns < TORN_WARN_INTERVAL_NS:
+            return
+        self._last_torn_warn_k_ns = now_ns
+        logger.warning(
+            "SeqlockRingBuffer '%s': torn read in get_last_k(k=%d); "
+            "%d/%d frames recovered.",
+            self.name,
+            k,
+            recovered,
+            k,
         )

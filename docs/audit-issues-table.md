@@ -13,25 +13,34 @@
 | **P0** | M02 | 🔵 | — | **无 Observation Wrapper** | — | 无法构建 k-帧历史 observation tensor；无预处理（resize/normalize）抽象 | 实现 ObsWrapper 工厂，参考 `PPTImageWrapper` / `FalconPCDWrapper` | 缺失机制 |
 | **P0** | M03 | 🔵 | — | **无 Action Wrapper** | — | 无 chunk 提取、坐标空间转换、latency 补偿；仅支持 joint position 模式 | 实现 ActWrapper，参考 `ActionChunkWrapper` | 缺失机制 |
 | **P0** | M04 | 🔵 | — | **无推理-执行同步协议** | — | 无 `robot_ready`/`policy_ready` Event 握手；无封闭推理-执行循环 | 新增双 Event 同步协议 | 缺失机制 |
-| **P0** | M05 | 🔵 | — | **RingBuffer 缺少 get_last_k(k)** | `shm/robot_ring.py` | `SeqlockRingBuffer` 仅支持 `read_latest()`（1 帧），无法读 k-帧历史窗口 | 实现 `get_last_k(k)`，利用 seqlock 保护读多帧 | 缺失机制 |
+| **P0** | M05 | 🔵 | ✅ | ✅已修复 | **RingBuffer 缺少 get_last_k(k)** | `shm/robot_ring.py` | `SeqlockRingBuffer` 仅支持 `read_latest()`（1 帧），无法读 k-帧历史窗口 | ✅ `get_last_k(k)` 已实现：独立 seqlock 验证、最新优先遍历、严格序列匹配、覆盖检测+早停。+`read_arm_state_k`/`read_hand_state_k` 便捷封装；state ring maxlen 3→8。16 单元测试 | 缺失机制 |
 | **P0** | M06 | 🔵 | — | **无 Cartesian 动作模式** | `robot/types.py` | `RobotAction` 仅有 `arm_qpos_cmd(7)` + `hand_qpos_cmd(12)`，无 `control_mode` 字段 | 新增 `control_mode` 字段（joint/Cartesian） | 缺失机制 |
-| **P1** | D01 | 🔴 | ✅ | **手部归位代码 4 处重复** | `policy/vr_teleop_policy.py:351-377,488-506,546-573` + `examples/real/vr_teleop_hand_record.py:379-396` | 相同的 poll→send→converge 循环出现 4 次；实例 2 是截断版（缺 `_hand_home_reached` 跟踪）；实例 4 调用不同的写函数 | 提取 `_home_hand(shared, timeout_s, tol_rad)` 辅助函数 | 代码重复 |
-| **P1** | D02 | 🔴 | ✅ | **手部 retargeter reset 3 处重复** | `policy/vr_teleop_policy.py:631-638,707-714,867` | `_try_init_hand_retargeter()` + `_reset_hand_retargeter()` 模式重复；实例 1/2 字面相同（仅变量名不同），实例 3 数据源不同 | 提取 `_reinit_hand_retargeter(shared)` 统一入口 | 代码重复 |
-| **P1** | D03 | 🔴 | ✅ | **arm+hand 联合归位 5 处重复** | `policy/vr_teleop_policy.py`(x3) + `examples/real/vr_teleop_hand_record.py`(x2) | 完整 hand home poll → arm home queue → wait convergence 序列 5 处出现。本仓库重复度最高的模式 | 提取 `_home_hand_then_arm(shared)` | 代码重复 |
-| **P1** | M07 | 🔵 | — | **HDF5→LeRobot/RLDS 导出缺失** | — | 采集格式（HDF5 v11）与标准训练格式（LeRobot v3.0 / RLDS）之间无桥接工具 | 实现 `export_to_lerobot.py` 转换脚本 | 缺失机制 |
-| **P1** | M08 | 🔵 | — | **多 Episode 合并缺失** | — | 无 Zarr ReplayBuffer 式追加或虚拟合并视图；多 episode 训练需外部脚本手动拼接 | 实现 `merge_episodes.py` 或 Zarr 导出 | 缺失机制 |
-| **P1** | M09 | 🔵 | — | **自动质量评估未集成** | `dexmani_real/tools/episode_quality.py` | `episode_quality.py` 已实现 filter/assess/validate，但 `stop_episode` 后未自动调用 | 在 `EpisodeRecorder.stop_episode` 完成回调中触发 assess | 缺失机制 |
-| **P1** | M10 | 🔵 | — | **多相机支持缺失** | `sensor/camera_process.py` | 当前仅支持单相机；无 dict-of-rings 模式 | 参考 ManiUniCon 多相机架构（独立 ring + 融合 ring） | 缺失机制 |
-| **P1** | T01 | 🔴 | — | **零单元测试** | — | 两个项目均无任何 `test_*.py` 文件；无 CI/CD pipeline | 核心模块优先加测：`safety.py`、`ik_candidates.py`、`episode_recorder.py` | 测试 |
-| **P2** | L01 | 🟡 | ✅ | **手部 Tactile 重复读取** | `policy/vr_teleop_policy.py:761,1031` | `_read_hand_tactile()` 每帧调用 2 次；Line 761 服务于 held-frame，Line 1031 服务于 active-frame；recording_active 时两路径同时触发 | 合并为单次读取，在调用处按需分发 | 效率 |
-| **P2** | L02 | 🟡 | ✅ | **`_safe_arm_queue_put` timeout 过长** | `policy/vr_teleop_policy.py:1065` | `timeout=0.5s` = 8 帧@16Hz；Arm 死亡后 Policy 持续 500ms 发手部命令但臂部停滞 → 手-臂异步 | 降至 `0.2s`（3 帧） | 逻辑缺陷 |
-| **P2** | L03 | 🟡 | ⚠️ | **hand_loop + camera_loop 用裸 time.sleep()** | `robot/hand_process.py:284-288` + `sensor/camera_process.py:148` | 两个进程使用手动 `elapsed = monotonic()-last_ts; sleep(interval-elapsed)` 模式，不补偿 overshoot。arm_loop 和 policy_loop 使用 RateManager | 统一迁移到 `RateManager` | 效率 |
-| **P2** | M11 | 🔵 | — | **无 validate_action() 最后防线** | `robot/arm_loop.py` | 策略层裁剪后无 robot 进程内二次验证；ManiUniCon 的 `RobotInterface.validate_action()` 提供此防护 | 在 arm_loop 的 Mode 6 send 前增加 bounds check | 缺失机制 |
-| **P2** | M12 | 🔵 | — | **无 RobotInterface ABC** | — | 无 `connect/send/validate/stop` 抽象接口；机器人硬件依赖直接耦合到 arm_loop/hand_loop | 提取 `RobotInterface` ABC，arm_loop/hand_loop 依赖注入 | 缺失机制 |
-| **P2** | M13 | 🔵 | — | **无分层配置系统** | `config/defaults.py` | Frozen dataclass 单例无 CLI override、无分层（default→experiment→CLI）、无运行时验证 | 评估 Hydra/OmegaConf 或轻量替代（如 `pydantic.BaseSettings`） | 缺失机制 |
-| **P2** | M14 | 🔵 | — | **无结构化遥测导出** | — | 无 Prometheus/StatsD metrics；无运行时 CPU/内存/GPU 监控 | 至少增加 per-process RSS 监控 + 日志 | 缺失机制 |
-| **P2** | M15 | 🔵 | — | **无 CI/CD** | — | 无 GitHub Actions；无自动化 mypy/lint/test | 最小化：`mypy dexmani_real/` + `black --check` | 缺失机制 |
-| **P2** | M16 | 🔵 | — | **无 README** | — | 无安装说明、快速开始、硬件要求文档 | 基于 CLAUDE.md 内容编写精简 README | 文档 |
+| **P1** | D01 | 🔴 | ✅ | ✅已修复 | **手部归位代码 4 处重复** | `policy/vr_teleop_policy.py:351-377,488-506,546-573` + `examples/real/vr_teleop_hand_record.py:379-396` | 相同的 poll→send→converge 循环出现 4 次 | ✅ `hand_home_converge()` 提取到 shared_storage.py；4 call site 替换为 3-9 行调用 | 代码重复 |
+| **P1** | D02 | 🔴 | ✅ | ✅已修复 | **手部 retargeter reset 3 处重复** | `policy/vr_teleop_policy.py:631-638,707-714,867` | `_try_init_hand_retargeter()` + `_reset_hand_retargeter()` 模式重复 | ✅ `_seed_hand_retargeter()` 提取；3 call site 替换 | 代码重复 |
+| **P1** | D03 | 🔴 | ✅ | ✅已修复 | **arm+hand 联合归位 5 处重复** | `policy/vr_teleop_policy.py`(x3) + `examples/real/vr_teleop_hand_record.py`(x2) | 完整 hand home poll → arm home queue → wait convergence 序列 5 处出现 | ✅ 随 D01 一并消除；hand 归位统一为 `hand_home_converge()` | 代码重复 |
+| **P1** | M07 | 🔵 | — | 待处理 | **HDF5→LeRobot/RLDS 导出缺失** | — | 采集格式（HDF5 v11）与标准训练格式（LeRobot v3.0 / RLDS）之间无桥接工具 | 实现 `export_to_lerobot.py` 转换脚本 | 缺失机制 |
+| **P1** | M08 | 🔵 | — | 待处理 | **多 Episode 合并缺失** | — | 无 Zarr ReplayBuffer 式追加或虚拟合并视图 | 实现 `merge_episodes.py` 或 Zarr 导出 | 缺失机制 |
+| **P1** | M09 | 🔵 | — | 待处理 | **自动质量评估未集成** | `dexmani_real/tools/episode_quality.py` | `episode_quality.py` 已实现但未自动调用 | 在 `EpisodeRecorder.stop_episode` 回调中触发 assess | 缺失机制 |
+| **P1** | M10 | 🔵 | — | 待处理 | **多相机支持缺失** | `sensor/camera_process.py` | 当前仅支持单相机 | 参考 ManiUniCon 多相机架构 | 缺失机制 |
+| **P1** | T01 | 🔴 | — | 🟡部分 | **零单元测试** | — | 两个项目均无任何 `test_*.py` 文件 | ✅ `tests/test_robot_ring.py` 已添加（16 测试，M05）。核心模块（safety/ik_candidates/timestamp_buffer）仍缺 | 测试 |
+| **P0** | M06 | 🔵 | — | **无 Cartesian 动作模式** | `robot/types.py` | `RobotAction` 仅有 `arm_qpos_cmd(7)` + `hand_qpos_cmd(12)`，无 `control_mode` 字段 | 新增 `control_mode` 字段（joint/Cartesian） | 缺失机制 |
+| **P1** | D01 | 🔴 | ✅ | 待处理 | **手部归位代码 4 处重复** | `policy/vr_teleop_policy.py:351-377,488-506,546-573` + `examples/real/vr_teleop_hand_record.py:379-396` | 相同的 poll→send→converge 循环出现 4 次；实例 2 是截断版（缺 `_hand_home_reached` 跟踪）；实例 4 调用不同的写函数 | 提取 `_home_hand(shared, timeout_s, tol_rad)` 辅助函数 | 代码重复 |
+| **P1** | D02 | 🔴 | ✅ | 待处理 | **手部 retargeter reset 3 处重复** | `policy/vr_teleop_policy.py:631-638,707-714,867` | `_try_init_hand_retargeter()` + `_reset_hand_retargeter()` 模式重复；实例 1/2 字面相同（仅变量名不同），实例 3 数据源不同 | 提取 `_reinit_hand_retargeter(shared)` 统一入口 | 代码重复 |
+| **P1** | D03 | 🔴 | ✅ | 待处理 | **arm+hand 联合归位 5 处重复** | `policy/vr_teleop_policy.py`(x3) + `examples/real/vr_teleop_hand_record.py`(x2) | 完整 hand home poll → arm home queue → wait convergence 序列 5 处出现。本仓库重复度最高的模式 | 提取 `_home_hand_then_arm(shared)` | 代码重复 |
+| **P1** | M07 | 🔵 | — | 待处理 | **HDF5→LeRobot/RLDS 导出缺失** | — | 采集格式（HDF5 v11）与标准训练格式（LeRobot v3.0 / RLDS）之间无桥接工具 | 实现 `export_to_lerobot.py` 转换脚本 | 缺失机制 |
+| **P1** | M08 | 🔵 | — | 待处理 | **多 Episode 合并缺失** | — | 无 Zarr ReplayBuffer 式追加或虚拟合并视图；多 episode 训练需外部脚本手动拼接 | 实现 `merge_episodes.py` 或 Zarr 导出 | 缺失机制 |
+| **P1** | M09 | 🔵 | — | 待处理 | **自动质量评估未集成** | `dexmani_real/tools/episode_quality.py` | `episode_quality.py` 已实现 filter/assess/validate，但 `stop_episode` 后未自动调用 | 在 `EpisodeRecorder.stop_episode` 完成回调中触发 assess | 缺失机制 |
+| **P1** | M10 | 🔵 | — | 待处理 | **多相机支持缺失** | `sensor/camera_process.py` | 当前仅支持单相机；无 dict-of-rings 模式 | 参考 ManiUniCon 多相机架构（独立 ring + 融合 ring） | 缺失机制 |
+| **P1** | T01 | 🔴 | — | 待处理 | **零单元测试** | — | 两个项目均无任何 `test_*.py` 文件；无 CI/CD pipeline | 核心模块优先加测：`safety.py`、`ik_candidates.py`、`episode_recorder.py` | 测试 |
+| **P2** | L01 | 🟡 | ✅ | ✅已修复 | **手部 Tactile 重复读取** | `policy/vr_teleop_policy.py:782,1052` | `_read_hand_tactile()` 每帧调用 2 次（happy path: 782+1052）；held 帧缺 forward-fill（E02 cache 仅覆盖 active path） | 合并为单次读取：forward-fill 上移至 line 782，删除 line 1052 双读。统一 held/active 两路径触觉数据一致性 | 效率 |
+| **P2** | L02 | 🟡 | ✅ | ✅已修复 | **`_safe_arm_queue_put` timeout 过长** | `policy/vr_teleop_policy.py:1092` | `timeout=0.5s` = 8 帧@16Hz；Arm 死亡后 Policy 阻塞 500ms 发手部命令但臂部停滞 → 手-臂异步 | 降至 `0.2s`（3 帧）— arm_loop 恢复 ~200ms + 排空 66ms = 266ms 最坏窗口，0.2s 刚好覆盖；false-positive 触发干净 shutdown | 逻辑缺陷 |
+| **P2** | L03 | 🟡 | ⚠️ | ✅已修复 | **hand_loop + camera_loop 用裸 time.sleep()** | `robot/hand_process.py:284-288` + `sensor/camera_process.py:149-150` | 两个进程使用手动 `elapsed/sleep/last_ts` 模式（无累积漂移但缺过载检测），arm_loop/policy_loop 已用 RateManager | 统一迁移到 `RateManager`：绝对截止时间调度 + 过载检测。hand_loop: 30Hz <1ms 工作；camera_loop: 16Hz 含 40ms 点云，RateManager 提供一致性+过载告警 | 效率 |
+| **P2** | M11 | 🔵 | — | ⏭️ skip | **无 validate_action() 最后防线** | `robot/arm_loop.py` | 策略层裁剪后无 robot 进程内二次验证 | Policy 层已有完整裁剪（workspace + delta + NaN + IK + joint limits）+ 固件 C31 backstop。加 arm_loop 二次验证是防御纵深非必须 | 缺失机制 |
+| **P2** | M12 | 🔵 | — | ⏭️ defer | **无 RobotInterface ABC** | — | 无 `connect/send/validate/stop` 抽象接口；机器人硬件依赖直接耦合到 arm_loop/hand_loop | 当前纯函数架构不需要 ABC。P0 ModelPolicy 落地时按需提取 Protocol | 缺失机制 |
+| **P2** | M13 | 🔵 | — | ⏭️ skip | **无分层配置系统** | `config/defaults.py` | Frozen dataclass 单例无 Hydra 式分层 | P3 C02（load_config_json + --config）已覆盖 80% 用例。Hydra 对单机系统过度工程 | 缺失机制 |
+| **P2** | M14 | 🔵 | — | ⏭️ skip | **无结构化遥测导出** | — | 无 Prometheus/StatsD metrics；无运行时 CPU/内存/GPU 监控 | Prometheus/StatsD 面向多机集群。单机遥操作已有 status print + heartbeat 监控 | 缺失机制 |
+| **P2** | M15 | 🔵 | — | ⏭️ skip | **无 CI/CD** | — | 无 GitHub Actions；无自动化 mypy/lint/test | P3 T02（.pre-commit-config.yaml）已覆盖格式化+类型检查。本地 hooks 是 80/20 的 CI | 缺失机制 |
+| **P2** | M16 | 🔵 | — | ⏭️ skip | **无 README** | — | 无安装说明、快速开始、硬件要求文档 | CLAUDE.md（~400 行）已是实质文档，含架构图、快速参考、硬件说明 | 文档 |
 | **P3** | L04 | 🟡 | ✅ | ✅已修复 | **gc.disable() 全会话禁用 GC** | `policy/vr_teleop_policy.py:322` | `gc.disable()` 在 16Hz loop 入口；`gc.collect()` 仅在 Line 337（录制保存后）+ Line 657（新 episode 前）；长时采集可能累积循环引用 | **删除 gc.disable()/gc.enable()** — numpy 引用计数管理主导分配，GC 在 62.5ms 帧预算内不会触发（ManiUniCon 无此类禁用） | 逻辑缺陷 |
 | **P3** | L05 | 🟡 | ✅ | ✅已修复 | **eef_quat_wxyz 硬编码 identity** | `policy/vr_teleop_policy.py:1367` | 每帧 `[1,0,0,0]`；实际方向在 `eef_rot6d`（Line 1368）。HDF5 每帧浪费 32B 无效数据 | `rot6d_to_quat_wxyz(eef_rot6d)` + NaN guard（避免 arm_state=None 时 NaN quat） | 数据质量 |
 | **P3** | L06 | 🟡 | ✅ | ✅已修复 | **安全状态机 transition() 理论竞争** | `robot/safety.py:61-83` | read-modify-write 无锁；实践中安全（Main/Policy 合法转换集不相交），但非零风险 | **仅注释** — 写权分离 + FAULT 自愈（supervisor 100ms 重断言）+ arm 先停后报，加 mp.Lock 属于过度工程 | 并发安全 |
@@ -59,12 +68,12 @@
 
 | 优先级 | 数量 | 已修复 | 类别分布 |
 |:---:|:---:|:---:|---|
-| **P0** | 6 | 0 | 全部为缺失机制（策略推理部署基础设施） |
-| **P1** | 10 | 0 | 3 代码重复 + 4 缺失机制 + 1 训练管道 + 1 多相机 + 1 测试 |
-| **P2** | 9 | 0 | 3 逻辑/效率 + 6 缺失机制/基础设施 |
-| **P3** | 10 | **8** ✅ | 4 逻辑/数据质量 + 2 效率 + 2 配置 + 1 测试 + 1 并发。剩余 2 项待处理 |
-| **P4** | **12** | **12** ✅ | 6 可维护性 + 2 效率/微优化 + 1 正确性 + 1 数据完整性 + 1 可观测性 + 1 存储泄漏 + 1 防御性编程 + 1 配置 + 1 缺失机制（与 L13 合并） |
-| **合计** | **48** | **20** | P4 全部修复 + P3 8/10 已修复（2026-08-05），P0-P2 + P3 剩余待后续 |
+| **P0** | 6 | **1** ✅ | 全部为缺失机制。M05 (get_last_k) 已修复 |
+| **P1** | 10 | **3** ✅ + **1** 🟡部分 | 3 代码重复（D01/D02/D03 已去重）+ 1 测试（T01 部分：1 文件 16 测试）+ 6 缺失机制 |
+| **P2** | 9 | **3** ✅ + **6** ⏭️ | 3 逻辑/效率（L01/L02/L03 已修复）+ 6 缺失机制/基础设施（M11-M16 skip/defer） |
+| **P3** | 10 | **8** ✅ | 4 逻辑/数据质量 + 2 效率 + 2 配置 + 1 测试 + 1 并发 |
+| **P4** | **12** | **12** ✅ | 全部修复 |
+| **合计** | **48** | **27** ✅ + **6** ⏭️ + **1** 🟡 | P4 12 + P3 8 + P2 3 + P1 3 + P0 1 已修复；T01 部分；P0/P1 剩余待后续 |
 
 ### 按严重度
 
@@ -87,16 +96,17 @@
 
 ## P0 详细说明（策略推理部署 — 结构性断裂）
 
-当前 DexMani 从采集到部署的路径是断的。6 个 P0 项共同构成部署能力的**最小可行集合**：
+当前 DexMani 从采集到部署的路径是断的。6 个 P0 项共同构成部署能力的**最小可行集合**。
+**2026-08-05: M05 (get_last_k) 已实现 — P0 首个修复项。**
 
 ```
-采集 (现有)                    训练 (手动)                    部署 (缺失)
+采集 (现有)                    训练 (手动)                    部署 (部分就绪)
 ─────────                    ─────────                    ─────────
 HDF5 v11  ──→ LeRobot导出 ──→ 模型训练 ──→ ModelPolicy ──→ Arm/Hand
               (P1 M07)                     ├─ ObsWrapper (M02)
                                            ├─ ActWrapper (M03)
                                            ├─ 同步协议 (M04)
-                                           ├─ get_last_k (M05)
+                                           ├─ get_last_k (M05) ✅
                                            └─ Cartesian模式 (M06)
 ```
 

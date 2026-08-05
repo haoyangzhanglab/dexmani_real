@@ -45,7 +45,7 @@ from dexmani_real.shm.shared_storage import SharedStorage, HOME_SENTINEL
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.config.defaults import policy
+from dexmani_real.config.defaults import arm, policy
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 try:
@@ -317,15 +317,13 @@ def main():
                 print(f"\n[T+{elapsed:.0f}s f={loop_count}] [R] return_home", flush=True)
                 # Plan collision-safe path to home (same as VR policy)
                 _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
                 if _waypoints is not None and len(_waypoints) > 0:
                     print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
                 elif _waypoints is not None and len(_waypoints) == 0:
-                    # Should not happen (plan_joint_home_path returns None when at home),
-                    # but guard defensively.
-                    print(f"  home  already close to home, skipping", flush=True)
+                    print(f"  home  NO SAFE PATH — holding position", flush=True)
                 else:
-                    print(f"  home  plan returned None, falling back to joint-space interpolation", flush=True)
+                    print(f"  home  already close to home", flush=True)
                 shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                 _prev_ema_pos = _prev_ema_quat = None
                 consecutive_divergence = 0
@@ -644,15 +642,19 @@ def main():
                         _ad, _, _ = _arm_result
                         _arm_qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
                         _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                        _waypoints = plan_joint_home_path(_arm_qpos, _home_qpos, planner)
+                        _waypoints = plan_joint_home_path(_arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
                         if _waypoints is not None and len(_waypoints) > 0:
                             print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
                         elif _waypoints is not None and len(_waypoints) == 0:
-                            print(f"  home  already close to home, skipping", flush=True)
+                            print(f"  home  NO SAFE PATH — holding position", flush=True)
                         else:
-                            print(f"  home  plan returned None, falling back to joint-space interpolation", flush=True)
+                            print(f"  home  already close to home", flush=True)
                         shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                     else:
+                        # Arm state ring has no valid frame — can't plan a path.
+                        # _planned_homing will read the current position from the
+                        # arm SDK directly and do its own wrapping + interpolation.
+                        print("  home  arm state unavailable — falling back to SDK-based homing", flush=True)
                         shared.arm_action_q.put((HOME_SENTINEL, None))
                     _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
                     _converged = _wait_for_home(shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0)

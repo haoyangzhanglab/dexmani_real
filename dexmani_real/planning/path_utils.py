@@ -100,16 +100,47 @@ def plan_joint_home_path(
     qpos: np.ndarray,
     home_qpos: np.ndarray,
     planner: "XArm7MotionPlanner | None" = None,
+    *,
+    table_z_surface_m: float | None = None,
+    hand_safety_margin_m: float | None = None,
 ) -> np.ndarray | None:
     """Plan a collision-safe joint-space path from *qpos* to *home_qpos*.
 
-    Returns a dense (D×7) waypoint array, or ``None`` when the arm is already
-    close enough that no waypoints are needed.  Raises no exceptions — on any
-    failure to plan, returns ``None`` (caller falls back to linear interpolation).
+    Returns:
+        * ``None`` — arm is already at home (delta < 0.5°); caller should
+          send ``home_qpos`` directly (no-op).
+        * ``(D, 7)`` dense waypoint array (D ≥ 2) — collision-safe path found.
+        * ``(0, 7)`` empty array — **no safe path exists**; caller MUST NOT
+          fall back to linear interpolation.  The arm should hold position
+          and the operator should be alerted.
+
+    Raises no exceptions.
 
     This function only reads the collision model — it does NOT need a live
     XArm7 connection.
+
+    Args:
+        qpos:              Current arm joint positions (7,).
+        home_qpos:          Target home joint positions (7,).
+        planner:            Planner with collision model.  When None, only
+                            joint-limit-aware wrapping is performed.
+        table_z_surface_m:  Table top Z in arm-base frame (metres).  When
+                            provided, an additional EEF-z check ensures the
+                            fingertips cannot reach below the table surface
+                            along the planned path.  This complements the
+                            Pinocchio self-collision check — mesh-based collision
+                            detection can produce false positives for hand links
+                            (coarse convex hulls), while the EEF-z check is a
+                            simple, reliable geometric bound.
+        hand_safety_margin_m:
+                            Conservative estimate of the maximum vertical
+                            distance from EEF to the lowest fingertip.
+                            Defaults to ``arm.hand_safety_margin_m`` (0.05 m)
+                            when ``None``.  Used with *table_z_surface_m*.
     """
+    if hand_safety_margin_m is None:
+        hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
+
     # ── Wrap home_qpos to nearest equivalent of current qpos ──
     # Prevents interpolate_waypoints from generating up to 360° of unnecessary
     # rotation for equivalent joints (J1/J3/J5/J7 on xArm7, 720° range).
@@ -134,19 +165,38 @@ def plan_joint_home_path(
         planner is not None
         and planner.planning_profile.check_self_collision
     )
+    _check_table = table_z_surface_m is not None and planner is not None
 
     def _check_safe(path: np.ndarray) -> bool:
-        if not have_collision:
-            return True
-        result = planner.ik_mgr.check_path_collisions(path)  # type: ignore[union-attr]
-        return not result.get("path_self_collision", False)
+        # ── Self-collision check (Pinocchio mesh-based) ──
+        if have_collision:
+            result = planner.ik_mgr.check_path_collisions(path)  # type: ignore[union-attr]
+            if result.get("path_self_collision", False):
+                return False
+
+        # ── Table clearance check (EEF z-based, complements mesh check) ──
+        # Pinocchio convex-hull collision meshes for hand links can be
+        # conservatively large, producing false positives against the table
+        # box.  The EEF-z check provides a simple, reliable bound: the
+        # lowest fingertip is at most *hand_safety_margin_m* below the EEF.
+        if _check_table:
+            for _wp in path:
+                try:
+                    _eef_p = planner.kin.compute_eef_pose_world(_wp).p  # type: ignore[union-attr]
+                except Exception:
+                    return False  # FK failure → treat as unsafe
+                if not np.all(np.isfinite(_eef_p)):
+                    return False
+                if float(_eef_p[2]) - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
+                    return False  # hand may collide with table
+        return True
 
     # ── Attempt 1: direct linear joint-space interpolation ──
     path = interpolate_waypoints(np.stack([qpos, _home]), np.deg2rad(1.0))
     if _check_safe(path):
         return path
 
-    if not have_collision:
+    if not have_collision and not _check_table:
         return None
 
     # ── Attempt 2: two-stage detour (proximal → wrist) ──
@@ -163,4 +213,4 @@ def plan_joint_home_path(
     if _check_safe(staged):
         return staged
 
-    return None  # no safe path — caller falls back to direct linear interpolation
+    return np.empty((0, 7), dtype=np.float64)  # sentinel: no safe path — caller MUST hold position

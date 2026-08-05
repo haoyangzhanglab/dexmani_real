@@ -137,6 +137,10 @@ class ArmParams:
     # ── Connection ──
     ip: str = "192.168.1.111"
 
+    # ── Environment ──
+    table_z_surface_m: float = -0.008  # table top surface Z in arm-base frame (m)
+    hand_safety_margin_m: float = 0.05  # conservative EEF-to-fingertip vertical distance (m)
+
     # ── Safety ──
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
     collision_sensitivity: int = 1  # 0-5, 1 = most sensitive

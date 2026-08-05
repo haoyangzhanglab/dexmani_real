@@ -16,6 +16,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import hand
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
 
@@ -131,8 +132,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     shared.hand_ready.set()
     logger.info("hand_loop: ready")
 
-    interval = 1.0 / cfg.loop_hz
-    last_ts = time.monotonic()
+    rate_mgr = RateManager(cfg.loop_hz)
     last_cmd_seq = 0
     consecutive_send_errors = 0
     _last_clear_error_s = 0.0
@@ -280,12 +280,8 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             tf["tactile_force"][0] = tactile_force
             shared.hand_tactile_ring.write(tf)
 
-        # Rate limit
-        elapsed = time.monotonic() - last_ts
-        sleep_time = interval - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-        last_ts = time.monotonic()
+        # Rate limit (absolute-deadline scheduling, consistent with arm_loop/policy_loop)
+        rate_mgr.wait()
 
     # ── Pre-disconnect home: drive hand to home_qpos before releasing the
     # EtherCAT bus.  If the hand driver board is in a degraded state

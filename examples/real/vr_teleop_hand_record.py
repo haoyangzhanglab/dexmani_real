@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, camera, hand, policy, safety, vr
 from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
+from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
@@ -61,6 +62,7 @@ from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
 from dexmani_real.shm.shared_storage import (
     HOME_SENTINEL,
     SharedStorage,
+    hand_home_converge,
     read_arm_state,
     read_hand_state,
     write_hand_cmd,
@@ -401,37 +403,28 @@ def _post_loop_home(shared: SharedStorage) -> None:
 
                     # ── Step 1: Hand home first ──
                     # hand_loop is still running (is_running not set yet).
-                    _hand_home_tol = np.deg2rad(5.0)
-                    _hand_home_deadline = time.monotonic() + 5.0
-                    _hand_home_reached = False
-                    while time.monotonic() < _hand_home_deadline:
-                        write_hand_cmd(shared, HAND_HOME_QPOS)
-                        _hs = read_hand_state(shared)
-                        if _hs is not None:
-                            _current = np.asarray(_hs["qpos"][0], dtype=np.float64)
-                            if np.all(np.isfinite(_current)):
-                                if float(np.max(np.abs(_current - HAND_HOME_QPOS))) < _hand_home_tol:
-                                    _hand_home_reached = True
-                                    break
-                        time.sleep(0.05)
-                    if _hand_home_reached:
-                        print("  hand: home reached", flush=True)
-                    else:
-                        print("  hand: home settle timeout — proceeding", flush=True)
+                    hand_home_converge(shared, HAND_HOME_QPOS, heartbeat=False, check_is_running=False, verbose=True)
 
                     # ── Step 2: Arm home ──
-                    # Uses None waypoints: arm_loop's _planned_homing falls back
-                    # to joint-space linear interpolation.  On Ctrl+C the arm
-                    # process typically exits before we reach here — best-effort only.
+                    # Planner/policy process has already exited — no collision model
+                    # available.  plan_joint_home_path with planner=None provides
+                    # equivalent-joint wrapping + dense interpolation but NO collision
+                    # checking.  Best-effort only: on Ctrl+C the arm process typically
+                    # exits before we reach here.
                     try:
-                        shared.arm_action_q.put((HOME_SENTINEL, None), timeout=2.0)
+                        _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                        _cur_as = read_arm_state(shared)
+                        _cur_qpos = _home_qpos.copy()
+                        if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
+                            _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
+                        _waypoints = plan_joint_home_path(_cur_qpos, _home_qpos, planner=None)
+                        shared.arm_action_q.put((HOME_SENTINEL, _waypoints), timeout=2.0)
                     except Exception:
-                        print("  arm_action_q full — arm may have already exited")
+                        print("  arm_action_q put failed — arm may have already exited")
                         break
                     # Wait for arm to converge to home_qpos (joint-position check).
                     # On Ctrl+C the arm process may have already exited — best-effort
                     # polling with a short timeout.
-                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
                     _home_tol = np.deg2rad(2.0)
                     _home_deadline = time.monotonic() + 10.0
                     _home_reached = False

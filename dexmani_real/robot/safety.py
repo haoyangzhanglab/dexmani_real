@@ -60,9 +60,11 @@ def transition(shared: Any, new_state: SafetyState) -> bool:
            Main owns DISARMED↔ARMED / →FAULT; Policy owns ARMED↔RUNNING.
         2. **FAULT is self-correcting:** the heartbeat supervisor re-asserts
            FAULT within 100 ms (10 Hz), so any overwrite is transient.
-        3. **Arm is already stopped** before ``error_state`` is set:
-           arm_loop calls ``set_state(4)`` before escalating to FAULT, so
-           no physical motion occurs during the race window.
+        3. **No new motion can occur after FAULT:** arm_loop stops issuing
+           ``set_servo_angle`` calls as soon as FAULT is set (the loop breaks
+           immediately), so the arm holds its last Mode 6 target.
+           ``set_state(4)`` is called during cleanup as a belt-and-suspenders
+           measure, not the primary safety mechanism.
 
         Adding ``mp.Lock`` was considered (2026-08-05 audit) and rejected:
         the overhead for a theoretical race that self-corrects within one

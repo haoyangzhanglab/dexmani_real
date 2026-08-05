@@ -18,9 +18,13 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, safety
+from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
+from dexmani_real.robot.safety import SafetyState, transition
+from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, HOME_SENTINEL, new_frame
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real import ASSET_DIR
 
 logger = get_logger(__name__)
 
@@ -63,37 +67,10 @@ class ArmLoopConfig:
     homing_max_speed_rad_per_s: float = field(default_factory=lambda: np.deg2rad(arm.homing.max_speed_deg_s))
     homing_target_timeout_s: float = field(default_factory=lambda: arm.homing.target_timeout_s)
 
-    # ── Velocity feedforward (application-level compensation for Mode 6 servo lag) ──
-    # Per-joint lead gain (seconds).  Adds cmd_vel * lead_gain to the position
-    # command — the anticipatory target gives Mode 6's trajectory planner a
-    # "head start" that compensates for its lack of velocity feedforward.
-    #   J5 (wrist roll, highest inertia):        0.06 s  (~2 servo ticks @30Hz)
-    #   J2 (shoulder lift), J6 (wrist pitch):    0.04 s
-    #   J1/J3/J4/J7 (lighter joints):            0.03 s  (~1 servo tick @30Hz)
-    # Set to None to disable feedforward entirely.
-    feedforward_lead_gain: tuple[float, ...] | None = field(default_factory=lambda: (
-        0.03,  # J1
-        0.04,  # J2
-        0.03,  # J3
-        0.03,  # J4
-        0.06,  # J5
-        0.04,  # J6
-        0.03,  # J7
-    ))
-
-    # Max absolute correction per joint (rad).  Clamps the feedforward term to
-    # prevent overshoot on noisy velocity estimates.  0.05 rad ≈ 2.9°.
-    feedforward_max_correction_rad: float = 0.05
-
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
 _RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
 _RECOVERY_MAX: int = safety.max_consecutive_recoveries  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
-
-# Velocity feedforward: number of ticks to skip after startup or HOME before
-# enabling compensation.  3 ticks @ 30 Hz ≈ 100 ms — enough for the arm state
-# ring to be populated and any homing transient to settle.
-_FF_SKIP_TICKS: int = 3
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -106,47 +83,18 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     Designed as an mp.Process target. Communicates exclusively through
     SharedStorage (no RPC, no side channels).
-
-    Features velocity feedforward compensation (configurable via
-    ``ArmLoopConfig.feedforward_lead_gain``): adds ``cmd_vel * lead_gain``
-    to the position command to compensate for Mode 6 servo lag.  Per-joint
-    direction guard prevents overshoot; joint-limit clip after feedforward
-    is defense-in-depth against C31 triggers.
     """
     from queue import Empty
 
-    from dexmani_real.shm.shared_storage import HOME_SENTINEL, ARM_STATE_DTYPE, new_frame
-    from dexmani_real.robot.safety import SafetyState, transition
-    from dexmani_real.planning.kinematics import ArmFK
-    from dexmani_real import ASSET_DIR
-
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
+    _state_read_warn = ThrottledWarner(interval_s=5.0)
     _consecutive_recoveries = 0
     _consecutive_state_errors = 0
+    _tracking_err_count = 0
     cfg = config or ArmLoopConfig()
 
     HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
-
-    # ── Velocity feedforward state ──
-    _ff_enabled = (
-        cfg.feedforward_lead_gain is not None
-        and any(g != 0.0 for g in cfg.feedforward_lead_gain)
-    )
-    _ff_lead_gain = (
-        np.array(cfg.feedforward_lead_gain, dtype=np.float64)
-        if cfg.feedforward_lead_gain is not None
-        else np.zeros(7, dtype=np.float64)
-    )
-    _current_raw_target: np.ndarray | None = None  # uncompensated target, updated on new-action ticks only
-    _prev_raw_target: np.ndarray | None = None  # previous new-action target, for velocity estimation
-    _prev_target_time: float | None = None
-    _last_cmd_vel: np.ndarray | None = None  # 7-DOF (rad/s), reused on hold ticks
-    _ff_skip_count: int = _FF_SKIP_TICKS  # skip first N frames after startup/HOME
-
-    # Pre-convert joint limits for fast clamping (feedforward safety net).
-    _joint_lo = np.array(cfg.joint_limit_lower, dtype=np.float64)
-    _joint_hi = np.array(cfg.joint_limit_upper, dtype=np.float64)
 
     # ── URDF-consistent FK (replaces arm.get_position_aa) ──
     # xArm firmware uses a different EEF coordinate definition than our URDF.
@@ -170,6 +118,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         arm.set_mode(6)
         arm.set_state(0)
         arm.set_collision_sensitivity(cfg.collision_sensitivity)
+        # Torque-based collision detection (level 1 = most sensitive).  Detects
+        # impact/impulse collisions but may miss slow/gentle contact (e.g., hand
+        # brushing the table surface — torque rise is too gradual to trigger).
+        # Software-level checks (Pinocchio self-collision + EEF z-clearance in
+        # plan_joint_home_path) are the primary protection for table contact.
         arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True)
         if getattr(arm, "mode", -1) != 6:
             logger.error("arm_loop: failed to set mode 6")
@@ -207,18 +160,18 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     except Exception:
         eef_pos_init = np.zeros(3, dtype=np.float64)
         eef_rot6d_init = np.zeros(6, dtype=np.float64)
-    _frame0 = new_frame(ARM_STATE_DTYPE)
-    _frame0["qpos"][0] = last_qpos
-    _frame0["qvel"][0] = np.zeros(7, dtype=np.float64)
-    _frame0["tau"][0] = np.zeros(7, dtype=np.float64)
-    _frame0["eef_pos"][0] = eef_pos_init
-    _frame0["eef_rot6d"][0] = eef_rot6d_init
-    _frame0["error_code"][0] = 0
-    _frame0["connected"][0] = 1
-    _frame0["mode"][0] = 6
-    _frame0["tracking_err"][0] = 0.0
-    _frame0["timestamp"][0] = time.monotonic()
-    shared.arm_state_ring.write(_frame0)
+    _frame = new_frame(ARM_STATE_DTYPE)
+    _frame["qpos"][0] = last_qpos
+    _frame["qvel"][0] = np.zeros(7, dtype=np.float64)
+    _frame["tau"][0] = np.zeros(7, dtype=np.float64)
+    _frame["eef_pos"][0] = eef_pos_init
+    _frame["eef_rot6d"][0] = eef_rot6d_init
+    _frame["error_code"][0] = 0
+    _frame["connected"][0] = 1
+    _frame["mode"][0] = getattr(arm, "mode", 6)
+    _frame["tracking_err"][0] = 0.0
+    _frame["timestamp"][0] = time.monotonic()
+    shared.arm_state_ring.write(_frame)
 
     # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
     # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
@@ -233,10 +186,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         shared.arm_heartbeat_s.value = time.monotonic()
 
         if shared.estop_request.value:
-            try:
-                arm.set_state(4)
-            except Exception:
-                logger.warning("arm_loop: estop set_state(4) failed", exc_info=True)
             break
 
         # Safety state gate — only process commands in ARMED or RUNNING.
@@ -257,15 +206,35 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 logger.info("arm_loop: HOME sentinel — planned homing (%d waypoints)",
                             len(_waypoints) if _waypoints is not None else 0)
                 _planned_homing(arm, _waypoints, HOME_QPOS, cfg, shared=shared)
-                last_qpos = HOME_QPOS.copy()
-                last_target = HOME_QPOS.copy()
-                # Reset feedforward state — skip first N frames after home
-                # to avoid transient compensation from the jump to home_qpos.
-                _current_raw_target = None
-                _prev_raw_target = None
-                _prev_target_time = None
-                _last_cmd_vel = None
-                _ff_skip_count = _FF_SKIP_TICKS
+                # Read actual state after homing — arm may still be settling
+                # (all servo commands use wait=False)
+                try:
+                    code, states = arm.get_joint_states(is_radian=True, num=1)
+                    if code == 0 and len(states) > 0:
+                        last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
+                    else:
+                        last_qpos = HOME_QPOS.copy()
+                except Exception:
+                    last_qpos = HOME_QPOS.copy()
+                last_target = last_qpos.copy()
+                # Publish post-homing state so consumers see the final position
+                try:
+                    eef_pos_home, eef_rot6d_home = _arm_fk.compute(last_qpos)
+                except Exception:
+                    eef_pos_home = np.zeros(3, dtype=np.float64)
+                    eef_rot6d_home = np.zeros(6, dtype=np.float64)
+                _frame_home = new_frame(ARM_STATE_DTYPE)
+                _frame_home["qpos"][0] = last_qpos
+                _frame_home["qvel"][0] = np.zeros(7, dtype=np.float64)
+                _frame_home["tau"][0] = np.zeros(7, dtype=np.float64)
+                _frame_home["eef_pos"][0] = eef_pos_home
+                _frame_home["eef_rot6d"][0] = eef_rot6d_home
+                _frame_home["error_code"][0] = 0
+                _frame_home["connected"][0] = 1
+                _frame_home["mode"][0] = getattr(arm, "mode", 6)
+                _frame_home["tracking_err"][0] = 0.0
+                _frame_home["timestamp"][0] = time.monotonic()
+                shared.arm_state_ring.write(_frame_home)
                 continue
 
             # Servo
@@ -286,66 +255,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                         target, last_qpos,
                         cfg.joint_limit_lower, cfg.joint_limit_upper,
                     )
-                    last_target = target.copy()
-
-            # ── Velocity feedforward compensation ──
-            # Compute command velocity from successive targets and add a lead
-            # term to the position command: compensated = target + cmd_vel × lead_gain.
-            # Mode 6 lacks velocity feedforward — the anticipatory position target
-            # gives the firmware's trajectory planner a "head start".
-            #
-            # arm_loop runs at 30Hz but new targets arrive at 16Hz.  On hold ticks
-            # (no new action) we reuse the last velocity estimate AND the last
-            # uncompensated target (_current_raw_target).  Critically, we do NOT
-            # snapshot last_target as the base — it carries compensation from the
-            # previous tick, and using it would accumulate lead on every hold tick
-            # (verified: 5 hold ticks → +28.7° drift).
-            _loop_time = time.monotonic()
-
-            if _new_action:
-                _current_raw_target = last_target.copy()  # uncompensated snapshot
-
-            if _ff_enabled and _ff_skip_count <= 0 and _current_raw_target is not None:
-                if _new_action and _prev_raw_target is not None and _prev_target_time is not None:
-                    _dt = max(_loop_time - _prev_target_time, 1e-6)
-                    _cmd_vel = (_current_raw_target - _prev_raw_target) / _dt  # 7-DOF (rad/s)
-                    _last_cmd_vel = _cmd_vel
-                # else: hold tick — reuse _last_cmd_vel from previous new-action tick
-
-                if _last_cmd_vel is not None:
-                    _pos_err = _current_raw_target - last_qpos  # shrinks as arm approaches target
-                    # Per-joint guard: only compensate joints where the arm is
-                    # chasing the target in the same direction as cmd velocity.
-                    # Prevents overshoot when a joint has passed the target while
-                    # others are still catching up.
-                    _guard = (_last_cmd_vel * _pos_err) > 0  # shape (7,) bool
-                    _lead = np.where(
-                        _guard,
-                        _last_cmd_vel * _ff_lead_gain,
-                        np.float64(0.0),
-                    )
-                    _lead = np.clip(
-                        _lead,
-                        -cfg.feedforward_max_correction_rad,
-                        cfg.feedforward_max_correction_rad,
-                    )
-                    # mypy narrows _current_raw_target correctly but np.where
-                    # dtype inference interacts poorly with the type guard.
-                    _compensated: np.ndarray = _current_raw_target + _lead.astype(np.float64)
-                    last_target = _compensated
-
-            # ── Joint-limit safety clamp (defense-in-depth) ──
-            # Feedforward can push last_target up to ±0.05 rad beyond the
-            # IK target.  Clamp to hardware limits so we never trigger C31
-            # (joint limit) on a compensated command.
-            last_target = np.clip(last_target, _joint_lo, _joint_hi)
-
-            if _new_action:
-                _prev_raw_target = _current_raw_target  # for next velocity estimate
-                _prev_target_time = _loop_time
-
-            if _ff_skip_count > 0:
-                _ff_skip_count -= 1
+                    last_target = target
 
             try:
                 code = arm.set_servo_angle(angle=last_target, is_radian=True,
@@ -400,18 +310,21 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
         # Read state
         arm_connected = True
-        _state_ts = time.monotonic()  # capture BEFORE FK — timestamp = joint read time
         try:
             code, states = arm.get_joint_states(is_radian=True, num=3)
             if code == 0 and len(states) > 0:
+                _state_ts = time.monotonic()  # timestamp = post-read time
                 qpos = np.asarray(states[0], dtype=np.float64)[:7]
                 qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.zeros(7)
                 tau = np.asarray(states[2], dtype=np.float64)[:7] if len(states) > 2 else np.zeros(7)
                 last_qpos = qpos.copy()
             else:
+                _state_ts = time.monotonic()
+                _state_read_warn("arm_loop: get_joint_states returned code=%d", code)
                 qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
                 arm_connected = False
         except Exception:
+            _state_ts = time.monotonic()
             logger.warning("arm_loop: get_joint_states failed", exc_info=True)
             qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
             arm_connected = False
@@ -426,11 +339,17 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             eef_pos = np.zeros(3, dtype=np.float64)
             eef_rot6d = np.zeros(6, dtype=np.float64)
 
-        # Compute tracking error
+        # Compute tracking error (with persistence gate — 3 consecutive
+        # frames above threshold before warning, to suppress single-frame
+        # transients from abrupt IK target changes).
         tracking_err = float(np.max(np.abs(qpos - last_target)))
 
         if tracking_err > cfg.tracking_error_warn_rad:
-            _tracking_warn("arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad)
+            _tracking_err_count += 1
+            if _tracking_err_count >= 3:
+                _tracking_warn("arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad)
+        else:
+            _tracking_err_count = 0
 
         # Error handling
         # arm.error_code is an SDK cached property (updated by background report
@@ -450,10 +369,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 break
             try:
                 arm.clean_error()
-                arm.set_mode(6)
                 arm.set_state(0)
+                arm.set_mode(6)
             except Exception:
-                pass
+                logger.warning("arm_loop: state-read recovery failed", exc_info=True)
         elif error_code != 0:
             shared.error_state.value = True
             transition(shared, SafetyState.FAULT)
@@ -462,18 +381,17 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             _consecutive_state_errors = 0
 
         # Publish state
-        frame = new_frame(ARM_STATE_DTYPE)
-        frame["qpos"][0] = qpos
-        frame["qvel"][0] = qvel
-        frame["tau"][0] = tau
-        frame["eef_pos"][0] = eef_pos
-        frame["eef_rot6d"][0] = eef_rot6d
-        frame["error_code"][0] = int(error_code)
-        frame["connected"][0] = 1 if arm_connected else 0
-        frame["mode"][0] = 6
-        frame["tracking_err"][0] = tracking_err
-        frame["timestamp"][0] = _state_ts
-        shared.arm_state_ring.write(frame)
+        _frame["qpos"][0] = qpos
+        _frame["qvel"][0] = qvel
+        _frame["tau"][0] = tau
+        _frame["eef_pos"][0] = eef_pos
+        _frame["eef_rot6d"][0] = eef_rot6d
+        _frame["error_code"][0] = int(error_code)
+        _frame["connected"][0] = 1 if arm_connected else 0
+        _frame["mode"][0] = getattr(arm, "mode", 6)
+        _frame["tracking_err"][0] = tracking_err
+        _frame["timestamp"][0] = _state_ts
+        shared.arm_state_ring.write(_frame)
 
         # Rate limit
         limiter.wait()
@@ -533,7 +451,7 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
     if waypoints is not None and len(waypoints) > 0:
         for _wp in waypoints:
             if shared is not None:
-                if not shared.is_running.value:
+                if not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT:
                     return
                 shared.arm_heartbeat_s.value = time.monotonic()
             try:
@@ -541,9 +459,21 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
             except Exception:
                 break
             time.sleep(_cfg.homing_step_interval_s)
+    elif waypoints is not None and len(waypoints) == 0:
+        # Empty (0,7) array = sentinel from plan_joint_home_path: no safe path
+        # to home exists.  Hold position — do NOT fall back to raw linear
+        # interpolation (which has zero collision checking).
+        logger.warning("_planned_homing: no safe path to home — holding position")
+        return
 
     # ── Stage 2: converge to exact home_qpos (fine positioning) ──
-    if shared is not None and not shared.is_running.value:
+    # Stage 2 does its own linear interpolation from current→home without
+    # collision checking.  This is safe because Stage 1 waypoints have already
+    # brought the arm close to home (typically <10° remaining), and the home
+    # pose is a neutral configuration far from the body and table.  The
+    # convergence check below (homing_convergence_rad ≈ 1°) further limits the
+    # interpolation range.
+    if shared is not None and (not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT):
         return
 
     # Re-read current position — Stage 1 may have moved the arm.
@@ -569,7 +499,7 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
     steps = max(int(_total_time_s / _cfg.homing_step_interval_s), 10)
     for i in range(1, steps + 1):
         if shared is not None:
-            if not shared.is_running.value:
+            if not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT:
                 break
             shared.arm_heartbeat_s.value = time.monotonic()
         wp = current + (i / steps) * (_home - current)

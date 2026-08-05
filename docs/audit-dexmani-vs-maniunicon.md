@@ -27,7 +27,7 @@ DexMani 和 ManiUniCon 均采用**多进程 + 共享内存**架构进行机器�
 **关键数字：**
 - 28 个 fact-check claim 中 23 个确认、3 个修正、0 个推翻
 - 发现 48 项问题（P0: 6, P1: 10, P2: 9, P3: 10, P4: 12）
-- **P4 全部 12 项已修复**（2026-08-05，9 文件 ~100 行），P0-P3 待后续
+- **P4 全部 12 项 + P3 8/10 项 + P2 3/9 项已修复**（2026-08-05，合计 23/48），P0-P1 + 剩余待后续
 - DexMani 在 17 个架构维度优于 ManiUniCon
 
 ---
@@ -61,9 +61,13 @@ TorchModelPolicy.run():
 
 **差距本质：** DexMani 的策略进程是"VR→IK 转换器"，不是"策略推理器"。
 
-### 1.2 RingBuffer k-帧历史 — 基础设施缺失
+### 1.2 RingBuffer k-帧历史 — ✅ 已修复（2026-08-05）
 
-ManiUniCon 的 `SharedMemoryRingBuffer.get_last_k(k)` 返回 k 帧历史窗口，是 observation window 的基础设施。DexMani 的 `SeqlockRingBuffer` 仅支持 `read_latest()`（读最新 1 帧）。要实现 k-帧历史，需在 Policy 进程中维护额外 FIFO 缓存。
+ManiUniCon 的 `SharedMemoryRingBuffer.get_last_k(k)` 返回 k 帧历史窗口，是 observation window 的基础设施。
+**DexMani 现已实现等价功能：** `SeqlockRingBuffer.get_last_k(k)` — 独立 seqlock 验证每帧、最新优先遍历 + 严格序列匹配检测覆盖、覆盖时早停。
+配套 `read_arm_state_k()` / `read_hand_state_k()` 便捷封装在 `shared_storage.py`。
+State ring maxlen 3→8（100ms→266ms 覆盖），支持 ≤8 帧观察窗口。
+16 单元测试覆盖空 ring、wrap-around、并发 writer、覆盖检测等边界情况。
 
 ### 1.3 建议：Phase 2 部署架构
 
@@ -92,7 +96,7 @@ ModelPolicy(mp.Process):
 | 多 key 支持 | 一个 ring 多个命名数组 | 单一 dtype |
 | 容量计算 | `get_time_budget` + `put_desired_frequency` 自动 | 手动指定 maxlen |
 | **无撕裂读** | 无 seqlock — 依赖时序假设 | ✅ **Seqlock 保护** — x86_64 TSO + aligned uint64 原子写 |
-| **k-帧历史** | `get_last_k(k)` ✅ | `read_latest()` 仅 1 帧 ❌ |
+| **k-帧历史** | `get_last_k(k)` ✅ | ✅ **`get_last_k(k)`** — 独立 seqlock + 严格序列匹配 + 覆盖检测早停 |
 | Queue | `SharedMemoryQueue` + `get_all()` | `mp.Queue`(maxsize=2) |
 
 ### 2.2 相机数据路径
@@ -141,7 +145,7 @@ ManiUniCon 无统一恢复计数或 FAULT 升级模式。
 
 ### 3.3 独有安全机制对比
 
-**DexMani 有而 ManiUniCon 无：** 5 进程心跳+Supervisor、estop_request 标志、连续恢复计数器、手部 qpos_stale 检测、速度前馈补偿、启动前状态发布、录制 atexit 安全网、手部 send-error watchdog、手部清理前归位。
+**DexMani 有而 ManiUniCon 无：** 5 进程心跳+Supervisor、estop_request 标志、连续恢复计数器、手部 qpos_stale 检测、启动前状态发布、录制 atexit 安全网、手部 send-error watchdog、手部清理前归位。
 
 **ManiUniCon 有而 DexMani 无：** `RobotInterface.validate_action()` 进程内裁剪、workspace bounds 后重算 IK、抽象安全接口（is_error/clear_error/stop）。
 
@@ -207,17 +211,23 @@ ManiUniCon 仅记录原始 state + action + camera，无任何逐帧诊断或质
 
 完整"先 hand home poll → 再 arm home queue + wait convergence"序列出现在 policy 的 3 处 + `_post_loop_home` 的 hand 部分 + `_post_loop_home` 的 arm 部分。这是本仓库重复度最高的模式。
 
-### 5.4 🟡 ✅ 手部 Tactile 重复读取
+### 5.4 🟡 ✅ 手部 Tactile 重复读取 ✅ 已修复
 
-`policy/vr_teleop_policy.py`：`_read_hand_tactile(shared)` 在 Line 761（主循环顶部）和 Line 1031（recording_active 分支内）各调用一次。**修正：** Line 761 的读取服务于 held-frame 录制路径（`_record_held_frame`），不完全浪费。但当 recording_active=True 时，Line 1031 覆盖 Line 761 的结果，held-frame 路径用 Line 761 的值，active-frame 路径用 Line 1031 的值。
+`policy/vr_teleop_policy.py`：`_read_hand_tactile(shared)` 在 Line 782（主循环顶部）和 Line 1052（recording_active 分支内）各调用一次。Happy path 时 Line 782 读取被丢弃，Line 1052 重复读同一 ring。Held 帧缺 forward-fill（E02 cache 仅覆盖 active path）。
 
-### 5.5 🟡 ✅ `_safe_arm_queue_put` 超时 500ms
+**修复（2026-08-05）：** forward-fill 上移至 Line 782，删除 Line 1052 双读。统一 held/active 两路径触觉数据一致性，消除 ~14KB 零张量分配。
 
-`policy/vr_teleop_policy.py:1065`：`def _safe_arm_queue_put(shared, action, *, timeout: float = 0.5)`。16Hz 循环（62.5ms/帧）中 500ms = 8 帧。Arm 死亡后 Policy 在 500ms 内继续发手部命令但臂部停滞 → 手-臂异步。应降至 ~200ms（3 帧）。
+### 5.5 🟡 ✅ `_safe_arm_queue_put` 超时 500ms ✅ 已修复
 
-### 5.6 🟡 ⚠️ hand_loop 和 camera_loop 使用裸 `time.sleep()` 而非 `RateManager`
+`policy/vr_teleop_policy.py:1092`：`def _safe_arm_queue_put(shared, action, *, timeout: float = 0.5)`。16Hz 循环（62.5ms/帧）中 500ms = 8 帧。Arm 死亡后 Policy 在 500ms 内继续发手部命令但臂部停滞 → 手-臂异步。
 
-**修正：** 不仅 hand_process.py，camera_process.py 也使用手动 `time.sleep()` 进行速率限制。arm_loop（`RateManager(cfg.arm_loop_hz)`）和 policy_loop（`RateManager(cfg.control_hz)`）使用 RateManager。hand_process 和 camera_process 使用 simple `elapsed = monotonic() - last_ts; sleep(interval - elapsed); last_ts = monotonic()` 模式，不补偿 overshoot。
+**修复（2026-08-05）：** 降至 0.2s（3 帧）。arm_loop C22/C24/C31 恢复 ~200ms + 排空 66ms = 266ms 最坏窗口，0.2s 刚好覆盖。False-positive 触发干净 shutdown（非 FAULT）。
+
+### 5.6 🟡 ⚠️ hand_loop 和 camera_loop 使用裸 `time.sleep()` 而非 `RateManager` ✅ 已修复
+
+**原状：** hand_process.py 和 camera_process.py 使用手动 `elapsed = monotonic() - last_ts; sleep(interval - elapsed); last_ts = monotonic()` 模式。arm_loop 和 policy_loop 已使用 RateManager（绝对截止时间调度 + 混合 busy-wait + 过载检测）。
+
+**修复（2026-08-05）：** hand_loop（30Hz, <1ms 工作）和 camera_loop（16Hz, ~40ms 点云）均迁移到 `RateManager`。统一 4 个进程的时序机制，过载检测提供性能回归早期预警。
 
 ### 5.7 🟡 ✅ `gc.disable()` 全会话禁用 GC
 
@@ -379,36 +389,39 @@ ManiUniCon 仅记录原始 state + action + camera，无任何逐帧诊断或质
 1. **SeqlockRingBuffer** — 真正的无撕裂读（x86_64 TSO + aligned uint64 原子写），vs ManiUniCon 的时间假设方案
 2. **四状态安全状态机** — 形式化 DISARMED→ARMED→RUNNING→FAULT + 显式转换表 + 写所有权分离
 3. **5 进程心跳 + Supervisor** — 每进程独立心跳 + 10Hz 监控 + 可配置超时 → FAULT
-4. **速度前馈补偿** — 逐关节 lead gain + 方向守卫 + hold-tick 不累积（ManiUniCon 无等价物）
-5. **手部 qpos_stale 检测** — 驱动板锁定检测 + 断连重置 gap-jump 防护
-6. **触觉力录制** — 5×120×3 阵列 + 稀疏写入（仅接触时写入 ring），ManiUniCon 无触觉硬件
-7. **录制元数据丰富度** — Schema v11 + 逐帧诊断 + 16 质量标志 + 双命令流 + serial 验证 extrinsics
-8. **MP4 硬件编码** — 流式 H.264，零停止耗时，vs 存原始帧
-9. **原子化 Episode 最终化** — 临时目录 + rename + atexit 安全网 + 跨设备 copytree fallback
-10. **RateManager** — 混合 sleep+busy-wait 绝对截止时间调度，<1ms 误差
-11. **ThrottledWarner** — 频率限制日志防洪水
-12. **生产级 PointCloud 管道** — depth gate + edge filter + voxel downsample + FPS 固定尺寸 + radius outlier removal
-13. **IKCandidateManager** — 多 seed 生成 → 多 gate 过滤 → 加权评分 → canonicalization（k±1 扩展防 2π wraparound）
-14. **ArmWristMapper** — heading-dependent position + heading-independent rotation + per-frame spike gate（~30°/frame）+ total-from-reset rotation cap + continuous quat tracking
-15. **XHand 驱动质量**（`robot/xhand.py`） — 两阶段 EtherCAT 枚举、触觉 bias 计算、Stub 模式优雅降级、板级错误传播
-16. **CollisionModel** — 7-DOF ~30μs / 19-DOF ~35μs 自碰撞检测 + pybind11 错误 fallback
-17. **CLAUDE.md + memory/ 知识管理体系** — ~400 行架构文档 + ~25 个设计决策/bug 根因记录
+4. **手部 qpos_stale 检测** — 驱动板锁定检测 + 断连重置 gap-jump 防护
+5. **触觉力录制** — 5×120×3 阵列 + 稀疏写入（仅接触时写入 ring），ManiUniCon 无触觉硬件
+6. **录制元数据丰富度** — Schema v11 + 逐帧诊断 + 16 质量标志 + 双命令流 + serial 验证 extrinsics
+7. **MP4 硬件编码** — 流式 H.264，零停止耗时，vs 存原始帧
+8. **原子化 Episode 最终化** — 临时目录 + rename + atexit 安全网 + 跨设备 copytree fallback
+9. **RateManager** — 混合 sleep+busy-wait 绝对截止时间调度，<1ms 误差
+10. **ThrottledWarner** — 频率限制日志防洪水
+11. **生产级 PointCloud 管道** — depth gate + edge filter + voxel downsample + FPS 固定尺寸 + radius outlier removal
+12. **IKCandidateManager** — 多 seed 生成 → 多 gate 过滤 → 加权评分 → canonicalization（k±1 扩展防 2π wraparound）
+13. **ArmWristMapper** — heading-dependent position + heading-independent rotation + per-frame spike gate（~30°/frame）+ total-from-reset rotation cap + continuous quat tracking
+14. **XHand 驱动质量**（`robot/xhand.py`） — 两阶段 EtherCAT 枚举、触觉 bias 计算、Stub 模式优雅降级、板级错误传播
+15. **CollisionModel** — 7-DOF ~30μs / 19-DOF ~35μs 自碰撞检测 + pybind11 错误 fallback
+16. **CLAUDE.md + memory/ 知识管理体系** — ~400 行架构文档 + ~25 个设计决策/bug 根因记录
 
 ---
 
 ## 13. 优先级总表
 
-> **2026-08-05 更新：P4（12 项）已全部修复，P3 8/10 已修复。**
-> P4: 9 文件 ~100 行。P3: 4 文件 ~135 行（L04 删除 gc.disable/enable、L05 eef_quat_wxyz→rot6d_to_quat_wxyz、L06 transition() 注释、L07 SIGTERM handler、C01 __post_init__ ValueError、C02 load_config_json + --config、T02 .pre-commit-config.yaml、E01 FK 优化: hoist compose_pose + dedup rot6d_to_quat_wxyz → ~25% 加速）。P3 剩余 2 项。
+> **2026-08-05 更新：P4（12 项）全部修复，P3 8/10 已修复，P2 3/9 已修复。**
+> P2: 1 文件 ~10 行（L01 合并 tactile 双读 + held 帧 forward-fill、L02 timeout 0.5→0.2s）+ 2 文件 ~12 行（L03 hand_loop+camera_loop→RateManager）。P2 剩余 6 项 skip/defer（M11-M16）。
 
 | 优先级 | ID | 项目 | 类别 | 状态 |
 |---|---|---|---|---|
 | **P0** | 1.1-1.5 | 策略推理架构（ModelPolicy + Wrapper + 同步协议） | 部署能力 | 待定 |
-| **P1** | 5.1-5.3 | 提取重复归位/retargeter reset/联合归位 | 可维护性 | 待定 |
-| **P1** | — | HDF5→LeRobot 导出工具 | 训练管道 | 待定 |
-| **P2** | 5.4 | 移除 tactile 重复读取（合并两个 call site） | 效率 | 待定 |
-| **P2** | 5.5 | `_safe_arm_queue_put` timeout 0.5s→0.2s | 故障检测 | 待定 |
-| **P2** | 5.6 | hand_loop + camera_loop 迁移到 RateManager | 一致性 | 待定 |
+| **P0** | **M05** | **get_last_k(k) + state ring maxlen 3→8** | **基础设施** | **✅ 已修复 (2026-08-05)** |
+| **P1** | 5.1-5.3 | 提取重复归位/retargeter reset/联合归位 | 可维护性 | **✅ 已修复 (2026-08-05)** |
+| **P1** | — | HDF5→LeRobot 导出工具 | 训练管道 | 待处理 |
+| **P1** | — | HDF5→LeRobot 导出工具 | 训练管道 | 待处理 |
+| **P1** | — | 多 Episode 合并、自动质量评估、多相机、单元测试 | 基础设施 | 待处理 |
+| **P2** | 5.4 | 移除 tactile 重复读取（合并两个 call site） | 效率 | ✅ 已修复 |
+| **P2** | 5.5 | `_safe_arm_queue_put` timeout 0.5s→0.2s | 故障检测 | ✅ 已修复 |
+| **P2** | 5.6 | hand_loop + camera_loop 迁移到 RateManager | 一致性 | ✅ 已修复 |
+| **P2** | M11-M16 | validate_action / RobotInterface ABC / 分层配置 / 遥测 / CI/CD / README | 基础设施 | ⏭️ skip/defer |
 | **P3** | 5.7 | 评估 gc.disable() 实际内存影响 | 内存安全 | ✅ 已修复 |
 | **P3** | 5.8 | 修复 eef_quat_wxyz 记录实际值 | 数据质量 | ✅ 已修复 |
 | **P3** | 5.9 | 安全状态机 transition() 加锁（低优先级） | 并发安全 | ✅ 已修复（注释） |

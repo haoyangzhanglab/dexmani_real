@@ -12,6 +12,8 @@ import multiprocessing as mp
 from dataclasses import dataclass, field
 from typing import Any
 
+import time
+
 import numpy as np
 
 from dexmani_real.config.defaults import camera, policy
@@ -46,8 +48,8 @@ class SharedStorageConfig:
     # ── Ring capacities ──
     camera_ring_maxlen: int = 5
     vr_ring_maxlen: int = 8
-    arm_state_ring_maxlen: int = 3
-    hand_state_ring_maxlen: int = 3
+    arm_state_ring_maxlen: int = 8
+    hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
 
@@ -362,3 +364,74 @@ def write_hand_cmd(shared: "SharedStorage", qpos: "np.ndarray") -> None:
     frame = new_frame(HAND_CMD_DTYPE)
     frame["qpos_cmd"][0] = np.asarray(qpos, dtype=np.float64).ravel()[:12]
     shared.hand_cmd_ring.write(frame)
+
+
+def hand_home_converge(
+    shared: SharedStorage,
+    home_qpos: np.ndarray,
+    *,
+    timeout_s: float = 5.0,
+    tol_deg: float = 5.0,
+    heartbeat: bool = False,
+    check_is_running: bool = True,
+    verbose: bool = True,
+) -> "tuple[bool, np.ndarray | None]":
+    """Poll hand_state_ring until hand converges to home_qpos.
+
+    Returns ``(reached, final_qpos_or_none)``.  *final_qpos* is the last
+    measured qpos on success, ``None`` on timeout.  Callers should update
+    their ``prev_hand_qpos`` from *final_qpos* when not ``None``.
+
+    *heartbeat* writes ``shared.policy_heartbeat_s`` each tick.
+    *check_is_running* adds ``shared.is_running`` to the while condition.
+    *verbose* prints progress and timeout warnings.
+    """
+    tol = np.deg2rad(tol_deg)
+    deadline = time.monotonic() + timeout_s
+    first = True
+
+    while time.monotonic() < deadline:
+        if check_is_running and not shared.is_running.value:
+            break
+        if heartbeat:
+            shared.policy_heartbeat_s.value = time.monotonic()
+        write_hand_cmd(shared, home_qpos)
+        hs = read_hand_state(shared)
+        if hs is not None:
+            current = np.asarray(hs["qpos"][0], dtype=np.float64)
+            if np.all(np.isfinite(current)):
+                err = float(np.max(np.abs(current - home_qpos)))
+                if err < tol:
+                    if verbose:
+                        print("  hand: home reached", flush=True)
+                    return True, current.copy()
+                if verbose and first:
+                    print(f"  hand: homing... (max_err={np.rad2deg(err):.0f}°)", flush=True)
+                    first = False
+        time.sleep(0.05)
+
+    if verbose:
+        print(f"  hand: home settle timeout after {timeout_s:.0f}s — proceeding", flush=True)
+    return False, None
+
+
+def read_arm_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
+    """Read up to *k* most recent arm state frames (oldest-first).
+
+    Returns a list of raw structured arrays (each shaped ``(1,)`` matching
+    :data:`ARM_STATE_DTYPE`).  May be shorter than *k* — callers must
+    handle ``len(result) < k`` gracefully.
+    """
+    frames = shared.arm_state_ring.get_last_k(k)
+    return [data for data, _ts, _seq in frames]
+
+
+def read_hand_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
+    """Read up to *k* most recent hand state frames (oldest-first).
+
+    Returns a list of raw structured arrays (each shaped ``(1,)`` matching
+    :data:`HAND_STATE_DTYPE`).  May be shorter than *k* — callers must
+    handle ``len(result) < k`` gracefully.
+    """
+    frames = shared.hand_state_ring.get_last_k(k)
+    return [data for data, _ts, _seq in frames]

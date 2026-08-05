@@ -95,7 +95,7 @@ _cfg = CameraCalibConfig()
 # the data-collection entry points.  The Y bounds are slightly tighter than
 # the default config (-0.45 vs -0.50) because the calibration rig (ArUco
 # marker on end-effector + fixed tripod camera) has a narrower useful range.
-from dexmani_real.config.defaults import policy
+from dexmani_real.config.defaults import arm, policy
 WORKSPACE_BOUNDS = policy.workspace.as_array()
 WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
 WORKSPACE_BOUNDS[1, 1] = 0.45   # y_max: tighter for calibration rig
@@ -816,13 +816,13 @@ def main():
             if keys.is_pressed("r"):
                 print("\n  R: return_home")
                 _home_qpos = np.array(ArmLoopConfig().home_qpos, dtype=np.float64)
-                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner)
+                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
                 if _waypoints is not None and len(_waypoints) > 0:
                     print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
                 elif _waypoints is not None and len(_waypoints) == 0:
-                    print(f"  planned homing: already close to home, skipping")
+                    print(f"  planned homing: NO SAFE PATH — holding position")
                 else:
-                    print(f"  plan_joint_home_path returned None — falling back to joint-space interpolation")
+                    print(f"  planned homing: already close to home")
                 shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                 # Wait for qpos to converge to home (arm stays there after homing).
                 _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
