@@ -52,14 +52,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, camera, hand, policy, safety, vr
 from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
-from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
+from dexmani_real.robot.arm_loop import ArmLoopConfig
+from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
+from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
 from dexmani_real.shm.shared_storage import (
-    HOME_SENTINEL, SharedStorage, read_arm_state, read_hand_state, write_hand_cmd,
+    HOME_SENTINEL,
+    SharedStorage,
+    read_arm_state,
+    read_hand_state,
+    write_hand_cmd,
 )
-from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -78,8 +83,14 @@ def main() -> None:
     parser.add_argument("--acc", type=float, default=900.0, help="Joint max acceleration (°/s², default: 900)")
     parser.add_argument("--speed", type=float, default=120.0, help="Joint max speed (°/s, default: 120)")
     parser.add_argument("--no-hand", action="store_true", help="Disable hand retargeting (hold-position only)")
+    parser.add_argument("--config", type=str, default=None, help="JSON file with config overrides (flat fields only)")
     parser.add_argument("--print-config", action="store_true", help="Print all config values and exit")
     args = parser.parse_args()
+
+    if args.config:
+        from dexmani_real.config.defaults import load_config_json
+
+        load_config_json(args.config)
 
     if args.print_config:
         import dataclasses

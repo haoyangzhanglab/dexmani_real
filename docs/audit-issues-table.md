@@ -32,14 +32,14 @@
 | **P2** | M14 | 🔵 | — | **无结构化遥测导出** | — | 无 Prometheus/StatsD metrics；无运行时 CPU/内存/GPU 监控 | 至少增加 per-process RSS 监控 + 日志 | 缺失机制 |
 | **P2** | M15 | 🔵 | — | **无 CI/CD** | — | 无 GitHub Actions；无自动化 mypy/lint/test | 最小化：`mypy dexmani_real/` + `black --check` | 缺失机制 |
 | **P2** | M16 | 🔵 | — | **无 README** | — | 无安装说明、快速开始、硬件要求文档 | 基于 CLAUDE.md 内容编写精简 README | 文档 |
-| **P3** | L04 | 🟡 | ✅ | **gc.disable() 全会话禁用 GC** | `policy/vr_teleop_policy.py:322` | `gc.disable()` 在 16Hz loop 入口；`gc.collect()` 仅在 Line 337（录制保存后）+ Line 657（新 episode 前）；长时采集可能累积循环引用 | 评估实际内存影响；考虑 per-N-frames 手动 gc.collect() | 逻辑缺陷 |
-| **P3** | L05 | 🟡 | ✅ | **eef_quat_wxyz 硬编码 identity** | `policy/vr_teleop_policy.py:1360` | 每帧 `[1,0,0,0]`；实际方向在 `eef_rot6d`（Line 1361）。HDF5 每帧浪费 32B 无效数据 | 从 `eef_rot6d` 转换或删除冗余字段 | 数据质量 |
-| **P3** | L06 | 🟡 | ✅ | **安全状态机 transition() 理论竞争** | `robot/safety.py:61-83` | read-modify-write 无锁；实践中安全（Main/Policy 合法转换集不相交），但非零风险 | 加 `mp.Lock` 或改用 `compare_and_swap` 语义 | 并发安全 |
-| **P3** | L07 | 🟡 | ✅ | **EpisodeRecorder daemon 线程信号安全** | `recording/episode_recorder.py:658-664` | `stop_episode()` 在 daemon 线程执行 HDF5 写入；SIGTERM 直接杀 daemon → HDF5 截断。atexit 仅覆盖正常 exit() | 注册 SIGTERM 信号处理器，非 daemon join stop_thread | 数据完整性 |
-| **P3** | E01 | 🟡 | ✅ | **每帧 World-Frame Fingertip Position** | `policy/vr_teleop_policy.py:1337-1353` | Hand FK + 5 次 compose_pose + rot6d 转换，每帧无条件计算（含 held 帧）。估计 ~1ms/frame | 降采样到 4Hz 或仅在 recording_active 时计算 | 效率 |
-| **P3** | C01 | 🟡 | — | **无运行时配置验证** | `config/defaults.py` | Frozen dataclass 依赖 Python 类型提示，无运行时范围/有效性检查 | 在 `__post_init__` 增加 assert 或 pydantic validator | 配置 |
-| **P3** | C02 | 🟡 | — | **配置不可热加载** | `config/defaults.py` | 修改配置需改 Python 代码；无法 YAML/JSON 文件覆盖 | 支持 JSON/YAML 文件加载覆盖 dataclass 默认值 | 配置 |
-| **P3** | T02 | 🟡 | — | **无 pre-commit hooks** | — | 无自动格式化/类型检查门禁；依赖开发者手动运行 black/isort/mypy | 添加 `.pre-commit-config.yaml` | 测试 |
+| **P3** | L04 | 🟡 | ✅ | ✅已修复 | **gc.disable() 全会话禁用 GC** | `policy/vr_teleop_policy.py:322` | `gc.disable()` 在 16Hz loop 入口；`gc.collect()` 仅在 Line 337（录制保存后）+ Line 657（新 episode 前）；长时采集可能累积循环引用 | **删除 gc.disable()/gc.enable()** — numpy 引用计数管理主导分配，GC 在 62.5ms 帧预算内不会触发（ManiUniCon 无此类禁用） | 逻辑缺陷 |
+| **P3** | L05 | 🟡 | ✅ | ✅已修复 | **eef_quat_wxyz 硬编码 identity** | `policy/vr_teleop_policy.py:1367` | 每帧 `[1,0,0,0]`；实际方向在 `eef_rot6d`（Line 1368）。HDF5 每帧浪费 32B 无效数据 | `rot6d_to_quat_wxyz(eef_rot6d)` + NaN guard（避免 arm_state=None 时 NaN quat） | 数据质量 |
+| **P3** | L06 | 🟡 | ✅ | ✅已修复 | **安全状态机 transition() 理论竞争** | `robot/safety.py:61-83` | read-modify-write 无锁；实践中安全（Main/Policy 合法转换集不相交），但非零风险 | **仅注释** — 写权分离 + FAULT 自愈（supervisor 100ms 重断言）+ arm 先停后报，加 mp.Lock 属于过度工程 | 并发安全 |
+| **P3** | L07 | 🟡 | ✅ | ✅已修复 | **EpisodeRecorder daemon 线程信号安全** | `recording/episode_recorder.py:658-664` | `stop_episode()` 在 daemon 线程执行 HDF5 写入；SIGTERM 直接杀 daemon → HDF5 截断。atexit 仅覆盖正常 exit() | SIGTERM handler 设 flag → 主循环退出 → finally 块复用已有 `_stop_recording` + `join_stop` 完成安全刷新 | 数据完整性 |
+| **P3** | E01 | 🟡 | ✅ | ✅已修复 | **每帧 World-Frame Fingertip Position** | `policy/vr_teleop_policy.py:1362-1382` | Hand FK + compose_pose×10 + rot6d×2，每帧 ~0.4ms。内层 compose_pose 循环内重复计算 5×，rot6d 重复计算 2× | Hoist `T_world_handbase` 出循环（省 4× compose_pose）+ dedup `rot6d_to_quat_wxyz`（省 1×）→ ~0.3ms/帧，减少 ~25% | 效率 |
+| **P3** | C01 | 🟡 | — | ✅已修复 | **无运行时配置验证** | `config/defaults.py` | Frozen dataclass 依赖 Python 类型提示，无运行时范围/有效性检查 | 3× `__post_init__` assert（ArmParams: joint limits + home within limits; PolicyParams: control_hz > 0 + EMA in [0,1]; SafetyParams: heartbeats > 0 + recoveries > 0） | 配置 |
+| **P3** | C02 | 🟡 | — | ✅已修复 | **配置不可热加载** | `config/defaults.py` | 修改配置需改 Python 代码；无法 YAML/JSON 文件覆盖 | `load_config_json()` 用 `object.__setattr__` 原地突变 frozen 单例（覆盖对所有 `from defaults import` 引用可见）；`--config` CLI flag | 配置 |
+| **P3** | T02 | 🟡 | — | ✅已修复 | **无 pre-commit hooks** | — | 无自动格式化/类型检查门禁；依赖开发者手动运行 black/isort/mypy | 添加 `.pre-commit-config.yaml`（black + isort + mypy + trailing-ws） | 测试 |
 | **P4** | L08 | 🟢 | ✅ | ✅已修复 | **`_RECOVERY_MAX` 重复定义** | `arm_loop.py:20,91` | 模块级常量与 config 值相同但无引用 | arm_loop import `safety`，引用 `safety.max_consecutive_recoveries` | 可维护性 |
 | **P4** | L09 | 🟢 | ✅ | ✅已修复 | **arm.error_code SDK 属性误解** | `arm_loop.py:437` | 原以为需缓存；agent 确认 SDK property 读后台缓存，纳秒级 | 加注释说明 SDK 已缓存，无代码变更 | 微优化 |
 | **P4** | L10 | 🟢 | ✅ | ✅已修复 | **Camera 16Hz 硬编码** | `camera_process.py:17,145,148` | 字面量 1/16.0 与 policy.control_hz 脱钩 | `import policy`，`interval = 1.0 / policy.control_hz` | 正确性 |
@@ -62,9 +62,9 @@
 | **P0** | 6 | 0 | 全部为缺失机制（策略推理部署基础设施） |
 | **P1** | 10 | 0 | 3 代码重复 + 4 缺失机制 + 1 训练管道 + 1 多相机 + 1 测试 |
 | **P2** | 9 | 0 | 3 逻辑/效率 + 6 缺失机制/基础设施 |
-| **P3** | 10 | 0 | 4 逻辑/数据质量 + 2 效率 + 2 配置 + 1 测试 + 1 并发 |
+| **P3** | 10 | **8** ✅ | 4 逻辑/数据质量 + 2 效率 + 2 配置 + 1 测试 + 1 并发。剩余 2 项待处理 |
 | **P4** | **12** | **12** ✅ | 6 可维护性 + 2 效率/微优化 + 1 正确性 + 1 数据完整性 + 1 可观测性 + 1 存储泄漏 + 1 防御性编程 + 1 配置 + 1 缺失机制（与 L13 合并） |
-| **合计** | **48** | **12** | P4 全部修复（9 文件 ~100 行），P0-P3 待后续 |
+| **合计** | **48** | **20** | P4 全部修复 + P3 8/10 已修复（2026-08-05），P0-P2 + P3 剩余待后续 |
 
 ### 按严重度
 

@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shared sub-structures
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -155,6 +154,18 @@ class ArmParams:
     def max_joint_acceleration_rad_per_s2(self) -> float:
         return float(np.deg2rad(self.max_joint_acceleration_deg_per_s2))
 
+    def __post_init__(self):
+        if len(self.joint_limit_lower) != 7 or len(self.joint_limit_upper) != 7:
+            raise ValueError("joint_limit_lower/upper must have 7 elements")
+        if not all(lo <= hi for lo, hi in zip(self.joint_limit_lower, self.joint_limit_upper)):
+            raise ValueError("joint_limit_lower must be <= joint_limit_upper")
+        if not all(lo <= q <= hi for q, lo, hi in zip(self.home_qpos, self.joint_limit_lower, self.joint_limit_upper)):
+            raise ValueError("home_qpos must be within joint limits")
+        if not (0 < self.max_joint_velocity_deg_per_s <= 500):
+            raise ValueError(f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} out of range (0, 500]")
+        if not (0 < self.max_joint_acceleration_deg_per_s2 <= 50000):
+            raise ValueError(f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} out of range (0, 50000]")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Hand parameters (XHand, 12-DOF)
@@ -240,6 +251,14 @@ class PolicyParams:
     hand_ramp_frame_count: int = 16  # smoothstep ramp (~1s @ 16Hz)
     hand_disconnect_timeout_s: float = 1.0
 
+    def __post_init__(self):
+        if self.control_hz <= 0:
+            raise ValueError(f"control_hz={self.control_hz} must be > 0")
+        if not (0.0 <= self.ema.alpha_pos <= 1.0):
+            raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
+        if not (0.0 <= self.ema.alpha_rot <= 1.0):
+            raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VR receiver parameters
@@ -279,6 +298,14 @@ class SafetyParams:
     # Supervisor check rate (Main)
     supervisor_hz: float = 10.0
 
+    def __post_init__(self):
+        if not all(v > 0 for v in self.heartbeat_timeouts.values()):
+            raise ValueError("heartbeat timeouts must be > 0")
+        if self.max_consecutive_recoveries <= 0:
+            raise ValueError(f"max_consecutive_recoveries={self.max_consecutive_recoveries} must be > 0")
+        if self.supervisor_hz <= 0:
+            raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Camera parameters
@@ -304,5 +331,49 @@ policy = PolicyParams()
 vr = VRParams()
 safety = SafetyParams()
 camera = CameraParams()
+
+
+def load_config_json(path: str) -> None:
+    """Override module-level config singletons from a JSON file.
+
+    Mutates the existing singletons in-place (via ``object.__setattr__``)
+    so that **all** references — including ``from defaults import arm``
+    captured before this call — see the new values.
+
+    Only **flat** (non-dataclass) fields are supported.  Nested dataclass
+    fields (``ema``, ``workspace``, ``homing``, etc.) must be updated via
+    Python code.
+
+    Example JSON::
+
+        {"arm": {"max_joint_velocity_deg_per_s": 150}, "policy": {"control_hz": 20}}
+
+    Keys are singleton names (``arm``, ``hand``, ``policy``, ``vr``,
+    ``safety``, ``camera``).  Values are flat field overrides.
+    """
+    import dataclasses
+    import json
+    import sys
+
+    from dexmani_real.utils.log import get_logger
+
+    _log = get_logger(__name__)
+
+    with open(path) as f:
+        data = json.load(f)
+    mod = sys.modules[__name__]
+    for name, overrides in data.items():
+        original = getattr(mod, name)
+        for k, v in overrides.items():
+            if not hasattr(original, k):
+                raise TypeError(f"'{type(original).__name__}' has no field '{k}'")
+            current = getattr(original, k)
+            if dataclasses.is_dataclass(current) and not isinstance(v, type(current)):
+                raise TypeError(
+                    f"Field '{k}' of '{name}' is a nested dataclass ({type(current).__name__}) — "
+                    f"override not supported via JSON (edit defaults.py)"
+                )
+            object.__setattr__(original, k, v)
+        _log.info("config: %s overridden with %s", name, list(overrides.keys()))
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import json
+import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,27 +18,25 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.path_utils import plan_joint_home_path
-from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import arm, hand, policy
-from dexmani_real.recording.episode_recorder import EpisodeRecorder
+from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.hand_kinematics import HandKinematics
+from dexmani_real.planning.path_utils import plan_joint_home_path
+from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
+from dexmani_real.policy.loop_timing import StageTimer
+from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import (
-    HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage,
-    read_arm_state as _read_arm_state,
-    read_hand_state as _read_hand_state,
-    write_hand_cmd as _write_hand_cmd,
-)
-from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage
+from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state
+from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
+from dexmani_real.shm.shared_storage import write_hand_cmd as _write_hand_cmd
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
+from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.hand_retarget import XHandRetargeter
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import ThrottledWarner, get_logger
-from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 
@@ -318,11 +317,32 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     _last_target_eef_rot6d = np.full(6, np.nan)
     _last_tactile_data: np.ndarray | None = None  # forward-fill cache for held-frame tactile
 
+    # ── GC strategy ──
+    # Automatic cyclic GC is left enabled (2026-08-05 audit).  The hot path
+    # allocates mostly numpy arrays (refcounted, not cyclic), so GC thresholds
+    # are rarely reached.  The two manual gc.collect() calls at episode
+    # boundaries (save-completion + new-episode) serve as explicit hints.
+    # ManiUniCon also runs without gc.disable() at similar rates.
+
+    # ── SIGTERM graceful shutdown ──
+    # Policy is spawned via mp.Process; Main calls process.terminate() on
+    # shutdown, which sends SIGTERM.  Default SIGTERM handler kills the
+    # process immediately → daemon stop-thread killed mid-HDF5-write
+    # → truncated HDF5.  We intercept SIGTERM and set a flag so the main
+    # loop exits cleanly through the finally block, which flushes and
+    # joins the recorder daemon.
+    _sigterm_requested = False
+
+    def _on_sigterm(signum: int, frame: object) -> None:
+        nonlocal _sigterm_requested
+        _sigterm_requested = True
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     logger.info("Policy: entering main loop @ %.0f Hz", cfg.control_hz)
 
-    gc.disable()
     try:
-        while shared.is_running.value:
+        while shared.is_running.value and not _sigterm_requested:
             shared.policy_heartbeat_s.value = time.monotonic()
             stage_timer.tick()
             limiter.wait()
@@ -1053,7 +1073,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             stage_timer.mark("rec")
 
     finally:
-        gc.enable()
         if recording_active:
             _stop_recording(recorder, True, save=False)
         recorder.join_stop(timeout=60)
@@ -1340,22 +1359,25 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
     else:
         hand_tactile_force = np.zeros((5, 120, 3), dtype=np.float64)
 
+    # ── EEF quaternion (computed once, used by FK block + return) ──
+    _eef_finite = np.all(np.isfinite(eef_rot6d))
+    eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d) if _eef_finite else np.array([1.0, 0.0, 0.0, 0.0])
+
     # Compute world-frame fingertip positions via hand FK.
     fingertip_pos = nan_array((5, 3))
     if hk is not None and hk.is_ready() and hand_connected and np.all(np.isfinite(hand_qpos)):
         tips_in_handbase = hk.compute_tip_positions_in_handbase(hand_qpos)
-        if np.all(np.isfinite(tips_in_handbase)) and np.all(np.isfinite(eef_pos)):
-            eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
+        if np.all(np.isfinite(tips_in_handbase)) and _eef_finite and np.all(np.isfinite(eef_pos)):
             T_world_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
             T_eef_handbase = Pose(
                 p=T_eef_handbase_pos if T_eef_handbase_pos is not None else np.zeros(3),
                 q=T_eef_handbase_quat_wxyz if T_eef_handbase_quat_wxyz is not None else np.array([1.0, 0.0, 0.0, 0.0]),
             )
-            identity_quat = np.array([1.0, 0.0, 0.0, 0.0])
+            T_world_handbase = compose_pose(T_world_eef, T_eef_handbase)
             tips_world = np.zeros((5, 3), dtype=np.float64)
+            _id_quat = np.array([1.0, 0.0, 0.0, 0.0])
             for i in range(5):
-                tip_in_handbase = Pose(p=tips_in_handbase[i], q=identity_quat)
-                T_world_tip = compose_pose(compose_pose(T_world_eef, T_eef_handbase), tip_in_handbase)
+                T_world_tip = compose_pose(T_world_handbase, Pose(p=tips_in_handbase[i], q=_id_quat))
                 tips_world[i] = T_world_tip.p
             fingertip_pos = tips_world
 
@@ -1364,7 +1386,7 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
         arm_qvel=arm_qvel,
         arm_tau=arm_tau,
         eef_pos=eef_pos,
-        eef_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+        eef_quat_wxyz=eef_quat_wxyz,
         eef_rot6d=eef_rot6d,
         hand_qpos=hand_qpos,
         hand_current=hand_current,

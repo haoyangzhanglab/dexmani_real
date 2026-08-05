@@ -398,7 +398,8 @@ ManiUniCon 仅记录原始 state + action + camera，无任何逐帧诊断或质
 
 ## 13. 优先级总表
 
-> **2026-08-05 更新：P4（12 项）已全部修复。** 9 文件 ~100 行变更。P0-P3 待后续。
+> **2026-08-05 更新：P4（12 项）已全部修复，P3 8/10 已修复。**
+> P4: 9 文件 ~100 行。P3: 4 文件 ~135 行（L04 删除 gc.disable/enable、L05 eef_quat_wxyz→rot6d_to_quat_wxyz、L06 transition() 注释、L07 SIGTERM handler、C01 __post_init__ ValueError、C02 load_config_json + --config、T02 .pre-commit-config.yaml、E01 FK 优化: hoist compose_pose + dedup rot6d_to_quat_wxyz → ~25% 加速）。P3 剩余 2 项。
 
 | 优先级 | ID | 项目 | 类别 | 状态 |
 |---|---|---|---|---|
@@ -408,10 +409,10 @@ ManiUniCon 仅记录原始 state + action + camera，无任何逐帧诊断或质
 | **P2** | 5.4 | 移除 tactile 重复读取（合并两个 call site） | 效率 | 待定 |
 | **P2** | 5.5 | `_safe_arm_queue_put` timeout 0.5s→0.2s | 故障检测 | 待定 |
 | **P2** | 5.6 | hand_loop + camera_loop 迁移到 RateManager | 一致性 | 待定 |
-| **P3** | 5.7 | 评估 gc.disable() 实际内存影响 | 内存安全 | 待定 |
-| **P3** | 5.8 | 修复 eef_quat_wxyz 记录实际值 | 数据质量 | 待定 |
-| **P3** | 5.9 | 安全状态机 transition() 加锁（低优先级） | 并发安全 | 待定 |
-| **P3** | 5.12 | 信号处理器优雅停止 EpisodeRecorder | 数据完整性 | 待定 |
+| **P3** | 5.7 | 评估 gc.disable() 实际内存影响 | 内存安全 | ✅ 已修复 |
+| **P3** | 5.8 | 修复 eef_quat_wxyz 记录实际值 | 数据质量 | ✅ 已修复 |
+| **P3** | 5.9 | 安全状态机 transition() 加锁（低优先级） | 并发安全 | ✅ 已修复（注释） |
+| **P3** | 5.12 | 信号处理器优雅停止 EpisodeRecorder | 数据完整性 | ✅ 已修复 |
 | **P4** | 5.10 | `_RECOVERY_MAX` 去重（arm_loop 引用 safety.max_consecutive_recoveries） | 可维护性 | ✅ 已修复 |
 | **P4** | 5.11 | arm.error_code — agent 确认 SDK 已缓存，不修 | 微优化 | ✅ 已修复（注释） |
 | **P4** | 5.13 | camera 频率从 policy.control_hz 读取 | 正确性 | ✅ 已修复 |

@@ -51,6 +51,23 @@ ALLOWED_TRANSITIONS: dict[tuple[int, int], bool] = {
 def transition(shared: Any, new_state: SafetyState) -> bool:
     """Validate and execute a safety state transition.
 
+    Note:
+        The read-validate-write on ``shared.safety_state`` (``mp.Value('i')``)
+        is **not atomic** — no ``mp.Lock`` protects it.  This is a known
+        TOCTOU window, safe in practice because:
+
+        1. **Write ownership separation** prevents overlapping transitions:
+           Main owns DISARMED↔ARMED / →FAULT; Policy owns ARMED↔RUNNING.
+        2. **FAULT is self-correcting:** the heartbeat supervisor re-asserts
+           FAULT within 100 ms (10 Hz), so any overwrite is transient.
+        3. **Arm is already stopped** before ``error_state`` is set:
+           arm_loop calls ``set_state(4)`` before escalating to FAULT, so
+           no physical motion occurs during the race window.
+
+        Adding ``mp.Lock`` was considered (2026-08-05 audit) and rejected:
+        the overhead for a theoretical race that self-corrects within one
+        supervisor tick is not justified.
+
     Args:
         shared: SharedStorage instance with ``safety_state`` (mp.Value('i')).
         new_state: Target SafetyState.
