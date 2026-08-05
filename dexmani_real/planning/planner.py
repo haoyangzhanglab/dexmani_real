@@ -111,6 +111,25 @@ class XArm7MotionPlanner:
 
         self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
         joint_limits = np.asarray(self.mplib_planner.joint_limits, dtype=np.float64)
+
+        # Cross-check URDF (mplib) limits against defaults.arm (Python config).
+        # They should be identical; divergence indicates a stale hardcoded copy.
+        from dexmani_real.config.defaults import arm as _arm_cfg
+
+        _cfg_lower = np.asarray(_arm_cfg.joint_limit_lower, dtype=np.float64)
+        _cfg_upper = np.asarray(_arm_cfg.joint_limit_upper, dtype=np.float64)
+        if not np.allclose(joint_limits[:, 0], _cfg_lower, atol=1e-3) or not np.allclose(
+            joint_limits[:, 1], _cfg_upper, atol=1e-3
+        ):
+            logger.warning(
+                "URDF joint limits differ from defaults.arm — using URDF values.\n"
+                "  URDF lower:  %s\n  defaults:    %s\n"
+                "  URDF upper:  %s\n  defaults:    %s",
+                joint_limits[:, 0], _cfg_lower, joint_limits[:, 1], _cfg_upper,
+            )
+        else:
+            logger.debug("URDF joint limits match defaults.arm (ok)")
+
         dof = int(joint_limits.shape[0])
         equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) > 2 * np.pi
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
+from dexmani_real.config.defaults import policy
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -142,11 +143,17 @@ def camera_loop(shared: "SharedStorage") -> None:
         zero_pc = np.zeros(pc_shape, dtype=np.float32) if pc_shape else None
 
         shared.camera_ready.set()
-        _logger.info("camera_loop: ready @ 16 Hz (matching policy control_hz)")
+        _logger.info("camera_loop: ready @ %.1f Hz (from policy.control_hz)", policy.control_hz)
 
         # ── Main capture loop ──
-        interval: float = 1.0 / 16.0
+        interval: float = 1.0 / policy.control_hz
         last_ts: float = time.monotonic()
+
+        # Forward-fill cache: when is_recording transitions False→True, the
+        # first ring write uses the most recently computed pointcloud so the
+        # policy never sees a frame with missing pc data (~1 tick old is fine).
+        _last_pc: np.ndarray | None = None
+        _was_recording: bool = False
 
         while shared.is_running.value:
             shared.camera_heartbeat_s.value = time.monotonic()
@@ -168,19 +175,27 @@ def camera_loop(shared: "SharedStorage") -> None:
             # --- pointcloud (only when recording) ---
             # Pointcloud processing (~40ms) is the dominant cost in the pipeline.
             # Computing it every tick — even when no one consumes the data — would
-            # needlessly burn CPU.  The first recording frame computes pointcloud
-            # on-the-spot; TimestampAlignedBuffer handles the alignment.
+            # needlessly burn CPU.  A forward-fill cache (_last_pc) bridges the
+            # cross-process delay between the Policy setting is_recording=True and
+            # the camera loop observing it — the first recorded frame gets the
+            # most recently computed pc (~1 tick old).
             pc: np.ndarray | None = None
+            _recording_now: bool = shared.is_recording.value
 
             # --- write to SharedStorage ring ---
             # Only bridge frames when Policy is recording — avoids sustained SHM
             # writes (~1.6 MB/frame) when nobody is consuming them.
-            if shared.is_recording.value:
+            if _recording_now:
                 if processor is not None:
-                    try:
-                        pc = processor.process(frame.depth, frame.rgb, cam.get_rays())
-                    except Exception:
-                        _logger.warning("camera_loop: pointcloud processing failed", exc_info=True)
+                    # On the first tick after is_recording flips True, forward-fill
+                    # the cached pointcloud to avoid a gap.
+                    if not _was_recording and _last_pc is not None:
+                        pc = _last_pc
+                    else:
+                        try:
+                            pc = processor.process(frame.depth, frame.rgb, cam.get_rays())
+                        except Exception:
+                            _logger.warning("camera_loop: pointcloud processing failed", exc_info=True)
                 try:
                     header, rgb, depth = pack_camera_frame(
                         frame.rgb,  # type: ignore[arg-type]
@@ -198,6 +213,14 @@ def camera_loop(shared: "SharedStorage") -> None:
                     )
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
+
+                # Update forward-fill cache (only when recording — non-recording
+                # ticks don't compute pc, so the cache stays fresh from the last
+                # recording tick).
+                if pc is not None:
+                    _last_pc = pc
+
+            _was_recording = _recording_now
 
             # --- maintain target rate ---
             elapsed = time.monotonic() - last_ts

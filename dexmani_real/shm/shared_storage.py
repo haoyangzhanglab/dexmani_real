@@ -280,27 +280,38 @@ class SharedStorage:
         segment (and the tracker registration) survives until ``unlink()`` is
         called by the creating process.
         """
-        for ring in (
-            self.camera_ring,
-            self.vr_ring,
-            self.arm_state_ring,
-            self.hand_state_ring,
-            self.hand_tactile_ring,
-            self.hand_cmd_ring,
+        _close_errors: list[str] = []
+
+        for ring_name, ring in (
+            ("camera_ring", self.camera_ring),
+            ("vr_ring", self.vr_ring),
+            ("arm_state_ring", self.arm_state_ring),
+            ("hand_state_ring", self.hand_state_ring),
+            ("hand_tactile_ring", self.hand_tactile_ring),
+            ("hand_cmd_ring", self.hand_cmd_ring),
         ):
             try:
                 ring.close()  # type: ignore[attr-defined]
-                ring.unlink()  # type: ignore[attr-defined]
             except Exception:
-                pass
+                _close_errors.append(f"{ring_name}.close() failed")
+
+            try:
+                ring.unlink()  # type: ignore[attr-defined]
+            except FileNotFoundError:
+                pass  # already unlinked by another process — expected
+            except Exception:
+                _close_errors.append(f"{ring_name}.unlink() failed")
 
         try:
             self.arm_action_q.close()
             self.arm_action_q.join_thread()
         except Exception:
-            pass
+            _close_errors.append("arm_action_q cleanup failed")
 
-        logger.info("SharedStorage closed")
+        if _close_errors:
+            logger.warning("SharedStorage close: %d error(s): %s", len(_close_errors), "; ".join(_close_errors))
+        else:
+            logger.info("SharedStorage closed cleanly")
 
 
 def vr_frame_dtype() -> np.dtype:

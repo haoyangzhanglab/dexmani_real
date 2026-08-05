@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.config.defaults import arm as _arm_cfg
+
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
 
@@ -118,9 +120,8 @@ def plan_joint_home_path(
         _home = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
         delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(_home, qpos))))
     else:
-        # Fallback when planner is unavailable: import arm config limits and
-        # wrap manually.  arm.joint_limit_lower/upper mirror the URDF.
-        from dexmani_real.config.defaults import arm as _arm_cfg
+        # Fallback when planner is unavailable: wrap to nearest equivalent using
+        # the arm config limits (which mirror the URDF).
         _home = wrap_nearest_equivalent(
             home_qpos, qpos,
             _arm_cfg.joint_limit_lower, _arm_cfg.joint_limit_upper,

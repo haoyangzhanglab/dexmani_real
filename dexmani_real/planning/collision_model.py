@@ -34,12 +34,20 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 if TYPE_CHECKING:
     from .types import CollisionInfo
 
 logger = get_logger(__name__)
+
+# Home (open-hand) posture — used as the default when _hand_qpos hasn't been set.
+# Zero = clenched fist, which would pass collision checks that the actual open
+# hand would fail.  Values from XHandParams.home_qpos_deg.
+_HAND_HOME_QPOS: np.ndarray = np.deg2rad(
+    np.array([0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0], dtype=np.float64)
+)
+_warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # once per session
 
 # ---------------------------------------------------------------------------
 # Collision URDF / SRDF paths
@@ -190,7 +198,8 @@ class CollisionModel:
         qpos = np.asarray(qpos, dtype=np.float64)
         if self._hand_dof and qpos.shape == (7,):
             if self._hand_qpos is None:
-                return np.concatenate([qpos, np.zeros(_HAND_DOF_COUNT, dtype=np.float64)])
+                _warn_hand_qpos_unset("hand_qpos not set, using home position. Call set_hand_qpos() first.")
+                return np.concatenate([qpos, _HAND_HOME_QPOS.copy()])
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:
             raise ValueError(

@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm
+from dexmani_real.config.defaults import arm, safety
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
@@ -88,7 +88,7 @@ class ArmLoopConfig:
 
 # Controller errors that indicate a problematic target rather than a hardware fault.
 _RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
-_RECOVERY_MAX: int = 30  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
+_RECOVERY_MAX: int = safety.max_consecutive_recoveries  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
 
 # Velocity feedforward: number of ticks to skip after startup or HOME before
 # enabling compensation.  3 ticks @ 30 Hz ≈ 100 ms — enough for the arm state
@@ -433,6 +433,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             _tracking_warn("arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad)
 
         # Error handling
+        # arm.error_code is an SDK cached property (updated by background report
+        # thread ~every 200ms), not a per-access network call.
         try:
             error_code = arm.error_code
         except Exception:

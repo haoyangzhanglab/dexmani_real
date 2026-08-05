@@ -211,6 +211,10 @@ class EpisodeRecorder:
         if self._recording:
             return False
 
+        # Defence-in-depth: remove orphaned .tmp_episode_* directories left by
+        # previous crashes (SIGKILL / power loss that bypass atexit+finally).
+        self._cleanup_orphan_temp_dirs(str(self.data_dir))
+
         stamp = time.strftime("%Y%m%d_%H%M%S")
         ep_dir = self.data_dir / f"episode_{stamp}"
         tmp_dir = self.data_dir / f".tmp_episode_{stamp}"
@@ -767,7 +771,9 @@ class EpisodeRecorder:
             except Exception:
                 pass
             self._depth_file = None
-            # Clean up temp directory if it still exists.
+        finally:
+            # Always clean up temp directory and reset state, even if the
+            # except handler above also failed (e.g. file close() raised).
             _tmp = self._temp_dir
             if _tmp is not None:
                 self._discard_temp_files(_tmp)
@@ -866,7 +872,13 @@ class EpisodeRecorder:
         except OSError:
             if os.path.isdir(src):
                 shutil.copytree(src, dst)
-                shutil.rmtree(src)
+                # dst is intact even if src removal fails — orphaned temp
+                # directories are cleaned by _cleanup_orphan_temp_dirs on
+                # the next start_episode() call.
+                try:
+                    shutil.rmtree(src)
+                except Exception:
+                    pass
             else:
                 shutil.copy2(src, dst)
                 os.unlink(src)
@@ -878,6 +890,23 @@ class EpisodeRecorder:
             shutil.rmtree(tmp, ignore_errors=True)
         except OSError:
             pass
+
+    @classmethod
+    def _cleanup_orphan_temp_dirs(cls, data_dir: str) -> None:
+        """Remove orphaned ``.tmp_episode_*`` directories left by crashes.
+
+        Called at the start of every ``start_episode()`` — defence-in-depth
+        against SIGKILL / power loss that bypasses atexit and finally blocks.
+        """
+        import glob
+
+        pattern = os.path.join(data_dir, ".tmp_episode_*")
+        for tmp in glob.glob(pattern):
+            try:
+                shutil.rmtree(tmp, ignore_errors=True)
+                logger.info("Cleaned up orphan temp dir: %s", tmp)
+            except Exception:
+                pass
 
     def _rename_temp_to_final(self, tmp: str, final: str) -> None:
         """Rename temp directory to final episode directory."""

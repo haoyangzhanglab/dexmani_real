@@ -316,6 +316,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     prev_eef_pos: np.ndarray | None = None
     _last_target_eef_pos = np.full(3, np.nan)  # last valid IK target (held frame continuity)
     _last_target_eef_rot6d = np.full(6, np.nan)
+    _last_tactile_data: np.ndarray | None = None  # forward-fill cache for held-frame tactile
 
     logger.info("Policy: entering main loop @ %.0f Hz", cfg.control_hz)
 
@@ -1029,6 +1030,12 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             # ── Record ──
             if recording_active:
                 hand_tactile = _read_hand_tactile(shared)
+                # Forward-fill: cache the last non-None tactile read so held
+                # frames never allocate a full zeros(5,120,3) array (~14KB).
+                if hand_tactile is not None:
+                    _last_tactile_data = hand_tactile
+                elif _last_tactile_data is not None:
+                    hand_tactile = _last_tactile_data
                 # Track last valid IK target for held-frame continuity.
                 _last_target_eef_pos = target_pos.copy()
                 _last_target_eef_rot6d = quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat))
