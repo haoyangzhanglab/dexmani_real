@@ -1,12 +1,8 @@
-"""EpisodeRecorder — HDF5-based teleoperation data recorder.
+"""EpisodeRecorder — HDF5 teleoperation data recorder.
 
-Single write path: state/action/vr streams are aligned to a fixed dt=1/control_hz
-time grid at record time (TimestampAlignedBuffer) and flushed to HDF5 in bulk at
-stop_episode(); camera frames are accumulated in memory and written to HDF5 in
-periodic batches (~10 s), then tail-padded to grid length at stop — every dataset
-is index-aligned by construction.
-
-Ref: ManiUniCon accumulate-then-dump pattern (replay_buffer.py).
+Accumulate-then-dump: state/action/vr streams aligned to dt=1/control_hz via
+TimestampAlignedBuffer, flushed in bulk at stop_episode(). Camera frames batched
+every ~10s, tail-padded to grid length at stop.
 """
 
 from __future__ import annotations
@@ -102,8 +98,6 @@ class EpisodeRecorder:
         # actually forwarded to the SDK each tick, as opposed to action_arm_joint
         # (the IK target).  Set by vr_teleop_policy.py.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
-
-
 
         self._file: Any = None  # h5py.File | None — data.h5 (non-camera + pointcloud)
         self._depth_file: Any = None  # h5py.File | None — depth.h5 (uint16, gzip-1)
@@ -388,7 +382,11 @@ class EpisodeRecorder:
             "hand_tipboard_err": np.asarray(state.hand_tipboard_err, dtype=np.int32),
             "hand_commboard_err": np.asarray(state.hand_commboard_err, dtype=np.int32),
             "hand_jointboard_err": np.asarray(state.hand_jointboard_err, dtype=np.int32),
-            "hand_current": np.asarray(state.hand_current, dtype=np.float64) if state.hand_current is not None else np.full(12, np.nan),
+            "hand_current": (
+                np.asarray(state.hand_current, dtype=np.float64)
+                if state.hand_current is not None
+                else np.full(12, np.nan)
+            ),
             # ── Connection status ──
             # Distinguishes "physically disconnected (NaN qpos + connected=False)"
             # from "connected but read failed (NaN qpos + connected=True)".
@@ -846,6 +844,7 @@ class EpisodeRecorder:
                 self._discard_temp_files(_tmp)
 
         self._reset_episode_state()
+
     def _reset_episode_state(self) -> None:
         """Reset all mutable episode state to defaults (called from both the
         success path and the crash-handler in _stop_episode_impl)."""
@@ -911,6 +910,3 @@ class EpisodeRecorder:
     def _rename_temp_to_final(self, tmp: str, final: str) -> None:
         """Rename temp directory to final episode directory."""
         self._try_rename(tmp, final)
-
-
-

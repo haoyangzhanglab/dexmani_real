@@ -1,11 +1,4 @@
-"""Hand process — SharedStorage architecture.
-
-Architecture:
-    Policy → hand_cmd_ring → hand_loop → XHand hardware
-    XHand hardware → hand_state_ring / hand_tactile_ring → Policy
-
-Single entry point: hand_loop(shared) — mp.Process target, uses SharedStorage rings.
-"""
+"""Hand servo process — reads hand_cmd_ring, servos XHand, writes hand_state_ring."""
 
 from __future__ import annotations
 
@@ -21,14 +14,9 @@ from dexmani_real.utils.rate_manager import RateManager
 logger = get_logger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════
-
-
 @dataclass
 class HandProcessConfig:
-    """Configuration for hand_loop — defaults from hand singleton."""
+    """Configuration for hand_loop."""
 
     loop_hz: float = field(default_factory=lambda: hand.loop_hz)
 
@@ -44,25 +32,22 @@ class HandProcessConfig:
     send_err_watchdog_frames: int = field(default_factory=lambda: hand.send_err_watchdog_count)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# hand_loop — mp.Process target
-# ═══════════════════════════════════════════════════════════════════
-
-
 def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     """Hand process entry point — reads shared.hand_cmd_ring, servos hand.
 
     Designed as an mp.Process target. Communicates exclusively through
     SharedStorage (no RPC, no side channels).
     """
-    from dexmani_real.shm.shared_storage import HAND_STATE_DTYPE as _HS_STATE
-    from dexmani_real.shm.shared_storage import HAND_TACTILE_DTYPE as _HS_TACTILE, new_frame as _nf
     from dexmani_real.robot.safety import SafetyState, transition
+    from dexmani_real.shm.shared_storage import HAND_STATE_DTYPE as _HS_STATE
+    from dexmani_real.shm.shared_storage import HAND_TACTILE_DTYPE as _HS_TACTILE
+    from dexmani_real.shm.shared_storage import new_frame as _nf
 
     cfg = config or HandProcessConfig()
 
     try:
         from dexmani_real.robot.xhand import XHand, XHandConfig
+
         hand = XHand(XHandConfig())
         if not hand.connect():
             logger.error("hand_loop: connect failed")
@@ -77,7 +62,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
     # Home — re-send in the polling loop so the hand PID keeps driving
     # toward home_qpos until the physical qpos converges.
-    home_qpos = getattr(hand.config, 'home_qpos', None)
+    home_qpos = getattr(hand.config, "home_qpos", None)
     if home_qpos is not None and np.all(np.isfinite(home_qpos)):
         _home_deadline = time.monotonic() + cfg.home_settle_timeout_s
         _home_reached = False
@@ -173,7 +158,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                             consecutive_send_errors = 0
                         except Exception:
                             consecutive_send_errors += 1
-                            logger.warning("hand_loop: send_action failed (consecutive=%d)", consecutive_send_errors, exc_info=True)
+                            logger.warning(
+                                "hand_loop: send_action failed (consecutive=%d)", consecutive_send_errors, exc_info=True
+                            )
                         last_cmd_seq = seq_int
 
             # Send-error watchdog: auto clear_error() after consecutive failures.
@@ -255,8 +242,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 shared.error_state.value = True
                 transition(shared, SafetyState.FAULT)
                 logger.error(
-                    "hand_loop: hand error_state persisted after %d retries — "
-                    "setting global error_state + FAULT",
+                    "hand_loop: hand error_state persisted after %d retries — " "setting global error_state + FAULT",
                     _ERROR_STATE_RETRY_MAX,
                 )
         elif not error_state:

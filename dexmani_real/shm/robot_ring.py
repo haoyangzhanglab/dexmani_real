@@ -58,7 +58,14 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer, TORN_WARN_INTERVAL_NS, _seqlock_even, _seqlock_is_complete, _seqlock_odd, _seqlock_to_logical
+from dexmani_real.shm.ring_buffer import (
+    TORN_WARN_INTERVAL_NS,
+    SharedMemoryRingBuffer,
+    _seqlock_even,
+    _seqlock_is_complete,
+    _seqlock_odd,
+    _seqlock_to_logical,
+)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -141,8 +148,7 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             return cls(name, dtype, maxlen=maxlen, create=True)
         except FileExistsError:
             logger.warning(
-                "SeqlockRingBuffer '%s' already exists "
-                "(stale from a previous run) — unlinking and recreating.",
+                "SeqlockRingBuffer '%s' already exists " "(stale from a previous run) — unlinking and recreating.",
                 name,
             )
             stale = shared_memory.SharedMemory(name=name)
@@ -297,9 +303,7 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             return []
 
         if k > self.maxlen:
-            raise ValueError(
-                f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})"
-            )
+            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
 
         latest_seq = int(self._write_seq[0])
         if latest_seq == 0:
@@ -348,11 +352,7 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
 
                 # Accept: both samples agree, nonzero, EVEN, and still the
                 # same logical sequence (no mid-copy overwrite).
-                if (
-                    seq1 == seq2
-                    and _seqlock_is_complete(seq2)
-                    and _seqlock_to_logical(seq2) == target_seq
-                ):
+                if seq1 == seq2 and _seqlock_is_complete(seq2) and _seqlock_to_logical(seq2) == target_seq:
                     frames.append((data, ts, target_seq))
                     accepted = True
                     break
@@ -390,8 +390,7 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             return
         self._last_torn_warn_k_ns = now_ns
         logger.warning(
-            "SeqlockRingBuffer '%s': torn read in get_last_k(k=%d); "
-            "%d/%d frames recovered.",
+            "SeqlockRingBuffer '%s': torn read in get_last_k(k=%d); " "%d/%d frames recovered.",
             self.name,
             k,
             recovered,

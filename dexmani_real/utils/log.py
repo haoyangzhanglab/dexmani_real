@@ -49,13 +49,13 @@ def _get_file_handler() -> logging.FileHandler | None:
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
-            handler = logging.StreamHandler(sys.stdout)
-            handler.setFormatter(_FORMATTER)
-            logger.addHandler(handler)
-            file_handler = _get_file_handler()
-            if file_handler is not None:
-                logger.addHandler(file_handler)
-            logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_FORMATTER)
+        logger.addHandler(handler)
+        file_handler = _get_file_handler()
+        if file_handler is not None:
+            logger.addHandler(file_handler)
+        logger.setLevel(logging.INFO)
     return logger
 
 

@@ -102,7 +102,9 @@ def transition(shared: Any, new_state: SafetyState) -> bool:
     shared.safety_state.value = int(new_state)
     logger.info(
         "safety: %s(%d) → %s(%d)",
-        current.name, int(current),
-        new_state.name, int(new_state),
+        current.name,
+        int(current),
+        new_state.name,
+        int(new_state),
     )
     return True

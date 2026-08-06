@@ -153,4 +153,3 @@ def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
     """
     quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
     return Rotation.from_quat(quat_xyzw).as_matrix()
-

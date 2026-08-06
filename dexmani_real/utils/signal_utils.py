@@ -7,17 +7,8 @@ __all__ = ["ema_smooth_pose"]
 import numpy as np
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Quaternion utilities (inlined from planning/pose_utils to avoid reverse dep)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
 def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
-    """Convert wxyz quaternion to rotation vector (axis * angle).
-
-    Handles quaternion double cover: q and -q represent the same rotation.
-    Forcing w ≥ 0 ensures the rotation vector angle is always ≤ π.
-    """
+    """Convert wxyz quaternion to rotation vector (axis * angle)."""
     sign = np.asarray(q, dtype=np.float64)
     if sign[0] < 0:
         sign = -sign
@@ -27,11 +18,6 @@ def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
         return np.zeros(3, dtype=np.float64)
     angle = 2.0 * np.arctan2(sin_half, w)
     return angle * np.array([x, y, z], dtype=np.float64) / sin_half
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Cartesian-space pose EMA — position R³ + rotation vector so(3)
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 def ema_smooth_pose(

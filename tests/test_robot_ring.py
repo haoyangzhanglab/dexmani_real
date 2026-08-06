@@ -195,9 +195,7 @@ class TestGetLastK:
                 # marker (enforced by get_last_k).  We additionally verify
                 # the data is finite — torn writes can produce garbage.
                 vals = data["value"][0]
-                assert np.all(np.isfinite(vals)), (
-                    f"non-finite values in frame seq={seq}: {vals}"
-                )
+                assert np.all(np.isfinite(vals)), f"non-finite values in frame seq={seq}: {vals}"
 
         writer.join(timeout=3)
         if writer.is_alive():
@@ -226,9 +224,7 @@ class TestGetLastK:
             # written (98, 99, 100).
             latest = int(r._write_seq[0])
             for _, _, seq in result:
-                assert seq > latest - 3, (
-                    f"stale frame seq={seq} survived; latest={latest}"
-                )
+                assert seq > latest - 3, f"stale frame seq={seq} survived; latest={latest}"
         finally:
             try:
                 r.close()
@@ -325,10 +321,8 @@ class TestSharedStorageHelpers:
 
     def test_read_arm_state_k_on_real_ring(self):
         """Integration: create a ring, write to it, read via helper."""
-        from dexmani_real.shm.shared_storage import read_arm_state_k
-
         # Use the real ARM_STATE_DTYPE ring for a quick integration check.
-        from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, new_frame, SharedStorageConfig
+        from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, SharedStorageConfig, new_frame, read_arm_state_k
 
         name = _ring_name("arm_state_k_test")
         cfg = SharedStorageConfig(arm_state_ring_maxlen=4)

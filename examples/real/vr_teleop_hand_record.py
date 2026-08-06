@@ -1,37 +1,12 @@
 #!/usr/bin/env python3
 """VR teleop xArm7 + XHand with recording — canonical data-collection entry point.
 
-5 child processes + thin Main orchestrator. All data exchange through SharedStorage.
-
-**This is the PRIMARY data-collection entry point.** Supports:
-- Arm teleop via VR wrist → IK (EMA + workspace clamp + delta clamp)
-- Hand teleop via VR landmarks → DexPilot NLP retargeting
-- Safety: DISARMED/ARMED/RUNNING/FAULT state machine + 5 per-process heartbeats
-- Recording: TimestampAlignedBuffer → HDF5 (schema v11, arm+hand+EEF+camera)
-- Voice feedback (TTS audio prompts for headset-blind operation)
-- Camera metadata (intrinsics, depth_scale, serial) propagated to HDF5 /meta
-
-Architecture:
-    Main (~200 lines) — spawns 5 processes, monitors is_running + heartbeats
-      │
-      ├─ camera_loop ──camera_ring──┐
-      ├─ vr_loop ────────vr_ring─────┤
-      │                               ▼
-      ├─ policy_loop ───arm_action_q──→ arm_loop
-      │                ──hand_cmd_ring─→ hand_loop
-      │                ◄──arm_state_ring, hand_state_ring, hand_tactile_ring
-      │                owns EpisodeRecorder (single-clock recording)
-      │
-      ├─ arm_loop (Mode 6, 30Hz) — reads arm_action_q, servos xArm7
-      └─ hand_loop (30Hz) — reads hand_cmd_ring, servos XHand
+5-process SharedStorage model: camera, VR, policy, arm (Mode 6), hand.
+Safety: DISARMED/ARMED/RUNNING/FAULT state machine + 5 per-process heartbeats.
+Recording: HDF5 schema v11 via TimestampAlignedBuffer → EpisodeRecorder.
 
 Usage:
-    source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_robot
-    python examples/real/vr_teleop_hand_record.py
-    python examples/real/vr_teleop_hand_record.py --task pick_place --operator alice
-    python examples/real/vr_teleop_hand_record.py --acc 900 --speed 120
-    python examples/real/vr_teleop_hand_record.py --no-hand
-
+    python examples/real/vr_teleop_hand_record.py [--task T] [--operator O] [--acc A] [--speed S] [--no-hand]
 Controls:
     B=teleop+record  C=pause  S=save  D=discard  H=home  Q=quit  ESC=estop
 """
@@ -51,8 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, camera, hand, policy, safety, vr
-from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
 from dexmani_real.planning.path_utils import plan_joint_home_path
+from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
@@ -70,11 +45,6 @@ from dexmani_real.shm.shared_storage import (
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════
 
 
 def main() -> None:
@@ -98,8 +68,12 @@ def main() -> None:
         import dataclasses
 
         for label, obj in (
-            ("arm", arm), ("hand", hand), ("policy", policy),
-            ("vr", vr), ("safety", safety), ("camera", camera),
+            ("arm", arm),
+            ("hand", hand),
+            ("policy", policy),
+            ("vr", vr),
+            ("safety", safety),
+            ("camera", camera),
         ):
             print(f"[{label}]")
             for k, v in dataclasses.asdict(obj).items():
@@ -123,10 +97,10 @@ def main() -> None:
     print(f"  {'  '.join(_meta)}")
     print("=" * 60)
 
-    # ── 1. SharedStorage ──
+    # 1. SharedStorage
     shared = SharedStorage.create(prefix="dexmani")
 
-    # ── 2. Policy config ──
+    # 2. Policy config
     policy_cfg = PolicyConfig(
         task_label=args.task,
         operator=args.operator,
@@ -137,13 +111,13 @@ def main() -> None:
     if args.no_hand:
         policy_cfg.hand_enabled = False
 
-    # ── 2b. Arm config (must match PolicyConfig speed/acc) ──
+    # 2b. Arm config (must match PolicyConfig speed/acc)
     arm_cfg = ArmLoopConfig(
         joint_max_speed_rad_per_s=float(np.deg2rad(args.speed)),
         joint_max_acc_rad_per_s2=float(np.deg2rad(args.acc)),
     )
 
-    # ── 3. Spawn ──
+    # 3. Spawn
     procs: list[mp.Process] = [
         mp.Process(target=_camera_loop, args=(shared,), name="cam", daemon=True),
         mp.Process(target=_vr_loop, args=(shared,), name="vr", daemon=True),
@@ -155,7 +129,7 @@ def main() -> None:
     for p in procs:
         p.start()
 
-    # ── 4. Wait for ready ──
+    # 4. Wait for ready
     # vr_loop defers vr_ready until the first HTS event arrives (not just TCP
     # connect), so the 120 s timeout here doubles as the "put on headset" grace
     # period.  Arm/camera/hand are ready within seconds.
@@ -200,15 +174,17 @@ def main() -> None:
         else:
             print(f"  {name}: ready", flush=True)
 
-    # ── 4b. Pre-flight health summary (ring-based, no direct hardware access) ──
+    # 4b. Pre-flight health summary (ring-based, no direct hardware access)
     _print_health_summary(shared)
 
     # All subsystems ready — transition to ARMED.
     transition(shared, SafetyState.ARMED)
-    print(f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"
-          "Controls: B=teleop+record  C=pause  S=save  D=discard  H=home  Q=quit  ESC=estop\n")
+    print(
+        f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"
+        "Controls: B=teleop+record  C=pause  S=save  D=discard  H=home  Q=quit  ESC=estop\n"
+    )
 
-    # ── 5. Supervisor (heartbeat + process monitor) ──
+    # 5. Supervisor (heartbeat + process monitor)
     _all_names = ["camera", "vr", "policy", "arm"]
     if not args.no_hand:
         _all_names.append("hand")
@@ -292,8 +268,7 @@ def main() -> None:
             if now - _last_status_s >= 30.0:
                 _runtime_m = (now - _start_time) / 60.0
                 _safety = shared.safety_state.value
-                _hb_ages = ", ".join(f"{n}={now - float(HEARTBEAT_FIELDS[n].value):.1f}s"
-                                    for n in PROC_NAMES)
+                _hb_ages = ", ".join(f"{n}={now - float(HEARTBEAT_FIELDS[n].value):.1f}s" for n in PROC_NAMES)
                 print(f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})", flush=True)
                 _last_status_s = now
 
@@ -306,7 +281,7 @@ def main() -> None:
     finally:
         transition(shared, SafetyState.DISARMED)
 
-        # ── Post-loop: offer return_home on normal exit ──
+        # Post-loop: offer return_home on normal exit
         # Skip when Policy initiated the quit (quit_requested=True) — Policy
         # already handled the [H] return_home / [Q] quit prompt while all
         # processes were still alive.
@@ -315,18 +290,15 @@ def main() -> None:
 
         _shutdown(procs, shared)
 
-        # ── Exit summary ──
+        # Exit summary
         _runtime_m = (time.monotonic() - _start_time) / 60.0
         _final_safety = shared.safety_state.value
         print(f"\n── Session End ──")
-        print(f"  exit_reason={_exit_reason}  runtime={_runtime_m:.1f}min  "
-              f"safety={_final_safety}  normal={normal_exit}")
+        print(
+            f"  exit_reason={_exit_reason}  runtime={_runtime_m:.1f}min  "
+            f"safety={_final_safety}  normal={normal_exit}"
+        )
         print("──")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════
 
 
 def _print_health_summary(shared: SharedStorage) -> None:
@@ -342,8 +314,10 @@ def _print_health_summary(shared: SharedStorage) -> None:
         arm_qpos = np.asarray(arm_data["qpos"][0], dtype=np.float64)
         arm_qpos_ok = int(np.all(np.isfinite(arm_qpos)))
         arm_ok = arm_connected and arm_error == 0 and bool(arm_qpos_ok)
-        print(f"  arm   {'OK' if arm_ok else 'FAIL':>4s}  connected={int(arm_connected)}  "
-              f"error={arm_error}  qpos_ok={arm_qpos_ok}")
+        print(
+            f"  arm   {'OK' if arm_ok else 'FAIL':>4s}  connected={int(arm_connected)}  "
+            f"error={arm_error}  qpos_ok={arm_qpos_ok}"
+        )
     else:
         print("  arm   ----  (no data yet)")
 
@@ -358,8 +332,10 @@ def _print_health_summary(shared: SharedStorage) -> None:
         hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
         hand_ok = hand_connected and not hand_error and bool(hand_qpos_ok)
         stale_note = " stale=1" if hand_qpos_stale else ""
-        print(f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
-              f"error={int(hand_error)}  qpos_ok={hand_qpos_ok}{stale_note}")
+        print(
+            f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
+            f"error={int(hand_error)}  qpos_ok={hand_qpos_ok}{stale_note}"
+        )
     else:
         print("  hand  ----  (no data yet)")
 
@@ -367,7 +343,9 @@ def _print_health_summary(shared: SharedStorage) -> None:
     vr_result = shared.vr_ring.read_latest()
     if vr_result is not None:
         vr_data, _, _ = vr_result
-        vr_age_s = (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9 if vr_data["local_recv_ns"][0] > 0 else -1
+        vr_age_s = (
+            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9 if vr_data["local_recv_ns"][0] > 0 else -1
+        )
         print(f"  vr     OK   age={vr_age_s:.1f}s  seq={int(vr_data['sequence_id'][0])}")
     else:
         print("  vr    ----  (no data yet)")
@@ -401,11 +379,11 @@ def _post_loop_home(shared: SharedStorage) -> None:
                 if sig == ControlSignal.HOME:
                     print("  H: return_home")
 
-                    # ── Step 1: Hand home first ──
+                    # Step 1: Hand home first
                     # hand_loop is still running (is_running not set yet).
                     hand_home_converge(shared, HAND_HOME_QPOS, heartbeat=False, check_is_running=False, verbose=True)
 
-                    # ── Step 2: Arm home ──
+                    # Step 2: Arm home
                     # Planner/policy process has already exited — no collision model
                     # available.  plan_joint_home_path with planner=None provides
                     # equivalent-joint wrapping + dense interpolation but NO collision
@@ -466,10 +444,6 @@ def _shutdown(procs: list, shared: SharedStorage) -> None:
     shared.close()
     print(f"  shutdown: {'  '.join(_status)}")
 
-
-# ═══════════════════════════════════════════════════════════════════
-# Entry point
-# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     main()

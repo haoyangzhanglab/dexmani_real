@@ -1,19 +1,4 @@
-"""pynput-based keyboard handler — global key capture, no terminal focus required.
-
-Replaces the termios cbreak + select.select pattern with pynput.keyboard.Listener
-running in a daemon thread.  Key events are captured globally (even when the
-terminal window is NOT focused), stored in a thread-safe buffer, and drained by
-poll() on the main thread.
-
-7-key mapping:
-    B  → BEGIN             (IDLE → TELEOP + auto-recording)
-    C  → PAUSE             (TELEOP ⇄ PAUSED)
-    S  → STOP              (stop recording → auto-save → IDLE)
-    D  → DISCARD           (stop recording → discard → IDLE)
-    H  → HOME              (stop recording → return to home → IDLE)
-    Q  → QUIT              (always quit; auto-save if recording)
-    ESC → EMERGENCY_STOP
-"""
+"""pynput-based global keyboard handler for teleop control (B/C/S/D/H/Q/ESC)."""
 
 from __future__ import annotations
 
@@ -49,16 +34,8 @@ _KEY_MAP: dict[str, ControlSignal] = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Terminal echo suppression (shared by KeyboardHandler and GlobalKeyState)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 def _suppress_terminal_echo() -> list[Any] | None:
-    """Disable terminal ECHO so captured keys don't echo to stdout.
-
-    Returns the saved termios attributes, or None on failure / non-TTY.
-    """
+    """Disable terminal ECHO; returns saved termios attrs or None on failure."""
     if not sys.stdin.isatty():
         return None
     try:
@@ -89,7 +66,7 @@ def _restore_terminal_echo(saved: list[Any] | None) -> None:
 class KeyboardHandler:
     """Global keyboard handler using pynput.
 
-    Captures keystrokes globally — works even when the terminal window
+    Captures keystrokes globally - works even when the terminal window
     does not have focus.
 
     Compatible with the existing API:

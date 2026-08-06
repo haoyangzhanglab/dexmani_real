@@ -1,28 +1,13 @@
 """VR-to-XHand retargeting via dex_retargeting + adaptive finger scaling.
 
-Two landmark-space adaptations compensate for human-robot kinematic mismatches
-before reference vectors are computed:
-
-1. adaptive_retargeting_thumb — scales thumb_tip to match XHand mechanical thumb
-   length (~23% longer than MANO model).  Adaptive: more when extended, less
-   when curled — drives rot2 (IP flexion) toward zero in neutral poses while
-   preserving curl range for opposition/grip gestures.
-
-2. adaptive_retargeting_xhand (LeFranX) — scales pinky chain (MCP→PIP→DIP→TIP)
-   based on extension state, compensating for human-robot finger length
-   differences.  Uniform scaling along the kinematic chain.
-
-Both operate on MANO-space landmarks and modify disjoint landmark indices
-(thumb: 4, pinky: 18-20), so order is irrelevant.
-
-Refs:
-  LeFranX vr_hand_detector_adapter.py:27-84 (pinky)
-  CL-20260701 thumb FK analysis: robot wrist→thumb_tip 0.161m vs MANO 0.131m
+Two landmark-space adaptations compensate human-robot kinematic mismatches:
+1. adaptive_retargeting_thumb — scales thumb_tip to match XHand mechanical thumb length
+2. adaptive_retargeting_xhand — scales pinky chain (MCP→PIP→DIP→TIP) by extension state
 """
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]  # adaptive_retargeting_xhand: public for external pinky scaling
+__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]
 
 import os
 import tempfile

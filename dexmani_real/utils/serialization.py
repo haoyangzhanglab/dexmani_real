@@ -181,5 +181,3 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
         kw[f.name] = _convert_field_value(val, target)
 
     return kw
-
-

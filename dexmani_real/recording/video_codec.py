@@ -157,9 +157,7 @@ class VideoEncoder:
         """Lock must be held by caller."""
         # Validate shape so we fail early with a clear message.
         if frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError(
-                f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}"
-            )
+            raise ValueError(f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}")
         if frame.shape[0] != self._height or frame.shape[1] != self._width:
             raise ValueError(
                 f"Frame shape {(frame.shape[0], frame.shape[1])} does not match "
@@ -170,9 +168,7 @@ class VideoEncoder:
             self._container = av.open(str(self._path), "w", format="mp4")
             # add_stream returns a VideoStream at runtime for video codecs;
             # PyAV stubs are incomplete so use Any for _stream.
-            self._stream = self._container.add_stream(
-                self._cfg.codec, rate=int(self._fps)
-            )
+            self._stream = self._container.add_stream(self._cfg.codec, rate=int(self._fps))
             self._stream.width = self._width
             self._stream.height = self._height
             self._stream.pix_fmt = self._cfg.pixel_format
@@ -252,9 +248,7 @@ class VideoDecoder:
             self._open()
         assert self._container is not None
         if index < 0 or index >= self._frame_count:
-            raise IndexError(
-                f"Frame index {index} out of range [0, {self._frame_count})"
-            )
+            raise IndexError(f"Frame index {index} out of range [0, {self._frame_count})")
 
         # Seek to the target timestamp (best-effort — lands on preceding keyframe).
         time_base = self._stream.time_base  # Fraction (PyAV stubs: Fraction | None)

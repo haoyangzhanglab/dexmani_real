@@ -1,8 +1,10 @@
 # Standalone vendor diagnostic — uses raw xhand_controller SDK, not dexmani_real architecture.
-from xhand_controller import xhand_control
 import math
 import sys
 import time
+
+from xhand_controller import xhand_control
+
 
 class XHandControlExample:
     def __init__(self, hand_id=0, position=0.1, mode=3):
@@ -96,7 +98,7 @@ class XHandControlExample:
         print("//Read hand device information")
         print("//================================")
         error_struct, info = self._device.read_device_info(self._hand_id)
-        print(f"=@= xhand serial_number: {info.serial_number[0:16]}") # sn is 16 bytes
+        print(f"=@= xhand serial_number: {info.serial_number[0:16]}")  # sn is 16 bytes
         print(f"=@= xhand hand_id: {info.hand_id}")
         print(f"=@= xhand hand_id: {info.ev_hand}\n")
 
@@ -122,13 +124,15 @@ class XHandControlExample:
         joint_id = 0
         error_struct, version = self._device.read_version(self._hand_id, joint_id)
         print(f"=@= xhand hardware SDK version: {version}\n")
-            
+
     def exam_send_command(self):
         print("//================================")
         print("//Send hand activity command")
         print("//================================")
         error_struct = self._device.send_command(self._hand_id, self._hand_command)
-        print(f"=@= xhand send_command result: { error_struct.error_code == 0}, message: {error_struct.error_message}\n")
+        print(
+            f"=@= xhand send_command result: { error_struct.error_code == 0}, message: {error_struct.error_message}\n"
+        )
         time.sleep(1)
 
     def exam_read_state(self, finger_id=2, force_update=True):
@@ -139,7 +143,7 @@ class XHandControlExample:
         if error_struct.error_code != 0:
             print(f"=@= xhand read_state error: {error_struct.error_message}\n")
             return
-        
+
         finger_1 = state.finger_state[finger_id]
         print(f"|+| finger.id = {finger_1.id}, finger.temperature = {finger_1.temperature} ")
         print(f"|+| finger.id = {finger_1.id}, finger.temperature & 0xFF = {finger_1.temperature & 0xFF} ")
@@ -157,17 +161,20 @@ class XHandControlExample:
                 sensor_data.calc_force.fz,
             ]
             fingertip_state["raw_pressure"] = [
-                [force.fx, force.fy, force.fz]
-                for force in state.sensor_data[0].raw_force
+                [force.fx, force.fy, force.fz] for force in state.sensor_data[0].raw_force
             ]
             fingertip_state["sensor_temperature"] = sensor_data.calc_temperature
 
         if fingertip_state:
             print(f"|+| finger.id = {finger_1.id}, fingertip calc_pressure = {fingertip_state.get('calc_pressure')}")
             print(f"|+| finger.id = {finger_1.id}, fingertip raw_pressure = {fingertip_state.get('raw_pressure')}")
-            print(f"|+| finger.id = {finger_1.id}, fingertip sensor_temperature = {fingertip_state.get('sensor_temperature')}\n")
-        print(f"=@= xhand read state result: {error_struct.error_code == 0} | error_struct.error_code={error_struct.error_code} error_msg={error_struct.error_message}\n")
-    
+            print(
+                f"|+| finger.id = {finger_1.id}, fingertip sensor_temperature = {fingertip_state.get('sensor_temperature')}\n"
+            )
+        print(
+            f"=@= xhand read state result: {error_struct.error_code == 0} | error_struct.error_code={error_struct.error_code} error_msg={error_struct.error_message}\n"
+        )
+
     def exam_reset_sensor(self):
         print("//================================")
         print("//Reset fingertip sensor")
@@ -181,7 +188,7 @@ class XHandControlExample:
         print("//================================")
         self._device.close_device()
         print(f"=@= xhand device closed\n")
-	
+
     def set_hand_mode(self, mode: int):
         print("//================================")
         print("//Set hand activity mode")
@@ -196,7 +203,9 @@ class XHandControlExample:
             hand_mode.finger_command[i].tor_max = 380
             hand_mode.finger_command[i].mode = mode
         error_struct = self._device.send_command(self._hand_id, hand_mode)
-        print(f"=@= xhand set hand mode result: {error_struct.error_code == 0} | error_struct.error_code={error_struct.error_code} error_msg={error_struct.error_message}\n")
+        print(
+            f"=@= xhand set hand mode result: {error_struct.error_code == 0} | error_struct.error_code={error_struct.error_code} error_msg={error_struct.error_message}\n"
+        )
         time.sleep(1)
 
     def exam_get_sdk_version(self):
@@ -211,24 +220,26 @@ if __name__ == "__main__":
     xhand_exam = XHandControlExample(hand_id=0, position=0.1, mode=3)
 
     # Choose one communication method, currently supports EtherCAT and RS485
-    # First of all, open device 
+    # First of all, open device
     device_identifier = {}
 
     while True:
-        communication_choice = input("Choose communication method (enter '1' for EtherCAT, enter '2' for RS485): ").strip()
-        if communication_choice == '1':
-            device_identifier['protocol'] = 'EtherCAT'
+        communication_choice = input(
+            "Choose communication method (enter '1' for EtherCAT, enter '2' for RS485): "
+        ).strip()
+        if communication_choice == "1":
+            device_identifier["protocol"] = "EtherCAT"
             if xhand_exam.exam_open_device(device_identifier):
                 break
             else:
                 sys.exit(1)
-        elif communication_choice == '2':
-            device_identifier['protocol'] = 'RS485'
+        elif communication_choice == "2":
+            device_identifier["protocol"] = "RS485"
             # You can use exam_enumerate_devices('RS485') to read serial port list information, choose ttyUSB prefixed port
             # Get serial port list, choose ttyUSB*
-            xhand_exam.exam_enumerate_devices('RS485')
-            device_identifier["serial_port"] = '/dev/ttyUSB0'
-            device_identifier['baud_rate'] = 3000000
+            xhand_exam.exam_enumerate_devices("RS485")
+            device_identifier["serial_port"] = "/dev/ttyUSB0"
+            device_identifier["baud_rate"] = 3000000
             if xhand_exam.exam_open_device(device_identifier):
                 break
             else:
@@ -280,22 +291,22 @@ if __name__ == "__main__":
     # ================================================================================
     # Get XHAND type
     serial_number = xhand_exam.exam_serial_number()
-    # Send xhand preset action list  
+    # Send xhand preset action list
     # XHAND 1
     if serial_number[4] == "3":
         actions_list = {
-            'fist': [11.85, 74.58, 40, -3.08, 106.02, 110, 109.75, 107.56, 107.66, 110, 109.1, 109.15],
-            'palm': [0, 80.66, 33.2, 0.00, 5.11, 0, 6.53, 0, 6.76, 4.41, 10.13, 0],
-            'v': [38.32, 90, 52.08, 6.21, 2.6, 0, 2.1, 0, 110, 110, 110, 109.23],
-            'ok': [45.88, 41.54, 67.35, 2.22, 80.45, 70.82, 31.37, 10.39, 13.69, 16.88, 1.39, 10.55]
+            "fist": [11.85, 74.58, 40, -3.08, 106.02, 110, 109.75, 107.56, 107.66, 110, 109.1, 109.15],
+            "palm": [0, 80.66, 33.2, 0.00, 5.11, 0, 6.53, 0, 6.76, 4.41, 10.13, 0],
+            "v": [38.32, 90, 52.08, 6.21, 2.6, 0, 2.1, 0, 110, 110, 110, 109.23],
+            "ok": [45.88, 41.54, 67.35, 2.22, 80.45, 70.82, 31.37, 10.39, 13.69, 16.88, 1.39, 10.55],
         }
     # XHAND 1 Lite
     elif serial_number[4] == "6":
         actions_list = {
-            'fist': [0, 58, 83, 80, 80, 80, 0, 0, 0, 0, 0, 0],
-            'palm': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            'v': [54, 66, 0, 0, 80, 80, 0, 0, 0, 0, 0, 0],
-            'ok': [49, 43, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            "fist": [0, 58, 83, 80, 80, 80, 0, 0, 0, 0, 0, 0],
+            "palm": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "v": [54, 66, 0, 0, 80, 80, 0, 0, 0, 0, 0, 0],
+            "ok": [49, 43, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         }
 
     for action in actions_list:

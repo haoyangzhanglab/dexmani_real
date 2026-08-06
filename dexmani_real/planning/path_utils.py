@@ -154,17 +154,16 @@ def plan_joint_home_path(
         # Fallback when planner is unavailable: wrap to nearest equivalent using
         # the arm config limits (which mirror the URDF).
         _home = wrap_nearest_equivalent(
-            home_qpos, qpos,
-            _arm_cfg.joint_limit_lower, _arm_cfg.joint_limit_upper,
+            home_qpos,
+            qpos,
+            _arm_cfg.joint_limit_lower,
+            _arm_cfg.joint_limit_upper,
         )
         delta = float(np.max(np.abs(qpos - _home)))
     if delta < np.deg2rad(0.5):
         return None  # caller can send home_qpos directly
 
-    have_collision = (
-        planner is not None
-        and planner.planning_profile.check_self_collision
-    )
+    have_collision = planner is not None and planner.planning_profile.check_self_collision
     _check_table = table_z_surface_m is not None and planner is not None
 
     def _check_safe(path: np.ndarray) -> bool:

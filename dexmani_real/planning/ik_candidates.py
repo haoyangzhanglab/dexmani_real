@@ -281,9 +281,8 @@ class IKCandidateManager:
         # factor k may push result slightly past the limit; the final
         # np.clip will snap it back.  Without this expansion, k_max clips
         # the wrapping factor and the canonicalised target ends up ~2π
-        # away from current qpos → large tracking-error spike / "joint
-        # turning a full circle" during teleop.
-        # Ref: "关节转了大圈" in calibrate_camera keyboard teleop —
+        # away from current qpos → large tracking-error spike (joint
+        # rotates full circle during teleop).
         # canonicalize_qpos chose the wrong 2π band for J1/J3/J5/J7.
         valid = k_min <= k_max
         k = np.where(valid, np.clip(k, k_min - 1, k_max + 1), 0.0)

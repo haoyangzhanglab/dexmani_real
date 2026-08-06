@@ -43,7 +43,6 @@ JOINT_NAMES = [
 SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
 
 
-
 @dataclass
 class XHandConfig:
     comm_type: str = "EtherCAT"
@@ -84,18 +83,18 @@ class XHandConfig:
         default_factory=lambda: np.deg2rad(
             np.array(
                 [
-                    0.0,    # J0  thumb_abd
+                    0.0,  # J0  thumb_abd
                     80.66,  # J1  thumb_j1      (ref: LeFranX)
-                    33.2,   # J2  thumb_j2      (ref: LeFranX)
-                    0.0,    # J3  index_abd
-                    5.11,   # J4  index_j1      (ref: LeFranX)
-                    5.0,    # J5  index_j2      min 5° (prevent mechanical clogging)
-                    6.53,   # J6  middle_j1     (ref: LeFranX)
-                    5.0,    # J7  middle_j2     min 5° (prevent mechanical clogging)
-                    6.76,   # J8  ring_j1       (ref: LeFranX)
-                    5.0,    # J9  ring_j2       min 5° (prevent mechanical clogging)
+                    33.2,  # J2  thumb_j2      (ref: LeFranX)
+                    0.0,  # J3  index_abd
+                    5.11,  # J4  index_j1      (ref: LeFranX)
+                    5.0,  # J5  index_j2      min 5° (prevent mechanical clogging)
+                    6.53,  # J6  middle_j1     (ref: LeFranX)
+                    5.0,  # J7  middle_j2     min 5° (prevent mechanical clogging)
+                    6.76,  # J8  ring_j1       (ref: LeFranX)
+                    5.0,  # J9  ring_j2       min 5° (prevent mechanical clogging)
                     10.13,  # J10 little_j1     (ref: LeFranX)
-                    5.0,    # J11 little_j2     min 5° (prevent mechanical clogging)
+                    5.0,  # J11 little_j2     min 5° (prevent mechanical clogging)
                 ],
                 dtype=np.float64,
             )
@@ -148,9 +147,7 @@ class XHandConfig:
 
     max_qvel: np.ndarray = field(
         default_factory=lambda: np.deg2rad(np.ones(12) * 180.0),
-        metadata={
-            "help": "Per-joint max velocity (rad/s) — soft speed limit for joint-space moves."
-        },
+        metadata={"help": "Per-joint max velocity (rad/s) — soft speed limit for joint-space moves."},
     )
 
     kp: int = 100
@@ -221,7 +218,7 @@ class XHand:
         # We take 5 fresh readings after reset and store the average as a
         # software bias; parse_tactile() and parse_tactile_sum() subtract
         # it to zero the no-contact baseline.
-        self._tactile_bias_ft: np.ndarray | None = None   # (5, 3)   — calc_force bias
+        self._tactile_bias_ft: np.ndarray | None = None  # (5, 3)   — calc_force bias
         self._tactile_bias_raw: np.ndarray | None = None  # (5, 120, 3) — raw_force bias
 
         self._stub_mode = False  # True when xhand_controller SDK unavailable (ref: LeFranX)
@@ -333,7 +330,9 @@ class XHand:
         # lower retry cap because each failed open_ethercat() transitions the
         # slave to OP regardless of PDO/SDO outcome, and repeated transitions
         # compound state corruption without recovery value.
-        retries = max(1, int(self.config.open_ethercat_retries if comm_type == "EtherCAT" else self.config.open_serial_retries))
+        retries = max(
+            1, int(self.config.open_ethercat_retries if comm_type == "EtherCAT" else self.config.open_serial_retries)
+        )
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
         for attempt in range(1, retries + 1):
@@ -505,9 +504,7 @@ class XHand:
         raw_samples: list[np.ndarray] = []
 
         for _ in range(n_samples):
-            err, hand_state = self._unpack_result(
-                self.control.read_state(device_id, True)  # force_update=True
-            )
+            err, hand_state = self._unpack_result(self.control.read_state(device_id, True))  # force_update=True
             if not self.error_ok(err):
                 logger.warning(
                     "Tactile bias sample read failed (code=%s) — "
@@ -638,8 +635,7 @@ class XHand:
             )
         except Exception:
             logger.debug(
-                "XHand: set_firmware_state() unavailable — "
-                "falling back to post-disconnect watchdog wait.",
+                "XHand: set_firmware_state() unavailable — " "falling back to post-disconnect watchdog wait.",
                 exc_info=True,
             )
         return False
@@ -692,9 +688,7 @@ class XHand:
                 "wait ≥5 s), then retry."
             )
         else:
-            logger.warning(
-                "XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions"
-            )
+            logger.warning("XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions")
 
     def _stub_state(self, full: bool = False) -> dict[str, Any]:
         """Return zero state for stub mode (ref: LeFranX xhand.py:219-223)."""

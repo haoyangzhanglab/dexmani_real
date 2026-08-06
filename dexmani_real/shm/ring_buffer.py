@@ -27,7 +27,6 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
-
 # ---------------------------------------------------------------------------
 # Seqlock protocol helpers (odd/even markers for lock-free torn-read defence)
 # ---------------------------------------------------------------------------

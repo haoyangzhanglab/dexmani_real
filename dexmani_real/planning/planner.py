@@ -125,7 +125,10 @@ class XArm7MotionPlanner:
                 "URDF joint limits differ from defaults.arm — using URDF values.\n"
                 "  URDF lower:  %s\n  defaults:    %s\n"
                 "  URDF upper:  %s\n  defaults:    %s",
-                joint_limits[:, 0], _cfg_lower, joint_limits[:, 1], _cfg_upper,
+                joint_limits[:, 0],
+                _cfg_lower,
+                joint_limits[:, 1],
+                _cfg_upper,
             )
         else:
             logger.debug("URDF joint limits match defaults.arm (ok)")
@@ -159,7 +162,9 @@ class XArm7MotionPlanner:
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
         self.teleop_solver = TeleopIKSolver(
-            self.kin, self.ik_mgr, self.teleop_profile,
+            self.kin,
+            self.ik_mgr,
+            self.teleop_profile,
             elbow_joint_index=self._elbow_joint_index,
         )
 
@@ -227,8 +232,6 @@ class XArm7MotionPlanner:
         No-op in 7-DOF mode.
         """
         self.collision_model.set_hand_qpos(hand_qpos)
-
-    # --- Public API ---
 
     def set_base_pose(self, base_pose_world: Pose) -> None:
         self.kin.set_base_pose(base_pose_world)
@@ -321,17 +324,8 @@ class XArm7MotionPlanner:
         best.report["num_valid_plans"] = len(valid_results)
         return best
 
-    # ── Pass-through delegates ──
-    # All kinematics, IK candidate, and collision-check methods are proxied via
+    # Kinematics, IK candidate, and collision-check methods are proxied via
     # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
-    # See __getattr__ docstring for rationale.
-    #
-    # Explicit delegates retained only for methods that add semantic value:
-    #   - solve_ik / solve_teleop_ik / plan_path  (planning orchestration)
-    #   - set_base_pose  (coordinates kin + mp_planner)
-    #
-    # Direct passthrough callers use the same syntax as before (e.g.
-    # planner.compute_eef_pose_world(q)), now routed via __getattr__.
 
     def try_screw_plan(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
@@ -407,7 +401,7 @@ class XArm7MotionPlanner:
         path_result.report.update(mplib_status=status)
         return path_result
 
-    # ── Path validation (internal) ──
+    # Path validation — each returns None on pass, PathResult on failure.
 
     def shortcut_smooth_path(self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile) -> np.ndarray:
         limits = self.resolve_planning_limits(profile, current_qpos)
@@ -480,7 +474,7 @@ class XArm7MotionPlanner:
         gaps larger than max_waypoint_delta_deg when the arm is far from the
         target (e.g. return-to-home from a stretched pose).
         """
-        # ── Preprocessing ──
+        # Preprocessing
         try:
             path = self.snap_path_to_nearest_equivalent(path, current_qpos)
             path = self.canonicalize_path_to_planning_limits(path, current_qpos, profile)
@@ -490,7 +484,7 @@ class XArm7MotionPlanner:
             logger.debug("validate_path preprocessing failed: %s", error, exc_info=True)
             return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
 
-        # ── Try smoothed path first; fall back to unsmoothed on failure ──
+        # Try smoothed path first; fall back to unsmoothed on failure.
         smoothed_failure_reason: str | None = None
         for attempt_label, candidate in (
             ("smoothed", path),
@@ -516,7 +510,7 @@ class XArm7MotionPlanner:
                     break
 
             if failure is None:
-                # ── All checks passed ──
+                # All checks passed.
                 report["path_score"] = float(
                     _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
                     + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
@@ -537,18 +531,20 @@ class XArm7MotionPlanner:
 
         return failure  # type: ignore[return-value]  # both attempts failed
 
-    # ── Path validators (each returns None on pass, PathResult on failure) ──
+    # Path validators — each returns None on pass, PathResult on failure.
 
     @staticmethod
     def _make_failure(reason: str, source: str, report: dict) -> PathResult:
         return PathResult(success=False, qpos_path=None, source=source, reason=reason, report=report)
 
     def _check_limit_violation(self, _path, report, source, _profile):
+        """Fail if the planner report flags a joint limit violation."""
         if report.get("limit_violation"):
             return self._make_failure("Path violates planning limits.", source, report)
         return None
 
     def _check_elbow_consistency(self, path, report, source, _profile):
+        """Fail if the path contains an elbow branch flip (J4 crossing ±360° bands)."""
         has_flip, flip_info = self.check_elbow_consistency(path)
         if has_flip:
             report.update(flip_info)
@@ -556,16 +552,19 @@ class XArm7MotionPlanner:
         return None
 
     def _check_start_distance(self, _path, report, source, profile):
+        """Fail if the path start is too far from current joint positions."""
         if report["start_qpos_error_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
             return self._make_failure("Path start is too far from current_qpos.", source, report)
         return None
 
     def _check_waypoint_delta(self, _path, report, source, profile):
+        """Fail if any consecutive waypoint step exceeds the delta limit."""
         if report["max_waypoint_delta_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
             return self._make_failure("Path waypoint delta too large.", source, report)
         return None
 
     def _check_terminal_pose(self, _path, report, source, profile):
+        """Fail if the final waypoint EEF pose error exceeds thresholds."""
         if (
             report["terminal_pos_error_m"] > profile.max_pose_error_pos_m
             or report["terminal_rot_error_rad"] > profile.max_pose_error_rot_rad
@@ -574,6 +573,7 @@ class XArm7MotionPlanner:
         return None
 
     def _check_self_collision(self, path, report, source, profile):
+        """Fail if any waypoint is in self-collision (per SRDF collision pairs)."""
         if not profile.check_self_collision:
             return None
         collision_report = self.check_path_collisions(path)
@@ -592,11 +592,11 @@ class XArm7MotionPlanner:
         return None
 
     def _check_workspace_bounds(self, path, report, source, _profile):
+        """Fail if any waypoint (beyond the first) violates workspace safety bounds."""
         if self.workspace_safety is None:
             return None
         eef_positions = np.array([self.compute_eef_pose_world(q).p for q in path], dtype=np.float64)
-        # Skip waypoint 0 (start position) — the arm may already be outside
-        # workspace; the path is valid as long as subsequent waypoints are safe.
+        # Skip waypoint 0 (start) — arm may already be outside workspace.
         for i, eef_p in enumerate(eef_positions):
             if i == 0:
                 continue
@@ -682,4 +682,3 @@ class XArm7MotionPlanner:
                 "elbow_span_deg": float(np.rad2deg(span)),
             }
         return False, {}
-

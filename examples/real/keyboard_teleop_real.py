@@ -35,17 +35,18 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from dexmani_real.config.defaults import arm, policy
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.path_utils import plan_joint_home_path, wrap_nearest_equivalent
 from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.teleop.keyboard import GlobalKeyState
-from dexmani_real.robot.arm_loop import arm_loop as _arm_loop, ArmLoopConfig
+from dexmani_real.robot.arm_loop import ArmLoopConfig
+from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
-from dexmani_real.shm.shared_storage import SharedStorage, HOME_SENTINEL
 from dexmani_real.robot.safety import SafetyState, transition
+from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage
+from dexmani_real.teleop.keyboard import GlobalKeyState
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.config.defaults import arm, policy
 from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 try:
@@ -158,7 +159,10 @@ def _wait_for_home(
                 # Wrap home_qpos to the nearest equivalent band for comparison
                 # (J1/J3/J5/J7 may report on any ±360° band).
                 _wrapped_home = wrap_nearest_equivalent(
-                    home_qpos_arr, _q, joint_limit_lower, joint_limit_upper,
+                    home_qpos_arr,
+                    _q,
+                    joint_limit_lower,
+                    joint_limit_upper,
                 )
                 if float(np.max(np.abs(_q - _wrapped_home))) < tol_rad:
                     return True
@@ -173,7 +177,9 @@ def main():
     _dt = 1.0 / _cfg.ctrl_hz
     print("=" * 60)
     print("  Keyboard Teleop — xArm7 (SharedStorage)")
-    print(f"  step  pos={_cfg.delta_pos*1000:.0f} mm  rot={np.rad2deg(_cfg.delta_rpy):.1f} deg  dt={_dt*1000:.0f} ms  rate={_cfg.ctrl_hz:.0f} Hz")
+    print(
+        f"  step  pos={_cfg.delta_pos*1000:.0f} mm  rot={np.rad2deg(_cfg.delta_rpy):.1f} deg  dt={_dt*1000:.0f} ms  rate={_cfg.ctrl_hz:.0f} Hz"
+    )
     print(f"  EMA   pos={policy.ema.alpha_pos:.2f}  rot={policy.ema.alpha_rot:.2f}")
     print(f"  Kp    cartesian={_cfg.cartesian_kp:.1f}")
     print(f"  WS    x{WORKSPACE_BOUNDS[0]}  y{WORKSPACE_BOUNDS[1]}  z{WORKSPACE_BOUNDS[2]}")
@@ -264,8 +270,8 @@ def main():
     error_count = 0
     total_state_errors = 0  # cumulative arm state read failures
     max_consecutive_errors = 10
-    _status_interval = 50   # frames between active status prints
-    _idle_interval = 150    # frames between idle heartbeat prints
+    _status_interval = 50  # frames between active status prints
+    _idle_interval = 150  # frames between idle heartbeat prints
     consecutive_divergence = 0
     TRACKING_DIVERGENCE_THRESHOLD_RAD = 5.0
     start_time = time.perf_counter()
@@ -317,7 +323,9 @@ def main():
                 print(f"\n[T+{elapsed:.0f}s f={loop_count}] [R] return_home", flush=True)
                 # Plan collision-safe path to home (same as VR policy)
                 _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
+                _waypoints = plan_joint_home_path(
+                    arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                )
                 if _waypoints is not None and len(_waypoints) > 0:
                     print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
                 elif _waypoints is not None and len(_waypoints) == 0:
@@ -330,7 +338,9 @@ def main():
                 error_count = 0
                 # Wait for homing to converge, then refresh state from ring.
                 _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                _converged = _wait_for_home(shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0)
+                _converged = _wait_for_home(
+                    shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0
+                )
                 if not _converged:
                     print("  home  wait timeout — continuing", flush=True)
                 _arm_result = shared.arm_state_ring.read_latest()
@@ -434,7 +444,7 @@ def main():
                 prev_eef_pos = eef_pos.copy()
                 if not _is_idle:
                     elapsed = time.perf_counter() - start_time
-                    _eef_world_status = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.,0.,0.,0.])))
+                    _eef_world_status = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.0, 0.0, 0.0, 0.0])))
                     _tw = _eef_world_status.p
                     print(
                         f"[T+{elapsed:.0f}s f={loop_count}] "
@@ -454,7 +464,10 @@ def main():
                 _prev_ema_pos = _prev_ema_quat = None  # reset EMA on re-engage
                 if loop_count % _idle_interval == 0:
                     elapsed = time.perf_counter() - start_time
-                    print(f"[idle T+{elapsed:.0f}s]  eef_w=({target_pos[0]:.3f},{target_pos[1]:.3f},{target_pos[2]:.3f}) m", flush=True)
+                    print(
+                        f"[idle T+{elapsed:.0f}s]  eef_w=({target_pos[0]:.3f},{target_pos[1]:.3f},{target_pos[2]:.3f}) m",
+                        flush=True,
+                    )
                 continue
 
             # ── Incremental target (world frame) ──
@@ -471,7 +484,7 @@ def main():
                 _wall_check(axis, target_pos, WORKSPACE_BOUNDS, wall_warned, wall_timers)
 
             if np.any(drpy != 0):
-                dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)
+                dq = R.from_euler("xyz", drpy).as_quat(scalar_first=True)
                 target_quat = quat_multiply(dq, target_quat)
 
             # ── Cartesian EMA (before IK, same as vr_teleop_policy pipeline) ──
@@ -502,12 +515,14 @@ def main():
             #   Kp=0.5 → ~33 mm (−33 %)   Kp=1.0 → ~25 mm (−50 %)
             # Also counteracts Z-axis coupling during pure-X motion.
             if _cfg.cartesian_kp > 0:
-                _eef_world_p = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.,0.,0.,0.]))).p
+                _eef_world_p = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.0, 0.0, 0.0, 0.0]))).p
                 pos_error = target_pos - _eef_world_p
                 if float(np.linalg.norm(pos_error)) > 0.003:  # 3 mm deadband
                     ik_target_pos = ik_target_pos + _cfg.cartesian_kp * pos_error
                     ik_target_pos = np.clip(
-                        ik_target_pos, WORKSPACE_BOUNDS[:, 0], WORKSPACE_BOUNDS[:, 1],
+                        ik_target_pos,
+                        WORKSPACE_BOUNDS[:, 0],
+                        WORKSPACE_BOUNDS[:, 1],
                     )
 
             # ── IK solve (on EMA-smoothed world-frame target) ──
@@ -552,7 +567,7 @@ def main():
                 and np.all(drpy == 0)
             ):
                 ik_fk_pose_world = planner.kin.compute_eef_pose_world(ik_result.qpos)
-                _eef_world_trace = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.,0.,0.,0.])))
+                _eef_world_trace = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.0, 0.0, 0.0, 0.0])))
                 _print_motion_trace(
                     loop_count=loop_count,
                     dx=dx,
@@ -583,7 +598,8 @@ def main():
                     consecutive_divergence += 1
                     logger.warning(
                         "Tracking divergence: max_err=%.1f rad  frame=%d/3",
-                        tracking_err, consecutive_divergence,
+                        tracking_err,
+                        consecutive_divergence,
                     )
                     if consecutive_divergence >= 3:
                         logger.error("Persistent tracking divergence — emergency stop")
@@ -603,8 +619,10 @@ def main():
         ik_ok_count = loop_count - ik_fail_count
         print()
         print("=" * 60)
-        print(f"  Session ended  elapsed={elapsed_total:.0f}s  frames={loop_count}  "
-              f"ik_ok={ik_ok_count}  ik_fail={ik_fail_count}  state_errs={total_state_errors}")
+        print(
+            f"  Session ended  elapsed={elapsed_total:.0f}s  frames={loop_count}  "
+            f"ik_ok={ik_ok_count}  ik_fail={ik_fail_count}  state_errs={total_state_errors}"
+        )
         print("=" * 60)
 
         # Post-loop: offer return_home (keys listener still alive).
@@ -621,8 +639,10 @@ def main():
                     # Wrap home_qpos to nearest equivalent band before comparing
                     # (J1/J3/J5/J7 have 720° range; encoder may report on any band).
                     _wrapped_home = wrap_nearest_equivalent(
-                        _home_qpos_arr, _qpos,
-                        arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper,
+                        _home_qpos_arr,
+                        _qpos,
+                        arm_loop_cfg.joint_limit_lower,
+                        arm_loop_cfg.joint_limit_upper,
                     )
                     _near_home = float(np.max(np.abs(_qpos - _wrapped_home))) < 0.05  # ~3°
 
@@ -642,7 +662,9 @@ def main():
                         _ad, _, _ = _arm_result
                         _arm_qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
                         _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                        _waypoints = plan_joint_home_path(_arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
+                        _waypoints = plan_joint_home_path(
+                            _arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                        )
                         if _waypoints is not None and len(_waypoints) > 0:
                             print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
                         elif _waypoints is not None and len(_waypoints) == 0:
@@ -657,7 +679,13 @@ def main():
                         print("  home  arm state unavailable — falling back to SDK-based homing", flush=True)
                         shared.arm_action_q.put((HOME_SENTINEL, None))
                     _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                    _converged = _wait_for_home(shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0)
+                    _converged = _wait_for_home(
+                        shared,
+                        _home_arr,
+                        arm_loop_cfg.joint_limit_lower,
+                        arm_loop_cfg.joint_limit_upper,
+                        timeout_s=20.0,
+                    )
                     if not _converged:
                         print("  home  wait timeout — continuing", flush=True)
                     print("[Q] quit")

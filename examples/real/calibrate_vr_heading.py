@@ -147,6 +147,7 @@ def main() -> None:
 
     shared = SharedStorage.create(prefix="dexmani_vr_calib")
     from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig
+
     vr_cfg = VRReceiverConfig(port=args.port)
     vr_proc = mp.Process(target=vr_loop, args=(shared, vr_cfg), name="vr-calib", daemon=True)
     vr_proc.start()

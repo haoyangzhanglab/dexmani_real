@@ -104,7 +104,6 @@ class CameraFrame:
     frame_name: str
 
 
-
 def _normalize_align_mode(mode: str) -> AlignMode:
     key = str(mode).lower()
     if key not in ALIGN_MODE_ALIASES:

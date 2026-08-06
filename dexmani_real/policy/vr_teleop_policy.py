@@ -1,9 +1,4 @@
-"""Policy process — VR→IK pipeline, state machine, recording.
-
-Runs as an independent mp.Process, exchanging data exclusively through SharedStorage.
-
-Ref: ManiUniCon Policy process pattern.
-"""
+"""Policy process: VR-to-IK pipeline, state machine, and recording via SharedStorage."""
 
 from __future__ import annotations
 
@@ -27,11 +22,10 @@ from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, 
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage
+from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage, hand_home_converge
 from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state
 from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
 from dexmani_real.shm.shared_storage import write_hand_cmd as _write_hand_cmd
-from dexmani_real.shm.shared_storage import hand_home_converge
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.hand_retarget import XHandRetargeter
@@ -43,7 +37,6 @@ from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 logger = get_logger(__name__)
 
-# ── Frame quality codes (schema v11) ──
 _FRAME_OK = 0
 _FRAME_HELD = 1
 _FRAME_IK_FAIL = 2
@@ -51,16 +44,10 @@ _FRAME_SAFETY_REJECT = 3
 _FRAME_RETARGET_FAIL = 4
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════
-
-
 @dataclass
 class PolicyConfig:
-    """Policy process configuration — defaults from arm/hand/policy singletons."""
+    """Policy process configuration."""
 
-    # Control rate
     control_hz: float = field(default_factory=lambda: policy.control_hz)
 
     # Mode 6 firmware parameters (deg — matches CLI convention)
@@ -68,7 +55,6 @@ class PolicyConfig:
     joint_max_acc_deg_s2: float = field(default_factory=lambda: arm.max_joint_acceleration_deg_per_s2)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
 
-    # VR mapping
     vr_pos_scale: float = field(default_factory=lambda: policy.vr_mapping.pos_scale)
     vr_rot_scale: float = field(default_factory=lambda: policy.vr_mapping.rot_scale)
     vr_max_delta_rot_rad: float = field(default_factory=lambda: policy.vr_mapping.max_delta_rot_rad)
@@ -80,7 +66,6 @@ class PolicyConfig:
     ema_alpha_pos: float = field(default_factory=lambda: policy.ema.alpha_pos)
     ema_alpha_rot: float = field(default_factory=lambda: policy.ema.alpha_rot)
 
-    # Recording
     max_record_seconds: float = field(default_factory=lambda: policy.max_record_duration_s)
     min_record_seconds: float = field(default_factory=lambda: policy.min_record_duration_s)
     episodes_dir: str = field(default_factory=lambda: policy.episodes_dir)
@@ -90,38 +75,29 @@ class PolicyConfig:
     # Status print interval (in control ticks)
     status_every: int = field(default_factory=lambda: policy.status_print_interval)
 
-    # Error tolerance
     max_consecutive_errors: int = field(default_factory=lambda: policy.max_consecutive_errors)
 
-    # Hand retargeting
     hand_enabled: bool = field(default_factory=lambda: policy.hand_enabled)
     hand_retargeting_type: str = field(default_factory=lambda: policy.hand_retargeting_type)
     hand_ramp_frames: int = field(default_factory=lambda: policy.hand_ramp_frame_count)
     hand_disconnect_timeout_s: float = field(default_factory=lambda: policy.hand_disconnect_timeout_s)
 
     # Hand FK (fingertip positions)
-    hand_urdf_path: str = field(
-        default_factory=lambda: str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf")
-    )
+    hand_urdf_path: str = field(default_factory=lambda: str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"))
     fingertip_link_names: tuple[str, ...] = field(default_factory=lambda: hand.fingertip_link_names)
     T_eef_handbase_pos_xyz: tuple[float, float, float] = field(default_factory=lambda: hand.T_eef_handbase_pos_xyz)
-    T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = field(default_factory=lambda: hand.T_eef_handbase_quat_wxyz)
-
+    T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = field(
+        default_factory=lambda: hand.T_eef_handbase_quat_wxyz
+    )
 
     # Joint-space hard limits — sourced from arm singleton via shared_storage.
     joint_limit_lower: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_lower)
     joint_limit_upper: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_upper)
 
-    # Hand home position — sourced from hand singleton.
     hand_home_qpos_deg: tuple[float, ...] = field(default_factory=lambda: hand.home_qpos_deg)
 
     # VR transform config path (relative to repo root)
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Policy loop
-# ═══════════════════════════════════════════════════════════════════
 
 
 def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> None:
@@ -139,7 +115,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     JOINT_HI = np.array(cfg.joint_limit_upper, dtype=np.float64)
     HAND_HOME_QPOS = np.deg2rad(np.array(cfg.hand_home_qpos_deg, dtype=np.float64))
 
-    # ── 1. Planner (MPlib + collision checking) ──
     try:
         urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
         srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
@@ -161,7 +136,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
         )
 
-        # ── 2. VR Arm Mapper ──
         _vr_cfg_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
         if _vr_cfg_path.exists():
             with open(_vr_cfg_path) as _f:
@@ -178,12 +152,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             vr_to_base_rot=_T_vr_fixed,
             T_vr_to_robot=_T_vr_fixed,
             max_delta_rot_rad=cfg.vr_max_delta_rot_rad,
-            base_to_world_rot=Rotation.from_quat(
-                [0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]
-            ).as_matrix(),
+            base_to_world_rot=Rotation.from_quat([0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]).as_matrix(),
         )
 
-        # ── 3. Recorder ──
         _repo_root = Path(__file__).resolve().parents[2]
         recorder = EpisodeRecorder(
             data_dir=str(_repo_root / cfg.episodes_dir),
@@ -197,12 +168,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         shared.is_running.value = False
         return
 
-    # ── 4. Keyboard + Audio ──
     kb = KeyboardHandler()
     kb.start()
     audio = AudioFeedback()
 
-    # ── 4b. Hand Retargeter (VR landmarks → XHand 12-DOF joints) ──
     hand_retargeter: XHandRetargeter | None = None
     hand_available = False
     _hand_disconnected_at: float | None = None  # monotonic timestamp of first bad frame
@@ -225,7 +194,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             hand_available = False
             hand_retargeter = None
 
-    # ── 4b. Hand FK (fingertip positions in world frame) ──
     _hand_fk: HandKinematics | None = None
     _T_eef_handbase_pos = np.array(cfg.T_eef_handbase_pos_xyz, dtype=np.float64)
     _T_eef_handbase_quat_wxyz = np.array(cfg.T_eef_handbase_quat_wxyz, dtype=np.float64)
@@ -239,7 +207,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         except Exception as e:
             logger.warning("Hand FK init failed: %s", e)
 
-    # ── 5. Wait for subsystems ──
     logger.info("Policy: waiting for arm/hand/camera/vr ready...")
     for name, ev in [
         ("arm", shared.arm_ready),
@@ -254,9 +221,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             return
     logger.info("Policy: all subsystems ready")
 
-    # ── 5b. Hand connectivity check (MUST run after hand_ready —
-    # hand_loop publishes initial state BEFORE setting the event,
-    # so the ring is guaranteed populated by now.)
+    # Hand connectivity check: MUST run after hand_ready — hand_loop publishes
+    # initial state BEFORE setting the event, so the ring is guaranteed populated.
     if not cfg.hand_enabled:
         hand_available = False
         logger.info("Hand disabled (hand_enabled=False) — hold-position only")
@@ -276,7 +242,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     # Without this, the ~40 lines of init below race the first supervisor tick.
     shared.policy_heartbeat_s.value = time.monotonic()
 
-    # ── 6. Initial state ──
     home_qpos = np.array(arm.home_qpos, dtype=np.float64)
     arm_state = _read_arm_state(shared)
     hand_state = _read_hand_state(shared)
@@ -292,7 +257,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     )
     planner.set_hand_qpos(prev_hand_qpos)  # sync hand pose for collision checks
 
-    # ── 7. State machine ──
     teleop_active = False
     recording_active = False
     recording_paused = False
@@ -302,11 +266,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     quit_pending = False
     post_teleop_deadline = 0.0
 
-    # ── 8. EMA state ──
     ema_prev_pos: np.ndarray | None = None
     ema_prev_quat: np.ndarray | None = None
 
-    # ── 9. Diagnostics ──
     limiter = RateManager(cfg.control_hz)
     stage_timer = StageTimer(window=cfg.status_every)
     _validate_warn = ThrottledWarner(interval_s=2.0)
@@ -319,14 +281,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     _last_target_eef_rot6d = np.full(6, np.nan)
     _last_tactile_data: np.ndarray | None = None  # forward-fill cache for held-frame tactile
 
-    # ── GC strategy ──
     # Automatic cyclic GC is left enabled (2026-08-05 audit).  The hot path
     # allocates mostly numpy arrays (refcounted, not cyclic), so GC thresholds
-    # are rarely reached.  The two manual gc.collect() calls at episode
-    # boundaries (save-completion + new-episode) serve as explicit hints.
-    # ManiUniCon also runs without gc.disable() at similar rates.
+    # are rarely reached.  gc.collect() at episode boundaries serves as explicit hints.
 
-    # ── SIGTERM graceful shutdown ──
+    # SIGTERM graceful shutdown
     # Policy is spawned via mp.Process; Main calls process.terminate() on
     # shutdown, which sends SIGTERM.  Default SIGTERM handler kills the
     # process immediately → daemon stop-thread killed mid-HDF5-write
@@ -350,7 +309,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             limiter.wait()
             stage_timer.mark("wait")
 
-            # ── Non-blocking save completion ──
             _stop_result = recorder.poll_stop()
             if _stop_result.done and _stop_result.path is not None:
                 if _stop_result.error:
@@ -361,7 +319,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
             loop_count += 1
 
-            # ── Post-teleop quit prompt (two-stage Q) ──
             # Entered after Q key stops teleop.  Policy loop stays alive with
             # heartbeats ticking so arm/hand/vr continue running — H (return_home)
             # can still queue HOME_SENTINEL and wait for convergence.
@@ -370,24 +327,28 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 for _sig in kb.poll(timeout=0.1):
                     if _sig == ControlSignal.HOME:
                         print("  H: return_home")
-                        # ── Hand home first (blocking with heartbeat) ──
                         if hand_available and not shared.error_state.value:
                             _, final_qpos = hand_home_converge(
-                                shared, HAND_HOME_QPOS, heartbeat=True, check_is_running=True, verbose=True,
+                                shared,
+                                HAND_HOME_QPOS,
+                                heartbeat=True,
+                                check_is_running=True,
+                                verbose=True,
                             )
                             if final_qpos is not None:
                                 prev_hand_qpos = final_qpos
                         elif not hand_available:
                             print("  hand: not connected — skipping hand home", flush=True)
 
-                        # ── Arm home ──
                         _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
                         # Read current arm position for path planning.
                         _cur_as = _read_arm_state(shared)
                         _cur_qpos = _home_qpos.copy()
                         if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
                             _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
-                        _waypoints = plan_joint_home_path(_cur_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
+                        _waypoints = plan_joint_home_path(
+                            _cur_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                        )
                         if _waypoints is not None and len(_waypoints) == 0:
                             logger.warning("No collision-safe path to home — arm will hold position")
                         _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
@@ -416,7 +377,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
                 continue  # stay in quit_pending, don't process normal teleop
 
-            # ── Keyboard ──
             skip_rest = False
             for sig in kb.poll(timeout=0.0):
                 if sig == ControlSignal.EMERGENCY_STOP:
@@ -488,17 +448,21 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             ema_prev_pos = ema_prev_quat = None
                             _reset_hand_retargeter(hand_retargeter)
 
-                            # ── Step 1: Hand home first (before arm moves) ──
                             if hand_available and not shared.error_state.value:
                                 _, final_qpos = hand_home_converge(
-                                    shared, HAND_HOME_QPOS, heartbeat=True, check_is_running=True, verbose=True,
+                                    shared,
+                                    HAND_HOME_QPOS,
+                                    heartbeat=True,
+                                    check_is_running=True,
+                                    verbose=True,
                                 )
                                 if final_qpos is not None:
                                     prev_hand_qpos = final_qpos
 
-                            # ── Step 2: Arm home ──
                             _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                            _home_wp = plan_joint_home_path(arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
+                            _home_wp = plan_joint_home_path(
+                                arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                            )
                             if _home_wp is not None and len(_home_wp) == 0:
                                 logger.warning("No collision-safe path to home — arm will hold position")
                             _safe_arm_queue_put(shared, (HOME_SENTINEL, _home_wp))
@@ -530,7 +494,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     ema_prev_pos = ema_prev_quat = None
                     _reset_hand_retargeter(hand_retargeter)
 
-                    # ── Step 1: Hand home first ──
                     # Poll hand_state_ring until the hand converges to home_qpos.
                     # Prevents the arm from sweeping across the workspace while
                     # the hand is still in a grasp pose (collision risk), and
@@ -538,16 +501,21 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     # a single write is unreliable when the hand is in qpos_stale.
                     if hand_available and not shared.error_state.value:
                         _, final_qpos = hand_home_converge(
-                            shared, HAND_HOME_QPOS, heartbeat=True, check_is_running=True, verbose=True,
+                            shared,
+                            HAND_HOME_QPOS,
+                            heartbeat=True,
+                            check_is_running=True,
+                            verbose=True,
                         )
                         if final_qpos is not None:
                             prev_hand_qpos = final_qpos
                     elif not hand_available:
                         print("  hand: not connected — skipping hand home", flush=True)
 
-                    # ── Step 2: Arm home (after hand is at home) ──
                     _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                    _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
+                    _waypoints = plan_joint_home_path(
+                        arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                    )
                     _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
 
                     # Wait for arm to actually converge to home_qpos before
@@ -630,7 +598,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _cam_K_flat = list(shared.camera_K)
                     if any(v != 0.0 for v in _cam_K_flat):
                         _cam_K = np.array(_cam_K_flat, dtype=np.float64).reshape(3, 3)
-                    _depth_scale = float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
+                    _depth_scale = (
+                        float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
+                    )
                     _cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
                     _cam_serial = _cam_serial_bytes.decode() if _cam_serial_bytes else None
 
@@ -640,7 +610,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         _cam_name = _calib.resolve_name_by_serial(_cam_serial) if _cam_serial else None
                     except (KeyError, FileNotFoundError):
                         _cam_name = None
-                        logger.warning("Camera serial %s not found in cameras.json — no extrinsics in /meta", _cam_serial)
+                        logger.warning(
+                            "Camera serial %s not found in cameras.json — no extrinsics in /meta", _cam_serial
+                        )
 
                     if not recorder.start_episode(
                         task_label=cfg.task_label,
@@ -690,7 +662,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             if skip_rest:
                 continue
 
-            # ── Read arm state ──
             arm_state = _read_arm_state(shared)
             if arm_state is None:
                 error_count += 1
@@ -711,18 +682,15 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 continue
             error_count = 0
 
-            # ── Read VR frame ──
             vr_frame = _read_vr_frame(shared)
             vr_stale = vr_frame is None or (
                 (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > cfg.vr_stale_threshold_s * 1e9
             )
             stage_timer.mark("vr")
 
-            # ── Read camera frame ──
             cam = _read_camera_frame(shared)
             stage_timer.mark("cam")
 
-            # ── Read hand state (before held-recording so held frames capture hand data) ──
             hand_state = _read_hand_state(shared)
             hand_tactile = _read_hand_tactile(shared)
             # Forward-fill: cache the last non-None tactile read so both held
@@ -734,7 +702,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             elif _last_tactile_data is not None:
                 hand_tactile = _last_tactile_data
 
-            # ── Hand liveness: transient-glitch hold, persistent-disconnect detection ──
             # Single-frame RS485/EtherCAT glitches → retargeter keeps running (commands
             # land on a silent bus — harmless).  Only degrade to hold-position mode after
             # a persistent disconnect exceeding hand_disconnect_timeout_s.
@@ -770,28 +737,42 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     )
                     hand_available = False
 
-            # ── Periodic status ──
             if loop_count % cfg.status_every == 0:
                 _arm_age = time.monotonic() - float(arm_state["timestamp"][0]) if arm_state is not None else -1.0
                 _qdepth = shared.arm_action_q.qsize()
-                _print_status(loop_count, arm_state, vr_frame, teleop_active, recording_active,
-                             error_count, arm_q_depth=_qdepth, arm_state_age_s=_arm_age)
+                _print_status(
+                    loop_count,
+                    arm_state,
+                    vr_frame,
+                    teleop_active,
+                    recording_active,
+                    error_count,
+                    arm_q_depth=_qdepth,
+                    arm_state_age_s=_arm_age,
+                )
 
-            # ── Held / inactive → record held frame → continue ──
             if not teleop_active or vr_stale:
                 if recording_active and not recording_paused:
-                    _record_held(recorder, arm_state, prev_qpos_cmd, prev_hand_qpos, vr_frame, cam,
-                                 hand_state=hand_state, hand_tactile=hand_tactile,
-                                 arm_qpos_sent=prev_qpos_cmd.copy(),
-                                 target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d,
-                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
-                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
                 prev_qpos_cmd = arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None
                 continue
 
-            # ── Audio hold (falling-edge detection) ──
             # Hold arm position while voice prompts play, then run hold-exit
             # (mapper reset + EMA clear + hand ramp) on the falling edge.
             if audio.is_playing:
@@ -840,18 +821,26 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 _reset_hand_retargeter(hand_retargeter, prev_hand_qpos.copy() if hand_available else None)
                 _prev_audio_playing = False
 
-            # ── VR→EEF mapping ──
             assert vr_frame is not None  # guaranteed by vr_stale check above
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
                 if recording_active:
-                    _record_held(recorder, arm_state, prev_qpos_cmd, prev_hand_qpos, vr_frame, cam,
-                                 hand_state=hand_state, hand_tactile=hand_tactile,
-                                 arm_qpos_sent=prev_qpos_cmd.copy(),
-                                 target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d,
-                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
-                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
                 if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
                     shared.is_running.value = False
                     break
@@ -860,22 +849,23 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             target_pos = mapped["pos"]
             target_quat = mapped["quat_wxyz"]
 
-            # ── Cartesian EMA ──
             if ema_prev_pos is not None:
                 assert ema_prev_quat is not None  # set together with ema_prev_pos
                 target_pos, target_quat = ema_smooth_pose(
-                    target_pos, target_quat, ema_prev_pos, ema_prev_quat,
-                    cfg.ema_alpha_pos, cfg.ema_alpha_rot,
+                    target_pos,
+                    target_quat,
+                    ema_prev_pos,
+                    ema_prev_quat,
+                    cfg.ema_alpha_pos,
+                    cfg.ema_alpha_rot,
                 )
 
-            # ── Workspace clamp ──
             target_pos_before_clamp = target_pos.copy()
             for axis in range(3):
                 lo, hi = cfg.workspace_bounds[axis]
                 target_pos[axis] = np.clip(target_pos[axis], lo, hi)
             stage_timer.mark("map")
 
-            # ── IK solve ──
             planner.set_hand_qpos(prev_hand_qpos)  # sync hand pose for collision checks
             target_pose = Pose(p=target_pos, q=target_quat)
             _ik_t0 = time.perf_counter()
@@ -883,7 +873,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             ik_solve_time_ms = (time.perf_counter() - _ik_t0) * 1000.0
             stage_timer.mark("ik")
 
-            # ── Hand: compute via retargeting from VR landmarks ──
             # (before IK fail/gate checks — hand retargeting is independent of arm IK,
             # so hand commands are sent even when IK fails)
             hand_cmd, retarget_ok = _compute_hand_command(
@@ -914,14 +903,24 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
             if not ik_result.success or ik_result.qpos is None:
                 if recording_active:
-                    _record_held(recorder, arm_state, prev_qpos_cmd, prev_hand_qpos, vr_frame, cam,
-                                 hand_state=hand_state, hand_tactile=hand_tactile,
-                                 frame_status=_FRAME_IK_FAIL, retarget_ok=retarget_ok,
-                                 arm_qpos_sent=prev_qpos_cmd.copy(),
-                                 target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d,
-                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
-                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        frame_status=_FRAME_IK_FAIL,
+                        retarget_ok=retarget_ok,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
                 if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
                     shared.is_running.value = False
                     break
@@ -940,7 +939,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             # IK drifts beyond firmware-accepted bounds).
             arm_cmd = np.clip(arm_cmd, JOINT_LO, JOINT_HI)
 
-            # ── Validate (arm connection + NaN guard) ──
             # Error codes (C22/C24/C31) are handled by arm_loop independently
             # (auto-recover) or trigger FAULT (non-recoverable).  Policy only
             # gates on arm connectivity and command sanity.
@@ -959,14 +957,24 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             if _reject:
                 _validate_warn("policy_loop: action rejected — %s", _reject_reason)
                 if recording_active:
-                    _record_held(recorder, arm_state, prev_qpos_cmd, prev_hand_qpos, vr_frame, cam,
-                                 hand_state=hand_state, hand_tactile=hand_tactile,
-                                 frame_status=_FRAME_SAFETY_REJECT, retarget_ok=retarget_ok,
-                                 arm_qpos_sent=prev_qpos_cmd.copy(),
-                                 target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d,
-                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
-                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        frame_status=_FRAME_SAFETY_REJECT,
+                        retarget_ok=retarget_ok,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
                 if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
                     shared.is_running.value = False
                     break
@@ -977,17 +985,25 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     prev_hand_qpos = hand_cmd.copy()
                 continue
 
-            # ── Send ──
             # FAULT gate: do not send actions when system is in fault state.
             if shared.safety_state.value == SafetyState.FAULT:
                 if recording_active:
-                    _record_held(recorder, arm_state, prev_qpos_cmd, prev_hand_qpos, vr_frame, cam,
-                                 hand_state=hand_state, hand_tactile=hand_tactile,
-                                 arm_qpos_sent=prev_qpos_cmd.copy(),
-                                 target_eef_pos=_last_target_eef_pos,
-                                 target_eef_rot6d=_last_target_eef_rot6d,
-                                 hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
-                                 T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
                 continue
             if not _safe_arm_queue_put(shared, {"qpos": arm_cmd.copy()}):
                 logger.error("policy_loop: arm_action_q full on main send — arm unresponsive")
@@ -1000,7 +1016,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             ema_prev_pos = target_pos.copy()
             ema_prev_quat = target_quat.copy()
 
-            # ── Record ──
             if recording_active:
                 # Track last valid IK target for held-frame continuity.
                 _last_target_eef_pos = target_pos.copy()
@@ -1010,12 +1025,25 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _f_status = _FRAME_RETARGET_FAIL
                 else:
                     _f_status = _FRAME_OK
-                _record_frame(recorder, arm_state, hand_state, arm_cmd, hand_cmd,
-                              target_pos, target_quat, vr_frame, cam, ik_solve_time_ms,
-                              target_pos_before_clamp,
-                              hand_tactile, retarget_ok=retarget_ok, frame_status=_f_status,
-                              hand_fk=_hand_fk, T_eef_handbase_pos=_T_eef_handbase_pos,
-                              T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz)
+                _record_frame(
+                    recorder,
+                    arm_state,
+                    hand_state,
+                    arm_cmd,
+                    hand_cmd,
+                    target_pos,
+                    target_quat,
+                    vr_frame,
+                    cam,
+                    ik_solve_time_ms,
+                    target_pos_before_clamp,
+                    hand_tactile,
+                    retarget_ok=retarget_ok,
+                    frame_status=_f_status,
+                    hand_fk=_hand_fk,
+                    T_eef_handbase_pos=_T_eef_handbase_pos,
+                    T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                )
             stage_timer.mark("rec")
 
     finally:
@@ -1027,11 +1055,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         audio.play("end")
         time.sleep(2.0)
         logger.info("Policy: loop exited")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════
 
 
 def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.2) -> bool:
@@ -1078,7 +1101,6 @@ def _wait_arm_home_convergence(shared: SharedStorage, home_qpos: np.ndarray, *, 
     return False
 
 
-
 def _read_vr_frame(shared: SharedStorage) -> dict | None:
     """Read latest VR frame from ring, return as dict or None."""
     result = shared.vr_ring.read_latest()
@@ -1121,7 +1143,6 @@ def _read_camera_frame(shared: SharedStorage) -> dict | None:
     return None
 
 
-
 def _try_reset_mapper(shared: SharedStorage) -> bool:
     """Validate that arm and VR state are available for resume-calibrate initiation. Returns True on success."""
     vr_frame = _read_vr_frame(shared)
@@ -1138,7 +1159,9 @@ def _try_reset_mapper(shared: SharedStorage) -> bool:
     return True
 
 
-def _stop_recording(recorder: EpisodeRecorder, was_active: bool, *, save: bool, shared: SharedStorage | None = None) -> None:
+def _stop_recording(
+    recorder: EpisodeRecorder, was_active: bool, *, save: bool, shared: SharedStorage | None = None
+) -> None:
     """Stop recording if active. Non-blocking — poll completion in main loop."""
     if was_active:
         recorder.stop_episode(success=save)
@@ -1162,7 +1185,7 @@ def _record_held(
     diagnostics: dict | None = None,
     target_eef_pos: np.ndarray | None = None,
     target_eef_rot6d: np.ndarray | None = None,
-    hand_fk = None,
+    hand_fk=None,
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
 ) -> None:
@@ -1188,17 +1211,26 @@ def _record_held(
         target_eef_rot6d=target_eef_rot6d.copy() if target_eef_rot6d is not None else None,
     )
     state = _build_robot_state(
-        arm_state, hand_state, hand_tactile,
+        arm_state,
+        hand_state,
+        hand_tactile,
         hk=hand_fk,
         T_eef_handbase_pos=T_eef_handbase_pos,
         T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
     )
     recorder.add_frame(
-        state, action, vr_frame, camera_frame=cam,
-        signals={"ik_ok": False, "ik_attempted": frame_status != _FRAME_HELD,
-                 "retarget_ok": retarget_ok, "held": True,
-                 "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
-                 "frame_status": frame_status},
+        state,
+        action,
+        vr_frame,
+        camera_frame=cam,
+        signals={
+            "ik_ok": False,
+            "ik_attempted": frame_status != _FRAME_HELD,
+            "retarget_ok": retarget_ok,
+            "held": True,
+            "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
+            "frame_status": frame_status,
+        },
         arm_qpos_sent=arm_qpos_sent,
         diagnostics=diagnostics,
     )
@@ -1220,7 +1252,7 @@ def _record_frame(
     *,
     retarget_ok: bool = False,
     frame_status: int = _FRAME_OK,
-    hand_fk = None,
+    hand_fk=None,
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
 ) -> None:
@@ -1237,25 +1269,43 @@ def _record_frame(
         target_eef_rot6d=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat)),
     )
     state = _build_robot_state(
-        arm_state, hand_state, hand_tactile,
+        arm_state,
+        hand_state,
+        hand_tactile,
         hk=hand_fk,
         T_eef_handbase_pos=T_eef_handbase_pos,
         T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
     )
     head_quat = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
-    _vr = vr_frame if vr_frame is not None else {
-        "wrist_pos": np.full(3, np.nan),
-        "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
-        "landmarks": np.full((21, 3), np.nan),
-    }
+    _vr = (
+        vr_frame
+        if vr_frame is not None
+        else {
+            "wrist_pos": np.full(3, np.nan),
+            "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+            "landmarks": np.full((21, 3), np.nan),
+        }
+    )
     recorder.add_frame(
-        state, action, _vr, camera_frame=cam,
-        signals={"ik_ok": True, "ik_attempted": True, "retarget_ok": retarget_ok,
-                 "held": False, "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
-                 "frame_status": frame_status},
+        state,
+        action,
+        _vr,
+        camera_frame=cam,
+        signals={
+            "ik_ok": True,
+            "ik_attempted": True,
+            "retarget_ok": retarget_ok,
+            "held": False,
+            "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
+            "frame_status": frame_status,
+        },
         arm_qpos_sent=arm_cmd.copy(),
         diagnostics={
-            "tracking_error": float(arm_state["tracking_err"][0]) if arm_state is not None and "tracking_err" in arm_state.dtype.names else 0.0,
+            "tracking_error": (
+                float(arm_state["tracking_err"][0])
+                if arm_state is not None and "tracking_err" in arm_state.dtype.names
+                else 0.0
+            ),
             "ik_solve_time_ms": ik_solve_time_ms,
             "target_pos_before_clamp": target_pos_before_clamp,
             "head_quat_wxyz": head_quat if head_quat is not None else np.full(4, np.nan),
@@ -1263,11 +1313,14 @@ def _record_frame(
     )
 
 
-def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | None,
-                       hand_tactile: np.ndarray | None = None,
-                       hk: HandKinematics | None = None,
-                       T_eef_handbase_pos: np.ndarray | None = None,
-                       T_eef_handbase_quat_wxyz: np.ndarray | None = None) -> RobotState:
+def _build_robot_state(
+    arm_state: np.ndarray | None,
+    hand_state: np.ndarray | None,
+    hand_tactile: np.ndarray | None = None,
+    hk: HandKinematics | None = None,
+    T_eef_handbase_pos: np.ndarray | None = None,
+    T_eef_handbase_quat_wxyz: np.ndarray | None = None,
+) -> RobotState:
     """Build a RobotState from ring data for recording compatibility."""
     if arm_state is not None:
         r = arm_state[0]
@@ -1307,7 +1360,6 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
     else:
         hand_tactile_force = np.zeros((5, 120, 3), dtype=np.float64)
 
-    # ── EEF quaternion (computed once, used by FK block + return) ──
     _eef_finite = np.all(np.isfinite(eef_rot6d))
     eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d) if _eef_finite else np.array([1.0, 0.0, 0.0, 0.0])
 
@@ -1351,11 +1403,6 @@ def _build_robot_state(arm_state: np.ndarray | None, hand_state: np.ndarray | No
         timestamp=time.perf_counter(),
     )
 
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Hand retargeting helpers (P4 Step 1 — ported from vr_teleop_hand_record.py)
-# ═══════════════════════════════════════════════════════════════════
 
 _retarget_fail_warn = ThrottledWarner()
 

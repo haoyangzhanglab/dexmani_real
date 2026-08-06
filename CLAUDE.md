@@ -32,7 +32,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 
 ---
 
-## Architecture (simplified — Phase 2, 2026-08-02)
+## Architecture
 
 ### 5-Process Model + Thin Main
 
@@ -178,49 +178,21 @@ already catches.
 8. **Safety state machine:** formal DISARMED/ARMED/RUNNING/FAULT states with validated
    transitions (Main owns DISARMED↔ARMED/→FAULT, Policy owns ARMED↔RUNNING)
 
-### Removed (2026-08-03 audit)
+### Key safety features
 
-- ~~Arm-level joint limit clip~~ (Policy clips, firmware C31 is backstop — arm_loop don't re-clip)
-- ~~Policy arm error code gate~~ (arm_loop independently handles all error codes)
-- ~~VR quat continuity gate~~ (firmware speed/accel limits + IK delta clamp sufficient)
-- ~~startup_error mp.Array~~ (child processes `logger.error()` + `return`; Main detects via
-  ready-event timeout + process exit)
-- ~~Tactile force safety gate~~ (not a safety concern for this system)
-- ~~Arm-level stale target timeout~~ (heartbeat supervisor is the real safety net; redundant
-  `set_servo_angle` calls to Mode 6 are no-ops — same target = no motion)
-
-### Added (2026-08-03)
-
-- **Hand qpos_stale hold:** when hand_loop detects driver board lockout (qpos unchanged 15+
-  frames), Policy holds prev_hand_qpos and sets retarget_ok=False — prevents gap jump on
-  recovery, marks frames for offline filtering
-- **Hand cmd NaN ring guard:** Policy no longer pushes NaN-rejected hand commands into
-  hand_cmd_ring (hand_loop NaN guard retained as zero-cost backstop)
-- **Recovery counter FAULT escalation (2026-08-03 ultracode review):** arm_loop's
-  `except Exception` path and state-read C22/C24/C31 recovery path now share
-  `_RECOVERY_MAX=30` escalation — persistent servo exceptions or state-read errors
-  trigger FAULT instead of silent infinite retry. Separate counters
-  (`_consecutive_recoveries` for servo, `_consecutive_state_errors` for state-read)
-  prevent cross-contamination. Hand send-error watchdog intentionally excluded —
-  hand comm errors are frequently intermittent and self-recovering; the clear_error()
-  retry loop is correct.
-
-### Earlier removals (pre-2026-08-03)
-
-- ~~Dual-path estop fallback~~ (flag → loop exit → cleanup, single path)
-- ~~Three-tier tracking error~~ (single warning threshold)
-- ~~RPC macro subsystem~~ (HOME sentinel through action queue)
-- ~~No heartbeat~~ (2026-08-02: per-process heartbeat + Supervisor, ManiUniCon P0)
+- **Hand qpos_stale hold**: prevents gap jump on driver board lockout recovery
+- **Recovery counter FAULT escalation**: `_RECOVERY_MAX=30` — persistent errors trigger FAULT instead of silent infinite retry. Separate counters for servo and state-read errors.
+- Archived safety simplifications: arm joint-limit clip, policy error-code gate, VR quat gate, startup_error, tactile gate, stale target timeout — all removed in favor of firmware backstop + heartbeat supervisor.
 
 ---
 
 ## Known Footguns
 
-- **C24 mid-motion:** IK spike → hold-on-failure → ramp reset → overspeed trip (`c24-ramp-reset-midmotion.md`)
-- **Frozen camera:** L515 mid-run silent stall ~35-60s; forward-fill masks it (`l515-midrun-stream-stall.md`)
-- **ENOSPC false positive:** Disk check races with async writer (`arm-only-record-session-2026-07-18.md`)
-- **Velocity tuning ineffective:** Mode 6 bottleneck is acc/jerk, not velocity (`mode6-tracking-error-root-cause.md`)
-- **Arm Queue backpressure:** `maxsize=2` means Policy blocks if Arm falls >125ms behind — monitor with status print
+- **C24 mid-motion**: ~~IK spike → hold-on-failure → ramp reset → overspeed trip~~ (fixed: hold-on-failure preserves last valid target)
+- **Frozen camera**: L515 mid-run silent stall ~35-60s; forward-fill masks it
+- **ENOSPC false positive**: Disk check races with async writer
+- **Velocity tuning ineffective**: Mode 6 bottleneck is acc/jerk, not velocity
+- **Arm Queue backpressure**: `maxsize=2` means Policy blocks if Arm falls >125ms behind — monitor with status print
 
 ---
 
@@ -277,9 +249,11 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 
 ## Entry Points
 
-**Primary (new architecture):** `examples/real/vr_teleop_hand_record.py` (~310 lines, canonical entry point — 5-process SharedStorage model, `--task`/`--operator`/`--acc`/`--speed`/`--no-hand` CLI).
-**Also new arch:** `keyboard_teleop_real.py`, `calibrate_vr_heading.py`, **`replay_traj.py`**, **`calibrate_camera.py`**.
-**Diag:** `calibrate_l515_depth.py`, `test_*.py`.
+- **Primary**: `examples/real/vr_teleop_hand_record.py` — canonical 5-process entry, `--task`/`--operator`/`--acc`/`--speed`/`--no-hand`
+- **Keyboard teleop**: `examples/real/keyboard_teleop_real.py` — arm-only, SharedStorage
+- **Camera calibration**: `examples/real/calibrate_camera.py` — ArUco eye-to-hand
+- **Trajectory replay**: `examples/real/replay_traj.py` — episode replay + consistency metrics
+- **VR heading calib**: `examples/real/calibrate_vr_heading.py`
 
 ---
 
@@ -297,23 +271,20 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 
 ---
 
-## ToDo
+## Changelog (key milestones)
 
-- **P0 — 采集入口加 task_label 参数**: ✅ `--task`/`--operator` CLI 已在 `vr_teleop_hand_record.py`（主入口）接入。
-- **P0 — M05 RingBuffer get_last_k(k)** (2026-08-05): ✅ `SeqlockRingBuffer.get_last_k(k)` 已实现（独立 seqlock + 严格序列匹配 + 覆盖早停）；+`read_arm_state_k`/`read_hand_state_k` 便捷封装；state ring maxlen 3→8；16 单元测试。
-- **P1 — held 帧过滤工具**: ✅ `dexmani_real/tools/episode_quality.py filter` 已实现 (2026-08-03)。训练前按 `flag_held == True` 过滤（`data.h5` 已有此字段）。
-- **P1 — 代码去重 D01+D02+D03** (2026-08-05): ✅ `hand_home_converge()` 提取到 shared_storage.py；✅ `_seed_hand_retargeter()` 提取到 vr_teleop_policy.py；消除 ~80 行重复代码。
-- **P2 — 跟踪误差过滤阈值**: ✅ tracking error 已由 arm_loop 计算并发布到 arm_state_ring，Policy 记录到 HDF5。episode_quality.py filter 支持 `--max-tracking-error`。
-- **P3 — camera_loop 独立模块**: ✅ camera_loop 已提取到 `sensor/camera_process.py`。
-- **P4 — 旧入口点迁移**: ✅ 全部完成 (2026-08-03)。旧入口点已删除，所有功能已迁移至 SharedStorage 架构。
-- **P5 — Config 常量整合**: ✅ 全部完成 (2026-08-03)。SharedStorageConfig 集中 ring maxlen、camera 默认分辨率、workspace bounds。
-- **P6 — 异常处理加固 (2026-08-02)**: ✅ S02 validate gate 接入 policy_loop；✅ ERR-1~ERR-11 全部修复；✅ PI-4 hand_loop home settle；✅ PI-5 policy init 异常；✅ ThrottledWarner 支持 kwargs。
-- **P6c — 安全简化 (2026-08-03)**: ✅ Arm 层关节限位裁剪移除；✅ Policy 层 arm 错误码门控移除；✅ startup_error mp.Array 移除；✅ VR/NAN/tactile/hand 门控简化；✅ arm_loop stale target timeout 移除。
-- **P6b — Safety State Machine + Heartbeat (2026-08-02)**: ✅ SafetyState enum + transition validation；✅ 5 per-process heartbeats；✅ Main 10Hz heartbeat supervisor；✅ arm_loop/hand_loop/policy_loop safety gate；✅ FAULT transition on non-recoverable errors。Ref: ManiUniCon §13.2 P0 #2, #4。
-- **Phase 3~7 — 入口点全量迁移 (2026-08-03)**: ✅ vr_teleop_hand_record.py (canonical)、keyboard_teleop_real.py、calibrate_vr_heading.py、replay_traj.py、calibrate_camera.py 全部迁移至 SharedStorage 架构。
-- **Phase 9b — SharedStorageConfig 常量整合 (2026-08-03)**: ✅ SharedStorageConfig dataclass 集中 ring maxlen、camera 默认分辨率、workspace bounds。
-- **Dead code cleanup (2026-08-03)**: ✅ 删除 robot/interface.py、robot/validate.py、robot/preflight.py、robot/arm_process.py；✅ hand_process.py 移除所有 legacy 类（HandControlProcess/HandSHMFaçade/HandSHMAdapter 等）；✅ types.py 移除 RobotInterfaceConfig；✅ (2026-08-03 后续) 删除 defaults.py 6 个 _Deprecated* 类 + TeleopDefaults；✅ 删除 planning/collision_config.py；✅ 删除 test_quest_hand_teleop.py；✅ shared_storage.py 移除 4 个 re-export；✅ 清理所有过期注释/docstring 中的 RobotInterface/RobotInterfaceConfig/ArmProcess 引用；✅ 更新 CLAUDE.md 架构图。
-- **Teleop 扁平化 (2026-08-04)**: ✅ 移除 control/core/vr 三个子目录，所有文件直置于 teleop/；✅ 删除 core/pipeline.py (TeleopPipeline 未使用)、vr/vr_tracker.py (QuestHandTracker 未使用)、vr/dummy_tracker.py (零引用)；✅ 更新所有 import 路径 (teleop.{control,vr}.* → teleop.*)；✅ 清理 stale 注释和 pycache。
-- **Code review bugfixes (2026-08-03)**: ✅ calibrate_camera.py CRITICAL NameError 修复（_get_ee_pose 中未定义的 Rotation）；✅ replay_traj.py queue.put 死锁修复（error_state 门控 + estopped 守卫）；✅ 多处 heartbeat wait loop 修复。
-- **Code review round 2 (2026-08-03)**: ✅ CRITICAL: keyboard_teleop NameError 修复（XArm7Config 未导入）；✅ CRITICAL: `--acc`/`--speed` CLI 参数传递到 arm_loop（hand_record + keyboard_teleop）；✅ CRITICAL: arm_action_q blocking put() 改为 timeout-protected（policy_loop）；✅ HIGH: `--no-hand` 标志修复（hand_enabled 字段 +hand_loop 跳过）；✅ HIGH: arm_loop/hand_loop 资源泄漏修复（init 失败时 disconnect）；✅ HIGH: 重复辅助函数提取（read_arm_state/read_hand_state/write_hand_cmd → shared_storage.py）；✅ HIGH: 重复 rot6d 转换函数去重；✅ vm_loop 心跳竞态修复；✅ _simple_homing 心跳阻塞修复；✅ HandState.from_ring() 添加 qpos_stale；✅ arm.home_qpos 常量集中；✅ 死配置字段/无用导入/过时 docstring 清理。
-- **Ultracode 全库审查修复 (2026-08-03)**: ✅ M1: arm_loop 恢复路径 FAULT 升级（`_RECOVERY_MAX=30` 常量 + `except Exception` 路径 + state-read C22/C24/C31 独立计数器）；✅ F#15: ArmWristMapper.reset() NaN 守卫；✅ F#3: camera_loop 元数据轮询；✅ F#13: camera_serial 校验接通；✅ F#14: 相机帧读取错误日志 DEBUG→WARNING；✅ F#4: smoothing_alpha 死参数修复（默认 None，YAML 仅在未指定时覆盖）；✅ F#18: HandRetarget.reset() 关节顺序重映射；✅ F#23: 仿真 np.clip NaN 守卫；✅ F#17: GlobalKeyState stop-before-start 修复；✅ F#12: 空 MP4 守卫；✅ F#8: align 丢弃相机→报错；✅ 死代码清理（vr_tracker event/last_read_key, serialization 不可达分支, log.py _loggers 冗余, visualize sys.path hack）；✅ 代码质量（audio bare except, pointcloud FPS warning, is_error 简化, types string concat）。Hand 发送错误看门狗**保留现状**（通信错误偶发可恢复，clear_error 重试是正确策略）。
+All items below are resolved — see git log for full history.
+
+- **P0**: Safety state machine (DISARMED/ARMED/RUNNING/FAULT) + 5-process heartbeats + Main supervisor
+- **P0**: `SeqlockRingBuffer.get_last_k(k)` multi-frame read + `read_arm_state_k`/`read_hand_state_k`
+- **P1**: Code dedup — `hand_home_converge()`, `_seed_hand_retargeter()`, shared ring helpers
+- **P1**: Episode quality toolkit — held-frame filter, tracking-error filter, health/validate/assess
+- **P2**: camera_loop extracted to `sensor/camera_process.py`
+- **P3-P7**: All entry points migrated to SharedStorage architecture; old entry points deleted
+- **Config**: `SharedStorageConfig` centralized; defaults.py frozen singletons + JSON override
+- **Teleop**: Directory flattened (control/vr/core removed); dead code deleted (~690 lines)
+- **Robot**: `xarm7/` subpackage deleted; inner_loop→arm_loop rename; hand legacy classes removed
+- **Safety simplification**: Redundant gates removed (firmware is the backstop)
+- **Ultracode review**: 23 fixes (arm_loop FAULT escalation, NaN guards, camera metadata race, etc.)
+- **Code review rounds 1-2**: NameError fixes, CLI parameter plumbing, resource leak fixes, import cleanup
+- **Dead code**: `robot/interface.py`, `validate.py`, `preflight.py`, `arm_process.py`, `collision_config.py`, deprecation classes, unused imports — all removed

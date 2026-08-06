@@ -75,7 +75,8 @@ from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7Mot
 from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
-from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
+from dexmani_real.robot.arm_loop import ArmLoopConfig
+from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
@@ -566,7 +567,7 @@ def compute_metrics(
     if T >= 20:
         try:
             MAX_LAG = int(np.ceil(fps * 0.4))  # ±400 ms search window
-            MAX_LAG = max(MAX_LAG, 6)          # at least ±6 frames
+            MAX_LAG = max(MAX_LAG, 6)  # at least ±6 frames
             joint_lags: list[int] = []
             for j in range(7):
                 best_lag, best_rmse = 0, float("inf")
@@ -991,8 +992,13 @@ class TrajectoryReplayer:
                     ts = time.perf_counter()
                     if self._recorder is not None:
                         self._recorder.record(
-                            frame_idx, as_dict["qpos"], as_dict["eef_pos"], as_dict["eef_rot6d"],
-                            arm_cmd, hand_cmd, ts,
+                            frame_idx,
+                            as_dict["qpos"],
+                            as_dict["eef_pos"],
+                            as_dict["eef_rot6d"],
+                            arm_cmd,
+                            hand_cmd,
+                            ts,
                             arm_sent_cmd=None,
                             arm_tracking_error=as_dict["tracking_err"],
                             safety_reject_reason=fail_reason,
@@ -1025,8 +1031,12 @@ class TrajectoryReplayer:
                 if self._recorder is not None:
                     self._recorder.record(
                         frame_idx,
-                        as_dict["qpos"], as_dict["eef_pos"], as_dict["eef_rot6d"],
-                        arm_cmd, hand_cmd, ts,
+                        as_dict["qpos"],
+                        as_dict["eef_pos"],
+                        as_dict["eef_rot6d"],
+                        arm_cmd,
+                        hand_cmd,
+                        ts,
                         arm_sent_cmd=sent_cmd,
                         arm_tracking_error=as_dict["tracking_err"],
                         hand_qpos=hand_qpos,
@@ -1271,6 +1281,7 @@ Control keys:
     ]
     if hand_available:
         from dexmani_real.robot.hand_process import HandProcessConfig
+
         hand_cfg = HandProcessConfig()
         procs.append(mp.Process(target=_hand_loop, args=(shared, hand_cfg), name="hand", daemon=True))
 
@@ -1319,7 +1330,8 @@ Control keys:
 
     # ── Replay ──
     replayer = TrajectoryReplayer(
-        traj, shared,
+        traj,
+        shared,
         speed=args.speed,
         dry_run=False,
         no_hand=args.no_hand,
@@ -1440,8 +1452,11 @@ Control keys:
                         if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
                             _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
                         from dexmani_real.config.defaults import arm as _arm_defaults
+
                         _waypoints = plan_joint_home_path(
-                            _cur_qpos, _home_arr, replayer._planner,
+                            _cur_qpos,
+                            _home_arr,
+                            replayer._planner,
                             table_z_surface_m=_arm_defaults.table_z_surface_m,
                         )
                         if _waypoints is not None and len(_waypoints) == 0:

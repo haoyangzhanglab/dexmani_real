@@ -137,8 +137,10 @@ class AudioFeedback:
                 cancel = threading.Event()
                 self._queue_cancel = cancel
                 self._queue_thread = threading.Thread(
-                    target=self._queue_worker, args=(cancel,),
-                    daemon=True, name="audio-queue",
+                    target=self._queue_worker,
+                    args=(cancel,),
+                    daemon=True,
+                    name="audio-queue",
                 )
                 self._queue_thread.start()
 

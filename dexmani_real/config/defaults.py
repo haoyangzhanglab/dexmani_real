@@ -113,20 +113,32 @@ class ArmParams:
     home_qpos: tuple[float, ...] = (
         -0.523599,  # J1: -30.0°
         -0.033161,  # J2: -1.9°
-        0.0,        # J3: 0.0°
-        0.235619,   # J4: 13.5°
+        0.0,  # J3: 0.0°
+        0.235619,  # J4: 13.5°
         -3.141593,  # J5: -180.0°
-        1.303762,   # J6: 74.7°
-        0.0,        # J7: 0.0°
+        1.303762,  # J6: 74.7°
+        0.0,  # J7: 0.0°
     )
 
     # ── Joint limits (rad) — mirrors xarm7 URDF ──
     # URDF source: assets/robots/xhand/xarm7_xhand_collision.urdf
     joint_limit_lower: tuple[float, ...] = (
-        -6.28318530718, -2.059, -6.28318530718, -0.19198, -6.28318530718, -1.69297, -6.28318530718,
+        -6.28318530718,
+        -2.059,
+        -6.28318530718,
+        -0.19198,
+        -6.28318530718,
+        -1.69297,
+        -6.28318530718,
     )
     joint_limit_upper: tuple[float, ...] = (
-        6.28318530718, 2.0944, 6.28318530718, 3.927, 6.28318530718, 3.14159265359, 6.28318530718,
+        6.28318530718,
+        2.0944,
+        6.28318530718,
+        3.927,
+        6.28318530718,
+        3.14159265359,
+        6.28318530718,
     )
 
     # ── Dynamics (Mode 6 firmware) ──
@@ -168,7 +180,9 @@ class ArmParams:
         if not (0 < self.max_joint_velocity_deg_per_s <= 500):
             raise ValueError(f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} out of range (0, 500]")
         if not (0 < self.max_joint_acceleration_deg_per_s2 <= 50000):
-            raise ValueError(f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} out of range (0, 50000]")
+            raise ValueError(
+                f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} out of range (0, 50000]"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -182,7 +196,18 @@ class HandParams:
 
     # ── Home position (deg) — open-hand neutral ──
     home_qpos_deg: tuple[float, ...] = (
-        0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0,
+        0.0,
+        80.66,
+        33.2,
+        0.0,
+        5.11,
+        5.0,
+        6.53,
+        5.0,
+        6.76,
+        5.0,
+        10.13,
+        5.0,
     )
 
     loop_hz: float = 30.0
@@ -210,10 +235,10 @@ class HandParams:
     # quat = RotY(+π/2) — hand_base Z points palm-forward in URDF; EEF X is link_eef Z.
     #
     # T_eef_handbase_pos breakdown:
-    #   URDF 原始值   = -0.005 m  (right_hand_mount_joint origin in custom_eef_link)
-    #   物理 flange 修正 = -0.010 m  (URDF 0.043 m → 实测 0.033 m，短 10 mm;
-    #                              link_eef -Z = custom_eef_link +X，故补在 -X)
-    #   合计           = -0.015 m
+    #   URDF raw value  = -0.005 m  (right_hand_mount_joint origin in custom_eef_link)
+    #   Physical flange correction = -0.010 m  (URDF 0.043 m → measured 0.033 m, short 10 mm;
+    #                              link_eef -Z = custom_eef_link +X, so compensated in -X)
+    #   Total            = -0.015 m
     #
     # Verified 2026-07-28: URDF-vs-simulation FK = 0.00 mm.
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
@@ -288,13 +313,15 @@ class VRParams:
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
-    heartbeat_timeouts: dict[str, float] = field(default_factory=lambda: {
-        "arm": 1.0,
-        "hand": 1.0,
-        "policy": 1.0,
-        "vr": 5.0,
-        "camera": 2.0,
-    })
+    heartbeat_timeouts: dict[str, float] = field(
+        default_factory=lambda: {
+            "arm": 1.0,
+            "hand": 1.0,
+            "policy": 1.0,
+            "vr": 5.0,
+            "camera": 2.0,
+        }
+    )
 
     # Consecutive recovery escalation threshold (arm_loop)
     max_consecutive_recoveries: int = 30  # 1s @ 30Hz → FAULT
@@ -379,5 +406,3 @@ def load_config_json(path: str) -> None:
                 )
             object.__setattr__(original, k, v)
         _log.info("config: %s overridden with %s", name, list(overrides.keys()))
-
-

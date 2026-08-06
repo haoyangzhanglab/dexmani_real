@@ -2,17 +2,14 @@
 
 A single class owns all rings, queues, events, and flags. Processes exchange data
 through it — no direct references, no RPC, no business logic.
-
-Ref: ManiUniCon SharedStorage pattern.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from dataclasses import dataclass, field
 from typing import Any
-
-import time
 
 import numpy as np
 
@@ -25,9 +22,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # SharedStorageConfig — centralized tuning constants
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -45,7 +40,6 @@ class SharedStorageConfig:
         shared = SharedStorage.create(config=cfg)
     """
 
-    # ── Ring capacities ──
     camera_ring_maxlen: int = 5
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
@@ -53,24 +47,16 @@ class SharedStorageConfig:
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
 
-    # ── Camera defaults — sourced from camera singleton ──
     camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
     camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
-    camera_pc_shape: tuple[int, int] = (2048, 6)  # matches PointCloudProcessorConfig.num_points default
+    camera_pc_shape: tuple[int, int] = (2048, 6)
 
-    # ── Queue sizes ──
     arm_action_q_maxsize: int = 2
 
-    # ── Workspace bounds (arm base frame, meters) — sourced from policy singleton ──
     workspace_bounds: "np.ndarray" = field(default_factory=lambda: policy.workspace.as_array())
 
 
-# ── Home sentinel for arm_action_q ──
-# Policy puts this sentinel to request homing; arm_loop detects and executes.
-# Using a string sentinel (not None — None means "no action / hold").
 HOME_SENTINEL = "__HOME__"
-
-# ── Compact dtypes for SeqlockRingBuffer structured arrays ──
 
 ARM_STATE_DTYPE = np.dtype(
     [
@@ -124,54 +110,39 @@ class SharedStorage:
 
     Created by Main before spawning child processes. Each process receives a
     reference and reads/writes its designated rings/queues/flags.
-
-    Usage::
-
-        shared = SharedStorage.create(prefix="dexmani",
-                                       camera_rgb_shape=(480, 848, 3),
-                                       camera_depth_shape=(480, 848))
-        # ... spawn processes with shared ...
-        shared.close()
     """
 
-    # ---- Rings: continuous streams, read-latest ----
-    camera_ring: CameraRingBuffer  # camera_loop  -> policy_loop
-    vr_ring: SeqlockRingBuffer  # VRProcess      -> PolicyProcess
-    arm_state_ring: SeqlockRingBuffer  # arm_loop     -> PolicyProcess
-    hand_state_ring: SeqlockRingBuffer  # hand_loop    -> PolicyProcess
-    hand_tactile_ring: SeqlockRingBuffer  # hand_loop    -> PolicyProcess (sparse)
-    hand_cmd_ring: SeqlockRingBuffer  # PolicyProcess  -> hand_loop (latest-wins)
+    camera_ring: CameraRingBuffer  # camera -> policy
+    vr_ring: SeqlockRingBuffer  # vr -> policy
+    arm_state_ring: SeqlockRingBuffer  # arm -> policy
+    hand_state_ring: SeqlockRingBuffer  # hand -> policy
+    hand_tactile_ring: SeqlockRingBuffer  # hand -> policy (sparse)
+    hand_cmd_ring: SeqlockRingBuffer  # policy -> hand
 
-    # ---- Queue: ordered actions (arm only — Mode 6 needs ordering) ----
-    arm_action_q: mp.Queue  # PolicyProcess -> arm_loop, maxsize=2
+    arm_action_q: mp.Queue  # policy -> arm, maxsize=2
 
-    # ---- Flags ----
-    is_running: Any  # mp.Value('b') — Main -> all processes (sole writer)
-    is_recording: Any  # mp.Value('b') — PolicyProcess -> Arm/Hand/Camera
-    error_state: Any  # mp.Value('b') — Arm/Hand -> all (sticky latch, set-only)
-    estop_request: Any  # mp.Value('b') — PolicyProcess -> Arm/Hand
-    quit_requested: Any  # mp.Value('b') — Policy -> Main (Policy handled post-teleop)
+    is_running: Any  # Main -> all
+    is_recording: Any  # policy -> arm/hand/camera
+    error_state: Any  # arm/hand -> all (sticky latch)
+    estop_request: Any  # policy -> arm/hand
+    quit_requested: Any  # policy -> Main
 
-    # ---- Safety state machine (ManiUniCon P0) ----
-    safety_state: Any  # mp.Value('i') — SafetyState enum (0-3), Main + Policy write
+    safety_state: Any  # SafetyState enum (0-3), Main + policy write
 
-    # ---- Process heartbeats (each process writes its own, Main monitors) ----
-    arm_heartbeat_s: Any  # mp.Value('d') — arm_loop writes time.monotonic()
-    hand_heartbeat_s: Any  # mp.Value('d') — hand_loop writes time.monotonic()
-    policy_heartbeat_s: Any  # mp.Value('d') — policy_loop writes time.monotonic()
-    vr_heartbeat_s: Any  # mp.Value('d') — vr_loop writes time.monotonic()
-    camera_heartbeat_s: Any  # mp.Value('d') — camera_loop writes time.monotonic()
+    arm_heartbeat_s: Any
+    hand_heartbeat_s: Any
+    policy_heartbeat_s: Any
+    vr_heartbeat_s: Any
+    camera_heartbeat_s: Any
 
-    # ---- Events ----
-    arm_ready: Any  # mp.Event — arm_loop -> Main
-    hand_ready: Any  # mp.Event — hand_loop -> Main
-    camera_ready: Any  # mp.Event — camera_loop -> Main
-    vr_ready: Any  # mp.Event — vr_loop -> Main
+    arm_ready: Any  # -> Main
+    hand_ready: Any  # -> Main
+    camera_ready: Any  # -> Main
+    vr_ready: Any  # -> Main
 
-    # ---- Camera metadata (set by camera_loop, read by policy_loop) ----
-    camera_depth_scale: Any  # mp.Value('d') — depth scale (mm to meters)
-    camera_K: Any  # mp.Array('d', 9) — 3x3 intrinsics matrix (row-major)
-    camera_serial: Any  # mp.Array('c', 32) — camera serial number string
+    camera_depth_scale: Any  # depth scale (mm to meters)
+    camera_K: Any  # 3x3 intrinsics, row-major
+    camera_serial: Any  # serial number string
 
     @classmethod
     def create(
@@ -182,19 +153,9 @@ class SharedStorage:
         camera_rgb_shape: tuple[int, int, int] | None = None,
         camera_depth_shape: tuple[int, int] | None = None,
     ) -> "SharedStorage":
-        """Create all shared memory primitives.
+        """Create all rings, queues, flags, events, and heartbeats.
 
         Call once from Main before spawning child processes.
-        Each child calls the per-ring attach constructor (create=False).
-
-        Args:
-            prefix: Name prefix for POSIX shared memory segments.
-            config: Optional :class:`SharedStorageConfig` to set ring
-                capacities, camera defaults, and workspace bounds.
-            camera_rgb_shape: Override RGB frame shape (H, W, C). Takes
-                precedence over *config* values when both are provided.
-            camera_depth_shape: Override depth frame shape (H, W). Same
-                precedence rule as *camera_rgb_shape*.
         """
         cfg = config or SharedStorageConfig()
 
@@ -203,7 +164,6 @@ class SharedStorage:
 
         storage = cls.__new__(cls)
 
-        # ---- Rings (create=True — Main owns creation) ----
         storage.camera_ring = CameraRingBuffer(
             name=f"{prefix}_camera",
             rgb_shape=_rgb_shape,
@@ -238,33 +198,27 @@ class SharedStorage:
             maxlen=cfg.hand_cmd_ring_maxlen,
         )
 
-        # ---- Queue (bounded — provides backpressure) ----
         storage.arm_action_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
 
-        # ---- Flags ----
         storage.is_running = mp.Value("b", True)
         storage.is_recording = mp.Value("b", False)
         storage.error_state = mp.Value("b", False)
         storage.estop_request = mp.Value("b", False)
         storage.quit_requested = mp.Value("b", False)
 
-        # ---- Safety state machine ----
         storage.safety_state = mp.Value("i", int(SafetyState.DISARMED))
 
-        # ---- Heartbeats ----
         storage.arm_heartbeat_s = mp.Value("d", 0.0)
         storage.hand_heartbeat_s = mp.Value("d", 0.0)
         storage.policy_heartbeat_s = mp.Value("d", 0.0)
         storage.vr_heartbeat_s = mp.Value("d", 0.0)
         storage.camera_heartbeat_s = mp.Value("d", 0.0)
 
-        # ---- Events ----
         storage.arm_ready = mp.Event()
         storage.hand_ready = mp.Event()
         storage.camera_ready = mp.Event()
         storage.vr_ready = mp.Event()
 
-        # ---- Camera metadata (written by camera_loop) ----
         storage.camera_depth_scale = mp.Value("d", 0.0)
         storage.camera_K = mp.Array("d", [0.0] * 9)
         storage.camera_serial = mp.Array("c", b"\x00" * 32)
@@ -273,14 +227,10 @@ class SharedStorage:
         return storage
 
     def close(self) -> None:
-        """Release all shared memory and multiprocessing primitives.
+        """Release all shared memory primitives.
 
-        Calls ``close()`` (release fd) then ``unlink()`` (destroy the POSIX
-        shared-memory segment) on every ring.  ``unlink()`` is required to avoid
-        the "leaked shared_memory objects" warning from Python's resource tracker;
-        *close* alone only releases the local file descriptor — the kernel
-        segment (and the tracker registration) survives until ``unlink()`` is
-        called by the creating process.
+        ``unlink()`` destroys the POSIX shared-memory segment, preventing
+        Python's resource tracker "leaked shared_memory objects" warning.
         """
         _close_errors: list[str] = []
 
@@ -336,9 +286,7 @@ def vr_frame_dtype() -> np.dtype:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Shared ring read/write helpers (single source of truth for all entry points)
-# ═══════════════════════════════════════════════════════════════════════════════
+# Shared ring read/write helpers
 
 
 def read_arm_state(shared: "SharedStorage") -> "np.ndarray | None":
@@ -378,13 +326,7 @@ def hand_home_converge(
 ) -> "tuple[bool, np.ndarray | None]":
     """Poll hand_state_ring until hand converges to home_qpos.
 
-    Returns ``(reached, final_qpos_or_none)``.  *final_qpos* is the last
-    measured qpos on success, ``None`` on timeout.  Callers should update
-    their ``prev_hand_qpos`` from *final_qpos* when not ``None``.
-
-    *heartbeat* writes ``shared.policy_heartbeat_s`` each tick.
-    *check_is_running* adds ``shared.is_running`` to the while condition.
-    *verbose* prints progress and timeout warnings.
+    Returns ``(reached, final_qpos_or_none)``.
     """
     tol = np.deg2rad(tol_deg)
     deadline = time.monotonic() + timeout_s
@@ -416,22 +358,12 @@ def hand_home_converge(
 
 
 def read_arm_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
-    """Read up to *k* most recent arm state frames (oldest-first).
-
-    Returns a list of raw structured arrays (each shaped ``(1,)`` matching
-    :data:`ARM_STATE_DTYPE`).  May be shorter than *k* — callers must
-    handle ``len(result) < k`` gracefully.
-    """
+    """Read up to *k* most recent arm state frames (oldest-first), may be shorter than *k*."""
     frames = shared.arm_state_ring.get_last_k(k)
     return [data for data, _ts, _seq in frames]
 
 
 def read_hand_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
-    """Read up to *k* most recent hand state frames (oldest-first).
-
-    Returns a list of raw structured arrays (each shaped ``(1,)`` matching
-    :data:`HAND_STATE_DTYPE`).  May be shorter than *k* — callers must
-    handle ``len(result) < k`` gracefully.
-    """
+    """Read up to *k* most recent hand state frames (oldest-first), may be shorter than *k*."""
     frames = shared.hand_state_ring.get_last_k(k)
     return [data for data, _ts, _seq in frames]

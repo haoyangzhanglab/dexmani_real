@@ -122,10 +122,7 @@ def camera_loop(shared: "SharedStorage") -> None:
         pc_shape: tuple[int, int] | None = None
         try:
             from dexmani_real.config.camera_calib import CameraCalib
-            from dexmani_real.sensor.pointcloud_processor import (
-                PointCloudProcessor,
-                PointCloudProcessorConfig,
-            )
+            from dexmani_real.sensor.pointcloud_processor import PointCloudProcessor, PointCloudProcessorConfig
 
             calib = CameraCalib()
             cam_name = calib.resolve_name_by_serial(str(cam.active_serial))

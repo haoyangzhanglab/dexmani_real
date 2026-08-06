@@ -32,11 +32,8 @@ class VRReceiverConfig:
     hand_side: str = field(default_factory=lambda: vr.hand_side)  # "both" needed for HeadFrame
 
 
-
 def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
-    """VR process entry point — writes directly to SharedStorage.vr_ring.
-
-    """
+    """VR process entry point — writes directly to SharedStorage.vr_ring."""
 
     cfg = config or VRReceiverConfig()
 
@@ -44,18 +41,29 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
 
     try:
         from hand_tracking_sdk import (
-            HandFilter, HandFrame, HeadFrame, HTSClient, HTSClientConfig,
-            StreamOutput, TransportMode,
-            unity_left_to_flu_position, unity_left_to_flu_rotation,
+            HandFilter,
+            HandFrame,
+            HeadFrame,
+            HTSClient,
+            HTSClientConfig,
+            StreamOutput,
+            TransportMode,
+            unity_left_to_flu_position,
+            unity_left_to_flu_rotation,
         )
 
-        client = HTSClient(HTSClientConfig(
-            transport_mode=TransportMode(cfg.transport),
-            host=cfg.host, port=cfg.port,
-            timeout_s=1.0, output=StreamOutput.FRAMES,
-            hand_filter=HandFilter(cfg.hand_side),
-            error_policy=0, include_wall_time=True,
-        ))
+        client = HTSClient(
+            HTSClientConfig(
+                transport_mode=TransportMode(cfg.transport),
+                host=cfg.host,
+                port=cfg.port,
+                timeout_s=1.0,
+                output=StreamOutput.FRAMES,
+                hand_filter=HandFilter(cfg.hand_side),
+                error_policy=0,
+                include_wall_time=True,
+            )
+        )
     except ImportError as e:
         logger.error("vr_loop: SDK import failed: %s", e)
         return

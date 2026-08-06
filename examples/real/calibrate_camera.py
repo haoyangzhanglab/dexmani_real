@@ -57,12 +57,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.planning.path_utils import plan_joint_home_path
-from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop as _arm_loop
-from dexmani_real.teleop.keyboard import GlobalKeyState
+from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
+from dexmani_real.robot.arm_loop import ArmLoopConfig
+from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage, SharedStorageConfig, read_arm_state
+from dexmani_real.teleop.keyboard import GlobalKeyState
 from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
@@ -96,9 +97,10 @@ _cfg = CameraCalibConfig()
 # the default config (-0.45 vs -0.50) because the calibration rig (ArUco
 # marker on end-effector + fixed tripod camera) has a narrower useful range.
 from dexmani_real.config.defaults import arm, policy
+
 WORKSPACE_BOUNDS = policy.workspace.as_array()
 WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
-WORKSPACE_BOUNDS[1, 1] = 0.45   # y_max: tighter for calibration rig
+WORKSPACE_BOUNDS[1, 1] = 0.45  # y_max: tighter for calibration rig
 
 # ArUco dictionary (fixed — not tunable per-session)
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
@@ -748,9 +750,7 @@ def main():
                         # 转到 world 系，与下游 eef_pos/arm_ee(compute_eef_pose_world) 一致：
                         #   T_world_camera = T_world_base @ T_base_camera
                         T_world_base = np.eye(4, dtype=np.float64)
-                        T_world_base[:3, :3] = R.from_quat(
-                            np.roll(planner.kin.base_pose_world.q, -1)
-                        ).as_matrix()
+                        T_world_base[:3, :3] = R.from_quat(np.roll(planner.kin.base_pose_world.q, -1)).as_matrix()
                         T_world_base[:3, 3] = planner.kin.base_pose_world.p
                         T_candidate = T_world_base @ T_candidate
                         std_mm = float(errors_mm.std())
@@ -816,7 +816,9 @@ def main():
             if keys.is_pressed("r"):
                 print("\n  R: return_home")
                 _home_qpos = np.array(ArmLoopConfig().home_qpos, dtype=np.float64)
-                _waypoints = plan_joint_home_path(arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m)
+                _waypoints = plan_joint_home_path(
+                    arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                )
                 if _waypoints is not None and len(_waypoints) > 0:
                     print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
                 elif _waypoints is not None and len(_waypoints) == 0:
@@ -947,7 +949,7 @@ def main():
                         last_wall_time[axis] = now
 
             if np.any(drpy != 0):
-                dq = R.from_euler('xyz', drpy).as_quat(scalar_first=True)
+                dq = R.from_euler("xyz", drpy).as_quat(scalar_first=True)
                 target_quat = quat_multiply(dq, target_quat)
 
             # ── IK (target in world frame, same as keyboard_teleop) ──

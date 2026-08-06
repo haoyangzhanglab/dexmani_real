@@ -9,6 +9,7 @@ import numpy as np
 
 from dexmani_real.utils.serialization import from_dict_helper
 
+
 @dataclass(frozen=True, slots=True)
 class CollisionPair:
     """A single self-collision contact between two links.
@@ -139,7 +140,6 @@ class XArm7PlannerConfig:
     # Cartesian workspace bounds (world frame). (3,2) [[x_min,x_max],[y_min,y_max],[z_min,z_max]].
     # None disables the check (backward compatible).
     workspace_bounds: np.ndarray | None = None
-
 
 
 @dataclass(kw_only=True)

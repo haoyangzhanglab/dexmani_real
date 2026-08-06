@@ -49,8 +49,8 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
 
 # Per-finger colors for hand_fingertip keypoints (thumb, index, middle, ring, pinky).
 _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
-    (255, 60, 60),   # thumb  — red
-    (60, 255, 60),   # index  — green
+    (255, 60, 60),  # thumb  — red
+    (60, 255, 60),  # index  — green
     (60, 120, 255),  # middle — blue
     (255, 200, 40),  # ring   — gold
     (220, 60, 255),  # pinky  — magenta
@@ -526,7 +526,9 @@ class EpisodeVisualizer:
             rr.log("camera/rgb", rr.Image(rgb))
         if "depth" in camera_keys:
             depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
-            rr.log("camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)))  # clamp outliers to stabilize colormap
+            rr.log(
+                "camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000))
+            )  # clamp outliers to stabilize colormap
 
         # 3D point cloud: /pointcloud (world-frame, grid-aligned) > depth back-projection.
         if self._has_precomputed_pc:
@@ -538,7 +540,8 @@ class EpisodeVisualizer:
             if cam_idx not in self._pc_cache:
                 depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
                 rgb = (
-                    self._rgb_cache[cam_idx] if self._rgb_cache is not None
+                    self._rgb_cache[cam_idx]
+                    if self._rgb_cache is not None
                     else (self._h5f["rgb"][cam_idx] if "rgb" in camera_keys else None)
                 )
                 u_strided, v_strided = self._pc_rays
@@ -640,12 +643,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes with Rerun 3D.")
     parser.add_argument("episode", type=str, help="Path to episode (.h5 file or directory).")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
-    parser.add_argument("--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale).")
+    parser.add_argument(
+        "--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale)."
+    )
     parser.add_argument("--info", action="store_true", help="Print HDF5 structure summary and exit (no Rerun needed).")
-    parser.add_argument("--point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Enable 3D point cloud from depth.")
-    parser.add_argument("--pc-stride", type=int, default=4, help="Pixel stride for point cloud downsampling (default: 4).")
-    parser.add_argument("--pc-min-depth", type=float, default=0.1, help="Min depth for point cloud filtering in meters (default: 0.1).")
-    parser.add_argument("--pc-max-depth", type=float, default=2.0, help="Max depth for point cloud filtering in meters (default: 2.0).")
+    parser.add_argument(
+        "--point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Enable 3D point cloud from depth."
+    )
+    parser.add_argument(
+        "--pc-stride", type=int, default=4, help="Pixel stride for point cloud downsampling (default: 4)."
+    )
+    parser.add_argument(
+        "--pc-min-depth", type=float, default=0.1, help="Min depth for point cloud filtering in meters (default: 0.1)."
+    )
+    parser.add_argument(
+        "--pc-max-depth", type=float, default=2.0, help="Max depth for point cloud filtering in meters (default: 2.0)."
+    )
 
     args = parser.parse_args()
     h5_path = Path(args.episode).expanduser().resolve()

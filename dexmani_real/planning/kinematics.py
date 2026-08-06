@@ -15,19 +15,11 @@ from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz
 from .types import Pose
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# ArmFK — standalone Pinocchio FK (no MPlib dependency)
-# Used by arm_loop to replace xArm SDK get_position_aa() with
-# URDF-consistent FK.  The xArm firmware uses a different EEF coordinate
-# frame than the URDF; this ensures all consumers share one system.
-# ═══════════════════════════════════════════════════════════════════════
-
-
 class ArmFK:
-    """Pinocchio FK for the 7-DOF xArm7 URDF, base-frame output.
+    """Standalone Pinocchio FK for arm_loop — URDF-consistent, no MPlib dependency.
 
-    The Pinocchio model + data are constructed once at init (~50 ms) and then
-    ``compute()`` is a cheap FK call (~0.05 ms).
+    Used instead of xArm SDK get_position_aa() because the firmware EEF frame
+    differs from the URDF definition.
     """
 
     def __init__(self, urdf_path: str, eef_frame_name: str = "custom_eef_link") -> None:
@@ -38,16 +30,7 @@ class ArmFK:
         self._eef_frame_id = self._model.getFrameId(eef_frame_name)
 
     def compute(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Compute EEF pose in arm base frame.
-
-        Args:
-            qpos: Joint positions (7,) in **radians**.
-
-        Returns:
-            (eef_pos, eef_rot6d):
-            - *eef_pos*  — (3,)  float64  metres
-            - *eef_rot6d* — (6,)  float64  first two columns of rotation matrix
-        """
+        """Compute EEF pose in arm base frame. Returns (eef_pos(3), eef_rot6d(6))."""
         qpos = np.asarray(qpos, dtype=np.float64).ravel()[:7]
         import pinocchio
 
@@ -61,13 +44,8 @@ class ArmFK:
         return eef_pos, eef_rot6d
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# XArm7Kinematics — full kinematics with MPlib integration
-# ═══════════════════════════════════════════════════════════════════════
-
-
 class XArm7Kinematics:
-    """FK, Jacobian, pose transforms, and manipulability for xArm7."""
+    """Full kinematics with MPlib integration — FK, Jacobian, pose transforms, manipulability."""
 
     def __init__(
         self,

@@ -1,35 +1,11 @@
 #!/usr/bin/env python3
-"""Episode quality toolkit — programmatic API with optional CLI.
+"""Episode quality toolkit — assess, health-check, filter, and validate recorded episodes.
 
-Primary API (import-friendly)::
+API: ``EpisodeQuality(episode_dir)`` context manager with ``.assess()``, ``.health()``,
+``.validate()``, ``.filter()`` methods.  Also provides convenience functions
+``assess_episode()``, ``check_episode_health()``, ``batch_assess()``, ``batch_health()``.
 
-    from dexmani_real.tools.episode_quality import (
-        EpisodeQuality,
-        assess_episode, check_episode_health,
-        batch_assess, batch_health,
-        QualityReport, HealthReport, ValidationReport,
-    )
-
-    # Single episode, single pass — open once, run multiple checks
-    with EpisodeQuality("episode_001") as eq:
-        quality = eq.assess()       # → QualityReport
-        health  = eq.health()       # → HealthReport
-        valid   = eq.validate()     # → ValidationReport
-        result  = eq.filter(output_dir="filtered/", drop_held=True)  # → FilterResult
-
-    # Convenience one-liners (open+close internally)
-    quality = assess_episode("episode_001.h5")
-    health  = check_episode_health("episode_001.h5")
-
-    # Batch operations
-    reports = batch_assess(["ep_001.h5", "ep_002.h5"])
-
-CLI (thin wrapper over the same API)::
-
-    python -m dexmani_real.tools.episode_quality assess episodes/*.h5 --summary
-    python -m dexmani_real.tools.episode_quality health episode.h5
-    python -m dexmani_real.tools.episode_quality filter episodes/ --output cleaned/
-    python -m dexmani_real.tools.episode_quality validate episodes/
+CLI: ``python -m dexmani_real.tools.episode_quality {assess,health,filter,validate} ...``
 """
 
 from __future__ import annotations
@@ -204,6 +180,7 @@ class QualityReport:
 @dataclass
 class FreezeRun:
     """A single hand freeze event."""
+
     start_frame: int
     length: int
     max_cmd_gap_deg: float
@@ -250,7 +227,9 @@ class HealthReport:
             "camera_dup_pct": {k: round(v, 2) for k, v in self.camera_dup_pct.items()},
             "cam_frames_dropped": self.cam_frames_dropped,
             "tracking_p95_deg": round(self.tracking_p95_deg, 2) if self.tracking_p95_deg is not None else None,
-            "hand_tracking_p95_deg": round(self.hand_tracking_p95_deg, 2) if self.hand_tracking_p95_deg is not None else None,
+            "hand_tracking_p95_deg": (
+                round(self.hand_tracking_p95_deg, 2) if self.hand_tracking_p95_deg is not None else None
+            ),
             "hand_freeze_runs": len(self.hand_freeze_runs),
             "hand_freeze_total_frames": self.hand_freeze_total_frames,
             "tactile_zero_pcts": {k: round(v, 2) for k, v in self.tactile_zero_pcts.items()},
@@ -378,7 +357,9 @@ class EpisodeQuality:
 
     @property
     def _action_hand_joint(self) -> np.ndarray:
-        return self._cached("action_hand_joint", lambda: np.asarray(self._h5f["action_hand_joint"][:], dtype=np.float64))
+        return self._cached(
+            "action_hand_joint", lambda: np.asarray(self._h5f["action_hand_joint"][:], dtype=np.float64)
+        )
 
     # ── assess ──
 
@@ -569,7 +550,7 @@ class EpisodeQuality:
         dup = np.zeros(T, dtype=bool)
         prev: int | None = None
         for t in range(T):
-            h = hash(data[t, ::self._roi_stride, ::self._roi_stride].tobytes())
+            h = hash(data[t, :: self._roi_stride, :: self._roi_stride].tobytes())
             dup[t] = prev is not None and h == prev
             prev = h
         return 100.0 * dup[1:].sum() / (T - 1)
@@ -590,7 +571,7 @@ class EpisodeQuality:
             if length < min_frames:
                 continue
             end = start + length
-            cmd_slice = cmd_step[max(0, start - 1):min(len(cmd_step), end)]
+            cmd_slice = cmd_step[max(0, start - 1) : min(len(cmd_step), end)]
             if not np.any(cmd_slice >= cmd_active_thresh_rad):
                 continue
             gap = np.max(np.abs(cmd[start:end] - hq[start:end]))
@@ -617,9 +598,7 @@ class EpisodeQuality:
             zero_pct = 100.0 * float(np.mean(force_mag[:, i] == 0.0))
             result[name] = zero_pct
             if zero_pct > TACTILE_ALLZERO_WARN_PCT:
-                report.warnings.append(
-                    f"tactile {name} zero rate {zero_pct:.1f}% > {TACTILE_ALLZERO_WARN_PCT:.0f}%"
-                )
+                report.warnings.append(f"tactile {name} zero rate {zero_pct:.1f}% > {TACTILE_ALLZERO_WARN_PCT:.0f}%")
 
         return result
 
@@ -639,7 +618,9 @@ class EpisodeQuality:
                 continue
             data = np.asarray(self._h5f[key][:], dtype=np.float64)
             ok = not np.any(~np.isfinite(data))
-            report.checks.append({"name": "no_nan", "passed": ok, "detail": f"{key}: {'OK' if ok else 'CONTAINS NaN/Inf'}"})
+            report.checks.append(
+                {"name": "no_nan", "passed": ok, "detail": f"{key}: {'OK' if ok else 'CONTAINS NaN/Inf'}"}
+            )
 
         # Variance checks
         for key in ("arm_qpos", "arm_ee", "hand_qpos", "action_arm_joint", "action_hand_joint"):
@@ -650,14 +631,22 @@ class EpisodeQuality:
                 data = data[:, np.newaxis]
             var = np.var(data, axis=0)
             zero_var = int(np.sum(var < variance_epsilon))
-            report.checks.append({
-                "name": "non_zero_variance",
-                "passed": zero_var == 0,
-                "detail": f"{key}: OK" if zero_var == 0 else f"{key}: {zero_var}/{var.shape[0]} dims zero variance",
-            })
+            report.checks.append(
+                {
+                    "name": "non_zero_variance",
+                    "passed": zero_var == 0,
+                    "detail": f"{key}: OK" if zero_var == 0 else f"{key}: {zero_var}/{var.shape[0]} dims zero variance",
+                }
+            )
 
         # Min frames
-        report.checks.append({"name": "min_frames", "passed": self._n_frames >= min_frames, "detail": f"{self._n_frames} frames (min={min_frames})"})
+        report.checks.append(
+            {
+                "name": "min_frames",
+                "passed": self._n_frames >= min_frames,
+                "detail": f"{self._n_frames} frames (min={min_frames})",
+            }
+        )
 
         # Duplicate frames
         if "arm_qpos" in self._h5f and "action_arm_joint" in self._h5f:
@@ -674,11 +663,13 @@ class EpisodeQuality:
                     obs_diff = np.abs(np.diff(obs[active], axis=0)).sum(axis=1)
                     act_diff = np.abs(np.diff(act[active], axis=0)).sum(axis=1)
                     n_dup = max(int((obs_diff < 1e-4).sum()), int((act_diff < 1e-4).sum()))
-                    report.checks.append({
-                        "name": "no_duplicate_frames",
-                        "passed": n_dup == 0,
-                        "detail": f"{n_dup} duplicate frames" if n_dup else "No duplicate frames.",
-                    })
+                    report.checks.append(
+                        {
+                            "name": "no_duplicate_frames",
+                            "passed": n_dup == 0,
+                            "detail": f"{n_dup} duplicate frames" if n_dup else "No duplicate frames.",
+                        }
+                    )
 
         # Timestamp monotonicity
         if "timestamp" in self._h5f:
@@ -686,11 +677,15 @@ class EpisodeQuality:
             if len(ts) >= 2:
                 diffs = np.diff(ts)
                 n_regressions = int(np.sum(diffs < 0))
-                report.checks.append({
-                    "name": "timestamp_monotonic",
-                    "passed": n_regressions == 0,
-                    "detail": f"{n_regressions} backwards timestamps" if n_regressions else "Timestamps non-decreasing",
-                })
+                report.checks.append(
+                    {
+                        "name": "timestamp_monotonic",
+                        "passed": n_regressions == 0,
+                        "detail": (
+                            f"{n_regressions} backwards timestamps" if n_regressions else "Timestamps non-decreasing"
+                        ),
+                    }
+                )
 
         # Camera freshness
         try:
@@ -698,11 +693,13 @@ class EpisodeQuality:
             rgb = self._reader.read_camera_all("rgb")
             sample = rgb[: min(10, rgb.shape[0])]
             all_zero = all(np.count_nonzero(frame) == 0 for frame in sample)
-            report.checks.append({
-                "name": "camera_fresh",
-                "passed": not all_zero,
-                "detail": "Camera frames OK" if not all_zero else "All camera frames zero",
-            })
+            report.checks.append(
+                {
+                    "name": "camera_fresh",
+                    "passed": not all_zero,
+                    "detail": "Camera frames OK" if not all_zero else "All camera frames zero",
+                }
+            )
         except (KeyError, AttributeError):
             pass
 
@@ -727,25 +724,25 @@ class EpisodeQuality:
         counts: dict[str, int] = {}
 
         if drop_held and "flag_held" in self._h5f:
-            held = np.asarray(self._h5f["flag_held"][:self._n_frames], dtype=bool)
+            held = np.asarray(self._h5f["flag_held"][: self._n_frames], dtype=bool)
             counts["held"] = int(np.sum(held))
             mask &= ~held
 
         status_drops = drop_ik_fail or drop_safety_reject or drop_retarget_fail
         if status_drops and "flag_frame_status" in self._h5f:
-            status = np.asarray(self._h5f["flag_frame_status"][:self._n_frames], dtype=np.int32)
+            status = np.asarray(self._h5f["flag_frame_status"][: self._n_frames], dtype=np.int32)
             if drop_ik_fail:
                 counts["ik_fail"] = int(np.sum(status == _FRAME_IK_FAIL))
-                mask &= (status != _FRAME_IK_FAIL)
+                mask &= status != _FRAME_IK_FAIL
             if drop_safety_reject:
                 counts["safety_reject"] = int(np.sum(status == _FRAME_SAFETY_REJECT))
-                mask &= (status != _FRAME_SAFETY_REJECT)
+                mask &= status != _FRAME_SAFETY_REJECT
             if drop_retarget_fail:
                 counts["retarget_fail"] = int(np.sum(status == _FRAME_RETARGET_FAIL))
-                mask &= (status != _FRAME_RETARGET_FAIL)
+                mask &= status != _FRAME_RETARGET_FAIL
 
         if max_tracking_error is not None and "tracking_error" in self._h5f:
-            te = np.asarray(self._h5f["tracking_error"][:self._n_frames], dtype=np.float64)
+            te = np.asarray(self._h5f["tracking_error"][: self._n_frames], dtype=np.float64)
             valid = np.isfinite(te)
             counts["tracking_error"] = int(np.sum(valid & (te > max_tracking_error)))
             mask &= ~(valid & (te > max_tracking_error))
@@ -908,7 +905,9 @@ def batch_assess(
         if r is not None:
             reports.append(r)
             if verbose:
-                print(f"  {r.classification:>9s}  {r.anomaly_ratio*100:5.1f}% anomalous  p95={r.overall_p95_deg:5.1f}°  {p}")
+                print(
+                    f"  {r.classification:>9s}  {r.anomaly_ratio*100:5.1f}% anomalous  p95={r.overall_p95_deg:5.1f}°  {p}"
+                )
         else:
             if verbose:
                 print(f"  SKIP      {p}")
@@ -984,7 +983,9 @@ def print_quality_report(report: QualityReport) -> None:
     print(f"  Anomalous:      {report.anomaly_ratio*100:.1f}% ({int(report.anomaly_ratio*report.num_frames)} frames)")
     print(f"  Elevated:       {report.elevated_ratio*100:.1f}% ({int(report.elevated_ratio*report.num_frames)} frames)")
     print("  Tracking error (L∞ across joints):")
-    print(f"    Overall:      mean={report.overall_mean_deg:.2f}°  p95={report.overall_p95_deg:.2f}°  max={report.overall_max_deg:.2f}°")
+    print(
+        f"    Overall:      mean={report.overall_mean_deg:.2f}°  p95={report.overall_p95_deg:.2f}°  max={report.overall_max_deg:.2f}°"
+    )
     print(f"    Per-joint mean:  {np.array2string(report.per_joint_mean_deg, precision=2, separator=', ')}")
     print(f"    Per-joint p95:   {np.array2string(report.per_joint_p95_deg, precision=2, separator=', ')}")
     print(f"    Per-joint rmse:  {np.array2string(report.per_joint_rmse_deg, precision=2, separator=', ')}")
@@ -1012,10 +1013,7 @@ def print_health_report(report: HealthReport) -> None:
     print(f"  grid fill: {report.grid_fill_pct:.1f}%  " f"(longest run ≈ {longest_grid * dt * 1000:.0f}ms)")
 
     for key, dup_pct in report.camera_dup_pct.items():
-        print(
-            f"  {key} content dup: {dup_pct:.1f}% "
-            f"(expected baseline {report.camera_expected_baseline_pct:.0f}%)"
-        )
+        print(f"  {key} content dup: {dup_pct:.1f}% " f"(expected baseline {report.camera_expected_baseline_pct:.0f}%)")
 
     if report.tracking_p95_deg is not None:
         print(f"  tracking error p95: {report.tracking_p95_deg:.1f}°  >threshold: {report.tracking_over_pct:.1f}%")
@@ -1156,8 +1154,10 @@ def _cli_health(args: argparse.Namespace) -> None:
         if args.quality:
             qr = assess_episode(str(path))
             if qr is not None:
-                print(f"\n  [quality] {qr.classification:>9s}  {qr.anomaly_ratio*100:.1f}% anomalous  "
-                      f"p95={qr.overall_p95_deg:.1f}°  max={qr.overall_max_deg:.1f}°  J{qr.worst_joint} worst")
+                print(
+                    f"\n  [quality] {qr.classification:>9s}  {qr.anomaly_ratio*100:.1f}% anomalous  "
+                    f"p95={qr.overall_p95_deg:.1f}°  max={qr.overall_max_deg:.1f}°  J{qr.worst_joint} worst"
+                )
                 if qr.classification == "DEGRADED":
                     total_warns += 1
             else:
@@ -1201,7 +1201,9 @@ def main() -> None:
     fp.add_argument("--drop-ik-fail", action="store_true")
     fp.add_argument("--drop-safety-reject", action="store_true")
     fp.add_argument("--drop-retarget-fail", action="store_true")
-    fp.add_argument("--max-tracking-error", type=float, default=None, help="Drop frames with tracking_error > THRESHOLD (rad)")
+    fp.add_argument(
+        "--max-tracking-error", type=float, default=None, help="Drop frames with tracking_error > THRESHOLD (rad)"
+    )
 
     ap = sub.add_parser("assess", help="Velocity-adaptive trajectory quality classification")
     ap.add_argument("h5_files", nargs="+", help="HDF5 episode files to assess")

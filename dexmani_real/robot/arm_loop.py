@@ -1,12 +1,6 @@
 """Arm servo loop — Mode 6 joint online trajectory planning for xArm7.
 
-Primary entry point: ``arm_loop(shared)`` — mp.Process target, reads
-SharedStorage.arm_action_q, writes arm_state_ring. Communicates exclusively
-through SharedStorage (no direct SDK access from other processes).
-
-Mode 6: firmware performs online trajectory replanning with configurable
-speed/acceleration limits. No inner-loop interpolation — commands forwarded
-directly and firmware handles all trajectory smoothing.
+Primary entry point: ``arm_loop(shared)`` — mp.Process target using SharedStorage.
 """
 
 from __future__ import annotations
@@ -17,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, safety
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
@@ -24,44 +19,29 @@ from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, HOME_SENTINEL, new_frame
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real import ASSET_DIR
 
 logger = get_logger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════
-
-
 @dataclass
 class ArmLoopConfig:
-    """Configuration for arm_loop (Mode 6: joint online trajectory planning).
-
-    Defaults sourced from :data:`~dexmani_real.config.defaults.arm` singleton.
-    """
+    """Mode 6 joint online trajectory planning configuration."""
 
     joint_max_speed_rad_per_s: float = field(default_factory=lambda: arm.max_joint_velocity_rad_per_s)
     joint_max_acc_rad_per_s2: float = field(default_factory=lambda: arm.max_joint_acceleration_rad_per_s2)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
 
-    # Joint limits — sourced from arm singleton via shared_storage re-exports.
     joint_limit_lower: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_lower)
     joint_limit_upper: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_upper)
 
-    # Tracking error warning threshold (rad). Diagnostic only.
     tracking_error_warn_rad: float = field(default_factory=lambda: arm.tracking_error_warn_rad)
 
-    # Arm connection (single source of truth for IP).
     arm_ip: str = field(default_factory=lambda: arm.ip)
 
-    # Home position — sourced from arm singleton via shared_storage re-exports.
     home_qpos: tuple[float, ...] = field(default_factory=lambda: arm.home_qpos)
 
-    # Collision sensitivity level (0-5, 1 = most sensitive).
     collision_sensitivity: int = field(default_factory=lambda: arm.collision_sensitivity)
 
-    # Homing parameters for _planned_homing.
     homing_convergence_rad: float = field(default_factory=lambda: arm.homing.convergence_rad)
     homing_step_interval_s: float = field(default_factory=lambda: arm.homing.step_interval_s)
     homing_max_speed_rad_per_s: float = field(default_factory=lambda: np.deg2rad(arm.homing.max_speed_deg_s))
@@ -73,16 +53,10 @@ _RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
 _RECOVERY_MAX: int = safety.max_consecutive_recoveries  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# arm_loop (mp.Process target)
-# ═══════════════════════════════════════════════════════════════════
-
-
 def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
-    """Arm process entry point — reads SharedStorage.arm_action_q, servos arm.
+    """Arm process entry point — reads arm_action_q, servos arm via Mode 6.
 
-    Designed as an mp.Process target. Communicates exclusively through
-    SharedStorage (no RPC, no side channels).
+    mp.Process target communicating exclusively through SharedStorage.
     """
     from queue import Empty
 
@@ -96,15 +70,15 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
 
-    # ── URDF-consistent FK (replaces arm.get_position_aa) ──
-    # xArm firmware uses a different EEF coordinate definition than our URDF.
-    # Using Pinocchio FK ensures all downstream consumers (IK, recording,
-    # display) share a single coordinate system.
+    # URDF-consistent FK (replaces arm.get_position_aa). xArm firmware uses a
+    # different EEF coordinate definition — Pinocchio FK ensures all consumers
+    # share a single coordinate system.
     _urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
     _arm_fk = ArmFK(_urdf_path)
 
     try:
         from xarm.wrapper import XArmAPI
+
         arm = XArmAPI(cfg.arm_ip, is_radian=True)
     except Exception as e:
         logger.error("arm_loop: connect failed: %s", e)
@@ -118,11 +92,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         arm.set_mode(6)
         arm.set_state(0)
         arm.set_collision_sensitivity(cfg.collision_sensitivity)
-        # Torque-based collision detection (level 1 = most sensitive).  Detects
-        # impact/impulse collisions but may miss slow/gentle contact (e.g., hand
-        # brushing the table surface — torque rise is too gradual to trigger).
-        # Software-level checks (Pinocchio self-collision + EEF z-clearance in
-        # plan_joint_home_path) are the primary protection for table contact.
+        # Torque-based collision detection (level 1). Detects impacts but may
+        # miss slow contact. Primary table protection: self-collision + z-clearance.
         arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True)
         if getattr(arm, "mode", -1) != 6:
             logger.error("arm_loop: failed to set mode 6")
@@ -194,7 +165,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         _safety = shared.safety_state.value
         if _safety in (SafetyState.ARMED, SafetyState.RUNNING):
 
-            # Read action from queue (non-blocking — rate limiter controls cadence)
             try:
                 action = shared.arm_action_q.get(timeout=0.0)
             except Empty:
@@ -203,8 +173,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             # HOME sentinel (tuple: (HOME_SENTINEL, waypoints_or_None))
             if isinstance(action, tuple) and len(action) == 2 and action[0] == HOME_SENTINEL:
                 _waypoints = action[1]
-                logger.info("arm_loop: HOME sentinel — planned homing (%d waypoints)",
-                            len(_waypoints) if _waypoints is not None else 0)
+                logger.info(
+                    "arm_loop: HOME sentinel — planned homing (%d waypoints)",
+                    len(_waypoints) if _waypoints is not None else 0,
+                )
                 _planned_homing(arm, _waypoints, HOME_QPOS, cfg, shared=shared)
                 # Read actual state after homing — arm may still be settling
                 # (all servo commands use wait=False)
@@ -237,42 +209,42 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 shared.arm_state_ring.write(_frame_home)
                 continue
 
-            # Servo
             _new_action = action is not None and isinstance(action, dict)
             if _new_action:
                 target = np.asarray(action.get("qpos", last_target), dtype=np.float64).ravel()[:7]
                 if np.all(np.isfinite(target)):
-                    # Wrap equivalent joints (J1/J3/J5/J7) to the same 2π band
-                    # as the physical arm position, so Mode 6 always takes the
-                    # shortest angular path.  Without this, a target on the
-                    # opposite band (e.g. +3.1 rad when the arm is at -3.1 rad)
-                    # can cause the firmware to rotate the joint through ~2π
-                    # → "关节转大圈" during teleop.
-                    # Ref: canonicalize_qpos in ik_candidates.py does the same
-                    # wrapping during IK, but this is defense-in-depth for any
-                    # edge case where the IK result slips onto the wrong band.
+                    # Wrap equivalent joints to the same 2π band for shortest
+                    # path. Mismatched bands cause the joint to rotate full
+                    # circle (~2π) — defense-in-depth for IK edge cases.
                     target = wrap_nearest_equivalent(
-                        target, last_qpos,
-                        cfg.joint_limit_lower, cfg.joint_limit_upper,
+                        target,
+                        last_qpos,
+                        cfg.joint_limit_lower,
+                        cfg.joint_limit_upper,
                     )
                     last_target = target
 
             try:
-                code = arm.set_servo_angle(angle=last_target, is_radian=True,
-                                           speed=cfg.joint_max_speed_rad_per_s, mvacc=cfg.joint_max_acc_rad_per_s2, wait=False)
+                code = arm.set_servo_angle(
+                    angle=last_target,
+                    is_radian=True,
+                    speed=cfg.joint_max_speed_rad_per_s,
+                    mvacc=cfg.joint_max_acc_rad_per_s2,
+                    wait=False,
+                )
                 if code != 0:
                     err_code = getattr(arm, "error_code", 0)
                     if err_code in _RECOVERABLE_ERRORS:
-                        # C22/C24/C31 — recoverable arm errors.
-                        # Standard recovery: clean error → ready state → re-enter Mode 6.
-                        # set_state(0) MUST come before set_mode(6) — the arm needs to
-                        # be in ready state before the mode change is accepted.
+                        # C22/C24/C31 — recoverable. Clean error → ready state →
+                        # re-enter Mode 6. set_state(0) MUST precede set_mode(6).
                         arm.clean_error()
                         arm.set_state(0)
                         arm.set_mode(6)
                         _consecutive_recoveries += 1
                         if _consecutive_recoveries > _RECOVERY_MAX:
-                            logger.error("arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries)
+                            logger.error(
+                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries
+                            )
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
                             break
@@ -282,17 +254,18 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                         transition(shared, SafetyState.FAULT)
                         break
                     else:
-                        # code != 0 but err_code == 0 (e.g. ERR_CODE=1 transient error,
-                        # mode drop).  Same recovery as above; do NOT FAULT on a
-                        # single failure — transient comm glitches can self-resolve.
-                        # The _RECOVERY_MAX counter gates escalation.
-                        logger.warning("arm_loop: set_servo_angle code=%d (no arm error) — attempting mode recovery", code)
+                        # code != 0, err_code == 0 — transient glitch; same recovery, _RECOVERY_MAX gates escalation.
+                        logger.warning(
+                            "arm_loop: set_servo_angle code=%d (no arm error) — attempting mode recovery", code
+                        )
                         arm.clean_error()
                         arm.set_state(0)
                         arm.set_mode(6)
                         _consecutive_recoveries += 1
                         if _consecutive_recoveries > _RECOVERY_MAX:
-                            logger.error("arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries)
+                            logger.error(
+                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries
+                            )
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
                             break
@@ -308,7 +281,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 # code == 0: successful send — reset recovery streak
                 _consecutive_recoveries = 0
 
-        # Read state
         arm_connected = True
         try:
             code, states = arm.get_joint_states(is_radian=True, num=3)
@@ -329,9 +301,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
             arm_connected = False
 
-        # FK: Pinocchio URDF-consistent FK (NOT arm firmware get_position_aa).
-        # The xArm firmware uses a different EEF coordinate definition; using
-        # URDF FK ensures consumers (IK, recording, display) share one system.
+        # Pinocchio URDF-consistent FK (see note above).
         try:
             eef_pos, eef_rot6d = _arm_fk.compute(qpos)
         except Exception:
@@ -339,21 +309,19 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             eef_pos = np.zeros(3, dtype=np.float64)
             eef_rot6d = np.zeros(6, dtype=np.float64)
 
-        # Compute tracking error (with persistence gate — 3 consecutive
-        # frames above threshold before warning, to suppress single-frame
-        # transients from abrupt IK target changes).
         tracking_err = float(np.max(np.abs(qpos - last_target)))
 
         if tracking_err > cfg.tracking_error_warn_rad:
             _tracking_err_count += 1
             if _tracking_err_count >= 3:
-                _tracking_warn("arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad)
+                _tracking_warn(
+                    "arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad
+                )
         else:
             _tracking_err_count = 0
 
-        # Error handling
-        # arm.error_code is an SDK cached property (updated by background report
-        # thread ~every 200ms), not a per-access network call.
+        # arm.error_code is an SDK cached property (background report thread
+        # ~every 200ms), not a per-access network call.
         try:
             error_code = arm.error_code
         except Exception:
@@ -363,7 +331,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         if error_code in _RECOVERABLE_ERRORS:
             _consecutive_state_errors += 1
             if _consecutive_state_errors > _RECOVERY_MAX:
-                logger.error("arm_loop: %d consecutive state-read errors — escalating to FAULT", _consecutive_state_errors)
+                logger.error(
+                    "arm_loop: %d consecutive state-read errors — escalating to FAULT", _consecutive_state_errors
+                )
                 shared.error_state.value = True
                 transition(shared, SafetyState.FAULT)
                 break
@@ -413,15 +383,17 @@ def _disconnect_arm(arm: Any) -> None:
         pass
 
 
-def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarray,
-                    cfg: ArmLoopConfig | None = None, *, shared: Any = None) -> None:
+def _planned_homing(
+    arm: Any,
+    waypoints: np.ndarray | None,
+    home_qpos: np.ndarray,
+    cfg: ArmLoopConfig | None = None,
+    *,
+    shared: Any = None,
+) -> None:
     """Execute planned waypoints, then converge to exact home_qpos.
 
-    When *waypoints* is ``None`` or empty, falls back to joint-space linear
-    interpolation (the old ``_simple_homing`` path).
-
-    Writes heartbeat to ``shared.arm_heartbeat_s`` during execution so that
-    the homing sequence does not trigger a false FAULT timeout.
+    Falls back to joint-space linear interpolation when waypoints is None.
     """
     _cfg = cfg or ArmLoopConfig()
 
@@ -434,20 +406,19 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
     except Exception:
         return
 
-    # ── Wrap home_qpos to nearest equivalent of current position ──
-    # Prevents Stage 2 from taking the long way around for equivalent joints
-    # (J1/J3/J5/J7 on xArm7, 720° range).  Wrapping home→current keeps all
-    # interpolation waypoints and the final set_servo_angle target in the arm's
-    # current encoder band.
+    # Wrap home_qpos to nearest equivalent of current position — prevents
+    # the long way around for equivalent joints (J1/J3/J5/J7, 720° range).
     _home = wrap_nearest_equivalent(
-        home_qpos, current,
-        _cfg.joint_limit_lower, _cfg.joint_limit_upper,
+        home_qpos,
+        current,
+        _cfg.joint_limit_lower,
+        _cfg.joint_limit_upper,
     )
 
     if np.max(np.abs(current - _home)) < _cfg.homing_convergence_rad:
         return
 
-    # ── Stage 1: execute planned waypoints (collision-safe path) ──
+    # Stage 1: execute planned waypoints (collision-safe path).
     if waypoints is not None and len(waypoints) > 0:
         for _wp in waypoints:
             if shared is not None:
@@ -466,13 +437,8 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
         logger.warning("_planned_homing: no safe path to home — holding position")
         return
 
-    # ── Stage 2: converge to exact home_qpos (fine positioning) ──
-    # Stage 2 does its own linear interpolation from current→home without
-    # collision checking.  This is safe because Stage 1 waypoints have already
-    # brought the arm close to home (typically <10° remaining), and the home
-    # pose is a neutral configuration far from the body and table.  The
-    # convergence check below (homing_convergence_rad ≈ 1°) further limits the
-    # interpolation range.
+    # Stage 2: converge to exact home_qpos (fine positioning). Linear interpolation
+    # without collision check — safe because Stage 1 brings arm close to home.
     if shared is not None and (not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT):
         return
 
@@ -486,8 +452,10 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
 
     # Re-wrap after Stage 1 — the arm may have settled in a different band.
     _home = wrap_nearest_equivalent(
-        home_qpos, current,
-        _cfg.joint_limit_lower, _cfg.joint_limit_upper,
+        home_qpos,
+        current,
+        _cfg.joint_limit_lower,
+        _cfg.joint_limit_upper,
     )
 
     if np.max(np.abs(current - _home)) < _cfg.homing_convergence_rad:
@@ -517,7 +485,6 @@ def _planned_homing(arm: Any, waypoints: np.ndarray | None, home_qpos: np.ndarra
     # Mode 6 firmware handles trajectory interpolation internally.
     _align_speed = np.deg2rad(90.0)
     try:
-        arm.set_servo_angle(angle=home_qpos, is_radian=True,
-                           speed=_align_speed, wait=False)
+        arm.set_servo_angle(angle=home_qpos, is_radian=True, speed=_align_speed, wait=False)
     except Exception:
         pass

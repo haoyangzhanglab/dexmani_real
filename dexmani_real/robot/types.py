@@ -119,14 +119,9 @@ class RobotAction:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Per-process state type specifications
-# ═══════════════════════════════════════════════════════════════════
-#
-# These dataclasses document the field layout of each ring buffer.
-# The authoritative data format is defined by *_DTYPE in shm/shared_storage.py.
-# At runtime, processes read/write raw structured arrays; these classes
-# are NOT instantiated — they serve as human-readable format specs.
+# Per-process state type specifications.
+# These dataclasses document field layout; authoritative format = *_DTYPE in shm/shared_storage.py.
+# Classes are NOT instantiated at runtime — they serve as human-readable format specs.
 
 
 @dataclass
@@ -148,7 +143,6 @@ class ArmState:
     timestamp: float
 
 
-
 @dataclass
 class HandState:
     """Hand process state — published to hand_state_ring every tick (~328 bytes).
@@ -167,7 +161,6 @@ class HandState:
     timestamp: float
 
 
-
 @dataclass
 class HandTactile:
     """Hand tactile force — published to hand_tactile_ring (sparse, ~14.4KB).
@@ -176,4 +169,3 @@ class HandTactile:
     """
 
     tactile_force: np.ndarray  # (5,120,3) float64  N
-
