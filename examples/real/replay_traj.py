@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -71,7 +72,7 @@ from scipy.spatial.transform import Rotation
 # Ensure repo root is on sys.path (belt-and-suspenders for runs without PYTHONPATH=.)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
+from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
@@ -83,8 +84,13 @@ from dexmani_real.shm.shared_storage import (
     HOME_SENTINEL,
     SharedStorage,
     SharedStorageConfig,
+    hand_home_converge,
     read_arm_state,
-    read_hand_state,
+    read_arm_state_dict,
+    read_hand_state_dict,
+    shutdown_processes,
+    wait_for_arm_home,
+    wait_subsystem_ready,
     write_hand_cmd,
 )
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
@@ -665,33 +671,6 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
 # ═══════════════════════════════════════════════ Helpers
 
 
-def _read_arm_state_dict(shared: SharedStorage) -> dict | None:
-    """Read latest arm state from ring, return as dict of numpy arrays or None."""
-    data = read_arm_state(shared)
-    if data is None:
-        return None
-    return {
-        "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
-        "qvel": np.asarray(data["qvel"][0], dtype=np.float64),
-        "tau": np.asarray(data["tau"][0], dtype=np.float64),
-        "eef_pos": np.asarray(data["eef_pos"][0], dtype=np.float64),
-        "eef_rot6d": np.asarray(data["eef_rot6d"][0], dtype=np.float64),
-        "error_code": int(data["error_code"][0]),
-        "connected": bool(data["connected"][0]),
-        "tracking_err": float(data["tracking_err"][0]),
-    }
-
-
-def _read_hand_state_dict(shared: SharedStorage) -> dict | None:
-    """Read latest hand state from ring, return as dict of numpy arrays or None."""
-    data = read_hand_state(shared)
-    if data is None:
-        return None
-    return {
-        "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
-        "connected": bool(data["connected"][0]),
-        "error_state": bool(data["error_state"][0]),
-    }
 
 
 # ═══════════════════════════════════════════════ Main Replayer
@@ -790,7 +769,7 @@ class TrajectoryReplayer:
         # ── Sync hand qpos for collision checks ──
         if self._hand_available:
             try:
-                hs = _read_hand_state_dict(self.shared)
+                hs = read_hand_state_dict(self.shared)
                 if hs is not None and hs["connected"] and np.all(np.isfinite(hs["qpos"])):
                     self._planner.set_hand_qpos(hs["qpos"])
             except Exception:
@@ -833,7 +812,7 @@ class TrajectoryReplayer:
         time.sleep(0.15)
 
         # ── Read final position from ring ──
-        as_dict = _read_arm_state_dict(self.shared)
+        as_dict = read_arm_state_dict(self.shared)
         if as_dict is None or not np.all(np.isfinite(as_dict["qpos"])):
             print("  WARNING: cannot read arm state after approach")
             return arm_qpos  # best-effort: return the input
@@ -859,7 +838,7 @@ class TrajectoryReplayer:
                 time.sleep(HOME_DT)
             time.sleep(0.15)
 
-            as_dict = _read_arm_state_dict(self.shared)
+            as_dict = read_arm_state_dict(self.shared)
             if as_dict is not None and np.all(np.isfinite(as_dict["qpos"])):
                 arm_qpos = as_dict["qpos"]
                 final_dev = np.rad2deg(np.max(np.abs(arm_qpos - first_cmd)))
@@ -888,7 +867,7 @@ class TrajectoryReplayer:
         self._recorder = ReplayRecorder(T, has_hand=has_hand)
 
         # ── Read initial state from rings ──
-        as_dict = _read_arm_state_dict(self.shared)
+        as_dict = read_arm_state_dict(self.shared)
         if as_dict is None or not np.all(np.isfinite(as_dict["qpos"])):
             print("ERROR: cannot read initial arm state from ring — aborting")
             return None
@@ -945,7 +924,7 @@ class TrajectoryReplayer:
                 # NaN guard
                 if not np.all(np.isfinite(arm_cmd)):
                     logger.warning("Frame %d arm_cmd has NaN, using current state", frame_idx)
-                    as_cur = _read_arm_state_dict(self.shared)
+                    as_cur = read_arm_state_dict(self.shared)
                     if as_cur is not None and np.all(np.isfinite(as_cur["qpos"])):
                         arm_cmd = as_cur["qpos"].copy()
                     else:
@@ -953,7 +932,7 @@ class TrajectoryReplayer:
                         continue
 
                 # ── Read arm state from ring ──
-                as_dict = _read_arm_state_dict(self.shared)
+                as_dict = read_arm_state_dict(self.shared)
                 if as_dict is None:
                     error_count += 1
                     logger.warning("arm_state_ring read returned None at frame %d", frame_idx)
@@ -1008,7 +987,7 @@ class TrajectoryReplayer:
                 # ── Read hand state ──
                 hand_qpos: np.ndarray | None = None
                 if has_hand:
-                    hs = _read_hand_state_dict(self.shared)
+                    hs = read_hand_state_dict(self.shared)
                     if hs is not None and hs["connected"]:
                         hand_qpos = hs["qpos"]
 
@@ -1257,7 +1236,6 @@ Control keys:
     # ═══════════════════════════════════════════════════════════════
     # SharedStorage architecture — spawn arm_loop (+ optional hand_loop)
     # ═══════════════════════════════════════════════════════════════
-    import multiprocessing as mp
 
     print("\n" + "=" * 60)
     print("Replay — SharedStorage architecture (arm_loop + hand_loop)")
@@ -1295,30 +1273,9 @@ Control keys:
     if hand_available:
         ready_checks.append(("hand", shared.hand_ready, 30))
 
-    for name, ev, timeout in ready_checks:
-        _ready_deadline = time.monotonic() + timeout
-        _ready_ok = False
-        _already_logged = False
-        while time.monotonic() < _ready_deadline:
-            if ev.is_set():
-                _ready_ok = True
-                break
-            if shared.error_state.value:
-                logger.error("%s startup failed: error_state set by %s process", name, name)
-                _already_logged = True
-                break
-            # Check if the corresponding process exited prematurely
-            if not any(p.name == name and p.is_alive() for p in procs):
-                logger.error("%s startup failed: %s process exited", name, name)
-                _already_logged = True
-                break
-            time.sleep(0.2)
-        if not _ready_ok and not _already_logged:
-            logger.error("%s startup failed: ready-event timeout after %ds", name, timeout)
-        if not _ready_ok:
-            shared.is_running.value = False
-            _shutdown_replay(procs, shared)
-            return
+    if not wait_subsystem_ready(shared, ready_checks, procs):
+        shutdown_processes(shared, procs)
+        return
 
     print("  arm_loop: ready")
     if hand_available:
@@ -1429,21 +1386,7 @@ Control keys:
                             from dexmani_real.config.defaults import hand as _hand_defaults
 
                             _HAND_HOME = np.deg2rad(np.array(_hand_defaults.home_qpos_deg, dtype=np.float64))
-                            _hand_tol = np.deg2rad(5.0)
-                            _hand_deadline = time.monotonic() + 5.0
-                            _hand_reached = False
-                            while time.monotonic() < _hand_deadline:
-                                write_hand_cmd(shared, _HAND_HOME)
-                                _hs = _read_hand_state_dict(shared)
-                                if _hs is not None and np.all(np.isfinite(_hs["qpos"])):
-                                    if float(np.max(np.abs(_hs["qpos"] - _HAND_HOME))) < _hand_tol:
-                                        _hand_reached = True
-                                        break
-                                time.sleep(0.05)
-                            if _hand_reached:
-                                print("  hand: home reached", flush=True)
-                            else:
-                                print("  hand: home settle timeout — proceeding", flush=True)
+                            hand_home_converge(shared, _HAND_HOME, heartbeat=False, check_is_running=False, verbose=True)
 
                         # ── Step 2: Arm home (collision-checked path) ──
                         _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
@@ -1462,40 +1405,17 @@ Control keys:
                         if _waypoints is not None and len(_waypoints) == 0:
                             print("  arm: NO SAFE PATH to home — holding position", flush=True)
                         shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
-                        # Wait for qpos to converge to home (poll, up to 20s).
-                        _home_deadline = time.perf_counter() + 20.0
-                        _home_reached = False
-                        while time.perf_counter() < _home_deadline:
-                            _as = _read_arm_state_dict(shared)
-                            if _as is not None and np.all(np.isfinite(_as["qpos"])):
-                                if float(np.max(np.abs(_as["qpos"] - _home_arr))) < 0.03:
-                                    _home_reached = True
-                                    break
-                            time.sleep(0.2)
-                        if _home_reached:
-                            print("  arm: home reached", flush=True)
+                        wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
                         print("Press Q to exit...")
             finally:
                 kb.stop()
 
         transition(shared, SafetyState.DISARMED)
         replayer.shutdown()
-        _shutdown_replay(procs, shared)
+        shutdown_processes(shared, procs)
 
     print("Done.")
 
-
-def _shutdown_replay(procs: list, shared: SharedStorage) -> None:
-    """Graceful shutdown for replay processes."""
-    shared.is_running.value = False
-    for p in procs:
-        p.join(timeout=5)
-    for p in procs:
-        if p.is_alive():
-            p.terminate()
-            p.join(timeout=1)
-    shared.close()
-    print("Shutdown complete")
 
 
 if __name__ == "__main__":

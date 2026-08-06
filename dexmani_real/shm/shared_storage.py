@@ -7,6 +7,7 @@ through it — no direct references, no RPC, no business logic.
 from __future__ import annotations
 
 import multiprocessing as mp
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -367,3 +368,205 @@ def read_hand_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
     """Read up to *k* most recent hand state frames (oldest-first), may be shorter than *k*."""
     frames = shared.hand_state_ring.get_last_k(k)
     return [data for data, _ts, _seq in frames]
+
+
+# ═══════════════════════════════════════════════ Shared entry-point helpers
+
+
+def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
+    """Read latest arm state from ring. Return dict of numpy arrays or None.
+
+    Fields: qpos(7), qvel(7), tau(7), eef_pos(3), eef_rot6d(6),
+            error_code, connected, tracking_err.
+    Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
+    """
+    data = read_arm_state(shared)
+    if data is None:
+        return None
+    return {
+        "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
+        "qvel": np.asarray(data["qvel"][0], dtype=np.float64),
+        "tau": np.asarray(data["tau"][0], dtype=np.float64),
+        "eef_pos": np.asarray(data["eef_pos"][0], dtype=np.float64),
+        "eef_rot6d": np.asarray(data["eef_rot6d"][0], dtype=np.float64),
+        "error_code": int(data["error_code"][0]),
+        "connected": bool(data["connected"][0]),
+        "tracking_err": float(data["tracking_err"][0]),
+    }
+
+
+def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
+    """Read latest hand state from ring. Return dict of numpy arrays or None.
+
+    Fields: qpos(12), current(12), tactile_sum(5,3), tactile_contact(5),
+            connected, error_state, qpos_stale.
+    """
+    data = read_hand_state(shared)
+    if data is None:
+        return None
+    return {
+        "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
+        "current": np.asarray(data["current"][0], dtype=np.float64),
+        "tactile_sum": np.asarray(data["tactile_sum"][0], dtype=np.float64),
+        "tactile_contact": np.asarray(data["tactile_contact"][0], dtype=bool),
+        "connected": bool(data["connected"][0]),
+        "error_state": bool(data["error_state"][0]),
+        "qpos_stale": bool(data["qpos_stale"][0]),
+    }
+
+
+def shutdown_processes(shared: "SharedStorage", procs: "list[mp.Process]") -> None:
+    """Graceful shutdown: is_running=False, join(5s), terminate stragglers, close shared.
+
+    Safe to call with an empty list (e.g. dry-run).
+    """
+    shared.is_running.value = False
+    _status: list[str] = []
+    for p in procs:
+        p.join(timeout=5)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=1)
+            _status.append(f"{p.name}=term")
+        else:
+            _status.append(f"{p.name}=ok")
+    shared.close()
+    if _status:
+        print(f"  shutdown: {'  '.join(_status)}")
+
+
+def wait_for_arm_home(
+    shared: "SharedStorage",
+    home_qpos: "np.ndarray",
+    *,
+    timeout_s: float = 20.0,
+    tol_rad: float = 0.03,
+    verbose: bool = True,
+) -> bool:
+    """Poll arm_state_ring until qpos converges to *home_qpos* or timeout.
+
+    Does NOT use ``wrap_nearest_equivalent`` — ``arm_loop._planned_homing``
+    (triggered by ``HOME_SENTINEL``) already handles joint-band wrapping and
+    finishes with ``set_servo_angle(home_qpos)``, so joints converge to the
+    canonical home position.
+
+    Returns True if home is reached, False on timeout.
+    """
+    _deadline = time.monotonic() + timeout_s
+    while time.monotonic() < _deadline:
+        _as = read_arm_state(shared)
+        if _as is not None:
+            _q = np.asarray(_as["qpos"][0], dtype=np.float64)
+            if np.all(np.isfinite(_q)):
+                if float(np.max(np.abs(_q - home_qpos))) < tol_rad:
+                    if verbose:
+                        print("  arm: home reached", flush=True)
+                    return True
+        time.sleep(0.1)
+    if verbose:
+        print(f"  arm: home settle timeout ({timeout_s:.0f}s)", flush=True)
+    return False
+
+
+def wait_subsystem_ready(
+    shared: "SharedStorage",
+    ready_checks: "list[tuple[str, Any, float]]",
+    procs: "list[mp.Process]",
+) -> bool:
+    """Wait for each ``(name, event, timeout_s)`` ready event to be set.
+
+    Checks ``error_state`` and process liveness on every poll tick.
+    Returns True if all subsystems are ready, False if any fail.
+
+    The caller is responsible for printing pre-wait user messages
+    (e.g. "put on Quest headset") before calling this function.
+    """
+    for name, ev, timeout in ready_checks:
+        _deadline = time.monotonic() + timeout
+        _ok = False
+        _logged = False
+        while time.monotonic() < _deadline:
+            if ev.is_set():
+                _ok = True
+                break
+            if shared.error_state.value:
+                logger.error("subsystem=%s init failed: error_state set", name)
+                _logged = True
+                break
+            if not all(p.is_alive() for p in procs):
+                _dead_names = [p.name for p in procs if not p.is_alive()]
+                logger.error(
+                    "subsystem=%s init failed: process(es) %s exited prematurely",
+                    name,
+                    _dead_names,
+                )
+                _logged = True
+                break
+            time.sleep(0.2)
+        if not _ok and not _logged:
+            logger.error("subsystem=%s ready_timeout=%ds", name, timeout)
+        if not _ok:
+            return False
+    return True
+
+
+def print_health_summary(shared: "SharedStorage") -> None:
+    """Print a pre-flight health summary from ring data (arm, hand, VR, camera)."""
+    print("\n── Health Check ──")
+
+    # Arm
+    arm_result = shared.arm_state_ring.read_latest()
+    if arm_result is not None:
+        arm_data, _, _ = arm_result
+        arm_connected = bool(arm_data["connected"][0])
+        arm_error = int(arm_data["error_code"][0])
+        arm_qpos = np.asarray(arm_data["qpos"][0], dtype=np.float64)
+        arm_qpos_ok = int(np.all(np.isfinite(arm_qpos)))
+        arm_ok = arm_connected and arm_error == 0 and bool(arm_qpos_ok)
+        print(
+            f"  arm   {'OK' if arm_ok else 'FAIL':>4s}  connected={int(arm_connected)}  "
+            f"error={arm_error}  qpos_ok={arm_qpos_ok}"
+        )
+    else:
+        print("  arm   ----  (no data yet)")
+
+    # Hand
+    hand_result = shared.hand_state_ring.read_latest()
+    if hand_result is not None:
+        hand_data, _, _ = hand_result
+        hand_connected = bool(hand_data["connected"][0])
+        hand_error = bool(hand_data["error_state"][0])
+        hand_qpos_stale = bool(hand_data["qpos_stale"][0])
+        hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
+        hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
+        hand_ok = hand_connected and not hand_error and bool(hand_qpos_ok)
+        stale_note = " stale=1" if hand_qpos_stale else ""
+        print(
+            f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
+            f"error={int(hand_error)}  qpos_ok={hand_qpos_ok}{stale_note}"
+        )
+    else:
+        print("  hand  ----  (no data yet)")
+
+    # VR
+    vr_result = shared.vr_ring.read_latest()
+    if vr_result is not None:
+        vr_data, _, _ = vr_result
+        vr_age_s = (
+            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9 if vr_data["local_recv_ns"][0] > 0 else -1
+        )
+        print(f"  vr     OK   age={vr_age_s:.1f}s  seq={int(vr_data['sequence_id'][0])}")
+    else:
+        print("  vr    ----  (no data yet)")
+
+    # Camera
+    cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
+    if cam_serial_bytes:
+        print(f"  cam    OK   serial={cam_serial_bytes.decode()}")
+    elif shared.camera_heartbeat_s.value > 0:
+        print("  cam    OK   serial=unknown")
+    else:
+        print("  cam   ----  (no data yet)")
+
+    print("──")
+    sys.stdout.flush()

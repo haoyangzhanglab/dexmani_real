@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["ControlSignal", "KeyboardHandler", "GlobalKeyState"]
+__all__ = ["ControlSignal", "KeyboardHandler", "GlobalKeyState", "eef_delta_from_keys"]
 
 import os
 import sys
@@ -11,6 +11,8 @@ import time
 from collections import deque
 from enum import Enum
 from typing import Any
+
+import numpy as np
 
 
 class ControlSignal(Enum):
@@ -364,3 +366,48 @@ class GlobalKeyState:
     @property
     def any_pressed(self) -> bool:
         return len(self._keys) > 0
+
+
+def eef_delta_from_keys(
+    keys: GlobalKeyState, delta_pos: float, delta_rpy: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map held WASD/arrow/IJKL keys to EEF delta position (dx) and rotation (drpy).
+
+    Args:
+        keys: Active :class:`GlobalKeyState` instance.
+        delta_pos: Per-frame translation step (m).
+        delta_rpy: Per-frame rotation step (rad).
+
+    Returns:
+        ``(dx, drpy)`` — each is a (3,) ``np.float64`` array.  Zero when no
+        relevant keys are held.
+    """
+    dx = np.zeros(3, dtype=np.float64)
+    if keys.is_pressed("w"):
+        dx[0] += delta_pos
+    if keys.is_pressed("s"):
+        dx[0] -= delta_pos
+    if keys.is_pressed("a"):
+        dx[1] -= delta_pos
+    if keys.is_pressed("d"):
+        dx[1] += delta_pos
+    if keys.is_pressed("up"):
+        dx[2] += delta_pos
+    if keys.is_pressed("down"):
+        dx[2] -= delta_pos
+
+    drpy = np.zeros(3, dtype=np.float64)
+    if keys.is_pressed("left"):
+        drpy[0] += delta_rpy
+    if keys.is_pressed("right"):
+        drpy[0] -= delta_rpy
+    if keys.is_pressed("i"):
+        drpy[1] += delta_rpy
+    if keys.is_pressed("k"):
+        drpy[1] -= delta_rpy
+    if keys.is_pressed("j"):
+        drpy[2] -= delta_rpy
+    if keys.is_pressed("l"):
+        drpy[2] += delta_rpy
+
+    return dx, drpy

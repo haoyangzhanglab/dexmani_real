@@ -209,6 +209,8 @@ def main() -> None:
     quat_key = "wrist_quat_wxyz" if args.ref == "wrist" else "head_quat_wxyz"
 
     print(f"  采集 {args.duration}s (保持静止)...")
+    prev_seq: int | None = None
+    stale_count = 0
     while time.monotonic() < deadline:
         result = shared.vr_ring.read_latest()
         if result is None:
@@ -216,6 +218,14 @@ def main() -> None:
             continue
 
         data, _ts, _seq = result
+
+        # Skip duplicate frames (VR data stalled — same quaternion re-reads
+        # would produce a falsely low std and inflated quality grade).
+        if prev_seq is not None and _seq == prev_seq:
+            stale_count += 1
+            time.sleep(0.01)
+            continue
+        prev_seq = _seq
 
         # Extract quaternion from structured array field.
         if args.ref == "wrist":
@@ -270,7 +280,7 @@ def main() -> None:
 
     print(f"\n{'='*55}")
     print(f"标定结果")
-    print(f"  有效帧:   {len(forwards)} (剔除 {int(np.sum(~inlier))} 离群)")
+    print(f"  有效帧:   {len(forwards)} (剔除 {int(np.sum(~inlier))} 离群, 跳过 {stale_count} 重复)")
     print(f"  forward:  [{mean_fwd[0]:.4f}, {mean_fwd[1]:.4f}]")
     print(f"  theta:    {theta_deg:.1f}°")
     print(f"  质量:     {quality}")

@@ -111,7 +111,7 @@ class ArmParams:
 
     # ── Home position (rad) — neutral pose ──
     home_qpos: tuple[float, ...] = (
-        -0.523599,  # J1: -30.0°
+        0.0,  # J1: 0.0°
         -0.033161,  # J2: -1.9°
         0.0,  # J3: 0.0°
         0.235619,  # J4: 13.5°

@@ -92,6 +92,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         arm.set_mode(6)
         arm.set_state(0)
         arm.set_collision_sensitivity(cfg.collision_sensitivity)
+        # TCP load: XHand (1.1 kg). COG in tool-flange frame (link_eef) from
+        # URDF weighted-COM of all end-effector links; flange_joint2 corrected
+        # 0.043→0.033 m per physical measurement.
+        arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5])
         # Torque-based collision detection (level 1). Detects impacts but may
         # miss slow contact. Primary table protection: self-collision + z-clearance.
         arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True)

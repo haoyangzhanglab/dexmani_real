@@ -43,8 +43,8 @@ from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage
-from dexmani_real.teleop.keyboard import GlobalKeyState
+from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage, shutdown_processes, wait_for_arm_home, wait_subsystem_ready
+from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import ema_smooth_pose
@@ -83,7 +83,7 @@ class KeyboardTeleopConfig:
 _cfg = KeyboardTeleopConfig()
 
 # Workspace bounds in WORLD frame (defined in defaults.py as world-frame coordinates).
-# The robot base sits at base_pose_world (30° Z rotation) within this world.
+# Base frame = world frame (identity transform).
 WORKSPACE_BOUNDS = policy.workspace.as_array()
 
 
@@ -140,41 +140,18 @@ def _wall_check(
             wall_timers[axis] = now
 
 
-def _wait_for_home(
-    shared: SharedStorage,
-    home_qpos_arr: np.ndarray,
-    joint_limit_lower: tuple[float, ...],
-    joint_limit_upper: tuple[float, ...],
-    timeout_s: float = 20.0,
-    tol_rad: float = 0.03,
-) -> bool:
-    """Poll arm_state_ring until qpos converges to home_qpos or timeout."""
-    _deadline = time.perf_counter() + timeout_s
-    while time.perf_counter() < _deadline:
-        _res = shared.arm_state_ring.read_latest()
-        if _res is not None:
-            _ad, _, _ = _res
-            _q = np.asarray(_ad["qpos"][0], dtype=np.float64)
-            if np.all(np.isfinite(_q)):
-                # Wrap home_qpos to the nearest equivalent band for comparison
-                # (J1/J3/J5/J7 may report on any ±360° band).
-                _wrapped_home = wrap_nearest_equivalent(
-                    home_qpos_arr,
-                    _q,
-                    joint_limit_lower,
-                    joint_limit_upper,
-                )
-                if float(np.max(np.abs(_q - _wrapped_home))) < tol_rad:
-                    return True
-        time.sleep(0.2)
-    return False
-
-
 # ═══════════════════════════════════════════════ Main Loop
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Keyboard Teleop xArm7")
+    parser.add_argument("--no-hand", action="store_true", help="Disable hand (no hand_loop spawned)")
+    _args = parser.parse_args()
+
     _dt = 1.0 / _cfg.ctrl_hz
+    _hand_enabled = not _args.no_hand
     print("=" * 60)
     print("  Keyboard Teleop — xArm7 (SharedStorage)")
     print(
@@ -183,6 +160,7 @@ def main():
     print(f"  EMA   pos={policy.ema.alpha_pos:.2f}  rot={policy.ema.alpha_rot:.2f}")
     print(f"  Kp    cartesian={_cfg.cartesian_kp:.1f}")
     print(f"  WS    x{WORKSPACE_BOUNDS[0]}  y{WORKSPACE_BOUNDS[1]}  z{WORKSPACE_BOUNDS[2]}")
+    print(f"  Hand  {'ON' if _hand_enabled else 'OFF'}")
     print("=" * 60)
 
     # ── 1. Planner ──
@@ -198,32 +176,20 @@ def main():
     shared = SharedStorage.create(prefix="dexmani_kb")
     arm_loop_cfg = ArmLoopConfig()
     arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_loop_cfg), name="arm-kb", daemon=True)
-    hand_proc = mp.Process(target=_hand_loop, args=(shared,), name="hand-kb", daemon=True)
     arm_proc.start()
-    hand_proc.start()
+    hand_proc: mp.Process | None = None
+    if _hand_enabled:
+        hand_proc = mp.Process(target=_hand_loop, args=(shared,), name="hand-kb", daemon=True)
+        hand_proc.start()
 
-    _arm_ready_ok = False
-    _already_logged = False
-    _arm_deadline = time.monotonic() + 15
-    while time.monotonic() < _arm_deadline:
-        if shared.arm_ready.is_set():
-            _arm_ready_ok = True
-            break
-        if shared.error_state.value:
-            logger.error("Arm init failed: error_state set")
-            _already_logged = True
-            break
-        if not arm_proc.is_alive():
-            logger.error("Arm init failed: arm process exited")
-            _already_logged = True
-            break
-        time.sleep(0.2)
-    if not _arm_ready_ok and not _already_logged:
-        logger.error("Arm process startup timeout (15s) — exiting")
-    if not _arm_ready_ok:
-        _shutdown_kb(shared, arm_proc, hand_proc)
+    _procs = [arm_proc]
+    if hand_proc is not None:
+        _procs.append(hand_proc)
+    if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, 15)], _procs):
+        shutdown_processes(shared, _procs)
         return
-    shared.hand_ready.wait(timeout=15)  # optional — degrade gracefully
+    if _hand_enabled and hand_proc is not None:
+        shared.hand_ready.wait(timeout=15)  # optional — degrade gracefully
 
     transition(shared, SafetyState.ARMED)
 
@@ -231,7 +197,7 @@ def main():
     _arm_result = shared.arm_state_ring.read_latest()
     if _arm_result is None:
         logger.error("Cannot read initial arm state from ring — exiting")
-        _shutdown_kb(shared, arm_proc, hand_proc)
+        shutdown_processes(shared, [arm_proc] if hand_proc is None else [arm_proc, hand_proc])
         return
     _arm_data, _, _ = _arm_result
     arm_qpos = np.asarray(_arm_data["qpos"][0], dtype=np.float64)
@@ -240,12 +206,12 @@ def main():
     arm_connected = bool(_arm_data["connected"][0])
     if not arm_connected or not np.all(np.isfinite(arm_qpos)):
         logger.error("Arm state invalid: connected=%s, qpos_finite=%s", arm_connected, np.all(np.isfinite(arm_qpos)))
-        _shutdown_kb(shared, arm_proc, hand_proc)
+        shutdown_processes(shared, [arm_proc] if hand_proc is None else [arm_proc, hand_proc])
         return
 
     prev_qpos_cmd = arm_qpos.copy()
     # Initialize target in WORLD frame (consistent with keyboard operator's perspective).
-    # Pinocchio FK gives base-frame EEF; base_to_world_pose rotates by ~30° around Z.
+    # Pinocchio FK gives base-frame EEF; base_to_world_pose is identity (base = world).
     _eef_pin = planner.compute_eef_pose_base(arm_qpos)
     _eef_world = planner.base_to_world_pose(_eef_pin)
     target_pos = _eef_world.p.copy()
@@ -338,9 +304,7 @@ def main():
                 error_count = 0
                 # Wait for homing to converge, then refresh state from ring.
                 _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                _converged = _wait_for_home(
-                    shared, _home_arr, arm_loop_cfg.joint_limit_lower, arm_loop_cfg.joint_limit_upper, timeout_s=20.0
-                )
+                _converged = wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
                 if not _converged:
                     print("  home  wait timeout — continuing", flush=True)
                 _arm_result = shared.arm_state_ring.read_latest()
@@ -404,33 +368,7 @@ def main():
                 continue
 
             # ── EEF target delta from keys ──
-            dx = np.zeros(3, dtype=np.float64)
-            if keys.is_pressed("w"):
-                dx[0] += _cfg.delta_pos
-            if keys.is_pressed("s"):
-                dx[0] -= _cfg.delta_pos
-            if keys.is_pressed("a"):
-                dx[1] -= _cfg.delta_pos
-            if keys.is_pressed("d"):
-                dx[1] += _cfg.delta_pos
-            if keys.is_pressed("up"):
-                dx[2] += _cfg.delta_pos
-            if keys.is_pressed("down"):
-                dx[2] -= _cfg.delta_pos
-
-            drpy = np.zeros(3, dtype=np.float64)
-            if keys.is_pressed("left"):
-                drpy[0] += _cfg.delta_rpy
-            if keys.is_pressed("right"):
-                drpy[0] -= _cfg.delta_rpy
-            if keys.is_pressed("i"):
-                drpy[1] += _cfg.delta_rpy
-            if keys.is_pressed("k"):
-                drpy[1] -= _cfg.delta_rpy
-            if keys.is_pressed("j"):
-                drpy[2] -= _cfg.delta_rpy
-            if keys.is_pressed("l"):
-                drpy[2] += _cfg.delta_rpy
+            dx, drpy = eef_delta_from_keys(keys, _cfg.delta_pos, _cfg.delta_rpy)
 
             # ── Periodic status (suppressed when idle — no keys pressed) ──
             _is_idle = np.all(dx == 0) and np.all(drpy == 0)
@@ -527,13 +465,14 @@ def main():
 
             # ── IK solve (on EMA-smoothed world-frame target) ──
             target_pose_world = Pose(p=ik_target_pos, q=ik_target_quat)
-            # Hand qpos from ring (if available — keyboard teleop doesn't need hand)
-            _hand_result = shared.hand_state_ring.read_latest()
-            if _hand_result is not None:
-                _hd, _, _ = _hand_result
-                _hand_qpos = np.asarray(_hd["qpos"][0], dtype=np.float64)
-                if np.all(np.isfinite(_hand_qpos)):
-                    planner.set_hand_qpos(_hand_qpos)
+            # Hand qpos from ring (for collision checking — optional)
+            if _hand_enabled:
+                _hand_result = shared.hand_state_ring.read_latest()
+                if _hand_result is not None:
+                    _hd, _, _ = _hand_result
+                    _hand_qpos = np.asarray(_hd["qpos"][0], dtype=np.float64)
+                    if np.all(np.isfinite(_hand_qpos)):
+                        planner.set_hand_qpos(_hand_qpos)
             ik_result = planner.solve_teleop_ik(target_pose_world, arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:
@@ -585,7 +524,7 @@ def main():
             # NaN gate (inline — same as policy_loop)
             if not np.all(np.isfinite(arm_cmd)):
                 continue
-            if shared.safety_state.value == SafetyState.FAULT:
+            if shared.safety_state.value == int(SafetyState.FAULT):
                 continue
 
             shared.arm_action_q.put({"qpos": arm_cmd.copy()})
@@ -679,13 +618,7 @@ def main():
                         print("  home  arm state unavailable — falling back to SDK-based homing", flush=True)
                         shared.arm_action_q.put((HOME_SENTINEL, None))
                     _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                    _converged = _wait_for_home(
-                        shared,
-                        _home_arr,
-                        arm_loop_cfg.joint_limit_lower,
-                        arm_loop_cfg.joint_limit_upper,
-                        timeout_s=20.0,
-                    )
+                    _converged = wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
                     if not _converged:
                         print("  home  wait timeout — continuing", flush=True)
                     print("[Q] quit")
@@ -696,19 +629,9 @@ def main():
         keys.stop()
 
         # ── Cleanup ──
-        _shutdown_kb(shared, arm_proc, hand_proc)
+        shutdown_processes(shared, [arm_proc] if hand_proc is None else [arm_proc, hand_proc])
         print("Shutdown complete.")
 
-
-def _shutdown_kb(shared: SharedStorage, arm_proc: mp.Process, hand_proc: mp.Process) -> None:
-    """Graceful shutdown for keyboard teleop."""
-    shared.is_running.value = False
-    for p in (arm_proc, hand_proc):
-        p.join(timeout=5)
-        if p.is_alive():
-            p.terminate()
-            p.join(timeout=1)
-    shared.close()
 
 
 if __name__ == "__main__":

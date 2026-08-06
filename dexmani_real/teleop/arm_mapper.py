@@ -74,7 +74,7 @@ class ArmWristMapper:
         self.eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz))
         # Seed continuous_quat in WORLD frame so the first map() dot-product
         # compares quaternions in the same coordinate system.
-        # (base_to_world_rot is R_z(30°) — pure Z rotation, zero translation.)
+        # (base_to_world_rot is identity — base frame = world frame, zero transform.)
         _eef_rot0_world = self.base_to_world_rot @ self.eef_rot0
         self.last_quat_wxyz = mat2quat(_eef_rot0_world)
         self._last_wrist_rot = self.wrist_rot0.copy()

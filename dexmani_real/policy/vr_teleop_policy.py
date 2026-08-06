@@ -124,7 +124,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 srdf_path=srdf_path,
                 base_pose_world=Pose(
                     p=np.array([0.0, 0.0, 0.0]),
-                    q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
+                    q=np.array([1.0, 0.0, 0.0, 0.0]),
                 ),
             ),
             planning_profile=PlanningProfile(),
@@ -152,7 +152,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             vr_to_base_rot=_T_vr_fixed,
             T_vr_to_robot=_T_vr_fixed,
             max_delta_rot_rad=cfg.vr_max_delta_rot_rad,
-            base_to_world_rot=Rotation.from_quat([0.0, 0.0, np.sin(np.pi / 12), np.cos(np.pi / 12)]).as_matrix(),
+            base_to_world_rot=np.eye(3, dtype=np.float64),
         )
 
         _repo_root = Path(__file__).resolve().parents[2]
@@ -794,6 +794,12 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _eef_pos = arm_state["eef_pos"][0].copy()
                     _eef_rot6d = arm_state["eef_rot6d"][0].copy()
                     if np.all(np.isfinite(_eef_pos)) and np.all(np.isfinite(_eef_rot6d)):
+                        # Dynamic heading calibration: set vr_to_base_rot from the
+                        # operator's current head orientation so position mapping
+                        # adapts to where the operator is actually facing.
+                        _head_q = vr_frame.get("head_quat_wxyz")
+                        if _head_q is not None and np.all(np.isfinite(_head_q)) and not np.allclose(_head_q, 0):
+                            arm_mapper.set_heading(np.asarray(_head_q, dtype=np.float64))
                         arm_mapper.reset(
                             wrist_pos=vr_frame["wrist_pos"],
                             wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
@@ -808,8 +814,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 # arm pose in world frame.
                 # IMPORTANT: do NOT seed from arm_state["eef_pos"] — that
                 # value is in base frame (Pinocchio FK), while mapper
-                # output is in world frame.  Mixing the two in EMA would
-                # produce a garbage pose and arm jump.
+                # output is in world frame (identity transform: base=world).
+                # For consistency, always use the mapper's own output.
                 ema_prev_pos = ema_prev_quat = None
                 _hand_ramp_start = prev_hand_qpos.copy() if hand_available else None
                 _hand_ramp_frames = cfg.hand_ramp_frames

@@ -41,6 +41,7 @@ cv2.calibrateHandEye（5 种算法比选）自动求解相机外参。
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import sys
 import termios
 import time
@@ -62,8 +63,16 @@ from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage, SharedStorageConfig, read_arm_state
-from dexmani_real.teleop.keyboard import GlobalKeyState
+from dexmani_real.shm.shared_storage import (
+    HOME_SENTINEL,
+    SharedStorage,
+    SharedStorageConfig,
+    read_arm_state_dict,
+    shutdown_processes,
+    wait_for_arm_home,
+    wait_subsystem_ready,
+)
+from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
 from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
@@ -404,9 +413,10 @@ def calibrate_and_select(
                 tvec_marker2camera_list,
             )
             std_mm = float(errors_mm.std())
-        except Exception:
+        except Exception as e:
             # cv2.error (calibrate_eye_to_hand) or LinAlgError / RuntimeWarning
             # (compute_marker_consistency: degenerate rotation → SVD failure)
+            print(f"    {name}: failed — {e}")
             table.append((name, float("nan")))
             continue
         table.append((name, std_mm))
@@ -502,8 +512,6 @@ def main():
     )
 
     # ── 2. SharedStorage + arm_loop (new architecture) ──
-    import multiprocessing as mp
-
     shm_cfg = SharedStorageConfig()
     shared = SharedStorage.create(prefix="dexmani_calib", config=shm_cfg)
     arm_cfg = ArmLoopConfig()
@@ -511,57 +519,26 @@ def main():
     arm_proc.start()
 
     transition(shared, SafetyState.DISARMED)
-    _arm_ready_ok = False
-    _already_logged = False
-    _arm_deadline = time.monotonic() + 30
-    while time.monotonic() < _arm_deadline:
-        if shared.arm_ready.is_set():
-            _arm_ready_ok = True
-            break
-        if shared.error_state.value:
-            print("❌ arm_loop init failed: error_state set")
-            _already_logged = True
-            break
-        if not arm_proc.is_alive():
-            print("❌ arm_loop init failed: process exited")
-            _already_logged = True
-            break
-        time.sleep(0.2)
-    if not _arm_ready_ok and not _already_logged:
-        print("❌ arm_loop 启动超时")
-    if not _arm_ready_ok:
-        shared.is_running.value = False
-        arm_proc.join(timeout=5)
-        shared.close()
+    if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, 30)], [arm_proc]):
+        shutdown_processes(shared, [arm_proc])
         return
     transition(shared, SafetyState.ARMED)
     print("  ✓ arm_loop 就绪 (SharedStorage, Mode 6, 30Hz)")
 
     # ── Read initial state from ring (retry: arm_loop sets arm_ready before first write) ──
 
-    def _read_arm_state_ring():
-        """Read latest arm state from ring, return (qpos, eef_pos, eef_rot6d) or (None,)*3."""
-        data = read_arm_state(shared)
-        if data is None:
-            return None, None, None
-        qpos = np.asarray(data["qpos"][0], dtype=np.float64)
-        eef_pos = np.asarray(data["eef_pos"][0], dtype=np.float64)
-        eef_rot6d = np.asarray(data["eef_rot6d"][0], dtype=np.float64)
-        if not np.all(np.isfinite(qpos)):
-            return None, None, None
-        return qpos, eef_pos, eef_rot6d
-
     arm_qpos = eef_pos = _eef_rot6d = None
     for _ in range(30):  # up to ~1s
-        arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
-        if arm_qpos is not None:
+        _as = read_arm_state_dict(shared)
+        if _as is not None and np.all(np.isfinite(_as["qpos"])):
+            arm_qpos = _as["qpos"]
+            eef_pos = _as["eef_pos"]
+            _eef_rot6d = _as["eef_rot6d"]
             break
         time.sleep(0.05)
     if arm_qpos is None:
         print("❌ 无法从 arm_state_ring 读取初始状态")
-        shared.is_running.value = False
-        arm_proc.join(timeout=5)
-        shared.close()
+        shutdown_processes(shared, [arm_proc])
         return
 
     prev_qpos_cmd = arm_qpos.copy()
@@ -638,9 +615,11 @@ def main():
 
     def _get_ee_pose() -> tuple[np.ndarray, np.ndarray]:
         """获取当前末端位姿 (pos_m, rpy_rad)。Rot6d→RPY via canonical library path."""
-        qpos, eef_pos, eef_rot6d = _read_arm_state_ring()
-        if qpos is None or eef_pos is None or eef_rot6d is None:
+        _as = read_arm_state_dict(shared)
+        if _as is None or not np.all(np.isfinite(_as["qpos"])):
             return np.full(3, np.nan), np.full(3, np.nan)
+        eef_pos = _as["eef_pos"]
+        eef_rot6d = _as["eef_rot6d"]
         try:
             q_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
             rpy = R.from_quat(np.roll(q_wxyz, -1)).as_euler("xyz", degrees=False)
@@ -815,7 +794,7 @@ def main():
             # ── R: 归位 (collision-safe path via plan_joint_home_path) ──
             if keys.is_pressed("r"):
                 print("\n  R: return_home")
-                _home_qpos = np.array(ArmLoopConfig().home_qpos, dtype=np.float64)
+                _home_qpos = np.array(arm_cfg.home_qpos, dtype=np.float64)
                 _waypoints = plan_joint_home_path(
                     arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
                 )
@@ -828,20 +807,15 @@ def main():
                 shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                 # Wait for qpos to converge to home (arm stays there after homing).
                 _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                _home_deadline = time.perf_counter() + 20.0
-                _home_ok = False
-                while time.perf_counter() < _home_deadline:
-                    _qpos_h, _, _ = _read_arm_state_ring()
-                    if _qpos_h is not None:
-                        if float(np.max(np.abs(_qpos_h - _home_arr))) < 0.03:
-                            _home_ok = True
-                            break
-                    time.sleep(0.2)
+                _home_ok = wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
                 if not _home_ok:
                     print("  home wait timeout — continuing", flush=True)
                 # Re-sync after homing
-                arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
-                if arm_qpos is not None:
+                _as = read_arm_state_dict(shared)
+                if _as is not None and np.all(np.isfinite(_as["qpos"])):
+                    arm_qpos = _as["qpos"]
+                    eef_pos = _as["eef_pos"]
+                    _eef_rot6d = _as["eef_rot6d"]
                     prev_qpos_cmd = arm_qpos.copy()
                     # World-frame target at home position
                     _eef_quat_base = rot6d_to_quat_wxyz(_eef_rot6d)
@@ -855,9 +829,32 @@ def main():
 
             # ── 读取状态 (from arm_state_ring) ──
             try:
-                arm_qpos, eef_pos, _eef_rot6d = _read_arm_state_ring()
-                if arm_qpos is None:
+                _as = read_arm_state_dict(shared)
+                if _as is None or not np.all(np.isfinite(_as["qpos"])):
                     continue
+                arm_qpos = _as["qpos"]
+                eef_pos = _as["eef_pos"]
+                _eef_rot6d = _as["eef_rot6d"]
+                arm_error_code = _as["error_code"]
+                arm_connected = _as["connected"]
+
+                # ── Safety: error_state latch ──
+                if shared.error_state.value:
+                    print("  ⚠ error_state set — emergency stop", flush=True)
+                    _emergency_stop()
+                    break
+
+                # ── Safety: arm disconnected ──
+                if not arm_connected:
+                    print("  ⚠ arm disconnected — emergency stop", flush=True)
+                    _emergency_stop()
+                    break
+
+                # ── Safety: arm unrecoverable error ──
+                if arm_error_code != 0 and arm_error_code not in (22, 24, 31):
+                    print(f"  ⚠ arm unrecoverable error C{arm_error_code} — emergency stop", flush=True)
+                    _emergency_stop()
+                    break
                 # Derive eef_quat from rot6d, then convert to world frame.
                 # eef_pos/rot6d from the ring are base-frame (Pinocchio FK);
                 # keyboard deltas (WASD) are world-frame — both must be in
@@ -875,33 +872,7 @@ def main():
                 continue
 
             # ── EEF target delta from keys (world frame) ──
-            dx = np.zeros(3)
-            if keys.is_pressed("w"):
-                dx[0] += _cfg.delta_pos
-            if keys.is_pressed("s"):
-                dx[0] -= _cfg.delta_pos
-            if keys.is_pressed("a"):
-                dx[1] -= _cfg.delta_pos
-            if keys.is_pressed("d"):
-                dx[1] += _cfg.delta_pos
-            if keys.is_pressed("up"):
-                dx[2] += _cfg.delta_pos
-            if keys.is_pressed("down"):
-                dx[2] -= _cfg.delta_pos
-
-            drpy = np.zeros(3)
-            if keys.is_pressed("left"):
-                drpy[0] += _cfg.delta_rpy
-            if keys.is_pressed("right"):
-                drpy[0] -= _cfg.delta_rpy
-            if keys.is_pressed("i"):
-                drpy[1] += _cfg.delta_rpy
-            if keys.is_pressed("k"):
-                drpy[1] -= _cfg.delta_rpy
-            if keys.is_pressed("j"):
-                drpy[2] -= _cfg.delta_rpy
-            if keys.is_pressed("l"):
-                drpy[2] += _cfg.delta_rpy
+            dx, drpy = eef_delta_from_keys(keys, _cfg.delta_pos, _cfg.delta_rpy)
 
             # 周期性状态打印 (world frame)
             if loop_count % 50 == 0:
@@ -988,12 +959,7 @@ def main():
                 pass
 
         # ── SharedStorage cleanup ──
-        shared.is_running.value = False
-        arm_proc.join(timeout=5)
-        if arm_proc.is_alive():
-            arm_proc.terminate()
-            arm_proc.join(timeout=1)
-        shared.close()
+        shutdown_processes(shared, [arm_proc])
 
         n = len(samples_tvec_ee2base)
         if n >= _cfg.min_samples and T_world_camera is None:

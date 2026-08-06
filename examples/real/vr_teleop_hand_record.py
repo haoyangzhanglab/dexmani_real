@@ -38,9 +38,11 @@ from dexmani_real.shm.shared_storage import (
     HOME_SENTINEL,
     SharedStorage,
     hand_home_converge,
+    print_health_summary,
     read_arm_state,
-    read_hand_state,
-    write_hand_cmd,
+    shutdown_processes,
+    wait_for_arm_home,
+    wait_subsystem_ready,
 )
 from dexmani_real.utils.log import get_logger
 
@@ -135,7 +137,7 @@ def main() -> None:
     # period.  Arm/camera/hand are ready within seconds.
     transition(shared, SafetyState.DISARMED)
 
-    _ready_checks: list[tuple[str, mp.synchronize.Event, float]] = [
+    _ready_checks: list[tuple[str, object, float]] = [
         ("arm", shared.arm_ready, 15),
         ("camera", shared.camera_ready, 15),
         ("vr", shared.vr_ready, 120),
@@ -143,39 +145,24 @@ def main() -> None:
     if not args.no_hand:
         _ready_checks.append(("hand", shared.hand_ready, 15))
 
-    for name, ev, timeout in _ready_checks:
+    # VR-specific pre-wait message (caller responsibility — wait_subsystem_ready
+    # is a pure polling loop).
+    for name, _ev, timeout in _ready_checks:
         if name == "vr":
             print(f"\n  Waiting for VR connection (up to {timeout}s) — put on Quest headset...", flush=True)
-        _ready_deadline = time.monotonic() + timeout
-        _ready_ok = False
-        _already_logged = False
-        while time.monotonic() < _ready_deadline:
-            if ev.is_set():
-                _ready_ok = True
-                break
-            if shared.error_state.value:
-                logger.error("subsystem=%s init failed: error_state set", name)
-                _already_logged = True
-                break
-            # If any spawned process exits during ready-check, abort immediately
-            if not all(p.is_alive() for p in procs):
-                logger.error("subsystem=%s init failed: a process exited prematurely", name)
-                _already_logged = True
-                break
-            time.sleep(0.2)
-        if not _ready_ok and not _already_logged:
-            logger.error("subsystem=%s ready_timeout=%ds", name, timeout)
-        if not _ready_ok:
-            shared.is_running.value = False
-            _shutdown(procs, shared)
-            return
+
+    if not wait_subsystem_ready(shared, _ready_checks, procs):
+        shutdown_processes(shared, procs)
+        return
+
+    for name, _ev, _timeout in _ready_checks:
         if name == "vr":
             print(f"  VR connected", flush=True)
         else:
             print(f"  {name}: ready", flush=True)
 
     # 4b. Pre-flight health summary (ring-based, no direct hardware access)
-    _print_health_summary(shared)
+    print_health_summary(shared)
 
     # All subsystems ready — transition to ARMED.
     transition(shared, SafetyState.ARMED)
@@ -288,7 +275,7 @@ def main() -> None:
         if normal_exit and not shared.error_state.value and not shared.quit_requested.value:
             _post_loop_home(shared)
 
-        _shutdown(procs, shared)
+        shutdown_processes(shared, procs)
 
         # Exit summary
         _runtime_m = (time.monotonic() - _start_time) / 60.0
@@ -299,68 +286,6 @@ def main() -> None:
             f"safety={_final_safety}  normal={normal_exit}"
         )
         print("──")
-
-
-def _print_health_summary(shared: SharedStorage) -> None:
-    """Print a pre-flight style health summary from ring data."""
-    print("\n── Health Check ──")
-
-    # Arm
-    arm_result = shared.arm_state_ring.read_latest()
-    if arm_result is not None:
-        arm_data, _, _ = arm_result
-        arm_connected = bool(arm_data["connected"][0])
-        arm_error = int(arm_data["error_code"][0])
-        arm_qpos = np.asarray(arm_data["qpos"][0], dtype=np.float64)
-        arm_qpos_ok = int(np.all(np.isfinite(arm_qpos)))
-        arm_ok = arm_connected and arm_error == 0 and bool(arm_qpos_ok)
-        print(
-            f"  arm   {'OK' if arm_ok else 'FAIL':>4s}  connected={int(arm_connected)}  "
-            f"error={arm_error}  qpos_ok={arm_qpos_ok}"
-        )
-    else:
-        print("  arm   ----  (no data yet)")
-
-    # Hand
-    hand_result = shared.hand_state_ring.read_latest()
-    if hand_result is not None:
-        hand_data, _, _ = hand_result
-        hand_connected = bool(hand_data["connected"][0])
-        hand_error = bool(hand_data["error_state"][0])
-        hand_qpos_stale = bool(hand_data["qpos_stale"][0])
-        hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
-        hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
-        hand_ok = hand_connected and not hand_error and bool(hand_qpos_ok)
-        stale_note = " stale=1" if hand_qpos_stale else ""
-        print(
-            f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
-            f"error={int(hand_error)}  qpos_ok={hand_qpos_ok}{stale_note}"
-        )
-    else:
-        print("  hand  ----  (no data yet)")
-
-    # VR
-    vr_result = shared.vr_ring.read_latest()
-    if vr_result is not None:
-        vr_data, _, _ = vr_result
-        vr_age_s = (
-            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9 if vr_data["local_recv_ns"][0] > 0 else -1
-        )
-        print(f"  vr     OK   age={vr_age_s:.1f}s  seq={int(vr_data['sequence_id'][0])}")
-    else:
-        print("  vr    ----  (no data yet)")
-
-    # Camera
-    cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
-    if cam_serial_bytes:
-        print(f"  cam    OK   serial={cam_serial_bytes.decode()}")
-    elif shared.camera_heartbeat_s.value > 0:
-        print("  cam    OK   serial=unknown")
-    else:
-        print("  cam   ----  (no data yet)")
-
-    print("──")
-    sys.stdout.flush()
 
 
 def _post_loop_home(shared: SharedStorage) -> None:
@@ -400,23 +325,7 @@ def _post_loop_home(shared: SharedStorage) -> None:
                     except Exception:
                         print("  arm_action_q put failed — arm may have already exited")
                         break
-                    # Wait for arm to converge to home_qpos (joint-position check).
-                    # On Ctrl+C the arm process may have already exited — best-effort
-                    # polling with a short timeout.
-                    _home_tol = np.deg2rad(2.0)
-                    _home_deadline = time.monotonic() + 10.0
-                    _home_reached = False
-                    while time.monotonic() < _home_deadline:
-                        _as = read_arm_state(shared)
-                        if _as is not None:
-                            _q = np.asarray(_as["qpos"][0], dtype=np.float64)
-                            if np.all(np.isfinite(_q)):
-                                if float(np.max(np.abs(_q - _home_qpos))) < _home_tol:
-                                    _home_reached = True
-                                    break
-                        time.sleep(0.1)
-                    if _home_reached:
-                        print("  arm: home reached", flush=True)
+                    wait_for_arm_home(shared, _home_qpos, timeout_s=10.0, tol_rad=np.deg2rad(2.0))
                     print("  [Q] quit")
                 if sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
                     break
@@ -427,22 +336,6 @@ def _post_loop_home(shared: SharedStorage) -> None:
             print("  timeout — auto exit")
     finally:
         kb.stop()
-
-
-def _shutdown(procs: list, shared: SharedStorage) -> None:
-    """Graceful shutdown: signal -> join -> terminate."""
-    shared.is_running.value = False
-    _status: list[str] = []
-    for p in procs:
-        p.join(timeout=5)
-        if p.is_alive():
-            p.terminate()
-            p.join(timeout=1)
-            _status.append(f"{p.name}=term")
-        else:
-            _status.append(f"{p.name}=ok")
-    shared.close()
-    print(f"  shutdown: {'  '.join(_status)}")
 
 
 if __name__ == "__main__":

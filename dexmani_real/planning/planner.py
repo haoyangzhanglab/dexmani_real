@@ -179,7 +179,7 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
     ) -> "XArm7MotionPlanner":
-        """Factory with canonical URDF/SRDF and base_pose_world (30° Z rotation).
+        """Factory with canonical URDF/SRDF and identity base_pose_world.
 
         Centralises the invariant planner setup shared by keyboard_teleop,
         calibrate_camera, and replay_traj.  Callers pass their own
@@ -196,7 +196,7 @@ class XArm7MotionPlanner:
             srdf_path=srdf_path,
             base_pose_world=Pose(
                 p=np.array([0.0, 0.0, 0.0]),
-                q=np.array([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)]),
+                q=np.array([1.0, 0.0, 0.0, 0.0]),
             ),
         )
         return cls(
