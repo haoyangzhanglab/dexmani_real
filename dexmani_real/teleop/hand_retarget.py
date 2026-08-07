@@ -7,22 +7,13 @@ Two landmark-space adaptations compensate human-robot kinematic mismatches:
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "adaptive_retargeting_xhand"]
+__all__ = ["XHandRetargeter", "TAGHandRetargeter", "adaptive_retargeting_xhand"]
 
-import os
-import tempfile
 import time
 
 import numpy as np
-import torch
 import yaml
-from dex_retargeting import yourdfpy as urdf
-from dex_retargeting.kinematics_adaptor import MimicJointKinematicAdaptor
-from dex_retargeting.optimizer import DexPilotOptimizer
-from dex_retargeting.optimizer_utils import LPFilter
-from dex_retargeting.retargeting_config import RetargetingConfig, parse_mimic_joint
-from dex_retargeting.robot_wrapper import RobotWrapper
-from dex_retargeting.seq_retarget import SeqRetargeting
+from dex_retargeting.retargeting_config import RetargetingConfig
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
@@ -159,129 +150,6 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
     return landmarks
 
 
-class XHandDexPilotOptimizer(DexPilotOptimizer):
-    """DexPilot variant with balanced wrist→fingertip vs between-finger weights.
-
-    The original DexPilotOptimizer assigns weight ~15 to wrist→fingertip vectors
-    and weight 1 to between-finger vectors, causing distal joints (J2, J11) to
-    serve as binary length compensators instead of tracking finger flexion.
-
-    This subclass rebalances the weights so between-finger vectors (which carry
-    the true finger flexion signal) have more influence on the optimizer.
-    """
-
-    def __init__(self, wrist_weight: float = 2.0, **kwargs):
-        super().__init__(**kwargs)
-        self.wrist_weight = float(wrist_weight)
-
-    def get_objective_function(self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray):
-        """Same as parent but with configurable wrist→fingertip weight.
-
-        The only change from DexPilotOptimizer.get_objective_function() is the
-        weight computation: wrist→fingertip vectors use self.wrist_weight * n_fingers
-        instead of hardcoded len_proj + n_fingers (~15).
-        """
-        qpos = np.zeros(self.num_joints)
-        qpos[self.idx_pin2fixed] = fixed_qpos
-
-        len_proj = len(self.projected)
-        len_s2 = len(self.s2_project_index_task)
-        len_s1 = len_proj - len_s2
-
-        # Update projection indicator
-        target_vec_dist = np.linalg.norm(target_vector[:len_proj], axis=1)
-        self.projected[:len_s1][target_vec_dist[0:len_s1] < self.project_dist] = True
-        self.projected[:len_s1][target_vec_dist[0:len_s1] > self.escape_dist] = False
-        self.projected[len_s1:len_proj] = np.logical_and(
-            self.projected[:len_s1][self.s2_project_index_origin], self.projected[:len_s1][self.s2_project_index_task]
-        )
-        self.projected[len_s1:len_proj] = np.logical_and(
-            self.projected[len_s1:len_proj], target_vec_dist[len_s1:len_proj] <= 0.03
-        )
-
-        # Update weight vector
-        normal_weight = np.ones(len_proj, dtype=np.float32) * 1
-        high_weight = np.array([200] * len_s1 + [400] * len_s2, dtype=np.float32)
-        weight: np.ndarray | torch.Tensor = np.where(self.projected, high_weight, normal_weight)
-
-        # ── KEY CHANGE: balanced wrist→fingertip weight ──
-        # Original: wrist weight = len_proj + n_fingers ≈ 15 (dominates between-finger weight 1)
-        # New:       wrist weight = wrist_weight * n_fingers → DEFAULT 10 (= 2.0 * 5)
-        #            This gives between-finger vectors a stronger voice in the optimizer,
-        #            reducing the optimizer's reliance on distal joints for length compensation.
-        wrist_finger_weight = self.wrist_weight * self.num_fingers
-        weight = torch.from_numpy(
-            np.concatenate([weight, np.ones(self.num_fingers, dtype=np.float32) * wrist_finger_weight])
-        )
-
-        # Compute reference distance vector
-        normal_vec = target_vector * self.scaling  # (10, 3)
-        dir_vec = target_vector[:len_proj] / (target_vec_dist[:, None] + 1e-6)  # (6, 3)
-        projected_vec = dir_vec * self.projected_dist[:, None]  # (6, 3)
-
-        # Compute final reference vector
-        reference_vec = np.where(self.projected[:, None], projected_vec, normal_vec[:len_proj])  # (6, 3)
-        reference_vec = np.concatenate([reference_vec, normal_vec[len_proj:]], axis=0)  # (10, 3)
-        torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
-        torch_target_vec.requires_grad_(False)
-
-        def objective(x: np.ndarray, grad: np.ndarray) -> float:
-            qpos[self.idx_pin2target] = x
-
-            # Kinematics forwarding for qpos
-            if self.adaptor is not None:
-                qpos[:] = self.adaptor.forward_qpos(qpos)[:]
-
-            self.robot.compute_forward_kinematics(qpos)
-            target_link_poses = [self.robot.get_link_pose(index) for index in self.computed_link_indices]
-            body_pos = np.array([pose[:3, 3] for pose in target_link_poses])
-
-            # Torch computation for accurate loss and grad
-            torch_body_pos = torch.as_tensor(body_pos)
-            torch_body_pos.requires_grad_()
-
-            # Index link for computation
-            origin_link_pos = torch_body_pos[self.origin_link_indices, :]
-            task_link_pos = torch_body_pos[self.task_link_indices, :]
-            robot_vec = task_link_pos - origin_link_pos
-
-            vec_dist = torch.norm(robot_vec - torch_target_vec, dim=1, keepdim=False)
-            huber_distance = (
-                self.huber_loss(vec_dist, torch.zeros_like(vec_dist)) * weight / (robot_vec.shape[0])
-            ).sum()
-            huber_distance = huber_distance.sum()
-            result = huber_distance.cpu().detach().item()
-
-            if grad.size > 0:
-                jacobians = []
-                for i, index in enumerate(self.computed_link_indices):
-                    link_body_jacobian = self.robot.compute_single_link_local_jacobian(qpos, index)[:3, ...]
-                    link_pose = target_link_poses[i]
-                    link_rot = link_pose[:3, :3]
-                    link_kinematics_jacobian = link_rot @ link_body_jacobian
-                    jacobians.append(link_kinematics_jacobian)
-
-                jacobians = np.stack(jacobians, axis=0)
-                huber_distance.backward()
-                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]  # type: ignore[union-attr]  # huber_distance.backward() above populates .grad (requires_grad leaf)
-
-                if self.adaptor is not None:
-                    jacobians = self.adaptor.backward_jacobian(jacobians)
-                else:
-                    jacobians = jacobians[..., self.idx_pin2target]
-
-                grad_qpos = np.matmul(grad_pos, np.array(jacobians))
-                grad_qpos = grad_qpos.mean(1).sum(0)
-
-                grad_qpos += 2 * self.norm_delta * (x - last_qpos)
-
-                grad[:] = grad_qpos[:]
-
-            return result
-
-        return objective
-
-
 class XHandRetargeter:
     def __init__(
         self,
@@ -296,7 +164,7 @@ class XHandRetargeter:
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
         self.last_debug: dict[str, float | str] = {}
-        self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
+        self._smoothing_alpha: float | None = float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
         self._hand_ema_state: np.ndarray | None = None
 
         self.urdf_joint_names = [
@@ -319,66 +187,20 @@ class XHandRetargeter:
     def load_retargeter(self):
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
 
-        # Load YAML config
+        # Read YAML — extract custom smoothing_alpha before passing to RetargetingConfig
         with open(str(config_path), "r") as f:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
         cfg = yaml_config["retargeting"]
 
-        # Extract XHand-specific wrist_weight (default 2.0 if not specified)
-        wrist_weight = float(cfg.get("wrist_weight", 2.0))
-        scaling_factor = float(cfg.get("scaling_factor", 1.0))
-
-        # ── Manual build (replaces RetargetingConfig.build()) ──
-        # We build the retargeter manually so we can inject XHandDexPilotOptimizer
-        # with balanced wrist→fingertip weights.
-        RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
-        urdf_path = str(ASSET_DIR / "robots" / cfg["urdf_path"])
-
-        robot_urdf = urdf.URDF.load(urdf_path, add_dummy_free_joints=False, build_scene_graph=False)
-        urdf_name = os.path.basename(urdf_path)
-        with tempfile.TemporaryDirectory(prefix="dex_retargeting-") as temp_dir:
-            temp_path = os.path.join(temp_dir, urdf_name)
-            robot_urdf.write_xml_file(temp_path)
-            robot = RobotWrapper(temp_path)
-
-        joint_names = robot.dof_joint_names
-        target_joint_names = cfg.get("target_joint_names", joint_names)
-
-        optimizer = XHandDexPilotOptimizer(
-            robot=robot,
-            target_joint_names=target_joint_names,
-            finger_tip_link_names=cfg["finger_tip_link_names"],
-            wrist_link_name=cfg["wrist_link_name"],
-            target_link_human_indices=cfg.get("target_link_human_indices"),
-            scaling=scaling_factor,
-            project_dist=cfg.get("project_dist", 0.03),
-            escape_dist=cfg.get("escape_dist", 0.05),
-            wrist_weight=wrist_weight,
-        )
-
-        # Set up mimic joints (same as RetargetingConfig.build())
-        has_mimic, src_names, mimic_names, multipliers, offsets = parse_mimic_joint(robot_urdf)
-        if has_mimic:
-            adaptor = MimicJointKinematicAdaptor(
-                robot,
-                target_joint_names=target_joint_names,
-                source_joint_names=src_names,
-                mimic_joint_names=mimic_names,
-                multipliers=multipliers,
-                offsets=offsets,
-            )
-            optimizer.set_kinematic_adaptor(adaptor)
-
-        # Low-pass filter (ref: LeFranX low_pass_alpha=0.1)
-        alpha = float(cfg.get("low_pass_alpha", 0.1))
-        lp_filter = LPFilter(alpha) if 0 <= alpha <= 1 else None
-
-        self.retargeter = SeqRetargeting(optimizer, has_joint_limits=True, lp_filter=lp_filter)
-        self.indices = self.retargeter.optimizer.target_link_human_indices
-
-        # Teleoperator-level EMA smoothing (second layer, ref: LeFranX smoothing_alpha=0.3)
+        # Teleoperator-level EMA (our custom field, not a RetargetingConfig param)
         if self._smoothing_alpha is None:
-            self._smoothing_alpha = float(cfg.get("smoothing_alpha", 0.3))
+            self._smoothing_alpha = float(cfg.pop("smoothing_alpha", 0.3))
+
+        # Standard build (same path as LeFranX)
+        RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
+        self.retargeter = RetargetingConfig.from_dict(cfg).build()
+
+        self.indices = self.retargeter.optimizer.target_link_human_indices
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
         self.retargeted_joint_order = np.array(
@@ -389,7 +211,7 @@ class XHandRetargeter:
     def low_pass_alpha(self) -> float:
         """Current LPFilter alpha (new-value weight: 1.0 = pass-through, →0 = freeze).
 
-        Default from YAML config (low_pass_alpha: 0.1)."""
+        Default from YAML config (low_pass_alpha: 0.6)."""
         return float(self.retargeter.filter.alpha)
 
     @low_pass_alpha.setter
@@ -450,13 +272,16 @@ class XHandRetargeter:
             return None
 
         # ── Teleoperator-level EMA smoothing (ref: LeFranX smoothing_alpha=0.3) ──
-        # Applied AFTER SeqRetargeting LPFilter (alpha=0.1) for two-layer smoothing.
+        # Applied AFTER SeqRetargeting LPFilter for two-layer smoothing.
+        # Early-exit when alpha >= 1.0 (default config: pass-through, disabled).
         qpos_arr = np.asarray(qpos, dtype=float)
-        if self._hand_ema_state is not None:
-            if self._smoothing_alpha is None:
-                raise RuntimeError("XHandDexPilotOptimizer: _smoothing_alpha not set — call load_retargeter() first")
-            qpos_arr = self._smoothing_alpha * qpos_arr + (1.0 - self._smoothing_alpha) * self._hand_ema_state
-        self._hand_ema_state = qpos_arr.copy()
+        assert self._smoothing_alpha is not None  # set by load_retargeter()
+        if self._smoothing_alpha < 1.0:
+            if self._hand_ema_state is not None:
+                qpos_arr = self._smoothing_alpha * qpos_arr + (1.0 - self._smoothing_alpha) * self._hand_ema_state
+            self._hand_ema_state = qpos_arr.copy()
+        else:
+            self._hand_ema_state = None
 
         # Joint order remap
         qpos_arr = qpos_arr[self.retargeted_joint_order]
@@ -507,3 +332,253 @@ class XHandRetargeter:
                 self.retargeter.last_qpos = qpos_retargeter[idx]
             else:
                 logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MediaPipe fingertip landmark indices
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
+"""MediaPipe hand landmark indices for fingertips: thumb, index, middle, ring, pinky."""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAGHandRetargeter — TAG two-stage NLopt hand retargeting backend
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TAGHandRetargeter:
+    """VR-to-XHand retargeting via TAG's two-stage NLopt optimization.
+
+    Same protocol as ``XHandRetargeter`` (``__init__``, ``retarget()``, ``reset()``)
+    so the policy loop can use either class without code changes.
+
+    Pipeline::
+
+        VR landmarks (21,3) operator frame
+            → _estimate_palm_frame + _OPERATOR2MANO_RIGHT  (MANO frame)
+            → adaptive_retargeting_xhand                    (pinky chain scaling)
+            → extract fingertips [4,8,12,16,20] - wrist[0]  (wrist-centered)
+            → rotate by R_mano_to_urdf                      (align to URDF frame)
+            → HandOptimizer.solve()                         (two-stage NLopt)
+            → model→SDK joint order remap
+            → EMA post-filter
+            → (12,) SDK-order qpos
+
+    Parameters
+    ----------
+    hand_type:
+        ``"right"`` (default).
+    smoothing_alpha:
+        Teleoperator-level EMA smoothing factor (0.0 = freeze, 1.0 = pass-through).
+        Default 0.3 provides moderate smoothing at 16 Hz.
+    debug:
+        If True, log per-frame retargeting timing.
+    """
+
+    def __init__(
+        self,
+        hand_type: str = "right",
+        smoothing_alpha: float = 0.3,
+        debug: bool = False,
+    ) -> None:
+        from scipy.spatial.transform import Rotation
+
+        from dexmani_real.config.defaults import hand as hand_d, tag_retargeting as tag_cfg
+        from dexmani_real.teleop.tag_retargeting.optimizer import HandOptimizer
+
+        # ── Load URDF, read joint limits ──
+        urdf_path = str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
+        model = pin_loading(urdf_path)
+        joint_lo = model.lowerPositionLimit[7:].copy()
+        joint_hi = model.upperPositionLimit[7:].copy()
+
+        # ── Joint order mapping ──────────────────────────────────────────
+        # Pinocchio parses URDF joints in a different order than the canonical
+        # SDK order used by XHand driver.  We build two mapping arrays:
+        #
+        #   _mapping_model_to_sdk:  for each SDK joint i, its Pinocchio model index.
+        #     Usage: qpos_model[_mapping_model_to_sdk] → SDK-order qpos (retarget output).
+        #   _mapping_sdk_to_model:  for each model joint i, its SDK index.
+        #     Usage: qpos_sdk[_mapping_sdk_to_model] → model-order qpos (reset warm-start).
+        #
+        # Pinocchio model order:  index_bend, index_j1, index_j2, mid_j1, mid_j2,
+        #   pinky_j1, pinky_j2, ring_j1, ring_j2, thumb_bend, thumb_rota_j1, thumb_rota_j2
+        # Canonical SDK order:    thumb_bend, thumb_rota_j1, thumb_rota_j2, index_bend, …
+        model_names = list(model.names[2:])  # skip "universe" and "root_joint"
+        self.urdf_joint_names = [
+            "right_hand_thumb_bend_joint",
+            "right_hand_thumb_rota_joint1",
+            "right_hand_thumb_rota_joint2",
+            "right_hand_index_bend_joint",
+            "right_hand_index_joint1",
+            "right_hand_index_joint2",
+            "right_hand_mid_joint1",
+            "right_hand_mid_joint2",
+            "right_hand_ring_joint1",
+            "right_hand_ring_joint2",
+            "right_hand_pinky_joint1",
+            "right_hand_pinky_joint2",
+        ]
+        self._mapping_model_to_sdk = np.array(
+            [model_names.index(n) for n in self.urdf_joint_names], dtype=np.intp
+        )
+        self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
+
+        # ── Merge driver-enforced joint limits ───────────────────────────
+        # URDF limits are used as NLopt bounds, but the XHand driver silently
+        # clamps qpos to its own [qpos_min, qpos_max] (anti-clogging margins).
+        # For 5 distal joints the driver lower bound is more restrictive than
+        # the URDF (thumb_rota_j2: +10°, index/mid/ring/pinky_j2: +5°).
+        # Passing the intersection to the optimizer prevents it from proposing
+        # unreachable angles that would cause FK-predicted ≠ actual fingertip positions.
+        from dexmani_real.robot.xhand import XHandConfig as _XHandConfig
+
+        _driver_cfg = _XHandConfig()
+        _driver_lo_sdk = np.asarray(_driver_cfg.qpos_min, dtype=np.float64)  # rad, SDK order
+        _driver_hi_sdk = np.asarray(_driver_cfg.qpos_max, dtype=np.float64)  # rad, SDK order
+        _driver_lo_model = _driver_lo_sdk[self._mapping_sdk_to_model]
+        _driver_hi_model = _driver_hi_sdk[self._mapping_sdk_to_model]
+        joint_lo = np.maximum(joint_lo, _driver_lo_model)
+        joint_hi = np.minimum(joint_hi, _driver_hi_model)
+
+        # ── Optimizer ──
+        self._optimizer = HandOptimizer(
+            urdf_path=urdf_path,
+            fingertip_frame_names=list(hand_d.fingertip_link_names),
+            joint_limits_lower=joint_lo,
+            joint_limits_upper=joint_hi,
+            finger_lengths_robot=np.array(tag_cfg.robot_finger_lengths, dtype=np.float64),
+            finger_lengths_human=np.array(tag_cfg.human_finger_lengths, dtype=np.float64),
+            finger_scale_boost=tag_cfg.finger_scale_boost,
+            smooth_weight=tag_cfg.smooth_weight,
+            ftol_abs_s1=tag_cfg.ftol_abs_s1,
+            maxeval_s1=tag_cfg.maxeval_s1,
+            ftol_abs_s2=tag_cfg.ftol_abs_s2,
+            maxeval_s2=tag_cfg.maxeval_s2,
+            pinch_base_weight=tag_cfg.pinch_base_weight,
+            pinch_start_dist_m=tag_cfg.pinch_start_dist_m,
+            pinch_full_dist_m=tag_cfg.pinch_full_dist_m,
+            pinch_ema_alpha=tag_cfg.pinch_ema_alpha,
+            pinch_skip_threshold=tag_cfg.pinch_skip_threshold,
+            reg_stage1_weight=tag_cfg.reg_stage1_weight,
+            reg_last_weight=tag_cfg.reg_last_weight,
+        )
+
+        # ── Pre-computed transforms (avoid per-frame allocation) ──
+        self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
+        # Identity: MANO +Z (finger extension) → URDF +Z (finger extension). Verified 2026-08-07.
+
+        # ── Smoothing & debug ──
+        self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        self._ema_state: np.ndarray | None = None
+        self.debug = bool(debug)
+
+        logger.info(
+            "TAGHandRetargeter ready (urdf=%s, smoothing_alpha=%.2f, mano→urdf=%s)",
+            urdf_path,
+            self._smoothing_alpha,
+            tag_cfg.mano_to_urdf_euler,
+        )
+
+    # ── Public API (compatible with XHandRetargeter) ────────────
+
+    def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
+        """Retarget VR landmarks (operator-frame, 21×3) to XHand joint qpos (12,).
+
+        Returns None on any failure — caller falls back to previous hand command.
+        """
+        if landmarks is None:
+            return None
+        if landmarks.shape != (21, 3):
+            return None
+        if not np.all(np.isfinite(landmarks)):
+            logger.warning("TAGHandRetargeter: landmarks contain NaN/Inf — holding position")
+            return None
+
+        t0 = time.perf_counter() if self.debug else 0.0
+
+        # 1. Coordinate transform: operator → MANO (reuse existing helpers)
+        try:
+            wrist_rot = _estimate_palm_frame(landmarks)
+            mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
+        except (ValueError, np.linalg.LinAlgError):
+            logger.warning("TAGHandRetargeter: coordinate transform failed — holding position")
+            return None
+
+        # 2. Adaptive pinky chain scaling (reuse existing)
+        mano = adaptive_retargeting_xhand(mano)
+
+        # 3. Extract 5 fingertip positions → wrist-centered → rotate to URDF frame
+        tips = mano[_FINGERTIP_INDICES].copy()  # (5, 3) in MANO frame
+        tips -= mano[0]  # center at wrist
+        tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
+
+        # 4. Two-stage NLopt optimization
+        try:
+            qpos_model = self._optimizer.solve(tips_urdf)  # (12,) in Pinocchio model order
+        except Exception:
+            logger.warning("TAGHandRetargeter: optimizer.solve() crashed — holding position", exc_info=True)
+            return None
+
+        if qpos_model is None:
+            return None
+
+        # 5. Joint order remap: model order → canonical SDK order
+        qpos_sdk = qpos_model[self._mapping_model_to_sdk]
+
+        # 6. Teleoperator-level EMA post-filter
+        if self._smoothing_alpha < 1.0:
+            if self._ema_state is not None:
+                qpos_sdk = self._smoothing_alpha * qpos_sdk + (1.0 - self._smoothing_alpha) * self._ema_state
+            self._ema_state = qpos_sdk.copy()
+        else:
+            self._ema_state = None
+
+        if self.debug:
+            dt_ms = 1000.0 * (time.perf_counter() - t0)
+            logger.info("TAGHandRetargeter: retarget %.2f ms", dt_ms)
+
+        return qpos_sdk
+
+    def reset(self, initial_qpos: np.ndarray | None = None) -> None:
+        """Reset retargeter state for a clean episode start.
+
+        Args:
+            initial_qpos: Optional (12,) current hand joint positions in SDK order.
+                When provided, seeds the NLopt warm-start from the actual hardware
+                pose so the first-frame optimization converges from near-optimum.
+        """
+        # Clear teleoperator EMA state
+        self._ema_state = None
+
+        if initial_qpos is not None and initial_qpos.shape == (12,) and np.all(np.isfinite(initial_qpos)):
+            # SDK order → model order for optimizer warm-start
+            qpos_model = initial_qpos[self._mapping_sdk_to_model]
+            self._optimizer.reset(qpos_model)
+        else:
+            self._optimizer.reset(None)
+
+    @property
+    def low_pass_alpha(self) -> float:
+        """Current EMA smoothing alpha (1.0 = pass-through)."""
+        return self._smoothing_alpha
+
+    @low_pass_alpha.setter
+    def low_pass_alpha(self, value: float) -> None:
+        """Tune the EMA smoothing strength at runtime."""
+        self._smoothing_alpha = float(np.clip(value, 0.0, 1.0))
+
+
+# ── Lazy Pinocchio URDF loader (avoids import at module level) ──
+
+
+def pin_loading(urdf_path: str):
+    """Load a URDF with Pinocchio FreeFlyer model.
+
+    Extracted so TAGHandRetargeter.__init__ doesn't need a module-level
+    pinocchio import (consistent with the project's lazy-SDK-import pattern).
+    """
+    import pinocchio as pin
+
+    return pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())

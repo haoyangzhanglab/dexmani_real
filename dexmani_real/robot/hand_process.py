@@ -58,12 +58,10 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         if not hand.connect():
             logger.error("hand_loop: connect failed")
             shared.hand_ready.set()
-            shared.error_state.value = True
             return
     except Exception as e:
         logger.error("hand_loop: init failed: %s", e)
         shared.hand_ready.set()
-        shared.error_state.value = True
         return
 
     # Home — re-send in the polling loop so the hand PID keeps driving
@@ -92,7 +90,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             except Exception:
                 pass
             shared.hand_ready.set()
-            shared.error_state.value = True
             return
 
     # Publish initial state BEFORE hand_ready — consumers wait on hand_ready and

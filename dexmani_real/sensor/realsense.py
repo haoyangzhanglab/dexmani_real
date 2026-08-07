@@ -43,21 +43,50 @@ ALIGN_MODE_ALIASES = {
 class L515DepthConfig:
     """L515-only depth settings, applied via set_option after pipeline start.
 
-    Exactly the subset settable over plain UVC. load_json (XU control path)
-    fails silently on the stock uvcvideo kernel — no error, hardware reads
-    back preset defaults — so it is not used. JSON-only parameters
-    (digital_gain, depth_units, depth_offset, ...) stay at hardware defaults.
-    Defaults below were validated on SN f1382055 (2026-07-15): Low Ambient
-    base + conf=2 + gain=12 -> 95% valid depth. D400 cameras ignore this.
+    All 11 settable L515 options are exposed. load_json (XU control path)
+    fails silently on the stock uvcvideo kernel, so set_option is the sole
+    config path.
+
+    Tuning strategy (2026-08-07): Short Range preset (5) for the close-range
+    dexterous-manipulation workspace (0.25-0.85 m).  The factory Short Range
+    parameter table optimises MEMS timing, noise estimation, and confidence
+    mapping for < 1 m — then we override only what needs fine-tuning on top.
+    D400 cameras ignore this config.
     """
 
     enabled: bool = True
-    visual_preset: int = 3  # L500 runtime enum: 3 = Low Ambient Light (base)
-    min_distance: int = 190  # mm
-    laser_power: int = 100
-    receiver_gain: int = 12  # 8-18; numerically higher = lower actual gain
-    confidence_threshold: int = 2  # firmware confidence cull, 0-3
-    noise_filtering: int = 2  # runtime scale 0-6
+
+    # --- visual preset (applied FIRST — loads the factory base table) ---
+    visual_preset: int = 5  # L500: 5 = Short Range (< 1 m); was 3 = Low Ambient
+
+    # --- explicit overrides (applied AFTER preset, flips label to 0=Custom) ---
+    laser_power: int = 100  # 0-100, full power (MEMS eye-safe at all levels)
+    receiver_gain: int = 9  # 8-18; numerically higher = *lower* actual gain.
+    # At close range the reflected signal is strong — lower gain (higher number)
+    # reduces shot noise with plenty of margin on dark/absorbing surfaces.
+    confidence_threshold: int = 1  # 0-3 firmware confidence cull; 1 = keep more
+    # pixels (thin fingertip structures survive).  Short Range preset already
+    # has a tighter confidence mapping than Low Ambient.
+    noise_filtering: int = 1  # 0-6; 1 = light temporal smoothing.  Short Range's
+    # native noise floor is ~2-3× lower at 0.5 m than Low Ambient, so we can
+    # back off the filter and preserve fine edge detail.
+    min_distance: int = 150  # mm; was 190.  15 cm gives headroom for the hand
+    # operating close to the camera without clipping valid near-field depth.
+
+    # --- gains & sharpening (newly exposed — were at hardware defaults) ---
+    digital_gain: int = 1  # 1-2; post-ADC digital amplification.  1 = no extra
+    # gain → less noise amplification.  Strong close-range signal makes the
+    # extra 6 dB unnecessary.
+    depth_offset: float = 4.5  # mm; per-unit calibration constant.  Do NOT change
+    # without re-running a per-device depth calibration — this is NOT a tuning
+    # knob but a factory / calibration adjustment.
+    post_processing_sharpening: int = 2  # 0-3; edge-enhancement on the firmware
+    # depth output.  2 = moderate sharpening — crisper object boundaries without
+    # the ringing artefacts that 3 can produce on thin geometry.
+    pre_processing_sharpening: int = 0  # 0-5; pre-sharpening amplifies sensor
+    # noise before the noise filter runs — keep off.
+    noise_estimation: float | None = None  # 0-4100; None = leave at the Short
+    # Range preset's factory value.  Explicit override only for custom tuning.
 
 
 @dataclass(frozen=True)
@@ -218,9 +247,17 @@ class RealSense:
             (rs.option.laser_power, float(cfg.laser_power)),
             (rs.option.receiver_gain, float(cfg.receiver_gain)),
             (rs.option.confidence_threshold, float(cfg.confidence_threshold)),
-            (rs.option.min_distance, float(cfg.min_distance)),
             (rs.option.noise_filtering, float(cfg.noise_filtering)),
+            (rs.option.min_distance, float(cfg.min_distance)),
+            (rs.option.digital_gain, float(cfg.digital_gain)),
+            (rs.option.post_processing_sharpening, float(cfg.post_processing_sharpening)),
+            (rs.option.pre_processing_sharpening, float(cfg.pre_processing_sharpening)),
+            # depth_offset is a per-unit calibration constant — applied but
+            # not treated as a tuning knob (range is typically a single value).
+            (rs.option.depth_offset, float(cfg.depth_offset)),
         ]
+        if cfg.noise_estimation is not None:
+            options.append((rs.option.noise_estimation, float(cfg.noise_estimation)))
 
         for option, value in options:
             try:
@@ -236,13 +273,19 @@ class RealSense:
         actual_gain = float(sensor.get_option(rs.option.receiver_gain))
         logger.info(
             "L515 depth config applied (set_option): preset_base=%d, laser=%d, "
-            "gain=%d, conf=%d, noise=%d, min_dist=%d",
+            "gain=%d, conf=%d, noise=%d, min_dist=%d, digital_gain=%d, "
+            "sharpening(post=%d, pre=%d), depth_offset=%.1f, noise_est=%s",
             int(cfg.visual_preset),
             int(cfg.laser_power),
             int(actual_gain),
             int(cfg.confidence_threshold),
             int(cfg.noise_filtering),
             int(cfg.min_distance),
+            int(cfg.digital_gain),
+            int(cfg.post_processing_sharpening),
+            int(cfg.pre_processing_sharpening),
+            float(cfg.depth_offset),
+            "preset" if cfg.noise_estimation is None else str(cfg.noise_estimation),
         )
         if not np.isclose(actual_gain, float(cfg.receiver_gain), atol=1e-6):
             logger.warning(

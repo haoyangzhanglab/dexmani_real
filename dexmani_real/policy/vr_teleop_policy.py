@@ -27,7 +27,7 @@ from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
 from dexmani_real.shm.shared_storage import write_hand_cmd as _write_hand_cmd
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.hand_retarget import XHandRetargeter
+from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import ThrottledWarner, get_logger
@@ -185,6 +185,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 nullspace_step_size_deg=1.0 * (50.0 / cfg.control_hz),
             ),
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
+            home_qpos=np.array(arm.home_qpos, dtype=np.float64),
         )
 
         _vr_cfg_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
@@ -223,7 +224,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     kb.start()
     audio = AudioFeedback()
 
-    hand_retargeter: XHandRetargeter | None = None
+    hand_retargeter: TAGHandRetargeter | XHandRetargeter | None = None
     hand_available = False
     _hand_disconnected_at: float | None = None  # monotonic timestamp of first bad frame
     _hand_ramp_start: np.ndarray | None = None
@@ -235,15 +236,28 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         if hand_retargeter is not None:
             return
         try:
-            hand_retargeter = XHandRetargeter(
-                hand_type="right",
-                retargeting_type=cfg.hand_retargeting_type,
-            )
+            if cfg.hand_retargeting_type == "tag":
+                hand_retargeter = TAGHandRetargeter(hand_type="right")
+            else:
+                hand_retargeter = XHandRetargeter(
+                    hand_type="right",
+                    retargeting_type=cfg.hand_retargeting_type,
+                )
             logger.info("Hand retargeter ready (type=%s)", cfg.hand_retargeting_type)
         except Exception as e:
             logger.warning("Hand retargeter init failed: %s — degraded to hold-position", e)
             hand_available = False
             hand_retargeter = None
+
+    def _init_and_seed_hand_retargeter() -> np.ndarray | None:
+        """Lazy-init retargeter and seed NLP warm-start from hardware qpos.
+
+        Returns the seeded qpos (for updating ``prev_hand_qpos``) or None.
+        """
+        _try_init_hand_retargeter()
+        hs = _read_hand_state(shared)
+        qpos = hs["qpos"][0] if hs is not None else None
+        return _seed_hand_retargeter(hand_retargeter, qpos)
 
     _hand_fk: HandKinematics | None = None
     _T_eef_handbase_pos = np.array(cfg.T_eef_handbase_pos_xyz, dtype=np.float64)
@@ -542,12 +556,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             # Warm-start hand retargeter NLP from current hardware
                             # pose so the first retarget() converges from near-optimum
                             # (matching B-press pattern).
-                            _try_init_hand_retargeter()
-                            _hs = _read_hand_state(shared)
-                            _seeded = _seed_hand_retargeter(
-                                hand_retargeter,
-                                _hs["qpos"][0] if _hs is not None else None,
-                            )
+                            _seeded = _init_and_seed_hand_retargeter()
                             if _seeded is not None:
                                 prev_hand_qpos = _seeded
                     else:
@@ -620,12 +629,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _hand_disconnected_at = None
                     # Reset hand retargeter and seed with current hardware pose
                     # so the first retarget() frame converges from near-optimum.
-                    _try_init_hand_retargeter()
-                    _hand_state_for_reset = _read_hand_state(shared)
-                    _seeded = _seed_hand_retargeter(
-                        hand_retargeter,
-                        _hand_state_for_reset["qpos"][0] if _hand_state_for_reset is not None else None,
-                    )
+                    _seeded = _init_and_seed_hand_retargeter()
                     if _seeded is not None:
                         prev_hand_qpos = _seeded
                     audio.play("begin")
@@ -693,14 +697,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     else:
                         logger.info("Hand connected — enabling hand control (cold-start)")
                     hand_available = True
-                    _try_init_hand_retargeter()
-                    if hand_available:
-                        _seeded = _seed_hand_retargeter(
-                            hand_retargeter,
-                            hand_state["qpos"][0] if hand_state is not None else None,
-                        )
-                        if _seeded is not None:
-                            prev_hand_qpos = _seeded
+                    _seeded = _init_and_seed_hand_retargeter()
+                    if _seeded is not None:
+                        prev_hand_qpos = _seeded
                 _hand_disconnected_at = None
             elif hand_available:
                 if _hand_disconnected_at is None:
@@ -892,8 +891,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 t_smooth = t * t * (3.0 - 2.0 * t)
                 hand_cmd = _hand_ramp_start + t_smooth * (hand_cmd - _hand_ramp_start)
                 _hand_ramp_frames -= 1
-            elif _hand_ramp_frames == 0:
+            elif _hand_ramp_start is not None:
                 _hand_ramp_start = None  # ramp complete, release reference
+                _hand_ramp_frames = 0
 
             # G1: detect hand driver board lockout (hand_loop → qpos_stale in state ring).
             # When the hand stops executing commands despite being connected, hold the
@@ -1015,6 +1015,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             stage_timer.mark("send")
 
             prev_qpos_cmd = arm_cmd.copy()
+            prev_hand_qpos = hand_cmd.copy()
             ema_prev_pos = target_pos.copy()
             ema_prev_quat = target_quat.copy()
 
@@ -1392,7 +1393,7 @@ _retarget_fail_warn = ThrottledWarner()
 
 
 def _compute_hand_command(
-    retargeter: XHandRetargeter | None,
+    retargeter: TAGHandRetargeter | XHandRetargeter | None,
     vr_frame: dict | None,
     prev_hand_cmd: np.ndarray,
     hand_available: bool,
@@ -1427,7 +1428,7 @@ def _compute_hand_command(
 
 
 def _reset_hand_retargeter(
-    retargeter: XHandRetargeter | None,
+    retargeter: TAGHandRetargeter | XHandRetargeter | None,
     hand_qpos: np.ndarray | None = None,
 ) -> None:
     """Reset hand retargeter state for a clean teleop start.
@@ -1443,7 +1444,7 @@ def _reset_hand_retargeter(
 
 
 def _seed_hand_retargeter(
-    retargeter: XHandRetargeter | None,
+    retargeter: TAGHandRetargeter | XHandRetargeter | None,
     qpos: np.ndarray | None,
 ) -> np.ndarray | None:
     """Reset hand retargeter NLP warm-start from *qpos*.

@@ -38,11 +38,13 @@ class TeleopIKSolver:
         ik_mgr: IKCandidateManager,
         teleop_profile: TeleopProfile,
         elbow_joint_index: int = 3,
+        home_qpos: np.ndarray | None = None,
     ) -> None:
         self.kin = kin
         self.ik_mgr = ik_mgr
         self.profile = teleop_profile
         self._elbow_joint_index = elbow_joint_index
+        self._home_qpos = home_qpos
         self._nullspace_warn_last_s: float = 0.0
         self._hold_start: float | None = None
         self._hold_warned: bool = False
@@ -420,6 +422,7 @@ class TeleopIKSolver:
                     self.ik_mgr.joint_limits,
                     step_size_rad=np.deg2rad(profile.nullspace_step_size_deg),
                     margin_deg=profile.nullspace_joint_limit_margin_deg,
+                    home_qpos=self._home_qpos,
                 )
             except (ValueError, RuntimeError):
                 _now = time.monotonic()
@@ -507,16 +510,29 @@ def apply_nullspace_optimization(
     joint_limits: np.ndarray,
     step_size_rad: float = np.deg2rad(1.0),
     margin_deg: float = 15.0,
+    home_qpos: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Apply null-space joint-limit repulsion to an IK solution.
+    """Apply null-space joint-limit repulsion + optional home bias.
 
-    Projects the repulsive gradient into the self-motion manifold using the
-    null-space projector (J @ (qpos' - qpos) ≈ 0).  Skips SVD when no joint
-    is near a limit.
+    Projects the combined gradient (limit repulsion + homeward bias) into the
+    self-motion manifold using the null-space projector (J @ (qpos' - qpos) ≈ 0).
+    Skips SVD when no joint is near a limit and no home bias is configured.
+
+    The home bias is normalised to a unit-length direction so it shares the
+    *step_size_rad* budget equally with joint-limit repulsion.  When only one
+    force is active, it gets the full budget.
     """
     grad = joint_limit_gradient(qpos, joint_limits, margin_deg)
+
+    if home_qpos is not None:
+        home_dir = home_qpos - qpos
+        home_max = float(np.max(np.abs(home_dir)))
+        if home_max > 1e-12:
+            home_dir = home_dir / home_max  # unit-length direction toward home
+            grad = grad + home_dir if np.any(grad) else home_dir
+
     if not np.any(grad):
-        return qpos  # no joint near limit — skip SVD (~0.13 ms saved)
+        return qpos
 
     N = nullspace_projector(jacobian)
     dq = N @ grad

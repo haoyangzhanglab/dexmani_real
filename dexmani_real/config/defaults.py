@@ -150,7 +150,7 @@ class ArmParams:
     ip: str = "192.168.1.111"
 
     # ── Environment ──
-    table_z_surface_m: float = -0.008  # table top surface Z in arm-base frame (m)
+    table_z_surface_m: float = 0.022  # table top surface Z in arm-base frame (m), from desk_plane.json
     hand_safety_margin_m: float = 0.05  # conservative EEF-to-fingertip vertical distance (m)
 
     # ── Safety ──
@@ -276,7 +276,7 @@ class PolicyParams:
 
     # ── Hand retargeting ──
     hand_enabled: bool = True
-    hand_retargeting_type: str = "dexpilot"
+    hand_retargeting_type: str = "tag"
     hand_ramp_frame_count: int = 16  # smoothstep ramp (~1s @ 16Hz)
     hand_disconnect_timeout_s: float = 1.0
 
@@ -287,6 +287,49 @@ class PolicyParams:
             raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
         if not (0.0 <= self.ema.alpha_rot <= 1.0):
             raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAG retargeting parameters
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class TAGRetargetingParams:
+    """TAG two-stage NLopt hand retargeting parameters (``retargeting_type="tag"``)."""
+
+    # ── Finger length scaling ──
+    robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
+    """XHand finger lengths (thumb..pinky, meters). Pinky set equal to human — adaptive_retargeting_xhand
+    already handles pinky chain scaling (1.2-2.2x), so finger_scale for pinky must be 1.0 to avoid
+    double-compensation."""
+
+    human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
+    """Human finger lengths from TAG glove calibration (thumb..pinky, meters)."""
+
+    finger_scale_boost: float = 1.0
+    """Multiplier on robot/human length ratio.  1.0 = no extra boost — VR landmarks
+    are already at robot scale after MANO transform + adaptive_retargeting_xhand."""
+
+    # ── Coordinate alignment: MANO → XHand URDF frame (Euler XYZ, rad) ──
+    mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Identity: MANO +Z (finger extension) → URDF +Z (finger extension). Verified via FK analysis (2026-08-07)."""
+
+    # ── Stage 1: Global position matching (L-BFGS) ──
+    smooth_weight: float = 0.02
+    ftol_abs_s1: float = 1e-4
+    maxeval_s1: int = 80
+
+    # ── Stage 2: Pinch refinement (SLSQP) ──
+    ftol_abs_s2: float = 1e-6
+    maxeval_s2: int = 100
+    pinch_base_weight: float = 2000.0
+    pinch_start_dist_m: float = 0.030
+    pinch_full_dist_m: float = 0.008
+    pinch_ema_alpha: float = 0.4
+    pinch_skip_threshold: float = 0.01
+    reg_stage1_weight: float = 1.0
+    reg_last_weight: float = 0.8
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,6 +405,7 @@ policy = PolicyParams()
 vr = VRParams()
 safety = SafetyParams()
 camera = CameraParams()
+tag_retargeting = TAGRetargetingParams()
 
 
 def load_config_json(path: str) -> None:

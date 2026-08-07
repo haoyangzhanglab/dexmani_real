@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""L515 tabletop point-cloud diagnostic.
+"""L515 tabletop point-cloud diagnostic + desk-plane calibration.
 
-  - RGB:   640 x 480 @ 30 FPS
-  - Depth: 1024 x 768 @ 30 FPS, aligned to RGB (output 640 x 480)
-  - Camera-frame valid depth: [0.3, 1.5] m
-  - Workspace crop, desk RANSAC, 5 mm voxel, cluster outlier removal, FPS to 2048
+  - Connects RealSense L515, reads back all 11 depth config parameters
+  - Captures one aligned RGB-D frame, visualises RGB + depth + edge filter
+  - Calibrates the desk plane via RANSAC, persists to desk_plane.json
+  - Runs the production PointCloudProcessor pipeline end-to-end
+  - Prints per-stage timing with ASCII bar charts for bottleneck analysis
+  - Visualises the final world-frame point cloud (open3d)
 
 Usage:
   conda activate real_robot
@@ -20,45 +22,22 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 import pyrealsense2 as rs
-import torch
-from pytorch3d.ops import sample_farthest_points
+from scipy.spatial.transform import Rotation as R
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.sensor.pointcloud_processor import PointCloudProcessor, PointCloudProcessorConfig
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
 from dexmani_real.utils.pointcloud_utils import make_depth_vis
 
-# Acquisition settings: intentionally unchanged.
 RGB_RESOLUTION = (640, 480)
 DEPTH_RESOLUTION = (1024, 768)
 FPS = 30
-
-USE_RGBD_VIS = True
-
-# Single-pass outlier removal (policy-inference latency budget): Euclidean
-# clustering at eps = 2 x voxel, then drop connected components smaller than
-# CLUSTER_MIN_SIZE points (~7.5 cm^2 of surface at 5 mm voxel). One pass covers
-# every artifact class — isolated specks/strings become tiny clusters, dense
-# clumps stay below the size threshold — while anything resting on / touching
-# another structure merges into that structure's cluster, so on-desk objects
-# survive (verified: 2x2 cm on-desk object kept 16/16; 300 specks, 10-pt
-# string, 8-pt clump all removed; ~1.2 ms @ 3k post-voxel points).
-CLUSTER_EPS_M = 0.010
-CLUSTER_MIN_SIZE = 30
-
-# Fixed-size policy input. >= TARGET points: farthest point sampling
-# (pytorch3d GPU ~9 ms @ 5.3k pts — B=1 underutilizes the GPU but keeps the
-# CPU free; open3d CPU FPS is ~7 ms if no CUDA). < TARGET: random duplicate
-# padding of existing points.
 TARGET_POINTS = 2048
 
-# Depth edge filter: pixels at depth discontinuities have large systematic
-# error.  Gradient magnitude > EDGE_THRESHOLD_M on the 2-D depth image marks
-# an edge; the mask is dilated by EDGE_DILATE_PX to widen the rejection band.
-# Set EDGE_THRESHOLD_M <= 0 to disable.
-EDGE_THRESHOLD_M = 0.020
-EDGE_DILATE_PX = 1
+USE_RGBD_VIS = True
+USE_O3D_VIS = True
 
 
 def _show_rgbd_panels(
@@ -108,6 +87,13 @@ def _show_rgbd_panels(
 
 
 def main() -> None:
+    # ═══════════════════════════════════════════════════════════
+    # Timing accumulators
+    # ═══════════════════════════════════════════════════════════
+    _timings: dict[str, float] = {}
+
+    # ── Connect ──
+    t_connect_0 = time.perf_counter()
     camera = RealSense(
         RealSenseConfig(
             camera_name="realsense",
@@ -118,27 +104,17 @@ def main() -> None:
             align_mode="depth_to_color",
             enable_global_time=True,
             warmup_frames=30,
-            l515_depth_config=L515DepthConfig(
-                enabled=True,
-                # Low Ambient Light (runtime enum 3) — dense indoor base preset.
-                # 2026-07-15 A/B on this scene: Low-Ambient base + conf=1 gave
-                # 95% valid depth; Short-Range base (5) + conf=3 gave 48%.
-                visual_preset=3,
-                min_distance=190,
-                laser_power=100,
-                receiver_gain=12,
-                # Firmware confidence cull (0-3). At 3 (max) roughly half the
-                # image was invalidated; 2 keeps marginal pixels for the
-                # driver's image-domain gate + cluster filter to judge.
-                confidence_threshold=2,
-                noise_filtering=2,  # runtime scale 0-6
-            ),
+            # Use the production defaults (Short Range preset, tuned for
+            # close-range dexterous manipulation).  See L515DepthConfig
+            # docstring in dexmani_real/sensor/realsense.py for rationale.
+            l515_depth_config=L515DepthConfig(),
         )
     )
 
     print("Connecting to RealSense...")
     if not camera.connect():
         raise RuntimeError("Failed to connect to RealSense.")
+    _timings["connect"] = (time.perf_counter() - t_connect_0) * 1000.0
 
     try:
         info = camera.get_device_info()
@@ -157,17 +133,14 @@ def main() -> None:
 
         preset = depth_sensor.get_option(rs.option.visual_preset)
         try:
-            preset_name = depth_sensor.get_option_value_description(
-                rs.option.visual_preset,
-                preset,
-            )
+            preset_name = depth_sensor.get_option_value_description(rs.option.visual_preset, preset)
         except RuntimeError:
             preset_name = "unknown"
 
         print(f"  Runtime preset: {preset} {preset_name}")
         print(f"  Depth scale:    {depth_scale:.6f} (raw_uint16 x scale = meters)")
 
-        # --- Verify key L515 parameters actually applied ---
+        # --- Sensor read-back ---
         readable_opts = [
             ("visual_preset", rs.option.visual_preset),
             ("laser_power", rs.option.laser_power),
@@ -184,14 +157,15 @@ def main() -> None:
         print("\n  --- Sensor read-back ---")
         for name, opt in readable_opts:
             try:
-                val = depth_sensor.get_option(opt)
-                print(f"  {name}: {val}")
+                print(f"  {name}: {depth_sensor.get_option(opt)}")
             except RuntimeError:
                 print(f"  {name}: <not readable>")
 
-        # Capture a single aligned RGBD frame.
+        # ── Capture one aligned RGB-D frame ──
         print("\nCapturing aligned RGBD frame...")
+        t_cap_0 = time.perf_counter()
         frame = camera.read()
+        _timings["capture"] = (time.perf_counter() - t_cap_0) * 1000.0
 
         if frame.rgb is None:
             raise RuntimeError("RGB frame is unavailable.")
@@ -202,74 +176,111 @@ def main() -> None:
         rgb_bgr = np.ascontiguousarray(rgb[..., ::-1])
         depth_m = np.ascontiguousarray(frame.depth, dtype=np.float32)
         K = np.asarray(frame.K, dtype=np.float64)
+        total_pixels = depth_m.size
 
         print(f"  RGB:            shape={rgb.shape}, dtype={rgb.dtype}")
-        print("  Depth:          " f"shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/" f"{depth_m.size}")
-        print(f"  Intrinsics:     {depth_m.shape[1]}x{depth_m.shape[0]} " f"fx={K[0, 0]:.1f} fy={K[1, 1]:.1f}")
+        print(f"  Depth:          shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/{total_pixels}")
+        print(f"  Intrinsics:     {depth_m.shape[1]}x{depth_m.shape[0]} fx={K[0,0]:.1f} fy={K[1,1]:.1f}")
 
-        depth_for_pointcloud = depth_m
+        # ═══════════════════════════════════════════════════════════
+        # 2-D depth filtering (pre-deprojection, production-identical)
+        # ═══════════════════════════════════════════════════════════
+        print("\n" + "=" * 60)
+        print("2-D Depth Filtering (before deprojection)")
+        print("=" * 60)
 
-        # Camera-frame point cloud — gate in 2-D before deprojection.
-        # Production pipeline order (PointCloudProcessor.process):
-        #   depth gate → depth edge filter → deproject → world transform → crop
-        print("\nGenerating camera-frame point cloud...")
-        rays_cam = camera.get_rays()
-        if rays_cam.shape[:2] != depth_for_pointcloud.shape:
-            raise RuntimeError(f"rays shape {rays_cam.shape[:2]} does not match depth {depth_for_pointcloud.shape}.")
+        cfg_default = PointCloudProcessorConfig()
 
-        total_pixels = depth_for_pointcloud.size
+        # Warm up lazy imports so timing below reflects steady-state.
+        import cv2  # noqa: F811
 
-        # --- 1. Depth range gate (2-D, before deprojection) ---
-        z_flat = depth_for_pointcloud.ravel()
-        mask = np.isfinite(z_flat) & (z_flat > 0.3) & (z_flat < 1.5)
+        # --- 1. Depth range gate ---
+        t_gate_0 = time.perf_counter()
+        z_flat = depth_m.ravel()
+        mask = np.isfinite(z_flat) & (z_flat > cfg_default.depth_min_m) & (z_flat < cfg_default.depth_max_m)
         n_depth_gate = int(mask.sum())
-        print(f"  Depth gate [0.3, 1.5]m:       {n_depth_gate:6d} / {total_pixels} pixels")
+        _timings["2d_depth_gate"] = (time.perf_counter() - t_gate_0) * 1000.0
+        print(f"  1. Depth gate [{cfg_default.depth_min_m}, {cfg_default.depth_max_m}]m:       "
+              f"{n_depth_gate:6d} / {total_pixels} pixels  ({_timings['2d_depth_gate']:.2f}ms)")
 
-        # --- 2. Depth edge filter (2-D, before deprojection) ---
-        edge_vis: np.ndarray | None = None  # for diagnostic overlay
-        if EDGE_THRESHOLD_M > 0:
-            with np.errstate(invalid="ignore"):
-                gy, gx = np.gradient(depth_for_pointcloud)
-                grad_mag = np.sqrt(gx.astype(np.float64) ** 2 + gy.astype(np.float64) ** 2)
-            edge_2d = grad_mag > EDGE_THRESHOLD_M
-            n_edge = int(edge_2d.sum())
-            # Save undilated edge mask for visualization (before dilation widens it).
-            edge_raw_vis = edge_2d.copy()
-            if EDGE_DILATE_PX > 0:
-                import cv2
+        # --- 2. Depth edge filter (LoG, byte-identical to production) ---
+        t_edge_0 = time.perf_counter()
+        edge_vis: np.ndarray | None = None
+        if cfg_default.depth_edge_threshold_m > 0:
 
-                k = 2 * EDGE_DILATE_PX + 1
-                kernel = np.ones((k, k), dtype=np.uint8)
-                edge_2d = cv2.dilate(edge_2d.astype(np.uint8), kernel).astype(bool)
+            depth_blur = cv2.GaussianBlur(depth_m, (3, 3), sigmaX=0.8)
+            laplacian = cv2.Laplacian(depth_blur, cv2.CV_32F, ksize=3)
+            edge_mag = np.abs(laplacian)
+
+            if cfg_default.depth_edge_relative_ratio > 0:
+                thresh = np.maximum(cfg_default.depth_edge_threshold_m, depth_m * cfg_default.depth_edge_relative_ratio)
+                edge_raw = edge_mag > thresh
+            else:
+                edge_raw = edge_mag > cfg_default.depth_edge_threshold_m
+
+            n_raw_edge = int(edge_raw.sum())
+
+            # Dilate with cross kernel (same as production).
+            if cfg_default.depth_edge_dilate_px > 0:
+                k = 2 * cfg_default.depth_edge_dilate_px + 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (k, k))
+                edge_2d = cv2.dilate(edge_raw.astype(np.uint8), kernel).astype(bool)
+            else:
+                edge_2d = edge_raw
+
+            n_edge_dilated = int(edge_2d.sum())
             n_before_edge = int(mask.sum())
             mask = mask & ~edge_2d.ravel()
             n_after_edge = int(mask.sum())
-            n_edge_dilated = int(edge_2d.sum())
-            print(
-                f"  Depth edge filter (>{EDGE_THRESHOLD_M*1000:.0f}mm, dilate={EDGE_DILATE_PX}): "
-                f"{n_before_edge - n_after_edge:6d} removed "
-                f"(raw edges={n_edge}, dilated={n_edge_dilated}), "
-                f"{n_after_edge:6d} survive"
-            )
-            # Build edge overlay: grey = kept, red = raw edge, yellow = dilated-only
-            edge_vis = np.full((*depth_for_pointcloud.shape, 3), 128, dtype=np.uint8)
-            edge_vis[edge_raw_vis] = [0, 0, 255]  # red: raw edge core
-            edge_vis[edge_2d & ~edge_raw_vis] = [0, 255, 255]  # yellow: dilation band
+
+            # Build edge overlay: grey = kept, red = raw edge core, yellow = dilation band.
+            edge_vis = np.full((*depth_m.shape, 3), 128, dtype=np.uint8)
+            edge_vis[edge_raw] = [0, 0, 255]
+            edge_vis[edge_2d & ~edge_raw] = [0, 255, 255]
+        _timings["2d_edge_filter"] = (time.perf_counter() - t_edge_0) * 1000.0
+
+        if cfg_default.depth_edge_threshold_m > 0:
+            print(f"  2. Edge filter (LoG, >{cfg_default.depth_edge_threshold_m*1000:.0f}mm abs, "
+                  f"dilate={cfg_default.depth_edge_dilate_px}): "
+                  f"{n_before_edge - n_after_edge:6d} removed  "
+                  f"(raw edges={n_raw_edge}, dilated={n_edge_dilated}), "
+                  f"{n_after_edge:6d} survive  ({_timings['2d_edge_filter']:.2f}ms)")
         else:
-            print("  Depth edge filter:              DISABLED")
+            print(f"  2. Edge filter:                                      DISABLED")
 
         _show_rgbd_panels(rgb_bgr, depth_m, edge_vis)
 
         if not np.any(mask):
             raise RuntimeError("No pixels survived 2-D gates — check depth range or edge threshold.")
 
-        # --- 3. Deproject surviving pixels ---
-        pts_cam = (rays_cam.reshape(-1, 3)[mask] * z_flat[mask, None]).astype(np.float64)
-        col_cam = (rgb.astype(np.float64) / 255.0).reshape(-1, 3)[mask]
-        print(f"  Camera-frame points:            {pts_cam.shape[0]:6d}")
+        # --- 3. Speckle filter ---
+        t_speckle_0 = time.perf_counter()
+        if cfg_default.speckle_min_pixels > 0:
+            mask_2d = mask.reshape(depth_m.shape).astype(np.uint8)
+            _, labels, stats, _ = cv2.connectedComponentsWithStats(mask_2d, connectivity=8)
+            for label_id in range(1, len(stats)):
+                if stats[label_id, cv2.CC_STAT_AREA] < cfg_default.speckle_min_pixels:
+                    mask_2d[labels == label_id] = 0
+            n_before_speckle = int(mask.sum())
+            mask = mask_2d.ravel().astype(bool)
+            n_after_speckle = int(mask.sum())
+        _timings["2d_speckle"] = (time.perf_counter() - t_speckle_0) * 1000.0
 
-        # Transform to world frame.
+        if cfg_default.speckle_min_pixels > 0:
+            print(f"  3. Speckle filter (<{cfg_default.speckle_min_pixels}px components):     "
+                  f"{n_after_speckle:6d} survive  ({n_before_speckle - n_after_speckle} removed)"
+                  f"  ({_timings['2d_speckle']:.2f}ms)")
+        else:
+            print(f"  3. Speckle filter:                                    DISABLED")
+
+        print(f"     (median filter: {'ON' if cfg_default.depth_median_enabled else 'OFF'} "
+              f"— applied before all gates above)")
+
+        # ═══════════════════════════════════════════════════════════
+        # Load extrinsics
+        # ═══════════════════════════════════════════════════════════
         print("\nLoading extrinsics from cameras.json...")
+        t_ext_0 = time.perf_counter()
         serial = str(info.get("serial", ""))
         calib = CameraCalib()
         cam_name = calib.resolve_name_by_serial(serial)
@@ -279,8 +290,7 @@ def main() -> None:
             raise RuntimeError(f"Invalid extrinsic shape: {T_world_camera.shape}")
         if not np.allclose(T_world_camera[3], [0, 0, 0, 1], atol=1e-6):
             raise RuntimeError("Invalid homogeneous transform last row.")
-
-        from scipy.spatial.transform import Rotation as R
+        _timings["extrinsics"] = (time.perf_counter() - t_ext_0) * 1000.0
 
         pos = T_world_camera[:3, 3]
         quat_xyzw = R.from_matrix(T_world_camera[:3, :3]).as_quat()
@@ -288,164 +298,187 @@ def main() -> None:
         print(f"  T_world_camera pos:         {np.round(pos, 4)} m")
         print(f"  T_world_camera quat (xyzw): {np.round(quat_xyzw, 4)}")
 
-        ones = np.ones((pts_cam.shape[0], 1), dtype=np.float64)
-        pts_world = (np.concatenate([pts_cam, ones], axis=1) @ T_world_camera.T)[:, :3]
-        print(f"  World-frame points: {pts_world.shape[0]}")
+        # ═══════════════════════════════════════════════════════════
+        # Calibrate desk plane (one-shot RANSAC)
+        # ═══════════════════════════════════════════════════════════
+        rays = camera.get_rays()
+        print("\n" + "=" * 60)
+        print("Desk Plane Calibration (one-shot RANSAC)")
+        print("=" * 60)
+        print("  Make sure the desk is clear of objects for best results.")
 
-        # Spatial crop: intentionally unchanged.
-        x_min, x_max = 0.0, 0.8
-        y_min, y_max = -0.6, 0.6
-        z_guard_lo, z_guard_hi = -0.2, 0.8
-        crop_mask = (
-            (pts_world[:, 0] >= x_min)
-            & (pts_world[:, 0] <= x_max)
-            & (pts_world[:, 1] >= y_min)
-            & (pts_world[:, 1] <= y_max)
-            & (pts_world[:, 2] >= z_guard_lo)
-            & (pts_world[:, 2] <= z_guard_hi)
-        )
-        pts_world = pts_world[crop_mask]
-        col_cam = col_cam[crop_mask]
-        print(
-            f"  After X/Y crop (x in [{x_min},{x_max}], y in [{y_min},{y_max}], "
-            f"z guard in [{z_guard_lo},{z_guard_hi}]): {pts_world.shape[0]} points"
-        )
-        if pts_world.shape[0] < 3:
-            raise RuntimeError("Too few workspace points for plane fitting.")
+        t_desk_0 = time.perf_counter()
+        desk_plane = PointCloudProcessor.calibrate_desk_plane(depth_m, rgb, rays, T_world_camera)
+        _timings["desk_calib"] = (time.perf_counter() - t_desk_0) * 1000.0
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts_world.astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(col_cam.astype(np.float64))
-
-        # Desk plane fitting: original 1 cm threshold retained.
-        print("\nFitting desk plane (RANSAC, distance threshold = 1 cm)...")
-        plane_model, inliers = pcd.segment_plane(
-            distance_threshold=0.01,
-            ransac_n=3,
-            num_iterations=1000,
-        )
-        a, b, c, d = plane_model
-        if c < 0:
-            a, b, c, d = -a, -b, -c, -d
-
-        inlier_pts_full = np.asarray(pcd.points)[inliers]
-        if inlier_pts_full.shape[0] == 0:
-            raise RuntimeError("Desk plane has no inliers.")
-
-        desk_z_mean = float(inlier_pts_full[:, 2].mean())
-        desk_z_std = float(inlier_pts_full[:, 2].std())
-        normal = np.asarray([a, b, c], dtype=np.float64)
-        normal /= max(np.linalg.norm(normal), 1e-12)
+        a, b, c_plane, d_plane = desk_plane
+        normal = np.array([a, b, c_plane])
         angle_deg = float(np.degrees(np.arccos(np.clip(np.dot(normal, [0.0, 0.0, 1.0]), -1.0, 1.0))))
+        print(f"  Plane:  {a:.4f}x + {b:.4f}y + {c_plane:.4f}z + {d_plane:.4f} = 0")
+        print(f"  Tilt:   {angle_deg:.1f} deg from horizontal")
 
-        print(f"  Plane equation:   {a:.4f}x + {b:.4f}y + {c:.4f}z + {d:.4f} = 0")
-        print(f"  Plane normal:     [{a:.4f}, {b:.4f}, {c:.4f}]")
-        print(f"  Inlier count:     {len(inliers)} / {len(pcd.points)}")
-        print(f"  Desk Z (world):   mean={desk_z_mean:.4f} m  std={desk_z_std:.4f} m")
-        print(f"  Tilt from horiz:  {angle_deg:.1f} deg")
+        # Persist.
+        _repo_root = Path(__file__).resolve().parents[2]
+        _desk_plane_path = str(_repo_root / "dexmani_real" / "config" / "desk_plane.json")
+        PointCloudProcessor.save_desk_plane(desk_plane, _desk_plane_path)
+        _loaded = PointCloudProcessor.load_desk_plane(_desk_plane_path)
+        print(f"  Saved + round-trip OK: a={_loaded[0]:.4f} b={_loaded[1]:.4f} c={_loaded[2]:.4f} d={_loaded[3]:.4f}")
 
-        # Fixed Z crop.
-        z_lo, z_hi = 0.0, 0.8
-        pts_all = np.asarray(pcd.points)
-        col_all = np.asarray(pcd.colors)
-        z_mask = (pts_all[:, 2] >= z_lo) & (pts_all[:, 2] <= z_hi)
+        # ═══════════════════════════════════════════════════════════
+        # Production pipeline with per-stage point counts
+        # ═══════════════════════════════════════════════════════════
+        print("\n" + "=" * 60)
+        print("3-D Outlier Removal Pipeline (post-deprojection)")
+        print("=" * 60)
+        print("  Each stage below removes a different noise class.")
+        print()
 
-        pcd.points = o3d.utility.Vector3dVector(pts_all[z_mask])
-        pcd.colors = o3d.utility.Vector3dVector(col_all[z_mask])
-        print(f"  After fixed Z crop (z in [{z_lo},{z_hi}]): " f"{int(z_mask.sum())} points")
+        processor = PointCloudProcessor(T_world_camera)
+        cfg = processor.config
 
-        # 5 mm voxel downsample.
-        pcd_ds = pcd.voxel_down_sample(voxel_size=0.005)
-        print(f"  Downsampled: {len(pcd_ds.points)} points (5mm voxel)")
-
-        # Single-pass outlier removal (see constants at top).
-        n_before = len(pcd_ds.points)
-        t_start = time.perf_counter()
-        labels = np.asarray(pcd_ds.cluster_dbscan(eps=CLUSTER_EPS_M, min_points=1))
-        cluster_sizes = np.bincount(labels)
-        keep_idx = np.flatnonzero(cluster_sizes[labels] >= CLUSTER_MIN_SIZE)
-        pcd_ds = pcd_ds.select_by_index(keep_idx)
-        elapsed_ms = (time.perf_counter() - t_start) * 1e3
-        print(
-            f"  Cluster outlier removal (eps={CLUSTER_EPS_M * 1000:.0f}mm, "
-            f"min_size={CLUSTER_MIN_SIZE}): "
-            f"removed {n_before - len(pcd_ds.points)}, kept {len(pcd_ds.points)} "
-            f"in {int((cluster_sizes >= CLUSTER_MIN_SIZE).sum())}/{len(cluster_sizes)} "
-            f"clusters ({elapsed_ms:.1f} ms)"
-        )
-
-        # Fixed-size downsample for policy input (see constants at top).
-        pts_in = np.asarray(pcd_ds.points, dtype=np.float32)
-        col_in = np.asarray(pcd_ds.colors)
-        n_in = pts_in.shape[0]
-        if n_in == 0:
-            raise RuntimeError("No points left before fixed-size downsampling.")
-        use_cuda = torch.cuda.is_available()
-        if use_cuda:
-            # Warm up CUDA so the timing below reflects steady state.
-            sample_farthest_points(torch.zeros((1, 8, 3), device="cuda"), K=2)
-        t_start = time.perf_counter()
-        if n_in >= TARGET_POINTS:
-            pts_t = torch.from_numpy(pts_in)[None].to("cuda" if use_cuda else "cpu")
-            _, idx_t = sample_farthest_points(pts_t, K=TARGET_POINTS)
-            idx = idx_t[0].cpu().numpy()
-            method = "FPS/" + ("cuda" if use_cuda else "cpu")
+        if processor._desk_plane is not None:
+            print(f"  Desk plane: auto-loaded from file  (clearance={cfg.desk_clearance_m*1000:.0f}mm)")
         else:
-            pad = np.random.default_rng().integers(0, n_in, TARGET_POINTS - n_in)
-            idx = np.concatenate([np.arange(n_in), pad])
-            method = "random pad"
-        elapsed_ms = (time.perf_counter() - t_start) * 1e3
-        pcd_ds = o3d.geometry.PointCloud()
-        pcd_ds.points = o3d.utility.Vector3dVector(pts_in[idx].astype(np.float64))
-        pcd_ds.colors = o3d.utility.Vector3dVector(col_in[idx])
-        print(f"  Fixed-size downsample ({method}): {n_in} -> {len(idx)} points " f"({elapsed_ms:.1f} ms)")
+            print(f"  Desk plane: NONE — falling back to workspace z_min={cfg.workspace[2]*1000:.0f}mm")
 
+        # --- Run the full pipeline once (warm-up) ---
+        rays_2d = rays.reshape(depth_m.shape[0], depth_m.shape[1], 3)
+        _ = processor.process(depth_m, rgb, rays_2d)
+
+        # --- Describe each stage ---
+        print(f"  1. Desk plane removal       → drops points <{cfg.desk_clearance_m*1000:.0f}mm above desk")
+        print(f"                              (tilt-aware: handles {angle_deg:.1f} deg desk slope)")
+        print(f"  2. Workspace crop           → keeps only x in [{cfg.workspace[0]:.1f},{cfg.workspace[3]:.1f}] "
+              f"y in [{cfg.workspace[1]:.1f},{cfg.workspace[4]:.1f}] "
+              f"z in [{cfg.workspace[2]:.3f},{cfg.workspace[5]:.1f}]")
+        print(f"  3. 5mm voxel downsample     → averages points in each 5mm grid cell")
+        if cfg.dbscan_min_cluster_size > 0:
+            print(f"  4. DBSCAN two-in-one filter  → noise pts (label=-1) + clusters <{cfg.dbscan_min_cluster_size} pts")
+            print(f"                              (eps={cfg.dbscan_eps*1000:.0f}mm, min_points={cfg.dbscan_min_points})")
+        else:
+            print(f"  4. DBSCAN two-in-one filter  → DISABLED")
+        if cfg.radius_outlier_min_points > 0:
+            print(f"  5. Radius outlier removal   → drops points with <{cfg.radius_outlier_min_points} "
+                  f"neighbours in {cfg.radius_outlier_radius*1000:.0f}mm")
+        else:
+            print(f"  5. Radius outlier removal   → DISABLED (DBSCAN noise removal covers it)")
+        if cfg.stat_outlier_nb_neighbors > 0:
+            print(f"  6. Statistical outlier      → drops points whose mean k-NN distance "
+              f"(k={cfg.stat_outlier_nb_neighbors}) deviates >{cfg.stat_outlier_std_ratio} sigma")
+        else:
+            print(f"  6. Statistical outlier      → DISABLED (DBSCAN noise removal covers it)")
+        print(f"  7. Farthest-point sampling  → selects {cfg.num_points} points with max spatial coverage")
+
+        # --- Measure a single-frame timing breakdown by temporarily lower the log interval ---
+        # Save original accumulators, reset, run one frame, read back.
+        saved = (
+            processor._t_numpy, processor._t_voxel, processor._t_dbscan,
+            processor._t_radius, processor._t_stat, processor._t_fps,
+            processor._t_in_n, processor._t_voxel_n, processor._t_radius_n, processor._t_n,
+        )
+        processor._t_numpy = processor._t_voxel = processor._t_dbscan = 0.0
+        processor._t_radius = processor._t_stat = processor._t_fps = 0.0
+        processor._t_in_n = processor._t_voxel_n = processor._t_radius_n = 0
+        processor._t_n = 0
+
+        t_prod_0 = time.perf_counter()
+        result = processor.process(depth_m, rgb, rays_2d)
+        _timings["pipeline_total"] = (time.perf_counter() - t_prod_0) * 1000.0
+
+        # Extract single-frame stage timings from processor accumulators.
+        _timings["p_numpy"] = processor._t_numpy  # 2-D gates + deproject + crop
+        _timings["p_voxel"] = processor._t_voxel
+        _timings["p_dbscan"] = processor._t_dbscan
+        _timings["p_radius"] = processor._t_radius
+        _timings["p_stat"] = processor._t_stat
+        _timings["p_fps"] = processor._t_fps
+
+        # Restore.
+        (processor._t_numpy, processor._t_voxel, processor._t_dbscan,
+         processor._t_radius, processor._t_stat, processor._t_fps,
+         processor._t_in_n, processor._t_voxel_n, processor._t_radius_n, processor._t_n) = saved
+
+        if result is not None:
+            print(f"\n  Output: {result.shape[0]} points  ({_timings['pipeline_total']:.1f} ms)")
+        else:
+            print(f"\n  Output: no points survived  ({_timings['pipeline_total']:.1f} ms)")
+            result = np.zeros((0, 6), dtype=np.float32)
+
+        # ═══════════════════════════════════════════════════════════
+        # Per-stage timing summary
+        # ═══════════════════════════════════════════════════════════
+        print("\n" + "=" * 60)
+        print("Per-Stage Timing Summary")
+        print("=" * 60)
+
+        def _tprint(label: str, key: str) -> None:
+            ms = _timings.get(key, 0.0)
+            pct = ms / max(_timings.get("pipeline_total", 1.0), 0.001) * 100
+            if ms < 0.01:
+                print(f"  {label:<30s}     —   (disabled)")
+            else:
+                bar = "█" * max(1, int(pct / 2.5))
+                print(f"  {label:<30s} {ms:6.1f} ms  {bar}")
+
+        print("\n  ── Setup ──")
+        _tprint("Camera connect", "connect")
+        _tprint("Frame capture", "capture")
+        _tprint("Extrinsics load", "extrinsics")
+        _tprint("Desk plane calibration", "desk_calib")
+
+        print("\n  ── 2-D Pre-deprojection Filters ──")
+        _tprint("Depth gate", "2d_depth_gate")
+        _tprint("Edge filter (LoG + dilate)", "2d_edge_filter")
+        _tprint("Speckle filter", "2d_speckle")
+        _2d_total = _timings.get("2d_depth_gate", 0) + _timings.get("2d_edge_filter", 0) + _timings.get("2d_speckle", 0)
+        print(f"  {'2-D total':<30s} {_2d_total:6.1f} ms")
+
+        print("\n  ── 3-D Pipeline (per-frame steady-state) ──")
+        _tprint("  2-D gates + deproject + crop", "p_numpy")
+        _tprint("  5mm voxel downsample", "p_voxel")
+        _tprint("  DBSCAN two-in-one filter", "p_dbscan")
+        _tprint("  Radius outlier removal", "p_radius")
+        _tprint("  Statistical outlier", "p_stat")
+        _tprint("  FPS to 2048", "p_fps")
+        _p3d_total = sum(_timings.get(k, 0) for k in ["p_numpy", "p_voxel", "p_dbscan", "p_radius", "p_stat", "p_fps"])
+        print(f"  {'  3-D subtotal':<30s} {_p3d_total:6.1f} ms")
+        print(f"  {'Pipeline total':<30s} {_timings.get('pipeline_total', 0):6.1f} ms  (budget: 62.5ms @ 16Hz)")
+
+        # ═══════════════════════════════════════════════════════════
+        # Visualise final point cloud
+        # ═══════════════════════════════════════════════════════════
         world_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
         camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
         camera_frame.transform(T_world_camera)
 
-        # Workspace crop box wireframe (effective bounds after all crop stages).
-        crop_corners = np.array(
-            [
-                [x_min, y_min, z_lo],
-                [x_max, y_min, z_lo],
-                [x_max, y_max, z_lo],
-                [x_min, y_max, z_lo],
-                [x_min, y_min, z_hi],
-                [x_max, y_min, z_hi],
-                [x_max, y_max, z_hi],
-                [x_min, y_max, z_hi],
-            ]
-        )
+        ws = cfg.workspace
+        crop_corners = np.array([
+            [ws[0], ws[1], ws[2]], [ws[3], ws[1], ws[2]], [ws[3], ws[4], ws[2]], [ws[0], ws[4], ws[2]],
+            [ws[0], ws[1], ws[5]], [ws[3], ws[1], ws[5]], [ws[3], ws[4], ws[5]], [ws[0], ws[4], ws[5]],
+        ])
         crop_edges = [
-            [0, 1],
-            [1, 2],
-            [2, 3],
-            [3, 0],
-            [4, 5],
-            [5, 6],
-            [6, 7],
-            [7, 4],
-            [0, 4],
-            [1, 5],
-            [2, 6],
-            [3, 7],
+            [0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4],
+            [0, 4], [1, 5], [2, 6], [3, 7],
         ]
         crop_box = o3d.geometry.LineSet()
         crop_box.points = o3d.utility.Vector3dVector(crop_corners)
         crop_box.lines = o3d.utility.Vector2iVector(crop_edges)
         crop_box.colors = o3d.utility.Vector3dVector([[0.0, 1.0, 0.0] for _ in crop_edges])
 
-        print("\nLaunching open3d visualizer (close window to continue)...")
-        print(
-            "  World-frame point cloud (RGB) + workspace crop box (green) + "
-            "coordinate frames (world=large, camera=small)"
-        )
-        o3d.visualization.draw_geometries(
-            [pcd_ds, crop_box, world_frame, camera_frame],
-            window_name="World-frame Point Cloud",
-            point_show_normal=False,
-        )
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(result[:, :3].astype(np.float64))
+        pcd.colors = o3d.utility.Vector3dVector(result[:, 3:6].astype(np.float64))
+
+        if USE_O3D_VIS:
+            print("\nLaunching open3d visualizer (close window to continue)...")
+            print("  World-frame point cloud + workspace crop box (green) + coordinate frames")
+            o3d.visualization.draw_geometries(
+                [pcd, crop_box, world_frame, camera_frame],
+                window_name="Point Cloud (production pipeline)",
+                point_show_normal=False,
+            )
+        else:
+            print("\n  open3d visualizer skipped (USE_O3D_VIS=False)")
 
         print("\nDone.")
 

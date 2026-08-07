@@ -547,11 +547,14 @@ def _planned_homing(
         time.sleep(_cfg.homing_step_interval_s)
 
     # Final: send canonical home_qpos to align encoder values.
-    # Stage 2 converged to _home (shortest equivalent path).  If _home and
-    # home_qpos are in different ±360° bands, this final set_servo_angle
-    # triggers a deliberate full rotation to the canonical band at 90°/s —
-    # acceptable because the arm is already at the physical home pose.
-    # Mode 6 firmware handles trajectory interpolation internally.
+    # In the normal path (planner available), send_arm_home appends a
+    # collision-checked band-alignment segment to the waypoints, so the arm
+    # is already at the canonical band after Stage 1+2 — this call is a no-op.
+    # In the fallback path (planner=None, post-exit homing), Stage 2 converges
+    # to _home (wrapped) and this final call may trigger a band-alignment
+    # rotation WITHOUT collision checking.  This is acceptable only because
+    # post-exit homing runs after the arm is already near home from a prior
+    # homing cycle, and no operator is present.
     _align_speed = np.deg2rad(90.0)
     try:
         arm.set_servo_angle(angle=home_qpos, is_radian=True, speed=_align_speed, wait=False)

@@ -59,6 +59,22 @@ class SharedStorageConfig:
 
 HOME_SENTINEL = "__HOME__"
 
+
+def _describe_band_diff(wrapped: "np.ndarray", canonical: "np.ndarray") -> str:
+    """Describe which equivalent joints differ between wrapped and canonical home.
+
+    Returns a short string like ``"J7:-360→0°"`` or ``"same band"``.
+    """
+    import numpy as np
+
+    delta_deg = np.rad2deg(np.abs(wrapped - canonical))
+    _EQ_JOINT_NAMES = {0: "J1", 2: "J3", 4: "J5", 6: "J7"}
+    parts: list[str] = []
+    for _ji, _name in _EQ_JOINT_NAMES.items():
+        if delta_deg[_ji] > 1.0:
+            parts.append(f"{_name}:{np.rad2deg(wrapped[_ji]):.0f}→{np.rad2deg(canonical[_ji]):.0f}°")
+    return ", ".join(parts) if parts else "same band"
+
 ARM_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", (7,)),
@@ -502,7 +518,7 @@ def send_arm_home(
 
     Returns True if home reached, False on timeout or error.
     """
-    from dexmani_real.planning.path_utils import plan_joint_home_path
+    from dexmani_real.planning.path_utils import plan_band_alignment_path, plan_joint_home_path
 
     # ── Step 1: resolve current qpos ──
     if current_qpos is None:
@@ -511,7 +527,7 @@ def send_arm_home(
         if _as is not None and np.all(np.isfinite(_as["qpos"][0])):
             current_qpos = np.asarray(_as["qpos"][0], dtype=np.float64)
 
-    # ── Step 2: plan collision-safe path ──
+    # ── Step 2: plan collision-safe path to wrapped home ──
     try:
         _waypoints = plan_joint_home_path(
             current_qpos, home_qpos, planner, table_z_surface_m=table_z_surface_m
@@ -520,6 +536,40 @@ def send_arm_home(
         if verbose:
             print("  arm: home path planning failed — falling back to direct home", flush=True)
         _waypoints = None
+
+    # ── Step 2b: plan band-alignment path (wrapped_home → canonical_home) ──
+    # plan_joint_home_path wraps home_qpos to the nearest 2π band of the
+    # arm's current encoder position.  The returned waypoints end at this
+    # wrapped position (_home).  For strategy learning we need the arm at
+    # the canonical home_qpos, so we append a collision-checked alignment
+    # segment that rotates only the band-mismatched equivalent joints.
+    if (
+        _waypoints is not None
+        and len(_waypoints) > 0
+        and planner is not None
+        and table_z_surface_m is not None
+    ):
+        try:
+            _wrapped_home = _waypoints[-1].copy()
+            _align_path = plan_band_alignment_path(
+                _wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m
+            )
+        except Exception:
+            _align_path = None
+
+        if _align_path is not None:
+            if len(_align_path) > 0:
+                # Skip the first waypoint (== _wrapped_home, already at end
+                # of main path) and append the rest.
+                _waypoints = np.concatenate([_waypoints, _align_path[1:]], axis=0)
+                if verbose:
+                    _desc = _describe_band_diff(_wrapped_home, home_qpos)
+                    print(f"  arm: band-alignment appended ({len(_align_path) - 1} waypoints, {_desc})", flush=True)
+            else:
+                # Empty sentinel: alignment needed but unsafe — stay at _wrapped_home.
+                if verbose:
+                    _desc = _describe_band_diff(_wrapped_home, home_qpos)
+                    print(f"  arm: band-alignment UNSAFE ({_desc}) — staying at wrapped home", flush=True)
 
     # ── Step 3: queue HOME_SENTINEL ──
     try:

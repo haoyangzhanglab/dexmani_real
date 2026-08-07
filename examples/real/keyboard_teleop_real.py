@@ -170,6 +170,7 @@ def main():
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
+        home_qpos=np.array(arm.home_qpos, dtype=np.float64),
     )
 
     # ── 2. SharedStorage + subprocesses ──
@@ -185,7 +186,7 @@ def main():
     _procs = [arm_proc]
     if hand_proc is not None:
         _procs.append(hand_proc)
-    if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, 15)], _procs):
+    if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, 15)], [arm_proc]):
         shutdown_processes(shared, _procs)
         return
     if _hand_enabled and hand_proc is not None:

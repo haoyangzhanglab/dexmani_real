@@ -81,6 +81,7 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
         hand_dof: bool = True,
+        home_qpos: np.ndarray | None = None,
     ) -> None:
         import mplib
 
@@ -166,6 +167,7 @@ class XArm7MotionPlanner:
             self.ik_mgr,
             self.teleop_profile,
             elbow_joint_index=self._elbow_joint_index,
+            home_qpos=home_qpos,
         )
 
         # Convenience aliases (used by teleop_solver and external code)
@@ -178,6 +180,7 @@ class XArm7MotionPlanner:
         cls,
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
+        home_qpos: np.ndarray | None = None,
     ) -> "XArm7MotionPlanner":
         """Factory with canonical URDF/SRDF and identity base_pose_world.
 
@@ -203,6 +206,7 @@ class XArm7MotionPlanner:
             cfg,
             planning_profile=planning_profile or PlanningProfile(),
             teleop_profile=teleop_profile or TeleopProfile(),
+            home_qpos=home_qpos,
         )
 
     def __getattr__(self, name: str):

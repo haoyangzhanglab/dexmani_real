@@ -166,7 +166,7 @@ def camera_loop(shared: "SharedStorage") -> None:
                 continue
 
             # --- pointcloud (only when recording) ---
-            # Pointcloud processing (~40ms) is the dominant cost in the pipeline.
+            # Pointcloud processing (~46 ms) is the dominant cost in the pipeline.
             # Computing it every tick — even when no one consumes the data — would
             # needlessly burn CPU.  A forward-fill cache (_last_pc) bridges the
             # cross-process delay between the Policy setting is_recording=True and

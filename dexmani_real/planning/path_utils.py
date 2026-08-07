@@ -213,3 +213,70 @@ def plan_joint_home_path(
         return staged
 
     return np.empty((0, 7), dtype=np.float64)  # sentinel: no safe path — caller MUST hold position
+
+
+def plan_band_alignment_path(
+    wrapped_home: np.ndarray,
+    canonical_home: np.ndarray,
+    planner: "XArm7MotionPlanner | None" = None,
+    *,
+    table_z_surface_m: float | None = None,
+    hand_safety_margin_m: float | None = None,
+) -> np.ndarray | None:
+    """Plan a collision-safe band-alignment path from *wrapped_home* to *canonical_home*.
+
+    *wrapped_home* is ``home_qpos`` shifted by integer multiples of 2π on
+    equivalent joints (J1/J3/J5/J7) to match the current encoder band — the
+    arm is physically at the home pose but the encoder values differ.
+
+    This function generates a dense 1°/step joint-space path that rotates
+    only the band-mismatched joints through exactly one 2π wrap, then checks
+    self-collision and table clearance.  On a pure wrist-roll alignment
+    (J7 only), the EEF position is invariant so the table check is a no-op;
+    Pinocchio self-collision is the primary guard.
+
+    Returns:
+        * ``None`` — no alignment needed (*wrapped_home* ≈ *canonical_home*).
+        * ``(D, 7)`` dense waypoint array (D ≥ 2) — safe alignment path.
+        * ``(0, 7)`` empty array — alignment needed but **no safe path**;
+          the caller SHOULD keep the arm at *wrapped_home*.
+    """
+    if hand_safety_margin_m is None:
+        hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
+
+    # Only plan if the two home positions differ on equivalent joints.
+    # Use RAW (unwrapped) delta — compute_qpos_delta wraps 2π apart to 0,
+    # defeating the purpose of detecting band mismatches.
+    # Equivalent joints: J1(idx=0), J3(2), J5(4), J7(6) — 720° range.
+    _EQ_MASK = np.array([True, False, True, False, True, False, True])
+    _raw_delta_deg = np.rad2deg(np.abs(wrapped_home - canonical_home))
+    if not np.any(_raw_delta_deg[_EQ_MASK] > 1.0):
+        return None  # same band — no alignment needed
+
+    # Linear joint-space interpolation at 1°/step — this produces a pure
+    # equivalent-joint rotation (e.g. J7: -360° → 0° at 1°/step = 360 steps).
+    # The path is fully wrapping-aware because interpolate_waypoints computes
+    # raw (unwrapped) deltas between waypoints.
+    path = interpolate_waypoints(np.stack([wrapped_home, canonical_home]), np.deg2rad(1.0))
+
+    have_collision = planner is not None and planner.planning_profile.check_self_collision
+    _check_table = table_z_surface_m is not None and planner is not None
+
+    # ── Safety checks (same as plan_joint_home_path._check_safe) ──
+    if have_collision:
+        result = planner.ik_mgr.check_path_collisions(path)  # type: ignore[union-attr]
+        if result.get("path_self_collision", False):
+            return np.empty((0, 7), dtype=np.float64)
+
+    if _check_table:
+        for _wp in path:
+            try:
+                _eef_p = planner.kin.compute_eef_pose_world(_wp).p  # type: ignore[union-attr]
+            except Exception:
+                return np.empty((0, 7), dtype=np.float64)
+            if not np.all(np.isfinite(_eef_p)):
+                return np.empty((0, 7), dtype=np.float64)
+            if float(_eef_p[2]) - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
+                return np.empty((0, 7), dtype=np.float64)
+
+    return path
