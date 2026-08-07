@@ -450,7 +450,8 @@ class EpisodeRecorder:
             rgb = camera_frame.get("rgb")
             if rgb is not None:
                 if self._rgb_encoder is None:
-                    assert self._temp_dir is not None
+                    if self._temp_dir is None:
+                        raise RuntimeError("EpisodeRecorder: _temp_dir is None during RGB encoder init")
                     h, w = rgb.shape[:2]
                     mp4_path = Path(self._temp_dir) / "rgb.mp4"
                     self._rgb_encoder = VideoEncoder(mp4_path, fps=self.control_hz, width=w, height=h)
@@ -573,7 +574,8 @@ class EpisodeRecorder:
         """
         if self._file is not None:
             return
-        assert self._temp_dir is not None
+        if self._temp_dir is None:
+            raise RuntimeError("EpisodeRecorder: _temp_dir is None during HDF5 open")
         self._file = h5py.File(str(Path(self._temp_dir) / "data.h5"), "w")
         self._write_meta_attrs(self._file.create_group("meta"))
         self._depth_file = h5py.File(str(Path(self._temp_dir) / "depth.h5"), "w")

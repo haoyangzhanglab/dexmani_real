@@ -145,7 +145,7 @@ class ArmState:
 
 @dataclass
 class HandState:
-    """Hand process state — published to hand_state_ring every tick (~328 bytes).
+    """Hand process state — published to hand_state_ring every tick (~472 bytes).
 
     Does NOT include tactile_force — that's in HandTactile on a separate ring.
     Matches HAND_STATE_DTYPE in shm/shared_storage.py.
@@ -158,6 +158,9 @@ class HandState:
     error_state: bool
     connected: bool
     qpos_stale: bool
+    commboard_err: np.ndarray  # (12,) int32
+    jointboard_err: np.ndarray  # (12,) int32
+    tipboard_err: np.ndarray  # (12,) int32
     timestamp: float
 
 

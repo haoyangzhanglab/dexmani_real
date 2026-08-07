@@ -17,12 +17,11 @@ from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import arm, hand, policy
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.hand_kinematics import HandKinematics
-from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, HOME_SENTINEL, SharedStorage, hand_home_converge
+from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, SharedStorage, hand_home_converge, send_arm_home
 from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state
 from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
 from dexmani_real.shm.shared_storage import write_hand_cmd as _write_hand_cmd
@@ -98,6 +97,58 @@ class PolicyConfig:
 
     # VR transform config path (relative to repo root)
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
+
+
+def _do_teleop_home(
+    shared: SharedStorage,
+    *,
+    hand_available: bool,
+    prev_hand_qpos: np.ndarray,
+    arm_qpos: np.ndarray,
+    planner,
+    audio,
+    hand_home_qpos: np.ndarray,
+    table_z_surface_m: float,
+    arm_mapper=None,
+    hand_retargeter=None,
+    heartbeat: bool = True,
+) -> np.ndarray:
+    """Home hand first, then arm. Returns updated *prev_hand_qpos*.
+
+    If *arm_mapper* and *hand_retargeter* are both provided, clears EMA
+    state and re-seeds retargeter before homing (active-teleop H path).
+    Post-teleop callers pass ``None`` for both — the state is already cleared.
+    """
+    if arm_mapper is not None:
+        arm_mapper.clear()
+    if hand_retargeter is not None:
+        _reset_hand_retargeter(hand_retargeter)
+
+    # Step 1: hand home first (prevents arm sweeping while hand is in grasp).
+    if hand_available and not shared.error_state.value:
+        _, final_qpos = hand_home_converge(
+            shared, hand_home_qpos, heartbeat=heartbeat, check_is_running=True, verbose=True,
+        )
+        if final_qpos is not None:
+            prev_hand_qpos = final_qpos
+    elif not hand_available:
+        print("  hand: not connected — skipping hand home", flush=True)
+
+    # Step 2: arm home (collision-checked path via HOME_SENTINEL).
+    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+    _ok = send_arm_home(
+        shared, _home_qpos,
+        planner=planner, table_z_surface_m=table_z_surface_m,
+        current_qpos=arm_qpos, heartbeat=heartbeat,
+        converge_timeout_s=15.0, queue_timeout=0.2, verbose=True,
+    )
+    if _ok:
+        audio.play("home_done")
+        print("  arm: home reached", flush=True)
+    else:
+        logger.warning("arm home convergence timeout after 15s")
+
+    return prev_hand_qpos
 
 
 def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> None:
@@ -327,38 +378,13 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 for _sig in kb.poll(timeout=0.1):
                     if _sig == ControlSignal.HOME:
                         print("  H: return_home")
-                        if hand_available and not shared.error_state.value:
-                            _, final_qpos = hand_home_converge(
-                                shared,
-                                HAND_HOME_QPOS,
-                                heartbeat=True,
-                                check_is_running=True,
-                                verbose=True,
-                            )
-                            if final_qpos is not None:
-                                prev_hand_qpos = final_qpos
-                        elif not hand_available:
-                            print("  hand: not connected — skipping hand home", flush=True)
-
-                        _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                        # Read current arm position for path planning.
-                        _cur_as = _read_arm_state(shared)
-                        _cur_qpos = _home_qpos.copy()
-                        if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
-                            _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
-                        _waypoints = plan_joint_home_path(
-                            _cur_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                        prev_hand_qpos = _do_teleop_home(
+                            shared, hand_available=hand_available, prev_hand_qpos=prev_hand_qpos,
+                            arm_qpos=arm_qpos, planner=planner, audio=audio,
+                            hand_home_qpos=HAND_HOME_QPOS, table_z_surface_m=arm.table_z_surface_m,
+                            # arm_mapper/hand_retargeter=None: post-teleop, state already cleared
                         )
-                        if _waypoints is not None and len(_waypoints) == 0:
-                            logger.warning("No collision-safe path to home — arm will hold position")
-                        _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
-                        _arm_home_ok = _wait_arm_home_convergence(shared, _home_qpos)
-                        if _arm_home_ok:
-                            audio.play("home_done")
-                            print("  arm: home reached", flush=True)
-                        else:
-                            logger.warning("arm home convergence timeout after 15s")
-                        limiter.reset()  # prevent over-budget warning after blocking hand home
+                        limiter.reset()
                         print("  [Q] quit", flush=True)
 
                     elif _sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
@@ -444,32 +470,13 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             audio.play("home")
                             teleop_active = False
                             transition(shared, SafetyState.ARMED)
-                            arm_mapper.clear()
                             ema_prev_pos = ema_prev_quat = None
-                            _reset_hand_retargeter(hand_retargeter)
-
-                            if hand_available and not shared.error_state.value:
-                                _, final_qpos = hand_home_converge(
-                                    shared,
-                                    HAND_HOME_QPOS,
-                                    heartbeat=True,
-                                    check_is_running=True,
-                                    verbose=True,
-                                )
-                                if final_qpos is not None:
-                                    prev_hand_qpos = final_qpos
-
-                            _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                            _home_wp = plan_joint_home_path(
-                                arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                            prev_hand_qpos = _do_teleop_home(
+                                shared, hand_available=hand_available, prev_hand_qpos=prev_hand_qpos,
+                                arm_qpos=arm_qpos, planner=planner, audio=audio,
+                                hand_home_qpos=HAND_HOME_QPOS, table_z_surface_m=arm.table_z_surface_m,
+                                arm_mapper=arm_mapper, hand_retargeter=hand_retargeter,
                             )
-                            if _home_wp is not None and len(_home_wp) == 0:
-                                logger.warning("No collision-safe path to home — arm will hold position")
-                            _safe_arm_queue_put(shared, (HOME_SENTINEL, _home_wp))
-                            _arm_home_converged = _wait_arm_home_convergence(shared, _home_qpos)
-                            if _arm_home_converged:
-                                audio.play("home_done")
-                                print("  arm: home reached", flush=True)
 
                     # Enter post-teleop state (two-stage Q) instead of immediate exit.
                     # Policy loop stays alive with heartbeats ticking; arm/hand/vr
@@ -490,46 +497,14 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     recording_active = False
                     teleop_active = False
                     transition(shared, SafetyState.ARMED)
-                    arm_mapper.clear()
                     ema_prev_pos = ema_prev_quat = None
-                    _reset_hand_retargeter(hand_retargeter)
-
-                    # Poll hand_state_ring until the hand converges to home_qpos.
-                    # Prevents the arm from sweeping across the workspace while
-                    # the hand is still in a grasp pose (collision risk), and
-                    # ensures the hand driver receives persistent commands —
-                    # a single write is unreliable when the hand is in qpos_stale.
-                    if hand_available and not shared.error_state.value:
-                        _, final_qpos = hand_home_converge(
-                            shared,
-                            HAND_HOME_QPOS,
-                            heartbeat=True,
-                            check_is_running=True,
-                            verbose=True,
-                        )
-                        if final_qpos is not None:
-                            prev_hand_qpos = final_qpos
-                    elif not hand_available:
-                        print("  hand: not connected — skipping hand home", flush=True)
-
-                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                    _waypoints = plan_joint_home_path(
-                        arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                    prev_hand_qpos = _do_teleop_home(
+                        shared, hand_available=hand_available, prev_hand_qpos=prev_hand_qpos,
+                        arm_qpos=arm_qpos, planner=planner, audio=audio,
+                        hand_home_qpos=HAND_HOME_QPOS, table_z_surface_m=arm.table_z_surface_m,
+                        arm_mapper=arm_mapper, hand_retargeter=hand_retargeter,
                     )
-                    _safe_arm_queue_put(shared, (HOME_SENTINEL, _waypoints))
-
-                    # Wait for arm to actually converge to home_qpos before
-                    # playing "home_done".  arm_loop executes waypoints
-                    # synchronously in _planned_homing (~1s for 31 waypoints
-                    # at 30Hz).  We poll arm_state_ring with heartbeat ticks.
-                    _arm_home_ok = _wait_arm_home_convergence(shared, _home_qpos)
-                    if _arm_home_ok:
-                        audio.play("home_done")
-                        print("  arm: home reached", flush=True)
-                    else:
-                        logger.warning("arm home convergence timeout after 15s")
-
-                    limiter.reset()  # prevent over-budget warning after blocking home
+                    limiter.reset()
                     skip_rest = True
 
                 elif sig == ControlSignal.STOP:
@@ -827,7 +802,26 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 _reset_hand_retargeter(hand_retargeter, prev_hand_qpos.copy() if hand_available else None)
                 _prev_audio_playing = False
 
-            assert vr_frame is not None  # guaranteed by vr_stale check above
+            if vr_frame is None:
+                logger.warning("policy_loop: vr_frame is None after vr_stale check — holding")
+                if recording_active:
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        None,  # vr_frame
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
+                continue
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
                 if recording_active:
@@ -856,15 +850,17 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             target_quat = mapped["quat_wxyz"]
 
             if ema_prev_pos is not None:
-                assert ema_prev_quat is not None  # set together with ema_prev_pos
-                target_pos, target_quat = ema_smooth_pose(
-                    target_pos,
-                    target_quat,
-                    ema_prev_pos,
-                    ema_prev_quat,
-                    cfg.ema_alpha_pos,
-                    cfg.ema_alpha_rot,
-                )
+                if ema_prev_quat is None:
+                    logger.warning("policy_loop: ema_prev_quat is None but ema_prev_pos is set — skipping EMA")
+                else:
+                    target_pos, target_quat = ema_smooth_pose(
+                        target_pos,
+                        target_quat,
+                        ema_prev_pos,
+                        ema_prev_quat,
+                        cfg.ema_alpha_pos,
+                        cfg.ema_alpha_rot,
+                    )
 
             target_pos_before_clamp = target_pos.copy()
             for axis in range(3):
@@ -1080,31 +1076,6 @@ def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.2) 
     except Full:
         logger.warning("policy_loop: arm_action_q full (timeout=%.1fs) — arm unresponsive", timeout)
         return False
-
-
-def _wait_arm_home_convergence(shared: SharedStorage, home_qpos: np.ndarray, *, timeout_s: float = 15.0) -> bool:
-    """Wait for the arm to converge to home_qpos after queuing HOME_SENTINEL.
-
-    Polls ``arm_state_ring`` at ~10 Hz, ticking ``policy_heartbeat_s`` so the
-    supervisor doesn't FAULT.  Returns True when all joints are within 2° of
-    *home_qpos*, False on timeout.
-
-    This replaces the old heartbeat-staleness check which was a no-op: arm_loop
-    ticks ``arm_heartbeat_s`` every ~33 ms during normal operation, so
-    ``now - arm_heartbeat_s > 3.0`` never fires while the arm is alive.
-    """
-    _home_tol = np.deg2rad(2.0)
-    _deadline = time.monotonic() + timeout_s
-    while time.monotonic() < _deadline and shared.is_running.value:
-        shared.policy_heartbeat_s.value = time.monotonic()
-        _as = _read_arm_state(shared)
-        if _as is not None:
-            _q = np.asarray(_as["qpos"][0], dtype=np.float64)
-            if np.all(np.isfinite(_q)):
-                if float(np.max(np.abs(_q - home_qpos))) < _home_tol:
-                    return True
-        time.sleep(0.1)
-    return False
 
 
 def _read_vr_frame(shared: SharedStorage) -> dict | None:
@@ -1352,6 +1323,10 @@ def _build_robot_state(
         hand_tactile_contact = np.asarray(h["tactile_contact"], dtype=bool)
         hand_connected = bool(h["connected"])
         hand_qpos_stale = bool(h["qpos_stale"]) if "qpos_stale" in h.dtype.names else False
+        # Board error registers — per-joint hardware fault indicators.
+        hand_commboard_err = np.asarray(h["commboard_err"], dtype=np.int32) if "commboard_err" in h.dtype.names else np.zeros(12, dtype=np.int32)
+        hand_jointboard_err = np.asarray(h["jointboard_err"], dtype=np.int32) if "jointboard_err" in h.dtype.names else np.zeros(12, dtype=np.int32)
+        hand_tipboard_err = np.asarray(h["tipboard_err"], dtype=np.int32) if "tipboard_err" in h.dtype.names else np.zeros(12, dtype=np.int32)
     else:
         hand_qpos = nan_array(12)
         hand_current = nan_array(12)
@@ -1359,6 +1334,9 @@ def _build_robot_state(
         hand_tactile_contact = np.zeros(5, dtype=bool)
         hand_connected = False
         hand_qpos_stale = False
+        hand_commboard_err = np.zeros(12, dtype=np.int32)
+        hand_jointboard_err = np.zeros(12, dtype=np.int32)
+        hand_tipboard_err = np.zeros(12, dtype=np.int32)
 
     # Tactile force from separate ring (Phase 2.8)
     if hand_tactile is not None:
@@ -1399,9 +1377,9 @@ def _build_robot_state(
         hand_tactile_sum=hand_tactile_sum,
         hand_tactile_force=hand_tactile_force,
         hand_tactile_contact=hand_tactile_contact,
-        hand_tipboard_err=np.zeros(12, dtype=np.int32),
-        hand_commboard_err=np.zeros(12, dtype=np.int32),
-        hand_jointboard_err=np.zeros(12, dtype=np.int32),
+        hand_tipboard_err=hand_tipboard_err,
+        hand_commboard_err=hand_commboard_err,
+        hand_jointboard_err=hand_jointboard_err,
         hand_qpos_stale=hand_qpos_stale,
         fingertip_pos=fingertip_pos,
         arm_connected=arm_connected,

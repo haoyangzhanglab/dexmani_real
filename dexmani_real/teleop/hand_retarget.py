@@ -453,7 +453,8 @@ class XHandRetargeter:
         # Applied AFTER SeqRetargeting LPFilter (alpha=0.1) for two-layer smoothing.
         qpos_arr = np.asarray(qpos, dtype=float)
         if self._hand_ema_state is not None:
-            assert self._smoothing_alpha is not None  # set by load_retargeter() in __init__
+            if self._smoothing_alpha is None:
+                raise RuntimeError("XHandDexPilotOptimizer: _smoothing_alpha not set — call load_retargeter() first")
             qpos_arr = self._smoothing_alpha * qpos_arr + (1.0 - self._smoothing_alpha) * self._hand_ema_state
         self._hand_ema_state = qpos_arr.copy()
 

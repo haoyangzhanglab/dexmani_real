@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, camera, hand, policy, safety, vr
-from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
@@ -35,13 +34,12 @@ from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
 from dexmani_real.shm.shared_storage import (
-    HOME_SENTINEL,
     SharedStorage,
     hand_home_converge,
     print_health_summary,
-    read_arm_state,
+    run_supervisor,
+    send_arm_home,
     shutdown_processes,
-    wait_for_arm_home,
     wait_subsystem_ready,
 )
 from dexmani_real.utils.log import get_logger
@@ -172,18 +170,17 @@ def main() -> None:
     )
 
     # 5. Supervisor (heartbeat + process monitor)
-    _all_names = ["camera", "vr", "policy", "arm"]
+    _proc_names = ["camera", "vr", "policy", "arm"]
     if not args.no_hand:
-        _all_names.append("hand")
-    PROC_NAMES = _all_names
-    HEARTBEAT_FIELDS = {
+        _proc_names.append("hand")
+    _heartbeat_fields = {
         "arm": shared.arm_heartbeat_s,
         "policy": shared.policy_heartbeat_s,
         "vr": shared.vr_heartbeat_s,
         "camera": shared.camera_heartbeat_s,
     }
     if not args.no_hand:
-        HEARTBEAT_FIELDS["hand"] = shared.hand_heartbeat_s
+        _heartbeat_fields["hand"] = shared.hand_heartbeat_s
 
     # Seed any heartbeats still at 0.0 (processes still initializing) to
     # current time so they get the full timeout window from ARMED, not from
@@ -191,101 +188,35 @@ def main() -> None:
     # init (collision model, hand retargeter) after all Ready events but
     # before its main loop starts ticking the heartbeat.
     _now = time.monotonic()
-    for _hb in HEARTBEAT_FIELDS.values():
+    for _hb in _heartbeat_fields.values():
         if _hb.value == 0.0:
             _hb.value = _now
 
     _start_time = time.monotonic()
-    _last_status_s = _start_time
-    _exit_reason = "unknown"
-    normal_exit = False
-    try:
-        while True:
-            # 0. Normal exit — policy set is_running=False (Q key)
-            if not shared.is_running.value:
-                normal_exit = True
-                _exit_reason = "is_running=False (Q key)"
-                logger.info("exit_reason=%s", _exit_reason)
-                break
+    _exit_reason, normal_exit = run_supervisor(
+        shared, procs, _proc_names, _heartbeat_fields,
+    )
 
-            # 1. Process aliveness
-            for p, name in zip(procs, PROC_NAMES):
-                if not p.is_alive():
-                    if normal_exit:
-                        logger.info("process=%s exit=normal", name)
-                    else:
-                        _exit_reason = f"process={name} died"
-                        logger.error("%s — FAULT", _exit_reason)
-                        transition(shared, SafetyState.FAULT)
-                    break
-            if shared.safety_state.value == int(SafetyState.FAULT):
-                # FAULT was set by a subprocess (arm_loop/hand_loop).
-                # Diagnose the root cause from available flags.
-                if shared.error_state.value:
-                    _exit_reason = "error_state set (subprocess)"
-                elif shared.estop_request.value:
-                    _exit_reason = "e-stop (subprocess)"
-                else:
-                    _exit_reason = "FAULT set by subprocess"
-                logger.error("%s — FAULT", _exit_reason)
-                break
+    transition(shared, SafetyState.DISARMED)
 
-            # 2. Error state (sticky latch from arm/hand)
-            if shared.error_state.value:
-                _exit_reason = "error_state set"
-                logger.error("%s — FAULT", _exit_reason)
-                transition(shared, SafetyState.FAULT)
-                break
+    # Post-loop: offer return_home on normal exit.
+    # Skip when Policy initiated the quit (quit_requested=True) — Policy
+    # already handled the [H] return_home / [Q] quit prompt while all
+    # processes were still alive.
+    if normal_exit and not shared.error_state.value and not shared.quit_requested.value:
+        _post_loop_home(shared)
 
-            # 3. Heartbeat timeouts
-            now = time.monotonic()
-            for name in PROC_NAMES:
-                last_hb = float(HEARTBEAT_FIELDS[name].value)
-                age_s = now - last_hb if last_hb > 0 else float("inf")
-                timeout_s = float(safety.heartbeat_timeouts[name])
-                if age_s > timeout_s:
-                    _exit_reason = f"heartbeat={name} timeout={age_s:.1f}s>{timeout_s:.1f}s"
-                    logger.error("%s — FAULT", _exit_reason)
-                    transition(shared, SafetyState.FAULT)
-                    break
-            if shared.safety_state.value == int(SafetyState.FAULT):
-                break
+    shutdown_processes(shared, procs)
 
-            # 4. Periodic supervisor heartbeat (~every 30s)
-            if now - _last_status_s >= 30.0:
-                _runtime_m = (now - _start_time) / 60.0
-                _safety = shared.safety_state.value
-                _hb_ages = ", ".join(f"{n}={now - float(HEARTBEAT_FIELDS[n].value):.1f}s" for n in PROC_NAMES)
-                print(f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})", flush=True)
-                _last_status_s = now
-
-            time.sleep(0.1)  # 10Hz supervisor
-
-    except KeyboardInterrupt:
-        _exit_reason = "KeyboardInterrupt"
-        normal_exit = True
-        shared.is_running.value = False
-    finally:
-        transition(shared, SafetyState.DISARMED)
-
-        # Post-loop: offer return_home on normal exit
-        # Skip when Policy initiated the quit (quit_requested=True) — Policy
-        # already handled the [H] return_home / [Q] quit prompt while all
-        # processes were still alive.
-        if normal_exit and not shared.error_state.value and not shared.quit_requested.value:
-            _post_loop_home(shared)
-
-        shutdown_processes(shared, procs)
-
-        # Exit summary
-        _runtime_m = (time.monotonic() - _start_time) / 60.0
-        _final_safety = shared.safety_state.value
-        print(f"\n── Session End ──")
-        print(
-            f"  exit_reason={_exit_reason}  runtime={_runtime_m:.1f}min  "
-            f"safety={_final_safety}  normal={normal_exit}"
-        )
-        print("──")
+    # Exit summary
+    _runtime_m = (time.monotonic() - _start_time) / 60.0
+    _final_safety = shared.safety_state.value
+    print(f"\n── Session End ──")
+    print(
+        f"  exit_reason={_exit_reason}  runtime={_runtime_m:.1f}min  "
+        f"safety={_final_safety}  normal={normal_exit}"
+    )
+    print("──")
 
 
 def _post_loop_home(shared: SharedStorage) -> None:
@@ -308,24 +239,12 @@ def _post_loop_home(shared: SharedStorage) -> None:
                     # hand_loop is still running (is_running not set yet).
                     hand_home_converge(shared, HAND_HOME_QPOS, heartbeat=False, check_is_running=False, verbose=True)
 
-                    # Step 2: Arm home
-                    # Planner/policy process has already exited — no collision model
-                    # available.  plan_joint_home_path with planner=None provides
-                    # equivalent-joint wrapping + dense interpolation but NO collision
-                    # checking.  Best-effort only: on Ctrl+C the arm process typically
-                    # exits before we reach here.
-                    try:
-                        _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                        _cur_as = read_arm_state(shared)
-                        _cur_qpos = _home_qpos.copy()
-                        if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
-                            _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
-                        _waypoints = plan_joint_home_path(_cur_qpos, _home_qpos, planner=None)
-                        shared.arm_action_q.put((HOME_SENTINEL, _waypoints), timeout=2.0)
-                    except Exception:
-                        print("  arm_action_q put failed — arm may have already exited")
-                        break
-                    wait_for_arm_home(shared, _home_qpos, timeout_s=10.0, tol_rad=np.deg2rad(2.0))
+                    # Step 2: Arm home — no planner available post-exit.
+                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+                    send_arm_home(
+                        shared, _home_qpos,
+                        planner=None, heartbeat=False, converge_timeout_s=10.0, verbose=True,
+                    )
                     print("  [Q] quit")
                 if sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
                     break

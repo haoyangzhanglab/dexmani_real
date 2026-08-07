@@ -37,13 +37,13 @@ from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.config.defaults import arm, policy
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.path_utils import plan_joint_home_path, wrap_nearest_equivalent
+from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import HOME_SENTINEL, SharedStorage, shutdown_processes, wait_for_arm_home, wait_subsystem_ready
+from dexmani_real.shm.shared_storage import SharedStorage, send_arm_home, shutdown_processes, wait_for_arm_home, wait_subsystem_ready
 from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
@@ -287,26 +287,16 @@ def main():
                 _homed_during_session = True
                 elapsed = time.perf_counter() - start_time
                 print(f"\n[T+{elapsed:.0f}s f={loop_count}] [R] return_home", flush=True)
-                # Plan collision-safe path to home (same as VR policy)
                 _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                _waypoints = plan_joint_home_path(
-                    arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                send_arm_home(
+                    shared, _home_qpos,
+                    planner=planner, table_z_surface_m=arm.table_z_surface_m,
+                    current_qpos=arm_qpos, heartbeat=False, verbose=True,
                 )
-                if _waypoints is not None and len(_waypoints) > 0:
-                    print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
-                elif _waypoints is not None and len(_waypoints) == 0:
-                    print(f"  home  NO SAFE PATH — holding position", flush=True)
-                else:
-                    print(f"  home  already close to home", flush=True)
-                shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
                 _prev_ema_pos = _prev_ema_quat = None
                 consecutive_divergence = 0
                 error_count = 0
-                # Wait for homing to converge, then refresh state from ring.
-                _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                _converged = wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
-                if not _converged:
-                    print("  home  wait timeout — continuing", flush=True)
+                # Refresh state from ring after homing.
                 _arm_result = shared.arm_state_ring.read_latest()
                 if _arm_result is not None:
                     _ad, _, _ = _arm_result
@@ -595,32 +585,12 @@ def main():
             print("\n[R] return_home  [Q] quit")
             while True:
                 if keys.is_pressed("r"):
-                    # Read current arm state for path planning
-                    _arm_result = shared.arm_state_ring.read_latest()
-                    if _arm_result is not None:
-                        _ad, _, _ = _arm_result
-                        _arm_qpos = np.asarray(_ad["qpos"][0], dtype=np.float64)
-                        _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                        _waypoints = plan_joint_home_path(
-                            _arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
-                        )
-                        if _waypoints is not None and len(_waypoints) > 0:
-                            print(f"  home  path={len(_waypoints)} waypoints  collision-free", flush=True)
-                        elif _waypoints is not None and len(_waypoints) == 0:
-                            print(f"  home  NO SAFE PATH — holding position", flush=True)
-                        else:
-                            print(f"  home  already close to home", flush=True)
-                        shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
-                    else:
-                        # Arm state ring has no valid frame — can't plan a path.
-                        # _planned_homing will read the current position from the
-                        # arm SDK directly and do its own wrapping + interpolation.
-                        print("  home  arm state unavailable — falling back to SDK-based homing", flush=True)
-                        shared.arm_action_q.put((HOME_SENTINEL, None))
-                    _home_arr = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                    _converged = wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
-                    if not _converged:
-                        print("  home  wait timeout — continuing", flush=True)
+                    _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
+                    send_arm_home(
+                        shared, _home_qpos,
+                        planner=planner, table_z_surface_m=arm.table_z_surface_m,
+                        heartbeat=False, verbose=True,
+                    )
                     print("[Q] quit")
                 if keys.is_pressed("q") or keys.is_pressed("esc"):
                     break

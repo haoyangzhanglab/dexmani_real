@@ -73,7 +73,6 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.robot.arm_loop import ArmLoopConfig
@@ -81,13 +80,13 @@ from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
-    HOME_SENTINEL,
     SharedStorage,
     SharedStorageConfig,
     hand_home_converge,
     read_arm_state,
     read_arm_state_dict,
     read_hand_state_dict,
+    send_arm_home,
     shutdown_processes,
     wait_for_arm_home,
     wait_subsystem_ready,
@@ -749,7 +748,8 @@ class TrajectoryReplayer:
         if max_dev <= self.JOINT_ALIGN_MAX_DEG:
             return arm_qpos
 
-        assert self._planner is not None
+        if self._planner is None:
+            raise RuntimeError("TrajectoryReplayer: _planner is None — call load() first")
 
         print(f"\nArm is {max_dev:.1f}° from trajectory start (threshold: {self.JOINT_ALIGN_MAX_DEG}°)")
         print("Planning collision-checked approach to trajectory start ...")
@@ -1390,22 +1390,14 @@ Control keys:
 
                         # ── Step 2: Arm home (collision-checked path) ──
                         _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                        _cur_as = read_arm_state(shared)
-                        _cur_qpos = _home_arr.copy()
-                        if _cur_as is not None and np.all(np.isfinite(_cur_as["qpos"][0])):
-                            _cur_qpos = np.asarray(_cur_as["qpos"][0], dtype=np.float64)
                         from dexmani_real.config.defaults import arm as _arm_defaults
 
-                        _waypoints = plan_joint_home_path(
-                            _cur_qpos,
-                            _home_arr,
-                            replayer._planner,
+                        send_arm_home(
+                            shared, _home_arr,
+                            planner=replayer._planner,
                             table_z_surface_m=_arm_defaults.table_z_surface_m,
+                            heartbeat=False, verbose=True,
                         )
-                        if _waypoints is not None and len(_waypoints) == 0:
-                            print("  arm: NO SAFE PATH to home — holding position", flush=True)
-                        shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
-                        wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
                         print("Press Q to exit...")
             finally:
                 kb.stop()

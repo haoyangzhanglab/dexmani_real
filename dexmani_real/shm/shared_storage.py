@@ -83,9 +83,12 @@ HAND_STATE_DTYPE = np.dtype(
         ("error_state", "<u1"),
         ("connected", "<u1"),
         ("qpos_stale", "<u1"),
+        ("commboard_err", "<i4", (12,)),
+        ("jointboard_err", "<i4", (12,)),
+        ("tipboard_err", "<i4", (12,)),
         ("timestamp", "<f8"),
     ]
-)  # 328 bytes (no tactile_force — that's in hand_tactile_ring)
+)  # 472 bytes (no tactile_force — that's in hand_tactile_ring)
 
 HAND_CMD_DTYPE = np.dtype(
     [
@@ -441,6 +444,7 @@ def wait_for_arm_home(
     *,
     timeout_s: float = 20.0,
     tol_rad: float = 0.03,
+    heartbeat: bool = False,
     verbose: bool = True,
 ) -> bool:
     """Poll arm_state_ring until qpos converges to *home_qpos* or timeout.
@@ -450,10 +454,15 @@ def wait_for_arm_home(
     finishes with ``set_servo_angle(home_qpos)``, so joints converge to the
     canonical home position.
 
+    If *heartbeat* is True, ticks ``policy_heartbeat_s`` on every poll so the
+    supervisor does not FAULT during homing (required inside policy_loop).
+
     Returns True if home is reached, False on timeout.
     """
     _deadline = time.monotonic() + timeout_s
     while time.monotonic() < _deadline:
+        if heartbeat:
+            shared.policy_heartbeat_s.value = time.monotonic()
         _as = read_arm_state(shared)
         if _as is not None:
             _q = np.asarray(_as["qpos"][0], dtype=np.float64)
@@ -466,6 +475,157 @@ def wait_for_arm_home(
     if verbose:
         print(f"  arm: home settle timeout ({timeout_s:.0f}s)", flush=True)
     return False
+
+
+def send_arm_home(
+    shared: "SharedStorage",
+    home_qpos: "np.ndarray",
+    *,
+    planner: "Any | None" = None,
+    table_z_surface_m: float = 0.0,
+    current_qpos: "np.ndarray | None" = None,
+    queue_timeout: float = 2.0,
+    converge_timeout_s: float = 15.0,
+    heartbeat: bool = True,
+    verbose: bool = True,
+) -> bool:
+    """Send arm to home via collision-safe path and wait for convergence.
+
+    Encapsulates the full home sequence used by all entry points:
+    1. Read current qpos (from *current_qpos* or ``arm_state_ring``).
+    2. Plan collision-safe path via ``plan_joint_home_path``.
+    3. Queue ``(HOME_SENTINEL, waypoints)`` to ``arm_action_q``.
+    4. Wait for convergence via ``wait_for_arm_home``.
+
+    If *planner* is None (post-exit callers), uses equivalent-joint wrapping
+    without collision checking.
+
+    Returns True if home reached, False on timeout or error.
+    """
+    from dexmani_real.planning.path_utils import plan_joint_home_path
+
+    # ── Step 1: resolve current qpos ──
+    if current_qpos is None:
+        _as = read_arm_state(shared)
+        current_qpos = home_qpos.copy()
+        if _as is not None and np.all(np.isfinite(_as["qpos"][0])):
+            current_qpos = np.asarray(_as["qpos"][0], dtype=np.float64)
+
+    # ── Step 2: plan collision-safe path ──
+    try:
+        _waypoints = plan_joint_home_path(
+            current_qpos, home_qpos, planner, table_z_surface_m=table_z_surface_m
+        )
+    except Exception:
+        if verbose:
+            print("  arm: home path planning failed — falling back to direct home", flush=True)
+        _waypoints = None
+
+    # ── Step 3: queue HOME_SENTINEL ──
+    try:
+        shared.arm_action_q.put((HOME_SENTINEL, _waypoints), timeout=queue_timeout)
+    except Exception:
+        if verbose:
+            print("  arm_action_q put failed — arm may have already exited", flush=True)
+        return False
+
+    # ── Step 4: wait for convergence ──
+    return wait_for_arm_home(
+        shared, home_qpos, timeout_s=converge_timeout_s,
+        tol_rad=np.deg2rad(2.0), heartbeat=heartbeat, verbose=verbose,
+    )
+
+
+def run_supervisor(
+    shared: "SharedStorage",
+    procs: "list",
+    proc_names: "list[str]",
+    heartbeat_fields: "dict[str, Any]",
+    *,
+    status_interval_s: float = 30.0,
+) -> "tuple[str, bool]":
+    """Run the standard 10 Hz supervisor loop — monitors process health, error state, and heartbeats.
+
+    Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
+    supervisor stopped; *normal_exit* is True for user-requested clean exits
+    (Q key or KeyboardInterrupt), False for faults.
+
+    The caller should have already transitioned to ARMED before calling this
+    and must handle shutdown + DISARMED transition after it returns.
+    """
+    import time as _time
+
+    from dexmani_real.config.defaults import safety
+    from dexmani_real.robot.safety import SafetyState, transition
+
+    _start_time = _time.monotonic()
+    _last_status_s = _start_time
+    _exit_reason = "unknown"
+    normal_exit = False
+
+    try:
+        while True:
+            # 0. Normal exit — Policy set is_running=False (Q key).
+            if not shared.is_running.value:
+                normal_exit = True
+                _exit_reason = "is_running=False (Q key)"
+                break
+
+            # 1. Process aliveness.
+            for _p, _name in zip(procs, proc_names):
+                if not _p.is_alive():
+                    _exit_reason = f"process={_name} died"
+                    transition(shared, SafetyState.FAULT)
+                    break
+            if shared.safety_state.value == int(SafetyState.FAULT):
+                if shared.error_state.value:
+                    _exit_reason = "error_state set (subprocess)"
+                elif shared.estop_request.value:
+                    _exit_reason = "e-stop (subprocess)"
+                else:
+                    _exit_reason = "FAULT set by subprocess"
+                break
+
+            # 2. Error state (sticky latch from arm/hand).
+            if shared.error_state.value:
+                _exit_reason = "error_state set"
+                transition(shared, SafetyState.FAULT)
+                break
+
+            # 3. Heartbeat timeouts.
+            _now = _time.monotonic()
+            for _name in proc_names:
+                _last_hb = float(heartbeat_fields[_name].value)
+                _age_s = _now - _last_hb if _last_hb > 0 else float("inf")
+                _timeout_s = float(safety.heartbeat_timeouts[_name])
+                if _age_s > _timeout_s:
+                    _exit_reason = f"heartbeat={_name} timeout={_age_s:.1f}s>{_timeout_s:.1f}s"
+                    transition(shared, SafetyState.FAULT)
+                    break
+            if shared.safety_state.value == int(SafetyState.FAULT):
+                break
+
+            # 4. Periodic status print.
+            if _now - _last_status_s >= status_interval_s:
+                _runtime_m = (_now - _start_time) / 60.0
+                _safety = shared.safety_state.value
+                _hb_ages = ", ".join(
+                    f"{n}={_now - float(heartbeat_fields[n].value):.1f}s" for n in proc_names
+                )
+                print(
+                    f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})",
+                    flush=True,
+                )
+                _last_status_s = _now
+
+            _time.sleep(0.1)  # 10 Hz
+
+    except KeyboardInterrupt:
+        _exit_reason = "KeyboardInterrupt"
+        normal_exit = True
+        shared.is_running.value = False
+
+    return _exit_reason, normal_exit
 
 
 def wait_subsystem_ready(

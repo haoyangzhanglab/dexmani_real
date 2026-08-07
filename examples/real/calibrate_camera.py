@@ -58,16 +58,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
-    HOME_SENTINEL,
     SharedStorage,
     SharedStorageConfig,
     read_arm_state_dict,
+    send_arm_home,
     shutdown_processes,
     wait_for_arm_home,
     wait_subsystem_ready,
@@ -795,21 +794,11 @@ def main():
             if keys.is_pressed("r"):
                 print("\n  R: return_home")
                 _home_qpos = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                _waypoints = plan_joint_home_path(
-                    arm_qpos, _home_qpos, planner, table_z_surface_m=arm.table_z_surface_m
+                send_arm_home(
+                    shared, _home_qpos,
+                    planner=planner, table_z_surface_m=arm.table_z_surface_m,
+                    current_qpos=arm_qpos, heartbeat=False, verbose=True,
                 )
-                if _waypoints is not None and len(_waypoints) > 0:
-                    print(f"  planned homing: {len(_waypoints)} waypoints (路径安全无碰撞)")
-                elif _waypoints is not None and len(_waypoints) == 0:
-                    print(f"  planned homing: NO SAFE PATH — holding position")
-                else:
-                    print(f"  planned homing: already close to home")
-                shared.arm_action_q.put((HOME_SENTINEL, _waypoints))
-                # Wait for qpos to converge to home (arm stays there after homing).
-                _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                _home_ok = wait_for_arm_home(shared, _home_arr, timeout_s=20.0)
-                if not _home_ok:
-                    print("  home wait timeout — continuing", flush=True)
                 # Re-sync after homing
                 _as = read_arm_state_dict(shared)
                 if _as is not None and np.all(np.isfinite(_as["qpos"])):

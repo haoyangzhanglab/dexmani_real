@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Standalone vendor diagnostic — uses raw xhand_controller SDK, not dexmani_real architecture.
 import math
 import sys

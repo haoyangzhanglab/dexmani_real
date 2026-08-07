@@ -466,7 +466,8 @@ class EpisodeQuality:
         rgb_data = None
         if not cam_keys:
             try:
-                assert self._reader is not None
+                if self._reader is None:
+                    raise RuntimeError("EpisodeQualityChecker: _reader is None")
                 rgb_data = self._reader.read_camera_all("rgb")
                 cam_keys.append("rgb")
             except KeyError:
@@ -689,7 +690,8 @@ class EpisodeQuality:
 
         # Camera freshness
         try:
-            assert self._reader is not None
+            if self._reader is None:
+                raise RuntimeError("EpisodeQualityChecker: _reader is None")
             rgb = self._reader.read_camera_all("rgb")
             sample = rgb[: min(10, rgb.shape[0])]
             all_zero = all(np.count_nonzero(frame) == 0 for frame in sample)

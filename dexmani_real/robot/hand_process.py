@@ -10,6 +10,7 @@ import numpy as np
 from dexmani_real.config.defaults import hand
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.retry import RetryCounter
 
 logger = get_logger(__name__)
 
@@ -48,7 +49,12 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     try:
         from dexmani_real.robot.xhand import XHand, XHandConfig
 
-        hand = XHand(XHandConfig())
+        # Per-joint tor_max: index abduction (J3) handles sideways load,
+        # benefit from higher current limit (380 vs default 300 mA).
+        _tor_max_pj = np.full(12, 300, dtype=np.int32)
+        _tor_max_pj[3] = 380
+
+        hand = XHand(XHandConfig(tor_max_per_joint=_tor_max_pj))
         if not hand.connect():
             logger.error("hand_loop: connect failed")
             shared.hand_ready.set()
@@ -106,6 +112,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _frame0["error_state"][0] = 0
     _frame0["connected"][0] = 1
     _frame0["qpos_stale"][0] = 0
+    _frame0["commboard_err"][0] = np.zeros(12, dtype=np.int32)
+    _frame0["jointboard_err"][0] = np.zeros(12, dtype=np.int32)
+    _frame0["tipboard_err"][0] = np.zeros(12, dtype=np.int32)
     _frame0["timestamp"][0] = time.monotonic()
     shared.hand_state_ring.write(_frame0)
 
@@ -119,7 +128,8 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
     rate_mgr = RateManager(cfg.loop_hz)
     last_cmd_seq = 0
-    consecutive_send_errors = 0
+    _send_error_counter = RetryCounter(max_consecutive=cfg.send_err_watchdog_frames, label="hand_send")
+    _error_state_counter = RetryCounter(max_consecutive=5, label="hand_error_state")
     _last_clear_error_s = 0.0
 
     # Qpos freshness detection (driver board lockout guard)
@@ -127,11 +137,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _last_fresh_qpos: np.ndarray | None = None
     last_known_qpos: np.ndarray = np.zeros(12, dtype=np.float64)
 
-    # Error-state retry: hand comm errors are frequently intermittent and
-    # self-recovering (same design rationale as send-error watchdog).
-    # Try clear_error() up to N times before escalating to global error_state.
-    _consecutive_error_states = 0
-    _ERROR_STATE_RETRY_MAX = 5
     _last_error_clear_s = 0.0
 
     while shared.is_running.value:
@@ -155,19 +160,19 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     if np.all(np.isfinite(cmd)):
                         try:
                             hand.send_action(cmd)
-                            consecutive_send_errors = 0
+                            _send_error_counter.reset()
                         except Exception:
-                            consecutive_send_errors += 1
+                            _send_error_counter.inc()
                             logger.warning(
-                                "hand_loop: send_action failed (consecutive=%d)", consecutive_send_errors, exc_info=True
+                                "hand_loop: send_action failed (consecutive=%d)", _send_error_counter.count, exc_info=True
                             )
                         last_cmd_seq = seq_int
 
             # Send-error watchdog: auto clear_error() after consecutive failures.
-            if consecutive_send_errors >= cfg.send_err_watchdog_frames:
+            if _send_error_counter.triggered:
                 _now = time.monotonic()
                 if _now - _last_clear_error_s > 2.0:
-                    logger.warning("hand_loop: %d consecutive send errors — clear_error()", consecutive_send_errors)
+                    logger.warning("hand_loop: %d consecutive send errors — clear_error()", _send_error_counter.count)
                     try:
                         hand.clear_error()
                     except Exception:
@@ -193,6 +198,13 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             connected = hand.connected_flag
             error_state = hand.error_state
             last_known_qpos = qpos.copy()
+            # Board error registers (per-joint hardware fault indicators).
+            _raw_cbe = st.get("commboard_err")
+            commboard_err = np.asarray(_raw_cbe if _raw_cbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32)
+            _raw_jbe = st.get("jointboard_err")
+            jointboard_err = np.asarray(_raw_jbe if _raw_jbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32)
+            _raw_tbe = st.get("tipboard_err")
+            tipboard_err = np.asarray(_raw_tbe if _raw_tbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32)
         except Exception:
             logger.warning("hand_loop: get_state failed", exc_info=True)
             qpos = last_known_qpos.copy()
@@ -202,6 +214,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             tactile_contact = np.zeros(5, dtype=bool)
             connected = False
             error_state = False  # transient comm glitch — do NOT fabricate error_state
+            commboard_err = np.zeros(12, dtype=np.int32)
+            jointboard_err = np.zeros(12, dtype=np.int32)
+            tipboard_err = np.zeros(12, dtype=np.int32)
 
         # Detect stale qpos (driver board lockout)
         if not connected:
@@ -220,33 +235,33 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         qpos_stale = _stale_frames >= cfg.stale_qpos_frame_limit
 
         # Error-state retry: hand comm errors are frequently intermittent and
-        # self-recovering.  Try clear_error() up to _ERROR_STATE_RETRY_MAX times
-        # before escalating to global error_state + FAULT.
+        # self-recovering.  Try clear_error() up to N times before escalating
+        # to global error_state + FAULT.
         # (Same design rationale as send-error watchdog — ref: Hand Comm Error
         # Handling Policy memory.)
         if error_state and not shared.error_state.value:
-            _consecutive_error_states += 1
+            _error_state_counter.inc()
             _now_err = time.monotonic()
             if _now_err - _last_error_clear_s > 1.0:
                 logger.warning(
                     "hand_loop: hand error_state — clear_error() (%d/%d consecutive)",
-                    _consecutive_error_states,
-                    _ERROR_STATE_RETRY_MAX,
+                    _error_state_counter.count,
+                    _error_state_counter.max_consecutive,
                 )
                 try:
                     hand.clear_error()
                 except Exception:
                     logger.warning("hand_loop: clear_error() failed", exc_info=True)
                 _last_error_clear_s = _now_err
-            if _consecutive_error_states >= _ERROR_STATE_RETRY_MAX:
+            if _error_state_counter.triggered:
                 shared.error_state.value = True
                 transition(shared, SafetyState.FAULT)
                 logger.error(
-                    "hand_loop: hand error_state persisted after %d retries — " "setting global error_state + FAULT",
-                    _ERROR_STATE_RETRY_MAX,
+                    "hand_loop: hand error_state persisted after %d retries — setting global error_state + FAULT",
+                    _error_state_counter.max_consecutive,
                 )
         elif not error_state:
-            _consecutive_error_states = 0
+            _error_state_counter.reset()
 
         # Publish state
         frame = _nf(_HS_STATE)
@@ -257,6 +272,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         frame["error_state"][0] = int(error_state)
         frame["connected"][0] = int(connected)
         frame["qpos_stale"][0] = int(qpos_stale)
+        frame["commboard_err"][0] = commboard_err
+        frame["jointboard_err"][0] = jointboard_err
+        frame["tipboard_err"][0] = tipboard_err
         frame["timestamp"][0] = time.monotonic()
         shared.hand_state_ring.write(frame)
 

@@ -208,7 +208,9 @@ class RealSense:
         if cfg is None or not cfg.enabled:
             return
 
-        assert self.profile is not None  # _apply_depth_config dispatcher guards this
+        if self.profile is None:
+            logger.warning("RealSense: profile is None — cannot apply depth config")
+            return
         sensor = self.profile.get_device().first_depth_sensor()
 
         options: list[tuple[rs.option, float]] = [

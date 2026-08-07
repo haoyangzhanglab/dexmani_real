@@ -77,7 +77,7 @@ VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik →
 | `arm_action_q` | mp.Queue(maxsize=2) | Policy → Arm | Ordered, bounded backpressure |
 | `hand_cmd_ring` | SeqlockRingBuffer(8) | Policy → Hand | Latest-wins (position servo) |
 | `arm_state_ring` | SeqlockRingBuffer(8) | Arm → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~265B) |
-| `hand_state_ring` | SeqlockRingBuffer(8) | Hand → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~328B, no tactile_force) |
+| `hand_state_ring` | SeqlockRingBuffer(8) | Hand → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~472B, no tactile_force) |
 | `hand_tactile_ring` | SeqlockRingBuffer(8) | Hand → Policy | Sparse writes (~14.4KB, only on contact) |
 | `vr_ring` | SeqlockRingBuffer(8) | VR → Policy | ~600B/frame |
 | `camera_ring` | CameraRingBuffer(5) | Camera → Policy | ~1.5MB/frame |
@@ -106,7 +106,7 @@ camera_loop(shared)         # Main — bridges frames from CameraSession → sha
 ### Core Types (`robot/types.py`)
 
 - **`ArmState`** — `qpos(7) qvel(7) tau(7) eef_pos(3) eef_rot6d(6) error_code connected mode tracking_err timestamp` (~294B, from arm_state_ring; eef via Pinocchio ArmFK in arm_loop, tracking_err = max|qpos - last_target|)
-- **`HandState`** — `qpos(12) current(12) tactile_sum(5,3) tactile_contact(5) error_state connected timestamp` (328B, from hand_state_ring)
+- **`HandState`** — `qpos(12) current(12) tactile_sum(5,3) tactile_contact(5) error_state connected qpos_stale commboard_err(12) jointboard_err(12) tipboard_err(12) timestamp` (472B, from hand_state_ring)
 - **`HandTactile`** — `tactile_force(5,120,3)` (14.4KB, from hand_tactile_ring, sparse)
 - **`RobotState`** — legacy 22-field monolithic state (Policy assembles from ArmState+HandState+HandTactile for recording)
 - **`RobotAction`** — `arm_qpos_cmd(7) hand_qpos_cmd(12)` + optional `target_eef_pos/rot6d`

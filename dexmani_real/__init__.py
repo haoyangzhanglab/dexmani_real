@@ -11,6 +11,8 @@ Subsystems:
     utils/      — Shared utilities (arrays, signals, coordinate transforms, point clouds)
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).parent.resolve()

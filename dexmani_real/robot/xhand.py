@@ -160,7 +160,11 @@ class XHandConfig:
     kp_per_joint: np.ndarray | None = None  # (12,) per-joint kp overrides
     ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
     kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
-    tor_max: int = 320  # max 320mA
+    tor_max: int = 300  # max 300mA (per-joint default)
+    # Per-joint tor_max overrides. When set (shape (12,)), individual joint
+    # current limits replace the scalar tor_max.  Index abduction (J3) benefits
+    # from higher current to compensate for sideways loading.
+    tor_max_per_joint: np.ndarray | None = None  # (12,) per-joint tor_max overrides
     mode: int = 3
 
     clip_joint_limit: bool = True
@@ -444,11 +448,18 @@ class XHand:
         reset before data is reported.  This is called once at connect time;
         individual sensor failures are logged but are non-fatal.
 
-        After hardware reset, computes a software bias from 5 fresh readings
-        (ref: pi-r2-flow xhand_robot.py:285-299) to compensate for the vendor's
-        residual offset (~5--30 N).  The bias is stored on the instance and
-        subtracted in ``parse_tactile()`` / ``parse_tactile_sum()`` so that
-        no-contact readings are zeroed.
+        Adds an outer verify-retry loop (ref: pi-r2-flow xhand_robot.py:252-326):
+        after reset, raw force magnitudes are checked — sensors still above
+        2.0 N are selectively re-reset (up to 5 total iterations).  This
+        handles the known issue where a single ``reset_sensor()`` call leaves
+        a residual offset of ~5--30 N on some sensors (see also
+        [[tactile-p0-c1-reset-sensor]]).
+
+        After hardware reset converges (or exhausts retries), a software bias
+        is computed from 5 fresh readings to compensate for any remaining
+        vendor offset.  The bias is stored on the instance and subtracted in
+        ``parse_tactile()`` / ``parse_tactile_sum()`` so that no-contact
+        readings are zeroed.
 
         The C++ SDK (libxhand_control.so) prints "Unknow Cmd!" to stdout for
         each ``reset_sensor()`` call when the hand firmware does not recognise
@@ -458,18 +469,75 @@ class XHand:
             return
         device_id = self.config.device_id
 
-        for sensor_id in range(17, 22):  # 17=thumb, 18=index, 19=middle, 20=ring, 21=little
-            try:
-                err = self.control.reset_sensor(device_id, sensor_id)
-                if not self.error_ok(err):
+        MAX_OUTER_ITERS = 5
+        VERIFY_THRESH_N = 2.0
+        FINGER_LABELS = ["thumb", "index", "middle", "ring", "pinky"]
+
+        bad_indices: list[int] = list(range(5))  # 0=thumb … 4=pinky
+        _last_mags: np.ndarray | None = None  # cached for else-clause diagnostics
+
+        for outer in range(MAX_OUTER_ITERS):
+            # ── Reset only sensors that still have residual offset ──
+            for idx in bad_indices:
+                sensor_id = 17 + idx
+                for attempt in range(3):
+                    try:
+                        err = self.control.reset_sensor(device_id, sensor_id)
+                        if self.error_ok(err):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                else:
                     logger.warning(
-                        "Tactile sensor %d reset failed: code=%s msg=%s",
+                        "Tactile sensor %d (%s) reset failed after 3 attempts",
                         sensor_id,
-                        self.error_code(err),
-                        str(getattr(err, "error_message", "")),
+                        FINGER_LABELS[idx],
                     )
-            except Exception:
-                logger.warning("Tactile sensor %d reset raised exception", sensor_id, exc_info=True)
+
+            # ── Verify: read fresh state (before bias) and check force magnitudes ──
+            err, hand_state = self._unpack_result(
+                self.control.read_state(device_id, True)  # force_update=True
+            )
+            if not self.error_ok(err):
+                logger.warning(
+                    "Tactile verify read failed (iter %d/%d, code=%s) — retrying all sensors",
+                    outer + 1,
+                    MAX_OUTER_ITERS,
+                    self.error_code(err),
+                )
+                continue  # retry all sensors next iteration
+
+            force_sum = self.parse_tactile_sum(hand_state)  # raw — bias is None during init
+            mags = np.linalg.norm(force_sum, axis=1)  # (5,) — |F| per finger
+            _last_mags = mags
+
+            new_bad = [i for i in bad_indices if mags[i] > VERIFY_THRESH_N]
+            if not new_bad:
+                break  # all previously-bad sensors now within threshold
+
+            if outer < MAX_OUTER_ITERS - 1:
+                _labels = [FINGER_LABELS[i] for i in new_bad]
+                _max_mag = max(float(mags[i]) for i in new_bad)
+                logger.warning(
+                    "Tactile verify-retry %d/%d: %s still > %.1f N (max %.2f N)",
+                    outer + 1,
+                    MAX_OUTER_ITERS,
+                    ", ".join(_labels),
+                    VERIFY_THRESH_N,
+                    _max_mag,
+                )
+            bad_indices = new_bad
+        else:
+            _labels = [FINGER_LABELS[i] for i in bad_indices]
+            _max_mag = max(float(_last_mags[i]) for i in bad_indices) if _last_mags is not None else float("nan")
+            logger.warning(
+                "Tactile bias non-zero after %d retries: %s (max %.2f N) — "
+                "software bias will compensate for residual offset",
+                MAX_OUTER_ITERS,
+                ", ".join(_labels),
+                _max_mag,
+            )
 
         # ── Software bias computation (ref: pi-r2-flow xhand_robot.py:285-299) ──
         # The vendor's reset_sensor() alone leaves a residual offset of ~5-30 N
@@ -887,7 +955,7 @@ class XHand:
             cmd.ki = int(self.config.ki_per_joint[i]) if self.config.ki_per_joint is not None else int(ki)
             cmd.kd = int(self.config.kd_per_joint[i]) if self.config.kd_per_joint is not None else int(kd)
             cmd.position = float(qpos[i])
-            cmd.tor_max = int(tor_max)
+            cmd.tor_max = int(self.config.tor_max_per_joint[i]) if self.config.tor_max_per_joint is not None else int(tor_max)
             cmd.mode = int(mode)
             cmd.res0 = 0
             cmd.res1 = 0
@@ -911,6 +979,7 @@ class XHand:
         finger_ids = np.full(12, -1, dtype=np.int32)
         sensor_ids = np.full(12, -1, dtype=np.int32)
         raw_position = nan_array(12)
+        finger_temperatures = np.zeros(12, dtype=np.float64)
         commboard_err = np.zeros(12, dtype=np.int32)
         jointboard_err = np.zeros(12, dtype=np.int32)
         tipboard_err = np.zeros(12, dtype=np.int32)
@@ -926,6 +995,7 @@ class XHand:
             qpos[idx] = float(getattr(item, "position", np.nan))
             current[idx] = float(getattr(item, "torque", np.nan))
             raw_position[idx] = float(getattr(item, "raw_position", np.nan))
+            finger_temperatures[idx] = float(getattr(item, "temperature", 0.0))
             commboard_err[idx] = int(getattr(item, "commboard_err", 0))
             # SDK misspelling: "jonitboard_err" for "jointboard_err".
             jointboard_err[idx] = int(getattr(item, "jonitboard_err", getattr(item, "jointboard_err", 0)))
@@ -946,12 +1016,25 @@ class XHand:
             "tipboard_err": tipboard_err,
         }
 
+        # Sensor-level diagnostics (ref: DexUMI, pi-r2-flow) — not on the
+        # hot path; only populated when full=True callers request them.
+        sensor_temperatures = np.zeros(5, dtype=np.float64)
+        if full:
+            sensor_data = getattr(hand_state, "sensor_data", None)
+            if sensor_data:
+                for j, sd in enumerate(sensor_data):
+                    if j >= 5:
+                        break
+                    sensor_temperatures[j] = float(getattr(sd, "calc_temperature", 0.0))
+
         if full:
             state.update(
                 {
                     "finger_ids": finger_ids,
                     "sensor_ids": sensor_ids,
                     "raw_position": raw_position,
+                    "finger_temperatures": finger_temperatures,
+                    "sensor_temperatures": sensor_temperatures,
                     "connected_flag": self.connected_flag,
                     "error_state": self.error_state,
                     "last_action_code": self.last_action_code,
@@ -1053,6 +1136,8 @@ class XHand:
             "finger_ids": np.full(12, -1, dtype=np.int32),
             "sensor_ids": np.full(12, -1, dtype=np.int32),
             "raw_position": nan_array(12),
+            "finger_temperatures": np.zeros(12, dtype=np.float64),
+            "sensor_temperatures": np.zeros(5, dtype=np.float64),
             "commboard_err": np.zeros(12, dtype=np.int32),
             "jointboard_err": np.zeros(12, dtype=np.int32),
             "tipboard_err": np.zeros(12, dtype=np.int32),

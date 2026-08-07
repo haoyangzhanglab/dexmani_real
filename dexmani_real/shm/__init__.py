@@ -9,3 +9,5 @@ Public API:
     shutdown_processes, wait_subsystem_ready
     print_health_summary
 """
+
+from __future__ import annotations

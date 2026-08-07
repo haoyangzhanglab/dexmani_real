@@ -1,6 +1,6 @@
 """Centralized defaults — single source of truth for all numeric constants.
 
-Organized as frozen dataclasses with snake_case fields, grouped into logical
+Organized as dataclasses with snake_case fields, grouped into logical
 sub-structures (homing, stale detection, workspace, EMA, etc.).
 
 Module-level singletons (``arm``, ``hand``, ``policy``, ``vr``, ``safety``,
@@ -34,7 +34,7 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class HomingParams:
     """Joint-space linear-interpolation homing parameters."""
 
@@ -44,7 +44,7 @@ class HomingParams:
     target_timeout_s: float = 0.2
 
 
-@dataclass(frozen=True)
+@dataclass
 class WorkspaceBounds:
     """EEF workspace bounds in arm-base frame (meters)."""
 
@@ -71,7 +71,7 @@ class WorkspaceBounds:
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class StaleDetectionParams:
     """Qpos freshness detection (driver board lockout guard)."""
 
@@ -79,7 +79,7 @@ class StaleDetectionParams:
     qpos_delta_rad: float = 1e-4
 
 
-@dataclass(frozen=True)
+@dataclass
 class EMAParams:
     """Cartesian-space EMA smoothing parameters (tuned at 16 Hz, dt=62.5ms).
 
@@ -90,7 +90,7 @@ class EMAParams:
     alpha_rot: float = 0.25  # τ≈223ms — heavy smoothing for wrist jitter
 
 
-@dataclass(frozen=True)
+@dataclass
 class VRMappingParams:
     """VR wrist → EEF mapping parameters."""
 
@@ -105,18 +105,18 @@ class VRMappingParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class ArmParams:
     """xArm7 hardware parameters — single source of truth."""
 
     # ── Home position (rad) — neutral pose ──
     home_qpos: tuple[float, ...] = (
         0.0,  # J1: 0.0°
-        -0.033161,  # J2: -1.9°
-        0.0,  # J3: 0.0°
-        0.235619,  # J4: 13.5°
-        -3.141593,  # J5: -180.0°
-        1.303762,  # J6: 74.7°
+        0.041888,  # J2: 2.4°
+        0.001745,  # J3: 0.1°
+        0.417134,  # J4: 23.9°
+        -3.138102,  # J5: -179.8°
+        1.195551,  # J6: 68.5°
         0.0,  # J7: 0.0°
     )
 
@@ -190,7 +190,7 @@ class ArmParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class HandParams:
     """XHand hardware parameters — single source of truth."""
 
@@ -250,7 +250,7 @@ class HandParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
 
@@ -294,7 +294,7 @@ class PolicyParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class VRParams:
     """VR receiver (HTS) parameters."""
 
@@ -309,7 +309,7 @@ class VRParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
@@ -343,7 +343,7 @@ class SafetyParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
+@dataclass
 class CameraParams:
     """Camera / RealSense parameters."""
 
@@ -404,5 +404,5 @@ def load_config_json(path: str) -> None:
                     f"Field '{k}' of '{name}' is a nested dataclass ({type(current).__name__}) — "
                     f"override not supported via JSON (edit defaults.py)"
                 )
-            object.__setattr__(original, k, v)
+            setattr(original, k, v)
         _log.info("config: %s overridden with %s", name, list(overrides.keys()))

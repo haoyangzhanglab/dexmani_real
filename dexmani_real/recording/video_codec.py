@@ -223,7 +223,8 @@ class VideoDecoder:
         if not self._opened:
             self._open()
         frames: list[np.ndarray] = []
-        assert self._container is not None
+        if self._container is None:
+            raise RuntimeError("VideoDecoder: container is None after _open()")
         self._container.seek(0)  # rewind to start
         # Demux + decode in one pass (no seeking — pure sequential).
         for packet in self._container.demux(self._stream):
@@ -246,7 +247,8 @@ class VideoDecoder:
         """
         if not self._opened:
             self._open()
-        assert self._container is not None
+        if self._container is None:
+            raise RuntimeError("VideoDecoder: container is None after _open()")
         if index < 0 or index >= self._frame_count:
             raise IndexError(f"Frame index {index} out of range [0, {self._frame_count})")
 

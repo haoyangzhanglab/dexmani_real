@@ -18,6 +18,7 @@ from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, HOME_SENTINEL, new_frame
 from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.retry import RetryCounter
 from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
@@ -63,8 +64,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
     _state_read_warn = ThrottledWarner(interval_s=5.0)
-    _consecutive_recoveries = 0
-    _consecutive_state_errors = 0
+    _recovery_counter = RetryCounter(max_consecutive=_RECOVERY_MAX, label="arm_servo")
+    _state_error_counter = RetryCounter(max_consecutive=_RECOVERY_MAX, label="arm_state")
     _tracking_err_count = 0
     cfg = config or ArmLoopConfig()
 
@@ -85,12 +86,57 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         shared.error_state.value = True
         return
 
+    # 3-retry connect recovery (ref: pi-r2-flow xarm_sdk.py:61-81).
+    # Sticky error states (post-collision, E-Stop, power-on race) may need
+    # multiple clear cycles.  Transition through mode 0 first — some firmware
+    # releases require this intermediate state.
+    _CONNECT_MAX_RETRIES = 3
+    for _attempt in range(_CONNECT_MAX_RETRIES):
+        try:
+            arm.clean_error()
+            arm.clean_warn()
+            arm.motion_enable(True)
+            time.sleep(0.3)
+            arm.set_mode(0)
+            time.sleep(0.1)
+            arm.set_state(0)
+            time.sleep(0.3)
+            arm.set_mode(6)
+            time.sleep(0.1)
+            # Live read via get_err_warn_code() — more reliable than the cached
+            # .error_code property (background report thread, ~200ms refresh).
+            try:
+                _rc, _codes = arm.get_err_warn_code()
+                _err = _codes[0] if _rc == 0 else 1
+            except Exception:
+                _err = getattr(arm, "error_code", 0) or 0
+            _state = getattr(arm, "state", -1)
+            if _err == 0 and _state == 2:  # 2 = ready-to-move
+                break
+            logger.warning(
+                "arm_loop: connect recovery attempt %d/%d: err=%s state=%s",
+                _attempt + 1,
+                _CONNECT_MAX_RETRIES,
+                _err,
+                _state,
+            )
+            time.sleep(0.5)
+        except Exception:
+            logger.warning(
+                "arm_loop: connect recovery attempt %d/%d raised exception",
+                _attempt + 1,
+                _CONNECT_MAX_RETRIES,
+                exc_info=True,
+            )
+            time.sleep(0.5)
+    else:
+        logger.error("arm_loop: connect recovery failed after %d attempts", _CONNECT_MAX_RETRIES)
+        shared.error_state.value = True
+        _disconnect_arm(arm)
+        return
+
+    # Post-recovery configuration (only after successful mode-6 transition).
     try:
-        arm.clean_error()
-        arm.clean_warn()
-        arm.motion_enable(True)
-        arm.set_mode(6)
-        arm.set_state(0)
         arm.set_collision_sensitivity(cfg.collision_sensitivity)
         # TCP load: XHand (1.1 kg). COG in tool-flange frame (link_eef) from
         # URDF weighted-COM of all end-effector links; flange_joint2 corrected
@@ -99,29 +145,38 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         # Torque-based collision detection (level 1). Detects impacts but may
         # miss slow contact. Primary table protection: self-collision + z-clearance.
         arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True)
-        if getattr(arm, "mode", -1) != 6:
-            logger.error("arm_loop: failed to set mode 6")
-            shared.error_state.value = True
-            _disconnect_arm(arm)
-            return
     except Exception as e:
-        logger.error("arm_loop: init failed: %s", e)
+        logger.error("arm_loop: post-recovery config failed: %s", e)
         shared.error_state.value = True
         _disconnect_arm(arm)
         return
 
-    # Seed last_qpos — FAIL if initial state unreadable (safety: never cmd HOME_QPOS blind).
-    try:
-        code, states = arm.get_joint_states(is_radian=True, num=1)
-        if code == 0 and len(states) > 0:
-            last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
-        else:
-            logger.error("arm_loop: cannot read initial joint states (code=%d)", code)
-            shared.error_state.value = True
-            _disconnect_arm(arm)
-            return
-    except Exception as e:
-        logger.error("arm_loop: joint states read failed: %s", e)
+    # Seed last_qpos — retry transient comm failures (ref: pi-r2-flow
+    # control_utils.py:181-192 get_obs_retry).  A single failed read during
+    # startup is not a reason to abort the process.
+    _STATE_READ_MAX_RETRIES = 10
+    for _attempt in range(_STATE_READ_MAX_RETRIES):
+        try:
+            code, states = arm.get_joint_states(is_radian=True, num=1)
+            if code == 0 and len(states) > 0:
+                last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
+                break
+            logger.warning(
+                "arm_loop: initial joint state read attempt %d/%d: code=%d",
+                _attempt + 1,
+                _STATE_READ_MAX_RETRIES,
+                code,
+            )
+        except Exception:
+            logger.warning(
+                "arm_loop: initial joint state read attempt %d/%d raised exception",
+                _attempt + 1,
+                _STATE_READ_MAX_RETRIES,
+                exc_info=True,
+            )
+        time.sleep(0.1)
+    else:
+        logger.error("arm_loop: cannot read initial joint states after %d attempts", _STATE_READ_MAX_RETRIES)
         shared.error_state.value = True
         _disconnect_arm(arm)
         return
@@ -161,6 +216,13 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         shared.arm_heartbeat_s.value = time.monotonic()
 
         if shared.estop_request.value:
+            # SDK emergency_stop() is the fastest path to kill motor power.
+            # Fall back to set_state(4) in cleanup if the SDK method is
+            # unavailable or fails (belt-and-suspenders per Xarm7-).
+            try:
+                arm.emergency_stop()
+            except Exception:
+                pass
             break
 
         # Safety state gate — only process commands in ARMED or RUNNING.
@@ -239,15 +301,16 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 if code != 0:
                     err_code = getattr(arm, "error_code", 0)
                     if err_code in _RECOVERABLE_ERRORS:
-                        # C22/C24/C31 — recoverable. Clean error → ready state →
+                        # C22/C24/C31 — recoverable. Clean error + warn → ready state →
                         # re-enter Mode 6. set_state(0) MUST precede set_mode(6).
                         arm.clean_error()
+                        arm.clean_warn()
                         arm.set_state(0)
                         arm.set_mode(6)
-                        _consecutive_recoveries += 1
-                        if _consecutive_recoveries > _RECOVERY_MAX:
+                        _recovery_counter.inc()
+                        if _recovery_counter.triggered:
                             logger.error(
-                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries
+                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _recovery_counter.count
                             )
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
@@ -263,27 +326,28 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                             "arm_loop: set_servo_angle code=%d (no arm error) — attempting mode recovery", code
                         )
                         arm.clean_error()
+                        arm.clean_warn()
                         arm.set_state(0)
                         arm.set_mode(6)
-                        _consecutive_recoveries += 1
-                        if _consecutive_recoveries > _RECOVERY_MAX:
+                        _recovery_counter.inc()
+                        if _recovery_counter.triggered:
                             logger.error(
-                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _consecutive_recoveries
+                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _recovery_counter.count
                             )
                             shared.error_state.value = True
                             transition(shared, SafetyState.FAULT)
                             break
             except Exception:
                 logger.warning("arm_loop: set_servo_angle failed", exc_info=True)
-                _consecutive_recoveries += 1
-                if _consecutive_recoveries > _RECOVERY_MAX:
-                    logger.error("arm_loop: %d consecutive exceptions — escalating to FAULT", _consecutive_recoveries)
+                _recovery_counter.inc()
+                if _recovery_counter.triggered:
+                    logger.error("arm_loop: %d consecutive exceptions — escalating to FAULT", _recovery_counter.count)
                     shared.error_state.value = True
                     transition(shared, SafetyState.FAULT)
                     break
             else:
                 # code == 0: successful send — reset recovery streak
-                _consecutive_recoveries = 0
+                _recovery_counter.reset()
 
         arm_connected = True
         try:
@@ -333,16 +397,17 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             arm_connected = False
 
         if error_code in _RECOVERABLE_ERRORS:
-            _consecutive_state_errors += 1
-            if _consecutive_state_errors > _RECOVERY_MAX:
+            _state_error_counter.inc()
+            if _state_error_counter.triggered:
                 logger.error(
-                    "arm_loop: %d consecutive state-read errors — escalating to FAULT", _consecutive_state_errors
+                    "arm_loop: %d consecutive state-read errors — escalating to FAULT", _state_error_counter.count
                 )
                 shared.error_state.value = True
                 transition(shared, SafetyState.FAULT)
                 break
             try:
                 arm.clean_error()
+                arm.clean_warn()
                 arm.set_state(0)
                 arm.set_mode(6)
             except Exception:
@@ -352,7 +417,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             transition(shared, SafetyState.FAULT)
             break
         else:
-            _consecutive_state_errors = 0
+            _state_error_counter.reset()
 
         # Publish state
         _frame["qpos"][0] = qpos
