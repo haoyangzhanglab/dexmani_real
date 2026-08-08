@@ -23,6 +23,7 @@ Usage::
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,17 @@ logger = get_logger(__name__)
 # Camera dataset keys routed to depth.h5 (new format).
 # "rgb" is handled by VideoDecoder (MP4 sidecar) — not in either HDF5 file.
 _CAM_KEYS = {"depth"}
+
+
+@dataclass(frozen=True)
+class EpisodeTiming:
+    """Normalized timing view for both legacy and schema-v13 episodes."""
+
+    rate_hz: float
+    grid_dt_s: float
+    grid_duration_s: float
+    wall_duration_s: float
+    non_sampled_duration_s: float
 
 
 class MergedH5File:
@@ -133,6 +145,77 @@ class EpisodeReader:
     @property
     def h5_path(self) -> Path:
         return self._path
+
+    @property
+    def timing(self) -> EpisodeTiming:
+        """Return timing with v13 attrs preferred and safe legacy fallbacks.
+
+        Legacy ``fps`` may have been diluted by pauses because it was computed
+        from wall time.  A valid ``control_hz`` or timestamp grid therefore
+        takes precedence over that attribute.
+        """
+        meta = self._h5f.get("meta")
+        attrs = meta.attrs if meta is not None else {}
+
+        def _positive(value: Any) -> float | None:
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                return None
+            return result if np.isfinite(result) and result > 0 else None
+
+        timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64) if "timestamp" in self._h5f else None
+        timestamp_dt_s: float | None = None
+        timestamp_duration_s: float | None = None
+        if timestamps is not None and timestamps.size >= 2:
+            finite = timestamps[np.isfinite(timestamps)]
+            if finite.size >= 2:
+                positive_deltas = np.diff(finite)
+                positive_deltas = positive_deltas[positive_deltas > 0]
+                if positive_deltas.size:
+                    timestamp_dt_s = float(np.median(positive_deltas))
+                span = float(finite[-1] - finite[0])
+                if span >= 0:
+                    timestamp_duration_s = span
+
+        control_hz = _positive(attrs.get("control_hz"))
+        explicit_grid_dt_s = _positive(attrs.get("grid_dt_s"))
+        legacy_fps = _positive(attrs.get("fps"))
+        grid_dt_s = explicit_grid_dt_s or timestamp_dt_s
+        if grid_dt_s is None and control_hz is not None:
+            grid_dt_s = 1.0 / control_hz
+        if grid_dt_s is None and legacy_fps is not None:
+            grid_dt_s = 1.0 / legacy_fps
+        if grid_dt_s is None:
+            grid_dt_s = 1.0 / 16.0
+
+        rate_hz = control_hz or (1.0 / grid_dt_s)
+        explicit_grid_duration_s = attrs.get("grid_duration_s")
+        try:
+            grid_duration_s = float(explicit_grid_duration_s) if explicit_grid_duration_s is not None else float("nan")
+        except (TypeError, ValueError):
+            grid_duration_s = float("nan")
+        if not np.isfinite(grid_duration_s) or grid_duration_s < 0:
+            if timestamp_duration_s is not None:
+                grid_duration_s = timestamp_duration_s
+            else:
+                num_frames = int(attrs.get("num_frames", len(timestamps) if timestamps is not None else 0))
+                grid_duration_s = max(0, num_frames - 1) * grid_dt_s
+
+        wall_duration_s = float(attrs.get("wall_duration_s", attrs.get("duration", grid_duration_s)))
+        if not np.isfinite(wall_duration_s) or wall_duration_s < 0:
+            wall_duration_s = grid_duration_s
+        non_sampled_duration_s = float(attrs.get("non_sampled_duration_s", max(0.0, wall_duration_s - grid_duration_s)))
+        if not np.isfinite(non_sampled_duration_s) or non_sampled_duration_s < 0:
+            non_sampled_duration_s = max(0.0, wall_duration_s - grid_duration_s)
+
+        return EpisodeTiming(
+            rate_hz=rate_hz,
+            grid_dt_s=grid_dt_s,
+            grid_duration_s=grid_duration_s,
+            wall_duration_s=wall_duration_s,
+            non_sampled_duration_s=non_sampled_duration_s,
+        )
 
     # -- camera queries ---------------------------------------------------
 

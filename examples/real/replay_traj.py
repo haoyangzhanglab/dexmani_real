@@ -216,9 +216,9 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
             logger.warning("HDF5 schema v%d < 3 — some datasets may be missing", schema)
 
         num_frames_orig = meta.attrs.get("num_frames", 0) if meta else 0
-        # Nominal grid rate: schema v7 stores control_hz; fps is the achieved
-        # rate recomputed at stop (frame_count/duration) — prefer the nominal.
-        fps = meta.attrs.get("control_hz", meta.attrs.get("fps", 16.0)) if meta else 16.0
+        # Normalized reader timing prefers the explicit grid/control rate and
+        # avoids legacy wall-time-diluted fps values from paused episodes.
+        fps = reader.timing.rate_hz
         # Clamp: replay_hz drives the real arm — a diluted fps from an old
         # paused episode (or fps=0) must not set the physical replay rate.
         if not (1.0 <= float(fps) <= 100.0):

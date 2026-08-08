@@ -70,6 +70,11 @@ class AudioFeedback:
     def is_playing(self) -> bool:
         """True if a voice prompt is currently playing or queued."""
         with self._lock:
+            # play() publishes the cancel token before the daemon thread starts
+            # the subprocess.  Counting that short pending window avoids a race
+            # where the policy sees the cue as already silent on its next tick.
+            if self._cancel_flag is not None and not self._cancel_flag.is_set():
+                return True
             if self._current_proc is not None and self._current_proc.poll() is None:
                 return True
         with self._queue_lock:
@@ -165,13 +170,14 @@ class AudioFeedback:
                 logger.warning("Audio cancel: process kill failed", exc_info=True)
 
     def _play_thread(self, path: str, cancel: threading.Event) -> None:
-        player = _find_player()
-        if player is None:
-            return
-
-        # aplay -q suppresses the "Playing WAVE ..." banner
-        cmd = [player, "-q", path] if player == "aplay" else [player, path]
+        proc: subprocess.Popen | None = None
         try:
+            player = _find_player()
+            if player is None:
+                return
+
+            # aplay -q suppresses the "Playing WAVE ..." banner
+            cmd = [player, "-q", path] if player == "aplay" else [player, path]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             with self._lock:
@@ -191,8 +197,10 @@ class AudioFeedback:
             logger.warning("Audio playback failed for %s", path, exc_info=True)
         finally:
             with self._lock:
-                if self._current_proc is proc:
+                if proc is not None and self._current_proc is proc:
                     self._current_proc = None
+                if self._cancel_flag is cancel:
+                    self._cancel_flag = None
 
     def _queue_worker(self, cancel: threading.Event) -> None:
         """Process the audio queue sequentially."""

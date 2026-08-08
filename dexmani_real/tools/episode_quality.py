@@ -22,6 +22,7 @@ from typing import Any
 import h5py
 import numpy as np
 
+from dexmani_real.config.defaults import hand
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.utils.log import get_logger
 
@@ -78,6 +79,47 @@ def _runs_of(mask: np.ndarray) -> list[tuple[int, int]]:
     if n:
         runs.append((len(mask) - n, n))
     return runs
+
+
+def _grid_fill_mask(h5f: Any, num_frames: int) -> np.ndarray:
+    """Return slots that were grid back-fills, including legacy hole detection."""
+    fill = np.zeros(num_frames, dtype=bool)
+    if num_frames == 0:
+        return fill
+
+    if "flag_sample_valid" in h5f:
+        raw = np.asarray(h5f["flag_sample_valid"][:], dtype=bool).reshape(-1)
+        n = min(num_frames, raw.size)
+        fill[:n] = ~raw[:n]
+        fill[n:] = True
+        return fill
+
+    # Backward compatibility: older schemas did not persist validity. Detect
+    # duplicate timestamps and the zero/non-finite holes produced by the v11
+    # accumulator regression without assuming optional action/state fields.
+    if "timestamp" in h5f:
+        ts = np.asarray(h5f["timestamp"][:num_frames], dtype=np.float64).reshape(-1)
+        n = min(num_frames, ts.size)
+        fill[:n] = ~np.isfinite(ts[:n]) | (ts[:n] <= 0.0)
+        fill[n:] = True
+        if n >= 2:
+            diffs = np.diff(ts[:n])
+            fill[1:n] |= np.isfinite(diffs) & (np.abs(diffs) <= 1e-12)
+    return fill
+
+
+def _hand_feedback_bound_violation(
+    qpos: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> np.ndarray:
+    """Per-frame, per-joint excursion outside strict SDK command bounds."""
+    qpos = np.asarray(qpos, dtype=np.float64)
+    lower = np.asarray(lower, dtype=np.float64)
+    upper = np.asarray(upper, dtype=np.float64)
+    if qpos.ndim != 2 or qpos.shape[1:] != lower.shape or lower.shape != upper.shape:
+        raise ValueError("hand qpos/bounds shapes are inconsistent")
+    return np.maximum(np.maximum(lower - qpos, 0.0), np.maximum(qpos - upper, 0.0))
 
 
 def _compute_adaptive_threshold(
@@ -194,6 +236,8 @@ class HealthReport:
     num_frames: int
     # Grid
     grid_fill_pct: float = 0.0
+    grid_fill_frames: int = 0
+    grid_fill_longest_run: int = 0
     # Camera
     camera_dup_pct: dict[str, float] = field(default_factory=dict)
     camera_expected_baseline_pct: float = 0.0
@@ -204,6 +248,13 @@ class HealthReport:
     # Hand tracking
     hand_tracking_p95_deg: float | None = None
     hand_tracking_over_pct: float = 0.0
+    # Measured feedback outside strict SDK command bounds
+    hand_feedback_bound_tolerance_deg: float = 0.0
+    hand_feedback_bound_violation_pct: float = 0.0
+    hand_feedback_bound_over_tolerance_pct: float = 0.0
+    hand_feedback_bound_max_violation_deg: float = 0.0
+    hand_feedback_bound_violation_per_joint_pct: list[float] = field(default_factory=list)
+    hand_feedback_bound_over_tolerance_per_joint_pct: list[float] = field(default_factory=list)
     # Hand freeze
     hand_freeze_runs: list[FreezeRun] = field(default_factory=list)
     hand_freeze_total_frames: int = 0
@@ -224,12 +275,24 @@ class HealthReport:
             "episode_path": self.episode_path,
             "num_frames": self.num_frames,
             "grid_fill_pct": round(self.grid_fill_pct, 2),
+            "grid_fill_frames": self.grid_fill_frames,
+            "grid_fill_longest_run": self.grid_fill_longest_run,
             "camera_dup_pct": {k: round(v, 2) for k, v in self.camera_dup_pct.items()},
             "cam_frames_dropped": self.cam_frames_dropped,
             "tracking_p95_deg": round(self.tracking_p95_deg, 2) if self.tracking_p95_deg is not None else None,
             "hand_tracking_p95_deg": (
                 round(self.hand_tracking_p95_deg, 2) if self.hand_tracking_p95_deg is not None else None
             ),
+            "hand_feedback_bound_tolerance_deg": round(self.hand_feedback_bound_tolerance_deg, 3),
+            "hand_feedback_bound_violation_pct": round(self.hand_feedback_bound_violation_pct, 2),
+            "hand_feedback_bound_over_tolerance_pct": round(self.hand_feedback_bound_over_tolerance_pct, 2),
+            "hand_feedback_bound_max_violation_deg": round(self.hand_feedback_bound_max_violation_deg, 3),
+            "hand_feedback_bound_violation_per_joint_pct": np.round(
+                self.hand_feedback_bound_violation_per_joint_pct, 2
+            ).tolist(),
+            "hand_feedback_bound_over_tolerance_per_joint_pct": np.round(
+                self.hand_feedback_bound_over_tolerance_per_joint_pct, 2
+            ).tolist(),
             "hand_freeze_runs": len(self.hand_freeze_runs),
             "hand_freeze_total_frames": self.hand_freeze_total_frames,
             "tactile_zero_pcts": {k: round(v, 2) for k, v in self.tactile_zero_pcts.items()},
@@ -328,7 +391,8 @@ class EpisodeQuality:
         self._meta = dict(self._h5f["meta"].attrs) if "meta" in self._h5f else {}
         self._params = _read_meta_defaults(self._h5f)
         self._n_frames = int(self._h5f["arm_qpos"].shape[0]) if "arm_qpos" in self._h5f else 0
-        self._control_hz = float(self._meta.get("control_hz", 0.0) or 0.0)
+        self._control_hz = self._reader.timing.rate_hz
+        self._params["control_hz"] = self._control_hz
         return self
 
     def __exit__(self, *args: Any) -> None:
@@ -451,15 +515,16 @@ class EpisodeQuality:
         )
 
         # ── Grid fill ──
-        if "timestamp" in self._h5f:
-            ts = self._h5f["timestamp"][:]
-            if len(ts) >= 2:
-                dup = np.diff(ts) == 0.0
-                report.grid_fill_pct = 100.0 * dup.sum() / len(ts)
-                if report.grid_fill_pct > FILL_WARN_PCT:
-                    report.warnings.append(
-                        f"grid fill {report.grid_fill_pct:.1f}% > {FILL_WARN_PCT:.0f}% — decision loop overrun"
-                    )
+        fill_mask = _grid_fill_mask(self._h5f, self._n_frames)
+        report.grid_fill_frames = int(np.sum(fill_mask))
+        fill_runs = _runs_of(fill_mask)
+        report.grid_fill_longest_run = max((length for _, length in fill_runs), default=0)
+        if self._n_frames > 0:
+            report.grid_fill_pct = 100.0 * report.grid_fill_frames / self._n_frames
+        if report.grid_fill_pct > FILL_WARN_PCT:
+            report.warnings.append(
+                f"grid fill {report.grid_fill_pct:.1f}% > {FILL_WARN_PCT:.0f}% — decision loop overrun"
+            )
 
         # ── Camera content duplication ──
         cam_keys = [k for k in self._h5f.keys() if k == "rgb" or k.endswith("_rgb")]
@@ -508,6 +573,42 @@ class EpisodeQuality:
                 if report.hand_tracking_p95_deg > HAND_TRACK_P95_WARN_DEG:
                     report.warnings.append(
                         f"hand tracking error p95 {report.hand_tracking_p95_deg:.1f}° > {HAND_TRACK_P95_WARN_DEG:.0f}°"
+                    )
+
+        # ── Hand measured-feedback bounds ──
+        if "hand_qpos" in self._h5f:
+            tolerance_rad = float(
+                self._meta.get("hand_feedback_bound_tolerance_rad", hand.feedback_bound_tolerance_rad)
+            )
+            if not np.isfinite(tolerance_rad) or tolerance_rad < 0:
+                tolerance_rad = hand.feedback_bound_tolerance_rad
+            report.hand_feedback_bound_tolerance_deg = float(np.rad2deg(tolerance_rad))
+
+            qpos = self._hand_qpos[: self._n_frames]
+            finite_rows = np.all(np.isfinite(qpos), axis=1)
+            source_rows = ~fill_mask[: len(qpos)]
+            valid_rows = finite_rows & source_rows
+            if np.any(valid_rows):
+                violation = _hand_feedback_bound_violation(
+                    qpos[valid_rows],
+                    np.asarray(hand.qpos_min_rad, dtype=np.float64),
+                    np.asarray(hand.qpos_max_rad, dtype=np.float64),
+                )
+                frame_max = np.max(violation, axis=1)
+                report.hand_feedback_bound_violation_pct = 100.0 * float(np.mean(frame_max > 1e-12))
+                report.hand_feedback_bound_over_tolerance_pct = 100.0 * float(np.mean(frame_max > tolerance_rad))
+                report.hand_feedback_bound_max_violation_deg = float(np.rad2deg(np.max(frame_max)))
+                report.hand_feedback_bound_violation_per_joint_pct = (
+                    100.0 * np.mean(violation > 1e-12, axis=0)
+                ).tolist()
+                report.hand_feedback_bound_over_tolerance_per_joint_pct = (
+                    100.0 * np.mean(violation > tolerance_rad, axis=0)
+                ).tolist()
+                if report.hand_feedback_bound_over_tolerance_pct > 0.0:
+                    report.warnings.append(
+                        "hand feedback outside command bounds beyond tolerance: "
+                        f"{report.hand_feedback_bound_over_tolerance_pct:.1f}% frames, "
+                        f"max={report.hand_feedback_bound_max_violation_deg:.2f}°"
                     )
 
         # ── Hand freeze ──
@@ -612,6 +713,7 @@ class EpisodeQuality:
     ) -> ValidationReport:
         """Pre-training automated quality checks (NaN, variance, camera, etc.)."""
         report = ValidationReport(episode_path=self._path)
+        source_sample_mask = ~_grid_fill_mask(self._h5f, self._n_frames)
 
         # NaN checks
         for key in ("arm_qpos", "arm_ee", "hand_qpos", "action_arm_joint", "action_arm_ee", "action_hand_joint"):
@@ -628,15 +730,22 @@ class EpisodeQuality:
             if key not in self._h5f:
                 continue
             data = np.asarray(self._h5f[key][:], dtype=np.float64)
+            if data.shape[0] == source_sample_mask.shape[0]:
+                data = data[source_sample_mask]
             if data.ndim == 1:
                 data = data[:, np.newaxis]
-            var = np.var(data, axis=0)
-            zero_var = int(np.sum(var < variance_epsilon))
+            if data.shape[0] == 0:
+                zero_var = data.shape[1]
+                detail = f"{key}: no source samples"
+            else:
+                var = np.var(data, axis=0)
+                zero_var = int(np.sum(var < variance_epsilon))
+                detail = f"{key}: OK" if zero_var == 0 else f"{key}: {zero_var}/{var.shape[0]} dims zero variance"
             report.checks.append(
                 {
                     "name": "non_zero_variance",
                     "passed": zero_var == 0,
-                    "detail": f"{key}: OK" if zero_var == 0 else f"{key}: {zero_var}/{var.shape[0]} dims zero variance",
+                    "detail": detail,
                 }
             )
 
@@ -660,6 +769,8 @@ class EpisodeQuality:
                     active = np.asarray(self._h5f["flag_frame_status"][:], dtype=np.int32) != 1
                 else:
                     active = np.ones(len(obs), dtype=bool)
+                if len(active) == len(source_sample_mask):
+                    active &= source_sample_mask
                 if active.sum() >= 2:
                     obs_diff = np.abs(np.diff(obs[active], axis=0)).sum(axis=1)
                     act_diff = np.abs(np.diff(act[active], axis=0)).sum(axis=1)
@@ -672,18 +783,21 @@ class EpisodeQuality:
                         }
                     )
 
-        # Timestamp monotonicity
+        # Timestamp validity and strict monotonicity. Synthetic grid timestamps
+        # are strictly increasing; zero holes and duplicate legacy fills are not.
         if "timestamp" in self._h5f:
             ts = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
-            if len(ts) >= 2:
-                diffs = np.diff(ts)
-                n_regressions = int(np.sum(diffs < 0))
+            if len(ts) > 0:
+                n_invalid = int(np.sum(~np.isfinite(ts) | (ts <= 0.0)))
+                n_non_increasing = int(np.sum(np.diff(ts) <= 0.0)) if len(ts) >= 2 else 0
                 report.checks.append(
                     {
                         "name": "timestamp_monotonic",
-                        "passed": n_regressions == 0,
+                        "passed": n_invalid == 0 and n_non_increasing == 0,
                         "detail": (
-                            f"{n_regressions} backwards timestamps" if n_regressions else "Timestamps non-decreasing"
+                            f"{n_invalid} invalid, {n_non_increasing} non-increasing timestamps"
+                            if n_invalid or n_non_increasing
+                            else "Timestamps finite, positive, and strictly increasing"
                         ),
                     }
                 )
@@ -825,9 +939,18 @@ class EpisodeQuality:
                     data = np.asarray(self._h5f[key][:total])
                     out_f.create_dataset(key, data=data[mask], compression="gzip", compression_opts=4)
                 if "meta" in out_f:
-                    out_f["meta"].attrs["num_frames"] = kept
-                    out_f["meta"].attrs["filter_original_frames"] = total
-                    out_f["meta"].attrs["filter_kept_frames"] = kept
+                    out_meta = out_f["meta"].attrs
+                    out_meta["num_frames"] = kept
+                    out_meta["filter_original_frames"] = total
+                    out_meta["filter_kept_frames"] = kept
+                    if int(out_meta.get("schema_version", 0)) >= 13:
+                        filtered_ts = np.asarray(out_f["timestamp"][:], dtype=np.float64)
+                        finite_ts = filtered_ts[np.isfinite(filtered_ts)]
+                        grid_duration_s = float(finite_ts[-1] - finite_ts[0]) if finite_ts.size >= 2 else 0.0
+                        wall_duration_s = float(out_meta.get("wall_duration_s", out_meta.get("duration", 0.0)))
+                        out_meta["grid_duration_s"] = max(0.0, grid_duration_s)
+                        out_meta["non_sampled_duration_s"] = max(0.0, wall_duration_s - grid_duration_s)
+                        out_meta["wall_fps"] = kept / wall_duration_s if wall_duration_s > 0 else self._control_hz
 
             if input_path.is_dir():
                 for sidecar in ("depth.h5", "rgb.mp4"):
@@ -1011,8 +1134,10 @@ def print_health_report(report: HealthReport) -> None:
 
     dt = report.meta.get("control_hz", 0)
     dt = 1.0 / dt if dt and dt > 0 else float("nan")
-    longest_grid = 0  # best-effort
-    print(f"  grid fill: {report.grid_fill_pct:.1f}%  " f"(longest run ≈ {longest_grid * dt * 1000:.0f}ms)")
+    print(
+        f"  grid fill: {report.grid_fill_pct:.1f}% ({report.grid_fill_frames} frames)  "
+        f"(longest run ≈ {report.grid_fill_longest_run * dt * 1000:.0f}ms)"
+    )
 
     for key, dup_pct in report.camera_dup_pct.items():
         print(f"  {key} content dup: {dup_pct:.1f}% " f"(expected baseline {report.camera_expected_baseline_pct:.0f}%)")
@@ -1022,6 +1147,22 @@ def print_health_report(report: HealthReport) -> None:
 
     if report.hand_tracking_p95_deg is not None:
         print(f"  hand tracking error p95: {report.hand_tracking_p95_deg:.1f}°")
+
+    if report.hand_feedback_bound_over_tolerance_per_joint_pct:
+        print(
+            "  hand feedback bounds: "
+            f"outside={report.hand_feedback_bound_violation_pct:.1f}%  "
+            f">tolerance={report.hand_feedback_bound_over_tolerance_pct:.1f}%  "
+            f"max={report.hand_feedback_bound_max_violation_deg:.2f}°  "
+            f"tolerance={report.hand_feedback_bound_tolerance_deg:.2f}°"
+        )
+        per_joint_over = [
+            f"J{joint}={pct:.1f}%"
+            for joint, pct in enumerate(report.hand_feedback_bound_over_tolerance_per_joint_pct)
+            if pct > 0.0
+        ]
+        if per_joint_over:
+            print(f"    per-joint >tolerance (SDK order): {'  '.join(per_joint_over)}")
 
     if report.hand_freeze_runs:
         freeze_desc = "  ".join(

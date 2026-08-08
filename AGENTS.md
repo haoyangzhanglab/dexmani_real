@@ -19,7 +19,7 @@ policy ──arm queue──> arm
    └──hand ring─────> hand
 
 arm/hand/camera/VR ──shared-memory state──> policy
-policy ──aligned samples──> HDF5 episode (schema v11)
+policy ──aligned samples──> HDF5 episode (schema v13)
 ```
 
 The thin main process only creates shared storage, starts workers, supervises
@@ -43,7 +43,7 @@ in the worker or domain module, not in the entry point.
 - `dexmani_real/robot/hand_process.py`: XHand servo loop and hand state producer.
 - `dexmani_real/robot/safety.py`: `DISARMED/ARMED/RUNNING/FAULT` transitions.
 - `dexmani_real/planning/`: FK, IK, collision checking, pose and path utilities.
-- `dexmani_real/recording/`: timestamp alignment and HDF5 schema v11 I/O.
+- `dexmani_real/recording/`: timestamp alignment and HDF5 schema v13 I/O.
 - `dexmani_real/sensor/`: RealSense, point-cloud, and VR receiver processes.
 - `dexmani_real/teleop/`: arm mapping, hand retargeting, keyboard and audio UX.
 - `dexmani_real/tools/`: episode quality analysis and visualization CLIs.

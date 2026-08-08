@@ -62,6 +62,20 @@ class PolicyConfig:
     # Workspace bounds: [[x_min, x_max], [y_min, y_max], [z_min, z_max]] (m)
     workspace_bounds: tuple = field(default_factory=lambda: policy.workspace.as_tuple())
 
+    # Contact-stall resync. Table height is context only, never a pose limit.
+    contact_stall_enabled: bool = field(default_factory=lambda: policy.contact_stall_enabled)
+    contact_stall_table_z_surface_m: float = field(default_factory=lambda: arm.table_z_surface_m)
+    contact_stall_table_context_height_m: float = field(
+        default_factory=lambda: policy.contact_stall_table_context_height_m
+    )
+    contact_stall_min_downward_target_m: float = field(
+        default_factory=lambda: policy.contact_stall_min_downward_target_m
+    )
+    contact_stall_tracking_error_rad: float = field(default_factory=lambda: policy.contact_stall_tracking_error_rad)
+    contact_stall_max_closing_speed_rad_s: float = field(
+        default_factory=lambda: policy.contact_stall_max_closing_speed_rad_s
+    )
+
     # Cartesian EMA smoothing (tuned at 16Hz)
     ema_alpha_pos: float = field(default_factory=lambda: policy.ema.alpha_pos)
     ema_alpha_rot: float = field(default_factory=lambda: policy.ema.alpha_rot)
@@ -79,7 +93,9 @@ class PolicyConfig:
 
     hand_enabled: bool = field(default_factory=lambda: policy.hand_enabled)
     hand_retargeting_type: str = field(default_factory=lambda: policy.hand_retargeting_type)
-    hand_ramp_frames: int = field(default_factory=lambda: policy.hand_ramp_frame_count)
+    hand_output_smoothing_alpha: float = field(default_factory=lambda: policy.hand_output_smoothing_alpha)
+    hand_ramp_duration_s: float = field(default_factory=lambda: policy.hand_ramp_duration_s)
+    begin_motion_gate_timeout_s: float = field(default_factory=lambda: policy.begin_motion_gate_timeout_s)
     hand_disconnect_timeout_s: float = field(default_factory=lambda: policy.hand_disconnect_timeout_s)
 
     # Hand FK (fingertip positions)
@@ -97,10 +113,21 @@ class PolicyConfig:
     hand_home_qpos_deg: tuple[float, ...] = field(default_factory=lambda: hand.home_qpos_deg)
     hand_qpos_lower_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_min_rad)
     hand_qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_max_rad)
+    hand_feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
     hand_max_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
 
     # VR transform config path (relative to repo root)
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.control_hz) or self.control_hz <= 0:
+            raise ValueError("control_hz must be finite and > 0")
+        if not (0.0 <= self.hand_output_smoothing_alpha <= 1.0):
+            raise ValueError("hand_output_smoothing_alpha must be in [0, 1]")
+        if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
+            raise ValueError("hand_ramp_duration_s must be finite and >= 0")
+        if not np.isfinite(self.begin_motion_gate_timeout_s) or self.begin_motion_gate_timeout_s < 0:
+            raise ValueError("begin_motion_gate_timeout_s must be finite and >= 0")
 
 
 def _sanitize_hand_command(
@@ -125,6 +152,58 @@ def _sanitize_hand_command(
     return command
 
 
+def _hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:
+    """Convert a ramp duration to policy frames without baking in 16 Hz."""
+    if not np.isfinite(duration_s) or duration_s < 0:
+        raise ValueError("duration_s must be finite and >= 0")
+    if not np.isfinite(control_hz) or control_hz <= 0:
+        raise ValueError("control_hz must be finite and > 0")
+    return max(0, int(round(duration_s * control_hz)))
+
+
+def _smoothstep_hand_ramp(
+    start: np.ndarray,
+    target: np.ndarray,
+    step_index: int,
+    total_steps: int,
+) -> np.ndarray:
+    """Blend one startup-ramp sample; the final configured step reaches target exactly."""
+    start_arr = np.asarray(start, dtype=np.float64)
+    target_arr = np.asarray(target, dtype=np.float64)
+    if start_arr.shape != target_arr.shape:
+        raise ValueError(f"ramp arrays must have matching shapes, got {start_arr.shape} and {target_arr.shape}")
+    if total_steps <= 0:
+        return target_arr.copy()
+    if not 0 <= step_index < total_steps:
+        raise ValueError(f"step_index={step_index} must be in [0, {total_steps})")
+    progress = (step_index + 1) / total_steps
+    smooth = progress * progress * (3.0 - 2.0 * progress)
+    return start_arr + smooth * (target_arr - start_arr)
+
+
+def _update_audio_motion_gate(
+    *,
+    audio_playing: bool,
+    begin_deadline_s: float | None,
+    ignore_begin_until_silent: bool,
+    now_s: float,
+) -> tuple[bool, float | None, bool]:
+    """Advance the bounded begin-audio gate and return ``(hold, deadline, ignore)``."""
+    begin_active = begin_deadline_s is not None and now_s < begin_deadline_s
+    if begin_deadline_s is not None and not begin_active:
+        # The begin cue may continue audibly, but no longer gates motion.
+        ignore_begin_until_silent = audio_playing
+        begin_deadline_s = None
+
+    if ignore_begin_until_silent:
+        if not audio_playing:
+            ignore_begin_until_silent = False
+        should_hold = False
+    else:
+        should_hold = begin_active or audio_playing
+    return should_hold, begin_deadline_s, ignore_begin_until_silent
+
+
 def _transition_collision_free(
     planner: XArm7MotionPlanner,
     arm_start: np.ndarray,
@@ -138,6 +217,45 @@ def _transition_collision_free(
     except (ValueError, RuntimeError):
         logger.warning("policy_loop: arm-hand collision check failed", exc_info=True)
         return False
+
+
+def _contact_stall_detected(
+    arm_qpos: np.ndarray,
+    arm_qvel: np.ndarray,
+    previous_arm_cmd: np.ndarray,
+    eef_pos: np.ndarray,
+    target_pos: np.ndarray,
+    *,
+    table_z_surface_m: float,
+    table_context_height_m: float,
+    min_downward_target_m: float,
+    tracking_error_rad: float,
+    max_closing_speed_rad_s: float,
+) -> bool:
+    """Detect a blocked downward command without treating the table as forbidden."""
+    qpos = np.asarray(arm_qpos, dtype=np.float64)
+    qvel = np.asarray(arm_qvel, dtype=np.float64)
+    command = np.asarray(previous_arm_cmd, dtype=np.float64)
+    eef = np.asarray(eef_pos, dtype=np.float64)
+    target = np.asarray(target_pos, dtype=np.float64)
+    if qpos.shape != (7,) or qvel.shape != (7,) or command.shape != (7,):
+        return False
+    if eef.shape != (3,) or target.shape != (3,):
+        return False
+    if not all(np.all(np.isfinite(values)) for values in (qpos, qvel, command, eef, target)):
+        return False
+
+    near_table = eef[2] <= table_z_surface_m + table_context_height_m
+    downward_intent = target[2] <= eef[2] - min_downward_target_m
+    command_error = command - qpos
+    if not near_table or not downward_intent or np.max(np.abs(command_error)) < tracking_error_rad:
+        return False
+
+    error_norm = float(np.linalg.norm(command_error))
+    if error_norm <= 1e-12:
+        return False
+    closing_speed = float(np.dot(qvel, command_error) / error_norm)
+    return closing_speed <= max_closing_speed_rad_s
 
 
 def _do_teleop_home(
@@ -258,7 +376,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 nullspace_step_size_deg=1.0 * (50.0 / cfg.control_hz),
             ),
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
-            home_qpos=np.array(arm.home_qpos, dtype=np.float64),
         )
 
         _vr_cfg_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
@@ -301,7 +418,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     hand_available = False
     _hand_disconnected_at: float | None = None  # monotonic timestamp of first bad frame
     _hand_ramp_start: np.ndarray | None = None
-    _hand_ramp_frames = 0
+    _hand_ramp_step = 0
+    _hand_ramp_total_frames = _hand_ramp_frame_count(cfg.hand_ramp_duration_s, cfg.control_hz)
 
     def _try_init_hand_retargeter() -> None:
         """Lazily initialize hand_retargeter if not already created."""
@@ -310,11 +428,16 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             return
         try:
             if cfg.hand_retargeting_type == "tag":
-                hand_retargeter = TAGHandRetargeter(hand_type="right")
+                hand_retargeter = TAGHandRetargeter(
+                    hand_type="right",
+                    smoothing_alpha=cfg.hand_output_smoothing_alpha,
+                    feedback_bound_tolerance_rad=cfg.hand_feedback_bound_tolerance_rad,
+                )
             else:
                 hand_retargeter = XHandRetargeter(
                     hand_type="right",
                     retargeting_type=cfg.hand_retargeting_type,
+                    smoothing_alpha=cfg.hand_output_smoothing_alpha,
                 )
             logger.info("Hand retargeter ready (type=%s)", cfg.hand_retargeting_type)
         except Exception as e:
@@ -399,6 +522,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     recording_active = False
     recording_paused = False
     _prev_audio_playing = False
+    _begin_audio_gate_deadline_s: float | None = None
+    _ignore_begin_audio_until_silent = False
 
     # Post-teleop quit prompt (two-stage Q: first Q stops teleop, second Q exits)
     quit_pending = False
@@ -699,8 +824,18 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             "joint_max_acc": cfg.joint_max_acc_deg_s2,
                             "joint_max_speed": cfg.joint_max_speed_deg_s,
                             "arm_loop_hz": cfg.arm_loop_hz,
+                            "contact_stall_enabled": cfg.contact_stall_enabled,
+                            "contact_stall_table_z_surface_m": cfg.contact_stall_table_z_surface_m,
+                            "contact_stall_table_context_height_m": cfg.contact_stall_table_context_height_m,
+                            "contact_stall_min_downward_target_m": cfg.contact_stall_min_downward_target_m,
+                            "contact_stall_tracking_error_rad": cfg.contact_stall_tracking_error_rad,
+                            "contact_stall_max_closing_speed_rad_s": cfg.contact_stall_max_closing_speed_rad_s,
                             "hand_available": hand_available,
                             "hand_retargeting_type": cfg.hand_retargeting_type,
+                            "hand_output_smoothing_alpha": cfg.hand_output_smoothing_alpha,
+                            "hand_ramp_duration_s": cfg.hand_ramp_duration_s,
+                            "begin_motion_gate_timeout_s": cfg.begin_motion_gate_timeout_s,
+                            "hand_feedback_bound_tolerance_rad": cfg.hand_feedback_bound_tolerance_rad,
                         },
                     ):
                         print("  ⚠ 无法开始录制")
@@ -720,7 +855,20 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     if _seeded is not None:
                         prev_hand_qpos = _seeded
                     audio.play("begin")
+                    # The gate is evaluated only on policy ticks.  Subtract one
+                    # nominal tick so the first tick after expiry stays within
+                    # the configured wall-time budget (0.35 s by default).
+                    _begin_audio_gate_deadline_s = time.monotonic() + max(
+                        0.0, cfg.begin_motion_gate_timeout_s - ctrl_dt
+                    )
+                    _ignore_begin_audio_until_silent = False
+                    # Treat the cue as a hold transition even if the audio thread
+                    # has not yet spawned its player process on the next tick.
+                    _prev_audio_playing = True
                     print(f"\nB: 遥操作+录制开始  episode={recorder.frame_count}")
+                    # Episode setup, GC, and retargeter seeding are intentional
+                    # boundary work, not an active control-loop overrun.
+                    limiter.reset()
                     skip_rest = True
 
             if not shared.is_running.value:
@@ -835,9 +983,18 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 ema_prev_pos = ema_prev_quat = None
                 continue
 
-            # Hold arm position while voice prompts play, then run hold-exit
-            # (mapper reset + EMA clear + hand ramp) on the falling edge.
-            if audio.is_playing:
+            # Hold during state-transition voice prompts.  The begin cue is
+            # special: it may block motion only for a bounded interval, then it
+            # continues playing in the background.  Other safety/state cues keep
+            # their existing full-duration gate.
+            _audio_playing = audio.is_playing
+            _hold_for_audio, _begin_audio_gate_deadline_s, _ignore_begin_audio_until_silent = _update_audio_motion_gate(
+                audio_playing=_audio_playing,
+                begin_deadline_s=_begin_audio_gate_deadline_s,
+                ignore_begin_until_silent=_ignore_begin_audio_until_silent,
+                now_s=time.monotonic(),
+            )
+            if _hold_for_audio:
                 prev_qpos_cmd = arm_qpos.copy()
                 # Refresh prev_hand_qpos from current hardware state so
                 # the hand ramp starts from the actual joint position.
@@ -847,11 +1004,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 continue
 
             if _prev_audio_playing:
-                # Audio just ended — re-establish wrist→EEF mapping from the
-                # current pose to prevent a jump.  The user's VR hand naturally
-                # moves during the ~2s audio playback; resetting the mapper
-                # captures the current offset, so the first map() produces a
-                # near-zero delta (same pattern as C-resume handler).
+                # The audio motion gate just ended — re-establish wrist→EEF
+                # mapping from the current pose to prevent a jump.  Resetting
+                # captures any VR-hand motion during the gate, so the first map()
+                # produces a near-zero delta (same pattern as C-resume handler).
                 if arm_state is not None and vr_frame is not None:
                     _eef_pos = arm_state["eef_pos"][0].copy()
                     _eef_rot6d = arm_state["eef_rot6d"][0].copy()
@@ -880,10 +1036,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 # For consistency, always use the mapper's own output.
                 ema_prev_pos = ema_prev_quat = None
                 _hand_ramp_start = prev_hand_qpos.copy() if hand_available else None
-                _hand_ramp_frames = cfg.hand_ramp_frames
+                _hand_ramp_step = 0
                 # Re-seed hand retargeter NLP warm-start from current hardware
                 # pose (mirrors the arm_mapper reset above).  Without this, the
-                # SLSQP initial guess is the qpos from B-press time (~2s stale).
+                # optimizer initial guess remains the qpos captured at B press.
                 # Smoothstep ramp + one-frame SLSQP self-correction make this
                 # harmless in practice, but re-seeding is symmetric and clear.
                 _reset_hand_retargeter(hand_retargeter, prev_hand_qpos.copy() if hand_available else None)
@@ -909,6 +1065,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                     )
                 continue
+            _policy_compute_t0 = time.perf_counter()
+            _map_t0 = time.perf_counter()
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
                 if recording_active:
@@ -933,8 +1091,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     break
                 continue
 
-            target_pos = mapped["pos"]
-            target_quat = mapped["quat_wxyz"]
+            target_pos_raw = np.asarray(mapped["pos"], dtype=np.float64).copy()
+            target_quat_raw = np.asarray(mapped["quat_wxyz"], dtype=np.float64).copy()
+            target_pos = target_pos_raw.copy()
+            target_quat = target_quat_raw.copy()
 
             if ema_prev_pos is not None:
                 if ema_prev_quat is None:
@@ -953,7 +1113,72 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             for axis in range(3):
                 lo, hi = cfg.workspace_bounds[axis]
                 target_pos[axis] = np.clip(target_pos[axis], lo, hi)
+            policy_map_time_ms = (time.perf_counter() - _map_t0) * 1000.0
             stage_timer.mark("map")
+
+            # Intentional tabletop contact is allowed. If a downward target has
+            # accumulated substantial joint error while the arm is no longer
+            # closing that error, discard the buried target and re-anchor VR at
+            # the measured pose. This stops continued pushing without a table
+            # exclusion zone or any speed/acceleration change.
+            if (
+                cfg.contact_stall_enabled
+                and arm_state is not None
+                and _contact_stall_detected(
+                    arm_qpos,
+                    arm_state["qvel"][0],
+                    prev_qpos_cmd,
+                    arm_state["eef_pos"][0],
+                    target_pos,
+                    table_z_surface_m=cfg.contact_stall_table_z_surface_m,
+                    table_context_height_m=cfg.contact_stall_table_context_height_m,
+                    min_downward_target_m=cfg.contact_stall_min_downward_target_m,
+                    tracking_error_rad=cfg.contact_stall_tracking_error_rad,
+                    max_closing_speed_rad_s=cfg.contact_stall_max_closing_speed_rad_s,
+                )
+            ):
+                command_error = prev_qpos_cmd - arm_qpos
+                closing_speed = float(
+                    np.dot(arm_state["qvel"][0], command_error) / max(np.linalg.norm(command_error), 1e-12)
+                )
+                logger.warning(
+                    "policy_loop: downward contact stall — resync measured pose "
+                    "(tracking_err=%.3frad closing_speed=%.3frad/s eef_z=%.3fm)",
+                    float(np.max(np.abs(command_error))),
+                    closing_speed,
+                    float(arm_state["eef_pos"][0][2]),
+                )
+                hold_qpos = arm_qpos.copy()
+                arm_mapper.reset(
+                    wrist_pos=vr_frame["wrist_pos"],
+                    wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
+                    eef_pos=arm_state["eef_pos"][0],
+                    eef_quat_wxyz=rot6d_to_quat_wxyz(arm_state["eef_rot6d"][0]),
+                )
+                ema_prev_pos = ema_prev_quat = None
+                prev_qpos_cmd = hold_qpos
+                if recording_active:
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        hold_qpos,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        frame_status=_FRAME_SAFETY_REJECT,
+                        arm_qpos_sent=hold_qpos.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    )
+                if not _safe_arm_queue_put(shared, {"qpos": hold_qpos, "is_hold": True}):
+                    shared.is_running.value = False
+                    break
+                continue
 
             planner.set_hand_qpos(prev_hand_qpos)  # sync hand pose for collision checks
             target_pose = Pose(p=target_pos, q=target_quat)
@@ -964,24 +1189,31 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
             # Compute hand retargeting before IK outcome handling. Hand-only motion
             # remains allowed on IK failure only after arm↔hand transition validation.
+            _hand_retarget_t0 = time.perf_counter()
             hand_cmd, retarget_ok = _compute_hand_command(
                 hand_retargeter,
                 vr_frame,
                 prev_hand_qpos,
                 hand_available,
             )
-            # Smoothstep ramp: ease from home_qpos (captured at audio end)
-            # to VR retargeting target over ~1s.  Smoothstep has zero
-            # derivative at t=0 — the first few frames barely move,
-            # giving the NLP warm-start time to converge.
-            if _hand_ramp_frames > 0 and _hand_ramp_start is not None:
-                t = 1.0 - (_hand_ramp_frames / cfg.hand_ramp_frames)
-                t_smooth = t * t * (3.0 - 2.0 * t)
-                hand_cmd = _hand_ramp_start + t_smooth * (hand_cmd - _hand_ramp_start)
-                _hand_ramp_frames -= 1
+            hand_retarget_time_ms = (time.perf_counter() - _hand_retarget_t0) * 1000.0
+            hand_cmd_raw = _get_raw_hand_command(hand_retargeter, hand_cmd, retarget_ok)
+            # Rate-independent smoothstep ramp from the measured pose captured
+            # at hold exit.  The last configured frame reaches the live target
+            # exactly, avoiding an extra one-frame tail.
+            if _hand_ramp_start is not None and _hand_ramp_step < _hand_ramp_total_frames:
+                hand_cmd = _smoothstep_hand_ramp(
+                    _hand_ramp_start,
+                    hand_cmd,
+                    _hand_ramp_step,
+                    _hand_ramp_total_frames,
+                )
+                _hand_ramp_step += 1
+                if _hand_ramp_step >= _hand_ramp_total_frames:
+                    _hand_ramp_start = None
             elif _hand_ramp_start is not None:
-                _hand_ramp_start = None  # ramp complete, release reference
-                _hand_ramp_frames = 0
+                _hand_ramp_start = None
+                _hand_ramp_step = 0
 
             # G1: detect hand driver board lockout (hand_loop → qpos_stale in state ring).
             # When the hand stops executing commands despite being connected, hold the
@@ -1049,6 +1281,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             arm_cmd = np.clip(arm_cmd, JOINT_LO, JOINT_HI)
 
             # Validate cheap boundaries before entering Pinocchio/hpp-fcl.
+            _transition_check_t0 = time.perf_counter()
             _arm_ok = arm_state is not None and bool(arm_state["connected"][0])
             _reject = False
             _reject_reason = ""
@@ -1067,6 +1300,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             elif not _transition_collision_free(planner, arm_qpos, arm_cmd, hand_start_qpos, hand_cmd):
                 _reject = True
                 _reject_reason = "final arm-hand transition collision"
+            transition_check_time_ms = (time.perf_counter() - _transition_check_t0) * 1000.0
             if _reject:
                 _validate_warn("policy_loop: action rejected — %s", _reject_reason)
                 if recording_active:
@@ -1129,6 +1363,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             ema_prev_quat = target_quat.copy()
 
             if recording_active:
+                policy_compute_time_ms = (time.perf_counter() - _policy_compute_t0) * 1000.0
                 # Track last valid IK target for held-frame continuity.
                 _last_target_eef_pos = target_pos.copy()
                 _last_target_eef_rot6d = quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat))
@@ -1152,6 +1387,13 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     hand_tactile,
                     retarget_ok=retarget_ok,
                     frame_status=_f_status,
+                    target_eef_pos_raw=target_pos_raw,
+                    target_eef_rot6d_raw=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat_raw)),
+                    action_hand_joint_raw=hand_cmd_raw,
+                    policy_map_time_ms=policy_map_time_ms,
+                    hand_retarget_time_ms=hand_retarget_time_ms,
+                    transition_check_time_ms=transition_check_time_ms,
+                    policy_compute_time_ms=policy_compute_time_ms,
                     hand_fk=_hand_fk,
                     T_eef_handbase_pos=_T_eef_handbase_pos,
                     T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
@@ -1347,6 +1589,13 @@ def _record_frame(
     *,
     retarget_ok: bool = False,
     frame_status: int = _FRAME_OK,
+    target_eef_pos_raw: np.ndarray | None = None,
+    target_eef_rot6d_raw: np.ndarray | None = None,
+    action_hand_joint_raw: np.ndarray | None = None,
+    policy_map_time_ms: float = np.nan,
+    hand_retarget_time_ms: float = np.nan,
+    transition_check_time_ms: float = np.nan,
+    policy_compute_time_ms: float = np.nan,
     hand_fk=None,
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
@@ -1404,6 +1653,25 @@ def _record_frame(
             "ik_solve_time_ms": ik_solve_time_ms,
             "target_pos_before_clamp": target_pos_before_clamp,
             "head_quat_wxyz": head_quat if head_quat is not None else np.full(4, np.nan),
+            "target_eef_pos_raw": (
+                np.asarray(target_eef_pos_raw, dtype=np.float64)
+                if target_eef_pos_raw is not None
+                else np.full(3, np.nan)
+            ),
+            "target_eef_rot6d_raw": (
+                np.asarray(target_eef_rot6d_raw, dtype=np.float64)
+                if target_eef_rot6d_raw is not None
+                else np.full(6, np.nan)
+            ),
+            "action_hand_joint_raw": (
+                np.asarray(action_hand_joint_raw, dtype=np.float64)
+                if action_hand_joint_raw is not None
+                else hand_cmd.copy()
+            ),
+            "policy_map_time_ms": policy_map_time_ms,
+            "hand_retarget_time_ms": hand_retarget_time_ms,
+            "transition_check_time_ms": transition_check_time_ms,
+            "policy_compute_time_ms": policy_compute_time_ms,
         },
     )
 
@@ -1553,6 +1821,22 @@ def _build_robot_state(
 _retarget_fail_warn = ThrottledWarner()
 
 
+def _get_raw_hand_command(
+    retargeter: TAGHandRetargeter | XHandRetargeter | None,
+    filtered_command: np.ndarray,
+    retarget_ok: bool,
+) -> np.ndarray:
+    """Return pre-EMA TAG output when available, otherwise the filtered command."""
+    fallback = np.asarray(filtered_command, dtype=np.float64).copy()
+    if not retarget_ok or retargeter is None:
+        return fallback
+    raw = getattr(retargeter, "last_raw_qpos", None)
+    if raw is None:
+        return fallback
+    raw_arr = np.asarray(raw, dtype=np.float64)
+    return raw_arr.copy() if raw_arr.shape == (12,) and np.all(np.isfinite(raw_arr)) else fallback
+
+
 def _compute_hand_command(
     retargeter: TAGHandRetargeter | XHandRetargeter | None,
     vr_frame: dict | None,
@@ -1601,7 +1885,7 @@ def _reset_hand_retargeter(
         try:
             retargeter.reset(initial_qpos=hand_qpos)
         except Exception:
-            pass
+            logger.warning("Hand retargeter reset failed — previous optimizer state retained", exc_info=True)
 
 
 def _seed_hand_retargeter(

@@ -3,7 +3,7 @@
 
 5-process SharedStorage model: camera, VR, policy, arm (Mode 6), hand.
 Safety: DISARMED/ARMED/RUNNING/FAULT state machine + 5 per-process heartbeats.
-Recording: HDF5 schema v11 via TimestampAlignedBuffer → EpisodeRecorder.
+Recording: HDF5 schema v13 via TimestampAlignedBuffer → EpisodeRecorder.
 
 Usage:
     python examples/real/vr_teleop_hand_record.py [--task T] [--operator O] [--acc A] [--speed S]
@@ -60,7 +60,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="VR Teleop xArm7 + XHand with recording")
     parser.add_argument("--task", type=str, default="", help="Task label for recording metadata")
     parser.add_argument("--operator", type=str, default="", help="Operator name for recording metadata")
-    parser.add_argument("--acc", type=_positive_float, default=900.0, help="Joint max acceleration (°/s², default: 900)")
+    parser.add_argument(
+        "--acc", type=_positive_float, default=900.0, help="Joint max acceleration (°/s², default: 900)"
+    )
     parser.add_argument("--speed", type=_positive_float, default=120.0, help="Joint max speed (°/s, default: 120)")
     parser.add_argument("--no-hand", action="store_true", help="Disable hand retargeting (hold-position only)")
     parser.add_argument("--config", type=str, default=None, help="JSON file with config overrides (flat fields only)")

@@ -35,6 +35,10 @@ class HandProcessConfig:
     home_settle_timeout_s: float = field(default_factory=lambda: hand.home_settle_timeout_s)
     home_settle_tol_rad: float = field(default_factory=lambda: hand.home_settle_tol_rad)
 
+    # Feedback-only diagnostic tolerance; strict XHand command limits are
+    # configured separately in XHandConfig and remain unchanged.
+    feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
+
     # Qpos freshness detection (driver board lockout guard)
     stale_qpos_frame_limit: int = field(default_factory=lambda: hand.stale.frame_count)
     stale_qpos_delta_rad: float = field(default_factory=lambda: hand.stale.qpos_delta_rad)
@@ -75,7 +79,12 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _tor_max_pj = np.full(12, 300, dtype=np.int32)
         _tor_max_pj[3] = 380
 
-        hand = XHand(XHandConfig(tor_max_per_joint=_tor_max_pj))
+        hand = XHand(
+            XHandConfig(
+                tor_max_per_joint=_tor_max_pj,
+                feedback_bound_tolerance_rad=cfg.feedback_bound_tolerance_rad,
+            )
+        )
         if not hand.connect():
             if cfg.startup_failure_is_fatal:
                 logger.error("hand_loop: connect failed")
@@ -393,6 +402,19 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             logger.warning("hand_loop: pre-disconnect home failed", exc_info=True)
 
     try:
+        _feedback_stats = hand.feedback_bound_stats
+        _feedback_checks = int(_feedback_stats["checks"])
+        if _feedback_checks:
+            logger.info(
+                "hand_loop: feedback bounds checks=%d outside=%d over_tolerance=%d "
+                "max=%.3fdeg tolerance=%.3fdeg per_joint_over=%s",
+                _feedback_checks,
+                int(_feedback_stats["outside_bounds_frames"]),
+                int(_feedback_stats["over_tolerance_frames"]),
+                float(np.rad2deg(float(_feedback_stats["max_violation_rad"]))),
+                float(np.rad2deg(cfg.feedback_bound_tolerance_rad)),
+                np.asarray(_feedback_stats["per_joint_over_tolerance_counts"], dtype=np.int64).tolist(),
+            )
         hand.stop()
         hand.disconnect()
     except Exception:

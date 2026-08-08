@@ -4,7 +4,7 @@ Accumulate-then-dump: state/action/vr streams aligned to dt=1/control_hz via
 TimestampAlignedBuffer, flushed in bulk at stop_episode(). Camera frames batched
 every ~10s, tail-padded to grid length at stop.
 
-Schema v11 datasets (add_frame data dict):
+Schema v13 datasets (add_frame data dict):
   Observables: arm_qpos(7), arm_ee(9), arm_qvel(7), arm_tau(7),
     hand_qpos(12), hand_fingertip(5,3), hand_contact(5,3),
     hand_tactile_force(5,120,3), hand_tactile_contact(5),
@@ -13,14 +13,16 @@ Schema v11 datasets (add_frame data dict):
     hand_qpos_stale, hand_error_state
   Actions: action_arm_joint(7), action_arm_ee(9), action_hand_joint(12),
     action_arm_joint_sent(7, opt-in v9)
-  Flags: flag_ik_ok, flag_ik_attempted, flag_retarget_ok, flag_held,
-    flag_safety_reject, camera_health, flag_frame_status
+  Flags: flag_sample_valid, flag_ik_ok, flag_ik_attempted, flag_retarget_ok,
+    flag_held, flag_safety_reject, camera_health, flag_frame_status
   VR: vr_wrist_pos(3), vr_wrist_rot6d(6), vr_landmarks(21,3)
   Diagnostics (v10+): tracking_error, ik_solve_time_ms, target_pos_before_clamp(3),
     head_quat_wxyz(4), arm_last_cmd_seq, arm_last_cmd_queue_latency_s,
     arm_last_cmd_apply_latency_s, arm_last_cmd_sdk_duration_s,
-    arm_last_cmd_is_hold
-  Meta: timestamp (synthetic grid-aligned), /meta group with attrs
+    arm_last_cmd_is_hold. v13 adds target_eef_pos_raw(3), target_eef_rot6d_raw(6),
+    action_hand_joint_raw(12), policy_map_time_ms, hand_retarget_time_ms,
+    transition_check_time_ms, policy_compute_time_ms
+  Meta: timestamp (synthetic grid-aligned), /meta group with explicit wall/grid timing
 
 Tactile force stored as a 5-finger x 120-taxel x 3-axis array; hand_tactile_ring
 publishes sparsely (contact-only writes).  hand_state_ring publishes every tick.
@@ -53,7 +55,7 @@ logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
 
-SCHEMA_VERSION_V11 = 11  # v11: +flag_ik_attempted +flag_frame_status (always recorded)
+SCHEMA_VERSION = 13  # v13: explicit wall/grid timing + raw targets and policy-stage telemetry
 
 
 # ── atexit safety net ──
@@ -440,6 +442,18 @@ class EpisodeRecorder:
             "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
             "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
             "vr_landmarks": np.asarray(vr_frame["landmarks"], dtype=np.float64),
+            # ── Policy diagnostics (schema v13; optional values use NaN) ──
+            "tracking_error": np.nan,
+            "ik_solve_time_ms": np.nan,
+            "target_pos_before_clamp": np.full(3, np.nan),
+            "head_quat_wxyz": np.full(4, np.nan),
+            "target_eef_pos_raw": np.full(3, np.nan),
+            "target_eef_rot6d_raw": np.full(6, np.nan),
+            "action_hand_joint_raw": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
+            "policy_map_time_ms": np.nan,
+            "hand_retarget_time_ms": np.nan,
+            "transition_check_time_ms": np.nan,
+            "policy_compute_time_ms": np.nan,
         }
         # ── Opt-in sent-command stream (schema v9) ──
         # None (kwarg unset) → zeros: the TimestampAlignedBuffer forward-fills
@@ -450,7 +464,7 @@ class EpisodeRecorder:
             sent = np.asarray(arm_qpos_sent, dtype=np.float64) if arm_qpos_sent is not None else np.full(7, np.nan)
             data["action_arm_joint_sent"] = sent
 
-        # ── Diagnostics (v10): continuous telemetry — auto-discovered by _flush_buffered ──
+        # ── Diagnostics: caller values override the schema defaults above ──
         if diagnostics:
             for key, val in diagnostics.items():
                 data[key] = np.asarray(val, dtype=np.float64)
@@ -627,11 +641,6 @@ class EpisodeRecorder:
         new_start = self._flushed_frames
 
         for h5_key, arr in buf_data.items():
-            # flag_sample_valid is internal TimestampAlignedBuffer bookkeeping
-            # (tracks which grid slots received source samples vs were back-filled).
-            # Excluded from HDF5 — not a user-facing dataset.
-            if h5_key == "flag_sample_valid":
-                continue
             if h5_key not in self._datasets:
                 self._datasets[h5_key] = self._file.create_dataset(
                     h5_key,
@@ -846,11 +855,21 @@ class EpisodeRecorder:
         # ── Write final metadata ──
         if self._file is not None:
             meta = self._file["meta"]
-            meta.attrs["schema_version"] = SCHEMA_VERSION_V11
+            grid_dt_s = 1.0 / self.control_hz
+            grid_duration_s = max(0, self._frame_count - 1) * grid_dt_s
+            meta.attrs["schema_version"] = SCHEMA_VERSION
+            # Backward compatibility: duration keeps its historical wall-clock
+            # meaning.  v13 adds explicit names so paused/audio time can no
+            # longer be mistaken for a reduced control/sample rate.
             meta.attrs["duration"] = duration
+            meta.attrs["wall_duration_s"] = duration
+            meta.attrs["grid_duration_s"] = grid_duration_s
+            meta.attrs["grid_dt_s"] = grid_dt_s
+            meta.attrs["non_sampled_duration_s"] = max(0.0, duration - grid_duration_s)
             meta.attrs["num_frames"] = self._frame_count
             meta.attrs["success"] = success
-            meta.attrs["fps"] = self._frame_count / duration if duration > 0 else self.control_hz
+            meta.attrs["fps"] = self.control_hz
+            meta.attrs["wall_fps"] = self._frame_count / duration if duration > 0 else self.control_hz
             meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
             meta.attrs["has_camera"] = _had_rgb
             meta.attrs["has_pointcloud"] = "pointcloud" in self._datasets

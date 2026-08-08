@@ -252,8 +252,19 @@ def test_episode_recorder_persists_arm_command_timing(tmp_path: Path) -> None:
     assert recorder.join_stop(timeout=5.0)
 
     with h5py.File(Path(episode_path) / "data.h5", "r") as h5_file:
+        meta = h5_file["meta"].attrs
+        assert int(meta["schema_version"]) == 13
+        assert float(meta["fps"]) == pytest.approx(16.0)
+        assert float(meta["grid_dt_s"]) == pytest.approx(1.0 / 16.0)
+        assert float(meta["grid_duration_s"]) == pytest.approx(0.0)
+        assert float(meta["duration"]) == pytest.approx(float(meta["wall_duration_s"]))
+        assert float(meta["non_sampled_duration_s"]) >= 0.0
+        assert bool(h5_file["flag_sample_valid"][0]) is True
         assert int(h5_file["arm_last_cmd_seq"][0]) == 42
         assert float(h5_file["arm_last_cmd_queue_latency_s"][0]) == pytest.approx(0.004)
         assert float(h5_file["arm_last_cmd_apply_latency_s"][0]) == pytest.approx(0.006)
         assert float(h5_file["arm_last_cmd_sdk_duration_s"][0]) == pytest.approx(0.002)
         assert bool(h5_file["arm_last_cmd_is_hold"][0]) is True
+        assert h5_file["target_eef_pos_raw"].shape == (1, 3)
+        assert h5_file["action_hand_joint_raw"].shape == (1, 12)
+        assert np.isnan(h5_file["policy_compute_time_ms"][0])

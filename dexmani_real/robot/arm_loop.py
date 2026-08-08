@@ -94,7 +94,24 @@ def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
                 details = info
         except Exception:
             logger.warning("arm_loop: failed to read C31 diagnostics", exc_info=True)
-    logger.error("arm_loop: collision fault C%d detected; details=%s", error_code, details)
+    if error_code == 31 and isinstance(details, (list, tuple, np.ndarray)) and len(details) >= 3:
+        try:
+            servo_id = int(details[0])
+            theoretical_tau = float(details[1])
+            actual_tau = float(details[2])
+        except (TypeError, ValueError, OverflowError):
+            logger.error("arm_loop: collision fault C31 detected; details=%s", details)
+        else:
+            logger.error(
+                "arm_loop: collision fault C31 detected; servo_id=%d "
+                "theoretical_tau=%.3f actual_tau=%.3f delta_tau=%.3f",
+                servo_id,
+                theoretical_tau,
+                actual_tau,
+                actual_tau - theoretical_tau,
+            )
+    else:
+        logger.error("arm_loop: collision fault C%d detected; details=%s", error_code, details)
     shared.error_state.value = True
 
 
@@ -184,8 +201,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         # URDF weighted-COM of all end-effector links; flange_joint2 corrected
         # 0.043→0.033 m per physical measurement.
         _require_sdk_ok("set_tcp_load", arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5]))
-        # Torque-based collision detection (level 1). Detects impacts but may
-        # miss slow contact. Primary table protection: self-collision + z-clearance.
+        # Torque-based collision detection (level 1, least-sensitive enabled
+        # setting). Keep this firmware backstop enabled during intentional contact.
         _require_sdk_ok("set_joint_maxacc", arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True))
     except Exception as e:
         logger.error("arm_loop: post-recovery config failed: %s", e)

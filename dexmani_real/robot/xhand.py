@@ -20,7 +20,7 @@ except ImportError:
 
 
 from dexmani_real.utils.array_utils import nan_array, safe_resize
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
@@ -87,6 +87,11 @@ class XHandConfig:
 
     qpos_max: np.ndarray = field(default_factory=lambda: np.asarray(hand.qpos_max_rad, dtype=np.float64))
 
+    # Feedback-only tolerance for measured encoder positions outside the strict
+    # command limits. It classifies diagnostics; it never widens or clips the
+    # feedback stream and is independent of clip_report_tolerance below.
+    feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
+
     max_qvel: np.ndarray = field(
         default_factory=lambda: np.deg2rad(np.ones(12) * 180.0),
         metadata={"help": "Per-joint max velocity (rad/s) — soft speed limit for joint-space moves."},
@@ -110,9 +115,9 @@ class XHandConfig:
     mode: int = 3
 
     clip_joint_limit: bool = True
-    # Minimum per-joint deviation (rad) before CLIP flag is set in status output.
-    # Prevents logspam from sub-degree retargeting imprecision (≈0.57° = 0.01 rad).
-    # Actual np.clip is always enforced regardless of this threshold.
+    # Command-side reporting threshold: minimum requested-target deviation (rad)
+    # before the CLIP status flag is set. np.clip is always enforced. This does
+    # not classify encoder feedback; feedback_bound_tolerance_rad does that.
     clip_report_tolerance: float = 0.01
 
     # ── Per-step delta clamp (off by default) ──
@@ -133,6 +138,10 @@ class XHandConfig:
     # Values are in Newtons (parse_tactile_sum divides SDK raw readings by 10).
     # 1.0 N ≈ light touch; ref: DexUMI eval_xhand.py:72 binary_cutoff=[10,10,10] (raw).
     tactile_contact_threshold: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
+            raise ValueError("feedback_bound_tolerance_rad must be finite and >= 0")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "XHandConfig":
@@ -155,6 +164,16 @@ class XHand:
         self.last_cmd_time: float | None = None
         self.last_error_code: int | None = None
         self.last_joint_limit_clipped = False
+
+        # Measured-feedback diagnostics are deliberately separate from command
+        # clipping. Raw finite qpos remains unchanged when published/recorded.
+        self._feedback_bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
+        self._feedback_bound_checks = 0
+        self._feedback_bound_outside = 0
+        self._feedback_bound_over_tolerance = 0
+        self._feedback_bound_max_violation_rad = 0.0
+        self._feedback_bound_joint_outside_counts = np.zeros(12, dtype=np.int64)
+        self._feedback_bound_joint_over_tolerance_counts = np.zeros(12, dtype=np.int64)
 
         # Error recovery: track consecutive send failures for circuit breaker
         self._consecutive_send_errors: int = 0
@@ -786,6 +805,7 @@ class XHand:
             return state
 
         state = self.parse_state(hand_state, full=full)
+        self._record_feedback_bound_check(state["qpos"])
         self.last_error_code = 0
         self.last_error_message = ""
         # Bridge board-status (Layer 2) into safety gate: per-joint hardware
@@ -1056,9 +1076,9 @@ class XHand:
         return force_sum
 
     def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
-        # XHand variant: per-joint CLIP flag with tolerance (0.01 rad) for noise suppression.
-        # but with different clipping targets (hand finger ranges vs arm joint ranges).
-        # clip_report_tolerance suppresses false CLIP flags from sub-degree retargeting noise.
+        # Command targets always stay inside strict SDK bounds. The reporting
+        # tolerance here is command-side only and is unrelated to measured
+        # feedback_bound_tolerance_rad.
         if not self.config.clip_joint_limit:
             self.last_joint_limit_clipped = False
             return qpos
@@ -1067,6 +1087,53 @@ class XHand:
         max_deviation = float(np.max(np.abs(qpos - clipped)))
         self.last_joint_limit_clipped = max_deviation > self.config.clip_report_tolerance
         return clipped
+
+    @property
+    def feedback_bound_stats(self) -> dict[str, Any]:
+        """Return a copy of cumulative finite measured-qpos bound statistics."""
+        return {
+            "checks": self._feedback_bound_checks,
+            "outside_bounds_frames": self._feedback_bound_outside,
+            "over_tolerance_frames": self._feedback_bound_over_tolerance,
+            "max_violation_rad": self._feedback_bound_max_violation_rad,
+            "per_joint_outside_counts": self._feedback_bound_joint_outside_counts.copy(),
+            "per_joint_over_tolerance_counts": self._feedback_bound_joint_over_tolerance_counts.copy(),
+        }
+
+    def _record_feedback_bound_check(self, qpos: Any) -> None:
+        """Count one raw feedback frame without modifying it or command bounds."""
+        qpos_array = np.asarray(qpos, dtype=np.float64)
+        if qpos_array.shape != (12,) or not np.all(np.isfinite(qpos_array)):
+            return
+
+        violation = np.maximum(
+            np.maximum(self.config.qpos_min - qpos_array, 0.0),
+            np.maximum(qpos_array - self.config.qpos_max, 0.0),
+        )
+        outside = violation > 1e-12
+        over_tolerance = violation > self.config.feedback_bound_tolerance_rad
+
+        self._feedback_bound_checks += 1
+        self._feedback_bound_joint_outside_counts[outside] += 1
+        self._feedback_bound_joint_over_tolerance_counts[over_tolerance] += 1
+        if np.any(outside):
+            self._feedback_bound_outside += 1
+            self._feedback_bound_max_violation_rad = max(
+                self._feedback_bound_max_violation_rad,
+                float(np.max(violation)),
+            )
+        if np.any(over_tolerance):
+            self._feedback_bound_over_tolerance += 1
+            joints = np.flatnonzero(over_tolerance)
+            self._feedback_bounds_warn(
+                "XHand feedback exceeds bound tolerance "
+                "(SDK joints=%s, deviation_deg=%s, tolerance=%.3fdeg, over_tolerance=%d/%d)",
+                joints.tolist(),
+                np.round(np.rad2deg(violation[joints]), 3).tolist(),
+                float(np.rad2deg(self.config.feedback_bound_tolerance_rad)),
+                self._feedback_bound_over_tolerance,
+                self._feedback_bound_checks,
+            )
 
     def is_valid_qpos_state(self, state: dict[str, Any]) -> bool:
         qpos = state.get("qpos", None)

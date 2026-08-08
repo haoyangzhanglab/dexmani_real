@@ -294,10 +294,8 @@ class TeleopProfile:
 
     # ── Null-space optimization ──
     # Post-IK null-space projection that adjusts the redundant DOF to repel
-    # joints from their limits without altering the EEF pose (J · dq_null = 0).
-    # Enabled by default: the ~130 us overhead is negligible at 30 Hz, all
-    # safety gates (collision, pre-send, step-limit) run after this step,
-    # and it cannot degrade EEF tracking by construction.
+    # joints from their limits while preserving the EEF pose to first order
+    # (J · dq_null = 0). Final nonlinear pose and collision gates run after it.
     enable_nullspace_optimization: bool = True
     nullspace_step_size_deg: float = 1.0  # max null-space joint step per frame [deg]
     nullspace_joint_limit_margin_deg: float = 15.0  # repulsion margin from limits [deg]

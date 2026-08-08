@@ -512,7 +512,6 @@ def main():
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
-        home_qpos=np.array(arm.home_qpos, dtype=np.float64),
     )
     # Camera calibration is an arm-only experiment: no XHand worker is
     # started. Explicitly seed the 19-DOF collision model with the configured

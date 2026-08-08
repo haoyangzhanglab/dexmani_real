@@ -155,7 +155,9 @@ class ArmParams:
 
     # ── Safety ──
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
-    collision_sensitivity: int = 1  # 0-5, 1 = most sensitive
+    # UFACTORY semantics: 0 disables detection; 1 is the least-sensitive
+    # enabled level and sensitivity increases through level 5.
+    collision_sensitivity: int = 1
     recoverable_errors: frozenset[int] = frozenset({24})  # C24 speed-limit error only
     collision_fault_errors: frozenset[int] = frozenset({22, 31})  # self-collision / collision current
 
@@ -243,6 +245,11 @@ class HandParams:
         1.919,
         1.919,
     )
+    # Measured joint feedback may settle slightly outside the command/model
+    # limits because of encoder resolution, PID steady-state error, backlash,
+    # or external load. This tolerance applies ONLY to feedback diagnostics and
+    # optimizer warm starts; command and NLopt bounds remain strict.
+    feedback_bound_tolerance_rad: float = 0.01  # ~0.57 deg
     # 0.20 rad per 16 Hz policy frame (~183 deg/s). This bounds motor jumps
     # and caps the conservative arm×hand transition collision grid.
     max_delta_rad: float | None = 0.20
@@ -252,6 +259,8 @@ class HandParams:
             raise ValueError("hand qpos defaults must have 12 elements")
         if not all(lo <= hi for lo, hi in zip(self.qpos_min_rad, self.qpos_max_rad)):
             raise ValueError("hand qpos_min_rad must be <= qpos_max_rad")
+        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
+            raise ValueError("hand feedback_bound_tolerance_rad must be finite and >= 0")
         if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
             raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
 
@@ -319,10 +328,22 @@ class PolicyParams:
     status_print_interval: int = 16  # status print interval (ticks)
     max_consecutive_errors: int = 10
 
+    # ── Contact-stall resync ──
+    # This is not a table exclusion zone. Near the tabletop, a downward target
+    # is resynchronised to measured pose only when the previous Mode-6 joint
+    # target has accumulated error and the arm is no longer closing that error.
+    contact_stall_enabled: bool = True
+    contact_stall_table_context_height_m: float = 0.18
+    contact_stall_min_downward_target_m: float = 0.003
+    contact_stall_tracking_error_rad: float = 0.18
+    contact_stall_max_closing_speed_rad_s: float = 0.05
+
     # ── Hand retargeting ──
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
-    hand_ramp_frame_count: int = 16  # smoothstep ramp (~1s @ 16Hz)
+    hand_output_smoothing_alpha: float = 0.5  # retarget post-filter; ~62.5ms group delay at 16Hz
+    hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
+    begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
 
     def __post_init__(self):
@@ -332,6 +353,23 @@ class PolicyParams:
             raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
         if not (0.0 <= self.ema.alpha_rot <= 1.0):
             raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
+        if not (0.0 <= self.hand_output_smoothing_alpha <= 1.0):
+            raise ValueError("hand_output_smoothing_alpha must be in [0, 1]")
+        if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
+            raise ValueError("hand_ramp_duration_s must be finite and >= 0")
+        if not np.isfinite(self.begin_motion_gate_timeout_s) or self.begin_motion_gate_timeout_s < 0:
+            raise ValueError("begin_motion_gate_timeout_s must be finite and >= 0")
+        if not np.isfinite(self.contact_stall_table_context_height_m) or self.contact_stall_table_context_height_m <= 0:
+            raise ValueError("contact_stall_table_context_height_m must be finite and > 0")
+        if not np.isfinite(self.contact_stall_min_downward_target_m) or self.contact_stall_min_downward_target_m <= 0:
+            raise ValueError("contact_stall_min_downward_target_m must be finite and > 0")
+        if not np.isfinite(self.contact_stall_tracking_error_rad) or self.contact_stall_tracking_error_rad <= 0:
+            raise ValueError("contact_stall_tracking_error_rad must be finite and > 0")
+        if (
+            not np.isfinite(self.contact_stall_max_closing_speed_rad_s)
+            or self.contact_stall_max_closing_speed_rad_s < 0
+        ):
+            raise ValueError("contact_stall_max_closing_speed_rad_s must be finite and >= 0")
 
 
 @dataclass

@@ -59,6 +59,12 @@ class XArm7MotionPlanner:
     ) -> None:
         import mplib
 
+        if home_qpos is not None:
+            logger.warning(
+                "XArm7MotionPlanner.home_qpos is deprecated and ignored; "
+                "teleop null-space optimization now performs joint-limit repulsion only"
+            )
+
         self.mplib = mplib
         self.config = config
         self.planning_profile = planning_profile or PlanningProfile()
@@ -144,7 +150,6 @@ class XArm7MotionPlanner:
             self.ik_mgr,
             self.teleop_profile,
             elbow_joint_index=self._elbow_joint_index,
-            home_qpos=home_qpos,
         )
 
         # Convenience aliases (used by teleop_solver and external code)

@@ -175,7 +175,8 @@ commands before they reach firmware; firmware remains the final safety backstop.
    `clean_error+set_state+set_mode` recovery; repeated C24 failures → FAULT)
    + `except Exception` path also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
 2. **Policy-level:** arm connected gate + NaN guard + workspace clamp + conservative
-   asynchronous arm-hand transition envelope +
+   asynchronous arm-hand transition envelope + downward contact-stall pose resync
+   near the tabletop (context only; not a table exclusion zone) +
    safety_state gate (ARMED required for B, FAULT blocks send) + hand_qpos_stale hold
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure + delta clamp
 4. **E-stop:** Policy sets `estop_request=True` → Arm/Hand detect flag → `set_state(4)`
@@ -213,13 +214,15 @@ commands before they reach firmware; firmware remains the final safety backstop.
 
 ## Recording Format
 
-HDF5 v11. All streams grid-aligned to 16 Hz. Pipeline: `TimestampAlignedBuffer` → `EpisodeRecorder` (accumulate-then-dump, async writer).
+HDF5 v13. All streams are grid-aligned (normally 16 Hz). Pipeline: `TimestampAlignedBuffer` → `EpisodeRecorder` (accumulate-then-dump, async writer). `flag_sample_valid` distinguishes source samples from grid back-fills. `/meta/fps` and `control_hz` denote the nominal grid rate; `duration` retains its legacy wall-clock meaning, while `wall_duration_s`, `grid_duration_s`, `grid_dt_s`, `non_sampled_duration_s`, and `wall_fps` make pauses and prompt gates explicit. Raw arm/hand targets and policy-stage timing datasets support latency diagnosis.
 
 Key hand-related datasets in `data.h5` (full catalog: `episode_recorder.py:add_frame()`):
 - `hand_qpos` (T,12), `hand_fingertip` (T,5,3), `hand_contact` (T,5,3), `hand_tactile_force` (T,5,120,3), `hand_tactile_contact` (T,5)
 - `hand_current` (T,12), `hand_connected` (T,), `hand_qpos_stale` (T,), `hand_error_state` (T,)
 - `hand_tipboard_err` / `hand_commboard_err` / `hand_jointboard_err` (T,12)
 - `action_hand_joint` (T,12), `flag_retarget_ok` (T,), `flag_frame_status` (T,)
+
+`episode_quality health` reports measured `hand_qpos` excursions outside the strict SDK command bounds. The independent `hand_feedback_bound_tolerance_rad` metadata/config value classifies sub-degree settling error without widening command or optimizer bounds. The XHand driver counts every finite 30 Hz feedback read, throttles only over-tolerance warnings, and logs the aggregate/per-joint totals at worker exit; the episode report computes the analogous statistics on valid recorded source frames.
 
 `hand_tactile_ring` publishes sparsely (contact-only); `hand_state_ring` publishes every tick (30 Hz).
 

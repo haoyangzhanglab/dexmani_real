@@ -72,13 +72,14 @@ class ThrottledWarner:
     (torn reads, stale state, producer mismatch).  Default interval: 5.0 s.
     """
 
-    def __init__(self, interval_s: float = 5.0) -> None:
+    def __init__(self, interval_s: float = 5.0, logger: logging.Logger | None = None) -> None:
         self._interval_ns = int(interval_s * 1e9)
         self._last_ns = 0
+        self._logger = logger or _logger
 
     def __call__(self, msg: str, *args: Any, **kwargs: Any) -> None:
         now_ns = time.monotonic_ns()
         if now_ns - self._last_ns < self._interval_ns:
             return
         self._last_ns = now_ns
-        _logger.warning(msg, *args, **kwargs)
+        self._logger.warning(msg, *args, **kwargs)

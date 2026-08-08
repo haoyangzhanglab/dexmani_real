@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from dexmani_real.planning.ik import TeleopIKSolver, nullspace_projector
+from dexmani_real.planning.ik import TeleopIKSolver, apply_nullspace_optimization, nullspace_projector
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.planning.planner import XArm7MotionPlanner
 from dexmani_real.planning.types import Pose, TeleopProfile
@@ -85,7 +85,7 @@ def test_final_ik_validation_rejects_nonlinear_nullspace_drift():
 
         @staticmethod
         def compute_world_pose_error(_target, qpos):
-            return float(qpos[6] ** 2), 0.0
+            return float((qpos[6] - 0.95) ** 2), 0.0
 
     class FakeManager:
         joint_limits = np.column_stack((-np.ones(7), np.ones(7)))
@@ -108,13 +108,24 @@ def test_final_ik_validation_rejects_nonlinear_nullspace_drift():
         max_pose_error_pos_m=0.001,
         nullspace_step_size_deg=10.0,
     )
-    solver = TeleopIKSolver(FakeKinematics(), FakeManager(), profile, home_qpos=np.array([0, 0, 0, 0, 0, 0, 0.5]))
+    solver = TeleopIKSolver(FakeKinematics(), FakeManager(), profile)
+    target_qpos = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.95])
 
-    result = solver._command_from_target_qpos(Pose.identity(), np.zeros(7), np.zeros(7), np.zeros(7), profile, {})
+    result = solver._command_from_target_qpos(Pose.identity(), target_qpos, target_qpos, target_qpos, profile, {})
 
     assert not result.success
     assert result.held
     assert "pose-error" in result.reason
+
+
+def test_nullspace_is_noop_away_from_joint_limits():
+    qpos = np.array([0.3, -0.2, 0.1, 0.4, -0.5, 0.2, -0.1])
+    jacobian = np.column_stack([np.eye(6), np.ones(6)])
+    limits = np.column_stack((-2.0 * np.ones(7), 2.0 * np.ones(7)))
+
+    result = apply_nullspace_optimization(qpos, jacobian, limits, margin_deg=15.0)
+
+    np.testing.assert_array_equal(result, qpos)
 
 
 def test_workspace_segment_checks_intermediate_states():

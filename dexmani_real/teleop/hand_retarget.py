@@ -200,8 +200,9 @@ class XHandRetargeter:
         cfg = yaml_config["retargeting"]
 
         # Teleoperator-level EMA (our custom field, not a RetargetingConfig param)
+        yaml_smoothing_alpha = float(cfg.pop("smoothing_alpha", 0.3))
         if self._smoothing_alpha is None:
-            self._smoothing_alpha = float(cfg.pop("smoothing_alpha", 0.3))
+            self._smoothing_alpha = yaml_smoothing_alpha
 
         # Standard build (same path as LeFranX)
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
@@ -378,7 +379,11 @@ class TAGHandRetargeter:
         ``"right"`` (default).
     smoothing_alpha:
         Teleoperator-level EMA smoothing factor (0.0 = freeze, 1.0 = pass-through).
-        Default 0.3 provides moderate smoothing at 16 Hz.
+        ``None`` uses the central policy default (currently 0.5 at 16 Hz).
+    feedback_bound_tolerance_rad:
+        Allowed measured-qpos excursion outside strict optimizer bounds. This
+        affects reset diagnostics only; warm starts are always clipped and
+        optimizer outputs always obey the strict bounds.
     debug:
         If True, log per-frame retargeting timing.
     """
@@ -386,12 +391,15 @@ class TAGHandRetargeter:
     def __init__(
         self,
         hand_type: str = "right",
-        smoothing_alpha: float = 0.3,
+        smoothing_alpha: float | None = None,
         debug: bool = False,
+        feedback_bound_tolerance_rad: float | None = None,
     ) -> None:
         from scipy.spatial.transform import Rotation
 
-        from dexmani_real.config.defaults import hand as hand_d, tag_retargeting as tag_cfg
+        from dexmani_real.config.defaults import hand as hand_d
+        from dexmani_real.config.defaults import policy as policy_d
+        from dexmani_real.config.defaults import tag_retargeting as tag_cfg
         from dexmani_real.teleop.tag_retargeting.optimizer import HandOptimizer
 
         # ── Load URDF, read joint limits ──
@@ -470,6 +478,11 @@ class TAGHandRetargeter:
             pinch_skip_threshold=tag_cfg.pinch_skip_threshold,
             reg_stage1_weight=tag_cfg.reg_stage1_weight,
             reg_last_weight=tag_cfg.reg_last_weight,
+            feedback_bound_tolerance_rad=(
+                hand_d.feedback_bound_tolerance_rad
+                if feedback_bound_tolerance_rad is None
+                else feedback_bound_tolerance_rad
+            ),
         )
 
         # ── Pre-computed transforms (avoid per-frame allocation) ──
@@ -477,8 +490,10 @@ class TAGHandRetargeter:
         # Identity: MANO +Z (finger extension) → URDF +Z (finger extension). Verified 2026-08-07.
 
         # ── Smoothing & debug ──
-        self._smoothing_alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
+        effective_smoothing_alpha = policy_d.hand_output_smoothing_alpha if smoothing_alpha is None else smoothing_alpha
+        self._smoothing_alpha = float(np.clip(effective_smoothing_alpha, 0.0, 1.0))
         self._ema_state: np.ndarray | None = None
+        self._last_raw_qpos: np.ndarray | None = None
         self.debug = bool(debug)
 
         logger.info(
@@ -533,6 +548,7 @@ class TAGHandRetargeter:
 
         # 5. Joint order remap: model order → canonical SDK order
         qpos_sdk = qpos_model[self._mapping_model_to_sdk]
+        self._last_raw_qpos = qpos_sdk.copy()
 
         # 6. Teleoperator-level EMA post-filter
         if self._smoothing_alpha < 1.0:
@@ -558,6 +574,7 @@ class TAGHandRetargeter:
         """
         # Clear teleoperator EMA state
         self._ema_state = None
+        self._last_raw_qpos = None
 
         if initial_qpos is not None and initial_qpos.shape == (12,) and np.all(np.isfinite(initial_qpos)):
             # SDK order → model order for optimizer warm-start
@@ -565,6 +582,16 @@ class TAGHandRetargeter:
             self._optimizer.reset(qpos_model)
         else:
             self._optimizer.reset(None)
+
+    @property
+    def feedback_bound_stats(self) -> dict[str, object]:
+        """Cumulative hardware warm-start boundary statistics."""
+        return self._optimizer.feedback_bound_stats
+
+    @property
+    def last_raw_qpos(self) -> np.ndarray | None:
+        """Latest SDK-order optimizer output before the teleoperator EMA."""
+        return self._last_raw_qpos.copy() if self._last_raw_qpos is not None else None
 
     @property
     def low_pass_alpha(self) -> float:

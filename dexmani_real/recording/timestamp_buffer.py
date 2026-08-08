@@ -60,11 +60,14 @@ def _get_accumulate_timestamp_idxs(
         if global_idx < 0:
             continue
 
-        if global_idx < next_global_idx:
-            continue
-        local_idxs.append(local_idx)
-        global_idxs.append(global_idx)
-        next_global_idx = global_idx + 1
+        # Repeat this source sample across every unoccupied slot up to its own
+        # slot. This is the ManiUniCon accumulator contract: a delayed sample
+        # back-fills missed grid ticks instead of leaving zero-initialized holes.
+        n_repeats = max(0, global_idx - next_global_idx + 1)
+        for i in range(n_repeats):
+            local_idxs.append(local_idx)
+            global_idxs.append(next_global_idx + i)
+        next_global_idx += n_repeats
 
     return local_idxs, global_idxs, next_global_idx
 
@@ -154,6 +157,10 @@ class TimestampAlignedBuffer:
         if len(global_idxs) == 0:
             return
 
+        # add() accepts one source sample, so the final mapped grid index is
+        # the sample's own slot; earlier indices are back-filled slots.
+        source_global_idx = global_idxs[-1]
+
         # Check capacity — truncate to valid slots if last index overflows.
         max_required = global_idxs[-1] + 1
         if max_required > self.max_record_steps:
@@ -182,7 +189,9 @@ class TimestampAlignedBuffer:
         for key, value in data.items():
             if key in self._data_buffer:  # type: ignore[operator]
                 self._data_buffer[key][global_idxs] = value  # type: ignore[index]
-        self._data_buffer["flag_sample_valid"][global_idxs] = True  # type: ignore[index]
+        self._data_buffer["flag_sample_valid"][global_idxs] = False  # type: ignore[index]
+        if source_global_idx in global_idxs:
+            self._data_buffer["flag_sample_valid"][source_global_idx] = True  # type: ignore[index]
 
         if self._timestamp_buffer is not None:
             # Assign grid-aligned synthetic timestamps so every slot gets

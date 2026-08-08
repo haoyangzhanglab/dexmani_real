@@ -43,9 +43,9 @@ ALIGN_MODE_ALIASES = {
 class L515DepthConfig:
     """L515-only depth settings, applied via set_option after pipeline start.
 
-    All 11 settable L515 options are exposed. load_json (XU control path)
-    fails silently on the stock uvcvideo kernel, so set_option is the sole
-    config path.
+    Ten writable L515 options are exposed, plus the read-only depth-offset
+    calibration for verification. load_json (XU control path) fails silently
+    on the stock uvcvideo kernel, so set_option is the sole config path.
 
     Tuning strategy (2026-08-07): Short Range preset (5) for the close-range
     dexterous-manipulation workspace (0.25-0.85 m).  The factory Short Range
@@ -77,9 +77,8 @@ class L515DepthConfig:
     digital_gain: int = 1  # 1-2; post-ADC digital amplification.  1 = no extra
     # gain → less noise amplification.  Strong close-range signal makes the
     # extra 6 dB unnecessary.
-    depth_offset: float = 4.5  # mm; per-unit calibration constant.  Do NOT change
-    # without re-running a per-device depth calibration — this is NOT a tuning
-    # knob but a factory / calibration adjustment.
+    depth_offset: float = 4.5  # mm; expected read-only per-unit calibration.
+    # This is verified at startup, not written and not used as a tuning knob.
     post_processing_sharpening: int = 2  # 0-3; edge-enhancement on the firmware
     # depth output.  2 = moderate sharpening — crisper object boundaries without
     # the ringing artefacts that 3 can produce on thin geometry.
@@ -252,9 +251,6 @@ class RealSense:
             (rs.option.digital_gain, float(cfg.digital_gain)),
             (rs.option.post_processing_sharpening, float(cfg.post_processing_sharpening)),
             (rs.option.pre_processing_sharpening, float(cfg.pre_processing_sharpening)),
-            # depth_offset is a per-unit calibration constant — applied but
-            # not treated as a tuning knob (range is typically a single value).
-            (rs.option.depth_offset, float(cfg.depth_offset)),
         ]
         if cfg.noise_estimation is not None:
             options.append((rs.option.noise_estimation, float(cfg.noise_estimation)))
@@ -271,10 +267,17 @@ class RealSense:
         # receiver_gain is checked instead.
         time.sleep(0.5)
         actual_gain = float(sensor.get_option(rs.option.receiver_gain))
+        # depth_offset is a per-unit calibration constant and read-only on the
+        # connected L515. Verify/read it instead of issuing a failing setter.
+        actual_depth_offset = (
+            float(sensor.get_option(rs.option.depth_offset))
+            if sensor.supports(rs.option.depth_offset)
+            else float("nan")
+        )
         logger.info(
             "L515 depth config applied (set_option): preset_base=%d, laser=%d, "
             "gain=%d, conf=%d, noise=%d, min_dist=%d, digital_gain=%d, "
-            "sharpening(post=%d, pre=%d), depth_offset=%.1f, noise_est=%s",
+            "sharpening(post=%d, pre=%d), depth_offset_readback=%.1f, noise_est=%s",
             int(cfg.visual_preset),
             int(cfg.laser_power),
             int(actual_gain),
@@ -284,7 +287,7 @@ class RealSense:
             int(cfg.digital_gain),
             int(cfg.post_processing_sharpening),
             int(cfg.pre_processing_sharpening),
-            float(cfg.depth_offset),
+            actual_depth_offset,
             "preset" if cfg.noise_estimation is None else str(cfg.noise_estimation),
         )
         if not np.isclose(actual_gain, float(cfg.receiver_gain), atol=1e-6):
@@ -292,6 +295,12 @@ class RealSense:
                 "L515 receiver_gain read-back mismatch: requested=%d, actual=%.0f.",
                 int(cfg.receiver_gain),
                 actual_gain,
+            )
+        if np.isfinite(actual_depth_offset) and not np.isclose(actual_depth_offset, float(cfg.depth_offset), atol=1e-6):
+            logger.warning(
+                "L515 read-only depth_offset mismatch: expected=%.1f, actual=%.1f",
+                float(cfg.depth_offset),
+                actual_depth_offset,
             )
 
     def _setup_pipeline_post_start(self) -> None:
