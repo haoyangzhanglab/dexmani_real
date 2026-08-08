@@ -44,12 +44,12 @@ def wrap_nearest_equivalent(
     joint_limit_lower: tuple[float, ...],
     joint_limit_upper: tuple[float, ...],
 ) -> np.ndarray:
-    """Wrap equivalent joints to the nearest +/-2*pi band of *reference*.
+    """Select the nearest limit-valid equivalent of each joint.
 
     Equivalent joints are those where the joint limit span exceeds 2*pi
     (J1, J3, J5, J7 on xArm7).  For each such joint, the value is shifted
     by an integer multiple of 2*pi so it is as close as possible to the
-    corresponding reference value, then clipped to hardware limits.
+    corresponding reference value while remaining inside hardware limits.
 
     Non-equivalent joints are returned unchanged.
 
@@ -65,34 +65,33 @@ def wrap_nearest_equivalent(
     result = np.asarray(qpos, dtype=np.float64).copy()
     lo = np.asarray(joint_limit_lower, dtype=np.float64)
     hi = np.asarray(joint_limit_upper, dtype=np.float64)
+    ref = np.asarray(reference, dtype=np.float64)
+    if result.ndim != 1 or ref.shape != result.shape or lo.shape != result.shape or hi.shape != result.shape:
+        raise ValueError("qpos, reference, and joint limits must be matching 1-D arrays")
+    if not all(np.all(np.isfinite(values)) for values in (result, ref, lo, hi)):
+        raise ValueError("qpos, reference, and joint limits must be finite")
+    if np.any(lo > hi):
+        raise ValueError("joint lower limits must not exceed upper limits")
     joint_range = hi - lo
     is_equiv = joint_range > 2.0 * np.pi
 
     if not np.any(is_equiv):
         return result
 
-    ref = np.asarray(reference, dtype=np.float64)
     period = 2.0 * np.pi
-
-    # ── k-bounds expansion (backported from ik_candidates.canonicalize_qpos) ──
-    # When the physical arm is near a joint-limit boundary (e.g. +2π) and the
-    # raw value is near the opposite limit (e.g. -2π), the ideal wrapping factor
-    # k may push the result slightly past the limit; the final np.clip snaps it
-    # back.  Without the ±1 expansion, k_max clips the wrapping factor and the
-    # wrapped result ends up ~2π away from reference → "joint turning a full
-    # circle" during teleop.
     lo_equiv = lo[is_equiv]
     hi_equiv = hi[is_equiv]
     res_equiv = result[is_equiv]
     ref_equiv = ref[is_equiv]
     k_min = np.ceil((lo_equiv - res_equiv) / period)
     k_max = np.floor((hi_equiv - res_equiv) / period)
-    k = np.round((ref_equiv - res_equiv) / period)
     valid = k_min <= k_max
-    k = np.where(valid, np.clip(k, k_min - 1, k_max + 1), 0.0)
+    nearest_k = np.rint((ref_equiv - res_equiv) / period)
+    nearest_k = np.minimum(np.maximum(nearest_k, k_min), k_max)
+    # Preserve an invalid raw value when no legal equivalent exists.  A
+    # downstream validator can reject it; clipping would change the robot pose.
+    result[is_equiv] = np.where(valid, res_equiv + nearest_k * period, res_equiv)
 
-    result[is_equiv] += k * period
-    np.clip(result, lo, hi, out=result)
     return result
 
 
@@ -125,16 +124,13 @@ def plan_joint_home_path(
         planner:            Planner with collision model.  When None, only
                             joint-limit-aware wrapping is performed.
         table_z_surface_m:  Table top Z in arm-base frame (metres).  When
-                            provided, an additional EEF-z check ensures the
-                            fingertips cannot reach below the table surface
-                            along the planned path.  This complements the
-                            Pinocchio self-collision check — mesh-based collision
-                            detection can produce false positives for hand links
-                            (coarse convex hulls), while the EEF-z check is a
-                            simple, reliable geometric bound.
+                            provided, the lowest XHand link-frame origin is
+                            checked at every waypoint using the cached real hand
+                            posture. This complements robot self-collision;
+                            the table is not part of the SRDF model.
         hand_safety_margin_m:
-                            Conservative estimate of the maximum vertical
-                            distance from EEF to the lowest fingertip.
+                            Conservative padding from link-frame origins to the
+                            lowest hand collision surface.
                             Defaults to ``arm.hand_safety_margin_m`` (0.05 m)
                             when ``None``.  Used with *table_z_surface_m*.
     """
@@ -173,20 +169,29 @@ def plan_joint_home_path(
             if result.get("path_self_collision", False):
                 return False
 
-        # ── Table clearance check (EEF z-based, complements mesh check) ──
-        # Pinocchio convex-hull collision meshes for hand links can be
-        # conservatively large, producing false positives against the table
-        # box.  The EEF-z check provides a simple, reliable bound: the
-        # lowest fingertip is at most *hand_safety_margin_m* below the EEF.
+        # Homing bypasses planner.validate_path(), so apply the same configured
+        # world-frame EEF workspace boundary explicitly to every segment.
+        if planner is not None:
+            try:
+                for _start, _end in zip(path[:-1], path[1:]):
+                    if not planner.is_workspace_segment_safe(_start, _end):
+                        return False
+            except (ValueError, RuntimeError):
+                return False
+
+        # ── Table clearance check (orientation-aware hand link frames) ──
+        # The collision model supplies the lowest XHand link-frame origin for
+        # the actual cached hand pose.  The margin covers mesh extent below a
+        # frame origin; this avoids the old, orientation-blind EEF-z estimate.
         if _check_table:
             for _wp in path:
                 try:
-                    _eef_p = planner.kin.compute_eef_pose_world(_wp).p  # type: ignore[union-attr]
+                    _hand_min_z = planner.collision_model.minimum_hand_frame_z(_wp)  # type: ignore[union-attr]
                 except Exception:
-                    return False  # FK failure → treat as unsafe
-                if not np.all(np.isfinite(_eef_p)):
+                    return False  # FK/frame failure → treat as unsafe
+                if not np.isfinite(_hand_min_z):
                     return False
-                if float(_eef_p[2]) - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
+                if _hand_min_z - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
                     return False  # hand may collide with table
         return True
 
@@ -231,9 +236,7 @@ def plan_band_alignment_path(
 
     This function generates a dense 1°/step joint-space path that rotates
     only the band-mismatched joints through exactly one 2π wrap, then checks
-    self-collision and table clearance.  On a pure wrist-roll alignment
-    (J7 only), the EEF position is invariant so the table check is a no-op;
-    Pinocchio self-collision is the primary guard.
+    self-collision, workspace bounds, and orientation-aware hand/table clearance.
 
     Returns:
         * ``None`` — no alignment needed (*wrapped_home* ≈ *canonical_home*).
@@ -247,10 +250,10 @@ def plan_band_alignment_path(
     # Only plan if the two home positions differ on equivalent joints.
     # Use RAW (unwrapped) delta — compute_qpos_delta wraps 2π apart to 0,
     # defeating the purpose of detecting band mismatches.
-    # Equivalent joints: J1(idx=0), J3(2), J5(4), J7(6) — 720° range.
-    _EQ_MASK = np.array([True, False, True, False, True, False, True])
+    # Equivalent joints: range > 2π (J1, J3, J5, J7 on xArm7 — 720° range).
+    _eq_mask = (np.array(_arm_cfg.joint_limit_upper) - np.array(_arm_cfg.joint_limit_lower)) > 2.0 * np.pi
     _raw_delta_deg = np.rad2deg(np.abs(wrapped_home - canonical_home))
-    if not np.any(_raw_delta_deg[_EQ_MASK] > 1.0):
+    if not np.any(_raw_delta_deg[_eq_mask] > 1.0):
         return None  # same band — no alignment needed
 
     # Linear joint-space interpolation at 1°/step — this produces a pure
@@ -268,15 +271,23 @@ def plan_band_alignment_path(
         if result.get("path_self_collision", False):
             return np.empty((0, 7), dtype=np.float64)
 
+    if planner is not None:
+        try:
+            for _start, _end in zip(path[:-1], path[1:]):
+                if not planner.is_workspace_segment_safe(_start, _end):
+                    return np.empty((0, 7), dtype=np.float64)
+        except (ValueError, RuntimeError):
+            return np.empty((0, 7), dtype=np.float64)
+
     if _check_table:
         for _wp in path:
             try:
-                _eef_p = planner.kin.compute_eef_pose_world(_wp).p  # type: ignore[union-attr]
+                _hand_min_z = planner.collision_model.minimum_hand_frame_z(_wp)  # type: ignore[union-attr]
             except Exception:
                 return np.empty((0, 7), dtype=np.float64)
-            if not np.all(np.isfinite(_eef_p)):
+            if not np.isfinite(_hand_min_z):
                 return np.empty((0, 7), dtype=np.float64)
-            if float(_eef_p[2]) - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
+            if _hand_min_z - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
                 return np.empty((0, 7), dtype=np.float64)
 
     return path

@@ -22,32 +22,16 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
 # Remap from XHand SDK qpos order to Pinocchio model order.
-#
-# SDK (JOINT_NAMES from xhand.py, finger-grouped):
-#   0:thumb_abduction  1:thumb_joint1  2:thumb_joint2
-#   3:index_abduction  4:index_joint1  5:index_joint2
-#   6:middle_joint1    7:middle_joint2
-#   8:ring_joint1      9:ring_joint2
-#  10:little_joint1   11:little_joint2
-#
-# Pinocchio model.names (alphabetical by joint name):
-#   0:index_bend   1:index_joint1   2:index_joint2
-#   3:mid_joint1   4:mid_joint2
-#   5:pinky_joint1 6:pinky_joint2
-#   7:ring_joint1  8:ring_joint2
-#   9:thumb_bend  10:thumb_rota1   11:thumb_rota2
-#
-# URDF XML has thumb first; Pinocchio re-sorts alphabetically at build time
-# (index → mid → pinky → ring → thumb).  This mapping compensates for that.
-#
-# Verified 2026-07-28 against SAPIEN XArm7XHand simulation FK.
-_SDK_TO_URDF_IDX = np.array([3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2], dtype=np.intp)
+# Defined in planning.constants (single source of truth shared with collision_model.py).
+# See constants.HAND_SDK_TO_URDF_IDX for the full joint-name mapping.
+_SDK_TO_URDF_IDX = np.array(HAND_SDK_TO_URDF_IDX, dtype=np.intp)
 
 
 class HandKinematics:

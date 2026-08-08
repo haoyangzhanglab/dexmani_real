@@ -7,7 +7,8 @@ A single unified SRDF controls collision pair filtering:
 
 - ``xarm7_xhand.srdf`` — unified SRDF used by both 7-DOF and 19-DOF modes.
   Enables arm-wrist to hand collision detection while keeping hand self-collision
-  disabled (291 inter-finger Never rules retained).
+  disabled. The 19-DOF model retains 255 active pairs: 17 arm-arm and
+  238 arm-hand; no hand-hand pairs remain active.
 
 Performance (post-optimisation, measured on i9-13900K):
 
@@ -34,6 +35,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real import ASSET_DIR
+from dexmani_real.config.defaults import hand
+from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 if TYPE_CHECKING:
@@ -44,9 +47,7 @@ logger = get_logger(__name__)
 # Home (open-hand) posture — used as the default when _hand_qpos hasn't been set.
 # Zero = clenched fist, which would pass collision checks that the actual open
 # hand would fail.  Values from XHandParams.home_qpos_deg.
-_HAND_HOME_QPOS: np.ndarray = np.deg2rad(
-    np.array([0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0], dtype=np.float64)
-)
+_HAND_HOME_QPOS: np.ndarray = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
 _warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # warn every 30s if hand_qpos never set
 _collision_detail_warn = ThrottledWarner(interval_s=60.0)
 
@@ -60,16 +61,10 @@ _COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand.srdf")  # unified SRDF (single s
 
 _HAND_DOF_COUNT = 12  # number of active hand joints
 
-# User→URDF reorder map for set_hand_qpos().
-# Hardware returns hand qpos in user order:
-#   [thumb_bend, thumb_rota1, thumb_rota2, index_bend, index_j1, index_j2,
-#    mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2]
-# But the URDF (and thus Pinocchio) expects:
-#   [index_bend, index_j1, index_j2, mid_j1, mid_j2,
-#    pinky_j1, pinky_j2, ring_j1, ring_j2,
-#    thumb_bend, thumb_rota1, thumb_rota2]
-# _hand_user_to_urdf[i] = user index for URDF slot i.
-_HAND_USER_TO_URDF: tuple[int, ...] = (3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2)
+# User→URDF reorder map for set_hand_qpos().  Defined in planning.constants
+# (single source of truth shared with hand_kinematics.py).
+_HAND_USER_TO_URDF = HAND_SDK_TO_URDF_IDX
+_HAND_HOME_QPOS_URDF: np.ndarray = _HAND_HOME_QPOS[list(_HAND_USER_TO_URDF)]
 
 
 class CollisionModel:
@@ -123,8 +118,8 @@ class CollisionModel:
         # --- Collision pair setup ---
         # Both modes: URDFs have 0 default collision pairs.  Add all N*(N-1)/2
         # possible pairs, then let the SRDF remove Adjacent + Never pairs.
-        # 7-DOF:  34²/2 = 561 → after SRDF: ~0–141  (collision URDF)
-        # 19-DOF: 40²/2 = 780 → after SRDF: ~254      (full URDF, no hand self-collision)
+        # 7-DOF:  34 geometries, 233 active pairs after SRDF filtering.
+        # 19-DOF: 40 geometries, 255 active pairs (17 arm-arm + 238 arm-hand).
         import itertools
 
         n = self._collision_model.ngeoms
@@ -132,17 +127,13 @@ class CollisionModel:
             self._collision_model.addCollisionPair(pin.CollisionPair(i, j))
         pin.removeCollisionPairs(self._model, self._collision_model, _srdf)
 
-        # Hand self-collision is NOT checked — the SRDF Never rules disable
-        # all 483 inter-finger pairs, and we intentionally do NOT re-enable any.
+        # Hand self-collision is NOT checked: SRDF filtering leaves no active
+        # hand-hand pair, while arm↔hand pairs remain enabled.
         # Arm↔hand collisions (e.g., wrist hitting fingers) remain active.
 
         self._collision_data = self._collision_model.createData()
 
         self._nq: int = self._model.nq
-        self._link_names: list[str] = (
-            self._model.names.tolist() if hasattr(self._model.names, "tolist") else list(self._model.names)
-        )
-
         logger.info(
             "CollisionModel ready: %d DOF%s, %d geometries, %d collision pairs",
             self._nq,
@@ -198,10 +189,12 @@ class CollisionModel:
           ``(19,)`` (uses as-is).
         """
         qpos = np.asarray(qpos, dtype=np.float64)
+        if not np.all(np.isfinite(qpos)):
+            raise ValueError("qpos contains NaN or Inf — collision FK requires finite values")
         if self._hand_dof and qpos.shape == (7,):
             if self._hand_qpos is None:
                 _warn_hand_qpos_unset("hand_qpos not set, using home position. Call set_hand_qpos() first.")
-                return np.concatenate([qpos, _HAND_HOME_QPOS.copy()])
+                return np.concatenate([qpos, _HAND_HOME_QPOS_URDF])
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:
             raise ValueError(
@@ -214,19 +207,14 @@ class CollisionModel:
     # Core collision evaluation
     # ------------------------------------------------------------------
 
-    def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> tuple[np.ndarray, bool]:
-        """FK + update geometry placements + compute self-collisions.
-
-        Returns ``(full_qpos, has_any_collision)`` where ``has_any_collision`` is
-        the return value of ``pin.computeCollisions()``.
-        """
+    def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
+        """Compute self-collisions for a validated full configuration."""
         qpos = self._to_full_qpos(qpos)
-        self._pin.forwardKinematics(self._model, self._data, qpos)
-        self._pin.updateGeometryPlacements(self._model, self._data, self._collision_model, self._collision_data)
-        has_any = self._pin.computeCollisions(
-            self._model, self._data, self._collision_model, self._collision_data, qpos, stop_at_first
+        return bool(
+            self._pin.computeCollisions(
+                self._model, self._data, self._collision_model, self._collision_data, qpos, stop_at_first
+            )
         )
-        return qpos, has_any
 
     # ------------------------------------------------------------------
     # Self-collision
@@ -237,8 +225,28 @@ class CollisionModel:
 
         Uses ``stop_at_first_collision=True`` for early exit.
         """
-        _qpos, has_any = self._pin_update(qpos, stop_at_first=True)
-        return has_any
+        return self._pin_update(qpos, stop_at_first=True)
+
+    def minimum_hand_frame_z(self, arm_qpos: np.ndarray) -> float:
+        """Return the lowest XHand link-frame origin in the robot base frame.
+
+        The active hand configuration comes from ``set_hand_qpos`` in 19-DOF
+        mode; the fixed hand posture is used by the 7-DOF model.  Callers apply
+        an additional mesh-extent margin because frame origins are not surface
+        points.  This is substantially more orientation-aware than subtracting
+        a constant distance from the EEF origin.
+        """
+        qpos = self._to_full_qpos(arm_qpos)
+        self._pin.forwardKinematics(self._model, self._data, qpos)
+        self._pin.updateFramePlacements(self._model, self._data)
+        z_values = [
+            float(self._data.oMf[index].translation[2])
+            for index, frame in enumerate(self._model.frames)
+            if frame.name.startswith("right_hand_")
+        ]
+        if not z_values or not np.all(np.isfinite(z_values)):
+            raise RuntimeError("XHand frame placements unavailable")
+        return min(z_values)
 
     def check_self_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
         """Check self-collision and return structured ``CollisionInfo``.
@@ -248,7 +256,7 @@ class CollisionModel:
         """
         from .types import CollisionInfo, CollisionPair
 
-        _qpos, has_any = self._pin_update(qpos, stop_at_first=False)
+        has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo.no_collision()
         # self._collision_data.collisionResults returns a C++ std::vector that
@@ -280,34 +288,35 @@ class CollisionModel:
             )
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         if not pairs:
-            return CollisionInfo.no_collision()
+            # ``computeCollisions`` is authoritative. Pair enumeration is
+            # diagnostic-only; never turn a real collision into a pass.
+            return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))
 
     # ------------------------------------------------------------------
     # Segment collision checking
     # ------------------------------------------------------------------
 
-    def _check_segment_free(
-        self,
-        q1: np.ndarray,
-        q2: np.ndarray,
-        step_size: float,
-        check_fn,
-    ) -> bool:
-        """Generic dense segment interpolation with early exit on collision.
+    @staticmethod
+    def _validate_step_size(step_size: float) -> float:
+        step_size = float(step_size)
+        if not np.isfinite(step_size) or step_size <= 0.0:
+            raise ValueError(f"step_size must be finite and > 0, got {step_size!r}")
+        return step_size
 
-        Interpolates at ``step_size`` (L∞ rad) resolution and calls ``check_fn(q)``
-        at each sample.  Returns True if all samples pass.
-        """
+    @staticmethod
+    def _sample_count(q1: np.ndarray, q2: np.ndarray, step_size: float) -> int:
+        return max(1, int(np.ceil(float(np.max(np.abs(q2 - q1))) / step_size)))
+
+    def _check_segment_free(self, q1: np.ndarray, q2: np.ndarray, step_size: float) -> bool:
+        """Dense joint-space interpolation with early exit on collision."""
+        step_size = self._validate_step_size(step_size)
         q1 = self._to_full_qpos(q1)
         q2 = self._to_full_qpos(q2)
         diff = q2 - q1
-        dist = float(np.max(np.abs(diff)))
-        if dist <= step_size:
-            return not check_fn(q2)
-        n = int(np.ceil(dist / step_size))
-        for step in range(1, n + 1):
-            if check_fn(q1 + (step / n) * diff):
+        n = self._sample_count(q1, q2, step_size)
+        for step in range(n + 1):
+            if self.check_self_collision(q1 + (step / n) * diff):
                 return False
         return True
 
@@ -318,7 +327,49 @@ class CollisionModel:
         step_size: float = 0.02,
     ) -> bool:
         """Check if the linear joint-space segment q1→q2 is self-collision-free."""
-        return self._check_segment_free(q1, q2, step_size, self.check_self_collision)
+        return self._check_segment_free(q1, q2, step_size)
+
+    def check_transition_collision_free(
+        self,
+        arm_start_qpos: np.ndarray,
+        arm_end_qpos: np.ndarray,
+        hand_start_qpos: np.ndarray,
+        hand_end_qpos: np.ndarray,
+        step_size_rad: float = 0.02,
+    ) -> bool:
+        """Check the conservative envelope of independently executed arm and hand motion."""
+        if not self._hand_dof:
+            raise RuntimeError("arm/hand transition checks require hand_dof=True")
+        step_size = self._validate_step_size(step_size_rad)
+        arm_start = self._validate_vector(arm_start_qpos, 7, "arm_start_qpos")
+        arm_end = self._validate_vector(arm_end_qpos, 7, "arm_end_qpos")
+        hand_start = self._user_hand_to_urdf(hand_start_qpos, "hand_start_qpos")
+        hand_end = self._user_hand_to_urdf(hand_end_qpos, "hand_end_qpos")
+        arm_steps = int(np.ceil(float(np.max(np.abs(arm_end - arm_start))) / step_size))
+        hand_steps = int(np.ceil(float(np.max(np.abs(hand_end - hand_start))) / step_size))
+        arm_diff = arm_end - arm_start
+        hand_diff = hand_end - hand_start
+        arm_alphas = (0.0,) if arm_steps == 0 else np.linspace(0.0, 1.0, arm_steps + 1)
+        hand_alphas = (0.0,) if hand_steps == 0 else np.linspace(0.0, 1.0, hand_steps + 1)
+        for arm_alpha in arm_alphas:
+            arm_qpos = arm_start + arm_alpha * arm_diff
+            for hand_alpha in hand_alphas:
+                hand_qpos = hand_start + hand_alpha * hand_diff
+                if self.check_self_collision(np.concatenate([arm_qpos, hand_qpos])):
+                    return False
+        return True
+
+    @staticmethod
+    def _validate_vector(values: np.ndarray, size: int, name: str) -> np.ndarray:
+        result = np.asarray(values, dtype=np.float64)
+        if result.shape != (size,):
+            raise ValueError(f"Expected {name} shape ({size},), got {result.shape}")
+        if not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} contains NaN or Inf")
+        return result
+
+    def _user_hand_to_urdf(self, hand_qpos: np.ndarray, name: str) -> np.ndarray:
+        return self._validate_vector(hand_qpos, _HAND_DOF_COUNT, name)[list(_HAND_USER_TO_URDF)]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -327,9 +378,9 @@ class CollisionModel:
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
         geom = self._collision_model.geometryObjects[geom_id]
-        parent_joint = geom.parentJoint
-        if parent_joint < len(self._link_names):
-            return self._link_names[parent_joint]
+        parent_frame = geom.parentFrame
+        if parent_frame < len(self._model.frames):
+            return self._model.frames[parent_frame].name
         return geom.name
 
     # ------------------------------------------------------------------

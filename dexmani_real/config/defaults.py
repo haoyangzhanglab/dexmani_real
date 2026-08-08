@@ -36,12 +36,12 @@ import numpy as np
 
 @dataclass
 class HomingParams:
-    """Joint-space linear-interpolation homing parameters."""
+    """Feedback-driven execution parameters for collision-validated home paths."""
 
-    convergence_rad: float = 0.0174533  # ~1°
-    step_interval_s: float = 0.04
-    max_speed_deg_s: float = 30.0  # linear-interpolation fallback speed
-    target_timeout_s: float = 0.2
+    convergence_rad: float = 0.0174533  # final canonical-home tolerance (~1°)
+    step_interval_s: float = 0.04  # controller-state polling interval
+    max_speed_deg_s: float = 30.0  # Mode 6 speed while advancing validated waypoints
+    target_timeout_s: float = 0.5  # maximum convergence time for one dense waypoint
 
 
 @dataclass
@@ -151,12 +151,13 @@ class ArmParams:
 
     # ── Environment ──
     table_z_surface_m: float = 0.022  # table top surface Z in arm-base frame (m), from desk_plane.json
-    hand_safety_margin_m: float = 0.05  # conservative EEF-to-fingertip vertical distance (m)
+    hand_safety_margin_m: float = 0.05  # hand-link-frame to collision-surface padding (m)
 
     # ── Safety ──
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
     collision_sensitivity: int = 1  # 0-5, 1 = most sensitive
-    recoverable_errors: frozenset[int] = frozenset({22, 24, 31})  # C22/C24/C31
+    recoverable_errors: frozenset[int] = frozenset({24})  # C24 speed-limit error only
+    collision_fault_errors: frozenset[int] = frozenset({22, 31})  # self-collision / collision current
 
     # ── Homing ──
     homing: HomingParams = field(default_factory=HomingParams)
@@ -177,6 +178,10 @@ class ArmParams:
             raise ValueError("joint_limit_lower must be <= joint_limit_upper")
         if not all(lo <= q <= hi for q, lo, hi in zip(self.home_qpos, self.joint_limit_lower, self.joint_limit_upper)):
             raise ValueError("home_qpos must be within joint limits")
+        if not (0 <= self.collision_sensitivity <= 5):
+            raise ValueError(f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]")
+        if self.recoverable_errors & self.collision_fault_errors:
+            raise ValueError("recoverable_errors and collision_fault_errors must be disjoint")
         if not (0 < self.max_joint_velocity_deg_per_s <= 500):
             raise ValueError(f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} out of range (0, 500]")
         if not (0 < self.max_joint_acceleration_deg_per_s2 <= 50000):
@@ -209,6 +214,46 @@ class HandParams:
         10.13,
         5.0,
     )
+
+    qpos_min_rad: tuple[float, ...] = (
+        0.0,
+        -0.6981317008,
+        0.1745329252,
+        -0.1745329252,
+        0.0,
+        0.0872664626,
+        0.0,
+        0.0872664626,
+        0.0,
+        0.0872664626,
+        0.0,
+        0.0872664626,
+    )
+    qpos_max_rad: tuple[float, ...] = (
+        1.832,
+        1.745,
+        1.745,
+        0.174,
+        1.919,
+        1.919,
+        1.919,
+        1.919,
+        1.919,
+        1.919,
+        1.919,
+        1.919,
+    )
+    # 0.20 rad per 16 Hz policy frame (~183 deg/s). This bounds motor jumps
+    # and caps the conservative arm×hand transition collision grid.
+    max_delta_rad: float | None = 0.20
+
+    def __post_init__(self) -> None:
+        if len(self.home_qpos_deg) != 12 or len(self.qpos_min_rad) != 12 or len(self.qpos_max_rad) != 12:
+            raise ValueError("hand qpos defaults must have 12 elements")
+        if not all(lo <= hi for lo, hi in zip(self.qpos_min_rad, self.qpos_max_rad)):
+            raise ValueError("hand qpos_min_rad must be <= qpos_max_rad")
+        if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
+            raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
 
     loop_hz: float = 30.0
 

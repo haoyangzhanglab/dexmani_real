@@ -14,7 +14,7 @@ from dexmani_real.utils.serialization import from_dict_helper
 class CollisionPair:
     """A single self-collision contact between two links.
 
-    Extracted from MPlib ``WorldCollisionResult`` into a lightweight,
+    Extracted from Pinocchio/hpp-fcl collision results into a lightweight,
     hashable, pickle-safe dataclass suitable for diagnostic dicts and logs.
     """
 
@@ -40,11 +40,10 @@ class CollisionInfo:
 
     **Hot-path safety:** When no collision is detected, ``no_collision()``
     returns a module-level cached singleton — zero allocation beyond the
-    underlying MPlib C++ ``check_for_self_collision`` call.
+    underlying Pinocchio/hpp-fcl collision query.
 
-    When a collision exists, the ``WorldCollisionResult`` list is already
-    computed by MPlib; wrapping it here only iterates the result strings
-    (no second collision query).
+    When a collision exists, the Pinocchio collision result vector is already
+    populated; wrapping it here only extracts structured diagnostics.
 
     ``bool(collision_info)`` returns ``in_collision``, so existing code
     that checks ``if check_self_collision(q):`` continues to work.
@@ -81,6 +80,8 @@ class CollisionInfo:
         if not self.in_collision:
             return "no collision"
         pairs = [f"{p.link_name1}↔{p.link_name2}" for p in self.collision_pairs]
+        if not pairs:
+            return f"{self.num_contacts} contact(s), pair details unavailable"
         return f"{self.num_contacts} contact(s): " + ", ".join(pairs)
 
 
@@ -137,8 +138,8 @@ class XArm7PlannerConfig:
     use_convex: bool = False
     joint_vel_limits_deg: tuple[float, ...] = (180, 180, 180, 180, 180, 180, 180)
     joint_acc_scale: float = 2.0
-    # Cartesian workspace bounds (world frame). (3,2) [[x_min,x_max],[y_min,y_max],[z_min,z_max]].
-    # None disables the check (backward compatible).
+    # Optional world-frame EEF bounds, shape (3, 2). Paths are validated at
+    # every returned waypoint; None keeps generic offline use unrestricted.
     workspace_bounds: np.ndarray | None = None
 
 

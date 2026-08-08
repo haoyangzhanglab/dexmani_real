@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.config.defaults import hand
+
 try:
     from xhand_controller import xhand_control as xhc
 
@@ -79,71 +81,11 @@ class XHandConfig:
     init_state_read_attempts: int = 3
     init_state_read_interval: float = 0.02
 
-    home_qpos: np.ndarray = field(
-        default_factory=lambda: np.deg2rad(
-            np.array(
-                [
-                    0.0,  # J0  thumb_abd
-                    80.66,  # J1  thumb_j1      (ref: LeFranX)
-                    33.2,  # J2  thumb_j2      (ref: LeFranX)
-                    0.0,  # J3  index_abd
-                    5.11,  # J4  index_j1      (ref: LeFranX)
-                    5.0,  # J5  index_j2      min 5° (prevent mechanical clogging)
-                    6.53,  # J6  middle_j1     (ref: LeFranX)
-                    5.0,  # J7  middle_j2     min 5° (prevent mechanical clogging)
-                    6.76,  # J8  ring_j1       (ref: LeFranX)
-                    5.0,  # J9  ring_j2       min 5° (prevent mechanical clogging)
-                    10.13,  # J10 little_j1     (ref: LeFranX)
-                    5.0,  # J11 little_j2     min 5° (prevent mechanical clogging)
-                ],
-                dtype=np.float64,
-            )
-        )
-    )
+    home_qpos: np.ndarray = field(default_factory=lambda: np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64)))
 
-    qpos_min: np.ndarray = field(
-        default_factory=lambda: np.deg2rad(
-            np.array(
-                [
-                    0.0,
-                    -40.0,
-                    10.0,  # thumb_j2:   prevent mechanical clogging (ref: LeFranX)
-                    -10.0,
-                    0.0,
-                    5.0,  # index_j2:  prevent mechanical clogging (ref: LeFranX)
-                    0.0,
-                    5.0,  # middle_j2: prevent mechanical clogging (ref: LeFranX)
-                    0.0,
-                    5.0,  # ring_j2:   prevent mechanical clogging (ref: LeFranX)
-                    0.0,
-                    5.0,  # little_j2: prevent mechanical clogging (ref: LeFranX)
-                ],
-                dtype=np.float64,
-            )
-        )
-    )
+    qpos_min: np.ndarray = field(default_factory=lambda: np.asarray(hand.qpos_min_rad, dtype=np.float64))
 
-    qpos_max: np.ndarray = field(
-        default_factory=lambda: np.array(
-            # XHand joint limits from URDF (xhand_right.urdf), in radians.
-            # Using exact URDF values avoids floating-point rounding from deg2rad.
-            [
-                1.832,  # J0  thumb_abd
-                1.745,  # J1  thumb_j1 (-40° ~ 100°)
-                1.745,  # J2  thumb_j2 (0° ~ 100°)
-                0.174,  # J3  index_abd
-                1.919,  # J4  index_j1
-                1.919,  # J5  index_j2
-                1.919,  # J6  middle_j1
-                1.919,  # J7  middle_j2
-                1.919,  # J8  ring_j1
-                1.919,  # J9  ring_j2
-                1.919,  # J10 little_j1
-                1.919,  # J11 little_j2
-            ],
-            dtype=np.float64,
-        ),
-    )
+    qpos_max: np.ndarray = field(default_factory=lambda: np.asarray(hand.qpos_max_rad, dtype=np.float64))
 
     max_qvel: np.ndarray = field(
         default_factory=lambda: np.deg2rad(np.ones(12) * 180.0),
@@ -184,7 +126,7 @@ class XHandConfig:
     #   - scalar: applied to all 12 joints
     #   - (12,) array: per-joint limits
     #   - None: disabled (default)
-    max_delta_rad: float | np.ndarray | None = None
+    max_delta_rad: float | np.ndarray | None = field(default_factory=lambda: hand.max_delta_rad)
 
     # ── F1: Tactile contact detection ──
     # L2 norm threshold (Newtons) on per-finger combined force for contact detection.
@@ -496,9 +438,7 @@ class XHand:
                     )
 
             # ── Verify: read fresh state (before bias) and check force magnitudes ──
-            err, hand_state = self._unpack_result(
-                self.control.read_state(device_id, True)  # force_update=True
-            )
+            err, hand_state = self._unpack_result(self.control.read_state(device_id, True))  # force_update=True
             if not self.error_ok(err):
                 logger.warning(
                     "Tactile verify read failed (iter %d/%d, code=%s) — retrying all sensors",
@@ -955,7 +895,9 @@ class XHand:
             cmd.ki = int(self.config.ki_per_joint[i]) if self.config.ki_per_joint is not None else int(ki)
             cmd.kd = int(self.config.kd_per_joint[i]) if self.config.kd_per_joint is not None else int(kd)
             cmd.position = float(qpos[i])
-            cmd.tor_max = int(self.config.tor_max_per_joint[i]) if self.config.tor_max_per_joint is not None else int(tor_max)
+            cmd.tor_max = (
+                int(self.config.tor_max_per_joint[i]) if self.config.tor_max_per_joint is not None else int(tor_max)
+            )
             cmd.mode = int(mode)
             cmd.res0 = 0
             cmd.res1 = 0

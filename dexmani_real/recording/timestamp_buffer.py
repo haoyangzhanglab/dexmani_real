@@ -60,11 +60,11 @@ def _get_accumulate_timestamp_idxs(
         if global_idx < 0:
             continue
 
-        n_repeats = max(0, global_idx - next_global_idx + 1)
-        for i in range(n_repeats):
-            local_idxs.append(local_idx)
-            global_idxs.append(next_global_idx + i)
-        next_global_idx += n_repeats
+        if global_idx < next_global_idx:
+            continue
+        local_idxs.append(local_idx)
+        global_idxs.append(global_idx)
+        next_global_idx = global_idx + 1
 
     return local_idxs, global_idxs, next_global_idx
 
@@ -182,6 +182,7 @@ class TimestampAlignedBuffer:
         for key, value in data.items():
             if key in self._data_buffer:  # type: ignore[operator]
                 self._data_buffer[key][global_idxs] = value  # type: ignore[index]
+        self._data_buffer["flag_sample_valid"][global_idxs] = True  # type: ignore[index]
 
         if self._timestamp_buffer is not None:
             # Assign grid-aligned synthetic timestamps so every slot gets
@@ -212,4 +213,5 @@ class TimestampAlignedBuffer:
                     type(value).__name__,
                 )
 
+        self._data_buffer["flag_sample_valid"] = np.zeros(self.max_record_steps, dtype=bool)
         self._timestamp_buffer = np.zeros(self.max_record_steps, dtype=np.float64)

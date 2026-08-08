@@ -81,6 +81,14 @@ def invert_pose(pose: Pose) -> Pose:
 
 
 def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
+    # Guard against NaN/Inf Pose inputs.  Return infinite errors so that
+    # downstream >threshold comparisons correctly reject the candidate
+    # (NaN > threshold is always False per IEEE 754, but inf > threshold
+    # is always True).
+    if not np.all(np.isfinite(actual.p)) or not np.all(np.isfinite(actual.q)):
+        return (float("inf"), float("inf"))
+    if not np.all(np.isfinite(target.p)) or not np.all(np.isfinite(target.q)):
+        return (float("inf"), float("inf"))
     position_error = float(np.linalg.norm(target.p - actual.p))
     q_dot = abs(float(np.dot(target.q, actual.q)))
     rotation_error = 2.0 * np.arccos(min(1.0, q_dot))

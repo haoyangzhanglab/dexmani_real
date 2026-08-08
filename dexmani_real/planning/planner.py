@@ -8,14 +8,17 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
+
+_warn_hand_qpos_unset_teleop = ThrottledWarner(interval_s=30.0)
 
 from .collision_model import CollisionModel
 from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager, is_mplib_success
 from .kinematics import XArm7Kinematics
+from .path_utils import interpolate_waypoints
 from .pose_utils import compute_pose_error, ensure_qpos
 from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
 
@@ -29,35 +32,6 @@ _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
 
 
-class WorkspaceSafety:
-    """EEF workspace position bounds checking and clamping.
-
-    workspace_bounds: (3, 2) array [[x_min, x_max], [y_min, y_max], [z_min, z_max]] in meters.
-    """
-
-    def __init__(
-        self,
-        workspace_bounds: np.ndarray,
-    ) -> None:
-        self.bounds = np.asarray(workspace_bounds, dtype=np.float64)
-        if self.bounds.shape != (3, 2):
-            raise ValueError(f"workspace_bounds must have shape (3, 2), got {self.bounds.shape}.")
-
-    def check(self, eef_pos: np.ndarray) -> bool:
-        """Check whether EEF position is within workspace bounds."""
-        eef_pos = np.asarray(eef_pos, dtype=np.float64).reshape(3)
-        if not np.all(np.isfinite(eef_pos)):
-            logger.warning("WorkspaceSafety: NaN/Inf EEF position — treating as out-of-bounds")
-            return False
-        return bool(np.all((eef_pos >= self.bounds[:, 0]) & (eef_pos <= self.bounds[:, 1])))
-
-    def clamp(self, target_pos: np.ndarray) -> np.ndarray:
-        """Clip target position to workspace bounds."""
-        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3).copy()
-        np.clip(target_pos, self.bounds[:, 0], self.bounds[:, 1], out=target_pos)
-        return target_pos
-
-
 class XArm7MotionPlanner:
     """Arm-only xArm7 motion planner with MPlib backend.
 
@@ -69,7 +43,7 @@ class XArm7MotionPlanner:
         plan_qpos calls.
 
     Public API (prefer these over direct subsystem access):
-      - ``solve_ik`` / ``solve_teleop_ik`` — single-shot IK suitable for teleop.
+      - ``solve_teleop_ik`` — single-shot IK for teleop.
       - ``plan_path`` — multi-strategy path planning (screw → RRT).
       - ``compute_eef_pose_world`` / ``compute_eef_jacobian`` — FK queries.
       - ``has_self_collision`` — collision queries.
@@ -89,6 +63,12 @@ class XArm7MotionPlanner:
         self.config = config
         self.planning_profile = planning_profile or PlanningProfile()
         self.teleop_profile = teleop_profile or TeleopProfile()
+        self.workspace_bounds = None
+        if config.workspace_bounds is not None:
+            bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
+            if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] > bounds[:, 1]):
+                raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
+            self.workspace_bounds = bounds.copy()
 
         joint_vel_limits = np.deg2rad(np.asarray(config.joint_vel_limits_deg, dtype=np.float64))
         joint_acc_limits = joint_vel_limits * float(config.joint_acc_scale)
@@ -138,9 +118,6 @@ class XArm7MotionPlanner:
         equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) > 2 * np.pi
 
         base_pose_world = config.base_pose_world.copy()
-        self.workspace_safety: WorkspaceSafety | None = (
-            WorkspaceSafety(config.workspace_bounds) if config.workspace_bounds is not None else None
-        )
 
         self.kin = XArm7Kinematics(
             mp_planner=self.mplib_planner,
@@ -240,17 +217,17 @@ class XArm7MotionPlanner:
     def set_base_pose(self, base_pose_world: Pose) -> None:
         self.kin.set_base_pose(base_pose_world)
 
-    def solve_ik(self, target_eef_pose_world: Pose, current_qpos: np.ndarray) -> IKResult:
-        current_qpos = ensure_qpos(current_qpos, self.dof, "current_qpos")
-        candidates, ik_report = self.collect_ik_candidates(target_eef_pose_world, current_qpos, self.planning_profile)
-        if not candidates:
-            return IKResult(success=False, qpos=None, reason="No valid IK candidate.", report=ik_report)
-        qpos, report = candidates[0]
-        return IKResult(success=True, qpos=qpos, report={**report, "candidate_summary": ik_report})
-
     def solve_teleop_ik(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
+        # Mirror plan_path's hand_qpos guard (line ~227): warn when
+        # collision checks will use the fallback open-hand proxy pose.
+        if self.collision_model.hand_dof and self.collision_model._hand_qpos is None:
+            _warn_hand_qpos_unset_teleop(
+                "solve_teleop_ik: hand_qpos not set — "
+                "collision checks use home (open-hand) pose. "
+                "Call set_hand_qpos() before solve_teleop_ik()."
+            )
         return self.teleop_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
     def plan_path(self, target_eef_pose_world: Pose, current_qpos: np.ndarray) -> PathResult:
@@ -485,7 +462,7 @@ class XArm7MotionPlanner:
             path_before_smooth = path.copy()
             path = self.shortcut_smooth_path(path, current_qpos, profile)
         except ValueError as error:
-            logger.debug("validate_path preprocessing failed: %s", error, exc_info=True)
+            logger.warning("validate_path preprocessing failed: %s", error, exc_info=True)
             return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
 
         # Try smoothed path first; fall back to unsmoothed on failure.
@@ -506,8 +483,8 @@ class XArm7MotionPlanner:
                 self._check_start_distance,
                 self._check_waypoint_delta,
                 self._check_terminal_pose,
+                self._check_workspace,
                 self._check_self_collision,
-                self._check_workspace_bounds,
             ):
                 failure = check(candidate, report, source, profile)
                 if failure is not None:
@@ -576,6 +553,42 @@ class XArm7MotionPlanner:
             return self._make_failure("Terminal pose error too large.", source, report)
         return None
 
+    def _check_workspace(self, path, report, source, _profile):
+        """Fail if any returned waypoint leaves configured world-frame bounds."""
+        if self.workspace_bounds is None:
+            return None
+        dense_path = interpolate_waypoints(path, max_step=0.02)
+        for index, qpos in enumerate(dense_path):
+            try:
+                position = self.compute_eef_pose_world(qpos).p
+            except (ValueError, RuntimeError):
+                position = np.full(3, np.nan)
+            if (
+                not np.all(np.isfinite(position))
+                or np.any(position < self.workspace_bounds[:, 0])
+                or np.any(position > self.workspace_bounds[:, 1])
+            ):
+                report["workspace_violation_index"] = index
+                report["workspace_violation_position_m"] = position.copy()
+                return self._make_failure("Path leaves configured workspace.", source, report)
+        return None
+
+    def is_workspace_segment_safe(self, start_qpos: np.ndarray, end_qpos: np.ndarray) -> bool:
+        """Check a short commanded segment against configured EEF bounds."""
+        if self.workspace_bounds is None:
+            return True
+        path = interpolate_waypoints(np.stack([start_qpos, end_qpos]), max_step=0.02)
+        for qpos in path:
+            try:
+                position = self.compute_eef_pose_world(qpos).p
+            except (ValueError, RuntimeError):
+                return False
+            if not np.all(np.isfinite(position)):
+                return False
+            if np.any(position < self.workspace_bounds[:, 0]) or np.any(position > self.workspace_bounds[:, 1]):
+                return False
+        return True
+
     def _check_self_collision(self, path, report, source, profile):
         """Fail if any waypoint is in self-collision (per SRDF collision pairs)."""
         if not profile.check_self_collision:
@@ -593,39 +606,6 @@ class XArm7MotionPlanner:
                     link_names += f" ... +{len(pairs) - 5} more"
                 reason = f"Path contains self-collision ({num} contact(s): {link_names})."
             return self._make_failure(reason, source, report)
-        return None
-
-    def _check_workspace_bounds(self, path, report, source, _profile):
-        """Fail if any waypoint (beyond the first) violates workspace safety bounds."""
-        if self.workspace_safety is None:
-            return None
-        eef_positions = np.array([self.compute_eef_pose_world(q).p for q in path], dtype=np.float64)
-        # Skip waypoint 0 (start) — arm may already be outside workspace.
-        for i, eef_p in enumerate(eef_positions):
-            if i == 0:
-                continue
-            if not np.all(np.isfinite(eef_p)):
-                report["workspace_violation_index"] = i
-                report["workspace_violation_summary"] = "FK returned NaN/Inf"
-                return self._make_failure(f"Path contains NaN/Inf EEF position at waypoint[{i}]", source, report)
-            if not self.workspace_safety.check(eef_p):
-                violations = []
-                for ax in range(3):
-                    if eef_p[ax] < self.workspace_safety.bounds[ax, 0]:
-                        violations.append(
-                            f"axis={'XYZ'[ax]} val={eef_p[ax]:.3f} < {self.workspace_safety.bounds[ax, 0]:.3f}"
-                        )
-                    elif eef_p[ax] > self.workspace_safety.bounds[ax, 1]:
-                        violations.append(
-                            f"axis={'XYZ'[ax]} val={eef_p[ax]:.3f} > {self.workspace_safety.bounds[ax, 1]:.3f}"
-                        )
-                report["workspace_violation_index"] = i
-                report["workspace_violation_summary"] = "; ".join(violations)
-                return self._make_failure(
-                    f"Path contains workspace violations: waypoint[{i}] ({'; '.join(violations)})",
-                    source,
-                    report,
-                )
         return None
 
     def compute_path_metrics(

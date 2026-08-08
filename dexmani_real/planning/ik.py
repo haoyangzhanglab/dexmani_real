@@ -48,6 +48,7 @@ class TeleopIKSolver:
         self._nullspace_warn_last_s: float = 0.0
         self._hold_start: float | None = None
         self._hold_warned: bool = False
+        self._rng = np.random.default_rng(teleop_profile.teleop_ik_seed)
 
     def solve(self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> IKResult:
         """Run teleop IK — prev_cmd seed, multi-seed fallback, hold on failure."""
@@ -68,13 +69,6 @@ class TeleopIKSolver:
                 profile=profile,
                 report=report,
             )
-            # Re-canonicalize to current_qpos after nullspace optimization.
-            # Nullspace perturbs by <1°, but defense-in-depth: ensure Mode 6
-            # always receives a target on the shortest angular path from the
-            # physical joint position.  (Root fix is in _solve_position_ik
-            # where canonicalize_qpos now uses current_qpos as reference.)
-            if result.success and result.qpos is not None:
-                result.qpos = self.ik_mgr.canonicalize_qpos(result.qpos, current_qpos)
             # Propagate total solve time to success path (failure path already has it at line 103).
             result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
         else:
@@ -126,7 +120,7 @@ class TeleopIKSolver:
 
         attempts: list[str] = []
         candidates: list[tuple[np.ndarray, str, float, float]] = []  # (qpos, seed_name, score, manipulability)
-        best_fallback: tuple[np.ndarray, str, float] | None = None  # (qpos, seed_name, weighted_dist)
+        seen_qpos: list[np.ndarray] = []
 
         for seed_name, seed, n_init in seeds:
             _tik0 = time.perf_counter()
@@ -142,10 +136,25 @@ class TeleopIKSolver:
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
+            # Reject NaN/Inf from MPlib immediately — the earliest
+            # interception point before any validation gate (all of
+            # which use >threshold comparisons that silently pass NaN
+            # per IEEE 754).
+            if not np.all(np.isfinite(raw_qpos)):
+                attempts.append(f"{seed_name}:nan_qpos({_solve_ms:.1f}ms)")
+                continue
             # Canonicalize relative to physical encoder position (current_qpos)
             # to avoid Mode 6 taking the "long way" around 2π equivalent joints.
             # previous_qpos_cmd can drift into a different band over many frames.
             qpos = self.ik_mgr.canonicalize_qpos(raw_qpos, current_qpos)
+            outside, _ = self.ik_mgr.limit_violation(qpos, self.ik_mgr.joint_limits)
+            if np.any(outside):
+                attempts.append(f"{seed_name}:limits({_solve_ms:.1f}ms)")
+                continue
+            if any(np.max(np.abs(self.ik_mgr.compute_qpos_delta(qpos, seen))) < 1e-4 for seen in seen_qpos):
+                attempts.append(f"{seed_name}:duplicate({_solve_ms:.1f}ms)")
+                continue
+            seen_qpos.append(qpos.copy())
 
             jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos)
             pos_err, rot_err = compute_pose_error(target_eef_pose_world, eef_pose_world)
@@ -167,7 +176,7 @@ class TeleopIKSolver:
             delta_current = self.ik_mgr.compute_qpos_delta(qpos, current_qpos)
             hw_dist_raw = float(np.max(np.abs(qpos - current_qpos)))
             hw_dist = float(np.max(np.abs(delta_current)))
-            weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights)
+            weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights, delta=delta_current)
 
             # Band-mismatch gate: detect 2π band shift vs physical arm position.
             # J1/J3/J5/J7 wrap at 2π; canonicalize_qpos can be defeated at joint
@@ -189,8 +198,14 @@ class TeleopIKSolver:
                 attempts.append(f"{seed_name}:hw_dist({_solve_ms:.1f}ms, {np.rad2deg(hw_dist):.0f}deg)")
                 continue
 
-            if best_fallback is None or weighted_dist < best_fallback[2]:
-                best_fallback = (qpos.copy(), seed_name, weighted_dist)
+            # Self-collision gate: reject colliding candidates during ranking
+            # so safe lower-scored alternatives can be selected.  Post-nullspace
+            # collision is still checked in _command_from_target_qpos as
+            # defense-in-depth for the winning candidate.
+            if profile.check_self_collision and self.ik_mgr.has_self_collision(qpos):
+                attempts.append(f"{seed_name}:collision({_solve_ms:.1f}ms)")
+                continue
+
             attempts.append(f"{seed_name}:ok({_solve_ms:.1f}ms)")
 
             if seed_name == "prev_cmd" and hw_dist <= fast_accept_rad:
@@ -218,10 +233,6 @@ class TeleopIKSolver:
                 "best_manipulability": round(best_mu, 4),
                 "attempts": attempts,
             }
-
-        if best_fallback is not None:
-            qpos, seed_name, _ = best_fallback
-            return qpos, {"method": "position_ik", "seed": seed_name, "fallback": True, "attempts": attempts}
 
         return None, {"method": "position_ik", "failure_reason": f"all failed: {attempts}"}
 
@@ -273,13 +284,15 @@ class TeleopIKSolver:
             ("prev_cmd", prev_cmd.copy(), 1),
             ("current_qpos", current_qpos.copy(), 1),
         ]
-        seed = profile.teleop_ik_seed
-        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
         offsets_rad = np.deg2rad(profile.position_ik_seed_offset_deg)
         for i in range(profile.position_ik_num_random_seeds):
-            seed = prev_cmd + rng.uniform(-offsets_rad, offsets_rad, self.kin.dof)
+            seed = prev_cmd + self._rng.uniform(-offsets_rad, offsets_rad, self.kin.dof)
             seeds.append((f"random_{i}", seed, 1))
-        return seeds
+        unique: list[tuple[str, np.ndarray, int]] = []
+        for item in seeds:
+            if not any(np.allclose(item[1], previous[1], atol=1e-8, rtol=0.0) for previous in unique):
+                unique.append(item)
+        return unique
 
     def _score_candidate(
         self,
@@ -407,22 +420,25 @@ class TeleopIKSolver:
         """Nullspace-optimize, collision-check, and assemble IKResult."""
         qpos_cmd = target_qpos.copy()
 
-        # EEF pose computed once, reused for tracking error.
-        # Nullspace preserves EEF pose (J · dq_null = 0), so it stays valid.
-        eef_pose_world: Pose | None = None
-
-        # Null-space joint-limit repulsion (zero EEF error by construction).
+        # Null-space joint-limit repulsion. J·dq=0 is only a first-order
+        # property, so the final nonlinear FK is always validated below.
         if profile.enable_nullspace_optimization:
             try:
-                jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
+                jacobian, _ = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
 
+                # Compare home in the nearest equivalent encoder band.  Raw
+                # canonical home would turn a physical +2π equivalent into a
+                # full-revolution null-space bias.
+                home_qpos = (
+                    self.ik_mgr.canonicalize_qpos(self._home_qpos, qpos_cmd) if self._home_qpos is not None else None
+                )
                 qpos_cmd = apply_nullspace_optimization(
                     qpos_cmd,
                     jacobian,
                     self.ik_mgr.joint_limits,
                     step_size_rad=np.deg2rad(profile.nullspace_step_size_deg),
                     margin_deg=profile.nullspace_joint_limit_margin_deg,
-                    home_qpos=self._home_qpos,
+                    home_qpos=home_qpos,
                 )
             except (ValueError, RuntimeError):
                 _now = time.monotonic()
@@ -433,8 +449,44 @@ class TeleopIKSolver:
                     )
                     self._nullspace_warn_last_s = _now
 
+        qpos_cmd = self.ik_mgr.canonicalize_qpos(qpos_cmd, current_qpos)
+        outside, _ = self.ik_mgr.limit_violation(qpos_cmd, self.ik_mgr.joint_limits)
+        if not np.all(np.isfinite(qpos_cmd)) or np.any(outside):
+            return self._make_collision_held(
+                qpos_cmd, current_qpos, previous_qpos_cmd, "Final IK command violates joint limits", report
+            )
+
+        cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
+        if cmd_pos_error > profile.max_pose_error_pos_m or cmd_rot_error > profile.max_pose_error_rot_rad:
+            return self._make_collision_held(
+                qpos_cmd,
+                current_qpos,
+                previous_qpos_cmd,
+                "Final IK command exceeds pose-error limits",
+                report,
+                cmd_tracking_error_pos_m=cmd_pos_error,
+                cmd_tracking_error_rot_rad=cmd_rot_error,
+            )
+
         # Collision safety gate.
-        collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)
+        try:
+            collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)
+        except (ValueError, RuntimeError):
+            # CollisionModel._to_full_qpos rejects NaN/Inf qpos with
+            # ValueError.  RuntimeError is raised by _require_collision_model
+            # when CollisionModel is not configured.  Treat both as collision
+            # → hold position rather than crashing the policy process.
+            logger.warning(
+                "Collision check failed (NaN/Inf qpos likely) — holding position",
+                exc_info=True,
+            )
+            return self._make_collision_held(
+                qpos_cmd,
+                current_qpos,
+                previous_qpos_cmd,
+                "Collision check failed (invalid qpos)",
+                report,
+            )
         if collision_reason is not None:
             return self._make_collision_held(
                 qpos_cmd,
@@ -446,10 +498,6 @@ class TeleopIKSolver:
             )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-        if eef_pose_world is not None:
-            cmd_pos_error, cmd_rot_error = compute_pose_error(target_eef_pose_world, eef_pose_world)
-        else:
-            cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(target_eef_pose_world, qpos_cmd)
         result_report = {
             **report,
             "cmd_tracking_error_pos_m": cmd_pos_error,
@@ -463,15 +511,15 @@ class TeleopIKSolver:
 # Null-space optimization helpers
 
 
-def nullspace_projector(J: np.ndarray) -> np.ndarray:
+def nullspace_projector(J: np.ndarray, rcond: float = 1e-6) -> np.ndarray:
     """Compute null-space projector N = I - J⁺J via SVD.
 
     For xArm7 (6×7 Jacobian, rank 6): N is 7×7, symmetric, idempotent,
     with one eigenvalue ≈ 1 and six ≈ 0.
     """
-    U, S, Vt = np.linalg.svd(J, full_matrices=False)
-    V = Vt.T  # 7×6
-    return np.eye(J.shape[1]) - V @ V.T
+    if J.ndim != 2 or not np.all(np.isfinite(J)):
+        raise ValueError("Jacobian must be a finite 2-D array")
+    return np.eye(J.shape[1]) - np.linalg.pinv(J, rcond=rcond) @ J
 
 
 def joint_limit_gradient(

@@ -68,13 +68,17 @@ VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik →
                                          shared.hand_cmd_ring.write(HandCmd)
 ```
 
-**Rates:** Policy loop 16 Hz. Arm/Hand servo loops 30 Hz. Mode 6 firmware handles all trajectory smoothing (120 deg/s, acc configurable). No arm-side interpolation.
+**Rates:** Policy loop 16 Hz. Arm/Hand servo loops 30 Hz. Normal teleoperation sends
+one target per policy tick and relies on Mode 6 firmware smoothing. Return-home is
+exceptional: the arm worker advances through an already collision-validated dense
+path only after fresh controller feedback converges to each waypoint.
 
 ### SharedStorage Data Plane (`shm/shared_storage.py`, ~340 lines)
 
 | Transport | Type | Direction | Semantics |
 |-----------|------|-----------|-----------|
 | `arm_action_q` | mp.Queue(maxsize=2) | Policy → Arm | Ordered, bounded backpressure |
+| `arm_home_result_q` | mp.Queue(maxsize=2) | Arm → requester | Correlated `HomeResult` ACK; success/failure is never inferred from stale state |
 | `hand_cmd_ring` | SeqlockRingBuffer(8) | Policy → Hand | Latest-wins (position servo) |
 | `arm_state_ring` | SeqlockRingBuffer(8) | Arm → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~265B) |
 | `hand_state_ring` | SeqlockRingBuffer(8) | Hand → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~472B, no tactile_force) |
@@ -156,18 +160,18 @@ DISARMED(0) --[Main: all ready]--> ARMED(1) --[Policy: B key]--> RUNNING(2)
 
 ### Design principle: firmware is the safety backstop
 
-xArm7 Mode 6 firmware already enforces: C22 (position), C24 (velocity), C31 (joint limit),
-collision detection, torque limit.  App-level safety prevents firmware trips (1-2s recovery
-interrupts collection) and ensures data quality — it does NOT duplicate what the firmware
-already catches.
+xArm7 Mode 6 firmware already enforces: C22 (self-collision), C24 (velocity), C31 (collision-induced current),
+collision detection, torque limit. Application-level collision checks reject invalid
+commands before they reach firmware; firmware remains the final safety backstop.
 
-### Layers (single-writer, no defense-in-depth redundancy)
+### Coordinated safety layers (single-writer)
 
 1. **Arm-level:** NaN guard (protects `last_target`)
-   + Mode 6 error handling (C22/C24/C31 auto-recover → `clean_error+set_mode+set_state`;
-   consecutive recoveries > `_RECOVERY_MAX` (30) → FAULT; non-recoverable → immediate FAULT)
+   + Mode 6 error handling (C22/C31 → immediate sticky FAULT; C24 has bounded
+   `clean_error+set_state+set_mode` recovery; repeated C24 failures → FAULT)
    + `except Exception` path also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
-2. **Policy-level:** arm connected gate + NaN guard for arm/hand + workspace clamp +
+2. **Policy-level:** arm connected gate + NaN guard + workspace clamp + conservative
+   asynchronous arm-hand transition envelope +
    safety_state gate (ARMED required for B, FAULT blocks send) + hand_qpos_stale hold
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure + delta clamp
 4. **E-stop:** Policy sets `estop_request=True` → Arm/Hand detect flag → `set_state(4)`
@@ -177,6 +181,11 @@ already catches.
 7. **Heartbeat supervisor:** Main monitors 5 process heartbeats at 10Hz → FAULT on timeout
 8. **Safety state machine:** formal DISARMED/ARMED/RUNNING/FAULT states with validated
    transitions (Main owns DISARMED↔ARMED/→FAULT, Policy owns ARMED↔RUNNING)
+9. **Return-home:** the caller holding the collision planner builds self-collision,
+   arm-hand, workspace and table-checked waypoints. `arm_loop` executes them with
+   Mode 6 speed/acceleration limits, waits for real joint feedback at every waypoint,
+   and replies on `arm_home_result_q` using the request ID. VR homing is policy-owned;
+   Main never tries to move workers after `is_running=False` or `DISARMED`.
 
 ### Key safety features
 
@@ -259,7 +268,12 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 
 ## Hardware Notes
 
-**xArm7 Mode 6:** Firmware trajectory planning, targets at 16 Hz. No arm-side interpolation. Tracking error bottleneck is acc/jerk, not velocity. Default: 120°/s, acc adjustable via `ArmLoopConfig.joint_max_acc_rad_per_s2`.
+**xArm7 Mode 6:** Firmware online replanning handles normal 16 Hz teleoperation;
+do not add interpolation to that stream. Homing uses a separate feedback-driven
+protocol because continuously overwriting a prevalidated path would not prove that
+the real arm visited its safe waypoints. Homing defaults to 30°/s and acknowledges
+completion only from fresh encoder feedback. See UFACTORY's official
+[Mode 6 description](https://github.com/xarm-developer/xarm_ros#57-xarm_apixarm_msgs-online-planning-modes-added).
 
 **XHand:** 12-DOF EtherCAT position servo. Latest-wins semantics (hand_cmd_ring). Tactile: 5 fingers × 120 taxels × 3 axes. Board errors auto-logged.
 

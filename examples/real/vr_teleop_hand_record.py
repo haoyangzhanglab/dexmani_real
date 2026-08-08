@@ -25,7 +25,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.config.defaults import arm, camera, hand, policy, safety, vr
+from dexmani_real.config.defaults import arm, camera, policy, safety, vr
 from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
@@ -35,10 +35,8 @@ from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
 from dexmani_real.shm.shared_storage import (
     SharedStorage,
-    hand_home_converge,
     print_health_summary,
     run_supervisor,
-    send_arm_home,
     shutdown_processes,
     wait_subsystem_ready,
 )
@@ -194,17 +192,13 @@ def main() -> None:
 
     _start_time = time.monotonic()
     _exit_reason, normal_exit = run_supervisor(
-        shared, procs, _proc_names, _heartbeat_fields,
+        shared,
+        procs,
+        _proc_names,
+        _heartbeat_fields,
     )
 
     transition(shared, SafetyState.DISARMED)
-
-    # Post-loop: offer return_home on normal exit.
-    # Skip when Policy initiated the quit (quit_requested=True) — Policy
-    # already handled the [H] return_home / [Q] quit prompt while all
-    # processes were still alive.
-    if normal_exit and not shared.error_state.value and not shared.quit_requested.value:
-        _post_loop_home(shared)
 
     shutdown_processes(shared, procs)
 
@@ -213,48 +207,9 @@ def main() -> None:
     _final_safety = shared.safety_state.value
     print(f"\n── Session End ──")
     print(
-        f"  exit_reason={_exit_reason}  runtime={_runtime_m:.1f}min  "
-        f"safety={_final_safety}  normal={normal_exit}"
+        f"  exit_reason={_exit_reason}  runtime={_runtime_m:.1f}min  " f"safety={_final_safety}  normal={normal_exit}"
     )
     print("──")
-
-
-def _post_loop_home(shared: SharedStorage) -> None:
-    """Offer return_home after normal exit — hand first, then arm."""
-    from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
-
-    HAND_HOME_QPOS = np.deg2rad(np.array(hand.home_qpos_deg, dtype=np.float64))
-
-    kb = KeyboardHandler()
-    kb.start()
-    try:
-        print("\n[H] return_home  [Q] quit  (60s timeout)")
-        _deadline = time.perf_counter() + 60.0
-        while time.perf_counter() < _deadline:
-            for sig in kb.poll(timeout=0.1):
-                if sig == ControlSignal.HOME:
-                    print("  H: return_home")
-
-                    # Step 1: Hand home first
-                    # hand_loop is still running (is_running not set yet).
-                    hand_home_converge(shared, HAND_HOME_QPOS, heartbeat=False, check_is_running=False, verbose=True)
-
-                    # Step 2: Arm home — no planner available post-exit.
-                    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
-                    send_arm_home(
-                        shared, _home_qpos,
-                        planner=None, heartbeat=False, converge_timeout_s=10.0, verbose=True,
-                    )
-                    print("  [Q] quit")
-                if sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
-                    break
-            else:
-                continue
-            break
-        else:
-            print("  timeout — auto exit")
-    finally:
-        kb.stop()
 
 
 if __name__ == "__main__":

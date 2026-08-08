@@ -275,11 +275,11 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         frame["timestamp"][0] = time.monotonic()
         shared.hand_state_ring.write(frame)
 
-        # Publish tactile (sparse — only when contact detected)
-        if np.any(tactile_contact):
-            tf = _nf(_HS_TACTILE)
-            tf["tactile_force"][0] = tactile_force
-            shared.hand_tactile_ring.write(tf)
+        # Publish every frame, including an explicit zero on release. A
+        # contact-only ring otherwise retains stale non-zero force forever.
+        tf = _nf(_HS_TACTILE)
+        tf["tactile_force"][0] = tactile_force if np.any(tactile_contact) else 0.0
+        shared.hand_tactile_ring.write(tf)
 
         # Rate limit (absolute-deadline scheduling, consistent with arm_loop/policy_loop)
         rate_mgr.wait()

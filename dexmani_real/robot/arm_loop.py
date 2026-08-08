@@ -16,10 +16,10 @@ from dexmani_real.config.defaults import arm, safety
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, HOME_SENTINEL, new_frame
+from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, HOME_SENTINEL, HomeRequest, HomeResult, new_frame
 from dexmani_real.utils.log import ThrottledWarner, get_logger
-from dexmani_real.utils.retry import RetryCounter
 from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.retry import RetryCounter
 
 logger = get_logger(__name__)
 
@@ -49,9 +49,30 @@ class ArmLoopConfig:
     homing_target_timeout_s: float = field(default_factory=lambda: arm.homing.target_timeout_s)
 
 
-# Controller errors that indicate a problematic target rather than a hardware fault.
+# Controller errors: C24 is recoverable; C22/C31 are immediate collision faults.
 _RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
+_COLLISION_FAULT_ERRORS: frozenset[int] = arm.collision_fault_errors
 _RECOVERY_MAX: int = safety.max_consecutive_recoveries  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
+
+
+def _require_sdk_ok(operation: str, code: Any) -> None:
+    """Raise when an xArm setter reports failure without raising."""
+    if not isinstance(code, (int, np.integer)) or int(code) != 0:
+        raise RuntimeError(f"{operation} failed with SDK code {code!r}")
+
+
+def _transition_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
+    details: Any = None
+    if error_code == 31 and hasattr(arm_api, "get_c31_error_info"):
+        try:
+            code, info = arm_api.get_c31_error_info()
+            if code == 0:
+                details = info
+        except Exception:
+            logger.warning("arm_loop: failed to read C31 diagnostics", exc_info=True)
+    logger.error("arm_loop: collision fault C%d detected; details=%s", error_code, details)
+    shared.error_state.value = True
+    transition(shared, SafetyState.FAULT)
 
 
 def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
@@ -68,8 +89,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _state_error_counter = RetryCounter(max_consecutive=_RECOVERY_MAX, label="arm_state")
     _tracking_err_count = 0
     cfg = config or ArmLoopConfig()
-
-    HOME_QPOS = np.array(cfg.home_qpos, dtype=np.float64)
 
     # URDF-consistent FK (replaces arm.get_position_aa). xArm firmware uses a
     # different EEF coordinate definition — Pinocchio FK ensures all consumers
@@ -137,14 +156,14 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     # Post-recovery configuration (only after successful mode-6 transition).
     try:
-        arm.set_collision_sensitivity(cfg.collision_sensitivity)
+        _require_sdk_ok("set_collision_sensitivity", arm.set_collision_sensitivity(cfg.collision_sensitivity))
         # TCP load: XHand (1.1 kg). COG in tool-flange frame (link_eef) from
         # URDF weighted-COM of all end-effector links; flange_joint2 corrected
         # 0.043→0.033 m per physical measurement.
-        arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5])
+        _require_sdk_ok("set_tcp_load", arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5]))
         # Torque-based collision detection (level 1). Detects impacts but may
         # miss slow contact. Primary table protection: self-collision + z-clearance.
-        arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True)
+        _require_sdk_ok("set_joint_maxacc", arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True))
     except Exception as e:
         logger.error("arm_loop: post-recovery config failed: %s", e)
         shared.error_state.value = True
@@ -236,43 +255,30 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             except Empty:
                 action = None
 
-            # HOME sentinel (tuple: (HOME_SENTINEL, waypoints_or_None))
+            # HOME sentinel carries a collision-validated path and a request ID.
+            # Execution is feedback-driven; completion is acknowledged only
+            # after fresh controller state converges to the canonical target.
             if isinstance(action, tuple) and len(action) == 2 and action[0] == HOME_SENTINEL:
-                _waypoints = action[1]
+                _request = action[1]
+                if not isinstance(_request, HomeRequest):
+                    logger.error("arm_loop: rejecting malformed HOME request")
+                    continue
                 logger.info(
                     "arm_loop: HOME sentinel — planned homing (%d waypoints)",
-                    len(_waypoints) if _waypoints is not None else 0,
+                    len(_request.waypoints),
                 )
-                _planned_homing(arm, _waypoints, HOME_QPOS, cfg, shared=shared)
-                # Read actual state after homing — arm may still be settling
-                # (all servo commands use wait=False)
+                _home_result = _planned_homing(arm, _request, cfg, shared=shared)
                 try:
-                    code, states = arm.get_joint_states(is_radian=True, num=1)
-                    if code == 0 and len(states) > 0:
-                        last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
-                    else:
-                        last_qpos = HOME_QPOS.copy()
+                    shared.arm_home_result_q.put(_home_result, timeout=0.2)
                 except Exception:
-                    last_qpos = HOME_QPOS.copy()
-                last_target = last_qpos.copy()
-                # Publish post-homing state so consumers see the final position
-                try:
-                    eef_pos_home, eef_rot6d_home = _arm_fk.compute(last_qpos)
-                except Exception:
-                    eef_pos_home = np.zeros(3, dtype=np.float64)
-                    eef_rot6d_home = np.zeros(6, dtype=np.float64)
-                _frame_home = new_frame(ARM_STATE_DTYPE)
-                _frame_home["qpos"][0] = last_qpos
-                _frame_home["qvel"][0] = np.zeros(7, dtype=np.float64)
-                _frame_home["tau"][0] = np.zeros(7, dtype=np.float64)
-                _frame_home["eef_pos"][0] = eef_pos_home
-                _frame_home["eef_rot6d"][0] = eef_rot6d_home
-                _frame_home["error_code"][0] = 0
-                _frame_home["connected"][0] = 1
-                _frame_home["mode"][0] = getattr(arm, "mode", 6)
-                _frame_home["tracking_err"][0] = 0.0
-                _frame_home["timestamp"][0] = time.monotonic()
-                shared.arm_state_ring.write(_frame_home)
+                    logger.error("arm_loop: failed to publish HOME result", exc_info=True)
+                if _home_result.final_qpos.shape == (7,) and np.all(np.isfinite(_home_result.final_qpos)):
+                    last_qpos = _home_result.final_qpos.copy()
+                    last_target = last_qpos.copy()
+                if not _home_result.success and shared.is_running.value:
+                    logger.error("arm_loop: HOME failed — %s", _home_result.reason)
+                    shared.error_state.value = True
+                    transition(shared, SafetyState.FAULT)
                 continue
 
             _new_action = action is not None and isinstance(action, dict)
@@ -282,13 +288,19 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     # Wrap equivalent joints to the same 2π band for shortest
                     # path. Mismatched bands cause the joint to rotate full
                     # circle (~2π) — defense-in-depth for IK edge cases.
-                    target = wrap_nearest_equivalent(
-                        target,
-                        last_qpos,
-                        cfg.joint_limit_lower,
-                        cfg.joint_limit_upper,
-                    )
-                    last_target = target
+                    try:
+                        target = wrap_nearest_equivalent(
+                            target, last_qpos, cfg.joint_limit_lower, cfg.joint_limit_upper
+                        )
+                    except ValueError:
+                        logger.warning("arm_loop: invalid target joint vector — holding", exc_info=True)
+                    else:
+                        low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
+                        high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
+                        if np.all((target >= low) & (target <= high)):
+                            last_target = target
+                        else:
+                            logger.warning("arm_loop: no limit-valid equivalent target — holding")
 
             try:
                 code = arm.set_servo_angle(
@@ -300,8 +312,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 )
                 if code != 0:
                     err_code = getattr(arm, "error_code", 0)
-                    if err_code in _RECOVERABLE_ERRORS:
-                        # C22/C24/C31 — recoverable. Clean error + warn → ready state →
+                    if err_code in _COLLISION_FAULT_ERRORS:
+                        _transition_collision_fault(shared, arm, err_code)
+                        break
+                    elif err_code in _RECOVERABLE_ERRORS:
+                        # C24 speed-limit error — bounded recovery. Clean error + warn → ready state →
                         # re-enter Mode 6. set_state(0) MUST precede set_mode(6).
                         arm.clean_error()
                         arm.clean_warn()
@@ -346,8 +361,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     transition(shared, SafetyState.FAULT)
                     break
             else:
-                # code == 0: successful send — reset recovery streak
-                _recovery_counter.reset()
+                if code == 0:
+                    _recovery_counter.reset()
 
         arm_connected = True
         try:
@@ -396,7 +411,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             error_code = 0
             arm_connected = False
 
-        if error_code in _RECOVERABLE_ERRORS:
+        if error_code in _COLLISION_FAULT_ERRORS:
+            _transition_collision_fault(shared, arm, error_code)
+            break
+        elif error_code in _RECOVERABLE_ERRORS:
             _state_error_counter.inc()
             if _state_error_counter.triggered:
                 logger.error(
@@ -454,109 +472,122 @@ def _disconnect_arm(arm: Any) -> None:
 
 def _planned_homing(
     arm: Any,
-    waypoints: np.ndarray | None,
-    home_qpos: np.ndarray,
+    request: HomeRequest,
     cfg: ArmLoopConfig | None = None,
     *,
     shared: Any = None,
-) -> None:
-    """Execute planned waypoints, then converge to exact home_qpos.
+) -> HomeResult:
+    """Execute a validated path one waypoint at a time using controller feedback.
 
-    Falls back to joint-space linear interpolation when waypoints is None.
+    Mode 6 replans online to every new target.  Advancing only after the real
+    joint state reaches the current small waypoint keeps the executed motion
+    close to the collision-checked path and prevents time-based target
+    overwrite.  Every exit returns an explicit correlated result; no state is
+    fabricated when the SDK cannot be read.
     """
     _cfg = cfg or ArmLoopConfig()
+
+    def _result(success: bool, reason: str, qpos: np.ndarray) -> HomeResult:
+        return HomeResult(
+            request_id=request.request_id,
+            success=success,
+            reason=reason,
+            final_qpos=np.asarray(qpos, dtype=np.float64).copy(),
+            completed_at_s=time.monotonic(),
+        )
+
+    waypoints = np.asarray(request.waypoints, dtype=np.float64)
+    home_qpos = np.asarray(request.final_qpos, dtype=np.float64)
+    if not isinstance(request.request_id, (int, np.integer)) or int(request.request_id) <= 0:
+        return _result(False, "invalid request_id", np.full(7, np.nan))
+    if waypoints.ndim != 2 or waypoints.shape[1:] != (7,) or not np.all(np.isfinite(waypoints)):
+        return _result(False, "invalid waypoint array", np.full(7, np.nan))
+    if home_qpos.shape != (7,) or not np.all(np.isfinite(home_qpos)):
+        return _result(False, "invalid final_qpos", np.full(7, np.nan))
+    if not np.isfinite(request.execution_timeout_s) or request.execution_timeout_s <= 0.0:
+        return _result(False, "invalid execution timeout", np.full(7, np.nan))
+    _lower = np.asarray(_cfg.joint_limit_lower, dtype=np.float64)
+    _upper = np.asarray(_cfg.joint_limit_upper, dtype=np.float64)
+    if len(waypoints) > 0 and not np.all((waypoints >= _lower) & (waypoints <= _upper)):
+        return _result(False, "waypoint violates joint limits", np.full(7, np.nan))
+    if len(waypoints) > 1 and float(np.max(np.abs(np.diff(waypoints, axis=0)))) > np.deg2rad(1.01):
+        return _result(False, "waypoint step exceeds validated 1deg bound", np.full(7, np.nan))
 
     try:
         code, states = arm.get_joint_states(is_radian=True, num=1)
         if code == 0 and len(states) > 0:
             current = np.asarray(states[0], dtype=np.float64)[:7]
         else:
-            return
+            return _result(False, f"initial state read failed (code={code})", np.full(7, np.nan))
     except Exception:
-        return
+        logger.warning("_planned_homing: initial state read raised", exc_info=True)
+        return _result(False, "initial state read raised", np.full(7, np.nan))
+    if current.shape != (7,) or not np.all(np.isfinite(current)):
+        return _result(False, "initial state is invalid", np.full(7, np.nan))
 
-    # Wrap home_qpos to nearest equivalent of current position — prevents
-    # the long way around for equivalent joints (J1/J3/J5/J7, 720° range).
-    _home = wrap_nearest_equivalent(
-        home_qpos,
-        current,
-        _cfg.joint_limit_lower,
-        _cfg.joint_limit_upper,
-    )
+    if len(waypoints) == 0:
+        if float(np.max(np.abs(current - home_qpos))) <= _cfg.homing_convergence_rad:
+            return _result(True, "already at canonical home", current)
+        return _result(False, "empty path while away from canonical home", current)
+    if float(np.max(np.abs(current - waypoints[0]))) > np.deg2rad(2.0):
+        return _result(False, "current state moved too far from planned path start", current)
 
-    if np.max(np.abs(current - _home)) < _cfg.homing_convergence_rad:
-        return
+    _overall_deadline = time.monotonic() + request.execution_timeout_s
+    _waypoint_tol = min(_cfg.homing_convergence_rad, np.deg2rad(0.5))
+    _stable_required = 2
 
-    # Stage 1: execute planned waypoints (collision-safe path).
-    if waypoints is not None and len(waypoints) > 0:
-        for _wp in waypoints:
+    for _index, _wp in enumerate(waypoints):
+        if shared is not None:
+            if not shared.is_running.value:
+                return _result(False, "shutdown requested", current)
+            if shared.safety_state.value == SafetyState.FAULT:
+                return _result(False, "FAULT during homing", current)
+            shared.arm_heartbeat_s.value = time.monotonic()
+        if time.monotonic() >= _overall_deadline:
+            return _result(False, f"overall timeout at waypoint {_index + 1}/{len(waypoints)}", current)
+
+        try:
+            _code = arm.set_servo_angle(
+                angle=_wp,
+                is_radian=True,
+                speed=_cfg.homing_max_speed_rad_per_s,
+                mvacc=_cfg.joint_max_acc_rad_per_s2,
+                wait=False,
+            )
+        except Exception:
+            logger.warning("_planned_homing: waypoint send failed", exc_info=True)
+            return _result(False, f"waypoint {_index + 1} send raised", current)
+        if _code != 0:
+            return _result(False, f"waypoint {_index + 1} rejected (SDK code={_code})", current)
+
+        _segment_deadline = min(_overall_deadline, time.monotonic() + _cfg.homing_target_timeout_s)
+        _stable = 0
+        while time.monotonic() < _segment_deadline:
             if shared is not None:
                 if not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT:
-                    return
+                    return _result(False, "homing interrupted", current)
                 shared.arm_heartbeat_s.value = time.monotonic()
             try:
-                arm.set_servo_angle(angle=_wp, is_radian=True, wait=False)
+                _state_code, _states = arm.get_joint_states(is_radian=True, num=1)
             except Exception:
-                break
+                logger.warning("_planned_homing: waypoint state read raised", exc_info=True)
+                return _result(False, f"state read raised at waypoint {_index + 1}", current)
+            if _state_code != 0 or len(_states) == 0:
+                return _result(False, f"state read failed at waypoint {_index + 1} (code={_state_code})", current)
+            current = np.asarray(_states[0], dtype=np.float64)[:7]
+            if current.shape != (7,) or not np.all(np.isfinite(current)):
+                return _result(False, f"invalid state at waypoint {_index + 1}", current)
+            if float(np.max(np.abs(current - _wp))) <= _waypoint_tol:
+                _stable += 1
+                if _stable >= _stable_required:
+                    break
+            else:
+                _stable = 0
             time.sleep(_cfg.homing_step_interval_s)
-    elif waypoints is not None and len(waypoints) == 0:
-        # Empty (0,7) array = sentinel from plan_joint_home_path: no safe path
-        # to home exists.  Hold position — do NOT fall back to raw linear
-        # interpolation (which has zero collision checking).
-        logger.warning("_planned_homing: no safe path to home — holding position")
-        return
+        else:
+            return _result(False, f"waypoint {_index + 1}/{len(waypoints)} convergence timeout", current)
 
-    # Stage 2: converge to exact home_qpos (fine positioning). Linear interpolation
-    # without collision check — safe because Stage 1 brings arm close to home.
-    if shared is not None and (not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT):
-        return
-
-    # Re-read current position — Stage 1 may have moved the arm.
-    try:
-        code, states = arm.get_joint_states(is_radian=True, num=1)
-        if code == 0 and len(states) > 0:
-            current = np.asarray(states[0], dtype=np.float64)[:7]
-    except Exception:
-        pass
-
-    # Re-wrap after Stage 1 — the arm may have settled in a different band.
-    _home = wrap_nearest_equivalent(
-        home_qpos,
-        current,
-        _cfg.joint_limit_lower,
-        _cfg.joint_limit_upper,
-    )
-
-    if np.max(np.abs(current - _home)) < _cfg.homing_convergence_rad:
-        return
-
-    # Compute step count from max joint delta and configured speed (30°/s default).
-    _max_delta_rad = float(np.max(np.abs(_home - current)))
-    _total_time_s = _max_delta_rad / _cfg.homing_max_speed_rad_per_s
-    steps = max(int(_total_time_s / _cfg.homing_step_interval_s), 10)
-    for i in range(1, steps + 1):
-        if shared is not None:
-            if not shared.is_running.value or shared.safety_state.value == SafetyState.FAULT:
-                break
-            shared.arm_heartbeat_s.value = time.monotonic()
-        wp = current + (i / steps) * (_home - current)
-        try:
-            arm.set_servo_angle(angle=wp, is_radian=True, wait=False)
-        except Exception:
-            break
-        time.sleep(_cfg.homing_step_interval_s)
-
-    # Final: send canonical home_qpos to align encoder values.
-    # In the normal path (planner available), send_arm_home appends a
-    # collision-checked band-alignment segment to the waypoints, so the arm
-    # is already at the canonical band after Stage 1+2 — this call is a no-op.
-    # In the fallback path (planner=None, post-exit homing), Stage 2 converges
-    # to _home (wrapped) and this final call may trigger a band-alignment
-    # rotation WITHOUT collision checking.  This is acceptable only because
-    # post-exit homing runs after the arm is already near home from a prior
-    # homing cycle, and no operator is present.
-    _align_speed = np.deg2rad(90.0)
-    try:
-        arm.set_servo_angle(angle=home_qpos, is_radian=True, speed=_align_speed, wait=False)
-    except Exception:
-        pass
+    _final_error = float(np.max(np.abs(current - home_qpos)))
+    if _final_error > _cfg.homing_convergence_rad:
+        return _result(False, f"final error {np.rad2deg(_final_error):.2f}deg", current)
+    return _result(True, "canonical home reached", current)

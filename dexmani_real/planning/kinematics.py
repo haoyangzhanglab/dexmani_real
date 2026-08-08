@@ -82,6 +82,9 @@ class XArm7Kinematics:
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
         # Hot-path: ensure_qpos validation is done at entry points (solve / solve_teleop_ik).
         # Skipped here to avoid redundant per-frame checks (ref: P1.1).
+        # Defense-in-depth: NaN/Inf qpos causes undefined behavior in Pinocchio C++ FK.
+        if not np.all(np.isfinite(qpos)):
+            raise ValueError(f"compute_eef_pose_base: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)
@@ -99,6 +102,9 @@ class XArm7Kinematics:
     def compute_eef_jacobian(self, qpos: np.ndarray) -> np.ndarray:
         # Hot-path: ensure_qpos validation is done at entry points.
         # Skipped here to avoid redundant per-frame checks (ref: P1.1).
+        # Defense-in-depth: NaN/Inf qpos causes undefined behavior in Pinocchio C++ FK.
+        if not np.all(np.isfinite(qpos)):
+            raise ValueError(f"compute_eef_jacobian: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         jacobian = np.asarray(
@@ -119,6 +125,11 @@ class XArm7Kinematics:
             Jacobian columns map joint velocities to world-frame spatial velocity
             [v_world; ω_world].  Pose is the world-frame EEF pose.
         """
+        # Reject NaN/Inf qpos before Pinocchio FK — prevents undefined
+        # behavior in the C++ kinematics engine (cf. _to_full_qpos guard
+        # in collision_model.py).
+        if not np.all(np.isfinite(qpos)):
+            raise ValueError("compute_eef_jacobian_and_pose_world: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
 
@@ -174,7 +185,11 @@ class XArm7Kinematics:
 
         Returns:
             sqrt(det(J @ Jᵀ)), clamped to ≥ 0.
+            Returns 0.0 on non-finite Jacobian (NaN/Inf) — zero
+            manipulability triggers downstream rejection gates.
         """
+        if not np.all(np.isfinite(J)):
+            return 0.0
         JJT = J @ J.T
         det = float(np.linalg.det(JJT))
         return np.sqrt(max(det, 0.0))

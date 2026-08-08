@@ -10,11 +10,12 @@ import multiprocessing as mp
 import sys
 import time
 from dataclasses import dataclass, field
+from queue import Empty
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import camera, policy
+from dexmani_real.config.defaults import arm, camera, policy
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.ring_buffer import CameraRingBuffer
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer
@@ -60,6 +61,27 @@ class SharedStorageConfig:
 HOME_SENTINEL = "__HOME__"
 
 
+@dataclass(frozen=True)
+class HomeRequest:
+    """A fully planned, fail-closed homing command for ``arm_loop``."""
+
+    request_id: int
+    waypoints: "np.ndarray"
+    final_qpos: "np.ndarray"
+    execution_timeout_s: float
+
+
+@dataclass(frozen=True)
+class HomeResult:
+    """Completion acknowledgement produced by the arm worker for one home request."""
+
+    request_id: int
+    success: bool
+    reason: str
+    final_qpos: "np.ndarray"
+    completed_at_s: float
+
+
 def _describe_band_diff(wrapped: "np.ndarray", canonical: "np.ndarray") -> str:
     """Describe which equivalent joints differ between wrapped and canonical home.
 
@@ -74,6 +96,7 @@ def _describe_band_diff(wrapped: "np.ndarray", canonical: "np.ndarray") -> str:
         if delta_deg[_ji] > 1.0:
             parts.append(f"{_name}:{np.rad2deg(wrapped[_ji]):.0f}→{np.rad2deg(canonical[_ji]):.0f}°")
     return ", ".join(parts) if parts else "same band"
+
 
 ARM_STATE_DTYPE = np.dtype(
     [
@@ -140,6 +163,7 @@ class SharedStorage:
     hand_cmd_ring: SeqlockRingBuffer  # policy -> hand
 
     arm_action_q: mp.Queue  # policy -> arm, maxsize=2
+    arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -219,6 +243,7 @@ class SharedStorage:
         )
 
         storage.arm_action_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
+        storage.arm_home_result_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
 
         storage.is_running = mp.Value("b", True)
         storage.is_recording = mp.Value("b", False)
@@ -274,11 +299,15 @@ class SharedStorage:
             except Exception:
                 _close_errors.append(f"{ring_name}.unlink() failed")
 
-        try:
-            self.arm_action_q.close()
-            self.arm_action_q.join_thread()
-        except Exception:
-            _close_errors.append("arm_action_q cleanup failed")
+        for queue_name, queue in (
+            ("arm_action_q", self.arm_action_q),
+            ("arm_home_result_q", self.arm_home_result_q),
+        ):
+            try:
+                queue.close()
+                queue.join_thread()
+            except Exception:
+                _close_errors.append(f"{queue_name} cleanup failed")
 
         if _close_errors:
             logger.warning("SharedStorage close: %d error(s): %s", len(_close_errors), "; ".join(_close_errors))
@@ -350,6 +379,7 @@ def hand_home_converge(
     """
     tol = np.deg2rad(tol_deg)
     deadline = time.monotonic() + timeout_s
+    requested_after_s = time.monotonic()
     first = True
 
     while time.monotonic() < deadline:
@@ -361,7 +391,9 @@ def hand_home_converge(
         hs = read_hand_state(shared)
         if hs is not None:
             current = np.asarray(hs["qpos"][0], dtype=np.float64)
-            if np.all(np.isfinite(current)):
+            fresh = float(hs["timestamp"][0]) >= requested_after_s
+            healthy = bool(hs["connected"][0]) and not bool(hs["error_state"][0])
+            if fresh and healthy and np.all(np.isfinite(current)):
                 err = float(np.max(np.abs(current - home_qpos)))
                 if err < tol:
                     if verbose:
@@ -458,39 +490,84 @@ def wait_for_arm_home(
     shared: "SharedStorage",
     home_qpos: "np.ndarray",
     *,
+    request_id: int | None = None,
+    requested_after_s: float | None = None,
     timeout_s: float = 20.0,
     tol_rad: float = 0.03,
     heartbeat: bool = False,
     verbose: bool = True,
 ) -> bool:
-    """Poll arm_state_ring until qpos converges to *home_qpos* or timeout.
+    """Wait for a fresh, correlated arm-worker homing acknowledgement.
 
-    Does NOT use ``wrap_nearest_equivalent`` — ``arm_loop._planned_homing``
-    (triggered by ``HOME_SENTINEL``) already handles joint-band wrapping and
-    finishes with ``set_servo_angle(home_qpos)``, so joints converge to the
-    canonical home position.
-
-    If *heartbeat* is True, ticks ``policy_heartbeat_s`` on every poll so the
-    supervisor does not FAULT during homing (required inside policy_loop).
-
-    Returns True if home is reached, False on timeout.
+    New callers pass *request_id*.  The legacy state-only path is retained for
+    compatibility with external callers, but requires a frame newer than
+    *requested_after_s* and a healthy, connected arm.  Both paths fail early on
+    shutdown, sticky error, FAULT, stale arm heartbeat, or controller error.
     """
     _deadline = time.monotonic() + timeout_s
+    _not_before = time.monotonic() if requested_after_s is None else float(requested_after_s)
     while time.monotonic() < _deadline:
+        _now = time.monotonic()
         if heartbeat:
-            shared.policy_heartbeat_s.value = time.monotonic()
+            shared.policy_heartbeat_s.value = _now
+
+        _result = None
+        if request_id is not None:
+            try:
+                _result = shared.arm_home_result_q.get(timeout=min(0.1, max(0.0, _deadline - _now)))
+            except Empty:
+                pass
+            if _result is not None and (not isinstance(_result, HomeResult) or _result.request_id != request_id):
+                logger.warning("wait_for_arm_home: discarded stale/malformed result %r", _result)
+                continue
+        if isinstance(_result, HomeResult):
+            _q = np.asarray(_result.final_qpos, dtype=np.float64)
+            _converged = (
+                _q.shape == home_qpos.shape
+                and np.all(np.isfinite(_q))
+                and float(np.max(np.abs(_q - home_qpos))) < tol_rad
+            )
+            if _result.success and _converged:
+                if verbose:
+                    print("  arm: home reached", flush=True)
+                return True
+            if verbose:
+                print(f"  arm: home failed — {_result.reason}", flush=True)
+            return False
+
+        if not shared.is_running.value or shared.error_state.value:
+            break
+        if shared.safety_state.value == int(SafetyState.FAULT):
+            break
+        _arm_hb = float(shared.arm_heartbeat_s.value)
+        if _arm_hb > 0.0 and _now - _arm_hb > 1.0:
+            break
+        if request_id is not None:
+            continue
+
         _as = read_arm_state(shared)
         if _as is not None:
             _q = np.asarray(_as["qpos"][0], dtype=np.float64)
-            if np.all(np.isfinite(_q)):
+            _fresh = float(_as["timestamp"][0]) >= _not_before
+            _healthy = bool(_as["connected"][0]) and int(_as["error_code"][0]) == 0
+            if _fresh and _healthy and np.all(np.isfinite(_q)):
                 if float(np.max(np.abs(_q - home_qpos))) < tol_rad:
                     if verbose:
                         print("  arm: home reached", flush=True)
                     return True
         time.sleep(0.1)
     if verbose:
-        print(f"  arm: home settle timeout ({timeout_s:.0f}s)", flush=True)
+        print(f"  arm: home wait aborted or timed out ({timeout_s:.0f}s)", flush=True)
     return False
+
+
+def _estimate_home_timeout_s(waypoints: "np.ndarray") -> float:
+    """Conservative deadline derived from path length and configured homing speed."""
+    if len(waypoints) < 2:
+        return 10.0
+    segment_motion = np.max(np.abs(np.diff(waypoints, axis=0)), axis=1)
+    nominal_s = float(np.sum(segment_motion)) / max(np.deg2rad(arm.homing.max_speed_deg_s), 1e-6)
+    return max(10.0, 2.0 * nominal_s + 5.0)
 
 
 def send_arm_home(
@@ -513,8 +590,8 @@ def send_arm_home(
     3. Queue ``(HOME_SENTINEL, waypoints)`` to ``arm_action_q``.
     4. Wait for convergence via ``wait_for_arm_home``.
 
-    If *planner* is None (post-exit callers), uses equivalent-joint wrapping
-    without collision checking.
+    A planner is required. Missing state, planning errors, and unsafe paths
+    fail closed and are never converted into direct interpolation.
 
     Returns True if home reached, False on timeout or error.
     """
@@ -523,19 +600,38 @@ def send_arm_home(
     # ── Step 1: resolve current qpos ──
     if current_qpos is None:
         _as = read_arm_state(shared)
-        current_qpos = home_qpos.copy()
-        if _as is not None and np.all(np.isfinite(_as["qpos"][0])):
-            current_qpos = np.asarray(_as["qpos"][0], dtype=np.float64)
+        if _as is None or not np.all(np.isfinite(_as["qpos"][0])):
+            if verbose:
+                print("  arm: no valid current state — homing cancelled", flush=True)
+            return False
+        current_qpos = np.asarray(_as["qpos"][0], dtype=np.float64)
+
+    if planner is None:
+        if verbose:
+            print("  arm: no collision planner — homing cancelled", flush=True)
+        return False
 
     # ── Step 2: plan collision-safe path to wrapped home ──
     try:
-        _waypoints = plan_joint_home_path(
-            current_qpos, home_qpos, planner, table_z_surface_m=table_z_surface_m
-        )
-    except Exception:
+        _waypoints = plan_joint_home_path(current_qpos, home_qpos, planner, table_z_surface_m=table_z_surface_m)
+    except Exception as exc:
+        logger.warning("send_arm_home: planning failed", exc_info=True)
         if verbose:
-            print("  arm: home path planning failed — falling back to direct home", flush=True)
-        _waypoints = None
+            print(f"  arm: home path planning failed — holding ({exc})", flush=True)
+        return False
+
+    if _waypoints is not None and len(_waypoints) == 0:
+        if verbose:
+            print("  arm: no collision-safe home path — holding", flush=True)
+        return False
+
+    _wrapped_home = (
+        _waypoints[-1].copy()
+        if _waypoints is not None and len(_waypoints) > 0
+        else planner.ik_mgr.nearest_equivalent_qpos(home_qpos, current_qpos)
+    )
+    if _waypoints is None:
+        _waypoints = np.empty((0, 7), dtype=np.float64)
 
     # ── Step 2b: plan band-alignment path (wrapped_home → canonical_home) ──
     # plan_joint_home_path wraps home_qpos to the nearest 2π band of the
@@ -543,37 +639,46 @@ def send_arm_home(
     # wrapped position (_home).  For strategy learning we need the arm at
     # the canonical home_qpos, so we append a collision-checked alignment
     # segment that rotates only the band-mismatched equivalent joints.
-    if (
-        _waypoints is not None
-        and len(_waypoints) > 0
-        and planner is not None
-        and table_z_surface_m is not None
-    ):
-        try:
-            _wrapped_home = _waypoints[-1].copy()
-            _align_path = plan_band_alignment_path(
-                _wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m
-            )
-        except Exception:
-            _align_path = None
+    try:
+        _align_path = plan_band_alignment_path(_wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m)
+    except Exception as exc:
+        logger.warning("send_arm_home: band-alignment planning failed", exc_info=True)
+        if verbose:
+            print(f"  arm: band-alignment planning failed — holding ({exc})", flush=True)
+        return False
 
-        if _align_path is not None:
-            if len(_align_path) > 0:
-                # Skip the first waypoint (== _wrapped_home, already at end
-                # of main path) and append the rest.
-                _waypoints = np.concatenate([_waypoints, _align_path[1:]], axis=0)
-                if verbose:
-                    _desc = _describe_band_diff(_wrapped_home, home_qpos)
-                    print(f"  arm: band-alignment appended ({len(_align_path) - 1} waypoints, {_desc})", flush=True)
-            else:
-                # Empty sentinel: alignment needed but unsafe — stay at _wrapped_home.
-                if verbose:
-                    _desc = _describe_band_diff(_wrapped_home, home_qpos)
-                    print(f"  arm: band-alignment UNSAFE ({_desc}) — staying at wrapped home", flush=True)
+    if _align_path is not None:
+        if len(_align_path) == 0:
+            if verbose:
+                _desc = _describe_band_diff(_wrapped_home, home_qpos)
+                print(f"  arm: band-alignment UNSAFE ({_desc}) — holding", flush=True)
+            return False
+        # Keep the first alignment waypoint only when there is no main path.
+        _tail = _align_path[1:] if len(_waypoints) > 0 else _align_path
+        _waypoints = np.concatenate([_waypoints, _tail], axis=0)
+        if verbose:
+            _desc = _describe_band_diff(_wrapped_home, home_qpos)
+            print(f"  arm: band-alignment appended ({len(_tail)} waypoints, {_desc})", flush=True)
 
     # ── Step 3: queue HOME_SENTINEL ──
+    _request_id = time.monotonic_ns()
+    _execution_timeout_s = max(float(converge_timeout_s), _estimate_home_timeout_s(_waypoints))
+    # A prior caller may have abandoned a result.  Homing is serialized, so it
+    # is safe to drain stale acknowledgements before publishing the new ID.
+    while True:
+        try:
+            shared.arm_home_result_q.get_nowait()
+        except Empty:
+            break
     try:
-        shared.arm_action_q.put((HOME_SENTINEL, _waypoints), timeout=queue_timeout)
+        _request = HomeRequest(
+            request_id=_request_id,
+            waypoints=np.asarray(_waypoints, dtype=np.float64),
+            final_qpos=np.asarray(home_qpos, dtype=np.float64).copy(),
+            execution_timeout_s=_execution_timeout_s,
+        )
+        _requested_at_s = time.monotonic()
+        shared.arm_action_q.put((HOME_SENTINEL, _request), timeout=queue_timeout)
     except Exception:
         if verbose:
             print("  arm_action_q put failed — arm may have already exited", flush=True)
@@ -581,8 +686,14 @@ def send_arm_home(
 
     # ── Step 4: wait for convergence ──
     return wait_for_arm_home(
-        shared, home_qpos, timeout_s=converge_timeout_s,
-        tol_rad=np.deg2rad(2.0), heartbeat=heartbeat, verbose=verbose,
+        shared,
+        home_qpos,
+        request_id=_request_id,
+        requested_after_s=_requested_at_s,
+        timeout_s=_execution_timeout_s + 2.0,
+        tol_rad=np.deg2rad(2.0),
+        heartbeat=heartbeat,
+        verbose=verbose,
     )
 
 
@@ -659,9 +770,7 @@ def run_supervisor(
             if _now - _last_status_s >= status_interval_s:
                 _runtime_m = (_now - _start_time) / 60.0
                 _safety = shared.safety_state.value
-                _hb_ages = ", ".join(
-                    f"{n}={_now - float(heartbeat_fields[n].value):.1f}s" for n in proc_names
-                )
+                _hb_ages = ", ".join(f"{n}={_now - float(heartbeat_fields[n].value):.1f}s" for n in proc_names)
                 print(
                     f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})",
                     flush=True,

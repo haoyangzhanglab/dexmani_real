@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .path_utils import wrap_nearest_equivalent
+
 if TYPE_CHECKING:
     from .kinematics import XArm7Kinematics
     from .collision_model import CollisionModel
@@ -60,6 +62,10 @@ class IKCandidateManager:
         self.equivalent_joint_mask = kinematics.equivalent_joint_mask
         self.mp_planner = kinematics.mp_planner
         self._cm = collision_model
+        # Cached: mask already guarantees range > 2π for equivalent joints,
+        # so min(2π, joint_range) ≡ 2π — the np.minimum in the original
+        # _periods() was dead logic.
+        self._periods_arr = np.where(self.equivalent_joint_mask, 2.0 * np.pi, 1.0)
 
     def call_mplib_ik(
         self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
@@ -111,7 +117,19 @@ class IKCandidateManager:
 
             raw_success_count += 1
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
+            # Reject NaN/Inf from MPlib — symmetric with the teleop path
+            # (ik.py:149).  MPlib can return "Success" status alongside
+            # NaN/Inf qpos from numerical instability or degenerate seeds.
+            if not np.all(np.isfinite(raw_qpos)):
+                reason = "mplib_ik_failed"
+                reject_counts[reason] = reject_counts.get(reason, 0) + 1
+                continue
             qpos = self.canonicalize_qpos(raw_qpos, current_qpos, planning_limits)
+            if any(
+                np.max(np.abs(self.compute_qpos_delta(qpos, existing_qpos))) < 1e-4 for existing_qpos, _ in candidates
+            ):
+                reject_counts["duplicate_candidate"] = reject_counts.get("duplicate_candidate", 0) + 1
+                continue
             valid, report = self.filter_ik_candidate(
                 qpos, raw_qpos, target_eef_pose_world, current_qpos, profile, planning_limits
             )
@@ -166,7 +184,6 @@ class IKCandidateManager:
             )
             return False, report
 
-        np.clip(qpos, low, high, out=qpos)
         delta = self.compute_qpos_delta(qpos, current_qpos)
         max_delta = np.deg2rad(self.profile_array(profile.max_ik_delta_deg, "max_ik_delta_deg"))
         over_delta = np.abs(delta) > max_delta
@@ -238,20 +255,20 @@ class IKCandidateManager:
             reference_qpos = np.zeros(self.dof, dtype=np.float64)
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
 
-        for joint_index in range(self.dof):
-            if not self.equivalent_joint_mask[joint_index]:
-                continue
-            hardware_low = self.joint_limits[joint_index, 0]
-            hardware_high = self.joint_limits[joint_index, 1]
-            local_low = reference_qpos[joint_index] - np.pi
-            local_high = reference_qpos[joint_index] + np.pi
-            limits[joint_index, 0] = max(hardware_low, local_low)
-            limits[joint_index, 1] = min(hardware_high, local_high)
+        # Expand the ±π window by one full period for equivalent joints so
+        # configurations near hardware limits (e.g. ref at +354°, valid
+        # solution at 0°) are not rejected.  canonicalize_qpos handles
+        # wrapping the IK output back into the correct band; this window
+        # only needs to be wide enough to accept the raw MPlib output in
+        # any equivalent band within ±π wrapped distance.
+        mask = self.equivalent_joint_mask
+        if np.any(mask):
+            limits[mask, 0] = np.maximum(self.joint_limits[mask, 0], reference_qpos[mask] - 3.0 * np.pi)
+            limits[mask, 1] = np.minimum(self.joint_limits[mask, 1], reference_qpos[mask] + 3.0 * np.pi)
         return limits
 
     def _periods(self) -> np.ndarray:
-        joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
-        return np.where(self.equivalent_joint_mask, np.minimum(2.0 * np.pi, joint_ranges), 1.0)
+        return self._periods_arr
 
     def nearest_equivalent_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
         return self.canonicalize_qpos(qpos, reference_qpos, limits=self.joint_limits, limit_tol=0.0)
@@ -267,28 +284,12 @@ class IKCandidateManager:
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
         if limits is None:
             limits = self.joint_limits
-        result = qpos.copy()
-        mask = self.equivalent_joint_mask
-        periods = self._periods()
-        low, high = limits[:, 0], limits[:, 1]
-
-        k_min = np.ceil((low[mask] - result[mask] - limit_tol) / periods[mask])
-        k_max = np.floor((high[mask] - result[mask] + limit_tol) / periods[mask])
-        k = np.round((reference_qpos[mask] - result[mask]) / periods[mask])
-        # Expand k bounds by 1 period on each side — when the physical arm
-        # is near a joint-limit boundary (e.g. +2π) and the raw IK result
-        # lands near the opposite limit (e.g. -2π), the ideal wrapping
-        # factor k may push result slightly past the limit; the final
-        # np.clip will snap it back.  Without this expansion, k_max clips
-        # the wrapping factor and the canonicalised target ends up ~2π
-        # away from current qpos → large tracking-error spike (joint
-        # rotates full circle during teleop).
-        # canonicalize_qpos chose the wrong 2π band for J1/J3/J5/J7.
-        valid = k_min <= k_max
-        k = np.where(valid, np.clip(k, k_min - 1, k_max + 1), 0.0)
-        result[mask] += k * periods[mask]
-        np.clip(result, low, high, out=result)
-        return result
+        return wrap_nearest_equivalent(
+            qpos,
+            reference_qpos,
+            tuple(np.asarray(limits)[:, 0]),
+            tuple(np.asarray(limits)[:, 1]),
+        )
 
     def canonicalize_path_to_planning_limits(
         self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile
@@ -346,11 +347,20 @@ class IKCandidateManager:
 
     # ── Collision check wrappers (delegate to CollisionModel) ──
 
+    def _require_collision_model(self) -> None:
+        if self._cm is None:
+            raise RuntimeError(
+                "CollisionModel not configured — cannot check collisions. "
+                "Pass collision_model=... to IKCandidateManager constructor."
+            )
+
     def has_self_collision(self, qpos: np.ndarray) -> bool:
-        return self._cm.check_self_collision(qpos)  # type: ignore[union-attr]  # wrappers require a configured CollisionModel (planner always builds one)
+        self._require_collision_model()
+        return self._cm.check_self_collision(qpos)  # type: ignore[union-attr]
 
     def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
-        return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]  # see has_self_collision
+        self._require_collision_model()
+        return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]
 
     def check_path_collisions(
         self,
@@ -364,6 +374,21 @@ class IKCandidateManager:
         collision is found, includes structured ``CollisionInfo`` at the
         violating configuration for root-cause diagnostics.
         """
+        self._require_collision_model()
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1] != self.dof:
+            raise ValueError(f"path must have shape (N, {self.dof}), got {path.shape}")
+        if len(path) == 0:
+            return {"path_self_collision": False}
+        first_info = self.check_self_collision(path[0])
+        if first_info:
+            return {
+                "path_self_collision": True,
+                "collision_waypoint_index": 0,
+                "collision_waypoint_count": len(path),
+                "collision_step_size": collision_step_size,
+                "collision": first_info.to_dict(),
+            }
         for i in range(len(path) - 1):
             # Dense segment check — fast bool path for most points.
             if not self._cm.check_segment_collision_free(  # type: ignore[union-attr]  # requires a configured CollisionModel (planner always builds one)
@@ -403,7 +428,7 @@ class IKCandidateManager:
             info = self.check_self_collision(end)
             return info if info else None
         n_steps = int(np.ceil(dist / step_size))
-        for step in range(1, n_steps + 1):
+        for step in range(n_steps + 1):
             alpha = step / n_steps
             q = start + alpha * diff
             info = self.check_self_collision(q)
@@ -425,6 +450,7 @@ class IKCandidateManager:
         qpos: np.ndarray,
         reference_qpos: np.ndarray,
         weights: tuple[float, ...] | np.ndarray,
+        delta: np.ndarray | None = None,
     ) -> float:
         """Per-joint weighted, range-normalised L2 distance (ref: LeFranX weighted_ik.cpp:62-69).
 
@@ -439,10 +465,16 @@ class IKCandidateManager:
         This is the metric that LeFranX uses for ``current_distance`` in their
         multi-objective IK scoring function.  In DexMani it is used by the
         teleop position-IK fallback to rank candidates.
+
+        Args:
+            delta: Pre-computed wrapped delta from ``compute_qpos_delta``.
+                   When provided, avoids a redundant ``compute_qpos_delta``
+                   call (hot-path optimisation).
         """
         qpos = ensure_qpos(qpos, self.dof, "qpos")
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
-        delta = self.compute_qpos_delta(qpos, reference_qpos)
+        if delta is None:
+            delta = self.compute_qpos_delta(qpos, reference_qpos)
         joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
         joint_ranges = np.maximum(joint_ranges, 1e-6)
         weights_arr = self.profile_array(weights, "joint_weights")
