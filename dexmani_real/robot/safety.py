@@ -60,9 +60,10 @@ def transition(shared: Any, new_state: SafetyState) -> bool:
            Main owns DISARMED↔ARMED / →FAULT; Policy owns ARMED↔RUNNING.
         2. **FAULT is self-correcting:** the heartbeat supervisor re-asserts
            FAULT within 100 ms (10 Hz), so any overwrite is transient.
-        3. **No new motion can occur after FAULT:** arm_loop stops issuing
-           ``set_servo_angle`` calls as soon as FAULT is set (the loop breaks
-           immediately), so the arm holds its last Mode 6 target.
+        3. **No new motion can occur after a worker fault latch:** arm_loop and
+           hand_loop gate commands on sticky ``error_state`` immediately;
+           Main then owns the transition to FAULT.  The arm holds its last
+           Mode 6 target during that bounded handoff.
            ``set_state(4)`` is called during cleanup as a belt-and-suspenders
            measure, not the primary safety mechanism.
 

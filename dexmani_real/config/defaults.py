@@ -36,12 +36,12 @@ import numpy as np
 
 @dataclass
 class HomingParams:
-    """Feedback-driven execution parameters for collision-validated home paths."""
+    """Firmware-planned execution parameters for validated home milestones."""
 
     convergence_rad: float = 0.0174533  # final canonical-home tolerance (~1°)
     step_interval_s: float = 0.04  # controller-state polling interval
-    max_speed_deg_s: float = 30.0  # Mode 6 speed while advancing validated waypoints
-    target_timeout_s: float = 0.5  # maximum convergence time for one dense waypoint
+    max_speed_deg_s: float = 30.0  # conservative Mode 0 joint speed; hardware validation required before tuning
+    target_timeout_s: float = 0.5  # settling allowance added after distance/speed timing
 
 
 @dataclass
@@ -334,6 +334,43 @@ class PolicyParams:
             raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
 
 
+@dataclass
+class KeyboardTeleopParams:
+    """Keyboard teleoperation parameters — single source of truth.
+
+    At 30 Hz, the 8 mm translation step requests 0.24 m/s Cartesian target
+    motion. Mode 6 following distance is expected at this rate and is exposed
+    by the arm command timing diagnostics.
+    """
+
+    control_hz: float = 30.0
+    delta_pos_m: float = 0.008  # 240 mm/s at 30 Hz
+    delta_rpy_rad: float = 0.03  # 1.7 deg/frame, 51 deg/s at 30 Hz
+    cartesian_kp: float = 0.0
+    trace_motion: bool = True
+    trace_frame_interval: int = 10
+    release_trace_enabled: bool = True
+    release_trace_pre_frames: int = 6
+    release_trace_post_frames: int = 20  # 0.67 s at 30 Hz, covers the observed ~0.25 s settling dynamics
+    release_trace_cooldown_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.control_hz <= 0:
+            raise ValueError(f"control_hz={self.control_hz} must be > 0")
+        if self.delta_pos_m <= 0:
+            raise ValueError(f"delta_pos_m={self.delta_pos_m} must be > 0")
+        if self.delta_rpy_rad <= 0:
+            raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
+        if self.cartesian_kp < 0:
+            raise ValueError(f"cartesian_kp={self.cartesian_kp} must be >= 0")
+        if self.trace_frame_interval <= 0:
+            raise ValueError(f"trace_frame_interval={self.trace_frame_interval} must be > 0")
+        if self.release_trace_pre_frames <= 0 or self.release_trace_post_frames <= 0:
+            raise ValueError("release trace pre/post frames must be > 0")
+        if not np.isfinite(self.release_trace_cooldown_s) or self.release_trace_cooldown_s < 0:
+            raise ValueError("release_trace_cooldown_s must be finite and >= 0")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAG retargeting parameters
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -447,6 +484,7 @@ class CameraParams:
 arm = ArmParams()
 hand = HandParams()
 policy = PolicyParams()
+keyboard_teleop = KeyboardTeleopParams()
 vr = VRParams()
 safety = SafetyParams()
 camera = CameraParams()
@@ -466,10 +504,11 @@ def load_config_json(path: str) -> None:
 
     Example JSON::
 
-        {"arm": {"max_joint_velocity_deg_per_s": 150}, "policy": {"control_hz": 20}}
+        {"arm": {"max_joint_velocity_deg_per_s": 150}, "keyboard_teleop": {"delta_pos_m": 0.005}}
 
-    Keys are singleton names (``arm``, ``hand``, ``policy``, ``vr``,
-    ``safety``, ``camera``).  Values are flat field overrides.
+    Keys are singleton names (``arm``, ``hand``, ``policy``,
+    ``keyboard_teleop``, ``vr``, ``safety``, ``camera``).  Values are flat
+    field overrides.
     """
     import dataclasses
     import json

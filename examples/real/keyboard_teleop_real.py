@@ -6,6 +6,8 @@ Uses arm_loop process (Mode 6, 30Hz) for arm control via SharedStorage.
 Usage:
     source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_robot
     python examples/real/keyboard_teleop_real.py
+    # Default: probe XHand, then fall back to arm-only if no slave is present.
+    # --no-hand skips probing; --require-hand restores fail-closed startup.
 
 Controls:
     Move EEF (world frame):
@@ -30,21 +32,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import termios
 import time
-from dataclasses import dataclass
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.config.defaults import arm, policy
+from dexmani_real.config.defaults import arm, hand, keyboard_teleop, policy, safety
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
+from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import SharedStorage, send_arm_home, shutdown_processes, wait_for_arm_home, wait_subsystem_ready
-from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
+from dexmani_real.shm.shared_storage import (
+    SharedStorage,
+    make_arm_action,
+    send_arm_home,
+    shutdown_processes,
+    wait_subsystem_ready,
+)
+from dexmani_real.teleop.keyboard import (
+    GlobalKeyState,
+    MotionActivityLatch,
+    MotionTraceSample,
+    ReleaseMotionTracer,
+    eef_delta_from_keys,
+)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import ema_smooth_pose
@@ -59,28 +73,8 @@ logger = get_logger(__name__)
 # ═══════════════════════════════════════════════ Config
 
 
-@dataclass
-class KeyboardTeleopConfig:
-    """Keyboard teleop tuning parameters. Edit defaults here — no CLI needed."""
-
-    ctrl_hz: float = 30.0  # control loop rate, matches arm_loop to avoid queue backpressure
-    delta_pos: float = 0.008  # EEF translation per keypress (m) → 240 mm/s @ 30Hz
-    delta_rpy: float = 0.03  # EEF rotation per keypress (rad) → 1.7°/frame, 51°/s @ 30Hz
-
-    # Cartesian P-term: amplifies position error before IK to reduce steady-state
-    # tracking lag.  At Kp=0.0 the arm lags ~50mm behind the target at 250 mm/s
-    # (open-loop time constant τ ≈ 0.2 s).  Kp=0.3 reduces the steady-state error
-    # by ~23 % (to ~38 mm); Kp=0.5 by ~33 % (to ~33 mm).  Higher values risk
-    # overshoot on direction reversals.  Set 0.0 for pure open-loop behaviour.
-    cartesian_kp: float = 0.0  # conservative default; try 0.3–0.5 for less lag
-
-    # ── Motion tracing: track position pipeline during pure-axis motion ──
-    trace_motion: bool = True
-    trace_frame_interval: int = 10  # print every N frames
-
-
-# Singleton config (edit defaults in the dataclass above).
-_cfg = KeyboardTeleopConfig()
+# Numeric defaults live in config/defaults.py with the other runtime rates.
+_cfg = keyboard_teleop
 
 # Workspace bounds in WORLD frame (defined in defaults.py as world-frame coordinates).
 # Base frame = world frame (identity transform).
@@ -100,6 +94,12 @@ def _print_motion_trace(
     ik_fk_quat: np.ndarray,
     ik_target_quat: np.ndarray,
     report: dict,
+    state_age_s: float,
+    last_cmd_seq: int,
+    queue_latency_s: float,
+    apply_latency_s: float,
+    sdk_duration_s: float,
+    last_cmd_is_hold: bool,
 ) -> None:
     """Print pure-axis (+X or -X) motion trace — target → EMA → IK → FK pipeline."""
     pos_error_mm = float(np.linalg.norm(ik_target_pos - ik_fk_pos) * 1000)
@@ -117,6 +117,9 @@ def _print_motion_trace(
         f"lead raw={raw_lead_mm:.0f} EMA={ema_lead_mm:.0f} mm  "
         f"err pos={pos_error_mm:.1f} rot={rot_error_deg:.2f} deg  "
         f"Z-off={z_shift_mm:+.1f} mm  "
+        f"cmd={last_cmd_seq}{'H' if last_cmd_is_hold else ''} "
+        f"age={state_age_s * 1000:.0f} q={queue_latency_s * 1000:.1f} "
+        f"apply={apply_latency_s * 1000:.1f} sdk={sdk_duration_s * 1000:.1f} ms  "
         f"IK={report.get('method', '?')} att={', '.join(report.get('attempts', ['?']))}",
         flush=True,
     )
@@ -140,6 +143,35 @@ def _wall_check(
             wall_timers[axis] = now
 
 
+def _runtime_health_error(
+    shared: SharedStorage,
+    arm_proc: mp.Process,
+    hand_proc: mp.Process | None,
+    *,
+    hand_required: bool,
+) -> str | None:
+    """Return a fail-closed runtime health error, or ``None`` when healthy."""
+    if shared.error_state.value:
+        return "sticky error_state set by a worker"
+    if shared.safety_state.value == int(SafetyState.FAULT):
+        return "safety state is FAULT"
+    if not arm_proc.is_alive():
+        return "arm worker exited"
+    if hand_required and (hand_proc is None or not hand_proc.is_alive()):
+        return "hand worker exited"
+
+    now = time.monotonic()
+    heartbeats = [("arm", shared.arm_heartbeat_s)]
+    if hand_required:
+        heartbeats.append(("hand", shared.hand_heartbeat_s))
+    for name, heartbeat in heartbeats:
+        last_s = float(heartbeat.value)
+        age_s = now - last_s if last_s > 0.0 else float("inf")
+        if age_s > float(safety.heartbeat_timeouts[name]):
+            return f"{name} heartbeat stale ({age_s:.2f}s)"
+    return None
+
+
 # ═══════════════════════════════════════════════ Main Loop
 
 
@@ -147,20 +179,30 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Keyboard Teleop xArm7")
-    parser.add_argument("--no-hand", action="store_true", help="Disable hand (no hand_loop spawned)")
+    _hand_group = parser.add_mutually_exclusive_group()
+    _hand_group.add_argument("--no-hand", action="store_true", help="Skip XHand probing and run arm-only")
+    _hand_group.add_argument("--require-hand", action="store_true", help="Abort unless XHand becomes ready")
     _args = parser.parse_args()
 
-    _dt = 1.0 / _cfg.ctrl_hz
+    _dt = 1.0 / _cfg.control_hz
     _hand_enabled = not _args.no_hand
+    _hand_required = bool(_args.require_hand)
+    _hand_mode = "OFF" if not _hand_enabled else ("REQUIRED" if _hand_required else "OPTIONAL")
     print("=" * 60)
     print("  Keyboard Teleop — xArm7 (SharedStorage)")
     print(
-        f"  step  pos={_cfg.delta_pos*1000:.0f} mm  rot={np.rad2deg(_cfg.delta_rpy):.1f} deg  dt={_dt*1000:.0f} ms  rate={_cfg.ctrl_hz:.0f} Hz"
+        f"  step  pos={_cfg.delta_pos_m*1000:.0f} mm  rot={np.rad2deg(_cfg.delta_rpy_rad):.1f} deg  "
+        f"dt={_dt*1000:.0f} ms  rate={_cfg.control_hz:.0f} Hz"
     )
     print(f"  EMA   pos={policy.ema.alpha_pos:.2f}  rot={policy.ema.alpha_rot:.2f}")
     print(f"  Kp    cartesian={_cfg.cartesian_kp:.1f}")
+    if _cfg.release_trace_enabled:
+        print(
+            f"  Trace release={_cfg.release_trace_pre_frames}+{_cfg.release_trace_post_frames} frames  "
+            f"cooldown={_cfg.release_trace_cooldown_s:.1f}s"
+        )
     print(f"  WS    x{WORKSPACE_BOUNDS[0]}  y{WORKSPACE_BOUNDS[1]}  z{WORKSPACE_BOUNDS[2]}")
-    print(f"  Hand  {'ON' if _hand_enabled else 'OFF'}")
+    print(f"  Hand  {_hand_mode}")
     print("=" * 60)
 
     # ── 1. Planner ──
@@ -172,6 +214,11 @@ def main():
         ),
         home_qpos=np.array(arm.home_qpos, dtype=np.float64),
     )
+    # These experimental entries may run without XHand hardware. Keep the
+    # 19-DOF collision model conservative and deterministic by explicitly
+    # using the configured open-hand pose until measured state is available.
+    _assumed_hand_qpos = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
+    planner.set_hand_qpos(_assumed_hand_qpos)
 
     # ── 2. SharedStorage + subprocesses ──
     shared = SharedStorage.create(prefix="dexmani_kb")
@@ -179,18 +226,58 @@ def main():
     arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_loop_cfg), name="arm-kb", daemon=True)
     arm_proc.start()
     hand_proc: mp.Process | None = None
-    if _hand_enabled:
-        hand_proc = mp.Process(target=_hand_loop, args=(shared,), name="hand-kb", daemon=True)
-        hand_proc.start()
-
     _procs = [arm_proc]
-    if hand_proc is not None:
-        _procs.append(hand_proc)
     if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, 15)], [arm_proc]):
         shutdown_processes(shared, _procs)
         return
-    if _hand_enabled and hand_proc is not None:
-        shared.hand_ready.wait(timeout=15)  # optional — degrade gracefully
+
+    if _hand_enabled:
+        _hand_cfg = HandProcessConfig(startup_failure_is_fatal=_hand_required)
+        hand_proc = mp.Process(target=_hand_loop, args=(shared, _hand_cfg), name="hand-kb", daemon=True)
+        hand_proc.start()
+        _procs.append(hand_proc)
+
+        _hand_deadline_s = time.monotonic() + 15.0
+        while not shared.hand_ready.is_set() and hand_proc.is_alive() and time.monotonic() < _hand_deadline_s:
+            time.sleep(0.1)
+
+        if not shared.hand_ready.is_set():
+            if hand_proc.is_alive():
+                logger.error("XHand startup did not finish within 15s — aborting to avoid an indeterminate worker")
+                shutdown_processes(shared, _procs)
+                return
+            if _hand_required:
+                logger.error("XHand is required but its worker exited before ready")
+                shutdown_processes(shared, _procs)
+                return
+            _hand_enabled = False
+            logger.warning(
+                "XHand unavailable — continuing arm-only with configured open-hand collision geometry. "
+                "If a physical hand is mounted, secure it in that pose or use --require-hand."
+            )
+            print("  Hand  unavailable → ARM-ONLY (open-hand collision model)")
+        else:
+            _hand_result = shared.hand_state_ring.read_latest()
+            if _hand_result is None:
+                logger.error("XHand ready event has no state frame — aborting before ARMED")
+                shutdown_processes(shared, _procs)
+                return
+            _hand_data, _, _ = _hand_result
+            _initial_hand_qpos = np.asarray(_hand_data["qpos"][0], dtype=np.float64)
+            if not bool(_hand_data["connected"][0]) or not np.all(np.isfinite(_initial_hand_qpos)):
+                logger.error("XHand initial state is disconnected or invalid — aborting before ARMED")
+                shutdown_processes(shared, _procs)
+                return
+            planner.set_hand_qpos(_initial_hand_qpos)
+            print("  Hand  connected → measured posture enabled for collision checks")
+
+    if shared.error_state.value:
+        logger.error("A required worker failed during startup — aborting before ARMED")
+        shutdown_processes(shared, _procs)
+        return
+
+    if not _hand_enabled and _args.no_hand:
+        print("  Hand  disabled → ARM-ONLY (open-hand collision model)")
 
     transition(shared, SafetyState.ARMED)
 
@@ -229,7 +316,18 @@ def main():
     print("\nKeyboard control active — [Q] quit")
 
     # ── 6. Main loop ──
-    limiter = RateManager(1.0 / (1.0 / _cfg.ctrl_hz))
+    limiter = RateManager(_cfg.control_hz)
+    motion_latch = MotionActivityLatch()
+    release_tracer = (
+        ReleaseMotionTracer(
+            pre_frames=_cfg.release_trace_pre_frames,
+            post_frames=_cfg.release_trace_post_frames,
+            cooldown_s=_cfg.release_trace_cooldown_s,
+        )
+        if _cfg.release_trace_enabled
+        else None
+    )
+    _last_translation_direction: np.ndarray | None = None
     running = True
     wall_warned = [False, False, False]
     wall_timers = [0.0, 0.0, 0.0]  # per-axis debounce (independent 3 s cooldown)
@@ -244,19 +342,27 @@ def main():
     start_time = time.perf_counter()
     prev_eef_pos: np.ndarray | None = None
     ik_outcome = "-"
+    ik_attempt_count = 0
+    ik_ok_count = 0
     ik_fail_count = 0
     _last_ik_fail_reason = ""
     _last_ik_fail_time = 0.0
     _homed_during_session = False  # skip redundant post-loop home prompt
+    _faulted = False
+    _r_was_pressed = False
 
-    # Cartesian EMA state (same smoothing as vr_teleop_policy)
-    _prev_ema_pos: np.ndarray | None = None
-    _prev_ema_quat: np.ndarray | None = None
+    # Seed EMA at the held target. Resetting it to None on every release makes
+    # the next keypress bypass smoothing for one frame (an 8 mm position step),
+    # followed by a smaller EMA step; that velocity discontinuity is visible as
+    # a repeated start/stop twitch during short keyboard taps.
+    _prev_ema_pos: np.ndarray | None = target_pos.copy()
+    _prev_ema_quat: np.ndarray | None = target_quat.copy()
 
     def _emergency_stop():
         """Set estop flag — arm_loop detects and stops."""
         nonlocal running
         shared.estop_request.value = True
+        transition(shared, SafetyState.FAULT)
         shared.is_running.value = False
         running = False
 
@@ -273,6 +379,19 @@ def main():
             limiter.wait()
             loop_count += 1
 
+            _health_error = _runtime_health_error(
+                shared,
+                arm_proc,
+                hand_proc,
+                hand_required=_hand_enabled,
+            )
+            if _health_error is not None:
+                logger.error("Runtime health failure: %s", _health_error)
+                transition(shared, SafetyState.FAULT)
+                _faulted = True
+                running = False
+                break
+
             # ── Exit / estop ──
             if keys.is_pressed("esc"):
                 print("\n[ESC] emergency stop", flush=True)
@@ -284,17 +403,27 @@ def main():
                 running = False
                 break
 
-            if keys.is_pressed("r"):
-                _homed_during_session = True
+            _r_pressed = keys.is_pressed("r")
+            _home_requested = _r_pressed and not _r_was_pressed
+            _r_was_pressed = _r_pressed
+            if _home_requested:
                 elapsed = time.perf_counter() - start_time
                 print(f"\n[T+{elapsed:.0f}s f={loop_count}] [R] return_home", flush=True)
                 _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                send_arm_home(
-                    shared, _home_qpos,
-                    planner=planner, table_z_surface_m=arm.table_z_surface_m,
-                    current_qpos=arm_qpos, heartbeat=False, verbose=True,
+                _home_ok = send_arm_home(
+                    shared,
+                    _home_qpos,
+                    planner=planner,
+                    table_z_surface_m=arm.table_z_surface_m,
+                    current_qpos=arm_qpos,
+                    heartbeat=False,
+                    verbose=True,
                 )
-                _prev_ema_pos = _prev_ema_quat = None
+                _homed_during_session = _homed_during_session or _home_ok
+                motion_latch.reset()
+                if release_tracer is not None:
+                    release_tracer.reset()
+                _last_translation_direction = None
                 consecutive_divergence = 0
                 error_count = 0
                 # Refresh state from ring after homing.
@@ -308,8 +437,15 @@ def main():
                     _eef_world = planner.base_to_world_pose(_eef_pin)
                     target_pos = _eef_world.p.copy()
                     target_quat = _eef_world.q.copy()
+                    _prev_ema_pos = target_pos.copy()
+                    _prev_ema_quat = target_quat.copy()
                 prev_eef_pos = None
-                ik_outcome = "home"
+                ik_outcome = "home" if _home_ok else "home_failed"
+                if shared.error_state.value or shared.safety_state.value == int(SafetyState.FAULT):
+                    transition(shared, SafetyState.FAULT)
+                    _faulted = True
+                    running = False
+                    break
                 limiter.reset()
                 continue
 
@@ -331,6 +467,18 @@ def main():
             eef_pos = np.asarray(_arm_data["eef_pos"][0], dtype=np.float64)
             eef_rot6d = np.asarray(_arm_data["eef_rot6d"][0], dtype=np.float64)
 
+            _arm_state_age_s = time.monotonic() - float(_arm_data["timestamp"][0])
+            if _arm_state_age_s > 0.5:
+                error_count += 1
+                total_state_errors += 1
+                if error_count > 3:
+                    logger.error("Arm state stale for %.2fs — entering FAULT", _arm_state_age_s)
+                    transition(shared, SafetyState.FAULT)
+                    _faulted = True
+                    running = False
+                    break
+                continue
+
             if not arm_connected:
                 error_count += 1
                 total_state_errors += 1
@@ -344,10 +492,16 @@ def main():
 
             # ── Safety: arm error ──
             if arm_error_code != 0:
-                if arm_error_code in (22, 24, 31):
-                    # arm_loop auto-clears these — just log and continue
+                if arm_error_code == 24:
+                    # arm_loop performs bounded C24 recovery.
                     if loop_count % _status_interval == 0:
                         logger.warning("Arm error C%d (arm_loop auto-recovering)", arm_error_code)
+                elif arm_error_code in (22, 31):
+                    logger.error("Arm collision fault C%d — entering FAULT", arm_error_code)
+                    transition(shared, SafetyState.FAULT)
+                    _faulted = True
+                    running = False
+                    break
                 else:
                     logger.error("Arm unrecoverable error C%d — emergency stop", arm_error_code)
                     _emergency_stop()
@@ -359,10 +513,58 @@ def main():
                 continue
 
             # ── EEF target delta from keys ──
-            dx, drpy = eef_delta_from_keys(keys, _cfg.delta_pos, _cfg.delta_rpy)
+            dx, drpy = eef_delta_from_keys(keys, _cfg.delta_pos_m, _cfg.delta_rpy_rad)
 
             # ── Periodic status (suppressed when idle — no keys pressed) ──
             _is_idle = np.all(dx == 0) and np.all(drpy == 0)
+            _motion_active = not _is_idle
+            _release_edge = motion_latch.update(_motion_active)
+            _translation_norm = float(np.linalg.norm(dx))
+            if _translation_norm > 0.0:
+                _last_translation_direction = dx / _translation_norm
+            elif _motion_active:
+                # Rotation-only activity must not inherit an old translation
+                # direction and produce a misleading release trace.
+                _last_translation_direction = None
+
+            # High-rate release window. This is read-only instrumentation: the
+            # sample is aligned to the arm state timestamp and the last queued
+            # joint target, and never publishes a control action. Avoid the
+            # extra FK/delta work during unrelated idle intervals.
+            _release_sample_needed = release_tracer is not None and (
+                release_tracer.active or _translation_norm > 0.0 or _release_edge
+            )
+            if release_tracer is not None and _release_sample_needed:
+                _eef_world_diag = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.0, 0.0, 0.0, 0.0]))).p
+                try:
+                    _command_world_diag = planner.kin.compute_eef_pose_world(prev_qpos_cmd).p
+                    _qpos_error_diag = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(prev_qpos_cmd, arm_qpos))))
+                except (ValueError, RuntimeError):
+                    logger.warning("Release-motion diagnostic FK/delta failed", exc_info=True)
+                    _command_world_diag = target_pos.copy()
+                    _qpos_error_diag = float(np.max(np.abs(prev_qpos_cmd - arm_qpos)))
+                _release_sample = MotionTraceSample(
+                    frame=loop_count,
+                    timestamp_s=float(_arm_data["timestamp"][0]),
+                    input_active=_motion_active,
+                    eef_pos_m=_eef_world_diag,
+                    command_pos_m=_command_world_diag,
+                    qpos_error_rad=_qpos_error_diag,
+                    qvel_peak_rad_s=float(np.max(np.abs(arm_qvel))),
+                    state_age_s=_arm_state_age_s,
+                    queue_latency_s=float(_arm_data["last_cmd_queue_latency_s"][0]),
+                    apply_latency_s=float(_arm_data["last_cmd_apply_latency_s"][0]),
+                )
+                _release_lines = release_tracer.observe(
+                    _release_sample,
+                    release_edge=_release_edge,
+                    translation_direction=_last_translation_direction,
+                )
+                if _release_lines:
+                    # One terminal write after capture avoids injecting stdout
+                    # latency into each measured 30 Hz control interval.
+                    print("\n".join(_release_lines), flush=True)
+
             if loop_count % _status_interval == 0:
                 # Always track velocity baseline (even when idle) so the first
                 # non-idle status line gets an accurate speed estimate.
@@ -383,18 +585,31 @@ def main():
                         flush=True,
                     )
 
-            # No input → snap target to current world-frame EEF, reset EMA state
+            # No input → keep the last accepted target. arm_loop already
+            # resends its last target every Mode 6 tick, so enqueueing a
+            # duplicate HOLD here only consumes an ordered FIFO slot. A rapid
+            # re-press would then execute one stale no-motion command before
+            # the new command, producing a 33 ms start/stop notch.
             if _is_idle:
-                _eef_pin = planner.compute_eef_pose_base(arm_qpos)
-                _eef_world = planner.base_to_world_pose(_eef_pin)
-                target_pos = _eef_world.p.copy()
-                target_quat = _eef_world.q.copy()
-                prev_qpos_cmd = arm_qpos.copy()
-                _prev_ema_pos = _prev_ema_quat = None  # reset EMA on re-engage
+                if _release_edge:
+                    # Keep the Cartesian accumulator consistent with that joint
+                    # target. Snapping to measured state would command a stale
+                    # backward step; keeping an empty EMA state would bypass
+                    # smoothing on the next press.
+                    _hold_pose_world = planner.kin.compute_eef_pose_world(prev_qpos_cmd)
+                    target_pos = _hold_pose_world.p.copy()
+                    target_quat = _hold_pose_world.q.copy()
+                    _prev_ema_pos = target_pos.copy()
+                    _prev_ema_quat = target_quat.copy()
+                    if _cfg.trace_motion:
+                        print(f"[HOLD f={loop_count}] key-release local-last-target (queue unchanged)", flush=True)
                 if loop_count % _idle_interval == 0:
                     elapsed = time.perf_counter() - start_time
+                    _idle_pose_world = planner.kin.compute_eef_pose_world(arm_qpos)
+                    _idle_eef = _idle_pose_world.p
                     print(
-                        f"[idle T+{elapsed:.0f}s]  eef_w=({target_pos[0]:.3f},{target_pos[1]:.3f},{target_pos[2]:.3f}) m",
+                        f"[idle T+{elapsed:.0f}s]  "
+                        f"eef_w=({_idle_eef[0]:.3f},{_idle_eef[1]:.3f},{_idle_eef[2]:.3f}) m",
                         flush=True,
                     )
                 continue
@@ -418,10 +633,10 @@ def main():
 
             # ── Cartesian EMA (before IK, same as vr_teleop_policy pipeline) ──
             # Smooths target trajectory to prevent IK discontinuities from
-            # abrupt keypress changes.  At α=0.8 the EMA steady-state lag
-            # is ~(1-α)/α × Δ ≈ 1.25 mm — negligible; the dominant 50 mm
-            # lead comes from arm tracking dynamics, which the EMA does not
-            # address (see _cfg.cartesian_kp below for that).
+            # abrupt keypress changes.  At the configured alpha=0.60, the
+            # theoretical ramp lag is 5.3 mm at the 8 mm step. The much larger
+            # observed lead is therefore downstream tracking dynamics, not EMA
+            # alone.
             if _prev_ema_pos is not None:
                 ik_target_pos, ik_target_quat = ema_smooth_pose(
                     target_pos,
@@ -437,12 +652,10 @@ def main():
             _prev_ema_quat = ik_target_quat.copy()
 
             # ── Cartesian P-term: amplify position error → reduce tracking lag ──
-            # Without feedback the arm lags ~50 mm behind the target at 250 mm/s
-            # (open-loop time constant τ ≈ 0.2 s).  Adding Kp × pos_error to the
-            # IK target effectively reduces the time constant by 1/(1+Kp):
-            #   Kp=0.0 → 50 mm lag   Kp=0.3 → ~38 mm (−23 %)
-            #   Kp=0.5 → ~33 mm (−33 %)   Kp=1.0 → ~25 mm (−50 %)
-            # Also counteracts Z-axis coupling during pure-X motion.
+            # The log showed about 60 mm following distance at the configured
+            # 0.24 m/s command. Cartesian gain remains disabled by default: the
+            # new timestamps should be measured before tuning closed-loop gain,
+            # especially because Mode 6 already smooths the joint trajectory.
             if _cfg.cartesian_kp > 0:
                 _eef_world_p = planner.base_to_world_pose(Pose(p=eef_pos, q=np.array([1.0, 0.0, 0.0, 0.0]))).p
                 pos_error = target_pos - _eef_world_p
@@ -464,6 +677,7 @@ def main():
                     _hand_qpos = np.asarray(_hd["qpos"][0], dtype=np.float64)
                     if np.all(np.isfinite(_hand_qpos)):
                         planner.set_hand_qpos(_hand_qpos)
+            ik_attempt_count += 1
             ik_result = planner.solve_teleop_ik(target_pose_world, arm_qpos, prev_qpos_cmd)
 
             if not ik_result.success or ik_result.qpos is None:
@@ -479,11 +693,13 @@ def main():
                 _eef_world = planner.base_to_world_pose(_eef_pin)
                 target_pos = _eef_world.p.copy()
                 target_quat = _eef_world.q.copy()
-                _prev_ema_pos = _prev_ema_quat = None  # reset EMA on IK failure
+                _prev_ema_pos = target_pos.copy()
+                _prev_ema_quat = target_quat.copy()
                 ik_outcome = "held"
                 continue
 
             ik_outcome = "ok"
+            ik_ok_count += 1
             prev_qpos_cmd = ik_result.qpos.copy()
             arm_cmd = ik_result.qpos
 
@@ -508,6 +724,12 @@ def main():
                     ik_fk_quat=ik_fk_pose_world.q,
                     ik_target_quat=ik_target_quat,
                     report=getattr(ik_result, "report", {}) or {},
+                    state_age_s=_arm_state_age_s,
+                    last_cmd_seq=int(_arm_data["last_cmd_seq"][0]),
+                    queue_latency_s=float(_arm_data["last_cmd_queue_latency_s"][0]),
+                    apply_latency_s=float(_arm_data["last_cmd_apply_latency_s"][0]),
+                    sdk_duration_s=float(_arm_data["last_cmd_sdk_duration_s"][0]),
+                    last_cmd_is_hold=bool(_arm_data["last_cmd_is_hold"][0]),
                 )
 
             # ── Send via SharedStorage ──
@@ -518,7 +740,7 @@ def main():
             if shared.safety_state.value == int(SafetyState.FAULT):
                 continue
 
-            shared.arm_action_q.put({"qpos": arm_cmd.copy()})
+            shared.arm_action_q.put(make_arm_action(shared, arm_cmd))
 
             # ── Tracking safety ──
             if np.all(np.isfinite(arm_qpos)):
@@ -546,12 +768,12 @@ def main():
 
         # ── Exit summary ──
         elapsed_total = time.perf_counter() - start_time
-        ik_ok_count = loop_count - ik_fail_count
         print()
         print("=" * 60)
         print(
             f"  Session ended  elapsed={elapsed_total:.0f}s  frames={loop_count}  "
-            f"ik_ok={ik_ok_count}  ik_fail={ik_fail_count}  state_errs={total_state_errors}"
+            f"ik_attempts={ik_attempt_count}  ik_ok={ik_ok_count}  "
+            f"ik_fail={ik_fail_count}  state_errs={total_state_errors}"
         )
         print("=" * 60)
 
@@ -559,7 +781,14 @@ def main():
         # Skip the prompt if the arm was already homed during the session and is
         # still near home — avoids confusing the operator with a redundant prompt.
         _near_home = False
-        if _homed_during_session:
+        _home_prompt_allowed = (
+            not _faulted
+            and not shared.error_state.value
+            and not shared.estop_request.value
+            and shared.is_running.value
+            and shared.safety_state.value != int(SafetyState.FAULT)
+        )
+        if _home_prompt_allowed and _homed_during_session:
             _arm_result = shared.arm_state_ring.read_latest()
             if _arm_result is not None:
                 _ad, _, _ = _arm_result
@@ -576,22 +805,56 @@ def main():
                     )
                     _near_home = float(np.max(np.abs(_qpos - _wrapped_home))) < 0.05  # ~3°
 
-        if _near_home:
+        if not _home_prompt_allowed:
+            print("\nFAULT/E-stop active — return_home is disabled; shutting down")
+        elif _near_home:
             print("\nAlready at home — [Q] quit")
             while True:
+                _health_error = _runtime_health_error(
+                    shared,
+                    arm_proc,
+                    hand_proc,
+                    hand_required=_hand_enabled,
+                )
+                if _health_error is not None:
+                    logger.error("Runtime health failure while waiting to quit: %s", _health_error)
+                    transition(shared, SafetyState.FAULT)
+                    break
                 if keys.is_pressed("q") or keys.is_pressed("esc"):
                     break
                 time.sleep(0.1)
         else:
             print("\n[R] return_home  [Q] quit")
+            _post_r_was_pressed = keys.is_pressed("r")
             while True:
-                if keys.is_pressed("r"):
+                _health_error = _runtime_health_error(
+                    shared,
+                    arm_proc,
+                    hand_proc,
+                    hand_required=_hand_enabled,
+                )
+                if _health_error is not None:
+                    logger.error("Runtime health failure in post-loop prompt: %s", _health_error)
+                    transition(shared, SafetyState.FAULT)
+                    break
+                _post_r_pressed = keys.is_pressed("r")
+                _post_home_requested = _post_r_pressed and not _post_r_was_pressed
+                _post_r_was_pressed = _post_r_pressed
+                if _post_home_requested:
                     _home_qpos = np.array(arm_loop_cfg.home_qpos, dtype=np.float64)
-                    send_arm_home(
-                        shared, _home_qpos,
-                        planner=planner, table_z_surface_m=arm.table_z_surface_m,
-                        heartbeat=False, verbose=True,
+                    _home_ok = send_arm_home(
+                        shared,
+                        _home_qpos,
+                        planner=planner,
+                        table_z_surface_m=arm.table_z_surface_m,
+                        heartbeat=False,
+                        verbose=True,
                     )
+                    if shared.error_state.value or shared.safety_state.value == int(SafetyState.FAULT):
+                        transition(shared, SafetyState.FAULT)
+                        break
+                    if not _home_ok:
+                        print("  arm: return_home was not executed; inspect the reason above")
                     print("[Q] quit")
                 if keys.is_pressed("q") or keys.is_pressed("esc"):
                     break
@@ -602,7 +865,6 @@ def main():
         # ── Cleanup ──
         shutdown_processes(shared, [arm_proc] if hand_proc is None else [arm_proc, hand_proc])
         print("Shutdown complete.")
-
 
 
 if __name__ == "__main__":

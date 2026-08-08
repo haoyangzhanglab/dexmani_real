@@ -1,4 +1,9 @@
-"""Hand servo process — reads hand_cmd_ring, servos XHand, writes hand_state_ring."""
+"""Hand servo process — reads hand_cmd_ring, servos XHand, writes hand_state_ring + hand_tactile_ring.
+
+Tactile ring publishes sparsely (contact-only writes); hand_state_ring publishes every tick.
+Error recovery: three independent counters for send failures, board error states,
+and read exceptions — each escalates to global error_state on persistent failure.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,11 @@ class HandProcessConfig:
 
     loop_hz: float = field(default_factory=lambda: hand.loop_hz)
 
+    # Some arm-only experimental entry points may probe for an optional XHand
+    # and continue with an explicit open-hand collision-model assumption when
+    # it is absent. Canonical data collection keeps the default fail-closed.
+    startup_failure_is_fatal: bool = True
+
     # Homing convergence
     home_settle_timeout_s: float = field(default_factory=lambda: hand.home_settle_timeout_s)
     home_settle_tol_rad: float = field(default_factory=lambda: hand.home_settle_tol_rad)
@@ -32,6 +42,11 @@ class HandProcessConfig:
     # Send-error watchdog: auto clear_error() after N consecutive send failures
     send_err_watchdog_frames: int = field(default_factory=lambda: hand.send_err_watchdog_count)
 
+    # Error-state watchdog: latch global error_state after N consecutive
+    # error_state ticks (persistent board faults).  Shared with the
+    # get_state-exception counter for consistent escalation behaviour.
+    error_state_watchdog_frames: int = 5
+
 
 def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     """Hand process entry point — reads shared.hand_cmd_ring, servos hand.
@@ -39,12 +54,18 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     Designed as an mp.Process target. Communicates exclusively through
     SharedStorage (no RPC, no side channels).
     """
-    from dexmani_real.robot.safety import SafetyState, transition
+    from dexmani_real.robot.safety import SafetyState
     from dexmani_real.shm.shared_storage import HAND_STATE_DTYPE as _HS_STATE
     from dexmani_real.shm.shared_storage import HAND_TACTILE_DTYPE as _HS_TACTILE
     from dexmani_real.shm.shared_storage import new_frame as _nf
 
     cfg = config or HandProcessConfig()
+
+    def _mark_startup_failure() -> None:
+        if cfg.startup_failure_is_fatal:
+            shared.error_state.value = True
+        else:
+            logger.warning("hand_loop: optional XHand unavailable — leaving hand_ready unset")
 
     try:
         from dexmani_real.robot.xhand import XHand, XHandConfig
@@ -56,12 +77,22 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
         hand = XHand(XHandConfig(tor_max_per_joint=_tor_max_pj))
         if not hand.connect():
-            logger.error("hand_loop: connect failed")
-            shared.hand_ready.set()
+            if cfg.startup_failure_is_fatal:
+                logger.error("hand_loop: connect failed")
+            else:
+                logger.warning("hand_loop: optional XHand connect failed")
+            try:
+                hand.disconnect()
+            except Exception:
+                logger.warning("hand_loop: cleanup after connect failure failed", exc_info=True)
+            _mark_startup_failure()
             return
-    except Exception as e:
-        logger.error("hand_loop: init failed: %s", e)
-        shared.hand_ready.set()
+    except Exception:
+        if cfg.startup_failure_is_fatal:
+            logger.error("hand_loop: init failed", exc_info=True)
+        else:
+            logger.warning("hand_loop: optional XHand init failed", exc_info=True)
+        _mark_startup_failure()
         return
 
     # Home — re-send in the polling loop so the hand PID keeps driving
@@ -70,8 +101,12 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     if home_qpos is not None and np.all(np.isfinite(home_qpos)):
         _home_deadline = time.monotonic() + cfg.home_settle_timeout_s
         _home_reached = False
+        _home_read_error_logged = False
+        _home_send_error_logged = False
         while time.monotonic() < _home_deadline:
-            hand.send_action(home_qpos)
+            if not hand.send_action(home_qpos) and not _home_send_error_logged:
+                logger.warning("hand_loop: home command was rejected")
+                _home_send_error_logged = True
             try:
                 st = hand.get_state()
                 if st is not None:
@@ -80,16 +115,19 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                         _home_reached = True
                         break
             except Exception:
-                pass
+                if not _home_read_error_logged:
+                    logger.warning("hand_loop: state read failed while homing", exc_info=True)
+                    _home_read_error_logged = True
             time.sleep(0.05)
         if not _home_reached:
-            logger.error("hand_loop: home settle failed after %.1fs", cfg.home_settle_timeout_s)
+            _log = logger.error if cfg.startup_failure_is_fatal else logger.warning
+            _log("hand_loop: home settle failed after %.1fs", cfg.home_settle_timeout_s)
             try:
                 hand.stop()
                 hand.disconnect()
             except Exception:
-                pass
-            shared.hand_ready.set()
+                logger.warning("hand_loop: cleanup after home failure failed", exc_info=True)
+            _mark_startup_failure()
             return
 
     # Publish initial state BEFORE hand_ready — consumers wait on hand_ready and
@@ -98,9 +136,21 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # (Same pattern as arm_loop arm_ready.)
     try:
         st = hand.get_state()
-        _init_qpos = np.asarray(st.get("qpos", np.zeros(12)), dtype=np.float64) if st is not None else np.zeros(12)
+        if st is None:
+            raise RuntimeError("initial hand state is unavailable")
+        _init_qpos = np.asarray(st.get("qpos"), dtype=np.float64)
+        if _init_qpos.shape != (12,) or not np.all(np.isfinite(_init_qpos)):
+            raise ValueError(f"invalid initial hand qpos shape/values: {_init_qpos.shape}")
     except Exception:
-        _init_qpos = np.zeros(12, dtype=np.float64)
+        _log = logger.error if cfg.startup_failure_is_fatal else logger.warning
+        _log("hand_loop: cannot publish a valid initial state", exc_info=True)
+        try:
+            hand.stop()
+            hand.disconnect()
+        except Exception:
+            logger.warning("hand_loop: cleanup after initial-state failure failed", exc_info=True)
+        _mark_startup_failure()
+        return
     _frame0 = _nf(_HS_STATE)
     _frame0["qpos"][0] = _init_qpos
     _frame0["current"][0] = np.zeros(12, dtype=np.float64)
@@ -126,13 +176,16 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     rate_mgr = RateManager(cfg.loop_hz)
     last_cmd_seq = 0
     _send_error_counter = RetryCounter(max_consecutive=cfg.send_err_watchdog_frames, label="hand_send")
-    _error_state_counter = RetryCounter(max_consecutive=5, label="hand_error_state")
+    _error_state_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_error_state")
+    _read_error_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_read_error")
     _last_clear_error_s = 0.0
 
     # Qpos freshness detection (driver board lockout guard)
     _stale_frames = 0
     _last_fresh_qpos: np.ndarray | None = None
     last_known_qpos: np.ndarray = np.zeros(12, dtype=np.float64)
+    _last_tactile_sum: np.ndarray = np.zeros((5, 3), dtype=np.float64)
+    _last_tactile_force: np.ndarray = np.zeros((5, 120, 3), dtype=np.float64)
 
     _last_error_clear_s = 0.0
 
@@ -145,7 +198,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
         # Safety state gate — only process commands in ARMED or RUNNING.
         _safety = shared.safety_state.value
-        if _safety in (SafetyState.ARMED, SafetyState.RUNNING):
+        if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
 
             # Read cmd ring (latest-wins)
             result = shared.hand_cmd_ring.read_latest()
@@ -156,12 +209,21 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     cmd = np.asarray(data["qpos_cmd"][0], dtype=np.float64)
                     if np.all(np.isfinite(cmd)):
                         try:
-                            hand.send_action(cmd)
-                            _send_error_counter.reset()
+                            if hand.send_action(cmd):
+                                _send_error_counter.reset()
+                            else:
+                                _send_error_counter.inc()
+                                if _send_error_counter.count in (1, _send_error_counter.max_consecutive):
+                                    logger.warning(
+                                        "hand_loop: send_action rejected (consecutive=%d)",
+                                        _send_error_counter.count,
+                                    )
                         except Exception:
                             _send_error_counter.inc()
                             logger.warning(
-                                "hand_loop: send_action failed (consecutive=%d)", _send_error_counter.count, exc_info=True
+                                "hand_loop: send_action failed (consecutive=%d)",
+                                _send_error_counter.count,
+                                exc_info=True,
                             )
                         last_cmd_seq = seq_int
 
@@ -195,25 +257,49 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             connected = hand.connected_flag
             error_state = hand.error_state
             last_known_qpos = qpos.copy()
+            # Cache tactile values for forward-fill on future get_state exceptions,
+            # preventing false-negative contact gaps during comm glitches.
+            if np.any(tactile_contact):
+                _last_tactile_sum = tactile_sum.copy()
+                _last_tactile_force = tactile_force.copy()
+            _read_error_counter.reset()
             # Board error registers (per-joint hardware fault indicators).
             _raw_cbe = st.get("commboard_err")
-            commboard_err = np.asarray(_raw_cbe if _raw_cbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32)
+            commboard_err = np.asarray(
+                _raw_cbe if _raw_cbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32
+            )
             _raw_jbe = st.get("jointboard_err")
-            jointboard_err = np.asarray(_raw_jbe if _raw_jbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32)
+            jointboard_err = np.asarray(
+                _raw_jbe if _raw_jbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32
+            )
             _raw_tbe = st.get("tipboard_err")
-            tipboard_err = np.asarray(_raw_tbe if _raw_tbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32)
+            tipboard_err = np.asarray(
+                _raw_tbe if _raw_tbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32
+            )
         except Exception:
             logger.warning("hand_loop: get_state failed", exc_info=True)
             qpos = last_known_qpos.copy()
             current = np.zeros(12)
-            tactile_sum = np.zeros((5, 3))
-            tactile_force = np.zeros((5, 120, 3))
+            tactile_sum = _last_tactile_sum.copy()
+            tactile_force = _last_tactile_force.copy()
             tactile_contact = np.zeros(5, dtype=bool)
             connected = False
             error_state = False  # transient comm glitch — do NOT fabricate error_state
             commboard_err = np.zeros(12, dtype=np.int32)
             jointboard_err = np.zeros(12, dtype=np.int32)
             tipboard_err = np.zeros(12, dtype=np.int32)
+
+            # Read-error escalation: persistent get_state exceptions (SDK crash,
+            # USB disconnect) bypass the normal error_state retry path because
+            # error_state is forced to False above.  A dedicated counter ensures
+            # this silent-dead-hand scenario still escalates to global error_state.
+            _read_error_counter.inc()
+            if _read_error_counter.triggered:
+                shared.error_state.value = True
+                logger.error(
+                    "hand_loop: %d consecutive get_state exceptions — latching global error_state",
+                    _read_error_counter.max_consecutive,
+                )
 
         # Detect stale qpos (driver board lockout)
         if not connected:
@@ -252,9 +338,8 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 _last_error_clear_s = _now_err
             if _error_state_counter.triggered:
                 shared.error_state.value = True
-                transition(shared, SafetyState.FAULT)
                 logger.error(
-                    "hand_loop: hand error_state persisted after %d retries — setting global error_state + FAULT",
+                    "hand_loop: hand error_state persisted after %d retries — latching global error_state",
                     _error_state_counter.max_consecutive,
                 )
         elif not error_state:
@@ -275,11 +360,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         frame["timestamp"][0] = time.monotonic()
         shared.hand_state_ring.write(frame)
 
-        # Publish every frame, including an explicit zero on release. A
-        # contact-only ring otherwise retains stale non-zero force forever.
-        tf = _nf(_HS_TACTILE)
-        tf["tactile_force"][0] = tactile_force if np.any(tactile_contact) else 0.0
-        shared.hand_tactile_ring.write(tf)
+        # Publish tactile force only on contact (sparse write).
+        # When no finger is in contact, skip the write — consumers forward-fill
+        # from their last cached frame.  This saves ~14.4 KB per tick (30 Hz)
+        # and activates the forward-fill path in vr_teleop_policy.py.
+        if np.any(tactile_contact):
+            tf = _nf(_HS_TACTILE)
+            tf["tactile_force"][0] = tactile_force
+            shared.hand_tactile_ring.write(tf)
 
         # Rate limit (absolute-deadline scheduling, consistent with arm_loop/policy_loop)
         rate_mgr.wait()
@@ -288,14 +376,21 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # EtherCAT bus.  If the hand driver board is in a degraded state
     # (qpos_stale / comm errors), a clean disconnect is more likely when
     # the board is idle at a known position rather than mid-grasp.
-    _cleanup_home_qpos = home_qpos  # captured at init (line 79)
-    if _cleanup_home_qpos is not None and np.all(np.isfinite(_cleanup_home_qpos)):
+    _cleanup_home_qpos = home_qpos
+    _cleanup_motion_safe = (
+        not shared.estop_request.value
+        and not shared.error_state.value
+        and shared.safety_state.value in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
+    )
+    if _cleanup_motion_safe and _cleanup_home_qpos is not None and np.all(np.isfinite(_cleanup_home_qpos)):
         try:
             for _ in range(40):  # ~2s at 30 Hz (generous settle window)
-                hand.send_action(_cleanup_home_qpos)
+                if not hand.send_action(_cleanup_home_qpos):
+                    logger.warning("hand_loop: pre-disconnect home command rejected — stopping cleanup motion")
+                    break
                 time.sleep(0.05)
         except Exception:
-            pass
+            logger.warning("hand_loop: pre-disconnect home failed", exc_info=True)
 
     try:
         hand.stop()

@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import time
 from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 
 from dexmani_real.planning.path_utils import plan_joint_home_path
+from dexmani_real.planning.types import PathResult
 from dexmani_real.policy.vr_teleop_policy import _do_teleop_home
 from dexmani_real.robot.arm_loop import ArmLoopConfig, _planned_homing
+from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
 from dexmani_real.robot.safety import SafetyState
-from dexmani_real.shm.shared_storage import HomeRequest, HomeResult, _estimate_home_timeout_s, wait_for_arm_home
+from dexmani_real.shm.shared_storage import (
+    HomeRequest,
+    HomeResult,
+    _estimate_home_timeout_s,
+    send_arm_home,
+    wait_for_arm_home,
+)
 
 
 class _Value:
@@ -23,29 +32,62 @@ def _shared() -> SimpleNamespace:
     return SimpleNamespace(
         is_running=_Value(True),
         error_state=_Value(False),
+        estop_request=_Value(False),
         safety_state=_Value(int(SafetyState.ARMED)),
         arm_heartbeat_s=_Value(0.0),
         policy_heartbeat_s=_Value(0.0),
         arm_home_result_q=Queue(),
+        arm_action_q=Queue(maxsize=2),
     )
 
 
 class _FeedbackArm:
-    def __init__(self, qpos: np.ndarray, *, send_code: int = 0, read_code: int = 0):
+    def __init__(
+        self,
+        qpos: np.ndarray,
+        *,
+        send_code: int = 0,
+        read_code: int = 0,
+        follow_commands: bool = True,
+        mode_codes: dict[int, int] | None = None,
+        state_code: int = 0,
+        error_after_send: int = 0,
+    ):
         self.qpos = np.asarray(qpos, dtype=np.float64).copy()
         self.send_code = send_code
         self.read_code = read_code
-        self.commands: list[tuple[np.ndarray, float, float]] = []
+        self.follow_commands = follow_commands
+        self.error_code = 0
+        self.mode = 6
+        self.mode_codes = mode_codes or {}
+        self.state_code = state_code
+        self.error_after_send = error_after_send
+        self.mode_calls: list[int] = []
+        self.state_calls: list[int] = []
+        self.commands: list[tuple[np.ndarray, float, float, float | None]] = []
 
     def get_joint_states(self, *, is_radian: bool, num: int):
         if self.read_code != 0:
             return self.read_code, []
         return 0, [self.qpos.copy()]
 
-    def set_servo_angle(self, *, angle, is_radian, speed, mvacc, wait):
-        self.commands.append((np.asarray(angle).copy(), float(speed), float(mvacc)))
-        if self.send_code == 0:
+    def set_mode(self, mode: int):
+        self.mode_calls.append(mode)
+        code = self.mode_codes.get(mode, 0)
+        if code == 0:
+            self.mode = mode
+        return code
+
+    def set_state(self, state: int):
+        self.state_calls.append(state)
+        return self.state_code
+
+    def set_servo_angle(self, *, angle, is_radian, speed, mvacc, wait, radius):
+        self.commands.append((np.asarray(angle).copy(), float(speed), float(mvacc), radius))
+        if self.send_code == 0 and self.follow_commands:
             self.qpos = np.asarray(angle, dtype=np.float64).copy()
+        if self.send_code == 0:
+            self.error_code = self.error_after_send
         return self.send_code
 
 
@@ -69,8 +111,12 @@ def test_planned_homing_advances_only_with_feedback_and_returns_ack() -> None:
     assert result.success
     assert result.request_id == 7
     np.testing.assert_allclose(result.final_qpos, q1)
-    assert len(arm.commands) == 2
-    assert all(speed == cfg.homing_max_speed_rad_per_s for _, speed, _ in arm.commands)
+    assert len(arm.commands) == 1
+    assert all(speed == cfg.homing_max_speed_rad_per_s for _, speed, _, _ in arm.commands)
+    assert arm.commands[0][3] is None
+    assert arm.mode_calls == [0, 6]
+    assert arm.state_calls == [0, 0]
+    assert arm.mode == 6
 
 
 def test_planned_homing_propagates_sdk_rejection_without_fabricating_home() -> None:
@@ -78,11 +124,65 @@ def test_planned_homing_propagates_sdk_rejection_without_fabricating_home() -> N
     q1 = np.full(7, 0.01)
     arm = _FeedbackArm(q0, send_code=9)
 
-    result = _planned_homing(arm, _request(np.stack([q1])), shared=_shared())
+    result = _planned_homing(arm, _request(np.stack([q0, q1])), shared=_shared())
 
     assert not result.success
     assert "rejected" in result.reason
     np.testing.assert_allclose(result.final_qpos, q0)
+    assert arm.mode_calls == [0, 6]
+
+
+def test_planned_homing_fails_if_mode6_cannot_be_restored() -> None:
+    q0 = np.zeros(7)
+    q1 = np.full(7, 0.01)
+    arm = _FeedbackArm(q0, mode_codes={6: 8})
+
+    result = _planned_homing(arm, _request(np.stack([q0, q1])), shared=_shared())
+
+    assert not result.success
+    assert "Mode 6 restore failed" in result.reason
+    np.testing.assert_allclose(result.final_qpos, q1)
+
+
+def test_planned_homing_fails_closed_when_mode0_entry_is_rejected() -> None:
+    q0 = np.zeros(7)
+    q1 = np.full(7, 0.01)
+    arm = _FeedbackArm(q0, mode_codes={0: 9})
+
+    result = _planned_homing(arm, _request(np.stack([q0, q1])), shared=_shared())
+
+    assert not result.success
+    assert "Mode 0 entry failed" in result.reason
+    assert not arm.commands
+    assert arm.mode_calls == [0, 6]
+
+
+def test_planned_homing_stops_instead_of_restoring_ready_after_controller_fault() -> None:
+    q0 = np.zeros(7)
+    q1 = np.full(7, 0.01)
+    arm = _FeedbackArm(q0, error_after_send=31)
+
+    result = _planned_homing(arm, _request(np.stack([q0, q1])), shared=_shared())
+
+    assert not result.success
+    assert "controller error C31" in result.reason
+    assert arm.mode_calls == [0]
+    assert arm.state_calls == [0, 4]
+
+
+def test_planned_homing_rejects_estop_before_changing_mode() -> None:
+    q0 = np.zeros(7)
+    q1 = np.full(7, 0.01)
+    arm = _FeedbackArm(q0)
+    shared = _shared()
+    shared.estop_request.value = True
+
+    result = _planned_homing(arm, _request(np.stack([q0, q1])), shared=shared)
+
+    assert not result.success
+    assert result.reason == "e-stop requested"
+    assert not arm.mode_calls
+    assert not arm.commands
 
 
 def test_planned_homing_propagates_initial_state_failure() -> None:
@@ -107,10 +207,52 @@ def test_wait_for_arm_home_requires_matching_ack() -> None:
 
 
 def test_home_timeout_scales_past_fixed_15_seconds_for_full_band() -> None:
-    path = np.zeros((361, 7), dtype=np.float64)
-    path[:, 6] = np.linspace(0.0, 2.0 * np.pi, len(path))
+    path = np.zeros((2, 7), dtype=np.float64)
+    path[:, 6] = [0.0, 2.0 * np.pi]
 
     assert _estimate_home_timeout_s(path) > 15.0
+
+
+def test_planned_homing_distinguishes_overall_timeout_and_reports_joint_error() -> None:
+    q0 = np.zeros(7)
+    q1 = q0.copy()
+    q1[0] = 0.1
+    arm = _FeedbackArm(q0, follow_commands=False)
+    shared = _shared()
+    request = HomeRequest(8, np.stack([q0, q1]), q1, execution_timeout_s=0.12)
+    cfg = ArmLoopConfig(homing_step_interval_s=0.04, homing_target_timeout_s=0.1)
+    clock = [0.0]
+
+    def _advance(dt: float) -> None:
+        clock[0] += dt
+
+    with (
+        patch("dexmani_real.robot.arm_loop.time.monotonic", side_effect=lambda: clock[0]),
+        patch("dexmani_real.robot.arm_loop.time.sleep", side_effect=_advance),
+    ):
+        result = _planned_homing(arm, request, cfg, shared=shared)
+
+    assert not result.success
+    assert "overall timeout" in result.reason
+    assert "J1 error=" in result.reason
+
+
+def test_planned_homing_publishes_fresh_feedback_while_waiting() -> None:
+    q0 = np.zeros(7)
+    q1 = np.full(7, 0.01)
+    feedback = Mock()
+
+    result = _planned_homing(
+        _FeedbackArm(q0),
+        _request(np.stack([q0, q1])),
+        ArmLoopConfig(homing_step_interval_s=0.0),
+        shared=_shared(),
+        feedback_callback=feedback,
+    )
+
+    assert result.success
+    assert feedback.call_count >= 2
+    np.testing.assert_allclose(feedback.call_args.args[0], q1)
 
 
 def test_home_path_fails_closed_when_workspace_segment_is_unsafe() -> None:
@@ -136,6 +278,181 @@ def test_home_path_fails_closed_when_workspace_segment_is_unsafe() -> None:
 
     assert path is not None
     assert path.shape == (0, 7)
+
+
+def test_home_path_densely_validates_but_returns_sparse_firmware_milestones() -> None:
+    checked_sizes: list[int] = []
+
+    class _Ik:
+        @staticmethod
+        def nearest_equivalent_qpos(home, current):
+            return np.asarray(home, dtype=np.float64)
+
+        @staticmethod
+        def compute_qpos_delta(a, b):
+            return np.asarray(a) - np.asarray(b)
+
+        @staticmethod
+        def check_path_collisions(path):
+            checked_sizes.append(len(path))
+            return {"path_self_collision": False}
+
+    planner = SimpleNamespace(
+        ik_mgr=_Ik(),
+        planning_profile=SimpleNamespace(check_self_collision=True),
+        is_workspace_segment_safe=lambda start, end: True,
+    )
+    path = plan_joint_home_path(np.zeros(7), np.full(7, 0.1), planner)
+
+    assert path is not None
+    assert path.shape == (2, 7)
+    assert checked_sizes and checked_sizes[0] > len(path)
+
+
+def test_home_path_tries_distal_first_when_other_linear_candidates_collide() -> None:
+    collision_checks = 0
+
+    class _Ik:
+        @staticmethod
+        def nearest_equivalent_qpos(home, current):
+            return np.asarray(home, dtype=np.float64)
+
+        @staticmethod
+        def compute_qpos_delta(a, b):
+            return np.asarray(a) - np.asarray(b)
+
+        @staticmethod
+        def check_path_collisions(path):
+            nonlocal collision_checks
+            collision_checks += 1
+            return {"path_self_collision": collision_checks <= 2}
+
+    planner = SimpleNamespace(
+        ik_mgr=_Ik(),
+        planning_profile=SimpleNamespace(check_self_collision=True),
+        is_workspace_segment_safe=lambda start, end: True,
+    )
+    report: dict = {}
+    path = plan_joint_home_path(np.zeros(7), np.full(7, 0.1), planner, report=report)
+
+    assert path is not None
+    assert path.shape == (3, 7)
+    np.testing.assert_allclose(path[1, :4], 0.0)
+    np.testing.assert_allclose(path[1, 4:], 0.1)
+    assert report["selected_candidate"] == "distal_first"
+    assert [candidate["reason"] for candidate in report["candidates"][:2]] == [
+        "self_collision",
+        "self_collision",
+    ]
+
+
+def test_home_path_uses_bounded_rrt_after_all_linear_candidates_fail() -> None:
+    collision_checks = 0
+
+    class _Ik:
+        @staticmethod
+        def nearest_equivalent_qpos(home, current):
+            return np.asarray(home, dtype=np.float64)
+
+        @staticmethod
+        def compute_qpos_delta(a, b):
+            return np.asarray(a) - np.asarray(b)
+
+        @staticmethod
+        def check_path_collisions(path):
+            nonlocal collision_checks
+            collision_checks += 1
+            return {"path_self_collision": collision_checks <= 3}
+
+    rrt_path = np.stack([np.zeros(7), np.full(7, 0.04), np.full(7, 0.1)])
+    planner = SimpleNamespace(
+        ik_mgr=_Ik(),
+        planning_profile=SimpleNamespace(check_self_collision=True),
+        is_workspace_segment_safe=lambda start, end: True,
+        plan_joint_qpos_path=Mock(return_value=PathResult(success=True, qpos_path=rrt_path, source="joint_qpos_rrt")),
+    )
+    report: dict = {}
+    path = plan_joint_home_path(np.zeros(7), np.full(7, 0.1), planner, report=report)
+
+    assert path is not None
+    np.testing.assert_allclose(path, rrt_path)
+    planner.plan_joint_qpos_path.assert_called_once()
+    assert planner.plan_joint_qpos_path.call_args.kwargs["planning_time_s"] == 0.5
+    assert report["selected_candidate"] == "joint_qpos_rrt"
+
+
+def test_send_arm_home_rejects_fault_before_planning_or_queueing() -> None:
+    shared = _shared()
+    shared.error_state.value = True
+    planner = Mock()
+
+    assert not send_arm_home(shared, np.zeros(7), planner=planner, verbose=False)
+    planner.ik_mgr.nearest_equivalent_qpos.assert_not_called()
+    assert shared.arm_action_q.empty()
+
+
+def test_hand_startup_failure_sets_fault_latch_without_false_ready() -> None:
+    shared = SimpleNamespace(error_state=_Value(False), hand_ready=Event())
+    hand_instance = Mock()
+    hand_instance.connect.return_value = False
+
+    with patch("dexmani_real.robot.xhand.XHand", return_value=hand_instance):
+        hand_loop(shared)
+
+    assert shared.error_state.value
+    assert not shared.hand_ready.is_set()
+    hand_instance.disconnect.assert_called_once()
+
+
+def test_optional_hand_startup_failure_does_not_fault_arm_only_entry() -> None:
+    shared = SimpleNamespace(error_state=_Value(False), hand_ready=Event())
+    hand_instance = Mock()
+    hand_instance.connect.return_value = False
+
+    with patch("dexmani_real.robot.xhand.XHand", return_value=hand_instance):
+        hand_loop(shared, HandProcessConfig(startup_failure_is_fatal=False))
+
+    assert not shared.error_state.value
+    assert not shared.hand_ready.is_set()
+    hand_instance.disconnect.assert_called_once()
+
+
+def test_hand_runtime_counts_boolean_command_rejection() -> None:
+    shared = SimpleNamespace(
+        is_running=_Value(True),
+        error_state=_Value(False),
+        estop_request=_Value(False),
+        safety_state=_Value(int(SafetyState.ARMED)),
+        hand_heartbeat_s=_Value(0.0),
+        hand_ready=Event(),
+        hand_cmd_ring=Mock(),
+        hand_state_ring=Mock(),
+        hand_tactile_ring=Mock(),
+    )
+    shared.hand_cmd_ring.read_latest.return_value = ({"qpos_cmd": np.zeros((1, 12))}, 0.0, 1)
+
+    hand_instance = Mock()
+    hand_instance.config = SimpleNamespace(home_qpos=None)
+    hand_instance.connect.return_value = True
+    hand_instance.send_action.return_value = False
+    hand_instance.connected_flag = True
+    hand_instance.error_state = False
+    state_reads = 0
+
+    def _get_state(*args, **kwargs):
+        nonlocal state_reads
+        state_reads += 1
+        if state_reads >= 2:
+            shared.is_running.value = False
+        return {"qpos": np.zeros(12)}
+
+    hand_instance.get_state.side_effect = _get_state
+
+    with patch("dexmani_real.robot.xhand.XHand", return_value=hand_instance):
+        hand_loop(shared, HandProcessConfig(send_err_watchdog_frames=1))
+
+    hand_instance.send_action.assert_called_once()
+    hand_instance.clear_error.assert_called_once()
 
 
 def test_policy_home_syncs_hand_and_reloads_fresh_arm_state() -> None:

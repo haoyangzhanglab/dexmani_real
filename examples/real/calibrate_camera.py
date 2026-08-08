@@ -29,13 +29,16 @@ cv2.calibrateHandEye（5 种算法比选）自动求解相机外参。
   BACKSPACE      删除上一次采集的样本
   X              删除残差最大的最差帧（需先按 ENTER 评估质量）
   ENTER          计算标定并写入 cameras.json（至少 10 组，推荐 10~20 组）
-  R              归位（return_home，2 段式路径）
+  R              归位（return_home，多候选碰撞安全路径）
   Q              退出（丢弃数据）
   ESC            急停退出
 
 注意: 手眼标定必须有姿态变化才能解出旋转，请务必用旋转键在各样本间改变末端
       朝向、覆盖不共线的旋转轴；纯平移采样会导致标定退化。
       标定质量不达标时: ENTER 查看逐帧残差 → X 删最差帧 → 再 ENTER 复算，迭代提质。
+
+XHand is optional: this arm-only calibration does not start a hand worker and
+uses the configured open-hand geometry for collision checks.
 """
 
 from __future__ import annotations
@@ -65,13 +68,14 @@ from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
     SharedStorage,
     SharedStorageConfig,
+    make_arm_action,
     read_arm_state_dict,
     send_arm_home,
     shutdown_processes,
     wait_for_arm_home,
     wait_subsystem_ready,
 )
-from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
+from dexmani_real.teleop.keyboard import GlobalKeyState, MotionActivityLatch, eef_delta_from_keys
 from dexmani_real.utils.rate_manager import RateManager
 
 # ═══════════════════════════════════════════════ 配置
@@ -104,7 +108,7 @@ _cfg = CameraCalibConfig()
 # the data-collection entry points.  The Y bounds are slightly tighter than
 # the default config (-0.45 vs -0.50) because the calibration rig (ArUco
 # marker on end-effector + fixed tripod camera) has a narrower useful range.
-from dexmani_real.config.defaults import arm, policy
+from dexmani_real.config.defaults import arm, hand, policy
 
 WORKSPACE_BOUNDS = policy.workspace.as_array()
 WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
@@ -510,6 +514,12 @@ def main():
         ),
         home_qpos=np.array(arm.home_qpos, dtype=np.float64),
     )
+    # Camera calibration is an arm-only experiment: no XHand worker is
+    # started. Explicitly seed the 19-DOF collision model with the configured
+    # open-hand pose instead of relying on an implicit fallback warning.
+    _assumed_hand_qpos = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
+    planner.set_hand_qpos(_assumed_hand_qpos)
+    print("  XHand: not required (open-hand geometry used for collision checks)")
 
     # ── 2. SharedStorage + arm_loop (new architecture) ──
     shm_cfg = SharedStorageConfig()
@@ -612,6 +622,8 @@ def main():
     # 最近一次 ENTER 计算出的逐帧残差 (mm)，与样本列表同序；样本变动即作废
     last_residuals: np.ndarray | None = None
     prev_x_pressed = False  # edge detection for 'x' one-shot key
+    prev_r_pressed = False  # edge detection for return_home
+    motion_latch = MotionActivityLatch()
 
     def _get_ee_pose() -> tuple[np.ndarray, np.ndarray]:
         """获取当前末端位姿 (pos_m, rpy_rad)。Rot6d→RPY via canonical library path."""
@@ -630,6 +642,7 @@ def main():
     def _emergency_stop():
         nonlocal running
         shared.estop_request.value = True
+        transition(shared, SafetyState.FAULT)
         shared.is_running.value = False
         running = False
 
@@ -792,14 +805,29 @@ def main():
                 break
 
             # ── R: 归位 (collision-safe path via plan_joint_home_path) ──
-            if keys.is_pressed("r"):
+            cur_r_pressed = keys.is_pressed("r")
+            return_home_requested = cur_r_pressed and not prev_r_pressed
+            prev_r_pressed = cur_r_pressed
+            if return_home_requested:
                 print("\n  R: return_home")
                 _home_qpos = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                send_arm_home(
-                    shared, _home_qpos,
-                    planner=planner, table_z_surface_m=arm.table_z_surface_m,
-                    current_qpos=arm_qpos, heartbeat=False, verbose=True,
+                _home_ok = send_arm_home(
+                    shared,
+                    _home_qpos,
+                    planner=planner,
+                    table_z_surface_m=arm.table_z_surface_m,
+                    current_qpos=arm_qpos,
+                    heartbeat=False,
+                    verbose=True,
                 )
+                if not _home_ok:
+                    if shared.error_state.value or shared.safety_state.value == int(SafetyState.FAULT):
+                        transition(shared, SafetyState.FAULT)
+                        running = False
+                        break
+                    print("  ⚠ return_home 未执行，机械臂保持当前位置")
+                    continue
+                motion_latch.reset()
                 # Re-sync after homing
                 _as = read_arm_state_dict(shared)
                 if _as is not None and np.all(np.isfinite(_as["qpos"])):
@@ -875,12 +903,18 @@ def main():
                     flush=True,
                 )
 
-            # 无输入 → snap target to current world-frame EEF
+            # 无输入 → hold the last accepted target
             if np.all(dx == 0) and np.all(drpy == 0):
-                target_pos = eef_pos_world.copy()
-                target_quat = eef_quat_world.copy()
-                prev_qpos_cmd = arm_qpos.copy()
+                if motion_latch.update(False):
+                    # arm_loop continuously resends its last accepted target;
+                    # do not occupy the ordered action FIFO with a duplicate
+                    # release command immediately before a possible re-press.
+                    _hold_pose_world = planner.kin.compute_eef_pose_world(prev_qpos_cmd)
+                    target_pos = _hold_pose_world.p.copy()
+                    target_quat = _hold_pose_world.q.copy()
                 continue
+
+            motion_latch.update(True)
 
             # ── Target lead limit (world frame) ──
             lead = np.linalg.norm(target_pos - eef_pos_world)
@@ -931,7 +965,7 @@ def main():
             if shared.safety_state.value == int(SafetyState.FAULT):
                 continue
 
-            shared.arm_action_q.put({"qpos": ik_result.qpos.copy()})
+            shared.arm_action_q.put(make_arm_action(shared, ik_result.qpos))
 
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt — 退出")

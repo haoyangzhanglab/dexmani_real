@@ -11,7 +11,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | Task | Key File(s) |
 |------|------------|
 | **Main entry point** | `examples/real/vr_teleop_hand_record.py` (canonical, 5-process arch) |
-| Keyboard teleop | `examples/real/keyboard_teleop_real.py` — arm-only, SharedStorage, `KeyboardTeleopConfig` |
+| Keyboard teleop | `examples/real/keyboard_teleop_real.py` — optional XHand, SharedStorage, `defaults.keyboard_teleop` |
 | Camera calibration | `examples/real/calibrate_camera.py` — ArUco eye-to-hand, `CameraCalibConfig` |
 | Trajectory replay | `examples/real/replay_traj.py` — episode replay + consistency metrics |
 | VR heading calib | `examples/real/calibrate_vr_heading.py` — one-shot T_vr_to_robot |
@@ -37,7 +37,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 ### 5-Process Model + Thin Main
 
 ```
-Main (140 lines) — spawns 5 processes, monitors is_running
+Main (~150 lines) — spawns 5 processes, monitors is_running
   │
   ├─ Camera (camera_loop) ──camera_ring──┐
   ├─ VR (vr_loop) ──────vr_ring─────┤
@@ -69,9 +69,13 @@ VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik →
 ```
 
 **Rates:** Policy loop 16 Hz. Arm/Hand servo loops 30 Hz. Normal teleoperation sends
-one target per policy tick and relies on Mode 6 firmware smoothing. Return-home is
-exceptional: the arm worker advances through an already collision-validated dense
-path only after fresh controller feedback converges to each waypoint.
+one target per policy tick and relies on Mode 6 firmware smoothing. Return-home
+densely samples direct and staged joint-space candidates offline for collision
+validation, with a bounded MPlib joint-space fallback when those heuristics are
+blocked. It then temporarily switches to Mode 0 and sends only the validated
+milestones as unblended MoveJoint targets. The arm worker restores Mode 6 on
+healthy exits and acknowledges completion only after fresh controller feedback
+converges.
 
 ### SharedStorage Data Plane (`shm/shared_storage.py`, ~340 lines)
 
@@ -109,7 +113,7 @@ camera_loop(shared)         # Main — bridges frames from CameraSession → sha
 
 ### Core Types (`robot/types.py`)
 
-- **`ArmState`** — `qpos(7) qvel(7) tau(7) eef_pos(3) eef_rot6d(6) error_code connected mode tracking_err timestamp` (~294B, from arm_state_ring; eef via Pinocchio ArmFK in arm_loop, tracking_err = max|qpos - last_target|)
+- **`ArmState`** — joint/EEF/status fields plus last accepted command sequence, producer/receive/SDK-return monotonic timestamps, derived queue/apply/SDK latency, HOLD flag, and state timestamp (322B, from arm_state_ring; eef via Pinocchio ArmFK in arm_loop, tracking_err = max|qpos - last_target|)
 - **`HandState`** — `qpos(12) current(12) tactile_sum(5,3) tactile_contact(5) error_state connected qpos_stale commboard_err(12) jointboard_err(12) tipboard_err(12) timestamp` (472B, from hand_state_ring)
 - **`HandTactile`** — `tactile_force(5,120,3)` (14.4KB, from hand_tactile_ring, sparse)
 - **`RobotState`** — legacy 22-field monolithic state (Policy assembles from ArmState+HandState+HandTactile for recording)
@@ -181,10 +185,12 @@ commands before they reach firmware; firmware remains the final safety backstop.
 7. **Heartbeat supervisor:** Main monitors 5 process heartbeats at 10Hz → FAULT on timeout
 8. **Safety state machine:** formal DISARMED/ARMED/RUNNING/FAULT states with validated
    transitions (Main owns DISARMED↔ARMED/→FAULT, Policy owns ARMED↔RUNNING)
-9. **Return-home:** the caller holding the collision planner builds self-collision,
-   arm-hand, workspace and table-checked waypoints. `arm_loop` executes them with
-   Mode 6 speed/acceleration limits, waits for real joint feedback at every waypoint,
-   and replies on `arm_home_result_q` using the request ID. VR homing is policy-owned;
+9. **Return-home:** the caller holding the collision planner densely validates
+   self-collision, arm-hand, workspace and table clearance along every segment,
+   then sends only safe milestones. `arm_loop` temporarily uses firmware Mode 0
+   MoveJoint point-to-point planning, restores Mode 6, waits for real joint feedback
+   at each milestone, and replies on
+   `arm_home_result_q` using the request ID. VR homing is policy-owned;
    Main never tries to move workers after `is_running=False` or `DISARMED`.
 
 ### Key safety features
@@ -207,7 +213,15 @@ commands before they reach firmware; firmware remains the final safety backstop.
 
 ## Recording Format
 
-HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `TimestampAlignedBuffer` → `EpisodeRecorder` (accumulate-then-dump, async writer). Field catalog: `episode_recorder.py` docstring. Tactile force stored separately in `hand_tactile_ring` (sparse writes).
+HDF5 v11. All streams grid-aligned to 16 Hz. Pipeline: `TimestampAlignedBuffer` → `EpisodeRecorder` (accumulate-then-dump, async writer).
+
+Key hand-related datasets in `data.h5` (full catalog: `episode_recorder.py:add_frame()`):
+- `hand_qpos` (T,12), `hand_fingertip` (T,5,3), `hand_contact` (T,5,3), `hand_tactile_force` (T,5,120,3), `hand_tactile_contact` (T,5)
+- `hand_current` (T,12), `hand_connected` (T,), `hand_qpos_stale` (T,), `hand_error_state` (T,)
+- `hand_tipboard_err` / `hand_commboard_err` / `hand_jointboard_err` (T,12)
+- `action_hand_joint` (T,12), `flag_retarget_ok` (T,), `flag_frame_status` (T,)
+
+`hand_tactile_ring` publishes sparsely (contact-only); `hand_state_ring` publishes every tick (30 Hz).
 
 ---
 
@@ -248,7 +262,8 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 | When you... | Also update... |
 |-------------|---------------|
 | Add a field to ArmState/HandState | `shared_storage.py` (dtype) + `types.py` (dataclass) + arm_loop/hand_loop (write) + policy (read) |
-| Add a recording dataset | `episode_recorder.py` + `episode_reader.py` + `episode_quality.py` |
+| Add a recording dataset | `episode_recorder.py` (add_frame data dict) + `episode_reader.py` + `episode_quality.py` |
+| Add a hand health flag (bool) | `types.py` (RobotState, default False after hand_current) + `policy/vr_teleop_policy.py` (_build_robot_state read + else-branch) + `episode_recorder.py` (add_frame data dict) |
 | Change IK solver | `planning/ik.py` + `policy/vr_teleop_policy.py` |
 | Add a new ring to SharedStorage | `shared_storage.py` + producer process + consumer process |
 | New entry point (new architecture) | Follow Main pattern: `SharedStorage.create()` → spawn `*_loop(shared)` → monitor |
@@ -258,8 +273,8 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 
 ## Entry Points
 
-- **Primary**: `examples/real/vr_teleop_hand_record.py` — canonical 5-process entry, `--task`/`--operator`/`--acc`/`--speed`/`--no-hand`
-- **Keyboard teleop**: `examples/real/keyboard_teleop_real.py` — arm-only, SharedStorage
+- **Primary**: `examples/real/vr_teleop_hand_record.py` — canonical 5-process entry, `--task`/`--operator`/`--acc`/`--speed`/`--no-hand`/`--config`/`--print-config`
+- **Keyboard teleop**: `examples/real/keyboard_teleop_real.py` — optional XHand, SharedStorage; 8 mm maximum translation step, continuous EMA state across key-release edges, no redundant release command in the ordered arm FIFO, and throttled/buffered `RELTRACE` pre/post-release motion diagnostics
 - **Camera calibration**: `examples/real/calibrate_camera.py` — ArUco eye-to-hand
 - **Trajectory replay**: `examples/real/replay_traj.py` — episode replay + consistency metrics
 - **VR heading calib**: `examples/real/calibrate_vr_heading.py`
@@ -268,14 +283,20 @@ HDF5 v8-10 (auto-selected). All streams grid-aligned to 16 Hz. Pipeline: `Timest
 
 ## Hardware Notes
 
-**xArm7 Mode 6:** Firmware online replanning handles normal 16 Hz teleoperation;
-do not add interpolation to that stream. Homing uses a separate feedback-driven
-protocol because continuously overwriting a prevalidated path would not prove that
-the real arm visited its safe waypoints. Homing defaults to 30°/s and acknowledges
-completion only from fresh encoder feedback. See UFACTORY's official
-[Mode 6 description](https://github.com/xarm-developer/xarm_ros#57-xarm_apixarm_msgs-online-planning-modes-added).
+**xArm7 motion modes:** Mode 6 online replanning handles normal 16 Hz teleoperation;
+do not add interpolation to that stream. Its per-joint velocity profiles need not be
+synchronous, so homing densely validates joint-space segments, temporarily enters
+Mode 0, and sends sparse unblended MoveJoint targets. Firmware still owns trajectory
+generation; the worker restores Mode 6 on healthy exits and stops on E-stop/FAULT.
+Homing defaults to 30°/s and
+acknowledges completion only from fresh encoder feedback. See UFACTORY's official
+[Mode 0/6 description](https://github.com/xarm-developer/xarm_ros#57-xarm_apixarm_msgs-online-planning-modes-added).
 
 **XHand:** 12-DOF EtherCAT position servo. Latest-wins semantics (hand_cmd_ring). Tactile: 5 fingers × 120 taxels × 3 axes. Board errors auto-logged.
+`keyboard_teleop_real.py` probes XHand optionally by default (`--require-hand`
+for strict startup, `--no-hand` to skip probing); `calibrate_camera.py` is
+arm-only. Both seed the collision model with configured open-hand geometry when
+measured hand state is unavailable. Canonical data collection remains fail-closed.
 
 **L515:** Direct motherboard USB 3.0 only (no hub; verify `lsusb -t`, 8086:0b64 under root hub). Depth intrinsics bad state: `hardware_reset()`. Mid-run stream stall ~35-60s. XU flaky: use `set_option` fallback.
 

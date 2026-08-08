@@ -150,7 +150,9 @@ class PlanningProfile:
     path_dt: float = 1 / 15
     planning_limits_deg: tuple[tuple[float, float], ...] | None = None
     max_ik_delta_deg: tuple[float, ...] = (120, 135, 120, 120, 180, 150, 180)
-    max_waypoint_delta_deg: float = 15.0  # relaxed from 8° — execution always interpolates at 1° resolution anyway
+    # Validation bound between returned planner waypoints. Firmware, not the
+    # application, owns execution-time trajectory generation.
+    max_waypoint_delta_deg: float = 15.0
     max_pose_error_pos_m: float = 0.005
     max_pose_error_rot_rad: float = 0.05
 
@@ -185,8 +187,8 @@ class TeleopProfile:
     """Online teleoperation IK/servo configuration."""
 
     max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
-    # Speed limiting is handled by arm_loop (30 Hz, Mode 6): per-step joint
-    # delta clamp + firmware online trajectory planning (joint_max_speed/acc).
+    # max_ik_jump_deg is a discontinuity guard, not a velocity clamp. arm_loop
+    # passes speed/acceleration limits to Mode 6; firmware owns smoothing.
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision

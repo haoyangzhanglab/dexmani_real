@@ -305,6 +305,52 @@ class XArm7MotionPlanner:
         best.report["num_valid_plans"] = len(valid_results)
         return best
 
+    def plan_joint_qpos_path(
+        self,
+        target_qpos: np.ndarray,
+        current_qpos: np.ndarray,
+        *,
+        planning_time_s: float = 0.5,
+    ) -> PathResult:
+        """Plan to an exact joint target with MPlib and validate the result.
+
+        Return-home first tries inexpensive, densely validated joint-space
+        segments.  This method is its bounded RRT fallback for poses where
+        those straight-line heuristics are blocked.  The normal planner
+        validation pipeline still checks limits, waypoint spacing, terminal
+        FK error, workspace bounds, and the active 19-DOF collision model.
+        Table clearance remains a caller-owned check because it is not part of
+        MPlib's environment model.
+        """
+        current_qpos = ensure_qpos(current_qpos, self.dof, "current_qpos")
+        target_qpos = ensure_qpos(target_qpos, self.dof, "target_qpos")
+        if not np.isfinite(planning_time_s) or planning_time_s <= 0.0:
+            raise ValueError("planning_time_s must be finite and > 0")
+
+        target_qpos = self.canonicalize_qpos(target_qpos, current_qpos)
+        target_pose_world = self.compute_eef_pose_world(target_qpos)
+        profile = self.planning_profile
+        rrt_range = max(profile.rrt_range_options) if profile.rrt_range_options else 0.12
+        result = self.mplib_planner.plan_qpos(
+            goal_qposes=[target_qpos],
+            current_qpos=current_qpos,
+            time_step=profile.path_dt,
+            rrt_range=rrt_range,
+            planning_time=float(planning_time_s),
+            simplify=profile.simplify_path,
+            verbose=False,
+        )
+        path_result = self.result_from_mplib(
+            result,
+            target_pose_world,
+            current_qpos,
+            source="joint_qpos_rrt",
+            profile=profile,
+        )
+        path_result.report["rrt_range"] = rrt_range
+        path_result.report["planning_time_s"] = float(planning_time_s)
+        return path_result
+
     # Kinematics, IK candidate, and collision-check methods are proxied via
     # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
 

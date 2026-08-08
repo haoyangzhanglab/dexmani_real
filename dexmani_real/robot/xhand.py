@@ -675,26 +675,31 @@ class XHand:
 
     def _diagnose_connection_failure(self) -> None:
         if self.cached_comm_type == "EtherCAT":
-            logger.warning(
-                "XHand connection failed — check power, EtherCAT cable, "
-                "and eno1 link status; EtherCAT raw socket requires "
-                "CAP_NET_RAW (sudo setcap cap_net_raw+ep python) or root"
-            )
-            # SDO write failures during open_ethercat (e.g. "write sdo failed
-            # 1,0,13") indicate the slave's CoE object dictionary is in an
-            # inconsistent state — typically the slave was left in OP by a
-            # previous session that didn't cleanly transition to INIT.
-            # disconnect() now calls set_firmware_state(INIT) + a watchdog
-            # wait; if this error still appears, the previous exit path may
-            # have been kill -9 or an SDK-level crash that bypassed
-            # disconnect().  A power cycle forces a cold boot that clears
-            # all volatile state.
-            logger.error(
-                "If SDO errors appeared above: the previous session may not "
-                "have called disconnect() cleanly (e.g. kill -9 or SDK crash). "
-                "Power-cycle the XHand (disconnect + reconnect 24V power, "
-                "wait ≥5 s), then retry."
-            )
+            if self.last_error_code == -2:
+                logger.warning(
+                    "No XHand EtherCAT slave was enumerated — check 24V power, "
+                    "EtherCAT cable, and eno1 link/carrier. If the SDK printed "
+                    "'ec_init ... succeeded', raw-socket permission is already "
+                    "working; CAP_NET_RAW is relevant only when ec_init/socket "
+                    "creation reports a permission failure."
+                )
+            else:
+                logger.warning(
+                    "XHand EtherCAT open failed — check power, cable, eno1 link, "
+                    "and the SDK error above. CAP_NET_RAW is required only when "
+                    "ec_init/socket creation reports a permission failure."
+                )
+            if self.last_error_code != -2:
+                # SDO write failures during open_ethercat (e.g. "write sdo
+                # failed 1,0,13") indicate that a previous unclean exit may
+                # have left the slave state inconsistent. No-slave discovery
+                # (-2) occurs before SDO traffic, so this advice would be noise.
+                logger.error(
+                    "If SDO errors appeared above: the previous session may not "
+                    "have called disconnect() cleanly (e.g. kill -9 or SDK crash). "
+                    "Power-cycle the XHand (disconnect + reconnect 24V power, "
+                    "wait ≥5 s), then retry."
+                )
         else:
             logger.warning("XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions")
 

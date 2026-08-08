@@ -3,6 +3,27 @@
 Accumulate-then-dump: state/action/vr streams aligned to dt=1/control_hz via
 TimestampAlignedBuffer, flushed in bulk at stop_episode(). Camera frames batched
 every ~10s, tail-padded to grid length at stop.
+
+Schema v11 datasets (add_frame data dict):
+  Observables: arm_qpos(7), arm_ee(9), arm_qvel(7), arm_tau(7),
+    hand_qpos(12), hand_fingertip(5,3), hand_contact(5,3),
+    hand_tactile_force(5,120,3), hand_tactile_contact(5),
+    hand_tipboard_err(12), hand_commboard_err(12), hand_jointboard_err(12),
+    hand_current(12), arm_connected, hand_connected,
+    hand_qpos_stale, hand_error_state
+  Actions: action_arm_joint(7), action_arm_ee(9), action_hand_joint(12),
+    action_arm_joint_sent(7, opt-in v9)
+  Flags: flag_ik_ok, flag_ik_attempted, flag_retarget_ok, flag_held,
+    flag_safety_reject, camera_health, flag_frame_status
+  VR: vr_wrist_pos(3), vr_wrist_rot6d(6), vr_landmarks(21,3)
+  Diagnostics (v10+): tracking_error, ik_solve_time_ms, target_pos_before_clamp(3),
+    head_quat_wxyz(4), arm_last_cmd_seq, arm_last_cmd_queue_latency_s,
+    arm_last_cmd_apply_latency_s, arm_last_cmd_sdk_duration_s,
+    arm_last_cmd_is_hold
+  Meta: timestamp (synthetic grid-aligned), /meta group with attrs
+
+Tactile force stored as a 5-finger x 120-taxel x 3-axis array; hand_tactile_ring
+publishes sparsely (contact-only writes).  hand_state_ring publishes every tick.
 """
 
 from __future__ import annotations
@@ -392,6 +413,15 @@ class EpisodeRecorder:
             # from "connected but read failed (NaN qpos + connected=True)".
             "arm_connected": bool(state.arm_connected),
             "hand_connected": bool(state.hand_connected),
+            # ── Hand health flags ──
+            "hand_qpos_stale": bool(state.hand_qpos_stale),
+            "hand_error_state": bool(state.hand_error_state),
+            # ── Arm command timing (P0 latency observability) ──
+            "arm_last_cmd_seq": int(state.arm_last_cmd_seq),
+            "arm_last_cmd_queue_latency_s": float(state.arm_last_cmd_queue_latency_s),
+            "arm_last_cmd_apply_latency_s": float(state.arm_last_cmd_apply_latency_s),
+            "arm_last_cmd_sdk_duration_s": float(state.arm_last_cmd_sdk_duration_s),
+            "arm_last_cmd_is_hold": bool(state.arm_last_cmd_is_hold),
             # ── Actions ──
             "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
             "action_arm_ee": self._build_action_ee(action),
@@ -597,6 +627,11 @@ class EpisodeRecorder:
         new_start = self._flushed_frames
 
         for h5_key, arr in buf_data.items():
+            # flag_sample_valid is internal TimestampAlignedBuffer bookkeeping
+            # (tracks which grid slots received source samples vs were back-filled).
+            # Excluded from HDF5 — not a user-facing dataset.
+            if h5_key == "flag_sample_valid":
+                continue
             if h5_key not in self._datasets:
                 self._datasets[h5_key] = self._file.create_dataset(
                     h5_key,

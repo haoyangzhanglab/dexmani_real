@@ -21,7 +21,7 @@ from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, 
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, SharedStorage, hand_home_converge
+from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, SharedStorage, hand_home_converge, make_arm_action
 from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state
 from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
 from dexmani_real.shm.shared_storage import send_arm_home
@@ -216,7 +216,7 @@ def _do_teleop_home(
         audio.play("home_done")
         print("  arm: home reached", flush=True)
     else:
-        logger.warning("arm home convergence timeout after 15s")
+        logger.warning("arm home failed or was cancelled; see correlated HOME result above")
 
     return prev_hand_qpos
 
@@ -759,10 +759,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
             hand_state = _read_hand_state(shared)
             hand_tactile = _read_hand_tactile(shared)
-            # Forward-fill: cache the last non-None tactile read so both held
-            # and active frames reuse it when tactile writes are sparse
-            # (contact-only publish).  Avoids allocating full zeros(5,120,3)
-            # (~14KB) per frame when the ring has no new data.
+            # Forward-fill: hand_loop publishes hand_tactile_ring sparsely
+            # (contact-only writes — saves ~14.4 KB/tick @ 30 Hz).  Cache
+            # the last non-None read so held and active frames reuse it when
+            # the ring has no new data.  Avoids allocating zeros(5,120,3)
+            # (~14 KB) per frame.
             if hand_tactile is not None:
                 _last_tactile_data = hand_tactile
             elif _last_tactile_data is not None:
@@ -927,7 +928,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
+                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy(), "is_hold": True}):
                     shared.is_running.value = False
                     break
                 continue
@@ -1024,7 +1025,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
+                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy(), "is_hold": True}):
                     shared.is_running.value = False
                     break
                 # The arm is held, but hand motion still needs arm↔hand collision validation.
@@ -1087,7 +1088,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy()}):
+                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy(), "is_hold": True}):
                     shared.is_running.value = False
                     break
                 # Any joint transition rejection holds both independently driven workers.
@@ -1169,7 +1170,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
 
 def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.2) -> bool:
-    """Put an action onto arm_action_q with timeout protection.
+    """Stamp and put an action onto arm_action_q with timeout protection.
 
     Returns True on success, False if the queue was full (arm_loop dead or
     severely backed up).  The default 0.2s timeout (~3 policy frames @16Hz)
@@ -1180,8 +1181,16 @@ def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.2) 
     from queue import Full
 
     try:
-        shared.arm_action_q.put(action, block=True, timeout=timeout)
+        stamped_action = make_arm_action(
+            shared,
+            np.asarray(action["qpos"], dtype=np.float64),
+            is_hold=bool(action.get("is_hold", False)),
+        )
+        shared.arm_action_q.put(stamped_action, block=True, timeout=timeout)
         return True
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.error("policy_loop: rejected invalid arm action: %s", exc)
+        return False
     except Full:
         logger.warning("policy_loop: arm_action_q full (timeout=%.1fs) — arm unresponsive", timeout)
         return False
@@ -1407,7 +1416,15 @@ def _build_robot_state(
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
 ) -> RobotState:
-    """Build a RobotState from ring data for recording compatibility."""
+    """Build a RobotState from ring data for recording.
+
+    Reads arm_state_ring + hand_state_ring + hand_tactile_ring and assembles
+    a complete RobotState.  Computes world-frame fingertip positions via hand FK
+    chain (handbase -> fingertip -> world via EEF transform).
+
+    Hand health flags (qpos_stale, error_state) are read from HAND_STATE_DTYPE
+    and forwarded to RobotState for recording.
+    """
     if arm_state is not None:
         r = arm_state[0]
         arm_qpos = np.asarray(r["qpos"], dtype=np.float64)
@@ -1416,6 +1433,17 @@ def _build_robot_state(
         eef_pos = np.asarray(r["eef_pos"], dtype=np.float64)
         eef_rot6d = np.asarray(r["eef_rot6d"], dtype=np.float64)
         arm_connected = bool(r["connected"])
+        arm_last_cmd_seq = int(r["last_cmd_seq"]) if "last_cmd_seq" in r.dtype.names else 0
+        arm_last_cmd_queue_latency_s = (
+            float(r["last_cmd_queue_latency_s"]) if "last_cmd_queue_latency_s" in r.dtype.names else 0.0
+        )
+        arm_last_cmd_apply_latency_s = (
+            float(r["last_cmd_apply_latency_s"]) if "last_cmd_apply_latency_s" in r.dtype.names else 0.0
+        )
+        arm_last_cmd_sdk_duration_s = (
+            float(r["last_cmd_sdk_duration_s"]) if "last_cmd_sdk_duration_s" in r.dtype.names else 0.0
+        )
+        arm_last_cmd_is_hold = bool(r["last_cmd_is_hold"]) if "last_cmd_is_hold" in r.dtype.names else False
     else:
         arm_qpos = nan_array(7)
         arm_qvel = nan_array(7)
@@ -1423,6 +1451,11 @@ def _build_robot_state(
         eef_pos = nan_array(3)
         eef_rot6d = nan_array(6)
         arm_connected = False
+        arm_last_cmd_seq = 0
+        arm_last_cmd_queue_latency_s = 0.0
+        arm_last_cmd_apply_latency_s = 0.0
+        arm_last_cmd_sdk_duration_s = 0.0
+        arm_last_cmd_is_hold = False
 
     if hand_state is not None:
         h = hand_state[0]
@@ -1432,6 +1465,7 @@ def _build_robot_state(
         hand_tactile_contact = np.asarray(h["tactile_contact"], dtype=bool)
         hand_connected = bool(h["connected"])
         hand_qpos_stale = bool(h["qpos_stale"]) if "qpos_stale" in h.dtype.names else False
+        hand_error_state = bool(h["error_state"]) if "error_state" in h.dtype.names else False
         # Board error registers — per-joint hardware fault indicators.
         hand_commboard_err = (
             np.asarray(h["commboard_err"], dtype=np.int32)
@@ -1455,6 +1489,7 @@ def _build_robot_state(
         hand_tactile_contact = np.zeros(5, dtype=bool)
         hand_connected = False
         hand_qpos_stale = False
+        hand_error_state = False
         hand_commboard_err = np.zeros(12, dtype=np.int32)
         hand_jointboard_err = np.zeros(12, dtype=np.int32)
         hand_tipboard_err = np.zeros(12, dtype=np.int32)
@@ -1502,6 +1537,12 @@ def _build_robot_state(
         hand_commboard_err=hand_commboard_err,
         hand_jointboard_err=hand_jointboard_err,
         hand_qpos_stale=hand_qpos_stale,
+        hand_error_state=hand_error_state,
+        arm_last_cmd_seq=arm_last_cmd_seq,
+        arm_last_cmd_queue_latency_s=arm_last_cmd_queue_latency_s,
+        arm_last_cmd_apply_latency_s=arm_last_cmd_apply_latency_s,
+        arm_last_cmd_sdk_duration_s=arm_last_cmd_sdk_duration_s,
+        arm_last_cmd_is_hold=arm_last_cmd_is_hold,
         fingertip_pos=fingertip_pos,
         arm_connected=arm_connected,
         hand_connected=hand_connected,

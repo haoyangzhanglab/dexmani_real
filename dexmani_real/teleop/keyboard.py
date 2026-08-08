@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-__all__ = ["ControlSignal", "KeyboardHandler", "GlobalKeyState", "eef_delta_from_keys"]
+__all__ = [
+    "ControlSignal",
+    "KeyboardHandler",
+    "GlobalKeyState",
+    "MotionActivityLatch",
+    "MotionTraceSample",
+    "ReleaseMotionTracer",
+    "eef_delta_from_keys",
+]
 
 import os
 import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -368,8 +377,314 @@ class GlobalKeyState:
         return len(self._keys) > 0
 
 
+class MotionActivityLatch:
+    """Detect the active-to-idle edge of continuous keyboard motion."""
+
+    def __init__(self) -> None:
+        self._active = False
+
+    def update(self, active: bool) -> bool:
+        """Store *active* and return True exactly once when motion is released."""
+        released = self._active and not active
+        self._active = bool(active)
+        return released
+
+    def reset(self) -> None:
+        self._active = False
+
+
+@dataclass
+class MotionTraceSample:
+    """One state-aligned sample for keyboard release diagnostics."""
+
+    frame: int
+    timestamp_s: float
+    input_active: bool
+    eef_pos_m: np.ndarray
+    command_pos_m: np.ndarray
+    qpos_error_rad: float
+    qvel_peak_rad_s: float
+    state_age_s: float
+    queue_latency_s: float
+    apply_latency_s: float
+
+    def __post_init__(self) -> None:
+        self.eef_pos_m = self._vector3(self.eef_pos_m, "eef_pos_m")
+        self.command_pos_m = self._vector3(self.command_pos_m, "command_pos_m")
+        if self.frame < 0:
+            raise ValueError("motion trace frame must be >= 0")
+        for name in (
+            "timestamp_s",
+            "qpos_error_rad",
+            "qvel_peak_rad_s",
+            "state_age_s",
+            "queue_latency_s",
+            "apply_latency_s",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0")
+            setattr(self, name, value)
+
+    @staticmethod
+    def _vector3(value: np.ndarray, name: str) -> np.ndarray:
+        vector = np.asarray(value, dtype=np.float64)
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            raise ValueError(f"{name} must be a finite (3,) vector")
+        return vector.copy()
+
+
+class ReleaseMotionTracer:
+    """Capture and summarize a short high-rate window around key release.
+
+    The tracer is deliberately control-agnostic: callers provide state-aligned
+    samples and the last translational input direction. It returns printable
+    lines, so the helper remains deterministic and hardware-free in tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        pre_frames: int = 6,
+        post_frames: int = 20,
+        cooldown_s: float = 5.0,
+        velocity_deadband_m_s: float = 0.01,
+    ) -> None:
+        if pre_frames <= 0 or post_frames <= 0:
+            raise ValueError("release trace pre/post frames must be > 0")
+        if not np.isfinite(cooldown_s) or cooldown_s < 0.0:
+            raise ValueError("release trace cooldown_s must be finite and >= 0")
+        if not np.isfinite(velocity_deadband_m_s) or velocity_deadband_m_s < 0.0:
+            raise ValueError("release trace velocity deadband must be finite and >= 0")
+        self.pre_frames = int(pre_frames)
+        self.post_frames = int(post_frames)
+        self.cooldown_s = float(cooldown_s)
+        self.velocity_deadband_m_s = float(velocity_deadband_m_s)
+        self._history: deque[MotionTraceSample] = deque(maxlen=self.pre_frames)
+        self._pre_samples: list[MotionTraceSample] = []
+        self._window_samples: list[MotionTraceSample] = []
+        self._release_prev_sample: MotionTraceSample | None = None
+        self._direction: np.ndarray | None = None
+        self._release_pos_m: np.ndarray | None = None
+        self._post_seen = 0
+        self._window_id = 0
+        self._last_start_s = float("-inf")
+        self.last_summary: dict[str, float | int | str | bool] | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._direction is not None
+
+    def reset(self) -> None:
+        """Discard history/window state after a blocking mode change such as HOME."""
+        self._history.clear()
+        self._pre_samples.clear()
+        self._window_samples.clear()
+        self._release_prev_sample = None
+        self._direction = None
+        self._release_pos_m = None
+        self._post_seen = 0
+        self._last_start_s = float("-inf")
+        self.last_summary = None
+
+    def observe(
+        self,
+        sample: MotionTraceSample,
+        *,
+        release_edge: bool = False,
+        translation_direction: np.ndarray | None = None,
+    ) -> list[str]:
+        """Consume a sample and return zero or more diagnostic log lines."""
+        lines: list[str] = []
+        if release_edge and not self.active:
+            direction = self._normalize_direction(translation_direction)
+            cooldown_elapsed = sample.timestamp_s - self._last_start_s >= self.cooldown_s
+            if direction is not None and cooldown_elapsed:
+                pre_samples = list(self._history)
+                self._window_id += 1
+                self._last_start_s = sample.timestamp_s
+                self._direction = direction
+                self._release_pos_m = sample.eef_pos_m.copy()
+                self._release_prev_sample = pre_samples[-1] if pre_samples else None
+                self._pre_samples = pre_samples
+                self._window_samples = [sample]
+                self._post_seen = 0
+                self.last_summary = None
+                self._history.clear()
+                return lines
+            self._history.clear()
+
+        if self.active:
+            self._window_samples.append(sample)
+            self._post_seen += 1
+            if sample.input_active:
+                # The sample is contaminated and detailed lines would also add
+                # terminal I/O to the newly active control interval. Emit only
+                # one summary line in this case.
+                lines.extend(self._finish("reengaged", include_samples=False))
+            elif self._post_seen >= self.post_frames:
+                # Buffer the whole window until capture is complete. Printing
+                # 30 Hz samples during capture would alter the timing that this
+                # diagnostic is intended to measure.
+                lines.extend(self._finish("completed", include_samples=True))
+
+        if sample.input_active:
+            if self._normalize_direction(translation_direction) is None:
+                self._history.clear()
+            else:
+                self._history.append(sample)
+        return lines
+
+    @staticmethod
+    def _normalize_direction(direction: np.ndarray | None) -> np.ndarray | None:
+        if direction is None:
+            return None
+        vector = np.asarray(direction, dtype=np.float64)
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            raise ValueError("translation_direction must be a finite (3,) vector")
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-12:
+            return None
+        return vector / norm
+
+    def _format_sample(
+        self,
+        sample: MotionTraceSample,
+        previous: MotionTraceSample | None,
+        phase: str,
+    ) -> str:
+        assert self._direction is not None
+        assert self._release_pos_m is not None
+        velocity = np.zeros(3, dtype=np.float64)
+        dt_s = 0.0
+        if previous is not None:
+            dt_s = sample.timestamp_s - previous.timestamp_s
+            if dt_s > 1e-6:
+                velocity = (sample.eef_pos_m - previous.eef_pos_m) / dt_s
+        displacement = sample.eef_pos_m - self._release_pos_m
+        along_velocity = float(np.dot(velocity, self._direction))
+        lateral_velocity = velocity - along_velocity * self._direction
+        command_error = sample.command_pos_m - sample.eef_pos_m
+        return (
+            f"[RELTRACE#{self._window_id} {phase} f={sample.frame}] "
+            f"dt={dt_s * 1000:.1f}ms in={int(sample.input_active)} "
+            f"eef={self._fmt_vec(sample.eef_pos_m, scale=1000.0, precision=1)}mm "
+            f"drel={self._fmt_vec(displacement, scale=1000.0, precision=1)}mm "
+            f"v={self._fmt_vec(velocity, scale=1000.0, precision=1)}mm/s "
+            f"va={along_velocity * 1000:+.1f} vl={np.linalg.norm(lateral_velocity) * 1000:.1f}mm/s "
+            f"cmd_err={self._fmt_vec(command_error, scale=1000.0, precision=1)}mm "
+            f"qerr={np.rad2deg(sample.qpos_error_rad):.1f}deg qv={np.rad2deg(sample.qvel_peak_rad_s):.1f}deg/s "
+            f"age/q/apply={sample.state_age_s * 1000:.0f}/"
+            f"{sample.queue_latency_s * 1000:.1f}/{sample.apply_latency_s * 1000:.1f}ms"
+        )
+
+    def _finish(self, reason: str, *, include_samples: bool) -> list[str]:
+        assert self._direction is not None
+        assert self._release_pos_m is not None
+        samples = self._window_samples
+        displacement = np.stack([sample.eef_pos_m - self._release_pos_m for sample in samples])
+        along = displacement @ self._direction
+        lateral = displacement - along[:, None] * self._direction[None, :]
+
+        velocity_samples: list[np.ndarray] = []
+        velocity_timestamps_s: list[float] = []
+        previous = self._release_prev_sample
+        for sample in samples:
+            if previous is not None:
+                dt_s = sample.timestamp_s - previous.timestamp_s
+                if dt_s > 1e-6:
+                    velocity_samples.append((sample.eef_pos_m - previous.eef_pos_m) / dt_s)
+                    velocity_timestamps_s.append(sample.timestamp_s)
+            previous = sample
+        velocities = np.stack(velocity_samples) if velocity_samples else np.zeros((1, 3), dtype=np.float64)
+        along_velocity = velocities @ self._direction
+        lateral_velocity = velocities - along_velocity[:, None] * self._direction[None, :]
+
+        acceleration_peak_m_s2 = 0.0
+        if len(velocities) >= 2:
+            velocity_intervals_s = np.diff(velocity_timestamps_s)
+            valid = velocity_intervals_s > 1e-6
+            if np.any(valid):
+                accelerations = np.diff(velocities, axis=0)[valid] / velocity_intervals_s[valid, None]
+                acceleration_peak_m_s2 = float(np.max(np.linalg.norm(accelerations, axis=1)))
+
+        signs = np.sign(along_velocity[np.abs(along_velocity) >= self.velocity_deadband_m_s])
+        direction_reversals = int(np.count_nonzero(signs[1:] != signs[:-1])) if len(signs) >= 2 else 0
+        peak_forward_m = max(0.0, float(np.max(along)))
+        final_along_m = float(along[-1])
+        rollback_m = max(0.0, peak_forward_m - final_along_m)
+        duration_s = max(0.0, samples[-1].timestamp_s - samples[0].timestamp_s)
+        summary: dict[str, float | int | str | bool] = {
+            "reason": reason,
+            "clean": reason == "completed",
+            "duration_s": duration_s,
+            "final_along_m": final_along_m,
+            "peak_forward_m": peak_forward_m,
+            "rollback_m": rollback_m,
+            "peak_lateral_m": float(np.max(np.linalg.norm(lateral, axis=1))),
+            "peak_reverse_velocity_m_s": max(0.0, float(-np.min(along_velocity))),
+            "peak_lateral_velocity_m_s": float(np.max(np.linalg.norm(lateral_velocity, axis=1))),
+            "direction_reversals": direction_reversals,
+            "peak_acceleration_m_s2": acceleration_peak_m_s2,
+            "peak_qpos_error_rad": max(sample.qpos_error_rad for sample in samples),
+            "peak_qvel_rad_s": max(sample.qvel_peak_rad_s for sample in samples),
+            "max_state_age_s": max(sample.state_age_s for sample in samples),
+            "max_queue_latency_s": max(sample.queue_latency_s for sample in samples),
+            "max_apply_latency_s": max(sample.apply_latency_s for sample in samples),
+        }
+        self.last_summary = summary
+        summary_line = (
+            f"[RELTRACE#{self._window_id} SUMMARY] reason={reason} clean={int(bool(summary['clean']))} "
+            f"duration={duration_s * 1000:.0f}ms final={final_along_m * 1000:+.1f}mm "
+            f"peak={peak_forward_m * 1000:+.1f}mm rollback={rollback_m * 1000:.1f}mm "
+            f"lateral={float(summary['peak_lateral_m']) * 1000:.1f}mm "
+            f"reverse_v={float(summary['peak_reverse_velocity_m_s']) * 1000:.1f}mm/s "
+            f"lateral_v={float(summary['peak_lateral_velocity_m_s']) * 1000:.1f}mm/s "
+            f"reversals={direction_reversals} a_peak={acceleration_peak_m_s2:.2f}m/s2 "
+            f"qerr={np.rad2deg(float(summary['peak_qpos_error_rad'])):.1f}deg "
+            f"qv={np.rad2deg(float(summary['peak_qvel_rad_s'])):.1f}deg/s "
+            f"age/q/apply_max={float(summary['max_state_age_s']) * 1000:.0f}/"
+            f"{float(summary['max_queue_latency_s']) * 1000:.1f}/"
+            f"{float(summary['max_apply_latency_s']) * 1000:.1f}ms"
+        )
+
+        lines: list[str] = []
+        if include_samples:
+            direction_text = self._fmt_vec(self._direction, scale=1.0, precision=2)
+            release_frame = samples[0].frame
+            lines.append(
+                f"[RELTRACE#{self._window_id} START f={release_frame}] "
+                f"dir={direction_text} pre={len(self._pre_samples)} post={self._post_seen} buffered=1"
+            )
+            format_previous: MotionTraceSample | None = None
+            for offset, pre_sample in enumerate(self._pre_samples, start=-len(self._pre_samples)):
+                lines.append(self._format_sample(pre_sample, format_previous, f"PRE{offset:+d}"))
+                format_previous = pre_sample
+            lines.append(self._format_sample(samples[0], format_previous, "REL"))
+            format_previous = samples[0]
+            for index, post_sample in enumerate(samples[1:], start=1):
+                lines.append(self._format_sample(post_sample, format_previous, f"POST{index:02d}"))
+                format_previous = post_sample
+        lines.append(summary_line)
+
+        self._pre_samples = []
+        self._window_samples = []
+        self._release_prev_sample = None
+        self._direction = None
+        self._release_pos_m = None
+        self._post_seen = 0
+        return lines
+
+    @staticmethod
+    def _fmt_vec(vector: np.ndarray, *, scale: float, precision: int) -> str:
+        values = np.asarray(vector, dtype=np.float64) * scale
+        return f"({values[0]:+.{precision}f},{values[1]:+.{precision}f},{values[2]:+.{precision}f})"
+
+
 def eef_delta_from_keys(
-    keys: GlobalKeyState, delta_pos: float, delta_rpy: float
+    keys: GlobalKeyState,
+    delta_pos: float,
+    delta_rpy: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map held WASD/arrow/IJKL keys to EEF delta position (dx) and rotation (drpy).
 

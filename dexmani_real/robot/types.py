@@ -69,6 +69,16 @@ class RobotState:
     # ── Hand motor current (optional, for safety gating) ──
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
+    # ── Hand health flags (default-False for backward compat) ──
+    hand_error_state: bool = False  # True when hand reports hardware errors (board faults)
+
+    # ── Arm command timing (default values keep older producers compatible) ──
+    arm_last_cmd_seq: int = 0
+    arm_last_cmd_queue_latency_s: float = 0.0  # producer -> arm queue receive
+    arm_last_cmd_apply_latency_s: float = 0.0  # producer -> successful SDK return
+    arm_last_cmd_sdk_duration_s: float = 0.0  # duration of set_servo_angle()
+    arm_last_cmd_is_hold: bool = False  # release-edge/hold command rather than motion intent
+
     def __post_init__(self):
         _validate_field_shapes(
             self,
@@ -126,7 +136,7 @@ class RobotAction:
 
 @dataclass
 class ArmState:
-    """Arm process state — published to arm_state_ring every tick (~265 bytes).
+    """Arm process state — published to arm_state_ring every tick (~322 bytes).
 
     Matches ARM_STATE_DTYPE in shm/shared_storage.py.
     """
@@ -140,6 +150,14 @@ class ArmState:
     connected: bool
     mode: int
     tracking_err: float
+    last_cmd_seq: int
+    last_cmd_created_s: float  # producer time.monotonic(), seconds
+    last_cmd_received_s: float  # arm worker time.monotonic(), seconds
+    last_cmd_applied_s: float  # successful SDK return, time.monotonic(), seconds
+    last_cmd_queue_latency_s: float
+    last_cmd_apply_latency_s: float
+    last_cmd_sdk_duration_s: float
+    last_cmd_is_hold: bool
     timestamp: float
 
 

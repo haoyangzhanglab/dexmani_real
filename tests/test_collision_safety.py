@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -10,8 +10,7 @@ from dexmani_real.planning.collision_model import CollisionModel
 from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
 from dexmani_real.planning.ik_candidates import IKCandidateManager
 from dexmani_real.policy.vr_teleop_policy import _sanitize_hand_command
-from dexmani_real.robot.arm_loop import _require_sdk_ok, _transition_collision_fault
-from dexmani_real.robot.safety import SafetyState
+from dexmani_real.robot.arm_loop import _latch_collision_fault, _require_sdk_ok
 
 
 class CollisionModelSafetyTests(unittest.TestCase):
@@ -103,15 +102,13 @@ class CommandSafetyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _require_sdk_ok("failed", 1)
 
-    def test_c31_transitions_immediately_to_fault(self) -> None:
+    def test_c31_latches_error_for_main_owned_fault_transition(self) -> None:
         shared = Mock()
         shared.error_state.value = False
         arm_api = Mock()
         arm_api.get_c31_error_info.return_value = (0, [3, 1.0, 2.0])
-        with patch("dexmani_real.robot.arm_loop.transition") as transition_mock:
-            _transition_collision_fault(shared, arm_api, 31)
+        _latch_collision_fault(shared, arm_api, 31)
         self.assertTrue(shared.error_state.value)
-        transition_mock.assert_called_once_with(shared, SafetyState.FAULT)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+_palm_fallback_warn = None  # lazy ThrottledWarner — initialized on first fallback
+
 # ── Pinky landmark indices (MediaPipe convention) ──
 _PINKY_MCP = 17
 _PINKY_PIP = 18
@@ -65,6 +67,11 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     points = keypoint_3d_array[[0, 5, 9], :].copy()
 
     if not np.all(np.isfinite(points)):
+        global _palm_fallback_warn
+        if _palm_fallback_warn is None:
+            from dexmani_real.utils.log import ThrottledWarner
+            _palm_fallback_warn = ThrottledWarner(interval_s=5.0)
+        _palm_fallback_warn("_estimate_palm_frame: NaN/Inf in wrist+MCP points — falling back to identity")
         return np.eye(3, dtype=np.float64)
 
     x_vector = points[0] - points[2]  # wrist → middle MCP

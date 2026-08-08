@@ -10,7 +10,7 @@ import multiprocessing as mp
 import sys
 import time
 from dataclasses import dataclass, field
-from queue import Empty
+from queue import Empty, Full
 from typing import Any
 
 import numpy as np
@@ -63,7 +63,7 @@ HOME_SENTINEL = "__HOME__"
 
 @dataclass(frozen=True)
 class HomeRequest:
-    """A fully planned, fail-closed homing command for ``arm_loop``."""
+    """Densely validated, sparse-milestone homing command for ``arm_loop``."""
 
     request_id: int
     waypoints: "np.ndarray"
@@ -109,9 +109,19 @@ ARM_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         ("mode", "<i4"),
         ("tracking_err", "<f8"),
+        # Last arm action successfully accepted by the SDK. Monotonic timestamps
+        # share one host clock across processes and make queue/SDK latency measurable.
+        ("last_cmd_seq", "<u8"),
+        ("last_cmd_created_s", "<f8"),
+        ("last_cmd_received_s", "<f8"),
+        ("last_cmd_applied_s", "<f8"),
+        ("last_cmd_queue_latency_s", "<f8"),
+        ("last_cmd_apply_latency_s", "<f8"),
+        ("last_cmd_sdk_duration_s", "<f8"),
+        ("last_cmd_is_hold", "<u1"),
         ("timestamp", "<f8"),
     ]
-)  # 265 bytes
+)  # 322 bytes
 
 HAND_STATE_DTYPE = np.dtype(
     [
@@ -164,6 +174,7 @@ class SharedStorage:
 
     arm_action_q: mp.Queue  # policy -> arm, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
+    arm_command_seq: Any  # all arm-action producers -> globally unique monotonic IDs
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -244,6 +255,7 @@ class SharedStorage:
 
         storage.arm_action_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
         storage.arm_home_result_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
+        storage.arm_command_seq = mp.Value("Q", 0)
 
         storage.is_running = mp.Value("b", True)
         storage.is_recording = mp.Value("b", False)
@@ -347,6 +359,33 @@ def read_arm_state(shared: "SharedStorage") -> "np.ndarray | None":
     return data
 
 
+def make_arm_action(shared: "SharedStorage", qpos: "np.ndarray", *, is_hold: bool = False) -> "dict[str, Any]":
+    """Build one validated, timestamped arm queue action.
+
+    ``command_seq`` is allocated atomically from :class:`SharedStorage`, so
+    every producer (policy, keyboard, calibration, replay) uses one monotonic
+    command domain. ``created_monotonic_s`` is comparable directly with the
+    arm worker's receive/apply timestamps because all processes run on the same
+    host monotonic clock.
+    """
+    qpos_array = np.asarray(qpos, dtype=np.float64)
+    if qpos_array.shape != (7,):
+        raise ValueError(f"arm qpos action must have shape (7,), got {qpos_array.shape}")
+    if not np.all(np.isfinite(qpos_array)):
+        raise ValueError("arm qpos action contains NaN/Inf")
+
+    with shared.arm_command_seq.get_lock():
+        command_seq = int(shared.arm_command_seq.value) + 1
+        shared.arm_command_seq.value = command_seq
+
+    return {
+        "qpos": qpos_array.copy(),
+        "command_seq": command_seq,
+        "created_monotonic_s": time.monotonic(),
+        "is_hold": bool(is_hold),
+    }
+
+
 def read_hand_state(shared: "SharedStorage") -> "np.ndarray | None":
     """Read latest hand state from ring. Returns raw structured array or None."""
     result = shared.hand_state_ring.read_latest()
@@ -428,7 +467,7 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
     Fields: qpos(7), qvel(7), tau(7), eef_pos(3), eef_rot6d(6),
-            error_code, connected, tracking_err.
+            error_code, connected, tracking_err, and last-command timing.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
     """
     data = read_arm_state(shared)
@@ -443,6 +482,14 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
         "error_code": int(data["error_code"][0]),
         "connected": bool(data["connected"][0]),
         "tracking_err": float(data["tracking_err"][0]),
+        "last_cmd_seq": int(data["last_cmd_seq"][0]),
+        "last_cmd_created_s": float(data["last_cmd_created_s"][0]),
+        "last_cmd_received_s": float(data["last_cmd_received_s"][0]),
+        "last_cmd_applied_s": float(data["last_cmd_applied_s"][0]),
+        "last_cmd_queue_latency_s": float(data["last_cmd_queue_latency_s"][0]),
+        "last_cmd_apply_latency_s": float(data["last_cmd_apply_latency_s"][0]),
+        "last_cmd_sdk_duration_s": float(data["last_cmd_sdk_duration_s"][0]),
+        "last_cmd_is_hold": bool(data["last_cmd_is_hold"][0]),
     }
 
 
@@ -506,6 +553,8 @@ def wait_for_arm_home(
     """
     _deadline = time.monotonic() + timeout_s
     _not_before = time.monotonic() if requested_after_s is None else float(requested_after_s)
+    _abort_reason: str | None = None
+    _fault_ack_deadline: float | None = None
     while time.monotonic() < _deadline:
         _now = time.monotonic()
         if heartbeat:
@@ -535,12 +584,30 @@ def wait_for_arm_home(
                 print(f"  arm: home failed — {_result.reason}", flush=True)
             return False
 
-        if not shared.is_running.value or shared.error_state.value:
+        if not shared.is_running.value:
+            _abort_reason = "shutdown requested"
             break
-        if shared.safety_state.value == int(SafetyState.FAULT):
+        _fault_reason: str | None = None
+        if shared.error_state.value:
+            _fault_reason = "sticky error_state set"
+        elif shared.safety_state.value == int(SafetyState.FAULT):
+            _fault_reason = "safety state is FAULT"
+        if _fault_reason is not None:
+            # multiprocessing.Queue.put() may return before its feeder thread
+            # makes the correlated HomeResult visible.  The arm worker latches
+            # error_state immediately after publishing a failed result, so give
+            # that acknowledgement one bounded grace window before reporting a
+            # generic fault.  This preserves the precise SDK/timeout reason.
+            if request_id is not None:
+                if _fault_ack_deadline is None:
+                    _fault_ack_deadline = min(_deadline, _now + 0.25)
+                if _now < _fault_ack_deadline:
+                    continue
+            _abort_reason = _fault_reason
             break
         _arm_hb = float(shared.arm_heartbeat_s.value)
         if _arm_hb > 0.0 and _now - _arm_hb > 1.0:
+            _abort_reason = f"arm heartbeat stale ({_now - _arm_hb:.1f}s)"
             break
         if request_id is not None:
             continue
@@ -557,17 +624,44 @@ def wait_for_arm_home(
                     return True
         time.sleep(0.1)
     if verbose:
-        print(f"  arm: home wait aborted or timed out ({timeout_s:.0f}s)", flush=True)
+        if _abort_reason is not None:
+            print(f"  arm: home wait aborted — {_abort_reason}", flush=True)
+        else:
+            print(f"  arm: home acknowledgement timed out after {timeout_s:.1f}s", flush=True)
     return False
 
 
 def _estimate_home_timeout_s(waypoints: "np.ndarray") -> float:
-    """Conservative deadline derived from path length and configured homing speed."""
+    """Deadline derived from milestone path length and feedback settle overhead."""
     if len(waypoints) < 2:
         return 10.0
     segment_motion = np.max(np.abs(np.diff(waypoints, axis=0)), axis=1)
     nominal_s = float(np.sum(segment_motion)) / max(np.deg2rad(arm.homing.max_speed_deg_s), 1e-6)
-    return max(10.0, 2.0 * nominal_s + 5.0)
+    moving_segments = int(np.count_nonzero(segment_motion > 1e-9))
+    settle_s = moving_segments * arm.homing.target_timeout_s
+    return max(10.0, 2.0 * nominal_s + settle_s + 5.0)
+
+
+def _format_home_candidate_rejection(candidate: "dict[str, Any]") -> str:
+    """Format one path-candidate diagnostic without dumping large arrays."""
+    name = str(candidate.get("name", "unknown"))
+    reason = str(candidate.get("reason", "unknown"))
+    if reason == "self_collision":
+        collision = candidate.get("collision") or {}
+        pairs = collision.get("collision_pairs", []) if isinstance(collision, dict) else []
+        pair_names = [f"{pair.get('link1', '?')}<->{pair.get('link2', '?')}" for pair in pairs[:2]]
+        pair_text = ",".join(pair_names) if pair_names else "pair unavailable"
+        return f"{name}: self_collision sample={candidate.get('collision_waypoint_index', '?')} ({pair_text})"
+    if reason == "table_clearance":
+        clearance_mm = 1000.0 * float(candidate.get("clearance_m", float("nan")))
+        return (
+            f"{name}: table_clearance sample={candidate.get('table_waypoint_index', '?')} "
+            f"margin={clearance_mm:+.1f}mm"
+        )
+    if reason == "workspace":
+        return f"{name}: workspace segment={candidate.get('workspace_segment_index', '?')}"
+    detail = str(candidate.get("detail", "")).strip()
+    return f"{name}: {reason}" + (f" ({detail})" if detail else "")
 
 
 def send_arm_home(
@@ -586,8 +680,8 @@ def send_arm_home(
 
     Encapsulates the full home sequence used by all entry points:
     1. Read current qpos (from *current_qpos* or ``arm_state_ring``).
-    2. Plan collision-safe path via ``plan_joint_home_path``.
-    3. Queue ``(HOME_SENTINEL, waypoints)`` to ``arm_action_q``.
+    2. Densely validate collision-safe segments and retain sparse milestones.
+    3. Queue a correlated ``HomeRequest`` to ``arm_action_q``.
     4. Wait for convergence via ``wait_for_arm_home``.
 
     A planner is required. Missing state, planning errors, and unsafe paths
@@ -597,14 +691,45 @@ def send_arm_home(
     """
     from dexmani_real.planning.path_utils import plan_band_alignment_path, plan_joint_home_path
 
+    # HOME is a motion command, not a fault-recovery command.  arm_loop stops
+    # consuming actions after a sticky fault, so rejecting here prevents
+    # impossible requests from filling the bounded action queue.
+    if not shared.is_running.value:
+        if verbose:
+            print("  arm: homing cancelled — shutdown in progress", flush=True)
+        return False
+    if shared.error_state.value or shared.safety_state.value == int(SafetyState.FAULT):
+        if verbose:
+            print("  arm: homing cancelled — system is in FAULT; restart after inspection", flush=True)
+        return False
+    if shared.safety_state.value not in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
+        if verbose:
+            print("  arm: homing cancelled — safety state is not ARMED/RUNNING", flush=True)
+        return False
+
     # ── Step 1: resolve current qpos ──
     if current_qpos is None:
         _as = read_arm_state(shared)
-        if _as is None or not np.all(np.isfinite(_as["qpos"][0])):
+        _state_age_s = float("inf") if _as is None else time.monotonic() - float(_as["timestamp"][0])
+        if (
+            _as is None
+            or _state_age_s > 0.5
+            or not bool(_as["connected"][0])
+            or int(_as["error_code"][0]) != 0
+            or not np.all(np.isfinite(_as["qpos"][0]))
+        ):
             if verbose:
-                print("  arm: no valid current state — homing cancelled", flush=True)
+                print(
+                    f"  arm: current state is stale/unhealthy (age={_state_age_s:.2f}s) — homing cancelled", flush=True
+                )
             return False
         current_qpos = np.asarray(_as["qpos"][0], dtype=np.float64)
+    else:
+        current_qpos = np.asarray(current_qpos, dtype=np.float64)
+        if current_qpos.shape != (7,) or not np.all(np.isfinite(current_qpos)):
+            if verbose:
+                print("  arm: invalid current qpos — homing cancelled", flush=True)
+            return False
 
     if planner is None:
         if verbose:
@@ -612,8 +737,15 @@ def send_arm_home(
         return False
 
     # ── Step 2: plan collision-safe path to wrapped home ──
+    _home_path_report: dict[str, Any] = {}
     try:
-        _waypoints = plan_joint_home_path(current_qpos, home_qpos, planner, table_z_surface_m=table_z_surface_m)
+        _waypoints = plan_joint_home_path(
+            current_qpos,
+            home_qpos,
+            planner,
+            table_z_surface_m=table_z_surface_m,
+            report=_home_path_report,
+        )
     except Exception as exc:
         logger.warning("send_arm_home: planning failed", exc_info=True)
         if verbose:
@@ -622,8 +754,23 @@ def send_arm_home(
 
     if _waypoints is not None and len(_waypoints) == 0:
         if verbose:
-            print("  arm: no collision-safe home path — holding", flush=True)
+            _candidate_text = "; ".join(
+                _format_home_candidate_rejection(candidate)
+                for candidate in _home_path_report.get("candidates", [])
+                if not candidate.get("safe", False)
+            )
+            _qpos_text = np.array2string(np.rad2deg(current_qpos), precision=1, separator=",")
+            print(
+                "  arm: no validated home-path candidate — holding\n"
+                f"       current_qpos_deg={_qpos_text}\n"
+                f"       rejected={_candidate_text or 'no candidate diagnostics'}",
+                flush=True,
+            )
         return False
+
+    if verbose and _waypoints is not None:
+        _selected = _home_path_report.get("selected_candidate", "unknown")
+        print(f"  arm: home path selected={_selected} milestones={len(_waypoints)}", flush=True)
 
     _wrapped_home = (
         _waypoints[-1].copy()
@@ -658,7 +805,7 @@ def send_arm_home(
         _waypoints = np.concatenate([_waypoints, _tail], axis=0)
         if verbose:
             _desc = _describe_band_diff(_wrapped_home, home_qpos)
-            print(f"  arm: band-alignment appended ({len(_tail)} waypoints, {_desc})", flush=True)
+            print(f"  arm: band-alignment appended ({len(_tail)} milestones, {_desc})", flush=True)
 
     # ── Step 3: queue HOME_SENTINEL ──
     _request_id = time.monotonic_ns()
@@ -679,9 +826,14 @@ def send_arm_home(
         )
         _requested_at_s = time.monotonic()
         shared.arm_action_q.put((HOME_SENTINEL, _request), timeout=queue_timeout)
-    except Exception:
+    except Full:
         if verbose:
-            print("  arm_action_q put failed — arm may have already exited", flush=True)
+            print("  arm: action queue is full — homing request was not queued", flush=True)
+        return False
+    except Exception:
+        logger.warning("send_arm_home: failed to queue HOME request", exc_info=True)
+        if verbose:
+            print("  arm: failed to queue homing request", flush=True)
         return False
 
     # ── Step 4: wait for convergence ──

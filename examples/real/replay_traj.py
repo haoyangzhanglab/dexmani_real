@@ -9,7 +9,7 @@
 
    Data collection: use **vr_teleop_hand_record.py** (canonical entry point).
 
-Reads a DexMani episode (schema v8+) — either a **directory** (``data.h5``,
+Reads a DexMani episode (schema v3+) — either a **directory** (``data.h5``,
 ``depth.h5``, ``rgb.mp4``) or a **legacy single ``.h5`` file** — replays
 the recorded joint commands on the real robot, captures the actual robot state
 during replay, and evaluates how closely the replayed motion matches the
@@ -47,6 +47,9 @@ Usage:
     # Custom output directory (default: replay_results/<episode>_replay/)
     python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --output results/my_replay/
 
+    # Specify xArm controller IP (default: 192.168.1.111)
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --arm-ip 192.168.1.100
+
 Control:
     Q     clean exit (stop replay, save partial results)
     H     return arm to home position (post-replay prompt)
@@ -83,6 +86,7 @@ from dexmani_real.shm.shared_storage import (
     SharedStorage,
     SharedStorageConfig,
     hand_home_converge,
+    make_arm_action,
     read_arm_state,
     read_arm_state_dict,
     read_hand_state_dict,
@@ -667,11 +671,6 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
     print(f"Replay data saved: {npz_path}  ({replay_data['arm_qpos'].shape[0]} frames)")
 
 
-# ═══════════════════════════════════════════════ Helpers
-
-
-
-
 # ═══════════════════════════════════════════════ Main Replayer
 
 
@@ -805,7 +804,7 @@ class TrajectoryReplayer:
                 continue
             if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
                 return None
-            self.shared.arm_action_q.put({"qpos": waypoint})
+            self.shared.arm_action_q.put(make_arm_action(self.shared, waypoint))
             time.sleep(HOME_DT)
 
         # Settle
@@ -834,7 +833,7 @@ class TrajectoryReplayer:
                     continue
                 if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
                     return None
-                self.shared.arm_action_q.put({"qpos": _js_cmd})
+                self.shared.arm_action_q.put(make_arm_action(self.shared, _js_cmd))
                 time.sleep(HOME_DT)
             time.sleep(0.15)
 
@@ -887,7 +886,7 @@ class TrajectoryReplayer:
 
         # ── Pre-warm: send first target before rate limiter ──
         if np.all(np.isfinite(first_cmd)) and int(self.shared.safety_state.value) != int(SafetyState.FAULT):
-            self.shared.arm_action_q.put({"qpos": first_cmd})
+            self.shared.arm_action_q.put(make_arm_action(self.shared, first_cmd))
         if has_hand and self.traj.action_hand_joint is not None:
             write_hand_cmd(self.shared, self.traj.action_hand_joint[0])
         self._rate_mgr = RateManager(self.replay_hz)
@@ -999,7 +998,7 @@ class TrajectoryReplayer:
                 if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
                     logger.warning("Frame %d: safety FAULT — stopping replay", frame_idx)
                     break
-                self.shared.arm_action_q.put({"qpos": arm_cmd})
+                self.shared.arm_action_q.put(make_arm_action(self.shared, arm_cmd))
 
                 # ── Send hand command ──
                 if has_hand and hand_cmd is not None:
@@ -1039,8 +1038,6 @@ class TrajectoryReplayer:
                 if actual < T:
                     print(f"\nReplay stopped at frame {actual}/{T}")
                 return self._recorder.to_dict()
-
-        return None
 
     def _emergency_stop(self) -> None:
         """Signal all processes to stop via flags (no direct SDK access)."""
@@ -1179,6 +1176,9 @@ Control keys:
     if args.speed <= 0:
         print("Error: --speed must be positive")
         sys.exit(1)
+    if args.acc is not None and args.acc <= 0:
+        print("Error: --acc must be positive")
+        sys.exit(1)
     if args.speed > 1.5:
         print(f"Warning: --speed={args.speed}x may exceed hardware limits (inner loop runs at 30Hz)")
 
@@ -1244,167 +1244,175 @@ Control keys:
     # ── SharedStorage ──
     shm_cfg = SharedStorageConfig()
     shared = SharedStorage.create(prefix="dexmani_replay", config=shm_cfg)
-
-    # ── ArmLoop config: match replay acceleration ──
-    _joint_max_acc_rad = float(np.deg2rad(_replay_acc))
-    arm_cfg = ArmLoopConfig(
-        arm_ip=args.arm_ip,
-        joint_max_acc_rad_per_s2=_joint_max_acc_rad,
-    )
-    hand_available = traj.has_hand and not args.no_hand
-
-    # ── Spawn processes ──
-    procs: list[mp.Process] = [
-        mp.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm", daemon=True),
-    ]
-    if hand_available:
-        from dexmani_real.robot.hand_process import HandProcessConfig
-
-        hand_cfg = HandProcessConfig()
-        procs.append(mp.Process(target=_hand_loop, args=(shared, hand_cfg), name="hand", daemon=True))
-
-    for p in procs:
-        p.start()
-
-    # ── Wait for ready ──
-    transition(shared, SafetyState.DISARMED)
-
-    ready_checks: list[tuple[str, Any, float]] = [("arm", shared.arm_ready, 30)]
-    if hand_available:
-        ready_checks.append(("hand", shared.hand_ready, 30))
-
-    if not wait_subsystem_ready(shared, ready_checks, procs):
-        shutdown_processes(shared, procs)
-        return
-
-    print("  arm_loop: ready")
-    if hand_available:
-        print("  hand_loop: ready")
-
-    # All subsystems ready — transition to ARMED
-    transition(shared, SafetyState.ARMED)
-    print(f"Safety state: ARMED ({int(SafetyState.ARMED)})\n")
-
-    # ── Replay ──
-    replayer = TrajectoryReplayer(
-        traj,
-        shared,
-        speed=args.speed,
-        dry_run=False,
-        no_hand=args.no_hand,
-        max_frames=args.max_frames,
-    )
-
     try:
-        replayer.setup()
-        replay_data = replayer.run()
+        # ── ArmLoop config: match replay acceleration ──
+        _joint_max_acc_rad = float(np.deg2rad(_replay_acc))
+        arm_cfg = ArmLoopConfig(
+            arm_ip=args.arm_ip,
+            joint_max_acc_rad_per_s2=_joint_max_acc_rad,
+        )
+        hand_available = traj.has_hand and not args.no_hand
 
-        # ── Compute metrics ──
-        if replay_data is not None and replay_data["arm_qpos"].shape[0] > 0 and eval_available:
-            print("\nComputing consistency metrics...")
-            metrics = compute_metrics(
-                original_arm_qpos=traj.arm_qpos,
-                replay_arm_qpos=replay_data["arm_qpos"],
-                original_arm_ee=traj.arm_ee,
-                replay_arm_ee_pos=replay_data["eef_pos"],
-                replay_arm_ee_rot6d=replay_data["eef_rot6d"],
-                fps=traj.fps,
-                original_hand_qpos=traj.hand_qpos,
-                replay_hand_qpos=replay_data.get("hand_qpos"),
-                h5_path=traj.h5_path,
-                task_label=traj.task_label,
-                speed_factor=args.speed,
-            )
+        # ── Spawn processes ──
+        procs: list[mp.Process] = [
+            mp.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm", daemon=True),
+        ]
+        if hand_available:
+            from dexmani_real.robot.hand_process import HandProcessConfig
 
-            if "arm_tracking_error" in replay_data:
-                track_err = replay_data["arm_tracking_error"]
-                valid = track_err[np.isfinite(track_err)]
-                if len(valid) > 0:
-                    metrics.arm_tracking_error_mean_deg = float(np.rad2deg(np.mean(valid)))
-                    metrics.arm_tracking_error_p95_deg = float(np.rad2deg(np.percentile(valid, 95)))
-                    metrics.arm_tracking_error_max_deg = float(np.rad2deg(np.max(valid)))
+            hand_cfg = HandProcessConfig()
+            procs.append(mp.Process(target=_hand_loop, args=(shared, hand_cfg), name="hand", daemon=True))
 
-            print("\n" + "=" * 60)
-            print("Consistency Evaluation")
-            print("=" * 60)
-            print(f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original")
-            print(
-                f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  (overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
-            )
-            print(
-                f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  (overall: {metrics.arm_joint_rmse_overall_deg:.3f} deg)"
-            )
-            if metrics.eef_pos_error_mean_mm > 0:
-                print(
-                    f"  EEF pos error:  mean={metrics.eef_pos_error_mean_mm:.1f}mm  max={metrics.eef_pos_error_max_mm:.1f}mm  rmse={metrics.eef_pos_error_rmse_mm:.1f}mm"
-                )
-            if metrics.eef_rot_error_mean_deg > 0:
-                print(
-                    f"  EEF rot error:  mean={metrics.eef_rot_error_mean_deg:.2f}°  max={metrics.eef_rot_error_max_deg:.2f}°"
-                )
-            if metrics.hand_joint_mae_overall_deg is not None:
-                print(f"  Hand joint MAE: {metrics.hand_joint_mae_overall_deg:.3f} deg")
-            print(f"  Tracking lag:  {metrics.tracking_lag_frames} frames ({metrics.tracking_lag_seconds:.3f}s)")
-            if metrics.arm_tracking_error_mean_deg > 0:
-                print(
-                    f"  Replay tracking error (cmd vs actual): "
-                    f"mean={metrics.arm_tracking_error_mean_deg:.2f}°  "
-                    f"p95={metrics.arm_tracking_error_p95_deg:.2f}°  "
-                    f"max={metrics.arm_tracking_error_max_deg:.2f}°"
-                )
-            print("=" * 60)
+        for p in procs:
+            p.start()
 
-            save_results(metrics, replay_data, output_dir)
-        elif replay_data is None:
-            print("\nNo replay data collected (replay interrupted before any frames captured).")
-        else:
-            print("\nSkipping metrics: no replay data available")
-
-    except (ConnectionError, RuntimeError) as e:
-        print(f"\nSetup failed: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    finally:
-        # ── Post-loop: offer return-to-home via HOME_SENTINEL ──
-        # Skip home prompt if emergency-stopped (arm_loop already dead)
-        if not shared.error_state.value and not replayer._estopped:
-            print("\nPress H to return_home, or Q to exit...")
-            kb = KeyboardHandler()
-            kb.start()
-            try:
-                _deadline = time.perf_counter() + 60.0
-                while time.perf_counter() < _deadline:
-                    sigs = {s for s in kb.poll(timeout=0.1)}
-                    if ControlSignal.QUIT in sigs or ControlSignal.EMERGENCY_STOP in sigs:
-                        break
-                    if ControlSignal.HOME in sigs:
-                        print("\nH: return_home")
-
-                        # ── Step 1: Hand home first (before arm moves) ──
-                        if hand_available:
-                            from dexmani_real.config.defaults import hand as _hand_defaults
-
-                            _HAND_HOME = np.deg2rad(np.array(_hand_defaults.home_qpos_deg, dtype=np.float64))
-                            hand_home_converge(shared, _HAND_HOME, heartbeat=False, check_is_running=False, verbose=True)
-
-                        # ── Step 2: Arm home (collision-checked path) ──
-                        _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                        from dexmani_real.config.defaults import arm as _arm_defaults
-
-                        send_arm_home(
-                            shared, _home_arr,
-                            planner=replayer._planner,
-                            table_z_surface_m=_arm_defaults.table_z_surface_m,
-                            heartbeat=False, verbose=True,
-                        )
-                        print("Press Q to exit...")
-            finally:
-                kb.stop()
-
+        # ── Wait for ready ──
         transition(shared, SafetyState.DISARMED)
-        replayer.shutdown()
-        shutdown_processes(shared, procs)
+
+        ready_checks: list[tuple[str, Any, float]] = [("arm", shared.arm_ready, 30)]
+        if hand_available:
+            ready_checks.append(("hand", shared.hand_ready, 30))
+
+        if not wait_subsystem_ready(shared, ready_checks, procs):
+            shutdown_processes(shared, procs)
+            return
+
+        print("  arm_loop: ready")
+        if hand_available:
+            print("  hand_loop: ready")
+
+        # All subsystems ready — transition to ARMED
+        transition(shared, SafetyState.ARMED)
+        print(f"Safety state: ARMED ({int(SafetyState.ARMED)})\n")
+
+        # ── Replay ──
+        replayer = TrajectoryReplayer(
+            traj,
+            shared,
+            speed=args.speed,
+            dry_run=False,
+            no_hand=args.no_hand,
+            max_frames=args.max_frames,
+        )
+
+        try:
+            replayer.setup()
+            replay_data = replayer.run()
+
+            # ── Compute metrics ──
+            if replay_data is not None and replay_data["arm_qpos"].shape[0] > 0 and eval_available:
+                print("\nComputing consistency metrics...")
+                metrics = compute_metrics(
+                    original_arm_qpos=traj.arm_qpos,
+                    replay_arm_qpos=replay_data["arm_qpos"],
+                    original_arm_ee=traj.arm_ee,
+                    replay_arm_ee_pos=replay_data["eef_pos"],
+                    replay_arm_ee_rot6d=replay_data["eef_rot6d"],
+                    fps=traj.fps,
+                    original_hand_qpos=traj.hand_qpos,
+                    replay_hand_qpos=replay_data.get("hand_qpos"),
+                    h5_path=traj.h5_path,
+                    task_label=traj.task_label,
+                    speed_factor=args.speed,
+                )
+
+                if "arm_tracking_error" in replay_data:
+                    track_err = replay_data["arm_tracking_error"]
+                    valid = track_err[np.isfinite(track_err)]
+                    if len(valid) > 0:
+                        metrics.arm_tracking_error_mean_deg = float(np.rad2deg(np.mean(valid)))
+                        metrics.arm_tracking_error_p95_deg = float(np.rad2deg(np.percentile(valid, 95)))
+                        metrics.arm_tracking_error_max_deg = float(np.rad2deg(np.max(valid)))
+
+                print("\n" + "=" * 60)
+                print("Consistency Evaluation")
+                print("=" * 60)
+                print(f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original")
+                print(
+                    f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  (overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
+                )
+                print(
+                    f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  (overall: {metrics.arm_joint_rmse_overall_deg:.3f} deg)"
+                )
+                if metrics.eef_pos_error_mean_mm > 0:
+                    print(
+                        f"  EEF pos error:  mean={metrics.eef_pos_error_mean_mm:.1f}mm  max={metrics.eef_pos_error_max_mm:.1f}mm  rmse={metrics.eef_pos_error_rmse_mm:.1f}mm"
+                    )
+                if metrics.eef_rot_error_mean_deg > 0:
+                    print(
+                        f"  EEF rot error:  mean={metrics.eef_rot_error_mean_deg:.2f}°  max={metrics.eef_rot_error_max_deg:.2f}°"
+                    )
+                if metrics.hand_joint_mae_overall_deg is not None:
+                    print(f"  Hand joint MAE: {metrics.hand_joint_mae_overall_deg:.3f} deg")
+                print(f"  Tracking lag:  {metrics.tracking_lag_frames} frames ({metrics.tracking_lag_seconds:.3f}s)")
+                if metrics.arm_tracking_error_mean_deg > 0:
+                    print(
+                        f"  Replay tracking error (cmd vs actual): "
+                        f"mean={metrics.arm_tracking_error_mean_deg:.2f}°  "
+                        f"p95={metrics.arm_tracking_error_p95_deg:.2f}°  "
+                        f"max={metrics.arm_tracking_error_max_deg:.2f}°"
+                    )
+                print("=" * 60)
+
+                save_results(metrics, replay_data, output_dir)
+            elif replay_data is None:
+                print("\nNo replay data collected (replay interrupted before any frames captured).")
+            else:
+                print("\nSkipping metrics: no replay data available")
+
+        except (ConnectionError, RuntimeError) as e:
+            print(f"\nSetup failed: {e}")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+        finally:
+            # ── Post-loop: offer return-to-home via HOME_SENTINEL ──
+            # Skip home prompt if emergency-stopped (arm_loop already dead)
+            if not shared.error_state.value and not replayer._estopped:
+                print("\nPress H to return_home, or Q to exit...")
+                kb = KeyboardHandler()
+                kb.start()
+                try:
+                    _deadline = time.perf_counter() + 60.0
+                    while time.perf_counter() < _deadline:
+                        sigs = {s for s in kb.poll(timeout=0.1)}
+                        if ControlSignal.QUIT in sigs or ControlSignal.EMERGENCY_STOP in sigs:
+                            break
+                        if ControlSignal.HOME in sigs:
+                            print("\nH: return_home")
+
+                            # ── Step 1: Hand home first (before arm moves) ──
+                            if hand_available:
+                                from dexmani_real.config.defaults import hand as _hand_defaults
+
+                                _HAND_HOME = np.deg2rad(np.array(_hand_defaults.home_qpos_deg, dtype=np.float64))
+                                hand_home_converge(shared, _HAND_HOME, heartbeat=False, check_is_running=False, verbose=True)
+
+                            # ── Step 2: Arm home (collision-checked path) ──
+                            _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
+                            from dexmani_real.config.defaults import arm as _arm_defaults
+
+                            send_arm_home(
+                                shared, _home_arr,
+                                planner=replayer._planner,
+                                table_z_surface_m=_arm_defaults.table_z_surface_m,
+                                heartbeat=False, verbose=True,
+                            )
+                            print("Press Q to exit...")
+                finally:
+                    kb.stop()
+
+            transition(shared, SafetyState.DISARMED)
+            replayer.shutdown()
+            shutdown_processes(shared, procs)
+    finally:
+        # Best-effort cleanup on unexpected exceptions.
+        # On normal paths shutdown_processes already calls close(); calling
+        # close() again is safe (FileNotFoundError on unlink is caught).
+        try:
+            shared.close()
+        except Exception:
+            pass
 
     print("Done.")
 

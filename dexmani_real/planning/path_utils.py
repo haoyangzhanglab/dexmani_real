@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -102,18 +102,18 @@ def plan_joint_home_path(
     *,
     table_z_surface_m: float | None = None,
     hand_safety_margin_m: float | None = None,
+    report: dict[str, Any] | None = None,
 ) -> np.ndarray | None:
     """Plan a collision-safe joint-space path from *qpos* to *home_qpos*.
 
     Returns:
         * ``None`` — arm is already at home (delta < 0.5°); caller should
           send ``home_qpos`` directly (no-op).
-        * ``(D, 7)`` dense waypoint array (D ≥ 2) — collision-safe path found.
-        * ``(0, 7)`` empty array — **no safe path exists**; caller MUST NOT
-          fall back to linear interpolation.  The arm should hold position
-          and the operator should be alerted.
-
-    Raises no exceptions.
+        * ``(M, 7)`` execution milestones (normally 2–3) — every segment has
+          been densely sampled and collision-checked at ≤1° joint increments.
+        * ``(0, 7)`` empty array — no candidate passed all configured safety
+          checks; caller MUST NOT fall back to unchecked interpolation.  The
+          arm should hold position and the operator should be alerted.
 
     This function only reads the collision model — it does NOT need a live
     XArm7 connection.
@@ -133,7 +133,16 @@ def plan_joint_home_path(
                             lowest hand collision surface.
                             Defaults to ``arm.hand_safety_margin_m`` (0.05 m)
                             when ``None``.  Used with *table_z_surface_m*.
+        report:             Optional mutable diagnostics dictionary. It is
+                            cleared and populated with every attempted path and
+                            its first rejection reason.
     """
+    if report is None:
+        report = {}
+    else:
+        report.clear()
+    report["candidates"] = []
+
     if hand_safety_margin_m is None:
         hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
 
@@ -141,7 +150,7 @@ def plan_joint_home_path(
     # Prevents interpolate_waypoints from generating up to 360° of unnecessary
     # rotation for equivalent joints (J1/J3/J5/J7 on xArm7, 720° range).
     # Wrapping home→qpos (not qpos→home) keeps all waypoints in the arm's
-    # current encoder band — critical because Mode 6 firmware plans from the
+    # current encoder band — critical because the firmware plans from the
     # physical encoder position to each waypoint target.
     if planner is not None:
         _home = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
@@ -157,26 +166,45 @@ def plan_joint_home_path(
         )
         delta = float(np.max(np.abs(qpos - _home)))
     if delta < np.deg2rad(0.5):
+        report["status"] = "already_home"
         return None  # caller can send home_qpos directly
 
     have_collision = planner is not None and planner.planning_profile.check_self_collision
     _check_table = table_z_surface_m is not None and planner is not None
 
-    def _check_safe(path: np.ndarray) -> bool:
+    def _check_safe(path: np.ndarray, candidate_name: str) -> bool:
+        candidate: dict[str, Any] = {
+            "name": candidate_name,
+            "sample_count": len(path),
+        }
+        report["candidates"].append(candidate)
+
         # ── Self-collision check (Pinocchio mesh-based) ──
         if have_collision:
             result = planner.ik_mgr.check_path_collisions(path)  # type: ignore[union-attr]
             if result.get("path_self_collision", False):
+                candidate.update(
+                    safe=False,
+                    reason="self_collision",
+                    collision_waypoint_index=result.get("collision_waypoint_index"),
+                    collision=result.get("collision"),
+                )
                 return False
 
         # Homing bypasses planner.validate_path(), so apply the same configured
         # world-frame EEF workspace boundary explicitly to every segment.
         if planner is not None:
             try:
-                for _start, _end in zip(path[:-1], path[1:]):
+                for _segment_index, (_start, _end) in enumerate(zip(path[:-1], path[1:])):
                     if not planner.is_workspace_segment_safe(_start, _end):
+                        candidate.update(
+                            safe=False,
+                            reason="workspace",
+                            workspace_segment_index=_segment_index,
+                        )
                         return False
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError) as exc:
+                candidate.update(safe=False, reason="workspace_check_error", detail=str(exc))
                 return False
 
         # ── Table clearance check (orientation-aware hand link frames) ──
@@ -184,24 +212,64 @@ def plan_joint_home_path(
         # the actual cached hand pose.  The margin covers mesh extent below a
         # frame origin; this avoids the old, orientation-blind EEF-z estimate.
         if _check_table:
-            for _wp in path:
+            _minimum_clearance_m = float("inf")
+            for _waypoint_index, _wp in enumerate(path):
                 try:
                     _hand_min_z = planner.collision_model.minimum_hand_frame_z(_wp)  # type: ignore[union-attr]
-                except Exception:
+                except Exception as exc:
+                    candidate.update(
+                        safe=False,
+                        reason="table_check_error",
+                        table_waypoint_index=_waypoint_index,
+                        detail=str(exc),
+                    )
                     return False  # FK/frame failure → treat as unsafe
                 if not np.isfinite(_hand_min_z):
+                    candidate.update(
+                        safe=False,
+                        reason="table_check_nonfinite",
+                        table_waypoint_index=_waypoint_index,
+                    )
                     return False
-                if _hand_min_z - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
+                _clearance_m = _hand_min_z - hand_safety_margin_m - table_z_surface_m  # type: ignore[operator]
+                _minimum_clearance_m = min(_minimum_clearance_m, _clearance_m)
+                if _clearance_m < 0.0:
+                    candidate.update(
+                        safe=False,
+                        reason="table_clearance",
+                        table_waypoint_index=_waypoint_index,
+                        hand_frame_min_z_m=float(_hand_min_z),
+                        clearance_m=float(_clearance_m),
+                    )
                     return False  # hand may collide with table
+            candidate["minimum_table_clearance_m"] = _minimum_clearance_m
+        candidate["safe"] = True
         return True
 
-    # ── Attempt 1: direct linear joint-space interpolation ──
-    path = interpolate_waypoints(np.stack([qpos, _home]), np.deg2rad(1.0))
-    if _check_safe(path):
-        return path
+    def _validate_milestones(milestones: np.ndarray, candidate_name: str) -> bool:
+        samples = interpolate_waypoints(milestones, np.deg2rad(1.0))
+        return _check_safe(samples, candidate_name)
 
-    if not have_collision and not _check_table:
-        return None
+    def _unique_milestones(*points: np.ndarray) -> np.ndarray:
+        unique = [np.asarray(points[0], dtype=np.float64)]
+        for point in points[1:]:
+            point = np.asarray(point, dtype=np.float64)
+            if float(np.max(np.abs(point - unique[-1]))) > 1e-9:
+                unique.append(point)
+        return np.asarray(unique, dtype=np.float64)
+
+    # Collision validation and execution intentionally use different
+    # representations.  The dense samples validate the whole joint-space
+    # segment; the Mode 0 MoveJoint executor receives only its endpoints and
+    # lets the firmware generate the point-to-point trajectory.  Sending every
+    # 1° validation sample would add arm-side interpolation and force repeated
+    # deceleration at artificial stops.
+
+    # ── Attempt 1: direct linear joint-space segment ──
+    direct_milestones = np.stack([qpos, _home])
+    if _validate_milestones(direct_milestones, "direct"):
+        report.update(status="safe", selected_candidate="direct")
+        return direct_milestones
 
     # ── Attempt 2: two-stage detour (proximal → wrist) ──
     # Move shoulder/elbow joints to home first while keeping wrist fixed,
@@ -209,15 +277,52 @@ def plan_joint_home_path(
     mid = qpos.copy()
     mid[_PROXIMAL_MASK] = _home[_PROXIMAL_MASK]
 
-    path1 = interpolate_waypoints(np.stack([qpos, mid]), np.deg2rad(1.0))
-    path2_full = interpolate_waypoints(np.stack([mid, _home]), np.deg2rad(1.0))
-    path2 = path2_full[1:]  # skip mid (already at end of path1)
+    proximal_first = _unique_milestones(qpos, mid, _home)
+    if _validate_milestones(proximal_first, "proximal_first"):
+        report.update(status="safe", selected_candidate="proximal_first")
+        return proximal_first
 
-    staged = np.concatenate([path1, path2], axis=0) if len(path2) > 0 else path1
-    if _check_safe(staged):
-        return staged
+    # The opposite ordering is materially different: from some extended/high
+    # poses, bringing the wrist close to its home orientation before sweeping
+    # the shoulder avoids the hand/body or hand/table intersection created by
+    # the proximal-first heuristic.  It receives exactly the same dense checks.
+    distal_mid = qpos.copy()
+    distal_mid[~_PROXIMAL_MASK] = _home[~_PROXIMAL_MASK]
+    distal_first = _unique_milestones(qpos, distal_mid, _home)
+    if _validate_milestones(distal_first, "distal_first"):
+        report.update(status="safe", selected_candidate="distal_first")
+        return distal_first
 
-    return np.empty((0, 7), dtype=np.float64)  # sentinel: no safe path — caller MUST hold position
+    # Straight-line heuristics are not a proof that no path exists. Use the
+    # project's bounded joint-space RRT as a final candidate, then re-run the
+    # same 19-DOF/table checks before publishing any firmware milestones.
+    if planner is not None and hasattr(planner, "plan_joint_qpos_path"):
+        try:
+            planned = planner.plan_joint_qpos_path(_home, qpos, planning_time_s=0.5)
+        except (ValueError, RuntimeError) as exc:
+            report["candidates"].append(
+                {"name": "joint_qpos_rrt", "safe": False, "reason": "planner_error", "detail": str(exc)}
+            )
+        else:
+            if planned.success and planned.qpos_path is not None and len(planned.qpos_path) >= 2:
+                rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
+                if float(np.max(np.abs(rrt_milestones[-1] - _home))) > 1e-6:
+                    rrt_milestones = np.concatenate([rrt_milestones, _home.reshape(1, 7)], axis=0)
+                if _validate_milestones(rrt_milestones, "joint_qpos_rrt"):
+                    report.update(status="safe", selected_candidate="joint_qpos_rrt")
+                    return rrt_milestones
+            else:
+                report["candidates"].append(
+                    {
+                        "name": "joint_qpos_rrt",
+                        "safe": False,
+                        "reason": "planner_failed",
+                        "detail": planned.reason,
+                    }
+                )
+
+    report["status"] = "unsafe"
+    return np.empty((0, 7), dtype=np.float64)  # no validated candidate — caller MUST hold position
 
 
 def plan_band_alignment_path(
@@ -234,13 +339,14 @@ def plan_band_alignment_path(
     equivalent joints (J1/J3/J5/J7) to match the current encoder band — the
     arm is physically at the home pose but the encoder values differ.
 
-    This function generates a dense 1°/step joint-space path that rotates
-    only the band-mismatched joints through exactly one 2π wrap, then checks
-    self-collision, workspace bounds, and orientation-aware hand/table clearance.
+    This function densely validates the 2π joint-space segment at 1°/step,
+    then returns only its endpoints for Mode 0 MoveJoint execution.  Only the
+    band-mismatched equivalent joints move; self-collision, workspace bounds,
+    and orientation-aware hand/table clearance are checked on every sample.
 
     Returns:
         * ``None`` — no alignment needed (*wrapped_home* ≈ *canonical_home*).
-        * ``(D, 7)`` dense waypoint array (D ≥ 2) — safe alignment path.
+        * ``(2, 7)`` execution milestones — densely validated safe alignment.
         * ``(0, 7)`` empty array — alignment needed but **no safe path**;
           the caller SHOULD keep the arm at *wrapped_home*.
     """
@@ -290,4 +396,4 @@ def plan_band_alignment_path(
             if _hand_min_z - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
                 return np.empty((0, 7), dtype=np.float64)
 
-    return path
+    return np.stack([wrapped_home, canonical_home])

@@ -1,9 +1,0 @@
-# Project-local Codex defaults. Effective in new trusted-project sessions.
-sandbox_mode = "workspace-write"
-approval_policy = "on-request"
-approvals_reviewer = "auto_review"
-web_search = "live"
-
-[sandbox_workspace_write]
-writable_roots = ["/home/zhanghaoyang/Desktop/dexmani_real"]
-network_access = true
