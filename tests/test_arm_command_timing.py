@@ -11,7 +11,13 @@ import pytest
 from dexmani_real.config.defaults import KeyboardTeleopParams
 from dexmani_real.policy.action_protocol import ARM_COMMAND_DTYPE
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.arm_loop import ArmLoopConfig, _parse_arm_action_metadata, _recover_c24_measured_hold
+from dexmani_real.robot.arm_loop import (
+    ArmLoopConfig,
+    _decode_joint_state_feedback,
+    _parse_arm_action_metadata,
+    _recover_c24_measured_hold,
+    _update_state_read_watchdog,
+)
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE
 from dexmani_real.teleop.keyboard import (
@@ -20,6 +26,7 @@ from dexmani_real.teleop.keyboard import (
     ReleaseMotionTracer,
     eef_delta_from_keys,
 )
+from dexmani_real.utils.retry import RetryCounter
 
 
 class _Keys:
@@ -95,6 +102,29 @@ def test_c24_recovery_fails_before_sending_an_invalid_measurement() -> None:
         _recover_c24_measured_hold(arm, ArmLoopConfig())
 
     arm.set_servo_angle.assert_not_called()
+
+
+def test_arm_feedback_boundary_and_watchdog_reject_persistent_bad_reads() -> None:
+    qpos, qvel, tau = _decode_joint_state_feedback(
+        0,
+        [np.zeros(7), np.ones(7), np.full(7, 2.0)],
+    )
+    np.testing.assert_array_equal(qpos, np.zeros(7))
+    np.testing.assert_array_equal(qvel, np.ones(7))
+    np.testing.assert_array_equal(tau, np.full(7, 2.0))
+
+    with pytest.raises(RuntimeError, match="SDK code"):
+        _decode_joint_state_feedback(1, [])
+    with pytest.raises(RuntimeError, match="invalid qpos"):
+        _decode_joint_state_feedback(0, [np.zeros(6)])
+    with pytest.raises(RuntimeError, match="invalid qvel"):
+        _decode_joint_state_feedback(0, [np.zeros(7), np.full(7, np.nan)])
+
+    watchdog = RetryCounter(max_consecutive=2, label="arm_state")
+    assert not _update_state_read_watchdog(watchdog, succeeded=False)
+    assert _update_state_read_watchdog(watchdog, succeeded=False)
+    assert not _update_state_read_watchdog(watchdog, succeeded=True)
+    assert watchdog.count == 0
 
 
 def test_motion_latch_emits_one_release_edge() -> None:

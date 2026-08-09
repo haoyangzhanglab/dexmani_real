@@ -108,23 +108,63 @@ def test_recorder_io_round_trip_over_bounded_shared_ring(tmp_path: Path) -> None
             "ik_ok": True,
             "retarget_ok": True,
         }
+        state_time_s = time.perf_counter()
+        camera_frame = {
+            "rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+            "depth": np.zeros((8, 8), dtype=np.uint16),
+            "pointcloud": np.zeros((2, 6), dtype=np.float32),
+            "camera_fresh": True,
+            "pointcloud_valid": False,
+            "camera_health": 0,
+        }
         assert client.add_frame(
-            _state(time.perf_counter()),
+            _state(state_time_s),
             RobotAction(np.zeros(7), np.zeros(12)),
             {
                 "wrist_pos": np.zeros(3),
                 "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
                 "landmarks": np.zeros((21, 3)),
             },
-            camera_frame={
-                "rgb": np.zeros((8, 8, 3), dtype=np.uint8),
-                "depth": np.zeros((8, 8), dtype=np.uint16),
-                "pointcloud": np.zeros((2, 6), dtype=np.float32),
-                "camera_fresh": True,
-                "pointcloud_valid": False,
-                "camera_health": 0,
-            },
+            camera_frame=camera_frame,
             signals=signals,
+            arm_qpos_sent=np.zeros(7),
+        )
+        held_signals = dict(signals)
+        held_signals.update(
+            {
+                "observation_id": 2,
+                "observation_anchor_monotonic_ns": now_ns + 100_000_000,
+                "arm_source_monotonic_ns": source_ns + 100_000_000,
+                "hand_source_monotonic_ns": source_ns + 100_000_000,
+                "vr_source_monotonic_ns": source_ns + 100_000_000,
+                "camera_source_monotonic_ns": source_ns + 100_000_000,
+                "arm_publish_monotonic_ns": publish_ns + 100_000_000,
+                "hand_publish_monotonic_ns": publish_ns + 100_000_000,
+                "vr_publish_monotonic_ns": publish_ns + 100_000_000,
+                "camera_publish_monotonic_ns": publish_ns + 100_000_000,
+                "observation_source_receive_monotonic_ns": np.full(4, receive_ns + 100_000_000, dtype=np.uint64),
+                "tactile_source_monotonic_ns": source_ns + 100_000_000,
+                "action_id": 0,
+                "action_chunk_id": 0,
+                "action_created_monotonic_ns": 0,
+                "action_target_monotonic_ns": 0,
+                "action_valid_until_monotonic_ns": 0,
+                "action_queued": False,
+                "action_committed": False,
+                "held": True,
+                "ik_ok": False,
+            }
+        )
+        assert client.add_frame(
+            _state(state_time_s + 0.1),
+            RobotAction(np.zeros(7), np.zeros(12)),
+            {
+                "wrist_pos": np.zeros(3),
+                "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+                "landmarks": np.zeros((21, 3)),
+            },
+            camera_frame=camera_frame,
+            signals=held_signals,
             arm_qpos_sent=np.zeros(7),
         )
         client.stop_episode(success=True)
@@ -137,7 +177,8 @@ def test_recorder_io_round_trip_over_bounded_shared_ring(tmp_path: Path) -> None
         assert len(episode_paths) == 1
         with EpisodeReader(episode_paths[0]) as reader:
             assert reader.validity is ValidityState.VALID
-            assert reader.h5f["observation_id"][:].tolist() == [1]
+            assert reader.h5f["observation_id"][:].tolist() == [1, 2]
+            assert reader.h5f["action_id"][:].tolist() == [1, 0]
 
         with h5py.File(episode_paths[0] / "data.h5", "r+") as data_file:
             original_tactile_source = int(data_file["tactile_source_monotonic_ns"][0])

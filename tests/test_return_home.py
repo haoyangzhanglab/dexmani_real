@@ -10,7 +10,7 @@ import numpy as np
 
 from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.types import PathResult
-from dexmani_real.policy.action_protocol import COMMIT_DTYPE, make_command_frame
+from dexmani_real.policy.action_protocol import COMMIT_DTYPE, AckStatus, make_command_frame
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.vr_teleop_policy import _do_teleop_home
 from dexmani_real.robot.arm_loop import ArmLoopConfig, _planned_homing
@@ -548,6 +548,117 @@ def test_hand_runtime_counts_boolean_command_rejection() -> None:
 
     hand_instance.send_action.assert_called_once()
     hand_instance.clear_error.assert_called_once()
+
+
+def test_hand_runtime_prepares_next_chunk_step_in_apply_tick() -> None:
+    now_ns = time.monotonic_ns()
+
+    def candidate(action_id: int, target_offset_ns: int, step_index: int) -> ActionCandidate:
+        return ActionCandidate(
+            observation_id=1,
+            session_generation=1,
+            policy_epoch=1,
+            action_id=action_id,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns + target_offset_ns,
+            valid_until_monotonic_ns=now_ns + 1_000_000_000,
+            arm_qpos=None,
+            hand_qpos=np.full(12, action_id / 10.0),
+            chunk_id=1,
+            step_index=step_index,
+        )
+
+    commands = [
+        make_command_frame(candidate(1, 20_000_000, 0), actuator="hand"),
+        make_command_frame(candidate(2, 80_000_000, 1), actuator="hand"),
+    ]
+
+    def commit_for(command: np.ndarray) -> np.ndarray:
+        commit = np.zeros(1, dtype=COMMIT_DTYPE)
+        for name in (
+            "session_generation",
+            "policy_epoch",
+            "observation_id",
+            "action_id",
+            "chunk_id",
+            "step_index",
+            "created_monotonic_ns",
+            "target_monotonic_ns",
+            "valid_until_monotonic_ns",
+            "is_hold",
+        ):
+            commit[name][0] = command[name][0]
+        commit["committed_monotonic_ns"][0] = now_ns + 1
+        return commit
+
+    commits = [commit_for(command) for command in commands]
+    command_reads = 0
+    commit_reads = 0
+
+    def read_command():
+        nonlocal command_reads
+        if command_reads >= len(commands):
+            return None
+        result = (commands[command_reads], 0.0, command_reads + 1)
+        command_reads += 1
+        return result
+
+    def read_commit():
+        nonlocal commit_reads
+        if commit_reads >= len(commits):
+            return None
+        result = (commits[commit_reads], 0.0, commit_reads + 1)
+        commit_reads += 1
+        return result
+
+    shared = SimpleNamespace(
+        is_running=_Value(True),
+        error_state=_Value(False),
+        estop_request=_Value(False),
+        safety_state=_Value(int(SafetyState.ARMED)),
+        hand_heartbeat_s=_Value(0.0),
+        hand_ready=Event(),
+        hand_cmd_ring=Mock(read_latest=Mock(side_effect=read_command)),
+        hand_state_ring=Mock(),
+        hand_tactile_ring=Mock(),
+        hand_ack_ring=Mock(),
+        action_commit_ring=Mock(read_latest=Mock(side_effect=read_commit)),
+        policy_epoch=_Value(1),
+        session_generation=_Value(1),
+    )
+    hand_instance = Mock()
+    hand_instance.config = SimpleNamespace(home_qpos=None, qpos_min=np.full(12, -1.0), qpos_max=np.full(12, 1.0))
+    hand_instance.connect.return_value = True
+    hand_instance.send_action.return_value = True
+    hand_instance.connected_flag = True
+    hand_instance.error_state = False
+    hand_instance.last_action_code = 0
+    hand_instance.tactile_calibrated = False
+    hand_instance.feedback_bound_stats = {"checks": 0}
+    hand_instance.stop.return_value = True
+    state_reads = 0
+
+    def get_state(*_args, **_kwargs):
+        nonlocal state_reads
+        state_reads += 1
+        if state_reads >= 4:
+            shared.is_running.value = False
+        return {"qpos": np.zeros(12)}
+
+    hand_instance.get_state.side_effect = get_state
+
+    with patch("dexmani_real.robot.xhand.XHand", return_value=hand_instance):
+        hand_loop(shared, HandProcessConfig(loop_hz=20.0))
+
+    assert hand_instance.send_action.call_count == 2
+    np.testing.assert_allclose(hand_instance.send_action.call_args_list[0].args[0], np.full(12, 0.1))
+    np.testing.assert_allclose(hand_instance.send_action.call_args_list[1].args[0], np.full(12, 0.2))
+    prepared_ids = [
+        int(call.args[0]["action_id"][0])
+        for call in shared.hand_ack_ring.write.call_args_list
+        if int(call.args[0]["status"][0]) == int(AckStatus.PREPARED)
+    ]
+    assert prepared_ids == [1, 2]
 
 
 def test_policy_home_syncs_hand_and_reloads_fresh_arm_state() -> None:

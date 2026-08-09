@@ -349,9 +349,17 @@ class EpisodeReader:
         action_valid_until_ns = np.asarray(self._h5f["action_valid_until_monotonic_ns"][:], dtype=np.uint64)
         queued = np.asarray(self._h5f["flag_action_queued"][:], dtype=bool)
         committed = np.asarray(self._h5f["flag_action_committed"][:], dtype=bool)
-        # Explicit invalid observations are legal, but no source sample may
-        # masquerade as v15 provenance with both identities left at zero.
-        if np.any((observation_ids[sample_valid] == 0) | (action_ids[sample_valid] == 0)):
+        held = (
+            np.asarray(self._h5f["flag_held"][:], dtype=bool)
+            if "flag_held" in self._h5f
+            else np.zeros(frame_count, dtype=bool)
+        )
+        # A held source sample may intentionally publish no new action.  Active
+        # samples still require an action identity, and protocol flags may never
+        # claim queue/commit progress for the zero-action sentinel.
+        if np.any(observation_ids[sample_valid] == 0) or np.any(sample_valid & ~held & (action_ids == 0)):
+            return ValidityState.INVALID
+        if np.any((queued | committed) & (action_ids == 0)):
             return ValidityState.INVALID
         action_timing_valid = (
             (action_created_ns > 0)
@@ -370,11 +378,6 @@ class EpisodeReader:
             values = np.asarray(self._h5f[name][:], dtype=np.float64)
             if values.shape != expected_shape or np.any(~np.isfinite(values[sample_valid])):
                 return ValidityState.INVALID
-        held = (
-            np.asarray(self._h5f["flag_held"][:], dtype=bool)
-            if "flag_held" in self._h5f
-            else np.zeros(frame_count, dtype=bool)
-        )
         if np.any(sample_valid & ~held & ~committed):
             return ValidityState.INVALID
         return ValidityState.VALID

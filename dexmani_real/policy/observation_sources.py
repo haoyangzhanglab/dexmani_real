@@ -226,15 +226,35 @@ class SharedObservationSource:
             )
         return frames
 
+    def _camera_generation_at(self, anchor_monotonic_ns: int) -> int:
+        """Return the newest generation with metadata causal to this anchor."""
+        generation = self._builder.camera_generation
+        for header, ring_publish_ns, _sequence in self.shared.camera_ring.get_last_metadata(
+            self.shared.camera_ring.maxlen
+        ):
+            record = header[0]
+            source_ns = int(record["source_monotonic_ns"])
+            receive_ns = int(record["receive_monotonic_ns"])
+            publish_ns = int(record["publish_monotonic_ns"]) or int(ring_publish_ns)
+            if (
+                source_ns > 0
+                and source_ns <= receive_ns <= publish_ns <= anchor_monotonic_ns
+                and not bool(record["duplicate"])
+            ):
+                generation = max(generation, int(record["camera_generation"]))
+        return generation
+
     def build(self, *, anchor_monotonic_ns: int) -> ObservationSnapshot:
         frames: dict[str, list[CausalFrame]] = {}
-        camera_generation = self._builder.camera_generation
+        camera_generation = (
+            self._camera_generation_at(anchor_monotonic_ns)
+            if any(modality.name in _CAMERA_MODALITIES for modality in self.spec.modalities)
+            else self._builder.camera_generation
+        )
         for modality in self.spec.modalities:
             if modality.name in _CAMERA_MODALITIES:
                 modality_frames = self._read_camera(modality)
-                if modality_frames:
-                    camera_generation = max(frame.generation for frame in modality_frames)
-                    modality_frames = [frame for frame in modality_frames if frame.generation == camera_generation]
+                modality_frames = [frame for frame in modality_frames if frame.generation == camera_generation]
                 frames[modality.name] = modality_frames
             else:
                 frames[modality.name] = self._read_structured(modality)

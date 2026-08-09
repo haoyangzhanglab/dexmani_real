@@ -65,9 +65,7 @@ class PinGrad:
 
     # ── Position gradient ───────────────────────────────────────
 
-    def compute_position_gradient(
-        self, qpos_floating: np.ndarray, target_pos: np.ndarray
-    ) -> tuple[np.ndarray, float]:
+    def compute_position_gradient(self, qpos_floating: np.ndarray, target_pos: np.ndarray) -> tuple[np.ndarray, float]:
         """Analytic gradient of squared fingertip position error.
 
         ∂/∂q  Σ_i ||FK_tip_i(q) - target_i||²
@@ -87,9 +85,7 @@ class PinGrad:
 
         for i in range(n_fingers):
             fid = self.tip_frame_ids[i]
-            J_full = pin.getFrameJacobian(
-                self.model, self.data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
-            )
+            J_full = pin.getFrameJacobian(self.model, self.data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
             J_v = J_full[:3, 6:]  # strip FreeFlyer columns, keep joint DOFs
             p_tip = self.data.oMf[fid].translation
             diff = p_tip - target_pos[i]
@@ -101,9 +97,7 @@ class PinGrad:
     # ── Temporal smoothness gradient (static — no Pinocchio needed) ─
 
     @staticmethod
-    def compute_smoothness_gradient(
-        q: np.ndarray, q_last: np.ndarray, weight: float
-    ) -> tuple[np.ndarray, float]:
+    def compute_smoothness_gradient(q: np.ndarray, q_last: np.ndarray, weight: float) -> tuple[np.ndarray, float]:
         """Gradient of temporal smoothness penalty:  weight * ||q - q_last||².
 
         Returns:

@@ -169,6 +169,29 @@ def _parse_arm_action_metadata(action: Any, received_s: float) -> tuple[int, flo
     return 0, received_s, False
 
 
+def _decode_joint_state_feedback(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validate one xArm feedback response at the worker boundary."""
+    _require_sdk_ok("get_joint_states", code)
+    if not isinstance(states, (list, tuple)) or not states:
+        raise RuntimeError("get_joint_states returned no joint state")
+    qpos = np.asarray(states[0], dtype=np.float64)[:7]
+    qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.zeros(7, dtype=np.float64)
+    tau = np.asarray(states[2], dtype=np.float64)[:7] if len(states) > 2 else np.zeros(7, dtype=np.float64)
+    for name, value in (("qpos", qpos), ("qvel", qvel), ("tau", tau)):
+        if value.shape != (7,) or not np.all(np.isfinite(value)):
+            raise RuntimeError(f"get_joint_states returned invalid {name}: shape={value.shape}")
+    return qpos, qvel, tau
+
+
+def _update_state_read_watchdog(counter: RetryCounter, *, succeeded: bool) -> bool:
+    """Update the consecutive feedback-failure counter and report escalation."""
+    if succeeded:
+        counter.reset()
+        return False
+    counter.inc()
+    return counter.triggered
+
+
 def _read_live_status(arm_api: Any) -> tuple[int, int, int]:
     """Return live ``(state, mode, error)`` or raise on any failed read."""
     if hasattr(arm_api, "get_state"):
@@ -401,10 +424,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     pending_action: np.ndarray | None = None
     pending_received_ns = 0
     pending_committed = False
+    deferred_action: Any | None = None
     motion_enabled = False
     last_safety_state = int(SafetyState.DISARMED)
     last_state_source_ns = time.monotonic_ns()
     last_c24_s = float("-inf")
+    terminal_feedback_fault = False
 
     # Publish initial state BEFORE arm_ready — consumers wait on arm_ready and
     # expect the ring to already contain a valid frame.  Without this, there is
@@ -447,6 +472,46 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     logger.info("arm_loop: ready and DISARMED (state=4, ip=%s, hz=%.0f)", cfg.arm_ip, cfg.arm_loop_hz)
 
     limiter = RateManager(cfg.arm_loop_hz)
+    low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
+    high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
+
+    def _prepare_protocol_action(action: Any) -> tuple[np.ndarray, int] | None:
+        """Validate and PREPARE one protocol command without executing it."""
+        nonlocal last_action_id, minimum_policy_epoch
+        if not isinstance(action, np.ndarray):
+            return None
+        received_ns = time.monotonic_ns()
+        minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
+        reason = validate_worker_command(
+            action,
+            dtype=ARM_COMMAND_DTYPE,
+            expected_session_generation=int(shared.session_generation.value),
+            minimum_policy_epoch=minimum_policy_epoch,
+            last_action_id=last_action_id,
+            now_monotonic_ns=received_ns,
+            joint_lower_rad=low,
+            joint_upper_rad=high,
+        )
+        if reason is not RejectReason.NONE:
+            if action.shape == (1,) and action.dtype == ARM_COMMAND_DTYPE:
+                shared.arm_ack_ring.write(
+                    make_ack(action, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns)
+                )
+            logger.warning("arm_loop: rejected command: %s", reason.name)
+            return None
+        shared.arm_ack_ring.write(make_ack(action, AckStatus.RECEIVED, received_monotonic_ns=received_ns))
+        last_action_id = int(action["action_id"][0])
+        prepared_ns = time.monotonic_ns()
+        shared.arm_ack_ring.write(
+            make_ack(
+                action,
+                AckStatus.PREPARED,
+                received_monotonic_ns=received_ns,
+                prepared_monotonic_ns=prepared_ns,
+            )
+        )
+        return action.copy(), received_ns
+
     while shared.is_running.value:
         c24_recovered_this_tick = False
         # Heartbeat — written even when holding position (proves we're alive)
@@ -481,6 +546,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 pending_action = None
                 pending_received_ns = 0
                 pending_committed = False
+                deferred_action = None
         elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not motion_enabled:
             try:
                 _require_sdk_ok("armed set_mode(6)", arm.set_mode(6))
@@ -506,10 +572,14 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 commit = commit_result[0] if commit_result is not None else None
                 pending_committed = commit is not None and command_matches_commit(pending_action, commit)
             if pending_action is None or not pending_committed:
-                try:
-                    action = shared.arm_action_q.get(timeout=0.0)
-                except Empty:
-                    action = None
+                if deferred_action is not None:
+                    action = deferred_action
+                    deferred_action = None
+                else:
+                    try:
+                        action = shared.arm_action_q.get(timeout=0.0)
+                    except Empty:
+                        action = None
             else:
                 action = None
 
@@ -582,44 +652,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     shared.error_state.value = True
                 continue
 
-            low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
-            high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
-            minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
             if action is not None and not isinstance(action, tuple):
-                received_ns = time.monotonic_ns()
-                reason = validate_worker_command(
-                    action,
-                    dtype=ARM_COMMAND_DTYPE,
-                    expected_session_generation=int(shared.session_generation.value),
-                    minimum_policy_epoch=minimum_policy_epoch,
-                    last_action_id=last_action_id,
-                    now_monotonic_ns=received_ns,
-                    joint_lower_rad=low,
-                    joint_upper_rad=high,
-                )
-                if reason is not RejectReason.NONE:
-                    if isinstance(action, np.ndarray) and action.shape == (1,) and action.dtype == ARM_COMMAND_DTYPE:
-                        shared.arm_ack_ring.write(
-                            make_ack(
-                                action, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns
-                            )
-                        )
-                    logger.warning("arm_loop: rejected command: %s", reason.name)
-                else:
-                    shared.arm_ack_ring.write(make_ack(action, AckStatus.RECEIVED, received_monotonic_ns=received_ns))
-                    pending_action = action.copy()
-                    pending_received_ns = received_ns
+                prepared = _prepare_protocol_action(action)
+                if prepared is not None:
+                    pending_action, pending_received_ns = prepared
                     pending_committed = False
-                    last_action_id = int(action["action_id"][0])
-                    prepared_ns = time.monotonic_ns()
-                    shared.arm_ack_ring.write(
-                        make_ack(
-                            action,
-                            AckStatus.PREPARED,
-                            received_monotonic_ns=received_ns,
-                            prepared_monotonic_ns=prepared_ns,
-                        )
-                    )
 
             execute_action: np.ndarray | None = None
             execute_received_ns = 0
@@ -740,23 +777,40 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                             shared.error_state.value = True
                             break
 
+            # A chunk's next prepare window opens slightly before the previous
+            # endpoint is applied (62.5 ms action dt vs ~66.7 ms lead at the
+            # defaults).  Poll once more immediately after freeing the committed
+            # slot; otherwise the next command waits an additional 30 Hz worker
+            # tick and can exceed the coordinator's 50 ms prepare deadline.
+            if pending_action is None and deferred_action is None and not c24_recovered_this_tick:
+                try:
+                    prefetched = shared.arm_action_q.get(timeout=0.0)
+                except Empty:
+                    prefetched = None
+                if isinstance(prefetched, tuple):
+                    deferred_action = prefetched
+                elif prefetched is not None:
+                    prepared = _prepare_protocol_action(prefetched)
+                    if prepared is not None:
+                        pending_action, pending_received_ns = prepared
+                        pending_committed = False
+
         arm_connected = True
+        state_read_succeeded = False
         try:
             code, states = arm.get_joint_states(is_radian=True, num=3)
-            if code == 0 and len(states) > 0:
-                last_state_source_ns = time.monotonic_ns()
-                qpos = np.asarray(states[0], dtype=np.float64)[:7]
-                qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.zeros(7)
-                tau = np.asarray(states[2], dtype=np.float64)[:7] if len(states) > 2 else np.zeros(7)
-                last_qpos = qpos.copy()
-            else:
-                _state_read_warn("arm_loop: get_joint_states returned code=%d", code)
-                qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
-                arm_connected = False
+            qpos, qvel, tau = _decode_joint_state_feedback(code, states)
+            last_state_source_ns = time.monotonic_ns()
+            last_qpos = qpos.copy()
+            state_read_succeeded = True
         except Exception:
             logger.warning("arm_loop: get_joint_states failed", exc_info=True)
             qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
             arm_connected = False
+        state_read_fault = _update_state_read_watchdog(
+            _state_error_counter,
+            succeeded=state_read_succeeded,
+        )
 
         # Pinocchio URDF-consistent FK (see note above).
         try:
@@ -807,8 +861,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         elif error_code != 0 and not (c24_recovered_this_tick and error_code == 24):
             shared.error_state.value = True
             break
-        else:
-            _state_error_counter.reset()
 
         # Publish state
         _frame["qpos"][0] = qpos
@@ -834,6 +886,22 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         _frame["timestamp"][0] = last_state_source_ns / 1e9
         shared.arm_state_ring.write(_frame)
 
+        if state_read_fault:
+            terminal_feedback_fault = True
+            shared.error_state.value = True
+            logger.error(
+                "arm_loop: %d consecutive feedback-read failures — latching global fault",
+                _state_error_counter.count,
+            )
+            publish_component_status(
+                shared,
+                "arm",
+                ComponentPhase.FAULT,
+                fault_code=FaultCode.DEVICE_IO,
+                detail="persistent get_joint_states failure",
+            )
+            break
+
         # Rate limit
         limiter.wait()
 
@@ -848,7 +916,15 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     except Exception:
         logger.warning("arm_loop: cleanup failed", exc_info=True)
         shared.error_state.value = True
-    if stopped_cleanly:
+    if terminal_feedback_fault:
+        publish_component_status(
+            shared,
+            "arm",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.DEVICE_IO,
+            detail="persistent get_joint_states failure",
+        )
+    elif stopped_cleanly:
         publish_component_status(shared, "arm", ComponentPhase.STOPPED)
     else:
         publish_component_status(

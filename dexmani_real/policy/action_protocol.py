@@ -735,7 +735,7 @@ class JointActionScheduler:
         lead_time_s: float,
         now_monotonic_ns: int | None = None,
     ) -> ActionCandidate | None:
-        """Pop the newest endpoint whose prepare window has opened.
+        """Pop the earliest endpoint whose prepare window has opened.
 
         ``target_monotonic_ns`` is the worker application time, so a
         coordinator must publish before it becomes due.  This method keeps the
@@ -748,7 +748,11 @@ class JointActionScheduler:
         ready = [step for step in self._future if step.target_monotonic_ns <= now_ns + int(lead_time_s * 1e9)]
         if not ready:
             return None
-        selected = ready[-1]
+        # Workers enforce monotonically increasing action IDs.  Selecting the
+        # newest ready endpoint while leaving older ready endpoints queued would
+        # publish those older IDs later and make the workers reject them as
+        # OUT_OF_ORDER after any coordinator stall spanning multiple steps.
+        selected = ready[0]
         self._future = [step for step in self._future if step.action_id != selected.action_id]
         self._committed.discard(selected.action_id)
         return selected

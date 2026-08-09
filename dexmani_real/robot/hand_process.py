@@ -267,6 +267,47 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
     _last_error_clear_s = 0.0
 
+    def _prepare_latest_command() -> np.ndarray | None:
+        """Read and PREPARE a new latest-wins command, if one is available."""
+        nonlocal last_action_id, last_cmd_seq, minimum_policy_epoch
+        result = shared.hand_cmd_ring.read_latest()
+        if result is None:
+            return None
+        data, _ts, seq = result
+        seq_int = int(seq) if isinstance(seq, (int, np.integer)) else 0
+        if seq_int == last_cmd_seq:
+            return None
+        received_ns = time.monotonic_ns()
+        minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
+        reason = validate_worker_command(
+            data,
+            dtype=HAND_COMMAND_DTYPE,
+            expected_session_generation=int(shared.session_generation.value),
+            minimum_policy_epoch=minimum_policy_epoch,
+            last_action_id=last_action_id,
+            now_monotonic_ns=received_ns,
+            joint_lower_rad=np.asarray(hand.config.qpos_min, dtype=np.float64),
+            joint_upper_rad=np.asarray(hand.config.qpos_max, dtype=np.float64),
+        )
+        last_cmd_seq = seq_int
+        if reason is not RejectReason.NONE:
+            shared.hand_ack_ring.write(
+                make_ack(data, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns)
+            )
+            return None
+        shared.hand_ack_ring.write(make_ack(data, AckStatus.RECEIVED, received_monotonic_ns=received_ns))
+        last_action_id = int(data["action_id"][0])
+        prepared_ns = time.monotonic_ns()
+        shared.hand_ack_ring.write(
+            make_ack(
+                data,
+                AckStatus.PREPARED,
+                received_monotonic_ns=received_ns,
+                prepared_monotonic_ns=prepared_ns,
+            )
+        )
+        return data.copy()
+
     while shared.is_running.value:
         # Heartbeat — written even when gated (proves we're alive)
         shared.hand_heartbeat_s.value = time.monotonic()
@@ -283,44 +324,11 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 commit_result = shared.action_commit_ring.read_latest()
                 commit = commit_result[0] if commit_result is not None else None
                 pending_committed = commit is not None and command_matches_commit(pending_action, commit)
-            result = shared.hand_cmd_ring.read_latest() if pending_action is None or not pending_committed else None
-            if result is not None:
-                data, _ts, seq = result
-                seq_int = int(seq) if isinstance(seq, (int, np.integer)) else 0
-                if seq_int != last_cmd_seq:
-                    received_ns = time.monotonic_ns()
-                    minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
-                    reason = validate_worker_command(
-                        data,
-                        dtype=HAND_COMMAND_DTYPE,
-                        expected_session_generation=int(shared.session_generation.value),
-                        minimum_policy_epoch=minimum_policy_epoch,
-                        last_action_id=last_action_id,
-                        now_monotonic_ns=received_ns,
-                        joint_lower_rad=np.asarray(hand.config.qpos_min, dtype=np.float64),
-                        joint_upper_rad=np.asarray(hand.config.qpos_max, dtype=np.float64),
-                    )
-                    if reason is RejectReason.NONE:
-                        shared.hand_ack_ring.write(
-                            make_ack(data, AckStatus.RECEIVED, received_monotonic_ns=received_ns)
-                        )
-                        pending_action = data.copy()
-                        pending_committed = False
-                        last_action_id = int(data["action_id"][0])
-                        prepared_ns = time.monotonic_ns()
-                        shared.hand_ack_ring.write(
-                            make_ack(
-                                data,
-                                AckStatus.PREPARED,
-                                received_monotonic_ns=received_ns,
-                                prepared_monotonic_ns=prepared_ns,
-                            )
-                        )
-                    else:
-                        shared.hand_ack_ring.write(
-                            make_ack(data, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns)
-                        )
-                    last_cmd_seq = seq_int
+            if pending_action is None or not pending_committed:
+                prepared = _prepare_latest_command()
+                if prepared is not None:
+                    pending_action = prepared
+                    pending_committed = False
 
             execute_action: np.ndarray | None = None
             if pending_action is not None:
@@ -377,6 +385,15 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                             applied_monotonic_ns=time.monotonic_ns(),
                         )
                     )
+
+            # Freeing the committed slot and preparing the next latest-wins
+            # command in the same worker tick avoids an extra 30 Hz delay that
+            # can otherwise exceed the coordinator's prepare timeout.
+            if pending_action is None:
+                prepared = _prepare_latest_command()
+                if prepared is not None:
+                    pending_action = prepared
+                    pending_committed = False
 
             # Send-error watchdog: auto clear_error() after consecutive failures.
             if _send_error_counter.triggered:

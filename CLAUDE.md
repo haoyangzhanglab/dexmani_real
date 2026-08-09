@@ -266,7 +266,9 @@ source/padding statistics, the canonical resolved config, and hashed
 robot/device/calibration resources provide v15 provenance. Arm and hand workers
 publish canonical device-identity JSON from values already exposed by their
 SDK connection; missing vendor fields remain `unavailable` rather than being
-guessed. Old dataset meanings are unchanged.
+guessed. A held source row that intentionally emits no new command uses
+`action_id=0` with queued/committed both false; a published hold is bound to its
+exact action candidate and ACKs. Old dataset meanings are unchanged.
 
 Key hand-related datasets in `data.h5` (full catalog: `episode_recorder.py:add_frame()`):
 - `hand_qpos` (T,12), `hand_fingertip` (T,5,3), `hand_contact` (T,5,3), `hand_tactile_force` (T,5,120,3), `hand_tactile_contact` (T,5)

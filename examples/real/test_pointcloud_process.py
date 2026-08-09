@@ -200,8 +200,10 @@ def main() -> None:
         mask = np.isfinite(z_flat) & (z_flat > cfg_default.depth_min_m) & (z_flat < cfg_default.depth_max_m)
         n_depth_gate = int(mask.sum())
         _timings["2d_depth_gate"] = (time.perf_counter() - t_gate_0) * 1000.0
-        print(f"  1. Depth gate [{cfg_default.depth_min_m}, {cfg_default.depth_max_m}]m:       "
-              f"{n_depth_gate:6d} / {total_pixels} pixels  ({_timings['2d_depth_gate']:.2f}ms)")
+        print(
+            f"  1. Depth gate [{cfg_default.depth_min_m}, {cfg_default.depth_max_m}]m:       "
+            f"{n_depth_gate:6d} / {total_pixels} pixels  ({_timings['2d_depth_gate']:.2f}ms)"
+        )
 
         # --- 2. Depth edge filter (LoG, byte-identical to production) ---
         t_edge_0 = time.perf_counter()
@@ -240,11 +242,13 @@ def main() -> None:
         _timings["2d_edge_filter"] = (time.perf_counter() - t_edge_0) * 1000.0
 
         if cfg_default.depth_edge_threshold_m > 0:
-            print(f"  2. Edge filter (LoG, >{cfg_default.depth_edge_threshold_m*1000:.0f}mm abs, "
-                  f"dilate={cfg_default.depth_edge_dilate_px}): "
-                  f"{n_before_edge - n_after_edge:6d} removed  "
-                  f"(raw edges={n_raw_edge}, dilated={n_edge_dilated}), "
-                  f"{n_after_edge:6d} survive  ({_timings['2d_edge_filter']:.2f}ms)")
+            print(
+                f"  2. Edge filter (LoG, >{cfg_default.depth_edge_threshold_m*1000:.0f}mm abs, "
+                f"dilate={cfg_default.depth_edge_dilate_px}): "
+                f"{n_before_edge - n_after_edge:6d} removed  "
+                f"(raw edges={n_raw_edge}, dilated={n_edge_dilated}), "
+                f"{n_after_edge:6d} survive  ({_timings['2d_edge_filter']:.2f}ms)"
+            )
         else:
             print(f"  2. Edge filter:                                      DISABLED")
 
@@ -267,14 +271,18 @@ def main() -> None:
         _timings["2d_speckle"] = (time.perf_counter() - t_speckle_0) * 1000.0
 
         if cfg_default.speckle_min_pixels > 0:
-            print(f"  3. Speckle filter (<{cfg_default.speckle_min_pixels}px components):     "
-                  f"{n_after_speckle:6d} survive  ({n_before_speckle - n_after_speckle} removed)"
-                  f"  ({_timings['2d_speckle']:.2f}ms)")
+            print(
+                f"  3. Speckle filter (<{cfg_default.speckle_min_pixels}px components):     "
+                f"{n_after_speckle:6d} survive  ({n_before_speckle - n_after_speckle} removed)"
+                f"  ({_timings['2d_speckle']:.2f}ms)"
+            )
         else:
             print(f"  3. Speckle filter:                                    DISABLED")
 
-        print(f"     (median filter: {'ON' if cfg_default.depth_median_enabled else 'OFF'} "
-              f"— applied before all gates above)")
+        print(
+            f"     (median filter: {'ON' if cfg_default.depth_median_enabled else 'OFF'} "
+            f"— applied before all gates above)"
+        )
 
         # ═══════════════════════════════════════════════════════════
         # Load extrinsics
@@ -348,23 +356,33 @@ def main() -> None:
         # --- Describe each stage ---
         print(f"  1. Desk plane removal       → drops points <{cfg.desk_clearance_m*1000:.0f}mm above desk")
         print(f"                              (tilt-aware: handles {angle_deg:.1f} deg desk slope)")
-        print(f"  2. Workspace crop           → keeps only x in [{cfg.workspace[0]:.1f},{cfg.workspace[3]:.1f}] "
-              f"y in [{cfg.workspace[1]:.1f},{cfg.workspace[4]:.1f}] "
-              f"z in [{cfg.workspace[2]:.3f},{cfg.workspace[5]:.1f}]")
+        print(
+            f"  2. Workspace crop           → keeps only x in [{cfg.workspace[0]:.1f},{cfg.workspace[3]:.1f}] "
+            f"y in [{cfg.workspace[1]:.1f},{cfg.workspace[4]:.1f}] "
+            f"z in [{cfg.workspace[2]:.3f},{cfg.workspace[5]:.1f}]"
+        )
         print(f"  3. 5mm voxel downsample     → averages points in each 5mm grid cell")
         if cfg.dbscan_min_cluster_size > 0:
-            print(f"  4. DBSCAN two-in-one filter  → noise pts (label=-1) + clusters <{cfg.dbscan_min_cluster_size} pts")
-            print(f"                              (eps={cfg.dbscan_eps*1000:.0f}mm, min_points={cfg.dbscan_min_points})")
+            print(
+                f"  4. DBSCAN two-in-one filter  → noise pts (label=-1) + clusters <{cfg.dbscan_min_cluster_size} pts"
+            )
+            print(
+                f"                              (eps={cfg.dbscan_eps*1000:.0f}mm, min_points={cfg.dbscan_min_points})"
+            )
         else:
             print(f"  4. DBSCAN two-in-one filter  → DISABLED")
         if cfg.radius_outlier_min_points > 0:
-            print(f"  5. Radius outlier removal   → drops points with <{cfg.radius_outlier_min_points} "
-                  f"neighbours in {cfg.radius_outlier_radius*1000:.0f}mm")
+            print(
+                f"  5. Radius outlier removal   → drops points with <{cfg.radius_outlier_min_points} "
+                f"neighbours in {cfg.radius_outlier_radius*1000:.0f}mm"
+            )
         else:
             print(f"  5. Radius outlier removal   → DISABLED (DBSCAN noise removal covers it)")
         if cfg.stat_outlier_nb_neighbors > 0:
-            print(f"  6. Statistical outlier      → drops points whose mean k-NN distance "
-              f"(k={cfg.stat_outlier_nb_neighbors}) deviates >{cfg.stat_outlier_std_ratio} sigma")
+            print(
+                f"  6. Statistical outlier      → drops points whose mean k-NN distance "
+                f"(k={cfg.stat_outlier_nb_neighbors}) deviates >{cfg.stat_outlier_std_ratio} sigma"
+            )
         else:
             print(f"  6. Statistical outlier      → DISABLED (DBSCAN noise removal covers it)")
         print(f"  7. Farthest-point sampling  → selects {cfg.num_points} points with max spatial coverage")
@@ -372,9 +390,16 @@ def main() -> None:
         # --- Measure a single-frame timing breakdown by temporarily lower the log interval ---
         # Save original accumulators, reset, run one frame, read back.
         saved = (
-            processor._t_numpy, processor._t_voxel, processor._t_dbscan,
-            processor._t_radius, processor._t_stat, processor._t_fps,
-            processor._t_in_n, processor._t_voxel_n, processor._t_radius_n, processor._t_n,
+            processor._t_numpy,
+            processor._t_voxel,
+            processor._t_dbscan,
+            processor._t_radius,
+            processor._t_stat,
+            processor._t_fps,
+            processor._t_in_n,
+            processor._t_voxel_n,
+            processor._t_radius_n,
+            processor._t_n,
         )
         processor._t_numpy = processor._t_voxel = processor._t_dbscan = 0.0
         processor._t_radius = processor._t_stat = processor._t_fps = 0.0
@@ -394,9 +419,18 @@ def main() -> None:
         _timings["p_fps"] = processor._t_fps
 
         # Restore.
-        (processor._t_numpy, processor._t_voxel, processor._t_dbscan,
-         processor._t_radius, processor._t_stat, processor._t_fps,
-         processor._t_in_n, processor._t_voxel_n, processor._t_radius_n, processor._t_n) = saved
+        (
+            processor._t_numpy,
+            processor._t_voxel,
+            processor._t_dbscan,
+            processor._t_radius,
+            processor._t_stat,
+            processor._t_fps,
+            processor._t_in_n,
+            processor._t_voxel_n,
+            processor._t_radius_n,
+            processor._t_n,
+        ) = saved
 
         if result is not None:
             print(f"\n  Output: {result.shape[0]} points  ({_timings['pipeline_total']:.1f} ms)")
@@ -452,13 +486,31 @@ def main() -> None:
         camera_frame.transform(T_world_camera)
 
         ws = cfg.workspace
-        crop_corners = np.array([
-            [ws[0], ws[1], ws[2]], [ws[3], ws[1], ws[2]], [ws[3], ws[4], ws[2]], [ws[0], ws[4], ws[2]],
-            [ws[0], ws[1], ws[5]], [ws[3], ws[1], ws[5]], [ws[3], ws[4], ws[5]], [ws[0], ws[4], ws[5]],
-        ])
+        crop_corners = np.array(
+            [
+                [ws[0], ws[1], ws[2]],
+                [ws[3], ws[1], ws[2]],
+                [ws[3], ws[4], ws[2]],
+                [ws[0], ws[4], ws[2]],
+                [ws[0], ws[1], ws[5]],
+                [ws[3], ws[1], ws[5]],
+                [ws[3], ws[4], ws[5]],
+                [ws[0], ws[4], ws[5]],
+            ]
+        )
         crop_edges = [
-            [0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4],
-            [0, 4], [1, 5], [2, 6], [3, 7],
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [7, 4],
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
         ]
         crop_box = o3d.geometry.LineSet()
         crop_box.points = o3d.utility.Vector3dVector(crop_corners)

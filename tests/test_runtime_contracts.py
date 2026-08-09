@@ -16,11 +16,14 @@ from dexmani_real.planning.preflight import PreflightCertificate, create_preflig
 from dexmani_real.policy.action_protocol import (
     ARM_COMMAND_DTYPE,
     COMMIT_DTYPE,
+    AckStatus,
     ActionSafetyGate,
     ActionSafetyGateConfig,
     JointActionScheduler,
     RejectReason,
+    SafeCommandPublisher,
     command_matches_commit,
+    make_ack,
     make_command_frame,
     make_stopped_ack,
     publish_joint_targets,
@@ -28,6 +31,7 @@ from dexmani_real.policy.action_protocol import (
 )
 from dexmani_real.policy.inference_process import InferenceConfig, encode_candidate
 from dexmani_real.policy.learned_coordinator import CoordinatorTick, LearnedCoordinatorConfig, LearnedPolicyCoordinator
+from dexmani_real.policy.observation_sources import SharedObservationSource
 from dexmani_real.policy.runtime import (
     ActionCandidate,
     ActionChunk,
@@ -38,11 +42,17 @@ from dexmani_real.policy.runtime import (
     ObservationSpec,
 )
 from dexmani_real.policy.tensor_block import ObservationTensorBlock
-from dexmani_real.policy.vr_teleop_policy import PolicyConfig, _matching_source_sequence, _read_causal_structured_frame
+from dexmani_real.policy.vr_teleop_policy import (
+    PolicyConfig,
+    _matching_source_sequence,
+    _read_causal_structured_frame,
+    _recording_provenance,
+)
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.runtime.processes import shutdown_processes_verified, supervisor_exit_reason
 from dexmani_real.runtime.status import ExitReason
+from dexmani_real.sensor.camera_process import pack_camera_frame
 from dexmani_real.sensor.clock_sync import DeviceClockMapper
 from dexmani_real.shm.shared_storage import (
     ARM_STATE_DTYPE,
@@ -366,6 +376,18 @@ def test_chunk_scheduler_opens_prepare_window_before_target() -> None:
     assert scheduler.pop_ready(lead_time_s=0.010, now_monotonic_ns=now_ns) == candidate
 
 
+def test_chunk_scheduler_keeps_action_ids_in_order_when_multiple_steps_are_ready() -> None:
+    now_ns = time.monotonic_ns()
+    scheduler = JointActionScheduler(ActionSpec(chunk_length=2, dt_s=0.01))
+    first = _candidate(now_ns=now_ns, action_id=1, step_index=0)
+    second = _candidate(now_ns=now_ns, action_id=2, step_index=1)
+    scheduler.submit(ActionChunk(5, (first, second)), now_monotonic_ns=now_ns)
+
+    stalled_tick_ns = now_ns + 15_000_000
+    assert scheduler.pop_ready(lead_time_s=0.010, now_monotonic_ns=stalled_tick_ns) == first
+    assert scheduler.pop_ready(lead_time_s=0.010, now_monotonic_ns=stalled_tick_ns) == second
+
+
 def test_learned_coordinator_normalizes_backend_protocol_metadata() -> None:
     prefix = f"learned_{uuid.uuid4().hex}"
     shared = SharedStorage.create(
@@ -482,6 +504,55 @@ def test_camera_generation_change_forces_armed_epoch_and_rewarm() -> None:
         shared.close()
 
 
+def test_camera_snapshot_never_mixes_payload_generations() -> None:
+    prefix = f"camera_generation_{uuid.uuid4().hex}"
+    shared = SharedStorage.create(
+        prefix=prefix,
+        config=SharedStorageConfig(
+            camera_rgb_shape=(2, 3, 3),
+            camera_depth_shape=(2, 3),
+            camera_pc_shape=(4, 6),
+        ),
+    )
+    spec = ObservationSpec(
+        (
+            ModalitySpec("camera_rgb", (2, 3, 3), "uint8"),
+            ModalitySpec("camera_pointcloud", (4, 6), "float32"),
+        )
+    )
+    try:
+        source = SharedObservationSource(shared, spec)
+
+        def write_frame(*, generation: int, value: int, pointcloud_valid: bool) -> None:
+            receive_ns = time.monotonic_ns()
+            rgb = np.full((2, 3, 3), value, dtype=np.uint8)
+            depth = np.full((2, 3), value, dtype=np.uint16)
+            pointcloud = np.full((4, 6), value, dtype=np.float32)
+            header, _, _ = pack_camera_frame(
+                rgb,
+                depth,
+                timestamp=float(generation),
+                capture_monotonic_s=receive_ns / 1e9,
+                frame_id=generation,
+                pc_num_points=4 if pointcloud_valid else 0,
+                source_monotonic_ns=receive_ns - 1_000_000,
+                camera_generation=generation,
+            )
+            shared.camera_ring.write(header, rgb, depth, pointcloud)
+
+        write_frame(generation=1, value=1, pointcloud_valid=True)
+        write_frame(generation=2, value=2, pointcloud_valid=False)
+        snapshot = source.build(anchor_monotonic_ns=time.monotonic_ns())
+
+        assert snapshot.camera_generation == 2
+        assert bool(snapshot.valid_history_mask["camera_rgb"][0])
+        np.testing.assert_array_equal(snapshot.values["camera_rgb"][0], np.full((2, 3, 3), 2, dtype=np.uint8))
+        assert not bool(snapshot.valid_history_mask["camera_pointcloud"][0])
+        np.testing.assert_array_equal(snapshot.values["camera_pointcloud"][0], np.zeros((4, 6), dtype=np.float32))
+    finally:
+        shared.close()
+
+
 def test_device_clock_mapping_detects_duplicate_gap_and_reset() -> None:
     mapper = DeviceClockMapper(reset_jump_ns=100_000_000)
     first = mapper.map(device_time_s=1.0, host_receive_ns=2_000_000_000, frame_number=10)
@@ -549,6 +620,96 @@ def test_recording_provenance_recovers_exact_source_sequence_not_latest() -> Non
 
     assert _matching_source_sequence(ring, selected) == 7
     assert _matching_source_sequence(ring, frame(50, 60)) == 0
+
+
+def test_recording_provenance_uses_explicit_candidate_not_latest_global_commit() -> None:
+    prefix = f"record_provenance_{uuid.uuid4().hex}"
+    shared = SharedStorage.create(
+        prefix=prefix,
+        config=SharedStorageConfig(
+            camera_rgb_shape=(2, 3, 3),
+            camera_depth_shape=(2, 3),
+            camera_pc_shape=(4, 6),
+        ),
+    )
+    try:
+        now_ns = time.monotonic_ns()
+        source_ns = now_ns - 3_000_000
+        publish_ns = now_ns - 2_000_000
+        arm_frame = new_frame(ARM_STATE_DTYPE)
+        arm_frame["source_monotonic_ns"][0] = source_ns
+        arm_frame["publish_monotonic_ns"][0] = publish_ns
+        arm_frame["state_valid"][0] = 1
+        shared.arm_state_ring.write(arm_frame)
+        hand_frame = new_frame(HAND_STATE_DTYPE)
+        hand_frame["source_monotonic_ns"][0] = source_ns
+        hand_frame["publish_monotonic_ns"][0] = publish_ns
+        hand_frame["state_valid"][0] = 1
+        shared.hand_state_ring.write(hand_frame)
+
+        candidate = ActionCandidate(
+            observation_id=44,
+            session_generation=int(shared.session_generation.value),
+            policy_epoch=int(shared.policy_epoch.value),
+            action_id=7,
+            created_monotonic_ns=now_ns - 1_000_000,
+            target_monotonic_ns=now_ns + 100_000_000,
+            valid_until_monotonic_ns=now_ns + 200_000_000,
+            arm_qpos=np.zeros(7),
+            hand_qpos=np.zeros(12),
+            chunk_id=7,
+        )
+        shared.arm_ack_ring.write(make_ack(make_command_frame(candidate, actuator="arm"), AckStatus.PREPARED))
+        shared.hand_ack_ring.write(make_ack(make_command_frame(candidate, actuator="hand"), AckStatus.PREPARED))
+        unrelated = ActionCandidate(
+            observation_id=99,
+            session_generation=int(shared.session_generation.value),
+            policy_epoch=int(shared.policy_epoch.value),
+            action_id=99,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns + 300_000_000,
+            valid_until_monotonic_ns=now_ns + 400_000_000,
+            arm_qpos=np.zeros(7),
+            chunk_id=99,
+        )
+        SafeCommandPublisher(shared).commit(unrelated)
+        vr_frame = {
+            "ring_sequence": 44,
+            "local_recv_ns": source_ns,
+            "publish_monotonic_ns": publish_ns,
+        }
+
+        signals = _recording_provenance(
+            shared,
+            arm_frame,
+            hand_frame,
+            None,
+            vr_frame,
+            None,
+            anchor_monotonic_ns=time.monotonic_ns(),
+            action_candidate=candidate,
+        )
+        assert signals["observation_id"] == 44
+        assert signals["action_id"] == 7
+        assert signals["action_chunk_id"] == 7
+        assert signals["action_queued"] is True
+        assert signals["action_committed"] is True
+
+        held = _recording_provenance(
+            shared,
+            arm_frame,
+            hand_frame,
+            None,
+            vr_frame,
+            None,
+            anchor_monotonic_ns=time.monotonic_ns(),
+        )
+        assert held["observation_id"] == 44
+        assert held["action_id"] == 0
+        assert held["action_queued"] is False
+        assert held["action_committed"] is False
+    finally:
+        shared.close()
 
 
 @pytest.mark.parametrize(

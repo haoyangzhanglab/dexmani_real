@@ -1208,6 +1208,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             if _arm_state_age_s > 0.5:
                 _arm_stale_warn("policy_loop: arm_state stale %.2fs", _arm_state_age_s)
                 error_count += 1
+                if error_count > cfg.max_consecutive_errors:
+                    logger.error("连续 arm state stale，退出")
+                    shared.error_state.value = True
+                    break
                 continue
             arm_qpos = arm_state["qpos"][0].copy()
             if not np.all(np.isfinite(arm_qpos)):
@@ -1399,6 +1403,16 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             _map_t0 = time.perf_counter()
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
+                published_hold = _safe_arm_queue_put(
+                    shared,
+                    {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                )
+                if published_hold is None:
+                    shared.error_state.value = True
+                    break
                 if recording_active:
                     _record_held(
                         recorder,
@@ -1417,16 +1431,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                         observation_anchor_monotonic_ns=_current_grid_anchor_ns,
                         shared=shared,
+                        action_candidate=published_hold,
                     )
-                if not _safe_arm_queue_put(
-                    shared,
-                    {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
-                    observation_id=int(vr_frame["ring_sequence"]),
-                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
-                ):
-                    shared.error_state.value = True
-                    break
                 continue
 
             target_pos_raw = np.asarray(mapped["pos"], dtype=np.float64).copy()
@@ -1495,6 +1501,16 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 )
                 ema_prev_pos = ema_prev_quat = None
                 prev_qpos_cmd = hold_qpos
+                published_hold = _safe_arm_queue_put(
+                    shared,
+                    {"qpos": hold_qpos, "is_hold": True},
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                )
+                if published_hold is None:
+                    shared.error_state.value = True
+                    break
                 if recording_active:
                     _record_held(
                         recorder,
@@ -1514,16 +1530,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                         observation_anchor_monotonic_ns=_current_grid_anchor_ns,
                         shared=shared,
+                        action_candidate=published_hold,
                     )
-                if not _safe_arm_queue_put(
-                    shared,
-                    {"qpos": hold_qpos, "is_hold": True},
-                    observation_id=int(vr_frame["ring_sequence"]),
-                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
-                ):
-                    shared.error_state.value = True
-                    break
                 continue
 
             planner.set_hand_qpos(prev_hand_qpos)  # sync hand pose for collision checks
@@ -1584,27 +1592,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 retarget_ok = False
 
             if not ik_result.success or ik_result.qpos is None:
-                if recording_active:
-                    _record_held(
-                        recorder,
-                        arm_state,
-                        prev_qpos_cmd,
-                        prev_hand_qpos,
-                        vr_frame,
-                        cam,
-                        hand_state=hand_state,
-                        hand_tactile=hand_tactile,
-                        frame_status=_FRAME_IK_FAIL,
-                        retarget_ok=retarget_ok,
-                        arm_qpos_sent=prev_qpos_cmd.copy(),
-                        target_eef_pos=_last_target_eef_pos,
-                        target_eef_rot6d=_last_target_eef_rot6d,
-                        hand_fk=_hand_fk,
-                        T_eef_handbase_pos=_T_eef_handbase_pos,
-                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
-                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-                        shared=shared,
-                    )
                 # The arm is held, but hand motion still needs arm↔hand collision validation.
                 hand_safe = hand_cmd_valid and _transition_collision_free(
                     planner, arm_qpos, prev_qpos_cmd, hand_start_qpos, hand_cmd
@@ -1631,15 +1618,39 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     if published_candidate.hand_qpos is not None:
                         safe_hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
                     prev_hand_qpos = safe_hand_cmd.copy()
-                elif not _safe_arm_queue_put(
-                    shared,
-                    {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
-                    observation_id=int(vr_frame["ring_sequence"]),
-                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
-                ):
-                    shared.error_state.value = True
-                    break
+                else:
+                    published_candidate = _safe_arm_queue_put(
+                        shared,
+                        {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
+                        observation_id=int(vr_frame["ring_sequence"]),
+                        observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                        safety_gate=action_safety_gate,
+                    )
+                    if published_candidate is None:
+                        shared.error_state.value = True
+                        break
+                if recording_active:
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        prev_qpos_cmd,
+                        prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        frame_status=_FRAME_IK_FAIL,
+                        retarget_ok=retarget_ok,
+                        arm_qpos_sent=prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
+                        action_candidate=published_candidate,
+                    )
                 continue
 
             # IK delta clamp
@@ -1674,6 +1685,19 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             transition_check_time_ms = (time.perf_counter() - _transition_check_t0) * 1000.0
             if _reject:
                 _validate_warn("policy_loop: action rejected — %s", _reject_reason)
+                published_hold = _safe_joint_publish(
+                    shared,
+                    prev_qpos_cmd.copy(),
+                    prev_hand_qpos.copy() if hand_available else None,
+                    is_hold=True,
+                    timeout=0.06,
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                )
+                if published_hold is None:
+                    shared.error_state.value = True
+                    break
                 if recording_active:
                     _record_held(
                         recorder,
@@ -1694,19 +1718,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                         observation_anchor_monotonic_ns=_current_grid_anchor_ns,
                         shared=shared,
+                        action_candidate=published_hold,
                     )
-                if not _safe_joint_publish(
-                    shared,
-                    prev_qpos_cmd.copy(),
-                    prev_hand_qpos.copy() if hand_available else None,
-                    is_hold=True,
-                    timeout=0.06,
-                    observation_id=int(vr_frame["ring_sequence"]),
-                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
-                ):
-                    shared.error_state.value = True
-                    break
                 continue
 
             # FAULT gate: do not send actions when system is in fault state.
@@ -1793,6 +1806,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                     observation_anchor_monotonic_ns=_current_grid_anchor_ns,
                     shared=shared,
+                    action_candidate=published_candidate,
                 )
             stage_timer.mark("rec")
 
@@ -2108,6 +2122,7 @@ def _recording_provenance(
     cam: dict | None,
     *,
     anchor_monotonic_ns: int | None = None,
+    action_candidate: ActionCandidate | None = None,
 ) -> dict[str, object]:
     """Correlate one policy-grid sample with causal sources and action ACKs."""
     anchor_ns = time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
@@ -2165,16 +2180,18 @@ def _recording_provenance(
         required_mask = np.concatenate([required_mask, source_valid[1:2]])
     observation_valid = bool(np.all(required_mask)) and bool(np.nanmax(skew_s, initial=0.0) <= 0.10)
 
-    commit_result = shared.action_commit_ring.read_latest()
-    commit = commit_result[0][0] if commit_result is not None else None
-    action_id = int(commit["action_id"]) if commit is not None else 0
+    action_id = action_candidate.action_id if action_candidate is not None else 0
     arm_ack = _latest_action_ack(shared.arm_ack_ring, action_id)
     hand_ack = _latest_action_ack(shared.hand_ack_ring, action_id)
-    action_observation_id = 0
-    if arm_ack is not None:
-        action_observation_id = int(arm_ack["observation_id"])
-    elif hand_ack is not None:
-        action_observation_id = int(hand_ack["observation_id"])
+    observation_id = (
+        action_candidate.observation_id
+        if action_candidate is not None
+        else int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
+    )
+    if observation_id <= 0:
+        # The grid anchor is a stable, positive identity for observations that
+        # intentionally have no VR frame (for example a stale-input hold).
+        observation_id = anchor_ns
 
     def _ack_value(ack: np.void | None, name: str) -> int:
         return int(ack[name]) if ack is not None else 0
@@ -2202,7 +2219,7 @@ def _recording_provenance(
         and anchor_ns - tactile_source_ns <= 250_000_000
     )
     return {
-        "observation_id": action_observation_id or anchor_ns,
+        "observation_id": observation_id,
         "observation_anchor_monotonic_ns": anchor_ns,
         "arm_source_sequence": arm_source_sequence,
         "hand_source_sequence": hand_source_sequence,
@@ -2223,13 +2240,19 @@ def _recording_provenance(
         "observation_valid": observation_valid,
         "observation_skew_s": float(np.nanmax(skew_s, initial=0.0)),
         "action_id": action_id,
-        "action_chunk_id": int(commit["chunk_id"]) if commit is not None else 0,
-        "action_step_index": int(commit["step_index"]) if commit is not None else 0,
-        "action_created_monotonic_ns": int(commit["created_monotonic_ns"]) if commit is not None else 0,
-        "action_target_monotonic_ns": int(commit["target_monotonic_ns"]) if commit is not None else 0,
-        "action_valid_until_monotonic_ns": (int(commit["valid_until_monotonic_ns"]) if commit is not None else 0),
-        "action_queued": arm_ack is not None or hand_ack is not None,
-        "action_committed": commit is not None,
+        "action_chunk_id": action_candidate.chunk_id if action_candidate is not None else 0,
+        "action_step_index": action_candidate.step_index if action_candidate is not None else 0,
+        "action_created_monotonic_ns": action_candidate.created_monotonic_ns if action_candidate is not None else 0,
+        "action_target_monotonic_ns": action_candidate.target_monotonic_ns if action_candidate is not None else 0,
+        "action_valid_until_monotonic_ns": (
+            action_candidate.valid_until_monotonic_ns if action_candidate is not None else 0
+        ),
+        "action_queued": bool(
+            action_candidate is not None
+            and (action_candidate.arm_qpos is None or arm_ack is not None)
+            and (action_candidate.hand_qpos is None or hand_ack is not None)
+        ),
+        "action_committed": action_candidate is not None,
         "arm_ack_status": _ack_value(arm_ack, "status"),
         "hand_ack_status": _ack_value(hand_ack, "status"),
         "arm_ack_reject_reason": _ack_value(arm_ack, "reject_reason"),
@@ -2278,8 +2301,9 @@ def _record_held(
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     shared: SharedStorage | None = None,
+    action_candidate: ActionCandidate | None = None,
 ) -> None:
-    """Record a held frame (no new action sent).
+    """Record a held frame, optionally bound to the exact hold command sent.
 
     Args:
         arm_qpos_sent: Last command actually queued to arm_action_q.
@@ -2287,6 +2311,8 @@ def _record_held(
         diagnostics: Per-frame diagnostics (tracking_error, ik_solve_time_ms, etc.).
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
             ``action_arm_ee`` for replay.
+        action_candidate: Exact hold candidate committed for this observation,
+            or ``None`` when the grid intentionally emitted no new command.
     """
     if recorder is None:
         return
@@ -2329,6 +2355,7 @@ def _record_held(
                 vr_frame,
                 cam,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
+                action_candidate=action_candidate,
             )
         )
     recorder.add_frame(
@@ -2371,6 +2398,7 @@ def _record_frame(
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     shared: SharedStorage | None = None,
+    action_candidate: ActionCandidate | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
 
@@ -2426,6 +2454,7 @@ def _record_frame(
                 vr_frame,
                 cam,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
+                action_candidate=action_candidate,
             )
         )
     recorder.add_frame(
