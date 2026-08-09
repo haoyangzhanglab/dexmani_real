@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rerun-based episode visualizer for DexMani teleop data.
 
-Supports legacy (single ``.h5``) and current (directory with ``data.h5`` +
-``depth.h5`` + ``rgb.mp4``) episode formats.
+Supports legacy single-HDF5 and v13–v15 directory episodes
+(``data.h5`` + ``depth.h5`` + ``pointcloud.h5`` + ``rgb.mp4``) episodes.
 
 Usage:
   python -m dexmani_real.tools.visualize_episode episode.h5
@@ -43,7 +43,15 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "action": {"action_arm_joint", "action_arm_ee", "action_hand_joint"},
     "vr": {"vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks"},
     "camera": {"rgb", "depth"},
-    "flags": {"flag_ik_ok", "flag_retarget_ok", "flag_held", "flag_camera_fresh"},
+    "flags": {
+        "flag_ik_ok",
+        "flag_retarget_ok",
+        "flag_held",
+        "flag_camera_fresh",
+        "flag_pointcloud_valid",
+        "camera_age_s",
+        "camera_frame_number",
+    },
     "meta": {"timestamp"},
 }
 
@@ -138,6 +146,9 @@ def print_episode_info(h5_path: str) -> None:
         if "flag_camera_fresh" in f:
             fresh = f["flag_camera_fresh"][:]
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
+        if "flag_pointcloud_valid" in f:
+            valid = f["flag_pointcloud_valid"][:]
+            print(f"flag_pointcloud_valid rate: {valid.mean():.2%}")
 
 
 # ---------------------------------------------------------------------------

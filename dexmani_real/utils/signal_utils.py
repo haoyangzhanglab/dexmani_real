@@ -7,12 +7,36 @@ __all__ = ["ema_smooth_pose"]
 import numpy as np
 
 
+def _normalize_quat(q: np.ndarray, *, name: str) -> np.ndarray:
+    value = np.asarray(q, dtype=np.float64)
+    if value.shape != (4,) or not np.all(np.isfinite(value)):
+        raise ValueError(f"{name} must be a finite (4,) quaternion")
+    norm = float(np.linalg.norm(value))
+    if norm < 1e-12:
+        raise ValueError(f"{name} quaternion norm is too small")
+    return value / norm
+
+
+def _quat_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return np.array(
+        [
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ],
+        dtype=np.float64,
+    )
+
+
 def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
-    """Convert wxyz quaternion to rotation vector (axis * angle)."""
+    """Convert a normalized wxyz quaternion to a shortest-arc rotation vector."""
     sign = np.asarray(q, dtype=np.float64)
     if sign[0] < 0:
         sign = -sign
-    w, x, y, z = sign[0], sign[1], sign[2], sign[3]
+    w, x, y, z = np.clip(sign[0], -1.0, 1.0), sign[1], sign[2], sign[3]
     sin_half = np.sqrt(x * x + y * y + z * z)
     if sin_half < 1e-12:
         return np.zeros(3, dtype=np.float64)
@@ -61,19 +85,27 @@ def ema_smooth_pose(
         prev_pos, dtype=np.float64
     )
 
-    # Orientation: quat → rotvec → EMA → quat
-    target_rv = _quat_to_rotvec(np.asarray(target_quat_wxyz, dtype=np.float64))
-    prev_rv = _quat_to_rotvec(np.asarray(prev_quat_wxyz, dtype=np.float64))
-    rv = alpha_rot * target_rv + (1.0 - alpha_rot) * prev_rv
+    # Orientation: interpolate the relative rotation, not two absolute
+    # rotation vectors.  Choose the target quaternion sign from the adjacent
+    # dot product so the ±π/S³ antipode boundary always follows the shortest
+    # arc, then apply an exp/log SO(3) step from the previous orientation.
+    prev_quat = _normalize_quat(prev_quat_wxyz, name="prev_quat_wxyz")
+    target_quat = _normalize_quat(target_quat_wxyz, name="target_quat_wxyz")
+    if float(np.dot(prev_quat, target_quat)) < 0.0:
+        target_quat = -target_quat
+    prev_conjugate = prev_quat * np.array([1.0, -1.0, -1.0, -1.0])
+    relative_quat = _normalize_quat(_quat_multiply(prev_conjugate, target_quat), name="relative")
+    rv = alpha_rot * _quat_to_rotvec(relative_quat)
 
     angle = float(np.linalg.norm(rv))
     if angle < 1e-12:
-        quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        quat = prev_quat.copy()
     else:
         axis = rv / angle
         half = angle / 2.0
-        quat = np.array(
+        delta_quat = np.array(
             [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)], dtype=np.float64
         )
+        quat = _normalize_quat(_quat_multiply(prev_quat, delta_quat), name="smoothed")
 
     return pos, quat

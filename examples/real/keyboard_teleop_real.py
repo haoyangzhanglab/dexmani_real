@@ -36,10 +36,15 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.config.defaults import arm, hand, keyboard_teleop, policy, safety
+from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.planning.pose_utils import quat_multiply
+from dexmani_real.policy.action_protocol import (
+    ActionSafetyGateConfig,
+    planner_action_safety_gate,
+    publish_joint_targets,
+)
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import HandProcessConfig
@@ -47,7 +52,7 @@ from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
     SharedStorage,
-    make_arm_action,
+    SharedStorageConfig,
     send_arm_home,
     shutdown_processes,
     wait_subsystem_ready,
@@ -69,17 +74,6 @@ except ImportError:
     raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
 
 logger = get_logger(__name__)
-
-# ═══════════════════════════════════════════════ Config
-
-
-# Numeric defaults live in config/defaults.py with the other runtime rates.
-_cfg = keyboard_teleop
-
-# Workspace bounds in WORLD frame (defined in defaults.py as world-frame coordinates).
-# Base frame = world frame (identity transform).
-WORKSPACE_BOUNDS = policy.workspace.as_array()
-
 
 # ═══════════════════════════════════════════════ Helpers
 
@@ -145,19 +139,20 @@ def _wall_check(
 
 def _runtime_health_error(
     shared: SharedStorage,
-    arm_proc: mp.Process,
-    hand_proc: mp.Process | None,
+    arm_proc: object,
+    hand_proc: object | None,
     *,
     hand_required: bool,
+    heartbeat_timeouts_s: dict[str, float],
 ) -> str | None:
     """Return a fail-closed runtime health error, or ``None`` when healthy."""
     if shared.error_state.value:
         return "sticky error_state set by a worker"
     if shared.safety_state.value == int(SafetyState.FAULT):
         return "safety state is FAULT"
-    if not arm_proc.is_alive():
+    if not getattr(arm_proc, "is_alive")():
         return "arm worker exited"
-    if hand_required and (hand_proc is None or not hand_proc.is_alive()):
+    if hand_required and (hand_proc is None or not getattr(hand_proc, "is_alive")()):
         return "hand worker exited"
 
     now = time.monotonic()
@@ -167,7 +162,7 @@ def _runtime_health_error(
     for name, heartbeat in heartbeats:
         last_s = float(heartbeat.value)
         age_s = now - last_s if last_s > 0.0 else float("inf")
-        if age_s > float(safety.heartbeat_timeouts[name]):
+        if age_s > float(heartbeat_timeouts_s[name]):
             return f"{name} heartbeat stale ({age_s:.2f}s)"
     return None
 
@@ -182,10 +177,31 @@ def main():
     _hand_group = parser.add_mutually_exclusive_group()
     _hand_group.add_argument("--no-hand", action="store_true", help="Skip XHand probing and run arm-only")
     _hand_group.add_argument("--require-hand", action="store_true", help="Abort unless XHand becomes ready")
+    parser.add_argument("--config", type=Path, default=None, help="Runtime JSON; CLI capability flags take precedence")
     _args = parser.parse_args()
 
+    runtime = resolve_runtime_config(
+        json_path=_args.config,
+        cli_overrides={
+            "policy.hand_enabled": False if _args.no_hand else True if _args.require_hand else None,
+        },
+    )
+    _cfg = runtime.keyboard_teleop
+    arm_runtime = runtime.arm
+    hand_runtime = runtime.hand
+    policy_runtime = runtime.policy
+    heartbeat_timeouts_s = dict(runtime.safety.heartbeat_timeouts)
+    workspace_bounds = np.array(
+        [
+            [policy_runtime.workspace.x_min, policy_runtime.workspace.x_max],
+            [policy_runtime.workspace.y_min, policy_runtime.workspace.y_max],
+            [policy_runtime.workspace.z_min, policy_runtime.workspace.z_max],
+        ],
+        dtype=np.float64,
+    )
+
     _dt = 1.0 / _cfg.control_hz
-    _hand_enabled = not _args.no_hand
+    _hand_enabled = bool(runtime.policy.hand_enabled)
     _hand_required = bool(_args.require_hand)
     _hand_mode = "OFF" if not _hand_enabled else ("REQUIRED" if _hand_required else "OPTIONAL")
     print("=" * 60)
@@ -194,15 +210,16 @@ def main():
         f"  step  pos={_cfg.delta_pos_m*1000:.0f} mm  rot={np.rad2deg(_cfg.delta_rpy_rad):.1f} deg  "
         f"dt={_dt*1000:.0f} ms  rate={_cfg.control_hz:.0f} Hz"
     )
-    print(f"  EMA   pos={policy.ema.alpha_pos:.2f}  rot={policy.ema.alpha_rot:.2f}")
+    print(f"  EMA   pos={policy_runtime.ema.alpha_pos:.2f}  rot={policy_runtime.ema.alpha_rot:.2f}")
     print(f"  Kp    cartesian={_cfg.cartesian_kp:.1f}")
     if _cfg.release_trace_enabled:
         print(
             f"  Trace release={_cfg.release_trace_pre_frames}+{_cfg.release_trace_post_frames} frames  "
             f"cooldown={_cfg.release_trace_cooldown_s:.1f}s"
         )
-    print(f"  WS    x{WORKSPACE_BOUNDS[0]}  y{WORKSPACE_BOUNDS[1]}  z{WORKSPACE_BOUNDS[2]}")
+    print(f"  WS    x{workspace_bounds[0]}  y{workspace_bounds[1]}  z{workspace_bounds[2]}")
     print(f"  Hand  {_hand_mode}")
+    print(f"  Config {runtime.sha256[:12]}")
     print("=" * 60)
 
     # ── 1. Planner ──
@@ -216,32 +233,58 @@ def main():
     # These experimental entries may run without XHand hardware. Keep the
     # 19-DOF collision model conservative and deterministic by explicitly
     # using the configured open-hand pose until measured state is available.
-    _assumed_hand_qpos = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
+    _assumed_hand_qpos = np.deg2rad(np.asarray(hand_runtime.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(_assumed_hand_qpos)
+    planner.workspace_bounds = workspace_bounds.copy()
+    action_safety_gate = planner_action_safety_gate(
+        ActionSafetyGateConfig(
+            arm_joint_lower_rad=tuple(arm_runtime.joint_limit_lower),
+            arm_joint_upper_rad=tuple(arm_runtime.joint_limit_upper),
+            hand_joint_lower_rad=tuple(hand_runtime.qpos_min_rad),
+            hand_joint_upper_rad=tuple(hand_runtime.qpos_max_rad),
+            arm_max_velocity_rad_s=float(np.deg2rad(arm_runtime.max_joint_velocity_deg_per_s)),
+            hand_max_velocity_rad_s=(
+                float(hand_runtime.max_delta_rad) * _cfg.control_hz
+                if hand_runtime.max_delta_rad is not None
+                else float(np.deg2rad(180.0))
+            ),
+            require_geometry_checks=True,
+        ),
+        planner=planner,
+        table_z_surface_m=float(arm_runtime.table_z_surface_m),
+        hand_safety_margin_m=float(arm_runtime.hand_safety_margin_m),
+    )
 
     # ── 2. SharedStorage + subprocesses ──
-    shared = SharedStorage.create(prefix="dexmani_kb")
-    arm_loop_cfg = ArmLoopConfig()
-    arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_loop_cfg), name="arm-kb", daemon=True)
+    ctx = mp.get_context("spawn")
+    shared = SharedStorage.create(
+        prefix="dexmani_kb",
+        config=SharedStorageConfig.from_runtime(runtime),
+        mp_context=ctx,
+    )
+    arm_loop_cfg = ArmLoopConfig.from_runtime(runtime)
+    arm_proc = ctx.Process(target=_arm_loop, args=(shared, arm_loop_cfg), name="arm-kb", daemon=False)
     arm_proc.start()
-    hand_proc: mp.Process | None = None
-    _procs = [arm_proc]
+    hand_proc: object | None = None
+    _procs: list[object] = [arm_proc]
     if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, 15)], [arm_proc]):
         shutdown_processes(shared, _procs)
         return
 
     if _hand_enabled:
-        _hand_cfg = HandProcessConfig(startup_failure_is_fatal=_hand_required)
-        hand_proc = mp.Process(target=_hand_loop, args=(shared, _hand_cfg), name="hand-kb", daemon=True)
-        hand_proc.start()
+        _hand_cfg = HandProcessConfig.from_runtime(runtime, startup_failure_is_fatal=_hand_required)
+        hand_proc = ctx.Process(target=_hand_loop, args=(shared, _hand_cfg), name="hand-kb", daemon=False)
+        getattr(hand_proc, "start")()
         _procs.append(hand_proc)
 
         _hand_deadline_s = time.monotonic() + 15.0
-        while not shared.hand_ready.is_set() and hand_proc.is_alive() and time.monotonic() < _hand_deadline_s:
+        while (
+            not shared.hand_ready.is_set() and getattr(hand_proc, "is_alive")() and time.monotonic() < _hand_deadline_s
+        ):
             time.sleep(0.1)
 
         if not shared.hand_ready.is_set():
-            if hand_proc.is_alive():
+            if getattr(hand_proc, "is_alive")():
                 logger.error("XHand startup did not finish within 15s — aborting to avoid an indeterminate worker")
                 shutdown_processes(shared, _procs)
                 return
@@ -383,6 +426,7 @@ def main():
                 arm_proc,
                 hand_proc,
                 hand_required=_hand_enabled,
+                heartbeat_timeouts_s=heartbeat_timeouts_s,
             )
             if _health_error is not None:
                 logger.error("Runtime health failure: %s", _health_error)
@@ -413,7 +457,7 @@ def main():
                     shared,
                     _home_qpos,
                     planner=planner,
-                    table_z_surface_m=arm.table_z_surface_m,
+                    table_z_surface_m=float(arm_runtime.table_z_surface_m),
                     current_qpos=arm_qpos,
                     heartbeat=False,
                     verbose=True,
@@ -621,10 +665,10 @@ def main():
                     target_pos[axis] += dx[axis]
 
             # Workspace boundary: direct clamp in world frame.
-            # WORKSPACE_BOUNDS is the world-frame AABB of the base workspace box.
-            target_pos = np.clip(target_pos, WORKSPACE_BOUNDS[:, 0], WORKSPACE_BOUNDS[:, 1])
+            # workspace_bounds is the world-frame AABB of the base workspace box.
+            target_pos = np.clip(target_pos, workspace_bounds[:, 0], workspace_bounds[:, 1])
             for axis in range(3):
-                _wall_check(axis, target_pos, WORKSPACE_BOUNDS, wall_warned, wall_timers)
+                _wall_check(axis, target_pos, workspace_bounds, wall_warned, wall_timers)
 
             if np.any(drpy != 0):
                 dq = R.from_euler("xyz", drpy).as_quat(scalar_first=True)
@@ -636,14 +680,14 @@ def main():
             # theoretical ramp lag is 5.3 mm at the 8 mm step. The much larger
             # observed lead is therefore downstream tracking dynamics, not EMA
             # alone.
-            if _prev_ema_pos is not None:
+            if _prev_ema_pos is not None and _prev_ema_quat is not None:
                 ik_target_pos, ik_target_quat = ema_smooth_pose(
                     target_pos,
                     target_quat,
                     _prev_ema_pos,
                     _prev_ema_quat,
-                    policy.ema.alpha_pos,
-                    policy.ema.alpha_rot,
+                    policy_runtime.ema.alpha_pos,
+                    policy_runtime.ema.alpha_rot,
                 )
             else:
                 ik_target_pos, ik_target_quat = target_pos.copy(), target_quat.copy()
@@ -662,8 +706,8 @@ def main():
                     ik_target_pos = ik_target_pos + _cfg.cartesian_kp * pos_error
                     ik_target_pos = np.clip(
                         ik_target_pos,
-                        WORKSPACE_BOUNDS[:, 0],
-                        WORKSPACE_BOUNDS[:, 1],
+                        workspace_bounds[:, 0],
+                        workspace_bounds[:, 1],
                     )
 
             # ── IK solve (on EMA-smoothed world-frame target) ──
@@ -699,7 +743,6 @@ def main():
 
             ik_outcome = "ok"
             ik_ok_count += 1
-            prev_qpos_cmd = ik_result.qpos.copy()
             arm_cmd = ik_result.qpos
 
             # ── Motion Trace: pure-axis pipeline diagnostics ──
@@ -739,7 +782,20 @@ def main():
             if shared.safety_state.value == int(SafetyState.FAULT):
                 continue
 
-            shared.arm_action_q.put(make_arm_action(shared, arm_cmd))
+            published_candidate = publish_joint_targets(
+                shared,
+                arm_cmd,
+                prepare_timeout_s=0.06,
+                dt_s=_dt,
+                safety_gate=action_safety_gate,
+            )
+            if published_candidate is None:
+                logger.error("keyboard teleop: arm prepare/commit failed")
+                shared.error_state.value = True
+                break
+            assert published_candidate.arm_qpos is not None
+            arm_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
+            prev_qpos_cmd = arm_cmd.copy()
 
             # ── Tracking safety ──
             if np.all(np.isfinite(arm_qpos)):
@@ -814,6 +870,7 @@ def main():
                     arm_proc,
                     hand_proc,
                     hand_required=_hand_enabled,
+                    heartbeat_timeouts_s=heartbeat_timeouts_s,
                 )
                 if _health_error is not None:
                     logger.error("Runtime health failure while waiting to quit: %s", _health_error)
@@ -831,6 +888,7 @@ def main():
                     arm_proc,
                     hand_proc,
                     hand_required=_hand_enabled,
+                    heartbeat_timeouts_s=heartbeat_timeouts_s,
                 )
                 if _health_error is not None:
                     logger.error("Runtime health failure in post-loop prompt: %s", _health_error)
@@ -845,7 +903,7 @@ def main():
                         shared,
                         _home_qpos,
                         planner=planner,
-                        table_z_surface_m=arm.table_z_surface_m,
+                        table_z_surface_m=float(arm_runtime.table_z_surface_m),
                         heartbeat=False,
                         verbose=True,
                     )

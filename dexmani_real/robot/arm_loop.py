@@ -5,6 +5,7 @@ Primary entry point: ``arm_loop(shared)`` — mp.Process target using SharedStor
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -15,8 +16,25 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, safety
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
+from dexmani_real.policy.action_protocol import (
+    ARM_COMMAND_DTYPE,
+    AckStatus,
+    RejectReason,
+    command_matches_commit,
+    make_ack,
+    make_stopped_ack,
+    validate_worker_command,
+)
 from dexmani_real.robot.safety import SafetyState
-from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, HOME_SENTINEL, HomeRequest, HomeResult, new_frame
+from dexmani_real.runtime.status import ComponentPhase, FaultCode
+from dexmani_real.shm.shared_storage import (
+    ARM_STATE_DTYPE,
+    HOME_SENTINEL,
+    HomeRequest,
+    HomeResult,
+    new_frame,
+    publish_component_status,
+)
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
@@ -42,47 +60,146 @@ class ArmLoopConfig:
     home_qpos: tuple[float, ...] = field(default_factory=lambda: arm.home_qpos)
 
     collision_sensitivity: int = field(default_factory=lambda: arm.collision_sensitivity)
+    recoverable_errors: frozenset[int] = field(default_factory=lambda: arm.recoverable_errors)
+    collision_fault_errors: frozenset[int] = field(default_factory=lambda: arm.collision_fault_errors)
+    max_consecutive_recoveries: int = field(default_factory=lambda: safety.max_consecutive_recoveries)
 
     homing_convergence_rad: float = field(default_factory=lambda: arm.homing.convergence_rad)
     homing_step_interval_s: float = field(default_factory=lambda: arm.homing.step_interval_s)
     homing_max_speed_rad_per_s: float = field(default_factory=lambda: np.deg2rad(arm.homing.max_speed_deg_s))
     homing_target_timeout_s: float = field(default_factory=lambda: arm.homing.target_timeout_s)
+    homing_velocity_convergence_rad_s: float = field(default_factory=lambda: arm.homing.velocity_convergence_rad_s)
+    homing_dwell_s: float = field(default_factory=lambda: arm.homing.dwell_s)
+
+    def __post_init__(self) -> None:
+        lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
+        upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
+        home = np.asarray(self.home_qpos, dtype=np.float64)
+        if lower.shape != (7,) or upper.shape != (7,) or home.shape != (7,):
+            raise ValueError("arm loop joint limits/home must have shape (7,)")
+        if not np.all(np.isfinite(np.concatenate((lower, upper, home)))) or np.any(lower > upper):
+            raise ValueError("arm loop joint limits/home must be finite and ordered")
+        if self.recoverable_errors & self.collision_fault_errors:
+            raise ValueError("recoverable and collision-fault error codes must be disjoint")
+        if self.recoverable_errors != frozenset({24}) or not frozenset({22, 31}).issubset(self.collision_fault_errors):
+            raise ValueError("arm loop requires only C24 recoverable and C22/C31 collision-fatal")
+        if self.max_consecutive_recoveries <= 0:
+            raise ValueError("max_consecutive_recoveries must be positive")
+        timing = (
+            self.joint_max_speed_rad_per_s,
+            self.joint_max_acc_rad_per_s2,
+            self.arm_loop_hz,
+            self.tracking_error_warn_rad,
+            self.homing_convergence_rad,
+            self.homing_step_interval_s,
+            self.homing_max_speed_rad_per_s,
+            self.homing_target_timeout_s,
+            self.homing_velocity_convergence_rad_s,
+            self.homing_dwell_s,
+        )
+        if not all(np.isfinite(value) and value > 0 for value in timing):
+            raise ValueError("arm loop motion/homing parameters must be finite and positive")
+        if not self.arm_ip or not (0 <= self.collision_sensitivity <= 5):
+            raise ValueError("arm loop IP/collision sensitivity is invalid")
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> "ArmLoopConfig":
+        cfg = runtime.arm
+        return cls(
+            joint_max_speed_rad_per_s=float(np.deg2rad(cfg.max_joint_velocity_deg_per_s)),
+            joint_max_acc_rad_per_s2=float(np.deg2rad(cfg.max_joint_acceleration_deg_per_s2)),
+            arm_loop_hz=float(cfg.loop_hz),
+            joint_limit_lower=tuple(cfg.joint_limit_lower),
+            joint_limit_upper=tuple(cfg.joint_limit_upper),
+            tracking_error_warn_rad=float(cfg.tracking_error_warn_rad),
+            arm_ip=str(cfg.ip),
+            home_qpos=tuple(cfg.home_qpos),
+            collision_sensitivity=int(cfg.collision_sensitivity),
+            recoverable_errors=frozenset(int(code) for code in cfg.recoverable_errors),
+            collision_fault_errors=frozenset(int(code) for code in cfg.collision_fault_errors),
+            max_consecutive_recoveries=int(runtime.safety.max_consecutive_recoveries),
+            homing_convergence_rad=float(cfg.homing.convergence_rad),
+            homing_step_interval_s=float(cfg.homing.step_interval_s),
+            homing_max_speed_rad_per_s=float(np.deg2rad(cfg.homing.max_speed_deg_s)),
+            homing_target_timeout_s=float(cfg.homing.target_timeout_s),
+            homing_velocity_convergence_rad_s=float(cfg.homing.velocity_convergence_rad_s),
+            homing_dwell_s=float(cfg.homing.dwell_s),
+        )
 
 
 # Controller errors: C24 is recoverable; C22/C31 are immediate collision faults.
-_RECOVERABLE_ERRORS: frozenset[int] = arm.recoverable_errors
-_COLLISION_FAULT_ERRORS: frozenset[int] = arm.collision_fault_errors
-_RECOVERY_MAX: int = safety.max_consecutive_recoveries  # consecutive recoveries before FAULT escalation (1s @ 30Hz)
-
-
 def _require_sdk_ok(operation: str, code: Any) -> None:
     """Raise when an xArm setter reports failure without raising."""
     if not isinstance(code, (int, np.integer)) or int(code) != 0:
         raise RuntimeError(f"{operation} failed with SDK code {code!r}")
 
 
-def _parse_arm_action_metadata(action: dict[str, Any], received_s: float) -> tuple[int, float, bool]:
-    """Return validated ``(sequence, created_s, is_hold)`` metadata.
+def _recover_c24_measured_hold(arm_api: Any, cfg: ArmLoopConfig, *, operation_prefix: str = "C24") -> np.ndarray:
+    """Clear one C24, read fresh joints, and send exactly one measured hold."""
+    _require_sdk_ok(f"{operation_prefix} clean_error", arm_api.clean_error())
+    _require_sdk_ok(f"{operation_prefix} clean_warn", arm_api.clean_warn())
+    _require_sdk_ok(f"{operation_prefix} set_mode(6)", arm_api.set_mode(6))
+    _require_sdk_ok(f"{operation_prefix} set_state(0)", arm_api.set_state(0))
+    state_code, measured = arm_api.get_joint_states(is_radian=True, num=1)
+    _require_sdk_ok(f"{operation_prefix} fresh get_joint_states", state_code)
+    measured_hold = np.asarray(measured[0], dtype=np.float64)[:7]
+    if measured_hold.shape != (7,) or not np.all(np.isfinite(measured_hold)):
+        raise RuntimeError(f"{operation_prefix} measured hold is invalid")
+    _require_sdk_ok(
+        f"{operation_prefix} measured hold",
+        arm_api.set_servo_angle(
+            angle=measured_hold,
+            is_radian=True,
+            speed=cfg.joint_max_speed_rad_per_s,
+            mvacc=cfg.joint_max_acc_rad_per_s2,
+            wait=False,
+        ),
+    )
+    return measured_hold.copy()
 
-    Legacy/externally constructed actions remain executable, but receive a
-    sequence of zero and a zero-queue-age timestamp instead of publishing
-    invalid latency diagnostics.
-    """
-    try:
-        command_seq = int(action.get("command_seq", 0))
-    except (TypeError, ValueError, OverflowError):
-        command_seq = 0
-    if command_seq < 0:
-        command_seq = 0
 
-    try:
-        created_s = float(action.get("created_monotonic_s", received_s))
-    except (TypeError, ValueError, OverflowError):
-        created_s = received_s
-    if not np.isfinite(created_s) or created_s <= 0.0 or created_s > received_s:
-        created_s = received_s
+def _parse_arm_action_metadata(action: Any, received_s: float) -> tuple[int, float, bool]:
+    """Return ``(sequence, created_s, is_hold)`` for a fixed command frame."""
+    if isinstance(action, np.ndarray) and action.shape == (1,) and action.dtype == ARM_COMMAND_DTYPE:
+        command_seq = int(action["action_id"][0])
+        created_s = int(action["created_monotonic_ns"][0]) / 1e9
+        if not np.isfinite(created_s) or created_s <= 0.0 or created_s > received_s:
+            created_s = received_s
+        return command_seq, created_s, bool(action["is_hold"][0])
+    return 0, received_s, False
 
-    return command_seq, created_s, bool(action.get("is_hold", False))
+
+def _read_live_status(arm_api: Any) -> tuple[int, int, int]:
+    """Return live ``(state, mode, error)`` or raise on any failed read."""
+    if hasattr(arm_api, "get_state"):
+        code, state = arm_api.get_state()
+        _require_sdk_ok("get_state", code)
+    else:
+        state = getattr(arm_api, "state")
+    mode = int(getattr(arm_api, "mode"))
+    code, values = arm_api.get_err_warn_code()
+    _require_sdk_ok("get_err_warn_code", code)
+    return int(state), mode, int(values[0])
+
+
+def _wait_live_status(
+    arm_api: Any,
+    *,
+    expected_state: int,
+    expected_mode: int | None = None,
+    timeout_s: float = 1.0,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    last: tuple[int, int, int] | None = None
+    while time.monotonic() < deadline:
+        last = _read_live_status(arm_api)
+        state, mode, error = last
+        if state == expected_state and error == 0 and (expected_mode is None or mode == expected_mode):
+            return
+        time.sleep(0.03)
+    raise RuntimeError(
+        f"controller postcondition failed: expected state={expected_state} mode={expected_mode} error=0, got {last}"
+    )
 
 
 def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
@@ -125,10 +242,20 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
     _state_read_warn = ThrottledWarner(interval_s=5.0)
-    _recovery_counter = RetryCounter(max_consecutive=_RECOVERY_MAX, label="arm_servo")
-    _state_error_counter = RetryCounter(max_consecutive=_RECOVERY_MAX, label="arm_state")
-    _tracking_err_count = 0
     cfg = config or ArmLoopConfig()
+    _recovery_counter = RetryCounter(max_consecutive=cfg.max_consecutive_recoveries, label="arm_servo")
+    _state_error_counter = RetryCounter(max_consecutive=cfg.max_consecutive_recoveries, label="arm_state")
+    _tracking_err_count = 0
+    publish_component_status(shared, "arm", ComponentPhase.LOADING)
+
+    def _publish_startup_fault(detail: str) -> None:
+        publish_component_status(
+            shared,
+            "arm",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.STARTUP_FAILED,
+            detail=detail,
+        )
 
     # URDF-consistent FK (replaces arm.get_position_aa). xArm firmware uses a
     # different EEF coordinate definition — Pinocchio FK ensures all consumers
@@ -142,26 +269,33 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         arm = XArmAPI(cfg.arm_ip, is_radian=True)
     except Exception as e:
         logger.error("arm_loop: connect failed: %s", e)
+        _publish_startup_fault("SDK connect failed")
         shared.error_state.value = True
         return
 
-    # 3-retry connect recovery (ref: pi-r2-flow xarm_sdk.py:61-81).
-    # Sticky error states (post-collision, E-Stop, power-on race) may need
-    # multiple clear cycles.  Transition through mode 0 first — some firmware
-    # releases require this intermediate state.
+    if hasattr(shared, "arm_device_identity"):
+        identity = {
+            "device_type": str(getattr(arm, "device_type", "unavailable")),
+            "firmware_version": str(getattr(arm, "version", "unavailable")),
+            "model": "xArm7",
+            "serial_number": str(getattr(arm, "sn", "unavailable")),
+        }
+        encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        shared.arm_device_identity.value = encoded_identity[:1023].ljust(1024, b"\x00")
+
+    # Connect/configure while the application remains DISARMED. Motion mode is
+    # entered only on the ARMED edge below.
     _CONNECT_MAX_RETRIES = 3
     for _attempt in range(_CONNECT_MAX_RETRIES):
         try:
-            arm.clean_error()
-            arm.clean_warn()
-            arm.motion_enable(True)
+            _require_sdk_ok("startup clean_error", arm.clean_error())
+            _require_sdk_ok("startup clean_warn", arm.clean_warn())
+            _require_sdk_ok("startup motion_enable", arm.motion_enable(True))
             time.sleep(0.3)
-            arm.set_mode(0)
+            _require_sdk_ok("startup set_mode(0)", arm.set_mode(0))
             time.sleep(0.1)
-            arm.set_state(0)
+            _require_sdk_ok("startup set_state(0)", arm.set_state(0))
             time.sleep(0.3)
-            arm.set_mode(6)
-            time.sleep(0.1)
             # Live read via get_err_warn_code() — more reliable than the cached
             # .error_code property (background report thread, ~200ms refresh).
             try:
@@ -170,7 +304,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             except Exception:
                 _err = getattr(arm, "error_code", 0) or 0
             _state = getattr(arm, "state", -1)
-            if _err == 0 and _state == 2:  # 2 = ready-to-move
+            if _err == 0 and _state == 2:
                 break
             logger.warning(
                 "arm_loop: connect recovery attempt %d/%d: err=%s state=%s",
@@ -190,11 +324,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             time.sleep(0.5)
     else:
         logger.error("arm_loop: connect recovery failed after %d attempts", _CONNECT_MAX_RETRIES)
+        _publish_startup_fault("controller recovery failed")
         shared.error_state.value = True
         _disconnect_arm(arm)
         return
 
-    # Post-recovery configuration (only after successful mode-6 transition).
+    # Post-connect configuration. Every setter return code is authoritative.
     try:
         _require_sdk_ok("set_collision_sensitivity", arm.set_collision_sensitivity(cfg.collision_sensitivity))
         # TCP load: XHand (1.1 kg). COG in tool-flange frame (link_eef) from
@@ -206,6 +341,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         _require_sdk_ok("set_joint_maxacc", arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True))
     except Exception as e:
         logger.error("arm_loop: post-recovery config failed: %s", e)
+        _publish_startup_fault("controller configuration failed")
         shared.error_state.value = True
         _disconnect_arm(arm)
         return
@@ -236,10 +372,22 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         time.sleep(0.1)
     else:
         logger.error("arm_loop: cannot read initial joint states after %d attempts", _STATE_READ_MAX_RETRIES)
+        _publish_startup_fault("initial feedback unavailable")
         shared.error_state.value = True
         _disconnect_arm(arm)
         return
     last_target = last_qpos.copy()
+    # Ready means connected/configured and physically STOPPED, not Mode-6
+    # motion-enabled. Confirm state 4 before exposing arm_ready.
+    try:
+        _require_sdk_ok("startup set_state(4)", arm.set_state(4))
+        _wait_live_status(arm, expected_state=4)
+    except Exception:
+        logger.error("arm_loop: failed to enter confirmed DISARMED state", exc_info=True)
+        _publish_startup_fault("confirmed state-4 startup stop failed")
+        shared.error_state.value = True
+        _disconnect_arm(arm)
+        return
     last_cmd_seq = 0
     last_cmd_created_s = 0.0
     last_cmd_received_s = 0.0
@@ -248,6 +396,15 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     last_cmd_apply_latency_s = 0.0
     last_cmd_sdk_duration_s = 0.0
     last_cmd_is_hold = False
+    last_action_id = 0
+    minimum_policy_epoch = int(shared.policy_epoch.value)
+    pending_action: np.ndarray | None = None
+    pending_received_ns = 0
+    pending_committed = False
+    motion_enabled = False
+    last_safety_state = int(SafetyState.DISARMED)
+    last_state_source_ns = time.monotonic_ns()
+    last_c24_s = float("-inf")
 
     # Publish initial state BEFORE arm_ready — consumers wait on arm_ready and
     # expect the ring to already contain a valid frame.  Without this, there is
@@ -275,7 +432,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _frame["last_cmd_apply_latency_s"][0] = last_cmd_apply_latency_s
     _frame["last_cmd_sdk_duration_s"][0] = last_cmd_sdk_duration_s
     _frame["last_cmd_is_hold"][0] = int(last_cmd_is_hold)
-    _frame["timestamp"][0] = time.monotonic()
+    _frame["source_monotonic_ns"][0] = last_state_source_ns
+    _frame["publish_monotonic_ns"][0] = time.monotonic_ns()
+    _frame["state_valid"][0] = 1
+    _frame["timestamp"][0] = last_state_source_ns / 1e9
     shared.arm_state_ring.write(_frame)
 
     # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
@@ -283,10 +443,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     # after all ready events.
     shared.arm_heartbeat_s.value = time.monotonic()
     shared.arm_ready.set()
-    logger.info("arm_loop: ready (Mode 6, ip=%s, hz=%.0f)", cfg.arm_ip, cfg.arm_loop_hz)
+    publish_component_status(shared, "arm", ComponentPhase.READY)
+    logger.info("arm_loop: ready and DISARMED (state=4, ip=%s, hz=%.0f)", cfg.arm_ip, cfg.arm_loop_hz)
 
     limiter = RateManager(cfg.arm_loop_hz)
     while shared.is_running.value:
+        c24_recovered_this_tick = False
         # Heartbeat — written even when holding position (proves we're alive)
         shared.arm_heartbeat_s.value = time.monotonic()
 
@@ -297,20 +459,58 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             try:
                 arm.emergency_stop()
             except Exception:
-                pass
+                logger.warning("arm_loop: emergency_stop call failed; cleanup will enforce state 4", exc_info=True)
             break
 
-        # Safety state gate — only process commands in ARMED or RUNNING.
+        # Safety-state/controller lifecycle edges. DISARMED/FAULT always map to
+        # confirmed controller state 4; ARMED enters Mode 6 then state 0 and
+        # confirms the live postcondition before accepting commands.
         # When gated (DISARMED or FAULT), skip action read + servo but continue
         # to publish state (for monitoring) and rate-limit normally.
         _safety = shared.safety_state.value
+        if _safety in (SafetyState.DISARMED, SafetyState.FAULT):
+            if motion_enabled or last_safety_state not in (SafetyState.DISARMED, SafetyState.FAULT):
+                try:
+                    _require_sdk_ok("safety set_state(4)", arm.set_state(4))
+                    _wait_live_status(arm, expected_state=4)
+                except Exception:
+                    logger.error("arm_loop: failed to confirm safe stop", exc_info=True)
+                    shared.error_state.value = True
+                    break
+                motion_enabled = False
+                pending_action = None
+                pending_received_ns = 0
+                pending_committed = False
+        elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not motion_enabled:
+            try:
+                _require_sdk_ok("armed set_mode(6)", arm.set_mode(6))
+                _require_sdk_ok("armed set_state(0)", arm.set_state(0))
+                _wait_live_status(arm, expected_state=2, expected_mode=6)
+            except Exception:
+                logger.error("arm_loop: failed ARMED Mode-6 postcondition", exc_info=True)
+                shared.error_state.value = True
+                try:
+                    arm.set_state(4)
+                except Exception:
+                    logger.error("arm_loop: fallback stop failed", exc_info=True)
+                break
+            motion_enabled = True
+        last_safety_state = int(_safety)
         if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
 
-            _action_received_s = 0.0
-            try:
-                action = shared.arm_action_q.get(timeout=0.0)
-                _action_received_s = time.monotonic()
-            except Empty:
+            # Once an endpoint is committed it may not be replaced before its
+            # target time.  This is what preserves committed chunk steps while
+            # the bounded queue backpressures the next prepare.
+            if pending_action is not None and not pending_committed:
+                commit_result = shared.action_commit_ring.read_latest()
+                commit = commit_result[0] if commit_result is not None else None
+                pending_committed = commit is not None and command_matches_commit(pending_action, commit)
+            if pending_action is None or not pending_committed:
+                try:
+                    action = shared.arm_action_q.get(timeout=0.0)
+                except Empty:
+                    action = None
+            else:
                 action = None
 
             # HOME sentinel carries a collision-validated path and a request ID.
@@ -333,7 +533,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     target: np.ndarray,
                 ) -> None:
                     """Keep the state ring fresh while homing owns the SDK loop."""
-                    _state_ts = time.monotonic()
+                    nonlocal last_state_source_ns
+                    last_state_source_ns = time.monotonic_ns()
                     try:
                         eef_pos, eef_rot6d = _arm_fk.compute(qpos)
                     except Exception:
@@ -353,7 +554,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     _frame["connected"][0] = 1
                     _frame["mode"][0] = getattr(arm, "mode", 6)
                     _frame["tracking_err"][0] = float(np.max(np.abs(qpos - target)))
-                    _frame["timestamp"][0] = _state_ts
+                    _frame["source_monotonic_ns"][0] = last_state_source_ns
+                    _frame["publish_monotonic_ns"][0] = time.monotonic_ns()
+                    _frame["state_valid"][0] = 1
+                    _frame["timestamp"][0] = last_state_source_ns / 1e9
                     shared.arm_state_ring.write(_frame)
 
                 _home_started_s = time.monotonic()
@@ -378,123 +582,178 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     shared.error_state.value = True
                 continue
 
-            _new_action = action is not None and isinstance(action, dict)
-            _accepted_action_metadata: tuple[int, float, float, bool] | None = None
-            if _new_action:
-                target = np.asarray(action.get("qpos", last_target), dtype=np.float64).ravel()[:7]
-                if np.all(np.isfinite(target)):
-                    # Wrap equivalent joints to the same 2π band for shortest
-                    # path. Mismatched bands cause the joint to rotate full
-                    # circle (~2π) — defense-in-depth for IK edge cases.
-                    try:
-                        target = wrap_nearest_equivalent(
-                            target, last_qpos, cfg.joint_limit_lower, cfg.joint_limit_upper
-                        )
-                    except ValueError:
-                        logger.warning("arm_loop: invalid target joint vector — holding", exc_info=True)
-                    else:
-                        low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
-                        high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
-                        if np.all((target >= low) & (target <= high)):
-                            last_target = target
-                            _command_seq, _created_s, _is_hold = _parse_arm_action_metadata(action, _action_received_s)
-                            _accepted_action_metadata = (
-                                _command_seq,
-                                _created_s,
-                                _action_received_s,
-                                _is_hold,
-                            )
-                        else:
-                            logger.warning("arm_loop: no limit-valid equivalent target — holding")
-
-            _sdk_started_s = time.monotonic()
-            try:
-                code = arm.set_servo_angle(
-                    angle=last_target,
-                    is_radian=True,
-                    speed=cfg.joint_max_speed_rad_per_s,
-                    mvacc=cfg.joint_max_acc_rad_per_s2,
-                    wait=False,
+            low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
+            high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
+            minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
+            if action is not None and not isinstance(action, tuple):
+                received_ns = time.monotonic_ns()
+                reason = validate_worker_command(
+                    action,
+                    dtype=ARM_COMMAND_DTYPE,
+                    expected_session_generation=int(shared.session_generation.value),
+                    minimum_policy_epoch=minimum_policy_epoch,
+                    last_action_id=last_action_id,
+                    now_monotonic_ns=received_ns,
+                    joint_lower_rad=low,
+                    joint_upper_rad=high,
                 )
-                _sdk_finished_s = time.monotonic()
-                if code != 0:
-                    err_code = getattr(arm, "error_code", 0)
-                    if err_code in _COLLISION_FAULT_ERRORS:
-                        _latch_collision_fault(shared, arm, err_code)
-                        break
-                    elif err_code in _RECOVERABLE_ERRORS:
-                        # C24 speed-limit error — bounded recovery. Clean error + warn → ready state →
-                        # re-enter Mode 6. set_state(0) MUST precede set_mode(6).
-                        arm.clean_error()
-                        arm.clean_warn()
-                        arm.set_state(0)
-                        arm.set_mode(6)
-                        _recovery_counter.inc()
-                        if _recovery_counter.triggered:
-                            logger.error(
-                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _recovery_counter.count
+                if reason is not RejectReason.NONE:
+                    if isinstance(action, np.ndarray) and action.shape == (1,) and action.dtype == ARM_COMMAND_DTYPE:
+                        shared.arm_ack_ring.write(
+                            make_ack(
+                                action, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns
                             )
-                            shared.error_state.value = True
-                            break
-                    elif err_code != 0:
-                        logger.error("arm_loop: set_servo_angle code=%d err=%d — non-recoverable", code, err_code)
+                        )
+                    logger.warning("arm_loop: rejected command: %s", reason.name)
+                else:
+                    shared.arm_ack_ring.write(make_ack(action, AckStatus.RECEIVED, received_monotonic_ns=received_ns))
+                    pending_action = action.copy()
+                    pending_received_ns = received_ns
+                    pending_committed = False
+                    last_action_id = int(action["action_id"][0])
+                    prepared_ns = time.monotonic_ns()
+                    shared.arm_ack_ring.write(
+                        make_ack(
+                            action,
+                            AckStatus.PREPARED,
+                            received_monotonic_ns=received_ns,
+                            prepared_monotonic_ns=prepared_ns,
+                        )
+                    )
+
+            execute_action: np.ndarray | None = None
+            execute_received_ns = 0
+            if pending_action is not None:
+                now_ns = time.monotonic_ns()
+                pending_epoch_valid = int(pending_action["policy_epoch"][0]) == int(shared.policy_epoch.value)
+                pending_session_valid = int(pending_action["session_generation"][0]) == int(
+                    shared.session_generation.value
+                )
+                if not pending_epoch_valid or not pending_session_valid:
+                    reason = RejectReason.OLD_EPOCH if not pending_epoch_valid else RejectReason.WRONG_SESSION
+                    shared.arm_ack_ring.write(make_ack(pending_action, AckStatus.REJECTED, reject_reason=reason))
+                    pending_action = None
+                    pending_received_ns = 0
+                    pending_committed = False
+                elif int(pending_action["valid_until_monotonic_ns"][0]) < now_ns:
+                    shared.arm_ack_ring.write(
+                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.EXPIRED)
+                    )
+                    pending_action = None
+                    pending_received_ns = 0
+                    pending_committed = False
+                elif not pending_committed and int(pending_action["target_monotonic_ns"][0]) <= now_ns:
+                    shared.arm_ack_ring.write(
+                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.NOT_COMMITTED)
+                    )
+                    pending_action = None
+                    pending_received_ns = 0
+                else:
+                    if pending_committed and now_ns >= int(pending_action["target_monotonic_ns"][0]):
+                        execute_action = pending_action
+                        execute_received_ns = pending_received_ns
+                        pending_action = None
+                        pending_received_ns = 0
+                        pending_committed = False
+
+            # No new committed endpoint means no SDK call. Re-sending an old
+            # endpoint at 30 Hz would repeatedly restart Mode-6 planning.
+            if execute_action is not None:
+                target = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
+                try:
+                    target = wrap_nearest_equivalent(target, last_qpos, cfg.joint_limit_lower, cfg.joint_limit_upper)
+                except ValueError:
+                    shared.arm_ack_ring.write(
+                        make_ack(execute_action, AckStatus.REJECTED, reject_reason=RejectReason.JOINT_LIMIT)
+                    )
+                    target = last_qpos.copy()
+                else:
+                    last_target = target.copy()
+                    _sdk_started_s = time.monotonic()
+                    try:
+                        code = arm.set_servo_angle(
+                            angle=target,
+                            is_radian=True,
+                            speed=cfg.joint_max_speed_rad_per_s,
+                            mvacc=cfg.joint_max_acc_rad_per_s2,
+                            wait=False,
+                        )
+                        _sdk_finished_s = time.monotonic()
+                        _sdk_finished_ns = time.monotonic_ns()
+                    except Exception:
+                        logger.error("arm_loop: committed set_servo_angle raised", exc_info=True)
+                        shared.arm_ack_ring.write(
+                            make_ack(
+                                execute_action,
+                                AckStatus.SDK_FAILED,
+                                reject_reason=RejectReason.SDK_ERROR,
+                                applied_monotonic_ns=time.monotonic_ns(),
+                            )
+                        )
                         shared.error_state.value = True
                         break
-                    else:
-                        # code != 0, err_code == 0 — transient glitch; same recovery, _RECOVERY_MAX gates escalation.
-                        logger.warning(
-                            "arm_loop: set_servo_angle code=%d (no arm error) — attempting mode recovery", code
+                    if code == 0:
+                        _recovery_counter.reset()
+                        shared.arm_ack_ring.write(
+                            make_ack(execute_action, AckStatus.APPLIED, applied_monotonic_ns=_sdk_finished_ns)
                         )
-                        arm.clean_error()
-                        arm.clean_warn()
-                        arm.set_state(0)
-                        arm.set_mode(6)
-                        _recovery_counter.inc()
-                        if _recovery_counter.triggered:
-                            logger.error(
-                                "arm_loop: %d consecutive recoveries — escalating to FAULT", _recovery_counter.count
-                            )
-                            shared.error_state.value = True
-                            break
-            except Exception:
-                _sdk_finished_s = time.monotonic()
-                logger.warning("arm_loop: set_servo_angle failed", exc_info=True)
-                _recovery_counter.inc()
-                if _recovery_counter.triggered:
-                    logger.error("arm_loop: %d consecutive exceptions — escalating to FAULT", _recovery_counter.count)
-                    shared.error_state.value = True
-                    break
-            else:
-                if code == 0:
-                    _recovery_counter.reset()
-                    if _accepted_action_metadata is not None:
-                        (
-                            last_cmd_seq,
-                            last_cmd_created_s,
-                            last_cmd_received_s,
-                            last_cmd_is_hold,
-                        ) = _accepted_action_metadata
+                        last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = _parse_arm_action_metadata(
+                            execute_action, _sdk_started_s
+                        )
+                        last_cmd_received_s = execute_received_ns / 1e9
                         last_cmd_applied_s = _sdk_finished_s
                         last_cmd_queue_latency_s = max(0.0, last_cmd_received_s - last_cmd_created_s)
                         last_cmd_apply_latency_s = max(0.0, last_cmd_applied_s - last_cmd_created_s)
                         last_cmd_sdk_duration_s = max(0.0, _sdk_finished_s - _sdk_started_s)
+                    else:
+                        err_code = int(getattr(arm, "error_code", 0) or 0)
+                        shared.arm_ack_ring.write(
+                            make_ack(
+                                execute_action,
+                                AckStatus.SDK_FAILED,
+                                reject_reason=RejectReason.SDK_ERROR,
+                                sdk_code=int(code),
+                                applied_monotonic_ns=_sdk_finished_ns,
+                            )
+                        )
+                        if err_code in cfg.collision_fault_errors:
+                            _latch_collision_fault(shared, arm, err_code)
+                            break
+                        if err_code == 24:
+                            now_s = time.monotonic()
+                            if now_s - last_c24_s <= 2.0:
+                                logger.error("arm_loop: second C24 inside 2s — latching fault")
+                                shared.error_state.value = True
+                                break
+                            last_c24_s = now_s
+                            # Discard the failed target. Recover Mode 6, obtain a
+                            # fresh measurement, and send exactly one measured hold.
+                            try:
+                                last_target = _recover_c24_measured_hold(arm, cfg)
+                                c24_recovered_this_tick = True
+                            except Exception:
+                                logger.error("arm_loop: C24 measured-hold recovery failed", exc_info=True)
+                                shared.error_state.value = True
+                                break
+                        else:
+                            logger.error("arm_loop: committed command SDK failure code=%d err=%d", code, err_code)
+                            shared.error_state.value = True
+                            break
 
         arm_connected = True
         try:
             code, states = arm.get_joint_states(is_radian=True, num=3)
             if code == 0 and len(states) > 0:
-                _state_ts = time.monotonic()  # timestamp = post-read time
+                last_state_source_ns = time.monotonic_ns()
                 qpos = np.asarray(states[0], dtype=np.float64)[:7]
                 qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.zeros(7)
                 tau = np.asarray(states[2], dtype=np.float64)[:7] if len(states) > 2 else np.zeros(7)
                 last_qpos = qpos.copy()
             else:
-                _state_ts = time.monotonic()
                 _state_read_warn("arm_loop: get_joint_states returned code=%d", code)
                 qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
                 arm_connected = False
         except Exception:
-            _state_ts = time.monotonic()
             logger.warning("arm_loop: get_joint_states failed", exc_info=True)
             qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
             arm_connected = False
@@ -526,25 +785,26 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             error_code = 0
             arm_connected = False
 
-        if error_code in _COLLISION_FAULT_ERRORS:
+        if error_code in cfg.collision_fault_errors:
             _latch_collision_fault(shared, arm, error_code)
             break
-        elif error_code in _RECOVERABLE_ERRORS:
-            _state_error_counter.inc()
-            if _state_error_counter.triggered:
-                logger.error(
-                    "arm_loop: %d consecutive state-read errors — escalating to FAULT", _state_error_counter.count
-                )
+        elif error_code in cfg.recoverable_errors and not c24_recovered_this_tick:
+            # A C24 observed through the state stream follows the same bounded
+            # recovery as a command return: discard the old endpoint, recover
+            # Mode 6, read fresh feedback, then issue exactly one measured hold.
+            now_s = time.monotonic()
+            if now_s - last_c24_s <= 2.0:
+                logger.error("arm_loop: repeated C24 inside 2s — latching fault")
                 shared.error_state.value = True
                 break
+            last_c24_s = now_s
             try:
-                arm.clean_error()
-                arm.clean_warn()
-                arm.set_state(0)
-                arm.set_mode(6)
+                last_target = _recover_c24_measured_hold(arm, cfg, operation_prefix="state C24")
             except Exception:
-                logger.warning("arm_loop: state-read recovery failed", exc_info=True)
-        elif error_code != 0:
+                logger.error("arm_loop: state C24 measured-hold recovery failed", exc_info=True)
+                shared.error_state.value = True
+                break
+        elif error_code != 0 and not (c24_recovered_this_tick and error_code == 24):
             shared.error_state.value = True
             break
         else:
@@ -568,18 +828,32 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         _frame["last_cmd_apply_latency_s"][0] = last_cmd_apply_latency_s
         _frame["last_cmd_sdk_duration_s"][0] = last_cmd_sdk_duration_s
         _frame["last_cmd_is_hold"][0] = int(last_cmd_is_hold)
-        _frame["timestamp"][0] = _state_ts
+        _frame["source_monotonic_ns"][0] = last_state_source_ns
+        _frame["publish_monotonic_ns"][0] = time.monotonic_ns()
+        _frame["state_valid"][0] = int(arm_connected)
+        _frame["timestamp"][0] = last_state_source_ns / 1e9
         shared.arm_state_ring.write(_frame)
 
         # Rate limit
         limiter.wait()
 
     # Cleanup
+    stopped_cleanly = False
     try:
-        arm.set_state(4)
+        _require_sdk_ok("cleanup set_state(4)", arm.set_state(4))
+        _wait_live_status(arm, expected_state=4)
+        shared.arm_ack_ring.write(make_stopped_ack())
         arm.disconnect()
+        stopped_cleanly = True
     except Exception:
         logger.warning("arm_loop: cleanup failed", exc_info=True)
+        shared.error_state.value = True
+    if stopped_cleanly:
+        publish_component_status(shared, "arm", ComponentPhase.STOPPED)
+    else:
+        publish_component_status(
+            shared, "arm", ComponentPhase.FAULT, fault_code=FaultCode.DEVICE_IO, detail="state-4 cleanup failed"
+        )
     logger.info("arm_loop: exited")
 
 
@@ -654,6 +928,7 @@ def _planned_homing(
         code, states = arm.get_joint_states(is_radian=True, num=3)
         if code == 0 and len(states) > 0:
             current = np.asarray(states[0], dtype=np.float64)[:7]
+            current_qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.full(7, np.inf)
         else:
             return _result(False, f"initial state read failed (code={code})", np.full(7, np.nan))
     except Exception:
@@ -662,19 +937,43 @@ def _planned_homing(
     if current.shape != (7,) or not np.all(np.isfinite(current)):
         return _result(False, "initial state is invalid", np.full(7, np.nan))
 
+    def _confirm_home_dwell(failure_reason: str) -> HomeResult:
+        nonlocal current, current_qvel
+        if (
+            float(np.max(np.abs(current - home_qpos))) > _cfg.homing_convergence_rad
+            or float(np.max(np.abs(current_qvel))) > _cfg.homing_velocity_convergence_rad_s
+        ):
+            return _result(False, failure_reason, current)
+        stable_since = time.monotonic()
+        while time.monotonic() - stable_since < _cfg.homing_dwell_s:
+            abort_reason = _shared_abort_reason()
+            if abort_reason is not None:
+                return _result(False, abort_reason, current)
+            time.sleep(min(_cfg.homing_step_interval_s, _cfg.homing_dwell_s))
+            code, states = arm.get_joint_states(is_radian=True, num=3)
+            if code != 0 or len(states) <= 1:
+                return _result(False, "state/qvel unavailable during home dwell", current)
+            current = np.asarray(states[0], dtype=np.float64)[:7]
+            current_qvel = np.asarray(states[1], dtype=np.float64)[:7]
+            if (
+                current.shape != (7,)
+                or current_qvel.shape != (7,)
+                or not np.all(np.isfinite(current))
+                or not np.all(np.isfinite(current_qvel))
+                or float(np.max(np.abs(current - home_qpos))) > _cfg.homing_convergence_rad
+                or float(np.max(np.abs(current_qvel))) > _cfg.homing_velocity_convergence_rad_s
+            ):
+                return _result(False, "home dwell interrupted by position/velocity", current)
+        return _result(True, "already at canonical home and settled", current)
+
     if len(waypoints) == 0:
-        if float(np.max(np.abs(current - home_qpos))) <= _cfg.homing_convergence_rad:
-            return _result(True, "already at canonical home", current)
-        return _result(False, "empty path while away from canonical home", current)
+        return _confirm_home_dwell("empty path while away from stationary canonical home")
     if float(np.max(np.abs(current - waypoints[0]))) > np.deg2rad(2.0):
         return _result(False, "current state moved too far from planned path start", current)
 
     _execution_targets = waypoints[1:]
     if len(_execution_targets) == 0:
-        _final_error = float(np.max(np.abs(current - home_qpos)))
-        if _final_error <= _cfg.homing_convergence_rad:
-            return _result(True, "already at canonical home", current)
-        return _result(False, f"final error {np.rad2deg(_final_error):.2f}deg", current)
+        return _confirm_home_dwell("single-point path is not at stationary canonical home")
     _preflight_abort = _shared_abort_reason()
     if _preflight_abort is not None:
         return _result(False, _preflight_abort, current)
@@ -683,7 +982,6 @@ def _planned_homing(
         nonlocal current
         _overall_deadline = time.monotonic() + request.execution_timeout_s
         _milestone_tol = min(_cfg.homing_convergence_rad, np.deg2rad(0.5))
-        _stable_required = 2
 
         for _target_index, _target in enumerate(_execution_targets, start=1):
             if shared is not None:
@@ -717,7 +1015,7 @@ def _planned_homing(
 
             _segment_timeout_s = _estimate_homing_segment_timeout_s(_segment_start, _target, _cfg)
             _segment_deadline = min(_overall_deadline, _segment_started_s + _segment_timeout_s)
-            _stable = 0
+            _stable_since_s: float | None = None
             while time.monotonic() < _segment_deadline:
                 if shared is not None:
                     _abort_reason = _shared_abort_reason()
@@ -738,7 +1036,9 @@ def _planned_homing(
                 current = np.asarray(_states[0], dtype=np.float64)[:7]
                 if current.shape != (7,) or not np.all(np.isfinite(current)):
                     return _result(False, f"invalid state at milestone {_target_index}", current)
-                qvel = np.asarray(_states[1], dtype=np.float64)[:7] if len(_states) > 1 else np.zeros(7)
+                if len(_states) <= 1:
+                    return _result(False, f"qvel unavailable at milestone {_target_index}", current)
+                qvel = np.asarray(_states[1], dtype=np.float64)[:7]
                 tau = np.asarray(_states[2], dtype=np.float64)[:7] if len(_states) > 2 else np.zeros(7)
                 try:
                     _controller_error = int(getattr(arm, "error_code", 0) or 0)
@@ -755,12 +1055,16 @@ def _planned_homing(
                         feedback_callback(current.copy(), qvel.copy(), tau.copy(), _target.copy())
                     except Exception:
                         logger.warning("_planned_homing: feedback publication failed", exc_info=True)
-                if float(np.max(np.abs(current - _target))) <= _milestone_tol:
-                    _stable += 1
-                    if _stable >= _stable_required:
+                if (
+                    float(np.max(np.abs(current - _target))) <= _milestone_tol
+                    and float(np.max(np.abs(qvel))) <= _cfg.homing_velocity_convergence_rad_s
+                ):
+                    if _stable_since_s is None:
+                        _stable_since_s = time.monotonic()
+                    if time.monotonic() - _stable_since_s >= _cfg.homing_dwell_s:
                         break
                 else:
-                    _stable = 0
+                    _stable_since_s = None
                 time.sleep(_cfg.homing_step_interval_s)
             else:
                 _error = np.abs(current - _target)

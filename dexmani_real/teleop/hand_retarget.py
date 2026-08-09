@@ -7,13 +7,12 @@ Two landmark-space adaptations compensate human-robot kinematic mismatches:
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "TAGHandRetargeter", "adaptive_retargeting_xhand"]
+__all__ = ["XHandRetargeter", "TAGHandRetargeter", "adaptive_retargeting_xhand", "validate_landmarks"]
 
 import time
+from typing import Any
 
 import numpy as np
-import yaml
-from dex_retargeting.retargeting_config import RetargetingConfig
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.utils.log import get_logger
@@ -36,6 +35,18 @@ _PINKY_MAX_EXTENSION = 0.10  # fully extended pinky MCP→TIP distance
 _PINKY_BASE_SCALE = 1.2  # minimum scaling for curled state
 _PINKY_MAX_SCALE = 2.2  # maximum scaling for extended state
 
+_CONTIGUOUS_BONES = tuple(
+    (parent, child)
+    for chain in (
+        (0, 1, 2, 3, 4),
+        (0, 5, 6, 7, 8),
+        (0, 9, 10, 11, 12),
+        (0, 13, 14, 15, 16),
+        (0, 17, 18, 19, 20),
+    )
+    for parent, child in zip(chain, chain[1:])
+)
+
 # ── Operator-to-MANO coordinate transform ──
 # (originally from deleted utils/hand_utils.py — sole caller is retarget() below)
 
@@ -48,6 +59,28 @@ _OPERATOR2MANO_RIGHT = np.array(
         [0, 1, 0],
     ]
 )
+
+
+def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
+    """Apply the fail-closed geometric gate before touching temporal state."""
+    points = np.asarray(keypoint_3d_array, dtype=np.float64)
+    if points.shape != (21, 3):
+        return False, f"shape {points.shape} != (21, 3)"
+    if not np.all(np.isfinite(points)):
+        return False, "contains NaN/Inf"
+    index_basis = points[5] - points[0]
+    pinky_basis = points[17] - points[0]
+    index_length = float(np.linalg.norm(index_basis))
+    pinky_length = float(np.linalg.norm(pinky_basis))
+    if index_length < 0.01 or pinky_length < 0.01:
+        return False, "wrist-to-index/pinky MCP baseline is shorter than 1 cm"
+    palm_sine = float(np.linalg.norm(np.cross(index_basis, pinky_basis)) / (index_length * pinky_length))
+    if palm_sine < 0.1:
+        return False, "palm basis is collinear"
+    shortest_bone = min(float(np.linalg.norm(points[child] - points[parent])) for parent, child in _CONTIGUOUS_BONES)
+    if shortest_bone < 0.002:
+        return False, "a retargeting bone is shorter than 2 mm"
+    return True, ""
 
 
 def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
@@ -66,39 +99,35 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     eps = 1e-8
     points = keypoint_3d_array[[0, 5, 9], :].copy()
 
-    if not np.all(np.isfinite(points)):
-        global _palm_fallback_warn
-        if _palm_fallback_warn is None:
-            from dexmani_real.utils.log import ThrottledWarner
-            _palm_fallback_warn = ThrottledWarner(interval_s=5.0)
-        _palm_fallback_warn("_estimate_palm_frame: NaN/Inf in wrist+MCP points — falling back to identity")
-        return np.eye(3, dtype=np.float64)
+    valid, reason = validate_landmarks(keypoint_3d_array)
+    if not valid:
+        raise ValueError(f"degenerate hand landmarks: {reason}")
 
     x_vector = points[0] - points[2]  # wrist → middle MCP
     points_centered = points - np.mean(points, axis=0, keepdims=True)
 
     try:
         _, _, v = np.linalg.svd(points_centered)
-    except np.linalg.LinAlgError:
-        return np.eye(3, dtype=np.float64)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("palm SVD failed") from exc
 
     normal = v[2, :]
     normal_norm = np.linalg.norm(normal)
     if normal_norm < eps:
-        return np.eye(3, dtype=np.float64)
+        raise ValueError("palm normal is degenerate")
     normal = normal / normal_norm
 
     # Gram-Schmidt
     x = x_vector - np.sum(x_vector * normal) * normal
     x_norm = np.linalg.norm(x)
     if x_norm < eps:
-        return np.eye(3, dtype=np.float64)
+        raise ValueError("palm longitudinal axis is degenerate")
     x = x / x_norm
 
     z = np.cross(x, normal)
     z_norm = np.linalg.norm(z)
     if z_norm < eps:
-        return np.eye(3, dtype=np.float64)
+        raise ValueError("palm lateral axis is degenerate")
     z = z / z_norm
 
     # LeFranX: use index_mcp → middle_mcp as lateral reference
@@ -128,7 +157,13 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
     Returns:
         (21, 3) array with pinky chain scaled (new copy, input unchanged).
     """
-    landmarks = landmarks.copy()
+    landmarks = np.asarray(landmarks, dtype=np.float64).copy()
+    if landmarks.shape != (21, 3) or not np.all(np.isfinite(landmarks)):
+        raise ValueError("landmarks must be a finite (21, 3) array")
+    # Preserve every parent→child vector from the unmodified input.  Computing
+    # distal segments after moving their parent compounds the translation and
+    # is not a kinematic scaling of the original pinky.
+    raw = landmarks.copy()
 
     # Finger extension: distance from MCP to TIP
     pinky_extension = float(np.linalg.norm(landmarks[_PINKY_TIP] - landmarks[_PINKY_MCP]))
@@ -145,13 +180,13 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
 
     # Apply progressive scaling along the kinematic chain (MCP→PIP→DIP→TIP).
     # Each segment is extended from the (possibly modified) parent joint.
-    mcp_to_pip = landmarks[_PINKY_PIP] - landmarks[_PINKY_MCP]
+    mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
     landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * adaptive_scale
 
-    pip_to_dip = landmarks[_PINKY_DIP] - landmarks[_PINKY_PIP]
+    pip_to_dip = raw[_PINKY_DIP] - raw[_PINKY_PIP]
     landmarks[_PINKY_DIP] = landmarks[_PINKY_PIP] + pip_to_dip * adaptive_scale
 
-    dip_to_tip = landmarks[_PINKY_TIP] - landmarks[_PINKY_DIP]
+    dip_to_tip = raw[_PINKY_TIP] - raw[_PINKY_DIP]
     landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * adaptive_scale
 
     return landmarks
@@ -171,7 +206,9 @@ class XHandRetargeter:
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
         self.last_debug: dict[str, float | str] = {}
-        self._smoothing_alpha: float | None = float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
+        self._smoothing_alpha: float | None = (
+            float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
+        )
         self._hand_ema_state: np.ndarray | None = None
 
         self.urdf_joint_names = [
@@ -192,6 +229,11 @@ class XHandRetargeter:
         self.load_retargeter()
 
     def load_retargeter(self):
+        # Import only the selected DexPilot backend.  TAG deployments should
+        # not load dex-retargeting, its native dependencies, or model assets.
+        import yaml
+        from dex_retargeting.retargeting_config import RetargetingConfig
+
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
 
         # Read YAML — extract custom smoothing_alpha before passing to RetargetingConfig
@@ -214,6 +256,7 @@ class XHandRetargeter:
         self.retargeted_joint_order = np.array(
             [retargeter_joint_names.index(name) for name in self.urdf_joint_names]
         ).astype(int)
+        self.inverse_retargeted_joint_order = np.argsort(self.retargeted_joint_order)
 
     @property
     def low_pass_alpha(self) -> float:
@@ -256,10 +299,9 @@ class XHandRetargeter:
         """
         if landmarks is None:
             return None
-        if landmarks.shape != (21, 3):
-            return None
-        if not np.all(np.isfinite(landmarks)):
-            logger.warning("VR landmarks contain NaN/Inf — holding hand position")
+        valid, reason = validate_landmarks(landmarks)
+        if not valid:
+            logger.warning("VR landmarks rejected (%s) — holding hand position", reason)
             return None
 
         # ── Coordinate transform: operator → MANO ──
@@ -335,7 +377,7 @@ class XHandRetargeter:
             if np.all(np.isfinite(qpos)):
                 # Remap from hardware joint order (urdf_joint_names) to
                 # retargeter internal order before subsetting by pin2target.
-                qpos_retargeter = qpos[self.retargeted_joint_order]
+                qpos_retargeter = qpos[self.inverse_retargeted_joint_order]
                 idx = self.retargeter.optimizer.idx_pin2target
                 self.retargeter.last_qpos = qpos_retargeter[idx]
             else:
@@ -394,13 +436,19 @@ class TAGHandRetargeter:
         smoothing_alpha: float | None = None,
         debug: bool = False,
         feedback_bound_tolerance_rad: float | None = None,
+        qpos_lower_rad: tuple[float, ...] | None = None,
+        qpos_upper_rad: tuple[float, ...] | None = None,
+        fingertip_link_names: tuple[str, ...] | None = None,
+        tag_config: Any | None = None,
     ) -> None:
         from scipy.spatial.transform import Rotation
 
         from dexmani_real.config.defaults import hand as hand_d
         from dexmani_real.config.defaults import policy as policy_d
-        from dexmani_real.config.defaults import tag_retargeting as tag_cfg
+        from dexmani_real.config.defaults import tag_retargeting as default_tag_cfg
         from dexmani_real.teleop.tag_retargeting.optimizer import HandOptimizer
+
+        tag_cfg = default_tag_cfg if tag_config is None else tag_config
 
         # ── Load URDF, read joint limits ──
         urdf_path = str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
@@ -435,9 +483,7 @@ class TAGHandRetargeter:
             "right_hand_pinky_joint1",
             "right_hand_pinky_joint2",
         ]
-        self._mapping_model_to_sdk = np.array(
-            [model_names.index(n) for n in self.urdf_joint_names], dtype=np.intp
-        )
+        self._mapping_model_to_sdk = np.array([model_names.index(n) for n in self.urdf_joint_names], dtype=np.intp)
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
 
         # ── Merge driver-enforced joint limits ───────────────────────────
@@ -447,11 +493,16 @@ class TAGHandRetargeter:
         # the URDF (thumb_rota_j2: +10°, index/mid/ring/pinky_j2: +5°).
         # Passing the intersection to the optimizer prevents it from proposing
         # unreachable angles that would cause FK-predicted ≠ actual fingertip positions.
-        from dexmani_real.robot.xhand import XHandConfig as _XHandConfig
-
-        _driver_cfg = _XHandConfig()
-        _driver_lo_sdk = np.asarray(_driver_cfg.qpos_min, dtype=np.float64)  # rad, SDK order
-        _driver_hi_sdk = np.asarray(_driver_cfg.qpos_max, dtype=np.float64)  # rad, SDK order
+        _driver_lo_sdk = np.asarray(hand_d.qpos_min_rad if qpos_lower_rad is None else qpos_lower_rad, dtype=np.float64)
+        _driver_hi_sdk = np.asarray(hand_d.qpos_max_rad if qpos_upper_rad is None else qpos_upper_rad, dtype=np.float64)
+        if (
+            _driver_lo_sdk.shape != (12,)
+            or _driver_hi_sdk.shape != (12,)
+            or not np.all(np.isfinite(_driver_lo_sdk))
+            or not np.all(np.isfinite(_driver_hi_sdk))
+            or np.any(_driver_lo_sdk > _driver_hi_sdk)
+        ):
+            raise ValueError("TAG retargeting SDK bounds must be finite, ordered shape-(12,) arrays")
         _driver_lo_model = _driver_lo_sdk[self._mapping_sdk_to_model]
         _driver_hi_model = _driver_hi_sdk[self._mapping_sdk_to_model]
         joint_lo = np.maximum(joint_lo, _driver_lo_model)
@@ -460,7 +511,9 @@ class TAGHandRetargeter:
         # ── Optimizer ──
         self._optimizer = HandOptimizer(
             urdf_path=urdf_path,
-            fingertip_frame_names=list(hand_d.fingertip_link_names),
+            fingertip_frame_names=list(
+                hand_d.fingertip_link_names if fingertip_link_names is None else fingertip_link_names
+            ),
             joint_limits_lower=joint_lo,
             joint_limits_upper=joint_hi,
             finger_lengths_robot=np.array(tag_cfg.robot_finger_lengths, dtype=np.float64),
@@ -512,10 +565,9 @@ class TAGHandRetargeter:
         """
         if landmarks is None:
             return None
-        if landmarks.shape != (21, 3):
-            return None
-        if not np.all(np.isfinite(landmarks)):
-            logger.warning("TAGHandRetargeter: landmarks contain NaN/Inf — holding position")
+        valid, reason = validate_landmarks(landmarks)
+        if not valid:
+            logger.warning("TAGHandRetargeter: landmarks rejected (%s) — holding position", reason)
             return None
 
         t0 = time.perf_counter() if self.debug else 0.0

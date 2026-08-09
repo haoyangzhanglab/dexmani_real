@@ -1,18 +1,29 @@
-"""Hand servo process — reads hand_cmd_ring, servos XHand, writes hand_state_ring + hand_tactile_ring.
+"""Hand servo process — reads hand_cmd_ring, servos XHand, writes hand state and tactile rings.
 
-Tactile ring publishes sparsely (contact-only writes); hand_state_ring publishes every tick.
+Every successful device read publishes tactile data, including release/no-contact;
+hand_state_ring publishes every tick and marks failed reads invalid.
 Error recovery: three independent counters for send failures, board error states,
 and read exceptions — each escalates to global error_state on persistent failure.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from dexmani_real.config.defaults import hand
+from dexmani_real.policy.action_protocol import (
+    HAND_COMMAND_DTYPE,
+    AckStatus,
+    RejectReason,
+    command_matches_commit,
+    make_ack,
+    make_stopped_ack,
+    validate_worker_command,
+)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
@@ -30,6 +41,7 @@ class HandProcessConfig:
     # and continue with an explicit open-hand collision-model assumption when
     # it is absent. Canonical data collection keeps the default fail-closed.
     startup_failure_is_fatal: bool = True
+    ethercat_slave_position: int = field(default_factory=lambda: hand.ethercat_slave_position)
 
     # Homing convergence
     home_settle_timeout_s: float = field(default_factory=lambda: hand.home_settle_timeout_s)
@@ -38,6 +50,12 @@ class HandProcessConfig:
     # Feedback-only diagnostic tolerance; strict XHand command limits are
     # configured separately in XHandConfig and remain unchanged.
     feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
+    home_qpos_rad: tuple[float, ...] = field(
+        default_factory=lambda: tuple(float(value) for value in np.deg2rad(hand.home_qpos_deg))
+    )
+    qpos_lower_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_min_rad)
+    qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_max_rad)
+    max_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
 
     # Qpos freshness detection (driver board lockout guard)
     stale_qpos_frame_limit: int = field(default_factory=lambda: hand.stale.frame_count)
@@ -51,6 +69,54 @@ class HandProcessConfig:
     # get_state-exception counter for consistent escalation behaviour.
     error_state_watchdog_frames: int = 5
 
+    def __post_init__(self) -> None:
+        if self.ethercat_slave_position < -1:
+            raise ValueError("hand process EtherCAT slave position must be -1 or non-negative")
+        home = np.asarray(self.home_qpos_rad, dtype=np.float64)
+        lower = np.asarray(self.qpos_lower_rad, dtype=np.float64)
+        upper = np.asarray(self.qpos_upper_rad, dtype=np.float64)
+        if home.shape != (12,) or lower.shape != (12,) or upper.shape != (12,):
+            raise ValueError("hand process home/limits must have shape (12,)")
+        if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(lower > upper):
+            raise ValueError("hand process home/limits must be finite and ordered")
+        if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
+            raise ValueError("hand process max_delta_rad must be finite and positive")
+        timing = (
+            self.loop_hz,
+            self.home_settle_timeout_s,
+            self.home_settle_tol_rad,
+            self.stale_qpos_delta_rad,
+        )
+        if not all(np.isfinite(value) and value > 0 for value in timing):
+            raise ValueError("hand process rates/tolerances must be finite and positive")
+        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
+            raise ValueError("hand feedback tolerance must be finite and non-negative")
+        if (
+            self.stale_qpos_frame_limit <= 0
+            or self.send_err_watchdog_frames <= 0
+            or self.error_state_watchdog_frames <= 0
+        ):
+            raise ValueError("hand process rates/watchdog thresholds must be positive")
+
+    @classmethod
+    def from_runtime(cls, runtime: object, *, startup_failure_is_fatal: bool = True) -> "HandProcessConfig":
+        cfg = getattr(runtime, "hand")
+        return cls(
+            loop_hz=float(cfg.loop_hz),
+            startup_failure_is_fatal=startup_failure_is_fatal,
+            ethercat_slave_position=int(cfg.ethercat_slave_position),
+            home_settle_timeout_s=float(cfg.home_settle_timeout_s),
+            home_settle_tol_rad=float(cfg.home_settle_tol_rad),
+            feedback_bound_tolerance_rad=float(cfg.feedback_bound_tolerance_rad),
+            home_qpos_rad=tuple(float(value) for value in np.deg2rad(cfg.home_qpos_deg)),
+            qpos_lower_rad=tuple(float(value) for value in cfg.qpos_min_rad),
+            qpos_upper_rad=tuple(float(value) for value in cfg.qpos_max_rad),
+            max_delta_rad=None if cfg.max_delta_rad is None else float(cfg.max_delta_rad),
+            stale_qpos_frame_limit=int(cfg.stale.frame_count),
+            stale_qpos_delta_rad=float(cfg.stale.qpos_delta_rad),
+            send_err_watchdog_frames=int(cfg.send_err_watchdog_count),
+        )
+
 
 def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     """Hand process entry point — reads shared.hand_cmd_ring, servos hand.
@@ -59,13 +125,23 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     SharedStorage (no RPC, no side channels).
     """
     from dexmani_real.robot.safety import SafetyState
+    from dexmani_real.runtime.status import ComponentPhase, FaultCode
     from dexmani_real.shm.shared_storage import HAND_STATE_DTYPE as _HS_STATE
     from dexmani_real.shm.shared_storage import HAND_TACTILE_DTYPE as _HS_TACTILE
     from dexmani_real.shm.shared_storage import new_frame as _nf
+    from dexmani_real.shm.shared_storage import publish_component_status
 
     cfg = config or HandProcessConfig()
+    publish_component_status(shared, "hand", ComponentPhase.LOADING)
 
     def _mark_startup_failure() -> None:
+        publish_component_status(
+            shared,
+            "hand",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.STARTUP_FAILED,
+            detail="XHand startup failed; see process log",
+        )
         if cfg.startup_failure_is_fatal:
             shared.error_state.value = True
         else:
@@ -82,7 +158,12 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         hand = XHand(
             XHandConfig(
                 tor_max_per_joint=_tor_max_pj,
+                ethercat_slave_position=cfg.ethercat_slave_position,
                 feedback_bound_tolerance_rad=cfg.feedback_bound_tolerance_rad,
+                home_qpos=np.asarray(cfg.home_qpos_rad, dtype=np.float64),
+                qpos_min=np.asarray(cfg.qpos_lower_rad, dtype=np.float64),
+                qpos_max=np.asarray(cfg.qpos_upper_rad, dtype=np.float64),
+                max_delta_rad=cfg.max_delta_rad,
             )
         )
         if not hand.connect():
@@ -96,6 +177,10 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 logger.warning("hand_loop: cleanup after connect failure failed", exc_info=True)
             _mark_startup_failure()
             return
+        if hasattr(shared, "hand_device_identity"):
+            identity = getattr(hand, "device_identity", {"backend": "unavailable"})
+            encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            shared.hand_device_identity.value = encoded_identity[:1023].ljust(1024, b"\x00")
     except Exception:
         if cfg.startup_failure_is_fatal:
             logger.error("hand_loop: init failed", exc_info=True)
@@ -104,40 +189,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _mark_startup_failure()
         return
 
-    # Home — re-send in the polling loop so the hand PID keeps driving
-    # toward home_qpos until the physical qpos converges.
-    home_qpos = getattr(hand.config, "home_qpos", None)
-    if home_qpos is not None and np.all(np.isfinite(home_qpos)):
-        _home_deadline = time.monotonic() + cfg.home_settle_timeout_s
-        _home_reached = False
-        _home_read_error_logged = False
-        _home_send_error_logged = False
-        while time.monotonic() < _home_deadline:
-            if not hand.send_action(home_qpos) and not _home_send_error_logged:
-                logger.warning("hand_loop: home command was rejected")
-                _home_send_error_logged = True
-            try:
-                st = hand.get_state()
-                if st is not None:
-                    current = np.asarray(st.get("qpos", np.zeros(12)), dtype=np.float64)
-                    if float(np.max(np.abs(current - home_qpos))) < cfg.home_settle_tol_rad:
-                        _home_reached = True
-                        break
-            except Exception:
-                if not _home_read_error_logged:
-                    logger.warning("hand_loop: state read failed while homing", exc_info=True)
-                    _home_read_error_logged = True
-            time.sleep(0.05)
-        if not _home_reached:
-            _log = logger.error if cfg.startup_failure_is_fatal else logger.warning
-            _log("hand_loop: home settle failed after %.1fs", cfg.home_settle_timeout_s)
-            try:
-                hand.stop()
-                hand.disconnect()
-            except Exception:
-                logger.warning("hand_loop: cleanup after home failure failed", exc_info=True)
-            _mark_startup_failure()
-            return
+    # DISARMED startup is read-only.  Opening the bus and validating feedback
+    # must never create a home motion; homing remains an explicit, correlated
+    # policy action after Main transitions the system to ARMED.
 
     # Publish initial state BEFORE hand_ready — consumers wait on hand_ready and
     # expect the ring to already contain a valid frame.  Without this, there is
@@ -171,7 +225,13 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _frame0["commboard_err"][0] = np.zeros(12, dtype=np.int32)
     _frame0["jointboard_err"][0] = np.zeros(12, dtype=np.int32)
     _frame0["tipboard_err"][0] = np.zeros(12, dtype=np.int32)
-    _frame0["timestamp"][0] = time.monotonic()
+    _initial_source_ns = time.monotonic_ns()
+    _frame0["source_monotonic_ns"][0] = _initial_source_ns
+    _frame0["publish_monotonic_ns"][0] = time.monotonic_ns()
+    _frame0["state_valid"][0] = 1
+    _frame0["send_healthy"][0] = 1
+    _frame0["read_healthy"][0] = 1
+    _frame0["timestamp"][0] = _initial_source_ns / 1e9
     shared.hand_state_ring.write(_frame0)
 
     # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
@@ -180,10 +240,15 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # heartbeat=0 → age=inf → spurious FAULT.
     shared.hand_heartbeat_s.value = time.monotonic()
     shared.hand_ready.set()
+    publish_component_status(shared, "hand", ComponentPhase.READY)
     logger.info("hand_loop: ready")
 
     rate_mgr = RateManager(cfg.loop_hz)
     last_cmd_seq = 0
+    last_action_id = 0
+    minimum_policy_epoch = int(shared.policy_epoch.value)
+    pending_action: np.ndarray | None = None
+    pending_committed = False
     _send_error_counter = RetryCounter(max_consecutive=cfg.send_err_watchdog_frames, label="hand_send")
     _error_state_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_error_state")
     _read_error_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_read_error")
@@ -195,6 +260,10 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     last_known_qpos: np.ndarray = np.zeros(12, dtype=np.float64)
     _last_tactile_sum: np.ndarray = np.zeros((5, 3), dtype=np.float64)
     _last_tactile_force: np.ndarray = np.zeros((5, 120, 3), dtype=np.float64)
+    _last_state_source_ns = _initial_source_ns
+    _tracking_target: np.ndarray | None = None
+    _tracking_prev_error = float("inf")
+    _tracking_change_frames = 0
 
     _last_error_clear_s = 0.0
 
@@ -209,35 +278,110 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _safety = shared.safety_state.value
         if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
 
-            # Read cmd ring (latest-wins)
-            result = shared.hand_cmd_ring.read_latest()
+            # Read prepare command ring (latest-wins) and ACK it without moving.
+            if pending_action is not None and not pending_committed:
+                commit_result = shared.action_commit_ring.read_latest()
+                commit = commit_result[0] if commit_result is not None else None
+                pending_committed = commit is not None and command_matches_commit(pending_action, commit)
+            result = shared.hand_cmd_ring.read_latest() if pending_action is None or not pending_committed else None
             if result is not None:
                 data, _ts, seq = result
                 seq_int = int(seq) if isinstance(seq, (int, np.integer)) else 0
                 if seq_int != last_cmd_seq:
-                    cmd = np.asarray(data["qpos_cmd"][0], dtype=np.float64)
-                    if np.all(np.isfinite(cmd)):
-                        try:
-                            if hand.send_action(cmd):
-                                _send_error_counter.reset()
-                            else:
-                                _send_error_counter.inc()
-                                if _send_error_counter.count in (1, _send_error_counter.max_consecutive):
-                                    logger.warning(
-                                        "hand_loop: send_action rejected (consecutive=%d)",
-                                        _send_error_counter.count,
-                                    )
-                        except Exception:
-                            _send_error_counter.inc()
-                            logger.warning(
-                                "hand_loop: send_action failed (consecutive=%d)",
-                                _send_error_counter.count,
-                                exc_info=True,
+                    received_ns = time.monotonic_ns()
+                    minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
+                    reason = validate_worker_command(
+                        data,
+                        dtype=HAND_COMMAND_DTYPE,
+                        expected_session_generation=int(shared.session_generation.value),
+                        minimum_policy_epoch=minimum_policy_epoch,
+                        last_action_id=last_action_id,
+                        now_monotonic_ns=received_ns,
+                        joint_lower_rad=np.asarray(hand.config.qpos_min, dtype=np.float64),
+                        joint_upper_rad=np.asarray(hand.config.qpos_max, dtype=np.float64),
+                    )
+                    if reason is RejectReason.NONE:
+                        shared.hand_ack_ring.write(
+                            make_ack(data, AckStatus.RECEIVED, received_monotonic_ns=received_ns)
+                        )
+                        pending_action = data.copy()
+                        pending_committed = False
+                        last_action_id = int(data["action_id"][0])
+                        prepared_ns = time.monotonic_ns()
+                        shared.hand_ack_ring.write(
+                            make_ack(
+                                data,
+                                AckStatus.PREPARED,
+                                received_monotonic_ns=received_ns,
+                                prepared_monotonic_ns=prepared_ns,
                             )
-                        last_cmd_seq = seq_int
+                        )
+                    else:
+                        shared.hand_ack_ring.write(
+                            make_ack(data, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns)
+                        )
+                    last_cmd_seq = seq_int
+
+            execute_action: np.ndarray | None = None
+            if pending_action is not None:
+                now_ns = time.monotonic_ns()
+                pending_epoch_valid = int(pending_action["policy_epoch"][0]) == int(shared.policy_epoch.value)
+                pending_session_valid = int(pending_action["session_generation"][0]) == int(
+                    shared.session_generation.value
+                )
+                if not pending_epoch_valid or not pending_session_valid:
+                    reason = RejectReason.OLD_EPOCH if not pending_epoch_valid else RejectReason.WRONG_SESSION
+                    shared.hand_ack_ring.write(make_ack(pending_action, AckStatus.REJECTED, reject_reason=reason))
+                    pending_action = None
+                    pending_committed = False
+                elif int(pending_action["valid_until_monotonic_ns"][0]) < now_ns:
+                    shared.hand_ack_ring.write(
+                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.EXPIRED)
+                    )
+                    pending_action = None
+                    pending_committed = False
+                elif not pending_committed and int(pending_action["target_monotonic_ns"][0]) <= now_ns:
+                    shared.hand_ack_ring.write(
+                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.NOT_COMMITTED)
+                    )
+                    pending_action = None
+                else:
+                    if pending_committed and now_ns >= int(pending_action["target_monotonic_ns"][0]):
+                        execute_action = pending_action
+                        pending_action = None
+                        pending_committed = False
+
+            if execute_action is not None:
+                cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
+                try:
+                    sent = hand.send_action(cmd)
+                except Exception:
+                    sent = False
+                    logger.warning("hand_loop: committed send_action raised", exc_info=True)
+                if sent:
+                    _send_error_counter.reset()
+                    shared.hand_ack_ring.write(
+                        make_ack(execute_action, AckStatus.APPLIED, applied_monotonic_ns=time.monotonic_ns())
+                    )
+                    if _tracking_target is None or np.max(np.abs(cmd - _tracking_target)) >= cfg.stale_qpos_delta_rad:
+                        _tracking_change_frames = cfg.stale_qpos_frame_limit
+                    _tracking_target = cmd.copy()
+                else:
+                    _send_error_counter.inc()
+                    shared.hand_ack_ring.write(
+                        make_ack(
+                            execute_action,
+                            AckStatus.SDK_FAILED,
+                            reject_reason=RejectReason.SDK_ERROR,
+                            sdk_code=int(hand.last_action_code or -1),
+                            applied_monotonic_ns=time.monotonic_ns(),
+                        )
+                    )
 
             # Send-error watchdog: auto clear_error() after consecutive failures.
             if _send_error_counter.triggered:
+                shared.error_state.value = True
+                logger.error("hand_loop: persistent send failures — latching global fault")
                 _now = time.monotonic()
                 if _now - _last_clear_error_s > 2.0:
                     logger.warning("hand_loop: %d consecutive send errors — clear_error()", _send_error_counter.count)
@@ -263,14 +407,24 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             tactile_force = np.asarray(_raw_tf if _raw_tf is not None else np.zeros((5, 120, 3)), dtype=np.float64)
             _raw_tc = st.get("tactile_contact")
             tactile_contact = np.asarray(_raw_tc if _raw_tc is not None else np.zeros(5, dtype=bool), dtype=bool)
+            expected_shapes = (
+                ("qpos", qpos, (12,)),
+                ("current", current, (12,)),
+                ("tactile_force_sum", tactile_sum, (5, 3)),
+                ("tactile_force", tactile_force, (5, 120, 3)),
+                ("tactile_contact", tactile_contact, (5,)),
+            )
+            for field_name, value, expected_shape in expected_shapes:
+                if value.shape != expected_shape:
+                    raise ValueError(f"invalid {field_name} shape {value.shape}, expected {expected_shape}")
+                if field_name != "tactile_contact" and not np.all(np.isfinite(value)):
+                    raise ValueError(f"{field_name} contains NaN/Inf")
             connected = hand.connected_flag
             error_state = hand.error_state
+            _last_state_source_ns = time.monotonic_ns()
             last_known_qpos = qpos.copy()
-            # Cache tactile values for forward-fill on future get_state exceptions,
-            # preventing false-negative contact gaps during comm glitches.
-            if np.any(tactile_contact):
-                _last_tactile_sum = tactile_sum.copy()
-                _last_tactile_force = tactile_force.copy()
+            _last_tactile_sum = tactile_sum.copy()
+            _last_tactile_force = tactile_force.copy()
             _read_error_counter.reset()
             # Board error registers (per-joint hardware fault indicators).
             _raw_cbe = st.get("commboard_err")
@@ -310,20 +464,19 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     _read_error_counter.max_consecutive,
                 )
 
-        # Detect stale qpos (driver board lockout)
-        if not connected:
-            # Reset on disconnect — prevents false stale-positive on reconnect
-            # when hand moved while limp (pre-disconnect qpos ≠ post-reconnect qpos).
-            _last_fresh_qpos = None
+        # Tracking stall requires a changing target and no feedback progress;
+        # a stationary hand is healthy, not stale.
+        if not connected or _tracking_target is None or _tracking_change_frames <= 0:
             _stale_frames = 0
-        elif connected and _last_fresh_qpos is not None:
-            if np.max(np.abs(qpos - _last_fresh_qpos)) < cfg.stale_qpos_delta_rad:
-                _stale_frames += 1
-            else:
+            _tracking_prev_error = float("inf")
+        else:
+            tracking_error = float(np.max(np.abs(qpos - _tracking_target)))
+            if _tracking_prev_error - tracking_error > cfg.stale_qpos_delta_rad:
                 _stale_frames = 0
-                _last_fresh_qpos = qpos.copy()
-        elif _last_fresh_qpos is None:
-            _last_fresh_qpos = qpos.copy()
+            else:
+                _stale_frames += 1
+            _tracking_prev_error = tracking_error
+            _tracking_change_frames -= 1
         qpos_stale = _stale_frames >= cfg.stale_qpos_frame_limit
 
         # Error-state retry: hand comm errors are frequently intermittent and
@@ -366,41 +519,34 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         frame["commboard_err"][0] = commboard_err
         frame["jointboard_err"][0] = jointboard_err
         frame["tipboard_err"][0] = tipboard_err
-        frame["timestamp"][0] = time.monotonic()
+        frame["source_monotonic_ns"][0] = _last_state_source_ns
+        frame["publish_monotonic_ns"][0] = time.monotonic_ns()
+        frame["state_valid"][0] = int(connected)
+        frame["send_healthy"][0] = int(not _send_error_counter.triggered)
+        frame["read_healthy"][0] = int(not _read_error_counter.triggered)
+        frame["timestamp"][0] = _last_state_source_ns / 1e9
         shared.hand_state_ring.write(frame)
 
-        # Publish tactile force only on contact (sparse write).
-        # When no finger is in contact, skip the write — consumers forward-fill
-        # from their last cached frame.  This saves ~14.4 KB per tick (30 Hz)
-        # and activates the forward-fill path in vr_teleop_policy.py.
-        if np.any(tactile_contact):
+        # Every successful read is a source sample, including release/no-contact.
+        if connected:
             tf = _nf(_HS_TACTILE)
             tf["tactile_force"][0] = tactile_force
+            tf["source_monotonic_ns"][0] = _last_state_source_ns
+            tf["fresh"][0] = 1
+            tf["calibrated"][0] = int(hand.tactile_calibrated)
+            # The SDK conversion provenance has not been independently
+            # established on hardware.  Preserve the values, but label their
+            # unit as unknown instead of guessing Newtons.
+            tf["unit_code"][0] = 0
             shared.hand_tactile_ring.write(tf)
 
         # Rate limit (absolute-deadline scheduling, consistent with arm_loop/policy_loop)
         rate_mgr.wait()
 
-    # ── Pre-disconnect home: drive hand to home_qpos before releasing the
-    # EtherCAT bus.  If the hand driver board is in a degraded state
-    # (qpos_stale / comm errors), a clean disconnect is more likely when
-    # the board is idle at a known position rather than mid-grasp.
-    _cleanup_home_qpos = home_qpos
-    _cleanup_motion_safe = (
-        not shared.estop_request.value
-        and not shared.error_state.value
-        and shared.safety_state.value in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
-    )
-    if _cleanup_motion_safe and _cleanup_home_qpos is not None and np.all(np.isfinite(_cleanup_home_qpos)):
-        try:
-            for _ in range(40):  # ~2s at 30 Hz (generous settle window)
-                if not hand.send_action(_cleanup_home_qpos):
-                    logger.warning("hand_loop: pre-disconnect home command rejected — stopping cleanup motion")
-                    break
-                time.sleep(0.05)
-        except Exception:
-            logger.warning("hand_loop: pre-disconnect home failed", exc_info=True)
-
+    # Shutdown never creates new motion. Homing is an explicit, correlated
+    # policy operation; worker cleanup only stops the device and releases the
+    # bus after the command loop has been gated.
+    stopped_cleanly = False
     try:
         _feedback_stats = hand.feedback_bound_stats
         _feedback_checks = int(_feedback_stats["checks"])
@@ -415,8 +561,22 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 float(np.rad2deg(cfg.feedback_bound_tolerance_rad)),
                 np.asarray(_feedback_stats["per_joint_over_tolerance_counts"], dtype=np.int64).tolist(),
             )
-        hand.stop()
+        if not hand.stop():
+            raise RuntimeError(f"XHand stop failed with SDK code {hand.last_action_code!r}")
+        shared.hand_ack_ring.write(make_stopped_ack())
         hand.disconnect()
+        stopped_cleanly = True
     except Exception:
         logger.warning("hand_loop: cleanup failed", exc_info=True)
+        shared.error_state.value = True
+    if stopped_cleanly:
+        publish_component_status(shared, "hand", ComponentPhase.STOPPED)
+    else:
+        publish_component_status(
+            shared,
+            "hand",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.DEVICE_IO,
+            detail="XHand stop/disconnect failed",
+        )
     logger.info("hand_loop: exited")

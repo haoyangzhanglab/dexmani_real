@@ -226,6 +226,23 @@ class SharedMemoryRingBuffer:
         """Destroy the shared memory block (only call from creator process)."""
         self._shm.unlink()
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize by identity so ``spawn`` children attach to the block.
+
+        ``SharedMemory`` memoryviews and NumPy views themselves are not a safe
+        pickle transport.  Reconstructing them from the named block also keeps
+        parent and child resource ownership explicit.
+        """
+        # Pickle the dtype object itself. ``dtype.descr`` materializes implicit
+        # alignment gaps as synthetic ``fN`` fields, so an aligned structured
+        # dtype no longer compares/casts equal after spawn reconstruction.
+        return {"name": self.name, "dtype": self.dtype, "maxlen": self.maxlen}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        SharedMemoryRingBuffer.__init__(
+            self, state["name"], np.dtype(state["dtype"]), maxlen=int(state["maxlen"]), create=False
+        )
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -264,9 +281,9 @@ class CameraRingBuffer:
         [64:)     N slots, each of:
                     [0:8)   timestamp_ns (uint64)
                     [8:16)  sequence (uint64)
-                    [16:80) CAMERA_FRAME_HEADER_DTYPE (64 bytes)
-                    [80:80+max_rgb_bytes) RGB data
-                    [80+max_rgb_bytes:...+max_depth_bytes) Depth data
+                    [16:16+header.itemsize) CAMERA_FRAME_HEADER_DTYPE
+                    [...:...+max_rgb_bytes) RGB data
+                    [...:...+max_depth_bytes) Depth data
                     [...:...+max_pc_bytes) Pointcloud data (float32)
     """
 
@@ -340,6 +357,24 @@ class CameraRingBuffer:
             create,
         )
 
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "maxlen": self.maxlen,
+            "rgb_shape": self._rgb_shape,
+            "depth_shape": self._depth_shape,
+            "pc_shape": self._pc_shape,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        CameraRingBuffer.__init__(self, state["name"], maxlen=int(state["maxlen"]), create=False)
+        rgb_shape = state["rgb_shape"]
+        depth_shape = state["depth_shape"]
+        pc_shape = state["pc_shape"]
+        self._rgb_shape = (int(rgb_shape[0]), int(rgb_shape[1]), int(rgb_shape[2])) if rgb_shape is not None else None
+        self._depth_shape = (int(depth_shape[0]), int(depth_shape[1])) if depth_shape is not None else None
+        self._pc_shape = (int(pc_shape[0]), int(pc_shape[1])) if pc_shape is not None else None
+
     def write(
         self,
         header: np.ndarray,
@@ -359,6 +394,55 @@ class CameraRingBuffer:
         Returns:
             New sequence number.
         """
+        if not isinstance(header, np.ndarray) or header.shape != (1,) or header.dtype != CAMERA_FRAME_HEADER_DTYPE:
+            raise ValueError(
+                f"camera header must have shape (1,) and dtype {CAMERA_FRAME_HEADER_DTYPE}, "
+                f"got shape={getattr(header, 'shape', None)} dtype={getattr(header, 'dtype', None)}"
+            )
+        if not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2:] != (3,):
+            raise ValueError(f"camera rgb must be (H, W, 3) uint8, got shape={getattr(rgb, 'shape', None)}")
+        if not isinstance(depth, np.ndarray) or depth.dtype != np.uint16 or depth.ndim != 2:
+            raise ValueError(f"camera depth must be (H, W) uint16, got shape={getattr(depth, 'shape', None)}")
+        if not rgb.flags.c_contiguous or not depth.flags.c_contiguous:
+            raise ValueError("camera rgb/depth payloads must be C-contiguous")
+        if self._rgb_shape is not None and rgb.shape != self._rgb_shape:
+            raise ValueError(f"camera rgb shape {rgb.shape} does not match ring capacity {self._rgb_shape}")
+        if self._depth_shape is not None and depth.shape != self._depth_shape:
+            raise ValueError(f"camera depth shape {depth.shape} does not match ring capacity {self._depth_shape}")
+        if rgb.nbytes != self._max_rgb_bytes or depth.nbytes != self._max_depth_bytes:
+            raise ValueError("camera rgb/depth payload must exactly fill its configured ring capacity")
+        if self._max_pc_bytes > 0:
+            if pointcloud is None or pointcloud.dtype != np.float32 or pointcloud.shape != self._pc_shape:
+                raise ValueError(
+                    f"camera pointcloud must be {self._pc_shape} float32, "
+                    f"got shape={getattr(pointcloud, 'shape', None)} dtype={getattr(pointcloud, 'dtype', None)}"
+                )
+            if pointcloud.nbytes != self._max_pc_bytes:
+                raise ValueError("camera pointcloud payload must exactly fill its configured ring capacity")
+            if not pointcloud.flags.c_contiguous:
+                raise ValueError("camera pointcloud payload must be C-contiguous")
+
+        h = header[0]
+        if int(h["rgb_size"]) != rgb.nbytes or int(h["depth_size"]) != depth.nbytes:
+            raise ValueError("camera header byte sizes do not match payloads")
+        if (int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])) != rgb.shape:
+            raise ValueError("camera header RGB shape does not match payload")
+        if (int(h["depth_shape_h"]), int(h["depth_shape_w"])) != depth.shape:
+            raise ValueError("camera header depth shape does not match payload")
+        pc_num_points = int(h["pc_num_points"])
+        if self._pc_shape is not None and not 0 <= pc_num_points <= self._pc_shape[0]:
+            raise ValueError(f"pc_num_points={pc_num_points} exceeds ring capacity {self._pc_shape[0]}")
+        if self._pc_shape is None and (pointcloud is not None or pc_num_points != 0):
+            raise ValueError("pointcloud payload/header provided to a ring without pointcloud capacity")
+        if bool(h["pointcloud_valid"]) != (pc_num_points > 0):
+            raise ValueError("pointcloud_valid must agree with pc_num_points")
+        valid_depth_ratio = float(h["pc_valid_depth_ratio"])
+        padding_count = int(h["pc_padding_count"])
+        if not np.isfinite(valid_depth_ratio) or not 0.0 <= valid_depth_ratio <= 1.0:
+            raise ValueError("pc_valid_depth_ratio must be finite and in [0, 1]")
+        if self._pc_shape is not None and not 0 <= padding_count <= self._pc_shape[0]:
+            raise ValueError("pc_padding_count exceeds ring capacity")
+
         now_ns = time.monotonic_ns()
         seq = int(self._write_seq[0]) + 1
         self._write_seq[0] = np.uint64(seq)
@@ -375,16 +459,17 @@ class CameraRingBuffer:
         ts_arr[1] = np.uint64(_seqlock_odd(seq))  # odd: writer active — MUST be first
         ts_arr[0] = np.uint64(now_ns)
 
-        # Write camera header (64 bytes)
+        # Write the fixed camera transport header.
         header_offset = slot_base + 16
         header_dest: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
             (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
         )
         header_dest[0] = header[0]
+        header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
 
         # Write RGB bytes
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
-        rgb_len = min(rgb.nbytes, self._max_rgb_bytes)
+        rgb_len = rgb.nbytes
         rgb_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
             (rgb_len,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset
         )
@@ -392,7 +477,7 @@ class CameraRingBuffer:
 
         # Write depth bytes
         depth_offset = rgb_offset + self._max_rgb_bytes
-        depth_len = min(depth.nbytes, self._max_depth_bytes)
+        depth_len = depth.nbytes
         depth_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
             (depth_len,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset
         )
@@ -401,7 +486,7 @@ class CameraRingBuffer:
         # Write pointcloud bytes (fixed-size block; validity is header-flagged)
         if self._max_pc_bytes > 0 and pointcloud is not None:
             pc_offset = depth_offset + self._max_depth_bytes
-            pc_len = min(pointcloud.nbytes, self._max_pc_bytes)
+            pc_len = pointcloud.nbytes
             pc_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
                 (pc_len,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset
             )
@@ -518,6 +603,99 @@ class CameraRingBuffer:
 
         return header, rgb, depth, pointcloud, _seqlock_to_logical(slot_seq)
 
+    def get_last_metadata(self, k: int) -> list[tuple[np.ndarray, int, int]]:
+        """Return up to *k* verified camera headers without copying payloads.
+
+        Results are oldest-first ``(header, publish_monotonic_ns, sequence)``.
+        This is the cheap first phase of causal camera selection.
+        """
+        if k <= 0:
+            return []
+        if k > self.maxlen:
+            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
+        latest_seq = int(self._write_seq[0])
+        if latest_seq == 0:
+            return []
+        result: list[tuple[np.ndarray, int, int]] = []
+        for sequence in range(max(1, latest_seq - min(k, latest_seq) + 1), latest_seq + 1):
+            idx = sequence % self.maxlen
+            slot_base = self._HEADER_SIZE + idx * self._slot_size
+            ts_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+                (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
+            )
+            marker1 = int(ts_seq[1])
+            if not _seqlock_is_complete(marker1) or _seqlock_to_logical(marker1) != sequence:
+                continue
+            publish_ns = int(ts_seq[0])
+            header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
+                (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=slot_base + 16
+            ).copy()
+            marker2 = int(ts_seq[1])
+            if marker1 == marker2 and _seqlock_is_complete(marker2):
+                result.append((header, publish_ns, sequence))
+        return result
+
+    def read_sequence(
+        self,
+        sequence: int,
+        *,
+        modalities: tuple[str, ...] = ("rgb", "depth", "pointcloud"),
+    ) -> dict[str, np.ndarray] | None:
+        """Copy selected payloads for one still-resident verified sequence."""
+        allowed = {"rgb", "depth", "pointcloud"}
+        unknown = set(modalities) - allowed
+        if unknown:
+            raise ValueError(f"unknown camera modalities: {sorted(unknown)}")
+        if sequence <= 0:
+            return None
+        idx = sequence % self.maxlen
+        slot_base = self._HEADER_SIZE + idx * self._slot_size
+        ts_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
+        )
+        marker1 = int(ts_seq[1])
+        if not _seqlock_is_complete(marker1) or _seqlock_to_logical(marker1) != sequence:
+            return None
+        header_offset = slot_base + 16
+        header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
+            (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
+        ).copy()
+        h = header[0]
+        output: dict[str, np.ndarray] = {"header": header}
+        rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
+        if "rgb" in modalities:
+            rgb_shape = (int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"]))
+            size = int(h["rgb_size"])
+            if size <= 0 or size > self._max_rgb_bytes or int(np.prod(rgb_shape)) != size:
+                return None
+            output["rgb"] = (
+                np.ndarray((size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset).copy().reshape(rgb_shape)
+            )
+        depth_offset = rgb_offset + self._max_rgb_bytes
+        if "depth" in modalities:
+            depth_shape = (int(h["depth_shape_h"]), int(h["depth_shape_w"]))
+            size = int(h["depth_size"])
+            if size <= 0 or size > self._max_depth_bytes or int(np.prod(depth_shape)) * 2 != size:
+                return None
+            output["depth"] = (
+                np.ndarray((size,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset)
+                .copy()
+                .view(np.uint16)
+                .reshape(depth_shape)
+            )
+        if "pointcloud" in modalities and self._max_pc_bytes > 0 and self._pc_shape is not None:
+            pc_offset = depth_offset + self._max_depth_bytes
+            output["pointcloud"] = (
+                np.ndarray((self._max_pc_bytes,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset)
+                .copy()
+                .view(np.float32)
+                .reshape(self._pc_shape)
+            )
+        marker2 = int(ts_seq[1])
+        if marker1 != marker2 or not _seqlock_is_complete(marker2):
+            return None
+        return output
+
     def frame_age_ns(self) -> int:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""
         idx = int(self._write_idx_view()[0])
@@ -559,8 +737,17 @@ class CameraRingBuffer:
 # Camera frame header dtype
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
-        ("timestamp", "<f8"),
+        ("timestamp", "<f8"),  # RealSense device timestamp (seconds)
+        ("capture_monotonic_s", "<f8"),
+        ("source_monotonic_ns", "<u8"),
+        ("receive_monotonic_ns", "<u8"),
+        ("publish_monotonic_ns", "<u8"),
+        ("camera_generation", "<u8"),
         ("frame_number", "<u8"),
+        ("frame_gap", "<u4"),
+        ("clock_reset", "<u1"),
+        ("duplicate", "<u1"),
+        ("backlog_s", "<f8"),
         ("rgb_size", "<u8"),
         ("depth_size", "<u8"),
         ("rgb_shape_h", "<u4"),
@@ -569,8 +756,12 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("depth_shape_h", "<u4"),
         ("depth_shape_w", "<u4"),
         ("pc_num_points", "<u4"),
+        ("pc_source_point_count", "<u4"),
+        ("pc_valid_depth_ratio", "<f4"),
+        ("pc_padding_count", "<u4"),
         ("camera_health", "<u1"),
-        ("pad", "<u1", (7,)),
+        ("pointcloud_valid", "<u1"),
+        ("pad", "<u1", (4,)),
     ],
     align=True,
 )

@@ -31,13 +31,21 @@ class VRReceiverConfig:
     port: int = field(default_factory=lambda: vr.port)
     hand_side: str = field(default_factory=lambda: vr.hand_side)  # "both" needed for HeadFrame
 
+    @classmethod
+    def from_runtime(cls, runtime: object) -> "VRReceiverConfig":
+        cfg = getattr(runtime, "vr")
+        return cls(transport=str(cfg.transport), host=str(cfg.host), port=int(cfg.port), hand_side=str(cfg.hand_side))
+
 
 def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
     """VR process entry point — writes directly to SharedStorage.vr_ring."""
 
     cfg = config or VRReceiverConfig()
 
-    from dexmani_real.shm.shared_storage import new_frame, vr_frame_dtype
+    from dexmani_real.runtime.status import ComponentPhase, FaultCode
+    from dexmani_real.shm.shared_storage import new_frame, publish_component_status, vr_frame_dtype
+
+    publish_component_status(shared, "vr", ComponentPhase.LOADING)
 
     try:
         from hand_tracking_sdk import (
@@ -66,9 +74,15 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         )
     except ImportError as e:
         logger.error("vr_loop: SDK import failed: %s", e)
+        publish_component_status(
+            shared, "vr", ComponentPhase.FAULT, fault_code=FaultCode.STARTUP_FAILED, detail="VR SDK import failed"
+        )
         return
     except Exception as e:
         logger.error("vr_loop: connect failed: %s", e)
+        publish_component_status(
+            shared, "vr", ComponentPhase.FAULT, fault_code=FaultCode.STARTUP_FAILED, detail="VR connect failed"
+        )
         return
 
     logger.info("vr_loop: connected to HTS port=%d", cfg.port)
@@ -95,6 +109,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
 
         if not shared.vr_ready.is_set():
             shared.vr_ready.set()
+            publish_component_status(shared, "vr", ComponentPhase.READY)
             logger.info("vr_loop: ready (first event received)")
 
         if isinstance(event, HeadFrame):
@@ -138,4 +153,5 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             logger.warning("vr_loop: frame conversion error", exc_info=True)
             continue
 
+    publish_component_status(shared, "vr", ComponentPhase.STOPPED)
     logger.info("vr_loop: exited")

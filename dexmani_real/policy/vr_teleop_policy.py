@@ -3,29 +3,39 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.camera_calib import CameraCalib
-from dexmani_real.config.defaults import arm, hand, policy
+from dexmani_real.config.defaults import arm, camera, hand, policy
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
+from dexmani_real.policy.action_protocol import (
+    AckStatus,
+    ActionSafetyGate,
+    ActionSafetyGateConfig,
+    planner_action_safety_gate,
+    publish_joint_targets,
+)
 from dexmani_real.policy.loop_timing import StageTimer
-from dexmani_real.recording.episode_recorder import EpisodeRecorder
+from dexmani_real.policy.runtime import ActionCandidate
+from dexmani_real.recording.io_process import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import HAND_CMD_DTYPE, SharedStorage, hand_home_converge, make_arm_action
-from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state
-from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state
+from dexmani_real.runtime.status import ComponentPhase, FaultCode
+from dexmani_real.shm.shared_storage import SharedStorage, hand_home_converge, publish_component_status
+from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state_latest
+from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state_latest
 from dexmani_real.shm.shared_storage import send_arm_home
-from dexmani_real.shm.shared_storage import write_hand_cmd as _write_hand_cmd
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
@@ -49,11 +59,14 @@ class PolicyConfig:
     """Policy process configuration."""
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
+    coordinator_hz: float = field(default_factory=lambda: policy.coordinator_hz)
 
     # Mode 6 firmware parameters (deg — matches CLI convention)
     joint_max_speed_deg_s: float = field(default_factory=lambda: arm.max_joint_velocity_deg_per_s)
     joint_max_acc_deg_s2: float = field(default_factory=lambda: arm.max_joint_acceleration_deg_per_s2)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
+    arm_home_qpos: tuple[float, ...] = field(default_factory=lambda: arm.home_qpos)
+    hand_safety_margin_m: float = field(default_factory=lambda: arm.hand_safety_margin_m)
 
     vr_pos_scale: float = field(default_factory=lambda: policy.vr_mapping.pos_scale)
     vr_rot_scale: float = field(default_factory=lambda: policy.vr_mapping.rot_scale)
@@ -83,8 +96,18 @@ class PolicyConfig:
     max_record_seconds: float = field(default_factory=lambda: policy.max_record_duration_s)
     min_record_seconds: float = field(default_factory=lambda: policy.min_record_duration_s)
     episodes_dir: str = field(default_factory=lambda: policy.episodes_dir)
+    recording_enabled: bool = field(default_factory=lambda: policy.recording_enabled)
     task_label: str = ""
     operator: str = ""
+    resolved_config_json: str = ""
+    resolved_config_sha256: str = ""
+
+    camera_max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
+    camera_recording_stall_abort_s: float = field(default_factory=lambda: camera.recording_stall_abort_s)
+    camera_width: int = field(default_factory=lambda: camera.width)
+    camera_height: int = field(default_factory=lambda: camera.height)
+    camera_fps: int = field(default_factory=lambda: camera.fps)
+    camera_align_mode: str = field(default_factory=lambda: camera.align_mode)
 
     # Status print interval (in control ticks)
     status_every: int = field(default_factory=lambda: policy.status_print_interval)
@@ -115,6 +138,7 @@ class PolicyConfig:
     hand_qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_max_rad)
     hand_feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
     hand_max_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
+    tag_retargeting_config: Any | None = None
 
     # VR transform config path (relative to repo root)
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
@@ -122,12 +146,147 @@ class PolicyConfig:
     def __post_init__(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError("control_hz must be finite and > 0")
+        if not np.isfinite(self.coordinator_hz) or self.coordinator_hz < self.control_hz:
+            raise ValueError("coordinator_hz must be finite and >= control_hz")
         if not (0.0 <= self.hand_output_smoothing_alpha <= 1.0):
             raise ValueError("hand_output_smoothing_alpha must be in [0, 1]")
         if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
             raise ValueError("hand_ramp_duration_s must be finite and >= 0")
         if not np.isfinite(self.begin_motion_gate_timeout_s) or self.begin_motion_gate_timeout_s < 0:
             raise ValueError("begin_motion_gate_timeout_s must be finite and >= 0")
+        if self.camera_max_frame_age_s <= 0:
+            raise ValueError("camera_max_frame_age_s must be > 0")
+        if self.camera_recording_stall_abort_s <= self.camera_max_frame_age_s:
+            raise ValueError("camera_recording_stall_abort_s must exceed camera_max_frame_age_s")
+
+    @classmethod
+    def from_runtime(
+        cls,
+        runtime: object,
+        *,
+        task_label: str = "",
+        operator: str = "",
+        hand_urdf_path: str | None = None,
+    ) -> "PolicyConfig":
+        arm_cfg = getattr(runtime, "arm")
+        hand_cfg = getattr(runtime, "hand")
+        policy_cfg = getattr(runtime, "policy")
+        camera_cfg = getattr(runtime, "camera")
+        return cls(
+            control_hz=float(policy_cfg.control_hz),
+            coordinator_hz=float(policy_cfg.coordinator_hz),
+            joint_max_speed_deg_s=float(arm_cfg.max_joint_velocity_deg_per_s),
+            joint_max_acc_deg_s2=float(arm_cfg.max_joint_acceleration_deg_per_s2),
+            arm_loop_hz=float(arm_cfg.loop_hz),
+            arm_home_qpos=tuple(arm_cfg.home_qpos),
+            hand_safety_margin_m=float(arm_cfg.hand_safety_margin_m),
+            vr_pos_scale=float(policy_cfg.vr_mapping.pos_scale),
+            vr_rot_scale=float(policy_cfg.vr_mapping.rot_scale),
+            vr_max_delta_rot_rad=float(policy_cfg.vr_mapping.max_delta_rot_rad),
+            vr_stale_threshold_s=float(policy_cfg.vr_mapping.stale_threshold_s),
+            workspace_bounds=(
+                (float(policy_cfg.workspace.x_min), float(policy_cfg.workspace.x_max)),
+                (float(policy_cfg.workspace.y_min), float(policy_cfg.workspace.y_max)),
+                (float(policy_cfg.workspace.z_min), float(policy_cfg.workspace.z_max)),
+            ),
+            contact_stall_enabled=bool(policy_cfg.contact_stall_enabled),
+            contact_stall_table_z_surface_m=float(arm_cfg.table_z_surface_m),
+            contact_stall_table_context_height_m=float(policy_cfg.contact_stall_table_context_height_m),
+            contact_stall_min_downward_target_m=float(policy_cfg.contact_stall_min_downward_target_m),
+            contact_stall_tracking_error_rad=float(policy_cfg.contact_stall_tracking_error_rad),
+            contact_stall_max_closing_speed_rad_s=float(policy_cfg.contact_stall_max_closing_speed_rad_s),
+            ema_alpha_pos=float(policy_cfg.ema.alpha_pos),
+            ema_alpha_rot=float(policy_cfg.ema.alpha_rot),
+            max_record_seconds=float(policy_cfg.max_record_duration_s),
+            min_record_seconds=float(policy_cfg.min_record_duration_s),
+            episodes_dir=str(policy_cfg.episodes_dir),
+            recording_enabled=bool(policy_cfg.recording_enabled),
+            task_label=task_label,
+            operator=operator,
+            resolved_config_json=str(getattr(runtime, "canonical_json", "")),
+            resolved_config_sha256=str(getattr(runtime, "sha256", "")),
+            camera_max_frame_age_s=float(camera_cfg.max_frame_age_s),
+            camera_recording_stall_abort_s=float(camera_cfg.recording_stall_abort_s),
+            camera_width=int(camera_cfg.width),
+            camera_height=int(camera_cfg.height),
+            camera_fps=int(camera_cfg.fps),
+            camera_align_mode=str(camera_cfg.align_mode),
+            status_every=int(policy_cfg.status_print_interval),
+            max_consecutive_errors=int(policy_cfg.max_consecutive_errors),
+            hand_enabled=bool(policy_cfg.hand_enabled),
+            hand_retargeting_type=str(policy_cfg.hand_retargeting_type),
+            hand_output_smoothing_alpha=float(policy_cfg.hand_output_smoothing_alpha),
+            hand_ramp_duration_s=float(policy_cfg.hand_ramp_duration_s),
+            begin_motion_gate_timeout_s=float(policy_cfg.begin_motion_gate_timeout_s),
+            hand_disconnect_timeout_s=float(policy_cfg.hand_disconnect_timeout_s),
+            hand_urdf_path=(
+                str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf") if hand_urdf_path is None else hand_urdf_path
+            ),
+            fingertip_link_names=tuple(hand_cfg.fingertip_link_names),
+            T_eef_handbase_pos_xyz=tuple(hand_cfg.T_eef_handbase_pos_xyz),
+            T_eef_handbase_quat_wxyz=tuple(hand_cfg.T_eef_handbase_quat_wxyz),
+            joint_limit_lower=tuple(arm_cfg.joint_limit_lower),
+            joint_limit_upper=tuple(arm_cfg.joint_limit_upper),
+            hand_home_qpos_deg=tuple(hand_cfg.home_qpos_deg),
+            hand_qpos_lower_rad=tuple(hand_cfg.qpos_min_rad),
+            hand_qpos_upper_rad=tuple(hand_cfg.qpos_max_rad),
+            hand_feedback_bound_tolerance_rad=float(hand_cfg.feedback_bound_tolerance_rad),
+            hand_max_delta_rad=None if hand_cfg.max_delta_rad is None else float(hand_cfg.max_delta_rad),
+            tag_retargeting_config=getattr(runtime, "tag_retargeting"),
+        )
+
+
+@dataclass
+class CameraFreshnessTracker:
+    """Classify per-grid camera freshness and detect a continuous source stall."""
+
+    max_age_s: float
+    abort_after_s: float
+    episode_started_s: float = 0.0
+    last_ring_sequence: int = 0
+    last_frame_number: int = 0
+    stale_since_s: float | None = None
+
+    def reset(self, episode_started_s: float) -> None:
+        self.episode_started_s = float(episode_started_s)
+        self.last_ring_sequence = 0
+        self.last_frame_number = 0
+        self.stale_since_s = None
+
+    def observe(self, frame: dict | None, now_s: float | None = None) -> tuple[dict | None, bool]:
+        now = time.monotonic() if now_s is None else float(now_s)
+        fresh = False
+        if frame is not None:
+            sequence = int(frame.get("ring_sequence", 0))
+            frame_number = int(frame.get("frame_number", 0))
+            source_ns = int(frame.get("source_monotonic_ns", 0))
+            # Schema-v15 camera frames carry mapped source time.  Accept the
+            # legacy capture field only for old offline fixtures/readers.
+            source_s = source_ns / 1e9 if source_ns > 0 else float(frame.get("capture_monotonic_s", np.nan))
+            age_s = max(0.0, now - source_s) if np.isfinite(source_s) else float("inf")
+            is_new = (
+                sequence > 0
+                and sequence != self.last_ring_sequence
+                and frame_number > 0
+                and frame_number != self.last_frame_number
+            )
+            after_episode_start = np.isfinite(source_s) and source_s >= self.episode_started_s
+            healthy = int(frame.get("camera_health", 1)) == 0
+            fresh = is_new and after_episode_start and healthy and age_s <= self.max_age_s
+            if sequence > 0 and sequence != self.last_ring_sequence:
+                self.last_ring_sequence = sequence
+                self.last_frame_number = frame_number
+            frame["camera_age_s"] = age_s
+            frame["camera_fresh"] = fresh
+            frame["pointcloud_valid"] = bool(frame.get("pointcloud_valid", False)) and fresh
+
+        if fresh:
+            self.stale_since_s = None
+        elif self.stale_since_s is None:
+            self.stale_since_s = now
+
+        stalled = self.stale_since_s is not None and now - self.stale_since_s >= self.abort_after_s
+        return frame, stalled
 
 
 def _sanitize_hand_command(
@@ -270,6 +429,8 @@ def _do_teleop_home(
     arm_mapper=None,
     hand_retargeter=None,
     heartbeat: bool = True,
+    action_safety_gate: ActionSafetyGate | None = None,
+    arm_home_qpos: np.ndarray | None = None,
 ) -> np.ndarray:
     """Home hand first, then arm. Returns updated *prev_hand_qpos*.
 
@@ -290,6 +451,7 @@ def _do_teleop_home(
             heartbeat=heartbeat,
             check_is_running=True,
             verbose=True,
+            safety_gate=action_safety_gate,
         )
         if final_qpos is not None:
             prev_hand_qpos = final_qpos
@@ -318,7 +480,7 @@ def _do_teleop_home(
         logger.warning("arm home cancelled: arm state is stale or unhealthy (age=%.3fs)", _state_age_s)
         return prev_hand_qpos
     arm_qpos = np.asarray(_arm_state["qpos"][0], dtype=np.float64).copy()
-    _home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+    _home_qpos = np.array(arm.home_qpos if arm_home_qpos is None else arm_home_qpos, dtype=np.float64)
     _ok = send_arm_home(
         shared,
         _home_qpos,
@@ -348,6 +510,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     from dexmani_real.robot.safety import SafetyState, transition
 
     cfg = config or PolicyConfig()
+    publish_component_status(shared, "policy", ComponentPhase.LOADING)
     ctrl_dt = 1.0 / cfg.control_hz
     arm_cmd_max_step_rad = float(np.deg2rad(cfg.joint_max_speed_deg_s)) * ctrl_dt
     JOINT_LO = np.array(cfg.joint_limit_lower, dtype=np.float64)
@@ -397,17 +560,36 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             base_to_world_rot=np.eye(3, dtype=np.float64),
         )
 
-        _repo_root = Path(__file__).resolve().parents[2]
-        recorder = EpisodeRecorder(
-            data_dir=str(_repo_root / cfg.episodes_dir),
-            max_frames=int(round(cfg.max_record_seconds * cfg.control_hz)),
-            control_hz=cfg.control_hz,
-            min_frames=int(round(cfg.min_record_seconds * cfg.control_hz)),
-            arm_sent_stream=True,
+        action_safety_gate = planner_action_safety_gate(
+            ActionSafetyGateConfig(
+                arm_joint_lower_rad=tuple(cfg.joint_limit_lower),
+                arm_joint_upper_rad=tuple(cfg.joint_limit_upper),
+                hand_joint_lower_rad=tuple(cfg.hand_qpos_lower_rad),
+                hand_joint_upper_rad=tuple(cfg.hand_qpos_upper_rad),
+                arm_max_velocity_rad_s=float(np.deg2rad(cfg.joint_max_speed_deg_s)),
+                hand_max_velocity_rad_s=(
+                    float(cfg.hand_max_delta_rad) * cfg.control_hz
+                    if cfg.hand_max_delta_rad is not None
+                    else float(np.deg2rad(180.0))
+                ),
+                observation_max_age_s=max(0.25, cfg.vr_stale_threshold_s),
+                require_geometry_checks=True,
+            ),
+            planner=planner,
+            table_z_surface_m=cfg.contact_stall_table_z_surface_m,
+            hand_safety_margin_m=cfg.hand_safety_margin_m,
         )
+
+        recorder = RecorderClient(shared) if cfg.recording_enabled else None
     except Exception as e:
         logger.warning("policy_loop: init failed", exc_info=True)
-        shared.is_running.value = False
+        publish_component_status(
+            shared,
+            "policy",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.STARTUP_FAILED,
+            detail="VR policy initialization failed",
+        )
         return
 
     kb = KeyboardHandler()
@@ -421,17 +603,21 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     _hand_ramp_step = 0
     _hand_ramp_total_frames = _hand_ramp_frame_count(cfg.hand_ramp_duration_s, cfg.control_hz)
 
-    def _try_init_hand_retargeter() -> None:
+    def _try_init_hand_retargeter() -> bool:
         """Lazily initialize hand_retargeter if not already created."""
         nonlocal hand_retargeter, hand_available
         if hand_retargeter is not None:
-            return
+            return True
         try:
             if cfg.hand_retargeting_type == "tag":
                 hand_retargeter = TAGHandRetargeter(
                     hand_type="right",
                     smoothing_alpha=cfg.hand_output_smoothing_alpha,
                     feedback_bound_tolerance_rad=cfg.hand_feedback_bound_tolerance_rad,
+                    qpos_lower_rad=cfg.hand_qpos_lower_rad,
+                    qpos_upper_rad=cfg.hand_qpos_upper_rad,
+                    fingertip_link_names=cfg.fingertip_link_names,
+                    tag_config=cfg.tag_retargeting_config,
                 )
             else:
                 hand_retargeter = XHandRetargeter(
@@ -440,10 +626,12 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     smoothing_alpha=cfg.hand_output_smoothing_alpha,
                 )
             logger.info("Hand retargeter ready (type=%s)", cfg.hand_retargeting_type)
+            return True
         except Exception as e:
-            logger.warning("Hand retargeter init failed: %s — degraded to hold-position", e)
+            logger.error("Hand retargeter init failed: %s", e, exc_info=True)
             hand_available = False
             hand_retargeter = None
+            return False
 
     def _init_and_seed_hand_retargeter() -> np.ndarray | None:
         """Lazy-init retargeter and seed NLP warm-start from hardware qpos.
@@ -468,16 +656,22 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         except Exception as e:
             logger.warning("Hand FK init failed: %s", e)
 
-    logger.info("Policy: waiting for arm/hand/camera/vr ready...")
-    for name, ev in [
-        ("arm", shared.arm_ready),
-        ("hand", shared.hand_ready),
-        ("camera", shared.camera_ready),
-        ("vr", shared.vr_ready),
-    ]:
+    logger.info("Policy: waiting for enabled arm/hand/camera/vr capabilities...")
+    _ready_events = [("arm", shared.arm_ready), ("camera", shared.camera_ready), ("vr", shared.vr_ready)]
+    if cfg.recording_enabled:
+        _ready_events.append(("recorder", shared.recorder_ready))
+    if cfg.hand_enabled:
+        _ready_events.insert(1, ("hand", shared.hand_ready))
+    for name, ev in _ready_events:
         if not ev.wait(timeout=120):
             logger.error("Policy: %s startup timeout (120s)", name)
-            shared.is_running.value = False
+            publish_component_status(
+                shared,
+                "policy",
+                ComponentPhase.FAULT,
+                fault_code=FaultCode.STARTUP_FAILED,
+                detail=f"startup timeout waiting for {name}",
+            )
             kb.stop()
             return
     logger.info("Policy: all subsystems ready")
@@ -494,7 +688,17 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         else:
             hand_available = False
         if hand_available:
-            _try_init_hand_retargeter()
+            if not _try_init_hand_retargeter():
+                publish_component_status(
+                    shared,
+                    "policy",
+                    ComponentPhase.FAULT,
+                    fault_code=FaultCode.STARTUP_FAILED,
+                    detail="hand retargeter initialization failed",
+                )
+                shared.error_state.value = True
+                kb.stop()
+                return
         else:
             logger.info("Hand not connected — hold-position only")
 
@@ -502,8 +706,10 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     # enters the supervisor, which checks policy_heartbeat_s immediately.
     # Without this, the ~40 lines of init below race the first supervisor tick.
     shared.policy_heartbeat_s.value = time.monotonic()
+    shared.policy_ready.set()
+    publish_component_status(shared, "policy", ComponentPhase.READY)
 
-    home_qpos = np.array(arm.home_qpos, dtype=np.float64)
+    home_qpos = np.array(cfg.arm_home_qpos, dtype=np.float64)
     arm_state = _read_arm_state(shared)
     hand_state = _read_hand_state(shared)
     if arm_state is None:
@@ -532,7 +738,13 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     ema_prev_pos: np.ndarray | None = None
     ema_prev_quat: np.ndarray | None = None
 
-    limiter = RateManager(cfg.control_hz)
+    # Coordinator duties (heartbeat, ESC/keyboard and RecorderIO status) run
+    # at 64 Hz while observation/action/recording remain on the 16 Hz grid.
+    limiter = RateManager(cfg.coordinator_hz)
+    _grid_period_ns = int(round(1e9 / cfg.control_hz))
+    _next_grid_ns = time.monotonic_ns() + _grid_period_ns
+    _current_grid_anchor_ns = _next_grid_ns
+    _pending_controls: list[ControlSignal] = []
     stage_timer = StageTimer(window=cfg.status_every)
     _validate_warn = ThrottledWarner(interval_s=2.0)
     _arm_stale_warn = ThrottledWarner(interval_s=3.0)
@@ -542,19 +754,20 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     prev_eef_pos: np.ndarray | None = None
     _last_target_eef_pos = np.full(3, np.nan)  # last valid IK target (held frame continuity)
     _last_target_eef_rot6d = np.full(6, np.nan)
-    _last_tactile_data: np.ndarray | None = None  # forward-fill cache for held-frame tactile
+    _camera_freshness = CameraFreshnessTracker(
+        max_age_s=cfg.camera_max_frame_age_s,
+        abort_after_s=cfg.camera_recording_stall_abort_s,
+    )
 
     # Automatic cyclic GC is left enabled (2026-08-05 audit).  The hot path
     # allocates mostly numpy arrays (refcounted, not cyclic), so GC thresholds
     # are rarely reached.  gc.collect() at episode boundaries serves as explicit hints.
 
     # SIGTERM graceful shutdown
-    # Policy is spawned via mp.Process; Main calls process.terminate() on
-    # shutdown, which sends SIGTERM.  Default SIGTERM handler kills the
-    # process immediately → daemon stop-thread killed mid-HDF5-write
-    # → truncated HDF5.  We intercept SIGTERM and set a flag so the main
-    # loop exits cleanly through the finally block, which flushes and
-    # joins the recorder daemon.
+    # Verified shutdown first requests a graceful exit and may escalate to
+    # process.terminate(), which sends SIGTERM. Intercept that signal so the
+    # loop can close its RecorderIO client cleanly before an escalation timer
+    # expires; RecorderIO itself is a supervised non-daemon process.
     _sigterm_requested = False
 
     def _on_sigterm(signum: int, frame: object) -> None:
@@ -563,24 +776,38 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
-    logger.info("Policy: entering main loop @ %.0f Hz", cfg.control_hz)
+    logger.info(
+        "Policy: entering coordinator loop @ %.0f Hz (observation/action grid %.0f Hz)",
+        cfg.coordinator_hz,
+        cfg.control_hz,
+    )
 
     try:
         while shared.is_running.value and not _sigterm_requested:
             shared.policy_heartbeat_s.value = time.monotonic()
-            stage_timer.tick()
             limiter.wait()
-            stage_timer.mark("wait")
 
-            _stop_result = recorder.poll_stop()
-            if _stop_result.done and _stop_result.path is not None:
-                if _stop_result.error:
-                    print(f"  ⚠ 保存失败 ({_stop_result.error}): {_stop_result.path}")
-                elif _stop_result.success:
-                    print(f"  录制已保存: {_stop_result.path}  ({_stop_result.frame_count} 帧)")
-                gc.collect()
+            if recorder is not None:
+                _stop_result = recorder.poll_stop()
+                if _stop_result.done and _stop_result.path is not None:
+                    if _stop_result.error:
+                        print(f"  ⚠ 保存失败 ({_stop_result.error}): {_stop_result.path}")
+                    elif _stop_result.success:
+                        print(f"  录制已保存: {_stop_result.path}  ({_stop_result.frame_count} 帧)")
+                    gc.collect()
 
-            loop_count += 1
+            if recorder is not None and recording_active and recorder.camera_writer_error is not None:
+                _writer_error = recorder.camera_writer_error
+                logger.error("Camera writer failed — discarding current episode: %s", _writer_error)
+                print(f"  ⚠ 相机写盘失败，当前 episode 已废弃: {_writer_error}")
+                _stop_recording(
+                    recorder,
+                    recording_active,
+                    save=False,
+                    shared=shared,
+                    reason="camera_writer_error",
+                )
+                recording_active = False
 
             # Entered after Q key stops teleop.  Policy loop stays alive with
             # heartbeats ticking so arm/hand/vr continue running — H (return_home)
@@ -597,7 +824,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             planner=planner,
                             audio=audio,
                             hand_home_qpos=HAND_HOME_QPOS,
-                            table_z_surface_m=arm.table_z_surface_m,
+                            table_z_surface_m=cfg.contact_stall_table_z_surface_m,
+                            action_safety_gate=action_safety_gate,
+                            arm_home_qpos=home_qpos,
                             # arm_mapper/hand_retargeter=None: post-teleop, state already cleared
                         )
                         limiter.reset()
@@ -606,26 +835,43 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     elif _sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
                         if _sig == ControlSignal.EMERGENCY_STOP:
                             shared.estop_request.value = True
-                        shared.is_running.value = False
+                        else:
+                            shared.quit_requested.value = True
                         break
 
-                if not shared.is_running.value:
+                if shared.estop_request.value or shared.quit_requested.value or not shared.is_running.value:
                     break
 
                 if time.perf_counter() > post_teleop_deadline:
                     print("  timeout — auto exit")
-                    shared.is_running.value = False
+                    shared.quit_requested.value = True
                     break
 
                 continue  # stay in quit_pending, don't process normal teleop
 
+            _pending_controls.extend(kb.poll(timeout=0.0))
+            _coordinator_now_ns = time.monotonic_ns()
+            _grid_due = _coordinator_now_ns >= _next_grid_ns
+            if _grid_due:
+                # Skip missed deadlines rather than executing catch-up bursts;
+                # every produced sample still has exactly one causal grid slot.
+                _missed_periods = max(1, (_coordinator_now_ns - _next_grid_ns) // _grid_period_ns + 1)
+                _current_grid_anchor_ns = _next_grid_ns + int(_missed_periods - 1) * _grid_period_ns
+                _next_grid_ns += int(_missed_periods) * _grid_period_ns
+                loop_count += 1
+                stage_timer.tick()
+                stage_timer.mark("coordinator")
+            if not _grid_due and not _pending_controls:
+                continue
+
+            _controls = tuple(_pending_controls)
+            _pending_controls.clear()
             skip_rest = False
-            for sig in kb.poll(timeout=0.0):
+            for sig in _controls:
                 if sig == ControlSignal.EMERGENCY_STOP:
                     print("\nESC: emergency_stop")
                     audio.play("emergency")
                     shared.estop_request.value = True
-                    shared.is_running.value = False
                     _stop_recording(recorder, recording_active, save=False, shared=shared)
                     recording_active = False
                     break
@@ -663,7 +909,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                     break
                             if decision is not None:
                                 break
-                            if not shared.is_running.value:
+                            if shared.estop_request.value or not shared.is_running.value:
                                 break
 
                         if decision is True:
@@ -694,9 +940,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                                 planner=planner,
                                 audio=audio,
                                 hand_home_qpos=HAND_HOME_QPOS,
-                                table_z_surface_m=arm.table_z_surface_m,
+                                table_z_surface_m=cfg.contact_stall_table_z_surface_m,
                                 arm_mapper=arm_mapper,
                                 hand_retargeter=hand_retargeter,
+                                action_safety_gate=action_safety_gate,
+                                arm_home_qpos=home_qpos,
                             )
 
                     # Enter post-teleop state (two-stage Q) instead of immediate exit.
@@ -704,7 +952,6 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     # continue running so H (return_home) still works.
                     teleop_active = False
                     transition(shared, SafetyState.ARMED)
-                    shared.quit_requested.value = True
                     quit_pending = True
                     post_teleop_deadline = time.perf_counter() + 60.0
                     print("\n[H] return_home  [Q] quit  (60s timeout)", flush=True)
@@ -726,9 +973,11 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         planner=planner,
                         audio=audio,
                         hand_home_qpos=HAND_HOME_QPOS,
-                        table_z_surface_m=arm.table_z_surface_m,
+                        table_z_surface_m=cfg.contact_stall_table_z_surface_m,
                         arm_mapper=arm_mapper,
                         hand_retargeter=hand_retargeter,
+                        action_safety_gate=action_safety_gate,
+                        arm_home_qpos=home_qpos,
                     )
                     limiter.reset()
                     skip_rest = True
@@ -789,6 +1038,30 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     _stop_recording(recorder, recording_active, save=recording_active, shared=shared)
                     gc.collect()
 
+                    if recorder is None:
+                        recording_active = False
+                        shared.is_recording.value = False
+                        kb.drain_signal(ControlSignal.BEGIN)
+                        teleop_active = True
+                        transition(shared, SafetyState.RUNNING)
+                        publish_component_status(shared, "policy", ComponentPhase.RUNNING)
+                        recording_paused = False
+                        error_count = 0
+                        _hand_disconnected_at = None
+                        _seeded = _init_and_seed_hand_retargeter()
+                        if _seeded is not None:
+                            prev_hand_qpos = _seeded
+                        audio.play("begin")
+                        _begin_audio_gate_deadline_s = time.monotonic() + max(
+                            0.0, cfg.begin_motion_gate_timeout_s - ctrl_dt
+                        )
+                        _ignore_begin_audio_until_silent = False
+                        _prev_audio_playing = True
+                        print("\nB: 遥操作开始（未启用录制 capability）")
+                        limiter.reset()
+                        skip_rest = True
+                        continue
+
                     # Read camera metadata from SharedStorage (set by camera_loop).
                     _cam_K = None
                     _cam_K_flat = list(shared.camera_K)
@@ -799,6 +1072,25 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     )
                     _cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
                     _cam_serial = _cam_serial_bytes.decode() if _cam_serial_bytes else None
+                    _cam_firmware_bytes = shared.camera_firmware.value.rstrip(b"\x00")
+                    _cam_firmware = _cam_firmware_bytes.decode() if _cam_firmware_bytes else "unknown"
+                    _cam_sdk_bytes = shared.camera_sdk_version.value.rstrip(b"\x00")
+                    _cam_sdk_version = _cam_sdk_bytes.decode() if _cam_sdk_bytes else "unknown"
+                    _cam_profile_bytes = shared.camera_profile.value.rstrip(b"\x00")
+                    _cam_profile_json = _cam_profile_bytes.decode() if _cam_profile_bytes else "{}"
+                    _arm_identity_bytes = shared.arm_device_identity.value.rstrip(b"\x00")
+                    _arm_identity_json = (
+                        _arm_identity_bytes.decode("utf-8") if _arm_identity_bytes else '{"status":"unavailable"}'
+                    )
+                    _hand_identity_bytes = shared.hand_device_identity.value.rstrip(b"\x00")
+                    _hand_identity_json = (
+                        _hand_identity_bytes.decode("utf-8")
+                        if _hand_identity_bytes
+                        else ('{"status":"unavailable"}' if cfg.hand_enabled else '{"status":"disabled"}')
+                    )
+
+                    def _identity_hash(value: str) -> str:
+                        return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
                     # Resolve camera extrinsics from cameras.json by serial.
                     _calib = CameraCalib()
@@ -818,12 +1110,31 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         camera_name=_cam_name,
                         camera_serial=_cam_serial,
                         depth_scale=_depth_scale,
+                        camera_metadata={
+                            "camera_config_width": cfg.camera_width,
+                            "camera_config_height": cfg.camera_height,
+                            "camera_config_fps": cfg.camera_fps,
+                            "camera_align_mode": cfg.camera_align_mode,
+                            "camera_max_frame_age_s": cfg.camera_max_frame_age_s,
+                            "camera_recording_stall_abort_s": cfg.camera_recording_stall_abort_s,
+                            "camera_firmware": _cam_firmware,
+                            "camera_sdk_version": _cam_sdk_version,
+                            "camera_actual_profile_json": _cam_profile_json,
+                            "camera_serial_sha256": _identity_hash(_cam_serial or "unknown"),
+                            "camera_firmware_sha256": _identity_hash(_cam_firmware),
+                            "camera_sdk_version_sha256": _identity_hash(_cam_sdk_version),
+                            "camera_actual_profile_sha256": _identity_hash(_cam_profile_json),
+                        },
                         record_config={
                             "ema_alpha_pos": cfg.ema_alpha_pos,
                             "ema_alpha_rot": cfg.ema_alpha_rot,
                             "joint_max_acc": cfg.joint_max_acc_deg_s2,
                             "joint_max_speed": cfg.joint_max_speed_deg_s,
                             "arm_loop_hz": cfg.arm_loop_hz,
+                            # Jerk is intentionally unmanaged until a separate
+                            # hardware validation authorizes a persistent
+                            # controller setting; provenance must say so.
+                            "jerk_management": "unmanaged",
                             "contact_stall_enabled": cfg.contact_stall_enabled,
                             "contact_stall_table_z_surface_m": cfg.contact_stall_table_z_surface_m,
                             "contact_stall_table_context_height_m": cfg.contact_stall_table_context_height_m,
@@ -836,16 +1147,22 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             "hand_ramp_duration_s": cfg.hand_ramp_duration_s,
                             "begin_motion_gate_timeout_s": cfg.begin_motion_gate_timeout_s,
                             "hand_feedback_bound_tolerance_rad": cfg.hand_feedback_bound_tolerance_rad,
+                            "arm_device_identity_json": _arm_identity_json,
+                            "arm_device_identity_sha256": _identity_hash(_arm_identity_json),
+                            "hand_device_identity_json": _hand_identity_json,
+                            "hand_device_identity_sha256": _identity_hash(_hand_identity_json),
                         },
                     ):
                         print("  ⚠ 无法开始录制")
                         skip_rest = True
                         continue
                     recording_active = True
+                    _camera_freshness.reset(time.monotonic())
                     shared.is_recording.value = True
                     kb.drain_signal(ControlSignal.BEGIN)
                     teleop_active = True
                     transition(shared, SafetyState.RUNNING)
+                    publish_component_status(shared, "policy", ComponentPhase.RUNNING)
                     recording_paused = False
                     error_count = 0
                     _hand_disconnected_at = None
@@ -871,17 +1188,19 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     limiter.reset()
                     skip_rest = True
 
-            if not shared.is_running.value:
+            if shared.estop_request.value or shared.quit_requested.value or not shared.is_running.value:
                 break
             if skip_rest:
                 continue
+            if not _grid_due:
+                continue
 
-            arm_state = _read_arm_state(shared)
+            arm_state = _read_arm_state(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
             if arm_state is None:
                 error_count += 1
                 if error_count > cfg.max_consecutive_errors:
                     logger.error("连续 arm state 丢失，退出")
-                    shared.is_running.value = False
+                    shared.error_state.value = True
                     break
                 continue
             # S06: detect stale arm_state_ring (arm_loop hung but not crashed)
@@ -896,26 +1215,33 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 continue
             error_count = 0
 
-            vr_frame = _read_vr_frame(shared)
+            vr_frame = _read_vr_frame(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
             vr_stale = vr_frame is None or (
                 (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > cfg.vr_stale_threshold_s * 1e9
             )
             stage_timer.mark("vr")
 
-            cam = _read_camera_frame(shared)
+            cam = _read_camera_frame(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
+            if recording_active:
+                cam, _camera_stalled = _camera_freshness.observe(cam)
+                if _camera_stalled:
+                    logger.error(
+                        "Camera source stale for %.1fs — discarding episode; teleoperation remains RUNNING",
+                        cfg.camera_recording_stall_abort_s,
+                    )
+                    print("  ⚠ 相机连续失帧超过阈值，当前 episode 已废弃；遥操作继续")
+                    _stop_recording(
+                        recorder,
+                        recording_active,
+                        save=False,
+                        shared=shared,
+                        reason="camera_stall",
+                    )
+                    recording_active = False
             stage_timer.mark("cam")
 
-            hand_state = _read_hand_state(shared)
-            hand_tactile = _read_hand_tactile(shared)
-            # Forward-fill: hand_loop publishes hand_tactile_ring sparsely
-            # (contact-only writes — saves ~14.4 KB/tick @ 30 Hz).  Cache
-            # the last non-None read so held and active frames reuse it when
-            # the ring has no new data.  Avoids allocating zeros(5,120,3)
-            # (~14 KB) per frame.
-            if hand_tactile is not None:
-                _last_tactile_data = hand_tactile
-            elif _last_tactile_data is not None:
-                hand_tactile = _last_tactile_data
+            hand_state = _read_hand_state(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
+            hand_tactile = _read_hand_tactile(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
 
             # Single-frame RS485/EtherCAT glitches → retargeter keeps running (commands
             # land on a silent bus — harmless).  Only degrade to hold-position mode after
@@ -978,6 +1304,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
                 prev_qpos_cmd = arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None
@@ -1063,6 +1391,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
                 continue
             _policy_compute_t0 = time.perf_counter()
@@ -1085,9 +1415,17 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy(), "is_hold": True}):
-                    shared.is_running.value = False
+                if not _safe_arm_queue_put(
+                    shared,
+                    {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                ):
+                    shared.error_state.value = True
                     break
                 continue
 
@@ -1174,9 +1512,17 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": hold_qpos, "is_hold": True}):
-                    shared.is_running.value = False
+                if not _safe_arm_queue_put(
+                    shared,
+                    {"qpos": hold_qpos, "is_hold": True},
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                ):
+                    shared.error_state.value = True
                     break
                 continue
 
@@ -1256,10 +1602,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy(), "is_hold": True}):
-                    shared.is_running.value = False
-                    break
                 # The arm is held, but hand motion still needs arm↔hand collision validation.
                 hand_safe = hand_cmd_valid and _transition_collision_free(
                     planner, arm_qpos, prev_qpos_cmd, hand_start_qpos, hand_cmd
@@ -1268,12 +1613,38 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     safe_hand_cmd = hand_cmd if hand_safe else prev_hand_qpos
                     if not hand_safe:
                         _validate_warn("policy_loop: hand-only transition rejected — holding")
-                    _write_hand_cmd(shared, safe_hand_cmd)
+                    published_candidate = _safe_joint_publish(
+                        shared,
+                        prev_qpos_cmd.copy(),
+                        safe_hand_cmd,
+                        is_hold=True,
+                        timeout=0.06,
+                        observation_id=int(vr_frame["ring_sequence"]),
+                        observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                        safety_gate=action_safety_gate,
+                    )
+                    if published_candidate is None:
+                        shared.error_state.value = True
+                        break
+                    if published_candidate.arm_qpos is not None:
+                        prev_qpos_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
+                    if published_candidate.hand_qpos is not None:
+                        safe_hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
                     prev_hand_qpos = safe_hand_cmd.copy()
+                elif not _safe_arm_queue_put(
+                    shared,
+                    {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                ):
+                    shared.error_state.value = True
+                    break
                 continue
 
             # IK delta clamp
-            arm_cmd = np.asarray(ik_result.qpos, dtype=np.float64)
+            arm_cmd_raw = np.asarray(ik_result.qpos, dtype=np.float64).copy()
+            arm_cmd = arm_cmd_raw.copy()
             arm_cmd = prev_qpos_cmd + np.clip(arm_cmd - prev_qpos_cmd, -arm_cmd_max_step_rad, arm_cmd_max_step_rad)
 
             # Joint-space hard limit clip (P4 — prevents C9/C31 cascade when
@@ -1321,13 +1692,21 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
-                if not _safe_arm_queue_put(shared, {"qpos": prev_qpos_cmd.copy(), "is_hold": True}):
-                    shared.is_running.value = False
+                if not _safe_joint_publish(
+                    shared,
+                    prev_qpos_cmd.copy(),
+                    prev_hand_qpos.copy() if hand_available else None,
+                    is_hold=True,
+                    timeout=0.06,
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=action_safety_gate,
+                ):
+                    shared.error_state.value = True
                     break
-                # Any joint transition rejection holds both independently driven workers.
-                if hand_available:
-                    _write_hand_cmd(shared, prev_hand_qpos.copy())
                 continue
 
             # FAULT gate: do not send actions when system is in fault state.
@@ -1348,15 +1727,29 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         hand_fk=_hand_fk,
                         T_eef_handbase_pos=_T_eef_handbase_pos,
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
                     )
                 continue
-            if not _safe_arm_queue_put(shared, {"qpos": arm_cmd.copy()}):
-                logger.error("policy_loop: arm_action_q full on main send — arm unresponsive")
-                shared.is_running.value = False
+            published_candidate = _safe_joint_publish(
+                shared,
+                arm_cmd.copy(),
+                hand_cmd.copy() if hand_available else None,
+                timeout=0.06,
+                observation_id=int(vr_frame["ring_sequence"]),
+                observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                safety_gate=action_safety_gate,
+            )
+            if published_candidate is None:
+                logger.error("policy_loop: joint prepare/commit failed — actuator unresponsive")
+                shared.error_state.value = True
                 break
-            _write_hand_cmd(shared, hand_cmd)
             stage_timer.mark("send")
 
+            if published_candidate.arm_qpos is not None:
+                arm_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
+            if published_candidate.hand_qpos is not None:
+                hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
             prev_qpos_cmd = arm_cmd.copy()
             prev_hand_qpos = hand_cmd.copy()
             ema_prev_pos = target_pos.copy()
@@ -1390,6 +1783,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     target_eef_pos_raw=target_pos_raw,
                     target_eef_rot6d_raw=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat_raw)),
                     action_hand_joint_raw=hand_cmd_raw,
+                    action_arm_joint_raw=arm_cmd_raw,
                     policy_map_time_ms=policy_map_time_ms,
                     hand_retarget_time_ms=hand_retarget_time_ms,
                     transition_check_time_ms=transition_check_time_ms,
@@ -1397,53 +1791,138 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     hand_fk=_hand_fk,
                     T_eef_handbase_pos=_T_eef_handbase_pos,
                     T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                    observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                    shared=shared,
                 )
             stage_timer.mark("rec")
 
     finally:
         if recording_active:
-            _stop_recording(recorder, True, save=False)
-        recorder.join_stop(timeout=60)
+            _stop_recording(recorder, True, save=False, shared=shared, reason="policy_shutdown")
+        if recorder is not None:
+            recorder.join_stop(timeout=60)
         kb.stop()
-        shared.is_running.value = False
         audio.play("end")
         time.sleep(2.0)
+        if shared.error_state.value:
+            publish_component_status(
+                shared,
+                "policy",
+                ComponentPhase.FAULT,
+                fault_code=FaultCode.COMMAND_INVALID,
+                detail="policy exited with sticky fault",
+            )
+        else:
+            publish_component_status(shared, "policy", ComponentPhase.STOPPED)
         logger.info("Policy: loop exited")
 
 
-def _safe_arm_queue_put(shared: SharedStorage, action, *, timeout: float = 0.2) -> bool:
-    """Stamp and put an action onto arm_action_q with timeout protection.
-
-    Returns True on success, False if the queue was full (arm_loop dead or
-    severely backed up).  The default 0.2s timeout (~3 policy frames @16Hz)
-    balances fast fault detection against bounded arm_loop C24 recovery
-    (~200ms worst case); C22/C31 transition directly to FAULT.  A false-positive timeout triggers clean shutdown,
-    not FAULT.
-    """
-    from queue import Full
-
+def _safe_arm_queue_put(
+    shared: SharedStorage,
+    action,
+    *,
+    timeout: float = 0.2,
+    observation_id: int | None = None,
+    observation_anchor_monotonic_ns: int | None = None,
+    safety_gate: ActionSafetyGate | None = None,
+) -> ActionCandidate | None:
+    """Compatibility wrapper over the unified prepare/commit publisher."""
     try:
-        stamped_action = make_arm_action(
+        return _safe_joint_publish(
             shared,
             np.asarray(action["qpos"], dtype=np.float64),
+            None,
             is_hold=bool(action.get("is_hold", False)),
+            timeout=timeout,
+            observation_id=observation_id,
+            observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            safety_gate=safety_gate,
         )
-        shared.arm_action_q.put(stamped_action, block=True, timeout=timeout)
-        return True
     except (KeyError, TypeError, ValueError) as exc:
         logger.error("policy_loop: rejected invalid arm action: %s", exc)
-        return False
-    except Full:
-        logger.warning("policy_loop: arm_action_q full (timeout=%.1fs) — arm unresponsive", timeout)
-        return False
+        return None
 
 
-def _read_vr_frame(shared: SharedStorage) -> dict | None:
-    """Read latest VR frame from ring, return as dict or None."""
-    result = shared.vr_ring.read_latest()
+def _safe_joint_publish(
+    shared: SharedStorage,
+    arm_qpos: np.ndarray,
+    hand_qpos: np.ndarray | None,
+    *,
+    is_hold: bool = False,
+    timeout: float = 0.06,
+    observation_id: int | None = None,
+    observation_anchor_monotonic_ns: int | None = None,
+    safety_gate: ActionSafetyGate | None = None,
+) -> ActionCandidate | None:
+    """Publish one identity-correlated arm/hand endpoint through prepare/commit."""
+    return publish_joint_targets(
+        shared,
+        np.asarray(arm_qpos, dtype=np.float64),
+        None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
+        is_hold=is_hold,
+        prepare_timeout_s=timeout,
+        observation_id=observation_id,
+        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+        safety_gate=safety_gate,
+    )
+
+
+def _read_causal_structured_frame(
+    ring: Any,
+    *,
+    source_field: str,
+    anchor_monotonic_ns: int,
+) -> tuple[np.ndarray, int, int] | None:
+    """Return the newest frame whose source and publication precede *anchor*."""
+    for data, ring_publish_ns, sequence in reversed(ring.get_last_k(ring.maxlen)):
+        source_ns = int(data[source_field][0])
+        names = data.dtype.names or ()
+        publish_ns = (
+            int(data["publish_monotonic_ns"][0])
+            if "publish_monotonic_ns" in names and int(data["publish_monotonic_ns"][0]) > 0
+            else int(ring_publish_ns)
+        )
+        if 0 < source_ns <= publish_ns <= anchor_monotonic_ns:
+            return data, publish_ns, int(sequence)
+    return None
+
+
+def _read_arm_state(shared: SharedStorage, *, anchor_monotonic_ns: int | None = None) -> np.ndarray | None:
+    if anchor_monotonic_ns is None:
+        return _read_arm_state_latest(shared)
+    result = _read_causal_structured_frame(
+        shared.arm_state_ring,
+        source_field="source_monotonic_ns",
+        anchor_monotonic_ns=int(anchor_monotonic_ns),
+    )
+    return None if result is None else result[0]
+
+
+def _read_hand_state(shared: SharedStorage, *, anchor_monotonic_ns: int | None = None) -> np.ndarray | None:
+    if anchor_monotonic_ns is None:
+        return _read_hand_state_latest(shared)
+    result = _read_causal_structured_frame(
+        shared.hand_state_ring,
+        source_field="source_monotonic_ns",
+        anchor_monotonic_ns=int(anchor_monotonic_ns),
+    )
+    return None if result is None else result[0]
+
+
+def _read_vr_frame(shared: SharedStorage, *, anchor_monotonic_ns: int | None = None) -> dict | None:
+    """Read the latest or newest causal verified VR frame."""
+    result = (
+        shared.vr_ring.read_latest()
+        if anchor_monotonic_ns is None
+        else _read_causal_structured_frame(
+            shared.vr_ring,
+            source_field="local_recv_ns",
+            anchor_monotonic_ns=int(anchor_monotonic_ns),
+        )
+    )
     if result is None:
         return None
-    data, _ts_ns, _seq = result
+    data, publish_ns, sequence = result
     rec = data[0]
     return {
         "wrist_pos": np.asarray(rec["wrist_pos"], dtype=np.float64),
@@ -1456,25 +1935,84 @@ def _read_vr_frame(shared: SharedStorage) -> dict | None:
         "sequence_id": int(rec["sequence_id"]),
         "source_frame_seq": int(rec["source_frame_seq"]),
         "local_recv_ns": int(rec["local_recv_ns"]),
+        "publish_monotonic_ns": int(publish_ns),
+        "ring_sequence": int(sequence),
         "side": int(rec["side"]),
     }
 
 
-def _read_hand_tactile(shared: SharedStorage) -> np.ndarray | None:
-    """Read latest hand tactile force from sparse ring."""
-    result = shared.hand_tactile_ring.read_latest()
+def _read_hand_tactile(shared: SharedStorage, *, anchor_monotonic_ns: int | None = None) -> np.ndarray | None:
+    """Read the latest or newest causal hand tactile frame."""
+    result = (
+        shared.hand_tactile_ring.read_latest()
+        if anchor_monotonic_ns is None
+        else _read_causal_structured_frame(
+            shared.hand_tactile_ring,
+            source_field="source_monotonic_ns",
+            anchor_monotonic_ns=int(anchor_monotonic_ns),
+        )
+    )
     if result is None:
         return None
     data, _ts_ns, _seq = result
     return data
 
 
-def _read_camera_frame(shared: SharedStorage) -> dict | None:
-    """Read latest camera frame. Returns None on failure."""
+def _read_camera_frame(shared: SharedStorage, *, anchor_monotonic_ns: int | None = None) -> dict | None:
+    """Read the latest or newest causal camera frame. Returns None on failure."""
     try:
-        result = shared.camera_ring.read_latest()
+        if anchor_monotonic_ns is None:
+            result = shared.camera_ring.read_latest()
+        else:
+            result = None
+            for header, _publish_ns, sequence in reversed(
+                shared.camera_ring.get_last_metadata(shared.camera_ring.maxlen)
+            ):
+                source_ns = int(header["source_monotonic_ns"][0])
+                receive_ns = int(header["receive_monotonic_ns"][0])
+                publish_ns = int(header["publish_monotonic_ns"][0]) or int(_publish_ns)
+                if 0 < source_ns <= receive_ns <= publish_ns <= int(anchor_monotonic_ns):
+                    payload = shared.camera_ring.read_sequence(
+                        int(sequence),
+                        modalities=("rgb", "depth", "pointcloud"),
+                    )
+                    if payload is not None:
+                        result = (
+                            header,
+                            payload["rgb"],
+                            payload["depth"],
+                            payload["pointcloud"],
+                            int(sequence),
+                        )
+                        break
         if result is not None:
-            return {"header": result[0], "rgb": result[1], "depth": result[2], "pointcloud": result[3]}
+            header, rgb, depth, pointcloud, ring_sequence = result
+            rec = header[0]
+            pointcloud_valid = bool(rec["pointcloud_valid"]) and int(rec["pc_num_points"]) > 0
+            return {
+                "header": header,
+                "rgb": rgb,
+                "depth": depth,
+                "pointcloud": pointcloud,
+                "ring_sequence": ring_sequence,
+                "frame_number": int(rec["frame_number"]),
+                "device_timestamp_s": float(rec["timestamp"]),
+                "capture_monotonic_s": float(rec["capture_monotonic_s"]),
+                "source_monotonic_ns": int(rec["source_monotonic_ns"]),
+                "receive_monotonic_ns": int(rec["receive_monotonic_ns"]),
+                "publish_monotonic_ns": int(rec["publish_monotonic_ns"]),
+                "camera_generation": int(rec["camera_generation"]),
+                "clock_reset": bool(rec["clock_reset"]),
+                "duplicate": bool(rec["duplicate"]),
+                "frame_gap": int(rec["frame_gap"]),
+                "backlog_s": float(rec["backlog_s"]),
+                "camera_health": int(rec["camera_health"]),
+                "pointcloud_valid": pointcloud_valid,
+                "pc_num_points": int(rec["pc_num_points"]),
+                "pointcloud_source_point_count": int(rec["pc_source_point_count"]),
+                "valid_depth_ratio": float(rec["pc_valid_depth_ratio"]),
+                "pointcloud_padding_count": int(rec["pc_padding_count"]),
+            }
     except Exception:
         logger.warning("policy_loop: camera ring read failed", exc_info=True)
     return None
@@ -1497,17 +2035,230 @@ def _try_reset_mapper(shared: SharedStorage) -> bool:
 
 
 def _stop_recording(
-    recorder: EpisodeRecorder, was_active: bool, *, save: bool, shared: SharedStorage | None = None
+    recorder: RecorderClient | None,
+    was_active: bool,
+    *,
+    save: bool,
+    shared: SharedStorage | None = None,
+    reason: str = "",
 ) -> None:
     """Stop recording if active. Non-blocking — poll completion in main loop."""
-    if was_active:
-        recorder.stop_episode(success=save)
+    if was_active and recorder is not None:
+        recorder.stop_episode(success=save, reason=reason)
         if shared is not None:
             shared.is_recording.value = False
 
 
+def _latest_action_ack(ring, action_id: int) -> np.void | None:
+    """Return the newest verified ACK for one action without trusting latest-only state."""
+    if action_id <= 0:
+        return None
+    try:
+        frames = ring.get_last_k(ring.maxlen)
+    except Exception:
+        logger.warning("policy_loop: ACK history read failed", exc_info=True)
+        return None
+    result: np.void | None = None
+    for data, _publish_ns, _sequence in frames:
+        if int(data["action_id"][0]) == action_id:
+            result = data[0]
+    return result
+
+
+def _latest_ack_with_status(ring, status: int) -> np.void | None:
+    """Return the newest ACK event with one terminal status."""
+    try:
+        frames = ring.get_last_k(ring.maxlen)
+    except Exception:
+        logger.warning("policy_loop: ACK history read failed", exc_info=True)
+        return None
+    for data, _publish_ns, _sequence in reversed(frames):
+        if int(data["status"][0]) == status:
+            return data[0]
+    return None
+
+
+def _matching_source_sequence(ring: Any, frame: np.ndarray | None) -> int:
+    """Recover the exact verified ring identity for one copied state frame."""
+    if frame is None or frame.dtype.names is None or "source_monotonic_ns" not in frame.dtype.names:
+        return 0
+    source_ns = int(frame["source_monotonic_ns"][0])
+    publish_ns = int(frame["publish_monotonic_ns"][0]) if "publish_monotonic_ns" in frame.dtype.names else 0
+    try:
+        history = ring.get_last_k(ring.maxlen)
+    except Exception:
+        logger.warning("policy_loop: source history read failed", exc_info=True)
+        return 0
+    for data, _ring_publish_ns, sequence in reversed(history):
+        if int(data["source_monotonic_ns"][0]) != source_ns:
+            continue
+        if publish_ns and "publish_monotonic_ns" in (data.dtype.names or ()):
+            if int(data["publish_monotonic_ns"][0]) != publish_ns:
+                continue
+        return int(sequence)
+    return 0
+
+
+def _recording_provenance(
+    shared: SharedStorage,
+    arm_state: np.ndarray | None,
+    hand_state: np.ndarray | None,
+    hand_tactile: np.ndarray | None,
+    vr_frame: dict | None,
+    cam: dict | None,
+    *,
+    anchor_monotonic_ns: int | None = None,
+) -> dict[str, object]:
+    """Correlate one policy-grid sample with causal sources and action ACKs."""
+    anchor_ns = time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
+    if anchor_ns <= 0 or anchor_ns > time.monotonic_ns():
+        raise ValueError("recording observation anchor must be a positive elapsed grid deadline")
+
+    def _field(frame: np.ndarray | None, name: str) -> int:
+        if frame is None or frame.dtype.names is None or name not in frame.dtype.names:
+            return 0
+        return int(frame[name][0])
+
+    arm_source_ns = _field(arm_state, "source_monotonic_ns")
+    arm_publish_ns = _field(arm_state, "publish_monotonic_ns")
+    hand_source_ns = _field(hand_state, "source_monotonic_ns")
+    hand_publish_ns = _field(hand_state, "publish_monotonic_ns")
+    arm_source_sequence = _matching_source_sequence(shared.arm_state_ring, arm_state)
+    hand_source_sequence = _matching_source_sequence(shared.hand_state_ring, hand_state)
+    vr_source_ns = int(vr_frame.get("local_recv_ns", 0)) if vr_frame is not None else 0
+    vr_source_sequence = int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
+    vr_publish_ns = int(vr_frame.get("publish_monotonic_ns", 0)) if vr_frame is not None else 0
+    camera_source_ns = int(cam.get("source_monotonic_ns", 0)) if cam is not None else 0
+    camera_receive_ns = int(cam.get("receive_monotonic_ns", 0)) if cam is not None else 0
+    camera_publish_ns = int(cam.get("publish_monotonic_ns", 0)) if cam is not None else 0
+    source_ns = np.array([arm_source_ns, hand_source_ns, vr_source_ns, camera_source_ns], dtype=np.uint64)
+    publish_ns = np.array([arm_publish_ns, hand_publish_ns, vr_publish_ns, camera_publish_ns], dtype=np.uint64)
+    receive_ns = np.array([arm_publish_ns, hand_publish_ns, vr_source_ns, camera_receive_ns], dtype=np.uint64)
+
+    source_valid = np.array(
+        [
+            arm_source_ns > 0 and arm_source_sequence > 0 and _field(arm_state, "state_valid") == 1,
+            hand_source_ns > 0 and hand_source_sequence > 0 and _field(hand_state, "state_valid") == 1,
+            vr_source_ns > 0 and vr_source_sequence > 0,
+            camera_source_ns > 0 and bool(cam.get("camera_fresh", False)) if cam is not None else False,
+        ],
+        dtype=bool,
+    )
+    time_valid = (
+        (source_ns > 0)
+        & (receive_ns > 0)
+        & (publish_ns > 0)
+        & (source_ns <= receive_ns)
+        & (receive_ns <= publish_ns)
+        & (publish_ns <= anchor_ns)
+    )
+    source_valid &= time_valid
+    ages_s = np.full(4, np.nan, dtype=np.float64)
+    ages_s[source_valid] = (anchor_ns - source_ns[source_valid].astype(np.int64)) / 1e9
+    valid_times = source_ns[source_valid]
+    newest_source_ns = int(np.max(valid_times)) if valid_times.size else 0
+    skew_s = np.full(4, np.nan, dtype=np.float64)
+    if newest_source_ns:
+        skew_s[source_valid] = (newest_source_ns - source_ns[source_valid].astype(np.int64)) / 1e9
+    required_mask = source_valid[[0, 2, 3]]
+    if hand_state is not None:
+        required_mask = np.concatenate([required_mask, source_valid[1:2]])
+    observation_valid = bool(np.all(required_mask)) and bool(np.nanmax(skew_s, initial=0.0) <= 0.10)
+
+    commit_result = shared.action_commit_ring.read_latest()
+    commit = commit_result[0][0] if commit_result is not None else None
+    action_id = int(commit["action_id"]) if commit is not None else 0
+    arm_ack = _latest_action_ack(shared.arm_ack_ring, action_id)
+    hand_ack = _latest_action_ack(shared.hand_ack_ring, action_id)
+    action_observation_id = 0
+    if arm_ack is not None:
+        action_observation_id = int(arm_ack["observation_id"])
+    elif hand_ack is not None:
+        action_observation_id = int(hand_ack["observation_id"])
+
+    def _ack_value(ack: np.void | None, name: str) -> int:
+        return int(ack[name]) if ack is not None else 0
+
+    arm_applied_ns = _ack_value(arm_ack, "applied_monotonic_ns")
+    hand_applied_ns = _ack_value(hand_ack, "applied_monotonic_ns")
+    latest_arm_applied = _latest_ack_with_status(shared.arm_ack_ring, int(AckStatus.APPLIED))
+    latest_hand_applied = _latest_ack_with_status(shared.hand_ack_ring, int(AckStatus.APPLIED))
+    arm_applied_action_id = _ack_value(latest_arm_applied, "action_id")
+    hand_applied_action_id = _ack_value(latest_hand_applied, "action_id")
+    latest_arm_applied_ns = _ack_value(latest_arm_applied, "applied_monotonic_ns")
+    latest_hand_applied_ns = _ack_value(latest_hand_applied, "applied_monotonic_ns")
+    apply_skew_s = (
+        abs(latest_arm_applied_ns - latest_hand_applied_ns) / 1e9
+        if arm_applied_action_id > 0
+        and arm_applied_action_id == hand_applied_action_id
+        and latest_arm_applied_ns > 0
+        and latest_hand_applied_ns > 0
+        else np.nan
+    )
+    tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
+    tactile_fresh = (
+        _field(hand_tactile, "fresh") == 1
+        and 0 < tactile_source_ns <= anchor_ns
+        and anchor_ns - tactile_source_ns <= 250_000_000
+    )
+    return {
+        "observation_id": action_observation_id or anchor_ns,
+        "observation_anchor_monotonic_ns": anchor_ns,
+        "arm_source_sequence": arm_source_sequence,
+        "hand_source_sequence": hand_source_sequence,
+        "vr_source_sequence": vr_source_sequence,
+        "camera_source_sequence": int(cam.get("ring_sequence", 0)) if cam is not None else 0,
+        "arm_source_monotonic_ns": arm_source_ns,
+        "hand_source_monotonic_ns": hand_source_ns,
+        "vr_source_monotonic_ns": vr_source_ns,
+        "camera_source_monotonic_ns": camera_source_ns,
+        "arm_publish_monotonic_ns": arm_publish_ns,
+        "hand_publish_monotonic_ns": hand_publish_ns,
+        "vr_publish_monotonic_ns": vr_publish_ns,
+        "camera_publish_monotonic_ns": camera_publish_ns,
+        "observation_source_receive_monotonic_ns": receive_ns,
+        "observation_source_age_s": ages_s,
+        "observation_source_skew_s": skew_s,
+        "observation_history_valid_mask": source_valid[:, None],
+        "observation_valid": observation_valid,
+        "observation_skew_s": float(np.nanmax(skew_s, initial=0.0)),
+        "action_id": action_id,
+        "action_chunk_id": int(commit["chunk_id"]) if commit is not None else 0,
+        "action_step_index": int(commit["step_index"]) if commit is not None else 0,
+        "action_created_monotonic_ns": int(commit["created_monotonic_ns"]) if commit is not None else 0,
+        "action_target_monotonic_ns": int(commit["target_monotonic_ns"]) if commit is not None else 0,
+        "action_valid_until_monotonic_ns": (int(commit["valid_until_monotonic_ns"]) if commit is not None else 0),
+        "action_queued": arm_ack is not None or hand_ack is not None,
+        "action_committed": commit is not None,
+        "arm_ack_status": _ack_value(arm_ack, "status"),
+        "hand_ack_status": _ack_value(hand_ack, "status"),
+        "arm_ack_reject_reason": _ack_value(arm_ack, "reject_reason"),
+        "hand_ack_reject_reason": _ack_value(hand_ack, "reject_reason"),
+        "arm_ack_sdk_code": _ack_value(arm_ack, "sdk_code"),
+        "hand_ack_sdk_code": _ack_value(hand_ack, "sdk_code"),
+        "arm_received_monotonic_ns": _ack_value(arm_ack, "received_monotonic_ns"),
+        "hand_received_monotonic_ns": _ack_value(hand_ack, "received_monotonic_ns"),
+        "arm_prepared_monotonic_ns": _ack_value(arm_ack, "prepared_monotonic_ns"),
+        "hand_prepared_monotonic_ns": _ack_value(hand_ack, "prepared_monotonic_ns"),
+        "arm_applied_monotonic_ns": arm_applied_ns,
+        "hand_applied_monotonic_ns": hand_applied_ns,
+        "arm_latest_applied_action_id": arm_applied_action_id,
+        "hand_latest_applied_action_id": hand_applied_action_id,
+        "arm_latest_applied_monotonic_ns": latest_arm_applied_ns,
+        "hand_latest_applied_monotonic_ns": latest_hand_applied_ns,
+        "arm_hand_apply_skew_s": apply_skew_s,
+        "tactile_fresh": tactile_fresh,
+        "tactile_source_monotonic_ns": tactile_source_ns,
+        "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
+        "tactile_unit_code": _field(hand_tactile, "unit_code"),
+        "pointcloud_source_point_count": (int(cam.get("pointcloud_source_point_count", 0)) if cam is not None else 0),
+        "pointcloud_valid_depth_ratio": float(cam.get("valid_depth_ratio", np.nan)) if cam is not None else np.nan,
+        "pointcloud_padding_count": int(cam.get("pointcloud_padding_count", 0)) if cam is not None else 0,
+    }
+
+
 def _record_held(
-    recorder: EpisodeRecorder,
+    recorder: RecorderClient | None,
     arm_state: np.ndarray | None,
     hold_arm: np.ndarray,
     hold_hand: np.ndarray,
@@ -1525,6 +2276,8 @@ def _record_held(
     hand_fk=None,
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
+    observation_anchor_monotonic_ns: int | None = None,
+    shared: SharedStorage | None = None,
 ) -> None:
     """Record a held frame (no new action sent).
 
@@ -1535,6 +2288,8 @@ def _record_held(
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
             ``action_arm_ee`` for replay.
     """
+    if recorder is None:
+        return
     if vr_frame is None:
         vr_frame = {
             "wrist_pos": np.full(3, np.nan),
@@ -1554,27 +2309,41 @@ def _record_held(
         hk=hand_fk,
         T_eef_handbase_pos=T_eef_handbase_pos,
         T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
+        timestamp_s=(None if observation_anchor_monotonic_ns is None else int(observation_anchor_monotonic_ns) / 1e9),
     )
+    signals: dict[str, object] = {
+        "ik_ok": False,
+        "ik_attempted": frame_status != _FRAME_HELD,
+        "retarget_ok": retarget_ok,
+        "held": True,
+        "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
+        "frame_status": frame_status,
+    }
+    if shared is not None:
+        signals.update(
+            _recording_provenance(
+                shared,
+                arm_state,
+                hand_state,
+                hand_tactile,
+                vr_frame,
+                cam,
+                anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            )
+        )
     recorder.add_frame(
         state,
         action,
         vr_frame,
         camera_frame=cam,
-        signals={
-            "ik_ok": False,
-            "ik_attempted": frame_status != _FRAME_HELD,
-            "retarget_ok": retarget_ok,
-            "held": True,
-            "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
-            "frame_status": frame_status,
-        },
+        signals=signals,
         arm_qpos_sent=arm_qpos_sent,
         diagnostics=diagnostics,
     )
 
 
 def _record_frame(
-    recorder: EpisodeRecorder,
+    recorder: RecorderClient | None,
     arm_state: np.ndarray | None,
     hand_state: np.ndarray | None,
     arm_cmd: np.ndarray,
@@ -1591,6 +2360,7 @@ def _record_frame(
     frame_status: int = _FRAME_OK,
     target_eef_pos_raw: np.ndarray | None = None,
     target_eef_rot6d_raw: np.ndarray | None = None,
+    action_arm_joint_raw: np.ndarray | None = None,
     action_hand_joint_raw: np.ndarray | None = None,
     policy_map_time_ms: float = np.nan,
     hand_retarget_time_ms: float = np.nan,
@@ -1599,6 +2369,8 @@ def _record_frame(
     hand_fk=None,
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
+    observation_anchor_monotonic_ns: int | None = None,
+    shared: SharedStorage | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
 
@@ -1606,6 +2378,8 @@ def _record_frame(
         target_quat: EMA-smoothed IK target quaternion (wxyz), NOT raw VR wrist.
             This is what the IK solver actually tracked.
     """
+    if recorder is None:
+        return
     action = RobotAction(
         arm_qpos_cmd=arm_cmd,
         hand_qpos_cmd=hand_cmd,
@@ -1619,6 +2393,7 @@ def _record_frame(
         hk=hand_fk,
         T_eef_handbase_pos=T_eef_handbase_pos,
         T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
+        timestamp_s=(None if observation_anchor_monotonic_ns is None else int(observation_anchor_monotonic_ns) / 1e9),
     )
     head_quat = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
     _vr = (
@@ -1630,19 +2405,35 @@ def _record_frame(
             "landmarks": np.full((21, 3), np.nan),
         }
     )
+    signals: dict[str, object] = {
+        "ik_ok": True,
+        "ik_attempted": True,
+        "retarget_ok": retarget_ok,
+        "held": False,
+        "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
+        "frame_status": frame_status,
+        "action_arm_joint_raw": (
+            np.asarray(action_arm_joint_raw, dtype=np.float64) if action_arm_joint_raw is not None else arm_cmd.copy()
+        ),
+    }
+    if shared is not None:
+        signals.update(
+            _recording_provenance(
+                shared,
+                arm_state,
+                hand_state,
+                hand_tactile,
+                vr_frame,
+                cam,
+                anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            )
+        )
     recorder.add_frame(
         state,
         action,
         _vr,
         camera_frame=cam,
-        signals={
-            "ik_ok": True,
-            "ik_attempted": True,
-            "retarget_ok": retarget_ok,
-            "held": False,
-            "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
-            "frame_status": frame_status,
-        },
+        signals=signals,
         arm_qpos_sent=arm_cmd.copy(),
         diagnostics={
             "tracking_error": (
@@ -1683,6 +2474,7 @@ def _build_robot_state(
     hk: HandKinematics | None = None,
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
+    timestamp_s: float | None = None,
 ) -> RobotState:
     """Build a RobotState from ring data for recording.
 
@@ -1814,7 +2606,7 @@ def _build_robot_state(
         fingertip_pos=fingertip_pos,
         arm_connected=arm_connected,
         hand_connected=hand_connected,
-        timestamp=time.perf_counter(),
+        timestamp=time.perf_counter() if timestamp_s is None else float(timestamp_s),
     )
 
 

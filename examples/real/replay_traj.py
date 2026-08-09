@@ -4,16 +4,17 @@
 .. attention::
    **SharedStorage architecture** — uses arm_loop + hand_loop processes
    with SafetyState machine and heartbeat monitoring.  Commands go through
-   ``arm_action_q`` / ``hand_cmd_ring``; state is read from ``arm_state_ring``
-   / ``hand_state_ring``.  No direct SDK access from the main process.
+   the unified safety gate and prepare/commit protocol; state is read from
+   ``arm_state_ring`` / ``hand_state_ring``.  No direct SDK access from the
+   main process.
 
    Data collection: use **vr_teleop_hand_record.py** (canonical entry point).
 
 Reads a DexMani episode (schema v3+) — either a **directory** (``data.h5``,
 ``depth.h5``, ``rgb.mp4``) or a **legacy single ``.h5`` file** — replays
-the recorded joint commands on the real robot, captures the actual robot state
-during replay, and evaluates how closely the replayed motion matches the
-original recording.
+the recorded joint commands in dry-run mode by default.  Live motion requires
+an additive-schema-v15 episode, the actually-sent action stream, and a matching
+dense preflight certificate.
 
 Architecture:
     Episode dir / legacy .h5 → load_trajectory() → TrajectoryReplayer (robot control loop)
@@ -23,7 +24,7 @@ Architecture:
                                                   compute_metrics() → metrics.json + replay_data.npz
 
 Usage:
-    # Basic replay (new directory-format episode)
+    # Basic offline inspection (default; never connects to hardware)
     python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332
 
     # Legacy single-file episode
@@ -38,8 +39,9 @@ Usage:
     # Arm-only replay (ignore hand data even if present)
     python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --no-hand
 
-    # Replay the delta-clamped "sent" stream (schema v9+) instead of raw cmd
-    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent
+    # Generate a certificate, then separately authorize live replay
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent --write-certificate preflight.json
+    python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent --live --certificate preflight.json
 
     # Override acceleration from HDF5 meta (e.g. match the collection condition)
     python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --acc 900
@@ -60,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -75,8 +78,17 @@ from scipy.spatial.transform import Rotation
 # Ensure repo root is on sys.path (belt-and-suspenders for runs without PYTHONPATH=.)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
+from dexmani_real import ASSET_DIR
+from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+from dexmani_real.planning.preflight import PreflightCertificate, create_preflight_certificate, verify_preflight_binding
+from dexmani_real.policy.action_protocol import (
+    ActionSafetyGate,
+    ActionSafetyGateConfig,
+    planner_action_safety_gate,
+    publish_joint_targets,
+)
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
@@ -86,7 +98,6 @@ from dexmani_real.shm.shared_storage import (
     SharedStorage,
     SharedStorageConfig,
     hand_home_converge,
-    make_arm_action,
     read_arm_state,
     read_arm_state_dict,
     read_hand_state_dict,
@@ -94,7 +105,6 @@ from dexmani_real.shm.shared_storage import (
     shutdown_processes,
     wait_for_arm_home,
     wait_subsystem_ready,
-    write_hand_cmd,
 )
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
@@ -113,6 +123,145 @@ HOME_DT = 0.04
 ARM_MAX_ACC_DEG_S2 = 500.0
 
 DEFAULT_OUTPUT_DIR = "replay_results"
+
+
+def _replay_runtime_hash(
+    canonical_config_json: str,
+    *,
+    source: str,
+    speed_factor: float,
+    no_hand: bool,
+    jerk_management: str,
+) -> str:
+    payload = {
+        "resolved_config": json.loads(canonical_config_json),
+        "replay": {
+            "source": source,
+            "speed_factor": float(speed_factor),
+            "no_hand": bool(no_hand),
+            "jerk_management": jerk_management,
+        },
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _preflight_model_paths() -> tuple[Path, ...]:
+    model_dir = ASSET_DIR / "robots" / "xhand"
+    return (
+        model_dir / "xarm7_xhand_collision.urdf",
+        model_dir / "xarm7_xhand_right.urdf",
+        model_dir / "xarm7_xhand.srdf",
+    )
+
+
+def _modeled_hand_actions(traj: "TrajectoryData", *, no_hand: bool, home_qpos_rad: np.ndarray) -> np.ndarray:
+    if not no_hand and traj.action_hand_joint is not None:
+        return np.asarray(traj.action_hand_joint, dtype=np.float64)
+    return np.repeat(np.asarray(home_qpos_rad, dtype=np.float64)[None, :], traj.num_frames, axis=0)
+
+
+def _build_preflight_certificate(
+    traj: "TrajectoryData",
+    *,
+    runtime: object,
+    replay_runtime_sha256: str,
+    no_hand: bool,
+) -> PreflightCertificate:
+    runtime_arm = getattr(runtime, "arm")
+    runtime_hand = getattr(runtime, "hand")
+    runtime_policy = getattr(runtime, "policy")
+    workspace = np.array(
+        [
+            [runtime_policy.workspace.x_min, runtime_policy.workspace.x_max],
+            [runtime_policy.workspace.y_min, runtime_policy.workspace.y_max],
+            [runtime_policy.workspace.z_min, runtime_policy.workspace.z_max],
+        ],
+        dtype=np.float64,
+    )
+    model_dir = ASSET_DIR / "robots" / "xhand"
+    planner = XArm7MotionPlanner(
+        XArm7PlannerConfig(
+            urdf_path=str(model_dir / "xarm7_xhand_collision.urdf"),
+            srdf_path=str(model_dir / "xarm7_xhand.srdf"),
+            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
+            workspace_bounds=workspace,
+        ),
+        hand_dof=True,
+    )
+    modeled_hand = _modeled_hand_actions(
+        traj,
+        no_hand=no_hand,
+        home_qpos_rad=np.deg2rad(np.asarray(runtime_hand.home_qpos_deg, dtype=np.float64)),
+    )
+
+    def table_check(arm_start: np.ndarray, arm_end: np.ndarray, hand_start: np.ndarray, hand_end: np.ndarray) -> bool:
+        max_delta = max(float(np.max(np.abs(arm_end - arm_start))), float(np.max(np.abs(hand_end - hand_start))))
+        steps = max(1, int(np.ceil(max_delta / 0.02)))
+        for alpha in np.linspace(0.0, 1.0, steps + 1):
+            arm_qpos = arm_start + alpha * (arm_end - arm_start)
+            hand_qpos = hand_start + alpha * (hand_end - hand_start)
+            planner.collision_model.set_hand_qpos(hand_qpos)
+            lowest_surface_m = planner.collision_model.minimum_hand_frame_z(arm_qpos) - float(
+                runtime_arm.hand_safety_margin_m
+            )
+            if lowest_surface_m < float(runtime_arm.table_z_surface_m):
+                return False
+        return True
+
+    return create_preflight_certificate(
+        source_episode=traj.h5_path,
+        arm_actions=traj.action_arm_joint,
+        hand_actions=modeled_hand,
+        collision_model_paths=_preflight_model_paths(),
+        workspace_bounds_m=workspace,
+        resolved_config_sha256=replay_runtime_sha256,
+        transition_check=planner.collision_model.check_transition_collision_free,
+        workspace_check=planner.is_workspace_segment_safe,
+        table_check=table_check,
+        hand_enabled=not no_hand and traj.action_hand_joint is not None,
+    )
+
+
+def _verify_live_provenance(traj: "TrajectoryData", runtime: object) -> None:
+    runtime_arm = getattr(runtime, "arm")
+    required = {
+        "joint_max_acc": traj.joint_max_acc,
+        "joint_max_speed": traj.joint_max_speed,
+        "arm_loop_hz": traj.arm_loop_hz,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing or traj.jerk_management is None:
+        raise ValueError(
+            f"live replay provenance is incomplete: {missing + ['jerk_management'] if traj.jerk_management is None else missing}"
+        )
+    recorded = {name: float(value) for name, value in required.items() if value is not None}
+    expected = {
+        "joint_max_acc": float(runtime_arm.max_joint_acceleration_deg_per_s2),
+        "joint_max_speed": float(runtime_arm.max_joint_velocity_deg_per_s),
+        "arm_loop_hz": float(runtime_arm.loop_hz),
+    }
+    mismatches = [name for name, value in recorded.items() if not np.isclose(value, expected[name])]
+    if mismatches:
+        raise ValueError(f"live replay controller provenance mismatch: {mismatches}")
+    if traj.jerk_management != "unmanaged":
+        raise ValueError(f"unsupported recorded jerk management {traj.jerk_management!r}")
+    recorded_models = dict(traj.model_provenance)
+    model_keys = (
+        "arm_hand_collision_urdf_sha256",
+        "arm_hand_urdf_sha256",
+        "arm_hand_srdf_sha256",
+    )
+    missing_models = [name for name in model_keys if name not in recorded_models]
+    if missing_models:
+        raise ValueError(f"live replay model provenance is incomplete: {missing_models}")
+    current_models = {
+        name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in zip(model_keys, _preflight_model_paths())
+    }
+    mismatched_models = [name for name in model_keys if recorded_models[name] != current_models[name]]
+    if mismatched_models:
+        raise ValueError(f"live replay model provenance mismatch: {mismatched_models}")
+
 
 # ═══════════════════════════════════════════════ HDF5 Loading
 
@@ -137,6 +286,11 @@ class TrajectoryData:
 
     # Recording parameters (from /meta, for matching replay conditions)
     joint_max_acc: float | None = None  # °/s², read from HDF5 meta; None if absent (legacy)
+    joint_max_speed: float | None = None
+    arm_loop_hz: float | None = None
+    jerk_management: str | None = None
+    resolved_config_sha256: str | None = None
+    model_provenance: tuple[tuple[str, str], ...] = ()
 
     @property
     def has_hand(self) -> bool:
@@ -176,7 +330,13 @@ def _resolve_episode_path(raw_path: str) -> tuple[str, str]:
     return (str(p), p.stem)
 
 
-def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "cmd") -> TrajectoryData:
+def load_trajectory(
+    h5_path: str,
+    max_frames: int | None = None,
+    source: str = "cmd",
+    *,
+    require_live_validity: bool = False,
+) -> TrajectoryData:
     """Load and validate an episode for replay.
 
     Supports both new directory-format episodes (``data.h5`` + ``depth.h5``
@@ -205,6 +365,8 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
         raise FileNotFoundError(f"Episode not found: {h5_path}")
 
     with EpisodeReader(resolved_path) as reader:
+        if require_live_validity:
+            reader.require_valid(purpose="live replay")
         f = reader.h5f
         # ── Validate schema ──
         # f.get("/meta") returns None when the group is missing (safe h5py idiom).
@@ -228,6 +390,11 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
 
         # ── Recording parameters for matching replay conditions ──
         _joint_max_acc = None
+        _joint_max_speed = None
+        _arm_loop_hz = None
+        _jerk_management = None
+        _resolved_config_sha256 = None
+        _model_provenance: tuple[tuple[str, str], ...] = ()
         if meta is not None:
             _raw = meta.attrs.get("joint_max_acc")
             if _raw is not None:
@@ -235,11 +402,37 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
                     _joint_max_acc = float(_raw)
                 except (TypeError, ValueError):
                     pass
+            for attr_name, target_name in (
+                ("joint_max_speed", "speed"),
+                ("arm_loop_hz", "loop"),
+            ):
+                raw = meta.attrs.get(attr_name)
+                try:
+                    parsed = None if raw is None else float(raw)
+                except (TypeError, ValueError):
+                    parsed = None
+                if target_name == "speed":
+                    _joint_max_speed = parsed
+                else:
+                    _arm_loop_hz = parsed
+            raw_jerk = meta.attrs.get("jerk_management")
+            _jerk_management = None if raw_jerk is None else str(raw_jerk)
+            raw_hash = meta.attrs.get("resolved_config_sha256")
+            _resolved_config_sha256 = None if raw_hash is None else str(raw_hash)
+            _model_provenance = tuple(
+                sorted(
+                    (name.removeprefix("provenance_"), str(meta.attrs[name]))
+                    for name in meta.attrs
+                    if name.startswith("provenance_arm_hand_")
+                )
+            )
 
         # ── Source: which arm action stream to replay ──
         arm_action_key = "action_arm_joint_sent" if source == "sent" else "action_arm_joint"
         if arm_action_key not in f:
             if source == "sent":
+                if require_live_validity:
+                    raise ValueError("live replay requires the recorded /action_arm_joint_sent stream")
                 logger.warning("/action_arm_joint_sent not found (pre-v9 HDF5) — falling back to /action_arm_joint")
                 arm_action_key = "action_arm_joint"
 
@@ -283,6 +476,11 @@ def load_trajectory(h5_path: str, max_frames: int | None = None, source: str = "
         hand_qpos=hand_qpos,
         arm_ee=arm_ee,
         joint_max_acc=_joint_max_acc,
+        joint_max_speed=_joint_max_speed,
+        arm_loop_hz=_arm_loop_hz,
+        jerk_management=_jerk_management,
+        resolved_config_sha256=_resolved_config_sha256,
+        model_provenance=_model_provenance,
     )
 
     logger.info(
@@ -693,17 +891,20 @@ class TrajectoryReplayer:
         dry_run: bool = False,
         no_hand: bool = False,
         max_frames: int | None = None,
+        runtime: Any | None = None,
     ) -> None:
         self.traj = trajectory
         self.shared = shared
         self.speed = speed
         self.dry_run = dry_run
         self.no_hand = no_hand
+        self.runtime = runtime
 
         self.replay_hz = trajectory.fps * speed
         self._rate_mgr = RateManager(self.replay_hz)
 
         self._planner: XArm7MotionPlanner | None = None
+        self._action_safety_gate: ActionSafetyGate | None = None
         self._recorder: ReplayRecorder | None = None
         self._running = False
         self._estopped = False
@@ -720,11 +921,50 @@ class TrajectoryReplayer:
         """Create planner for start-alignment (no hardware connect — arm_loop owns the SDK)."""
         if self.dry_run:
             return
-        self._planner = XArm7MotionPlanner.create_default(
+        if self.runtime is None:
+            raise RuntimeError("live replay requires a resolved runtime configuration")
+        runtime_arm = self.runtime.arm
+        runtime_hand = self.runtime.hand
+        runtime_policy = self.runtime.policy
+        workspace = np.array(
+            [
+                [runtime_policy.workspace.x_min, runtime_policy.workspace.x_max],
+                [runtime_policy.workspace.y_min, runtime_policy.workspace.y_max],
+                [runtime_policy.workspace.z_min, runtime_policy.workspace.z_max],
+            ],
+            dtype=np.float64,
+        )
+        model_dir = ASSET_DIR / "robots" / "xhand"
+        self._planner = XArm7MotionPlanner(
+            XArm7PlannerConfig(
+                urdf_path=str(model_dir / "xarm7_xhand_collision.urdf"),
+                srdf_path=str(model_dir / "xarm7_xhand.srdf"),
+                base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
+                workspace_bounds=workspace,
+            ),
             teleop_profile=TeleopProfile(
                 max_pose_error_pos_m=0.02,
                 max_pose_error_rot_rad=np.deg2rad(5.0),
             ),
+            hand_dof=True,
+        )
+        self._action_safety_gate = planner_action_safety_gate(
+            ActionSafetyGateConfig(
+                arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
+                arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
+                hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
+                hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
+                arm_max_velocity_rad_s=float(runtime_arm.max_joint_velocity_rad_per_s),
+                hand_max_velocity_rad_s=(
+                    float(runtime_hand.max_delta_rad) * runtime_policy.control_hz
+                    if runtime_hand.max_delta_rad is not None
+                    else float(np.deg2rad(180.0))
+                ),
+                require_geometry_checks=True,
+            ),
+            planner=self._planner,
+            table_z_surface_m=float(runtime_arm.table_z_surface_m),
+            hand_safety_margin_m=float(runtime_arm.hand_safety_margin_m),
         )
         self._hand_available = self.traj.has_hand and not self.no_hand
         print("Planner ready for start-alignment (arm_loop/hand_loop already running)")
@@ -804,7 +1044,14 @@ class TrajectoryReplayer:
                 continue
             if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
                 return None
-            self.shared.arm_action_q.put(make_arm_action(self.shared, waypoint))
+            if not publish_joint_targets(
+                self.shared,
+                waypoint,
+                prepare_timeout_s=0.06,
+                dt_s=HOME_DT,
+                safety_gate=self._action_safety_gate,
+            ):
+                return None
             time.sleep(HOME_DT)
 
         # Settle
@@ -820,28 +1067,9 @@ class TrajectoryReplayer:
         final_dev = np.rad2deg(np.max(np.abs(arm_qpos - first_cmd)))
         print(f"Approach complete. Remaining deviation: {final_dev:.2f}°")
 
-        # ── Joint-space fallback ──
         if final_dev > self.JOINT_ALIGN_MAX_DEG:
-            n_steps = max(1, int(np.ceil(final_dev / 5.0)))
-            print(f"Joint-space interpolation: {n_steps} step(s) ...")
-            for alpha in np.linspace(0, 1, n_steps + 1)[1:]:
-                if self.shared.error_state.value:
-                    print("  Joint-space fallback aborted: error_state detected")
-                    return None
-                _js_cmd = arm_qpos + alpha * (first_cmd - arm_qpos)
-                if not np.all(np.isfinite(_js_cmd)):
-                    continue
-                if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
-                    return None
-                self.shared.arm_action_q.put(make_arm_action(self.shared, _js_cmd))
-                time.sleep(HOME_DT)
-            time.sleep(0.15)
-
-            as_dict = read_arm_state_dict(self.shared)
-            if as_dict is not None and np.all(np.isfinite(as_dict["qpos"])):
-                arm_qpos = as_dict["qpos"]
-                final_dev = np.rad2deg(np.max(np.abs(arm_qpos - first_cmd)))
-                print(f"Joint-space approach done. Remaining deviation: {final_dev:.2f}°")
+            print("Approach did not converge within the certified threshold; aborting without a joint-linear fallback.")
+            return None
 
         return arm_qpos
 
@@ -886,9 +1114,18 @@ class TrajectoryReplayer:
 
         # ── Pre-warm: send first target before rate limiter ──
         if np.all(np.isfinite(first_cmd)) and int(self.shared.safety_state.value) != int(SafetyState.FAULT):
-            self.shared.arm_action_q.put(make_arm_action(self.shared, first_cmd))
-        if has_hand and self.traj.action_hand_joint is not None:
-            write_hand_cmd(self.shared, self.traj.action_hand_joint[0])
+            first_hand = (
+                self.traj.action_hand_joint[0] if has_hand and self.traj.action_hand_joint is not None else None
+            )
+            if not publish_joint_targets(
+                self.shared,
+                first_cmd,
+                first_hand,
+                prepare_timeout_s=0.06,
+                dt_s=1.0 / self.replay_hz,
+                safety_gate=self._action_safety_gate,
+            ):
+                return self._recorder.to_dict()
         self._rate_mgr = RateManager(self.replay_hz)
 
         self._running = True
@@ -998,11 +1235,23 @@ class TrajectoryReplayer:
                 if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
                     logger.warning("Frame %d: safety FAULT — stopping replay", frame_idx)
                     break
-                self.shared.arm_action_q.put(make_arm_action(self.shared, arm_cmd))
-
-                # ── Send hand command ──
-                if has_hand and hand_cmd is not None:
-                    write_hand_cmd(self.shared, hand_cmd)
+                published_candidate = publish_joint_targets(
+                    self.shared,
+                    arm_cmd,
+                    hand_cmd,
+                    prepare_timeout_s=0.06,
+                    dt_s=1.0 / self.replay_hz,
+                    safety_gate=self._action_safety_gate,
+                )
+                if published_candidate is None:
+                    logger.error("Frame %d: joint prepare/commit failed", frame_idx)
+                    self._emergency_stop()
+                    break
+                assert published_candidate.arm_qpos is not None
+                sent_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
+                arm_cmd = sent_cmd.copy()
+                if published_candidate.hand_qpos is not None:
+                    hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
 
                 # ── Record ──
                 ts = time.perf_counter()
@@ -1083,7 +1332,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Directory-format episode (data.h5 + depth.h5 + rgb.mp4)
+  # Offline inspection is the default (data.h5 + depth.h5 + rgb.mp4)
   python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332
 
   # Legacy single-file episode
@@ -1098,8 +1347,9 @@ Examples:
   # Arm-only (skip hand even if episode has hand data)
   python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --no-hand
 
-  # Replay "sent" stream (delta-clamped, schema v9+)
-  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent
+  # Generate a certificate, then separately authorize live replay
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent --write-certificate preflight.json
+  python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --source sent --live --certificate preflight.json
 
   # Override acceleration (e.g. match collection conditions)
   python examples/real/replay_traj.py --h5 episodes/episode_20260729_213332 --acc 900
@@ -1131,11 +1381,27 @@ Control keys:
         default=None,
         help="Maximum number of frames to replay (default: all).",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--dry-run",
         action="store_true",
-        help="Load and validate trajectory without connecting to robot.",
+        help="Offline validation only (default; retained for explicit scripts).",
     )
+    mode_group.add_argument(
+        "--live",
+        action="store_true",
+        help="Authorize hardware replay after a matching preflight certificate is supplied.",
+    )
+    parser.add_argument(
+        "--certificate", type=str, default=None, help="Existing preflight certificate required by --live."
+    )
+    parser.add_argument(
+        "--write-certificate",
+        type=str,
+        default=None,
+        help="In dry-run mode, run dense checks and atomically write a new certificate.",
+    )
+    parser.add_argument("--config", type=str, default=None, help="Validated runtime JSON overrides.")
     parser.add_argument(
         "--output",
         type=str,
@@ -1150,8 +1416,8 @@ Control keys:
     parser.add_argument(
         "--arm-ip",
         type=str,
-        default="192.168.1.111",
-        help="XArm controller IP address (passed to ArmLoopConfig).",
+        default=None,
+        help="XArm controller IP (JSON/defaults when omitted).",
     )
     parser.add_argument(
         "--source",
@@ -1159,6 +1425,13 @@ Control keys:
         default="cmd",
         choices=["cmd", "sent"],
         help="Which arm action stream to replay: cmd (action_arm_joint, default) or sent (action_arm_joint_sent, schema v9+).",
+    )
+    parser.add_argument(
+        "--joint-speed",
+        type=float,
+        default=None,
+        metavar="DEG_S",
+        help="Mode-6 joint speed; defaults to recorded provenance, then runtime config.",
     )
     parser.add_argument(
         "--acc",
@@ -1171,6 +1444,7 @@ Control keys:
         "Use this flag to override (e.g. --acc 900).",
     )
     args = parser.parse_args()
+    args.dry_run = not args.live
 
     # ── Validate args ──
     if args.speed <= 0:
@@ -1179,12 +1453,29 @@ Control keys:
     if args.acc is not None and args.acc <= 0:
         print("Error: --acc must be positive")
         sys.exit(1)
+    if args.joint_speed is not None and args.joint_speed <= 0:
+        print("Error: --joint-speed must be positive")
+        sys.exit(1)
+    if args.live and args.certificate is None:
+        print("Error: --live requires --certificate from a successful dry-run preflight")
+        sys.exit(1)
+    if args.live and args.write_certificate is not None:
+        print("Error: --write-certificate is dry-run only")
+        sys.exit(1)
+    if args.live and args.source != "sent":
+        print("Error: --live requires --source sent; raw policy candidates are never replayed on hardware")
+        sys.exit(1)
     if args.speed > 1.5:
         print(f"Warning: --speed={args.speed}x may exceed hardware limits (inner loop runs at 30Hz)")
 
     # ── Load trajectory ──
     try:
-        traj = load_trajectory(args.h5, max_frames=args.max_frames, source=args.source)
+        traj = load_trajectory(
+            args.h5,
+            max_frames=args.max_frames,
+            source=args.source,
+            require_live_validity=args.live,
+        )
     except (FileNotFoundError, ValueError, OSError) as e:
         print(f"Error loading episode: {e}")
         sys.exit(1)
@@ -1206,6 +1497,32 @@ Control keys:
         _replay_acc = ARM_MAX_ACC_DEG_S2
         _acc_source = " (default, no HDF5 meta)"
 
+    _replay_joint_speed = (
+        args.joint_speed
+        if args.joint_speed is not None
+        else (
+            traj.joint_max_speed
+            if traj.joint_max_speed is not None
+            else resolve_runtime_config(json_path=args.config).arm.max_joint_velocity_deg_per_s
+        )
+    )
+    runtime = resolve_runtime_config(
+        json_path=args.config,
+        cli_overrides={
+            "arm.ip": args.arm_ip,
+            "arm.max_joint_acceleration_deg_per_s2": _replay_acc,
+            "arm.max_joint_velocity_deg_per_s": _replay_joint_speed,
+            "policy.hand_enabled": False if args.no_hand else None,
+        },
+    )
+    replay_runtime_sha256 = _replay_runtime_hash(
+        runtime.canonical_json,
+        source=args.source,
+        speed_factor=args.speed,
+        no_hand=args.no_hand,
+        jerk_management="unmanaged",
+    )
+
     # ── Print trajectory info ──
     print(f"Trajectory: {traj.h5_path}")
     print(f"  Frames: {traj.num_frames}  FPS: {traj.fps:.1f}  Duration: {traj.num_frames/traj.fps:.1f}s")
@@ -1213,6 +1530,8 @@ Control keys:
     print(f"  Hand data: {'yes' if traj.has_hand else 'no'}")
     print(f"  EE data: {'yes' if traj.arm_ee is not None else 'no'}")
     print(f"  Acc: {_replay_acc:.0f}°/s²{_acc_source}")
+    print(f"  Joint speed: {float(_replay_joint_speed):.0f}°/s")
+    print(f"  Replay config: {replay_runtime_sha256[:12]}")
 
     eval_available = traj.arm_qpos is not None and np.all(np.isfinite(traj.arm_qpos))
     if not eval_available:
@@ -1228,10 +1547,57 @@ Control keys:
 
     # ── Dry-run: no hardware, just validate ──
     if args.dry_run:
-        replayer = TrajectoryReplayer(traj, None, speed=args.speed, dry_run=True, no_hand=args.no_hand, max_frames=args.max_frames)  # type: ignore[arg-type]
+        replayer = TrajectoryReplayer(
+            traj,
+            None,  # type: ignore[arg-type]
+            speed=args.speed,
+            dry_run=True,
+            no_hand=args.no_hand,
+            max_frames=args.max_frames,
+            runtime=runtime,
+        )
         replayer._dry_run_loop(replayer._T)
+        if args.write_certificate is not None:
+            certificate = _build_preflight_certificate(
+                traj,
+                runtime=runtime,
+                replay_runtime_sha256=replay_runtime_sha256,
+                no_hand=args.no_hand,
+            )
+            path = certificate.write(args.write_certificate)
+            print(f"Preflight certificate: {path}")
         print("Done.")
         return
+
+    try:
+        _verify_live_provenance(traj, runtime)
+        modeled_hand = _modeled_hand_actions(
+            traj,
+            no_hand=args.no_hand,
+            home_qpos_rad=np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)),
+        )
+        certificate = PreflightCertificate.read(args.certificate)
+        workspace = np.array(
+            [
+                [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
+                [runtime.policy.workspace.y_min, runtime.policy.workspace.y_max],
+                [runtime.policy.workspace.z_min, runtime.policy.workspace.z_max],
+            ],
+            dtype=np.float64,
+        )
+        verify_preflight_binding(
+            certificate,
+            source_episode=traj.h5_path,
+            arm_actions=traj.action_arm_joint,
+            hand_actions=modeled_hand,
+            collision_model_paths=_preflight_model_paths(),
+            workspace_bounds_m=workspace,
+            resolved_config_sha256=replay_runtime_sha256,
+            hand_enabled=not args.no_hand and traj.action_hand_joint is not None,
+        )
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"Error: live replay preflight rejected: {exc}")
+        sys.exit(1)
 
     # ═══════════════════════════════════════════════════════════════
     # SharedStorage architecture — spawn arm_loop (+ optional hand_loop)
@@ -1242,26 +1608,24 @@ Control keys:
     print("=" * 60)
 
     # ── SharedStorage ──
-    shm_cfg = SharedStorageConfig()
-    shared = SharedStorage.create(prefix="dexmani_replay", config=shm_cfg)
+    shm_cfg = SharedStorageConfig.from_runtime(runtime)
+    ctx = mp.get_context("spawn")
+    shared = SharedStorage.create(prefix="dexmani_replay", config=shm_cfg, mp_context=ctx)
+    procs: list[Any] = []
     try:
         # ── ArmLoop config: match replay acceleration ──
-        _joint_max_acc_rad = float(np.deg2rad(_replay_acc))
-        arm_cfg = ArmLoopConfig(
-            arm_ip=args.arm_ip,
-            joint_max_acc_rad_per_s2=_joint_max_acc_rad,
-        )
+        arm_cfg = ArmLoopConfig.from_runtime(runtime)
         hand_available = traj.has_hand and not args.no_hand
 
         # ── Spawn processes ──
-        procs: list[mp.Process] = [
-            mp.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm", daemon=True),
+        procs = [
+            ctx.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm", daemon=False),
         ]
         if hand_available:
             from dexmani_real.robot.hand_process import HandProcessConfig
 
-            hand_cfg = HandProcessConfig()
-            procs.append(mp.Process(target=_hand_loop, args=(shared, hand_cfg), name="hand", daemon=True))
+            hand_cfg = HandProcessConfig.from_runtime(runtime)
+            procs.append(ctx.Process(target=_hand_loop, args=(shared, hand_cfg), name="hand", daemon=False))
 
         for p in procs:
             p.start()
@@ -1293,6 +1657,7 @@ Control keys:
             dry_run=False,
             no_hand=args.no_hand,
             max_frames=args.max_frames,
+            runtime=runtime,
         )
 
         try:
@@ -1383,20 +1748,25 @@ Control keys:
 
                             # ── Step 1: Hand home first (before arm moves) ──
                             if hand_available:
-                                from dexmani_real.config.defaults import hand as _hand_defaults
-
-                                _HAND_HOME = np.deg2rad(np.array(_hand_defaults.home_qpos_deg, dtype=np.float64))
-                                hand_home_converge(shared, _HAND_HOME, heartbeat=False, check_is_running=False, verbose=True)
+                                _HAND_HOME = np.deg2rad(np.array(runtime.hand.home_qpos_deg, dtype=np.float64))
+                                hand_home_converge(
+                                    shared,
+                                    _HAND_HOME,
+                                    heartbeat=False,
+                                    check_is_running=False,
+                                    verbose=True,
+                                    safety_gate=replayer._action_safety_gate,
+                                )
 
                             # ── Step 2: Arm home (collision-checked path) ──
                             _home_arr = np.array(arm_cfg.home_qpos, dtype=np.float64)
-                            from dexmani_real.config.defaults import arm as _arm_defaults
-
                             send_arm_home(
-                                shared, _home_arr,
+                                shared,
+                                _home_arr,
                                 planner=replayer._planner,
-                                table_z_surface_m=_arm_defaults.table_z_surface_m,
-                                heartbeat=False, verbose=True,
+                                table_z_surface_m=float(runtime.arm.table_z_surface_m),
+                                heartbeat=False,
+                                verbose=True,
                             )
                             print("Press Q to exit...")
                 finally:
@@ -1406,16 +1776,19 @@ Control keys:
             replayer.shutdown()
             shutdown_processes(shared, procs)
     finally:
-        # Best-effort cleanup on unexpected exceptions.
-        # On normal paths shutdown_processes already calls close(); calling
-        # close() again is safe (FileNotFoundError on unlink is caught).
-        try:
-            shared.close()
-        except Exception:
-            pass
+        started = [process for process in procs if process.pid is not None]
+        if any(process.is_alive() for process in started):
+            try:
+                shutdown_processes(shared, started)
+            except RuntimeError:
+                logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
+        if not any(process.is_alive() for process in started):
+            try:
+                shared.close()
+            except Exception:
+                logger.warning("SharedStorage cleanup failed", exc_info=True)
 
     print("Done.")
-
 
 
 if __name__ == "__main__":

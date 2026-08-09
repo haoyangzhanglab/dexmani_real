@@ -10,6 +10,8 @@ import numpy as np
 
 from dexmani_real.planning.path_utils import plan_joint_home_path
 from dexmani_real.planning.types import PathResult
+from dexmani_real.policy.action_protocol import COMMIT_DTYPE, make_command_frame
+from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.vr_teleop_policy import _do_teleop_home
 from dexmani_real.robot.arm_loop import ArmLoopConfig, _planned_homing
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
@@ -54,6 +56,7 @@ class _FeedbackArm:
         error_after_send: int = 0,
     ):
         self.qpos = np.asarray(qpos, dtype=np.float64).copy()
+        self.qvel = np.zeros(7, dtype=np.float64)
         self.send_code = send_code
         self.read_code = read_code
         self.follow_commands = follow_commands
@@ -69,7 +72,7 @@ class _FeedbackArm:
     def get_joint_states(self, *, is_radian: bool, num: int):
         if self.read_code != 0:
             return self.read_code, []
-        return 0, [self.qpos.copy()]
+        return 0, [self.qpos.copy(), self.qvel.copy(), np.zeros(7, dtype=np.float64)]
 
     def set_mode(self, mode: int):
         self.mode_calls.append(mode)
@@ -104,7 +107,7 @@ def test_planned_homing_advances_only_with_feedback_and_returns_ack() -> None:
     q0 = np.zeros(7)
     q1 = np.full(7, 0.01)
     arm = _FeedbackArm(q0)
-    cfg = ArmLoopConfig(homing_step_interval_s=0.0, homing_target_timeout_s=0.1)
+    cfg = ArmLoopConfig(homing_step_interval_s=1e-6, homing_target_timeout_s=0.5)
 
     result = _planned_homing(arm, _request(np.stack([q0, q1])), cfg, shared=_shared())
 
@@ -245,7 +248,7 @@ def test_planned_homing_publishes_fresh_feedback_while_waiting() -> None:
     result = _planned_homing(
         _FeedbackArm(q0),
         _request(np.stack([q0, q1])),
-        ArmLoopConfig(homing_step_interval_s=0.0),
+        ArmLoopConfig(homing_step_interval_s=1e-6),
         shared=_shared(),
         feedback_callback=feedback,
     )
@@ -253,6 +256,32 @@ def test_planned_homing_publishes_fresh_feedback_while_waiting() -> None:
     assert result.success
     assert feedback.call_count >= 2
     np.testing.assert_allclose(feedback.call_args.args[0], q1)
+
+
+def test_planned_homing_requires_low_velocity_for_full_dwell() -> None:
+    q0 = np.zeros(7)
+    q1 = np.full(7, 0.01)
+    arm = _FeedbackArm(q0)
+    arm.qvel[:] = 0.2
+    cfg = ArmLoopConfig(homing_target_timeout_s=0.04, homing_step_interval_s=1e-6)
+
+    result = _planned_homing(arm, _request(np.stack([q0, q1])), cfg, shared=_shared())
+
+    assert not result.success
+    assert "convergence timeout" in result.reason
+    assert "J1 error=0.00deg" in result.reason
+
+
+def test_single_point_home_path_rejects_high_velocity() -> None:
+    home = np.zeros(7)
+    arm = _FeedbackArm(home)
+    arm.qvel[:] = 0.2
+
+    result = _planned_homing(arm, _request(np.stack([home])), shared=_shared())
+
+    assert not result.success
+    assert "stationary canonical home" in result.reason
+    assert not arm.commands
 
 
 def test_home_path_fails_closed_when_workspace_segment_is_unsafe() -> None:
@@ -417,7 +446,65 @@ def test_optional_hand_startup_failure_does_not_fault_arm_only_entry() -> None:
     hand_instance.disconnect.assert_called_once()
 
 
+def test_hand_disarmed_startup_validates_feedback_without_home_motion() -> None:
+    shared = SimpleNamespace(
+        is_running=_Value(False),
+        error_state=_Value(False),
+        estop_request=_Value(False),
+        safety_state=_Value(int(SafetyState.DISARMED)),
+        session_generation=_Value(1),
+        policy_epoch=_Value(1),
+        hand_heartbeat_s=_Value(0.0),
+        hand_ready=Event(),
+        hand_state_ring=Mock(),
+        hand_ack_ring=Mock(),
+        component_status_ring=None,
+    )
+    hand_instance = Mock()
+    hand_instance.connect.return_value = True
+    hand_instance.get_state.return_value = {"qpos": np.zeros(12)}
+    hand_instance.stop.return_value = True
+    hand_instance.feedback_bound_stats = {"checks": 0}
+
+    with patch("dexmani_real.robot.xhand.XHand", return_value=hand_instance):
+        hand_loop(shared)
+
+    assert shared.hand_ready.is_set()
+    hand_instance.send_action.assert_not_called()
+    hand_instance.stop.assert_called_once()
+    hand_instance.disconnect.assert_called_once()
+
+
 def test_hand_runtime_counts_boolean_command_rejection() -> None:
+    now_ns = time.monotonic_ns()
+    candidate = ActionCandidate(
+        observation_id=1,
+        session_generation=1,
+        policy_epoch=1,
+        action_id=1,
+        created_monotonic_ns=now_ns,
+        target_monotonic_ns=now_ns + 20_000_000,
+        valid_until_monotonic_ns=now_ns + 1_000_000_000,
+        arm_qpos=None,
+        hand_qpos=np.zeros(12),
+        chunk_id=1,
+    )
+    command = make_command_frame(candidate, actuator="hand")
+    commit = np.zeros(1, dtype=COMMIT_DTYPE)
+    for name in (
+        "session_generation",
+        "policy_epoch",
+        "observation_id",
+        "action_id",
+        "chunk_id",
+        "step_index",
+        "created_monotonic_ns",
+        "target_monotonic_ns",
+        "valid_until_monotonic_ns",
+        "is_hold",
+    ):
+        commit[name][0] = command[name][0]
+    commit["committed_monotonic_ns"][0] = now_ns + 1
     shared = SimpleNamespace(
         is_running=_Value(True),
         error_state=_Value(False),
@@ -428,21 +515,29 @@ def test_hand_runtime_counts_boolean_command_rejection() -> None:
         hand_cmd_ring=Mock(),
         hand_state_ring=Mock(),
         hand_tactile_ring=Mock(),
+        hand_ack_ring=Mock(),
+        action_commit_ring=Mock(),
+        policy_epoch=_Value(1),
+        session_generation=_Value(1),
     )
-    shared.hand_cmd_ring.read_latest.return_value = ({"qpos_cmd": np.zeros((1, 12))}, 0.0, 1)
+    shared.hand_cmd_ring.read_latest.return_value = (command, 0.0, 1)
+    shared.action_commit_ring.read_latest.return_value = (commit, 0.0, 1)
 
     hand_instance = Mock()
-    hand_instance.config = SimpleNamespace(home_qpos=None)
+    hand_instance.config = SimpleNamespace(home_qpos=None, qpos_min=np.full(12, -1.0), qpos_max=np.full(12, 1.0))
     hand_instance.connect.return_value = True
     hand_instance.send_action.return_value = False
     hand_instance.connected_flag = True
     hand_instance.error_state = False
+    hand_instance.last_action_code = 9
+    hand_instance.tactile_calibrated = False
+    hand_instance.feedback_bound_stats = {"checks": 0}
     state_reads = 0
 
     def _get_state(*args, **kwargs):
         nonlocal state_reads
         state_reads += 1
-        if state_reads >= 2:
+        if state_reads >= 3:
             shared.is_running.value = False
         return {"qpos": np.zeros(12)}
 

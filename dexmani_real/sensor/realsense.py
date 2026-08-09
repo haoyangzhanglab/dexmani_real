@@ -18,6 +18,7 @@ __all__ = [
 import numpy as np
 import pyrealsense2 as rs
 
+from dexmani_real.sensor.clock_sync import DeviceClockMapper
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import (
     intrinsics_to_dict,
@@ -121,6 +122,13 @@ class CameraFrame:
     depth_raw: np.ndarray
     timestamp: float
     host_time: float
+    capture_monotonic_s: float
+    source_monotonic_ns: int
+    camera_generation: int
+    clock_reset: bool
+    duplicate: bool
+    frame_gap: int
+    backlog_s: float
     frame_id: int
     K: np.ndarray
     intr: np.ndarray
@@ -148,6 +156,7 @@ class RealSense:
         self.context = rs.context()
         self.active_serial: str | None = config.serial
         self.active_is_l515 = False
+        self._clock_mapper = DeviceClockMapper()
 
         self.pipeline: rs.pipeline | None = None
         self.profile: rs.pipeline_profile | None = None
@@ -169,6 +178,7 @@ class RealSense:
         if self.pipeline is not None:
             return True
 
+        self._clock_mapper.reset()
         return self._open_pipeline()
 
     def _open_pipeline(self) -> bool:
@@ -489,6 +499,8 @@ class RealSense:
             frames = self.aligner.process(frames)
 
         host_time = time.time()
+        capture_monotonic_ns = time.monotonic_ns()
+        capture_monotonic_s = capture_monotonic_ns / 1e9
         depth_frame = frames.get_depth_frame()
         color_frame = frames.get_color_frame() if self.config.enable_color else None
         if not depth_frame:
@@ -511,15 +523,29 @@ class RealSense:
             bgr = np.asanyarray(color_frame.get_data())
             rgb = np.ascontiguousarray(bgr[..., ::-1])
 
-        # Increment frame_id on every successful read.
-        self.frame_id += 1
+        # Preserve the device-provided frame number.  Unlike a local counter,
+        # this exposes device/pipeline stalls and dropped frames end-to-end.
+        self.frame_id = int(depth_frame.get_frame_number())
 
+        device_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
+        clock_mapping = self._clock_mapper.map(
+            device_time_s=device_timestamp_s,
+            host_receive_ns=capture_monotonic_ns,
+            frame_number=self.frame_id,
+        )
         frame = CameraFrame(
             rgb=rgb,
             depth=depth,
             depth_raw=depth_raw,
-            timestamp=float(depth_frame.get_timestamp()) * 1e-3,
+            timestamp=device_timestamp_s,
             host_time=host_time,
+            capture_monotonic_s=capture_monotonic_s,
+            source_monotonic_ns=clock_mapping.source_monotonic_ns,
+            camera_generation=clock_mapping.generation,
+            clock_reset=clock_mapping.clock_reset,
+            duplicate=clock_mapping.duplicate,
+            frame_gap=clock_mapping.frame_gap,
+            backlog_s=clock_mapping.backlog_ns / 1e9,
             frame_id=self.frame_id,
             K=self.K.copy(),
             intr=self.intr.copy(),
@@ -565,6 +591,26 @@ class RealSense:
                 info[name] = ""
         return info
 
+    def get_active_profiles(self) -> dict[str, dict[str, Any]]:
+        """Return the actual stream profiles selected by librealsense."""
+        if self.profile is None:
+            raise RuntimeError("RealSense is not connected.")
+        profiles: dict[str, dict[str, Any]] = {}
+        for name, stream in (("color", rs.stream.color), ("depth", rs.stream.depth)):
+            if name == "color" and not self.config.enable_color:
+                continue
+            video = self.profile.get_stream(stream).as_video_stream_profile()
+            intrinsics = video.get_intrinsics()
+            profiles[name] = {
+                "width": int(intrinsics.width),
+                "height": int(intrinsics.height),
+                "fps": int(video.fps()),
+                "format": str(video.format()),
+                "distortion_model": str(intrinsics.model),
+                "distortion_coeffs": [float(value) for value in intrinsics.coeffs],
+            }
+        return profiles
+
     @staticmethod
     def get_device_info_value(device: rs.device, key: rs.camera_info) -> str:
         try:
@@ -583,6 +629,12 @@ class RealSense:
         devices = self.context.query_devices()
         if len(devices) == 0:
             raise RuntimeError("No RealSense camera found.")
+        if len(devices) != 1:
+            serials = [self.get_device_info_value(device, rs.camera_info.serial_number) for device in devices]
+            raise RuntimeError(
+                "Multiple RealSense cameras found; configure an explicit serial "
+                f"instead of relying on discovery order (connected={serials})."
+            )
         serial = self.get_device_info_value(devices[0], rs.camera_info.serial_number)
         if not serial:
             raise RuntimeError("The first RealSense camera does not expose a serial number.")

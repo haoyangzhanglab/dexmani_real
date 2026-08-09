@@ -9,21 +9,24 @@ from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer, _get
 from dexmani_real.tools.episode_quality import EpisodeQuality, _grid_fill_mask
 
 
-def test_timestamp_mapping_backfills_every_skipped_slot() -> None:
+def test_timestamp_mapping_never_assigns_a_future_sample_to_skipped_slots() -> None:
     local, global_, next_idx = _get_accumulate_timestamp_idxs([10.0, 10.2], start_time=10.0, dt=0.1)
 
-    assert local == [0, 1, 1]
-    assert global_ == [0, 1, 2]
+    assert local == [0, 1]
+    assert global_ == [0, 2]
     assert next_idx == 3
 
 
-def test_timestamp_buffer_backfills_data_without_zero_holes() -> None:
+def test_timestamp_buffer_fills_gap_only_from_a_past_sample() -> None:
     buffer = TimestampAlignedBuffer(start_time=10.0, dt=0.1, max_record_steps=8)
     buffer.add({"value": np.array([1.0, 2.0])}, timestamp=10.0)
     buffer.add({"value": np.array([3.0, 4.0])}, timestamp=10.2)
 
-    np.testing.assert_array_equal(buffer.data["value"], [[1.0, 2.0], [3.0, 4.0], [3.0, 4.0]])
+    np.testing.assert_array_equal(buffer.data["value"], [[1.0, 2.0], [1.0, 2.0], [3.0, 4.0]])
     np.testing.assert_array_equal(buffer.data["flag_sample_valid"], [True, False, True])
+    np.testing.assert_array_equal(buffer.data["source_sample_index"], [0, 0, 1])
+    np.testing.assert_array_equal(buffer.data["fill_reason"], [0, 1, 0])
+    np.testing.assert_allclose(buffer.data["source_timestamp"], [10.0, 10.0, 10.2])
     np.testing.assert_allclose(buffer.timestamps, [10.0, 10.1, 10.2])
 
 
@@ -32,9 +35,11 @@ def test_timestamp_buffer_keeps_first_sample_in_grid_bucket() -> None:
     buffer.add({"value": np.array([1])}, timestamp=10.01)
     buffer.add({"value": np.array([2])}, timestamp=10.02)
 
-    assert buffer.size == 1
-    np.testing.assert_array_equal(buffer.data["value"], [[1]])
-    np.testing.assert_array_equal(buffer.data["flag_sample_valid"], [True])
+    assert buffer.size == 2
+    np.testing.assert_array_equal(buffer.data["value"], [[0], [1]])
+    np.testing.assert_array_equal(buffer.data["flag_sample_valid"], [False, True])
+    np.testing.assert_array_equal(buffer.data["fill_reason"], [2, 0])
+    assert buffer.data["source_timestamp"][1] <= buffer.timestamps[1]
 
 
 def test_grid_fill_mask_prefers_v12_validity_flag(tmp_path) -> None:
@@ -53,6 +58,23 @@ def test_grid_fill_mask_detects_legacy_zero_hole() -> None:
     np.testing.assert_array_equal(_grid_fill_mask(legacy, 4), [False, False, True, False])
 
 
+def test_filter_requires_explicit_legacy_offline_override(tmp_path) -> None:
+    path = tmp_path / "legacy.h5"
+    with h5py.File(path, "w") as h5_file:
+        meta = h5_file.create_group("meta")
+        meta.attrs["schema_version"] = 14
+        meta.attrs["control_hz"] = 10.0
+        h5_file.create_dataset("timestamp", data=[1.0, 1.1])
+        h5_file.create_dataset("arm_qpos", data=np.zeros((2, 7)))
+
+    with EpisodeQuality(path) as quality:
+        with pytest.raises(ValueError, match="UNKNOWN"):
+            quality.filter()
+        result = quality.filter(allow_legacy_offline=True)
+
+    assert result.kept_frames == 2
+
+
 def test_validation_excludes_legacy_hole_from_variance(tmp_path) -> None:
     path = tmp_path / "episode.h5"
     with h5py.File(path, "w") as h5_file:
@@ -66,7 +88,15 @@ def test_validation_excludes_legacy_hole_from_variance(tmp_path) -> None:
         h5_file.create_dataset("action_hand_joint", data=hand_command)
 
     with EpisodeQuality(path) as quality:
-        report = quality.validate(min_frames=1)
+        refused = quality.validate(min_frames=1)
+        report = quality.validate(min_frames=1, allow_legacy_offline=True)
+
+    assert refused.total_count == 1
+    assert refused.checks[0] == {
+        "name": "schema_v15_semantic_validity",
+        "passed": False,
+        "detail": "UNKNOWN",
+    }
 
     hand_check = next(
         check

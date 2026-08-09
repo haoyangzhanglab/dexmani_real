@@ -18,7 +18,9 @@ cv2.calibrateHandEye（5 种算法比选）自动求解相机外参。
 用法:
   conda activate real
   cd examples/real
-  python calibrate_camera.py
+  python calibrate_camera.py --serial <REALSENSE_SERIAL>
+
+若只连接一台 RealSense，可省略 ``--serial``；连接多台时必须显式指定。
 
 操作:
   WASD / ↑↓       移动 EEF（与 keyboard_teleop 一致）
@@ -43,6 +45,7 @@ uses the configured open-hand geometry for collision checks.
 
 from __future__ import annotations
 
+import argparse
 import json
 import multiprocessing as mp
 import sys
@@ -60,15 +63,20 @@ from scipy.spatial.transform import Rotation as R
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dexmani_real import PACKAGE_DIR
+from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
+from dexmani_real.policy.action_protocol import (
+    ActionSafetyGateConfig,
+    planner_action_safety_gate,
+    publish_joint_targets,
+)
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
     SharedStorage,
     SharedStorageConfig,
-    make_arm_action,
     read_arm_state_dict,
     send_arm_home,
     shutdown_processes,
@@ -76,7 +84,10 @@ from dexmani_real.shm.shared_storage import (
     wait_subsystem_ready,
 )
 from dexmani_real.teleop.keyboard import GlobalKeyState, MotionActivityLatch, eef_delta_from_keys
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
+
+logger = get_logger(__name__)
 
 # ═══════════════════════════════════════════════ 配置
 
@@ -103,16 +114,6 @@ class CameraCalibConfig:
 
 
 _cfg = CameraCalibConfig()
-
-# Workspace bounds — derived from policy.workspace for consistency with
-# the data-collection entry points.  The Y bounds are slightly tighter than
-# the default config (-0.45 vs -0.50) because the calibration rig (ArUco
-# marker on end-effector + fixed tripod camera) has a narrower useful range.
-from dexmani_real.config.defaults import arm, hand, policy
-
-WORKSPACE_BOUNDS = policy.workspace.as_array()
-WORKSPACE_BOUNDS[1, 0] = -0.45  # y_min: tighter for calibration rig
-WORKSPACE_BOUNDS[1, 1] = 0.45  # y_max: tighter for calibration rig
 
 # ArUco dictionary (fixed — not tunable per-session)
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
@@ -435,7 +436,13 @@ def calibrate_and_select(
 # ═══════════════════════════════════════════════ cameras.json 写入
 
 
-def save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) -> None:
+def save_cameras_json(
+    T_world_camera: np.ndarray,
+    serial: str,
+    json_path: Path,
+    *,
+    capture_metadata: dict | None = None,
+) -> None:
     """将标定结果写入 cameras.json（pose 格式，与 CameraCalib 兼容）。
 
     - position: XYZ (m), camera 在 world 系中的位置
@@ -458,6 +465,8 @@ def save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) 
             ],
         },
     }
+    if capture_metadata:
+        entry["calibration_capture"] = capture_metadata
 
     # 保留现有文件中的其他相机条目
     if json_path.exists():
@@ -494,13 +503,61 @@ def save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) 
 # ═══════════════════════════════════════════════ 主程序
 
 
+def _select_camera_serial(requested_serial: str | None) -> str:
+    """Require an explicit serial unless exactly one RealSense is connected."""
+    devices = rs.context().query_devices()
+    serials = [
+        str(device.get_info(rs.camera_info.serial_number))
+        for device in devices
+        if device.supports(rs.camera_info.serial_number)
+    ]
+    if requested_serial is not None:
+        if requested_serial not in serials:
+            raise RuntimeError(f"RealSense serial {requested_serial!r} not found; connected={serials}")
+        return requested_serial
+    if len(serials) != 1:
+        raise RuntimeError(f"Expected exactly one RealSense or --serial; connected={serials}")
+    return serials[0]
+
+
 def main():
+    parser = argparse.ArgumentParser(description="ArUco eye-to-hand camera calibration")
+    parser.add_argument(
+        "--serial", default=None, help="RealSense serial (required when multiple devices are connected)"
+    )
+    parser.add_argument("--config", type=Path, default=None, help="Runtime JSON; --serial takes precedence")
+    args = parser.parse_args()
+    runtime = resolve_runtime_config(
+        json_path=args.config,
+        cli_overrides={"camera.serial": args.serial},
+    )
+    arm_runtime = runtime.arm
+    hand_runtime = runtime.hand
+    camera_runtime = runtime.camera
+    policy_runtime = runtime.policy
+    workspace_bounds = np.array(
+        [
+            [policy_runtime.workspace.x_min, policy_runtime.workspace.x_max],
+            [policy_runtime.workspace.y_min, policy_runtime.workspace.y_max],
+            [policy_runtime.workspace.z_min, policy_runtime.workspace.z_max],
+        ],
+        dtype=np.float64,
+    )
+    # The calibration rig has a narrower useful Y range than normal teleop.
+    workspace_bounds[1] = np.clip(workspace_bounds[1], -0.45, 0.45)
+
     print("=" * 60)
     print("  ArUco 手眼标定 — xArm7 + RealSense (eye-to-hand)")
     print(f"  ArUco: {ARUCO_DICT_NAME} ID={_cfg.marker_id} size={_cfg.marker_size_m*1000:.1f}mm")
     print(f"  移动: WASD/↑↓  旋转: ←→(roll) IK(pitch) JL(yaw)")
     print(f"  采集: SPACE  标定: ENTER(≥10,推荐10~20)  撤销: BACKSPACE  删最差帧: X  归位: R  退出: Q")
     print("=" * 60)
+
+    try:
+        selected_serial = _select_camera_serial(camera_runtime.serial)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        return
 
     # 保存终端 tty 设置，退出时恢复（pynput 监听退出后常残留 echo/规范模式异常）
     tty_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
@@ -516,15 +573,35 @@ def main():
     # Camera calibration is an arm-only experiment: no XHand worker is
     # started. Explicitly seed the 19-DOF collision model with the configured
     # open-hand pose instead of relying on an implicit fallback warning.
-    _assumed_hand_qpos = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
+    _assumed_hand_qpos = np.deg2rad(np.asarray(hand_runtime.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(_assumed_hand_qpos)
+    planner.workspace_bounds = workspace_bounds.copy()
+    action_safety_gate = planner_action_safety_gate(
+        ActionSafetyGateConfig(
+            arm_joint_lower_rad=tuple(arm_runtime.joint_limit_lower),
+            arm_joint_upper_rad=tuple(arm_runtime.joint_limit_upper),
+            hand_joint_lower_rad=tuple(hand_runtime.qpos_min_rad),
+            hand_joint_upper_rad=tuple(hand_runtime.qpos_max_rad),
+            arm_max_velocity_rad_s=float(np.deg2rad(arm_runtime.max_joint_velocity_deg_per_s)),
+            hand_max_velocity_rad_s=(
+                float(hand_runtime.max_delta_rad) * _cfg.ctrl_hz
+                if hand_runtime.max_delta_rad is not None
+                else float(np.deg2rad(180.0))
+            ),
+            require_geometry_checks=True,
+        ),
+        planner=planner,
+        table_z_surface_m=float(arm_runtime.table_z_surface_m),
+        hand_safety_margin_m=float(arm_runtime.hand_safety_margin_m),
+    )
     print("  XHand: not required (open-hand geometry used for collision checks)")
 
     # ── 2. SharedStorage + arm_loop (new architecture) ──
-    shm_cfg = SharedStorageConfig()
-    shared = SharedStorage.create(prefix="dexmani_calib", config=shm_cfg)
-    arm_cfg = ArmLoopConfig()
-    arm_proc = mp.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm-calib", daemon=True)
+    shm_cfg = SharedStorageConfig.from_runtime(runtime)
+    ctx = mp.get_context("spawn")
+    shared = SharedStorage.create(prefix="dexmani_calib", config=shm_cfg, mp_context=ctx)
+    arm_cfg = ArmLoopConfig.from_runtime(runtime)
+    arm_proc = ctx.Process(target=_arm_loop, args=(shared, arm_cfg), name="arm-calib", daemon=False)
     arm_proc.start()
 
     transition(shared, SafetyState.DISARMED)
@@ -549,12 +626,18 @@ def main():
         print("❌ 无法从 arm_state_ring 读取初始状态")
         shutdown_processes(shared, [arm_proc])
         return
+    assert eef_pos is not None and _eef_rot6d is not None
 
     prev_qpos_cmd = arm_qpos.copy()
     # Initialize target in WORLD frame (consistent with keyboard_teleop).
     # eef_pos/rot6d from the ring are base-frame (Pinocchio FK); convert to world.
-    _eef_quat_base_init = rot6d_to_quat_wxyz(_eef_rot6d)
-    _eef_world_init = planner.base_to_world_pose(Pose(p=eef_pos, q=_eef_quat_base_init))
+    try:
+        _eef_quat_base_init = rot6d_to_quat_wxyz(_eef_rot6d)
+        _eef_world_init = planner.base_to_world_pose(Pose(p=eef_pos, q=_eef_quat_base_init))
+    except Exception:
+        transition(shared, SafetyState.DISARMED)
+        shutdown_processes(shared, [arm_proc])
+        raise
     target_pos = _eef_world_init.p.copy()
     target_quat = _eef_world_init.q.copy()
 
@@ -564,38 +647,93 @@ def main():
     print("\n启动 RealSense 相机...")
     pipeline = rs.pipeline()
     rs_config = rs.config()
-    pipeline_wrapper = rs.pipeline_wrapper(pipeline)
-    pipeline_profile = rs_config.resolve(pipeline_wrapper)
-    device = pipeline_profile.get_device()
+    pipeline_started = False
+    try:
+        rs_config.enable_device(selected_serial)
+        rs_config.enable_stream(
+            rs.stream.color,
+            int(camera_runtime.width),
+            int(camera_runtime.height),
+            rs.format.bgr8,
+            int(camera_runtime.fps),
+        )
+        profile = pipeline.start(rs_config)
+        pipeline_started = True
+        device = profile.get_device()
 
-    # 获取相机序列号
-    serial = device.get_info(rs.camera_info.serial_number)
-    print(f"  序列号: {serial}")
+        # 获取并核对实际相机身份/固件。
+        serial = device.get_info(rs.camera_info.serial_number)
+        if serial != selected_serial:
+            raise RuntimeError(f"Started RealSense {serial}, expected {selected_serial}")
+        firmware = device.get_info(rs.camera_info.firmware_version)
+        sdk_version = str(getattr(rs, "__version__", "unknown"))
+        print(f"  序列号: {serial}  固件: {firmware}  SDK: {sdk_version}")
 
-    rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    profile = pipeline.start(rs_config)
+        # 获取内参
+        color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        intr = color_profile.get_intrinsics()
+        INTRINSICS = np.array(
+            [
+                [intr.fx, 0, intr.ppx],
+                [0, intr.fy, intr.ppy],
+                [0, 0, 1],
+            ]
+        )
+        DISTORTION = np.array(intr.coeffs)
+        actual_fps = int(color_profile.fps())
+        actual_format = str(color_profile.format())
+        distortion_model = str(intr.model)
+        print(
+            f"  实际 profile: {intr.width}x{intr.height}@{actual_fps} {actual_format}; "
+            f"fx={intr.fx:.1f} fy={intr.fy:.1f} distortion={distortion_model}"
+        )
+        capture_metadata = {
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "firmware": firmware,
+            "sdk_version": sdk_version,
+            "resolved_config_sha256": runtime.sha256,
+            "color_profile": {
+                "width": int(intr.width),
+                "height": int(intr.height),
+                "fps": actual_fps,
+                "format": actual_format,
+            },
+            "intrinsics": {
+                "fx": float(intr.fx),
+                "fy": float(intr.fy),
+                "ppx": float(intr.ppx),
+                "ppy": float(intr.ppy),
+                "distortion_model": distortion_model,
+                "distortion_coeffs": [float(value) for value in intr.coeffs],
+            },
+        }
 
-    # 获取内参
-    color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-    intr = color_profile.get_intrinsics()
-    INTRINSICS = np.array(
-        [
-            [intr.fx, 0, intr.ppx],
-            [0, intr.fy, intr.ppy],
-            [0, 0, 1],
-        ]
-    )
-    DISTORTION = np.array(intr.coeffs)
-    print(f"  内参 fx={intr.fx:.1f} fy={intr.fy:.1f} ({intr.width}x{intr.height})")
-
-    # 预热相机（前几帧可能曝光不稳定）
-    for _ in range(30):
-        pipeline.wait_for_frames()
+        # 预热相机（前几帧可能曝光不稳定）
+        for _ in range(int(camera_runtime.warmup_frames)):
+            pipeline.wait_for_frames()
+    except Exception:
+        if pipeline_started:
+            try:
+                pipeline.stop()
+            except Exception:
+                logger.warning("RealSense cleanup failed during startup abort", exc_info=True)
+        transition(shared, SafetyState.DISARMED)
+        shutdown_processes(shared, [arm_proc])
+        raise
 
     # ── 4. 键盘输入 ──
     keys = GlobalKeyState(suppress_echo=True)
-    keys.start()
-    print("\n  键盘控制就绪 ←")
+    try:
+        keys.start()
+        print("\n  键盘控制就绪 ←")
+    except Exception:
+        try:
+            pipeline.stop()
+        except Exception:
+            logger.warning("RealSense cleanup failed during keyboard startup abort", exc_info=True)
+        transition(shared, SafetyState.DISARMED)
+        shutdown_processes(shared, [arm_proc])
+        raise
 
     # ── 5. 标定数据 ──
     samples_tvec_ee2base: list[np.ndarray] = []
@@ -604,10 +742,20 @@ def main():
     samples_tvec_marker2cam: list[np.ndarray] = []
 
     # 实时预览窗口（叠加 marker 检测框/坐标轴/状态）
-    cv2.namedWindow("ArUco Calibration", cv2.WINDOW_AUTOSIZE)
-    preview_detector = cv2.aruco.ArucoDetector(
-        cv2.aruco.getPredefinedDictionary(ARUCO_DICT), cv2.aruco.DetectorParameters()
-    )
+    try:
+        cv2.namedWindow("ArUco Calibration", cv2.WINDOW_AUTOSIZE)
+        preview_detector = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(ARUCO_DICT), cv2.aruco.DetectorParameters()
+        )
+    except Exception:
+        for cleanup_name, cleanup in (("keyboard", keys.stop), ("RealSense pipeline", pipeline.stop)):
+            try:
+                cleanup()
+            except Exception:
+                logger.warning("calibration cleanup failed during GUI startup: %s", cleanup_name, exc_info=True)
+        transition(shared, SafetyState.DISARMED)
+        shutdown_processes(shared, [arm_proc])
+        raise
     display_img: np.ndarray | None = None
     print("  预览窗口已打开（绿=已检测，红=未检测）")
 
@@ -787,7 +935,12 @@ def main():
                             print(f"     BACKSPACE 可逐个撤销可疑样本，再按 ENTER 重新计算。")
                         else:
                             T_world_camera = T_candidate
-                            save_cameras_json(T_world_camera, serial, CAMERAS_JSON_PATH)
+                            save_cameras_json(
+                                T_world_camera,
+                                serial,
+                                CAMERAS_JSON_PATH,
+                                capture_metadata=capture_metadata,
+                            )
                             print(
                                 f"  ✓ 标定完成 (选用 {method_best}, 位置 std={std_mm:.1f}mm, 旋转 std={std_deg:.2f}°)"
                             )
@@ -814,7 +967,7 @@ def main():
                     shared,
                     _home_qpos,
                     planner=planner,
-                    table_z_surface_m=arm.table_z_surface_m,
+                    table_z_surface_m=float(arm_runtime.table_z_surface_m),
                     current_qpos=arm_qpos,
                     heartbeat=False,
                     verbose=True,
@@ -923,7 +1076,7 @@ def main():
             # ── Workspace soft-wall: directional — allow moving back into workspace ──
             new_pos = target_pos + dx
             for axis in range(3):
-                lo, hi = WORKSPACE_BOUNDS[axis]
+                lo, hi = workspace_bounds[axis]
                 cur = target_pos[axis]
                 new = new_pos[axis]
                 if dx[axis] == 0:
@@ -956,25 +1109,41 @@ def main():
                 target_quat = eef_quat_world.copy()
                 continue
 
-            prev_qpos_cmd = ik_result.qpos.copy()
-
             # ── Safety gates (same as keyboard_teleop / policy_loop) ──
             if not np.all(np.isfinite(ik_result.qpos)):
                 continue
             if shared.safety_state.value == int(SafetyState.FAULT):
                 continue
 
-            shared.arm_action_q.put(make_arm_action(shared, ik_result.qpos))
+            published_candidate = publish_joint_targets(
+                shared,
+                ik_result.qpos,
+                prepare_timeout_s=0.06,
+                dt_s=1.0 / _cfg.ctrl_hz,
+                safety_gate=action_safety_gate,
+            )
+            if published_candidate is None:
+                print("  arm prepare/commit timeout — entering FAULT")
+                shared.error_state.value = True
+                break
+            assert published_candidate.arm_qpos is not None
+            prev_qpos_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
 
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt — 退出")
     finally:
-        keys.stop()
-        cv2.destroyAllWindows()
-        pipeline.stop()
+        for cleanup_name, cleanup in (
+            ("keyboard", keys.stop),
+            ("OpenCV windows", cv2.destroyAllWindows),
+            ("RealSense pipeline", pipeline.stop),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                logger.warning("calibration cleanup failed: %s", cleanup_name, exc_info=True)
 
         # 恢复终端 tty：丢弃缓冲的按键并还原 echo/规范模式
-        if tty_attrs is not None:
+        if tty_attrs is not None and tty_fd is not None:
             try:
                 termios.tcflush(tty_fd, termios.TCIFLUSH)
                 termios.tcsetattr(tty_fd, termios.TCSADRAIN, tty_attrs)

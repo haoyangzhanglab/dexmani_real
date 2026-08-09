@@ -189,6 +189,9 @@ class PointCloudProcessor:
         self._t_voxel_n = 0
         self._t_radius_n = 0
         self._t_n = 0
+        self.last_source_point_count = 0
+        self.last_valid_depth_ratio = 0.0
+        self.last_padding_count = 0
 
     def process(self, depth_m: np.ndarray, rgb: np.ndarray, rays: np.ndarray) -> np.ndarray | None:
         """(H,W) float32 meters + (H,W,3) uint8 RGB + (H,W,3) float32 unit rays
@@ -198,6 +201,9 @@ class PointCloudProcessor:
         cfg = self.config
         if rays.shape[:2] != depth_m.shape or rgb.shape[:2] != depth_m.shape:
             raise ValueError(f"Shape mismatch: depth {depth_m.shape}, rgb {rgb.shape[:2]}, rays {rays.shape[:2]}.")
+        self.last_source_point_count = 0
+        self.last_valid_depth_ratio = float(np.count_nonzero(np.isfinite(depth_m) & (depth_m > 0)) / depth_m.size)
+        self.last_padding_count = 0
 
         import time as _time
 
@@ -228,9 +234,7 @@ class PointCloudProcessor:
                 self._depth_ema = depth_m.copy()
             else:
                 _alpha = float(cfg.depth_ema_alpha)
-                self._depth_ema[_valid] = (
-                    _alpha * depth_m[_valid] + (1.0 - _alpha) * self._depth_ema[_valid]
-                )
+                self._depth_ema[_valid] = _alpha * depth_m[_valid] + (1.0 - _alpha) * self._depth_ema[_valid]
                 # Pixels that just became valid (newly appeared) skip smoothing.
                 _newly_valid = _valid & (self._depth_ema == 0)
                 self._depth_ema[_newly_valid] = depth_m[_newly_valid]
@@ -378,7 +382,9 @@ class PointCloudProcessor:
         # Radius outlier removal (disabled by default — DBSCAN two-in-one above
         # already removes isolated specks + thin noise strings at no extra cost).
         if cfg.radius_outlier_min_points > 0:
-            pcd, _ = pcd.remove_radius_outlier(nb_points=cfg.radius_outlier_min_points, radius=cfg.radius_outlier_radius)
+            pcd, _ = pcd.remove_radius_outlier(
+                nb_points=cfg.radius_outlier_min_points, radius=cfg.radius_outlier_radius
+            )
             if len(pcd.points) == 0:
                 return None
         n_radius = len(pcd.points)
@@ -402,6 +408,8 @@ class PointCloudProcessor:
         # spatial coverage without FPS's noise amplification bias.  Falls back to
         # FPS when sparse or when hybrid_fps_threshold is 0 (disabled).
         n = len(pcd.points)
+        self.last_source_point_count = int(n)
+        self.last_padding_count = max(0, int(cfg.num_points - n))
         if n >= cfg.num_points:
             if cfg.hybrid_fps_threshold > 0 and n > cfg.hybrid_fps_threshold:
                 idx = self._rng.choice(n, cfg.num_points, replace=False)
@@ -503,7 +511,14 @@ class PointCloudProcessor:
 
         # Coarse workspace crop to isolate the desk region.
         # Keep a generous z band — the RANSAC plane fit will find the desk.
-        crop = (pts[:, 0] >= -0.2) & (pts[:, 0] <= 1.0) & (pts[:, 1] >= -0.8) & (pts[:, 1] <= 0.8) & (pts[:, 2] >= -0.2) & (pts[:, 2] <= 0.5)
+        crop = (
+            (pts[:, 0] >= -0.2)
+            & (pts[:, 0] <= 1.0)
+            & (pts[:, 1] >= -0.8)
+            & (pts[:, 1] <= 0.8)
+            & (pts[:, 2] >= -0.2)
+            & (pts[:, 2] <= 0.5)
+        )
         pts = pts[crop]
         cols = cols[crop]
         if pts.shape[0] < 100:
@@ -546,6 +561,7 @@ class PointCloudProcessor:
         with open(path, "w") as f:
             json.dump({"a": a, "b": b, "c": c, "d": d}, f, indent=2)
         from dexmani_real.utils.log import get_logger
+
         _log = get_logger(__name__)
         _log.info("Desk plane saved to %s: a=%.4f b=%.4f c=%.4f d=%.4f", path, a, b, c, d)
 
@@ -566,11 +582,13 @@ class PointCloudProcessor:
         norm = np.sqrt(a * a + b * b + c * c)
         if not np.isclose(norm, 1.0, atol=1e-4):
             from dexmani_real.utils.log import get_logger
+
             _log = get_logger(__name__)
             _log.warning("Desk plane normal in %s has norm=%.6f (expected 1.0) — re-normalizing", path, norm)
             a, b, c, d = a / norm, b / norm, c / norm, d / norm
         if c < 0:
             from dexmani_real.utils.log import get_logger
+
             _log = get_logger(__name__)
             _log.warning("Desk plane in %s has downward normal — flipping", path)
             a, b, c, d = -a, -b, -c, -d
@@ -593,6 +611,7 @@ class PointCloudProcessor:
             return PointCloudProcessor.load_desk_plane(_abs)
         except (KeyError, ValueError, OSError) as e:
             from dexmani_real.utils.log import get_logger
+
             _log = get_logger(__name__)
             _log.warning("Failed to load desk plane from %s: %s — using workspace z_min fallback", _abs, e)
             return None

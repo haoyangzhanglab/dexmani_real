@@ -31,9 +31,10 @@ Two storage formats are supported:
          }
        }
 
-Intrinsics (K matrix) are read from the RealSense hardware at runtime, not from
-this calibration file. They are stored into HDF5 /meta at recording time for
-self-contained episodes.
+Intrinsics (K matrix) are read from the RealSense hardware at runtime and stored
+into HDF5 /meta for self-contained episodes.  New calibration entries may also
+carry a ``calibration_capture`` snapshot (profile, distortion, firmware, SDK)
+for provenance; it is diagnostic and is not used as runtime intrinsics.
 
 Usage:
     calib = CameraCalib()

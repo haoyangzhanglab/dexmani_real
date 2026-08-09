@@ -37,9 +37,10 @@ _repo_root = Path(__file__).resolve().parents[2]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
+from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz
-from dexmani_real.sensor.vr_receiver_process import vr_loop
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, vr_loop
+from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig, shutdown_processes
 
 CONFIG_DIR = _repo_root / "dexmani_real" / "config"
 OUTPUT_PATH = CONFIG_DIR / "vr_transform.json"
@@ -124,7 +125,8 @@ def _quality_grade(forwards: np.ndarray, theta_mean: float, inlier: np.ndarray) 
 def main() -> None:
     parser = argparse.ArgumentParser(description="VR heading calibration")
     parser.add_argument("--duration", type=float, default=10.0, help="采集时长 (秒), default: 10")
-    parser.add_argument("--port", type=int, default=8000, help="VR TCP 端口, default: 8000")
+    parser.add_argument("--port", type=int, default=None, help="VR TCP 端口 (CLI > JSON > defaults)")
+    parser.add_argument("--config", default=None, help="Validated runtime JSON overrides")
     parser.add_argument(
         "--ref",
         choices=["wrist", "head"],
@@ -132,6 +134,8 @@ def main() -> None:
         help="标定参考: wrist=手腕指向机器人+X (默认), head=头部面朝机器人+X",
     )
     args = parser.parse_args()
+    runtime = resolve_runtime_config(json_path=args.config, cli_overrides={"vr.port": args.port})
+    vr_port = int(runtime.vr.port)
 
     ref_label = "头部 (面朝机器人 +X)" if args.ref == "head" else "手腕 (伸出右臂, 手指指向机器人 +X)"
 
@@ -139,17 +143,20 @@ def main() -> None:
     print("VR Heading 标定")
     print(f"  参考:   {ref_label}")
     print(f"  采集:   {args.duration}s")
-    print(f"  端口:   {args.port}")
+    print(f"  端口:   {vr_port}")
     print("=" * 55)
 
     # ── Start VR receiver (new architecture: SharedStorage + vr_loop) ──
     import multiprocessing as mp
 
-    shared = SharedStorage.create(prefix="dexmani_vr_calib")
-    from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig
-
-    vr_cfg = VRReceiverConfig(port=args.port)
-    vr_proc = mp.Process(target=vr_loop, args=(shared, vr_cfg), name="vr-calib", daemon=True)
+    ctx = mp.get_context("spawn")
+    shared = SharedStorage.create(
+        prefix="dexmani_vr_calib",
+        config=SharedStorageConfig.from_runtime(runtime),
+        mp_context=ctx,
+    )
+    vr_cfg = VRReceiverConfig.from_runtime(runtime)
+    vr_proc = ctx.Process(target=vr_loop, args=(shared, vr_cfg), name="vr-calib", daemon=False)
     vr_proc.start()
 
     # vr_ready is set on the first HTS event (headset-on), not just TCP connect.
@@ -157,9 +164,7 @@ def main() -> None:
     print("\n  Waiting for VR connection (up to 120s) — put on Quest headset...", flush=True)
     if not shared.vr_ready.wait(timeout=120):
         print("  ERROR: VR receiver startup timeout (120s)", flush=True)
-        shared.is_running.value = False
-        vr_proc.join(timeout=5)
-        shared.close()
+        shutdown_processes(shared, [vr_proc])
         sys.exit(1)
     print("  VR connected", flush=True)
 
@@ -183,9 +188,7 @@ def main() -> None:
         time.sleep(0.1)
     else:
         print("  ERROR: no VR tracking data after 15s", flush=True)
-        shared.is_running.value = False
-        vr_proc.join(timeout=5)
-        shared.close()
+        shutdown_processes(shared, [vr_proc])
         sys.exit(1)
 
     # ── Settle period: first 3 s after the headset is on are discarded so the
@@ -251,12 +254,7 @@ def main() -> None:
             last_print = now
         time.sleep(0.01)
 
-    shared.is_running.value = False
-    vr_proc.join(timeout=5)
-    if vr_proc.is_alive():
-        vr_proc.terminate()
-        vr_proc.join(timeout=1)
-    shared.close()
+    shutdown_processes(shared, [vr_proc])
 
     if len(forwards) < 30:
         print(f"ERROR: 只采集到 {len(forwards)} 帧 ({args.ref} quat 不可用?), 样本不足 (需 ≥30)")

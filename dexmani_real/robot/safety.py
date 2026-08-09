@@ -12,6 +12,7 @@ This split prevents races: the two writers operate on disjoint transition pairs.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from enum import IntEnum
 from typing import Any
 
@@ -51,25 +52,9 @@ ALLOWED_TRANSITIONS: dict[tuple[int, int], bool] = {
 def transition(shared: Any, new_state: SafetyState) -> bool:
     """Validate and execute a safety state transition.
 
-    Note:
-        The read-validate-write on ``shared.safety_state`` (``mp.Value('i')``)
-        is **not atomic** — no ``mp.Lock`` protects it.  This is a known
-        TOCTOU window, safe in practice because:
-
-        1. **Write ownership separation** prevents overlapping transitions:
-           Main owns DISARMED↔ARMED / →FAULT; Policy owns ARMED↔RUNNING.
-        2. **FAULT is self-correcting:** the heartbeat supervisor re-asserts
-           FAULT within 100 ms (10 Hz), so any overwrite is transient.
-        3. **No new motion can occur after a worker fault latch:** arm_loop and
-           hand_loop gate commands on sticky ``error_state`` immediately;
-           Main then owns the transition to FAULT.  The arm holds its last
-           Mode 6 target during that bounded handoff.
-           ``set_state(4)`` is called during cleanup as a belt-and-suspenders
-           measure, not the primary safety mechanism.
-
-        Adding ``mp.Lock`` was considered (2026-08-05 audit) and rejected:
-        the overhead for a theoretical race that self-corrects within one
-        supervisor tick is not justified.
+    The synchronized ``mp.Value`` lock covers read/validate/write as one
+    operation.  Write ownership remains split between Main and Policy, while
+    the lock prevents a concurrent FAULT transition from being overwritten.
 
     Args:
         shared: SharedStorage instance with ``safety_state`` (mp.Value('i')).
@@ -78,29 +63,32 @@ def transition(shared: Any, new_state: SafetyState) -> bool:
     Returns:
         True if transition succeeded, False if rejected (invalid transition).
     """
-    current_int = shared.safety_state.value
-    try:
-        current = SafetyState(current_int)
-    except ValueError:
-        logger.error("safety: unknown current state %d — forcing FAULT", current_int)
-        shared.safety_state.value = int(SafetyState.FAULT)
-        return False
+    lock_getter = getattr(shared.safety_state, "get_lock", None)
+    lock = lock_getter() if callable(lock_getter) else nullcontext()
+    with lock:
+        current_int = shared.safety_state.value
+        try:
+            current = SafetyState(current_int)
+        except ValueError:
+            logger.error("safety: unknown current state %d — forcing FAULT", current_int)
+            shared.safety_state.value = int(SafetyState.FAULT)
+            return False
 
-    if current == new_state:
-        return True  # Idempotent — no-op transitions are harmless
+        if current == new_state:
+            return True  # Idempotent — no-op transitions are harmless
 
-    key = (int(current), int(new_state))
-    if not ALLOWED_TRANSITIONS.get(key, False):
-        logger.error(
-            "safety: rejected transition %s(%d) → %s(%d)",
-            current.name,
-            int(current),
-            new_state.name,
-            int(new_state),
-        )
-        return False
+        key = (int(current), int(new_state))
+        if not ALLOWED_TRANSITIONS.get(key, False):
+            logger.error(
+                "safety: rejected transition %s(%d) → %s(%d)",
+                current.name,
+                int(current),
+                new_state.name,
+                int(new_state),
+            )
+            return False
 
-    shared.safety_state.value = int(new_state)
+        shared.safety_state.value = int(new_state)
     logger.info(
         "safety: %s(%d) → %s(%d)",
         current.name,

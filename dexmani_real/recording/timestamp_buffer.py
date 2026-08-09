@@ -9,6 +9,7 @@ Ref: ManiUniCon TimestampAlignedBuffer (maniunicon/utils/timestamp_accumulator.p
 from __future__ import annotations
 
 import math
+from enum import IntEnum
 from typing import Any
 
 import numpy as np
@@ -17,7 +18,13 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["TimestampAlignedBuffer"]
+__all__ = ["FillReason", "TimestampAlignedBuffer"]
+
+
+class FillReason(IntEnum):
+    SOURCE = 0
+    CAUSAL_HOLD_LAST = 1
+    LEADING_PLACEHOLDER = 2
 
 
 def _get_accumulate_timestamp_idxs(
@@ -29,10 +36,11 @@ def _get_accumulate_timestamp_idxs(
 ) -> tuple[list[int], list[int], int]:
     """Map raw timestamps to discrete grid indices.
 
-    For each dt window [start_time + k*dt, start_time + (k+1)*dt), assigns the
-    first timestamp falling into that window (later samples in the same window
-    are dropped — first wins).  When a window has no timestamp (dropped frame),
-    it is back-filled by the NEXT arriving sample's index.
+    Assigns each source to the first grid deadline that is not earlier than its
+    timestamp. Exact-boundary samples stay on that boundary; later samples in
+    the same interval are dropped (first wins). Missing deadlines are never
+    associated with a future source sample; :class:`TimestampAlignedBuffer`
+    fills them from a past source or an explicit leading placeholder.
 
     Args:
         timestamps: Sorted list of timestamps (or a single float).
@@ -55,19 +63,18 @@ def _get_accumulate_timestamp_idxs(
     for local_idx, ts in enumerate(timestamps):
         if not np.isfinite(ts):
             continue
-        # eps*dt ensures ts == start_time + k*dt lands exactly in slot k
-        global_idx = math.floor((ts - start_time) / dt + eps)
+        # The grid is a causal deadline, not the left edge of an arrival-time
+        # bucket. eps keeps floating-point representations of exact boundaries
+        # on that boundary while every truly later source moves to the next one.
+        global_idx = math.ceil((ts - start_time) / dt - eps)
         if global_idx < 0:
             continue
 
-        # Repeat this source sample across every unoccupied slot up to its own
-        # slot. This is the ManiUniCon accumulator contract: a delayed sample
-        # back-fills missed grid ticks instead of leaving zero-initialized holes.
-        n_repeats = max(0, global_idx - next_global_idx + 1)
-        for i in range(n_repeats):
-            local_idxs.append(local_idx)
-            global_idxs.append(next_global_idx + i)
-        next_global_idx += n_repeats
+        if global_idx < next_global_idx:
+            continue
+        local_idxs.append(local_idx)
+        global_idxs.append(global_idx)
+        next_global_idx = global_idx + 1
 
     return local_idxs, global_idxs, next_global_idx
 
@@ -79,9 +86,10 @@ class TimestampAlignedBuffer:
     ``add()`` inspects the data dict to determine shapes and dtypes, then
     pre-allocates numpy arrays of shape ``(max_record_steps,) + value.shape``.
 
-    When the data source is slower than 1/dt, missed slots are back-filled by
-    the next arriving sample.  When faster, the first value in each window wins
-    (later ones are dropped).
+    When the data source is slower than 1/dt, missed slots causally hold the
+    latest *past* sample. Episode-leading slots with no past source use an
+    explicit zero/NaN placeholder. When faster, the first value before each
+    deadline wins (later values assigned to the same deadline are dropped).
 
     Camera frames should NOT be routed through this buffer (they are too large
     for pre-allocation); use the existing per-frame HDF5 path instead.
@@ -104,6 +112,10 @@ class TimestampAlignedBuffer:
         self._size: int = 0
         self._recording_stopped: bool = False
         self._next_global_idx: int = 0
+        self._next_source_index: int = 0
+        self._last_source_data: dict[str, Any] | None = None
+        self._last_source_index: int = -1
+        self._last_source_timestamp: float = float("nan")
 
     # -- public properties ----------------------------------------------------
 
@@ -137,7 +149,7 @@ class TimestampAlignedBuffer:
     # -- core methods ---------------------------------------------------------
 
     def add(self, data: dict[str, np.ndarray | float | int], timestamp: float) -> None:
-        """Add one multi-stream data point, assigning it to the nearest grid slot.
+        """Add one multi-stream data point at the first causal grid deadline.
 
         On the first call the buffer allocates arrays based on the keys, shapes,
         and dtypes found in *data*.  Subsequent calls must supply the same keys.
@@ -145,6 +157,9 @@ class TimestampAlignedBuffer:
         if self._recording_stopped:
             return
 
+        source_index = self._next_source_index
+        self._next_source_index += 1
+        previous_next_idx = self._next_global_idx
         _, global_idxs, next_global_idx = _get_accumulate_timestamp_idxs(
             timestamps=timestamp,
             start_time=self.start_time,
@@ -157,27 +172,26 @@ class TimestampAlignedBuffer:
         if len(global_idxs) == 0:
             return
 
-        # add() accepts one source sample, so the final mapped grid index is
-        # the sample's own slot; earlier indices are back-filled slots.
-        source_global_idx = global_idxs[-1]
+        source_global_idx = global_idxs[0]
+        gap_idxs = list(range(previous_next_idx, source_global_idx))
+        write_idxs = gap_idxs + [source_global_idx]
 
         # Check capacity — truncate to valid slots if last index overflows.
-        max_required = global_idxs[-1] + 1
+        max_required = source_global_idx + 1
         if max_required > self.max_record_steps:
             # Keep only the indices that fit within the pre-allocated arrays.
-            keep = [i for i, g in enumerate(global_idxs) if g < self.max_record_steps]
-            if not keep:
+            write_idxs = [g for g in write_idxs if g < self.max_record_steps]
+            if not write_idxs:
                 self._recording_stopped = True
                 return
-            n_dropped = len(global_idxs) - len(keep)
-            global_idxs = [global_idxs[i] for i in keep]
-            max_required = global_idxs[-1] + 1
+            n_dropped = max_required - self.max_record_steps
+            max_required = write_idxs[-1] + 1
             logger.warning(
                 "TimestampAlignedBuffer: reached max_record_steps=%d — "
                 "truncated %d/%d slots, stopping after this batch",
                 self.max_record_steps,
                 n_dropped,
-                n_dropped + len(keep),
+                n_dropped + len(write_idxs),
             )
             self._recording_stopped = True
 
@@ -185,13 +199,38 @@ class TimestampAlignedBuffer:
         if self._data_buffer is None:
             self._allocate(data)
 
-        # Write data into pre-allocated slots
-        for key, value in data.items():
-            if key in self._data_buffer:  # type: ignore[operator]
-                self._data_buffer[key][global_idxs] = value  # type: ignore[index]
-        self._data_buffer["flag_sample_valid"][global_idxs] = False  # type: ignore[index]
-        if source_global_idx in global_idxs:
-            self._data_buffer["flag_sample_valid"][source_global_idx] = True  # type: ignore[index]
+        assert self._data_buffer is not None
+        # Fill gaps only from an already observed source. No future sample may
+        # write a slot whose grid time precedes that sample's source time.
+        for grid_idx in gap_idxs:
+            if grid_idx >= self.max_record_steps:
+                break
+            if self._last_source_data is not None:
+                for key, value in self._last_source_data.items():
+                    if key in self._data_buffer:
+                        self._data_buffer[key][grid_idx] = value
+                self._data_buffer["source_sample_index"][grid_idx] = self._last_source_index
+                self._data_buffer["source_timestamp"][grid_idx] = self._last_source_timestamp
+                self._data_buffer["fill_reason"][grid_idx] = int(FillReason.CAUSAL_HOLD_LAST)
+            else:
+                self._data_buffer["source_sample_index"][grid_idx] = -1
+                self._data_buffer["source_timestamp"][grid_idx] = np.nan
+                self._data_buffer["fill_reason"][grid_idx] = int(FillReason.LEADING_PLACEHOLDER)
+
+        if source_global_idx < self.max_record_steps:
+            for key, value in data.items():
+                if key in self._data_buffer:
+                    self._data_buffer[key][source_global_idx] = value
+            self._data_buffer["flag_sample_valid"][source_global_idx] = True
+            self._data_buffer["source_sample_index"][source_global_idx] = source_index
+            self._data_buffer["source_timestamp"][source_global_idx] = timestamp
+            self._data_buffer["fill_reason"][source_global_idx] = int(FillReason.SOURCE)
+            self._last_source_data = {
+                key: np.array(value, copy=True) if isinstance(value, np.ndarray) else value
+                for key, value in data.items()
+            }
+            self._last_source_index = source_index
+            self._last_source_timestamp = timestamp
 
         if self._timestamp_buffer is not None:
             # Assign grid-aligned synthetic timestamps so every slot gets
@@ -199,7 +238,7 @@ class TimestampAlignedBuffer:
             # back-fills or stalls.  Without this, back-filled slots all
             # share the original timestamp → duplicate timestamps in the
             # HDF5 → broken temporal alignment for downstream training.
-            for gidx in global_idxs:
+            for gidx in write_idxs:
                 self._timestamp_buffer[gidx] = self.start_time + gidx * self.dt
 
         self._size = max_required
@@ -212,9 +251,15 @@ class TimestampAlignedBuffer:
         for key, value in data.items():
             if isinstance(value, np.ndarray):
                 shape = (self.max_record_steps,) + value.shape
-                self._data_buffer[key] = np.zeros(shape, dtype=value.dtype)
+                if np.issubdtype(value.dtype, np.floating):
+                    self._data_buffer[key] = np.full(shape, np.nan, dtype=value.dtype)
+                else:
+                    self._data_buffer[key] = np.zeros(shape, dtype=value.dtype)
             elif isinstance(value, (float, int)):
-                self._data_buffer[key] = np.zeros(self.max_record_steps, dtype=type(value))
+                if isinstance(value, float):
+                    self._data_buffer[key] = np.full(self.max_record_steps, np.nan, dtype=np.float64)
+                else:
+                    self._data_buffer[key] = np.zeros(self.max_record_steps, dtype=type(value))
             else:
                 logger.warning(
                     "TimestampAlignedBuffer: skipping key=%r (unsupported type %s)",
@@ -223,4 +268,9 @@ class TimestampAlignedBuffer:
                 )
 
         self._data_buffer["flag_sample_valid"] = np.zeros(self.max_record_steps, dtype=bool)
+        self._data_buffer["source_sample_index"] = np.full(self.max_record_steps, -1, dtype=np.int64)
+        self._data_buffer["source_timestamp"] = np.full(self.max_record_steps, np.nan, dtype=np.float64)
+        self._data_buffer["fill_reason"] = np.full(
+            self.max_record_steps, int(FillReason.LEADING_PLACEHOLDER), dtype=np.uint8
+        )
         self._timestamp_buffer = np.zeros(self.max_record_steps, dtype=np.float64)

@@ -1,0 +1,480 @@
+"""Policy-side scheduler for an isolated learned-policy inference worker."""
+
+from __future__ import annotations
+
+import time
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import Any
+
+import numpy as np
+
+from dexmani_real.policy.action_protocol import ActionSafetyGate, JointActionScheduler, SafeCommandPublisher
+from dexmani_real.policy.inference_process import InferenceConfig, decode_candidate
+from dexmani_real.policy.observation_sources import SharedObservationSource
+from dexmani_real.policy.runtime import ActionCandidate, ActionChunk, ObservationSnapshot
+from dexmani_real.policy.tensor_block import ObservationTensorBlock
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
+
+
+class CoordinatorTick(Enum):
+    IDLE = "idle"
+    SNAPSHOT = "snapshot"
+    PUBLISHED = "published"
+    HELD = "held"
+    REJECTED = "rejected"
+    REWARMING = "rewarming"
+
+
+@dataclass(frozen=True)
+class LearnedCoordinatorConfig:
+    coordinator_hz: float = 64.0
+    prepare_timeout_s: float = 0.05
+    candidate_timeout_s: float = 0.25
+    hand_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        timing = (self.coordinator_hz, self.prepare_timeout_s, self.candidate_timeout_s)
+        if not all(np.isfinite(value) and value > 0 for value in timing):
+            raise ValueError("learned coordinator rates/timeouts must be finite and positive")
+
+
+def learned_policy_loop(
+    shared: Any,
+    runtime: Any,
+    inference: InferenceConfig,
+    tensor_block: ObservationTensorBlock,
+) -> None:
+    """Spawn target for the 64 Hz coordinator and explicit operator gate."""
+    import signal
+    from pathlib import Path
+
+    from dexmani_real import ASSET_DIR
+    from dexmani_real.planning.planner import PlanningProfile, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+    from dexmani_real.planning.types import Pose
+    from dexmani_real.policy.action_protocol import ActionSafetyGateConfig, planner_action_safety_gate
+    from dexmani_real.robot.safety import SafetyState, transition
+    from dexmani_real.runtime.status import ComponentPhase, FaultCode
+    from dexmani_real.shm.shared_storage import publish_component_status
+    from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+    from dexmani_real.utils.rate_manager import RateManager
+
+    stop_requested = False
+
+    def _on_sigterm(_signum: int, _frame: object) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    keyboard: KeyboardHandler | None = None
+    coordinator: LearnedPolicyCoordinator | None = None
+    failed = False
+    try:
+        publish_component_status(shared, "policy", ComponentPhase.LOADING)
+        hand_enabled = "hand" in inference.actuators
+        if hand_enabled and not bool(runtime.policy.hand_enabled):
+            raise ValueError("inference manifest requires hand but resolved runtime disables it")
+        urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
+        srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
+        planner = XArm7MotionPlanner(
+            XArm7PlannerConfig(
+                urdf_path=urdf_path,
+                srdf_path=srdf_path,
+                base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
+                workspace_bounds=np.asarray(
+                    [
+                        [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
+                        [runtime.policy.workspace.y_min, runtime.policy.workspace.y_max],
+                        [runtime.policy.workspace.z_min, runtime.policy.workspace.z_max],
+                    ],
+                    dtype=np.float64,
+                ),
+            ),
+            planning_profile=PlanningProfile(),
+            teleop_profile=TeleopProfile(),
+            hand_dof=True,
+        )
+        gate = planner_action_safety_gate(
+            ActionSafetyGateConfig(
+                arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+                arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+                hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
+                hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
+                arm_max_velocity_rad_s=float(np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)),
+                hand_max_velocity_rad_s=(
+                    float(runtime.hand.max_delta_rad) * inference.observation_spec.control_hz
+                    if runtime.hand.max_delta_rad is not None
+                    else float(np.deg2rad(180.0))
+                ),
+                observation_max_age_s=max(modality.max_age_s for modality in inference.observation_spec.modalities),
+                require_geometry_checks=True,
+            ),
+            planner=planner,
+            table_z_surface_m=float(runtime.arm.table_z_surface_m),
+            hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
+        )
+        coordinator = LearnedPolicyCoordinator(
+            shared,
+            inference,
+            tensor_block,
+            gate,
+            config=LearnedCoordinatorConfig(hand_enabled=hand_enabled),
+        )
+
+        ready_events: list[tuple[str, Any]] = [("arm", shared.arm_ready), ("inference", shared.inference_ready)]
+        if coordinator.sources.requires_hand or hand_enabled:
+            ready_events.append(("hand", shared.hand_ready))
+        if coordinator.sources.requires_camera:
+            ready_events.append(("camera", shared.camera_ready))
+        if coordinator.sources.requires_vr:
+            ready_events.append(("vr", shared.vr_ready))
+        for name, event in ready_events:
+            if not event.wait(timeout=120.0):
+                raise TimeoutError(f"learned policy startup timed out waiting for {name}")
+
+        publish_component_status(shared, "policy", ComponentPhase.WARMING_UP)
+        warmup_deadline = time.monotonic() + 15.0
+        live_output_validated = False
+        warmup_limiter = RateManager(64.0)
+        while shared.is_running.value and time.monotonic() < warmup_deadline:
+            shared.policy_heartbeat_s.value = time.monotonic()
+            coordinator.publish_snapshot()
+            if coordinator.consume_candidate_chunk() is not None:
+                live_output_validated = True
+                coordinator.scheduler.reset()
+            if coordinator.snapshot_ready and live_output_validated and shared.inference_ready.is_set():
+                break
+            warmup_limiter.wait()
+        if not coordinator.snapshot_ready or not live_output_validated:
+            raise RuntimeError("live observation history/backend output did not validate during warmup")
+
+        keyboard = KeyboardHandler()
+        keyboard.start()
+        shared.policy_heartbeat_s.value = time.monotonic()
+        shared.policy_ready.set()
+        publish_component_status(shared, "policy", ComponentPhase.READY)
+        limiter = RateManager(64.0)
+
+        while shared.is_running.value and not stop_requested:
+            shared.policy_heartbeat_s.value = time.monotonic()
+            for control in keyboard.poll(timeout=0.0):
+                if control is ControlSignal.EMERGENCY_STOP:
+                    shared.estop_request.value = True
+                    break
+                if control is ControlSignal.QUIT:
+                    shared.quit_requested.value = True
+                    stop_requested = True
+                    break
+                if (
+                    control is ControlSignal.BEGIN
+                    and shared.safety_state.value == int(SafetyState.ARMED)
+                    and shared.inference_ready.is_set()
+                    and not coordinator.rewarm_pending
+                ):
+                    coordinator.begin_new_epoch()
+                    transition(shared, SafetyState.RUNNING)
+                    publish_component_status(shared, "policy", ComponentPhase.RUNNING)
+                elif control in {ControlSignal.PAUSE, ControlSignal.STOP, ControlSignal.DISCARD} and (
+                    shared.safety_state.value == int(SafetyState.RUNNING)
+                ):
+                    transition(shared, SafetyState.ARMED)
+                    coordinator.hold()
+                    publish_component_status(shared, "policy", ComponentPhase.READY)
+
+            if shared.safety_state.value == int(SafetyState.RUNNING):
+                tick_result = coordinator.tick()
+                if tick_result is CoordinatorTick.REWARMING:
+                    publish_component_status(shared, "policy", ComponentPhase.WARMING_UP)
+            else:
+                coordinator.publish_snapshot()
+                coordinator.consume_candidate_chunk()
+                coordinator.scheduler.reset()
+                if coordinator.rewarm_pending and shared.inference_ready.is_set():
+                    coordinator.complete_rewarm()
+                    publish_component_status(shared, "policy", ComponentPhase.READY)
+            limiter.wait()
+    except Exception:
+        failed = True
+        logger.error("learned policy coordinator failed", exc_info=True)
+        publish_component_status(
+            shared,
+            "policy",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.INFERENCE_FAILED,
+            detail="coordinator exception; see process log",
+        )
+        shared.error_state.value = True
+    finally:
+        if keyboard is not None:
+            keyboard.stop()
+        if not failed:
+            publish_component_status(shared, "policy", ComponentPhase.STOPPED)
+        logger.info("learned policy coordinator exited")
+
+
+class LearnedPolicyCoordinator:
+    """Own snapshots, candidate IDs, SafetyGate, scheduling, and publication.
+
+    The inference process never receives this object or ``SharedStorage``.  It
+    can only read the tensor block and write its candidate mailbox.
+    """
+
+    def __init__(
+        self,
+        shared: Any,
+        inference: InferenceConfig,
+        tensor_block: ObservationTensorBlock,
+        safety_gate: ActionSafetyGate,
+        *,
+        config: LearnedCoordinatorConfig | None = None,
+    ) -> None:
+        if inference.action_spec.chunk_length > int(shared.inference_candidate_ring.maxlen):
+            raise ValueError("ActionSpec chunk exceeds inference candidate ring capacity")
+        self.shared = shared
+        self.inference = inference
+        self.tensor_block = tensor_block
+        self.safety_gate = safety_gate
+        self.config = config or LearnedCoordinatorConfig()
+        self.sources = SharedObservationSource(shared, inference.observation_spec)
+        self.scheduler = JointActionScheduler(inference.action_spec)
+        self.publisher = SafeCommandPublisher(shared)
+        self._snapshots: dict[int, ObservationSnapshot] = {}
+        self._last_snapshot_ns = 0
+        self._last_candidate_sequence = 0
+        self._last_candidate_ns = time.monotonic_ns()
+        self._last_camera_generation: int | None = None
+        self._hold_after_timeout = False
+        self._hold_published = False
+        self._rewarm_pending = False
+        self._rewarm_triggered = False
+
+    @property
+    def rewarm_pending(self) -> bool:
+        return self._rewarm_pending
+
+    def complete_rewarm(self) -> None:
+        if not self.shared.inference_ready.is_set():
+            raise RuntimeError("cannot complete policy re-warm before inference is ready")
+        self._rewarm_pending = False
+
+    @property
+    def snapshot_ready(self) -> bool:
+        if not self._snapshots:
+            return False
+        snapshot = self._snapshots[max(self._snapshots)]
+        return all(bool(np.all(snapshot.valid_history_mask[name])) for name in snapshot.valid_history_mask)
+
+    def publish_snapshot(self, *, anchor_monotonic_ns: int | None = None) -> ObservationSnapshot | None:
+        now_ns = time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
+        period_ns = int(round(1e9 / self.inference.observation_spec.control_hz))
+        if self._last_snapshot_ns and now_ns < self._last_snapshot_ns + period_ns:
+            return None
+        snapshot = self.sources.build(anchor_monotonic_ns=now_ns)
+        if self._last_camera_generation is None:
+            self._last_camera_generation = snapshot.camera_generation
+        elif snapshot.camera_generation != self._last_camera_generation:
+            from dexmani_real.robot.safety import SafetyState, transition
+
+            self._last_camera_generation = snapshot.camera_generation
+            self._snapshots[snapshot.observation_id] = snapshot
+            current_safety = SafetyState(int(self.shared.safety_state.value))
+            if current_safety is SafetyState.RUNNING:
+                transition(self.shared, SafetyState.ARMED)
+            self.begin_new_epoch(now_monotonic_ns=now_ns)
+            if current_safety in (SafetyState.ARMED, SafetyState.RUNNING):
+                self.hold(now_monotonic_ns=now_ns)
+            self.shared.inference_ready.clear()
+            self._rewarm_pending = True
+            self._rewarm_triggered = True
+        self.tensor_block.write(snapshot)
+        self._snapshots[snapshot.observation_id] = snapshot
+        while len(self._snapshots) > 64:
+            del self._snapshots[min(self._snapshots)]
+        self._last_snapshot_ns = now_ns
+        return snapshot
+
+    def _allocate_action_ids(self, count: int) -> list[int]:
+        with self.shared.arm_command_seq.get_lock():
+            first = int(self.shared.arm_command_seq.value) + 1
+            self.shared.arm_command_seq.value = first + count - 1
+        return list(range(first, first + count))
+
+    def consume_candidate_chunk(self, *, now_monotonic_ns: int | None = None) -> ActionChunk | None:
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        history = self.shared.inference_candidate_ring.get_last_k(self.shared.inference_candidate_ring.maxlen)
+        unseen = [
+            (data, sequence) for data, _publish_ns, sequence in history if sequence > self._last_candidate_sequence
+        ]
+        if not unseen:
+            return None
+
+        groups: dict[tuple[int, int], list[tuple[ActionCandidate, int, int]]] = defaultdict(list)
+        for data, sequence in unseen:
+            candidate, chunk_length = decode_candidate(data)
+            groups[(candidate.observation_id, candidate.chunk_id)].append((candidate, chunk_length, sequence))
+
+        complete: list[tuple[int, list[ActionCandidate]]] = []
+        for entries in groups.values():
+            lengths = {length for _candidate, length, _sequence in entries}
+            if len(lengths) != 1:
+                continue
+            length = lengths.pop()
+            if len(entries) != length:
+                continue
+            by_step = {candidate.step_index: candidate for candidate, _length, _sequence in entries}
+            if set(by_step) != set(range(length)):
+                continue
+            complete.append(
+                (max(sequence for _candidate, _length, sequence in entries), [by_step[i] for i in range(length)])
+            )
+        if not complete:
+            return None
+
+        newest_sequence, raw_steps = max(complete, key=lambda item: item[0])
+        snapshot = self._snapshots.get(raw_steps[0].observation_id)
+        if snapshot is None:
+            self._last_candidate_sequence = newest_sequence
+            return None
+        if now_ns - snapshot.anchor_monotonic_ns > int(self.inference.action_spec.deadline_s * 1e9):
+            self._last_candidate_sequence = newest_sequence
+            self._hold_after_timeout = True
+            return None
+
+        action_ids = self._allocate_action_ids(len(raw_steps))
+        lead_ns = int(float(self.shared.action_lead_time_s) * 1e9)
+        dt_ns = int(self.inference.action_spec.dt_s * 1e9)
+        chunk_id = action_ids[0]
+        normalized: list[ActionCandidate] = []
+        for index, (raw, action_id) in enumerate(zip(raw_steps, action_ids)):
+            if not self.config.hand_enabled and raw.hand_qpos is not None:
+                raise ValueError("backend produced a hand action while the hand capability is disabled")
+            target_ns = now_ns + lead_ns + index * dt_ns
+            normalized.append(
+                replace(
+                    raw,
+                    session_generation=int(self.shared.session_generation.value),
+                    policy_epoch=int(self.shared.policy_epoch.value),
+                    action_id=action_id,
+                    created_monotonic_ns=now_ns,
+                    target_monotonic_ns=target_ns,
+                    valid_until_monotonic_ns=target_ns + dt_ns,
+                    chunk_id=chunk_id,
+                    step_index=index,
+                )
+            )
+        chunk = ActionChunk(chunk_id, tuple(normalized))
+        self.scheduler.submit(chunk, now_monotonic_ns=now_ns)
+        self._last_candidate_sequence = newest_sequence
+        self._last_candidate_ns = now_ns
+        self._hold_after_timeout = self.scheduler.all_late
+        self._hold_published = False
+        return chunk
+
+    def _current_joints(self) -> tuple[np.ndarray, np.ndarray]:
+        arm_result = self.shared.arm_state_ring.read_latest()
+        hand_result = self.shared.hand_state_ring.read_latest() if self.config.hand_enabled else None
+        if arm_result is None or (self.config.hand_enabled and hand_result is None):
+            raise RuntimeError("fresh feedback is required for every enabled actuator")
+        arm_record = arm_result[0][0]
+        if not bool(arm_record["state_valid"]):
+            raise RuntimeError("invalid arm feedback")
+        if hand_result is None:
+            hand_qpos = np.asarray(self.shared.hand_home_qpos_rad, dtype=np.float64)
+        else:
+            hand_record = hand_result[0][0]
+            if not bool(hand_record["state_valid"]):
+                raise RuntimeError("invalid hand feedback")
+            hand_qpos = np.array(hand_record["qpos"], copy=True)
+        return np.array(arm_record["qpos"], copy=True), hand_qpos
+
+    def _publish_candidate(self, candidate: ActionCandidate, *, now_ns: int) -> CoordinatorTick:
+        snapshot = self._snapshots.get(candidate.observation_id)
+        if snapshot is None:
+            return CoordinatorTick.REJECTED
+        current_arm, current_hand = self._current_joints()
+        result = self.safety_gate.evaluate(
+            candidate,
+            snapshot=snapshot,
+            current_arm_qpos=current_arm,
+            current_hand_qpos=current_hand,
+            expected_session_generation=int(self.shared.session_generation.value),
+            expected_policy_epoch=int(self.shared.policy_epoch.value),
+            now_monotonic_ns=now_ns,
+            dt_s=self.inference.action_spec.dt_s,
+        )
+        if not result.accepted or result.candidate is None:
+            logger.warning("learned candidate rejected: %s", result.reason)
+            return CoordinatorTick.REJECTED
+        if not self.publisher.publish(result.candidate, prepare_timeout_s=self.config.prepare_timeout_s):
+            raise TimeoutError("learned action prepare/commit failed")
+        self.scheduler.mark_committed(result.candidate.action_id)
+        return CoordinatorTick.PUBLISHED
+
+    def _publish_coordinated_hold(self, *, now_ns: int) -> None:
+        if self._hold_published or not self._snapshots:
+            return
+        snapshot = self._snapshots[max(self._snapshots)]
+        current_arm, current_hand = self._current_joints()
+        action_id = self._allocate_action_ids(1)[0]
+        target_ns = now_ns + int(float(self.shared.action_lead_time_s) * 1e9)
+        hold = ActionCandidate(
+            observation_id=snapshot.observation_id,
+            session_generation=int(self.shared.session_generation.value),
+            policy_epoch=int(self.shared.policy_epoch.value),
+            action_id=action_id,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=target_ns,
+            valid_until_monotonic_ns=target_ns + int(self.inference.action_spec.dt_s * 1e9),
+            arm_qpos=current_arm,
+            hand_qpos=current_hand if self.config.hand_enabled else None,
+            chunk_id=action_id,
+            step_index=0,
+            is_hold=True,
+        )
+        if self._publish_candidate(hold, now_ns=now_ns) is not CoordinatorTick.PUBLISHED:
+            raise RuntimeError("coordinated hold was rejected")
+        self._hold_published = True
+
+    def begin_new_epoch(self, *, now_monotonic_ns: int | None = None) -> int:
+        """Drop old proposals before an explicit ARMED→RUNNING transition."""
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        with self.shared.policy_epoch.get_lock():
+            self.shared.policy_epoch.value = int(self.shared.policy_epoch.value) + 1
+            epoch = int(self.shared.policy_epoch.value)
+        self.scheduler.reset()
+        self._last_candidate_sequence = int(self.shared.inference_candidate_ring.latest_sequence)
+        self._last_candidate_ns = now_ns
+        self._hold_after_timeout = False
+        self._hold_published = False
+        return epoch
+
+    def hold(self, *, now_monotonic_ns: int | None = None) -> None:
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        self.scheduler.reset()
+        self._hold_published = False
+        self._publish_coordinated_hold(now_ns=now_ns)
+
+    def tick(self, *, now_monotonic_ns: int | None = None) -> CoordinatorTick:
+        """Run one non-blocking 64 Hz coordinator iteration."""
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        snapshot = self.publish_snapshot(anchor_monotonic_ns=now_ns)
+        if self._rewarm_triggered:
+            self._rewarm_triggered = False
+            return CoordinatorTick.REWARMING
+        self.consume_candidate_chunk(now_monotonic_ns=now_ns)
+        ready = self.scheduler.pop_ready(lead_time_s=float(self.shared.action_lead_time_s), now_monotonic_ns=now_ns)
+        if ready is not None:
+            result = self._publish_candidate(ready, now_ns=now_ns)
+            if result is CoordinatorTick.REJECTED:
+                self._hold_after_timeout = True
+                self._publish_coordinated_hold(now_ns=now_ns)
+                return CoordinatorTick.HELD
+            return result
+        if self._hold_after_timeout or now_ns - self._last_candidate_ns > int(self.config.candidate_timeout_s * 1e9):
+            self._hold_after_timeout = True
+            self._publish_coordinated_hold(now_ns=now_ns)
+            return CoordinatorTick.HELD
+        return CoordinatorTick.SNAPSHOT if snapshot is not None else CoordinatorTick.IDLE

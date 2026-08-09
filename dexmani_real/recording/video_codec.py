@@ -111,7 +111,7 @@ class VideoEncoder:
 
         Frame shape must be ``(height, width, 3)`` with dtype ``uint8``.
         The caller is responsible for feeding frames in display order;
-        duplicate frames (forward-filled grid slots) are fine — H.264
+        duplicate frames (causal hold-last grid slots) are fine — H.264
         encodes them as near-zero-cost skip blocks.
         """
         with self._lock:
@@ -236,6 +236,20 @@ class VideoDecoder:
         if not frames:
             raise ValueError(f"No frames decoded from {self._path}")
         return np.stack(frames, axis=0)
+
+    def count_decoded_frames(self) -> int:
+        """Fully decode the stream and count frames without retaining pixels."""
+        if not self._opened:
+            self._open()
+        if self._container is None:
+            raise RuntimeError("VideoDecoder: container is None after _open()")
+        self._container.seek(0)
+        count = 0
+        for packet in self._container.demux(self._stream):
+            for frame in packet.decode():
+                if isinstance(frame, av.VideoFrame):
+                    count += 1
+        return count
 
     def read_frame(self, index: int) -> np.ndarray:
         """Decode a single frame by index.

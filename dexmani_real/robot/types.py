@@ -50,8 +50,8 @@ class RobotState:
     hand_qpos: np.ndarray  # (12,) float64  rad
 
     # ── Tactile (ref: DexUMI — both combined force and raw array in default mode) ──
-    hand_tactile_sum: np.ndarray  # (5,3)     float64  N — per-finger combined force
-    hand_tactile_force: np.ndarray  # (5,120,3) float64  N — per-finger raw force array
+    hand_tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
+    hand_tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified
     hand_tactile_contact: np.ndarray  # (5,) bool — per-finger contact detection (from detect_contact)
     hand_tipboard_err: np.ndarray  # (12,) int32 — tip board error registers per joint
     hand_commboard_err: np.ndarray  # (12,) int32 — comm board error registers per joint
@@ -171,7 +171,7 @@ class HandState:
 
     qpos: np.ndarray  # (12,) float64  rad
     current: np.ndarray  # (12,) float64  mA
-    tactile_sum: np.ndarray  # (5,3) float64  N
+    tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
     tactile_contact: np.ndarray  # (5,) bool
     error_state: bool
     connected: bool
@@ -189,4 +189,4 @@ class HandTactile:
     Only written when tactile_contact[finger] is nonzero.
     """
 
-    tactile_force: np.ndarray  # (5,120,3) float64  N
+    tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified

@@ -15,8 +15,12 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, camera, policy
+from dexmani_real.config.defaults import arm, camera, hand, policy
+from dexmani_real.policy.action_protocol import ACK_DTYPE, ARM_COMMAND_DTYPE, COMMIT_DTYPE, HAND_COMMAND_DTYPE
+from dexmani_real.policy.inference_process import INFERENCE_CANDIDATE_DTYPE
+from dexmani_real.recording.io_process import RECORD_CONTROL_DTYPE, RECORD_STATUS_DTYPE, make_record_sample_dtype
 from dexmani_real.robot.safety import SafetyState
+from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
 from dexmani_real.shm.ring_buffer import CameraRingBuffer
 from dexmani_real.shm.robot_ring import SeqlockRingBuffer
 from dexmani_real.utils.log import get_logger
@@ -42,20 +46,76 @@ class SharedStorageConfig:
         shared = SharedStorage.create(config=cfg)
     """
 
-    camera_ring_maxlen: int = 5
+    camera_ring_maxlen: int = field(default_factory=lambda: camera.ring_maxlen)
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
+    record_sample_ring_maxlen: int = 4
+
+    control_hz: float = field(default_factory=lambda: policy.control_hz)
+    arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
+    hand_loop_hz: float = field(default_factory=lambda: hand.loop_hz)
+    hand_home_qpos_rad: tuple[float, ...] = field(
+        default_factory=lambda: tuple(float(value) for value in np.deg2rad(hand.home_qpos_deg))
+    )
 
     camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
     camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
-    camera_pc_shape: tuple[int, int] = (2048, 6)
+    camera_pc_shape: tuple[int, int] = field(default_factory=lambda: camera.pointcloud_shape)
 
     arm_action_q_maxsize: int = 2
 
     workspace_bounds: "np.ndarray" = field(default_factory=lambda: policy.workspace.as_array())
+
+    def __post_init__(self) -> None:
+        capacities = (
+            self.camera_ring_maxlen,
+            self.vr_ring_maxlen,
+            self.arm_state_ring_maxlen,
+            self.hand_state_ring_maxlen,
+            self.hand_tactile_ring_maxlen,
+            self.hand_cmd_ring_maxlen,
+            self.record_sample_ring_maxlen,
+            self.arm_action_q_maxsize,
+        )
+        if any(int(value) <= 0 for value in capacities):
+            raise ValueError("SharedStorage ring/queue capacities must be positive")
+        if min(self.control_hz, self.arm_loop_hz, self.hand_loop_hz) <= 0:
+            raise ValueError("SharedStorage action rates must be positive")
+        bounds = np.asarray(self.workspace_bounds, dtype=np.float64)
+        if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] > bounds[:, 1]):
+            raise ValueError("SharedStorage workspace_bounds must be finite shape (3, 2)")
+        hand_home = np.asarray(self.hand_home_qpos_rad, dtype=np.float64)
+        if hand_home.shape != (12,) or not np.all(np.isfinite(hand_home)):
+            raise ValueError("SharedStorage hand_home_qpos_rad must be finite shape (12,)")
+
+    @classmethod
+    def from_runtime(cls, runtime: object) -> "SharedStorageConfig":
+        cam = getattr(runtime, "camera")
+        pol = getattr(runtime, "policy")
+        arm_cfg = getattr(runtime, "arm")
+        hand_cfg = getattr(runtime, "hand")
+        bounds = np.array(
+            [
+                [pol.workspace.x_min, pol.workspace.x_max],
+                [pol.workspace.y_min, pol.workspace.y_max],
+                [pol.workspace.z_min, pol.workspace.z_max],
+            ],
+            dtype=np.float64,
+        )
+        return cls(
+            camera_ring_maxlen=int(cam.ring_maxlen),
+            camera_rgb_shape=(int(cam.height), int(cam.width), 3),
+            camera_depth_shape=(int(cam.height), int(cam.width)),
+            camera_pc_shape=(int(cam.pointcloud_num_points), 6),
+            control_hz=float(pol.control_hz),
+            arm_loop_hz=float(arm_cfg.loop_hz),
+            hand_loop_hz=float(hand_cfg.loop_hz),
+            hand_home_qpos_rad=tuple(float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)),
+            workspace_bounds=bounds,
+        )
 
 
 HOME_SENTINEL = "__HOME__"
@@ -119,9 +179,12 @@ ARM_STATE_DTYPE = np.dtype(
         ("last_cmd_apply_latency_s", "<f8"),
         ("last_cmd_sdk_duration_s", "<f8"),
         ("last_cmd_is_hold", "<u1"),
+        ("source_monotonic_ns", "<u8"),
+        ("publish_monotonic_ns", "<u8"),
+        ("state_valid", "<u1"),
         ("timestamp", "<f8"),
     ]
-)  # 322 bytes
+)
 
 HAND_STATE_DTYPE = np.dtype(
     [
@@ -135,21 +198,39 @@ HAND_STATE_DTYPE = np.dtype(
         ("commboard_err", "<i4", (12,)),
         ("jointboard_err", "<i4", (12,)),
         ("tipboard_err", "<i4", (12,)),
+        ("source_monotonic_ns", "<u8"),
+        ("publish_monotonic_ns", "<u8"),
+        ("state_valid", "<u1"),
+        ("send_healthy", "<u1"),
+        ("read_healthy", "<u1"),
         ("timestamp", "<f8"),
     ]
-)  # 472 bytes (no tactile_force — that's in hand_tactile_ring)
+)  # no tactile_force — that is carried by hand_tactile_ring
 
-HAND_CMD_DTYPE = np.dtype(
+HAND_CMD_DTYPE = HAND_COMMAND_DTYPE
+
+COMPONENT_STATUS_DTYPE = np.dtype(
     [
-        ("qpos_cmd", "<f8", (12,)),
-    ]
-)  # 96 bytes
+        ("component", "S24"),
+        ("phase", "<u1"),
+        ("fault_code", "<u2"),
+        ("exit_reason", "<u1"),
+        ("generation", "<u8"),
+        ("updated_monotonic_ns", "<u8"),
+        ("detail", "S160"),
+    ],
+    align=True,
+)
 
 HAND_TACTILE_DTYPE = np.dtype(
     [
         ("tactile_force", "<f8", (5, 120, 3)),
+        ("source_monotonic_ns", "<u8"),
+        ("fresh", "<u1"),
+        ("calibrated", "<u1"),
+        ("unit_code", "<u1"),  # 0=unknown, 1=newton (vendor conversion provenance required)
     ]
-)  # 14,400 bytes
+)
 
 
 def new_frame(dtype: np.dtype) -> np.ndarray:
@@ -171,10 +252,25 @@ class SharedStorage:
     hand_state_ring: SeqlockRingBuffer  # hand -> policy
     hand_tactile_ring: SeqlockRingBuffer  # hand -> policy (sparse)
     hand_cmd_ring: SeqlockRingBuffer  # policy -> hand
+    action_commit_ring: SeqlockRingBuffer  # coordinator -> arm + hand
+    arm_ack_ring: SeqlockRingBuffer  # arm -> coordinator
+    hand_ack_ring: SeqlockRingBuffer  # hand -> coordinator
+    component_status_ring: SeqlockRingBuffer  # workers -> supervisor diagnostics
+    record_control_ring: SeqlockRingBuffer  # policy -> RecorderIO episode boundary
+    record_sample_ring: SeqlockRingBuffer  # policy -> RecorderIO fixed payload
+    record_status_ring: SeqlockRingBuffer  # RecorderIO -> policy/main
+    inference_candidate_ring: SeqlockRingBuffer  # Inference -> coordinator only
 
     arm_action_q: mp.Queue  # policy -> arm, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
     arm_command_seq: Any  # all arm-action producers -> globally unique monotonic IDs
+    session_generation: Any
+    policy_epoch: Any
+    recorder_consumed_sequence: Any
+    action_control_hz: float
+    action_lead_time_s: float
+    action_validity_s: float
+    hand_home_qpos_rad: tuple[float, ...]
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -187,6 +283,8 @@ class SharedStorage:
     arm_heartbeat_s: Any
     hand_heartbeat_s: Any
     policy_heartbeat_s: Any
+    recorder_heartbeat_s: Any
+    inference_heartbeat_s: Any
     vr_heartbeat_s: Any
     camera_heartbeat_s: Any
 
@@ -194,10 +292,20 @@ class SharedStorage:
     hand_ready: Any  # -> Main
     camera_ready: Any  # -> Main
     vr_ready: Any  # -> Main
+    policy_ready: Any  # -> Main, only after policy/backend warmup
+    inference_ready: Any  # optional capability -> Main
+    recorder_ready: Any  # optional capability -> Main
+    component_status_lock: Any  # serializes the multi-producer diagnostic ring
 
+    arm_device_identity: Any  # worker-reported canonical identity JSON
+    hand_device_identity: Any  # worker-reported canonical identity JSON
     camera_depth_scale: Any  # depth scale (mm to meters)
     camera_K: Any  # 3x3 intrinsics, row-major
     camera_serial: Any  # serial number string
+    camera_firmware: Any  # firmware version string
+    camera_sdk_version: Any  # pyrealsense2/librealsense version string
+    camera_profile: Any  # actual color/depth profile JSON
+    camera_observation_required: Any  # learned policy requests camera payload publication
 
     @classmethod
     def create(
@@ -207,12 +315,14 @@ class SharedStorage:
         config: SharedStorageConfig | None = None,
         camera_rgb_shape: tuple[int, int, int] | None = None,
         camera_depth_shape: tuple[int, int] | None = None,
+        mp_context: Any | None = None,
     ) -> "SharedStorage":
         """Create all rings, queues, flags, events, and heartbeats.
 
         Call once from Main before spawning child processes.
         """
         cfg = config or SharedStorageConfig()
+        ctx = mp_context or mp.get_context("spawn")
 
         _rgb_shape = camera_rgb_shape or cfg.camera_rgb_shape
         _depth_shape = camera_depth_shape or cfg.camera_depth_shape
@@ -252,35 +362,77 @@ class SharedStorage:
             dtype=HAND_CMD_DTYPE,
             maxlen=cfg.hand_cmd_ring_maxlen,
         )
+        storage.action_commit_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_action_commit", dtype=COMMIT_DTYPE, maxlen=8
+        )
+        storage.arm_ack_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_arm_ack", dtype=ACK_DTYPE, maxlen=16)
+        storage.hand_ack_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_hand_ack", dtype=ACK_DTYPE, maxlen=16)
+        storage.component_status_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_component_status", dtype=COMPONENT_STATUS_DTYPE, maxlen=32
+        )
+        storage.record_control_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=8
+        )
+        storage.record_sample_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_record_sample",
+            dtype=make_record_sample_dtype(_rgb_shape, _depth_shape, cfg.camera_pc_shape),
+            maxlen=cfg.record_sample_ring_maxlen,
+        )
+        storage.record_status_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_record_status", dtype=RECORD_STATUS_DTYPE, maxlen=16
+        )
+        storage.inference_candidate_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_inference_candidate", dtype=INFERENCE_CANDIDATE_DTYPE, maxlen=16
+        )
 
-        storage.arm_action_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
-        storage.arm_home_result_q = mp.Queue(maxsize=cfg.arm_action_q_maxsize)
-        storage.arm_command_seq = mp.Value("Q", 0)
+        storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
+        storage.arm_home_result_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
+        storage.arm_command_seq = ctx.Value("Q", 0)
+        storage.session_generation = ctx.Value("Q", time.monotonic_ns())
+        storage.policy_epoch = ctx.Value("Q", 1)
+        storage.recorder_consumed_sequence = ctx.Value("Q", 0)
+        storage.action_control_hz = float(cfg.control_hz)
+        storage.action_lead_time_s = 2.0 / min(float(cfg.arm_loop_hz), float(cfg.hand_loop_hz))
+        storage.action_validity_s = 1.0 / float(cfg.control_hz)
+        storage.hand_home_qpos_rad = tuple(float(value) for value in cfg.hand_home_qpos_rad)
 
-        storage.is_running = mp.Value("b", True)
-        storage.is_recording = mp.Value("b", False)
-        storage.error_state = mp.Value("b", False)
-        storage.estop_request = mp.Value("b", False)
-        storage.quit_requested = mp.Value("b", False)
+        storage.is_running = ctx.Value("b", True)
+        storage.is_recording = ctx.Value("b", False)
+        storage.error_state = ctx.Value("b", False)
+        storage.estop_request = ctx.Value("b", False)
+        storage.quit_requested = ctx.Value("b", False)
 
-        storage.safety_state = mp.Value("i", int(SafetyState.DISARMED))
+        storage.safety_state = ctx.Value("i", int(SafetyState.DISARMED))
 
-        storage.arm_heartbeat_s = mp.Value("d", 0.0)
-        storage.hand_heartbeat_s = mp.Value("d", 0.0)
-        storage.policy_heartbeat_s = mp.Value("d", 0.0)
-        storage.vr_heartbeat_s = mp.Value("d", 0.0)
-        storage.camera_heartbeat_s = mp.Value("d", 0.0)
+        storage.arm_heartbeat_s = ctx.Value("d", 0.0)
+        storage.hand_heartbeat_s = ctx.Value("d", 0.0)
+        storage.policy_heartbeat_s = ctx.Value("d", 0.0)
+        storage.recorder_heartbeat_s = ctx.Value("d", 0.0)
+        storage.inference_heartbeat_s = ctx.Value("d", 0.0)
+        storage.vr_heartbeat_s = ctx.Value("d", 0.0)
+        storage.camera_heartbeat_s = ctx.Value("d", 0.0)
 
-        storage.arm_ready = mp.Event()
-        storage.hand_ready = mp.Event()
-        storage.camera_ready = mp.Event()
-        storage.vr_ready = mp.Event()
+        storage.arm_ready = ctx.Event()
+        storage.hand_ready = ctx.Event()
+        storage.camera_ready = ctx.Event()
+        storage.vr_ready = ctx.Event()
+        storage.policy_ready = ctx.Event()
+        storage.inference_ready = ctx.Event()
+        storage.recorder_ready = ctx.Event()
+        storage.component_status_lock = ctx.Lock()
 
-        storage.camera_depth_scale = mp.Value("d", 0.0)
-        storage.camera_K = mp.Array("d", [0.0] * 9)
-        storage.camera_serial = mp.Array("c", b"\x00" * 32)
+        storage.arm_device_identity = ctx.Array("c", b"\x00" * 1024)
+        storage.hand_device_identity = ctx.Array("c", b"\x00" * 1024)
+        storage.camera_depth_scale = ctx.Value("d", 0.0)
+        storage.camera_K = ctx.Array("d", [0.0] * 9)
+        storage.camera_serial = ctx.Array("c", b"\x00" * 32)
+        storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
+        storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
+        storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
+        storage.camera_observation_required = ctx.Value("b", False)
 
         logger.info("SharedStorage created (prefix=%s)", prefix)
+        storage._closed = False
         return storage
 
     def close(self) -> None:
@@ -289,6 +441,9 @@ class SharedStorage:
         ``unlink()`` destroys the POSIX shared-memory segment, preventing
         Python's resource tracker "leaked shared_memory objects" warning.
         """
+        if bool(getattr(self, "_closed", False)):
+            return
+        self._closed = True
         _close_errors: list[str] = []
 
         for ring_name, ring in (
@@ -298,6 +453,14 @@ class SharedStorage:
             ("hand_state_ring", self.hand_state_ring),
             ("hand_tactile_ring", self.hand_tactile_ring),
             ("hand_cmd_ring", self.hand_cmd_ring),
+            ("action_commit_ring", self.action_commit_ring),
+            ("arm_ack_ring", self.arm_ack_ring),
+            ("hand_ack_ring", self.hand_ack_ring),
+            ("component_status_ring", self.component_status_ring),
+            ("record_control_ring", self.record_control_ring),
+            ("record_sample_ring", self.record_sample_ring),
+            ("record_status_ring", self.record_status_ring),
+            ("inference_candidate_ring", self.inference_candidate_ring),
         ):
             try:
                 ring.close()  # type: ignore[attr-defined]
@@ -359,33 +522,6 @@ def read_arm_state(shared: "SharedStorage") -> "np.ndarray | None":
     return data
 
 
-def make_arm_action(shared: "SharedStorage", qpos: "np.ndarray", *, is_hold: bool = False) -> "dict[str, Any]":
-    """Build one validated, timestamped arm queue action.
-
-    ``command_seq`` is allocated atomically from :class:`SharedStorage`, so
-    every producer (policy, keyboard, calibration, replay) uses one monotonic
-    command domain. ``created_monotonic_s`` is comparable directly with the
-    arm worker's receive/apply timestamps because all processes run on the same
-    host monotonic clock.
-    """
-    qpos_array = np.asarray(qpos, dtype=np.float64)
-    if qpos_array.shape != (7,):
-        raise ValueError(f"arm qpos action must have shape (7,), got {qpos_array.shape}")
-    if not np.all(np.isfinite(qpos_array)):
-        raise ValueError("arm qpos action contains NaN/Inf")
-
-    with shared.arm_command_seq.get_lock():
-        command_seq = int(shared.arm_command_seq.value) + 1
-        shared.arm_command_seq.value = command_seq
-
-    return {
-        "qpos": qpos_array.copy(),
-        "command_seq": command_seq,
-        "created_monotonic_s": time.monotonic(),
-        "is_hold": bool(is_hold),
-    }
-
-
 def read_hand_state(shared: "SharedStorage") -> "np.ndarray | None":
     """Read latest hand state from ring. Returns raw structured array or None."""
     result = shared.hand_state_ring.read_latest()
@@ -395,11 +531,59 @@ def read_hand_state(shared: "SharedStorage") -> "np.ndarray | None":
     return data
 
 
-def write_hand_cmd(shared: "SharedStorage", qpos: "np.ndarray") -> None:
-    """Write hand position command to ring (latest-wins)."""
-    frame = new_frame(HAND_CMD_DTYPE)
-    frame["qpos_cmd"][0] = np.asarray(qpos, dtype=np.float64).ravel()[:12]
-    shared.hand_cmd_ring.write(frame)
+def write_hand_cmd(shared: "SharedStorage", qpos: "np.ndarray", *, safety_gate: "Any | None" = None) -> bool:
+    """Publish a hand target together with a measured arm hold."""
+    arm_state = read_arm_state(shared)
+    if arm_state is None:
+        return False
+    arm_qpos = np.asarray(arm_state["qpos"][0], dtype=np.float64)
+    from dexmani_real.policy.action_protocol import publish_joint_targets
+
+    return (
+        publish_joint_targets(
+            shared,
+            arm_qpos,
+            np.asarray(qpos, dtype=np.float64),
+            is_hold=True,
+            safety_gate=safety_gate,
+        )
+        is not None
+    )
+
+
+def publish_component_status(
+    shared: Any,
+    component: str,
+    phase: ComponentPhase,
+    *,
+    fault_code: FaultCode = FaultCode.NONE,
+    exit_reason: ExitReason = ExitReason.NONE,
+    detail: str = "",
+) -> None:
+    """Publish one structured component health transition when available.
+
+    Minimal offline mocks and older external façades may omit the diagnostic
+    ring; status reporting is observability-only and must not mask the worker's
+    primary safety behavior in that compatibility case.
+    """
+    ring = getattr(shared, "component_status_ring", None)
+    if ring is None:
+        return
+    frame = new_frame(COMPONENT_STATUS_DTYPE)
+    frame["component"][0] = component.encode("utf-8")[:24]
+    frame["phase"][0] = int(phase)
+    frame["fault_code"][0] = int(fault_code)
+    frame["exit_reason"][0] = int(exit_reason)
+    generation = getattr(shared, "session_generation", None)
+    frame["generation"][0] = int(generation.value) if generation is not None else 0
+    frame["updated_monotonic_ns"][0] = time.monotonic_ns()
+    frame["detail"][0] = detail.encode("utf-8")[:160]
+    lock = getattr(shared, "component_status_lock", None)
+    if lock is None:
+        ring.write(frame)
+    else:
+        with lock:
+            ring.write(frame)
 
 
 def hand_home_converge(
@@ -411,6 +595,7 @@ def hand_home_converge(
     heartbeat: bool = False,
     check_is_running: bool = True,
     verbose: bool = True,
+    safety_gate: "Any | None" = None,
 ) -> "tuple[bool, np.ndarray | None]":
     """Poll hand_state_ring until hand converges to home_qpos.
 
@@ -426,7 +611,10 @@ def hand_home_converge(
             break
         if heartbeat:
             shared.policy_heartbeat_s.value = time.monotonic()
-        write_hand_cmd(shared, home_qpos)
+        if not write_hand_cmd(shared, home_qpos, safety_gate=safety_gate):
+            if verbose:
+                print("  hand: coordinated home command was rejected", flush=True)
+            return False, None
         hs = read_hand_state(shared)
         if hs is not None:
             current = np.asarray(hs["qpos"][0], dtype=np.float64)
@@ -441,7 +629,9 @@ def hand_home_converge(
                 if verbose and first:
                     print(f"  hand: homing... (max_err={np.rad2deg(err):.0f}°)", flush=True)
                     first = False
-        time.sleep(0.05)
+        # Allow the two-worker lead time plus one actuator tick before
+        # replacing the next latest-wins hand endpoint.
+        time.sleep(0.1)
 
     if verbose:
         print(f"  hand: home settle timeout after {timeout_s:.0f}s — proceeding", flush=True)
@@ -490,6 +680,9 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
         "last_cmd_apply_latency_s": float(data["last_cmd_apply_latency_s"][0]),
         "last_cmd_sdk_duration_s": float(data["last_cmd_sdk_duration_s"][0]),
         "last_cmd_is_hold": bool(data["last_cmd_is_hold"][0]),
+        "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
+        "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
+        "state_valid": bool(data["state_valid"][0]),
     }
 
 
@@ -510,27 +703,26 @@ def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
         "connected": bool(data["connected"][0]),
         "error_state": bool(data["error_state"][0]),
         "qpos_stale": bool(data["qpos_stale"][0]),
+        "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
+        "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
+        "state_valid": bool(data["state_valid"][0]),
+        "send_healthy": bool(data["send_healthy"][0]),
+        "read_healthy": bool(data["read_healthy"][0]),
     }
 
 
-def shutdown_processes(shared: "SharedStorage", procs: "list[mp.Process]") -> None:
-    """Graceful shutdown: is_running=False, join(5s), terminate stragglers, close shared.
+def shutdown_processes(
+    shared: "SharedStorage",
+    procs: "list[Any]",
+    *,
+    graceful_timeout_s: float = 5.0,
+) -> None:
+    """Compatibility wrapper for verified graceful→terminate→kill shutdown."""
+    from dexmani_real.runtime.processes import shutdown_processes_verified
 
-    Safe to call with an empty list (e.g. dry-run).
-    """
-    shared.is_running.value = False
-    _status: list[str] = []
-    for p in procs:
-        p.join(timeout=5)
-        if p.is_alive():
-            p.terminate()
-            p.join(timeout=1)
-            _status.append(f"{p.name}=term")
-        else:
-            _status.append(f"{p.name}=ok")
-    shared.close()
-    if _status:
-        print(f"  shutdown: {'  '.join(_status)}")
+    report = shutdown_processes_verified(shared, procs, graceful_timeout_s=graceful_timeout_s)
+    if report.exits:
+        print("  shutdown: " + "  ".join(f"{item.name}={item.escalation}:{item.exitcode}" for item in report.exits))
 
 
 def wait_for_arm_home(
@@ -856,8 +1048,10 @@ def run_supervisor(
     heartbeat_fields: "dict[str, Any]",
     *,
     status_interval_s: float = 30.0,
+    heartbeat_timeouts_s: "dict[str, float] | None" = None,
+    supervisor_hz: float | None = None,
 ) -> "tuple[str, bool]":
-    """Run the standard 10 Hz supervisor loop — monitors process health, error state, and heartbeats.
+    """Run the standard supervisor loop with resolved heartbeat settings.
 
     Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
     supervisor stopped; *normal_exit* is True for user-requested clean exits
@@ -870,52 +1064,50 @@ def run_supervisor(
 
     from dexmani_real.config.defaults import safety
     from dexmani_real.robot.safety import SafetyState, transition
+    from dexmani_real.runtime.processes import supervisor_exit_reason
+    from dexmani_real.runtime.status import ExitReason
 
     _start_time = _time.monotonic()
     _last_status_s = _start_time
     _exit_reason = "unknown"
     normal_exit = False
+    _supervisor_hz = float(safety.supervisor_hz if supervisor_hz is None else supervisor_hz)
+    if _supervisor_hz <= 0:
+        raise ValueError("supervisor_hz must be positive")
+    configured_timeouts = safety.heartbeat_timeouts if heartbeat_timeouts_s is None else heartbeat_timeouts_s
+    _timeouts = {name: float(configured_timeouts[name]) for name in heartbeat_fields}
+    if any(timeout <= 0 for timeout in _timeouts.values()):
+        raise ValueError("heartbeat timeouts must be positive")
 
     try:
         while True:
-            # 0. Normal exit — Policy set is_running=False (Q key).
-            if not shared.is_running.value:
-                normal_exit = True
-                _exit_reason = "is_running=False (Q key)"
+            _now = _time.monotonic()
+            _heartbeat_ages = {
+                name: (_now - float(value.value) if float(value.value) > 0 else float("inf"))
+                for name, value in heartbeat_fields.items()
+            }
+            _reason = supervisor_exit_reason(shared, procs, _heartbeat_ages, _timeouts)
+            if _reason is ExitReason.ESTOP:
+                _exit_reason = "e-stop requested"
+                transition(shared, SafetyState.FAULT)
                 break
-
-            # 1. Process aliveness.
-            for _p, _name in zip(procs, proc_names):
-                if not _p.is_alive():
-                    _exit_reason = f"process={_name} died"
-                    transition(shared, SafetyState.FAULT)
-                    break
-            if shared.safety_state.value == int(SafetyState.FAULT):
-                if shared.error_state.value:
-                    _exit_reason = "error_state set (subprocess)"
-                elif shared.estop_request.value:
-                    _exit_reason = "e-stop (subprocess)"
-                else:
-                    _exit_reason = "FAULT set by subprocess"
-                break
-
-            # 2. Error state (sticky latch from arm/hand).
-            if shared.error_state.value:
+            if _reason is ExitReason.STICKY_FAULT:
                 _exit_reason = "error_state set"
                 transition(shared, SafetyState.FAULT)
                 break
-
-            # 3. Heartbeat timeouts.
-            _now = _time.monotonic()
-            for _name in proc_names:
-                _last_hb = float(heartbeat_fields[_name].value)
-                _age_s = _now - _last_hb if _last_hb > 0 else float("inf")
-                _timeout_s = float(safety.heartbeat_timeouts[_name])
-                if _age_s > _timeout_s:
-                    _exit_reason = f"heartbeat={_name} timeout={_age_s:.1f}s>{_timeout_s:.1f}s"
-                    transition(shared, SafetyState.FAULT)
-                    break
-            if shared.safety_state.value == int(SafetyState.FAULT):
+            if _reason is ExitReason.WORKER_DEATH:
+                _dead_names = [process.name for process in procs if process.exitcode is not None]
+                _exit_reason = f"process died: {_dead_names}"
+                transition(shared, SafetyState.FAULT)
+                break
+            if _reason is ExitReason.HEARTBEAT_TIMEOUT:
+                _stale = [name for name, age in _heartbeat_ages.items() if age > _timeouts[name]]
+                _exit_reason = f"heartbeat timeout: {_stale}"
+                transition(shared, SafetyState.FAULT)
+                break
+            if _reason is ExitReason.EXPLICIT_QUIT:
+                normal_exit = True
+                _exit_reason = "explicit quit"
                 break
 
             # 4. Periodic status print.
@@ -929,7 +1121,7 @@ def run_supervisor(
                 )
                 _last_status_s = _now
 
-            _time.sleep(0.1)  # 10 Hz
+            _time.sleep(1.0 / _supervisor_hz)
 
     except KeyboardInterrupt:
         _exit_reason = "KeyboardInterrupt"
@@ -942,7 +1134,7 @@ def run_supervisor(
 def wait_subsystem_ready(
     shared: "SharedStorage",
     ready_checks: "list[tuple[str, Any, float]]",
-    procs: "list[mp.Process]",
+    procs: "list[Any]",
 ) -> bool:
     """Wait for each ``(name, event, timeout_s)`` ready event to be set.
 

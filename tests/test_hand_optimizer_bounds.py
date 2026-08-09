@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 
@@ -120,3 +122,26 @@ def test_xhand_feedback_stats_are_independent_from_command_clipping() -> None:
     assert limited[0] == pytest.approx(config.qpos_min[0])
     assert driver.last_joint_limit_clipped is False  # separate command-report tolerance
     assert driver.feedback_bound_stats["checks"] == 3  # commands are not feedback samples
+
+
+def test_xhand_rejects_invalid_action_without_calling_sdk() -> None:
+    driver = XHand(XHandConfig())
+    driver.control = Mock()
+    driver.hand_command = object()
+    driver.last_qpos_cmd = np.zeros(12)
+
+    assert not driver.send_action(np.full(12, np.nan))
+    assert not driver.send_action(np.zeros(11))
+    driver.control.send_command.assert_not_called()
+
+
+def test_xhand_tactile_startup_load_check_fails_closed() -> None:
+    driver = XHand(XHandConfig(tactile_contact_threshold=1.0))
+
+    assert driver._tactile_load_present(None)
+    assert driver._tactile_load_present(np.full((5, 3), np.nan))
+    assert driver._tactile_load_present(np.array([[2.0, 0.0, 0.0]] + [[0.0, 0.0, 0.0]] * 4))
+    assert not driver._tactile_load_present(np.zeros((5, 3)))
+
+    with pytest.raises(ValueError, match="tactile_contact_threshold"):
+        XHandConfig(tactile_contact_threshold=float("nan"))

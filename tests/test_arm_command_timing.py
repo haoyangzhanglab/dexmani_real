@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import multiprocessing as mp
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from unittest.mock import Mock
 
 import h5py
 import numpy as np
 import pytest
 
 from dexmani_real.config.defaults import KeyboardTeleopParams
+from dexmani_real.policy.action_protocol import ARM_COMMAND_DTYPE
 from dexmani_real.recording.episode_recorder import EpisodeRecorder
-from dexmani_real.robot.arm_loop import _parse_arm_action_metadata
+from dexmani_real.robot.arm_loop import ArmLoopConfig, _parse_arm_action_metadata, _recover_c24_measured_hold
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE, make_arm_action
+from dexmani_real.shm.shared_storage import ARM_STATE_DTYPE
 from dexmani_real.teleop.keyboard import (
     MotionActivityLatch,
     MotionTraceSample,
@@ -30,54 +30,26 @@ class _Keys:
         return key in self.pressed
 
 
-def _sequence_shared() -> SimpleNamespace:
-    return SimpleNamespace(arm_command_seq=mp.Value("Q", 0))
-
-
-def test_make_arm_action_allocates_sequence_timestamp_and_copy() -> None:
-    shared = _sequence_shared()
-    qpos = np.linspace(-0.3, 0.3, 7)
-    before_s = time.monotonic()
-
-    first = make_arm_action(shared, qpos)
-    second = make_arm_action(shared, qpos, is_hold=True)
-    after_s = time.monotonic()
-
-    assert first["command_seq"] == 1
-    assert second["command_seq"] == 2
-    assert before_s <= first["created_monotonic_s"] <= second["created_monotonic_s"] <= after_s
-    assert first["is_hold"] is False
-    assert second["is_hold"] is True
-    qpos[0] = 99.0
-    assert first["qpos"][0] != 99.0
-
-
-@pytest.mark.parametrize("qpos", [np.zeros(6), np.zeros(8), np.full(7, np.nan)])
-def test_make_arm_action_rejects_invalid_boundary_values(qpos: np.ndarray) -> None:
-    with pytest.raises(ValueError):
-        make_arm_action(_sequence_shared(), qpos)
-
-
-def test_arm_worker_metadata_parser_bounds_invalid_timestamps() -> None:
+def test_arm_worker_metadata_parser_accepts_only_fixed_command_frames() -> None:
     received_s = 123.0
-    assert _parse_arm_action_metadata(
-        {"command_seq": 7, "created_monotonic_s": 122.5, "is_hold": True}, received_s
-    ) == (7, 122.5, True)
-    assert _parse_arm_action_metadata({"command_seq": -4, "created_monotonic_s": received_s + 1.0}, received_s) == (
-        0,
-        received_s,
-        False,
-    )
-    assert _parse_arm_action_metadata({"command_seq": "bad", "created_monotonic_s": float("nan")}, received_s) == (
-        0,
-        received_s,
-        False,
-    )
+    frame = np.zeros(1, dtype=ARM_COMMAND_DTYPE)
+    frame["action_id"][0] = 7
+    frame["created_monotonic_ns"][0] = 122_500_000_000
+    frame["is_hold"][0] = 1
+    assert _parse_arm_action_metadata(frame, received_s) == (7, 122.5, True)
+    assert _parse_arm_action_metadata({"command_seq": 7}, received_s) == (0, received_s, False)
+
+
+def test_arm_worker_metadata_parser_bounds_invalid_fixed_timestamp() -> None:
+    received_s = 123.0
+    frame = np.zeros(1, dtype=ARM_COMMAND_DTYPE)
+    frame["action_id"][0] = 8
+    frame["created_monotonic_ns"][0] = 124_000_000_000
+    assert _parse_arm_action_metadata(frame, received_s) == (8, received_s, False)
 
 
 def test_arm_state_dtype_contains_end_to_end_timing_fields() -> None:
-    assert ARM_STATE_DTYPE.itemsize == 322
-    assert ARM_STATE_DTYPE.names[-9:] == (
+    assert ARM_STATE_DTYPE.names[-12:] == (
         "last_cmd_seq",
         "last_cmd_created_s",
         "last_cmd_received_s",
@@ -86,8 +58,43 @@ def test_arm_state_dtype_contains_end_to_end_timing_fields() -> None:
         "last_cmd_apply_latency_s",
         "last_cmd_sdk_duration_s",
         "last_cmd_is_hold",
+        "source_monotonic_ns",
+        "publish_monotonic_ns",
+        "state_valid",
         "timestamp",
     )
+
+
+def test_c24_recovery_sends_exactly_one_fresh_measured_hold() -> None:
+    arm = Mock()
+    arm.clean_error.return_value = 0
+    arm.clean_warn.return_value = 0
+    arm.set_mode.return_value = 0
+    arm.set_state.return_value = 0
+    arm.set_servo_angle.return_value = 0
+    measured = np.linspace(-0.3, 0.3, 7)
+    arm.get_joint_states.return_value = (0, [measured.copy()])
+
+    recovered = _recover_c24_measured_hold(arm, ArmLoopConfig())
+
+    np.testing.assert_allclose(recovered, measured)
+    arm.get_joint_states.assert_called_once_with(is_radian=True, num=1)
+    arm.set_servo_angle.assert_called_once()
+    np.testing.assert_allclose(arm.set_servo_angle.call_args.kwargs["angle"], measured)
+
+
+def test_c24_recovery_fails_before_sending_an_invalid_measurement() -> None:
+    arm = Mock()
+    arm.clean_error.return_value = 0
+    arm.clean_warn.return_value = 0
+    arm.set_mode.return_value = 0
+    arm.set_state.return_value = 0
+    arm.get_joint_states.return_value = (0, [np.full(7, np.nan)])
+
+    with pytest.raises(RuntimeError, match="measured hold is invalid"):
+        _recover_c24_measured_hold(arm, ArmLoopConfig())
+
+    arm.set_servo_angle.assert_not_called()
 
 
 def test_motion_latch_emits_one_release_edge() -> None:
@@ -253,7 +260,7 @@ def test_episode_recorder_persists_arm_command_timing(tmp_path: Path) -> None:
 
     with h5py.File(Path(episode_path) / "data.h5", "r") as h5_file:
         meta = h5_file["meta"].attrs
-        assert int(meta["schema_version"]) == 13
+        assert int(meta["schema_version"]) == 15
         assert float(meta["fps"]) == pytest.approx(16.0)
         assert float(meta["grid_dt_s"]) == pytest.approx(1.0 / 16.0)
         assert float(meta["grid_duration_s"]) == pytest.approx(0.0)

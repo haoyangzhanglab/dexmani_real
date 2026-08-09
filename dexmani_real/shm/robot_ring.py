@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import time
 from multiprocessing import shared_memory
+from typing import Any
 
 import numpy as np
 
@@ -134,6 +135,16 @@ class SeqlockRingBuffer(SharedMemoryRingBuffer):
             maxlen,
             self._total_size,
             create,
+        )
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Attach a spawn child and restore seqlock-only local caches."""
+        SeqlockRingBuffer.__init__(
+            self,
+            str(state["name"]),
+            np.dtype(state["dtype"]),
+            maxlen=int(state["maxlen"]),
+            create=False,
         )
 
     @classmethod

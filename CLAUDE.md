@@ -10,21 +10,24 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 
 | Task | Key File(s) |
 |------|------------|
-| **Main entry point** | `examples/real/vr_teleop_hand_record.py` (canonical, 5-process arch) |
+| **Main entry point** | `examples/real/vr_teleop_hand_record.py` (spawn-only canonical runtime) |
+| Learned policy entry | `examples/real/learned_policy_real.py` — manifest/hash validated, isolated inference, explicit B-to-run |
 | Keyboard teleop | `examples/real/keyboard_teleop_real.py` — optional XHand, SharedStorage, `defaults.keyboard_teleop` |
 | Camera calibration | `examples/real/calibrate_camera.py` — ArUco eye-to-hand, `CameraCalibConfig` |
-| Trajectory replay | `examples/real/replay_traj.py` — episode replay + consistency metrics |
+| Trajectory replay | `examples/real/replay_traj.py` — dry-run by default; certified v15 `sent`-stream live replay |
 | VR heading calib | `examples/real/calibrate_vr_heading.py` — one-shot T_vr_to_robot |
-| **Policy process** | `policy/vr_teleop_policy.py` — `policy_loop(shared, config)`, reads rings, writes actions, owns recording |
+| **Policy coordinator** | `policy/vr_teleop_policy.py` — owns grid/episode decisions and the only safe-command path |
+| Action protocol | `policy/action_protocol.py` — SafetyGate, prepare/commit, ACKs, chunk scheduler, epoch quiesce |
+| Optional inference | `policy/runtime.py`, `policy/inference_process.py`, `policy/tensor_block.py` — backend-neutral contracts and isolated worker |
 | Planner factory | `planning/planner.py` — `XArm7MotionPlanner.create_default()` canonical setup |
 | **SharedStorage (data plane)** | `shm/shared_storage.py` — all rings, queues, flags in one place |
 | Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical), Mode 6 |
 | Hand control | `robot/hand_process.py` — `hand_loop(shared)` (canonical) |
 | VR receiver | `sensor/vr_receiver_process.py` — `vr_loop(shared)` writes to `vr_ring` |
-| Camera | `sensor/camera_process.py` — independent process, unchanged |
+| Camera | `sensor/camera_process.py` — independent capture/pointcloud process with source-freshness metadata |
 | IK / retargeting | `planning/ik.py`, `planning/kinematics.py`, `teleop/arm_mapper.py`, `teleop/hand_retarget.py` |
 | Safety state machine | `robot/safety.py` — SafetyState enum (DISARMED/ARMED/RUNNING/FAULT) + transition helpers |
-| Recording format / lifecycle | `recording/episode_recorder.py` |
+| Recording format / lifecycle | `recording/io_process.py`, `recording/episode_recorder.py` — dedicated RecorderIO + schema v15 |
 | SHM primitives | `shm/ring_buffer.py` (CameraRingBuffer + SeqlockRingBuffer base), `shm/robot_ring.py` (SeqlockRingBuffer + `get_last_k(k)` multi-frame read) |
 | Core types | `robot/types.py` — RobotState, RobotAction + ArmState/HandState/HandTactile (doc-only dataclasses; authoritative format = `*_DTYPE` in `shm/shared_storage.py`) |
 | Episode tools (quality/viz) | `dexmani_real/tools/` — `episode_quality.py` (filter/health/assess/validate), `visualize_episode.py` (3D + tactile) |
@@ -34,42 +37,67 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 
 ## Architecture
 
-### 5-Process Model + Thin Main
+### Spawn-only capability process model + thin Main
 
 ```
-Main (~150 lines) — spawns 5 processes, monitors is_running
+Main — resolves immutable config, creates SharedStorage, spawns capabilities,
+supervises health, and performs verified shutdown
   │
   ├─ Camera (camera_loop) ──camera_ring──┐
   ├─ VR (vr_loop) ──────vr_ring─────┤
   │                               ▼
-  ├─ Policy (policy_loop) ──arm_action_q──→ Arm (arm_loop)
-  │                ──hand_cmd_ring─→ Hand (hand_loop)
+  ├─ PolicyCoordinator ──SafetyGate/prepare/commit──→ Arm + optional Hand
   │                ◄──arm_state_ring, hand_state_ring, hand_tactile_ring
-  │                owns EpisodeRecorder (single-clock recording)
+  │                ──bounded record_sample_ring──→ optional RecorderIO
   │
   ├─ Arm (arm_loop, Mode 6, 30Hz) — reads arm_action_q, servos xArm7, writes arm_state_ring
-  └─ Hand (hand_loop, 30Hz) — reads hand_cmd_ring, servos XHand, writes hand_state_ring + hand_tactile_ring
+  ├─ Hand (hand_loop, 30Hz) — reads prepared/committed endpoints, writes state/tactile/ACK
+  └─ RecorderIO (recording capability only) — writes, verifies, fsyncs, and atomically publishes episodes
 ```
+
+The learned-policy entry adds an isolated Inference worker and a two-slot
+seqlock tensor block. PolicyCoordinator alone reads SharedStorage, constructs
+causal 16 Hz snapshots, normalizes backend proposals into the current
+session/epoch/action-ID domain, and schedules prepare/commit work at 64 Hz.
+Model imports occur only in Inference after spawn; the ordinary VR entry never
+loads an unselected model. A camera clock reset increments the camera
+generation, forces RUNNING back to ARMED, invalidates the old policy epoch,
+performs a fresh backend warmup/finite-output check, and requires the operator
+to press B again; it is never treated as a seamless hot swap.
+
+An inference manifest names `backend_entrypoint` (`module:Class`), `actuators`,
+the 16 Hz `modalities`/history contract, the joint-position `action` contract,
+and every model/preprocessor resource as a relative path plus SHA-256. Startup
+fails while DISARMED on an unknown modality, hash mismatch, insufficient ring
+capacity or memory budget, warmup exception/NaN, invalid output shape, or a
+missed benchmark deadline. Camera payload publication is enabled only when a
+selected modality requests it. `camera_ready` is published only after the
+worker has captured and published one verified RGB-D frame (with either a valid
+point cloud or the configured invalid point-cloud placeholder).
 
 **Key principles (from ManiUniCon):**
 - Main does NOT touch data plane — only orchestrates
 - SharedStorage is the sole data plane — one class, all rings/queues/flags
 - Processes exchange structured data only — no Python objects, no RPC
-- Policy owns recording — single-process TimestampAlignedBuffer, natural alignment
+- Policy owns episode/grid/sample decisions; RecorderIO owns only serialization and transactional publication
+- Every process and multiprocessing primitive comes from `mp.get_context("spawn")`
 
 ### Data Flow
 
 ```
-VR Tracker → ArmWristMapper → EMA → WorkspaceClamp → solve_teleop_ik → DeltaClamp
+VR Tracker → ArmWristMapper → shortest-arc EMA → solve_teleop_ik → raw candidate
                                                                               │
                                                           ┌───────────────────┘
                                                           ▼
-                                         shared.arm_action_q.put(ArmAction)
-                                         shared.hand_cmd_ring.write(HandCmd)
+                       ActionSafetyGate (freshness/limits/delta/workspace/table/collision)
+                                                          ↓
+                          correlated arm+hand prepare → ACK → commit → apply ACK
 ```
 
-**Rates:** Policy loop 16 Hz. Arm/Hand servo loops 30 Hz. Normal teleoperation sends
-one target per policy tick and relies on Mode 6 firmware smoothing. Return-home
+**Rates:** Policy coordination (heartbeat, operator input, RecorderIO status) runs at
+64 Hz; causal observations, actions, and recording stay on the 16 Hz grid. Arm/Hand
+servo loops run at 30 Hz. Normal teleoperation sends one target per grid tick and
+relies on Mode 6 firmware smoothing. Return-home
 densely samples direct and staged joint-space candidates offline for collision
 validation, with a bounded MPlib joint-space fallback when those heuristics are
 blocked. It then temporarily switches to Mode 0 and sends only the validated
@@ -84,21 +112,25 @@ converges.
 | `arm_action_q` | mp.Queue(maxsize=2) | Policy → Arm | Ordered, bounded backpressure |
 | `arm_home_result_q` | mp.Queue(maxsize=2) | Arm → requester | Correlated `HomeResult` ACK; success/failure is never inferred from stale state |
 | `hand_cmd_ring` | SeqlockRingBuffer(8) | Policy → Hand | Latest-wins (position servo) |
+| `action_commit_ring` | SeqlockRingBuffer | Policy → Arm/Hand | Correlated commit after all enabled workers PREPARED |
+| `arm_ack_ring`, `hand_ack_ring` | SeqlockRingBuffer | Workers → Policy | RECEIVED/PREPARED/APPLIED/REJECTED/SDK_FAILED plus confirmed STOPPED |
 | `arm_state_ring` | SeqlockRingBuffer(8) | Arm → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~265B) |
 | `hand_state_ring` | SeqlockRingBuffer(8) | Hand → Policy | Read-latest; `get_last_k(k)` k-帧历史 (~472B, no tactile_force) |
-| `hand_tactile_ring` | SeqlockRingBuffer(8) | Hand → Policy | Sparse writes (~14.4KB, only on contact) |
+| `hand_tactile_ring` | SeqlockRingBuffer(8) | Hand → Policy | Every successful read, including release; freshness/calibration/unit metadata |
 | `vr_ring` | SeqlockRingBuffer(8) | VR → Policy | ~600B/frame |
-| `camera_ring` | CameraRingBuffer(5) | Camera → Policy | ~1.5MB/frame |
+| `camera_ring` | CameraRingBuffer(5) | Camera → Policy | Strict 640×480 RGB/depth + 2048×6 pointcloud; device/capture timestamps and validity |
+| `record_sample_ring` | SeqlockRingBuffer(4) | Policy → RecorderIO | Fixed camera/control payload; overflow aborts the episode |
 | `is_running` | mp.Value | Main → all | Sole writer: Main |
 | `is_recording` | mp.Value | Policy → Arm/Hand/Camera | Sole writer: Policy |
-| `error_state` | mp.Value | Arm/Hand → all | Sticky latch (set-only) |
+| `error_state` | mp.Value | Safety-critical workers → all | Sticky latch (set-only) |
 | `estop_request` | mp.Value | Policy → Arm/Hand | ESC key |
 | `safety_state` | mp.Value('i') | Main + Policy → all | SafetyState enum (0-3). Main: DISARMED↔ARMED, →FAULT. Policy: ARMED↔RUNNING |
 | `arm_heartbeat_s` | mp.Value('d') | Arm → Main | `time.monotonic()` per tick, timeout=1.0s |
 | `hand_heartbeat_s` | mp.Value('d') | Hand → Main | `time.monotonic()` per tick, timeout=1.0s |
 | `policy_heartbeat_s` | mp.Value('d') | Policy → Main | `time.monotonic()` per tick, timeout=1.0s |
 | `vr_heartbeat_s` | mp.Value('d') | VR → Main | `time.monotonic()` per event, timeout=5.0s |
-| `camera_heartbeat_s` | mp.Value('d') | Camera → Main | `time.monotonic()` per tick, timeout=2.0s |
+| `camera_heartbeat_s` | mp.Value('d') | Camera → Main | Worker-liveness heartbeat; source freshness comes from frame capture monotonic time |
+| `recorder_heartbeat_s` | mp.Value('d') | RecorderIO → Main | Writer-process liveness, distinct from episode health |
 
 ### Process Entries
 
@@ -107,6 +139,7 @@ converges.
 arm_loop(shared, config)    # robot/arm_loop.py — Mode 6 servo, FK, tracking error
 hand_loop(shared, config)   # robot/hand_process.py — XHand position servo, sets error_state
 policy_loop(shared, config) # policy/vr_teleop_policy.py — VR→IK + recording, sets is_recording
+recorder_io_loop(shared, config) # recording/io_process.py — HDF5/video transaction worker
 vr_loop(shared)             # sensor/vr_receiver_process.py — HTS TCP
 camera_loop(shared)         # Main — bridges frames from CameraSession → shared.camera_ring
 ```
@@ -124,7 +157,7 @@ camera_loop(shared)         # Main — bridges frames from CameraSession → sha
 ## Key Invariants
 
 1. **All cross-process data through SharedStorage** — never direct SDK calls across processes
-2. **Policy owns recording** — single-clock domain, natural (state, action, camera) alignment
+2. **Policy owns recording decisions/grid** — RecorderIO may write bytes but never chooses samples
 3. **Mode 6 handles trajectory** — do NOT interpolate arm commands (double-interpolation → overshoot)
 4. **Arm Queue (maxsize=2)** — bounded backpressure; Policy blocks if Arm falls behind
 5. **Hand Ring (latest-wins)** — position servo; old targets overwritten
@@ -153,7 +186,7 @@ DISARMED(0) --[Main: all ready]--> ARMED(1) --[Policy: B key]--> RUNNING(2)
 - **Main** owns: DISARMED↔ARMED, →FAULT, →DISARMED
 - **Policy** owns: ARMED↔RUNNING (teleop start/stop)
 - **Arm/Hand** read-only: gate servo on `safety_state in (ARMED, RUNNING)`
-- **5 process heartbeats** (`time.monotonic()` per tick) monitored by Main at 10Hz
+- **Enabled-capability heartbeats** (`time.monotonic()` per tick) monitored by Main at 10Hz
 - **Heartbeat timeouts** (from `config/defaults.py` `safety.heartbeat_timeouts`): arm/hand/policy=1.0s, vr=5.0s, camera=2.0s
 - **Existing bool flags preserved** (`is_running`, `error_state`, `estop_request`) — state machine is additive
 - **See**: `robot/safety.py` for SafetyState enum + transition validation
@@ -172,18 +205,18 @@ commands before they reach firmware; firmware remains the final safety backstop.
 
 1. **Arm-level:** NaN guard (protects `last_target`)
    + Mode 6 error handling (C22/C31 → immediate sticky FAULT; C24 has bounded
-   `clean_error+set_state+set_mode` recovery; repeated C24 failures → FAULT)
+   fresh-feedback measured-hold recovery; a second C24 in the bounded window → FAULT)
    + `except Exception` path also escalates to FAULT after `_RECOVERY_MAX` consecutive failures
-2. **Policy-level:** arm connected gate + NaN guard + workspace clamp + conservative
-   asynchronous arm-hand transition envelope + downward contact-stall pose resync
-   near the tabletop (context only; not a table exclusion zone) +
-   safety_state gate (ARMED required for B, FAULT blocks send) + hand_qpos_stale hold
+2. **Policy-level:** mandatory ActionSafetyGate applies finite/shape, freshness,
+   epoch/TTL, joint limits, dt-aware delta, workspace, table clearance, and a
+   conservative asynchronous arm-hand transition envelope before raw IPC; plus
+   safety-state gating and hand tracking-stall hold
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure + delta clamp
 4. **E-stop:** Policy sets `estop_request=True` → Arm/Hand detect flag → `set_state(4)`
 5. **Error state:** sticky latch (`error_state` mp.Value) — Arm/Hand set, Main detects → FAULT
 6. **FK zero-pose guard:** throttled warning on FK failure (code≠0 or exception) — consumers
    see zero EEF with log trail
-7. **Heartbeat supervisor:** Main monitors 5 process heartbeats at 10Hz → FAULT on timeout
+7. **Heartbeat supervisor:** Main monitors every enabled capability at 10Hz → FAULT on timeout
 8. **Safety state machine:** formal DISARMED/ARMED/RUNNING/FAULT states with validated
    transitions (Main owns DISARMED↔ARMED/→FAULT, Policy owns ARMED↔RUNNING)
 9. **Return-home:** the caller holding the collision planner densely validates
@@ -205,8 +238,8 @@ commands before they reach firmware; firmware remains the final safety backstop.
 ## Known Footguns
 
 - **C24 mid-motion**: ~~IK spike → hold-on-failure → ramp reset → overspeed trip~~ (fixed: hold-on-failure preserves last valid target)
-- **Frozen camera**: L515 mid-run silent stall ~35-60s; forward-fill masks it
-- **ENOSPC false positive**: Disk check races with async writer
+- **Frozen camera**: L515 may silently stall; v15 marks duplicate/old slots stale and discards the active episode after 2s without changing teleop safety state
+- **Camera writer failure**: queue saturation, codec crash, and ENOSPC are episode-fatal; only the temp directory is removed, never a partial published episode
 - **Velocity tuning ineffective**: Mode 6 bottleneck is acc/jerk, not velocity
 - **Arm Queue backpressure**: `maxsize=2` means Policy blocks if Arm falls >125ms behind — monitor with status print
 
@@ -214,7 +247,26 @@ commands before they reach firmware; firmware remains the final safety backstop.
 
 ## Recording Format
 
-HDF5 v13. All streams are grid-aligned (normally 16 Hz). Pipeline: `TimestampAlignedBuffer` → `EpisodeRecorder` (accumulate-then-dump, async writer). `flag_sample_valid` distinguishes source samples from grid back-fills. `/meta/fps` and `control_hz` denote the nominal grid rate; `duration` retains its legacy wall-clock meaning, while `wall_duration_s`, `grid_duration_s`, `grid_dt_s`, `non_sampled_duration_s`, and `wall_fps` make pauses and prompt gates explicit. Raw arm/hand targets and policy-stage timing datasets support latency diagnosis.
+HDF5 v15 is additive; the high-level reader keeps v12–v14 raw-readable but marks
+their semantic validity `UNKNOWN`. Training and live replay require `VALID` v15
+episodes. The pre-training validator and filter reject `UNKNOWN` by default;
+`--allow-legacy-offline` is limited to explicit migration/diagnostic work. Policy
+emits a fixed 16 Hz sample stream to the bounded RecorderIO
+ring; RecorderIO owns `data.h5`, `rgb.mp4`, `depth.h5`, and `pointcloud.h5`,
+drains and reopens every output, verifies all lengths/shapes/dtypes and decoded
+video length, fsyncs file and directory, then atomically renames the hidden temp
+directory. Overflow, codec, ENOSPC, or camera-source faults abort only the
+episode and leave teleoperation available.
+
+`source_sample_index`, `source_timestamp`, `fill_reason`, and validity flags make
+causal hold-last/leading placeholders explicit. Observation source/receive/
+publish times, age/skew/history masks, raw and safe actions, commit/ACK
+identities, tactile source time/freshness/calibration/unit, pointcloud
+source/padding statistics, the canonical resolved config, and hashed
+robot/device/calibration resources provide v15 provenance. Arm and hand workers
+publish canonical device-identity JSON from values already exposed by their
+SDK connection; missing vendor fields remain `unavailable` rather than being
+guessed. Old dataset meanings are unchanged.
 
 Key hand-related datasets in `data.h5` (full catalog: `episode_recorder.py:add_frame()`):
 - `hand_qpos` (T,12), `hand_fingertip` (T,5,3), `hand_contact` (T,5,3), `hand_tactile_force` (T,5,120,3), `hand_tactile_contact` (T,5)
@@ -224,7 +276,12 @@ Key hand-related datasets in `data.h5` (full catalog: `episode_recorder.py:add_f
 
 `episode_quality health` reports measured `hand_qpos` excursions outside the strict SDK command bounds. The independent `hand_feedback_bound_tolerance_rad` metadata/config value classifies sub-degree settling error without widening command or optimizer bounds. The XHand driver counts every finite 30 Hz feedback read, throttles only over-tolerance warnings, and logs the aggregate/per-joint totals at worker exit; the episode report computes the analogous statistics on valid recorded source frames.
 
-`hand_tactile_ring` publishes sparsely (contact-only); `hand_state_ring` publishes every tick (30 Hz).
+`hand_tactile_ring` publishes every successful device read, including release;
+`hand_state_ring` also publishes every tick (30 Hz).
+`hand.ethercat_slave_position=-1` means unverified/unknown: shutdown skips the
+vendor INIT request and relies on close plus watchdog. Configure a non-negative
+position only after an installation-specific hardware check; it is then covered
+by the resolved-config hash.
 
 ---
 
@@ -276,7 +333,7 @@ Key hand-related datasets in `data.h5` (full catalog: `episode_recorder.py:add_f
 
 ## Entry Points
 
-- **Primary**: `examples/real/vr_teleop_hand_record.py` — canonical 5-process entry, `--task`/`--operator`/`--acc`/`--speed`/`--no-hand`/`--config`/`--print-config`
+- **Primary**: `examples/real/vr_teleop_hand_record.py` — spawn-only VR runtime with camera, VR, policy, arm, optional hand, and optional RecorderIO; recording remains enabled by default and `--no-record` removes that process; `--task`/`--operator`/`--acc`/`--speed`/`--no-hand`/`--no-record`/`--config`/`--print-config`
 - **Keyboard teleop**: `examples/real/keyboard_teleop_real.py` — optional XHand, SharedStorage; 8 mm maximum translation step, continuous EMA state across key-release edges, no redundant release command in the ordered arm FIFO, and throttled/buffered `RELTRACE` pre/post-release motion diagnostics
 - **Camera calibration**: `examples/real/calibrate_camera.py` — ArUco eye-to-hand
 - **Trajectory replay**: `examples/real/replay_traj.py` — episode replay + consistency metrics
@@ -301,7 +358,15 @@ for strict startup, `--no-hand` to skip probing); `calibrate_camera.py` is
 arm-only. Both seed the collision model with configured open-hand geometry when
 measured hand state is unavailable. Canonical data collection remains fail-closed.
 
-**L515:** Direct motherboard USB 3.0 only (no hub; verify `lsusb -t`, 8086:0b64 under root hub). Depth intrinsics bad state: `hardware_reset()`. Mid-run stream stall ~35-60s. XU flaky: use `set_option` fallback.
+**L515:** The device is retired; librealsense 2.50.0 is the last project
+baseline known to support it. Do not blindly upgrade the SDK. Every v15 episode
+records the observed SDK/firmware, actual stream profile, alignment mode,
+intrinsics/distortion, depth scale, and encoding settings. Use a direct
+motherboard USB 3.0 connection (no hub; verify `lsusb -t`, 8086:0b64 under root
+hub) and verify the active profile is 640×480@30 Hz. Depth intrinsics bad state:
+`hardware_reset()`. XU is flaky, so use the existing `set_option` path. A source
+stall marks short gaps stale and discards the current recording after 2s;
+teleoperation remains RUNNING and no camera-only FAULT is raised.
 
 **Quest VR:** HTS TCP on port 8000. `adb reverse tcp:8000 tcp:8000` for USB. `vr_loop` handles coordinate conversion (Unity left-hand → FLU).
 
@@ -313,16 +378,16 @@ measured hand state is unavailable. Canonical data collection remains fail-close
 
 All items below are resolved — see git log for full history.
 
-- **P0**: Safety state machine (DISARMED/ARMED/RUNNING/FAULT) + 5-process heartbeats + Main supervisor
+- **P0**: Safety state machine (DISARMED/ARMED/RUNNING/FAULT) + capability heartbeats + Main supervisor
 - **P0**: `SeqlockRingBuffer.get_last_k(k)` multi-frame read + `read_arm_state_k`/`read_hand_state_k`
 - **P1**: Code dedup — `hand_home_converge()`, `_seed_hand_retargeter()`, shared ring helpers
 - **P1**: Episode quality toolkit — held-frame filter, tracking-error filter, health/validate/assess
 - **P2**: camera_loop extracted to `sensor/camera_process.py`
 - **P3-P7**: All entry points migrated to SharedStorage architecture; old entry points deleted
-- **Config**: `SharedStorageConfig` centralized; defaults.py frozen singletons + JSON override
+- **Config**: immutable `ResolvedRuntimeConfig`; `CLI > JSON > defaults`, canonical JSON + SHA-256
 - **Teleop**: Directory flattened (control/vr/core removed); dead code deleted (~690 lines)
 - **Robot**: `xarm7/` subpackage deleted; inner_loop→arm_loop rename; hand legacy classes removed
-- **Safety simplification**: Redundant gates removed (firmware is the backstop)
+- **Safety protocol**: mandatory geometry-aware ActionSafetyGate + correlated prepare/commit/ACK + epoch/TTL rejection
 - **Ultracode review**: 23 fixes (arm_loop FAULT escalation, NaN guards, camera metadata race, etc.)
 - **Code review rounds 1-2**: NameError fixes, CLI parameter plumbing, resource leak fixes, import cleanup
-- **Dead code**: `robot/interface.py`, `validate.py`, `preflight.py`, `arm_process.py`, `collision_config.py`, deprecation classes, unused imports — all removed
+- **Replay**: hash-bound preflight certificate and dry-run default; live replay requires v15 validity and the `sent` stream

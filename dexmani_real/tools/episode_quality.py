@@ -15,6 +15,8 @@ import json
 import os
 import shutil
 import sys
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,9 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.defaults import hand
-from dexmani_real.recording.episode_reader import EpisodeReader
+from dexmani_real.recording.episode_reader import EpisodeReader, ValidityState
+from dexmani_real.recording.transaction import atomic_publish
+from dexmani_real.recording.video_codec import VideoEncoder
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -242,6 +246,12 @@ class HealthReport:
     camera_dup_pct: dict[str, float] = field(default_factory=dict)
     camera_expected_baseline_pct: float = 0.0
     cam_frames_dropped: int = 0
+    camera_fresh_pct: float | None = None
+    camera_stale_frames: int = 0
+    camera_longest_stale_run: int = 0
+    camera_repeated_frame_numbers: int = 0
+    pointcloud_invalid_frames: int = 0
+    camera_writer_error: str = ""
     # Arm tracking
     tracking_p95_deg: float | None = None
     tracking_over_pct: float = 0.0
@@ -279,6 +289,12 @@ class HealthReport:
             "grid_fill_longest_run": self.grid_fill_longest_run,
             "camera_dup_pct": {k: round(v, 2) for k, v in self.camera_dup_pct.items()},
             "cam_frames_dropped": self.cam_frames_dropped,
+            "camera_fresh_pct": round(self.camera_fresh_pct, 2) if self.camera_fresh_pct is not None else None,
+            "camera_stale_frames": self.camera_stale_frames,
+            "camera_longest_stale_run": self.camera_longest_stale_run,
+            "camera_repeated_frame_numbers": self.camera_repeated_frame_numbers,
+            "pointcloud_invalid_frames": self.pointcloud_invalid_frames,
+            "camera_writer_error": self.camera_writer_error,
             "tracking_p95_deg": round(self.tracking_p95_deg, 2) if self.tracking_p95_deg is not None else None,
             "hand_tracking_p95_deg": (
                 round(self.hand_tracking_p95_deg, 2) if self.hand_tracking_p95_deg is not None else None
@@ -343,6 +359,8 @@ class FilterResult:
     dropped_safety_reject: int = 0
     dropped_retarget_fail: int = 0
     dropped_tracking_error: int = 0
+    dropped_camera_stale: int = 0
+    dropped_pointcloud_invalid: int = 0
 
     @property
     def keep_rate(self) -> float:
@@ -527,9 +545,14 @@ class EpisodeQuality:
             )
 
         # ── Camera content duplication ──
-        cam_keys = [k for k in self._h5f.keys() if k == "rgb" or k.endswith("_rgb")]
+        # v14 source frame numbers/freshness are authoritative and avoid a full
+        # video decode (static scenes can also look like content duplicates).
+        has_v14_camera_diagnostics = "flag_camera_fresh" in self._h5f and "camera_frame_number" in self._h5f
+        cam_keys = (
+            [] if has_v14_camera_diagnostics else [k for k in self._h5f.keys() if k == "rgb" or k.endswith("_rgb")]
+        )
         rgb_data = None
-        if not cam_keys:
+        if not has_v14_camera_diagnostics and not cam_keys:
             try:
                 if self._reader is None:
                     raise RuntimeError("EpisodeQualityChecker: _reader is None")
@@ -550,6 +573,39 @@ class EpisodeQuality:
         report.cam_frames_dropped = int(self._meta.get("cam_frames_dropped", 0) or 0)
         if report.cam_frames_dropped > 0:
             report.warnings.append(f"cam_frames_dropped={report.cam_frames_dropped} — writer thread queue drops")
+
+        # ── Schema v14 camera source/writer diagnostics ──
+        if "flag_camera_fresh" in self._h5f:
+            fresh = np.asarray(self._h5f["flag_camera_fresh"][: self._n_frames], dtype=bool)
+            stale = ~fresh
+            report.camera_fresh_pct = 100.0 * float(np.mean(fresh)) if fresh.size else 0.0
+            report.camera_stale_frames = int(np.sum(stale))
+            report.camera_longest_stale_run = max((length for _, length in _runs_of(stale)), default=0)
+            if report.camera_stale_frames:
+                report.warnings.append(
+                    f"camera stale/duplicate slots={report.camera_stale_frames} "
+                    f"(longest run={report.camera_longest_stale_run})"
+                )
+
+        if "camera_frame_number" in self._h5f:
+            frame_numbers = np.asarray(self._h5f["camera_frame_number"][: self._n_frames], dtype=np.uint64)
+            if frame_numbers.size >= 2:
+                repeated = (frame_numbers[1:] == frame_numbers[:-1]) & (frame_numbers[1:] > 0)
+                report.camera_repeated_frame_numbers = int(np.sum(repeated))
+                if report.camera_repeated_frame_numbers:
+                    report.warnings.append(
+                        f"camera repeated frame_number transitions={report.camera_repeated_frame_numbers}"
+                    )
+
+        if "flag_pointcloud_valid" in self._h5f:
+            pc_valid = np.asarray(self._h5f["flag_pointcloud_valid"][: self._n_frames], dtype=bool)
+            report.pointcloud_invalid_frames = int(np.sum(~pc_valid))
+            if report.pointcloud_invalid_frames:
+                report.warnings.append(f"pointcloud invalid slots={report.pointcloud_invalid_frames}")
+
+        report.camera_writer_error = str(self._meta.get("camera_writer_error", "") or "")
+        if report.camera_writer_error:
+            report.warnings.append(f"camera writer error: {report.camera_writer_error}")
 
         # ── Arm tracking error ──
         if "action_arm_joint" in self._h5f and "arm_qpos" in self._h5f:
@@ -710,9 +766,23 @@ class EpisodeQuality:
         self,
         min_frames: int = 50,
         variance_epsilon: float = 1e-8,
+        *,
+        allow_legacy_offline: bool = False,
     ) -> ValidationReport:
         """Pre-training automated quality checks (NaN, variance, camera, etc.)."""
         report = ValidationReport(episode_path=self._path)
+        if self._reader is None:
+            raise RuntimeError("EpisodeQuality must be entered before validation")
+        validity = self._reader.validity
+        report.checks.append(
+            {
+                "name": "schema_v15_semantic_validity",
+                "passed": validity is ValidityState.VALID,
+                "detail": validity.value,
+            }
+        )
+        if validity is not ValidityState.VALID and not allow_legacy_offline:
+            return report
         source_sample_mask = ~_grid_fill_mask(self._h5f, self._n_frames)
 
         # NaN checks
@@ -802,22 +872,76 @@ class EpisodeQuality:
                     }
                 )
 
-        # Camera freshness
-        try:
-            if self._reader is None:
-                raise RuntimeError("EpisodeQualityChecker: _reader is None")
-            rgb = self._reader.read_camera_all("rgb")
-            sample = rgb[: min(10, rgb.shape[0])]
-            all_zero = all(np.count_nonzero(frame) == 0 for frame in sample)
+        # Camera freshness: v14 flags are authoritative.  Older episodes keep
+        # the weak nonzero-content fallback for backward compatibility only.
+        if "flag_camera_fresh" in self._h5f:
+            fresh = np.asarray(self._h5f["flag_camera_fresh"][:], dtype=bool)
+            stale_count = int(np.sum(~fresh))
             report.checks.append(
                 {
                     "name": "camera_fresh",
-                    "passed": not all_zero,
-                    "detail": "Camera frames OK" if not all_zero else "All camera frames zero",
+                    "passed": fresh.shape == (self._n_frames,) and stale_count == 0,
+                    "detail": f"{stale_count}/{self._n_frames} stale or duplicate camera slots",
                 }
             )
-        except (KeyError, AttributeError):
-            pass
+        else:
+            try:
+                if self._reader is None:
+                    raise RuntimeError("EpisodeQualityChecker: _reader is None")
+                rgb = self._reader.read_camera_all("rgb")
+                sample = rgb[: min(10, rgb.shape[0])]
+                all_zero = all(np.count_nonzero(frame) == 0 for frame in sample)
+                report.checks.append(
+                    {
+                        "name": "camera_fresh_legacy_fallback",
+                        "passed": not all_zero,
+                        "detail": "Camera frames nonzero" if not all_zero else "All sampled camera frames zero",
+                    }
+                )
+            except (KeyError, AttributeError, RuntimeError, ValueError):
+                pass
+
+        if "flag_pointcloud_valid" in self._h5f:
+            valid = np.asarray(self._h5f["flag_pointcloud_valid"][:], dtype=bool)
+            invalid_count = int(np.sum(~valid))
+            report.checks.append(
+                {
+                    "name": "pointcloud_valid",
+                    "passed": valid.shape == (self._n_frames,) and invalid_count == 0,
+                    "detail": f"{invalid_count}/{self._n_frames} invalid pointcloud slots",
+                }
+            )
+
+        # All schema-v14 modalities must have exactly one row per control slot.
+        camera_lengths: dict[str, int] = {}
+        for key in ("depth", "pointcloud"):
+            if key in self._h5f:
+                camera_lengths[key] = int(self._h5f[key].shape[0])
+        try:
+            if self._reader is not None:
+                camera_lengths["rgb"] = int(self._reader.read_camera_all("rgb").shape[0])
+        except (KeyError, RuntimeError, ValueError, OSError):
+            if int(self._meta.get("schema_version", 0)) >= 14:
+                camera_lengths["rgb"] = -1
+        if camera_lengths:
+            bad = {key: length for key, length in camera_lengths.items() if length != self._n_frames}
+            report.checks.append(
+                {
+                    "name": "camera_stream_lengths",
+                    "passed": not bad,
+                    "detail": f"control={self._n_frames}, streams={camera_lengths}",
+                }
+            )
+
+        writer_error = str(self._meta.get("camera_writer_error", "") or "")
+        if int(self._meta.get("schema_version", 0)) >= 14:
+            report.checks.append(
+                {
+                    "name": "camera_writer_clean",
+                    "passed": not writer_error,
+                    "detail": writer_error or "No camera writer error",
+                }
+            )
 
         return report
 
@@ -829,6 +953,8 @@ class EpisodeQuality:
         drop_ik_fail: bool = False,
         drop_safety_reject: bool = False,
         drop_retarget_fail: bool = False,
+        drop_camera_stale: bool = True,
+        drop_invalid_pointcloud: bool = True,
         max_tracking_error: float | None = None,
     ) -> tuple[np.ndarray, dict[str, int]]:
         """Build boolean mask of frames to KEEP.
@@ -863,6 +989,16 @@ class EpisodeQuality:
             counts["tracking_error"] = int(np.sum(valid & (te > max_tracking_error)))
             mask &= ~(valid & (te > max_tracking_error))
 
+        if drop_camera_stale and "flag_camera_fresh" in self._h5f:
+            camera_fresh = np.asarray(self._h5f["flag_camera_fresh"][: self._n_frames], dtype=bool)
+            counts["camera_stale"] = int(np.sum(~camera_fresh))
+            mask &= camera_fresh
+
+        if drop_invalid_pointcloud and "flag_pointcloud_valid" in self._h5f:
+            pointcloud_valid = np.asarray(self._h5f["flag_pointcloud_valid"][: self._n_frames], dtype=bool)
+            counts["pointcloud_invalid"] = int(np.sum(~pointcloud_valid))
+            mask &= pointcloud_valid
+
         return mask, counts
 
     def filter(
@@ -874,7 +1010,10 @@ class EpisodeQuality:
         drop_ik_fail: bool = False,
         drop_safety_reject: bool = False,
         drop_retarget_fail: bool = False,
+        drop_camera_stale: bool = True,
+        drop_invalid_pointcloud: bool = True,
         max_tracking_error: float | None = None,
+        allow_legacy_offline: bool = False,
     ) -> FilterResult:
         """Filter frames and optionally write cleaned HDF5.
 
@@ -883,12 +1022,19 @@ class EpisodeQuality:
 
         Returns FilterResult with per-category drop counts.
         """
+        if self._reader is None:
+            raise RuntimeError("EpisodeQuality must be entered before filtering")
+        if not allow_legacy_offline:
+            self._reader.require_valid(purpose="episode filtering")
+
         if mask is None:
             mask, counts = self.build_filter_mask(
                 drop_held=drop_held,
                 drop_ik_fail=drop_ik_fail,
                 drop_safety_reject=drop_safety_reject,
                 drop_retarget_fail=drop_retarget_fail,
+                drop_camera_stale=drop_camera_stale,
+                drop_invalid_pointcloud=drop_invalid_pointcloud,
                 max_tracking_error=max_tracking_error,
             )
         else:
@@ -907,6 +1053,8 @@ class EpisodeQuality:
             dropped_safety_reject=counts.get("safety_reject", 0),
             dropped_retarget_fail=counts.get("retarget_fail", 0),
             dropped_tracking_error=counts.get("tracking_error", 0),
+            dropped_camera_stale=counts.get("camera_stale", 0),
+            dropped_pointcloud_invalid=counts.get("pointcloud_invalid", 0),
         )
 
         if output_dir is not None and kept > 0:
@@ -914,10 +1062,19 @@ class EpisodeQuality:
             out_dir = Path(output_dir)
             out_name = input_path.name
             out_path = out_dir / out_name
-
-            h5_path = input_path / "data.h5" if input_path.is_dir() else input_path
-            out_h5_path = out_path / "data.h5" if input_path.is_dir() else out_path.with_suffix(".h5")
-            out_h5_path.parent.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if input_path.is_dir():
+                if out_path.exists():
+                    raise FileExistsError(f"refusing to overwrite filtered episode: {out_path}")
+                temp_path = out_dir / f".tmp_filter_{out_name}_{uuid.uuid4().hex}"
+                temp_path.mkdir(exist_ok=False)
+                out_h5_path = temp_path / "data.h5"
+            else:
+                out_path = out_path.with_suffix(".h5")
+                if out_path.exists():
+                    raise FileExistsError(f"refusing to overwrite filtered episode: {out_path}")
+                temp_path = out_dir / f".{out_path.name}.tmp-{uuid.uuid4().hex}"
+                out_h5_path = temp_path
 
             # Collect time-series keys
             time_series_keys: list[str] = []
@@ -928,37 +1085,78 @@ class EpisodeQuality:
                 if isinstance(ds, h5py.Dataset) and ds.ndim >= 1 and ds.shape[0] == total:
                     time_series_keys.append(key)
 
-            with h5py.File(out_h5_path, "w") as out_f:
-                if "meta" in self._h5f:
-                    # MergedH5File.copy doesn't exist — copy attrs manually
-                    meta_src = self._h5f["meta"]
-                    out_meta = out_f.create_group("meta")
-                    for k, v in meta_src.attrs.items():
-                        out_meta.attrs[k] = v
-                for key in time_series_keys:
-                    data = np.asarray(self._h5f[key][:total])
-                    out_f.create_dataset(key, data=data[mask], compression="gzip", compression_opts=4)
-                if "meta" in out_f:
-                    out_meta = out_f["meta"].attrs
-                    out_meta["num_frames"] = kept
-                    out_meta["filter_original_frames"] = total
-                    out_meta["filter_kept_frames"] = kept
-                    if int(out_meta.get("schema_version", 0)) >= 13:
-                        filtered_ts = np.asarray(out_f["timestamp"][:], dtype=np.float64)
-                        finite_ts = filtered_ts[np.isfinite(filtered_ts)]
-                        grid_duration_s = float(finite_ts[-1] - finite_ts[0]) if finite_ts.size >= 2 else 0.0
-                        wall_duration_s = float(out_meta.get("wall_duration_s", out_meta.get("duration", 0.0)))
-                        out_meta["grid_duration_s"] = max(0.0, grid_duration_s)
-                        out_meta["non_sampled_duration_s"] = max(0.0, wall_duration_s - grid_duration_s)
-                        out_meta["wall_fps"] = kept / wall_duration_s if wall_duration_s > 0 else self._control_hz
+            try:
+                with h5py.File(out_h5_path, "w") as out_f:
+                    if "meta" in self._h5f:
+                        # MergedH5File.copy doesn't exist — copy attrs manually
+                        meta_src = self._h5f["meta"]
+                        out_meta = out_f.create_group("meta")
+                        for k, v in meta_src.attrs.items():
+                            out_meta.attrs[k] = v
+                    for key in time_series_keys:
+                        if input_path.is_dir() and key in ("depth", "pointcloud"):
+                            continue
+                        data = np.asarray(self._h5f[key][:total])
+                        out_f.create_dataset(key, data=data[mask], compression="gzip", compression_opts=4)
+                    if "meta" in out_f:
+                        out_meta = out_f["meta"].attrs
+                        out_meta["num_frames"] = kept
+                        out_meta["filter_original_frames"] = total
+                        out_meta["filter_kept_frames"] = kept
+                        if int(out_meta.get("schema_version", 0)) >= 13:
+                            filtered_ts = np.asarray(out_f["timestamp"][:], dtype=np.float64)
+                            finite_ts = filtered_ts[np.isfinite(filtered_ts)]
+                            grid_duration_s = float(finite_ts[-1] - finite_ts[0]) if finite_ts.size >= 2 else 0.0
+                            wall_duration_s = float(out_meta.get("wall_duration_s", out_meta.get("duration", 0.0)))
+                            out_meta["grid_duration_s"] = max(0.0, grid_duration_s)
+                            out_meta["non_sampled_duration_s"] = max(0.0, wall_duration_s - grid_duration_s)
+                            out_meta["wall_fps"] = kept / wall_duration_s if wall_duration_s > 0 else self._control_hz
+                        if int(out_meta.get("schema_version", 0)) >= 14:
+                            out_meta["camera_stream_frames"] = kept
 
-            if input_path.is_dir():
-                for sidecar in ("depth.h5", "rgb.mp4"):
-                    src = input_path / sidecar
-                    if src.exists():
-                        shutil.copy2(src, out_path / sidecar)
+                if input_path.is_dir():
+                    for key, filename in (("depth", "depth.h5"), ("pointcloud", "pointcloud.h5")):
+                        if key not in self._h5f:
+                            raise ValueError(f"input episode is missing required {key} modality")
+                        data = np.asarray(self._h5f[key][:total])
+                        with h5py.File(temp_path / filename, "w") as sidecar:
+                            sidecar.create_dataset(key, data=data[mask], compression="gzip", compression_opts=1)
 
-            result.output_path = str(out_h5_path)
+                    if self._reader is None:
+                        raise RuntimeError("EpisodeQuality reader is closed")
+                    rgb = self._reader.read_camera_all("rgb")
+                    if rgb.shape[0] != total:
+                        raise ValueError(f"RGB length {rgb.shape[0]} does not match control length {total}")
+                    if rgb.shape[0] > 0:
+                        height, width = rgb.shape[1:3]
+                        with VideoEncoder(
+                            temp_path / "rgb.mp4", fps=self._control_hz, width=width, height=height
+                        ) as enc:
+                            for frame in rgb[mask]:
+                                enc.write_frame(frame)
+                    with EpisodeReader(temp_path) as filtered_reader:
+                        lengths = {
+                            "control": int(filtered_reader.h5f["arm_qpos"].shape[0]),
+                            "depth": int(filtered_reader.h5f["depth"].shape[0]),
+                            "pointcloud": int(filtered_reader.h5f["pointcloud"].shape[0]),
+                            "rgb": int(filtered_reader.read_camera_all("rgb").shape[0]),
+                        }
+                    if any(length != kept for length in lengths.values()):
+                        raise RuntimeError(f"filtered modality length mismatch: {lengths}")
+                    atomic_publish(temp_path, out_path)
+                    result.output_path = str(out_path / "data.h5")
+                else:
+                    atomic_publish(temp_path, out_path)
+                    result.output_path = str(out_path)
+            except Exception:
+                if temp_path.is_dir():
+                    shutil.rmtree(temp_path, ignore_errors=True)
+                else:
+                    try:
+                        temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
 
         return result
 
@@ -1005,11 +1203,17 @@ def validate_episode(
     h5_path: str | Path,
     min_frames: int = 50,
     variance_epsilon: float = 1e-8,
+    *,
+    allow_legacy_offline: bool = False,
 ) -> ValidationReport | None:
     """Convenience wrapper: open+validate+close one episode."""
     try:
         with EpisodeQuality(h5_path) as eq:
-            return eq.validate(min_frames=min_frames, variance_epsilon=variance_epsilon)
+            return eq.validate(
+                min_frames=min_frames,
+                variance_epsilon=variance_epsilon,
+                allow_legacy_offline=allow_legacy_offline,
+            )
     except (OSError, RuntimeError) as e:
         logger.error("%s: failed to open: %s", h5_path, e)
         return None
@@ -1054,15 +1258,22 @@ def batch_health(
 
 
 def batch_validate(
-    paths: list[str | Path],
+    paths: Sequence[str | Path],
     min_frames: int = 50,
     variance_epsilon: float = 1e-8,
     verbose: bool = True,
+    *,
+    allow_legacy_offline: bool = False,
 ) -> list[ValidationReport]:
     """Validate multiple episodes."""
     reports: list[ValidationReport] = []
     for p in paths:
-        r = validate_episode(p, min_frames=min_frames, variance_epsilon=variance_epsilon)
+        r = validate_episode(
+            p,
+            min_frames=min_frames,
+            variance_epsilon=variance_epsilon,
+            allow_legacy_offline=allow_legacy_offline,
+        )
         if r is not None:
             reports.append(r)
             if verbose:
@@ -1141,6 +1352,13 @@ def print_health_report(report: HealthReport) -> None:
 
     for key, dup_pct in report.camera_dup_pct.items():
         print(f"  {key} content dup: {dup_pct:.1f}% " f"(expected baseline {report.camera_expected_baseline_pct:.0f}%)")
+
+    if report.camera_fresh_pct is not None:
+        print(
+            f"  camera fresh: {report.camera_fresh_pct:.1f}%  "
+            f"stale={report.camera_stale_frames}  repeated={report.camera_repeated_frame_numbers}  "
+            f"pointcloud_invalid={report.pointcloud_invalid_frames}"
+        )
 
     if report.tracking_p95_deg is not None:
         print(f"  tracking error p95: {report.tracking_p95_deg:.1f}°  >threshold: {report.tracking_over_pct:.1f}%")
@@ -1231,6 +1449,7 @@ def _cli_filter(args: argparse.Namespace) -> None:
         drop_safety_reject=args.drop_safety_reject,
         drop_retarget_fail=args.drop_retarget_fail,
         max_tracking_error=args.max_tracking_error,
+        allow_legacy_offline=args.allow_legacy_offline,
     )
     total_frames = sum(r.total_frames for r in results)
     total_kept = sum(r.kept_frames for r in results)
@@ -1313,13 +1532,21 @@ def _cli_health(args: argparse.Namespace) -> None:
 
 def _cli_validate(args: argparse.Namespace) -> None:
     data_dir = Path(args.data_dir)
-    h5_paths = sorted(data_dir.glob("episode_*.h5"))
-    if not h5_paths:
-        print(f"No episode_*.h5 files found in {data_dir}")
+    paths = sorted(
+        [path for path in data_dir.glob("episode_*") if _is_episode_dir(path)]
+        + [path for path in data_dir.glob("episode_*.h5") if _is_legacy_episode(path)]
+    )
+    if not paths:
+        print(f"No episode directories or episode_*.h5 files found in {data_dir}")
         sys.exit(1)
 
-    paths: list[str | Path] = [str(p) for p in h5_paths]
-    reports = batch_validate(paths, min_frames=args.min_frames, variance_epsilon=args.variance_epsilon, verbose=True)
+    reports = batch_validate(
+        paths,
+        min_frames=args.min_frames,
+        variance_epsilon=args.variance_epsilon,
+        verbose=True,
+        allow_legacy_offline=args.allow_legacy_offline,
+    )
 
     total_pass = sum(1 for r in reports if r.is_valid)
     print(f"\n{total_pass}/{len(reports)} episodes passed validation")
@@ -1347,6 +1574,11 @@ def main() -> None:
     fp.add_argument(
         "--max-tracking-error", type=float, default=None, help="Drop frames with tracking_error > THRESHOLD (rad)"
     )
+    fp.add_argument(
+        "--allow-legacy-offline",
+        action="store_true",
+        help="Explicitly allow UNKNOWN pre-v15 input for offline-only migration/filtering",
+    )
 
     ap = sub.add_parser("assess", help="Velocity-adaptive trajectory quality classification")
     ap.add_argument("h5_files", nargs="+", help="HDF5 episode files to assess")
@@ -1365,6 +1597,11 @@ def main() -> None:
     vp.add_argument("--min-frames", type=int, default=50)
     vp.add_argument("--variance-epsilon", type=float, default=1e-8)
     vp.add_argument("--output-json", type=str, default=None, help="Save validation report as JSON")
+    vp.add_argument(
+        "--allow-legacy-offline",
+        action="store_true",
+        help="Explicitly analyze UNKNOWN pre-v15 episodes for offline migration only",
+    )
 
     args = parser.parse_args()
 
