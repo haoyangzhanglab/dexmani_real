@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.defaults import hand
+from dexmani_real.ipc.schema import HAND_COMMAND_DTYPE, HAND_STATE_DTYPE, HAND_TACTILE_DTYPE
 from dexmani_real.policy.action_protocol import (
-    HAND_COMMAND_DTYPE,
     AckStatus,
     RejectReason,
     command_matches_commit,
@@ -118,6 +118,28 @@ class HandProcessConfig:
         )
 
 
+def _update_tracking_stall(
+    qpos: np.ndarray,
+    target: np.ndarray | None,
+    *,
+    active: bool,
+    previous_error_rad: float,
+    stale_frames: int,
+    progress_epsilon_rad: float,
+) -> tuple[int, float, bool]:
+    """Advance feedback-stall state without treating a settled hand as stale."""
+    if not active or target is None:
+        return 0, float("inf"), False
+    error_rad = float(np.max(np.abs(qpos - target)))
+    if error_rad <= progress_epsilon_rad:
+        return 0, error_rad, False
+    if np.isfinite(previous_error_rad) and previous_error_rad - error_rad > progress_epsilon_rad:
+        stale_frames = 0
+    else:
+        stale_frames += 1
+    return stale_frames, error_rad, True
+
+
 def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     """Hand process entry point — reads shared.hand_cmd_ring, servos hand.
 
@@ -126,8 +148,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     """
     from dexmani_real.robot.safety import SafetyState
     from dexmani_real.runtime.status import ComponentPhase, FaultCode
-    from dexmani_real.shm.shared_storage import HAND_STATE_DTYPE as _HS_STATE
-    from dexmani_real.shm.shared_storage import HAND_TACTILE_DTYPE as _HS_TACTILE
     from dexmani_real.shm.shared_storage import new_frame as _nf
     from dexmani_real.shm.shared_storage import publish_component_status
 
@@ -214,7 +234,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             logger.warning("hand_loop: cleanup after initial-state failure failed", exc_info=True)
         _mark_startup_failure()
         return
-    _frame0 = _nf(_HS_STATE)
+    _frame0 = _nf(HAND_STATE_DTYPE)
     _frame0["qpos"][0] = _init_qpos
     _frame0["current"][0] = np.zeros(12, dtype=np.float64)
     _frame0["tactile_sum"][0] = np.zeros((5, 3), dtype=np.float64)
@@ -257,7 +277,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # Qpos freshness detection (driver board lockout guard)
     _stale_frames = 0
     _last_fresh_qpos: np.ndarray | None = None
-    last_known_qpos: np.ndarray = np.zeros(12, dtype=np.float64)
+    last_known_qpos = _init_qpos.copy()
     _last_tactile_sum: np.ndarray = np.zeros((5, 3), dtype=np.float64)
     _last_tactile_force: np.ndarray = np.zeros((5, 120, 3), dtype=np.float64)
     _last_state_source_ns = _initial_source_ns
@@ -371,8 +391,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     shared.hand_ack_ring.write(
                         make_ack(execute_action, AckStatus.APPLIED, applied_monotonic_ns=time.monotonic_ns())
                     )
-                    if _tracking_target is None or np.max(np.abs(cmd - _tracking_target)) >= cfg.stale_qpos_delta_rad:
-                        _tracking_change_frames = cfg.stale_qpos_frame_limit
+                    target_changed = (
+                        _tracking_target is None or np.max(np.abs(cmd - _tracking_target)) >= cfg.stale_qpos_delta_rad
+                    )
+                    target_unmet = np.max(np.abs(last_known_qpos - cmd)) >= cfg.stale_qpos_delta_rad
+                    if target_changed or (_tracking_change_frames <= 0 and target_unmet):
+                        _tracking_change_frames = 1
+                        _tracking_prev_error = float(np.max(np.abs(last_known_qpos - cmd)))
+                        _stale_frames = 0
                     _tracking_target = cmd.copy()
                 else:
                     _send_error_counter.inc()
@@ -481,19 +507,17 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     _read_error_counter.max_consecutive,
                 )
 
-        # Tracking stall requires a changing target and no feedback progress;
-        # a stationary hand is healthy, not stale.
-        if not connected or _tracking_target is None or _tracking_change_frames <= 0:
-            _stale_frames = 0
-            _tracking_prev_error = float("inf")
-        else:
-            tracking_error = float(np.max(np.abs(qpos - _tracking_target)))
-            if _tracking_prev_error - tracking_error > cfg.stale_qpos_delta_rad:
-                _stale_frames = 0
-            else:
-                _stale_frames += 1
-            _tracking_prev_error = tracking_error
-            _tracking_change_frames -= 1
+        # Tracking stall requires an unmet target and no feedback progress;
+        # a stationary hand that has reached its target is healthy, not stale.
+        _stale_frames, _tracking_prev_error, tracking_active = _update_tracking_stall(
+            qpos,
+            _tracking_target,
+            active=connected and _tracking_change_frames > 0,
+            previous_error_rad=_tracking_prev_error,
+            stale_frames=_stale_frames,
+            progress_epsilon_rad=cfg.stale_qpos_delta_rad,
+        )
+        _tracking_change_frames = int(tracking_active)
         qpos_stale = _stale_frames >= cfg.stale_qpos_frame_limit
 
         # Error-state retry: hand comm errors are frequently intermittent and
@@ -525,7 +549,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             _error_state_counter.reset()
 
         # Publish state
-        frame = _nf(_HS_STATE)
+        frame = _nf(HAND_STATE_DTYPE)
         frame["qpos"][0] = qpos
         frame["current"][0] = current
         frame["tactile_sum"][0] = tactile_sum
@@ -546,7 +570,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
         # Every successful read is a source sample, including release/no-contact.
         if connected:
-            tf = _nf(_HS_TACTILE)
+            tf = _nf(HAND_TACTILE_DTYPE)
             tf["tactile_force"][0] = tactile_force
             tf["source_monotonic_ns"][0] = _last_state_source_ns
             tf["fresh"][0] = 1

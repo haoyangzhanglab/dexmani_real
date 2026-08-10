@@ -7,6 +7,16 @@ profile = "black"
 line_length = 120
 src_paths = ["dexmani_real"]
 
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# Keep Ruff complementary to Black and isort.  These rules catch syntax/name
+# errors plus a deliberately small set of exception, simplification, and
+# allocation mistakes without imposing repository-wide style churn.
+select = ["E9", "F63", "F7", "F82", "B012", "B017", "B904", "UP017", "SIM103", "PERF102"]
+
 [tool.mypy]
 python_version = "3.10"
 cache_dir = "/tmp/mypy_cache"

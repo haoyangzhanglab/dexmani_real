@@ -19,7 +19,7 @@ policy ──arm queue──> arm
    └──hand ring─────> hand
 
 arm/hand/camera/VR ──shared-memory state──> policy
-policy ──aligned samples──> HDF5 episode (schema v13)
+policy ──aligned samples──> HDF5 episode (schema v15)
 ```
 
 The thin main process only creates shared storage, starts workers, supervises
@@ -34,7 +34,9 @@ in the worker or domain module, not in the entry point.
 - `examples/real/calibrate_vr_heading.py`: VR-to-robot heading calibration.
 - `examples/real/replay_traj.py`: recorded-episode replay and consistency checks.
 - `dexmani_real/config/defaults.py`: source of truth for numeric defaults.
-- `dexmani_real/shm/shared_storage.py`: cross-process data plane, dtypes, queues,
+- `dexmani_real/ipc/schema.py`: dependency-neutral source of truth for every
+  cross-process NumPy dtype and fixed-size protocol payload.
+- `dexmani_real/shm/shared_storage.py`: cross-process data plane, ring/queue allocation,
   flags, readiness events, and supervisor helpers.
 - `dexmani_real/shm/ring_buffer.py`, `robot_ring.py`: seqlock ring primitives.
 - `dexmani_real/policy/vr_teleop_policy.py`: VR mapping, IK, command production,
@@ -43,7 +45,7 @@ in the worker or domain module, not in the entry point.
 - `dexmani_real/robot/hand_process.py`: XHand servo loop and hand state producer.
 - `dexmani_real/robot/safety.py`: `DISARMED/ARMED/RUNNING/FAULT` transitions.
 - `dexmani_real/planning/`: FK, IK, collision checking, pose and path utilities.
-- `dexmani_real/recording/`: timestamp alignment and HDF5 schema v13 I/O.
+- `dexmani_real/recording/`: timestamp alignment and HDF5 schema v15 I/O.
 - `dexmani_real/sensor/`: RealSense, point-cloud, and VR receiver processes.
 - `dexmani_real/teleop/`: arm mapping, hand retargeting, keyboard and audio UX.
 - `dexmani_real/tools/`: episode quality analysis and visualization CLIs.
@@ -110,8 +112,9 @@ Preserve these unless the user explicitly requests an architectural redesign:
    call one another or share live SDK objects.
 2. Only arm and hand worker processes import/use their respective vendor SDKs.
    Keep SDK imports lazy where needed so the main process can import offline.
-3. The policy process owns `EpisodeRecorder`, maintaining one clock domain for
-   state, action, VR, and camera alignment.
+3. Policy owns the episode/grid/sample decisions and one coordinator clock
+   domain for state, action, VR, and camera alignment. `RecorderIO` owns only
+   serialization, verification, and transactional publication.
 4. Policy recording is grid-aligned at `1 / control_hz` (normally 16 Hz). Do
    not replace this with arrival-time sampling.
 5. The arm action queue is ordered and bounded (`maxsize=2`); its backpressure
@@ -135,7 +138,7 @@ Preserve these unless the user explicitly requests an architectural redesign:
 
 Changes to shared formats have a wider blast radius than their defining file:
 
-- Arm/hand state field: update the dtype in `shared_storage.py`, documentation
+- Arm/hand state field: update the dtype in `ipc/schema.py`, documentation
   dataclass in `robot/types.py`, producer write, policy read, and recording path.
 - Ring or queue: update `SharedStorage` creation/cleanup, producer, consumer,
   readiness/heartbeat handling where applicable, and architecture docs.

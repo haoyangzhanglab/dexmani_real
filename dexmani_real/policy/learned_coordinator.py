@@ -344,23 +344,17 @@ class LearnedPolicyCoordinator:
             return None
 
         action_ids = self._allocate_action_ids(len(raw_steps))
-        lead_ns = int(float(self.shared.action_lead_time_s) * 1e9)
-        dt_ns = int(self.inference.action_spec.dt_s * 1e9)
         chunk_id = action_ids[0]
         normalized: list[ActionCandidate] = []
         for index, (raw, action_id) in enumerate(zip(raw_steps, action_ids)):
             if not self.config.hand_enabled and raw.hand_qpos is not None:
                 raise ValueError("backend produced a hand action while the hand capability is disabled")
-            target_ns = now_ns + lead_ns + index * dt_ns
             normalized.append(
                 replace(
                     raw,
                     session_generation=int(self.shared.session_generation.value),
                     policy_epoch=int(self.shared.policy_epoch.value),
                     action_id=action_id,
-                    created_monotonic_ns=now_ns,
-                    target_monotonic_ns=target_ns,
-                    valid_until_monotonic_ns=target_ns + dt_ns,
                     chunk_id=chunk_id,
                     step_index=index,
                 )

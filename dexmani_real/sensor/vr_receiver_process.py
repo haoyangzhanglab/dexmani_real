@@ -16,10 +16,28 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+_QUAT_NORM_EPS = 1e-12
+
 
 def xyzw_to_wxyz(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float, float]:
     """Convert xyzw quaternion to wxyz."""
     return (qw, qx, qy, qz)
+
+
+def _finite_vector(value: object, shape: tuple[int, ...], name: str) -> np.ndarray:
+    """Validate one converted SDK payload before cross-process publication."""
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != shape or not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must be a finite array with shape {shape}")
+    return array.copy()
+
+
+def _normalized_wxyz(value: object, name: str) -> np.ndarray:
+    quat = _finite_vector(value, (4,), name)
+    norm = float(np.linalg.norm(quat))
+    if norm < _QUAT_NORM_EPS:
+        raise ValueError(f"{name} norm is too small")
+    return quat / norm
 
 
 @dataclass
@@ -113,10 +131,13 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             logger.info("vr_loop: ready (first event received)")
 
         if isinstance(event, HeadFrame):
-            head_flu_pos = unity_left_to_flu_position(event.head.x, event.head.y, event.head.z)
-            head_flu_quat = unity_left_to_flu_rotation(event.head.qx, event.head.qy, event.head.qz, event.head.qw)
-            _latest_head_pos = np.asarray(head_flu_pos, dtype=np.float64)
-            _latest_head_quat_wxyz = np.asarray(xyzw_to_wxyz(*head_flu_quat), dtype=np.float64)
+            try:
+                head_flu_pos = unity_left_to_flu_position(event.head.x, event.head.y, event.head.z)
+                head_flu_quat = unity_left_to_flu_rotation(event.head.qx, event.head.qy, event.head.qz, event.head.qw)
+                _latest_head_pos = _finite_vector(head_flu_pos, (3,), "head_pos")
+                _latest_head_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(*head_flu_quat), "head_quat_wxyz")
+            except (ValueError, TypeError, AttributeError):
+                logger.warning("vr_loop: invalid head pose rejected", exc_info=True)
             continue
 
         if not isinstance(event, HandFrame):
@@ -131,13 +152,18 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             flu_pos = unity_left_to_flu_position(wrist.x, wrist.y, wrist.z)
             flu_quat = unity_left_to_flu_rotation(wrist.qx, wrist.qy, wrist.qz, wrist.qw)
 
-            frame = new_frame(dtype)
-            frame["wrist_pos"][0] = np.asarray(flu_pos, dtype=np.float64)
-            frame["wrist_quat_wxyz"][0] = np.asarray(xyzw_to_wxyz(*flu_quat), dtype=np.float64)
-            frame["landmarks"][0] = np.asarray(
+            wrist_pos = _finite_vector(flu_pos, (3,), "wrist_pos")
+            wrist_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(*flu_quat), "wrist_quat_wxyz")
+            landmarks = _finite_vector(
                 [unity_left_to_flu_position(*p) for p in event.landmarks.points],
-                dtype=np.float64,
-            ).reshape(21, 3)
+                (21, 3),
+                "landmarks",
+            )
+
+            frame = new_frame(dtype)
+            frame["wrist_pos"][0] = wrist_pos
+            frame["wrist_quat_wxyz"][0] = wrist_quat_wxyz
+            frame["landmarks"][0] = landmarks
             frame["head_pos"][0] = _latest_head_pos.copy()
             frame["head_quat_wxyz"][0] = _latest_head_quat_wxyz.copy()
             frame["recv_ts_ns"][0] = np.uint64(event.recv_ts_ns)

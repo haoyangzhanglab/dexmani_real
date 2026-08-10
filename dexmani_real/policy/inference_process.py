@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.ipc.schema import INFERENCE_CANDIDATE_DTYPE
 from dexmani_real.policy.runtime import (
     ActionCandidate,
     ActionChunk,
@@ -27,27 +28,6 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
-
-INFERENCE_CANDIDATE_DTYPE = np.dtype(
-    [
-        ("observation_id", "<u8"),
-        ("session_generation", "<u8"),
-        ("policy_epoch", "<u8"),
-        ("action_id", "<u8"),
-        ("chunk_id", "<u8"),
-        ("step_index", "<u4"),
-        ("chunk_length", "<u4"),
-        ("created_monotonic_ns", "<u8"),
-        ("target_monotonic_ns", "<u8"),
-        ("valid_until_monotonic_ns", "<u8"),
-        ("has_arm", "<u1"),
-        ("has_hand", "<u1"),
-        ("is_hold", "<u1"),
-        ("arm_qpos", "<f8", (7,)),
-        ("hand_qpos", "<f8", (12,)),
-    ],
-    align=True,
-)
 
 
 @dataclass(frozen=True)

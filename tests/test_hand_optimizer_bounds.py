@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -145,3 +145,29 @@ def test_xhand_tactile_startup_load_check_fails_closed() -> None:
 
     with pytest.raises(ValueError, match="tactile_contact_threshold"):
         XHandConfig(tactile_contact_threshold=float("nan"))
+
+
+def test_xhand_post_open_failure_always_enters_disconnect_cleanup() -> None:
+    with patch("dexmani_real.robot.xhand._SDK_AVAILABLE", True):
+        driver = XHand(XHandConfig())
+    driver._retry_open_device = Mock(return_value=True)  # type: ignore[method-assign]
+    driver.control = Mock()
+    driver.control.list_hands_id.side_effect = RuntimeError("enumeration failed after open")
+    driver.disconnect = Mock()  # type: ignore[method-assign]
+
+    assert not driver.connect()
+    driver.disconnect.assert_called_once()
+    assert driver.error_state
+
+
+def test_xhand_missing_sdk_is_fail_closed_unless_simulation_is_explicit() -> None:
+    with patch("dexmani_real.robot.xhand._SDK_AVAILABLE", False):
+        hardware = XHand(XHandConfig())
+        assert not hardware.connect()
+        assert hardware.error_state
+
+        simulation = XHand(XHandConfig(simulation_backend=True))
+        assert simulation.connect()
+        target = np.asarray(simulation.config.home_qpos, dtype=np.float64) + 0.01
+        assert simulation.send_action(target)
+        np.testing.assert_allclose(simulation.get_state()["qpos"], simulation.last_qpos_cmd)

@@ -174,11 +174,21 @@ class SharedObservationSource:
                 raise ValueError(f"unsupported observation modality {modality.name!r}")
         SnapshotBuilder.validate_ring_capacities(self.spec, capacities)
 
-    def _read_structured(self, modality: ModalitySpec) -> list[CausalFrame]:
+    @staticmethod
+    def _scan_count(modalities: list[ModalitySpec], maxlen: int) -> int:
+        """Bound a history scan when producer rates make the horizon explicit."""
+        if not modalities or any(modality.producer_hz is None for modality in modalities):
+            return int(maxlen)
+        return min(int(maxlen), max(modality.required_ring_capacity for modality in modalities))
+
+    def _read_structured(
+        self,
+        modality: ModalitySpec,
+        history: list[tuple[np.ndarray, int, int]],
+    ) -> list[CausalFrame]:
         source = _ROBOT_FIELDS[modality.name]
-        ring = getattr(self.shared, source.ring_name)
         frames: list[CausalFrame] = []
-        for data, ring_publish_ns, sequence in ring.get_last_k(ring.maxlen):
+        for data, ring_publish_ns, sequence in history:
             record = data[0]
             if not _source_frame_valid(source.ring_name, record):
                 continue
@@ -197,41 +207,64 @@ class SharedObservationSource:
             )
         return frames
 
-    def _read_camera(self, modality: ModalitySpec) -> list[CausalFrame]:
+    def _select_camera_metadata(
+        self,
+        modality: ModalitySpec,
+        metadata: list[tuple[np.ndarray, int, int]],
+        *,
+        anchor_monotonic_ns: int,
+        generation: int,
+    ) -> list[tuple[np.ndarray, int, int]]:
+        """Select causal header identities before copying any large payload."""
         payload_name = _CAMERA_MODALITIES[modality.name]
-        frames: list[CausalFrame] = []
-        for header, ring_publish_ns, sequence in self.shared.camera_ring.get_last_metadata(
-            self.shared.camera_ring.maxlen
-        ):
+        candidates: list[tuple[np.ndarray, int, int]] = []
+        for header, ring_publish_ns, sequence in metadata:
             record = header[0]
             source_ns = int(record["source_monotonic_ns"])
+            receive_ns = int(record["receive_monotonic_ns"])
             publish_ns = int(record["publish_monotonic_ns"]) or int(ring_publish_ns)
-            generation = int(record["camera_generation"])
-            if source_ns <= 0 or publish_ns < source_ns or bool(record["duplicate"]):
+            if (
+                source_ns <= 0
+                or not source_ns <= receive_ns <= publish_ns
+                or bool(record["duplicate"])
+                or int(record["camera_generation"]) != generation
+            ):
                 continue
             if payload_name == "pointcloud" and not bool(record["pointcloud_valid"]):
                 continue
-            payload = self.shared.camera_ring.read_sequence(int(sequence), modalities=(payload_name,))
-            if payload is None:
-                continue
-            frames.append(
-                CausalFrame(
-                    value=payload[payload_name],
-                    sequence=int(sequence),
-                    source_monotonic_ns=source_ns,
-                    publish_monotonic_ns=publish_ns,
-                    receive_monotonic_ns=int(record["receive_monotonic_ns"]),
-                    generation=generation,
-                )
-            )
-        return frames
+            candidates.append((header, ring_publish_ns, int(sequence)))
 
-    def _camera_generation_at(self, anchor_monotonic_ns: int) -> int:
+        candidates.sort(key=lambda item: (int(item[0]["source_monotonic_ns"][0]), item[2]))
+        selected: list[tuple[np.ndarray, int, int]] = []
+        used_sequences: set[int] = set()
+        dt_ns = int(round(1e9 / self.spec.control_hz))
+        for history_index in reversed(range(modality.history_length)):
+            target_ns = anchor_monotonic_ns - (modality.history_length - 1 - history_index) * dt_ns
+            causal = [
+                item
+                for item in candidates
+                if int(item[0]["source_monotonic_ns"][0]) <= target_ns
+                and int(item[0]["receive_monotonic_ns"][0]) <= target_ns
+                and (int(item[0]["publish_monotonic_ns"][0]) or int(item[1])) <= target_ns
+                and item[2] not in used_sequences
+            ]
+            if not causal:
+                continue
+            chosen = causal[-1]
+            if target_ns - int(chosen[0]["source_monotonic_ns"][0]) > int(modality.max_age_s * 1e9):
+                continue
+            selected.append(chosen)
+            used_sequences.add(chosen[2])
+        return selected
+
+    def _camera_generation_at(
+        self,
+        anchor_monotonic_ns: int,
+        metadata: list[tuple[np.ndarray, int, int]],
+    ) -> int:
         """Return the newest generation with metadata causal to this anchor."""
         generation = self._builder.camera_generation
-        for header, ring_publish_ns, _sequence in self.shared.camera_ring.get_last_metadata(
-            self.shared.camera_ring.maxlen
-        ):
+        for header, ring_publish_ns, _sequence in metadata:
             record = header[0]
             source_ns = int(record["source_monotonic_ns"])
             receive_ns = int(record["receive_monotonic_ns"])
@@ -244,19 +277,82 @@ class SharedObservationSource:
                 generation = max(generation, int(record["camera_generation"]))
         return generation
 
+    def _read_selected_camera(
+        self,
+        modalities: list[ModalitySpec],
+        metadata: list[tuple[np.ndarray, int, int]],
+        *,
+        anchor_monotonic_ns: int,
+        generation: int,
+    ) -> dict[str, list[CausalFrame]]:
+        selected = {
+            modality.name: self._select_camera_metadata(
+                modality,
+                metadata,
+                anchor_monotonic_ns=anchor_monotonic_ns,
+                generation=generation,
+            )
+            for modality in modalities
+        }
+        modalities_by_sequence: dict[int, set[str]] = {}
+        for modality in modalities:
+            payload_name = _CAMERA_MODALITIES[modality.name]
+            for _header, _publish_ns, sequence in selected[modality.name]:
+                modalities_by_sequence.setdefault(sequence, set()).add(payload_name)
+
+        payloads = {
+            sequence: self.shared.camera_ring.read_sequence(
+                sequence,
+                modalities=tuple(sorted(payload_names)),
+            )
+            for sequence, payload_names in modalities_by_sequence.items()
+        }
+        frames: dict[str, list[CausalFrame]] = {modality.name: [] for modality in modalities}
+        for modality in modalities:
+            payload_name = _CAMERA_MODALITIES[modality.name]
+            for header, ring_publish_ns, sequence in selected[modality.name]:
+                payload = payloads.get(sequence)
+                if payload is None or payload_name not in payload:
+                    continue
+                record = header[0]
+                frames[modality.name].append(
+                    CausalFrame(
+                        value=payload[payload_name],
+                        sequence=sequence,
+                        source_monotonic_ns=int(record["source_monotonic_ns"]),
+                        publish_monotonic_ns=int(record["publish_monotonic_ns"]) or int(ring_publish_ns),
+                        receive_monotonic_ns=int(record["receive_monotonic_ns"]),
+                        generation=generation,
+                    )
+                )
+        return frames
+
     def build(self, *, anchor_monotonic_ns: int) -> ObservationSnapshot:
         frames: dict[str, list[CausalFrame]] = {}
-        camera_generation = (
-            self._camera_generation_at(anchor_monotonic_ns)
-            if any(modality.name in _CAMERA_MODALITIES for modality in self.spec.modalities)
-            else self._builder.camera_generation
-        )
+        camera_modalities = [modality for modality in self.spec.modalities if modality.name in _CAMERA_MODALITIES]
+        camera_metadata: list[tuple[np.ndarray, int, int]] = []
+        camera_generation = self._builder.camera_generation
+        if camera_modalities:
+            camera_scan_count = self._scan_count(camera_modalities, self.shared.camera_ring.maxlen)
+            camera_metadata = self.shared.camera_ring.get_last_metadata(camera_scan_count)
+            camera_generation = self._camera_generation_at(anchor_monotonic_ns, camera_metadata)
+            frames.update(
+                self._read_selected_camera(
+                    camera_modalities,
+                    camera_metadata,
+                    anchor_monotonic_ns=anchor_monotonic_ns,
+                    generation=camera_generation,
+                )
+            )
+
+        structured_by_ring: dict[str, list[ModalitySpec]] = {}
         for modality in self.spec.modalities:
-            if modality.name in _CAMERA_MODALITIES:
-                modality_frames = self._read_camera(modality)
-                modality_frames = [frame for frame in modality_frames if frame.generation == camera_generation]
-                frames[modality.name] = modality_frames
-            else:
-                frames[modality.name] = self._read_structured(modality)
+            if modality.name in _ROBOT_FIELDS:
+                structured_by_ring.setdefault(_ROBOT_FIELDS[modality.name].ring_name, []).append(modality)
+        for ring_name, modalities in structured_by_ring.items():
+            ring = getattr(self.shared, ring_name)
+            history = ring.get_last_k(self._scan_count(modalities, ring.maxlen))
+            for modality in modalities:
+                frames[modality.name] = self._read_structured(modality, history)
         self._builder.camera_generation = camera_generation
         return self._builder.build(anchor_monotonic_ns=anchor_monotonic_ns, frames=frames)

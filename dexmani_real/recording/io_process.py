@@ -18,6 +18,14 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.ipc.schema import (
+    RECORD_CONTROL_DTYPE,
+    RECORD_CONTROL_JSON_BYTES,
+    RECORD_SAMPLE_JSON_BYTES,
+    RECORD_STATUS_DTYPE,
+    RECORD_STATUS_TEXT_BYTES,
+    make_record_sample_dtype,
+)
 from dexmani_real.recording.camera_stream_writer import CameraStreamWriterConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder, StopResult
 from dexmani_real.robot.types import RobotAction, RobotState
@@ -26,9 +34,9 @@ from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
 
-CONTROL_JSON_BYTES = 65_536
-SAMPLE_JSON_BYTES = 32_768
-STATUS_TEXT_BYTES = 2_048
+CONTROL_JSON_BYTES = RECORD_CONTROL_JSON_BYTES
+SAMPLE_JSON_BYTES = RECORD_SAMPLE_JSON_BYTES
+STATUS_TEXT_BYTES = RECORD_STATUS_TEXT_BYTES
 
 
 class RecorderCommand(IntEnum):
@@ -44,90 +52,6 @@ class RecorderPhase(IntEnum):
     COMPLETED = 4
     ERROR = 5
     STOPPED = 6
-
-
-RECORD_CONTROL_DTYPE = np.dtype(
-    [
-        ("command", "<u1"),
-        ("generation", "<u8"),
-        ("save", "<u1"),
-        ("created_monotonic_ns", "<u8"),
-        ("json_length", "<u4"),
-        ("json_crc32", "<u4"),
-        ("json_payload", f"S{CONTROL_JSON_BYTES}"),
-    ],
-    align=True,
-)
-
-RECORD_STATUS_DTYPE = np.dtype(
-    [
-        ("phase", "<u1"),
-        ("saved", "<u1"),
-        ("generation", "<u8"),
-        ("frame_count", "<u8"),
-        ("updated_monotonic_ns", "<u8"),
-        ("error_length", "<u4"),
-        ("error", f"S{STATUS_TEXT_BYTES}"),
-        ("path_length", "<u4"),
-        ("path", f"S{STATUS_TEXT_BYTES}"),
-    ],
-    align=True,
-)
-
-
-def make_record_sample_dtype(
-    rgb_shape: tuple[int, int, int],
-    depth_shape: tuple[int, int],
-    pointcloud_shape: tuple[int, int],
-) -> np.dtype:
-    """Return the fixed cross-process sample contract for configured shapes."""
-    return np.dtype(
-        [
-            ("generation", "<u8"),
-            ("sample_sequence", "<u8"),
-            ("arm_qpos", "<f8", (7,)),
-            ("arm_qvel", "<f8", (7,)),
-            ("arm_tau", "<f8", (7,)),
-            ("eef_pos", "<f8", (3,)),
-            ("eef_quat_wxyz", "<f8", (4,)),
-            ("eef_rot6d", "<f8", (6,)),
-            ("hand_qpos", "<f8", (12,)),
-            ("hand_current", "<f8", (12,)),
-            ("hand_tactile_sum", "<f8", (5, 3)),
-            ("hand_tactile_force", "<f8", (5, 120, 3)),
-            ("hand_tactile_contact", "<u1", (5,)),
-            ("hand_tipboard_err", "<i4", (12,)),
-            ("hand_commboard_err", "<i4", (12,)),
-            ("hand_jointboard_err", "<i4", (12,)),
-            ("hand_qpos_stale", "<u1"),
-            ("fingertip_pos", "<f8", (5, 3)),
-            ("arm_connected", "<u1"),
-            ("hand_connected", "<u1"),
-            ("state_timestamp", "<f8"),
-            ("hand_error_state", "<u1"),
-            ("arm_last_cmd_seq", "<u8"),
-            ("arm_last_cmd_queue_latency_s", "<f8"),
-            ("arm_last_cmd_apply_latency_s", "<f8"),
-            ("arm_last_cmd_sdk_duration_s", "<f8"),
-            ("arm_last_cmd_is_hold", "<u1"),
-            ("action_arm_qpos", "<f8", (7,)),
-            ("action_hand_qpos", "<f8", (12,)),
-            ("action_target_eef_pos", "<f8", (3,)),
-            ("action_target_eef_rot6d", "<f8", (6,)),
-            ("vr_wrist_pos", "<f8", (3,)),
-            ("vr_wrist_quat_wxyz", "<f8", (4,)),
-            ("vr_landmarks", "<f8", (21, 3)),
-            ("vr_head_quat_wxyz", "<f8", (4,)),
-            ("camera_present", "<u1"),
-            ("camera_rgb", "<u1", rgb_shape),
-            ("camera_depth", "<u2", depth_shape),
-            ("camera_pointcloud", "<f4", pointcloud_shape),
-            ("json_length", "<u4"),
-            ("json_crc32", "<u4"),
-            ("json_payload", f"S{SAMPLE_JSON_BYTES}"),
-        ],
-        align=True,
-    )
 
 
 @dataclass(frozen=True)

@@ -25,6 +25,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
 from dexmani_real.utils.log import get_logger
 
 # ---------------------------------------------------------------------------
@@ -732,36 +733,3 @@ class CameraRingBuffer:
 
     def _write_idx_view(self) -> np.ndarray:
         return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
-
-
-# Camera frame header dtype
-CAMERA_FRAME_HEADER_DTYPE = np.dtype(
-    [
-        ("timestamp", "<f8"),  # RealSense device timestamp (seconds)
-        ("capture_monotonic_s", "<f8"),
-        ("source_monotonic_ns", "<u8"),
-        ("receive_monotonic_ns", "<u8"),
-        ("publish_monotonic_ns", "<u8"),
-        ("camera_generation", "<u8"),
-        ("frame_number", "<u8"),
-        ("frame_gap", "<u4"),
-        ("clock_reset", "<u1"),
-        ("duplicate", "<u1"),
-        ("backlog_s", "<f8"),
-        ("rgb_size", "<u8"),
-        ("depth_size", "<u8"),
-        ("rgb_shape_h", "<u4"),
-        ("rgb_shape_w", "<u4"),
-        ("rgb_shape_c", "<u4"),
-        ("depth_shape_h", "<u4"),
-        ("depth_shape_w", "<u4"),
-        ("pc_num_points", "<u4"),
-        ("pc_source_point_count", "<u4"),
-        ("pc_valid_depth_ratio", "<f4"),
-        ("pc_padding_count", "<u4"),
-        ("camera_health", "<u1"),
-        ("pointcloud_valid", "<u1"),
-        ("pad", "<u1", (4,)),
-    ],
-    align=True,
-)

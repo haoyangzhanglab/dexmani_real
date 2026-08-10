@@ -23,11 +23,13 @@ from dexmani_real.policy.action_protocol import (
     RejectReason,
     SafeCommandPublisher,
     command_matches_commit,
+    hand_home_converge,
     make_ack,
     make_command_frame,
     make_stopped_ack,
     publish_joint_targets,
     validate_worker_command,
+    write_hand_cmd,
 )
 from dexmani_real.policy.inference_process import InferenceConfig, encode_candidate
 from dexmani_real.policy.learned_coordinator import CoordinatorTick, LearnedCoordinatorConfig, LearnedPolicyCoordinator
@@ -44,9 +46,14 @@ from dexmani_real.policy.runtime import (
 from dexmani_real.policy.tensor_block import ObservationTensorBlock
 from dexmani_real.policy.vr_teleop_policy import (
     PolicyConfig,
+    _advance_policy_epoch,
+    _candidate_application_state,
+    _feedback_after_hold,
     _matching_source_sequence,
     _read_causal_structured_frame,
     _recording_provenance,
+    _reset_mapper_from_frames,
+    _vr_after_hold,
 )
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig
@@ -61,6 +68,7 @@ from dexmani_real.shm.shared_storage import (
     SharedStorageConfig,
     new_frame,
 )
+from dexmani_real.teleop.arm_mapper import ArmWristMapper
 
 
 def _candidate(*, now_ns: int, action_id: int = 1, epoch: int = 3, step_index: int = 0) -> ActionCandidate:
@@ -99,6 +107,100 @@ def _gate(*, geometry: bool = False) -> ActionSafetyGate:
         transition_collision_check=(lambda _a, _b, _c, _d: True) if geometry else None,
         table_clearance_check=(lambda _a, _b, _c, _d: True) if geometry else None,
     )
+
+
+def test_hold_epoch_invalidation_and_exact_applied_ack_contract() -> None:
+    now_ns = time.monotonic_ns()
+    candidate = _candidate(now_ns=now_ns, epoch=4)
+    old_command = make_command_frame(_candidate(now_ns=now_ns, epoch=3), actuator="arm")
+    shared = SimpleNamespace(
+        policy_epoch=SimpleNamespace(value=3),
+        arm_ack_ring=Mock(),
+        hand_ack_ring=Mock(),
+    )
+
+    assert _advance_policy_epoch(shared) == 4
+    assert (
+        validate_worker_command(
+            old_command,
+            dtype=ARM_COMMAND_DTYPE,
+            expected_session_generation=7,
+            minimum_policy_epoch=shared.policy_epoch.value,
+            last_action_id=0,
+            now_monotonic_ns=now_ns,
+            joint_lower_rad=np.full(7, -1.0),
+            joint_upper_rad=np.full(7, 1.0),
+        )
+        is RejectReason.OLD_EPOCH
+    )
+
+    arm_command = make_command_frame(candidate, actuator="arm")
+    hand_command = make_command_frame(candidate, actuator="hand")
+    shared.arm_ack_ring.read_latest.return_value = (
+        make_ack(arm_command, AckStatus.APPLIED, applied_monotonic_ns=now_ns),
+        0,
+        1,
+    )
+    shared.hand_ack_ring.read_latest.return_value = (make_ack(hand_command, AckStatus.PREPARED), 0, 1)
+    assert _candidate_application_state(shared, candidate) == "pending"
+
+    shared.hand_ack_ring.read_latest.return_value = (
+        make_ack(hand_command, AckStatus.APPLIED, applied_monotonic_ns=now_ns + 1),
+        0,
+        2,
+    )
+    assert _candidate_application_state(shared, candidate) == "applied"
+
+    stale_hand = make_command_frame(_candidate(now_ns=now_ns, action_id=2, epoch=4), actuator="hand")
+    shared.hand_ack_ring.read_latest.return_value = (
+        make_ack(stale_hand, AckStatus.APPLIED, applied_monotonic_ns=now_ns + 2),
+        0,
+        3,
+    )
+    assert _candidate_application_state(shared, candidate) == "pending"
+
+    shared.hand_ack_ring.read_latest.return_value = (
+        make_ack(hand_command, AckStatus.REJECTED, reject_reason=RejectReason.EXPIRED),
+        0,
+        4,
+    )
+    assert _candidate_application_state(shared, candidate) == "failed"
+
+    arm_feedback = new_frame(ARM_STATE_DTYPE)
+    hand_feedback = new_frame(HAND_STATE_DTYPE)
+    arm_feedback["source_monotonic_ns"][0] = now_ns + 2
+    hand_feedback["source_monotonic_ns"][0] = now_ns + 2
+    assert _feedback_after_hold(arm_feedback, hand_feedback, candidate, now_ns + 1)
+    hand_feedback["source_monotonic_ns"][0] = now_ns
+    assert not _feedback_after_hold(arm_feedback, hand_feedback, candidate, now_ns + 1)
+    assert not _vr_after_hold({"local_recv_ns": now_ns}, now_ns + 1)
+    assert _vr_after_hold({"local_recv_ns": now_ns + 2}, now_ns + 1)
+
+
+def test_mapper_reanchor_uses_current_frames_and_invalid_state_clears_anchor() -> None:
+    mapper = ArmWristMapper()
+    arm_frame = new_frame(ARM_STATE_DTYPE)
+    arm_frame["connected"][0] = 1
+    arm_frame["state_valid"][0] = 1
+    arm_frame["eef_pos"][0] = np.array([0.4, -0.1, 0.3])
+    arm_frame["eef_rot6d"][0] = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    vr_frame = {
+        "wrist_pos": np.array([0.2, 0.3, 0.4]),
+        "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+        "head_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+    }
+
+    assert _reset_mapper_from_frames(mapper, arm_frame, vr_frame)
+    mapped = mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
+    assert mapped is not None
+    np.testing.assert_allclose(mapped["pos"], arm_frame["eef_pos"][0])
+
+    invalid_vr = dict(vr_frame, wrist_quat_wxyz=np.zeros(4))
+    assert not _reset_mapper_from_frames(mapper, arm_frame, invalid_vr)
+    assert not mapper.is_ready()
+
+    arm_frame["eef_rot6d"][0] = 0.0
+    assert not _reset_mapper_from_frames(mapper, arm_frame, vr_frame)
 
 
 def test_runtime_config_precedence_is_immutable_and_hash_is_canonical(tmp_path: Path) -> None:
@@ -278,6 +380,43 @@ def test_joint_publisher_returns_the_committed_dt_clamped_candidate() -> None:
         shared.close()
 
 
+def test_coordinated_hand_home_helpers_fail_closed_and_converge_on_fresh_feedback() -> None:
+    shared = SimpleNamespace(arm_state_ring=Mock())
+    shared.arm_state_ring.read_latest.return_value = None
+    assert not write_hand_cmd(shared, np.zeros(12))
+
+    arm_frame = new_frame(ARM_STATE_DTYPE)
+    arm_frame["qpos"][0] = np.linspace(0.0, 0.6, 7)
+    shared.arm_state_ring.read_latest.return_value = (arm_frame, time.monotonic_ns(), 1)
+    with patch("dexmani_real.policy.action_protocol.publish_joint_targets", return_value=object()) as publish:
+        assert write_hand_cmd(shared, np.zeros(12))
+    np.testing.assert_allclose(publish.call_args.args[1], arm_frame["qpos"][0])
+    assert publish.call_args.kwargs["is_hold"]
+
+    hand_frame = new_frame(HAND_STATE_DTYPE)
+    home = np.linspace(0.0, 0.11, 12)
+    hand_frame["qpos"][0] = home
+    hand_frame["timestamp"][0] = time.monotonic() + 1.0
+    hand_frame["connected"][0] = 1
+    hand_frame["error_state"][0] = 0
+    home_shared = SimpleNamespace(
+        is_running=SimpleNamespace(value=True),
+        policy_heartbeat_s=SimpleNamespace(value=0.0),
+        hand_state_ring=Mock(read_latest=Mock(return_value=(hand_frame, time.monotonic_ns(), 1))),
+    )
+    with patch("dexmani_real.policy.action_protocol.write_hand_cmd", return_value=True):
+        reached, final = hand_home_converge(home_shared, home, heartbeat=True, verbose=True)
+    assert reached
+    np.testing.assert_allclose(final, home)
+    assert home_shared.policy_heartbeat_s.value > 0
+
+    with patch("dexmani_real.policy.action_protocol.write_hand_cmd", return_value=False):
+        assert hand_home_converge(home_shared, home, verbose=True) == (False, None)
+
+    home_shared.is_running.value = False
+    assert hand_home_converge(home_shared, home, timeout_s=0.01, verbose=True) == (False, None)
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
@@ -388,7 +527,7 @@ def test_chunk_scheduler_keeps_action_ids_in_order_when_multiple_steps_are_ready
     assert scheduler.pop_ready(lead_time_s=0.010, now_monotonic_ns=stalled_tick_ns) == second
 
 
-def test_learned_coordinator_normalizes_backend_protocol_metadata() -> None:
+def test_learned_coordinator_normalizes_identity_without_retiming_backend_action() -> None:
     prefix = f"learned_{uuid.uuid4().hex}"
     shared = SharedStorage.create(
         prefix=prefix,
@@ -430,9 +569,9 @@ def test_learned_coordinator_normalizes_backend_protocol_metadata() -> None:
             session_generation=999,
             policy_epoch=888,
             action_id=777,
-            created_monotonic_ns=source_ns,
-            target_monotonic_ns=source_ns + 1,
-            valid_until_monotonic_ns=source_ns + 2,
+            created_monotonic_ns=source_ns + 2,
+            target_monotonic_ns=source_ns + 50_000_000,
+            valid_until_monotonic_ns=source_ns + 70_000_000,
             arm_qpos=np.zeros(7),
             chunk_id=44,
         )
@@ -445,7 +584,65 @@ def test_learned_coordinator_normalizes_backend_protocol_metadata() -> None:
         assert normalized.session_generation == int(shared.session_generation.value)
         assert normalized.policy_epoch == int(shared.policy_epoch.value)
         assert normalized.action_id != raw.action_id
-        assert normalized.target_monotonic_ns > source_ns + 3
+        assert normalized.created_monotonic_ns == raw.created_monotonic_ns
+        assert normalized.target_monotonic_ns == raw.target_monotonic_ns
+        assert normalized.valid_until_monotonic_ns == raw.valid_until_monotonic_ns
+    finally:
+        block.close()
+        block.unlink()
+        shared.close()
+
+
+def test_learned_coordinator_never_revives_an_expired_backend_chunk() -> None:
+    prefix = f"learned_expired_{uuid.uuid4().hex}"
+    shared = SharedStorage.create(
+        prefix=prefix,
+        config=SharedStorageConfig(
+            camera_rgb_shape=(2, 3, 3),
+            camera_depth_shape=(2, 3),
+            camera_pc_shape=(4, 6),
+        ),
+    )
+    spec = ObservationSpec((ModalitySpec("arm_qpos", (7,), "float64"),))
+    block = ObservationTensorBlock.create(f"{prefix}_tensor", spec)
+    try:
+        source_ns = time.monotonic_ns()
+        arm_frame = new_frame(ARM_STATE_DTYPE)
+        arm_frame["qpos"][0] = np.zeros(7)
+        arm_frame["source_monotonic_ns"][0] = source_ns
+        arm_frame["publish_monotonic_ns"][0] = source_ns + 1
+        arm_frame["state_valid"][0] = 1
+        shared.arm_state_ring.write(arm_frame)
+
+        inference = InferenceConfig("unused.module:Backend", spec, ActionSpec(chunk_length=1, deadline_s=0.2))
+        coordinator = LearnedPolicyCoordinator(
+            shared,
+            inference,
+            block,
+            _gate(),
+            config=LearnedCoordinatorConfig(candidate_timeout_s=1.0),
+        )
+        snapshot = coordinator.publish_snapshot(anchor_monotonic_ns=source_ns + 2)
+        assert snapshot is not None
+        raw = ActionCandidate(
+            observation_id=snapshot.observation_id,
+            session_generation=999,
+            policy_epoch=888,
+            action_id=777,
+            created_monotonic_ns=source_ns + 2,
+            target_monotonic_ns=source_ns + 10_000_000,
+            valid_until_monotonic_ns=source_ns + 20_000_000,
+            arm_qpos=np.zeros(7),
+            chunk_id=44,
+        )
+        shared.inference_candidate_ring.write(encode_candidate(raw))
+
+        chunk = coordinator.consume_candidate_chunk(now_monotonic_ns=source_ns + 30_000_000)
+
+        assert chunk is not None
+        assert chunk.steps[0].valid_until_monotonic_ns == raw.valid_until_monotonic_ns
+        assert coordinator.scheduler.pending == ()
+        assert coordinator.scheduler.all_late
     finally:
         block.close()
         block.unlink()
@@ -522,6 +719,10 @@ def test_camera_snapshot_never_mixes_payload_generations() -> None:
     )
     try:
         source = SharedObservationSource(shared, spec)
+        read_sequence = Mock(wraps=shared.camera_ring.read_sequence)
+        get_last_metadata = Mock(wraps=shared.camera_ring.get_last_metadata)
+        shared.camera_ring.read_sequence = read_sequence  # type: ignore[method-assign]
+        shared.camera_ring.get_last_metadata = get_last_metadata  # type: ignore[method-assign]
 
         def write_frame(*, generation: int, value: int, pointcloud_valid: bool) -> None:
             receive_ns = time.monotonic_ns()
@@ -549,6 +750,45 @@ def test_camera_snapshot_never_mixes_payload_generations() -> None:
         np.testing.assert_array_equal(snapshot.values["camera_rgb"][0], np.full((2, 3, 3), 2, dtype=np.uint8))
         assert not bool(snapshot.valid_history_mask["camera_pointcloud"][0])
         np.testing.assert_array_equal(snapshot.values["camera_pointcloud"][0], np.zeros((4, 6), dtype=np.float32))
+        assert get_last_metadata.call_count == 1
+        assert read_sequence.call_count == 1
+        assert read_sequence.call_args.kwargs["modalities"] == ("rgb",)
+    finally:
+        shared.close()
+
+
+def test_observation_source_scans_each_structured_ring_once_per_snapshot() -> None:
+    prefix = f"learned_scan_{uuid.uuid4().hex}"
+    shared = SharedStorage.create(
+        prefix=prefix,
+        config=SharedStorageConfig(
+            camera_rgb_shape=(2, 3, 3),
+            camera_depth_shape=(2, 3),
+            camera_pc_shape=(4, 6),
+            arm_state_ring_maxlen=12,
+        ),
+    )
+    spec = ObservationSpec(
+        (
+            ModalitySpec("arm_qpos", (7,), "float64", producer_hz=30.0),
+            ModalitySpec("arm_qvel", (7,), "float64", producer_hz=30.0),
+            ModalitySpec("arm_tau", (7,), "float64", producer_hz=30.0),
+        )
+    )
+    try:
+        source_ns = time.monotonic_ns()
+        arm_frame = new_frame(ARM_STATE_DTYPE)
+        arm_frame["source_monotonic_ns"][0] = source_ns
+        arm_frame["publish_monotonic_ns"][0] = source_ns + 1
+        arm_frame["state_valid"][0] = 1
+        shared.arm_state_ring.write(arm_frame)
+        get_last_k = Mock(wraps=shared.arm_state_ring.get_last_k)
+        shared.arm_state_ring.get_last_k = get_last_k  # type: ignore[method-assign]
+
+        snapshot = SharedObservationSource(shared, spec).build(anchor_monotonic_ns=source_ns + 2)
+
+        assert get_last_k.call_count == 1
+        assert all(bool(snapshot.valid_history_mask[name][0]) for name in ("arm_qpos", "arm_qvel", "arm_tau"))
     finally:
         shared.close()
 

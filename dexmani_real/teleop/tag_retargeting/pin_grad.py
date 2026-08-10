@@ -18,6 +18,26 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+_FINGERTIP_ORDER = ("thumb", "index", "mid", "ring", "pinky")
+
+
+def validate_fingertip_frame_names(fingertip_frame_names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Validate the fixed five-finger XHand optimizer contract."""
+    names = tuple(fingertip_frame_names)
+    if len(names) != len(_FINGERTIP_ORDER):
+        raise ValueError("fingertip_frame_names must contain exactly five entries")
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("fingertip_frame_names entries must be non-empty strings")
+    if len(set(names)) != len(names):
+        raise ValueError("fingertip_frame_names entries must be unique")
+    for index, (name, expected_finger) in enumerate(zip(names, _FINGERTIP_ORDER)):
+        if expected_finger not in name.lower():
+            raise ValueError(
+                "fingertip_frame_names must be ordered thumb/index/mid/ring/pinky; "
+                f"entry {index}={name!r} does not identify {expected_finger}"
+            )
+    return names
+
 
 class PinGrad:
     """Pinocchio-based analytical gradient engine for hand FK optimization.
@@ -35,21 +55,18 @@ class PinGrad:
             fingertip_frame_names: URDF ``<frame>`` names for the 5 fingertips
                 (e.g. ``"right_hand_thumb_rota_tip"``).
         """
+        names = validate_fingertip_frame_names(fingertip_frame_names)
         self.model = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())
         self.data = self.model.createData()
         self.dof: int = self.model.nv - 6  # 12 for XHand
         self._nv: int = self.model.nv
 
-        # Resolve fingertip frame names → frame IDs
-        self.tip_frame_ids: list[int] = []
-        for name in fingertip_frame_names:
-            if not self.model.existFrame(name):
-                logger.warning("Fingertip frame %r not found in URDF — skipped", name)
-            else:
-                self.tip_frame_ids.append(int(self.model.getFrameId(name)))
-
-        if len(self.tip_frame_ids) < 1:
-            logger.warning("No fingertip frames resolved from %r", fingertip_frame_names)
+        # The optimizer always receives five targets in semantic finger order;
+        # silently shortening this list shifts target-to-frame associations.
+        missing = [name for name in names if not self.model.existFrame(name)]
+        if missing:
+            raise ValueError(f"fingertip frames not found in URDF {urdf_path!r}: {missing}")
+        self.tip_frame_ids = [int(self.model.getFrameId(name)) for name in names]
 
     # ── Kinematics ──────────────────────────────────────────────
 
@@ -81,9 +98,10 @@ class PinGrad:
 
         grad = np.zeros(self.dof, dtype=np.float64)
         loss = 0.0
-        n_fingers = min(len(self.tip_frame_ids), len(target_pos))
+        if target_pos.shape != (len(self.tip_frame_ids), 3) or not np.all(np.isfinite(target_pos)):
+            raise ValueError(f"target_pos must be a finite ({len(self.tip_frame_ids)}, 3) array")
 
-        for i in range(n_fingers):
+        for i in range(len(self.tip_frame_ids)):
             fid = self.tip_frame_ids[i]
             J_full = pin.getFrameJacobian(self.model, self.data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
             J_v = J_full[:3, 6:]  # strip FreeFlyer columns, keep joint DOFs

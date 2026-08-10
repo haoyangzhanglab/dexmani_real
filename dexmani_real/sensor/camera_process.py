@@ -107,7 +107,7 @@ def pack_camera_frame(
     """Pack camera frame attributes into (header, rgb_bytes, depth_bytes)."""
     import numpy as np
 
-    from dexmani_real.shm.ring_buffer import CAMERA_FRAME_HEADER_DTYPE
+    from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
 
     rgb_arr = np.ascontiguousarray(rgb, dtype=np.uint8)
     depth_arr = np.ascontiguousarray(depth_raw, dtype=np.uint16)

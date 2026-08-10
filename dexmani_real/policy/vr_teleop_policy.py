@@ -24,6 +24,8 @@ from dexmani_real.policy.action_protocol import (
     AckStatus,
     ActionSafetyGate,
     ActionSafetyGateConfig,
+    SafeCommandPublisher,
+    hand_home_converge,
     planner_action_safety_gate,
     publish_joint_targets,
 )
@@ -32,13 +34,13 @@ from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.io_process import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import SharedStorage, hand_home_converge, publish_component_status
+from dexmani_real.shm.shared_storage import SharedStorage, publish_component_status
 from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state_latest
 from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state_latest
 from dexmani_real.shm.shared_storage import send_arm_home
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
+from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter, _tag_config_with_urdf
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import ThrottledWarner, get_logger
@@ -52,6 +54,7 @@ _FRAME_HELD = 1
 _FRAME_IK_FAIL = 2
 _FRAME_SAFETY_REJECT = 3
 _FRAME_RETARGET_FAIL = 4
+_HOLD_APPLY_TIMEOUT_S = 0.75
 
 
 @dataclass
@@ -363,6 +366,142 @@ def _update_audio_motion_gate(
     return should_hold, begin_deadline_s, ignore_begin_until_silent
 
 
+def _advance_policy_epoch(shared: Any) -> int:
+    """Invalidate every previously prepared/committed policy command."""
+    lock_getter = getattr(shared.policy_epoch, "get_lock", None)
+    if callable(lock_getter):
+        with lock_getter():
+            shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
+            return int(shared.policy_epoch.value)
+    shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
+    return int(shared.policy_epoch.value)
+
+
+def _candidate_application_state(shared: Any, candidate: ActionCandidate) -> str:
+    """Return pending/applied/failed from exact identity-correlated worker ACKs."""
+    arm_status = (
+        AckStatus.APPLIED
+        if candidate.arm_qpos is None
+        else SafeCommandPublisher._ack_status(shared.arm_ack_ring, candidate)
+    )
+    hand_status = (
+        AckStatus.APPLIED
+        if candidate.hand_qpos is None
+        else SafeCommandPublisher._ack_status(shared.hand_ack_ring, candidate)
+    )
+    failed = {AckStatus.REJECTED, AckStatus.SDK_FAILED}
+    if arm_status in failed or hand_status in failed:
+        return "failed"
+    if arm_status is AckStatus.APPLIED and hand_status is AckStatus.APPLIED:
+        return "applied" if _candidate_applied_monotonic_ns(shared, candidate) is not None else "pending"
+    return "pending"
+
+
+def _candidate_applied_monotonic_ns(shared: Any, candidate: ActionCandidate) -> int | None:
+    """Return the latest enabled-worker SDK apply time for one exact candidate."""
+    applied_times: list[int] = []
+    for qpos, ack_ring in (
+        (candidate.arm_qpos, shared.arm_ack_ring),
+        (candidate.hand_qpos, shared.hand_ack_ring),
+    ):
+        if qpos is None:
+            continue
+        result = ack_ring.read_latest()
+        if result is None or not SafeCommandPublisher._ack_matches(result[0], candidate):
+            return None
+        ack = result[0]
+        if int(ack["status"][0]) != int(AckStatus.APPLIED):
+            return None
+        applied_ns = int(ack["applied_monotonic_ns"][0])
+        if applied_ns <= 0:
+            return None
+        applied_times.append(applied_ns)
+    return max(applied_times) if applied_times else None
+
+
+def _feedback_after_hold(
+    arm_state: np.ndarray,
+    hand_state: np.ndarray | None,
+    candidate: ActionCandidate,
+    applied_monotonic_ns: int,
+) -> bool:
+    """Require measured feedback produced after every coordinated hold apply."""
+    arm_names = arm_state.dtype.names or ()
+    if "source_monotonic_ns" not in arm_names:
+        return False
+    if int(arm_state["source_monotonic_ns"][0]) < applied_monotonic_ns:
+        return False
+    if candidate.hand_qpos is None:
+        return True
+    if hand_state is None:
+        return False
+    hand_names = hand_state.dtype.names or ()
+    return "source_monotonic_ns" in hand_names and int(hand_state["source_monotonic_ns"][0]) >= applied_monotonic_ns
+
+
+def _vr_after_hold(vr_frame: dict[str, Any] | None, applied_monotonic_ns: int) -> bool:
+    """Return whether the VR sample was received after coordinated hold apply."""
+    if vr_frame is None:
+        return False
+    try:
+        return int(vr_frame.get("local_recv_ns", 0)) >= applied_monotonic_ns
+    except (TypeError, ValueError):
+        return False
+
+
+def _reset_mapper_from_frames(
+    mapper: ArmWristMapper,
+    arm_state: np.ndarray | None,
+    vr_frame: dict[str, Any] | None,
+) -> bool:
+    """Atomically re-anchor wrist mapping from fresh measured arm/VR poses."""
+    if arm_state is None or vr_frame is None:
+        mapper.clear()
+        return False
+    names = arm_state.dtype.names or ()
+    if "state_valid" in names and not bool(arm_state["state_valid"][0]):
+        mapper.clear()
+        return False
+    if "connected" in names and not bool(arm_state["connected"][0]):
+        mapper.clear()
+        return False
+    eef_pos = np.asarray(arm_state["eef_pos"][0], dtype=np.float64)
+    eef_rot6d = np.asarray(arm_state["eef_rot6d"][0], dtype=np.float64)
+    if eef_pos.shape != (3,) or eef_rot6d.shape != (6,):
+        mapper.clear()
+        return False
+    if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(eef_rot6d)):
+        mapper.clear()
+        return False
+    c1 = eef_rot6d[:3]
+    c2 = eef_rot6d[3:]
+    if np.linalg.norm(c1) < 1e-12 or np.linalg.norm(np.cross(c1, c2)) < 1e-12:
+        mapper.clear()
+        return False
+
+    try:
+        head_quat = vr_frame.get("head_quat_wxyz")
+        if head_quat is not None:
+            mapper.set_heading(np.asarray(head_quat, dtype=np.float64))
+        wrist_pos = vr_frame.get("wrist_pos")
+        wrist_quat_wxyz = vr_frame.get("wrist_quat_wxyz")
+        if wrist_pos is None or wrist_quat_wxyz is None:
+            mapper.clear()
+            return False
+        wrist_pos_array = np.asarray(wrist_pos, dtype=np.float64)
+        wrist_quat_array = np.asarray(wrist_quat_wxyz, dtype=np.float64)
+    except (TypeError, ValueError):
+        mapper.clear()
+        return False
+    mapper.reset(
+        wrist_pos=wrist_pos_array,
+        wrist_quat_wxyz=wrist_quat_array,
+        eef_pos=eef_pos,
+        eef_quat_wxyz=rot6d_to_quat_wxyz(eef_rot6d),
+    )
+    return mapper.is_ready()
+
+
 def _transition_collision_free(
     planner: XArm7MotionPlanner,
     arm_start: np.ndarray,
@@ -617,7 +756,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     qpos_lower_rad=cfg.hand_qpos_lower_rad,
                     qpos_upper_rad=cfg.hand_qpos_upper_rad,
                     fingertip_link_names=cfg.fingertip_link_names,
-                    tag_config=cfg.tag_retargeting_config,
+                    tag_config=_tag_config_with_urdf(cfg.tag_retargeting_config, cfg.hand_urdf_path),
                 )
             else:
                 hand_retargeter = XHandRetargeter(
@@ -727,9 +866,15 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
     teleop_active = False
     recording_active = False
     recording_paused = False
-    _prev_audio_playing = False
     _begin_audio_gate_deadline_s: float | None = None
     _ignore_begin_audio_until_silent = False
+    _control_hold_reason: str | None = None
+    _control_hold_candidate: ActionCandidate | None = None
+    _control_hold_record_candidate: ActionCandidate | None = None
+    _control_hold_applied = False
+    _control_hold_applied_ns = 0
+    _control_hold_deadline_s: float | None = None
+    _reanchor_pending_reason: str | None = None
 
     # Post-teleop quit prompt (two-stage Q: first Q stops teleop, second Q exits)
     quit_pending = False
@@ -759,6 +904,98 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         abort_after_s=cfg.camera_recording_stall_abort_s,
     )
 
+    def _enter_measured_hold(reason: str) -> bool:
+        """Invalidate old endpoints and commit one measured arm/hand hold."""
+        nonlocal _control_hold_reason, _control_hold_candidate, _control_hold_record_candidate
+        nonlocal _control_hold_applied, _control_hold_applied_ns, _control_hold_deadline_s
+        nonlocal _reanchor_pending_reason
+        nonlocal prev_qpos_cmd, prev_hand_qpos, ema_prev_pos, ema_prev_quat
+        nonlocal _hand_ramp_start, _hand_ramp_step
+
+        if _control_hold_reason is not None:
+            _control_hold_reason = reason
+            _reanchor_pending_reason = reason
+            return True
+
+        latest_arm = _read_arm_state(shared)
+        if latest_arm is None:
+            logger.error("policy_loop: cannot enter %s hold without arm feedback", reason)
+            return False
+        measured_arm = np.asarray(latest_arm["qpos"][0], dtype=np.float64)
+        if measured_arm.shape != (7,) or not np.all(np.isfinite(measured_arm)):
+            logger.error("policy_loop: cannot enter %s hold with invalid arm feedback", reason)
+            return False
+
+        measured_hand: np.ndarray | None = None
+        if hand_available:
+            latest_hand = _read_hand_state(shared)
+            if (
+                latest_hand is None
+                or not bool(latest_hand["connected"][0])
+                or not np.all(np.isfinite(latest_hand["qpos"][0]))
+            ):
+                logger.error("policy_loop: cannot enter %s hold without healthy hand feedback", reason)
+                return False
+            measured_hand = np.clip(
+                np.asarray(latest_hand["qpos"][0], dtype=np.float64),
+                HAND_QPOS_LO,
+                HAND_QPOS_HI,
+            )
+
+        epoch = _advance_policy_epoch(shared)
+        candidate = _safe_joint_publish(
+            shared,
+            measured_arm,
+            measured_hand,
+            is_hold=True,
+            timeout=0.06,
+            safety_gate=action_safety_gate,
+        )
+        if candidate is None:
+            logger.error("policy_loop: failed to publish %s hold after advancing to epoch=%d", reason, epoch)
+            return False
+
+        _control_hold_reason = reason
+        _control_hold_candidate = candidate
+        _control_hold_record_candidate = candidate
+        _control_hold_applied = False
+        _control_hold_applied_ns = 0
+        _control_hold_deadline_s = time.monotonic() + _HOLD_APPLY_TIMEOUT_S
+        _reanchor_pending_reason = reason
+        prev_qpos_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
+        if candidate.hand_qpos is not None:
+            prev_hand_qpos = np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
+        arm_mapper.clear()
+        ema_prev_pos = ema_prev_quat = None
+        _hand_ramp_start = None
+        _hand_ramp_step = 0
+        logger.info(
+            "policy_loop: %s hold committed (epoch=%d action_id=%d)",
+            reason,
+            epoch,
+            candidate.action_id,
+        )
+        return True
+
+    def _complete_reanchor(
+        current_arm_state: np.ndarray,
+        current_vr_frame: dict[str, Any],
+        current_hand_state: np.ndarray | None,
+    ) -> bool:
+        """Reset arm/hand temporal state; caller holds the re-anchor grid frame."""
+        nonlocal ema_prev_pos, ema_prev_quat, prev_hand_qpos
+        nonlocal _hand_ramp_start, _hand_ramp_step
+        if not _reset_mapper_from_frames(arm_mapper, current_arm_state, current_vr_frame):
+            _validate_warn("policy_loop: re-anchor inputs invalid — remaining held")
+            return False
+        ema_prev_pos = ema_prev_quat = None
+        if hand_available and current_hand_state is not None and np.all(np.isfinite(current_hand_state["qpos"][0])):
+            prev_hand_qpos = np.asarray(current_hand_state["qpos"][0], dtype=np.float64).copy()
+        _hand_ramp_start = prev_hand_qpos.copy() if hand_available else None
+        _hand_ramp_step = 0
+        _reset_hand_retargeter(hand_retargeter, prev_hand_qpos.copy() if hand_available else None)
+        return True
+
     # Automatic cyclic GC is left enabled (2026-08-05 audit).  The hot path
     # allocates mostly numpy arrays (refcounted, not cyclic), so GC thresholds
     # are rarely reached.  gc.collect() at episode boundaries serves as explicit hints.
@@ -786,6 +1023,29 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         while shared.is_running.value and not _sigterm_requested:
             shared.policy_heartbeat_s.value = time.monotonic()
             limiter.wait()
+
+            if _control_hold_candidate is not None and not _control_hold_applied:
+                _hold_state = _candidate_application_state(shared, _control_hold_candidate)
+                if _hold_state == "applied":
+                    _control_hold_applied = True
+                    _control_hold_applied_ns = _candidate_applied_monotonic_ns(shared, _control_hold_candidate) or 0
+                    _control_hold_deadline_s = None
+                    logger.info(
+                        "policy_loop: %s hold applied (action_id=%d)",
+                        _control_hold_reason,
+                        _control_hold_candidate.action_id,
+                    )
+                elif _hold_state == "failed" or (
+                    _control_hold_deadline_s is not None and time.monotonic() >= _control_hold_deadline_s
+                ):
+                    logger.error(
+                        "policy_loop: %s hold failed to reach APPLIED (state=%s action_id=%d)",
+                        _control_hold_reason,
+                        _hold_state,
+                        _control_hold_candidate.action_id,
+                    )
+                    shared.error_state.value = True
+                    break
 
             if recorder is not None:
                 _stop_result = recorder.poll_stop()
@@ -1006,20 +1266,19 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         print(f"\nC: safety_state={shared.safety_state.value} — cannot resume")
                         skip_rest = True
                         continue
-                    teleop_active = not teleop_active
-                    recording_paused = not teleop_active
-                    state_str = "暂停" if not teleop_active else "恢复"
+                    if teleop_active:
+                        if not _enter_measured_hold("pause"):
+                            shared.error_state.value = True
+                            break
+                        teleop_active = False
+                        recording_paused = True
+                    else:
+                        teleop_active = True
+                        _reanchor_pending_reason = "resume"
+                    state_str = "恢复" if teleop_active else "暂停"
                     print(f"\nC: {state_str}遥操作")
                     if teleop_active:
                         audio.play("resume")
-                        arm_mapper_reset = _try_reset_mapper(shared)
-                        if arm_mapper_reset:
-                            # Warm-start hand retargeter NLP from current hardware
-                            # pose so the first retarget() converges from near-optimum
-                            # (matching B-press pattern).
-                            _seeded = _init_and_seed_hand_retargeter()
-                            if _seeded is not None:
-                                prev_hand_qpos = _seeded
                     else:
                         audio.play("pause")
                     skip_rest = True
@@ -1056,7 +1315,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                             0.0, cfg.begin_motion_gate_timeout_s - ctrl_dt
                         )
                         _ignore_begin_audio_until_silent = False
-                        _prev_audio_playing = True
+                        _reanchor_pending_reason = "begin"
                         print("\nB: 遥操作开始（未启用录制 capability）")
                         limiter.reset()
                         skip_rest = True
@@ -1179,9 +1438,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         0.0, cfg.begin_motion_gate_timeout_s - ctrl_dt
                     )
                     _ignore_begin_audio_until_silent = False
-                    # Treat the cue as a hold transition even if the audio thread
-                    # has not yet spawned its player process on the next tick.
-                    _prev_audio_playing = True
+                    # Re-anchor correctness is driven by internal state, not by
+                    # whether the optional audio player starts successfully.
+                    _reanchor_pending_reason = "begin"
                     print(f"\nB: 遥操作+录制开始  episode={recorder.frame_count}")
                     # Episode setup, GC, and retargeter seeding are intentional
                     # boundary work, not an active control-loop overrun.
@@ -1189,6 +1448,8 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     skip_rest = True
 
             if shared.estop_request.value or shared.quit_requested.value or not shared.is_running.value:
+                break
+            if shared.error_state.value:
                 break
             if skip_rest:
                 continue
@@ -1225,7 +1486,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             )
             stage_timer.mark("vr")
 
-            cam = _read_camera_frame(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
+            # VR control does not consume camera pixels.  Scan/copy the large
+            # payload only while the policy-owned recorder requests it.
+            cam = _read_camera_frame(shared, anchor_monotonic_ns=_current_grid_anchor_ns) if recording_active else None
             if recording_active:
                 cam, _camera_stalled = _camera_freshness.observe(cam)
                 if _camera_stalled:
@@ -1291,7 +1554,41 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                     arm_state_age_s=_arm_age,
                 )
 
-            if not teleop_active or vr_stale:
+            if teleop_active and vr_stale and _control_hold_reason is None:
+                if not _enter_measured_hold("vr_stale"):
+                    shared.error_state.value = True
+                    break
+
+            if not teleop_active or vr_stale or _control_hold_reason is not None:
+                # A stale-input/resume release is legal only after the exact
+                # coordinated measured hold reached both enabled SDKs and a
+                # fresh VR frame can be anchored to current measured FK.
+                if (
+                    teleop_active
+                    and not vr_stale
+                    and _control_hold_reason is not None
+                    and _control_hold_applied
+                    and _control_hold_candidate is not None
+                    and _control_hold_applied_ns > 0
+                    and _vr_after_hold(vr_frame, _control_hold_applied_ns)
+                    and _feedback_after_hold(
+                        arm_state,
+                        hand_state,
+                        _control_hold_candidate,
+                        _control_hold_applied_ns,
+                    )
+                ):
+                    assert vr_frame is not None  # _vr_after_hold() proved the frame exists
+                    if _complete_reanchor(arm_state, vr_frame, hand_state):
+                        logger.info("policy_loop: released %s hold after fresh re-anchor", _control_hold_reason)
+                        _control_hold_reason = None
+                        _control_hold_candidate = None
+                        _control_hold_record_candidate = None
+                        _control_hold_applied = False
+                        _control_hold_applied_ns = 0
+                        _control_hold_deadline_s = None
+                        _reanchor_pending_reason = None
+                        recording_paused = False
                 if recording_active and not recording_paused:
                     _record_held(
                         recorder,
@@ -1310,7 +1607,9 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                         observation_anchor_monotonic_ns=_current_grid_anchor_ns,
                         shared=shared,
+                        action_candidate=_control_hold_record_candidate,
                     )
+                    _control_hold_record_candidate = None
                 prev_qpos_cmd = arm_qpos.copy()
                 ema_prev_pos = ema_prev_quat = None
                 continue
@@ -1332,50 +1631,24 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 # the hand ramp starts from the actual joint position.
                 if hand_available and hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
                     prev_hand_qpos = hand_state["qpos"][0].copy()
-                _prev_audio_playing = True
+                if _reanchor_pending_reason is None:
+                    _reanchor_pending_reason = "audio_gate"
                 continue
 
-            if _prev_audio_playing:
-                # The audio motion gate just ended — re-establish wrist→EEF
-                # mapping from the current pose to prevent a jump.  Resetting
-                # captures any VR-hand motion during the gate, so the first map()
-                # produces a near-zero delta (same pattern as C-resume handler).
-                if arm_state is not None and vr_frame is not None:
-                    _eef_pos = arm_state["eef_pos"][0].copy()
-                    _eef_rot6d = arm_state["eef_rot6d"][0].copy()
-                    if np.all(np.isfinite(_eef_pos)) and np.all(np.isfinite(_eef_rot6d)):
-                        # Dynamic heading calibration: set vr_to_base_rot from the
-                        # operator's current head orientation so position mapping
-                        # adapts to where the operator is actually facing.
-                        _head_q = vr_frame.get("head_quat_wxyz")
-                        if _head_q is not None and np.all(np.isfinite(_head_q)) and not np.allclose(_head_q, 0):
-                            arm_mapper.set_heading(np.asarray(_head_q, dtype=np.float64))
-                        arm_mapper.reset(
-                            wrist_pos=vr_frame["wrist_pos"],
-                            wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                            eef_pos=_eef_pos,
-                            eef_quat_wxyz=rot6d_to_quat_wxyz(_eef_rot6d),
-                        )
-                # Clear EMA state: the mapper was just reset above so
-                # the first post-audio map() produces a near-zero delta.
-                # Letting EMA start from None causes the first frame to
-                # skip smoothing (no prior to interpolate against), which
-                # is correct — the re-reset mapper output IS the current
-                # arm pose in world frame.
-                # IMPORTANT: do NOT seed from arm_state["eef_pos"] — that
-                # value is in base frame (Pinocchio FK), while mapper
-                # output is in world frame (identity transform: base=world).
-                # For consistency, always use the mapper's own output.
-                ema_prev_pos = ema_prev_quat = None
-                _hand_ramp_start = prev_hand_qpos.copy() if hand_available else None
-                _hand_ramp_step = 0
-                # Re-seed hand retargeter NLP warm-start from current hardware
-                # pose (mirrors the arm_mapper reset above).  Without this, the
-                # optimizer initial guess remains the qpos captured at B press.
-                # Smoothstep ramp + one-frame SLSQP self-correction make this
-                # harmless in practice, but re-seeding is symmetric and clear.
-                _reset_hand_retargeter(hand_retargeter, prev_hand_qpos.copy() if hand_available else None)
-                _prev_audio_playing = False
+            if _reanchor_pending_reason is not None:
+                # This flag is set directly by begin/resume/stale state changes;
+                # audio is only an optional UX gate and cannot suppress reset.
+                if vr_frame is None or not _complete_reanchor(arm_state, vr_frame, hand_state):
+                    prev_qpos_cmd = arm_qpos.copy()
+                    ema_prev_pos = ema_prev_quat = None
+                    continue
+                logger.info("policy_loop: completed %s re-anchor", _reanchor_pending_reason)
+                _reanchor_pending_reason = None
+                recording_paused = False
+                # Keep the re-anchor grid frame held.  Active mapping resumes
+                # on the next 16 Hz slot from a zero reset-relative delta.
+                prev_qpos_cmd = arm_qpos.copy()
+                continue
 
             if vr_frame is None:
                 logger.warning("policy_loop: vr_frame is None after vr_stale check — holding")
@@ -2030,22 +2303,6 @@ def _read_camera_frame(shared: SharedStorage, *, anchor_monotonic_ns: int | None
     except Exception:
         logger.warning("policy_loop: camera ring read failed", exc_info=True)
     return None
-
-
-def _try_reset_mapper(shared: SharedStorage) -> bool:
-    """Validate that arm and VR state are available for resume-calibrate initiation. Returns True on success."""
-    vr_frame = _read_vr_frame(shared)
-    if vr_frame is None:
-        return False
-    arm_state = _read_arm_state(shared)
-    if arm_state is None:
-        return False
-    eef_pos = arm_state["eef_pos"][0].copy()
-    eef_rot6d = arm_state["eef_rot6d"][0].copy()
-    eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d)
-    if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(eef_quat_wxyz)):
-        return False
-    return True
 
 
 def _stop_recording(

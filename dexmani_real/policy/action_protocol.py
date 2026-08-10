@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from dexmani_real.ipc.schema import ACK_DTYPE, ARM_COMMAND_DTYPE, COMMIT_DTYPE, HAND_COMMAND_DTYPE
 from dexmani_real.policy.runtime import ActionCandidate, ActionChunk, ActionSpec, FrozenArrayMap, ObservationSnapshot
 from dexmani_real.utils.log import get_logger
 
@@ -45,56 +46,6 @@ class RejectReason(IntEnum):
     SAFETY_STATE = 9
     PREPARE_TIMEOUT = 10
     SDK_ERROR = 11
-
-
-_COMMAND_COMMON_FIELDS = [
-    ("session_generation", "<u8"),
-    ("policy_epoch", "<u8"),
-    ("observation_id", "<u8"),
-    ("action_id", "<u8"),
-    ("chunk_id", "<u8"),
-    ("step_index", "<u4"),
-    ("created_monotonic_ns", "<u8"),
-    ("target_monotonic_ns", "<u8"),
-    ("valid_until_monotonic_ns", "<u8"),
-    ("is_hold", "<u1"),
-]
-
-ARM_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", (7,))], align=True)
-HAND_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", (12,))], align=True)
-COMMIT_DTYPE = np.dtype(
-    [
-        ("session_generation", "<u8"),
-        ("policy_epoch", "<u8"),
-        ("observation_id", "<u8"),
-        ("action_id", "<u8"),
-        ("chunk_id", "<u8"),
-        ("step_index", "<u4"),
-        ("created_monotonic_ns", "<u8"),
-        ("committed_monotonic_ns", "<u8"),
-        ("target_monotonic_ns", "<u8"),
-        ("valid_until_monotonic_ns", "<u8"),
-        ("is_hold", "<u1"),
-    ],
-    align=True,
-)
-ACK_DTYPE = np.dtype(
-    [
-        ("session_generation", "<u8"),
-        ("policy_epoch", "<u8"),
-        ("observation_id", "<u8"),
-        ("action_id", "<u8"),
-        ("chunk_id", "<u8"),
-        ("step_index", "<u4"),
-        ("status", "<u1"),
-        ("reject_reason", "<u2"),
-        ("sdk_code", "<i4"),
-        ("received_monotonic_ns", "<u8"),
-        ("prepared_monotonic_ns", "<u8"),
-        ("applied_monotonic_ns", "<u8"),
-    ],
-    align=True,
-)
 
 
 @dataclass(frozen=True)
@@ -655,6 +606,74 @@ def publish_joint_targets(
     except (TimeoutError, ValueError):
         logger.warning("joint target publication failed", exc_info=True)
         return None
+
+
+def write_hand_cmd(shared: Any, qpos: np.ndarray, *, safety_gate: ActionSafetyGate | None = None) -> bool:
+    """Publish a hand target together with a measured arm hold."""
+    arm_result = shared.arm_state_ring.read_latest()
+    if arm_result is None:
+        return False
+    arm_qpos = np.asarray(arm_result[0]["qpos"][0], dtype=np.float64)
+    return (
+        publish_joint_targets(
+            shared,
+            arm_qpos,
+            np.asarray(qpos, dtype=np.float64),
+            is_hold=True,
+            safety_gate=safety_gate,
+        )
+        is not None
+    )
+
+
+def hand_home_converge(
+    shared: Any,
+    home_qpos: np.ndarray,
+    *,
+    timeout_s: float = 5.0,
+    tol_deg: float = 5.0,
+    heartbeat: bool = False,
+    check_is_running: bool = True,
+    verbose: bool = True,
+    safety_gate: ActionSafetyGate | None = None,
+) -> tuple[bool, np.ndarray | None]:
+    """Publish coordinated endpoints until fresh hand feedback reaches home."""
+    tol = np.deg2rad(tol_deg)
+    deadline = time.monotonic() + timeout_s
+    requested_after_s = time.monotonic()
+    first = True
+
+    while time.monotonic() < deadline:
+        if check_is_running and not shared.is_running.value:
+            break
+        if heartbeat:
+            shared.policy_heartbeat_s.value = time.monotonic()
+        if not write_hand_cmd(shared, home_qpos, safety_gate=safety_gate):
+            if verbose:
+                print("  hand: coordinated home command was rejected", flush=True)
+            return False, None
+        hand_result = shared.hand_state_ring.read_latest()
+        if hand_result is not None:
+            state = hand_result[0]
+            current = np.asarray(state["qpos"][0], dtype=np.float64)
+            fresh = float(state["timestamp"][0]) >= requested_after_s
+            healthy = bool(state["connected"][0]) and not bool(state["error_state"][0])
+            if fresh and healthy and np.all(np.isfinite(current)):
+                err = float(np.max(np.abs(current - home_qpos)))
+                if err < tol:
+                    if verbose:
+                        print("  hand: home reached", flush=True)
+                    return True, current.copy()
+                if verbose and first:
+                    print(f"  hand: homing... (max_err={np.rad2deg(err):.0f}°)", flush=True)
+                    first = False
+        # Allow the two-worker lead time plus one actuator tick before
+        # replacing the next latest-wins hand endpoint.
+        time.sleep(0.1)
+
+    if verbose:
+        print(f"  hand: home settle timeout after {timeout_s:.0f}s — proceeding", flush=True)
+    return False, None
 
 
 def quiesce_for_policy_restart(

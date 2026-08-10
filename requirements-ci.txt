@@ -1,0 +1,13 @@
+-r requirements-dev.txt
+
+# Dependencies imported by the pure-offline test suite.  Installing an SDK is
+# not permission to connect to hardware; CI only runs tests/ and never executes
+# examples/real/test_* or a hardware entry point.
+av==17.1.0
+h5py==3.16.0
+hpp-fcl==2.4.4
+nlopt==2.7.1
+numpy==1.26.4
+pin==2.7.0
+pyrealsense2>=2.50,<3
+scipy==1.15.3

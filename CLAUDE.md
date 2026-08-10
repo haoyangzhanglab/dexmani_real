@@ -20,6 +20,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | Action protocol | `policy/action_protocol.py` — SafetyGate, prepare/commit, ACKs, chunk scheduler, epoch quiesce |
 | Optional inference | `policy/runtime.py`, `policy/inference_process.py`, `policy/tensor_block.py` — backend-neutral contracts and isolated worker |
 | Planner factory | `planning/planner.py` — `XArm7MotionPlanner.create_default()` canonical setup |
+| IPC schemas | `ipc/schema.py` — dependency-neutral NumPy dtypes for state, action, inference, recording, VR, and camera headers |
 | **SharedStorage (data plane)** | `shm/shared_storage.py` — all rings, queues, flags in one place |
 | Arm servo loop | `robot/arm_loop.py` — `arm_loop(shared)` (canonical), Mode 6 |
 | Hand control | `robot/hand_process.py` — `hand_loop(shared)` (canonical) |
@@ -29,7 +30,7 @@ Activate: `source ~/miniconda3/etc/profile.d/conda.sh && conda activate real_rob
 | Safety state machine | `robot/safety.py` — SafetyState enum (DISARMED/ARMED/RUNNING/FAULT) + transition helpers |
 | Recording format / lifecycle | `recording/io_process.py`, `recording/episode_recorder.py` — dedicated RecorderIO + schema v15 |
 | SHM primitives | `shm/ring_buffer.py` (CameraRingBuffer + SeqlockRingBuffer base), `shm/robot_ring.py` (SeqlockRingBuffer + `get_last_k(k)` multi-frame read) |
-| Core types | `robot/types.py` — RobotState, RobotAction + ArmState/HandState/HandTactile (doc-only dataclasses; authoritative format = `*_DTYPE` in `shm/shared_storage.py`) |
+| Core types | `robot/types.py` — RobotState, RobotAction + ArmState/HandState/HandTactile (doc-only dataclasses; authoritative IPC format = `*_DTYPE` in `ipc/schema.py`) |
 | Episode tools (quality/viz) | `dexmani_real/tools/` — `episode_quality.py` (filter/health/assess/validate), `visualize_episode.py` (3D + tactile) |
 | Type-check | `conda run -n real_robot mypy dexmani_real/` |
 
@@ -57,8 +58,10 @@ supervises health, and performs verified shutdown
 
 The learned-policy entry adds an isolated Inference worker and a two-slot
 seqlock tensor block. PolicyCoordinator alone reads SharedStorage, constructs
-causal 16 Hz snapshots, normalizes backend proposals into the current
-session/epoch/action-ID domain, and schedules prepare/commit work at 64 Hz.
+causal 16 Hz snapshots, normalizes only backend identity into the current
+session/epoch/action-ID domain, preserves backend-created target/expiry times,
+and schedules prepare/commit work at 64 Hz. Expired backend chunks are never
+retimed or revived.
 Model imports occur only in Inference after spawn; the ordinary VR entry never
 loads an unselected model. A camera clock reset increments the camera
 generation, forces RUNNING back to ARMED, invalidates the old policy epoch,
@@ -105,7 +108,11 @@ milestones as unblended MoveJoint targets. The arm worker restores Mode 6 on
 healthy exits and acknowledges completion only after fresh controller feedback
 converges.
 
-### SharedStorage Data Plane (`shm/shared_storage.py`, ~340 lines)
+### SharedStorage Data Plane (`shm/shared_storage.py`)
+
+All payload layouts live in `ipc/schema.py`; SharedStorage allocates and owns
+their transports but does not import policy, inference, or recording
+implementations merely to discover a dtype.
 
 | Transport | Type | Direction | Semantics |
 |-----------|------|-----------|-----------|
@@ -210,7 +217,10 @@ commands before they reach firmware; firmware remains the final safety backstop.
 2. **Policy-level:** mandatory ActionSafetyGate applies finite/shape, freshness,
    epoch/TTL, joint limits, dt-aware delta, workspace, table clearance, and a
    conservative asynchronous arm-hand transition envelope before raw IPC; plus
-   safety-state gating and hand tracking-stall hold
+   safety-state gating and hand tracking-stall hold. Pause and stale-VR edges
+   increment `policy_epoch`, publish one coordinated measured arm/hand hold,
+   require the exact APPLIED ACKs, then re-anchor on fresh measured FK/VR before
+   active mapping resumes; audio playback is not part of this correctness path.
 3. **IK-level:** workspace clamping + elbow-flip detection + hold-on-failure + delta clamp
 4. **E-stop:** Policy sets `estop_request=True` → Arm/Hand detect flag → `set_state(4)`
 5. **Error state:** sticky latch (`error_state` mp.Value) — Arm/Hand set, Main detects → FAULT
@@ -231,7 +241,8 @@ commands before they reach firmware; firmware remains the final safety backstop.
 
 - **Hand qpos_stale hold**: prevents gap jump on driver board lockout recovery
 - **Recovery counter FAULT escalation**: `_RECOVERY_MAX=30` — persistent errors trigger FAULT instead of silent infinite retry. Separate counters for servo and state-read errors.
-- Archived safety simplifications: arm joint-limit clip, policy error-code gate, VR quat gate, startup_error, tactile gate, stale target timeout — all removed in favor of firmware backstop + heartbeat supervisor.
+- **VR pose validity gate:** the receiver publishes only finite, exact-shape poses/landmarks with normalized nonzero quaternions; the mapper independently fails closed and clears an invalid reset anchor.
+- Archived safety simplifications: policy error-code gate, startup_error, tactile gate, and stale target timeout were removed in favor of the coordinated safety protocol and heartbeat supervisor.
 
 ---
 
@@ -323,7 +334,7 @@ by the resolved-config hash.
 
 | When you... | Also update... |
 |-------------|---------------|
-| Add a field to ArmState/HandState | `shared_storage.py` (dtype) + `types.py` (dataclass) + arm_loop/hand_loop (write) + policy (read) |
+| Add a field to ArmState/HandState | `ipc/schema.py` (dtype) + `types.py` (dataclass) + arm_loop/hand_loop (write) + policy (read) |
 | Add a recording dataset | `episode_recorder.py` (add_frame data dict) + `episode_reader.py` + `episode_quality.py` |
 | Add a hand health flag (bool) | `types.py` (RobotState, default False after hand_current) + `policy/vr_teleop_policy.py` (_build_robot_state read + else-branch) + `episode_recorder.py` (add_frame data dict) |
 | Change IK solver | `planning/ik.py` + `policy/vr_teleop_policy.py` |
@@ -371,6 +382,11 @@ stall marks short gaps stale and discards the current recording after 2s;
 teleoperation remains RUNNING and no camera-only FAULT is raised.
 
 **Quest VR:** HTS TCP on port 8000. `adb reverse tcp:8000 tcp:8000` for USB. `vr_loop` handles coordinate conversion (Unity left-hand → FLU).
+
+**TAG hand retargeting:** policy hand FK and TAG optimization use the same resolved
+`hand_urdf_path`. Startup requires five unique existing fingertip frames in
+thumb/index/middle/ring/pinky order; configuration drift fails before the first
+retargeting frame instead of shortening or shifting the optimizer target list.
 
 **Deps:** `mplib`, `pinocchio`, `h5py`, RealSense SDK, XArm7/XHand SDKs, `numpy`, `pyav`.
 

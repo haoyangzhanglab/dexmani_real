@@ -13,6 +13,34 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+_QUAT_NORM_EPS = 1e-12
+
+
+def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
+    """Return a finite float64 copy with the exact expected shape."""
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != shape or not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must be a finite array with shape {shape}")
+    return array.copy()
+
+
+def _unit_quat_wxyz(value: np.ndarray, name: str) -> np.ndarray:
+    """Validate and normalize one wxyz quaternion without identity fallback."""
+    quat = _finite_vector(value, (4,), name)
+    norm = float(np.linalg.norm(quat))
+    if norm < _QUAT_NORM_EPS:
+        raise ValueError(f"{name} norm is too small")
+    return quat / norm
+
+
+def _clip_signed_axis_angle(rot: np.ndarray, max_abs_angle_rad: float) -> tuple[np.ndarray, float, bool]:
+    """Clamp a rotation's signed axis-angle magnitude symmetrically."""
+    axis, angle = mat2axangle(rot)
+    if abs(angle) <= max_abs_angle_rad:
+        return rot, float(angle), False
+    clipped_angle = float(np.copysign(max_abs_angle_rad, angle))
+    return axangle2mat(axis, clipped_angle, is_normalized=True), float(angle), True
+
 
 class ArmWristMapper:
     """Reset-relative wrist mapper."""
@@ -28,20 +56,36 @@ class ArmWristMapper:
         max_delta_rot_rad: float = 1.0,
         max_per_frame_rot_rad: float = 0.52,  # ~30°/frame @ 16 Hz — VR glitch gate
     ) -> None:
+        if not np.isfinite(pos_scale):
+            raise ValueError("pos_scale must be finite")
+        if not np.isfinite(rot_scale) or rot_scale < 0:
+            raise ValueError("rot_scale must be finite and >= 0")
+        if not np.isfinite(max_delta_rot_rad) or max_delta_rot_rad <= 0:
+            raise ValueError("max_delta_rot_rad must be finite and > 0")
+        if not np.isfinite(max_per_frame_rot_rad) or max_per_frame_rot_rad <= 0:
+            raise ValueError("max_per_frame_rot_rad must be finite and > 0")
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
         # ── Position: heading-dependent (set by set_heading) ──
-        self.vr_to_base_rot = np.eye(3) if vr_to_base_rot is None else np.asarray(vr_to_base_rot, dtype=np.float64)
+        self.vr_to_base_rot = (
+            np.eye(3) if vr_to_base_rot is None else _finite_vector(vr_to_base_rot, (3, 3), "vr_to_base_rot")
+        )
         # ── Position + Rotation: base → world ──
         self.base_to_world_rot = (
-            np.eye(3) if base_to_world_rot is None else np.asarray(base_to_world_rot, dtype=np.float64)
+            np.eye(3) if base_to_world_rot is None else _finite_vector(base_to_world_rot, (3, 3), "base_to_world_rot")
         )
         # ── Rotation: fixed VR→robot axis mapping (heading-INDEPENDENT) ──
         # LeFranX-style: a constant similarity transform mapping VR hand axes to
         # robot base axes.  Identity means VR FLU axes = robot base axes.
-        self.T_vr_to_robot = np.eye(3) if T_vr_to_robot is None else np.asarray(T_vr_to_robot, dtype=np.float64)
+        self.T_vr_to_robot = (
+            np.eye(3) if T_vr_to_robot is None else _finite_vector(T_vr_to_robot, (3, 3), "T_vr_to_robot")
+        )
         # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
-        self.eef_delta_bounds = None if eef_delta_bounds is None else np.asarray(eef_delta_bounds, dtype=np.float64)
+        self.eef_delta_bounds = (
+            None if eef_delta_bounds is None else _finite_vector(eef_delta_bounds, (3, 2), "eef_delta_bounds")
+        )
+        if self.eef_delta_bounds is not None and np.any(self.eef_delta_bounds[:, 0] > self.eef_delta_bounds[:, 1]):
+            raise ValueError("eef_delta_bounds lower values must not exceed upper values")
         # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
         # drift from the reset pose before it reaches IK.
         self.max_delta_rot_rad = max_delta_rot_rad
@@ -63,15 +107,21 @@ class ArmWristMapper:
         eef_pos: np.ndarray,
         eef_quat_wxyz: np.ndarray,
     ) -> None:
-        # NaN/Inf guard — a single contaminated reference frame poisons
-        # every subsequent map() call for the entire episode.
-        if not all(np.isfinite(x) for x in (*wrist_pos, *wrist_quat_wxyz, *eef_pos, *eef_quat_wxyz)):
-            logger.warning("ArmWristMapper.reset: NaN/Inf in inputs — reset rejected")
+        # Validate into locals, then commit atomically.  A failed reset clears
+        # the old anchor so callers cannot unknowingly continue from stale data.
+        try:
+            next_wrist_pos0 = _finite_vector(wrist_pos, (3,), "wrist_pos")
+            next_wrist_rot0 = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
+            next_eef_pos0 = _finite_vector(eef_pos, (3,), "eef_pos")
+            next_eef_rot0 = quat2mat(_unit_quat_wxyz(eef_quat_wxyz, "eef_quat_wxyz"))
+        except (TypeError, ValueError):
+            self.clear()
+            logger.warning("ArmWristMapper.reset: invalid pose input — mapper cleared", exc_info=True)
             return
-        self.wrist_pos0 = np.asarray(wrist_pos, dtype=np.float64).copy()
-        self.wrist_rot0 = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
-        self.eef_pos0 = np.asarray(eef_pos, dtype=np.float64).copy()
-        self.eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz))
+        self.wrist_pos0 = next_wrist_pos0
+        self.wrist_rot0 = next_wrist_rot0
+        self.eef_pos0 = next_eef_pos0
+        self.eef_rot0 = next_eef_rot0
         # Seed continuous_quat in WORLD frame so the first map() dot-product
         # compares quaternions in the same coordinate system.
         # (base_to_world_rot is identity — base frame = world frame, zero transform.)
@@ -87,8 +137,12 @@ class ArmWristMapper:
         if not self.is_ready():
             return None
 
-        wrist_pos = np.asarray(wrist_pos, dtype=np.float64)
-        wrist_rot = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz))
+        try:
+            current_wrist_pos = _finite_vector(wrist_pos, (3,), "wrist_pos")
+            wrist_rot = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
+        except (TypeError, ValueError):
+            logger.warning("ArmWristMapper.map: invalid wrist pose — holding", exc_info=True)
+            return None
 
         # F2: Per-frame rotation delta gate — catches single-frame VR tracking
         # glitches (spike-and-recover) that the total-from-reset clip misses.
@@ -102,18 +156,18 @@ class ArmWristMapper:
         wrist_rot_gated = wrist_rot
         if self._last_wrist_rot is not None:
             frame_delta = wrist_rot @ self._last_wrist_rot.T
-            _axis, frame_angle = mat2axangle(frame_delta)
-            if frame_angle > self.max_per_frame_rot_rad:
+            frame_delta_clamped, frame_angle, was_clamped = _clip_signed_axis_angle(
+                frame_delta, self.max_per_frame_rot_rad
+            )
+            if was_clamped:
                 logger.warning(
                     "Per-frame rotation spike: %.1f° -> clamped to %.1f°",
                     np.rad2deg(frame_angle),
-                    np.rad2deg(self.max_per_frame_rot_rad),
+                    np.rad2deg(np.copysign(self.max_per_frame_rot_rad, frame_angle)),
                 )
-                frame_delta_clamped = axangle2mat(_axis, self.max_per_frame_rot_rad, is_normalized=True)
                 wrist_rot_gated = frame_delta_clamped @ self._last_wrist_rot
-        self._last_wrist_rot = wrist_rot.copy()
 
-        delta_pos_vr = wrist_pos - self.wrist_pos0
+        delta_pos_vr = current_wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
         delta_pos_base = self.clip_delta_pos(delta_pos_base)
         # Transform base-frame delta → world frame before adding to
@@ -138,7 +192,18 @@ class ArmWristMapper:
 
         target_pos = eef_pos0_world + delta_pos_world
         target_rot = delta_rot_world @ eef_rot0_world
-        target_quat_wxyz = self.continuous_quat(mat2quat(target_rot))
+        target_quat_wxyz = normalize_quat_wxyz(mat2quat(target_rot))
+        if self.last_quat_wxyz is not None and np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
+            target_quat_wxyz = -target_quat_wxyz
+        if not np.all(np.isfinite(target_pos)) or not np.all(np.isfinite(target_quat_wxyz)):
+            logger.warning("ArmWristMapper.map: non-finite mapped pose — holding")
+            return None
+
+        # Mutate temporal state only after the complete input and mapped output
+        # have passed validation.  Invalid frames therefore cannot poison the
+        # next frame's glitch baseline or quaternion-continuity reference.
+        self._last_wrist_rot = wrist_rot.copy()
+        self.last_quat_wxyz = target_quat_wxyz.copy()
 
         return {
             "pos": target_pos,
@@ -154,7 +219,16 @@ class ArmWristMapper:
         self._last_wrist_rot = None
 
     def is_ready(self) -> bool:
-        return self.wrist_pos0 is not None and self.eef_pos0 is not None
+        return all(
+            value is not None
+            for value in (
+                self.wrist_pos0,
+                self.wrist_rot0,
+                self.eef_pos0,
+                self.eef_rot0,
+                self._last_wrist_rot,
+            )
+        )
 
     def set_heading(self, head_quat_wxyz: np.ndarray) -> None:
         """Calibrate ``vr_to_base_rot`` so the user's facing direction → robot +X.
@@ -164,15 +238,11 @@ class ArmWristMapper:
 
         Call once per teleop session (on B-press), before :meth:`reset`.
         """
-        head_q = np.asarray(head_quat_wxyz, dtype=np.float64)
-        if not np.all(np.isfinite(head_q)):
-            logger.warning("set_heading: head quaternion contains NaN/inf, keeping current heading")
+        try:
+            head_q = _unit_quat_wxyz(head_quat_wxyz, "head_quat_wxyz")
+        except (TypeError, ValueError):
+            logger.warning("set_heading: invalid head quaternion, keeping current heading", exc_info=True)
             return
-        norm = np.linalg.norm(head_q)
-        if norm < 1e-12:
-            logger.warning("set_heading: head quaternion is zero, keeping current heading")
-            return
-        head_q = head_q / norm
 
         head_rot = quat2mat(head_q)
         # Head forward in FLU: rotation matrix applied to FLU +X
@@ -227,17 +297,17 @@ class ArmWristMapper:
         Catches accumulated drift from the reset pose before it reaches IK.
         Note: this is NOT per-frame — it clips the total rotation since reset().
         """
-        axis, angle = mat2axangle(delta_rot)
-        if angle > self.max_delta_rot_rad:
+        clipped, angle, was_clamped = _clip_signed_axis_angle(delta_rot, self.max_delta_rot_rad)
+        if was_clamped:
             logger.warning(
                 "Total-from-reset rotation clamped: %.1f° -> %.1f° "
                 "(max_delta_rot_rad=%.1f°).  EEF orientation will not track "
                 "wrist beyond this limit.  Press B to re-calibrate at new pose.",
                 np.rad2deg(angle),
-                np.rad2deg(self.max_delta_rot_rad),
+                np.rad2deg(np.copysign(self.max_delta_rot_rad, angle)),
                 np.rad2deg(self.max_delta_rot_rad),
             )
-            return axangle2mat(axis, self.max_delta_rot_rad, is_normalized=True)
+            return clipped
         return delta_rot
 
     def continuous_quat(self, quat_wxyz: np.ndarray) -> np.ndarray:

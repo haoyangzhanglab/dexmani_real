@@ -1,0 +1,35 @@
+"""Neutral fixed-shape IPC schemas shared by every process."""
+
+from dexmani_real.ipc.schema import (
+    ACK_DTYPE,
+    ARM_COMMAND_DTYPE,
+    ARM_STATE_DTYPE,
+    CAMERA_FRAME_HEADER_DTYPE,
+    COMMIT_DTYPE,
+    COMPONENT_STATUS_DTYPE,
+    HAND_COMMAND_DTYPE,
+    HAND_STATE_DTYPE,
+    HAND_TACTILE_DTYPE,
+    INFERENCE_CANDIDATE_DTYPE,
+    RECORD_CONTROL_DTYPE,
+    RECORD_STATUS_DTYPE,
+    VR_FRAME_DTYPE,
+    make_record_sample_dtype,
+)
+
+__all__ = [
+    "ACK_DTYPE",
+    "ARM_COMMAND_DTYPE",
+    "ARM_STATE_DTYPE",
+    "CAMERA_FRAME_HEADER_DTYPE",
+    "COMMIT_DTYPE",
+    "COMPONENT_STATUS_DTYPE",
+    "HAND_COMMAND_DTYPE",
+    "HAND_STATE_DTYPE",
+    "HAND_TACTILE_DTYPE",
+    "INFERENCE_CANDIDATE_DTYPE",
+    "RECORD_CONTROL_DTYPE",
+    "RECORD_STATUS_DTYPE",
+    "VR_FRAME_DTYPE",
+    "make_record_sample_dtype",
+]

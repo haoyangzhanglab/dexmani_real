@@ -16,9 +16,21 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, camera, hand, policy
-from dexmani_real.policy.action_protocol import ACK_DTYPE, ARM_COMMAND_DTYPE, COMMIT_DTYPE, HAND_COMMAND_DTYPE
-from dexmani_real.policy.inference_process import INFERENCE_CANDIDATE_DTYPE
-from dexmani_real.recording.io_process import RECORD_CONTROL_DTYPE, RECORD_STATUS_DTYPE, make_record_sample_dtype
+from dexmani_real.ipc.schema import (
+    ACK_DTYPE,
+    ARM_COMMAND_DTYPE,
+    ARM_STATE_DTYPE,
+    COMMIT_DTYPE,
+    COMPONENT_STATUS_DTYPE,
+    HAND_COMMAND_DTYPE,
+    HAND_STATE_DTYPE,
+    HAND_TACTILE_DTYPE,
+    INFERENCE_CANDIDATE_DTYPE,
+    RECORD_CONTROL_DTYPE,
+    RECORD_STATUS_DTYPE,
+    VR_FRAME_DTYPE,
+    make_record_sample_dtype,
+)
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
 from dexmani_real.shm.ring_buffer import CameraRingBuffer
@@ -158,79 +170,9 @@ def _describe_band_diff(wrapped: "np.ndarray", canonical: "np.ndarray") -> str:
     return ", ".join(parts) if parts else "same band"
 
 
-ARM_STATE_DTYPE = np.dtype(
-    [
-        ("qpos", "<f8", (7,)),
-        ("qvel", "<f8", (7,)),
-        ("tau", "<f8", (7,)),
-        ("eef_pos", "<f8", (3,)),
-        ("eef_rot6d", "<f8", (6,)),
-        ("error_code", "<i4"),
-        ("connected", "<u1"),
-        ("mode", "<i4"),
-        ("tracking_err", "<f8"),
-        # Last arm action successfully accepted by the SDK. Monotonic timestamps
-        # share one host clock across processes and make queue/SDK latency measurable.
-        ("last_cmd_seq", "<u8"),
-        ("last_cmd_created_s", "<f8"),
-        ("last_cmd_received_s", "<f8"),
-        ("last_cmd_applied_s", "<f8"),
-        ("last_cmd_queue_latency_s", "<f8"),
-        ("last_cmd_apply_latency_s", "<f8"),
-        ("last_cmd_sdk_duration_s", "<f8"),
-        ("last_cmd_is_hold", "<u1"),
-        ("source_monotonic_ns", "<u8"),
-        ("publish_monotonic_ns", "<u8"),
-        ("state_valid", "<u1"),
-        ("timestamp", "<f8"),
-    ]
-)
-
-HAND_STATE_DTYPE = np.dtype(
-    [
-        ("qpos", "<f8", (12,)),
-        ("current", "<f8", (12,)),
-        ("tactile_sum", "<f8", (5, 3)),
-        ("tactile_contact", "<u1", (5,)),
-        ("error_state", "<u1"),
-        ("connected", "<u1"),
-        ("qpos_stale", "<u1"),
-        ("commboard_err", "<i4", (12,)),
-        ("jointboard_err", "<i4", (12,)),
-        ("tipboard_err", "<i4", (12,)),
-        ("source_monotonic_ns", "<u8"),
-        ("publish_monotonic_ns", "<u8"),
-        ("state_valid", "<u1"),
-        ("send_healthy", "<u1"),
-        ("read_healthy", "<u1"),
-        ("timestamp", "<f8"),
-    ]
-)  # no tactile_force — that is carried by hand_tactile_ring
-
+# Backward-compatible alias retained for external callers; the canonical
+# command schema is defined in dexmani_real.ipc.schema.
 HAND_CMD_DTYPE = HAND_COMMAND_DTYPE
-
-COMPONENT_STATUS_DTYPE = np.dtype(
-    [
-        ("component", "S24"),
-        ("phase", "<u1"),
-        ("fault_code", "<u2"),
-        ("exit_reason", "<u1"),
-        ("generation", "<u8"),
-        ("updated_monotonic_ns", "<u8"),
-        ("detail", "S160"),
-    ],
-    align=True,
-)
-
-HAND_TACTILE_DTYPE = np.dtype(
-    [
-        ("tactile_force", "<f8", (5, 120, 3)),
-        ("source_monotonic_ns", "<u8"),
-        ("fresh", "<u1"),
-        ("calibrated", "<u1"),
-        ("unit_code", "<u1"),  # 0=unknown, 1=newton (vendor conversion provenance required)
-    ]
-)
 
 
 def new_frame(dtype: np.dtype) -> np.ndarray:
@@ -492,22 +434,7 @@ class SharedStorage:
 
 def vr_frame_dtype() -> np.dtype:
     """VR frame dtype — mirrors vr_receiver_process frame output."""
-    return np.dtype(
-        [
-            ("wrist_pos", "<f8", (3,)),
-            ("wrist_quat_wxyz", "<f8", (4,)),
-            ("landmarks", "<f8", (21, 3)),
-            ("head_pos", "<f8", (3,)),
-            ("head_quat_wxyz", "<f8", (4,)),
-            ("recv_ts_ns", "<u8"),
-            ("source_ts_ns", "<u8"),
-            ("sequence_id", "<u8"),
-            ("source_frame_seq", "<u8"),
-            ("local_recv_ns", "<u8"),
-            ("side", "<i4"),
-        ],
-        align=True,
-    )
+    return VR_FRAME_DTYPE
 
 
 # Shared ring read/write helpers
@@ -529,26 +456,6 @@ def read_hand_state(shared: "SharedStorage") -> "np.ndarray | None":
         return None
     data, _ts_ns, _seq = result
     return data
-
-
-def write_hand_cmd(shared: "SharedStorage", qpos: "np.ndarray", *, safety_gate: "Any | None" = None) -> bool:
-    """Publish a hand target together with a measured arm hold."""
-    arm_state = read_arm_state(shared)
-    if arm_state is None:
-        return False
-    arm_qpos = np.asarray(arm_state["qpos"][0], dtype=np.float64)
-    from dexmani_real.policy.action_protocol import publish_joint_targets
-
-    return (
-        publish_joint_targets(
-            shared,
-            arm_qpos,
-            np.asarray(qpos, dtype=np.float64),
-            is_hold=True,
-            safety_gate=safety_gate,
-        )
-        is not None
-    )
 
 
 def publish_component_status(
@@ -584,58 +491,6 @@ def publish_component_status(
     else:
         with lock:
             ring.write(frame)
-
-
-def hand_home_converge(
-    shared: SharedStorage,
-    home_qpos: np.ndarray,
-    *,
-    timeout_s: float = 5.0,
-    tol_deg: float = 5.0,
-    heartbeat: bool = False,
-    check_is_running: bool = True,
-    verbose: bool = True,
-    safety_gate: "Any | None" = None,
-) -> "tuple[bool, np.ndarray | None]":
-    """Poll hand_state_ring until hand converges to home_qpos.
-
-    Returns ``(reached, final_qpos_or_none)``.
-    """
-    tol = np.deg2rad(tol_deg)
-    deadline = time.monotonic() + timeout_s
-    requested_after_s = time.monotonic()
-    first = True
-
-    while time.monotonic() < deadline:
-        if check_is_running and not shared.is_running.value:
-            break
-        if heartbeat:
-            shared.policy_heartbeat_s.value = time.monotonic()
-        if not write_hand_cmd(shared, home_qpos, safety_gate=safety_gate):
-            if verbose:
-                print("  hand: coordinated home command was rejected", flush=True)
-            return False, None
-        hs = read_hand_state(shared)
-        if hs is not None:
-            current = np.asarray(hs["qpos"][0], dtype=np.float64)
-            fresh = float(hs["timestamp"][0]) >= requested_after_s
-            healthy = bool(hs["connected"][0]) and not bool(hs["error_state"][0])
-            if fresh and healthy and np.all(np.isfinite(current)):
-                err = float(np.max(np.abs(current - home_qpos)))
-                if err < tol:
-                    if verbose:
-                        print("  hand: home reached", flush=True)
-                    return True, current.copy()
-                if verbose and first:
-                    print(f"  hand: homing... (max_err={np.rad2deg(err):.0f}°)", flush=True)
-                    first = False
-        # Allow the two-worker lead time plus one actuator tick before
-        # replacing the next latest-wins hand endpoint.
-        time.sleep(0.1)
-
-    if verbose:
-        print(f"  hand: home settle timeout after {timeout_s:.0f}s — proceeding", flush=True)
-    return False, None
 
 
 def read_arm_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":

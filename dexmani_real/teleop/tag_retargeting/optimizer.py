@@ -86,6 +86,8 @@ class HandOptimizer:
         self.pin_grad = PinGrad(urdf_path, fingertip_frame_names)
         self.dof: int = self.pin_grad.dof
         self.finger_num: int = len(self.pin_grad.tip_frame_ids)
+        if self.finger_num != 5:
+            raise ValueError(f"TAG optimizer requires exactly five fingertip frames, got {self.finger_num}")
 
         lower = np.asarray(joint_limits_lower, dtype=np.float64)
         upper = np.asarray(joint_limits_upper, dtype=np.float64)
@@ -102,7 +104,20 @@ class HandOptimizer:
         self.feedback_bound_tolerance_rad = float(feedback_bound_tolerance_rad)
 
         # ── Finger length scaling ──
-        ratio = np.asarray(finger_lengths_robot, dtype=np.float64) / np.asarray(finger_lengths_human, dtype=np.float64)
+        robot_lengths = np.asarray(finger_lengths_robot, dtype=np.float64)
+        human_lengths = np.asarray(finger_lengths_human, dtype=np.float64)
+        if (
+            robot_lengths.shape != (self.finger_num,)
+            or human_lengths.shape != (self.finger_num,)
+            or not np.all(np.isfinite(robot_lengths))
+            or not np.all(np.isfinite(human_lengths))
+            or np.any(robot_lengths <= 0)
+            or np.any(human_lengths <= 0)
+            or not np.isfinite(finger_scale_boost)
+            or finger_scale_boost <= 0
+        ):
+            raise ValueError("finger lengths and scale boost must be finite, positive five-finger values")
+        ratio = robot_lengths / human_lengths
         self.finger_scale: np.ndarray = ratio * finger_scale_boost  # (finger_num,)
 
         # ── FreeFlyer buffer: base translation always zero, rotation always identity ──

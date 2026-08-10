@@ -138,7 +138,7 @@ class RobotAction:
 class ArmState:
     """Arm process state — published to arm_state_ring every tick (~322 bytes).
 
-    Matches ARM_STATE_DTYPE in shm/shared_storage.py.
+    Matches ARM_STATE_DTYPE in ipc/schema.py.
     """
 
     qpos: np.ndarray  # (7,)  float64  rad
@@ -166,7 +166,7 @@ class HandState:
     """Hand process state — published to hand_state_ring every tick (~472 bytes).
 
     Does NOT include tactile_force — that's in HandTactile on a separate ring.
-    Matches HAND_STATE_DTYPE in shm/shared_storage.py.
+    Matches HAND_STATE_DTYPE in ipc/schema.py.
     """
 
     qpos: np.ndarray  # (12,) float64  rad

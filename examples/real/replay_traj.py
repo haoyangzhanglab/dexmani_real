@@ -86,6 +86,7 @@ from dexmani_real.planning.preflight import PreflightCertificate, create_preflig
 from dexmani_real.policy.action_protocol import (
     ActionSafetyGate,
     ActionSafetyGateConfig,
+    hand_home_converge,
     planner_action_safety_gate,
     publish_joint_targets,
 )
@@ -97,7 +98,6 @@ from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import (
     SharedStorage,
     SharedStorageConfig,
-    hand_home_converge,
     read_arm_state,
     read_arm_state_dict,
     read_hand_state_dict,
@@ -1125,6 +1125,7 @@ class TrajectoryReplayer:
                 dt_s=1.0 / self.replay_hz,
                 safety_gate=self._action_safety_gate,
             ):
+                kb.stop()
                 return self._recorder.to_dict()
         self._rate_mgr = RateManager(self.replay_hz)
 
@@ -1282,11 +1283,12 @@ class TrajectoryReplayer:
         finally:
             kb.stop()
 
-            if self._recorder is not None:
-                actual = self._recorder.count
-                if actual < T:
-                    print(f"\nReplay stopped at frame {actual}/{T}")
-                return self._recorder.to_dict()
+        if self._recorder is not None:
+            actual = self._recorder.count
+            if actual < T:
+                print(f"\nReplay stopped at frame {actual}/{T}")
+            return self._recorder.to_dict()
+        return None
 
     def _emergency_stop(self) -> None:
         """Signal all processes to stop via flags (no direct SDK access)."""

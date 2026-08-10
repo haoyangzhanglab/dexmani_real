@@ -71,7 +71,7 @@ from dexmani_real.utils.signal_utils import ema_smooth_pose
 try:
     from pynput import keyboard  # type: ignore[import-untyped]
 except ImportError:
-    raise ImportError("pynput is required for keyboard input. Install with: pip install pynput")
+    raise ImportError("pynput is required for keyboard input. Install with: pip install pynput") from None
 
 logger = get_logger(__name__)
 

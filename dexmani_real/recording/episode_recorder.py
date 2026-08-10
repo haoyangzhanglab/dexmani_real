@@ -814,10 +814,8 @@ class EpisodeRecorder:
         """
         t = self._stop_thread
         if t is None:
-            if self._stop_error is not None:
-                # Thread already joined (dead from crash) in a prior call.
-                return False
-            return True
+            # A prior call may already have joined a crashed stop thread.
+            return self._stop_error is None
         if t.is_alive():
             t.join(timeout=timeout)
             if t.is_alive():

@@ -48,6 +48,16 @@ def test_backend_runtime_import_surface_is_device_and_gui_free() -> None:
     )
 
 
+def test_ipc_schema_layer_has_no_policy_or_recording_dependency() -> None:
+    schema = (REPO_ROOT / "dexmani_real" / "ipc" / "schema.py").read_text(encoding="utf-8")
+    storage = (REPO_ROOT / "dexmani_real" / "shm" / "shared_storage.py").read_text(encoding="utf-8")
+    forbidden = ("dexmani_real.policy", "dexmani_real.recording", "dexmani_real.robot", "dexmani_real.sensor")
+
+    assert not [token for token in forbidden if token in schema]
+    assert "from dexmani_real.policy" not in storage
+    assert "from dexmani_real.recording" not in storage
+
+
 def test_worker_modules_do_not_own_global_shutdown_flag() -> None:
     violations: list[str] = []
     for package in ("policy", "recording", "robot", "sensor"):
@@ -76,3 +86,19 @@ def test_hardware_entry_points_supply_geometry_aware_action_gate() -> None:
             if not any(keyword.arg == "safety_gate" for keyword in node.keywords):
                 violations.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
     assert not violations, "hardware publisher omitted geometry-aware safety_gate: " + ", ".join(violations)
+
+
+def test_replay_never_returns_from_finally_and_swallows_motion_errors() -> None:
+    path = REPO_ROOT / "examples" / "real" / "replay_traj.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    replayer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TrajectoryReplayer")
+    run_method = next(node for node in replayer.body if isinstance(node, ast.FunctionDef) and node.name == "run")
+    violations = [
+        node.lineno
+        for node in ast.walk(run_method)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(descendant, ast.Return) for statement in node.finalbody for descendant in ast.walk(statement)
+        )
+    ]
+    assert not violations, f"replay return in finally suppresses exceptions at lines {violations}"

@@ -14,7 +14,7 @@ from dexmani_real.policy.action_protocol import COMMIT_DTYPE, AckStatus, make_co
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.vr_teleop_policy import _do_teleop_home
 from dexmani_real.robot.arm_loop import ArmLoopConfig, _planned_homing
-from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
+from dexmani_real.robot.hand_process import HandProcessConfig, _update_tracking_stall, hand_loop
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.shared_storage import (
     HomeRequest,
@@ -548,6 +548,46 @@ def test_hand_runtime_counts_boolean_command_rejection() -> None:
 
     hand_instance.send_action.assert_called_once()
     hand_instance.clear_error.assert_called_once()
+    assert shared.error_state.value
+
+
+def test_hand_tracking_stall_distinguishes_settled_feedback_from_no_progress() -> None:
+    target = np.ones(12)
+    stale_frames, previous_error, active = _update_tracking_stall(
+        target.copy(),
+        target,
+        active=True,
+        previous_error_rad=1.0,
+        stale_frames=14,
+        progress_epsilon_rad=1e-4,
+    )
+    assert (stale_frames, active) == (0, False)
+
+    qpos = np.zeros(12)
+    previous_error = float(np.max(np.abs(qpos - target)))
+    stale_frames = 0
+    active = True
+    for _ in range(15):
+        stale_frames, previous_error, active = _update_tracking_stall(
+            qpos,
+            target,
+            active=active,
+            previous_error_rad=previous_error,
+            stale_frames=stale_frames,
+            progress_epsilon_rad=1e-4,
+        )
+    assert active
+    assert stale_frames == 15
+
+    stale_frames, previous_error, active = _update_tracking_stall(
+        np.full(12, 0.5),
+        target,
+        active=True,
+        previous_error_rad=1.0,
+        stale_frames=7,
+        progress_epsilon_rad=1e-4,
+    )
+    assert (stale_frames, previous_error, active) == (0, 0.5, True)
 
 
 def test_hand_runtime_prepares_next_chunk_step_in_apply_tick() -> None:

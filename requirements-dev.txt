@@ -1,0 +1,10 @@
+# Offline development and verification tools.  Robot, camera, and planning
+# runtimes remain intentionally absent from setup.py.
+black==26.5.1
+coverage==7.10.2
+diff-cover==9.7.1
+isort==5.13.2
+mypy==2.3.0
+pytest==9.1.1
+pytest-cov==6.2.1
+ruff==0.12.8

@@ -132,7 +132,9 @@ class KeyboardHandler:
         try:
             from pynput import keyboard  # type: ignore[import-untyped]
         except ImportError:
-            raise ImportError("pynput is required for global keyboard capture. " "Install with: pip install pynput")
+            raise ImportError(
+                "pynput is required for global keyboard capture. " "Install with: pip install pynput"
+            ) from None
 
         # Suppress terminal echo so keys captured by pynput don't also
         # appear as stray characters on stdout (interleaving with print()

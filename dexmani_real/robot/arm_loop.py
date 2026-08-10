@@ -14,10 +14,10 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, safety
+from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, ARM_STATE_DTYPE
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.action_protocol import (
-    ARM_COMMAND_DTYPE,
     AckStatus,
     RejectReason,
     command_matches_commit,
@@ -27,14 +27,7 @@ from dexmani_real.policy.action_protocol import (
 )
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import (
-    ARM_STATE_DTYPE,
-    HOME_SENTINEL,
-    HomeRequest,
-    HomeResult,
-    new_frame,
-    publish_component_status,
-)
+from dexmani_real.shm.shared_storage import HOME_SENTINEL, HomeRequest, HomeResult, new_frame, publish_component_status
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter

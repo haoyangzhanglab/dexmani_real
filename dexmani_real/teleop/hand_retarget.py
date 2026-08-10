@@ -21,6 +21,19 @@ logger = get_logger(__name__)
 
 _palm_fallback_warn = None  # lazy ThrottledWarner — initialized on first fallback
 
+
+class _TAGRuntimeOverrides:
+    """Private policy-to-TAG wiring that leaves the public constructor stable."""
+
+    def __init__(self, config: Any | None, urdf_path: str) -> None:
+        self.config = config
+        self.urdf_path = str(urdf_path)
+
+
+def _tag_config_with_urdf(config: Any | None, urdf_path: str) -> _TAGRuntimeOverrides:
+    return _TAGRuntimeOverrides(config, urdf_path)
+
+
 # ── Pinky landmark indices (MediaPipe convention) ──
 _PINKY_MCP = 17
 _PINKY_PIP = 18
@@ -51,7 +64,8 @@ _CONTIGUOUS_BONES = tuple(
 # (originally from deleted utils/hand_utils.py — sole caller is retarget() below)
 
 # Operator→MANO coordinate transform (right hand).
-# det = -1: improper rotation includes a reflection for left→right hand chirality flip.
+# det = +1: this is a proper rotation.  Unity left-handed → FLU chirality conversion
+# has already happened once in sensor/vr_receiver_process.py.
 _OPERATOR2MANO_RIGHT = np.array(
     [
         [0, 0, -1],
@@ -447,12 +461,24 @@ class TAGHandRetargeter:
         from dexmani_real.config.defaults import policy as policy_d
         from dexmani_real.config.defaults import tag_retargeting as default_tag_cfg
         from dexmani_real.teleop.tag_retargeting.optimizer import HandOptimizer
+        from dexmani_real.teleop.tag_retargeting.pin_grad import validate_fingertip_frame_names
 
+        runtime_urdf_path: str | None = None
+        if isinstance(tag_config, _TAGRuntimeOverrides):
+            runtime_urdf_path = tag_config.urdf_path
+            tag_config = tag_config.config
         tag_cfg = default_tag_cfg if tag_config is None else tag_config
 
         # ── Load URDF, read joint limits ──
-        urdf_path = str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
-        model = pin_loading(urdf_path)
+        resolved_urdf_path = (
+            str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
+            if runtime_urdf_path is None
+            else runtime_urdf_path
+        )
+        resolved_tip_names = validate_fingertip_frame_names(
+            hand_d.fingertip_link_names if fingertip_link_names is None else fingertip_link_names
+        )
+        model = pin_loading(resolved_urdf_path)
         joint_lo = model.lowerPositionLimit[7:].copy()
         joint_hi = model.upperPositionLimit[7:].copy()
 
@@ -510,10 +536,8 @@ class TAGHandRetargeter:
 
         # ── Optimizer ──
         self._optimizer = HandOptimizer(
-            urdf_path=urdf_path,
-            fingertip_frame_names=list(
-                hand_d.fingertip_link_names if fingertip_link_names is None else fingertip_link_names
-            ),
+            urdf_path=resolved_urdf_path,
+            fingertip_frame_names=list(resolved_tip_names),
             joint_limits_lower=joint_lo,
             joint_limits_upper=joint_hi,
             finger_lengths_robot=np.array(tag_cfg.robot_finger_lengths, dtype=np.float64),
@@ -551,7 +575,7 @@ class TAGHandRetargeter:
 
         logger.info(
             "TAGHandRetargeter ready (urdf=%s, smoothing_alpha=%.2f, mano→urdf=%s)",
-            urdf_path,
+            resolved_urdf_path,
             self._smoothing_alpha,
             tag_cfg.mano_to_urdf_euler,
         )
