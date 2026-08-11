@@ -85,7 +85,7 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 | 键盘控制 | `examples/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` → `keyboard.py` → 安全动作协议 |
 | 实验性学习策略 | `examples/deploy_policy.py` | `policy/deployment.py` → `inference_process.py` → `learned_coordinator.py` |
 | Episode 回放 | `examples/replay_episode.py` | `replay/episode.py` → `preflight.py` → `session.py` / `runner.py` |
-| 相机标定 | `examples/calibrate_camera.py` | `calibration/camera_experiment.py` → ArUco、手眼标定与原子写入 |
+| 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | 无额外包装入口 | `python -m dexmani_real.recording.analysis.episode_quality` 或 `visualize_episode` |
 
 ## 从入口到核心模块
@@ -124,20 +124,6 @@ python -m compileall -q dexmani_real examples
 |---|---|
 | `dexmani_real/__init__.py` | 定义包级路径 `PACKAGE_DIR`、`ASSET_DIR`，并概述机器人、遥操作、规划、录制和传感器子系统。 |
 
-### `calibration/` — 相机与 VR 标定
-
-| 文件 | 作用 |
-|---|---|
-| `calibration/__init__.py` | 导出可离线验证的 VR 朝向估计、质量门与原子 JSON 写入接口。 |
-| `calibration/aruco.py` | 定义 ArUco 配置，检测 marker 位姿、聚合稳定帧并绘制诊断叠加层。 |
-| `calibration/camera_device.py` | 延迟导入 RealSense，选择相机序列号并启动带内参与元数据的标定相机流。 |
-| `calibration/camera_experiment.py` | 相机眼到手标定的 CLI 协调器：构建运行时/规划器、收集样本、评估并保存候选结果。 |
-| `calibration/camera_motion.py` | 以受限工作空间步进驱动机械臂，为相机标定采样提供运动控制状态机。 |
-| `calibration/camera_session.py` | 定义相机标定会话配置、采样状态校验和事件回调协议。 |
-| `calibration/hand_eye.py` | 求解眼到手变换，衡量运动激励与 marker 一致性，筛选候选并更新相机标定数据。 |
-| `calibration/vr_heading.py` | 从 VR 四元数稳健估计水平朝向，执行质量检查并生成/原子写入变换配置。 |
-| `calibration/vr_heading_experiment.py` | VR 朝向标定 CLI：监督 VR 健康、采集参考朝向、报告估计质量。 |
-
 ### `config/` — 默认值、运行时快照与标定数据
 
 | 文件 | 作用 |
@@ -146,15 +132,6 @@ python -m compileall -q dexmani_real examples
 | `config/camera_calib.py` | 加载相机外参，按物理序列号校验条目，并统一 eye-to-hand / eye-in-hand 坐标变换。 |
 | `config/defaults.py` | 所有数值默认值的单一来源：臂、手、VR、相机、策略、键盘、安全、碰撞与录制参数。 |
 | `config/runtime.py` | 将默认 dataclass 与 YAML/点路径覆盖合并、验证并冻结为可跨进程使用的运行时配置快照。 |
-
-### `diagnostics/` — 受限硬件诊断
-
-| 文件 | 作用 |
-|---|---|
-| `diagnostics/__init__.py` | 标识可离线导入、命令受限的硬件诊断包。 |
-| `diagnostics/pointcloud.py` | 检查 RGB-D/外参/桌面平面质量；只有显式写入选项和确认流程才会更新平面配置。 |
-| `diagnostics/realsense.py` | 列举 RealSense、验证 connect/disconnect 生命周期并在限时流中检查帧质量。 |
-| `diagnostics/xhand.py` | 启动处于 `DISARMED` 的手部 worker，仅监控身份、心跳和状态新鲜度。 |
 
 ### `ipc/` — 进程无关的数据协议
 
@@ -311,11 +288,11 @@ python -m compileall -q dexmani_real examples
 | `examples/deploy_policy.py` | `policy.deployment.main` | 实验性学习策略入口；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
 | `examples/keyboard_teleop_real.py` | `teleop.keyboard_experiment.main` | 以键盘驱动机械臂、默认使用实测 XHand 反馈的入口；硬件相关。 |
 | `examples/replay_episode.py` | `replay.episode.main` | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
-| `examples/calibrate_camera.py` | `calibration.camera_experiment.main` | ArUco 眼到手标定入口；会采集设备数据并可能更新标定。 |
-| `examples/calibrate_vr_heading.py` | `calibration.vr_heading_experiment.main` | VR 朝向标定入口；会读取 VR 数据并在确认后写入变换。 |
-| `examples/diagnose_realsense.py` | `diagnostics.realsense.main` | 限时 RealSense 生命周期/流诊断入口；会连接相机。 |
-| `examples/diagnose_pointcloud.py` | `diagnostics.pointcloud.main` | 点云与桌面平面诊断入口；默认检查，显式写入选项才修改配置。 |
-| `examples/diagnose_xhand.py` | `diagnostics.xhand.main` | XHand 只读状态诊断入口；仍会启动并连接手部 worker。 |
+| `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
+| `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
+| `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
+| `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
+| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；动作命令需显式硬件授权。 |
 
 ## 配置、资源与延伸文档
 

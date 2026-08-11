@@ -13,6 +13,7 @@ _XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
 __all__ = [
     "compose_pose",
     "compute_pose_error",
+    "forward_from_quat_wxyz",
     "invert_pose",
     "normalize_quat_wxyz",
     "quat_multiply",
@@ -161,3 +162,13 @@ def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
     """
     quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
     return Rotation.from_quat(quat_xyzw).as_matrix()
+
+
+def forward_from_quat_wxyz(q_wxyz: np.ndarray) -> np.ndarray:
+    """FLU +X forward direction from a WXYZ quaternion.
+
+    Applies the quaternion rotation to the canonical forward vector [1, 0, 0],
+    returning the resulting direction in world coordinates.
+    """
+    quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
+    return Rotation.from_quat(quat_xyzw).apply(np.array([1.0, 0.0, 0.0]))

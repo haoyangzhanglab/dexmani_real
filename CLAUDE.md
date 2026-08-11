@@ -33,7 +33,7 @@ entry points, not test fixtures.
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, safety gate |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
 | Change replay | `replay/episode.py` | preflight → session → runner → metrics |
-| Change calibration/diagnostics | `calibration/` / `diagnostics/` | explicit confirmation/write paths and JSON compatibility |
+| Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and JSON compatibility |
 
 ## 2. Ownership map
 
@@ -250,11 +250,11 @@ aligned samples → RecorderIO → temporary episode + stream verification
 | `examples/deploy_policy.py` | `policy/deployment.py` | Hardware control; spec/hash/preflight gated |
 | `examples/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` | Hardware control; measured hand feedback by default |
 | `examples/replay_episode.py` | `replay/episode.py` | Dry-run by default; `--live` reruns dense preflight |
-| `examples/calibrate_camera.py` | `calibration/camera_experiment.py` | Hardware/data-writing operation |
-| `examples/calibrate_vr_heading.py` | `calibration/vr_heading_experiment.py` | Hardware read; transform write is gated |
-| `examples/diagnose_realsense.py` | `diagnostics/realsense.py` | Bounded device diagnostic |
-| `examples/diagnose_pointcloud.py` | `diagnostics/pointcloud.py` | Inspection by default; explicit confirmation for calibration write |
-| `examples/diagnose_xhand.py` | `diagnostics/xhand.py` | Read-only hand-state diagnostic |
+| `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |
+| `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |
+| `examples/realsense_record_example.py` | — | Interactive RealSense RGB-D + point-cloud test; hardware read-only by default |
+| `examples/pointcloud_process_example.py` | `sensor/pointcloud_processor.py` | Production point-cloud pipeline diagnostic; explicit confirmation for desk-plane write |
+| `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; requires explicit hardware authorization for motion commands |
 
 ## 8. Completion checklist
 

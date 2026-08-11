@@ -62,7 +62,7 @@ producers and consumers.
 | FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
 | Episode schema or quality rule | `recording/` | reader, analysis, replay consumers, schema marker, old-format behavior |
 | Replay behavior | `replay/episode.py`, `replay/preflight.py` | provenance/dense preflight, session/runner, metrics, live safety path |
-| Calibration or diagnostics | `calibration/` or `diagnostics/` | explicit write/confirmation path and operational JSON compatibility |
+| Calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit write/confirmation path and operational JSON compatibility |
 | CLI surface | `examples/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
 
 ## 3. Non-negotiable architecture
@@ -99,8 +99,8 @@ Preserve these unless the user explicitly requests an architectural redesign.
 ## 4. Hardware and operational safety
 
 Every program below `examples/` can affect hardware. Do **not** run
-teleoperation, policy deployment, replay, homing, calibration, RealSense, or
-XHand diagnostics without explicit user authorization and confirmation that the
+teleoperation, policy deployment, replay, homing, calibration, or RealSense
+without explicit user authorization and confirmation that the
 workspace is clear and the hardware is ready. Do not use a module import as a
 shortcut when it might initialize a device SDK.
 
