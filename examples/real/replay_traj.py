@@ -188,6 +188,7 @@ def _build_preflight_certificate(
             workspace_bounds=workspace,
         ),
         hand_dof=True,
+        static_boxes=tuple(runtime.environment.static_boxes),
     )
     modeled_hand = _modeled_hand_actions(
         traj,
@@ -220,6 +221,7 @@ def _build_preflight_certificate(
         workspace_check=planner.is_workspace_segment_safe,
         table_check=table_check,
         hand_enabled=not no_hand and traj.action_hand_joint is not None,
+        static_boxes=tuple(runtime.environment.static_boxes),
     )
 
 
@@ -947,6 +949,7 @@ class TrajectoryReplayer:
                 max_pose_error_rot_rad=np.deg2rad(5.0),
             ),
             hand_dof=True,
+            static_boxes=tuple(self.runtime.environment.static_boxes),
         )
         self._action_safety_gate = planner_action_safety_gate(
             ActionSafetyGateConfig(
@@ -1596,6 +1599,7 @@ Control keys:
             workspace_bounds_m=workspace,
             resolved_config_sha256=replay_runtime_sha256,
             hand_enabled=not args.no_hand and traj.action_hand_joint is not None,
+            static_boxes=tuple(runtime.environment.static_boxes),
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"Error: live replay preflight rejected: {exc}")

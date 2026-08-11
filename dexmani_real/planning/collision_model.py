@@ -30,7 +30,8 @@ Usage::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -96,6 +97,7 @@ class CollisionModel:
         urdf_path: str | None = None,
         srdf_path: str | None = None,
         package_dir: str | None = None,
+        static_boxes: Iterable[Any] = (),
     ) -> None:
         import pinocchio as pin
 
@@ -133,13 +135,46 @@ class CollisionModel:
 
         self._collision_data = self._collision_model.createData()
 
+        # A separate geometry model contains only robot↔static-obstacle pairs.
+        # It deliberately has no robot↔robot or obstacle↔obstacle pairs, so the
+        # existing self-collision API and SRDF semantics remain unchanged.
+        self._environment_collision_model = pin.buildGeomFromUrdf(
+            self._model, _urdf, pin.GeometryType.COLLISION, package_dirs=[pkg]
+        )
+        self._robot_environment_geom_count = int(self._environment_collision_model.ngeoms)
+        self._environment_names: dict[int, str] = {}
+        normalized_boxes = tuple(self._normalize_static_box(box) for box in static_boxes)
+        box_names = [str(box["name"]) for box in normalized_boxes]
+        if len(box_names) != len(set(box_names)):
+            raise ValueError("static collision box names must be unique")
+        if normalized_boxes:
+            from hppfcl.hppfcl import Box
+
+            for box in normalized_boxes:
+                placement = pin.SE3(self._quat_wxyz_to_matrix(box["quat_wxyz"]), box["center_xyz_m"])
+                geometry = pin.GeometryObject(
+                    f"environment::{box['name']}",
+                    0,
+                    0,
+                    Box(*box["size_xyz_m"]),
+                    placement,
+                )
+                obstacle_id = int(self._environment_collision_model.addGeometryObject(geometry))
+                self._environment_names[obstacle_id] = str(box["name"])
+                for robot_id in range(self._robot_environment_geom_count):
+                    self._environment_collision_model.addCollisionPair(pin.CollisionPair(robot_id, obstacle_id))
+        self._environment_collision_data = self._environment_collision_model.createData()
+        self._static_boxes = normalized_boxes
+
         self._nq: int = self._model.nq
         logger.info(
-            "CollisionModel ready: %d DOF%s, %d geometries, %d collision pairs",
+            "CollisionModel ready: %d DOF%s, %d geometries, %d self pairs, %d static boxes, %d environment pairs",
             self._nq,
             " (7 arm + 12 hand)" if hand_dof else "",
             self._collision_model.ngeoms,
             len(self._collision_model.collisionPairs),
+            len(self._static_boxes),
+            len(self._environment_collision_model.collisionPairs),
         )
 
         # --- qpos shape cache for validation ---
@@ -148,6 +183,49 @@ class CollisionModel:
         # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF).
         # None = not yet set by caller; set_hand_qpos() assigns a real array.
         self._hand_qpos: np.ndarray | None = None
+
+    @staticmethod
+    def _box_value(box: Any, name: str) -> Any:
+        if isinstance(box, Mapping):
+            return box[name]
+        return getattr(box, name)
+
+    @classmethod
+    def _normalize_static_box(cls, box: Any) -> dict[str, Any]:
+        """Validate and copy a dataclass, frozen config node, or mapping box."""
+        raw_name = cls._box_value(box, "name")
+        if not isinstance(raw_name, str):
+            raise TypeError("static collision box name must be a string")
+        name = raw_name
+        center = np.asarray(cls._box_value(box, "center_xyz_m"), dtype=np.float64)
+        size = np.asarray(cls._box_value(box, "size_xyz_m"), dtype=np.float64)
+        quat = np.asarray(cls._box_value(box, "quat_wxyz"), dtype=np.float64)
+        if not name.strip() or name != name.strip() or name == "table":
+            raise ValueError("static collision box name must be non-empty and must not use reserved name 'table'")
+        if center.shape != (3,) or size.shape != (3,) or quat.shape != (4,):
+            raise ValueError("static collision box center/size/quaternion shapes are invalid")
+        if not np.all(np.isfinite(np.concatenate((center, size, quat)))) or np.any(size <= 0.0):
+            raise ValueError("static collision box values must be finite and sizes positive")
+        if not np.isclose(float(np.linalg.norm(quat)), 1.0, rtol=0.0, atol=1e-6):
+            raise ValueError("static collision box quaternion must have unit norm")
+        return {
+            "name": name,
+            "center_xyz_m": center.copy(),
+            "size_xyz_m": size.copy(),
+            "quat_wxyz": quat.copy(),
+        }
+
+    @staticmethod
+    def _quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
+        w, x, y, z = (float(value) for value in quat_wxyz)
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
 
     # ------------------------------------------------------------------
     # qpos handling
@@ -294,6 +372,80 @@ class CollisionModel:
         return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))
 
     # ------------------------------------------------------------------
+    # Static environment and combined collision checks
+    # ------------------------------------------------------------------
+
+    @property
+    def has_static_environment(self) -> bool:
+        return bool(self._static_boxes)
+
+    def check_environment_collision(self, qpos: np.ndarray) -> bool:
+        """Return whether robot geometry touches any configured static box."""
+        if not self._static_boxes:
+            self._to_full_qpos(qpos)  # preserve finite/shape validation
+            return False
+        full_qpos = self._to_full_qpos(qpos)
+        return bool(
+            self._pin.computeCollisions(
+                self._model,
+                self._data,
+                self._environment_collision_model,
+                self._environment_collision_data,
+                full_qpos,
+                True,
+            )
+        )
+
+    def check_environment_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
+        """Return robot link, obstacle name, and sampled qpos for a scene contact."""
+        from .types import CollisionInfo, CollisionPair
+
+        full_qpos = self._to_full_qpos(qpos)
+        if not self._static_boxes:
+            return CollisionInfo.no_collision()
+        self._pin.forwardKinematics(self._model, self._data, full_qpos)
+        self._pin.updateGeometryPlacements(
+            self._model,
+            self._data,
+            self._environment_collision_model,
+            self._environment_collision_data,
+        )
+        pairs: list[CollisionPair] = []
+        for pair_index, pair in enumerate(self._environment_collision_model.collisionPairs):
+            if not self._pin.computeCollision(
+                self._environment_collision_model, self._environment_collision_data, pair_index
+            ):
+                continue
+            robot_id = int(pair.first)
+            obstacle_id = int(pair.second)
+            pairs.append(
+                CollisionPair(
+                    link_name1=self._get_environment_geom_link_name(robot_id),
+                    link_name2=self._environment_names[obstacle_id],
+                    object_name1=self._environment_collision_model.geometryObjects[robot_id].name,
+                    object_name2=self._environment_names[obstacle_id],
+                    collision_type="environment",
+                )
+            )
+        if not pairs:
+            return CollisionInfo.no_collision()
+        return CollisionInfo(
+            in_collision=True,
+            collision_pairs=tuple(pairs),
+            num_contacts=len(pairs),
+            sample_qpos_rad=tuple(float(value) for value in full_qpos),
+        )
+
+    def check_collision(self, qpos: np.ndarray) -> bool:
+        """Fast combined self + static-environment collision query."""
+        return self.check_self_collision(qpos) or self.check_environment_collision(qpos)
+
+    def check_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
+        """Detailed combined query; self collision takes diagnostic precedence."""
+        self_info = self.check_self_collision_details(qpos)
+        return self_info if self_info else self.check_environment_collision_details(qpos)
+
+    # ------------------------------------------------------------------
     # Segment collision checking
     # ------------------------------------------------------------------
 
@@ -329,6 +481,23 @@ class CollisionModel:
         """Check if the linear joint-space segment q1→q2 is self-collision-free."""
         return self._check_segment_free(q1, q2, step_size)
 
+    def check_combined_segment_collision_free(
+        self,
+        q1: np.ndarray,
+        q2: np.ndarray,
+        step_size: float = 0.02,
+    ) -> bool:
+        """Densely check a joint segment against self and static geometry."""
+        step_size = self._validate_step_size(step_size)
+        q1 = self._to_full_qpos(q1)
+        q2 = self._to_full_qpos(q2)
+        diff = q2 - q1
+        count = self._sample_count(q1, q2, step_size)
+        for step in range(count + 1):
+            if self.check_collision(q1 + (step / count) * diff):
+                return False
+        return True
+
     def check_transition_collision_free(
         self,
         arm_start_qpos: np.ndarray,
@@ -355,7 +524,7 @@ class CollisionModel:
             arm_qpos = arm_start + arm_alpha * arm_diff
             for hand_alpha in hand_alphas:
                 hand_qpos = hand_start + hand_alpha * hand_diff
-                if self.check_self_collision(np.concatenate([arm_qpos, hand_qpos])):
+                if self.check_collision(np.concatenate([arm_qpos, hand_qpos])):
                     return False
         return True
 
@@ -378,6 +547,13 @@ class CollisionModel:
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
         geom = self._collision_model.geometryObjects[geom_id]
+        parent_frame = geom.parentFrame
+        if parent_frame < len(self._model.frames):
+            return self._model.frames[parent_frame].name
+        return geom.name
+
+    def _get_environment_geom_link_name(self, geom_id: int) -> str:
+        geom = self._environment_collision_model.geometryObjects[geom_id]
         parent_frame = geom.parentFrame
         if parent_frame < len(self._model.frames):
             return self._model.frames[parent_frame].name

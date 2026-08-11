@@ -21,6 +21,7 @@ from dexmani_real.ipc.schema import (
     ARM_COMMAND_DTYPE,
     ARM_STATE_DTYPE,
     COMMIT_DTYPE,
+    COMPONENT_METRICS_DTYPE,
     COMPONENT_STATUS_DTYPE,
     HAND_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
@@ -198,6 +199,10 @@ class SharedStorage:
     arm_ack_ring: SeqlockRingBuffer  # arm -> coordinator
     hand_ack_ring: SeqlockRingBuffer  # hand -> coordinator
     component_status_ring: SeqlockRingBuffer  # workers -> supervisor diagnostics
+    arm_metrics_ring: SeqlockRingBuffer  # arm -> supervisor, single writer
+    hand_metrics_ring: SeqlockRingBuffer  # hand -> supervisor, single writer
+    camera_metrics_ring: SeqlockRingBuffer  # camera -> supervisor, single writer
+    policy_metrics_ring: SeqlockRingBuffer  # policy -> supervisor, single writer
     record_control_ring: SeqlockRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SeqlockRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SeqlockRingBuffer  # RecorderIO -> policy/main
@@ -312,6 +317,14 @@ class SharedStorage:
         storage.component_status_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_component_status", dtype=COMPONENT_STATUS_DTYPE, maxlen=32
         )
+        for component in ("arm", "hand", "camera", "policy"):
+            setattr(
+                storage,
+                f"{component}_metrics_ring",
+                SeqlockRingBuffer.create_or_replace(
+                    f"{prefix}_{component}_metrics", dtype=COMPONENT_METRICS_DTYPE, maxlen=8
+                ),
+            )
         storage.record_control_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=8
         )
@@ -399,6 +412,10 @@ class SharedStorage:
             ("arm_ack_ring", self.arm_ack_ring),
             ("hand_ack_ring", self.hand_ack_ring),
             ("component_status_ring", self.component_status_ring),
+            ("arm_metrics_ring", self.arm_metrics_ring),
+            ("hand_metrics_ring", self.hand_metrics_ring),
+            ("camera_metrics_ring", self.camera_metrics_ring),
+            ("policy_metrics_ring", self.policy_metrics_ring),
             ("record_control_ring", self.record_control_ring),
             ("record_sample_ring", self.record_sample_ring),
             ("record_status_ring", self.record_status_ring),
@@ -491,6 +508,89 @@ def publish_component_status(
     else:
         with lock:
             ring.write(frame)
+
+
+def publish_component_metrics(
+    shared: Any,
+    component: str,
+    rate_manager: Any,
+    *,
+    interval_s: float = 1.0,
+    now_s: float | None = None,
+) -> bool:
+    """Best-effort, at-most-once-per-interval publication of loop metrics.
+
+    Metrics are observability-only: every exception is contained here so a
+    diagnostics failure cannot block a worker or replace its original fault.
+    """
+    try:
+        now = time.monotonic() if now_s is None else float(now_s)
+        marker_name = "_dexmani_metrics_last_publish_s"
+        last = float(getattr(rate_manager, marker_name, float("-inf")))
+        if now - last < interval_s:
+            return False
+        setattr(rate_manager, marker_name, now)
+        ring = getattr(shared, f"{component}_metrics_ring", None)
+        if ring is None:
+            return False
+        stats = rate_manager.stats
+        frame = new_frame(COMPONENT_METRICS_DTYPE)
+        frame["component"][0] = component.encode("utf-8")[:16]
+        for field_name in (
+            "target_period_s",
+            "loop_count",
+            "last_work_duration_s",
+            "max_work_duration_s",
+            "deadline_overrun_count",
+            "missed_slot_count",
+            "long_block_reanchor_count",
+            "elapsed_s",
+            "actual_hz",
+        ):
+            frame[field_name][0] = getattr(stats, field_name)
+        frame["updated_monotonic_ns"][0] = time.monotonic_ns()
+        ring.write(frame)
+        return True
+    except Exception:
+        logger.warning("component=%s metrics publication failed", component, exc_info=True)
+        return False
+
+
+def read_component_metrics(shared: Any, component: str) -> dict[str, float | int | str] | None:
+    ring = getattr(shared, f"{component}_metrics_ring", None)
+    if ring is None:
+        return None
+    result = ring.read_latest()
+    if result is None:
+        return None
+    frame, _timestamp_ns, _sequence = result
+    return {
+        "component": bytes(frame["component"][0]).rstrip(b"\x00").decode("utf-8", errors="replace"),
+        "target_period_s": float(frame["target_period_s"][0]),
+        "loop_count": int(frame["loop_count"][0]),
+        "last_work_duration_s": float(frame["last_work_duration_s"][0]),
+        "max_work_duration_s": float(frame["max_work_duration_s"][0]),
+        "deadline_overrun_count": int(frame["deadline_overrun_count"][0]),
+        "missed_slot_count": int(frame["missed_slot_count"][0]),
+        "long_block_reanchor_count": int(frame["long_block_reanchor_count"][0]),
+        "elapsed_s": float(frame["elapsed_s"][0]),
+        "actual_hz": float(frame["actual_hz"][0]),
+    }
+
+
+def format_component_metrics_summary(shared: Any) -> str:
+    parts: list[str] = []
+    for component in ("arm", "hand", "camera", "policy"):
+        metrics = read_component_metrics(shared, component)
+        if metrics is None:
+            continue
+        parts.append(
+            f"{component}={metrics['actual_hz']:.1f}Hz/"
+            f"max={1000.0 * float(metrics['max_work_duration_s']):.1f}ms/"
+            f"over={metrics['deadline_overrun_count']}/miss={metrics['missed_slot_count']}/"
+            f"reanchor={metrics['long_block_reanchor_count']}"
+        )
+    return ", ".join(parts) if parts else "unavailable"
 
 
 def read_arm_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
@@ -693,12 +793,12 @@ def _format_home_candidate_rejection(candidate: "dict[str, Any]") -> str:
     """Format one path-candidate diagnostic without dumping large arrays."""
     name = str(candidate.get("name", "unknown"))
     reason = str(candidate.get("reason", "unknown"))
-    if reason == "self_collision":
+    if reason in ("self_collision", "environment_collision", "collision"):
         collision = candidate.get("collision") or {}
         pairs = collision.get("collision_pairs", []) if isinstance(collision, dict) else []
         pair_names = [f"{pair.get('link1', '?')}<->{pair.get('link2', '?')}" for pair in pairs[:2]]
         pair_text = ",".join(pair_names) if pair_names else "pair unavailable"
-        return f"{name}: self_collision sample={candidate.get('collision_waypoint_index', '?')} ({pair_text})"
+        return f"{name}: collision sample={candidate.get('collision_waypoint_index', '?')} ({pair_text})"
     if reason == "table_clearance":
         clearance_mm = 1000.0 * float(candidate.get("clearance_m", float("nan")))
         return (
@@ -971,7 +1071,8 @@ def run_supervisor(
                 _safety = shared.safety_state.value
                 _hb_ages = ", ".join(f"{n}={_now - float(heartbeat_fields[n].value):.1f}s" for n in proc_names)
                 print(
-                    f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})",
+                    f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})\n"
+                    f"                loops=({format_component_metrics_summary(shared)})",
                     flush=True,
                 )
                 _last_status_s = _now
@@ -983,6 +1084,7 @@ def run_supervisor(
         normal_exit = True
         shared.is_running.value = False
 
+    print(f"  [supervisor exit] reason={_exit_reason} loops=({format_component_metrics_summary(shared)})", flush=True)
     return _exit_reason, normal_exit
 
 
@@ -1086,5 +1188,6 @@ def print_health_summary(shared: "SharedStorage") -> None:
     else:
         print("  cam   ----  (no data yet)")
 
+    print(f"  loops  {format_component_metrics_summary(shared)}")
     print("──")
     sys.stdout.flush()

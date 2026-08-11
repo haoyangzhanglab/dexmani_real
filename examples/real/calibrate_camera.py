@@ -569,6 +569,7 @@ def main():
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
+        static_boxes=tuple(runtime.environment.static_boxes),
     )
     # Camera calibration is an arm-only experiment: no XHand worker is
     # started. Explicitly seed the 19-DOF collision model with the configured

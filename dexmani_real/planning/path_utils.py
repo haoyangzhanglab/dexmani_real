@@ -181,11 +181,28 @@ def plan_joint_home_path(
 
         # ── Self-collision check (Pinocchio mesh-based) ──
         if have_collision:
-            result = planner.ik_mgr.check_path_collisions(path)  # type: ignore[union-attr]
-            if result.get("path_self_collision", False):
+            assert planner is not None
+            _path_check = getattr(
+                planner.ik_mgr,
+                "check_path_combined_collisions",
+                planner.ik_mgr.check_path_collisions,
+            )
+            try:
+                result = _path_check(path)
+            except Exception as exc:
+                candidate.update(safe=False, reason="collision_check_error", detail=str(exc))
+                return False
+            if result.get("path_collision", result.get("path_self_collision", False)):
+                _collision = result.get("collision")
+                _pairs = _collision.get("collision_pairs", []) if isinstance(_collision, dict) else []
+                _reason = (
+                    "environment_collision"
+                    if any(pair.get("type") == "environment" for pair in _pairs)
+                    else "self_collision"
+                )
                 candidate.update(
                     safe=False,
-                    reason="self_collision",
+                    reason=_reason,
                     collision_waypoint_index=result.get("collision_waypoint_index"),
                     collision=result.get("collision"),
                 )
@@ -373,8 +390,17 @@ def plan_band_alignment_path(
 
     # ── Safety checks (same as plan_joint_home_path._check_safe) ──
     if have_collision:
-        result = planner.ik_mgr.check_path_collisions(path)  # type: ignore[union-attr]
-        if result.get("path_self_collision", False):
+        assert planner is not None
+        _path_check = getattr(
+            planner.ik_mgr,
+            "check_path_combined_collisions",
+            planner.ik_mgr.check_path_collisions,
+        )
+        try:
+            result = _path_check(path)
+        except Exception:
+            return np.empty((0, 7), dtype=np.float64)
+        if result.get("path_collision", result.get("path_self_collision", False)):
             return np.empty((0, 7), dtype=np.float64)
 
     if planner is not None:

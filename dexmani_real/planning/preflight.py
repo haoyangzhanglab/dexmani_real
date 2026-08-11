@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,39 @@ def hash_files(paths: Iterable[str | Path]) -> str:
     return _sha256_bytes(parts)
 
 
+def _canonical_scene_value(value: object) -> object:
+    if dataclasses.is_dataclass(value):
+        return {field.name: _canonical_scene_value(getattr(value, field.name)) for field in dataclasses.fields(value)}
+    if isinstance(value, Mapping):
+        return {str(key): _canonical_scene_value(item) for key, item in sorted(value.items())}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (tuple, list)):
+        return [_canonical_scene_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if hasattr(value, "to_dict"):
+        return _canonical_scene_value(value.to_dict())  # type: ignore[union-attr]
+    raise TypeError(f"unsupported collision scene value {type(value).__name__}")
+
+
+def hash_collision_scene(paths: Iterable[str | Path], static_boxes: Iterable[object]) -> str:
+    """Bind collision model contents and ordered, normalized static geometry."""
+    model_contents_hash = _sha256_bytes(
+        path.read_bytes() for path in sorted((Path(raw_path) for raw_path in paths), key=lambda item: str(item))
+    )
+    scene_json = json.dumps(
+        _canonical_scene_value(tuple(static_boxes)),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return _sha256_bytes((model_contents_hash.encode("ascii"), scene_json.encode("utf-8")))
+
+
 @dataclass(frozen=True)
 class PreflightCertificate:
     version: int
@@ -50,11 +85,16 @@ class PreflightCertificate:
     checks_run: tuple[str, ...]
     created_utc: str
     certificate_sha256: str
+    collision_scene_sha256: str | None = None
 
     def _payload(self) -> dict[str, object]:
         data = asdict(self)
         data.pop("certificate_sha256")
         data["checks_run"] = list(self.checks_run)
+        # Preserve the exact v1 payload so historical certificate checksums
+        # remain readable and verifiable.
+        if self.version == 1 and self.collision_scene_sha256 is None:
+            data.pop("collision_scene_sha256")
         return data
 
     def verify_integrity(self) -> None:
@@ -107,6 +147,7 @@ def create_preflight_certificate(
     workspace_check: Callable[[np.ndarray, np.ndarray], bool],
     table_check: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool],
     hand_enabled: bool | None = None,
+    static_boxes: Iterable[object] = (),
 ) -> PreflightCertificate:
     """Densely validate every replay transition and checksum-bind the exact inputs."""
     arm_actions = np.asarray(arm_actions, dtype=np.float64)
@@ -143,13 +184,23 @@ def create_preflight_certificate(
             raise ValueError(f"preflight table rejection at transition {start_index}->{end_index}")
 
     trajectory_hash = hash_arrays(arm_actions, hand)
-    collision_hash = hash_files(collision_model_paths)
+    collision_paths = tuple(collision_model_paths)
+    boxes = tuple(static_boxes)
+    collision_hash = hash_files(collision_paths)
+    collision_scene_hash = hash_collision_scene(collision_paths, boxes)
     workspace_hash = hash_arrays(workspace)
-    checks_run = ("shape_finite", "workspace_dense", "arm_hand_collision_dense", "table_clearance_dense")
+    checks_run = (
+        "shape_finite",
+        "workspace_dense",
+        "arm_hand_collision_dense",
+        "environment_collision_dense",
+        "table_clearance_dense",
+    )
     payload: dict[str, object] = {
-        "version": 1,
+        "version": 2,
         "trajectory_sha256": trajectory_hash,
         "collision_model_sha256": collision_hash,
+        "collision_scene_sha256": collision_scene_hash,
         "workspace_sha256": workspace_hash,
         "resolved_config_sha256": resolved_config_sha256,
         "source_episode": str(Path(source_episode).resolve()),
@@ -160,7 +211,7 @@ def create_preflight_certificate(
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return PreflightCertificate(
-        version=1,
+        version=2,
         trajectory_sha256=trajectory_hash,
         collision_model_sha256=collision_hash,
         workspace_sha256=workspace_hash,
@@ -171,6 +222,7 @@ def create_preflight_certificate(
         checks_run=checks_run,
         created_utc=str(payload["created_utc"]),
         certificate_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        collision_scene_sha256=collision_scene_hash,
     )
 
 
@@ -184,22 +236,31 @@ def verify_preflight_binding(
     workspace_bounds_m: np.ndarray,
     resolved_config_sha256: str,
     hand_enabled: bool | None = None,
+    static_boxes: Iterable[object] = (),
 ) -> None:
     certificate.verify_integrity()
+    boxes = tuple(static_boxes)
+    if certificate.version not in (1, 2):
+        raise ValueError(f"unsupported preflight certificate version {certificate.version}")
+    if certificate.version == 1 and boxes:
+        raise ValueError("preflight v1 certificate cannot validate a non-empty static collision scene")
     hand = (
         np.zeros((len(arm_actions), 12), dtype=np.float64)
         if hand_actions is None
         else np.asarray(hand_actions, dtype=np.float64)
     )
+    collision_paths = tuple(collision_model_paths)
     actual = {
         "source_episode": str(Path(source_episode).resolve()),
         "trajectory_sha256": hash_arrays(np.asarray(arm_actions, dtype=np.float64), hand),
-        "collision_model_sha256": hash_files(collision_model_paths),
+        "collision_model_sha256": hash_files(collision_paths),
         "workspace_sha256": hash_arrays(np.asarray(workspace_bounds_m, dtype=np.float64)),
         "resolved_config_sha256": resolved_config_sha256,
         "frame_count": len(arm_actions),
         "hand_enabled": hand_actions is not None if hand_enabled is None else bool(hand_enabled),
     }
+    if certificate.version == 2:
+        actual["collision_scene_sha256"] = hash_collision_scene(collision_paths, boxes)
     mismatches = [key for key, value in actual.items() if getattr(certificate, key) != value]
     if mismatches:
         raise ValueError(f"preflight certificate binding mismatch: {mismatches}")

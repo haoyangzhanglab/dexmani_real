@@ -52,6 +52,7 @@ class CollisionInfo:
     in_collision: bool
     collision_pairs: tuple[CollisionPair, ...] = ()
     num_contacts: int = 0
+    sample_qpos_rad: tuple[float, ...] | None = None
 
     # Module-level cached singleton — set after the class body.
     _NO_COLLISION: ClassVar[CollisionInfo]
@@ -68,11 +69,14 @@ class CollisionInfo:
         """Serializable dict for ``IKResult.report`` integration."""
         if not self.in_collision:
             return {"in_collision": False}
-        return {
+        result: dict[str, Any] = {
             "in_collision": True,
             "num_contacts": self.num_contacts,
             "collision_pairs": [p.to_dict() for p in self.collision_pairs],
         }
+        if self.sample_qpos_rad is not None:
+            result["sample_qpos_rad"] = list(self.sample_qpos_rad)
+        return result
 
     @property
     def summary(self) -> str:

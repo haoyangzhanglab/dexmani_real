@@ -200,9 +200,16 @@ class TeleopIKSolver:
             # so safe lower-scored alternatives can be selected.  Post-nullspace
             # collision is still checked in _command_from_target_qpos as
             # defense-in-depth for the winning candidate.
-            if profile.check_self_collision and self.ik_mgr.has_self_collision(qpos):
-                attempts.append(f"{seed_name}:collision({_solve_ms:.1f}ms)")
-                continue
+            if profile.check_self_collision:
+                try:
+                    candidate_in_collision = self.ik_mgr.has_collision(qpos)
+                except Exception:
+                    logger.warning("Teleop IK candidate collision check failed closed", exc_info=True)
+                    attempts.append(f"{seed_name}:collision_check_failed({_solve_ms:.1f}ms)")
+                    continue
+                if candidate_in_collision:
+                    attempts.append(f"{seed_name}:collision({_solve_ms:.1f}ms)")
+                    continue
 
             attempts.append(f"{seed_name}:ok({_solve_ms:.1f}ms)")
 
@@ -369,16 +376,21 @@ class TeleopIKSolver:
         qpos_cmd: np.ndarray,
         profile: TeleopProfile,
     ) -> tuple[str | None, dict[str, Any]]:
-        """Self-collision gate. Returns (reason, extra_report) or (None, {})."""
+        """Combined collision gate. Returns (reason, extra_report) or (None, {})."""
         if not profile.check_self_collision:
             return None, {}
 
-        if self.ik_mgr.has_self_collision(qpos_cmd):
-            info = self.ik_mgr.check_self_collision(qpos_cmd)
+        if self.ik_mgr.has_collision(qpos_cmd):
+            info = self.ik_mgr.check_collision(qpos_cmd)
             if info:
+                collision_type = (
+                    "environment"
+                    if info.collision_pairs and info.collision_pairs[0].collision_type == "environment"
+                    else "self"
+                )
                 return (
-                    f"IK result in self-collision ({info.summary}), holding.",
-                    {"collision_type": "self", "collision": info.to_dict()},
+                    f"IK result in {collision_type} collision ({info.summary}), holding.",
+                    {"collision_type": collision_type, "collision": info.to_dict()},
                 )
         return None, {}
 

@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.camera_calib import CameraCalib
-from dexmani_real.config.defaults import arm, camera, hand, policy
+from dexmani_real.config.defaults import arm, camera, environment, hand, policy
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
@@ -34,7 +34,7 @@ from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.io_process import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import SharedStorage, publish_component_status
+from dexmani_real.shm.shared_storage import SharedStorage, publish_component_metrics, publish_component_status
 from dexmani_real.shm.shared_storage import read_arm_state as _read_arm_state_latest
 from dexmani_real.shm.shared_storage import read_hand_state as _read_hand_state_latest
 from dexmani_real.shm.shared_storage import send_arm_home
@@ -77,6 +77,7 @@ class PolicyConfig:
     vr_stale_threshold_s: float = field(default_factory=lambda: policy.vr_mapping.stale_threshold_s)
     # Workspace bounds: [[x_min, x_max], [y_min, y_max], [z_min, z_max]] (m)
     workspace_bounds: tuple = field(default_factory=lambda: policy.workspace.as_tuple())
+    static_collision_boxes: tuple[Any, ...] = field(default_factory=lambda: environment.static_boxes)
 
     # Contact-stall resync. Table height is context only, never a pose limit.
     contact_stall_enabled: bool = field(default_factory=lambda: policy.contact_stall_enabled)
@@ -175,6 +176,7 @@ class PolicyConfig:
         hand_cfg = getattr(runtime, "hand")
         policy_cfg = getattr(runtime, "policy")
         camera_cfg = getattr(runtime, "camera")
+        environment_cfg = getattr(runtime, "environment")
         return cls(
             control_hz=float(policy_cfg.control_hz),
             coordinator_hz=float(policy_cfg.coordinator_hz),
@@ -192,6 +194,7 @@ class PolicyConfig:
                 (float(policy_cfg.workspace.y_min), float(policy_cfg.workspace.y_max)),
                 (float(policy_cfg.workspace.z_min), float(policy_cfg.workspace.z_max)),
             ),
+            static_collision_boxes=tuple(environment_cfg.static_boxes),
             contact_stall_enabled=bool(policy_cfg.contact_stall_enabled),
             contact_stall_table_z_surface_m=float(arm_cfg.table_z_surface_m),
             contact_stall_table_context_height_m=float(policy_cfg.contact_stall_table_context_height_m),
@@ -678,6 +681,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
                 nullspace_step_size_deg=1.0 * (50.0 / cfg.control_hz),
             ),
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
+            static_boxes=cfg.static_collision_boxes,
         )
 
         _vr_cfg_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
@@ -1023,6 +1027,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
         while shared.is_running.value and not _sigterm_requested:
             shared.policy_heartbeat_s.value = time.monotonic()
             limiter.wait()
+            publish_component_metrics(shared, "policy", limiter)
 
             if _control_hold_candidate is not None and not _control_hold_applied:
                 _hold_state = _candidate_application_state(shared, _control_hold_candidate)
@@ -2084,6 +2089,7 @@ def policy_loop(shared: SharedStorage, config: PolicyConfig | None = None) -> No
             stage_timer.mark("rec")
 
     finally:
+        publish_component_metrics(shared, "policy", limiter, interval_s=0.0)
         if recording_active:
             _stop_recording(recorder, True, save=False, shared=shared, reason="policy_shutdown")
         if recorder is not None:

@@ -16,7 +16,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast, get_args, get_origin, get_type_hints
 
 import numpy as np
 
@@ -29,6 +29,7 @@ _SECTION_NAMES = (
     "safety",
     "camera",
     "tag_retargeting",
+    "environment",
 )
 
 
@@ -106,6 +107,7 @@ class ResolvedRuntimeConfig:
     safety: FrozenConfigNode
     camera: FrozenConfigNode
     tag_retargeting: FrozenConfigNode
+    environment: FrozenConfigNode
     canonical_json: str
     sha256: str
 
@@ -154,7 +156,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     """Rebuild every defaults dataclass so all field validators run."""
     from dexmani_real.config import defaults
 
-    def rebuild(template: Any, raw: Any, path: str) -> Any:
+    def rebuild(template: Any, raw: Any, path: str, annotation: Any | None = None) -> Any:
         if raw is None and path == "hand.max_delta_rad":
             return None
         if dataclasses.is_dataclass(template):
@@ -165,14 +167,28 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
             if unknown:
                 raise TypeError(f"unknown runtime config field(s) in {path}: {sorted(unknown)}")
             kwargs: dict[str, Any] = {}
+            type_hints = get_type_hints(type(template))
             for field in dataclasses.fields(template):
                 current = getattr(template, field.name)
                 value = raw.get(field.name, _json_value(current))
-                kwargs[field.name] = rebuild(current, value, f"{path}.{field.name}")
+                kwargs[field.name] = rebuild(
+                    current,
+                    value,
+                    f"{path}.{field.name}",
+                    type_hints.get(field.name),
+                )
             return type(template)(**kwargs)  # type: ignore[misc]
         if isinstance(template, tuple):
             if not isinstance(raw, (list, tuple)):
                 raise TypeError(f"runtime config field {path!r} must be an array")
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+            if not template and origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+                item_type = args[0]
+                if dataclasses.is_dataclass(item_type):
+                    item_factory = cast(Any, item_type)
+                    return tuple(rebuild(item_factory(), item, f"{path}[{index}]") for index, item in enumerate(raw))
+                return tuple(raw)
             if len(raw) != len(template):
                 raise ValueError(f"runtime config field {path!r} must contain {len(template)} values")
             return tuple(

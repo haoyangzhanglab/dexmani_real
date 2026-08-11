@@ -127,6 +127,7 @@ implementations merely to discover a dtype.
 | `vr_ring` | SeqlockRingBuffer(8) | VR → Policy | ~600B/frame |
 | `camera_ring` | CameraRingBuffer(5) | Camera → Policy | Strict 640×480 RGB/depth + 2048×6 pointcloud; device/capture timestamps and validity |
 | `record_sample_ring` | SeqlockRingBuffer(4) | Policy → RecorderIO | Fixed camera/control payload; overflow aborts the episode |
+| `arm_metrics_ring`, `hand_metrics_ring`, `camera_metrics_ring`, `policy_metrics_ring` | dedicated SeqlockRingBuffer(8) | single worker → Main | ~1 Hz loop health; actual Hz, work-time max, overruns, missed slots, long-block reanchors; warning-only |
 | `is_running` | mp.Value | Main → all | Sole writer: Main |
 | `is_recording` | mp.Value | Policy → Arm/Hand/Camera | Sole writer: Policy |
 | `error_state` | mp.Value | Safety-critical workers → all | Sticky latch (set-only) |
@@ -195,6 +196,7 @@ DISARMED(0) --[Main: all ready]--> ARMED(1) --[Policy: B key]--> RUNNING(2)
 - **Arm/Hand** read-only: gate servo on `safety_state in (ARMED, RUNNING)`
 - **Enabled-capability heartbeats** (`time.monotonic()` per tick) monitored by Main at 10Hz
 - **Heartbeat timeouts** (from `config/defaults.py` `safety.heartbeat_timeouts`): arm/hand/policy=1.0s, vr=5.0s, camera=2.0s
+- **Loop metrics are diagnostic-only.** Heartbeats remain the liveness/fault signal; performance overruns never transition safety state by themselves.
 - **Existing bool flags preserved** (`is_running`, `error_state`, `estop_request`) — state machine is additive
 - **See**: `robot/safety.py` for SafetyState enum + transition validation
 
@@ -207,6 +209,42 @@ DISARMED(0) --[Main: all ready]--> ARMED(1) --[Policy: B key]--> RUNNING(2)
 xArm7 Mode 6 firmware already enforces: C22 (self-collision), C24 (velocity), C31 (collision-induced current),
 collision detection, torque limit. Application-level collision checks reject invalid
 commands before they reach firmware; firmware remains the final safety backstop.
+
+### Collision detection layers and static scene
+
+The Pinocchio collision validator owns two deliberately separate geometry
+models. The SRDF-filtered self model preserves the meaning of
+`check_self_collision*`: robot↔robot only. A second model contains only
+robot↔static-obstacle pairs. Combined point, detail, dense segment, and
+asynchronous arm×hand transition queries are used by teleop IK candidate
+filtering/final review, `ActionSafetyGate`, planned paths, return-home,
+band-alignment, and replay preflight. MPlib still proposes paths; the combined
+model performs dense post-validation and does not add arm-side interpolation.
+
+Static boxes are optional and default to an empty scene:
+
+```json
+{
+  "environment": {
+    "static_boxes": [
+      {
+        "name": "fixture_left",
+        "center_xyz_m": [0.35, -0.42, 0.20],
+        "size_xyz_m": [0.20, 0.05, 0.40],
+        "quat_wxyz": [1.0, 0.0, 0.0, 0.0]
+      }
+    ]
+  }
+}
+```
+
+Centers and full side lengths are metres in the xArm base frame; quaternions
+rotate box-local axes into that frame. Names are unique and `table` is reserved
+for the existing independent table-clearance layer. Non-finite values,
+non-positive sizes, and non-unit quaternions fail configuration resolution.
+Collision-query exceptions fail closed at command/path boundaries. Replay
+preflight certificate v2 binds URDF/SRDF contents plus the ordered normalized
+scene; v1 remains readable but is accepted only for an empty static scene.
 
 ### Coordinated safety layers (single-writer)
 
@@ -230,7 +268,7 @@ commands before they reach firmware; firmware remains the final safety backstop.
 8. **Safety state machine:** formal DISARMED/ARMED/RUNNING/FAULT states with validated
    transitions (Main owns DISARMED↔ARMED/→FAULT, Policy owns ARMED↔RUNNING)
 9. **Return-home:** the caller holding the collision planner densely validates
-   self-collision, arm-hand, workspace and table clearance along every segment,
+   self-collision, arm-hand, static environment, workspace and table clearance along every segment,
    then sends only safe milestones. `arm_loop` temporarily uses firmware Mode 0
    MoveJoint point-to-point planning, restores Mode 6, waits for real joint feedback
    at each milestone, and replies on

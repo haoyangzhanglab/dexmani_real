@@ -27,7 +27,14 @@ from dexmani_real.policy.action_protocol import (
 )
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import HOME_SENTINEL, HomeRequest, HomeResult, new_frame, publish_component_status
+from dexmani_real.shm.shared_storage import (
+    HOME_SENTINEL,
+    HomeRequest,
+    HomeResult,
+    new_frame,
+    publish_component_metrics,
+    publish_component_status,
+)
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
@@ -897,6 +904,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
         # Rate limit
         limiter.wait()
+        publish_component_metrics(shared, "arm", limiter)
+
+    publish_component_metrics(shared, "arm", limiter, interval_s=0.0)
 
     # Cleanup
     stopped_cleanly = False

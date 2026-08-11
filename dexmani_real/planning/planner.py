@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -56,6 +57,7 @@ class XArm7MotionPlanner:
         teleop_profile: TeleopProfile | None = None,
         hand_dof: bool = True,
         home_qpos: np.ndarray | None = None,
+        static_boxes: Iterable[Any] = (),
     ) -> None:
         import mplib
 
@@ -141,7 +143,7 @@ class XArm7MotionPlanner:
         # Both use the same SRDF (xarm7_xhand.srdf) so collision pair rules
         # are consistent.  See CLAUDE.md §Collision Detection Layers for the
         # full architecture.
-        self.collision_model = CollisionModel(hand_dof=hand_dof)
+        self.collision_model = CollisionModel(hand_dof=hand_dof, static_boxes=static_boxes)
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
@@ -163,6 +165,7 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
         home_qpos: np.ndarray | None = None,
+        static_boxes: Iterable[Any] = (),
     ) -> "XArm7MotionPlanner":
         """Factory with canonical URDF/SRDF and identity base_pose_world.
 
@@ -189,6 +192,7 @@ class XArm7MotionPlanner:
             planning_profile=planning_profile or PlanningProfile(),
             teleop_profile=teleop_profile or TeleopProfile(),
             home_qpos=home_qpos,
+            static_boxes=static_boxes,
         )
 
     def __getattr__(self, name: str):
@@ -484,7 +488,12 @@ class XArm7MotionPlanner:
 
         if profile.check_self_collision:
             for q in samples:
-                if self.ik_mgr.has_self_collision(q):
+                try:
+                    in_collision = self.ik_mgr.has_collision(q)
+                except Exception:
+                    logger.warning("shortcut collision check failed closed", exc_info=True)
+                    return False
+                if in_collision:
                     return False
         return True
 
@@ -641,21 +650,31 @@ class XArm7MotionPlanner:
         return True
 
     def _check_self_collision(self, path, report, source, profile):
-        """Fail if any waypoint is in self-collision (per SRDF collision pairs)."""
+        """Fail if the dense path hits self or configured static geometry."""
         if not profile.check_self_collision:
             return None
-        collision_report = self.check_path_collisions(path)
+        try:
+            collision_report = self.ik_mgr.check_path_combined_collisions(path)
+        except Exception as exc:
+            logger.warning("planned-path collision check failed closed", exc_info=True)
+            report["collision_check_error"] = str(exc)
+            return self._make_failure("Path collision check failed closed.", source, report)
         report.update(collision_report)
-        if collision_report.get("path_self_collision"):
+        if collision_report.get("path_collision"):
             collision_dict = collision_report.get("collision")
-            reason = "Path contains self-collision."
+            reason = "Path contains a collision."
             if isinstance(collision_dict, dict) and collision_dict.get("in_collision"):
                 num = collision_dict.get("num_contacts", 0)
                 pairs = collision_dict.get("collision_pairs", [])
                 link_names = ", ".join(f"{p['link1']}↔{p['link2']}" for p in pairs[:5])
                 if len(pairs) > 5:
                     link_names += f" ... +{len(pairs) - 5} more"
-                reason = f"Path contains self-collision ({num} contact(s): {link_names})."
+                collision_kind = (
+                    "environment collision"
+                    if any(pair.get("type") == "environment" for pair in pairs)
+                    else "self-collision"
+                )
+                reason = f"Path contains {collision_kind} ({num} contact(s): {link_names})."
             return self._make_failure(reason, source, report)
         return None
 

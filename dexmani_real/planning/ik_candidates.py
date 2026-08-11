@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from dexmani_real.utils.log import get_logger
+
 from .path_utils import wrap_nearest_equivalent
 
 if TYPE_CHECKING:
@@ -14,6 +16,8 @@ if TYPE_CHECKING:
 
 from .pose_utils import ensure_qpos
 from .types import CollisionInfo, PlanningProfile, Pose
+
+logger = get_logger(__name__)
 
 # Map freeform reject reason strings → structured diagnostic categories.
 # Used in collect_ik_candidates() to produce reject_by_category summary.
@@ -24,6 +28,8 @@ _REJECT_CATEGORY_MAP: dict[str, str] = {
     "IK candidate exceeds max_ik_delta_deg.": "delta",
     "IK candidate pose error exceeds threshold.": "pose_error",
     "IK candidate in self-collision.": "collision",
+    "IK candidate collides with environment.": "collision",
+    "IK candidate collision check failed.": "collision",
 }
 
 
@@ -212,9 +218,18 @@ class IKCandidateManager:
             return False, report
 
         if profile.check_self_collision:
-            collision_info = self.check_self_collision(qpos)
+            try:
+                collision_info = self.check_collision(qpos)
+            except Exception as exc:
+                logger.warning("IK candidate collision check failed closed", exc_info=True)
+                report.update(reason="IK candidate collision check failed.", collision_check_error=str(exc))
+                return False, report
             if collision_info:
-                report["reason"] = "IK candidate in self-collision."
+                pairs = collision_info.collision_pairs
+                is_environment = bool(pairs) and pairs[0].collision_type == "environment"
+                report["reason"] = (
+                    "IK candidate collides with environment." if is_environment else "IK candidate in self-collision."
+                )
                 report["collision"] = collision_info.to_dict()
                 return False, report
 
@@ -362,6 +377,14 @@ class IKCandidateManager:
         self._require_collision_model()
         return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]
 
+    def has_collision(self, qpos: np.ndarray) -> bool:
+        self._require_collision_model()
+        return self._cm.check_collision(qpos)  # type: ignore[union-attr]
+
+    def check_collision(self, qpos: np.ndarray) -> CollisionInfo:
+        self._require_collision_model()
+        return self._cm.check_collision_details(qpos)  # type: ignore[union-attr]
+
     def check_path_collisions(
         self,
         path: np.ndarray,
@@ -410,6 +433,59 @@ class IKCandidateManager:
                     "collision": collision_info.to_dict() if collision_info else None,
                 }
         return {"path_self_collision": False}
+
+    def check_path_combined_collisions(
+        self,
+        path: np.ndarray,
+        collision_step_size: float = 0.02,
+    ) -> dict[str, Any]:
+        """Check a path densely against self and configured static geometry."""
+        self._require_collision_model()
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1] != self.dof:
+            raise ValueError(f"path must have shape (N, {self.dof}), got {path.shape}")
+        if len(path) == 0:
+            return {"path_collision": False, "path_self_collision": False}
+        first = self.check_collision(path[0])
+        if first:
+            return {
+                "path_collision": True,
+                "path_self_collision": any(pair.collision_type != "environment" for pair in first.collision_pairs),
+                "collision_waypoint_index": 0,
+                "collision_waypoint_count": len(path),
+                "collision_step_size": collision_step_size,
+                "collision": first.to_dict(),
+            }
+        for index in range(len(path) - 1):
+            if self._cm.check_combined_segment_collision_free(  # type: ignore[union-attr]
+                path[index], path[index + 1], collision_step_size
+            ):
+                continue
+            info = self._find_combined_collision_in_segment(path[index], path[index + 1], collision_step_size)
+            return {
+                "path_collision": True,
+                "path_self_collision": info is not None
+                and any(pair.collision_type != "environment" for pair in info.collision_pairs),
+                "collision_waypoint_index": index,
+                "collision_waypoint_count": len(path),
+                "collision_step_size": collision_step_size,
+                "collision": info.to_dict() if info else None,
+            }
+        return {"path_collision": False, "path_self_collision": False}
+
+    def _find_combined_collision_in_segment(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+        step_size: float,
+    ) -> CollisionInfo | None:
+        diff = end - start
+        steps = max(1, int(np.ceil(float(np.max(np.abs(diff))) / step_size)))
+        for step in range(steps + 1):
+            info = self.check_collision(start + (step / steps) * diff)
+            if info:
+                return info
+        return None
 
     def _find_collision_in_segment(
         self,

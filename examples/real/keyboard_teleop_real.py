@@ -229,6 +229,7 @@ def main():
             max_pose_error_pos_m=0.02,
             max_pose_error_rot_rad=np.deg2rad(5.0),
         ),
+        static_boxes=tuple(runtime.environment.static_boxes),
     )
     # These experimental entries may run without XHand hardware. Keep the
     # 19-DOF collision model conservative and deterministic by explicitly

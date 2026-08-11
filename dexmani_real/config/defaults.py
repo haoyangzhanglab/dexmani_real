@@ -135,6 +135,59 @@ class VRMappingParams:
             raise ValueError("VR mapping scales, delta, and stale threshold must be finite and positive")
 
 
+@dataclass(frozen=True)
+class StaticCollisionBox:
+    """One oriented static obstacle in the xArm base frame.
+
+    ``size_xyz_m`` contains full side lengths (not half extents) and
+    ``quat_wxyz`` rotates the box-local axes into the base frame.
+    """
+
+    name: str = "obstacle"
+    center_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    size_xyz_m: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.name, str)
+            or not self.name.strip()
+            or self.name != self.name.strip()
+            or self.name == "table"
+        ):
+            raise ValueError("static collision box name must be non-empty and must not use reserved name 'table'")
+        for field_name in ("center_xyz_m", "size_xyz_m", "quat_wxyz"):
+            if not isinstance(getattr(self, field_name), tuple):
+                raise TypeError(f"static collision box {field_name} must be an immutable tuple")
+        center = np.asarray(self.center_xyz_m, dtype=np.float64)
+        size = np.asarray(self.size_xyz_m, dtype=np.float64)
+        quat = np.asarray(self.quat_wxyz, dtype=np.float64)
+        if center.shape != (3,) or size.shape != (3,) or quat.shape != (4,):
+            raise ValueError("static collision box center/size/quaternion must have shapes (3,), (3,), and (4,)")
+        if not np.all(np.isfinite(np.concatenate((center, size, quat)))):
+            raise ValueError("static collision box values must be finite")
+        if np.any(size <= 0.0):
+            raise ValueError("static collision box size_xyz_m must contain positive full side lengths")
+        if not np.isclose(float(np.linalg.norm(quat)), 1.0, rtol=0.0, atol=1e-6):
+            raise ValueError("static collision box quat_wxyz must be a unit quaternion")
+
+
+@dataclass(frozen=True)
+class EnvironmentConfig:
+    """Static geometry used only for robot-to-environment collision checks."""
+
+    static_boxes: tuple[StaticCollisionBox, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.static_boxes, tuple) or any(
+            not isinstance(box, StaticCollisionBox) for box in self.static_boxes
+        ):
+            raise TypeError("environment.static_boxes must be a tuple of StaticCollisionBox values")
+        names = [box.name for box in self.static_boxes]
+        if len(names) != len(set(names)):
+            raise ValueError("environment.static_boxes names must be unique")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Arm parameters (xArm7, 7-DOF)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -705,6 +758,7 @@ vr = VRParams()
 safety = SafetyParams()
 camera = CameraParams()
 tag_retargeting = TAGRetargetingParams()
+environment = EnvironmentConfig()
 
 
 def load_config_json(path: str):
