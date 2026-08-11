@@ -32,7 +32,7 @@ entry points, not test fixtures.
 | Change an arm/hand action | `policy/action_protocol.py` | arm/hand worker ACKs, `robot/safety.py`, supervisor |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, safety gate |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
-| Change replay | `replay/episode.py` | preflight → session → runner → metrics |
+| Change replay | `examples/replay_episode.py` | — | Self-contained script; preflight → session → runner → metrics |
 | Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and JSON compatibility |
 
 ## 2. Ownership map
@@ -162,17 +162,15 @@ Only `examples/deploy_policy.py` (via ``SharedStorageConfig.from_runtime(..., en
 
 ```text
 aligned samples → RecorderIO → temporary episode + stream verification
-                → fsync + atomic publish → EpisodeReader / analysis / replay
+                → fsync + atomic publish → EpisodeReader / visualize / replay
 ```
 
 - HDF5 schema v15 is additive. Readers keep v12–v14 raw-readable but treat
   semantic validity conservatively; never silently repurpose an old dataset.
 - Writer failure, stream mismatch, overflow, codec failure, or ENOSPC aborts
   the episode rather than silently publishing partial data.
-- `recording/analysis/episode_quality.py` and
-  `recording/analysis/visualize_episode.py` are
-  offline consumers under `recording/analysis/`.
-- `replay/episode.py` defaults to dry-run. Live replay reruns fail-closed
+- `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
+- `examples/replay_episode.py` defaults to dry-run. Live replay reruns fail-closed
   provenance and dense geometry checks immediately before worker startup.
 
 ## 5. Edit recipes
@@ -249,12 +247,13 @@ aligned samples → RecorderIO → temporary episode + stream verification
 | `examples/collect_teleop.py` | — | Hardware control; self-contained script; explicit authorization required |
 | `examples/deploy_policy.py` | — | Hardware control; self-contained script; spec/hash/preflight gated |
 | `examples/keyboard_teleop.py` | — | Hardware control; self-contained script; measured hand feedback by default |
-| `examples/replay_episode.py` | `replay/episode.py` | Dry-run by default; `--live` reruns dense preflight |
+| `examples/replay_episode.py` | — | Dry-run by default; `--live` reruns dense preflight; self-contained script |
 | `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |
 | `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |
 | `examples/realsense_record_example.py` | — | Interactive RealSense RGB-D + point-cloud test; hardware read-only by default |
 | `examples/pointcloud_process_example.py` | `sensor/pointcloud_processor.py` | Production point-cloud pipeline diagnostic; explicit confirmation for desk-plane write |
 | `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; requires explicit hardware authorization for motion commands |
+| `examples/visualize_episode.py` | — | Offline Rerun 3D visualization; no hardware control; self-contained script |
 
 ## 8. Completion checklist
 

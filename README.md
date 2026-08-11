@@ -41,9 +41,9 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
                                                     ▼
                                     ┌────────── recording/ ──────────┐
                                     │ RecorderIO → HDF5 episode v15  │
-                                    └───────┬─────────────┬───────────┘
-                                            ▼             ▼
-                                       replay/     recording/analysis/
+                                    └───────────────────┬───────────┘
+                                                        ▼
+                                               examples/visualize_episode.py
 ```
 
 ### 设计边界
@@ -84,9 +84,9 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 | VR 采集 | `examples/collect_teleop.py` | `teleop/loop.py` → `planning/`、`robot/`、`recording/`（实验生命周期自包含在 examples 中）|
 | 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 安全动作协议 |
 | 实验性学习策略 | `examples/deploy_policy.py` | 自包含入口 → `inference_process.py` → `learned_coordinator.py`（部署生命周期自包含在 examples 中）|
-| Episode 回放 | `examples/replay_episode.py` | `replay/episode.py` → `preflight.py` → `session.py` / `runner.py` |
+| Episode 回放 | `examples/replay_episode.py` | — | Self-contained script; dry-run by default; `--live` reruns dense preflight |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
-| 离线数据分析 | 无额外包装入口 | `python -m dexmani_real.recording.analysis.episode_quality` 或 `visualize_episode` |
+| 离线数据分析 | `examples/visualize_episode.py` | Rerun 3D episode 可视化；`python examples/visualize_episode.py <episode>` |
 
 ## 从入口到核心模块
 
@@ -96,7 +96,7 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 2. **数据平面与生命周期**：再读 `shm/shared_storage.py`、`shm/ring_buffer.py`、`runtime/supervisor.py`，了解进程如何共享数据、就绪和停止。
 3. **设备和运动能力**：阅读 `sensor/`、`robot/` 与 `planning/`，它们分别产生观测、执行动作、计算 FK/IK/碰撞和路径。
 4. **业务控制环**：`teleop/` 是 VR 控制和记录决策中心；`policy/` 是学习策略的隔离推理与动作调度中心。
-5. **持久化和事后工作流**：`recording/` 写入/读取 episode；`replay/` 和 `recording/analysis/` 消费这些数据。
+5. **持久化和事后工作流**：`recording/` 写入/读取 episode；`examples/replay_episode.py` 和 `examples/visualize_episode.py` 消费这些数据。
 
 ## 环境与安全边界
 
@@ -177,21 +177,10 @@ python -m compileall -q dexmani_real examples
 | `recording/timestamp_buffer.py` | 按目标时间戳插值、前向填充和标记缺口原因，保证采样网格对齐。 |
 | `recording/transaction.py` | 目录 fsync 和原子发布工具，避免半成品 episode 被当作完成数据。 |
 | `recording/video_codec.py` | 基于 PyAV 的视频编码器/解码器及其配置，服务 HDF5 旁路视频流。 |
-| `recording/analysis/__init__.py` | 标识仅离线使用的 episode 分析与可视化子包。 |
-| `recording/analysis/episode_quality.py` | 质量、健康和一致性分析 CLI；支持批量评估、验证、筛选和冻结/缺帧诊断。 |
-| `recording/analysis/visualize_episode.py` | 读取 episode 并借助 Rerun 展示 3D、图像、动作、触觉和元数据。 |
 
-### `replay/` — 检查、授权与受控回放
+### `examples/replay_episode.py` — 检查、授权与受控回放
 
-| 文件 | 作用 |
-|---|---|
-| `replay/__init__.py` | 标识 episode 检查、预检与回放子系统。 |
-| `replay/data.py` | 从 HDF5 加载并规范化为回放所需的状态/动作 `TrajectoryData`。 |
-| `replay/episode.py` | 回放 CLI：默认离线检查；live 模式在启动 worker 前直接执行密集预检。 |
-| `replay/metrics.py` | 捕获回放期间状态，计算关节/末端跟踪和时延指标，并保存报告与原始数据。 |
-| `replay/preflight.py` | 在 live replay 启动 worker 前 fail-closed 地重验轨迹来源、模型、几何路径和手部模式。 |
-| `replay/runner.py` | 通过 `SharedStorage` 执行已预检轨迹，监控臂/手反馈、动作确认和安全终态。 |
-| `replay/session.py` | 启停 live 回放 worker，整合预检、运行结果、回零选项与事后指标报告。 |
+Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.py` 中（约 2100 行）。默认执行离线检查（dry-run）；`--live --source sent` 跨越硬件安全边界，在启动 arm/hand worker 前执行密集几何和来源预检，通过 `SharedStorage` 回放轨迹，捕获回放状态并计算关节/末端跟踪一致性指标与时间延迟。
 
 ### `robot/` — xArm7、XHand 与安全状态
 
@@ -272,25 +261,26 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`examples`
 
-`examples/` 目前有 **9 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
+`examples/` 目前有 **10 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
 
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
 | `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
 | `examples/deploy_policy.py` | — | 实验性学习策略入口；部署生命周期自包含；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
 | `examples/keyboard_teleop.py` | — | 以键盘驱动机械臂、默认使用实测 XHand 反馈的自包含入口；硬件相关。 |
-| `examples/replay_episode.py` | `replay.episode.main` | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
+| `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
 | `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
 | `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；动作命令需显式硬件授权。 |
+| `examples/visualize_episode.py` | — | 离线 Rerun 3D 可视化；读取 HDF5 episode 并展示点云、图像、动作、触觉和元数据；无硬件控制。 |
 
 ## 配置、资源与延伸文档
 
 | 位置 | 内容 |
 |---|---|
-| `examples/configs/teleop_lab.yaml` | 遥操作实验覆盖配置示例；只记录刻意偏离默认值的少量字段。 |
+
 | `dexmani_real/config/cameras.json` | 物理相机序列号、类型和外参，是运行时校验的一部分。 |
 | `dexmani_real/config/desk_plane.json` | 点云工作空间使用的桌面平面运行数据。 |
 | `dexmani_real/config/vr_transform.json` | VR 朝向标定得到的坐标变换运行数据。 |

@@ -2,13 +2,13 @@
 """Rerun-based episode visualizer for DexMani teleop data.
 
 Supports legacy single-HDF5 and v13–v15 directory episodes
-(``data.h5`` + ``depth.h5`` + ``pointcloud.h5`` + ``rgb.mp4``) episodes.
+(``data.h5`` + ``depth.h5`` + ``pointcloud.h5`` + ``rgb.mp4``).
 
 Usage:
-  python -m dexmani_real.recording.analysis.visualize_episode episode.h5
-  python -m dexmani_real.recording.analysis.visualize_episode episode_dir/
-  python -m dexmani_real.recording.analysis.visualize_episode episode.h5 --info
-  python -m dexmani_real.recording.analysis.visualize_episode episode.h5 --max-frames 500
+  python examples/visualize_episode.py episode.h5
+  python examples/visualize_episode.py episode_dir/
+  python examples/visualize_episode.py episode.h5 --info
+  python examples/visualize_episode.py episode.h5 --max-frames 500
 """
 
 from __future__ import annotations
@@ -17,10 +17,9 @@ import argparse
 import os
 import sys
 import time
-
-# Suppress Rerun's wgpu/Vulkan backend diagnostics (noisy on Linux).
-os.environ["RUST_LOG"] = "error"
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import h5py
 import numpy as np
@@ -31,6 +30,9 @@ from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE
 from dexmani_real.recording.episode_reader import EpisodeReader, MergedH5File
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters
+
+# Suppress Rerun's wgpu/Vulkan backend diagnostics (noisy on Linux).
+os.environ["RUST_LOG"] = "error"
 
 logger = get_logger(__name__)
 
@@ -280,9 +282,9 @@ class EpisodeVisualizer:
 
         # Unique recording_id per invocation avoids stale-data merge on re-run.
         self._blueprint = self._build_blueprint()
-        _app_id = f"DexMani - {self._h5_path.stem}"
-        _rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
-        rr.init(_app_id, recording_id=_rec_id, spawn=True, default_blueprint=self._blueprint)
+        app_id = f"DexMani - {self._h5_path.stem}"
+        rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
+        rr.init(app_id, recording_id=rec_id, spawn=True, default_blueprint=self._blueprint)
         rr.send_blueprint(blueprint=self._blueprint)  # force-override any cached blueprint for this app_id
         self._log_static()
 
@@ -651,7 +653,7 @@ class EpisodeVisualizer:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes with Rerun 3D.")
     parser.add_argument("episode", type=str, help="Path to episode (.h5 file or directory).")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
@@ -672,15 +674,15 @@ def main() -> None:
         "--pc-max-depth", type=float, default=2.0, help="Max depth for point cloud filtering in meters (default: 2.0)."
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     h5_path = Path(args.episode).expanduser().resolve()
     if not h5_path.exists():
         logger.error("Episode not found: %s", h5_path)
-        sys.exit(1)
+        return 1
 
     if args.info:
         print_episode_info(str(h5_path))
-        return
+        return 0
 
     viz = EpisodeVisualizer(
         str(h5_path),
@@ -700,7 +702,8 @@ def main() -> None:
         logger.info("Done. Close the Rerun window to exit.")
     finally:
         viz.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -61,7 +61,8 @@ producers and consumers.
 | Arm/hand safety or servo behavior | `robot/arm_loop.py`, `robot/hand_process.py` | `robot/safety.py`, action protocol, supervisor, homing and e-stop paths |
 | FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
 | Episode schema or quality rule | `recording/` | reader, analysis, replay consumers, schema marker, old-format behavior |
-| Replay behavior | `replay/episode.py`, `replay/preflight.py` | provenance/dense preflight, session/runner, metrics, live safety path |
+| Replay behavior | `examples/replay_episode.py` | provenance/dense preflight, session/runner, metrics, live safety path |
+| Episode visualization | `examples/visualize_episode.py` | Rerun integration, EpisodeReader, point cloud, time-series views |
 | Calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit write/confirmation path and operational JSON compatibility |
 | CLI surface | `examples/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
 
