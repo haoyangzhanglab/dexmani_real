@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from dexmani_real.ipc.schema import INFERENCE_CANDIDATE_DTYPE
+from dexmani_real.utils.schema import INFERENCE_CANDIDATE_DTYPE
 from dexmani_real.policy.runtime import (
     ActionCandidate,
     ActionChunk,

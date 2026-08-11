@@ -37,7 +37,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import hand
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_DOF
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_DOF
 from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.ipc.schema import HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import HAND_JOINT_SHAPE
 from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 

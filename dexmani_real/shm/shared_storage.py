@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, camera, hand, policy
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     ACK_DTYPE,
     ARM_STATE_DTYPE,
     COMMIT_DTYPE,
@@ -160,7 +160,7 @@ class HomeResult:
 
 
 # Backward-compatible alias retained for external callers; the canonical
-# command schema is defined in dexmani_real.ipc.schema.
+# command schema is defined in dexmani_real.utils.schema.
 HAND_CMD_DTYPE = HAND_COMMAND_DTYPE
 
 _RING_RESOURCE_NAMES = (

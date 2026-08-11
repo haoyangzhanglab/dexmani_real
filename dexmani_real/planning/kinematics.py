@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 from .types import Pose

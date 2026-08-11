@@ -18,7 +18,7 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.config.defaults import hand, policy
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     ACK_DTYPE,
     ARM_COMMAND_DTYPE,
     ARM_JOINT_SHAPE,

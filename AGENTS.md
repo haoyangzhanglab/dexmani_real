@@ -54,7 +54,7 @@ producers and consumers.
 | If the task changes… | Start here | Then audit |
 |---|---|---|
 | Numeric default or runtime override | `config/defaults.py`, `config/runtime.py` | Derived rates, buffer capacities, timeouts, metadata, CLI overrides |
-| Cross-process state/action layout | `ipc/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
+| Cross-process state/action layout | `utils/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
 | Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers, readiness, heartbeat, shutdown |
 | VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
 | Learned-policy behavior | `policy/spec.py`, `policy/learned_coordinator.py` | inference worker, observation sources, action protocol, deployment lifecycle |
@@ -71,7 +71,7 @@ Preserve these unless the user explicitly requests an architectural redesign.
 
 1. `SharedStorage` is the only cross-process data plane. Processes do not call
    each other or exchange live SDK objects/mutable object graphs.
-2. `ipc/schema.py` owns fixed-shape NumPy payload definitions. Cross-process
+2. `utils/schema.py` owns fixed-shape NumPy payload definitions. Cross-process
    values must stay structured and shape/finite-validated at their boundary.
 3. Hardware SDK instances are local to their owning device worker/driver. Do
    not add xArm/XHand SDK calls to main, policy, recorder, or replay code; never

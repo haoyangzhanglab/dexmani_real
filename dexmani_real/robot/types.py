@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     ARM_JOINT_SHAPE,
     HAND_CONTACT_SHAPE,
     HAND_FINGERTIP_SHAPE,
@@ -125,7 +125,7 @@ class RobotAction:
 
 @dataclass
 class ArmState:
-    """Documentation view of ``ipc.schema.ARM_STATE_DTYPE``."""
+    """Documentation view of ``utils.schema.ARM_STATE_DTYPE``."""
 
     qpos: np.ndarray  # (7,)  float64  rad
     qvel: np.ndarray  # (7,)  float64  rad/s
@@ -152,7 +152,7 @@ class ArmState:
 
 @dataclass
 class HandState:
-    """Documentation view of ``ipc.schema.HAND_STATE_DTYPE``."""
+    """Documentation view of ``utils.schema.HAND_STATE_DTYPE``."""
 
     qpos: np.ndarray  # (12,) float64  rad
     current: np.ndarray  # (12,) float64  mA
@@ -174,7 +174,7 @@ class HandState:
 
 @dataclass
 class HandTactile:
-    """Documentation view of ``ipc.schema.HAND_TACTILE_DTYPE``."""
+    """Documentation view of ``utils.schema.HAND_TACTILE_DTYPE``."""
 
     tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified
     source_monotonic_ns: int

@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)

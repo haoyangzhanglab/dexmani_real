@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import hand
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     HAND_CONTACT_SHAPE,
     HAND_DOF,
     HAND_FINGER_COUNT,

@@ -11,7 +11,7 @@ from typing import Any, NoReturn
 import numpy as np
 
 from dexmani_real.config.defaults import policy, safety
-from dexmani_real.ipc.schema import HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import HAND_JOINT_SHAPE
 from dexmani_real.policy.action_protocol import (
     ActionSafetyGate,
     JointActionScheduler,

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm as _arm_cfg
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner

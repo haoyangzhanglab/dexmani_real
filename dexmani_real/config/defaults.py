@@ -13,7 +13,7 @@ from typing import Literal
 
 import numpy as np
 
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 _HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "inference", "vr", "camera"})
 _READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "inference", "policy", "vr"})

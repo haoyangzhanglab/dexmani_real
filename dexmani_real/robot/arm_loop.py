@@ -14,7 +14,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, safety
-from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, ARM_JOINT_SHAPE, ARM_STATE_DTYPE
+from dexmani_real.utils.schema import ARM_COMMAND_DTYPE, ARM_JOINT_SHAPE, ARM_STATE_DTYPE
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.action_protocol import (

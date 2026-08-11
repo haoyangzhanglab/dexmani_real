@@ -12,7 +12,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.policy.action_protocol import (
     ActionSafetyGate,

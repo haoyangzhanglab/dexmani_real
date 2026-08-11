@@ -26,7 +26,7 @@ entry points, not test fixtures.
 | Goal | Start with | Follow next |
 |---|---|---|
 | Change a runtime value | `config/defaults.py` | `config/runtime.py`, every derived duration/capacity/metadata field |
-| Change a shared field or command | `ipc/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
+| Change a shared field or command | `utils/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
 | Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → action protocol → samples |
 | Change learned deployment | `policy/deployment.py`, `policy/spec.py` | inference process → coordinator → action protocol |
 | Change an arm/hand action | `policy/action_protocol.py` | arm/hand worker ACKs, `robot/safety.py`, supervisor |
@@ -82,7 +82,7 @@ path does not load a model.
 
 ### Shared storage and IPC
 
-`ipc/schema.py` is the authority for cross-process NumPy dtypes and fixed
+`utils/schema.py` is the authority for cross-process NumPy dtypes and fixed
 shapes. `SharedStorage` owns allocation, names, close/unlink, flags, events,
 and transport instances; it must not import policy or recorder code merely to
 discover a dtype.
@@ -179,7 +179,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
 
 ### Adding a shared state field
 
-1. Define shape/dtype in `ipc/schema.py`; add the corresponding explanatory
+1. Define shape/dtype in `utils/schema.py`; add the corresponding explanatory
    dataclass field in `robot/types.py`.
 2. Allocate it through `SharedStorage`; write it in the owning worker and read
    it in each consumer.

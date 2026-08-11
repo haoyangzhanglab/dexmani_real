@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.defaults import hand
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     HAND_COMMAND_DTYPE,
     HAND_CONTACT_SHAPE,
     HAND_JOINT_SHAPE,

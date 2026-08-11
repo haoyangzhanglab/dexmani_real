@@ -25,7 +25,7 @@ import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import camera
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.camera_stream_writer import CameraStreamWriter, CameraStreamWriterConfig
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer

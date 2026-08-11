@@ -27,7 +27,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.ipc.schema import HAND_FINGERTIP_SHAPE
+from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE
 from dexmani_real.recording.episode_reader import EpisodeReader, MergedH5File
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters

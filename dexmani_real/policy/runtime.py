@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 PaddingMode = Literal["invalid_zero", "invalid_nan"]
 

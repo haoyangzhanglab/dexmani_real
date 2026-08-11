@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     HAND_JOINT_SHAPE,
     RECORD_CONTROL_DTYPE,
     RECORD_CONTROL_JSON_BYTES,

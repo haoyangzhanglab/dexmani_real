@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.shared_storage import HOME_SENTINEL, HomeRequest, HomeResult, SharedStorage
 from dexmani_real.utils.log import get_logger

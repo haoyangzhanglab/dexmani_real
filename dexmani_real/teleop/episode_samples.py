@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import (
+from dexmani_real.utils.schema import (
     ARM_JOINT_SHAPE,
     HAND_CONTACT_SHAPE,
     HAND_FINGERTIP_SHAPE,

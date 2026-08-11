@@ -1,4 +1,4 @@
-"""Dependency-neutral NumPy schemas for all cross-process payloads.
+"""Cross-process NumPy dtype definitions and shape constants.
 
 This module deliberately imports only NumPy.  Shared-memory allocation,
 policy logic, device workers, and recording serialization may depend on these
@@ -288,3 +288,20 @@ def make_record_sample_dtype(
         ],
         align=True,
     )
+
+
+__all__ = [
+    "ACK_DTYPE",
+    "ARM_COMMAND_DTYPE",
+    "ARM_STATE_DTYPE",
+    "CAMERA_FRAME_HEADER_DTYPE",
+    "COMMIT_DTYPE",
+    "HAND_COMMAND_DTYPE",
+    "HAND_STATE_DTYPE",
+    "HAND_TACTILE_DTYPE",
+    "INFERENCE_CANDIDATE_DTYPE",
+    "RECORD_CONTROL_DTYPE",
+    "RECORD_STATUS_DTYPE",
+    "VR_FRAME_DTYPE",
+    "make_record_sample_dtype",
+]

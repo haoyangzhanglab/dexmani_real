@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.utils.log import get_logger
 

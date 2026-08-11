@@ -25,7 +25,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.defaults import hand
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 from dexmani_real.recording.episode_reader import EpisodeReader, ValidityState
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.recording.video_codec import VideoEncoder

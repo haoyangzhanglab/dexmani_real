@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
+from dexmani_real.utils.schema import CAMERA_FRAME_HEADER_DTYPE
 from dexmani_real.utils.log import get_logger
 
 # ---------------------------------------------------------------------------

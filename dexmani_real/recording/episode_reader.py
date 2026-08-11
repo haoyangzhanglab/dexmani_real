@@ -31,7 +31,7 @@ from typing import Any
 import h5py
 import numpy as np
 
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.recording.timestamp_buffer import FillReason
 from dexmani_real.recording.video_codec import VideoDecoder
 from dexmani_real.utils.log import get_logger

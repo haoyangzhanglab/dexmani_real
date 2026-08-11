@@ -29,9 +29,9 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
                     └──────────────┬──────────────────────┘
                                    │ state frames
                                    ▼
-┌──────── robot/ ────────┐   ┌───────────── shm/ + ipc/ ──────────────┐
-│ xArm loop / XHand loop │◀──│  SharedStorage · typed rings · queues  │
-└──────────▲─────────────┘   └──────────────────┬─────────────────────┘
+┌──────── robot/ ────────┐   ┌──────────────── shm/ ────────────────┐
+│ xArm loop / XHand loop │◀──│ SharedStorage · typed rings · queues │
+└──────────▲─────────────┘   └─────────────────┬────────────────────┘
            │ arm queue / hand ring               │ snapshots
            │                                     ▼
            │                         ┌──── teleop/ 或 policy/ ────┐
@@ -48,7 +48,7 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 
 ### 设计边界
 
-- **IPC 边界**：所有跨进程数据经 `SharedStorage` 传递；有效负载由 `ipc/schema.py` 的固定 NumPy dtype 定义。
+- **IPC 边界**：所有跨进程数据经 `SharedStorage` 传递；有效负载由 `utils/schema.py` 的固定 NumPy dtype 定义。
 - **硬件边界**：xArm/XHand SDK 仅由各自的执行 worker 使用，RealSense SDK 由 `sensor/` 持有；其他进程不共享活的 SDK 对象。
 - **控制边界**：策略/遥操作 worker 决定动作与采样网格；`RecorderIO` 只负责序列化、校验和事务式发布。
 - **安全边界**：`SafetyState` 管理 `DISARMED → ARMED → RUNNING → FAULT`；固件仍是最后一道安全保护。
@@ -92,7 +92,7 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 
 建议按下面顺序阅读代码；每一层只建立在前面层的稳定接口上。
 
-1. **配置与协议**：先读 `config/defaults.py`、`config/runtime.py`、`ipc/schema.py`，了解默认参数与跨进程数据形状。
+1. **配置与协议**：先读 `config/defaults.py`、`config/runtime.py`、`utils/schema.py`，了解默认参数与跨进程数据形状。
 2. **数据平面与生命周期**：再读 `shm/shared_storage.py`、`shm/ring_buffer.py`、`runtime/supervisor.py`，了解进程如何共享数据、就绪和停止。
 3. **设备和运动能力**：阅读 `sensor/`、`robot/` 与 `planning/`，它们分别产生观测、执行动作、计算 FK/IK/碰撞和路径。
 4. **业务控制环**：`teleop/` 是 VR 控制和记录决策中心；`policy/` 是学习策略的隔离推理与动作调度中心。
@@ -132,13 +132,6 @@ python -m compileall -q dexmani_real examples
 | `config/camera_calib.py` | 加载相机外参，按物理序列号校验条目，并统一 eye-to-hand / eye-in-hand 坐标变换。 |
 | `config/defaults.py` | 所有数值默认值的单一来源：臂、手、VR、相机、策略、键盘、安全、碰撞与录制参数。 |
 | `config/runtime.py` | 将默认 dataclass 与 YAML/点路径覆盖合并、验证并冻结为可跨进程使用的运行时配置快照。 |
-
-### `ipc/` — 进程无关的数据协议
-
-| 文件 | 作用 |
-|---|---|
-| `ipc/__init__.py` | 集中导出所有跨进程 dtype：状态、命令、确认、相机、VR、推理和录制帧。 |
-| `ipc/schema.py` | 权威的固定形状 NumPy dtype 与关节/末端尺寸常量；构造录制样本复合 dtype。 |
 
 ### `planning/` — 运动学、IK、碰撞与轨迹规划
 
@@ -210,7 +203,7 @@ python -m compileall -q dexmani_real examples
 | `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、发布关节/触觉反馈，并检测跟踪停滞。 |
 | `robot/homing.py` | 执行并验证机械臂回零，包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
-| `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `ipc/schema.py` 决定。 |
+| `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `utils/schema.py` 决定。 |
 | `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放。 |
 
 ### `runtime/` — 进程生命周期与状态码
@@ -269,12 +262,13 @@ python -m compileall -q dexmani_real examples
 
 | 文件 | 作用 |
 |---|---|
-| `utils/__init__.py` | 标识日志、序列化、限速、信号和数组工具的公共包。 |
+| `utils/__init__.py` | 标识日志、序列化、限速、信号、schema 和数组工具的公共包。 |
 | `utils/array_utils.py` | 提供 NaN 初始化数组与安全 resize 等数值数组小工具。 |
 | `utils/log.py` | 创建统一 logger、可选文件日志和按时间节流的告警器。 |
 | `utils/pointcloud_utils.py` | 实现内参/变换/工作空间校验、RGB-D 到点云、裁剪、下采样、采样与深度可视化。 |
 | `utils/rate_manager.py` | 以单调时钟稳定控制循环频率，并报告周期统计信息。 |
 | `utils/retry.py` | 提供可重置的连续失败计数器，供设备读写 watchdog 使用。 |
+| `utils/schema.py` | 跨进程 NumPy dtype 与关节/末端尺寸常量的唯一定义源（原 `ipc/` 已合并至此）。 |
 | `utils/serialization.py` | 按 dataclass 类型注解将字典安全转换为嵌套对象和 NumPy 数组。 |
 | `utils/signal_utils.py` | 提供四元数安全归一化和位姿 EMA 平滑。 |
 
