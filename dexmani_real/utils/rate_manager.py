@@ -1,11 +1,4 @@
-"""High-precision rate manager with hybrid busy-wait.
-
-RateManager: high-precision sleep using busy-wait hybrid,
-achieving < 1ms target error (vs ~15ms for time.sleep()).
-
-Ref: LeFranX Ruckig rate decoupling.
-     BunnyVisionPro wait_until_next_control_signal.
-"""
+"""Absolute-deadline rate limiting with overrun accounting."""
 
 from __future__ import annotations
 
@@ -17,9 +10,6 @@ from typing import Callable
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-# ── Rate Manager ──
 
 
 @dataclass(frozen=True)
@@ -38,18 +28,7 @@ class RateStats:
 
 
 class RateManager:
-    """High-precision rate limiter with hybrid busy-wait + sleep.
-
-    Uses a hybrid approach: sleep for 95% of the remaining time, then busy-wait
-    for the final ~1ms. This achieves < 1ms target error on Linux with
-    PREEMPT_RT or standard kernels.
-
-    Usage:
-        rm = RateManager(50.0)  # e.g. 50 Hz
-        while running:
-            do_work()
-            rm.wait()
-    """
+    """Rate limiter that preserves an absolute schedule without catch-up bursts."""
 
     def __init__(
         self,

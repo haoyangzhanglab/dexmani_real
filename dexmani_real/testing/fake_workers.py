@@ -219,7 +219,10 @@ def fake_vr_worker(shared: object, config: FakeWorkerConfig = FakeWorkerConfig()
         frame["head_quat_wxyz"][0] = (1.0, 0.0, 0.0, 0.0)
         frame["sequence_id"][0] = sequence
         now_ns = time.monotonic_ns()
-        frame["local_recv_ns"][0] = now_ns - 10_000_000_000 if config.stale_vr else now_ns
+        source_ns = now_ns - 10_000_000_000 if config.stale_vr else now_ns
+        frame["head_sequence_id"][0] = sequence
+        frame["head_recv_ts_ns"][0] = source_ns
+        frame["local_recv_ns"][0] = source_ns
         shared.vr_ring.write(frame)  # type: ignore[attr-defined]
         time.sleep(config.tick_s)
 

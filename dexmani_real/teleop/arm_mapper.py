@@ -54,7 +54,7 @@ class ArmWristMapper:
         T_vr_to_robot: np.ndarray | None = None,
         eef_delta_bounds: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
-        max_per_frame_rot_rad: float = 0.52,  # ~30°/frame @ 16 Hz — VR glitch gate
+        max_per_frame_rot_rad: float = 0.52,  # ~30°/frame at the default 16 Hz
     ) -> None:
         if not np.isfinite(pos_scale):
             raise ValueError("pos_scale must be finite")
@@ -146,13 +146,12 @@ class ArmWristMapper:
 
         # F2: Per-frame rotation delta gate — catches single-frame VR tracking
         # glitches (spike-and-recover) that the total-from-reset clip misses.
-        # Normal human wrist rotation is < 20°/frame at 16 Hz; the 30°/frame
+        # At the default 16 Hz, normal wrist rotation is <20°/frame; the 30°/frame
         # default (~480°/s) is ~2× the fastest plausible motion.
         #
         # _last_wrist_rot tracks the RAW wrist orientation as the delta reference
         # for the next frame.  Using the clamped output as reference caused the
         # baseline to drift after a spike, distorting recovery-frame deltas
-        # (ref: arm-ik-adversarial-review §3.2 F8).
         wrist_rot_gated = wrist_rot
         if self._last_wrist_rot is not None:
             frame_delta = wrist_rot @ self._last_wrist_rot.T
@@ -293,7 +292,6 @@ class ArmWristMapper:
     def _clip_total_delta_rot(self, delta_rot: np.ndarray) -> np.ndarray:
         """Clamp total-from-reset rotation delta to prevent VR tracking glitches.
 
-        Ref: ManiUniCon max_delta_rot=1.0rad (~57°).
         Catches accumulated drift from the reset pose before it reaches IK.
         Note: this is NOT per-frame — it clips the total rotation since reset().
         """

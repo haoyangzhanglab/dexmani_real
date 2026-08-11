@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+
 from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 from .types import Pose
 
@@ -31,7 +33,9 @@ class ArmFK:
 
     def compute(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Compute EEF pose in arm base frame. Returns (eef_pos(3), eef_rot6d(6))."""
-        qpos = np.asarray(qpos, dtype=np.float64).ravel()[:7]
+        qpos = np.asarray(qpos, dtype=np.float64)
+        if qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
+            raise ValueError(f"arm qpos must be finite with shape {ARM_JOINT_SHAPE}")
         import pinocchio
 
         pinocchio.forwardKinematics(self._model, self._data, qpos)
@@ -81,7 +85,7 @@ class XArm7Kinematics:
 
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
         # Hot-path: ensure_qpos validation is done at entry points (solve / solve_teleop_ik).
-        # Skipped here to avoid redundant per-frame checks (ref: P1.1).
+        # Boundary callers validate the base pose once.
         # Defense-in-depth: NaN/Inf qpos causes undefined behavior in Pinocchio C++ FK.
         if not np.all(np.isfinite(qpos)):
             raise ValueError(f"compute_eef_pose_base: qpos contains NaN or Inf")
@@ -101,7 +105,7 @@ class XArm7Kinematics:
 
     def compute_eef_jacobian(self, qpos: np.ndarray) -> np.ndarray:
         # Hot-path: ensure_qpos validation is done at entry points.
-        # Skipped here to avoid redundant per-frame checks (ref: P1.1).
+        # Boundary callers validate the base pose once.
         # Defense-in-depth: NaN/Inf qpos causes undefined behavior in Pinocchio C++ FK.
         if not np.all(np.isfinite(qpos)):
             raise ValueError(f"compute_eef_jacobian: qpos contains NaN or Inf")

@@ -37,6 +37,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import hand
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_DOF
 from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
@@ -60,7 +61,7 @@ _COLLISION_URDF = str(_XHAND_DIR / "xarm7_xhand_collision.urdf")  # 7-DOF (hand 
 _FULL_URDF = str(_XHAND_DIR / "xarm7_xhand_right.urdf")  # 19-DOF (7 arm + 12 hand)
 _COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand.srdf")  # unified SRDF (single source)
 
-_HAND_DOF_COUNT = 12  # number of active hand joints
+_HAND_DOF_COUNT = HAND_DOF
 
 # User→URDF reorder map for set_hand_qpos().  Defined in planning.constants
 # (single source of truth shared with hand_kinematics.py).
@@ -269,7 +270,7 @@ class CollisionModel:
         qpos = np.asarray(qpos, dtype=np.float64)
         if not np.all(np.isfinite(qpos)):
             raise ValueError("qpos contains NaN or Inf — collision FK requires finite values")
-        if self._hand_dof and qpos.shape == (7,):
+        if self._hand_dof and qpos.shape == ARM_JOINT_SHAPE:
             if self._hand_qpos is None:
                 _warn_hand_qpos_unset("hand_qpos not set, using home position. Call set_hand_qpos() first.")
                 return np.concatenate([qpos, _HAND_HOME_QPOS_URDF])

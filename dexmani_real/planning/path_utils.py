@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm as _arm_cfg
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
@@ -324,7 +325,7 @@ def plan_joint_home_path(
             if planned.success and planned.qpos_path is not None and len(planned.qpos_path) >= 2:
                 rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
                 if float(np.max(np.abs(rrt_milestones[-1] - _home))) > 1e-6:
-                    rrt_milestones = np.concatenate([rrt_milestones, _home.reshape(1, 7)], axis=0)
+                    rrt_milestones = np.concatenate([rrt_milestones, _home.reshape((1, *ARM_JOINT_SHAPE))], axis=0)
                 if _validate_milestones(rrt_milestones, "joint_qpos_rrt"):
                     report.update(status="safe", selected_candidate="joint_qpos_rrt")
                     return rrt_milestones
@@ -339,7 +340,7 @@ def plan_joint_home_path(
                 )
 
     report["status"] = "unsafe"
-    return np.empty((0, 7), dtype=np.float64)  # no validated candidate — caller MUST hold position
+    return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)  # caller must hold position
 
 
 def plan_band_alignment_path(
@@ -399,27 +400,27 @@ def plan_band_alignment_path(
         try:
             result = _path_check(path)
         except Exception:
-            return np.empty((0, 7), dtype=np.float64)
+            return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
         if result.get("path_collision", result.get("path_self_collision", False)):
-            return np.empty((0, 7), dtype=np.float64)
+            return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
 
     if planner is not None:
         try:
             for _start, _end in zip(path[:-1], path[1:]):
                 if not planner.is_workspace_segment_safe(_start, _end):
-                    return np.empty((0, 7), dtype=np.float64)
+                    return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
         except (ValueError, RuntimeError):
-            return np.empty((0, 7), dtype=np.float64)
+            return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
 
     if _check_table:
         for _wp in path:
             try:
                 _hand_min_z = planner.collision_model.minimum_hand_frame_z(_wp)  # type: ignore[union-attr]
             except Exception:
-                return np.empty((0, 7), dtype=np.float64)
+                return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
             if not np.isfinite(_hand_min_z):
-                return np.empty((0, 7), dtype=np.float64)
+                return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
             if _hand_min_z - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
-                return np.empty((0, 7), dtype=np.float64)
+                return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
 
     return np.stack([wrapped_home, canonical_home])

@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real import ASSET_DIR
+from dexmani_real.ipc.schema import HAND_JOINT_SHAPE
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -59,9 +60,6 @@ _CONTIGUOUS_BONES = tuple(
     )
     for parent, child in zip(chain, chain[1:])
 )
-
-# ── Operator-to-MANO coordinate transform ──
-# (originally from deleted utils/hand_utils.py — sole caller is retarget() below)
 
 # Operator→MANO coordinate transform (right hand).
 # det = +1: this is a proper rotation.  Unity left-handed → FLU chirality conversion
@@ -386,7 +384,7 @@ class XHandRetargeter:
         # converge from neutral → actual, costing more iterations (and wall time)
         # on the first frame.  Seeding with the real hardware position makes the
         # first-frame optimization nearly trivial.
-        if initial_qpos is not None and initial_qpos.shape == (12,):
+        if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE:
             qpos = np.asarray(initial_qpos, dtype=np.float32)
             if np.all(np.isfinite(qpos)):
                 # Remap from hardware joint order (urdf_joint_names) to
@@ -398,17 +396,9 @@ class XHandRetargeter:
                 logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # MediaPipe fingertip landmark indices
-# ═══════════════════════════════════════════════════════════════════════════════
 
 _FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
-"""MediaPipe hand landmark indices for fingertips: thumb, index, middle, ring, pinky."""
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAGHandRetargeter — TAG two-stage NLopt hand retargeting backend
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TAGHandRetargeter:
@@ -522,8 +512,8 @@ class TAGHandRetargeter:
         _driver_lo_sdk = np.asarray(hand_d.qpos_min_rad if qpos_lower_rad is None else qpos_lower_rad, dtype=np.float64)
         _driver_hi_sdk = np.asarray(hand_d.qpos_max_rad if qpos_upper_rad is None else qpos_upper_rad, dtype=np.float64)
         if (
-            _driver_lo_sdk.shape != (12,)
-            or _driver_hi_sdk.shape != (12,)
+            _driver_lo_sdk.shape != HAND_JOINT_SHAPE
+            or _driver_hi_sdk.shape != HAND_JOINT_SHAPE
             or not np.all(np.isfinite(_driver_lo_sdk))
             or not np.all(np.isfinite(_driver_hi_sdk))
             or np.any(_driver_lo_sdk > _driver_hi_sdk)
@@ -564,7 +554,7 @@ class TAGHandRetargeter:
 
         # ── Pre-computed transforms (avoid per-frame allocation) ──
         self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
-        # Identity: MANO +Z (finger extension) → URDF +Z (finger extension). Verified 2026-08-07.
+        # MANO and URDF both use +Z for finger extension.
 
         # ── Smoothing & debug ──
         effective_smoothing_alpha = policy_d.hand_output_smoothing_alpha if smoothing_alpha is None else smoothing_alpha
@@ -652,7 +642,7 @@ class TAGHandRetargeter:
         self._ema_state = None
         self._last_raw_qpos = None
 
-        if initial_qpos is not None and initial_qpos.shape == (12,) and np.all(np.isfinite(initial_qpos)):
+        if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(initial_qpos)):
             # SDK order → model order for optimizer warm-start
             qpos_model = initial_qpos[self._mapping_sdk_to_model]
             self._optimizer.reset(qpos_model)

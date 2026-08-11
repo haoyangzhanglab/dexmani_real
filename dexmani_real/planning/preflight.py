@@ -15,6 +15,8 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+
 
 def _sha256_bytes(parts: Iterable[bytes]) -> str:
     digest = hashlib.sha256()
@@ -151,16 +153,16 @@ def create_preflight_certificate(
 ) -> PreflightCertificate:
     """Densely validate every replay transition and checksum-bind the exact inputs."""
     arm_actions = np.asarray(arm_actions, dtype=np.float64)
-    if arm_actions.ndim != 2 or arm_actions.shape[1] != 7 or not np.all(np.isfinite(arm_actions)):
+    if arm_actions.ndim != 2 or arm_actions.shape[1:] != ARM_JOINT_SHAPE or not np.all(np.isfinite(arm_actions)):
         raise ValueError("preflight arm trajectory must be finite shape (T, 7)")
     if arm_actions.shape[0] < 1:
         raise ValueError("preflight trajectory is empty")
     if hand_actions is None:
-        hand = np.zeros((arm_actions.shape[0], 12), dtype=np.float64)
+        hand = np.zeros((arm_actions.shape[0], *HAND_JOINT_SHAPE), dtype=np.float64)
         resolved_hand_enabled = False if hand_enabled is None else bool(hand_enabled)
     else:
         hand = np.asarray(hand_actions, dtype=np.float64)
-        if hand.shape != (arm_actions.shape[0], 12) or not np.all(np.isfinite(hand)):
+        if hand.shape != (arm_actions.shape[0], *HAND_JOINT_SHAPE) or not np.all(np.isfinite(hand)):
             raise ValueError("preflight hand trajectory must be finite shape (T, 12)")
         resolved_hand_enabled = True if hand_enabled is None else bool(hand_enabled)
     workspace = np.asarray(workspace_bounds_m, dtype=np.float64)
@@ -245,7 +247,7 @@ def verify_preflight_binding(
     if certificate.version == 1 and boxes:
         raise ValueError("preflight v1 certificate cannot validate a non-empty static collision scene")
     hand = (
-        np.zeros((len(arm_actions), 12), dtype=np.float64)
+        np.zeros((len(arm_actions), *HAND_JOINT_SHAPE), dtype=np.float64)
         if hand_actions is None
         else np.asarray(hand_actions, dtype=np.float64)
     )

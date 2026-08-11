@@ -18,6 +18,7 @@ class _RingField:
     field_name: str
     source_field: str
     publish_field: str | None
+    sequence_field: str | None = None
 
 
 _ROBOT_FIELDS: dict[str, _RingField] = {
@@ -33,8 +34,8 @@ _ROBOT_FIELDS: dict[str, _RingField] = {
     "vr_wrist_pos": _RingField("vr_ring", "wrist_pos", "local_recv_ns", None),
     "vr_wrist_quat_wxyz": _RingField("vr_ring", "wrist_quat_wxyz", "local_recv_ns", None),
     "vr_landmarks": _RingField("vr_ring", "landmarks", "local_recv_ns", None),
-    "vr_head_pos": _RingField("vr_ring", "head_pos", "local_recv_ns", None),
-    "vr_head_quat_wxyz": _RingField("vr_ring", "head_quat_wxyz", "local_recv_ns", None),
+    "vr_head_pos": _RingField("vr_ring", "head_pos", "head_recv_ts_ns", None, "head_sequence_id"),
+    "vr_head_quat_wxyz": _RingField("vr_ring", "head_quat_wxyz", "head_recv_ts_ns", None, "head_sequence_id"),
 }
 
 _CAMERA_MODALITIES = {
@@ -196,10 +197,13 @@ class SharedObservationSource:
             publish_ns = int(record[source.publish_field]) if source.publish_field is not None else int(ring_publish_ns)
             if source_ns <= 0 or publish_ns < source_ns:
                 continue
+            # SDK HeadFrame sequence IDs start at zero, whereas CausalFrame
+            # reserves zero for an unavailable source identity.
+            source_sequence = int(record[source.sequence_field]) + 1 if source.sequence_field is not None else sequence
             frames.append(
                 CausalFrame(
                     value=np.array(record[source.field_name], copy=True),
-                    sequence=int(sequence),
+                    sequence=int(source_sequence),
                     source_monotonic_ns=source_ns,
                     publish_monotonic_ns=publish_ns,
                     receive_monotonic_ns=source_ns if source.ring_name == "vr_ring" else publish_ns,

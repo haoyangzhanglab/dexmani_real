@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
+
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 PaddingMode = Literal["invalid_zero", "invalid_nan"]
 
@@ -97,8 +98,8 @@ class ActionSpec:
     representation: Literal["joint_position"] = "joint_position"
     units: Literal["rad"] = "rad"
     frame: Literal["robot_joint"] = "robot_joint"
-    arm_shape: tuple[int, ...] = (7,)
-    hand_shape: tuple[int, ...] = (12,)
+    arm_shape: tuple[int, ...] = ARM_JOINT_SHAPE
+    hand_shape: tuple[int, ...] = HAND_JOINT_SHAPE
     chunk_length: int = 1
     dt_s: float = 1.0 / 16.0
     deadline_s: float = 0.20
@@ -108,7 +109,7 @@ class ActionSpec:
         object.__setattr__(self, "hand_shape", tuple(int(dim) for dim in self.hand_shape))
         if self.representation != "joint_position" or self.units != "rad" or self.frame != "robot_joint":
             raise ValueError("unsupported action representation/units/frame")
-        if self.arm_shape != (7,) or self.hand_shape != (12,):
+        if self.arm_shape != ARM_JOINT_SHAPE or self.hand_shape != HAND_JOINT_SHAPE:
             raise ValueError("DexMani joint action shapes must be (7,) and (12,)")
         if (
             self.chunk_length <= 0
@@ -269,9 +270,17 @@ class ActionCandidate:
         if self.arm_qpos is None and self.hand_qpos is None:
             raise ValueError("action candidate controls no actuator")
         if self.arm_qpos is not None:
-            object.__setattr__(self, "arm_qpos", _readonly_array(self.arm_qpos, (7,), np.float64, name="arm_qpos"))
+            object.__setattr__(
+                self,
+                "arm_qpos",
+                _readonly_array(self.arm_qpos, ARM_JOINT_SHAPE, np.float64, name="arm_qpos"),
+            )
         if self.hand_qpos is not None:
-            object.__setattr__(self, "hand_qpos", _readonly_array(self.hand_qpos, (12,), np.float64, name="hand_qpos"))
+            object.__setattr__(
+                self,
+                "hand_qpos",
+                _readonly_array(self.hand_qpos, HAND_JOINT_SHAPE, np.float64, name="hand_qpos"),
+            )
 
 
 @dataclass(frozen=True)
@@ -288,19 +297,3 @@ class ActionChunk:
             raise ValueError("action chunk step_index values must be contiguous from zero")
         if any(a.target_monotonic_ns >= b.target_monotonic_ns for a, b in zip(self.steps, self.steps[1:])):
             raise ValueError("action chunk target times must be strictly increasing")
-
-
-class PolicyBackend(ABC):
-    """No-hardware backend interface. Implementations may not publish commands."""
-
-    @abstractmethod
-    def load(self) -> None: ...
-
-    @abstractmethod
-    def warmup(self, observation_spec: ObservationSpec, action_spec: ActionSpec) -> None: ...
-
-    @abstractmethod
-    def infer(self, snapshot: ObservationSnapshot) -> ActionCandidate | ActionChunk: ...
-
-    @abstractmethod
-    def close(self) -> None: ...

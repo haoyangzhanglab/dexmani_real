@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
-__all__ = [
-    "ControlSignal",
-    "KeyboardHandler",
-    "GlobalKeyState",
-    "MotionActivityLatch",
-    "MotionTraceSample",
-    "ReleaseMotionTracer",
-    "eef_delta_from_keys",
-]
-
 import os
 import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from collections.abc import Callable
 from enum import Enum
 from typing import Any
 
 import numpy as np
+
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
+
+__all__ = [
+    "ControlSignal",
+    "KeyboardHandler",
+    "GlobalKeyState",
+    "MotionActivityLatch",
+    "validate_arm_feedback",
+    "validate_hand_feedback",
+    "eef_delta_from_keys",
+]
 
 
 class ControlSignal(Enum):
@@ -71,46 +76,48 @@ def _restore_terminal_echo(saved: list[Any] | None) -> None:
 
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
     except (termios.error, OSError):
-        pass
+        logger.warning("terminal echo restoration failed", exc_info=True)
 
 
 class KeyboardHandler:
-    """Global keyboard handler using pynput.
+    """Thread-safe global keyboard events with a latched emergency stop."""
 
-    Captures keystrokes globally - works even when the terminal window
-    does not have focus.
-
-    Compatible with the existing API:
-        handler = KeyboardHandler()
-        handler.start()                    # start global listener thread
-        signals = handler.poll(timeout=0.05)  # drain pending signals
-        handler.stop()                     # stop listener, restore state
-
-    Context manager:
-        with KeyboardHandler() as kb:
-            ...
-            for sig in kb.poll(timeout=0.0):
-                ...
-    """
-
-    def __init__(self, debounce_s: float = 0.5) -> None:
-        """Initialize keyboard handler.
-
-        Args:
-            debounce_s: Per-signal debounce interval in seconds (default 0.5).
-                        Suppresses X11/Wayland auto-repeat for the same key.
-        """
+    def __init__(
+        self,
+        debounce_s: float = 0.5,
+        *,
+        estop_callback: Callable[[], None] | None = None,
+        startup_timeout_s: float = 2.0,
+    ) -> None:
+        if not np.isfinite(debounce_s) or debounce_s < 0.0:
+            raise ValueError("debounce_s must be finite and non-negative")
+        if not np.isfinite(startup_timeout_s) or startup_timeout_s <= 0.0:
+            raise ValueError("startup_timeout_s must be finite and positive")
         self._buffer: deque[ControlSignal] = deque()
         self._lock = threading.Lock()
         self._listener: Any = None  # pynput.keyboard.Listener
         self._running: bool = False
         self._debounce_s = float(debounce_s)
+        self._startup_timeout_s = float(startup_timeout_s)
+        self._estop_callback = estop_callback
+        self._estop_latched = threading.Event()
+        self._listener_failure_reported = False
         self._last_signal_time: dict[ControlSignal, float] = {}
-        self._saved_termios: list | None = None  # saved terminal attributes for echo restore
+        self._saved_termios: list | None = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    def _latch_emergency_stop(self) -> None:
+        callback: Callable[[], None] | None = None
+        with self._lock:
+            if self._estop_latched.is_set():
+                return
+            self._estop_latched.set()
+            self._buffer.append(ControlSignal.EMERGENCY_STOP)
+            callback = self._estop_callback
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logger.error("keyboard emergency-stop callback failed", exc_info=True)
 
     def start(self) -> None:
         """Start the global pynput keyboard listener in a daemon thread.
@@ -120,8 +127,6 @@ class KeyboardHandler:
         if self._running:
             return
 
-        # Headless guard: without a display, pynput's Listener dies with an
-        # obscure Xlib/uinput error deep in its backend. Fail fast and clear.
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             raise RuntimeError(
                 "KeyboardHandler requires a graphical session (pynput global "
@@ -136,41 +141,70 @@ class KeyboardHandler:
                 "pynput is required for global keyboard capture. " "Install with: pip install pynput"
             ) from None
 
-        # Suppress terminal echo so keys captured by pynput don't also
-        # appear as stray characters on stdout (interleaving with print()
-        # output).  pynput's ``suppress=True`` requires the uinput kernel
-        # module + write access to /dev/uinput on Linux; termios is more
-        # portable (no extra permissions) and equally effective.
         self._suppress_terminal_echo()
+        self._estop_latched.clear()
+        self._listener_failure_reported = False
 
         def on_press(key: object) -> None:
             try:
                 if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
                     sig = _KEY_MAP.get(key.char.lower())  # type: ignore[union-attr]
                 elif key == keyboard.Key.esc:
-                    sig = ControlSignal.EMERGENCY_STOP
+                    self._latch_emergency_stop()
+                    return
                 else:
                     return
                 if sig is not None:
-                    # Per-signal debounce — suppress X11/Wayland auto-repeat
-                    # (holding a key fires repeated press events at ~30-60 Hz).
-                    # ESC always bypasses debounce (emergency stop).
-                    if sig != ControlSignal.EMERGENCY_STOP:
-                        now = time.perf_counter()
+                    now = time.perf_counter()
+                    with self._lock:
                         last = self._last_signal_time.get(sig, 0.0)
                         if now - last < self._debounce_s:
                             return
                         self._last_signal_time[sig] = now
-                    with self._lock:
                         self._buffer.append(sig)
             except Exception:
-                pass
+                logger.warning("keyboard press callback failed", exc_info=True)
 
         try:
             self._listener = keyboard.Listener(on_press=on_press)
             self._listener.start()
+            ready = threading.Event()
+            startup_errors: list[BaseException] = []
+
+            def wait_until_ready() -> None:
+                try:
+                    listener = self._listener
+                    if listener is None:
+                        raise RuntimeError("keyboard listener disappeared during startup")
+                    listener.wait()
+                except BaseException as exc:
+                    startup_errors.append(exc)
+                finally:
+                    ready.set()
+
+            threading.Thread(target=wait_until_ready, name="keyboard-events-ready", daemon=True).start()
+            if not ready.wait(timeout=self._startup_timeout_s):
+                raise RuntimeError(f"keyboard listener startup timed out after {self._startup_timeout_s:.1f}s")
+            if startup_errors:
+                raise RuntimeError("keyboard listener failed during startup") from startup_errors[0]
+            if not self._listener.is_alive():
+                raise RuntimeError("keyboard listener exited during startup")
         except Exception:
-            self._restore_terminal_echo()  # roll back echo suppression on failure
+            listener = self._listener
+            try:
+                if listener is not None:
+                    listener.stop()
+                    listener.join(timeout=1.0)
+            except Exception:
+                logger.warning("keyboard listener rollback failed", exc_info=True)
+            try:
+                listener_alive = bool(listener is not None and listener.is_alive())
+            except Exception:
+                logger.warning("keyboard listener rollback health check failed", exc_info=True)
+                listener_alive = True
+            if not listener_alive:
+                self._listener = None
+            self._restore_terminal_echo()
             raise
 
         self._running = True
@@ -181,24 +215,24 @@ class KeyboardHandler:
         Idempotent: calling on an already-stopped handler is a no-op.
         Safe to call from finally blocks.
         """
-        if not self._running:
-            return
+        listener = self._listener
+        self._running = False
         try:
-            if self._listener is not None:
-                self._listener.stop()
-                self._listener = None
+            if listener is not None:
+                listener.stop()
+                listener.join(timeout=1.0)
+                if listener.is_alive():
+                    logger.error("keyboard listener did not stop within 1s")
+                else:
+                    self._listener = None
         except Exception:
-            pass
+            logger.warning("keyboard listener stop failed", exc_info=True)
         finally:
-            self._running = False
             with self._lock:
                 self._buffer.clear()
             self._last_signal_time.clear()
+            self._estop_latched.clear()
             self._restore_terminal_echo()
-
-    # ------------------------------------------------------------------
-    # Terminal echo suppression
-    # ------------------------------------------------------------------
 
     def _suppress_terminal_echo(self) -> None:
         """Disable terminal ECHO (delegates to module-level helper)."""
@@ -209,20 +243,12 @@ class KeyboardHandler:
         _restore_terminal_echo(self._saved_termios)
         self._saved_termios = None
 
-    # ------------------------------------------------------------------
-    # Context manager protocol
-    # ------------------------------------------------------------------
-
     def __enter__(self) -> "KeyboardHandler":
         self.start()
         return self
 
     def __exit__(self, *args: object) -> None:
         self.stop()
-
-    # ------------------------------------------------------------------
-    # Poll
-    # ------------------------------------------------------------------
 
     def poll(self, timeout: float = 0.05) -> list[ControlSignal]:
         """Drain all pending ControlSignals from the keyboard buffer.
@@ -234,7 +260,14 @@ class KeyboardHandler:
         Returns:
             List of ControlSignal values (may be empty).
         """
-        # Fast path: drain buffer under lock
+        if not np.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("timeout must be finite and non-negative")
+        if self._running and not self.healthy:
+            if not self._listener_failure_reported:
+                logger.error("keyboard listener exited; latching emergency stop")
+                self._listener_failure_reported = True
+            self._latch_emergency_stop()
+
         with self._lock:
             if self._buffer:
                 signals = list(self._buffer)
@@ -252,6 +285,20 @@ class KeyboardHandler:
                         return signals
                 time.sleep(0.005)  # 5 ms polling granularity
         return []
+
+    @property
+    def healthy(self) -> bool:
+        """Whether the listener that owns emergency-stop input is alive."""
+        listener = self._listener
+        try:
+            return bool(self._running and listener is not None and listener.is_alive())
+        except Exception:
+            logger.error("keyboard listener health check failed", exc_info=True)
+            return False
+
+    @property
+    def estop_latched(self) -> bool:
+        return self._estop_latched.is_set()
 
     def drain_signal(self, target: ControlSignal | None) -> int:
         """Remove all occurrences of *target* from the buffer, preserving others.
@@ -293,90 +340,185 @@ class GlobalKeyState:
         keys.stop()
     """
 
-    def __init__(self, suppress_echo: bool = False) -> None:
+    def __init__(
+        self,
+        suppress_echo: bool = False,
+        *,
+        estop_callback: Callable[[], None] | None = None,
+        startup_timeout_s: float = 2.0,
+    ) -> None:
+        if not np.isfinite(startup_timeout_s) or startup_timeout_s <= 0.0:
+            raise ValueError("startup_timeout_s must be finite and positive")
         self._keys: set[str] = set()
-        self._events: list[str] = []  # one-shot event queue
+        self._events: deque[str] = deque()
+        self._lock = threading.Lock()
+        self._estop_latched = threading.Event()
         self._running = False
-        self._thread: threading.Thread | None = None
         self._listener: Any = None  # pynput keyboard.Listener
         self._suppress_echo = suppress_echo
         self._saved_termios: list[Any] | None = None
+        self._estop_callback = estop_callback
+        self._startup_timeout_s = float(startup_timeout_s)
 
-    def _run(self) -> None:
-        from pynput import keyboard
-
+    def _callbacks(self, keyboard: Any) -> tuple[Any, Any]:
         def on_press(key: object) -> None:
             try:
+                name: str | None = None
+                event: str | None = None
                 if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
-                    self._keys.add(key.char.lower())  # type: ignore[union-attr]
+                    name = key.char.lower()  # type: ignore[union-attr]
                 elif key == keyboard.Key.esc:
-                    self._keys.add("esc")
+                    name = "esc"
+                    self._estop_latched.set()
+                    if self._estop_callback is not None:
+                        self._estop_callback()
                 elif key == keyboard.Key.up:
-                    self._keys.add("up")
+                    name = "up"
                 elif key == keyboard.Key.down:
-                    self._keys.add("down")
+                    name = "down"
                 elif key == keyboard.Key.left:
-                    self._keys.add("left")
+                    name = "left"
                 elif key == keyboard.Key.right:
-                    self._keys.add("right")
+                    name = "right"
                 elif key == keyboard.Key.space:
-                    self._events.append("space")
+                    event = "space"
                 elif key == keyboard.Key.enter:
-                    self._events.append("enter")
+                    event = "enter"
                 elif key == keyboard.Key.backspace:
-                    self._events.append("backspace")
+                    event = "backspace"
+                with self._lock:
+                    if name is not None:
+                        self._keys.add(name)
+                    if event is not None:
+                        self._events.append(event)
             except Exception:
-                pass
+                logger.warning("global key press callback failed", exc_info=True)
 
         def on_release(key: object) -> None:
             try:
+                name: str | None = None
                 if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
-                    self._keys.discard(key.char.lower())  # type: ignore[union-attr]
+                    name = key.char.lower()  # type: ignore[union-attr]
                 elif key == keyboard.Key.esc:
-                    self._keys.discard("esc")
+                    name = "esc"
                 elif key == keyboard.Key.up:
-                    self._keys.discard("up")
+                    name = "up"
                 elif key == keyboard.Key.down:
-                    self._keys.discard("down")
+                    name = "down"
                 elif key == keyboard.Key.left:
-                    self._keys.discard("left")
+                    name = "left"
                 elif key == keyboard.Key.right:
-                    self._keys.discard("right")
+                    name = "right"
+                if name is not None:
+                    with self._lock:
+                        self._keys.discard(name)
             except Exception:
-                pass
+                logger.warning("global key release callback failed", exc_info=True)
 
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
-        while self._running:
-            time.sleep(0.1)
-        self._listener.stop()
-        self._listener = None
+        return on_press, on_release
 
     def stop(self) -> None:
+        """Stop the listener and restore terminal state. Idempotent."""
+        listener = self._listener
         self._running = False
-        if self._suppress_echo:
-            _restore_terminal_echo(self._saved_termios)
-            self._saved_termios = None
+        try:
+            if listener is not None:
+                listener.stop()
+                listener.join(timeout=1.0)
+                if listener.is_alive():
+                    logger.error("global keyboard listener did not stop within 1s")
+                else:
+                    self._listener = None
+        except Exception:
+            logger.warning("global keyboard listener stop failed", exc_info=True)
+        finally:
+            with self._lock:
+                self._keys.clear()
+                self._events.clear()
+            self._estop_latched.clear()
+            if self._suppress_echo:
+                _restore_terminal_echo(self._saved_termios)
+                self._saved_termios = None
 
     def start(self) -> None:
+        """Synchronously create and start the global listener."""
+        if self._running:
+            return
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            raise RuntimeError("GlobalKeyState requires an X11/Wayland graphical session")
+        try:
+            from pynput import keyboard  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError("pynput is required for global keyboard capture") from None
+
         if self._suppress_echo:
             self._saved_termios = _suppress_terminal_echo()
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        try:
+            on_press, on_release = self._callbacks(keyboard)
+            listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self._listener = listener
+            listener.start()
+            ready = threading.Event()
+            startup_errors: list[BaseException] = []
+
+            def wait_until_ready() -> None:
+                try:
+                    listener.wait()
+                except BaseException as exc:
+                    startup_errors.append(exc)
+                finally:
+                    ready.set()
+
+            threading.Thread(target=wait_until_ready, name="keyboard-ready", daemon=True).start()
+            if not ready.wait(timeout=self._startup_timeout_s):
+                raise RuntimeError(f"global keyboard listener startup timed out after {self._startup_timeout_s:.1f}s")
+            if startup_errors:
+                raise RuntimeError("global keyboard listener failed during startup") from startup_errors[0]
+            if not listener.is_alive():
+                raise RuntimeError("global keyboard listener exited during startup")
+            self._running = True
+        except Exception:
+            rollback_listener = self._listener
+            try:
+                if rollback_listener is not None:
+                    rollback_listener.stop()
+                    rollback_listener.join(timeout=1.0)
+            except Exception:
+                logger.warning("global keyboard listener rollback failed", exc_info=True)
+            if rollback_listener is None or not rollback_listener.is_alive():
+                self._listener = None
+            else:
+                logger.error("global keyboard listener survived failed startup")
+            if self._suppress_echo:
+                _restore_terminal_echo(self._saved_termios)
+                self._saved_termios = None
+            raise
 
     def is_pressed(self, key: str) -> bool:
-        return key in self._keys
+        if key == "esc" and self._estop_latched.is_set():
+            return True
+        with self._lock:
+            return key in self._keys
+
+    @property
+    def healthy(self) -> bool:
+        """Whether the listener that owns the emergency-stop input is alive."""
+        listener = self._listener
+        healthy = bool(self._running and listener is not None and listener.is_alive())
+        if not healthy:
+            with self._lock:
+                self._keys.clear()
+        return healthy
 
     def pop_event(self) -> str | None:
         """Pop the next one-shot event (space/enter/backspace), or None."""
-        if self._events:
-            return self._events.pop(0)
-        return None
+        with self._lock:
+            return self._events.popleft() if self._events else None
 
     @property
     def any_pressed(self) -> bool:
-        return len(self._keys) > 0
+        with self._lock:
+            return bool(self._keys)
 
 
 class MotionActivityLatch:
@@ -395,292 +537,85 @@ class MotionActivityLatch:
         self._active = False
 
 
-@dataclass
-class MotionTraceSample:
-    """One state-aligned sample for keyboard release diagnostics."""
+def validate_arm_feedback(
+    *,
+    connected: bool,
+    state_valid: bool,
+    source_monotonic_ns: int,
+    now_monotonic_ns: int,
+    max_age_s: float,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+    eef_pos: np.ndarray,
+    eef_rot6d: np.ndarray,
+) -> str | None:
+    """Return why required arm feedback is unusable, or ``None``."""
+    if not connected:
+        return "arm disconnected"
+    if not state_valid:
+        return "arm state marked invalid"
+    if source_monotonic_ns <= 0:
+        return "arm state has no source timestamp"
+    age_s = (now_monotonic_ns - source_monotonic_ns) * 1e-9
+    if age_s < 0.0:
+        return f"arm state timestamp is {abs(age_s):.3f}s in the future"
+    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
+        raise ValueError("max_age_s must be finite and positive")
+    if age_s > max_age_s:
+        return f"arm state stale ({age_s:.2f}s)"
+    fields = {
+        "qpos": (np.asarray(qpos), ARM_JOINT_SHAPE),
+        "qvel": (np.asarray(qvel), ARM_JOINT_SHAPE),
+        "eef_pos": (np.asarray(eef_pos), (3,)),
+        "eef_rot6d": (np.asarray(eef_rot6d), (6,)),
+    }
+    for name, (value, expected_shape) in fields.items():
+        if value.shape != expected_shape:
+            return f"arm {name} has shape {value.shape}, expected {expected_shape}"
+        if not np.all(np.isfinite(value)):
+            return f"arm {name} is non-finite"
+    return None
 
-    frame: int
-    timestamp_s: float
-    input_active: bool
-    eef_pos_m: np.ndarray
-    command_pos_m: np.ndarray
-    qpos_error_rad: float
-    qvel_peak_rad_s: float
-    state_age_s: float
-    queue_latency_s: float
-    apply_latency_s: float
 
-    def __post_init__(self) -> None:
-        self.eef_pos_m = self._vector3(self.eef_pos_m, "eef_pos_m")
-        self.command_pos_m = self._vector3(self.command_pos_m, "command_pos_m")
-        if self.frame < 0:
-            raise ValueError("motion trace frame must be >= 0")
-        for name in (
-            "timestamp_s",
-            "qpos_error_rad",
-            "qvel_peak_rad_s",
-            "state_age_s",
-            "queue_latency_s",
-            "apply_latency_s",
-        ):
-            value = float(getattr(self, name))
-            if not np.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be finite and >= 0")
-            setattr(self, name, value)
-
-    @staticmethod
-    def _vector3(value: np.ndarray, name: str) -> np.ndarray:
-        vector = np.asarray(value, dtype=np.float64)
-        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
-            raise ValueError(f"{name} must be a finite (3,) vector")
-        return vector.copy()
-
-
-class ReleaseMotionTracer:
-    """Capture and summarize a short high-rate window around key release.
-
-    The tracer is deliberately control-agnostic: callers provide state-aligned
-    samples and the last translational input direction. It returns printable
-    lines, so the helper remains deterministic and hardware-free in tests.
-    """
-
-    def __init__(
-        self,
-        *,
-        pre_frames: int = 6,
-        post_frames: int = 20,
-        cooldown_s: float = 5.0,
-        velocity_deadband_m_s: float = 0.01,
-    ) -> None:
-        if pre_frames <= 0 or post_frames <= 0:
-            raise ValueError("release trace pre/post frames must be > 0")
-        if not np.isfinite(cooldown_s) or cooldown_s < 0.0:
-            raise ValueError("release trace cooldown_s must be finite and >= 0")
-        if not np.isfinite(velocity_deadband_m_s) or velocity_deadband_m_s < 0.0:
-            raise ValueError("release trace velocity deadband must be finite and >= 0")
-        self.pre_frames = int(pre_frames)
-        self.post_frames = int(post_frames)
-        self.cooldown_s = float(cooldown_s)
-        self.velocity_deadband_m_s = float(velocity_deadband_m_s)
-        self._history: deque[MotionTraceSample] = deque(maxlen=self.pre_frames)
-        self._pre_samples: list[MotionTraceSample] = []
-        self._window_samples: list[MotionTraceSample] = []
-        self._release_prev_sample: MotionTraceSample | None = None
-        self._direction: np.ndarray | None = None
-        self._release_pos_m: np.ndarray | None = None
-        self._post_seen = 0
-        self._window_id = 0
-        self._last_start_s = float("-inf")
-        self.last_summary: dict[str, float | int | str | bool] | None = None
-
-    @property
-    def active(self) -> bool:
-        return self._direction is not None
-
-    def reset(self) -> None:
-        """Discard history/window state after a blocking mode change such as HOME."""
-        self._history.clear()
-        self._pre_samples.clear()
-        self._window_samples.clear()
-        self._release_prev_sample = None
-        self._direction = None
-        self._release_pos_m = None
-        self._post_seen = 0
-        self._last_start_s = float("-inf")
-        self.last_summary = None
-
-    def observe(
-        self,
-        sample: MotionTraceSample,
-        *,
-        release_edge: bool = False,
-        translation_direction: np.ndarray | None = None,
-    ) -> list[str]:
-        """Consume a sample and return zero or more diagnostic log lines."""
-        lines: list[str] = []
-        if release_edge and not self.active:
-            direction = self._normalize_direction(translation_direction)
-            cooldown_elapsed = sample.timestamp_s - self._last_start_s >= self.cooldown_s
-            if direction is not None and cooldown_elapsed:
-                pre_samples = list(self._history)
-                self._window_id += 1
-                self._last_start_s = sample.timestamp_s
-                self._direction = direction
-                self._release_pos_m = sample.eef_pos_m.copy()
-                self._release_prev_sample = pre_samples[-1] if pre_samples else None
-                self._pre_samples = pre_samples
-                self._window_samples = [sample]
-                self._post_seen = 0
-                self.last_summary = None
-                self._history.clear()
-                return lines
-            self._history.clear()
-
-        if self.active:
-            self._window_samples.append(sample)
-            self._post_seen += 1
-            if sample.input_active:
-                # The sample is contaminated and detailed lines would also add
-                # terminal I/O to the newly active control interval. Emit only
-                # one summary line in this case.
-                lines.extend(self._finish("reengaged", include_samples=False))
-            elif self._post_seen >= self.post_frames:
-                # Buffer the whole window until capture is complete. Printing
-                # 30 Hz samples during capture would alter the timing that this
-                # diagnostic is intended to measure.
-                lines.extend(self._finish("completed", include_samples=True))
-
-        if sample.input_active:
-            if self._normalize_direction(translation_direction) is None:
-                self._history.clear()
-            else:
-                self._history.append(sample)
-        return lines
-
-    @staticmethod
-    def _normalize_direction(direction: np.ndarray | None) -> np.ndarray | None:
-        if direction is None:
-            return None
-        vector = np.asarray(direction, dtype=np.float64)
-        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
-            raise ValueError("translation_direction must be a finite (3,) vector")
-        norm = float(np.linalg.norm(vector))
-        if norm <= 1e-12:
-            return None
-        return vector / norm
-
-    def _format_sample(
-        self,
-        sample: MotionTraceSample,
-        previous: MotionTraceSample | None,
-        phase: str,
-    ) -> str:
-        assert self._direction is not None
-        assert self._release_pos_m is not None
-        velocity = np.zeros(3, dtype=np.float64)
-        dt_s = 0.0
-        if previous is not None:
-            dt_s = sample.timestamp_s - previous.timestamp_s
-            if dt_s > 1e-6:
-                velocity = (sample.eef_pos_m - previous.eef_pos_m) / dt_s
-        displacement = sample.eef_pos_m - self._release_pos_m
-        along_velocity = float(np.dot(velocity, self._direction))
-        lateral_velocity = velocity - along_velocity * self._direction
-        command_error = sample.command_pos_m - sample.eef_pos_m
-        return (
-            f"[RELTRACE#{self._window_id} {phase} f={sample.frame}] "
-            f"dt={dt_s * 1000:.1f}ms in={int(sample.input_active)} "
-            f"eef={self._fmt_vec(sample.eef_pos_m, scale=1000.0, precision=1)}mm "
-            f"drel={self._fmt_vec(displacement, scale=1000.0, precision=1)}mm "
-            f"v={self._fmt_vec(velocity, scale=1000.0, precision=1)}mm/s "
-            f"va={along_velocity * 1000:+.1f} vl={np.linalg.norm(lateral_velocity) * 1000:.1f}mm/s "
-            f"cmd_err={self._fmt_vec(command_error, scale=1000.0, precision=1)}mm "
-            f"qerr={np.rad2deg(sample.qpos_error_rad):.1f}deg qv={np.rad2deg(sample.qvel_peak_rad_s):.1f}deg/s "
-            f"age/q/apply={sample.state_age_s * 1000:.0f}/"
-            f"{sample.queue_latency_s * 1000:.1f}/{sample.apply_latency_s * 1000:.1f}ms"
-        )
-
-    def _finish(self, reason: str, *, include_samples: bool) -> list[str]:
-        assert self._direction is not None
-        assert self._release_pos_m is not None
-        samples = self._window_samples
-        displacement = np.stack([sample.eef_pos_m - self._release_pos_m for sample in samples])
-        along = displacement @ self._direction
-        lateral = displacement - along[:, None] * self._direction[None, :]
-
-        velocity_samples: list[np.ndarray] = []
-        velocity_timestamps_s: list[float] = []
-        previous = self._release_prev_sample
-        for sample in samples:
-            if previous is not None:
-                dt_s = sample.timestamp_s - previous.timestamp_s
-                if dt_s > 1e-6:
-                    velocity_samples.append((sample.eef_pos_m - previous.eef_pos_m) / dt_s)
-                    velocity_timestamps_s.append(sample.timestamp_s)
-            previous = sample
-        velocities = np.stack(velocity_samples) if velocity_samples else np.zeros((1, 3), dtype=np.float64)
-        along_velocity = velocities @ self._direction
-        lateral_velocity = velocities - along_velocity[:, None] * self._direction[None, :]
-
-        acceleration_peak_m_s2 = 0.0
-        if len(velocities) >= 2:
-            velocity_intervals_s = np.diff(velocity_timestamps_s)
-            valid = velocity_intervals_s > 1e-6
-            if np.any(valid):
-                accelerations = np.diff(velocities, axis=0)[valid] / velocity_intervals_s[valid, None]
-                acceleration_peak_m_s2 = float(np.max(np.linalg.norm(accelerations, axis=1)))
-
-        signs = np.sign(along_velocity[np.abs(along_velocity) >= self.velocity_deadband_m_s])
-        direction_reversals = int(np.count_nonzero(signs[1:] != signs[:-1])) if len(signs) >= 2 else 0
-        peak_forward_m = max(0.0, float(np.max(along)))
-        final_along_m = float(along[-1])
-        rollback_m = max(0.0, peak_forward_m - final_along_m)
-        duration_s = max(0.0, samples[-1].timestamp_s - samples[0].timestamp_s)
-        summary: dict[str, float | int | str | bool] = {
-            "reason": reason,
-            "clean": reason == "completed",
-            "duration_s": duration_s,
-            "final_along_m": final_along_m,
-            "peak_forward_m": peak_forward_m,
-            "rollback_m": rollback_m,
-            "peak_lateral_m": float(np.max(np.linalg.norm(lateral, axis=1))),
-            "peak_reverse_velocity_m_s": max(0.0, float(-np.min(along_velocity))),
-            "peak_lateral_velocity_m_s": float(np.max(np.linalg.norm(lateral_velocity, axis=1))),
-            "direction_reversals": direction_reversals,
-            "peak_acceleration_m_s2": acceleration_peak_m_s2,
-            "peak_qpos_error_rad": max(sample.qpos_error_rad for sample in samples),
-            "peak_qvel_rad_s": max(sample.qvel_peak_rad_s for sample in samples),
-            "max_state_age_s": max(sample.state_age_s for sample in samples),
-            "max_queue_latency_s": max(sample.queue_latency_s for sample in samples),
-            "max_apply_latency_s": max(sample.apply_latency_s for sample in samples),
-        }
-        self.last_summary = summary
-        summary_line = (
-            f"[RELTRACE#{self._window_id} SUMMARY] reason={reason} clean={int(bool(summary['clean']))} "
-            f"duration={duration_s * 1000:.0f}ms final={final_along_m * 1000:+.1f}mm "
-            f"peak={peak_forward_m * 1000:+.1f}mm rollback={rollback_m * 1000:.1f}mm "
-            f"lateral={float(summary['peak_lateral_m']) * 1000:.1f}mm "
-            f"reverse_v={float(summary['peak_reverse_velocity_m_s']) * 1000:.1f}mm/s "
-            f"lateral_v={float(summary['peak_lateral_velocity_m_s']) * 1000:.1f}mm/s "
-            f"reversals={direction_reversals} a_peak={acceleration_peak_m_s2:.2f}m/s2 "
-            f"qerr={np.rad2deg(float(summary['peak_qpos_error_rad'])):.1f}deg "
-            f"qv={np.rad2deg(float(summary['peak_qvel_rad_s'])):.1f}deg/s "
-            f"age/q/apply_max={float(summary['max_state_age_s']) * 1000:.0f}/"
-            f"{float(summary['max_queue_latency_s']) * 1000:.1f}/"
-            f"{float(summary['max_apply_latency_s']) * 1000:.1f}ms"
-        )
-
-        lines: list[str] = []
-        if include_samples:
-            direction_text = self._fmt_vec(self._direction, scale=1.0, precision=2)
-            release_frame = samples[0].frame
-            lines.append(
-                f"[RELTRACE#{self._window_id} START f={release_frame}] "
-                f"dir={direction_text} pre={len(self._pre_samples)} post={self._post_seen} buffered=1"
-            )
-            format_previous: MotionTraceSample | None = None
-            for offset, pre_sample in enumerate(self._pre_samples, start=-len(self._pre_samples)):
-                lines.append(self._format_sample(pre_sample, format_previous, f"PRE{offset:+d}"))
-                format_previous = pre_sample
-            lines.append(self._format_sample(samples[0], format_previous, "REL"))
-            format_previous = samples[0]
-            for index, post_sample in enumerate(samples[1:], start=1):
-                lines.append(self._format_sample(post_sample, format_previous, f"POST{index:02d}"))
-                format_previous = post_sample
-        lines.append(summary_line)
-
-        self._pre_samples = []
-        self._window_samples = []
-        self._release_prev_sample = None
-        self._direction = None
-        self._release_pos_m = None
-        self._post_seen = 0
-        return lines
-
-    @staticmethod
-    def _fmt_vec(vector: np.ndarray, *, scale: float, precision: int) -> str:
-        values = np.asarray(vector, dtype=np.float64) * scale
-        return f"({values[0]:+.{precision}f},{values[1]:+.{precision}f},{values[2]:+.{precision}f})"
+def validate_hand_feedback(
+    *,
+    connected: bool,
+    error_state: bool,
+    qpos_stale: bool,
+    state_valid: bool,
+    send_healthy: bool,
+    read_healthy: bool,
+    source_monotonic_ns: int,
+    now_monotonic_ns: int,
+    max_age_s: float,
+    qpos: np.ndarray,
+) -> str | None:
+    """Return why measured XHand feedback is unusable, or ``None``."""
+    if not connected:
+        return "hand disconnected"
+    if error_state:
+        return "hand reported a hardware error"
+    if qpos_stale:
+        return "hand joint feedback is stale"
+    if not state_valid:
+        return "hand state marked invalid"
+    if not send_healthy or not read_healthy:
+        return "hand command/state I/O is unhealthy"
+    if source_monotonic_ns <= 0:
+        return "hand state has no source timestamp"
+    age_s = (now_monotonic_ns - source_monotonic_ns) * 1e-9
+    if age_s < 0.0:
+        return f"hand state timestamp is {abs(age_s):.3f}s in the future"
+    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
+        raise ValueError("max_age_s must be finite and positive")
+    if age_s > max_age_s:
+        return f"hand state stale ({age_s:.2f}s)"
+    value = np.asarray(qpos)
+    if value.shape != HAND_JOINT_SHAPE:
+        return f"hand qpos has shape {value.shape}, expected {HAND_JOINT_SHAPE}"
+    if not np.all(np.isfinite(value)):
+        return "hand qpos is non-finite"
+    return None
 
 
 def eef_delta_from_keys(

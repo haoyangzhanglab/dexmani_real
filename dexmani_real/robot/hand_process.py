@@ -15,7 +15,15 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.defaults import hand
-from dexmani_real.ipc.schema import HAND_COMMAND_DTYPE, HAND_STATE_DTYPE, HAND_TACTILE_DTYPE
+from dexmani_real.ipc.schema import (
+    HAND_COMMAND_DTYPE,
+    HAND_CONTACT_SHAPE,
+    HAND_JOINT_SHAPE,
+    HAND_STATE_DTYPE,
+    HAND_TACTILE_DTYPE,
+    HAND_TACTILE_FORCE_SHAPE,
+    HAND_TACTILE_SUM_SHAPE,
+)
 from dexmani_real.policy.action_protocol import (
     AckStatus,
     RejectReason,
@@ -37,9 +45,8 @@ class HandProcessConfig:
 
     loop_hz: float = field(default_factory=lambda: hand.loop_hz)
 
-    # Some arm-only experimental entry points may probe for an optional XHand
-    # and continue with an explicit open-hand collision-model assumption when
-    # it is absent. Canonical data collection keeps the default fail-closed.
+    # Production entry points keep this fail-closed. The non-fatal mode is
+    # retained only for explicit offline fault-injection tests.
     startup_failure_is_fatal: bool = True
     ethercat_slave_position: int = field(default_factory=lambda: hand.ethercat_slave_position)
 
@@ -75,8 +82,8 @@ class HandProcessConfig:
         home = np.asarray(self.home_qpos_rad, dtype=np.float64)
         lower = np.asarray(self.qpos_lower_rad, dtype=np.float64)
         upper = np.asarray(self.qpos_upper_rad, dtype=np.float64)
-        if home.shape != (12,) or lower.shape != (12,) or upper.shape != (12,):
-            raise ValueError("hand process home/limits must have shape (12,)")
+        if home.shape != HAND_JOINT_SHAPE or lower.shape != HAND_JOINT_SHAPE or upper.shape != HAND_JOINT_SHAPE:
+            raise ValueError(f"hand process home/limits must have shape {HAND_JOINT_SHAPE}")
         if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(lower > upper):
             raise ValueError("hand process home/limits must be finite and ordered")
         if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
@@ -165,14 +172,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         if cfg.startup_failure_is_fatal:
             shared.error_state.value = True
         else:
-            logger.warning("hand_loop: optional XHand unavailable — leaving hand_ready unset")
+            logger.warning("hand_loop: XHand unavailable in non-fatal test mode — leaving hand_ready unset")
 
     try:
         from dexmani_real.robot.xhand import XHand, XHandConfig
 
         # Per-joint tor_max: index abduction (J3) handles sideways load,
         # benefit from higher current limit (380 vs default 300 mA).
-        _tor_max_pj = np.full(12, 300, dtype=np.int32)
+        _tor_max_pj = np.full(HAND_JOINT_SHAPE, 300, dtype=np.int32)
         _tor_max_pj[3] = 380
 
         hand = XHand(
@@ -190,7 +197,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             if cfg.startup_failure_is_fatal:
                 logger.error("hand_loop: connect failed")
             else:
-                logger.warning("hand_loop: optional XHand connect failed")
+                logger.warning("hand_loop: XHand connect failed in non-fatal test mode")
             try:
                 hand.disconnect()
             except Exception:
@@ -205,7 +212,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         if cfg.startup_failure_is_fatal:
             logger.error("hand_loop: init failed", exc_info=True)
         else:
-            logger.warning("hand_loop: optional XHand init failed", exc_info=True)
+            logger.warning("hand_loop: XHand init failed in non-fatal test mode", exc_info=True)
         _mark_startup_failure()
         return
 
@@ -218,12 +225,32 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # a one-tick window where hand_ready is set but hand_state_ring is empty.
     # (Same pattern as arm_loop arm_ready.)
     try:
-        st = hand.get_state()
+        st = hand.get_state(full=True, force_update=True)
         if st is None:
             raise RuntimeError("initial hand state is unavailable")
         _init_qpos = np.asarray(st.get("qpos"), dtype=np.float64)
-        if _init_qpos.shape != (12,) or not np.all(np.isfinite(_init_qpos)):
+        if _init_qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(_init_qpos)):
             raise ValueError(f"invalid initial hand qpos shape/values: {_init_qpos.shape}")
+        _initial_values: dict[str, np.ndarray] = {}
+        for _name, _shape, _dtype in (
+            ("current", HAND_JOINT_SHAPE, np.float64),
+            ("tactile_force_sum", HAND_TACTILE_SUM_SHAPE, np.float64),
+            ("tactile_contact", HAND_CONTACT_SHAPE, bool),
+        ):
+            _value = np.asarray(st.get(_name), dtype=_dtype)
+            if _value.shape != _shape or (_name != "tactile_contact" and not np.all(np.isfinite(_value))):
+                raise ValueError(f"invalid initial hand {_name} shape/values: {_value.shape}")
+            _initial_values[_name] = _value.copy()
+        if not bool(getattr(hand, "connected_flag", st.get("connected_flag", False))):
+            raise RuntimeError("initial hand feedback reports a disconnected device")
+        if bool(getattr(hand, "error_state", st.get("error_state", True))):
+            raise RuntimeError("initial hand feedback reports a hardware error")
+        _initial_board_errors: dict[str, np.ndarray] = {}
+        for _name in ("commboard_err", "jointboard_err", "tipboard_err"):
+            _value = np.asarray(st.get(_name), dtype=np.int32)
+            if _value.shape != HAND_JOINT_SHAPE or np.any(_value != 0):
+                raise RuntimeError(f"initial hand feedback reports {_name}")
+            _initial_board_errors[_name] = _value.copy()
     except Exception:
         _log = logger.error if cfg.startup_failure_is_fatal else logger.warning
         _log("hand_loop: cannot publish a valid initial state", exc_info=True)
@@ -236,15 +263,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         return
     _frame0 = _nf(HAND_STATE_DTYPE)
     _frame0["qpos"][0] = _init_qpos
-    _frame0["current"][0] = np.zeros(12, dtype=np.float64)
-    _frame0["tactile_sum"][0] = np.zeros((5, 3), dtype=np.float64)
-    _frame0["tactile_contact"][0] = np.zeros(5, dtype=bool)
-    _frame0["error_state"][0] = 0
-    _frame0["connected"][0] = 1
+    _frame0["current"][0] = _initial_values["current"]
+    _frame0["tactile_sum"][0] = _initial_values["tactile_force_sum"]
+    _frame0["tactile_contact"][0] = _initial_values["tactile_contact"]
+    _frame0["error_state"][0] = int(bool(hand.error_state))
+    _frame0["connected"][0] = int(bool(hand.connected_flag))
     _frame0["qpos_stale"][0] = 0
-    _frame0["commboard_err"][0] = np.zeros(12, dtype=np.int32)
-    _frame0["jointboard_err"][0] = np.zeros(12, dtype=np.int32)
-    _frame0["tipboard_err"][0] = np.zeros(12, dtype=np.int32)
+    for _name, _value in _initial_board_errors.items():
+        _frame0[_name][0] = _value
     _initial_source_ns = time.monotonic_ns()
     _frame0["source_monotonic_ns"][0] = _initial_source_ns
     _frame0["publish_monotonic_ns"][0] = time.monotonic_ns()
@@ -278,8 +304,8 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _stale_frames = 0
     _last_fresh_qpos: np.ndarray | None = None
     last_known_qpos = _init_qpos.copy()
-    _last_tactile_sum: np.ndarray = np.zeros((5, 3), dtype=np.float64)
-    _last_tactile_force: np.ndarray = np.zeros((5, 120, 3), dtype=np.float64)
+    _last_tactile_sum: np.ndarray = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+    _last_tactile_force: np.ndarray = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
     _last_state_source_ns = _initial_source_ns
     _tracking_target: np.ndarray | None = None
     _tracking_prev_error = float("inf")
@@ -441,21 +467,29 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             # dict.get(key, default) evaluates `default` unconditionally,
             # wasting ~14.5 KB per tick (30 Hz) on large tactile arrays.
             _raw_qpos = st.get("qpos")
-            qpos = np.asarray(_raw_qpos if _raw_qpos is not None else np.zeros(12), dtype=np.float64)
+            qpos = np.asarray(_raw_qpos if _raw_qpos is not None else np.zeros(HAND_JOINT_SHAPE), dtype=np.float64)
             _raw_current = st.get("current")
-            current = np.asarray(_raw_current if _raw_current is not None else np.zeros(12), dtype=np.float64)
+            current = np.asarray(
+                _raw_current if _raw_current is not None else np.zeros(HAND_JOINT_SHAPE), dtype=np.float64
+            )
             _raw_ts = st.get("tactile_force_sum")
-            tactile_sum = np.asarray(_raw_ts if _raw_ts is not None else np.zeros((5, 3)), dtype=np.float64)
+            tactile_sum = np.asarray(
+                _raw_ts if _raw_ts is not None else np.zeros(HAND_TACTILE_SUM_SHAPE), dtype=np.float64
+            )
             _raw_tf = st.get("tactile_force")
-            tactile_force = np.asarray(_raw_tf if _raw_tf is not None else np.zeros((5, 120, 3)), dtype=np.float64)
+            tactile_force = np.asarray(
+                _raw_tf if _raw_tf is not None else np.zeros(HAND_TACTILE_FORCE_SHAPE), dtype=np.float64
+            )
             _raw_tc = st.get("tactile_contact")
-            tactile_contact = np.asarray(_raw_tc if _raw_tc is not None else np.zeros(5, dtype=bool), dtype=bool)
+            tactile_contact = np.asarray(
+                _raw_tc if _raw_tc is not None else np.zeros(HAND_CONTACT_SHAPE, dtype=bool), dtype=bool
+            )
             expected_shapes = (
-                ("qpos", qpos, (12,)),
-                ("current", current, (12,)),
-                ("tactile_force_sum", tactile_sum, (5, 3)),
-                ("tactile_force", tactile_force, (5, 120, 3)),
-                ("tactile_contact", tactile_contact, (5,)),
+                ("qpos", qpos, HAND_JOINT_SHAPE),
+                ("current", current, HAND_JOINT_SHAPE),
+                ("tactile_force_sum", tactile_sum, HAND_TACTILE_SUM_SHAPE),
+                ("tactile_force", tactile_force, HAND_TACTILE_FORCE_SHAPE),
+                ("tactile_contact", tactile_contact, HAND_CONTACT_SHAPE),
             )
             for field_name, value, expected_shape in expected_shapes:
                 if value.shape != expected_shape:
@@ -472,28 +506,28 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             # Board error registers (per-joint hardware fault indicators).
             _raw_cbe = st.get("commboard_err")
             commboard_err = np.asarray(
-                _raw_cbe if _raw_cbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32
+                _raw_cbe if _raw_cbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
             )
             _raw_jbe = st.get("jointboard_err")
             jointboard_err = np.asarray(
-                _raw_jbe if _raw_jbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32
+                _raw_jbe if _raw_jbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
             )
             _raw_tbe = st.get("tipboard_err")
             tipboard_err = np.asarray(
-                _raw_tbe if _raw_tbe is not None else np.zeros(12, dtype=np.int32), dtype=np.int32
+                _raw_tbe if _raw_tbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
             )
         except Exception:
             logger.warning("hand_loop: get_state failed", exc_info=True)
             qpos = last_known_qpos.copy()
-            current = np.zeros(12)
+            current = np.zeros(HAND_JOINT_SHAPE)
             tactile_sum = _last_tactile_sum.copy()
             tactile_force = _last_tactile_force.copy()
-            tactile_contact = np.zeros(5, dtype=bool)
+            tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
             connected = False
             error_state = False  # transient comm glitch — do NOT fabricate error_state
-            commboard_err = np.zeros(12, dtype=np.int32)
-            jointboard_err = np.zeros(12, dtype=np.int32)
-            tipboard_err = np.zeros(12, dtype=np.int32)
+            commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+            jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+            tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
 
             # Read-error escalation: persistent get_state exceptions (SDK crash,
             # USB disconnect) bypass the normal error_state retry path because
@@ -520,11 +554,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _tracking_change_frames = int(tracking_active)
         qpos_stale = _stale_frames >= cfg.stale_qpos_frame_limit
 
-        # Error-state retry: hand comm errors are frequently intermittent and
-        # self-recovering.  Try clear_error() up to N times before escalating
-        # to global error_state + FAULT.
-        # (Same design rationale as send-error watchdog — ref: Hand Comm Error
-        # Handling Policy memory.)
+        # Retry transient hand errors only for the configured bounded window.
         if error_state and not shared.error_state.value:
             _error_state_counter.inc()
             _now_err = time.monotonic()
@@ -581,7 +611,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             tf["unit_code"][0] = 0
             shared.hand_tactile_ring.write(tf)
 
-        # Rate limit (absolute-deadline scheduling, consistent with arm_loop/policy_loop)
+        # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
         rate_mgr.wait()
         publish_component_metrics(shared, "hand", rate_mgr)
 

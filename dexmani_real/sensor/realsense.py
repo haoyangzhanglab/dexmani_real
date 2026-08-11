@@ -48,7 +48,7 @@ class L515DepthConfig:
     calibration for verification. load_json (XU control path) fails silently
     on the stock uvcvideo kernel, so set_option is the sole config path.
 
-    Tuning strategy (2026-08-07): Short Range preset (5) for the close-range
+    The Short Range preset (5) targets the close-range
     dexterous-manipulation workspace (0.25-0.85 m).  The factory Short Range
     parameter table optimises MEMS timing, noise estimation, and confidence
     mapping for < 1 m — then we override only what needs fine-tuning on top.
@@ -399,7 +399,7 @@ class RealSense:
                 try:
                     self.pipeline.stop()
                 except RuntimeError:
-                    pass
+                    logger.warning("RealSense pipeline stop failed before restart", exc_info=True)
                 time.sleep(delay)
                 self._start_pipeline(self.create_rs_config())
                 # Reapply Short Range and rebuild active-profile state after every restart.
@@ -417,7 +417,7 @@ class RealSense:
         try:
             self.pipeline.stop()
         except RuntimeError:
-            pass
+            logger.warning("RealSense pipeline stop failed during disconnect", exc_info=True)
         finally:
             self.pipeline = None
             self.profile = None
@@ -452,7 +452,7 @@ class RealSense:
                 if sensor.supports(rs.option.global_time_enabled):
                     sensor.set_option(rs.option.global_time_enabled, 1)
             except RuntimeError:
-                pass
+                logger.warning("RealSense global-time option could not be enabled", exc_info=True)
 
     @staticmethod
     def is_l515_device(device: rs.device) -> bool:

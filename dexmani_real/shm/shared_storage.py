@@ -7,10 +7,8 @@ through it — no direct references, no RPC, no business logic.
 from __future__ import annotations
 
 import multiprocessing as mp
-import sys
 import time
 from dataclasses import dataclass, field
-from queue import Empty, Full
 from typing import Any
 
 import numpy as np
@@ -18,12 +16,12 @@ import numpy as np
 from dexmani_real.config.defaults import arm, camera, hand, policy
 from dexmani_real.ipc.schema import (
     ACK_DTYPE,
-    ARM_COMMAND_DTYPE,
     ARM_STATE_DTYPE,
     COMMIT_DTYPE,
     COMPONENT_METRICS_DTYPE,
     COMPONENT_STATUS_DTYPE,
     HAND_COMMAND_DTYPE,
+    HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
     INFERENCE_CANDIDATE_DTYPE,
@@ -65,7 +63,14 @@ class SharedStorageConfig:
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
+    action_commit_ring_maxlen: int = 8
+    action_ack_ring_maxlen: int = 16
+    component_status_ring_maxlen: int = 32
+    component_metrics_ring_maxlen: int = 8
+    record_control_ring_maxlen: int = 8
     record_sample_ring_maxlen: int = 4
+    record_status_ring_maxlen: int = 16
+    inference_candidate_ring_maxlen: int = 16
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
@@ -90,7 +95,14 @@ class SharedStorageConfig:
             self.hand_state_ring_maxlen,
             self.hand_tactile_ring_maxlen,
             self.hand_cmd_ring_maxlen,
+            self.action_commit_ring_maxlen,
+            self.action_ack_ring_maxlen,
+            self.component_status_ring_maxlen,
+            self.component_metrics_ring_maxlen,
+            self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
+            self.record_status_ring_maxlen,
+            self.inference_candidate_ring_maxlen,
             self.arm_action_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
@@ -101,7 +113,7 @@ class SharedStorageConfig:
         if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] > bounds[:, 1]):
             raise ValueError("SharedStorage workspace_bounds must be finite shape (3, 2)")
         hand_home = np.asarray(self.hand_home_qpos_rad, dtype=np.float64)
-        if hand_home.shape != (12,) or not np.all(np.isfinite(hand_home)):
+        if hand_home.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(hand_home)):
             raise ValueError("SharedStorage hand_home_qpos_rad must be finite shape (12,)")
 
     @classmethod
@@ -136,44 +148,47 @@ HOME_SENTINEL = "__HOME__"
 
 @dataclass(frozen=True)
 class HomeRequest:
-    """Densely validated, sparse-milestone homing command for ``arm_loop``."""
-
     request_id: int
-    waypoints: "np.ndarray"
-    final_qpos: "np.ndarray"
+    waypoints: np.ndarray
+    final_qpos: np.ndarray
     execution_timeout_s: float
 
 
 @dataclass(frozen=True)
 class HomeResult:
-    """Completion acknowledgement produced by the arm worker for one home request."""
-
     request_id: int
     success: bool
     reason: str
-    final_qpos: "np.ndarray"
+    final_qpos: np.ndarray
     completed_at_s: float
-
-
-def _describe_band_diff(wrapped: "np.ndarray", canonical: "np.ndarray") -> str:
-    """Describe which equivalent joints differ between wrapped and canonical home.
-
-    Returns a short string like ``"J7:-360→0°"`` or ``"same band"``.
-    """
-    import numpy as np
-
-    delta_deg = np.rad2deg(np.abs(wrapped - canonical))
-    _EQ_JOINT_NAMES = {0: "J1", 2: "J3", 4: "J5", 6: "J7"}
-    parts: list[str] = []
-    for _ji, _name in _EQ_JOINT_NAMES.items():
-        if delta_deg[_ji] > 1.0:
-            parts.append(f"{_name}:{np.rad2deg(wrapped[_ji]):.0f}→{np.rad2deg(canonical[_ji]):.0f}°")
-    return ", ".join(parts) if parts else "same band"
 
 
 # Backward-compatible alias retained for external callers; the canonical
 # command schema is defined in dexmani_real.ipc.schema.
 HAND_CMD_DTYPE = HAND_COMMAND_DTYPE
+
+_RING_RESOURCE_NAMES = (
+    "camera_ring",
+    "vr_ring",
+    "arm_state_ring",
+    "hand_state_ring",
+    "hand_tactile_ring",
+    "hand_cmd_ring",
+    "action_commit_ring",
+    "arm_ack_ring",
+    "hand_ack_ring",
+    "component_status_ring",
+    "arm_metrics_ring",
+    "hand_metrics_ring",
+    "camera_metrics_ring",
+    "policy_metrics_ring",
+    "record_control_ring",
+    "record_sample_ring",
+    "record_status_ring",
+    "inference_candidate_ring",
+)
+_QUEUE_RESOURCE_NAMES = ("arm_action_q", "arm_home_result_q")
+_ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
 
 def new_frame(dtype: np.dtype) -> np.ndarray:
@@ -253,6 +268,8 @@ class SharedStorage:
     camera_sdk_version: Any  # pyrealsense2/librealsense version string
     camera_profile: Any  # actual color/depth profile JSON
     camera_observation_required: Any  # learned policy requests camera payload publication
+    _closed: bool = field(init=False, repr=False, default=False)
+    _close_completed_operations: set[str] = field(init=False, repr=False, default_factory=set)
 
     @classmethod
     def create(
@@ -275,11 +292,40 @@ class SharedStorage:
         _depth_shape = camera_depth_shape or cfg.camera_depth_shape
 
         storage = cls.__new__(cls)
+        storage._closed = False
+        storage._close_completed_operations = set()
+        try:
+            cls._allocate_resources(storage, prefix, cfg, ctx, _rgb_shape, _depth_shape)
+        except BaseException as allocation_error:
+            cleanup_succeeded = False
+            for _ in range(_ALLOCATION_ROLLBACK_ATTEMPTS):
+                try:
+                    cleanup_succeeded = storage.close()
+                except BaseException:
+                    logger.critical("SharedStorage allocation rollback raised", exc_info=True)
+                    raise RuntimeError("SharedStorage allocation failed and rollback raised") from allocation_error
+                if cleanup_succeeded:
+                    break
+            if not cleanup_succeeded:
+                raise RuntimeError("SharedStorage allocation failed and rollback was incomplete") from allocation_error
+            raise
 
+        logger.info("SharedStorage created (prefix=%s)", prefix)
+        return storage
+
+    @staticmethod
+    def _allocate_resources(
+        storage: "SharedStorage",
+        prefix: str,
+        cfg: SharedStorageConfig,
+        ctx: Any,
+        rgb_shape: tuple[int, int, int],
+        depth_shape: tuple[int, int],
+    ) -> None:
         storage.camera_ring = CameraRingBuffer(
             name=f"{prefix}_camera",
-            rgb_shape=_rgb_shape,
-            depth_shape=_depth_shape,
+            rgb_shape=rgb_shape,
+            depth_shape=depth_shape,
             pc_shape=cfg.camera_pc_shape,
             maxlen=cfg.camera_ring_maxlen,
             create=True,
@@ -310,34 +356,44 @@ class SharedStorage:
             maxlen=cfg.hand_cmd_ring_maxlen,
         )
         storage.action_commit_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_action_commit", dtype=COMMIT_DTYPE, maxlen=8
+            f"{prefix}_action_commit", dtype=COMMIT_DTYPE, maxlen=cfg.action_commit_ring_maxlen
         )
-        storage.arm_ack_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_arm_ack", dtype=ACK_DTYPE, maxlen=16)
-        storage.hand_ack_ring = SeqlockRingBuffer.create_or_replace(f"{prefix}_hand_ack", dtype=ACK_DTYPE, maxlen=16)
+        storage.arm_ack_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_arm_ack", dtype=ACK_DTYPE, maxlen=cfg.action_ack_ring_maxlen
+        )
+        storage.hand_ack_ring = SeqlockRingBuffer.create_or_replace(
+            f"{prefix}_hand_ack", dtype=ACK_DTYPE, maxlen=cfg.action_ack_ring_maxlen
+        )
         storage.component_status_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_component_status", dtype=COMPONENT_STATUS_DTYPE, maxlen=32
+            f"{prefix}_component_status",
+            dtype=COMPONENT_STATUS_DTYPE,
+            maxlen=cfg.component_status_ring_maxlen,
         )
         for component in ("arm", "hand", "camera", "policy"):
             setattr(
                 storage,
                 f"{component}_metrics_ring",
                 SeqlockRingBuffer.create_or_replace(
-                    f"{prefix}_{component}_metrics", dtype=COMPONENT_METRICS_DTYPE, maxlen=8
+                    f"{prefix}_{component}_metrics",
+                    dtype=COMPONENT_METRICS_DTYPE,
+                    maxlen=cfg.component_metrics_ring_maxlen,
                 ),
             )
         storage.record_control_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=8
+            f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=cfg.record_control_ring_maxlen
         )
         storage.record_sample_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_record_sample",
-            dtype=make_record_sample_dtype(_rgb_shape, _depth_shape, cfg.camera_pc_shape),
+            dtype=make_record_sample_dtype(rgb_shape, depth_shape, cfg.camera_pc_shape),
             maxlen=cfg.record_sample_ring_maxlen,
         )
         storage.record_status_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_record_status", dtype=RECORD_STATUS_DTYPE, maxlen=16
+            f"{prefix}_record_status", dtype=RECORD_STATUS_DTYPE, maxlen=cfg.record_status_ring_maxlen
         )
         storage.inference_candidate_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_inference_candidate", dtype=INFERENCE_CANDIDATE_DTYPE, maxlen=16
+            f"{prefix}_inference_candidate",
+            dtype=INFERENCE_CANDIDATE_DTYPE,
+            maxlen=cfg.inference_candidate_ring_maxlen,
         )
 
         storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
@@ -386,67 +442,68 @@ class SharedStorage:
         storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
         storage.camera_observation_required = ctx.Value("b", False)
 
-        logger.info("SharedStorage created (prefix=%s)", prefix)
-        storage._closed = False
-        return storage
-
-    def close(self) -> None:
+    def close(self) -> bool:
         """Release all shared memory primitives.
 
         ``unlink()`` destroys the POSIX shared-memory segment, preventing
         Python's resource tracker "leaked shared_memory objects" warning.
+        Cleanup is best-effort across every resource.  A failed operation is
+        retryable, while operations that already succeeded are not repeated.
+
+        Returns:
+            Whether every owned resource was closed and unlinked successfully.
         """
         if bool(getattr(self, "_closed", False)):
-            return
-        self._closed = True
+            return True
+
+        completed: set[str] = getattr(self, "_close_completed_operations", set())
+        if not isinstance(completed, set):
+            completed = set()
+        self._close_completed_operations = completed
+        expected: set[str] = set()
         _close_errors: list[str] = []
 
-        for ring_name, ring in (
-            ("camera_ring", self.camera_ring),
-            ("vr_ring", self.vr_ring),
-            ("arm_state_ring", self.arm_state_ring),
-            ("hand_state_ring", self.hand_state_ring),
-            ("hand_tactile_ring", self.hand_tactile_ring),
-            ("hand_cmd_ring", self.hand_cmd_ring),
-            ("action_commit_ring", self.action_commit_ring),
-            ("arm_ack_ring", self.arm_ack_ring),
-            ("hand_ack_ring", self.hand_ack_ring),
-            ("component_status_ring", self.component_status_ring),
-            ("arm_metrics_ring", self.arm_metrics_ring),
-            ("hand_metrics_ring", self.hand_metrics_ring),
-            ("camera_metrics_ring", self.camera_metrics_ring),
-            ("policy_metrics_ring", self.policy_metrics_ring),
-            ("record_control_ring", self.record_control_ring),
-            ("record_sample_ring", self.record_sample_ring),
-            ("record_status_ring", self.record_status_ring),
-            ("inference_candidate_ring", self.inference_candidate_ring),
-        ):
+        def _attempt(operation: str, callback: Any, *, missing_ok: bool = False) -> bool:
+            expected.add(operation)
+            if operation in completed:
+                return True
             try:
-                ring.close()  # type: ignore[attr-defined]
-            except Exception:
-                _close_errors.append(f"{ring_name}.close() failed")
-
-            try:
-                ring.unlink()  # type: ignore[attr-defined]
+                callback()
             except FileNotFoundError:
-                pass  # already unlinked by another process — expected
+                if not missing_ok:
+                    _close_errors.append(operation)
+                    logger.warning("SharedStorage close: %s failed", operation, exc_info=True)
+                    return False
             except Exception:
-                _close_errors.append(f"{ring_name}.unlink() failed")
+                _close_errors.append(operation)
+                logger.warning("SharedStorage close: %s failed", operation, exc_info=True)
+                return False
+            completed.add(operation)
+            return True
 
-        for queue_name, queue in (
-            ("arm_action_q", self.arm_action_q),
-            ("arm_home_result_q", self.arm_home_result_q),
-        ):
-            try:
-                queue.close()
-                queue.join_thread()
-            except Exception:
-                _close_errors.append(f"{queue_name} cleanup failed")
+        for ring_name in _RING_RESOURCE_NAMES:
+            ring = getattr(self, ring_name, None)
+            if ring is None:
+                continue
+            _attempt(f"{ring_name}.close", ring.close)
+            _attempt(f"{ring_name}.unlink", ring.unlink, missing_ok=True)
 
-        if _close_errors:
-            logger.warning("SharedStorage close: %d error(s): %s", len(_close_errors), "; ".join(_close_errors))
-        else:
+        for queue_name in _QUEUE_RESOURCE_NAMES:
+            queue = getattr(self, queue_name, None)
+            if queue is None:
+                continue
+            queue_close = f"{queue_name}.close"
+            queue_join = f"{queue_name}.join_thread"
+            expected.add(queue_join)
+            if _attempt(queue_close, queue.close):
+                _attempt(queue_join, queue.join_thread)
+
+        self._closed = not _close_errors and expected.issubset(completed)
+        if self._closed:
             logger.info("SharedStorage closed cleanly")
+        else:
+            logger.error("SharedStorage close incomplete: %s", ", ".join(_close_errors))
+        return self._closed
 
 
 def vr_frame_dtype() -> np.dtype:
@@ -593,21 +650,6 @@ def format_component_metrics_summary(shared: Any) -> str:
     return ", ".join(parts) if parts else "unavailable"
 
 
-def read_arm_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
-    """Read up to *k* most recent arm state frames (oldest-first), may be shorter than *k*."""
-    frames = shared.arm_state_ring.get_last_k(k)
-    return [data for data, _ts, _seq in frames]
-
-
-def read_hand_state_k(shared: "SharedStorage", k: int) -> "list[np.ndarray]":
-    """Read up to *k* most recent hand state frames (oldest-first), may be shorter than *k*."""
-    frames = shared.hand_state_ring.get_last_k(k)
-    return [data for data, _ts, _seq in frames]
-
-
-# ═══════════════════════════════════════════════ Shared entry-point helpers
-
-
 def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
@@ -664,530 +706,3 @@ def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
         "send_healthy": bool(data["send_healthy"][0]),
         "read_healthy": bool(data["read_healthy"][0]),
     }
-
-
-def shutdown_processes(
-    shared: "SharedStorage",
-    procs: "list[Any]",
-    *,
-    graceful_timeout_s: float = 5.0,
-) -> None:
-    """Compatibility wrapper for verified graceful→terminate→kill shutdown."""
-    from dexmani_real.runtime.processes import shutdown_processes_verified
-
-    report = shutdown_processes_verified(shared, procs, graceful_timeout_s=graceful_timeout_s)
-    if report.exits:
-        print("  shutdown: " + "  ".join(f"{item.name}={item.escalation}:{item.exitcode}" for item in report.exits))
-
-
-def wait_for_arm_home(
-    shared: "SharedStorage",
-    home_qpos: "np.ndarray",
-    *,
-    request_id: int | None = None,
-    requested_after_s: float | None = None,
-    timeout_s: float = 20.0,
-    tol_rad: float = 0.03,
-    heartbeat: bool = False,
-    verbose: bool = True,
-) -> bool:
-    """Wait for a fresh, correlated arm-worker homing acknowledgement.
-
-    New callers pass *request_id*.  The legacy state-only path is retained for
-    compatibility with external callers, but requires a frame newer than
-    *requested_after_s* and a healthy, connected arm.  Both paths fail early on
-    shutdown, sticky error, FAULT, stale arm heartbeat, or controller error.
-    """
-    _deadline = time.monotonic() + timeout_s
-    _not_before = time.monotonic() if requested_after_s is None else float(requested_after_s)
-    _abort_reason: str | None = None
-    _fault_ack_deadline: float | None = None
-    while time.monotonic() < _deadline:
-        _now = time.monotonic()
-        if heartbeat:
-            shared.policy_heartbeat_s.value = _now
-
-        _result = None
-        if request_id is not None:
-            try:
-                _result = shared.arm_home_result_q.get(timeout=min(0.1, max(0.0, _deadline - _now)))
-            except Empty:
-                pass
-            if _result is not None and (not isinstance(_result, HomeResult) or _result.request_id != request_id):
-                logger.warning("wait_for_arm_home: discarded stale/malformed result %r", _result)
-                continue
-        if isinstance(_result, HomeResult):
-            _q = np.asarray(_result.final_qpos, dtype=np.float64)
-            _converged = (
-                _q.shape == home_qpos.shape
-                and np.all(np.isfinite(_q))
-                and float(np.max(np.abs(_q - home_qpos))) < tol_rad
-            )
-            if _result.success and _converged:
-                if verbose:
-                    print("  arm: home reached", flush=True)
-                return True
-            if verbose:
-                print(f"  arm: home failed — {_result.reason}", flush=True)
-            return False
-
-        if not shared.is_running.value:
-            _abort_reason = "shutdown requested"
-            break
-        _fault_reason: str | None = None
-        if shared.error_state.value:
-            _fault_reason = "sticky error_state set"
-        elif shared.safety_state.value == int(SafetyState.FAULT):
-            _fault_reason = "safety state is FAULT"
-        if _fault_reason is not None:
-            # multiprocessing.Queue.put() may return before its feeder thread
-            # makes the correlated HomeResult visible.  The arm worker latches
-            # error_state immediately after publishing a failed result, so give
-            # that acknowledgement one bounded grace window before reporting a
-            # generic fault.  This preserves the precise SDK/timeout reason.
-            if request_id is not None:
-                if _fault_ack_deadline is None:
-                    _fault_ack_deadline = min(_deadline, _now + 0.25)
-                if _now < _fault_ack_deadline:
-                    continue
-            _abort_reason = _fault_reason
-            break
-        _arm_hb = float(shared.arm_heartbeat_s.value)
-        if _arm_hb > 0.0 and _now - _arm_hb > 1.0:
-            _abort_reason = f"arm heartbeat stale ({_now - _arm_hb:.1f}s)"
-            break
-        if request_id is not None:
-            continue
-
-        _as = read_arm_state(shared)
-        if _as is not None:
-            _q = np.asarray(_as["qpos"][0], dtype=np.float64)
-            _fresh = float(_as["timestamp"][0]) >= _not_before
-            _healthy = bool(_as["connected"][0]) and int(_as["error_code"][0]) == 0
-            if _fresh and _healthy and np.all(np.isfinite(_q)):
-                if float(np.max(np.abs(_q - home_qpos))) < tol_rad:
-                    if verbose:
-                        print("  arm: home reached", flush=True)
-                    return True
-        time.sleep(0.1)
-    if verbose:
-        if _abort_reason is not None:
-            print(f"  arm: home wait aborted — {_abort_reason}", flush=True)
-        else:
-            print(f"  arm: home acknowledgement timed out after {timeout_s:.1f}s", flush=True)
-    return False
-
-
-def _estimate_home_timeout_s(waypoints: "np.ndarray") -> float:
-    """Deadline derived from milestone path length and feedback settle overhead."""
-    if len(waypoints) < 2:
-        return 10.0
-    segment_motion = np.max(np.abs(np.diff(waypoints, axis=0)), axis=1)
-    nominal_s = float(np.sum(segment_motion)) / max(np.deg2rad(arm.homing.max_speed_deg_s), 1e-6)
-    moving_segments = int(np.count_nonzero(segment_motion > 1e-9))
-    settle_s = moving_segments * arm.homing.target_timeout_s
-    return max(10.0, 2.0 * nominal_s + settle_s + 5.0)
-
-
-def _format_home_candidate_rejection(candidate: "dict[str, Any]") -> str:
-    """Format one path-candidate diagnostic without dumping large arrays."""
-    name = str(candidate.get("name", "unknown"))
-    reason = str(candidate.get("reason", "unknown"))
-    if reason in ("self_collision", "environment_collision", "collision"):
-        collision = candidate.get("collision") or {}
-        pairs = collision.get("collision_pairs", []) if isinstance(collision, dict) else []
-        pair_names = [f"{pair.get('link1', '?')}<->{pair.get('link2', '?')}" for pair in pairs[:2]]
-        pair_text = ",".join(pair_names) if pair_names else "pair unavailable"
-        return f"{name}: collision sample={candidate.get('collision_waypoint_index', '?')} ({pair_text})"
-    if reason == "table_clearance":
-        clearance_mm = 1000.0 * float(candidate.get("clearance_m", float("nan")))
-        return (
-            f"{name}: table_clearance sample={candidate.get('table_waypoint_index', '?')} "
-            f"margin={clearance_mm:+.1f}mm"
-        )
-    if reason == "workspace":
-        return f"{name}: workspace segment={candidate.get('workspace_segment_index', '?')}"
-    detail = str(candidate.get("detail", "")).strip()
-    return f"{name}: {reason}" + (f" ({detail})" if detail else "")
-
-
-def send_arm_home(
-    shared: "SharedStorage",
-    home_qpos: "np.ndarray",
-    *,
-    planner: "Any | None" = None,
-    table_z_surface_m: float = 0.0,
-    current_qpos: "np.ndarray | None" = None,
-    queue_timeout: float = 2.0,
-    converge_timeout_s: float = 15.0,
-    heartbeat: bool = True,
-    verbose: bool = True,
-) -> bool:
-    """Send arm to home via collision-safe path and wait for convergence.
-
-    Encapsulates the full home sequence used by all entry points:
-    1. Read current qpos (from *current_qpos* or ``arm_state_ring``).
-    2. Densely validate collision-safe segments and retain sparse milestones.
-    3. Queue a correlated ``HomeRequest`` to ``arm_action_q``.
-    4. Wait for convergence via ``wait_for_arm_home``.
-
-    A planner is required. Missing state, planning errors, and unsafe paths
-    fail closed and are never converted into direct interpolation.
-
-    Returns True if home reached, False on timeout or error.
-    """
-    from dexmani_real.planning.path_utils import plan_band_alignment_path, plan_joint_home_path
-
-    # HOME is a motion command, not a fault-recovery command.  arm_loop stops
-    # consuming actions after a sticky fault, so rejecting here prevents
-    # impossible requests from filling the bounded action queue.
-    if not shared.is_running.value:
-        if verbose:
-            print("  arm: homing cancelled — shutdown in progress", flush=True)
-        return False
-    if shared.error_state.value or shared.safety_state.value == int(SafetyState.FAULT):
-        if verbose:
-            print("  arm: homing cancelled — system is in FAULT; restart after inspection", flush=True)
-        return False
-    if shared.safety_state.value not in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
-        if verbose:
-            print("  arm: homing cancelled — safety state is not ARMED/RUNNING", flush=True)
-        return False
-
-    # ── Step 1: resolve current qpos ──
-    if current_qpos is None:
-        _as = read_arm_state(shared)
-        _state_age_s = float("inf") if _as is None else time.monotonic() - float(_as["timestamp"][0])
-        if (
-            _as is None
-            or _state_age_s > 0.5
-            or not bool(_as["connected"][0])
-            or int(_as["error_code"][0]) != 0
-            or not np.all(np.isfinite(_as["qpos"][0]))
-        ):
-            if verbose:
-                print(
-                    f"  arm: current state is stale/unhealthy (age={_state_age_s:.2f}s) — homing cancelled", flush=True
-                )
-            return False
-        current_qpos = np.asarray(_as["qpos"][0], dtype=np.float64)
-    else:
-        current_qpos = np.asarray(current_qpos, dtype=np.float64)
-        if current_qpos.shape != (7,) or not np.all(np.isfinite(current_qpos)):
-            if verbose:
-                print("  arm: invalid current qpos — homing cancelled", flush=True)
-            return False
-
-    if planner is None:
-        if verbose:
-            print("  arm: no collision planner — homing cancelled", flush=True)
-        return False
-
-    # ── Step 2: plan collision-safe path to wrapped home ──
-    _home_path_report: dict[str, Any] = {}
-    try:
-        _waypoints = plan_joint_home_path(
-            current_qpos,
-            home_qpos,
-            planner,
-            table_z_surface_m=table_z_surface_m,
-            report=_home_path_report,
-        )
-    except Exception as exc:
-        logger.warning("send_arm_home: planning failed", exc_info=True)
-        if verbose:
-            print(f"  arm: home path planning failed — holding ({exc})", flush=True)
-        return False
-
-    if _waypoints is not None and len(_waypoints) == 0:
-        if verbose:
-            _candidate_text = "; ".join(
-                _format_home_candidate_rejection(candidate)
-                for candidate in _home_path_report.get("candidates", [])
-                if not candidate.get("safe", False)
-            )
-            _qpos_text = np.array2string(np.rad2deg(current_qpos), precision=1, separator=",")
-            print(
-                "  arm: no validated home-path candidate — holding\n"
-                f"       current_qpos_deg={_qpos_text}\n"
-                f"       rejected={_candidate_text or 'no candidate diagnostics'}",
-                flush=True,
-            )
-        return False
-
-    if verbose and _waypoints is not None:
-        _selected = _home_path_report.get("selected_candidate", "unknown")
-        print(f"  arm: home path selected={_selected} milestones={len(_waypoints)}", flush=True)
-
-    _wrapped_home = (
-        _waypoints[-1].copy()
-        if _waypoints is not None and len(_waypoints) > 0
-        else planner.ik_mgr.nearest_equivalent_qpos(home_qpos, current_qpos)
-    )
-    if _waypoints is None:
-        _waypoints = np.empty((0, 7), dtype=np.float64)
-
-    # ── Step 2b: plan band-alignment path (wrapped_home → canonical_home) ──
-    # plan_joint_home_path wraps home_qpos to the nearest 2π band of the
-    # arm's current encoder position.  The returned waypoints end at this
-    # wrapped position (_home).  For strategy learning we need the arm at
-    # the canonical home_qpos, so we append a collision-checked alignment
-    # segment that rotates only the band-mismatched equivalent joints.
-    try:
-        _align_path = plan_band_alignment_path(_wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m)
-    except Exception as exc:
-        logger.warning("send_arm_home: band-alignment planning failed", exc_info=True)
-        if verbose:
-            print(f"  arm: band-alignment planning failed — holding ({exc})", flush=True)
-        return False
-
-    if _align_path is not None:
-        if len(_align_path) == 0:
-            if verbose:
-                _desc = _describe_band_diff(_wrapped_home, home_qpos)
-                print(f"  arm: band-alignment UNSAFE ({_desc}) — holding", flush=True)
-            return False
-        # Keep the first alignment waypoint only when there is no main path.
-        _tail = _align_path[1:] if len(_waypoints) > 0 else _align_path
-        _waypoints = np.concatenate([_waypoints, _tail], axis=0)
-        if verbose:
-            _desc = _describe_band_diff(_wrapped_home, home_qpos)
-            print(f"  arm: band-alignment appended ({len(_tail)} milestones, {_desc})", flush=True)
-
-    # ── Step 3: queue HOME_SENTINEL ──
-    _request_id = time.monotonic_ns()
-    _execution_timeout_s = max(float(converge_timeout_s), _estimate_home_timeout_s(_waypoints))
-    # A prior caller may have abandoned a result.  Homing is serialized, so it
-    # is safe to drain stale acknowledgements before publishing the new ID.
-    while True:
-        try:
-            shared.arm_home_result_q.get_nowait()
-        except Empty:
-            break
-    try:
-        _request = HomeRequest(
-            request_id=_request_id,
-            waypoints=np.asarray(_waypoints, dtype=np.float64),
-            final_qpos=np.asarray(home_qpos, dtype=np.float64).copy(),
-            execution_timeout_s=_execution_timeout_s,
-        )
-        _requested_at_s = time.monotonic()
-        shared.arm_action_q.put((HOME_SENTINEL, _request), timeout=queue_timeout)
-    except Full:
-        if verbose:
-            print("  arm: action queue is full — homing request was not queued", flush=True)
-        return False
-    except Exception:
-        logger.warning("send_arm_home: failed to queue HOME request", exc_info=True)
-        if verbose:
-            print("  arm: failed to queue homing request", flush=True)
-        return False
-
-    # ── Step 4: wait for convergence ──
-    return wait_for_arm_home(
-        shared,
-        home_qpos,
-        request_id=_request_id,
-        requested_after_s=_requested_at_s,
-        timeout_s=_execution_timeout_s + 2.0,
-        tol_rad=np.deg2rad(2.0),
-        heartbeat=heartbeat,
-        verbose=verbose,
-    )
-
-
-def run_supervisor(
-    shared: "SharedStorage",
-    procs: "list",
-    proc_names: "list[str]",
-    heartbeat_fields: "dict[str, Any]",
-    *,
-    status_interval_s: float = 30.0,
-    heartbeat_timeouts_s: "dict[str, float] | None" = None,
-    supervisor_hz: float | None = None,
-) -> "tuple[str, bool]":
-    """Run the standard supervisor loop with resolved heartbeat settings.
-
-    Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
-    supervisor stopped; *normal_exit* is True for user-requested clean exits
-    (Q key or KeyboardInterrupt), False for faults.
-
-    The caller should have already transitioned to ARMED before calling this
-    and must handle shutdown + DISARMED transition after it returns.
-    """
-    import time as _time
-
-    from dexmani_real.config.defaults import safety
-    from dexmani_real.robot.safety import SafetyState, transition
-    from dexmani_real.runtime.processes import supervisor_exit_reason
-    from dexmani_real.runtime.status import ExitReason
-
-    _start_time = _time.monotonic()
-    _last_status_s = _start_time
-    _exit_reason = "unknown"
-    normal_exit = False
-    _supervisor_hz = float(safety.supervisor_hz if supervisor_hz is None else supervisor_hz)
-    if _supervisor_hz <= 0:
-        raise ValueError("supervisor_hz must be positive")
-    configured_timeouts = safety.heartbeat_timeouts if heartbeat_timeouts_s is None else heartbeat_timeouts_s
-    _timeouts = {name: float(configured_timeouts[name]) for name in heartbeat_fields}
-    if any(timeout <= 0 for timeout in _timeouts.values()):
-        raise ValueError("heartbeat timeouts must be positive")
-
-    try:
-        while True:
-            _now = _time.monotonic()
-            _heartbeat_ages = {
-                name: (_now - float(value.value) if float(value.value) > 0 else float("inf"))
-                for name, value in heartbeat_fields.items()
-            }
-            _reason = supervisor_exit_reason(shared, procs, _heartbeat_ages, _timeouts)
-            if _reason is ExitReason.ESTOP:
-                _exit_reason = "e-stop requested"
-                transition(shared, SafetyState.FAULT)
-                break
-            if _reason is ExitReason.STICKY_FAULT:
-                _exit_reason = "error_state set"
-                transition(shared, SafetyState.FAULT)
-                break
-            if _reason is ExitReason.WORKER_DEATH:
-                _dead_names = [process.name for process in procs if process.exitcode is not None]
-                _exit_reason = f"process died: {_dead_names}"
-                transition(shared, SafetyState.FAULT)
-                break
-            if _reason is ExitReason.HEARTBEAT_TIMEOUT:
-                _stale = [name for name, age in _heartbeat_ages.items() if age > _timeouts[name]]
-                _exit_reason = f"heartbeat timeout: {_stale}"
-                transition(shared, SafetyState.FAULT)
-                break
-            if _reason is ExitReason.EXPLICIT_QUIT:
-                normal_exit = True
-                _exit_reason = "explicit quit"
-                break
-
-            # 4. Periodic status print.
-            if _now - _last_status_s >= status_interval_s:
-                _runtime_m = (_now - _start_time) / 60.0
-                _safety = shared.safety_state.value
-                _hb_ages = ", ".join(f"{n}={_now - float(heartbeat_fields[n].value):.1f}s" for n in proc_names)
-                print(
-                    f"  [supervisor]  runtime={_runtime_m:.1f}min  safety={_safety}  hb_age=({_hb_ages})\n"
-                    f"                loops=({format_component_metrics_summary(shared)})",
-                    flush=True,
-                )
-                _last_status_s = _now
-
-            _time.sleep(1.0 / _supervisor_hz)
-
-    except KeyboardInterrupt:
-        _exit_reason = "KeyboardInterrupt"
-        normal_exit = True
-        shared.is_running.value = False
-
-    print(f"  [supervisor exit] reason={_exit_reason} loops=({format_component_metrics_summary(shared)})", flush=True)
-    return _exit_reason, normal_exit
-
-
-def wait_subsystem_ready(
-    shared: "SharedStorage",
-    ready_checks: "list[tuple[str, Any, float]]",
-    procs: "list[Any]",
-) -> bool:
-    """Wait for each ``(name, event, timeout_s)`` ready event to be set.
-
-    Checks ``error_state`` and process liveness on every poll tick.
-    Returns True if all subsystems are ready, False if any fail.
-
-    The caller is responsible for printing pre-wait user messages
-    (e.g. "put on Quest headset") before calling this function.
-    """
-    for name, ev, timeout in ready_checks:
-        _deadline = time.monotonic() + timeout
-        _ok = False
-        _logged = False
-        while time.monotonic() < _deadline:
-            if ev.is_set():
-                _ok = True
-                break
-            if shared.error_state.value:
-                logger.error("subsystem=%s init failed: error_state set", name)
-                _logged = True
-                break
-            if not all(p.is_alive() for p in procs):
-                _dead_names = [p.name for p in procs if not p.is_alive()]
-                logger.error(
-                    "subsystem=%s init failed: process(es) %s exited prematurely",
-                    name,
-                    _dead_names,
-                )
-                _logged = True
-                break
-            time.sleep(0.2)
-        if not _ok and not _logged:
-            logger.error("subsystem=%s ready_timeout=%ds", name, timeout)
-        if not _ok:
-            return False
-    return True
-
-
-def print_health_summary(shared: "SharedStorage") -> None:
-    """Print a pre-flight health summary from ring data (arm, hand, VR, camera)."""
-    print("\n── Health Check ──")
-
-    # Arm
-    arm_result = shared.arm_state_ring.read_latest()
-    if arm_result is not None:
-        arm_data, _, _ = arm_result
-        arm_connected = bool(arm_data["connected"][0])
-        arm_error = int(arm_data["error_code"][0])
-        arm_qpos = np.asarray(arm_data["qpos"][0], dtype=np.float64)
-        arm_qpos_ok = int(np.all(np.isfinite(arm_qpos)))
-        arm_ok = arm_connected and arm_error == 0 and bool(arm_qpos_ok)
-        print(
-            f"  arm   {'OK' if arm_ok else 'FAIL':>4s}  connected={int(arm_connected)}  "
-            f"error={arm_error}  qpos_ok={arm_qpos_ok}"
-        )
-    else:
-        print("  arm   ----  (no data yet)")
-
-    # Hand
-    hand_result = shared.hand_state_ring.read_latest()
-    if hand_result is not None:
-        hand_data, _, _ = hand_result
-        hand_connected = bool(hand_data["connected"][0])
-        hand_error = bool(hand_data["error_state"][0])
-        hand_qpos_stale = bool(hand_data["qpos_stale"][0])
-        hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
-        hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
-        hand_ok = hand_connected and not hand_error and bool(hand_qpos_ok)
-        stale_note = " stale=1" if hand_qpos_stale else ""
-        print(
-            f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
-            f"error={int(hand_error)}  qpos_ok={hand_qpos_ok}{stale_note}"
-        )
-    else:
-        print("  hand  ----  (no data yet)")
-
-    # VR
-    vr_result = shared.vr_ring.read_latest()
-    if vr_result is not None:
-        vr_data, _, _ = vr_result
-        vr_age_s = (
-            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9 if vr_data["local_recv_ns"][0] > 0 else -1
-        )
-        print(f"  vr     OK   age={vr_age_s:.1f}s  seq={int(vr_data['sequence_id'][0])}")
-    else:
-        print("  vr    ----  (no data yet)")
-
-    # Camera
-    cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
-    if cam_serial_bytes:
-        print(f"  cam    OK   serial={cam_serial_bytes.decode()}")
-    elif shared.camera_heartbeat_s.value > 0:
-        print("  cam    OK   serial=unknown")
-    else:
-        print("  cam   ----  (no data yet)")
-
-    print(f"  loops  {format_component_metrics_summary(shared)}")
-    print("──")
-    sys.stdout.flush()

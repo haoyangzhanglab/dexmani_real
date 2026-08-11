@@ -27,6 +27,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
+from dexmani_real.ipc.schema import HAND_FINGERTIP_SHAPE
 from dexmani_real.recording.episode_reader import EpisodeReader, MergedH5File
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters
@@ -583,7 +584,7 @@ class EpisodeVisualizer:
         if fp_data is None:
             return
         fp = np.asarray(fp_data[step_idx], dtype=np.float32)
-        if fp.ndim != 2 or fp.shape != (5, 3):
+        if fp.ndim != 2 or fp.shape != HAND_FINGERTIP_SHAPE:
             return
         if not np.all(np.isfinite(fp)):
             return

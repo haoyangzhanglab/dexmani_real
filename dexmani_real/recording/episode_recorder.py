@@ -1,34 +1,7 @@
-"""EpisodeRecorder — HDF5 teleoperation data recorder.
+"""Transactional HDF5 v15 episode serialization.
 
-State/action/VR streams are aligned to dt=1/control_hz via
-TimestampAlignedBuffer.  Camera streams are submitted to a dedicated bounded
-writer and written one-for-one with the control grid.
-
-Schema v15 datasets (add_frame data dict):
-  Observables: arm_qpos(7), arm_ee(9), arm_qvel(7), arm_tau(7),
-    hand_qpos(12), hand_fingertip(5,3), hand_contact(5,3),
-    hand_tactile_force(5,120,3), hand_tactile_contact(5),
-    hand_tipboard_err(12), hand_commboard_err(12), hand_jointboard_err(12),
-    hand_current(12), arm_connected, hand_connected,
-    hand_qpos_stale, hand_error_state
-  Actions: action_arm_joint(7), action_arm_ee(9), action_hand_joint(12),
-    action_arm_joint_sent(7, opt-in v9)
-  Flags: flag_sample_valid, flag_ik_ok, flag_ik_attempted, flag_retarget_ok,
-    flag_held, flag_safety_reject, camera_health, flag_frame_status,
-    flag_camera_fresh, flag_pointcloud_valid
-  VR: vr_wrist_pos(3), vr_wrist_rot6d(6), vr_landmarks(21,3)
-  Diagnostics (v10+): tracking_error, ik_solve_time_ms, target_pos_before_clamp(3),
-    head_quat_wxyz(4), arm_last_cmd_seq, arm_last_cmd_queue_latency_s,
-    arm_last_cmd_apply_latency_s, arm_last_cmd_sdk_duration_s,
-    arm_last_cmd_is_hold. v13 adds target_eef_pos_raw(3), target_eef_rot6d_raw(6),
-    action_hand_joint_raw(12), policy_map_time_ms, hand_retarget_time_ms,
-    transition_check_time_ms, policy_compute_time_ms
-  Camera diagnostics: camera_frame_number, camera_ring_sequence,
-    camera_device_timestamp_s, camera_capture_monotonic_s, camera_age_s
-  Meta: timestamp (synthetic grid-aligned), /meta group with explicit wall/grid timing
-
-Tactile force stored as a 5-finger x 120-taxel x 3-axis array; every successful
-hand read publishes a tactile source sample, including release/no-contact.
+State, action, VR, and camera rows are written one-for-one on the policy grid.
+The recorder verifies all sidecars before atomically publishing an episode.
 """
 
 from __future__ import annotations
@@ -52,6 +25,7 @@ import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import camera
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.camera_stream_writer import CameraStreamWriter, CameraStreamWriterConfig
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
@@ -62,11 +36,12 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
-
 SCHEMA_VERSION = 15  # v15: causal source/fill/action provenance; v12-v14 remain readable
+_CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
+_PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
+_PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
 
 
-# ── atexit safety net ──
 # The episode-stop thread is a daemon: if an entry point exits without
 # join_stop() (estop path, second Ctrl-C inside a finally prompt), the
 # interpreter kills it mid-flush and truncates the HDF5.  One hook joins
@@ -79,9 +54,10 @@ def _flush_all_recorders() -> None:
         try:
             if rec._recording:
                 rec.stop_episode(success=False, reason="atexit")
-            rec.join_stop(timeout=60.0)
+            if not rec.join_stop(timeout=_PROCESS_EXIT_STOP_TIMEOUT_S):
+                logger.error("recorder did not finish before interpreter shutdown")
         except Exception:
-            pass  # never raise during interpreter shutdown
+            logger.warning("recorder cleanup failed during interpreter shutdown", exc_info=True)
 
 
 atexit.register(_flush_all_recorders)
@@ -132,9 +108,8 @@ class EpisodeRecorder:
         self._resolved_config_hash = resolved_config_hash
         self._provenance = dict(provenance or {})
 
-        # Opt-in additive stream (schema v9): the delta-clipped arm joint command
-        # actually forwarded to the SDK each tick, as opposed to action_arm_joint
-        # (the IK target).  Set by vr_teleop_policy.py.
+        # Opt-in stream: the safe arm command actually forwarded to the worker,
+        # as opposed to action_arm_joint (the raw IK target).
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
         self._file: Any = None  # h5py.File | None — data.h5 (control streams + metadata)
@@ -237,7 +212,7 @@ class EpisodeRecorder:
         # would let the old stop thread clobber the new episode's state.
         # A crashed stop (ENOSPC, etc.) has already reset state — allow
         # a new start after logging the error.
-        if not self.join_stop(timeout=15.0):
+        if not self.join_stop(timeout=_PREVIOUS_EPISODE_STOP_TIMEOUT_S):
             if self._stop_error is not None:
                 logger.warning(
                     "Previous stop crashed (%s) — state was reset, allowing new start",
@@ -457,7 +432,7 @@ class EpisodeRecorder:
             "hand_current": (
                 np.asarray(state.hand_current, dtype=np.float64)
                 if state.hand_current is not None
-                else np.full(12, np.nan)
+                else np.full(HAND_JOINT_SHAPE, np.nan)
             ),
             # ── Connection status ──
             # Distinguishes "physically disconnected (NaN qpos + connected=False)"
@@ -467,7 +442,7 @@ class EpisodeRecorder:
             # ── Hand health flags ──
             "hand_qpos_stale": bool(state.hand_qpos_stale),
             "hand_error_state": bool(state.hand_error_state),
-            # ── Arm command timing (P0 latency observability) ──
+            # Arm command timing.
             "arm_last_cmd_seq": int(state.arm_last_cmd_seq),
             "arm_last_cmd_queue_latency_s": float(state.arm_last_cmd_queue_latency_s),
             "arm_last_cmd_apply_latency_s": float(state.arm_last_cmd_apply_latency_s),
@@ -598,7 +573,11 @@ class EpisodeRecorder:
         # earlier slot. Gated on the constructor flag so
         # an accidental kwarg can never add a dataset to a default (v8) recording.
         if self.arm_sent_stream:
-            sent = np.asarray(arm_qpos_sent, dtype=np.float64) if arm_qpos_sent is not None else np.full(7, np.nan)
+            sent = (
+                np.asarray(arm_qpos_sent, dtype=np.float64)
+                if arm_qpos_sent is not None
+                else np.full(ARM_JOINT_SHAPE, np.nan)
+            )
             data["action_arm_joint_sent"] = sent
 
         # ── Diagnostics: caller values override the schema defaults above ──
@@ -812,6 +791,8 @@ class EpisodeRecorder:
         a True from a crashed thread means "no pending flush" (the daemon is dead
         and can't be re-joined), NOT "file written successfully".
         """
+        if not np.isfinite(timeout) or timeout < 0:
+            raise ValueError("episode stop timeout must be finite and non-negative")
         t = self._stop_thread
         if t is None:
             # A prior call may already have joined a crashed stop thread.
@@ -834,7 +815,7 @@ class EpisodeRecorder:
     def poll_stop(self) -> StopResult:
         """Non-blocking check: has the background stop daemon finished?
 
-        Safe to call at 16 Hz from the main control loop.  Returns immediately
+        Safe to call once per configured control-grid tick. Returns immediately
         — never blocks on I/O.  After the first call that returns
         ``done=True``, the internal state is reset and subsequent calls
         return a clean sentinel (``done=True, path=None``) until the next
@@ -890,13 +871,13 @@ class EpisodeRecorder:
                 if self._camera_writer is not None:
                     self._camera_writer.close(timeout=5.0)
             except Exception:
-                pass
+                logger.warning("camera writer cleanup failed after episode stop error", exc_info=True)
             self._camera_writer = None
             try:
                 if self._file is not None:
                     self._file.close()
             except Exception:
-                pass
+                logger.warning("HDF5 cleanup failed after episode stop error", exc_info=True)
             self._file = None
         finally:
             # Always clean up temp directory and reset state, even if the
@@ -915,7 +896,7 @@ class EpisodeRecorder:
         writer = self._camera_writer
         if writer is None:
             raise RuntimeError("camera writer missing at episode stop")
-        writer.close(timeout=60.0)
+        writer.close(timeout=_CAMERA_WRITER_CLOSE_TIMEOUT_S)
         camera_frame_count = writer.frame_count
         self._camera_writer_metrics = writer.metrics
         self._camera_writer = None
@@ -977,7 +958,7 @@ class EpisodeRecorder:
         if _tmp is not None and _final is not None:
             if success:
                 self._validate_and_sync_temp_episode(Path(_tmp), self._frame_count)
-                self._rename_temp_to_final(_tmp, _final)
+                atomic_publish(_tmp, _final)
             else:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
                 self._discard_temp_files(_tmp)
@@ -1040,11 +1021,6 @@ class EpisodeRecorder:
         return target
 
     @staticmethod
-    def _try_rename(src: str, dst: str) -> None:
-        """Atomically rename within one parent; never copy a partial episode."""
-        atomic_publish(src, dst)
-
-    @staticmethod
     def _validate_and_sync_temp_episode(temp_dir: Path, expected_frames: int) -> None:
         """Reopen/decode all four modalities, then fsync before publication."""
         paths = {
@@ -1084,14 +1060,7 @@ class EpisodeRecorder:
         finally:
             os.close(dir_fd)
 
-    @classmethod
-    def _discard_temp_files(cls, tmp: str) -> None:
+    @staticmethod
+    def _discard_temp_files(tmp: str) -> None:
         """Remove temp directory and all contents. Never raises."""
-        try:
-            shutil.rmtree(tmp, ignore_errors=True)
-        except OSError:
-            pass
-
-    def _rename_temp_to_final(self, tmp: str, final: str) -> None:
-        """Rename temp directory to final episode directory."""
-        self._try_rename(tmp, final)
+        shutil.rmtree(tmp, ignore_errors=True)

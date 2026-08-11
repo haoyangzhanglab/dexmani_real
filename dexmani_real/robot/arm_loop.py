@@ -14,7 +14,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, safety
-from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, ARM_STATE_DTYPE
+from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, ARM_JOINT_SHAPE, ARM_STATE_DTYPE
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.action_protocol import (
@@ -25,16 +25,10 @@ from dexmani_real.policy.action_protocol import (
     make_stopped_ack,
     validate_worker_command,
 )
+from dexmani_real.robot.homing import HOME_SENTINEL, HomeRequest, HomeResult
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import (
-    HOME_SENTINEL,
-    HomeRequest,
-    HomeResult,
-    new_frame,
-    publish_component_metrics,
-    publish_component_status,
-)
+from dexmani_real.shm.shared_storage import new_frame, publish_component_metrics, publish_component_status
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
@@ -75,8 +69,8 @@ class ArmLoopConfig:
         lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
         upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
         home = np.asarray(self.home_qpos, dtype=np.float64)
-        if lower.shape != (7,) or upper.shape != (7,) or home.shape != (7,):
-            raise ValueError("arm loop joint limits/home must have shape (7,)")
+        if lower.shape != ARM_JOINT_SHAPE or upper.shape != ARM_JOINT_SHAPE or home.shape != ARM_JOINT_SHAPE:
+            raise ValueError(f"arm loop joint limits/home must have shape {ARM_JOINT_SHAPE}")
         if not np.all(np.isfinite(np.concatenate((lower, upper, home)))) or np.any(lower > upper):
             raise ValueError("arm loop joint limits/home must be finite and ordered")
         if self.recoverable_errors & self.collision_fault_errors:
@@ -142,8 +136,8 @@ def _recover_c24_measured_hold(arm_api: Any, cfg: ArmLoopConfig, *, operation_pr
     _require_sdk_ok(f"{operation_prefix} set_state(0)", arm_api.set_state(0))
     state_code, measured = arm_api.get_joint_states(is_radian=True, num=1)
     _require_sdk_ok(f"{operation_prefix} fresh get_joint_states", state_code)
-    measured_hold = np.asarray(measured[0], dtype=np.float64)[:7]
-    if measured_hold.shape != (7,) or not np.all(np.isfinite(measured_hold)):
+    measured_hold = np.asarray(measured[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+    if measured_hold.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(measured_hold)):
         raise RuntimeError(f"{operation_prefix} measured hold is invalid")
     _require_sdk_ok(
         f"{operation_prefix} measured hold",
@@ -174,11 +168,19 @@ def _decode_joint_state_feedback(code: Any, states: Any) -> tuple[np.ndarray, np
     _require_sdk_ok("get_joint_states", code)
     if not isinstance(states, (list, tuple)) or not states:
         raise RuntimeError("get_joint_states returned no joint state")
-    qpos = np.asarray(states[0], dtype=np.float64)[:7]
-    qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.zeros(7, dtype=np.float64)
-    tau = np.asarray(states[2], dtype=np.float64)[:7] if len(states) > 2 else np.zeros(7, dtype=np.float64)
+    qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+    qvel = (
+        np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+        if len(states) > 1
+        else np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
+    )
+    tau = (
+        np.asarray(states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+        if len(states) > 2
+        else np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
+    )
     for name, value in (("qpos", qpos), ("qvel", qvel), ("tau", tau)):
-        if value.shape != (7,) or not np.all(np.isfinite(value)):
+        if value.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(value)):
             raise RuntimeError(f"get_joint_states returned invalid {name}: shape={value.shape}")
     return qpos, qvel, tau
 
@@ -369,15 +371,13 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         _disconnect_arm(arm)
         return
 
-    # Seed last_qpos — retry transient comm failures (ref: pi-r2-flow
-    # control_utils.py:181-192 get_obs_retry).  A single failed read during
-    # startup is not a reason to abort the process.
+    # A single failed startup read is not enough to declare the controller dead.
     _STATE_READ_MAX_RETRIES = 10
     for _attempt in range(_STATE_READ_MAX_RETRIES):
         try:
             code, states = arm.get_joint_states(is_radian=True, num=1)
             if code == 0 and len(states) > 0:
-                last_qpos = np.asarray(states[0], dtype=np.float64)[:7].copy()
+                last_qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
                 break
             logger.warning(
                 "arm_loop: initial joint state read attempt %d/%d: code=%d",
@@ -441,8 +441,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         eef_rot6d_init = np.zeros(6, dtype=np.float64)
     _frame = new_frame(ARM_STATE_DTYPE)
     _frame["qpos"][0] = last_qpos
-    _frame["qvel"][0] = np.zeros(7, dtype=np.float64)
-    _frame["tau"][0] = np.zeros(7, dtype=np.float64)
+    _frame["qvel"][0] = np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
+    _frame["tau"][0] = np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
     _frame["eef_pos"][0] = eef_pos_init
     _frame["eef_rot6d"][0] = eef_rot6d_init
     _frame["error_code"][0] = 0
@@ -642,7 +642,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     shared.arm_home_result_q.put(_home_result, timeout=0.2)
                 except Exception:
                     logger.error("arm_loop: failed to publish HOME result", exc_info=True)
-                if _home_result.final_qpos.shape == (7,) and np.all(np.isfinite(_home_result.final_qpos)):
+                if _home_result.final_qpos.shape == ARM_JOINT_SHAPE and np.all(np.isfinite(_home_result.final_qpos)):
                     last_qpos = _home_result.final_qpos.copy()
                     last_target = last_qpos.copy()
                 if _home_result.success:
@@ -805,7 +805,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             state_read_succeeded = True
         except Exception:
             logger.warning("arm_loop: get_joint_states failed", exc_info=True)
-            qpos, qvel, tau = last_qpos.copy(), np.zeros(7), np.zeros(7)
+            qpos, qvel, tau = last_qpos.copy(), np.zeros(ARM_JOINT_SHAPE), np.zeros(ARM_JOINT_SHAPE)
             arm_connected = False
         state_read_fault = _update_state_read_watchdog(
             _state_error_counter,
@@ -937,11 +937,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
 
 def _disconnect_arm(arm: Any) -> None:
-    """Disconnect arm safely, ignoring errors."""
+    """Disconnect arm and report best-effort cleanup failures."""
     try:
         arm.disconnect()
     except Exception:
-        pass
+        logger.warning("arm disconnect failed during cleanup", exc_info=True)
 
 
 def _planned_homing(
@@ -989,32 +989,36 @@ def _planned_homing(
     waypoints = np.asarray(request.waypoints, dtype=np.float64)
     home_qpos = np.asarray(request.final_qpos, dtype=np.float64)
     if not isinstance(request.request_id, (int, np.integer)) or int(request.request_id) <= 0:
-        return _result(False, "invalid request_id", np.full(7, np.nan))
-    if waypoints.ndim != 2 or waypoints.shape[1:] != (7,) or not np.all(np.isfinite(waypoints)):
-        return _result(False, "invalid waypoint array", np.full(7, np.nan))
-    if home_qpos.shape != (7,) or not np.all(np.isfinite(home_qpos)):
-        return _result(False, "invalid final_qpos", np.full(7, np.nan))
+        return _result(False, "invalid request_id", np.full(ARM_JOINT_SHAPE, np.nan))
+    if waypoints.ndim != 2 or waypoints.shape[1:] != ARM_JOINT_SHAPE or not np.all(np.isfinite(waypoints)):
+        return _result(False, "invalid waypoint array", np.full(ARM_JOINT_SHAPE, np.nan))
+    if home_qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(home_qpos)):
+        return _result(False, "invalid final_qpos", np.full(ARM_JOINT_SHAPE, np.nan))
     if not np.isfinite(request.execution_timeout_s) or request.execution_timeout_s <= 0.0:
-        return _result(False, "invalid execution timeout", np.full(7, np.nan))
+        return _result(False, "invalid execution timeout", np.full(ARM_JOINT_SHAPE, np.nan))
     _lower = np.asarray(_cfg.joint_limit_lower, dtype=np.float64)
     _upper = np.asarray(_cfg.joint_limit_upper, dtype=np.float64)
     if len(waypoints) > 0 and not np.all((waypoints >= _lower) & (waypoints <= _upper)):
-        return _result(False, "waypoint violates joint limits", np.full(7, np.nan))
+        return _result(False, "waypoint violates joint limits", np.full(ARM_JOINT_SHAPE, np.nan))
     if len(waypoints) > 0 and float(np.max(np.abs(waypoints[-1] - home_qpos))) > 1e-6:
-        return _result(False, "final milestone does not match canonical home", np.full(7, np.nan))
+        return _result(False, "final milestone does not match canonical home", np.full(ARM_JOINT_SHAPE, np.nan))
 
     try:
         code, states = arm.get_joint_states(is_radian=True, num=3)
         if code == 0 and len(states) > 0:
-            current = np.asarray(states[0], dtype=np.float64)[:7]
-            current_qvel = np.asarray(states[1], dtype=np.float64)[:7] if len(states) > 1 else np.full(7, np.inf)
+            current = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+            current_qvel = (
+                np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+                if len(states) > 1
+                else np.full(ARM_JOINT_SHAPE, np.inf)
+            )
         else:
-            return _result(False, f"initial state read failed (code={code})", np.full(7, np.nan))
+            return _result(False, f"initial state read failed (code={code})", np.full(ARM_JOINT_SHAPE, np.nan))
     except Exception:
         logger.warning("_planned_homing: initial state read raised", exc_info=True)
-        return _result(False, "initial state read raised", np.full(7, np.nan))
-    if current.shape != (7,) or not np.all(np.isfinite(current)):
-        return _result(False, "initial state is invalid", np.full(7, np.nan))
+        return _result(False, "initial state read raised", np.full(ARM_JOINT_SHAPE, np.nan))
+    if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
+        return _result(False, "initial state is invalid", np.full(ARM_JOINT_SHAPE, np.nan))
 
     def _confirm_home_dwell(failure_reason: str) -> HomeResult:
         nonlocal current, current_qvel
@@ -1032,11 +1036,11 @@ def _planned_homing(
             code, states = arm.get_joint_states(is_radian=True, num=3)
             if code != 0 or len(states) <= 1:
                 return _result(False, "state/qvel unavailable during home dwell", current)
-            current = np.asarray(states[0], dtype=np.float64)[:7]
-            current_qvel = np.asarray(states[1], dtype=np.float64)[:7]
+            current = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+            current_qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
             if (
-                current.shape != (7,)
-                or current_qvel.shape != (7,)
+                current.shape != ARM_JOINT_SHAPE
+                or current_qvel.shape != ARM_JOINT_SHAPE
                 or not np.all(np.isfinite(current))
                 or not np.all(np.isfinite(current_qvel))
                 or float(np.max(np.abs(current - home_qpos))) > _cfg.homing_convergence_rad
@@ -1047,7 +1051,7 @@ def _planned_homing(
 
     if len(waypoints) == 0:
         return _confirm_home_dwell("empty path while away from stationary canonical home")
-    if float(np.max(np.abs(current - waypoints[0]))) > np.deg2rad(2.0):
+    if float(np.max(np.abs(current - waypoints[0]))) > _cfg.homing_convergence_rad:
         return _result(False, "current state moved too far from planned path start", current)
 
     _execution_targets = waypoints[1:]
@@ -1112,13 +1116,17 @@ def _planned_homing(
                         f"state read failed at milestone {_target_index} (code={_state_code})",
                         current,
                     )
-                current = np.asarray(_states[0], dtype=np.float64)[:7]
-                if current.shape != (7,) or not np.all(np.isfinite(current)):
+                current = np.asarray(_states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+                if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
                     return _result(False, f"invalid state at milestone {_target_index}", current)
                 if len(_states) <= 1:
                     return _result(False, f"qvel unavailable at milestone {_target_index}", current)
-                qvel = np.asarray(_states[1], dtype=np.float64)[:7]
-                tau = np.asarray(_states[2], dtype=np.float64)[:7] if len(_states) > 2 else np.zeros(7)
+                qvel = np.asarray(_states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+                tau = (
+                    np.asarray(_states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+                    if len(_states) > 2
+                    else np.zeros(ARM_JOINT_SHAPE)
+                )
                 try:
                     _controller_error = int(getattr(arm, "error_code", 0) or 0)
                 except Exception:

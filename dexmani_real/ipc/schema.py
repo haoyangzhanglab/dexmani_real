@@ -13,6 +13,20 @@ RECORD_CONTROL_JSON_BYTES = 65_536
 RECORD_SAMPLE_JSON_BYTES = 32_768
 RECORD_STATUS_TEXT_BYTES = 2_048
 
+ARM_DOF = 7
+HAND_DOF = 12
+HAND_FINGER_COUNT = 5
+TACTILE_POINTS_PER_FINGER = 120
+TACTILE_AXIS_COUNT = 3
+
+ARM_JOINT_SHAPE = (ARM_DOF,)
+HAND_JOINT_SHAPE = (HAND_DOF,)
+ARM_EE_SHAPE = (9,)
+HAND_TACTILE_SUM_SHAPE = (HAND_FINGER_COUNT, TACTILE_AXIS_COUNT)
+HAND_TACTILE_FORCE_SHAPE = (HAND_FINGER_COUNT, TACTILE_POINTS_PER_FINGER, TACTILE_AXIS_COUNT)
+HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
+HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
+
 _COMMAND_COMMON_FIELDS = [
     ("session_generation", "<u8"),
     ("policy_epoch", "<u8"),
@@ -26,8 +40,8 @@ _COMMAND_COMMON_FIELDS = [
     ("is_hold", "<u1"),
 ]
 
-ARM_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", (7,))], align=True)
-HAND_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", (12,))], align=True)
+ARM_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True)
+HAND_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True)
 COMMIT_DTYPE = np.dtype(
     [
         ("session_generation", "<u8"),
@@ -77,17 +91,17 @@ INFERENCE_CANDIDATE_DTYPE = np.dtype(
         ("has_arm", "<u1"),
         ("has_hand", "<u1"),
         ("is_hold", "<u1"),
-        ("arm_qpos", "<f8", (7,)),
-        ("hand_qpos", "<f8", (12,)),
+        ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
+        ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
     ],
     align=True,
 )
 
 ARM_STATE_DTYPE = np.dtype(
     [
-        ("qpos", "<f8", (7,)),
-        ("qvel", "<f8", (7,)),
-        ("tau", "<f8", (7,)),
+        ("qpos", "<f8", ARM_JOINT_SHAPE),
+        ("qvel", "<f8", ARM_JOINT_SHAPE),
+        ("tau", "<f8", ARM_JOINT_SHAPE),
         ("eef_pos", "<f8", (3,)),
         ("eef_rot6d", "<f8", (6,)),
         ("error_code", "<i4"),
@@ -111,16 +125,16 @@ ARM_STATE_DTYPE = np.dtype(
 
 HAND_STATE_DTYPE = np.dtype(
     [
-        ("qpos", "<f8", (12,)),
-        ("current", "<f8", (12,)),
-        ("tactile_sum", "<f8", (5, 3)),
-        ("tactile_contact", "<u1", (5,)),
+        ("qpos", "<f8", HAND_JOINT_SHAPE),
+        ("current", "<f8", HAND_JOINT_SHAPE),
+        ("tactile_sum", "<f8", HAND_TACTILE_SUM_SHAPE),
+        ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
         ("error_state", "<u1"),
         ("connected", "<u1"),
         ("qpos_stale", "<u1"),
-        ("commboard_err", "<i4", (12,)),
-        ("jointboard_err", "<i4", (12,)),
-        ("tipboard_err", "<i4", (12,)),
+        ("commboard_err", "<i4", HAND_JOINT_SHAPE),
+        ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
+        ("tipboard_err", "<i4", HAND_JOINT_SHAPE),
         ("source_monotonic_ns", "<u8"),
         ("publish_monotonic_ns", "<u8"),
         ("state_valid", "<u1"),
@@ -132,7 +146,7 @@ HAND_STATE_DTYPE = np.dtype(
 
 HAND_TACTILE_DTYPE = np.dtype(
     [
-        ("tactile_force", "<f8", (5, 120, 3)),
+        ("tactile_force", "<f8", HAND_TACTILE_FORCE_SHAPE),
         ("source_monotonic_ns", "<u8"),
         ("fresh", "<u1"),
         ("calibrated", "<u1"),
@@ -140,6 +154,8 @@ HAND_TACTILE_DTYPE = np.dtype(
     ]
 )
 
+# A ring publication is driven by a right-hand frame. ``head_*`` pose fields
+# are the latest cached HeadFrame, identified by its own sequence and receive time.
 VR_FRAME_DTYPE = np.dtype(
     [
         ("wrist_pos", "<f8", (3,)),
@@ -153,6 +169,8 @@ VR_FRAME_DTYPE = np.dtype(
         ("source_frame_seq", "<u8"),
         ("local_recv_ns", "<u8"),
         ("side", "<i4"),
+        ("head_sequence_id", "<u8"),
+        ("head_recv_ts_ns", "<u8"),
     ],
     align=True,
 )
@@ -257,22 +275,22 @@ def make_record_sample_dtype(
         [
             ("generation", "<u8"),
             ("sample_sequence", "<u8"),
-            ("arm_qpos", "<f8", (7,)),
-            ("arm_qvel", "<f8", (7,)),
-            ("arm_tau", "<f8", (7,)),
+            ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
+            ("arm_qvel", "<f8", ARM_JOINT_SHAPE),
+            ("arm_tau", "<f8", ARM_JOINT_SHAPE),
             ("eef_pos", "<f8", (3,)),
             ("eef_quat_wxyz", "<f8", (4,)),
             ("eef_rot6d", "<f8", (6,)),
-            ("hand_qpos", "<f8", (12,)),
-            ("hand_current", "<f8", (12,)),
-            ("hand_tactile_sum", "<f8", (5, 3)),
-            ("hand_tactile_force", "<f8", (5, 120, 3)),
-            ("hand_tactile_contact", "<u1", (5,)),
-            ("hand_tipboard_err", "<i4", (12,)),
-            ("hand_commboard_err", "<i4", (12,)),
-            ("hand_jointboard_err", "<i4", (12,)),
+            ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
+            ("hand_current", "<f8", HAND_JOINT_SHAPE),
+            ("hand_tactile_sum", "<f8", HAND_TACTILE_SUM_SHAPE),
+            ("hand_tactile_force", "<f8", HAND_TACTILE_FORCE_SHAPE),
+            ("hand_tactile_contact", "<u1", HAND_CONTACT_SHAPE),
+            ("hand_tipboard_err", "<i4", HAND_JOINT_SHAPE),
+            ("hand_commboard_err", "<i4", HAND_JOINT_SHAPE),
+            ("hand_jointboard_err", "<i4", HAND_JOINT_SHAPE),
             ("hand_qpos_stale", "<u1"),
-            ("fingertip_pos", "<f8", (5, 3)),
+            ("fingertip_pos", "<f8", HAND_FINGERTIP_SHAPE),
             ("arm_connected", "<u1"),
             ("hand_connected", "<u1"),
             ("state_timestamp", "<f8"),
@@ -282,8 +300,8 @@ def make_record_sample_dtype(
             ("arm_last_cmd_apply_latency_s", "<f8"),
             ("arm_last_cmd_sdk_duration_s", "<f8"),
             ("arm_last_cmd_is_hold", "<u1"),
-            ("action_arm_qpos", "<f8", (7,)),
-            ("action_hand_qpos", "<f8", (12,)),
+            ("action_arm_qpos", "<f8", ARM_JOINT_SHAPE),
+            ("action_hand_qpos", "<f8", HAND_JOINT_SHAPE),
             ("action_target_eef_pos", "<f8", (3,)),
             ("action_target_eef_rot6d", "<f8", (6,)),
             ("vr_wrist_pos", "<f8", (3,)),

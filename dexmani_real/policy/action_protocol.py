@@ -17,11 +17,23 @@ from typing import Any, Callable
 
 import numpy as np
 
-from dexmani_real.ipc.schema import ACK_DTYPE, ARM_COMMAND_DTYPE, COMMIT_DTYPE, HAND_COMMAND_DTYPE
+from dexmani_real.config.defaults import hand, policy
+from dexmani_real.ipc.schema import (
+    ACK_DTYPE,
+    ARM_COMMAND_DTYPE,
+    ARM_JOINT_SHAPE,
+    ARM_STATE_DTYPE,
+    COMMIT_DTYPE,
+    HAND_COMMAND_DTYPE,
+    HAND_JOINT_SHAPE,
+    HAND_STATE_DTYPE,
+)
 from dexmani_real.policy.runtime import ActionCandidate, ActionChunk, ActionSpec, FrozenArrayMap, ObservationSnapshot
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+_HAND_HOME_PUBLISH_INTERVAL_S = 0.1
 
 
 class AckStatus(IntEnum):
@@ -48,6 +60,17 @@ class RejectReason(IntEnum):
     SDK_ERROR = 11
 
 
+def advance_policy_epoch(shared: Any) -> int:
+    """Invalidate commands prepared under the previous policy epoch."""
+    lock_getter = getattr(shared.policy_epoch, "get_lock", None)
+    if callable(lock_getter):
+        with lock_getter():
+            shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
+            return int(shared.policy_epoch.value)
+    shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
+    return int(shared.policy_epoch.value)
+
+
 @dataclass(frozen=True)
 class GateResult:
     accepted: bool
@@ -72,9 +95,9 @@ class ActionSafetyGateConfig:
         arm_upper = np.asarray(self.arm_joint_upper_rad, dtype=np.float64)
         hand_lower = np.asarray(self.hand_joint_lower_rad, dtype=np.float64)
         hand_upper = np.asarray(self.hand_joint_upper_rad, dtype=np.float64)
-        if arm_lower.shape != (7,) or arm_upper.shape != (7,):
+        if arm_lower.shape != ARM_JOINT_SHAPE or arm_upper.shape != ARM_JOINT_SHAPE:
             raise ValueError("arm gate limits must have seven entries")
-        if hand_lower.shape != (12,) or hand_upper.shape != (12,):
+        if hand_lower.shape != HAND_JOINT_SHAPE or hand_upper.shape != HAND_JOINT_SHAPE:
             raise ValueError("hand gate limits must have twelve entries")
         if (
             not np.all(np.isfinite(np.concatenate((arm_lower, arm_upper, hand_lower, hand_upper))))
@@ -128,7 +151,8 @@ class ActionSafetyGate:
         if candidate.policy_epoch != expected_policy_epoch:
             return GateResult(False, None, "policy epoch mismatch")
         if (
-            candidate.valid_until_monotonic_ns < now_ns
+            candidate.target_monotonic_ns <= now_ns
+            or candidate.valid_until_monotonic_ns < now_ns
             or candidate.target_monotonic_ns > candidate.valid_until_monotonic_ns
         ):
             return GateResult(False, None, "action expired")
@@ -144,7 +168,7 @@ class ActionSafetyGate:
 
         arm_start = np.asarray(current_arm_qpos, dtype=np.float64)
         hand_start = np.asarray(current_hand_qpos, dtype=np.float64)
-        if arm_start.shape != (7,) or hand_start.shape != (12,):
+        if arm_start.shape != ARM_JOINT_SHAPE or hand_start.shape != HAND_JOINT_SHAPE:
             return GateResult(False, None, "invalid current joint state shape")
         if not np.all(np.isfinite(arm_start)) or not np.all(np.isfinite(hand_start)):
             return GateResult(False, None, "current joint state contains NaN/Inf")
@@ -158,8 +182,8 @@ class ActionSafetyGate:
             else np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
         )
         if (
-            arm_end.shape != (7,)
-            or hand_end.shape != (12,)
+            arm_end.shape != ARM_JOINT_SHAPE
+            or hand_end.shape != HAND_JOINT_SHAPE
             or not np.all(np.isfinite(arm_end))
             or not np.all(np.isfinite(hand_end))
         ):
@@ -349,7 +373,72 @@ def command_matches_commit(command: np.ndarray, commit: np.ndarray) -> bool:
         if int(commit[name][0]) != int(command[name][0]):
             return False
     committed_ns = int(commit["committed_monotonic_ns"][0])
-    return int(command["created_monotonic_ns"][0]) <= committed_ns <= int(command["target_monotonic_ns"][0])
+    return int(command["created_monotonic_ns"][0]) <= committed_ns < int(command["target_monotonic_ns"][0])
+
+
+def _source_age_s(source_monotonic_ns: int, *, now_monotonic_ns: int, max_age_s: float, actuator: str) -> float:
+    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
+        raise ValueError("feedback max age must be finite and positive")
+    if source_monotonic_ns <= 0:
+        raise ValueError(f"{actuator} feedback has no source timestamp")
+    age_s = (now_monotonic_ns - source_monotonic_ns) * 1e-9
+    if age_s < 0.0 or age_s > max_age_s:
+        raise ValueError(f"{actuator} feedback is stale or from the future")
+    return age_s
+
+
+def _validated_arm_feedback_qpos(record: np.void, *, now_monotonic_ns: int, max_age_s: float) -> np.ndarray:
+    """Return a private copy of complete, healthy arm feedback."""
+    if not isinstance(record, np.void) or record.dtype != ARM_STATE_DTYPE:
+        raise ValueError("arm feedback has an invalid schema")
+    if not bool(record["connected"]) or not bool(record["state_valid"]):
+        raise ValueError("arm feedback is disconnected or invalid")
+    if int(record["error_code"]) != 0:
+        raise ValueError(f"arm feedback reports controller error {int(record['error_code'])}")
+    _source_age_s(
+        int(record["source_monotonic_ns"]),
+        now_monotonic_ns=now_monotonic_ns,
+        max_age_s=max_age_s,
+        actuator="arm",
+    )
+    for name, expected_shape in (
+        ("qpos", ARM_JOINT_SHAPE),
+        ("qvel", ARM_JOINT_SHAPE),
+        ("eef_pos", (3,)),
+        ("eef_rot6d", (6,)),
+    ):
+        value = np.asarray(record[name], dtype=np.float64)
+        if value.shape != expected_shape or not np.all(np.isfinite(value)):
+            raise ValueError(f"arm feedback {name} has an invalid shape or value")
+    return np.asarray(record["qpos"], dtype=np.float64).copy()
+
+
+def _validated_hand_feedback_qpos(record: np.void, *, now_monotonic_ns: int, max_age_s: float) -> np.ndarray:
+    """Return a private copy of complete, healthy measured-hand feedback."""
+    if not isinstance(record, np.void) or record.dtype != HAND_STATE_DTYPE:
+        raise ValueError("hand feedback has an invalid schema")
+    if not bool(record["connected"]) or not bool(record["state_valid"]):
+        raise ValueError("hand feedback is disconnected or invalid")
+    if bool(record["error_state"]):
+        raise ValueError("hand feedback reports a hardware error")
+    if bool(record["qpos_stale"]):
+        raise ValueError("hand joint feedback is stale")
+    if not bool(record["send_healthy"]) or not bool(record["read_healthy"]):
+        raise ValueError("hand command/state I/O is unhealthy")
+    for name in ("commboard_err", "jointboard_err", "tipboard_err"):
+        value = np.asarray(record[name])
+        if value.shape != HAND_JOINT_SHAPE or np.any(value != 0):
+            raise ValueError(f"hand feedback reports {name}")
+    _source_age_s(
+        int(record["source_monotonic_ns"]),
+        now_monotonic_ns=now_monotonic_ns,
+        max_age_s=max_age_s,
+        actuator="hand",
+    )
+    qpos = np.asarray(record["qpos"], dtype=np.float64)
+    if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
+        raise ValueError("hand feedback qpos has an invalid shape or value")
+    return qpos.copy()
 
 
 def validate_worker_command(
@@ -390,7 +479,7 @@ class SafeCommandPublisher:
     def __init__(self, shared: Any) -> None:
         self.shared = shared
 
-    def prepare(self, candidate: ActionCandidate, *, timeout_s: float = 0.05) -> None:
+    def prepare(self, candidate: ActionCandidate, *, timeout_s: float = policy.action_prepare_timeout_s) -> None:
         if candidate.arm_qpos is not None:
             arm_frame = make_command_frame(candidate, actuator="arm")
             try:
@@ -400,7 +489,15 @@ class SafeCommandPublisher:
         if candidate.hand_qpos is not None:
             self.shared.hand_cmd_ring.write(make_command_frame(candidate, actuator="hand"))
 
-    def commit(self, candidate: ActionCandidate) -> None:
+    def commit(self, candidate: ActionCandidate) -> bool:
+        committed_ns = time.monotonic_ns()
+        if (
+            committed_ns < candidate.created_monotonic_ns
+            or committed_ns >= candidate.target_monotonic_ns
+            or committed_ns > candidate.valid_until_monotonic_ns
+        ):
+            logger.error("SafeCommandPublisher: refusing late commit for action_id=%d", candidate.action_id)
+            return False
         frame = np.zeros(1, dtype=COMMIT_DTYPE)
         frame["session_generation"][0] = candidate.session_generation
         frame["policy_epoch"][0] = candidate.policy_epoch
@@ -409,11 +506,12 @@ class SafeCommandPublisher:
         frame["chunk_id"][0] = candidate.chunk_id
         frame["step_index"][0] = candidate.step_index
         frame["created_monotonic_ns"][0] = candidate.created_monotonic_ns
-        frame["committed_monotonic_ns"][0] = time.monotonic_ns()
+        frame["committed_monotonic_ns"][0] = committed_ns
         frame["target_monotonic_ns"][0] = candidate.target_monotonic_ns
         frame["valid_until_monotonic_ns"][0] = candidate.valid_until_monotonic_ns
         frame["is_hold"][0] = candidate.is_hold
         self.shared.action_commit_ring.write(frame)
+        return True
 
     @staticmethod
     def _ack_matches(ack: np.ndarray, candidate: ActionCandidate) -> bool:
@@ -432,16 +530,35 @@ class SafeCommandPublisher:
         data = result[0]
         return cls._ack_matches(data, candidate) and int(data["status"][0]) == int(AckStatus.PREPARED)
 
-    def publish(self, candidate: ActionCandidate, *, prepare_timeout_s: float = 0.05) -> bool:
-        """Prepare both enabled actuators, wait for ACKs, then commit atomically."""
-        self.prepare(candidate, timeout_s=prepare_timeout_s)
-        deadline = time.monotonic() + prepare_timeout_s
-        while time.monotonic() < deadline:
+    def publish(
+        self,
+        candidate: ActionCandidate,
+        *,
+        prepare_timeout_s: float = policy.action_prepare_timeout_s,
+    ) -> bool:
+        """Prepare enabled actuators and commit before one shared deadline."""
+        if not np.isfinite(prepare_timeout_s) or prepare_timeout_s <= 0.0:
+            raise ValueError("prepare_timeout_s must be finite and positive")
+        started_ns = time.monotonic_ns()
+        deadline_ns = min(
+            started_ns + int(prepare_timeout_s * 1e9),
+            candidate.target_monotonic_ns,
+            candidate.valid_until_monotonic_ns,
+        )
+        remaining_s = (deadline_ns - time.monotonic_ns()) * 1e-9
+        if remaining_s <= 0.0:
+            logger.error("SafeCommandPublisher: action_id=%d has no prepare window", candidate.action_id)
+            return False
+        try:
+            self.prepare(candidate, timeout_s=remaining_s)
+        except TimeoutError:
+            logger.error("SafeCommandPublisher: prepare enqueue timeout for action_id=%d", candidate.action_id)
+            return False
+        while time.monotonic_ns() < deadline_ns:
             arm_ready = candidate.arm_qpos is None or self._prepared(self.shared.arm_ack_ring, candidate)
             hand_ready = candidate.hand_qpos is None or self._prepared(self.shared.hand_ack_ring, candidate)
             if arm_ready and hand_ready:
-                self.commit(candidate)
-                return True
+                return self.commit(candidate)
             time.sleep(0.001)
         logger.error("SafeCommandPublisher: prepare timeout for action_id=%d", candidate.action_id)
         return False
@@ -456,7 +573,7 @@ class SafeCommandPublisher:
         except ValueError:
             return None
 
-    def wait_applied(self, candidate: ActionCandidate, *, timeout_s: float = 0.5) -> bool:
+    def wait_applied(self, candidate: ActionCandidate, *, timeout_s: float = policy.action_apply_timeout_s) -> bool:
         """Wait for every enabled actuator to acknowledge SDK application."""
         deadline = time.monotonic() + timeout_s
         failed = {AckStatus.REJECTED, AckStatus.SDK_FAILED}
@@ -486,13 +603,13 @@ def publish_joint_targets(
     hand_qpos: np.ndarray | None = None,
     *,
     is_hold: bool = False,
-    prepare_timeout_s: float = 0.06,
+    prepare_timeout_s: float = policy.action_prepare_timeout_s,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     dt_s: float | None = None,
     safety_gate: ActionSafetyGate | None = None,
     wait_applied: bool = False,
-    apply_timeout_s: float = 0.5,
+    apply_timeout_s: float = policy.action_apply_timeout_s,
 ) -> ActionCandidate | None:
     """Gate, prepare, and commit one correlated endpoint.
 
@@ -535,39 +652,28 @@ def publish_joint_targets(
         if arm_result is None:
             raise ValueError("arm feedback unavailable for safety gate")
         arm_record = arm_result[0][0]
-        if "state_valid" in arm_record.dtype.names and not bool(arm_record["state_valid"]):
-            raise ValueError("arm feedback is invalid")
-        if "source_monotonic_ns" in arm_record.dtype.names:
-            arm_source_ns = int(arm_record["source_monotonic_ns"])
-            arm_age_ns = now_ns - arm_source_ns
-            if arm_source_ns <= 0 or arm_age_ns < 0 or arm_age_ns > int(gate.config.observation_max_age_s * 1e9):
-                raise ValueError("arm feedback is stale or from the future")
-        current_arm = np.asarray(arm_record["qpos"], dtype=np.float64)
+        current_arm = _validated_arm_feedback_qpos(
+            arm_record,
+            now_monotonic_ns=now_ns,
+            max_age_s=gate.config.observation_max_age_s,
+        )
+        arm_source_ns = int(arm_record["source_monotonic_ns"])
         current_hand = np.asarray(shared.hand_home_qpos_rad, dtype=np.float64)
         hand_result = shared.hand_state_ring.read_latest()
+        hand_source_ns: int | None = None
         if hand_result is not None:
             hand_record = hand_result[0][0]
-            if "state_valid" in hand_record.dtype.names and not bool(hand_record["state_valid"]):
-                raise ValueError("hand feedback is invalid")
-            else:
-                if "source_monotonic_ns" in hand_record.dtype.names:
-                    hand_source_ns = int(hand_record["source_monotonic_ns"])
-                    hand_age_ns = now_ns - hand_source_ns
-                    if (
-                        hand_source_ns <= 0
-                        or hand_age_ns < 0
-                        or hand_age_ns > int(gate.config.observation_max_age_s * 1e9)
-                    ):
-                        raise ValueError("hand feedback is stale or from the future")
-                    else:
-                        current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
-                else:
-                    current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
+            current_hand = _validated_hand_feedback_qpos(
+                hand_record,
+                now_monotonic_ns=now_ns,
+                max_age_s=gate.config.observation_max_age_s,
+            )
+            hand_source_ns = int(hand_record["source_monotonic_ns"])
         elif hand_qpos is not None:
             raise ValueError("hand feedback unavailable for safety gate")
 
-        feedback_source_times = [arm_source_ns] if "source_monotonic_ns" in arm_record.dtype.names else []
-        if hand_qpos is not None and hand_result is not None and "source_monotonic_ns" in hand_record.dtype.names:
+        feedback_source_times = [arm_source_ns]
+        if hand_source_ns is not None:
             feedback_source_times.append(hand_source_ns)
         snapshot_anchor_ns = (
             min(feedback_source_times)
@@ -630,20 +736,34 @@ def hand_home_converge(
     shared: Any,
     home_qpos: np.ndarray,
     *,
-    timeout_s: float = 5.0,
-    tol_deg: float = 5.0,
+    timeout_s: float = hand.home_settle_timeout_s,
+    tol_rad: float = hand.home_settle_tol_rad,
     heartbeat: bool = False,
     check_is_running: bool = True,
     verbose: bool = True,
     safety_gate: ActionSafetyGate | None = None,
+    abort_requested: Callable[[], bool] | None = None,
 ) -> tuple[bool, np.ndarray | None]:
     """Publish coordinated endpoints until fresh hand feedback reaches home."""
-    tol = np.deg2rad(tol_deg)
+    if not np.isfinite(timeout_s) or timeout_s <= 0 or not np.isfinite(tol_rad) or tol_rad <= 0:
+        raise ValueError("hand home timeout and tolerance must be finite and positive")
+    home_qpos = np.asarray(home_qpos, dtype=np.float64)
+    if home_qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(home_qpos)):
+        raise ValueError(f"hand home must be a finite array with shape {HAND_JOINT_SHAPE}")
     deadline = time.monotonic() + timeout_s
-    requested_after_s = time.monotonic()
+    requested_after_ns: int | None = None
     first = True
 
+    def aborted() -> bool:
+        return bool(
+            getattr(getattr(shared, "estop_request", None), "value", False)
+            or getattr(getattr(shared, "error_state", None), "value", False)
+            or (abort_requested is not None and abort_requested())
+        )
+
     while time.monotonic() < deadline:
+        if aborted():
+            return False, None
         if check_is_running and not shared.is_running.value:
             break
         if heartbeat:
@@ -652,15 +772,28 @@ def hand_home_converge(
             if verbose:
                 print("  hand: coordinated home command was rejected", flush=True)
             return False, None
+        if requested_after_ns is None:
+            requested_after_ns = time.monotonic_ns()
+        if aborted():
+            return False, None
         hand_result = shared.hand_state_ring.read_latest()
         if hand_result is not None:
-            state = hand_result[0]
-            current = np.asarray(state["qpos"][0], dtype=np.float64)
-            fresh = float(state["timestamp"][0]) >= requested_after_s
-            healthy = bool(state["connected"][0]) and not bool(state["error_state"][0])
-            if fresh and healthy and np.all(np.isfinite(current)):
+            state = hand_result[0][0]
+            now_ns = time.monotonic_ns()
+            try:
+                current = _validated_hand_feedback_qpos(
+                    state,
+                    now_monotonic_ns=now_ns,
+                    max_age_s=timeout_s,
+                )
+            except ValueError:
+                current = None
+            source_ns = int(state["source_monotonic_ns"])
+            if current is not None and requested_after_ns <= source_ns <= now_ns:
                 err = float(np.max(np.abs(current - home_qpos)))
-                if err < tol:
+                if err < tol_rad:
+                    if aborted():
+                        return False, None
                     if verbose:
                         print("  hand: home reached", flush=True)
                     return True, current.copy()
@@ -669,45 +802,11 @@ def hand_home_converge(
                     first = False
         # Allow the two-worker lead time plus one actuator tick before
         # replacing the next latest-wins hand endpoint.
-        time.sleep(0.1)
+        time.sleep(_HAND_HOME_PUBLISH_INTERVAL_S)
 
     if verbose:
-        print(f"  hand: home settle timeout after {timeout_s:.0f}s — proceeding", flush=True)
+        print(f"  hand: home not confirmed after {timeout_s:.0f}s", flush=True)
     return False, None
-
-
-def quiesce_for_policy_restart(
-    shared: Any,
-    *,
-    arm_qpos: np.ndarray,
-    hand_qpos: np.ndarray | None,
-    safety_gate: ActionSafetyGate,
-    timeout_s: float = 0.5,
-) -> int:
-    """Invalidate the old epoch and reach an applied coordinated hold.
-
-    The caller may load/warm a replacement backend only after this returns.
-    This function deliberately leaves the system ARMED; returning to RUNNING
-    remains an explicit operator action, so there is no seamless hot swap.
-    """
-    from dexmani_real.robot.safety import SafetyState, transition
-
-    transition(shared, SafetyState.ARMED)
-    with shared.policy_epoch.get_lock():
-        shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
-        epoch = int(shared.policy_epoch.value)
-    if not publish_joint_targets(
-        shared,
-        arm_qpos,
-        hand_qpos,
-        is_hold=True,
-        safety_gate=safety_gate,
-        wait_applied=True,
-        apply_timeout_s=timeout_s,
-    ):
-        shared.error_state.value = True
-        raise RuntimeError("policy restart failed to reach an applied coordinated hold")
-    return epoch
 
 
 class JointActionScheduler:
@@ -716,37 +815,26 @@ class JointActionScheduler:
     def __init__(self, action_spec: ActionSpec) -> None:
         self.action_spec = action_spec
         self._future: list[ActionCandidate] = []
-        self._committed: set[int] = set()
         self._all_late = False
 
     def submit(self, chunk: ActionChunk, *, now_monotonic_ns: int | None = None) -> None:
         now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
-        # Preserve committed endpoints; replace every uncommitted future step.
-        self._future = [step for step in self._future if step.action_id in self._committed]
-        accepted = [step for step in chunk.steps if step.valid_until_monotonic_ns >= now_ns]
+        # Already-published endpoints have been popped. A newer chunk replaces
+        # every endpoint that has not yet been published.
+        self._future.clear()
+        accepted = [
+            step
+            for step in chunk.steps
+            if step.target_monotonic_ns > now_ns and step.valid_until_monotonic_ns >= now_ns
+        ]
         self._all_late = not accepted
         self._future.extend(accepted)
         self._future.sort(key=lambda step: (step.target_monotonic_ns, step.action_id))
 
-    def mark_committed(self, action_id: int) -> None:
-        self._committed.add(int(action_id))
-
     def reset(self) -> None:
         """Invalidate all scheduled endpoints at an epoch boundary."""
         self._future.clear()
-        self._committed.clear()
         self._all_late = False
-
-    def pop_due(self, *, now_monotonic_ns: int | None = None) -> ActionCandidate | None:
-        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
-        self._future = [step for step in self._future if step.valid_until_monotonic_ns >= now_ns]
-        due = [step for step in self._future if step.target_monotonic_ns <= now_ns]
-        if not due:
-            return None
-        selected = due[-1]
-        self._future = [step for step in self._future if step.action_id != selected.action_id]
-        self._committed.discard(selected.action_id)
-        return selected
 
     def pop_ready(
         self,
@@ -757,13 +845,23 @@ class JointActionScheduler:
         """Pop the earliest endpoint whose prepare window has opened.
 
         ``target_monotonic_ns`` is the worker application time, so a
-        coordinator must publish before it becomes due.  This method keeps the
-        older :meth:`pop_due` behavior available for non-actuator consumers.
+        coordinator must publish before it becomes due.
         """
         if not np.isfinite(lead_time_s) or lead_time_s < 0:
             raise ValueError("lead_time_s must be finite and non-negative")
         now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
-        self._future = [step for step in self._future if step.valid_until_monotonic_ns >= now_ns]
+        late = [
+            step
+            for step in self._future
+            if step.target_monotonic_ns <= now_ns or step.valid_until_monotonic_ns < now_ns
+        ]
+        self._future = [
+            step
+            for step in self._future
+            if step.target_monotonic_ns > now_ns and step.valid_until_monotonic_ns >= now_ns
+        ]
+        if late and not self._future:
+            self._all_late = True
         ready = [step for step in self._future if step.target_monotonic_ns <= now_ns + int(lead_time_s * 1e9)]
         if not ready:
             return None
@@ -773,7 +871,6 @@ class JointActionScheduler:
         # OUT_OF_ORDER after any coordinator stall spanning multiple steps.
         selected = ready[0]
         self._future = [step for step in self._future if step.action_id != selected.action_id]
-        self._committed.discard(selected.action_id)
         return selected
 
     @property
@@ -782,7 +879,7 @@ class JointActionScheduler:
 
     @property
     def all_late(self) -> bool:
-        """Whether the most recent chunk had no endpoint that remained valid."""
+        """Whether the most recent chunk has no endpoint publishable before target."""
         return self._all_late
 
     def make_coordinated_hold(

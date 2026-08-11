@@ -5,7 +5,7 @@ filter (LoG gradient) → speckle filter → world transform → desk-plane remo
 → workspace crop → 5 mm voxel → DBSCAN two-in-one outlier filter (noise-point
 removal + small-cluster cull) → fixed-size output via FPS/random.
 
-Runs inside ``camera_loop`` at ``policy.control_hz`` (16 Hz); the same
+Runs inside ``camera_loop`` at ``policy.control_hz`` (16 Hz by default); the same
 (num_points, 6) float32 output is recorded to HDF5 (/pointcloud) and consumed
 by the policy loop, so training data and deployment observations are
 byte-identical by construction.
@@ -27,7 +27,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class PointCloudProcessorConfig:
-    """Parameters of the depth->pointcloud pipeline (validated 2026-07-15)."""
+    """Parameters of the depth-to-point-cloud pipeline."""
 
     num_points: int = 2048
     # Camera-frame z gate: 0.3 m near (min-Z + margin), 1.5 m far (workspace corner)
@@ -225,7 +225,7 @@ class PointCloudProcessor:
             _work[_invalid] = np.nan
             depth_m = _work
 
-        # ── Temporal depth EMA (P2) ──
+        # Temporal depth EMA.
         # Exponential moving average on valid depth pixels reduces L515
         # frame-to-frame noise (~2-4 mm) before any subsequent gates.
         if cfg.depth_ema_alpha > 0:
@@ -280,7 +280,7 @@ class PointCloudProcessor:
         if not np.any(mask):
             return None
 
-        # ── Speckle filter (P3) ──
+        # Speckle filter.
         # L515 produces isolated single-pixel or few-pixel "speckles" of valid
         # depth surrounded by invalid pixels.  Connected-components on the 2-D
         # valid mask drops components smaller than speckle_min_pixels.
@@ -305,7 +305,7 @@ class PointCloudProcessor:
         # World transform + single workspace crop (no RANSAC in production).
         pts = pts_cam @ self._R.T + self._t
 
-        # ── Desk plane removal (P1) ──
+        # Desk-plane removal.
         # Pre-calibrated plane in world frame: points whose signed distance
         # to the desk is below desk_clearance_m are removed.  Auto-loaded
         # from desk_plane_path at init when not explicitly configured.

@@ -1,6 +1,6 @@
 """Dedicated RecorderIO process with a bounded shared-memory sample ring.
 
-Policy owns episode boundaries, the 16 Hz grid, and sample contents.  This
+Policy owns episode boundaries, the configured control grid, and sample contents. This
 module owns only serialization, camera encoding, HDF5 writes, verification and
 transactional publication.  Large camera arrays never travel through an
 ``mp.Queue``; they occupy fixed slots in a seqlock ring.
@@ -13,18 +13,17 @@ import time
 import zlib
 from dataclasses import dataclass
 from enum import IntEnum
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from dexmani_real.ipc.schema import (
+    HAND_JOINT_SHAPE,
     RECORD_CONTROL_DTYPE,
     RECORD_CONTROL_JSON_BYTES,
     RECORD_SAMPLE_JSON_BYTES,
     RECORD_STATUS_DTYPE,
     RECORD_STATUS_TEXT_BYTES,
-    make_record_sample_dtype,
 )
 from dexmani_real.recording.camera_stream_writer import CameraStreamWriterConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder, StopResult
@@ -37,6 +36,8 @@ logger = get_logger(__name__)
 CONTROL_JSON_BYTES = RECORD_CONTROL_JSON_BYTES
 SAMPLE_JSON_BYTES = RECORD_SAMPLE_JSON_BYTES
 STATUS_TEXT_BYTES = RECORD_STATUS_TEXT_BYTES
+_RECORDER_STOP_TIMEOUT_S = 60.0
+_STOP_POLL_INTERVAL_S = 0.01
 
 
 class RecorderCommand(IntEnum):
@@ -246,7 +247,9 @@ class RecorderClient:
         frame["sample_sequence"][0] = self._frame_count + 1
         for name in ("arm_qpos", "arm_qvel", "arm_tau", "eef_pos", "eef_quat_wxyz", "eef_rot6d", "hand_qpos"):
             frame[name][0] = getattr(state, name)
-        frame["hand_current"][0] = state.hand_current if state.hand_current is not None else np.full(12, np.nan)
+        frame["hand_current"][0] = (
+            state.hand_current if state.hand_current is not None else np.full(HAND_JOINT_SHAPE, np.nan)
+        )
         for name in (
             "hand_tactile_sum",
             "hand_tactile_force",
@@ -332,14 +335,17 @@ class RecorderClient:
     def join_stop(self, timeout: float | None = None) -> bool:
         if not self._stop_requested:
             return True
-        deadline = time.monotonic() + (60.0 if timeout is None else float(timeout))
+        timeout_s = _RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
+        if not np.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("recorder stop timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             status = self._read_status()
             if status is not None and int(status["generation"]) == self._generation:
                 if RecorderPhase(int(status["phase"])) in (RecorderPhase.COMPLETED, RecorderPhase.ERROR):
                     self._stop_requested = False
                     return True
-            time.sleep(0.01)
+            time.sleep(_STOP_POLL_INTERVAL_S)
         return False
 
 
@@ -471,7 +477,8 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                 reason = f"sample ring overflow: expected {last_sample_sequence + 1}, found {unseen[0][1]}"
                 logger.error("RecorderIO %s", reason)
                 recorder.stop_episode(success=False, reason="sample_ring_overflow")
-                recorder.join_stop(timeout=60.0)
+                if not recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S):
+                    logger.error("RecorderIO timed out aborting an overflowed episode")
                 _publish_status(shared, RecorderPhase.ERROR, active_generation, error=reason)
             for data, sequence in unseen:
                 last_sample_sequence = sequence
@@ -502,7 +509,8 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                 except Exception as exc:
                     logger.error("RecorderIO sample write failed", exc_info=True)
                     recorder.stop_episode(success=False, reason="sample_write_error")
-                    recorder.join_stop(timeout=60.0)
+                    if not recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S):
+                        logger.error("RecorderIO timed out aborting an episode after a write failure")
                     _publish_status(shared, RecorderPhase.ERROR, active_generation, error=str(exc))
                     break
 
@@ -523,8 +531,10 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                 completed_frame_count = recorder.frame_count
                 _publish_status(shared, RecorderPhase.STOPPING, generation, frame_count=completed_frame_count)
                 path = recorder.stop_episode(success=save, reason=reason)
-                recorder.join_stop(timeout=60.0)
-                error = recorder.stop_error or ""
+                joined = recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S)
+                error = recorder.stop_error or ("" if joined else "episode finalization timed out")
+                if not joined:
+                    logger.error("RecorderIO %s", error)
                 phase = RecorderPhase.ERROR if error else RecorderPhase.COMPLETED
                 _publish_status(
                     shared,
@@ -552,7 +562,8 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
     finally:
         if recorder is not None and recorder.is_recording:
             recorder.stop_episode(success=False, reason="recorder_process_shutdown")
-            recorder.join_stop(timeout=60.0)
+            if not recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S):
+                logger.error("RecorderIO timed out during process-shutdown finalization")
         _publish_status(shared, RecorderPhase.STOPPED, active_generation)
         if not crashed:
             publish_component_status(shared, "recorder", ComponentPhase.STOPPED)

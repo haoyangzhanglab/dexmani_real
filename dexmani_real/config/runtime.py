@@ -1,11 +1,12 @@
-"""Immutable, validated runtime configuration resolution.
+"""Resolve immutable experiment configuration from YAML or legacy JSON.
 
 The module-level objects in :mod:`dexmani_real.config.defaults` are convenient
 templates, but they are not a safe runtime configuration transport: mutating a
 template after another module imported it makes process startup order affect
-the effective configuration.  This module resolves a fresh snapshot using the
-single precedence rule ``CLI > JSON > defaults`` and gives that snapshot a
-canonical JSON representation and SHA-256 identity.
+the effective configuration. This module resolves a fresh snapshot using the
+single precedence rule ``CLI > file > defaults`` and gives that snapshot a
+stable canonical-JSON SHA-256 identity. YAML is the primary experiment format;
+JSON input remains readable for existing experiments.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterator, cast, get_args, get_origin, get_type_hints
 
 import numpy as np
+import yaml
 
 _SECTION_NAMES = (
     "arm",
@@ -33,14 +35,14 @@ _SECTION_NAMES = (
 )
 
 
-def _json_value(value: Any) -> Any:
-    """Return a deterministic, JSON-compatible copy of *value*."""
+def _plain_value(value: Any) -> Any:
+    """Return a deterministic YAML-safe copy of *value*."""
     if dataclasses.is_dataclass(value):
-        return {field.name: _json_value(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        return {field.name: _plain_value(getattr(value, field.name)) for field in dataclasses.fields(value)}
     if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        return {str(key): _plain_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
     if isinstance(value, (tuple, list, set, frozenset)):
-        items = [_json_value(item) for item in value]
+        items = [_plain_value(item) for item in value]
         return sorted(items, key=repr) if isinstance(value, (set, frozenset)) else items
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -109,6 +111,7 @@ class ResolvedRuntimeConfig:
     tag_retargeting: FrozenConfigNode
     environment: FrozenConfigNode
     canonical_json: str
+    canonical_yaml: str
     sha256: str
 
     @property
@@ -121,7 +124,7 @@ class ResolvedRuntimeConfig:
 
 
 def _merge(base: dict[str, Any], overrides: Mapping[str, Any], *, path: str = "") -> dict[str, Any]:
-    result = {key: _json_value(value) for key, value in base.items()}
+    result = {key: _plain_value(value) for key, value in base.items()}
     for key, value in overrides.items():
         key = str(key)
         location = f"{path}.{key}" if path else key
@@ -132,7 +135,7 @@ def _merge(base: dict[str, Any], overrides: Mapping[str, Any], *, path: str = ""
                 raise TypeError(f"runtime config field {location!r} must be an object")
             result[key] = _merge(result[key], value, path=location)
         else:
-            result[key] = _json_value(value)
+            result[key] = _plain_value(value)
     return result
 
 
@@ -170,7 +173,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
             type_hints = get_type_hints(type(template))
             for field in dataclasses.fields(template):
                 current = getattr(template, field.name)
-                value = raw.get(field.name, _json_value(current))
+                value = raw.get(field.name, _plain_value(current))
                 kwargs[field.name] = rebuild(
                     current,
                     value,
@@ -242,41 +245,60 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     workspace = rebuilt["policy"].workspace
     if workspace.x_min > workspace.x_max or workspace.y_min > workspace.y_max or workspace.z_min > workspace.z_max:
         raise ValueError("policy.workspace lower bounds must not exceed upper bounds")
-    return {name: _json_value(value) for name, value in rebuilt.items()}
+    return {name: _plain_value(value) for name, value in rebuilt.items()}
 
 
 def resolve_runtime_config(
     *,
+    yaml_path: str | Path | None = None,
+    data: Mapping[str, Any] | None = None,
     json_path: str | Path | None = None,
     json_data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ResolvedRuntimeConfig:
-    """Resolve ``CLI > JSON > defaults`` without mutating global defaults.
+    """Resolve ``CLI > file/data > defaults`` without mutating global defaults.
 
     CLI keys may be nested mappings or dotted paths such as
     ``{"arm.ip": "192.0.2.1"}``.  ``None`` CLI values mean "not supplied" and
-    therefore never mask JSON/default values.
+    therefore never mask file/default values. ``json_path`` and ``json_data``
+    are compatibility spellings; JSON is valid YAML and follows the same path.
     """
     from dexmani_real.config import defaults
 
-    if json_path is not None and json_data is not None:
-        raise ValueError("provide json_path or json_data, not both")
-    base = {name: _json_value(getattr(defaults, name)) for name in _SECTION_NAMES}
+    sources = [yaml_path is not None, data is not None, json_path is not None, json_data is not None]
+    if sum(sources) > 1:
+        raise ValueError("provide at most one of yaml_path, data, json_path, or json_data")
+    base = {name: _plain_value(getattr(defaults, name)) for name in _SECTION_NAMES}
 
     file_overrides: Mapping[str, Any] = {}
-    if json_path is not None:
-        with Path(json_path).open("r", encoding="utf-8") as stream:
-            loaded = json.load(stream)
+    config_path = yaml_path if yaml_path is not None else json_path
+    if config_path is not None:
+        with Path(config_path).open("r", encoding="utf-8") as stream:
+            loaded = yaml.safe_load(stream)
+        if loaded is None:
+            loaded = {}
         if not isinstance(loaded, Mapping):
-            raise TypeError("runtime JSON root must be an object")
+            raise TypeError("experiment config root must be a mapping")
         file_overrides = loaded
-    elif json_data is not None:
-        file_overrides = json_data
+    elif data is not None or json_data is not None:
+        file_overrides = data if data is not None else json_data or {}
 
     merged = _merge(base, file_overrides)
     merged = _merge(merged, _expand_dotted(cli_overrides))
     validated = _validated_defaults_snapshot(merged)
-    canonical = json.dumps(validated, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    canonical_json = json.dumps(
+        validated,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    canonical_yaml = yaml.safe_dump(validated, allow_unicode=True, sort_keys=True)
+    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
     frozen = {name: _freeze(validated[name]) for name in _SECTION_NAMES}
-    return ResolvedRuntimeConfig(**frozen, canonical_json=canonical, sha256=digest)
+    return ResolvedRuntimeConfig(
+        **frozen,
+        canonical_json=canonical_json,
+        canonical_yaml=canonical_yaml,
+        sha256=digest,
+    )

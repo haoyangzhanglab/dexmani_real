@@ -1,26 +1,7 @@
-"""Centralized defaults — single source of truth for all numeric constants.
+"""Numeric defaults shared by experiment configs and worker adapters.
 
-Organized as dataclasses with snake_case fields, grouped into logical
-sub-structures (homing, stale detection, workspace, EMA, etc.).
-
-Module-level singletons (``arm``, ``hand``, ``policy``, ``vr``, ``safety``,
-``camera``) provide ergonomic access::
-
-    from dexmani_real.config.defaults import arm, hand, policy
-
-    @dataclass
-    class ArmLoopConfig:
-        joint_max_speed_rad_per_s: float = field(
-            default_factory=lambda: arm.max_joint_velocity_rad_per_s
-        )
-        homing_convergence_rad: float = field(default_factory=lambda: arm.homing.convergence_rad)
-
-Conventions:
-    - All angles in **radians** unless suffixed ``_deg``.
-    - All rates in **Hz** (not periods).
-    - Workspace bounds in **meters**, arm-base frame.
-    - Unit suffixes: ``_deg``, ``_rad``, ``_deg_per_s``, ``_deg_per_s2``,
-      ``_s`` (seconds), ``_hz`` (frequency), ``_m`` (meters), ``_count`` (dimensionless).
+Angles are radians unless named ``_deg``; distances are metres, rates are Hz,
+and durations are seconds. Runtime YAML overrides these dataclass values.
 """
 
 from __future__ import annotations
@@ -30,9 +11,12 @@ from typing import Literal
 
 import numpy as np
 
-# ═══════════════════════════════════════════════════════════════════════════════
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
+
+_HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "inference", "vr", "camera"})
+_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "inference", "policy", "vr"})
+
 # Shared sub-structures
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -45,6 +29,9 @@ class HomingParams:
     target_timeout_s: float = 0.5  # settling allowance added after distance/speed timing
     velocity_convergence_rad_s: float = 0.03
     dwell_s: float = 0.30
+    convergence_timeout_s: float = 15.0
+    request_queue_timeout_s: float = 0.2
+    state_max_age_s: float = 0.5
 
     def __post_init__(self) -> None:
         values = (
@@ -54,6 +41,9 @@ class HomingParams:
             self.target_timeout_s,
             self.velocity_convergence_rad_s,
             self.dwell_s,
+            self.convergence_timeout_s,
+            self.request_queue_timeout_s,
+            self.state_max_age_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
             raise ValueError("all homing parameters must be finite and positive")
@@ -105,13 +95,10 @@ class StaleDetectionParams:
 
 @dataclass
 class EMAParams:
-    """Cartesian-space EMA smoothing parameters (tuned at 16 Hz, dt=62.5ms).
+    """Cartesian-space EMA smoothing parameters (tuned for the default 16 Hz grid)."""
 
-    Tuning history: POS 0.8→0.65→0.6, ROT 0.4→0.3→0.25.
-    """
-
-    alpha_pos: float = 0.6  # τ≈65ms — moderate smoothing
-    alpha_rot: float = 0.25  # τ≈223ms — heavy smoothing for wrist jitter
+    alpha_pos: float = 0.6  # τ≈65 ms at 16 Hz
+    alpha_rot: float = 0.25  # τ≈223 ms at 16 Hz
 
     def __post_init__(self) -> None:
         if not (np.isfinite(self.alpha_pos) and np.isfinite(self.alpha_rot)):
@@ -188,9 +175,7 @@ class EnvironmentConfig:
             raise ValueError("environment.static_boxes names must be unique")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Arm parameters (xArm7, 7-DOF)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -261,11 +246,11 @@ class ArmParams:
     def max_joint_acceleration_rad_per_s2(self) -> float:
         return float(np.deg2rad(self.max_joint_acceleration_deg_per_s2))
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         home = np.asarray(self.home_qpos, dtype=np.float64)
         lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
         upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
-        if home.shape != (7,) or lower.shape != (7,) or upper.shape != (7,):
+        if home.shape != ARM_JOINT_SHAPE or lower.shape != ARM_JOINT_SHAPE or upper.shape != ARM_JOINT_SHAPE:
             raise ValueError("arm home and joint limits must have 7 elements")
         if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(lower > upper):
             raise ValueError("arm home and joint limits must be finite and ordered")
@@ -299,9 +284,7 @@ class ArmParams:
             )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Hand parameters (XHand, 12-DOF)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -362,44 +345,10 @@ class HandParams:
     # or external load. This tolerance applies ONLY to feedback diagnostics and
     # optimizer warm starts; command and NLopt bounds remain strict.
     feedback_bound_tolerance_rad: float = 0.01  # ~0.57 deg
-    # 0.20 rad per 16 Hz policy frame (~183 deg/s). This bounds motor jumps
+    # 0.20 rad per frame (~183 deg/s at the default 16 Hz). This bounds motor jumps
     # and caps the conservative arm×hand transition collision grid.
     max_delta_rad: float | None = 0.20
-
-    def __post_init__(self) -> None:
-        if self.ethercat_slave_position < -1:
-            raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
-        if len(self.home_qpos_deg) != 12 or len(self.qpos_min_rad) != 12 or len(self.qpos_max_rad) != 12:
-            raise ValueError("hand qpos defaults must have 12 elements")
-        if not all(lo <= hi for lo, hi in zip(self.qpos_min_rad, self.qpos_max_rad)):
-            raise ValueError("hand qpos_min_rad must be <= qpos_max_rad")
-        home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
-        limit_tolerance_rad = 1e-9
-        if (
-            not np.all(np.isfinite(home_rad))
-            or np.any(home_rad < np.asarray(self.qpos_min_rad) - limit_tolerance_rad)
-            or np.any(home_rad > np.asarray(self.qpos_max_rad) + limit_tolerance_rad)
-        ):
-            raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
-        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
-            raise ValueError("hand feedback_bound_tolerance_rad must be finite and >= 0")
-        if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
-            raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
-        if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
-            raise ValueError("hand loop_hz must be finite and positive")
-        if not np.isfinite(self.home_settle_timeout_s) or self.home_settle_timeout_s <= 0:
-            raise ValueError("hand home_settle_timeout_s must be finite and positive")
-        if not np.isfinite(self.home_settle_tol_rad) or self.home_settle_tol_rad <= 0:
-            raise ValueError("hand home_settle_tol_rad must be finite and positive")
-        if self.send_err_watchdog_count <= 0:
-            raise ValueError("hand send_err_watchdog_count must be positive")
-        if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
-            raise ValueError("hand fingertip_link_names must contain five non-empty names")
-        transform = np.asarray(self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz, dtype=np.float64)
-        if transform.shape != (7,) or not np.all(np.isfinite(transform)):
-            raise ValueError("hand base transform must contain seven finite values")
-        if np.linalg.norm(transform[3:]) <= 1e-12:
-            raise ValueError("hand base quaternion must be non-zero")
+    safety_gate_max_velocity_deg_per_s: float = 180.0
 
     loop_hz: float = 30.0
 
@@ -431,14 +380,48 @@ class HandParams:
     #                              link_eef -Z = custom_eef_link +X, so compensated in -X)
     #   Total            = -0.015 m
     #
-    # Verified 2026-07-28: URDF-vs-simulation FK = 0.00 mm.
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (0.707107, 0.0, 0.707107, 0.0)
 
+    def __post_init__(self) -> None:
+        if self.ethercat_slave_position < -1:
+            raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
+        if len(self.home_qpos_deg) != 12 or len(self.qpos_min_rad) != 12 or len(self.qpos_max_rad) != 12:
+            raise ValueError("hand qpos defaults must have 12 elements")
+        if not all(lo <= hi for lo, hi in zip(self.qpos_min_rad, self.qpos_max_rad)):
+            raise ValueError("hand qpos_min_rad must be <= hand qpos_max_rad")
+        home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
+        limit_tolerance_rad = 1e-9
+        if (
+            not np.all(np.isfinite(home_rad))
+            or np.any(home_rad < np.asarray(self.qpos_min_rad) - limit_tolerance_rad)
+            or np.any(home_rad > np.asarray(self.qpos_max_rad) + limit_tolerance_rad)
+        ):
+            raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
+        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
+            raise ValueError("hand feedback_bound_tolerance_rad must be finite and >= 0")
+        if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
+            raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
+        if not np.isfinite(self.safety_gate_max_velocity_deg_per_s) or self.safety_gate_max_velocity_deg_per_s <= 0:
+            raise ValueError("hand safety_gate_max_velocity_deg_per_s must be finite and positive")
+        if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
+            raise ValueError("hand loop_hz must be finite and positive")
+        if not np.isfinite(self.home_settle_timeout_s) or self.home_settle_timeout_s <= 0:
+            raise ValueError("hand home_settle_timeout_s must be finite and positive")
+        if not np.isfinite(self.home_settle_tol_rad) or self.home_settle_tol_rad <= 0:
+            raise ValueError("hand home_settle_tol_rad must be finite and positive")
+        if self.send_err_watchdog_count <= 0:
+            raise ValueError("hand send_err_watchdog_count must be positive")
+        if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
+            raise ValueError("hand fingertip_link_names must contain five non-empty names")
+        transform = np.asarray(self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz, dtype=np.float64)
+        if transform.shape != (7,) or not np.all(np.isfinite(transform)):
+            raise ValueError("hand base transform must contain seven finite values")
+        if np.linalg.norm(transform[3:]) <= 1e-12:
+            raise ValueError("hand base quaternion must be non-zero")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
 # Policy / teleop parameters
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -447,6 +430,12 @@ class PolicyParams:
 
     control_hz: float = 16.0
     coordinator_hz: float = 64.0
+    action_prepare_timeout_s: float = 0.06
+    action_apply_timeout_s: float = 0.75
+    arm_state_stale_threshold_s: float = 0.5
+    inference_candidate_timeout_s: float = 0.25
+    quit_save_timeout_s: float = 30.0
+    post_teleop_timeout_s: float = 60.0
 
     # ── Cartesian EMA ──
     ema: EMAParams = field(default_factory=EMAParams)
@@ -466,6 +455,11 @@ class PolicyParams:
     # ── Diagnostics ──
     status_print_interval: int = 16  # status print interval (ticks)
     max_consecutive_errors: int = 10
+
+    # ── VR teleoperation IK ──
+    ik_max_pose_error_pos_m: float = 0.02
+    ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
+    ik_nullspace_step_rate_deg_s: float = 50.0
 
     # ── Contact-stall resync ──
     # This is not a table exclusion zone. Near the tabletop, a downward target
@@ -490,6 +484,16 @@ class PolicyParams:
             raise ValueError(f"control_hz={self.control_hz} must be > 0")
         if not np.isfinite(self.coordinator_hz) or self.coordinator_hz < self.control_hz:
             raise ValueError("coordinator_hz must be finite and >= control_hz")
+        timing = (
+            self.action_prepare_timeout_s,
+            self.action_apply_timeout_s,
+            self.arm_state_stale_threshold_s,
+            self.inference_candidate_timeout_s,
+            self.quit_save_timeout_s,
+            self.post_teleop_timeout_s,
+        )
+        if not all(np.isfinite(value) and value > 0 for value in timing):
+            raise ValueError("policy action, freshness, inference, and operator timeouts must be finite and positive")
         if not (0.0 <= self.ema.alpha_pos <= 1.0):
             raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
         if not (0.0 <= self.ema.alpha_rot <= 1.0):
@@ -510,6 +514,15 @@ class PolicyParams:
             raise ValueError("recording durations must be finite, ordered, and non-negative")
         if not self.episodes_dir or self.status_print_interval <= 0 or self.max_consecutive_errors <= 0:
             raise ValueError("policy output path and diagnostic intervals must be valid")
+        if (
+            not np.isfinite(self.ik_max_pose_error_pos_m)
+            or not np.isfinite(self.ik_max_pose_error_rot_rad)
+            or not np.isfinite(self.ik_nullspace_step_rate_deg_s)
+            or self.ik_max_pose_error_pos_m <= 0
+            or self.ik_max_pose_error_rot_rad <= 0
+            or self.ik_nullspace_step_rate_deg_s <= 0
+        ):
+            raise ValueError("policy teleop IK limits must be finite and positive")
         if self.hand_retargeting_type not in {"tag", "dexpilot"}:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
         if not np.isfinite(self.hand_disconnect_timeout_s) or self.hand_disconnect_timeout_s <= 0:
@@ -540,15 +553,25 @@ class KeyboardTeleopParams:
     delta_pos_m: float = 0.008  # 240 mm/s at 30 Hz
     delta_rpy_rad: float = 0.03  # 1.7 deg/frame, 51 deg/s at 30 Hz
     cartesian_kp: float = 0.0
-    trace_motion: bool = True
-    trace_frame_interval: int = 10
-    release_trace_enabled: bool = True
-    release_trace_pre_frames: int = 6
-    release_trace_post_frames: int = 20  # 0.67 s at 30 Hz, covers the observed ~0.25 s settling dynamics
-    release_trace_cooldown_s: float = 5.0
+    ik_max_pose_error_pos_m: float = 0.02
+    ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
+    status_interval_frames: int = 50
+    idle_interval_frames: int = 150
+    tracking_fault_rad: float = 5.0
+    tracking_fault_frames: int = 3
+    cartesian_deadband_m: float = 0.003
 
     def __post_init__(self) -> None:
-        numeric = (self.control_hz, self.delta_pos_m, self.delta_rpy_rad, self.cartesian_kp)
+        numeric = (
+            self.control_hz,
+            self.delta_pos_m,
+            self.delta_rpy_rad,
+            self.cartesian_kp,
+            self.ik_max_pose_error_pos_m,
+            self.ik_max_pose_error_rot_rad,
+            self.tracking_fault_rad,
+            self.cartesian_deadband_m,
+        )
         if not all(np.isfinite(value) for value in numeric):
             raise ValueError("keyboard teleop numeric parameters must be finite")
         if self.control_hz <= 0:
@@ -559,17 +582,17 @@ class KeyboardTeleopParams:
             raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
         if self.cartesian_kp < 0:
             raise ValueError(f"cartesian_kp={self.cartesian_kp} must be >= 0")
-        if self.trace_frame_interval <= 0:
-            raise ValueError(f"trace_frame_interval={self.trace_frame_interval} must be > 0")
-        if self.release_trace_pre_frames <= 0 or self.release_trace_post_frames <= 0:
-            raise ValueError("release trace pre/post frames must be > 0")
-        if not np.isfinite(self.release_trace_cooldown_s) or self.release_trace_cooldown_s < 0:
-            raise ValueError("release_trace_cooldown_s must be finite and >= 0")
+        if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
+            raise ValueError("keyboard IK pose-error limits must be > 0")
+        if self.status_interval_frames <= 0 or self.idle_interval_frames <= 0:
+            raise ValueError("keyboard status/idle intervals must be > 0")
+        if self.tracking_fault_rad <= 0:
+            raise ValueError("keyboard tracking fault threshold must be > 0")
+        if self.tracking_fault_frames <= 0 or self.cartesian_deadband_m < 0:
+            raise ValueError("keyboard tracking frames must be > 0 and deadband must be >= 0")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # TAG retargeting parameters
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -591,7 +614,7 @@ class TAGRetargetingParams:
 
     # ── Coordinate alignment: MANO → XHand URDF frame (Euler XYZ, rad) ──
     mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    """Identity: MANO +Z (finger extension) → URDF +Z (finger extension). Verified via FK analysis (2026-08-07)."""
+    """Identity because MANO and URDF both use +Z for finger extension."""
 
     # ── Stage 1: Global position matching (L-BFGS) ──
     smooth_weight: float = 0.02
@@ -639,9 +662,7 @@ class TAGRetargetingParams:
             raise ValueError("TAG pinch EMA/skip thresholds must be in [0, 1]")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # VR receiver parameters
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -660,9 +681,7 @@ class VRParams:
             raise ValueError("VR port must be in [1, 65535]")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Safety parameters
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -680,6 +699,18 @@ class SafetyParams:
             "camera": 2.0,
         }
     )
+    readiness_timeouts_s: dict[str, float] = field(
+        default_factory=lambda: {
+            "arm": 15.0,
+            "hand": 15.0,
+            "camera": 15.0,
+            "recorder": 15.0,
+            "inference": 60.0,
+            "policy": 120.0,
+            "vr": 120.0,
+        }
+    )
+    shutdown_timeout_s: float = 65.0
 
     # Consecutive recovery escalation threshold (arm_loop)
     max_consecutive_recoveries: int = 30  # 1s @ 30Hz → FAULT
@@ -692,15 +723,23 @@ class SafetyParams:
             not name or not np.isfinite(value) or value <= 0 for name, value in self.heartbeat_timeouts.items()
         ):
             raise ValueError("heartbeat timeout names/values must be non-empty, finite, and > 0")
+        if _HEARTBEAT_SUBSYSTEMS - self.heartbeat_timeouts.keys():
+            raise ValueError("heartbeat_timeouts is missing a runtime subsystem")
+        if not self.readiness_timeouts_s or any(
+            not name or not np.isfinite(value) or value <= 0 for name, value in self.readiness_timeouts_s.items()
+        ):
+            raise ValueError("readiness timeout names/values must be non-empty, finite, and > 0")
+        if _READINESS_SUBSYSTEMS - self.readiness_timeouts_s.keys():
+            raise ValueError("readiness_timeouts_s is missing a runtime subsystem")
+        if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
+            raise ValueError("shutdown_timeout_s must be finite and positive")
         if self.max_consecutive_recoveries <= 0:
             raise ValueError(f"max_consecutive_recoveries={self.max_consecutive_recoveries} must be > 0")
         if not np.isfinite(self.supervisor_hz) or self.supervisor_hz <= 0:
             raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Camera parameters
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -746,9 +785,7 @@ class CameraParams:
             raise ValueError("camera serial must be non-empty when configured")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Module-level singletons — ergonomic access
-# ═══════════════════════════════════════════════════════════════════════════════
+# Module-level defaults
 
 arm = ArmParams()
 hand = HandParams()
@@ -762,13 +799,7 @@ environment = EnvironmentConfig()
 
 
 def load_config_json(path: str):
-    """Return a validated immutable runtime snapshot loaded from *path*.
-
-    Kept as a compatibility spelling for callers that used the old helper.
-    Unlike the legacy implementation this function never mutates the module
-    singletons.  New code should call
-    :func:`dexmani_real.config.runtime.resolve_runtime_config` directly.
-    """
+    """Compatibility alias for existing JSON experiment files."""
     from dexmani_real.config.runtime import resolve_runtime_config
 
     return resolve_runtime_config(json_path=path)

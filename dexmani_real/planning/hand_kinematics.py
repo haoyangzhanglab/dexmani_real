@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.ipc.schema import HAND_FINGERTIP_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
 from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
@@ -104,19 +105,19 @@ class HandKinematics:
     def compute_tip_positions_in_handbase(self, hand_qpos: np.ndarray) -> np.ndarray:
         """Returns (5, 3) fingertip positions in hand_base frame."""
         if not self._ready:
-            return nan_array((5, 3))
+            return nan_array(HAND_FINGERTIP_SHAPE)
 
         try:
             import pinocchio
         except ImportError:
-            return nan_array((5, 3))
+            return nan_array(HAND_FINGERTIP_SHAPE)
 
-        q = np.asarray(hand_qpos, dtype=np.float64).reshape(12)
+        q = np.asarray(hand_qpos, dtype=np.float64).reshape(HAND_JOINT_SHAPE)
         q_urdf = q[_SDK_TO_URDF_IDX]  # remap SDK order → URDF order
         pinocchio.forwardKinematics(self._model, self._data, q_urdf)
         pinocchio.updateFramePlacements(self._model, self._data)
 
-        tips = np.zeros((5, 3), dtype=np.float64)
+        tips = np.zeros(HAND_FINGERTIP_SHAPE, dtype=np.float64)
         for i, fid in enumerate(self._fingertip_frame_ids):
             # fid is a frame ID from getFrameId() → use oMf (frame placements),
             # NOT oMi (joint placements).

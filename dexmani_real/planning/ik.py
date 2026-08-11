@@ -269,7 +269,7 @@ class TeleopIKSolver:
             return False, "elbow_flip"
 
         # L2 catch-all for multi-joint branch jumps the J4-only elbow check misses.
-        # 120° L2 is 4-8× normal 16 Hz frame-to-frame motion (< 30°).
+        # 120° L2 is 4–8× normal frame motion at the default 16 Hz (<30°).
         if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
             return False, "branch_jump_l2"
 

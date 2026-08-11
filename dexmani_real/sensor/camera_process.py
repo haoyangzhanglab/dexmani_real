@@ -1,13 +1,4 @@
-"""Camera process target for SharedStorage architecture.
-
-Runs RealSense capture as an ``mp.Process`` target, writing frames directly to
-``shared.camera_ring`` via :class:`~dexmani_real.shm.ring_buffer.CameraRingBuffer`.
-
-Architecture (spawn-only SharedStorage capability model):
-    camera_loop writes → shared.camera_ring → policy_loop reads (single-clock recording)
-
-Ref: ManiUniCon Camera Process (main.py:163-170 RobotControlSystem).
-"""
+"""RealSense process that publishes frames to ``SharedStorage.camera_ring``."""
 
 from __future__ import annotations
 
@@ -191,7 +182,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
 
     # ── Thread pool limit ──
     # OpenCV/NumPy default to multi-threading on many-core machines, competing
-    # for CPU with the 16 Hz control loop.  We rely on process-level parallelism
+    # for CPU with the configured policy loop. We rely on process-level parallelism
     # (arm/hand/camera each in its own process), not per-library thread pools.
     try:
         import cv2

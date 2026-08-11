@@ -1,30 +1,31 @@
-[tool.black]
-line-length = 120
-target-version = ["py310"]
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
-[tool.isort]
-profile = "black"
-line_length = 120
-src_paths = ["dexmani_real"]
-
-[tool.ruff]
-target-version = "py310"
-line-length = 120
-
-[tool.ruff.lint]
-# Keep Ruff complementary to Black and isort.  These rules catch syntax/name
-# errors plus a deliberately small set of exception, simplification, and
-# allocation mistakes without imposing repository-wide style churn.
-select = ["E9", "F63", "F7", "F82", "B012", "B017", "B904", "UP017", "SIM103", "PERF102"]
-
-[tool.mypy]
-python_version = "3.10"
-cache_dir = "/tmp/mypy_cache"
-warn_unused_configs = true
-disallow_untyped_defs = false
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-filterwarnings = [
-    "ignore::pytest.PytestReturnNotNoneWarning:test_collision_19dof.*",
+[project]
+name = "dexmani_real"
+version = "0.0.1"
+description = "VR teleoperation, data collection, and policy deployment for dexterous manipulation research"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23,<2",
+    "scipy>=1.10",
+    "PyYAML>=6",
+    "h5py>=3.8",
+    "av>=10",
+    "opencv-python>=4.8",
+    "transforms3d>=0.4",
+    "pynput>=1.7",
 ]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dexmani_real*"]
+exclude = ["dexmani_real.testing*", "tests*", "examples*", "assets*", "docs*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"dexmani_real.config" = ["*.json"]

@@ -108,6 +108,8 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
     _latest_head_pos = np.zeros(3, dtype=np.float64)
     _latest_head_quat_wxyz = np.zeros(4, dtype=np.float64)
     _latest_head_quat_wxyz[0] = 1.0
+    _latest_head_sequence_id = 0
+    _latest_head_recv_ts_ns = 0
 
     # vr_ready is deferred to the first event (HeadFrame or HandFrame).
     # TCP connect alone is not enough — data must actually be flowing before
@@ -134,8 +136,16 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             try:
                 head_flu_pos = unity_left_to_flu_position(event.head.x, event.head.y, event.head.z)
                 head_flu_quat = unity_left_to_flu_rotation(event.head.qx, event.head.qy, event.head.qz, event.head.qw)
-                _latest_head_pos = _finite_vector(head_flu_pos, (3,), "head_pos")
-                _latest_head_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(*head_flu_quat), "head_quat_wxyz")
+                head_pos = _finite_vector(head_flu_pos, (3,), "head_pos")
+                head_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(*head_flu_quat), "head_quat_wxyz")
+                head_sequence_id = int(event.sequence_id)
+                head_recv_ts_ns = int(event.recv_ts_ns)
+                if head_sequence_id < 0 or head_recv_ts_ns <= 0:
+                    raise ValueError("head sequence/timestamp must be non-negative and nonzero")
+                _latest_head_pos = head_pos
+                _latest_head_quat_wxyz = head_quat_wxyz
+                _latest_head_sequence_id = head_sequence_id
+                _latest_head_recv_ts_ns = head_recv_ts_ns
             except (ValueError, TypeError, AttributeError):
                 logger.warning("vr_loop: invalid head pose rejected", exc_info=True)
             continue
@@ -166,6 +176,8 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             frame["landmarks"][0] = landmarks
             frame["head_pos"][0] = _latest_head_pos.copy()
             frame["head_quat_wxyz"][0] = _latest_head_quat_wxyz.copy()
+            frame["head_sequence_id"][0] = np.uint64(_latest_head_sequence_id)
+            frame["head_recv_ts_ns"][0] = np.uint64(_latest_head_recv_ts_ns)
             frame["recv_ts_ns"][0] = np.uint64(event.recv_ts_ns)
             frame["source_ts_ns"][0] = np.uint64(event.source_ts_ns or 0)
             frame["sequence_id"][0] = np.uint64(event.sequence_id)

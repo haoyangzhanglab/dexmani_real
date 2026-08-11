@@ -3,7 +3,7 @@
 
 API: ``EpisodeQuality(episode_dir)`` context manager with ``.assess()``, ``.health()``,
 ``.validate()``, ``.filter()`` methods.  Also provides convenience functions
-``assess_episode()``, ``check_episode_health()``, ``batch_assess()``, ``batch_health()``.
+``assess_episode()``, ``check_episode_health()``, and ``batch_assess()``.
 
 CLI: ``python -m dexmani_real.tools.episode_quality {assess,health,filter,validate} ...``
 """
@@ -25,6 +25,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.defaults import hand
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE
 from dexmani_real.recording.episode_reader import EpisodeReader, ValidityState
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.recording.video_codec import VideoEncoder
@@ -126,21 +127,6 @@ def _hand_feedback_bound_violation(
     return np.maximum(np.maximum(lower - qpos, 0.0), np.maximum(qpos - upper, 0.0))
 
 
-def _compute_adaptive_threshold(
-    cmd_vel_rad_s: float,
-    joint_max_acc_rad_s2: float,
-    arm_loop_hz: float = 30.0,
-    adaptive_max_rad: float = 0.60,
-) -> float:
-    """Replicate arm_loop adaptive tracking error threshold formula."""
-    if joint_max_acc_rad_s2 <= 0:
-        return adaptive_max_rad
-    steady = cmd_vel_rad_s / arm_loop_hz
-    accel = cmd_vel_rad_s * cmd_vel_rad_s / joint_max_acc_rad_s2
-    expected = steady + accel + _TRACKING_NOISE_RAD
-    return float(np.clip(expected, _ADAPTIVE_MIN_RAD, adaptive_max_rad))
-
-
 def _read_meta_defaults(f: h5py.File) -> dict:
     """Read tracking parameters from /meta with safe defaults."""
     meta = f.get("/meta")
@@ -191,9 +177,9 @@ class QualityReport:
     classification: str  # "CLEAN", "MARGINAL", "DEGRADED"
     anomaly_ratio: float
     elevated_ratio: float
-    per_joint_mean_deg: np.ndarray = field(default_factory=lambda: np.zeros(7))
-    per_joint_p95_deg: np.ndarray = field(default_factory=lambda: np.zeros(7))
-    per_joint_rmse_deg: np.ndarray = field(default_factory=lambda: np.zeros(7))
+    per_joint_mean_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
+    per_joint_p95_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
+    per_joint_rmse_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
     overall_mean_deg: float = 0.0
     overall_p95_deg: float = 0.0
     overall_max_deg: float = 0.0
@@ -1243,20 +1229,6 @@ def batch_assess(
     return reports
 
 
-def batch_health(
-    paths: list[str],
-    roi_stride: int = 8,
-    track_thresh_rad: float = 0.35,
-) -> list[HealthReport]:
-    """Run health checks on multiple episodes."""
-    reports: list[HealthReport] = []
-    for p in paths:
-        r = check_episode_health(p, roi_stride=roi_stride, track_thresh_rad=track_thresh_rad)
-        if r is not None:
-            reports.append(r)
-    return reports
-
-
 def batch_validate(
     paths: Sequence[str | Path],
     min_frames: int = 50,
@@ -1405,21 +1377,6 @@ def print_health_report(report: HealthReport) -> None:
         print(f"  ⚠ WARN: {w}")
     if not report.warnings:
         print("  ✓ no warnings")
-
-
-def print_validation_report(report: ValidationReport) -> None:
-    """Human-readable output for a ValidationReport."""
-    status = "PASS" if report.is_valid else "FAIL"
-    name = Path(report.episode_path).name
-    print(f"  [{status}] {name}: {report.passed_count}/{report.total_count} checks")
-    for c in report.checks:
-        flag = "✓" if c["passed"] else "✗"
-        print(f"    {flag} {c['name']}: {c['detail']}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Thin CLI (delegates to the API above)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _cli_filter(args: argparse.Namespace) -> None:

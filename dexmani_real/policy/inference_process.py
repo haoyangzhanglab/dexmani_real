@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib
-import json
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, Callable
 
 import numpy as np
 
@@ -18,93 +16,15 @@ from dexmani_real.policy.runtime import (
     ActionChunk,
     ActionSpec,
     FrozenArrayMap,
-    ModalitySpec,
     ObservationSnapshot,
     ObservationSpec,
-    PolicyBackend,
 )
+from dexmani_real.policy.spec import PolicySpec
 from dexmani_real.policy.tensor_block import ObservationTensorBlock
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class InferenceConfig:
-    backend_entrypoint: str
-    observation_spec: ObservationSpec
-    action_spec: ActionSpec
-    poll_hz: float = 256.0
-    benchmark_deadline_s: float = 0.20
-    manifest_sha256: str = ""
-    resource_hashes: tuple[tuple[str, str], ...] = ()
-    actuators: tuple[str, ...] = ("arm", "hand")
-
-    def __post_init__(self) -> None:
-        if (
-            ":" not in self.backend_entrypoint
-            or not np.isfinite(self.poll_hz)
-            or not np.isfinite(self.benchmark_deadline_s)
-            or self.poll_hz <= 0
-            or self.benchmark_deadline_s <= 0
-        ):
-            raise ValueError("invalid inference entrypoint/rate/deadline")
-        if not self.actuators or "arm" not in self.actuators or set(self.actuators) - {"arm", "hand"}:
-            raise ValueError("inference actuators must contain arm and may contain hand")
-
-    @classmethod
-    def from_manifest(cls, path: str | Path) -> "InferenceConfig":
-        """Load and verify a backend-neutral model resource manifest."""
-        manifest_path = Path(path).resolve()
-        raw = manifest_path.read_bytes()
-        decoded = json.loads(raw.decode("utf-8"))
-        if not isinstance(decoded, dict):
-            raise TypeError("inference manifest root must be an object")
-        modalities_raw = decoded.get("modalities")
-        if not isinstance(modalities_raw, list) or not modalities_raw:
-            raise ValueError("inference manifest requires a non-empty modalities list")
-        modalities: list[ModalitySpec] = []
-        for item in modalities_raw:
-            if not isinstance(item, dict):
-                raise TypeError("each inference modality must be an object")
-            modality_data = dict(item)
-            if "shape" in modality_data:
-                modality_data["shape"] = tuple(modality_data["shape"])
-            modalities.append(ModalitySpec(**modality_data))
-        observation_spec = ObservationSpec(
-            tuple(modalities),
-            control_hz=float(decoded.get("control_hz", 16.0)),
-        )
-        action_data = dict(decoded.get("action") or {})
-        for shape_name in ("arm_shape", "hand_shape"):
-            if shape_name in action_data:
-                action_data[shape_name] = tuple(action_data[shape_name])
-        action_spec = ActionSpec(**action_data)
-
-        resources_raw = decoded.get("resources") or {}
-        if not isinstance(resources_raw, dict):
-            raise TypeError("inference manifest resources must be an object")
-        resource_hashes: list[tuple[str, str]] = []
-        for name, item in sorted(resources_raw.items()):
-            if not isinstance(item, dict) or "path" not in item or "sha256" not in item:
-                raise ValueError(f"resource {name!r} requires path and sha256")
-            resource_path = (manifest_path.parent / str(item["path"])).resolve()
-            expected = str(item["sha256"]).lower()
-            actual = hashlib.sha256(resource_path.read_bytes()).hexdigest()
-            if actual != expected:
-                raise ValueError(f"resource {name!r} SHA-256 mismatch")
-            resource_hashes.append((str(name), actual))
-        return cls(
-            backend_entrypoint=str(decoded["backend_entrypoint"]),
-            observation_spec=observation_spec,
-            action_spec=action_spec,
-            poll_hz=float(decoded.get("poll_hz", 256.0)),
-            benchmark_deadline_s=float(decoded.get("benchmark_deadline_s", action_spec.deadline_s)),
-            manifest_sha256=hashlib.sha256(raw).hexdigest(),
-            resource_hashes=tuple(resource_hashes),
-            actuators=tuple(str(name) for name in decoded.get("actuators", ("arm", "hand"))),
-        )
 
 
 @dataclass(frozen=True)
@@ -134,13 +54,14 @@ class InferenceWorkerTransport:
         )
 
 
-def _load_backend(entrypoint: str) -> PolicyBackend:
-    module_name, class_name = entrypoint.split(":", 1)
-    module = importlib.import_module(module_name)
-    backend = getattr(module, class_name)()
-    if not isinstance(backend, PolicyBackend):
-        raise TypeError(f"{entrypoint} does not implement PolicyBackend")
-    return backend
+def _load_adapter(spec: PolicySpec) -> tuple[ModuleType, object, Callable[[object, ObservationSnapshot], Any]]:
+    """Load the two-function adapter boundary inside the inference child."""
+    module = importlib.import_module(spec.adapter_module)
+    load_policy = getattr(module, "load_policy", None)
+    predict = getattr(module, "predict", None)
+    if not callable(load_policy) or not callable(predict):
+        raise TypeError(f"{spec.adapter_module} must define callable load_policy() and predict()")
+    return module, load_policy(spec), predict
 
 
 def encode_candidate(candidate: ActionCandidate, *, chunk_length: int = 1) -> np.ndarray:
@@ -252,24 +173,24 @@ def _validate_output(
 def inference_loop(
     transport: InferenceWorkerTransport,
     tensor_block: ObservationTensorBlock,
-    config: InferenceConfig,
+    config: PolicySpec,
 ) -> None:
-    """Load/warm selected backend lazily, then infer from immutable snapshots."""
+    """Load one adapter lazily, then infer from immutable snapshots."""
     from dexmani_real.runtime.status import ComponentPhase, FaultCode
     from dexmani_real.shm.shared_storage import publish_component_status
 
-    backend: PolicyBackend | None = None
+    adapter_module: ModuleType | None = None
+    policy: object | None = None
+    predict: Callable[[object, ObservationSnapshot], Any] | None = None
     ready = False
     failed = False
     try:
         publish_component_status(transport, "inference", ComponentPhase.LOADING)
-        backend = _load_backend(config.backend_entrypoint)
-        backend.load()
+        adapter_module, policy, predict = _load_adapter(config)
         publish_component_status(transport, "inference", ComponentPhase.WARMING_UP)
-        backend.warmup(config.observation_spec, config.action_spec)
-        warmup_snapshot = _synthetic_snapshot(config.observation_spec)
+        warmup_snapshot = _synthetic_snapshot(config.observation)
         benchmark_started = time.monotonic()
-        _validate_output(backend.infer(warmup_snapshot), warmup_snapshot, config.action_spec, config.actuators)
+        _validate_output(predict(policy, warmup_snapshot), warmup_snapshot, config.action, config.actuators)
         benchmark_s = time.monotonic() - benchmark_started
         if benchmark_s > config.benchmark_deadline_s:
             raise TimeoutError(
@@ -295,11 +216,10 @@ def inference_loop(
                     if camera_generation_changed:
                         transport.ready.clear()
                         publish_component_status(transport, "inference", ComponentPhase.WARMING_UP)
-                        backend.warmup(config.observation_spec, config.action_spec)
                         _validate_output(
-                            backend.infer(snapshot),
+                            predict(policy, snapshot),
                             snapshot,
-                            config.action_spec,
+                            config.action,
                             config.actuators,
                         )
                         transport.heartbeat_s.value = time.monotonic()
@@ -313,8 +233,8 @@ def inference_loop(
                     if not running_published:
                         publish_component_status(transport, "inference", ComponentPhase.RUNNING)
                         running_published = True
-                    output = backend.infer(snapshot)
-                    candidates = _validate_output(output, snapshot, config.action_spec, config.actuators)
+                    output = predict(policy, snapshot)
+                    candidates = _validate_output(output, snapshot, config.action, config.actuators)
                     for candidate in candidates:
                         transport.candidate_ring.write(encode_candidate(candidate, chunk_length=len(candidates)))
                     last_camera_generation = snapshot.camera_generation
@@ -335,11 +255,13 @@ def inference_loop(
         if ready:
             transport.fault_latch.value = True
     finally:
-        if backend is not None:
+        if adapter_module is not None and policy is not None:
             try:
-                backend.close()
+                close_policy = getattr(adapter_module, "close_policy", None)
+                if callable(close_policy):
+                    close_policy(policy)
             except Exception:
-                logger.warning("Inference backend close failed", exc_info=True)
+                logger.warning("Inference adapter close failed", exc_info=True)
         if not failed:
             publish_component_status(transport, "inference", ComponentPhase.STOPPED)
         logger.info("Inference worker exited")

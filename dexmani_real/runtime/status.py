@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import IntEnum
 
 
@@ -46,14 +45,3 @@ class ExitReason(IntEnum):
     STARTUP_FAILURE = 6
     SUPERVISOR_SHUTDOWN = 7
     KILLED = 8
-
-
-@dataclass(frozen=True)
-class ComponentStatus:
-    component: str
-    phase: ComponentPhase
-    fault_code: FaultCode = FaultCode.NONE
-    exit_reason: ExitReason = ExitReason.NONE
-    generation: int = 0
-    updated_monotonic_ns: int = 0
-    detail: str = ""

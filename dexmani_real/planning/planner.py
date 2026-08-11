@@ -27,7 +27,6 @@ __all__ = [
     "XArm7MotionPlanner",
 ]
 
-# Path scoring weights (Phase 4.2)
 _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
@@ -56,16 +55,9 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
         hand_dof: bool = True,
-        home_qpos: np.ndarray | None = None,
         static_boxes: Iterable[Any] = (),
     ) -> None:
         import mplib
-
-        if home_qpos is not None:
-            logger.warning(
-                "XArm7MotionPlanner.home_qpos is deprecated and ignored; "
-                "teleop null-space optimization now performs joint-limit repulsion only"
-            )
 
         self.mplib = mplib
         self.config = config
@@ -164,13 +156,12 @@ class XArm7MotionPlanner:
         cls,
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
-        home_qpos: np.ndarray | None = None,
         static_boxes: Iterable[Any] = (),
     ) -> "XArm7MotionPlanner":
         """Factory with canonical URDF/SRDF and identity base_pose_world.
 
         Centralises the invariant planner setup shared by keyboard_teleop,
-        calibrate_camera, and replay_traj.  Callers pass their own
+        calibrate_camera, and replay_episode. Callers pass their own
         *planning_profile* / *teleop_profile* to match their use case (teleop
         tolerances are intentionally looser than the dataclass defaults).
         """
@@ -191,14 +182,12 @@ class XArm7MotionPlanner:
             cfg,
             planning_profile=planning_profile or PlanningProfile(),
             teleop_profile=teleop_profile or TeleopProfile(),
-            home_qpos=home_qpos,
             static_boxes=static_boxes,
         )
 
     def __getattr__(self, name: str):
         """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mplib_planner.
 
-        Eliminates 24 pure-delegation methods (ref: code-simplification-review).
         Callers use ``planner.compute_eef_pose_world(q)`` as before — the proxy
         routes to ``self.kin.compute_eef_pose_world(q)`` transparently.
 
@@ -229,8 +218,6 @@ class XArm7MotionPlanner:
     def solve_teleop_ik(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
-        # Mirror plan_path's hand_qpos guard (line ~227): warn when
-        # collision checks will use the fallback open-hand proxy pose.
         if self.collision_model.hand_dof and self.collision_model._hand_qpos is None:
             _warn_hand_qpos_unset_teleop(
                 "solve_teleop_ik: hand_qpos not set — "
@@ -393,7 +380,7 @@ class XArm7MotionPlanner:
                     rrt_range=rrt_range,
                     planning_time=profile.rrt_time_limit,
                     simplify=profile.simplify_path,
-                    verbose=False,  # MPlib verbose=False suppresses debug output (P3.2)
+                    verbose=False,
                 )
                 path_result = self.result_from_mplib(
                     result, target_eef_pose_world, current_qpos, source="rrt", profile=profile

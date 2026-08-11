@@ -1,7 +1,7 @@
 """Non-blocking voice prompt player for teleop state transitions.
 
 Plays pre-recorded .wav files via system audio (aplay/paplay) in a daemon
-thread so the 16 Hz control loop is never blocked.  Only one prompt plays at
+thread so the configured control loop is never blocked. Only one prompt plays at
 a time — a new play() call cancels any in-progress playback.
 
 Events are short keys (e.g. "begin", "save") that map to filenames under
@@ -10,7 +10,7 @@ assets/audio/.  Missing player or file degrades silently to a log warning.
 
 from __future__ import annotations
 
-__all__ = ["AudioFeedback"]
+__all__ = ["AudioFeedback", "update_motion_gate"]
 
 import os
 import shutil
@@ -41,6 +41,28 @@ _EVENT_MAP: dict[str, str] = {
 }
 
 
+def update_motion_gate(
+    *,
+    audio_playing: bool,
+    begin_deadline_s: float | None,
+    ignore_begin_until_silent: bool,
+    now_s: float,
+) -> tuple[bool, float | None, bool]:
+    """Bound how long the begin cue may hold robot motion."""
+    begin_active = begin_deadline_s is not None and now_s < begin_deadline_s
+    if begin_deadline_s is not None and not begin_active:
+        ignore_begin_until_silent = audio_playing
+        begin_deadline_s = None
+
+    if ignore_begin_until_silent:
+        if not audio_playing:
+            ignore_begin_until_silent = False
+        should_hold = False
+    else:
+        should_hold = begin_active or audio_playing
+    return should_hold, begin_deadline_s, ignore_begin_until_silent
+
+
 class AudioFeedback:
     """Non-blocking voice prompt player.
 
@@ -56,15 +78,10 @@ class AudioFeedback:
         self._lock = threading.Lock()
         self._current_proc: subprocess.Popen | None = None
         self._cancel_flag: threading.Event | None = None
-        # Queue support: sequential playback
-        self._queue: list[str] = []  # list of file paths
+        self._queue: list[str] = []
         self._queue_lock = threading.Lock()
         self._queue_cancel: threading.Event | None = None
         self._queue_thread: threading.Thread | None = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     @property
     def is_playing(self) -> bool:
@@ -148,10 +165,6 @@ class AudioFeedback:
                     name="audio-queue",
                 )
                 self._queue_thread.start()
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
     def _cancel_current(self) -> None:
         """Kill the current subprocess and signal its thread to exit."""
@@ -244,11 +257,6 @@ class AudioFeedback:
             with self._lock:
                 if self._current_proc is proc:
                     self._current_proc = None
-
-
-# ------------------------------------------------------------------
-# Module-level helpers
-# ------------------------------------------------------------------
 
 
 def _find_player() -> str | None:

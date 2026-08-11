@@ -140,9 +140,9 @@ dmypy.json
 .pyre/
 
 .vscode/
-.claude/
-.codex/
-.agents/
+# .claude/
+# .codex/
+# .agents/
 
 trajectories/
 episodes_arm/

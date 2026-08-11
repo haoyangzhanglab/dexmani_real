@@ -4,7 +4,6 @@ Uses multiprocessing.shared_memory for zero-copy cross-process communication.
 Single producer (writer), single consumer (reader) — safe without CAS on
 x86_64 because aligned uint64 stores are atomic at the instruction level.
 
-Ref: ManiUniCon lock-free shared memory pattern (main.py:163-170).
      DexUMI drop-oldest backpressure via FILO semantics.
 
 Usage:

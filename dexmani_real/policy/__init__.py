@@ -1,10 +1,12 @@
+"""Policy runtime and action protocol."""
+
 from __future__ import annotations
 
 __all__ = ["PolicyConfig", "policy_loop"]
 
 
 def __getattr__(name: str):
-    """Keep policy package import free of planners, HDF5, SDKs and UI modules."""
+    """Load teleoperation code only when the compatibility API is requested."""
     if name in __all__:
         from dexmani_real.policy.vr_teleop_policy import PolicyConfig, policy_loop
 

@@ -31,6 +31,7 @@ from typing import Any
 import h5py
 import numpy as np
 
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.recording.timestamp_buffer import FillReason
 from dexmani_real.recording.video_codec import VideoDecoder
 from dexmani_real.utils.log import get_logger
@@ -369,10 +370,10 @@ class EpisodeReader:
         if np.any(committed & (~queued | ~action_timing_valid)):
             return ValidityState.INVALID
         action_arrays = (
-            ("action_arm_joint", (frame_count, 7)),
-            ("action_hand_joint", (frame_count, 12)),
-            ("action_arm_joint_raw", (frame_count, 7)),
-            ("action_hand_joint_raw", (frame_count, 12)),
+            ("action_arm_joint", (frame_count, *ARM_JOINT_SHAPE)),
+            ("action_hand_joint", (frame_count, *HAND_JOINT_SHAPE)),
+            ("action_arm_joint_raw", (frame_count, *ARM_JOINT_SHAPE)),
+            ("action_hand_joint_raw", (frame_count, *HAND_JOINT_SHAPE)),
         )
         for name, expected_shape in action_arrays:
             values = np.asarray(self._h5f[name][:], dtype=np.float64)

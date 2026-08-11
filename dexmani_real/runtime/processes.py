@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.runtime.status import ExitReason
 from dexmani_real.utils.log import get_logger
 
@@ -29,10 +31,79 @@ class ProcessExit:
 class ShutdownReport:
     exits: tuple[ProcessExit, ...]
     shared_closed: bool
+    error_latched: bool = False
+    estop_requested: bool = False
+    safety_state: int | None = None
 
     @property
     def all_stopped(self) -> bool:
         return all(item.exitcode is not None for item in self.exits)
+
+    @property
+    def abnormal_exits(self) -> tuple[ProcessExit, ...]:
+        return tuple(item for item in self.exits if item.exitcode != 0 or item.escalation != "graceful")
+
+    @property
+    def faulted(self) -> bool:
+        return (
+            self.error_latched
+            or self.estop_requested
+            or self.safety_state == int(SafetyState.FAULT)
+            or bool(self.abnormal_exits)
+        )
+
+    @property
+    def clean(self) -> bool:
+        safety_is_clean = self.safety_state in (None, int(SafetyState.DISARMED))
+        return self.all_stopped and self.shared_closed and safety_is_clean and not self.faulted
+
+
+def _shared_value(shared: Any, name: str) -> Any | None:
+    field = getattr(shared, name, None)
+    return None if field is None else getattr(field, "value", None)
+
+
+def _finalize_shutdown_state(
+    shared: Any,
+    exits: tuple[ProcessExit, ...],
+    *,
+    disarm_if_clean: bool,
+) -> tuple[bool, bool, int | None]:
+    """Latch post-join failures, or disarm only after a verified clean stop."""
+    error_latched = bool(_shared_value(shared, "error_state"))
+    estop_requested = bool(_shared_value(shared, "estop_request"))
+    safety_value = _shared_value(shared, "safety_state")
+    safety_state = None if safety_value is None else int(safety_value)
+    worker_failed = any(item.exitcode != 0 or item.escalation != "graceful" for item in exits)
+    faulted = error_latched or estop_requested or safety_state == int(SafetyState.FAULT) or worker_failed
+
+    if faulted:
+        error_field = getattr(shared, "error_state", None)
+        if error_field is not None:
+            error_field.value = True
+            error_latched = True
+        if safety_state is not None:
+            transition(shared, SafetyState.FAULT)
+    elif disarm_if_clean and safety_state is not None:
+        if not transition(shared, SafetyState.DISARMED):
+            error_field = getattr(shared, "error_state", None)
+            if error_field is not None:
+                error_field.value = True
+                error_latched = True
+            transition(shared, SafetyState.FAULT)
+
+    final_safety_value = _shared_value(shared, "safety_state")
+    final_safety_state = None if final_safety_value is None else int(final_safety_value)
+    return error_latched, estop_requested, final_safety_state
+
+
+def _close_shared_storage(shared: Any) -> bool:
+    """Close IPC and convert cleanup exceptions into a failed shutdown report."""
+    try:
+        return bool(shared.close())
+    except Exception:
+        logger.error("SharedStorage cleanup raised", exc_info=True)
+        return False
 
 
 def supervisor_exit_reason(
@@ -46,11 +117,26 @@ def supervisor_exit_reason(
         return ExitReason.ESTOP
     if bool(shared.error_state.value):
         return ExitReason.STICKY_FAULT
-    if any(process.exitcode is not None for process in processes):
+    stopped = [process for process in processes if process.exitcode is not None]
+    explicit_quit = bool(shared.quit_requested.value) or not bool(shared.is_running.value)
+    # The policy sets quit_requested before its own clean exit. Accept that
+    # expected zero exit without masking non-zero worker failures.
+    if stopped and explicit_quit and all(int(process.exitcode) == 0 for process in stopped):
+        return ExitReason.EXPLICIT_QUIT
+    if stopped:
         return ExitReason.WORKER_DEATH
-    if any(heartbeat_ages_s.get(name, float("inf")) > timeout for name, timeout in heartbeat_timeouts_s.items()):
-        return ExitReason.HEARTBEAT_TIMEOUT
-    if bool(shared.quit_requested.value) or not bool(shared.is_running.value):
+    for name, timeout in heartbeat_timeouts_s.items():
+        age_s = float(heartbeat_ages_s.get(name, float("inf")))
+        timeout_s = float(timeout)
+        if (
+            not math.isfinite(age_s)
+            or age_s < 0.0
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0.0
+            or age_s > timeout_s
+        ):
+            return ExitReason.HEARTBEAT_TIMEOUT
+    if explicit_quit:
         return ExitReason.EXPLICIT_QUIT
     return ExitReason.NONE
 
@@ -62,8 +148,9 @@ def shutdown_processes_verified(
     graceful_timeout_s: float = 5.0,
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
+    disarm_if_clean: bool = False,
 ) -> ShutdownReport:
-    """Join, terminate, then kill stragglers; close IPC only after all exited."""
+    """Join workers, finalize safety from their terminal state, then close IPC."""
     procs = list(processes)
     shared.is_running.value = False
     exits: list[ProcessExit] = []
@@ -88,7 +175,28 @@ def shutdown_processes_verified(
             raise RuntimeError(f"process {process.name} could not be confirmed stopped; SharedStorage remains open")
         exits.append(ProcessExit(process.name, process.exitcode, escalation))
 
-    shared.close()
-    report = ShutdownReport(tuple(exits), shared_closed=True)
+    frozen_exits = tuple(exits)
+    error_latched, estop_requested, safety_state = _finalize_shutdown_state(
+        shared,
+        frozen_exits,
+        disarm_if_clean=disarm_if_clean,
+    )
+    shared_closed = _close_shared_storage(shared)
+    if not shared_closed:
+        error_field = getattr(shared, "error_state", None)
+        if error_field is not None:
+            error_field.value = True
+            error_latched = True
+        if safety_state is not None:
+            transition(shared, SafetyState.FAULT)
+            final_safety_value = _shared_value(shared, "safety_state")
+            safety_state = None if final_safety_value is None else int(final_safety_value)
+    report = ShutdownReport(
+        frozen_exits,
+        shared_closed=shared_closed,
+        error_latched=error_latched,
+        estop_requested=estop_requested,
+        safety_state=safety_state,
+    )
     logger.info("verified process shutdown: %s", report.exits)
     return report

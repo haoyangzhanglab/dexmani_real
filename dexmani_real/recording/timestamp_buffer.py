@@ -3,7 +3,6 @@
 Assigns each incoming data point to a fixed dt time grid (start_time + k*dt),
 pre-allocates numpy arrays, and flushes aligned data in bulk at episode stop.
 
-Ref: ManiUniCon TimestampAlignedBuffer (maniunicon/utils/timestamp_accumulator.py).
 """
 
 from __future__ import annotations

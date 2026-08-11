@@ -197,58 +197,20 @@ class TeleopProfile:
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
 
-    # Fast-accept threshold for position IK fallback (ref: ssik seed_tolerance).
-    # A candidate is accepted immediately without trying additional seeds when
-    # max single-joint delta from current hardware position is below this value.
-    # 15° default: accept quickly if the solution is close to where we already are.
+    # Skip extra seeds when the first valid solution is near measured state.
     position_ik_fast_accept_rad: float = np.deg2rad(15.0)
 
-    # ── Multi-candidate scoring (Phase 2, dexterous manipulation) ──
-    # When the fast-accept path (prev_cmd seed within 15°) doesn't trigger,
-    # multiple seeds are tried and candidates are scored by:
-    #   score = weighted_joint_distance - manipulability_weight * μ + limit_penalty_weight * penalty
-    # Lower score = better.  μ is the Yoshikawa manipulability measure.
-    position_ik_num_random_seeds: int = 3  # extra random seeds around prev_cmd
-    position_ik_seed_offset_deg: float = 5.0  # ±offset per joint for random seeds
-    teleop_ik_seed: int | None = 42  # deterministic RNG seed (set None for non-det legacy behavior)
-    position_ik_manipulability_weight: float = 0.05  # higher → prefer dexterous configs
-    position_ik_limit_penalty_weight: float = 0.01  # higher → prefer configs farther from limits
-    # Soft velocity tiebreaker: prefer candidates close to the previous command.
-    # This is NOT a hard ceiling (the 90° jump guard already handles that) — it is a
-    # lightweight preference that breaks ties between equally-valid IK solutions by
-    # penalising frame-to-frame oscillation.  Set to 0.0 to disable.
+    # Multi-seed scoring balances motion, manipulability, limits, and pose accuracy.
+    position_ik_num_random_seeds: int = 3
+    position_ik_seed_offset_deg: float = 5.0
+    teleop_ik_seed: int | None = 42
+    position_ik_manipulability_weight: float = 0.05
+    position_ik_limit_penalty_weight: float = 0.01
     position_ik_velocity_weight: float = 0.03
-    # EEF pose accuracy in multi-candidate scoring.  Within the acceptable range
-    # (≤ max_pose_error_pos_m / max_pose_error_rot_rad), some candidates match
-    # the target pose more precisely than others.  This weight adds pos_err + rot_err
-    # (both normalised to their respective max thresholds) to the score.
-    # Set to 0.0 to disable (backward compatible).
     position_ik_pose_accuracy_weight: float = 0.05
-    # Minimum Yoshikawa manipulability μ = sqrt(det(J·Jᵀ)) for IK candidates.
-    # Candidates below this threshold are rejected in validation (before scoring),
-    # preventing large joint motions near kinematic singularities.
-    # 0.0 = disabled (backward compatible).  For xArm7, μ ≈ 0.02–0.15 in normal
-    # operation; values below 0.002 indicate near-singular configurations.
+    # Zero disables hard rejection by Yoshikawa manipulability.
     position_ik_min_manipulability: float = 0.0
-    # Per-joint weights for the velocity term.  Unlike joint_weights (which penalise
-    # static displacement from hardware position), velocity weights penalise frame-to-frame
-    # command changes and are tuned for joint INERTIA and RESPONSIVENESS rather than range:
-    #
-    #   J1 base (high inertia):       5.0 — heavy, resist oscillation aggressively
-    #   J2 shoulder (highest inertia): 1.5 — heaviest joint, moderate extra damping
-    #   J3 elbow:                      0.8 — neutral, slight relaxation vs position
-    #   J4 wrist pitch:                0.5 — small range provides natural penalty
-    #   J5 wrist roll (dexterity):     0.2 — primary manipulation axis, high freedom
-    #   J6 wrist yaw (dexterity):      0.3 — secondary orientation axis, high freedom
-    #   J7 tool flange (negligible):   0.1 — negligible inertia, near-zero resistance
-    #
-    # Effective velocity cost per radian (weight ÷ joint_range):
-    #   J1(0.398) > J2(0.361) > J4(0.121) > J3(0.064)
-    #   > J6(0.062) > J5(0.016) > J7(0.005)
-    #
-    # Contrast with position cost: J1 rises from #2→#1 (now most damped),
-    # J6 drops #3→#5 (2.7× freer), J5/J7 get 3-5× more freedom.
-    # Set to None to fall back to joint_weights (backward compatible).
+    # Dampen the heavy base/shoulder while leaving wrist joints responsive.
     velocity_joint_weights: tuple[float, ...] | None = (5.0, 1.5, 0.8, 0.5, 0.2, 0.3, 0.1)
 
     @classmethod
@@ -256,47 +218,9 @@ class TeleopProfile:
         """Reconstruct from a serialized dict."""
         return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
-    # ── Joint-specific IK scoring weights (ref: LeFranX weighted_ik.cpp:62-69) ──
-    # Higher weight → solver penalises moving that joint away from its current
-    # position, i.e. "expensive" joints stay stable while "cheap" joints do the
-    # tracking work.  Applied via weighted, range-normalised L2 distance.
-    #
-    # xArm7 joint semantics and tuning rationale:
-    #   joint1 (base rotation, ±360°):     3.0 — huge range makes raw radians
-    #                                             cheap; high weight keeps the base
-    #                                             stable and avoids large arm swings
-    #                                             for small VR hand motions.
-    #   joint2 (shoulder lift, -118~120°): 1.2 — small range (238°) already
-    #                                             provides natural normalisation
-    #                                             penalty; moderate extra weight
-    #                                             because shoulder is the heaviest
-    #                                             joint yet essential for vertical
-    #                                             VR tracking.
-    #   joint3 (elbow, ±360°):             1.0 — neutral; elbow contributes to
-    #                                             both reach and orientation and
-    #                                             should move without bias.
-    #   joint4 (wrist pitch, -11~225°):    0.5 — small range provides natural
-    #                                             penalty; low weight lets wrist
-    #                                             pitch track VR orientation freely
-    #                                             within its asymmetric limits.
-    #   joint5 (wrist roll, ±360°):        0.5 — low weight; wrist roll is the
-    #                                             primary manipulation axis and
-    #                                             has ample range.
-    #   joint6 (wrist yaw, -97~180°):      0.8 — moderate range (277°); slight
-    #                                             penalty relative to roll to
-    #                                             prefer roll (joint5) over yaw
-    #                                             for hand orientation changes.
-    #   joint7 (tool flange, ±360°):       0.3 — lowest weight; tool rotation
-    #                                             has negligible effect on arm
-    #                                             configuration and should move
-    #                                             most freely.
-    #
-    # Effective cost per radian (weight ÷ joint_range):
-    #   J2(0.289) > J1(0.239) > J6(0.166) > J4(0.121)
-    #   > J3(0.080) > J5(0.040) > J7(0.024)
+    # Range-normalized weights keep the base stable and favor wrist motion.
     joint_weights: tuple[float, ...] = (3.0, 1.2, 1.0, 0.5, 0.5, 0.8, 0.3)
 
-    # ── Null-space optimization ──
     # Post-IK null-space projection that adjusts the redundant DOF to repel
     # joints from their limits while preserving the EEF pose to first order
     # (J · dq_null = 0). Final nonlinear pose and collision gates run after it.

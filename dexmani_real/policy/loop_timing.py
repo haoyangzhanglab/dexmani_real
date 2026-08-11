@@ -1,4 +1,4 @@
-"""Per-stage timing for the 16 Hz teleop main loop.
+"""Per-stage timing for the configured teleoperation control grid.
 
 Usage (one ``tick()`` at the loop top, ``mark()`` after each stage):
 

@@ -6,19 +6,18 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from dexmani_real.ipc.schema import (
+    ARM_JOINT_SHAPE,
+    HAND_CONTACT_SHAPE,
+    HAND_FINGERTIP_SHAPE,
+    HAND_JOINT_SHAPE,
+    HAND_TACTILE_FORCE_SHAPE,
+    HAND_TACTILE_SUM_SHAPE,
+)
 
-def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
-    """Validate ndarray field shapes for a dataclass instance.
 
-    For each (field_name, expected_shape) in specs:
-      - retrieves the field value via getattr
-      - skips None-valued fields
-      - converts to np.ndarray via np.asarray
-      - raises ValueError on shape mismatch
-
-    The error message includes the class name and field name, matching the
-    format originally used inline in RobotState/RobotAction.__post_init__.
-    """
+def _validate_field_shapes(instance: object, specs: list[tuple[str, tuple[int, ...]]]) -> None:
+    """Validate present NumPy-compatible fields against expected shapes."""
     cls_name = type(instance).__name__
     for field_name, expected_shape in specs:
         val = getattr(instance, field_name)
@@ -31,10 +30,7 @@ def _validate_field_shapes(instance, specs: list[tuple[str, tuple]]) -> None:
 
 @dataclass
 class RobotState:
-    """Complete robot state — assembled from arm_state_ring + hand_state_ring.
-
-    All physical quantities annotated with units in comments.
-    """
+    """Recording state assembled from the arm, hand, and tactile rings."""
 
     # ── Arm joints ──
     arm_qpos: np.ndarray  # (7,)  float64  rad
@@ -49,7 +45,7 @@ class RobotState:
     # ── Hand joints ──
     hand_qpos: np.ndarray  # (12,) float64  rad
 
-    # ── Tactile (ref: DexUMI — both combined force and raw array in default mode) ──
+    # ── Tactile ──
     hand_tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
     hand_tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified
     hand_tactile_contact: np.ndarray  # (5,) bool — per-finger contact detection (from detect_contact)
@@ -69,10 +65,8 @@ class RobotState:
     # ── Hand motor current (optional, for safety gating) ──
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
-    # ── Hand health flags (default-False for backward compat) ──
     hand_error_state: bool = False  # True when hand reports hardware errors (board faults)
 
-    # ── Arm command timing (default values keep older producers compatible) ──
     arm_last_cmd_seq: int = 0
     arm_last_cmd_queue_latency_s: float = 0.0  # producer -> arm queue receive
     arm_last_cmd_apply_latency_s: float = 0.0  # producer -> successful SDK return
@@ -83,21 +77,21 @@ class RobotState:
         _validate_field_shapes(
             self,
             [
-                ("arm_qpos", (7,)),
-                ("arm_qvel", (7,)),
-                ("arm_tau", (7,)),
+                ("arm_qpos", ARM_JOINT_SHAPE),
+                ("arm_qvel", ARM_JOINT_SHAPE),
+                ("arm_tau", ARM_JOINT_SHAPE),
                 ("eef_pos", (3,)),
                 ("eef_quat_wxyz", (4,)),
                 ("eef_rot6d", (6,)),
-                ("hand_qpos", (12,)),
-                ("hand_current", (12,)),
-                ("hand_tactile_sum", (5, 3)),
-                ("hand_tactile_force", (5, 120, 3)),
-                ("hand_tactile_contact", (5,)),
-                ("hand_tipboard_err", (12,)),
-                ("hand_commboard_err", (12,)),
-                ("hand_jointboard_err", (12,)),
-                ("fingertip_pos", (5, 3)),
+                ("hand_qpos", HAND_JOINT_SHAPE),
+                ("hand_current", HAND_JOINT_SHAPE),
+                ("hand_tactile_sum", HAND_TACTILE_SUM_SHAPE),
+                ("hand_tactile_force", HAND_TACTILE_FORCE_SHAPE),
+                ("hand_tactile_contact", HAND_CONTACT_SHAPE),
+                ("hand_tipboard_err", HAND_JOINT_SHAPE),
+                ("hand_commboard_err", HAND_JOINT_SHAPE),
+                ("hand_jointboard_err", HAND_JOINT_SHAPE),
+                ("fingertip_pos", HAND_FINGERTIP_SHAPE),
             ],
         )
 
@@ -113,7 +107,7 @@ class RobotAction:
     hand_qpos_cmd: np.ndarray  # (12,) float64  rad
 
     # ── Intent (pre-IK Cartesian EEF target the arm command tracks) ──
-    # Populated by the teleop pipeline (vr_teleop_policy); recorded so EE-space policies can train.
+    # Populated by the teleop loop; recorded so EE-space policies can train.
     target_eef_pos: np.ndarray | None = field(default=None)  # (3,)  float64  m
     target_eef_rot6d: np.ndarray | None = field(default=None)  # (6,)  float64
 
@@ -121,25 +115,17 @@ class RobotAction:
         _validate_field_shapes(
             self,
             [
-                ("arm_qpos_cmd", (7,)),
-                ("hand_qpos_cmd", (12,)),
+                ("arm_qpos_cmd", ARM_JOINT_SHAPE),
+                ("hand_qpos_cmd", HAND_JOINT_SHAPE),
                 ("target_eef_pos", (3,)),
                 ("target_eef_rot6d", (6,)),
             ],
         )
 
 
-# Per-process state type specifications.
-# These dataclasses document field layout; authoritative format = *_DTYPE in shm/shared_storage.py.
-# Classes are NOT instantiated at runtime — they serve as human-readable format specs.
-
-
 @dataclass
 class ArmState:
-    """Arm process state — published to arm_state_ring every tick (~322 bytes).
-
-    Matches ARM_STATE_DTYPE in ipc/schema.py.
-    """
+    """Documentation view of ``ipc.schema.ARM_STATE_DTYPE``."""
 
     qpos: np.ndarray  # (7,)  float64  rad
     qvel: np.ndarray  # (7,)  float64  rad/s
@@ -158,16 +144,15 @@ class ArmState:
     last_cmd_apply_latency_s: float
     last_cmd_sdk_duration_s: float
     last_cmd_is_hold: bool
+    source_monotonic_ns: int
+    publish_monotonic_ns: int
+    state_valid: bool
     timestamp: float
 
 
 @dataclass
 class HandState:
-    """Hand process state — published to hand_state_ring every tick (~472 bytes).
-
-    Does NOT include tactile_force — that's in HandTactile on a separate ring.
-    Matches HAND_STATE_DTYPE in ipc/schema.py.
-    """
+    """Documentation view of ``ipc.schema.HAND_STATE_DTYPE``."""
 
     qpos: np.ndarray  # (12,) float64  rad
     current: np.ndarray  # (12,) float64  mA
@@ -179,14 +164,20 @@ class HandState:
     commboard_err: np.ndarray  # (12,) int32
     jointboard_err: np.ndarray  # (12,) int32
     tipboard_err: np.ndarray  # (12,) int32
+    source_monotonic_ns: int
+    publish_monotonic_ns: int
+    state_valid: bool
+    send_healthy: bool
+    read_healthy: bool
     timestamp: float
 
 
 @dataclass
 class HandTactile:
-    """Hand tactile force — published to hand_tactile_ring (sparse, ~14.4KB).
-
-    Only written when tactile_contact[finger] is nonzero.
-    """
+    """Documentation view of ``ipc.schema.HAND_TACTILE_DTYPE``."""
 
     tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified
+    source_monotonic_ns: int
+    fresh: bool
+    calibrated: bool
+    unit_code: int

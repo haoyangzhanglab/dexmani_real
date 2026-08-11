@@ -8,7 +8,8 @@ added later, its instructions take precedence for that subtree.
 
 DexMani Real is a Python 3.10 robotics system for VR teleoperation and data
 collection with an xArm7 (7 DoF), an XHand (12 DoF), a Quest headset, and an
-Intel RealSense L515. The canonical runtime is a five-process architecture:
+Intel RealSense L515. The canonical runtime has five control/device workers;
+recording adds a sixth RecorderIO worker:
 
 ```text
 camera ───────────────┐
@@ -19,28 +20,47 @@ policy ──arm queue──> arm
    └──hand ring─────> hand
 
 arm/hand/camera/VR ──shared-memory state──> policy
-policy ──aligned samples──> HDF5 episode (schema v15)
+policy ──aligned sample ring──> RecorderIO ──> HDF5 episode (schema v15)
 ```
 
-The thin main process only creates shared storage, starts workers, supervises
-heartbeats and process health, and shuts workers down. Business logic belongs
-in the worker or domain module, not in the entry point.
+The thin main process creates shared storage, starts workers, performs bounded
+read-only readiness preflight, supervises health, and shuts workers down.
+Mapping, command, and recording decisions belong in workers or domain modules,
+not in the entry point.
 
 ## Source map
 
-- `examples/real/vr_teleop_hand_record.py`: canonical five-process entry point.
+- `examples/real/collect_teleop.py`, `deploy_policy.py`: thin canonical CLI
+  entry points for teleoperation/data collection and learned-policy deployment.
 - `examples/real/keyboard_teleop_real.py`: arm-oriented keyboard teleoperation.
-- `examples/real/calibrate_camera.py`: ArUco eye-to-hand camera calibration.
-- `examples/real/calibrate_vr_heading.py`: VR-to-robot heading calibration.
-- `examples/real/replay_traj.py`: recorded-episode replay and consistency checks.
+- `examples/real/calibrate_camera.py`, `calibrate_vr_heading.py`: thin
+  calibration CLIs; implementation lives in `dexmani_real/calibration/`.
+- `examples/real/diagnose_realsense.py`, `diagnose_pointcloud.py`,
+  `diagnose_xhand.py`: bounded hardware diagnostics backed by
+  `dexmani_real/diagnostics/`. The older diagnostic names are compatibility
+  entry points only.
+- `examples/real/replay_episode.py`: dry-run inspection, certified replay, and
+  consistency checks. `replay_traj.py` is a compatibility entry point.
 - `dexmani_real/config/defaults.py`: source of truth for numeric defaults.
 - `dexmani_real/ipc/schema.py`: dependency-neutral source of truth for every
   cross-process NumPy dtype and fixed-size protocol payload.
-- `dexmani_real/shm/shared_storage.py`: cross-process data plane, ring/queue allocation,
-  flags, readiness events, and supervisor helpers.
-- `dexmani_real/shm/ring_buffer.py`, `robot_ring.py`: seqlock ring primitives.
-- `dexmani_real/policy/vr_teleop_policy.py`: VR mapping, IK, command production,
-  safety gating, and ownership of recording.
+- `dexmani_real/shm/shared_storage.py`: cross-process data plane, ring/queue
+  allocation, flags, and readiness events.
+- `dexmani_real/shm/ring_buffer.py`: camera shared-memory ring.
+- `dexmani_real/shm/robot_ring.py`: seqlock control/state ring primitive.
+- `dexmani_real/teleop/loop.py`: VR mapping, IK, command production, safety
+  gating, and ownership of recording. `policy/vr_teleop_policy.py` is a
+  compatibility import.
+- `dexmani_real/teleop/experiment.py`: teleoperation worker lifecycle,
+  readiness/health preflight, supervision, and shutdown.
+- `dexmani_real/policy/spec.py`, `learned_coordinator.py`: learned-policy
+  contract and causal action scheduling.
+- `dexmani_real/policy/deployment.py`: validated `PolicySpec` deployment
+  lifecycle; inference runs in an isolated worker.
+- `dexmani_real/replay/`: episode loading, preflight CLI, live worker session,
+  command execution, and metrics.
+- `dexmani_real/runtime/supervisor.py`: readiness, heartbeat/process
+  supervision, and verified shutdown.
 - `dexmani_real/robot/arm_loop.py`: xArm Mode 6 servo loop and arm state producer.
 - `dexmani_real/robot/hand_process.py`: XHand servo loop and hand state producer.
 - `dexmani_real/robot/safety.py`: `DISARMED/ARMED/RUNNING/FAULT` transitions.
@@ -64,28 +84,27 @@ conda activate real_robot
 export PYTHONPATH=.
 ```
 
-Packaging metadata is intentionally minimal; `setup.py` does not declare the
-hardware and planning dependencies. Do not assume `pip install -e .` creates a
-working robot environment. Important external dependencies include NumPy,
-SciPy, h5py, PyAV, mplib, Pinocchio, nlopt, pyrealsense2, OpenCV, Open3D,
-PyTorch, rerun, dex-retargeting, and the vendor xArm/XHand SDKs.
+`pyproject.toml` is the sole packaging configuration. Its dependencies cover
+the portable Python layer, but `pip install -e .` does not provision the native
+planning stack, CUDA packages, device SDKs, or a working robot environment.
+Those remain managed by the `real_robot` conda environment. Important external
+dependencies include mplib, Pinocchio, nlopt, pyrealsense2, Open3D, PyTorch,
+rerun, dex-retargeting, and the vendor xArm/XHand SDKs.
 
 Useful non-hardware validation commands:
 
 ```bash
 conda run -n real_robot python -m compileall -q dexmani_real examples/real
-conda run -n real_robot mypy dexmani_real/
-conda run -n real_robot black --check dexmani_real examples/real
-conda run -n real_robot isort --check-only dexmani_real examples/real
 ```
 
-Formatting is Black-compatible with a 120-character line length and isort's
-Black profile, as configured in `pyproject.toml`. Prefer a focused check of the
-changed modules when optional SDK imports prevent a repository-wide check.
+This personal research repository does not require a project-level linter,
+formatter, type checker, or test runner. Keep edits consistent with nearby
+code, avoid repository-wide formatting churn, and prefer small deterministic
+offline checks for the behavior being changed.
 
-There is currently no conventional unit-test suite. Files named
-`examples/real/test_*.py` are interactive hardware diagnostics, not safe
-pytest tests. Never run them merely because their names begin with `test_`.
+There is no conventional automated unit-test suite. Files named
+`examples/real/test_*.py` are interactive hardware diagnostics, not automated
+tests. Never run them merely because their names begin with `test_`.
 
 ## Hardware safety boundary
 
@@ -100,9 +119,9 @@ clear and the hardware is ready. In particular, do not execute:
 - direct vendor SDK examples or commands that connect to the robot;
 - ad-hoc imports when module import itself may initialize a device SDK.
 
-Static inspection, compilation, formatting checks, type checking, and focused
-tests with mocked hardware are acceptable. Do not weaken a safety check merely
-to make an offline test pass.
+Static inspection, compilation, and focused offline checks with fakes or mocks
+are acceptable. Do not weaken a safety check merely to make an offline check
+pass.
 
 ## Architectural invariants
 
@@ -150,8 +169,9 @@ Changes to shared formats have a wider blast radius than their defining file:
   durations, buffer sizes, heartbeat thresholds, recorder metadata, and CLIs.
 - Robot state transition or fault behavior: audit main supervisor, policy,
   arm loop, hand loop, shutdown, and e-stop paths together.
-- New entry point: follow the thin-main pattern: create `SharedStorage`, spawn
-  plain `*_loop(shared, config)` functions, await readiness, supervise, shut down.
+- New entry point: keep the `examples/real/` file as a thin CLI forwarding to a
+  domain module. The domain lifecycle creates `SharedStorage`, spawns plain
+  `*_loop(shared, config)` workers, awaits readiness, supervises, and shuts down.
 
 Do not silently change HDF5 meanings in place. Add fields compatibly and keep
 old episodes readable. Readers should tolerate older optional datasets.
@@ -181,14 +201,14 @@ Choose checks according to risk and report exactly what was and was not run:
 
 1. For documentation/config-only edits, inspect the diff and verify referenced
    paths and commands.
-2. For pure Python helpers, add or run focused deterministic tests without SDKs.
-3. For dtype, ring, timing, or recording changes, test round trips, shapes,
+2. For pure Python helpers, run focused deterministic checks without SDKs.
+3. For dtype, ring, timing, or recording changes, check round trips, shapes,
    units, boundary values, old-format reads, and cleanup of shared memory/files.
 4. For process changes, validate startup failure, normal shutdown, worker death,
    heartbeat timeout, sticky fault, and e-stop paths with mocks where possible.
 5. Hardware validation is a separate, explicitly authorized step. Provide a
    concise manual checklist rather than claiming hardware behavior from static
-   or mocked tests.
+   or mocked checks.
 
 Before finishing, inspect `git diff` and `git status --short`. Do not overwrite,
 revert, format, or include unrelated pre-existing modifications.

@@ -1,0 +1,3 @@
+# Example: keep experiment files small and record only deliberate deviations.
+policy:
+  max_record_duration_s: 90.0
