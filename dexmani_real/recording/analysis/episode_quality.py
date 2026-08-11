@@ -5,7 +5,7 @@ API: ``EpisodeQuality(episode_dir)`` context manager with ``.assess()``, ``.heal
 ``.validate()``, ``.filter()`` methods.  Also provides convenience functions
 ``assess_episode()``, ``check_episode_health()``, and ``batch_assess()``.
 
-CLI: ``python -m dexmani_real.tools.episode_quality {assess,health,filter,validate} ...``
+CLI: ``python -m dexmani_real.recording.analysis.episode_quality {assess,health,filter,validate} ...``
 """
 
 from __future__ import annotations

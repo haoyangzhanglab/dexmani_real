@@ -1,226 +1,170 @@
-# AGENTS.md — DexMani Real
+# AGENTS.md — DexMani Real Working Contract
 
-This file defines the repository-wide working agreement for coding agents. It
-applies to every file below the repository root. If a deeper `AGENTS.md` is
-added later, its instructions take precedence for that subtree.
+This is the repository-wide contract for coding agents. It applies below the
+repository root unless a deeper `AGENTS.md` overrides it. Read this file before
+editing; use [README.md](README.md) as the file-by-file project map and
+`CLAUDE.md` as the implementation navigation guide.
 
-## Project purpose
+## 1. Fast start
 
-DexMani Real is a Python 3.10 robotics system for VR teleoperation and data
-collection with an xArm7 (7 DoF), an XHand (12 DoF), a Quest headset, and an
-Intel RealSense L515. The canonical runtime has five control/device workers;
-recording adds a sixth RecorderIO worker:
-
-```text
-camera ───────────────┐
-VR ──────────────────┤
-                     v
-policy ──arm queue──> arm
-   │
-   └──hand ring─────> hand
-
-arm/hand/camera/VR ──shared-memory state──> policy
-policy ──aligned sample ring──> RecorderIO ──> HDF5 episode (schema v15)
-```
-
-The thin main process creates shared storage, starts workers, performs bounded
-read-only readiness preflight, supervises health, and shuts workers down.
-Mapping, command, and recording decisions belong in workers or domain modules,
-not in the entry point.
-
-## Source map
-
-- `examples/real/collect_teleop.py`, `deploy_policy.py`: thin canonical CLI
-  entry points for teleoperation/data collection and learned-policy deployment.
-- `examples/real/keyboard_teleop_real.py`: arm-oriented keyboard teleoperation.
-- `examples/real/calibrate_camera.py`, `calibrate_vr_heading.py`: thin
-  calibration CLIs; implementation lives in `dexmani_real/calibration/`.
-- `examples/real/diagnose_realsense.py`, `diagnose_pointcloud.py`,
-  `diagnose_xhand.py`: bounded hardware diagnostics backed by
-  `dexmani_real/diagnostics/`. The older diagnostic names are compatibility
-  entry points only.
-- `examples/real/replay_episode.py`: dry-run inspection, certified replay, and
-  consistency checks. `replay_traj.py` is a compatibility entry point.
-- `dexmani_real/config/defaults.py`: source of truth for numeric defaults.
-- `dexmani_real/ipc/schema.py`: dependency-neutral source of truth for every
-  cross-process NumPy dtype and fixed-size protocol payload.
-- `dexmani_real/shm/shared_storage.py`: cross-process data plane, ring/queue
-  allocation, flags, and readiness events.
-- `dexmani_real/shm/ring_buffer.py`: camera shared-memory ring.
-- `dexmani_real/shm/robot_ring.py`: seqlock control/state ring primitive.
-- `dexmani_real/teleop/loop.py`: VR mapping, IK, command production, safety
-  gating, and ownership of recording. `policy/vr_teleop_policy.py` is a
-  compatibility import.
-- `dexmani_real/teleop/experiment.py`: teleoperation worker lifecycle,
-  readiness/health preflight, supervision, and shutdown.
-- `dexmani_real/policy/spec.py`, `learned_coordinator.py`: learned-policy
-  contract and causal action scheduling.
-- `dexmani_real/policy/deployment.py`: validated `PolicySpec` deployment
-  lifecycle; inference runs in an isolated worker.
-- `dexmani_real/replay/`: episode loading, preflight CLI, live worker session,
-  command execution, and metrics.
-- `dexmani_real/runtime/supervisor.py`: readiness, heartbeat/process
-  supervision, and verified shutdown.
-- `dexmani_real/robot/arm_loop.py`: xArm Mode 6 servo loop and arm state producer.
-- `dexmani_real/robot/hand_process.py`: XHand servo loop and hand state producer.
-- `dexmani_real/robot/safety.py`: `DISARMED/ARMED/RUNNING/FAULT` transitions.
-- `dexmani_real/planning/`: FK, IK, collision checking, pose and path utilities.
-- `dexmani_real/recording/`: timestamp alignment and HDF5 schema v15 I/O.
-- `dexmani_real/sensor/`: RealSense, point-cloud, and VR receiver processes.
-- `dexmani_real/teleop/`: arm mapping, hand retargeting, keyboard and audio UX.
-- `dexmani_real/tools/`: episode quality analysis and visualization CLIs.
-- `assets/`: URDF/SRDF meshes, retargeting configuration, and audio prompts.
-- `CLAUDE.md`: detailed architecture notes and operational background. Keep it
-  aligned when an architectural change makes its statements stale.
-
-## Environment and commands
-
-Run commands from the repository root. The expected environment is conda
-`real_robot`, Python 3.10, with the repository on `PYTHONPATH`:
+Work from the repository root. Before editing, inspect the current worktree and
+the smallest relevant call path; do not assume a clean tree or reformat unrelated
+files.
 
 ```bash
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate real_robot
-export PYTHONPATH=.
-```
-
-`pyproject.toml` is the sole packaging configuration. Its dependencies cover
-the portable Python layer, but `pip install -e .` does not provision the native
-planning stack, CUDA packages, device SDKs, or a working robot environment.
-Those remain managed by the `real_robot` conda environment. Important external
-dependencies include mplib, Pinocchio, nlopt, pyrealsense2, Open3D, PyTorch,
-rerun, dex-retargeting, and the vendor xArm/XHand SDKs.
-
-Useful non-hardware validation commands:
-
-```bash
+git status --short
+rg -n "<symbol-or-config-key>" dexmani_real examples
 conda run -n real_robot python -m compileall -q dexmani_real examples/real
 ```
 
-This personal research repository does not require a project-level linter,
-formatter, type checker, or test runner. Keep edits consistent with nearby
-code, avoid repository-wide formatting churn, and prefer small deterministic
-offline checks for the behavior being changed.
+- Target environment: conda `real_robot`, Python 3.10, `PYTHONPATH=.`.
+- `pyproject.toml` is the only packaging configuration. Native planning, CUDA,
+  device-SDK, and robot dependencies are managed by the conda environment.
+- This repository has no conventional unit-test suite. Treat any `test_*.py`
+  under `examples/real/` as an interactive hardware program, never as a test.
+- Prefer a small deterministic offline check that exercises the changed pure
+  helper, dtype, reader, or lifecycle branch.
 
-There is no conventional automated unit-test suite. Files named
-`examples/real/test_*.py` are interactive hardware diagnostics, not automated
-tests. Never run them merely because their names begin with `test_`.
+## 2. System model
 
-## Hardware safety boundary
+DexMani Real is a VR teleoperation, data collection, learned-policy deployment,
+and replay system for an xArm7 (7 DoF), XHand (12 DoF), Quest, and RealSense
+L515.
 
-Treat every script under `examples/real/` as potentially hardware-affecting.
-Do not run teleoperation, replay, calibration, RealSense, or XHand examples
-without explicit user authorization and confirmation that the workspace is
-clear and the hardware is ready. In particular, do not execute:
+```text
+camera / VR / arm / hand ──shared-memory state──► teleop or learned policy
+                                                     │
+                       arm queue ◄──────────────────┼──► hand command ring
+                                                     │
+                                         aligned sample ring
+                                                     ▼
+                                            RecorderIO ──► HDF5 episode v15
+```
 
-- the canonical or keyboard teleoperation entry points;
-- trajectory replay or homing routines;
-- camera/VR calibration routines that write calibration JSON;
-- direct vendor SDK examples or commands that connect to the robot;
-- ad-hoc imports when module import itself may initialize a device SDK.
+The main/lifecycle process resolves immutable configuration, creates
+`SharedStorage`, performs bounded read-only readiness checks, supervises worker
+health, and shuts down. It does not map VR poses, publish actions, or choose
+recording samples.
 
-Static inspection, compilation, and focused offline checks with fakes or mocks
-are acceptable. Do not weaken a safety check merely to make an offline check
-pass.
+### Task router
 
-## Architectural invariants
+Start with the source of truth in this table, then follow only its direct
+producers and consumers.
 
-Preserve these unless the user explicitly requests an architectural redesign:
+| If the task changes… | Start here | Then audit |
+|---|---|---|
+| Numeric default or runtime override | `config/defaults.py`, `config/runtime.py` | Derived rates, buffer capacities, timeouts, metadata, CLI overrides |
+| Cross-process state/action layout | `ipc/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
+| Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers, readiness, heartbeat, shutdown |
+| VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
+| Learned-policy behavior | `policy/spec.py`, `policy/learned_coordinator.py` | inference worker, observation sources, action protocol, deployment lifecycle |
+| Arm/hand safety or servo behavior | `robot/arm_loop.py`, `robot/hand_process.py` | `robot/safety.py`, action protocol, supervisor, homing and e-stop paths |
+| FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp, replay preflight, collision certificates |
+| Episode schema or quality rule | `recording/` | reader, analysis, replay consumers, schema marker, old-format behavior |
+| Replay behavior | `replay/episode.py`, `replay/preflight.py` | certificate binding, session/runner, metrics, live safety path |
+| Calibration or diagnostics | `calibration/` or `diagnostics/` | explicit write/confirmation path and operational JSON compatibility |
+| CLI surface | `examples/real/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
 
-1. All inter-process payloads travel through `SharedStorage`; processes do not
-   call one another or share live SDK objects.
-2. Only arm and hand worker processes import/use their respective vendor SDKs.
-   Keep SDK imports lazy where needed so the main process can import offline.
-3. Policy owns the episode/grid/sample decisions and one coordinator clock
-   domain for state, action, VR, and camera alignment. `RecorderIO` owns only
-   serialization, verification, and transactional publication.
-4. Policy recording is grid-aligned at `1 / control_hz` (normally 16 Hz). Do
-   not replace this with arrival-time sampling.
-5. The arm action queue is ordered and bounded (`maxsize=2`); its backpressure
-   is intentional. The hand command ring is latest-wins by design.
-6. xArm Mode 6 firmware performs trajectory smoothing. Do not add arm-side
-   interpolation; double interpolation can produce overshoot and C24 faults.
-7. Shared control/state rings use seqlocks. `get_last_k(k)` returns verified
-   frames oldest-first, may return fewer than `k`, and rejects `k > maxlen`.
-8. `is_running`, `is_recording`, `error_state`, and `estop_request` remain
-   simple shared flags. `safety_state` alone is the `SafetyState` enum.
-9. `error_state` is a sticky latch. Heartbeat timestamps use
-   `time.monotonic()`, not wall-clock time.
-10. Main owns `DISARMED <-> ARMED`, transitions to `FAULT`, and shutdown;
-    policy owns `ARMED <-> RUNNING`; arm and hand only gate behavior on state.
-11. The firmware is the final safety backstop. Application checks protect
-    command validity, recovery behavior, data quality, and coordinated stop.
-12. Cross-process structures are NumPy dtypes/scalars or other explicitly
-    structured values—not arbitrary mutable Python object graphs.
+## 3. Non-negotiable architecture
 
-## Cross-module change checklist
+Preserve these unless the user explicitly requests an architectural redesign.
 
-Changes to shared formats have a wider blast radius than their defining file:
+1. `SharedStorage` is the only cross-process data plane. Processes do not call
+   each other or exchange live SDK objects/mutable object graphs.
+2. `ipc/schema.py` owns fixed-shape NumPy payload definitions. Cross-process
+   values must stay structured and shape/finite-validated at their boundary.
+3. Hardware SDK instances are local to their owning device worker/driver. Do
+   not add xArm/XHand SDK calls to main, policy, recorder, or replay code; never
+   share a live SDK instance across processes.
+4. Teleoperation or the learned-policy coordinator owns control-grid, action,
+   and episode/sample decisions. `RecorderIO` only serializes, verifies, and
+   transactionally publishes what it receives.
+5. Recording is grid-aligned to `1 / control_hz` (normally 16 Hz), never
+   arrival-time sampled.
+6. The arm queue is ordered and intentionally bounded (`maxsize=2`). The hand
+   command ring is intentionally latest-wins.
+7. Shared control/state rings use seqlocks. `get_last_k(k)` is verified,
+   oldest-first, may return fewer than `k`, and rejects `k > maxlen`.
+8. `is_running`, `is_recording`, `error_state`, and `estop_request` are simple
+   shared flags. Only `safety_state` stores the `SafetyState` enum.
+9. `error_state` is sticky; heartbeats use `time.monotonic()`, never wall time.
+10. Main owns `DISARMED ↔ ARMED`, transition to `FAULT`, and shutdown. Policy
+    owns `ARMED ↔ RUNNING`; arm/hand workers only gate behavior on state.
+11. xArm Mode 6 firmware performs arm trajectory smoothing. Do not add
+    application-side arm interpolation; it can cause overshoot and C24 faults.
+12. Firmware is the final safety backstop. Application checks protect command
+    validity, recovery, data quality, and coordinated stop—they do not replace
+    firmware limits.
 
-- Arm/hand state field: update the dtype in `ipc/schema.py`, documentation
-  dataclass in `robot/types.py`, producer write, policy read, and recording path.
-- Ring or queue: update `SharedStorage` creation/cleanup, producer, consumer,
-  readiness/heartbeat handling where applicable, and architecture docs.
-- Recording dataset/schema: update recorder, reader, quality tool,
-  visualization/replay consumers, schema marker, and backward compatibility.
-- IK or collision behavior: inspect both planning code and policy fallback,
-  hold-on-failure, delta-clamp, and frame-quality flags.
-- Rate/default: change `config/defaults.py` first, then audit all derived
-  durations, buffer sizes, heartbeat thresholds, recorder metadata, and CLIs.
-- Robot state transition or fault behavior: audit main supervisor, policy,
-  arm loop, hand loop, shutdown, and e-stop paths together.
-- New entry point: keep the `examples/real/` file as a thin CLI forwarding to a
-  domain module. The domain lifecycle creates `SharedStorage`, spawns plain
-  `*_loop(shared, config)` workers, awaits readiness, supervises, and shuts down.
+## 4. Hardware and operational safety
 
-Do not silently change HDF5 meanings in place. Add fields compatibly and keep
-old episodes readable. Readers should tolerate older optional datasets.
+Every program below `examples/real/` can affect hardware. Do **not** run
+teleoperation, policy deployment, replay, homing, calibration, RealSense, or
+XHand diagnostics without explicit user authorization and confirmation that the
+workspace is clear and the hardware is ready. Do not use a module import as a
+shortcut when it might initialize a device SDK.
 
-## Coding conventions
+Allowed without that authorization: static inspection, compilation, and focused
+offline tests with fakes/mocks. Do not weaken safety checks merely to make an
+offline check pass.
 
-- Use Python 3.10+ syntax and `from __future__ import annotations` in new modules.
-- Use dataclasses for configuration/state and NumPy arrays for numeric payloads.
-- Use `snake_case`, `PascalCase`, and `UPPER_SNAKE_CASE` conventionally.
-- Put `logger = get_logger(__name__)` after imports and before definitions.
-- Log caught operational exceptions with context and `exc_info=True`; do not
-  silently swallow faults in control, hardware, IPC, or recording paths.
-- Use `field(default_factory=...)` for mutable dataclass values.
-- Include units in names (`_rad`, `_deg`, `_m`, `_s`, `_hz`) and preserve the
-  repository convention that unsuffixed angles are radians.
-- Validate array shapes and finite values at process/module boundaries. Avoid
-  in-place mutation of state/action arrays after publication.
-- Keep control loops free of blocking file, camera, network, and UI operations.
-- Prefer small pure helpers for math and transformation logic; they are easier
-  to validate offline than process loops.
-- Avoid broad refactors while fixing a focused issue, especially in safety and
-  timing code. Preserve unrelated user changes in a dirty worktree.
+Operational data is not disposable test data:
 
-## Validation strategy
+- `dexmani_real/config/*.json` carries calibration/frame conventions.
+- Recordings, logs, videos, and temporary episode directories may be large and
+  safety-relevant. Do not delete or rewrite them without an explicit target.
+- The xArm default address is `192.168.1.111`; never probe it without approval.
+- Quest HTS uses TCP 8000; the L515 should use a direct USB 3 connection.
 
-Choose checks according to risk and report exactly what was and was not run:
+## 5. Change playbooks
 
-1. For documentation/config-only edits, inspect the diff and verify referenced
-   paths and commands.
-2. For pure Python helpers, run focused deterministic checks without SDKs.
-3. For dtype, ring, timing, or recording changes, check round trips, shapes,
-   units, boundary values, old-format reads, and cleanup of shared memory/files.
-4. For process changes, validate startup failure, normal shutdown, worker death,
-   heartbeat timeout, sticky fault, and e-stop paths with mocks where possible.
-5. Hardware validation is a separate, explicitly authorized step. Provide a
-   concise manual checklist rather than claiming hardware behavior from static
-   or mocked checks.
+Use the smallest vertical slice that fully preserves a contract.
 
-Before finishing, inspect `git diff` and `git status --short`. Do not overwrite,
-revert, format, or include unrelated pre-existing modifications.
+| Change | Required impact check |
+|---|---|
+| Add/change arm or hand state | dtype → documentation dataclass → worker write → policy read → recording path → reader/analysis if persisted |
+| Add/change a recording dataset | recorder → reader → analysis → replay consumer → schema marker → backward-compatible old reader |
+| Add/change a ring or queue | `SharedStorage` create/close → producer → consumer → readiness/heartbeat → failure/shutdown behavior |
+| Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
+| Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
+| Change safety/fault transition | supervisor + policy + arm + hand + shutdown + e-stop, including sticky-fault behavior |
+| Add an entry point | Thin `examples/real/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
-## Operational notes
+Do not silently change HDF5 meaning in place. Add fields compatibly and keep
+older episodes readable; readers must tolerate optional legacy datasets.
 
-- xArm default address is `192.168.1.111`; do not probe it without permission.
-- Quest HTS traffic uses TCP port 8000; USB operation commonly needs
-  `adb reverse tcp:8000 tcp:8000`.
-- The L515 should be directly attached over USB 3.0. A stalled stream can look
-  healthy if frames are forward-filled, so freshness must be measured at source.
-- Calibration files under `dexmani_real/config/*.json` are operational data.
-  Preserve coordinate-frame conventions and do not regenerate them casually.
-- Generated recordings, logs, videos, and temporary episode directories can be
-  large or safety-relevant. Do not delete or rewrite them without explicit scope.
+## 6. Implementation rules
+
+- Use Python 3.10+ syntax and `from __future__ import annotations` in new
+  modules. Use dataclasses for configuration/state and NumPy arrays for numeric
+  payloads.
+- Keep units in names (`_rad`, `_deg`, `_m`, `_s`, `_hz`); unsuffixed angles are
+  radians. Validate shapes and finite values at module/process boundaries.
+- Put `logger = get_logger(__name__)` after imports. Log caught operational
+  exceptions with context and `exc_info=True`; never silently swallow a control,
+  hardware, IPC, or recording fault.
+- Use `field(default_factory=...)` for mutable dataclass fields. Do not mutate a
+  published state/action array in place.
+- Keep control loops free of blocking file, camera, network, or UI work. Put
+  pure math and transforms in small helpers that can be tested offline.
+- Avoid broad refactors while addressing a focused issue. Preserve unrelated
+  changes in a dirty worktree.
+
+## 7. Finish definition
+
+Before handing off:
+
+1. Inspect the focused diff and `git status --short`; do not overwrite or
+   include unrelated modifications.
+2. Verify changed paths/commands and run the least risky relevant offline check.
+3. Run `conda run -n real_robot python -m compileall -q dexmani_real examples/real`
+   for Python-source changes unless a narrower check is more appropriate.
+4. For safety/process changes, cover startup failure, normal shutdown, worker
+   death, heartbeat timeout, sticky fault, and e-stop with fakes/mocks where
+   feasible.
+5. Report exactly what was and was not run. Hardware validation is a separate,
+   explicitly authorized manual step.
+
+Update `README.md` when the file map or user-facing architecture changes, and
+update `CLAUDE.md` when implementation routing, ownership, or a key invariant
+changes.

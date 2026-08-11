@@ -5,10 +5,10 @@ Supports legacy single-HDF5 and v13–v15 directory episodes
 (``data.h5`` + ``depth.h5`` + ``pointcloud.h5`` + ``rgb.mp4``) episodes.
 
 Usage:
-  python -m dexmani_real.tools.visualize_episode episode.h5
-  python -m dexmani_real.tools.visualize_episode episode_dir/
-  python -m dexmani_real.tools.visualize_episode episode.h5 --info
-  python -m dexmani_real.tools.visualize_episode episode.h5 --max-frames 500
+  python -m dexmani_real.recording.analysis.visualize_episode episode.h5
+  python -m dexmani_real.recording.analysis.visualize_episode episode_dir/
+  python -m dexmani_real.recording.analysis.visualize_episode episode.h5 --info
+  python -m dexmani_real.recording.analysis.visualize_episode episode.h5 --max-frames 500
 """
 
 from __future__ import annotations

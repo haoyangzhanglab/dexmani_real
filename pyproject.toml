@@ -24,7 +24,7 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dexmani_real*"]
-exclude = ["dexmani_real.testing*", "tests*", "examples*", "assets*", "docs*"]
+exclude = ["tests*", "examples*", "assets*", "docs*"]
 namespaces = false
 
 [tool.setuptools.package-data]
