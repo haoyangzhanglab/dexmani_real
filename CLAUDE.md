@@ -28,7 +28,7 @@ entry points, not test fixtures.
 | Change a runtime value | `config/defaults.py` | `config/runtime.py`, every derived duration/capacity/metadata field |
 | Change a shared field or command | `utils/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
 | Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → action protocol → samples |
-| Change learned deployment | `policy/deployment.py`, `policy/spec.py` | inference process → coordinator → action protocol |
+| Change learned deployment | `examples/deploy_policy.py`, `policy/spec.py` | inference process → coordinator → action protocol |
 | Change an arm/hand action | `policy/action_protocol.py` | arm/hand worker ACKs, `robot/safety.py`, supervisor |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, safety gate |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
@@ -156,7 +156,7 @@ child and retain backend-created action target/expiry times—do not retime stal
 chunks into validity.
 
 The default teleoperation `SharedStorage` does not allocate inference rings.
-Only `policy/deployment.py` may opt into that experimental capability.
+Only `examples/deploy_policy.py` (via ``SharedStorageConfig.from_runtime(..., enable_inference=True)``) may opt into that experimental capability.
 
 ### Episode write, read, analyse, replay
 
@@ -246,9 +246,9 @@ aligned samples → RecorderIO → temporary episode + stream verification
 
 | Entry point | Domain owner | Default safety posture |
 |---|---|---|
-| `examples/collect_teleop.py` | `teleop/experiment.py` | Hardware control; explicit authorization required |
-| `examples/deploy_policy.py` | `policy/deployment.py` | Hardware control; spec/hash/preflight gated |
-| `examples/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` | Hardware control; measured hand feedback by default |
+| `examples/collect_teleop.py` | — | Hardware control; self-contained script; explicit authorization required |
+| `examples/deploy_policy.py` | — | Hardware control; self-contained script; spec/hash/preflight gated |
+| `examples/keyboard_teleop.py` | — | Hardware control; self-contained script; measured hand feedback by default |
 | `examples/replay_episode.py` | `replay/episode.py` | Dry-run by default; `--live` reruns dense preflight |
 | `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |
 | `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |

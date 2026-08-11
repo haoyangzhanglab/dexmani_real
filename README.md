@@ -81,9 +81,9 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 
 | 使用场景 | 入口 | 主要调用链 |
 |---|---|---|
-| VR 采集 | `examples/collect_teleop.py` | `teleop/experiment.py` → `teleop/loop.py` → `planning/`、`robot/`、`recording/` |
-| 键盘控制 | `examples/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` → `keyboard.py` → 安全动作协议 |
-| 实验性学习策略 | `examples/deploy_policy.py` | `policy/deployment.py` → `inference_process.py` → `learned_coordinator.py` |
+| VR 采集 | `examples/collect_teleop.py` | `teleop/loop.py` → `planning/`、`robot/`、`recording/`（实验生命周期自包含在 examples 中）|
+| 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 安全动作协议 |
+| 实验性学习策略 | `examples/deploy_policy.py` | 自包含入口 → `inference_process.py` → `learned_coordinator.py`（部署生命周期自包含在 examples 中）|
 | Episode 回放 | `examples/replay_episode.py` | `replay/episode.py` → `preflight.py` → `session.py` / `runner.py` |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | 无额外包装入口 | `python -m dexmani_real.recording.analysis.episode_quality` 或 `visualize_episode` |
@@ -116,7 +116,7 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`dexmani_real`
 
-以下清单覆盖当前包内的 **109 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
+以下清单覆盖当前包内的 **92 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
 
 ### 根包
 
@@ -155,7 +155,6 @@ python -m compileall -q dexmani_real examples
 |---|---|
 | `policy/__init__.py` | 提供延迟加载的旧式 VR policy 兼容导入，避免离线主进程提前载入遥操作代码。 |
 | `policy/action_protocol.py` | 定义 prepare/commit/ack 协议、动作安全门、反馈校验、动作发布器与因果关节动作调度器。 |
-| `policy/deployment.py` | 实验性学习策略部署 CLI/生命周期：显式启用 inference IPC，解析 spec 并监督推理与执行 worker。 |
 | `policy/inference_process.py` | 隔离推理 worker，加载 adapter，编解码候选动作，并验证模型输出是否满足策略契约。 |
 | `policy/learned_coordinator.py` | 以单一时钟协调 observation、推理结果、动作执行和退出前 hold 的学习策略控制环。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
@@ -213,6 +212,7 @@ python -m compileall -q dexmani_real examples
 | `runtime/__init__.py` | 导出组件阶段、故障码和退出原因等运行时状态枚举。 |
 | `runtime/processes.py` | 提供 spawn 上下文、进程退出报告，以及可验证的停止/回收/共享内存关闭流程。 |
 | `runtime/status.py` | 定义跨模块使用的组件阶段、故障和退出原因的整数枚举。 |
+| `runtime/session.py` | 提供 `ManagedProcessGroup`，封装进程组的启动、关闭与共享资源清理。 |
 | `runtime/supervisor.py` | 完成 worker 就绪等待、心跳/进程监督、健康摘要和协调关闭。 |
 
 ### `sensor/` — 相机、点云与 VR 接收
@@ -245,11 +245,9 @@ python -m compileall -q dexmani_real examples
 | `teleop/config.py` | 汇集遥操作控制环所需的强类型配置。 |
 | `teleop/control_state.py` | 表示控制 hold 与回零交接状态，统一记录控制环暂停原因。 |
 | `teleop/episode_samples.py` | 将因果状态、动作确认、VR/相机数据对齐为记录帧，并处理 start/stop/held 样本。 |
-| `teleop/experiment.py` | VR 采集实验 CLI/生命周期：创建共享存储、启动 worker、预检、监督并有序退出。 |
 | `teleop/hand_control.py` | 从手部重定向结果生成平滑、限幅、可回零的 XHand 指令。 |
 | `teleop/hand_retarget.py` | 校验手部 landmarks，并提供启发式 XHand 和 TAG 优化两类手部重定向器。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量。 |
-| `teleop/keyboard_experiment.py` | 键盘遥操作实验的 worker 编排、反馈预检、控制循环、故障与退出处理。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
 | `teleop/recording_session.py` | 处理退出时的录制决策，并构建带运行时/资源溯源的 episode 启动元数据。 |
 | `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、hold 后反馈、无碰撞转移、接触停滞与回零流程。 |
@@ -274,13 +272,13 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`examples`
 
-`examples/` 目前有 **9 个 Python 文件**；它们全都是薄 CLI，只负责把仓库根加入 `sys.path` 并调用相应领域模块的 `main()`。业务逻辑不应继续堆放在这些文件中。
+`examples/` 目前有 **9 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
 
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
-| `examples/collect_teleop.py` | `teleop.experiment.main` | 标准 VR 遥操作与数据采集入口；会启动真实设备 worker。 |
-| `examples/deploy_policy.py` | `policy.deployment.main` | 实验性学习策略入口；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
-| `examples/keyboard_teleop_real.py` | `teleop.keyboard_experiment.main` | 以键盘驱动机械臂、默认使用实测 XHand 反馈的入口；硬件相关。 |
+| `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
+| `examples/deploy_policy.py` | — | 实验性学习策略入口；部署生命周期自包含；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
+| `examples/keyboard_teleop.py` | — | 以键盘驱动机械臂、默认使用实测 XHand 反馈的自包含入口；硬件相关。 |
 | `examples/replay_episode.py` | `replay.episode.main` | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |

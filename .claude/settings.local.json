@@ -201,7 +201,8 @@
       "Bash(python -c \"from dexmani_real.policy import PolicyConfig, policy_loop; print\\('policy OK'\\)\")",
       "Bash(python -c \"from dexmani_real.recording import EpisodeRecorder; print\\('recording OK'\\)\")",
       "Bash(rg *)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(echo \"EXIT_CODE=$?\")"
     ]
   }
 }

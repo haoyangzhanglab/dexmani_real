@@ -1,3 +1,1 @@
-"""VR teleoperation — arm/hand mapping, keyboard handler, audio feedback."""
-
-from __future__ import annotations
+"""VR teleoperation — control loop, arm/hand mapping, keyboard handler, hand retargeting, audio feedback, and recording-session management."""
