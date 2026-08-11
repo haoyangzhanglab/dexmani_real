@@ -26,7 +26,7 @@ from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.io_process import RecorderClient
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import SharedStorage, publish_component_metrics, publish_component_status
+from dexmani_real.shm.shared_storage import SharedStorage, publish_component_status
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback, update_motion_gate
 from dexmani_real.teleop.config import TeleopConfig
@@ -613,8 +613,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         while shared.is_running.value and not _sigterm_requested:
             shared.policy_heartbeat_s.value = time.monotonic()
             limiter.wait()
-            publish_component_metrics(shared, "policy", limiter)
-
             if _control_hold.application_pending:
                 _hold_candidate = _control_hold.candidate
                 assert _hold_candidate is not None
@@ -1565,7 +1563,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             stage_timer.mark("rec")
 
     finally:
-        publish_component_metrics(shared, "policy", limiter, interval_s=0.0)
         if recording_active:
             _stop_recording(recorder, True, save=False, shared=shared, reason="policy_shutdown")
         if recorder is not None:

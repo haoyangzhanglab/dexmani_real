@@ -8,17 +8,17 @@ complete file-by-file map.
 ## 1. Sixty-second orientation
 
 DexMani Real controls an xArm7 (7 DoF) and XHand (12 DoF) from Quest VR,
-records HDF5 episodes, can deploy a learned policy, and can certify/replay an
+records HDF5 episodes, can deploy an experimental learned policy, and can replay an
 episode. Python 3.10 runs in conda `real_robot`; commands run from the repo root
 with `PYTHONPATH=.`.
 
 ```bash
 git status --short
 rg -n "<symbol-or-config-key>" dexmani_real examples
-conda run -n real_robot python -m compileall -q dexmani_real examples/real
+conda run -n real_robot python -m compileall -q dexmani_real examples
 ```
 
-Do not run `examples/real/` without explicit hardware authorization. They are
+Do not run `examples/` without explicit hardware authorization. They are
 entry points, not test fixtures.
 
 ### Task-to-code router
@@ -142,7 +142,7 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
   emitted per `control_hz` grid tick (normally 16 Hz), not per sensor arrival.
 - Mode 6 firmware smooths arm targets. Application-side interpolation is unsafe.
 
-### Learned-policy deployment
+### Experimental learned-policy deployment
 
 ```text
 PolicySpec YAML + resource hashes → deployment preflight → isolated inference
@@ -154,6 +154,9 @@ resources and SHA-256s. `action.dt_s` must equal `1 / control_hz`; a live run
 also requires `hardware_deployable: true`. Keep model import in the inference
 child and retain backend-created action target/expiry times—do not retime stale
 chunks into validity.
+
+The default teleoperation `SharedStorage` does not allocate inference rings.
+Only `policy/deployment.py` may opt into that experimental capability.
 
 ### Episode write, read, analyse, replay
 
@@ -169,8 +172,8 @@ aligned samples → RecorderIO → temporary episode + stream verification
 - `recording/analysis/episode_quality.py` and
   `recording/analysis/visualize_episode.py` are
   offline consumers under `recording/analysis/`.
-- `replay/episode.py` defaults to dry-run. Live replay requires an explicit,
-  fail-closed preflight certificate bound to trajectory, models, and scene.
+- `replay/episode.py` defaults to dry-run. Live replay reruns fail-closed
+  provenance and dense geometry checks immediately before worker startup.
 
 ## 5. Edit recipes
 
@@ -200,8 +203,8 @@ aligned samples → RecorderIO → temporary episode + stream verification
 1. Keep v15 dataset meanings stable; add optional fields compatibly.
 2. Update producer, reader, offline quality/visualization, replay loader, and
    provenance/schema marker together.
-3. For replay, verify certificate binding and explicit hand mode before worker
-   startup. Do not weaken a check to make dry-run or a fixture pass.
+3. For replay, verify provenance, dense geometry and explicit hand mode before
+   worker startup. Do not weaken a check to make dry-run or a fixture pass.
 
 ### Adding a worker or CLI
 
@@ -209,7 +212,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
    function.
 2. Extend the owning lifecycle module for storage, spawn, readiness, heartbeat,
    shutdown, and failure behavior.
-3. Keep the `examples/real/` script as a one-import `main()` wrapper.
+3. Keep the `examples/` script as a one-import `main()` wrapper.
 4. Update README’s project map and this guide when ownership/routing changes.
 
 ## 6. High-value conventions and footguns
@@ -243,15 +246,15 @@ aligned samples → RecorderIO → temporary episode + stream verification
 
 | Entry point | Domain owner | Default safety posture |
 |---|---|---|
-| `examples/real/collect_teleop.py` | `teleop/experiment.py` | Hardware control; explicit authorization required |
-| `examples/real/deploy_policy.py` | `policy/deployment.py` | Hardware control; spec/hash/preflight gated |
-| `examples/real/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` | Hardware control; measured hand feedback by default |
-| `examples/real/replay_episode.py` | `replay/episode.py` | Dry-run by default; `--live` is certificate-gated |
-| `examples/real/calibrate_camera.py` | `calibration/camera_experiment.py` | Hardware/data-writing operation |
-| `examples/real/calibrate_vr_heading.py` | `calibration/vr_heading_experiment.py` | Hardware read; transform write is gated |
-| `examples/real/diagnose_realsense.py` | `diagnostics/realsense.py` | Bounded device diagnostic |
-| `examples/real/diagnose_pointcloud.py` | `diagnostics/pointcloud.py` | Inspection by default; explicit confirmation for calibration write |
-| `examples/real/diagnose_xhand.py` | `diagnostics/xhand.py` | Read-only hand-state diagnostic |
+| `examples/collect_teleop.py` | `teleop/experiment.py` | Hardware control; explicit authorization required |
+| `examples/deploy_policy.py` | `policy/deployment.py` | Hardware control; spec/hash/preflight gated |
+| `examples/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` | Hardware control; measured hand feedback by default |
+| `examples/replay_episode.py` | `replay/episode.py` | Dry-run by default; `--live` reruns dense preflight |
+| `examples/calibrate_camera.py` | `calibration/camera_experiment.py` | Hardware/data-writing operation |
+| `examples/calibrate_vr_heading.py` | `calibration/vr_heading_experiment.py` | Hardware read; transform write is gated |
+| `examples/diagnose_realsense.py` | `diagnostics/realsense.py` | Bounded device diagnostic |
+| `examples/diagnose_pointcloud.py` | `diagnostics/pointcloud.py` | Inspection by default; explicit confirmation for calibration write |
+| `examples/diagnose_xhand.py` | `diagnostics/xhand.py` | Read-only hand-state diagnostic |
 
 ## 8. Completion checklist
 

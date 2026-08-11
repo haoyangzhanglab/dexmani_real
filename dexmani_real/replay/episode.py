@@ -1,4 +1,4 @@
-"""Offline episode inspection and certificate-gated hardware replay.
+"""Offline episode inspection and fail-closed hardware replay.
 
 Live commands reach arm/hand workers only through SharedStorage and the
 geometry-aware prepare/commit protocol. Dry-run is the default.
@@ -12,19 +12,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.preflight import PreflightCertificate, create_preflight_certificate
 from dexmani_real.replay.data import TrajectoryData, load_trajectory
 from dexmani_real.replay.data import resolve_episode_path as _resolve_episode_path
-from dexmani_real.replay.preflight import (
-    LiveReplayAuthorization,
-    modeled_hand_actions,
-    preflight_model_paths,
-    replay_runtime_hash,
-    require_explicit_hand_mode,
-)
+from dexmani_real.replay.preflight import replay_runtime_hash
 from dexmani_real.replay.runner import ReplayStatus, TrajectoryReplayer
 from dexmani_real.replay.session import LiveReplayConfig, run_live_replay
 from dexmani_real.utils.log import get_logger
@@ -32,7 +23,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_OUTPUT_DIR = "replay_results"
-_PREFLIGHT_MAX_JOINT_STEP_RAD = 0.02
 
 
 def _positive_finite_float(value: str) -> float:
@@ -56,70 +46,6 @@ class ReplayRuntimeSelection:
     joint_speed_deg_s: float
     acceleration_source: str
     config_sha256: str
-
-
-def _build_preflight_certificate(
-    traj: "TrajectoryData",
-    *,
-    runtime: ResolvedRuntimeConfig,
-    replay_runtime_sha256: str,
-    no_hand: bool,
-) -> PreflightCertificate:
-    runtime_arm = runtime.arm
-    runtime_hand = runtime.hand
-    runtime_policy = runtime.policy
-    workspace = np.array(
-        [
-            [runtime_policy.workspace.x_min, runtime_policy.workspace.x_max],
-            [runtime_policy.workspace.y_min, runtime_policy.workspace.y_max],
-            [runtime_policy.workspace.z_min, runtime_policy.workspace.z_max],
-        ],
-        dtype=np.float64,
-    )
-    model_dir = ASSET_DIR / "robots" / "xhand"
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=str(model_dir / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(model_dir / "xarm7_xhand.srdf"),
-            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
-            workspace_bounds=workspace,
-        ),
-        hand_dof=True,
-        static_boxes=tuple(runtime.environment.static_boxes),
-    )
-    modeled_hand = modeled_hand_actions(
-        traj,
-        no_hand=no_hand,
-        home_qpos_rad=np.deg2rad(np.asarray(runtime_hand.home_qpos_deg, dtype=np.float64)),
-    )
-
-    def table_check(arm_start: np.ndarray, arm_end: np.ndarray, hand_start: np.ndarray, hand_end: np.ndarray) -> bool:
-        max_delta = max(float(np.max(np.abs(arm_end - arm_start))), float(np.max(np.abs(hand_end - hand_start))))
-        steps = max(1, int(np.ceil(max_delta / _PREFLIGHT_MAX_JOINT_STEP_RAD)))
-        for alpha in np.linspace(0.0, 1.0, steps + 1):
-            arm_qpos = arm_start + alpha * (arm_end - arm_start)
-            hand_qpos = hand_start + alpha * (hand_end - hand_start)
-            planner.collision_model.set_hand_qpos(hand_qpos)
-            lowest_surface_m = planner.collision_model.minimum_hand_frame_z(arm_qpos) - float(
-                runtime_arm.hand_safety_margin_m
-            )
-            if lowest_surface_m < float(runtime_arm.table_z_surface_m):
-                return False
-        return True
-
-    return create_preflight_certificate(
-        source_episode=traj.episode_path,
-        arm_actions=traj.action_arm_joint,
-        hand_actions=modeled_hand,
-        collision_model_paths=preflight_model_paths(),
-        workspace_bounds_m=workspace,
-        resolved_config_sha256=replay_runtime_sha256,
-        transition_check=planner.collision_model.check_transition_collision_free,
-        workspace_check=planner.is_workspace_segment_safe,
-        table_check=table_check,
-        hand_enabled=not no_hand and traj.has_hand,
-        static_boxes=tuple(runtime.environment.static_boxes),
-    )
 
 
 def _resolve_replay_runtime(args: argparse.Namespace, trajectory: TrajectoryData) -> ReplayRuntimeSelection:
@@ -179,43 +105,32 @@ def _run_offline(
         runtime=selection.runtime,
     )
     replayer.validate_offline()
-    if args.write_certificate is not None:
-        require_explicit_hand_mode(trajectory, no_hand=args.no_hand)
-        certificate = _build_preflight_certificate(
-            trajectory,
-            runtime=selection.runtime,
-            replay_runtime_sha256=selection.config_sha256,
-            no_hand=args.no_hand,
-        )
-        path = certificate.write(args.write_certificate)
-        print(f"Preflight certificate: {path}")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate a DexMani trajectory offline or run a certified live replay.",
+        description="Validate a DexMani trajectory offline or run a fail-closed live replay.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Offline inspection is the default; --live is the hardware boundary.
-  python examples/real/replay_episode.py episodes/episode_20260729_213332
+  python examples/replay_episode.py episodes/episode_20260729_213332
 
   # Validate only a bounded prefix
-  python examples/real/replay_episode.py episodes/episode_20260729_213332 --max-frames 200
+  python examples/replay_episode.py episodes/episode_20260729_213332 --max-frames 200
 
   # Validate trajectory without hardware (dry-run)
-  python examples/real/replay_episode.py episodes/episode_20260729_213332 --dry-run
+  python examples/replay_episode.py episodes/episode_20260729_213332 --dry-run
 
   # Arm-only (skip hand even if episode has hand data)
-  python examples/real/replay_episode.py episodes/episode_20260729_213332 --no-hand
+  python examples/replay_episode.py episodes/episode_20260729_213332 --no-hand
 
-  # Generate a certificate, then separately authorize live replay
-  python examples/real/replay_episode.py episodes/episode_20260729_213332 --source sent --write-certificate preflight.json
-  python examples/real/replay_episode.py episodes/episode_20260729_213332 --source sent --live --certificate preflight.json
+  # Live replay re-runs dense geometry and provenance checks before workers start
+  python examples/replay_episode.py episodes/episode_20260729_213332 --source sent --live
 
   # Live replay with a custom capture/metrics directory
-  python examples/real/replay_episode.py episodes/episode_20260729_213332 --source sent --live \
-    --certificate preflight.json --output results/my_replay/
+  python examples/replay_episode.py episodes/episode_20260729_213332 --source sent --live \
+    --output results/my_replay/
 
 Live replay controls:
   Q     clean exit (save partial results)
@@ -239,7 +154,7 @@ Live replay controls:
         "--speed",
         type=_positive_finite_float,
         default=1.0,
-        help="Speed factor bound into a certificate and used by live replay (1.0=recorded speed).",
+        help="Speed factor used by live replay (1.0=recorded speed).",
     )
     parser.add_argument(
         "--max-frames",
@@ -256,16 +171,7 @@ Live replay controls:
     mode_group.add_argument(
         "--live",
         action="store_true",
-        help="Authorize hardware replay after a matching preflight certificate is supplied.",
-    )
-    parser.add_argument(
-        "--certificate", type=str, default=None, help="Existing preflight certificate required by --live."
-    )
-    parser.add_argument(
-        "--write-certificate",
-        type=str,
-        default=None,
-        help="In dry-run mode, run dense checks and atomically write a new certificate.",
+        help="Run dense preflight checks, then cross the hardware boundary.",
     )
     parser.add_argument("--config", type=str, default=None, help="Validated experiment YAML overrides.")
     parser.add_argument(
@@ -314,18 +220,10 @@ Live replay controls:
     args.episode = args.episode if args.episode is not None else args.episode_h5
     if args.episode is None:
         parser.error("an episode path is required (positional path or --h5 PATH)")
-    if args.live and args.certificate is None:
-        parser.error("--live requires --certificate from a successful dry-run preflight")
-    if not args.live and args.certificate is not None:
-        parser.error("--certificate is only used with --live")
     if not args.live and args.output is not None:
         parser.error("--output is only used with --live; offline validation does not produce replay metrics")
-    if args.live and args.write_certificate is not None:
-        parser.error("--write-certificate is dry-run only")
     if args.live and args.source != "sent":
         parser.error("--live requires --source sent; raw policy candidates are never replayed on hardware")
-    if args.write_certificate is not None and args.source != "sent":
-        parser.error("--write-certificate requires --source sent so its binding can authorize live replay")
     if args.live and args.speed > 1.0:
         print("Warning: speed-up increases commanded joint velocities; live safety gates may reject the replay")
 
@@ -341,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             max_frames=args.max_frames,
             source=args.source,
             require_live_validity=args.live,
-            require_exact_source=args.write_certificate is not None,
+            require_exact_source=args.live,
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"Error loading episode: {exc}")
@@ -396,10 +294,6 @@ def main(argv: list[str] | None = None) -> int:
                 max_frames=args.max_frames,
                 output_dir=output_dir,
                 evaluate_consistency=bool(eval_available),
-                authorization=LiveReplayAuthorization(
-                    certificate_path=args.certificate,
-                    replay_runtime_sha256=selection.config_sha256,
-                ),
             ),
         )
     except Exception as exc:

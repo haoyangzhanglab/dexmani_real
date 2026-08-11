@@ -17,10 +17,22 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, cast, get_args, get_origin, get_type_hints
+from typing import Any, cast, get_args, get_origin, get_type_hints
 
 import numpy as np
 import yaml
+
+from dexmani_real.config.defaults import (
+    ArmParams,
+    CameraParams,
+    EnvironmentConfig,
+    HandParams,
+    KeyboardTeleopParams,
+    PolicyParams,
+    SafetyParams,
+    TAGRetargetingParams,
+    VRParams,
+)
 
 _SECTION_NAMES = (
     "arm",
@@ -53,63 +65,19 @@ def _plain_value(value: Any) -> Any:
     raise TypeError(f"unsupported runtime config value {type(value).__name__}")
 
 
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return FrozenConfigNode(tuple((str(key), _freeze(item)) for key, item in sorted(value.items())))
-    if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
-    return value
-
-
-def _thaw(value: Any) -> Any:
-    if isinstance(value, FrozenConfigNode):
-        return {key: _thaw(item) for key, item in value._items}
-    if isinstance(value, tuple):
-        return [_thaw(item) for item in value]
-    return value
-
-
-@dataclass(frozen=True)
-class FrozenConfigNode(Mapping[str, Any]):
-    """Pickle-safe immutable mapping with attribute access."""
-
-    _items: tuple[tuple[str, Any], ...]
-
-    def __getitem__(self, key: str) -> Any:
-        for item_key, value in self._items:
-            if item_key == key:
-                return value
-        raise KeyError(key)
-
-    def __iter__(self) -> Iterator[str]:
-        return (key for key, _ in self._items)
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-    def __getattr__(self, name: str) -> Any:
-        try:
-            return self[name]
-        except KeyError as exc:
-            raise AttributeError(name) from exc
-
-    def to_dict(self) -> dict[str, Any]:
-        return {key: _thaw(value) for key, value in self._items}
-
-
 @dataclass(frozen=True)
 class ResolvedRuntimeConfig:
-    """Deeply immutable, validated runtime configuration snapshot."""
+    """Deeply immutable, validated and statically named runtime snapshot."""
 
-    arm: FrozenConfigNode
-    hand: FrozenConfigNode
-    policy: FrozenConfigNode
-    keyboard_teleop: FrozenConfigNode
-    vr: FrozenConfigNode
-    safety: FrozenConfigNode
-    camera: FrozenConfigNode
-    tag_retargeting: FrozenConfigNode
-    environment: FrozenConfigNode
+    arm: ArmParams
+    hand: HandParams
+    policy: PolicyParams
+    keyboard_teleop: KeyboardTeleopParams
+    vr: VRParams
+    safety: SafetyParams
+    camera: CameraParams
+    tag_retargeting: TAGRetargetingParams
+    environment: EnvironmentConfig
     canonical_json: str
     canonical_yaml: str
     sha256: str
@@ -120,7 +88,7 @@ class ResolvedRuntimeConfig:
         return self.sha256
 
     def to_dict(self) -> dict[str, Any]:
-        return {name: getattr(self, name).to_dict() for name in _SECTION_NAMES}
+        return {name: _plain_value(getattr(self, name)) for name in _SECTION_NAMES}
 
 
 def _merge(base: dict[str, Any], overrides: Mapping[str, Any], *, path: str = "") -> dict[str, Any]:
@@ -204,7 +172,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
                 return frozenset(raw)
             prototype = next(iter(template))
             return frozenset(rebuild(prototype, value, f"{path}[]") for value in raw)
-        if isinstance(template, dict):
+        if isinstance(template, Mapping):
             if not isinstance(raw, Mapping):
                 raise TypeError(f"runtime config field {path!r} must be an object")
             unknown = set(raw) - set(template)
@@ -245,7 +213,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     workspace = rebuilt["policy"].workspace
     if workspace.x_min > workspace.x_max or workspace.y_min > workspace.y_max or workspace.z_min > workspace.z_max:
         raise ValueError("policy.workspace lower bounds must not exceed upper bounds")
-    return {name: _plain_value(value) for name, value in rebuilt.items()}
+    return rebuilt
 
 
 def resolve_runtime_config(
@@ -285,7 +253,8 @@ def resolve_runtime_config(
 
     merged = _merge(base, file_overrides)
     merged = _merge(merged, _expand_dotted(cli_overrides))
-    validated = _validated_defaults_snapshot(merged)
+    sections = _validated_defaults_snapshot(merged)
+    validated = {name: _plain_value(value) for name, value in sections.items()}
     canonical_json = json.dumps(
         validated,
         sort_keys=True,
@@ -295,9 +264,8 @@ def resolve_runtime_config(
     )
     canonical_yaml = yaml.safe_dump(validated, allow_unicode=True, sort_keys=True)
     digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-    frozen = {name: _freeze(validated[name]) for name in _SECTION_NAMES}
     return ResolvedRuntimeConfig(
-        **frozen,
+        **sections,
         canonical_json=canonical_json,
         canonical_yaml=canonical_yaml,
         sha256=digest,

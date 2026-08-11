@@ -270,6 +270,8 @@ class CameraMotionController:
             prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
             dt_s=1.0 / self.session.control_hz,
             safety_gate=self.session.action_safety_gate,
+            wait_applied=True,
+            apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
         )
         if candidate is None:
             self.session.latch_fault("arm command was rejected or could not be committed")

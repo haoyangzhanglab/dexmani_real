@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.shm.shared_storage import SharedStorage, format_component_metrics_summary
+from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -122,8 +122,7 @@ def run_supervisor(
                 safety_state = shared.safety_state.value
                 heartbeat_text = ", ".join(f"{name}={heartbeat_ages[name]:.1f}s" for name in proc_names)
                 print(
-                    f"  [supervisor]  runtime={runtime_m:.1f}min  safety={safety_state}  hb_age=({heartbeat_text})\n"
-                    f"                loops=({format_component_metrics_summary(shared)})",
+                    f"  [supervisor]  runtime={runtime_m:.1f}min  safety={safety_state}  hb_age=({heartbeat_text})",
                     flush=True,
                 )
                 last_status_s = now
@@ -135,7 +134,7 @@ def run_supervisor(
         normal_exit = True
         shared.is_running.value = False
 
-    print(f"  [supervisor exit] reason={exit_reason} loops=({format_component_metrics_summary(shared)})", flush=True)
+    print(f"  [supervisor exit] reason={exit_reason}", flush=True)
     return exit_reason, normal_exit
 
 
@@ -247,6 +246,5 @@ def print_health_summary(shared: SharedStorage) -> None:
     else:
         print("  cam   ----  (no data yet)")
 
-    print(f"  loops  {format_component_metrics_summary(shared)}")
     print("──")
     sys.stdout.flush()

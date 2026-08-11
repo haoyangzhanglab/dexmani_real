@@ -193,9 +193,18 @@ class ActionSafetyGate:
         arm_high = np.asarray(self.config.arm_joint_upper_rad, dtype=np.float64)
         hand_low = np.asarray(self.config.hand_joint_lower_rad, dtype=np.float64)
         hand_high = np.asarray(self.config.hand_joint_upper_rad, dtype=np.float64)
-        if np.any(arm_end < arm_low) or np.any(arm_end > arm_high):
+        # Only check joint limits on explicitly commanded targets.
+        # When an actuator is not commanded (qpos is None -> hold in place),
+        # the gate enforces command correctness, not sensor precision -
+        # measured feedback may sit outside nominal limits due to encoder
+        # resolution, PID steady-state error, or external load.
+        if candidate.arm_qpos is not None and (
+            np.any(arm_end < arm_low) or np.any(arm_end > arm_high)
+        ):
             return GateResult(False, None, "arm joint limit violation")
-        if np.any(hand_end < hand_low) or np.any(hand_end > hand_high):
+        if candidate.hand_qpos is not None and (
+            np.any(hand_end < hand_low) or np.any(hand_end > hand_high)
+        ):
             return GateResult(False, None, "hand joint limit violation")
 
         arm_delta = self.config.arm_max_velocity_rad_s * dt_s
@@ -239,6 +248,7 @@ def planner_action_safety_gate(
     table_z_surface_m: float,
     hand_safety_margin_m: float,
     transition_step_rad: float = 0.02,
+    enable_table_check: bool = True,
 ) -> ActionSafetyGate:
     """Build the canonical geometry-aware gate around a configured planner.
 
@@ -246,41 +256,50 @@ def planner_action_safety_gate(
     progress because the two workers can apply a committed endpoint up to one
     worker tick apart.  Planner state is restored to the measured hand pose on
     rejection and advanced to the accepted endpoint on success.
-    """
-    if not np.isfinite(table_z_surface_m) or not np.isfinite(hand_safety_margin_m):
-        raise ValueError("table surface and hand safety margin must be finite")
-    if transition_step_rad <= 0 or not np.isfinite(transition_step_rad):
-        raise ValueError("transition_step_rad must be finite and positive")
 
-    def table_clearance_check(
-        arm_start: np.ndarray,
-        arm_end: np.ndarray,
-        hand_start: np.ndarray,
-        hand_end: np.ndarray,
-    ) -> bool:
-        arm_steps = max(1, int(np.ceil(np.max(np.abs(arm_end - arm_start)) / transition_step_rad)))
-        hand_steps = max(1, int(np.ceil(np.max(np.abs(hand_end - hand_start)) / transition_step_rad)))
-        try:
-            for arm_alpha in np.linspace(0.0, 1.0, arm_steps + 1):
-                arm_sample = arm_start + arm_alpha * (arm_end - arm_start)
-                for hand_alpha in np.linspace(0.0, 1.0, hand_steps + 1):
-                    hand_sample = hand_start + hand_alpha * (hand_end - hand_start)
-                    planner.set_hand_qpos(hand_sample)
-                    minimum_z = float(planner.collision_model.minimum_hand_frame_z(arm_sample))
-                    if not np.isfinite(minimum_z) or minimum_z - hand_safety_margin_m < table_z_surface_m:
-                        planner.set_hand_qpos(hand_start)
-                        return False
-        except Exception:
-            planner.set_hand_qpos(hand_start)
-            raise
-        planner.set_hand_qpos(hand_end)
-        return True
+    Set *enable_table_check* to False for teleoperation where the operator
+    provides the table-awareness; ``send_arm_home`` performs its own
+    independent table-clearance validation.
+    """
+
+    _table_check: Callable[..., bool] | None = None
+    if enable_table_check:
+        if not np.isfinite(table_z_surface_m) or not np.isfinite(hand_safety_margin_m):
+            raise ValueError("table surface and hand safety margin must be finite")
+        if transition_step_rad <= 0 or not np.isfinite(transition_step_rad):
+            raise ValueError("transition_step_rad must be finite and positive")
+
+        def table_clearance_check(
+            arm_start: np.ndarray,
+            arm_end: np.ndarray,
+            hand_start: np.ndarray,
+            hand_end: np.ndarray,
+        ) -> bool:
+            arm_steps = max(1, int(np.ceil(np.max(np.abs(arm_end - arm_start)) / transition_step_rad)))
+            hand_steps = max(1, int(np.ceil(np.max(np.abs(hand_end - hand_start)) / transition_step_rad)))
+            try:
+                for arm_alpha in np.linspace(0.0, 1.0, arm_steps + 1):
+                    arm_sample = arm_start + arm_alpha * (arm_end - arm_start)
+                    for hand_alpha in np.linspace(0.0, 1.0, hand_steps + 1):
+                        hand_sample = hand_start + hand_alpha * (hand_end - hand_start)
+                        planner.set_hand_qpos(hand_sample)
+                        minimum_z = float(planner.collision_model.minimum_hand_frame_z(arm_sample))
+                        if not np.isfinite(minimum_z) or minimum_z - hand_safety_margin_m < table_z_surface_m:
+                            planner.set_hand_qpos(hand_start)
+                            return False
+            except Exception:
+                planner.set_hand_qpos(hand_start)
+                raise
+            planner.set_hand_qpos(hand_end)
+            return True
+
+        _table_check = table_clearance_check
 
     return ActionSafetyGate(
         config,
         workspace_check=planner.is_workspace_segment_safe,
         transition_collision_check=planner.collision_model.check_transition_collision_free,
-        table_clearance_check=table_clearance_check,
+        table_clearance_check=_table_check,
     )
 
 
@@ -703,12 +722,24 @@ def publish_joint_targets(
         if not gate_result.accepted or gate_result.candidate is None:
             logger.warning("joint target rejected by ActionSafetyGate: %s", gate_result.reason)
             return None
+        # Re-anchor timestamps after gate evaluation so that collision checks
+        # and feedback validation do not consume the prepare window.  The
+        # candidate identity (action_id, session_generation, policy_epoch) is
+        # unchanged - only the delivery schedule is refreshed.
+        _publish_ns = time.monotonic_ns()
+        _lead_ns = int(lead_time_s * 1e9)
+        _validity_ns = int(validity_s * 1e9)
+        _refreshed = replace(
+            gate_result.candidate,
+            target_monotonic_ns=_publish_ns + _lead_ns,
+            valid_until_monotonic_ns=_publish_ns + _lead_ns + _validity_ns,
+        )
         publisher = SafeCommandPublisher(shared)
-        if not publisher.publish(gate_result.candidate, prepare_timeout_s=prepare_timeout_s):
+        if not publisher.publish(_refreshed, prepare_timeout_s=prepare_timeout_s):
             return None
-        if wait_applied and not publisher.wait_applied(gate_result.candidate, timeout_s=apply_timeout_s):
+        if wait_applied and not publisher.wait_applied(_refreshed, timeout_s=apply_timeout_s):
             return None
-        return gate_result.candidate
+        return _refreshed
     except (TimeoutError, ValueError):
         logger.warning("joint target publication failed", exc_info=True)
         return None

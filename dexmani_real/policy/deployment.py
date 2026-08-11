@@ -111,7 +111,7 @@ def _feedback_preflight_issues(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="DexMani policy deployment experiment")
+    parser = argparse.ArgumentParser(description="Experimental DexMani learned-policy deployment")
     parser.add_argument("--policy", required=True, help="Policy adapter and resource YAML")
     parser.add_argument("--config", default=None, help="Experiment config YAML")
     parser.add_argument(
@@ -212,7 +212,7 @@ def run_policy_deployment(
 
     ctx = mp.get_context("spawn")
     storage_config = with_observation_capacities(
-        SharedStorageConfig.from_runtime(runtime),
+        SharedStorageConfig.from_runtime(runtime, enable_inference=True),
         inference.observation,
     )
     prefix = f"dexmani_learned_{os.getpid()}"

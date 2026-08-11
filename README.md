@@ -19,9 +19,9 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 项目覆盖四条相互衔接的工作流：
 
 1. **VR 遥操作与采集**：读取 Quest、相机和机器人状态，生成安全的臂/手指令，并按固定控制网格记录 episode。
-2. **学习策略部署**：在隔离的推理进程中执行模型，将候选动作经过协议校验与安全门后送往执行器。
+2. **实验性学习策略部署**：仅在提供外部 adapter、PolicySpec、模型资源和离线验证后启用隔离推理链；默认遥操作运行时不分配其 IPC。
 3. **标定与诊断**：标定相机外参和 VR 朝向；以受限、可观测的方式诊断 RealSense、点云和 XHand。
-4. **回放与离线分析**：检查 HDF5 episode、生成回放授权证书、执行受控 live replay，并评估或可视化数据质量。
+4. **回放与离线分析**：检查 HDF5 episode、在启动前直接执行密集预检、运行受控 live replay，并评估或可视化数据质量。
 
 ```text
                     ┌───────────── sensor/ ──────────────┐
@@ -81,11 +81,11 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 
 | 使用场景 | 入口 | 主要调用链 |
 |---|---|---|
-| VR 采集 | `examples/real/collect_teleop.py` | `teleop/experiment.py` → `teleop/loop.py` → `planning/`、`robot/`、`recording/` |
-| 键盘控制 | `examples/real/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` → `keyboard.py` → 安全动作协议 |
-| 学习策略 | `examples/real/deploy_policy.py` | `policy/deployment.py` → `inference_process.py` → `learned_coordinator.py` |
-| Episode 回放 | `examples/real/replay_episode.py` | `replay/episode.py` → `preflight.py` → `session.py` / `runner.py` |
-| 相机标定 | `examples/real/calibrate_camera.py` | `calibration/camera_experiment.py` → ArUco、手眼标定与原子写入 |
+| VR 采集 | `examples/collect_teleop.py` | `teleop/experiment.py` → `teleop/loop.py` → `planning/`、`robot/`、`recording/` |
+| 键盘控制 | `examples/keyboard_teleop_real.py` | `teleop/keyboard_experiment.py` → `keyboard.py` → 安全动作协议 |
+| 实验性学习策略 | `examples/deploy_policy.py` | `policy/deployment.py` → `inference_process.py` → `learned_coordinator.py` |
+| Episode 回放 | `examples/replay_episode.py` | `replay/episode.py` → `preflight.py` → `session.py` / `runner.py` |
+| 相机标定 | `examples/calibrate_camera.py` | `calibration/camera_experiment.py` → ArUco、手眼标定与原子写入 |
 | 离线数据分析 | 无额外包装入口 | `python -m dexmani_real.recording.analysis.episode_quality` 或 `visualize_episode` |
 
 ## 从入口到核心模块
@@ -108,11 +108,11 @@ conda activate real_robot
 export PYTHONPATH=.
 
 # 不连接任何硬件的语法检查
-python -m compileall -q dexmani_real examples/real
+python -m compileall -q dexmani_real examples
 ```
 
 > [!WARNING]
-> `examples/real/` 下的所有入口都可能影响硬件。不要仅为“试一下”而运行遥操作、回放、标定或设备诊断；执行前应确认工作空间清空、设备状态正常，并获得相应操作授权。`replay_episode.py` 默认为离线检查，但 `--live` 会跨越硬件安全边界。
+> `examples/` 下的所有入口都可能影响硬件。不要仅为“试一下”而运行遥操作、回放、标定或设备诊断；执行前应确认工作空间清空、设备状态正常，并获得相应操作授权。`replay_episode.py` 默认为离线检查，但 `--live` 会跨越硬件安全边界。
 
 ## 项目地图：`dexmani_real`
 
@@ -177,16 +177,15 @@ python -m compileall -q dexmani_real examples/real
 | `planning/path_utils.py` | 关节路径插值、稠密化、角度等价包裹，以及两阶段回零和 band 对齐路径规划。 |
 | `planning/planner.py` | `XArm7MotionPlanner`：组合 MPlib、运动学、IK 候选和碰撞模型以完成 IK/路径规划。 |
 | `planning/pose_utils.py` | 位姿组合/求逆、四元数与 rot6d 转换、关节形状检查和位置姿态误差计算。 |
-| `planning/preflight.py` | 为离线回放生成和验证绑定代码、模型、碰撞场景与数组输入的哈希证书。 |
 | `planning/types.py` | 定义 `Pose`、IK/路径结果、碰撞信息以及规划/遥操作 profile 等核心数据类。 |
 
-### `policy/` — 学习策略契约、隔离推理与动作提交
+### `policy/` — 动作协议与实验性学习策略部署
 
 | 文件 | 作用 |
 |---|---|
 | `policy/__init__.py` | 提供延迟加载的旧式 VR policy 兼容导入，避免离线主进程提前载入遥操作代码。 |
 | `policy/action_protocol.py` | 定义 prepare/commit/ack 协议、动作安全门、反馈校验、动作发布器与因果关节动作调度器。 |
-| `policy/deployment.py` | 学习策略部署 CLI/生命周期：解析 spec、检查能力与反馈条件、启动并监督推理与执行 worker。 |
+| `policy/deployment.py` | 实验性学习策略部署 CLI/生命周期：显式启用 inference IPC，解析 spec 并监督推理与执行 worker。 |
 | `policy/inference_process.py` | 隔离推理 worker，加载 adapter，编解码候选动作，并验证模型输出是否满足策略契约。 |
 | `policy/learned_coordinator.py` | 以单一时钟协调 observation、推理结果、动作执行和退出前 hold 的学习策略控制环。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
@@ -217,13 +216,13 @@ python -m compileall -q dexmani_real examples/real
 
 | 文件 | 作用 |
 |---|---|
-| `replay/__init__.py` | 标识 episode 检查、认证与回放子系统。 |
+| `replay/__init__.py` | 标识 episode 检查、预检与回放子系统。 |
 | `replay/data.py` | 从 HDF5 加载并规范化为回放所需的状态/动作 `TrajectoryData`。 |
-| `replay/episode.py` | 回放 CLI：默认离线检查；live 模式先构建/验证预检证书，再进入受控会话。 |
+| `replay/episode.py` | 回放 CLI：默认离线检查；live 模式在启动 worker 前直接执行密集预检。 |
 | `replay/metrics.py` | 捕获回放期间状态，计算关节/末端跟踪和时延指标，并保存报告与原始数据。 |
-| `replay/preflight.py` | 对 live replay 采取 fail-closed 授权：验证轨迹来源、模型哈希、证书和手部模式。 |
-| `replay/runner.py` | 通过 `SharedStorage` 执行已认证轨迹，监控臂/手反馈、动作确认和安全终态。 |
-| `replay/session.py` | 启停 live 回放 worker，整合授权、运行结果、回零选项与事后指标报告。 |
+| `replay/preflight.py` | 在 live replay 启动 worker 前 fail-closed 地重验轨迹来源、模型、几何路径和手部模式。 |
+| `replay/runner.py` | 通过 `SharedStorage` 执行已预检轨迹，监控臂/手反馈、动作确认和安全终态。 |
+| `replay/session.py` | 启停 live 回放 worker，整合预检、运行结果、回零选项与事后指标报告。 |
 
 ### `robot/` — xArm7、XHand 与安全状态
 
@@ -263,8 +262,8 @@ python -m compileall -q dexmani_real examples/real
 |---|---|
 | `shm/__init__.py` | 说明共享内存公共接口及其与回零/监督模块的职责边界。 |
 | `shm/ring_buffer.py` | 通用共享内存 seqlock 环和相机专用环，提供零拷贝写入与已验证读取。 |
-| `shm/robot_ring.py` | 为机器人状态/控制帧提供带 `get_last_k()` 的 seqlock 环封装。 |
-| `shm/shared_storage.py` | 创建并持有全部共享环、队列、标志、事件和指标；提供状态/组件信息的读写辅助函数。 |
+| `shm/robot_ring.py` | 兼容旧导入路径；实际 seqlock 与 `get_last_k()` 实现在 `ring_buffer.py`。 |
+| `shm/shared_storage.py` | 创建并持有共享环、队列、标志和事件；默认仅分配遥操作/采集能力，推理 IPC 需显式启用。 |
 
 ### `teleop/` — VR 映射、控制环与采集决策
 
@@ -304,25 +303,25 @@ python -m compileall -q dexmani_real examples/real
 
 ## 项目地图：`examples`
 
-`examples/real/` 目前有 **9 个 Python 文件**；它们全都是薄 CLI，只负责把仓库根加入 `sys.path` 并调用相应领域模块的 `main()`。业务逻辑不应继续堆放在这些文件中。
+`examples/` 目前有 **9 个 Python 文件**；它们全都是薄 CLI，只负责把仓库根加入 `sys.path` 并调用相应领域模块的 `main()`。业务逻辑不应继续堆放在这些文件中。
 
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
-| `examples/real/collect_teleop.py` | `teleop.experiment.main` | 标准 VR 遥操作与数据采集入口；会启动真实设备 worker。 |
-| `examples/real/deploy_policy.py` | `policy.deployment.main` | 标准学习策略部署入口；会进入真实执行器控制链。 |
-| `examples/real/keyboard_teleop_real.py` | `teleop.keyboard_experiment.main` | 以键盘驱动机械臂、默认使用实测 XHand 反馈的入口；硬件相关。 |
-| `examples/real/replay_episode.py` | `replay.episode.main` | episode 检查/回放入口；默认 dry-run，`--live` 需要额外预检授权。 |
-| `examples/real/calibrate_camera.py` | `calibration.camera_experiment.main` | ArUco 眼到手标定入口；会采集设备数据并可能更新标定。 |
-| `examples/real/calibrate_vr_heading.py` | `calibration.vr_heading_experiment.main` | VR 朝向标定入口；会读取 VR 数据并在确认后写入变换。 |
-| `examples/real/diagnose_realsense.py` | `diagnostics.realsense.main` | 限时 RealSense 生命周期/流诊断入口；会连接相机。 |
-| `examples/real/diagnose_pointcloud.py` | `diagnostics.pointcloud.main` | 点云与桌面平面诊断入口；默认检查，显式写入选项才修改配置。 |
-| `examples/real/diagnose_xhand.py` | `diagnostics.xhand.main` | XHand 只读状态诊断入口；仍会启动并连接手部 worker。 |
+| `examples/collect_teleop.py` | `teleop.experiment.main` | 标准 VR 遥操作与数据采集入口；会启动真实设备 worker。 |
+| `examples/deploy_policy.py` | `policy.deployment.main` | 实验性学习策略入口；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
+| `examples/keyboard_teleop_real.py` | `teleop.keyboard_experiment.main` | 以键盘驱动机械臂、默认使用实测 XHand 反馈的入口；硬件相关。 |
+| `examples/replay_episode.py` | `replay.episode.main` | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
+| `examples/calibrate_camera.py` | `calibration.camera_experiment.main` | ArUco 眼到手标定入口；会采集设备数据并可能更新标定。 |
+| `examples/calibrate_vr_heading.py` | `calibration.vr_heading_experiment.main` | VR 朝向标定入口；会读取 VR 数据并在确认后写入变换。 |
+| `examples/diagnose_realsense.py` | `diagnostics.realsense.main` | 限时 RealSense 生命周期/流诊断入口；会连接相机。 |
+| `examples/diagnose_pointcloud.py` | `diagnostics.pointcloud.main` | 点云与桌面平面诊断入口；默认检查，显式写入选项才修改配置。 |
+| `examples/diagnose_xhand.py` | `diagnostics.xhand.main` | XHand 只读状态诊断入口；仍会启动并连接手部 worker。 |
 
 ## 配置、资源与延伸文档
 
 | 位置 | 内容 |
 |---|---|
-| `examples/real/configs/teleop_lab.yaml` | 遥操作实验覆盖配置示例；只记录刻意偏离默认值的少量字段。 |
+| `examples/configs/teleop_lab.yaml` | 遥操作实验覆盖配置示例；只记录刻意偏离默认值的少量字段。 |
 | `dexmani_real/config/cameras.json` | 物理相机序列号、类型和外参，是运行时校验的一部分。 |
 | `dexmani_real/config/desk_plane.json` | 点云工作空间使用的桌面平面运行数据。 |
 | `dexmani_real/config/vr_transform.json` | VR 朝向标定得到的坐标变换运行数据。 |

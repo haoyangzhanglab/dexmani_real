@@ -156,7 +156,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     from dexmani_real.robot.safety import SafetyState
     from dexmani_real.runtime.status import ComponentPhase, FaultCode
     from dexmani_real.shm.shared_storage import new_frame as _nf
-    from dexmani_real.shm.shared_storage import publish_component_metrics, publish_component_status
+    from dexmani_real.shm.shared_storage import publish_component_status
 
     cfg = config or HandProcessConfig()
     publish_component_status(shared, "hand", ComponentPhase.LOADING)
@@ -613,10 +613,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
         # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
         rate_mgr.wait()
-        publish_component_metrics(shared, "hand", rate_mgr)
-
-    publish_component_metrics(shared, "hand", rate_mgr, interval_s=0.0)
-
     # Shutdown never creates new motion. Homing is an explicit, correlated
     # policy operation; worker cleanup only stops the device and releases the
     # bus after the command loop has been gated.

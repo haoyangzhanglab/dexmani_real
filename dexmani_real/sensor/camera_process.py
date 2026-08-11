@@ -173,7 +173,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     import numpy as np
 
     from dexmani_real.runtime.status import ComponentPhase, FaultCode
-    from dexmani_real.shm.shared_storage import publish_component_metrics, publish_component_status
+    from dexmani_real.shm.shared_storage import publish_component_status
 
     _logger = get_logger("camera_loop")
     cfg = config or CameraLoopConfig()
@@ -290,7 +290,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 # Maintain target rate even on read failure so a persistent
                 # error doesn't turn into a tight loop.
                 rate_mgr.wait()
-                publish_component_metrics(shared, "camera", rate_mgr)
                 continue
             shared.camera_heartbeat_s.value = time.monotonic()
 
@@ -362,7 +361,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
 
             # --- maintain target rate (absolute-deadline scheduling, consistent with other loops) ---
             rate_mgr.wait()
-            publish_component_metrics(shared, "camera", rate_mgr)
 
     except Exception:
         failed = True
@@ -375,8 +373,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             detail="camera process crashed; see process log",
         )
     finally:
-        if "rate_mgr" in locals():
-            publish_component_metrics(shared, "camera", rate_mgr, interval_s=0.0)
         if cam is not None:
             try:
                 cam.disconnect()

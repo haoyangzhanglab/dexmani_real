@@ -15,7 +15,7 @@ from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.policy.action_protocol import hand_home_converge
 from dexmani_real.replay.data import TrajectoryData
 from dexmani_real.replay.metrics import ReplayMetrics, compute_metrics, save_replay_data, save_results
-from dexmani_real.replay.preflight import LiveReplayAuthorization, verify_live_replay_authorization
+from dexmani_real.replay.preflight import verify_live_replay_preflight
 from dexmani_real.replay.runner import ReplayOutcome, ReplayStatus, TrajectoryReplayer
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
@@ -40,7 +40,6 @@ class LiveReplayConfig:
     max_frames: int | None
     output_dir: str
     evaluate_consistency: bool
-    authorization: LiveReplayAuthorization | None = None
 
 
 def _latched_fault_status(shared: SharedStorage) -> ReplayStatus | None:
@@ -290,12 +289,11 @@ def run_live_replay(
 ) -> ReplayOutcome:
     """Start arm/hand workers, run one replay, then shut the session down."""
     try:
-        verify_live_replay_authorization(
+        verify_live_replay_preflight(
             trajectory,
             runtime,
             no_hand=config.no_hand,
             speed_factor=config.speed,
-            authorization=config.authorization,
         )
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
         return ReplayOutcome(

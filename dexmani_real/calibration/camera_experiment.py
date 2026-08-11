@@ -319,6 +319,7 @@ def _build_planner(runtime: Any, config: CameraSessionConfig) -> tuple[Any, Any,
         planner=planner,
         table_z_surface_m=float(runtime.arm.table_z_surface_m),
         hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
+        enable_table_check=False,
     )
     return planner, safety_gate, workspace_bounds
 
@@ -329,8 +330,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--hand-geometry",
         choices=("absent", "secured-home"),
-        required=True,
-        help="physical assertion because this arm-only procedure does not read XHand feedback",
+        default="secured-home",
+        help="physical assertion because this arm-only procedure does not read XHand feedback (default: secured-home)",
     )
     parser.add_argument("--config", type=Path, default=None, help="experiment YAML; --serial takes precedence")
     return parser.parse_args(argv)

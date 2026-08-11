@@ -7,7 +7,7 @@ Safety: DISARMED/ARMED/RUNNING/FAULT state machine + enabled-capability heartbea
 Recording: one causal configured-rate grid published as HDF5 schema v15.
 
 Usage:
-    python examples/real/collect_teleop.py [--task T] [--operator O] [--acc A] [--speed S]
+    python examples/collect_teleop.py [--task T] [--operator O] [--acc A] [--speed S]
                      [--no-hand] [--no-record] [--config PATH] [--print-config]
 Controls:
     B=teleop(+record when enabled)  C=pause  S=stop/save  D=discard  H=home  Q=quit  ESC=estop
@@ -35,10 +35,10 @@ from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
+from dexmani_real.runtime.session import ManagedProcessGroup
 from dexmani_real.runtime.supervisor import (
     print_health_summary,
     run_supervisor,
-    shutdown_processes,
     wait_subsystem_ready,
 )
 from dexmani_real.sensor.camera_process import CameraLoopConfig
@@ -430,6 +430,7 @@ def run_teleop_experiment(
         mp_context=ctx,
     )
     procs: list[Any] = []
+    group: ManagedProcessGroup | None = None
     shared_closed = False
     try:
         procs = _build_processes(
@@ -443,9 +444,13 @@ def run_teleop_experiment(
             hand_enabled=hand_enabled,
             recording_enabled=recording_enabled,
         )
+        group = ManagedProcessGroup(
+            shared,
+            procs,
+            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+        )
         require_transition(shared, SafetyState.DISARMED)
-        for process in procs:
-            process.start()
+        group.start()
 
         ready_checks = _readiness_checks(
             shared,
@@ -461,11 +466,7 @@ def run_teleop_experiment(
         if not wait_subsystem_ready(shared, ready_checks, procs):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
-            shutdown_report = shutdown_processes(
-                shared,
-                procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            )
+            shutdown_report = group.shutdown()
             shared_closed = shutdown_report.shared_closed
             return 1
 
@@ -487,11 +488,7 @@ def run_teleop_experiment(
                 logger.error("preflight health failed: %s", issue)
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
-            shutdown_report = shutdown_processes(
-                shared,
-                procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            )
+            shutdown_report = group.shutdown()
             shared_closed = shutdown_report.shared_closed
             return 1
 
@@ -519,12 +516,7 @@ def run_teleop_experiment(
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
-        shutdown_report = shutdown_processes(
-            shared,
-            procs,
-            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            disarm_if_clean=normal_exit,
-        )
+        shutdown_report = group.shutdown(disarm_if_clean=normal_exit)
         shared_closed = shutdown_report.shared_closed
         clean_exit = normal_exit and shutdown_report.clean
         if normal_exit and not clean_exit:
@@ -549,19 +541,14 @@ def run_teleop_experiment(
         return 1
     finally:
         # RecorderIO may still be validating and publishing an episode transaction.
-        started = [process for process in procs if process.pid is not None]
-        if any(process.is_alive() for process in started):
+        if group is not None:
             try:
-                shutdown_report = shutdown_processes(
-                    shared,
-                    started,
-                    graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                )
+                shutdown_report = group.shutdown()
                 shared_closed = shutdown_report.shared_closed
             except RuntimeError:
                 logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
                 raise
-        if not shared_closed and not any(process.is_alive() for process in started):
+        if group is None and not shared_closed:
             try:
                 shared_closed = bool(shared.close())
                 if not shared_closed:

@@ -95,7 +95,7 @@ def learned_policy_loop(
     from dexmani_real.policy.action_protocol import ActionSafetyGateConfig, planner_action_safety_gate
     from dexmani_real.robot.safety import SafetyState, transition
     from dexmani_real.runtime.status import ComponentPhase, FaultCode
-    from dexmani_real.shm.shared_storage import publish_component_metrics, publish_component_status
+    from dexmani_real.shm.shared_storage import publish_component_status
     from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
     from dexmani_real.utils.rate_manager import RateManager
 
@@ -251,7 +251,6 @@ def learned_policy_loop(
                     coordinator.complete_rewarm()
                     publish_component_status(shared, "policy", ComponentPhase.READY)
             limiter.wait()
-            publish_component_metrics(shared, "policy", limiter)
     except Exception:
         failed = True
         logger.error("learned policy coordinator failed", exc_info=True)
@@ -264,8 +263,6 @@ def learned_policy_loop(
         )
         shared.error_state.value = True
     finally:
-        if "limiter" in locals():
-            publish_component_metrics(shared, "policy", limiter, interval_s=0.0)
         if keyboard is not None:
             keyboard.stop()
         if not failed:

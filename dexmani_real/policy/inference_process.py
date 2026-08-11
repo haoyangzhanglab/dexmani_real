@@ -36,8 +36,6 @@ class InferenceWorkerTransport:
     ready: Any
     fault_latch: Any
     candidate_ring: Any
-    component_status_ring: Any
-    component_status_lock: Any
     session_generation: Any
 
     @classmethod
@@ -48,8 +46,6 @@ class InferenceWorkerTransport:
             ready=shared.inference_ready,
             fault_latch=shared.error_state,
             candidate_ring=shared.inference_candidate_ring,
-            component_status_ring=shared.component_status_ring,
-            component_status_lock=shared.component_status_lock,
             session_generation=shared.session_generation,
         )
 

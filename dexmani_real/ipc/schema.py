@@ -206,36 +206,6 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     align=True,
 )
 
-COMPONENT_STATUS_DTYPE = np.dtype(
-    [
-        ("component", "S24"),
-        ("phase", "<u1"),
-        ("fault_code", "<u2"),
-        ("exit_reason", "<u1"),
-        ("generation", "<u8"),
-        ("updated_monotonic_ns", "<u8"),
-        ("detail", "S160"),
-    ],
-    align=True,
-)
-
-COMPONENT_METRICS_DTYPE = np.dtype(
-    [
-        ("component", "S16"),
-        ("target_period_s", "<f8"),
-        ("loop_count", "<u8"),
-        ("last_work_duration_s", "<f8"),
-        ("max_work_duration_s", "<f8"),
-        ("deadline_overrun_count", "<u8"),
-        ("missed_slot_count", "<u8"),
-        ("long_block_reanchor_count", "<u8"),
-        ("elapsed_s", "<f8"),
-        ("actual_hz", "<f8"),
-        ("updated_monotonic_ns", "<u8"),
-    ],
-    align=True,
-)
-
 RECORD_CONTROL_DTYPE = np.dtype(
     [
         ("command", "<u1"),

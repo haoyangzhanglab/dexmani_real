@@ -6,7 +6,9 @@ and durations are seconds. Runtime YAML overrides these dataclass values.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal
 
 import numpy as np
@@ -19,7 +21,7 @@ _READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "inferen
 # Shared sub-structures
 
 
-@dataclass
+@dataclass(frozen=True)
 class HomingParams:
     """Firmware-planned execution parameters for validated home milestones."""
 
@@ -49,7 +51,7 @@ class HomingParams:
             raise ValueError("all homing parameters must be finite and positive")
 
 
-@dataclass
+@dataclass(frozen=True)
 class WorkspaceBounds:
     """EEF workspace bounds in arm-base frame (meters)."""
 
@@ -81,7 +83,7 @@ class WorkspaceBounds:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class StaleDetectionParams:
     """Qpos freshness detection (driver board lockout guard)."""
 
@@ -93,7 +95,7 @@ class StaleDetectionParams:
             raise ValueError("stale detection frame_count/qpos_delta_rad must be positive")
 
 
-@dataclass
+@dataclass(frozen=True)
 class EMAParams:
     """Cartesian-space EMA smoothing parameters (tuned for the default 16 Hz grid)."""
 
@@ -107,7 +109,7 @@ class EMAParams:
             raise ValueError("EMA alphas must be in [0, 1]")
 
 
-@dataclass
+@dataclass(frozen=True)
 class VRMappingParams:
     """VR wrist → EEF mapping parameters."""
 
@@ -178,7 +180,7 @@ class EnvironmentConfig:
 # Arm parameters (xArm7, 7-DOF)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ArmParams:
     """xArm7 hardware parameters — single source of truth."""
 
@@ -287,7 +289,7 @@ class ArmParams:
 # Hand parameters (XHand, 12-DOF)
 
 
-@dataclass
+@dataclass(frozen=True)
 class HandParams:
     """XHand hardware parameters — single source of truth."""
 
@@ -424,7 +426,7 @@ class HandParams:
 # Policy / teleop parameters
 
 
-@dataclass
+@dataclass(frozen=True)
 class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
 
@@ -479,7 +481,7 @@ class PolicyParams:
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError(f"control_hz={self.control_hz} must be > 0")
         if not np.isfinite(self.coordinator_hz) or self.coordinator_hz < self.control_hz:
@@ -540,7 +542,7 @@ class PolicyParams:
             raise ValueError("contact_stall_max_closing_speed_rad_s must be finite and >= 0")
 
 
-@dataclass
+@dataclass(frozen=True)
 class KeyboardTeleopParams:
     """Keyboard teleoperation parameters — single source of truth.
 
@@ -595,7 +597,7 @@ class KeyboardTeleopParams:
 # TAG retargeting parameters
 
 
-@dataclass
+@dataclass(frozen=True)
 class TAGRetargetingParams:
     """TAG two-stage NLopt hand retargeting parameters (``retargeting_type="tag"``)."""
 
@@ -665,7 +667,7 @@ class TAGRetargetingParams:
 # VR receiver parameters
 
 
-@dataclass
+@dataclass(frozen=True)
 class VRParams:
     """VR receiver (HTS) parameters."""
 
@@ -684,11 +686,11 @@ class VRParams:
 # Safety parameters
 
 
-@dataclass
+@dataclass(frozen=True)
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
-    heartbeat_timeouts: dict[str, float] = field(
+    heartbeat_timeouts: Mapping[str, float] = field(
         default_factory=lambda: {
             "arm": 1.0,
             "hand": 1.0,
@@ -699,7 +701,7 @@ class SafetyParams:
             "camera": 2.0,
         }
     )
-    readiness_timeouts_s: dict[str, float] = field(
+    readiness_timeouts_s: Mapping[str, float] = field(
         default_factory=lambda: {
             "arm": 15.0,
             "hand": 15.0,
@@ -718,7 +720,7 @@ class SafetyParams:
     # Supervisor check rate (Main)
     supervisor_hz: float = 10.0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.heartbeat_timeouts or any(
             not name or not np.isfinite(value) or value <= 0 for name, value in self.heartbeat_timeouts.items()
         ):
@@ -737,12 +739,27 @@ class SafetyParams:
             raise ValueError(f"max_consecutive_recoveries={self.max_consecutive_recoveries} must be > 0")
         if not np.isfinite(self.supervisor_hz) or self.supervisor_hz <= 0:
             raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
+        object.__setattr__(self, "heartbeat_timeouts", MappingProxyType(dict(self.heartbeat_timeouts)))
+        object.__setattr__(self, "readiness_timeouts_s", MappingProxyType(dict(self.readiness_timeouts_s)))
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        """Keep the read-only mappings compatible with multiprocessing spawn."""
+        return (
+            type(self),
+            (
+                dict(self.heartbeat_timeouts),
+                dict(self.readiness_timeouts_s),
+                self.shutdown_timeout_s,
+                self.max_consecutive_recoveries,
+                self.supervisor_hz,
+            ),
+        )
 
 
 # Camera parameters
 
 
-@dataclass
+@dataclass(frozen=True)
 class CameraParams:
     """Camera / RealSense parameters."""
 

@@ -26,7 +26,6 @@ from dexmani_real.calibration.vr_heading import (
     write_json_atomic_with_backup,
 )
 from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.runtime.status import ComponentPhase
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, vr_loop
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
@@ -62,16 +61,10 @@ def _positive_finite_seconds(value: str) -> float:
 
 
 def _latest_vr_fault(shared: SharedStorage) -> str | None:
-    result = shared.component_status_ring.read_latest()
-    if result is None:
-        return None
-    data, _publish_ns, _sequence = result
-    record = data[0]
-    component = bytes(record["component"]).rstrip(b"\x00").decode("utf-8", errors="replace")
-    if component != "vr" or int(record["phase"]) != int(ComponentPhase.FAULT):
-        return None
-    detail = bytes(record["detail"]).rstrip(b"\x00").decode("utf-8", errors="replace")
-    return f"VR worker reported fault_code={int(record['fault_code'])}: {detail or 'no detail'}"
+    # Worker liveness, heartbeat, and sticky error_state are the authoritative
+    # health channels. The former multi-producer status ring was not seqlock-safe.
+    del shared
+    return None
 
 
 def _require_vr_health(shared: SharedStorage, process: Any, heartbeat_timeout_s: float) -> None:

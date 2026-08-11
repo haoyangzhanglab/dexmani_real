@@ -1,10 +1,9 @@
-"""Fail-closed authorization for live replay."""
+"""Fail-closed, in-process validation immediately before live replay."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +12,7 @@ import yaml
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
-from dexmani_real.planning.preflight import PreflightCertificate, verify_preflight_binding
+from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.replay.data import TrajectoryData
 
 _MODEL_PROVENANCE_KEYS = (
@@ -21,23 +20,7 @@ _MODEL_PROVENANCE_KEYS = (
     "arm_hand_urdf_sha256",
     "arm_hand_srdf_sha256",
 )
-_REQUIRED_CERTIFICATE_CHECKS = frozenset(
-    {
-        "shape_finite",
-        "workspace_dense",
-        "arm_hand_collision_dense",
-        "environment_collision_dense",
-        "table_clearance_dense",
-    }
-)
-
-
-@dataclass(frozen=True)
-class LiveReplayAuthorization:
-    """Certificate inputs that the live domain must revalidate at startup."""
-
-    certificate_path: str | Path
-    replay_runtime_sha256: str
+_PREFLIGHT_MAX_JOINT_STEP_RAD = 0.02
 
 
 def replay_runtime_hash(
@@ -169,38 +152,25 @@ def _verify_trajectory_provenance(trajectory: TrajectoryData, runtime: ResolvedR
     return trajectory.action_source
 
 
-def verify_live_replay_authorization(
+def verify_live_replay_preflight(
     trajectory: TrajectoryData,
     runtime: ResolvedRuntimeConfig,
     *,
     no_hand: bool,
     speed_factor: float,
-    authorization: LiveReplayAuthorization | None,
 ) -> None:
-    """Revalidate live replay provenance and certificate binding."""
-    if authorization is None:
-        raise ValueError("live replay requires a preflight certificate authorization")
-    if not _is_sha256(authorization.replay_runtime_sha256):
-        raise ValueError("live replay authorization has an invalid runtime SHA-256")
+    """Validate provenance and every modeled transition before workers start."""
     require_explicit_hand_mode(trajectory, no_hand=no_hand)
     if not no_hand and not bool(runtime.policy.hand_enabled):
         raise ValueError("runtime policy.hand_enabled=false requires explicit no-hand acknowledgement")
     action_source = _verify_trajectory_provenance(trajectory, runtime)
-    expected_runtime_sha256 = replay_runtime_hash(
+    replay_runtime_hash(
         runtime.canonical_yaml,
         source=action_source,
         speed_factor=speed_factor,
         no_hand=no_hand,
         jerk_management="unmanaged",
     )
-    if authorization.replay_runtime_sha256 != expected_runtime_sha256:
-        raise ValueError("live replay authorization runtime binding mismatch")
-
-    certificate = PreflightCertificate.read(authorization.certificate_path)
-    missing_checks = sorted(_REQUIRED_CERTIFICATE_CHECKS.difference(certificate.checks_run))
-    if missing_checks:
-        raise ValueError(f"preflight certificate is missing required checks: {missing_checks}")
-
     modeled_hand = modeled_hand_actions(
         trajectory,
         no_hand=no_hand,
@@ -214,14 +184,38 @@ def verify_live_replay_authorization(
         ],
         dtype=np.float64,
     )
-    verify_preflight_binding(
-        certificate,
-        source_episode=trajectory.episode_path,
-        arm_actions=trajectory.action_arm_joint,
-        hand_actions=modeled_hand,
-        collision_model_paths=preflight_model_paths(),
-        workspace_bounds_m=workspace,
-        resolved_config_sha256=expected_runtime_sha256,
-        hand_enabled=not no_hand and trajectory.has_hand,
+    model_dir = ASSET_DIR / "robots" / "xhand"
+    planner = XArm7MotionPlanner(
+        XArm7PlannerConfig(
+            urdf_path=str(model_dir / "xarm7_xhand_collision.urdf"),
+            srdf_path=str(model_dir / "xarm7_xhand.srdf"),
+            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
+            workspace_bounds=workspace,
+        ),
+        hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
     )
+    arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
+    for index in range(max(1, trajectory.num_frames - 1)):
+        start = min(index, trajectory.num_frames - 1)
+        end = min(index + 1, trajectory.num_frames - 1)
+        arm_start, arm_end = arm_actions[start], arm_actions[end]
+        hand_start, hand_end = modeled_hand[start], modeled_hand[end]
+        if not planner.is_workspace_segment_safe(arm_start, arm_end):
+            raise ValueError(f"live replay workspace rejection at transition {start}->{end}")
+        if not planner.collision_model.check_transition_collision_free(arm_start, arm_end, hand_start, hand_end):
+            raise ValueError(f"live replay collision rejection at transition {start}->{end}")
+        max_delta = max(
+            float(np.max(np.abs(arm_end - arm_start))),
+            float(np.max(np.abs(hand_end - hand_start))),
+        )
+        steps = max(1, int(np.ceil(max_delta / _PREFLIGHT_MAX_JOINT_STEP_RAD)))
+        for alpha in np.linspace(0.0, 1.0, steps + 1):
+            arm_qpos = arm_start + alpha * (arm_end - arm_start)
+            hand_qpos = hand_start + alpha * (hand_end - hand_start)
+            planner.collision_model.set_hand_qpos(hand_qpos)
+            lowest_surface_m = planner.collision_model.minimum_hand_frame_z(arm_qpos) - float(
+                runtime.arm.hand_safety_margin_m
+            )
+            if not np.isfinite(lowest_surface_m) or lowest_surface_m < float(runtime.arm.table_z_surface_m):
+                raise ValueError(f"live replay table rejection at transition {start}->{end}")

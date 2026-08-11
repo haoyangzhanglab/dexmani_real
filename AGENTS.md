@@ -14,14 +14,14 @@ files.
 ```bash
 git status --short
 rg -n "<symbol-or-config-key>" dexmani_real examples
-conda run -n real_robot python -m compileall -q dexmani_real examples/real
+conda run -n real_robot python -m compileall -q dexmani_real examples
 ```
 
 - Target environment: conda `real_robot`, Python 3.10, `PYTHONPATH=.`.
 - `pyproject.toml` is the only packaging configuration. Native planning, CUDA,
   device-SDK, and robot dependencies are managed by the conda environment.
 - This repository has no conventional unit-test suite. Treat any `test_*.py`
-  under `examples/real/` as an interactive hardware program, never as a test.
+  under `examples/` as an interactive hardware program, never as a test.
 - Prefer a small deterministic offline check that exercises the changed pure
   helper, dtype, reader, or lifecycle branch.
 
@@ -59,11 +59,11 @@ producers and consumers.
 | VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
 | Learned-policy behavior | `policy/spec.py`, `policy/learned_coordinator.py` | inference worker, observation sources, action protocol, deployment lifecycle |
 | Arm/hand safety or servo behavior | `robot/arm_loop.py`, `robot/hand_process.py` | `robot/safety.py`, action protocol, supervisor, homing and e-stop paths |
-| FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp, replay preflight, collision certificates |
+| FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
 | Episode schema or quality rule | `recording/` | reader, analysis, replay consumers, schema marker, old-format behavior |
-| Replay behavior | `replay/episode.py`, `replay/preflight.py` | certificate binding, session/runner, metrics, live safety path |
+| Replay behavior | `replay/episode.py`, `replay/preflight.py` | provenance/dense preflight, session/runner, metrics, live safety path |
 | Calibration or diagnostics | `calibration/` or `diagnostics/` | explicit write/confirmation path and operational JSON compatibility |
-| CLI surface | `examples/real/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
+| CLI surface | `examples/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
 
 ## 3. Non-negotiable architecture
 
@@ -98,7 +98,7 @@ Preserve these unless the user explicitly requests an architectural redesign.
 
 ## 4. Hardware and operational safety
 
-Every program below `examples/real/` can affect hardware. Do **not** run
+Every program below `examples/` can affect hardware. Do **not** run
 teleoperation, policy deployment, replay, homing, calibration, RealSense, or
 XHand diagnostics without explicit user authorization and confirmation that the
 workspace is clear and the hardware is ready. Do not use a module import as a
@@ -128,7 +128,7 @@ Use the smallest vertical slice that fully preserves a contract.
 | Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
 | Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
 | Change safety/fault transition | supervisor + policy + arm + hand + shutdown + e-stop, including sticky-fault behavior |
-| Add an entry point | Thin `examples/real/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
+| Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
 Do not silently change HDF5 meaning in place. Add fields compatibly and keep
 older episodes readable; readers must tolerate optional legacy datasets.
@@ -157,7 +157,7 @@ Before handing off:
 1. Inspect the focused diff and `git status --short`; do not overwrite or
    include unrelated modifications.
 2. Verify changed paths/commands and run the least risky relevant offline check.
-3. Run `conda run -n real_robot python -m compileall -q dexmani_real examples/real`
+3. Run `conda run -n real_robot python -m compileall -q dexmani_real examples`
    for Python-source changes unless a narrower check is more appropriate.
 4. For safety/process changes, cover startup failure, normal shutdown, worker
    death, heartbeat timeout, sticky fault, and e-stop with fakes/mocks where

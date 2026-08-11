@@ -83,6 +83,7 @@ def _build_planner_and_gate(runtime: ResolvedRuntimeConfig) -> tuple[XArm7Motion
         planner=planner,
         table_z_surface_m=float(runtime.arm.table_z_surface_m),
         hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
+        enable_table_check=False,
     )
     return planner, gate
 
@@ -490,6 +491,8 @@ def _run_control_loop(
             prepare_timeout_s=float(policy.action_prepare_timeout_s),
             dt_s=dt_s,
             safety_gate=safety_gate,
+            wait_applied=True,
+            apply_timeout_s=float(policy.action_apply_timeout_s),
         )
         if published is None or published.arm_qpos is None:
             _set_fault(shared, "arm prepare/commit failed")

@@ -1,8 +1,8 @@
 """Lock-free FILO ring buffer in shared memory.
 
 Uses multiprocessing.shared_memory for zero-copy cross-process communication.
-Single producer (writer), single consumer (reader) — safe without CAS on
-x86_64 because aligned uint64 stores are atomic at the instruction level.
+Each ring has one producer and may have multiple readers. Odd/even markers
+prevent readers from accepting a slot while its payload is being overwritten.
 
      DexUMI drop-oldest backpressure via FILO semantics.
 
@@ -13,7 +13,7 @@ Usage:
 
     # Consumer process
     buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=False)
-    latest = buf.read_latest()
+    latest = buf.read_latest()  # (data copy, timestamp_ns, logical sequence) or None
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
 class SharedMemoryRingBuffer:
-    """Lock-free FILO ring buffer in shared memory.
+    """Lock-free, odd/even-seqlock FILO ring buffer in shared memory.
 
     Layout of the shared memory block:
         [0:8)     write_idx  (uint64, atomic — only producer writes, consumer reads)
@@ -135,6 +135,9 @@ class SharedMemoryRingBuffer:
         self._write_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE
         )
+        self._last_good: tuple[np.ndarray, int, int] | None = None
+        self._last_torn_warn_ns = 0
+        self._last_torn_warn_k_ns = 0
 
         logger.debug(
             "SharedMemoryRingBuffer(name=%s, slot_size=%d, maxlen=%d, total=%d, create=%s)",
@@ -144,6 +147,18 @@ class SharedMemoryRingBuffer:
             self._total_size,
             create,
         )
+
+    @classmethod
+    def create_or_replace(cls, name: str, dtype: np.dtype, maxlen: int = 3) -> "SharedMemoryRingBuffer":
+        """Create a ring, unlinking a stale block left by a crashed run."""
+        try:
+            return cls(name, dtype, maxlen=maxlen, create=True)
+        except FileExistsError:
+            logger.warning("Shared-memory ring %s already exists; replacing stale block", name)
+            stale = shared_memory.SharedMemory(name=name)
+            stale.close()
+            stale.unlink()
+            return cls(name, dtype, maxlen=maxlen, create=True)
 
     # ------------------------------------------------------------------
     # Producer API
@@ -159,18 +174,20 @@ class SharedMemoryRingBuffer:
         """
         now_ns = time.monotonic_ns()
 
-        # Increment sequence
+        # Increment the logical sequence.
         seq = int(self._write_seq[0]) + 1
         self._write_seq[0] = np.uint64(seq)
 
         # Compute slot index
         idx = seq % self.maxlen
 
-        # Write to slot
+        # Mark the slot incomplete before touching its payload, then publish an
+        # even completion marker. Readers accept only two matching even reads.
         slot = self._data_buf[idx]
+        slot["sequence"] = np.uint64(_seqlock_odd(seq))
         slot["timestamp_ns"] = np.uint64(now_ns)
-        slot["sequence"] = np.uint64(seq)
         slot["data"] = data
+        slot["sequence"] = np.uint64(_seqlock_even(seq))
 
         # Atomic write of write_idx (aligned uint64 store on x86_64)
         self._write_idx_view()[0] = np.uint64(idx)
@@ -181,24 +198,60 @@ class SharedMemoryRingBuffer:
     # Consumer API
     # ------------------------------------------------------------------
 
-    def read_latest(self) -> np.ndarray | None:
-        """Read the most recently written frame (consumer-side).
-
-        Returns a copy of the latest data as a numpy array, or None if no
-        frame has been written yet.
-        """
-        idx = int(self._write_idx_view()[0])
-
-        # Check if any frame has been written
-        slot = self._data_buf[idx]
-        if slot["sequence"] == 0 and idx == 0:
-            # Ambiguous: either no writes or exactly one write to slot 0.
-            # Disambiguate using the global sequence counter.
-            if int(self._write_seq[0]) == 0:
+    def read_latest(self) -> tuple[np.ndarray, int, int] | None:
+        """Return a verified ``(data, timestamp_ns, logical_sequence)`` frame."""
+        for _attempt in range(2):
+            idx = int(self._write_idx_view()[0])
+            slot = self._data_buf[idx]
+            seq1 = int(slot["sequence"])
+            if seq1 == 0 and idx == 0 and int(self._write_seq[0]) == 0:
                 return None
+            timestamp_ns = int(slot["timestamp_ns"])
+            data = slot["data"].copy().reshape(1)
+            seq2 = int(slot["sequence"])
+            if seq1 == seq2 and _seqlock_is_complete(seq1):
+                self._last_good = (data, timestamp_ns, _seqlock_to_logical(seq1))
+                return self._last_good
+        self._warn_torn_read()
+        return self._last_good
 
-        # Return a copy of the data (safe for consumer to hold)
-        return slot["data"].copy()
+    def get_last_k(self, k: int) -> list[tuple[np.ndarray, int, int]]:
+        """Return up to ``k`` independently verified frames, oldest first."""
+        if k <= 0:
+            return []
+        if k > self.maxlen:
+            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
+        latest_seq = int(self._write_seq[0])
+        if latest_seq == 0:
+            return []
+        frames: list[tuple[np.ndarray, int, int]] = []
+        dropped = False
+        for offset in range(min(k, latest_seq)):
+            target_seq = latest_seq - offset
+            slot = self._data_buf[target_seq % self.maxlen]
+            accepted = False
+            for _attempt in range(2):
+                seq1 = int(slot["sequence"])
+                if not _seqlock_is_complete(seq1):
+                    continue
+                if _seqlock_to_logical(seq1) != target_seq:
+                    frames.reverse()
+                    if dropped:
+                        self._warn_torn_read_k(k, len(frames))
+                    return frames
+                timestamp_ns = int(slot["timestamp_ns"])
+                data = slot["data"].copy().reshape(1)
+                seq2 = int(slot["sequence"])
+                if seq1 == seq2 and _seqlock_is_complete(seq2) and _seqlock_to_logical(seq2) == target_seq:
+                    frames.append((data, timestamp_ns, target_seq))
+                    accepted = True
+                    break
+            if not accepted:
+                dropped = True
+        frames.reverse()
+        if dropped:
+            self._warn_torn_read_k(k, len(frames))
+        return frames
 
     def frame_age_ns(self) -> int:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""
@@ -239,7 +292,7 @@ class SharedMemoryRingBuffer:
         return {"name": self.name, "dtype": self.dtype, "maxlen": self.maxlen}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        SharedMemoryRingBuffer.__init__(
+        type(self).__init__(
             self, state["name"], np.dtype(state["dtype"]), maxlen=int(state["maxlen"]), create=False
         )
 
@@ -259,6 +312,34 @@ class SharedMemoryRingBuffer:
     def _write_idx_view(self) -> np.ndarray:
         """Return a writeable view of the write_idx as a uint64 array of length 1."""
         return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
+
+    def _warn_torn_read(self) -> None:
+        now_ns = time.monotonic_ns()
+        if now_ns - self._last_torn_warn_ns < TORN_WARN_INTERVAL_NS:
+            return
+        self._last_torn_warn_ns = now_ns
+        logger.warning(
+            "Shared-memory ring %s had a persistent torn read; returning %s",
+            self.name,
+            "last-good frame" if self._last_good is not None else "None",
+        )
+
+    def _warn_torn_read_k(self, k: int, recovered: int) -> None:
+        now_ns = time.monotonic_ns()
+        if now_ns - self._last_torn_warn_k_ns < TORN_WARN_INTERVAL_NS:
+            return
+        self._last_torn_warn_k_ns = now_ns
+        logger.warning(
+            "Shared-memory ring %s recovered %d/%d history frames",
+            self.name,
+            recovered,
+            k,
+        )
+
+
+# The explicit name documents the only supported structured-ring semantics.
+# Keep SharedMemoryRingBuffer as a compatibility alias for external imports.
+SeqlockRingBuffer = SharedMemoryRingBuffer
 
 
 class CameraRingBuffer:

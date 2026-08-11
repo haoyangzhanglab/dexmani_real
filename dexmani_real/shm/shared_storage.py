@@ -18,8 +18,6 @@ from dexmani_real.ipc.schema import (
     ACK_DTYPE,
     ARM_STATE_DTYPE,
     COMMIT_DTYPE,
-    COMPONENT_METRICS_DTYPE,
-    COMPONENT_STATUS_DTYPE,
     HAND_COMMAND_DTYPE,
     HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
@@ -65,12 +63,11 @@ class SharedStorageConfig:
     hand_cmd_ring_maxlen: int = 8
     action_commit_ring_maxlen: int = 8
     action_ack_ring_maxlen: int = 16
-    component_status_ring_maxlen: int = 32
-    component_metrics_ring_maxlen: int = 8
     record_control_ring_maxlen: int = 8
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 16
     inference_candidate_ring_maxlen: int = 16
+    enable_inference: bool = False
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
@@ -97,8 +94,6 @@ class SharedStorageConfig:
             self.hand_cmd_ring_maxlen,
             self.action_commit_ring_maxlen,
             self.action_ack_ring_maxlen,
-            self.component_status_ring_maxlen,
-            self.component_metrics_ring_maxlen,
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
@@ -117,7 +112,7 @@ class SharedStorageConfig:
             raise ValueError("SharedStorage hand_home_qpos_rad must be finite shape (12,)")
 
     @classmethod
-    def from_runtime(cls, runtime: object) -> "SharedStorageConfig":
+    def from_runtime(cls, runtime: object, *, enable_inference: bool = False) -> "SharedStorageConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
         arm_cfg = getattr(runtime, "arm")
@@ -140,6 +135,7 @@ class SharedStorageConfig:
             hand_loop_hz=float(hand_cfg.loop_hz),
             hand_home_qpos_rad=tuple(float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)),
             workspace_bounds=bounds,
+            enable_inference=enable_inference,
         )
 
 
@@ -177,11 +173,6 @@ _RING_RESOURCE_NAMES = (
     "action_commit_ring",
     "arm_ack_ring",
     "hand_ack_ring",
-    "component_status_ring",
-    "arm_metrics_ring",
-    "hand_metrics_ring",
-    "camera_metrics_ring",
-    "policy_metrics_ring",
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
@@ -213,15 +204,10 @@ class SharedStorage:
     action_commit_ring: SeqlockRingBuffer  # coordinator -> arm + hand
     arm_ack_ring: SeqlockRingBuffer  # arm -> coordinator
     hand_ack_ring: SeqlockRingBuffer  # hand -> coordinator
-    component_status_ring: SeqlockRingBuffer  # workers -> supervisor diagnostics
-    arm_metrics_ring: SeqlockRingBuffer  # arm -> supervisor, single writer
-    hand_metrics_ring: SeqlockRingBuffer  # hand -> supervisor, single writer
-    camera_metrics_ring: SeqlockRingBuffer  # camera -> supervisor, single writer
-    policy_metrics_ring: SeqlockRingBuffer  # policy -> supervisor, single writer
     record_control_ring: SeqlockRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SeqlockRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SeqlockRingBuffer  # RecorderIO -> policy/main
-    inference_candidate_ring: SeqlockRingBuffer  # Inference -> coordinator only
+    inference_candidate_ring: Any  # experimental capability; None unless explicitly enabled
 
     arm_action_q: mp.Queue  # policy -> arm, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
@@ -246,7 +232,7 @@ class SharedStorage:
     hand_heartbeat_s: Any
     policy_heartbeat_s: Any
     recorder_heartbeat_s: Any
-    inference_heartbeat_s: Any
+    inference_heartbeat_s: Any  # None unless experimental inference is enabled
     vr_heartbeat_s: Any
     camera_heartbeat_s: Any
 
@@ -255,9 +241,8 @@ class SharedStorage:
     camera_ready: Any  # -> Main
     vr_ready: Any  # -> Main
     policy_ready: Any  # -> Main, only after policy/backend warmup
-    inference_ready: Any  # optional capability -> Main
+    inference_ready: Any  # None unless experimental inference is enabled
     recorder_ready: Any  # optional capability -> Main
-    component_status_lock: Any  # serializes the multi-producer diagnostic ring
 
     arm_device_identity: Any  # worker-reported canonical identity JSON
     hand_device_identity: Any  # worker-reported canonical identity JSON
@@ -267,7 +252,7 @@ class SharedStorage:
     camera_firmware: Any  # firmware version string
     camera_sdk_version: Any  # pyrealsense2/librealsense version string
     camera_profile: Any  # actual color/depth profile JSON
-    camera_observation_required: Any  # learned policy requests camera payload publication
+    camera_observation_required: Any  # None unless experimental inference is enabled
     _closed: bool = field(init=False, repr=False, default=False)
     _close_completed_operations: set[str] = field(init=False, repr=False, default_factory=set)
 
@@ -364,21 +349,6 @@ class SharedStorage:
         storage.hand_ack_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_hand_ack", dtype=ACK_DTYPE, maxlen=cfg.action_ack_ring_maxlen
         )
-        storage.component_status_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_component_status",
-            dtype=COMPONENT_STATUS_DTYPE,
-            maxlen=cfg.component_status_ring_maxlen,
-        )
-        for component in ("arm", "hand", "camera", "policy"):
-            setattr(
-                storage,
-                f"{component}_metrics_ring",
-                SeqlockRingBuffer.create_or_replace(
-                    f"{prefix}_{component}_metrics",
-                    dtype=COMPONENT_METRICS_DTYPE,
-                    maxlen=cfg.component_metrics_ring_maxlen,
-                ),
-            )
         storage.record_control_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=cfg.record_control_ring_maxlen
         )
@@ -390,10 +360,14 @@ class SharedStorage:
         storage.record_status_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_record_status", dtype=RECORD_STATUS_DTYPE, maxlen=cfg.record_status_ring_maxlen
         )
-        storage.inference_candidate_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_inference_candidate",
-            dtype=INFERENCE_CANDIDATE_DTYPE,
-            maxlen=cfg.inference_candidate_ring_maxlen,
+        storage.inference_candidate_ring = (
+            SeqlockRingBuffer.create_or_replace(
+                f"{prefix}_inference_candidate",
+                dtype=INFERENCE_CANDIDATE_DTYPE,
+                maxlen=cfg.inference_candidate_ring_maxlen,
+            )
+            if cfg.enable_inference
+            else None
         )
 
         storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
@@ -419,7 +393,7 @@ class SharedStorage:
         storage.hand_heartbeat_s = ctx.Value("d", 0.0)
         storage.policy_heartbeat_s = ctx.Value("d", 0.0)
         storage.recorder_heartbeat_s = ctx.Value("d", 0.0)
-        storage.inference_heartbeat_s = ctx.Value("d", 0.0)
+        storage.inference_heartbeat_s = ctx.Value("d", 0.0) if cfg.enable_inference else None
         storage.vr_heartbeat_s = ctx.Value("d", 0.0)
         storage.camera_heartbeat_s = ctx.Value("d", 0.0)
 
@@ -428,9 +402,8 @@ class SharedStorage:
         storage.camera_ready = ctx.Event()
         storage.vr_ready = ctx.Event()
         storage.policy_ready = ctx.Event()
-        storage.inference_ready = ctx.Event()
+        storage.inference_ready = ctx.Event() if cfg.enable_inference else None
         storage.recorder_ready = ctx.Event()
-        storage.component_status_lock = ctx.Lock()
 
         storage.arm_device_identity = ctx.Array("c", b"\x00" * 1024)
         storage.hand_device_identity = ctx.Array("c", b"\x00" * 1024)
@@ -440,7 +413,7 @@ class SharedStorage:
         storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
         storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
         storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
-        storage.camera_observation_required = ctx.Value("b", False)
+        storage.camera_observation_required = ctx.Value("b", False) if cfg.enable_inference else None
 
     def close(self) -> bool:
         """Release all shared memory primitives.
@@ -541,113 +514,17 @@ def publish_component_status(
     exit_reason: ExitReason = ExitReason.NONE,
     detail: str = "",
 ) -> None:
-    """Publish one structured component health transition when available.
-
-    Minimal offline mocks and older external façades may omit the diagnostic
-    ring; status reporting is observability-only and must not mask the worker's
-    primary safety behavior in that compatibility case.
-    """
-    ring = getattr(shared, "component_status_ring", None)
-    if ring is None:
-        return
-    frame = new_frame(COMPONENT_STATUS_DTYPE)
-    frame["component"][0] = component.encode("utf-8")[:24]
-    frame["phase"][0] = int(phase)
-    frame["fault_code"][0] = int(fault_code)
-    frame["exit_reason"][0] = int(exit_reason)
-    generation = getattr(shared, "session_generation", None)
-    frame["generation"][0] = int(generation.value) if generation is not None else 0
-    frame["updated_monotonic_ns"][0] = time.monotonic_ns()
-    frame["detail"][0] = detail.encode("utf-8")[:160]
-    lock = getattr(shared, "component_status_lock", None)
-    if lock is None:
-        ring.write(frame)
-    else:
-        with lock:
-            ring.write(frame)
-
-
-def publish_component_metrics(
-    shared: Any,
-    component: str,
-    rate_manager: Any,
-    *,
-    interval_s: float = 1.0,
-    now_s: float | None = None,
-) -> bool:
-    """Best-effort, at-most-once-per-interval publication of loop metrics.
-
-    Metrics are observability-only: every exception is contained here so a
-    diagnostics failure cannot block a worker or replace its original fault.
-    """
-    try:
-        now = time.monotonic() if now_s is None else float(now_s)
-        marker_name = "_dexmani_metrics_last_publish_s"
-        last = float(getattr(rate_manager, marker_name, float("-inf")))
-        if now - last < interval_s:
-            return False
-        setattr(rate_manager, marker_name, now)
-        ring = getattr(shared, f"{component}_metrics_ring", None)
-        if ring is None:
-            return False
-        stats = rate_manager.stats
-        frame = new_frame(COMPONENT_METRICS_DTYPE)
-        frame["component"][0] = component.encode("utf-8")[:16]
-        for field_name in (
-            "target_period_s",
-            "loop_count",
-            "last_work_duration_s",
-            "max_work_duration_s",
-            "deadline_overrun_count",
-            "missed_slot_count",
-            "long_block_reanchor_count",
-            "elapsed_s",
-            "actual_hz",
-        ):
-            frame[field_name][0] = getattr(stats, field_name)
-        frame["updated_monotonic_ns"][0] = time.monotonic_ns()
-        ring.write(frame)
-        return True
-    except Exception:
-        logger.warning("component=%s metrics publication failed", component, exc_info=True)
-        return False
-
-
-def read_component_metrics(shared: Any, component: str) -> dict[str, float | int | str] | None:
-    ring = getattr(shared, f"{component}_metrics_ring", None)
-    if ring is None:
-        return None
-    result = ring.read_latest()
-    if result is None:
-        return None
-    frame, _timestamp_ns, _sequence = result
-    return {
-        "component": bytes(frame["component"][0]).rstrip(b"\x00").decode("utf-8", errors="replace"),
-        "target_period_s": float(frame["target_period_s"][0]),
-        "loop_count": int(frame["loop_count"][0]),
-        "last_work_duration_s": float(frame["last_work_duration_s"][0]),
-        "max_work_duration_s": float(frame["max_work_duration_s"][0]),
-        "deadline_overrun_count": int(frame["deadline_overrun_count"][0]),
-        "missed_slot_count": int(frame["missed_slot_count"][0]),
-        "long_block_reanchor_count": int(frame["long_block_reanchor_count"][0]),
-        "elapsed_s": float(frame["elapsed_s"][0]),
-        "actual_hz": float(frame["actual_hz"][0]),
-    }
-
-
-def format_component_metrics_summary(shared: Any) -> str:
-    parts: list[str] = []
-    for component in ("arm", "hand", "camera", "policy"):
-        metrics = read_component_metrics(shared, component)
-        if metrics is None:
-            continue
-        parts.append(
-            f"{component}={metrics['actual_hz']:.1f}Hz/"
-            f"max={1000.0 * float(metrics['max_work_duration_s']):.1f}ms/"
-            f"over={metrics['deadline_overrun_count']}/miss={metrics['missed_slot_count']}/"
-            f"reanchor={metrics['long_block_reanchor_count']}"
-        )
-    return ", ".join(parts) if parts else "unavailable"
+    """Log an optional component transition without creating a second health plane."""
+    del shared
+    log = logger.error if phase is ComponentPhase.FAULT else logger.debug
+    log(
+        "component=%s phase=%s fault=%s exit=%s detail=%s",
+        component,
+        phase.name,
+        fault_code.name,
+        exit_reason.name,
+        detail,
+    )
 
 
 def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":

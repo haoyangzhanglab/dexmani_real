@@ -1,4 +1,4 @@
-"""Certificate-gated trajectory execution through SharedStorage workers."""
+"""Preflight-gated trajectory execution through SharedStorage workers."""
 
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ def hand_feedback_is_healthy(
 
 
 class TrajectoryReplayer:
-    """Replay one certified command stream through arm and hand workers."""
+    """Replay one preflight-validated command stream through arm and hand workers."""
 
     START_POSE_TOLERANCE_DEG = 5.0
 
@@ -212,7 +212,7 @@ class TrajectoryReplayer:
         first_hand_cmd: np.ndarray | None = None,
         hand_qpos: np.ndarray | None = None,
     ) -> bool:
-        """Require measured joints to already be close to the certified start."""
+        """Require measured joints to already be close to the validated start."""
         max_dev = float(np.max(np.rad2deg(np.abs(arm_qpos - first_arm_cmd))))
         if first_hand_cmd is not None:
             if hand_qpos is None:
@@ -222,7 +222,7 @@ class TrajectoryReplayer:
         if np.isfinite(max_dev) and max_dev <= self.START_POSE_TOLERANCE_DEG:
             return True
         print(f"\nRobot is {max_dev:.1f}° from the trajectory start (limit {self.START_POSE_TOLERANCE_DEG:.1f}°).")
-        print("Move to the certified start pose in a separate supervised procedure, then retry replay.")
+        print("Move to the validated start pose in a separate supervised procedure, then retry replay.")
         return False
 
     def _outcome(self) -> ReplayOutcome:
@@ -444,7 +444,7 @@ class TrajectoryReplayer:
                 initial_hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
         if not self._align_to_start(first_arm_cmd, arm_state["qpos"], first_hand_cmd, initial_hand_qpos):
             self._status = ReplayStatus.REJECTED
-            self._reason = "robot is not at the certified trajectory start"
+            self._reason = "robot is not at the validated trajectory start"
             return self._outcome()
 
         shared = self.shared
