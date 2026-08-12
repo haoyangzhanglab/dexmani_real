@@ -12,11 +12,10 @@ import numpy as np
 
 from dexmani_real.config.defaults import policy, safety
 from dexmani_real.utils.schema import HAND_JOINT_SHAPE
-from dexmani_real.policy.action_protocol import (
-    ActionSafetyGate,
-    JointActionScheduler,
-    SafeCommandPublisher,
+from dexmani_real.policy.safety import (
+    SafetyGate,
     advance_policy_epoch,
+    send_command,
 )
 from dexmani_real.policy.inference_process import decode_candidate
 from dexmani_real.policy.observation_sources import SharedObservationSource
@@ -92,7 +91,7 @@ def learned_policy_loop(
     from dexmani_real import ASSET_DIR
     from dexmani_real.planning.planner import PlanningProfile, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
     from dexmani_real.planning.types import Pose
-    from dexmani_real.policy.action_protocol import ActionSafetyGateConfig, planner_action_safety_gate
+    from dexmani_real.policy.safety import ActionSafetyGateConfig, planner_action_safety_gate
     from dexmani_real.robot.safety import SafetyState, transition
     from dexmani_real.runtime.status import ComponentPhase, FaultCode
     from dexmani_real.shm.shared_storage import publish_component_status
@@ -287,6 +286,81 @@ def learned_policy_loop(
         logger.info("learned policy coordinator exited")
 
 
+class JointActionScheduler:
+    """Policy-owned chunk overlap, replacement, expiry, and per-tick scheduler."""
+
+    def __init__(self, action_spec: Any) -> None:
+        self.action_spec = action_spec
+        self._future: list[Any] = []
+        self._all_late = False
+
+    def submit(self, chunk: Any, *, now_monotonic_ns: int | None = None) -> None:
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        self._future.clear()
+        accepted = [
+            step
+            for step in chunk.steps
+            if step.target_monotonic_ns > now_ns and step.valid_until_monotonic_ns >= now_ns
+        ]
+        self._all_late = not accepted
+        self._future.extend(accepted)
+        self._future.sort(key=lambda step: (step.target_monotonic_ns, step.action_id))
+
+    def reset(self) -> None:
+        self._future.clear()
+        self._all_late = False
+
+    @property
+    def pending(self) -> tuple[Any, ...]:
+        return tuple(self._future)
+
+    @property
+    def all_late(self) -> bool:
+        return self._all_late
+
+    def pop_ready(self, *, lead_time_s: float, now_monotonic_ns: int | None = None) -> Any | None:
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        self._future = [
+            s for s in self._future if s.target_monotonic_ns > now_ns and s.valid_until_monotonic_ns >= now_ns
+        ]
+        if not self._future:
+            self._all_late = True
+            return None
+        ready = [s for s in self._future if s.target_monotonic_ns <= now_ns + int(lead_time_s * 1e9)]
+        if not ready:
+            return None
+        selected = ready[0]
+        self._future = [s for s in self._future if s.action_id != selected.action_id]
+        return selected
+
+    def make_coordinated_hold(
+        self,
+        *,
+        template: Any,
+        arm_qpos: np.ndarray,
+        hand_qpos: np.ndarray | None,
+        action_id: int,
+        now_monotonic_ns: int | None = None,
+    ) -> Any:
+        from dexmani_real.policy.runtime import ActionCandidate
+
+        now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        return ActionCandidate(
+            observation_id=template.observation_id,
+            session_generation=template.session_generation,
+            policy_epoch=template.policy_epoch,
+            action_id=int(action_id),
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns + int(2 * self.action_spec.dt_s * 1e9),
+            valid_until_monotonic_ns=now_ns + int(self.action_spec.dt_s * 1e9),
+            arm_qpos=np.asarray(arm_qpos, dtype=np.float64),
+            hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
+            chunk_id=template.chunk_id,
+            step_index=template.step_index,
+            is_hold=True,
+        )
+
+
 class LearnedPolicyCoordinator:
     """Own snapshots, candidate IDs, SafetyGate, scheduling, and publication.
 
@@ -299,7 +373,7 @@ class LearnedPolicyCoordinator:
         shared: Any,
         inference: PolicySpec,
         tensor_block: ObservationTensorBlock,
-        safety_gate: ActionSafetyGate,
+        safety_gate: SafetyGate,
         *,
         config: LearnedCoordinatorConfig | None = None,
     ) -> None:
@@ -312,7 +386,6 @@ class LearnedPolicyCoordinator:
         self.config = config or LearnedCoordinatorConfig()
         self.sources = SharedObservationSource(shared, inference.observation)
         self.scheduler = JointActionScheduler(inference.action)
-        self.publisher = SafeCommandPublisher(shared)
         self._snapshots: dict[int, ObservationSnapshot] = {}
         self._last_snapshot_ns = 0
         self._last_candidate_sequence = 0
@@ -514,8 +587,8 @@ class LearnedPolicyCoordinator:
         if not result.accepted or result.candidate is None:
             logger.warning("learned candidate rejected: %s", result.reason)
             return CoordinatorTick.REJECTED
-        if not self.publisher.publish(result.candidate, prepare_timeout_s=self.config.prepare_timeout_s):
-            raise TimeoutError("learned action prepare/commit failed")
+        if not send_command(self.shared, result.candidate, prepare_timeout_s=self.config.prepare_timeout_s):
+            raise TimeoutError("learned action publish failed")
         return CoordinatorTick.PUBLISHED
 
     def _publish_coordinated_hold(self, *, now_ns: int) -> None:
@@ -541,8 +614,6 @@ class LearnedPolicyCoordinator:
         )
         if self._publish_candidate(hold, now_ns=now_ns) is not CoordinatorTick.PUBLISHED:
             raise RuntimeError("coordinated hold was rejected")
-        if not self.publisher.wait_applied(hold, timeout_s=self.config.apply_timeout_s):
-            raise TimeoutError("coordinated hold was not applied")
         self._hold_published = True
 
     def begin_new_epoch(self, *, now_monotonic_ns: int | None = None) -> int:

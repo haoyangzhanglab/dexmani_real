@@ -61,22 +61,20 @@ class ControlHold:
         self.applied_monotonic_ns = 0
         self.deadline_s = float(deadline_s)
 
-    def observe_application(
-        self,
-        application_state: str,
-        *,
-        applied_monotonic_ns: int | None,
-        now_s: float,
-    ) -> HoldApplication:
-        """Advance the acknowledgement state without reading clocks or shared memory."""
+    def observe_delivery(self, sent_at_s: float | None, *, now_s: float, hold_delivery_s: float = 0.15) -> HoldApplication:
+        """Check whether the hold has had time to propagate through the workers.
+
+        Without ACK protocol, we wait ``hold_delivery_s`` after the command was
+        sent (enough for the arm queue to drain and both workers to apply).
+        """
         if self.candidate is None or self.applied:
             return "idle"
-        if application_state == "applied" and applied_monotonic_ns is not None and applied_monotonic_ns > 0:
+        if sent_at_s is not None and now_s - sent_at_s >= hold_delivery_s:
             self.applied = True
-            self.applied_monotonic_ns = int(applied_monotonic_ns)
+            self.applied_monotonic_ns = int(sent_at_s * 1e9)
             self.deadline_s = None
             return "applied"
-        if application_state == "failed" or (self.deadline_s is not None and now_s >= self.deadline_s):
+        if self.deadline_s is not None and now_s >= self.deadline_s:
             return "failed"
         return "pending"
 

@@ -15,12 +15,10 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.policy.action_protocol import (
-    ActionSafetyGate,
-    ActionSafetyGateConfig,
+from dexmani_real.policy.safety import (
+    SafetyGate,
+    send_command,
     advance_policy_epoch,
-    planner_action_safety_gate,
-    publish_joint_targets,
 )
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
@@ -57,14 +55,13 @@ from dexmani_real.teleop.recording_session import (
     build_episode_start_kwargs,
 )
 from dexmani_real.teleop.safety import (
-    _candidate_application_state,
-    _candidate_applied_monotonic_ns,
     _contact_stall_detected,
     _do_configured_teleop_home,
-    _feedback_after_hold,
+    _feedback_after_send,
+    _hold_delivered,
     _reset_mapper_from_frames,
     _transition_collision_free,
-    _vr_after_hold,
+    _vr_after_send,
 )
 from dexmani_real.teleop.snapshot import (
     CameraFreshnessTracker,
@@ -98,21 +95,20 @@ def _load_vr_transform(path: Path) -> tuple[np.ndarray, str]:
     return transform, str(config.get("theta_deg", "?"))
 
 
-def _action_safety_config(config: TeleopConfig) -> ActionSafetyGateConfig:
-    """Build the teleoperation action gate from its control-domain limits."""
-    return ActionSafetyGateConfig(
+def _build_safety_gate(config: TeleopConfig) -> SafetyGate:
+    """Build the teleoperation safety gate from control-domain limits."""
+    hand_max_vel = (
+        float(config.hand_max_delta_rad) * config.control_hz
+        if config.hand_max_delta_rad is not None
+        else float(np.deg2rad(config.hand_safety_gate_max_velocity_deg_per_s))
+    )
+    return SafetyGate(
         arm_joint_lower_rad=tuple(config.joint_limit_lower),
         arm_joint_upper_rad=tuple(config.joint_limit_upper),
         hand_joint_lower_rad=tuple(config.hand_qpos_lower_rad),
         hand_joint_upper_rad=tuple(config.hand_qpos_upper_rad),
         arm_max_velocity_rad_s=float(np.deg2rad(config.joint_max_speed_deg_s)),
-        hand_max_velocity_rad_s=(
-            float(config.hand_max_delta_rad) * config.control_hz
-            if config.hand_max_delta_rad is not None
-            else float(np.deg2rad(config.hand_safety_gate_max_velocity_deg_per_s))
-        ),
-        observation_max_age_s=config.vr_stale_threshold_s,
-        require_geometry_checks=True,
+        hand_max_velocity_rad_s=hand_max_vel,
     )
 
 
@@ -250,12 +246,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             base_to_world_rot=np.eye(3, dtype=np.float64),
         )
 
-        action_safety_gate = planner_action_safety_gate(
-            _action_safety_config(cfg),
-            planner=planner,
-            table_z_surface_m=cfg.contact_stall_table_z_surface_m,
-            hand_safety_margin_m=cfg.hand_safety_margin_m,
-        )
+        gate = _build_safety_gate(cfg)
+        gate.collision_check = planner.collision_model.check_collision
+        gate.workspace_check = planner.is_workspace_segment_safe
 
         recorder = RecorderClient(shared) if cfg.recording_enabled else None
     except Exception:
@@ -440,6 +433,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     _begin_audio_gate_deadline_s: float | None = None
     _ignore_begin_audio_until_silent = False
     _control_hold = ControlHold()
+    _hold_sent_at_s: float | None = None
     _reanchor_pending_reason: str | None = None
 
     # First Q leaves teleop active for an optional home; the next Q exits.
@@ -488,7 +482,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
     def _enter_measured_hold(reason: str) -> bool:
-        """Invalidate old endpoints and commit one measured arm/hand hold."""
+        """Invalidate old endpoints and publish one measured arm/hand hold."""
         nonlocal _reanchor_pending_reason
         nonlocal prev_qpos_cmd, prev_hand_qpos, ema_prev_pos, ema_prev_quat
         nonlocal _hand_ramp_start, _hand_ramp_step
@@ -538,13 +532,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             measured_hand,
             is_hold=True,
             timeout=cfg.action_prepare_timeout_s,
-            safety_gate=action_safety_gate,
+            safety_gate=gate,
         )
         if candidate is None:
             logger.error("teleop_loop: failed to publish %s hold after advancing to epoch=%d", reason, epoch)
             return False
 
         _control_hold.begin(reason, candidate, deadline_s=time.monotonic() + cfg.action_apply_timeout_s)
+        _hold_sent_at_s = time.monotonic()
         _reanchor_pending_reason = reason
         prev_qpos_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
         if candidate.hand_qpos is not None:
@@ -554,7 +549,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         _hand_ramp_start = None
         _hand_ramp_step = 0
         logger.info(
-            "teleop_loop: %s hold committed (epoch=%d action_id=%d)",
+            "teleop_loop: %s hold published (epoch=%d action_id=%d)",
             reason,
             epoch,
             candidate.action_id,
@@ -614,29 +609,20 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             shared.policy_heartbeat_s.value = time.monotonic()
             limiter.wait()
             if _control_hold.application_pending:
-                _hold_candidate = _control_hold.candidate
-                assert _hold_candidate is not None
-                _hold_state = _candidate_application_state(shared, _hold_candidate)
-                _applied_ns = (
-                    _candidate_applied_monotonic_ns(shared, _hold_candidate) if _hold_state == "applied" else None
-                )
-                _hold_result = _control_hold.observe_application(
-                    _hold_state,
-                    applied_monotonic_ns=_applied_ns,
+                _hold_result = _control_hold.observe_delivery(
+                    _hold_sent_at_s,
                     now_s=time.monotonic(),
                 )
                 if _hold_result == "applied":
                     logger.info(
                         "teleop_loop: %s hold applied (action_id=%d)",
                         _control_hold.reason,
-                        _hold_candidate.action_id,
+                        _control_hold.candidate.action_id if _control_hold.candidate else 0,
                     )
                 elif _hold_result == "failed":
                     logger.error(
-                        "teleop_loop: %s hold failed to reach APPLIED (state=%s action_id=%d)",
+                        "teleop_loop: %s hold delivery timed out",
                         _control_hold.reason,
-                        _hold_state,
-                        _hold_candidate.action_id,
                     )
                     shared.error_state.value = True
                     break
@@ -680,7 +666,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                             planner=planner,
                             audio=audio,
                             estop_requested=_keyboard_estop_requested,
-                            action_safety_gate=action_safety_gate,
+                            safety_gate=gate,
                         )
                         limiter.reset()
                         print("  [Q] quit", flush=True)
@@ -783,7 +769,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                                 estop_requested=_keyboard_estop_requested,
                                 arm_mapper=arm_mapper,
                                 hand_retargeter=hand_retargeter,
-                                action_safety_gate=action_safety_gate,
+                                safety_gate=gate,
                             )
 
                     # Enter post-teleop state (two-stage Q) instead of immediate exit.
@@ -818,7 +804,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         estop_requested=_keyboard_estop_requested,
                         arm_mapper=arm_mapper,
                         hand_retargeter=hand_retargeter,
-                        action_safety_gate=action_safety_gate,
+                        safety_gate=gate,
                     )
                     limiter.reset()
                     skip_rest = True
@@ -1056,16 +1042,16 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     and _control_hold.active
                     and _control_hold.applied
                     and _control_hold.candidate is not None
-                    and _control_hold.applied_monotonic_ns > 0
-                    and _vr_after_hold(vr_frame, _control_hold.applied_monotonic_ns)
-                    and _feedback_after_hold(
+                    and _hold_sent_at_s is not None
+                    and _vr_after_send(vr_frame, _hold_sent_at_s)
+                    and _feedback_after_send(
                         arm_state,
                         hand_state,
                         _control_hold.candidate,
-                        _control_hold.applied_monotonic_ns,
+                        _hold_sent_at_s,
                     )
                 ):
-                    assert vr_frame is not None  # _vr_after_hold() proved the frame exists
+                    assert vr_frame is not None  # _vr_after_send() proved the frame exists
                     if _complete_reanchor(arm_state, vr_frame, hand_state):
                         logger.info("teleop_loop: released %s hold after fresh re-anchor", _control_hold.reason)
                         _control_hold.clear()
@@ -1163,7 +1149,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     timeout=cfg.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
+                    safety_gate=gate,
                 )
                 if published_hold is None:
                     shared.error_state.value = True
@@ -1262,7 +1248,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     timeout=cfg.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
+                    safety_gate=gate,
                 )
                 if published_hold is None:
                     shared.error_state.value = True
@@ -1360,7 +1346,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         timeout=cfg.action_prepare_timeout_s,
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                        safety_gate=action_safety_gate,
+                        safety_gate=gate,
                     )
                     if published_candidate is None:
                         shared.error_state.value = True
@@ -1377,7 +1363,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         timeout=cfg.action_prepare_timeout_s,
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                        safety_gate=action_safety_gate,
+                        safety_gate=gate,
                     )
                     if published_candidate is None:
                         shared.error_state.value = True
@@ -1445,7 +1431,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     timeout=cfg.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=action_safety_gate,
+                    safety_gate=gate,
                 )
                 if published_hold is None:
                     shared.error_state.value = True
@@ -1503,10 +1489,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 timeout=cfg.action_prepare_timeout_s,
                 observation_id=int(vr_frame["ring_sequence"]),
                 observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                safety_gate=action_safety_gate,
+                safety_gate=gate,
             )
             if published_candidate is None:
-                logger.error("teleop_loop: joint prepare/commit failed — actuator unresponsive")
+                logger.error("teleop_loop: joint publish failed — actuator unresponsive")
                 shared.error_state.value = True
                 break
             stage_timer.mark("send")
@@ -1597,9 +1583,9 @@ def _safe_arm_queue_put(
     timeout: float,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
-    safety_gate: ActionSafetyGate | None = None,
+    safety_gate: SafetyGate | None = None,
 ) -> ActionCandidate | None:
-    """Compatibility wrapper over the unified prepare/commit publisher."""
+    """Publish a single arm command through the safety gate (fire-and-forget)."""
     try:
         return _safe_joint_publish(
             shared,
@@ -1607,8 +1593,6 @@ def _safe_arm_queue_put(
             None,
             is_hold=bool(action.get("is_hold", False)),
             timeout=timeout,
-            observation_id=observation_id,
-            observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
             safety_gate=safety_gate,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -1624,20 +1608,72 @@ def _safe_joint_publish(
     is_hold: bool = False,
     timeout: float,
     observation_id: int | None = None,
-    observation_anchor_monotonic_ns: int | None = None,
-    safety_gate: ActionSafetyGate | None = None,
+    safety_gate: SafetyGate | None = None,
 ) -> ActionCandidate | None:
-    """Publish one identity-correlated arm/hand endpoint through prepare/commit."""
-    return publish_joint_targets(
-        shared,
-        np.asarray(arm_qpos, dtype=np.float64),
-        None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
+    """Validate through SafetyGate and publish via fire-and-forget send_command."""
+    if safety_gate is None:
+        logger.error("joint target rejected: SafetyGate is required")
+        return None
+    gate = safety_gate
+
+    with shared.arm_command_seq.get_lock():
+        action_id = int(shared.arm_command_seq.value) + 1
+        shared.arm_command_seq.value = action_id
+    now_ns = time.monotonic_ns()
+
+    candidate = ActionCandidate(
+        observation_id=action_id if observation_id is None else int(observation_id),
+        session_generation=int(shared.session_generation.value),
+        policy_epoch=int(shared.policy_epoch.value),
+        action_id=action_id,
+        created_monotonic_ns=now_ns,
+        target_monotonic_ns=now_ns + int(0.05 * 1e9),
+        valid_until_monotonic_ns=now_ns + int(0.5 * 1e9),
+        arm_qpos=np.asarray(arm_qpos, dtype=np.float64),
+        hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
+        chunk_id=action_id,
+        step_index=0,
         is_hold=is_hold,
-        prepare_timeout_s=timeout,
-        observation_id=observation_id,
-        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
-        safety_gate=safety_gate,
     )
+
+    # Read current arm/hand feedback for the gate
+    arm_result = shared.arm_state_ring.read_latest()
+    if arm_result is None:
+        logger.warning("joint target rejected: arm feedback unavailable")
+        return None
+    arm_record = arm_result[0][0]
+    if not bool(arm_record["connected"]) or not bool(arm_record["state_valid"]):
+        logger.warning("joint target rejected: arm feedback unhealthy")
+        return None
+    current_arm = np.asarray(arm_record["qpos"][0], dtype=np.float64)
+    if current_arm.shape != (7,) or not np.all(np.isfinite(current_arm)):
+        return None
+
+    current_hand = np.zeros(12, dtype=np.float64)
+    hand_result = shared.hand_state_ring.read_latest()
+    if hand_result is not None:
+        hand_record = hand_result[0][0]
+        if bool(hand_record["connected"]) and bool(hand_record["state_valid"]):
+            current_hand = np.asarray(hand_record["qpos"][0], dtype=np.float64)
+    elif hand_qpos is not None:
+        logger.warning("joint target rejected: hand feedback unavailable")
+        return None
+
+    ctrl_dt = 1.0 / float(shared.action_control_hz)
+    gate_result = gate.validate(
+        candidate,
+        current_arm_qpos=current_arm,
+        current_hand_qpos=current_hand,
+        dt_s=ctrl_dt,
+        session_generation=int(shared.session_generation.value),
+    )
+    if not gate_result.accepted or gate_result.candidate is None:
+        logger.warning("joint target rejected by SafetyGate: %s", gate_result.reason)
+        return None
+
+    if not send_command(shared, gate_result.candidate, prepare_timeout_s=timeout):
+        return None
+    return gate_result.candidate
 
 
 def _print_status(

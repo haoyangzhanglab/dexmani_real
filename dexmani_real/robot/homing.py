@@ -329,7 +329,7 @@ def send_arm_home(
                 print("  arm: invalid current qpos hint — homing cancelled", flush=True)
             return False
 
-    from dexmani_real.policy.action_protocol import advance_policy_epoch
+    from dexmani_real.policy.safety import advance_policy_epoch
 
     advance_policy_epoch(shared)
     _epoch_advanced_ns = time.monotonic_ns()

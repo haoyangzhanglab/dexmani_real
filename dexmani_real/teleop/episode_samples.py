@@ -18,7 +18,6 @@ from dexmani_real.utils.schema import (
 from dexmani_real.planning import Pose
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.policy.action_protocol import AckStatus
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.io_process import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
@@ -53,34 +52,6 @@ def _stop_recording(
             shared.is_recording.value = False
 
 
-def _latest_action_ack(ring, action_id: int) -> np.void | None:
-    """Return the newest verified ACK for one action without trusting latest-only state."""
-    if action_id <= 0:
-        return None
-    try:
-        frames = ring.get_last_k(ring.maxlen)
-    except Exception:
-        logger.warning("teleop: ACK history read failed", exc_info=True)
-        return None
-    result: np.void | None = None
-    for data, _publish_ns, _sequence in frames:
-        if int(data["action_id"][0]) == action_id:
-            result = data[0]
-    return result
-
-
-def _latest_ack_with_status(ring, status: int) -> np.void | None:
-    """Return the newest ACK event with one terminal status."""
-    try:
-        frames = ring.get_last_k(ring.maxlen)
-    except Exception:
-        logger.warning("teleop: ACK history read failed", exc_info=True)
-        return None
-    for data, _publish_ns, _sequence in reversed(frames):
-        if int(data["status"][0]) == status:
-            return data[0]
-    return None
-
 
 def _matching_source_sequence(ring: Any, frame: np.ndarray | None) -> int:
     """Recover the exact verified ring identity for one copied state frame."""
@@ -114,7 +85,7 @@ def _recording_provenance(
     anchor_monotonic_ns: int | None = None,
     action_candidate: ActionCandidate | None = None,
 ) -> dict[str, object]:
-    """Correlate one policy-grid sample with causal sources and action ACKs."""
+    """Correlate one policy-grid sample with causal sources and send metadata."""
     anchor_ns = time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
     if anchor_ns <= 0 or anchor_ns > time.monotonic_ns():
         raise ValueError("recording observation anchor must be a positive elapsed grid deadline")
@@ -171,37 +142,17 @@ def _recording_provenance(
     observation_valid = bool(np.all(required_mask)) and bool(np.nanmax(skew_s, initial=0.0) <= _OBSERVATION_MAX_SKEW_S)
 
     action_id = action_candidate.action_id if action_candidate is not None else 0
-    arm_ack = _latest_action_ack(shared.arm_ack_ring, action_id)
-    hand_ack = _latest_action_ack(shared.hand_ack_ring, action_id)
     observation_id = (
         action_candidate.observation_id
         if action_candidate is not None
         else int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
     )
     if observation_id <= 0:
-        # The grid anchor is a stable, positive identity for observations that
-        # intentionally have no VR frame (for example a stale-input hold).
         observation_id = anchor_ns
 
-    def _ack_value(ack: np.void | None, name: str) -> int:
-        return int(ack[name]) if ack is not None else 0
-
-    arm_applied_ns = _ack_value(arm_ack, "applied_monotonic_ns")
-    hand_applied_ns = _ack_value(hand_ack, "applied_monotonic_ns")
-    latest_arm_applied = _latest_ack_with_status(shared.arm_ack_ring, int(AckStatus.APPLIED))
-    latest_hand_applied = _latest_ack_with_status(shared.hand_ack_ring, int(AckStatus.APPLIED))
-    arm_applied_action_id = _ack_value(latest_arm_applied, "action_id")
-    hand_applied_action_id = _ack_value(latest_hand_applied, "action_id")
-    latest_arm_applied_ns = _ack_value(latest_arm_applied, "applied_monotonic_ns")
-    latest_hand_applied_ns = _ack_value(latest_hand_applied, "applied_monotonic_ns")
-    apply_skew_s = (
-        abs(latest_arm_applied_ns - latest_hand_applied_ns) / _NS_PER_SECOND
-        if arm_applied_action_id > 0
-        and arm_applied_action_id == hand_applied_action_id
-        and latest_arm_applied_ns > 0
-        and latest_hand_applied_ns > 0
-        else np.nan
-    )
+    # ACK-derived provenance fields are always zero since fire-and-forget
+    # migration (2026-08-12).  The keys are preserved for backward-compatible
+    # episode schema compatibility.
     tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
     tactile_fresh = (
         _field(hand_tactile, "fresh") == 1
@@ -237,29 +188,25 @@ def _recording_provenance(
         "action_valid_until_monotonic_ns": (
             action_candidate.valid_until_monotonic_ns if action_candidate is not None else 0
         ),
-        "action_queued": bool(
-            action_candidate is not None
-            and (action_candidate.arm_qpos is None or arm_ack is not None)
-            and (action_candidate.hand_qpos is None or hand_ack is not None)
-        ),
+        "action_queued": action_candidate is not None,
         "action_committed": action_candidate is not None,
-        "arm_ack_status": _ack_value(arm_ack, "status"),
-        "hand_ack_status": _ack_value(hand_ack, "status"),
-        "arm_ack_reject_reason": _ack_value(arm_ack, "reject_reason"),
-        "hand_ack_reject_reason": _ack_value(hand_ack, "reject_reason"),
-        "arm_ack_sdk_code": _ack_value(arm_ack, "sdk_code"),
-        "hand_ack_sdk_code": _ack_value(hand_ack, "sdk_code"),
-        "arm_received_monotonic_ns": _ack_value(arm_ack, "received_monotonic_ns"),
-        "hand_received_monotonic_ns": _ack_value(hand_ack, "received_monotonic_ns"),
-        "arm_prepared_monotonic_ns": _ack_value(arm_ack, "prepared_monotonic_ns"),
-        "hand_prepared_monotonic_ns": _ack_value(hand_ack, "prepared_monotonic_ns"),
-        "arm_applied_monotonic_ns": arm_applied_ns,
-        "hand_applied_monotonic_ns": hand_applied_ns,
-        "arm_latest_applied_action_id": arm_applied_action_id,
-        "hand_latest_applied_action_id": hand_applied_action_id,
-        "arm_latest_applied_monotonic_ns": latest_arm_applied_ns,
-        "hand_latest_applied_monotonic_ns": latest_hand_applied_ns,
-        "arm_hand_apply_skew_s": apply_skew_s,
+        "arm_ack_status": 0,
+        "hand_ack_status": 0,
+        "arm_ack_reject_reason": 0,
+        "hand_ack_reject_reason": 0,
+        "arm_ack_sdk_code": 0,
+        "hand_ack_sdk_code": 0,
+        "arm_received_monotonic_ns": 0,
+        "hand_received_monotonic_ns": 0,
+        "arm_prepared_monotonic_ns": 0,
+        "hand_prepared_monotonic_ns": 0,
+        "arm_applied_monotonic_ns": 0,
+        "hand_applied_monotonic_ns": 0,
+        "arm_latest_applied_action_id": 0,
+        "hand_latest_applied_action_id": 0,
+        "arm_latest_applied_monotonic_ns": 0,
+        "hand_latest_applied_monotonic_ns": 0,
+        "arm_hand_apply_skew_s": np.nan,
         "tactile_fresh": tactile_fresh,
         "tactile_source_monotonic_ns": tactile_source_ns,
         "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
@@ -301,7 +248,7 @@ def _record_held(
         diagnostics: Per-frame diagnostics (tracking_error, ik_solve_time_ms, etc.).
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
             ``action_arm_ee`` for replay.
-        action_candidate: Exact hold candidate committed for this observation,
+        action_candidate: Exact hold candidate published for this observation,
             or ``None`` when the grid intentionally emitted no new command.
     """
     if recorder is None:

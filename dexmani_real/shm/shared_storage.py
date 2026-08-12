@@ -15,9 +15,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm, camera, hand, policy
 from dexmani_real.utils.schema import (
-    ACK_DTYPE,
     ARM_STATE_DTYPE,
-    COMMIT_DTYPE,
     HAND_COMMAND_DTYPE,
     HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
@@ -61,8 +59,6 @@ class SharedStorageConfig:
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
-    action_commit_ring_maxlen: int = 8
-    action_ack_ring_maxlen: int = 16
     record_control_ring_maxlen: int = 8
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 16
@@ -92,8 +88,6 @@ class SharedStorageConfig:
             self.hand_state_ring_maxlen,
             self.hand_tactile_ring_maxlen,
             self.hand_cmd_ring_maxlen,
-            self.action_commit_ring_maxlen,
-            self.action_ack_ring_maxlen,
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
@@ -170,9 +164,6 @@ _RING_RESOURCE_NAMES = (
     "hand_state_ring",
     "hand_tactile_ring",
     "hand_cmd_ring",
-    "action_commit_ring",
-    "arm_ack_ring",
-    "hand_ack_ring",
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
@@ -201,9 +192,6 @@ class SharedStorage:
     hand_state_ring: SeqlockRingBuffer  # hand -> policy
     hand_tactile_ring: SeqlockRingBuffer  # hand -> policy (sparse)
     hand_cmd_ring: SeqlockRingBuffer  # policy -> hand
-    action_commit_ring: SeqlockRingBuffer  # coordinator -> arm + hand
-    arm_ack_ring: SeqlockRingBuffer  # arm -> coordinator
-    hand_ack_ring: SeqlockRingBuffer  # hand -> coordinator
     record_control_ring: SeqlockRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SeqlockRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SeqlockRingBuffer  # RecorderIO -> policy/main
@@ -339,15 +327,6 @@ class SharedStorage:
             f"{prefix}_hand_cmd",
             dtype=HAND_CMD_DTYPE,
             maxlen=cfg.hand_cmd_ring_maxlen,
-        )
-        storage.action_commit_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_action_commit", dtype=COMMIT_DTYPE, maxlen=cfg.action_commit_ring_maxlen
-        )
-        storage.arm_ack_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_arm_ack", dtype=ACK_DTYPE, maxlen=cfg.action_ack_ring_maxlen
-        )
-        storage.hand_ack_ring = SeqlockRingBuffer.create_or_replace(
-            f"{prefix}_hand_ack", dtype=ACK_DTYPE, maxlen=cfg.action_ack_ring_maxlen
         )
         storage.record_control_ring = SeqlockRingBuffer.create_or_replace(
             f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=cfg.record_control_ring_maxlen

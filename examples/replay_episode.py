@@ -52,9 +52,9 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.action_protocol import (
-    ActionSafetyGate,
-    ActionSafetyGateConfig,
+from dexmani_real.policy.safety import (
+    SafetyGateConfig,
+    SafetyGate,
     advance_policy_epoch,
     hand_home_converge,
     planner_action_safety_gate,
@@ -1017,7 +1017,7 @@ class TrajectoryReplayer:
 
         self._health_check = health_check
         self._planner: XArm7MotionPlanner | None = None
-        self._action_safety_gate: ActionSafetyGate | None = None
+        self._action_safety_gate: SafetyGate | None = None
         self._recorder: ReplayRecorder | None = None
         self._running = False
         self._estopped = False
@@ -1060,7 +1060,7 @@ class TrajectoryReplayer:
             static_boxes=tuple(self.runtime.environment.static_boxes),
         )
         self._action_safety_gate = planner_action_safety_gate(
-            ActionSafetyGateConfig(
+            SafetyGateConfig(
                 arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
                 arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
                 hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
@@ -1399,7 +1399,7 @@ class TrajectoryReplayer:
                     apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
                 )
                 if published is None:
-                    boundary = "prepare/commit/APPLIED" if is_final_frame else "prepare/commit"
+                    boundary = "publish/APPLIED" if is_final_frame else "publish"
                     self._fault(f"frame {frame_idx}: joint {boundary} boundary rejected")
                     break
                 assert published.arm_qpos is not None
@@ -1480,7 +1480,7 @@ class TrajectoryReplayer:
         return self._planner
 
     @property
-    def action_safety_gate(self) -> ActionSafetyGate | None:
+    def action_safety_gate(self) -> SafetyGate | None:
         return self._action_safety_gate
 
     def shutdown(self) -> None:

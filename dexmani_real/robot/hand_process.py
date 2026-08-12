@@ -24,14 +24,7 @@ from dexmani_real.utils.schema import (
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
 )
-from dexmani_real.policy.action_protocol import (
-    AckStatus,
-    RejectReason,
-    command_matches_commit,
-    make_ack,
-    make_stopped_ack,
-    validate_worker_command,
-)
+from dexmani_real.policy.safety import worker_validate_hand
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
@@ -291,10 +284,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
     rate_mgr = RateManager(cfg.loop_hz)
     last_cmd_seq = 0
-    last_action_id = 0
-    minimum_policy_epoch = int(shared.policy_epoch.value)
-    pending_action: np.ndarray | None = None
-    pending_committed = False
     _send_error_counter = RetryCounter(max_consecutive=cfg.send_err_watchdog_frames, label="hand_send")
     _error_state_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_error_state")
     _read_error_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_read_error")
@@ -313,9 +302,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
     _last_error_clear_s = 0.0
 
-    def _prepare_latest_command() -> np.ndarray | None:
-        """Read and PREPARE a new latest-wins command, if one is available."""
-        nonlocal last_action_id, last_cmd_seq, minimum_policy_epoch
+    def _read_latest_command() -> np.ndarray | None:
+        """Read the latest-wins command if a new one is available."""
+        nonlocal last_cmd_seq
         result = shared.hand_cmd_ring.read_latest()
         if result is None:
             return None
@@ -323,35 +312,10 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         seq_int = int(seq) if isinstance(seq, (int, np.integer)) else 0
         if seq_int == last_cmd_seq:
             return None
-        received_ns = time.monotonic_ns()
-        minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
-        reason = validate_worker_command(
-            data,
-            dtype=HAND_COMMAND_DTYPE,
-            expected_session_generation=int(shared.session_generation.value),
-            minimum_policy_epoch=minimum_policy_epoch,
-            last_action_id=last_action_id,
-            now_monotonic_ns=received_ns,
-            joint_lower_rad=np.asarray(hand.config.qpos_min, dtype=np.float64),
-            joint_upper_rad=np.asarray(hand.config.qpos_max, dtype=np.float64),
-        )
         last_cmd_seq = seq_int
-        if reason is not RejectReason.NONE:
-            shared.hand_ack_ring.write(
-                make_ack(data, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns)
-            )
+        if not worker_validate_hand(data):
+            logger.warning("hand_loop: rejected malformed command")
             return None
-        shared.hand_ack_ring.write(make_ack(data, AckStatus.RECEIVED, received_monotonic_ns=received_ns))
-        last_action_id = int(data["action_id"][0])
-        prepared_ns = time.monotonic_ns()
-        shared.hand_ack_ring.write(
-            make_ack(
-                data,
-                AckStatus.PREPARED,
-                received_monotonic_ns=received_ns,
-                prepared_monotonic_ns=prepared_ns,
-            )
-        )
         return data.copy()
 
     while shared.is_running.value:
@@ -364,59 +328,16 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         # Safety state gate — only process commands in ARMED or RUNNING.
         _safety = shared.safety_state.value
         if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-
-            # Read prepare command ring (latest-wins) and ACK it without moving.
-            if pending_action is not None and not pending_committed:
-                commit_result = shared.action_commit_ring.read_latest()
-                commit = commit_result[0] if commit_result is not None else None
-                pending_committed = commit is not None and command_matches_commit(pending_action, commit)
-            if pending_action is None or not pending_committed:
-                prepared = _prepare_latest_command()
-                if prepared is not None:
-                    pending_action = prepared
-                    pending_committed = False
-
-            execute_action: np.ndarray | None = None
-            if pending_action is not None:
-                now_ns = time.monotonic_ns()
-                pending_epoch_valid = int(pending_action["policy_epoch"][0]) == int(shared.policy_epoch.value)
-                pending_session_valid = int(pending_action["session_generation"][0]) == int(
-                    shared.session_generation.value
-                )
-                if not pending_epoch_valid or not pending_session_valid:
-                    reason = RejectReason.OLD_EPOCH if not pending_epoch_valid else RejectReason.WRONG_SESSION
-                    shared.hand_ack_ring.write(make_ack(pending_action, AckStatus.REJECTED, reject_reason=reason))
-                    pending_action = None
-                    pending_committed = False
-                elif int(pending_action["valid_until_monotonic_ns"][0]) < now_ns:
-                    shared.hand_ack_ring.write(
-                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.EXPIRED)
-                    )
-                    pending_action = None
-                    pending_committed = False
-                elif not pending_committed and int(pending_action["target_monotonic_ns"][0]) <= now_ns:
-                    shared.hand_ack_ring.write(
-                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.NOT_COMMITTED)
-                    )
-                    pending_action = None
-                else:
-                    if pending_committed and now_ns >= int(pending_action["target_monotonic_ns"][0]):
-                        execute_action = pending_action
-                        pending_action = None
-                        pending_committed = False
-
+            execute_action = _read_latest_command()
             if execute_action is not None:
                 cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
                 try:
                     sent = hand.send_action(cmd)
                 except Exception:
                     sent = False
-                    logger.warning("hand_loop: committed send_action raised", exc_info=True)
+                    logger.warning("hand_loop: send_action raised", exc_info=True)
                 if sent:
                     _send_error_counter.reset()
-                    shared.hand_ack_ring.write(
-                        make_ack(execute_action, AckStatus.APPLIED, applied_monotonic_ns=time.monotonic_ns())
-                    )
                     target_changed = (
                         _tracking_target is None or np.max(np.abs(cmd - _tracking_target)) >= cfg.stale_qpos_delta_rad
                     )
@@ -428,24 +349,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     _tracking_target = cmd.copy()
                 else:
                     _send_error_counter.inc()
-                    shared.hand_ack_ring.write(
-                        make_ack(
-                            execute_action,
-                            AckStatus.SDK_FAILED,
-                            reject_reason=RejectReason.SDK_ERROR,
-                            sdk_code=int(hand.last_action_code or -1),
-                            applied_monotonic_ns=time.monotonic_ns(),
-                        )
-                    )
-
-            # Freeing the committed slot and preparing the next latest-wins
-            # command in the same worker tick avoids an extra 30 Hz delay that
-            # can otherwise exceed the coordinator's prepare timeout.
-            if pending_action is None:
-                prepared = _prepare_latest_command()
-                if prepared is not None:
-                    pending_action = prepared
-                    pending_committed = False
 
             # Send-error watchdog: auto clear_error() after consecutive failures.
             if _send_error_counter.triggered:
@@ -633,7 +536,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             )
         if not hand.stop():
             raise RuntimeError(f"XHand stop failed with SDK code {hand.last_action_code!r}")
-        shared.hand_ack_ring.write(make_stopped_ack())
         hand.disconnect()
         stopped_cleanly = True
     except Exception:

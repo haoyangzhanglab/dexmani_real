@@ -17,14 +17,7 @@ from dexmani_real.config.defaults import arm, safety
 from dexmani_real.utils.schema import ARM_COMMAND_DTYPE, ARM_JOINT_SHAPE, ARM_STATE_DTYPE
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
-from dexmani_real.policy.action_protocol import (
-    AckStatus,
-    RejectReason,
-    command_matches_commit,
-    make_ack,
-    make_stopped_ack,
-    validate_worker_command,
-)
+from dexmani_real.policy.safety import worker_validate_arm
 from dexmani_real.robot.homing import HOME_SENTINEL, HomeRequest, HomeResult
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
@@ -420,11 +413,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     last_cmd_sdk_duration_s = 0.0
     last_cmd_is_hold = False
     last_action_id = 0
-    minimum_policy_epoch = int(shared.policy_epoch.value)
-    pending_action: np.ndarray | None = None
-    pending_received_ns = 0
-    pending_committed = False
-    deferred_action: Any | None = None
     motion_enabled = False
     last_safety_state = int(SafetyState.DISARMED)
     last_state_source_ns = time.monotonic_ns()
@@ -475,43 +463,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
     high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
 
-    def _prepare_protocol_action(action: Any) -> tuple[np.ndarray, int] | None:
-        """Validate and PREPARE one protocol command without executing it."""
-        nonlocal last_action_id, minimum_policy_epoch
-        if not isinstance(action, np.ndarray):
-            return None
-        received_ns = time.monotonic_ns()
-        minimum_policy_epoch = max(minimum_policy_epoch, int(shared.policy_epoch.value))
-        reason = validate_worker_command(
-            action,
-            dtype=ARM_COMMAND_DTYPE,
-            expected_session_generation=int(shared.session_generation.value),
-            minimum_policy_epoch=minimum_policy_epoch,
-            last_action_id=last_action_id,
-            now_monotonic_ns=received_ns,
-            joint_lower_rad=low,
-            joint_upper_rad=high,
-        )
-        if reason is not RejectReason.NONE:
-            if action.shape == (1,) and action.dtype == ARM_COMMAND_DTYPE:
-                shared.arm_ack_ring.write(
-                    make_ack(action, AckStatus.REJECTED, reject_reason=reason, received_monotonic_ns=received_ns)
-                )
-            logger.warning("arm_loop: rejected command: %s", reason.name)
-            return None
-        shared.arm_ack_ring.write(make_ack(action, AckStatus.RECEIVED, received_monotonic_ns=received_ns))
-        last_action_id = int(action["action_id"][0])
-        prepared_ns = time.monotonic_ns()
-        shared.arm_ack_ring.write(
-            make_ack(
-                action,
-                AckStatus.PREPARED,
-                received_monotonic_ns=received_ns,
-                prepared_monotonic_ns=prepared_ns,
-            )
-        )
-        return action.copy(), received_ns
-
     while shared.is_running.value:
         c24_recovered_this_tick = False
         # Heartbeat — written even when holding position (proves we're alive)
@@ -543,10 +494,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     shared.error_state.value = True
                     break
                 motion_enabled = False
-                pending_action = None
-                pending_received_ns = 0
-                pending_committed = False
-                deferred_action = None
         elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not motion_enabled:
             try:
                 _require_sdk_ok("armed set_mode(6)", arm.set_mode(6))
@@ -563,29 +510,13 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             motion_enabled = True
         last_safety_state = int(_safety)
         if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-
-            # Once an endpoint is committed it may not be replaced before its
-            # target time.  This is what preserves committed chunk steps while
-            # the bounded queue backpressures the next prepare.
-            if pending_action is not None and not pending_committed:
-                commit_result = shared.action_commit_ring.read_latest()
-                commit = commit_result[0] if commit_result is not None else None
-                pending_committed = commit is not None and command_matches_commit(pending_action, commit)
-            if pending_action is None or not pending_committed:
-                if deferred_action is not None:
-                    action = deferred_action
-                    deferred_action = None
-                else:
-                    try:
-                        action = shared.arm_action_q.get(timeout=0.0)
-                    except Empty:
-                        action = None
-            else:
+            # ── Simple dequeue → validate → apply (fire-and-forget) ──
+            try:
+                action = shared.arm_action_q.get(timeout=0.0)
+            except Empty:
                 action = None
 
-            # HOME sentinel carries a collision-validated path and a request ID.
-            # Execution is feedback-driven; completion is acknowledged only
-            # after fresh controller state converges to the canonical target.
+            # HOME sentinel — collision-validated path with request ID.
             if isinstance(action, tuple) and len(action) == 2 and action[0] == HOME_SENTINEL:
                 _request = action[1]
                 if not isinstance(_request, HomeRequest):
@@ -602,7 +533,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     tau: np.ndarray,
                     target: np.ndarray,
                 ) -> None:
-                    """Keep the state ring fresh while homing owns the SDK loop."""
                     nonlocal last_state_source_ns
                     last_state_source_ns = time.monotonic_ns()
                     try:
@@ -653,147 +583,62 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 continue
 
             if action is not None and not isinstance(action, tuple):
-                prepared = _prepare_protocol_action(action)
-                if prepared is not None:
-                    pending_action, pending_received_ns = prepared
-                    pending_committed = False
-
-            execute_action: np.ndarray | None = None
-            execute_received_ns = 0
-            if pending_action is not None:
-                now_ns = time.monotonic_ns()
-                pending_epoch_valid = int(pending_action["policy_epoch"][0]) == int(shared.policy_epoch.value)
-                pending_session_valid = int(pending_action["session_generation"][0]) == int(
-                    shared.session_generation.value
-                )
-                if not pending_epoch_valid or not pending_session_valid:
-                    reason = RejectReason.OLD_EPOCH if not pending_epoch_valid else RejectReason.WRONG_SESSION
-                    shared.arm_ack_ring.write(make_ack(pending_action, AckStatus.REJECTED, reject_reason=reason))
-                    pending_action = None
-                    pending_received_ns = 0
-                    pending_committed = False
-                elif int(pending_action["valid_until_monotonic_ns"][0]) < now_ns:
-                    shared.arm_ack_ring.write(
-                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.EXPIRED)
-                    )
-                    pending_action = None
-                    pending_received_ns = 0
-                    pending_committed = False
-                elif not pending_committed and int(pending_action["target_monotonic_ns"][0]) <= now_ns:
-                    shared.arm_ack_ring.write(
-                        make_ack(pending_action, AckStatus.REJECTED, reject_reason=RejectReason.NOT_COMMITTED)
-                    )
-                    pending_action = None
-                    pending_received_ns = 0
+                if not worker_validate_arm(action):
+                    logger.warning("arm_loop: rejected malformed command")
                 else:
-                    if pending_committed and now_ns >= int(pending_action["target_monotonic_ns"][0]):
-                        execute_action = pending_action
-                        execute_received_ns = pending_received_ns
-                        pending_action = None
-                        pending_received_ns = 0
-                        pending_committed = False
-
-            # No new committed endpoint means no SDK call. Re-sending an old
-            # endpoint at 30 Hz would repeatedly restart Mode-6 planning.
-            if execute_action is not None:
-                target = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
-                try:
-                    target = wrap_nearest_equivalent(target, last_qpos, cfg.joint_limit_lower, cfg.joint_limit_upper)
-                except ValueError:
-                    shared.arm_ack_ring.write(
-                        make_ack(execute_action, AckStatus.REJECTED, reject_reason=RejectReason.JOINT_LIMIT)
-                    )
-                    target = last_qpos.copy()
-                else:
-                    last_target = target.copy()
-                    _sdk_started_s = time.monotonic()
+                    target = np.asarray(action["qpos_cmd"][0], dtype=np.float64)
                     try:
-                        code = arm.set_servo_angle(
-                            angle=target,
-                            is_radian=True,
-                            speed=cfg.joint_max_speed_rad_per_s,
-                            mvacc=cfg.joint_max_acc_rad_per_s2,
-                            wait=False,
-                        )
-                        _sdk_finished_s = time.monotonic()
-                        _sdk_finished_ns = time.monotonic_ns()
-                    except Exception:
-                        logger.error("arm_loop: committed set_servo_angle raised", exc_info=True)
-                        shared.arm_ack_ring.write(
-                            make_ack(
-                                execute_action,
-                                AckStatus.SDK_FAILED,
-                                reject_reason=RejectReason.SDK_ERROR,
-                                applied_monotonic_ns=time.monotonic_ns(),
-                            )
-                        )
-                        shared.error_state.value = True
-                        break
-                    if code == 0:
-                        _recovery_counter.reset()
-                        shared.arm_ack_ring.write(
-                            make_ack(execute_action, AckStatus.APPLIED, applied_monotonic_ns=_sdk_finished_ns)
-                        )
-                        last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = _parse_arm_action_metadata(
-                            execute_action, _sdk_started_s
-                        )
-                        last_cmd_received_s = execute_received_ns / 1e9
-                        last_cmd_applied_s = _sdk_finished_s
-                        last_cmd_queue_latency_s = max(0.0, last_cmd_received_s - last_cmd_created_s)
-                        last_cmd_apply_latency_s = max(0.0, last_cmd_applied_s - last_cmd_created_s)
-                        last_cmd_sdk_duration_s = max(0.0, _sdk_finished_s - _sdk_started_s)
+                        target = wrap_nearest_equivalent(target, last_qpos, cfg.joint_limit_lower, cfg.joint_limit_upper)
+                    except ValueError:
+                        target = last_qpos.copy()
                     else:
-                        err_code = int(getattr(arm, "error_code", 0) or 0)
-                        shared.arm_ack_ring.write(
-                            make_ack(
-                                execute_action,
-                                AckStatus.SDK_FAILED,
-                                reject_reason=RejectReason.SDK_ERROR,
-                                sdk_code=int(code),
-                                applied_monotonic_ns=_sdk_finished_ns,
+                        last_target = target.copy()
+                        _sdk_started_s = time.monotonic()
+                        try:
+                            code = arm.set_servo_angle(
+                                angle=target,
+                                is_radian=True,
+                                speed=cfg.joint_max_speed_rad_per_s,
+                                mvacc=cfg.joint_max_acc_rad_per_s2,
+                                wait=False,
                             )
-                        )
-                        if err_code in cfg.collision_fault_errors:
-                            _latch_collision_fault(shared, arm, err_code)
-                            break
-                        if err_code == 24:
-                            now_s = time.monotonic()
-                            if now_s - last_c24_s <= 2.0:
-                                logger.error("arm_loop: second C24 inside 2s — latching fault")
-                                shared.error_state.value = True
-                                break
-                            last_c24_s = now_s
-                            # Discard the failed target. Recover Mode 6, obtain a
-                            # fresh measurement, and send exactly one measured hold.
-                            try:
-                                last_target = _recover_c24_measured_hold(arm, cfg)
-                                c24_recovered_this_tick = True
-                            except Exception:
-                                logger.error("arm_loop: C24 measured-hold recovery failed", exc_info=True)
-                                shared.error_state.value = True
-                                break
-                        else:
-                            logger.error("arm_loop: committed command SDK failure code=%d err=%d", code, err_code)
+                        except Exception:
+                            logger.error("arm_loop: set_servo_angle raised", exc_info=True)
                             shared.error_state.value = True
                             break
-
-            # A chunk's next prepare window opens slightly before the previous
-            # endpoint is applied (62.5 ms action dt vs ~66.7 ms lead at the
-            # defaults).  Poll once more immediately after freeing the committed
-            # slot; otherwise the next command waits an additional 30 Hz worker
-            # tick and can exceed the coordinator's 50 ms prepare deadline.
-            if pending_action is None and deferred_action is None and not c24_recovered_this_tick:
-                try:
-                    prefetched = shared.arm_action_q.get(timeout=0.0)
-                except Empty:
-                    prefetched = None
-                if isinstance(prefetched, tuple):
-                    deferred_action = prefetched
-                elif prefetched is not None:
-                    prepared = _prepare_protocol_action(prefetched)
-                    if prepared is not None:
-                        pending_action, pending_received_ns = prepared
-                        pending_committed = False
+                        if code == 0:
+                            _recovery_counter.reset()
+                            last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = _parse_arm_action_metadata(
+                                action, _sdk_started_s
+                            )
+                            last_cmd_received_s = time.monotonic()
+                            last_cmd_applied_s = last_cmd_received_s
+                            last_cmd_queue_latency_s = max(0.0, last_cmd_received_s - last_cmd_created_s)
+                            last_cmd_apply_latency_s = max(0.0, last_cmd_applied_s - last_cmd_created_s)
+                            last_cmd_sdk_duration_s = time.monotonic() - _sdk_started_s
+                        else:
+                            err_code = int(getattr(arm, "error_code", 0) or 0)
+                            if err_code in cfg.collision_fault_errors:
+                                _latch_collision_fault(shared, arm, err_code)
+                                break
+                            if err_code == 24:
+                                now_s = time.monotonic()
+                                if now_s - last_c24_s <= 2.0:
+                                    logger.error("arm_loop: second C24 inside 2s — latching fault")
+                                    shared.error_state.value = True
+                                    break
+                                last_c24_s = now_s
+                                try:
+                                    last_target = _recover_c24_measured_hold(arm, cfg)
+                                    c24_recovered_this_tick = True
+                                except Exception:
+                                    logger.error("arm_loop: C24 measured-hold recovery failed", exc_info=True)
+                                    shared.error_state.value = True
+                                    break
+                            else:
+                                logger.error("arm_loop: SDK failure code=%d err=%d", code, err_code)
+                                shared.error_state.value = True
+                                break
 
         arm_connected = True
         state_read_succeeded = False
@@ -909,7 +754,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     try:
         _require_sdk_ok("cleanup set_state(4)", arm.set_state(4))
         _wait_live_status(arm, expected_state=4)
-        shared.arm_ack_ring.write(make_stopped_ack())
         arm.disconnect()
         stopped_cleanly = True
     except Exception:

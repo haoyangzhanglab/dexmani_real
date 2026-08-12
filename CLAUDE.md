@@ -27,9 +27,9 @@ entry points, not test fixtures.
 |---|---|---|
 | Change a runtime value | `config/defaults.py` | `config/runtime.py`, every derived duration/capacity/metadata field |
 | Change a shared field or command | `utils/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
-| Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → action protocol → samples |
-| Change learned deployment | `examples/deploy_policy.py`, `policy/spec.py` | inference process → coordinator → action protocol |
-| Change an arm/hand action | `policy/action_protocol.py` | arm/hand worker ACKs, `robot/safety.py`, supervisor |
+| Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → safety gate → samples |
+| Change learned deployment | `examples/deploy_policy.py`, `policy/spec.py` | inference process → coordinator → safety gate |
+| Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, safety gate |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
 | Change replay | `examples/replay_episode.py` | — | Self-contained script; preflight → session → runner → metrics |
@@ -47,7 +47,7 @@ Main / domain lifecycle
 Camera worker ─┐
 VR worker ─────┼── shared state rings ──► Teleop or learned-policy coordinator
 Arm worker ────┤                                  │
-Hand worker ───┘                         prepare/commit action protocol
+Hand worker ───┘                         fire-and-forget command publication
                                                     ├──► bounded arm queue → Arm worker
                                                     └──► latest-wins hand ring → Hand worker
 
@@ -60,7 +60,7 @@ Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► H
 | `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | HDF5 serialization or direct SDK use |
 | `policy/learned_coordinator.py` | Causal observations, inference result scheduling, policy epoch/action IDs | Direct SDK use or recording I/O |
 | `recording/io_process.py` | Record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
-| `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application, ACKs | Policy decisions or cross-worker calls |
+| `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application | Policy decisions or cross-worker calls |
 | `sensor/` workers | Device acquisition and source-freshness metadata | Motion/control decisions |
 | `runtime/` | Readiness, heartbeat/process supervision, verified teardown | Domain mapping or command production |
 
@@ -68,7 +68,7 @@ Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► H
 
 ```python
 arm_loop(shared, config)          # xArm Mode 6 servo and FK state
-hand_loop(shared, config)         # XHand servo, state/tactile and ACKs
+hand_loop(shared, config)         # XHand servo, state/tactile feedback
 camera_loop(shared, config)       # RealSense frames → camera_ring
 vr_loop(shared, config)           # Quest/HTS frames → vr_ring
 teleop_loop(shared, config)       # VR → candidate → safe arm/hand commands
@@ -91,7 +91,6 @@ discover a dtype.
 |---|---|---|
 | `arm_action_q` | controller → arm | Ordered `mp.Queue(maxsize=2)`; backpressure is intentional |
 | `hand_cmd_ring` | controller → hand | Seqlock, latest-wins servo target |
-| commit + ACK rings | controller ⇄ workers | Correlated prepare/commit/apply/reject protocol |
 | arm/hand/VR/camera rings | worker → controller | Seqlock state; source and publish freshness are distinct |
 | `record_sample_ring` | controller → RecorderIO | Fixed-grid aligned sample; overflow aborts the episode |
 | flags and heartbeats | lifecycle/workers | Flags are simple values; heartbeats use `time.monotonic()` |
@@ -115,13 +114,14 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
 - Arm and hand workers only gate command behavior on the state.
 - `error_state` is sticky. A process death or enabled-worker heartbeat timeout
   becomes a main-owned fault.
-- `ActionSafetyGate` validates shape/finite values, freshness, epoch/TTL,
-  limits, delta, workspace, table/collision constraints before raw command IPC.
+- `SafetyGate` (in `policy/safety.py`) is the single validation boundary:
+  well-formed → joint limits → velocity clamp → collision → workspace.
+  Workers trust the gate and apply commands with only hardware-level checks.
 - Pause, stale VR, or a camera generation reset invalidates the active policy
   epoch, publishes a coordinated hold, and requires fresh feedback/re-anchor.
 
-Do not turn a simple flag into an enum, add a second state writer, or make a
-recovery path bypass prepare/commit/ACK correlation.
+Do not turn a simple flag into an enum, add a second state writer, or bypass
+the SafetyGate validation boundary.
 
 ## 4. Critical behavior paths
 
@@ -129,7 +129,7 @@ recovery path bypass prepare/commit/ACK correlation.
 
 ```text
 VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candidate
-         → ActionSafetyGate → prepare + ACK → commit + apply ACK
+         → SafetyGate.validate() → send_command() → workers apply immediately
          → grid-aligned state/action/VR/camera sample → RecorderIO
 ```
 
@@ -146,7 +146,7 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
 
 ```text
 PolicySpec YAML + resource hashes → deployment preflight → isolated inference
-                                  → causal coordinator → ActionSafetyGate → workers
+                                  → causal coordinator → SafetyGate → workers
 ```
 
 `PolicySpec` binds adapter module, explicit observation history, action contract,
@@ -223,7 +223,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
 | Use `control_hz` and derived config values | Hard-coded timing/buffer assumptions |
 | Keep file/network/UI work out of control loops | Blocking I/O in servo or control loops |
 | Use `TYPE_CHECKING`/lazy imports to break cycles and isolate SDKs | Circular imports or SDK objects crossing process boundaries |
-| Check measured hand feedback and ACK identity | Assuming hand connection or command application |
+| Check measured hand feedback and SDK return codes | Assuming hand connection or command application |
 | Keep new logic in the domain owner | Business logic in a thin main/CLI wrapper |
 
 ### Hardware facts that change engineering decisions

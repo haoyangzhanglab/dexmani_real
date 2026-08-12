@@ -42,39 +42,6 @@ _COMMAND_COMMON_FIELDS = [
 
 ARM_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True)
 HAND_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True)
-COMMIT_DTYPE = np.dtype(
-    [
-        ("session_generation", "<u8"),
-        ("policy_epoch", "<u8"),
-        ("observation_id", "<u8"),
-        ("action_id", "<u8"),
-        ("chunk_id", "<u8"),
-        ("step_index", "<u4"),
-        ("created_monotonic_ns", "<u8"),
-        ("committed_monotonic_ns", "<u8"),
-        ("target_monotonic_ns", "<u8"),
-        ("valid_until_monotonic_ns", "<u8"),
-        ("is_hold", "<u1"),
-    ],
-    align=True,
-)
-ACK_DTYPE = np.dtype(
-    [
-        ("session_generation", "<u8"),
-        ("policy_epoch", "<u8"),
-        ("observation_id", "<u8"),
-        ("action_id", "<u8"),
-        ("chunk_id", "<u8"),
-        ("step_index", "<u4"),
-        ("status", "<u1"),
-        ("reject_reason", "<u2"),
-        ("sdk_code", "<i4"),
-        ("received_monotonic_ns", "<u8"),
-        ("prepared_monotonic_ns", "<u8"),
-        ("applied_monotonic_ns", "<u8"),
-    ],
-    align=True,
-)
 
 INFERENCE_CANDIDATE_DTYPE = np.dtype(
     [
@@ -291,11 +258,9 @@ def make_record_sample_dtype(
 
 
 __all__ = [
-    "ACK_DTYPE",
     "ARM_COMMAND_DTYPE",
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
-    "COMMIT_DTYPE",
     "HAND_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "HAND_TACTILE_DTYPE",

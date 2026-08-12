@@ -65,7 +65,7 @@ from dexmani_real import PACKAGE_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
-from dexmani_real.policy.action_protocol import (
+from dexmani_real.policy.safety import (
     ActionSafetyGateConfig,
     advance_policy_epoch,
     planner_action_safety_gate,
@@ -953,7 +953,7 @@ def _run_calibration(
                 wait_applied=True, apply_timeout_s=float(policy.action_apply_timeout_s),
             )
             if published is None or published.arm_qpos is None:
-                _set_fault(shared, "arm prepare/commit failed")
+                _set_fault(shared, "arm publish failed")
                 return 1
             previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
 

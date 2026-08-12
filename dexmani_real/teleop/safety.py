@@ -12,8 +12,8 @@ from dexmani_real.config.defaults import arm, hand, safety
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.action_protocol import AckStatus, ActionSafetyGate, SafeCommandPublisher, hand_home_converge
 from dexmani_real.policy.runtime import ActionCandidate
+from dexmani_real.policy.safety import send_command
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
@@ -24,75 +24,48 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-
-def _candidate_application_state(shared: Any, candidate: ActionCandidate) -> str:
-    """Return pending/applied/failed from exact identity-correlated worker ACKs."""
-    arm_status = (
-        AckStatus.APPLIED
-        if candidate.arm_qpos is None
-        else SafeCommandPublisher._ack_status(shared.arm_ack_ring, candidate)
-    )
-    hand_status = (
-        AckStatus.APPLIED
-        if candidate.hand_qpos is None
-        else SafeCommandPublisher._ack_status(shared.hand_ack_ring, candidate)
-    )
-    failed = {AckStatus.REJECTED, AckStatus.SDK_FAILED}
-    if arm_status in failed or hand_status in failed:
-        return "failed"
-    if arm_status is AckStatus.APPLIED and hand_status is AckStatus.APPLIED:
-        return "applied" if _candidate_applied_monotonic_ns(shared, candidate) is not None else "pending"
-    return "pending"
+# Time for a command to propagate through the arm queue and be applied by
+# both workers at 16 Hz.  Two worker ticks plus queue latency margin.
+_HOLD_DELIVERY_S = 0.15
 
 
-def _candidate_applied_monotonic_ns(shared: Any, candidate: ActionCandidate) -> int | None:
-    """Return the latest enabled-worker SDK apply time for one exact candidate."""
-    applied_times: list[int] = []
-    for qpos, ack_ring in (
-        (candidate.arm_qpos, shared.arm_ack_ring),
-        (candidate.hand_qpos, shared.hand_ack_ring),
-    ):
-        if qpos is None:
-            continue
-        result = ack_ring.read_latest()
-        if result is None or not SafeCommandPublisher._ack_matches(result[0], candidate):
-            return None
-        ack = result[0]
-        if int(ack["status"][0]) != int(AckStatus.APPLIED):
-            return None
-        applied_ns = int(ack["applied_monotonic_ns"][0])
-        if applied_ns <= 0:
-            return None
-        applied_times.append(applied_ns)
-    return max(applied_times) if applied_times else None
+def _hold_delivered(candidate: ActionCandidate, sent_at_s: float) -> bool:
+    """Return True after the hold has had time to propagate through the workers.
+
+    Without ACKs, we conservatively wait long enough for the arm queue to
+    drain and both workers to apply the command.
+    """
+    return time.monotonic() - sent_at_s >= _HOLD_DELIVERY_S
 
 
-def _feedback_after_hold(
+def _feedback_after_send(
     arm_state: np.ndarray,
     hand_state: np.ndarray | None,
     candidate: ActionCandidate,
-    applied_monotonic_ns: int,
+    sent_at_s: float,
 ) -> bool:
-    """Require measured feedback produced after every coordinated hold apply."""
+    """Require measured feedback produced after the hold command was sent."""
     arm_names = arm_state.dtype.names or ()
     if "source_monotonic_ns" not in arm_names:
         return False
-    if int(arm_state["source_monotonic_ns"][0]) < applied_monotonic_ns:
+    sent_ns = int(sent_at_s * 1e9)
+    if int(arm_state["source_monotonic_ns"][0]) < sent_ns:
         return False
     if candidate.hand_qpos is None:
         return True
     if hand_state is None:
         return False
     hand_names = hand_state.dtype.names or ()
-    return "source_monotonic_ns" in hand_names and int(hand_state["source_monotonic_ns"][0]) >= applied_monotonic_ns
+    return "source_monotonic_ns" in hand_names and int(hand_state["source_monotonic_ns"][0]) >= sent_ns
 
 
-def _vr_after_hold(vr_frame: dict[str, Any] | None, applied_monotonic_ns: int) -> bool:
-    """Return whether the VR sample was received after coordinated hold apply."""
+def _vr_after_send(vr_frame: dict[str, Any] | None, sent_at_s: float) -> bool:
+    """Return whether the VR sample was received after the hold command was sent."""
     if vr_frame is None:
         return False
+    sent_ns = int(sent_at_s * 1e9)
     try:
-        return int(vr_frame.get("local_recv_ns", 0)) >= applied_monotonic_ns
+        return int(vr_frame.get("local_recv_ns", 0)) >= sent_ns
     except (TypeError, ValueError):
         return False
 
@@ -228,7 +201,7 @@ def _do_teleop_home(
     arm_mapper=None,
     hand_retargeter=None,
     heartbeat: bool = True,
-    action_safety_gate: ActionSafetyGate | None = None,
+    safety_gate: Any = None,
     arm_home_qpos: np.ndarray | None = None,
 ) -> np.ndarray:
     """Home hand first, then arm. Returns updated *prev_hand_qpos*.
@@ -244,17 +217,47 @@ def _do_teleop_home(
 
     # Step 1: hand home first (prevents arm sweeping while hand is in grasp).
     if hand_available and not shared.error_state.value:
-        hand_reached, final_qpos = hand_home_converge(
-            shared,
-            hand_home_qpos,
-            timeout_s=hand_home_timeout_s,
-            tol_rad=hand_home_tolerance_rad,
-            heartbeat=heartbeat,
-            check_is_running=True,
-            verbose=True,
-            safety_gate=action_safety_gate,
-            abort_requested=estop_requested,
-        )
+        from dexmani_real.utils.schema import HAND_COMMAND_DTYPE
+
+        _hand_deadline = time.monotonic() + hand_home_timeout_s
+        hand_reached = False
+        final_qpos = None
+        _first = True
+        while time.monotonic() < _hand_deadline:
+            if (getattr(getattr(shared, "estop_request", None), "value", False)
+                    or getattr(getattr(shared, "error_state", None), "value", False)
+                    or (estop_requested is not None and estop_requested())):
+                break
+            if not shared.is_running.value:
+                break
+            if heartbeat:
+                shared.policy_heartbeat_s.value = time.monotonic()
+
+            _frame = np.zeros(1, dtype=HAND_COMMAND_DTYPE)
+            _frame["qpos_cmd"][0] = hand_home_qpos
+            shared.hand_cmd_ring.write(_frame)
+
+            hand_result = shared.hand_state_ring.read_latest()
+            if hand_result is not None:
+                state = hand_result[0][0]
+                try:
+                    if (bool(state["connected"]) and bool(state["state_valid"])
+                            and not bool(state["error_state"]) and not bool(state["qpos_stale"])
+                            and bool(state["send_healthy"]) and bool(state["read_healthy"])):
+                        current = np.asarray(state["qpos"], dtype=np.float64)
+                        if current.shape == (12,) and np.all(np.isfinite(current)):
+                            err = float(np.max(np.abs(current - hand_home_qpos)))
+                            if err < hand_home_tolerance_rad:
+                                final_qpos = current.copy()
+                                hand_reached = True
+                                break
+                            if _first:
+                                print(f"  hand: homing... (max_err={np.rad2deg(err):.0f}°)", flush=True)
+                                _first = False
+                except Exception:
+                    pass
+            time.sleep(0.1)
+
         if final_qpos is not None:
             prev_hand_qpos = final_qpos
             planner.set_hand_qpos(prev_hand_qpos)
@@ -323,7 +326,7 @@ def _do_configured_teleop_home(
     planner: XArm7MotionPlanner,
     audio: Any,
     estop_requested: Callable[[], bool],
-    action_safety_gate: ActionSafetyGate,
+    safety_gate: Any,
     arm_mapper: ArmWristMapper | None = None,
     hand_retargeter: Any = None,
 ) -> np.ndarray:
@@ -350,6 +353,6 @@ def _do_configured_teleop_home(
         table_z_surface_m=config.contact_stall_table_z_surface_m,
         arm_mapper=arm_mapper,
         hand_retargeter=hand_retargeter,
-        action_safety_gate=action_safety_gate,
+        safety_gate=safety_gate,
         arm_home_qpos=np.asarray(config.arm_home_qpos, dtype=np.float64),
     )

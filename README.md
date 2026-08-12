@@ -154,7 +154,7 @@ python -m compileall -q dexmani_real examples
 | 文件 | 作用 |
 |---|---|
 | `policy/__init__.py` | 提供延迟加载的旧式 VR policy 兼容导入，避免离线主进程提前载入遥操作代码。 |
-| `policy/action_protocol.py` | 定义 prepare/commit/ack 协议、动作安全门、反馈校验、动作发布器与因果关节动作调度器。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→速度钳制→碰撞→工作空间；send_command 即发即弃发布；planner_action_safety_gate 工厂；publish_joint_targets 便捷包装；hand_home_converge。 |
 | `policy/inference_process.py` | 隔离推理 worker，加载 adapter，编解码候选动作，并验证模型输出是否满足策略契约。 |
 | `policy/learned_coordinator.py` | 以单一时钟协调 observation、推理结果、动作执行和退出前 hold 的学习策略控制环。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
