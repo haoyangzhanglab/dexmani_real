@@ -56,6 +56,7 @@ class XArm7MotionPlanner:
         teleop_profile: TeleopProfile | None = None,
         hand_dof: bool = True,
         static_boxes: Iterable[Any] = (),
+        table: Any | None = None,
     ) -> None:
         import mplib
 
@@ -135,7 +136,7 @@ class XArm7MotionPlanner:
         # Both use the same SRDF (xarm7_xhand.srdf) so collision pair rules
         # are consistent.  See CLAUDE.md §Collision Detection Layers for the
         # full architecture.
-        self.collision_model = CollisionModel(hand_dof=hand_dof, static_boxes=static_boxes)
+        self.collision_model = CollisionModel(hand_dof=hand_dof, static_boxes=static_boxes, table=table)
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
@@ -157,6 +158,7 @@ class XArm7MotionPlanner:
         planning_profile: PlanningProfile | None = None,
         teleop_profile: TeleopProfile | None = None,
         static_boxes: Iterable[Any] = (),
+        table: Any | None = None,
     ) -> "XArm7MotionPlanner":
         """Factory with canonical URDF/SRDF and identity base_pose_world.
 
@@ -183,6 +185,7 @@ class XArm7MotionPlanner:
             planning_profile=planning_profile or PlanningProfile(),
             teleop_profile=teleop_profile or TeleopProfile(),
             static_boxes=static_boxes,
+            table=table,
         )
 
     def __getattr__(self, name: str):

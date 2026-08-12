@@ -14,7 +14,12 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, camera, hand, policy
+from dexmani_real.robot.safety import SafetyState
+from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
+from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
+    ARM_CONTROL_DTYPE,
     ARM_STATE_DTYPE,
     HAND_COMMAND_DTYPE,
     HAND_JOINT_SHAPE,
@@ -26,10 +31,6 @@ from dexmani_real.utils.schema import (
     VR_FRAME_DTYPE,
     make_record_sample_dtype,
 )
-from dexmani_real.robot.safety import SafetyState
-from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
-from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
-from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
@@ -58,6 +59,7 @@ class SharedStorageConfig:
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
+    arm_control_ring_maxlen: int = 2
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
@@ -68,16 +70,26 @@ class SharedStorageConfig:
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
     hand_loop_hz: float = field(default_factory=lambda: hand.loop_hz)
     hand_home_qpos_rad: tuple[float, ...] = field(
-        default_factory=lambda: tuple(float(value) for value in np.deg2rad(hand.home_qpos_deg))
+        default_factory=lambda: tuple(
+            float(value) for value in np.deg2rad(hand.home_qpos_deg)
+        )
     )
 
-    camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
-    camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
-    camera_pc_shape: tuple[int, int] = field(default_factory=lambda: camera.pointcloud_shape)
+    camera_rgb_shape: tuple[int, int, int] = field(
+        default_factory=lambda: camera.rgb_shape
+    )
+    camera_depth_shape: tuple[int, int] = field(
+        default_factory=lambda: camera.depth_shape
+    )
+    camera_pc_shape: tuple[int, int] = field(
+        default_factory=lambda: camera.pointcloud_shape
+    )
 
     arm_action_q_maxsize: int = 2
 
-    workspace_bounds: "np.ndarray" = field(default_factory=lambda: policy.workspace.as_array())
+    workspace_bounds: "np.ndarray" = field(
+        default_factory=lambda: policy.workspace.as_array()
+    )
 
     def __post_init__(self) -> None:
         capacities = (
@@ -87,6 +99,7 @@ class SharedStorageConfig:
             self.hand_state_ring_maxlen,
             self.hand_tactile_ring_maxlen,
             self.hand_cmd_ring_maxlen,
+            self.arm_control_ring_maxlen,
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
@@ -98,14 +111,24 @@ class SharedStorageConfig:
         if min(self.control_hz, self.arm_loop_hz, self.hand_loop_hz) <= 0:
             raise ValueError("SharedStorage action rates must be positive")
         bounds = np.asarray(self.workspace_bounds, dtype=np.float64)
-        if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] > bounds[:, 1]):
-            raise ValueError("SharedStorage workspace_bounds must be finite shape (3, 2)")
+        if (
+            bounds.shape != (3, 2)
+            or not np.all(np.isfinite(bounds))
+            or np.any(bounds[:, 0] > bounds[:, 1])
+        ):
+            raise ValueError(
+                "SharedStorage workspace_bounds must be finite shape (3, 2)"
+            )
         hand_home = np.asarray(self.hand_home_qpos_rad, dtype=np.float64)
         if hand_home.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(hand_home)):
-            raise ValueError("SharedStorage hand_home_qpos_rad must be finite shape (12,)")
+            raise ValueError(
+                "SharedStorage hand_home_qpos_rad must be finite shape (12,)"
+            )
 
     @classmethod
-    def from_runtime(cls, runtime: object, *, enable_inference: bool = False) -> "SharedStorageConfig":
+    def from_runtime(
+        cls, runtime: object, *, enable_inference: bool = False
+    ) -> "SharedStorageConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
         arm_cfg = getattr(runtime, "arm")
@@ -126,7 +149,9 @@ class SharedStorageConfig:
             control_hz=float(pol.control_hz),
             arm_loop_hz=float(arm_cfg.loop_hz),
             hand_loop_hz=float(hand_cfg.loop_hz),
-            hand_home_qpos_rad=tuple(float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)),
+            hand_home_qpos_rad=tuple(
+                float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)
+            ),
             workspace_bounds=bounds,
             enable_inference=enable_inference,
         )
@@ -159,6 +184,7 @@ _RING_RESOURCE_NAMES = (
     "hand_state_ring",
     "hand_tactile_ring",
     "hand_cmd_ring",
+    "arm_control_ring",
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
@@ -187,14 +213,21 @@ class SharedStorage:
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     hand_tactile_ring: SharedMemoryRingBuffer  # hand -> policy (sparse)
     hand_cmd_ring: SharedMemoryRingBuffer  # policy -> hand
+    arm_control_ring: (
+        SharedMemoryRingBuffer  # controller -> arm priority STOP/RESUME mailbox
+    )
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
-    inference_candidate_ring: Any  # experimental capability; None unless explicitly enabled
+    inference_candidate_ring: (
+        Any  # experimental capability; None unless explicitly enabled
+    )
 
-    arm_action_q: mp.Queue  # policy -> arm, maxsize=2
+    arm_action_q: mp.Queue  # policy -> ordered arm endpoints + HOME, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
-    arm_command_seq: Any  # all arm-action producers -> globally unique monotonic IDs
+    arm_command_seq: (
+        Any  # all actuator-action producers -> globally unique monotonic IDs
+    )
     run_generation: Any  # controller advances it to invalidate old policy proposals
     recorder_consumed_sequence: Any
     action_control_hz: float
@@ -236,7 +269,9 @@ class SharedStorage:
     camera_profile: Any  # actual color/depth profile JSON
     camera_observation_required: Any  # None unless experimental inference is enabled
     _closed: bool = field(init=False, repr=False, default=False)
-    _close_completed_operations: set[str] = field(init=False, repr=False, default_factory=set)
+    _close_completed_operations: set[str] = field(
+        init=False, repr=False, default_factory=set
+    )
 
     @classmethod
     def create(
@@ -269,12 +304,18 @@ class SharedStorage:
                 try:
                     cleanup_succeeded = storage.close()
                 except BaseException:
-                    logger.critical("SharedStorage allocation rollback raised", exc_info=True)
-                    raise RuntimeError("SharedStorage allocation failed and rollback raised") from allocation_error
+                    logger.critical(
+                        "SharedStorage allocation rollback raised", exc_info=True
+                    )
+                    raise RuntimeError(
+                        "SharedStorage allocation failed and rollback raised"
+                    ) from allocation_error
                 if cleanup_succeeded:
                     break
             if not cleanup_succeeded:
-                raise RuntimeError("SharedStorage allocation failed and rollback was incomplete") from allocation_error
+                raise RuntimeError(
+                    "SharedStorage allocation failed and rollback was incomplete"
+                ) from allocation_error
             raise
 
         logger.info("SharedStorage created (prefix=%s)", prefix)
@@ -322,8 +363,15 @@ class SharedStorage:
             dtype=HAND_COMMAND_DTYPE,
             maxlen=cfg.hand_cmd_ring_maxlen,
         )
+        storage.arm_control_ring = SharedMemoryRingBuffer.create_or_replace(
+            f"{prefix}_arm_control",
+            dtype=ARM_CONTROL_DTYPE,
+            maxlen=cfg.arm_control_ring_maxlen,
+        )
         storage.record_control_ring = SharedMemoryRingBuffer.create_or_replace(
-            f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=cfg.record_control_ring_maxlen
+            f"{prefix}_record_control",
+            dtype=RECORD_CONTROL_DTYPE,
+            maxlen=cfg.record_control_ring_maxlen,
         )
         storage.record_sample_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_record_sample",
@@ -331,7 +379,9 @@ class SharedStorage:
             maxlen=cfg.record_sample_ring_maxlen,
         )
         storage.record_status_ring = SharedMemoryRingBuffer.create_or_replace(
-            f"{prefix}_record_status", dtype=RECORD_STATUS_DTYPE, maxlen=cfg.record_status_ring_maxlen
+            f"{prefix}_record_status",
+            dtype=RECORD_STATUS_DTYPE,
+            maxlen=cfg.record_status_ring_maxlen,
         )
         storage.inference_candidate_ring = (
             SharedMemoryRingBuffer.create_or_replace(
@@ -349,9 +399,13 @@ class SharedStorage:
         storage.run_generation = ctx.Value("Q", 1)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.action_control_hz = float(cfg.control_hz)
-        storage.action_lead_time_s = 2.0 / min(float(cfg.arm_loop_hz), float(cfg.hand_loop_hz))
+        storage.action_lead_time_s = 2.0 / min(
+            float(cfg.arm_loop_hz), float(cfg.hand_loop_hz)
+        )
         storage.action_validity_s = 1.0 / float(cfg.control_hz)
-        storage.hand_home_qpos_rad = tuple(float(value) for value in cfg.hand_home_qpos_rad)
+        storage.hand_home_qpos_rad = tuple(
+            float(value) for value in cfg.hand_home_qpos_rad
+        )
 
         storage.is_running = ctx.Value("b", True)
         storage.is_recording = ctx.Value("b", False)
@@ -365,7 +419,9 @@ class SharedStorage:
         storage.hand_heartbeat_s = ctx.Value("d", 0.0)
         storage.policy_heartbeat_s = ctx.Value("d", 0.0)
         storage.recorder_heartbeat_s = ctx.Value("d", 0.0)
-        storage.inference_heartbeat_s = ctx.Value("d", 0.0) if cfg.enable_inference else None
+        storage.inference_heartbeat_s = (
+            ctx.Value("d", 0.0) if cfg.enable_inference else None
+        )
         storage.vr_heartbeat_s = ctx.Value("d", 0.0)
         storage.camera_heartbeat_s = ctx.Value("d", 0.0)
 
@@ -385,7 +441,9 @@ class SharedStorage:
         storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
         storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
         storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
-        storage.camera_observation_required = ctx.Value("b", False) if cfg.enable_inference else None
+        storage.camera_observation_required = (
+            ctx.Value("b", False) if cfg.enable_inference else None
+        )
 
     def close(self) -> bool:
         """Release all shared memory primitives.
@@ -408,7 +466,9 @@ class SharedStorage:
         expected: set[str] = set()
         _close_errors: list[str] = []
 
-        def _attempt(operation: str, callback: Any, *, missing_ok: bool = False) -> bool:
+        def _attempt(
+            operation: str, callback: Any, *, missing_ok: bool = False
+        ) -> bool:
             expected.add(operation)
             if operation in completed:
                 return True
@@ -417,11 +477,15 @@ class SharedStorage:
             except FileNotFoundError:
                 if not missing_ok:
                     _close_errors.append(operation)
-                    logger.warning("SharedStorage close: %s failed", operation, exc_info=True)
+                    logger.warning(
+                        "SharedStorage close: %s failed", operation, exc_info=True
+                    )
                     return False
             except Exception:
                 _close_errors.append(operation)
-                logger.warning("SharedStorage close: %s failed", operation, exc_info=True)
+                logger.warning(
+                    "SharedStorage close: %s failed", operation, exc_info=True
+                )
                 return False
             completed.add(operation)
             return True
@@ -535,8 +599,8 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
 def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
     """Read latest hand state from ring. Return dict of numpy arrays or None.
 
-    Fields: qpos(12), current(12), tactile_sum(5,3), tactile_contact(5),
-            connected, error_state, qpos_stale.
+    Fields include qpos/current/tactile data, hardware/read health, and the
+    last hand action ID accepted by the worker/SDK.
     """
     data = read_hand_state(shared)
     if data is None:
@@ -549,6 +613,8 @@ def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
         "connected": bool(data["connected"][0]),
         "error_state": bool(data["error_state"][0]),
         "qpos_stale": bool(data["qpos_stale"][0]),
+        "last_cmd_seq": int(data["last_cmd_seq"][0]),
+        "last_cmd_qpos": np.asarray(data["last_cmd_qpos"][0], dtype=np.float64),
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
         "state_valid": bool(data["state_valid"][0]),

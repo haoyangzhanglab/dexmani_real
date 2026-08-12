@@ -133,6 +133,7 @@ def learned_policy_loop(
             teleop_profile=TeleopProfile(),
             hand_dof=True,
             static_boxes=tuple(runtime.environment.static_boxes),
+            table=runtime.environment.table,
         )
         gate = planner_action_safety_gate(
             ActionSafetyGateConfig(
@@ -141,6 +142,7 @@ def learned_policy_loop(
                 hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
                 hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
                 arm_max_velocity_rad_s=float(np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)),
+                arm_tracking_tolerance_rad=float(runtime.arm.tracking_error_warn_rad),
                 hand_max_velocity_rad_s=(
                     float(runtime.hand.max_delta_rad) * inference.observation.control_hz
                     if runtime.hand.max_delta_rad is not None
@@ -312,6 +314,7 @@ class LearnedPolicyCoordinator:
         self._last_camera_generation: int | None = None
         self._hold_after_timeout = False
         self._hold_published = False
+        self._last_hand_qpos_cmd: np.ndarray | None = None
         self._rewarm_pending = False
         self._rewarm_triggered = False
 
@@ -430,7 +433,6 @@ class LearnedPolicyCoordinator:
             hand_issue = validate_hand_feedback(
                 connected=bool(hand_record["connected"]),
                 error_state=bool(hand_record["error_state"]),
-                qpos_stale=bool(hand_record["qpos_stale"]),
                 state_valid=bool(hand_record["state_valid"]),
                 send_healthy=bool(hand_record["send_healthy"]),
                 read_healthy=bool(hand_record["read_healthy"]),
@@ -465,19 +467,22 @@ class LearnedPolicyCoordinator:
             current_hand_qpos=current_hand,
             dt_s=self.inference.action.dt_s,
             run_generation=int(self.shared.run_generation.value),
+            previous_hand_qpos_cmd=self._last_hand_qpos_cmd,
         )
         if not result.accepted or result.candidate is None:
             logger.warning("learned candidate rejected: %s", result.reason)
             return CoordinatorTick.REJECTED
         if not send_command(self.shared, result.candidate, prepare_timeout_s=self.config.prepare_timeout_s):
             raise TimeoutError("learned action publish failed")
+        if result.candidate.hand_qpos is not None:
+            self._last_hand_qpos_cmd = np.asarray(result.candidate.hand_qpos, dtype=np.float64).copy()
         return CoordinatorTick.PUBLISHED
 
     def _publish_coordinated_hold(self, *, now_ns: int) -> None:
         if self._hold_published or not self._snapshots:
             return
         snapshot = self._snapshots[max(self._snapshots)]
-        current_arm, current_hand = self._current_joints()
+        current_arm, _current_hand = self._current_joints()
         action_id = self._allocate_action_id()
         hold = ActionCandidate(
             observation_id=snapshot.observation_id,
@@ -489,7 +494,9 @@ class LearnedPolicyCoordinator:
                 now_ns + int((float(self.shared.action_lead_time_s) + self.inference.action.dt_s) * 1e9)
             ),
             arm_qpos=current_arm,
-            hand_qpos=current_hand if self.config.hand_enabled else None,
+            # The latest-wins hand command remains active. Never republish
+            # measured feedback as a target during a coordinated hold.
+            hand_qpos=None,
             is_hold=True,
         )
         if self._publish_candidate(hold, now_ns=now_ns) is not CoordinatorTick.PUBLISHED:
@@ -507,7 +514,7 @@ class LearnedPolicyCoordinator:
         return run_generation
 
     def hold(self, *, now_monotonic_ns: int | None = None, invalidate_run: bool = True) -> None:
-        """Invalidate pending actions, then publish a hold from fresh measured joints."""
+        """Invalidate pending actions, then publish a fresh measured arm-only hold."""
         now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
         if invalidate_run:
             self.begin_new_run(now_monotonic_ns=now_ns)

@@ -427,8 +427,9 @@ def _build_robot_state(
     a complete RobotState.  Computes world-frame fingertip positions via hand FK
     chain (handbase -> fingertip -> world via EEF transform).
 
-    Hand health flags (qpos_stale, error_state) are read from HAND_STATE_DTYPE
-    and forwarded to RobotState for recording.
+    Hand hardware/error flags are forwarded to RobotState for recording.
+    ``qpos_stale`` remains a reserved false compatibility field; runtime
+    freshness comes from the source timestamp and read/state validity.
     """
     if arm_state is not None:
         r = arm_state[0]

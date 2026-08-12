@@ -424,7 +424,7 @@ class EpisodeRecorder:
             # from "connected but read failed (NaN qpos + connected=True)".
             "arm_connected": bool(state.arm_connected),
             "hand_connected": bool(state.hand_connected),
-            # ── Hand health flags ──
+            # ── Hand health/compatibility flags ──
             "hand_qpos_stale": bool(state.hand_qpos_stale),
             "hand_error_state": bool(state.hand_error_state),
             # Arm command timing.

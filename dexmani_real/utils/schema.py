@@ -24,7 +24,11 @@ ARM_JOINT_SHAPE = (ARM_DOF,)
 HAND_JOINT_SHAPE = (HAND_DOF,)
 ARM_EE_SHAPE = (9,)
 HAND_TACTILE_SUM_SHAPE = (HAND_FINGER_COUNT, TACTILE_AXIS_COUNT)
-HAND_TACTILE_FORCE_SHAPE = (HAND_FINGER_COUNT, TACTILE_POINTS_PER_FINGER, TACTILE_AXIS_COUNT)
+HAND_TACTILE_FORCE_SHAPE = (
+    HAND_FINGER_COUNT,
+    TACTILE_POINTS_PER_FINGER,
+    TACTILE_AXIS_COUNT,
+)
 HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
@@ -38,8 +42,23 @@ _COMMAND_COMMON_FIELDS = [
     ("is_hold", "<u1"),
 ]
 
-ARM_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True)
-HAND_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True)
+ARM_COMMAND_DTYPE = np.dtype(
+    _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True
+)
+HAND_COMMAND_DTYPE = np.dtype(
+    _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
+)
+
+ARM_CONTROL_DTYPE = np.dtype(
+    [
+        ("kind", "<u1"),
+        ("run_generation", "<u8"),
+        ("action_id", "<u8"),
+        ("created_monotonic_ns", "<u8"),
+        ("valid_until_monotonic_ns", "<u8"),
+    ],
+    align=True,
+)
 
 INFERENCE_CANDIDATE_DTYPE = np.dtype(
     [
@@ -91,7 +110,13 @@ HAND_STATE_DTYPE = np.dtype(
         ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
         ("error_state", "<u1"),
         ("connected", "<u1"),
+        # Reserved compatibility bit: execution non-convergence is not a
+        # feedback-freshness fault. Freshness comes from source timestamp and
+        # read_healthy/state_valid.
         ("qpos_stale", "<u1"),
+        # Last command for which XHand.send_action() returned success.
+        ("last_cmd_seq", "<u8"),
+        ("last_cmd_qpos", "<f8", HAND_JOINT_SHAPE),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
         ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
         ("tipboard_err", "<i4", HAND_JOINT_SHAPE),
@@ -316,6 +341,7 @@ def make_record_sample_dtype(
 
 __all__ = [
     "ARM_COMMAND_DTYPE",
+    "ARM_CONTROL_DTYPE",
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
     "HAND_COMMAND_DTYPE",

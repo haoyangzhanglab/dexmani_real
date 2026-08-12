@@ -48,7 +48,8 @@ Camera worker ─┐
 VR worker ─────┼── shared state rings ──► Teleop or learned-policy coordinator
 Arm worker ────┤                                  │
 Hand worker ───┘                         fire-and-forget command publication
-                                                    ├──► bounded arm queue → Arm worker
+                                                    ├──► bounded arm endpoint/HOME queue → Arm worker
+                                                    ├──► priority arm STOP/RESUME ring ───┘
                                                     └──► latest-wins hand ring → Hand worker
 
 Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v16
@@ -89,7 +90,8 @@ discover a dtype.
 
 | Transport | Direction | Semantics |
 |---|---|---|
-| `arm_action_q` | controller → arm | Ordered `mp.Queue(maxsize=2)`; backpressure is intentional |
+| `arm_action_q` | controller → arm | Ordered `mp.Queue(maxsize=2)`; carries fixed endpoints plus correlated HOME requests; endpoint backpressure is intentional |
+| `arm_control_ring` | controller → arm | Fixed-dtype latest-wins STOP/RESUME request; read before the ordered queue so braking never competes with endpoints for capacity |
 | `hand_cmd_ring` | controller → hand | Seqlock, latest-wins servo target |
 | arm/hand/VR/camera rings | worker → controller | Seqlock state; source and publish freshness are distinct |
 | `record_control_ring` | controller → RecorderIO | Latest immutable fixed-field START/STOP boundary; no JSON payload |
@@ -118,8 +120,12 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
 - `error_state` is sticky. A process death or enabled-worker heartbeat timeout
   becomes a main-owned fault.
 - `SafetyGate` (in `policy/safety.py`) is the single validation boundary:
-  well-formed → joint limits → velocity clamp → collision → workspace.
-  Workers trust the gate and apply commands with only hardware-level checks.
+  well-formed → joint limits → whole-action velocity-envelope accept/reject →
+  collision → workspace. It never clips individual joints of a motion action.
+  Hand velocity is command-to-command, never target-to-measured; workers
+  additionally reject stale-generation, expired, operational-limit, and rated
+  mechanical-limit violations without changing an endpoint. Runtime config may
+  narrow, but cannot widen, the bundled rated mechanical envelope.
 - `run_generation` tags both policy observations and candidates. Begin, pause,
   home, feedback fault, and camera re-warm advance it; the coordinator drops a
   mailbox result unless it, its observation, and shared state have the same
@@ -147,6 +153,16 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
 - `teleop/episode_samples.py` owns recording sample construction. One sample is
   emitted per `control_hz` grid tick (normally 16 Hz), not per sensor arrival.
 - Mode 6 firmware smooths arm targets. Application-side interpolation is unsafe.
+- A moving keyboard arm stops through a correlated firmware State 6 request,
+  not a delayed measured/predicted endpoint. State 6 is the request; deployed
+  firmware may report non-ready State 5 (or briefly State 6). The worker
+  accepts only that error-free post-request state set and ACKs through
+  `last_cmd_seq`; the caller independently waits for two fresh low-velocity
+  frames before re-anchoring to measured qpos. Before the next motion endpoint,
+  the controller sends an explicit RESUME request through the same priority
+  ring. The worker reads joints directly from the SDK, establishes that exact
+  measured hold while entering Mode 6/ready State 2, then ACKs; an ordinary
+  endpoint can neither resume the arm nor fill the queue during this handshake.
 
 ### Experimental learned-policy deployment
 
@@ -208,8 +224,8 @@ aligned samples → RecorderIO → temporary episode + stream verification
 
 1. Change the pure planning/mapper helper first, with explicit unit/shape
    validation.
-2. Trace candidate rejection to hold-on-failure, delta clamp, frame-quality
-   flags, safety gate, and replay preflight.
+2. Trace candidate rejection to hold-on-failure, upstream teleop delta shaping,
+   whole-action gate rejection, frame-quality flags, and replay preflight.
 3. Keep arm behavior as one Mode 6 endpoint per grid tick; never insert an
    interpolation layer.
 4. Exercise invalid target, stale feedback, collision/rejection, and normal
@@ -251,9 +267,28 @@ aligned samples → RecorderIO → temporary episode + stream verification
 - xArm Mode 6 is the normal servo mode; firmware is the final collision/current
   safety backstop. C22/C31 are immediate faults; C24 has bounded measured-hold
   recovery. Homing uses a separately validated Mode 0 milestone path.
+- Successful vendor SDK startup chatter may be captured only within the owning
+  device worker's bounded initialization calls. Project readiness logs remain
+  visible, and failed SDK calls replay their captured native diagnostics.
+- `config/desk_plane.json` is shared calibration input for point-cloud filtering,
+  online collision checks, replay preflight, and homing. The collision model
+  represents it as a tilted finite box, excludes only configured mounting-link
+  contact, and uses mesh distance for soft clearance; fixed-Z frame padding is
+  a compatibility fallback only.
 - XHand is a 12-DoF EtherCAT position servo; its command ring is latest-wins.
   The default keyboard/data-collection path requires measured hand feedback;
   `--no-hand` is an explicit secured/open-pose assumption.
+- XHand contact, backlash, and torque-limited steady-state error are valid
+  execution outcomes. Unchanged qpos or failure to converge to a requested
+  angle is diagnostic data, not a freshness fault; use forced-read success,
+  source timestamps, worker heartbeat, board error registers, and SDK return
+  codes for health. The v16 `qpos_stale` bit is retained as a reserved false
+  compatibility field.
+- Return-home creates explicit bounded milestones from the worker's last
+  accepted hand command to the configured hand-home endpoint. Every complete
+  endpoint is published unchanged and matched to a successful SDK action ID;
+  no measured-angle convergence is tested. After the exact final-home ACK, arm
+  homing uses configured hand-home geometry and the existing validated path.
 - A stalled L515 can appear healthy when frames are forward-filled. Source
   freshness, not just worker heartbeat, determines frame quality.
 - Quest HTS is TCP port 8000; USB commonly needs `adb reverse tcp:8000 tcp:8000`.

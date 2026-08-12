@@ -29,7 +29,7 @@ except ImportError:
 
 
 from dexmani_real.utils.array_utils import nan_array, safe_resize
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import ThrottledWarner, capture_native_stdout, extract_native_diagnostics, get_logger
 from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
@@ -96,9 +96,17 @@ class XHandConfig:
 
     qpos_max: np.ndarray = field(default_factory=lambda: np.asarray(hand.qpos_max_rad, dtype=np.float64))
 
+    mechanical_qpos_min: np.ndarray = field(
+        default_factory=lambda: np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64)
+    )
+
+    mechanical_qpos_max: np.ndarray = field(
+        default_factory=lambda: np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64)
+    )
+
     # Feedback-only tolerance for measured encoder positions outside the strict
     # command limits. It classifies diagnostics; it never widens or clips the
-    # feedback stream and is independent of clip_report_tolerance below.
+    # feedback stream and never changes command acceptance.
     feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
 
     kp: int = 100
@@ -118,21 +126,8 @@ class XHandConfig:
     tor_max_per_joint: np.ndarray | None = None  # (12,) per-joint tor_max overrides
     mode: int = 3
 
-    clip_joint_limit: bool = True
-    # Command-side reporting threshold: minimum requested-target deviation (rad)
-    # before the CLIP status flag is set. np.clip is always enforced. This does
-    # not classify encoder feedback; feedback_bound_tolerance_rad does that.
-    clip_report_tolerance: float = 0.01
-
-    # ── Per-step delta clamp (off by default) ──
-    # Mode 3 PID has no firmware trajectory planning (unlike arm Mode 6).
-    # A large instantaneous target jump is forwarded directly to the motor PID.
-    # When enabled, this clamp limits the per-step joint delta as a safety
-    # backstop. It is disabled because the shared action gate already bounds
-    # target changes and the firmware current limit is the hardware backstop.
-    #   - scalar: applied to all 12 joints
-    #   - (12,) array: per-joint limits
-    #   - None: disabled (default)
+    # Whole-command rejection threshold. The driver never clips a delta; home
+    # and other multi-step flows must publish explicit legal milestones.
     max_delta_rad: float | np.ndarray | None = field(default_factory=lambda: hand.max_delta_rad)
 
     # ── F1: Tactile contact detection ──
@@ -144,6 +139,30 @@ class XHandConfig:
     def __post_init__(self) -> None:
         if self.ethercat_slave_position < -1:
             raise ValueError("ethercat_slave_position must be -1 (unknown) or non-negative")
+        command_lower = np.asarray(self.qpos_min, dtype=np.float64)
+        command_upper = np.asarray(self.qpos_max, dtype=np.float64)
+        mechanical_lower = np.asarray(self.mechanical_qpos_min, dtype=np.float64)
+        mechanical_upper = np.asarray(self.mechanical_qpos_max, dtype=np.float64)
+        rated_lower = np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64)
+        rated_upper = np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64)
+        home_qpos = np.asarray(self.home_qpos, dtype=np.float64)
+        vectors = (command_lower, command_upper, mechanical_lower, mechanical_upper, home_qpos)
+        if any(value.shape != HAND_JOINT_SHAPE for value in vectors):
+            raise ValueError(f"XHand home and limit arrays must have shape {HAND_JOINT_SHAPE}")
+        if not np.all(np.isfinite(np.concatenate(vectors))):
+            raise ValueError("XHand home and limit arrays must be finite")
+        if np.any(mechanical_lower > mechanical_upper) or np.any(command_lower > command_upper):
+            raise ValueError("XHand mechanical and command limits must be ordered")
+        if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
+            raise ValueError("XHand mechanical limits cannot exceed the rated device envelope")
+        if np.any(command_lower < mechanical_lower) or np.any(command_upper > mechanical_upper):
+            raise ValueError("XHand command limits must be inside mechanical limits")
+        if np.any(home_qpos < command_lower - 1e-12) or np.any(home_qpos > command_upper + 1e-12):
+            raise ValueError("XHand home_qpos must be inside command limits")
+        if self.max_delta_rad is not None:
+            max_delta = np.broadcast_to(np.asarray(self.max_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE)
+            if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
+                raise ValueError("XHand max_delta_rad must broadcast to twelve finite positive values")
         if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
             raise ValueError("feedback_bound_tolerance_rad must be finite and >= 0")
         if not np.isfinite(self.tactile_contact_threshold) or self.tactile_contact_threshold < 0:
@@ -169,10 +188,10 @@ class XHand:
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_cmd_time: float | None = None
         self.last_error_code: int | None = None
-        self.last_joint_limit_clipped = False
+        self.last_joint_limit_rejected = False
 
         # Measured-feedback diagnostics are deliberately separate from command
-        # clipping. Raw finite qpos remains unchanged when published/recorded.
+        # acceptance. Raw finite qpos remains unchanged when published/recorded.
         self._feedback_bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._feedback_bound_checks = 0
         self._feedback_bound_outside = 0
@@ -285,8 +304,24 @@ class XHand:
         # Device discovery uses a temporary control that is closed afterward.
         if self.config.device_name is None:
             temp_control = xhc.XHandControl()
+            discovery_output = ""
+            discovery_capture = None
             try:
-                devices = temp_control.enumerate_devices(comm_type)
+                with capture_native_stdout() as discovery_capture:
+                    devices = temp_control.enumerate_devices(comm_type)
+                discovery_output = discovery_capture.text
+                discovery_diagnostics = extract_native_diagnostics(discovery_output)
+                if discovery_diagnostics:
+                    logger.warning("XHand discovery SDK diagnostics:\n%s", "\n".join(discovery_diagnostics))
+            except Exception:
+                discovery_output = discovery_capture.text if discovery_capture is not None else ""
+                logger.error(
+                    "XHand %s discovery raised%s",
+                    comm_type,
+                    f"; vendor output:\n{discovery_output}" if discovery_output else "",
+                    exc_info=True,
+                )
+                raise
             finally:
                 try:
                     temp_control.close_device()
@@ -296,6 +331,8 @@ class XHand:
                 self.error_state = True
                 self.last_error_code = -2
                 self.last_error_message = f"no XHand device found for {comm_type}"
+                if discovery_output:
+                    logger.warning("XHand discovery vendor output:\n%s", discovery_output)
                 self._diagnose_connection_failure()
                 return False
             self.device_name = devices[0]
@@ -314,17 +351,42 @@ class XHand:
 
         for attempt in range(1, retries + 1):
             self.control = xhc.XHandControl()
-            if comm_type == "RS485":
-                err = self.control.open_serial(self.device_name, int(self.config.baudrate))
-            elif comm_type == "EtherCAT":
-                err = self.control.open_ethercat(self.device_name)
-            else:
-                self.error_state = True
-                self.last_error_code = -3
-                self.last_error_message = f"unsupported comm_type: {self.config.comm_type}"
-                return False
+            open_capture = None
+            try:
+                with capture_native_stdout() as open_capture:
+                    if comm_type == "RS485":
+                        err = self.control.open_serial(self.device_name, int(self.config.baudrate))
+                    elif comm_type == "EtherCAT":
+                        err = self.control.open_ethercat(self.device_name)
+                    else:
+                        self.error_state = True
+                        self.last_error_code = -3
+                        self.last_error_message = f"unsupported comm_type: {self.config.comm_type}"
+                        return False
+            except Exception:
+                open_output = open_capture.text if open_capture is not None else ""
+                logger.error(
+                    "XHand open attempt %d/%d raised%s",
+                    attempt,
+                    retries,
+                    f"; vendor output:\n{open_output}" if open_output else "",
+                    exc_info=True,
+                )
+                raise
+            open_output = open_capture.text
 
             if self.error_ok(err):
+                if "Operation not permitted" in open_output:
+                    logger.warning(
+                        "XHand EtherCAT entered OP, but the SDK could not enable real-time thread scheduling; "
+                        "operation continues with normal scheduling"
+                    )
+                open_diagnostics = extract_native_diagnostics(
+                    open_output,
+                    ignore=("Operation not permitted",),
+                )
+                if open_diagnostics:
+                    logger.warning("XHand SDK initialization diagnostics:\n%s", "\n".join(open_diagnostics))
                 if attempt > 1:
                     logger.warning(
                         "XHand connect succeeded on attempt %d/%d "
@@ -337,6 +399,8 @@ class XHand:
                 return True
 
             self._record_error(err)
+            if open_output:
+                logger.warning("XHand open attempt %d/%d vendor output:\n%s", attempt, retries, open_output)
             # Close the failed control before retry
             try:
                 self.control.close_device()
@@ -400,8 +464,11 @@ class XHand:
                 time.sleep(interval)
 
         if valid_state is not None:
-            self.last_qpos_cmd = valid_state["qpos"].copy()
-            logger.info("Initial qpos from hand state: %s", self.last_qpos_cmd)
+            measured_qpos = np.asarray(valid_state["qpos"], dtype=np.float64)
+            # This projects only the internal command-history seed. No command
+            # is published here, and raw measured feedback stays unchanged.
+            self.last_qpos_cmd = np.clip(measured_qpos, self.config.qpos_min, self.config.qpos_max)
+            logger.debug("Initial qpos from hand state: %s", measured_qpos)
         else:
             return False
 
@@ -438,9 +505,9 @@ class XHand:
         reset failures are non-fatal, but calibration stays false when the
         no-contact quality gate fails.
 
-        The C++ SDK (libxhand_control.so) prints "Unknow Cmd!" to stdout for
-        each ``reset_sensor()`` call when the hand firmware does not recognise
-        the command.  The error codes are handled in Python regardless.
+        Some firmware prints ``Unknow Cmd!`` despite returning success for
+        ``reset_sensor()``.  Capture that native stdout noise, count it once,
+        and rely on the subsequent measured verification and software bias.
         """
         if self._stub_mode:
             self.tactile_calibrated = True
@@ -453,20 +520,36 @@ class XHand:
 
         bad_indices: list[int] = list(range(HAND_FINGER_COUNT))
         _last_mags: np.ndarray | None = None  # cached for else-clause diagnostics
+        unsupported_reset_count = 0
 
         for outer in range(MAX_OUTER_ITERS):
             # ── Reset only sensors that still have residual offset ──
             for idx in bad_indices:
                 sensor_id = 17 + idx
                 for attempt in range(3):
+                    reset_capture = None
                     try:
-                        err = self.control.reset_sensor(device_id, sensor_id)
+                        with capture_native_stdout() as reset_capture:
+                            err = self.control.reset_sensor(device_id, sensor_id)
+                        if "Unknow Cmd!" in reset_capture.text:
+                            unsupported_reset_count += 1
+                        reset_diagnostics = extract_native_diagnostics(
+                            reset_capture.text,
+                            ignore=("Unknow Cmd!",),
+                        )
+                        if reset_diagnostics:
+                            logger.warning(
+                                "XHand tactile-reset SDK diagnostics:\n%s",
+                                "\n".join(reset_diagnostics),
+                            )
                         if self.error_ok(err):
                             break
                     except Exception:
+                        reset_output = reset_capture.text if reset_capture is not None else ""
                         logger.warning(
-                            "Tactile sensor %d reset attempt raised",
+                            "Tactile sensor %d reset attempt raised%s",
                             sensor_id,
+                            f"; vendor output:\n{reset_output}" if reset_output else "",
                             exc_info=True,
                         )
                     time.sleep(0.2)
@@ -517,6 +600,13 @@ class XHand:
                 MAX_OUTER_ITERS,
                 ", ".join(_labels),
                 _max_mag,
+            )
+
+        if unsupported_reset_count:
+            logger.info(
+                "XHand firmware did not implement %d tactile reset request(s); "
+                "measured startup verification and software bias were used",
+                unsupported_reset_count,
             )
 
         # reset_sensor() can leave an offset, so estimate a bias from fresh reads.
@@ -594,7 +684,7 @@ class XHand:
                 )
 
         max_bias = float(np.max(np.abs(self._tactile_bias_raw)))
-        logger.info(
+        logger.debug(
             "Tactile bias computed from %d samples — max bias %.2f scaled units",
             n_samples,
             max_bias,
@@ -613,7 +703,6 @@ class XHand:
         try:
             ver = self.control.get_sdk_version()
             self.device_identity["sdk_version"] = str(ver)
-            logger.info("XHand SDK version: %s", ver)
         except Exception:
             logger.warning("XHand SDK version: unavailable", exc_info=True)
 
@@ -622,7 +711,6 @@ class XHand:
             err, hand_type = self.control.get_hand_type(device_id)
             if self.error_ok(err):
                 self.device_identity["hand_type"] = str(hand_type)
-                logger.info("XHand hand type: %s (device_id=%d)", hand_type, device_id)
             else:
                 code = self.error_code(err)
                 msg = str(getattr(err, "error_message", ""))
@@ -635,13 +723,20 @@ class XHand:
             err, serial = self.control.get_serial_number(device_id)
             if self.error_ok(err):
                 self.device_identity["serial_number"] = str(serial)
-                logger.info("XHand serial: %s", serial)
             else:
                 code = self.error_code(err)
                 msg = str(getattr(err, "error_message", ""))
                 logger.warning("XHand get_serial_number failed: code=%s msg=%s", code, msg)
         except Exception:
             logger.warning("XHand get_serial_number: unavailable", exc_info=True)
+
+        logger.info(
+            "XHand ready: SDK=%s type=%s serial=%s device_id=%d",
+            self.device_identity["sdk_version"],
+            self.device_identity["hand_type"],
+            self.device_identity["serial_number"],
+            device_id,
+        )
 
     # ── EtherCAT slave state management ──
 
@@ -870,11 +965,25 @@ class XHand:
             self.last_error_message = "XHand.send_action rejected invalid shape or NaN/Inf"
             logger.warning(self.last_error_message)
             return False
+        if not self._validate_joint_range(target_qpos):
+            return False
+        if self.config.max_delta_rad is not None and self.last_qpos_cmd is not None:
+            max_delta = np.broadcast_to(np.asarray(self.config.max_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE)
+            delta = np.abs(target_qpos - self.last_qpos_cmd)
+            violating = np.flatnonzero(delta > max_delta + 1e-12)
+            if violating.size:
+                joint_index = int(violating[0])
+                self.last_error_message = (
+                    "XHand.send_action rejected command delta violation: "
+                    f"joint={joint_index} delta={delta[joint_index]:.6f}rad "
+                    f"limit={max_delta[joint_index]:.6f}rad"
+                )
+                logger.warning(self.last_error_message)
+                return False
         if self._stub_mode:
-            # Track the (joint-limited) request so last_qpos_cmd follows the
-            # action stream instead of freezing at home_qpos — recorded actions
-            # would otherwise be silently replaced by a constant.
-            self.last_qpos_cmd = self._limit_joint_range(target_qpos)
+            # Track the accepted request so following simulation mirrors the
+            # same all-or-nothing command contract as hardware.
+            self.last_qpos_cmd = target_qpos.copy()
             return True
 
         if self.control is None or self.hand_command is None:
@@ -883,19 +992,10 @@ class XHand:
                 self.last_error_message = "hand_command is None (not initialized)"
             return False
 
-        qpos_cmd = self._limit_joint_range(target_qpos)
-
-        # ── Per-step delta clamp ──
-        # Mode 3 PID has no firmware trajectory planning.  Large instantaneous
-        # jumps (e.g. home_qpos → first VR pose) are forwarded directly to the
-        # motor PID at full torque.  This clamp is a safety backstop — normal
-        # teleop should rarely trigger it.
-        if self.config.max_delta_rad is not None and self.last_qpos_cmd is not None:
-            limit = np.broadcast_to(self.config.max_delta_rad, HAND_JOINT_SHAPE)
-            delta = qpos_cmd - self.last_qpos_cmd
-            clipped_delta = np.clip(delta, -limit, limit)
-            qpos_cmd = self.last_qpos_cmd + clipped_delta
-
+        # The policy boundary owns primary command-to-command validation. The
+        # driver redundantly checks bounds/delta and forwards the endpoint
+        # unchanged.
+        qpos_cmd = target_qpos.copy()
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)
         self.last_action_code = self.error_code(err)
@@ -1041,7 +1141,7 @@ class XHand:
                     "last_action_code": self.last_action_code,
                     "last_error_code": self.last_error_code,
                     "last_error_message": self.last_error_message,
-                    "last_joint_limit_clipped": self.last_joint_limit_clipped,
+                    "last_joint_limit_rejected": self.last_joint_limit_rejected,
                     "last_hand_ids": self.last_hand_ids,
                     "comm_type": self.cached_comm_type,
                     "device_name": self.device_name,
@@ -1106,18 +1206,30 @@ class XHand:
             force_sum -= self._tactile_bias_ft
         return force_sum
 
-    def _limit_joint_range(self, qpos: np.ndarray) -> np.ndarray:
-        # Command targets always stay inside strict SDK bounds. The reporting
-        # tolerance here is command-side only and is unrelated to measured
-        # feedback_bound_tolerance_rad.
-        if not self.config.clip_joint_limit:
-            self.last_joint_limit_clipped = False
-            return qpos
-
-        clipped = np.clip(qpos, self.config.qpos_min, self.config.qpos_max)
-        max_deviation = float(np.max(np.abs(qpos - clipped)))
-        self.last_joint_limit_clipped = max_deviation > self.config.clip_report_tolerance
-        return clipped
+    def _validate_joint_range(self, qpos: np.ndarray) -> bool:
+        """Reject an out-of-range endpoint without changing any joint target."""
+        command_low = np.asarray(self.config.qpos_min, dtype=np.float64)
+        command_high = np.asarray(self.config.qpos_max, dtype=np.float64)
+        mechanical_low = np.asarray(self.config.mechanical_qpos_min, dtype=np.float64)
+        mechanical_high = np.asarray(self.config.mechanical_qpos_max, dtype=np.float64)
+        command_violation = np.flatnonzero((qpos < command_low - 1e-12) | (qpos > command_high + 1e-12))
+        mechanical_violation = np.flatnonzero((qpos < mechanical_low - 1e-12) | (qpos > mechanical_high + 1e-12))
+        violating = mechanical_violation if mechanical_violation.size else command_violation
+        if violating.size == 0:
+            self.last_joint_limit_rejected = False
+            return True
+        joint_index = int(violating[0])
+        boundary = "mechanical" if mechanical_violation.size else "command"
+        lower = mechanical_low if mechanical_violation.size else command_low
+        upper = mechanical_high if mechanical_violation.size else command_high
+        self.last_joint_limit_rejected = True
+        self.last_error_message = (
+            f"XHand.send_action rejected {boundary} joint limit violation: "
+            f"joint={joint_index} target={qpos[joint_index]:.6f}rad "
+            f"range=[{lower[joint_index]:.6f},{upper[joint_index]:.6f}]rad"
+        )
+        logger.warning(self.last_error_message)
+        return False
 
     @property
     def feedback_bound_stats(self) -> dict[str, Any]:
@@ -1194,7 +1306,7 @@ class XHand:
             "last_action_code": self.last_action_code,
             "last_error_code": self.last_error_code,
             "last_error_message": self.last_error_message,
-            "last_joint_limit_clipped": self.last_joint_limit_clipped,
+            "last_joint_limit_rejected": self.last_joint_limit_rejected,
             "last_hand_ids": self.last_hand_ids,
             "comm_type": self.cached_comm_type,
             "device_name": self.device_name,

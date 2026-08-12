@@ -27,9 +27,11 @@ from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.policy.safety import (
     ActionSafetyGateConfig,
-    advance_run_generation,
     planner_action_safety_gate,
+    publish_hand_home_and_wait_applied,
     publish_joint_targets,
+    request_arm_decelerated_stop,
+    request_arm_resume,
 )
 from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
@@ -50,7 +52,6 @@ from dexmani_real.teleop.keyboard import (
 )
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.utils.signal_utils import ema_smooth_pose
 
 logger = get_logger(__name__)
 
@@ -61,30 +62,45 @@ _IK_WARNING_INTERVAL_S = 1.0
 def _workspace(runtime: ResolvedRuntimeConfig) -> np.ndarray:
     bounds = runtime.policy.workspace
     return np.array(
-        [[bounds.x_min, bounds.x_max], [bounds.y_min, bounds.y_max], [bounds.z_min, bounds.z_max]],
+        [
+            [bounds.x_min, bounds.x_max],
+            [bounds.y_min, bounds.y_max],
+            [bounds.z_min, bounds.z_max],
+        ],
         dtype=np.float64,
     )
 
 
-def _build_planner_and_gate(runtime: ResolvedRuntimeConfig) -> tuple[XArm7MotionPlanner, Any]:
+def _build_planner_and_gate(
+    runtime: ResolvedRuntimeConfig,
+) -> tuple[XArm7MotionPlanner, Any]:
     planner = XArm7MotionPlanner.create_default(
         teleop_profile=TeleopProfile(
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
-            max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
+            max_pose_error_rot_rad=float(
+                runtime.keyboard_teleop.ik_max_pose_error_rot_rad
+            ),
         ),
         static_boxes=tuple(runtime.environment.static_boxes),
+        table=runtime.environment.table,
     )
     planner.workspace_bounds = _workspace(runtime)
-    planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
+    planner.set_hand_qpos(
+        np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
+    )
     gate = planner_action_safety_gate(
         ActionSafetyGateConfig(
             arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
             arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
             hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
             hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-            arm_max_velocity_rad_s=float(np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)),
+            arm_max_velocity_rad_s=float(
+                np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)
+            ),
+            arm_tracking_tolerance_rad=float(runtime.arm.tracking_error_warn_rad),
             hand_max_velocity_rad_s=(
-                float(runtime.hand.max_delta_rad) * float(runtime.keyboard_teleop.control_hz)
+                float(runtime.hand.max_delta_rad)
+                * float(runtime.keyboard_teleop.control_hz)
                 if runtime.hand.max_delta_rad is not None
                 else float(np.deg2rad(runtime.hand.safety_gate_max_velocity_deg_per_s))
             ),
@@ -93,7 +109,7 @@ def _build_planner_and_gate(runtime: ResolvedRuntimeConfig) -> tuple[XArm7Motion
         planner=planner,
         table_z_surface_m=float(runtime.arm.table_z_surface_m),
         hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
-        enable_table_check=False,
+        enable_table_check=True,
     )
     return planner, gate
 
@@ -136,13 +152,14 @@ def _runtime_issue(
     return None
 
 
-def _hand_feedback_issue(state: dict[str, Any] | None, *, now_ns: int, max_age_s: float) -> str | None:
+def _hand_feedback_issue(
+    state: dict[str, Any] | None, *, now_ns: int, max_age_s: float
+) -> str | None:
     if state is None:
         return "hand state ring is empty"
     return validate_hand_feedback(
         connected=state["connected"],
         error_state=state["error_state"],
-        qpos_stale=state["qpos_stale"],
         state_valid=state["state_valid"],
         send_healthy=state["send_healthy"],
         read_healthy=state["read_healthy"],
@@ -153,7 +170,9 @@ def _hand_feedback_issue(state: dict[str, Any] | None, *, now_ns: int, max_age_s
     )
 
 
-def _read_initial_arm(shared: SharedStorage, runtime: ResolvedRuntimeConfig) -> dict[str, Any] | None:
+def _read_initial_arm(
+    shared: SharedStorage, runtime: ResolvedRuntimeConfig
+) -> dict[str, Any] | None:
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
     while time.monotonic() < deadline_s:
         state = read_arm_state_dict(shared)
@@ -192,7 +211,9 @@ def _start_workers(
     processes.append(arm_process)
     arm_process.start()
     arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
-    if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, arm_timeout_s)], processes):
+    if not wait_subsystem_ready(
+        shared, [("arm", shared.arm_ready, arm_timeout_s)], processes
+    ):
         return arm_process, None, False
 
     if not hand_requested:
@@ -210,7 +231,11 @@ def _start_workers(
     processes.append(hand_process)
     hand_process.start()
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["hand"])
-    while hand_process.is_alive() and not shared.hand_ready.is_set() and time.monotonic() < deadline_s:
+    while (
+        hand_process.is_alive()
+        and not shared.hand_ready.is_set()
+        and time.monotonic() < deadline_s
+    ):
         time.sleep(_INITIAL_STATE_POLL_S)
 
     if not shared.hand_ready.is_set():
@@ -237,31 +262,35 @@ def _set_fault(shared: SharedStorage, reason: str, *, estop: bool = False) -> No
     transition(shared, SafetyState.FAULT)
 
 
-def _publish_measured_quit_hold(
+def _stop_arm_motion(
     shared: SharedStorage,
-    arm_qpos: np.ndarray,
-    hand_qpos: np.ndarray | None,
+    runtime: ResolvedRuntimeConfig,
     *,
-    dt_s: float,
-    prepare_timeout_s: float,
-    apply_timeout_s: float,
-    safety_gate: Any,
-) -> bool:
-    """Invalidate pending motion and wait for one measured hold to reach the SDKs."""
-    advance_run_generation(shared)
-    return (
-        publish_joint_targets(
-            shared,
-            arm_qpos,
-            hand_qpos,
-            is_hold=True,
-            prepare_timeout_s=prepare_timeout_s,
-            dt_s=dt_s,
-            safety_gate=safety_gate,
-            wait_applied=True,
-            apply_timeout_s=apply_timeout_s,
-        )
-        is not None
+    reason: str,
+) -> np.ndarray | None:
+    """Brake in controller State 6 and return its settled measured position."""
+    return request_arm_decelerated_stop(
+        shared,
+        prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
+        apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
+        settle_velocity_rad_s=float(runtime.arm.homing.velocity_convergence_rad_s),
+        reason=f"keyboard-{reason}",
+        heartbeat=False,
+    )
+
+
+def _resume_arm_motion(
+    shared: SharedStorage,
+    runtime: ResolvedRuntimeConfig,
+    *,
+    reason: str,
+) -> np.ndarray | None:
+    """Resume Mode 6 behind a worker-measured hold and return that anchor."""
+    return request_arm_resume(
+        shared,
+        apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
+        reason=f"keyboard-{reason}",
+        heartbeat=False,
     )
 
 
@@ -291,22 +320,27 @@ def _run_control_loop(
     pose = planner.kin.compute_eef_pose_world(current_qpos)
     target_pos = pose.p.copy()
     target_quat = pose.q.copy()
-    ema_pos = target_pos.copy()
-    ema_quat = target_quat.copy()
 
     recoverable_errors = frozenset(int(code) for code in runtime.arm.recoverable_errors)
-    collision_errors = frozenset(int(code) for code in runtime.arm.collision_fault_errors)
+    collision_errors = frozenset(
+        int(code) for code in runtime.arm.collision_fault_errors
+    )
     heartbeat_timeouts = dict(runtime.safety.heartbeat_timeouts)
     rate = RateManager(float(cfg.control_hz))
     state_failures = 0
     home_key_down = False
     motion_active = False
     tracking_fault_frames = 0
+    previous_active_keys: tuple[str, ...] | None = None
+    blocked_keys: tuple[str, ...] | None = None
     frame = 0
     last_ik_warning_s = 0.0
     started_s = time.monotonic()
 
-    print("Keyboard active: WASD/arrows/IJKL move, R home, Q quit, ESC e-stop")
+    print(
+        "Keyboard active (terminal input captured through shutdown): "
+        "WASD/arrows/IJKL move, R home, Q quit, ESC e-stop"
+    )
     while shared.is_running.value:
         rate.wait()
         frame += 1
@@ -348,7 +382,9 @@ def _run_control_loop(
             )
         if feedback_issue is not None:
             if quit_requested:
-                _set_fault(shared, f"cannot publish a measured quit hold: {feedback_issue}")
+                _set_fault(
+                    shared, f"cannot confirm a decelerated quit stop: {feedback_issue}"
+                )
                 return False
             state_failures += 1
             if state_failures >= int(policy.max_consecutive_errors):
@@ -361,7 +397,10 @@ def _run_control_loop(
         error_code = int(state["error_code"])
         if error_code in recoverable_errors:
             if quit_requested:
-                _set_fault(shared, f"cannot publish a measured quit hold during arm error C{error_code}")
+                _set_fault(
+                    shared,
+                    f"cannot request a decelerated quit stop during arm error C{error_code}",
+                )
                 return False
             tracking_fault_frames = 0
             continue
@@ -369,7 +408,6 @@ def _run_control_loop(
             category = "collision" if error_code in collision_errors else "controller"
             _set_fault(shared, f"arm {category} error C{error_code}")
             return False
-        measured_hand_qpos: np.ndarray | None = None
         if hand_enabled:
             hand_state = read_hand_state_dict(shared)
             hand_issue = _hand_feedback_issue(
@@ -381,20 +419,11 @@ def _run_control_loop(
                 _set_fault(shared, hand_issue)
                 return False
             assert hand_state is not None
-            measured_hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
-            planner.set_hand_qpos(measured_hand_qpos)
+            planner.set_hand_qpos(np.asarray(hand_state["qpos"], dtype=np.float64))
 
         if quit_requested:
-            if not _publish_measured_quit_hold(
-                shared,
-                current_qpos,
-                measured_hand_qpos,
-                dt_s=dt_s,
-                prepare_timeout_s=float(policy.action_prepare_timeout_s),
-                apply_timeout_s=float(policy.action_apply_timeout_s),
-                safety_gate=safety_gate,
-            ):
-                _set_fault(shared, "measured quit hold was not applied")
+            if _stop_arm_motion(shared, runtime, reason="quit") is None:
+                _set_fault(shared, "decelerated quit stop did not settle")
                 return False
             if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                 require_transition(shared, SafetyState.ARMED)
@@ -404,24 +433,64 @@ def _run_control_loop(
         if home_pressed and not home_key_down:
             if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                 require_transition(shared, SafetyState.ARMED)
-            home_ok = send_arm_home(
-                shared,
-                np.asarray(runtime.arm.home_qpos, dtype=np.float64),
-                planner=planner,
-                table_z_surface_m=float(runtime.arm.table_z_surface_m),
-                current_qpos=current_qpos,
-                queue_timeout=float(runtime.arm.homing.request_queue_timeout_s),
-                converge_timeout_s=float(runtime.arm.homing.convergence_timeout_s),
-                state_max_age_s=float(runtime.arm.homing.state_max_age_s),
-                heartbeat=False,
-                estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
-                homing_max_speed_rad_s=float(np.deg2rad(runtime.arm.homing.max_speed_deg_s)),
-                homing_target_timeout_s=float(runtime.arm.homing.target_timeout_s),
-                arm_heartbeat_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
-                preplan_velocity_rad_s=float(runtime.arm.homing.velocity_convergence_rad_s),
-                result_tolerance_rad=float(runtime.arm.homing.convergence_rad),
-                verbose=True,
-            )
+            hand_home_accepted = True
+            if hand_enabled:
+                hand_home = np.deg2rad(
+                    np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
+                )
+                hand_home_accepted = publish_hand_home_and_wait_applied(
+                    shared,
+                    hand_home,
+                    command_lower_rad=np.asarray(
+                        runtime.hand.qpos_min_rad, dtype=np.float64
+                    ),
+                    command_upper_rad=np.asarray(
+                        runtime.hand.qpos_max_rad, dtype=np.float64
+                    ),
+                    mechanical_lower_rad=np.asarray(
+                        runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+                    ),
+                    mechanical_upper_rad=np.asarray(
+                        runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+                    ),
+                    max_command_delta_rad=runtime.hand.max_delta_rad,
+                    timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+                    heartbeat=False,
+                    abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+                )
+                if hand_home_accepted:
+                    planner.set_hand_qpos(hand_home)
+
+            home_ok = False
+            if hand_home_accepted:
+                home_ok = send_arm_home(
+                    shared,
+                    np.asarray(runtime.arm.home_qpos, dtype=np.float64),
+                    planner=planner,
+                    table_z_surface_m=float(runtime.arm.table_z_surface_m),
+                    current_qpos=current_qpos,
+                    queue_timeout=float(runtime.arm.homing.request_queue_timeout_s),
+                    converge_timeout_s=float(runtime.arm.homing.convergence_timeout_s),
+                    state_max_age_s=float(runtime.arm.homing.state_max_age_s),
+                    heartbeat=False,
+                    estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+                    homing_max_speed_rad_s=float(
+                        np.deg2rad(runtime.arm.homing.max_speed_deg_s)
+                    ),
+                    homing_target_timeout_s=float(runtime.arm.homing.target_timeout_s),
+                    arm_heartbeat_max_age_s=float(
+                        runtime.safety.heartbeat_timeouts["arm"]
+                    ),
+                    preplan_velocity_rad_s=float(
+                        runtime.arm.homing.velocity_convergence_rad_s
+                    ),
+                    result_tolerance_rad=float(runtime.arm.homing.convergence_rad),
+                    verbose=True,
+                )
+            else:
+                logger.warning(
+                    "Return-home cancelled: hand-home command was not accepted"
+                )
             if shared.estop_request.value:
                 _set_fault(shared, "operator e-stop during homing")
                 return False
@@ -433,7 +502,6 @@ def _run_control_loop(
             previous_command = current_qpos.copy()
             pose = planner.kin.compute_eef_pose_world(current_qpos)
             target_pos, target_quat = pose.p.copy(), pose.q.copy()
-            ema_pos, ema_quat = target_pos.copy(), target_quat.copy()
             if not home_ok:
                 logger.warning("Return-home request was not executed")
             motion_active = False
@@ -443,56 +511,122 @@ def _run_control_loop(
             continue
         home_key_down = home_pressed
 
-        dx, drpy = eef_delta_from_keys(keys, float(cfg.delta_pos_m), float(cfg.delta_rpy_rad))
+        active_keys = keys.pressed_keys()
+        dx, drpy = eef_delta_from_keys(
+            keys, float(cfg.delta_pos_m), float(cfg.delta_rpy_rad)
+        )
+        if active_keys != previous_active_keys:
+            logger.info(
+                "Keyboard input: held=%s dx_world_m=%s drpy_world_rad=%s",
+                active_keys,
+                np.round(dx, 4).tolist(),
+                np.round(drpy, 4).tolist(),
+            )
+            previous_active_keys = active_keys
         moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
+        if blocked_keys is not None:
+            if active_keys == blocked_keys:
+                if frame % int(cfg.idle_interval_frames) == 0:
+                    pose = planner.kin.compute_eef_pose_world(current_qpos)
+                    print(
+                        f"[blocked {time.monotonic() - started_s:.0f}s] "
+                        f"eef={np.round(pose.p, 3)}m held={active_keys}",
+                        flush=True,
+                    )
+                continue
+            blocked_keys = None
         if moving and not motion_active:
+            resumed_qpos = _resume_arm_motion(shared, runtime, reason="motion-start")
+            if resumed_qpos is None:
+                _set_fault(shared, "arm did not acknowledge the explicit motion resume")
+                return False
+            # The resume ACK carries the worker's direct SDK measurement taken
+            # at the State-0 transition.  Re-anchor both Cartesian and joint
+            # targets to it before publishing the first new motion endpoint.
+            current_qpos = resumed_qpos.copy()
+            measured_pose = planner.kin.compute_eef_pose_world(resumed_qpos)
+            target_pos, target_quat = measured_pose.p.copy(), measured_pose.q.copy()
+            previous_command = resumed_qpos.copy()
             require_transition(shared, SafetyState.RUNNING)
+            rate.reset()
         elif not moving and motion_active:
+            # A measured or predicted position target can land behind the
+            # moving arm after queue/feedback latency and command a reversal.
+            # State 6 lets firmware brake without inventing an endpoint.
+            stopped_qpos = _stop_arm_motion(shared, runtime, reason="key-release")
+            if stopped_qpos is None:
+                _set_fault(shared, "decelerated key-release stop did not settle")
+                return False
             require_transition(shared, SafetyState.ARMED)
-            held_pose = planner.kin.compute_eef_pose_world(previous_command)
+            previous_command = stopped_qpos.copy()
+            held_pose = planner.kin.compute_eef_pose_world(stopped_qpos)
             target_pos, target_quat = held_pose.p.copy(), held_pose.q.copy()
-            ema_pos, ema_quat = target_pos.copy(), target_quat.copy()
         motion_active = moving
         if not moving:
             tracking_fault_frames = 0
             if frame % int(cfg.idle_interval_frames) == 0:
                 pose = planner.kin.compute_eef_pose_world(current_qpos)
-                print(f"[idle {time.monotonic() - started_s:.0f}s] eef={np.round(pose.p, 3)}m", flush=True)
+                print(
+                    f"[idle {time.monotonic() - started_s:.0f}s] eef={np.round(pose.p, 3)}m",
+                    flush=True,
+                )
             continue
 
-        target_pos = np.clip(target_pos + dx, workspace[:, 0], workspace[:, 1])
+        # Advance a virtual Cartesian command at delta/dt, but cap its lead
+        # over fresh feedback.  This gives Mode 6 enough following error to
+        # reach the requested speed without allowing an unbounded target.
+        measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
+        workspace_margin_m = float(cfg.workspace_command_margin_m)
+        command_low = workspace[:, 0] + workspace_margin_m
+        command_high = workspace[:, 1] - workspace_margin_m
+        target_pos = np.clip(target_pos + dx, command_low, command_high)
+        position_lead = target_pos - measured_pose.p
+        max_position_lead_m = float(cfg.command_lookahead_frames) * float(
+            cfg.delta_pos_m
+        )
+        position_lead_norm = float(np.linalg.norm(position_lead))
+        if position_lead_norm > max_position_lead_m:
+            target_pos = measured_pose.p + position_lead * (
+                max_position_lead_m / position_lead_norm
+            )
         if np.any(drpy != 0.0):
             delta_quat = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
             target_quat = quat_multiply(delta_quat, target_quat)
-        ik_pos, ik_quat = ema_smooth_pose(
-            target_pos,
-            target_quat,
-            ema_pos,
-            ema_quat,
-            float(policy.ema.alpha_pos),
-            float(policy.ema.alpha_rot),
+        measured_rotation = Rotation.from_quat(measured_pose.q, scalar_first=True)
+        target_rotation = Rotation.from_quat(target_quat, scalar_first=True)
+        rotation_lead = (target_rotation * measured_rotation.inv()).as_rotvec()
+        rotation_lead_norm = float(np.linalg.norm(rotation_lead))
+        max_rotation_lead_rad = float(cfg.command_lookahead_frames) * float(
+            cfg.delta_rpy_rad
         )
-        ema_pos, ema_quat = ik_pos.copy(), ik_quat.copy()
-        if float(cfg.cartesian_kp) > 0.0:
-            measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
-            position_error = target_pos - measured_pose.p
-            if np.linalg.norm(position_error) > float(cfg.cartesian_deadband_m):
-                ik_pos = np.clip(
-                    ik_pos + float(cfg.cartesian_kp) * position_error,
-                    workspace[:, 0],
-                    workspace[:, 1],
+        if rotation_lead_norm > max_rotation_lead_rad:
+            target_rotation = (
+                Rotation.from_rotvec(
+                    rotation_lead * (max_rotation_lead_rad / rotation_lead_norm)
                 )
+                * measured_rotation
+            )
+            target_quat = target_rotation.as_quat(scalar_first=True)
 
-        result = planner.solve_teleop_ik(Pose(p=ik_pos, q=ik_quat), current_qpos, previous_command)
+        result = planner.solve_teleop_ik(
+            Pose(p=target_pos, q=target_quat), current_qpos, previous_command
+        )
         if not result.success or result.qpos is None:
             tracking_fault_frames = 0
             now_s = time.monotonic()
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
                 logger.warning("IK rejected target: %s", result.reason or "unknown")
                 last_ik_warning_s = now_s
-            measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
-            target_pos, target_quat = measured_pose.p.copy(), measured_pose.q.copy()
-            ema_pos, ema_quat = target_pos.copy(), target_quat.copy()
+            stopped_qpos = _stop_arm_motion(shared, runtime, reason="IK-rejection")
+            if stopped_qpos is None:
+                _set_fault(shared, "decelerated stop failed after IK rejection")
+                return False
+            require_transition(shared, SafetyState.ARMED)
+            previous_command = stopped_qpos.copy()
+            stopped_pose = planner.kin.compute_eef_pose_world(stopped_qpos)
+            target_pos, target_quat = stopped_pose.p.copy(), stopped_pose.q.copy()
+            motion_active = False
+            blocked_keys = active_keys
             continue
 
         published = publish_joint_targets(
@@ -501,19 +635,39 @@ def _run_control_loop(
             prepare_timeout_s=float(policy.action_prepare_timeout_s),
             dt_s=dt_s,
             safety_gate=safety_gate,
-            wait_applied=True,
-            apply_timeout_s=float(policy.action_apply_timeout_s),
+            previous_arm_qpos_cmd=previous_command,
         )
         if published is None or published.arm_qpos is None:
-            _set_fault(shared, "arm publish failed")
-            return False
+            logger.warning(
+                "Keyboard motion command rejected — decelerating until keys change"
+            )
+            stopped_qpos = _stop_arm_motion(shared, runtime, reason="motion-rejection")
+            if stopped_qpos is None:
+                _set_fault(shared, "decelerated stop failed after motion rejection")
+                return False
+            require_transition(shared, SafetyState.ARMED)
+            previous_command = stopped_qpos.copy()
+            stopped_pose = planner.kin.compute_eef_pose_world(stopped_qpos)
+            target_pos, target_quat = stopped_pose.p.copy(), stopped_pose.q.copy()
+            tracking_fault_frames = 0
+            motion_active = False
+            blocked_keys = active_keys
+            continue
         previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
 
-        tracking_error = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(previous_command, current_qpos))))
+        tracking_error = float(
+            np.max(
+                np.abs(
+                    planner.ik_mgr.compute_qpos_delta(previous_command, current_qpos)
+                )
+            )
+        )
         if tracking_error > float(cfg.tracking_fault_rad):
             tracking_fault_frames += 1
             if tracking_fault_frames >= int(cfg.tracking_fault_frames):
-                _set_fault(shared, f"persistent tracking divergence ({tracking_error:.2f}rad)")
+                _set_fault(
+                    shared, f"persistent tracking divergence ({tracking_error:.2f}rad)"
+                )
                 return False
         else:
             tracking_fault_frames = 0
@@ -522,7 +676,9 @@ def _run_control_loop(
             measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
             print(
                 f"[{time.monotonic() - started_s:.0f}s f={frame}] "
-                f"eef={np.round(measured_pose.p, 3)}m target={np.round(target_pos, 3)}m",
+                f"eef={np.round(measured_pose.p, 3)}m target={np.round(target_pos, 3)}m "
+                f"error={np.round(target_pos - measured_pose.p, 3)}m "
+                f"held={active_keys} dx_world={np.round(dx, 3)}m",
                 flush=True,
             )
     return False
@@ -606,7 +762,9 @@ def run_keyboard_experiment(
     processes: list[Any] = []
     keys = GlobalKeyState(
         suppress_echo=True,
-        estop_callback=lambda: _set_fault(shared, "operator e-stop callback", estop=True),
+        estop_callback=lambda: _set_fault(
+            shared, "operator e-stop callback", estop=True
+        ),
     )
     clean_exit = False
     exit_code = 1
@@ -631,12 +789,10 @@ def run_keyboard_experiment(
         logger.error("Keyboard teleop failed", exc_info=True)
         exit_code = 1
     finally:
-        try:
-            keys.stop()
-        except Exception:
-            _set_fault(shared, "keyboard listener cleanup failed")
-            logger.error("Keyboard listener cleanup failed", exc_info=True)
-            exit_code = 1
+        # Keep the listener and terminal suppression active until all device
+        # processes and shared resources are closed. Restoring it here used to
+        # expose the remaining 1–2 s shutdown window to the shell.
+        keys.quiesce()
         started = [process for process in processes if process.pid is not None]
         if started:
             try:
@@ -647,11 +803,17 @@ def run_keyboard_experiment(
                     disarm_if_clean=clean_exit and exit_code == 0,
                 )
             except RuntimeError:
-                logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
+                logger.critical(
+                    "child process remains alive; leaving SharedStorage linked",
+                    exc_info=True,
+                )
                 exit_code = 1
             else:
                 if exit_code == 0 and not shutdown_report.clean:
-                    logger.error("verified shutdown invalidated the clean control exit: %s", shutdown_report)
+                    logger.error(
+                        "verified shutdown invalidated the clean control exit: %s",
+                        shutdown_report,
+                    )
                     exit_code = 1
         else:
             try:
@@ -662,6 +824,15 @@ def run_keyboard_experiment(
                 _set_fault(shared, "SharedStorage cleanup failed")
                 logger.error("SharedStorage cleanup failed", exc_info=True)
                 exit_code = 1
+        try:
+            if not keys.wait_for_release(timeout_s=2.0):
+                logger.warning(
+                    "Keyboard keys remained held while restoring terminal input"
+                )
+            keys.stop()
+        except Exception:
+            logger.error("Keyboard listener cleanup failed", exc_info=True)
+            exit_code = 1
     return exit_code
 
 
@@ -674,7 +845,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not connect XHand; it must be absent or secured at configured home",
     )
-    parser.add_argument("--config", type=Path, default=None, help="Validated experiment YAML")
+    parser.add_argument(
+        "--config", type=Path, default=None, help="Validated experiment YAML"
+    )
     args = parser.parse_args(argv)
     try:
         runtime = resolve_runtime_config(
@@ -683,7 +856,14 @@ def main(argv: list[str] | None = None) -> int:
                 "policy.hand_enabled": False if args.no_hand else None,
             },
         )
-    except (KeyError, OSError, TypeError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
         parser.error(f"invalid experiment config: {exc}")
     return run_keyboard_experiment(runtime, no_hand=args.no_hand)
 

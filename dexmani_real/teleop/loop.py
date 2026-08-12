@@ -12,63 +12,55 @@ from typing import Any
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.planning import PlanningProfile, Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning import (PlanningProfile, Pose, TeleopProfile,
+                                   XArm7MotionPlanner, XArm7PlannerConfig)
 from dexmani_real.planning.hand_kinematics import HandKinematics
-from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.policy.safety import (
-    SafetyGate,
-    send_command,
-    advance_run_generation,
-)
+from dexmani_real.planning.pose_utils import (normalize_quat_wxyz,
+                                              quat_wxyz_to_rot6d,
+                                              rot6d_to_quat_wxyz)
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
+from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
+                                        send_command)
 from dexmani_real.recording.io_process import RecorderClient
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import SharedStorage, publish_component_status
+from dexmani_real.shm.shared_storage import (SharedStorage,
+                                             publish_component_status)
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
-from dexmani_real.teleop.audio_feedback import AudioFeedback, update_motion_gate
+from dexmani_real.teleop.audio_feedback import (AudioFeedback,
+                                                update_motion_gate)
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_state import ControlHold
-from dexmani_real.teleop.episode_samples import (
-    _FRAME_IK_FAIL,
-    _FRAME_OK,
-    _FRAME_RETARGET_FAIL,
-    _FRAME_SAFETY_REJECT,
-    _record_frame,
-    _record_held,
-    _stop_recording,
-)
-from dexmani_real.teleop.hand_control import (
-    _compute_hand_command,
-    _get_raw_hand_command,
-    _hand_ramp_frame_count,
-    _reset_hand_retargeter,
-    _sanitize_hand_command,
-    _seed_hand_retargeter,
-    _smoothstep_hand_ramp,
-)
-from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter, _tag_config_with_urdf
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler, validate_arm_feedback, validate_hand_feedback
+from dexmani_real.teleop.episode_samples import (_FRAME_IK_FAIL, _FRAME_OK,
+                                                 _FRAME_RETARGET_FAIL,
+                                                 _FRAME_SAFETY_REJECT,
+                                                 _record_frame, _record_held,
+                                                 _stop_recording)
+from dexmani_real.teleop.hand_control import (_compute_hand_command,
+                                              _get_raw_hand_command,
+                                              _hand_ramp_frame_count,
+                                              _reset_hand_retargeter,
+                                              _sanitize_hand_command,
+                                              _seed_hand_retargeter,
+                                              _smoothstep_hand_ramp)
+from dexmani_real.teleop.hand_retarget import (TAGHandRetargeter,
+                                               XHandRetargeter,
+                                               _tag_config_with_urdf)
+from dexmani_real.teleop.keyboard import (ControlSignal, KeyboardHandler,
+                                          validate_arm_feedback,
+                                          validate_hand_feedback)
 from dexmani_real.teleop.recording_session import (
-    QuitRecordingDecision,
-    await_quit_recording_decision,
-)
-from dexmani_real.teleop.safety import (
-    _contact_stall_detected,
-    _do_configured_teleop_home,
-    _feedback_after_send,
-    _reset_mapper_from_frames,
-    _transition_collision_free,
-    _vr_after_send,
-)
-from dexmani_real.teleop.snapshot import (
-    CameraFreshnessTracker,
-    _read_arm_state,
-    _read_camera_frame,
-    _read_hand_state,
-    _read_hand_tactile,
-    _read_vr_frame,
-)
+    QuitRecordingDecision, await_quit_recording_decision)
+from dexmani_real.teleop.safety import (_contact_stall_detected,
+                                        _do_configured_teleop_home,
+                                        _feedback_after_send,
+                                        _reset_mapper_from_frames,
+                                        _transition_collision_free,
+                                        _vr_after_send)
+from dexmani_real.teleop.snapshot import (CameraFreshnessTracker,
+                                          _read_arm_state, _read_camera_frame,
+                                          _read_hand_state, _read_hand_tactile,
+                                          _read_vr_frame)
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import ema_smooth_pose
@@ -106,6 +98,7 @@ def _build_safety_gate(config: TeleopConfig) -> SafetyGate:
         hand_joint_lower_rad=tuple(config.hand_qpos_lower_rad),
         hand_joint_upper_rad=tuple(config.hand_qpos_upper_rad),
         arm_max_velocity_rad_s=float(np.deg2rad(config.joint_max_speed_deg_s)),
+        arm_tracking_tolerance_rad=float(config.arm_tracking_tolerance_rad),
         hand_max_velocity_rad_s=hand_max_vel,
     )
 
@@ -229,6 +222,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             ),
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
             static_boxes=cfg.static_collision_boxes,
+            table=cfg.table_collision,
         )
 
         vr_config_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
@@ -327,7 +321,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         return validate_hand_feedback(
             connected=bool(state["connected"][0]),
             error_state=bool(state["error_state"][0]),
-            qpos_stale=bool(state["qpos_stale"][0]),
             state_valid=bool(state["state_valid"][0]),
             send_healthy=bool(state["send_healthy"][0]),
             read_healthy=bool(state["read_healthy"][0]),
@@ -480,16 +473,16 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
     def _enter_measured_hold(reason: str) -> bool:
-        """Invalidate old endpoints and publish one measured arm/hand hold."""
+        """Invalidate old endpoints and publish one measured arm-only hold."""
         nonlocal _reanchor_pending_reason
-        nonlocal prev_qpos_cmd, prev_hand_qpos, ema_prev_pos, ema_prev_quat
+        nonlocal prev_qpos_cmd, ema_prev_pos, ema_prev_quat
         nonlocal _hand_ramp_start, _hand_ramp_step
 
         if _control_hold.active:
             _control_hold.relabel(reason)
             _reanchor_pending_reason = reason
             if _control_hold.candidate is None:
-                logger.error("teleop_loop: cannot enter %s without a measured hold candidate", reason)
+                logger.error("teleop_loop: cannot enter %s without a measured arm hold candidate", reason)
                 return False
             return True
 
@@ -505,7 +498,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         assert latest_arm is not None
         measured_arm = np.asarray(latest_arm["qpos"][0], dtype=np.float64)
 
-        measured_hand: np.ndarray | None = None
         if hand_available:
             latest_hand = _read_hand_state(shared)
             latest_hand_issue = _hand_feedback_issue(latest_hand)
@@ -517,17 +509,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 )
                 return False
             assert latest_hand is not None
-            measured_hand = np.clip(
-                np.asarray(latest_hand["qpos"][0], dtype=np.float64),
-                hand_qpos_lower_rad,
-                hand_qpos_upper_rad,
-            )
 
         run_generation = advance_run_generation(shared)
         candidate = _safe_joint_publish(
             shared,
             measured_arm,
-            measured_hand,
+            None,
             is_hold=True,
             timeout=cfg.action_prepare_timeout_s,
             safety_gate=gate,
@@ -540,8 +527,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         _hold_sent_at_s = time.monotonic()
         _reanchor_pending_reason = reason
         prev_qpos_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
-        if candidate.hand_qpos is not None:
-            prev_hand_qpos = np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
         arm_mapper.clear()
         ema_prev_pos = ema_prev_quat = None
         _hand_ramp_start = None
@@ -664,7 +649,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                             planner=planner,
                             audio=audio,
                             estop_requested=_keyboard_estop_requested,
-                            safety_gate=gate,
                         )
                         limiter.reset()
                         print("  [Q] quit", flush=True)
@@ -767,7 +751,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                                 estop_requested=_keyboard_estop_requested,
                                 arm_mapper=arm_mapper,
                                 hand_retargeter=hand_retargeter,
-                                safety_gate=gate,
                             )
 
                     # Enter post-teleop state (two-stage Q) instead of immediate exit.
@@ -802,7 +785,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         estop_requested=_keyboard_estop_requested,
                         arm_mapper=arm_mapper,
                         hand_retargeter=hand_retargeter,
-                        safety_gate=gate,
                     )
                     limiter.reset()
                     skip_rest = True
@@ -1320,8 +1302,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     hand_qpos_upper_rad,
                     cfg.hand_max_delta_rad,
                 )
-            except ValueError:
-                _validate_warn("teleop_loop: invalid hand command — holding")
+            except ValueError as exc:
+                _validate_warn("teleop_loop: invalid hand command — holding: %s", exc)
                 hand_cmd = prev_hand_qpos.copy()
                 hand_cmd_valid = False
                 retarget_ok = False
@@ -1332,7 +1314,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     planner, arm_qpos, prev_qpos_cmd, hand_start_qpos, hand_cmd
                 )
                 if hand_available:
-                    safe_hand_cmd = hand_cmd if hand_safe else prev_hand_qpos
+                    safe_hand_cmd = hand_cmd if hand_safe else None
                     if not hand_safe:
                         _validate_warn("teleop_loop: hand-only transition rejected — holding")
                     published_candidate = _safe_joint_publish(
@@ -1343,6 +1325,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         timeout=cfg.action_prepare_timeout_s,
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                        previous_arm_qpos_cmd=prev_qpos_cmd,
+                        previous_hand_qpos_cmd=prev_hand_qpos,
                         safety_gate=gate,
                     )
                     if published_candidate is None:
@@ -1351,8 +1335,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     if published_candidate.arm_qpos is not None:
                         prev_qpos_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
                     if published_candidate.hand_qpos is not None:
-                        safe_hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
-                    prev_hand_qpos = safe_hand_cmd.copy()
+                        prev_hand_qpos = np.asarray(published_candidate.hand_qpos, dtype=np.float64).copy()
                 else:
                     published_candidate = _safe_arm_queue_put(
                         shared,
@@ -1407,7 +1390,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 _reject_reason = "arm_cmd NaN/Inf"
             elif not hand_cmd_valid:
                 _reject = True
-                _reject_reason = "hand_cmd NaN/Inf"
+                _reject_reason = "hand command validation failed"
             elif not _arm_ok:
                 _reject = True
                 _reject_reason = "arm disconnected"
@@ -1423,7 +1406,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 published_hold = _safe_joint_publish(
                     shared,
                     prev_qpos_cmd.copy(),
-                    prev_hand_qpos.copy() if hand_available else None,
+                    None,
                     is_hold=True,
                     timeout=cfg.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
@@ -1486,6 +1469,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 timeout=cfg.action_prepare_timeout_s,
                 observation_id=int(vr_frame["ring_sequence"]),
                 observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                previous_arm_qpos_cmd=prev_qpos_cmd,
+                previous_hand_qpos_cmd=prev_hand_qpos,
                 safety_gate=gate,
             )
             if published_candidate is None:
@@ -1590,6 +1575,8 @@ def _safe_arm_queue_put(
             None,
             is_hold=bool(action.get("is_hold", False)),
             timeout=timeout,
+            observation_id=observation_id,
+            observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
             safety_gate=safety_gate,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -1605,6 +1592,9 @@ def _safe_joint_publish(
     is_hold: bool = False,
     timeout: float,
     observation_id: int | None = None,
+    observation_anchor_monotonic_ns: int | None = None,
+    previous_arm_qpos_cmd: np.ndarray | None = None,
+    previous_hand_qpos_cmd: np.ndarray | None = None,
     safety_gate: SafetyGate | None = None,
 ) -> ActionCandidate | None:
     """Validate through SafetyGate and publish via fire-and-forget send_command."""
@@ -1617,6 +1607,11 @@ def _safe_joint_publish(
         action_id = int(shared.arm_command_seq.value) + 1
         shared.arm_command_seq.value = action_id
     now_ns = time.monotonic_ns()
+    if observation_anchor_monotonic_ns is not None:
+        anchor_ns = int(observation_anchor_monotonic_ns)
+        if anchor_ns <= 0 or anchor_ns > now_ns:
+            logger.warning("joint target rejected: invalid observation anchor")
+            return None
 
     candidate = ActionCandidate(
         observation_id=action_id if observation_id is None else int(observation_id),
@@ -1639,7 +1634,8 @@ def _safe_joint_publish(
     if not bool(arm_record["connected"]) or not bool(arm_record["state_valid"]):
         logger.warning("joint target rejected: arm feedback unhealthy")
         return None
-    current_arm = np.asarray(arm_record["qpos"][0], dtype=np.float64)
+    # ``arm_record`` is a scalar structured record, so qpos is already (7,).
+    current_arm = np.asarray(arm_record["qpos"], dtype=np.float64)
     if current_arm.shape != (7,) or not np.all(np.isfinite(current_arm)):
         return None
 
@@ -1648,7 +1644,7 @@ def _safe_joint_publish(
     if hand_result is not None:
         hand_record = hand_result[0][0]
         if bool(hand_record["connected"]) and bool(hand_record["state_valid"]):
-            current_hand = np.asarray(hand_record["qpos"][0], dtype=np.float64)
+            current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
     elif hand_qpos is not None:
         logger.warning("joint target rejected: hand feedback unavailable")
         return None
@@ -1660,6 +1656,8 @@ def _safe_joint_publish(
         current_hand_qpos=current_hand,
         dt_s=ctrl_dt,
         run_generation=int(shared.run_generation.value),
+        previous_arm_qpos_cmd=previous_arm_qpos_cmd,
+        previous_hand_qpos_cmd=previous_hand_qpos_cmd,
     )
     if not gate_result.accepted or gate_result.candidate is None:
         logger.warning("joint target rejected by SafetyGate: %s", gate_result.reason)

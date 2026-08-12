@@ -546,6 +546,7 @@ def _build_planner_and_gate(
             max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
         ),
         static_boxes=tuple(runtime.environment.static_boxes),
+        table=runtime.environment.table,
     )
     planner.workspace_bounds = workspace.copy()
     planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
@@ -556,13 +557,14 @@ def _build_planner_and_gate(
             hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
             hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
             arm_max_velocity_rad_s=float(np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)),
+            arm_tracking_tolerance_rad=float(runtime.arm.tracking_error_warn_rad),
             hand_max_velocity_rad_s=float(np.deg2rad(runtime.hand.safety_gate_max_velocity_deg_per_s)),
             require_geometry_checks=True,
         ),
         planner=planner,
         table_z_surface_m=float(runtime.arm.table_z_surface_m),
         hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
-        enable_table_check=False,
+        enable_table_check=True,
     )
     return planner, gate, workspace
 

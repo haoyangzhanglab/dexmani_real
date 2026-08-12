@@ -49,17 +49,16 @@ import yaml
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.config.runtime import (ResolvedRuntimeConfig,
+                                         resolve_runtime_config)
+from dexmani_real.planning import (Pose, TeleopProfile, XArm7MotionPlanner,
+                                   XArm7PlannerConfig)
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.safety import (
-    SafetyGateConfig,
-    SafetyGate,
-    advance_run_generation,
-    hand_home_converge,
-    planner_action_safety_gate,
-    publish_joint_targets,
-)
+from dexmani_real.policy.safety import (ActionSafetyGateConfig, SafetyGate,
+                                        advance_run_generation,
+                                        planner_action_safety_gate,
+                                        publish_hand_home_and_wait_applied,
+                                        publish_joint_targets)
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
@@ -67,11 +66,18 @@ from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition
 from dexmani_real.runtime.processes import ShutdownReport
-from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
-from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig, read_arm_state_dict, read_hand_state_dict
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler, validate_arm_feedback, validate_hand_feedback
+from dexmani_real.runtime.supervisor import (shutdown_processes,
+                                             wait_subsystem_ready)
+from dexmani_real.shm.shared_storage import (SharedStorage,
+                                             SharedStorageConfig,
+                                             read_arm_state_dict,
+                                             read_hand_state_dict)
+from dexmani_real.teleop.keyboard import (ControlSignal, KeyboardHandler,
+                                          validate_arm_feedback,
+                                          validate_hand_feedback)
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import ARM_EE_SHAPE, ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import (ARM_EE_SHAPE, ARM_JOINT_SHAPE,
+                                       HAND_JOINT_SHAPE)
 
 logger = get_logger(__name__)
 
@@ -864,6 +870,7 @@ def verify_live_replay_preflight(
         ),
         hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
+        table=runtime.environment.table,
     )
     arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
     for index in range(max(1, trajectory.num_frames - 1)):
@@ -884,10 +891,11 @@ def verify_live_replay_preflight(
             arm_qpos = arm_start + alpha * (arm_end - arm_start)
             hand_qpos = hand_start + alpha * (hand_end - hand_start)
             planner.collision_model.set_hand_qpos(hand_qpos)
-            lowest_surface_m = planner.collision_model.minimum_hand_frame_z(arm_qpos) - float(
-                runtime.arm.hand_safety_margin_m
-            )
-            if not np.isfinite(lowest_surface_m) or lowest_surface_m < float(runtime.arm.table_z_surface_m):
+            table_distance_m = planner.collision_model.minimum_table_distance(arm_qpos)
+            if (
+                not np.isfinite(table_distance_m)
+                or table_distance_m < planner.collision_model.table_soft_clearance_m
+            ):
                 raise ValueError(f"live replay table rejection at transition {start}->{end}")
 
 
@@ -962,7 +970,6 @@ def hand_feedback_is_healthy(
         issue = validate_hand_feedback(
             connected=bool(state.get("connected", False)),
             error_state=bool(state.get("error_state", True)),
-            qpos_stale=bool(state.get("qpos_stale", True)),
             state_valid=bool(state.get("state_valid", False)),
             send_healthy=bool(state.get("send_healthy", False)),
             read_healthy=bool(state.get("read_healthy", False)),
@@ -1046,14 +1053,16 @@ class TrajectoryReplayer:
             ),
             hand_dof=True,
             static_boxes=tuple(self.runtime.environment.static_boxes),
+            table=self.runtime.environment.table,
         )
         self._action_safety_gate = planner_action_safety_gate(
-            SafetyGateConfig(
+            ActionSafetyGateConfig(
                 arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
                 arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
                 hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
                 hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
                 arm_max_velocity_rad_s=float(np.deg2rad(runtime_arm.max_joint_velocity_deg_per_s)),
+                arm_tracking_tolerance_rad=float(runtime_arm.tracking_error_warn_rad),
                 hand_max_velocity_rad_s=(
                     float(runtime_hand.max_delta_rad) * runtime_policy.control_hz
                     if runtime_hand.max_delta_rad is not None
@@ -1178,7 +1187,7 @@ class TrajectoryReplayer:
         try:
             run_generation = advance_run_generation(self.shared)
             run_changed_ns = time.monotonic_ns()
-            arm_qpos, hand_qpos = self._read_terminal_hold_targets(
+            arm_qpos, _hand_qpos = self._read_terminal_hold_targets(
                 newer_than_ns=run_changed_ns,
                 timeout_s=apply_timeout_s,
             )
@@ -1188,7 +1197,7 @@ class TrajectoryReplayer:
         candidate = publish_joint_targets(
             self.shared,
             arm_qpos,
-            hand_qpos,
+            None,
             is_hold=True,
             prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
             dt_s=1.0 / self.replay_hz,
@@ -1197,8 +1206,8 @@ class TrajectoryReplayer:
             apply_timeout_s=apply_timeout_s,
         )
         if candidate is None:
-            return f"measured hold was rejected or not applied after advancing to run {run_generation}"
-        logger.info("replay terminal hold applied (run=%d action_id=%d)", run_generation, candidate.action_id)
+            return f"measured arm-only hold was rejected or not applied after advancing to run {run_generation}"
+        logger.info("replay terminal arm-only hold applied (run=%d action_id=%d)", run_generation, candidate.action_id)
         return None
 
     def _poll_control(self, keyboard: KeyboardHandler, timeout_s: float) -> bool:
@@ -1327,6 +1336,7 @@ class TrajectoryReplayer:
         next_deadline_s = time.perf_counter()
         start_time = next_deadline_s
         frame_idx = 0
+        previous_hand_cmd = None if initial_hand_qpos is None else initial_hand_qpos.copy()
 
         try:
             require_transition(self.shared, SafetyState.RUNNING)
@@ -1383,6 +1393,7 @@ class TrajectoryReplayer:
                     prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
                     dt_s=period_s,
                     safety_gate=self._action_safety_gate,
+                    previous_hand_qpos_cmd=previous_hand_cmd,
                     wait_applied=is_final_frame,
                     apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
                 )
@@ -1394,6 +1405,7 @@ class TrajectoryReplayer:
                 sent_arm_cmd = np.asarray(published.arm_qpos, dtype=np.float64)
                 if published.hand_qpos is not None:
                     hand_cmd = np.asarray(published.hand_qpos, dtype=np.float64)
+                    previous_hand_cmd = hand_cmd.copy()
 
                 self._recorder.record(
                     frame_idx,
@@ -1671,20 +1683,25 @@ def _offer_return_home(
 
             if hand_available:
                 hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-                hand_reached, _final_hand_qpos = hand_home_converge(
+                hand_accepted = publish_hand_home_and_wait_applied(
                     shared,
                     hand_home,
-                    timeout_s=float(runtime.hand.home_settle_timeout_s),
-                    tol_rad=float(runtime.hand.home_settle_tol_rad),
+                    command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
+                    command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
+                    mechanical_lower_rad=np.asarray(runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
+                    mechanical_upper_rad=np.asarray(runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
+                    max_command_delta_rad=runtime.hand.max_delta_rad,
+                    timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                     heartbeat=False,
                     check_is_running=False,
                     verbose=True,
-                    safety_gate=replayer.action_safety_gate,
                     abort_requested=lambda: keyboard.estop_latched or not keyboard.healthy,
                 )
-                if not hand_reached:
-                    logger.warning("arm home cancelled because hand home was not confirmed")
+                if not hand_accepted:
+                    logger.warning("arm home cancelled because hand-home command was not accepted")
                     continue
+                assert replayer.planner is not None
+                replayer.planner.set_hand_qpos(hand_home)
 
             arm_reached = send_arm_home(
                 shared,

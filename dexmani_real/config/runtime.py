@@ -127,7 +127,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     from dexmani_real.config import defaults
 
     def rebuild(template: Any, raw: Any, path: str, annotation: Any | None = None) -> Any:
-        if raw is None and path == "hand.max_delta_rad":
+        if raw is None and path in {"hand.max_delta_rad", "environment.table.plane_path"}:
             return None
         if dataclasses.is_dataclass(template):
             if not isinstance(raw, Mapping):
@@ -212,6 +212,12 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     workspace = rebuilt["policy"].workspace
     if workspace.x_min > workspace.x_max or workspace.y_min > workspace.y_max or workspace.z_min > workspace.z_max:
         raise ValueError("policy.workspace lower bounds must not exceed upper bounds")
+    workspace_widths = np.array(
+        [workspace.x_max - workspace.x_min, workspace.y_max - workspace.y_min, workspace.z_max - workspace.z_min],
+        dtype=np.float64,
+    )
+    if 2.0 * rebuilt["keyboard_teleop"].workspace_command_margin_m >= float(np.min(workspace_widths)):
+        raise ValueError("keyboard workspace command margin leaves no interior workspace")
     return rebuilt
 
 
@@ -251,6 +257,17 @@ def resolve_runtime_config(
 
     merged = _merge(base, file_overrides)
     merged = _merge(merged, _expand_dotted(cli_overrides))
+    table_config = merged["environment"]["table"]
+    if bool(table_config["enabled"]) and table_config["plane_path"] is not None:
+        plane_path = Path(str(table_config["plane_path"]))
+        if not plane_path.is_absolute():
+            plane_path = Path(__file__).resolve().parents[2] / plane_path
+        try:
+            with plane_path.open("r", encoding="utf-8") as stream:
+                plane_data = json.load(stream)
+            table_config["plane_abcd"] = [float(plane_data[name]) for name in ("a", "b", "c", "d")]
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"failed to load calibrated table plane from {plane_path}: {exc}") from exc
     sections = _validated_defaults_snapshot(merged)
     validated = {name: _plain_value(value) for name, value in sections.items()}
     canonical_json = json.dumps(

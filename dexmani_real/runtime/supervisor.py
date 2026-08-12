@@ -207,7 +207,6 @@ def print_health_summary(shared: SharedStorage) -> None:
         hand_data, _, _ = hand_result
         hand_connected = bool(hand_data["connected"][0])
         hand_error = bool(hand_data["error_state"][0])
-        hand_qpos_stale = bool(hand_data["qpos_stale"][0])
         hand_state_valid = bool(hand_data["state_valid"][0])
         hand_io_healthy = bool(hand_data["send_healthy"][0]) and bool(hand_data["read_healthy"][0])
         hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
@@ -215,7 +214,6 @@ def print_health_summary(shared: SharedStorage) -> None:
         hand_ok = (
             hand_connected
             and not hand_error
-            and not hand_qpos_stale
             and hand_state_valid
             and hand_io_healthy
             and bool(hand_qpos_ok)
@@ -223,7 +221,7 @@ def print_health_summary(shared: SharedStorage) -> None:
         print(
             f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
             f"valid={int(hand_state_valid)}  io={int(hand_io_healthy)}  error={int(hand_error)}  "
-            f"stale={int(hand_qpos_stale)}  qpos_ok={hand_qpos_ok}"
+            f"qpos_ok={hand_qpos_ok}"
         )
     else:
         print("  hand  ----  (no data yet)")

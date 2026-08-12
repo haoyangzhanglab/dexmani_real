@@ -6,25 +6,38 @@ Primary entry point: ``arm_loop(shared)`` — mp.Process target using SharedStor
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
+from queue import Empty
 from typing import Any, Callable
 
 import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import arm, safety
-from dexmani_real.utils.schema import ARM_COMMAND_DTYPE, ARM_JOINT_SHAPE, ARM_STATE_DTYPE
 from dexmani_real.planning.kinematics import ArmFK
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import worker_validate_arm
 from dexmani_real.robot.homing import HOME_SENTINEL, HomeRequest, HomeResult
 from dexmani_real.robot.safety import SafetyState
+from dexmani_real.robot.types import ArmControlKind
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
 from dexmani_real.shm.shared_storage import new_frame, publish_component_status
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import (
+    ThrottledWarner,
+    capture_native_stdout,
+    extract_native_diagnostics,
+    get_logger,
+)
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
+from dexmani_real.utils.schema import (
+    ARM_COMMAND_DTYPE,
+    ARM_CONTROL_DTYPE,
+    ARM_JOINT_SHAPE,
+    ARM_STATE_DTYPE,
+)
 
 logger = get_logger(__name__)
 
@@ -33,43 +46,85 @@ logger = get_logger(__name__)
 class ArmLoopConfig:
     """Mode 6 joint online trajectory planning configuration."""
 
-    joint_max_speed_rad_per_s: float = field(default_factory=lambda: arm.max_joint_velocity_rad_per_s)
-    joint_max_acc_rad_per_s2: float = field(default_factory=lambda: arm.max_joint_acceleration_rad_per_s2)
+    joint_max_speed_rad_per_s: float = field(
+        default_factory=lambda: arm.max_joint_velocity_rad_per_s
+    )
+    joint_max_acc_rad_per_s2: float = field(
+        default_factory=lambda: arm.max_joint_acceleration_rad_per_s2
+    )
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
 
-    joint_limit_lower: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_lower)
-    joint_limit_upper: tuple[float, ...] = field(default_factory=lambda: arm.joint_limit_upper)
+    joint_limit_lower: tuple[float, ...] = field(
+        default_factory=lambda: arm.joint_limit_lower
+    )
+    joint_limit_upper: tuple[float, ...] = field(
+        default_factory=lambda: arm.joint_limit_upper
+    )
 
-    tracking_error_warn_rad: float = field(default_factory=lambda: arm.tracking_error_warn_rad)
+    tracking_error_warn_rad: float = field(
+        default_factory=lambda: arm.tracking_error_warn_rad
+    )
 
     arm_ip: str = field(default_factory=lambda: arm.ip)
 
     home_qpos: tuple[float, ...] = field(default_factory=lambda: arm.home_qpos)
 
-    collision_sensitivity: int = field(default_factory=lambda: arm.collision_sensitivity)
-    recoverable_errors: frozenset[int] = field(default_factory=lambda: arm.recoverable_errors)
-    collision_fault_errors: frozenset[int] = field(default_factory=lambda: arm.collision_fault_errors)
-    max_consecutive_recoveries: int = field(default_factory=lambda: safety.max_consecutive_recoveries)
+    collision_sensitivity: int = field(
+        default_factory=lambda: arm.collision_sensitivity
+    )
+    recoverable_errors: frozenset[int] = field(
+        default_factory=lambda: arm.recoverable_errors
+    )
+    collision_fault_errors: frozenset[int] = field(
+        default_factory=lambda: arm.collision_fault_errors
+    )
+    max_consecutive_recoveries: int = field(
+        default_factory=lambda: safety.max_consecutive_recoveries
+    )
 
-    homing_convergence_rad: float = field(default_factory=lambda: arm.homing.convergence_rad)
-    homing_step_interval_s: float = field(default_factory=lambda: arm.homing.step_interval_s)
-    homing_max_speed_rad_per_s: float = field(default_factory=lambda: np.deg2rad(arm.homing.max_speed_deg_s))
-    homing_target_timeout_s: float = field(default_factory=lambda: arm.homing.target_timeout_s)
-    homing_velocity_convergence_rad_s: float = field(default_factory=lambda: arm.homing.velocity_convergence_rad_s)
+    homing_convergence_rad: float = field(
+        default_factory=lambda: arm.homing.convergence_rad
+    )
+    homing_step_interval_s: float = field(
+        default_factory=lambda: arm.homing.step_interval_s
+    )
+    homing_max_speed_rad_per_s: float = field(
+        default_factory=lambda: np.deg2rad(arm.homing.max_speed_deg_s)
+    )
+    homing_target_timeout_s: float = field(
+        default_factory=lambda: arm.homing.target_timeout_s
+    )
+    homing_velocity_convergence_rad_s: float = field(
+        default_factory=lambda: arm.homing.velocity_convergence_rad_s
+    )
     homing_dwell_s: float = field(default_factory=lambda: arm.homing.dwell_s)
 
     def __post_init__(self) -> None:
         lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
         upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
         home = np.asarray(self.home_qpos, dtype=np.float64)
-        if lower.shape != ARM_JOINT_SHAPE or upper.shape != ARM_JOINT_SHAPE or home.shape != ARM_JOINT_SHAPE:
-            raise ValueError(f"arm loop joint limits/home must have shape {ARM_JOINT_SHAPE}")
-        if not np.all(np.isfinite(np.concatenate((lower, upper, home)))) or np.any(lower > upper):
+        if (
+            lower.shape != ARM_JOINT_SHAPE
+            or upper.shape != ARM_JOINT_SHAPE
+            or home.shape != ARM_JOINT_SHAPE
+        ):
+            raise ValueError(
+                f"arm loop joint limits/home must have shape {ARM_JOINT_SHAPE}"
+            )
+        if not np.all(np.isfinite(np.concatenate((lower, upper, home)))) or np.any(
+            lower > upper
+        ):
             raise ValueError("arm loop joint limits/home must be finite and ordered")
         if self.recoverable_errors & self.collision_fault_errors:
-            raise ValueError("recoverable and collision-fault error codes must be disjoint")
-        if self.recoverable_errors != frozenset({24}) or not frozenset({22, 31}).issubset(self.collision_fault_errors):
-            raise ValueError("arm loop requires only C24 recoverable and C22/C31 collision-fatal")
+            raise ValueError(
+                "recoverable and collision-fault error codes must be disjoint"
+            )
+        if self.recoverable_errors != frozenset({24}) or not frozenset(
+            {22, 31}
+        ).issubset(self.collision_fault_errors):
+            raise ValueError(
+                "arm loop requires only C24 recoverable and C22/C31 collision-fatal"
+            )
         if self.max_consecutive_recoveries <= 0:
             raise ValueError("max_consecutive_recoveries must be positive")
         timing = (
@@ -85,7 +140,9 @@ class ArmLoopConfig:
             self.homing_dwell_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in timing):
-            raise ValueError("arm loop motion/homing parameters must be finite and positive")
+            raise ValueError(
+                "arm loop motion/homing parameters must be finite and positive"
+            )
         if not self.arm_ip or not (0 <= self.collision_sensitivity <= 5):
             raise ValueError("arm loop IP/collision sensitivity is invalid")
 
@@ -93,8 +150,12 @@ class ArmLoopConfig:
     def from_runtime(cls, runtime: Any) -> "ArmLoopConfig":
         cfg = runtime.arm
         return cls(
-            joint_max_speed_rad_per_s=float(np.deg2rad(cfg.max_joint_velocity_deg_per_s)),
-            joint_max_acc_rad_per_s2=float(np.deg2rad(cfg.max_joint_acceleration_deg_per_s2)),
+            joint_max_speed_rad_per_s=float(
+                np.deg2rad(cfg.max_joint_velocity_deg_per_s)
+            ),
+            joint_max_acc_rad_per_s2=float(
+                np.deg2rad(cfg.max_joint_acceleration_deg_per_s2)
+            ),
             arm_loop_hz=float(cfg.loop_hz),
             joint_limit_lower=tuple(cfg.joint_limit_lower),
             joint_limit_upper=tuple(cfg.joint_limit_upper),
@@ -103,13 +164,17 @@ class ArmLoopConfig:
             home_qpos=tuple(cfg.home_qpos),
             collision_sensitivity=int(cfg.collision_sensitivity),
             recoverable_errors=frozenset(int(code) for code in cfg.recoverable_errors),
-            collision_fault_errors=frozenset(int(code) for code in cfg.collision_fault_errors),
+            collision_fault_errors=frozenset(
+                int(code) for code in cfg.collision_fault_errors
+            ),
             max_consecutive_recoveries=int(runtime.safety.max_consecutive_recoveries),
             homing_convergence_rad=float(cfg.homing.convergence_rad),
             homing_step_interval_s=float(cfg.homing.step_interval_s),
             homing_max_speed_rad_per_s=float(np.deg2rad(cfg.homing.max_speed_deg_s)),
             homing_target_timeout_s=float(cfg.homing.target_timeout_s),
-            homing_velocity_convergence_rad_s=float(cfg.homing.velocity_convergence_rad_s),
+            homing_velocity_convergence_rad_s=float(
+                cfg.homing.velocity_convergence_rad_s
+            ),
             homing_dwell_s=float(cfg.homing.dwell_s),
         )
 
@@ -121,7 +186,9 @@ def _require_sdk_ok(operation: str, code: Any) -> None:
         raise RuntimeError(f"{operation} failed with SDK code {code!r}")
 
 
-def _recover_c24_measured_hold(arm_api: Any, cfg: ArmLoopConfig, *, operation_prefix: str = "C24") -> np.ndarray:
+def _recover_c24_measured_hold(
+    arm_api: Any, cfg: ArmLoopConfig, *, operation_prefix: str = "C24"
+) -> np.ndarray:
     """Clear one C24, read fresh joints, and send exactly one measured hold."""
     _require_sdk_ok(f"{operation_prefix} clean_error", arm_api.clean_error())
     _require_sdk_ok(f"{operation_prefix} clean_warn", arm_api.clean_warn())
@@ -145,9 +212,15 @@ def _recover_c24_measured_hold(arm_api: Any, cfg: ArmLoopConfig, *, operation_pr
     return measured_hold.copy()
 
 
-def _parse_arm_action_metadata(action: Any, received_s: float) -> tuple[int, float, bool]:
+def _parse_arm_action_metadata(
+    action: Any, received_s: float
+) -> tuple[int, float, bool]:
     """Return ``(sequence, created_s, is_hold)`` for a fixed command frame."""
-    if isinstance(action, np.ndarray) and action.shape == (1,) and action.dtype == ARM_COMMAND_DTYPE:
+    if (
+        isinstance(action, np.ndarray)
+        and action.shape == (1,)
+        and action.dtype == ARM_COMMAND_DTYPE
+    ):
         command_seq = int(action["action_id"][0])
         created_s = int(action["created_monotonic_ns"][0]) / 1e9
         if not np.isfinite(created_s) or created_s <= 0.0 or created_s > received_s:
@@ -156,7 +229,150 @@ def _parse_arm_action_metadata(action: Any, received_s: float) -> tuple[int, flo
     return 0, received_s, False
 
 
-def _decode_joint_state_feedback(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _arm_control_request_is_current(
+    request: Any,
+    *,
+    expected_run_generation: int,
+    now_monotonic_ns: int,
+) -> bool:
+    """Validate a fixed-dtype STOP/RESUME request at the worker boundary."""
+    if (
+        not isinstance(request, np.ndarray)
+        or request.shape != (1,)
+        or request.dtype != ARM_CONTROL_DTYPE
+    ):
+        return False
+    kind = int(request["kind"][0])
+    if kind not in (int(ArmControlKind.DECELERATED_STOP), int(ArmControlKind.RESUME)):
+        return False
+    integer_fields = tuple(
+        int(request[name][0])
+        for name in (
+            "action_id",
+            "run_generation",
+            "created_monotonic_ns",
+            "valid_until_monotonic_ns",
+        )
+    )
+    if not all(value > 0 for value in integer_fields):
+        return False
+    _action_id, run_generation, created_ns, valid_until_ns = integer_fields
+    return bool(
+        run_generation == int(expected_run_generation)
+        and created_ns <= int(now_monotonic_ns)
+        and valid_until_ns > int(now_monotonic_ns)
+        and valid_until_ns > created_ns
+    )
+
+
+def _enter_mode6_ready(arm_api: Any, *, operation_prefix: str) -> None:
+    """Enter Mode 6/State 0 and verify the controller reports ready State 2."""
+    _require_sdk_ok(f"{operation_prefix} set_mode(6)", arm_api.set_mode(6))
+    _require_sdk_ok(f"{operation_prefix} set_state(0)", arm_api.set_state(0))
+    _wait_live_status(arm_api, expected_state=2, expected_mode=6)
+
+
+def _resume_mode6_with_measured_hold(
+    arm_api: Any,
+    cfg: ArmLoopConfig,
+    *,
+    operation_prefix: str = "resume",
+) -> np.ndarray:
+    """Resume Mode 6 behind a fresh, zero-lead worker-measured endpoint."""
+    state_code, states = arm_api.get_joint_states(is_radian=True, num=1)
+    measured_qpos, _qvel, _tau = _decode_joint_state_feedback(state_code, states)
+    _require_sdk_ok(f"{operation_prefix} set_mode(6)", arm_api.set_mode(6))
+    _require_sdk_ok(f"{operation_prefix} set_state(0)", arm_api.set_state(0))
+    # Publish the fresh anchor immediately after State 0 is accepted. Waiting
+    # for State 2 first would leave a window in which firmware could continue
+    # toward the endpoint superseded by the preceding State-6 stop.
+    _require_sdk_ok(
+        f"{operation_prefix} measured hold",
+        arm_api.set_servo_angle(
+            angle=measured_qpos,
+            is_radian=True,
+            speed=cfg.joint_max_speed_rad_per_s,
+            mvacc=cfg.joint_max_acc_rad_per_s2,
+            wait=False,
+        ),
+    )
+    _wait_live_status(arm_api, expected_state=2, expected_mode=6, timeout_s=0.5)
+    return measured_qpos.copy()
+
+
+def _apply_decelerated_stop(
+    arm_api: Any, *, operation_prefix: str = "decelerated stop"
+) -> int:
+    """Request State 6 braking and return the controller's reported stop state.
+
+    ``set_state(6)`` is a command, not a stable feedback postcondition.  xArm
+    firmware 2.7.1 reports State 5 once that request is accepted; other SDK /
+    firmware combinations may briefly retain State 6.  Both prevent normal
+    command execution until State 0; the caller separately verifies measured
+    velocity has settled before it re-anchors keyboard motion.
+    """
+    _require_sdk_ok(f"{operation_prefix} set_state(6)", arm_api.set_state(6))
+    return _wait_live_status(
+        arm_api,
+        expected_state=(5, 6),
+        expected_mode=6,
+        timeout_s=0.25,
+    )
+
+
+def _take_next_current_arm_action(
+    action_q: Any, *, expected_run_generation: int
+) -> Any | None:
+    """Return one actionable queue item while draining invalidated endpoints."""
+    while True:
+        try:
+            queued_action = action_q.get(timeout=0.0)
+        except Empty:
+            return None
+        now_ns = time.monotonic_ns()
+        if isinstance(queued_action, np.ndarray):
+            if worker_validate_arm(
+                queued_action,
+                expected_run_generation=expected_run_generation,
+                now_monotonic_ns=now_ns,
+            ):
+                return queued_action
+            logger.info(
+                "arm_loop: discarded malformed, stale-generation, or expired command"
+            )
+            continue
+        return queued_action
+
+
+def _take_latest_arm_control_request(
+    control_ring: Any,
+    *,
+    last_sequence: int,
+    expected_run_generation: int,
+) -> tuple[np.ndarray | None, int]:
+    """Consume at most one new priority control request from a latest-wins ring."""
+    result = control_ring.read_latest()
+    if result is None:
+        return None, int(last_sequence)
+    request, _publish_ns, sequence = result
+    sequence = int(sequence)
+    if sequence <= int(last_sequence):
+        return None, int(last_sequence)
+    if _arm_control_request_is_current(
+        request,
+        expected_run_generation=expected_run_generation,
+        now_monotonic_ns=time.monotonic_ns(),
+    ):
+        return request.copy(), sequence
+    logger.info(
+        "arm_loop: discarded malformed, stale-generation, or expired arm control request"
+    )
+    return None, sequence
+
+
+def _decode_joint_state_feedback(
+    code: Any, states: Any
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Validate one xArm feedback response at the worker boundary."""
     _require_sdk_ok("get_joint_states", code)
     if not isinstance(states, (list, tuple)) or not states:
@@ -174,7 +390,9 @@ def _decode_joint_state_feedback(code: Any, states: Any) -> tuple[np.ndarray, np
     )
     for name, value in (("qpos", qpos), ("qvel", qvel), ("tau", tau)):
         if value.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(value)):
-            raise RuntimeError(f"get_joint_states returned invalid {name}: shape={value.shape}")
+            raise RuntimeError(
+                f"get_joint_states returned invalid {name}: shape={value.shape}"
+            )
     return qpos, qvel, tau
 
 
@@ -203,20 +421,36 @@ def _read_live_status(arm_api: Any) -> tuple[int, int, int]:
 def _wait_live_status(
     arm_api: Any,
     *,
-    expected_state: int,
+    expected_state: int | tuple[int, ...],
     expected_mode: int | None = None,
     timeout_s: float = 1.0,
-) -> None:
+) -> int:
+    expected_states = (
+        (expected_state,) if isinstance(expected_state, int) else tuple(expected_state)
+    )
+    if not expected_states or any(
+        not isinstance(value, int) for value in expected_states
+    ):
+        raise ValueError(
+            "expected_state must contain one or more integer controller states"
+        )
     deadline = time.monotonic() + timeout_s
     last: tuple[int, int, int] | None = None
     while time.monotonic() < deadline:
         last = _read_live_status(arm_api)
         state, mode, error = last
-        if state == expected_state and error == 0 and (expected_mode is None or mode == expected_mode):
-            return
+        if (
+            state in expected_states
+            and error == 0
+            and (expected_mode is None or mode == expected_mode)
+        ):
+            return state
         time.sleep(0.03)
+    expected_label = (
+        expected_states[0] if len(expected_states) == 1 else expected_states
+    )
     raise RuntimeError(
-        f"controller postcondition failed: expected state={expected_state} mode={expected_mode} error=0, got {last}"
+        f"controller postcondition failed: expected state={expected_label} mode={expected_mode} error=0, got {last}"
     )
 
 
@@ -229,7 +463,11 @@ def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
                 details = info
         except Exception:
             logger.warning("arm_loop: failed to read C31 diagnostics", exc_info=True)
-    if error_code == 31 and isinstance(details, (list, tuple, np.ndarray)) and len(details) >= 3:
+    if (
+        error_code == 31
+        and isinstance(details, (list, tuple, np.ndarray))
+        and len(details) >= 3
+    ):
         try:
             servo_id = int(details[0])
             theoretical_tau = float(details[1])
@@ -246,7 +484,9 @@ def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
                 actual_tau - theoretical_tau,
             )
     else:
-        logger.error("arm_loop: collision fault C%d detected; details=%s", error_code, details)
+        logger.error(
+            "arm_loop: collision fault C%d detected; details=%s", error_code, details
+        )
     shared.error_state.value = True
 
 
@@ -255,14 +495,16 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     mp.Process target communicating exclusively through SharedStorage.
     """
-    from queue import Empty
-
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
     _state_read_warn = ThrottledWarner(interval_s=5.0)
     cfg = config or ArmLoopConfig()
-    _recovery_counter = RetryCounter(max_consecutive=cfg.max_consecutive_recoveries, label="arm_servo")
-    _state_error_counter = RetryCounter(max_consecutive=cfg.max_consecutive_recoveries, label="arm_state")
+    _recovery_counter = RetryCounter(
+        max_consecutive=cfg.max_consecutive_recoveries, label="arm_servo"
+    )
+    _state_error_counter = RetryCounter(
+        max_consecutive=cfg.max_consecutive_recoveries, label="arm_state"
+    )
     _tracking_err_count = 0
     publish_component_status(shared, "arm", ComponentPhase.LOADING)
 
@@ -281,12 +523,31 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
     _arm_fk = ArmFK(_urdf_path)
 
+    sdk_connect_output = None
     try:
-        from xarm.wrapper import XArmAPI
+        # The vendor SDK prints a multi-line banner directly to stdout and its
+        # ``origin.print`` logger announces every ready/not-ready transition.
+        # Our worker validates and reports those states itself, so suppress the
+        # successful duplicate chatter while retaining SDK WARNING/ERROR logs.
+        with capture_native_stdout() as sdk_connect_output:
+            from xarm.wrapper import XArmAPI
 
-        arm = XArmAPI(cfg.arm_ip, is_radian=True)
+            logging.getLogger("origin.print").setLevel(logging.WARNING)
+            arm = XArmAPI(cfg.arm_ip, is_radian=True)
+        sdk_diagnostics = extract_native_diagnostics(sdk_connect_output.text)
+        if sdk_diagnostics:
+            logger.warning(
+                "xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics)
+            )
     except Exception as e:
-        logger.error("arm_loop: connect failed: %s", e)
+        vendor_detail = (
+            sdk_connect_output.text if sdk_connect_output is not None else ""
+        )
+        logger.error(
+            "arm_loop: connect failed: %s%s",
+            e,
+            f"; vendor output:\n{vendor_detail}" if vendor_detail else "",
+        )
         _publish_startup_fault("SDK connect failed")
         shared.error_state.value = True
         return
@@ -298,7 +559,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             "model": "xArm7",
             "serial_number": str(getattr(arm, "sn", "unavailable")),
         }
-        encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded_identity = json.dumps(
+            identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         shared.arm_device_identity.value = encoded_identity[:1023].ljust(1024, b"\x00")
 
     # Connect/configure while the application remains DISARMED. Motion mode is
@@ -341,7 +604,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             )
             time.sleep(0.5)
     else:
-        logger.error("arm_loop: connect recovery failed after %d attempts", _CONNECT_MAX_RETRIES)
+        logger.error(
+            "arm_loop: connect recovery failed after %d attempts", _CONNECT_MAX_RETRIES
+        )
         _publish_startup_fault("controller recovery failed")
         shared.error_state.value = True
         _disconnect_arm(arm)
@@ -349,14 +614,23 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     # Post-connect configuration. Every setter return code is authoritative.
     try:
-        _require_sdk_ok("set_collision_sensitivity", arm.set_collision_sensitivity(cfg.collision_sensitivity))
+        _require_sdk_ok(
+            "set_collision_sensitivity",
+            arm.set_collision_sensitivity(cfg.collision_sensitivity),
+        )
         # TCP load: XHand (1.1 kg). COG in tool-flange frame (link_eef) from
         # URDF weighted-COM of all end-effector links; flange_joint2 corrected
         # 0.043→0.033 m per physical measurement.
-        _require_sdk_ok("set_tcp_load", arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5]))
+        _require_sdk_ok(
+            "set_tcp_load",
+            arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5]),
+        )
         # Torque-based collision detection (level 1, least-sensitive enabled
         # setting). Keep this firmware backstop enabled during intentional contact.
-        _require_sdk_ok("set_joint_maxacc", arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True))
+        _require_sdk_ok(
+            "set_joint_maxacc",
+            arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True),
+        )
     except Exception as e:
         logger.error("arm_loop: post-recovery config failed: %s", e)
         _publish_startup_fault("controller configuration failed")
@@ -370,7 +644,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         try:
             code, states = arm.get_joint_states(is_radian=True, num=1)
             if code == 0 and len(states) > 0:
-                last_qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
+                last_qpos = np.asarray(states[0], dtype=np.float64)[
+                    : ARM_JOINT_SHAPE[0]
+                ].copy()
                 break
             logger.warning(
                 "arm_loop: initial joint state read attempt %d/%d: code=%d",
@@ -387,7 +663,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             )
         time.sleep(0.1)
     else:
-        logger.error("arm_loop: cannot read initial joint states after %d attempts", _STATE_READ_MAX_RETRIES)
+        logger.error(
+            "arm_loop: cannot read initial joint states after %d attempts",
+            _STATE_READ_MAX_RETRIES,
+        )
         _publish_startup_fault("initial feedback unavailable")
         shared.error_state.value = True
         _disconnect_arm(arm)
@@ -399,7 +678,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         _require_sdk_ok("startup set_state(4)", arm.set_state(4))
         _wait_live_status(arm, expected_state=4)
     except Exception:
-        logger.error("arm_loop: failed to enter confirmed DISARMED state", exc_info=True)
+        logger.error(
+            "arm_loop: failed to enter confirmed DISARMED state", exc_info=True
+        )
         _publish_startup_fault("confirmed state-4 startup stop failed")
         shared.error_state.value = True
         _disconnect_arm(arm)
@@ -412,8 +693,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     last_cmd_apply_latency_s = 0.0
     last_cmd_sdk_duration_s = 0.0
     last_cmd_is_hold = False
-    last_action_id = 0
+    last_arm_control_sequence = 0
     motion_enabled = False
+    controller_decel_stopped = False
     last_safety_state = int(SafetyState.DISARMED)
     last_state_source_ns = time.monotonic_ns()
     last_c24_s = float("-inf")
@@ -457,7 +739,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     shared.arm_heartbeat_s.value = time.monotonic()
     shared.arm_ready.set()
     publish_component_status(shared, "arm", ComponentPhase.READY)
-    logger.info("arm_loop: ready and DISARMED (state=4, ip=%s, hz=%.0f)", cfg.arm_ip, cfg.arm_loop_hz)
+    logger.info(
+        "arm_loop: ready and DISARMED (state=4, ip=%s, hz=%.0f)",
+        cfg.arm_ip,
+        cfg.arm_loop_hz,
+    )
 
     limiter = RateManager(cfg.arm_loop_hz)
     low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
@@ -475,7 +761,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             try:
                 arm.emergency_stop()
             except Exception:
-                logger.warning("arm_loop: emergency_stop call failed; cleanup will enforce state 4", exc_info=True)
+                logger.warning(
+                    "arm_loop: emergency_stop call failed; cleanup will enforce state 4",
+                    exc_info=True,
+                )
             break
 
         # Safety-state/controller lifecycle edges. DISARMED/FAULT always map to
@@ -485,7 +774,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         # to publish state (for monitoring) and rate-limit normally.
         _safety = shared.safety_state.value
         if _safety in (SafetyState.DISARMED, SafetyState.FAULT):
-            if motion_enabled or last_safety_state not in (SafetyState.DISARMED, SafetyState.FAULT):
+            if motion_enabled or last_safety_state not in (
+                SafetyState.DISARMED,
+                SafetyState.FAULT,
+            ):
                 try:
                     _require_sdk_ok("safety set_state(4)", arm.set_state(4))
                     _wait_live_status(arm, expected_state=4)
@@ -494,13 +786,18 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     shared.error_state.value = True
                     break
                 motion_enabled = False
-        elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not motion_enabled:
+                controller_decel_stopped = False
+        elif (
+            _safety in (SafetyState.ARMED, SafetyState.RUNNING)
+            and not motion_enabled
+            and not controller_decel_stopped
+        ):
             try:
-                _require_sdk_ok("armed set_mode(6)", arm.set_mode(6))
-                _require_sdk_ok("armed set_state(0)", arm.set_state(0))
-                _wait_live_status(arm, expected_state=2, expected_mode=6)
+                _enter_mode6_ready(arm, operation_prefix="armed")
             except Exception:
-                logger.error("arm_loop: failed ARMED Mode-6 postcondition", exc_info=True)
+                logger.error(
+                    "arm_loop: failed ARMED Mode-6 postcondition", exc_info=True
+                )
                 shared.error_state.value = True
                 try:
                     arm.set_state(4)
@@ -509,15 +806,115 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 break
             motion_enabled = True
         last_safety_state = int(_safety)
-        if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-            # ── Simple dequeue → validate → apply (fire-and-forget) ──
-            try:
-                action = shared.arm_action_q.get(timeout=0.0)
-            except Empty:
-                action = None
+        if (
+            _safety in (SafetyState.ARMED, SafetyState.RUNNING)
+            and not shared.error_state.value
+        ):
+            # STOP/RESUME control is latest-wins and has priority over the
+            # ordered endpoint queue.  It therefore remains deliverable even
+            # when two Mode-6 endpoints already occupy that bounded queue.
+            control_request, last_arm_control_sequence = (
+                _take_latest_arm_control_request(
+                    shared.arm_control_ring,
+                    last_sequence=last_arm_control_sequence,
+                    expected_run_generation=int(shared.run_generation.value),
+                )
+            )
+            action = None
+            if control_request is not None:
+                control_kind = ArmControlKind(int(control_request["kind"][0]))
+                received_s = time.monotonic()
+                sdk_started_s = received_s
+                try:
+                    if control_kind is ArmControlKind.DECELERATED_STOP:
+                        reported_stop_state = (
+                            _wait_live_status(
+                                arm,
+                                expected_state=(5, 6),
+                                expected_mode=6,
+                                timeout_s=0.25,
+                            )
+                            if controller_decel_stopped
+                            else _apply_decelerated_stop(arm)
+                        )
+                        last_target = last_qpos.copy()
+                        motion_enabled = False
+                        controller_decel_stopped = True
+                    else:
+                        resumed_qpos = _resume_mode6_with_measured_hold(
+                            arm,
+                            cfg,
+                            operation_prefix="explicit resume",
+                        )
+                        last_qpos = resumed_qpos.copy()
+                        last_target = resumed_qpos.copy()
+                        motion_enabled = True
+                        controller_decel_stopped = False
+                except Exception:
+                    operation = (
+                        "decelerated stop"
+                        if control_kind is ArmControlKind.DECELERATED_STOP
+                        else "resume"
+                    )
+                    logger.error(
+                        "arm_loop: failed to confirm controller %s postcondition",
+                        operation,
+                        exc_info=True,
+                    )
+                    try:
+                        _require_sdk_ok(
+                            f"{operation} fallback set_state(4)", arm.set_state(4)
+                        )
+                        _wait_live_status(arm, expected_state=4)
+                    except Exception:
+                        logger.error(
+                            "arm_loop: %s fallback state 4 failed",
+                            operation,
+                            exc_info=True,
+                        )
+                    motion_enabled = False
+                    controller_decel_stopped = False
+                    shared.error_state.value = True
+                    break
+                applied_s = time.monotonic()
+                last_cmd_seq = int(control_request["action_id"][0])
+                last_cmd_created_s = (
+                    int(control_request["created_monotonic_ns"][0]) / 1e9
+                )
+                last_cmd_received_s = received_s
+                last_cmd_applied_s = applied_s
+                last_cmd_queue_latency_s = max(0.0, received_s - last_cmd_created_s)
+                last_cmd_apply_latency_s = max(0.0, applied_s - last_cmd_created_s)
+                last_cmd_sdk_duration_s = max(0.0, applied_s - sdk_started_s)
+                last_cmd_is_hold = True
+                _recovery_counter.reset()
+                if control_kind is ArmControlKind.DECELERATED_STOP:
+                    logger.info(
+                        "arm_loop: State-6 decelerated stop accepted "
+                        "(reported_state=%d, action_id=%d, apply_latency=%.1fms)",
+                        reported_stop_state,
+                        last_cmd_seq,
+                        1e3 * last_cmd_apply_latency_s,
+                    )
+                else:
+                    logger.info(
+                        "arm_loop: explicit Mode-6 resume accepted behind measured hold "
+                        "(action_id=%d, apply_latency=%.1fms)",
+                        last_cmd_seq,
+                        1e3 * last_cmd_apply_latency_s,
+                    )
+            else:
+                action = _take_next_current_arm_action(
+                    shared.arm_action_q,
+                    expected_run_generation=int(shared.run_generation.value),
+                )
 
             # HOME sentinel — collision-validated path with request ID.
-            if isinstance(action, tuple) and len(action) == 2 and action[0] == HOME_SENTINEL:
+            if (
+                isinstance(action, tuple)
+                and len(action) == 2
+                and action[0] == HOME_SENTINEL
+            ):
                 _request = action[1]
                 if not isinstance(_request, HomeRequest):
                     logger.error("arm_loop: rejecting malformed HOME request")
@@ -538,7 +935,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     try:
                         eef_pos, eef_rot6d = _arm_fk.compute(qpos)
                     except Exception:
-                        _fk_warn("arm_loop: Pinocchio FK failed during homing — publishing zero EEF")
+                        _fk_warn(
+                            "arm_loop: Pinocchio FK failed during homing — publishing zero EEF"
+                        )
                         eef_pos = np.zeros(3, dtype=np.float64)
                         eef_rot6d = np.zeros(6, dtype=np.float64)
                     try:
@@ -571,24 +970,52 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 try:
                     shared.arm_home_result_q.put(_home_result, timeout=0.2)
                 except Exception:
-                    logger.error("arm_loop: failed to publish HOME result", exc_info=True)
-                if _home_result.final_qpos.shape == ARM_JOINT_SHAPE and np.all(np.isfinite(_home_result.final_qpos)):
+                    logger.error(
+                        "arm_loop: failed to publish HOME result", exc_info=True
+                    )
+                if _home_result.final_qpos.shape == ARM_JOINT_SHAPE and np.all(
+                    np.isfinite(_home_result.final_qpos)
+                ):
                     last_qpos = _home_result.final_qpos.copy()
                     last_target = last_qpos.copy()
                 if _home_result.success:
-                    logger.info("arm_loop: HOME complete in %.2fs", time.monotonic() - _home_started_s)
+                    motion_enabled = True
+                    controller_decel_stopped = False
+                    logger.info(
+                        "arm_loop: HOME complete in %.2fs",
+                        time.monotonic() - _home_started_s,
+                    )
                 elif shared.is_running.value:
                     logger.error("arm_loop: HOME failed — %s", _home_result.reason)
                     shared.error_state.value = True
                 continue
 
-            if action is not None and not isinstance(action, tuple):
-                if not worker_validate_arm(action):
-                    logger.warning("arm_loop: rejected malformed command")
+            elif action is not None and not isinstance(action, tuple):
+                if not worker_validate_arm(
+                    action,
+                    expected_run_generation=int(shared.run_generation.value),
+                    now_monotonic_ns=time.monotonic_ns(),
+                ):
+                    logger.info(
+                        "arm_loop: discarded malformed, stale-generation, or expired command"
+                    )
+                elif controller_decel_stopped or not motion_enabled:
+                    # Only the priority RESUME request may leave State 5/6.
+                    # Consuming an endpoint as an implicit resume can block the
+                    # worker while producers fill the two-slot queue and can
+                    # make firmware continue toward a superseded target.
+                    logger.warning(
+                        "arm_loop: discarded endpoint while explicit resume is pending"
+                    )
                 else:
                     target = np.asarray(action["qpos_cmd"][0], dtype=np.float64)
                     try:
-                        target = wrap_nearest_equivalent(target, last_qpos, cfg.joint_limit_lower, cfg.joint_limit_upper)
+                        target = wrap_nearest_equivalent(
+                            target,
+                            last_qpos,
+                            cfg.joint_limit_lower,
+                            cfg.joint_limit_upper,
+                        )
                     except ValueError:
                         target = last_qpos.copy()
                     else:
@@ -603,18 +1030,24 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                                 wait=False,
                             )
                         except Exception:
-                            logger.error("arm_loop: set_servo_angle raised", exc_info=True)
+                            logger.error(
+                                "arm_loop: set_servo_angle raised", exc_info=True
+                            )
                             shared.error_state.value = True
                             break
                         if code == 0:
                             _recovery_counter.reset()
-                            last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = _parse_arm_action_metadata(
-                                action, _sdk_started_s
+                            last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = (
+                                _parse_arm_action_metadata(action, _sdk_started_s)
                             )
                             last_cmd_received_s = time.monotonic()
                             last_cmd_applied_s = last_cmd_received_s
-                            last_cmd_queue_latency_s = max(0.0, last_cmd_received_s - last_cmd_created_s)
-                            last_cmd_apply_latency_s = max(0.0, last_cmd_applied_s - last_cmd_created_s)
+                            last_cmd_queue_latency_s = max(
+                                0.0, last_cmd_received_s - last_cmd_created_s
+                            )
+                            last_cmd_apply_latency_s = max(
+                                0.0, last_cmd_applied_s - last_cmd_created_s
+                            )
                             last_cmd_sdk_duration_s = time.monotonic() - _sdk_started_s
                         else:
                             err_code = int(getattr(arm, "error_code", 0) or 0)
@@ -624,7 +1057,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                             if err_code == 24:
                                 now_s = time.monotonic()
                                 if now_s - last_c24_s <= 2.0:
-                                    logger.error("arm_loop: second C24 inside 2s — latching fault")
+                                    logger.error(
+                                        "arm_loop: second C24 inside 2s — latching fault"
+                                    )
                                     shared.error_state.value = True
                                     break
                                 last_c24_s = now_s
@@ -632,13 +1067,24 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                                     last_target = _recover_c24_measured_hold(arm, cfg)
                                     c24_recovered_this_tick = True
                                 except Exception:
-                                    logger.error("arm_loop: C24 measured-hold recovery failed", exc_info=True)
+                                    logger.error(
+                                        "arm_loop: C24 measured-hold recovery failed",
+                                        exc_info=True,
+                                    )
                                     shared.error_state.value = True
                                     break
                             else:
-                                logger.error("arm_loop: SDK failure code=%d err=%d", code, err_code)
+                                logger.error(
+                                    "arm_loop: SDK failure code=%d err=%d",
+                                    code,
+                                    err_code,
+                                )
                                 shared.error_state.value = True
                                 break
+            elif action is not None:
+                logger.error(
+                    "arm_loop: rejecting malformed action queue item %r", action
+                )
 
         arm_connected = True
         state_read_succeeded = False
@@ -650,7 +1096,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             state_read_succeeded = True
         except Exception:
             logger.warning("arm_loop: get_joint_states failed", exc_info=True)
-            qpos, qvel, tau = last_qpos.copy(), np.zeros(ARM_JOINT_SHAPE), np.zeros(ARM_JOINT_SHAPE)
+            qpos, qvel, tau = (
+                last_qpos.copy(),
+                np.zeros(ARM_JOINT_SHAPE),
+                np.zeros(ARM_JOINT_SHAPE),
+            )
             arm_connected = False
         state_read_fault = _update_state_read_watchdog(
             _state_error_counter,
@@ -665,13 +1115,22 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             eef_pos = np.zeros(3, dtype=np.float64)
             eef_rot6d = np.zeros(6, dtype=np.float64)
 
-        tracking_err = float(np.max(np.abs(qpos - last_target)))
+        if controller_decel_stopped:
+            # State 6 chooses the physical terminal point.  Following error to
+            # the superseded Mode-6 endpoint is meaningless while braking;
+            # continuously re-anchor diagnostics to fresh feedback instead.
+            last_target = qpos.copy()
+            tracking_err = 0.0
+        else:
+            tracking_err = float(np.max(np.abs(qpos - last_target)))
 
         if tracking_err > cfg.tracking_error_warn_rad:
             _tracking_err_count += 1
             if _tracking_err_count >= 3:
                 _tracking_warn(
-                    "arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad", tracking_err, cfg.tracking_error_warn_rad
+                    "arm_loop: tracking_err=%.3f_rad threshold=%.3f_rad",
+                    tracking_err,
+                    cfg.tracking_error_warn_rad,
                 )
         else:
             _tracking_err_count = 0
@@ -698,9 +1157,13 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 break
             last_c24_s = now_s
             try:
-                last_target = _recover_c24_measured_hold(arm, cfg, operation_prefix="state C24")
+                last_target = _recover_c24_measured_hold(
+                    arm, cfg, operation_prefix="state C24"
+                )
             except Exception:
-                logger.error("arm_loop: state C24 measured-hold recovery failed", exc_info=True)
+                logger.error(
+                    "arm_loop: state C24 measured-hold recovery failed", exc_info=True
+                )
                 shared.error_state.value = True
                 break
         elif error_code != 0 and not (c24_recovered_this_tick and error_code == 24):
@@ -771,7 +1234,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         publish_component_status(shared, "arm", ComponentPhase.STOPPED)
     else:
         publish_component_status(
-            shared, "arm", ComponentPhase.FAULT, fault_code=FaultCode.DEVICE_IO, detail="state-4 cleanup failed"
+            shared,
+            "arm",
+            ComponentPhase.FAULT,
+            fault_code=FaultCode.DEVICE_IO,
+            detail="state-4 cleanup failed",
         )
     logger.info("arm_loop: exited")
 
@@ -790,7 +1257,9 @@ def _planned_homing(
     cfg: ArmLoopConfig | None = None,
     *,
     shared: Any = None,
-    feedback_callback: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None] | None = None,
+    feedback_callback: (
+        Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None] | None
+    ) = None,
 ) -> HomeResult:
     """Execute collision-validated milestones with the firmware joint planner.
 
@@ -828,20 +1297,40 @@ def _planned_homing(
 
     waypoints = np.asarray(request.waypoints, dtype=np.float64)
     home_qpos = np.asarray(request.final_qpos, dtype=np.float64)
-    if not isinstance(request.request_id, (int, np.integer)) or int(request.request_id) <= 0:
+    if (
+        not isinstance(request.request_id, (int, np.integer))
+        or int(request.request_id) <= 0
+    ):
         return _result(False, "invalid request_id", np.full(ARM_JOINT_SHAPE, np.nan))
-    if waypoints.ndim != 2 or waypoints.shape[1:] != ARM_JOINT_SHAPE or not np.all(np.isfinite(waypoints)):
-        return _result(False, "invalid waypoint array", np.full(ARM_JOINT_SHAPE, np.nan))
+    if (
+        waypoints.ndim != 2
+        or waypoints.shape[1:] != ARM_JOINT_SHAPE
+        or not np.all(np.isfinite(waypoints))
+    ):
+        return _result(
+            False, "invalid waypoint array", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
     if home_qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(home_qpos)):
         return _result(False, "invalid final_qpos", np.full(ARM_JOINT_SHAPE, np.nan))
-    if not np.isfinite(request.execution_timeout_s) or request.execution_timeout_s <= 0.0:
-        return _result(False, "invalid execution timeout", np.full(ARM_JOINT_SHAPE, np.nan))
+    if (
+        not np.isfinite(request.execution_timeout_s)
+        or request.execution_timeout_s <= 0.0
+    ):
+        return _result(
+            False, "invalid execution timeout", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
     _lower = np.asarray(_cfg.joint_limit_lower, dtype=np.float64)
     _upper = np.asarray(_cfg.joint_limit_upper, dtype=np.float64)
     if len(waypoints) > 0 and not np.all((waypoints >= _lower) & (waypoints <= _upper)):
-        return _result(False, "waypoint violates joint limits", np.full(ARM_JOINT_SHAPE, np.nan))
+        return _result(
+            False, "waypoint violates joint limits", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
     if len(waypoints) > 0 and float(np.max(np.abs(waypoints[-1] - home_qpos))) > 1e-6:
-        return _result(False, "final milestone does not match canonical home", np.full(ARM_JOINT_SHAPE, np.nan))
+        return _result(
+            False,
+            "final milestone does not match canonical home",
+            np.full(ARM_JOINT_SHAPE, np.nan),
+        )
 
     try:
         code, states = arm.get_joint_states(is_radian=True, num=3)
@@ -853,18 +1342,27 @@ def _planned_homing(
                 else np.full(ARM_JOINT_SHAPE, np.inf)
             )
         else:
-            return _result(False, f"initial state read failed (code={code})", np.full(ARM_JOINT_SHAPE, np.nan))
+            return _result(
+                False,
+                f"initial state read failed (code={code})",
+                np.full(ARM_JOINT_SHAPE, np.nan),
+            )
     except Exception:
         logger.warning("_planned_homing: initial state read raised", exc_info=True)
-        return _result(False, "initial state read raised", np.full(ARM_JOINT_SHAPE, np.nan))
+        return _result(
+            False, "initial state read raised", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
     if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
-        return _result(False, "initial state is invalid", np.full(ARM_JOINT_SHAPE, np.nan))
+        return _result(
+            False, "initial state is invalid", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
 
     def _confirm_home_dwell(failure_reason: str) -> HomeResult:
         nonlocal current, current_qvel
         if (
             float(np.max(np.abs(current - home_qpos))) > _cfg.homing_convergence_rad
-            or float(np.max(np.abs(current_qvel))) > _cfg.homing_velocity_convergence_rad_s
+            or float(np.max(np.abs(current_qvel)))
+            > _cfg.homing_velocity_convergence_rad_s
         ):
             return _result(False, failure_reason, current)
         stable_since = time.monotonic()
@@ -875,7 +1373,9 @@ def _planned_homing(
             time.sleep(min(_cfg.homing_step_interval_s, _cfg.homing_dwell_s))
             code, states = arm.get_joint_states(is_radian=True, num=3)
             if code != 0 or len(states) <= 1:
-                return _result(False, "state/qvel unavailable during home dwell", current)
+                return _result(
+                    False, "state/qvel unavailable during home dwell", current
+                )
             current = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
             current_qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
             if (
@@ -883,20 +1383,30 @@ def _planned_homing(
                 or current_qvel.shape != ARM_JOINT_SHAPE
                 or not np.all(np.isfinite(current))
                 or not np.all(np.isfinite(current_qvel))
-                or float(np.max(np.abs(current - home_qpos))) > _cfg.homing_convergence_rad
-                or float(np.max(np.abs(current_qvel))) > _cfg.homing_velocity_convergence_rad_s
+                or float(np.max(np.abs(current - home_qpos)))
+                > _cfg.homing_convergence_rad
+                or float(np.max(np.abs(current_qvel)))
+                > _cfg.homing_velocity_convergence_rad_s
             ):
-                return _result(False, "home dwell interrupted by position/velocity", current)
+                return _result(
+                    False, "home dwell interrupted by position/velocity", current
+                )
         return _result(True, "already at canonical home and settled", current)
 
     if len(waypoints) == 0:
-        return _confirm_home_dwell("empty path while away from stationary canonical home")
+        return _confirm_home_dwell(
+            "empty path while away from stationary canonical home"
+        )
     if float(np.max(np.abs(current - waypoints[0]))) > _cfg.homing_convergence_rad:
-        return _result(False, "current state moved too far from planned path start", current)
+        return _result(
+            False, "current state moved too far from planned path start", current
+        )
 
     _execution_targets = waypoints[1:]
     if len(_execution_targets) == 0:
-        return _confirm_home_dwell("single-point path is not at stationary canonical home")
+        return _confirm_home_dwell(
+            "single-point path is not at stationary canonical home"
+        )
     _preflight_abort = _shared_abort_reason()
     if _preflight_abort is not None:
         return _result(False, _preflight_abort, current)
@@ -934,10 +1444,18 @@ def _planned_homing(
                 logger.warning("_planned_homing: milestone send failed", exc_info=True)
                 return _result(False, f"milestone {_target_index} send raised", current)
             if _code != 0:
-                return _result(False, f"milestone {_target_index} rejected (SDK code={_code})", current)
+                return _result(
+                    False,
+                    f"milestone {_target_index} rejected (SDK code={_code})",
+                    current,
+                )
 
-            _segment_timeout_s = _estimate_homing_segment_timeout_s(_segment_start, _target, _cfg)
-            _segment_deadline = min(_overall_deadline, _segment_started_s + _segment_timeout_s)
+            _segment_timeout_s = _estimate_homing_segment_timeout_s(
+                _segment_start, _target, _cfg
+            )
+            _segment_deadline = min(
+                _overall_deadline, _segment_started_s + _segment_timeout_s
+            )
             _stable_since_s: float | None = None
             while time.monotonic() < _segment_deadline:
                 if shared is not None:
@@ -948,8 +1466,14 @@ def _planned_homing(
                 try:
                     _state_code, _states = arm.get_joint_states(is_radian=True, num=3)
                 except Exception:
-                    logger.warning("_planned_homing: milestone state read raised", exc_info=True)
-                    return _result(False, f"state read raised at milestone {_target_index}", current)
+                    logger.warning(
+                        "_planned_homing: milestone state read raised", exc_info=True
+                    )
+                    return _result(
+                        False,
+                        f"state read raised at milestone {_target_index}",
+                        current,
+                    )
                 if _state_code != 0 or len(_states) == 0:
                     return _result(
                         False,
@@ -958,9 +1482,13 @@ def _planned_homing(
                     )
                 current = np.asarray(_states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
                 if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
-                    return _result(False, f"invalid state at milestone {_target_index}", current)
+                    return _result(
+                        False, f"invalid state at milestone {_target_index}", current
+                    )
                 if len(_states) <= 1:
-                    return _result(False, f"qvel unavailable at milestone {_target_index}", current)
+                    return _result(
+                        False, f"qvel unavailable at milestone {_target_index}", current
+                    )
                 qvel = np.asarray(_states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
                 tau = (
                     np.asarray(_states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
@@ -979,12 +1507,18 @@ def _planned_homing(
                     )
                 if feedback_callback is not None:
                     try:
-                        feedback_callback(current.copy(), qvel.copy(), tau.copy(), _target.copy())
+                        feedback_callback(
+                            current.copy(), qvel.copy(), tau.copy(), _target.copy()
+                        )
                     except Exception:
-                        logger.warning("_planned_homing: feedback publication failed", exc_info=True)
+                        logger.warning(
+                            "_planned_homing: feedback publication failed",
+                            exc_info=True,
+                        )
                 if (
                     float(np.max(np.abs(current - _target))) <= _milestone_tol
-                    and float(np.max(np.abs(qvel))) <= _cfg.homing_velocity_convergence_rad_s
+                    and float(np.max(np.abs(qvel)))
+                    <= _cfg.homing_velocity_convergence_rad_s
                 ):
                     if _stable_since_s is None:
                         _stable_since_s = time.monotonic()
@@ -1010,7 +1544,9 @@ def _planned_homing(
 
         _final_error = float(np.max(np.abs(current - home_qpos)))
         if _final_error > _cfg.homing_convergence_rad:
-            return _result(False, f"final error {np.rad2deg(_final_error):.2f}deg", current)
+            return _result(
+                False, f"final error {np.rad2deg(_final_error):.2f}deg", current
+            )
         return _result(True, "canonical home reached", current)
 
     # Mode 6 is designed for continuously changing online targets and its
@@ -1049,24 +1585,39 @@ def _planned_homing(
             _restore_error = exc
             logger.error("_planned_homing: failed to restore Mode 6", exc_info=True)
     elif _mode_switch_attempted:
-        _stop_reason = _post_homing_abort or f"controller error C{_controller_error_after_home}"
+        _stop_reason = (
+            _post_homing_abort or f"controller error C{_controller_error_after_home}"
+        )
         try:
             _require_sdk_ok("stop after interrupted homing", arm.set_state(4))
         except Exception as exc:
             _restore_error = exc
-            logger.error("_planned_homing: failed to stop after interrupted homing", exc_info=True)
+            logger.error(
+                "_planned_homing: failed to stop after interrupted homing",
+                exc_info=True,
+            )
         if _home_result.success:
-            _home_result = _result(False, f"homing interrupted after convergence: {_stop_reason}", current)
+            _home_result = _result(
+                False, f"homing interrupted after convergence: {_stop_reason}", current
+            )
     if _restore_error is not None:
         _operation = "Mode 6 restore" if _restore_mode6 else "safe stop"
-        return _result(False, f"{_home_result.reason}; {_operation} failed: {_restore_error}", current)
+        return _result(
+            False,
+            f"{_home_result.reason}; {_operation} failed: {_restore_error}",
+            current,
+        )
     if _restore_mode6:
         logger.info("arm_loop: homing restored Mode 6")
     return _home_result
 
 
-def _estimate_homing_segment_timeout_s(start: np.ndarray, target: np.ndarray, cfg: ArmLoopConfig) -> float:
+def _estimate_homing_segment_timeout_s(
+    start: np.ndarray, target: np.ndarray, cfg: ArmLoopConfig
+) -> float:
     """Deadline for one firmware-planned milestone, including settle time."""
     delta_rad = float(np.max(np.abs(np.asarray(target) - np.asarray(start))))
     nominal_s = delta_rad / max(cfg.homing_max_speed_rad_per_s, 1e-6)
-    return max(cfg.homing_target_timeout_s, 2.0 * nominal_s + cfg.homing_target_timeout_s)
+    return max(
+        cfg.homing_target_timeout_s, 2.0 * nominal_s + cfg.homing_target_timeout_s
+    )

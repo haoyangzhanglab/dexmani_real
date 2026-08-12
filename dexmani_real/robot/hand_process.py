@@ -15,18 +15,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.defaults import hand
-from dexmani_real.utils.schema import (
-    HAND_CONTACT_SHAPE,
-    HAND_JOINT_SHAPE,
-    HAND_STATE_DTYPE,
-    HAND_TACTILE_DTYPE,
-    HAND_TACTILE_FORCE_SHAPE,
-    HAND_TACTILE_SUM_SHAPE,
-)
 from dexmani_real.policy.safety import worker_validate_hand
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
+from dexmani_real.utils.schema import (HAND_CONTACT_SHAPE, HAND_JOINT_SHAPE,
+                                       HAND_STATE_DTYPE, HAND_TACTILE_DTYPE,
+                                       HAND_TACTILE_FORCE_SHAPE,
+                                       HAND_TACTILE_SUM_SHAPE)
 
 logger = get_logger(__name__)
 
@@ -42,10 +38,6 @@ class HandProcessConfig:
     startup_failure_is_fatal: bool = True
     ethercat_slave_position: int = field(default_factory=lambda: hand.ethercat_slave_position)
 
-    # Homing convergence
-    home_settle_timeout_s: float = field(default_factory=lambda: hand.home_settle_timeout_s)
-    home_settle_tol_rad: float = field(default_factory=lambda: hand.home_settle_tol_rad)
-
     # Feedback-only diagnostic tolerance; strict XHand command limits are
     # configured separately in XHandConfig and remain unchanged.
     feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
@@ -54,11 +46,9 @@ class HandProcessConfig:
     )
     qpos_lower_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_min_rad)
     qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_max_rad)
-    max_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
-
-    # Qpos freshness detection (driver board lockout guard)
-    stale_qpos_frame_limit: int = field(default_factory=lambda: hand.stale.frame_count)
-    stale_qpos_delta_rad: float = field(default_factory=lambda: hand.stale.qpos_delta_rad)
+    mechanical_qpos_lower_rad: tuple[float, ...] = field(default_factory=lambda: hand.mechanical_qpos_min_rad)
+    mechanical_qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.mechanical_qpos_max_rad)
+    max_command_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
 
     # Send-error watchdog: auto clear_error() after N consecutive send failures
     send_err_watchdog_frames: int = field(default_factory=lambda: hand.send_err_watchdog_count)
@@ -74,28 +64,33 @@ class HandProcessConfig:
         home = np.asarray(self.home_qpos_rad, dtype=np.float64)
         lower = np.asarray(self.qpos_lower_rad, dtype=np.float64)
         upper = np.asarray(self.qpos_upper_rad, dtype=np.float64)
-        if home.shape != HAND_JOINT_SHAPE or lower.shape != HAND_JOINT_SHAPE or upper.shape != HAND_JOINT_SHAPE:
+        mechanical_lower = np.asarray(self.mechanical_qpos_lower_rad, dtype=np.float64)
+        mechanical_upper = np.asarray(self.mechanical_qpos_upper_rad, dtype=np.float64)
+        rated_lower = np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64)
+        rated_upper = np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64)
+        vectors = (home, lower, upper, mechanical_lower, mechanical_upper)
+        if any(value.shape != HAND_JOINT_SHAPE for value in vectors):
             raise ValueError(f"hand process home/limits must have shape {HAND_JOINT_SHAPE}")
-        if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(lower > upper):
+        if not np.all(np.isfinite(np.concatenate(vectors))):
+            raise ValueError("hand process home/limits must be finite")
+        if np.any(lower > upper) or np.any(mechanical_lower > mechanical_upper):
             raise ValueError("hand process home/limits must be finite and ordered")
-        if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
-            raise ValueError("hand process max_delta_rad must be finite and positive")
-        timing = (
-            self.loop_hz,
-            self.home_settle_timeout_s,
-            self.home_settle_tol_rad,
-            self.stale_qpos_delta_rad,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in timing):
-            raise ValueError("hand process rates/tolerances must be finite and positive")
+        if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
+            raise ValueError("hand process mechanical limits cannot exceed the rated device envelope")
+        if np.any(lower < mechanical_lower) or np.any(upper > mechanical_upper):
+            raise ValueError("hand process command limits must be inside mechanical limits")
+        if np.any(home < lower - 1e-12) or np.any(home > upper + 1e-12):
+            raise ValueError("hand process home must be inside command limits")
+        if self.max_command_delta_rad is not None and (
+            not np.isfinite(self.max_command_delta_rad) or self.max_command_delta_rad <= 0.0
+        ):
+            raise ValueError("hand process max command delta must be finite and positive")
+        if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
+            raise ValueError("hand process loop_hz must be finite and positive")
         if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
             raise ValueError("hand feedback tolerance must be finite and non-negative")
-        if (
-            self.stale_qpos_frame_limit <= 0
-            or self.send_err_watchdog_frames <= 0
-            or self.error_state_watchdog_frames <= 0
-        ):
-            raise ValueError("hand process rates/watchdog thresholds must be positive")
+        if self.send_err_watchdog_frames <= 0 or self.error_state_watchdog_frames <= 0:
+            raise ValueError("hand process watchdog thresholds must be positive")
 
     @classmethod
     def from_runtime(cls, runtime: object, *, startup_failure_is_fatal: bool = True) -> "HandProcessConfig":
@@ -104,39 +99,15 @@ class HandProcessConfig:
             loop_hz=float(cfg.loop_hz),
             startup_failure_is_fatal=startup_failure_is_fatal,
             ethercat_slave_position=int(cfg.ethercat_slave_position),
-            home_settle_timeout_s=float(cfg.home_settle_timeout_s),
-            home_settle_tol_rad=float(cfg.home_settle_tol_rad),
             feedback_bound_tolerance_rad=float(cfg.feedback_bound_tolerance_rad),
             home_qpos_rad=tuple(float(value) for value in np.deg2rad(cfg.home_qpos_deg)),
             qpos_lower_rad=tuple(float(value) for value in cfg.qpos_min_rad),
             qpos_upper_rad=tuple(float(value) for value in cfg.qpos_max_rad),
-            max_delta_rad=None if cfg.max_delta_rad is None else float(cfg.max_delta_rad),
-            stale_qpos_frame_limit=int(cfg.stale.frame_count),
-            stale_qpos_delta_rad=float(cfg.stale.qpos_delta_rad),
+            mechanical_qpos_lower_rad=tuple(float(value) for value in cfg.mechanical_qpos_min_rad),
+            mechanical_qpos_upper_rad=tuple(float(value) for value in cfg.mechanical_qpos_max_rad),
+            max_command_delta_rad=None if cfg.max_delta_rad is None else float(cfg.max_delta_rad),
             send_err_watchdog_frames=int(cfg.send_err_watchdog_count),
         )
-
-
-def _update_tracking_stall(
-    qpos: np.ndarray,
-    target: np.ndarray | None,
-    *,
-    active: bool,
-    previous_error_rad: float,
-    stale_frames: int,
-    progress_epsilon_rad: float,
-) -> tuple[int, float, bool]:
-    """Advance feedback-stall state without treating a settled hand as stale."""
-    if not active or target is None:
-        return 0, float("inf"), False
-    error_rad = float(np.max(np.abs(qpos - target)))
-    if error_rad <= progress_epsilon_rad:
-        return 0, error_rad, False
-    if np.isfinite(previous_error_rad) and previous_error_rad - error_rad > progress_epsilon_rad:
-        stale_frames = 0
-    else:
-        stale_frames += 1
-    return stale_frames, error_rad, True
 
 
 def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
@@ -182,7 +153,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 home_qpos=np.asarray(cfg.home_qpos_rad, dtype=np.float64),
                 qpos_min=np.asarray(cfg.qpos_lower_rad, dtype=np.float64),
                 qpos_max=np.asarray(cfg.qpos_upper_rad, dtype=np.float64),
-                max_delta_rad=cfg.max_delta_rad,
+                mechanical_qpos_min=np.asarray(cfg.mechanical_qpos_lower_rad, dtype=np.float64),
+                mechanical_qpos_max=np.asarray(cfg.mechanical_qpos_upper_rad, dtype=np.float64),
+                max_delta_rad=cfg.max_command_delta_rad,
             )
         )
         if not hand.connect():
@@ -260,7 +233,11 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _frame0["tactile_contact"][0] = _initial_values["tactile_contact"]
     _frame0["error_state"][0] = int(bool(hand.error_state))
     _frame0["connected"][0] = int(bool(hand.connected_flag))
+    # Kept zero for schema compatibility. A stationary joint vector under
+    # contact is valid feedback, not a stale-source condition.
     _frame0["qpos_stale"][0] = 0
+    _frame0["last_cmd_seq"][0] = 0
+    _frame0["last_cmd_qpos"][0] = np.asarray(hand.last_qpos_cmd, dtype=np.float64)
     for _name, _value in _initial_board_errors.items():
         _frame0[_name][0] = _value
     _initial_source_ns = time.monotonic_ns()
@@ -288,16 +265,11 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     _read_error_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_read_error")
     _last_clear_error_s = 0.0
 
-    # Qpos freshness detection (driver board lockout guard)
-    _stale_frames = 0
-    _last_fresh_qpos: np.ndarray | None = None
     last_known_qpos = _init_qpos.copy()
     _last_tactile_sum: np.ndarray = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
     _last_tactile_force: np.ndarray = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
     _last_state_source_ns = _initial_source_ns
-    _tracking_target: np.ndarray | None = None
-    _tracking_prev_error = float("inf")
-    _tracking_change_frames = 0
+    last_applied_action_id = 0
 
     _last_error_clear_s = 0.0
 
@@ -312,8 +284,20 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         if seq_int == last_cmd_seq:
             return None
         last_cmd_seq = seq_int
-        if not worker_validate_hand(data):
-            logger.warning("hand_loop: rejected malformed command")
+        if not worker_validate_hand(
+            data,
+            qpos_lower_rad=np.asarray(cfg.qpos_lower_rad, dtype=np.float64),
+            qpos_upper_rad=np.asarray(cfg.qpos_upper_rad, dtype=np.float64),
+            mechanical_lower_rad=np.asarray(cfg.mechanical_qpos_lower_rad, dtype=np.float64),
+            mechanical_upper_rad=np.asarray(cfg.mechanical_qpos_upper_rad, dtype=np.float64),
+            previous_qpos_cmd=np.asarray(hand.last_qpos_cmd, dtype=np.float64),
+            max_command_delta_rad=cfg.max_command_delta_rad,
+            expected_run_generation=int(shared.run_generation.value),
+            now_monotonic_ns=time.monotonic_ns(),
+        ):
+            logger.info(
+                "hand_loop: discarded malformed, out-of-envelope, stale-generation, or expired command"
+            )
             return None
         return data.copy()
 
@@ -337,15 +321,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     logger.warning("hand_loop: send_action raised", exc_info=True)
                 if sent:
                     _send_error_counter.reset()
-                    target_changed = (
-                        _tracking_target is None or np.max(np.abs(cmd - _tracking_target)) >= cfg.stale_qpos_delta_rad
-                    )
-                    target_unmet = np.max(np.abs(last_known_qpos - cmd)) >= cfg.stale_qpos_delta_rad
-                    if target_changed or (_tracking_change_frames <= 0 and target_unmet):
-                        _tracking_change_frames = 1
-                        _tracking_prev_error = float(np.max(np.abs(last_known_qpos - cmd)))
-                        _stale_frames = 0
-                    _tracking_target = cmd.copy()
+                    last_applied_action_id = int(execute_action["action_id"][0])
                 else:
                     _send_error_counter.inc()
 
@@ -443,19 +419,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     _read_error_counter.max_consecutive,
                 )
 
-        # Tracking stall requires an unmet target and no feedback progress;
-        # a stationary hand that has reached its target is healthy, not stale.
-        _stale_frames, _tracking_prev_error, tracking_active = _update_tracking_stall(
-            qpos,
-            _tracking_target,
-            active=connected and _tracking_change_frames > 0,
-            previous_error_rad=_tracking_prev_error,
-            stale_frames=_stale_frames,
-            progress_epsilon_rad=cfg.stale_qpos_delta_rad,
-        )
-        _tracking_change_frames = int(tracking_active)
-        qpos_stale = _stale_frames >= cfg.stale_qpos_frame_limit
-
         # Retry transient hand errors only for the configured bounded window.
         if error_state and not shared.error_state.value:
             _error_state_counter.inc()
@@ -488,7 +451,9 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         frame["tactile_contact"][0] = tactile_contact
         frame["error_state"][0] = int(error_state)
         frame["connected"][0] = int(connected)
-        frame["qpos_stale"][0] = int(qpos_stale)
+        frame["qpos_stale"][0] = 0
+        frame["last_cmd_seq"][0] = last_applied_action_id
+        frame["last_cmd_qpos"][0] = np.asarray(hand.last_qpos_cmd, dtype=np.float64)
         frame["commboard_err"][0] = commboard_err
         frame["jointboard_err"][0] = jointboard_err
         frame["tipboard_err"][0] = tipboard_err

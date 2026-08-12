@@ -158,7 +158,6 @@ def _feedback_preflight_issues(
             hand_issue = validate_hand_feedback(
                 connected=bool(hand["connected"][0]),
                 error_state=bool(hand["error_state"][0]),
-                qpos_stale=bool(hand["qpos_stale"][0]),
                 state_valid=bool(hand["state_valid"][0]),
                 send_healthy=bool(hand["send_healthy"][0]),
                 read_healthy=bool(hand["read_healthy"][0]),

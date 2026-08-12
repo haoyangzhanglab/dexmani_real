@@ -84,18 +84,6 @@ class WorkspaceBounds:
 
 
 @dataclass(frozen=True)
-class StaleDetectionParams:
-    """Qpos freshness detection (driver board lockout guard)."""
-
-    frame_count: int = 15  # frames @ 30Hz → 0.5s
-    qpos_delta_rad: float = 1e-4
-
-    def __post_init__(self) -> None:
-        if self.frame_count <= 0 or not np.isfinite(self.qpos_delta_rad) or self.qpos_delta_rad <= 0:
-            raise ValueError("stale detection frame_count/qpos_delta_rad must be positive")
-
-
-@dataclass(frozen=True)
 class EMAParams:
     """Cartesian-space EMA smoothing parameters (tuned for the default 16 Hz grid)."""
 
@@ -162,12 +150,56 @@ class StaticCollisionBox:
 
 
 @dataclass(frozen=True)
-class EnvironmentConfig:
-    """Static geometry used only for robot-to-environment collision checks."""
+class TableCollisionConfig:
+    """Calibrated table represented as a finite box below an upward plane.
 
+    ``plane_abcd`` uses the robot-base/world convention ``ax+by+cz+d=0``.
+    Runtime resolution refreshes it from ``plane_path`` so perception,
+    online action validation, and homing use the same calibration artifact.
+    """
+
+    enabled: bool = True
+    plane_path: str | None = "dexmani_real/config/desk_plane.json"
+    plane_abcd: tuple[float, float, float, float] = (0.0, 0.0, 1.0, -0.022)
+    size_xy_m: tuple[float, float] = (2.0, 2.0)
+    thickness_m: float = 0.04
+    soft_clearance_m: float = 0.01
+    allowed_contact_links: tuple[str, ...] = ("link_base",)
+
+    def __post_init__(self) -> None:
+        if self.plane_path is not None and (not isinstance(self.plane_path, str) or not self.plane_path.strip()):
+            raise ValueError("table plane_path must be a non-empty string or null")
+        plane = np.asarray(self.plane_abcd, dtype=np.float64)
+        size = np.asarray(self.size_xy_m, dtype=np.float64)
+        if plane.shape != (4,) or size.shape != (2,):
+            raise ValueError("table plane_abcd and size_xy_m must have shapes (4,) and (2,)")
+        if not np.all(np.isfinite(np.concatenate((plane, size)))):
+            raise ValueError("table plane and size must be finite")
+        normal_norm = float(np.linalg.norm(plane[:3]))
+        if normal_norm <= 1e-9 or float(plane[2] / normal_norm) <= 0.0:
+            raise ValueError("table plane must have a finite upward-pointing normal")
+        if np.any(size <= 0.0) or not np.isfinite(self.thickness_m) or self.thickness_m <= 0.0:
+            raise ValueError("table size and thickness must be finite and positive")
+        if not np.isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:
+            raise ValueError("table soft_clearance_m must be finite and non-negative")
+        if not isinstance(self.allowed_contact_links, tuple) or any(
+            not isinstance(name, str) or not name.strip() for name in self.allowed_contact_links
+        ):
+            raise TypeError("table allowed_contact_links must be a tuple of non-empty link names")
+        if len(self.allowed_contact_links) != len(set(self.allowed_contact_links)):
+            raise ValueError("table allowed_contact_links must be unique")
+
+
+@dataclass(frozen=True)
+class EnvironmentConfig:
+    """Calibrated table plus optional static robot-environment geometry."""
+
+    table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.table, TableCollisionConfig):
+            raise TypeError("environment.table must be a TableCollisionConfig value")
         if not isinstance(self.static_boxes, tuple) or any(
             not isinstance(box, StaticCollisionBox) for box in self.static_boxes
         ):
@@ -225,8 +257,9 @@ class ArmParams:
     ip: str = "192.168.1.111"
 
     # ── Environment ──
-    table_z_surface_m: float = 0.022  # table top surface Z in arm-base frame (m), from desk_plane.json
-    hand_safety_margin_m: float = 0.05  # hand-link-frame to collision-surface padding (m)
+    # Compatibility fallback when calibrated environment.table is disabled.
+    table_z_surface_m: float = 0.022
+    hand_safety_margin_m: float = 0.05
 
     # ── Safety ──
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
@@ -288,6 +321,35 @@ class ArmParams:
 
 # Hand parameters (XHand, 12-DOF)
 
+_XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
+    0.0,
+    -0.698,
+    0.0,
+    -0.174,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+)
+_XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
+    1.832,
+    1.745,
+    1.745,
+    0.174,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+)
+
 
 @dataclass(frozen=True)
 class HandParams:
@@ -314,19 +376,27 @@ class HandParams:
         5.0,
     )
 
+    # Rated mechanical ranges from the bundled vendor-derived XHand right-hand
+    # URDF. These describe the model/hard-stop envelope and cannot be widened
+    # by a runtime override for this device model.
+    mechanical_qpos_min_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MIN_RAD
+    mechanical_qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
+
+    # Operational command bounds. They deliberately form a conservative
+    # subset of the rated mechanical ranges, particularly at distal minima.
     qpos_min_rad: tuple[float, ...] = (
         0.0,
-        -0.6981317008,
-        0.1745329252,
-        -0.1745329252,
+        -0.698,
+        0.17453292519943295,
+        -0.174,
         0.0,
-        0.0872664626,
+        0.08726646259971647,
         0.0,
-        0.0872664626,
+        0.08726646259971647,
         0.0,
-        0.0872664626,
+        0.08726646259971647,
         0.0,
-        0.0872664626,
+        0.08726646259971647,
     )
     qpos_max_rad: tuple[float, ...] = (
         1.832,
@@ -347,19 +417,18 @@ class HandParams:
     # or external load. This tolerance applies ONLY to feedback diagnostics and
     # optimizer warm starts; command and NLopt bounds remain strict.
     feedback_bound_tolerance_rad: float = 0.01  # ~0.57 deg
-    # 0.20 rad per frame (~183 deg/s at the default 16 Hz). This bounds motor jumps
-    # and caps the conservative arm×hand transition collision grid.
+    # 0.20 rad per action (~183 deg/s at the default 16 Hz). SafetyGate rejects
+    # the complete action when command-to-command motion exceeds this bound;
+    # neither the gate nor the XHand driver clips the target.
     max_delta_rad: float | None = 0.20
     safety_gate_max_velocity_deg_per_s: float = 180.0
 
     loop_hz: float = 30.0
 
     # ── Homing ──
-    home_settle_timeout_s: float = 3.0
-    home_settle_tol_rad: float = 0.06
-
-    # ── Qpos freshness (driver board lockout guard) ──
-    stale: StaleDetectionParams = field(default_factory=StaleDetectionParams)
+    # Return-home waits only for the hand worker/SDK to accept the configured
+    # home command. It never waits for measured joint convergence.
+    home_command_ack_timeout_s: float = 1.0
 
     # ── Send-error watchdog ──
     send_err_watchdog_count: int = 30  # 1s @ 30Hz
@@ -388,16 +457,35 @@ class HandParams:
     def __post_init__(self) -> None:
         if self.ethercat_slave_position < -1:
             raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
-        if len(self.home_qpos_deg) != 12 or len(self.qpos_min_rad) != 12 or len(self.qpos_max_rad) != 12:
-            raise ValueError("hand qpos defaults must have 12 elements")
-        if not all(lo <= hi for lo, hi in zip(self.qpos_min_rad, self.qpos_max_rad)):
-            raise ValueError("hand qpos_min_rad must be <= hand qpos_max_rad")
+        limit_vectors = (
+            self.mechanical_qpos_min_rad,
+            self.mechanical_qpos_max_rad,
+            self.qpos_min_rad,
+            self.qpos_max_rad,
+        )
+        if len(self.home_qpos_deg) != 12 or any(len(values) != 12 for values in limit_vectors):
+            raise ValueError("hand home and joint-limit defaults must have 12 elements")
+        mechanical_lower = np.asarray(self.mechanical_qpos_min_rad, dtype=np.float64)
+        mechanical_upper = np.asarray(self.mechanical_qpos_max_rad, dtype=np.float64)
+        rated_lower = np.asarray(_XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
+        rated_upper = np.asarray(_XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
+        command_lower = np.asarray(self.qpos_min_rad, dtype=np.float64)
+        command_upper = np.asarray(self.qpos_max_rad, dtype=np.float64)
+        all_limits = np.concatenate((mechanical_lower, mechanical_upper, command_lower, command_upper))
+        if not np.all(np.isfinite(all_limits)):
+            raise ValueError("hand mechanical and command limits must be finite")
+        if np.any(mechanical_lower > mechanical_upper) or np.any(command_lower > command_upper):
+            raise ValueError("hand mechanical and command limits must be ordered")
+        if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
+            raise ValueError("hand mechanical limits cannot exceed the rated XHand envelope")
+        if np.any(command_lower < mechanical_lower) or np.any(command_upper > mechanical_upper):
+            raise ValueError("hand command limits must be a subset of mechanical limits")
         home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
         limit_tolerance_rad = 1e-9
         if (
             not np.all(np.isfinite(home_rad))
-            or np.any(home_rad < np.asarray(self.qpos_min_rad) - limit_tolerance_rad)
-            or np.any(home_rad > np.asarray(self.qpos_max_rad) + limit_tolerance_rad)
+            or np.any(home_rad < command_lower - limit_tolerance_rad)
+            or np.any(home_rad > command_upper + limit_tolerance_rad)
         ):
             raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
         if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
@@ -408,10 +496,8 @@ class HandParams:
             raise ValueError("hand safety_gate_max_velocity_deg_per_s must be finite and positive")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
-        if not np.isfinite(self.home_settle_timeout_s) or self.home_settle_timeout_s <= 0:
-            raise ValueError("hand home_settle_timeout_s must be finite and positive")
-        if not np.isfinite(self.home_settle_tol_rad) or self.home_settle_tol_rad <= 0:
-            raise ValueError("hand home_settle_tol_rad must be finite and positive")
+        if not np.isfinite(self.home_command_ack_timeout_s) or self.home_command_ack_timeout_s <= 0:
+            raise ValueError("hand home_command_ack_timeout_s must be finite and positive")
         if self.send_err_watchdog_count <= 0:
             raise ValueError("hand send_err_watchdog_count must be positive")
         if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
@@ -554,12 +640,14 @@ class KeyboardTeleopParams:
     control_hz: float = 30.0
     delta_pos_m: float = 0.008  # 240 mm/s at 30 Hz
     delta_rpy_rad: float = 0.03  # 1.7 deg/frame, 51 deg/s at 30 Hz
+    command_lookahead_frames: int = 5  # bounded 40 mm / 0.15 rad firmware-following lead
+    workspace_command_margin_m: float = 0.002
     cartesian_kp: float = 0.0
-    ik_max_pose_error_pos_m: float = 0.02
-    ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
+    ik_max_pose_error_pos_m: float = 0.002
+    ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
     status_interval_frames: int = 50
     idle_interval_frames: int = 150
-    tracking_fault_rad: float = 5.0
+    tracking_fault_rad: float = 0.35
     tracking_fault_frames: int = 3
     cartesian_deadband_m: float = 0.003
 
@@ -568,6 +656,7 @@ class KeyboardTeleopParams:
             self.control_hz,
             self.delta_pos_m,
             self.delta_rpy_rad,
+            self.workspace_command_margin_m,
             self.cartesian_kp,
             self.ik_max_pose_error_pos_m,
             self.ik_max_pose_error_rot_rad,
@@ -582,6 +671,10 @@ class KeyboardTeleopParams:
             raise ValueError(f"delta_pos_m={self.delta_pos_m} must be > 0")
         if self.delta_rpy_rad <= 0:
             raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
+        if self.command_lookahead_frames <= 0:
+            raise ValueError("command_lookahead_frames must be positive")
+        if self.workspace_command_margin_m < 0:
+            raise ValueError("workspace_command_margin_m must be non-negative")
         if self.cartesian_kp < 0:
             raise ValueError(f"cartesian_kp={self.cartesian_kp} must be >= 0")
         if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
@@ -813,5 +906,3 @@ safety = SafetyParams()
 camera = CameraParams()
 tag_retargeting = TAGRetargetingParams()
 environment = EnvironmentConfig()
-
-

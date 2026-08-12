@@ -286,10 +286,10 @@ if __name__ == "__main__":
     serial_number = xhand_exam.read_serial_number()
     xhand_exam.read_state(finger_id=5, force_update=True)
 
-    # ── Motion commands -- UNCOMMENT to execute (requires hardware authorization) ──
-    #
-    # xhand_exam.go_home()
-    # actions = _select_preset_actions(serial_number)
-    # xhand_exam.run_preset_actions(actions)
+    # Motion commands. Confirm the workspace is clear before running this example.
+    xhand_exam.go_home()
+    actions = _select_preset_actions(serial_number)
+    xhand_exam.run_preset_actions(actions)
+    xhand_exam.go_home()
 
     xhand_exam.close()

@@ -9,10 +9,10 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, hand, safety
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.runtime import ActionCandidate
+from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
@@ -20,6 +20,7 @@ from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.hand_control import _reset_hand_retargeter
 from dexmani_real.teleop.snapshot import _read_arm_state
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
@@ -186,8 +187,12 @@ def _do_teleop_home(
     audio,
     hand_home_qpos: np.ndarray,
     table_z_surface_m: float,
-    hand_home_timeout_s: float = hand.home_settle_timeout_s,
-    hand_home_tolerance_rad: float = hand.home_settle_tol_rad,
+    hand_command_lower_rad: tuple[float, ...] | np.ndarray = hand.qpos_min_rad,
+    hand_command_upper_rad: tuple[float, ...] | np.ndarray = hand.qpos_max_rad,
+    hand_mechanical_lower_rad: tuple[float, ...] | np.ndarray = hand.mechanical_qpos_min_rad,
+    hand_mechanical_upper_rad: tuple[float, ...] | np.ndarray = hand.mechanical_qpos_max_rad,
+    hand_max_command_delta_rad: float | None = hand.max_delta_rad,
+    hand_home_ack_timeout_s: float = hand.home_command_ack_timeout_s,
     arm_home_convergence_timeout_s: float = arm.homing.convergence_timeout_s,
     arm_home_request_queue_timeout_s: float = arm.homing.request_queue_timeout_s,
     arm_home_state_max_age_s: float = arm.homing.state_max_age_s,
@@ -200,69 +205,41 @@ def _do_teleop_home(
     arm_mapper=None,
     hand_retargeter=None,
     heartbeat: bool = True,
-    safety_gate: Any = None,
     arm_home_qpos: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Home hand first, then arm. Returns updated *prev_hand_qpos*.
+    """Apply hand-home, acknowledge its SDK send, then home the arm.
 
     If *arm_mapper* and *hand_retargeter* are both provided, clears EMA
     state and re-seeds retargeter before homing (active-teleop H path).
     Post-teleop callers pass ``None`` for both — the state is already cleared.
+    Hand execution convergence is intentionally not inspected.
     """
     if arm_mapper is not None:
         arm_mapper.clear()
     if hand_retargeter is not None:
         _reset_hand_retargeter(hand_retargeter)
 
-    # Step 1: hand home first (prevents arm sweeping while hand is in grasp).
+    # Step 1: publish the exact configured hand-home endpoint. Success means
+    # the hand worker received it and XHand.send_action() returned success; a
+    # grasped object or steady-state joint error never blocks arm homing.
     if hand_available and not shared.error_state.value:
-        from dexmani_real.utils.schema import HAND_COMMAND_DTYPE
-
-        _hand_deadline = time.monotonic() + hand_home_timeout_s
-        hand_reached = False
-        final_qpos = None
-        _first = True
-        while time.monotonic() < _hand_deadline:
-            if (getattr(getattr(shared, "estop_request", None), "value", False)
-                    or getattr(getattr(shared, "error_state", None), "value", False)
-                    or (estop_requested is not None and estop_requested())):
-                break
-            if not shared.is_running.value:
-                break
-            if heartbeat:
-                shared.policy_heartbeat_s.value = time.monotonic()
-
-            _frame = np.zeros(1, dtype=HAND_COMMAND_DTYPE)
-            _frame["qpos_cmd"][0] = hand_home_qpos
-            shared.hand_cmd_ring.write(_frame)
-
-            hand_result = shared.hand_state_ring.read_latest()
-            if hand_result is not None:
-                state = hand_result[0][0]
-                try:
-                    if (bool(state["connected"]) and bool(state["state_valid"])
-                            and not bool(state["error_state"]) and not bool(state["qpos_stale"])
-                            and bool(state["send_healthy"]) and bool(state["read_healthy"])):
-                        current = np.asarray(state["qpos"], dtype=np.float64)
-                        if current.shape == (12,) and np.all(np.isfinite(current)):
-                            err = float(np.max(np.abs(current - hand_home_qpos)))
-                            if err < hand_home_tolerance_rad:
-                                final_qpos = current.copy()
-                                hand_reached = True
-                                break
-                            if _first:
-                                print(f"  hand: homing... (max_err={np.rad2deg(err):.0f}°)", flush=True)
-                                _first = False
-                except Exception:
-                    pass
-            time.sleep(0.1)
-
-        if final_qpos is not None:
-            prev_hand_qpos = final_qpos
-            planner.set_hand_qpos(prev_hand_qpos)
-        if not hand_reached:
-            logger.warning("arm home cancelled: hand did not reach a fresh, healthy home state")
+        hand_accepted = publish_hand_home_and_wait_applied(
+            shared,
+            np.asarray(hand_home_qpos, dtype=np.float64),
+            command_lower_rad=np.asarray(hand_command_lower_rad, dtype=np.float64),
+            command_upper_rad=np.asarray(hand_command_upper_rad, dtype=np.float64),
+            mechanical_lower_rad=np.asarray(hand_mechanical_lower_rad, dtype=np.float64),
+            mechanical_upper_rad=np.asarray(hand_mechanical_upper_rad, dtype=np.float64),
+            max_command_delta_rad=hand_max_command_delta_rad,
+            timeout_s=hand_home_ack_timeout_s,
+            heartbeat=heartbeat,
+            abort_requested=estop_requested,
+        )
+        if not hand_accepted:
+            logger.warning("arm home cancelled: hand-home command was not accepted by the worker/SDK")
             return prev_hand_qpos
+        prev_hand_qpos = np.asarray(hand_home_qpos, dtype=np.float64).copy()
+        planner.set_hand_qpos(prev_hand_qpos)
     elif fixed_hand_home_acknowledged:
         prev_hand_qpos = np.asarray(hand_home_qpos, dtype=np.float64).copy()
         planner.set_hand_qpos(prev_hand_qpos)
@@ -271,9 +248,9 @@ def _do_teleop_home(
         print("  hand: not connected — arm home cancelled (hand pose unknown)", flush=True)
         return prev_hand_qpos
 
-    # Step 2: arm home (collision-checked path via HOME_SENTINEL).
-    # Re-read after hand homing: the old loop-local qpos may be several seconds
-    # stale, and collision/path execution must start from current encoder state.
+    # Step 2: arm home (collision-checked path via HOME_SENTINEL). Planning uses
+    # configured hand-home geometry by explicit operator policy; it does not
+    # wait for or substitute measured hand convergence.
     _arm_state = _read_arm_state(shared)
     if _arm_state is None:
         logger.warning("arm home cancelled: no current arm state")
@@ -325,7 +302,6 @@ def _do_configured_teleop_home(
     planner: XArm7MotionPlanner,
     audio: Any,
     estop_requested: Callable[[], bool],
-    safety_gate: Any,
     arm_mapper: ArmWristMapper | None = None,
     hand_retargeter: Any = None,
 ) -> np.ndarray:
@@ -338,8 +314,12 @@ def _do_configured_teleop_home(
         planner=planner,
         audio=audio,
         hand_home_qpos=np.deg2rad(np.asarray(config.hand_home_qpos_deg, dtype=np.float64)),
-        hand_home_timeout_s=config.hand_home_settle_timeout_s,
-        hand_home_tolerance_rad=config.hand_home_settle_tolerance_rad,
+        hand_command_lower_rad=np.asarray(config.hand_qpos_lower_rad, dtype=np.float64),
+        hand_command_upper_rad=np.asarray(config.hand_qpos_upper_rad, dtype=np.float64),
+        hand_mechanical_lower_rad=np.asarray(config.hand_mechanical_qpos_lower_rad, dtype=np.float64),
+        hand_mechanical_upper_rad=np.asarray(config.hand_mechanical_qpos_upper_rad, dtype=np.float64),
+        hand_max_command_delta_rad=config.hand_max_delta_rad,
+        hand_home_ack_timeout_s=config.hand_home_command_ack_timeout_s,
         arm_home_convergence_timeout_s=config.arm_home_convergence_timeout_s,
         arm_home_request_queue_timeout_s=config.arm_home_request_queue_timeout_s,
         arm_home_state_max_age_s=config.arm_home_state_max_age_s,
@@ -352,6 +332,5 @@ def _do_configured_teleop_home(
         table_z_surface_m=config.contact_stall_table_z_surface_m,
         arm_mapper=arm_mapper,
         hand_retargeter=hand_retargeter,
-        safety_gate=safety_gate,
         arm_home_qpos=np.asarray(config.arm_home_qpos, dtype=np.float64),
     )

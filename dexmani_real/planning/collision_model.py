@@ -99,6 +99,7 @@ class CollisionModel:
         srdf_path: str | None = None,
         package_dir: str | None = None,
         static_boxes: Iterable[Any] = (),
+        table: Any | None = None,
     ) -> None:
         import pinocchio as pin
 
@@ -144,11 +145,13 @@ class CollisionModel:
         )
         self._robot_environment_geom_count = int(self._environment_collision_model.ngeoms)
         self._environment_names: dict[int, str] = {}
+        self._table_pair_indices: tuple[int, ...] = ()
+        self._table = self._normalize_table(table)
         normalized_boxes = tuple(self._normalize_static_box(box) for box in static_boxes)
         box_names = [str(box["name"]) for box in normalized_boxes]
         if len(box_names) != len(set(box_names)):
             raise ValueError("static collision box names must be unique")
-        if normalized_boxes:
+        if normalized_boxes or self._table is not None:
             from hppfcl.hppfcl import Box
 
             for box in normalized_boxes:
@@ -164,17 +167,45 @@ class CollisionModel:
                 self._environment_names[obstacle_id] = str(box["name"])
                 for robot_id in range(self._robot_environment_geom_count):
                     self._environment_collision_model.addCollisionPair(pin.CollisionPair(robot_id, obstacle_id))
+            if self._table is not None:
+                table_config = self._table
+                normal = table_config["normal"]
+                placement = pin.SE3(
+                    self._table_rotation(normal),
+                    table_config["surface_origin"] - 0.5 * table_config["thickness_m"] * normal,
+                )
+                geometry = pin.GeometryObject(
+                    "environment::table",
+                    0,
+                    0,
+                    Box(*table_config["size_xyz_m"]),
+                    placement,
+                )
+                table_id = int(self._environment_collision_model.addGeometryObject(geometry))
+                self._environment_names[table_id] = "table"
+                table_pair_indices: list[int] = []
+                allowed = table_config["allowed_contact_links"]
+                for robot_id in range(self._robot_environment_geom_count):
+                    link_name = self._get_environment_geom_link_name(robot_id)
+                    if link_name in allowed:
+                        continue
+                    self._environment_collision_model.addCollisionPair(pin.CollisionPair(robot_id, table_id))
+                    table_pair_indices.append(len(self._environment_collision_model.collisionPairs) - 1)
+                self._table_pair_indices = tuple(table_pair_indices)
         self._environment_collision_data = self._environment_collision_model.createData()
         self._static_boxes = normalized_boxes
+        self._environment_obstacle_count = len(normalized_boxes) + int(self._table is not None)
 
         self._nq: int = self._model.nq
         logger.info(
-            "CollisionModel ready: %d DOF%s, %d geometries, %d self pairs, %d static boxes, %d environment pairs",
+            "CollisionModel ready: %d DOF%s, %d geometries, %d self pairs, "
+            "%d static boxes, table=%s, %d environment pairs",
             self._nq,
             " (7 arm + 12 hand)" if hand_dof else "",
             self._collision_model.ngeoms,
             len(self._collision_model.collisionPairs),
             len(self._static_boxes),
+            "calibrated" if self._table is not None else "disabled",
             len(self._environment_collision_model.collisionPairs),
         )
 
@@ -215,6 +246,53 @@ class CollisionModel:
             "size_xyz_m": size.copy(),
             "quat_wxyz": quat.copy(),
         }
+
+    @classmethod
+    def _normalize_table(cls, table: Any | None) -> dict[str, Any] | None:
+        """Validate and normalize a calibrated table configuration."""
+        if table is None or not bool(cls._box_value(table, "enabled")):
+            return None
+        plane = np.asarray(cls._box_value(table, "plane_abcd"), dtype=np.float64)
+        size_xy = np.asarray(cls._box_value(table, "size_xy_m"), dtype=np.float64)
+        thickness_m = float(cls._box_value(table, "thickness_m"))
+        soft_clearance_m = float(cls._box_value(table, "soft_clearance_m"))
+        allowed = tuple(str(name) for name in cls._box_value(table, "allowed_contact_links"))
+        if plane.shape != (4,) or size_xy.shape != (2,):
+            raise ValueError("table plane_abcd and size_xy_m shapes are invalid")
+        if not np.all(np.isfinite(np.concatenate((plane, size_xy)))):
+            raise ValueError("table plane and size must be finite")
+        normal_norm = float(np.linalg.norm(plane[:3]))
+        if normal_norm <= 1e-9:
+            raise ValueError("table plane normal must be non-zero")
+        normal = plane[:3] / normal_norm
+        d_normalized = float(plane[3] / normal_norm)
+        if normal[2] <= 0.0:
+            normal = -normal
+            d_normalized = -d_normalized
+        if np.any(size_xy <= 0.0) or not np.isfinite(thickness_m) or thickness_m <= 0.0:
+            raise ValueError("table size and thickness must be finite and positive")
+        if not np.isfinite(soft_clearance_m) or soft_clearance_m < 0.0:
+            raise ValueError("table soft clearance must be finite and non-negative")
+        return {
+            "normal": normal,
+            "surface_origin": -d_normalized * normal,
+            "size_xyz_m": np.array([size_xy[0], size_xy[1], thickness_m], dtype=np.float64),
+            "thickness_m": thickness_m,
+            "soft_clearance_m": soft_clearance_m,
+            "allowed_contact_links": frozenset(allowed),
+        }
+
+    @staticmethod
+    def _table_rotation(normal: np.ndarray) -> np.ndarray:
+        """Return a stable local-box orientation whose +Z axis is *normal*."""
+        reference = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        local_x = reference - float(np.dot(reference, normal)) * normal
+        if float(np.linalg.norm(local_x)) < 1e-6:
+            reference = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            local_x = reference - float(np.dot(reference, normal)) * normal
+        local_x /= np.linalg.norm(local_x)
+        local_y = np.cross(normal, local_x)
+        return np.column_stack((local_x, local_y, normal))
 
     @staticmethod
     def _quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -378,11 +456,49 @@ class CollisionModel:
 
     @property
     def has_static_environment(self) -> bool:
-        return bool(self._static_boxes)
+        return self._environment_obstacle_count > 0
+
+    @property
+    def has_table(self) -> bool:
+        return self._table is not None
+
+    @property
+    def table_soft_clearance_m(self) -> float:
+        return 0.0 if self._table is None else float(self._table["soft_clearance_m"])
+
+    @property
+    def table_normal(self) -> np.ndarray:
+        if self._table is None:
+            raise RuntimeError("calibrated table geometry is disabled")
+        return np.asarray(self._table["normal"], dtype=np.float64).copy()
+
+    def minimum_table_distance(self, qpos: np.ndarray) -> float:
+        """Return the minimum mesh-to-table distance over non-allowed links."""
+        if self._table is None or not self._table_pair_indices:
+            raise RuntimeError("calibrated table geometry is disabled")
+        full_qpos = self._to_full_qpos(qpos)
+        self._pin.forwardKinematics(self._model, self._data, full_qpos)
+        self._pin.updateGeometryPlacements(
+            self._model,
+            self._data,
+            self._environment_collision_model,
+            self._environment_collision_data,
+        )
+        minimum_m = float("inf")
+        for pair_index in self._table_pair_indices:
+            result = self._pin.computeDistance(
+                self._environment_collision_model,
+                self._environment_collision_data,
+                pair_index,
+            )
+            minimum_m = min(minimum_m, float(result.min_distance))
+        if not np.isfinite(minimum_m):
+            raise RuntimeError("table distance query returned a non-finite value")
+        return minimum_m
 
     def check_environment_collision(self, qpos: np.ndarray) -> bool:
         """Return whether robot geometry touches any configured static box."""
-        if not self._static_boxes:
+        if not self.has_static_environment:
             self._to_full_qpos(qpos)  # preserve finite/shape validation
             return False
         full_qpos = self._to_full_qpos(qpos)
@@ -402,7 +518,7 @@ class CollisionModel:
         from .types import CollisionInfo, CollisionPair
 
         full_qpos = self._to_full_qpos(qpos)
-        if not self._static_boxes:
+        if not self.has_static_environment:
             return CollisionInfo.no_collision()
         self._pin.forwardKinematics(self._model, self._data, full_qpos)
         self._pin.updateGeometryPlacements(
@@ -540,6 +656,19 @@ class CollisionModel:
 
     def _user_hand_to_urdf(self, hand_qpos: np.ndarray, name: str) -> np.ndarray:
         return self._validate_vector(hand_qpos, _HAND_DOF_COUNT, name)[list(_HAND_USER_TO_URDF)]
+
+    def action_qpos_to_model(self, qpos: np.ndarray) -> np.ndarray:
+        """Convert gate action order (arm + SDK hand) to model joint order."""
+        values = np.asarray(qpos, dtype=np.float64)
+        if self._hand_dof and values.shape == (7 + _HAND_DOF_COUNT,):
+            arm_qpos = self._validate_vector(values[:7], 7, "arm_qpos")
+            hand_qpos = self._user_hand_to_urdf(values[7:], "hand_qpos")
+            return np.concatenate((arm_qpos, hand_qpos))
+        return self._to_full_qpos(values)
+
+    def check_action_collision(self, qpos: np.ndarray) -> bool:
+        """Check a gate action whose hand joints use native SDK order."""
+        return self.check_collision(self.action_qpos_to_model(qpos))
 
     # ------------------------------------------------------------------
     # Helpers

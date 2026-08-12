@@ -503,9 +503,9 @@ class TAGHandRetargeter:
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
 
         # ── Merge driver-enforced joint limits ───────────────────────────
-        # URDF limits are used as NLopt bounds, but the XHand driver silently
-        # clamps qpos to its own [qpos_min, qpos_max] (anti-clogging margins).
-        # For 5 distal joints the driver lower bound is more restrictive than
+        # URDF limits are used as NLopt bounds, while the XHand command boundary
+        # rejects targets outside [qpos_min, qpos_max] (anti-clogging margins).
+        # For five distal joints the command lower bound is more restrictive than
         # the URDF (thumb_rota_j2: +10°, index/mid/ring/pinky_j2: +5°).
         # Passing the intersection to the optimizer prevents it from proposing
         # unreachable angles that would cause FK-predicted ≠ actual fingertip positions.

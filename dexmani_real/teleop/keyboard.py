@@ -13,10 +13,15 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 logger = get_logger(__name__)
+
+# stop() disables callbacks synchronously.  A Linux/XRecord backend thread may
+# remain blocked until another input event wakes it, so do not add seconds of
+# user-visible shutdown latency waiting for a daemon-thread bookkeeping state.
+_LISTENER_STOP_TIMEOUT_S = 0.25
 
 __all__ = [
     "ControlSignal",
@@ -67,15 +72,45 @@ def _suppress_terminal_echo() -> list[Any] | None:
 
 
 def _restore_terminal_echo(saved: list[Any] | None) -> None:
-    """Restore terminal attributes saved by :func:`_suppress_terminal_echo`."""
+    """Restore terminal attributes and discard canonical input typed meanwhile."""
     if saved is None:
         return
     try:
         import termios
 
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+        # pynput receives events globally while the terminal's canonical input
+        # queue independently accumulates the same characters.  TCSAFLUSH
+        # restores the saved attributes after draining output and atomically
+        # discards that unread input, preventing it from reaching the shell.
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, saved)
     except (termios.error, OSError):
         logger.warning("terminal echo restoration failed", exc_info=True)
+
+
+def _stop_listener_bounded(listener: Any, *, label: str) -> bool:
+    """Request pynput shutdown without treating a slow daemon join as a fault."""
+    if listener is None:
+        return True
+    try:
+        listener.stop()
+        listener.join(timeout=_LISTENER_STOP_TIMEOUT_S)
+        alive = bool(listener.is_alive())
+    except Exception:
+        logger.warning("%s listener shutdown raised", label, exc_info=True)
+        return False
+    if alive:
+        # pynput's Linux backend may remain blocked in its native event wait
+        # after stop() even though callbacks have been disabled.  It is a
+        # daemon thread; terminal restoration/flush below is the user-visible
+        # shutdown boundary, so this is diagnostic rather than a robot fault.
+        logger.debug(
+            "%s listener backend did not confirm exit within %.1fs; "
+            "terminal input will still be restored and flushed",
+            label,
+            _LISTENER_STOP_TIMEOUT_S,
+        )
+        return False
+    return True
 
 
 class KeyboardHandler:
@@ -217,15 +252,8 @@ class KeyboardHandler:
         listener = self._listener
         self._running = False
         try:
-            if listener is not None:
-                listener.stop()
-                listener.join(timeout=1.0)
-                if listener.is_alive():
-                    logger.error("keyboard listener did not stop within 1s")
-                else:
-                    self._listener = None
-        except Exception:
-            logger.warning("keyboard listener stop failed", exc_info=True)
+            if _stop_listener_bounded(listener, label="keyboard"):
+                self._listener = None
         finally:
             with self._lock:
                 self._buffer.clear()
@@ -421,15 +449,8 @@ class GlobalKeyState:
         listener = self._listener
         self._running = False
         try:
-            if listener is not None:
-                listener.stop()
-                listener.join(timeout=1.0)
-                if listener.is_alive():
-                    logger.error("global keyboard listener did not stop within 1s")
-                else:
-                    self._listener = None
-        except Exception:
-            logger.warning("global keyboard listener stop failed", exc_info=True)
+            if _stop_listener_bounded(listener, label="global keyboard"):
+                self._listener = None
         finally:
             with self._lock:
                 self._keys.clear()
@@ -438,6 +459,23 @@ class GlobalKeyState:
             if self._suppress_echo:
                 _restore_terminal_echo(self._saved_termios)
                 self._saved_termios = None
+
+    def quiesce(self) -> None:
+        """Disable external callbacks while retaining capture through shutdown."""
+        self._estop_callback = None
+        with self._lock:
+            self._events.clear()
+
+    def wait_for_release(self, timeout_s: float = 2.0) -> bool:
+        """Wait boundedly for tracked keys to be released before stopping capture."""
+        deadline_s = time.monotonic() + timeout_s
+        while time.monotonic() < deadline_s:
+            with self._lock:
+                if not self._keys:
+                    return True
+            time.sleep(0.01)
+        with self._lock:
+            return not self._keys
 
     def start(self) -> None:
         """Synchronously create and start the global listener."""
@@ -454,7 +492,15 @@ class GlobalKeyState:
             self._saved_termios = _suppress_terminal_echo()
         try:
             on_press, on_release = self._callbacks(keyboard)
-            listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            # Do not request pynput's X11-wide keyboard grab: its RECORD
+            # listener can fail to terminate after an asynchronous device
+            # shutdown.  Terminal echo stays disabled until all workers exit,
+            # then TCSAFLUSH discards the canonical input queue atomically.
+            listener = keyboard.Listener(
+                on_press=on_press,
+                on_release=on_release,
+                suppress=False,
+            )
             self._listener = listener
             listener.start()
             ready = threading.Event()
@@ -498,6 +544,11 @@ class GlobalKeyState:
             return True
         with self._lock:
             return key in self._keys
+
+    def pressed_keys(self) -> tuple[str, ...]:
+        """Return a stable snapshot of currently held keys for diagnostics."""
+        with self._lock:
+            return tuple(sorted(self._keys))
 
     @property
     def healthy(self) -> bool:
@@ -564,7 +615,6 @@ def validate_hand_feedback(
     *,
     connected: bool,
     error_state: bool,
-    qpos_stale: bool,
     state_valid: bool,
     send_healthy: bool,
     read_healthy: bool,
@@ -578,8 +628,6 @@ def validate_hand_feedback(
         return "hand disconnected"
     if error_state:
         return "hand reported a hardware error"
-    if qpos_stale:
-        return "hand joint feedback is stale"
     if not state_valid:
         return "hand state marked invalid"
     if not send_healthy or not read_healthy:
@@ -630,6 +678,9 @@ def eef_delta_from_keys(
         dx[2] += delta_pos
     if keys.is_pressed("down"):
         dx[2] -= delta_pos
+    dx_norm = float(np.linalg.norm(dx))
+    if dx_norm > delta_pos:
+        dx *= delta_pos / dx_norm
 
     drpy = np.zeros(3, dtype=np.float64)
     if keys.is_pressed("left"):
@@ -644,5 +695,8 @@ def eef_delta_from_keys(
         drpy[2] -= delta_rpy
     if keys.is_pressed("l"):
         drpy[2] += delta_rpy
+    drpy_norm = float(np.linalg.norm(drpy))
+    if drpy_norm > delta_rpy:
+        drpy *= delta_rpy / drpy_norm
 
     return dx, drpy

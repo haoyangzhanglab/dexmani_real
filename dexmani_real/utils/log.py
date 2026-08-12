@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-__all__ = ["get_logger", "ThrottledWarner"]
+__all__ = [
+    "CapturedProcessOutput",
+    "capture_native_stdout",
+    "extract_native_diagnostics",
+    "get_logger",
+    "ThrottledWarner",
+]
 
+import ctypes
 import logging
 import os
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 _FORMATTER = logging.Formatter(
     "[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
@@ -63,6 +73,78 @@ def get_logger(name: str) -> logging.Logger:
 # throttled warnings share the same [timestamp] [level] [name] format as
 # every other log message in the project.
 _logger = get_logger(__name__)
+
+
+@dataclass
+class CapturedProcessOutput:
+    """Text emitted to process stdout inside ``capture_native_stdout``."""
+
+    text: str = ""
+
+
+def _flush_process_stdout() -> None:
+    """Flush Python and C stdio before changing/restoring file descriptor 1."""
+    try:
+        sys.stdout.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        ctypes.CDLL(None).fflush(None)
+    except (AttributeError, OSError):
+        pass
+
+
+@contextmanager
+def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
+    """Capture Python/C/C++ stdout for one bounded vendor-SDK operation.
+
+    The redirection is process-wide, so callers must use it only during device
+    initialization, never inside a live control loop.  The captured text is
+    made available after the context exits so successful SDK chatter can be
+    discarded while a failed operation can still replay its diagnostics.
+    """
+    captured = CapturedProcessOutput()
+    try:
+        stdout_fd = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        yield captured
+        return
+
+    saved_fd: int | None = None
+    sink = None
+    try:
+        saved_fd = os.dup(stdout_fd)
+        sink = tempfile.TemporaryFile(mode="w+b")
+        _flush_process_stdout()
+        os.dup2(sink.fileno(), stdout_fd)
+    except OSError:
+        if sink is not None:
+            sink.close()
+        if saved_fd is not None:
+            os.close(saved_fd)
+        yield captured
+        return
+
+    assert saved_fd is not None and sink is not None
+    try:
+        yield captured
+    finally:
+        _flush_process_stdout()
+        os.dup2(saved_fd, stdout_fd)
+        os.close(saved_fd)
+        sink.seek(0)
+        captured.text = sink.read().decode("utf-8", errors="replace").strip()
+        sink.close()
+
+
+def extract_native_diagnostics(text: str, *, ignore: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Return suspicious vendor-output lines while dropping known chatter."""
+    markers = ("error", "fail", "exception", "traceback", "permission", "unknown", "unknow", "compare_time")
+    return tuple(
+        line
+        for line in (value.strip() for value in text.splitlines())
+        if line and not any(token in line for token in ignore) and any(marker in line.lower() for marker in markers)
+    )
 
 
 class ThrottledWarner:

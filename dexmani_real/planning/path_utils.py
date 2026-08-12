@@ -18,6 +18,26 @@ if TYPE_CHECKING:
 _PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
 
+def _table_clearance_m(
+    planner: "XArm7MotionPlanner",
+    arm_qpos: np.ndarray,
+    *,
+    table_z_surface_m: float | None,
+    hand_safety_margin_m: float,
+) -> tuple[float, float, str]:
+    """Return ``(clearance, raw_measurement, source)`` for one arm pose."""
+    collision_model = planner.collision_model
+    if bool(getattr(collision_model, "has_table", False)):
+        distance_m = float(collision_model.minimum_table_distance(arm_qpos))
+        clearance_m = distance_m - float(collision_model.table_soft_clearance_m)
+        return clearance_m, distance_m, "calibrated_mesh_distance"
+    if table_z_surface_m is None:
+        return float("inf"), float("inf"), "disabled"
+    hand_min_z_m = float(collision_model.minimum_hand_frame_z(arm_qpos))
+    clearance_m = hand_min_z_m - hand_safety_margin_m - table_z_surface_m
+    return clearance_m, hand_min_z_m, "legacy_hand_frame_proxy"
+
+
 def interpolate_waypoints(path: np.ndarray, max_step: float) -> np.ndarray:
     """Linearly densify a sparse joint path so each step ≤ max_step rad.
 
@@ -124,16 +144,15 @@ def plan_joint_home_path(
         home_qpos:          Target home joint positions (7,).
         planner:            Planner with collision model.  When None, only
                             joint-limit-aware wrapping is performed.
-        table_z_surface_m:  Table top Z in arm-base frame (metres).  When
-                            provided, the lowest XHand link-frame origin is
-                            checked at every waypoint using the cached real hand
-                            posture. This complements robot self-collision;
-                            the table is not part of the SRDF model.
+        table_z_surface_m:  Legacy fixed-Z fallback used only when the planner
+                            has no calibrated table geometry.  With
+                            ``environment.table`` enabled, every waypoint uses
+                            exact robot-mesh distance to the tilted table box.
         hand_safety_margin_m:
                             Conservative padding from link-frame origins to the
                             lowest hand collision surface.
                             Defaults to ``arm.hand_safety_margin_m`` (0.05 m)
-                            when ``None``.  Used with *table_z_surface_m*.
+                            when ``None``. Used only by the fixed-Z fallback.
         report:             Optional mutable diagnostics dictionary. It is
                             cleared and populated with every attempted path and
                             its first rejection reason.
@@ -171,7 +190,9 @@ def plan_joint_home_path(
         return None  # caller can send home_qpos directly
 
     have_collision = planner is not None and planner.planning_profile.check_self_collision
-    _check_table = table_z_surface_m is not None and planner is not None
+    _check_table = planner is not None and (
+        bool(getattr(planner.collision_model, "has_table", False)) or table_z_surface_m is not None
+    )
 
     def _check_safe(path: np.ndarray, candidate_name: str) -> bool:
         candidate: dict[str, Any] = {
@@ -225,15 +246,21 @@ def plan_joint_home_path(
                 candidate.update(safe=False, reason="workspace_check_error", detail=str(exc))
                 return False
 
-        # ── Table clearance check (orientation-aware hand link frames) ──
-        # The collision model supplies the lowest XHand link-frame origin for
-        # the actual cached hand pose.  The margin covers mesh extent below a
-        # frame origin; this avoids the old, orientation-blind EEF-z estimate.
+        # ── Table clearance check ─────────────────────────────────────
+        # Prefer the calibrated, tilted table box and exact mesh distance.
+        # The fixed-Z hand-frame proxy remains only as a compatibility fallback
+        # for planners constructed without calibrated table geometry.
         if _check_table:
             _minimum_clearance_m = float("inf")
+            _table_samples: list[tuple[int, float, float, str]] = []
             for _waypoint_index, _wp in enumerate(path):
                 try:
-                    _hand_min_z = planner.collision_model.minimum_hand_frame_z(_wp)  # type: ignore[union-attr]
+                    _clearance_m, _raw_table_measurement_m, _table_source = _table_clearance_m(
+                        planner,  # type: ignore[arg-type]
+                        _wp,
+                        table_z_surface_m=table_z_surface_m,
+                        hand_safety_margin_m=float(hand_safety_margin_m),
+                    )
                 except Exception as exc:
                     candidate.update(
                         safe=False,
@@ -242,24 +269,44 @@ def plan_joint_home_path(
                         detail=str(exc),
                     )
                     return False  # FK/frame failure → treat as unsafe
-                if not np.isfinite(_hand_min_z):
+                if not np.isfinite(_clearance_m):
                     candidate.update(
                         safe=False,
                         reason="table_check_nonfinite",
                         table_waypoint_index=_waypoint_index,
                     )
                     return False
-                _clearance_m = _hand_min_z - hand_safety_margin_m - table_z_surface_m  # type: ignore[operator]
                 _minimum_clearance_m = min(_minimum_clearance_m, _clearance_m)
-                if _clearance_m < 0.0:
+                _table_samples.append(
+                    (_waypoint_index, _clearance_m, _raw_table_measurement_m, _table_source)
+                )
+            _negative = [sample for sample in _table_samples if sample[1] < 0.0]
+            if _negative:
+                _starts_inside_soft_zone = _table_samples[0][1] < 0.0
+                _negative_is_initial_prefix = all(sample[0] == index for index, sample in enumerate(_negative))
+                _monotonic_escape = all(
+                    current[1] >= previous[1] - 5e-4
+                    for previous, current in zip(_table_samples[:-1], _table_samples[1:])
+                    if previous[1] < 0.0
+                )
+                _reaches_clearance = _table_samples[-1][1] >= 0.0
+                if not (
+                    _starts_inside_soft_zone
+                    and _negative_is_initial_prefix
+                    and _monotonic_escape
+                    and _reaches_clearance
+                ):
+                    _bad = _negative[0]
                     candidate.update(
                         safe=False,
                         reason="table_clearance",
-                        table_waypoint_index=_waypoint_index,
-                        hand_frame_min_z_m=float(_hand_min_z),
-                        clearance_m=float(_clearance_m),
+                        table_waypoint_index=_bad[0],
+                        table_check_source=_bad[3],
+                        table_raw_measurement_m=float(_bad[2]),
+                        clearance_m=float(_bad[1]),
                     )
-                    return False  # hand may collide with table
+                    return False
+                candidate["table_soft_escape"] = True
             candidate["minimum_table_clearance_m"] = _minimum_clearance_m
         candidate["safe"] = True
         return True
@@ -387,7 +434,9 @@ def plan_band_alignment_path(
     path = interpolate_waypoints(np.stack([wrapped_home, canonical_home]), np.deg2rad(1.0))
 
     have_collision = planner is not None and planner.planning_profile.check_self_collision
-    _check_table = table_z_surface_m is not None and planner is not None
+    _check_table = planner is not None and (
+        bool(getattr(planner.collision_model, "has_table", False)) or table_z_surface_m is not None
+    )
 
     # ── Safety checks (same as plan_joint_home_path._check_safe) ──
     if have_collision:
@@ -415,12 +464,17 @@ def plan_band_alignment_path(
     if _check_table:
         for _wp in path:
             try:
-                _hand_min_z = planner.collision_model.minimum_hand_frame_z(_wp)  # type: ignore[union-attr]
+                _clearance_m, _, _ = _table_clearance_m(
+                    planner,  # type: ignore[arg-type]
+                    _wp,
+                    table_z_surface_m=table_z_surface_m,
+                    hand_safety_margin_m=float(hand_safety_margin_m),
+                )
             except Exception:
                 return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
-            if not np.isfinite(_hand_min_z):
+            if not np.isfinite(_clearance_m):
                 return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
-            if _hand_min_z - hand_safety_margin_m < table_z_surface_m:  # type: ignore[operator]
+            if _clearance_m < 0.0:
                 return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
 
     return np.stack([wrapped_home, canonical_home])

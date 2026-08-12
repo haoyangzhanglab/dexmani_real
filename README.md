@@ -61,7 +61,8 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 
 ```text
 camera ────────┐
-VR ────────────┼──► teleop / policy ──► arm queue ──► arm worker
+VR ────────────┼──► teleop / policy ──► arm endpoint/HOME queue ──► arm worker
+                           │              └──► priority STOP/RESUME ring ───┘
 arm state ─────┤          │
 hand state ────┤          └────────────► hand ring ──► hand worker
                │
@@ -73,6 +74,7 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 | 通道 | 语义 | 关键约束 |
 |---|---|---|
 | 臂动作队列 | 有序、短队列的未来关节目标 | `maxsize=2` 的反压是有意设计 |
+| 臂控制环 | 松键 STOP 与显式 RESUME | 固定 dtype、latest-wins，worker 优先于端点队列读取 |
 | 手动作环 | 最新目标覆盖旧目标 | latest-wins，避免手部控制滞后 |
 | 状态环 | 相机、VR、臂、手的共享快照 | seqlock 验证读，跨进程不传可变对象图 |
 | 录制采样环 | 对齐后的机器人、动作与传感器样本 | 固定为 `1 / control_hz` 网格，不以到达时间采样 |
@@ -82,7 +84,7 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 | 使用场景 | 入口 | 主要调用链 |
 |---|---|---|
 | VR 采集 | `examples/collect_teleop.py` | `teleop/loop.py` → `planning/`、`robot/`、`recording/`（实验生命周期自包含在 examples 中）|
-| 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 安全动作协议 |
+| 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → State-6 松键刹停 / 实测位姿显式恢复协议 → 安全动作协议 |
 | 实验性学习策略 | `examples/deploy_policy.py` | 自包含入口 → `inference_process.py` → `learned_coordinator.py`（部署生命周期自包含在 examples 中）|
 | Episode 回放 | `examples/replay_episode.py` | — | Self-contained script; dry-run by default; `--live` reruns dense preflight |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
@@ -138,7 +140,7 @@ python -m compileall -q dexmani_real examples
 | 文件 | 作用 |
 |---|---|
 | `planning/__init__.py` | 导出规划器、位姿和规划配置/运行 profile。 |
-| `planning/collision_model.py` | 基于 Pinocchio 的 xArm7+XHand 自碰撞/环境碰撞模型，加载统一 SRDF 过滤规则并提供路径段检测。 |
+| `planning/collision_model.py` | 基于 Pinocchio 的 xArm7+XHand 自碰撞/环境碰撞模型；把标定桌面构造成倾斜碰撞几何，允许基座安装接触，并提供真实网格距离与路径段检测。 |
 | `planning/constants.py` | 集中定义 XHand SDK 关节序与 URDF/Pinocchio 关节序之间的重排常量。 |
 | `planning/hand_kinematics.py` | 用 Pinocchio 计算手部正向运动学和五指指尖位置，并处理关节顺序重映射。 |
 | `planning/ik.py` | 遥操作位置 IK 求解器：确定性种子、快速接受、多候选回退、误差/碰撞检查与零空间优化。 |
@@ -153,7 +155,7 @@ python -m compileall -q dexmani_real examples
 
 | 文件 | 作用 |
 |---|---|
-| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→速度钳制→碰撞→工作空间；send_command 即发即弃发布；planner_action_safety_gate 工厂；publish_joint_targets 便捷包装；hand_home_converge。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→整包速度包络接受/拒绝→碰撞→工作空间；手部速度以前一条已接受命令为基准，不使用执行误差，也不裁剪 action；机械臂 STOP/RESUME 使用不与两槽端点队列争用容量的高优先级固定 dtype 环；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/inference_process.py` | 隔离推理 worker，加载 adapter，编解码单个当前 tick 候选动作，并验证模型输出是否满足策略契约。 |
 | `policy/learned_coordinator.py` | 以单一时钟协调 observation、当前 tick 推理结果、动作执行和退出前 hold 的学习策略控制环。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
@@ -191,12 +193,12 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `robot/__init__.py` | 标识 xArm7、XHand 驱动和执行 worker 所在包。 |
-| `robot/arm_loop.py` | xArm Mode 6 伺服 worker：读取有序臂命令、发布 FK 状态、处理 C24 恢复与碰撞故障。 |
-| `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、发布关节/触觉反馈，并检测跟踪停滞。 |
+| `robot/arm_loop.py` | xArm Mode 6 伺服 worker：读取有序臂命令、执行带 ACK 的 State 6 减速停止（兼容固件上报 State 5/6）、发布 FK 状态，并处理 C24 恢复与碰撞故障；成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
+| `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、复核命令/机械限位、发布关节/触觉反馈与最后成功 action ID；不以目标—反馈不收敛判定故障。 |
 | `robot/homing.py` | 执行并验证机械臂回零，包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
 | `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `utils/schema.py` 决定。 |
-| `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放。 |
+| `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放；超过运行或厂商机械限位的命令整条拒绝，绝不隐式 clip，运行配置只能收紧而不能放宽额定机械包络；成功初始化时汇总原生 SDK 噪声，连接失败时回放完整诊断。 |
 
 ### `runtime/` — 进程生命周期与状态码
 
@@ -237,12 +239,12 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/config.py` | 汇集遥操作控制环所需的强类型配置。 |
 | `teleop/control_state.py` | 表示控制 hold 与回零交接状态，统一记录控制环暂停原因。 |
 | `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop/held 样本。 |
-| `teleop/hand_control.py` | 从手部重定向结果生成平滑、限幅、可回零的 XHand 指令。 |
+| `teleop/hand_control.py` | 校验手部重定向结果的有限值、关节限位和命令间增量；返回原目标或整条拒绝，不做末端 clip。 |
 | `teleop/hand_retarget.py` | 校验手部 landmarks，并提供启发式 XHand 和 TAG 优化两类手部重定向器。 |
-| `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量。 |
+| `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
 | `teleop/recording_session.py` | 处理退出时的保存、丢弃和停机决策。 |
-| `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、hold 后反馈、无碰撞转移、接触停滞与回零流程。 |
+| `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、arm-only hold、无碰撞转移、接触停滞与回零流程；return-home 逐条确认有界 hand-home 里程碑已被 SDK 接受，但不等待手指角度收敛。 |
 | `teleop/snapshot.py` | 从共享环读取同一因果锚点附近的臂、手、VR、触觉、相机快照，并跟踪相机新鲜度。 |
 | `teleop/tag_retargeting/__init__.py` | 导出 TAG 两阶段手部重定向的优化器与 Pinocchio 梯度计算器。 |
 | `teleop/tag_retargeting/optimizer.py` | 使用 NLopt 执行 TAG 手部两阶段优化，平衡指尖目标、关节限制与平滑性。 |
@@ -270,7 +272,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 |---|---|---|
 | `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
 | `examples/deploy_policy.py` | — | 实验性学习策略入口；部署生命周期自包含；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
-| `examples/keyboard_teleop.py` | — | 以键盘驱动机械臂、默认使用实测 XHand 反馈的自包含入口；硬件相关。 |
+| `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键会使旧 generation 失效，并请求固件 State 6 减速停止，待 worker ACK 和连续两帧低速反馈后用实测位置重建参考，不发布可能导致反向回弹的滞后 hold 终点；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
 | `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
@@ -285,7 +287,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 |---|---|
 
 | `dexmani_real/config/cameras.json` | 物理相机序列号、类型和外参，是运行时校验的一部分。 |
-| `dexmani_real/config/desk_plane.json` | 点云工作空间使用的桌面平面运行数据。 |
+| `dexmani_real/config/desk_plane.json` | 点云过滤、在线动作安全与回零路径共同使用的桌面平面标定数据。 |
 | `dexmani_real/config/vr_transform.json` | VR 朝向标定得到的坐标变换运行数据。 |
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
 | `CLAUDE.md` | 更详细的架构、运行流程、安全/碰撞、录制 schema 与运维背景。 |

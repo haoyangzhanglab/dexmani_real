@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import IntEnum
 
 import numpy as np
 
@@ -16,7 +17,9 @@ from dexmani_real.utils.schema import (
 )
 
 
-def _validate_field_shapes(instance: object, specs: list[tuple[str, tuple[int, ...]]]) -> None:
+def _validate_field_shapes(
+    instance: object, specs: list[tuple[str, tuple[int, ...]]]
+) -> None:
     """Validate present NumPy-compatible fields against expected shapes."""
     cls_name = type(instance).__name__
     for field_name, expected_shape in specs:
@@ -25,7 +28,46 @@ def _validate_field_shapes(instance: object, specs: list[tuple[str, tuple[int, .
             continue
         arr = np.asarray(val)
         if arr.shape != expected_shape:
-            raise ValueError(f"{cls_name}.{field_name} shape mismatch: expected {expected_shape}, got {arr.shape}")
+            raise ValueError(
+                f"{cls_name}.{field_name} shape mismatch: expected {expected_shape}, got {arr.shape}"
+            )
+
+
+class ArmControlKind(IntEnum):
+    """Non-endpoint commands carried by the priority arm control ring."""
+
+    DECELERATED_STOP = 1
+    RESUME = 2
+
+
+@dataclass(frozen=True)
+class ArmControlRequest:
+    """Documentation model for one fixed-dtype arm control request."""
+
+    kind: ArmControlKind
+    run_generation: int
+    action_id: int
+    created_monotonic_ns: int
+    valid_until_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ArmControlKind):
+            raise ValueError("ArmControlRequest.kind must be an ArmControlKind")
+        integer_fields = (
+            self.run_generation,
+            self.action_id,
+            self.created_monotonic_ns,
+            self.valid_until_monotonic_ns,
+        )
+        if any(
+            not isinstance(value, (int, np.integer)) or int(value) <= 0
+            for value in integer_fields
+        ):
+            raise ValueError(
+                "ArmControlRequest metadata must contain positive integers"
+            )
+        if self.valid_until_monotonic_ns <= self.created_monotonic_ns:
+            raise ValueError("ArmControlRequest validity must end after creation")
 
 
 @dataclass
@@ -47,12 +89,20 @@ class RobotState:
 
     # ── Tactile ──
     hand_tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
-    hand_tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified
-    hand_tactile_contact: np.ndarray  # (5,) bool — per-finger contact detection (from detect_contact)
+    hand_tactile_force: (
+        np.ndarray
+    )  # (5,120,3) float64 — SDK-scaled, physical unit unverified
+    hand_tactile_contact: (
+        np.ndarray
+    )  # (5,) bool — per-finger contact detection (from detect_contact)
     hand_tipboard_err: np.ndarray  # (12,) int32 — tip board error registers per joint
     hand_commboard_err: np.ndarray  # (12,) int32 — comm board error registers per joint
-    hand_jointboard_err: np.ndarray  # (12,) int32 — joint motor-driver board error registers per joint
-    hand_qpos_stale: bool  # True when hand_qpos frozen despite active cmd (driver board lockout)
+    hand_jointboard_err: (
+        np.ndarray
+    )  # (12,) int32 — joint motor-driver board error registers per joint
+    # Reserved v16 compatibility flag. Normal contact/non-convergence is not a
+    # freshness fault; runtime health uses timestamps and read/state validity.
+    hand_qpos_stale: bool
 
     # ── Derived (chained FK) ──
     fingertip_pos: np.ndarray  # (5,3) float64  m (world frame)
@@ -65,13 +115,17 @@ class RobotState:
     # ── Hand motor current (optional, for safety gating) ──
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
-    hand_error_state: bool = False  # True when hand reports hardware errors (board faults)
+    hand_error_state: bool = (
+        False  # True when hand reports hardware errors (board faults)
+    )
 
     arm_last_cmd_seq: int = 0
     arm_last_cmd_queue_latency_s: float = 0.0  # producer -> arm queue receive
     arm_last_cmd_apply_latency_s: float = 0.0  # producer -> successful SDK return
     arm_last_cmd_sdk_duration_s: float = 0.0  # duration of set_servo_angle()
-    arm_last_cmd_is_hold: bool = False  # release-edge/hold command rather than motion intent
+    arm_last_cmd_is_hold: bool = (
+        False  # fixed hold or STOP/RESUME control, not a motion endpoint
+    )
 
     def __post_init__(self):
         _validate_field_shapes(

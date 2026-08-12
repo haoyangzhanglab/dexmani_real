@@ -21,19 +21,28 @@ def _sanitize_hand_command(
     upper: np.ndarray,
     max_delta_rad: float | None,
 ) -> np.ndarray:
-    """Validate, limit, and rate-limit the target sent to the hand worker."""
+    """Validate one hand target without modifying any joint endpoint."""
     command = np.asarray(hand_cmd, dtype=np.float64)
     previous = np.asarray(previous_hand_cmd, dtype=np.float64)
+    lower_bound = np.asarray(lower, dtype=np.float64)
+    upper_bound = np.asarray(upper, dtype=np.float64)
     if command.shape != HAND_JOINT_SHAPE or previous.shape != HAND_JOINT_SHAPE:
         raise ValueError(f"hand commands must have shape {HAND_JOINT_SHAPE}, got {command.shape} and {previous.shape}")
-    if not np.all(np.isfinite(command)) or not np.all(np.isfinite(previous)):
+    if lower_bound.shape != HAND_JOINT_SHAPE or upper_bound.shape != HAND_JOINT_SHAPE:
+        raise ValueError(f"hand command limits must have shape {HAND_JOINT_SHAPE}")
+    if not np.all(np.isfinite(np.concatenate((command, previous, lower_bound, upper_bound)))):
         raise ValueError("hand command contains NaN or Inf")
-    command = np.clip(command, lower, upper)
+    if np.any(lower_bound > upper_bound):
+        raise ValueError("hand command limits must be ordered")
+    limit_tolerance_rad = 1e-12
+    if np.any(command < lower_bound - limit_tolerance_rad) or np.any(command > upper_bound + limit_tolerance_rad):
+        raise ValueError("hand command violates joint limits")
     if max_delta_rad is not None:
         if not np.isfinite(max_delta_rad) or max_delta_rad <= 0:
             raise ValueError("hand_max_delta_rad must be finite and > 0")
-        command = previous + np.clip(command - previous, -max_delta_rad, max_delta_rad)
-    return command
+        if np.any(np.abs(command - previous) > max_delta_rad + 1e-12):
+            raise ValueError("hand command violates command-to-command delta limit")
+    return command.copy()
 
 
 def _hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:
