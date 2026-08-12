@@ -150,9 +150,8 @@ def _recording_provenance(
     if observation_id <= 0:
         observation_id = anchor_ns
 
-    # ACK-derived provenance fields are always zero since fire-and-forget
-    # migration (2026-08-12).  The keys are preserved for backward-compatible
-    # episode schema compatibility.
+    # Fire-and-forget worker status is not recorded: there is no ACK path to
+    # make those values meaningful on this control tick.
     tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
     tactile_fresh = (
         _field(hand_tactile, "fresh") == 1
@@ -181,32 +180,12 @@ def _recording_provenance(
         "observation_valid": observation_valid,
         "observation_skew_s": float(np.nanmax(skew_s, initial=0.0)),
         "action_id": action_id,
-        "action_chunk_id": action_candidate.chunk_id if action_candidate is not None else 0,
-        "action_step_index": action_candidate.step_index if action_candidate is not None else 0,
         "action_created_monotonic_ns": action_candidate.created_monotonic_ns if action_candidate is not None else 0,
         "action_target_monotonic_ns": action_candidate.target_monotonic_ns if action_candidate is not None else 0,
         "action_valid_until_monotonic_ns": (
             action_candidate.valid_until_monotonic_ns if action_candidate is not None else 0
         ),
         "action_queued": action_candidate is not None,
-        "action_committed": action_candidate is not None,
-        "arm_ack_status": 0,
-        "hand_ack_status": 0,
-        "arm_ack_reject_reason": 0,
-        "hand_ack_reject_reason": 0,
-        "arm_ack_sdk_code": 0,
-        "hand_ack_sdk_code": 0,
-        "arm_received_monotonic_ns": 0,
-        "hand_received_monotonic_ns": 0,
-        "arm_prepared_monotonic_ns": 0,
-        "hand_prepared_monotonic_ns": 0,
-        "arm_applied_monotonic_ns": 0,
-        "hand_applied_monotonic_ns": 0,
-        "arm_latest_applied_action_id": 0,
-        "hand_latest_applied_action_id": 0,
-        "arm_latest_applied_monotonic_ns": 0,
-        "hand_latest_applied_monotonic_ns": 0,
-        "arm_hand_apply_skew_s": np.nan,
         "tactile_fresh": tactile_fresh,
         "tactile_source_monotonic_ns": tactile_source_ns,
         "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,

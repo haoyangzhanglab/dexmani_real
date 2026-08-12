@@ -55,7 +55,7 @@ def _seqlock_to_logical(marker: int) -> int:
 logger = get_logger(__name__)
 
 # Torn-read warning throttle: at most one warning per 5 s per buffer.
-# Shared by CameraRingBuffer and SeqlockRingBuffer.
+# Shared by CameraRingBuffer and SharedMemoryRingBuffer.
 TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
@@ -335,11 +335,6 @@ class SharedMemoryRingBuffer:
             recovered,
             k,
         )
-
-
-# The explicit name documents the only supported structured-ring semantics.
-# Keep SharedMemoryRingBuffer as a compatibility alias for external imports.
-SeqlockRingBuffer = SharedMemoryRingBuffer
 
 
 class CameraRingBuffer:

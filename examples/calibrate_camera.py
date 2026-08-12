@@ -67,7 +67,7 @@ from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import (
     ActionSafetyGateConfig,
-    advance_policy_epoch,
+    advance_run_generation,
     planner_action_safety_gate,
     publish_joint_targets,
 )
@@ -858,7 +858,7 @@ def _run_calibration(
                 return 1
 
             if quit_requested:
-                advance_policy_epoch(shared)
+                advance_run_generation(shared)
                 published = publish_joint_targets(
                     shared, current_qpos, is_hold=True,
                     prepare_timeout_s=float(policy.action_prepare_timeout_s),

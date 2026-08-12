@@ -119,7 +119,7 @@ class SharedObservationSource:
         self._validate_contract(max_tensor_bytes=max_tensor_bytes)
         self._builder = SnapshotBuilder(
             spec,
-            session_generation=int(shared.session_generation.value),
+            run_generation=int(shared.run_generation.value),
         )
 
     @property
@@ -332,6 +332,10 @@ class SharedObservationSource:
         return frames
 
     def build(self, *, anchor_monotonic_ns: int) -> ObservationSnapshot:
+        # Home, replay, and calibration can invalidate actions outside the
+        # learned coordinator.  Read shared state for every snapshot so the
+        # next inference result can rejoin the active control run.
+        self._builder.run_generation = int(self.shared.run_generation.value)
         frames: dict[str, list[CausalFrame]] = {}
         camera_modalities = [modality for modality in self.spec.modalities if modality.name in _CAMERA_MODALITIES]
         camera_metadata: list[tuple[np.ndarray, int, int]] = []

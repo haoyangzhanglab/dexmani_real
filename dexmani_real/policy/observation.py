@@ -39,9 +39,9 @@ def _readonly(value: Any, dtype: Any) -> np.ndarray:
 class SnapshotBuilder:
     """Select only verified ``source_time <= anchor`` frames for each history slot."""
 
-    def __init__(self, spec: ObservationSpec, *, session_generation: int, camera_generation: int = 0) -> None:
+    def __init__(self, spec: ObservationSpec, *, run_generation: int, camera_generation: int = 0) -> None:
         self.spec = spec
-        self.session_generation = int(session_generation)
+        self.run_generation = int(run_generation)
         self.camera_generation = int(camera_generation)
         self._next_observation_id = 1
 
@@ -149,7 +149,7 @@ class SnapshotBuilder:
             source_monotonic_ns=frozen_map(source_times, np.uint64),
             publish_monotonic_ns=frozen_map(publish_times, np.uint64),
             valid_history_mask=frozen_map(valid_masks, bool),
-            session_generation=self.session_generation,
+            run_generation=self.run_generation,
             camera_generation=self.camera_generation,
             receive_monotonic_ns=frozen_map(receive_times, np.uint64),
             source_age_s=frozen_map(source_ages_s, np.float64),

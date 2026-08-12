@@ -4,7 +4,7 @@
 Spawn-only capability model: VR, teleop, arm, measured hand (unless explicitly
 disabled), camera, and RecorderIO (only when recording is enabled).
 Safety: DISARMED/ARMED/RUNNING/FAULT state machine + enabled-capability heartbeats.
-Recording: one causal configured-rate grid published as HDF5 schema v15.
+Recording: one causal configured-rate grid published as HDF5 schema v16.
 
 The full experiment lifecycle lives here rather than in the ``dexmani_real``
 package — that keeps the package focused on reusable library code and avoids
@@ -276,7 +276,6 @@ def _build_processes(
             max_frames=int(round(policy_config.max_record_seconds * policy_config.control_hz)),
             control_hz=policy_config.control_hz,
             min_frames=int(round(policy_config.min_record_seconds * policy_config.control_hz)),
-            resolved_config_json=runtime.canonical_json,
             resolved_config_sha256=runtime.sha256,
             provenance=provenance,
             writer_queue_size=int(runtime.camera.writer_queue_size),

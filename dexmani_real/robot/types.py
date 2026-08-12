@@ -1,4 +1,4 @@
-"""Core robot data types — RobotState, RobotAction, ArmState, HandState, HandTactile."""
+"""Core robot data types — RobotState, RobotAction."""
 
 from __future__ import annotations
 
@@ -121,63 +121,3 @@ class RobotAction:
                 ("target_eef_rot6d", (6,)),
             ],
         )
-
-
-@dataclass
-class ArmState:
-    """Documentation view of ``utils.schema.ARM_STATE_DTYPE``."""
-
-    qpos: np.ndarray  # (7,)  float64  rad
-    qvel: np.ndarray  # (7,)  float64  rad/s
-    tau: np.ndarray  # (7,)  float64  N·m
-    eef_pos: np.ndarray  # (3,)  float64  m  (FK computed by arm_loop via Pinocchio ArmFK)
-    eef_rot6d: np.ndarray  # (6,)  float64
-    error_code: int
-    connected: bool
-    mode: int
-    tracking_err: float
-    last_cmd_seq: int
-    last_cmd_created_s: float  # producer time.monotonic(), seconds
-    last_cmd_received_s: float  # arm worker time.monotonic(), seconds
-    last_cmd_applied_s: float  # successful SDK return, time.monotonic(), seconds
-    last_cmd_queue_latency_s: float
-    last_cmd_apply_latency_s: float
-    last_cmd_sdk_duration_s: float
-    last_cmd_is_hold: bool
-    source_monotonic_ns: int
-    publish_monotonic_ns: int
-    state_valid: bool
-    timestamp: float
-
-
-@dataclass
-class HandState:
-    """Documentation view of ``utils.schema.HAND_STATE_DTYPE``."""
-
-    qpos: np.ndarray  # (12,) float64  rad
-    current: np.ndarray  # (12,) float64  mA
-    tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
-    tactile_contact: np.ndarray  # (5,) bool
-    error_state: bool
-    connected: bool
-    qpos_stale: bool
-    commboard_err: np.ndarray  # (12,) int32
-    jointboard_err: np.ndarray  # (12,) int32
-    tipboard_err: np.ndarray  # (12,) int32
-    source_monotonic_ns: int
-    publish_monotonic_ns: int
-    state_valid: bool
-    send_healthy: bool
-    read_healthy: bool
-    timestamp: float
-
-
-@dataclass
-class HandTactile:
-    """Documentation view of ``utils.schema.HAND_TACTILE_DTYPE``."""
-
-    tactile_force: np.ndarray  # (5,120,3) float64 — SDK-scaled, physical unit unverified
-    source_monotonic_ns: int
-    fresh: bool
-    calibrated: bool
-    unit_code: int

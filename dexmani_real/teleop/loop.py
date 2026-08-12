@@ -18,7 +18,7 @@ from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_r
 from dexmani_real.policy.safety import (
     SafetyGate,
     send_command,
-    advance_policy_epoch,
+    advance_run_generation,
 )
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
@@ -52,13 +52,11 @@ from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler, validat
 from dexmani_real.teleop.recording_session import (
     QuitRecordingDecision,
     await_quit_recording_decision,
-    build_episode_start_kwargs,
 )
 from dexmani_real.teleop.safety import (
     _contact_stall_detected,
     _do_configured_teleop_home,
     _feedback_after_send,
-    _hold_delivered,
     _reset_mapper_from_frames,
     _transition_collision_free,
     _vr_after_send,
@@ -467,7 +465,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         nonlocal _reanchor_pending_reason, recording_paused
         nonlocal ema_prev_pos, ema_prev_quat, _hand_ramp_start, _hand_ramp_step
 
-        epoch = advance_policy_epoch(shared)
+        run_generation = advance_run_generation(shared)
         _control_hold.pause_without_candidate("hand_feedback")
         _reanchor_pending_reason = "hand_recovered"
         recording_paused = True
@@ -476,8 +474,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         _hand_ramp_start = None
         _hand_ramp_step = 0
         logger.warning(
-            "teleop_loop: hand feedback pause invalidated epoch=%d without publishing: %s",
-            epoch,
+            "teleop_loop: hand feedback pause invalidated run=%d without publishing: %s",
+            run_generation,
             issue,
         )
 
@@ -525,7 +523,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_qpos_upper_rad,
             )
 
-        epoch = advance_policy_epoch(shared)
+        run_generation = advance_run_generation(shared)
         candidate = _safe_joint_publish(
             shared,
             measured_arm,
@@ -535,7 +533,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             safety_gate=gate,
         )
         if candidate is None:
-            logger.error("teleop_loop: failed to publish %s hold after advancing to epoch=%d", reason, epoch)
+            logger.error("teleop_loop: failed to publish %s hold after advancing to run=%d", reason, run_generation)
             return False
 
         _control_hold.begin(reason, candidate, deadline_s=time.monotonic() + cfg.action_apply_timeout_s)
@@ -549,9 +547,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         _hand_ramp_start = None
         _hand_ramp_step = 0
         logger.info(
-            "teleop_loop: %s hold published (epoch=%d action_id=%d)",
+            "teleop_loop: %s hold published (run=%d action_id=%d)",
             reason,
-            epoch,
+            run_generation,
             candidate.action_id,
         )
         return True
@@ -880,8 +878,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         begin_reason = "begin"
                         begin_message = "\nB: 遥操作开始（未启用录制 capability）"
                     else:
-                        episode_kwargs = build_episode_start_kwargs(shared, cfg, hand_available=hand_available)
-                        if not recorder.start_episode(**episode_kwargs):
+                        if not recorder.start_episode(task_label=cfg.task_label, operator=cfg.operator):
                             print("  ⚠ 无法开始录制")
                             skip_rest = True
                             continue
@@ -1623,16 +1620,13 @@ def _safe_joint_publish(
 
     candidate = ActionCandidate(
         observation_id=action_id if observation_id is None else int(observation_id),
-        session_generation=int(shared.session_generation.value),
-        policy_epoch=int(shared.policy_epoch.value),
+        run_generation=int(shared.run_generation.value),
         action_id=action_id,
         created_monotonic_ns=now_ns,
-        target_monotonic_ns=now_ns + int(0.05 * 1e9),
+        target_monotonic_ns=now_ns + int(float(shared.action_lead_time_s) * 1e9),
         valid_until_monotonic_ns=now_ns + int(0.5 * 1e9),
         arm_qpos=np.asarray(arm_qpos, dtype=np.float64),
         hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
-        chunk_id=action_id,
-        step_index=0,
         is_hold=is_hold,
     )
 
@@ -1665,7 +1659,7 @@ def _safe_joint_publish(
         current_arm_qpos=current_arm,
         current_hand_qpos=current_hand,
         dt_s=ctrl_dt,
-        session_generation=int(shared.session_generation.value),
+        run_generation=int(shared.run_generation.value),
     )
     if not gate_result.accepted or gate_result.candidate is None:
         logger.warning("joint target rejected by SafetyGate: %s", gate_result.reason)

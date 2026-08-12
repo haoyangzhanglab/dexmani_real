@@ -329,13 +329,13 @@ def send_arm_home(
                 print("  arm: invalid current qpos hint — homing cancelled", flush=True)
             return False
 
-    from dexmani_real.policy.safety import advance_policy_epoch
+    from dexmani_real.policy.safety import advance_run_generation
 
-    advance_policy_epoch(shared)
-    _epoch_advanced_ns = time.monotonic_ns()
+    advance_run_generation(shared)
+    _run_advanced_ns = time.monotonic_ns()
     _fresh_qpos = _wait_for_prehome_state(
         shared,
-        newer_than_ns=_epoch_advanced_ns,
+        newer_than_ns=_run_advanced_ns,
         timeout_s=max(float(converge_timeout_s), float(state_max_age_s)),
         max_velocity_rad_s=preplan_velocity_rad_s,
         heartbeat=heartbeat,

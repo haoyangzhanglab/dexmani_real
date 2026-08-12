@@ -1,4 +1,4 @@
-"""Transactional HDF5 v15 episode serialization.
+"""Transactional HDF5 v16 episode serialization.
 
 State, action, VR, and camera rows are written one-for-one on the policy grid.
 The recorder verifies all sidecars before atomically publishing an episode.
@@ -36,7 +36,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
-SCHEMA_VERSION = 15  # v15: causal source/fill/action provenance; v12-v14 remain readable
+SCHEMA_VERSION = 16
 _CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
 _PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
 _PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
@@ -93,18 +93,18 @@ class EpisodeRecorder:
         min_frames: int = 50,
         arm_sent_stream: bool = False,
         camera_writer_config: CameraStreamWriterConfig | None = None,
-        resolved_config_json: str | None = None,
         resolved_config_hash: str | None = None,
         provenance: dict[str, str] | None = None,
     ) -> None:
         if control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
+        if resolved_config_hash is None or len(resolved_config_hash) != 64:
+            raise ValueError("EpisodeRecorder requires a resolved config SHA-256")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
         self.min_frames = int(min_frames)
-        self._resolved_config_json = resolved_config_json
         self._resolved_config_hash = resolved_config_hash
         self._provenance = dict(provenance or {})
 
@@ -196,14 +196,12 @@ class EpisodeRecorder:
         self,
         task_label: str = "",
         operator: str = "",
-        tags: list[str] | None = None,
         calib: CameraCalib | None = None,
         camera_K: np.ndarray | None = None,
         camera_name: str | None = None,
         camera_serial: str | None = None,
         depth_scale: float | None = None,
         camera_metadata: dict[str, Any] | None = None,
-        record_config: dict | None = None,
         skip_initial_frames: int = 0,
     ) -> bool:
         # Wait for any pending async stop_episode to finish — it owns
@@ -255,14 +253,12 @@ class EpisodeRecorder:
         self._pending_meta = {
             "task_label": task_label,
             "operator": operator,
-            "tags": tags,
             "calib": calib,
             "camera_K": camera_K,
             "camera_name": camera_name,
             "camera_serial": camera_serial,
             "depth_scale": depth_scale,
             "camera_metadata": camera_metadata,
-            "record_config": record_config,
             "skip_initial_frames": self._skip_initial_frames,
         }
 
@@ -289,12 +285,8 @@ class EpisodeRecorder:
         p = self._pending_meta
         meta.attrs["task_label"] = p.get("task_label", "")
         meta.attrs["operator"] = p.get("operator", "")
-        tags = p.get("tags")
-        meta.attrs["tags"] = ",".join(tags) if tags else ""
         meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
-        if self._resolved_config_json is not None:
-            meta.attrs["resolved_config_json"] = self._resolved_config_json
         if self._resolved_config_hash is not None:
             meta.attrs["resolved_config_sha256"] = self._resolved_config_hash
         for key, value in sorted(self._provenance.items()):
@@ -307,14 +299,7 @@ class EpisodeRecorder:
 
         self._write_camera_meta_attrs(meta)
 
-        # Collection-config snapshot (control mode, EMA alphas, delta clips) —
-        # essential for downstream reproducibility.  Values are pre-sanitized to
-        # h5py-compatible scalars/strings by the controller.
         meta.attrs["skip_initial_frames"] = int(p.get("skip_initial_frames", 0))
-        record_config = p.get("record_config") or {}
-        for key, val in record_config.items():
-            meta.attrs[key] = val
-
         camera_metadata = p.get("camera_metadata") or {}
         for key, val in camera_metadata.items():
             meta.attrs[key] = val
@@ -452,7 +437,7 @@ class EpisodeRecorder:
             "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
             "action_arm_ee": self._build_action_ee(action),
             "action_hand_joint": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
-            # ── Causal/action protocol provenance (schema v15) ──
+            # ── Causal/action protocol provenance ──
             "observation_id": int(sig.get("observation_id", 0)),
             "observation_anchor_monotonic_ns": int(sig.get("observation_anchor_monotonic_ns", 0)),
             "arm_source_sequence": int(sig.get("arm_source_sequence", 0)),
@@ -492,31 +477,11 @@ class EpisodeRecorder:
             "observation_valid": bool(sig.get("observation_valid", False)),
             "observation_skew_s": float(sig.get("observation_skew_s", np.nan)),
             "action_id": int(sig.get("action_id", 0)),
-            "action_chunk_id": int(sig.get("action_chunk_id", 0)),
-            "action_step_index": int(sig.get("action_step_index", 0)),
             "action_created_monotonic_ns": int(sig.get("action_created_monotonic_ns", 0)),
             "action_target_monotonic_ns": int(sig.get("action_target_monotonic_ns", 0)),
             "action_valid_until_monotonic_ns": int(sig.get("action_valid_until_monotonic_ns", 0)),
             "action_arm_joint_raw": np.asarray(sig.get("action_arm_joint_raw", action.arm_qpos_cmd), dtype=np.float64),
             "flag_action_queued": bool(sig.get("action_queued", False)),
-            "flag_action_committed": bool(sig.get("action_committed", False)),
-            "arm_ack_status": int(sig.get("arm_ack_status", 0)),
-            "hand_ack_status": int(sig.get("hand_ack_status", 0)),
-            "arm_ack_reject_reason": int(sig.get("arm_ack_reject_reason", 0)),
-            "hand_ack_reject_reason": int(sig.get("hand_ack_reject_reason", 0)),
-            "arm_ack_sdk_code": int(sig.get("arm_ack_sdk_code", 0)),
-            "hand_ack_sdk_code": int(sig.get("hand_ack_sdk_code", 0)),
-            "arm_received_monotonic_ns": int(sig.get("arm_received_monotonic_ns", 0)),
-            "hand_received_monotonic_ns": int(sig.get("hand_received_monotonic_ns", 0)),
-            "arm_prepared_monotonic_ns": int(sig.get("arm_prepared_monotonic_ns", 0)),
-            "hand_prepared_monotonic_ns": int(sig.get("hand_prepared_monotonic_ns", 0)),
-            "arm_applied_monotonic_ns": int(sig.get("arm_applied_monotonic_ns", 0)),
-            "hand_applied_monotonic_ns": int(sig.get("hand_applied_monotonic_ns", 0)),
-            "arm_latest_applied_action_id": int(sig.get("arm_latest_applied_action_id", 0)),
-            "hand_latest_applied_action_id": int(sig.get("hand_latest_applied_action_id", 0)),
-            "arm_latest_applied_monotonic_ns": int(sig.get("arm_latest_applied_monotonic_ns", 0)),
-            "hand_latest_applied_monotonic_ns": int(sig.get("hand_latest_applied_monotonic_ns", 0)),
-            "arm_hand_apply_skew_s": float(sig.get("arm_hand_apply_skew_s", np.nan)),
             "tactile_fresh": bool(sig.get("tactile_fresh", False)),
             "tactile_source_monotonic_ns": int(sig.get("tactile_source_monotonic_ns", 0)),
             "tactile_calibrated": bool(sig.get("tactile_calibrated", False)),
@@ -554,7 +519,7 @@ class EpisodeRecorder:
             "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
             "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
             "vr_landmarks": np.asarray(vr_frame["landmarks"], dtype=np.float64),
-            # ── Policy diagnostics (schema v13; optional values use NaN) ──
+            # ── Optional policy diagnostics (NaN when unavailable) ──
             "tracking_error": np.nan,
             "ik_solve_time_ms": np.nan,
             "target_pos_before_clamp": np.full(3, np.nan),
@@ -920,9 +885,8 @@ class EpisodeRecorder:
             grid_dt_s = 1.0 / self.control_hz
             grid_duration_s = max(0, self._frame_count - 1) * grid_dt_s
             meta.attrs["schema_version"] = SCHEMA_VERSION
-            # Backward compatibility: duration keeps its historical wall-clock
-            # meaning.  v13 adds explicit names so paused/audio time can no
-            # longer be mistaken for a reduced control/sample rate.
+            # ``duration`` remains wall-clock time; explicit grid fields keep
+            # pauses and other non-sampled time distinct from the control rate.
             meta.attrs["duration"] = duration
             meta.attrs["wall_duration_s"] = duration
             meta.attrs["grid_duration_s"] = grid_duration_s

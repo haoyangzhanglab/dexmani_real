@@ -19,7 +19,7 @@ def _home_handoff_state(*, candidate_present: bool, candidate_applied: bool) -> 
 
 @dataclass
 class ControlHold:
-    """Track one epoch-scoped measured hold and its exact apply acknowledgement."""
+    """Track one run-scoped measured hold and its exact apply acknowledgement."""
 
     reason: str | None = None
     candidate: ActionCandidate | None = None

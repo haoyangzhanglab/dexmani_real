@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.policy.runtime import FrozenArrayMap, ObservationSnapshot, ObservationSpec
-from dexmani_real.shm.robot_ring import SeqlockRingBuffer
+from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer
 
 
 def _field_prefix(name: str) -> str:
@@ -21,7 +21,7 @@ def observation_tensor_dtype(spec: ObservationSpec) -> np.dtype:
     fields: list[tuple[Any, ...]] = [
         ("observation_id", "<u8"),
         ("anchor_monotonic_ns", "<u8"),
-        ("session_generation", "<u8"),
+        ("run_generation", "<u8"),
         ("camera_generation", "<u8"),
     ]
     for modality in spec.modalities:
@@ -44,7 +44,7 @@ def observation_tensor_dtype(spec: ObservationSpec) -> np.dtype:
 class ObservationTensorBlock:
     """Two fixed slots; one snapshot copy per policy/inference boundary."""
 
-    def __init__(self, ring: SeqlockRingBuffer, spec: ObservationSpec) -> None:
+    def __init__(self, ring: SharedMemoryRingBuffer, spec: ObservationSpec) -> None:
         expected = observation_tensor_dtype(spec)
         if ring.dtype != expected or ring.maxlen != 2:
             raise ValueError("tensor block ring does not match ObservationSpec/double-buffer contract")
@@ -53,14 +53,14 @@ class ObservationTensorBlock:
 
     @classmethod
     def create(cls, name: str, spec: ObservationSpec) -> "ObservationTensorBlock":
-        ring = SeqlockRingBuffer.create_or_replace(name, observation_tensor_dtype(spec), maxlen=2)
+        ring = SharedMemoryRingBuffer.create_or_replace(name, observation_tensor_dtype(spec), maxlen=2)
         return cls(ring, spec)
 
     def write(self, snapshot: ObservationSnapshot) -> int:
         frame = np.zeros(1, dtype=self.ring.dtype)
         frame["observation_id"][0] = snapshot.observation_id
         frame["anchor_monotonic_ns"][0] = snapshot.anchor_monotonic_ns
-        frame["session_generation"][0] = snapshot.session_generation
+        frame["run_generation"][0] = snapshot.run_generation
         frame["camera_generation"][0] = snapshot.camera_generation
         for modality in self.spec.modalities:
             prefix = _field_prefix(modality.name)
@@ -116,7 +116,7 @@ class ObservationTensorBlock:
             source_monotonic_ns=FrozenArrayMap(tuple(source_items)),
             publish_monotonic_ns=FrozenArrayMap(tuple(publish_items)),
             valid_history_mask=FrozenArrayMap(tuple(valid_items)),
-            session_generation=int(record["session_generation"]),
+            run_generation=int(record["run_generation"]),
             camera_generation=int(record["camera_generation"]),
             receive_monotonic_ns=FrozenArrayMap(tuple(receive_items)),
             source_age_s=FrozenArrayMap(tuple(age_items)),

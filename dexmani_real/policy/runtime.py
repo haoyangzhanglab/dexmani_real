@@ -100,7 +100,6 @@ class ActionSpec:
     frame: Literal["robot_joint"] = "robot_joint"
     arm_shape: tuple[int, ...] = ARM_JOINT_SHAPE
     hand_shape: tuple[int, ...] = HAND_JOINT_SHAPE
-    chunk_length: int = 1
     dt_s: float = 1.0 / 16.0
     deadline_s: float = 0.20
 
@@ -112,13 +111,12 @@ class ActionSpec:
         if self.arm_shape != ARM_JOINT_SHAPE or self.hand_shape != HAND_JOINT_SHAPE:
             raise ValueError("DexMani joint action shapes must be (7,) and (12,)")
         if (
-            self.chunk_length <= 0
-            or not np.isfinite(self.dt_s)
+            not np.isfinite(self.dt_s)
             or not np.isfinite(self.deadline_s)
             or self.dt_s <= 0
             or self.deadline_s <= 0
         ):
-            raise ValueError("invalid action chunk timing")
+            raise ValueError("invalid action timing")
 
 
 @dataclass(frozen=True)
@@ -173,20 +171,22 @@ class FrozenArrayMap(Mapping[str, np.ndarray]):
 
 @dataclass(frozen=True)
 class ObservationSnapshot:
+    """Immutable causal observation tagged with the control run that created it."""
+
     observation_id: int
     anchor_monotonic_ns: int
     values: FrozenArrayMap
     source_monotonic_ns: FrozenArrayMap
     publish_monotonic_ns: FrozenArrayMap
     valid_history_mask: FrozenArrayMap
-    session_generation: int
+    run_generation: int
     camera_generation: int = 0
     receive_monotonic_ns: FrozenArrayMap = field(default_factory=lambda: FrozenArrayMap(()))
     source_age_s: FrozenArrayMap = field(default_factory=lambda: FrozenArrayMap(()))
     source_skew_s: FrozenArrayMap = field(default_factory=lambda: FrozenArrayMap(()))
 
     def __post_init__(self) -> None:
-        if self.observation_id <= 0 or self.anchor_monotonic_ns <= 0 or self.session_generation < 0:
+        if self.observation_id <= 0 or self.anchor_monotonic_ns <= 0 or self.run_generation < 0:
             raise ValueError("invalid observation identity/timing")
         if self.camera_generation < 0:
             raise ValueError("camera_generation must be non-negative")
@@ -233,27 +233,33 @@ class ObservationSnapshot:
 
 @dataclass(frozen=True)
 class ActionCandidate:
+    """One current-tick joint target proposed by teleoperation or inference.
+
+    Inference publishes ``action_id=0`` through its mailbox.  The controller
+    assigns the globally monotonic action ID only after it confirms that the
+    observation and candidate belong to the active ``run_generation``.
+    ``target_monotonic_ns`` and ``valid_until_monotonic_ns`` describe the
+    proposal's intended timing for freshness and recording provenance; command
+    publication emits its own worker delivery target.
+    """
+
     observation_id: int
-    session_generation: int
-    policy_epoch: int
-    action_id: int
+    run_generation: int
     created_monotonic_ns: int
     target_monotonic_ns: int
     valid_until_monotonic_ns: int
+    action_id: int = 0
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
     representation: str = "joint_position"
     units: str = "rad"
     frame: str = "robot_joint"
-    chunk_id: int = 0
-    step_index: int = 0
     is_hold: bool = False
 
     def __post_init__(self) -> None:
         if (
             min(
                 self.observation_id,
-                self.action_id,
                 self.created_monotonic_ns,
                 self.target_monotonic_ns,
                 self.valid_until_monotonic_ns,
@@ -265,8 +271,8 @@ class ActionCandidate:
             raise ValueError("action target precedes creation")
         if self.target_monotonic_ns > self.valid_until_monotonic_ns:
             raise ValueError("action validity ends before target")
-        if self.session_generation < 0 or self.policy_epoch < 0 or self.chunk_id < 0 or self.step_index < 0:
-            raise ValueError("action generations/indices must be non-negative")
+        if self.run_generation < 0 or self.action_id < 0:
+            raise ValueError("action generation and ID must be non-negative")
         if self.arm_qpos is None and self.hand_qpos is None:
             raise ValueError("action candidate controls no actuator")
         if self.arm_qpos is not None:
@@ -281,19 +287,3 @@ class ActionCandidate:
                 "hand_qpos",
                 _readonly_array(self.hand_qpos, HAND_JOINT_SHAPE, np.float64, name="hand_qpos"),
             )
-
-
-@dataclass(frozen=True)
-class ActionChunk:
-    chunk_id: int
-    steps: tuple[ActionCandidate, ...]
-
-    def __post_init__(self) -> None:
-        if self.chunk_id <= 0 or not self.steps:
-            raise ValueError("chunk must have a positive ID and at least one step")
-        if any(step.chunk_id != self.chunk_id for step in self.steps):
-            raise ValueError("all action steps must carry the enclosing chunk ID")
-        if tuple(step.step_index for step in self.steps) != tuple(range(len(self.steps))):
-            raise ValueError("action chunk step_index values must be contiguous from zero")
-        if any(a.target_monotonic_ns >= b.target_monotonic_ns for a, b in zip(self.steps, self.steps[1:])):
-            raise ValueError("action chunk target times must be strictly increasing")

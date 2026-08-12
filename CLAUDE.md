@@ -33,7 +33,7 @@ entry points, not test fixtures.
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, safety gate |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
 | Change replay | `examples/replay_episode.py` | — | Self-contained script; preflight → session → runner → metrics |
-| Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and JSON compatibility |
+| Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and calibration JSON contract |
 
 ## 2. Ownership map
 
@@ -51,14 +51,14 @@ Hand worker ───┘                         fire-and-forget command publica
                                                     ├──► bounded arm queue → Arm worker
                                                     └──► latest-wins hand ring → Hand worker
 
-Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v15
+Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v16
 ```
 
 | Owner | Owns | Must not own |
 |---|---|---|
 | Main / lifecycle module | Config snapshot, storage, process creation, read-only readiness, health, shutdown | Mapping, actions, sample selection |
 | `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | HDF5 serialization or direct SDK use |
-| `policy/learned_coordinator.py` | Causal observations, inference result scheduling, policy epoch/action IDs | Direct SDK use or recording I/O |
+| `policy/learned_coordinator.py` | Causal observations, current-tick inference result publication, run generation/action IDs | Direct SDK use or recording I/O |
 | `recording/io_process.py` | Record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
 | `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application | Policy decisions or cross-worker calls |
 | `sensor/` workers | Device acquisition and source-freshness metadata | Motion/control decisions |
@@ -92,7 +92,10 @@ discover a dtype.
 | `arm_action_q` | controller → arm | Ordered `mp.Queue(maxsize=2)`; backpressure is intentional |
 | `hand_cmd_ring` | controller → hand | Seqlock, latest-wins servo target |
 | arm/hand/VR/camera rings | worker → controller | Seqlock state; source and publish freshness are distinct |
+| `record_control_ring` | controller → RecorderIO | Latest immutable fixed-field START/STOP boundary; no JSON payload |
 | `record_sample_ring` | controller → RecorderIO | Fixed-grid aligned sample; overflow aborts the episode |
+| `record_status_ring` | RecorderIO → controller/main | Latest lifecycle outcome and bounded error/path text; no progress protocol |
+| `inference_candidate_ring` | inference → learned coordinator | Latest current-tick candidate; only allocated for policy deployment |
 | flags and heartbeats | lifecycle/workers | Flags are simple values; heartbeats use `time.monotonic()` |
 
 Read a ring with its documented seqlock API. `get_last_k(k)` returns verified
@@ -117,8 +120,11 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
 - `SafetyGate` (in `policy/safety.py`) is the single validation boundary:
   well-formed → joint limits → velocity clamp → collision → workspace.
   Workers trust the gate and apply commands with only hardware-level checks.
-- Pause, stale VR, or a camera generation reset invalidates the active policy
-  epoch, publishes a coordinated hold, and requires fresh feedback/re-anchor.
+- `run_generation` tags both policy observations and candidates. Begin, pause,
+  home, feedback fault, and camera re-warm advance it; the coordinator drops a
+  mailbox result unless it, its observation, and shared state have the same
+  generation. Those paths publish a coordinated hold when fresh feedback is
+  available and require re-anchor/re-warm before motion resumes.
 
 Do not turn a simple flag into an enum, add a second state writer, or bypass
 the SafetyGate validation boundary.
@@ -152,11 +158,18 @@ PolicySpec YAML + resource hashes → deployment preflight → isolated inferenc
 `PolicySpec` binds adapter module, explicit observation history, action contract,
 resources and SHA-256s. `action.dt_s` must equal `1 / control_hz`; a live run
 also requires `hardware_deployable: true`. Keep model import in the inference
-child and retain backend-created action target/expiry times—do not retime stale
-chunks into validity.
+child. The adapter must return one current-tick `ActionCandidate`; adapters for
+chunk-producing models choose or expand their next step locally. A single
+`run_generation` invalidates candidates from a prior start, pause, home, or
+camera re-warm, while the control side assigns action IDs and command targets.
+`ActionCandidate.target_monotonic_ns` remains proposal/episode-provenance
+timing and `valid_until_monotonic_ns` is the freshness guard; `send_command`
+creates the actual worker delivery target after queueing begins.
 
 The default teleoperation `SharedStorage` does not allocate inference rings.
-Only `examples/deploy_policy.py` (via ``SharedStorageConfig.from_runtime(..., enable_inference=True)``) may opt into that experimental capability.
+Only `examples/deploy_policy.py` (via
+`SharedStorageConfig.from_runtime(..., enable_inference=True)`) may opt into
+that experimental capability.
 
 ### Episode write, read, analyse, replay
 
@@ -165,8 +178,14 @@ aligned samples → RecorderIO → temporary episode + stream verification
                 → fsync + atomic publish → EpisodeReader / visualize / replay
 ```
 
-- HDF5 schema v15 is additive. Readers keep v12–v14 raw-readable but treat
-  semantic validity conservatively; never silently repurpose an old dataset.
+- HDF5 schema v16 is the only runtime episode format. Readers, visualization,
+  and replay accept only a published v16 directory; migrate historical data
+  outside the runtime before using it.
+- Recorder control and the shared sample payload are fixed NumPy dtypes. The
+  START boundary snapshots only task/operator and essential device/calibration
+  metadata plus the required resolved-config SHA-256; per-grid fields are typed
+  rather than JSON-encoded. The
+  fire-and-forget worker protocol records no fabricated ACK or apply status.
 - Writer failure, stream mismatch, overflow, codec failure, or ENOSPC aborts
   the episode rather than silently publishing partial data.
 - `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
@@ -182,7 +201,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
 2. Allocate it through `SharedStorage`; write it in the owning worker and read
    it in each consumer.
 3. Decide whether recording persists it. If yes, update recorder, reader,
-   quality/visualization/replay consumers and preserve old episodes.
+   quality/visualization/replay consumers and the v16 schema contract together.
 4. Check finite values, units, initial/invalid values, and process cleanup.
 
 ### Changing control, IK, or collision behavior
@@ -198,7 +217,8 @@ aligned samples → RecorderIO → temporary episode + stream verification
 
 ### Changing recording or replay
 
-1. Keep v15 dataset meanings stable; add optional fields compatibly.
+1. Keep v16 dataset meanings stable. Coordinate any format change across
+   recorder, reader, visualization, and replay in the same change.
 2. Update producer, reader, offline quality/visualization, replay loader, and
    provenance/schema marker together.
 3. For replay, verify provenance, dense geometry and explicit hand mode before

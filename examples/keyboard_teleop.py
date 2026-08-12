@@ -27,7 +27,7 @@ from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.policy.safety import (
     ActionSafetyGateConfig,
-    advance_policy_epoch,
+    advance_run_generation,
     planner_action_safety_gate,
     publish_joint_targets,
 )
@@ -248,7 +248,7 @@ def _publish_measured_quit_hold(
     safety_gate: Any,
 ) -> bool:
     """Invalidate pending motion and wait for one measured hold to reach the SDKs."""
-    advance_policy_epoch(shared)
+    advance_run_generation(shared)
     return (
         publish_joint_targets(
             shared,

@@ -15,11 +15,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-def spawn_context() -> Any:
-    """Return the repository's sole multiprocessing context."""
-    return mp.get_context("spawn")
-
-
 @dataclass(frozen=True)
 class ProcessExit:
     name: str

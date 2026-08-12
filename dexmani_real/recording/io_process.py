@@ -8,9 +8,7 @@ transactional publication.  Large camera arrays never travel through an
 
 from __future__ import annotations
 
-import json
 import time
-import zlib
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -18,13 +16,16 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.utils.schema import (
+    ARM_JOINT_SHAPE,
     HAND_JOINT_SHAPE,
     RECORD_CONTROL_DTYPE,
-    RECORD_CONTROL_JSON_BYTES,
-    RECORD_SAMPLE_JSON_BYTES,
+    RECORD_OPERATOR_BYTES,
     RECORD_STATUS_DTYPE,
     RECORD_STATUS_TEXT_BYTES,
+    RECORD_STOP_REASON_BYTES,
+    RECORD_TASK_LABEL_BYTES,
 )
+from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.recording.camera_stream_writer import CameraStreamWriterConfig
 from dexmani_real.recording.episode_recorder import EpisodeRecorder, StopResult
 from dexmani_real.robot.types import RobotAction, RobotState
@@ -33,8 +34,6 @@ from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
 
-CONTROL_JSON_BYTES = RECORD_CONTROL_JSON_BYTES
-SAMPLE_JSON_BYTES = RECORD_SAMPLE_JSON_BYTES
 STATUS_TEXT_BYTES = RECORD_STATUS_TEXT_BYTES
 _RECORDER_STOP_TIMEOUT_S = 60.0
 _STOP_POLL_INTERVAL_S = 0.01
@@ -46,13 +45,11 @@ class RecorderCommand(IntEnum):
 
 
 class RecorderPhase(IntEnum):
-    INIT = 0
     READY = 1
     RECORDING = 2
-    STOPPING = 3
-    COMPLETED = 4
-    ERROR = 5
-    STOPPED = 6
+    COMPLETED = 3
+    ERROR = 4
+    STOPPED = 5
 
 
 @dataclass(frozen=True)
@@ -61,7 +58,6 @@ class RecorderIOConfig:
     max_frames: int
     control_hz: float
     min_frames: int
-    resolved_config_json: str
     resolved_config_sha256: str
     provenance: tuple[tuple[str, str], ...] = ()
     poll_hz: float = 128.0
@@ -87,38 +83,65 @@ class RecorderIOConfig:
             raise ValueError("RecorderIO provenance keys and values must be non-empty")
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    raise TypeError(f"RecorderIO JSON cannot encode {type(value).__name__}")
-
-
-def _encode_json(value: Any, *, capacity: int) -> tuple[bytes, int]:
-    payload = json.dumps(_jsonable(value), sort_keys=True, separators=(",", ":"), allow_nan=True).encode("utf-8")
+def _bounded_control_text(value: str, *, capacity: int, field: str) -> bytes:
+    """Encode a control-plane text field without an unbounded JSON side channel."""
+    payload = value.encode("utf-8")
     if len(payload) > capacity:
-        raise ValueError(f"RecorderIO JSON payload {len(payload)} exceeds fixed capacity {capacity}")
-    return payload, zlib.crc32(payload) & 0xFFFFFFFF
+        raise ValueError(f"RecorderIO {field} exceeds fixed capacity {capacity}")
+    return payload
 
 
-def _decode_json(record: np.void, *, capacity: int) -> dict[str, Any]:
-    length = int(record["json_length"])
-    if length < 0 or length > capacity:
-        raise ValueError("RecorderIO JSON length is out of bounds")
-    payload = bytes(record["json_payload"])[:length]
-    if (zlib.crc32(payload) & 0xFFFFFFFF) != int(record["json_crc32"]):
-        raise ValueError("RecorderIO JSON CRC mismatch")
-    decoded = json.loads(payload.decode("utf-8"))
-    if not isinstance(decoded, dict):
-        raise TypeError("RecorderIO JSON root must be an object")
-    return decoded
+def _control_text(record: np.void, field: str) -> str:
+    """Decode a null-padded fixed control-plane text field."""
+    return bytes(record[field]).rstrip(b"\x00").decode("utf-8", errors="replace")
+
+
+def _shared_text(value: bytes, *, default: str | None) -> str | None:
+    encoded = value.rstrip(b"\x00")
+    return encoded.decode("utf-8") if encoded else default
+
+
+def _build_start_metadata(shared: Any, *, task_label: str, operator: str) -> dict[str, Any]:
+    """Snapshot only essential recording metadata at the immutable START boundary."""
+    camera_K_values = list(shared.camera_K)
+    camera_K = (
+        np.asarray(camera_K_values, dtype=np.float64).reshape(3, 3)
+        if any(value != 0.0 for value in camera_K_values)
+        else None
+    )
+    depth_scale = float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
+    camera_serial = _shared_text(shared.camera_serial.value, default=None)
+    camera_firmware = _shared_text(shared.camera_firmware.value, default="unknown") or "unknown"
+    camera_sdk_version = _shared_text(shared.camera_sdk_version.value, default="unknown") or "unknown"
+    camera_profile_json = _shared_text(shared.camera_profile.value, default="{}") or "{}"
+    arm_identity_json = (
+        _shared_text(shared.arm_device_identity.value, default='{"status":"unavailable"}')
+        or '{"status":"unavailable"}'
+    )
+    hand_identity_json = _shared_text(shared.hand_device_identity.value, default='{"status":"unavailable"}')
+    calibration = CameraCalib()
+    try:
+        camera_name = calibration.resolve_name_by_serial(camera_serial) if camera_serial else None
+    except (KeyError, FileNotFoundError):
+        camera_name = None
+        logger.warning("Camera serial %s not found in cameras.json — no extrinsics in /meta", camera_serial)
+
+    return {
+        "task_label": task_label,
+        "operator": operator,
+        "calib": calibration,
+        "camera_K": camera_K,
+        "camera_name": camera_name,
+        "camera_serial": camera_serial,
+        "depth_scale": depth_scale,
+        "camera_metadata": {
+            "camera_firmware": camera_firmware,
+            "camera_sdk_version": camera_sdk_version,
+            "camera_actual_profile_json": camera_profile_json,
+            "arm_device_identity_json": arm_identity_json,
+            "hand_device_identity_json": hand_identity_json or '{"status":"disabled"}',
+        },
+    }
 
 
 def _bounded_text(value: str) -> tuple[bytes, int]:
@@ -151,6 +174,129 @@ def _publish_status(
     shared.record_status_ring.write(frame)
 
 
+def _write_sample_metadata(
+    frame: np.ndarray,
+    *,
+    action: RobotAction,
+    camera_frame: dict[str, Any] | None,
+    signals: dict[str, Any] | None,
+    arm_qpos_sent: np.ndarray | None,
+    diagnostics: dict[str, Any] | None,
+) -> None:
+    """Populate the fixed recorder metadata fields at the policy/IO boundary."""
+    signal_data = signals or {}
+    diagnostic_data = diagnostics or {}
+
+    frame["arm_qpos_sent"][0] = (
+        np.asarray(arm_qpos_sent, dtype=np.float64)
+        if arm_qpos_sent is not None
+        else np.full(ARM_JOINT_SHAPE, np.nan)
+    )
+    uint64_fields = (
+        "observation_id",
+        "observation_anchor_monotonic_ns",
+        "arm_source_sequence",
+        "hand_source_sequence",
+        "vr_source_sequence",
+        "camera_source_sequence",
+        "arm_source_monotonic_ns",
+        "hand_source_monotonic_ns",
+        "vr_source_monotonic_ns",
+        "camera_source_monotonic_ns",
+        "arm_publish_monotonic_ns",
+        "hand_publish_monotonic_ns",
+        "vr_publish_monotonic_ns",
+        "camera_publish_monotonic_ns",
+        "action_id",
+        "action_created_monotonic_ns",
+        "action_target_monotonic_ns",
+        "action_valid_until_monotonic_ns",
+        "tactile_source_monotonic_ns",
+    )
+    for name in uint64_fields:
+        frame[name][0] = int(signal_data.get(name, 0))
+    bool_fields = {
+        "observation_valid": "observation_valid",
+        "flag_action_queued": "action_queued",
+        "tactile_fresh": "tactile_fresh",
+        "tactile_calibrated": "tactile_calibrated",
+        "flag_ik_ok": "ik_ok",
+        "flag_ik_attempted": "ik_attempted",
+        "flag_retarget_ok": "retarget_ok",
+        "flag_held": "held",
+        "flag_safety_reject": "flag_safety_reject",
+    }
+    for field_name, signal_name in bool_fields.items():
+        default = field_name == "flag_ik_attempted"
+        frame[field_name][0] = int(bool(signal_data.get(signal_name, default)))
+    frame["tactile_unit_code"][0] = int(signal_data.get("tactile_unit_code", 0))
+    frame["pointcloud_source_point_count"][0] = int(signal_data.get("pointcloud_source_point_count", 0))
+    frame["pointcloud_padding_count"][0] = int(signal_data.get("pointcloud_padding_count", 0))
+    frame["flag_frame_status"][0] = int(signal_data.get("frame_status", 0))
+    frame["observation_source_receive_monotonic_ns"][0] = np.asarray(
+        signal_data.get("observation_source_receive_monotonic_ns", np.zeros(4)), dtype=np.uint64
+    )
+    frame["observation_source_age_s"][0] = np.asarray(
+        signal_data.get("observation_source_age_s", np.full(4, np.nan)), dtype=np.float64
+    )
+    frame["observation_source_skew_s"][0] = np.asarray(
+        signal_data.get("observation_source_skew_s", np.full(4, np.nan)), dtype=np.float64
+    )
+    frame["observation_history_valid_mask"][0] = np.asarray(
+        signal_data.get("observation_history_valid_mask", np.zeros((4, 1), dtype=bool)), dtype=np.uint8
+    )
+    for name in (
+        "observation_skew_s",
+        "pointcloud_valid_depth_ratio",
+    ):
+        frame[name][0] = float(signal_data.get(name, np.nan))
+    frame["action_arm_joint_raw"][0] = np.asarray(
+        signal_data.get("action_arm_joint_raw", action.arm_qpos_cmd), dtype=np.float64
+    )
+    frame["action_hand_joint_raw"][0] = np.asarray(
+        diagnostic_data.get("action_hand_joint_raw", action.hand_qpos_cmd), dtype=np.float64
+    )
+
+    cam = camera_frame or {}
+    frame["camera_health"][0] = int(cam.get("camera_health", 1))
+    frame["camera_fresh"][0] = int(bool(cam.get("camera_fresh", False)))
+    frame["pointcloud_valid"][0] = int(bool(cam.get("pointcloud_valid", False)))
+    camera_integer_fields = {
+        "camera_frame_number": "frame_number",
+        "camera_ring_sequence": "ring_sequence",
+        "camera_generation": "camera_generation",
+    }
+    for field_name, camera_name in camera_integer_fields.items():
+        frame[field_name][0] = int(cam.get(camera_name, 0))
+    frame["camera_clock_reset"][0] = int(bool(cam.get("clock_reset", False)))
+    frame["camera_duplicate"][0] = int(bool(cam.get("duplicate", False)))
+    frame["camera_frame_gap"][0] = int(cam.get("frame_gap", 0))
+    for name, source_name in (
+        ("camera_device_timestamp_s", "device_timestamp_s"),
+        ("camera_capture_monotonic_s", "capture_monotonic_s"),
+        ("camera_age_s", "camera_age_s"),
+        ("camera_backlog_s", "backlog_s"),
+    ):
+        frame[name][0] = float(cam.get(source_name, np.nan))
+
+    for name in (
+        "tracking_error",
+        "ik_solve_time_ms",
+        "policy_map_time_ms",
+        "hand_retarget_time_ms",
+        "transition_check_time_ms",
+        "policy_compute_time_ms",
+    ):
+        frame[name][0] = float(diagnostic_data.get(name, np.nan))
+    for name, shape in (
+        ("target_pos_before_clamp", (3,)),
+        ("head_quat_wxyz", (4,)),
+        ("target_eef_pos_raw", (3,)),
+        ("target_eef_rot6d_raw", (6,)),
+    ):
+        frame[name][0] = np.asarray(diagnostic_data.get(name, np.full(shape, np.nan)), dtype=np.float64)
+
+
 class RecorderClient:
     """Policy-side owner of recording decisions and fixed sample construction."""
 
@@ -181,32 +327,40 @@ class RecorderClient:
         length = int(status[f"{field}_length"])
         return bytes(status[field])[:length].decode("utf-8", errors="replace")
 
-    def _write_control(self, command: RecorderCommand, payload: dict[str, Any], *, save: bool = False) -> None:
-        encoded, crc = _encode_json(payload, capacity=CONTROL_JSON_BYTES)
+    def _write_control(
+        self,
+        command: RecorderCommand,
+        *,
+        save: bool = False,
+        task_label: str = "",
+        operator: str = "",
+        stop_reason: str = "",
+    ) -> None:
         frame = np.zeros(1, dtype=RECORD_CONTROL_DTYPE)
         frame["command"][0] = int(command)
         frame["generation"][0] = self._generation
         frame["save"][0] = int(save)
         frame["created_monotonic_ns"][0] = time.monotonic_ns()
-        frame["json_length"][0] = len(encoded)
-        frame["json_crc32"][0] = crc
-        frame["json_payload"][0] = encoded
+        frame["task_label"][0] = _bounded_control_text(
+            task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label"
+        )
+        frame["operator"][0] = _bounded_control_text(operator, capacity=RECORD_OPERATOR_BYTES, field="operator")
+        frame["stop_reason"][0] = _bounded_control_text(
+            stop_reason, capacity=RECORD_STOP_REASON_BYTES, field="stop_reason"
+        )
         self.shared.record_control_ring.write(frame)
 
-    def start_episode(self, **kwargs: Any) -> bool:
+    def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
         if self._recording or not self.shared.recorder_ready.is_set():
             return False
+        try:
+            _bounded_control_text(task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label")
+            _bounded_control_text(operator, capacity=RECORD_OPERATOR_BYTES, field="operator")
+        except ValueError:
+            logger.error("RecorderIO start metadata exceeds its fixed control boundary", exc_info=True)
+            return False
         self._generation += 1
-        metadata = dict(kwargs)
-        calib = metadata.pop("calib", None)
-        camera_name = metadata.get("camera_name")
-        camera_serial = metadata.get("camera_serial")
-        if calib is not None and camera_name is not None:
-            calib_metadata = calib.to_meta_dict(camera_name, expected_serial=camera_serial)
-            camera_metadata = dict(metadata.get("camera_metadata") or {})
-            camera_metadata.update(calib_metadata)
-            metadata["camera_metadata"] = camera_metadata
-        self._write_control(RecorderCommand.START, metadata)
+        self._write_control(RecorderCommand.START, task_label=task_label, operator=operator)
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and self.shared.is_running.value:
             status = self._read_status()
@@ -286,20 +440,14 @@ class RecorderClient:
             frame["camera_pointcloud"][0] = camera_frame.get(
                 "pointcloud", np.zeros(frame["camera_pointcloud"][0].shape, np.float32)
             )
-        small_payload = {
-            "camera": {
-                key: value
-                for key, value in (camera_frame or {}).items()
-                if key not in {"header", "rgb", "depth", "pointcloud"}
-            },
-            "signals": signals or {},
-            "arm_qpos_sent": arm_qpos_sent,
-            "diagnostics": diagnostics or {},
-        }
-        encoded, crc = _encode_json(small_payload, capacity=SAMPLE_JSON_BYTES)
-        frame["json_length"][0] = len(encoded)
-        frame["json_crc32"][0] = crc
-        frame["json_payload"][0] = encoded
+        _write_sample_metadata(
+            frame,
+            action=action,
+            camera_frame=camera_frame,
+            signals=signals,
+            arm_qpos_sent=arm_qpos_sent,
+            diagnostics=diagnostics,
+        )
         self.shared.record_sample_ring.write(frame)
         self._frame_count += 1
         return True
@@ -307,7 +455,7 @@ class RecorderClient:
     def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
         if not self._recording or self._stop_requested:
             return None
-        self._write_control(RecorderCommand.STOP, {"reason": reason}, save=success)
+        self._write_control(RecorderCommand.STOP, save=success, stop_reason=reason)
         self._recording = False
         self._stop_requested = True
         return None
@@ -349,8 +497,18 @@ class RecorderClient:
         return False
 
 
-def _unpack_sample(record: np.void) -> tuple[RobotState, RobotAction, dict[str, Any], dict[str, Any]]:
-    payload = _decode_json(record, capacity=SAMPLE_JSON_BYTES)
+def _unpack_sample(
+    record: np.void,
+) -> tuple[
+    RobotState,
+    RobotAction,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    np.ndarray,
+    dict[str, Any],
+]:
+    """Copy one fixed shared-memory sample into RecorderIO-owned values."""
     state = RobotState(
         arm_qpos=np.array(record["arm_qpos"], copy=True),
         arm_qvel=np.array(record["arm_qvel"], copy=True),
@@ -390,14 +548,91 @@ def _unpack_sample(record: np.void) -> tuple[RobotState, RobotAction, dict[str, 
         "landmarks": np.array(record["vr_landmarks"], copy=True),
         "head_quat_wxyz": np.array(record["vr_head_quat_wxyz"], copy=True),
     }
-    camera_frame = dict(payload.get("camera") or {})
+    camera_frame: dict[str, Any] = {
+        "camera_health": int(record["camera_health"]),
+        "camera_fresh": bool(record["camera_fresh"]),
+        "pointcloud_valid": bool(record["pointcloud_valid"]),
+        "frame_number": int(record["camera_frame_number"]),
+        "ring_sequence": int(record["camera_ring_sequence"]),
+        "device_timestamp_s": float(record["camera_device_timestamp_s"]),
+        "capture_monotonic_s": float(record["camera_capture_monotonic_s"]),
+        "camera_age_s": float(record["camera_age_s"]),
+        "camera_generation": int(record["camera_generation"]),
+        "clock_reset": bool(record["camera_clock_reset"]),
+        "duplicate": bool(record["camera_duplicate"]),
+        "frame_gap": int(record["camera_frame_gap"]),
+        "backlog_s": float(record["camera_backlog_s"]),
+    }
     if bool(record["camera_present"]):
         camera_frame.update(
             rgb=np.array(record["camera_rgb"], copy=True),
             depth=np.array(record["camera_depth"], copy=True),
             pointcloud=np.array(record["camera_pointcloud"], copy=True),
         )
-    return state, action, vr_frame, {**payload, "camera": camera_frame}
+    signal_names = (
+        "observation_id",
+        "observation_anchor_monotonic_ns",
+        "arm_source_sequence",
+        "hand_source_sequence",
+        "vr_source_sequence",
+        "camera_source_sequence",
+        "arm_source_monotonic_ns",
+        "hand_source_monotonic_ns",
+        "vr_source_monotonic_ns",
+        "camera_source_monotonic_ns",
+        "arm_publish_monotonic_ns",
+        "hand_publish_monotonic_ns",
+        "vr_publish_monotonic_ns",
+        "camera_publish_monotonic_ns",
+        "observation_source_receive_monotonic_ns",
+        "observation_source_age_s",
+        "observation_source_skew_s",
+        "observation_history_valid_mask",
+        "observation_valid",
+        "observation_skew_s",
+        "action_id",
+        "action_created_monotonic_ns",
+        "action_target_monotonic_ns",
+        "action_valid_until_monotonic_ns",
+        "action_arm_joint_raw",
+        "tactile_fresh",
+        "tactile_source_monotonic_ns",
+        "tactile_calibrated",
+        "tactile_unit_code",
+        "pointcloud_source_point_count",
+        "pointcloud_valid_depth_ratio",
+        "pointcloud_padding_count",
+        "flag_ik_ok",
+        "flag_ik_attempted",
+        "flag_retarget_ok",
+        "flag_held",
+        "flag_safety_reject",
+    )
+
+    def _copy_field(name: str) -> Any:
+        value = record[name]
+        return np.array(value, copy=True) if np.asarray(value).ndim else value.item()
+
+    signals = {name: _copy_field(name) for name in signal_names}
+    signals["action_queued"] = bool(record["flag_action_queued"])
+    signals["frame_status"] = int(record["flag_frame_status"])
+    diagnostics = {
+        name: _copy_field(name)
+        for name in (
+            "tracking_error",
+            "ik_solve_time_ms",
+            "target_pos_before_clamp",
+            "head_quat_wxyz",
+            "target_eef_pos_raw",
+            "target_eef_rot6d_raw",
+            "action_hand_joint_raw",
+            "policy_map_time_ms",
+            "hand_retarget_time_ms",
+            "transition_check_time_ms",
+            "policy_compute_time_ms",
+        )
+    }
+    return state, action, vr_frame, camera_frame, signals, np.array(record["arm_qpos_sent"], copy=True), diagnostics
 
 
 def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
@@ -426,7 +661,6 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             control_hz=config.control_hz,
             min_frames=config.min_frames,
             arm_sent_stream=True,
-            resolved_config_json=config.resolved_config_json,
             resolved_config_hash=config.resolved_config_sha256,
             provenance=dict(config.provenance),
             camera_writer_config=CameraStreamWriterConfig(
@@ -457,10 +691,11 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             if control is not None and RecorderCommand(int(control["command"])) is RecorderCommand.START:
                 generation = int(control["generation"])
                 try:
-                    metadata = _decode_json(control, capacity=CONTROL_JSON_BYTES)
-                    camera_K = metadata.get("camera_K")
-                    if camera_K is not None:
-                        metadata["camera_K"] = np.asarray(camera_K, dtype=np.float64)
+                    metadata = _build_start_metadata(
+                        shared,
+                        task_label=_control_text(control, "task_label"),
+                        operator=_control_text(control, "operator"),
+                    )
                     if not recorder.start_episode(**metadata):
                         raise RuntimeError("EpisodeRecorder refused start")
                     active_generation = generation
@@ -487,21 +722,19 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                 if not recorder.is_recording or int(record["generation"]) != active_generation:
                     continue
                 try:
-                    state, action, vr_frame, payload = _unpack_sample(record)
-                    camera_frame = payload["camera"] or None
+                    state, action, vr_frame, camera_frame, signals, arm_qpos_sent, diagnostics = _unpack_sample(record)
                     if (
                         not recorder.add_frame(
                             state,
                             action,
                             vr_frame,
+                            # Keep typed camera quality metadata even when the
+                            # image payload is absent; EpisodeRecorder fills
+                            # shape-stable zero arrays for that grid slot.
                             camera_frame=camera_frame,
-                            signals=payload.get("signals") or {},
-                            arm_qpos_sent=(
-                                np.asarray(payload["arm_qpos_sent"], dtype=np.float64)
-                                if payload.get("arm_qpos_sent") is not None
-                                else None
-                            ),
-                            diagnostics=payload.get("diagnostics") or {},
+                            signals=signals,
+                            arm_qpos_sent=arm_qpos_sent,
+                            diagnostics=diagnostics,
                         )
                         and recorder.camera_writer_error
                     ):
@@ -516,8 +749,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
 
             if control is not None and RecorderCommand(int(control["command"])) is RecorderCommand.STOP:
                 generation = int(control["generation"])
-                metadata = _decode_json(control, capacity=CONTROL_JSON_BYTES)
-                pending_stop = (generation, bool(control["save"]), str(metadata.get("reason", "")))
+                pending_stop = (generation, bool(control["save"]), _control_text(control, "stop_reason"))
 
             # An unexpected policy/main shutdown may arrive before the policy
             # can publish STOP.  Do not keep the RecorderIO child alive merely
@@ -529,7 +761,6 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             if pending_stop is not None and pending_stop[0] == active_generation and recorder.is_recording:
                 generation, save, reason = pending_stop
                 completed_frame_count = recorder.frame_count
-                _publish_status(shared, RecorderPhase.STOPPING, generation, frame_count=completed_frame_count)
                 path = recorder.stop_episode(success=save, reason=reason)
                 joined = recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S)
                 error = recorder.stop_error or ("" if joined else "episode finalization timed out")

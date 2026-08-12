@@ -38,7 +38,7 @@ camera / VR / arm / hand ──shared-memory state──► teleop or learned po
                                                      │
                                          aligned sample ring
                                                      ▼
-                                            RecorderIO ──► HDF5 episode v15
+                                            RecorderIO ──► HDF5 episode v16
 ```
 
 The main/lifecycle process resolves immutable configuration, creates
@@ -57,13 +57,13 @@ producers and consumers.
 | Cross-process state/action layout | `utils/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
 | Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers, readiness, heartbeat, shutdown |
 | VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
-| Learned-policy behavior | `policy/spec.py`, `policy/learned_coordinator.py` | inference worker, observation sources, action protocol, deployment lifecycle |
+| Learned-policy behavior | `policy/spec.py`, `policy/learned_coordinator.py` | current-tick inference mailbox, observation sources, run generation/action protocol, deployment lifecycle |
 | Arm/hand safety or servo behavior | `robot/arm_loop.py`, `robot/hand_process.py` | `robot/safety.py`, action protocol, supervisor, homing and e-stop paths |
 | FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
-| Episode schema or quality rule | `recording/` | reader, analysis, replay consumers, schema marker, old-format behavior |
+| Episode schema or quality rule | `recording/` | reader, analysis, visualization, replay consumers, v16 schema contract |
 | Replay behavior | `examples/replay_episode.py` | provenance/dense preflight, session/runner, metrics, live safety path |
 | Episode visualization | `examples/visualize_episode.py` | Rerun integration, EpisodeReader, point cloud, time-series views |
-| Calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit write/confirmation path and operational JSON compatibility |
+| Calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit write/confirmation path and calibration JSON contract |
 | CLI surface | `examples/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
 
 ## 3. Non-negotiable architecture
@@ -96,6 +96,13 @@ Preserve these unless the user explicitly requests an architectural redesign.
 12. Firmware is the final safety backstop. Application checks protect command
     validity, recovery, data quality, and coordinated stop—they do not replace
     firmware limits.
+13. `run_generation` invalidates learned-policy observations and mailbox
+    candidates across begin, pause, home, feedback fault, and camera re-warm.
+    Controllers accept only a candidate from the active generation and assign
+    its action ID before it crosses the command boundary.
+14. Recorder START/STOP boundaries, recorder status, and aligned samples are
+    fixed NumPy dtypes. Do not put JSON or an acknowledgement/apply protocol in
+    the shared-memory control path.
 
 ## 4. Hardware and operational safety
 
@@ -124,15 +131,18 @@ Use the smallest vertical slice that fully preserves a contract.
 | Change | Required impact check |
 |---|---|
 | Add/change arm or hand state | dtype → documentation dataclass → worker write → policy read → recording path → reader/analysis if persisted |
-| Add/change a recording dataset | recorder → reader → analysis → replay consumer → schema marker → backward-compatible old reader |
+| Add/change a recording dataset | schema dtype → recorder → reader → analysis/visualization → replay consumer → v16 schema contract |
 | Add/change a ring or queue | `SharedStorage` create/close → producer → consumer → readiness/heartbeat → failure/shutdown behavior |
+| Change learned-policy candidate flow | runtime/spec → tensor block/inference worker → coordinator generation/freshness → SafetyGate → action protocol |
 | Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
 | Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
 | Change safety/fault transition | supervisor + policy + arm + hand + shutdown + e-stop, including sticky-fault behavior |
 | Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
-Do not silently change HDF5 meaning in place. Add fields compatibly and keep
-older episodes readable; readers must tolerate optional legacy datasets.
+Do not silently change HDF5 meaning in place. Runtime episodes use schema v16
+only: coordinate a format change across writer, reader, visualization, replay,
+and the schema marker. Migrate historical episodes outside the runtime before
+using them.
 
 ## 6. Implementation rules
 

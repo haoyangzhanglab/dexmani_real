@@ -55,7 +55,7 @@ from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import (
     SafetyGateConfig,
     SafetyGate,
-    advance_policy_epoch,
+    advance_run_generation,
     hand_home_converge,
     planner_action_safety_gate,
     publish_joint_targets,
@@ -234,15 +234,11 @@ class TrajectoryData:
 
 
 def resolve_episode_path(raw_path: str) -> tuple[str, str]:
-    """Resolve an episode directory, its data.h5, or a legacy flat HDF5 file."""
+    """Validate and name one schema-v16 episode directory."""
     path = Path(raw_path)
-    if path.is_file() and path.name == "data.h5":
-        parent = path.parent
-        if (parent / "depth.h5").exists() or (parent / "rgb.mp4").exists():
-            return str(parent), parent.name
-    if path.is_dir():
-        return str(path), path.name
-    return str(path), path.stem
+    if not path.is_dir():
+        raise ValueError(f"episode must be a schema-v16 directory: {path}")
+    return str(path), path.name
 
 
 def load_trajectory(
@@ -253,7 +249,7 @@ def load_trajectory(
     require_live_validity: bool = False,
     require_exact_source: bool = False,
 ) -> TrajectoryData:
-    """Load one command trajectory while keeping older episodes offline-readable."""
+    """Load one command trajectory from a schema-v16 episode."""
     if max_frames is not None and max_frames <= 0:
         raise ValueError("max_frames must be positive when provided")
     if source not in {"cmd", "sent"}:
@@ -268,14 +264,6 @@ def load_trajectory(
             reader.require_valid(purpose="live replay")
         h5 = reader.h5f
         meta = h5.get("meta")
-        schema = meta.attrs.get("schema_version") if meta is not None else None
-        try:
-            schema_version = None if schema is None else int(schema)
-        except (TypeError, ValueError):
-            schema_version = None
-        if schema_version is not None and schema_version < 3:
-            logger.warning("HDF5 schema v%d < 3; optional replay fields may be absent", schema_version)
-
         num_frames_attr = int(meta.attrs.get("num_frames", 0)) if meta is not None else 0
         fps = float(reader.timing.rate_hz)
         if not _MIN_EPISODE_RATE_HZ <= fps <= _MAX_EPISODE_RATE_HZ:
@@ -1140,11 +1128,11 @@ class TrajectoryReplayer:
         newer_than_ns: int,
         timeout_s: float,
     ) -> tuple[np.ndarray, np.ndarray | None]:
-        """Wait for healthy measured joints published after an epoch change."""
+        """Wait for healthy measured joints published after a run change."""
         assert self.shared is not None
         assert self.runtime is not None
         deadline_s = time.monotonic() + timeout_s
-        last_issue = "feedback not yet newer than the replay epoch"
+        last_issue = "feedback not yet newer than the replay run"
         while time.monotonic() < deadline_s:
             runtime_issue = self._runtime_issue()
             if runtime_issue is not None:
@@ -1159,7 +1147,7 @@ class TrajectoryReplayer:
                 if int(arm_state["error_code"]) != 0:
                     arm_issue = f"arm controller error C{int(arm_state['error_code'])}"
                 elif int(arm_state["source_monotonic_ns"]) <= newer_than_ns:
-                    arm_issue = "arm feedback not yet newer than the replay epoch"
+                    arm_issue = "arm feedback not yet newer than the replay run"
 
             hand_state: dict[str, Any] | None = None
             hand_issue: str | None = None
@@ -1171,7 +1159,7 @@ class TrajectoryReplayer:
                 ):
                     hand_issue = "hand feedback is unavailable or unhealthy"
                 elif hand_state is not None and int(hand_state["source_monotonic_ns"]) <= newer_than_ns:
-                    hand_issue = "hand feedback not yet newer than the replay epoch"
+                    hand_issue = "hand feedback not yet newer than the replay run"
 
             if arm_issue is None and hand_issue is None and arm_state is not None:
                 arm_qpos = np.asarray(arm_state["qpos"], dtype=np.float64).copy()
@@ -1188,10 +1176,10 @@ class TrajectoryReplayer:
         assert self.runtime is not None
         apply_timeout_s = float(self.runtime.policy.action_apply_timeout_s)
         try:
-            epoch = advance_policy_epoch(self.shared)
-            epoch_changed_ns = time.monotonic_ns()
+            run_generation = advance_run_generation(self.shared)
+            run_changed_ns = time.monotonic_ns()
             arm_qpos, hand_qpos = self._read_terminal_hold_targets(
-                newer_than_ns=epoch_changed_ns,
+                newer_than_ns=run_changed_ns,
                 timeout_s=apply_timeout_s,
             )
         except (RuntimeError, TimeoutError, ValueError) as exc:
@@ -1209,8 +1197,8 @@ class TrajectoryReplayer:
             apply_timeout_s=apply_timeout_s,
         )
         if candidate is None:
-            return f"measured hold was rejected or not applied after advancing to epoch {epoch}"
-        logger.info("replay terminal hold applied (epoch=%d action_id=%d)", epoch, candidate.action_id)
+            return f"measured hold was rejected or not applied after advancing to run {run_generation}"
+        logger.info("replay terminal hold applied (run=%d action_id=%d)", run_generation, candidate.action_id)
         return None
 
     def _poll_control(self, keyboard: KeyboardHandler, timeout_s: float) -> bool:
@@ -2016,7 +2004,7 @@ Live replay controls:
         "episode",
         nargs="?",
         type=str,
-        help="Episode directory, data.h5, or legacy flat HDF5 file.",
+        help="Published schema-v16 episode directory.",
     )
     parser.add_argument(
         "--h5",

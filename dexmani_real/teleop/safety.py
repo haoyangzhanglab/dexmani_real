@@ -13,7 +13,6 @@ from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.runtime import ActionCandidate
-from dexmani_real.policy.safety import send_command
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper

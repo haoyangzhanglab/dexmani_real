@@ -815,8 +815,3 @@ tag_retargeting = TAGRetargetingParams()
 environment = EnvironmentConfig()
 
 
-def load_config_json(path: str):
-    """Compatibility alias for existing JSON experiment files."""
-    from dexmani_real.config.runtime import resolve_runtime_config
-
-    return resolve_runtime_config(json_path=path)

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import numpy as np
 
-RECORD_CONTROL_JSON_BYTES = 65_536
-RECORD_SAMPLE_JSON_BYTES = 32_768
+RECORD_TASK_LABEL_BYTES = 128
+RECORD_OPERATOR_BYTES = 128
+RECORD_STOP_REASON_BYTES = 512
 RECORD_STATUS_TEXT_BYTES = 2_048
 
 ARM_DOF = 7
@@ -28,12 +29,9 @@ HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
 _COMMAND_COMMON_FIELDS = [
-    ("session_generation", "<u8"),
-    ("policy_epoch", "<u8"),
+    ("run_generation", "<u8"),
     ("observation_id", "<u8"),
     ("action_id", "<u8"),
-    ("chunk_id", "<u8"),
-    ("step_index", "<u4"),
     ("created_monotonic_ns", "<u8"),
     ("target_monotonic_ns", "<u8"),
     ("valid_until_monotonic_ns", "<u8"),
@@ -46,12 +44,7 @@ HAND_COMMAND_DTYPE = np.dtype(_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND
 INFERENCE_CANDIDATE_DTYPE = np.dtype(
     [
         ("observation_id", "<u8"),
-        ("session_generation", "<u8"),
-        ("policy_epoch", "<u8"),
-        ("action_id", "<u8"),
-        ("chunk_id", "<u8"),
-        ("step_index", "<u4"),
-        ("chunk_length", "<u4"),
+        ("run_generation", "<u8"),
         ("created_monotonic_ns", "<u8"),
         ("target_monotonic_ns", "<u8"),
         ("valid_until_monotonic_ns", "<u8"),
@@ -179,9 +172,9 @@ RECORD_CONTROL_DTYPE = np.dtype(
         ("generation", "<u8"),
         ("save", "<u1"),
         ("created_monotonic_ns", "<u8"),
-        ("json_length", "<u4"),
-        ("json_crc32", "<u4"),
-        ("json_payload", f"S{RECORD_CONTROL_JSON_BYTES}"),
+        ("task_label", f"S{RECORD_TASK_LABEL_BYTES}"),
+        ("operator", f"S{RECORD_OPERATOR_BYTES}"),
+        ("stop_reason", f"S{RECORD_STOP_REASON_BYTES}"),
     ],
     align=True,
 )
@@ -249,9 +242,73 @@ def make_record_sample_dtype(
             ("camera_rgb", "<u1", rgb_shape),
             ("camera_depth", "<u2", depth_shape),
             ("camera_pointcloud", "<f4", pointcloud_shape),
-            ("json_length", "<u4"),
-            ("json_crc32", "<u4"),
-            ("json_payload", f"S{RECORD_SAMPLE_JSON_BYTES}"),
+            # Typed per-grid metadata required to reconstruct recorder input.
+            # Legacy HDF5-only defaults stay inside RecorderIO rather than
+            # becoming permanent cross-process fields.
+            ("arm_qpos_sent", "<f8", ARM_JOINT_SHAPE),
+            ("observation_id", "<u8"),
+            ("observation_anchor_monotonic_ns", "<u8"),
+            ("arm_source_sequence", "<u8"),
+            ("hand_source_sequence", "<u8"),
+            ("vr_source_sequence", "<u8"),
+            ("camera_source_sequence", "<u8"),
+            ("arm_source_monotonic_ns", "<u8"),
+            ("hand_source_monotonic_ns", "<u8"),
+            ("vr_source_monotonic_ns", "<u8"),
+            ("camera_source_monotonic_ns", "<u8"),
+            ("arm_publish_monotonic_ns", "<u8"),
+            ("hand_publish_monotonic_ns", "<u8"),
+            ("vr_publish_monotonic_ns", "<u8"),
+            ("camera_publish_monotonic_ns", "<u8"),
+            ("observation_source_receive_monotonic_ns", "<u8", (4,)),
+            ("observation_source_age_s", "<f8", (4,)),
+            ("observation_source_skew_s", "<f8", (4,)),
+            ("observation_history_valid_mask", "<u1", (4, 1)),
+            ("observation_valid", "<u1"),
+            ("observation_skew_s", "<f8"),
+            ("action_id", "<u8"),
+            ("action_created_monotonic_ns", "<u8"),
+            ("action_target_monotonic_ns", "<u8"),
+            ("action_valid_until_monotonic_ns", "<u8"),
+            ("action_arm_joint_raw", "<f8", ARM_JOINT_SHAPE),
+            ("action_hand_joint_raw", "<f8", HAND_JOINT_SHAPE),
+            ("flag_action_queued", "<u1"),
+            ("tactile_fresh", "<u1"),
+            ("tactile_source_monotonic_ns", "<u8"),
+            ("tactile_calibrated", "<u1"),
+            ("tactile_unit_code", "<u1"),
+            ("pointcloud_source_point_count", "<u4"),
+            ("pointcloud_valid_depth_ratio", "<f8"),
+            ("pointcloud_padding_count", "<u4"),
+            ("flag_ik_ok", "<u1"),
+            ("flag_ik_attempted", "<u1"),
+            ("flag_retarget_ok", "<u1"),
+            ("flag_held", "<u1"),
+            ("flag_safety_reject", "<u1"),
+            ("flag_frame_status", "<u1"),
+            ("camera_health", "<u1"),
+            ("camera_fresh", "<u1"),
+            ("pointcloud_valid", "<u1"),
+            ("camera_frame_number", "<u8"),
+            ("camera_ring_sequence", "<u8"),
+            ("camera_device_timestamp_s", "<f8"),
+            ("camera_capture_monotonic_s", "<f8"),
+            ("camera_age_s", "<f8"),
+            ("camera_generation", "<u8"),
+            ("camera_clock_reset", "<u1"),
+            ("camera_duplicate", "<u1"),
+            ("camera_frame_gap", "<u4"),
+            ("camera_backlog_s", "<f8"),
+            ("tracking_error", "<f8"),
+            ("ik_solve_time_ms", "<f8"),
+            ("target_pos_before_clamp", "<f8", (3,)),
+            ("head_quat_wxyz", "<f8", (4,)),
+            ("target_eef_pos_raw", "<f8", (3,)),
+            ("target_eef_rot6d_raw", "<f8", (6,)),
+            ("policy_map_time_ms", "<f8"),
+            ("hand_retarget_time_ms", "<f8"),
+            ("transition_check_time_ms", "<f8"),
+            ("policy_compute_time_ms", "<f8"),
         ],
         align=True,
     )
@@ -266,7 +323,10 @@ __all__ = [
     "HAND_TACTILE_DTYPE",
     "INFERENCE_CANDIDATE_DTYPE",
     "RECORD_CONTROL_DTYPE",
+    "RECORD_OPERATOR_BYTES",
     "RECORD_STATUS_DTYPE",
+    "RECORD_STOP_REASON_BYTES",
+    "RECORD_TASK_LABEL_BYTES",
     "VR_FRAME_DTYPE",
     "make_record_sample_dtype",
 ]

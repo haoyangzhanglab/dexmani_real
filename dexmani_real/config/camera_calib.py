@@ -3,9 +3,7 @@
 Loads per-camera extrinsics from a bundled cameras.json data file.
 Supports eye-to-hand (static camera) and eye-in-hand (end-effector mounted).
 
-Two storage formats are supported:
-
-1. **Pose format** (recommended, human-readable)::
+The storage format is a human-readable pose::
 
        {
          "camera_0": {
@@ -20,16 +18,6 @@ Two storage formats are supported:
 
    ``position`` is XYZ in meters, ``orientation`` is WXYZ quaternion.
    Converted to a 4×4 homogeneous matrix at load time.
-
-2. **Matrix format** (legacy, for backward compatibility)::
-
-       {
-         "camera_0": {
-           "serial": "...",
-           "type": "eye_to_hand",
-           "T_base_camera": [[...], ...]
-         }
-       }
 
 Intrinsics (K matrix) are read from the RealSense hardware at runtime and stored
 into HDF5 /meta for self-contained episodes.  New calibration entries may also
@@ -102,26 +90,9 @@ class CameraCalib:
 
     @classmethod
     def _resolve_default_path(cls) -> str:
-        """Find cameras.json using priority-ordered search paths.
-
-        1. Package directory: ``dexmani_real/config/cameras.json``
-        2. Project root (legacy): ``<project>/configs/cameras.json``
-        3. Package legacy fallback: ``dexmani_real/config/calib/cameras.json``
-        """
+        """Return the single authoritative cameras.json path."""
         pkg_dir = Path(__file__).resolve().parent  # dexmani_real/config/
-        project_root = pkg_dir.parent.parent
-
-        candidates = [
-            pkg_dir / "cameras.json",  # in-package (recommended)
-            project_root / "configs" / "cameras.json",  # legacy top-level
-            pkg_dir / "calib" / "cameras.json",  # legacy in-package
-        ]
-        for cand in candidates:
-            if cand.exists():
-                return str(cand)
-        # Default to the recommended path (let _load() raise FileNotFoundError
-        # with a helpful message if the file doesn't exist).
-        return str(candidates[0])
+        return str(pkg_dir / "cameras.json")
 
     def _load(self) -> None:
         if not self.calib_path.exists():
@@ -133,31 +104,23 @@ class CameraCalib:
             )
         with open(self.calib_path) as f:
             raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise TypeError("camera calibration root must be an object")
 
         for cam_name, cam in raw.items():
-            # Resolve extrinsics: prefer pose format, fall back to legacy matrix format
-            T_world_camera = None
-            T_eef_camera = None
-
-            if "pose" in cam:
-                # Pose format (recommended): position + orientation quaternion
-                pose = cam["pose"]
-                T = _pose_to_matrix(pose["position"], pose["orientation"])
-                if cam["type"] == "eye_to_hand":
-                    T_world_camera = T
-                else:
-                    T_eef_camera = T
-            else:
-                # Legacy matrix format (accept new + old key names for eye-to-hand)
-                mat = cam.get("T_world_camera", cam.get("T_base_camera"))
-                if mat is not None:
-                    T_world_camera = np.array(mat, dtype=np.float64)
-                if cam.get("T_eef_camera") is not None:
-                    T_eef_camera = np.array(cam["T_eef_camera"], dtype=np.float64)
+            if not isinstance(cam, dict):
+                raise TypeError(f"camera calibration entry {cam_name!r} must be an object")
+            pose = cam.get("pose")
+            if not isinstance(pose, dict):
+                raise ValueError(f"camera calibration entry {cam_name!r} requires pose.position and pose.orientation")
+            T = _pose_to_matrix(pose["position"], pose["orientation"])
+            camera_type = cam["type"]
+            T_world_camera = T if camera_type == "eye_to_hand" else None
+            T_eef_camera = T if camera_type == "eye_in_hand" else None
 
             entry = CameraCalibEntry(
                 serial=cam["serial"],
-                type=cam["type"],
+                type=camera_type,
                 T_world_camera=T_world_camera,
                 T_eef_camera=T_eef_camera,
             )

@@ -28,8 +28,7 @@ from dexmani_real.utils.schema import (
 )
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
-from dexmani_real.shm.ring_buffer import CameraRingBuffer
-from dexmani_real.shm.robot_ring import SeqlockRingBuffer
+from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -59,9 +58,9 @@ class SharedStorageConfig:
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
-    record_control_ring_maxlen: int = 8
+    record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
-    record_status_ring_maxlen: int = 16
+    record_status_ring_maxlen: int = 1
     inference_candidate_ring_maxlen: int = 16
     enable_inference: bool = False
 
@@ -153,10 +152,6 @@ class HomeResult:
     completed_at_s: float
 
 
-# Backward-compatible alias retained for external callers; the canonical
-# command schema is defined in dexmani_real.utils.schema.
-HAND_CMD_DTYPE = HAND_COMMAND_DTYPE
-
 _RING_RESOURCE_NAMES = (
     "camera_ring",
     "vr_ring",
@@ -187,21 +182,20 @@ class SharedStorage:
     """
 
     camera_ring: CameraRingBuffer  # camera -> policy
-    vr_ring: SeqlockRingBuffer  # vr -> policy
-    arm_state_ring: SeqlockRingBuffer  # arm -> policy
-    hand_state_ring: SeqlockRingBuffer  # hand -> policy
-    hand_tactile_ring: SeqlockRingBuffer  # hand -> policy (sparse)
-    hand_cmd_ring: SeqlockRingBuffer  # policy -> hand
-    record_control_ring: SeqlockRingBuffer  # policy -> RecorderIO episode boundary
-    record_sample_ring: SeqlockRingBuffer  # policy -> RecorderIO fixed payload
-    record_status_ring: SeqlockRingBuffer  # RecorderIO -> policy/main
+    vr_ring: SharedMemoryRingBuffer  # vr -> policy
+    arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
+    hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
+    hand_tactile_ring: SharedMemoryRingBuffer  # hand -> policy (sparse)
+    hand_cmd_ring: SharedMemoryRingBuffer  # policy -> hand
+    record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
+    record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
+    record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
     inference_candidate_ring: Any  # experimental capability; None unless explicitly enabled
 
     arm_action_q: mp.Queue  # policy -> arm, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
     arm_command_seq: Any  # all arm-action producers -> globally unique monotonic IDs
-    session_generation: Any
-    policy_epoch: Any
+    run_generation: Any  # controller advances it to invalidate old policy proposals
     recorder_consumed_sequence: Any
     action_control_hz: float
     action_lead_time_s: float
@@ -303,44 +297,44 @@ class SharedStorage:
             maxlen=cfg.camera_ring_maxlen,
             create=True,
         )
-        storage.vr_ring = SeqlockRingBuffer.create_or_replace(
+        storage.vr_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_vr",
             dtype=vr_frame_dtype(),
             maxlen=cfg.vr_ring_maxlen,
         )
-        storage.arm_state_ring = SeqlockRingBuffer.create_or_replace(
+        storage.arm_state_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_arm_state",
             dtype=ARM_STATE_DTYPE,
             maxlen=cfg.arm_state_ring_maxlen,
         )
-        storage.hand_state_ring = SeqlockRingBuffer.create_or_replace(
+        storage.hand_state_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_hand_state",
             dtype=HAND_STATE_DTYPE,
             maxlen=cfg.hand_state_ring_maxlen,
         )
-        storage.hand_tactile_ring = SeqlockRingBuffer.create_or_replace(
+        storage.hand_tactile_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_hand_tactile",
             dtype=HAND_TACTILE_DTYPE,
             maxlen=cfg.hand_tactile_ring_maxlen,
         )
-        storage.hand_cmd_ring = SeqlockRingBuffer.create_or_replace(
+        storage.hand_cmd_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_hand_cmd",
-            dtype=HAND_CMD_DTYPE,
+            dtype=HAND_COMMAND_DTYPE,
             maxlen=cfg.hand_cmd_ring_maxlen,
         )
-        storage.record_control_ring = SeqlockRingBuffer.create_or_replace(
+        storage.record_control_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_record_control", dtype=RECORD_CONTROL_DTYPE, maxlen=cfg.record_control_ring_maxlen
         )
-        storage.record_sample_ring = SeqlockRingBuffer.create_or_replace(
+        storage.record_sample_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_record_sample",
             dtype=make_record_sample_dtype(rgb_shape, depth_shape, cfg.camera_pc_shape),
             maxlen=cfg.record_sample_ring_maxlen,
         )
-        storage.record_status_ring = SeqlockRingBuffer.create_or_replace(
+        storage.record_status_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_record_status", dtype=RECORD_STATUS_DTYPE, maxlen=cfg.record_status_ring_maxlen
         )
         storage.inference_candidate_ring = (
-            SeqlockRingBuffer.create_or_replace(
+            SharedMemoryRingBuffer.create_or_replace(
                 f"{prefix}_inference_candidate",
                 dtype=INFERENCE_CANDIDATE_DTYPE,
                 maxlen=cfg.inference_candidate_ring_maxlen,
@@ -352,8 +346,7 @@ class SharedStorage:
         storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
         storage.arm_home_result_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
         storage.arm_command_seq = ctx.Value("Q", 0)
-        storage.session_generation = ctx.Value("Q", time.monotonic_ns())
-        storage.policy_epoch = ctx.Value("Q", 1)
+        storage.run_generation = ctx.Value("Q", 1)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.action_control_hz = float(cfg.control_hz)
         storage.action_lead_time_s = 2.0 / min(float(cfg.arm_loop_hz), float(cfg.hand_loop_hz))

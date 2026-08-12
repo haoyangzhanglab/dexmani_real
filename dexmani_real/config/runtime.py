@@ -1,12 +1,11 @@
-"""Resolve immutable experiment configuration from YAML or legacy JSON.
+"""Resolve an immutable experiment configuration from YAML.
 
 The module-level objects in :mod:`dexmani_real.config.defaults` are convenient
 templates, but they are not a safe runtime configuration transport: mutating a
 template after another module imported it makes process startup order affect
 the effective configuration. This module resolves a fresh snapshot using the
 single precedence rule ``CLI > file > defaults`` and gives that snapshot a
-stable canonical-JSON SHA-256 identity. YAML is the primary experiment format;
-JSON input remains readable for existing experiments.
+stable canonical-JSON SHA-256 identity.
 """
 
 from __future__ import annotations
@@ -220,36 +219,35 @@ def resolve_runtime_config(
     *,
     yaml_path: str | Path | None = None,
     data: Mapping[str, Any] | None = None,
-    json_path: str | Path | None = None,
-    json_data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ResolvedRuntimeConfig:
     """Resolve ``CLI > file/data > defaults`` without mutating global defaults.
 
     CLI keys may be nested mappings or dotted paths such as
     ``{"arm.ip": "192.0.2.1"}``.  ``None`` CLI values mean "not supplied" and
-    therefore never mask file/default values. ``json_path`` and ``json_data``
-    are compatibility spellings; JSON is valid YAML and follows the same path.
+    therefore never mask file/default values.
     """
     from dexmani_real.config import defaults
 
-    sources = [yaml_path is not None, data is not None, json_path is not None, json_data is not None]
+    sources = [yaml_path is not None, data is not None]
     if sum(sources) > 1:
-        raise ValueError("provide at most one of yaml_path, data, json_path, or json_data")
+        raise ValueError("provide at most one of yaml_path or data")
     base = {name: _plain_value(getattr(defaults, name)) for name in _SECTION_NAMES}
 
     file_overrides: Mapping[str, Any] = {}
-    config_path = yaml_path if yaml_path is not None else json_path
-    if config_path is not None:
-        with Path(config_path).open("r", encoding="utf-8") as stream:
+    if yaml_path is not None:
+        config_path = Path(yaml_path)
+        if config_path.suffix.lower() not in {".yaml", ".yml"}:
+            raise ValueError("experiment config path must use a .yaml or .yml suffix")
+        with config_path.open("r", encoding="utf-8") as stream:
             loaded = yaml.safe_load(stream)
         if loaded is None:
             loaded = {}
         if not isinstance(loaded, Mapping):
             raise TypeError("experiment config root must be a mapping")
         file_overrides = loaded
-    elif data is not None or json_data is not None:
-        file_overrides = data if data is not None else json_data or {}
+    elif data is not None:
+        file_overrides = data
 
     merged = _merge(base, file_overrides)
     merged = _merge(merged, _expand_dotted(cli_overrides))

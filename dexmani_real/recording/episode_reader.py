@@ -1,14 +1,12 @@
-"""Unified HDF5 episode reader.
+"""Reader for the current transactional HDF5 episode format.
 
 Reads camera frames from DexMani episodes. Non-camera datasets
 (arm_qpos, hand_qpos, flags, etc.) are accessed directly through
 :attr:`h5f` — a merged view of the episode HDF5 sidecars.
 
-Supports two formats:
-
-- **Legacy** (single ``.h5`` file): everything in one flat HDF5.
-- **v13 directory**: ``data.h5`` (non-camera + pointcloud), ``depth.h5``, ``rgb.mp4``.
-- **v14–v15 directory**: ``data.h5``, ``depth.h5``, ``pointcloud.h5``, ``rgb.mp4``.
+An episode is one published directory containing ``data.h5``, ``depth.h5``,
+``pointcloud.h5`` and ``rgb.mp4``. Older flat HDF5 files and pre-v16 episode
+directories intentionally require an external migration tool.
 
 Usage::
 
@@ -42,12 +40,11 @@ logger = get_logger(__name__)
 class ValidityState(str, Enum):
     VALID = "VALID"
     INVALID = "INVALID"
-    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)
 class EpisodeTiming:
-    """Normalized timing view for legacy and schema-v13+ episodes."""
+    """Timing metadata from a schema-v16 episode."""
 
     rate_hz: float
     grid_dt_s: float
@@ -108,45 +105,42 @@ class EpisodeReader:
     """Read camera frames from DexMani episodes.
 
     :attr:`h5f` returns a merged dict-like view over ``data.h5`` and camera
-    sidecars so downstream code that accesses datasets by key
-    (``f["arm_qpos"]``, ``f["depth"]``, ``f["pointcloud"]``) works
-    transparently across both old (single ``.h5``) and new (directory)
-    formats.
+    sidecars so downstream code can access datasets by key
+    (``f["arm_qpos"]``, ``f["depth"]``, ``f["pointcloud"]``).
     """
 
     def __init__(self, h5_path: str | Path) -> None:
         self._path = Path(h5_path)
-        self._is_legacy = self._path.is_file()
         self._closed = False
-        if self._is_legacy:
-            # Old format: single episode_XXX.h5 file.
-            self._data_h5f: h5py.File = h5py.File(self._path, "r")
-            self._h5f = MergedH5File(self._data_h5f)
-            self._rgb_decoder: VideoDecoder | None = None
-        elif self._path.is_dir():
-            # New format: episode_XXX/ directory.
-            data_path = self._path / "data.h5"
-            if not data_path.is_file():
-                raise FileNotFoundError(f"data.h5 not found in {self._path}")
-            depth_path = self._path / "depth.h5"
-            pointcloud_path = self._path / "pointcloud.h5"
-            self._data_h5f = h5py.File(str(data_path), "r")
-            depth_h5f = h5py.File(str(depth_path), "r") if depth_path.is_file() else None
-            pointcloud_h5f = h5py.File(str(pointcloud_path), "r") if pointcloud_path.is_file() else None
-            sidecars = {}
-            if depth_h5f is not None:
-                sidecars["depth"] = depth_h5f
-            if pointcloud_h5f is not None:
-                sidecars["pointcloud"] = pointcloud_h5f
-            self._h5f = MergedH5File(self._data_h5f, sidecars)
-            # RGB sidecar (optional).
-            rgb_mp4 = self._path / "rgb.mp4"
-            self._rgb_decoder = VideoDecoder(rgb_mp4) if rgb_mp4.is_file() else None
-        else:
-            raise FileNotFoundError(f"Episode not found: {self._path}")
-
-        # Lazy pre-decode cache for read_camera_all().
         self._cache: dict[str, np.ndarray] = {}
+        if not self._path.is_dir():
+            raise ValueError(f"episode must be a schema-v16 directory: {self._path}")
+
+        paths = {
+            "data": self._path / "data.h5",
+            "depth": self._path / "depth.h5",
+            "pointcloud": self._path / "pointcloud.h5",
+            "rgb": self._path / "rgb.mp4",
+        }
+        missing = [name for name, path in paths.items() if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"schema-v16 episode is missing required files {missing}: {self._path}")
+
+        self._data_h5f = h5py.File(paths["data"], "r")
+        depth_h5f = h5py.File(paths["depth"], "r")
+        pointcloud_h5f = h5py.File(paths["pointcloud"], "r")
+        self._h5f = MergedH5File(
+            self._data_h5f,
+            {"depth": depth_h5f, "pointcloud": pointcloud_h5f},
+        )
+        self._rgb_decoder = VideoDecoder(paths["rgb"])
+        schema_version = self.schema_version
+        if schema_version != 16:
+            self.close()
+            raise ValueError(
+                f"unsupported episode schema v{schema_version}; expected v16 "
+                "(migrate historical episodes outside the runtime)"
+            )
 
     # -- public properties ------------------------------------------------
 
@@ -170,12 +164,10 @@ class EpisodeReader:
 
     @property
     def validity(self) -> ValidityState:
-        """High-level suitability state; old schemas remain raw-readable."""
+        """Return whether the current schema-v16 episode is internally consistent."""
         meta = self._h5f.get("meta")
         if meta is None:
-            return ValidityState.UNKNOWN
-        if self.schema_version < 15:
-            return ValidityState.UNKNOWN
+            return ValidityState.INVALID
         required = {
             "timestamp",
             "flag_sample_valid",
@@ -202,8 +194,6 @@ class EpisodeReader:
             "observation_source_receive_monotonic_ns",
             "observation_history_valid_mask",
             "action_id",
-            "action_chunk_id",
-            "action_step_index",
             "action_created_monotonic_ns",
             "action_target_monotonic_ns",
             "action_valid_until_monotonic_ns",
@@ -212,19 +202,6 @@ class EpisodeReader:
             "action_arm_joint_raw",
             "action_hand_joint_raw",
             "flag_action_queued",
-            "flag_action_committed",
-            "arm_ack_status",
-            "hand_ack_status",
-            "arm_ack_reject_reason",
-            "hand_ack_reject_reason",
-            "arm_ack_sdk_code",
-            "hand_ack_sdk_code",
-            "arm_received_monotonic_ns",
-            "hand_received_monotonic_ns",
-            "arm_prepared_monotonic_ns",
-            "hand_prepared_monotonic_ns",
-            "arm_applied_monotonic_ns",
-            "hand_applied_monotonic_ns",
             "tactile_fresh",
             "tactile_source_monotonic_ns",
             "tactile_calibrated",
@@ -234,6 +211,9 @@ class EpisodeReader:
             return ValidityState.INVALID
         frame_count = int(meta.attrs.get("num_frames", -1))
         if frame_count < 0 or any(int(self._h5f[key].shape[0]) != frame_count for key in required):
+            return ValidityState.INVALID
+        config_hash = str(meta.attrs.get("resolved_config_sha256", ""))
+        if len(config_hash) != 64:
             return ValidityState.INVALID
         if not bool(meta.attrs.get("success", False)) or str(meta.attrs.get("camera_writer_error", "")):
             return ValidityState.INVALID
@@ -257,7 +237,7 @@ class EpisodeReader:
             if self._rgb_decoder.count_decoded_frames() != frame_count:
                 return ValidityState.INVALID
         except Exception:
-            logger.warning("failed to decode schema-v15 RGB stream", exc_info=True)
+            logger.warning("failed to decode schema-v16 RGB stream", exc_info=True)
             return ValidityState.INVALID
         timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
         sample_valid = np.asarray(self._h5f["flag_sample_valid"][:], dtype=bool)
@@ -349,25 +329,24 @@ class EpisodeReader:
         action_target_ns = np.asarray(self._h5f["action_target_monotonic_ns"][:], dtype=np.uint64)
         action_valid_until_ns = np.asarray(self._h5f["action_valid_until_monotonic_ns"][:], dtype=np.uint64)
         queued = np.asarray(self._h5f["flag_action_queued"][:], dtype=bool)
-        committed = np.asarray(self._h5f["flag_action_committed"][:], dtype=bool)
         held = (
             np.asarray(self._h5f["flag_held"][:], dtype=bool)
             if "flag_held" in self._h5f
             else np.zeros(frame_count, dtype=bool)
         )
-        # A held source sample may intentionally publish no new action.  Active
-        # samples still require an action identity, and protocol flags may never
-        # claim queue/commit progress for the zero-action sentinel.
+        # A held source sample may intentionally publish no new action. Active
+        # samples require an action identity, and queue progress may never
+        # claim the zero-action sentinel.
         if np.any(observation_ids[sample_valid] == 0) or np.any(sample_valid & ~held & (action_ids == 0)):
             return ValidityState.INVALID
-        if np.any((queued | committed) & (action_ids == 0)):
+        if np.any(queued & (action_ids == 0)):
             return ValidityState.INVALID
         action_timing_valid = (
             (action_created_ns > 0)
             & (action_created_ns <= action_target_ns)
             & (action_target_ns <= action_valid_until_ns)
         )
-        if np.any(committed & (~queued | ~action_timing_valid)):
+        if np.any(queued & ~action_timing_valid):
             return ValidityState.INVALID
         action_arrays = (
             ("action_arm_joint", (frame_count, *ARM_JOINT_SHAPE)),
@@ -379,7 +358,7 @@ class EpisodeReader:
             values = np.asarray(self._h5f[name][:], dtype=np.float64)
             if values.shape != expected_shape or np.any(~np.isfinite(values[sample_valid])):
                 return ValidityState.INVALID
-        if np.any(sample_valid & ~held & ~committed):
+        if np.any(sample_valid & ~held & ~queued):
             return ValidityState.INVALID
         return ValidityState.VALID
 
@@ -387,18 +366,13 @@ class EpisodeReader:
         state = self.validity
         if state is not ValidityState.VALID:
             raise ValueError(
-                f"episode validity is {state.value}; {purpose} requires schema-v15 VALID data "
-                "(use an explicit legacy offline tool for older episodes)"
+                f"episode validity is {state.value}; {purpose} requires schema-v16 VALID data "
+                "(the runtime only accepts schema-v16 episodes)"
             )
 
     @property
     def timing(self) -> EpisodeTiming:
-        """Return timing with v13 attrs preferred and safe legacy fallbacks.
-
-        Legacy ``fps`` may have been diluted by pauses because it was computed
-        from wall time.  A valid ``control_hz`` or timestamp grid therefore
-        takes precedence over that attribute.
-        """
+        """Return timing recorded by the schema-v16 fixed control grid."""
         meta = self._h5f.get("meta")
         attrs = meta.attrs if meta is not None else {}
 
@@ -409,7 +383,7 @@ class EpisodeReader:
                 return None
             return result if np.isfinite(result) and result > 0 else None
 
-        timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64) if "timestamp" in self._h5f else None
+        timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
         timestamp_dt_s: float | None = None
         timestamp_duration_s: float | None = None
         if timestamps is not None and timestamps.size >= 2:
@@ -424,30 +398,21 @@ class EpisodeReader:
                     timestamp_duration_s = span
 
         control_hz = _positive(attrs.get("control_hz"))
-        explicit_grid_dt_s = _positive(attrs.get("grid_dt_s"))
-        legacy_fps = _positive(attrs.get("fps"))
-        grid_dt_s = explicit_grid_dt_s or timestamp_dt_s
-        if grid_dt_s is None and control_hz is not None:
-            grid_dt_s = 1.0 / control_hz
-        if grid_dt_s is None and legacy_fps is not None:
-            grid_dt_s = 1.0 / legacy_fps
-        if grid_dt_s is None:
-            grid_dt_s = 1.0 / 16.0
-
-        rate_hz = control_hz or (1.0 / grid_dt_s)
+        grid_dt_s = _positive(attrs.get("grid_dt_s"))
+        if control_hz is None or grid_dt_s is None:
+            raise ValueError("schema-v16 episode has invalid control-grid metadata")
+        rate_hz = control_hz
         explicit_grid_duration_s = attrs.get("grid_duration_s")
         try:
             grid_duration_s = float(explicit_grid_duration_s) if explicit_grid_duration_s is not None else float("nan")
         except (TypeError, ValueError):
             grid_duration_s = float("nan")
         if not np.isfinite(grid_duration_s) or grid_duration_s < 0:
-            if timestamp_duration_s is not None:
-                grid_duration_s = timestamp_duration_s
-            else:
-                num_frames = int(attrs.get("num_frames", len(timestamps) if timestamps is not None else 0))
-                grid_duration_s = max(0, num_frames - 1) * grid_dt_s
+            if timestamp_duration_s is None:
+                raise ValueError("schema-v16 episode has invalid grid_duration_s")
+            grid_duration_s = timestamp_duration_s
 
-        wall_duration_s = float(attrs.get("wall_duration_s", attrs.get("duration", grid_duration_s)))
+        wall_duration_s = float(attrs.get("wall_duration_s", grid_duration_s))
         if not np.isfinite(wall_duration_s) or wall_duration_s < 0:
             wall_duration_s = grid_duration_s
         non_sampled_duration_s = float(attrs.get("non_sampled_duration_s", max(0.0, wall_duration_s - grid_duration_s)))
@@ -467,16 +432,13 @@ class EpisodeReader:
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
         """Read a single camera frame by index.
 
-        Legacy MP4 RGB streams clamp missing tail indices for raw compatibility.
-        Schema v15 rejects the mismatch instead of fabricating a frame.
+        The schema-v16 MP4 sidecar must have exactly one frame per grid slot.
         """
         if key == "rgb" and self._rgb_decoder is not None:
             n = self._rgb_decoder.frame_count
             if n == 0:
                 raise ValueError(f"MP4 file contains no frames: {self._path}")
-            if self.schema_version >= 15:
-                return self._rgb_decoder.read_frame(index)
-            return self._rgb_decoder.read_frame(min(index, n - 1))
+            return self._rgb_decoder.read_frame(index)
         if key in self._h5f:
             return np.asarray(self._h5f[key][index])
         raise KeyError(f"Camera dataset '{key}' not found in {self._path}")
@@ -485,8 +447,6 @@ class EpisodeReader:
         """Read all camera frames. Cached after the first call.
 
         Returns a ``(T, ...)`` array (``uint8`` for RGB, ``uint16`` for depth).
-        Legacy RGB is tail-padded to ``num_frames`` for raw compatibility.
-        Schema v15 requires the decoded stream to have exactly the grid length.
         """
         if key in self._cache:
             return self._cache[key]
@@ -494,11 +454,8 @@ class EpisodeReader:
         if key == "rgb" and self._rgb_decoder is not None:
             data = self._rgb_decoder.read_all()
             grid_len = int(self._h5f["meta"].attrs.get("num_frames", 0))
-            if self.schema_version >= 15 and grid_len != data.shape[0]:
-                raise ValueError(f"schema-v15 RGB length {data.shape[0]} does not match grid length {grid_len}")
-            if self.schema_version < 15 and grid_len > data.shape[0]:
-                pad = np.repeat(data[-1:], grid_len - data.shape[0], axis=0)
-                data = np.concatenate([data, pad], axis=0)
+            if grid_len != data.shape[0]:
+                raise ValueError(f"schema-v16 RGB length {data.shape[0]} does not match grid length {grid_len}")
         elif key in self._h5f:
             data = np.asarray(self._h5f[key][:])
         else:

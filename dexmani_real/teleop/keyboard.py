@@ -22,7 +22,6 @@ __all__ = [
     "ControlSignal",
     "KeyboardHandler",
     "GlobalKeyState",
-    "MotionActivityLatch",
     "validate_arm_feedback",
     "validate_hand_feedback",
     "eef_delta_from_keys",
@@ -519,22 +518,6 @@ class GlobalKeyState:
     def any_pressed(self) -> bool:
         with self._lock:
             return bool(self._keys)
-
-
-class MotionActivityLatch:
-    """Detect the active-to-idle edge of continuous keyboard motion."""
-
-    def __init__(self) -> None:
-        self._active = False
-
-    def update(self, active: bool) -> bool:
-        """Store *active* and return True exactly once when motion is released."""
-        released = self._active and not active
-        self._active = bool(active)
-        return released
-
-    def reset(self) -> None:
-        self._active = False
 
 
 def validate_arm_feedback(

@@ -13,7 +13,6 @@ import numpy as np
 from dexmani_real.utils.schema import INFERENCE_CANDIDATE_DTYPE
 from dexmani_real.policy.runtime import (
     ActionCandidate,
-    ActionChunk,
     ActionSpec,
     FrozenArrayMap,
     ObservationSnapshot,
@@ -36,7 +35,6 @@ class InferenceWorkerTransport:
     ready: Any
     fault_latch: Any
     candidate_ring: Any
-    session_generation: Any
 
     @classmethod
     def from_shared(cls, shared: Any) -> "InferenceWorkerTransport":
@@ -46,7 +44,6 @@ class InferenceWorkerTransport:
             ready=shared.inference_ready,
             fault_latch=shared.error_state,
             candidate_ring=shared.inference_candidate_ring,
-            session_generation=shared.session_generation,
         )
 
 
@@ -60,22 +57,18 @@ def _load_adapter(spec: PolicySpec) -> tuple[ModuleType, object, Callable[[objec
     return module, load_policy(spec), predict
 
 
-def encode_candidate(candidate: ActionCandidate, *, chunk_length: int = 1) -> np.ndarray:
+def encode_candidate(candidate: ActionCandidate) -> np.ndarray:
+    """Encode one adapter-selected current-tick candidate for the mailbox."""
     frame = np.zeros(1, dtype=INFERENCE_CANDIDATE_DTYPE)
     for name in (
         "observation_id",
-        "session_generation",
-        "policy_epoch",
-        "action_id",
-        "chunk_id",
-        "step_index",
+        "run_generation",
         "created_monotonic_ns",
         "target_monotonic_ns",
         "valid_until_monotonic_ns",
         "is_hold",
     ):
         frame[name][0] = getattr(candidate, name)
-    frame["chunk_length"][0] = int(chunk_length)
     if candidate.arm_qpos is not None:
         frame["has_arm"][0] = 1
         frame["arm_qpos"][0] = candidate.arm_qpos
@@ -85,29 +78,22 @@ def encode_candidate(candidate: ActionCandidate, *, chunk_length: int = 1) -> np
     return frame
 
 
-def decode_candidate(frame: np.ndarray) -> tuple[ActionCandidate, int]:
-    """Decode one fixed inference mailbox record with full validation."""
+def decode_candidate(frame: np.ndarray) -> ActionCandidate:
+    """Decode one fixed inference mailbox record into a validated candidate."""
     if frame.shape != (1,) or frame.dtype != INFERENCE_CANDIDATE_DTYPE:
         raise ValueError("invalid inference candidate frame")
     record = frame[0]
     candidate = ActionCandidate(
         observation_id=int(record["observation_id"]),
-        session_generation=int(record["session_generation"]),
-        policy_epoch=int(record["policy_epoch"]),
-        action_id=int(record["action_id"]),
+        run_generation=int(record["run_generation"]),
         created_monotonic_ns=int(record["created_monotonic_ns"]),
         target_monotonic_ns=int(record["target_monotonic_ns"]),
         valid_until_monotonic_ns=int(record["valid_until_monotonic_ns"]),
         arm_qpos=np.array(record["arm_qpos"], copy=True) if bool(record["has_arm"]) else None,
         hand_qpos=np.array(record["hand_qpos"], copy=True) if bool(record["has_hand"]) else None,
-        chunk_id=int(record["chunk_id"]),
-        step_index=int(record["step_index"]),
         is_hold=bool(record["is_hold"]),
     )
-    chunk_length = int(record["chunk_length"])
-    if chunk_length <= 0 or candidate.step_index >= chunk_length:
-        raise ValueError("invalid inference chunk metadata")
-    return candidate, chunk_length
+    return candidate
 
 
 def _synthetic_snapshot(spec: ObservationSpec) -> ObservationSnapshot:
@@ -134,7 +120,7 @@ def _synthetic_snapshot(spec: ObservationSpec) -> ObservationSnapshot:
         source_monotonic_ns=times,
         publish_monotonic_ns=times,
         valid_history_mask=masks,
-        session_generation=0,
+        run_generation=0,
         receive_monotonic_ns=times,
         source_age_s=zero_timing,
         source_skew_s=zero_timing,
@@ -142,28 +128,29 @@ def _synthetic_snapshot(spec: ObservationSpec) -> ObservationSnapshot:
 
 
 def _validate_output(
-    output: ActionCandidate | ActionChunk,
+    output: ActionCandidate,
     snapshot: ObservationSnapshot,
     action_spec: ActionSpec,
     actuators: tuple[str, ...] = ("arm", "hand"),
-) -> tuple[ActionCandidate, ...]:
-    candidates = output.steps if isinstance(output, ActionChunk) else (output,)
-    if not candidates or len(candidates) > action_spec.chunk_length:
-        raise ValueError("backend output chunk length violates ActionSpec")
-    for candidate in candidates:
-        if candidate.observation_id != snapshot.observation_id:
-            raise ValueError("backend output does not match its observation")
-        if (
-            candidate.representation != action_spec.representation
-            or candidate.units != action_spec.units
-            or candidate.frame != action_spec.frame
-        ):
-            raise ValueError("backend output representation/units/frame violates ActionSpec")
-        if candidate.arm_qpos is None:
-            raise ValueError("DexMani learned backends must produce an arm action")
-        if "hand" not in actuators and candidate.hand_qpos is not None:
-            raise ValueError("backend produced hand action without the hand capability")
-    return candidates
+) -> ActionCandidate:
+    """Require adapters to collapse model-specific chunks before IPC."""
+    if not isinstance(output, ActionCandidate):
+        raise TypeError("backend must return one ActionCandidate; adapters expand model chunks internally")
+    if output.observation_id != snapshot.observation_id:
+        raise ValueError("backend output does not match its observation")
+    if output.run_generation != snapshot.run_generation:
+        raise ValueError("backend output does not match its run generation")
+    if (
+        output.representation != action_spec.representation
+        or output.units != action_spec.units
+        or output.frame != action_spec.frame
+    ):
+        raise ValueError("backend output representation/units/frame violates ActionSpec")
+    if output.arm_qpos is None:
+        raise ValueError("DexMani learned backends must produce an arm action")
+    if "hand" not in actuators and output.hand_qpos is not None:
+        raise ValueError("backend produced hand action without the hand capability")
+    return output
 
 
 def inference_loop(
@@ -230,9 +217,8 @@ def inference_loop(
                         publish_component_status(transport, "inference", ComponentPhase.RUNNING)
                         running_published = True
                     output = predict(policy, snapshot)
-                    candidates = _validate_output(output, snapshot, config.action, config.actuators)
-                    for candidate in candidates:
-                        transport.candidate_ring.write(encode_candidate(candidate, chunk_length=len(candidates)))
+                    candidate = _validate_output(output, snapshot, config.action, config.actuators)
+                    transport.candidate_ring.write(encode_candidate(candidate))
                     last_camera_generation = snapshot.camera_generation
                     last_sequence = sequence
             limiter.wait()

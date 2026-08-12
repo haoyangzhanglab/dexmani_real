@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Rerun-based episode visualizer for DexMani teleop data.
-
-Supports legacy single-HDF5 and v13–v15 directory episodes
-(``data.h5`` + ``depth.h5`` + ``pointcloud.h5`` + ``rgb.mp4``).
+"""Rerun-based visualizer for schema-v16 DexMani episodes.
 
 Usage:
-  python examples/visualize_episode.py episode.h5
   python examples/visualize_episode.py episode_dir/
-  python examples/visualize_episode.py episode.h5 --info
-  python examples/visualize_episode.py episode.h5 --max-frames 500
+  python examples/visualize_episode.py episode_dir/ --info
+  python examples/visualize_episode.py episode_dir/ --max-frames 500
 """
 
 from __future__ import annotations
@@ -179,8 +175,8 @@ class EpisodeVisualizer:
         # Pre-decode camera frames (~50 MB for 960 frames @ 640×480).
         self._rgb_cache: np.ndarray | None = None
         self._depth_cache: np.ndarray | None = None
-        # RGB: HDF5 (legacy) or MP4 sidecar (current). _MergedH5File only
-        # knows HDF5 keys — query the reader for MP4.
+        # RGB lives in the MP4 sidecar, so query the reader rather than the
+        # merged HDF5 dataset view.
         try:
             self._rgb_cache = self._reader.read_camera_all("rgb")
             logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
@@ -196,16 +192,13 @@ class EpisodeVisualizer:
             self._available.setdefault("camera", []).append("rgb")
         logger.info("Detected %d categories: %s", len(self._available), sorted(self._available.keys()))
 
-        # Depth units: CLI > /meta depth_scale > 1mm default.
-        # Pre-depth_scale episodes (L515 0.25mm raw) need --depth-scale 0.00025.
+        # Depth units: CLI > the required /meta depth_scale.
         if depth_scale is None:
             meta = self._h5f.get("meta")
             if meta is not None and "depth_scale" in meta.attrs:
                 depth_scale = float(meta.attrs["depth_scale"])
             elif "depth" in self._h5f:
-                logger.warning(
-                    "/meta has no depth_scale — assuming 1mm units. " "Legacy L515 episodes need --depth-scale 0.00025."
-                )
+                raise ValueError("schema-v16 episode is missing /meta depth_scale")
         self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
         self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
 

@@ -23,15 +23,15 @@ from dexmani_real.utils.schema import ARM_COMMAND_DTYPE, ARM_JOINT_SHAPE, HAND_C
 logger = get_logger(__name__)
 
 
-def advance_policy_epoch(shared: Any) -> int:
-    """Invalidate commands prepared under a previous policy epoch."""
-    lock_getter = getattr(shared.policy_epoch, "get_lock", None)
+def advance_run_generation(shared: Any) -> int:
+    """Invalidate candidates prepared before the current control run."""
+    lock_getter = getattr(shared.run_generation, "get_lock", None)
     if callable(lock_getter):
         with lock_getter():
-            shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
-            return int(shared.policy_epoch.value)
-    shared.policy_epoch.value = int(shared.policy_epoch.value) + 1
-    return int(shared.policy_epoch.value)
+            shared.run_generation.value = int(shared.run_generation.value) + 1
+            return int(shared.run_generation.value)
+    shared.run_generation.value = int(shared.run_generation.value) + 1
+    return int(shared.run_generation.value)
 
 
 @dataclass(frozen=True)
@@ -55,9 +55,10 @@ class SafetyGate:
     4. **Collision** — ``collision_model.check_collision(clamped_qpos)``
     5. **Workspace** — optional segment check
 
-    Workers apply the clamped output immediately; they do **not** re-validate
-    epochs, sessions, action IDs, or temporal windows — the velocity clamp is
-    the universal backstop for stale or corrupt commands.
+    The controller validates ``run_generation`` and the proposal validity
+    window before publication.  Workers apply the resulting fixed command with
+    hardware-level dtype/finite and safety-state checks; the velocity clamp is
+    the universal backstop for stale or corrupt targets.
     """
 
     def __init__(
@@ -104,7 +105,7 @@ class SafetyGate:
         current_arm_qpos: np.ndarray,
         current_hand_qpos: np.ndarray,
         dt_s: float,
-        session_generation: int,
+        run_generation: int,
     ) -> GateResult:
         """Run the full validation pipeline.
 
@@ -113,7 +114,7 @@ class SafetyGate:
             current_arm_qpos: Latest measured arm joint positions [rad].
             current_hand_qpos: Latest measured hand joint positions [rad].
             dt_s: Action period (``1 / control_hz``).
-            session_generation: Expected session generation.
+            run_generation: Expected control-run generation.
 
         Returns:
             ``GateResult`` with the (possibly clamped) safe candidate.
@@ -126,8 +127,8 @@ class SafetyGate:
         ):
             return GateResult(False, candidate, "unsupported representation/units/frame")
 
-        if candidate.session_generation != session_generation:
-            return GateResult(False, candidate, "session generation mismatch")
+        if candidate.run_generation != run_generation:
+            return GateResult(False, candidate, "run generation mismatch")
 
         arm_start = np.asarray(current_arm_qpos, dtype=np.float64)
         hand_start = np.asarray(current_hand_qpos, dtype=np.float64)
@@ -213,12 +214,9 @@ def _make_arm_command(candidate: Any, now_monotonic_ns: int, target_monotonic_ns
     if candidate.arm_qpos is None:
         raise ValueError("candidate has no arm command")
     frame = np.zeros(1, dtype=ARM_COMMAND_DTYPE)
-    frame["session_generation"][0] = candidate.session_generation
-    frame["policy_epoch"][0] = candidate.policy_epoch
+    frame["run_generation"][0] = candidate.run_generation
     frame["observation_id"][0] = candidate.observation_id
     frame["action_id"][0] = candidate.action_id
-    frame["chunk_id"][0] = candidate.chunk_id
-    frame["step_index"][0] = candidate.step_index
     frame["created_monotonic_ns"][0] = now_monotonic_ns
     frame["target_monotonic_ns"][0] = target_monotonic_ns
     frame["valid_until_monotonic_ns"][0] = target_monotonic_ns + int(3e8)  # +300ms
@@ -232,12 +230,9 @@ def _make_hand_command(candidate: Any, now_monotonic_ns: int, target_monotonic_n
     if candidate.hand_qpos is None:
         raise ValueError("candidate has no hand command")
     frame = np.zeros(1, dtype=HAND_COMMAND_DTYPE)
-    frame["session_generation"][0] = candidate.session_generation
-    frame["policy_epoch"][0] = candidate.policy_epoch
+    frame["run_generation"][0] = candidate.run_generation
     frame["observation_id"][0] = candidate.observation_id
     frame["action_id"][0] = candidate.action_id
-    frame["chunk_id"][0] = candidate.chunk_id
-    frame["step_index"][0] = candidate.step_index
     frame["created_monotonic_ns"][0] = now_monotonic_ns
     frame["target_monotonic_ns"][0] = target_monotonic_ns
     frame["valid_until_monotonic_ns"][0] = target_monotonic_ns + int(3e8)
@@ -270,9 +265,9 @@ def send_command(
     lead_time_s = float(getattr(shared, "action_lead_time_s", 0.05))
     target_ns = now_ns + int(lead_time_s * 1e9)
 
-    # Reject when the target time has already passed or the validity window
-    # is behind wall-clock (can happen after a long gate evaluation).
-    if target_ns <= now_ns or (candidate.valid_until_monotonic_ns and candidate.valid_until_monotonic_ns < now_ns):
+    # The candidate validity window protects the policy boundary.  The publish
+    # boundary owns the worker delivery target because queueing adds latency.
+    if target_ns <= now_ns or candidate.valid_until_monotonic_ns < now_ns:
         logger.error("send_command: action_id=%d temporal window closed", candidate.action_id)
         return False
 
@@ -415,20 +410,15 @@ def publish_joint_targets(
         action_id = int(shared.arm_command_seq.value) + 1
         shared.arm_command_seq.value = action_id
     now_ns = time.monotonic_ns()
-    lead_time_s = float(getattr(shared, "action_lead_time_s", 0.05))
-
     candidate = ActionCandidate(
         observation_id=action_id if observation_id is None else int(observation_id),
-        session_generation=int(shared.session_generation.value),
-        policy_epoch=int(shared.policy_epoch.value),
+        run_generation=int(shared.run_generation.value),
         action_id=action_id,
         created_monotonic_ns=now_ns,
-        target_monotonic_ns=now_ns + int(lead_time_s * 1e9),
+        target_monotonic_ns=now_ns + int(float(shared.action_lead_time_s) * 1e9),
         valid_until_monotonic_ns=now_ns + int(0.5 * 1e9),
         arm_qpos=np.asarray(arm_qpos, dtype=np.float64),
         hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
-        chunk_id=action_id,
-        step_index=0,
         is_hold=is_hold,
     )
 
@@ -456,7 +446,7 @@ def publish_joint_targets(
         current_arm_qpos=current_arm,
         current_hand_qpos=current_hand,
         dt_s=ctrl_dt,
-        session_generation=int(shared.session_generation.value),
+        run_generation=int(shared.run_generation.value),
     )
     if not gate_result.accepted or gate_result.candidate is None:
         return None
