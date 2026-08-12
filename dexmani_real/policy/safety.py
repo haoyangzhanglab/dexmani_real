@@ -314,11 +314,15 @@ class SafetyGate:
 
     1. **Well-formed** — representation, shapes, finite values
     2. **Joint limits** — commanded actuators only; hold actuators skip
-    3. **Velocity envelope** — reject the complete action if any commanded
-       joint exceeds ``max_vel·dt``; never reshape an IK solution per joint
-    4. **Collision** — endpoint geometry check
-    5. **Transition** — dense geometry/clearance check
-    6. **Workspace** — optional segment check
+    3. **Workspace** — optional segment check
+
+    Velocity envelope checking was removed (2026-08-12).  xArm Mode 6
+    firmware enforces velocity, acceleration, and collision limits as the
+    final backstop.  Collision and transition geometry checks were
+    removed (2026-08-12); collision-free homing paths are planned
+    independently through ``plan_joint_home_path`` /
+    ``plan_band_alignment_path``, which call the collision model directly
+    rather than through the SafetyGate.
 
     The controller validates ``run_generation`` and the proposal validity
     window before publication.  Workers re-check generation and expiry before
@@ -333,9 +337,6 @@ class SafetyGate:
         arm_joint_upper_rad: tuple[float, ...],
         hand_joint_lower_rad: tuple[float, ...],
         hand_joint_upper_rad: tuple[float, ...],
-        arm_max_velocity_rad_s: float,
-        hand_max_velocity_rad_s: float,
-        arm_tracking_tolerance_rad: float = 0.35,
     ) -> None:
         _arm_low = np.asarray(arm_joint_lower_rad, dtype=np.float64)
         _arm_high = np.asarray(arm_joint_upper_rad, dtype=np.float64)
@@ -352,26 +353,13 @@ class SafetyGate:
             or np.any(_hand_low > _hand_high)
         ):
             raise ValueError("joint limits must be finite and ordered")
-        if not (np.isfinite(arm_max_velocity_rad_s) and arm_max_velocity_rad_s > 0):
-            raise ValueError("arm_max_velocity_rad_s must be finite and positive")
-        if not (np.isfinite(hand_max_velocity_rad_s) and hand_max_velocity_rad_s > 0):
-            raise ValueError("hand_max_velocity_rad_s must be finite and positive")
-        if not (
-            np.isfinite(arm_tracking_tolerance_rad) and arm_tracking_tolerance_rad > 0
-        ):
-            raise ValueError("arm_tracking_tolerance_rad must be finite and positive")
 
         self.arm_low = _arm_low
         self.arm_high = _arm_high
         self.hand_low = _hand_low
         self.hand_high = _hand_high
-        self.arm_max_vel = arm_max_velocity_rad_s
-        self.hand_max_vel = hand_max_velocity_rad_s
-        self.arm_tracking_tolerance_rad = float(arm_tracking_tolerance_rad)
 
-    # -- callbacks set after construction (avoids circular imports) ---------
-    collision_check: Any = None  # Callable[[np.ndarray], bool] | None
-    transition_check: Any = None  # Callable[[np.ndarray, np.ndarray], bool] | None
+    # -- callback set after construction (avoids circular imports) ----------
     workspace_check: Any = None  # Callable[[np.ndarray, np.ndarray], bool] | None
 
     def validate(
@@ -382,8 +370,6 @@ class SafetyGate:
         current_hand_qpos: np.ndarray,
         dt_s: float,
         run_generation: int,
-        previous_arm_qpos_cmd: np.ndarray | None = None,
-        previous_hand_qpos_cmd: np.ndarray | None = None,
     ) -> GateResult:
         """Run the full validation pipeline.
 
@@ -391,7 +377,8 @@ class SafetyGate:
             candidate: The proposed ``ActionCandidate``.
             current_arm_qpos: Latest measured arm joint positions [rad].
             current_hand_qpos: Latest measured hand joint positions [rad].
-            dt_s: Action period (``1 / control_hz``).
+            dt_s: Action period (``1 / control_hz``). Retained for API
+                stability; unused after velocity-envelope removal (2026-08-12).
             run_generation: Expected control-run generation.
 
         Returns:
@@ -443,75 +430,14 @@ class SafetyGate:
         ):
             return GateResult(False, candidate, "hand joint limit violation")
 
-        # 3 ── Velocity envelope (whole-action reject; never per-joint clip)
-        if not (np.isfinite(dt_s) and dt_s > 0):
-            return GateResult(False, candidate, "invalid dt")
+        # (removed) Velocity envelope ────────────────────────────────────
+        # Per the xArm Mode 6 contract the firmware is the final velocity,
+        # acceleration, and collision backstop.  The software gate no longer
+        # rejects on command-to-command or command-to-measured speed so that
+        # Cartesian keyboard deltas never deadlock when the IK maps a fixed
+        # step to joint changes above the configured limit.
 
-        arm_delta = self.arm_max_vel * dt_s
-        hand_delta = self.hand_max_vel * dt_s
-        arm_command_start = arm_start
-        if previous_arm_qpos_cmd is not None and not bool(
-            getattr(candidate, "is_hold", False)
-        ):
-            arm_command_start = np.asarray(previous_arm_qpos_cmd, dtype=np.float64)
-            if arm_command_start.shape != ARM_JOINT_SHAPE or not np.all(
-                np.isfinite(arm_command_start)
-            ):
-                return GateResult(False, candidate, "invalid previous arm command")
-        if candidate.arm_qpos is not None:
-            if np.any(np.abs(arm_end - arm_command_start) > arm_delta + 1e-12):
-                return GateResult(
-                    False, candidate, "arm command velocity envelope violation"
-                )
-            if np.any(
-                np.abs(arm_end - arm_start) > self.arm_tracking_tolerance_rad + 1e-12
-            ):
-                return GateResult(False, candidate, "arm tracking envelope violation")
-        hand_command_start = hand_start
-        if previous_hand_qpos_cmd is not None:
-            hand_command_start = np.asarray(previous_hand_qpos_cmd, dtype=np.float64)
-            if hand_command_start.shape != HAND_JOINT_SHAPE or not np.all(
-                np.isfinite(hand_command_start)
-            ):
-                return GateResult(False, candidate, "invalid previous hand command")
-        if candidate.hand_qpos is not None and np.any(
-            np.abs(hand_end - hand_command_start) > hand_delta + 1e-12
-        ):
-            return GateResult(
-                False, candidate, "hand command velocity envelope violation"
-            )
-        # 4 ── Collision ───────────────────────────────────────────────
-        if self.collision_check is not None:
-            try:
-                if candidate.arm_qpos is not None and candidate.hand_qpos is not None:
-                    # 19-DOF combined
-                    full_qpos = np.concatenate([arm_end, hand_end])
-                elif candidate.arm_qpos is not None:
-                    full_qpos = arm_end
-                else:
-                    full_qpos = hand_end  # hand-only (rare)
-                if self.collision_check(full_qpos):
-                    return GateResult(False, candidate, "collision")
-            except Exception:
-                logger.warning(
-                    "SafetyGate: collision check failed closed", exc_info=True
-                )
-                return GateResult(False, candidate, "collision check failed")
-
-        # 5 ── Dense transition geometry (optional) ───────────────────
-        if self.transition_check is not None and candidate.arm_qpos is not None:
-            try:
-                if not self.transition_check(arm_start, arm_end):
-                    return GateResult(
-                        False, candidate, "transition collision/clearance"
-                    )
-            except Exception:
-                logger.warning(
-                    "SafetyGate: transition check failed closed", exc_info=True
-                )
-                return GateResult(False, candidate, "transition check failed")
-
-        # 6 ── Workspace (optional) ────────────────────────────────────
+        # 3 ── Workspace (optional) ────────────────────────────────────
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
                 if not self.workspace_check(arm_start, arm_end):
@@ -772,106 +698,33 @@ def worker_validate_hand(
 
 @dataclass(frozen=True)
 class ActionSafetyGateConfig:
-    """Configuration for :func:`planner_action_safety_gate`.
-
-    This dataclass provides a typed configuration for
-    :func:`planner_action_safety_gate`.
-    """
+    """Configuration for :func:`planner_action_safety_gate`."""
 
     arm_joint_lower_rad: tuple[float, ...]
     arm_joint_upper_rad: tuple[float, ...]
     hand_joint_lower_rad: tuple[float, ...]
     hand_joint_upper_rad: tuple[float, ...]
-    arm_max_velocity_rad_s: float
-    hand_max_velocity_rad_s: float
-    arm_tracking_tolerance_rad: float = 0.35
-    observation_max_age_s: float = 0.25
-    require_geometry_checks: bool = True
 
 
 def planner_action_safety_gate(
     config: ActionSafetyGateConfig,
     *,
     planner: Any,
-    table_z_surface_m: float,
-    hand_safety_margin_m: float,
-    transition_step_rad: float = 0.02,
-    enable_table_check: bool = True,
 ) -> SafetyGate:
-    """Build a geometry-aware :class:`SafetyGate`, wired to planner callbacks."""
+    """Build a :class:`SafetyGate` wired to the planner's workspace callback.
+
+    Collision and transition geometry checks are **not** wired — they were
+    removed from SafetyGate (2026-08-12).  Collision-free homing paths are
+    planned independently through ``plan_joint_home_path`` and
+    ``plan_band_alignment_path``, which call the collision model directly.
+    """
     gate = SafetyGate(
         arm_joint_lower_rad=config.arm_joint_lower_rad,
         arm_joint_upper_rad=config.arm_joint_upper_rad,
         hand_joint_lower_rad=config.hand_joint_lower_rad,
         hand_joint_upper_rad=config.hand_joint_upper_rad,
-        arm_max_velocity_rad_s=config.arm_max_velocity_rad_s,
-        hand_max_velocity_rad_s=config.hand_max_velocity_rad_s,
-        arm_tracking_tolerance_rad=config.arm_tracking_tolerance_rad,
     )
-    if config.require_geometry_checks:
-        collision_model = planner.collision_model
-
-        def _endpoint_collision(qpos: np.ndarray) -> bool:
-            model_qpos = collision_model.action_qpos_to_model(qpos)
-            if collision_model.check_collision(model_qpos):
-                return True
-            if enable_table_check and qpos.shape == ARM_JOINT_SHAPE:
-                if not bool(getattr(collision_model, "has_table", False)):
-                    return bool(
-                        collision_model.minimum_hand_frame_z(qpos)
-                        - hand_safety_margin_m
-                        < table_z_surface_m
-                    )
-            return False
-
-        def _arm_transition_safe(start: np.ndarray, end: np.ndarray) -> bool:
-            if not collision_model.check_combined_segment_collision_free(
-                start,
-                end,
-                step_size=transition_step_rad,
-            ):
-                return False
-            if not (
-                enable_table_check
-                and bool(getattr(collision_model, "has_table", False))
-            ):
-                return True
-
-            max_delta = float(np.max(np.abs(end - start)))
-            count = max(1, int(np.ceil(max_delta / transition_step_rad)))
-            distances = [
-                float(
-                    collision_model.minimum_table_distance(
-                        start + (step / count) * (end - start)
-                    )
-                )
-                for step in range(count + 1)
-            ]
-            required_m = float(collision_model.table_soft_clearance_m)
-            if distances[0] >= required_m:
-                return all(distance >= required_m for distance in distances)
-            if max_delta <= 1e-12:
-                return True  # a non-colliding measured hold is always permitted
-            below = [
-                index
-                for index, distance in enumerate(distances)
-                if distance < required_m
-            ]
-            initial_prefix = all(
-                sample_index == index for index, sample_index in enumerate(below)
-            )
-            nondecreasing = all(
-                current >= previous - 5e-4
-                for previous, current in zip(distances[:-1], distances[1:])
-                if previous < required_m
-            )
-            return bool(
-                initial_prefix and nondecreasing and distances[-1] > distances[0] + 1e-6
-            )
-
-        gate.collision_check = _endpoint_collision
-        gate.transition_check = _arm_transition_safe
-        gate.workspace_check = planner.is_workspace_segment_safe
+    gate.workspace_check = planner.is_workspace_segment_safe
     return gate
 
 
@@ -891,8 +744,6 @@ def publish_joint_targets(
     observation_anchor_monotonic_ns: int | None = None,
     dt_s: float | None = None,
     safety_gate: SafetyGate | None = None,
-    previous_arm_qpos_cmd: np.ndarray | None = None,
-    previous_hand_qpos_cmd: np.ndarray | None = None,
     wait_applied: bool = False,
     apply_timeout_s: float = 0.5,
 ) -> Any | None:
@@ -979,8 +830,6 @@ def publish_joint_targets(
         current_hand_qpos=current_hand,
         dt_s=ctrl_dt,
         run_generation=int(shared.run_generation.value),
-        previous_arm_qpos_cmd=previous_arm_qpos_cmd,
-        previous_hand_qpos_cmd=previous_hand_qpos_cmd,
     )
     if not gate_result.accepted or gate_result.candidate is None:
         logger.warning(

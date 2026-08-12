@@ -307,7 +307,6 @@ def _record_frame(
     action_hand_joint_raw: np.ndarray | None = None,
     policy_map_time_ms: float = np.nan,
     hand_retarget_time_ms: float = np.nan,
-    transition_check_time_ms: float = np.nan,
     policy_compute_time_ms: float = np.nan,
     hand_fk=None,
     T_eef_handbase_pos: np.ndarray | None = None,
@@ -406,7 +405,7 @@ def _record_frame(
             ),
             "policy_map_time_ms": policy_map_time_ms,
             "hand_retarget_time_ms": hand_retarget_time_ms,
-            "transition_check_time_ms": transition_check_time_ms,
+            "transition_check_time_ms": 0.0,  # reserved (SafetyGate collision/transition removed 2026-08-12)
             "policy_compute_time_ms": policy_compute_time_ms,
         },
     )

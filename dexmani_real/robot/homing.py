@@ -353,7 +353,10 @@ def send_arm_home(
             print("  arm: no collision planner — homing cancelled", flush=True)
         return False
 
-    # Plan a collision-safe path to the nearest equivalent home.
+    # Plan a collision-safe path.  Prefer a single-phase path directly to the
+    # canonical home_qpos (equivalent joints rotate concurrently with the rest
+    # of the arm).  If no canonical candidate is safe, fall back to the proven
+    # two-phase path: nearest-equivalent home, then a band-alignment rotation.
     _home_path_report: dict[str, Any] = {}
     try:
         _waypoints = plan_joint_home_path(
@@ -361,6 +364,7 @@ def send_arm_home(
             home_qpos,
             planner,
             table_z_surface_m=table_z_surface_m,
+            use_canonical_target=True,
             report=_home_path_report,
         )
     except Exception as exc:
@@ -375,64 +379,101 @@ def send_arm_home(
         return False
 
     if _waypoints is not None and len(_waypoints) == 0:
+        # No safe single-phase path to canonical home.  Fall back to the
+        # two-phase wrapped path + band alignment.
         if verbose:
-            _candidate_text = "; ".join(
+            _canonical_rejections = "; ".join(
                 _format_home_candidate_rejection(candidate)
                 for candidate in _home_path_report.get("candidates", [])
                 if not candidate.get("safe", False)
             )
-            _qpos_text = np.array2string(np.rad2deg(current_qpos), precision=1, separator=",")
             print(
-                "  arm: no validated home-path candidate — holding\n"
-                f"       current_qpos_deg={_qpos_text}\n"
-                f"       rejected={_candidate_text or 'no candidate diagnostics'}",
+                "  arm: canonical home path rejected — falling back to wrapped+alignment"
+                f" ({_canonical_rejections or 'no candidate diagnostics'})",
                 flush=True,
             )
-        return False
+        try:
+            _waypoints = plan_joint_home_path(
+                current_qpos,
+                home_qpos,
+                planner,
+                table_z_surface_m=table_z_surface_m,
+                use_canonical_target=False,
+                report=_home_path_report,
+            )
+        except Exception as exc:
+            logger.warning("send_arm_home: fallback planning failed", exc_info=True)
+            if verbose:
+                print(f"  arm: fallback home path planning failed — holding ({exc})", flush=True)
+            return False
+
+        if _latch_operator_estop(shared, estop_requested):
+            if verbose:
+                print("  arm: homing cancelled during fallback planning — e-stop requested", flush=True)
+            return False
+
+        if _waypoints is not None and len(_waypoints) == 0:
+            if verbose:
+                _candidate_text = "; ".join(
+                    _format_home_candidate_rejection(candidate)
+                    for candidate in _home_path_report.get("candidates", [])
+                    if not candidate.get("safe", False)
+                )
+                _qpos_text = np.array2string(np.rad2deg(current_qpos), precision=1, separator=",")
+                print(
+                    "  arm: no validated home-path candidate — holding\n"
+                    f"       current_qpos_deg={_qpos_text}\n"
+                    f"       rejected={_candidate_text or 'no candidate diagnostics'}",
+                    flush=True,
+                )
+            return False
+
+        _wrapped_home = (
+            _waypoints[-1].copy()
+            if _waypoints is not None and len(_waypoints) > 0
+            else planner.ik_mgr.nearest_equivalent_qpos(home_qpos, current_qpos)
+        )
+        if _waypoints is None:
+            _waypoints = np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
+
+        # Align the nearest equivalent home to the canonical joint band.
+        # plan_joint_home_path wraps home_qpos to the nearest 2π band of the
+        # arm's current encoder position.  The returned waypoints end at this
+        # wrapped position.  For strategy learning we need the arm at the
+        # canonical home_qpos, so we append a collision-checked alignment
+        # segment that rotates only the band-mismatched equivalent joints.
+        try:
+            _align_path = plan_band_alignment_path(_wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m)
+        except Exception as exc:
+            logger.warning("send_arm_home: band-alignment planning failed", exc_info=True)
+            if verbose:
+                print(f"  arm: band-alignment planning failed — holding ({exc})", flush=True)
+            return False
+
+        if _latch_operator_estop(shared, estop_requested):
+            if verbose:
+                print("  arm: homing cancelled during band alignment — e-stop requested", flush=True)
+            return False
+
+        if _align_path is not None:
+            if len(_align_path) == 0:
+                if verbose:
+                    _desc = _describe_band_diff(_wrapped_home, home_qpos)
+                    print(f"  arm: band-alignment UNSAFE ({_desc}) — holding", flush=True)
+                return False
+            # Keep the first alignment waypoint only when there is no main path.
+            _tail = _align_path[1:] if len(_waypoints) > 0 else _align_path
+            _waypoints = np.concatenate([_waypoints, _tail], axis=0)
+            if verbose:
+                _desc = _describe_band_diff(_wrapped_home, home_qpos)
+                print(f"  arm: band-alignment appended ({len(_tail)} milestones, {_desc})", flush=True)
 
     if verbose and _waypoints is not None:
         _selected = _home_path_report.get("selected_candidate", "unknown")
         print(f"  arm: home path selected={_selected} milestones={len(_waypoints)}", flush=True)
 
-    _wrapped_home = (
-        _waypoints[-1].copy()
-        if _waypoints is not None and len(_waypoints) > 0
-        else planner.ik_mgr.nearest_equivalent_qpos(home_qpos, current_qpos)
-    )
     if _waypoints is None:
         _waypoints = np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
-
-    # Align the nearest equivalent home to the canonical joint band.
-    # plan_joint_home_path wraps home_qpos to the nearest 2π band of the
-    # arm's current encoder position.  The returned waypoints end at this
-    # wrapped position (_home).  For strategy learning we need the arm at
-    # the canonical home_qpos, so we append a collision-checked alignment
-    # segment that rotates only the band-mismatched equivalent joints.
-    try:
-        _align_path = plan_band_alignment_path(_wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m)
-    except Exception as exc:
-        logger.warning("send_arm_home: band-alignment planning failed", exc_info=True)
-        if verbose:
-            print(f"  arm: band-alignment planning failed — holding ({exc})", flush=True)
-        return False
-
-    if _latch_operator_estop(shared, estop_requested):
-        if verbose:
-            print("  arm: homing cancelled during band alignment — e-stop requested", flush=True)
-        return False
-
-    if _align_path is not None:
-        if len(_align_path) == 0:
-            if verbose:
-                _desc = _describe_band_diff(_wrapped_home, home_qpos)
-                print(f"  arm: band-alignment UNSAFE ({_desc}) — holding", flush=True)
-            return False
-        # Keep the first alignment waypoint only when there is no main path.
-        _tail = _align_path[1:] if len(_waypoints) > 0 else _align_path
-        _waypoints = np.concatenate([_waypoints, _tail], axis=0)
-        if verbose:
-            _desc = _describe_band_diff(_wrapped_home, home_qpos)
-            print(f"  arm: band-alignment appended ({len(_tail)} milestones, {_desc})", flush=True)
 
     # Queue the validated path.
     _request_id = time.monotonic_ns()

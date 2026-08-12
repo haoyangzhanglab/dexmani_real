@@ -155,7 +155,7 @@ python -m compileall -q dexmani_real examples
 
 | 文件 | 作用 |
 |---|---|
-| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→整包速度包络接受/拒绝→碰撞→工作空间；手部速度以前一条已接受命令为基准，不使用执行误差，也不裁剪 action；机械臂 STOP/RESUME 使用不与两槽端点队列争用容量的高优先级固定 dtype 环；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；机械臂 STOP/RESUME 使用不与两槽端点队列争用容量的高优先级固定 dtype 环；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/inference_process.py` | 隔离推理 worker，加载 adapter，编解码单个当前 tick 候选动作，并验证模型输出是否满足策略契约。 |
 | `policy/learned_coordinator.py` | 以单一时钟协调 observation、当前 tick 推理结果、动作执行和退出前 hold 的学习策略控制环。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
@@ -244,7 +244,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
 | `teleop/recording_session.py` | 处理退出时的保存、丢弃和停机决策。 |
-| `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、arm-only hold、无碰撞转移、接触停滞与回零流程；return-home 逐条确认有界 hand-home 里程碑已被 SDK 接受，但不等待手指角度收敛。 |
+| `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、arm-only hold、接触停滞与回零流程（臂-手过渡碰撞检查已移除，由 Mode 6 固件兜底）；return-home 逐条确认有界 hand-home 里程碑已被 SDK 接受，但不等待手指角度收敛。 |
 | `teleop/snapshot.py` | 从共享环读取同一因果锚点附近的臂、手、VR、触觉、相机快照，并跟踪相机新鲜度。 |
 | `teleop/tag_retargeting/__init__.py` | 导出 TAG 两阶段手部重定向的优化器与 Pinocchio 梯度计算器。 |
 | `teleop/tag_retargeting/optimizer.py` | 使用 NLopt 执行 TAG 手部两阶段优化，平衡指尖目标、关节限制与平滑性。 |

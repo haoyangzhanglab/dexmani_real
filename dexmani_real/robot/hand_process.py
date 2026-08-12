@@ -38,9 +38,6 @@ class HandProcessConfig:
     startup_failure_is_fatal: bool = True
     ethercat_slave_position: int = field(default_factory=lambda: hand.ethercat_slave_position)
 
-    # Feedback-only diagnostic tolerance; strict XHand command limits are
-    # configured separately in XHandConfig and remain unchanged.
-    feedback_bound_tolerance_rad: float = field(default_factory=lambda: hand.feedback_bound_tolerance_rad)
     home_qpos_rad: tuple[float, ...] = field(
         default_factory=lambda: tuple(float(value) for value in np.deg2rad(hand.home_qpos_deg))
     )
@@ -87,8 +84,6 @@ class HandProcessConfig:
             raise ValueError("hand process max command delta must be finite and positive")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand process loop_hz must be finite and positive")
-        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
-            raise ValueError("hand feedback tolerance must be finite and non-negative")
         if self.send_err_watchdog_frames <= 0 or self.error_state_watchdog_frames <= 0:
             raise ValueError("hand process watchdog thresholds must be positive")
 
@@ -99,7 +94,6 @@ class HandProcessConfig:
             loop_hz=float(cfg.loop_hz),
             startup_failure_is_fatal=startup_failure_is_fatal,
             ethercat_slave_position=int(cfg.ethercat_slave_position),
-            feedback_bound_tolerance_rad=float(cfg.feedback_bound_tolerance_rad),
             home_qpos_rad=tuple(float(value) for value in np.deg2rad(cfg.home_qpos_deg)),
             qpos_lower_rad=tuple(float(value) for value in cfg.qpos_min_rad),
             qpos_upper_rad=tuple(float(value) for value in cfg.qpos_max_rad),
@@ -149,7 +143,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             XHandConfig(
                 tor_max_per_joint=_tor_max_pj,
                 ethercat_slave_position=cfg.ethercat_slave_position,
-                feedback_bound_tolerance_rad=cfg.feedback_bound_tolerance_rad,
                 home_qpos=np.asarray(cfg.home_qpos_rad, dtype=np.float64),
                 qpos_min=np.asarray(cfg.qpos_lower_rad, dtype=np.float64),
                 qpos_max=np.asarray(cfg.qpos_upper_rad, dtype=np.float64),
@@ -485,19 +478,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # bus after the command loop has been gated.
     stopped_cleanly = False
     try:
-        _feedback_stats = hand.feedback_bound_stats
-        _feedback_checks = int(_feedback_stats["checks"])
-        if _feedback_checks:
-            logger.info(
-                "hand_loop: feedback bounds checks=%d outside=%d over_tolerance=%d "
-                "max=%.3fdeg tolerance=%.3fdeg per_joint_over=%s",
-                _feedback_checks,
-                int(_feedback_stats["outside_bounds_frames"]),
-                int(_feedback_stats["over_tolerance_frames"]),
-                float(np.rad2deg(float(_feedback_stats["max_violation_rad"]))),
-                float(np.rad2deg(cfg.feedback_bound_tolerance_rad)),
-                np.asarray(_feedback_stats["per_joint_over_tolerance_counts"], dtype=np.int64).tolist(),
-            )
         if not hand.stop():
             raise RuntimeError(f"XHand stop failed with SDK code {hand.last_action_code!r}")
         hand.disconnect()

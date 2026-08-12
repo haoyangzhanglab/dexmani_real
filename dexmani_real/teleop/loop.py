@@ -55,7 +55,6 @@ from dexmani_real.teleop.safety import (_contact_stall_detected,
                                         _do_configured_teleop_home,
                                         _feedback_after_send,
                                         _reset_mapper_from_frames,
-                                        _transition_collision_free,
                                         _vr_after_send)
 from dexmani_real.teleop.snapshot import (CameraFreshnessTracker,
                                           _read_arm_state, _read_camera_frame,
@@ -87,19 +86,11 @@ def _load_vr_transform(path: Path) -> tuple[np.ndarray, str]:
 
 def _build_safety_gate(config: TeleopConfig) -> SafetyGate:
     """Build the teleoperation safety gate from control-domain limits."""
-    hand_max_vel = (
-        float(config.hand_max_delta_rad) * config.control_hz
-        if config.hand_max_delta_rad is not None
-        else float(np.deg2rad(config.hand_safety_gate_max_velocity_deg_per_s))
-    )
     return SafetyGate(
         arm_joint_lower_rad=tuple(config.joint_limit_lower),
         arm_joint_upper_rad=tuple(config.joint_limit_upper),
         hand_joint_lower_rad=tuple(config.hand_qpos_lower_rad),
         hand_joint_upper_rad=tuple(config.hand_qpos_upper_rad),
-        arm_max_velocity_rad_s=float(np.deg2rad(config.joint_max_speed_deg_s)),
-        arm_tracking_tolerance_rad=float(config.arm_tracking_tolerance_rad),
-        hand_max_velocity_rad_s=hand_max_vel,
     )
 
 
@@ -239,7 +230,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
         gate = _build_safety_gate(cfg)
-        gate.collision_check = planner.collision_model.check_collision
+        # SafetyGate validates well-formedness, joint limits, and workspace
+        # only.  Collision and transition checks were removed (2026-08-12);
+        # xArm Mode 6 firmware provides the hardware backstop (C22/C31/C24).
+        # Collision-free homing paths are planned independently through
+        # plan_joint_home_path / plan_band_alignment_path.
         gate.workspace_check = planner.is_workspace_segment_safe
 
         recorder = RecorderClient(shared) if cfg.recording_enabled else None
@@ -281,7 +276,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_retargeter = TAGHandRetargeter(
                     hand_type="right",
                     smoothing_alpha=cfg.hand_output_smoothing_alpha,
-                    feedback_bound_tolerance_rad=cfg.hand_feedback_bound_tolerance_rad,
                     qpos_lower_rad=cfg.hand_qpos_lower_rad,
                     qpos_upper_rad=cfg.hand_qpos_upper_rad,
                     fingertip_link_names=cfg.fingertip_link_names,
@@ -1263,7 +1257,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             stage_timer.mark("ik")
 
             # Compute hand retargeting before IK outcome handling. Hand-only motion
-            # remains allowed on IK failure only after arm↔hand transition validation.
+            # remains allowed on IK failure; the hold arm publishes with well-formedness + joint-limit validation through SafetyGate.
             _hand_retarget_t0 = time.perf_counter()
             hand_cmd, retarget_ok = _compute_hand_command(
                 hand_retargeter,
@@ -1309,14 +1303,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 retarget_ok = False
 
             if not ik_result.success or ik_result.qpos is None:
-                # The arm is held, but hand motion still needs arm↔hand collision validation.
-                hand_safe = hand_cmd_valid and _transition_collision_free(
-                    planner, arm_qpos, prev_qpos_cmd, hand_start_qpos, hand_cmd
-                )
+                # Arm is held; hand motion proceeds independently.
+                # SafetyGate validates well-formedness + joint limits only for hand-only commands.
                 if hand_available:
-                    safe_hand_cmd = hand_cmd if hand_safe else None
-                    if not hand_safe:
-                        _validate_warn("teleop_loop: hand-only transition rejected — holding")
+                    safe_hand_cmd = hand_cmd if hand_cmd_valid else None
                     published_candidate = _safe_joint_publish(
                         shared,
                         prev_qpos_cmd.copy(),
@@ -1325,8 +1315,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         timeout=cfg.action_prepare_timeout_s,
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                        previous_arm_qpos_cmd=prev_qpos_cmd,
-                        previous_hand_qpos_cmd=prev_hand_qpos,
                         safety_gate=gate,
                     )
                     if published_candidate is None:
@@ -1380,8 +1368,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             # Keep IK output inside the firmware-accepted joint limits.
             arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
-            # Validate cheap boundaries before entering Pinocchio/hpp-fcl.
-            _transition_check_t0 = time.perf_counter()
+            # Pre-flight validation (NaN, health, workspace).
             _arm_ok = arm_state is not None and bool(arm_state["connected"][0])
             _reject = False
             _reject_reason = ""
@@ -1397,10 +1384,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             elif not planner.is_workspace_segment_safe(arm_qpos, arm_cmd):
                 _reject = True
                 _reject_reason = "final arm transition leaves workspace"
-            elif not _transition_collision_free(planner, arm_qpos, arm_cmd, hand_start_qpos, hand_cmd):
-                _reject = True
-                _reject_reason = "final arm-hand transition collision"
-            transition_check_time_ms = (time.perf_counter() - _transition_check_t0) * 1000.0
             if _reject:
                 _validate_warn("teleop_loop: action rejected — %s", _reject_reason)
                 published_hold = _safe_joint_publish(
@@ -1469,8 +1452,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 timeout=cfg.action_prepare_timeout_s,
                 observation_id=int(vr_frame["ring_sequence"]),
                 observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                previous_arm_qpos_cmd=prev_qpos_cmd,
-                previous_hand_qpos_cmd=prev_hand_qpos,
                 safety_gate=gate,
             )
             if published_candidate is None:
@@ -1519,7 +1500,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     action_arm_joint_raw=arm_cmd_raw,
                     policy_map_time_ms=policy_map_time_ms,
                     hand_retarget_time_ms=hand_retarget_time_ms,
-                    transition_check_time_ms=transition_check_time_ms,
                     policy_compute_time_ms=policy_compute_time_ms,
                     hand_fk=_hand_fk,
                     T_eef_handbase_pos=_T_eef_handbase_pos,
@@ -1593,8 +1573,6 @@ def _safe_joint_publish(
     timeout: float,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
-    previous_arm_qpos_cmd: np.ndarray | None = None,
-    previous_hand_qpos_cmd: np.ndarray | None = None,
     safety_gate: SafetyGate | None = None,
 ) -> ActionCandidate | None:
     """Validate through SafetyGate and publish via fire-and-forget send_command."""
@@ -1656,8 +1634,6 @@ def _safe_joint_publish(
         current_hand_qpos=current_hand,
         dt_s=ctrl_dt,
         run_generation=int(shared.run_generation.value),
-        previous_arm_qpos_cmd=previous_arm_qpos_cmd,
-        previous_hand_qpos_cmd=previous_hand_qpos_cmd,
     )
     if not gate_result.accepted or gate_result.candidate is None:
         logger.warning("joint target rejected by SafetyGate: %s", gate_result.reason)

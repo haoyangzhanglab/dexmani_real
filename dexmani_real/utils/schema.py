@@ -332,7 +332,7 @@ def make_record_sample_dtype(
             ("target_eef_rot6d_raw", "<f8", (6,)),
             ("policy_map_time_ms", "<f8"),
             ("hand_retarget_time_ms", "<f8"),
-            ("transition_check_time_ms", "<f8"),
+            ("transition_check_time_ms", "<f8"),  # reserved (always 0; SafetyGate collision/transition removed 2026-08-12)
             ("policy_compute_time_ms", "<f8"),
         ],
         align=True,

@@ -25,7 +25,7 @@ _READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "inferen
 class HomingParams:
     """Firmware-planned execution parameters for validated home milestones."""
 
-    convergence_rad: float = 0.0174533  # final canonical-home tolerance (~1°)
+    convergence_rad: float = 0.002618  # final canonical-home tolerance (~0.15°)
     step_interval_s: float = 0.04  # controller-state polling interval
     max_speed_deg_s: float = 30.0  # conservative Mode 0 joint speed; hardware validation required before tuning
     target_timeout_s: float = 0.5  # settling allowance added after distance/speed timing
@@ -412,11 +412,6 @@ class HandParams:
         1.919,
         1.919,
     )
-    # Measured joint feedback may settle slightly outside the command/model
-    # limits because of encoder resolution, PID steady-state error, backlash,
-    # or external load. This tolerance applies ONLY to feedback diagnostics and
-    # optimizer warm starts; command and NLopt bounds remain strict.
-    feedback_bound_tolerance_rad: float = 0.01  # ~0.57 deg
     # 0.20 rad per action (~183 deg/s at the default 16 Hz). SafetyGate rejects
     # the complete action when command-to-command motion exceeds this bound;
     # neither the gate nor the XHand driver clips the target.
@@ -488,8 +483,6 @@ class HandParams:
             or np.any(home_rad > command_upper + limit_tolerance_rad)
         ):
             raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
-        if not np.isfinite(self.feedback_bound_tolerance_rad) or self.feedback_bound_tolerance_rad < 0:
-            raise ValueError("hand feedback_bound_tolerance_rad must be finite and >= 0")
         if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
             raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
         if not np.isfinite(self.safety_gate_max_velocity_deg_per_s) or self.safety_gate_max_velocity_deg_per_s <= 0:

@@ -1023,7 +1023,7 @@ class TrajectoryReplayer:
         self._frame_count = trajectory.num_frames if max_frames is None else min(trajectory.num_frames, max_frames)
 
     def setup(self) -> None:
-        """Create the geometry safety gate without connecting to hardware."""
+        """Create the action safety gate without connecting to hardware."""
         if self.dry_run:
             return
         if self.runtime is None or self.shared is None:
@@ -1061,20 +1061,10 @@ class TrajectoryReplayer:
                 arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
                 hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
                 hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
-                arm_max_velocity_rad_s=float(np.deg2rad(runtime_arm.max_joint_velocity_deg_per_s)),
-                arm_tracking_tolerance_rad=float(runtime_arm.tracking_error_warn_rad),
-                hand_max_velocity_rad_s=(
-                    float(runtime_hand.max_delta_rad) * runtime_policy.control_hz
-                    if runtime_hand.max_delta_rad is not None
-                    else float(np.deg2rad(runtime_hand.safety_gate_max_velocity_deg_per_s))
-                ),
-                require_geometry_checks=True,
             ),
             planner=self._planner,
-            table_z_surface_m=float(runtime_arm.table_z_surface_m),
-            hand_safety_margin_m=float(runtime_arm.hand_safety_margin_m),
         )
-        print("Replay geometry safety gate ready")
+        print("Replay safety gate ready")
 
     def _align_to_start(
         self,
@@ -1393,7 +1383,6 @@ class TrajectoryReplayer:
                     prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
                     dt_s=period_s,
                     safety_gate=self._action_safety_gate,
-                    previous_hand_qpos_cmd=previous_hand_cmd,
                     wait_applied=is_final_frame,
                     apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
                 )

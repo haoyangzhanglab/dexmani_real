@@ -426,10 +426,6 @@ class TAGHandRetargeter:
     smoothing_alpha:
         Teleoperator-level EMA smoothing factor (0.0 = freeze, 1.0 = pass-through).
         ``None`` uses the central policy default (currently 0.5 at 16 Hz).
-    feedback_bound_tolerance_rad:
-        Allowed measured-qpos excursion outside strict optimizer bounds. This
-        affects reset diagnostics only; warm starts are always clipped and
-        optimizer outputs always obey the strict bounds.
     debug:
         If True, log per-frame retargeting timing.
     """
@@ -439,7 +435,6 @@ class TAGHandRetargeter:
         hand_type: str = "right",
         smoothing_alpha: float | None = None,
         debug: bool = False,
-        feedback_bound_tolerance_rad: float | None = None,
         qpos_lower_rad: tuple[float, ...] | None = None,
         qpos_upper_rad: tuple[float, ...] | None = None,
         fingertip_link_names: tuple[str, ...] | None = None,
@@ -545,11 +540,6 @@ class TAGHandRetargeter:
             pinch_skip_threshold=tag_cfg.pinch_skip_threshold,
             reg_stage1_weight=tag_cfg.reg_stage1_weight,
             reg_last_weight=tag_cfg.reg_last_weight,
-            feedback_bound_tolerance_rad=(
-                hand_d.feedback_bound_tolerance_rad
-                if feedback_bound_tolerance_rad is None
-                else feedback_bound_tolerance_rad
-            ),
         )
 
         # ── Pre-computed transforms (avoid per-frame allocation) ──

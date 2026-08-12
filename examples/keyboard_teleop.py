@@ -31,7 +31,6 @@ from dexmani_real.policy.safety import (
     publish_hand_home_and_wait_applied,
     publish_joint_targets,
     request_arm_decelerated_stop,
-    request_arm_resume,
 )
 from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
@@ -57,6 +56,21 @@ logger = get_logger(__name__)
 
 _INITIAL_STATE_POLL_S = 0.05
 _IK_WARNING_INTERVAL_S = 1.0
+_BOUNDARY_WARN_INTERVAL_S = 2.0
+
+
+def _fmt_vec3(v: np.ndarray, decimals: int = 3) -> str:
+    """Format a 3D vector as fixed-width comma-separated triple."""
+    w = decimals + 3  # sign + digit + dot + decimals
+    return f"({v[0]:{w}.{decimals}f}, {v[1]:{w}.{decimals}f}, {v[2]:{w}.{decimals}f})"
+
+
+def _fmt_keys(keys: tuple[str, ...]) -> str:
+    """Format held-key tuple for compact display."""
+    if not keys:
+        return "-"
+    short = {"up": "UP", "down": "DN", "left": "LT", "right": "RT"}
+    return "".join(short.get(k, k.upper()) for k in keys)
 
 
 def _workspace(runtime: ResolvedRuntimeConfig) -> np.ndarray:
@@ -94,22 +108,8 @@ def _build_planner_and_gate(
             arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
             hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
             hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-            arm_max_velocity_rad_s=float(
-                np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)
-            ),
-            arm_tracking_tolerance_rad=float(runtime.arm.tracking_error_warn_rad),
-            hand_max_velocity_rad_s=(
-                float(runtime.hand.max_delta_rad)
-                * float(runtime.keyboard_teleop.control_hz)
-                if runtime.hand.max_delta_rad is not None
-                else float(np.deg2rad(runtime.hand.safety_gate_max_velocity_deg_per_s))
-            ),
-            require_geometry_checks=True,
         ),
         planner=planner,
-        table_z_surface_m=float(runtime.arm.table_z_surface_m),
-        hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
-        enable_table_check=True,
     )
     return planner, gate
 
@@ -279,21 +279,6 @@ def _stop_arm_motion(
     )
 
 
-def _resume_arm_motion(
-    shared: SharedStorage,
-    runtime: ResolvedRuntimeConfig,
-    *,
-    reason: str,
-) -> np.ndarray | None:
-    """Resume Mode 6 behind a worker-measured hold and return that anchor."""
-    return request_arm_resume(
-        shared,
-        apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
-        reason=f"keyboard-{reason}",
-        heartbeat=False,
-    )
-
-
 def _run_control_loop(
     shared: SharedStorage,
     runtime: ResolvedRuntimeConfig,
@@ -335,6 +320,7 @@ def _run_control_loop(
     blocked_keys: tuple[str, ...] | None = None
     frame = 0
     last_ik_warning_s = 0.0
+    last_boundary_warn_s = 0.0
     started_s = time.monotonic()
 
     print(
@@ -516,61 +502,55 @@ def _run_control_loop(
             keys, float(cfg.delta_pos_m), float(cfg.delta_rpy_rad)
         )
         if active_keys != previous_active_keys:
-            logger.info(
-                "Keyboard input: held=%s dx_world_m=%s drpy_world_rad=%s",
-                active_keys,
-                np.round(dx, 4).tolist(),
-                np.round(drpy, 4).tolist(),
-            )
+            label = _fmt_keys(active_keys)
+            if active_keys:
+                print(
+                    f"  [{label:8s}] δpos={_fmt_vec3(dx)}m  δrot={_fmt_vec3(drpy)}rad",
+                    flush=True,
+                )
+            else:
+                print("  [--------] released", flush=True)
             previous_active_keys = active_keys
         moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
         if blocked_keys is not None:
             if active_keys == blocked_keys:
                 if frame % int(cfg.idle_interval_frames) == 0:
+                    elapsed = time.monotonic() - started_s
                     pose = planner.kin.compute_eef_pose_world(current_qpos)
                     print(
-                        f"[blocked {time.monotonic() - started_s:.0f}s] "
-                        f"eef={np.round(pose.p, 3)}m held={active_keys}",
+                        f"{_fmt_keys(active_keys):8s} !  [{elapsed:4.0f}s f={frame:5d}] "
+                        f"eef={_fmt_vec3(pose.p)}",
                         flush=True,
                     )
                 continue
             blocked_keys = None
-        if moving and not motion_active:
-            resumed_qpos = _resume_arm_motion(shared, runtime, reason="motion-start")
-            if resumed_qpos is None:
-                _set_fault(shared, "arm did not acknowledge the explicit motion resume")
-                return False
-            # The resume ACK carries the worker's direct SDK measurement taken
-            # at the State-0 transition.  Re-anchor both Cartesian and joint
-            # targets to it before publishing the first new motion endpoint.
-            current_qpos = resumed_qpos.copy()
-            measured_pose = planner.kin.compute_eef_pose_world(resumed_qpos)
-            target_pos, target_quat = measured_pose.p.copy(), measured_pose.q.copy()
-            previous_command = resumed_qpos.copy()
-            require_transition(shared, SafetyState.RUNNING)
-            rate.reset()
-        elif not moving and motion_active:
-            # A measured or predicted position target can land behind the
-            # moving arm after queue/feedback latency and command a reversal.
-            # State 6 lets firmware brake without inventing an endpoint.
-            stopped_qpos = _stop_arm_motion(shared, runtime, reason="key-release")
-            if stopped_qpos is None:
-                _set_fault(shared, "decelerated key-release stop did not settle")
-                return False
-            require_transition(shared, SafetyState.ARMED)
-            previous_command = stopped_qpos.copy()
-            held_pose = planner.kin.compute_eef_pose_world(stopped_qpos)
-            target_pos, target_quat = held_pose.p.copy(), held_pose.q.copy()
-        motion_active = moving
+        # ── Idle: no keys pressed ──────────────────────────────────
+        # Mode 6 is a position servo — the arm naturally converges to the
+        # last commanded endpoint and holds it with full active stiffness.
+        # No explicit stop or resume is needed; just stop publishing.
         if not moving:
+            if motion_active:
+                require_transition(shared, SafetyState.ARMED)
+                motion_active = False
+                rate.reset()
             tracking_fault_frames = 0
+            # Track measured position during idle so the velocity check on
+            # the next motion tick uses a fresh reference.
+            previous_command = current_qpos.copy()
             if frame % int(cfg.idle_interval_frames) == 0:
+                elapsed = time.monotonic() - started_s
                 pose = planner.kin.compute_eef_pose_world(current_qpos)
                 print(
-                    f"[idle {time.monotonic() - started_s:.0f}s] eef={np.round(pose.p, 3)}m",
+                    f"idle    [{elapsed:4.0f}s f={frame:5d}] eef={_fmt_vec3(pose.p)}",
                     flush=True,
                 )
             continue
+
+        # ── Moving: keys are held ──────────────────────────────────
+        if not motion_active:
+            require_transition(shared, SafetyState.RUNNING)
+            motion_active = True
+            rate.reset()
 
         # Advance a virtual Cartesian command at delta/dt, but cap its lead
         # over fresh feedback.  This gives Mode 6 enough following error to
@@ -579,7 +559,22 @@ def _run_control_loop(
         workspace_margin_m = float(cfg.workspace_command_margin_m)
         command_low = workspace[:, 0] + workspace_margin_m
         command_high = workspace[:, 1] - workspace_margin_m
-        target_pos = np.clip(target_pos + dx, command_low, command_high)
+        _desired_pos = target_pos + dx
+        target_pos = np.clip(_desired_pos, command_low, command_high)
+        boundary_indicator = ""
+        _clipped = np.abs(_desired_pos - target_pos) > 1e-9
+        if np.any(_clipped):
+            _axis_names = ("x", "y", "z")
+            _parts: list[str] = []
+            for _i in range(3):
+                if _clipped[_i]:
+                    _side = "⁺" if _desired_pos[_i] > target_pos[_i] else "⁻"
+                    _parts.append(f"{_axis_names[_i]}{_side}{target_pos[_i]:.3f}")
+            boundary_indicator = "  " + " ".join(_parts)
+            _now_s = time.monotonic()
+            if _now_s - last_boundary_warn_s >= _BOUNDARY_WARN_INTERVAL_S:
+                logger.warning("Workspace boundary: %s", " ".join(_parts))
+                last_boundary_warn_s = _now_s
         position_lead = target_pos - measured_pose.p
         max_position_lead_m = float(cfg.command_lookahead_frames) * float(
             cfg.delta_pos_m
@@ -617,15 +612,9 @@ def _run_control_loop(
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
                 logger.warning("IK rejected target: %s", result.reason or "unknown")
                 last_ik_warning_s = now_s
-            stopped_qpos = _stop_arm_motion(shared, runtime, reason="IK-rejection")
-            if stopped_qpos is None:
-                _set_fault(shared, "decelerated stop failed after IK rejection")
-                return False
-            require_transition(shared, SafetyState.ARMED)
-            previous_command = stopped_qpos.copy()
-            stopped_pose = planner.kin.compute_eef_pose_world(stopped_qpos)
-            target_pos, target_quat = stopped_pose.p.copy(), stopped_pose.q.copy()
-            motion_active = False
+            # Don't stop the arm — the last valid Mode 6 endpoint is still
+            # active and the arm is converging to a safe position.  Just
+            # block this key combination until the user changes keys.
             blocked_keys = active_keys
             continue
 
@@ -635,22 +624,11 @@ def _run_control_loop(
             prepare_timeout_s=float(policy.action_prepare_timeout_s),
             dt_s=dt_s,
             safety_gate=safety_gate,
-            previous_arm_qpos_cmd=previous_command,
         )
         if published is None or published.arm_qpos is None:
             logger.warning(
-                "Keyboard motion command rejected — decelerating until keys change"
+                "Keyboard motion command rejected — blocked until keys change"
             )
-            stopped_qpos = _stop_arm_motion(shared, runtime, reason="motion-rejection")
-            if stopped_qpos is None:
-                _set_fault(shared, "decelerated stop failed after motion rejection")
-                return False
-            require_transition(shared, SafetyState.ARMED)
-            previous_command = stopped_qpos.copy()
-            stopped_pose = planner.kin.compute_eef_pose_world(stopped_qpos)
-            target_pos, target_quat = stopped_pose.p.copy(), stopped_pose.q.copy()
-            tracking_fault_frames = 0
-            motion_active = False
             blocked_keys = active_keys
             continue
         previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
@@ -673,12 +651,13 @@ def _run_control_loop(
             tracking_fault_frames = 0
 
         if frame % int(cfg.status_interval_frames) == 0:
+            elapsed = time.monotonic() - started_s
             measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
+            _err_m = float(np.linalg.norm(target_pos - measured_pose.p))
             print(
-                f"[{time.monotonic() - started_s:.0f}s f={frame}] "
-                f"eef={np.round(measured_pose.p, 3)}m target={np.round(target_pos, 3)}m "
-                f"error={np.round(target_pos - measured_pose.p, 3)}m "
-                f"held={active_keys} dx_world={np.round(dx, 3)}m",
+                f"{_fmt_keys(active_keys):8s} [{elapsed:4.0f}s f={frame:5d}] "
+                f"eef={_fmt_vec3(measured_pose.p)} → {_fmt_vec3(target_pos)}  "
+                f"Δ={_err_m:.3f}m{boundary_indicator}",
                 flush=True,
             )
     return False
@@ -728,6 +707,40 @@ def _run_keyboard_session(
 
     keys.start()
     require_transition(shared, SafetyState.ARMED)
+    # Actively servo the hand at its home position.  Without this the hand
+    # stays at its power-up position and joints near the mechanical limit
+    # (particularly J5) may drift or repeatedly trigger feedback-bound
+    # tolerance warnings.
+    if hand_enabled:
+        hand_home = np.deg2rad(
+            np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
+        )
+        if publish_hand_home_and_wait_applied(
+            shared,
+            hand_home,
+            command_lower_rad=np.asarray(
+                runtime.hand.qpos_min_rad, dtype=np.float64
+            ),
+            command_upper_rad=np.asarray(
+                runtime.hand.qpos_max_rad, dtype=np.float64
+            ),
+            mechanical_lower_rad=np.asarray(
+                runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+            ),
+            mechanical_upper_rad=np.asarray(
+                runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+            ),
+            max_command_delta_rad=runtime.hand.max_delta_rad,
+            timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+            heartbeat=False,
+            abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+        ):
+            planner.set_hand_qpos(hand_home)
+        else:
+            logger.warning(
+                "Startup hand-home command was not accepted; "
+                "hand may be outside command limits"
+            )
     print(
         f"Keyboard teleop: {runtime.keyboard_teleop.control_hz:g}Hz, "
         f"hand={'measured' if hand_enabled else 'assumed-home'}, config={runtime.sha256[:12]}"

@@ -30,7 +30,7 @@ entry points, not test fixtures.
 | Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → safety gate → samples |
 | Change learned deployment | `examples/deploy_policy.py`, `policy/spec.py` | inference process → coordinator → safety gate |
 | Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
-| Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, safety gate |
+| Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, homing path planning |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
 | Change replay | `examples/replay_episode.py` | — | Self-contained script; preflight → session → runner → metrics |
 | Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and calibration JSON contract |
@@ -120,12 +120,17 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
 - `error_state` is sticky. A process death or enabled-worker heartbeat timeout
   becomes a main-owned fault.
 - `SafetyGate` (in `policy/safety.py`) is the single validation boundary:
-  well-formed → joint limits → whole-action velocity-envelope accept/reject →
-  collision → workspace. It never clips individual joints of a motion action.
-  Hand velocity is command-to-command, never target-to-measured; workers
-  additionally reject stale-generation, expired, operational-limit, and rated
-  mechanical-limit violations without changing an endpoint. Runtime config may
-  narrow, but cannot widen, the bundled rated mechanical envelope.
+  well-formed → joint limits → workspace.
+  Velocity envelope checking was removed (2026-08-12); xArm Mode 6 firmware is
+  the final velocity/acceleration/collision backstop.
+  Collision and transition geometry checks were removed from SafetyGate
+  (2026-08-12).  Collision-free homing paths are planned independently through
+  ``plan_joint_home_path`` / ``plan_band_alignment_path``, which call the
+  collision model directly.  Hand velocity is command-to-command, never
+  target-to-measured; workers additionally reject stale-generation, expired,
+  operational-limit, and rated mechanical-limit violations without changing an
+  endpoint. Runtime config may narrow, but cannot widen, the bundled rated
+  mechanical envelope.
 - `run_generation` tags both policy observations and candidates. Begin, pause,
   home, feedback fault, and camera re-warm advance it; the coordinator drops a
   mailbox result unless it, its observation, and shared state have the same

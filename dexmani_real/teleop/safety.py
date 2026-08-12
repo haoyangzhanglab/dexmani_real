@@ -123,21 +123,6 @@ def _reset_mapper_from_frames(
     return mapper.is_ready()
 
 
-def _transition_collision_free(
-    planner: XArm7MotionPlanner,
-    arm_start: np.ndarray,
-    arm_end: np.ndarray,
-    hand_start: np.ndarray,
-    hand_end: np.ndarray,
-) -> bool:
-    """Fail closed when the conservative arm-hand transition check cannot complete."""
-    try:
-        return planner.collision_model.check_transition_collision_free(arm_start, arm_end, hand_start, hand_end)
-    except (ValueError, RuntimeError):
-        logger.warning("teleop: arm-hand collision check failed", exc_info=True)
-        return False
-
-
 def _contact_stall_detected(
     arm_qpos: np.ndarray,
     arm_qvel: np.ndarray,

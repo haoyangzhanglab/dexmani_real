@@ -556,15 +556,8 @@ def _build_planner_and_gate(
             arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
             hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
             hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-            arm_max_velocity_rad_s=float(np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)),
-            arm_tracking_tolerance_rad=float(runtime.arm.tracking_error_warn_rad),
-            hand_max_velocity_rad_s=float(np.deg2rad(runtime.hand.safety_gate_max_velocity_deg_per_s)),
-            require_geometry_checks=True,
         ),
         planner=planner,
-        table_z_surface_m=float(runtime.arm.table_z_surface_m),
-        hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
-        enable_table_check=True,
     )
     return planner, gate, workspace
 
@@ -927,6 +920,9 @@ def _run_calibration(
                 target_pos, target_quat = held_pose.p.copy(), held_pose.q.copy()
             motion_active = moving
             if not moving:
+                # Track measured position during idle so the velocity check on
+                # the next motion tick uses a fresh reference.
+                previous_command = current_qpos.copy()
                 if frame % idle_interval == 0:
                     measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
                     print(f"[f={frame}] samples={len(samples)} "

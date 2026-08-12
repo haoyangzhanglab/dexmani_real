@@ -123,12 +123,13 @@ def plan_joint_home_path(
     *,
     table_z_surface_m: float | None = None,
     hand_safety_margin_m: float | None = None,
+    use_canonical_target: bool = False,
     report: dict[str, Any] | None = None,
 ) -> np.ndarray | None:
     """Plan a collision-safe joint-space path from *qpos* to *home_qpos*.
 
     Returns:
-        * ``None`` — arm is already at home (delta < 0.5°); caller should
+        * ``None`` — arm is already at home (delta < 0.15°); caller should
           send ``home_qpos`` directly (no-op).
         * ``(M, 7)`` execution milestones (normally 2–3) — every segment has
           been densely sampled and collision-checked at ≤1° joint increments.
@@ -153,6 +154,14 @@ def plan_joint_home_path(
                             lowest hand collision surface.
                             Defaults to ``arm.hand_safety_margin_m`` (0.05 m)
                             when ``None``. Used only by the fixed-Z fallback.
+        use_canonical_target:
+                            When True, plan directly to the canonical
+                            ``home_qpos`` (no nearest-equivalent wrapping).
+                            Equivalent joints whose encoder sits in a different
+                            2π band rotate through the full raw difference,
+                            concurrent with the rest of the arm, in a single
+                            motion.  When False (default), wrap ``home_qpos``
+                            to the nearest equivalent band first.
         report:             Optional mutable diagnostics dictionary. It is
                             cleared and populated with every attempted path and
                             its first rejection reason.
@@ -166,26 +175,40 @@ def plan_joint_home_path(
     if hand_safety_margin_m is None:
         hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
 
-    # ── Wrap home_qpos to nearest equivalent of current qpos ──
-    # Prevents interpolate_waypoints from generating up to 360° of unnecessary
-    # rotation for equivalent joints (J1/J3/J5/J7 on xArm7, 720° range).
-    # Wrapping home→qpos (not qpos→home) keeps all waypoints in the arm's
-    # current encoder band — critical because the firmware plans from the
-    # physical encoder position to each waypoint target.
-    if planner is not None:
-        _home = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
-        delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(_home, qpos))))
+    if use_canonical_target:
+        # Target canonical home_qpos directly, without band wrapping.  The
+        # firmware plans raw absolute deltas, so an equivalent joint whose
+        # encoder sits in a different 2π band (e.g. J7 at 350° vs canonical
+        # 0°) rotates through the full raw difference — concurrently with the
+        # other joints, in a single motion — instead of a separate
+        # band-alignment phase.
+        target = np.asarray(home_qpos, dtype=np.float64)
+        # "Already home" must use RAW delta.  compute_qpos_delta wraps 2π
+        # differences to 0 and would falsely report a band-mismatched arm
+        # (J7=360°) as already home; the arm_loop raw convergence check would
+        # then fail.  Raw delta returns None only when encoders read canonical.
+        delta = float(np.max(np.abs(target - qpos)))
     else:
-        # Fallback when planner is unavailable: wrap to nearest equivalent using
-        # the arm config limits (which mirror the URDF).
-        _home = wrap_nearest_equivalent(
-            home_qpos,
-            qpos,
-            _arm_cfg.joint_limit_lower,
-            _arm_cfg.joint_limit_upper,
-        )
-        delta = float(np.max(np.abs(qpos - _home)))
-    if delta < np.deg2rad(0.5):
+        # ── Wrap home_qpos to nearest equivalent of current qpos ──
+        # Prevents interpolate_waypoints from generating up to 360° of
+        # unnecessary rotation for equivalent joints (J1/J3/J5/J7 on xArm7,
+        # 720° range).  Wrapping home→qpos (not qpos→home) keeps all waypoints
+        # in the arm's current encoder band — critical because the firmware
+        # plans from the physical encoder position to each waypoint target.
+        if planner is not None:
+            target = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
+            delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(target, qpos))))
+        else:
+            # Fallback when planner is unavailable: wrap to nearest equivalent
+            # using the arm config limits (which mirror the URDF).
+            target = wrap_nearest_equivalent(
+                home_qpos,
+                qpos,
+                _arm_cfg.joint_limit_lower,
+                _arm_cfg.joint_limit_upper,
+            )
+            delta = float(np.max(np.abs(qpos - target)))
+    if delta < np.deg2rad(0.15):
         report["status"] = "already_home"
         return None  # caller can send home_qpos directly
 
@@ -331,7 +354,7 @@ def plan_joint_home_path(
     # deceleration at artificial stops.
 
     # ── Attempt 1: direct linear joint-space segment ──
-    direct_milestones = np.stack([qpos, _home])
+    direct_milestones = np.stack([qpos, target])
     if _validate_milestones(direct_milestones, "direct"):
         report.update(status="safe", selected_candidate="direct")
         return direct_milestones
@@ -340,9 +363,9 @@ def plan_joint_home_path(
     # Move shoulder/elbow joints to home first while keeping wrist fixed,
     # then move wrist joints.  This avoids the hand swinging through the body.
     mid = qpos.copy()
-    mid[_PROXIMAL_MASK] = _home[_PROXIMAL_MASK]
+    mid[_PROXIMAL_MASK] = target[_PROXIMAL_MASK]
 
-    proximal_first = _unique_milestones(qpos, mid, _home)
+    proximal_first = _unique_milestones(qpos, mid, target)
     if _validate_milestones(proximal_first, "proximal_first"):
         report.update(status="safe", selected_candidate="proximal_first")
         return proximal_first
@@ -352,8 +375,8 @@ def plan_joint_home_path(
     # the shoulder avoids the hand/body or hand/table intersection created by
     # the proximal-first heuristic.  It receives exactly the same dense checks.
     distal_mid = qpos.copy()
-    distal_mid[~_PROXIMAL_MASK] = _home[~_PROXIMAL_MASK]
-    distal_first = _unique_milestones(qpos, distal_mid, _home)
+    distal_mid[~_PROXIMAL_MASK] = target[~_PROXIMAL_MASK]
+    distal_first = _unique_milestones(qpos, distal_mid, target)
     if _validate_milestones(distal_first, "distal_first"):
         report.update(status="safe", selected_candidate="distal_first")
         return distal_first
@@ -363,7 +386,7 @@ def plan_joint_home_path(
     # same 19-DOF/table checks before publishing any firmware milestones.
     if planner is not None and hasattr(planner, "plan_joint_qpos_path"):
         try:
-            planned = planner.plan_joint_qpos_path(_home, qpos, planning_time_s=0.5)
+            planned = planner.plan_joint_qpos_path(target, qpos, planning_time_s=0.5)
         except (ValueError, RuntimeError) as exc:
             report["candidates"].append(
                 {"name": "joint_qpos_rrt", "safe": False, "reason": "planner_error", "detail": str(exc)}
@@ -371,8 +394,8 @@ def plan_joint_home_path(
         else:
             if planned.success and planned.qpos_path is not None and len(planned.qpos_path) >= 2:
                 rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
-                if float(np.max(np.abs(rrt_milestones[-1] - _home))) > 1e-6:
-                    rrt_milestones = np.concatenate([rrt_milestones, _home.reshape((1, *ARM_JOINT_SHAPE))], axis=0)
+                if float(np.max(np.abs(rrt_milestones[-1] - target))) > 1e-6:
+                    rrt_milestones = np.concatenate([rrt_milestones, target.reshape((1, *ARM_JOINT_SHAPE))], axis=0)
                 if _validate_milestones(rrt_milestones, "joint_qpos_rrt"):
                     report.update(status="safe", selected_candidate="joint_qpos_rrt")
                     return rrt_milestones

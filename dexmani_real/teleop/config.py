@@ -37,7 +37,6 @@ class TeleopConfig:
         "post_teleop_timeout_s": ("policy", "post_teleop_timeout_s"),
         "joint_max_speed_deg_s": ("arm", "max_joint_velocity_deg_per_s"),
         "joint_max_acc_deg_s2": ("arm", "max_joint_acceleration_deg_per_s2"),
-        "arm_tracking_tolerance_rad": ("arm", "tracking_error_warn_rad"),
         "arm_loop_hz": ("arm", "loop_hz"),
         "arm_home_qpos": ("arm", "home_qpos"),
         "arm_home_convergence_timeout_s": ("arm", "homing", "convergence_timeout_s"),
@@ -110,7 +109,6 @@ class TeleopConfig:
         "hand_qpos_upper_rad": ("hand", "qpos_max_rad"),
         "hand_mechanical_qpos_lower_rad": ("hand", "mechanical_qpos_min_rad"),
         "hand_mechanical_qpos_upper_rad": ("hand", "mechanical_qpos_max_rad"),
-        "hand_feedback_bound_tolerance_rad": ("hand", "feedback_bound_tolerance_rad"),
         "hand_home_command_ack_timeout_s": ("hand", "home_command_ack_timeout_s"),
         "hand_max_delta_rad": ("hand", "max_delta_rad"),
         "hand_safety_gate_max_velocity_deg_per_s": (

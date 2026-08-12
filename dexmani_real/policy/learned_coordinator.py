@@ -141,19 +141,8 @@ def learned_policy_loop(
                 arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
                 hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
                 hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-                arm_max_velocity_rad_s=float(np.deg2rad(runtime.arm.max_joint_velocity_deg_per_s)),
-                arm_tracking_tolerance_rad=float(runtime.arm.tracking_error_warn_rad),
-                hand_max_velocity_rad_s=(
-                    float(runtime.hand.max_delta_rad) * inference.observation.control_hz
-                    if runtime.hand.max_delta_rad is not None
-                    else float(np.deg2rad(runtime.hand.safety_gate_max_velocity_deg_per_s))
-                ),
-                observation_max_age_s=max(modality.max_age_s for modality in inference.observation.modalities),
-                require_geometry_checks=True,
             ),
             planner=planner,
-            table_z_surface_m=float(runtime.arm.table_z_surface_m),
-            hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
         )
         coordinator_config = LearnedCoordinatorConfig(
             coordinator_hz=float(runtime.policy.coordinator_hz),
@@ -467,7 +456,6 @@ class LearnedPolicyCoordinator:
             current_hand_qpos=current_hand,
             dt_s=self.inference.action.dt_s,
             run_generation=int(self.shared.run_generation.value),
-            previous_hand_qpos_cmd=self._last_hand_qpos_cmd,
         )
         if not result.accepted or result.candidate is None:
             logger.warning("learned candidate rejected: %s", result.reason)
