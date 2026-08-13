@@ -673,12 +673,12 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         )
         _publish_status(shared, RecorderPhase.READY, 0)
         publish_component_status(shared, "recorder", ComponentPhase.READY)
-        shared.recorder_heartbeat_s.value = time.monotonic()
+        shared.set_heartbeat("recorder", time.monotonic())
         shared.recorder_ready.set()
         limiter = RateManager(config.poll_hz)
 
         while shared.is_running.value or recorder.is_recording:
-            shared.recorder_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("recorder", time.monotonic())
             control_result = shared.record_control_ring.read_latest()
             control = None
             control_sequence = last_control_sequence

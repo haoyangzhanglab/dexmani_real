@@ -11,6 +11,7 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.utils.schema import INFERENCE_CANDIDATE_DTYPE
+from dexmani_real.shm.shared_storage import HEARTBEAT_INDEX
 from dexmani_real.policy.runtime import (
     ActionCandidate,
     ActionSpec,
@@ -31,7 +32,8 @@ class InferenceWorkerTransport:
     """Least-authority IPC view passed to the inference child."""
 
     is_running: Any
-    heartbeat_s: Any
+    heartbeats: Any
+    heartbeat_index: int
     ready: Any
     fault_latch: Any
     candidate_ring: Any
@@ -40,7 +42,8 @@ class InferenceWorkerTransport:
     def from_shared(cls, shared: Any) -> "InferenceWorkerTransport":
         return cls(
             is_running=shared.is_running,
-            heartbeat_s=shared.inference_heartbeat_s,
+            heartbeats=shared.heartbeats,
+            heartbeat_index=HEARTBEAT_INDEX["inference"],
             ready=shared.inference_ready,
             fault_latch=shared.error_state,
             candidate_ring=shared.inference_candidate_ring,
@@ -179,7 +182,7 @@ def inference_loop(
             raise TimeoutError(
                 f"inference warmup benchmark {benchmark_s:.3f}s exceeds {config.benchmark_deadline_s:.3f}s"
             )
-        transport.heartbeat_s.value = time.monotonic()
+        transport.heartbeats[transport.heartbeat_index] = time.monotonic()
         transport.ready.set()
         publish_component_status(transport, "inference", ComponentPhase.READY)
         ready = True
@@ -188,7 +191,7 @@ def inference_loop(
         running_published = False
         limiter = RateManager(config.poll_hz)
         while transport.is_running.value:
-            transport.heartbeat_s.value = time.monotonic()
+            transport.heartbeats[transport.heartbeat_index] = time.monotonic()
             result = tensor_block.read_latest()
             if result is not None:
                 snapshot, sequence = result
@@ -205,7 +208,7 @@ def inference_loop(
                             config.action,
                             config.actuators,
                         )
-                        transport.heartbeat_s.value = time.monotonic()
+                        transport.heartbeats[transport.heartbeat_index] = time.monotonic()
                         transport.ready.set()
                         publish_component_status(transport, "inference", ComponentPhase.READY)
                         running_published = False

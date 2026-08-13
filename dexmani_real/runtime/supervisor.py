@@ -44,7 +44,7 @@ def run_supervisor(
     shared: SharedStorage,
     procs: list[Any],
     proc_names: list[str],
-    heartbeat_fields: dict[str, Any],
+    heartbeat_names: list[str],
     *,
     status_interval_s: float = 30.0,
     heartbeat_timeouts_s: dict[str, float] | None = None,
@@ -76,18 +76,18 @@ def run_supervisor(
     configured_timeouts = safety.heartbeat_timeouts if heartbeat_timeouts_s is None else heartbeat_timeouts_s
     if len(procs) != len(proc_names) or len(set(proc_names)) != len(proc_names):
         raise ValueError("proc_names must contain one unique name per process")
-    if set(proc_names) != set(heartbeat_fields):
-        raise ValueError("proc_names must match heartbeat_fields")
-    missing_timeouts = set(heartbeat_fields) - set(configured_timeouts)
+    if set(proc_names) != set(heartbeat_names):
+        raise ValueError("proc_names must match heartbeat_names")
+    missing_timeouts = set(heartbeat_names) - set(configured_timeouts)
     if missing_timeouts:
         raise ValueError(f"missing heartbeat timeouts for {sorted(missing_timeouts)}")
-    timeouts = {name: float(configured_timeouts[name]) for name in heartbeat_fields}
+    timeouts = {name: float(configured_timeouts[name]) for name in heartbeat_names}
     if any(not np.isfinite(timeout) or timeout <= 0 for timeout in timeouts.values()):
         raise ValueError("heartbeat timeouts must be finite and positive")
 
     try:
         while True:
-            heartbeat_timestamps = {name: float(value.value) for name, value in heartbeat_fields.items()}
+            heartbeat_timestamps = {name: shared.get_heartbeat(name) for name in heartbeat_names}
             now = time.monotonic()
             heartbeat_ages = {
                 name: (now - timestamp_s if np.isfinite(timestamp_s) and 0.0 < timestamp_s <= now else float("inf"))
@@ -239,7 +239,7 @@ def print_health_summary(shared: SharedStorage) -> None:
     cam_serial_bytes = shared.camera_serial.value.rstrip(b"\x00")
     if cam_serial_bytes:
         print(f"  cam    OK   serial={cam_serial_bytes.decode()}")
-    elif shared.camera_heartbeat_s.value > 0:
+    elif shared.get_heartbeat("camera") > 0:
         print("  cam    OK   serial=unknown")
     else:
         print("  cam   ----  (no data yet)")

@@ -91,13 +91,13 @@ def wait_for_arm_home(
     while time.monotonic() < _deadline:
         _loop_now_s = time.monotonic()
         if heartbeat:
-            shared.policy_heartbeat_s.value = _loop_now_s
+            shared.set_heartbeat("policy", _loop_now_s)
 
         if _latch_operator_estop(shared, estop_requested):
             _abort_reason = "e-stop requested by operator"
             break
 
-        _arm_heartbeat_s = float(shared.arm_heartbeat_s.value)
+        _arm_heartbeat_s = shared.get_heartbeat("arm")
         _heartbeat_checked_s = time.monotonic()
         _heartbeat_issue = _arm_heartbeat_issue(
             _arm_heartbeat_s,
@@ -198,7 +198,7 @@ def _wait_for_prehome_state(
     while time.monotonic() < deadline_s:
         loop_now_s = time.monotonic()
         if heartbeat:
-            shared.policy_heartbeat_s.value = loop_now_s
+            shared.set_heartbeat("policy", loop_now_s)
         if _latch_operator_estop(shared, estop_requested):
             return None
         if (
@@ -207,7 +207,7 @@ def _wait_for_prehome_state(
             or int(shared.safety_state.value) == int(SafetyState.FAULT)
         ):
             return None
-        arm_heartbeat_s = float(shared.arm_heartbeat_s.value)
+        arm_heartbeat_s = shared.get_heartbeat("arm")
         heartbeat_checked_s = time.monotonic()
         if _arm_heartbeat_issue(arm_heartbeat_s, heartbeat_checked_s, arm_heartbeat_max_age_s) is not None:
             return None

@@ -179,7 +179,7 @@ def learned_policy_loop(
         live_output_validated = False
         warmup_limiter = RateManager(coordinator_config.coordinator_hz)
         while shared.is_running.value and time.monotonic() < warmup_deadline:
-            shared.policy_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("policy", time.monotonic())
             coordinator.publish_snapshot()
             if coordinator.consume_candidate() is not None:
                 live_output_validated = True
@@ -192,13 +192,13 @@ def learned_policy_loop(
 
         keyboard = KeyboardHandler(estop_callback=lambda: setattr(shared.estop_request, "value", True))
         keyboard.start()
-        shared.policy_heartbeat_s.value = time.monotonic()
+        shared.set_heartbeat("policy", time.monotonic())
         shared.policy_ready.set()
         publish_component_status(shared, "policy", ComponentPhase.READY)
         limiter = RateManager(coordinator_config.coordinator_hz)
 
         while shared.is_running.value and not stop_requested:
-            shared.policy_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("policy", time.monotonic())
             for control in keyboard.poll(timeout=0.0):
                 if control is ControlSignal.EMERGENCY_STOP:
                     shared.estop_request.value = True

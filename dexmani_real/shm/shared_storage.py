@@ -193,6 +193,19 @@ _RING_RESOURCE_NAMES = (
 _QUEUE_RESOURCE_NAMES = ("arm_action_q", "arm_home_result_q")
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
+# Ordered heartbeat slots — one fixed array replaces the seven per-subsystem
+# ``ctx.Value`` heartbeats. Index order is stable across processes.
+HEARTBEAT_FIELDS: tuple[str, ...] = (
+    "arm",
+    "hand",
+    "policy",
+    "recorder",
+    "inference",
+    "vr",
+    "camera",
+)
+HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
+
 
 def new_frame(dtype: np.dtype) -> np.ndarray:
     """Allocate a zero-initialized 1-element structured array for ring writes."""
@@ -242,13 +255,7 @@ class SharedStorage:
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
 
-    arm_heartbeat_s: Any
-    hand_heartbeat_s: Any
-    policy_heartbeat_s: Any
-    recorder_heartbeat_s: Any
-    inference_heartbeat_s: Any  # None unless experimental inference is enabled
-    vr_heartbeat_s: Any
-    camera_heartbeat_s: Any
+    heartbeats: Any  # fixed-order array of per-subsystem heartbeat timestamps (s)
 
     arm_ready: Any  # -> Main
     hand_ready: Any  # -> Main
@@ -413,15 +420,7 @@ class SharedStorage:
 
         storage.safety_state = ctx.Value("i", int(SafetyState.DISARMED))
 
-        storage.arm_heartbeat_s = ctx.Value("d", 0.0)
-        storage.hand_heartbeat_s = ctx.Value("d", 0.0)
-        storage.policy_heartbeat_s = ctx.Value("d", 0.0)
-        storage.recorder_heartbeat_s = ctx.Value("d", 0.0)
-        storage.inference_heartbeat_s = (
-            ctx.Value("d", 0.0) if cfg.enable_inference else None
-        )
-        storage.vr_heartbeat_s = ctx.Value("d", 0.0)
-        storage.camera_heartbeat_s = ctx.Value("d", 0.0)
+        storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS))
 
         storage.arm_ready = ctx.Event()
         storage.hand_ready = ctx.Event()
@@ -511,6 +510,14 @@ class SharedStorage:
         else:
             logger.error("SharedStorage close incomplete: %s", ", ".join(_close_errors))
         return self._closed
+
+    def set_heartbeat(self, name: str, value_s: float) -> None:
+        """Record a fresh heartbeat timestamp (s) for *name* (a HEARTBEAT_FIELDS key)."""
+        self.heartbeats[HEARTBEAT_INDEX[name]] = float(value_s)
+
+    def get_heartbeat(self, name: str) -> float:
+        """Return the last recorded heartbeat timestamp (s) for *name*, or 0.0."""
+        return float(self.heartbeats[HEARTBEAT_INDEX[name]])
 
 
 def vr_frame_dtype() -> np.dtype:

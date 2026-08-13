@@ -51,7 +51,7 @@ def _start_teleop(shared, cfg):
     shared.vr_ready.set()
     thread = run_in_thread(teleop_loop, shared, cfg)
     wait_until(
-        lambda: shared.policy_heartbeat_s.value > 0.0,
+        lambda: shared.get_heartbeat("policy") > 0.0,
         timeout_s=20.0,
         description="teleop main loop",
     )

@@ -286,12 +286,12 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
                 # This heartbeat represents worker liveness.  Source freshness
                 # is carried by capture_monotonic_s and enforced by Policy.
-                shared.camera_heartbeat_s.value = time.monotonic()
+                shared.set_heartbeat("camera", time.monotonic())
                 # Maintain target rate even on read failure so a persistent
                 # error doesn't turn into a tight loop.
                 rate_mgr.wait()
                 continue
-            shared.camera_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("camera", time.monotonic())
 
             # --- pointcloud (only when recording) ---
             # Pointcloud processing (~46 ms) is the dominant cost in the pipeline.

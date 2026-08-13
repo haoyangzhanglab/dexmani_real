@@ -28,7 +28,7 @@ def await_quit_recording_decision(
     while time.perf_counter() < deadline_s:
         if shared.estop_request.value:
             return QuitRecordingDecision.ESTOP
-        shared.policy_heartbeat_s.value = time.monotonic()
+        shared.set_heartbeat("policy", time.monotonic())
         for signal in keyboard.poll(timeout=0.1):
             if signal is ControlSignal.STOP:
                 return QuitRecordingDecision.SAVE

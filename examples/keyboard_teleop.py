@@ -133,9 +133,9 @@ def _runtime_issue(
     if hand_enabled and (hand_process is None or not hand_process.is_alive()):
         return "hand worker exited"
 
-    heartbeats = [("arm", float(shared.arm_heartbeat_s.value))]
+    heartbeats = [("arm", shared.get_heartbeat("arm"))]
     if hand_enabled:
-        heartbeats.append(("hand", float(shared.hand_heartbeat_s.value)))
+        heartbeats.append(("hand", shared.get_heartbeat("hand")))
     now_s = time.monotonic()
     for name, heartbeat_s in heartbeats:
         timeout_s = float(heartbeat_timeouts_s[name])

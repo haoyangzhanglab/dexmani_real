@@ -1534,15 +1534,11 @@ def _live_worker_health_issue(
         if not process.is_alive():
             return f"worker {process.name!r} exited with code {process.exitcode}"
 
-    heartbeat_by_name = {
-        "arm": shared.arm_heartbeat_s,
-        "hand": shared.hand_heartbeat_s,
-    }
+    heartbeat_by_name = {"arm", "hand"}
     for process in processes:
-        heartbeat = heartbeat_by_name.get(process.name)
-        if heartbeat is None:
+        if process.name not in heartbeat_by_name:
             continue
-        last_s = float(heartbeat.value)
+        last_s = shared.get_heartbeat(process.name)
         now = time.monotonic() if now_s is None else now_s
         timeout_s = float(heartbeat_timeouts_s[process.name])
         if not np.isfinite(last_s) or last_s <= 0 or last_s > now or now - last_s > timeout_s:

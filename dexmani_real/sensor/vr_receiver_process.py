@@ -125,7 +125,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         # Heartbeat on every event — proves VR process is alive + receiving data.
         # Written *before* vr_ready so the supervisor sees a fresh heartbeat
         # immediately (avoids false FAULT on the first check).
-        shared.vr_heartbeat_s.value = time.monotonic()
+        shared.set_heartbeat("vr", time.monotonic())
 
         if not shared.vr_ready.is_set():
             shared.vr_ready.set()

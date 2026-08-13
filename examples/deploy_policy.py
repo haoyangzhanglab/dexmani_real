@@ -100,20 +100,16 @@ def _feedback_preflight_issues(
         issues.append("e-stop is requested")
 
     # --- heartbeats -------------------------------------------------------
-    enabled_heartbeats: dict[str, Any] = {
-        "inference": shared.inference_heartbeat_s,
-        "policy": shared.policy_heartbeat_s,
-        "arm": shared.arm_heartbeat_s,
-    }
+    enabled_heartbeats: list[str] = ["inference", "policy", "arm"]
     if hand_feedback_enabled:
-        enabled_heartbeats["hand"] = shared.hand_heartbeat_s
+        enabled_heartbeats.append("hand")
     if needs_camera:
-        enabled_heartbeats["camera"] = shared.camera_heartbeat_s
+        enabled_heartbeats.append("camera")
     if needs_vr:
-        enabled_heartbeats["vr"] = shared.vr_heartbeat_s
+        enabled_heartbeats.append("vr")
     heartbeat_timeouts = runtime.safety.heartbeat_timeouts
-    for name, heartbeat in enabled_heartbeats.items():
-        last_s = float(heartbeat.value)
+    for name in enabled_heartbeats:
+        last_s = shared.get_heartbeat(name)
         current_s = time.monotonic() if now_s is None else now_s
         if (
             not np.isfinite(last_s)
@@ -446,22 +442,18 @@ def run_policy_deployment(
         print("Learned policy ready and ARMED. B=run C/S/D=hold Q=quit ESC=e-stop", flush=True)
 
         names = [process.name for process in processes]
-        heartbeat_fields = {
-            "inference": shared.inference_heartbeat_s,
-            "policy": shared.policy_heartbeat_s,
-            "arm": shared.arm_heartbeat_s,
-        }
+        heartbeat_names = ["inference", "policy", "arm"]
         if hand_feedback_enabled:
-            heartbeat_fields["hand"] = shared.hand_heartbeat_s
+            heartbeat_names.append("hand")
         if needs_camera:
-            heartbeat_fields["camera"] = shared.camera_heartbeat_s
+            heartbeat_names.append("camera")
         if needs_vr:
-            heartbeat_fields["vr"] = shared.vr_heartbeat_s
+            heartbeat_names.append("vr")
         exit_reason, normal_exit = run_supervisor(
             shared,
             processes,
             names,
-            heartbeat_fields,
+            heartbeat_names,
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )

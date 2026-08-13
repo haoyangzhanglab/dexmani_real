@@ -740,7 +740,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
     # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
     # after all ready events.
-    shared.arm_heartbeat_s.value = time.monotonic()
+    shared.set_heartbeat("arm", time.monotonic())
     shared.arm_ready.set()
     publish_component_status(shared, "arm", ComponentPhase.READY)
     logger.info(
@@ -756,7 +756,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     while shared.is_running.value:
         c24_recovered_this_tick = False
         # Heartbeat — written even when holding position (proves we're alive)
-        shared.arm_heartbeat_s.value = time.monotonic()
+        shared.set_heartbeat("arm", time.monotonic())
 
         if shared.estop_request.value:
             # SDK emergency_stop() is the fastest path to kill motor power.
@@ -1347,7 +1347,7 @@ def _execute_mode0_milestones_impl(
             _abort_reason = _shared_abort_reason_impl(shared)
             if _abort_reason is not None:
                 return _result_impl(request, False, _abort_reason, current), current
-            shared.arm_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("arm", time.monotonic())
         if time.monotonic() >= _overall_deadline:
             return _result_impl(request, 
                 False,
@@ -1388,7 +1388,7 @@ def _execute_mode0_milestones_impl(
                 _abort_reason = _shared_abort_reason_impl(shared)
                 if _abort_reason is not None:
                     return _result_impl(request, False, _abort_reason, current), current
-                shared.arm_heartbeat_s.value = time.monotonic()
+                shared.set_heartbeat("arm", time.monotonic())
             try:
                 _state_code, _states = arm.get_joint_states(is_radian=True, num=3)
             except Exception:

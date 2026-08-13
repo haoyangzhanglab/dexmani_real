@@ -104,19 +104,14 @@ def _preflight_health_issues(
 
     # The teleop loop reuses the "policy" heartbeat/ready slots in SharedStorage
     # (shared with the learned-policy deployment path).
-    enabled_heartbeats = {
-        "arm": shared.arm_heartbeat_s,
-        "vr": shared.vr_heartbeat_s,
-        "policy": shared.policy_heartbeat_s,
-    }
+    enabled_heartbeats = ["arm", "vr", "policy"]
     if hand_enabled:
-        enabled_heartbeats["hand"] = shared.hand_heartbeat_s
+        enabled_heartbeats.append("hand")
     if recording_enabled:
-        enabled_heartbeats["camera"] = shared.camera_heartbeat_s
-        enabled_heartbeats["recorder"] = shared.recorder_heartbeat_s
+        enabled_heartbeats += ["camera", "recorder"]
     heartbeat_timeouts = runtime.safety.heartbeat_timeouts
-    for name, heartbeat in enabled_heartbeats.items():
-        last_s = float(heartbeat.value)
+    for name in enabled_heartbeats:
+        last_s = shared.get_heartbeat(name)
         current_s = time.monotonic() if now_s is None else now_s
         if (
             not np.isfinite(last_s)
@@ -322,23 +317,17 @@ def _readiness_checks(
     return checks
 
 
-def _heartbeat_fields(
-    shared: SharedStorage,
+def _heartbeat_names(
     *,
     hand_enabled: bool,
     recording_enabled: bool,
-) -> dict[str, Any]:
-    fields = {
-        "arm": shared.arm_heartbeat_s,
-        "policy": shared.policy_heartbeat_s,
-        "vr": shared.vr_heartbeat_s,
-    }
+) -> list[str]:
+    names = ["arm", "policy", "vr"]
     if recording_enabled:
-        fields["camera"] = shared.camera_heartbeat_s
-        fields["recorder"] = shared.recorder_heartbeat_s
+        names += ["camera", "recorder"]
     if hand_enabled:
-        fields["hand"] = shared.hand_heartbeat_s
-    return fields
+        names.append("hand")
+    return names
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -507,8 +496,7 @@ def run_teleop_experiment(
         )
 
         process_names = [process.name for process in procs]
-        heartbeat_fields = _heartbeat_fields(
-            shared,
+        heartbeat_names = _heartbeat_names(
             hand_enabled=hand_enabled,
             recording_enabled=recording_enabled,
         )
@@ -518,7 +506,7 @@ def run_teleop_experiment(
             shared,
             procs,
             process_names,
-            heartbeat_fields,
+            heartbeat_names,
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )

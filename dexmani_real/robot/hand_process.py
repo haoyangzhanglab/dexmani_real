@@ -250,7 +250,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
     # after all ready events; if this process hasn't entered its main loop yet,
     # heartbeat=0 → age=inf → spurious FAULT.
-    shared.hand_heartbeat_s.value = time.monotonic()
+    shared.set_heartbeat("hand", time.monotonic())
     shared.hand_ready.set()
     publish_component_status(shared, "hand", ComponentPhase.READY)
     logger.info("hand_loop: ready")
@@ -300,7 +300,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
 
     while shared.is_running.value:
         # Heartbeat — written even when gated (proves we're alive)
-        shared.hand_heartbeat_s.value = time.monotonic()
+        shared.set_heartbeat("hand", time.monotonic())
 
         if shared.estop_request.value:
             break

@@ -601,7 +601,7 @@ def _runtime_issue(shared: SharedStorage, arm_process: Any, heartbeat_timeout_s:
         return "safety state is FAULT"
     if not arm_process.is_alive():
         return "arm worker exited"
-    heartbeat_s = float(shared.arm_heartbeat_s.value)
+    heartbeat_s = shared.get_heartbeat("arm")
     now_s = time.monotonic()
     age_s = now_s - heartbeat_s
     if not np.isfinite(heartbeat_s) or heartbeat_s <= 0.0 or heartbeat_s > now_s or age_s > heartbeat_timeout_s:

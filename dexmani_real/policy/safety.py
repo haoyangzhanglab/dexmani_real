@@ -136,7 +136,7 @@ def request_arm_decelerated_stop(
     last_source_ns = 0
     while time.monotonic() < apply_deadline_s:
         if heartbeat:
-            shared.policy_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("policy", time.monotonic())
         if (
             not bool(shared.is_running.value)
             or bool(shared.error_state.value)
@@ -251,7 +251,7 @@ def request_arm_resume(
     deadline_s = time.monotonic() + float(apply_timeout_s)
     while time.monotonic() < deadline_s:
         if heartbeat:
-            shared.policy_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("policy", time.monotonic())
         if (
             not bool(shared.is_running.value)
             or bool(shared.error_state.value)
@@ -1030,7 +1030,7 @@ def publish_hand_home_and_wait_applied(
             if check_is_running and not bool(shared.is_running.value):
                 return False
             if heartbeat:
-                shared.policy_heartbeat_s.value = time.monotonic()
+                shared.set_heartbeat("policy", time.monotonic())
 
             result = shared.hand_state_ring.read_latest()
             if result is not None:

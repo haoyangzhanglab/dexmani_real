@@ -578,7 +578,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             return
 
     # Publish before policy_ready so Main never observes a ready worker with a zero heartbeat.
-    shared.policy_heartbeat_s.value = time.monotonic()
+    shared.set_heartbeat("policy", time.monotonic())
     shared.policy_ready.set()
     publish_component_status(shared, "policy", ComponentPhase.READY)
 
@@ -657,7 +657,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     try:
         while shared.is_running.value and not ctx.sigterm_requested:
-            shared.policy_heartbeat_s.value = time.monotonic()
+            shared.set_heartbeat("policy", time.monotonic())
             limiter.wait()
             if _control_hold.application_pending:
                 _hold_result = _control_hold.observe_delivery(
