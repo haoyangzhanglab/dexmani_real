@@ -36,13 +36,13 @@ _HOME_QPOS = np.asarray(ArmLoopConfig().home_qpos, dtype=np.float64)
 
 def _mark_ready(shared, cfg: TeleopConfig) -> None:
     """Set the readiness events teleop_loop waits on before entering its main loop."""
-    shared.arm_ready.set()
-    shared.vr_ready.set()
+    shared.set_ready("arm")
+    shared.set_ready("vr")
     if cfg.runtime.policy.hand_enabled:
-        shared.hand_ready.set()
+        shared.set_ready("hand")
     if cfg.runtime.policy.recording_enabled:
-        shared.camera_ready.set()
-        shared.recorder_ready.set()
+        shared.set_ready("camera")
+        shared.set_ready("recorder")
 
 
 def _start_arm_writer(shared, qpos, interval_s: float = 0.02) -> tuple[threading.Event, threading.Thread]:

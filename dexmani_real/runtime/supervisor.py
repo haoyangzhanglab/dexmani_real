@@ -140,10 +140,10 @@ def run_supervisor(
 
 def wait_subsystem_ready(
     shared: SharedStorage,
-    ready_checks: list[tuple[str, Any, float]],
+    ready_checks: list[tuple[str, float]],
     procs: list[Any],
 ) -> bool:
-    """Wait for each ``(name, event, timeout_s)`` ready event to be set.
+    """Wait for each ``(name, timeout_s)`` subsystem to become ready.
 
     Checks ``error_state`` and process liveness on every poll tick.
     Returns True if all subsystems are ready, False if any fail.
@@ -151,14 +151,14 @@ def wait_subsystem_ready(
     The caller is responsible for printing pre-wait user messages
     (e.g. "put on Quest headset") before calling this function.
     """
-    for name, ev, timeout in ready_checks:
+    for name, timeout in ready_checks:
         if not np.isfinite(timeout) or timeout <= 0:
             raise ValueError(f"readiness timeout for {name!r} must be finite and positive")
         deadline = time.monotonic() + timeout
         ready = False
         failure_logged = False
         while time.monotonic() < deadline:
-            if ev.is_set():
+            if shared.is_ready(name):
                 ready = True
                 break
             if shared.error_state.value:

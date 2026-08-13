@@ -36,7 +36,7 @@ def _start_arm(shared, fake_cls):
     """Start arm_loop and wait for Mode-6 ready State 2."""
     shared.safety_state.value = int(SafetyState.ARMED)
     arm_thread = run_in_thread(arm_loop, shared, ArmLoopConfig())
-    assert shared.arm_ready.wait(timeout=8.0), "arm_loop did not set arm_ready"
+    assert shared.wait_ready("arm", 8.0), "arm_loop did not set arm_ready"
     wait_until(
         lambda: fake_cls.last_instance is not None
         and fake_cls.last_instance.mode == 6
@@ -48,7 +48,7 @@ def _start_arm(shared, fake_cls):
 
 def _start_teleop(shared, cfg):
     """Start teleop_loop (arm_ready is already set by arm_loop)."""
-    shared.vr_ready.set()
+    shared.set_ready("vr")
     thread = run_in_thread(teleop_loop, shared, cfg)
     wait_until(
         lambda: shared.get_heartbeat("policy") > 0.0,

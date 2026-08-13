@@ -212,7 +212,7 @@ def _start_workers(
     arm_process.start()
     arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
     if not wait_subsystem_ready(
-        shared, [("arm", shared.arm_ready, arm_timeout_s)], processes
+        shared, [("arm", arm_timeout_s)], processes
     ):
         return arm_process, None, False
 
@@ -233,12 +233,12 @@ def _start_workers(
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["hand"])
     while (
         hand_process.is_alive()
-        and not shared.hand_ready.is_set()
+        and not shared.is_ready("hand")
         and time.monotonic() < deadline_s
     ):
         time.sleep(_INITIAL_STATE_POLL_S)
 
-    if not shared.hand_ready.is_set():
+    if not shared.is_ready("hand"):
         return arm_process, hand_process, False
 
     hand_state = read_hand_state_dict(shared)
@@ -682,14 +682,14 @@ def _run_keyboard_session(
         processes,
         hand_requested=bool(runtime.policy.hand_enabled) and not no_hand,
     )
-    if not shared.arm_ready.is_set():
+    if not shared.is_ready("arm"):
         logger.error("Arm worker did not become ready")
         return False
     if bool(runtime.policy.hand_enabled) and not no_hand and not hand_enabled:
         logger.error("XHand is required but did not become ready")
         return False
     if bool(runtime.policy.hand_enabled) and not no_hand and hand_process is not None:
-        if hand_process.is_alive() and not shared.hand_ready.is_set():
+        if hand_process.is_alive() and not shared.is_ready("hand"):
             logger.error("XHand startup timed out in an indeterminate state")
             return False
     if shared.error_state.value:

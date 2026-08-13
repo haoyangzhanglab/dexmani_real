@@ -293,27 +293,26 @@ def _build_processes(
 
 
 def _readiness_checks(
-    shared: SharedStorage,
     runtime: ResolvedRuntimeConfig,
     *,
     hand_enabled: bool,
     recording_enabled: bool,
-) -> list[tuple[str, Any, float]]:
+) -> list[tuple[str, float]]:
     timeouts = runtime.safety.readiness_timeouts_s
     checks = [
-        ("arm", shared.arm_ready, float(timeouts["arm"])),
-        ("vr", shared.vr_ready, float(timeouts["vr"])),
-        ("policy", shared.policy_ready, float(timeouts["policy"])),
+        ("arm", float(timeouts["arm"])),
+        ("vr", float(timeouts["vr"])),
+        ("policy", float(timeouts["policy"])),
     ]
     if recording_enabled:
         checks.extend(
             (
-                ("camera", shared.camera_ready, float(timeouts["camera"])),
-                ("recorder", shared.recorder_ready, float(timeouts["recorder"])),
+                ("camera", float(timeouts["camera"])),
+                ("recorder", float(timeouts["recorder"])),
             )
         )
     if hand_enabled:
-        checks.append(("hand", shared.hand_ready, float(timeouts["hand"])))
+        checks.append(("hand", float(timeouts["hand"])))
     return checks
 
 
@@ -449,13 +448,12 @@ def run_teleop_experiment(
         group.start()
 
         ready_checks = _readiness_checks(
-            shared,
             runtime,
             hand_enabled=hand_enabled,
             recording_enabled=recording_enabled,
         )
 
-        for name, _event, timeout in ready_checks:
+        for name, timeout in ready_checks:
             if name == "vr":
                 print(f"\n  Waiting for VR connection (up to {timeout}s) — put on Quest headset...", flush=True)
 
@@ -466,7 +464,7 @@ def run_teleop_experiment(
             shared_closed = shutdown_report.shared_closed
             return 1
 
-        for name, _event, _timeout in ready_checks:
+        for name, _timeout in ready_checks:
             if name == "vr":
                 print(f"  VR connected", flush=True)
             else:

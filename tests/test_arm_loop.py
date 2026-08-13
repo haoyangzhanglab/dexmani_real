@@ -42,7 +42,7 @@ def _wait_mode6_ready(fake):
 def test_startup_publishes_state_and_sets_ready(shared, arm_fakes):
     thread = _start_arm(shared)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0), "arm_ready was not set"
+    assert shared.wait_ready("arm", 8.0), "arm_ready was not set"
     wait_until(
         lambda: shared.arm_state_ring.read_latest() is not None,
         description="initial arm state publication",
@@ -57,7 +57,7 @@ def test_startup_publishes_state_and_sets_ready(shared, arm_fakes):
 def test_servo_endpoint_applies_target(shared, arm_fakes):
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0)
+    assert shared.wait_ready("arm", 8.0)
     _wait_mode6_ready(fake)
 
     cfg = ArmLoopConfig()
@@ -79,7 +79,7 @@ def test_servo_endpoint_applies_target(shared, arm_fakes):
 def test_decelerated_stop_then_resume(shared, arm_fakes):
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0)
+    assert shared.wait_ready("arm", 8.0)
     _wait_mode6_ready(fake)
 
     make_arm_control_request(shared, ArmControlKind.DECELERATED_STOP, action_id=1)
@@ -98,7 +98,7 @@ def test_decelerated_stop_then_resume(shared, arm_fakes):
 def test_home_single_point_confirm_dwell(shared, arm_fakes):
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0)
+    assert shared.wait_ready("arm", 8.0)
     _wait_mode6_ready(fake)
 
     cfg = ArmLoopConfig()
@@ -123,7 +123,7 @@ def test_home_single_point_confirm_dwell(shared, arm_fakes):
 def test_home_multi_milestone_executes_mode0(shared, arm_fakes):
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0)
+    assert shared.wait_ready("arm", 8.0)
     _wait_mode6_ready(fake)
 
     cfg = ArmLoopConfig()
@@ -161,7 +161,7 @@ def test_home_multi_milestone_failure_returns_result(shared, arm_fakes):
     """
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0)
+    assert shared.wait_ready("arm", 8.0)
     _wait_mode6_ready(fake)
 
     cfg = ArmLoopConfig()
@@ -190,7 +190,7 @@ def test_home_multi_milestone_failure_returns_result(shared, arm_fakes):
 def test_collision_fault_c31_latches_error(shared, arm_fakes):
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)
-    assert shared.arm_ready.wait(timeout=8.0)
+    assert shared.wait_ready("arm", 8.0)
     _wait_mode6_ready(fake)
 
     fake.error_code = 31  # collision fault

@@ -167,8 +167,8 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     Designed as an ``mp.Process`` target. Runs the camera capture loop directly
     in this process — no subprocess spawn.
 
-    On init failure, logs the error and returns without setting
-    ``shared.camera_ready`` — Main detects this via ready-event timeout.
+    On init failure, logs the error and returns without setting the camera
+    ready flag — Main detects this via ready timeout.
     """
     import numpy as np
 
@@ -353,7 +353,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                     )
                     if not ready_published:
                         ready_published = True
-                        shared.camera_ready.set()
+                        shared.set_ready("camera")
                         publish_component_status(shared, "camera", ComponentPhase.READY)
                         _logger.info("camera_loop: ready after first verified frame @ %.1f Hz", cfg.publish_hz)
                 except Exception:

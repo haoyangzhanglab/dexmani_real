@@ -1784,9 +1784,9 @@ def run_live_replay(
             process.start()
 
         timeouts = runtime.safety.readiness_timeouts_s
-        ready_checks: list[tuple[str, Any, float]] = [("arm", shared.arm_ready, float(timeouts["arm"]))]
+        ready_checks: list[tuple[str, float]] = [("arm", float(timeouts["arm"]))]
         if hand_available:
-            ready_checks.append(("hand", shared.hand_ready, float(timeouts["hand"])))
+            ready_checks.append(("hand", float(timeouts["hand"])))
         workers_ready = wait_subsystem_ready(shared, ready_checks, processes)
         if not workers_ready:
             shared.error_state.value = True

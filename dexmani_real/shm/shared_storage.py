@@ -206,6 +206,25 @@ HEARTBEAT_FIELDS: tuple[str, ...] = (
 )
 HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
 
+# Ordered readiness slots — one fixed array replaces the seven per-subsystem
+# ``ctx.Event`` ready flags. Per-element access on ``ctx.Array`` is atomic, so
+# each flag is a simple 0/1 store; the index order is stable across processes.
+READY_FIELDS: tuple[str, ...] = (
+    "arm",
+    "hand",
+    "camera",
+    "vr",
+    "policy",
+    "inference",
+    "recorder",
+)
+READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
+
+# Poll granularity for wait_ready(). Readiness is a one-shot startup wait with
+# generous timeouts; a short poll keeps the observed return value identical to
+# Event.wait(timeout) without burning CPU.
+_READY_POLL_INTERVAL_S = 0.01
+
 
 def new_frame(dtype: np.dtype) -> np.ndarray:
     """Allocate a zero-initialized 1-element structured array for ring writes."""
@@ -257,13 +276,7 @@ class SharedStorage:
 
     heartbeats: Any  # fixed-order array of per-subsystem heartbeat timestamps (s)
 
-    arm_ready: Any  # -> Main
-    hand_ready: Any  # -> Main
-    camera_ready: Any  # -> Main
-    vr_ready: Any  # -> Main
-    policy_ready: Any  # -> Main, only after policy/backend warmup
-    inference_ready: Any  # None unless experimental inference is enabled
-    recorder_ready: Any  # optional capability -> Main
+    ready_flags: Any  # fixed-order array of per-subsystem readiness flags (0/1)
 
     arm_device_identity: Any  # worker-reported canonical identity JSON
     hand_device_identity: Any  # worker-reported canonical identity JSON
@@ -422,13 +435,7 @@ class SharedStorage:
 
         storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS))
 
-        storage.arm_ready = ctx.Event()
-        storage.hand_ready = ctx.Event()
-        storage.camera_ready = ctx.Event()
-        storage.vr_ready = ctx.Event()
-        storage.policy_ready = ctx.Event()
-        storage.inference_ready = ctx.Event() if cfg.enable_inference else None
-        storage.recorder_ready = ctx.Event()
+        storage.ready_flags = ctx.Array("b", len(READY_FIELDS))
 
         storage.arm_device_identity = ctx.Array("c", b"\x00" * 1024)
         storage.hand_device_identity = ctx.Array("c", b"\x00" * 1024)
@@ -518,6 +525,32 @@ class SharedStorage:
     def get_heartbeat(self, name: str) -> float:
         """Return the last recorded heartbeat timestamp (s) for *name*, or 0.0."""
         return float(self.heartbeats[HEARTBEAT_INDEX[name]])
+
+    def set_ready(self, name: str) -> None:
+        """Mark *name* (a READY_FIELDS key) ready."""
+        self.ready_flags[READY_INDEX[name]] = 1
+
+    def clear_ready(self, name: str) -> None:
+        """Mark *name* not ready."""
+        self.ready_flags[READY_INDEX[name]] = 0
+
+    def is_ready(self, name: str) -> bool:
+        """Return True when *name* is ready."""
+        return bool(self.ready_flags[READY_INDEX[name]])
+
+    def wait_ready(self, name: str, timeout: float) -> bool:
+        """Block until *name* is ready or *timeout* seconds elapse; True if ready.
+
+        Equivalent to ``Event.wait(timeout)`` in its return value. Readiness is a
+        one-shot startup wait, so a short poll replaces the kernel-level event
+        wait without any observable latency difference.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_ready(name):
+                return True
+            time.sleep(_READY_POLL_INTERVAL_S)
+        return self.is_ready(name)
 
 
 def vr_frame_dtype() -> np.dtype:

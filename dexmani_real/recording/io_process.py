@@ -351,7 +351,7 @@ class RecorderClient:
         self.shared.record_control_ring.write(frame)
 
     def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
-        if self._recording or not self.shared.recorder_ready.is_set():
+        if self._recording or not self.shared.is_ready("recorder"):
             return False
         try:
             _bounded_control_text(task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label")
@@ -674,7 +674,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         _publish_status(shared, RecorderPhase.READY, 0)
         publish_component_status(shared, "recorder", ComponentPhase.READY)
         shared.set_heartbeat("recorder", time.monotonic())
-        shared.recorder_ready.set()
+        shared.set_ready("recorder")
         limiter = RateManager(config.poll_hz)
 
         while shared.is_running.value or recorder.is_recording:

@@ -394,17 +394,17 @@ def run_policy_deployment(
             process.start()
 
         ready_timeouts_s = dict(runtime.safety.readiness_timeouts_s)
-        ready_checks: list[tuple[str, Any, float]] = [("arm", shared.arm_ready, ready_timeouts_s["arm"])]
+        ready_checks: list[tuple[str, float]] = [("arm", ready_timeouts_s["arm"])]
         if hand_feedback_enabled:
-            ready_checks.append(("hand", shared.hand_ready, ready_timeouts_s["hand"]))
+            ready_checks.append(("hand", ready_timeouts_s["hand"]))
         if needs_camera:
-            ready_checks.append(("camera", shared.camera_ready, ready_timeouts_s["camera"]))
+            ready_checks.append(("camera", ready_timeouts_s["camera"]))
         if needs_vr:
-            ready_checks.append(("vr", shared.vr_ready, ready_timeouts_s["vr"]))
+            ready_checks.append(("vr", ready_timeouts_s["vr"]))
         ready_checks.extend(
             [
-                ("inference", shared.inference_ready, ready_timeouts_s["inference"]),
-                ("policy", shared.policy_ready, ready_timeouts_s["policy"]),
+                ("inference", ready_timeouts_s["inference"]),
+                ("policy", ready_timeouts_s["policy"]),
             ]
         )
         if not wait_subsystem_ready(shared, ready_checks, processes):

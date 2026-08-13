@@ -523,15 +523,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             logger.warning("Hand FK initialization failed", exc_info=True)
 
     logger.info("Teleop: waiting for enabled capabilities...")
-    _ready_events = [("arm", shared.arm_ready), ("vr", shared.vr_ready)]
+    _ready_names = ["arm", "vr"]
     if cfg.runtime.policy.recording_enabled:
-        _ready_events.append(("camera", shared.camera_ready))
-        _ready_events.append(("recorder", shared.recorder_ready))
+        _ready_names += ["camera", "recorder"]
     if cfg.runtime.policy.hand_enabled:
-        _ready_events.insert(1, ("hand", shared.hand_ready))
-    for name, ev in _ready_events:
+        _ready_names.insert(1, "hand")
+    for name in _ready_names:
         timeout_s = float(dict(cfg.runtime.safety.readiness_timeouts_s)[name])
-        if not ev.wait(timeout=timeout_s):
+        if not shared.wait_ready(name, timeout_s):
             logger.error("Teleop: %s startup timeout (%.1fs)", name, timeout_s)
             shared.error_state.value = True
             publish_component_status(
@@ -579,7 +578,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     # Publish before policy_ready so Main never observes a ready worker with a zero heartbeat.
     shared.set_heartbeat("policy", time.monotonic())
-    shared.policy_ready.set()
+    shared.set_ready("policy")
     publish_component_status(shared, "policy", ComponentPhase.READY)
 
     home_qpos = np.array(cfg.runtime.arm.home_qpos, dtype=np.float64)

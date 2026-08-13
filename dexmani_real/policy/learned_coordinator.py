@@ -162,16 +162,16 @@ def learned_policy_loop(
             config=coordinator_config,
         )
 
-        ready_events: list[tuple[str, Any]] = [("arm", shared.arm_ready), ("inference", shared.inference_ready)]
+        ready_names: list[str] = ["arm", "inference"]
         if coordinator.sources.requires_hand or hand_feedback_enabled:
-            ready_events.append(("hand", shared.hand_ready))
+            ready_names.append("hand")
         if coordinator.sources.requires_camera:
-            ready_events.append(("camera", shared.camera_ready))
+            ready_names.append("camera")
         if coordinator.sources.requires_vr:
-            ready_events.append(("vr", shared.vr_ready))
+            ready_names.append("vr")
         readiness_timeouts_s = dict(runtime.safety.readiness_timeouts_s)
-        for name, event in ready_events:
-            if not event.wait(timeout=float(readiness_timeouts_s[name])):
+        for name in ready_names:
+            if not shared.wait_ready(name, float(readiness_timeouts_s[name])):
                 raise TimeoutError(f"learned policy startup timed out waiting for {name}")
 
         publish_component_status(shared, "policy", ComponentPhase.WARMING_UP)
@@ -183,7 +183,7 @@ def learned_policy_loop(
             coordinator.publish_snapshot()
             if coordinator.consume_candidate() is not None:
                 live_output_validated = True
-            if coordinator.snapshot_ready and live_output_validated and shared.inference_ready.is_set():
+            if coordinator.snapshot_ready and live_output_validated and shared.is_ready("inference"):
                 break
             warmup_limiter.wait()
         if not coordinator.snapshot_ready or not live_output_validated:
@@ -193,7 +193,7 @@ def learned_policy_loop(
         keyboard = KeyboardHandler(estop_callback=lambda: setattr(shared.estop_request, "value", True))
         keyboard.start()
         shared.set_heartbeat("policy", time.monotonic())
-        shared.policy_ready.set()
+        shared.set_ready("policy")
         publish_component_status(shared, "policy", ComponentPhase.READY)
         limiter = RateManager(coordinator_config.coordinator_hz)
 
@@ -211,7 +211,7 @@ def learned_policy_loop(
                 if (
                     control is ControlSignal.BEGIN
                     and shared.safety_state.value == int(SafetyState.ARMED)
-                    and shared.inference_ready.is_set()
+                    and shared.is_ready("inference")
                     and not coordinator.rewarm_pending
                 ):
                     coordinator._current_joints()
@@ -234,7 +234,7 @@ def learned_policy_loop(
             else:
                 coordinator.publish_snapshot()
                 coordinator.consume_candidate()
-                if coordinator.rewarm_pending and shared.inference_ready.is_set():
+                if coordinator.rewarm_pending and shared.is_ready("inference"):
                     coordinator.complete_rewarm()
                     publish_component_status(shared, "policy", ComponentPhase.READY)
             limiter.wait()
@@ -312,7 +312,7 @@ class LearnedPolicyCoordinator:
         return self._rewarm_pending
 
     def complete_rewarm(self) -> None:
-        if not self.shared.inference_ready.is_set():
+        if not self.shared.is_ready("inference"):
             raise RuntimeError("cannot complete policy re-warm before inference is ready")
         self._rewarm_pending = False
 
@@ -344,7 +344,7 @@ class LearnedPolicyCoordinator:
                 self.hold(now_monotonic_ns=now_ns, invalidate_run=False)
             if current_safety is SafetyState.RUNNING and not transition(self.shared, SafetyState.ARMED):
                 raise RuntimeError("camera restart could not place policy in ARMED")
-            self.shared.inference_ready.clear()
+            self.shared.clear_ready("inference")
             self._rewarm_pending = True
             self._rewarm_triggered = True
         self.tensor_block.write(snapshot)

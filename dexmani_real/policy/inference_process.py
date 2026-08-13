@@ -11,7 +11,7 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.utils.schema import INFERENCE_CANDIDATE_DTYPE
-from dexmani_real.shm.shared_storage import HEARTBEAT_INDEX
+from dexmani_real.shm.shared_storage import HEARTBEAT_INDEX, READY_INDEX
 from dexmani_real.policy.runtime import (
     ActionCandidate,
     ActionSpec,
@@ -34,7 +34,8 @@ class InferenceWorkerTransport:
     is_running: Any
     heartbeats: Any
     heartbeat_index: int
-    ready: Any
+    ready_flags: Any
+    ready_index: int
     fault_latch: Any
     candidate_ring: Any
 
@@ -44,7 +45,8 @@ class InferenceWorkerTransport:
             is_running=shared.is_running,
             heartbeats=shared.heartbeats,
             heartbeat_index=HEARTBEAT_INDEX["inference"],
-            ready=shared.inference_ready,
+            ready_flags=shared.ready_flags,
+            ready_index=READY_INDEX["inference"],
             fault_latch=shared.error_state,
             candidate_ring=shared.inference_candidate_ring,
         )
@@ -183,7 +185,7 @@ def inference_loop(
                 f"inference warmup benchmark {benchmark_s:.3f}s exceeds {config.benchmark_deadline_s:.3f}s"
             )
         transport.heartbeats[transport.heartbeat_index] = time.monotonic()
-        transport.ready.set()
+        transport.ready_flags[transport.ready_index] = 1
         publish_component_status(transport, "inference", ComponentPhase.READY)
         ready = True
         last_sequence = 0
@@ -200,7 +202,7 @@ def inference_loop(
                         last_camera_generation is not None and snapshot.camera_generation != last_camera_generation
                     )
                     if camera_generation_changed:
-                        transport.ready.clear()
+                        transport.ready_flags[transport.ready_index] = 0
                         publish_component_status(transport, "inference", ComponentPhase.WARMING_UP)
                         _validate_output(
                             predict(policy, snapshot),
@@ -209,7 +211,7 @@ def inference_loop(
                             config.actuators,
                         )
                         transport.heartbeats[transport.heartbeat_index] = time.monotonic()
-                        transport.ready.set()
+                        transport.ready_flags[transport.ready_index] = 1
                         publish_component_status(transport, "inference", ComponentPhase.READY)
                         running_published = False
                         last_camera_generation = snapshot.camera_generation

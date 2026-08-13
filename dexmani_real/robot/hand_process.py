@@ -251,7 +251,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # after all ready events; if this process hasn't entered its main loop yet,
     # heartbeat=0 → age=inf → spurious FAULT.
     shared.set_heartbeat("hand", time.monotonic())
-    shared.hand_ready.set()
+    shared.set_ready("hand")
     publish_component_status(shared, "hand", ComponentPhase.READY)
     logger.info("hand_loop: ready")
 

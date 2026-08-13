@@ -127,8 +127,8 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         # immediately (avoids false FAULT on the first check).
         shared.set_heartbeat("vr", time.monotonic())
 
-        if not shared.vr_ready.is_set():
-            shared.vr_ready.set()
+        if not shared.is_ready("vr"):
+            shared.set_ready("vr")
             publish_component_status(shared, "vr", ComponentPhase.READY)
             logger.info("vr_loop: ready (first event received)")
 

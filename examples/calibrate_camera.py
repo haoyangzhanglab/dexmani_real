@@ -1027,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
     processes.append(arm_process)
     arm_process.start()
     arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
-    if not wait_subsystem_ready(shared, [("arm", shared.arm_ready, arm_timeout_s)], processes):
+    if not wait_subsystem_ready(shared, [("arm", arm_timeout_s)], processes):
         _set_fault(shared, "arm worker did not become ready")
         shutdown_processes(shared, processes)
         return 1

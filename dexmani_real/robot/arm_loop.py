@@ -741,7 +741,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
     # after all ready events.
     shared.set_heartbeat("arm", time.monotonic())
-    shared.arm_ready.set()
+    shared.set_ready("arm")
     publish_component_status(shared, "arm", ComponentPhase.READY)
     logger.info(
         "arm_loop: ready and DISARMED (state=4, ip=%s, hz=%.0f)",

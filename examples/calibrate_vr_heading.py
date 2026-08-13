@@ -249,7 +249,7 @@ def main() -> None:
 
     # Wait for headset-on event (not just TCP connect).
     print("\n  Waiting for VR connection (up to 120 s) — put on Quest headset...", flush=True)
-    if not shared.vr_ready.wait(timeout=cfg.vr_ready_timeout_s):
+    if not shared.wait_ready("vr", cfg.vr_ready_timeout_s):
         _fatal_exit(shared, vr_proc, "VR receiver startup timeout")
     print("  VR connected", flush=True)
 
