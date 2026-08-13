@@ -87,10 +87,10 @@ def _load_vr_transform(path: Path) -> tuple[np.ndarray, str]:
 def _build_safety_gate(config: TeleopConfig) -> SafetyGate:
     """Build the teleoperation safety gate from control-domain limits."""
     return SafetyGate(
-        arm_joint_lower_rad=tuple(config.joint_limit_lower),
-        arm_joint_upper_rad=tuple(config.joint_limit_upper),
-        hand_joint_lower_rad=tuple(config.hand_qpos_lower_rad),
-        hand_joint_upper_rad=tuple(config.hand_qpos_upper_rad),
+        arm_joint_lower_rad=tuple(config.runtime.arm.joint_limit_lower),
+        arm_joint_upper_rad=tuple(config.runtime.arm.joint_limit_upper),
+        hand_joint_lower_rad=tuple(config.runtime.hand.qpos_min_rad),
+        hand_joint_upper_rad=tuple(config.runtime.hand.qpos_max_rad),
     )
 
 
@@ -185,12 +185,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     publish_component_status(shared, "policy", ComponentPhase.LOADING)
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
-    arm_cmd_max_step_rad = float(np.deg2rad(cfg.joint_max_speed_deg_s)) * ctrl_dt
+    arm_cmd_max_step_rad = float(np.deg2rad(cfg.runtime.arm.max_joint_velocity_deg_per_s)) * ctrl_dt
     joint_lower_rad = np.asarray(cfg.runtime.arm.joint_limit_lower, dtype=np.float64)
     joint_upper_rad = np.asarray(cfg.runtime.arm.joint_limit_upper, dtype=np.float64)
-    hand_home_qpos_rad = np.deg2rad(np.asarray(cfg.hand_home_qpos_deg, dtype=np.float64))
-    hand_qpos_lower_rad = np.asarray(cfg.hand_qpos_lower_rad, dtype=np.float64)
-    hand_qpos_upper_rad = np.asarray(cfg.hand_qpos_upper_rad, dtype=np.float64)
+    hand_home_qpos_rad = np.deg2rad(np.asarray(cfg.runtime.hand.home_qpos_deg, dtype=np.float64))
+    hand_qpos_lower_rad = np.asarray(cfg.runtime.hand.qpos_min_rad, dtype=np.float64)
+    hand_qpos_upper_rad = np.asarray(cfg.runtime.hand.qpos_max_rad, dtype=np.float64)
 
     try:
         urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
@@ -203,7 +203,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     p=np.array([0.0, 0.0, 0.0]),
                     q=np.array([1.0, 0.0, 0.0, 0.0]),
                 ),
-                workspace_bounds=np.asarray(cfg.workspace_bounds, dtype=np.float64),
+                workspace_bounds=np.asarray(cfg.runtime.policy.workspace.as_tuple(), dtype=np.float64),
             ),
             planning_profile=PlanningProfile(),
             teleop_profile=TeleopProfile(
@@ -212,8 +212,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 nullspace_step_size_deg=cfg.runtime.policy.ik_nullspace_step_rate_deg_s / cfg.runtime.policy.control_hz,
             ),
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
-            static_boxes=cfg.static_collision_boxes,
-            table=cfg.table_collision,
+            static_boxes=cfg.runtime.environment.static_boxes,
+            table=cfg.runtime.environment.table,
         )
 
         vr_config_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
@@ -221,11 +221,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         logger.info("VR transform loaded: theta=%s°", vr_heading_deg)
 
         arm_mapper = ArmWristMapper(
-            pos_scale=cfg.vr_pos_scale,
-            rot_scale=cfg.vr_rot_scale,
+            pos_scale=cfg.runtime.policy.vr_mapping.pos_scale,
+            rot_scale=cfg.runtime.policy.vr_mapping.rot_scale,
             vr_to_base_rot=vr_to_robot,
             T_vr_to_robot=vr_to_robot,
-            max_delta_rot_rad=cfg.vr_max_delta_rot_rad,
+            max_delta_rot_rad=cfg.runtime.policy.vr_mapping.max_delta_rot_rad,
             base_to_world_rot=np.eye(3, dtype=np.float64),
         )
 
@@ -276,10 +276,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_retargeter = TAGHandRetargeter(
                     hand_type="right",
                     smoothing_alpha=cfg.runtime.policy.hand_output_smoothing_alpha,
-                    qpos_lower_rad=cfg.hand_qpos_lower_rad,
-                    qpos_upper_rad=cfg.hand_qpos_upper_rad,
+                    qpos_lower_rad=cfg.runtime.hand.qpos_min_rad,
+                    qpos_upper_rad=cfg.runtime.hand.qpos_max_rad,
                     fingertip_link_names=cfg.runtime.hand.fingertip_link_names,
-                    tag_config=_tag_config_with_urdf(cfg.tag_retargeting_config, cfg.hand_urdf_path),
+                    tag_config=_tag_config_with_urdf(cfg.runtime.tag_retargeting, cfg.hand_urdf_path),
                 )
             else:
                 hand_retargeter = XHandRetargeter(
@@ -320,7 +320,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             read_healthy=bool(state["read_healthy"][0]),
             source_monotonic_ns=int(state["source_monotonic_ns"][0]),
             now_monotonic_ns=time.monotonic_ns(),
-            max_age_s=cfg.hand_heartbeat_timeout_s,
+            max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
             qpos=np.asarray(state["qpos"][0]),
         )
 
@@ -345,7 +345,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     if cfg.runtime.policy.hand_enabled:
         _ready_events.insert(1, ("hand", shared.hand_ready))
     for name, ev in _ready_events:
-        timeout_s = float(cfg.readiness_timeouts_s[name])
+        timeout_s = float(dict(cfg.runtime.safety.readiness_timeouts_s)[name])
         if not ev.wait(timeout=timeout_s):
             logger.error("Teleop: %s startup timeout (%.1fs)", name, timeout_s)
             shared.error_state.value = True
@@ -397,7 +397,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     shared.policy_ready.set()
     publish_component_status(shared, "policy", ComponentPhase.READY)
 
-    home_qpos = np.array(cfg.arm_home_qpos, dtype=np.float64)
+    home_qpos = np.array(cfg.runtime.arm.home_qpos, dtype=np.float64)
     arm_state = _read_arm_state(shared)
     hand_state = _read_hand_state(shared)
     if arm_state is None:
@@ -435,7 +435,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     _next_grid_ns = time.monotonic_ns() + _grid_period_ns
     _current_grid_anchor_ns = _next_grid_ns
     _pending_controls: list[ControlSignal] = []
-    stage_timer = StageTimer(window=cfg.status_every)
+    stage_timer = StageTimer(window=cfg.runtime.policy.status_print_interval)
     _validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
     _arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
     loop_count = 0
@@ -443,8 +443,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     _last_target_eef_pos = np.full(3, np.nan)  # last valid IK target (held frame continuity)
     _last_target_eef_rot6d = np.full(6, np.nan)
     _camera_freshness = CameraFreshnessTracker(
-        max_age_s=cfg.camera_max_frame_age_s,
-        abort_after_s=cfg.camera_recording_stall_abort_s,
+        max_age_s=cfg.runtime.camera.max_frame_age_s,
+        abort_after_s=cfg.runtime.camera.recording_stall_abort_s,
     )
 
     def _enter_hand_feedback_pause(issue: str) -> None:
@@ -928,7 +928,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
             vr_frame = _read_vr_frame(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
             vr_stale = vr_frame is None or (
-                (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > cfg.vr_stale_threshold_s * 1e9
+                (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) > cfg.runtime.policy.vr_mapping.stale_threshold_s * 1e9
             )
             stage_timer.mark("vr")
 
@@ -940,7 +940,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 if _camera_stalled:
                     logger.error(
                         "Camera source stale for %.1fs — discarding episode; teleoperation remains RUNNING",
-                        cfg.camera_recording_stall_abort_s,
+                        cfg.runtime.camera.recording_stall_abort_s,
                     )
                     print("  ⚠ 相机连续失帧超过阈值，当前 episode 已废弃；遥操作继续")
                     _stop_recording(
@@ -986,7 +986,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         break
                     recording_paused = True
 
-            if loop_count % cfg.status_every == 0:
+            if loop_count % cfg.runtime.policy.status_print_interval == 0:
                 _arm_age = time.monotonic() - float(arm_state["timestamp"][0]) if arm_state is not None else -1.0
                 _qdepth = shared.arm_action_q.qsize()
                 _print_status(
@@ -1163,13 +1163,13 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         target_quat,
                         ema_prev_pos,
                         ema_prev_quat,
-                        cfg.ema_alpha_pos,
-                        cfg.ema_alpha_rot,
+                        cfg.runtime.policy.ema.alpha_pos,
+                        cfg.runtime.policy.ema.alpha_rot,
                     )
 
             target_pos_before_clamp = target_pos.copy()
             for axis in range(3):
-                lo, hi = cfg.workspace_bounds[axis]
+                lo, hi = cfg.runtime.policy.workspace.as_tuple()[axis]
                 target_pos[axis] = np.clip(target_pos[axis], lo, hi)
             policy_map_time_ms = (time.perf_counter() - _map_t0) * 1000.0
             stage_timer.mark("map")
@@ -1188,7 +1188,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     prev_qpos_cmd,
                     arm_state["eef_pos"][0],
                     target_pos,
-                    table_z_surface_m=cfg.contact_stall_table_z_surface_m,
+                    table_z_surface_m=cfg.runtime.arm.table_z_surface_m,
                     table_context_height_m=cfg.runtime.policy.contact_stall_table_context_height_m,
                     min_downward_target_m=cfg.runtime.policy.contact_stall_min_downward_target_m,
                     tracking_error_rad=cfg.runtime.policy.contact_stall_tracking_error_rad,
