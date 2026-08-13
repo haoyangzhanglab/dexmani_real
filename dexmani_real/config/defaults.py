@@ -635,8 +635,6 @@ class KeyboardTeleopParams:
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
     status_interval_frames: int = 50
     idle_interval_frames: int = 150
-    tracking_fault_rad: float = 0.35
-    tracking_fault_frames: int = 3
     cartesian_deadband_m: float = 0.003
 
     def __post_init__(self) -> None:
@@ -648,7 +646,6 @@ class KeyboardTeleopParams:
             self.cartesian_kp,
             self.ik_max_pose_error_pos_m,
             self.ik_max_pose_error_rot_rad,
-            self.tracking_fault_rad,
             self.cartesian_deadband_m,
         )
         if not all(np.isfinite(value) for value in numeric):
@@ -669,10 +666,8 @@ class KeyboardTeleopParams:
             raise ValueError("keyboard IK pose-error limits must be > 0")
         if self.status_interval_frames <= 0 or self.idle_interval_frames <= 0:
             raise ValueError("keyboard status/idle intervals must be > 0")
-        if self.tracking_fault_rad <= 0:
-            raise ValueError("keyboard tracking fault threshold must be > 0")
-        if self.tracking_fault_frames <= 0 or self.cartesian_deadband_m < 0:
-            raise ValueError("keyboard tracking frames must be > 0 and deadband must be >= 0")
+        if self.cartesian_deadband_m < 0:
+            raise ValueError("keyboard deadband must be >= 0")
 
 
 # TAG retargeting parameters

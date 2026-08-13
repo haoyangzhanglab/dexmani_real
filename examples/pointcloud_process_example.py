@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import open3d as o3d
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 
@@ -492,7 +493,6 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
 
 def _build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet":
     """Build a green wireframe box for the workspace crop volume."""
-    import open3d as o3d
 
     ws = workspace
     corners = np.array([

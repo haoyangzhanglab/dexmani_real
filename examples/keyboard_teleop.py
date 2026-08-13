@@ -315,7 +315,6 @@ def _run_control_loop(
     state_failures = 0
     home_key_down = False
     motion_active = False
-    tracking_fault_frames = 0
     previous_active_keys: tuple[str, ...] | None = None
     blocked_keys: tuple[str, ...] | None = None
     frame = 0
@@ -388,7 +387,6 @@ def _run_control_loop(
                     f"cannot request a decelerated quit stop during arm error C{error_code}",
                 )
                 return False
-            tracking_fault_frames = 0
             continue
         if error_code != 0:
             category = "collision" if error_code in collision_errors else "controller"
@@ -491,7 +489,6 @@ def _run_control_loop(
             if not home_ok:
                 logger.warning("Return-home request was not executed")
             motion_active = False
-            tracking_fault_frames = 0
             rate.reset()
             home_key_down = home_pressed
             continue
@@ -533,7 +530,6 @@ def _run_control_loop(
                 require_transition(shared, SafetyState.ARMED)
                 motion_active = False
                 rate.reset()
-            tracking_fault_frames = 0
             # Track measured position during idle so the velocity check on
             # the next motion tick uses a fresh reference.
             previous_command = current_qpos.copy()
@@ -607,7 +603,6 @@ def _run_control_loop(
             Pose(p=target_pos, q=target_quat), current_qpos, previous_command
         )
         if not result.success or result.qpos is None:
-            tracking_fault_frames = 0
             now_s = time.monotonic()
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
                 logger.warning("IK rejected target: %s", result.reason or "unknown")
@@ -632,23 +627,6 @@ def _run_control_loop(
             blocked_keys = active_keys
             continue
         previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
-
-        tracking_error = float(
-            np.max(
-                np.abs(
-                    planner.ik_mgr.compute_qpos_delta(previous_command, current_qpos)
-                )
-            )
-        )
-        if tracking_error > float(cfg.tracking_fault_rad):
-            tracking_fault_frames += 1
-            if tracking_fault_frames >= int(cfg.tracking_fault_frames):
-                _set_fault(
-                    shared, f"persistent tracking divergence ({tracking_error:.2f}rad)"
-                )
-                return False
-        else:
-            tracking_fault_frames = 0
 
         if frame % int(cfg.status_interval_frames) == 0:
             elapsed = time.monotonic() - started_s
