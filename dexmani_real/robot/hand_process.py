@@ -16,6 +16,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import hand
 from dexmani_real.policy.safety import worker_validate_hand
+from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.retry import RetryCounter
@@ -70,12 +71,15 @@ class HandProcessConfig:
             raise ValueError(f"hand process home/limits must have shape {HAND_JOINT_SHAPE}")
         if not np.all(np.isfinite(np.concatenate(vectors))):
             raise ValueError("hand process home/limits must be finite")
-        if np.any(lower > upper) or np.any(mechanical_lower > mechanical_upper):
-            raise ValueError("hand process home/limits must be finite and ordered")
-        if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
-            raise ValueError("hand process mechanical limits cannot exceed the rated device envelope")
-        if np.any(lower < mechanical_lower) or np.any(upper > mechanical_upper):
-            raise ValueError("hand process command limits must be inside mechanical limits")
+        validate_hand_limit_nesting(
+            lower,
+            upper,
+            mechanical_lower,
+            mechanical_upper,
+            rated_lower,
+            rated_upper,
+            label="hand process",
+        )
         if np.any(home < lower - 1e-12) or np.any(home > upper + 1e-12):
             raise ValueError("hand process home must be inside command limits")
         if self.max_command_delta_rad is not None and (

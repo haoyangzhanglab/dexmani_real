@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import hand
+from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.schema import (
     HAND_CONTACT_SHAPE,
     HAND_DOF,
@@ -146,12 +147,15 @@ class XHandConfig:
             raise ValueError(f"XHand home and limit arrays must have shape {HAND_JOINT_SHAPE}")
         if not np.all(np.isfinite(np.concatenate(vectors))):
             raise ValueError("XHand home and limit arrays must be finite")
-        if np.any(mechanical_lower > mechanical_upper) or np.any(command_lower > command_upper):
-            raise ValueError("XHand mechanical and command limits must be ordered")
-        if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
-            raise ValueError("XHand mechanical limits cannot exceed the rated device envelope")
-        if np.any(command_lower < mechanical_lower) or np.any(command_upper > mechanical_upper):
-            raise ValueError("XHand command limits must be inside mechanical limits")
+        validate_hand_limit_nesting(
+            command_lower,
+            command_upper,
+            mechanical_lower,
+            mechanical_upper,
+            rated_lower,
+            rated_upper,
+            label="XHand",
+        )
         if np.any(home_qpos < command_lower - 1e-12) or np.any(home_qpos > command_upper + 1e-12):
             raise ValueError("XHand home_qpos must be inside command limits")
         if self.max_delta_rad is not None:

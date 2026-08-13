@@ -14,34 +14,20 @@ logger = get_logger(__name__)
 _retarget_fail_warn = ThrottledWarner()
 
 
-def _sanitize_hand_command(
-    hand_cmd: np.ndarray,
-    previous_hand_cmd: np.ndarray,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    max_delta_rad: float | None,
-) -> np.ndarray:
-    """Validate one hand target without modifying any joint endpoint."""
+def _sanitize_hand_command(hand_cmd: np.ndarray) -> np.ndarray:
+    """Fail-fast on a malformed retarget output without modifying any endpoint.
+
+    Joint-limit and command-delta enforcement belong to SafetyGate (controller)
+    and worker_validate_hand / XHand._validate_joint_range (worker + SDK
+    boundary).  This check only distinguishes a malformed retarget output
+    (wrong shape / NaN) from a well-formed but rejected command, so the loop
+    can mark ``retarget_ok=False`` and hold instead of publishing garbage.
+    """
     command = np.asarray(hand_cmd, dtype=np.float64)
-    previous = np.asarray(previous_hand_cmd, dtype=np.float64)
-    lower_bound = np.asarray(lower, dtype=np.float64)
-    upper_bound = np.asarray(upper, dtype=np.float64)
-    if command.shape != HAND_JOINT_SHAPE or previous.shape != HAND_JOINT_SHAPE:
-        raise ValueError(f"hand commands must have shape {HAND_JOINT_SHAPE}, got {command.shape} and {previous.shape}")
-    if lower_bound.shape != HAND_JOINT_SHAPE or upper_bound.shape != HAND_JOINT_SHAPE:
-        raise ValueError(f"hand command limits must have shape {HAND_JOINT_SHAPE}")
-    if not np.all(np.isfinite(np.concatenate((command, previous, lower_bound, upper_bound)))):
+    if command.shape != HAND_JOINT_SHAPE:
+        raise ValueError(f"hand command must have shape {HAND_JOINT_SHAPE}, got {command.shape}")
+    if not np.all(np.isfinite(command)):
         raise ValueError("hand command contains NaN or Inf")
-    if np.any(lower_bound > upper_bound):
-        raise ValueError("hand command limits must be ordered")
-    limit_tolerance_rad = 1e-12
-    if np.any(command < lower_bound - limit_tolerance_rad) or np.any(command > upper_bound + limit_tolerance_rad):
-        raise ValueError("hand command violates joint limits")
-    if max_delta_rad is not None:
-        if not np.isfinite(max_delta_rad) or max_delta_rad <= 0:
-            raise ValueError("hand_max_delta_rad must be finite and > 0")
-        if np.any(np.abs(command - previous) > max_delta_rad + 1e-12):
-            raise ValueError("hand command violates command-to-command delta limit")
     return command.copy()
 
 

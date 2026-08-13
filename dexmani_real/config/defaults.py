@@ -13,6 +13,7 @@ from typing import Literal
 
 import numpy as np
 
+from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 _HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "inference", "vr", "camera"})
@@ -459,21 +460,17 @@ class HandParams:
         )
         if len(self.home_qpos_deg) != 12 or any(len(values) != 12 for values in limit_vectors):
             raise ValueError("hand home and joint-limit defaults must have 12 elements")
-        mechanical_lower = np.asarray(self.mechanical_qpos_min_rad, dtype=np.float64)
-        mechanical_upper = np.asarray(self.mechanical_qpos_max_rad, dtype=np.float64)
-        rated_lower = np.asarray(_XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
-        rated_upper = np.asarray(_XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
         command_lower = np.asarray(self.qpos_min_rad, dtype=np.float64)
         command_upper = np.asarray(self.qpos_max_rad, dtype=np.float64)
-        all_limits = np.concatenate((mechanical_lower, mechanical_upper, command_lower, command_upper))
-        if not np.all(np.isfinite(all_limits)):
-            raise ValueError("hand mechanical and command limits must be finite")
-        if np.any(mechanical_lower > mechanical_upper) or np.any(command_lower > command_upper):
-            raise ValueError("hand mechanical and command limits must be ordered")
-        if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
-            raise ValueError("hand mechanical limits cannot exceed the rated XHand envelope")
-        if np.any(command_lower < mechanical_lower) or np.any(command_upper > mechanical_upper):
-            raise ValueError("hand command limits must be a subset of mechanical limits")
+        validate_hand_limit_nesting(
+            command_lower,
+            command_upper,
+            self.mechanical_qpos_min_rad,
+            self.mechanical_qpos_max_rad,
+            _XHAND_RATED_QPOS_MIN_RAD,
+            _XHAND_RATED_QPOS_MAX_RAD,
+            label="hand",
+        )
         home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
         limit_tolerance_rad = 1e-9
         if (
