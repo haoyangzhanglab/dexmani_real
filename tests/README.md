@@ -28,6 +28,9 @@ No hardware, display, or `examples/` entry point is used.
   are patched headless in `tests/conftest.py::teleop_fakes`.  The readiness
   events it waits on (`arm_ready`, `vr_ready`, …) are set directly, and the
   sensor/robot workers are replaced by ring writers (`tests/fakes/workers.py`).
+- `tests/test_integration.py` runs **both** loops on one `SharedStorage` so the
+  coordinator's holds and HOME requests are actually consumed, applied, and
+  acknowledged by the arm worker.
 
 ## Coverage
 
@@ -44,13 +47,22 @@ No hardware, display, or `examples/` entry point is used.
 | teleop | stale arm feedback | consecutive-error fault path |
 | teleop | hand feedback unhealthy | `_enter_hand_feedback_pause` (`advance_run_generation`) |
 | teleop | clean shutdown | `is_running` teardown |
+| both | HOME round-trip | `_handoff_control_hold_to_home` → `_do_configured_teleop_home` → `send_arm_home` → `_planned_homing` |
+| both | vr_stale hold → re-anchor | `_enter_measured_hold` → `_complete_reanchor` |
 
-## Known gaps (not yet covered)
+## Bug the harness caught
 
-- `_complete_reanchor` (fresh-feedback hold release) and `_handoff_control_hold_to_home`
-  (H/SAVE-AND-HOME) require a live arm worker ACKing a hold through `last_cmd_seq`.
-  The natural next step is an integration test that runs `arm_loop` and
-  `teleop_loop` together against the fake SDK, so the coordinator's holds are
-  actually applied and re-anchored.
+`_enter_measured_hold` assigned `_hold_sent_at_s = time.monotonic()` without
+declaring it `nonlocal`, so the outer `_hold_sent_at_s` stayed `None`.  That
+made `ControlHold.observe_delivery(None, …)` never report `applied`, so every
+measured hold (PAUSE/STOP/QUIT/vr_stale/hand-recovered) faulted after the
+0.75 s apply timeout, and `_complete_reanchor` could never fire.  Fixed with a
+one-line `nonlocal` (see git history).  The re-anchor integration test is the
+regression guard for it.
+
+## Not covered
+
 - `_on_sigterm` is a one-line flag setter exercised only via the real SIGTERM
   handler; it is trivially verified by inspection.
+- Real xArm7/XHand firmware behavior (Mode-6 tracking, collision recovery,
+  homing convergence) is out of scope for this harness and requires hardware.
