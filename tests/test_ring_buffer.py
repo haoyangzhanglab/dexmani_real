@@ -4,6 +4,12 @@ The harness tests exercise ``SharedMemoryRingBuffer`` indirectly through the arm
 state ring, but neither ring's seqlock write/read protocol nor ``CameraRingBuffer``
 had direct coverage.  These tests pin the byte-level semantics that Phase 2.1
 (seqlock dedup) must preserve.
+
+These are single-process happy-path round-trips: they pin the byte-level layout
+(marker/timestamp order, payload offsets).  The seqlock *rejection* path
+(writer-active odd marker, torn read) is exercised deterministically by
+``test_seqlock_slot_rejects_writer_active_and_torn_marker`` against the
+``SeqlockSlot`` primitive, rather than a flaky concurrent writer.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import time
 import numpy as np
 
 from dexmani_real.sensor.camera_process import pack_camera_frame
-from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
+from dexmani_real.shm.ring_buffer import CameraRingBuffer, SeqlockSlot, SharedMemoryRingBuffer
 
 
 def _unique_name(tag: str) -> str:
@@ -170,3 +176,37 @@ def test_camera_ring_get_last_metadata_and_read_sequence():
         assert ring.read_sequence(999) is None  # not resident / non-matching marker
     finally:
         _close_unlink(ring)
+
+
+# ---------------------------------------------------------------------------
+# SeqlockSlot primitive — rejection path
+# ---------------------------------------------------------------------------
+
+
+def test_seqlock_slot_rejects_writer_active_and_torn_marker():
+    """Pin the seqlock *rejection* path the round-trip tests above cannot reach.
+
+    ``verify`` must decline the slot when the marker is odd (writer mid-write) or
+    when it changed between the before/after samples (torn read).  This is the
+    entire value of the seqlock, exercised deterministically against a synthetic
+    byte buffer rather than a flaky concurrent writer.
+    """
+    buf = bytearray(16)
+    slot = SeqlockSlot(buf, 0)
+
+    # begin_write stamps the odd (writer-active) marker, then the timestamp.
+    slot.begin_write(seq=1, now_ns=100)
+    assert slot.marker == 2 * 1 - 1  # odd marker
+    assert slot.timestamp_ns == 100
+    assert not slot.verify(slot.marker)  # writer-active -> reject
+
+    # end_write publishes the even (complete) marker.
+    slot.end_write(seq=1)
+    assert slot.marker == 2 * 1  # even marker
+    assert slot.verify(slot.marker)  # unchanged even marker -> accept
+
+    # Torn read: the writer starts the next write after the reader sampled the
+    # previous even marker, so the before-sample no longer matches the current
+    # (odd) marker.
+    slot.begin_write(seq=2, now_ns=200)
+    assert not slot.verify(2)  # before-sample 2 != current odd marker 3

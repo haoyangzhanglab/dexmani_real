@@ -29,7 +29,7 @@
 
 ```bash
 conda run -n real_robot python -m compileall -q dexmani_real examples
-conda run -n real_robot python -m pytest tests/ -q        # 14 tests, no hardware
+conda run -n real_robot python -m pytest tests/ -q        # 20 tests, no hardware
 rg -n "<被删符号>" dexmani_real                            # 零残留
 ```
 
@@ -86,7 +86,7 @@ _hold_sent_at_s`（提交 `7ce4813`），导致所有实测保持 0.75s 超时�
 ## 2. Phase 2.1 — seqlock 去重（低风险，热路径，需逐处核对写序）
 
 **目标**：`SharedMemoryRingBuffer` 与 `CameraRingBuffer` 各自重实现奇偶写 + 双读
-校验，抽共享 `SeqlockSlot` 助手，约 -200 行，**零行为变化**。
+校验，抽共享 `SeqlockSlot` 助手，**零行为变化**。
 
 **触及文件**：`dexmani_real/shm/ring_buffer.py`
 
@@ -111,13 +111,15 @@ read_sequence 714）。
 **风险/门槛**：这是最安全关键的 IPC 热路径。合并后必须逐处核对写序与双读校验；
 任一差异即停止，不得为过测试而放宽。
 
-**验收**：14 harness 全绿 + focused diff 确认零行为变化。
+**验收**：20 harness 全绿 + focused diff 确认零行为变化。
+
+**实施结论（2026-08-13）**：`SeqlockSlot` 去重已实施并提交（`40b07e7`），零行为变化。实际行数 +81/-49（净 +32 行），非估算的「约 -200 行」。新增 `tests/test_ring_buffer.py` 6 个聚焦测试，harness 现为 20 tests。2026-08-13 二次审查（6 维度 + 对抗验证）确认零行为回归；唯一确认项为本节的文档度量陈旧（已修正），无代码缺陷。
 
 ---
 
 ## 3. Phase 2.2 — 共享内存表面精简（可选，中等风险）
 
-**目标**：7 心跳 → 1 结构化数组；7 ready 事件 → 1 位掩码；若干元数据字段 → 1
+**目标**：7 心跳 → 1 结构化数组；7 ready 事件 → 1 标志数组（每子系统 1 字节）；若干元数据字段 → 1
 JSON blob。收益中等、调用面广，**默认不并入主线**（「安全优先」），或后置 Phase 3。
 
 **触及文件**：
@@ -139,17 +141,17 @@ rg -n "\.heartbeat_s\b|\._ready\b" dexmani_real/robot dexmani_real/sensor dexman
 
 1. 先列全每个心跳/ready/metadata 字段的**所有读写点**（写点 + supervisor 迭代点 +
    `close()` 记账），确认无遗漏。
-2. 逐字段迁移，每次一个字段族（心跳→结构化数组；ready→位掩码；metadata→JSON），
+2. 逐字段迁移，每次一个字段族（心跳→结构化数组；ready→标志数组；metadata→JSON），
    单独 commit。
 3. 每步 `compileall` + harness + focused diff。
 
 **风险**：`close()` 记账与 supervisor 迭代读法会改；跨进程 dtype 布局变化需与
 `utils/schema.py` 契约一致。**列为可选**，若不确定则不并入主线。
 
-**验收**：14 harness 全绿 + `close()` 记账无泄漏（进程退出无 shm 残留）。
+**验收**：20 harness 全绿 + `close()` 记账无泄漏（进程退出无 shm 残留）。
 
-**实施结论（2026-08-13）**：心跳→结构化数组、ready→位掩码已实施并提交（零行为
-变化，19 harness 全绿）。**metadata→JSON 已评估并判定不实施**：相机元数据 6 字段
+**实施结论（2026-08-13）**：心跳→结构化数组、ready→标志数组已实施并提交（零行为
+变化，20 harness 全绿）。**metadata→JSON 已评估并判定不实施**：相机元数据 6 字段
 现占 ~2288 B，合并为单 JSON blob 需把 2047 B 的 profile 作为转义字符串内嵌，blob
 需 ~4.5–8 KB——比被替换字段更占内存，且给录制路径增加 JSON 序列化/解析开销，并引入
 「截断即不可解析」的损坏模式；设备身份字段由不同 worker 写、各自已是单 JSON 字符串，
