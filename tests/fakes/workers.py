@@ -18,7 +18,6 @@ from dexmani_real.utils.schema import (
     ARM_COMMAND_DTYPE,
     ARM_CONTROL_DTYPE,
     ARM_STATE_DTYPE,
-    HAND_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
     VR_FRAME_DTYPE,
 )

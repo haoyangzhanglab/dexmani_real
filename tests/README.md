@@ -52,13 +52,22 @@ No hardware, display, or `examples/` entry point is used.
 
 ## Bug the harness caught
 
-`_enter_measured_hold` assigned `_hold_sent_at_s = time.monotonic()` without
-declaring it `nonlocal`, so the outer `_hold_sent_at_s` stayed `None`.  That
-made `ControlHold.observe_delivery(None, …)` never report `applied`, so every
+The harness surfaced a pre-existing safety-critical bug in `_enter_measured_hold`:
+it assigned the hold-send timestamp (`_hold_sent_at_s = time.monotonic()`) without
+declaring it `nonlocal`, so the outer variable stayed `None`.  That made
+`ControlHold.observe_delivery(None, …)` never report `applied`, so every
 measured hold (PAUSE/STOP/QUIT/vr_stale/hand-recovered) faulted after the
-0.75 s apply timeout, and `_complete_reanchor` could never fire.  Fixed with a
-one-line `nonlocal` (see git history).  The re-anchor integration test is the
-regression guard for it.
+0.75 s apply timeout, and `_complete_reanchor` could never fire.  It was fixed
+with a one-line `nonlocal` (commit `7ce4813`); after the later `TeleopLoopState`
+refactor the field lives as `ctx.hold_sent_at_s` (an attribute assignment,
+which needs no `nonlocal`).  The re-anchor integration test
+(`test_vr_stale_hold_releases_after_reanchor`) is the regression guard.
+
+A second regression was caught by review, not the harness (the homing tests
+only exercised the success path): `_execute_mode0_milestones_impl` returned a
+bare `HomeResult` on every failure path but a `(HomeResult, np.ndarray)` tuple
+on success, so the wrapper's tuple-unpack raised `TypeError` on any multi-
+milestone homing failure.  Fixed, and `test_homing_failure_paths` now guards it.
 
 ## Not covered by the harness
 

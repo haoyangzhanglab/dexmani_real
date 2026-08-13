@@ -149,6 +149,44 @@ def test_home_multi_milestone_executes_mode0(shared, arm_fakes):
     stop_loop(shared, thread)
 
 
+def test_home_multi_milestone_failure_returns_result(shared, arm_fakes):
+    """A multi-milestone homing failure must return a failure HomeResult, not
+    raise from the wrapper's tuple-unpack.
+
+    Regression guard for the `_execute_mode0_milestones_impl` inconsistent-return
+    bug: the impl returned a bare `HomeResult` on failure paths but a
+    `(HomeResult, ndarray)` tuple on success, so the wrapper's
+    `_home_result, current = _execute_mode0_milestones_impl(...)` raised
+    `TypeError` on every real homing failure.
+    """
+    thread = _start_arm(shared, safety=SafetyState.ARMED)
+    fake = _wait_connected(arm_fakes)
+    assert shared.arm_ready.wait(timeout=8.0)
+    _wait_mode6_ready(fake)
+
+    cfg = ArmLoopConfig()
+    home = np.asarray(cfg.home_qpos, dtype=np.float64)
+    start = home.copy()
+    start[0] += 0.1
+    fake.qpos = start.copy()
+
+    fake.fail_servo_code = 1  # reject the first milestone send -> early return
+
+    request = HomeRequest(
+        request_id=3,
+        waypoints=np.stack([start, home]),
+        final_qpos=home,
+        execution_timeout_s=10.0,
+    )
+    shared.arm_action_q.put((HOME_SENTINEL, request))
+
+    result = shared.arm_home_result_q.get(timeout=10.0)
+    assert result.request_id == 3
+    assert not result.success
+    assert "rejected" in result.reason, result.reason
+    stop_loop(shared, thread)
+
+
 def test_collision_fault_c31_latches_error(shared, arm_fakes):
     thread = _start_arm(shared, safety=SafetyState.ARMED)
     fake = _wait_connected(arm_fakes)

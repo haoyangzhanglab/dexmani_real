@@ -1363,7 +1363,13 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_start_qpos = np.asarray(hand_state["qpos"][0], dtype=np.float64).copy()
             hand_cmd_valid = True
             try:
-                hand_cmd = _sanitize_hand_command(hand_cmd)
+                hand_cmd = _sanitize_hand_command(
+                    hand_cmd,
+                    ctx.prev_hand_qpos,
+                    hand_qpos_lower_rad,
+                    hand_qpos_upper_rad,
+                    cfg.runtime.hand.max_delta_rad,
+                )
             except ValueError as exc:
                 _validate_warn("teleop_loop: invalid hand command — holding: %s", exc)
                 hand_cmd = ctx.prev_hand_qpos.copy()

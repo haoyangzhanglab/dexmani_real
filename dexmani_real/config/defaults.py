@@ -413,9 +413,10 @@ class HandParams:
         1.919,
         1.919,
     )
-    # 0.20 rad per action (~183 deg/s at the default 16 Hz). SafetyGate rejects
-    # the complete action when command-to-command motion exceeds this bound;
-    # neither the gate nor the XHand driver clips the target.
+    # 0.20 rad per action (~183 deg/s at the default 16 Hz). The controller's
+    # _sanitize_hand_command rejects the whole action (arm + hand hold) when a
+    # command-to-command motion exceeds this bound; neither SafetyGate nor the
+    # XHand driver clips the target.
     max_delta_rad: float | None = 0.20
 
     loop_hz: float = 30.0

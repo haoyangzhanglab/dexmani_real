@@ -49,6 +49,7 @@ class FakeXArmAPI:
         self.servo_calls: list[np.ndarray] = []
         self.state_calls: list[int] = []
         self.mode_calls: list[int] = []
+        self.fail_servo_code: int = 0  # non-zero -> set_servo_angle rejects (fault injection)
         self._lock = threading.Lock()
         FakeXArmAPI.last_instance = self
 
@@ -97,6 +98,8 @@ class FakeXArmAPI:
         wait: bool = False,
         radius: float | None = None,
     ) -> int:
+        if self.fail_servo_code != 0:
+            return self.fail_servo_code
         target = np.asarray(angle, dtype=np.float64)[:ARM_DOF]
         with self._lock:
             self.qpos = target.copy()

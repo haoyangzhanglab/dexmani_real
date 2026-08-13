@@ -1346,14 +1346,14 @@ def _execute_mode0_milestones_impl(
         if shared is not None:
             _abort_reason = _shared_abort_reason_impl(shared)
             if _abort_reason is not None:
-                return _result_impl(request, False, _abort_reason, current)
+                return _result_impl(request, False, _abort_reason, current), current
             shared.arm_heartbeat_s.value = time.monotonic()
         if time.monotonic() >= _overall_deadline:
             return _result_impl(request, 
                 False,
                 f"overall timeout before milestone {_target_index}/{len(execution_targets)}",
                 current,
-            )
+            ), current
 
         _segment_start = current.copy()
         _segment_started_s = time.monotonic()
@@ -1368,13 +1368,13 @@ def _execute_mode0_milestones_impl(
             )
         except Exception:
             logger.warning("_planned_homing: milestone send failed", exc_info=True)
-            return _result_impl(request, False, f"milestone {_target_index} send raised", current)
+            return _result_impl(request, False, f"milestone {_target_index} send raised", current), current
         if _code != 0:
             return _result_impl(request, 
                 False,
                 f"milestone {_target_index} rejected (SDK code={_code})",
                 current,
-            )
+            ), current
 
         _segment_timeout_s = _estimate_homing_segment_timeout_s(
             _segment_start, _target, cfg
@@ -1387,7 +1387,7 @@ def _execute_mode0_milestones_impl(
             if shared is not None:
                 _abort_reason = _shared_abort_reason_impl(shared)
                 if _abort_reason is not None:
-                    return _result_impl(request, False, _abort_reason, current)
+                    return _result_impl(request, False, _abort_reason, current), current
                 shared.arm_heartbeat_s.value = time.monotonic()
             try:
                 _state_code, _states = arm.get_joint_states(is_radian=True, num=3)
@@ -1399,22 +1399,22 @@ def _execute_mode0_milestones_impl(
                     False,
                     f"state read raised at milestone {_target_index}",
                     current,
-                )
+                ), current
             if _state_code != 0 or len(_states) == 0:
                 return _result_impl(request, 
                     False,
                     f"state read failed at milestone {_target_index} (code={_state_code})",
                     current,
-                )
+                ), current
             current = np.asarray(_states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
             if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
                 return _result_impl(request, 
                     False, f"invalid state at milestone {_target_index}", current
-                )
+                ), current
             if len(_states) <= 1:
                 return _result_impl(request, 
                     False, f"qvel unavailable at milestone {_target_index}", current
-                )
+                ), current
             qvel = np.asarray(_states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
             tau = (
                 np.asarray(_states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
@@ -1430,7 +1430,7 @@ def _execute_mode0_milestones_impl(
                     False,
                     f"controller error C{_controller_error} at milestone {_target_index}",
                     current,
-                )
+                ), current
             if feedback_callback is not None:
                 try:
                     feedback_callback(
@@ -1466,13 +1466,13 @@ def _execute_mode0_milestones_impl(
                 f"{_timeout_kind} at milestone {_target_index}/{len(execution_targets)} "
                 f"after {_elapsed_s:.2f}s (J{_joint + 1} error={np.rad2deg(_error[_joint]):.2f}deg)",
                 current,
-            )
+            ), current
 
     _final_error = float(np.max(np.abs(current - home_qpos)))
     if _final_error > cfg.homing_convergence_rad:
         return _result_impl(request, 
             False, f"final error {np.rad2deg(_final_error):.2f}deg", current
-        )
+        ), current
     return _result_impl(request, True, "canonical home reached", current), current
 
 

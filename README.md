@@ -239,7 +239,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/config.py` | 遥操作配置薄视图：仅持有 `runtime` 快照引用与 4 个会话专属字段（task_label/operator/hand_urdf_path/vr_transform_path），运行时值统一经 `config.runtime.<section>.<field>` 直读。 |
 | `teleop/control_state.py` | 表示控制 hold 与回零交接状态，统一记录控制环暂停原因。 |
 | `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop/held 样本。 |
-| `teleop/hand_control.py` | 对畸形重定向输出做 shape/finite 快速失败（区分「畸形」与「良构但被拒」以触发 hold）；关节限位与命令间增量校验归属 SafetyGate（控制器）与 worker/SDK 边界。 |
+| `teleop/hand_control.py` | 对畸形重定向输出做 shape/finite 快速失败，并强制执行关节限位与命令间增量校验（控制器侧优雅 hold 边界）；区别于 SafetyGate 的粘滞 fault 与 worker/SDK 的跨进程丢弃。 |
 | `teleop/hand_retarget.py` | 校验手部 landmarks，并提供启发式 XHand 和 TAG 优化两类手部重定向器。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
