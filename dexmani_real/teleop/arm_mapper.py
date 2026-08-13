@@ -52,7 +52,6 @@ class ArmWristMapper:
         vr_to_base_rot: np.ndarray | None = None,
         base_to_world_rot: np.ndarray | None = None,
         T_vr_to_robot: np.ndarray | None = None,
-        eef_delta_bounds: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
         max_per_frame_rot_rad: float = 0.52,  # ~30°/frame at the default 16 Hz
     ) -> None:
@@ -80,12 +79,6 @@ class ArmWristMapper:
         self.T_vr_to_robot = (
             np.eye(3) if T_vr_to_robot is None else _finite_vector(T_vr_to_robot, (3, 3), "T_vr_to_robot")
         )
-        # Bounds of target_eef_pos - eef_pos0 in robot base frame, shape (3, 2).
-        self.eef_delta_bounds = (
-            None if eef_delta_bounds is None else _finite_vector(eef_delta_bounds, (3, 2), "eef_delta_bounds")
-        )
-        if self.eef_delta_bounds is not None and np.any(self.eef_delta_bounds[:, 0] > self.eef_delta_bounds[:, 1]):
-            raise ValueError("eef_delta_bounds lower values must not exceed upper values")
         # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
         # drift from the reset pose before it reaches IK.
         self.max_delta_rot_rad = max_delta_rot_rad
@@ -168,7 +161,6 @@ class ArmWristMapper:
 
         delta_pos_vr = current_wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
-        delta_pos_base = self.clip_delta_pos(delta_pos_base)
         # Transform base-frame delta → world frame before adding to
         # world-frame eef_pos0.  eef_pos0 comes from ArmFK (base frame),
         # so it must also be rotated to world frame for a consistent sum.
@@ -277,11 +269,6 @@ class ArmWristMapper:
             forward_2d[1],
             np.rad2deg(theta),
         )
-
-    def clip_delta_pos(self, delta_pos: np.ndarray) -> np.ndarray:
-        if self.eef_delta_bounds is None:
-            return delta_pos
-        return np.clip(delta_pos, self.eef_delta_bounds[:, 0], self.eef_delta_bounds[:, 1])
 
     def scale_rot(self, rot: np.ndarray) -> np.ndarray:
         if self.rot_scale == 1.0:

@@ -416,7 +416,6 @@ class HandParams:
     # the complete action when command-to-command motion exceeds this bound;
     # neither the gate nor the XHand driver clips the target.
     max_delta_rad: float | None = 0.20
-    safety_gate_max_velocity_deg_per_s: float = 180.0
 
     loop_hz: float = 30.0
 
@@ -485,8 +484,6 @@ class HandParams:
             raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
         if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
             raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
-        if not np.isfinite(self.safety_gate_max_velocity_deg_per_s) or self.safety_gate_max_velocity_deg_per_s <= 0:
-            raise ValueError("hand safety_gate_max_velocity_deg_per_s must be finite and positive")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
         if not np.isfinite(self.home_command_ack_timeout_s) or self.home_command_ack_timeout_s <= 0:

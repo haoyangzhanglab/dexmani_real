@@ -111,10 +111,6 @@ class TeleopConfig:
         "hand_mechanical_qpos_upper_rad": ("hand", "mechanical_qpos_max_rad"),
         "hand_home_command_ack_timeout_s": ("hand", "home_command_ack_timeout_s"),
         "hand_max_delta_rad": ("hand", "max_delta_rad"),
-        "hand_safety_gate_max_velocity_deg_per_s": (
-            "hand",
-            "safety_gate_max_velocity_deg_per_s",
-        ),
         "tag_retargeting_config": ("tag_retargeting",),
         "table_collision": ("environment", "table"),
         "static_collision_boxes": ("environment", "static_boxes"),

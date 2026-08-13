@@ -232,7 +232,6 @@ class SharedStorage:
     recorder_consumed_sequence: Any
     action_control_hz: float
     action_lead_time_s: float
-    action_validity_s: float
     hand_home_qpos_rad: tuple[float, ...]
 
     is_running: Any  # Main -> all
@@ -402,7 +401,6 @@ class SharedStorage:
         storage.action_lead_time_s = 2.0 / min(
             float(cfg.arm_loop_hz), float(cfg.hand_loop_hz)
         )
-        storage.action_validity_s = 1.0 / float(cfg.control_hz)
         storage.hand_home_qpos_rad = tuple(
             float(value) for value in cfg.hand_home_qpos_rad
         )
