@@ -236,10 +236,10 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/__init__.py` | 标识 VR 遥操作、手部重定向、键盘和音频反馈子系统。 |
 | `teleop/arm_mapper.py` | 将 VR 手腕位姿映射为受工作空间、旋转增量和四元数校验约束的臂末端目标。 |
 | `teleop/audio_feedback.py` | 管理按键/运动门控下的音频提示播放与节流。 |
-| `teleop/config.py` | 汇集遥操作控制环所需的强类型配置。 |
+| `teleop/config.py` | 遥操作配置薄视图：仅持有 `runtime` 快照引用与 4 个会话专属字段（task_label/operator/hand_urdf_path/vr_transform_path），运行时值统一经 `config.runtime.<section>.<field>` 直读。 |
 | `teleop/control_state.py` | 表示控制 hold 与回零交接状态，统一记录控制环暂停原因。 |
 | `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop/held 样本。 |
-| `teleop/hand_control.py` | 校验手部重定向结果的有限值、关节限位和命令间增量；返回原目标或整条拒绝，不做末端 clip。 |
+| `teleop/hand_control.py` | 对畸形重定向输出做 shape/finite 快速失败（区分「畸形」与「良构但被拒」以触发 hold）；关节限位与命令间增量校验归属 SafetyGate（控制器）与 worker/SDK 边界。 |
 | `teleop/hand_retarget.py` | 校验手部 landmarks，并提供启发式 XHand 和 TAG 优化两类手部重定向器。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
@@ -254,8 +254,9 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 
 | 文件 | 作用 |
 |---|---|
-| `utils/__init__.py` | 标识日志、序列化、限速、信号、schema 和数组工具的公共包。 |
+| `utils/__init__.py` | 标识日志、序列化、限速、信号、schema、数组和限位校验工具的公共包。 |
 | `utils/array_utils.py` | 提供 NaN 初始化数组与安全 resize 等数值数组小工具。 |
+| `utils/limits.py` | 校验 XHand 三级关节限位层级（rated ⊇ mechanical ⊇ command），收敛 config/robot/hand_process 三处重复的嵌套校验。 |
 | `utils/log.py` | 创建统一 logger、可选文件日志和按时间节流的告警器。 |
 | `utils/pointcloud_utils.py` | 实现内参/变换/工作空间校验、RGB-D 到点云、裁剪、下采样、采样与深度可视化。 |
 | `utils/rate_manager.py` | 以单调时钟稳定控制循环频率，并报告周期统计信息。 |
