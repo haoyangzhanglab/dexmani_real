@@ -490,6 +490,16 @@ def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
     shared.error_state.value = True
 
 
+def _publish_startup_fault_impl(shared: Any, detail: str) -> None:
+    publish_component_status(
+        shared,
+        "arm",
+        ComponentPhase.FAULT,
+        fault_code=FaultCode.STARTUP_FAILED,
+        detail=detail,
+    )
+
+
 def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     """Arm process entry point — reads arm_action_q, servos arm via Mode 6.
 
@@ -509,13 +519,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     publish_component_status(shared, "arm", ComponentPhase.LOADING)
 
     def _publish_startup_fault(detail: str) -> None:
-        publish_component_status(
-            shared,
-            "arm",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.STARTUP_FAILED,
-            detail=detail,
-        )
+        return _publish_startup_fault_impl(shared, detail)
 
     # URDF-consistent FK (replaces arm.get_position_aa). xArm firmware uses a
     # different EEF coordinate definition — Pinocchio FK ensures all consumers
@@ -1251,6 +1255,35 @@ def _disconnect_arm(arm: Any) -> None:
         logger.warning("arm disconnect failed during cleanup", exc_info=True)
 
 
+def _result_impl(
+    request: HomeRequest,
+    success: bool,
+    reason: str,
+    qpos: np.ndarray,
+) -> HomeResult:
+    return HomeResult(
+        request_id=request.request_id,
+        success=success,
+        reason=reason,
+        final_qpos=np.asarray(qpos, dtype=np.float64).copy(),
+        completed_at_s=time.monotonic(),
+    )
+
+
+def _shared_abort_reason_impl(shared: Any) -> str | None:
+    if shared is None:
+        return None
+    if not shared.is_running.value:
+        return "shutdown requested"
+    if shared.estop_request.value:
+        return "e-stop requested"
+    if shared.error_state.value:
+        return "sticky error_state set during homing"
+    if shared.safety_state.value == SafetyState.FAULT:
+        return "FAULT during homing"
+    return None
+
+
 def _planned_homing(
     arm: Any,
     request: HomeRequest,
@@ -1274,26 +1307,10 @@ def _planned_homing(
     _cfg = cfg or ArmLoopConfig()
 
     def _result(success: bool, reason: str, qpos: np.ndarray) -> HomeResult:
-        return HomeResult(
-            request_id=request.request_id,
-            success=success,
-            reason=reason,
-            final_qpos=np.asarray(qpos, dtype=np.float64).copy(),
-            completed_at_s=time.monotonic(),
-        )
+        return _result_impl(request, success, reason, qpos)
 
     def _shared_abort_reason() -> str | None:
-        if shared is None:
-            return None
-        if not shared.is_running.value:
-            return "shutdown requested"
-        if shared.estop_request.value:
-            return "e-stop requested"
-        if shared.error_state.value:
-            return "sticky error_state set during homing"
-        if shared.safety_state.value == SafetyState.FAULT:
-            return "FAULT during homing"
-        return None
+        return _shared_abort_reason_impl(shared)
 
     waypoints = np.asarray(request.waypoints, dtype=np.float64)
     home_qpos = np.asarray(request.final_qpos, dtype=np.float64)

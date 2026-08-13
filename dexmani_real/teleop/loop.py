@@ -166,6 +166,44 @@ def _start_keyboard(shared: SharedStorage) -> KeyboardHandler | None:
     return keyboard
 
 
+def _transition_or_fault_impl(
+    shared: SharedStorage,
+    transition: Any,
+    new_state: Any,
+    reason: str,
+) -> bool:
+    if transition(shared, new_state):
+        return True
+    logger.error("teleop_loop: safety transition to %s failed during %s", new_state.name, reason)
+    shared.error_state.value = True
+    return False
+
+
+def _keyboard_estop_requested_impl(kb: KeyboardHandler) -> bool:
+    return kb.estop_latched or not kb.healthy
+
+
+def _hand_feedback_issue_impl(
+    cfg: TeleopConfig,
+    state: np.ndarray | None,
+) -> str | None:
+    if not cfg.runtime.policy.hand_enabled:
+        return None
+    if state is None:
+        return "hand feedback unavailable"
+    return validate_hand_feedback(
+        connected=bool(state["connected"][0]),
+        error_state=bool(state["error_state"][0]),
+        state_valid=bool(state["state_valid"][0]),
+        send_healthy=bool(state["send_healthy"][0]),
+        read_healthy=bool(state["read_healthy"][0]),
+        source_monotonic_ns=int(state["source_monotonic_ns"][0]),
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+        qpos=np.asarray(state["qpos"][0]),
+    )
+
+
 def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> None:
     """Teleoperation process entry point used by ``collect_teleop.py``.
 
@@ -177,11 +215,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     cfg = config or TeleopConfig()
 
     def _transition_or_fault(new_state: SafetyState, reason: str) -> bool:
-        if transition(shared, new_state):
-            return True
-        logger.error("teleop_loop: safety transition to %s failed during %s", new_state.name, reason)
-        shared.error_state.value = True
-        return False
+        return _transition_or_fault_impl(shared, transition, new_state, reason)
 
     publish_component_status(shared, "policy", ComponentPhase.LOADING)
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
@@ -255,7 +289,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         return
 
     def _keyboard_estop_requested() -> bool:
-        return kb.estop_latched or not kb.healthy
+        return _keyboard_estop_requested_impl(kb)
 
     audio = AudioFeedback()
 
@@ -308,21 +342,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         return _seed_hand_retargeter(hand_retargeter, qpos)
 
     def _hand_feedback_issue(state: np.ndarray | None) -> str | None:
-        if not cfg.runtime.policy.hand_enabled:
-            return None
-        if state is None:
-            return "hand feedback unavailable"
-        return validate_hand_feedback(
-            connected=bool(state["connected"][0]),
-            error_state=bool(state["error_state"][0]),
-            state_valid=bool(state["state_valid"][0]),
-            send_healthy=bool(state["send_healthy"][0]),
-            read_healthy=bool(state["read_healthy"][0]),
-            source_monotonic_ns=int(state["source_monotonic_ns"][0]),
-            now_monotonic_ns=time.monotonic_ns(),
-            max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
-            qpos=np.asarray(state["qpos"][0]),
-        )
+        return _hand_feedback_issue_impl(cfg, state)
 
     _hand_fk: HandKinematics | None = None
     _T_eef_handbase_pos = np.array(cfg.runtime.hand.T_eef_handbase_pos_xyz, dtype=np.float64)
