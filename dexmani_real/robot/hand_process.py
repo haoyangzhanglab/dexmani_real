@@ -217,7 +217,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _log = logger.error if cfg.startup_failure_is_fatal else logger.warning
         _log("hand_loop: cannot publish a valid initial state", exc_info=True)
         try:
-            hand.stop()
             hand.disconnect()
         except Exception:
             logger.warning("hand_loop: cleanup after initial-state failure failed", exc_info=True)
@@ -478,12 +477,12 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
         rate_mgr.wait()
     # Shutdown never creates new motion. Homing is an explicit, correlated
-    # policy operation; worker cleanup only stops the device and releases the
-    # bus after the command loop has been gated.
+    # policy operation; worker cleanup only closes the device and releases the
+    # bus after the command loop has been gated. The hand is intentionally NOT
+    # unforced (mode=0) on shutdown — it stays in its last commanded position,
+    # matching examples/xhand_control_example.py.
     stopped_cleanly = False
     try:
-        if not hand.stop():
-            raise RuntimeError(f"XHand stop failed with SDK code {hand.last_action_code!r}")
         hand.disconnect()
         stopped_cleanly = True
     except Exception:
@@ -497,6 +496,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             "hand",
             ComponentPhase.FAULT,
             fault_code=FaultCode.DEVICE_IO,
-            detail="XHand stop/disconnect failed",
+            detail="XHand disconnect failed",
         )
     logger.info("hand_loop: exited")

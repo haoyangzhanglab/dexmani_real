@@ -393,7 +393,11 @@ class GlobalKeyState:
                 name: str | None = None
                 event: str | None = None
                 if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
-                    name = key.char.lower()  # type: ignore[union-attr]
+                    ch = key.char.lower()  # type: ignore[union-attr]
+                    if ch == "x":
+                        event = "x"
+                    else:
+                        name = ch
                 elif key == keyboard.Key.esc:
                     name = "esc"
                     self._estop_latched.set()

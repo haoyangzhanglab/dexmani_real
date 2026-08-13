@@ -629,7 +629,7 @@ class KeyboardTeleopParams:
     delta_pos_m: float = 0.008  # 240 mm/s at 30 Hz
     delta_rpy_rad: float = 0.03  # 1.7 deg/frame, 51 deg/s at 30 Hz
     command_lookahead_frames: int = 5  # bounded 40 mm / 0.15 rad firmware-following lead
-    workspace_command_margin_m: float = 0.002
+    workspace_command_margin_m: float = 0.005  # > ik_max_pose_error_pos_m (0.002) so a clipped target's FK stays in-bounds
     cartesian_kp: float = 0.0
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)

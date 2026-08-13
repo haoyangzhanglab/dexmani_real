@@ -95,6 +95,7 @@ _CAMERAS_JSON_PATH = PACKAGE_DIR / "config" / "cameras.json"
 _WINDOW_NAME = "ArUco Calibration"
 _INITIAL_STATE_POLL_S = 0.05
 _IK_WARNING_INTERVAL_S = 1.0
+_BOUNDARY_WARN_INTERVAL_S = 2.0
 
 # Camera stream defaults.
 _CAMERA_WIDTH = 640
@@ -675,6 +676,8 @@ def _run_calibration(
     motion_active = False
     frame = 0
     last_ik_warning_s = 0.0
+    blocked_keys: tuple[str, ...] | None = None
+    last_boundary_warn_s = 0.0
 
     print(f"\n  ArUco: {_ARUCO_DICT_NAME} ID={aruco_cfg.target_id} "
           f"size={aruco_cfg.marker_size_m * 1000:.1f}mm")
@@ -742,7 +745,7 @@ def _run_calibration(
         worst = int(np.argmax(errors_mm))
         print("  per-frame residuals (mm, larger = more suspicious):")
         for i, r in enumerate(errors_mm):
-            bar = "#" * min(30, int(r / max(errors_mm.max(), 1e-9) * 30))
+            bar = "█" * min(30, int(r / max(errors_mm.max(), 1e-9) * 30))
             flag = "  ← worst, press X to remove" if i == worst else ""
             print(f"    #{i + 1:2d} {r:6.1f} {bar}{flag}")
         print(f"  T_world_camera position: {np.round(T_candidate[:3, 3], 4)}m")
@@ -912,6 +915,12 @@ def _run_calibration(
             # ── Keyboard deltas ──
             dx, drpy = eef_delta_from_keys(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
             moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
+            active_keys = keys.pressed_keys()
+            if blocked_keys is not None and active_keys == blocked_keys:
+                # Previous tick's command was rejected by the safety gate; hold
+                # without re-publishing until the held keys change.
+                continue
+            blocked_keys = None
             if moving and not motion_active:
                 require_transition(shared, SafetyState.RUNNING)
             elif not moving and motion_active:
@@ -929,7 +938,23 @@ def _run_calibration(
                           f"eef={np.round(measured_pose.p, 3)}m", flush=True)
                 continue
 
-            target_pos = np.clip(target_pos + dx, workspace[:, 0], workspace[:, 1])
+            workspace_margin_m = float(runtime.keyboard_teleop.workspace_command_margin_m)
+            command_low = workspace[:, 0] + workspace_margin_m
+            command_high = workspace[:, 1] - workspace_margin_m
+            _desired_pos = target_pos + dx
+            target_pos = np.clip(_desired_pos, command_low, command_high)
+            _clipped = np.abs(_desired_pos - target_pos) > 1e-9
+            if np.any(_clipped):
+                _axis_names = ("x", "y", "z")
+                _parts: list[str] = []
+                for _i in range(3):
+                    if _clipped[_i]:
+                        _side = "⁺" if _desired_pos[_i] > target_pos[_i] else "⁻"
+                        _parts.append(f"{_axis_names[_i]}{_side}{target_pos[_i]:.3f}")
+                _now_s = time.monotonic()
+                if _now_s - last_boundary_warn_s >= _BOUNDARY_WARN_INTERVAL_S:
+                    logger.warning("Workspace boundary: %s", " ".join(_parts))
+                    last_boundary_warn_s = _now_s
             if np.any(drpy != 0.0):
                 delta_quat = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
                 target_quat = quat_multiply(delta_quat, target_quat)
@@ -951,8 +976,9 @@ def _run_calibration(
                 wait_applied=True, apply_timeout_s=float(policy.action_apply_timeout_s),
             )
             if published is None or published.arm_qpos is None:
-                _set_fault(shared, "arm publish failed")
-                return 1
+                logger.warning("arm motion command rejected — blocked until keys change")
+                blocked_keys = active_keys
+                continue
             previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
 
             if frame % calib_cfg.status_interval_frames == 0:
