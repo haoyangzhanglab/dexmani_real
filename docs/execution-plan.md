@@ -1,18 +1,21 @@
 # DexMani Real 简化方案 — 执行文档（下次会话专用）
 
-> 本文件是「未实施项目」的执行清单。Phase 1 已全部完成并提交；本文档只描述**尚未
-> 实施**的工作，按优先级排序，每项给出目标、触及文件、定位命令、步骤、验收标准与
-> 风险。对照原始计划 `~/.claude/plans/sprightly-weaving-crab.md`。
+> 本文件是「未实施项目」的执行清单。Phase 1 与 Phase 2 已全部完成并提交；本文档
+> 剩余**尚未实施**的工作为 §1 真机校验（终止门，需硬件授权）与 §4 Phase 3（需
+> profiling / 真机数据先行），按优先级排序，每项给出目标、触及文件、定位命令、步骤、
+> 验收标准与风险。对照原始计划 `~/.claude/plans/sprightly-weaving-crab.md`。
 >
 > 生成日期：2026-08-13。分支：`simplify-phase1`。工作树 clean。
 
 ---
 
-## 0. 当前状态快照（已完成的 Phase 1）
+## 0. 当前状态快照（已完成的 Phase 1 + Phase 2）
 
-`simplify-phase1` 分支基于 `c57ae4d`（0813 temp0.0），其上 14 个提交。Phase 1 的
-机械重构（1.1–1.4）已全部完成；随后一次 ultracode 代码审查（11 agents / 17 发现 /
-6 项对抗验证）抓到并修复了 2 个「零行为变化」回归。当前 tip `7c908f6`，工作树 clean。
+`simplify-phase1` 分支基于 `c57ae4d`（0813 temp0.0），其上 21 个提交。Phase 1 的
+机械重构（1.1–1.4）与 Phase 2 的共享内存表面精简（2.1 seqlock 去重、2.2 心跳/ready
+合并）已全部完成；随后两次 ultracode 代码审查（Phase 1：11 agents / 17 发现 / 6 项
+对抗验证；Phase 2：6 维度 + 对抗验证 / 7 发现 / 2 项确认）均确认零行为回归。当前
+tip `b125067`，工作树 clean。
 
 | 里程碑 | 提交 | 内容 |
 |---|---|---|
@@ -24,8 +27,12 @@
 | harness | `1b991f5` `c86ab25` `7ce4813` `870988e` | headless harness + 抓出并修复 `_hold_sent_at_s` 非局部 bug |
 | 执行文档 | `136f4e8` | 本文件 |
 | 审查修复 | `7c908f6` | 修复 homing 返回类型 + 手部校验误删（见下） |
+| 2.1 seqlock 去重 | `40b07e7` | 抽 `SeqlockSlot`，两 ring 共享奇偶写 + 双读校验（零行为变化） |
+| 2.2 心跳/ready 合并 | `3e0cd8d` `fee3b13` | 7 心跳→1 结构化数组；7 ready→1 标志数组 |
+| 2.2 metadata 评估 | `fe05a35` | metadata→JSON 判定不实施（安全优先，见 §3） |
+| Phase-2 审查 | `b125067` | 度量修复 + seqlock 拒绝路径确定性测试 |
 
-**验证方式**（无自动化测试套件，沿用以下流程）：
+**验证方式**（20 个 harness 测试，无硬件、无 CI，手动运行）：
 
 ```bash
 conda run -n real_robot python -m compileall -q dexmani_real examples
@@ -56,6 +63,11 @@ _hold_sent_at_s`（提交 `7ce4813`），导致所有实测保持 0.75s 超时�
 > 这是信任 Phase 1（尤其 `7ce4813` 与 `7c908f6`）前的必经门槛。**需要真实
 > xArm7/XHand 与固件，且需硬件授权**；CLAUDE.md 规定「Do not run examples/
 > without explicit hardware authorization」。未授权前不执行。
+
+**逐步可执行版**：见 [docs/hardware-validation.md](hardware-validation.md) —— 把下面
+8 项展开为 Step 0–10（含每步的运行命令、前置、通过/中止判据、去风险项），先验
+`7ce4813`/`7c908f6` 两个回归，再走 Phase 1 广度，最后用一次 collect → visualize →
+replay 往返覆盖 Phase 2 共享内存面。下方清单是高层门与首要怀疑映射。
 
 按优先级：
 
@@ -178,8 +190,6 @@ rg -n "\.heartbeat_s\b|\._ready\b" dexmani_real/robot dexmani_real/sensor dexman
 
 ## 5. 关键文件清单（剩余工作会触及）
 
-- Phase 2.1：`shm/ring_buffer.py`
-- Phase 2.2：`shm/shared_storage.py`、`runtime/supervisor.py`、各 worker 心跳写点
 - Phase 3：`recording/io_process.py`、`recording/episode_recorder.py`、
   `policy/`、`config/`、`robot/arm_loop.py`、`robot/hand_process.py`
 
