@@ -271,10 +271,10 @@ def _build_processes(
     if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
         recorder_config = RecorderIOConfig(
-            data_dir=str(repo_root / policy_config.episodes_dir),
-            max_frames=int(round(policy_config.max_record_seconds * policy_config.control_hz)),
-            control_hz=policy_config.control_hz,
-            min_frames=int(round(policy_config.min_record_seconds * policy_config.control_hz)),
+            data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir),
+            max_frames=int(round(policy_config.max_record_seconds * policy_config.runtime.policy.control_hz)),
+            control_hz=policy_config.runtime.policy.control_hz,
+            min_frames=int(round(policy_config.min_record_seconds * policy_config.runtime.policy.control_hz)),
             resolved_config_sha256=runtime.sha256,
             provenance=provenance,
             writer_queue_size=int(runtime.camera.writer_queue_size),

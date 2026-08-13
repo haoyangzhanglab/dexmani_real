@@ -294,7 +294,7 @@ def _do_configured_teleop_home(
     return _do_teleop_home(
         shared,
         hand_available=hand_available,
-        fixed_hand_home_acknowledged=not config.hand_enabled,
+        fixed_hand_home_acknowledged=not config.runtime.policy.hand_enabled,
         prev_hand_qpos=prev_hand_qpos,
         planner=planner,
         audio=audio,

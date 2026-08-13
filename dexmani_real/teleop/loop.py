@@ -184,10 +184,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         return False
 
     publish_component_status(shared, "policy", ComponentPhase.LOADING)
-    ctrl_dt = 1.0 / cfg.control_hz
+    ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
     arm_cmd_max_step_rad = float(np.deg2rad(cfg.joint_max_speed_deg_s)) * ctrl_dt
-    joint_lower_rad = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
-    joint_upper_rad = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
+    joint_lower_rad = np.asarray(cfg.runtime.arm.joint_limit_lower, dtype=np.float64)
+    joint_upper_rad = np.asarray(cfg.runtime.arm.joint_limit_upper, dtype=np.float64)
     hand_home_qpos_rad = np.deg2rad(np.asarray(cfg.hand_home_qpos_deg, dtype=np.float64))
     hand_qpos_lower_rad = np.asarray(cfg.hand_qpos_lower_rad, dtype=np.float64)
     hand_qpos_upper_rad = np.asarray(cfg.hand_qpos_upper_rad, dtype=np.float64)
@@ -207,9 +207,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             ),
             planning_profile=PlanningProfile(),
             teleop_profile=TeleopProfile(
-                max_pose_error_pos_m=cfg.ik_max_pose_error_pos_m,
-                max_pose_error_rot_rad=cfg.ik_max_pose_error_rot_rad,
-                nullspace_step_size_deg=cfg.ik_nullspace_step_rate_deg_s / cfg.control_hz,
+                max_pose_error_pos_m=cfg.runtime.policy.ik_max_pose_error_pos_m,
+                max_pose_error_rot_rad=cfg.runtime.policy.ik_max_pose_error_rot_rad,
+                nullspace_step_size_deg=cfg.runtime.policy.ik_nullspace_step_rate_deg_s / cfg.runtime.policy.control_hz,
             ),
             hand_dof=True,  # 19-DOF — hand geometry follows set_hand_qpos()
             static_boxes=cfg.static_collision_boxes,
@@ -237,7 +237,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         # plan_joint_home_path / plan_band_alignment_path.
         gate.workspace_check = planner.is_workspace_segment_safe
 
-        recorder = RecorderClient(shared) if cfg.recording_enabled else None
+        recorder = RecorderClient(shared) if cfg.runtime.policy.recording_enabled else None
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
         shared.error_state.value = True
@@ -264,7 +264,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     _hand_disconnected_at: float | None = None  # monotonic timestamp of first bad frame
     _hand_ramp_start: np.ndarray | None = None
     _hand_ramp_step = 0
-    _hand_ramp_total_frames = _hand_ramp_frame_count(cfg.hand_ramp_duration_s, cfg.control_hz)
+    _hand_ramp_total_frames = _hand_ramp_frame_count(cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz)
 
     def _try_init_hand_retargeter() -> bool:
         """Lazily initialize hand_retargeter if not already created."""
@@ -272,22 +272,22 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         if hand_retargeter is not None:
             return True
         try:
-            if cfg.hand_retargeting_type == "tag":
+            if cfg.runtime.policy.hand_retargeting_type == "tag":
                 hand_retargeter = TAGHandRetargeter(
                     hand_type="right",
-                    smoothing_alpha=cfg.hand_output_smoothing_alpha,
+                    smoothing_alpha=cfg.runtime.policy.hand_output_smoothing_alpha,
                     qpos_lower_rad=cfg.hand_qpos_lower_rad,
                     qpos_upper_rad=cfg.hand_qpos_upper_rad,
-                    fingertip_link_names=cfg.fingertip_link_names,
+                    fingertip_link_names=cfg.runtime.hand.fingertip_link_names,
                     tag_config=_tag_config_with_urdf(cfg.tag_retargeting_config, cfg.hand_urdf_path),
                 )
             else:
                 hand_retargeter = XHandRetargeter(
                     hand_type="right",
-                    retargeting_type=cfg.hand_retargeting_type,
-                    smoothing_alpha=cfg.hand_output_smoothing_alpha,
+                    retargeting_type=cfg.runtime.policy.hand_retargeting_type,
+                    smoothing_alpha=cfg.runtime.policy.hand_output_smoothing_alpha,
                 )
-            logger.info("Hand retargeter ready (type=%s)", cfg.hand_retargeting_type)
+            logger.info("Hand retargeter ready (type=%s)", cfg.runtime.policy.hand_retargeting_type)
             return True
         except Exception:
             logger.error("Hand retargeter initialization failed", exc_info=True)
@@ -299,7 +299,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
         Returns the seeded qpos (for updating ``prev_hand_qpos``) or None.
         """
-        if not cfg.hand_enabled:
+        if not cfg.runtime.policy.hand_enabled:
             return None
         if not _try_init_hand_retargeter():
             return None
@@ -308,7 +308,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         return _seed_hand_retargeter(hand_retargeter, qpos)
 
     def _hand_feedback_issue(state: np.ndarray | None) -> str | None:
-        if not cfg.hand_enabled:
+        if not cfg.runtime.policy.hand_enabled:
             return None
         if state is None:
             return "hand feedback unavailable"
@@ -325,11 +325,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
     _hand_fk: HandKinematics | None = None
-    _T_eef_handbase_pos = np.array(cfg.T_eef_handbase_pos_xyz, dtype=np.float64)
-    _T_eef_handbase_quat_wxyz = np.array(cfg.T_eef_handbase_quat_wxyz, dtype=np.float64)
-    if cfg.recording_enabled and cfg.hand_urdf_path:
+    _T_eef_handbase_pos = np.array(cfg.runtime.hand.T_eef_handbase_pos_xyz, dtype=np.float64)
+    _T_eef_handbase_quat_wxyz = np.array(cfg.runtime.hand.T_eef_handbase_quat_wxyz, dtype=np.float64)
+    if cfg.runtime.policy.recording_enabled and cfg.hand_urdf_path:
         try:
-            _hand_fk = HandKinematics(cfg.hand_urdf_path, list(cfg.fingertip_link_names))
+            _hand_fk = HandKinematics(cfg.hand_urdf_path, list(cfg.runtime.hand.fingertip_link_names))
             if _hand_fk.is_ready():
                 logger.info("Hand FK ready")
             else:
@@ -339,10 +339,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     logger.info("Teleop: waiting for enabled capabilities...")
     _ready_events = [("arm", shared.arm_ready), ("vr", shared.vr_ready)]
-    if cfg.recording_enabled:
+    if cfg.runtime.policy.recording_enabled:
         _ready_events.append(("camera", shared.camera_ready))
         _ready_events.append(("recorder", shared.recorder_ready))
-    if cfg.hand_enabled:
+    if cfg.runtime.policy.hand_enabled:
         _ready_events.insert(1, ("hand", shared.hand_ready))
     for name, ev in _ready_events:
         timeout_s = float(cfg.readiness_timeouts_s[name])
@@ -361,7 +361,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     logger.info("Teleop: all subsystems ready")
 
     # hand_loop publishes its initial state before setting hand_ready.
-    if not cfg.hand_enabled:
+    if not cfg.runtime.policy.hand_enabled:
         hand_available = False
         logger.info("Hand explicitly disabled — using the configured fixed-home collision assumption")
     else:
@@ -430,8 +430,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     # Coordinator duties run at coordinator_hz; observations, actions, and
     # recording remain on the configured control_hz grid.
-    limiter = RateManager(cfg.coordinator_hz)
-    _grid_period_ns = int(round(_NS_PER_SECOND / cfg.control_hz))
+    limiter = RateManager(cfg.runtime.policy.coordinator_hz)
+    _grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.policy.control_hz))
     _next_grid_ns = time.monotonic_ns() + _grid_period_ns
     _current_grid_anchor_ns = _next_grid_ns
     _pending_controls: list[ControlSignal] = []
@@ -484,7 +484,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         latest_arm_issue = _arm_feedback_issue(
             latest_arm,
             now_monotonic_ns=time.monotonic_ns(),
-            max_age_s=cfg.arm_state_stale_threshold_s,
+            max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
         )
         if latest_arm_issue is not None:
             logger.error("teleop_loop: cannot enter %s hold: %s", reason, latest_arm_issue)
@@ -510,14 +510,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             measured_arm,
             None,
             is_hold=True,
-            timeout=cfg.action_prepare_timeout_s,
+            timeout=cfg.runtime.policy.action_prepare_timeout_s,
             safety_gate=gate,
         )
         if candidate is None:
             logger.error("teleop_loop: failed to publish %s hold after advancing to run=%d", reason, run_generation)
             return False
 
-        _control_hold.begin(reason, candidate, deadline_s=time.monotonic() + cfg.action_apply_timeout_s)
+        _control_hold.begin(reason, candidate, deadline_s=time.monotonic() + cfg.runtime.policy.action_apply_timeout_s)
         _hold_sent_at_s = time.monotonic()
         _reanchor_pending_reason = reason
         prev_qpos_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
@@ -577,8 +577,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     logger.info(
         "Teleop: entering coordinator loop @ %.0f Hz (observation/action grid %.0f Hz)",
-        cfg.coordinator_hz,
-        cfg.control_hz,
+        cfg.runtime.policy.coordinator_hz,
+        cfg.runtime.policy.control_hz,
     )
 
     try:
@@ -708,9 +708,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         audio.queue("quit_save_prompt")  # queue: plays after "quit" finishes
                         print(
                             "  [S] 保存并退出  [D] 丢弃并退出  [H] 保存并归位 "
-                            f"({cfg.quit_save_timeout_s:.0f}s 超时默认丢弃)"
+                            f"({cfg.runtime.policy.quit_save_timeout_s:.0f}s 超时默认丢弃)"
                         )
-                        decision = await_quit_recording_decision(shared, kb, timeout_s=cfg.quit_save_timeout_s)
+                        decision = await_quit_recording_decision(shared, kb, timeout_s=cfg.runtime.policy.quit_save_timeout_s)
                         if decision in (QuitRecordingDecision.SAVE, QuitRecordingDecision.SAVE_AND_HOME):
                             audio.play("save")
                             _stop_recording(recorder, recording_active, save=True, shared=shared)
@@ -751,9 +751,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     # Teleop stays alive with heartbeats ticking; arm/hand/vr
                     # continue running so H (return_home) still works.
                     quit_pending = True
-                    post_teleop_deadline = time.perf_counter() + cfg.post_teleop_timeout_s
+                    post_teleop_deadline = time.perf_counter() + cfg.runtime.policy.post_teleop_timeout_s
                     print(
-                        f"\n[H] return_home  [Q] quit  ({cfg.post_teleop_timeout_s:.0f}s timeout)",
+                        f"\n[H] return_home  [Q] quit  ({cfg.runtime.policy.post_teleop_timeout_s:.0f}s timeout)",
                         flush=True,
                     )
                     skip_rest = True
@@ -839,7 +839,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         print("\nB: 无 VR 帧，无法开始遥操作")
                         skip_rest = True
                         continue
-                    begin_hand_state = _read_hand_state(shared) if cfg.hand_enabled else None
+                    begin_hand_state = _read_hand_state(shared) if cfg.runtime.policy.hand_enabled else None
                     begin_hand_issue = _hand_feedback_issue(begin_hand_state)
                     if begin_hand_issue is not None:
                         print(f"\nB: hand feedback unhealthy ({begin_hand_issue}) — cannot begin")
@@ -883,7 +883,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         prev_hand_qpos = _seeded
                     audio.play("begin")
                     _begin_audio_gate_deadline_s = time.monotonic() + max(
-                        0.0, cfg.begin_motion_gate_timeout_s - ctrl_dt
+                        0.0, cfg.runtime.policy.begin_motion_gate_timeout_s - ctrl_dt
                     )
                     _ignore_begin_audio_until_silent = False
                     _reanchor_pending_reason = "begin"
@@ -904,18 +904,18 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             arm_issue = _arm_feedback_issue(
                 arm_state,
                 now_monotonic_ns=time.monotonic_ns(),
-                max_age_s=cfg.arm_state_stale_threshold_s,
+                max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
             )
             error_count, arm_feedback_fault = _advance_arm_feedback_error_count(
                 error_count,
                 arm_issue,
-                max_consecutive_errors=cfg.max_consecutive_errors,
+                max_consecutive_errors=cfg.runtime.policy.max_consecutive_errors,
             )
             if arm_issue is not None:
                 _arm_feedback_warn(
                     "teleop_loop: invalid arm feedback (%d/%d): %s",
                     error_count,
-                    cfg.max_consecutive_errors,
+                    cfg.runtime.policy.max_consecutive_errors,
                     arm_issue,
                 )
                 if arm_feedback_fault:
@@ -957,7 +957,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             hand_tactile = _read_hand_tactile(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
 
             hand_issue = _hand_feedback_issue(hand_state)
-            if cfg.hand_enabled and hand_issue is not None:
+            if cfg.runtime.policy.hand_enabled and hand_issue is not None:
                 now_s = time.monotonic()
                 if _hand_disconnected_at is None:
                     _hand_disconnected_at = now_s
@@ -965,7 +965,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 if teleop_active and _control_hold.reason != "hand_feedback":
                     _enter_hand_feedback_pause(hand_issue)
                 unhealthy_duration_s = now_s - _hand_disconnected_at
-                if unhealthy_duration_s >= cfg.hand_disconnect_timeout_s:
+                if unhealthy_duration_s >= cfg.runtime.policy.hand_disconnect_timeout_s:
                     logger.error(
                         "Hand feedback remained unhealthy for %.1fs: %s",
                         unhealthy_duration_s,
@@ -973,7 +973,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     )
                     shared.error_state.value = True
                     break
-            elif cfg.hand_enabled and _hand_disconnected_at is not None:
+            elif cfg.runtime.policy.hand_enabled and _hand_disconnected_at is not None:
                 unhealthy_duration_s = time.monotonic() - _hand_disconnected_at
                 _hand_disconnected_at = None
                 logger.info(
@@ -1119,7 +1119,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 published_hold = _safe_arm_queue_put(
                     shared,
                     {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
-                    timeout=cfg.action_prepare_timeout_s,
+                    timeout=cfg.runtime.policy.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
@@ -1180,7 +1180,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             # the measured pose. This stops continued pushing without a table
             # exclusion zone or any speed/acceleration change.
             if (
-                cfg.contact_stall_enabled
+                cfg.runtime.policy.contact_stall_enabled
                 and arm_state is not None
                 and _contact_stall_detected(
                     arm_qpos,
@@ -1189,10 +1189,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     arm_state["eef_pos"][0],
                     target_pos,
                     table_z_surface_m=cfg.contact_stall_table_z_surface_m,
-                    table_context_height_m=cfg.contact_stall_table_context_height_m,
-                    min_downward_target_m=cfg.contact_stall_min_downward_target_m,
-                    tracking_error_rad=cfg.contact_stall_tracking_error_rad,
-                    max_closing_speed_rad_s=cfg.contact_stall_max_closing_speed_rad_s,
+                    table_context_height_m=cfg.runtime.policy.contact_stall_table_context_height_m,
+                    min_downward_target_m=cfg.runtime.policy.contact_stall_min_downward_target_m,
+                    tracking_error_rad=cfg.runtime.policy.contact_stall_tracking_error_rad,
+                    max_closing_speed_rad_s=cfg.runtime.policy.contact_stall_max_closing_speed_rad_s,
                 )
             ):
                 command_error = prev_qpos_cmd - arm_qpos
@@ -1218,7 +1218,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 published_hold = _safe_arm_queue_put(
                     shared,
                     {"qpos": hold_qpos, "is_hold": True},
-                    timeout=cfg.action_prepare_timeout_s,
+                    timeout=cfg.runtime.policy.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
@@ -1306,7 +1306,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         prev_qpos_cmd.copy(),
                         safe_hand_cmd,
                         is_hold=True,
-                        timeout=cfg.action_prepare_timeout_s,
+                        timeout=cfg.runtime.policy.action_prepare_timeout_s,
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                         safety_gate=gate,
@@ -1322,7 +1322,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     published_candidate = _safe_arm_queue_put(
                         shared,
                         {"qpos": prev_qpos_cmd.copy(), "is_hold": True},
-                        timeout=cfg.action_prepare_timeout_s,
+                        timeout=cfg.runtime.policy.action_prepare_timeout_s,
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                         safety_gate=gate,
@@ -1385,7 +1385,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     prev_qpos_cmd.copy(),
                     None,
                     is_hold=True,
-                    timeout=cfg.action_prepare_timeout_s,
+                    timeout=cfg.runtime.policy.action_prepare_timeout_s,
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
@@ -1443,7 +1443,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 shared,
                 arm_cmd.copy(),
                 hand_cmd.copy() if hand_available else None,
-                timeout=cfg.action_prepare_timeout_s,
+                timeout=cfg.runtime.policy.action_prepare_timeout_s,
                 observation_id=int(vr_frame["ring_sequence"]),
                 observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                 safety_gate=gate,
@@ -1508,7 +1508,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         if recording_active:
             _stop_recording(recorder, True, save=False, shared=shared, reason="policy_shutdown")
         if recorder is not None:
-            if not recorder.join_stop(timeout=cfg.quit_save_timeout_s):
+            if not recorder.join_stop(timeout=cfg.runtime.policy.quit_save_timeout_s):
                 logger.error("teleop recorder did not finish before policy shutdown")
         kb.stop()
         audio.play("end")
