@@ -52,6 +52,56 @@ def _seqlock_to_logical(marker: int) -> int:
     return marker // 2
 
 
+class SeqlockSlot:
+    """Odd/even seqlock for a single slot's ``[timestamp_ns, sequence]`` prefix.
+
+    Every slot in both ``SharedMemoryRingBuffer`` and ``CameraRingBuffer`` is
+    laid out as ``[timestamp_ns: u8, sequence: u8, <payload>]``.  A producer
+    calls :meth:`begin_write` (odd marker, then timestamp) before writing the
+    payload and :meth:`end_write` (even marker) after, so a reader can never
+    observe a half-written frame as complete.  Readers sample :attr:`marker`
+    before and after reading the payload and accept the frame only when
+    :meth:`verify` confirms both samples agree on a complete (nonzero, even)
+    marker.
+
+    Instances are cheap, non-owning views over a slot's first 16 bytes and may
+    be created per access without concern.
+    """
+
+    def __init__(self, buf: Any, slot_base: int) -> None:
+        """Bind to the ``[timestamp_ns, sequence]`` prefix at *slot_base* of *buf*."""
+        self._ts_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
+            (2,), dtype=np.uint64, buffer=buf, offset=slot_base
+        )
+
+    @property
+    def marker(self) -> int:
+        """The current sequence marker (odd = writer active, even = complete)."""
+        return int(self._ts_seq[1])
+
+    @property
+    def timestamp_ns(self) -> int:
+        return int(self._ts_seq[0])
+
+    def begin_write(self, seq: int, now_ns: int) -> None:
+        """Mark writer-active (odd), then stamp the timestamp — in that order."""
+        self._ts_seq[1] = np.uint64(_seqlock_odd(seq))
+        self._ts_seq[0] = np.uint64(now_ns)
+
+    def end_write(self, seq: int) -> None:
+        """Mark the slot complete (even)."""
+        self._ts_seq[1] = np.uint64(_seqlock_even(seq))
+
+    def verify(self, marker_before: int) -> bool:
+        """Return True when the marker is unchanged and complete after the payload read.
+
+        ``marker_before`` is the marker sampled before reading the payload; the
+        marker is re-sampled now.  A torn read (marker changed mid-read) or a
+        writer-active (odd) slot fails the check.
+        """
+        return marker_before == self.marker and _seqlock_is_complete(marker_before)
+
+
 logger = get_logger(__name__)
 
 # Torn-read warning throttle: at most one warning per 5 s per buffer.
@@ -184,10 +234,10 @@ class SharedMemoryRingBuffer:
         # Mark the slot incomplete before touching its payload, then publish an
         # even completion marker. Readers accept only two matching even reads.
         slot = self._data_buf[idx]
-        slot["sequence"] = np.uint64(_seqlock_odd(seq))
-        slot["timestamp_ns"] = np.uint64(now_ns)
+        seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
+        seqlock.begin_write(seq, now_ns)
         slot["data"] = data
-        slot["sequence"] = np.uint64(_seqlock_even(seq))
+        seqlock.end_write(seq)
 
         # Atomic write of write_idx (aligned uint64 store on x86_64)
         self._write_idx_view()[0] = np.uint64(idx)
@@ -203,14 +253,14 @@ class SharedMemoryRingBuffer:
         for _attempt in range(2):
             idx = int(self._write_idx_view()[0])
             slot = self._data_buf[idx]
-            seq1 = int(slot["sequence"])
-            if seq1 == 0 and idx == 0 and int(self._write_seq[0]) == 0:
+            seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
+            marker1 = seqlock.marker
+            if marker1 == 0 and idx == 0 and int(self._write_seq[0]) == 0:
                 return None
-            timestamp_ns = int(slot["timestamp_ns"])
+            timestamp_ns = seqlock.timestamp_ns
             data = slot["data"].copy().reshape(1)
-            seq2 = int(slot["sequence"])
-            if seq1 == seq2 and _seqlock_is_complete(seq1):
-                self._last_good = (data, timestamp_ns, _seqlock_to_logical(seq1))
+            if seqlock.verify(marker1):
+                self._last_good = (data, timestamp_ns, _seqlock_to_logical(marker1))
                 return self._last_good
         self._warn_torn_read()
         return self._last_good
@@ -229,20 +279,20 @@ class SharedMemoryRingBuffer:
         for offset in range(min(k, latest_seq)):
             target_seq = latest_seq - offset
             slot = self._data_buf[target_seq % self.maxlen]
+            seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + (target_seq % self.maxlen) * self._slot_size)
             accepted = False
             for _attempt in range(2):
-                seq1 = int(slot["sequence"])
-                if not _seqlock_is_complete(seq1):
+                marker1 = seqlock.marker
+                if not _seqlock_is_complete(marker1):
                     continue
-                if _seqlock_to_logical(seq1) != target_seq:
+                if _seqlock_to_logical(marker1) != target_seq:
                     frames.reverse()
                     if dropped:
                         self._warn_torn_read_k(k, len(frames))
                     return frames
-                timestamp_ns = int(slot["timestamp_ns"])
+                timestamp_ns = seqlock.timestamp_ns
                 data = slot["data"].copy().reshape(1)
-                seq2 = int(slot["sequence"])
-                if seq1 == seq2 and _seqlock_is_complete(seq2) and _seqlock_to_logical(seq2) == target_seq:
+                if seqlock.verify(marker1) and _seqlock_to_logical(marker1) == target_seq:
                     frames.append((data, timestamp_ns, target_seq))
                     accepted = True
                     break
@@ -529,11 +579,8 @@ class CameraRingBuffer:
         # ── Seqlock write protocol: odd→data→even ──
         # Write an odd marker BEFORE the payload (including timestamp) so
         # concurrent readers see "writer active" and bail out.
-        ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
-        )
-        ts_arr[1] = np.uint64(_seqlock_odd(seq))  # odd: writer active — MUST be first
-        ts_arr[0] = np.uint64(now_ns)
+        seqlock = SeqlockSlot(self._shm.buf, slot_base)
+        seqlock.begin_write(seq, now_ns)
 
         # Write the fixed camera transport header.
         header_offset = slot_base + 16
@@ -569,7 +616,7 @@ class CameraRingBuffer:
             pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
 
         # ── Seqlock: write even marker — payload is now consistent ──
-        ts_arr[1] = np.uint64(_seqlock_even(seq))  # even: writer done
+        seqlock.end_write(seq)
 
         self._write_idx_view()[0] = np.uint64(idx)
         return seq
@@ -589,10 +636,8 @@ class CameraRingBuffer:
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
         # Read timestamp + sequence
-        ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
-        )
-        slot_seq = int(ts_arr[1])
+        seqlock = SeqlockSlot(self._shm.buf, slot_base)
+        slot_seq = seqlock.marker
 
         if slot_seq == 0 and idx == 0 and int(self._write_seq[0]) == 0:
             return None
@@ -669,12 +714,7 @@ class CameraRingBuffer:
 
         # ── Seqlock: reject writer-active or torn reads ──
         # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
-        if not _seqlock_is_complete(slot_seq):
-            return None
-        ts_arr_check: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
-        )
-        if int(ts_arr_check[1]) != slot_seq:
+        if not seqlock.verify(slot_seq):
             return None
 
         return header, rgb, depth, pointcloud, _seqlock_to_logical(slot_seq)
@@ -696,18 +736,15 @@ class CameraRingBuffer:
         for sequence in range(max(1, latest_seq - min(k, latest_seq) + 1), latest_seq + 1):
             idx = sequence % self.maxlen
             slot_base = self._HEADER_SIZE + idx * self._slot_size
-            ts_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-                (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
-            )
-            marker1 = int(ts_seq[1])
+            seqlock = SeqlockSlot(self._shm.buf, slot_base)
+            marker1 = seqlock.marker
             if not _seqlock_is_complete(marker1) or _seqlock_to_logical(marker1) != sequence:
                 continue
-            publish_ns = int(ts_seq[0])
+            publish_ns = seqlock.timestamp_ns
             header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
                 (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=slot_base + 16
             ).copy()
-            marker2 = int(ts_seq[1])
-            if marker1 == marker2 and _seqlock_is_complete(marker2):
+            if seqlock.verify(marker1):
                 result.append((header, publish_ns, sequence))
         return result
 
@@ -726,10 +763,8 @@ class CameraRingBuffer:
             return None
         idx = sequence % self.maxlen
         slot_base = self._HEADER_SIZE + idx * self._slot_size
-        ts_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
-        )
-        marker1 = int(ts_seq[1])
+        seqlock = SeqlockSlot(self._shm.buf, slot_base)
+        marker1 = seqlock.marker
         if not _seqlock_is_complete(marker1) or _seqlock_to_logical(marker1) != sequence:
             return None
         header_offset = slot_base + 16
@@ -767,8 +802,7 @@ class CameraRingBuffer:
                 .view(np.float32)
                 .reshape(self._pc_shape)
             )
-        marker2 = int(ts_seq[1])
-        if marker1 != marker2 or not _seqlock_is_complete(marker2):
+        if not seqlock.verify(marker1):
             return None
         return output
 
@@ -776,13 +810,11 @@ class CameraRingBuffer:
         """Return age of the latest frame in nanoseconds, or -1 if no frame."""
         idx = int(self._write_idx_view()[0])
         slot_base = self._HEADER_SIZE + idx * self._slot_size
-        ts_arr: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-            (2,), dtype=np.uint64, buffer=self._shm.buf, offset=slot_base
-        )
-        slot_seq = int(ts_arr[1])
+        seqlock = SeqlockSlot(self._shm.buf, slot_base)
+        slot_seq = seqlock.marker
         if slot_seq == 0 and idx == 0 and int(self._write_seq[0]) == 0:
             return -1
-        return time.monotonic_ns() - int(ts_arr[0])
+        return time.monotonic_ns() - seqlock.timestamp_ns
 
     def close(self) -> None:
         self._shm.close()
