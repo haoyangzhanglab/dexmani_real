@@ -148,6 +148,14 @@ rg -n "\.heartbeat_s\b|\._ready\b" dexmani_real/robot dexmani_real/sensor dexman
 
 **验收**：14 harness 全绿 + `close()` 记账无泄漏（进程退出无 shm 残留）。
 
+**实施结论（2026-08-13）**：心跳→结构化数组、ready→位掩码已实施并提交（零行为
+变化，19 harness 全绿）。**metadata→JSON 已评估并判定不实施**：相机元数据 6 字段
+现占 ~2288 B，合并为单 JSON blob 需把 2047 B 的 profile 作为转义字符串内嵌，blob
+需 ~4.5–8 KB——比被替换字段更占内存，且给录制路径增加 JSON 序列化/解析开销，并引入
+「截断即不可解析」的损坏模式；设备身份字段由不同 worker 写、各自已是单 JSON 字符串，
+`camera_observation_required` 是控制标志而非元数据。该合并并非净简化，违反 §6
+「零行为变化」约束，故按「安全优先 / 若不确定则不并入主线」不予实施。
+
 ---
 
 ## 4. Phase 3 — 可选 / 需真机或 profiling 先行的项（本次不展开）
