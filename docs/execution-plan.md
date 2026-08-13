@@ -10,9 +10,9 @@
 
 ## 0. 当前状态快照（已完成的 Phase 1）
 
-`simplify-phase1` 分支基于 `c57ae4d`（0813 temp0.0），其上 12 个提交，全部机械
-重构、零行为变化，并通过 `python -m compileall -q dexmani_real examples` + 符号
-grep + import smoke + 13 个 harness 测试验证：
+`simplify-phase1` 分支基于 `c57ae4d`（0813 temp0.0），其上 14 个提交。Phase 1 的
+机械重构（1.1–1.4）已全部完成；随后一次 ultracode 代码审查（11 agents / 17 发现 /
+6 项对抗验证）抓到并修复了 2 个「零行为变化」回归。当前 tip `7c908f6`，工作树 clean。
 
 | 里程碑 | 提交 | 内容 |
 |---|---|---|
@@ -21,27 +21,41 @@ grep + import smoke + 13 个 harness 测试验证：
 | 1.3 配置拍平 | `88da0b7` `89437ba` `b9fb351` | 删 `TeleopConfig._ALIASES`/`__getattr__`，全部 `cfg.` → `runtime.<section>.<field>` |
 | 1.4 函数拆分 A | `a96025d` | 提 6 个纯闭包为模块级函数 |
 | 1.4 函数拆分 B | `75d6793` `de3fb4a` | `TeleopLoopState` context + 6 个有状态闭包；arm_loop 2 个 homing 闭包 |
-| harness | `1b991f5` `c86ab25` `7ce4813` `870988e` | 13 测试 headless harness + 抓出并修复 `_hold_sent_at_s` 非局部 bug |
+| harness | `1b991f5` `c86ab25` `7ce4813` `870988e` | headless harness + 抓出并修复 `_hold_sent_at_s` 非局部 bug |
+| 执行文档 | `136f4e8` | 本文件 |
+| 审查修复 | `7c908f6` | 修复 homing 返回类型 + 手部校验误删（见下） |
 
 **验证方式**（无自动化测试套件，沿用以下流程）：
 
 ```bash
 conda run -n real_robot python -m compileall -q dexmani_real examples
-conda run -n real_robot python -m pytest tests/ -q        # 13 tests, no hardware
+conda run -n real_robot python -m pytest tests/ -q        # 14 tests, no hardware
 rg -n "<被删符号>" dexmani_real                            # 零残留
 ```
 
+**审查抓出的 2 个回归（均已修复，`7c908f6`）**：
+
+1. `_execute_mode0_milestones_impl`（arm_loop）失败路径返回裸 `HomeResult`、成功
+   路径返回 `(HomeResult, current)` 元组，wrapper 的元组解包在任何多里程碑 homing
+   失败时抛 `TypeError` → 已统一为一致元组返回，并新增 `fail_servo_code` 故障注入
+   + `test_home_multi_milestone_failure_returns_result` 回归测试。
+2. `_sanitize_hand_command` 被 Phase 1.2 误删了控制器侧**手部关节限位**（优雅 hold
+   退化为 SafetyGate 粘滞 fault）与**命令间增量**检查（该 bound 的唯一强制点；否则
+   臂动而手被 worker 丢弃）→ 已恢复两检查与调用点，docstring 标注「Do not delete
+   this check as "redundant"」。
+
 **关键既有 bug（harness 抓出，已修）**：`_enter_measured_hold` 缺 `nonlocal
 _hold_sent_at_s`（提交 `7ce4813`），导致所有实测保持 0.75s 超时锁 fault 且
-`_complete_reanchor` 永不触发。这是唯一的行为变更，需真机优先验证（见 §1）。
+`_complete_reanchor` 永不触发。相对基线 `c57ae4d`，这是**唯一**的净行为变更
+（`7c908f6` 是恢复基线行为，非新增变更），需真机优先验证（见 §1）。
 
 ---
 
 ## 1. 真机校验清单（终止门，最高优先级）
 
-> 这是信任 Phase 1（尤其 `7ce4813`）前的必经门槛。**需要真实 xArm7/XHand 与
-> 固件，且需硬件授权**；CLAUDE.md 规定「Do not run examples/ without explicit
-> hardware authorization」。未授权前不执行。
+> 这是信任 Phase 1（尤其 `7ce4813` 与 `7c908f6`）前的必经门槛。**需要真实
+> xArm7/XHand 与固件，且需硬件授权**；CLAUDE.md 规定「Do not run examples/
+> without explicit hardware authorization」。未授权前不执行。
 
 按优先级：
 
@@ -50,15 +64,22 @@ _hold_sent_at_s`（提交 `7ce4813`），导致所有实测保持 0.75s 超时�
 2. **Mode-6 跟踪**——快腕旋无 tracking-error 告警尖峰；固件是速度/加速度兜底
    （C22/C24/C31）。
 3. **碰撞恢复**——C24 → 有界实测保持恢复；C22/C31 → 粘滞 fault 安全停。
-4. **Homing**——return_home 经 Mode-0 里程碑收敛到规范 home，位置+速度静置，
+4. **Homing 收敛**——return_home 经 Mode-0 里程碑收敛到规范 home，位置+速度静置，
    恢复 Mode 6。
-5. **手部**——接触/回程/稳态误差是合法结果（非 freshness fault）；触觉复位；
-   hand-home 里程碑 ACK。
-6. **录制**——一整条 v16 episode 仍可经 `visualize_episode.py` 与
+5. **Homing 失败路径**（`7c908f6` 回归）——return_home 在真实失败（SDK 拒绝 /
+   C22/C24/C31 打断 / 收敛或整体超时）时返回失败 `HomeResult`（`success=False` +
+   原因），worker 不崩溃；可用 `examples/keyboard_teleop.py` 或碰撞触发验证。
+6. **手部接触/回程/稳态**——接触/回程/稳态误差是合法结果（非 freshness fault）；
+   触觉复位；hand-home 里程碑 ACK。
+7. **手部命令校验**（`7c908f6` 回归）——越界手部命令应**优雅 hold**（`retarget_ok
+   =False`，臂+手同时保持）而非 SafetyGate 粘滞 fault；命令间增量越界应臂+手同时
+   hold（而非臂继续动、手被 worker 丢弃）。
+8. **录制**——一整条 v16 episode 仍可经 `visualize_episode.py` 与
    `replay_episode.py --dry-run` 读回。
 
-验收：6 项全过才算 Phase 1 可信任；任一项失败，优先怀疑 `7ce4813` 与 Tier B 提取
-（用 harness 对拍）。详细清单也在 `tests/README.md` 末尾。
+验收：8 项全过才算 Phase 1 可信任；任一项失败，优先怀疑 `7ce4813`（保持）、
+`7c908f6`（homing 返回 / 手部校验）与 Tier B 提取（用 harness 对拍）。详细清单
+也在 `tests/README.md` 末尾。
 
 ---
 
@@ -85,12 +106,12 @@ read_sequence 714）。
    校验逻辑，确认语义**逐字节一致**后再合并。
 2. 新增 `SeqlockSlot` 承载「单槽奇偶写 + 读校验」；两个 ring 只保留各自的内存
    布局与 `get_last_k`/`read_sequence` 语义差异。
-3. `compileall` + 全量 harness（现有 13 测试已覆盖两类的读路径）+ focused diff。
+3. `compileall` + 全量 harness（现有 14 测试已覆盖两类的读路径）+ focused diff。
 
 **风险/门槛**：这是最安全关键的 IPC 热路径。合并后必须逐处核对写序与双读校验；
 任一差异即停止，不得为过测试而放宽。
 
-**验收**：13 harness 全绿 + focused diff 确认零行为变化。
+**验收**：14 harness 全绿 + focused diff 确认零行为变化。
 
 ---
 
@@ -125,7 +146,7 @@ rg -n "\.heartbeat_s\b|\._ready\b" dexmani_real/robot dexmani_real/sensor dexman
 **风险**：`close()` 记账与 supervisor 迭代读法会改；跨进程 dtype 布局变化需与
 `utils/schema.py` 契约一致。**列为可选**，若不确定则不并入主线。
 
-**验收**：13 harness 全绿 + `close()` 记账无泄漏（进程退出无 shm 残留）。
+**验收**：14 harness 全绿 + `close()` 记账无泄漏（进程退出无 shm 残留）。
 
 ---
 
@@ -162,3 +183,6 @@ rg -n "\.heartbeat_s\b|\._ready\b" dexmani_real/robot dexmani_real/sensor dexman
 - **验证三件套**：`compileall` + 符号 `rg` + focused diff；Phase 2 加 harness 全绿 +
   既有 episode 的 `visualize_episode`/`replay --dry-run` 兼容检查。
 - **每里程碑独立 commit**，保持可回滚；任一语义差异即停止，不为过测试放宽检查。
+- **「冗余」判定以行为为准**：审查证明「存在另一处类似检查」≠「可删」——`_sanitize_hand_command`
+  的手部限位/增量检查看似被 SafetyGate / worker 覆盖，实为「优雅 hold vs 粘滞 fault」与
+  「唯一强制点」的语义差异。Phase 2 的 seqlock/内存表面合并同样必须先证明行为等价。
