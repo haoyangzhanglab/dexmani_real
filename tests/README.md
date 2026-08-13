@@ -60,9 +60,28 @@ measured hold (PAUSE/STOP/QUIT/vr_stale/hand-recovered) faulted after the
 one-line `nonlocal` (see git history).  The re-anchor integration test is the
 regression guard for it.
 
-## Not covered
+## Not covered by the harness
 
 - `_on_sigterm` is a one-line flag setter exercised only via the real SIGTERM
   handler; it is trivially verified by inspection.
-- Real xArm7/XHand firmware behavior (Mode-6 tracking, collision recovery,
-  homing convergence) is out of scope for this harness and requires hardware.
+
+## Real-hardware validation checklist
+
+The harness reaches every behavior that is verifiable headless.  These require
+the real xArm7/XHand and firmware, and are the terminal gate before trusting the
+Phase-1.4 Tier B refactor (especially the `_hold_sent_at_s` fix, `7ce4813`):
+
+1. **Measured-hold apply + re-anchor** — teleop, then PAUSE/STOP/vr-stale:
+   the hold must log `applied` (not `delivery timed out`) and motion must resume
+   after a fresh re-anchor.  This is the bug the harness caught.
+2. **Mode-6 tracking** — fast wrist rotation produces no tracking-error warning
+   spikes; the firmware is the velocity/acceleration backstop (C22/C24/C31).
+3. **Collision recovery** — C24 → bounded measured-hold recovery; C22/C31 →
+   sticky fault and safe stop.
+4. **Homing** — return_home converges to canonical home through Mode-0
+   milestones, settles (position + velocity dwell), and restores Mode 6.
+5. **Hand** — contact/backlash/steady-state error is a valid outcome (not a
+   freshness fault); tactile reset works; hand-home milestones ACK.
+6. **Recording** — one full collect episode (v16) still reads back via
+   `visualize_episode.py` and `replay_episode.py --dry-run`.
+
