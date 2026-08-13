@@ -10,6 +10,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 from dexmani_real.config.defaults import camera, policy
+from dexmani_real.robot.safety import SafetyState
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
@@ -274,14 +275,22 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
 
         while shared.is_running.value:
             _observation_request = getattr(shared, "camera_observation_required", None)
+            # Pointcloud is only consumed by RecorderIO and inference, so compute
+            # it only when one of them needs it.  Frame publication, by contrast,
+            # must continue through the DISARMED startup phase so Main's preflight
+            # health gate (source_monotonic_ns within max_frame_age_s) sees a
+            # recent frame instead of the single stale ready probe.
+            _needs_pointcloud = bool(shared.is_recording.value) or bool(
+                _observation_request is not None and _observation_request.value
+            )
             _publish_payload = (
                 not ready_published
-                or bool(shared.is_recording.value)
-                or bool(_observation_request is not None and _observation_request.value)
+                or int(shared.safety_state.value) == int(SafetyState.DISARMED)
+                or _needs_pointcloud
             )
             # --- read frame ---
             try:
-                frame = cam.read(timeout_ms=300, compute_depth=processor is not None and _publish_payload)
+                frame = cam.read(timeout_ms=300, compute_depth=processor is not None and _needs_pointcloud)
             except (RuntimeError, OSError):
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
                 # This heartbeat represents worker liveness.  Source freshness
@@ -293,7 +302,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 continue
             shared.set_heartbeat("camera", time.monotonic())
 
-            # --- pointcloud (only when recording) ---
+            # --- pointcloud (only when a consumer needs it) ---
             # Pointcloud processing (~46 ms) is the dominant cost in the pipeline.
             # Computing it every tick — even when no one consumes the data — would
             # needlessly burn CPU.  Each episode starts without a cross-episode
@@ -301,14 +310,15 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             # pointcloud_valid=False.
             pc: np.ndarray | None = None
             # --- write to SharedStorage ring ---
-            # Bridge frames only when RecorderIO or a learned observation spec
-            # consumes them.  One startup probe is mandatory before ready;
-            # otherwise avoid sustained ~1.6 MB/frame SHM copies.
+            # Bridge frames during the DISARMED startup phase (so the preflight
+            # health gate observes a fresh source frame) and whenever RecorderIO
+            # or a learned observation spec consumes them; otherwise avoid
+            # sustained ~1.6 MB/frame SHM copies.
             if _publish_payload:
                 pc_source_point_count = 0
                 pc_valid_depth_ratio = float(np.count_nonzero(frame.depth_raw) / frame.depth_raw.size)
                 pc_padding_count = cfg.pointcloud_num_points
-                if processor is not None:
+                if _needs_pointcloud and processor is not None:
                     try:
                         pc = processor.process(frame.depth, frame.rgb, cam.get_rays())
                         pc_source_point_count = processor.last_source_point_count
