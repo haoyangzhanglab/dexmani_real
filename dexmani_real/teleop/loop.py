@@ -489,6 +489,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     def _enter_measured_hold(reason: str) -> bool:
         """Invalidate old endpoints and publish one measured arm-only hold."""
         nonlocal _reanchor_pending_reason
+        nonlocal _hold_sent_at_s
         nonlocal prev_qpos_cmd, ema_prev_pos, ema_prev_quat
         nonlocal _hand_ramp_start, _hand_ramp_step
 
