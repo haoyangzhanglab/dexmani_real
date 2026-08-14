@@ -270,6 +270,13 @@ class ArmParams:
     recoverable_errors: frozenset[int] = frozenset({24})  # C24 speed-limit error only
     collision_fault_errors: frozenset[int] = frozenset({22, 31})  # self-collision / collision current
 
+    # ── TCP load (end-effector mass/COG for firmware dynamics) ──
+    # XHand (1.1 kg). COG in tool-flange frame (link_eef) from URDF weighted-COM
+    # of all end-effector links; flange_joint2 corrected 0.043→0.033 m per
+    # physical measurement.
+    tcp_load_mass_kg: float = 1.1
+    tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
+
     # ── Homing ──
     homing: HomingParams = field(default_factory=HomingParams)
 
@@ -318,6 +325,11 @@ class ArmParams:
             raise ValueError(
                 f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} out of range (0, 50000]"
             )
+        if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
+            raise ValueError("tcp_load_mass_kg must be finite and positive")
+        cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
+        if cog.shape != (3,) or not np.all(np.isfinite(cog)):
+            raise ValueError("tcp_load_cog_mm must be a finite (3,) vector")
 
 
 # Hand parameters (XHand, 12-DOF)

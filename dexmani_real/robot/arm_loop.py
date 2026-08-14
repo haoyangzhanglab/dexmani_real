@@ -96,6 +96,11 @@ class ArmLoopConfig:
     )
     homing_dwell_s: float = field(default_factory=lambda: arm.homing.dwell_s)
 
+    tcp_load_mass_kg: float = field(default_factory=lambda: arm.tcp_load_mass_kg)
+    tcp_load_cog_mm: tuple[float, float, float] = field(
+        default_factory=lambda: arm.tcp_load_cog_mm
+    )
+
     def __post_init__(self) -> None:
         lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
         upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
@@ -142,6 +147,11 @@ class ArmLoopConfig:
             )
         if not self.arm_ip or not (0 <= self.collision_sensitivity <= 5):
             raise ValueError("arm loop IP/collision sensitivity is invalid")
+        if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
+            raise ValueError("arm loop tcp_load_mass_kg must be finite and positive")
+        cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
+        if cog.shape != (3,) or not np.all(np.isfinite(cog)):
+            raise ValueError("arm loop tcp_load_cog_mm must be a finite (3,) vector")
 
     @classmethod
     def from_runtime(cls, runtime: Any) -> "ArmLoopConfig":
@@ -173,6 +183,8 @@ class ArmLoopConfig:
                 cfg.homing.velocity_convergence_rad_s
             ),
             homing_dwell_s=float(cfg.homing.dwell_s),
+            tcp_load_mass_kg=float(cfg.tcp_load_mass_kg),
+            tcp_load_cog_mm=tuple(cfg.tcp_load_cog_mm),
         )
 
 
@@ -525,12 +537,13 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             "set_collision_sensitivity",
             arm.set_collision_sensitivity(cfg.collision_sensitivity),
         )
-        # TCP load: XHand (1.1 kg). COG in tool-flange frame (link_eef) from
-        # URDF weighted-COM of all end-effector links; flange_joint2 corrected
-        # 0.043→0.033 m per physical measurement.
+        # TCP load (XHand) mass/COG from runtime config (see ArmParams).
         _require_sdk_ok(
             "set_tcp_load",
-            arm.set_tcp_load(weight=1.1, center_of_gravity=[16.3, 7.9, 109.5]),
+            arm.set_tcp_load(
+                weight=cfg.tcp_load_mass_kg,
+                center_of_gravity=list(cfg.tcp_load_cog_mm),
+            ),
         )
         # Torque-based collision detection (level 1, least-sensitive enabled
         # setting). Keep this firmware backstop enabled during intentional contact.
