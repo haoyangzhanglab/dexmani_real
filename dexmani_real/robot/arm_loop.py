@@ -1237,9 +1237,19 @@ def _execute_mode0_milestones_impl(
                 else np.zeros(ARM_JOINT_SHAPE)
             )
             try:
-                _controller_error = int(getattr(arm, "error_code", 0) or 0)
+                _controller_error = _read_live_error_code(arm)
             except Exception:
-                _controller_error = 0
+                logger.warning(
+                    "_planned_homing: live controller error read failed at milestone %d",
+                    _target_index,
+                    exc_info=True,
+                )
+                return _result_impl(
+                    request,
+                    False,
+                    f"live error read failed at milestone {_target_index}",
+                    current,
+                ), current
             if _controller_error != 0:
                 return _result_impl(request, 
                     False,
