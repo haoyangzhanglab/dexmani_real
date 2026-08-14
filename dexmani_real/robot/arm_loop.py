@@ -600,7 +600,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     last_cmd_apply_latency_s = 0.0
     last_cmd_sdk_duration_s = 0.0
     last_cmd_is_hold = False
-    motion_enabled = False
+    accepts_motion_commands = False
     last_safety_state = int(SafetyState.DISARMED)
     last_state_source_ns = time.monotonic_ns()
     last_c24_s = float("-inf")
@@ -682,7 +682,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         # to publish state (for monitoring) and rate-limit normally.
         _safety = shared.safety_state.value
         if _safety in (SafetyState.DISARMED, SafetyState.FAULT):
-            if motion_enabled or last_safety_state not in (
+            if accepts_motion_commands or last_safety_state not in (
                 SafetyState.DISARMED,
                 SafetyState.FAULT,
             ):
@@ -693,8 +693,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     logger.error("arm_loop: failed to confirm safe stop", exc_info=True)
                     shared.error_state.value = True
                     break
-                motion_enabled = False
-        elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not motion_enabled:
+                accepts_motion_commands = False
+        elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not accepts_motion_commands:
             try:
                 _enter_mode6_ready(arm, operation_prefix="armed")
             except Exception:
@@ -707,7 +707,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 except Exception:
                     logger.error("arm_loop: fallback stop failed", exc_info=True)
                 break
-            motion_enabled = True
+            accepts_motion_commands = True
         last_safety_state = int(_safety)
         if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
             action = _take_next_current_arm_action(
@@ -793,7 +793,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     last_qpos = _home_result.final_qpos.copy()
                     last_target = last_qpos.copy()
                 if _home_result.success:
-                    motion_enabled = True
+                    accepts_motion_commands = True
                     logger.info(
                         "arm_loop: HOME complete in %.2fs",
                         time.monotonic() - _home_started_s,
@@ -810,7 +810,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     now_monotonic_ns=time.monotonic_ns(),
                 ):
                     logger.info("arm_loop: discarded malformed, stale-generation, or expired command")
-                elif not motion_enabled:
+                elif not accepts_motion_commands:
                     logger.warning("arm_loop: discarded endpoint while controller motion is disabled")
                 else:
                     target = np.asarray(action["qpos_cmd"][0], dtype=np.float64)

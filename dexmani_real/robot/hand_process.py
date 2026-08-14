@@ -48,7 +48,7 @@ class HandProcessConfig:
     mechanical_qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.mechanical_qpos_max_rad)
     max_command_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
 
-    # Send-error watchdog: auto clear_error() after N consecutive send failures
+    # Send-error watchdog: auto clear_local_error() after N consecutive send failures
     send_err_watchdog_frames: int = field(default_factory=lambda: hand.send_err_watchdog_count)
 
     # Error-state watchdog: latch global error_state after N consecutive
@@ -313,17 +313,17 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 else:
                     _send_error_counter.inc()
 
-            # Send-error watchdog: auto clear_error() after consecutive failures.
+            # Send-error watchdog: auto clear_local_error() after consecutive failures.
             if _send_error_counter.triggered:
                 shared.error_state.value = True
                 logger.error("hand_loop: persistent send failures — latching global fault")
                 _now = time.monotonic()
                 if _now - _last_clear_error_s > 2.0:
-                    logger.warning("hand_loop: %d consecutive send errors — clear_error()", _send_error_counter.count)
+                    logger.warning("hand_loop: %d consecutive send errors — clear_local_error()", _send_error_counter.count)
                     try:
-                        hand.clear_error()
+                        hand.clear_local_error()
                     except Exception:
-                        logger.warning("hand_loop: clear_error() failed", exc_info=True)
+                        logger.warning("hand_loop: clear_local_error() failed", exc_info=True)
                     _last_clear_error_s = _now
 
         # Read state (always — even when safety-gated)
@@ -413,14 +413,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             _now_err = time.monotonic()
             if _now_err - _last_error_clear_s > 1.0:
                 logger.warning(
-                    "hand_loop: hand error_state — clear_error() (%d/%d consecutive)",
+                    "hand_loop: hand error_state — clear_local_error() (%d/%d consecutive)",
                     _error_state_counter.count,
                     _error_state_counter.max_consecutive,
                 )
                 try:
-                    hand.clear_error()
+                    hand.clear_local_error()
                 except Exception:
-                    logger.warning("hand_loop: clear_error() failed", exc_info=True)
+                    logger.warning("hand_loop: clear_local_error() failed", exc_info=True)
                 _last_error_clear_s = _now_err
             if _error_state_counter.triggered:
                 shared.error_state.value = True

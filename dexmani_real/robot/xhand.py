@@ -868,7 +868,13 @@ class XHand:
     def is_error(self) -> bool:
         return self.control is None or not self.connected_flag or self.error_state
 
-    def clear_error(self) -> bool:
+    def clear_local_error(self) -> bool:
+        """Reset the local driver latch only; no hardware/SDK call is made.
+
+        Clears ``error_state``/``last_error_code``/``last_error_message`` so a
+        transient hand comm error can be retried.  This is not a controller
+        error clear (xArm's ``clean_error`` is a separate hardware call).
+        """
         self.error_state = False
         self.last_error_code = None
         self.last_error_message = ""
@@ -878,28 +884,6 @@ class XHand:
     def consecutive_send_errors(self) -> int:
         """Number of consecutive send_action() failures (circuit breaker counter)."""
         return self._consecutive_send_errors
-
-    def stop(self) -> bool:
-        if self._stub_mode:
-            self.error_state = True
-            return True
-        if self.control is None or not self.connected_flag:
-            return False
-        command = self.make_command(
-            self._array12(self.config.home_qpos),
-            mode=0,
-            tor_max=0,
-            kp=0,
-            ki=0,
-            kd=0,
-        )
-        err = self.control.send_command(self.config.device_id, command)
-        self.last_action_code = self.error_code(err)
-        self.error_state = True
-        if not self.error_ok(err):
-            self._record_error(err)
-            return False
-        return True
 
     def reset(self, qpos: np.ndarray | None = None) -> bool:
         target = self._array12(self.config.home_qpos if qpos is None else qpos)
@@ -937,7 +921,7 @@ class XHand:
         # Unlike send/read errors (tracked via _record_error +
         # _consecutive_send_errors watchdog), board errors are transient —
         # auto-clear when hardware status returns to normal (no manual
-        # clear_error() needed after an RS485 glitch).
+        # clear_local_error() needed after an RS485 glitch).
         self.error_state = bool(
             np.any(np.asarray(state["commboard_err"], dtype=np.int32))
             or np.any(np.asarray(state["jointboard_err"], dtype=np.int32))
