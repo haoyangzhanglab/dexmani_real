@@ -150,18 +150,3 @@ class RateManager:
         self._next_deadline = now + self.period
         self._cycle_started_at = now
         self._overdue_throttle = 0
-
-    def reset_statistics(self) -> None:
-        """Clear accumulated counters and start a fresh absolute schedule."""
-        now = self._clock()
-        self._started_at = now
-        self._cycle_started_at = now
-        self._last_completed_at = now
-        self._next_deadline = now + self.period
-        self._overdue_throttle = 0
-        self._loop_count = 0
-        self._last_work_duration_s = 0.0
-        self._max_work_duration_s = 0.0
-        self._deadline_overrun_count = 0
-        self._missed_slot_count = 0
-        self._long_block_reanchor_count = 0

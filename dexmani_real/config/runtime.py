@@ -81,14 +81,6 @@ class ResolvedRuntimeConfig:
     canonical_yaml: str
     sha256: str
 
-    @property
-    def config_hash(self) -> str:
-        """Alias used by recording and preflight metadata."""
-        return self.sha256
-
-    def to_dict(self) -> dict[str, Any]:
-        return {name: _plain_value(getattr(self, name)) for name in _SECTION_NAMES}
-
 
 def _merge(base: dict[str, Any], overrides: Mapping[str, Any], *, path: str = "") -> dict[str, Any]:
     result = {key: _plain_value(value) for key, value in base.items()}

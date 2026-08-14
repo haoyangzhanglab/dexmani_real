@@ -365,10 +365,6 @@ class RecorderClient:
         return self._stop_requested
 
     @property
-    def last_stop_result(self) -> RecorderStopResult | None:
-        return self._last_stop_result
-
-    @property
     def camera_writer_error(self) -> str | None:
         status = self._read_status()
         if status is None or int(status["generation"]) != self._generation:

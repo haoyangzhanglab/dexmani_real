@@ -94,10 +94,6 @@ class CameraStreamWriter:
         return self._frame_count
 
     @property
-    def queue_depth(self) -> int:
-        return self._queue.qsize()
-
-    @property
     def metrics(self) -> dict[str, float | int]:
         def summarize(name: str, values: deque[float]) -> dict[str, float]:
             if not values:

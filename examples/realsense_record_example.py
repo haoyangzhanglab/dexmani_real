@@ -157,10 +157,6 @@ class NonBlockingPCDViewer:
         self._created = False
         self.point_size = point_size
 
-    @property
-    def is_open(self) -> bool:
-        return self._created
-
     def update(self, points: np.ndarray) -> bool:
         """Update point cloud.  *points*: (N, 3) or (N, 6).  Returns False if window closed."""
         import open3d as o3d

@@ -128,10 +128,6 @@ class CameraCalib:
 
     # ---- public API ----
 
-    @property
-    def camera_names(self) -> list[str]:
-        return list(self._entries.keys())
-
     def resolve_name_by_serial(self, serial: str) -> str:
         """Return the camera_name whose entry matches ``serial``.
 

@@ -155,11 +155,6 @@ class TimestampAlignedBuffer:
         """Number of occupied grid slots."""
         return self._size
 
-    @property
-    def recording_stopped(self) -> bool:
-        """True when max_record_steps has been reached."""
-        return self._recording_stopped
-
     def __len__(self) -> int:
         return self._size
 

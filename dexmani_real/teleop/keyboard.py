@@ -569,11 +569,6 @@ class GlobalKeyState:
         with self._lock:
             return self._events.popleft() if self._events else None
 
-    @property
-    def any_pressed(self) -> bool:
-        with self._lock:
-            return bool(self._keys)
-
 
 def validate_arm_feedback(
     *,

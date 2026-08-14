@@ -491,10 +491,6 @@ class SharedStorage:
         """Mark *name* (a READY_FIELDS key) ready."""
         self.ready_flags[READY_INDEX[name]] = 1
 
-    def clear_ready(self, name: str) -> None:
-        """Mark *name* not ready."""
-        self.ready_flags[READY_INDEX[name]] = 0
-
     def is_ready(self, name: str) -> bool:
         """Return True when *name* is ready."""
         return bool(self.ready_flags[READY_INDEX[name]])

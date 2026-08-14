@@ -1395,10 +1395,6 @@ class TrajectoryReplayer:
     def planner(self) -> XArm7MotionPlanner | None:
         return self._planner
 
-    @property
-    def action_safety_gate(self) -> SafetyGate | None:
-        return self._action_safety_gate
-
     def shutdown(self) -> None:
         """Signal processes to stop; the session owns SharedStorage cleanup."""
         if not self.dry_run and self.shared is not None:

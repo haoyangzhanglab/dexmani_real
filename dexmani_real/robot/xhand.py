@@ -862,12 +862,6 @@ class XHand:
             state.update(self._empty_state())
         return state
 
-    def is_connected(self) -> bool:
-        return self.control is not None and self.connected_flag and not self.error_state
-
-    def is_error(self) -> bool:
-        return self.control is None or not self.connected_flag or self.error_state
-
     def clear_local_error(self) -> bool:
         """Reset the local driver latch only; no hardware/SDK call is made.
 
@@ -879,11 +873,6 @@ class XHand:
         self.last_error_code = None
         self.last_error_message = ""
         return self.control is not None and self.connected_flag
-
-    @property
-    def consecutive_send_errors(self) -> int:
-        """Number of consecutive send_action() failures (circuit breaker counter)."""
-        return self._consecutive_send_errors
 
     def reset(self, qpos: np.ndarray | None = None) -> bool:
         target = self._array12(self.config.home_qpos if qpos is None else qpos)

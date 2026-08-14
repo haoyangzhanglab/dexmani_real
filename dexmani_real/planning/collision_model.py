@@ -466,12 +466,6 @@ class CollisionModel:
     def table_soft_clearance_m(self) -> float:
         return 0.0 if self._table is None else float(self._table["soft_clearance_m"])
 
-    @property
-    def table_normal(self) -> np.ndarray:
-        if self._table is None:
-            raise RuntimeError("calibrated table geometry is disabled")
-        return np.asarray(self._table["normal"], dtype=np.float64).copy()
-
     def minimum_table_distance(self, qpos: np.ndarray) -> float:
         """Return the minimum mesh-to-table distance over non-allowed links."""
         if self._table is None or not self._table_pair_indices:
@@ -656,19 +650,6 @@ class CollisionModel:
 
     def _user_hand_to_urdf(self, hand_qpos: np.ndarray, name: str) -> np.ndarray:
         return self._validate_vector(hand_qpos, _HAND_DOF_COUNT, name)[list(_HAND_USER_TO_URDF)]
-
-    def action_qpos_to_model(self, qpos: np.ndarray) -> np.ndarray:
-        """Convert gate action order (arm + SDK hand) to model joint order."""
-        values = np.asarray(qpos, dtype=np.float64)
-        if self._hand_dof and values.shape == (7 + _HAND_DOF_COUNT,):
-            arm_qpos = self._validate_vector(values[:7], 7, "arm_qpos")
-            hand_qpos = self._user_hand_to_urdf(values[7:], "hand_qpos")
-            return np.concatenate((arm_qpos, hand_qpos))
-        return self._to_full_qpos(values)
-
-    def check_action_collision(self, qpos: np.ndarray) -> bool:
-        """Check a gate action whose hand joints use native SDK order."""
-        return self.check_collision(self.action_qpos_to_model(qpos))
 
     # ------------------------------------------------------------------
     # Helpers

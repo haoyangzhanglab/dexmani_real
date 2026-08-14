@@ -313,16 +313,6 @@ class SharedMemoryRingBuffer:
             self._warn_torn_read_k(k, len(frames))
         return frames
 
-    def frame_age_ns(self) -> int:
-        """Return age of the latest frame in nanoseconds, or -1 if no frame."""
-        idx = int(self._write_idx_view()[0])
-        slot = self._data_buf[idx]
-
-        if slot["sequence"] == 0 and idx == 0 and int(self._write_seq[0]) == 0:
-            return -1
-
-        return time.monotonic_ns() - int(slot["timestamp_ns"])
-
     @property
     def latest_sequence(self) -> int:
         return int(self._write_seq[0])
@@ -823,16 +813,6 @@ class CameraRingBuffer:
         if not seqlock.verify(marker1):
             return None
         return output
-
-    def frame_age_ns(self) -> int:
-        """Return age of the latest frame in nanoseconds, or -1 if no frame."""
-        idx = int(self._write_idx_view()[0])
-        slot_base = self._HEADER_SIZE + idx * self._slot_size
-        seqlock = SeqlockSlot(self._shm.buf, slot_base)
-        slot_seq = seqlock.marker
-        if slot_seq == 0 and idx == 0 and int(self._write_seq[0]) == 0:
-            return -1
-        return time.monotonic_ns() - seqlock.timestamp_ns
 
     def close(self) -> None:
         self._shm.close()

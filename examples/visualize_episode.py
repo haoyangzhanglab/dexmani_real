@@ -63,8 +63,6 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (220, 60, 255),  # pinky  — magenta
 )
 
-_FINGERTIP_LABELS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
-
 
 def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
     """Group top-level HDF5 datasets by category (arm, hand, action, vr, camera, flags, meta)."""
