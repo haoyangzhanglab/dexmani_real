@@ -498,7 +498,8 @@ def publish_joint_targets(
 
     Returns:
         The accepted ``ActionCandidate`` that was published (and, when
-        ``wait_applied`` is true, acknowledged by arm feedback), or ``None``
+        ``wait_applied`` is true, acknowledged by arm feedback — plus hand
+        feedback when the candidate carries a hand target), or ``None``
         when validation, publication, or acknowledgement failed.
     """
     from dexmani_real.policy.runtime import ActionCandidate
@@ -622,7 +623,16 @@ def publish_joint_targets(
                         )
                         return None
                     if arm_ok and hand_seq == action_id:
-                        return gate_result.candidate
+                        hs = hand_latest[0][0]
+                        healthy = (
+                            bool(hs["connected"])
+                            and bool(hs["state_valid"])
+                            and not bool(hs["error_state"])
+                            and bool(hs["send_healthy"])
+                            and bool(hs["read_healthy"])
+                        )
+                        if healthy:
+                            return gate_result.candidate
             time.sleep(0.005)
         logger.warning(
             "publish_joint_targets: action_id=%d was not acknowledged within %.3fs",

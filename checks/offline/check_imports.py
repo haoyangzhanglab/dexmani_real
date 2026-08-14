@@ -19,6 +19,7 @@ def main() -> int:
         ArmLoopConfig,
         _disconnect_arm,
         _enter_mode6_ready,
+        _read_live_error_code,
         _read_live_status,
         _recover_c24_measured_hold,
         _require_sdk_ok,

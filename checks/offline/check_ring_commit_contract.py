@@ -16,7 +16,10 @@ This check drives the ring deterministically in a single process:
   the newest (5);
 - simulating a producer that published a newer sequence without committing its
   payload (by bumping ``_write_seq`` past the committed slots) yields the
-  committed history (4, 5) instead of ``[]``.
+  committed history (4, 5) instead of ``[]``;
+- driving that newest slot into a half-written (odd-marker) state still yields
+  the committed history (4, 5) — a reader never mistakes a writer-active slot
+  for the latest frame.
 
 Run from the repo root:
     conda run -n real_robot python checks/offline/check_ring_commit_contract.py
@@ -26,7 +29,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer
+from dexmani_real.shm.ring_buffer import SeqlockSlot, SharedMemoryRingBuffer
 
 
 def _seqs(frames: list[tuple[np.ndarray, int, int]]) -> list[int]:
@@ -50,6 +53,15 @@ def main() -> int:
         # committing its payload: the newest slot is logically overwritten, so
         # get_last_k must skip it and return the committed 4 and 5 — not [].
         ring._write_seq[0] = np.uint64(6)
+        assert _seqs(ring.get_last_k(3)) == [4, 5], _seqs(ring.get_last_k(3))
+
+        # Drive that newest slot into a half-written (writer-active) state with
+        # the same uncommitted sequence: get_last_k must still skip it and never
+        # mistake a writer-active slot for the latest committed frame.
+        slot6 = SeqlockSlot(
+            ring._shm.buf, ring._HEADER_SIZE + (6 % ring.maxlen) * ring._slot_size
+        )
+        slot6.begin_write(6, 0)  # odd marker = 2*6 - 1 (writer active)
         assert _seqs(ring.get_last_k(3)) == [4, 5], _seqs(ring.get_last_k(3))
 
         print("OK: ring publishes sequence only after commit; get_last_k skips torn slots")
