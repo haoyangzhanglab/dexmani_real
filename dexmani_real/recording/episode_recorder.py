@@ -870,6 +870,13 @@ class EpisodeRecorder:
         # ── Flush remaining buffered non-camera streams ──
         self._flush_buffered()
         buf_size = self._buffer.size if self._buffer is not None else 0
+        # ``flag_pointcloud_valid`` is True only for source slots carrying a
+        # genuinely non-zero pointcloud; gap/hold slots are masked False.  Count
+        # it before dropping the buffer below so ``has_pointcloud`` reflects
+        # valid pointcloud presence rather than "any camera stream was written".
+        pointcloud_valid_frames = (
+            int(np.count_nonzero(self._buffer.data["flag_pointcloud_valid"])) if self._buffer is not None else 0
+        )
         self._ensure_hdf5()
 
         if camera_frame_count != buf_size:
@@ -899,7 +906,7 @@ class EpisodeRecorder:
             meta.attrs["wall_fps"] = self._frame_count / duration if duration > 0 else self.control_hz
             meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
             meta.attrs["has_camera"] = _had_rgb
-            meta.attrs["has_pointcloud"] = camera_frame_count > 0
+            meta.attrs["has_pointcloud"] = pointcloud_valid_frames > 0
             meta.attrs["has_timestamps"] = "timestamp" in self._datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["camera_writer_error"] = ""
