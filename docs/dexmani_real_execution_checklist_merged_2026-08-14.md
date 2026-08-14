@@ -168,6 +168,17 @@
 - **事实**：gap-fill（timestamp_buffer.py:245-251）全量拷贝 `_last_source_data`，`CAUSAL_HOLD_LAST` slot 继承 `flag_action_queued/action_id/action_created_monotonic_ns`（episode_recorder.py:478-483 构建，未清零）。`FillReason` 为 `SOURCE/CAUSAL_HOLD_LAST/LEADING_PLACEHOLDER`（非文档旧名）。
 - **改法**：synthetic hold 继承 effective target，但**清零 send-event 字段**（用现有 schema/reader 的 sentinel）；replay 在 `send_mask==false` 的 slot 不 republish。修改前先重 trace 当前 sampled-hold 路径，勿带旧结论；不 bump schema 除非不可避免。
 
+#### 实施状态（2026-08-14，ultracode 实施 WA\*）
+
+**已落地（离线验收通过，未做硬件验证）：**
+- **WA1A** — `camera_process.py` 消费 resolved `environment.table.plane_abcd`（enabled→tuple，disabled→`None` 且禁用 auto-load）；`align_mode=="none"` 时 fail early。**偏离清单字面**：清单写 `align_mode != depth_to_color`，但 `color_to_depth` 仍对齐（color 重采样到 depth），仅 `none` 是真正未对齐——故判定条件收紧为 `== "none"`。commit `6e88626`。
+- **WA1B** — 复核证实为真 bug：`has_pointcloud` 原为 `camera_frame_count > 0`，改为 `flag_pointcloud_valid` 计数 > 0。commit `fcfcc31`。
+- **WA1C** — 新增 `recording/transaction.py::atomic_json_dump`（mkstemp→dump→flush→fsync→`os.replace`→fsync parent，复用 `_fsync_path`）；`save_desk_plane`/`calibrate_camera`/`calibrate_vr_heading` 三处改走原子写；`calibrate_camera` backup 改 `copy2` 而非 rename。commit `8021d38`。
+- **WA2** — recording 在非 source slot 清零 `flag_action_queued` + 四个 action 身份/时序字段；replay 读 `flag_action_queued` 为 `send_mask`，quiescent slot 读状态并记录（`arm_sent_cmd=None`→NaN）但不发布命令、不报 premature stop。commit `f53effd`。
+- **离线检查** — `checks/offline/check_wa_contracts.py`（atomic_json_dump 四场景 + `CameraLoopConfig.from_runtime` desk-plane 三态）。commit `97e6041`。
+
+**未做（需单独显式硬件步骤）：** L515 实采验证 WA1A/WA1B/WA2 语义、标定写耐久性（掉电/中断）。
+
 ---
 
 ### 3.4 Phase B — XHand lifecycle（🧪 硬件门控实验，Claude 不得声称完成）
