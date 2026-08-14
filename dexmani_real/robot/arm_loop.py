@@ -309,6 +309,19 @@ def _read_live_status(arm_api: Any) -> tuple[int, int, int]:
     return int(state), mode, int(values[0])
 
 
+def _read_live_error_code(arm_api: Any) -> int:
+    """Return the live controller error code; raise if the live read fails.
+
+    Unlike the cached ``arm.error_code`` property (updated by a background
+    report thread), this synchronously reads ``get_err_warn_code``.  Control
+    decisions that follow a setter failure or a homing run must use this and
+    treat a raise as a fault — never fall back to the cached value.
+    """
+    code, values = arm_api.get_err_warn_code()
+    _require_sdk_ok("get_err_warn_code", code)
+    return int(values[0])
+
+
 def _wait_live_status(
     arm_api: Any,
     *,
@@ -842,7 +855,16 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                             )
                             last_cmd_sdk_duration_s = time.monotonic() - _sdk_started_s
                         else:
-                            err_code = int(getattr(arm, "error_code", 0) or 0)
+                            try:
+                                err_code = _read_live_error_code(arm)
+                            except Exception:
+                                logger.error(
+                                    "arm_loop: live controller error read failed "
+                                    "after setter failure",
+                                    exc_info=True,
+                                )
+                                shared.error_state.value = True
+                                break
                             if err_code in cfg.collision_fault_errors:
                                 _latch_collision_fault(shared, arm, err_code)
                                 break
@@ -1399,9 +1421,10 @@ def _planned_homing(
     _restore_error: Exception | None = None
     _post_homing_abort = _shared_abort_reason()
     try:
-        _controller_error_after_home = int(getattr(arm, "error_code", 0) or 0)
+        _controller_error_after_home = _read_live_error_code(arm)
     except Exception:
-        _controller_error_after_home = 0
+        # Fail-closed: without a live error read we do not restore Mode 6.
+        _controller_error_after_home = -1
     _restore_mode6 = _post_homing_abort is None and _controller_error_after_home == 0
     if _mode_switch_attempted and _restore_mode6:
         try:
