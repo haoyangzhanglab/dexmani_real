@@ -35,8 +35,8 @@ def main() -> int:
     from dexmani_real.config.defaults import arm, hand, safety  # noqa: F401
 
     # IPC ring
+    from dexmani_real.shm.camera_ring import CameraRingBuffer  # noqa: F401
     from dexmani_real.shm.ring_buffer import (  # noqa: F401
-        CameraRingBuffer,
         SeqlockSlot,
         SharedMemoryRingBuffer,
     )

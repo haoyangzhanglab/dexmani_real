@@ -15,7 +15,8 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm, camera, hand, policy
 from dexmani_real.robot.safety import SafetyState
-from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
+from dexmani_real.shm.camera_ring import CameraRingBuffer
+from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
     ARM_STATE_DTYPE,
