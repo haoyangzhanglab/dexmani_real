@@ -41,6 +41,7 @@ class CameraLoopConfig:
     pointcloud_num_points: int = field(default_factory=lambda: camera.pointcloud_num_points)
     publish_hz: float = field(default_factory=lambda: policy.control_hz)
     max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
+    desk_plane: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -60,6 +61,13 @@ class CameraLoopConfig:
     def from_runtime(cls, runtime: object) -> "CameraLoopConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
+        # The resolved environment.table.plane_abcd is the single desk-plane
+        # source of truth (already refreshed from plane_path at resolve time);
+        # consume it here instead of letting the pointcloud processor auto-load
+        # its own hardcoded desk_plane.json.  A disabled table means "no desk
+        # removal" rather than "re-read the calibration file".
+        table = getattr(getattr(runtime, "environment"), "table")
+        desk_plane = tuple(float(v) for v in table.plane_abcd) if table.enabled else None
         return cls(
             serial=cam.serial,
             width=int(cam.width),
@@ -70,6 +78,7 @@ class CameraLoopConfig:
             pointcloud_num_points=int(cam.pointcloud_num_points),
             publish_hz=float(pol.control_hz),
             max_frame_age_s=float(cam.max_frame_age_s),
+            desk_plane=desk_plane,
         )
 
 
@@ -178,6 +187,19 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     failed = False
     _logger.debug("camera_loop: LOADING")
 
+    # Production pointcloud recording requires depth and color aligned to one
+    # frame.  ``none`` leaves them at their native (mismatched) resolutions,
+    # silently producing an empty or misaligned pointcloud; fail closed before
+    # connecting so Main's readiness gate surfaces the misconfiguration.
+    if cfg.align_mode == "none":
+        _logger.error(
+            "camera_loop: align_mode=%r is unsupported for production pointcloud "
+            "recording (use 'depth_to_color' or 'color_to_depth')",
+            cfg.align_mode,
+        )
+        _logger.info("camera_loop: exited")
+        return
+
     # ── Thread pool limit ──
     # OpenCV/NumPy default to multi-threading on many-core machines, competing
     # for CPU with the configured policy loop. We rely on process-level parallelism
@@ -245,7 +267,12 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             calib = CameraCalib()
             cam_name = calib.resolve_name_by_serial(str(cam.active_serial))
             T_world_camera = calib.get_extrinsics(cam_name)
-            pc_config = PointCloudProcessorConfig(num_points=cfg.pointcloud_num_points)
+            pc_kwargs = {"num_points": cfg.pointcloud_num_points, "desk_plane": cfg.desk_plane}
+            if cfg.desk_plane is None:
+                # No resolved plane (table disabled): fall back to workspace
+                # z_min rather than the processor's own desk_plane.json auto-load.
+                pc_kwargs["desk_plane_path"] = ""
+            pc_config = PointCloudProcessorConfig(**pc_kwargs)
             processor = PointCloudProcessor(T_world_camera, pc_config)
             if pc_config.num_points != pc_shape[0]:
                 raise ValueError("pointcloud processor size does not match SharedStorage capacity")
