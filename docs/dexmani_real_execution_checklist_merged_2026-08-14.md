@@ -207,7 +207,7 @@
   - `_close_control` 使失败后 `self.control = None`（旧代码留下 dangling closed handle）。这是「单 controller 共享 discover+open」的必然结果（discovery 现在触碰 `self.control`），且行为惰性——所有消费者都以 `connected_flag` 门控，已逐路径核对。A/B 判定无需单独关注。
   - `open-raise` 路径仍不 close（**预先存在**的泄漏，旧代码同样如此）。未并入 B1 以免混淆 A/B 结果；若真机暴露问题，作为后续独立 cleanup。
   - discovery-close 失败日志文案由 `temporary XHand discovery control did not close cleanly` 改为 `failed XHand control did not close cleanly`（无「temporary control」概念后更准确）。
-- **未做**：硬件 soak（§8.2/§8.3）；A/B 记录模板见 `docs/phase_b_ab_record_template.md`。
+- **未做**：硬件 soak（§8.2/§8.3）。已备 soak harness `checks/hardware/xhand_reconnect_soak.py`（connect→fresh-read→disconnect 循环，无 motion，per-cycle `sdo_failures`/`open_retries` 统计，wedge-stop + `--start-cycle` 续跑，per-run 隔离 log）；A/B 记录模板见 `docs/phase_b_ab_record_template.md`。
 
 ---
 

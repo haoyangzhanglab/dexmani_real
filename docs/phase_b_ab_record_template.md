@@ -18,6 +18,24 @@
 | process start method | spawn / fork |
 | OS / kernel | `uname -a` |
 
+## 0.1 运行方式（自动化 harness，真人执行）
+
+`checks/hardware/xhand_reconnect_soak.py` 自动跑 connect→fresh-read→disconnect 循环（无 motion），
+写 JSONL 结果并自动统计 sdo / retry / latency。**每个分支各跑一轮，用不同 `--out`**：
+
+```bash
+git checkout main
+conda run -n real_robot python checks/hardware/xhand_reconnect_soak.py --cycles 100 --out main_soak.jsonl
+
+git checkout b1-single-controller
+conda run -n real_robot python checks/hardware/xhand_reconnect_soak.py --cycles 100 --out b1_soak.jsonl
+```
+
+- 输出逐行进度 + 末尾 `SOAK SUMMARY`（connect success/fail、error code 分布、`write sdo failed` 计数、open retries、latency avg/max、identity）。
+- 单次 connect 失败会记录并继续（当作 next-session reconnect 观察自愈）；连续 `--max-consecutive-failures`（默认 3）次失败判定 wedged 停止并打印 power-cycle 指令，用 `--start-cycle <n>` 续跑。
+- 每个 run 的 vendor log 落在 `./xhand_soak_logs/run_<ts>_<pid>/`，与另一分支隔离，`write sdo failed` 按 run 统计不会跨分支串味。
+- 把两份 `SOAK SUMMARY` 关键数字抄进 §1 表，再做 §2 判定。
+
 ## 1. B1 正常 reconnect soak（§8.2）
 
 目标：≥100 次起步，500 次更有判别力。每循环：
