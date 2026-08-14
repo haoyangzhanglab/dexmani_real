@@ -194,6 +194,19 @@
 - **WC2** 死配置/状态/注释清理：每删一处先 `rg "<symbol>" dexmani_real examples`；候选如 `apply_timeout_s`、`workspace_bounds`、`action_validity_s`、producer 侧 `publish_monotonic_ns` prefill（W2 后）、stale alias。**不删 v16 reserved/zero-filled 持久字段**（schema 清理需 DG-3）。
 - **WC3** 大文件可读性：只按单一 domain 拆（如 arm_loop homing → `robot/homing.py`），禁止"顺手 format"。
 
+#### 实施状态（2026-08-14，ultracode 对抗式审查后）
+
+**已落地（行为保持）：**
+- **WC2** — 删 17 个未引用符号（14 文件，−109 行），commit `e905bf6`。保留仍被引用的私有字段（`_recording_stopped`/`_last_stop_result`/`_consecutive_send_errors`/`_action_safety_gate`）与 v16 reserved/zero-filled 持久字段。
+- **WC3** — 两次单一 domain 拆分：
+  - `CameraRingBuffer`：`ring_buffer.py` 缩至 387 行，迁出至 `shm/camera_ring.py`，commit `521008d`。
+  - `RecorderClient` + 控制面协议类型（`RecorderCommand`/`RecorderPhase`/`RecorderStopResult`）：`io_process.py` 1028→617 行，迁出至 `recording/recorder_client.py`，commit `6491a6f`。依赖单向：`io_process → recorder_client`，`recorder_client` 不 import `io_process`。
+
+**延期（对抗式审查判定为「非行为保持」或「非干净切片」，未实施）：**
+- **WC1** 运行时拓扑/生命周期收敛 — **REFUTED**：会收敛 spawn/readiness/heartbeat/shutdown 生命周期，触碰 spawn-only 所有权契约，非行为保持。若要做需单独一轮带 fakes 的生命周期验证。
+- **WC3 `arm_homing` 拆分**（`robot/homing.py`）— **REFUTED-as-stated**：干净拆出需连带迁移 `ArmLoopConfig` + SDK helper + 为 `checks/offline` importer 重导出，非单一 domain 切片。
+- **WC3 `xhand_tactile` 拆分** — **REFUTED**：tactile 解析与 error-state helper 纠缠，切不干净。
+
 ---
 
 ## 4. 执行顺序与 commit 切分
