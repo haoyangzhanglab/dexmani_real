@@ -597,14 +597,32 @@ def publish_joint_targets(
         if not (np.isfinite(apply_timeout_s) and apply_timeout_s > 0):
             raise ValueError("apply_timeout_s must be finite and positive")
         deadline_s = time.monotonic() + float(apply_timeout_s)
+        # A candidate carrying a hand_qpos is published to both actuators under
+        # the same action_id (see send_command), so a synchronous caller must
+        # observe BOTH applied before returning.  Arm-only candidates keep the
+        # existing arm last_cmd_seq >= action_id gate.
+        with_hand = gate_result.candidate.hand_qpos is not None
         while time.monotonic() < deadline_s:
             if bool(shared.error_state.value) or not bool(shared.is_running.value):
                 break
             latest = shared.arm_state_ring.read_latest()
-            if latest is not None:
-                record = latest[0][0]
-                if int(record["last_cmd_seq"]) >= action_id:
+            arm_ok = latest is not None and int(latest[0][0]["last_cmd_seq"]) >= action_id
+            if not with_hand:
+                if arm_ok:
                     return gate_result.candidate
+            else:
+                hand_latest = shared.hand_state_ring.read_latest()
+                if hand_latest is not None:
+                    hand_seq = int(hand_latest[0][0]["last_cmd_seq"])
+                    if hand_seq > action_id:
+                        logger.warning(
+                            "publish_joint_targets: action_id=%d was superseded by hand action_id=%d",
+                            action_id,
+                            hand_seq,
+                        )
+                        return None
+                    if arm_ok and hand_seq == action_id:
+                        return gate_result.candidate
             time.sleep(0.005)
         logger.warning(
             "publish_joint_targets: action_id=%d was not acknowledged within %.3fs",
