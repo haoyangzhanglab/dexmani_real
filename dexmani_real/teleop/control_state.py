@@ -3,95 +3,81 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
-
-from dexmani_real.policy.runtime import ActionCandidate
-
-HoldApplication = Literal["idle", "pending", "applied", "failed"]
-
-
-def _home_handoff_state(*, candidate_present: bool, candidate_applied: bool) -> str:
-    """Describe the hold candidate that homing is about to supersede."""
-    if not candidate_present:
-        return "idle"
-    return "applied" if candidate_applied else "pending"
 
 
 @dataclass
-class ControlHold:
-    """Track one run-scoped measured hold and its exact apply acknowledgement."""
+class CommandQuiescence:
+    """Track one command-silent pause and its feedback freshness boundary.
+
+    This object never carries an actuator target. The owner advances
+    ``run_generation`` on the first entry, preserves that boundary across
+    repeated pause observations, may reclassify the current reason for an
+    explicit operator transition without a second generation advance, and
+    replaces the boundary when an explicit BEGIN opens a distinct run. The
+    boundary is used only to decide when feedback is safe to re-anchor from.
+    """
 
     reason: str | None = None
-    candidate: ActionCandidate | None = None
-    record_candidate: ActionCandidate | None = None
-    applied: bool = False
-    applied_monotonic_ns: int = 0
-    deadline_s: float | None = None
+    entered_monotonic_ns: int = 0
 
     @property
     def active(self) -> bool:
         return self.reason is not None
 
-    @property
-    def application_pending(self) -> bool:
-        """Whether clean exit must wait for the correlated apply ACK."""
-        return self.candidate is not None and not self.applied
-
-    def pause_without_candidate(self, reason: str) -> None:
-        """Invalidate local motion while feedback is too unhealthy to publish a hold."""
+    def enter(self, reason: str, *, entered_monotonic_ns: int) -> bool:
+        """Enter quiescence; preserve the first reason/time on repeated calls."""
+        self._validate_reason(reason)
+        entered_ns = int(entered_monotonic_ns)
+        if entered_ns <= 0:
+            raise ValueError("quiescence entry time must be positive")
+        if self.active:
+            return False
         self.reason = reason
-        self.candidate = None
-        self.record_candidate = None
-        self.applied = False
-        self.applied_monotonic_ns = 0
-        self.deadline_s = None
+        self.entered_monotonic_ns = entered_ns
+        return True
 
     def relabel(self, reason: str) -> None:
-        """Keep an existing hold but update why re-anchoring is required."""
-        if not self.active:
-            raise RuntimeError("cannot relabel an inactive control hold")
-        self.reason = reason
+        """Reclassify an active pause without moving its freshness boundary.
 
-    def begin(self, reason: str, candidate: ActionCandidate, *, deadline_s: float) -> None:
-        """Begin waiting for the exact arm/hand candidate to be applied."""
-        self.reason = reason
-        self.candidate = candidate
-        self.record_candidate = candidate
-        self.applied = False
-        self.applied_monotonic_ns = 0
-        self.deadline_s = float(deadline_s)
-
-    def observe_delivery(self, sent_at_s: float | None, *, now_s: float, hold_delivery_s: float = 0.15) -> HoldApplication:
-        """Check whether the hold has had time to propagate through the workers.
-
-        Without ACK protocol, we wait ``hold_delivery_s`` after the command was
-        sent (enough for the arm queue to drain and both workers to apply).
+        An explicit C can turn an automatic gate into a user-resumable pause;
+        STOP, DISCARD, maximum duration, and QUIT can make that same pause
+        non-resumable. In both cases its generation is already invalidated.
         """
-        if self.candidate is None or self.applied:
-            return "idle"
-        if sent_at_s is not None and now_s - sent_at_s >= hold_delivery_s:
-            self.applied = True
-            self.applied_monotonic_ns = int(sent_at_s * 1e9)
-            self.deadline_s = None
-            return "applied"
-        if self.deadline_s is not None and now_s >= self.deadline_s:
-            return "failed"
-        return "pending"
+        self._validate_reason(reason)
+        if not self.active:
+            raise RuntimeError("cannot relabel inactive command quiescence")
+        self.reason = reason
 
-    def take_record_candidate(self) -> ActionCandidate | None:
-        """Return the hold candidate once for recording provenance."""
-        candidate = self.record_candidate
-        self.record_candidate = None
-        return candidate
+    def feedback_is_newer(
+        self,
+        *,
+        arm_source_monotonic_ns: int,
+        vr_receive_monotonic_ns: int,
+        hand_source_monotonic_ns: int | None,
+    ) -> bool:
+        """Require every enabled feedback source to strictly postdate entry."""
+        if not self.active or self.entered_monotonic_ns <= 0:
+            return False
+        boundary_ns = self.entered_monotonic_ns
+        hand_is_newer = (
+            hand_source_monotonic_ns is None
+            or int(hand_source_monotonic_ns) > boundary_ns
+        )
+        return bool(
+            int(arm_source_monotonic_ns) > boundary_ns
+            and int(vr_receive_monotonic_ns) > boundary_ns
+            and hand_is_newer
+        )
 
-    def clear(self) -> tuple[str, str | None]:
-        """Clear the hold and return its pre-clear handoff state and reason."""
-        state = _home_handoff_state(candidate_present=self.candidate is not None, candidate_applied=self.applied)
+    def clear(self) -> tuple[str | None, int]:
+        """Leave quiescence and return the reason and original entry time."""
         reason = self.reason
+        entered_ns = self.entered_monotonic_ns
         self.reason = None
-        self.candidate = None
-        self.record_candidate = None
-        self.applied = False
-        self.applied_monotonic_ns = 0
-        self.deadline_s = None
-        return state, reason
+        self.entered_monotonic_ns = 0
+        return reason, entered_ns
+
+    @staticmethod
+    def _validate_reason(reason: str) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("quiescence reason must be a non-empty string")

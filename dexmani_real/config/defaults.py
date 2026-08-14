@@ -525,6 +525,8 @@ class PolicyParams:
     # ── Recording ──
     recording_enabled: bool = True
     max_record_duration_s: float = 60.0
+    # Quality label only: short, internally consistent episodes are published
+    # with min_frames_met=False and left to downstream filtering policy.
     min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 

@@ -266,6 +266,11 @@ def load_trajectory(
         raise FileNotFoundError(f"Episode not found: {episode_path}")
 
     with EpisodeReader(resolved_path) as reader:
+        if not reader.meets_min_duration:
+            logger.warning(
+                "Episode %s is internally readable but below the configured minimum recording duration",
+                resolved_path,
+            )
         if require_live_validity:
             reader.require_valid(purpose="live replay")
         h5 = reader.h5f
@@ -1121,84 +1126,18 @@ class TrajectoryReplayer:
                 return ReplayStatus.FAULT, issue
         return None
 
-    def _read_terminal_hold_targets(
-        self,
-        *,
-        newer_than_ns: int,
-        timeout_s: float,
-    ) -> tuple[np.ndarray, np.ndarray | None]:
-        """Wait for healthy measured joints published after a run change."""
+    def _enter_terminal_quiescence(self) -> None:
+        """Invalidate queued replay endpoints and publish nothing further.
+
+        An endpoint already accepted by firmware is not retractable; verified
+        shutdown later places the controller in State 4.
+        """
         assert self.shared is not None
-        assert self.runtime is not None
-        deadline_s = time.monotonic() + timeout_s
-        last_issue = "feedback not yet newer than the replay run"
-        while time.monotonic() < deadline_s:
-            runtime_issue = self._runtime_issue()
-            if runtime_issue is not None:
-                raise RuntimeError(runtime_issue[1])
-
-            arm_state = read_arm_state_dict(self.shared)
-            arm_issue = arm_feedback_issue(
-                arm_state,
-                float(self.runtime.policy.arm_state_stale_threshold_s),
-            )
-            if arm_issue is None and arm_state is not None:
-                if int(arm_state["error_code"]) != 0:
-                    arm_issue = f"arm controller error C{int(arm_state['error_code'])}"
-                elif int(arm_state["source_monotonic_ns"]) <= newer_than_ns:
-                    arm_issue = "arm feedback not yet newer than the replay run"
-
-            hand_state: dict[str, Any] | None = None
-            hand_issue: str | None = None
-            if self._hand_available:
-                hand_state = read_hand_state_dict(self.shared)
-                if not hand_feedback_is_healthy(
-                    hand_state,
-                    float(self.runtime.safety.heartbeat_timeouts["hand"]),
-                ):
-                    hand_issue = "hand feedback is unavailable or unhealthy"
-                elif hand_state is not None and int(hand_state["source_monotonic_ns"]) <= newer_than_ns:
-                    hand_issue = "hand feedback not yet newer than the replay run"
-
-            if arm_issue is None and hand_issue is None and arm_state is not None:
-                arm_qpos = np.asarray(arm_state["qpos"], dtype=np.float64).copy()
-                hand_qpos = None if hand_state is None else np.asarray(hand_state["qpos"], dtype=np.float64).copy()
-                return arm_qpos, hand_qpos
-
-            last_issue = arm_issue or hand_issue or last_issue
-            time.sleep(_WAIT_POLL_INTERVAL_S)
-        raise TimeoutError(last_issue)
-
-    def _publish_terminal_hold(self) -> str | None:
-        """Invalidate pending replay endpoints and confirm a measured hold."""
-        assert self.shared is not None
-        assert self.runtime is not None
-        apply_timeout_s = float(self.runtime.policy.action_apply_timeout_s)
-        try:
-            run_generation = advance_run_generation(self.shared)
-            run_changed_ns = time.monotonic_ns()
-            arm_qpos, _hand_qpos = self._read_terminal_hold_targets(
-                newer_than_ns=run_changed_ns,
-                timeout_s=apply_timeout_s,
-            )
-        except (RuntimeError, TimeoutError, ValueError) as exc:
-            return str(exc)
-
-        candidate = publish_joint_targets(
-            self.shared,
-            arm_qpos,
-            None,
-            is_hold=True,
-            prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
-            dt_s=1.0 / self.replay_hz,
-            safety_gate=self._action_safety_gate,
-            wait_applied=True,
-            apply_timeout_s=apply_timeout_s,
+        run_generation = advance_run_generation(self.shared)
+        logger.info(
+            "replay entered terminal command quiescence (run=%d)",
+            run_generation,
         )
-        if candidate is None:
-            return f"measured arm-only hold was rejected or not applied after advancing to run {run_generation}"
-        logger.info("replay terminal arm-only hold applied (run=%d action_id=%d)", run_generation, candidate.action_id)
-        return None
 
     def _poll_control(self, keyboard: KeyboardHandler, timeout_s: float) -> bool:
         """Poll keyboard and runtime health for up to *timeout_s* seconds.
@@ -1219,17 +1158,11 @@ class TrajectoryReplayer:
             self._fault(reason, estop=status is ReplayStatus.ESTOP)
             return False
         if ControlSignal.QUIT in signals:
-            print("\nQ: stopping at a measured hold")
-            hold_issue = self._publish_terminal_hold()
-            if hold_issue is not None:
-                self._fault(
-                    f"operator quit could not establish a safe hold: {hold_issue}",
-                    estop=bool(self.shared.estop_request.value),
-                )
-            else:
-                self._running = False
-                self._status = ReplayStatus.USER_QUIT
-                self._reason = "operator quit after measured hold was applied"
+            print("\nQ: stopping command publication")
+            self._enter_terminal_quiescence()
+            self._running = False
+            self._status = ReplayStatus.USER_QUIT
+            self._reason = "operator quit after entering command quiescence"
             return False
         return True
 
@@ -1421,17 +1354,11 @@ class TrajectoryReplayer:
                 if next_deadline_s < now_s:
                     next_deadline_s = now_s + period_s
         except KeyboardInterrupt:
-            print("\nInterrupted by user; stopping at a measured hold")
-            hold_issue = self._publish_terminal_hold()
-            if hold_issue is not None:
-                self._fault(
-                    f"operator interrupt could not establish a safe hold: {hold_issue}",
-                    estop=bool(self.shared.estop_request.value),
-                )
-            else:
-                self._running = False
-                self._status = ReplayStatus.USER_QUIT
-                self._reason = "operator interrupt after measured hold was applied"
+            print("\nInterrupted by user; stopping command publication")
+            self._enter_terminal_quiescence()
+            self._running = False
+            self._status = ReplayStatus.USER_QUIT
+            self._reason = "operator interrupt after entering command quiescence"
         except Exception as exc:
             logger.error("Unexpected replay failure", exc_info=True)
             self._fault(f"unexpected replay failure: {exc}")
@@ -1830,7 +1757,7 @@ def run_live_replay(
                         outcome = ReplayOutcome(
                             ReplayStatus.FAULT,
                             replayer.partial_data,
-                            "replay interrupted before a measured hold could be confirmed",
+                            "replay interrupted before command quiescence could be established",
                         )
                     else:
                         outcome = ReplayOutcome(ReplayStatus.USER_QUIT, replayer.partial_data, "KeyboardInterrupt")

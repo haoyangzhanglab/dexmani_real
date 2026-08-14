@@ -49,7 +49,6 @@ VR worker ─────┼── shared state rings ──► Teleop or learne
 Arm worker ────┤                                  │
 Hand worker ───┘                         fire-and-forget command publication
                                                     ├──► bounded arm endpoint/HOME queue → Arm worker
-                                                    ├──► priority arm STOP/RESUME ring ───┘
                                                     └──► latest-wins hand ring → Hand worker
 
 Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v16
@@ -91,12 +90,11 @@ discover a dtype.
 | Transport | Direction | Semantics |
 |---|---|---|
 | `arm_action_q` | controller → arm | Ordered `mp.Queue(maxsize=2)`; carries fixed endpoints plus correlated HOME requests; endpoint backpressure is intentional |
-| `arm_control_ring` | controller → arm | Fixed-dtype latest-wins STOP/RESUME request; read before the ordered queue so braking never competes with endpoints for capacity |
 | `hand_cmd_ring` | controller → hand | Seqlock, latest-wins servo target |
 | arm/hand/VR/camera rings | worker → controller | Seqlock state; source and publish freshness are distinct |
-| `record_control_ring` | controller → RecorderIO | Latest immutable fixed-field START/STOP boundary; no JSON payload |
-| `record_sample_ring` | controller → RecorderIO | Fixed-grid aligned sample; overflow aborts the episode |
-| `record_status_ring` | RecorderIO → controller/main | Latest lifecycle outcome and bounded error/path text; no progress protocol |
+| `record_control_ring` | controller → RecorderIO | Latest immutable fixed-field START/STOP boundary; client refuses START until the prior STOP terminal is harvested |
+| `record_sample_ring` | controller → RecorderIO | Fixed-grid sample plus transient control generation; overflow aborts the episode |
+| `record_status_ring` | RecorderIO → controller/main | READY/RECORDING/FINALIZING/terminal phase, bounded reason/error/path, minimum-duration label, and sticky session failure count |
 | `inference_candidate_ring` | inference → learned coordinator | Latest current-tick candidate; only allocated for policy deployment |
 | flags and heartbeats | lifecycle/workers | Flags are simple values; heartbeats use `time.monotonic()` |
 
@@ -134,8 +132,17 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
 - `run_generation` tags both policy observations and candidates. Begin, pause,
   home, feedback fault, and camera re-warm advance it; the coordinator drops a
   mailbox result unless it, its observation, and shared state have the same
-  generation. Those paths publish a coordinated hold when fresh feedback is
-  available and require re-anchor/re-warm before motion resumes.
+  generation. Workers also reject queued/ring commands from an older generation;
+  this cannot retract an endpoint already accepted by firmware. Ordinary pause
+  paths publish no replacement endpoint. Repeated observations of one pause do
+  not advance again; every explicit VR BEGIN opens a distinct generation and
+  supersedes an earlier STOP/DISCARD/max-duration boundary. VR teleop requires
+  feedback newer than its pause or BEGIN boundary and spends one full grid
+  re-anchoring. A session-ending signal received during a C pause preserves the
+  existing generation boundary but makes that pause non-resumable. Conversely,
+  C received during an automatic gate reclassifies the same boundary as a
+  C-resumable pause without advancing again; learned policy requires a candidate
+  from the active generation.
 
 Do not turn a simple flag into an enum, add a second state writer, or bypass
 the SafetyGate validation boundary.
@@ -157,17 +164,28 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
   holds rather than inventing a new command.
 - `teleop/episode_samples.py` owns recording sample construction. One sample is
   emitted per `control_hz` grid tick (normally 16 Hz), not per sensor arrival.
+- A command-silent pause is not a sampled grid interval. The first sample from
+  a new `run_generation` re-anchors the recorder's next contiguous storage slot;
+  its wall-time jump is retained, but no pause-time hold action is synthesized.
 - Mode 6 firmware smooths arm targets. Application-side interpolation is unsafe.
-- A moving keyboard arm stops through a correlated firmware State 6 request,
-  not a delayed measured/predicted endpoint. State 6 is the request; deployed
-  firmware may report non-ready State 5 (or briefly State 6). The worker
-  accepts only that error-free post-request state set and ACKs through
-  `last_cmd_seq`; the caller independently waits for two fresh low-velocity
-  frames before re-anchoring to measured qpos. Before the next motion endpoint,
-  the controller sends an explicit RESUME request through the same priority
-  ring. The worker reads joints directly from the SDK, establishes that exact
-  measured hold while entering Mode 6/ready State 2, then ACKs; an ordinary
-  endpoint can neither resume the arm nor fill the queue during this handshake.
+- Ordinary pause is command quiescence: advance `run_generation`, stop
+  publishing, and let Mode 6 finish the last endpoint already accepted by the
+  controller. No delayed measured endpoint is sent. Keyboard idle continuously
+  rebuilds its joint and Cartesian baselines from feedback; VR resume accepts
+  only feedback newer than pause entry and uses its first grid solely to
+  re-anchor. C only resumes a C-created pause; STOP, DISCARD, and max-duration
+  completion require a new BEGIN, which advances generation again and replaces
+  the freshness boundary. If one of those endings arrives during a C pause, it
+  cancels C resumability without a redundant generation advance. State 4
+  remains reserved for DISARMED, FAULT, e-stop fallback, and verified final
+  shutdown.
+- Command quiescence is not a ban on every `is_hold` endpoint. IK/mapping/
+  workspace rejection and contact-stall recovery may still publish an explicit
+  safe fallback endpoint; C24 recovery may send one freshly read measured hold.
+  Those are active safety/error-recovery actions, not ordinary pause behavior.
+- VR transform schema v1 is validated in Main before SharedStorage/process
+  creation and again in the policy child. It must be a proper SO(3) rotation
+  with the declared convention and machine-readable non-POOR quality metadata.
 
 ### Experimental learned-policy deployment
 
@@ -209,6 +227,16 @@ aligned samples → RecorderIO → temporary episode + stream verification
   fire-and-forget worker protocol records no fabricated ACK or apply status.
 - Writer failure, stream mismatch, overflow, codec failure, or ENOSPC aborts
   the episode rather than silently publishing partial data.
+- RecorderIO finalization is polled from its heartbeat loop; it never blocks
+  that loop on HDF5/codec completion. A max-duration boundary saves the episode
+  and moves teleop to ARMED command quiescence. Recording errors remain separate
+  from robot FAULT but make the collection CLI fail through `failure_count`.
+  A timeout remains non-terminal while the stop thread is alive: status stays
+  `FINALIZING`, START remains rejected, and the eventual terminal status is
+  `ERROR`.
+- `min_record_duration_s` is a quality label, not a publication gate. Short
+  consistent episodes keep schema-v16 validity and expose `min_frames_met=False`;
+  replay and visualization warn so downstream training can filter explicitly.
 - `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
 - `examples/replay_episode.py` defaults to dry-run. Live replay reruns fail-closed
   provenance and dense geometry checks immediately before worker startup.
@@ -271,7 +299,11 @@ aligned samples → RecorderIO → temporary episode + stream verification
 
 - xArm Mode 6 is the normal servo mode; firmware is the final collision/current
   safety backstop. C22/C31 are immediate faults; C24 has bounded measured-hold
-  recovery. Homing uses a separately validated Mode 0 milestone path.
+  recovery, with another C24 inside 2 seconds becoming a sticky fault. Homing
+  uses a separately validated Mode 0 milestone path.
+- Arm feedback is valid only when both the SDK state read and URDF FK succeed.
+  FK failure publishes NaN EEF with `state_valid=0`; persistent failure uses the
+  same bounded device-I/O escalation as repeated feedback-read failure.
 - Successful vendor SDK startup chatter may be captured only within the owning
   device worker's bounded initialization calls. Project readiness logs remain
   visible, and failed SDK calls replay their captured native diagnostics.

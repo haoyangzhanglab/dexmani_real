@@ -11,7 +11,6 @@ import numpy as np
 from dexmani_real.config.defaults import arm, hand, safety
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.shm.shared_storage import SharedStorage
@@ -23,51 +22,6 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 logger = get_logger(__name__)
-
-# Time for a command to propagate through the arm queue and be applied by
-# both workers at 16 Hz.  Two worker ticks plus queue latency margin.
-_HOLD_DELIVERY_S = 0.15
-
-
-def _hold_delivered(candidate: ActionCandidate, sent_at_s: float) -> bool:
-    """Return True after the hold has had time to propagate through the workers.
-
-    Without ACKs, we conservatively wait long enough for the arm queue to
-    drain and both workers to apply the command.
-    """
-    return time.monotonic() - sent_at_s >= _HOLD_DELIVERY_S
-
-
-def _feedback_after_send(
-    arm_state: np.ndarray,
-    hand_state: np.ndarray | None,
-    candidate: ActionCandidate,
-    sent_at_s: float,
-) -> bool:
-    """Require measured feedback produced after the hold command was sent."""
-    arm_names = arm_state.dtype.names or ()
-    if "source_monotonic_ns" not in arm_names:
-        return False
-    sent_ns = int(sent_at_s * 1e9)
-    if int(arm_state["source_monotonic_ns"][0]) < sent_ns:
-        return False
-    if candidate.hand_qpos is None:
-        return True
-    if hand_state is None:
-        return False
-    hand_names = hand_state.dtype.names or ()
-    return "source_monotonic_ns" in hand_names and int(hand_state["source_monotonic_ns"][0]) >= sent_ns
-
-
-def _vr_after_send(vr_frame: dict[str, Any] | None, sent_at_s: float) -> bool:
-    """Return whether the VR sample was received after the hold command was sent."""
-    if vr_frame is None:
-        return False
-    sent_ns = int(sent_at_s * 1e9)
-    try:
-        return int(vr_frame.get("local_recv_ns", 0)) >= sent_ns
-    except (TypeError, ValueError):
-        return False
 
 
 def _reset_mapper_from_frames(

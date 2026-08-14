@@ -52,7 +52,6 @@ def _stop_recording(
             shared.is_recording.value = False
 
 
-
 def _matching_source_sequence(ring: Any, frame: np.ndarray | None) -> int:
     """Recover the exact verified ring identity for one copied state frame."""
     if frame is None or frame.dtype.names is None or "source_monotonic_ns" not in frame.dtype.names:
@@ -219,7 +218,10 @@ def _record_held(
     shared: SharedStorage | None = None,
     action_candidate: ActionCandidate | None = None,
 ) -> None:
-    """Record a held frame, optionally bound to the exact hold command sent.
+    """Record an active safety-fallback frame and its optional hold command.
+
+    Ordinary ``CommandQuiescence`` never calls this helper: a command-silent
+    pause emits neither an actuator action nor a recording sample.
 
     Args:
         arm_qpos_sent: Last command actually queued to arm_action_q.

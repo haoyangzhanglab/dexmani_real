@@ -30,6 +30,8 @@ class ArmFK:
         self._model = pinocchio.buildModelFromUrdf(str(urdf_path))
         self._data = self._model.createData()
         self._eef_frame_id = self._model.getFrameId(eef_frame_name)
+        if self._eef_frame_id >= self._model.nframes:
+            raise ValueError(f"URDF is missing EEF frame {eef_frame_name!r}")
 
     def compute(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Compute EEF pose in arm base frame. Returns (eef_pos(3), eef_rot6d(6))."""
@@ -42,8 +44,22 @@ class ArmFK:
         pinocchio.updateFramePlacements(self._model, self._data)
         pose = self._data.oMf[self._eef_frame_id]
 
-        R = pose.rotation  # 3×3
+        R = np.asarray(pose.rotation, dtype=np.float64)  # 3×3
         eef_pos = np.asarray(pose.translation, dtype=np.float64).copy()
+        if (
+            eef_pos.shape != (3,)
+            or R.shape != (3, 3)
+            or not np.all(np.isfinite(eef_pos))
+            or not np.all(np.isfinite(R))
+        ):
+            raise RuntimeError("ArmFK produced a malformed or non-finite pose")
+        orthogonality_error = float(np.linalg.norm(R.T @ R - np.eye(3), ord="fro"))
+        determinant = float(np.linalg.det(R))
+        if orthogonality_error > 1e-6 or abs(determinant - 1.0) > 1e-6:
+            raise RuntimeError(
+                "ArmFK produced an invalid rotation "
+                f"(orthogonality_error={orthogonality_error:.3g}, det={determinant:.9g})"
+            )
         eef_rot6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
         return eef_pos, eef_rot6d
 

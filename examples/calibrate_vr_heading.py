@@ -45,6 +45,11 @@ from dexmani_real import ASSET_DIR, PACKAGE_DIR
 from dexmani_real.planning.pose_utils import forward_from_quat_wxyz, normalize_quat_wxyz
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, vr_loop
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
+from dexmani_real.teleop.vr_transform import (
+    VR_TRANSFORM_CONVENTION,
+    VR_TRANSFORM_MIN_FRAMES,
+    VR_TRANSFORM_SCHEMA_VERSION,
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Paths
@@ -78,7 +83,7 @@ class HeadingCalibrationConfig:
     vr_ready_timeout_s: float = 120.0
     tracking_data_timeout_s: float = 15.0
     settle_s: float = 3.0
-    min_frames: int = 30
+    min_frames: int = VR_TRANSFORM_MIN_FRAMES
     outlier_sigma: float = 3.0
     excellent_std_deg: float = 2.0
     good_std_deg: float = 5.0
@@ -153,10 +158,10 @@ def _quality_grade(
     *,
     excellent_std_deg: float = 2.0,
     good_std_deg: float = 5.0,
-) -> str:
+) -> dict[str, float | str]:
     """Grade calibration quality from per-frame theta scatter.
 
-    Returns a human-readable string like "excellent (σ=1.2°, max=3.1°)".
+    Returns machine-readable metrics consumed by the runtime preflight.
     """
     fwd_2d = forwards[:, :2]
     norms = np.linalg.norm(fwd_2d, axis=1)
@@ -172,8 +177,12 @@ def _quality_grade(
     elif std_deg < good_std_deg:
         grade = "good"
     else:
-        grade = "POOR"
-    return f"{grade} (σ={std_deg:.1f}°, max={max_dev:.1f}°)"
+        grade = "poor"
+    return {
+        "grade": grade,
+        "std_deg": std_deg,
+        "max_deviation_deg": max_dev,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -329,6 +338,10 @@ def main() -> None:
     # ── Compute ──
     forwards_arr = np.array(forwards, dtype=np.float64)
     theta_rad, mean_fwd, inlier = _circular_mean(forwards_arr, outlier_sigma=cfg.outlier_sigma)
+    inlier_frames = int(np.sum(inlier))
+    if inlier_frames < cfg.min_frames:
+        print(f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)")
+        sys.exit(1)
     theta_deg = float(np.rad2deg(theta_rad))
     quality = _quality_grade(
         forwards_arr, theta_rad, inlier,
@@ -347,11 +360,15 @@ def main() -> None:
 
     print(f"\n{'=' * 55}")
     print("Calibration result")
-    print(f"  valid frames:  {len(forwards)} "
+    print(f"  valid frames:  {inlier_frames} "
           f"(rejected {int(np.sum(~inlier))} outliers, skipped {stale_count} dupes)")
     print(f"  forward:       [{mean_fwd[0]:.4f}, {mean_fwd[1]:.4f}]")
     print(f"  theta:         {theta_deg:.1f}°")
-    print(f"  quality:       {quality}")
+    print(
+        "  quality:       "
+        f"{quality['grade']} (σ={float(quality['std_deg']):.1f}°, "
+        f"max={float(quality['max_deviation_deg']):.1f}°)"
+    )
     print(f"  verification:  T·forward = [{corrected[0]:.4f}, {corrected[1]:.4f}] (expect [1, 0])")
     print(f"  T = R_z(-{theta_deg:.1f}°):")
     print(f"    [{T[0, 0]:.4f}, {T[0, 1]:.4f}, {T[0, 2]:.4f}],")
@@ -364,15 +381,15 @@ def main() -> None:
     # ── Write config ──
     _OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     config = {
+        "schema_version": VR_TRANSFORM_SCHEMA_VERSION,
         "description": "Fixed VR-to-robot transform (FLU→robot frame)",
         "T_vr_to_robot": T.tolist(),
         "theta_deg": theta_deg,
-        "convention": "R_z(-theta) maps VR FLU forward → robot base +X",
+        "convention": VR_TRANSFORM_CONVENTION,
         "ref": args.ref,
-        "quality": quality,
-        "frames": len(forwards),
+        "quality": {**quality, "frames": inlier_frames},
     }
-    with open(_OUTPUT_PATH, "w") as f:
+    with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     print(f"\nSaved to: {_OUTPUT_PATH}")
 

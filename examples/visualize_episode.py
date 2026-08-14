@@ -87,6 +87,8 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
 def print_episode_info(h5_path: str) -> None:
     """Print a human-readable summary of the episode structure without opening Rerun."""
     with EpisodeReader(h5_path) as reader:
+        if not reader.meets_min_duration:
+            print("WARNING: episode is below the configured minimum recording duration (quality label only)")
         f = reader.h5f
         keys = sorted(k for k in f.keys() if isinstance(f[k], h5py.Dataset))
         groups = sorted(k for k in f.keys() if not isinstance(f[k], h5py.Dataset))
@@ -170,6 +172,8 @@ class EpisodeVisualizer:
     ):
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
+        if not self._reader.meets_min_duration:
+            logger.warning("Episode is below the configured minimum recording duration")
         self._h5f = self._reader.h5f
 
         # Pre-decode camera frames (~50 MB for 960 frames @ 640×480).

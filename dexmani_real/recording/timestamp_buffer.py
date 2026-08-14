@@ -1,13 +1,15 @@
 """Timestamp-aligned recording buffer for multi-rate sensor streams.
 
-Assigns each incoming data point to a fixed dt time grid (start_time + k*dt),
-pre-allocates numpy arrays, and flushes aligned data in bulk at episode stop.
+Assigns each incoming data point to a fixed-dt grid segment, supports explicit
+wall-time re-anchors between unsampled segments, pre-allocates NumPy arrays,
+and flushes aligned data in bulk at episode stop.
 
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
@@ -17,13 +19,27 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["FillReason", "TimestampAlignedBuffer"]
+__all__ = ["BufferAddResult", "FillReason", "TimestampAlignedBuffer"]
 
 
 class FillReason(IntEnum):
     SOURCE = 0
     CAUSAL_HOLD_LAST = 1
     LEADING_PLACEHOLDER = 2
+
+
+@dataclass(frozen=True)
+class BufferAddResult:
+    """Exact storage effect of one :meth:`TimestampAlignedBuffer.add` call."""
+
+    previous_size: int
+    size: int
+    source_written: bool
+    capacity_reached: bool
+
+    @property
+    def slots_written(self) -> int:
+        return self.size - self.previous_size
 
 
 def _get_accumulate_timestamp_idxs(
@@ -81,7 +97,9 @@ def _get_accumulate_timestamp_idxs(
 class TimestampAlignedBuffer:
     """Pre-allocated buffer that aligns streaming data to a fixed-dt time grid.
 
-    Data is assigned to discrete slots ``start_time + k*dt``.  The first call to
+    Within one segment, data is assigned to slots ``start_time + k*dt``. The
+    caller may re-anchor the next global index after an intentional unsampled
+    interval; prior slots and timestamps remain unchanged. The first call to
     ``add()`` inspects the data dict to determine shapes and dtypes, then
     pre-allocates numpy arrays of shape ``(max_record_steps,) + value.shape``.
 
@@ -147,14 +165,34 @@ class TimestampAlignedBuffer:
 
     # -- core methods ---------------------------------------------------------
 
-    def add(self, data: dict[str, np.ndarray | float | int], timestamp: float) -> None:
+    def reanchor(self, next_source_timestamp: float) -> None:
+        """Start the next contiguous storage slot at a new wall-time anchor.
+
+        Command-silent pauses intentionally contain no recording samples. A
+        controller generation change therefore re-anchors the remaining grid
+        instead of representing the pause as a run of causal hold-last slots.
+        Existing timestamps are never rewritten.
+        """
+        timestamp = float(next_source_timestamp)
+        if not np.isfinite(timestamp):
+            raise ValueError("re-anchor timestamp must be finite")
+        if self._recording_stopped:
+            raise RuntimeError("cannot re-anchor a full timestamp buffer")
+        if self._size > 0 and self._timestamp_buffer is not None:
+            previous_timestamp = float(self._timestamp_buffer[self._size - 1])
+            if timestamp <= previous_timestamp:
+                raise ValueError("re-anchor timestamp must be newer than the previous stored slot")
+        self.start_time = timestamp - self._next_global_idx * self.dt
+
+    def add(self, data: dict[str, np.ndarray | float | int], timestamp: float) -> BufferAddResult:
         """Add one multi-stream data point at the first causal grid deadline.
 
         On the first call the buffer allocates arrays based on the keys, shapes,
         and dtypes found in *data*.  Subsequent calls must supply the same keys.
         """
+        previous_size = self._size
         if self._recording_stopped:
-            return
+            return BufferAddResult(previous_size, self._size, False, True)
 
         source_index = self._next_source_index
         self._next_source_index += 1
@@ -169,7 +207,7 @@ class TimestampAlignedBuffer:
         self._next_global_idx = next_global_idx
 
         if len(global_idxs) == 0:
-            return
+            return BufferAddResult(previous_size, self._size, False, self._recording_stopped)
 
         source_global_idx = global_idxs[0]
         gap_idxs = list(range(previous_next_idx, source_global_idx))
@@ -182,7 +220,7 @@ class TimestampAlignedBuffer:
             write_idxs = [g for g in write_idxs if g < self.max_record_steps]
             if not write_idxs:
                 self._recording_stopped = True
-                return
+                return BufferAddResult(previous_size, self._size, False, True)
             n_dropped = max_required - self.max_record_steps
             max_required = write_idxs[-1] + 1
             logger.warning(
@@ -241,6 +279,12 @@ class TimestampAlignedBuffer:
                 self._timestamp_buffer[gidx] = self.start_time + gidx * self.dt
 
         self._size = max_required
+        return BufferAddResult(
+            previous_size=previous_size,
+            size=self._size,
+            source_written=source_global_idx < self.max_record_steps,
+            capacity_reached=self._recording_stopped or self._size >= self.max_record_steps,
+        )
 
     # -- internal helpers -----------------------------------------------------
 

@@ -49,17 +49,6 @@ HAND_COMMAND_DTYPE = np.dtype(
     _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
 )
 
-ARM_CONTROL_DTYPE = np.dtype(
-    [
-        ("kind", "<u1"),
-        ("run_generation", "<u8"),
-        ("action_id", "<u8"),
-        ("created_monotonic_ns", "<u8"),
-        ("valid_until_monotonic_ns", "<u8"),
-    ],
-    align=True,
-)
-
 INFERENCE_CANDIDATE_DTYPE = np.dtype(
     [
         ("observation_id", "<u8"),
@@ -208,9 +197,13 @@ RECORD_STATUS_DTYPE = np.dtype(
     [
         ("phase", "<u1"),
         ("saved", "<u1"),
+        ("min_frames_met", "<u1"),
         ("generation", "<u8"),
         ("frame_count", "<u8"),
+        ("failure_count", "<u8"),
         ("updated_monotonic_ns", "<u8"),
+        ("reason_length", "<u4"),
+        ("reason", f"S{RECORD_STOP_REASON_BYTES}"),
         ("error_length", "<u4"),
         ("error", f"S{RECORD_STATUS_TEXT_BYTES}"),
         ("path_length", "<u4"),
@@ -229,6 +222,9 @@ def make_record_sample_dtype(
     return np.dtype(
         [
             ("generation", "<u8"),
+            # Transient control-run identity. RecorderIO uses it to split the
+            # time grid across command-silent pauses; it is not persisted.
+            ("control_run_generation", "<u8"),
             ("sample_sequence", "<u8"),
             ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
             ("arm_qvel", "<f8", ARM_JOINT_SHAPE),
@@ -341,7 +337,6 @@ def make_record_sample_dtype(
 
 __all__ = [
     "ARM_COMMAND_DTYPE",
-    "ARM_CONTROL_DTYPE",
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
     "HAND_COMMAND_DTYPE",

@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "description": "Fixed VR-to-robot transform (FLU\u2192robot frame)",
   "T_vr_to_robot": [
     [
@@ -20,6 +21,10 @@
   "theta_deg": 74.98245735364802,
   "convention": "R_z(-theta) maps VR FLU forward \u2192 robot base +X",
   "ref": "head",
-  "quality": "excellent (\u03c3=0.2\u00b0, max=0.4\u00b0)",
-  "frames": 723
+  "quality": {
+    "grade": "excellent",
+    "std_deg": 0.2,
+    "max_deviation_deg": 0.4,
+    "frames": 723
+  }
 }

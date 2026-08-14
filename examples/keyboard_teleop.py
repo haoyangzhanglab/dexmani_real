@@ -27,10 +27,10 @@ from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.policy.safety import (
     ActionSafetyGateConfig,
+    advance_run_generation,
     planner_action_safety_gate,
     publish_hand_home_and_wait_applied,
     publish_joint_targets,
-    request_arm_decelerated_stop,
 )
 from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
@@ -262,21 +262,14 @@ def _set_fault(shared: SharedStorage, reason: str, *, estop: bool = False) -> No
     transition(shared, SafetyState.FAULT)
 
 
-def _stop_arm_motion(
-    shared: SharedStorage,
-    runtime: ResolvedRuntimeConfig,
-    *,
-    reason: str,
-) -> np.ndarray | None:
-    """Brake in controller State 6 and return its settled measured position."""
-    return request_arm_decelerated_stop(
-        shared,
-        prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
-        apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
-        settle_velocity_rad_s=float(runtime.arm.homing.velocity_convergence_rad_s),
-        reason=f"keyboard-{reason}",
-        heartbeat=False,
-    )
+def _keyboard_command_anchor(
+    planner: XArm7MotionPlanner,
+    measured_qpos: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rebuild joint and Cartesian command baselines from measured feedback."""
+    qpos = np.asarray(measured_qpos, dtype=np.float64).copy()
+    pose = planner.kin.compute_eef_pose_world(qpos)
+    return qpos, pose.p.copy(), pose.q.copy()
 
 
 def _run_control_loop(
@@ -301,10 +294,10 @@ def _run_control_loop(
     workspace = _workspace(runtime)
     dt_s = 1.0 / float(cfg.control_hz)
     current_qpos = np.asarray(state["qpos"], dtype=np.float64)
-    previous_command = current_qpos.copy()
-    pose = planner.kin.compute_eef_pose_world(current_qpos)
-    target_pos = pose.p.copy()
-    target_quat = pose.q.copy()
+    previous_command, target_pos, target_quat = _keyboard_command_anchor(
+        planner,
+        current_qpos,
+    )
 
     recoverable_errors = frozenset(int(code) for code in runtime.arm.recoverable_errors)
     collision_errors = frozenset(
@@ -315,6 +308,7 @@ def _run_control_loop(
     state_failures = 0
     home_key_down = False
     motion_active = False
+    quit_quiesced = False
     previous_active_keys: tuple[str, ...] | None = None
     blocked_keys: tuple[str, ...] | None = None
     frame = 0
@@ -348,6 +342,11 @@ def _run_control_loop(
             _set_fault(shared, issue)
             return False
         quit_requested = keys.is_pressed("q")
+        if quit_requested and not quit_quiesced:
+            # Establish the terminal command-silence boundary before any
+            # remaining feedback/fault classification work in this iteration.
+            advance_run_generation(shared)
+            quit_quiesced = True
         state = read_arm_state_dict(shared)
         feedback_issue: str | None
         if state is None:
@@ -366,11 +365,6 @@ def _run_control_loop(
                 eef_rot6d=state["eef_rot6d"],
             )
         if feedback_issue is not None:
-            if quit_requested:
-                _set_fault(
-                    shared, f"cannot confirm a decelerated quit stop: {feedback_issue}"
-                )
-                return False
             state_failures += 1
             if state_failures >= int(policy.max_consecutive_errors):
                 _set_fault(shared, feedback_issue)
@@ -381,14 +375,9 @@ def _run_control_loop(
         state_failures = 0
         error_code = int(state["error_code"])
         if error_code in recoverable_errors:
-            if quit_requested:
-                _set_fault(
-                    shared,
-                    f"cannot request a decelerated quit stop during arm error C{error_code}",
-                )
-                return False
-            continue
-        if error_code != 0:
+            if not quit_requested:
+                continue
+        elif error_code != 0:
             category = "collision" if error_code in collision_errors else "controller"
             _set_fault(shared, f"arm {category} error C{error_code}")
             return False
@@ -406,9 +395,6 @@ def _run_control_loop(
             planner.set_hand_qpos(np.asarray(hand_state["qpos"], dtype=np.float64))
 
         if quit_requested:
-            if _stop_arm_motion(shared, runtime, reason="quit") is None:
-                _set_fault(shared, "decelerated quit stop did not settle")
-                return False
             if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                 require_transition(shared, SafetyState.ARMED)
             return True
@@ -483,9 +469,10 @@ def _run_control_loop(
                 _set_fault(shared, "fresh arm feedback unavailable after homing")
                 return False
             current_qpos = np.asarray(refreshed["qpos"], dtype=np.float64)
-            previous_command = current_qpos.copy()
-            pose = planner.kin.compute_eef_pose_world(current_qpos)
-            target_pos, target_quat = pose.p.copy(), pose.q.copy()
+            previous_command, target_pos, target_quat = _keyboard_command_anchor(
+                planner,
+                current_qpos,
+            )
             if not home_ok:
                 logger.warning("Return-home request was not executed")
             motion_active = False
@@ -522,17 +509,22 @@ def _run_control_loop(
                 continue
             blocked_keys = None
         # ── Idle: no keys pressed ──────────────────────────────────
-        # Mode 6 is a position servo — the arm naturally converges to the
-        # last commanded endpoint and holds it with full active stiffness.
-        # No explicit stop or resume is needed; just stop publishing.
+        # Mode 6 is a position servo: after publication stops, firmware may
+        # still converge to its last accepted endpoint. No measured-hold,
+        # explicit stop, or explicit resume command is sent here.
         if not moving:
             if motion_active:
+                advance_run_generation(shared)
                 require_transition(shared, SafetyState.ARMED)
                 motion_active = False
                 rate.reset()
-            # Track measured position during idle so the velocity check on
-            # the next motion tick uses a fresh reference.
-            previous_command = current_qpos.copy()
+            # Rebuild both joint and Cartesian baselines continuously.  A new
+            # key press therefore starts from current feedback rather than a
+            # virtual target left behind before command silence.
+            previous_command, target_pos, target_quat = _keyboard_command_anchor(
+                planner,
+                current_qpos,
+            )
             if frame % int(cfg.idle_interval_frames) == 0:
                 elapsed = time.monotonic() - started_s
                 pose = planner.kin.compute_eef_pose_world(current_qpos)

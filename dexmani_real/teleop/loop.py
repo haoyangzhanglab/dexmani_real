@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-import json
 import signal
 import time
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
                                         send_command)
-from dexmani_real.recording.io_process import RecorderClient
+from dexmani_real.recording.io_process import RecorderClient, RecorderPhase
 from dexmani_real.runtime.status import ComponentPhase, FaultCode
 from dexmani_real.shm.shared_storage import (SharedStorage,
                                              publish_component_status)
@@ -31,7 +30,7 @@ from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import (AudioFeedback,
                                                 update_motion_gate)
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.control_state import ControlHold
+from dexmani_real.teleop.control_state import CommandQuiescence
 from dexmani_real.teleop.episode_samples import (_FRAME_IK_FAIL, _FRAME_OK,
                                                  _FRAME_RETARGET_FAIL,
                                                  _FRAME_SAFETY_REJECT,
@@ -54,13 +53,12 @@ from dexmani_real.teleop.recording_session import (
     QuitRecordingDecision, await_quit_recording_decision)
 from dexmani_real.teleop.safety import (_contact_stall_detected,
                                         _do_configured_teleop_home,
-                                        _feedback_after_send,
-                                        _reset_mapper_from_frames,
-                                        _vr_after_send)
+                                        _reset_mapper_from_frames)
 from dexmani_real.teleop.snapshot import (CameraFreshnessTracker,
                                           _read_arm_state, _read_camera_frame,
                                           _read_hand_state, _read_hand_tactile,
                                           _read_vr_frame)
+from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate_manager import RateManager
 from dexmani_real.utils.signal_utils import ema_smooth_pose
@@ -74,15 +72,9 @@ _ARM_FEEDBACK_WARN_INTERVAL_S = 3.0
 
 
 def _load_vr_transform(path: Path) -> tuple[np.ndarray, str]:
-    """Load the required calibrated VR-to-robot rotation."""
-    if not path.is_file():
-        raise FileNotFoundError(f"VR transform config not found: {path}")
-    with path.open(encoding="utf-8") as stream:
-        config = json.load(stream)
-    transform = np.asarray(config["T_vr_to_robot"], dtype=np.float64)
-    if transform.shape != (3, 3) or not np.all(np.isfinite(transform)):
-        raise ValueError("T_vr_to_robot must be a finite 3x3 matrix")
-    return transform, str(config.get("theta_deg", "?"))
+    """Compatibility wrapper around the shared schema-v1 calibration loader."""
+    calibration = load_vr_transform(path)
+    return calibration.transform, f"{calibration.theta_deg:.6g}"
 
 
 def _build_safety_gate(config: TeleopConfig) -> SafetyGate:
@@ -207,12 +199,12 @@ def _hand_feedback_issue_impl(
 
 @dataclass
 class TeleopLoopState:
-    """Mutable per-run state shared between the teleop loop body and its
+    """Mutable per-session state shared between the teleop loop body and its
     extracted module-level helper functions.
 
     The helpers mutate these fields in place (no ``nonlocal``), so the loop
     body and helpers see the same object.  Read-only dependencies (shared,
-    config, gate, planner, mapper, control hold, …) are passed as explicit
+    config, gate, planner, mapper, quiescence, …) are passed as explicit
     parameters instead of being bundled here.
     """
 
@@ -223,9 +215,6 @@ class TeleopLoopState:
     ema_prev_quat: np.ndarray | None = None
     hand_ramp_start: np.ndarray | None = None
     hand_ramp_step: int = 0
-    reanchor_pending_reason: str | None = None
-    recording_paused: bool = False
-    hold_sent_at_s: float | None = None
     sigterm_requested: bool = False
 
 
@@ -273,115 +262,69 @@ def _init_and_seed_hand_retargeter_impl(
     return _seed_hand_retargeter(ctx.hand_retargeter, qpos)
 
 
-def _enter_hand_feedback_pause_impl(
+def _enter_command_quiescence_impl(
     ctx: TeleopLoopState,
     shared: SharedStorage,
-    control_hold: ControlHold,
+    quiescence: CommandQuiescence,
     arm_mapper: ArmWristMapper,
-    issue: str,
-) -> None:
-    """Invalidate pending motion without publishing from unhealthy hand feedback."""
-    run_generation = advance_run_generation(shared)
-    control_hold.pause_without_candidate("hand_feedback")
-    ctx.reanchor_pending_reason = "hand_recovered"
-    ctx.recording_paused = True
-    arm_mapper.clear()
-    ctx.ema_prev_pos = ctx.ema_prev_quat = None
-    ctx.hand_ramp_start = None
-    ctx.hand_ramp_step = 0
-    logger.warning(
-        "teleop_loop: hand feedback pause invalidated run=%d without publishing: %s",
-        run_generation,
-        issue,
-    )
-
-
-def _enter_measured_hold_impl(
-    ctx: TeleopLoopState,
-    shared: SharedStorage,
-    cfg: TeleopConfig,
-    gate: SafetyGate,
-    control_hold: ControlHold,
-    arm_mapper: ArmWristMapper,
-    hand_available: bool,
     reason: str,
-) -> bool:
-    """Invalidate old endpoints and publish one measured arm-only hold."""
-    if control_hold.active:
-        control_hold.relabel(reason)
-        ctx.reanchor_pending_reason = reason
-        if control_hold.candidate is None:
-            logger.error("teleop_loop: cannot enter %s without a measured arm hold candidate", reason)
-            return False
-        return True
+    *,
+    start_new_run: bool = False,
+    replace_existing_reason: bool = False,
+) -> None:
+    """Invalidate pending commands, then remain silent until re-anchored.
 
-    latest_arm = _read_arm_state(shared)
-    latest_arm_issue = _arm_feedback_issue(
-        latest_arm,
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
-    )
-    if latest_arm_issue is not None:
-        logger.error("teleop_loop: cannot enter %s hold: %s", reason, latest_arm_issue)
-        return False
-    assert latest_arm is not None
-    measured_arm = np.asarray(latest_arm["qpos"][0], dtype=np.float64)
-
-    if hand_available:
-        latest_hand = _read_hand_state(shared)
-        latest_hand_issue = _hand_feedback_issue_impl(cfg, latest_hand)
-        if latest_hand_issue is not None:
-            logger.error(
-                "teleop_loop: cannot enter %s hold with unhealthy hand feedback: %s",
-                reason,
-                latest_hand_issue,
+    Repeated observations preserve the existing boundary and do not advance
+    the generation again. Explicit operator transitions may replace the reason
+    while retaining that boundary: C marks a resumable pause, whereas a
+    session-ending signal cancels that eligibility. A distinct BEGIN supersedes
+    the prior pause boundary and always creates a new run generation.
+    """
+    if start_new_run and replace_existing_reason:
+        raise ValueError("BEGIN cannot reuse an existing quiescence boundary")
+    if start_new_run:
+        previous_reason, _entered_ns = quiescence.clear()
+        if previous_reason is not None:
+            logger.info(
+                "teleop_loop: new run supersedes %s command quiescence",
+                previous_reason,
             )
-            return False
-        assert latest_hand is not None
-
-    run_generation = advance_run_generation(shared)
-    candidate = _safe_joint_publish(
-        shared,
-        measured_arm,
-        None,
-        is_hold=True,
-        timeout=cfg.runtime.policy.action_prepare_timeout_s,
-        safety_gate=gate,
+    first_entry = quiescence.enter(
+        reason,
+        entered_monotonic_ns=time.monotonic_ns(),
     )
-    if candidate is None:
-        logger.error("teleop_loop: failed to publish %s hold after advancing to run=%d", reason, run_generation)
-        return False
-
-    control_hold.begin(reason, candidate, deadline_s=time.monotonic() + cfg.runtime.policy.action_apply_timeout_s)
-    ctx.hold_sent_at_s = time.monotonic()
-    ctx.reanchor_pending_reason = reason
-    ctx.prev_qpos_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
+    if first_entry:
+        run_generation = advance_run_generation(shared)
+        logger.info(
+            "teleop_loop: entered %s command quiescence (run=%d)",
+            reason,
+            run_generation,
+        )
+    else:
+        previous_reason = quiescence.reason
+        if replace_existing_reason:
+            quiescence.relabel(reason)
+        logger.debug(
+            "teleop_loop: remaining in %s command quiescence "
+            "(observed %s; prior reason=%s)",
+            quiescence.reason,
+            reason,
+            previous_reason,
+        )
     arm_mapper.clear()
     ctx.ema_prev_pos = ctx.ema_prev_quat = None
     ctx.hand_ramp_start = None
     ctx.hand_ramp_step = 0
-    logger.info(
-        "teleop_loop: %s hold published (run=%d action_id=%d)",
-        reason,
-        run_generation,
-        candidate.action_id,
-    )
-    return True
 
 
-def _handoff_control_hold_to_home_impl(
-    ctx: TeleopLoopState, control_hold: ControlHold
-) -> None:
-    """Stop reviewing a hold that the homing protocol will invalidate."""
-    handoff_state, hold_reason = control_hold.clear()
-    if handoff_state != "idle":
+def _handoff_command_quiescence_to_home_impl(quiescence: CommandQuiescence) -> None:
+    """Let the homing protocol supersede command quiescence."""
+    reason, _entered_ns = quiescence.clear()
+    if reason is not None:
         logger.info(
-            "teleop_loop: homing supersedes %s %s hold candidate",
-            handoff_state,
-            hold_reason,
+            "teleop_loop: homing supersedes %s command quiescence",
+            reason,
         )
-    ctx.reanchor_pending_reason = None
-    ctx.recording_paused = False
 
 
 def _complete_reanchor_impl(
@@ -393,16 +336,22 @@ def _complete_reanchor_impl(
     current_vr_frame: dict[str, Any],
     current_hand_state: np.ndarray | None,
 ) -> bool:
-    """Reset arm/hand temporal state; caller holds the re-anchor grid frame."""
+    """Reset temporal state; the caller suppresses this grid's publication."""
     if not _reset_mapper_from_frames(arm_mapper, current_arm_state, current_vr_frame):
-        validate_warn("teleop_loop: re-anchor inputs invalid — remaining held")
+        validate_warn("teleop_loop: re-anchor inputs invalid — remaining command-silent")
         return False
     ctx.ema_prev_pos = ctx.ema_prev_quat = None
-    if hand_available and current_hand_state is not None and np.all(np.isfinite(current_hand_state["qpos"][0])):
-        ctx.prev_hand_qpos = np.asarray(current_hand_state["qpos"][0], dtype=np.float64).copy()
-    ctx.hand_ramp_start = ctx.prev_hand_qpos.copy() if hand_available else None
+    hand_anchor: np.ndarray | None = None
+    if hand_available:
+        if current_hand_state is not None and np.all(np.isfinite(current_hand_state["qpos"][0])):
+            ctx.prev_hand_qpos = np.asarray(current_hand_state["qpos"][0], dtype=np.float64).copy()
+        if ctx.prev_hand_qpos is None:
+            validate_warn("teleop_loop: hand re-anchor unavailable — remaining command-silent")
+            return False
+        hand_anchor = ctx.prev_hand_qpos.copy()
+    ctx.hand_ramp_start = hand_anchor
     ctx.hand_ramp_step = 0
-    _reset_hand_retargeter(ctx.hand_retargeter, ctx.prev_hand_qpos.copy() if hand_available else None)
+    _reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
     return True
 
 
@@ -600,10 +549,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     recording_active = False
     _begin_audio_gate_deadline_s: float | None = None
     _ignore_begin_audio_until_silent = False
-    _control_hold = ControlHold()
+    _quiescence = CommandQuiescence()
 
     # First Q leaves teleop active for an optional home; the next Q exits.
     quit_pending = False
+    quit_after_recording = False
+    quit_recording_deadline_s = 0.0
     post_teleop_deadline = 0.0
 
 
@@ -626,14 +577,24 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         abort_after_s=cfg.runtime.camera.recording_stall_abort_s,
     )
 
-    def _enter_hand_feedback_pause(issue: str) -> None:
-        _enter_hand_feedback_pause_impl(ctx, shared, _control_hold, arm_mapper, issue)
+    def _enter_command_quiescence(
+        reason: str,
+        *,
+        start_new_run: bool = False,
+        replace_existing_reason: bool = False,
+    ) -> None:
+        _enter_command_quiescence_impl(
+            ctx,
+            shared,
+            _quiescence,
+            arm_mapper,
+            reason,
+            start_new_run=start_new_run,
+            replace_existing_reason=replace_existing_reason,
+        )
 
-    def _enter_measured_hold(reason: str) -> bool:
-        return _enter_measured_hold_impl(ctx, shared, cfg, gate, _control_hold, arm_mapper, hand_available, reason)
-
-    def _handoff_control_hold_to_home() -> None:
-        _handoff_control_hold_to_home_impl(ctx, _control_hold)
+    def _handoff_command_quiescence_to_home() -> None:
+        _handoff_command_quiescence_to_home_impl(_quiescence)
 
     def _complete_reanchor(
         current_arm_state: np.ndarray,
@@ -658,33 +619,48 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         while shared.is_running.value and not ctx.sigterm_requested:
             shared.set_heartbeat("policy", time.monotonic())
             limiter.wait()
-            if _control_hold.application_pending:
-                _hold_result = _control_hold.observe_delivery(
-                    ctx.hold_sent_at_s,
-                    now_s=time.monotonic(),
-                )
-                if _hold_result == "applied":
-                    logger.info(
-                        "teleop_loop: %s hold applied (action_id=%d)",
-                        _control_hold.reason,
-                        _control_hold.candidate.action_id if _control_hold.candidate else 0,
-                    )
-                elif _hold_result == "failed":
-                    logger.error(
-                        "teleop_loop: %s hold delivery timed out",
-                        _control_hold.reason,
-                    )
-                    shared.error_state.value = True
-                    break
 
             if recorder is not None:
                 _stop_result = recorder.poll_stop()
-                if _stop_result.done and _stop_result.path is not None:
+                if (
+                    _stop_result.phase in (RecorderPhase.FINALIZING, RecorderPhase.COMPLETED, RecorderPhase.ERROR)
+                    and _stop_result.reason == "max_frames"
+                    and (teleop_active or recording_active)
+                ):
+                    _enter_command_quiescence(
+                        "max_frames",
+                        replace_existing_reason=True,
+                    )
+                    teleop_active = False
+                    recording_active = False
+                    shared.is_recording.value = False
+                    if not _transition_or_fault(SafetyState.ARMED, "maximum recording duration"):
+                        break
+                    print("  已达到最大录制时长：正在自动保存，遥操作进入静默暂停")
+                    audio.play("pause")
+                if _stop_result.done:
+                    recording_active = False
+                    shared.is_recording.value = False
                     if _stop_result.error:
-                        print(f"  ⚠ 保存失败 ({_stop_result.error}): {_stop_result.path}")
-                    elif _stop_result.success:
+                        path_label = f": {_stop_result.path}" if _stop_result.path else ""
+                        print(f"  ⚠ 录制终结失败 ({_stop_result.error}){path_label}")
+                    elif _stop_result.saved:
                         print(f"  录制已保存: {_stop_result.path}  ({_stop_result.frame_count} 帧)")
+                        if not _stop_result.min_frames_met:
+                            print("  ⚠ 已保存，但未达到配置的最短质量时长")
+                    else:
+                        print(f"  录制已丢弃 ({_stop_result.frame_count} 帧)")
                     gc.collect()
+                    if quit_after_recording:
+                        shared.quit_requested.value = True
+                elif (
+                    _stop_result.phase is RecorderPhase.FINALIZING
+                    and _stop_result.error
+                ):
+                    print(
+                        "  ⚠ 录制终结超过时限；仍在安全回收，"
+                        "本会话将标记为失败"
+                    )
 
             if recorder is not None and recording_active and recorder.camera_writer_error is not None:
                 _writer_error = recorder.camera_writer_error
@@ -707,7 +683,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 for _sig in kb.poll(timeout=0.1):
                     if _sig == ControlSignal.HOME:
                         print("  H: return_home")
-                        _handoff_control_hold_to_home()
+                        _handoff_command_quiescence_to_home()
                         ctx.prev_hand_qpos = _do_configured_teleop_home(
                             shared,
                             cfg,
@@ -723,20 +699,47 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     elif _sig in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
                         if _sig == ControlSignal.EMERGENCY_STOP:
                             shared.estop_request.value = True
-                        elif _control_hold.application_pending:
-                            print("  measured hold is still applying; Q will be accepted after its ACK", flush=True)
-                            continue
                         else:
-                            shared.quit_requested.value = True
-                        break
+                            if recorder is not None and recorder.stop_pending:
+                                if not quit_after_recording:
+                                    quit_after_recording = True
+                                    quit_recording_deadline_s = (
+                                        time.monotonic() + cfg.runtime.policy.quit_save_timeout_s
+                                    )
+                                print("  录制仍在终结；完成后自动退出", flush=True)
+                            else:
+                                shared.quit_requested.value = True
+                                break
 
                 if shared.estop_request.value or shared.quit_requested.value or not shared.is_running.value:
                     break
 
-                if time.perf_counter() > post_teleop_deadline:
-                    print("  timeout — auto exit")
+                if (
+                    quit_after_recording
+                    and recorder is not None
+                    and recorder.stop_pending
+                    and time.monotonic() >= quit_recording_deadline_s
+                ):
+                    print("  录制终结超时 — 退出并将本会话标记为失败")
                     shared.quit_requested.value = True
                     break
+
+                if time.perf_counter() > post_teleop_deadline:
+                    if recorder is not None and recorder.stop_pending:
+                        if not quit_after_recording:
+                            quit_after_recording = True
+                            quit_recording_deadline_s = (
+                                time.monotonic() + cfg.runtime.policy.quit_save_timeout_s
+                            )
+                            print("  timeout — 等待录制终结后自动退出", flush=True)
+                        elif time.monotonic() >= quit_recording_deadline_s:
+                            print("  录制终结超时 — 退出并将本会话标记为失败")
+                            shared.quit_requested.value = True
+                            break
+                    else:
+                        print("  timeout — auto exit")
+                        shared.quit_requested.value = True
+                        break
 
                 continue  # stay in quit_pending, don't process normal teleop
 
@@ -770,9 +773,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 elif sig == ControlSignal.QUIT:
                     print("\nQ: 退出")
                     audio.play("quit")
-                    if teleop_active and not _enter_measured_hold("quit"):
-                        shared.error_state.value = True
-                        break
+                    _enter_command_quiescence(
+                        "quit",
+                        replace_existing_reason=True,
+                    )
                     teleop_active = False
                     if not _transition_or_fault(SafetyState.ARMED, "quit"):
                         break
@@ -788,12 +792,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                             audio.play("save")
                             _stop_recording(recorder, recording_active, save=True, shared=shared)
                             recording_active = False
-                            print("  已保存")
+                            print("  保存请求已提交")
                         elif decision is QuitRecordingDecision.DISCARD:
                             audio.play("discard")
                             _stop_recording(recorder, recording_active, save=False, shared=shared)
                             recording_active = False
-                            print("  已丢弃")
+                            print("  丢弃请求已提交")
                         elif decision is QuitRecordingDecision.ESTOP:
                             audio.play("emergency")
                             _stop_recording(recorder, recording_active, save=False, shared=shared)
@@ -802,12 +806,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                             audio.play("discard")
                             _stop_recording(recorder, recording_active, save=False, shared=shared)
                             recording_active = False
-                            print("  超时，默认丢弃")
+                            print("  超时，默认丢弃请求已提交")
 
                         if decision is QuitRecordingDecision.SAVE_AND_HOME and shared.is_running.value:
                             audio.play("home")
                             ctx.ema_prev_pos = ctx.ema_prev_quat = None
-                            _handoff_control_hold_to_home()
+                            _handoff_command_quiescence_to_home()
                             ctx.prev_hand_qpos = _do_configured_teleop_home(
                                 shared,
                                 cfg,
@@ -841,7 +845,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     if not _transition_or_fault(SafetyState.ARMED, "home"):
                         break
                     ctx.ema_prev_pos = ctx.ema_prev_quat = None
-                    _handoff_control_hold_to_home()
+                    _handoff_command_quiescence_to_home()
                     ctx.prev_hand_qpos = _do_configured_teleop_home(
                         shared,
                         cfg,
@@ -861,9 +865,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     stop_reason = "stop" if save_episode else "discard"
                     print("\nS: 停止录制" if save_episode else "\nD: 丢弃录制")
                     audio.play("save" if save_episode else "discard")
-                    if teleop_active and not _enter_measured_hold(stop_reason):
-                        shared.error_state.value = True
-                        break
+                    _enter_command_quiescence(
+                        stop_reason,
+                        replace_existing_reason=True,
+                    )
                     _stop_recording(recorder, recording_active, save=save_episode, shared=shared)
                     recording_active = False
                     teleop_active = False
@@ -873,14 +878,21 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
                 elif sig == ControlSignal.PAUSE:
                     if teleop_active:
-                        if not _enter_measured_hold("pause"):
-                            shared.error_state.value = True
-                            break
+                        # C is an explicit operator pause. If an automatic gate
+                        # is already silent, retain its freshness boundary but
+                        # make this state resumable by the next C.
+                        _enter_command_quiescence(
+                            "pause",
+                            replace_existing_reason=True,
+                        )
                         teleop_active = False
-                        ctx.recording_paused = True
                         if not _transition_or_fault(SafetyState.ARMED, "pause"):
                             break
                     else:
+                        if not _quiescence.active or _quiescence.reason != "pause":
+                            print("\nC: 没有可恢复的暂停 session — 请按 B 开始新的遥操作 session")
+                            skip_rest = True
+                            continue
                         if shared.safety_state.value != SafetyState.ARMED:
                             print(f"\nC: safety_state={shared.safety_state.value} — must be ARMED to resume")
                             skip_rest = True
@@ -888,7 +900,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         if not _transition_or_fault(SafetyState.RUNNING, "resume"):
                             break
                         teleop_active = True
-                        ctx.reanchor_pending_reason = "resume"
                     state_str = "恢复" if teleop_active else "暂停"
                     print(f"\nC: {state_str}遥操作")
                     if teleop_active:
@@ -948,9 +959,13 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         )
                         recording_active = False
                         break
+                    # BEGIN is a distinct run boundary even when a prior STOP,
+                    # DISCARD, or max-duration stop already invalidated its own
+                    # generation. Require feedback newer than this BEGIN before
+                    # the one-grid re-anchor.
+                    _enter_command_quiescence("begin", start_new_run=True)
                     teleop_active = True
                     publish_component_status(shared, "policy", ComponentPhase.RUNNING)
-                    ctx.recording_paused = False
                     _seeded = _init_and_seed_hand_retargeter()
                     if _seeded is not None:
                         ctx.prev_hand_qpos = _seeded
@@ -959,7 +974,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         0.0, cfg.runtime.policy.begin_motion_gate_timeout_s - ctrl_dt
                     )
                     _ignore_begin_audio_until_silent = False
-                    ctx.reanchor_pending_reason = "begin"
                     print(begin_message)
                     limiter.reset()
                     skip_rest = True
@@ -991,6 +1005,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     cfg.runtime.policy.max_consecutive_errors,
                     arm_issue,
                 )
+                if teleop_active and not _quiescence.active:
+                    _enter_command_quiescence("arm_feedback")
                 if arm_feedback_fault:
                     logger.error("teleop_loop: arm feedback fault: %s", arm_issue)
                     shared.error_state.value = True
@@ -1035,8 +1051,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 if _hand_disconnected_at is None:
                     _hand_disconnected_at = now_s
                     logger.warning("Hand feedback unhealthy — pausing motion: %s", hand_issue)
-                if teleop_active and _control_hold.reason != "hand_feedback":
-                    _enter_hand_feedback_pause(hand_issue)
+                if teleop_active and not _quiescence.active:
+                    _enter_command_quiescence("hand_feedback")
                 unhealthy_duration_s = now_s - _hand_disconnected_at
                 if unhealthy_duration_s >= cfg.runtime.policy.hand_disconnect_timeout_s:
                     logger.error(
@@ -1050,14 +1066,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 unhealthy_duration_s = time.monotonic() - _hand_disconnected_at
                 _hand_disconnected_at = None
                 logger.info(
-                    "Hand feedback recovered after %.1fs — requiring measured hold and re-anchor", unhealthy_duration_s
+                    "Hand feedback recovered after %.1fs — waiting for fresh re-anchor",
+                    unhealthy_duration_s,
                 )
-                if teleop_active:
-                    _control_hold.clear()
-                    if not _enter_measured_hold("hand_recovered"):
-                        shared.error_state.value = True
-                        break
-                    ctx.recording_paused = True
 
             if loop_count % cfg.runtime.policy.status_print_interval == 0:
                 _arm_age = time.monotonic() - float(arm_state["timestamp"][0]) if arm_state is not None else -1.0
@@ -1073,64 +1084,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     arm_state_age_s=_arm_age,
                 )
 
-            if teleop_active and vr_stale and not _control_hold.active:
-                if not _enter_measured_hold("vr_stale"):
-                    shared.error_state.value = True
-                    break
+            if teleop_active and vr_stale and not _quiescence.active:
+                _enter_command_quiescence("vr_stale")
 
-            if not teleop_active or vr_stale or _control_hold.active:
-                # A stale-input/resume release is legal only after the exact
-                # coordinated measured hold reached both enabled SDKs and a
-                # fresh VR frame can be anchored to current measured FK.
-                if (
-                    teleop_active
-                    and not vr_stale
-                    and _control_hold.active
-                    and _control_hold.applied
-                    and _control_hold.candidate is not None
-                    and ctx.hold_sent_at_s is not None
-                    and _vr_after_send(vr_frame, ctx.hold_sent_at_s)
-                    and _feedback_after_send(
-                        arm_state,
-                        hand_state,
-                        _control_hold.candidate,
-                        ctx.hold_sent_at_s,
-                    )
-                ):
-                    assert vr_frame is not None  # _vr_after_send() proved the frame exists
-                    if _complete_reanchor(arm_state, vr_frame, hand_state):
-                        logger.info("teleop_loop: released %s hold after fresh re-anchor", _control_hold.reason)
-                        _control_hold.clear()
-                        ctx.reanchor_pending_reason = None
-                        ctx.recording_paused = False
-                if recording_active and not ctx.recording_paused:
-                    _record_held(
-                        recorder,
-                        arm_state,
-                        ctx.prev_qpos_cmd,
-                        ctx.prev_hand_qpos,
-                        vr_frame,
-                        cam,
-                        hand_state=hand_state,
-                        hand_tactile=hand_tactile,
-                        arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
-                        target_eef_pos=_last_target_eef_pos,
-                        target_eef_rot6d=_last_target_eef_rot6d,
-                        hand_fk=_hand_fk,
-                        T_eef_handbase_pos=_T_eef_handbase_pos,
-                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
-                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-                        shared=shared,
-                        action_candidate=_control_hold.take_record_candidate(),
-                    )
-                ctx.prev_qpos_cmd = arm_qpos.copy()
-                ctx.ema_prev_pos = ctx.ema_prev_quat = None
-                continue
-
-            # Hold during state-transition voice prompts.  The begin cue is
-            # special: it may block motion only for a bounded interval, then it
-            # continues playing in the background.  Other safety/state cues keep
-            # their existing full-duration gate.
+            # State-transition audio gates motion by invalidating old commands
+            # once and publishing nothing until the cue has released.
             _audio_playing = audio.is_playing
             _hold_for_audio, _begin_audio_gate_deadline_s, _ignore_begin_audio_until_silent = update_motion_gate(
                 audio_playing=_audio_playing,
@@ -1138,33 +1096,46 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 ignore_begin_until_silent=_ignore_begin_audio_until_silent,
                 now_s=time.monotonic(),
             )
-            if _hold_for_audio:
-                ctx.prev_qpos_cmd = arm_qpos.copy()
-                # Refresh ctx.prev_hand_qpos from current hardware state so
-                # the hand ramp starts from the actual joint position.
-                if hand_available and hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
-                    ctx.prev_hand_qpos = hand_state["qpos"][0].copy()
-                if ctx.reanchor_pending_reason is None:
-                    ctx.reanchor_pending_reason = "audio_gate"
-                continue
+            if teleop_active and _hold_for_audio and not _quiescence.active:
+                _enter_command_quiescence("audio_gate")
 
-            if ctx.reanchor_pending_reason is not None:
-                # This flag is set directly by begin/resume/stale state changes;
-                # audio is only an optional UX gate and cannot suppress reset.
-                if vr_frame is None or not _complete_reanchor(arm_state, vr_frame, hand_state):
-                    ctx.prev_qpos_cmd = arm_qpos.copy()
-                    ctx.ema_prev_pos = ctx.ema_prev_quat = None
-                    continue
-                logger.info("teleop_loop: completed %s re-anchor", ctx.reanchor_pending_reason)
-                ctx.reanchor_pending_reason = None
-                ctx.recording_paused = False
-                # Keep the re-anchor grid frame held.  Active mapping resumes
-                # on the next configured grid slot from a zero reset-relative delta.
+            if not teleop_active or vr_stale or _quiescence.active:
+                # Resumption requires source feedback newer than the original
+                # quiescence boundary.  This grid only re-anchors; command
+                # publication starts on the following grid.
+                if (
+                    teleop_active
+                    and not vr_stale
+                    and not _hold_for_audio
+                    and _quiescence.active
+                    and vr_frame is not None
+                    and (not hand_available or hand_state is not None)
+                    and (not hand_available or hand_issue is None)
+                    and _quiescence.feedback_is_newer(
+                        arm_source_monotonic_ns=int(arm_state["source_monotonic_ns"][0]),
+                        vr_receive_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                        hand_source_monotonic_ns=(
+                            int(hand_state["source_monotonic_ns"][0])
+                            if hand_available and hand_state is not None
+                            else None
+                        ),
+                    )
+                ):
+                    if _complete_reanchor(arm_state, vr_frame, hand_state):
+                        quiescence_reason = _quiescence.reason
+                        _quiescence.clear()
+                        logger.info(
+                            "teleop_loop: released %s command quiescence after fresh re-anchor",
+                            quiescence_reason,
+                        )
+                # Track measured arm position while silent.  This updates only
+                # the local command baseline; it does not publish a hold target.
                 ctx.prev_qpos_cmd = arm_qpos.copy()
+                ctx.ema_prev_pos = ctx.ema_prev_quat = None
                 continue
 
             if vr_frame is None:
-                logger.warning("teleop_loop: vr_frame is None after vr_stale check — holding")
+                logger.warning("teleop_loop: vr_frame is None after vr_stale check — suppressing publication")
                 if recording_active:
                     _record_held(
                         recorder,
@@ -1341,8 +1312,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             hand_retarget_time_ms = (time.perf_counter() - _hand_retarget_t0) * 1000.0
             hand_cmd_raw = _get_raw_hand_command(ctx.hand_retargeter, hand_cmd, retarget_ok)
             # Rate-independent smoothstep ramp from the measured pose captured
-            # at hold exit.  The last configured frame reaches the live target
-            # exactly, avoiding an extra one-frame tail.
+            # when command quiescence ends. The last configured frame reaches
+            # the live target exactly, avoiding an extra one-frame tail.
             if ctx.hand_ramp_start is not None and ctx.hand_ramp_step < _hand_ramp_total_frames:
                 hand_cmd = _smoothstep_hand_ramp(
                     ctx.hand_ramp_start,
@@ -1586,9 +1557,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     finally:
         if recording_active:
             _stop_recording(recorder, True, save=False, shared=shared, reason="policy_shutdown")
-        if recorder is not None:
-            if not recorder.join_stop(timeout=cfg.runtime.policy.quit_save_timeout_s):
-                logger.error("teleop recorder did not finish before policy shutdown")
+        # RecorderIO owns the asynchronous transaction and keeps its own
+        # heartbeat alive. Policy shutdown must not block on HDF5/codec I/O.
         kb.stop()
         audio.play("end")
         time.sleep(_END_AUDIO_GRACE_S)

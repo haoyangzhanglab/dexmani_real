@@ -62,7 +62,6 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 ```text
 camera ────────┐
 VR ────────────┼──► teleop / policy ──► arm endpoint/HOME queue ──► arm worker
-                           │              └──► priority STOP/RESUME ring ───┘
 arm state ─────┤          │
 hand state ────┤          └────────────► hand ring ──► hand worker
                │
@@ -73,9 +72,8 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 
 | 通道 | 语义 | 关键约束 |
 |---|---|---|
-| 臂动作队列 | 有序、短队列的未来关节目标 | `maxsize=2` 的反压是有意设计 |
-| 臂控制环 | 松键 STOP 与显式 RESUME | 固定 dtype、latest-wins，worker 优先于端点队列读取 |
-| 手动作环 | 最新目标覆盖旧目标 | latest-wins，避免手部控制滞后 |
+| 臂动作队列 | 有序、短队列的未来关节目标 | `maxsize=2` 的反压是有意设计；worker 丢弃非当前 generation 的待消费 endpoint |
+| 手动作环 | 最新目标覆盖旧目标 | latest-wins，避免手部控制滞后；worker 同样复核 generation 与有效期 |
 | 状态环 | 相机、VR、臂、手的共享快照 | seqlock 验证读，跨进程不传可变对象图 |
 | 录制采样环 | 对齐后的机器人、动作与传感器样本 | 固定为 `1 / control_hz` 网格，不以到达时间采样 |
 
@@ -84,11 +82,49 @@ teleop / policy ──► fixed-grid sample ring ──► RecorderIO ──► 
 | 使用场景 | 入口 | 主要调用链 |
 |---|---|---|
 | VR 采集 | `examples/collect_teleop.py` | `teleop/loop.py` → `planning/`、`robot/`、`recording/`（实验生命周期自包含在 examples 中）|
-| 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → State-6 松键刹停 / 实测位姿显式恢复协议 → 安全动作协议 |
+| 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 松键推进 generation / 命令静默 / 实测位姿重锚 → 安全动作协议 |
 | 实验性学习策略 | `examples/deploy_policy.py` | 自包含入口 → `inference_process.py` → `learned_coordinator.py`（部署生命周期自包含在 examples 中）|
-| Episode 回放 | `examples/replay_episode.py` | — | Self-contained script; dry-run by default; `--live` reruns dense preflight |
+| Episode 回放 | `examples/replay_episode.py` | 自包含脚本；默认 dry-run；`--live` 会重新执行密集预检 |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | `examples/visualize_episode.py` | Rerun 3D episode 可视化；`python examples/visualize_episode.py <episode>` |
+
+### 普通暂停的物理语义
+
+`collect_teleop` 的 C/S/D/Q、VR stale、手反馈异常和音频门控，以及键盘松键，采用同一条命令静默边界：
+
+```text
+推进 run_generation → 停止发布 arm/hand action
+→ worker 丢弃仍在 IPC 中的旧 generation 命令
+→ xArm Mode 6 完成最后一个已经接受的 endpoint
+→ 恢复前从新鲜实测反馈重锚
+```
+
+这不是急停，也不会调用 State 6 或发布“实测位置 hold”。generation 无法撤回已经被固件接受的
+endpoint。VR 恢复要求 arm、VR 和启用时的 hand 反馈严格晚于暂停边界，首个控制网格只重锚，下一网格
+才允许发布。C 只能恢复由 C 建立的暂停；S/D 和最大时长结束后的下一轮必须按 B。每次 B 都另开一个
+`run_generation`，替换旧暂停边界，并同样要求 B 之后的新鲜反馈完成首格重锚。若 S/D/时长触顶在
+C 暂停期间到达，它们不会重复推进 generation，但会立即取消 C 恢复资格。键盘空闲时持续用实测
+关节和 FK 更新基准。在自动门控已经静默时按 C，只把同一边界转为可 C 恢复的用户暂停，
+不二次推进 generation。State 4 只用于启动时的 DISARMED、FAULT、
+紧停后备、全局停止或故障打断的回零路径，以及最终验证式退出。
+
+`is_hold` endpoint 并未从整个系统删除：IK/映射/工作空间拒绝、接触 stall 等运行期安全回退仍可显式
+保持既有安全目标，C24 也保留一次控制器错误专用的 fresh measured-hold 恢复。这些分支不属于普通暂停。
+
+### 录制事务与时间语义
+
+命令静默期间不产生 action sample。恢复后的首个样本携带新的瞬态 `control_run_generation`，RecorderIO
+把下一个存储槽重锚到该样本的真实时间：episode 时间戳保留暂停造成的 wall-time 跳变，但不会把暂停补成
+虚假的 hold-last action。相同 generation 内真正错过的控制 deadline 仍按因果 hold-last 补齐。
+
+RecorderIO 以非阻塞 `FINALIZING` 状态完成编码、HDF5 校验、fsync 和原子发布，并在此期间持续 heartbeat。
+STOP 未得到终态前禁止新的 START。达到 `max_record_duration_s` 时自动保存、推进 generation 并进入
+`ARMED` 命令静默；用户需按 B 开始新的 session。只有终态确认后 UI 才显示“已保存”。录像错误不触发
+机器人 `FAULT`，但会累计会话失败并使采集 CLI 非零退出。终结超时只标记会话失败：后台线程真实结束前
+仍保持 `FINALIZING`，不会提前释放下一个 START。
+
+`min_record_duration_s` 是质量标签而非发布硬门槛：短 episode 可保持 v16 内部有效，但
+`min_frames_met=False`，回放和可视化会警告，由训练/分析入口显式过滤。
 
 ## 从入口到核心模块
 
@@ -155,9 +191,9 @@ python -m compileall -q dexmani_real examples
 
 | 文件 | 作用 |
 |---|---|
-| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；机械臂 STOP/RESUME 使用不与两槽端点队列争用容量的高优先级固定 dtype 环；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/inference_process.py` | 隔离推理 worker，加载 adapter，编解码单个当前 tick 候选动作，并验证模型输出是否满足策略契约。 |
-| `policy/learned_coordinator.py` | 以单一时钟协调 observation、当前 tick 推理结果、动作执行和退出前 hold 的学习策略控制环。 |
+| `policy/learned_coordinator.py` | 以单一时钟协调 observation、当前 tick 推理结果、动作执行和命令静默暂停的学习策略控制环。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
 | `policy/observation.py` | 构建不可变、因果一致的 observation 快照，防止推理读取到混合时刻的数据。 |
 | `policy/observation_sources.py` | 将共享状态环字段映射为策略观测来源，并校验容量、dtype、形状与帧有效性。 |
@@ -168,7 +204,7 @@ python -m compileall -q dexmani_real examples
 学习策略部署中，adapter 每次只向共享 mailbox 写入一个当前 tick 候选。协调器仅接受与
 当前 `run_generation` 及其 observation 一致且未过期的最新候选，随后才分配 action ID、执行
 SafetyGate 校验并发布。开始、暂停、回零、反馈故障和相机重新预热都会推进该 generation；
-模型原生 action chunk 必须在 adapter 内部收敛。候选的 `valid_until_monotonic_ns` 负责新鲜度，
+暂停期间不发布替代 endpoint；模型原生 action chunk 必须在 adapter 内部收敛。候选的 `valid_until_monotonic_ns` 负责新鲜度，
 实际 worker target 由发布边界生成。
 
 ### `recording/` — Episode 持久化与离线分析
@@ -177,10 +213,10 @@ SafetyGate 校验并发布。开始、暂停、回零、反馈故障和相机重
 |---|---|
 | `recording/__init__.py` | 导出 episode 读写器、时间信息和停止结果的公共接口。 |
 | `recording/camera_stream_writer.py` | 在独立写线程中编码并写入相机流，隔离视频 I/O 以免阻塞控制环。 |
-| `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并提供时间/有效性视图。 |
+| `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并分别提供内部有效性与最短时长质量视图。 |
 | `recording/episode_recorder.py` | 管理单个 episode 的 HDF5 数据集、相机写入器、停止校验与最终发布。 |
-| `recording/io_process.py` | `RecorderIO` worker 及其客户端协议；以固定 start/stop 与样本 dtype 消费对齐环，再驱动记录器。 |
-| `recording/timestamp_buffer.py` | 按目标时间戳插值、前向填充和标记缺口原因，保证采样网格对齐。 |
+| `recording/io_process.py` | `RecorderIO` 非阻塞事务 worker 及其客户端协议；固定 dtype 携带 generation、FINALIZING/终态和会话失败结果。 |
+| `recording/timestamp_buffer.py` | 对同一控制段按 deadline 因果补帧，并在命令静默后的新 generation 上重锚时间网格。 |
 | `recording/transaction.py` | 目录 fsync 和原子发布工具，避免半成品 episode 被当作完成数据。 |
 | `recording/video_codec.py` | 基于 PyAV 的视频编码器/解码器及其配置，服务 HDF5 旁路视频流。 |
 
@@ -193,7 +229,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `robot/__init__.py` | 标识 xArm7、XHand 驱动和执行 worker 所在包。 |
-| `robot/arm_loop.py` | xArm Mode 6 伺服 worker：读取有序臂命令、执行带 ACK 的 State 6 减速停止（兼容固件上报 State 5/6）、发布 FK 状态，并处理 C24 恢复与碰撞故障；成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
+| `robot/arm_loop.py` | xArm Mode 6 伺服 worker：按 generation 读取有序臂命令、发布 FK 状态，并处理 C24 恢复与碰撞故障；DISARMED、FAULT、紧停后备与退出确认 State 4，成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
 | `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、复核命令/机械限位、发布关节/触觉反馈与最后成功 action ID；不以目标—反馈不收敛判定故障。 |
 | `robot/homing.py` | 执行并验证机械臂回零，包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
@@ -237,8 +273,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/arm_mapper.py` | 将 VR 手腕位姿映射为受工作空间、旋转增量和四元数校验约束的臂末端目标。 |
 | `teleop/audio_feedback.py` | 管理按键/运动门控下的音频提示播放与节流。 |
 | `teleop/config.py` | 遥操作配置薄视图：仅持有 `runtime` 快照引用与 4 个会话专属字段（task_label/operator/hand_urdf_path/vr_transform_path），运行时值统一经 `config.runtime.<section>.<field>` 直读。 |
-| `teleop/control_state.py` | 表示控制 hold 与回零交接状态，统一记录控制环暂停原因。 |
-| `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop/held 样本。 |
+| `teleop/control_state.py` | 表示 command quiescence 与回零交接状态，记录首次暂停原因和反馈新鲜度边界。 |
+| `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop 与主动安全回退的 held 样本；命令静默期间不补造样本。 |
 | `teleop/hand_control.py` | 对畸形重定向输出做 shape/finite 快速失败，并强制执行关节限位与命令间增量校验（控制器侧优雅 hold 边界）；区别于 SafetyGate 的粘滞 fault 与 worker/SDK 的跨进程丢弃。 |
 | `teleop/hand_retarget.py` | 校验手部 landmarks，并提供启发式 XHand 和 TAG 优化两类手部重定向器。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
@@ -273,8 +309,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 |---|---|---|
 | `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
 | `examples/deploy_policy.py` | — | 实验性学习策略入口；部署生命周期自包含；需要外部 adapter/spec/模型并会进入真实执行器控制链。 |
-| `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键会使旧 generation 失效，并请求固件 State 6 减速停止，待 worker ACK 和连续两帧低速反馈后用实测位置重建参考，不发布可能导致反向回弹的滞后 hold 终点；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
-| `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检。 |
+| `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键推进 generation 后停止发布，控制器自然完成最后一个已接受 endpoint，空闲期间持续从实测关节/FK 重建命令基准；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
+| `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检，退出时推进 generation 并停止发布。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
@@ -289,9 +325,10 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 
 | `dexmani_real/config/cameras.json` | 物理相机序列号、类型和外参，是运行时校验的一部分。 |
 | `dexmani_real/config/desk_plane.json` | 点云过滤、在线动作安全与回零路径共同使用的桌面平面标定数据。 |
-| `dexmani_real/config/vr_transform.json` | VR 朝向标定得到的坐标变换运行数据。 |
+| `dexmani_real/config/vr_transform.json` | schema-v1 VR 朝向标定；启动前校验 SO(3)、坐标约定与机器可读质量，POOR 质量拒绝运行。 |
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
 | `CLAUDE.md` | 更详细的架构、运行流程、安全/碰撞、录制 schema 与运维背景。 |
 | `AGENTS.md` | 面向代码修改者的仓库约定、硬件安全边界和跨模块变更检查清单。 |
+| `docs/collect_teleop审查记录.md` | `examples/collect_teleop.py` 上下游的 fact-check 基线，记录已确认问题、触发条件、根因、术语和修复验收条件。 |
 
 对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的“Cross-module change checklist”，再沿本 README 的关键路径追踪所有生产者和消费者。

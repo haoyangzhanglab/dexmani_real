@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum
 
 import numpy as np
 
@@ -31,43 +30,6 @@ def _validate_field_shapes(
             raise ValueError(
                 f"{cls_name}.{field_name} shape mismatch: expected {expected_shape}, got {arr.shape}"
             )
-
-
-class ArmControlKind(IntEnum):
-    """Non-endpoint commands carried by the priority arm control ring."""
-
-    DECELERATED_STOP = 1
-    RESUME = 2
-
-
-@dataclass(frozen=True)
-class ArmControlRequest:
-    """Documentation model for one fixed-dtype arm control request."""
-
-    kind: ArmControlKind
-    run_generation: int
-    action_id: int
-    created_monotonic_ns: int
-    valid_until_monotonic_ns: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.kind, ArmControlKind):
-            raise ValueError("ArmControlRequest.kind must be an ArmControlKind")
-        integer_fields = (
-            self.run_generation,
-            self.action_id,
-            self.created_monotonic_ns,
-            self.valid_until_monotonic_ns,
-        )
-        if any(
-            not isinstance(value, (int, np.integer)) or int(value) <= 0
-            for value in integer_fields
-        ):
-            raise ValueError(
-                "ArmControlRequest metadata must contain positive integers"
-            )
-        if self.valid_until_monotonic_ns <= self.created_monotonic_ns:
-            raise ValueError("ArmControlRequest validity must end after creation")
 
 
 @dataclass
@@ -123,9 +85,9 @@ class RobotState:
     arm_last_cmd_queue_latency_s: float = 0.0  # producer -> arm queue receive
     arm_last_cmd_apply_latency_s: float = 0.0  # producer -> successful SDK return
     arm_last_cmd_sdk_duration_s: float = 0.0  # duration of set_servo_angle()
-    arm_last_cmd_is_hold: bool = (
-        False  # fixed hold or STOP/RESUME control, not a motion endpoint
-    )
+    # Safety/IK fallback endpoint marker; ordinary command quiescence publishes
+    # no endpoint.
+    arm_last_cmd_is_hold: bool = False
 
     def __post_init__(self):
         _validate_field_shapes(

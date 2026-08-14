@@ -33,7 +33,7 @@ class CoordinatorTick(Enum):
     IDLE = "idle"
     SNAPSHOT = "snapshot"
     PUBLISHED = "published"
-    HELD = "held"
+    QUIESCENT = "quiescent"
     REJECTED = "rejected"
     REWARMING = "rewarming"
 
@@ -64,16 +64,16 @@ class LearnedCoordinatorConfig:
             raise ValueError("hand actions require live hand feedback")
 
 
-def _hold_before_quit(shared: Any, coordinator: "LearnedPolicyCoordinator") -> bool:
-    """Invalidate pending motion and publish a measured hold before a RUNNING quit."""
+def _quiesce_before_quit(shared: Any, coordinator: "LearnedPolicyCoordinator") -> bool:
+    """Invalidate pending motion and stop publishing before a RUNNING quit."""
     from dexmani_real.robot.safety import SafetyState, transition
 
     if int(shared.safety_state.value) != int(SafetyState.RUNNING):
         shared.quit_requested.value = True
         return False
-    coordinator.hold()
+    coordinator.quiesce()
     if not transition(shared, SafetyState.ARMED):
-        raise RuntimeError("could not enter ARMED after publishing the quit hold")
+        raise RuntimeError("could not enter ARMED after command quiescence")
     shared.quit_requested.value = True
     return True
 
@@ -204,7 +204,7 @@ def learned_policy_loop(
                     shared.estop_request.value = True
                     break
                 if control is ControlSignal.QUIT:
-                    if _hold_before_quit(shared, coordinator):
+                    if _quiesce_before_quit(shared, coordinator):
                         publish_component_status(shared, "policy", ComponentPhase.READY)
                     stop_requested = True
                     break
@@ -218,10 +218,12 @@ def learned_policy_loop(
                     coordinator.begin_new_run()
                     if transition(shared, SafetyState.RUNNING):
                         publish_component_status(shared, "policy", ComponentPhase.RUNNING)
-                elif control in {ControlSignal.PAUSE, ControlSignal.STOP, ControlSignal.DISCARD} and (
-                    shared.safety_state.value == int(SafetyState.RUNNING)
-                ):
-                    coordinator.hold()
+                elif control in {
+                    ControlSignal.PAUSE,
+                    ControlSignal.STOP,
+                    ControlSignal.DISCARD,
+                } and (shared.safety_state.value == int(SafetyState.RUNNING)):
+                    coordinator.quiesce()
                     if transition(shared, SafetyState.ARMED):
                         publish_component_status(shared, "policy", ComponentPhase.READY)
 
@@ -301,8 +303,8 @@ class LearnedPolicyCoordinator:
         self._last_candidate_sequence = 0
         self._last_candidate_ns = time.monotonic_ns()
         self._last_camera_generation: int | None = None
-        self._hold_after_timeout = False
-        self._hold_published = False
+        self._quiescence_after_timeout = False
+        self._quiescent = False
         self._last_hand_qpos_cmd: np.ndarray | None = None
         self._rewarm_pending = False
         self._rewarm_triggered = False
@@ -341,7 +343,7 @@ class LearnedPolicyCoordinator:
             snapshot = replace(snapshot, run_generation=run_generation)
             self._snapshots[snapshot.observation_id] = snapshot
             if current_safety in (SafetyState.ARMED, SafetyState.RUNNING):
-                self.hold(now_monotonic_ns=now_ns, invalidate_run=False)
+                self.quiesce(now_monotonic_ns=now_ns, invalidate_run=False)
             if current_safety is SafetyState.RUNNING and not transition(self.shared, SafetyState.ARMED):
                 raise RuntimeError("camera restart could not place policy in ARMED")
             self.shared.clear_ready("inference")
@@ -378,14 +380,12 @@ class LearnedPolicyCoordinator:
         if raw.run_generation != active_run_generation or snapshot.run_generation != active_run_generation:
             return None
         if now_ns - snapshot.anchor_monotonic_ns > int(self.inference.action.deadline_s * 1e9):
-            self._hold_after_timeout = True
+            self._quiescence_after_timeout = True
             return None
         if not self.config.hand_enabled and raw.hand_qpos is not None:
             raise ValueError("backend produced a hand action while the hand capability is disabled")
         candidate = replace(raw, action_id=self._allocate_action_id())
         self._last_candidate_ns = now_ns
-        self._hold_after_timeout = False
-        self._hold_published = False
         return candidate
 
     def _current_joints(self) -> tuple[np.ndarray, np.ndarray]:
@@ -439,8 +439,8 @@ class LearnedPolicyCoordinator:
         """Invalidate pending actions before surfacing unusable measured geometry."""
         run_generation = advance_run_generation(self.shared)
         self._last_candidate_sequence = int(self.shared.inference_candidate_ring.latest_sequence)
-        self._hold_after_timeout = False
-        self._hold_published = False
+        self._quiescence_after_timeout = False
+        self._quiescent = True
         raise RuntimeError(f"{reason}; invalidated run generation {run_generation}")
 
     def _publish_candidate(self, candidate: ActionCandidate, *, now_ns: int) -> CoordinatorTick:
@@ -462,34 +462,11 @@ class LearnedPolicyCoordinator:
             return CoordinatorTick.REJECTED
         if not send_command(self.shared, result.candidate, prepare_timeout_s=self.config.prepare_timeout_s):
             raise TimeoutError("learned action publish failed")
+        self._quiescence_after_timeout = False
+        self._quiescent = False
         if result.candidate.hand_qpos is not None:
             self._last_hand_qpos_cmd = np.asarray(result.candidate.hand_qpos, dtype=np.float64).copy()
         return CoordinatorTick.PUBLISHED
-
-    def _publish_coordinated_hold(self, *, now_ns: int) -> None:
-        if self._hold_published or not self._snapshots:
-            return
-        snapshot = self._snapshots[max(self._snapshots)]
-        current_arm, _current_hand = self._current_joints()
-        action_id = self._allocate_action_id()
-        hold = ActionCandidate(
-            observation_id=snapshot.observation_id,
-            run_generation=int(self.shared.run_generation.value),
-            action_id=action_id,
-            created_monotonic_ns=now_ns,
-            target_monotonic_ns=now_ns + int(float(self.shared.action_lead_time_s) * 1e9),
-            valid_until_monotonic_ns=(
-                now_ns + int((float(self.shared.action_lead_time_s) + self.inference.action.dt_s) * 1e9)
-            ),
-            arm_qpos=current_arm,
-            # The latest-wins hand command remains active. Never republish
-            # measured feedback as a target during a coordinated hold.
-            hand_qpos=None,
-            is_hold=True,
-        )
-        if self._publish_candidate(hold, now_ns=now_ns) is not CoordinatorTick.PUBLISHED:
-            raise RuntimeError("coordinated hold was rejected")
-        self._hold_published = True
 
     def begin_new_run(self, *, now_monotonic_ns: int | None = None) -> int:
         """Drop old proposals before an explicit ARMED→RUNNING transition."""
@@ -497,21 +474,37 @@ class LearnedPolicyCoordinator:
         run_generation = advance_run_generation(self.shared)
         self._last_candidate_sequence = int(self.shared.inference_candidate_ring.latest_sequence)
         self._last_candidate_ns = now_ns
-        self._hold_after_timeout = False
-        self._hold_published = False
+        self._quiescence_after_timeout = False
+        self._quiescent = False
         return run_generation
 
-    def hold(self, *, now_monotonic_ns: int | None = None, invalidate_run: bool = True) -> None:
-        """Invalidate pending actions, then publish a fresh measured arm-only hold."""
+    def quiesce(
+        self,
+        *,
+        now_monotonic_ns: int | None = None,
+        invalidate_run: bool = True,
+    ) -> int:
+        """Invalidate pending actions once without changing controller state.
+
+        Repeated calls are idempotent for ``run_generation``.  Publication can
+        resume only from a candidate tagged with the active generation.
+        """
         now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+        if self._quiescent:
+            return int(self.shared.run_generation.value)
         if invalidate_run:
-            self.begin_new_run(now_monotonic_ns=now_ns)
+            run_generation = self.begin_new_run(now_monotonic_ns=now_ns)
         else:
+            run_generation = int(self.shared.run_generation.value)
             self._last_candidate_sequence = int(self.shared.inference_candidate_ring.latest_sequence)
             self._last_candidate_ns = now_ns
-            self._hold_after_timeout = False
-            self._hold_published = False
-        self._publish_coordinated_hold(now_ns=now_ns)
+            self._quiescence_after_timeout = False
+        self._quiescent = True
+        logger.info(
+            "learned coordinator entered command quiescence (run=%d)",
+            run_generation,
+        )
+        return run_generation
 
     def tick(self, *, now_monotonic_ns: int | None = None) -> CoordinatorTick:
         """Run one non-blocking coordinator iteration."""
@@ -524,13 +517,15 @@ class LearnedPolicyCoordinator:
         if candidate is not None:
             result = self._publish_candidate(candidate, now_ns=now_ns)
             if result is CoordinatorTick.REJECTED:
-                self.hold(now_monotonic_ns=now_ns)
-                self._hold_after_timeout = True
-                return CoordinatorTick.HELD
+                self.quiesce(now_monotonic_ns=now_ns)
+                self._quiescence_after_timeout = True
+                return CoordinatorTick.QUIESCENT
             return result
-        if self._hold_after_timeout or now_ns - self._last_candidate_ns > int(self.config.candidate_timeout_s * 1e9):
-            if not self._hold_published:
-                self.hold(now_monotonic_ns=now_ns)
-            self._hold_after_timeout = True
-            return CoordinatorTick.HELD
+        if self._quiescence_after_timeout or now_ns - self._last_candidate_ns > int(
+            self.config.candidate_timeout_s * 1e9
+        ):
+            if not self._quiescent:
+                self.quiesce(now_monotonic_ns=now_ns)
+            self._quiescence_after_timeout = True
+            return CoordinatorTick.QUIESCENT
         return CoordinatorTick.SNAPSHOT if snapshot is not None else CoordinatorTick.IDLE

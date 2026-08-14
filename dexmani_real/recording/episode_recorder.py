@@ -144,7 +144,7 @@ class EpisodeRecorder:
         # dropped frames leave no causal hold-last gap.
         self._skip_initial_frames: int = 0
         self._skipped_so_far: int = 0
-        self._grid_anchored: bool = False
+        self._last_control_run_generation: int | None = None
 
         # Pending async stop_episode thread (None = no pending stop).
         # Guarded by start_episode() to prevent overlapping episodes.
@@ -247,7 +247,7 @@ class EpisodeRecorder:
         # Skip-initial-frames gate — clamp below max_frames so we never drop all.
         self._skip_initial_frames = max(0, min(int(skip_initial_frames), self.max_frames - 1))
         self._skipped_so_far = 0
-        self._grid_anchored = False
+        self._last_control_run_generation = None
 
         # Store metadata for deferred write (HDF5 is created lazily).
         self._pending_meta = {
@@ -265,11 +265,10 @@ class EpisodeRecorder:
         # Defer data.h5 creation to the first periodic flush / stop_episode();
         # start the record-time aligned buffer for non-camera streams.
         dt = 1.0 / self.control_hz
-        buffer_steps = self.max_frames + 100  # margin for grid-boundary alignment
         self._buffer = TimestampAlignedBuffer(
             start_time=self._start_time,
             dt=dt,
-            max_record_steps=buffer_steps,
+            max_record_steps=self.max_frames,
             # Only tolerate floating-point representations of an exact grid
             # boundary. Scheduling jitter after a deadline must move the source
             # to the next slot; rounding it backward would violate causality.
@@ -366,6 +365,7 @@ class EpisodeRecorder:
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
         diagnostics: dict[str, Any] | None = None,
+        control_run_generation: int = 0,
     ) -> bool:
         if not self._recording or self._buffer is None:
             return False
@@ -382,19 +382,18 @@ class EpisodeRecorder:
             self._skipped_so_far += 1
             return False
 
-        # Re-anchor the aligned grid to the first accepted frame so the dropped
-        # frames leave no causal hold-last gap (the buffer starts at start_time).
-        if not self._grid_anchored:
-            ts0 = float(state.timestamp)
-            if np.isfinite(ts0):
-                self._buffer.start_time = ts0
-                self._buffer._next_global_idx = 0
-            self._grid_anchored = True
-
         # ── Non-camera streams → record-time aligned buffer ──
         sig = signals or {}
 
         ts = float(state.timestamp)
+        run_generation = int(control_run_generation)
+        if run_generation < 0:
+            raise ValueError("control_run_generation must be non-negative")
+        # The first accepted source and every command-quiescence boundary start
+        # a new wall-time segment. Storage remains contiguous, while the real
+        # pause is retained as a timestamp jump instead of synthetic actions.
+        if self._last_control_run_generation is None or run_generation != self._last_control_run_generation:
+            self._buffer.reanchor(ts)
 
         camera_health = int(camera_frame.get("camera_health", 1)) if camera_frame is not None else 1
         camera_fresh = bool(camera_frame.get("camera_fresh", False)) if camera_frame is not None else False
@@ -550,15 +549,13 @@ class EpisodeRecorder:
             for key, val in diagnostics.items():
                 data[key] = np.asarray(val, dtype=np.float64)
 
-        prev_size = self._buffer.size
-        self._buffer.add(data, timestamp=float(state.timestamp))
+        add_result = self._buffer.add(data, timestamp=ts)
+        if add_result.source_written:
+            self._last_control_run_generation = run_generation
 
-        if self._buffer.recording_stopped:
-            self._max_frames_reached = True
-            return False
-
-        self._frame_count = self._buffer.size
-        k = self._buffer.size - prev_size  # grid slots advanced (usually 1; 0 = dup bucket)
+        self._frame_count = add_result.size
+        prev_size = add_result.previous_size
+        k = add_result.slots_written  # grid slots advanced (usually 1; 0 = dup bucket)
 
         # A single live camera observation may advance across several skipped
         # grid deadlines. Only its causal source slot can be fresh/pointcloud-
@@ -623,6 +620,10 @@ class EpisodeRecorder:
                 if not writer.submit(rgb, depth, slot_pointcloud):
                     return False
 
+        if add_result.capacity_reached:
+            self._max_frames_reached = True
+            logger.info("Episode reached max_frames=%d after aligned camera submission", self.max_frames)
+            return False
         return True
 
     def _camera_payload(self, camera_frame: dict[str, Any] | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -781,13 +782,13 @@ class EpisodeRecorder:
         """Non-blocking check: has the background stop daemon finished?
 
         Safe to call once per configured control-grid tick. Returns immediately
-        — never blocks on I/O.  After the first call that returns
+        — never blocks on I/O. After the first call that returns
         ``done=True``, the internal state is reset and subsequent calls
         return a clean sentinel (``done=True, path=None``) until the next
         ``stop_episode()``.
 
-        Idempotent: once a stop completes, repeated calls return the same
-        result (cached in the first returned ``StopResult``, then cleared).
+        The terminal payload is consumptive: only the first completed poll
+        carries its path, frame count, success flag, and error.
         """
         t = self._stop_thread
         if t is None:
@@ -944,6 +945,7 @@ class EpisodeRecorder:
         self._camera_writer = None
         self._camera_writer_metrics = {}
         self._last_camera_payload = None
+        self._last_control_run_generation = None
 
     # ── Atomic file finalisation ──────────────────────────────────────
 

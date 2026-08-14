@@ -36,7 +36,7 @@ import yaml
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
+from dexmani_real.recording.io_process import RecorderIOConfig, RecorderPhase, recorder_io_loop
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import HandProcessConfig
@@ -56,6 +56,7 @@ from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.keyboard import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.teleop.loop import teleop_loop
+from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -329,6 +330,29 @@ def _heartbeat_names(
     return names
 
 
+def _recording_session_issue(shared: SharedStorage) -> str | None:
+    """Return a data-session failure independently of robot safety state."""
+    result = shared.record_status_ring.read_latest()
+    if result is None:
+        return "recorder status is unavailable"
+    status = result[0][0]
+    try:
+        phase = RecorderPhase(int(status["phase"]))
+    except ValueError:
+        return f"recorder reported unknown phase {int(status['phase'])}"
+    failure_count = int(status["failure_count"])
+    error_length = int(status["error_length"])
+    error = bytes(status["error"])[:error_length].decode("utf-8", errors="replace")
+    if failure_count > 0:
+        detail = f": {error}" if error else ""
+        return f"recorder reported {failure_count} failure(s){detail}"
+    if phase in (RecorderPhase.RECORDING, RecorderPhase.FINALIZING):
+        return f"recorder exited with transaction still {phase.name.lower()}"
+    if phase is RecorderPhase.ERROR:
+        return f"recorder terminal error: {error or 'unknown error'}"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """Spawn enabled child capabilities, supervise them, and clean up."""
     parser = argparse.ArgumentParser(description="VR Teleop xArm7 + XHand with recording")
@@ -401,8 +425,10 @@ def run_teleop_experiment(
 
     repo_root = Path(__file__).resolve().parents[1]
     vr_transform_path = repo_root / "dexmani_real" / "config" / "vr_transform.json"
-    if not vr_transform_path.is_file():
-        print(f"Preflight failed: VR transform is missing: {vr_transform_path}")
+    try:
+        load_vr_transform(vr_transform_path)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"Preflight failed: invalid VR transform: {exc}")
         return 1
     try:
         provenance = _resource_provenance(repo_root) if recording_enabled else ()
@@ -509,11 +535,16 @@ def run_teleop_experiment(
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
+        recording_issue = _recording_session_issue(shared) if recording_enabled else None
         shutdown_report = group.shutdown(disarm_if_clean=normal_exit)
         shared_closed = shutdown_report.shared_closed
-        clean_exit = normal_exit and shutdown_report.clean
+        clean_exit = normal_exit and shutdown_report.clean and recording_issue is None
         if normal_exit and not clean_exit:
-            logger.error("verified shutdown invalidated the clean supervisor exit: %s", shutdown_report)
+            logger.error(
+                "verified session outcome invalidated the clean supervisor exit: shutdown=%s recording=%s",
+                shutdown_report,
+                recording_issue,
+            )
 
         runtime_m = (time.monotonic() - start_time) / 60.0
         safety_name = (
@@ -524,6 +555,8 @@ def run_teleop_experiment(
             f"  exit_reason={exit_reason}  runtime={runtime_m:.1f}min  safety={safety_name}  "
             f"supervisor_normal={normal_exit}  clean={clean_exit}"
         )
+        if recording_issue is not None:
+            print(f"  recording_failure={recording_issue}")
         print("──")
         return 0 if clean_exit else 1
 

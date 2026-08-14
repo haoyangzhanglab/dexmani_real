@@ -133,7 +133,7 @@ class EpisodeReader:
             self._data_h5f,
             {"depth": depth_h5f, "pointcloud": pointcloud_h5f},
         )
-        self._rgb_decoder = VideoDecoder(paths["rgb"])
+        self._rgb_decoder: VideoDecoder | None = VideoDecoder(paths["rgb"])
         schema_version = self.schema_version
         if schema_version != 16:
             self.close()
@@ -161,6 +161,17 @@ class EpisodeReader:
     def schema_version(self) -> int:
         meta = self._h5f.get("meta")
         return 0 if meta is None else int(meta.attrs.get("schema_version", 0) or 0)
+
+    @property
+    def min_frames_met(self) -> bool:
+        """Quality label only; short episodes may still be internally valid."""
+        meta = self._h5f.get("meta")
+        return bool(meta is not None and meta.attrs.get("min_frames_met", False))
+
+    @property
+    def meets_min_duration(self) -> bool:
+        """Readable alias for :attr:`min_frames_met`."""
+        return self.min_frames_met
 
     @property
     def validity(self) -> ValidityState:

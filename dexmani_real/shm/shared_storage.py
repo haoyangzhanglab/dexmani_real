@@ -19,7 +19,6 @@ from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
-    ARM_CONTROL_DTYPE,
     ARM_STATE_DTYPE,
     HAND_COMMAND_DTYPE,
     HAND_JOINT_SHAPE,
@@ -59,7 +58,6 @@ class SharedStorageConfig:
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     hand_cmd_ring_maxlen: int = 8
-    arm_control_ring_maxlen: int = 2
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
@@ -99,7 +97,6 @@ class SharedStorageConfig:
             self.hand_state_ring_maxlen,
             self.hand_tactile_ring_maxlen,
             self.hand_cmd_ring_maxlen,
-            self.arm_control_ring_maxlen,
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
@@ -184,7 +181,6 @@ _RING_RESOURCE_NAMES = (
     "hand_state_ring",
     "hand_tactile_ring",
     "hand_cmd_ring",
-    "arm_control_ring",
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
@@ -245,9 +241,6 @@ class SharedStorage:
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     hand_tactile_ring: SharedMemoryRingBuffer  # hand -> policy (sparse)
     hand_cmd_ring: SharedMemoryRingBuffer  # policy -> hand
-    arm_control_ring: (
-        SharedMemoryRingBuffer  # controller -> arm priority STOP/RESUME mailbox
-    )
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
@@ -381,11 +374,6 @@ class SharedStorage:
             f"{prefix}_hand_cmd",
             dtype=HAND_COMMAND_DTYPE,
             maxlen=cfg.hand_cmd_ring_maxlen,
-        )
-        storage.arm_control_ring = SharedMemoryRingBuffer.create_or_replace(
-            f"{prefix}_arm_control",
-            dtype=ARM_CONTROL_DTYPE,
-            maxlen=cfg.arm_control_ring_maxlen,
         )
         storage.record_control_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_record_control",

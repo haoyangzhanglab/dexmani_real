@@ -9,6 +9,7 @@ from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
 
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz
+from dexmani_real.teleop.vr_transform import validate_rotation_matrix
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -67,17 +68,23 @@ class ArmWristMapper:
         self.rot_scale = rot_scale
         # ── Position: heading-dependent (set by set_heading) ──
         self.vr_to_base_rot = (
-            np.eye(3) if vr_to_base_rot is None else _finite_vector(vr_to_base_rot, (3, 3), "vr_to_base_rot")
+            np.eye(3)
+            if vr_to_base_rot is None
+            else validate_rotation_matrix(vr_to_base_rot, name="vr_to_base_rot")
         )
         # ── Position + Rotation: base → world ──
         self.base_to_world_rot = (
-            np.eye(3) if base_to_world_rot is None else _finite_vector(base_to_world_rot, (3, 3), "base_to_world_rot")
+            np.eye(3)
+            if base_to_world_rot is None
+            else validate_rotation_matrix(base_to_world_rot, name="base_to_world_rot")
         )
         # ── Rotation: fixed VR→robot axis mapping (heading-INDEPENDENT) ──
         # LeFranX-style: a constant similarity transform mapping VR hand axes to
         # robot base axes.  Identity means VR FLU axes = robot base axes.
         self.T_vr_to_robot = (
-            np.eye(3) if T_vr_to_robot is None else _finite_vector(T_vr_to_robot, (3, 3), "T_vr_to_robot")
+            np.eye(3)
+            if T_vr_to_robot is None
+            else validate_rotation_matrix(T_vr_to_robot, name="T_vr_to_robot")
         )
         # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
         # drift from the reset pose before it reaches IK.
