@@ -133,6 +133,13 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   a C pause preserves the existing generation boundary but makes that pause
   non-resumable. Conversely, C received during an automatic gate reclassifies
   the same boundary as a C-resumable pause without advancing again.
+- `publish_joint_targets(wait_applied=True)` is the synchronous coupled-action
+  confirmation. Arm-only actions require arm `last_cmd_seq >= action_id`;
+  arm+hand actions share one `action_id` and additionally require hand
+  `last_cmd_seq == action_id` (hand `>` action_id means superseded and fails
+  immediately), gated on hand health (connected, `state_valid`, no
+  `error_state`, `send_healthy`/`read_healthy`). Ordinary 16 Hz actions never
+  block on this.
 
 Do not turn a simple flag into an enum, add a second state writer, or bypass
 the SafetyGate validation boundary.
@@ -268,6 +275,15 @@ aligned samples → RecorderIO → temporary episode + stream verification
   safety backstop. C22/C31 are immediate faults; C24 has bounded measured-hold
   recovery, with another C24 inside 2 seconds becoming a sticky fault. Homing
   uses a separately validated Mode 0 milestone path.
+- Controller error classification for control decisions (setter-failure
+  classification, homing restore decision, homing milestone check) reads the
+  live `get_err_warn_code()` via `_read_live_error_code`, never the cached
+  `arm.error_code`; a live-read failure fails closed. Steady-state telemetry
+  may still report the cached value.
+- Arm cleanup confirms the physical stop (state 4) without requiring a zero
+  controller error: a fault exit leaves a latched non-zero error, so
+  `_wait_live_status(..., require_error_clear=False)` confirms the stop rather
+  than hanging on the latched error.
 - Arm feedback is valid only when both the SDK state read and URDF FK succeed.
   FK failure publishes NaN EEF with `state_valid=0`; persistent failure uses the
   same bounded device-I/O escalation as repeated feedback-read failure.
