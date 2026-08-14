@@ -658,10 +658,6 @@ def _run_keyboard_session(
     if bool(runtime.policy.hand_enabled) and not no_hand and not hand_enabled:
         logger.error("XHand is required but did not become ready")
         return False
-    if bool(runtime.policy.hand_enabled) and not no_hand and hand_process is not None:
-        if hand_process.is_alive() and not shared.is_ready("hand"):
-            logger.error("XHand startup timed out in an indeterminate state")
-            return False
     if shared.error_state.value:
         logger.error("A worker failed during startup")
         return False

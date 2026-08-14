@@ -192,6 +192,26 @@ class PointCloudProcessor:
         self.last_valid_depth_ratio = 0.0
         self.last_padding_count = 0
 
+    @staticmethod
+    def apply_depth_median(depth_m: np.ndarray, enabled: bool) -> np.ndarray:
+        """Apply the 3x3 median filter (L515 salt-and-pepper denoise) to ``depth_m``.
+
+        ``enabled=False`` returns ``depth_m`` unchanged.  ``enabled=True`` zeroes
+        invalid pixels (NaN or <= 0) before a single 3x3 medianBlur, then restores
+        NaN so they are excluded by the subsequent depth gate (depth_min_m=0.3 > 0).
+        Edge-preserving: unlike Gaussian, median does not soften depth edges.
+        """
+        if not enabled:
+            return depth_m
+        import cv2
+
+        _invalid = ~(np.isfinite(depth_m) & (depth_m > 0))
+        _work = depth_m.copy()
+        _work[_invalid] = 0.0
+        _work = cv2.medianBlur(_work, 3)
+        _work[_invalid] = np.nan
+        return _work
+
     def process(self, depth_m: np.ndarray, rgb: np.ndarray, rays: np.ndarray) -> np.ndarray | None:
         """(H,W) float32 meters + (H,W,3) uint8 RGB + (H,W,3) float32 unit rays
         -> (num_points, 6) float32 [xyz world-frame, rgb in 0..1], or None if no
@@ -210,19 +230,10 @@ class PointCloudProcessor:
 
         # ── 3x3 median filter (first operation on depth) ──
         # Eliminates L515 salt-and-pepper noise (isolated 1-2 px hot pixels)
-        # in a single pass without temporal state.  Edge-preserving — unlike
-        # Gaussian, median does not soften depth edges.  Invalid pixels (NaN
-        # or <= 0) are zeroed before the blur and are naturally filtered out
-        # by the subsequent depth gate (depth_min_m=0.3 > 0).
-        if cfg.depth_median_enabled:
-            import cv2
-
-            _invalid = ~(np.isfinite(depth_m) & (depth_m > 0))
-            _work = depth_m.copy()
-            _work[_invalid] = 0.0
-            _work = cv2.medianBlur(_work, 3)
-            _work[_invalid] = np.nan
-            depth_m = _work
+        # in a single pass without temporal state.  Invalid pixels (NaN or <= 0)
+        # are zeroed before the blur and naturally filtered out by the subsequent
+        # depth gate (depth_min_m=0.3 > 0).
+        depth_m = self.apply_depth_median(depth_m, cfg.depth_median_enabled)
 
         # Temporal depth EMA.
         # Exponential moving average on valid depth pixels reduces L515

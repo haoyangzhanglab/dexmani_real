@@ -170,118 +170,122 @@ class EpisodeVisualizer:
     ):
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
-        if not self._reader.meets_min_duration:
-            logger.warning("Episode is below the configured minimum recording duration")
-        self._h5f = self._reader.h5f
-
-        # Pre-decode camera frames (~50 MB for 960 frames @ 640×480).
-        self._rgb_cache: np.ndarray | None = None
-        self._depth_cache: np.ndarray | None = None
-        # RGB lives in the MP4 sidecar, so query the reader rather than the
-        # merged HDF5 dataset view.
         try:
-            self._rgb_cache = self._reader.read_camera_all("rgb")
-            logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
-        except KeyError:
-            pass
-        if "depth" in self._h5f:
-            self._depth_cache = self._reader.read_camera_all("depth")
-            logger.info("Pre-decoded %d depth frames", self._depth_cache.shape[0])
-
-        self._available = _classify_datasets(self._h5f)
-        # _classify_datasets only scans HDF5 keys — inject MP4 RGB when present.
-        if self._rgb_cache is not None and "rgb" not in self._available.get("camera", []):
-            self._available.setdefault("camera", []).append("rgb")
-        logger.info("Detected %d categories: %s", len(self._available), sorted(self._available.keys()))
-
-        # Depth units: CLI > the required /meta depth_scale.
-        if depth_scale is None:
+            if not self._reader.meets_min_duration:
+                logger.warning("Episode is below the configured minimum recording duration")
+            self._h5f = self._reader.h5f
+    
+            # Pre-decode camera frames (~50 MB for 960 frames @ 640×480).
+            self._rgb_cache: np.ndarray | None = None
+            self._depth_cache: np.ndarray | None = None
+            # RGB lives in the MP4 sidecar, so query the reader rather than the
+            # merged HDF5 dataset view.
+            try:
+                self._rgb_cache = self._reader.read_camera_all("rgb")
+                logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
+            except KeyError:
+                pass
+            if "depth" in self._h5f:
+                self._depth_cache = self._reader.read_camera_all("depth")
+                logger.info("Pre-decoded %d depth frames", self._depth_cache.shape[0])
+    
+            self._available = _classify_datasets(self._h5f)
+            # _classify_datasets only scans HDF5 keys — inject MP4 RGB when present.
+            if self._rgb_cache is not None and "rgb" not in self._available.get("camera", []):
+                self._available.setdefault("camera", []).append("rgb")
+            logger.info("Detected %d categories: %s", len(self._available), sorted(self._available.keys()))
+    
+            # Depth units: CLI > the required /meta depth_scale.
+            if depth_scale is None:
+                meta = self._h5f.get("meta")
+                if meta is not None and "depth_scale" in meta.attrs:
+                    depth_scale = float(meta.attrs["depth_scale"])
+                elif "depth" in self._h5f:
+                    raise ValueError("schema-v16 episode is missing /meta depth_scale")
+            self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
+            self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
+    
+            # Camera extrinsics: camera_T_world_camera (4x4 row-major) maps camera → world.
+            self._cam_R: np.ndarray | None = None
+            self._cam_t: np.ndarray | None = None
             meta = self._h5f.get("meta")
-            if meta is not None and "depth_scale" in meta.attrs:
-                depth_scale = float(meta.attrs["depth_scale"])
-            elif "depth" in self._h5f:
-                raise ValueError("schema-v16 episode is missing /meta depth_scale")
-        self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
-        self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
-
-        # Camera extrinsics: camera_T_world_camera (4x4 row-major) maps camera → world.
-        self._cam_R: np.ndarray | None = None
-        self._cam_t: np.ndarray | None = None
-        meta = self._h5f.get("meta")
-        if meta is not None and "camera_T_world_camera" in meta.attrs:
-            T_cw = np.asarray(meta.attrs["camera_T_world_camera"], dtype=float).reshape(4, 4)
-            self._cam_R = T_cw[:3, :3].copy()
-            self._cam_t = T_cw[:3, 3].copy()
-            logger.info("Camera extrinsics loaded: t=[%.3f, %.3f, %.3f]", *self._cam_t)
-        else:
-            logger.info("No camera extrinsics in /meta — camera frame = world frame (identity)")
-
-        # ── Point cloud config ──
-        self._pc_enabled = point_cloud and "depth" in (self._available.get("camera") or [])
-        self._pc_stride = max(1, pc_stride)
-        self._pc_min_depth = pc_min_depth
-        self._pc_max_depth = pc_max_depth
-        self._pc_cache: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
-
-        self._pc_K: np.ndarray | None = None
-        self._pc_rays: tuple[np.ndarray, np.ndarray] | None = None  # (u_strided, v_strided)
-        if self._pc_enabled:
-            meta = self._h5f.get("meta")
-            if meta is not None and "camera_K" in meta.attrs:
-                self._pc_K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
-                depth_shape = self._depth_cache.shape if self._depth_cache is not None else self._h5f["depth"].shape
-                h, w = depth_shape[1], depth_shape[2]
-                self._pc_h, self._pc_w = h, w
-                # Precompute strided pixel coordinates
-                v, u = np.mgrid[0 : h : self._pc_stride, 0 : w : self._pc_stride]
-                self._pc_rays = (u.astype(np.float32), v.astype(np.float32))
-                logger.info(
-                    "Point cloud enabled: stride=%d → ~%d points/frame, depth=[%.2f, %.2f]m",
-                    self._pc_stride,
-                    u.size,
-                    self._pc_min_depth,
-                    self._pc_max_depth,
-                )
+            if meta is not None and "camera_T_world_camera" in meta.attrs:
+                T_cw = np.asarray(meta.attrs["camera_T_world_camera"], dtype=float).reshape(4, 4)
+                self._cam_R = T_cw[:3, :3].copy()
+                self._cam_t = T_cw[:3, 3].copy()
+                logger.info("Camera extrinsics loaded: t=[%.3f, %.3f, %.3f]", *self._cam_t)
             else:
-                logger.warning("Point cloud disabled: no camera_K in /meta")
-                self._pc_enabled = False
-
-        # Pre-computed world-frame /pointcloud (preferred over depth back-projection).
-        self._has_precomputed_pc = (
-            point_cloud and "pointcloud" in self._h5f and isinstance(self._h5f["pointcloud"], h5py.Dataset)
-        )
-        if self._has_precomputed_pc:
-            pc_shape = self._h5f["pointcloud"].shape
-            logger.info(
-                "Pre-computed /pointcloud: shape=%s, dtype=%s (world-frame, skip back-projection)",
-                pc_shape,
-                self._h5f["pointcloud"].dtype,
+                logger.info("No camera extrinsics in /meta — camera frame = world frame (identity)")
+    
+            # ── Point cloud config ──
+            self._pc_enabled = point_cloud and "depth" in (self._available.get("camera") or [])
+            self._pc_stride = max(1, pc_stride)
+            self._pc_min_depth = pc_min_depth
+            self._pc_max_depth = pc_max_depth
+            self._pc_cache: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
+    
+            self._pc_K: np.ndarray | None = None
+            self._pc_rays: tuple[np.ndarray, np.ndarray] | None = None  # (u_strided, v_strided)
+            if self._pc_enabled:
+                meta = self._h5f.get("meta")
+                if meta is not None and "camera_K" in meta.attrs:
+                    self._pc_K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
+                    depth_shape = self._depth_cache.shape if self._depth_cache is not None else self._h5f["depth"].shape
+                    h, w = depth_shape[1], depth_shape[2]
+                    self._pc_h, self._pc_w = h, w
+                    # Precompute strided pixel coordinates
+                    v, u = np.mgrid[0 : h : self._pc_stride, 0 : w : self._pc_stride]
+                    self._pc_rays = (u.astype(np.float32), v.astype(np.float32))
+                    logger.info(
+                        "Point cloud enabled: stride=%d → ~%d points/frame, depth=[%.2f, %.2f]m",
+                        self._pc_stride,
+                        u.size,
+                        self._pc_min_depth,
+                        self._pc_max_depth,
+                    )
+                else:
+                    logger.warning("Point cloud disabled: no camera_K in /meta")
+                    self._pc_enabled = False
+    
+            # Pre-computed world-frame /pointcloud (preferred over depth back-projection).
+            self._has_precomputed_pc = (
+                point_cloud and "pointcloud" in self._h5f and isinstance(self._h5f["pointcloud"], h5py.Dataset)
             )
-        elif self._pc_enabled:
-            logger.info("No /pointcloud — falling back to depth back-projection + camera_K.")
-
-        self._T = self._resolve_frame_count(max_frames)
-        self._C = self._resolve_camera_count()
-        logger.info("State frames=%d, Camera frames=%d", self._T, self._C or 0)
-
-        # Preload non-camera data (small, fits in memory)
-        self._state = self._preload_state()
-
-        # state step → camera frame mapping
-        self._cam_idx: np.ndarray | None = None
-        if self._C is not None and self._C > 0:
-            if self._C < self._T:
-                self._cam_idx = np.minimum((np.arange(self._T) * self._C / self._T).astype(int), self._C - 1)
-            else:
-                self._cam_idx = np.arange(self._T, dtype=int)
-
-        # Unique recording_id per invocation avoids stale-data merge on re-run.
-        self._blueprint = self._build_blueprint()
-        app_id = f"DexMani - {self._h5_path.stem}"
-        rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
-        rr.init(app_id, recording_id=rec_id, spawn=True, default_blueprint=self._blueprint)
-        rr.send_blueprint(blueprint=self._blueprint)  # force-override any cached blueprint for this app_id
-        self._log_static()
+            if self._has_precomputed_pc:
+                pc_shape = self._h5f["pointcloud"].shape
+                logger.info(
+                    "Pre-computed /pointcloud: shape=%s, dtype=%s (world-frame, skip back-projection)",
+                    pc_shape,
+                    self._h5f["pointcloud"].dtype,
+                )
+            elif self._pc_enabled:
+                logger.info("No /pointcloud — falling back to depth back-projection + camera_K.")
+    
+            self._T = self._resolve_frame_count(max_frames)
+            self._C = self._resolve_camera_count()
+            logger.info("State frames=%d, Camera frames=%d", self._T, self._C or 0)
+    
+            # Preload non-camera data (small, fits in memory)
+            self._state = self._preload_state()
+    
+            # state step → camera frame mapping
+            self._cam_idx: np.ndarray | None = None
+            if self._C is not None and self._C > 0:
+                if self._C < self._T:
+                    self._cam_idx = np.minimum((np.arange(self._T) * self._C / self._T).astype(int), self._C - 1)
+                else:
+                    self._cam_idx = np.arange(self._T, dtype=int)
+    
+            # Unique recording_id per invocation avoids stale-data merge on re-run.
+            self._blueprint = self._build_blueprint()
+            app_id = f"DexMani - {self._h5_path.stem}"
+            rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
+            rr.init(app_id, recording_id=rec_id, spawn=True, default_blueprint=self._blueprint)
+            rr.send_blueprint(blueprint=self._blueprint)  # force-override any cached blueprint for this app_id
+            self._log_static()
+        except BaseException:
+            self.close()
+            raise
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -487,11 +491,12 @@ class EpisodeVisualizer:
         if self._cam_R is not None and self._cam_t is not None:
             rr.log("camera", rr.Transform3D(translation=self._cam_t, mat3x3=self._cam_R), static=True)
 
-        # Derived force series labels
+        # Derived force series labels.  Tactile values are SDK-scaled (physical
+        # unit unverified), so do not label them "(N)".
         _force_series = {
-            "hand_contact_mag": ("thumb (N)", "index (N)", "middle (N)", "ring (N)", "pinky (N)"),
-            "hand_force_thumb": ("Fx (N)", "Fy (N)", "Fz (N)"),
-            "hand_force_index": ("Fx (N)", "Fy (N)", "Fz (N)"),
+            "hand_contact_mag": ("thumb (SDK-scaled)", "index (SDK-scaled)", "middle (SDK-scaled)", "ring (SDK-scaled)", "pinky (SDK-scaled)"),
+            "hand_force_thumb": ("Fx", "Fy", "Fz"),
+            "hand_force_index": ("Fx", "Fy", "Fz"),
         }
         for fkey, labels in _force_series.items():
             if fkey in self._state:
@@ -541,10 +546,15 @@ class EpisodeVisualizer:
 
         # 3D point cloud: /pointcloud (world-frame, grid-aligned) > depth back-projection.
         if self._has_precomputed_pc:
-            pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6): xyz + float rgb
-            positions = pc_frame[:, :3]
-            colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)
-            rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
+            # Skip frames the recorder marked as having no valid point cloud
+            # (flag_pointcloud_valid=False): the all-zero placeholder rows are
+            # not real geometry.
+            valid = self._state.get("flag_pointcloud_valid")
+            if valid is None or bool(valid[step_idx]):
+                pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6): xyz + float rgb
+                positions = pc_frame[:, :3]
+                colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)
+                rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
         elif self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
                 depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]

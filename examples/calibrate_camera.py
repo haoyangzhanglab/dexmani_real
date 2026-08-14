@@ -706,8 +706,22 @@ def _run_calibration(
             return
         rvec, tvec = ar_result
         arm_state = read_arm_state_dict(shared)
-        if arm_state is None or not np.all(np.isfinite(arm_state["eef_pos"])):
+        if arm_state is None:
             print("FAILED — arm state unavailable, skipped")
+            return
+        feedback_issue = validate_arm_feedback(
+            connected=arm_state["connected"],
+            state_valid=arm_state["state_valid"],
+            source_monotonic_ns=arm_state["source_monotonic_ns"],
+            now_monotonic_ns=time.monotonic_ns(),
+            max_age_s=float(policy.arm_state_stale_threshold_s),
+            qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
+            qvel=arm_state["qvel"],
+            eef_pos=arm_state["eef_pos"],
+            eef_rot6d=arm_state["eef_rot6d"],
+        )
+        if feedback_issue is not None:
+            print(f"FAILED — {feedback_issue}, skipped")
             return
         pos_ee = arm_state["eef_pos"].copy()
         rpy_ee = _eef_rpy_from_state(arm_state)
@@ -722,9 +736,14 @@ def _run_calibration(
             print(f"  need at least {calib_cfg.min_samples} samples, have {n} — keep collecting")
             return
         print(f"\n  computing hand-eye calibration ({n} samples, 5 methods)...")
-        T_candidate, method_best, errors_mm, errors_deg, method_table = _calibrate_and_select(
-            *samples.solver_inputs(),
-        )
+        try:
+            T_candidate, method_best, errors_mm, errors_deg, method_table = _calibrate_and_select(
+                *samples.solver_inputs(),
+            )
+        except Exception as exc:
+            logger.warning("solve failed", exc_info=True)
+            print(f"FAILED — {exc}, skipped")
+            return
         # Convert T_base_camera → T_world_camera.
         T_world_base = np.eye(4, dtype=np.float64)
         T_world_base[:3, :3] = Rotation.from_quat(
@@ -755,8 +774,13 @@ def _run_calibration(
         pos_ok = std_mm <= calib_cfg.max_consistency_std_mm
         rot_ok = std_deg <= calib_cfg.max_consistency_rot_std_deg
         if pos_ok and rot_ok:
+            try:
+                _save_cameras_json(T_candidate, serial, _CAMERAS_JSON_PATH)
+            except Exception as exc:
+                logger.warning("save failed", exc_info=True)
+                print(f"FAILED — {exc}, skipped")
+                return
             T_world_camera = T_candidate
-            _save_cameras_json(T_world_camera, serial, _CAMERAS_JSON_PATH)
             print(f"  ACCEPTED ({method_best}, pos std={std_mm:.1f}mm, rot std={std_deg:.2f}°)")
         else:
             reasons = []
@@ -1070,25 +1094,36 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
 
     # ── Run ──
-    exit_code = _run_calibration(
-        shared, runtime, planner, safety_gate, workspace,
-        arm_process, args.serial, calib_cfg, aruco_cfg,
-    )
-
-    # ── Cleanup ──
+    exit_code = 1
     try:
-        clean_exit = exit_code == 0
-        shutdown_report = shutdown_processes(
-            shared, [p for p in processes if p.pid is not None],
-            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            disarm_if_clean=clean_exit,
+        exit_code = _run_calibration(
+            shared, runtime, planner, safety_gate, workspace,
+            arm_process, args.serial, calib_cfg, aruco_cfg,
         )
-        if clean_exit and not shutdown_report.clean:
-            logger.error("verified shutdown invalidated the clean control exit: %s", shutdown_report)
-            exit_code = 1
-    except RuntimeError:
-        logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
-        exit_code = 1
+    finally:
+        started = [p for p in processes if p.pid is not None]
+        if started:
+            try:
+                clean_exit = exit_code == 0
+                shutdown_report = shutdown_processes(
+                    shared, started,
+                    graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                    disarm_if_clean=clean_exit,
+                )
+                if clean_exit and not shutdown_report.clean:
+                    logger.error("verified shutdown invalidated the clean control exit: %s", shutdown_report)
+                    exit_code = 1
+            except RuntimeError:
+                logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
+                exit_code = 1
+        else:
+            try:
+                if not shared.close():
+                    _set_fault(shared, "SharedStorage cleanup was incomplete")
+                    exit_code = 1
+            except Exception:
+                _set_fault(shared, "SharedStorage cleanup failed")
+                exit_code = 1
 
     print(f"  calibration session exit code: {exit_code}")
     return exit_code

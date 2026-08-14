@@ -448,7 +448,7 @@ def _run_rgbd_test(camera: RealSense, test_cfg: CameraTestConfig) -> dict:
                 pcd_array = rgbd_to_pointcloud(depth=frame.depth, K=frame.K,
                                               rgb=frame.rgb, config=pcd_config)
                 point_count = pcd_array.shape[0]
-            except ValueError as e:
+            except (ValueError, RuntimeError) as e:
                 total_dropped += 1
                 if total_dropped <= 3:
                     print(f"  PCD generation failed (frame {frame_count}): {e}")
@@ -618,8 +618,10 @@ def main() -> None:
         connect_ok = camera.connect()
         if connect_ok:
             break
-        print(f"  Connection failed, retrying in {1.0 * (attempt + 1):.0f}s...")
-        time.sleep(1.0)
+        if attempt < 2:
+            delay = 1.0 * (attempt + 1)
+            print(f"  Connection failed, retrying in {delay:.0f}s...")
+            time.sleep(delay)
     if not connect_ok:
         print("Camera connection failed (3 retries).")
         sys.exit(1)

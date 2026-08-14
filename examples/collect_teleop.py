@@ -574,7 +574,7 @@ def run_teleop_experiment(
             except RuntimeError:
                 logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
                 raise
-        if group is None and not shared_closed:
+        if group is None:
             try:
                 shared_closed = bool(shared.close())
                 if not shared_closed:

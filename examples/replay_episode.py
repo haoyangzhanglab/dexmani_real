@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import multiprocessing as mp
 import os
 import sys
@@ -45,7 +44,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
-import yaml
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import ASSET_DIR
@@ -60,6 +58,7 @@ from dexmani_real.policy.safety import (ActionSafetyGateConfig, SafetyGate,
                                         publish_hand_home_and_wait_applied,
                                         publish_joint_targets)
 from dexmani_real.recording.episode_reader import EpisodeReader
+from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
@@ -137,60 +136,6 @@ def _is_sha256(value: str | None) -> bool:
     return True
 
 
-def _optional_float(meta: Any, name: str) -> float | None:
-    """Extract *name* from HDF5 attrs as a float, returning None on missing/unparseable."""
-    raw = meta.attrs.get(name)
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_bool(meta: Any, name: str) -> bool | None:
-    """Extract *name* from HDF5 attrs as a bool (native, np, or 0/1 int), returning None on failure."""
-    raw = meta.attrs.get(name)
-    if isinstance(raw, (bool, np.bool_)):
-        return bool(raw)
-    if isinstance(raw, (int, np.integer)) and int(raw) in (0, 1):
-        return bool(raw)
-    return None
-
-
-def replay_runtime_hash(
-    canonical_config_yaml: str,
-    *,
-    source: str,
-    speed_factor: float,
-    no_hand: bool,
-    jerk_management: str,
-) -> str:
-    """Hash the resolved runtime together with replay-only behavior."""
-    speed = float(speed_factor)
-    if not np.isfinite(speed) or speed <= 0:
-        raise ValueError("replay speed factor must be finite and positive")
-    if source not in {"cmd", "sent"}:
-        raise ValueError(f"unsupported replay action source {source!r}")
-    payload = {
-        "resolved_config": yaml.safe_load(canonical_config_yaml),
-        "replay": {
-            "source": source,
-            "speed_factor": speed,
-            "no_hand": bool(no_hand),
-            "jerk_management": jerk_management,
-        },
-    }
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 def preflight_model_paths() -> tuple[Path, ...]:
     """Return the three URDF/SRDF model paths used for geometry provenance checks."""
     model_dir = ASSET_DIR / "robots" / "xhand"
@@ -220,19 +165,14 @@ class TrajectoryData:
     hand_qpos: np.ndarray | None
     arm_ee: np.ndarray | None
     action_source: str | None = None
-    hand_available: bool | None = None
-    joint_max_acc: float | None = None
-    joint_max_speed: float | None = None
-    arm_loop_hz: float | None = None
-    jerk_management: str | None = None
     resolved_config_sha256: str | None = None
     model_provenance: tuple[tuple[str, str], ...] = ()
     send_mask: np.ndarray | None = None
 
     @property
     def has_hand(self) -> bool:
-        """Whether the episode certifies that hand hardware produced the stream."""
-        return self.hand_available is True and self.action_hand_joint is not None
+        """Whether a fixed-shape hand action stream is present."""
+        return self.has_hand_actions
 
     @property
     def has_hand_actions(self) -> bool:
@@ -288,17 +228,9 @@ def load_trajectory(
             )
             fps = _OFFLINE_FALLBACK_RATE_HZ
         task_label = str(meta.attrs.get("task_label", "")) if meta is not None else ""
-        hand_available = _optional_bool(meta, "hand_available") if meta is not None else None
-
-        joint_max_acc = _optional_float(meta, "joint_max_acc") if meta is not None else None
-        joint_max_speed = _optional_float(meta, "joint_max_speed") if meta is not None else None
-        arm_loop_hz = _optional_float(meta, "arm_loop_hz") if meta is not None else None
-        jerk_management = None
         resolved_config_sha256 = None
         model_provenance: tuple[tuple[str, str], ...] = ()
         if meta is not None:
-            raw_jerk = meta.attrs.get("jerk_management")
-            jerk_management = None if raw_jerk is None else str(raw_jerk)
             raw_hash = meta.attrs.get("resolved_config_sha256")
             resolved_config_sha256 = None if raw_hash is None else str(raw_hash)
             model_provenance = tuple(
@@ -349,6 +281,8 @@ def load_trajectory(
         arrays["hand state"] = (hand_qpos, (total_frames, *HAND_JOINT_SHAPE))
     if arm_ee is not None:
         arrays["arm EEF"] = (arm_ee, (total_frames, *ARM_EE_SHAPE))
+    if send_mask is not None:
+        arrays["send mask"] = (send_mask, (total_frames,))
     for name, (array, expected_shape) in arrays.items():
         if array.shape != expected_shape:
             raise ValueError(f"episode {name} has shape {array.shape}, expected {expected_shape}")
@@ -364,11 +298,6 @@ def load_trajectory(
         hand_qpos=hand_qpos,
         arm_ee=arm_ee,
         action_source=action_source,
-        hand_available=hand_available,
-        joint_max_acc=joint_max_acc,
-        joint_max_speed=joint_max_speed,
-        arm_loop_hz=arm_loop_hz,
-        jerk_management=jerk_management,
         resolved_config_sha256=resolved_config_sha256,
         model_provenance=model_provenance,
         send_mask=send_mask,
@@ -378,7 +307,7 @@ def load_trajectory(
         trajectory.num_frames,
         trajectory.fps,
         trajectory.task_label or "(none)",
-        ("yes" if trajectory.has_hand else "dataset-only" if trajectory.has_hand_actions else "no"),
+        ("yes" if trajectory.has_hand_actions else "no"),
         "yes" if trajectory.arm_ee is not None else "no",
     )
     return trajectory
@@ -683,7 +612,11 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     npz_path = output_path / "replay_data.npz"
-    np.savez_compressed(npz_path, **replay_data)
+    # Write to a sibling temp file that already ends in ".npz" (numpy appends
+    # ".npz" to any name that does not), then atomically move it into place.
+    tmp_path = npz_path.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp_path, **replay_data)
+    os.replace(tmp_path, npz_path)
     print(f"Replay data saved: {npz_path}  ({replay_data['arm_qpos'].shape[0]} frames)")
     return npz_path
 
@@ -737,9 +670,7 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
             "rmse_overall_deg": round(metrics.hand_joint_rmse_overall_deg, 4),
         }
 
-    metrics_path = output_path / "metrics.json"
-    with metrics_path.open("w", encoding="utf-8") as stream:
-        json.dump(metrics_dict, stream, indent=2, ensure_ascii=False)
+    metrics_path = atomic_json_dump(metrics_dict, output_path / "metrics.json", ensure_ascii=False)
     print(f"\nMetrics saved: {metrics_path}")
 
     save_replay_data(replay_data, output_dir)
@@ -775,15 +706,12 @@ def require_explicit_hand_mode(trajectory: TrajectoryData, *, no_hand: bool) -> 
     """Fail closed when an episode cannot prove that live hand data was recorded."""
     if no_hand:
         return
-    if trajectory.hand_available is not True:
-        detail = "missing hand_available metadata" if trajectory.hand_available is None else "hand_available=false"
-        raise ValueError(f"episode reports {detail}; pass --no-hand only after securing the physical hand")
     if not trajectory.has_hand_actions:
         raise ValueError("episode has no hand action stream; pass --no-hand only after securing the physical hand")
 
 
-def _verify_trajectory_provenance(trajectory: TrajectoryData, runtime: ResolvedRuntimeConfig) -> str:
-    """Fail-closed provenance gate: source stream, config hash, controller params, and model hashes."""
+def _verify_trajectory_provenance(trajectory: TrajectoryData, *, provenance_sha256: str) -> None:
+    """Fail-closed provenance gate: source stream, config hash, and model hashes."""
     if trajectory.action_source != "sent":
         raise ValueError("live replay requires the exact submitted action stream ('sent')")
     if trajectory.num_frames <= 0:
@@ -794,31 +722,8 @@ def _verify_trajectory_provenance(trajectory: TrajectoryData, runtime: ResolvedR
         raise ValueError(f"live replay arm actions must be finite shape {expected_arm_shape}")
     if not _is_sha256(trajectory.resolved_config_sha256):
         raise ValueError("live replay recording provenance lacks a valid resolved_config_sha256")
-
-    required_controller = {
-        "joint_max_acc": trajectory.joint_max_acc,
-        "joint_max_speed": trajectory.joint_max_speed,
-        "arm_loop_hz": trajectory.arm_loop_hz,
-    }
-    missing = [name for name, value in required_controller.items() if value is None]
-    if trajectory.jerk_management is None:
-        missing.append("jerk_management")
-    if missing:
-        raise ValueError(f"live replay controller provenance is incomplete: {missing}")
-
-    recorded = {name: float(value) for name, value in required_controller.items() if value is not None}
-    expected = {
-        "joint_max_acc": float(runtime.arm.max_joint_acceleration_deg_per_s2),
-        "joint_max_speed": float(runtime.arm.max_joint_velocity_deg_per_s),
-        "arm_loop_hz": float(runtime.arm.loop_hz),
-    }
-    mismatches = [
-        name for name, value in recorded.items() if not np.isfinite(value) or not np.isclose(value, expected[name])
-    ]
-    if mismatches:
-        raise ValueError(f"live replay controller provenance mismatch: {mismatches}")
-    if trajectory.jerk_management != "unmanaged":
-        raise ValueError(f"unsupported recorded jerk management {trajectory.jerk_management!r}")
+    if trajectory.resolved_config_sha256 != provenance_sha256:
+        raise ValueError("live replay config provenance mismatch: recorded resolved config differs from replay config")
 
     recorded_models = dict(trajectory.model_provenance)
     missing_models = [name for name in _MODEL_PROVENANCE_KEYS if not _is_sha256(recorded_models.get(name))]
@@ -831,7 +736,6 @@ def _verify_trajectory_provenance(trajectory: TrajectoryData, runtime: ResolvedR
     mismatched_models = [name for name in _MODEL_PROVENANCE_KEYS if recorded_models[name] != current_models[name]]
     if mismatched_models:
         raise ValueError(f"live replay model provenance mismatch: {mismatched_models}")
-    return trajectory.action_source
 
 
 def verify_live_replay_preflight(
@@ -839,7 +743,7 @@ def verify_live_replay_preflight(
     runtime: ResolvedRuntimeConfig,
     *,
     no_hand: bool,
-    speed_factor: float,
+    provenance_sha256: str,
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
@@ -851,14 +755,7 @@ def verify_live_replay_preflight(
     require_explicit_hand_mode(trajectory, no_hand=no_hand)
     if not no_hand and not bool(runtime.policy.hand_enabled):
         raise ValueError("runtime policy.hand_enabled=false requires explicit no-hand acknowledgement")
-    action_source = _verify_trajectory_provenance(trajectory, runtime)
-    replay_runtime_hash(
-        runtime.canonical_yaml,
-        source=action_source,
-        speed_factor=speed_factor,
-        no_hand=no_hand,
-        jerk_management="unmanaged",
-    )
+    _verify_trajectory_provenance(trajectory, provenance_sha256=provenance_sha256)
     modeled_hand = modeled_hand_actions(
         trajectory,
         no_hand=no_hand,
@@ -1266,7 +1163,6 @@ class TrajectoryReplayer:
         next_deadline_s = time.perf_counter()
         start_time = next_deadline_s
         frame_idx = 0
-        previous_hand_cmd = None if initial_hand_qpos is None else initial_hand_qpos.copy()
 
         try:
             require_transition(self.shared, SafetyState.RUNNING)
@@ -1364,7 +1260,6 @@ class TrajectoryReplayer:
                 sent_arm_cmd = np.asarray(published.arm_qpos, dtype=np.float64)
                 if published.hand_qpos is not None:
                     hand_cmd = np.asarray(published.hand_qpos, dtype=np.float64)
-                    previous_hand_cmd = hand_cmd.copy()
 
                 self._recorder.record(
                     frame_idx,
@@ -1451,6 +1346,7 @@ class LiveReplayConfig:
     max_frames: int | None
     output_dir: str
     evaluate_consistency: bool
+    config_sha256: str
 
 
 def _latched_fault_status(shared: SharedStorage) -> ReplayStatus | None:
@@ -1708,7 +1604,7 @@ def run_live_replay(
             trajectory,
             runtime,
             no_hand=config.no_hand,
-            speed_factor=config.speed,
+            provenance_sha256=config.config_sha256,
         )
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
         return ReplayOutcome(
@@ -1871,15 +1767,12 @@ class ReplayRuntimeSelection:
     config_sha256: str
 
 
-def _resolve_replay_runtime(args: argparse.Namespace, trajectory: TrajectoryData) -> ReplayRuntimeSelection:
-    """Resolve runtime config with CLI overrides and episode-metadata fallbacks for acceleration and joint speed."""
+def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
+    """Resolve runtime config with CLI overrides and the recording-equivalent config provenance hash."""
     base_runtime = resolve_runtime_config(yaml_path=args.config)
     if args.acc is not None:
         acceleration = float(args.acc)
         acceleration_source = " (--acc override)"
-    elif trajectory.joint_max_acc is not None:
-        acceleration = float(trajectory.joint_max_acc)
-        acceleration_source = " (from episode metadata)"
     else:
         acceleration = float(base_runtime.arm.max_joint_acceleration_deg_per_s2)
         acceleration_source = " (from runtime config)"
@@ -1887,11 +1780,7 @@ def _resolve_replay_runtime(args: argparse.Namespace, trajectory: TrajectoryData
     joint_speed = float(
         args.joint_speed
         if args.joint_speed is not None
-        else (
-            trajectory.joint_max_speed
-            if trajectory.joint_max_speed is not None
-            else base_runtime.arm.max_joint_velocity_deg_per_s
-        )
+        else base_runtime.arm.max_joint_velocity_deg_per_s
     )
     runtime = resolve_runtime_config(
         yaml_path=args.config,
@@ -1904,13 +1793,10 @@ def _resolve_replay_runtime(args: argparse.Namespace, trajectory: TrajectoryData
     )
     if not args.no_hand and not bool(runtime.policy.hand_enabled):
         raise ValueError("policy.hand_enabled=false requires explicit --no-hand confirmation")
-    config_sha256 = replay_runtime_hash(
-        runtime.canonical_yaml,
-        source=args.source,
-        speed_factor=args.speed,
-        no_hand=args.no_hand,
-        jerk_management="unmanaged",
-    )
+    # Provenance is the resolved config the replay actually runs (all CLI
+    # overrides included), so it matches the recorder's runtime.sha256 exactly
+    # when --acc/--joint-speed/--no-hand/--arm-ip agree with recording.
+    config_sha256 = runtime.sha256
     return ReplayRuntimeSelection(runtime, acceleration, joint_speed, acceleration_source, config_sha256)
 
 
@@ -2027,14 +1913,14 @@ Live replay controls:
         type=_positive_finite_float,
         default=None,
         metavar="DEG_S",
-        help="Mode-6 joint speed; defaults to recorded provenance, then runtime config.",
+        help="Mode-6 joint speed in °/s (defaults to the runtime config value).",
     )
     parser.add_argument(
         "--acc",
         type=_positive_finite_float,
         default=None,
         metavar="DEG_S2",
-        help="Joint max acceleration in °/s²; CLI overrides episode metadata and runtime config.",
+        help="Joint max acceleration in °/s² (defaults to the runtime config value).",
     )
     args = parser.parse_args(argv)
     args.dry_run = not args.live
@@ -2074,7 +1960,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        selection = _resolve_replay_runtime(args, traj)
+        selection = _resolve_replay_runtime(args)
     except (FileNotFoundError, TypeError, ValueError, OSError) as exc:
         print(f"Error resolving replay config: {exc}")
         return 1
@@ -2082,7 +1968,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Trajectory: {traj.episode_path}")
     print(f"  Frames: {traj.num_frames}  FPS: {traj.fps:.1f}  Duration: {traj.num_frames/traj.fps:.1f}s")
     print(f"  Task: {traj.task_label or '(none)'}")
-    hand_metadata = "yes" if traj.hand_available is True else "no" if traj.hand_available is False else "unknown"
+    hand_metadata = "yes" if traj.has_hand_actions else "no"
     print(f"  Hand available: {hand_metadata}  action dataset: {'yes' if traj.has_hand_actions else 'no'}")
     print(f"  EE data: {'yes' if traj.arm_ee is not None else 'no'}")
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²{selection.acceleration_source}")
@@ -2118,6 +2004,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_frames=args.max_frames,
                 output_dir=output_dir,
                 evaluate_consistency=bool(eval_available),
+                config_sha256=selection.config_sha256,
             ),
         )
     except Exception as exc:

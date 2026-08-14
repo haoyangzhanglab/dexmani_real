@@ -16,9 +16,12 @@ Usage::
 
 from __future__ import annotations
 
+import math
+import shutil
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -117,7 +120,9 @@ def _tprint(label: str, key: str, timings: dict[str, float]) -> None:
     """Print a single timing line with ASCII bar."""
     ms = timings.get(key, 0.0)
     pipeline_ms = max(timings.get("pipeline_total", 1.0), 0.001)
-    if ms < 0.01:
+    if math.isnan(ms):
+        print(f"  {label:<30s}     --   (unavailable)")
+    elif ms < 0.01:
         print(f"  {label:<30s}     --   (disabled)")
     else:
         pct = ms / pipeline_ms * 100
@@ -132,6 +137,7 @@ def _stage_label(key: str) -> str:
         "capture": "Frame capture",
         "extrinsics": "Extrinsics load",
         "desk_calib": "Desk plane calibration",
+        "2d_median": "Median filter",
         "2d_depth_gate": "Depth gate",
         "2d_edge_filter": "Edge filter (LoG + dilate)",
         "2d_speckle": "Speckle filter",
@@ -237,6 +243,13 @@ def _run_2d_filters(depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray | None,
     print("2-D Depth Filtering (before deprojection)")
     print("=" * 60)
 
+    # 0. Median filter (first operation, byte-identical to production).
+    t0 = time.perf_counter()
+    depth_m = PointCloudProcessor.apply_depth_median(depth_m, cfg.depth_median_enabled)
+    timings["2d_median"] = (time.perf_counter() - t0) * 1000.0
+    print(f"  0. Median filter ({'ON' if cfg.depth_median_enabled else 'OFF'}):  "
+          f"{timings['2d_median']:.2f}ms")
+
     # 1. Depth range gate.
     t0 = time.perf_counter()
     z_flat = depth_m.ravel()
@@ -312,9 +325,6 @@ def _run_2d_filters(depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray | None,
     else:
         print("  3. Speckle filter:  DISABLED")
 
-    median_status = "ON" if cfg.depth_median_enabled else "OFF"
-    print(f"     (median filter: {median_status} -- applied before all gates above)")
-
     if not np.any(mask):
         raise RuntimeError("No pixels survived 2-D gates -- check depth range or edge threshold.")
     return mask, edge_vis, timings
@@ -364,9 +374,23 @@ def _calibrate_desk(depth_m: np.ndarray, rgb: np.ndarray, camera: RealSense,
     print(f"  Plane:  {a:.4f}x + {b:.4f}y + {c_plane:.4f}z + {d_plane:.4f} = 0")
     print(f"  Tilt:   {angle_deg:.1f} deg from horizontal")
 
-    # Persist and round-trip verify.
+    # Persist and round-trip verify.  The desk plane is shared calibration input
+    # for point-cloud filtering, collision checks, and homing, so overwriting it
+    # requires an explicit confirmation and backs up any prior value first.
     repo_root = Path(__file__).resolve().parents[1]
     plane_path = str(repo_root / "dexmani_real" / "config" / "desk_plane.json")
+    plane_file = Path(plane_path)
+
+    answer = input(f"Overwrite {plane_path}? [y/N] ")
+    if answer.strip().lower() not in ("y", "yes"):
+        print("  Skipped -- desk_plane.json left unchanged.")
+        return desk_plane, elapsed
+
+    if plane_file.exists():
+        backup = plane_file.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        shutil.copy2(plane_file, backup)
+        print(f"  backed up previous plane → {backup.name}")
+
     PointCloudProcessor.save_desk_plane(desk_plane, plane_path)
     loaded = PointCloudProcessor.load_desk_plane(plane_path)
     print(f"  Saved + round-trip OK: a={loaded[0]:.4f} b={loaded[1]:.4f} "
@@ -436,14 +460,23 @@ def _run_pipeline(depth_m: np.ndarray, rgb: np.ndarray, T_world_camera: np.ndarr
     t0 = time.perf_counter()
     result = processor.process(depth_m, rgb, rays_2d)
     timings = {"pipeline_total": (time.perf_counter() - t0) * 1000.0}
-    timings.update({
-        "p_numpy": processor._t_numpy,
-        "p_voxel": processor._t_voxel,
-        "p_dbscan": processor._t_dbscan,
-        "p_radius": processor._t_radius,
-        "p_stat": processor._t_stat,
-        "p_fps": processor._t_fps,
-    })
+
+    if result is None:
+        # process() returned early (no pointcloud survived the depth gate); the
+        # per-stage accumulators were never updated, so mark them unavailable
+        # (NaN) so the summary renders "(unavailable)" instead of "(disabled)".
+        print("\n  process() early-returned (no pointcloud); per-stage timing unavailable")
+        for _key in ("p_numpy", "p_voxel", "p_dbscan", "p_radius", "p_stat", "p_fps"):
+            timings[_key] = float("nan")
+    else:
+        timings.update({
+            "p_numpy": processor._t_numpy,
+            "p_voxel": processor._t_voxel,
+            "p_dbscan": processor._t_dbscan,
+            "p_radius": processor._t_radius,
+            "p_stat": processor._t_stat,
+            "p_fps": processor._t_fps,
+        })
 
     # Restore accumulators.
     (processor._t_numpy, processor._t_voxel, processor._t_dbscan,
@@ -453,7 +486,6 @@ def _run_pipeline(depth_m: np.ndarray, rgb: np.ndarray, T_world_camera: np.ndarr
     if result is not None:
         print(f"\n  Output: {result.shape[0]} points  ({timings['pipeline_total']:.1f} ms)")
     else:
-        print(f"\n  Output: no points survived  ({timings['pipeline_total']:.1f} ms)")
         result = np.zeros((0, 6), dtype=np.float32)
 
     return result, timings
@@ -467,7 +499,7 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
 
     sections = [
         ("Setup", ["connect", "capture", "extrinsics", "desk_calib"]),
-        ("2-D Pre-deprojection Filters", ["2d_depth_gate", "2d_edge_filter", "2d_speckle"]),
+        ("2-D Pre-deprojection Filters", ["2d_median", "2d_depth_gate", "2d_edge_filter", "2d_speckle"]),
         ("3-D Pipeline (per-frame steady-state)",
          ["p_numpy", "p_voxel", "p_dbscan", "p_radius", "p_stat", "p_fps"]),
     ]
@@ -477,7 +509,9 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
         section_total = 0.0
         for key in keys:
             _tprint(f"  {_stage_label(key)}", key, timings)
-            section_total += timings.get(key, 0.0)
+            stage_ms = timings.get(key, 0.0)
+            if not math.isnan(stage_ms):
+                section_total += stage_ms
 
         if title.startswith("3-D"):
             pipeline_ms = timings.get("pipeline_total", 0.0)

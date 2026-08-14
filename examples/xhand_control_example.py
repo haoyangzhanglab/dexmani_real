@@ -29,6 +29,8 @@ _HAND_DOF = 12
 
 # Fingertip sensor joint IDs (thumb, index, middle, ring, little).
 _FINGERTIP_IDS = frozenset({2, 5, 7, 9, 11})
+# Map each fingertip joint ID to its index into state.sensor_data (0-4).
+_FINGERTIP_TO_SENSOR_IDX = {2: 0, 5: 1, 7: 2, 9: 3, 11: 4}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -161,7 +163,7 @@ class XHandControlExample:
     def read_device_info(self) -> None:
         self._header("Device info")
         error_struct, info = self._device.read_device_info(self._hand_id)
-        print(f"  serial_number: {info.serial_number[:16]}")
+        print(f"  serial_number: {''.join(info.serial_number[:16])}")
         print(f"  hand_id:       {info.hand_id}")
         print(f"  ev_hand:       {info.ev_hand}")
 
@@ -188,7 +190,7 @@ class XHandControlExample:
         print(f"  comm_err={f.commboard_err}  joint_err={f.jonitboard_err}  tip_err={f.tipboard_err}")
 
         if f.id in _FINGERTIP_IDS:
-            sensor = state.sensor_data[0]
+            sensor = state.sensor_data[_FINGERTIP_TO_SENSOR_IDX[f.id]]
             calc = sensor.calc_force
             print(f"  calc_pressure:     fx={calc.fx:.3f} fy={calc.fy:.3f} fz={calc.fz:.3f}")
             print(f"  sensor_temperature: {sensor.calc_temperature}")
@@ -255,8 +257,11 @@ def _choose_communication(xhand_exam: XHandControlExample) -> None:
                 return
             sys.exit(1)
         elif choice == "2":
-            xhand_exam.enumerate_devices("RS485")
-            if xhand_exam.open_device("RS485", _DEFAULT_SERIAL_PORT):
+            ports = xhand_exam.enumerate_devices("RS485")
+            if not ports:
+                print("  No RS485 devices found.")
+                sys.exit(1)
+            if xhand_exam.open_device("RS485", ports[0]):
                 return
             sys.exit(1)
         print("Invalid choice -- enter '1' or '2'.")

@@ -27,11 +27,14 @@ Features:
 from __future__ import annotations
 
 import argparse
+import math
 import multiprocessing as mp
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -87,7 +90,6 @@ class HeadingCalibrationConfig:
     outlier_sigma: float = 3.0
     excellent_std_deg: float = 2.0
     good_std_deg: float = 5.0
-    sanity_min_corrected_x: float = 0.98
 
     def __post_init__(self) -> None:
         if self.duration_s <= 0.0:
@@ -237,7 +239,14 @@ def main() -> None:
         "--ref", choices=["wrist", "head"], default="head",
         help="reference: head=face robot +X, wrist=extend arm pointing at robot +X",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="write the transform even when quality grade is 'poor'",
+    )
     args = parser.parse_args()
+
+    if not math.isfinite(args.duration) or args.duration <= 0:
+        parser.error("--duration must be a positive finite number of seconds")
 
     ref_label = "head (face robot +X)" if args.ref == "head" else "wrist (extend arm, point at robot +X)"
 
@@ -267,69 +276,71 @@ def main() -> None:
     if not _wait_for_vr_tracking(shared, cfg.tracking_data_timeout_s):
         _fatal_exit(shared, vr_proc, "no VR tracking data received")
 
-    # ── Settle period ──
-    print(f"  Settling ({cfg.settle_s:.0f} s) — fine-tune your pose...", flush=True)
-    time.sleep(cfg.settle_s)
+    # ── Settle / countdown / collect (guarded so SharedStorage is always cleaned) ──
+    try:
+        # ── Settle period ──
+        print(f"  Settling ({cfg.settle_s:.0f} s) — fine-tune your pose...", flush=True)
+        time.sleep(cfg.settle_s)
 
-    # ── Countdown ──
-    if args.ref == "head":
-        print("  Face the robot +X direction, hold your head still...")
-    else:
-        print("  Extend your right arm, point fingers toward robot +X, hold steady...")
-    for i in [3, 2, 1]:
-        print(f"  {i}...")
-        time.sleep(_COUNTDOWN_DWELL_S)
-
-    # ── Collect ──
-    quat_field = "wrist_quat_wxyz" if args.ref == "wrist" else "head_quat_wxyz"
-    forwards: list[np.ndarray] = []
-    deadline = time.monotonic() + args.duration
-    last_print = 0.0
-    prev_seq: int | None = None
-    stale_count = 0
-
-    print(f"  Collecting {args.duration}s (hold still)...")
-    while time.monotonic() < deadline:
-        result = shared.vr_ring.read_latest()
-        if result is None:
-            time.sleep(_POLL_INTERVAL_S)
-            continue
-
-        data, _ts, _seq = result
-
-        # Skip duplicate frames (stale VR data → falsely low std).
-        if prev_seq is not None and _seq == prev_seq:
-            stale_count += 1
-            time.sleep(_POLL_INTERVAL_S)
-            continue
-        prev_seq = _seq
-
-        q = np.asarray(data[quat_field][0], dtype=np.float64)
-        if not np.all(np.isfinite(q)):
-            continue
-
-        # For head mode: skip frames without a valid head position.
+        # ── Countdown ──
         if args.ref == "head":
-            hp = np.asarray(data["head_pos"][0], dtype=np.float64)
-            if not np.any(hp != 0):
+            print("  Face the robot +X direction, hold your head still...")
+        else:
+            print("  Extend your right arm, point fingers toward robot +X, hold steady...")
+        for i in [3, 2, 1]:
+            print(f"  {i}...")
+            time.sleep(_COUNTDOWN_DWELL_S)
+
+        # ── Collect ──
+        quat_field = "wrist_quat_wxyz" if args.ref == "wrist" else "head_quat_wxyz"
+        forwards: list[np.ndarray] = []
+        deadline = time.monotonic() + args.duration
+        last_print = 0.0
+        prev_seq: int | None = None
+        stale_count = 0
+
+        print(f"  Collecting {args.duration}s (hold still)...")
+        while time.monotonic() < deadline:
+            result = shared.vr_ring.read_latest()
+            if result is None:
+                time.sleep(_POLL_INTERVAL_S)
                 continue
 
-        q = normalize_quat_wxyz(q)
-        forwards.append(forward_from_quat_wxyz(q))
+            data, _ts, _seq = result
 
-        now = time.monotonic()
-        if now - last_print >= 1.0:
-            print(f"    collected {len(forwards)} frames...")
-            last_print = now
-        time.sleep(_POLL_INTERVAL_S)
+            # Skip duplicate frames (stale VR data → falsely low std).
+            if prev_seq is not None and _seq == prev_seq:
+                stale_count += 1
+                time.sleep(_POLL_INTERVAL_S)
+                continue
+            prev_seq = _seq
 
-    # ── Shutdown VR ──
-    shared.is_running.value = False
-    vr_proc.join(timeout=_JOIN_TIMEOUT_S)
-    if vr_proc.is_alive():
-        vr_proc.terminate()
-        vr_proc.join(timeout=_TERMINATE_TIMEOUT_S)
-    shared.close()
+            q = np.asarray(data[quat_field][0], dtype=np.float64)
+            if not np.all(np.isfinite(q)):
+                continue
+
+            # For head mode: skip frames without a valid head position.
+            if args.ref == "head":
+                hp = np.asarray(data["head_pos"][0], dtype=np.float64)
+                if not np.any(hp != 0):
+                    continue
+
+            q = normalize_quat_wxyz(q)
+            forwards.append(forward_from_quat_wxyz(q))
+
+            now = time.monotonic()
+            if now - last_print >= 1.0:
+                print(f"    collected {len(forwards)} frames...")
+                last_print = now
+            time.sleep(_POLL_INTERVAL_S)
+    finally:
+        # ── Shutdown VR (always run, even on KeyboardInterrupt) ──
+        shared.is_running.value = False
+        vr_proc.join(timeout=_JOIN_TIMEOUT_S)
+        if vr_proc.is_alive():
+            vr_proc.terminate()
+            vr_proc.join(timeout=_TERMINATE_TIMEOUT_S)
+        shared.close()
 
     if len(forwards) < cfg.min_frames:
         print(f"ERROR: only {len(forwards)} frames collected (< {cfg.min_frames} required)")
@@ -374,11 +385,22 @@ def main() -> None:
     print(f"    [{T[0, 0]:.4f}, {T[0, 1]:.4f}, {T[0, 2]:.4f}],")
     print(f"    [{T[1, 0]:.4f}, {T[1, 1]:.4f}, {T[1, 2]:.4f}],")
     print(f"    [{T[2, 0]:.4f}, {T[2, 1]:.4f}, {T[2, 2]:.4f}]")
-    if corrected[0] < cfg.sanity_min_corrected_x:
-        print("  WARNING: correction deviation is large — re-run recommended!")
     print(f"{'=' * 55}")
 
     # ── Write config ──
+    if quality["grade"] == "poor" and not args.force:
+        print(
+            f"\n  NOT written: quality grade is 'poor' "
+            f"(σ={float(quality['std_deg']):.1f}°). Re-collect a steadier sample, "
+            f"or pass --force to write anyway."
+        )
+        sys.exit(1)
+
+    if _OUTPUT_PATH.exists():
+        backup = _OUTPUT_PATH.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        shutil.copy2(_OUTPUT_PATH, backup)
+        print(f"  backed up previous transform → {backup.name}")
+
     config = {
         "schema_version": VR_TRANSFORM_SCHEMA_VERSION,
         "description": "Fixed VR-to-robot transform (FLU→robot frame)",
