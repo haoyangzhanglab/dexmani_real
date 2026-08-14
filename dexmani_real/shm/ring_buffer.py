@@ -92,6 +92,10 @@ class SeqlockSlot:
         """Mark the slot complete (even)."""
         self._ts_seq[1] = np.uint64(_seqlock_even(seq))
 
+    def stamp_timestamp(self, now_ns: int) -> None:
+        """Stamp the timestamp after the payload commit (deferred-commit writes)."""
+        self._ts_seq[0] = np.uint64(now_ns)
+
     def verify(self, marker_before: int) -> bool:
         """Return True when the marker is unchanged and complete after the payload read.
 
@@ -224,9 +228,10 @@ class SharedMemoryRingBuffer:
         """
         now_ns = time.monotonic_ns()
 
-        # Increment the logical sequence.
+        # Increment the logical sequence locally; publish it only after the
+        # payload is committed below, so a reader that samples a fresh
+        # _write_seq can never observe a half-written slot as "latest".
         seq = int(self._write_seq[0]) + 1
-        self._write_seq[0] = np.uint64(seq)
 
         # Compute slot index
         idx = seq % self.maxlen
@@ -238,6 +243,9 @@ class SharedMemoryRingBuffer:
         seqlock.begin_write(seq, now_ns)
         slot["data"] = data
         seqlock.end_write(seq)
+
+        # Publish the logical sequence only after the payload is committed.
+        self._write_seq[0] = np.uint64(seq)
 
         # Atomic write of write_idx (aligned uint64 store on x86_64)
         self._write_idx_view()[0] = np.uint64(idx)
@@ -286,10 +294,12 @@ class SharedMemoryRingBuffer:
                 if not _seqlock_is_complete(marker1):
                     continue
                 if _seqlock_to_logical(marker1) != target_seq:
-                    frames.reverse()
-                    if dropped:
-                        self._warn_torn_read_k(k, len(frames))
-                    return frames
+                    # This slot has already been overwritten by a newer write
+                    # (its marker now belongs to a later sequence).  Skip it and
+                    # keep walking older sequences rather than discarding the
+                    # still-valid history we already collected.
+                    dropped = True
+                    break
                 timestamp_ns = seqlock.timestamp_ns
                 data = slot["data"].copy().reshape(1)
                 if seqlock.verify(marker1) and _seqlock_to_logical(marker1) == target_seq:
@@ -569,18 +579,17 @@ class CameraRingBuffer:
         if self._pc_shape is not None and not 0 <= padding_count <= self._pc_shape[0]:
             raise ValueError("pc_padding_count exceeds ring capacity")
 
-        now_ns = time.monotonic_ns()
         seq = int(self._write_seq[0]) + 1
-        self._write_seq[0] = np.uint64(seq)
 
         idx = seq % self.maxlen
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
         # ── Seqlock write protocol: odd→data→even ──
-        # Write an odd marker BEFORE the payload (including timestamp) so
-        # concurrent readers see "writer active" and bail out.
+        # Write an odd marker BEFORE the payload so concurrent readers see
+        # "writer active" and bail out.  The timestamp is stamped only after the
+        # payload is committed below, so it reflects the true commit time.
         seqlock = SeqlockSlot(self._shm.buf, slot_base)
-        seqlock.begin_write(seq, now_ns)
+        seqlock.begin_write(seq, 0)
 
         # Write the fixed camera transport header.
         header_offset = slot_base + 16
@@ -588,7 +597,6 @@ class CameraRingBuffer:
             (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
         )
         header_dest[0] = header[0]
-        header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
 
         # Write RGB bytes
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
@@ -615,8 +623,18 @@ class CameraRingBuffer:
             )
             pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
 
+        # ── Commit: stamp the timestamp only after the payload is fully copied,
+        # so both the seqlock timestamp and the header publish field reflect the
+        # true commit time, not the start of a long RGB/depth/pointcloud copy.
+        now_ns = time.monotonic_ns()
+        seqlock.stamp_timestamp(now_ns)
+        header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
+
         # ── Seqlock: write even marker — payload is now consistent ──
         seqlock.end_write(seq)
+
+        # Publish the logical sequence only after the payload is committed.
+        self._write_seq[0] = np.uint64(seq)
 
         self._write_idx_view()[0] = np.uint64(idx)
         return seq
