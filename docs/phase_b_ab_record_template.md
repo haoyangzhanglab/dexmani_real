@@ -9,7 +9,8 @@
 | 字段 | 值 |
 |---|---|
 | Git commit（baseline） | `main` @ `62d803d` |
-| Git commit（B1） | `b1-single-controller` @ `633dc08` |
+| Git commit（B1） | `main` @ `789418e`（cherry-pick 自 `b70eeca`） |
+| Git commit（B2） | `b2-close-only` @ `2b5a44b`（含 `32c0823` close-only） |
 | XHand sdk_version | `1.4.6` |
 | XHand serial_number | `012R320220251128022` |
 | hand type | `R` |
@@ -100,13 +101,22 @@ B1 的 single-controller 路径在 100 次中 0 次 transient "No device found" 
 
 close-only disconnect 验收（在正常 reconnect soak 之外）：
 
-- [ ] normal exit
-- [ ] SIGTERM / orderly process termination
-- [ ] Python exception 触发 finally cleanup
-- [ ] worker crash 后由 supervisor 回收
-- [ ] SIGKILL（**只记录恢复行为**，不要求 Python cleanup 执行）
+- [x] normal exit —— exit 0（无 baseline teardown segfault）
+- [ ] SIGTERM / orderly process termination —— 未测（harness 只跑 normal 循环退出）
+- [ ] Python exception 触发 finally cleanup —— 未测
+- [ ] worker crash 后由 supervisor 回收 —— 未测
+- [ ] SIGKILL（**只记录恢复行为**，不要求 Python cleanup 执行）—— 未测
 
 判定重点：close-only 后下一次 reconnect 是否稳定、是否仍出现 stale OP / SDO failure、
 是否仍需 2–3s watchdog wait。
 
-结论：____________
+结果：100/100 connect、100/100 read，但 **16 次 `write sdo failed`（cycle 3 → 15，cycle 4 → 1）** +
+1 次 open retry（cycle 4，14.25s）；cycle 3 identity 读回 serial/hand_type `unavailable`（cycle 5 起自愈）。
+→ **仍出现 stale OP / SDO failure**，§8.4 判定重点不满足。
+
+结论：**no-go**（拒绝 close-only）。理由：B2 是三轮 soak 中唯一出现 `write sdo failed` 的 run；
+移除 INIT+watchdog 后下一次 reconnect 仍出现 stale-OP/SDO 抖动（transient 自愈，非硬 wedge）。
+两阶段 disconnect（`_request_slave_init` + 2s watchdog wait）保留为 load-bearing。
+归因 caveat（n=1）：16 次 sdo 集中在 cold-start 区（cycle 3-4）且自愈，非 16 个独立观测；baseline
+自身也有 1 次同类事件（cycle 77）；B2 一次移除两件事（INIT 请求 + 2s sleep）未单独隔离。disconnect
+仅 teardown、不在控制回路，2s wait 无 servo/estop 代价（安全审查确认 4 处 disconnect 调用点均在 command loop 之外）。

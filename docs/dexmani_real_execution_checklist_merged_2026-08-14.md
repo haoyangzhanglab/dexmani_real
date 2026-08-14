@@ -199,7 +199,7 @@
 
 #### 实施状态（2026-08-14，ultracode 对抗式审查后）
 
-**B1 patch 已备好，未做硬件验证**（commit `b70eeca`，分支 `b1-single-controller`）：
+**B1 已落地（soak 完成，判定 go）**（cherry-pick `789418e`，源自 `b70eeca` @ `b1-single-controller`）：
 - `_retry_open_device` 改为每次 attempt 一个 `XHandControl` 做 enumerate→open；新增 `_close_control`（close 并清 `self.control`）。
 - 离线 fake check `checks/offline/check_b1_single_controller.py` 覆盖 6 场景（单实例 discover+open / 重试不重发现 / config 命名跳过 / 无设备 fail-closed / 发现异常传播 / 重连再发现）。
 - 4 视角对抗审查结论：隔离变量保留正确（reconnect 语义、每 connect 一次发现、retry/delay/INIT-watchdog 均 byte-for-byte 等价），**无 blocker / high**。
@@ -207,7 +207,14 @@
   - `_close_control` 使失败后 `self.control = None`（旧代码留下 dangling closed handle）。这是「单 controller 共享 discover+open」的必然结果（discovery 现在触碰 `self.control`），且行为惰性——所有消费者都以 `connected_flag` 门控，已逐路径核对。A/B 判定无需单独关注。
   - `open-raise` 路径仍不 close（**预先存在**的泄漏，旧代码同样如此）。未并入 B1 以免混淆 A/B 结果；若真机暴露问题，作为后续独立 cleanup。
   - discovery-close 失败日志文案由 `temporary XHand discovery control did not close cleanly` 改为 `failed XHand control did not close cleanly`（无「temporary control」概念后更准确）。
-- **未做**：硬件 soak（§8.2/§8.3）。已备 soak harness `checks/hardware/xhand_reconnect_soak.py`（connect→fresh-read→disconnect 循环，无 motion，per-cycle `sdo_failures`/`open_retries` 统计，wedge-stop + `--start-cycle` 续跑，per-run 隔离 log）；A/B 记录模板见 `docs/phase_b_ab_record_template.md`。
+- **已完成**：硬件 soak（§8.2/§8.3）——baseline 100/100 connect / 0 sdo / 1 open retry（cycle 77，15.3s）；B1 100/100 connect / 0 sdo / 0 retry / exit 0（baseline teardown segfault 未现）。判定 **go**，详见 `docs/phase_b_ab_record_template.md` §1–§2。
+
+**B2 已拒绝（soak 完成，判定 no-go，不落 main）**（commit `32c0823` + `d1d07ea` @ `b2-close-only`）：
+- 100/100 connect、100/100 read，但出现 **16 次 `write sdo failed`（cycle 3 → 15，cycle 4 → 1）** + 1 次 open retry（cycle 4，14.25s stale-slave 恢复）；cycle 3 identity 读回 serial/hand_type `unavailable`（cycle 5 起自愈，transient 非硬 wedge）。
+- disconnect ~15ms（close-only）、exit 0。sdo failure 自愈后 96 cycle 干净。
+- 判定 **no-go**：违反 §8.4 判定重点「close-only 后是否仍出现 stale OP / SDO failure」——B2 是三轮 soak 中**唯一**出现 `write sdo failed` 的 run。
+- **两阶段 disconnect（`_request_slave_init` + 2s watchdog wait）保留为 load-bearing**；不删 `_request_slave_init` / `_EC_STATE_*` / `_POST_DISCONNECT_WATCHDOG_WAIT_S`。
+- **归因 caveat（诚实记录，非过度断言）**：n=1；16 次 sdo 集中在 cold-start 区（cycle 3-4）且自愈，非 16 个独立观测；baseline 自身也有 1 次同类 stale-slave 事件（cycle 77），故「close-only 是因果」仅方向性，未到统计显著。B2 一次移除两件事（INIT 请求 + 2s sleep），无法单独归因。可选后续（不阻塞落地）：confirmatory B2 run + 直接记录 disconnect/next-connect 的 slave AL 状态。
 
 ---
 
