@@ -274,59 +274,17 @@ class XHand:
         RS485 may need several attempts after cold start (C++ SDK retries
         internally, but may still fail intermittently).
 
-        Enumeration and open use SEPARATE XHandControl instances.  The
-        enumeration pass opens raw sockets on every interface to scan for
-        slaves; those sockets must be fully released before open_ethercat
-        creates its own socket on the target interface.  Reusing the same
-        control instance can leave duplicate raw sockets on the same
-        interface, causing SDO responses to route to the stale socket while
-        the open path waits on the new one — producing "write sdo failed"
-        errors observed in forked child processes.
-
-        This two-phase pattern isolates the vendor SDK's raw-socket discovery
-        lifetime from the long-lived control connection.  Keep it inside the
-        spawned hand worker: moving SDK ownership to Main would violate the
-        process boundary and make clean shutdown harder to prove.
+        B1 (experimental): discovery and open now share ONE XHandControl per
+        attempt, instead of a throwaway discovery control followed by a fresh
+        open control.  The prior two-phase pattern was introduced to avoid
+        "write sdo failed" from duplicate raw sockets left behind by the
+        enumeration pass; this experiment tests whether enumerate-then-open on
+        a single instance regresses that (or whether the SDK releases those
+        sockets on its own).  Retries, delays, and the disconnect
+        INIT-watchdog are unchanged.  Keep it inside the spawned hand worker:
+        moving SDK ownership to Main would violate the process boundary and
+        make clean shutdown harder to prove.
         """
-        # Device discovery uses a temporary control that is closed afterward.
-        if self.config.device_name is None:
-            temp_control = xhc.XHandControl()
-            discovery_output = ""
-            discovery_capture = None
-            try:
-                with capture_native_stdout() as discovery_capture:
-                    devices = temp_control.enumerate_devices(comm_type)
-                discovery_output = discovery_capture.text
-                discovery_diagnostics = extract_native_diagnostics(discovery_output)
-                if discovery_diagnostics:
-                    logger.warning("XHand discovery SDK diagnostics:\n%s", "\n".join(discovery_diagnostics))
-            except Exception:
-                discovery_output = discovery_capture.text if discovery_capture is not None else ""
-                logger.error(
-                    "XHand %s discovery raised%s",
-                    comm_type,
-                    f"; vendor output:\n{discovery_output}" if discovery_output else "",
-                    exc_info=True,
-                )
-                raise
-            finally:
-                try:
-                    temp_control.close_device()
-                except (OSError, RuntimeError):
-                    logger.warning("temporary XHand discovery control did not close cleanly", exc_info=True)
-            if devices is None or len(devices) == 0:
-                self.error_state = True
-                self.last_error_code = -2
-                self.last_error_message = f"no XHand device found for {comm_type}"
-                if discovery_output:
-                    logger.warning("XHand discovery vendor output:\n%s", discovery_output)
-                self._diagnose_connection_failure()
-                return False
-            self.device_name = devices[0]
-        else:
-            self.device_name = self.config.device_name
-
-        # Open on a fresh control; never reuse the discovery control.
         # RS485 may need several attempts after cold start; EtherCAT uses a
         # lower retry cap because each failed open_ethercat() transitions the
         # slave to OP regardless of PDO/SDO outcome, and repeated transitions
@@ -336,15 +294,54 @@ class XHand:
         )
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
+        # device_name stays None only while the config supplies no name and we
+        # have not discovered one this connect.  Discovery runs on the same
+        # control that will open (no throwaway discovery control).
+        device_name = self.config.device_name
+        self.device_name = device_name
+
         for attempt in range(1, retries + 1):
-            self.control = xhc.XHandControl()
+            self.control = xhc.XHandControl()  # one controller per attempt
+
+            if device_name is None:
+                discovery_output = ""
+                discovery_capture = None
+                try:
+                    with capture_native_stdout() as discovery_capture:
+                        devices = self.control.enumerate_devices(comm_type)
+                    discovery_output = discovery_capture.text
+                    discovery_diagnostics = extract_native_diagnostics(discovery_output)
+                    if discovery_diagnostics:
+                        logger.warning("XHand discovery SDK diagnostics:\n%s", "\n".join(discovery_diagnostics))
+                except Exception:
+                    discovery_output = discovery_capture.text if discovery_capture is not None else ""
+                    logger.error(
+                        "XHand %s discovery raised%s",
+                        comm_type,
+                        f"; vendor output:\n{discovery_output}" if discovery_output else "",
+                        exc_info=True,
+                    )
+                    self._close_control()
+                    raise
+                if devices is None or len(devices) == 0:
+                    self.error_state = True
+                    self.last_error_code = -2
+                    self.last_error_message = f"no XHand device found for {comm_type}"
+                    if discovery_output:
+                        logger.warning("XHand discovery vendor output:\n%s", discovery_output)
+                    self._close_control()
+                    self._diagnose_connection_failure()
+                    return False
+                device_name = devices[0]
+                self.device_name = device_name
+
             open_capture = None
             try:
                 with capture_native_stdout() as open_capture:
                     if comm_type == "RS485":
-                        err = self.control.open_serial(self.device_name, int(self.config.baudrate))
+                        err = self.control.open_serial(device_name, int(self.config.baudrate))
                     elif comm_type == "EtherCAT":
-                        err = self.control.open_ethercat(self.device_name)
+                        err = self.control.open_ethercat(device_name)
                     else:
                         self.error_state = True
                         self.last_error_code = -3
@@ -389,10 +386,7 @@ class XHand:
             if open_output:
                 logger.warning("XHand open attempt %d/%d vendor output:\n%s", attempt, retries, open_output)
             # Close the failed control before retry
-            try:
-                self.control.close_device()
-            except (OSError, RuntimeError):
-                logger.warning("failed XHand control did not close cleanly", exc_info=True)
+            self._close_control()
             if attempt < retries:
                 # On EtherCAT, the first failure may be a stale-slave-state
                 # condition (previous session exited without clean disconnect,
@@ -431,6 +425,20 @@ class XHand:
         )
         self._diagnose_connection_failure()
         return False
+
+    def _close_control(self) -> None:
+        """Best-effort close of the current control and clear the reference.
+
+        Used on failed open attempts and aborted discovery so a dangling
+        handle to a close_device()'d control is not left for a later
+        disconnect() to trip over.
+        """
+        if self.control is not None:
+            try:
+                self.control.close_device()
+            except (OSError, RuntimeError):
+                logger.warning("failed XHand control did not close cleanly", exc_info=True)
+            self.control = None
 
     def _init_hand_state(self) -> bool:
         """Force-refresh hardware state and read initial qpos.
@@ -803,10 +811,13 @@ class XHand:
             self.connected_flag = False
             return
         # Only perform EtherCAT cleanup when we actually connected successfully.
-        # After a failed connect(), self.control may still reference a
-        # close_device()'d handle from _retry_open_device — calling
-        # _request_slave_init() or close_device() on it again is at best a no-op
-        # and at worst triggers undefined behaviour in the C++ SDK.
+        # After a failed connect() self.control is None on the handled failure
+        # paths (no-devices / discovery-raise / open-exhausted are cleared by
+        # _close_control); the residual non-None cases (open-raise, unsupported
+        # comm_type) leave a never-opened control, not a closed one.
+        # connected_flag stays False in every failure case, so this guard keeps
+        # _request_slave_init()/close_device() off any control that never
+        # finished opening.
         if self.control is not None and self.connected_flag:
             self._request_slave_init()
             self.control.close_device()
