@@ -554,11 +554,13 @@ class PointCloudProcessor:
             path: JSON file path (relative paths resolved from the calling
                   process's working directory).
         """
-        import json
+        # Lazy import keeps the parent-process import (numpy-only) light; this
+        # helper is only invoked by the diagnostic calibration example, never
+        # by the production camera worker.
+        from dexmani_real.recording.transaction import atomic_json_dump
 
         a, b, c, d = [float(v) for v in plane]
-        with open(path, "w") as f:
-            json.dump({"a": a, "b": b, "c": c, "d": d}, f, indent=2)
+        atomic_json_dump({"a": a, "b": b, "c": c, "d": d}, path)
         from dexmani_real.utils.log import get_logger
 
         _log = get_logger(__name__)

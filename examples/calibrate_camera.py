@@ -45,6 +45,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -71,6 +72,7 @@ from dexmani_real.policy.safety import (
     planner_action_safety_gate,
     publish_joint_targets,
 )
+from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
@@ -517,13 +519,13 @@ def _save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path)
 
     if json_path.exists():
         backup = json_path.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        json_path.rename(backup)
+        # Copy (not rename) so the live cameras.json is never left absent in
+        # the window between backup and atomic write.
+        shutil.copy2(json_path, backup)
         print(f"  backed up previous config → {backup.name}")
 
     existing[cam_name] = entry
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(json_path, "w") as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
+    atomic_json_dump(existing, json_path, ensure_ascii=False)
     print(f"  calibration written → {json_path} (camera: {cam_name})")
 
 

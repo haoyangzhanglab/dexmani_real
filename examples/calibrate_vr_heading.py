@@ -27,7 +27,6 @@ Features:
 from __future__ import annotations
 
 import argparse
-import json
 import multiprocessing as mp
 import subprocess
 import sys
@@ -43,6 +42,7 @@ if str(_repo_root) not in sys.path:
 
 from dexmani_real import ASSET_DIR, PACKAGE_DIR
 from dexmani_real.planning.pose_utils import forward_from_quat_wxyz, normalize_quat_wxyz
+from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, vr_loop
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
 from dexmani_real.teleop.vr_transform import (
@@ -379,7 +379,6 @@ def main() -> None:
     print(f"{'=' * 55}")
 
     # ── Write config ──
-    _OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     config = {
         "schema_version": VR_TRANSFORM_SCHEMA_VERSION,
         "description": "Fixed VR-to-robot transform (FLU→robot frame)",
@@ -389,8 +388,7 @@ def main() -> None:
         "ref": args.ref,
         "quality": {**quality, "frames": inlier_frames},
     }
-    with open(_OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    atomic_json_dump(config, _OUTPUT_PATH)
     print(f"\nSaved to: {_OUTPUT_PATH}")
 
     # ── Audio feedback ──
