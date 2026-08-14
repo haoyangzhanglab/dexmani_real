@@ -22,7 +22,7 @@ from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
                                         send_command)
-from dexmani_real.recording.io_process import RecorderClient, RecorderPhase
+from dexmani_real.recording.recorder_client import RecorderClient, RecorderPhase
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import (AudioFeedback,

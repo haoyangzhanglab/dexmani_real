@@ -19,7 +19,7 @@ from dexmani_real.planning import Pose
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.policy.runtime import ActionCandidate
-from dexmani_real.recording.io_process import RecorderClient
+from dexmani_real.recording.recorder_client import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.utils.array_utils import nan_array

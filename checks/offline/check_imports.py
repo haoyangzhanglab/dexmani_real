@@ -48,6 +48,18 @@ def main() -> int:
         send_command,
     )
 
+    # recording protocol / process
+    from dexmani_real.recording.recorder_client import (  # noqa: F401
+        RecorderClient,
+        RecorderCommand,
+        RecorderPhase,
+        RecorderStopResult,
+    )
+    from dexmani_real.recording.io_process import (  # noqa: F401
+        RecorderIOConfig,
+        recorder_io_loop,
+    )
+
     print("OK: imports resolved")
     return 0
 
