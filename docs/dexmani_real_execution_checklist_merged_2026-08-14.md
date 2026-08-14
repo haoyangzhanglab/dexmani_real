@@ -197,6 +197,18 @@
 - **实验**：`close_device` + `connected_flag=False` + `control=None`（前置：command loop 已退出、无后续 send/read）。测 normal exit / SIGTERM / exception finally / supervisor 回收 / SIGKILL（只记录恢复）。
 - **通过后**：删 `_request_slave_init`、`_EC_STATE_*`、`_POST_DISCONNECT_WATCHDOG_WAIT_S` 及"必须等 watchdog"注释。仅当某 SDK/firmware 组合需旧路径才保留 narrow fallback（注释写清 SDK 版本/固件/复现/日期）。
 
+#### 实施状态（2026-08-14，ultracode 对抗式审查后）
+
+**B1 patch 已备好，未做硬件验证**（commit `b70eeca`，分支 `b1-single-controller`）：
+- `_retry_open_device` 改为每次 attempt 一个 `XHandControl` 做 enumerate→open；新增 `_close_control`（close 并清 `self.control`）。
+- 离线 fake check `checks/offline/check_b1_single_controller.py` 覆盖 6 场景（单实例 discover+open / 重试不重发现 / config 命名跳过 / 无设备 fail-closed / 发现异常传播 / 重连再发现）。
+- 4 视角对抗审查结论：隔离变量保留正确（reconnect 语义、每 connect 一次发现、retry/delay/INIT-watchdog 均 byte-for-byte 等价），**无 blocker / high**。
+- **已知偏离（记录而非修正）**：
+  - `_close_control` 使失败后 `self.control = None`（旧代码留下 dangling closed handle）。这是「单 controller 共享 discover+open」的必然结果（discovery 现在触碰 `self.control`），且行为惰性——所有消费者都以 `connected_flag` 门控，已逐路径核对。A/B 判定无需单独关注。
+  - `open-raise` 路径仍不 close（**预先存在**的泄漏，旧代码同样如此）。未并入 B1 以免混淆 A/B 结果；若真机暴露问题，作为后续独立 cleanup。
+  - discovery-close 失败日志文案由 `temporary XHand discovery control did not close cleanly` 改为 `failed XHand control did not close cleanly`（无「temporary control」概念后更准确）。
+- **未做**：硬件 soak（§8.2/§8.3）；A/B 记录模板见 `docs/phase_b_ab_record_template.md`。
+
 ---
 
 ### 3.5 结构减法（最后，行为保持）
