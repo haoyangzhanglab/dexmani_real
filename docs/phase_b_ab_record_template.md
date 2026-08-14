@@ -8,15 +8,16 @@
 
 | 字段 | 值 |
 |---|---|
-| Git commit | `git rev-parse --short HEAD` |
-| XHand sdk_version | |
-| XHand serial_number | |
-| hand type | |
-| Python version | `python --version` |
-| controller package / native lib 位置 | |
-| EtherCAT interface / device_name | |
-| process start method | spawn / fork |
-| OS / kernel | `uname -a` |
+| Git commit（baseline） | `main` @ `62d803d` |
+| Git commit（B1） | `b1-single-controller` @ `633dc08` |
+| XHand sdk_version | `1.4.6` |
+| XHand serial_number | `012R320220251128022` |
+| hand type | `R` |
+| Python version | `3.10.20`（conda env `real_robot`） |
+| controller package / native lib 位置 | `xhand_controller`（import 名 `xhc`） |
+| EtherCAT interface / device_name | `eno1`（discovery 模式，`device_name=None`） |
+| process start method | harness 单进程；driver 在循环内 create/destroy（非 mp spawn） |
+| OS / kernel | `Linux workstation 6.17.0-40-generic`（Ubuntu 24.04） |
 
 ## 0.1 运行方式（自动化 harness，真人执行）
 
@@ -43,38 +44,57 @@ conda run -n real_robot python checks/hardware/xhand_reconnect_soak.py --cycles 
 
 > ⚠️ 没有明确运动授权时**不要发 finger motion command**。
 
-| 指标 | 计数 |
-|---|---|
-| 总循环数 | |
-| connect success | |
-| connect fail | |
-| `open_ethercat` error code（分布） | |
-| `write sdo failed` 出现次数 / 字符串 | |
-| 需要 power-cycle 次数 | |
-| close/reconnect hang 次数 | |
-| 下次 session 无法 reconnect 次数 | |
-| connect 平均/最大 latency | |
-| disconnect 平均/最大 latency | |
+| 指标 | baseline（`main`） | B1（`b1-single-controller`） |
+|---|---|---|
+| 总循环数 | 100 | 100 |
+| connect success | 100 | 100 |
+| connect fail | 0 | 0 |
+| `open_ethercat` error code（分布） | 0 次非零（1 次 transient "No device found" 后重试成功，见下） | 0 次 |
+| `write sdo failed` 出现次数 / 字符串 | 0 | 0 |
+| 需要 power-cycle 次数 | 0 | 0 |
+| close/reconnect hang 次数 | 0 | 0 |
+| 下次 session 无法 reconnect 次数 | 0 | 0 |
+| open retries（`succeeded on attempt 2+`） | **1（cycle 77）** | **0** |
+| connect 平均/最大 latency | avg=1387.4ms / **max=15326.3ms**（cycle 77 重试） | avg=1243.3ms / max=1330.7ms |
+| disconnect 平均/最大 latency | avg=2018.3ms / max=2029.0ms | avg=2019.0ms / max=2044.5ms |
 
-关键 vendor stdout/stderr（复现时粘贴）：
+关键 vendor stdout/stderr（复现时粘贴）—— baseline cycle 77 的 transient stale-slave 重试：
+
 ```text
+[22:43:52] [WARNING] [dexmani_real.robot.xhand] XHand open attempt 1/2 vendor output:
+ec_init on eno1 succeeded.
+[22:43:52] [WARNING] [dexmani_real.robot.xhand] XHand connect attempt 1/2 failed: No device found — waiting 3.0s for potential stale-slave recovery before retry...
+[22:43:55] [WARNING] [dexmani_real.robot.xhand] XHand connect succeeded on attempt 2/2 (retries indicate SDO/communication glitch) — adding 1.0s post-recovery stabilisation delay.
 ```
+
+**附加发现（teardown segfault，非 per-cycle 指标）**：
+baseline 这轮在 100 个 cycle 全部完成、`SOAK SUMMARY` 打印 `stop reason: completed` **之后**，
+进程退出时 native `EcatUpdateThread` 在解释器卸载 `.so` 时 use-after-free → SIGSEGV（exit 139）。
+vendor log 尾部是一条线程/cycle 的 `EcatUpdateThread: Operation not permitted`（RT 调度失败，driver 已忽略）。
+B1 复跑 `--cycles 2` **确认 `EXIT_CODE=0` 干净退出**（无 segfault），且 B1 的 `EcatUpdateThread` 消息
+在 run 启动即打印（每条/线程），而 baseline 是 teardown 后洪流——两者 native 线程回收时序不同。
+故 teardown segfault 是 baseline 侧现象，B1 未复现（确认两次：先 100-cycle 无崩溃痕迹，后 2-cycle exit 0）。
 
 ## 2. B1 判定（§8.3，go / no-go）
 
 仅当**全部**满足才保留 single-controller：
 
-- [ ] 正常循环无 reproducible `write sdo failed` 回归
-- [ ] failure rate 不高于 baseline（main 分支同条件各跑一轮对比）
-- [ ] 不增加 power-cycle requirement
-- [ ] 不出现 close/reconnect hang
-- [ ] repeated run 后资源无明显泄漏（`ps`/fd/内存观察）
-- [ ] 失败时 diagnostics 仍足以定位
+- [x] 正常循环无 reproducible `write sdo failed` 回归 —— 两分支均 0
+- [x] failure rate 不高于 baseline —— 均 0/100；B1 反而少 1 次 transient "No device found"（0 vs 1）
+- [x] 不增加 power-cycle requirement —— 均 0
+- [x] 不出现 close/reconnect hang —— 均 0
+- [x] repeated run 后资源无明显泄漏 —— B1 干净退出（exit 0，确认两次）；baseline teardown segfault（exit 139，native EcatUpdateThread 未被 join）。B1 不劣于 baseline，反而少了 baseline 的 teardown 崩溃
+- [x] 失败时 diagnostics 仍足以定位 —— 两分支 vendor log 完整（含 open attempt N/M、stale-slave 恢复、succeeded on attempt）
 
 **只有**出现可重复现象 `single-controller → SDO fail；isolated discovery → 同 setup 成功`，
 才有证据保留 isolated discovery workaround —— 此时才加**极窄** compatibility switch，不提前加。
+→ 本次未出现该现象。
 
-结论：`go` / `no-go`，理由：____________
+结论：**go**（推荐保留 B1）。理由：100 次循环 reconnect 可靠性两分支均 100/100 无回归；
+B1 的 single-controller 路径在 100 次中 0 次 transient "No device found" 重试，baseline 出现 1 次（cycle 77，
+连带 3s stale-slave 恢复 + 1s 稳定化 = 15.3s connect 尾部）。方向性支持 B1，但 n=1 判别力弱，
+建议后续按 §8.2 扩到 500 次再确认。teardown segfault 是 SDK 层 close_device 未 join native 线程的独立问题
+（发生在完成后、不影响 per-cycle 指标），单独跟踪，不作为 B1 否决项。
 
 ## 3. B2（仅 B1 选定后，§8.4）
 
