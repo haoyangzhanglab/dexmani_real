@@ -227,6 +227,7 @@ class TrajectoryData:
     jerk_management: str | None = None
     resolved_config_sha256: str | None = None
     model_provenance: tuple[tuple[str, str], ...] = ()
+    send_mask: np.ndarray | None = None
 
     @property
     def has_hand(self) -> bool:
@@ -332,6 +333,11 @@ def load_trajectory(
         )
         hand_qpos = np.asarray(h5["hand_qpos"][:total_frames], dtype=np.float64) if "hand_qpos" in h5 else None
         arm_ee = np.asarray(h5["arm_ee"][:total_frames], dtype=np.float64) if "arm_ee" in h5 else None
+        send_mask = (
+            np.asarray(h5["flag_action_queued"][:total_frames], dtype=bool)
+            if "flag_action_queued" in h5
+            else None
+        )
 
     arrays: dict[str, tuple[np.ndarray, tuple[int, ...]]] = {
         "arm action": (action_arm_joint, (total_frames, *ARM_JOINT_SHAPE)),
@@ -365,6 +371,7 @@ def load_trajectory(
         jerk_management=jerk_management,
         resolved_config_sha256=resolved_config_sha256,
         model_provenance=model_provenance,
+        send_mask=send_mask,
     )
     logger.info(
         "Loaded trajectory: %d frames, fps=%.1f, task=%s, hand=%s, ee=%s",
@@ -1269,7 +1276,15 @@ class TrajectoryReplayer:
                 hand_cmd = None
                 if has_hand and self.traj.action_hand_joint is not None:
                     hand_cmd = self.traj.action_hand_joint[frame_idx].copy()
-                if not np.all(np.isfinite(arm_cmd)) or (hand_cmd is not None and not np.all(np.isfinite(hand_cmd))):
+                # ``flag_action_queued`` marks whether a command was actually
+                # queued on this grid slot during recording.  Synthetic hold
+                # slots recorded no send event; reproduce that quiescence below
+                # rather than republishing the inherited effective target.
+                send_this = self.traj.send_mask is None or bool(self.traj.send_mask[frame_idx])
+                if send_this and (
+                    not np.all(np.isfinite(arm_cmd))
+                    or (hand_cmd is not None and not np.all(np.isfinite(hand_cmd)))
+                ):
                     self._fault(f"frame {frame_idx} contains a non-finite replay action")
                     break
 
@@ -1307,6 +1322,28 @@ class TrajectoryReplayer:
                         break
                     assert hand_state is not None
                     hand_qpos = hand_state["qpos"]
+
+                if not send_this:
+                    # Recorded command quiescence: observe and record the slot
+                    # but send nothing (Mode 6 finishes the last accepted
+                    # endpoint).  ``arm_sent_cmd`` stays NaN in the recorder.
+                    self._recorder.record(
+                        frame_idx,
+                        arm_state["qpos"],
+                        arm_state["eef_pos"],
+                        arm_state["eef_rot6d"],
+                        arm_cmd,
+                        hand_cmd,
+                        time.perf_counter(),
+                        arm_tracking_error=arm_state["tracking_err"],
+                        hand_qpos=hand_qpos,
+                    )
+                    frame_idx += 1
+                    next_deadline_s += period_s
+                    now_s = time.perf_counter()
+                    if next_deadline_s < now_s:
+                        next_deadline_s = now_s + period_s
+                    continue
 
                 is_final_frame = frame_idx == frame_count - 1
                 published = publish_joint_targets(

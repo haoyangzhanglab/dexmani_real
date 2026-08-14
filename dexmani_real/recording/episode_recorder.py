@@ -584,6 +584,19 @@ class EpisodeRecorder:
             self._buffer.data["tactile_fresh"][new_slice] &= source_valid
             self._buffer.data["flag_camera_fresh"][new_slice] &= source_valid
             self._buffer.data["flag_pointcloud_valid"][new_slice] &= source_valid
+            # Synthetic gap/hold slots inherit the last source's effective
+            # target but must not claim a send event: clear the action-queue
+            # flag and zero action identity/timing on non-source slots so
+            # replay does not republish commands that were never sent.
+            hold_slots = ~source_valid
+            self._buffer.data["flag_action_queued"][new_slice] &= source_valid
+            for name in (
+                "action_id",
+                "action_created_monotonic_ns",
+                "action_target_monotonic_ns",
+                "action_valid_until_monotonic_ns",
+            ):
+                self._buffer.data[name][new_slice][hold_slots] = 0
 
         # ── Periodic non-camera flush: write buffered streams to HDF5 ──
         if self._buffer.size - self._flushed_frames >= self._flush_interval:
