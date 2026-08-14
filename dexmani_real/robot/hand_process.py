@@ -289,199 +289,201 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             return None
         return data.copy()
 
-    while shared.is_running.value:
-        # Heartbeat — written even when gated (proves we're alive)
-        shared.set_heartbeat("hand", time.monotonic())
+    try:
+        while shared.is_running.value:
+            # Heartbeat — written even when gated (proves we're alive)
+            shared.set_heartbeat("hand", time.monotonic())
 
-        if shared.estop_request.value:
-            break
+            if shared.estop_request.value:
+                break
 
-        # Safety state gate — only process commands in ARMED or RUNNING.
-        _safety = shared.safety_state.value
-        if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-            execute_action = _read_latest_command()
-            if execute_action is not None:
-                cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
-                try:
-                    sent = hand.send_action(cmd)
-                except Exception:
-                    sent = False
-                    logger.warning("hand_loop: send_action raised", exc_info=True)
-                if sent:
-                    _send_error_counter.reset()
-                    last_applied_action_id = int(execute_action["action_id"][0])
-                else:
-                    _send_error_counter.inc()
+            # Safety state gate — only process commands in ARMED or RUNNING.
+            _safety = shared.safety_state.value
+            if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
+                execute_action = _read_latest_command()
+                if execute_action is not None:
+                    cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
+                    try:
+                        sent = hand.send_action(cmd)
+                    except Exception:
+                        sent = False
+                        logger.warning("hand_loop: send_action raised", exc_info=True)
+                    if sent:
+                        _send_error_counter.reset()
+                        last_applied_action_id = int(execute_action["action_id"][0])
+                    else:
+                        _send_error_counter.inc()
 
-            # Send-error watchdog: auto clear_local_error() after consecutive failures.
-            if _send_error_counter.triggered:
-                shared.error_state.value = True
-                logger.error("hand_loop: persistent send failures — latching global fault")
-                _now = time.monotonic()
-                if _now - _last_clear_error_s > 2.0:
-                    logger.warning("hand_loop: %d consecutive send errors — clear_local_error()", _send_error_counter.count)
+                # Send-error watchdog: auto clear_local_error() after consecutive failures.
+                if _send_error_counter.triggered:
+                    shared.error_state.value = True
+                    logger.error("hand_loop: persistent send failures — latching global fault")
+                    _now = time.monotonic()
+                    if _now - _last_clear_error_s > 2.0:
+                        logger.warning("hand_loop: %d consecutive send errors — clear_local_error()", _send_error_counter.count)
+                        try:
+                            hand.clear_local_error()
+                        except Exception:
+                            logger.warning("hand_loop: clear_local_error() failed", exc_info=True)
+                        _last_clear_error_s = _now
+
+            # Read state (always — even when safety-gated)
+            try:
+                st = hand.get_state(full=True, force_update=True)
+                # Use sentinel-based .get() to avoid eager fallback allocation.
+                # dict.get(key, default) evaluates `default` unconditionally,
+                # wasting ~14.5 KB per tick (30 Hz) on large tactile arrays.
+                _raw_qpos = st.get("qpos")
+                qpos = np.asarray(_raw_qpos if _raw_qpos is not None else np.zeros(HAND_JOINT_SHAPE), dtype=np.float64)
+                _raw_current = st.get("current")
+                current = np.asarray(
+                    _raw_current if _raw_current is not None else np.zeros(HAND_JOINT_SHAPE), dtype=np.float64
+                )
+                _raw_ts = st.get("tactile_force_sum")
+                tactile_sum = np.asarray(
+                    _raw_ts if _raw_ts is not None else np.zeros(HAND_TACTILE_SUM_SHAPE), dtype=np.float64
+                )
+                _raw_tf = st.get("tactile_force")
+                tactile_force = np.asarray(
+                    _raw_tf if _raw_tf is not None else np.zeros(HAND_TACTILE_FORCE_SHAPE), dtype=np.float64
+                )
+                _raw_tc = st.get("tactile_contact")
+                tactile_contact = np.asarray(
+                    _raw_tc if _raw_tc is not None else np.zeros(HAND_CONTACT_SHAPE, dtype=bool), dtype=bool
+                )
+                expected_shapes = (
+                    ("qpos", qpos, HAND_JOINT_SHAPE),
+                    ("current", current, HAND_JOINT_SHAPE),
+                    ("tactile_force_sum", tactile_sum, HAND_TACTILE_SUM_SHAPE),
+                    ("tactile_force", tactile_force, HAND_TACTILE_FORCE_SHAPE),
+                    ("tactile_contact", tactile_contact, HAND_CONTACT_SHAPE),
+                )
+                for field_name, value, expected_shape in expected_shapes:
+                    if value.shape != expected_shape:
+                        raise ValueError(f"invalid {field_name} shape {value.shape}, expected {expected_shape}")
+                    if field_name != "tactile_contact" and not np.all(np.isfinite(value)):
+                        raise ValueError(f"{field_name} contains NaN/Inf")
+                connected = hand.connected_flag
+                error_state = hand.error_state
+                _last_state_source_ns = time.monotonic_ns()
+                last_known_qpos = qpos.copy()
+                _last_tactile_sum = tactile_sum.copy()
+                _last_tactile_force = tactile_force.copy()
+                _read_error_counter.reset()
+                # Board error registers (per-joint hardware fault indicators).
+                _raw_cbe = st.get("commboard_err")
+                commboard_err = np.asarray(
+                    _raw_cbe if _raw_cbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
+                )
+                _raw_jbe = st.get("jointboard_err")
+                jointboard_err = np.asarray(
+                    _raw_jbe if _raw_jbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
+                )
+                _raw_tbe = st.get("tipboard_err")
+                tipboard_err = np.asarray(
+                    _raw_tbe if _raw_tbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
+                )
+            except Exception:
+                logger.warning("hand_loop: get_state failed", exc_info=True)
+                qpos = last_known_qpos.copy()
+                current = np.zeros(HAND_JOINT_SHAPE)
+                tactile_sum = _last_tactile_sum.copy()
+                tactile_force = _last_tactile_force.copy()
+                tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
+                connected = False
+                error_state = False  # transient comm glitch — do NOT fabricate error_state
+                commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+                jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+                tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+
+                # Read-error escalation: persistent get_state exceptions (SDK crash,
+                # USB disconnect) bypass the normal error_state retry path because
+                # error_state is forced to False above.  A dedicated counter ensures
+                # this silent-dead-hand scenario still escalates to global error_state.
+                _read_error_counter.inc()
+                if _read_error_counter.triggered:
+                    shared.error_state.value = True
+                    logger.error(
+                        "hand_loop: %d consecutive get_state exceptions — latching global error_state",
+                        _read_error_counter.max_consecutive,
+                    )
+
+            # Retry transient hand errors only for the configured bounded window.
+            if error_state and not shared.error_state.value:
+                _error_state_counter.inc()
+                _now_err = time.monotonic()
+                if _now_err - _last_error_clear_s > 1.0:
+                    logger.warning(
+                        "hand_loop: hand error_state — clear_local_error() (%d/%d consecutive)",
+                        _error_state_counter.count,
+                        _error_state_counter.max_consecutive,
+                    )
                     try:
                         hand.clear_local_error()
                     except Exception:
                         logger.warning("hand_loop: clear_local_error() failed", exc_info=True)
-                    _last_clear_error_s = _now
+                    _last_error_clear_s = _now_err
+                if _error_state_counter.triggered:
+                    shared.error_state.value = True
+                    logger.error(
+                        "hand_loop: hand error_state persisted after %d retries — latching global error_state",
+                        _error_state_counter.max_consecutive,
+                    )
+            elif not error_state:
+                _error_state_counter.reset()
 
-        # Read state (always — even when safety-gated)
+            # Publish state
+            frame = _nf(HAND_STATE_DTYPE)
+            frame["qpos"][0] = qpos
+            frame["current"][0] = current
+            frame["tactile_sum"][0] = tactile_sum
+            frame["tactile_contact"][0] = tactile_contact
+            frame["error_state"][0] = int(error_state)
+            frame["connected"][0] = int(connected)
+            frame["qpos_stale"][0] = 0
+            frame["last_cmd_seq"][0] = last_applied_action_id
+            frame["last_cmd_qpos"][0] = np.asarray(hand.last_qpos_cmd, dtype=np.float64)
+            frame["commboard_err"][0] = commboard_err
+            frame["jointboard_err"][0] = jointboard_err
+            frame["tipboard_err"][0] = tipboard_err
+            frame["source_monotonic_ns"][0] = _last_state_source_ns
+            frame["publish_monotonic_ns"][0] = time.monotonic_ns()
+            frame["state_valid"][0] = int(connected)
+            frame["send_healthy"][0] = int(not _send_error_counter.triggered)
+            frame["read_healthy"][0] = int(not _read_error_counter.triggered)
+            frame["timestamp"][0] = _last_state_source_ns / 1e9
+            shared.hand_state_ring.write(frame)
+
+            # Every successful read is a source sample, including release/no-contact.
+            if connected:
+                tf = _nf(HAND_TACTILE_DTYPE)
+                tf["tactile_force"][0] = tactile_force
+                tf["source_monotonic_ns"][0] = _last_state_source_ns
+                tf["fresh"][0] = 1
+                tf["calibrated"][0] = int(hand.tactile_calibrated)
+                # The SDK conversion provenance has not been independently
+                # established on hardware.  Preserve the values, but label their
+                # unit as unknown instead of guessing Newtons.
+                tf["unit_code"][0] = 0
+                shared.hand_tactile_ring.write(tf)
+
+            # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
+            rate_mgr.wait()
+    finally:
+        # Shutdown never creates new motion. Homing is an explicit, correlated
+        # policy operation; worker cleanup only closes the device and releases the
+        # bus after the command loop has been gated. The hand is intentionally NOT
+        # unforced (mode=0) on shutdown — it stays in its last commanded position,
+        # matching examples/xhand_control_example.py.
+        stopped_cleanly = False
         try:
-            st = hand.get_state(full=True, force_update=True)
-            # Use sentinel-based .get() to avoid eager fallback allocation.
-            # dict.get(key, default) evaluates `default` unconditionally,
-            # wasting ~14.5 KB per tick (30 Hz) on large tactile arrays.
-            _raw_qpos = st.get("qpos")
-            qpos = np.asarray(_raw_qpos if _raw_qpos is not None else np.zeros(HAND_JOINT_SHAPE), dtype=np.float64)
-            _raw_current = st.get("current")
-            current = np.asarray(
-                _raw_current if _raw_current is not None else np.zeros(HAND_JOINT_SHAPE), dtype=np.float64
-            )
-            _raw_ts = st.get("tactile_force_sum")
-            tactile_sum = np.asarray(
-                _raw_ts if _raw_ts is not None else np.zeros(HAND_TACTILE_SUM_SHAPE), dtype=np.float64
-            )
-            _raw_tf = st.get("tactile_force")
-            tactile_force = np.asarray(
-                _raw_tf if _raw_tf is not None else np.zeros(HAND_TACTILE_FORCE_SHAPE), dtype=np.float64
-            )
-            _raw_tc = st.get("tactile_contact")
-            tactile_contact = np.asarray(
-                _raw_tc if _raw_tc is not None else np.zeros(HAND_CONTACT_SHAPE, dtype=bool), dtype=bool
-            )
-            expected_shapes = (
-                ("qpos", qpos, HAND_JOINT_SHAPE),
-                ("current", current, HAND_JOINT_SHAPE),
-                ("tactile_force_sum", tactile_sum, HAND_TACTILE_SUM_SHAPE),
-                ("tactile_force", tactile_force, HAND_TACTILE_FORCE_SHAPE),
-                ("tactile_contact", tactile_contact, HAND_CONTACT_SHAPE),
-            )
-            for field_name, value, expected_shape in expected_shapes:
-                if value.shape != expected_shape:
-                    raise ValueError(f"invalid {field_name} shape {value.shape}, expected {expected_shape}")
-                if field_name != "tactile_contact" and not np.all(np.isfinite(value)):
-                    raise ValueError(f"{field_name} contains NaN/Inf")
-            connected = hand.connected_flag
-            error_state = hand.error_state
-            _last_state_source_ns = time.monotonic_ns()
-            last_known_qpos = qpos.copy()
-            _last_tactile_sum = tactile_sum.copy()
-            _last_tactile_force = tactile_force.copy()
-            _read_error_counter.reset()
-            # Board error registers (per-joint hardware fault indicators).
-            _raw_cbe = st.get("commboard_err")
-            commboard_err = np.asarray(
-                _raw_cbe if _raw_cbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
-            )
-            _raw_jbe = st.get("jointboard_err")
-            jointboard_err = np.asarray(
-                _raw_jbe if _raw_jbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
-            )
-            _raw_tbe = st.get("tipboard_err")
-            tipboard_err = np.asarray(
-                _raw_tbe if _raw_tbe is not None else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32), dtype=np.int32
-            )
+            hand.disconnect()
+            stopped_cleanly = True
         except Exception:
-            logger.warning("hand_loop: get_state failed", exc_info=True)
-            qpos = last_known_qpos.copy()
-            current = np.zeros(HAND_JOINT_SHAPE)
-            tactile_sum = _last_tactile_sum.copy()
-            tactile_force = _last_tactile_force.copy()
-            tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
-            connected = False
-            error_state = False  # transient comm glitch — do NOT fabricate error_state
-            commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-            jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-            tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-
-            # Read-error escalation: persistent get_state exceptions (SDK crash,
-            # USB disconnect) bypass the normal error_state retry path because
-            # error_state is forced to False above.  A dedicated counter ensures
-            # this silent-dead-hand scenario still escalates to global error_state.
-            _read_error_counter.inc()
-            if _read_error_counter.triggered:
-                shared.error_state.value = True
-                logger.error(
-                    "hand_loop: %d consecutive get_state exceptions — latching global error_state",
-                    _read_error_counter.max_consecutive,
-                )
-
-        # Retry transient hand errors only for the configured bounded window.
-        if error_state and not shared.error_state.value:
-            _error_state_counter.inc()
-            _now_err = time.monotonic()
-            if _now_err - _last_error_clear_s > 1.0:
-                logger.warning(
-                    "hand_loop: hand error_state — clear_local_error() (%d/%d consecutive)",
-                    _error_state_counter.count,
-                    _error_state_counter.max_consecutive,
-                )
-                try:
-                    hand.clear_local_error()
-                except Exception:
-                    logger.warning("hand_loop: clear_local_error() failed", exc_info=True)
-                _last_error_clear_s = _now_err
-            if _error_state_counter.triggered:
-                shared.error_state.value = True
-                logger.error(
-                    "hand_loop: hand error_state persisted after %d retries — latching global error_state",
-                    _error_state_counter.max_consecutive,
-                )
-        elif not error_state:
-            _error_state_counter.reset()
-
-        # Publish state
-        frame = _nf(HAND_STATE_DTYPE)
-        frame["qpos"][0] = qpos
-        frame["current"][0] = current
-        frame["tactile_sum"][0] = tactile_sum
-        frame["tactile_contact"][0] = tactile_contact
-        frame["error_state"][0] = int(error_state)
-        frame["connected"][0] = int(connected)
-        frame["qpos_stale"][0] = 0
-        frame["last_cmd_seq"][0] = last_applied_action_id
-        frame["last_cmd_qpos"][0] = np.asarray(hand.last_qpos_cmd, dtype=np.float64)
-        frame["commboard_err"][0] = commboard_err
-        frame["jointboard_err"][0] = jointboard_err
-        frame["tipboard_err"][0] = tipboard_err
-        frame["source_monotonic_ns"][0] = _last_state_source_ns
-        frame["publish_monotonic_ns"][0] = time.monotonic_ns()
-        frame["state_valid"][0] = int(connected)
-        frame["send_healthy"][0] = int(not _send_error_counter.triggered)
-        frame["read_healthy"][0] = int(not _read_error_counter.triggered)
-        frame["timestamp"][0] = _last_state_source_ns / 1e9
-        shared.hand_state_ring.write(frame)
-
-        # Every successful read is a source sample, including release/no-contact.
-        if connected:
-            tf = _nf(HAND_TACTILE_DTYPE)
-            tf["tactile_force"][0] = tactile_force
-            tf["source_monotonic_ns"][0] = _last_state_source_ns
-            tf["fresh"][0] = 1
-            tf["calibrated"][0] = int(hand.tactile_calibrated)
-            # The SDK conversion provenance has not been independently
-            # established on hardware.  Preserve the values, but label their
-            # unit as unknown instead of guessing Newtons.
-            tf["unit_code"][0] = 0
-            shared.hand_tactile_ring.write(tf)
-
-        # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
-        rate_mgr.wait()
-    # Shutdown never creates new motion. Homing is an explicit, correlated
-    # policy operation; worker cleanup only closes the device and releases the
-    # bus after the command loop has been gated. The hand is intentionally NOT
-    # unforced (mode=0) on shutdown — it stays in its last commanded position,
-    # matching examples/xhand_control_example.py.
-    stopped_cleanly = False
-    try:
-        hand.disconnect()
-        stopped_cleanly = True
-    except Exception:
-        logger.warning("hand_loop: cleanup failed", exc_info=True)
-        shared.error_state.value = True
-    if stopped_cleanly:
-        logger.debug("hand_loop: STOPPED")
-    else:
-        logger.error("hand_loop: XHand disconnect failed")
-    logger.info("hand_loop: exited")
+            logger.warning("hand_loop: cleanup failed", exc_info=True)
+            shared.error_state.value = True
+        if stopped_cleanly:
+            logger.debug("hand_loop: STOPPED")
+        else:
+            logger.error("hand_loop: XHand disconnect failed")
+        logger.info("hand_loop: exited")
