@@ -173,13 +173,10 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     """
     import numpy as np
 
-    from dexmani_real.runtime.status import ComponentPhase, FaultCode
-    from dexmani_real.shm.shared_storage import publish_component_status
-
     _logger = get_logger("camera_loop")
     cfg = config or CameraLoopConfig()
     failed = False
-    publish_component_status(shared, "camera", ComponentPhase.LOADING)
+    _logger.debug("camera_loop: LOADING")
 
     # ── Thread pool limit ──
     # OpenCV/NumPy default to multi-threading on many-core machines, competing
@@ -211,13 +208,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         if not cam.connect():
             _logger.error("camera_loop: RealSense connect failed")
             failed = True
-            publish_component_status(
-                shared,
-                "camera",
-                ComponentPhase.FAULT,
-                fault_code=FaultCode.STARTUP_FAILED,
-                detail="RealSense connect failed",
-            )
             return
 
         # ── Publish metadata to SharedStorage ──
@@ -274,15 +264,12 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         ready_published = False
 
         while shared.is_running.value:
-            _observation_request = getattr(shared, "camera_observation_required", None)
-            # Pointcloud is only consumed by RecorderIO and inference, so compute
-            # it only when one of them needs it.  Frame publication, by contrast,
-            # must continue through the DISARMED startup phase so Main's preflight
-            # health gate (source_monotonic_ns within max_frame_age_s) sees a
-            # recent frame instead of the single stale ready probe.
-            _needs_pointcloud = bool(shared.is_recording.value) or bool(
-                _observation_request is not None and _observation_request.value
-            )
+            # Pointcloud is only consumed by RecorderIO, so compute it only when
+            # recording.  Frame publication, by contrast, must continue through
+            # the DISARMED startup phase so Main's preflight health gate
+            # (source_monotonic_ns within max_frame_age_s) sees a recent frame
+            # instead of the single stale ready probe.
+            _needs_pointcloud = bool(shared.is_recording.value)
             _publish_payload = (
                 not ready_published
                 or int(shared.safety_state.value) == int(SafetyState.DISARMED)
@@ -312,8 +299,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             # --- write to SharedStorage ring ---
             # Bridge frames during the DISARMED startup phase (so the preflight
             # health gate observes a fresh source frame) and whenever RecorderIO
-            # or a learned observation spec consumes them; otherwise avoid
-            # sustained ~1.6 MB/frame SHM copies.
+            # consumes them; otherwise avoid sustained ~1.6 MB/frame SHM copies.
             if _publish_payload:
                 pc_source_point_count = 0
                 pc_valid_depth_ratio = float(np.count_nonzero(frame.depth_raw) / frame.depth_raw.size)
@@ -364,7 +350,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                     if not ready_published:
                         ready_published = True
                         shared.set_ready("camera")
-                        publish_component_status(shared, "camera", ComponentPhase.READY)
+                        _logger.debug("camera_loop: READY")
                         _logger.info("camera_loop: ready after first verified frame @ %.1f Hz", cfg.publish_hz)
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
@@ -375,13 +361,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     except Exception:
         failed = True
         _logger.exception("camera_loop: crashed")
-        publish_component_status(
-            shared,
-            "camera",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.CAMERA_INVALID,
-            detail="camera process crashed; see process log",
-        )
     finally:
         if cam is not None:
             try:
@@ -390,5 +369,5 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 failed = True
                 _logger.warning("camera_loop: disconnect failed", exc_info=True)
         if not failed:
-            publish_component_status(shared, "camera", ComponentPhase.STOPPED)
+            _logger.debug("camera_loop: STOPPED")
         _logger.info("camera_loop: exited")

@@ -733,9 +733,6 @@ def _unpack_sample(
 
 def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
     """Long-lived process target. Recording errors never latch robot FAULT."""
-    from dexmani_real.runtime.status import ComponentPhase, FaultCode
-    from dexmani_real.shm.shared_storage import publish_component_status
-
     recorder: EpisodeRecorder | None = None
     active_generation = 0
     last_control_sequence = 0
@@ -744,7 +741,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
     failure_count = 0
     crashed = False
     try:
-        publish_component_status(shared, "recorder", ComponentPhase.LOADING)
+        logger.debug("RecorderIO: LOADING")
         sample_dtype = shared.record_sample_ring.dtype
         rgb_dims = sample_dtype.fields["camera_rgb"][0].shape
         depth_dims = sample_dtype.fields["camera_depth"][0].shape
@@ -769,7 +766,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             ),
         )
         _publish_status(shared, RecorderPhase.READY, 0, failure_count=failure_count)
-        publish_component_status(shared, "recorder", ComponentPhase.READY)
+        logger.debug("RecorderIO: READY")
         shared.set_heartbeat("recorder", time.monotonic())
         shared.set_ready("recorder")
         limiter = RateManager(config.poll_hz)
@@ -1004,13 +1001,6 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             reason="process_crash",
             failure_count=failure_count,
         )
-        publish_component_status(
-            shared,
-            "recorder",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.RECORDING_ABORTED,
-            detail="RecorderIO process crashed; robot fault is not latched",
-        )
     finally:
         if recorder is not None:
             if recorder.is_recording:
@@ -1038,5 +1028,5 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             failure_count=failure_count,
         )
         if not crashed:
-            publish_component_status(shared, "recorder", ComponentPhase.STOPPED)
+            logger.debug("RecorderIO: STOPPED")
         logger.info("RecorderIO exited")

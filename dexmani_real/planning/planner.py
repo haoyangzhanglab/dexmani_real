@@ -162,8 +162,8 @@ class XArm7MotionPlanner:
     ) -> "XArm7MotionPlanner":
         """Factory with canonical URDF/SRDF and identity base_pose_world.
 
-        Centralises the invariant planner setup shared by keyboard_teleop,
-        calibrate_camera, and replay_episode. Callers pass their own
+        Centralises the invariant planner setup shared by keyboard_teleop and
+        calibrate_camera. Callers pass their own
         *planning_profile* / *teleop_profile* to match their use case (teleop
         tolerances are intentionally looser than the dataclass defaults).
         """

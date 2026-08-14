@@ -115,21 +115,13 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     SharedStorage (no RPC, no side channels).
     """
     from dexmani_real.robot.safety import SafetyState
-    from dexmani_real.runtime.status import ComponentPhase, FaultCode
     from dexmani_real.shm.shared_storage import new_frame as _nf
-    from dexmani_real.shm.shared_storage import publish_component_status
 
     cfg = config or HandProcessConfig()
-    publish_component_status(shared, "hand", ComponentPhase.LOADING)
+    logger.debug("hand_loop: LOADING")
 
     def _mark_startup_failure() -> None:
-        publish_component_status(
-            shared,
-            "hand",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.STARTUP_FAILED,
-            detail="XHand startup failed; see process log",
-        )
+        logger.error("hand_loop: XHand startup failed; see process log")
         if cfg.startup_failure_is_fatal:
             shared.error_state.value = True
         else:
@@ -251,7 +243,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     # heartbeat=0 → age=inf → spurious FAULT.
     shared.set_heartbeat("hand", time.monotonic())
     shared.set_ready("hand")
-    publish_component_status(shared, "hand", ComponentPhase.READY)
+    logger.debug("hand_loop: READY")
     logger.info("hand_loop: ready")
 
     rate_mgr = RateManager(cfg.loop_hz)
@@ -489,13 +481,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         logger.warning("hand_loop: cleanup failed", exc_info=True)
         shared.error_state.value = True
     if stopped_cleanly:
-        publish_component_status(shared, "hand", ComponentPhase.STOPPED)
+        logger.debug("hand_loop: STOPPED")
     else:
-        publish_component_status(
-            shared,
-            "hand",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.DEVICE_IO,
-            detail="XHand disconnect failed",
-        )
+        logger.error("hand_loop: XHand disconnect failed")
     logger.info("hand_loop: exited")

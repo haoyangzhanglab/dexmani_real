@@ -1,6 +1,6 @@
 """Process lifecycle and structured runtime status contracts."""
 
-from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
 from dexmani_real.runtime.session import ManagedProcessGroup
+from dexmani_real.runtime.status import ExitReason
 
-__all__ = ["ComponentPhase", "ExitReason", "FaultCode", "ManagedProcessGroup"]
+__all__ = ["ExitReason", "ManagedProcessGroup"]

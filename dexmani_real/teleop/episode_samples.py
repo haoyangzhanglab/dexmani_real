@@ -225,10 +225,10 @@ def _record_held(
 
     Args:
         arm_qpos_sent: Last command actually queued to arm_action_q.
-            Ensures ``--source=sent`` replay works for held frames.
+            Persists the exact command sent so held-frame samples stay consistent.
         diagnostics: Per-frame diagnostics (tracking_error, ik_solve_time_ms, etc.).
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
-            ``action_arm_ee`` for replay.
+            ``action_arm_ee`` in the recorded sample.
         action_candidate: Exact hold candidate published for this observation,
             or ``None`` when the grid intentionally emitted no new command.
     """

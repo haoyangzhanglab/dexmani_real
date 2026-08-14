@@ -373,7 +373,7 @@ class EpisodeReader:
             return ValidityState.INVALID
         return ValidityState.VALID
 
-    def require_valid(self, purpose: str = "training/live replay") -> None:
+    def require_valid(self, purpose: str = "training") -> None:
         state = self.validity
         if state is not ValidityState.VALID:
             raise ValueError(

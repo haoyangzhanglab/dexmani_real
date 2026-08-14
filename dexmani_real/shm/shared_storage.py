@@ -15,7 +15,6 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm, camera, hand, policy
 from dexmani_real.robot.safety import SafetyState
-from dexmani_real.runtime.status import ComponentPhase, ExitReason, FaultCode
 from dexmani_real.shm.ring_buffer import CameraRingBuffer, SharedMemoryRingBuffer
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
@@ -24,7 +23,6 @@ from dexmani_real.utils.schema import (
     HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
-    INFERENCE_CANDIDATE_DTYPE,
     RECORD_CONTROL_DTYPE,
     RECORD_STATUS_DTYPE,
     VR_FRAME_DTYPE,
@@ -61,8 +59,6 @@ class SharedStorageConfig:
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
-    inference_candidate_ring_maxlen: int = 16
-    enable_inference: bool = False
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
@@ -100,7 +96,6 @@ class SharedStorageConfig:
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
-            self.inference_candidate_ring_maxlen,
             self.arm_action_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
@@ -123,9 +118,7 @@ class SharedStorageConfig:
             )
 
     @classmethod
-    def from_runtime(
-        cls, runtime: object, *, enable_inference: bool = False
-    ) -> "SharedStorageConfig":
+    def from_runtime(cls, runtime: object) -> "SharedStorageConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
         arm_cfg = getattr(runtime, "arm")
@@ -150,7 +143,6 @@ class SharedStorageConfig:
                 float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)
             ),
             workspace_bounds=bounds,
-            enable_inference=enable_inference,
         )
 
 
@@ -184,25 +176,23 @@ _RING_RESOURCE_NAMES = (
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
-    "inference_candidate_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_action_q", "arm_home_result_q")
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
-# Ordered heartbeat slots — one fixed array replaces the seven per-subsystem
+# Ordered heartbeat slots — one fixed array replaces the six per-subsystem
 # ``ctx.Value`` heartbeats. Index order is stable across processes.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
     "arm",
     "hand",
     "policy",
     "recorder",
-    "inference",
     "vr",
     "camera",
 )
 HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
 
-# Ordered readiness slots — one fixed array replaces the seven per-subsystem
+# Ordered readiness slots — one fixed array replaces the six per-subsystem
 # ``ctx.Event`` ready flags. Per-element access on ``ctx.Array`` is atomic, so
 # each flag is a simple 0/1 store; the index order is stable across processes.
 READY_FIELDS: tuple[str, ...] = (
@@ -211,7 +201,6 @@ READY_FIELDS: tuple[str, ...] = (
     "camera",
     "vr",
     "policy",
-    "inference",
     "recorder",
 )
 READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
@@ -244,9 +233,6 @@ class SharedStorage:
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
-    inference_candidate_ring: (
-        Any  # experimental capability; None unless explicitly enabled
-    )
 
     arm_action_q: mp.Queue  # policy -> ordered arm endpoints + HOME, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
@@ -279,7 +265,6 @@ class SharedStorage:
     camera_firmware: Any  # firmware version string
     camera_sdk_version: Any  # pyrealsense2/librealsense version string
     camera_profile: Any  # actual color/depth profile JSON
-    camera_observation_required: Any  # None unless experimental inference is enabled
     _closed: bool = field(init=False, repr=False, default=False)
     _close_completed_operations: set[str] = field(
         init=False, repr=False, default_factory=set
@@ -390,15 +375,6 @@ class SharedStorage:
             dtype=RECORD_STATUS_DTYPE,
             maxlen=cfg.record_status_ring_maxlen,
         )
-        storage.inference_candidate_ring = (
-            SharedMemoryRingBuffer.create_or_replace(
-                f"{prefix}_inference_candidate",
-                dtype=INFERENCE_CANDIDATE_DTYPE,
-                maxlen=cfg.inference_candidate_ring_maxlen,
-            )
-            if cfg.enable_inference
-            else None
-        )
 
         storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
         storage.arm_home_result_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
@@ -433,9 +409,6 @@ class SharedStorage:
         storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
         storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
         storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
-        storage.camera_observation_required = (
-            ctx.Value("b", False) if cfg.enable_inference else None
-        )
 
     def close(self) -> bool:
         """Release all shared memory primitives.
@@ -565,28 +538,6 @@ def read_hand_state(shared: "SharedStorage") -> "np.ndarray | None":
         return None
     data, _ts_ns, _seq = result
     return data
-
-
-def publish_component_status(
-    shared: Any,
-    component: str,
-    phase: ComponentPhase,
-    *,
-    fault_code: FaultCode = FaultCode.NONE,
-    exit_reason: ExitReason = ExitReason.NONE,
-    detail: str = "",
-) -> None:
-    """Log an optional component transition without creating a second health plane."""
-    del shared
-    log = logger.error if phase is ComponentPhase.FAULT else logger.debug
-    log(
-        "component=%s phase=%s fault=%s exit=%s detail=%s",
-        component,
-        phase.name,
-        fault_code.name,
-        exit_reason.name,
-        detail,
-    )
 
 
 def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":

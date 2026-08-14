@@ -49,22 +49,6 @@ HAND_COMMAND_DTYPE = np.dtype(
     _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
 )
 
-INFERENCE_CANDIDATE_DTYPE = np.dtype(
-    [
-        ("observation_id", "<u8"),
-        ("run_generation", "<u8"),
-        ("created_monotonic_ns", "<u8"),
-        ("target_monotonic_ns", "<u8"),
-        ("valid_until_monotonic_ns", "<u8"),
-        ("has_arm", "<u1"),
-        ("has_hand", "<u1"),
-        ("is_hold", "<u1"),
-        ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
-        ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
-    ],
-    align=True,
-)
-
 ARM_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", ARM_JOINT_SHAPE),
@@ -342,7 +326,6 @@ __all__ = [
     "HAND_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "HAND_TACTILE_DTYPE",
-    "INFERENCE_CANDIDATE_DTYPE",
     "RECORD_CONTROL_DTYPE",
     "RECORD_OPERATOR_BYTES",
     "RECORD_STATUS_DTYPE",

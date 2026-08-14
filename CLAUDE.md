@@ -7,9 +7,8 @@ complete file-by-file map.
 
 ## 1. Sixty-second orientation
 
-DexMani Real controls an xArm7 (7 DoF) and XHand (12 DoF) from Quest VR,
-records HDF5 episodes, can deploy an experimental learned policy, and can replay an
-episode. Python 3.10 runs in conda `real_robot`; commands run from the repo root
+DexMani Real controls an xArm7 (7 DoF) and XHand (12 DoF) from Quest VR and
+records HDF5 episodes, and can replay an episode. Python 3.10 runs in conda `real_robot`; commands run from the repo root
 with `PYTHONPATH=.`.
 
 ```bash
@@ -28,7 +27,6 @@ entry points, not test fixtures.
 | Change a runtime value | `config/defaults.py` | `config/runtime.py`, every derived duration/capacity/metadata field |
 | Change a shared field or command | `utils/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
 | Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → safety gate → samples |
-| Change learned deployment | `examples/deploy_policy.py`, `policy/spec.py` | inference process → coordinator → safety gate |
 | Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, homing path planning |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
@@ -45,7 +43,7 @@ Main / domain lifecycle
   resolve immutable config → create SharedStorage → spawn → readiness → supervise → verified shutdown
 
 Camera worker ─┐
-VR worker ─────┼── shared state rings ──► Teleop or learned-policy coordinator
+VR worker ─────┼── shared state rings ──► Teleop coordinator
 Arm worker ────┤                                  │
 Hand worker ───┘                         fire-and-forget command publication
                                                     ├──► bounded arm endpoint/HOME queue → Arm worker
@@ -58,7 +56,6 @@ Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► H
 |---|---|---|
 | Main / lifecycle module | Config snapshot, storage, process creation, read-only readiness, health, shutdown | Mapping, actions, sample selection |
 | `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | HDF5 serialization or direct SDK use |
-| `policy/learned_coordinator.py` | Causal observations, current-tick inference result publication, run generation/action IDs | Direct SDK use or recording I/O |
 | `recording/io_process.py` | Record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
 | `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application | Policy decisions or cross-worker calls |
 | `sensor/` workers | Device acquisition and source-freshness metadata | Motion/control decisions |
@@ -74,9 +71,6 @@ vr_loop(shared, config)           # Quest/HTS frames → vr_ring
 teleop_loop(shared, config)       # VR → candidate → safe arm/hand commands
 recorder_io_loop(shared, config)  # aligned samples → transactional episode
 ```
-
-Learned deployment adds `inference_loop` in an isolated child. The ordinary VR
-path does not load a model.
 
 ## 3. Data contracts that matter
 
@@ -95,7 +89,6 @@ discover a dtype.
 | `record_control_ring` | controller → RecorderIO | Latest immutable fixed-field START/STOP boundary; client refuses START until the prior STOP terminal is harvested |
 | `record_sample_ring` | controller → RecorderIO | Fixed-grid sample plus transient control generation; overflow aborts the episode |
 | `record_status_ring` | RecorderIO → controller/main | READY/RECORDING/FINALIZING/terminal phase, bounded reason/error/path, minimum-duration label, and sticky session failure count |
-| `inference_candidate_ring` | inference → learned coordinator | Latest current-tick candidate; only allocated for policy deployment |
 | flags and heartbeats | lifecycle/workers | Flags are simple values; heartbeats use `time.monotonic()` |
 
 Read a ring with its documented seqlock API. `get_last_k(k)` returns verified
@@ -105,7 +98,7 @@ Never store arbitrary mutable Python graphs in shared memory.
 ### Safety state and command lifetime
 
 ```text
-DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNING
+DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
     ^                               ^                                  |
     └------- Main shutdown ---------┴-------------- Main fault ---------┘
                                                      ▼
@@ -113,7 +106,7 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
 ```
 
 - Main owns `DISARMED ↔ ARMED`, `→ FAULT`, and shutdown.
-- Teleop/policy owns `ARMED ↔ RUNNING`.
+- Teleop owns `ARMED ↔ RUNNING`.
 - Arm and hand workers only gate command behavior on the state.
 - `error_state` is sticky. A process death or enabled-worker heartbeat timeout
   becomes a main-owned fault.
@@ -129,20 +122,17 @@ DISARMED -- Main readiness --> ARMED -- policy/teleop operator action --> RUNNIN
   operational-limit, and rated mechanical-limit violations without changing an
   endpoint. Runtime config may narrow, but cannot widen, the bundled rated
   mechanical envelope.
-- `run_generation` tags both policy observations and candidates. Begin, pause,
-  home, feedback fault, and camera re-warm advance it; the coordinator drops a
-  mailbox result unless it, its observation, and shared state have the same
-  generation. Workers also reject queued/ring commands from an older generation;
-  this cannot retract an endpoint already accepted by firmware. Ordinary pause
-  paths publish no replacement endpoint. Repeated observations of one pause do
-  not advance again; every explicit VR BEGIN opens a distinct generation and
-  supersedes an earlier STOP/DISCARD/max-duration boundary. VR teleop requires
-  feedback newer than its pause or BEGIN boundary and spends one full grid
-  re-anchoring. A session-ending signal received during a C pause preserves the
-  existing generation boundary but makes that pause non-resumable. Conversely,
-  C received during an automatic gate reclassifies the same boundary as a
-  C-resumable pause without advancing again; learned policy requires a candidate
-  from the active generation.
+- `run_generation` tags commands and candidates. Begin, pause, home, feedback
+  fault, and camera re-warm advance it; workers reject queued/ring commands from
+  an older generation; this cannot retract an endpoint already accepted by
+  firmware. Ordinary pause paths publish no replacement endpoint. Repeated
+  observations of one pause do not advance again; every explicit VR BEGIN opens
+  a distinct generation and supersedes an earlier STOP/DISCARD/max-duration
+  boundary. VR teleop requires feedback newer than its pause or BEGIN boundary
+  and spends one full grid re-anchoring. A session-ending signal received during
+  a C pause preserves the existing generation boundary but makes that pause
+  non-resumable. Conversely, C received during an automatic gate reclassifies
+  the same boundary as a C-resumable pause without advancing again.
 
 Do not turn a simple flag into an enum, add a second state writer, or bypass
 the SafetyGate validation boundary.
@@ -184,31 +174,8 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
   safe fallback endpoint; C24 recovery may send one freshly read measured hold.
   Those are active safety/error-recovery actions, not ordinary pause behavior.
 - VR transform schema v1 is validated in Main before SharedStorage/process
-  creation and again in the policy child. It must be a proper SO(3) rotation
+  creation and again in the teleop worker. It must be a proper SO(3) rotation
   with the declared convention and machine-readable non-POOR quality metadata.
-
-### Experimental learned-policy deployment
-
-```text
-PolicySpec YAML + resource hashes → deployment preflight → isolated inference
-                                  → causal coordinator → SafetyGate → workers
-```
-
-`PolicySpec` binds adapter module, explicit observation history, action contract,
-resources and SHA-256s. `action.dt_s` must equal `1 / control_hz`; a live run
-also requires `hardware_deployable: true`. Keep model import in the inference
-child. The adapter must return one current-tick `ActionCandidate`; adapters for
-chunk-producing models choose or expand their next step locally. A single
-`run_generation` invalidates candidates from a prior start, pause, home, or
-camera re-warm, while the control side assigns action IDs and command targets.
-`ActionCandidate.target_monotonic_ns` remains proposal/episode-provenance
-timing and `valid_until_monotonic_ns` is the freshness guard; `send_command`
-creates the actual worker delivery target after queueing begins.
-
-The default teleoperation `SharedStorage` does not allocate inference rings.
-Only `examples/deploy_policy.py` (via
-`SharedStorageConfig.from_runtime(..., enable_inference=True)`) may opt into
-that experimental capability.
 
 ### Episode write, read, analyse, replay
 
@@ -217,9 +184,9 @@ aligned samples → RecorderIO → temporary episode + stream verification
                 → fsync + atomic publish → EpisodeReader / visualize / replay
 ```
 
-- HDF5 schema v16 is the only runtime episode format. Readers, visualization,
-  and replay accept only a published v16 directory; migrate historical data
-  outside the runtime before using it.
+- HDF5 schema v16 is the only runtime episode format. Readers, visualization, and replay
+  accept only a published v16 directory; migrate historical data outside the
+  runtime before using it.
 - Recorder control and the shared sample payload are fixed NumPy dtypes. The
   START boundary snapshots only task/operator and essential device/calibration
   metadata plus the required resolved-config SHA-256; per-grid fields are typed
@@ -337,7 +304,6 @@ aligned samples → RecorderIO → temporary episode + stream verification
 | Entry point | Domain owner | Default safety posture |
 |---|---|---|
 | `examples/collect_teleop.py` | — | Hardware control; self-contained script; explicit authorization required |
-| `examples/deploy_policy.py` | — | Hardware control; self-contained script; spec/hash/preflight gated |
 | `examples/keyboard_teleop.py` | — | Hardware control; self-contained script; measured hand feedback by default |
 | `examples/replay_episode.py` | — | Dry-run by default; `--live` reruns dense preflight; self-contained script |
 | `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |

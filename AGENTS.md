@@ -27,12 +27,11 @@ conda run -n real_robot python -m compileall -q dexmani_real examples
 
 ## 2. System model
 
-DexMani Real is a VR teleoperation, data collection, learned-policy deployment,
-and replay system for an xArm7 (7 DoF), XHand (12 DoF), Quest, and RealSense
-L515.
+DexMani Real is a VR teleoperation, data collection, and replay system for an xArm7
+(7 DoF), XHand (12 DoF), Quest, and RealSense L515.
 
 ```text
-camera / VR / arm / hand ──shared-memory state──► teleop or learned policy
+camera / VR / arm / hand ──shared-memory state──► teleop
                                                      │
                        arm queue ◄──────────────────┼──► hand command ring
                                                      │
@@ -57,7 +56,6 @@ producers and consumers.
 | Cross-process state/action layout | `utils/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
 | Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers, readiness, heartbeat, shutdown |
 | VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
-| Learned-policy behavior | `policy/spec.py`, `policy/learned_coordinator.py` | current-tick inference mailbox, observation sources, run generation/action protocol, deployment lifecycle |
 | Arm/hand safety or servo behavior | `robot/arm_loop.py`, `robot/hand_process.py` | `robot/safety.py`, action protocol, supervisor, homing and e-stop paths |
 | FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
 | Episode schema or quality rule | `recording/` | reader, analysis, visualization, replay consumers, v16 schema contract |
@@ -77,9 +75,9 @@ Preserve these unless the user explicitly requests an architectural redesign.
 3. Hardware SDK instances are local to their owning device worker/driver. Do
    not add xArm/XHand SDK calls to main, policy, recorder, or replay code; never
    share a live SDK instance across processes.
-4. Teleoperation or the learned-policy coordinator owns control-grid, action,
-   and episode/sample decisions. `RecorderIO` only serializes, verifies, and
-   transactionally publishes what it receives.
+4. Teleoperation owns control-grid, action, and episode/sample decisions.
+   `RecorderIO` only serializes, verifies, and transactionally publishes what
+   it receives.
 5. Recording is grid-aligned to `1 / control_hz` (normally 16 Hz), never
    arrival-time sampled.
 6. The arm queue is ordered and intentionally bounded (`maxsize=2`). The hand
@@ -96,10 +94,9 @@ Preserve these unless the user explicitly requests an architectural redesign.
 12. Firmware is the final safety backstop. Application checks protect command
     validity, recovery, data quality, and coordinated stop—they do not replace
     firmware limits.
-13. `run_generation` invalidates learned-policy observations and mailbox
-    candidates across begin, pause, home, feedback fault, and camera re-warm.
-    Controllers accept only a candidate from the active generation and assign
-    its action ID before it crosses the command boundary.
+13. `run_generation` invalidates stale queued/ring commands across begin, pause,
+    home, feedback fault, and camera re-warm. Workers reject a command from an
+    older generation before it crosses the command boundary.
 14. Recorder START/STOP boundaries, recorder status, and aligned samples are
     fixed NumPy dtypes. Do not put JSON or an acknowledgement/apply protocol in
     the shared-memory control path.
@@ -107,7 +104,7 @@ Preserve these unless the user explicitly requests an architectural redesign.
 ## 4. Hardware and operational safety
 
 Every program below `examples/` can affect hardware. Do **not** run
-teleoperation, policy deployment, replay, homing, calibration, or RealSense
+teleoperation, replay, homing, calibration, or RealSense
 without explicit user authorization and confirmation that the
 workspace is clear and the hardware is ready. Do not use a module import as a
 shortcut when it might initialize a device SDK.
@@ -133,15 +130,14 @@ Use the smallest vertical slice that fully preserves a contract.
 | Add/change arm or hand state | dtype → documentation dataclass → worker write → policy read → recording path → reader/analysis if persisted |
 | Add/change a recording dataset | schema dtype → recorder → reader → analysis/visualization → replay consumer → v16 schema contract |
 | Add/change a ring or queue | `SharedStorage` create/close → producer → consumer → readiness/heartbeat → failure/shutdown behavior |
-| Change learned-policy candidate flow | runtime/spec → tensor block/inference worker → coordinator generation/freshness → SafetyGate → action protocol |
 | Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
 | Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
 | Change safety/fault transition | supervisor + policy + arm + hand + shutdown + e-stop, including sticky-fault behavior |
 | Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
 Do not silently change HDF5 meaning in place. Runtime episodes use schema v16
-only: coordinate a format change across writer, reader, visualization, replay,
-and the schema marker. Migrate historical episodes outside the runtime before
+only: coordinate a format change across writer, reader, visualization, replay, and the
+schema marker. Migrate historical episodes outside the runtime before
 using them.
 
 ## 6. Implementation rules

@@ -16,8 +16,8 @@ import numpy as np
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
-_HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "inference", "vr", "camera"})
-_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "inference", "policy", "vr"})
+_HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "vr", "camera"})
+_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "policy", "vr"})
 
 # Shared sub-structures
 
@@ -430,7 +430,6 @@ class HandParams:
     send_err_watchdog_count: int = 30  # 1s @ 30Hz
 
     # ── Hand FK (fingertip positions in world frame) ──
-    hand_urdf_path: str = ""
     fingertip_link_names: tuple[str, ...] = (
         "right_hand_thumb_rota_tip",
         "right_hand_index_rota_tip",
@@ -509,7 +508,6 @@ class PolicyParams:
     action_prepare_timeout_s: float = 0.06
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
-    inference_candidate_timeout_s: float = 0.25
     quit_save_timeout_s: float = 30.0
     post_teleop_timeout_s: float = 60.0
 
@@ -566,12 +564,11 @@ class PolicyParams:
             self.action_prepare_timeout_s,
             self.action_apply_timeout_s,
             self.arm_state_stale_threshold_s,
-            self.inference_candidate_timeout_s,
             self.quit_save_timeout_s,
             self.post_teleop_timeout_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in timing):
-            raise ValueError("policy action, freshness, inference, and operator timeouts must be finite and positive")
+            raise ValueError("policy action, freshness, and operator timeouts must be finite and positive")
         if not (0.0 <= self.ema.alpha_pos <= 1.0):
             raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
         if not (0.0 <= self.ema.alpha_rot <= 1.0):
@@ -632,12 +629,10 @@ class KeyboardTeleopParams:
     delta_rpy_rad: float = 0.03  # 1.7 deg/frame, 51 deg/s at 30 Hz
     command_lookahead_frames: int = 5  # bounded 40 mm / 0.15 rad firmware-following lead
     workspace_command_margin_m: float = 0.005  # > ik_max_pose_error_pos_m (0.002) so a clipped target's FK stays in-bounds
-    cartesian_kp: float = 0.0
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
     status_interval_frames: int = 50
     idle_interval_frames: int = 150
-    cartesian_deadband_m: float = 0.003
 
     def __post_init__(self) -> None:
         numeric = (
@@ -645,10 +640,8 @@ class KeyboardTeleopParams:
             self.delta_pos_m,
             self.delta_rpy_rad,
             self.workspace_command_margin_m,
-            self.cartesian_kp,
             self.ik_max_pose_error_pos_m,
             self.ik_max_pose_error_rot_rad,
-            self.cartesian_deadband_m,
         )
         if not all(np.isfinite(value) for value in numeric):
             raise ValueError("keyboard teleop numeric parameters must be finite")
@@ -662,14 +655,10 @@ class KeyboardTeleopParams:
             raise ValueError("command_lookahead_frames must be positive")
         if self.workspace_command_margin_m < 0:
             raise ValueError("workspace_command_margin_m must be non-negative")
-        if self.cartesian_kp < 0:
-            raise ValueError(f"cartesian_kp={self.cartesian_kp} must be >= 0")
         if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
             raise ValueError("keyboard IK pose-error limits must be > 0")
         if self.status_interval_frames <= 0 or self.idle_interval_frames <= 0:
             raise ValueError("keyboard status/idle intervals must be > 0")
-        if self.cartesian_deadband_m < 0:
-            raise ValueError("keyboard deadband must be >= 0")
 
 
 # TAG retargeting parameters
@@ -774,7 +763,6 @@ class SafetyParams:
             "hand": 1.0,
             "policy": 1.0,
             "recorder": 2.0,
-            "inference": 1.0,
             "vr": 5.0,
             "camera": 2.0,
         }
@@ -785,7 +773,6 @@ class SafetyParams:
             "hand": 15.0,
             "camera": 15.0,
             "recorder": 15.0,
-            "inference": 60.0,
             "policy": 120.0,
             "vr": 120.0,
         }

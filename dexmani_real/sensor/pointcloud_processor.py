@@ -5,10 +5,9 @@ filter (LoG gradient) → speckle filter → world transform → desk-plane remo
 → workspace crop → 5 mm voxel → DBSCAN two-in-one outlier filter (noise-point
 removal + small-cluster cull) → fixed-size output via FPS/random.
 
-Runs inside ``camera_loop`` at ``policy.control_hz`` (16 Hz by default); the same
-(num_points, 6) float32 output is recorded to HDF5 (/pointcloud) and consumed
-by the policy loop, so training data and deployment observations are
-byte-identical by construction.
+Runs inside ``camera_loop`` at ``policy.control_hz`` (16 Hz by default); the
+(num_points, 6) float32 output is published on the camera ring and recorded to
+HDF5 (/pointcloud) by RecorderIO.
 
 Module-level imports are numpy-only (open3d / torch imported lazily inside
 methods, same pattern as pointcloud_utils._voxel_down_sample_o3d) so importing

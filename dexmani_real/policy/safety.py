@@ -1,6 +1,6 @@
 """Unified safety gate — the single validation boundary for all action paths.
 
-Every coordinator (teleop, learned policy, keyboard, replay, calibration) must
+Every coordinator (teleop, keyboard, replay, calibration) must
 route candidates through :class:`SafetyGate` before :func:`send_command` writes
 to the actuator IPC primitives.  Workers trust the gate and apply commands
 immediately with hardware-boundary checks (safety state, dtype, finite values,
@@ -492,8 +492,8 @@ def publish_joint_targets(
 ) -> Any | None:
     """Validate a joint-space target through the gate and publish it.
 
-    This is a convenience wrapper used by keyboard teleop, calibration, and
-    replay — it builds an ``ActionCandidate`` from raw joint arrays, runs
+    This is a convenience wrapper used by keyboard teleop, calibration, and replay — it
+    builds an ``ActionCandidate`` from raw joint arrays, runs
     the full validation pipeline, and calls :func:`send_command`.
 
     Returns:

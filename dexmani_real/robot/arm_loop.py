@@ -21,8 +21,7 @@ from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import worker_validate_arm
 from dexmani_real.robot.homing import HOME_SENTINEL, HomeRequest, HomeResult
 from dexmani_real.robot.safety import SafetyState
-from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import new_frame, publish_component_status
+from dexmani_real.shm.shared_storage import new_frame
 from dexmani_real.utils.log import (
     ThrottledWarner,
     capture_native_stdout,
@@ -378,16 +377,6 @@ def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
     shared.error_state.value = True
 
 
-def _publish_startup_fault_impl(shared: Any, detail: str) -> None:
-    publish_component_status(
-        shared,
-        "arm",
-        ComponentPhase.FAULT,
-        fault_code=FaultCode.STARTUP_FAILED,
-        detail=detail,
-    )
-
-
 def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     """Arm process entry point — reads arm_action_q, servos arm via Mode 6.
 
@@ -407,10 +396,10 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         max_consecutive=cfg.max_consecutive_recoveries, label="arm_fk"
     )
     _tracking_err_count = 0
-    publish_component_status(shared, "arm", ComponentPhase.LOADING)
+    logger.debug("arm_loop: LOADING")
 
     def _publish_startup_fault(detail: str) -> None:
-        return _publish_startup_fault_impl(shared, detail)
+        logger.error("arm_loop: %s", detail)
 
     # URDF-consistent FK (replaces arm.get_position_aa). xArm firmware uses a
     # different EEF coordinate definition — Pinocchio FK ensures all consumers
@@ -640,7 +629,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     # after all ready events.
     shared.set_heartbeat("arm", time.monotonic())
     shared.set_ready("arm")
-    publish_component_status(shared, "arm", ComponentPhase.READY)
+    logger.debug("arm_loop: READY")
     logger.info(
         "arm_loop: ready and DISARMED (state=4, ip=%s, hz=%.0f)",
         cfg.arm_ip,
@@ -1001,13 +990,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 "arm_loop: %d consecutive feedback-read failures — latching global fault",
                 _state_error_counter.count,
             )
-            publish_component_status(
-                shared,
-                "arm",
-                ComponentPhase.FAULT,
-                fault_code=FaultCode.DEVICE_IO,
-                detail="persistent get_joint_states failure",
-            )
             break
         if fk_fault:
             terminal_feedback_detail = "persistent ArmFK failure"
@@ -1015,13 +997,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             logger.error(
                 "arm_loop: %d consecutive FK failures — latching global fault",
                 _fk_error_counter.count,
-            )
-            publish_component_status(
-                shared,
-                "arm",
-                ComponentPhase.FAULT,
-                fault_code=FaultCode.DEVICE_IO,
-                detail=terminal_feedback_detail,
             )
             break
 
@@ -1038,23 +1013,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         logger.warning("arm_loop: cleanup failed", exc_info=True)
         shared.error_state.value = True
     if terminal_feedback_detail is not None:
-        publish_component_status(
-            shared,
-            "arm",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.DEVICE_IO,
-            detail=terminal_feedback_detail,
-        )
+        logger.error("arm_loop: %s", terminal_feedback_detail)
     elif stopped_cleanly:
-        publish_component_status(shared, "arm", ComponentPhase.STOPPED)
+        logger.debug("arm_loop: STOPPED")
     else:
-        publish_component_status(
-            shared,
-            "arm",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.DEVICE_IO,
-            detail="state-4 cleanup failed",
-        )
+        logger.error("arm_loop: state-4 cleanup failed")
     logger.info("arm_loop: exited")
 
 

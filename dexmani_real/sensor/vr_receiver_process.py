@@ -60,10 +60,9 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
 
     cfg = config or VRReceiverConfig()
 
-    from dexmani_real.runtime.status import ComponentPhase, FaultCode
-    from dexmani_real.shm.shared_storage import new_frame, publish_component_status, vr_frame_dtype
+    from dexmani_real.shm.shared_storage import new_frame, vr_frame_dtype
 
-    publish_component_status(shared, "vr", ComponentPhase.LOADING)
+    logger.debug("vr_loop: LOADING")
 
     try:
         from hand_tracking_sdk import (
@@ -92,15 +91,9 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         )
     except ImportError as e:
         logger.error("vr_loop: SDK import failed: %s", e)
-        publish_component_status(
-            shared, "vr", ComponentPhase.FAULT, fault_code=FaultCode.STARTUP_FAILED, detail="VR SDK import failed"
-        )
         return
     except Exception as e:
         logger.error("vr_loop: connect failed: %s", e)
-        publish_component_status(
-            shared, "vr", ComponentPhase.FAULT, fault_code=FaultCode.STARTUP_FAILED, detail="VR connect failed"
-        )
         return
 
     logger.info("vr_loop: connected to HTS port=%d", cfg.port)
@@ -129,7 +122,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
 
         if not shared.is_ready("vr"):
             shared.set_ready("vr")
-            publish_component_status(shared, "vr", ComponentPhase.READY)
+            logger.debug("vr_loop: READY")
             logger.info("vr_loop: ready (first event received)")
 
         if isinstance(event, HeadFrame):
@@ -191,5 +184,5 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             logger.warning("vr_loop: frame conversion error", exc_info=True)
             continue
 
-    publish_component_status(shared, "vr", ComponentPhase.STOPPED)
+    logger.debug("vr_loop: STOPPED")
     logger.info("vr_loop: exited")

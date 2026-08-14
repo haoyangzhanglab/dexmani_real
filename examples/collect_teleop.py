@@ -103,8 +103,7 @@ def _preflight_health_issues(
     if shared.estop_request.value:
         issues.append("e-stop is requested")
 
-    # The teleop loop reuses the "policy" heartbeat/ready slots in SharedStorage
-    # (shared with the learned-policy deployment path).
+    # The teleop loop reuses the "policy" heartbeat/ready slots in SharedStorage.
     enabled_heartbeats = ["arm", "vr", "policy"]
     if hand_enabled:
         enabled_heartbeats.append("hand")

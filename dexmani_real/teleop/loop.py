@@ -23,9 +23,7 @@ from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
                                         send_command)
 from dexmani_real.recording.io_process import RecorderClient, RecorderPhase
-from dexmani_real.runtime.status import ComponentPhase, FaultCode
-from dexmani_real.shm.shared_storage import (SharedStorage,
-                                             publish_component_status)
+from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import (AudioFeedback,
                                                 update_motion_gate)
@@ -131,12 +129,12 @@ def _policy_exit_fault(
     error_state: bool,
     estop_request: bool,
     safety_fault: bool,
-) -> tuple[FaultCode, str] | None:
+) -> str | None:
     """Classify terminal policy state without losing an e-stop or sticky fault."""
     if estop_request:
-        return FaultCode.ESTOP, "policy exited after e-stop request"
+        return "policy exited after e-stop request"
     if error_state or safety_fault:
-        return FaultCode.COMMAND_INVALID, "policy exited with sticky fault"
+        return "policy exited with sticky fault"
     return None
 
 
@@ -148,13 +146,6 @@ def _start_keyboard(shared: SharedStorage) -> KeyboardHandler | None:
     except Exception:
         logger.error("teleop_loop: keyboard startup failed", exc_info=True)
         shared.error_state.value = True
-        publish_component_status(
-            shared,
-            "policy",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.STARTUP_FAILED,
-            detail="keyboard startup failed",
-        )
         return None
     return keyboard
 
@@ -369,7 +360,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     def _transition_or_fault(new_state: SafetyState, reason: str) -> bool:
         return _transition_or_fault_impl(shared, transition, new_state, reason)
 
-    publish_component_status(shared, "policy", ComponentPhase.LOADING)
+    logger.debug("teleop_loop: LOADING")
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
     arm_cmd_max_step_rad = float(np.deg2rad(cfg.runtime.arm.max_joint_velocity_deg_per_s)) * ctrl_dt
     joint_lower_rad = np.asarray(cfg.runtime.arm.joint_limit_lower, dtype=np.float64)
@@ -427,13 +418,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
         shared.error_state.value = True
-        publish_component_status(
-            shared,
-            "policy",
-            ComponentPhase.FAULT,
-            fault_code=FaultCode.STARTUP_FAILED,
-            detail="VR policy initialization failed",
-        )
         return
 
     kb = _start_keyboard(shared)
@@ -482,13 +466,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         if not shared.wait_ready(name, timeout_s):
             logger.error("Teleop: %s startup timeout (%.1fs)", name, timeout_s)
             shared.error_state.value = True
-            publish_component_status(
-                shared,
-                "policy",
-                ComponentPhase.FAULT,
-                fault_code=FaultCode.STARTUP_FAILED,
-                detail=f"startup timeout waiting for {name}",
-            )
             kb.stop()
             return
     logger.info("Teleop: all subsystems ready")
@@ -503,24 +480,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         if initial_hand_issue is not None:
             logger.error("Teleop: initial hand feedback rejected: %s", initial_hand_issue)
             shared.error_state.value = True
-            publish_component_status(
-                shared,
-                "policy",
-                ComponentPhase.FAULT,
-                fault_code=FaultCode.STARTUP_FAILED,
-                detail=initial_hand_issue,
-            )
             kb.stop()
             return
         hand_available = True
         if not _try_init_hand_retargeter():
-            publish_component_status(
-                shared,
-                "policy",
-                ComponentPhase.FAULT,
-                fault_code=FaultCode.STARTUP_FAILED,
-                detail="hand retargeter initialization failed",
-            )
+            logger.error("teleop_loop: hand retargeter initialization failed")
             shared.error_state.value = True
             kb.stop()
             return
@@ -528,7 +492,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     # Publish before policy_ready so Main never observes a ready worker with a zero heartbeat.
     shared.set_heartbeat("policy", time.monotonic())
     shared.set_ready("policy")
-    publish_component_status(shared, "policy", ComponentPhase.READY)
+    logger.debug("teleop_loop: READY")
 
     home_qpos = np.array(cfg.runtime.arm.home_qpos, dtype=np.float64)
     arm_state = _read_arm_state(shared)
@@ -965,7 +929,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     # the one-grid re-anchor.
                     _enter_command_quiescence("begin", start_new_run=True)
                     teleop_active = True
-                    publish_component_status(shared, "policy", ComponentPhase.RUNNING)
+                    logger.debug("teleop_loop: RUNNING")
                     _seeded = _init_and_seed_hand_retargeter()
                     if _seeded is not None:
                         ctx.prev_hand_qpos = _seeded
@@ -1568,16 +1532,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             safety_fault=shared.safety_state.value == SafetyState.FAULT,
         )
         if exit_fault is not None:
-            fault_code, detail = exit_fault
-            publish_component_status(
-                shared,
-                "policy",
-                ComponentPhase.FAULT,
-                fault_code=fault_code,
-                detail=detail,
-            )
+            logger.error("teleop_loop: %s", exit_fault)
         else:
-            publish_component_status(shared, "policy", ComponentPhase.STOPPED)
+            logger.debug("teleop_loop: STOPPED")
         logger.info("Teleop: loop exited")
 
 
