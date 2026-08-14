@@ -189,8 +189,12 @@ def _recover_c24_measured_hold(
     """Clear one C24, read fresh joints, and send exactly one measured hold."""
     _require_sdk_ok(f"{operation_prefix} clean_error", arm_api.clean_error())
     _require_sdk_ok(f"{operation_prefix} clean_warn", arm_api.clean_warn())
-    _require_sdk_ok(f"{operation_prefix} set_mode(6)", arm_api.set_mode(6))
-    _require_sdk_ok(f"{operation_prefix} set_state(0)", arm_api.set_state(0))
+    # Collision disables motion at the controller; re-enable before re-entering
+    # Mode 6.  _enter_mode6_ready also verifies the controller reaches the
+    # ready State 2 before we read joints, so the measured hold never races an
+    # unready controller.
+    _require_sdk_ok(f"{operation_prefix} motion_enable", arm_api.motion_enable(True))
+    _enter_mode6_ready(arm_api, operation_prefix=operation_prefix)
     state_code, measured = arm_api.get_joint_states(is_radian=True, num=1)
     _require_sdk_ok(f"{operation_prefix} fresh get_joint_states", state_code)
     measured_hold = np.asarray(measured[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
