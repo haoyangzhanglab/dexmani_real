@@ -340,7 +340,14 @@ def _wait_live_status(
     expected_state: int | tuple[int, ...],
     expected_mode: int | None = None,
     timeout_s: float = 1.0,
+    require_error_clear: bool = True,
 ) -> int:
+    """Wait until the controller reports ``expected_state`` (and mode/error).
+
+    ``require_error_clear=False`` relaxes the error==0 postcondition so a
+    fault-path cleanup can confirm the physical stop without first clearing a
+    latched controller error.
+    """
     expected_states = (
         (expected_state,) if isinstance(expected_state, int) else tuple(expected_state)
     )
@@ -357,7 +364,7 @@ def _wait_live_status(
         state, mode, error = last
         if (
             state in expected_states
-            and error == 0
+            and (not require_error_clear or error == 0)
             and (expected_mode is None or mode == expected_mode)
         ):
             return state
@@ -1047,7 +1054,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         # Cleanup: best-effort state 4 + disconnect, even if the loop raised.
         try:
             _require_sdk_ok("cleanup set_state(4)", arm.set_state(4))
-            _wait_live_status(arm, expected_state=4)
+            # A fault exit leaves a non-zero controller error; confirm the stop
+            # without requiring the error to be cleared (it is already latched).
+            _wait_live_status(arm, expected_state=4, require_error_clear=False)
             stopped_cleanly = True
         except Exception:
             logger.warning("arm_loop: cleanup failed", exc_info=True)
