@@ -24,6 +24,7 @@ from dexmani_real.utils.schema import (
     HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
+    POLICY_PLAN_DTYPE,
     RECORD_CONTROL_DTYPE,
     RECORD_STATUS_DTYPE,
     VR_FRAME_DTYPE,
@@ -60,6 +61,7 @@ class SharedStorageConfig:
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
+    policy_plan_ring_maxlen: int = 3
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
@@ -97,6 +99,7 @@ class SharedStorageConfig:
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
+            self.policy_plan_ring_maxlen,
             self.arm_action_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
@@ -177,6 +180,7 @@ _RING_RESOURCE_NAMES = (
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
+    "policy_plan_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_action_q", "arm_home_result_q")
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
@@ -190,6 +194,7 @@ HEARTBEAT_FIELDS: tuple[str, ...] = (
     "recorder",
     "vr",
     "camera",
+    "inference",
 )
 HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
 
@@ -203,6 +208,7 @@ READY_FIELDS: tuple[str, ...] = (
     "vr",
     "policy",
     "recorder",
+    "inference",
 )
 READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
 
@@ -234,6 +240,7 @@ class SharedStorage:
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
+    policy_plan_ring: SharedMemoryRingBuffer  # inference -> coordinator, latest-wins
 
     arm_action_q: mp.Queue  # policy -> ordered arm endpoints + HOME, maxsize=2
     arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
@@ -376,6 +383,11 @@ class SharedStorage:
             f"{prefix}_record_status",
             dtype=RECORD_STATUS_DTYPE,
             maxlen=cfg.record_status_ring_maxlen,
+        )
+        storage.policy_plan_ring = SharedMemoryRingBuffer.create_or_replace(
+            f"{prefix}_policy_plan",
+            dtype=POLICY_PLAN_DTYPE,
+            maxlen=cfg.policy_plan_ring_maxlen,
         )
 
         storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)

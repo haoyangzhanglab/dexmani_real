@@ -16,8 +16,8 @@ import numpy as np
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
-_HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "vr", "camera"})
-_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "policy", "vr"})
+_HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "vr", "camera", "inference"})
+_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "policy", "vr", "inference"})
 
 # Shared sub-structures
 
@@ -777,6 +777,7 @@ class SafetyParams:
             "recorder": 2.0,
             "vr": 5.0,
             "camera": 2.0,
+            "inference": 5.0,
         }
     )
     readiness_timeouts_s: Mapping[str, float] = field(
@@ -787,6 +788,7 @@ class SafetyParams:
             "recorder": 15.0,
             "policy": 120.0,
             "vr": 120.0,
+            "inference": 120.0,
         }
     )
     shutdown_timeout_s: float = 65.0

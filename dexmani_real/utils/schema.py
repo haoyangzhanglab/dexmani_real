@@ -32,6 +32,11 @@ HAND_TACTILE_FORCE_SHAPE = (
 HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
+# Learned-policy plan transport capacity (execution doc §61). This is a runtime
+# IPC capacity, not a model horizon; an adapter that requests N > this must fail
+# rather than silently truncate.
+MAX_POLICY_CHUNK_STEPS = 32
+
 _COMMAND_COMMON_FIELDS = [
     ("run_generation", "<u8"),
     ("observation_id", "<u8"),
@@ -47,6 +52,28 @@ ARM_COMMAND_DTYPE = np.dtype(
 )
 HAND_COMMAND_DTYPE = np.dtype(
     _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
+)
+
+# Learned-policy plan payload (execution doc §60). The inference worker writes
+# one of these per completed inference; the coordinator consumes the latest-wins
+# ring and never dumps the whole chunk into the arm queue or hand ring (§73/§74).
+POLICY_PLAN_DTYPE = np.dtype(
+    [
+        ("plan_id", "<u8"),
+        ("run_generation", "<u8"),
+        ("observation_id", "<u8"),
+        ("observation_anchor_monotonic_ns", "<u8"),
+        ("inference_started_monotonic_ns", "<u8"),
+        ("inference_finished_monotonic_ns", "<u8"),
+        ("num_steps", "<u4"),
+        ("arm_present", "<u1"),
+        ("hand_present", "<u1"),
+        ("target_monotonic_ns", "<u8", (MAX_POLICY_CHUNK_STEPS,)),
+        ("arm_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, ARM_DOF)),
+        ("hand_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, HAND_DOF)),
+        ("valid_mask", "<u1", (MAX_POLICY_CHUNK_STEPS,)),
+    ],
+    align=True,
 )
 
 ARM_STATE_DTYPE = np.dtype(
@@ -326,6 +353,8 @@ __all__ = [
     "HAND_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "HAND_TACTILE_DTYPE",
+    "MAX_POLICY_CHUNK_STEPS",
+    "POLICY_PLAN_DTYPE",
     "RECORD_CONTROL_DTYPE",
     "RECORD_OPERATOR_BYTES",
     "RECORD_STATUS_DTYPE",
