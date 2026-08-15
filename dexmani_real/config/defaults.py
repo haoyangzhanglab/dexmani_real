@@ -395,8 +395,12 @@ class HandParams:
     mechanical_qpos_min_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MIN_RAD
     mechanical_qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
 
-    # Operational command bounds. They deliberately form a conservative
-    # subset of the rated mechanical ranges, particularly at distal minima.
+    # Operational command bounds. The distal lower bounds are an operator-set
+    # anti-clogging margin (thumb_rota_j2 +10°, index/mid/ring/pinky_j2 +5°)
+    # that keeps *commands* away from the 0° hard stop. They are enforced by
+    # clipping the command on publish — never by rejecting the action, and never
+    # against measured feedback: the hand settles imprecisely (a 5° command
+    # lands ~4.6°) and contact can pull the measured angle far from the command.
     qpos_min_rad: tuple[float, ...] = (
         0.0,
         -0.698,
@@ -411,25 +415,51 @@ class HandParams:
         0.0,
         0.08726646259971647,
     )
-    qpos_max_rad: tuple[float, ...] = (
-        1.832,
-        1.745,
-        1.745,
-        0.174,
-        1.919,
-        1.919,
-        1.919,
-        1.919,
-        1.919,
-        1.919,
-        1.919,
-        1.919,
+    qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
+    # Command-to-command rate bound. None disables it: the EtherCAT firmware
+    # PID (with per-joint current limits) is the final velocity backstop,
+    # mirroring how the arm velocity envelope was removed. When configured,
+    # the controller clips the motion to this bound instead of rejecting the
+    # whole action.
+    max_delta_rad: float | None = None
+
+    # ── Servo gains (PID) and current limit ──
+    # Per-joint proportional gains. Index abduction (J3) is raised to 120 to
+    # compensate for sideways loading; all other joints use 100. Integral and
+    # derivative gains are uniform (0) across all joints.
+    kp: tuple[int, ...] = (
+        100,
+        100,
+        100,
+        120,
+        100,
+        100,
+        100,
+        100,
+        100,
+        100,
+        100,
+        100,
     )
-    # 0.20 rad per action (~183 deg/s at the default 16 Hz). The controller's
-    # _sanitize_hand_command rejects the whole action (arm + hand hold) when a
-    # command-to-command motion exceeds this bound; neither SafetyGate nor the
-    # XHand driver clips the target.
-    max_delta_rad: float | None = 0.20
+    ki: int = 0
+    kd: int = 0
+
+    # Per-joint torque (current) limit in mA. Index abduction (J3) is raised
+    # to 360 mA to handle sideways loading; all other joints use 300 mA.
+    tor_max_ma: tuple[int, ...] = (
+        300,
+        300,
+        300,
+        360,
+        300,
+        300,
+        300,
+        300,
+        300,
+        300,
+        300,
+        300,
+    )
 
     loop_hz: float = 30.0
 
@@ -493,6 +523,14 @@ class HandParams:
             raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
         if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
             raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
+        if len(self.kp) != 12 or any(not isinstance(value, int) or value <= 0 for value in self.kp):
+            raise ValueError("hand kp must contain twelve positive integer gains")
+        if self.ki < 0 or self.kd < 0:
+            raise ValueError("hand ki/kd must be non-negative")
+        if len(self.tor_max_ma) != 12 or any(
+            not isinstance(value, int) or value <= 0 for value in self.tor_max_ma
+        ):
+            raise ValueError("hand tor_max_ma must contain twelve positive integer mA limits")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
         if not np.isfinite(self.home_command_ack_timeout_s) or self.home_command_ack_timeout_s <= 0:
@@ -562,7 +600,6 @@ class PolicyParams:
     # ── Hand retargeting ──
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
-    hand_output_smoothing_alpha: float = 0.5  # retarget post-filter; ~62.5ms group delay at 16Hz
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
@@ -585,8 +622,6 @@ class PolicyParams:
             raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
         if not (0.0 <= self.ema.alpha_rot <= 1.0):
             raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
-        if not (0.0 <= self.hand_output_smoothing_alpha <= 1.0):
-            raise ValueError("hand_output_smoothing_alpha must be in [0, 1]")
         if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
             raise ValueError("hand_ramp_duration_s must be finite and >= 0")
         if not np.isfinite(self.begin_motion_gate_timeout_s) or self.begin_motion_gate_timeout_s < 0:
@@ -850,6 +885,11 @@ class CameraParams:
     warmup_frames: int = 10
     max_frame_age_s: float = 0.25
     recording_stall_abort_s: float = 2.0
+    # Frames skipped between consecutive reads that still count as normal.
+    # 0 (default) derives the threshold from fps/publish_hz, so the intentional
+    # publish-rate throttle does not read as a stall; set a positive value to
+    # override.  FRAME_GAP is flagged only when the gap exceeds this threshold.
+    frame_gap_stall_threshold: int = 0
     ring_maxlen: int = 5
     pointcloud_num_points: int = 2048
     writer_queue_size: int = 8
@@ -875,6 +915,8 @@ class CameraParams:
             raise ValueError("camera warmup_frames must be >= 0")
         if self.max_frame_age_s <= 0 or self.recording_stall_abort_s <= self.max_frame_age_s:
             raise ValueError("camera stall abort threshold must be greater than max frame age")
+        if self.frame_gap_stall_threshold < 0:
+            raise ValueError("camera frame_gap_stall_threshold must be >= 0 (0 = derive from fps/publish_hz)")
         if self.ring_maxlen <= 0 or self.pointcloud_num_points <= 0 or self.writer_queue_size <= 0:
             raise ValueError("camera ring, pointcloud, and writer capacities must be > 0")
         if self.serial is not None and not self.serial:

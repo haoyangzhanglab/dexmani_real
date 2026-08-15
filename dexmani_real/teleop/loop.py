@@ -218,9 +218,6 @@ def _try_init_hand_retargeter_impl(ctx: TeleopLoopState, cfg: TeleopConfig) -> b
         if cfg.runtime.policy.hand_retargeting_type == "tag":
             ctx.hand_retargeter = TAGHandRetargeter(
                 hand_type="right",
-                smoothing_alpha=cfg.runtime.policy.hand_output_smoothing_alpha,
-                qpos_lower_rad=cfg.runtime.hand.qpos_min_rad,
-                qpos_upper_rad=cfg.runtime.hand.qpos_max_rad,
                 fingertip_link_names=cfg.runtime.hand.fingertip_link_names,
                 tag_config=_tag_config_with_urdf(cfg.runtime.tag_retargeting, cfg.hand_urdf_path),
             )
@@ -228,7 +225,6 @@ def _try_init_hand_retargeter_impl(ctx: TeleopLoopState, cfg: TeleopConfig) -> b
             ctx.hand_retargeter = XHandRetargeter(
                 hand_type="right",
                 retargeting_type=cfg.runtime.policy.hand_retargeting_type,
-                smoothing_alpha=cfg.runtime.policy.hand_output_smoothing_alpha,
             )
         logger.info("Hand retargeter ready (type=%s)", cfg.runtime.policy.hand_retargeting_type)
         return True
@@ -1295,9 +1291,20 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 ctx.hand_ramp_start = None
                 ctx.hand_ramp_step = 0
 
-            hand_start_qpos = ctx.prev_hand_qpos.copy()
-            if hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0])):
-                hand_start_qpos = np.asarray(hand_state["qpos"][0], dtype=np.float64).copy()
+            # Hand delta clamp (mirrors the arm clamp below): saturate fast
+            # finger motion at max_delta_rad instead of reject-whole, so a
+            # single fast frame cannot latch the action for good.
+            if cfg.runtime.hand.max_delta_rad is not None:
+                hand_cmd = ctx.prev_hand_qpos + np.clip(
+                    hand_cmd - ctx.prev_hand_qpos,
+                    -cfg.runtime.hand.max_delta_rad,
+                    cfg.runtime.hand.max_delta_rad,
+                )
+            # Hand command-floor clip (mirrors the arm limit clip below):
+            # project the command into the operator-set anti-clogging command
+            # box instead of rejecting the whole action; measured feedback is
+            # never clipped here.
+            hand_cmd = np.clip(hand_cmd, hand_qpos_lower_rad, hand_qpos_upper_rad)
             hand_cmd_valid = True
             try:
                 hand_cmd = _sanitize_hand_command(

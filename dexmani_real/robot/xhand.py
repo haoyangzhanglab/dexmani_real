@@ -105,20 +105,24 @@ class XHandConfig:
         default_factory=lambda: np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64)
     )
 
+    # Scalar fallback gains, applied to every joint when the per-joint
+    # overrides below are not supplied. The production hand worker supplies
+    # per-joint gains resolved from config.defaults.HandParams.
     kp: int = 100
     ki: int = 0
     kd: int = 0
     # Per-joint overrides replace the scalar gains when configured.
-    # When set (shape (12,)), individual joint gains replace the scalar kp/ki/kd.
-    # Distal joints (especially little finger joint 11) benefit from higher gains
-    # to compensate for longer linkage and higher mechanical load.
+    # When set (shape (12,)), individual joint gains replace the scalar
+    # kp/ki/kd. The deployed config raises index abduction (J3) kp to 120.
     kp_per_joint: np.ndarray | None = None  # (12,) per-joint kp overrides
     ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
     kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
-    tor_max: int = 300  # max 300mA (per-joint default)
+    # Scalar fallback current limit, applied to every joint when the per-joint
+    # overrides below are not supplied.
+    tor_max: int = 300  # mA
     # Per-joint tor_max overrides. When set (shape (12,)), individual joint
-    # current limits replace the scalar tor_max.  Index abduction (J3) benefits
-    # from higher current to compensate for sideways loading.
+    # current limits replace the scalar tor_max. The deployed config raises
+    # index abduction (J3) to 360 mA to handle sideways loading.
     tor_max_per_joint: np.ndarray | None = None  # (12,) per-joint tor_max overrides
     mode: int = 3
 

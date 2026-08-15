@@ -53,9 +53,6 @@ class HandOptimizer:
         Skip Stage 2 when max(pinch_factors) < this value.
     reg_stage1_weight / reg_last_weight:
         Stage 2 regularization: anchor to Stage 1 solution / previous frame.
-    feedback_bound_tolerance_rad:
-        Feedback-only allowance used to classify measured warm-start
-        excursions. NLopt bounds remain strict and warm starts are projected.
     """
 
     def __init__(
@@ -80,7 +77,6 @@ class HandOptimizer:
         pinch_skip_threshold: float = 0.01,
         reg_stage1_weight: float = 1.0,
         reg_last_weight: float = 0.8,
-        feedback_bound_tolerance_rad: float = 0.01,
     ) -> None:
         # ── Kinematics ──
         self.pin_grad = PinGrad(urdf_path, fingertip_frame_names)
@@ -97,11 +93,8 @@ class HandOptimizer:
             raise ValueError("joint limits must be finite")
         if np.any(lower > upper):
             raise ValueError("joint lower bounds must not exceed upper bounds")
-        if not np.isfinite(feedback_bound_tolerance_rad) or feedback_bound_tolerance_rad < 0:
-            raise ValueError("feedback_bound_tolerance_rad must be finite and >= 0")
         self.joint_limits_lower = lower.copy()
         self.joint_limits_upper = upper.copy()
-        self.feedback_bound_tolerance_rad = float(feedback_bound_tolerance_rad)
 
         # ── Finger length scaling ──
         robot_lengths = np.asarray(finger_lengths_robot, dtype=np.float64)
@@ -160,12 +153,6 @@ class HandOptimizer:
         self._stage1_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._stage2_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
-        self._feedback_bound_checks = 0
-        self._feedback_bound_clips = 0
-        self._feedback_bound_within_tolerance = 0
-        self._feedback_bound_over_tolerance = 0
-        self._feedback_bound_max_violation_rad = 0.0
-        self._feedback_bound_joint_clip_counts = np.zeros(self.dof, dtype=np.int64)
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -254,63 +241,12 @@ class HandOptimizer:
         """
         if qpos is not None and np.asarray(qpos).shape == (self.dof,) and np.all(np.isfinite(qpos)):
             qpos_array = np.asarray(qpos, dtype=np.float64)
-            self._record_feedback_bound_check(qpos_array)
             bounded = self._bounded_qpos(qpos_array, "reset warm start", warn_on_clip=False)
             self.last_qpos = bounded
         else:
             self.last_qpos = self._default_qpos.copy()
         self.pinch_factors = np.zeros(self.finger_num, dtype=np.float64)
         self.qpos_stage1 = None
-
-    @property
-    def feedback_bound_stats(self) -> dict[str, object]:
-        """Return a copy of cumulative measured warm-start boundary statistics."""
-        return {
-            "checks": self._feedback_bound_checks,
-            "clipped_checks": self._feedback_bound_clips,
-            "within_tolerance_checks": self._feedback_bound_within_tolerance,
-            "over_tolerance_checks": self._feedback_bound_over_tolerance,
-            "max_violation_rad": self._feedback_bound_max_violation_rad,
-            "per_joint_clip_counts": self._feedback_bound_joint_clip_counts.copy(),
-        }
-
-    def _record_feedback_bound_check(self, qpos: np.ndarray) -> None:
-        """Classify one measured warm start without weakening strict bounds."""
-        lower_violation = np.maximum(self.joint_limits_lower - qpos, 0.0)
-        upper_violation = np.maximum(qpos - self.joint_limits_upper, 0.0)
-        violation = np.maximum(lower_violation, upper_violation)
-        clipped = np.flatnonzero(violation > 1e-12)
-
-        self._feedback_bound_checks += 1
-        if clipped.size == 0:
-            return
-
-        max_violation = float(np.max(violation))
-        self._feedback_bound_clips += 1
-        self._feedback_bound_joint_clip_counts[clipped] += 1
-        self._feedback_bound_max_violation_rad = max(self._feedback_bound_max_violation_rad, max_violation)
-        deviations_deg = np.round(np.rad2deg(violation[clipped]), 3).tolist()
-
-        if max_violation <= self.feedback_bound_tolerance_rad:
-            self._feedback_bound_within_tolerance += 1
-            logger.info(
-                "HandOptimizer: feedback warm start clipped within tolerance "
-                "(model joints=%s, deviation_deg=%s, tolerance=%.3fdeg)",
-                clipped.tolist(),
-                deviations_deg,
-                float(np.rad2deg(self.feedback_bound_tolerance_rad)),
-            )
-        else:
-            self._feedback_bound_over_tolerance += 1
-            logger.warning(
-                "HandOptimizer: feedback warm start exceeds bound tolerance "
-                "(model joints=%s, deviation_deg=%s, tolerance=%.3fdeg, over_tolerance=%d/%d)",
-                clipped.tolist(),
-                deviations_deg,
-                float(np.rad2deg(self.feedback_bound_tolerance_rad)),
-                self._feedback_bound_over_tolerance,
-                self._feedback_bound_checks,
-            )
 
     def _bounded_qpos(self, qpos: np.ndarray, label: str, *, warn_on_clip: bool = True) -> np.ndarray:
         """Validate and project one NLopt state into the configured box bounds."""

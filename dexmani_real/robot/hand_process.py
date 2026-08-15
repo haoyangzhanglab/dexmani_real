@@ -48,6 +48,14 @@ class HandProcessConfig:
     mechanical_qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.mechanical_qpos_max_rad)
     max_command_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
 
+    # Servo gains (PID) and per-joint current limit, resolved from the
+    # immutable runtime config (defaults + file/CLI overrides). ``kp`` and
+    # ``tor_max_ma`` are per-joint; ``ki``/``kd`` are uniform.
+    kp: tuple[int, ...] = field(default_factory=lambda: hand.kp)
+    ki: int = field(default_factory=lambda: hand.ki)
+    kd: int = field(default_factory=lambda: hand.kd)
+    tor_max_ma: tuple[int, ...] = field(default_factory=lambda: hand.tor_max_ma)
+
     # Send-error watchdog: auto clear_local_error() after N consecutive send failures
     send_err_watchdog_frames: int = field(default_factory=lambda: hand.send_err_watchdog_count)
 
@@ -86,6 +94,16 @@ class HandProcessConfig:
             not np.isfinite(self.max_command_delta_rad) or self.max_command_delta_rad <= 0.0
         ):
             raise ValueError("hand process max command delta must be finite and positive")
+        if len(self.kp) != HAND_JOINT_SHAPE[0] or any(
+            not isinstance(value, int) or value <= 0 for value in self.kp
+        ):
+            raise ValueError("hand process kp must contain twelve positive integer gains")
+        if self.ki < 0 or self.kd < 0:
+            raise ValueError("hand process ki/kd must be non-negative")
+        if len(self.tor_max_ma) != HAND_JOINT_SHAPE[0] or any(
+            not isinstance(value, int) or value <= 0 for value in self.tor_max_ma
+        ):
+            raise ValueError("hand process tor_max_ma must contain twelve positive integer mA limits")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand process loop_hz must be finite and positive")
         if self.send_err_watchdog_frames <= 0 or self.error_state_watchdog_frames <= 0:
@@ -104,6 +122,10 @@ class HandProcessConfig:
             mechanical_qpos_lower_rad=tuple(float(value) for value in cfg.mechanical_qpos_min_rad),
             mechanical_qpos_upper_rad=tuple(float(value) for value in cfg.mechanical_qpos_max_rad),
             max_command_delta_rad=None if cfg.max_delta_rad is None else float(cfg.max_delta_rad),
+            kp=tuple(int(value) for value in cfg.kp),
+            ki=int(cfg.ki),
+            kd=int(cfg.kd),
+            tor_max_ma=tuple(int(value) for value in cfg.tor_max_ma),
             send_err_watchdog_frames=int(cfg.send_err_watchdog_count),
         )
 
@@ -130,14 +152,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     try:
         from dexmani_real.robot.xhand import XHand, XHandConfig
 
-        # Per-joint tor_max: index abduction (J3) handles sideways load,
-        # benefit from higher current limit (380 vs default 300 mA).
-        _tor_max_pj = np.full(HAND_JOINT_SHAPE, 300, dtype=np.int32)
-        _tor_max_pj[3] = 380
-
+        # Servo gains and per-joint current limit come from the resolved
+        # runtime config (defaults + file/CLI overrides), not hardcoded here.
         hand = XHand(
             XHandConfig(
-                tor_max_per_joint=_tor_max_pj,
+                kp_per_joint=np.asarray(cfg.kp, dtype=np.int32),
+                ki=cfg.ki,
+                kd=cfg.kd,
+                tor_max_per_joint=np.asarray(cfg.tor_max_ma, dtype=np.int32),
                 ethercat_slave_position=cfg.ethercat_slave_position,
                 home_qpos=np.asarray(cfg.home_qpos_rad, dtype=np.float64),
                 qpos_min=np.asarray(cfg.qpos_lower_rad, dtype=np.float64),

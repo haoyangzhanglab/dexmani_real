@@ -36,6 +36,7 @@ import yaml
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
+from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
 from dexmani_real.recording.recorder_client import RecorderPhase
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
@@ -55,7 +56,7 @@ from dexmani_real.runtime.supervisor import (
     shutdown_processes,
     wait_subsystem_ready,
 )
-from dexmani_real.sensor.camera_process import CameraLoopConfig
+from dexmani_real.sensor.camera_process import CameraHealth, CameraLoopConfig
 from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
@@ -194,14 +195,33 @@ def _preflight_health_issues(
             issues.append("camera frame is unavailable")
         else:
             header = camera_result[0]
+            camera_health = int(header["camera_health"][0])
             source_ns = int(header["source_monotonic_ns"][0])
             current_ns = time.monotonic_ns() if now_ns is None else now_ns
-            camera_ok = (
-                int(header["camera_health"][0]) == 0
-                and 0 < source_ns <= current_ns
-                and current_ns - source_ns <= int(float(runtime.camera.max_frame_age_s) * 1e9)
-            )
+            max_age_ns = int(float(runtime.camera.max_frame_age_s) * 1e9)
+            age_ns = (current_ns - source_ns) if source_ns > 0 else -1
+            health_ok = camera_health == 0
+            ts_ok = 0 < source_ns <= current_ns
+            age_ok = age_ns <= max_age_ns
+            camera_ok = health_ok and ts_ok and age_ok
             if not camera_ok:
+                try:
+                    health_name = CameraHealth(camera_health).name
+                except ValueError:
+                    health_name = f"INVALID({camera_health})"
+                logger.warning(
+                    "camera preflight detail: health=%s(%d) source_ns=%d now=%d "
+                    "age_ms=%.2f max_age_ms=%.2f [health_ok=%s ts_ok=%s age_ok=%s]",
+                    health_name,
+                    camera_health,
+                    source_ns,
+                    current_ns,
+                    age_ns / 1e6,
+                    max_age_ns / 1e6,
+                    health_ok,
+                    ts_ok,
+                    age_ok,
+                )
                 issues.append("camera frame is unhealthy or stale")
     return issues
 
@@ -429,11 +449,16 @@ def run_teleop_experiment(
             if spec.ready_name
         ]
 
-        for name, timeout in ready_checks:
-            if name == "vr":
-                print(f"\n  Waiting for VR connection (up to {timeout}s) — put on Quest headset...", flush=True)
+        # VR is the one subsystem that needs operator action (donning the
+        # Quest headset), so it is prompted for and waited on last — only after
+        # every other subsystem has confirmed ready. This keeps "System ready"
+        # truthful and lets non-VR init failures surface without first waiting
+        # out the full VR timeout. The VR process is still *started* early (in
+        # specs order); only its readiness check is deferred.
+        non_vr_checks = [rc for rc in ready_checks if rc[0] != "vr"]
+        vr_checks = [rc for rc in ready_checks if rc[0] == "vr"]
 
-        if not wait_subsystem_ready(shared, ready_checks, procs):
+        if not wait_subsystem_ready(shared, non_vr_checks, procs):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
@@ -442,11 +467,25 @@ def run_teleop_experiment(
             shared_closed = shutdown_report.shared_closed
             return 1
 
-        for name, _timeout in ready_checks:
-            if name == "vr":
-                print(f"  VR connected", flush=True)
-            else:
-                print(f"  {name}: ready", flush=True)
+        for name, _timeout in non_vr_checks:
+            print(f"  {name}: ready", flush=True)
+
+        if vr_checks:
+            _, vr_timeout = vr_checks[0]
+            print(
+                f"\n  System ready — waiting for VR connection (up to {vr_timeout}s) — "
+                f"put on Quest headset...",
+                flush=True,
+            )
+            if not wait_subsystem_ready(shared, vr_checks, procs):
+                shared.error_state.value = True
+                require_transition(shared, SafetyState.FAULT)
+                shutdown_report = shutdown_processes(
+                    shared, procs, graceful_timeout_s=float(runtime.safety.shutdown_timeout_s)
+                )
+                shared_closed = shutdown_report.shared_closed
+                return 1
+            print(f"  VR connected", flush=True)
 
         print_health_summary(shared)
         health_issues = _preflight_health_issues(
@@ -467,6 +506,30 @@ def run_teleop_experiment(
             return 1
 
         require_transition(shared, SafetyState.ARMED)
+
+        # Reset the XHand to its configured open-neutral home once it has
+        # initialized and the system is ARMED. The hand worker only applies
+        # commands in ARMED/RUNNING, so this must follow the ARMED transition.
+        # It is an explicit, correlated homing action (the same hand-only path
+        # used by return-home/replay) and does not move the arm.
+        if hand_enabled:
+            hand_home = np.deg2rad(
+                np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
+            )
+            hand_home_accepted = publish_hand_home_and_wait_applied(
+                shared,
+                hand_home,
+                command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
+                command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
+                mechanical_lower_rad=np.asarray(runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
+                mechanical_upper_rad=np.asarray(runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
+                max_command_delta_rad=runtime.hand.max_delta_rad,
+                timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+                heartbeat=False,
+            )
+            if not hand_home_accepted:
+                logger.warning("XHand reset-to-home was not acknowledged by the worker/SDK")
+
         begin_label = "teleop+record" if recording_enabled else "teleop"
         print(
             f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"

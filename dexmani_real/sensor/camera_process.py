@@ -41,6 +41,7 @@ class CameraLoopConfig:
     pointcloud_num_points: int = field(default_factory=lambda: camera.pointcloud_num_points)
     publish_hz: float = field(default_factory=lambda: policy.control_hz)
     max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
+    frame_gap_stall_threshold: int = field(default_factory=lambda: camera.frame_gap_stall_threshold)
     desk_plane: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
@@ -56,6 +57,21 @@ class CameraLoopConfig:
             raise ValueError("camera dimensions/rates must be positive")
         if self.pointcloud_num_points <= 0:
             raise ValueError("pointcloud_num_points must be positive")
+        if self.frame_gap_stall_threshold < 0:
+            raise ValueError("frame_gap_stall_threshold must be >= 0 (0 = derive from fps/publish_hz)")
+
+    @property
+    def resolved_frame_gap_stall_threshold(self) -> int:
+        """Skipped-frame count above which a read gap is flagged as a stall.
+
+        A read throttled to ``publish_hz`` below the device ``fps`` inherently
+        skips ~``fps/publish_hz`` frames per read; only a gap beyond that
+        ceiling (plus jitter) is a real pipeline stall.  A positive configured
+        threshold overrides the derived value.
+        """
+        if self.frame_gap_stall_threshold > 0:
+            return self.frame_gap_stall_threshold
+        return int(math.ceil(self.fps / self.publish_hz))
 
     @classmethod
     def from_runtime(cls, runtime: object) -> "CameraLoopConfig":
@@ -78,6 +94,7 @@ class CameraLoopConfig:
             pointcloud_num_points=int(cam.pointcloud_num_points),
             publish_hz=float(pol.control_hz),
             max_frame_age_s=float(cam.max_frame_age_s),
+            frame_gap_stall_threshold=int(cam.frame_gap_stall_threshold),
             desk_plane=desk_plane,
         )
 
@@ -346,7 +363,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                     camera_health = CameraHealth.CLOCK_RESET
                 elif frame.duplicate:
                     camera_health = CameraHealth.DUPLICATE
-                elif frame.frame_gap:
+                elif frame.frame_gap > cfg.resolved_frame_gap_stall_threshold:
                     camera_health = CameraHealth.FRAME_GAP
                 elif frame.backlog_s > cfg.max_frame_age_s:
                     camera_health = CameraHealth.BACKLOG

@@ -24,23 +24,18 @@ def _sanitize_hand_command(
     mechanical_lower: np.ndarray,
     mechanical_upper: np.ndarray,
 ) -> np.ndarray:
-    """Validate one hand target without modifying any joint endpoint.
+    """Backstop validation of an already-clipped hand target; never clips.
 
-    Enforces, at the controller (before publication): well-formed shape, finite
-    values, commanded joint limits, the rated mechanical envelope, and the
-    command-to-command delta bound.  This is the *graceful-hold* boundary — a
-    violation raises so the loop marks ``hand_cmd_valid=False`` /
-    ``retarget_ok=False`` and holds arm + hand together, instead of letting
-    ``SafetyGate.validate`` turn an out-of-limit hand command into a sticky
-    fault, or letting a command-to-command delta violation desync the arm
-    (which would otherwise still move) from the hand.
-
-    On the VR-teleop path this delta bound is the only controller-side
-    enforcement: ``SafetyGate`` dropped its velocity envelope (2026-08-12) and
-    ``worker_validate_hand`` only discards the hand command after the arm has
-    already been commanded.  (Other coupled paths — keyboard, replay, calibrate —
-    enforce the same bound via ``validate_hand_command_delta`` inside
-    ``publish_joint_targets``.)  Do not delete this check as "redundant".
+    The VR-teleop caller clips the command into the operator-set anti-clogging
+    command box (loop.py) before calling here, so the operational bound should
+    never fire on that path.  This preflight remains as the *graceful-hold*
+    backstop for well-formed shape, finite values, the rated mechanical
+    envelope, and limit-array consistency: a violation raises so the loop marks
+    ``hand_cmd_valid=False`` and holds arm + hand together, instead of letting
+    ``SafetyGate.validate`` turn an out-of-limit command into a sticky fault.
+    (Other coupled paths — keyboard, replay, calibrate, return-home — still rely
+    on ``validate_hand_command_delta`` inside ``publish_joint_targets`` to
+    reject, not clip.)
     """
     return validate_hand_command_delta(
         hand_cmd,

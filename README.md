@@ -241,7 +241,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `robot/__init__.py` | 标识 xArm7、XHand 驱动和执行 worker 所在包。 |
 | `robot/arm_loop.py` | xArm Mode 6 伺服 worker：按 generation 读取有序臂命令、发布 FK 状态，并处理 C24 恢复与碰撞故障；DISARMED、FAULT、紧停后备与退出确认 State 4，成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
 | `robot/arm_sdk.py` | 共享 xArm SDK 表面：`ArmLoopConfig`（Mode 6 在线轨迹规划配置，`from_runtime` 解析）与叶子级 live-read 原语 `_read_live_error_code`/`_require_sdk_ok`，供 `arm_loop.py`（伺服）与 `homing.py`（回零执行）共同使用，保持依赖无环。 |
-| `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、复核命令/机械限位、发布关节/触觉反馈与最后成功 action ID；不以目标—反馈不收敛判定故障。 |
+| `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、复核命令/机械限位、发布关节/触觉反馈与最后成功 action ID；不以目标—反馈不收敛判定故障。伺服 PID 增益与逐关节电流上限从 `config.defaults.HandParams` 解析（`kp`/`tor_max_ma` 逐关节，`ki`/`kd` 均匀）。 |
 | `robot/homing.py` | 回零编排与执行：`send_arm_home` 编排候选路径，`run_planned_homing` 为执行入口（Mode 0 里程碑 + 完成后恢复 Mode 6）；包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
 | `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `utils/schema.py` 决定。 |

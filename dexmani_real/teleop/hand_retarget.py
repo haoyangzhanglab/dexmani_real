@@ -416,16 +416,12 @@ class TAGHandRetargeter:
             → rotate by R_mano_to_urdf                      (align to URDF frame)
             → HandOptimizer.solve()                         (two-stage NLopt)
             → model→SDK joint order remap
-            → EMA post-filter
             → (12,) SDK-order qpos
 
     Parameters
     ----------
     hand_type:
         ``"right"`` (default).
-    smoothing_alpha:
-        Teleoperator-level EMA smoothing factor (0.0 = freeze, 1.0 = pass-through).
-        ``None`` uses the central policy default (currently 0.5 at 16 Hz).
     debug:
         If True, log per-frame retargeting timing.
     """
@@ -433,17 +429,13 @@ class TAGHandRetargeter:
     def __init__(
         self,
         hand_type: str = "right",
-        smoothing_alpha: float | None = None,
         debug: bool = False,
-        qpos_lower_rad: tuple[float, ...] | None = None,
-        qpos_upper_rad: tuple[float, ...] | None = None,
         fingertip_link_names: tuple[str, ...] | None = None,
         tag_config: Any | None = None,
     ) -> None:
         from scipy.spatial.transform import Rotation
 
         from dexmani_real.config.defaults import hand as hand_d
-        from dexmani_real.config.defaults import policy as policy_d
         from dexmani_real.config.defaults import tag_retargeting as default_tag_cfg
         from dexmani_real.teleop.tag_retargeting.optimizer import HandOptimizer
         from dexmani_real.teleop.tag_retargeting.pin_grad import validate_fingertip_frame_names
@@ -497,29 +489,13 @@ class TAGHandRetargeter:
         self._mapping_model_to_sdk = np.array([model_names.index(n) for n in self.urdf_joint_names], dtype=np.intp)
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
 
-        # ── Merge driver-enforced joint limits ───────────────────────────
-        # URDF limits are used as NLopt bounds, while the XHand command boundary
-        # rejects targets outside [qpos_min, qpos_max] (anti-clogging margins).
-        # For five distal joints the command lower bound is more restrictive than
-        # the URDF (thumb_rota_j2: +10°, index/mid/ring/pinky_j2: +5°).
-        # Passing the intersection to the optimizer prevents it from proposing
-        # unreachable angles that would cause FK-predicted ≠ actual fingertip positions.
-        _driver_lo_sdk = np.asarray(hand_d.qpos_min_rad if qpos_lower_rad is None else qpos_lower_rad, dtype=np.float64)
-        _driver_hi_sdk = np.asarray(hand_d.qpos_max_rad if qpos_upper_rad is None else qpos_upper_rad, dtype=np.float64)
-        if (
-            _driver_lo_sdk.shape != HAND_JOINT_SHAPE
-            or _driver_hi_sdk.shape != HAND_JOINT_SHAPE
-            or not np.all(np.isfinite(_driver_lo_sdk))
-            or not np.all(np.isfinite(_driver_hi_sdk))
-            or np.any(_driver_lo_sdk > _driver_hi_sdk)
-        ):
-            raise ValueError("TAG retargeting SDK bounds must be finite, ordered shape-(12,) arrays")
-        _driver_lo_model = _driver_lo_sdk[self._mapping_sdk_to_model]
-        _driver_hi_model = _driver_hi_sdk[self._mapping_sdk_to_model]
-        joint_lo = np.maximum(joint_lo, _driver_lo_model)
-        joint_hi = np.minimum(joint_hi, _driver_hi_model)
-
         # ── Optimizer ──
+        # NLopt bounds are the URDF mechanical range, not the operator-set
+        # anti-clogging command floor. The measured warm-start pose is real
+        # hardware state (e.g. ~4.4° below a 5° command floor) and must not be
+        # projected into a stricter box; the command floor is applied later by
+        # clipping the published command.
+
         self._optimizer = HandOptimizer(
             urdf_path=resolved_urdf_path,
             fingertip_frame_names=list(resolved_tip_names),
@@ -546,17 +522,13 @@ class TAGHandRetargeter:
         self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
         # MANO and URDF both use +Z for finger extension.
 
-        # ── Smoothing & debug ──
-        effective_smoothing_alpha = policy_d.hand_output_smoothing_alpha if smoothing_alpha is None else smoothing_alpha
-        self._smoothing_alpha = float(np.clip(effective_smoothing_alpha, 0.0, 1.0))
-        self._ema_state: np.ndarray | None = None
+        # ── State & debug ──
         self._last_raw_qpos: np.ndarray | None = None
         self.debug = bool(debug)
 
         logger.info(
-            "TAGHandRetargeter ready (urdf=%s, smoothing_alpha=%.2f, mano→urdf=%s)",
+            "TAGHandRetargeter ready (urdf=%s, mano→urdf=%s)",
             resolved_urdf_path,
-            self._smoothing_alpha,
             tag_cfg.mano_to_urdf_euler,
         )
 
@@ -606,14 +578,6 @@ class TAGHandRetargeter:
         qpos_sdk = qpos_model[self._mapping_model_to_sdk]
         self._last_raw_qpos = qpos_sdk.copy()
 
-        # 6. Teleoperator-level EMA post-filter
-        if self._smoothing_alpha < 1.0:
-            if self._ema_state is not None:
-                qpos_sdk = self._smoothing_alpha * qpos_sdk + (1.0 - self._smoothing_alpha) * self._ema_state
-            self._ema_state = qpos_sdk.copy()
-        else:
-            self._ema_state = None
-
         if self.debug:
             dt_ms = 1000.0 * (time.perf_counter() - t0)
             logger.info("TAGHandRetargeter: retarget %.2f ms", dt_ms)
@@ -628,8 +592,7 @@ class TAGHandRetargeter:
                 When provided, seeds the NLopt warm-start from the actual hardware
                 pose so the first-frame optimization converges from near-optimum.
         """
-        # Clear teleoperator EMA state
-        self._ema_state = None
+        # Clear last raw output state
         self._last_raw_qpos = None
 
         if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(initial_qpos)):
@@ -640,24 +603,9 @@ class TAGHandRetargeter:
             self._optimizer.reset(None)
 
     @property
-    def feedback_bound_stats(self) -> dict[str, object]:
-        """Cumulative hardware warm-start boundary statistics."""
-        return self._optimizer.feedback_bound_stats
-
-    @property
     def last_raw_qpos(self) -> np.ndarray | None:
-        """Latest SDK-order optimizer output before the teleoperator EMA."""
+        """Latest SDK-order retarget output."""
         return self._last_raw_qpos.copy() if self._last_raw_qpos is not None else None
-
-    @property
-    def low_pass_alpha(self) -> float:
-        """Current EMA smoothing alpha (1.0 = pass-through)."""
-        return self._smoothing_alpha
-
-    @low_pass_alpha.setter
-    def low_pass_alpha(self, value: float) -> None:
-        """Tune the EMA smoothing strength at runtime."""
-        self._smoothing_alpha = float(np.clip(value, 0.0, 1.0))
 
 
 # ── Lazy Pinocchio URDF loader (avoids import at module level) ──

@@ -408,7 +408,12 @@ def worker_validate_hand(
         and np.all(qpos_cmd >= mechanical_lower - 1e-12)
         and np.all(qpos_cmd <= mechanical_upper + 1e-12)
     )
-    if previous_qpos_cmd is not None or max_command_delta_rad is not None:
+    # The command-to-command delta check applies only when a rate limit is
+    # configured. When max_command_delta_rad is None (rate limiting disabled),
+    # the last accepted target is irrelevant to validity and must not turn the
+    # reference into NaN — np.asarray(None, float64) is nan — and reject every
+    # command. previous_qpos_cmd alone never triggers the delta branch.
+    if max_command_delta_rad is not None:
         previous = np.asarray(previous_qpos_cmd, dtype=np.float64)
         try:
             max_delta = np.broadcast_to(
