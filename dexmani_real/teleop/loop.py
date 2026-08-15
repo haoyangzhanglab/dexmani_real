@@ -21,7 +21,8 @@ from dexmani_real.planning.pose_utils import (normalize_quat_wxyz,
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
-                                        send_command)
+                                        build_action_candidate,
+                                        validate_and_send_candidate)
 from dexmani_real.recording.recorder_client import RecorderClient, RecorderPhase
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
@@ -1585,67 +1586,23 @@ def _safe_joint_publish(
         return None
     gate = safety_gate
 
-    with shared.arm_command_seq.get_lock():
-        action_id = int(shared.arm_command_seq.value) + 1
-        shared.arm_command_seq.value = action_id
-    now_ns = time.monotonic_ns()
-    if observation_anchor_monotonic_ns is not None:
-        anchor_ns = int(observation_anchor_monotonic_ns)
-        if anchor_ns <= 0 or anchor_ns > now_ns:
-            logger.warning("joint target rejected: invalid observation anchor")
-            return None
-
-    candidate = ActionCandidate(
-        observation_id=action_id if observation_id is None else int(observation_id),
-        run_generation=int(shared.run_generation.value),
-        action_id=action_id,
-        created_monotonic_ns=now_ns,
-        target_monotonic_ns=now_ns + int(float(shared.action_lead_time_s) * 1e9),
-        valid_until_monotonic_ns=now_ns + int(0.5 * 1e9),
-        arm_qpos=np.asarray(arm_qpos, dtype=np.float64),
-        hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
+    candidate = build_action_candidate(
+        shared,
+        arm_qpos,
+        hand_qpos,
         is_hold=is_hold,
+        observation_id=observation_id,
+        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
     )
-
-    # Read current arm/hand feedback for the gate
-    arm_result = shared.arm_state_ring.read_latest()
-    if arm_result is None:
-        logger.warning("joint target rejected: arm feedback unavailable")
-        return None
-    arm_record = arm_result[0][0]
-    if not bool(arm_record["connected"]) or not bool(arm_record["state_valid"]):
-        logger.warning("joint target rejected: arm feedback unhealthy")
-        return None
-    # ``arm_record`` is a scalar structured record, so qpos is already (7,).
-    current_arm = np.asarray(arm_record["qpos"], dtype=np.float64)
-    if current_arm.shape != (7,) or not np.all(np.isfinite(current_arm)):
+    if candidate is None:
         return None
 
-    current_hand = np.zeros(12, dtype=np.float64)
-    hand_result = shared.hand_state_ring.read_latest()
-    if hand_result is not None:
-        hand_record = hand_result[0][0]
-        if bool(hand_record["connected"]) and bool(hand_record["state_valid"]):
-            current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
-    elif hand_qpos is not None:
-        logger.warning("joint target rejected: hand feedback unavailable")
-        return None
-
-    ctrl_dt = 1.0 / float(shared.action_control_hz)
-    gate_result = gate.validate(
+    return validate_and_send_candidate(
+        shared,
         candidate,
-        current_arm_qpos=current_arm,
-        current_hand_qpos=current_hand,
-        dt_s=ctrl_dt,
-        run_generation=int(shared.run_generation.value),
+        gate=gate,
+        prepare_timeout_s=timeout,
     )
-    if not gate_result.accepted or gate_result.candidate is None:
-        logger.warning("joint target rejected by SafetyGate: %s", gate_result.reason)
-        return None
-
-    if not send_command(shared, gate_result.candidate, prepare_timeout_s=timeout):
-        return None
-    return gate_result.candidate
 
 
 def _print_status(
