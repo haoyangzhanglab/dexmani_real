@@ -15,7 +15,7 @@ regression gate: `checks/offline/run_all.py` → **12/12 passed**.
 | A base | `34ddc70` | Phase A audit baseline (named in `docs/phase-a-audit-evidence-2026-08-15.md`) |
 | A final | `4561e05` | A0–A18 fixes landed + execution doc committed (`2b731d3` is the last A-fix; `4561e05` is its marker child) |
 | B base | `4cb75ae` | Parent of the first Phase B commit (`2834fb6`) |
-| B final | `a3e7c6e` | Current HEAD after B3/B4/B5/B6 subtraction |
+| B final | `a3e7c6e` | Last code commit of the B3/B4/B5/B6 subtraction (this report is committed on top as `f9d041d`) |
 
 **Commit topology note.** Phase B spans two non-contiguous ranges because the
 hardware-gated experiments ran before the Phase A audit:
@@ -23,8 +23,10 @@ hardware-gated experiments ran before the Phase A audit:
 1. **B hardware experiments (B1/B2)** — `2834fb6` … `38010d1` (2026-08-14),
    *before* the A audit.
 2. **A audit + fixes** — `61b9564` … `2b731d3` (2026-08-15).
-3. **B subtraction (B3/B4/B5/B6)** — `6bf11e7`, `fbce8b8`, `13f680e`, `a3e7c6e`
-   (2026-08-15), *after* the A audit.
+3. **B subtraction** — `6bf11e7` (B6: arm SDK split + homing execution),
+   `fbce8b8` (B3: xhand dead code), `13f680e` (B4: WorkerSpec replaces
+   ManagedProcessGroup), `a3e7c6e` (B5: stale comment fixes) — (2026-08-15),
+   *after* the A audit.
 
 "B final" (`a3e7c6e`) is the single frozen runtime HEAD.
 
@@ -77,7 +79,7 @@ Per decision, the soak `jsonl` files are **not restored**; the summary numbers i
 
 ### Disconnect (B2 NO-GO)
 
-- `disconnect()` = `_request_slave_init()` (slave → `_EC_STATE_INIT`)
+- `disconnect()` = `_request_slave_init()` (best-effort request to transition the slave back to `_EC_STATE_INIT`; falls back to the close/watchdog path when the explicit INIT request is unavailable)
   + `control.close_device()` + `time.sleep(_POST_DISCONNECT_WATCHDOG_WAIT_S = 2.0)`.
 - The **INIT transition + 2 s watchdog wait is load-bearing**. B2 (close-only)
   soak was the only run to reproduce `write sdo failed` (16×, cycle 3–4) plus a
