@@ -108,13 +108,6 @@ class PointCloudProcessorConfig:
     # Relative paths are resolved from the repo root (two parents up from this file).
     desk_plane_path: str = "dexmani_real/config/desk_plane.json"
 
-    # Temporal depth EMA: 0.0 = disabled (default).  Frame-to-frame smoothing
-    # reduces L515 noise (~2-4 mm) but causes motion blur on moving objects
-    # (robot arm, manipulated items).  Prefer spatial-only filters (median,
-    # speckle, stat outlier) for manipulation scenes with ego-motion.
-    # When enabled, 0.3 gives τ≈100ms @ 30Hz.
-    depth_ema_alpha: float = 0.0
-
     # 3x3 median filter on raw depth (pre-deprojection).  Eliminates L515
     # salt-and-pepper noise (isolated 1-2 px hot pixels) in a single pass
     # without temporal state or motion artifacts.  Edge-preserving — unlike
@@ -147,7 +140,6 @@ class PointCloudProcessorConfig:
             "pc_depth_edge_threshold_m": float(self.depth_edge_threshold_m),
             "pc_depth_edge_dilate_px": int(self.depth_edge_dilate_px),
             "pc_depth_edge_relative_ratio": float(self.depth_edge_relative_ratio),
-            "pc_depth_ema_alpha": float(self.depth_ema_alpha),
             "pc_depth_median_enabled": bool(self.depth_median_enabled),
             "pc_speckle_min_pixels": int(self.speckle_min_pixels),
         }
@@ -171,8 +163,6 @@ class PointCloudProcessor:
         self._R = T[:3, :3]
         self._t = T[:3, 3]
         self._rng = np.random.default_rng()
-        self._depth_ema: np.ndarray | None = None  # temporal depth smoothing state
-
         # Auto-load desk plane from persisted JSON if not explicitly provided.
         self._desk_plane: tuple[float, float, float, float] | None = self.config.desk_plane
         if self._desk_plane is None and self.config.desk_plane_path:
@@ -234,21 +224,6 @@ class PointCloudProcessor:
         # are zeroed before the blur and naturally filtered out by the subsequent
         # depth gate (depth_min_m=0.3 > 0).
         depth_m = self.apply_depth_median(depth_m, cfg.depth_median_enabled)
-
-        # Temporal depth EMA.
-        # Exponential moving average on valid depth pixels reduces L515
-        # frame-to-frame noise (~2-4 mm) before any subsequent gates.
-        if cfg.depth_ema_alpha > 0:
-            _valid = np.isfinite(depth_m) & (depth_m > 0)
-            if self._depth_ema is None or self._depth_ema.shape != depth_m.shape:
-                self._depth_ema = depth_m.copy()
-            else:
-                _alpha = float(cfg.depth_ema_alpha)
-                self._depth_ema[_valid] = _alpha * depth_m[_valid] + (1.0 - _alpha) * self._depth_ema[_valid]
-                # Pixels that just became valid (newly appeared) skip smoothing.
-                _newly_valid = _valid & (self._depth_ema == 0)
-                self._depth_ema[_newly_valid] = depth_m[_newly_valid]
-            depth_m = self._depth_ema
 
         # Gate on raw depth BEFORE deprojection — skip ~270k invalid pixels
         # instead of deprojecting all 307k then throwing most away.

@@ -341,6 +341,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
 | `CLAUDE.md` | 更详细的架构、运行流程、安全/碰撞、录制 schema 与运维背景。 |
 | `AGENTS.md` | 面向代码修改者的仓库约定、硬件安全边界和跨模块变更检查清单。 |
+| `docs/ema_delta_clip_scale_reject_control_contract.md` | EMA、delta clip、scale 与 reject 在 arm、hand、replay、deployment 和 recording 中的实际顺序、默认状态与责任边界。 |
 | `docs/ab_runtime_freeze_report.md` | A/B 冻结运行时契约（Phase C 只能搭在其上，不得修改）。 |
 | `docs/hdf5_episode_schema_v16.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
 | `docs/dexmani_sim_hdf5_zarr_schema.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |

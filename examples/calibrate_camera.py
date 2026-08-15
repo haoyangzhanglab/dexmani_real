@@ -152,7 +152,6 @@ class CalibrationConfig:
     max_consistency_rot_std_deg: float = 3.0
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
-    target_lead_max_m: float = 0.03
     status_interval_frames: int = 50
 
     def __post_init__(self) -> None:

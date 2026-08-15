@@ -29,6 +29,7 @@ def main() -> int:
     assert meta and all(str(k).startswith("pc_") for k in meta), (
         "to_meta_dict keys must be pc_-prefixed"
     )
+    assert "pc_depth_ema_alpha" not in meta, "removed temporal depth EMA must not be persisted"
     roundtrip = json.loads(json.dumps(meta))  # must not raise on any non-JSON type
     assert roundtrip["pc_dbscan_min_cluster_size"] == cfg.dbscan_min_cluster_size
 

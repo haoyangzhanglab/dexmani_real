@@ -267,11 +267,11 @@ attribute。上表列出当前标准采集入口实际提供的全部键；未�
 
 | Dataset | Shape | dtype | 单位 | 物理意义 |
 |---|---:|---|---|---|
-| `action_arm_joint_raw` | `(N,A)` | float64 | rad | IK 求解器原始关节解，尚未经过逐帧 delta clamp 和 firmware joint-limit clip。 |
+| `action_arm_joint_raw` | `(N,A)` | float64 | rad | IK 求解器原始关节解，尚未经过 teleop 应用层的逐帧 delta clamp 和 joint-limit clip。 |
 | `action_arm_joint` | `(N,A)` | float64 | rad | 经过 delta/joint-limit 处理并通过 SafetyGate 的有效机械臂命令；hold 槽保存有效 hold 目标。 |
 | `action_arm_joint_sent` | `(N,A)` | float64 | rad | 实际转发给 arm worker 的安全命令流。标准 RecorderIO v16 存在；手工构造且未启用 `arm_sent_stream` 时可缺省。 |
-| `action_hand_joint_raw` | `(N,H)` | float64 | rad | 位于 ramp、delta clamp 和机械限位之前；只有 TAG 成功路径保证是 EMA 前优化器输出，其他路径可能是 filtered command。详见第 10.4 节。 |
-| `action_hand_joint` | `(N,H)` | float64 | rad | 经过 ramp、delta/机械限位和 SafetyGate 后的有效手部命令。 |
+| `action_hand_joint_raw` | `(N,H)` | float64 | rad | 位于 ramp、可选 delta clip、操作限位 clip 和后续校验之前；TAG 成功路径保存 SDK 关节序的优化器输出，其他路径保存 retargeter 返回的命令。详见第 10.4 节。 |
+| `action_hand_joint` | `(N,H)` | float64 | rad | 经过 ramp、可选 delta clip、操作限位 clip 和后续校验的有效手部命令。 |
 | `action_arm_ee` | `(N,9)` | float64 | 前 3 列 m | IK 实际追踪的 `[target_pos(3), target_rot6d(6)]`；没有目标时为 NaN，held 帧尽量沿用最后有效目标。 |
 | `target_eef_pos_raw` | `(N,3)` | float64 | m | VR 映射后的原始 EEF 位置目标，位于 EMA/workspace clamp 之前。 |
 | `target_eef_rot6d_raw` | `(N,6)` | float64 | — | 与上一字段配套的原始 EEF 旋转目标。 |
@@ -281,7 +281,7 @@ attribute。上表列出当前标准采集入口实际提供的全部键；未�
 
 ```text
 action_arm_joint_raw
-    → per-frame delta clamp + firmware joint-limit clip + SafetyGate
+    → teleop per-frame delta clamp + application joint-limit clip + SafetyGate
     → action_arm_joint
     → 实际入队/hold endpoint
     → action_arm_joint_sent
@@ -527,7 +527,7 @@ episode，应先检查 `"action_arm_joint_sent" in f`；标准 RecorderIO 录制
 | H5-01 | 高 | `arm_ee`、`hand_fingertip` | 坐标系契约 | 文档已澄清；代码合同待统一 | `arm_ee` 的直接生产者输出 arm base frame；当前默认 base/world 为单位变换，所以数值重合，但不能把“world”视为字段固有合同。 |
 | H5-02 | 中 | `/depth`、`/meta.camera_K` | 对齐语义 | 文档已澄清 | `/depth` 位于对齐后的 depth frame；只有 `depth_to_color` 才是 color/RGB 平面，`color_to_depth` 时是 depth 平面。 |
 | H5-03 | 中 | `hand_contact`、`hand_tactile_force`、`hand_tactile_contact` | 单位/处理语义 | 文档已补充 | 触觉值经过 `0.1` 缩放和可选软件 bias 扣除；接触由每指三轴汇总值的 L2 范数与阈值比较。 |
-| H5-04 | 中 | `action_hand_joint_raw` | 动作语义 | 文档已澄清 | 只有 TAG 成功路径保证是 EMA 前优化器输出；其他路径回退为 filtered command。 |
+| H5-04 | 中 | `action_hand_joint_raw` | 动作语义 | 文档已澄清 | TAG 成功路径保存 SDK 关节序的优化器输出；其他路径回退为 retargeter 返回的命令。 |
 | H5-05 | 中 | `arm_tau` | 单位/传感器来源 | 待厂商合同确认 | 数据是 xArm SDK `get_joint_states(..., num=3)` 的 `effort`；官方资料说明它是基于电流的估计值而非直接力矩传感器读数，API 未明确给出精确单位。 |
 | H5-06 | 低 | 非标准 diagnostics | 扩展边界 | 已确认；非标准 schema | 标准 RecorderIO 字段清单完整；直接调用底层 recorder 时，第一帧的额外 diagnostics key 可能形成自定义 `float64` dataset。 |
 
@@ -584,17 +584,15 @@ RGB 平面。
 
 ### 10.4 H5-04：`action_hand_joint_raw` 是分路径定义
 
-`action_hand_joint_raw` 总是在启动 ramp、`_sanitize_hand_command()` 的单步 delta 限制和
-机械限位之前捕获，但“raw”的上游含义取决于 retargeter：
+`action_hand_joint_raw` 总是在启动 ramp、可选的单步 delta clip、操作限位 clip 和
+`_sanitize_hand_command()` 后续校验之前捕获，但“raw”的上游含义取决于 retargeter：
 
-- TAG 成功且 `last_raw_qpos` 有效：保存 SDK joint order 下、teleoperator EMA 之前的优化器
-  输出；
-- 非 TAG retargeter、retarget 失败、raw shape/finite 校验失败：保存已经由 retargeter
-  返回的 filtered command；
+- TAG 成功且 `last_raw_qpos` 有效：保存 SDK joint order 下的优化器输出；
+- 非 TAG retargeter、retarget 失败、raw shape/finite 校验失败：保存 retargeter 返回的命令；
 - 调用方没有显式传值：录制层回退为当帧 `hand_cmd`。
 
-因此该字段适合分析 ramp、delta clamp 和机械限位造成的变化；只有结合 retargeter 类型与
-`flag_retarget_ok`，才能把它解释为“优化器未经 EMA 的原始结果”。
+因此该字段适合分析 ramp、delta clip 和操作限位 clip 造成的变化；只有结合
+retargeter 类型与 `flag_retarget_ok`，才能区分 TAG 优化器输出和其他 retargeter 的返回命令。
 
 代码定位：`teleop/hand_retarget.py::TAGHandRetargeter.last_raw_qpos`、
 `teleop/hand_control.py::_get_raw_hand_command`、`teleop/loop.py::teleop_loop`、

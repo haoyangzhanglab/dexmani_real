@@ -109,7 +109,7 @@ class EpisodeRecorder:
         self._provenance = dict(provenance or {})
 
         # Opt-in stream: the safe arm command actually forwarded to the worker,
-        # as opposed to action_arm_joint (the raw IK target).
+        # kept distinct from the accepted candidate in action_arm_joint.
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
         self._file: Any = None  # h5py.File | None — data.h5 (control streams + metadata)

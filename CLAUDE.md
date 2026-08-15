@@ -123,11 +123,13 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   endpoint. Runtime config may narrow, but cannot widen, the bundled rated
   mechanical envelope.
   The command-to-command velocity clamp (`max_delta_rad`) now defaults to
-  ``None`` (disabled) and the teleoperator-level EMA
-  (`hand_output_smoothing_alpha`) was removed (2026-08-15): the EtherCAT
-  firmware PID (with per-joint current limits) is the final and only trajectory
-  smoother, mirroring how the arm velocity envelope was removed.  Coupled hand
-  paths still run a controller-side preflight (`validate_hand_command_delta`)
+  ``None`` (disabled), and the runtime teleoperator output-EMA setting
+  (`hand_output_smoothing_alpha`) was removed (2026-08-15).  The default TAG
+  path has no additional output EMA.  Optional DexPilot retains its own
+  retargeting filters; the bundled outer EMA setting is `1.0` (pass-through).
+  The EtherCAT firmware PID remains the execution-layer trajectory smoother.
+  Coupled hand paths still run a controller-side preflight
+  (`validate_hand_command_delta`)
   on the rated mechanical envelope before the arm endpoint is enqueued so a
   rejected hand command desyncs nothing, and `worker_validate_hand` remains the
   authoritative execution-layer backstop.

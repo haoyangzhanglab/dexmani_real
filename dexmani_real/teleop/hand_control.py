@@ -81,7 +81,7 @@ def _get_raw_hand_command(
     filtered_command: np.ndarray,
     retarget_ok: bool,
 ) -> np.ndarray:
-    """Return pre-EMA TAG output when available, otherwise the filtered command."""
+    """Return the TAG optimizer output when available, otherwise the retargeter output."""
     fallback = np.asarray(filtered_command, dtype=np.float64).copy()
     if not retarget_ok or retargeter is None:
         return fallback
