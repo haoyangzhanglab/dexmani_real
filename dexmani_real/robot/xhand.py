@@ -183,12 +183,8 @@ class XHand:
         self.hand_command: Any = None
 
         self.last_qpos_cmd: np.ndarray | None = None
-        self.last_cmd_time: float | None = None
         self.last_error_code: int | None = None
         self.last_joint_limit_rejected = False
-
-        # Error recovery: track consecutive send failures for circuit breaker
-        self._consecutive_send_errors: int = 0
 
         # reset_sensor() can leave an offset; subtract a fresh no-contact mean.
         self._tactile_bias_ft: np.ndarray | None = None  # (5, 3)   — calc_force bias
@@ -250,7 +246,6 @@ class XHand:
                     f"configured device_id={self.config.device_id} not found in enumerated hands {self.last_hand_ids}"
                 )
             self.error_state = False
-            self._consecutive_send_errors = 0
             self._verify_device()
             self.hand_command = self.make_command(self._array12(self.config.home_qpos))
             if not self._init_hand_state():
@@ -264,8 +259,6 @@ class XHand:
                 logger.error("XHand post-open cleanup failed", exc_info=True)
             return False
 
-        self.last_cmd_time = time.time()
-
         return True
 
     def _retry_open_device(self, comm_type: str) -> bool:
@@ -274,16 +267,12 @@ class XHand:
         RS485 may need several attempts after cold start (C++ SDK retries
         internally, but may still fail intermittently).
 
-        B1 (experimental): discovery and open now share ONE XHandControl per
-        attempt, instead of a throwaway discovery control followed by a fresh
-        open control.  The prior two-phase pattern was introduced to avoid
-        "write sdo failed" from duplicate raw sockets left behind by the
-        enumeration pass; this experiment tests whether enumerate-then-open on
-        a single instance regresses that (or whether the SDK releases those
-        sockets on its own).  Retries, delays, and the disconnect
-        INIT-watchdog are unchanged.  Keep it inside the spawned hand worker:
-        moving SDK ownership to Main would violate the process boundary and
-        make clean shutdown harder to prove.
+        Discovery and open share ONE XHandControl per attempt (no throwaway
+        discovery control followed by a fresh open control), which avoids
+        "write sdo failed" from duplicate raw sockets left behind by a separate
+        enumeration pass.  SDK ownership stays inside the spawned hand worker:
+        moving it to Main would violate the process boundary and make clean
+        shutdown harder to prove.
         """
         # RS485 may need several attempts after cold start; EtherCAT uses a
         # lower retry cap because each failed open_ethercat() transitions the
@@ -735,11 +724,9 @@ class XHand:
 
     # ── EtherCAT slave state management ──
 
-    # AL state constants (EtherCAT standard / SOEM convention).
+    # AL state constants (EtherCAT standard / SOEM convention). Only INIT is
+    # used here: disconnect requests the slave transition back to INIT.
     _EC_STATE_INIT = 1
-    _EC_STATE_PRE_OP = 2
-    _EC_STATE_SAFE_OP = 4
-    _EC_STATE_OP = 8
 
     # Post-disconnect watchdog wait (seconds).  After close_device() the slave
     # firmware has no more master frames; its internal SM-watchdog must expire
@@ -885,10 +872,6 @@ class XHand:
         self.last_error_message = ""
         return self.control is not None and self.connected_flag
 
-    def reset(self, qpos: np.ndarray | None = None) -> bool:
-        target = self._array12(self.config.home_qpos if qpos is None else qpos)
-        return self.send_action(target)
-
     def get_state(
         self,
         full: bool = False,
@@ -918,10 +901,9 @@ class XHand:
         self.last_error_message = ""
         # Bridge board-status (Layer 2) into safety gate: per-joint hardware
         # board error registers gate commands on hardware-level faults.
-        # Unlike send/read errors (tracked via _record_error +
-        # _consecutive_send_errors watchdog), board errors are transient —
-        # auto-clear when hardware status returns to normal (no manual
-        # clear_local_error() needed after an RS485 glitch).
+        # Unlike send/read errors (tracked via _record_error), board errors are
+        # transient — auto-clear when hardware status returns to normal (no
+        # manual clear_local_error() needed after an RS485 glitch).
         self.error_state = bool(
             np.any(np.asarray(state["commboard_err"], dtype=np.int32))
             or np.any(np.asarray(state["jointboard_err"], dtype=np.int32))
@@ -972,12 +954,9 @@ class XHand:
 
         if self.error_ok(err):
             self.last_qpos_cmd = qpos_cmd.copy()
-            self.last_cmd_time = time.time()
-            self._consecutive_send_errors = 0
             return True
 
         self._record_error(err)
-        self._consecutive_send_errors += 1
         return False
 
     def detect_contact(self, threshold: float | None = None, force_sum: np.ndarray | None = None) -> np.ndarray:
