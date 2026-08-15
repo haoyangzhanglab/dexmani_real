@@ -225,8 +225,6 @@ class SharedMemoryRingBuffer:
         Args:
             data: A 0-d or 1-d structured array matching self.dtype.
         """
-        now_ns = time.monotonic_ns()
-
         # Increment the logical sequence locally; publish it only after the
         # payload is committed below, so a reader that samples a fresh
         # _write_seq can never observe a half-written slot as "latest".
@@ -237,10 +235,14 @@ class SharedMemoryRingBuffer:
 
         # Mark the slot incomplete before touching its payload, then publish an
         # even completion marker. Readers accept only two matching even reads.
+        # The timestamp is stamped only after the payload is committed (mirrors
+        # CameraRingBuffer) so it reflects the true commit time, not the start
+        # of the payload copy.
         slot = self._data_buf[idx]
         seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
-        seqlock.begin_write(seq, now_ns)
+        seqlock.begin_write(seq, 0)
         slot["data"] = data
+        seqlock.stamp_timestamp(time.monotonic_ns())
         seqlock.end_write(seq)
 
         # Publish the logical sequence only after the payload is committed.
