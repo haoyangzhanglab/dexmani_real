@@ -31,7 +31,7 @@ def _readonly_array(
 
 @dataclass(frozen=True)
 class ActionCandidate:
-    """One current-tick joint target proposed by teleoperation.
+    """One current-tick joint target proposed by a control source.
 
     The controller assigns the globally monotonic action ID only after it
     confirms that the observation and candidate belong to the active

@@ -122,6 +122,18 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   operational-limit, and rated mechanical-limit violations without changing an
   endpoint. Runtime config may narrow, but cannot widen, the bundled rated
   mechanical envelope.
+  Coupled hand paths also run a controller-side preflight
+  (`validate_hand_command_delta`) on the rated mechanical envelope and the
+  command-to-command delta before the arm endpoint is enqueued, so a rejected
+  hand command desyncs nothing. Its delta reference is path-dependent: the
+  worker's last *accepted* command (`last_cmd_qpos`) for replay/keyboard/
+  calibrate, and the last *published* command for VR teleop.
+  The split is deliberate: the controller-side preflight bounds the *commanded*
+  rate (its reference is the previous *command*, so contact/torque-limit lag
+  never stalls the operator), while `worker_validate_hand` re-checks the same
+  delta against `last_qpos_cmd` (the last *accepted* command) as the
+  authoritative execution-layer backstop — matching LeFranX's command-level
+  `smoothing_alpha=0.3` EMA in `hand_retarget.py`.
 - `run_generation` tags commands and candidates. Begin, pause, home, feedback
   fault, and camera re-warm advance it; workers reject queued/ring commands from
   an older generation; this cannot retract an endpoint already accepted by

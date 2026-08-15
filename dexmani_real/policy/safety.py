@@ -497,7 +497,17 @@ def publish_joint_targets(
 
     This is a convenience wrapper used by keyboard teleop, calibration, and replay — it
     builds an ``ActionCandidate`` from raw joint arrays, runs
-    the full validation pipeline, and calls :func:`send_command`.
+    the full validation pipeline, and calls :func:`send_command`.  When the
+    candidate carries a hand target, a coupled-hand preflight
+    (:func:`validate_hand_command_delta`) additionally rejects-whole the rated
+    mechanical envelope and the command-to-command delta *before* the arm
+    endpoint is enqueued, so a rejected hand command cannot desync the arm from
+    the hand.
+
+    ``hand_mechanical_lower_rad`` / ``hand_mechanical_upper_rad`` default to the
+    rated device envelope; ``hand_max_delta_rad`` is optional (``None`` skips
+    the command-to-command delta check while still enforcing operational +
+    mechanical bounds).
 
     Returns:
         The accepted ``ActionCandidate`` that was published (and, when
@@ -704,11 +714,14 @@ def validate_hand_command_delta(
     and (optionally) a command-to-command delta; reject-whole, never clip.
 
     Shared preflight for every coupled hand path (teleop, replay, return-home).
-    ``previous`` is the last *accepted command* (``last_cmd_qpos``), not
-    measured feedback, so the delta bound is command-to-command — contact and
-    torque-limited steady-state lag are valid outcomes and must not reject a
-    valid next command.  Raises ``ValueError`` on any violation and returns a
-    copy otherwise.
+    ``previous`` is the reference *command* for the delta bound and is always a
+    command, never measured feedback, so contact and torque-limited steady-state
+    lag are valid outcomes and must not reject a valid next command.  Which
+    command is the reference is path-dependent: replay/keyboard/calibrate pass
+    the worker's last *accepted* command (``last_cmd_qpos``), while VR teleop
+    passes the last *published* command (``ctx.prev_hand_qpos``).  The worker's
+    authoritative delta check remains the final backstop on either path.  Raises
+    ``ValueError`` on any violation and returns a copy otherwise.
     """
     command = np.asarray(hand_cmd, dtype=np.float64)
     op_lower = np.asarray(operational_lower, dtype=np.float64)

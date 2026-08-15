@@ -56,9 +56,12 @@ class SeqlockSlot:
 
     Every slot in both ``SharedMemoryRingBuffer`` and ``CameraRingBuffer`` is
     laid out as ``[timestamp_ns: u8, sequence: u8, <payload>]``.  A producer
-    calls :meth:`begin_write` (odd marker, then timestamp) before writing the
-    payload and :meth:`end_write` (even marker) after, so a reader can never
-    observe a half-written frame as complete.  Readers sample :attr:`marker`
+    marks the slot writer-active (odd) with a *zero* placeholder timestamp via
+    :meth:`begin_write`, copies the payload, stamps the true commit time via
+    :meth:`stamp_timestamp`, and finally calls :meth:`end_write` (even marker),
+    so a reader can never observe a half-written frame as complete and the
+    timestamp reflects the commit time rather than the start of the payload
+    copy.  Readers sample :attr:`marker`
     before and after reading the payload and accept the frame only when
     :meth:`verify` confirms both samples agree on a complete (nonzero, even)
     marker.
@@ -83,7 +86,12 @@ class SeqlockSlot:
         return int(self._ts_seq[0])
 
     def begin_write(self, seq: int, now_ns: int) -> None:
-        """Mark writer-active (odd), then stamp the timestamp — in that order."""
+        """Mark writer-active (odd), then store *now_ns* as the timestamp.
+
+        Deferred-commit writers pass ``0`` here and stamp the real commit time
+        later via :meth:`stamp_timestamp`; the timestamp must not be trusted
+        until :meth:`end_write` publishes the even marker.
+        """
         self._ts_seq[1] = np.uint64(_seqlock_odd(seq))
         self._ts_seq[0] = np.uint64(now_ns)
 
