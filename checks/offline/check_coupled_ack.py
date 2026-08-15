@@ -72,6 +72,20 @@ def main() -> int:
         assert result.hand_qpos is not None
         _drain_arm_queue(shared)
 
+        # ── 2b. arm+hand with an unhealthy hand does not acknowledge ────
+        # The coupled ack must gate on hand health (no error_state, healthy
+        # send/read), not merely on last_cmd_seq == action_id.  A board-faulted
+        # hand with the right seq must still fail.
+        shared.arm_state_ring.write(make_arm_state_frame(arm_mid, last_cmd_seq=102))
+        shared.hand_state_ring.write(
+            make_hand_state_frame(hand_mid, last_cmd_seq=102, error_state=1)
+        )
+        result = publish_joint_targets(
+            shared, arm_mid, hand_mid, safety_gate=gate, wait_applied=True
+        )
+        assert result is None, "unhealthy hand must not acknowledge a coupled action"
+        _drain_arm_queue(shared)
+
         # ── 3. hand-superseded fails immediately (action_id = 103) ─────
         shared.arm_state_ring.write(make_arm_state_frame(arm_mid, last_cmd_seq=103))
         shared.hand_state_ring.write(

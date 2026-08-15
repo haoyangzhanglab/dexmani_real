@@ -16,6 +16,7 @@ import numpy as np
 
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 
+import dexmani_real.shm.ring_buffer as ring_buffer_mod
 from dexmani_real.shm.ring_buffer import (
     SeqlockSlot,
     SharedMemoryRingBuffer,
@@ -38,6 +39,56 @@ def main() -> int:
     slot.end_write(seq)
     assert slot.marker == _seqlock_even(seq), "end_write must set the even marker"
     assert slot.verify(_seqlock_even(seq)), "complete even marker must verify"
+
+    # ── write() wires the deferred-commit protocol in order ─────────────
+    # Monkeypatch the SeqlockSlot class that write() looks up by module global,
+    # then assert write() actually calls begin_write(seq, 0) -> payload ->
+    # stamp_timestamp -> end_write.  This is the ordering fa2f2be fixed; a
+    # regression that re-stamps the timestamp inside begin_write would be
+    # caught here (events would show a nonzero begin_write arg and no
+    # stamp_timestamp step).
+    class _SpySeqlockSlot(SeqlockSlot):
+        events: list = []
+
+        def __init__(self, buf, slot_base):
+            super().__init__(buf, slot_base)
+            _SpySeqlockSlot.events.append("init")
+
+        def begin_write(self, seq, now_ns):
+            _SpySeqlockSlot.events.append(("begin_write", now_ns))
+            super().begin_write(seq, now_ns)
+
+        def stamp_timestamp(self, now_ns):
+            _SpySeqlockSlot.events.append("stamp_timestamp")
+            super().stamp_timestamp(now_ns)
+
+        def end_write(self, seq):
+            _SpySeqlockSlot.events.append("end_write")
+            super().end_write(seq)
+
+    original_slot = ring_buffer_mod.SeqlockSlot
+    ring_buffer_mod.SeqlockSlot = _SpySeqlockSlot
+    try:
+        spy_dtype = np.dtype([("v", "<f8")])
+        spy_ring = SharedMemoryRingBuffer.create_or_replace(
+            "check_ring_commit_spy", spy_dtype, maxlen=2
+        )
+        try:
+            frame0 = np.zeros(1, dtype=spy_dtype)
+            frame0["v"][0] = 3.0
+            _SpySeqlockSlot.events = []
+            spy_ring.write(frame0)
+            assert _SpySeqlockSlot.events == [
+                "init",
+                ("begin_write", 0),
+                "stamp_timestamp",
+                "end_write",
+            ], f"write() must defer the timestamp: got {_SpySeqlockSlot.events}"
+        finally:
+            spy_ring.close()
+            spy_ring.unlink()
+    finally:
+        ring_buffer_mod.SeqlockSlot = original_slot
 
     # ── Round trip: positive timestamp, sequence only after commit ──────
     dtype = np.dtype([("v", "<f8")])

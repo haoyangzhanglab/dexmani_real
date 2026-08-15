@@ -37,6 +37,24 @@ def main() -> int:
         with open(target, "r", encoding="utf-8") as stream:
             assert json.load(stream) == updated
 
+        # A failed serialization must not truncate or replace the existing
+        # target: json.dump writes a partial prefix before raising on a
+        # non-serializable value, so a non-atomic writer would have already
+        # clobbered the target with that prefix.
+        class _NonSerializable:
+            pass
+
+        before = target.read_text(encoding="utf-8")
+        try:
+            atomic_json_dump({"bad": _NonSerializable()}, target)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("non-serializable payload must raise TypeError")
+        assert target.read_text(encoding="utf-8") == before, (
+            "a failed write must leave the prior target intact"
+        )
+
         # No stray temp files are left behind in the target directory.
         leftovers = [p.name for p in target.parent.iterdir() if p.name != target.name]
         assert leftovers == [], leftovers
