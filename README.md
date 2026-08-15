@@ -152,7 +152,7 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`dexmani_real`
 
-以下清单覆盖当前包内的 **76 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
+以下清单覆盖当前包内的 **92 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
 
 ### 根包
 
@@ -193,6 +193,29 @@ python -m compileall -q dexmani_real examples
 | `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
 | `policy/runtime.py` | 定义单 tick 动作候选 `ActionCandidate` 的数据契约，含 run generation、时效与只读数组封装。 |
+
+### `deployment/` — Learned-Policy 部署运行时（Phase C 新增）
+
+| 文件 | 作用 |
+|---|---|
+| `deployment/__init__.py` | 标识后端/观测/动作适配器边界与 learned-policy 部署运行时（模型输出只是 proposal，不是 robot command）。 |
+| `deployment/config.py` | `DeploymentConfig` 与 `resolve_deployment_config`（CLI > file/data > defaults + SHA-256）；模型内部参数绝不进配置（§93）。 |
+| `deployment/contracts.py` | `PolicyBackend` / `ObservationAdapter` / `ActionAdapter` 三个 Protocol + `JointActionChunk` / `InferenceContext`，均不 import torch 或 SharedStorage。 |
+| `deployment/observation.py` | 进程本地不可变观测窗 `ObservationBatch` / `FrameWindow` / `CameraWindow`（§54，不进 SharedStorage）。 |
+| `deployment/loader.py` | `module:symbol` 惰性加载器，实例化后 Protocol 校验，失败 fail-closed；parent 不 import torch。 |
+| `deployment/fake.py` | 确定性、无 torch、无硬件的 fake 后端（架构门 §66 与 backend-swap fixture）。 |
+| `deployment/worker.py` | `inference_loop`：观测 → encode → infer → decode → 只写 `policy_plan_ring`；不写 arm/hand transport、不碰 SafetyState（§48/§70）。 |
+| `deployment/coordinator.py` | `coordinator_loop`：唯一的 learned-policy robot-action producer——采纳计划、调度单个 due endpoint（latest-wins、不插值）、走共享 `build_action_candidate`/`validate_and_send_candidate` 发布边界、手部 delta 预检、命令静默 watchdog（§72–§82）。 |
+| `deployment/lifecycle.py` | `build_policy_worker_specs` + `run_policy_deployment`：组合 A/B 冻结的 `WorkerSpec`/`run_supervisor`/`shutdown_processes`，无第二套健康机制（§83）。 |
+| `deployment/metrics.py` | 无 Prometheus/OTel 的 counter/gauge 注册表 + 结构化 flush（§94）。 |
+| `deployment/provenance.py` | 一次性启动 provenance 日志（commit/target/checkpoint/runtime SHA-256），不进高频 IPC payload（§96）。 |
+
+### `integrations/` — 模型仓库适配器（Phase C 新增）
+
+| 文件 | 作用 |
+|---|---|
+| `integrations/__init__.py` | 说明依赖方向：`deployment/*` 不得 import 本包；integration → deployment。 |
+| `integrations/dexmani_policy.py` | DexMani Policy 模型仓库适配器：`DexManiObservationAdapter`/`DexManiPolicyBackend`/`DexManiActionAdapter`；`load()` 内惰性 import，native-joint-only，EE checkpoint 启动即拒绝（§86–§91）。 |
 
 ### `recording/` — Episode 持久化与离线分析
 
@@ -249,8 +272,9 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `shm/__init__.py` | 说明共享内存公共接口及其与回零/监督模块的职责边界。 |
+| `shm/causal_reader.py` | 从各状态环读取因果帧（`0 < source <= publish <= anchor`）的公共读取器；不含 age threshold，供遥操作快照与 deployment 观测共用（§51）。 |
 | `shm/ring_buffer.py` | 通用共享内存 seqlock 环和相机专用环，提供零拷贝写入与已验证读取。 |
-| `shm/shared_storage.py` | 创建并持有共享环、队列、标志和事件；默认仅分配遥操作/采集能力。 |
+| `shm/shared_storage.py` | 创建并持有共享环、队列、标志和事件；默认仅分配遥操作/采集能力，`policy_plan_ring` 供 learned-policy 部署使用。 |
 
 ### `teleop/` — VR 映射、控制环与采集决策
 
@@ -291,11 +315,12 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 
 ## 项目地图：`examples`
 
-`examples/` 目前有 **9 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
+`examples/` 目前有 **10 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
 
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
 | `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
+| `examples/run_policy.py` | `deployment.lifecycle` | learned-policy 部署入口：argparse → 解析 runtime/deployment 配置 → 运行生命周期 → 退出码（§84）；薄 CLI，无模型/调度/安全/存储逻辑。 |
 | `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键推进 generation 后停止发布，控制器自然完成最后一个已接受 endpoint，空闲期间持续从实测关节/FK 重建命令基准；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
 | `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检，退出时推进 generation 并停止发布。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
@@ -316,6 +341,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
 | `CLAUDE.md` | 更详细的架构、运行流程、安全/碰撞、录制 schema 与运维背景。 |
 | `AGENTS.md` | 面向代码修改者的仓库约定、硬件安全边界和跨模块变更检查清单。 |
+| `docs/ab_runtime_freeze_report.md` | A/B 冻结运行时契约（Phase C 只能搭在其上，不得修改）。 |
+| `docs/phase-c-deployment-runtime.md` | Learned-Policy 部署运行时说明：不变量、模块地图、失败语义、metrics/provenance、backend-swap 边界，以及 H0–H6 硬件门手工清单。 |
 | `docs/collect_teleop审查记录.md` | `examples/collect_teleop.py` 上下游的 fact-check 基线，记录已确认问题、触发条件、根因、术语和修复验收条件。 |
 
 对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的“Cross-module change checklist”，再沿本 README 的关键路径追踪所有生产者和消费者。

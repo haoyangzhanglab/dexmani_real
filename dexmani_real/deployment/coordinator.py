@@ -18,6 +18,16 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.deployment.config import DeploymentConfig
+from dexmani_real.deployment.metrics import (
+    COMMAND_SILENCE_ABORT,
+    ENDPOINTS_COALESCED,
+    ENDPOINTS_DUE,
+    ENDPOINTS_PUBLISHED,
+    POLICY_ABORTS,
+    SAFETY_REJECTIONS,
+    Metrics,
+    flush_every,
+)
 from dexmani_real.policy.safety import (
     SafetyGate,
     advance_run_generation,
@@ -180,7 +190,7 @@ def _seed_hand_reference(shared: SharedStorage) -> np.ndarray | None:
     return qpos.copy()
 
 
-def _abort_policy_run(shared: SharedStorage, reason: str) -> None:
+def _abort_policy_run(shared: SharedStorage, reason: str, metrics: Metrics | None = None) -> None:
     """Advance the generation and drop RUNNING -> ARMED (§80.2/§82).
 
     This is a policy-semantic failure, not a hardware fault: the robot is left
@@ -190,6 +200,8 @@ def _abort_policy_run(shared: SharedStorage, reason: str) -> None:
     if not transition(shared, SafetyState.ARMED):
         logger.error("coordinator: abort failed to transition RUNNING->ARMED")
     logger.warning("coordinator: policy run aborted: %s", reason)
+    if metrics is not None:
+        metrics.increment(POLICY_ABORTS)
 
 
 def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
@@ -203,6 +215,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
         hand_joint_lower_rad=config.hand_joint_lower_rad,
         hand_joint_upper_rad=config.hand_joint_upper_rad,
     )
+    metrics = Metrics()
 
     shared.set_heartbeat("policy", time.monotonic())
     # Publish readiness while still DISARMED/ARMED so Main's
@@ -246,6 +259,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
         _seed_hand_reference(shared) if config.deployment.hand_enabled else None
     )
     last_valid_policy_command_ns = time.monotonic_ns()
+    last_metrics_flush_ns = time.monotonic_ns()
     running = True
 
     try:
@@ -264,7 +278,8 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
 
             # Command silence watchdog (§82).
             if now_ns - last_valid_policy_command_ns > max_silence_ns:
-                _abort_policy_run(shared, "command silence timeout")
+                _abort_policy_run(shared, "command silence timeout", metrics)
+                metrics.increment(COMMAND_SILENCE_ABORT)
                 running = False
                 active_plan = None
                 continue
@@ -293,6 +308,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 continue
 
             n = int(active_plan["num_steps"])
+            prev_next_step = next_step
             selected, next_step = _select_due_step(
                 np.asarray(active_plan["target_monotonic_ns"][:n], dtype=np.uint64),
                 np.asarray(active_plan["valid_mask"][:n], dtype=np.uint8),
@@ -303,6 +319,10 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             if selected is None:
                 _sleep_tick(period_s, tick_start)
                 continue
+            metrics.increment(ENDPOINTS_DUE)
+            coalesced = int(selected) - int(prev_next_step)
+            if coalesced > 0:
+                metrics.increment(ENDPOINTS_COALESCED, coalesced)
 
             arm_qpos = np.asarray(active_plan["arm_qpos"][selected], dtype=np.float64)
             hand_qpos: np.ndarray | None = None
@@ -314,7 +334,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             if hand_qpos is not None:
                 error = _preflight_hand(hand_qpos, last_published_hand_cmd, config)
                 if error is not None:
-                    _abort_policy_run(shared, f"hand command delta violation: {error}")
+                    _abort_policy_run(shared, f"hand command delta violation: {error}", metrics)
                     running = False
                     active_plan = None
                     continue
@@ -344,7 +364,8 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 if reject_reason:
                     # SafetyGate rejection is a policy-semantic failure (§80.2):
                     # the model proposed an invalid endpoint. Abort immediately.
-                    _abort_policy_run(shared, f"safety gate rejection: {reject_reason[0]}")
+                    metrics.increment(SAFETY_REJECTIONS)
+                    _abort_policy_run(shared, f"safety gate rejection: {reject_reason[0]}", metrics)
                     running = False
                     active_plan = None
                     continue
@@ -353,10 +374,14 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 _sleep_tick(period_s, tick_start)
                 continue
 
+            metrics.increment(ENDPOINTS_PUBLISHED)
             if hand_qpos is not None:
                 last_published_hand_cmd = hand_qpos.copy()
             last_valid_policy_command_ns = now_ns
 
+            last_metrics_flush_ns = flush_every(
+                metrics, last_ns=last_metrics_flush_ns, prefix="coordinator metrics"
+            )
             _sleep_tick(period_s, tick_start)
     finally:
         logger.info("coordinator_loop: exited")

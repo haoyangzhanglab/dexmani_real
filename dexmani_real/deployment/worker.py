@@ -24,6 +24,15 @@ from dexmani_real.deployment.loader import (
     load_backend,
     load_observation_adapter,
 )
+from dexmani_real.deployment.metrics import (
+    INFERENCE_FAILURES,
+    INFERENCE_MS,
+    OBSERVATIONS_BUILT,
+    PLANS_CREATED,
+    PLANS_GENERATION_DROPPED,
+    Metrics,
+    flush_every,
+)
 from dexmani_real.deployment.observation import FrameWindow, ObservationBatch
 from dexmani_real.shm.shared_storage import SharedStorage, new_frame
 from dexmani_real.utils.log import get_logger
@@ -164,6 +173,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
 
     # Heartbeat before any lazy import so the supervisor never sees a dead gap.
     shared.set_heartbeat("inference", time.monotonic())
+    metrics = Metrics()
 
     backend = load_backend(config.backend_target, config=config)
     observation_adapter = load_observation_adapter(config.observation_adapter_target, config=config)
@@ -180,6 +190,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     plan_id = 0
     observation_id = 0
     last_generation = -1
+    last_metrics_flush_ns = time.monotonic_ns()
 
     try:
         while shared.is_running.value:
@@ -203,11 +214,13 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 continue  # no causal arm feedback yet — never publish garbage
             if config.hand_enabled and observation.hand_history is None:
                 continue
+            metrics.increment(OBSERVATIONS_BUILT)
 
             started_ns = time.monotonic_ns()
             model_input = observation_adapter.encode(observation)
             raw_output = backend.infer(model_input)
             finished_ns = time.monotonic_ns()
+            metrics.observe(INFERENCE_MS, (finished_ns - started_ns) / 1e6)
 
             context = InferenceContext(
                 run_generation=run_generation,
@@ -225,14 +238,22 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 # not a process failure (§80.2); the coordinator's silence watchdog
                 # is the eventual abort backstop.
                 logger.warning("inference: bad model output dropped: %s", exc)
+                metrics.increment(INFERENCE_FAILURES)
                 shared.set_heartbeat("inference", time.monotonic())
                 continue
 
             plan_id += 1
-            if not publish_plan(shared, plan_id=plan_id, context=context, chunk=chunk):
+            if publish_plan(shared, plan_id=plan_id, context=context, chunk=chunk):
+                metrics.increment(PLANS_CREATED)
+            else:
+                metrics.increment(PLANS_GENERATION_DROPPED)
                 logger.debug("inference: plan %d dropped (generation advanced)", plan_id)
 
             shared.set_heartbeat("inference", time.monotonic())
+
+            last_metrics_flush_ns = flush_every(
+                metrics, last_ns=last_metrics_flush_ns, prefix="inference metrics"
+            )
 
             elapsed = time.monotonic() - tick_start
             sleep_s = period_s - elapsed
