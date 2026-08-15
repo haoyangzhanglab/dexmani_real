@@ -334,6 +334,19 @@ def _read_live_error_code(arm_api: Any) -> int:
     return int(values[0])
 
 
+def _read_live_error_or_fail(arm_api: Any) -> int:
+    """Return the live controller error, or 1 (not-ready) if the read fails.
+
+    Connect-recovery uses this: it must fail closed to a non-ready status when
+    the live read fails rather than trust the cached value and declare the
+    controller ready.
+    """
+    try:
+        return _read_live_error_code(arm_api)
+    except Exception:
+        return 1
+
+
 def _wait_live_status(
     arm_api: Any,
     *,
@@ -505,11 +518,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             time.sleep(0.3)
             # Live read via get_err_warn_code() — more reliable than the cached
             # .error_code property (background report thread, ~200ms refresh).
-            try:
-                _rc, _codes = arm.get_err_warn_code()
-                _err = _codes[0] if _rc == 0 else 1
-            except Exception:
-                _err = getattr(arm, "error_code", 0) or 0
+            # A failed live read must fail closed (assume not-ready) rather than
+            # fall back to the cache and wrongly declare the controller ready.
+            _err = _read_live_error_or_fail(arm)
             _state = getattr(arm, "state", -1)
             if _err == 0 and _state == 2:
                 break
@@ -973,12 +984,25 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 _tracking_err_count = 0
 
             # arm.error_code is an SDK cached property (background report thread
-            # ~every 200ms), not a per-access network call.
+            # ~every 200ms), not a per-access network call.  A cached non-zero
+            # read drives a fault/C24 decision, so confirm it against the live
+            # controller register before acting; a failed live read fails closed
+            # (latches the fault) rather than trusting the cache.
             try:
                 error_code = arm.error_code
             except Exception:
                 error_code = 0
                 arm_connected = False
+            if error_code != 0:
+                try:
+                    error_code = _read_live_error_code(arm)
+                except Exception:
+                    logger.error(
+                        "arm_loop: live error read failed — latching fault",
+                        exc_info=True,
+                    )
+                    shared.error_state.value = True
+                    break
 
             if error_code in cfg.collision_fault_errors:
                 _latch_collision_fault(shared, arm, error_code)
