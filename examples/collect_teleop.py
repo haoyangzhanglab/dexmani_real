@@ -38,8 +38,8 @@ from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
 from dexmani_real.recording.recorder_client import RecorderPhase
-from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
+from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition

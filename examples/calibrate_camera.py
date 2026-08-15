@@ -73,7 +73,8 @@ from dexmani_real.policy.safety import (
     publish_joint_targets,
 )
 from dexmani_real.recording.transaction import atomic_json_dump
-from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop
+from dexmani_real.robot.arm_loop import arm_loop
+from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready

@@ -59,8 +59,8 @@ from dexmani_real.policy.safety import (ActionSafetyGateConfig, SafetyGate,
                                         publish_joint_targets)
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.transaction import atomic_json_dump
-from dexmani_real.robot.arm_loop import ArmLoopConfig
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
+from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition

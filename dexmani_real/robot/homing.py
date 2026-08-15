@@ -11,6 +11,11 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
+from dexmani_real.robot.arm_sdk import (
+    ArmLoopConfig,
+    _read_live_error_code,
+    _require_sdk_ok,
+)
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.shared_storage import HOME_SENTINEL, HomeRequest, HomeResult, SharedStorage
 from dexmani_real.utils.log import get_logger
@@ -524,4 +529,431 @@ def send_arm_home(
         estop_requested=estop_requested,
         arm_heartbeat_max_age_s=arm_heartbeat_max_age_s,
         verbose=verbose,
+    )
+
+
+def _result_impl(
+    request: HomeRequest,
+    success: bool,
+    reason: str,
+    qpos: np.ndarray,
+) -> HomeResult:
+    return HomeResult(
+        request_id=request.request_id,
+        success=success,
+        reason=reason,
+        final_qpos=np.asarray(qpos, dtype=np.float64).copy(),
+        completed_at_s=time.monotonic(),
+    )
+
+
+def _shared_abort_reason_impl(shared: Any) -> str | None:
+    if shared is None:
+        return None
+    if not shared.is_running.value:
+        return "shutdown requested"
+    if shared.estop_request.value:
+        return "e-stop requested"
+    if shared.error_state.value:
+        return "sticky error_state set during homing"
+    if shared.safety_state.value == SafetyState.FAULT:
+        return "FAULT during homing"
+    return None
+
+
+def _confirm_home_dwell_impl(
+    arm: Any,
+    request: HomeRequest,
+    cfg: ArmLoopConfig,
+    home_qpos: np.ndarray,
+    shared: Any,
+    current: np.ndarray,
+    current_qvel: np.ndarray,
+    failure_reason: str,
+) -> HomeResult:
+    if (
+        float(np.max(np.abs(current - home_qpos))) > cfg.homing_convergence_rad
+        or float(np.max(np.abs(current_qvel)))
+        > cfg.homing_velocity_convergence_rad_s
+    ):
+        return _result_impl(request, False, failure_reason, current)
+    stable_since = time.monotonic()
+    while time.monotonic() - stable_since < cfg.homing_dwell_s:
+        abort_reason = _shared_abort_reason_impl(shared)
+        if abort_reason is not None:
+            return _result_impl(request, False, abort_reason, current)
+        time.sleep(min(cfg.homing_step_interval_s, cfg.homing_dwell_s))
+        code, states = arm.get_joint_states(is_radian=True, num=3)
+        if code != 0 or len(states) <= 1:
+            return _result_impl(request, 
+                False, "state/qvel unavailable during home dwell", current
+            )
+        current = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+        current_qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+        if (
+            current.shape != ARM_JOINT_SHAPE
+            or current_qvel.shape != ARM_JOINT_SHAPE
+            or not np.all(np.isfinite(current))
+            or not np.all(np.isfinite(current_qvel))
+            or float(np.max(np.abs(current - home_qpos)))
+            > cfg.homing_convergence_rad
+            or float(np.max(np.abs(current_qvel)))
+            > cfg.homing_velocity_convergence_rad_s
+        ):
+            return _result_impl(request, 
+                False, "home dwell interrupted by position/velocity", current
+            )
+    return _result_impl(request, True, "already at canonical home and settled", current)
+
+
+def _execute_mode0_milestones_impl(
+    arm: Any,
+    request: HomeRequest,
+    cfg: ArmLoopConfig,
+    home_qpos: np.ndarray,
+    shared: Any,
+    feedback_callback: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None] | None,
+    execution_targets: np.ndarray,
+    current: np.ndarray,
+) -> tuple[HomeResult, np.ndarray]:
+    _overall_deadline = time.monotonic() + request.execution_timeout_s
+    _milestone_tol = min(cfg.homing_convergence_rad, np.deg2rad(0.5))
+
+    for _target_index, _target in enumerate(execution_targets, start=1):
+        if shared is not None:
+            _abort_reason = _shared_abort_reason_impl(shared)
+            if _abort_reason is not None:
+                return _result_impl(request, False, _abort_reason, current), current
+            shared.set_heartbeat("arm", time.monotonic())
+        if time.monotonic() >= _overall_deadline:
+            return _result_impl(request, 
+                False,
+                f"overall timeout before milestone {_target_index}/{len(execution_targets)}",
+                current,
+            ), current
+
+        _segment_start = current.copy()
+        _segment_started_s = time.monotonic()
+        try:
+            _code = arm.set_servo_angle(
+                angle=_target,
+                is_radian=True,
+                speed=cfg.homing_max_speed_rad_per_s,
+                mvacc=cfg.joint_max_acc_rad_per_s2,
+                wait=False,
+                radius=None,
+            )
+        except Exception:
+            logger.warning("run_planned_homing: milestone send failed", exc_info=True)
+            return _result_impl(request, False, f"milestone {_target_index} send raised", current), current
+        if _code != 0:
+            return _result_impl(request, 
+                False,
+                f"milestone {_target_index} rejected (SDK code={_code})",
+                current,
+            ), current
+
+        _segment_timeout_s = _estimate_homing_segment_timeout_s(
+            _segment_start, _target, cfg
+        )
+        _segment_deadline = min(
+            _overall_deadline, _segment_started_s + _segment_timeout_s
+        )
+        _stable_since_s: float | None = None
+        while time.monotonic() < _segment_deadline:
+            if shared is not None:
+                _abort_reason = _shared_abort_reason_impl(shared)
+                if _abort_reason is not None:
+                    return _result_impl(request, False, _abort_reason, current), current
+                shared.set_heartbeat("arm", time.monotonic())
+            try:
+                _state_code, _states = arm.get_joint_states(is_radian=True, num=3)
+            except Exception:
+                logger.warning(
+                    "run_planned_homing: milestone state read raised", exc_info=True
+                )
+                return _result_impl(request, 
+                    False,
+                    f"state read raised at milestone {_target_index}",
+                    current,
+                ), current
+            if _state_code != 0 or len(_states) == 0:
+                return _result_impl(request, 
+                    False,
+                    f"state read failed at milestone {_target_index} (code={_state_code})",
+                    current,
+                ), current
+            current = np.asarray(_states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+            if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
+                return _result_impl(request, 
+                    False, f"invalid state at milestone {_target_index}", current
+                ), current
+            if len(_states) <= 1:
+                return _result_impl(request, 
+                    False, f"qvel unavailable at milestone {_target_index}", current
+                ), current
+            qvel = np.asarray(_states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+            tau = (
+                np.asarray(_states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+                if len(_states) > 2
+                else np.zeros(ARM_JOINT_SHAPE)
+            )
+            try:
+                _controller_error = _read_live_error_code(arm)
+            except Exception:
+                logger.warning(
+                    "run_planned_homing: live controller error read failed at milestone %d",
+                    _target_index,
+                    exc_info=True,
+                )
+                return _result_impl(
+                    request,
+                    False,
+                    f"live error read failed at milestone {_target_index}",
+                    current,
+                ), current
+            if _controller_error != 0:
+                return _result_impl(request, 
+                    False,
+                    f"controller error C{_controller_error} at milestone {_target_index}",
+                    current,
+                ), current
+            if feedback_callback is not None:
+                try:
+                    feedback_callback(
+                        current.copy(), qvel.copy(), tau.copy(), _target.copy()
+                    )
+                except Exception:
+                    logger.warning(
+                        "run_planned_homing: feedback publication failed",
+                        exc_info=True,
+                    )
+            if (
+                float(np.max(np.abs(current - _target))) <= _milestone_tol
+                and float(np.max(np.abs(qvel)))
+                <= cfg.homing_velocity_convergence_rad_s
+            ):
+                if _stable_since_s is None:
+                    _stable_since_s = time.monotonic()
+                if time.monotonic() - _stable_since_s >= cfg.homing_dwell_s:
+                    break
+            else:
+                _stable_since_s = None
+            time.sleep(cfg.homing_step_interval_s)
+        else:
+            _error = np.abs(current - _target)
+            _joint = int(np.argmax(_error))
+            _elapsed_s = time.monotonic() - _segment_started_s
+            if time.monotonic() >= _overall_deadline:
+                _timeout_kind = "overall timeout"
+            else:
+                _timeout_kind = "convergence timeout"
+            return _result_impl(request, 
+                False,
+                f"{_timeout_kind} at milestone {_target_index}/{len(execution_targets)} "
+                f"after {_elapsed_s:.2f}s (J{_joint + 1} error={np.rad2deg(_error[_joint]):.2f}deg)",
+                current,
+            ), current
+
+    _final_error = float(np.max(np.abs(current - home_qpos)))
+    if _final_error > cfg.homing_convergence_rad:
+        return _result_impl(request, 
+            False, f"final error {np.rad2deg(_final_error):.2f}deg", current
+        ), current
+    return _result_impl(request, True, "canonical home reached", current), current
+
+
+def run_planned_homing(
+    arm: Any,
+    request: HomeRequest,
+    cfg: ArmLoopConfig | None = None,
+    *,
+    shared: Any = None,
+    feedback_callback: (
+        Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None] | None
+    ) = None,
+) -> HomeResult:
+    """Execute collision-validated milestones with the firmware joint planner.
+
+    The caller densely checks every joint-space segment for collision, but only
+    the sparse segment endpoints cross the process boundary.  Homing temporarily
+    enters Mode 0 and uses unblended ``MoveJoint`` commands so the controller,
+    rather than this process, owns the point-to-point trajectory.  Normal Mode 6
+    teleoperation is restored before returning from healthy paths; E-stop,
+    shutdown, and controller-fault paths stop instead.  Completion is based
+    only on fresh encoder feedback; no state is fabricated on SDK read failure.
+    """
+    _cfg = cfg or ArmLoopConfig()
+
+    def _result(success: bool, reason: str, qpos: np.ndarray) -> HomeResult:
+        return _result_impl(request, success, reason, qpos)
+
+    def _shared_abort_reason() -> str | None:
+        return _shared_abort_reason_impl(shared)
+
+    waypoints = np.asarray(request.waypoints, dtype=np.float64)
+    home_qpos = np.asarray(request.final_qpos, dtype=np.float64)
+    if (
+        not isinstance(request.request_id, (int, np.integer))
+        or int(request.request_id) <= 0
+    ):
+        return _result(False, "invalid request_id", np.full(ARM_JOINT_SHAPE, np.nan))
+    if (
+        waypoints.ndim != 2
+        or waypoints.shape[1:] != ARM_JOINT_SHAPE
+        or not np.all(np.isfinite(waypoints))
+    ):
+        return _result(
+            False, "invalid waypoint array", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
+    if home_qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(home_qpos)):
+        return _result(False, "invalid final_qpos", np.full(ARM_JOINT_SHAPE, np.nan))
+    if (
+        not np.isfinite(request.execution_timeout_s)
+        or request.execution_timeout_s <= 0.0
+    ):
+        return _result(
+            False, "invalid execution timeout", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
+    _lower = np.asarray(_cfg.joint_limit_lower, dtype=np.float64)
+    _upper = np.asarray(_cfg.joint_limit_upper, dtype=np.float64)
+    if len(waypoints) > 0 and not np.all((waypoints >= _lower) & (waypoints <= _upper)):
+        return _result(
+            False, "waypoint violates joint limits", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
+    if len(waypoints) > 0 and float(np.max(np.abs(waypoints[-1] - home_qpos))) > 1e-6:
+        return _result(
+            False,
+            "final milestone does not match canonical home",
+            np.full(ARM_JOINT_SHAPE, np.nan),
+        )
+
+    try:
+        code, states = arm.get_joint_states(is_radian=True, num=3)
+        if code == 0 and len(states) > 0:
+            current = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+            current_qvel = (
+                np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
+                if len(states) > 1
+                else np.full(ARM_JOINT_SHAPE, np.inf)
+            )
+        else:
+            return _result(
+                False,
+                f"initial state read failed (code={code})",
+                np.full(ARM_JOINT_SHAPE, np.nan),
+            )
+    except Exception:
+        logger.warning("run_planned_homing: initial state read raised", exc_info=True)
+        return _result(
+            False, "initial state read raised", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
+    if current.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current)):
+        return _result(
+            False, "initial state is invalid", np.full(ARM_JOINT_SHAPE, np.nan)
+        )
+
+    def _confirm_home_dwell(failure_reason: str) -> HomeResult:
+        return _confirm_home_dwell_impl(
+            arm, request, _cfg, home_qpos, shared, current, current_qvel, failure_reason
+        )
+
+    if len(waypoints) == 0:
+        return _confirm_home_dwell(
+            "empty path while away from stationary canonical home"
+        )
+    if float(np.max(np.abs(current - waypoints[0]))) > _cfg.homing_convergence_rad:
+        return _result(
+            False, "current state moved too far from planned path start", current
+        )
+
+    _execution_targets = waypoints[1:]
+    if len(_execution_targets) == 0:
+        return _confirm_home_dwell(
+            "single-point path is not at stationary canonical home"
+        )
+    _preflight_abort = _shared_abort_reason()
+    if _preflight_abort is not None:
+        return _result(False, _preflight_abort, current)
+
+    def _execute_mode0_milestones() -> HomeResult:
+        nonlocal current
+        _home_result, current = _execute_mode0_milestones_impl(
+            arm, request, _cfg, home_qpos, shared, feedback_callback,
+            _execution_targets, current,
+        )
+        return _home_result
+
+    # Mode 6 is designed for continuously changing online targets and its
+    # per-joint velocity profiles need not be synchronous.  A planned homing
+    # path instead uses Mode 0 MoveJoint.  Explicitly restore Mode 6 after
+    # healthy entry/execution failures so the worker never silently changes
+    # semantics; global-stop and controller-fault paths remain stopped.
+    _mode_switch_attempted = False
+    try:
+        logger.info(
+            "homing: entering Mode 0 MoveJoint (%d motion milestones, speed=%.1fdeg/s)",
+            len(_execution_targets),
+            np.rad2deg(_cfg.homing_max_speed_rad_per_s),
+        )
+        _mode_switch_attempted = True
+        _require_sdk_ok("set_mode(0)", arm.set_mode(0))
+        _require_sdk_ok("set_state(0) after Mode 0", arm.set_state(0))
+    except Exception as exc:
+        logger.error("run_planned_homing: failed to enter Mode 0", exc_info=True)
+        _home_result = _result(False, f"Mode 0 entry failed: {exc}", current)
+    else:
+        _home_result = _execute_mode0_milestones()
+
+    _restore_error: Exception | None = None
+    _post_homing_abort = _shared_abort_reason()
+    try:
+        _controller_error_after_home = _read_live_error_code(arm)
+    except Exception:
+        # Fail-closed: without a live error read we do not restore Mode 6.
+        _controller_error_after_home = -1
+    _restore_mode6 = _post_homing_abort is None and _controller_error_after_home == 0
+    if _mode_switch_attempted and _restore_mode6:
+        try:
+            _require_sdk_ok("restore set_mode(6)", arm.set_mode(6))
+            _require_sdk_ok("restore set_state(0)", arm.set_state(0))
+        except Exception as exc:
+            _restore_error = exc
+            logger.error("run_planned_homing: failed to restore Mode 6", exc_info=True)
+    elif _mode_switch_attempted:
+        _stop_reason = (
+            _post_homing_abort or f"controller error C{_controller_error_after_home}"
+        )
+        try:
+            _require_sdk_ok("stop after interrupted homing", arm.set_state(4))
+        except Exception as exc:
+            _restore_error = exc
+            logger.error(
+                "run_planned_homing: failed to stop after interrupted homing",
+                exc_info=True,
+            )
+        if _home_result.success:
+            _home_result = _result(
+                False, f"homing interrupted after convergence: {_stop_reason}", current
+            )
+    if _restore_error is not None:
+        _operation = "Mode 6 restore" if _restore_mode6 else "safe stop"
+        return _result(
+            False,
+            f"{_home_result.reason}; {_operation} failed: {_restore_error}",
+            current,
+        )
+    if _restore_mode6:
+        logger.info("homing: restored Mode 6")
+    return _home_result
+
+
+def _estimate_homing_segment_timeout_s(
+    start: np.ndarray, target: np.ndarray, cfg: ArmLoopConfig
+) -> float:
+    """Deadline for one firmware-planned milestone, including settle time."""
+    delta_rad = float(np.max(np.abs(np.asarray(target) - np.asarray(start))))
+    nominal_s = delta_rad / max(cfg.homing_max_speed_rad_per_s, 1e-6)
+    return max(
+        cfg.homing_target_timeout_s, 2.0 * nominal_s + cfg.homing_target_timeout_s
     )

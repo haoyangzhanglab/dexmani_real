@@ -32,7 +32,8 @@ from dexmani_real.policy.safety import (
     publish_hand_home_and_wait_applied,
     publish_joint_targets,
 )
-from dexmani_real.robot.arm_loop import ArmLoopConfig, arm_loop
+from dexmani_real.robot.arm_loop import arm_loop
+from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
