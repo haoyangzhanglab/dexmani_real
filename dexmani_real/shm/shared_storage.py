@@ -266,6 +266,7 @@ class SharedStorage:
     camera_firmware: Any  # firmware version string
     camera_sdk_version: Any  # pyrealsense2/librealsense version string
     camera_profile: Any  # actual color/depth profile JSON
+    camera_pointcloud_config: Any  # resolved pointcloud filter config JSON
     _closed: bool = field(init=False, repr=False, default=False)
     _close_completed_operations: set[str] = field(
         init=False, repr=False, default_factory=set
@@ -410,6 +411,7 @@ class SharedStorage:
         storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
         storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
         storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
+        storage.camera_pointcloud_config = ctx.Array("c", b"\x00" * 2048)
 
     def close(self) -> bool:
         """Release all shared memory primitives.

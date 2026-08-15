@@ -280,8 +280,11 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 "camera_loop: pointcloud enabled, T pos=%s",
                 T_world_camera[:3, 3].round(3).tolist(),
             )
+            _pc_meta = json.dumps(pc_config.to_meta_dict(), separators=(",", ":"))
+            shared.camera_pointcloud_config.value = _pc_meta[:2047].ljust(2048, "\x00").encode()
         except Exception:
             _logger.warning("camera_loop: pointcloud DISABLED", exc_info=True)
+            shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
 
         # Zero pointcloud fallback — used when process() returns None during recording.
         zero_pc = np.zeros(pc_shape, dtype=np.float32)

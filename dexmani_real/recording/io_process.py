@@ -106,6 +106,9 @@ def _build_start_metadata(shared: Any, *, task_label: str, operator: str) -> dic
     camera_firmware = _shared_text(shared.camera_firmware.value, default="unknown") or "unknown"
     camera_sdk_version = _shared_text(shared.camera_sdk_version.value, default="unknown") or "unknown"
     camera_profile_json = _shared_text(shared.camera_profile.value, default="{}") or "{}"
+    camera_pointcloud_config_json = (
+        _shared_text(shared.camera_pointcloud_config.value, default="{}") or "{}"
+    )
     arm_identity_json = (
         _shared_text(shared.arm_device_identity.value, default='{"status":"unavailable"}')
         or '{"status":"unavailable"}'
@@ -130,6 +133,7 @@ def _build_start_metadata(shared: Any, *, task_label: str, operator: str) -> dic
             "camera_firmware": camera_firmware,
             "camera_sdk_version": camera_sdk_version,
             "camera_actual_profile_json": camera_profile_json,
+            "camera_pointcloud_config_json": camera_pointcloud_config_json,
             "arm_device_identity_json": arm_identity_json,
             "hand_device_identity_json": hand_identity_json or '{"status":"disabled"}',
         },
