@@ -15,10 +15,8 @@ import numpy as np
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 from _fakes import FakeArm
 
-from dexmani_real.robot.arm_loop import (
-    ArmLoopConfig,
-    _recover_c24_measured_hold,
-)
+from dexmani_real.robot.arm_loop import _recover_c24_measured_hold
+from dexmani_real.robot.arm_sdk import ArmLoopConfig
 
 
 def _assert_order(calls: list[str], *names: str) -> None:

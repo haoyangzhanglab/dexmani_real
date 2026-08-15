@@ -13,7 +13,8 @@ import sys
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 from _fakes import FakeArm
 
-from dexmani_real.robot.arm_loop import _read_live_error_code, _read_live_error_or_fail
+from dexmani_real.robot.arm_loop import _read_live_error_or_fail
+from dexmani_real.robot.arm_sdk import _read_live_error_code
 
 
 def main() -> int:
