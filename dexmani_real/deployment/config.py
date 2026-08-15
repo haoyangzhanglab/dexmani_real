@@ -157,7 +157,10 @@ def resolve_deployment_config(
         file_overrides = file_overrides["deployment"]
 
     merged = _merge(DEFAULT_DEPLOYMENT_CONFIG, file_overrides)
-    merged = _merge(DeploymentConfig(**merged), cli_overrides or {})
+    # CLI values of None mean "not supplied" and never mask file/data defaults
+    # (mirrors resolve_runtime_config's _expand_dotted None-skip).
+    cli = {str(key): value for key, value in (cli_overrides or {}).items() if value is not None}
+    merged = _merge(DeploymentConfig(**merged), cli)
 
     config = DeploymentConfig(**merged)
     if not config.backend_target.strip():

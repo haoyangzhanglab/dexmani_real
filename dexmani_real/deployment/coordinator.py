@@ -205,11 +205,24 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     )
 
     shared.set_heartbeat("policy", time.monotonic())
+    # Publish readiness while still DISARMED/ARMED so Main's
+    # wait_subsystem_ready observes a ready worker with a live heartbeat.
+    shared.set_ready("policy")
 
-    # RUNNING entry — mirror teleop BEGIN: establish a fresh run boundary before
-    # the first endpoint. Only Main arms the system; the coordinator owns
-    # ARMED -> RUNNING. Advancing once invalidates any startup-generation plan
-    # and makes the inference worker reset its backend before the first proposal.
+    # RUNNING entry — the coordinator is the policy control source, so there is
+    # no operator BEGIN. It waits for Main to arm the system (DISARMED -> ARMED),
+    # then self-enters RUNNING and advances the generation once. The advance
+    # invalidates any startup-generation plan and makes the inference worker
+    # reset its backend before the first proposal.
+    while (
+        shared.is_running.value
+        and int(shared.safety_state.value) != int(SafetyState.ARMED)
+    ):
+        if bool(shared.error_state.value) or bool(shared.estop_request.value):
+            return
+        time.sleep(0.01)
+    if not shared.is_running.value or int(shared.safety_state.value) != int(SafetyState.ARMED):
+        return
     if not transition(shared, SafetyState.RUNNING):
         logger.error(
             "coordinator: cannot enter RUNNING (safety_state=%d)",
@@ -218,7 +231,6 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
         return
     advance_run_generation(shared)
     run_generation = int(shared.run_generation.value)
-    shared.set_ready("policy")
     logger.info("coordinator_loop: RUNNING (run_generation=%d)", run_generation)
 
     period_s = 1.0 / float(config.control_hz)

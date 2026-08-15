@@ -62,6 +62,13 @@ def main() -> int:
     assert again.sha256 == resolved.sha256, "same input must yield the same digest"
     assert again.canonical_json == resolved.canonical_json
 
+    # CLI None values mean "not supplied" and never mask file/data defaults.
+    none_resolved = resolve_deployment_config(
+        data={"backend_target": "pkg.mod:build_backend", "device": "cuda:1"},
+        cli_overrides={"device": None},
+    )
+    assert none_resolved.deployment.device == "cuda:1", "None CLI must not mask the file value"
+
     # missing backend_target / unknown field fail closed
     try:
         resolve_deployment_config(data={})
