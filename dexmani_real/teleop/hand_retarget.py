@@ -1,8 +1,8 @@
 """VR-to-XHand retargeting via dex_retargeting + adaptive finger scaling.
 
-Two landmark-space adaptations compensate human-robot kinematic mismatches:
-1. adaptive_retargeting_thumb — scales thumb_tip to match XHand mechanical thumb length
-2. adaptive_retargeting_xhand — scales pinky chain (MCP→PIP→DIP→TIP) by extension state
+One landmark-space adaptation compensates human-robot kinematic mismatch:
+``adaptive_retargeting_xhand`` scales the pinky chain (MCP→PIP→DIP→TIP) by
+extension state.
 """
 
 from __future__ import annotations

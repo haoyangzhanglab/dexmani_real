@@ -74,7 +74,7 @@ class RobotState:
     hand_connected: bool
     timestamp: float  # seconds
 
-    # ── Hand motor current (optional, for safety gating) ──
+    # ── Hand motor current (optional, recorded for offline safety analysis) ──
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
     hand_error_state: bool = (
