@@ -320,14 +320,24 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 _sleep_tick(period_s, tick_start)
                 continue
 
+            reject_reason: list[str] = []
             published = validate_and_send_candidate(
                 shared,
                 candidate,
                 gate=gate,
                 dt_s=period_s,
+                reject_reason_out=reject_reason,
             )
             if published is None:
-                # Gate rejection or transport failure: no command this tick.
+                if reject_reason:
+                    # SafetyGate rejection is a policy-semantic failure (§80.2):
+                    # the model proposed an invalid endpoint. Abort immediately.
+                    _abort_policy_run(shared, f"safety gate rejection: {reject_reason[0]}")
+                    running = False
+                    active_plan = None
+                    continue
+                # Feedback/transport failure is transient: drop this tick; the
+                # silence watchdog is the eventual abort backstop.
                 _sleep_tick(period_s, tick_start)
                 continue
 

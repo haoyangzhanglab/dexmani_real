@@ -530,6 +530,7 @@ def validate_and_send_candidate(
     current_arm_qpos: np.ndarray | None = None,
     current_hand_qpos: np.ndarray | None = None,
     dt_s: float | None = None,
+    reject_reason_out: list[str] | None = None,
 ) -> Any | None:
     """Validate a pre-built candidate through the gate and publish it.
 
@@ -541,6 +542,12 @@ def validate_and_send_candidate(
     The coupled-hand mechanical/delta preflight is deliberately absent: its delta
     reference and rejection policy are path-dependent (last-published vs
     last-accepted command), so each caller runs it before calling this function.
+
+    A *gate* rejection is a policy-semantic failure (the model proposed an
+    invalid endpoint), distinct from a transient feedback/transport failure. To
+    let the learned-policy coordinator abort on the former but drop on the
+    latter (§80.2), pass a list in ``reject_reason_out``; it is appended with
+    the gate reason only when the gate rejects.
 
     Returns:
         The accepted ``ActionCandidate`` on publication, or ``None`` when the
@@ -589,11 +596,14 @@ def validate_and_send_candidate(
         run_generation=int(shared.run_generation.value),
     )
     if not gate_result.accepted or gate_result.candidate is None:
+        reason = gate_result.reason or "unspecified"
         logger.warning(
             "validate_and_send_candidate: action_id=%d rejected by safety gate: %s",
             action_id,
-            gate_result.reason or "unspecified",
+            reason,
         )
+        if reject_reason_out is not None:
+            reject_reason_out.append(reason)
         return None
 
     if not send_command(shared, gate_result.candidate, prepare_timeout_s=prepare_timeout_s):
