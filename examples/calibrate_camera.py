@@ -10,7 +10,7 @@ the ``CameraCalib`` config loader.
 
 Hardware preparation:
 
-  1. Print an ArUco 7x7_50 marker (ID=1), size 122.8 mm × 122.8 mm.
+  1. Print an ArUco 7x7_50 marker (ID=1), size 98.2 mm × 98.2 mm.
   2. Attach the marker flat on the end-effector, facing the camera.
   3. Fix the RealSense camera on a tripod, covering the workspace.
   4. Ensure conda environment has: pyrealsense2, opencv-python, scipy.
@@ -131,7 +131,8 @@ _HAND_EYE_METHODS = {
 class ArucoConfig:
     """ArUco marker detection parameters."""
 
-    marker_size_m: float = 0.1228
+    # marker_size_m: float = 0.1228
+    marker_size_m: float = 0.0982
     target_id: int | None = 1
     capture_frames: int = 5
 
