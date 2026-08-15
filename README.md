@@ -217,8 +217,9 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 |---|---|
 | `robot/__init__.py` | 标识 xArm7、XHand 驱动和执行 worker 所在包。 |
 | `robot/arm_loop.py` | xArm Mode 6 伺服 worker：按 generation 读取有序臂命令、发布 FK 状态，并处理 C24 恢复与碰撞故障；DISARMED、FAULT、紧停后备与退出确认 State 4，成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
+| `robot/arm_sdk.py` | 共享 xArm SDK 表面：`ArmLoopConfig`（Mode 6 在线轨迹规划配置，`from_runtime` 解析）与叶子级 live-read 原语 `_read_live_error_code`/`_require_sdk_ok`，供 `arm_loop.py`（伺服）与 `homing.py`（回零执行）共同使用，保持依赖无环。 |
 | `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、复核命令/机械限位、发布关节/触觉反馈与最后成功 action ID；不以目标—反馈不收敛判定故障。 |
-| `robot/homing.py` | 执行并验证机械臂回零，包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
+| `robot/homing.py` | 回零编排与执行：`send_arm_home` 编排候选路径，`run_planned_homing` 为执行入口（Mode 0 里程碑 + 完成后恢复 Mode 6）；包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
 | `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `utils/schema.py` 决定。 |
 | `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放；超过运行或厂商机械限位的命令整条拒绝，绝不隐式 clip，运行配置只能收紧而不能放宽额定机械包络；成功初始化时汇总原生 SDK 噪声，连接失败时回放完整诊断。 |
@@ -228,9 +229,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `runtime/__init__.py` | 导出退出原因等运行时状态枚举。 |
-| `runtime/processes.py` | 提供 spawn 上下文、进程退出报告，以及可验证的停止/回收/共享内存关闭流程。 |
+| `runtime/processes.py` | `WorkerSpec` 声明 worker target/args，`build_processes`/`start_processes` 收敛 spawn/start 拓扑；`ProcessExit`/`ShutdownReport` 报告退出，并提供可验证的停止/回收/共享内存关闭流程。 |
 | `runtime/status.py` | 定义跨模块使用的退出原因整数枚举。 |
-| `runtime/session.py` | 提供 `ManagedProcessGroup`，封装进程组的启动、关闭与共享资源清理。 |
 | `runtime/supervisor.py` | 完成 worker 就绪等待、心跳/进程监督、健康摘要和协调关闭。 |
 
 ### `sensor/` — 相机、点云与 VR 接收
