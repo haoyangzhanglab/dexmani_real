@@ -13,7 +13,10 @@ Locks the counter/gauge registry semantics and the provenance logging boundary:
 
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
+import tempfile
 import time
 
 import _bootstrap  # noqa: F401  (repo root on sys.path)
@@ -26,7 +29,7 @@ from dexmani_real.deployment.metrics import (
     Metrics,
     flush_every,
 )
-from dexmani_real.deployment.provenance import log_deployment_provenance
+from dexmani_real.deployment.provenance import log_deployment_provenance, sha256_file
 
 
 class _Capture:
@@ -104,6 +107,16 @@ def main() -> int:
     log_deployment_provenance(capture2, deployment=DeploymentConfig(backend_target="a:b"), runtime_sha256="x" * 64)
     assert "model_commit=unknown" in capture2.records[0]
     assert "dexmani_commit=unknown" in capture2.records[0]
+
+    # ── sha256_file: best-effort provenance hash ──
+    with tempfile.NamedTemporaryFile("wb", delete=False) as tmp:
+        tmp.write(b"hello provenance")
+        tmp_path = tmp.name
+    try:
+        assert sha256_file(tmp_path) == hashlib.sha256(b"hello provenance").hexdigest()
+        assert sha256_file(tmp_path + ".missing") == "", "missing file must hash to ''"
+    finally:
+        os.unlink(tmp_path)
 
     print("check_deployment_metrics: PASS")
     return 0

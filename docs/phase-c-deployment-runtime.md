@@ -7,7 +7,7 @@ Phase C adds exactly one new cross-process flow — *observations → model
 proposal → robot command* — and reuses every existing safety, lifecycle, and
 transport primitive.
 
-Offline regression gate: `checks/offline/run_all.py` → **25/25 passed**.
+Offline regression gate: `checks/offline/run_all.py` → **26/26 passed**.
 
 ---
 
@@ -114,7 +114,11 @@ The model-internal parameters (§93) never appear in `DeploymentConfig`.
 | Process failure (§81) | crash, CUDA fatal, backend exception, heartbeat timeout | existing supervisor fault path |
 
 - The coordinator's silence watchdog (§82): `RUNNING` with no valid policy
-  command for `max_command_silence_s` → advance generation + `RUNNING → ARMED`.
+  command **published** for `max_command_silence_s` since the last published
+  command (armed at the first publish, so slow first inference is not charged) →
+  advance generation + `RUNNING → ARMED`. A live-but-never-publishing policy is
+  a safe hold: a dead worker still faults via its heartbeat, and a
+  garbage-producing worker is observable via `inference_failures`.
 - The coordinator enters `RUNNING` itself (it is the policy control source — no
   operator BEGIN): set ready while `DISARMED/ARMED`, wait for Main to arm, then
   `ARMED → RUNNING` and one `advance_run_generation`.

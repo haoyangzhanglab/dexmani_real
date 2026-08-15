@@ -22,7 +22,7 @@ from typing import Any
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
-from dexmani_real.deployment.provenance import log_deployment_provenance
+from dexmani_real.deployment.provenance import log_deployment_provenance, sha256_file
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.robot.arm_sdk import ArmLoopConfig
@@ -99,7 +99,15 @@ def run_policy_deployment(
     transform/provenance/recording preflight the joint-only workflow does not
     need.
     """
-    log_deployment_provenance(logger, deployment=deployment, runtime_sha256=runtime.sha256)
+    log_deployment_provenance(
+        logger,
+        deployment=deployment,
+        runtime_sha256=runtime.sha256,
+        checkpoint_sha256=sha256_file(deployment.checkpoint) if deployment.checkpoint else "",
+        model_config_sha256=(
+            sha256_file(deployment.model_config_path) if deployment.model_config_path else ""
+        ),
+    )
 
     ctx = mp.get_context("spawn")
     shared = SharedStorage.create(

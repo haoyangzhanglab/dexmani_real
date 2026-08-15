@@ -27,13 +27,11 @@ from dexmani_real.deployment.loader import (
 def main() -> int:
     # ── DeploymentConfig validation ──
     cfg = DeploymentConfig()
-    assert cfg.max_chunk_steps == 32
     assert cfg.hand_enabled is False
     assert cfg.device == "cpu"
 
     for bad in (
         {"observation_horizon": 0},
-        {"max_chunk_steps": 0},
         {"inference_hz": 0.0},
         {"max_plan_age_s": -1.0},
     ):
@@ -46,7 +44,11 @@ def main() -> int:
 
     # ── resolve: CLI > data > defaults, stable SHA-256 ──
     resolved = resolve_deployment_config(
-        data={"backend_target": "pkg.mod:build_backend"},
+        data={
+            "backend_target": "pkg.mod:build_backend",
+            "observation_adapter_target": "pkg.mod:build_obs",
+            "action_adapter_target": "pkg.mod:build_act",
+        },
         cli_overrides={"device": "cuda:0", "inference_hz": 20},
     )
     assert resolved.deployment.backend_target == "pkg.mod:build_backend"
@@ -56,7 +58,11 @@ def main() -> int:
     assert len(resolved.sha256) == 64
 
     again = resolve_deployment_config(
-        data={"backend_target": "pkg.mod:build_backend"},
+        data={
+            "backend_target": "pkg.mod:build_backend",
+            "observation_adapter_target": "pkg.mod:build_obs",
+            "action_adapter_target": "pkg.mod:build_act",
+        },
         cli_overrides={"device": "cuda:0", "inference_hz": 20},
     )
     assert again.sha256 == resolved.sha256, "same input must yield the same digest"
@@ -64,18 +70,30 @@ def main() -> int:
 
     # CLI None values mean "not supplied" and never mask file/data defaults.
     none_resolved = resolve_deployment_config(
-        data={"backend_target": "pkg.mod:build_backend", "device": "cuda:1"},
+        data={
+            "backend_target": "pkg.mod:build_backend",
+            "observation_adapter_target": "pkg.mod:build_obs",
+            "action_adapter_target": "pkg.mod:build_act",
+            "device": "cuda:1",
+        },
         cli_overrides={"device": None},
     )
     assert none_resolved.deployment.device == "cuda:1", "None CLI must not mask the file value"
 
-    # missing backend_target / unknown field fail closed
-    try:
-        resolve_deployment_config(data={})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("missing backend_target must raise ValueError")
+    # any missing target fails closed (all three are required entry points)
+    for partial in (
+        {},
+        {"backend_target": "a:b"},
+        {"backend_target": "a:b", "observation_adapter_target": "c:d"},
+    ):
+        try:
+            resolve_deployment_config(data=partial)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"resolve_deployment_config(data={partial!r}) must raise ValueError"
+            )
     try:
         resolve_deployment_config(data={"backend_target": "a:b", "nope": 1})
     except TypeError:

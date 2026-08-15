@@ -16,6 +16,7 @@ from dexmani_real.deployment.contracts import (
     PolicyBackend,
 )
 from dexmani_real.deployment.observation import CameraWindow, FrameWindow, ObservationBatch
+from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS
 
 
 def _frame_window(t: int, feat: tuple[int, ...]) -> FrameWindow:
@@ -86,6 +87,12 @@ def main() -> int:
             hand_qpos=None,
             target_monotonic_ns=target,
             valid_mask=mask,
+        ),
+        dict(  # over transport capacity (MAX_POLICY_CHUNK_STEPS) — must fail, never truncate
+            arm_qpos=np.zeros((MAX_POLICY_CHUNK_STEPS + 1, 7)),
+            hand_qpos=None,
+            target_monotonic_ns=np.arange(MAX_POLICY_CHUNK_STEPS + 1, dtype=np.uint64) * 10 + 1000,
+            valid_mask=np.ones(MAX_POLICY_CHUNK_STEPS + 1, dtype=np.uint8),
         ),
     )
     for bad in bad_chunks:

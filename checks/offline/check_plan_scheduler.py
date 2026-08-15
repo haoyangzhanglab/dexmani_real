@@ -13,7 +13,8 @@ Locks the coordinator's correctness guarantees without hardware:
     (policy-semantic failure, not a hardware FAULT) (§80.2/§82).
 
 Two end-to-end runs prove the wiring: a due plan produces exactly one coalesced
-endpoint, and a command-silence timeout aborts the run to ARMED.
+endpoint, and a command-to-command silence timeout (after one publish) aborts the
+run to ARMED.
 """
 
 from __future__ import annotations
@@ -176,15 +177,33 @@ def _test_end_to_end_publish(arm_mid: np.ndarray) -> None:
         shared.close()
 
 
-def _test_silence_abort() -> None:
+def _test_silence_abort(arm_mid: np.ndarray) -> None:
     shared = SharedStorage.create(prefix="check_plan_scheduler_silence")
     try:
         assert transition(shared, SafetyState.ARMED)
-        # No plan: the silence watchdog must abort the run and drop to ARMED.
+        shared.arm_state_ring.write(make_arm_state_frame(arm_mid))
+
+        # Publish exactly one command (generation 2, single due step), then go
+        # silent: the command-to-command silence watchdog must drop to ARMED.
+        plan = _plan_frame(
+            run_generation=2,
+            observation_id=1,
+            num_steps=1,
+            arm_qpos=arm_mid[None, :],
+            target_ns=np.asarray([time.monotonic_ns() - 1_000_000], dtype=np.uint64),
+            hand_present=0,
+        )
+        shared.policy_plan_ring.write(plan)
+
         cfg = _coordinator_config(max_command_silence_s=0.05, control_hz=100.0)
         thread = threading.Thread(target=coordinator_loop, args=(shared, cfg), daemon=True)
         thread.start()
         try:
+            try:
+                shared.arm_action_q.get(timeout=3.0)
+            except Empty:
+                raise AssertionError("coordinator published no endpoint") from None
+            # No further plan/commands: the watchdog must drop the run to ARMED.
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
                 if int(shared.safety_state.value) == int(SafetyState.ARMED):
@@ -272,7 +291,7 @@ def main() -> int:
 
     # ── end-to-end wiring ──
     _test_end_to_end_publish(arm_mid)
-    _test_silence_abort()
+    _test_silence_abort(arm_mid)
 
     print("check_plan_scheduler: PASS")
     return 0

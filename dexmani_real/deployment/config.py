@@ -50,17 +50,11 @@ class DeploymentConfig:
     max_plan_age_s: float = 1.0
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
-    max_chunk_steps: int = 32
     hand_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.observation_horizon <= 0:
             raise ValueError("observation_horizon must be positive")
-        # Transport capacity is MAX_POLICY_CHUNK_STEPS (schema); the >0 floor
-        # here is the deployment-side contract, the <=capacity check lands with
-        # the dtype in P5.
-        if self.max_chunk_steps <= 0:
-            raise ValueError("max_chunk_steps must be positive")
         for name in _POSITIVE_FLOAT_FIELDS:
             value = getattr(self, name)
             if not math.isfinite(float(value)) or value <= 0:
@@ -130,8 +124,9 @@ def resolve_deployment_config(
     """Resolve ``CLI > file/data > defaults`` without mutating the template.
 
     Accepts either a flat mapping of deployment fields or a YAML document with a
-    top-level ``deployment:`` section (§58).  Raises when ``backend_target`` is
-    absent, since that is the single required entry point.
+    top-level ``deployment:`` section (§58).  Raises when any of the three
+    ``*_target`` fields is absent; the three targets are the required entry
+    points (the worker cannot run without all three).
     """
     sources = [yaml_path is not None, data is not None]
     if sum(sources) > 1:
@@ -163,8 +158,13 @@ def resolve_deployment_config(
     merged = _merge(DeploymentConfig(**merged), cli)
 
     config = DeploymentConfig(**merged)
-    if not config.backend_target.strip():
-        raise ValueError("deployment backend_target must be provided")
+    for target_name in (
+        "backend_target",
+        "observation_adapter_target",
+        "action_adapter_target",
+    ):
+        if not getattr(config, target_name).strip():
+            raise ValueError(f"deployment {target_name} must be provided")
 
     canonical = {field.name: getattr(config, field.name) for field in fields(DeploymentConfig)}
     canonical_json = json.dumps(

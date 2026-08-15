@@ -190,11 +190,19 @@ def _seed_hand_reference(shared: SharedStorage) -> np.ndarray | None:
     return qpos.copy()
 
 
-def _abort_policy_run(shared: SharedStorage, reason: str, metrics: Metrics | None = None) -> None:
+def _abort_policy_run(
+    shared: SharedStorage,
+    reason: str,
+    metrics: Metrics | None = None,
+    *,
+    metric: str | None = None,
+) -> None:
     """Advance the generation and drop RUNNING -> ARMED (§80.2/§82).
 
     This is a policy-semantic failure, not a hardware fault: the robot is left
-    ARMED (command quiescence) rather than FAULT.
+    ARMED (command quiescence) rather than FAULT. The abort counters are flushed
+    immediately because the success-path ``flush_every`` is never reached once a
+    run aborts (the loop idles in ARMED), and the H0 gate reads these counters.
     """
     advance_run_generation(shared)
     if not transition(shared, SafetyState.ARMED):
@@ -202,6 +210,9 @@ def _abort_policy_run(shared: SharedStorage, reason: str, metrics: Metrics | Non
     logger.warning("coordinator: policy run aborted: %s", reason)
     if metrics is not None:
         metrics.increment(POLICY_ABORTS)
+        if metric is not None:
+            metrics.increment(metric)
+        metrics.flush(prefix="coordinator metrics")
 
 
 def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
@@ -231,6 +242,10 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
         shared.is_running.value
         and int(shared.safety_state.value) != int(SafetyState.ARMED)
     ):
+        # Keep the heartbeat fresh while blocked: arm/inference readiness can
+        # exceed the 1.0s policy timeout, and run_supervisor starts checking
+        # heartbeats immediately after Main arms (mirrors the hand_process wait).
+        shared.set_heartbeat("policy", time.monotonic())
         if bool(shared.error_state.value) or bool(shared.estop_request.value):
             return
         time.sleep(0.01)
@@ -258,7 +273,11 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     last_published_hand_cmd: np.ndarray | None = (
         _seed_hand_reference(shared) if config.deployment.hand_enabled else None
     )
-    last_valid_policy_command_ns = time.monotonic_ns()
+    # Command-to-command silence reference. ``None`` until the first publish so
+    # the slow first inference (forced reset + encode + infer after the
+    # RUNNING-entry generation advance) is not charged against the silence
+    # budget (§82).
+    last_valid_policy_command_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
     running = True
 
@@ -276,10 +295,16 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            # Command silence watchdog (§82).
-            if now_ns - last_valid_policy_command_ns > max_silence_ns:
-                _abort_policy_run(shared, "command silence timeout", metrics)
-                metrics.increment(COMMAND_SILENCE_ABORT)
+            # Command silence watchdog (§82): command-to-command only, armed at
+            # the first publish, so first-command inference latency is not
+            # charged against the budget.
+            if (
+                last_valid_policy_command_ns is not None
+                and now_ns - last_valid_policy_command_ns > max_silence_ns
+            ):
+                _abort_policy_run(
+                    shared, "command silence timeout", metrics, metric=COMMAND_SILENCE_ABORT
+                )
                 running = False
                 active_plan = None
                 continue
@@ -332,6 +357,14 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             # Coupled-hand preflight before the arm endpoint is enqueued, so a
             # rejected hand command desyncs nothing (§74). Violation aborts.
             if hand_qpos is not None:
+                if last_published_hand_cmd is None:
+                    # First coupled command: (re)seed the delta reference from
+                    # measured feedback. A coupled endpoint is never published
+                    # without a command-to-command delta bound (§74).
+                    last_published_hand_cmd = _seed_hand_reference(shared)
+                    if last_published_hand_cmd is None:
+                        _sleep_tick(period_s, tick_start)
+                        continue
                 error = _preflight_hand(hand_qpos, last_published_hand_cmd, config)
                 if error is not None:
                     _abort_policy_run(shared, f"hand command delta violation: {error}", metrics)
@@ -364,8 +397,12 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 if reject_reason:
                     # SafetyGate rejection is a policy-semantic failure (§80.2):
                     # the model proposed an invalid endpoint. Abort immediately.
-                    metrics.increment(SAFETY_REJECTIONS)
-                    _abort_policy_run(shared, f"safety gate rejection: {reject_reason[0]}", metrics)
+                    _abort_policy_run(
+                        shared,
+                        f"safety gate rejection: {reject_reason[0]}",
+                        metrics,
+                        metric=SAFETY_REJECTIONS,
+                    )
                     running = False
                     active_plan = None
                     continue

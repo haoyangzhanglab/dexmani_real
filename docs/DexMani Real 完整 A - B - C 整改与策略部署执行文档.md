@@ -3759,7 +3759,6 @@ max_plan_age_s
 max_command_silence_s
 action_validity_s
 
-max_chunk_steps
 hand_enabled
 ```
 

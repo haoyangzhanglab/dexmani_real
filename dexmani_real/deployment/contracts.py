@@ -12,7 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 import numpy as np
 
 from dexmani_real.deployment.observation import ObservationBatch, _freeze
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE, MAX_POLICY_CHUNK_STEPS
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,10 @@ class JointActionChunk:
         n = arm.shape[0]
         if n == 0:
             raise ValueError("JointActionChunk must have at least one step")
+        if n > MAX_POLICY_CHUNK_STEPS:
+            raise ValueError(
+                f"JointActionChunk has {n} steps; transport capacity is {MAX_POLICY_CHUNK_STEPS}"
+            )
 
         hand = self.hand_qpos
         if hand is not None:

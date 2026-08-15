@@ -10,11 +10,30 @@ rather than fabricating a value.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dexmani_real.deployment.config import DeploymentConfig
+
+
+def sha256_file(path: str | Path) -> str:
+    """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
+
+    Best-effort: §96 logs the checkpoint/model-config hash "if available"; an
+    unreadable file logs empty rather than failing startup (the backend load is
+    the authoritative check for a bad checkpoint).
+    """
+    try:
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
 
 
 def log_deployment_provenance(

@@ -40,6 +40,12 @@ from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS, POLICY_PLAN_DTYPE
 
 logger = get_logger(__name__)
 
+# Poll delay while a required modality has no causal feedback yet. Non-zero so
+# the no-feedback continue paths (arm_history/hand_history None) do not busy-spin
+# a CPU core during the startup transient; small so readiness is picked up
+# promptly (§81).
+_NO_FEEDBACK_POLL_S = 0.005
+
 
 def publish_plan(
     shared: SharedStorage,
@@ -182,6 +188,10 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     backend.load()  # raises -> process failure (no dummy safe mode)
 
     shared.set_ready("inference")
+    # Refresh right after ready: backend.load() can exceed the 5.0s inference
+    # heartbeat timeout, and run_supervisor starts checking heartbeats
+    # immediately after wait_subsystem_ready returns (§81).
+    shared.set_heartbeat("inference", time.monotonic())
     logger.info("inference_loop: ready (backend=%s)", config.backend_target)
 
     step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
@@ -195,6 +205,10 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     try:
         while shared.is_running.value:
             tick_start = time.monotonic()
+            # Heartbeat every tick so the no-feedback continue paths and the
+            # first (potentially slow) inference never leave a stale heartbeat
+            # that run_supervisor reads as a dead worker (§81).
+            shared.set_heartbeat("inference", time.monotonic())
 
             run_generation = int(shared.run_generation.value)
             if run_generation != last_generation:
@@ -211,8 +225,10 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 anchor_ns=anchor_ns,
             )
             if observation.arm_history is None:
+                time.sleep(_NO_FEEDBACK_POLL_S)
                 continue  # no causal arm feedback yet — never publish garbage
             if config.hand_enabled and observation.hand_history is None:
+                time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
             metrics.increment(OBSERVATIONS_BUILT)
 
@@ -239,7 +255,6 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 # is the eventual abort backstop.
                 logger.warning("inference: bad model output dropped: %s", exc)
                 metrics.increment(INFERENCE_FAILURES)
-                shared.set_heartbeat("inference", time.monotonic())
                 continue
 
             plan_id += 1
@@ -248,8 +263,6 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
             else:
                 metrics.increment(PLANS_GENERATION_DROPPED)
                 logger.debug("inference: plan %d dropped (generation advanced)", plan_id)
-
-            shared.set_heartbeat("inference", time.monotonic())
 
             last_metrics_flush_ns = flush_every(
                 metrics, last_ns=last_metrics_flush_ns, prefix="inference metrics"
