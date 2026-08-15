@@ -46,6 +46,7 @@ if str(_repo_root) not in sys.path:
 from dexmani_real import ASSET_DIR, PACKAGE_DIR
 from dexmani_real.planning.pose_utils import forward_from_quat_wxyz, normalize_quat_wxyz
 from dexmani_real.recording.transaction import atomic_json_dump
+from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, vr_loop
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
 from dexmani_real.teleop.vr_transform import (
@@ -260,10 +261,9 @@ def main() -> None:
     # ── Start VR receiver ──
     ctx = mp.get_context("spawn")
     shared = SharedStorage.create(prefix="dexmani_vr_calib", config=SharedStorageConfig(), mp_context=ctx)
-    vr_proc = ctx.Process(
-        target=vr_loop, args=(shared, VRReceiverConfig(port=args.port)), name="vr-calib", daemon=True,
-    )
-    vr_proc.start()
+    specs = [WorkerSpec("vr-calib", vr_loop, (shared, VRReceiverConfig(port=args.port)), ready_name="vr", daemon=True)]
+    vr_proc = build_processes(ctx, specs)[0]
+    start_processes([vr_proc])
 
     # Wait for headset-on event (not just TCP connect).
     print("\n  Waiting for VR connection (up to 120 s) — put on Quest headset...", flush=True)

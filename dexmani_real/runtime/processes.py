@@ -6,7 +6,7 @@ import math
 import multiprocessing as mp
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.runtime.status import ExitReason
@@ -20,6 +20,36 @@ class ProcessExit:
     name: str
     exitcode: int | None
     escalation: str
+
+
+@dataclass(frozen=True)
+class WorkerSpec:
+    """One worker process to construct: name, target, args, readiness key.
+
+    ``ready_name`` is the SharedStorage readiness/heartbeat key (it may differ
+    from the OS process ``name``, e.g. a single "arm" worker named "arm-calib").
+    """
+
+    name: str
+    target: Callable[..., None]
+    args: tuple[Any, ...]
+    ready_name: str | None = None
+    daemon: bool = False
+
+
+def build_processes(context: Any, specs: Iterable[WorkerSpec]) -> list[Any]:
+    """Construct (but do not start) one process per spec."""
+    return [
+        context.Process(target=spec.target, args=spec.args, name=spec.name, daemon=spec.daemon)
+        for spec in specs
+    ]
+
+
+def start_processes(processes: Iterable[Any]) -> None:
+    """Start each process. Callers keep require_transition(DISARMED) between
+    build and start so worker processes never race the safety transition."""
+    for process in processes:
+        process.start()
 
 
 @dataclass(frozen=True)

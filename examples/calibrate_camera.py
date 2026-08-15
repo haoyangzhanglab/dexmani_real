@@ -77,6 +77,7 @@ from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
+from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig, read_arm_state_dict
 from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys, validate_arm_feedback
@@ -1072,13 +1073,9 @@ def main(argv: list[str] | None = None) -> int:
         config=SharedStorageConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    processes: list[Any] = []
-    arm_process = ctx.Process(
-        target=arm_loop, args=(shared, ArmLoopConfig.from_runtime(runtime)),
-        name="arm-calib", daemon=False,
-    )
-    processes.append(arm_process)
-    arm_process.start()
+    specs = [WorkerSpec("arm-calib", arm_loop, (shared, ArmLoopConfig.from_runtime(runtime)), ready_name="arm")]
+    processes = build_processes(ctx, specs)
+    start_processes(processes)
     arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
     if not wait_subsystem_ready(shared, [("arm", arm_timeout_s)], processes):
         _set_fault(shared, "arm worker did not become ready")

@@ -64,7 +64,12 @@ from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition
-from dexmani_real.runtime.processes import ShutdownReport
+from dexmani_real.runtime.processes import (
+    ShutdownReport,
+    WorkerSpec,
+    build_processes,
+    start_processes,
+)
 from dexmani_real.runtime.supervisor import (shutdown_processes,
                                              wait_subsystem_ready)
 from dexmani_real.shm.shared_storage import (SharedStorage,
@@ -1635,21 +1640,23 @@ def run_live_replay(
     try:
         arm_config = ArmLoopConfig.from_runtime(runtime)
         hand_available = trajectory.has_hand and not config.no_hand
-        processes.append(context.Process(target=_arm_loop, args=(shared, arm_config), name="arm", daemon=False))
+        specs = [WorkerSpec("arm", _arm_loop, (shared, arm_config), ready_name="arm")]
         if hand_available:
             from dexmani_real.robot.hand_process import HandProcessConfig
 
             hand_config = HandProcessConfig.from_runtime(runtime)
-            processes.append(context.Process(target=_hand_loop, args=(shared, hand_config), name="hand", daemon=False))
+            specs.append(WorkerSpec("hand", _hand_loop, (shared, hand_config), ready_name="hand"))
 
         require_transition(shared, SafetyState.DISARMED)
-        for process in processes:
-            process.start()
+        processes = build_processes(context, specs)
+        start_processes(processes)
 
         timeouts = runtime.safety.readiness_timeouts_s
-        ready_checks: list[tuple[str, float]] = [("arm", float(timeouts["arm"]))]
-        if hand_available:
-            ready_checks.append(("hand", float(timeouts["hand"])))
+        ready_checks = [
+            (spec.ready_name, float(timeouts[spec.ready_name]))
+            for spec in specs
+            if spec.ready_name
+        ]
         workers_ready = wait_subsystem_ready(shared, ready_checks, processes)
         if not workers_ready:
             shared.error_state.value = True

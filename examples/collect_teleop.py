@@ -43,10 +43,16 @@ from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
-from dexmani_real.runtime.session import ManagedProcessGroup
+from dexmani_real.runtime.processes import (
+    ShutdownReport,
+    WorkerSpec,
+    build_processes,
+    start_processes,
+)
 from dexmani_real.runtime.supervisor import (
     print_health_summary,
     run_supervisor,
+    shutdown_processes,
     wait_subsystem_ready,
 )
 from dexmani_real.sensor.camera_process import CameraLoopConfig
@@ -208,7 +214,7 @@ def _print_session_header(
     hand_enabled: bool,
     recording_enabled: bool,
 ) -> None:
-    process_labels = ["vr", "policy", "arm"]
+    process_labels = ["arm", "vr", "policy"]
     if recording_enabled:
         process_labels.extend(("camera", "recorder"))
     if hand_enabled:
@@ -237,7 +243,6 @@ def _print_session_header(
 def _build_processes(
     shared: SharedStorage,
     runtime: ResolvedRuntimeConfig,
-    context: Any,
     *,
     repo_root: Path,
     task_label: str,
@@ -245,24 +250,20 @@ def _build_processes(
     provenance: tuple[tuple[str, str], ...],
     hand_enabled: bool,
     recording_enabled: bool,
-) -> list[Any]:
+) -> list[WorkerSpec]:
     policy_config = TeleopConfig.from_runtime(
         runtime,
         task_label=task_label,
         operator=operator,
         hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
     )
-    processes = [
-        context.Process(
-            target=_vr_loop, args=(shared, VRReceiverConfig.from_runtime(runtime)), name="vr", daemon=False
-        ),
-        context.Process(target=teleop_loop, args=(shared, policy_config), name="policy", daemon=False),
-        context.Process(
-            target=_arm_loop,
-            args=(shared, ArmLoopConfig.from_runtime(runtime)),
-            name="arm",
-            daemon=False,
-        ),
+    # Readiness order is the single source of truth for build order and for the
+    # readiness/heartbeat names derived from it (arm → vr → policy → camera →
+    # recorder → hand).
+    specs = [
+        WorkerSpec("arm", _arm_loop, (shared, ArmLoopConfig.from_runtime(runtime)), ready_name="arm"),
+        WorkerSpec("vr", _vr_loop, (shared, VRReceiverConfig.from_runtime(runtime)), ready_name="vr"),
+        WorkerSpec("policy", teleop_loop, (shared, policy_config), ready_name="policy"),
     ]
     if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
@@ -275,59 +276,11 @@ def _build_processes(
             provenance=provenance,
             writer_queue_size=int(runtime.camera.writer_queue_size),
         )
-        processes.append(
-            context.Process(target=_camera_loop, args=(shared, camera_config), name="camera", daemon=False)
-        )
-        processes.append(
-            context.Process(target=recorder_io_loop, args=(shared, recorder_config), name="recorder", daemon=False)
-        )
+        specs.append(WorkerSpec("camera", _camera_loop, (shared, camera_config), ready_name="camera"))
+        specs.append(WorkerSpec("recorder", recorder_io_loop, (shared, recorder_config), ready_name="recorder"))
     if hand_enabled:
-        processes.append(
-            context.Process(
-                target=_hand_loop,
-                args=(shared, HandProcessConfig.from_runtime(runtime)),
-                name="hand",
-                daemon=False,
-            )
-        )
-    return processes
-
-
-def _readiness_checks(
-    runtime: ResolvedRuntimeConfig,
-    *,
-    hand_enabled: bool,
-    recording_enabled: bool,
-) -> list[tuple[str, float]]:
-    timeouts = runtime.safety.readiness_timeouts_s
-    checks = [
-        ("arm", float(timeouts["arm"])),
-        ("vr", float(timeouts["vr"])),
-        ("policy", float(timeouts["policy"])),
-    ]
-    if recording_enabled:
-        checks.extend(
-            (
-                ("camera", float(timeouts["camera"])),
-                ("recorder", float(timeouts["recorder"])),
-            )
-        )
-    if hand_enabled:
-        checks.append(("hand", float(timeouts["hand"])))
-    return checks
-
-
-def _heartbeat_names(
-    *,
-    hand_enabled: bool,
-    recording_enabled: bool,
-) -> list[str]:
-    names = ["arm", "policy", "vr"]
-    if recording_enabled:
-        names += ["camera", "recorder"]
-    if hand_enabled:
-        names.append("hand")
-    return names
+        specs.append(WorkerSpec("hand", _hand_loop, (shared, HandProcessConfig.from_runtime(runtime)), ready_name="hand"))
+    return specs
 
 
 def _recording_session_issue(shared: SharedStorage) -> str | None:
@@ -450,14 +403,14 @@ def run_teleop_experiment(
         config=SharedStorageConfig.from_runtime(runtime),
         mp_context=ctx,
     )
+    specs: list[WorkerSpec] = []
     procs: list[Any] = []
-    group: ManagedProcessGroup | None = None
+    shutdown_report: ShutdownReport | None = None
     shared_closed = False
     try:
-        procs = _build_processes(
+        specs = _build_processes(
             shared,
             runtime,
-            ctx,
             repo_root=repo_root,
             task_label=task_label,
             operator=operator,
@@ -465,19 +418,16 @@ def run_teleop_experiment(
             hand_enabled=hand_enabled,
             recording_enabled=recording_enabled,
         )
-        group = ManagedProcessGroup(
-            shared,
-            procs,
-            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-        )
+        procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
-        group.start()
+        start_processes(procs)
 
-        ready_checks = _readiness_checks(
-            runtime,
-            hand_enabled=hand_enabled,
-            recording_enabled=recording_enabled,
-        )
+        timeouts = runtime.safety.readiness_timeouts_s
+        ready_checks = [
+            (spec.ready_name, float(timeouts[spec.ready_name]))
+            for spec in specs
+            if spec.ready_name
+        ]
 
         for name, timeout in ready_checks:
             if name == "vr":
@@ -486,7 +436,9 @@ def run_teleop_experiment(
         if not wait_subsystem_ready(shared, ready_checks, procs):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
-            shutdown_report = group.shutdown()
+            shutdown_report = shutdown_processes(
+                shared, procs, graceful_timeout_s=float(runtime.safety.shutdown_timeout_s)
+            )
             shared_closed = shutdown_report.shared_closed
             return 1
 
@@ -508,7 +460,9 @@ def run_teleop_experiment(
                 logger.error("preflight health failed: %s", issue)
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
-            shutdown_report = group.shutdown()
+            shutdown_report = shutdown_processes(
+                shared, procs, graceful_timeout_s=float(runtime.safety.shutdown_timeout_s)
+            )
             shared_closed = shutdown_report.shared_closed
             return 1
 
@@ -519,11 +473,8 @@ def run_teleop_experiment(
             f"Controls: B={begin_label}  C=pause  S=stop  D=discard  H=home  Q=quit  ESC=estop\n"
         )
 
-        process_names = [process.name for process in procs]
-        heartbeat_names = _heartbeat_names(
-            hand_enabled=hand_enabled,
-            recording_enabled=recording_enabled,
-        )
+        process_names = [spec.name for spec in specs]
+        heartbeat_names = process_names
 
         start_time = time.monotonic()
         exit_reason, normal_exit = run_supervisor(
@@ -536,7 +487,12 @@ def run_teleop_experiment(
         )
 
         recording_issue = _recording_session_issue(shared) if recording_enabled else None
-        shutdown_report = group.shutdown(disarm_if_clean=normal_exit)
+        shutdown_report = shutdown_processes(
+            shared,
+            procs,
+            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+            disarm_if_clean=normal_exit,
+        )
         shared_closed = shutdown_report.shared_closed
         clean_exit = normal_exit and shutdown_report.clean and recording_issue is None
         if normal_exit and not clean_exit:
@@ -567,24 +523,30 @@ def run_teleop_experiment(
         return 1
     finally:
         # RecorderIO may still be validating and publishing an episode transaction.
-        if group is not None:
-            try:
-                shutdown_report = group.shutdown()
-                shared_closed = shutdown_report.shared_closed
-            except RuntimeError:
-                logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
-                raise
-        if group is None:
-            try:
-                shared_closed = bool(shared.close())
-                if not shared_closed:
+        if shutdown_report is None:
+            started = [process for process in procs if process.pid is not None]
+            if started:
+                try:
+                    shutdown_report = shutdown_processes(
+                        shared,
+                        started,
+                        graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                    )
+                    shared_closed = shutdown_report.shared_closed
+                except RuntimeError:
+                    logger.critical("child process remains alive; leaving SharedStorage linked", exc_info=True)
+                    raise
+            else:
+                try:
+                    shared_closed = bool(shared.close())
+                    if not shared_closed:
+                        shared.error_state.value = True
+                        transition(shared, SafetyState.FAULT)
+                        logger.error("SharedStorage cleanup was incomplete")
+                except Exception:
+                    logger.warning("SharedStorage cleanup failed", exc_info=True)
                     shared.error_state.value = True
                     transition(shared, SafetyState.FAULT)
-                    logger.error("SharedStorage cleanup was incomplete")
-            except Exception:
-                logger.warning("SharedStorage cleanup failed", exc_info=True)
-                shared.error_state.value = True
-                transition(shared, SafetyState.FAULT)
 
 
 if __name__ == "__main__":

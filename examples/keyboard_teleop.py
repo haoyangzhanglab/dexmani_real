@@ -37,6 +37,7 @@ from dexmani_real.robot.arm_sdk import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
+from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.shm.shared_storage import (
     SharedStorage,
@@ -203,14 +204,12 @@ def _start_workers(
     *,
     hand_requested: bool,
 ) -> tuple[Any, Any | None, bool]:
-    arm_process = context.Process(
-        target=arm_loop,
-        args=(shared, ArmLoopConfig.from_runtime(runtime)),
-        name="arm",
-        daemon=False,
+    arm_spec = WorkerSpec(
+        "arm", arm_loop, (shared, ArmLoopConfig.from_runtime(runtime)), ready_name="arm"
     )
+    arm_process = build_processes(context, [arm_spec])[0]
     processes.append(arm_process)
-    arm_process.start()
+    start_processes([arm_process])
     arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
     if not wait_subsystem_ready(
         shared, [("arm", arm_timeout_s)], processes
@@ -220,17 +219,15 @@ def _start_workers(
     if not hand_requested:
         return arm_process, None, False
 
-    hand_process = context.Process(
-        target=hand_loop,
-        args=(
-            shared,
-            HandProcessConfig.from_runtime(runtime, startup_failure_is_fatal=True),
-        ),
-        name="hand",
-        daemon=False,
+    hand_spec = WorkerSpec(
+        "hand",
+        hand_loop,
+        (shared, HandProcessConfig.from_runtime(runtime, startup_failure_is_fatal=True)),
+        ready_name="hand",
     )
+    hand_process = build_processes(context, [hand_spec])[0]
     processes.append(hand_process)
-    hand_process.start()
+    start_processes([hand_process])
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["hand"])
     while (
         hand_process.is_alive()
