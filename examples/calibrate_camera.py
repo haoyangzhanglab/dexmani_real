@@ -1076,6 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
     specs = [WorkerSpec("arm-calib", arm_loop, (shared, ArmLoopConfig.from_runtime(runtime)), ready_name="arm")]
     processes = build_processes(ctx, specs)
     start_processes(processes)
+    arm_process = processes[0]
     arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
     if not wait_subsystem_ready(shared, [("arm", arm_timeout_s)], processes):
         _set_fault(shared, "arm worker did not become ready")
