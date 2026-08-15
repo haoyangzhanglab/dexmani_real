@@ -368,6 +368,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     hand_home_qpos_rad = np.deg2rad(np.asarray(cfg.runtime.hand.home_qpos_deg, dtype=np.float64))
     hand_qpos_lower_rad = np.asarray(cfg.runtime.hand.qpos_min_rad, dtype=np.float64)
     hand_qpos_upper_rad = np.asarray(cfg.runtime.hand.qpos_max_rad, dtype=np.float64)
+    hand_mechanical_lower_rad = np.asarray(cfg.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64)
+    hand_mechanical_upper_rad = np.asarray(cfg.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64)
 
     try:
         urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
@@ -1303,6 +1305,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     hand_qpos_lower_rad,
                     hand_qpos_upper_rad,
                     cfg.runtime.hand.max_delta_rad,
+                    hand_mechanical_lower_rad,
+                    hand_mechanical_upper_rad,
                 )
             except ValueError as exc:
                 _validate_warn("teleop_loop: invalid hand command — holding: %s", exc)

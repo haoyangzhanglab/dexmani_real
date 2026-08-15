@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from dexmani_real.utils.schema import HAND_JOINT_SHAPE
+from dexmani_real.policy.safety import validate_hand_command_delta
 from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
@@ -20,43 +21,34 @@ def _sanitize_hand_command(
     lower: np.ndarray,
     upper: np.ndarray,
     max_delta_rad: float | None,
+    mechanical_lower: np.ndarray,
+    mechanical_upper: np.ndarray,
 ) -> np.ndarray:
     """Validate one hand target without modifying any joint endpoint.
 
     Enforces, at the controller (before publication): well-formed shape, finite
-    values, commanded joint limits, and the command-to-command delta bound.
-    This is the *graceful-hold* boundary — a violation raises so the loop marks
-    ``hand_cmd_valid=False`` / ``retarget_ok=False`` and holds arm + hand
-    together, instead of letting ``SafetyGate.validate`` turn an out-of-limit
-    hand command into a sticky fault, or letting a command-to-command delta
-    violation desync the arm (which would otherwise still move) from the hand.
+    values, commanded joint limits, the rated mechanical envelope, and the
+    command-to-command delta bound.  This is the *graceful-hold* boundary — a
+    violation raises so the loop marks ``hand_cmd_valid=False`` /
+    ``retarget_ok=False`` and holds arm + hand together, instead of letting
+    ``SafetyGate.validate`` turn an out-of-limit hand command into a sticky
+    fault, or letting a command-to-command delta violation desync the arm
+    (which would otherwise still move) from the hand.
 
     The command-to-command delta bound is not enforced anywhere else at the
     controller: ``SafetyGate`` dropped its velocity envelope (2026-08-12) and
     ``worker_validate_hand`` only discards the hand command after the arm has
     already been commanded.  Do not delete this check as "redundant".
     """
-    command = np.asarray(hand_cmd, dtype=np.float64)
-    previous = np.asarray(previous_hand_cmd, dtype=np.float64)
-    lower_bound = np.asarray(lower, dtype=np.float64)
-    upper_bound = np.asarray(upper, dtype=np.float64)
-    if command.shape != HAND_JOINT_SHAPE or previous.shape != HAND_JOINT_SHAPE:
-        raise ValueError(f"hand commands must have shape {HAND_JOINT_SHAPE}, got {command.shape} and {previous.shape}")
-    if lower_bound.shape != HAND_JOINT_SHAPE or upper_bound.shape != HAND_JOINT_SHAPE:
-        raise ValueError(f"hand command limits must have shape {HAND_JOINT_SHAPE}")
-    if not np.all(np.isfinite(np.concatenate((command, previous, lower_bound, upper_bound)))):
-        raise ValueError("hand command contains NaN or Inf")
-    if np.any(lower_bound > upper_bound):
-        raise ValueError("hand command limits must be ordered")
-    limit_tolerance_rad = 1e-12
-    if np.any(command < lower_bound - limit_tolerance_rad) or np.any(command > upper_bound + limit_tolerance_rad):
-        raise ValueError("hand command violates joint limits")
-    if max_delta_rad is not None:
-        if not np.isfinite(max_delta_rad) or max_delta_rad <= 0:
-            raise ValueError("hand_max_delta_rad must be finite and > 0")
-        if np.any(np.abs(command - previous) > max_delta_rad + 1e-12):
-            raise ValueError("hand command violates command-to-command delta limit")
-    return command.copy()
+    return validate_hand_command_delta(
+        hand_cmd,
+        previous_hand_cmd,
+        lower,
+        upper,
+        mechanical_lower,
+        mechanical_upper,
+        max_delta_rad,
+    )
 
 
 def _hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:

@@ -489,6 +489,9 @@ def publish_joint_targets(
     safety_gate: SafetyGate | None = None,
     wait_applied: bool = False,
     apply_timeout_s: float = 0.5,
+    hand_mechanical_lower_rad: np.ndarray | None = None,
+    hand_mechanical_upper_rad: np.ndarray | None = None,
+    hand_max_delta_rad: float | np.ndarray | None = None,
 ) -> Any | None:
     """Validate a joint-space target through the gate and publish it.
 
@@ -551,11 +554,17 @@ def publish_joint_targets(
     current_arm = np.asarray(arm_record["qpos"], dtype=np.float64)
 
     current_hand = np.zeros(12, dtype=np.float64)
+    previous_hand_cmd: np.ndarray | None = None
     hand_result = shared.hand_state_ring.read_latest()
     if hand_result is not None:
         hand_record = hand_result[0][0]
         if bool(hand_record["connected"]) and bool(hand_record["state_valid"]):
             current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
+            # The command-to-command delta reference is the last *accepted
+            # command*, not measured feedback (which may legitimately lag).
+            last_cmd = np.asarray(hand_record["last_cmd_qpos"], dtype=np.float64)
+            if last_cmd.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(last_cmd)):
+                previous_hand_cmd = last_cmd
     elif hand_qpos is not None:
         logger.warning(
             "publish_joint_targets: action_id=%d rejected: hand state ring is empty",
@@ -585,6 +594,40 @@ def publish_joint_targets(
             np.round(np.rad2deg(np.asarray(arm_qpos, dtype=np.float64)), 2).tolist(),
         )
         return None
+
+    # Coupled hand preflight: the gate only enforces operational limits.  Check
+    # the rated mechanical envelope and the command-to-command delta here
+    # (reject-whole, never clip) before the arm endpoint is enqueued, so a
+    # rejected hand command cannot desync the arm from the hand.
+    if gate_result.candidate.hand_qpos is not None:
+        mechanical_lower = (
+            np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
+            if hand_mechanical_lower_rad is None
+            else np.asarray(hand_mechanical_lower_rad, dtype=np.float64)
+        )
+        mechanical_upper = (
+            np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
+            if hand_mechanical_upper_rad is None
+            else np.asarray(hand_mechanical_upper_rad, dtype=np.float64)
+        )
+        try:
+            validate_hand_command_delta(
+                gate_result.candidate.hand_qpos,
+                previous_hand_cmd,
+                gate.hand_low,
+                gate.hand_high,
+                mechanical_lower,
+                mechanical_upper,
+                hand_max_delta_rad,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "publish_joint_targets: action_id=%d hand command rejected by "
+                "mechanical/delta preflight: %s",
+                action_id,
+                exc,
+            )
+            return None
 
     if not send_command(
         shared, gate_result.candidate, prepare_timeout_s=prepare_timeout_s
@@ -644,6 +687,87 @@ def publish_joint_targets(
 
 
 # ---------------------------------------------------------------------------
+# Hand command bound/delta preflight (shared by every coupled publish path)
+# ---------------------------------------------------------------------------
+
+
+def validate_hand_command_delta(
+    hand_cmd: np.ndarray,
+    previous: np.ndarray | None,
+    operational_lower: np.ndarray,
+    operational_upper: np.ndarray,
+    mechanical_lower: np.ndarray,
+    mechanical_upper: np.ndarray,
+    max_delta_rad: float | np.ndarray | None,
+) -> np.ndarray:
+    """Validate one hand target against operational + rated mechanical bounds
+    and (optionally) a command-to-command delta; reject-whole, never clip.
+
+    Shared preflight for every coupled hand path (teleop, replay, return-home).
+    ``previous`` is the last *accepted command* (``last_cmd_qpos``), not
+    measured feedback, so the delta bound is command-to-command — contact and
+    torque-limited steady-state lag are valid outcomes and must not reject a
+    valid next command.  Raises ``ValueError`` on any violation and returns a
+    copy otherwise.
+    """
+    command = np.asarray(hand_cmd, dtype=np.float64)
+    op_lower = np.asarray(operational_lower, dtype=np.float64)
+    op_upper = np.asarray(operational_upper, dtype=np.float64)
+    mech_lower = np.asarray(mechanical_lower, dtype=np.float64)
+    mech_upper = np.asarray(mechanical_upper, dtype=np.float64)
+    rated_lower = np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
+    rated_upper = np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
+
+    if command.shape != HAND_JOINT_SHAPE:
+        raise ValueError(
+            f"hand command must have shape {HAND_JOINT_SHAPE}, got {command.shape}"
+        )
+    for label, value in (
+        ("operational lower", op_lower),
+        ("operational upper", op_upper),
+        ("mechanical lower", mech_lower),
+        ("mechanical upper", mech_upper),
+    ):
+        if value.shape != HAND_JOINT_SHAPE:
+            raise ValueError(f"hand {label} limits must have shape {HAND_JOINT_SHAPE}")
+    if not np.all(
+        np.isfinite(np.concatenate((command, op_lower, op_upper, mech_lower, mech_upper)))
+    ):
+        raise ValueError("hand command and limit arrays must be finite")
+    if np.any(op_lower > op_upper) or np.any(mech_lower > mech_upper):
+        raise ValueError("hand operational and mechanical limits must be ordered")
+    if np.any(mech_lower < rated_lower) or np.any(mech_upper > rated_upper):
+        raise ValueError("hand mechanical limits cannot exceed the rated device envelope")
+    if np.any(op_lower < mech_lower) or np.any(op_upper > mech_upper):
+        raise ValueError("hand operational limits must be inside mechanical limits")
+    if np.any(command < op_lower - 1e-12) or np.any(command > op_upper + 1e-12):
+        raise ValueError("hand command violates operational joint limits")
+    if np.any(command < mech_lower - 1e-12) or np.any(command > mech_upper + 1e-12):
+        raise ValueError("hand command violates rated mechanical joint limits")
+
+    if max_delta_rad is not None:
+        if previous is None:
+            raise ValueError(
+                "hand command delta check requires a previous accepted command"
+            )
+        prev = np.asarray(previous, dtype=np.float64)
+        try:
+            max_delta = np.broadcast_to(
+                np.asarray(max_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE
+            )
+        except (TypeError, ValueError):
+            raise ValueError("hand max command delta must broadcast to twelve values") from None
+        if prev.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(prev)):
+            raise ValueError("hand previous command must be a finite 12-vector")
+        if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
+            raise ValueError("hand max command delta must be finite and positive")
+        if np.any(np.abs(command - prev) > max_delta + 1e-12):
+            raise ValueError("hand command violates command-to-command delta limit")
+
+    return command.copy()
+
+
+# ---------------------------------------------------------------------------
 # Hand homing utility (command acceptance only; no execution convergence gate)
 # ---------------------------------------------------------------------------
 
@@ -677,38 +801,20 @@ def publish_hand_home_and_wait_applied(
         raise ValueError(
             "hand home command acknowledgement timeout must be finite and positive"
         )
-    target = np.asarray(home_qpos, dtype=np.float64)
+    # Bound validation is shared with the other coupled hand paths; a
+    # violation raises (reject-whole, never clip).  Delta is not checked here:
+    # the milestone loop below enforces the command-to-command bound explicitly.
+    target = validate_hand_command_delta(
+        home_qpos,
+        None,
+        command_lower_rad,
+        command_upper_rad,
+        mechanical_lower_rad,
+        mechanical_upper_rad,
+        max_delta_rad=None,
+    )
     command_lower = np.asarray(command_lower_rad, dtype=np.float64)
     command_upper = np.asarray(command_upper_rad, dtype=np.float64)
-    mechanical_lower = np.asarray(mechanical_lower_rad, dtype=np.float64)
-    mechanical_upper = np.asarray(mechanical_upper_rad, dtype=np.float64)
-    rated_lower = np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
-    rated_upper = np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
-    vectors = (target, command_lower, command_upper, mechanical_lower, mechanical_upper)
-    if any(value.shape != HAND_JOINT_SHAPE for value in vectors):
-        raise ValueError(
-            f"hand home and limit arrays must have shape {HAND_JOINT_SHAPE}"
-        )
-    if not np.all(np.isfinite(np.concatenate(vectors))):
-        raise ValueError("hand home and limit arrays must be finite")
-    if np.any(command_lower > command_upper) or np.any(
-        mechanical_lower > mechanical_upper
-    ):
-        raise ValueError("hand command and mechanical limits must be ordered")
-    if np.any(mechanical_lower < rated_lower) or np.any(mechanical_upper > rated_upper):
-        raise ValueError(
-            "hand mechanical limits cannot exceed the rated device envelope"
-        )
-    if np.any(command_lower < mechanical_lower) or np.any(
-        command_upper > mechanical_upper
-    ):
-        raise ValueError("hand command limits must be inside mechanical limits")
-    if np.any(target < command_lower - 1e-12) or np.any(target > command_upper + 1e-12):
-        raise ValueError("hand home command violates operational joint limits")
-    if np.any(target < mechanical_lower - 1e-12) or np.any(
-        target > mechanical_upper + 1e-12
-    ):
-        raise ValueError("hand home command violates rated mechanical joint limits")
     deadline_s = time.monotonic() + timeout_s
     initial_result = shared.hand_state_ring.read_latest()
     if initial_result is None:

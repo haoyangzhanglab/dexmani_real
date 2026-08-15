@@ -1251,6 +1251,13 @@ class TrajectoryReplayer:
                     safety_gate=self._action_safety_gate,
                     wait_applied=is_final_frame,
                     apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
+                    hand_mechanical_lower_rad=np.asarray(
+                        self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+                    ),
+                    hand_mechanical_upper_rad=np.asarray(
+                        self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+                    ),
+                    hand_max_delta_rad=self.runtime.hand.max_delta_rad,
                 )
                 if published is None:
                     boundary = "publish/APPLIED" if is_final_frame else "publish"
