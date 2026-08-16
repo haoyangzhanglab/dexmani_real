@@ -841,9 +841,9 @@ class ReplayOutcome:
         return self.status in (ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT)
 
 
-def arm_error_requires_stop(error_code: int, recoverable_errors: tuple[int, ...]) -> bool:
-    """Only explicitly configured controller errors may continue to worker recovery."""
-    return error_code != 0 and error_code not in recoverable_errors
+def arm_error_requires_stop(error_code: int) -> bool:
+    """Any non-zero arm controller error is a stop condition (no worker recovery)."""
+    return error_code != 0
 
 
 def arm_feedback_issue(
@@ -1085,33 +1085,6 @@ class TrajectoryReplayer:
                 return False
         return False
 
-    def _wait_for_arm_recovery(
-        self,
-        keyboard: KeyboardHandler,
-        recoverable_errors: tuple[int, ...],
-    ) -> dict[str, Any] | None:
-        """Wait for worker-owned recovery without advancing the replay frame."""
-        assert self.shared is not None
-        assert self.runtime is not None
-        deadline = time.monotonic() + float(self.runtime.policy.action_apply_timeout_s)
-        max_age_s = float(self.runtime.policy.arm_state_stale_threshold_s)
-        while time.monotonic() < deadline:
-            if not self._poll_control(keyboard, _WAIT_POLL_INTERVAL_S):
-                return None
-            state = read_arm_state_dict(self.shared)
-            if arm_feedback_issue(state, max_age_s) is not None:
-                continue
-            assert state is not None
-            error_code = int(state["error_code"])
-            if error_code == 0:
-                return state
-            if arm_error_requires_stop(error_code, recoverable_errors):
-                self._fault(f"fatal arm controller error C{error_code}")
-                return None
-
-        self._fault("arm recovery timeout")
-        return None
-
     def run(self) -> ReplayOutcome:
         """Execute the replay loop and report its explicit terminal outcome."""
         frame_count = self._frame_count
@@ -1163,7 +1136,6 @@ class TrajectoryReplayer:
         self._running = True
         error_count = 0
         max_consecutive_errors = int(self.runtime.policy.max_consecutive_errors)
-        recoverable_errors = tuple(int(code) for code in self.runtime.arm.recoverable_errors)
         period_s = 1.0 / self.replay_hz
         next_deadline_s = time.perf_counter()
         start_time = next_deadline_s
@@ -1200,16 +1172,9 @@ class TrajectoryReplayer:
                 assert arm_state is not None
 
                 error_code = int(arm_state["error_code"])
-                if error_code != 0:
-                    if arm_error_requires_stop(error_code, recoverable_errors):
-                        self._fault(f"fatal arm controller error C{error_code}")
-                        break
-                    logger.warning("Frame %d: waiting for worker recovery from C%d", frame_idx, error_code)
-                    recovered_state = self._wait_for_arm_recovery(keyboard, recoverable_errors)
-                    if recovered_state is None:
-                        break
-                    arm_state = recovered_state
-                    next_deadline_s = time.perf_counter()
+                if arm_error_requires_stop(error_code):
+                    self._fault(f"fatal arm controller error C{error_code}")
+                    break
 
                 error_count = 0
                 hand_qpos: np.ndarray | None = None

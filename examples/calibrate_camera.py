@@ -640,8 +640,6 @@ def _run_calibration(
     """Interactive calibration control loop.  Returns 0 on success."""
     dt_s = 1.0 / float(runtime.keyboard_teleop.control_hz)
     heartbeat_timeout = float(runtime.safety.heartbeat_timeouts["arm"])
-    recoverable_errors = frozenset(int(c) for c in runtime.arm.recoverable_errors)
-    collision_errors = frozenset(int(c) for c in runtime.arm.collision_fault_errors)
     policy = runtime.policy
     idle_interval = int(runtime.keyboard_teleop.idle_interval_frames)
 
@@ -873,14 +871,8 @@ def _run_calibration(
                 continue
 
             error_code = int(state["error_code"])
-            if error_code in recoverable_errors:
-                if quit_requested:
-                    _set_fault(shared, f"cannot quit during recoverable arm error C{error_code}")
-                    return 1
-                continue
             if error_code != 0:
-                category = "collision" if error_code in collision_errors else "controller"
-                _set_fault(shared, f"arm {category} error C{error_code}")
+                _set_fault(shared, f"arm controller error C{error_code}")
                 return 1
 
             if quit_requested:

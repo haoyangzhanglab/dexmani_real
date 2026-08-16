@@ -1,12 +1,12 @@
 """Shared xArm SDK surface for the arm servo loop and homing execution.
 
 Holds the pieces both ``arm_loop.py`` (servo loop) and ``homing.py`` (homing
-execution) need without either owning them: the resolved ``ArmLoopConfig`` and
-the two leaf live-read primitives.  ``arm_loop`` imports from here, and so does
-``homing``; neither imports the other for these, so the dependency graph stays
-acyclic.  Live-status *composite* helpers (``_read_live_status``,
-``_wait_live_status``) remain in ``arm_loop`` because only the servo loop uses
-them.
+execution) need without either owning them: the resolved ``ArmLoopConfig``, the
+live-read primitives, and the controller state-transition leaf helpers
+(``enter_mode0`` / ``enter_mode6`` / ``stop_controller``).  ``arm_loop`` imports
+from here, and so does ``homing``; neither imports the other for these, so the
+dependency graph stays acyclic.  None of these helpers read or write
+``SharedStorage`` or make policy decisions.
 """
 
 from __future__ import annotations
@@ -51,12 +51,6 @@ class ArmLoopConfig:
     collision_sensitivity: int = field(
         default_factory=lambda: arm.collision_sensitivity
     )
-    recoverable_errors: frozenset[int] = field(
-        default_factory=lambda: arm.recoverable_errors
-    )
-    collision_fault_errors: frozenset[int] = field(
-        default_factory=lambda: arm.collision_fault_errors
-    )
     max_consecutive_recoveries: int = field(
         default_factory=lambda: safety.max_consecutive_recoveries
     )
@@ -99,16 +93,6 @@ class ArmLoopConfig:
             lower > upper
         ):
             raise ValueError("arm loop joint limits/home must be finite and ordered")
-        if self.recoverable_errors & self.collision_fault_errors:
-            raise ValueError(
-                "recoverable and collision-fault error codes must be disjoint"
-            )
-        if self.recoverable_errors != frozenset({24}) or not frozenset(
-            {22, 31}
-        ).issubset(self.collision_fault_errors):
-            raise ValueError(
-                "arm loop requires only C24 recoverable and C22/C31 collision-fatal"
-            )
         if self.max_consecutive_recoveries <= 0:
             raise ValueError("max_consecutive_recoveries must be positive")
         timing = (
@@ -152,10 +136,6 @@ class ArmLoopConfig:
             arm_ip=str(cfg.ip),
             home_qpos=tuple(cfg.home_qpos),
             collision_sensitivity=int(cfg.collision_sensitivity),
-            recoverable_errors=frozenset(int(code) for code in cfg.recoverable_errors),
-            collision_fault_errors=frozenset(
-                int(code) for code in cfg.collision_fault_errors
-            ),
             max_consecutive_recoveries=int(runtime.safety.max_consecutive_recoveries),
             homing_convergence_rad=float(cfg.homing.convergence_rad),
             homing_step_interval_s=float(cfg.homing.step_interval_s),
@@ -170,7 +150,6 @@ class ArmLoopConfig:
         )
 
 
-# Controller errors: C24 is recoverable; C22/C31 are immediate collision faults.
 def _require_sdk_ok(operation: str, code: Any) -> None:
     """Raise when an xArm setter reports failure without raising."""
     if not isinstance(code, (int, np.integer)) or int(code) != 0:

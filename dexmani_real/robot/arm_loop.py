@@ -21,8 +21,9 @@ from dexmani_real.robot.arm_sdk import (
     ArmLoopConfig,
     _read_live_error_code,
     _require_sdk_ok,
-    controller_state_allows_motion,
+    enter_mode0,
     enter_mode6,
+    read_live_state_and_error,
     stop_controller,
 )
 from dexmani_real.robot.homing import run_planned_homing
@@ -49,36 +50,6 @@ from dexmani_real.utils.schema import (
 )
 
 logger = get_logger(__name__)
-
-
-def _recover_c24_measured_hold(
-    arm_api: Any, cfg: ArmLoopConfig, *, operation_prefix: str = "C24"
-) -> np.ndarray:
-    """Clear one C24, read fresh joints, and send exactly one measured hold."""
-    _require_sdk_ok(f"{operation_prefix} clean_error", arm_api.clean_error())
-    _require_sdk_ok(f"{operation_prefix} clean_warn", arm_api.clean_warn())
-    # Collision disables motion at the controller; re-enable before re-entering
-    # Mode 6.  enter_mode6 also verifies the controller reaches a movable
-    # state before we read joints, so the measured hold never races an unready
-    # controller.
-    _require_sdk_ok(f"{operation_prefix} motion_enable", arm_api.motion_enable(True))
-    enter_mode6(arm_api)
-    state_code, measured = arm_api.get_joint_states(is_radian=True, num=1)
-    _require_sdk_ok(f"{operation_prefix} fresh get_joint_states", state_code)
-    measured_hold = np.asarray(measured[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
-    if measured_hold.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(measured_hold)):
-        raise RuntimeError(f"{operation_prefix} measured hold is invalid")
-    _require_sdk_ok(
-        f"{operation_prefix} measured hold",
-        arm_api.set_servo_angle(
-            angle=measured_hold,
-            is_radian=True,
-            speed=cfg.joint_max_speed_rad_per_s,
-            mvacc=cfg.joint_max_acc_rad_per_s2,
-            wait=False,
-        ),
-    )
-    return measured_hold.copy()
 
 
 def _parse_arm_action_metadata(
@@ -157,53 +128,79 @@ def _update_state_read_watchdog(counter: RetryCounter, *, succeeded: bool) -> bo
     return counter.triggered
 
 
-def _read_live_error_or_fail(arm_api: Any) -> int:
-    """Return the live controller error, or 1 (not-ready) if the read fails.
+_CONTROLLER_ERROR_LABELS: dict[int, str] = {
+    22: "self-collision",
+    24: "speed limit exceeded",
+    31: "collision current",
+}
 
-    Connect-recovery uses this: it must fail closed to a non-ready status when
-    the live read fails rather than trust the cached value and declare the
-    controller ready.
+
+def latch_arm_fault(
+    shared: Any,
+    arm: Any,
+    reason: str,
+    *,
+    api_code: int | None = None,
+    controller_error: int | None = None,
+    on_poll: Callable[[], None] | None = None,
+) -> None:
+    """Latch the single sticky arm fault and stop the controller.
+
+    Writes the sticky ``error_state`` first — before the stop attempt — so a
+    fault is never lost even if stopping raises.  ``api_code`` (SDK setter
+    return) and ``controller_error`` (live controller register) are distinct
+    namespaces and are logged separately.  Never calls ``clean_error`` and
+    never writes ``safety_state`` (Main/policy owns it).
     """
-    try:
-        return _read_live_error_code(arm_api)
-    except Exception:
-        return 1
-
-
-def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
-    details: Any = None
-    if error_code == 31 and hasattr(arm_api, "get_c31_error_info"):
+    shared.error_state.value = True
+    label = (
+        _CONTROLLER_ERROR_LABELS.get(controller_error, "")
+        if controller_error is not None
+        else ""
+    )
+    logger.error(
+        "arm_loop: latching fault: %s (api_code=%s, controller_error=%s%s, "
+        "mode=%s, state=%s)",
+        reason,
+        api_code,
+        controller_error,
+        f" {label}" if label else "",
+        getattr(arm, "mode", None),
+        getattr(arm, "state", None),
+    )
+    if controller_error == 31 and hasattr(arm, "get_c31_error_info"):
+        # C31 diagnostics (servo id / theoretical vs actual torque) are pure
+        # log output, never a control branch.
         try:
-            code, info = arm_api.get_c31_error_info()
-            if code == 0:
-                details = info
+            code, info = arm.get_c31_error_info()
         except Exception:
             logger.warning("arm_loop: failed to read C31 diagnostics", exc_info=True)
-    if (
-        error_code == 31
-        and isinstance(details, (list, tuple, np.ndarray))
-        and len(details) >= 3
-    ):
-        try:
-            servo_id = int(details[0])
-            theoretical_tau = float(details[1])
-            actual_tau = float(details[2])
-        except (TypeError, ValueError, OverflowError):
-            logger.error("arm_loop: collision fault C31 detected; details=%s", details)
         else:
-            logger.error(
-                "arm_loop: collision fault C31 detected; servo_id=%d "
-                "theoretical_tau=%.3f actual_tau=%.3f delta_tau=%.3f",
-                servo_id,
-                theoretical_tau,
-                actual_tau,
-                actual_tau - theoretical_tau,
-            )
-    else:
-        logger.error(
-            "arm_loop: collision fault C%d detected; details=%s", error_code, details
-        )
-    shared.error_state.value = True
+            if (
+                code == 0
+                and isinstance(info, (list, tuple, np.ndarray))
+                and len(info) >= 3
+            ):
+                try:
+                    servo_id = int(info[0])
+                    theoretical_tau = float(info[1])
+                    actual_tau = float(info[2])
+                except (TypeError, ValueError, OverflowError):
+                    logger.error("arm_loop: C31 diagnostics: %s", info)
+                else:
+                    logger.error(
+                        "arm_loop: C31 diagnostics: servo_id=%d theoretical_tau=%.3f "
+                        "actual_tau=%.3f delta_tau=%.3f",
+                        servo_id,
+                        theoretical_tau,
+                        actual_tau,
+                        actual_tau - theoretical_tau,
+                    )
+            else:
+                logger.error("arm_loop: C31 diagnostics: %s", info)
+    stop = stop_controller(arm, on_poll=on_poll)
+    if not stop.confirmed:
+        logger.error("arm_loop: fault stop not confirmed: %s", stop.reason)
 
 
 def _request_still_current_and_armed(shared: Any, request: HomeRequest) -> bool:
@@ -375,47 +372,47 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         shared.arm_device_identity.value = encoded_identity[:1023].ljust(1024, b"\x00")
 
     # Connect/configure while the application remains DISARMED. Motion mode is
-    # entered only on the ARMED edge below.
-    _CONNECT_MAX_RETRIES = 3
-    for _attempt in range(_CONNECT_MAX_RETRIES):
-        try:
-            _require_sdk_ok("startup clean_error", arm.clean_error())
-            _require_sdk_ok("startup clean_warn", arm.clean_warn())
-            _require_sdk_ok("startup motion_enable", arm.motion_enable(True))
-            time.sleep(0.3)
-            _require_sdk_ok("startup set_mode(0)", arm.set_mode(0))
-            time.sleep(0.1)
-            _require_sdk_ok("startup set_state(0)", arm.set_state(0))
-            time.sleep(0.3)
-            # Live read via get_err_warn_code() — more reliable than the cached
-            # .error_code property (background report thread, ~200ms refresh).
-            # A failed live read must fail closed (assume not-ready) rather than
-            # fall back to the cache and wrongly declare the controller ready.
-            _err = _read_live_error_or_fail(arm)
-            _state = getattr(arm, "state", -1)
-            if _err == 0 and controller_state_allows_motion(_state):
-                break
-            logger.warning(
-                "arm_loop: connect recovery attempt %d/%d: err=%s state=%s",
-                _attempt + 1,
-                _CONNECT_MAX_RETRIES,
-                _err,
-                _state,
-            )
-            time.sleep(0.5)
-        except Exception:
-            logger.warning(
-                "arm_loop: connect recovery attempt %d/%d raised exception",
-                _attempt + 1,
-                _CONNECT_MAX_RETRIES,
-                exc_info=True,
-            )
-            time.sleep(0.5)
-    else:
+    # entered only on the ARMED edge below.  Startup never clears a pre-existing
+    # controller error: read + record it first, and if non-zero, stop and exit
+    # without publishing readiness.
+    try:
+        _live = read_live_state_and_error(arm)
+    except Exception:
+        logger.error("arm_loop: startup live error/warn read failed", exc_info=True)
+        _publish_startup_fault("startup live error/warn read failed")
+        shared.error_state.value = True
+        _disconnect_arm(arm)
+        return
+    if _live.error_code != 0:
         logger.error(
-            "arm_loop: connect recovery failed after %d attempts", _CONNECT_MAX_RETRIES
+            "arm_loop: startup controller error C%d (warn=%d, state=%d) — "
+            "refusing to clear",
+            _live.error_code,
+            _live.warn_code,
+            _live.state,
         )
-        _publish_startup_fault("controller recovery failed")
+        _publish_startup_fault(f"startup controller error C{_live.error_code}")
+        shared.error_state.value = True
+        stop_controller(arm, on_poll=_heartbeat)
+        _disconnect_arm(arm)
+        return
+    if _live.warn_code != 0:
+        logger.warning(
+            "arm_loop: startup controller warn=%d (diagnostic only)", _live.warn_code
+        )
+
+    # A single non-retried state-change pass: motion-enable then Mode 0/State 0.
+    # ``enter_mode0`` verifies the controller reaches a movable, error-free
+    # state.  State changes are never retried; only the bounded reads below
+    # (initial joint state) may retry.
+    try:
+        _require_sdk_ok("startup motion_enable", arm.motion_enable(True))
+        enter_mode0(arm, on_poll=_heartbeat)
+    except Exception:
+        logger.error(
+            "arm_loop: startup motion/mode configuration failed", exc_info=True
+        )
+        _publish_startup_fault("controller configuration failed")
         shared.error_state.value = True
         _disconnect_arm(arm)
         return
@@ -504,7 +501,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     accepts_motion_commands = False
     last_safety_state = int(SafetyState.DISARMED)
     last_state_source_ns = time.monotonic_ns()
-    last_c24_s = float("-inf")
     terminal_feedback_detail: str | None = None
 
     # Publish initial state BEFORE arm_ready — consumers wait on arm_ready and
@@ -561,7 +557,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     stopped_cleanly = False
     try:
         while shared.is_running.value:
-            c24_recovered_this_tick = False
             # Heartbeat continues even when no new endpoint is being consumed.
             shared.set_heartbeat("arm", time.monotonic())
 
@@ -773,14 +768,15 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                                     mvacc=cfg.joint_max_acc_rad_per_s2,
                                     wait=False,
                                 )
-                            except Exception:
-                                logger.error(
-                                    "arm_loop: set_servo_angle raised", exc_info=True
+                            except Exception as exc:
+                                latch_arm_fault(
+                                    shared,
+                                    arm,
+                                    f"set_servo_angle raised: {exc}",
+                                    on_poll=_heartbeat,
                                 )
-                                shared.error_state.value = True
                                 break
                             if code == 0:
-                                _recovery_counter.reset()
                                 last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = (
                                     _parse_arm_action_metadata(action, _sdk_started_s)
                                 )
@@ -794,46 +790,30 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                                 )
                                 last_cmd_sdk_duration_s = time.monotonic() - _sdk_started_s
                             else:
+                                # A non-zero setter return is a terminal command
+                                # failure even when the live controller error is
+                                # 0 — record both namespaces, never continue.
                                 try:
                                     err_code = _read_live_error_code(arm)
                                 except Exception:
-                                    logger.error(
-                                        "arm_loop: live controller error read failed "
-                                        "after setter failure",
-                                        exc_info=True,
+                                    latch_arm_fault(
+                                        shared,
+                                        arm,
+                                        f"set_servo_angle failed (code={code}); "
+                                        "live error read failed",
+                                        api_code=code,
+                                        on_poll=_heartbeat,
                                     )
-                                    shared.error_state.value = True
                                     break
-                                if err_code in cfg.collision_fault_errors:
-                                    _latch_collision_fault(shared, arm, err_code)
-                                    break
-                                if err_code == 24:
-                                    now_s = time.monotonic()
-                                    if now_s - last_c24_s <= 2.0:
-                                        logger.error(
-                                            "arm_loop: second C24 inside 2s — latching fault"
-                                        )
-                                        shared.error_state.value = True
-                                        break
-                                    last_c24_s = now_s
-                                    try:
-                                        last_target = _recover_c24_measured_hold(arm, cfg)
-                                        c24_recovered_this_tick = True
-                                    except Exception:
-                                        logger.error(
-                                            "arm_loop: C24 measured-hold recovery failed",
-                                            exc_info=True,
-                                        )
-                                        shared.error_state.value = True
-                                        break
-                                else:
-                                    logger.error(
-                                        "arm_loop: SDK failure code=%d err=%d",
-                                        code,
-                                        err_code,
-                                    )
-                                    shared.error_state.value = True
-                                    break
+                                latch_arm_fault(
+                                    shared,
+                                    arm,
+                                    f"set_servo_angle failed (code={code})",
+                                    api_code=code,
+                                    controller_error=err_code,
+                                    on_poll=_heartbeat,
+                                )
+                                break
                 elif action is not None:
                     logger.error(
                         "arm_loop: rejecting malformed action queue item %r", action
@@ -891,7 +871,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
             # arm.error_code is an SDK cached property (background report thread
             # ~every 200ms), not a per-access network call.  A cached non-zero
-            # read drives a fault/C24 decision, so confirm it against the live
+            # read drives a fault decision, so confirm it against the live
             # controller register before acting; a failed live read fails closed
             # (latches the fault) rather than trusting the cache.
             try:
@@ -903,38 +883,22 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 try:
                     error_code = _read_live_error_code(arm)
                 except Exception:
-                    logger.error(
-                        "arm_loop: live error read failed — latching fault",
-                        exc_info=True,
+                    latch_arm_fault(
+                        shared,
+                        arm,
+                        "live controller error read failed",
+                        on_poll=_heartbeat,
                     )
-                    shared.error_state.value = True
                     break
 
-            if error_code in cfg.collision_fault_errors:
-                _latch_collision_fault(shared, arm, error_code)
-                break
-            elif error_code in cfg.recoverable_errors and not c24_recovered_this_tick:
-                # A C24 observed through the state stream follows the same bounded
-                # recovery as a command return: discard the old endpoint, recover
-                # Mode 6, read fresh feedback, then issue exactly one measured hold.
-                now_s = time.monotonic()
-                if now_s - last_c24_s <= 2.0:
-                    logger.error("arm_loop: repeated C24 inside 2s — latching fault")
-                    shared.error_state.value = True
-                    break
-                last_c24_s = now_s
-                try:
-                    last_target = _recover_c24_measured_hold(
-                        arm, cfg, operation_prefix="state C24"
-                    )
-                except Exception:
-                    logger.error(
-                        "arm_loop: state C24 measured-hold recovery failed", exc_info=True
-                    )
-                    shared.error_state.value = True
-                    break
-            elif error_code != 0 and not (c24_recovered_this_tick and error_code == 24):
-                shared.error_state.value = True
+            if error_code != 0:
+                latch_arm_fault(
+                    shared,
+                    arm,
+                    f"controller error C{error_code}",
+                    controller_error=error_code,
+                    on_poll=_heartbeat,
+                )
                 break
 
             # Publish state

@@ -297,10 +297,6 @@ def _run_control_loop(
         current_qpos,
     )
 
-    recoverable_errors = frozenset(int(code) for code in runtime.arm.recoverable_errors)
-    collision_errors = frozenset(
-        int(code) for code in runtime.arm.collision_fault_errors
-    )
     heartbeat_timeouts = dict(runtime.safety.heartbeat_timeouts)
     rate = RateManager(float(cfg.control_hz))
     state_failures = 0
@@ -372,12 +368,8 @@ def _run_control_loop(
 
         state_failures = 0
         error_code = int(state["error_code"])
-        if error_code in recoverable_errors:
-            if not quit_requested:
-                continue
-        elif error_code != 0:
-            category = "collision" if error_code in collision_errors else "controller"
-            _set_fault(shared, f"arm {category} error C{error_code}")
+        if error_code != 0:
+            _set_fault(shared, f"arm controller error C{error_code}")
             return False
         if hand_enabled:
             hand_state = read_hand_state_dict(shared)

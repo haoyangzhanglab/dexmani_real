@@ -107,7 +107,7 @@ C 暂停期间到达，它们不会重复推进 generation，但会立即取消 
 紧停后备、全局停止或故障打断的回零路径，以及最终验证式退出。
 
 `is_hold` endpoint 并未从整个系统删除：IK/映射/工作空间拒绝、接触 stall 等运行期安全回退仍可显式
-保持既有安全目标，C24 也保留一次控制器错误专用的 fresh measured-hold 恢复。这些分支不属于普通暂停。
+保持既有安全目标。这些分支不属于普通暂停。
 
 ### 录制事务与时间语义
 
@@ -239,10 +239,10 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `robot/__init__.py` | 标识 xArm7、XHand 驱动和执行 worker 所在包。 |
-| `robot/arm_loop.py` | xArm Mode 6 伺服 worker：按 generation 读取有序臂命令、发布 FK 状态，并处理 C24 恢复与碰撞故障；DISARMED、FAULT、紧停后备与退出确认 State 4，成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
+| `robot/arm_loop.py` | xArm Mode 6 伺服 worker：按 generation 读取有序臂命令、发布 FK 状态；任意运行期 controller error 或终止性 SDK/API 失败进入单一 sticky fault 路径（不隐式清错）；DISARMED、FAULT、紧停后备与退出确认 State 4，成功初始化时收敛 SDK 冗余输出，失败时保留原生诊断。 |
 | `robot/arm_sdk.py` | 共享 xArm SDK 表面：`ArmLoopConfig`（Mode 6 在线轨迹规划配置，`from_runtime` 解析）与叶子级 live-read 原语 `_read_live_error_code`/`_require_sdk_ok`，供 `arm_loop.py`（伺服）与 `homing.py`（回零执行）共同使用，保持依赖无环。 |
 | `robot/hand_process.py` | XHand worker：读取 latest-wins 手指令、复核命令/机械限位、发布关节/触觉反馈与最后成功 action ID；不以目标—反馈不收敛判定故障。伺服 PID 增益与逐关节电流上限从 `config.defaults.HandParams` 解析（`kp`/`tor_max_ma` 逐关节，`ki`/`kd` 均匀）。 |
-| `robot/homing.py` | 回零编排与执行：`send_arm_home` 编排候选路径，`run_planned_homing` 为执行入口（Mode 0 里程碑 + 完成后恢复 Mode 6）；包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
+| `robot/homing.py` | 回零编排与执行：`send_arm_home` 编排候选路径，`run_planned_homing` 为执行入口（Mode 0 里程碑执行，返回 provisional 结果；Mode 6 恢复由 arm loop 单点 finalize）；包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
 | `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `utils/schema.py` 决定。 |
 | `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放；超过运行或厂商机械限位的命令整条拒绝，绝不隐式 clip，运行配置只能收紧而不能放宽额定机械包络；成功初始化时汇总原生 SDK 噪声，连接失败时回放完整诊断。 |

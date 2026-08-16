@@ -267,8 +267,6 @@ class ArmParams:
     # UFACTORY semantics: 0 disables detection; 1 is the least-sensitive
     # enabled level and sensitivity increases through level 5.
     collision_sensitivity: int = 1
-    recoverable_errors: frozenset[int] = frozenset({24})  # C24 speed-limit error only
-    collision_fault_errors: frozenset[int] = frozenset({22, 31})  # self-collision / collision current
 
     # ── TCP load (end-effector mass/COG for firmware dynamics) ──
     # XHand (1.1 kg). COG in tool-flange frame (link_eef) from URDF weighted-COM
@@ -311,12 +309,6 @@ class ArmParams:
             raise ValueError("tracking_error_warn_rad must be finite and positive")
         if not (0 <= self.collision_sensitivity <= 5):
             raise ValueError(f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]")
-        if self.recoverable_errors & self.collision_fault_errors:
-            raise ValueError("recoverable_errors and collision_fault_errors must be disjoint")
-        if self.recoverable_errors != frozenset({24}):
-            raise ValueError("C24 must be the only recoverable xArm controller error")
-        if not frozenset({22, 31}).issubset(self.collision_fault_errors):
-            raise ValueError("C22 and C31 must remain immediate collision faults")
         if not (np.isfinite(self.max_joint_velocity_deg_per_s) and 0 < self.max_joint_velocity_deg_per_s <= 500):
             raise ValueError(f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} out of range (0, 500]")
         if not (

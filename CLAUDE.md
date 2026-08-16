@@ -189,8 +189,8 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
   shutdown.
 - Command quiescence is not a ban on every `is_hold` endpoint. IK/mapping/
   workspace rejection and contact-stall recovery may still publish an explicit
-  safe fallback endpoint; C24 recovery may send one freshly read measured hold.
-  Those are active safety/error-recovery actions, not ordinary pause behavior.
+  safe fallback endpoint. Those are active safety/error-recovery actions, not
+  ordinary pause behavior.
 - VR transform schema v1 is validated in Main before SharedStorage/process
   creation and again in the teleop worker. It must be a proper SO(3) rotation
   with the declared convention and machine-readable non-POOR quality metadata.
@@ -283,18 +283,19 @@ aligned samples → RecorderIO → temporary episode + stream verification
 ### Hardware facts that change engineering decisions
 
 - xArm Mode 6 is the normal servo mode; firmware is the final collision/current
-  safety backstop. C22/C31 are immediate faults; C24 has bounded measured-hold
-  recovery, with another C24 inside 2 seconds becoming a sticky fault. Homing
-  uses a separately validated Mode 0 milestone path.
-- Controller error classification for control decisions (setter-failure
-  classification, homing restore decision, homing milestone check) reads the
-  live `get_err_warn_code()` via `_read_live_error_code`, never the cached
+  safety backstop. Any runtime controller error (C22/C24/C31 or a terminal
+  setter/API failure) enters the single sticky fault path; the arm worker never
+  clears a controller error implicitly. Homing uses a separately validated Mode 0
+  milestone path.
+- Control decisions that depend on the controller error register (capturing the
+  controller error behind a setter failure, confirming a cached non-zero error,
+  the homing restore decision, the homing milestone check) read the live
+  `get_err_warn_code()` via `_read_live_error_code`, never the cached
   `arm.error_code`; a live-read failure fails closed. Steady-state telemetry
   may still report the cached value.
 - Arm cleanup confirms the physical stop (state 4) without requiring a zero
   controller error: a fault exit leaves a latched non-zero error, so
-  `_wait_live_status(..., require_error_clear=False)` confirms the stop rather
-  than hanging on the latched error.
+  `stop_controller` confirms the stop rather than hanging on the latched error.
 - Arm feedback is valid only when both the SDK state read and URDF FK succeed.
   FK failure publishes NaN EEF with `state_valid=0`; persistent failure uses the
   same bounded device-I/O escalation as repeated feedback-read failure.
