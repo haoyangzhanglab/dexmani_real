@@ -232,6 +232,7 @@ def _try_init_hand_retargeter_impl(ctx: TeleopLoopState, cfg: TeleopConfig) -> b
             ctx.hand_retargeter = XHandRetargeter(
                 hand_type="right",
                 retargeting_type=cfg.runtime.policy.hand_retargeting_type,
+                dexpilot_config=cfg.runtime.dexpilot_retargeting,
             )
         logger.info("Hand retargeter ready (type=%s)", cfg.runtime.policy.hand_retargeting_type)
         return True

@@ -24,6 +24,7 @@ import yaml
 from dexmani_real.config.defaults import (
     ArmParams,
     CameraParams,
+    DexPilotRetargetingParams,
     EnvironmentConfig,
     HandParams,
     KeyboardTeleopParams,
@@ -42,6 +43,7 @@ _SECTION_NAMES = (
     "safety",
     "camera",
     "tag_retargeting",
+    "dexpilot_retargeting",
     "environment",
 )
 
@@ -76,6 +78,7 @@ class ResolvedRuntimeConfig:
     safety: SafetyParams
     camera: CameraParams
     tag_retargeting: TAGRetargetingParams
+    dexpilot_retargeting: DexPilotRetargetingParams
     environment: EnvironmentConfig
     canonical_json: str
     canonical_yaml: str

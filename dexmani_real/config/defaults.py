@@ -411,18 +411,21 @@ class HandParams:
     device_id: int = 0
 
     # ── Home position (deg) — open-hand neutral ──
+    # Estimated from the median converged DexPilot pose of the first four
+    # stable operator frames in episode_20260816_234045.  The eight finger
+    # flexion joints retain at least a 5 deg lower-stop margin.
     home_qpos_deg: tuple[float, ...] = (
-        0.0,
-        80.66,
-        33.2,
-        0.0,
-        5.11,
+        0.67,
+        15.51,
+        65.18,
+        2.11,
         5.0,
-        6.53,
         5.0,
-        6.76,
         5.0,
-        10.13,
+        5.0,
+        5.0,
+        9.23,
+        18.89,
         5.0,
     )
 
@@ -642,7 +645,7 @@ class PolicyParams:
 
     # ── Hand retargeting ──
     hand_enabled: bool = True
-    hand_retargeting_type: str = "tag"
+    hand_retargeting_type: str = "dexpilot"
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
@@ -770,7 +773,9 @@ class TAGRetargetingParams:
     """Identity because MANO and URDF both use +Z for finger extension."""
 
     # ── Stage 1: Global position matching (L-BFGS) ──
-    smooth_weight: float = 0.02
+    # Offline sweep on episode_20260816_234045: 0.003 removes roughly 2.6
+    # frames of mean lag versus 0.02 while keeping the P95 joint step < 25 deg.
+    smooth_weight: float = 0.003
     ftol_abs_s1: float = 1e-4
     maxeval_s1: int = 80
 
@@ -813,6 +818,44 @@ class TAGRetargetingParams:
             raise ValueError("TAG pinch_full_dist_m must not exceed pinch_start_dist_m")
         if not (0.0 <= self.pinch_ema_alpha <= 1.0) or not (0.0 <= self.pinch_skip_threshold <= 1.0):
             raise ValueError("TAG pinch EMA/skip thresholds must be in [0, 1]")
+
+
+@dataclass(frozen=True)
+class DexPilotRetargetingParams:
+    """Effective dex-retargeting parameters for the DexPilot backend.
+
+    ``dex-retargeting==0.4.6`` does not wire its config-level Huber and
+    temporal weights into ``DexPilotOptimizer``.  They are deliberately not
+    exposed here: every field in this runtime section has a verified effect on
+    the backend used by :class:`teleop.hand_retarget.XHandRetargeter`.
+    """
+
+    # Bounded offline sweep on episode_20260816_234045.  The asymmetric
+    # project/escape thresholds add hysteresis and suppress projection chatter.
+    scaling_factor: float = 1.05
+    low_pass_alpha: float = 0.35
+    output_ema_alpha: float = 1.0
+    project_dist_m: float = 0.025
+    escape_dist_m: float = 0.035
+
+    def __post_init__(self) -> None:
+        numeric = (
+            self.scaling_factor,
+            self.low_pass_alpha,
+            self.output_ema_alpha,
+            self.project_dist_m,
+            self.escape_dist_m,
+        )
+        if not all(np.isfinite(value) for value in numeric):
+            raise ValueError("DexPilot retargeting parameters must be finite")
+        if self.scaling_factor <= 0:
+            raise ValueError("DexPilot scaling_factor must be positive")
+        if not 0.0 <= self.low_pass_alpha <= 1.0:
+            raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
+        if not 0.0 <= self.output_ema_alpha <= 1.0:
+            raise ValueError("DexPilot output_ema_alpha must be in [0, 1]")
+        if self.project_dist_m <= 0 or self.escape_dist_m < self.project_dist_m:
+            raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
 
 
 # VR receiver parameters
@@ -972,4 +1015,5 @@ vr = VRParams()
 safety = SafetyParams()
 camera = CameraParams()
 tag_retargeting = TAGRetargetingParams()
+dexpilot_retargeting = DexPilotRetargetingParams()
 environment = EnvironmentConfig()

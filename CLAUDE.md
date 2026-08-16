@@ -22,6 +22,7 @@ entry points, not test fixtures.
 | Change a runtime value | `config/defaults.py` | `config/runtime.py`, every derived duration/capacity/metadata field |
 | Change a shared field or command | `utils/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
 | Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → safety gate → samples |
+| Tune hand retargeting | `teleop/hand_retarget_eval.py`, `examples/tune_hand_retarget.py` | runtime TAG/DexPilot sections → wrapper → startup home/ramp |
 | Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
 | Change learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` → `deployment/config.py` → `deployment/contracts.py` → `integrations/` adapter → `policy_plan_ring` |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, homing path planning |
@@ -186,6 +187,8 @@ VR frame → causal snapshot → ArmWristMapper / per-VR-sequence hand solve cac
 - `utils/schema.py::XHAND_SDK_JOINT_NAMES` owns every cross-process hand-qpos
   order. TAG and DexPilot share the mechanical `xhand_right.urdf`; teleop, not
   either solver URDF, applies the operational anti-clogging command floor.
+- DexPilot is the current default hand backend. Its effective runtime parameters
+  live in `dexpilot_retargeting`; TAG remains the repository-owned fallback.
 - `teleop/arm_mapper.py` applies frame transforms and workspace/rotation bounds.
 - `planning/ik.py` and `planning/ik_candidates.py` solve and filter; failure
   holds rather than inventing a new command.
@@ -377,6 +380,7 @@ Cross-module obligations for each change are the contract in `AGENTS.md` §5
 | `examples/pointcloud_process_example.py` | `sensor/pointcloud_processor.py` | Production point-cloud pipeline diagnostic; explicit confirmation for desk-plane write |
 | `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; runs home + preset motion by default; no CLI flags |
 | `examples/visualize_episode.py` | — | Offline Rerun 3D visualization; no hardware control; self-contained script |
+| `examples/tune_hand_retarget.py` | `teleop.hand_retarget_eval` | Read-only offline TAG/DexPilot sweep and home estimate; emits JSON |
 
 ## 8. Completion checklist
 

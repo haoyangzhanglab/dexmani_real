@@ -208,11 +208,13 @@ class XHandRetargeter:
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
         smoothing_alpha: float | None = None,
+        dexpilot_config: Any | None = None,
     ):
         self.hand_type = hand_type
         self.retargeting_type = retargeting_type
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
+        self._dexpilot_config = dexpilot_config
         self.last_debug: dict[str, float | str] = {}
         self._smoothing_alpha: float | None = (
             float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
@@ -247,6 +249,15 @@ class XHandRetargeter:
                 "XHand SDK joint order"
             )
 
+        if self._dexpilot_config is not None:
+            cfg.update(
+                scaling_factor=float(self._dexpilot_config.scaling_factor),
+                low_pass_alpha=float(self._dexpilot_config.low_pass_alpha),
+                project_dist=float(self._dexpilot_config.project_dist_m),
+                escape_dist=float(self._dexpilot_config.escape_dist_m),
+                smoothing_alpha=float(self._dexpilot_config.output_ema_alpha),
+            )
+
         # Teleoperator-level EMA (our custom field, not a RetargetingConfig param)
         yaml_smoothing_alpha = float(cfg.pop("smoothing_alpha", 0.3))
         if self._smoothing_alpha is None:
@@ -268,12 +279,13 @@ class XHandRetargeter:
     def low_pass_alpha(self) -> float:
         """Current LPFilter alpha (new-value weight: 1.0 = pass-through, →0 = freeze).
 
-        Default from YAML config (low_pass_alpha: 0.6)."""
+        The YAML fallback is 0.6; production injects the resolved runtime value.
+        """
         return float(self.retargeter.filter.alpha)
 
     @low_pass_alpha.setter
     def low_pass_alpha(self, value: float) -> None:
-        """Tune the LPFilter smoothing strength at runtime (default from YAML: 0.6)."""
+        """Tune the LPFilter smoothing strength at runtime."""
         self.retargeter.filter.alpha = float(value)
 
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:

@@ -49,8 +49,8 @@ VR_FRAME_DTYPE / 历史可验证 VR ring
     ▼
 掌心局部坐标系 → MANO 轴约定 → 自适应小指补偿
     │
-    ├── TAG：两阶段 Pinocchio + NLopt，默认后端
-    └── DexPilot：外部 dex-retargeting，可选后端
+    ├── DexPilot：外部 dex-retargeting，当前默认后端
+    └── TAG：两阶段 Pinocchio + NLopt，仓库内可审计备选
     │
     ▼
 startup smoothstep ramp
@@ -77,7 +77,7 @@ XHand driver：最终范围检查，原样发送 endpoint
 最重要的当前事实是：
 
 1. 正常控制只消费**右手 21 个关键点**；手腕四元数服务于机械臂映射，不参与手指 retarget。
-2. TAG 是默认后端；DexPilot 是兼容保留的可选后端。
+2. DexPilot 是当前默认后端；TAG 是仓库内可审计的备选后端。
 3. TAG 当前**没有输出级 EMA**。它的连续性来自 Stage 1 时间正则、pinch activation EMA 和启动 ramp。
 4. DexPilot 默认保留外部库内部 LPFilter；仓库包装层的 output EMA 当前为直通。
 5. operational command bounds 当前是**发布前逐关节投影**，不是求解器边界，也不是整条拒绝条件。
@@ -305,7 +305,7 @@ L_1(q)=
 +\lambda_s\|q-q_{prev}\|^2
 $$
 
-当前默认 `smooth_weight` 为 0.02，solver 为 NLopt L-BFGS，最大 evaluation 80。
+当前默认 `smooth_weight` 为 0.003，solver 为 NLopt L-BFGS，最大 evaluation 80。该值保留 TAG 作为低延迟备选，但 TAG 不是当前默认后端。
 
 解析梯度为：
 
@@ -394,10 +394,14 @@ DexPilot 的 optimizer 边界主要来自机械范围 `xhand_right.urdf` 和外�
 
 | 层 | 当前默认 |
 |---|---:|
-| dex-retargeting internal LPFilter | alpha 0.6 |
+| vector scaling factor | 1.05 |
+| projected enter / escape | 25 mm / 35 mm |
+| dex-retargeting internal LPFilter | alpha 0.35 |
 | 仓库 wrapper output EMA | alpha 1.0，直通 |
 
-因此 DexPilot 当前不是文档历史版本中的“两层持续 EMA”。它仍然有外部库内部 LPFilter。
+不对称的 enter/escape 距离构成迟滞，用于降低 projected-vector 在阈值附近的往返切换。DexPilot 当前不是文档历史版本中的“两层持续 EMA”；它仅保留外部库内部 LPFilter。
+
+这些字段通过 runtime config 的 `dexpilot_retargeting` section 注入 wrapper。当前安装的 `dex-retargeting==0.4.6` 没有把 config-level Huber/temporal 参数接入 `DexPilotOptimizer` 的实际优化路径，因此 runtime 不暴露无效调参项。
 
 `reset()` 会清除外部 optimizer warm start、internal LPFilter、projected flags 和 wrapper EMA state，并尝试用 measured SDK qpos 重建内部顺序的 warm start。
 
@@ -405,7 +409,7 @@ DexPilot 的 optimizer 边界主要来自机械范围 `xhand_right.urdf` 和外�
 
 | 维度 | TAG | DexPilot |
 |---|---|---|
-| 默认状态 | 默认 | 可选 |
+| 默认状态 | 备选 | 默认 |
 | 目标 | 5 条 wrist-to-tip | 15 条 reference vectors |
 | pinch | 独立 Stage 2 | 外部 projected-vector 机制 |
 | 持续平滑 | 时间正则 + activation EMA | 外部 internal LPFilter |
@@ -612,7 +616,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 
 ### 13.2 实时预算
 
-16 Hz 控制周期名义预算为 62.5 ms。当前记录了单帧 retarget elapsed time；复用同一 VR observation 的控制帧只计 cache lookup，不代表执行了一次 solver。仓库合同没有把以下指标固化为回归门槛：
+16 Hz 控制周期名义预算为 62.5 ms。当前记录了单帧 retarget elapsed time；复用同一 VR observation 的控制帧只计 cache lookup，不代表执行了一次 solver。在线控制合同没有把以下诊断固化为 fault 条件：
 
 - Stage 1 / Stage 2 分项耗时；
 - P50/P95/P99；
@@ -622,6 +626,27 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 - 日志洪泛对控制周期的影响。
 
 单个 synthetic case 成功不能证明真实追踪分布下的实时性。
+
+### 13.3 离线调参与 home 估计
+
+[examples/tune_hand_retarget.py](../examples/tune_hand_retarget.py) 只读 schema-v16 episode，顺序重放 TAG 和 DexPilot，不创建 shared memory，不导入设备 SDK，不发布任何硬件命令。主要指标为：
+
+- 8 个非拇指弯曲关节的最佳因果 lag 和 Spearman 相关；
+- 10 组指尖间距离的平均 Spearman 相关；
+- P95/P99 最大单帧关节步长、人手静止区间的机器手步长；
+- mechanical-bound/operational-clip 占用率、solver P95/P99 耗时和失败数；
+- DexPilot projected bit 切换数，以及 thumb-index 近接召回/误闭合率。
+
+对 `episodes/episode_20260816_234045` 的 960 帧、16 Hz 数据进行有界搜索后，当前默认 DexPilot 候选为 `scale=1.05, LP alpha=0.35, project=25 mm, escape=35 mm`。关节相关、指尖几何和步长均以发布前 operational clip 后的有效 endpoint 计算；离线结果为：平均 lag 1.375 帧，8 关节平均/min 相关 0.875/0.766，指尖距离相关 0.736，P95/P99 步长 23.69°/28.42°，静止区间 P95 1.01°，projected bit 切换 193 次，P95 solver 耗时约 4.3 ms。该 episode 上的调优 TAG (`smooth_weight=0.003`) 平均 lag 同为 1.375 帧，但指尖距离相关为 0.690，静止区间 P95 步长为 4.43°，因此保留为备选而非默认。
+
+home 不直接平均 episode 中前 4 帧的 recorded raw/final：它们仍包含 warm-start 和 startup ramp 过渡。离线工具对每个初始 landmark 独立 reset，关闭 DexPilot 输出滤波后重复求解 512 次，对 4 个静态收敛解取 per-joint median，然后投影到 operational bounds，并为 8 个手指弯曲关节保留至少 5° 下限余量。当前 home（SDK order，deg）为：
+
+```text
+[0.67, 15.51, 65.18, 2.11, 5.00, 5.00,
+ 5.00,  5.00,  5.00, 9.23, 18.89, 5.00]
+```
+
+4 个静态解的最大跨帧离散为 0.36°，最终 settle residual 约 0.00023°。受 5° 防硬限余量约束，该 home 与前 4 帧 solver raw 输出的最大差为 5.06°；clip 后这些下限关节与 home 一致。这些都是单个 episode 上的离线接受结果，不代替低速真机观察、跨用户/跨 episode 验证和触觉抓取验证。
 
 ## 14. 后续实现 backlog（当前尚未实现）
 

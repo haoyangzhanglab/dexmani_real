@@ -365,11 +365,6 @@ def _unpack_sample(
         "pointcloud_source_point_count",
         "pointcloud_valid_depth_ratio",
         "pointcloud_padding_count",
-        "flag_ik_ok",
-        "flag_ik_attempted",
-        "flag_retarget_ok",
-        "flag_held",
-        "flag_safety_reject",
     )
 
     def _copy_field(name: str) -> Any:
@@ -377,7 +372,15 @@ def _unpack_sample(
         return np.array(value, copy=True) if np.asarray(value).ndim else value.item()
 
     signals = {name: _copy_field(name) for name in signal_names}
-    signals["action_queued"] = bool(record["flag_action_queued"])
+    for signal_name, field_name in (
+        ("action_queued", "flag_action_queued"),
+        ("ik_ok", "flag_ik_ok"),
+        ("ik_attempted", "flag_ik_attempted"),
+        ("retarget_ok", "flag_retarget_ok"),
+        ("held", "flag_held"),
+        ("flag_safety_reject", "flag_safety_reject"),
+    ):
+        signals[signal_name] = bool(record[field_name])
     signals["frame_status"] = int(record["flag_frame_status"])
     diagnostics = {
         name: _copy_field(name)

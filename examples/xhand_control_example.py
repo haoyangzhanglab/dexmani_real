@@ -24,7 +24,7 @@ from xhand_controller import xhand_control
 
 # Matches dexmani_real.config.defaults.hand.home_qpos_deg -- duplicated here
 # so this script stays usable without a full dexmani_real import chain.
-HOME_QPOS_DEG = (0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0)
+HOME_QPOS_DEG = (0.67, 15.51, 65.18, 2.11, 5.0, 5.0, 5.0, 5.0, 5.0, 9.23, 18.89, 5.0)
 
 _BAUD_RATE_RS485 = 3_000_000
 _DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
@@ -110,7 +110,7 @@ class PresetActions:
 # (the rated upper bound is 1.919 rad ≈ 109.95°).
 PRESET_XHAND1 = PresetActions(
     fist=(11.85, 74.58, 40, -3.08, 106.02, 109.5, 109.75, 107.56, 107.66, 109.5, 109.1, 109.15),
-    palm=(0, 80.66, 33.2, 0.00, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0),
+    palm=(0.67, 15.51, 65.18, 2.11, 5.0, 5.0, 5.0, 5.0, 5.0, 9.23, 18.89, 5.0),
     v=(38.32, 90, 52.08, 6.21, 2.6, 5.0, 2.1, 5.0, 109.5, 109.5, 109.5, 109.23),
     ok=(45.88, 41.54, 67.35, 2.22, 80.45, 70.82, 31.37, 10.39, 13.69, 16.88, 1.39, 10.55),
 )

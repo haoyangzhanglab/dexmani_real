@@ -88,6 +88,7 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 | Episode 回放 | `examples/replay_episode.py` | 自包含脚本；默认 live 完整回放并产出结果；`--dry-run` 仅离线校验 |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | `examples/visualize_episode.py` | Rerun 3D episode 可视化；`python examples/visualize_episode.py <episode>` |
+| Hand retarget 调参 | `examples/tune_hand_retarget.py` | 离线顺序重放 TAG/DexPilot，输出关节/指尖/平滑/耗时指标与前 4 帧 home 估计；不访问硬件 |
 
 ### 普通暂停与录制语义
 
@@ -132,7 +133,7 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`dexmani_real`
 
-以下清单覆盖当前包内的 **94 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
+以下清单覆盖当前包内的 **95 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
 
 ### 根包
 
@@ -273,6 +274,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop 与主动安全回退的 held 样本；命令静默期间不补造样本。 |
 | `teleop/hand_control.py` | 手部命令生成与重定向器状态辅助：每个 verified VR ring sequence 最多调用一次有状态 solver（成功/失败均缓存，ramp 仍按控制网格推进）；对 shaped 目标做后备校验，违规时优雅 hold 而非升级为粘滞 fault。 |
 | `teleop/hand_retarget.py` | 校验手部 landmarks，并提供 DexPilot 与 TAG 两类重定向器；二者输出统一为 schema 定义的 XHand SDK 关节顺序。 |
+| `teleop/hand_retarget_eval.py` | 纯离线 episode 重放、有界参数搜索、后端中立指标和静态收敛 home 估计；不启动设备或 shared-memory 生命周期。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
 | `teleop/recording_session.py` | 处理退出时的保存、丢弃和停机决策。 |
@@ -301,7 +303,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 
 ## 项目地图：`examples`
 
-`examples/` 目前有 **10 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
+`examples/` 目前有 **11 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
 
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
@@ -315,6 +317,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
 | `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认运行 home + 预设动作（枚举/读取/打印后直接动作），无 CLI 参数门控；预设动作按生产命令包络裁剪。 |
 | `examples/visualize_episode.py` | — | 离线 Rerun 3D 可视化；读取 HDF5 episode 并展示点云、图像、动作、触觉和元数据；无硬件控制。 |
+| `examples/tune_hand_retarget.py` | `teleop.hand_retarget_eval` | 离线 TAG/DexPilot 基准、有界搜索和 home 估计；只读 episode，输出 JSON，无硬件控制。 |
 
 ## 配置、资源与延伸文档
 
