@@ -1,26 +1,34 @@
-# XHand 机制审查与简化实施方案
+# XHand 机制审查与简化实施方案（修订版）
 
-> 日期：2026-08-16
+> 日期：2026-08-16（已按当日 HEAD `88becfd` 核对并修订）
 >
-> 范围：`dexmani_real/robot/xhand.py`、`dexmani_real/robot/hand_process.py`、手部状态与动作的直接生产者/消费者，以及 `docs/xhand/` 中的参考项目文档。
+> 范围：`dexmani_real/robot/xhand.py`、`dexmani_real/robot/hand_process.py`、手部状态与动作的直接生产者/消费者，以及 `docs/xhand/` 参考项目文档。
 >
 > 性质：离线代码审查与实施设计，不包含硬件参数调整或硬件验证。
 
+## 0. 修订说明
+
+本版相对初稿的实质修正：
+
+1. **原 P0（§4.1.1 全零手姿态回退）已过时**。该缺陷在评审时（提交 `c298505`/`fef5071`）确实存在，但已在同日提交 `88becfd`（"0816 temp1"）中修复。本文 §2.1 改记为"已修复"，并把剩余工作重新定义为**发布门缺失时间戳过期检查**这一窄项。
+2. **符号勘误**：初稿反复引用的 `current_hand_qpos` 在 `88becfd` 中被删除，当前树零匹配；真实字段是 `qpos`（健康输入）与 `last_cmd_qpos`（delta reference）。
+3. **字段语义据实修正**：`state_valid` 实际镜像 `connected`（非"成功完整读取"）；`error_state` 除板寄存器外还含 `_record_error` 来源。
+4. **健康门数量更正**：当前有 **四** 处手部健康判断，非两处；`deployment/coordinator.py` 与 `runtime/supervisor.py` 两处被初稿遗漏。
+5. **参考项目取舍修正**：πR² 一节的 adopt/reject 据参考原文重写；DexUMI 两处过度声称下调。
+
 ## 1. 结论摘要
 
-当前项目的总体架构是正确的：在生产运行链中，XHand SDK 对象只由手部 worker 持有，跨进程通信只通过 `SharedStorage`，手部命令采用 latest-wins ring，跨生命周期旧命令由 `run_generation` 隔离，时间过期则由命令有效窗口拒绝。这些约束应当保留。独立硬件示例可以直接使用驱动，但不属于生产跨进程控制链。
+生产运行链的总体架构正确，应保留：XHand SDK 对象只由手部 worker 持有；跨进程只经 `SharedStorage`；手部命令 latest-wins ring；`run_generation` 隔离跨生命周期旧命令；命令有效窗口拒绝过期命令。
 
-需要优先修复的 P0 逻辑错误是：**当动作包含手部目标时，只要当前反馈快照不可用、无效、非有限或过期，就必须在写入任一命令通道前拒绝该候选动作。** 当前部分发布路径在“状态帧存在但健康标志为假”时会使用全零手姿态继续校验，导致不健康的手部状态仍可能越过策略发布边界。
+**核心发布边界问题已经修复**：`policy/safety.py` 的 `_hand_feedback_snapshot` 现为 fail-closed，不健康的反馈（断连、无效、板错误、I/O watchdog 触发、非有限 qpos）会在任何 IPC 写入前拒绝耦合候选。**唯一残留缺口**是该快照不做 `source_monotonic_ns` 年龄/过期检查——"过期但标志健康"的帧仍能越过发布边界。这是阶段一的唯一行为性改动。
 
-其余问题主要集中在驱动和 worker 的职责重叠：连接时隐式完成触觉初始化、错误状态存在多套含义、失败计数与真实时间不一致、读取失败用 NaN 字典表达、`clear_local_error()` 看似恢复硬件但实际只清本地字段。这些行为增加了代码复杂度，也使日志和安全判断难以准确解释。
-
-建议采用“**薄驱动、厚 worker、单一健康门**”的目标结构：
+其余问题集中在驱动与 worker 的职责重叠：连接时隐式触觉初始化、错误状态多套语义、失败计数与真实时间不一致、读取失败用 NaN 字典表达、`clear_local_error()` 仅清本地字段却表现为恢复。这些需按"**薄驱动、厚 worker、单一健康门**"收口，但**大多是对现状的归位**，而非新机制：
 
 ```text
 teleop / policy / replay / home
                │
                ▼
-      统一的手部反馈健康门
+      统一的手部反馈健康门（纯函数，四处调用方共用）
                │
                ▼
       SharedStorage 命令 ring
@@ -32,271 +40,73 @@ teleop / policy / replay / home
  XHand：connect/get_state/send_action/disconnect
 ```
 
-本次审查不支持把 2026-08-15 的瞬时板级异常直接归因于拇指过流、`tor_max` 或 EtherCAT 实时调度权限。现有证据只能确认这些现象在时间上相关，不能确认因果关系。
+本次审查不支持把 2026-08-15 的瞬时板级异常归因于拇指过流、`tor_max` 或 EtherCAT 实时调度权限：现有证据只能确认时间相关性，不能确认因果关系。
 
-## 2. 审查原则与边界
+## 2. 现状与问题（已按 HEAD 核对）
 
-### 2.1 审查原则
+### 2.1 已修复：发布边界 fail-closed
 
-1. 修复确定的逻辑错误，不以猜测修改机械、安全或电流参数。
-2. 一个状态只保留一种明确语义，一个故障只保留一处升级策略。
-3. 驱动只适配 SDK；worker 拥有进程生命周期、重试和设备故障检测；Main 继续拥有全局 `SafetyState` 的 FAULT 转换与关闭协调。
-4. 对输入失败关闭：不静默补零、不静默截断、不静默夹紧。
-5. 不引入第二套 IPC、控制服务、插值器或跨进程状态机。
-6. 保持现有 `SharedStorage`、seqlock、latest-wins、`last_cmd_seq` 和 `run_generation` 契约。
+`validate_and_send_candidate`（`policy/safety.py:740-849`）在 `candidate.hand_qpos is not None` 时调用 `_hand_feedback_snapshot`（`:205-256`），任一拒绝即 return，到不了 `send_command`：
 
-### 2.2 不在本方案中处理的事项
+- ring 为空 → `HAND_FEEDBACK_UNAVAILABLE`（`:210-215`）；
+- `connected ∧ state_valid ∧ ¬error_state ∧ send_healthy ∧ read_healthy` 为假 → `HAND_FEEDBACK_UNHEALTHY`（`:217-236`）；
+- `qpos`/`last_cmd_qpos` 错 shape 或非有限 → `HAND_FEEDBACK_UNHEALTHY`（`:239-249`）。
 
-- 不修改 `tor_max`、PID、机械限位或触觉阈值。
-- 不为 xArm 或 XHand 添加持续的应用层轨迹插值。
-- 不调整操作系统 capability、实时优先级或 EtherCAT 部署权限。
-- 不依据一次现场异常推断厂商错误寄存器含义。
-- 不改变 HDF5 episode v16 的数据语义。
+`candidate.hand_qpos is None` 时按纯 arm 动作处理，不读 hand ring，不构造任何手姿态。已删除旧代码中的全零 `current_hand` 回退与 `current_hand_qpos` 参数。
 
-### 2.3 方案 review 后的防回归约束
+**残留缺口**：该快照不读 `source_monotonic_ns`、不校验 age。过期/未来时间戳的拒绝只存在于 `teleop/keyboard.py` 的 `validate_hand_feedback`（`:634-642`），而它不被 policy 发布路径调用。因此"过期但标志健康"的帧仍可通过。这是阶段一唯一的剩余行为改动，且需将 `max_age_s` 显式贯穿所有调用方，不能引入悄然放宽检查的默认值。
 
-下列约束用于防止“修复一个问题，同时引入新的控制问题”：
+### 2.2 已证实待修：驱动/worker 职责重叠
 
-1. **先冻结外部行为，再做内部简化。** 第一阶段只增加对无效 hand feedback 的拒绝，不同时改变 watchdog、触觉初始化、通信协议或 shared dtype。
-2. **不静默改变共享字段语义。** `HAND_STATE_DTYPE` 中的 `send_healthy`、`read_healthy`、`state_valid` 和时间戳已经有多个消费者。内部重构必须保持现有含义；如确需改变，必须从 `utils/schema.py` 开始审计 worker、policy、supervisor、录制和回放链路。
-3. **不把瞬时发送失败变成恢复死锁。** 如果将 `send_healthy` 改成“最近一次发送结果”并将其作为硬发布门，第一次失败后将没有新命令可用于证明恢复。本文不采用这种改法。
-4. **不宣称 arm/hand 传输是原子的。** arm queue 与 hand ring 是两个独立 IPC 原语，且架构明确不增加 prepare/commit 协议。“reject-whole”只表示所有健康和范围校验在第一次 IPC 写入前完成，不表示两个 transport 写入具有事务原子性。
-5. **不提前 readiness。** 拆分触觉初始化后，worker 仍须完成约定的初始化步骤并发布首个有效关节状态，才能设置 heartbeat 和 `hand_ready`。触觉校准失败按当前策略可以降级，但必须得到明确结果，不能仍在后台修改 bias 时宣布 ready。
-6. **不依赖 NumPy 的伪不可变性。** `@dataclass(frozen=True)` 不能阻止数组内容被原地修改。局部状态样本必须拥有自己的数组副本；若声明只读，还需显式设置数组为不可写。
-7. **前两个阶段不重命名公共方法。** 先保留 `connect/get_state/send_action/disconnect`，只收紧其内部契约。方法改名只有在所有直接调用方和示例完成迁移后才考虑。
-8. **裸 qpos 不是健康证明。** `current_hand_qpos` 只携带数值，不包含连接、错误、watchdog 和时间戳信息，不能作为跳过 hand ring 健康检查的依据。需要复用同一反馈时，应传递由统一健康门生成的内部 snapshot，而不是传一个未经证明来源的数组。
-
-## 3. 当前 XHand 机制
-
-### 3.1 控制链路
-
-1. teleop、策略、回放或 home 逻辑生成关节目标。
-2. 安全层校验机械范围、运行范围、单步变化量和反馈状态。
-3. arm 目标进入有界队列；hand 目标进入 latest-wins ring。
-4. 命令携带 `run_generation`，worker 拒绝旧 generation 命令。
-5. `hand_process` 是生产运行链中唯一持有 XHand SDK 对象的进程。
-6. worker 读取手部状态并写入 `SharedStorage`，同时用 `last_cmd_seq` 表示最近一次 `send_action()` 返回成功的 action ID。
-
-这一主链路符合项目架构约束，不应被参考项目中的 ZMQ server、pickle 消息或额外控制线程替代。
-
-### 3.2 当前职责分布
-
-| 模块 | 当前职责 | 审查结论 |
+| # | 问题（`xhand.py` / `hand_process.py`） | 结论与修法 |
 |---|---|---|
-| `robot/xhand.py` | SDK 打开/关闭、读写、状态解析、范围检查、触觉初始化、局部错误状态 | 职责过多，应缩为 SDK 适配器 |
-| `robot/hand_process.py` | 生命周期、状态发布、命令消费、watchdog、全局故障升级 | 所有进程级策略应集中在这里 |
-| `policy/safety.py` | 动作边界与反馈校验 | 应成为耦合动作发布的唯一健康门 |
-| `teleop/loop.py` 等调用方 | 决策是否生成和发布动作 | 不应分别实现不同版本的手部健康规则 |
-| `shm/shared_storage.py` | 跨进程状态与命令 | 结构正确，保持不变 |
+| 1 | RS485 `read_state(force_update=true)` 会先 `send_command()` 重发最后命令；EtherCAT 忽略该参数 | 已在本机 vendored 源码证实（`serial_communication.cpp` 重发 / `ethercat_communication.cpp` 返回 PDO 缓存）。当前生产固定 EtherCAT，不受影响；诊断示例需 `force_update=False` |
+| 2 | 连接失败清理不完整：`_retry_open_device` 抛异常不关已建 control；不支持 comm_type 返回失败但 control 已建；`disconnect()` 仅在 `connected_flag=True` 时关；worker 初始化异常分支无统一 close | 只要 SDK control 曾成功创建，所有失败路径进入同一 best-effort 清理；同会话底层 close 至多一次，重复 `disconnect()` 幂等 |
+| 3 | `clear_local_error()`（`:867-877`）仅清本地字段，无 SDK 调用，不确认恢复 | 删除该"恢复"概念。它被 worker 在发送失败与板错误路径调用（`hand_process.py:347/444`），但 `shared.error_state` 已在 `:341` 先 latch，本地清除是装饰性的。单次读写结果由当次 SDK 返回决定；是否升级 global fault 由 worker 有界 retry/watchdog 决定。**注意**：它是 load-bearing，删除必须与"成功重置/失败累计、阈值不变"的替代物同提交落地 |
+| 4 | 发送 watchdog 阈值 30 标注"1s @ 30Hz"，但计数器仅在"新命令 + 发送失败"时增加，约 1.875s@16Hz，无新命令不增长 | 先修正命名与注释，保持现有计数行为；`send_healthy` 的共享语义 = "watchdog 未触发"，非"上次发送成功"，重构不改变。改单调时间阈值属独立运行行为变更（见 §5 阶段四） |
+| 5 | `get_state(full=True)` 的 `error_state` 滞后一帧：先 `parse_state`（`:903`）把旧值写入返回字典，再重推 `self.error_state`（`:911-915`） | worker 读对象字段（`hand_process.py:389`），生产发布基本不受影响；引入固定 `XHandSample` 后此双返回协议一并删除 |
+| 6 | `connect()` 非只读：打开设备、读首帧、检查触觉负载、reset 触觉、算 bias | 拆分显式 `initialize_tactile()`（见 §3.4）。现有实现已在 reset 前查初始负载，不会把所有静态接触盲吸进 bias |
+| 7 | 正常 close 后仍保留 `control`/最后命令/触觉 bias | connect 开始与 close 结束统一重置会话状态 |
+| 8 | 状态解析对 out-of-range/负 joint ID 跳过并留下 NaN（`:1046`）；重复合法 ID 不产生 NaN（后者覆盖前者） | 解析层直接返回结构化错误，不生成半成品状态 |
+| 9 | `source_monotonic_ns` 是 host 接受时间 | 修正文档语义：证明本次 SDK read 完成，不证明设备产生新帧；除非 SDK 提供帧号，不声称设备侧新鲜度 |
+| 10 | 生产固定 EtherCAT，驱动表面支持 RS485 的"半支持" | 明确 EtherCAT-only 或把协议纳入 immutable runtime（见 §3.5） |
 
-## 4. Fact-check 结果
+### 2.3 尚不可证实：08-15 异常归因
 
-本章将结论分为“已证实”“潜在问题”和“尚不可证实”，避免把代码事实、现场相关性和原因假设混为一谈。
+当日记录只能确认：设备未断连、出现约 0.1s 的板错误寄存器异常、时间上与拇指停滞和电流变化相关。以下结论证据不足：拇指过流直接置 joint-board error；`tor_max` 含义或取值导致异常；EtherCAT 实时调度 `EPERM` 导致此次板错误；提高进程权限可修复。在取得厂商错误位定义、SDK/固件版本说明或受控硬件复现前，不据此调整扭矩、PID、机械范围或 capability。
 
-### 4.1 已证实的问题
+## 3. 目标设计
 
-#### 4.1.1 不健康手部反馈仍可能发布耦合动作
+### 3.1 单一手部健康门（落位 `utils/`）
 
-`policy/safety.py` 中的部分路径按以下方式构造当前手姿态：
+现有纯函数 `teleop/keyboard.py:613` `validate_hand_feedback()` 是 7 项 fail-closed 谓词（`connected` → `error_state` → `state_valid` → `send/read_healthy` → source 时间戳存在且不在未来 → `max_age_s` 有效且未过期 → qpos shape 且 finite），返回 `str | None`。
 
-1. 先创建全零 `current_hand`；
-2. 如果没有读到任何 hand frame 且候选动作包含手目标，则拒绝；
-3. 如果读到了 frame，但 `connected` 或 `state_valid` 为假，则保留全零值继续执行校验和发布。
+- **落位 `dexmani_real/utils/hand_health.py`**（非 `robot/`）：它是 schema-shape 纯校验（依赖 `utils/schema.py` 的 `HAND_JOINT_SHAPE`），不是 vendor-I/O 也不是 policy 处置；`robot/` 继续只做设备 I/O。对称地**一并迁移 `validate_arm_feedback`（`keyboard.py:573`）**，避免把一对纯函数拆到两个包。迁移保持签名与返回不变，先建离线回归用例；不在此提交内改 `send_healthy/read_healthy` 含义或超时默认值。
+- **实际有四处手部健康判断**，须统一：
 
-因此，“存在一帧无效状态”和“没有状态”产生了不同的安全行为。离线 fake/shared-memory 复现确认，无效状态帧下 `validate_and_send_candidate()` 仍可返回已发布结果。
-
-影响边界需要准确描述：这证明动作已经越过策略发布边界，并可能写入 arm queue 和 hand ring；它不等同于已经被硬件执行，因为 worker 和全局安全状态仍有后续门控。健康判断使用的是一次反馈快照，也不能保证设备在随后发送瞬间仍保持同一状态。
-
-修复规则：
-
-```text
-candidate 包含 hand_qpos
-        │
-        ├─ hand frame 不存在 ───────────► 拒绝
-        ├─ connected/state_valid 为假 ──► 拒绝
-        ├─ qpos 非有限或 shape 错误 ────► 拒绝
-        ├─ 状态过期 ────────────────────► 拒绝
-        └─ 健康 ────────────────────────► 继续做范围与 delta 校验
-```
-
-当 `candidate.hand_qpos is None` 时，通用发布函数按 payload 将其视为纯 arm 动作，不额外引入 `allow_arm_only` 开关。若某一具体工作流即使不发送 hand 命令也要求手部在线，应由该工作流在调用发布函数前增加前置条件。这样既避免全零回退，也避免新增一个容易被误设的通用布尔参数。
-
-这里的“整条拒绝”仅适用于第一次 IPC 写入前的健康和安全校验。现有 `send_command()` 先写 arm queue、再写 hand ring，两条通道不是事务。本文不通过交换写入顺序解决该问题，因为那只会把“arm 已写、hand 未写”变成“hand 已写、arm 未写”。如第二次写入出现意外 IPC 异常，应进入协调停止/全局故障路径，而不是尝试回滚已被另一进程看到的命令。
-
-#### 4.1.2 RS485 的强制刷新会重发最后命令，但当前生产路径不受影响
-
-本机 `xhand-controller 1.1.8`、SDK `1.4.6` 的实现显示：
-
-- RS485 的 `read_state(device_id, true)` 会先调用 `send_command()`，即重发 SDK 内部保存的最后命令；
-- EtherCAT 实现忽略 `force_update`，直接返回周期 PDO 缓存中的状态。
-
-当前 `hand_process` 没有传入通信类型，`XHandConfig` 默认使用 EtherCAT，因此该副作用不是当前生产链或 2026-08-15 异常的原因。它仍会影响允许选择 RS485 且使用 `force_update=True` 的诊断示例。
-
-#### 4.1.3 连接失败路径清理不完整
-
-正常连接后的 `disconnect()` 会调用 SDK `close_device()`，不能笼统地说“disconnect 不关设备”。确定的问题是：
-
-- SDK open 抛出异常时，`_retry_open_device()` 直接向上抛出，没有关闭已创建的 control；
-- 不支持的通信类型会返回失败，但 control 已经创建；
-- `disconnect()` 只在 `connected_flag=True` 时关闭，因此上述失败路径无法依靠它兜底；
-- `hand_process` 初始化异常分支记录并上报错误，但没有对局部 hand 对象执行统一关闭。
-
-修复后应满足：只要 SDK control 曾成功创建，初始化异常或失败返回都进入同一个 best-effort 清理路径；同一会话底层 close 最多执行一次，重复调用公开 `disconnect()` 不报错。
-
-#### 4.1.4 `clear_local_error()` 不具有硬件恢复效果
-
-该方法只清除 Python 对象中的错误字段，没有 SDK 调用，也不确认设备恢复。worker 在发送失败和板错误处理路径中调用它，会造成三种歧义：
-
-- 日志看起来像完成了恢复；
-- 下一次读取又可能覆盖刚清掉的本地状态；
-- 全局 sticky fault 与局部字段的关系不清楚。
-
-应删除这一恢复概念。单次读写结果由当次 SDK 返回决定；是否升级为 global fault 由 worker 的有界 retry/watchdog 策略决定，Main 继续负责 `SafetyState` 的 FAULT 转换和关闭协调。
-
-#### 4.1.5 发送 watchdog 不是稳定的时间阈值
-
-默认阈值为 30，并注明“1s @ 30Hz”，但计数器只在“收到新命令且发送失败”时增加。正常控制命令约为 16 Hz，因此连续 30 次发送失败约为 1.875 秒；没有新命令时，计数不会增长。
-
-这使 `send_healthy` 实际表示“发送失败 watchdog 尚未触发”，而不是“最近一次发送成功”。该字段已被 teleop 和 supervisor 消费，不能在内部重构时直接改义。
-
-安全的处理顺序是：
-
-1. 首先修正文档和变量命名，保持现有计数行为；
-2. 将 `clear_local_error()` 替换为“成功时重置私有计数、失败时继续累计”，但不改变阈值；
-3. 如果后续确实要改成单调时间阈值，将其作为独立运行策略变更，明确旧的“失败命令数”和新的“持续秒数”如何换算，并分别验证 16 Hz 命令、30 Hz worker 和命令静默场景；
-4. 不将“最近一次发送失败”直接作为禁止下一次恢复发送的硬门。
-
-#### 4.1.6 `full=True` 返回的 `error_state` 可能滞后一帧
-
-`XHand.get_state()` 先由解析函数把旧的 `self.error_state` 放入返回字典，随后才根据本次板状态更新内部字段。因此公共诊断返回可能比当前读数滞后一帧。
-
-当前 worker 使用更新后的对象字段，生产状态发布基本不受这一点影响。更简单的修复不是调整赋值顺序，而是删除 `full` 双返回协议，使用一次性构造的固定 `XHandSample`。
-
-#### 4.1.7 `connect()` 不是只读操作
-
-连接流程不仅打开设备和读取首帧，还会检查触觉负载、reset 触觉传感器并计算软件 bias。因此把 DISARMED 启动描述为“只读”并不准确。
-
-当前实现已经在 reset 前检查初始负载，不能据此断言它会把所有静态接触校准掉。真正的问题是触觉校准被隐藏在连接动作中：调用方无法区分“建立通信”和“修改传感器基线”。
-
-### 4.2 潜在问题
-
-以下问题在当前单次 worker 生命周期中不一定触发，但会影响重连、诊断或未来扩展。
-
-| 问题 | 当前影响 | 建议 |
+| 位置 | 内容 | 差异 |
 |---|---|---|
-| 正常 close 后仍保留 `control`、上次命令和触觉 bias | 当前 worker 通常不复用同一实例，风险暂时较低 | connect 开始和 close 结束统一重置会话状态 |
-| 状态解析对非法/重复 joint ID 采用跳过并留下 NaN | 下游 finite 校验通常会关闭失败，但路径间接 | 解析层直接返回结构化错误，不生成半成品状态 |
-| `source_monotonic_ns` 是 host 接受时间 | 可证明本次 SDK read 完成，不能证明设备产生了新帧 | 修正文档语义；除非 SDK 提供帧号，否则不声称设备侧新鲜度 |
-| `XHand.connect()` 内多次读取，worker 随后又读取初始帧 | 增加启动路径和错误分支 | 后续可让 connect 只完成连接/既有触觉步骤，由 worker 统一读取并发布首个有效样本；首轮重构不改变顺序 |
-| 生产配置固定 EtherCAT，但驱动表面支持 RS485 | 形成无法通过 runtime 选择的“半支持”状态 | 明确 EtherCAT-only，或正式把协议纳入 immutable runtime |
+| `teleop/keyboard.py:613` `validate_hand_feedback` | 7 项含时间戳/过期 | 基准 |
+| `policy/safety.py:205` `_hand_feedback_snapshot` | 5 标志 + shape/finite | 缺时间戳/过期，多 `last_cmd_qpos` |
+| `deployment/coordinator.py:145-171` `_seed_hand_reference` | 5 标志 + shape/finite | 缺时间戳/过期，缺 `last_cmd_qpos` |
+| `runtime/supervisor.py:205-215` 内联 `hand_ok` | 5 标志 + finite | 内联副本 |
 
-### 4.3 尚不可证实的原因假设
+统一方式：policy 内保留一个薄 adapter——一次读 hand record，调用上述纯函数；健康时返回含 `qpos`、source timestamp、可选 `last_cmd_qpos` 的内部 snapshot（`last_cmd_qpos` 不合格时保持 `None`，不把反馈健康与 delta reference 可用性混成同一条件）。`publish_joint_targets` 的 delta preflight 与 gate 使用同一 snapshot（当前 delta reference 在 `safety.py:822-826` 取 `last_cmd_qpos`）。coordinator/supervisor 改为复用同一纯函数，消除内联副本。
 
-2026-08-15 记录只能确认：设备没有断连，出现了约 0.1 秒的板错误寄存器异常，且时间上与拇指停滞和电流变化相关。以下结论没有足够证据：
+### 3.2 最小 XHand 驱动接口
 
-- “拇指过流直接设置了 joint-board error”；
-- “`tor_max` 的含义或当前取值导致了异常”；
-- “EtherCAT 实时调度 `EPERM` 导致了此次板错误”；
-- “提高进程权限即可修复该问题”。
-
-在获得厂商错误位定义、SDK/固件版本说明或受控硬件复现前，不应据此调整扭矩、PID、机械范围或系统 capability。
-
-## 5. 参考项目知识的取舍
-
-参考项目用于提炼边界和模式，不作为可以直接复制的实现。
-
-### 5.1 πR² XHand
-
-值得采用：
-
-- 命令执行结果与实测状态分开表达；
-- 反馈不依赖本地命令历史推算；
-- 打开设备后记录 SDK 版本、设备 ID 和身份；
-- 生命周期具有完整的 `try/finally`；
-- 用 fake SDK 覆盖失败路径。
-
-不建议采用：
-
-- 在应用层持续插值手部轨迹；
-- 再建立一套跨进程连接状态机；
-- 把大量诊断信息放进每一帧实时状态。
-
-当前项目已经有全局 `SafetyState`、worker 门控和 `run_generation`，再增加第二套状态机会造成所有权冲突。手部目标应继续作为绝对关节目标发送；如果 home 必须限制大步长，应使用少量显式里程碑，而不是引入通用插值器。
-
-### 5.2 LeFranX
-
-值得采用：
-
-- 驱动保持为固定 12 维绝对位置接口；
-- 命令对象预分配，循环中只更新固定字段；
-- home 使用普通位置命令，不建立特殊旁路。
-
-不建议采用：
-
-- `np.clip` 后继续执行，静默改变调用方请求；
-- 通过匹配错误字符串决定忽略 SDK 失败；
-- stub 或未实现路径默认返回成功；
-- 固定选择第一个设备；
-- 按 SDK 数组位置而不是 joint ID 解释状态；
-- 缺少明确 close 和恢复语义。
-
-本项目现有的设备 ID 检查、范围拒绝、SDK 成功后才更新 `last_qpos_cmd` 等行为比参考实现更可靠，应保留。
-
-### 5.3 DexUMI
-
-值得采用：
-
-- 采集、映射和硬件控制分层；
-- 使用固定领域状态对象表达一次完整样本；
-- 明确状态更新频率与缓存所有权；
-- 标定参数与控制过程分离。
-
-不建议采用：
-
-- reader 和 controller 并发访问同一 SDK；
-- 新增 ZMQ/pickle 控制面；
-- 用虚拟状态累计代替实际反馈；
-- 隐藏硬编码补偿、校准和单位转换；
-- 并列存在多套 server、interpolator 或命令协议。
-
-DexUMI 对本项目最重要的启示是负面的：当前单 worker + SharedStorage 的所有权更清晰，不应为了“模块化”引入第二条控制链。
-
-## 6. 目标设计
-
-### 6.1 单一手部健康门
-
-项目已经存在纯函数 `teleop.keyboard.validate_hand_feedback()`。为避免新增一份近似实现，应把它原样迁移到中立模块，例如 `robot/hand_health.py`，再让 keyboard、teleop、policy、home 和 replay 共同导入。第一步保持函数参数和返回值不变；如重复的 structured-record 解包确实明显，再增加一个很薄的 record adapter，而不是重写第二套规则。
-
-迁移时必须同步修改所有 import，并先为原函数建立离线回归用例。不能在“移动函数”的同一提交中改变 `send_healthy/read_healthy` 含义或超时默认值。
-
-为保持现有诊断优先级，纯函数的检查顺序先维持为：
-
-1. `connected`；
-2. 当前 hand `error_state`；
-3. `state_valid`；
-4. 按现有共享字段语义检查 `send_healthy/read_healthy`；
-5. source timestamp 存在且不在未来；
-6. resolved `max_age_s` 有效，且 worker 接受时间未过期；
-7. qpos shape 正确且全部数值有限。
-
-该函数只解释反馈，不发布命令、不修改 flag、不读取 SDK。hand ring 为空由调用它的薄 adapter 先处理。`max_age_s` 必须由 resolved runtime 配置显式传入，不能在 helper 内硬编码，也不能从 `SharedStorage` 猜测默认值；阶段一必须把该参数贯穿所有直接调用方，不能增加悄然放宽检查的默认值。
-
-policy 内再保留一个很薄的读取 adapter：一次读取 hand record，调用上述纯函数，健康时返回包含 `qpos`、source timestamp 和可选 `last_cmd_qpos` 的内部 snapshot；`last_cmd_qpos` shape/finite 不合格时保持 `None`，不把反馈健康与 delta reference 可用性混成同一条件。`publish_joint_targets()` 当前以 hand frame 的 `last_cmd_qpos` 做 delta reference，因此它的 delta preflight 与 gate 应使用同一 snapshot。learned policy、teleop 等路径已有不同的 last-published/last-accepted delta 契约，这些路径只复用健康判断，不改变其 delta reference。应删除或限制能用裸 `current_hand_qpos` 跳过健康检查的入口。这样既避免重复读取产生不一致，也避免“调用方传了一个数组，所以默认它健康”的旁路。
-
-### 6.2 最小 XHand 驱动接口
-
-建议保留四个现有必需操作和一个可选显式操作；前两个实施阶段不做方法改名：
+前两个阶段不做方法改名，保留四操作 + 一个可选显式步骤：
 
 ```python
 class XHand:
     def connect(self) -> bool: ...
     def get_state(self) -> XHandSample: ...
     def send_action(self, qpos_rad: np.ndarray) -> bool: ...
-    def initialize_tactile(self) -> bool: ...  # 可选的显式步骤
+    def initialize_tactile(self) -> bool: ...  # 显式步骤
     def disconnect(self) -> None: ...
 ```
 
-`XHandSample` 只携带单次读取的固定数据：
+`XHandSample` 是单次读取的固定数据类型（`frozen=True` 仅冻结属性绑定，不冻结 ndarray 内容）：
 
 ```python
 @dataclass(frozen=True)
@@ -311,195 +121,146 @@ class XHandSample:
     tipboard_error: np.ndarray
 ```
 
-`current` 沿用当前 SDK 字段名；在厂商量纲未确认前，不把它改写为 `_a`、`_ma` 或扭矩单位。上述 `frozen=True` 只冻结属性绑定，不冻结 ndarray 内容。实现时每个数组必须脱离 SDK 缓冲区并由 sample 独占；如果解析器已经生成新数组，不再做一次无意义的深拷贝；只有 SDK 返回共享/view 缓冲区时才显式 copy。如果类型对外承诺只读，应在构造后对数组执行 `setflags(write=False)`。worker 写入共享 dtype 时仍创建新 frame，不直接发布或原地复用 sample 数组。
-
 要求：
 
-- 所有数组在构造前完成精确 shape、joint ID 唯一性和 finite 校验；
-- SDK 返回错误时统一抛出一个由 worker 捕获的局部读取异常，不同时混用异常、`None` 和 NaN 半成品三套失败协议；
+- 所有数组构造前完成精确 shape、joint ID 唯一性、finite 校验；
+- SDK 返回错误时**统一抛局部读取异常**（不再混用异常 / `None` / NaN 半成品三套失败协议）；worker 捕获后决定重试或升级；
 - `send_action()` 仅在 SDK 确认成功后更新 `last_qpos_cmd`；
-- `disconnect()` 幂等，并重置整个会话状态；底层 SDK control 一旦成功创建，每个会话最多关闭一次；
+- `disconnect()` 幂等并重置整个会话状态；底层 control 每个会话至多 close 一次；
+- 构造器**恒 copy 并 `setflags(write=False)`**（"仅当 SDK 返回 view 才 copy"是脆弱优化、几乎零收益）；worker 每帧新建 shared dtype record，不原地复用 sample 数组；
 - 驱动不修改 `SharedStorage`，不决定 sticky fault，不持有跨进程状态。
 
-由于驱动只有一个直接消费者，命令返回不必引入复杂的跨进程结果对象。`bool` 加同一次调用捕获的 SDK 错误码和结构化日志已经足够；状态样本则值得使用固定类型，因为它替代了当前多分支字典和 NaN sentinel。不要在驱动和 worker 各记录一次相同堆栈：驱动提供错误上下文，worker 在决定重试或升级的位置记录一次。
+### 3.3 worker 统一恢复策略（字段语义据实）
 
-### 6.3 worker 统一拥有恢复策略
+`hand_process` 拥有 SDK 生命周期、首帧读取与 readiness、命令 generation/序号/global safety gate、私有读写重试/watchdog/故障升级、board 错误状态转换日志、完整样本到 shared dtype 的转换、统一 close。
 
-`hand_process` 应拥有：
-
-- SDK 对象完整生命周期；
-- 首帧读取和 readiness 发布；
-- 命令 generation、序号与 global safety gate；
-- 私有的读写重试、watchdog 与故障升级策略；
-- board 错误状态转换日志；
-- 将完整样本一次性转换为共享内存 dtype；
-- 初始化失败、正常退出、可捕获的循环异常和 e-stop 的统一 close；不可捕获的进程死亡由 supervisor 检测，不能承诺执行进程内 finally。
-
-建议明确状态字段语义：
-
-| 字段 | 唯一语义 |
+| 字段 | 唯一语义（据当前实现） |
 |---|---|
-| `state_valid` | 保持现有共享契约；最近发布的状态是否来自一次成功且完整的读取 |
-| `read_healthy` | 保持现有共享契约；读取失败 watchdog 是否尚未触发 |
-| `send_healthy` | 保持现有共享契约；发送失败 watchdog 是否尚未触发 |
-| `connected` | 保持现有共享契约；最近读取时驱动仍认为设备已连接 |
+| `state_valid` | 最近发布状态是否来自成功读取；**当前实现为镜像 `connected`（`hand_process.py:473`，首帧无条件置 1）** |
+| `read_healthy` | 读取失败 watchdog 是否尚未触发 |
+| `send_healthy` | 发送失败 watchdog 是否尚未触发 |
+| `connected` | 最近读取时驱动仍认为设备已连接 |
 | `source_monotonic_ns` | worker 接受该完整样本的 host 单调时间 |
-| hand frame 的 `error_state` | 当前样本是否包含非零板错误寄存器；它不是 sticky global fault |
-| `shared.error_state.value` | 进程间 sticky global fault，继续遵守既有所有权和升级路径 |
+| hand frame `error_state` | 板错误寄存器，**或非 raising 的读写错误**（`_record_error` 在 send/read/`hand_command is None` 路径也置位） |
+| `shared.error_state.value` | 进程间 sticky global fault，遵守既有所有权与升级路径 |
 
-连续失败策略先继续使用现有私有计数器，成功时重置、失败时增加。只有在独立策略变更中才改用 `failure_started_ns`；届时仍不能静默改变上述共享字段含义，并必须审计所有消费者。
+连续失败策略沿用现有私有计数器（成功重置、失败累计）；改 `failure_started_ns` 单调时间阈值属独立运行行为变更，须单独审计所有消费者。
 
-### 6.4 显式触觉初始化
+### 3.4 显式触觉初始化
 
-目标上，连接动作只负责创建 SDK、打开目标设备、确认通信协议和设备 ID、记录身份；触觉 reset/bias 作为独立初始化步骤，由 worker 在明确条件下调用。但这一拆分必须保持当前启动顺序：worker 在触觉步骤完成并发布首个有效关节状态之后，才设置 heartbeat 和 `hand_ready`。
+连接动作只负责建 SDK、开目标设备、确认协议与设备 ID、记录身份；触觉 reset/bias 作为独立 `initialize_tactile()` 由 worker 在明确条件下调用。保持现有启动顺序：触觉步骤完成并发布首个有效关节状态后，才设 heartbeat 与 `hand_ready`。第一轮拆分继续默认执行触觉初始化，保留"触觉校准失败可降级为 `calibrated=False`、有效关节控制仍可 ready"的策略；是否默认执行、是否把校准失败升级为启动失败属后续运行行为变化，需单独 fake 检查与硬件验证。
 
-这样可以同时满足：
+### 3.5 通信协议支持面
 
-- 日志能区分通信失败与触觉校准失败；
-- 只读诊断无需修改传感器基线；
-- 未来重连可以决定复用还是重新计算 bias；
-- 接触检查发生在明确的校准入口，而不是隐藏于 `connect()`。
+生产链固定 EtherCAT。作明确裁决：若生产永远 EtherCAT，则生产配置与驱动声明 EtherCAT-only，RS485 移入独立诊断适配器/示例；若须支持 RS485，则 `comm_type`/设备名/串口参数纳入 immutable runtime，两种协议分别 fake 测试，且 RS485 状态轮询禁止隐式重发命令。裁决前先修公共逻辑与失败清理，不必立即删协议分支。
 
-第一轮拆分继续默认执行触觉初始化，并保持“触觉校准失败可降级为 `calibrated=False`、但有效关节控制仍可 ready”的现有策略。是否默认执行、是否把校准失败升级为启动失败，都属于后续运行行为变化，需要单独的离线 fake 检查和硬件验证，不能在纯重构中悄然改变。
+## 4. 参考项目取舍
 
-### 6.5 通信协议支持面
+参考项目用于提炼边界与模式，不作为可直接复制的实现。
 
-当前生产链实际固定 EtherCAT。为了避免半支持状态，建议按真实部署作一次明确裁决：
+- **LeFranX**：adopt（固定 12 维绝对位置接口、命令对象预分配、home 走普通位置命令）与 reject（`np.clip` 后继续、按错误字符串匹配忽略、stub 默认成功、固定选首设备、按数组位置而非 joint ID 解释状态、缺 close/恢复语义）均逐条有据，可采纳。
+- **DexUMI**：负面教训成立——单 worker + SharedStorage 所有权更清晰，不应为"模块化"引入第二条控制链（ZMQ/pickle/多套 server/interpolator/命令协议）。adopt 项中"状态更新频率与缓存所有权""标定参数与控制分离"恰是参考文档自己列的缺陷（M-3 新鲜度不可见、M-9 硬编码补偿漂移），不应作为其成熟实践引用。
+- **πR² XHand**：底层判断（避免应用层插值、保持单一所有权链）正确，但初稿的支撑错位。其参考文档**自己把**"命令执行与实测分开"列为 P0 缺陷、"记录 SDK 版本/设备 ID"明确说没有、"完整 try/finally"说清理不足、"fake SDK 覆盖失败路径"说无 XHand 测试——这些不是 πR² 的现有实践，而是它的待修项，不得作为 adopt 依据。可采纳的只有"反馈不依赖本地命令历史推算"与"打开设备后记录身份"的方向性要求。reject 项应改为**本地故障状态机**（πR² 是单进程 in-process FSM，非"跨进程状态机"）与**启动期 home/首动作插值**（`interpolate_to` 只在启动期，主循环不逐 tick 插值）。
 
-- 若生产永远使用 EtherCAT：生产配置和驱动明确为 EtherCAT-only，RS485 放入独立诊断适配器或示例；
-- 若必须支持 RS485：把 `comm_type`、设备名和串口参数纳入 immutable runtime，并对两种协议分别进行 fake/offline 测试。RS485 状态轮询必须禁止隐式重发命令。
+本项目已有的设备 ID 检查、范围拒绝、SDK 成功后才更新 `last_qpos_cmd` 等行为比参考实现更可靠，应保留。
 
-在裁决前，可以先修复公共逻辑和失败清理，不必立即删除协议分支。
-
-## 7. 分阶段实施方案
+## 5. 分阶段实施
 
 ### 阶段零：冻结现有行为
 
-在修改生产代码前，用 fake SDK/SharedStorage 固定以下基线：
+用 fake SDK/SharedStorage 固定基线：EtherCAT 生产配置与设备 ID 选择；`HAND_STATE_DTYPE` 各字段现有含义；首个有效 hand frame 先于 `hand_ready`；触觉校准失败可降级但不触发 home；watchdog 现有计数与 sticky global fault；`send_command` 的 arm-then-hand 非原子顺序。基线保证每次提交只改变它声明要改变的行为。
 
-- 当前 EtherCAT 生产配置和设备 ID 选择；
-- `HAND_STATE_DTYPE` 各字段的现有含义；
-- 首个有效 hand frame 先于 `hand_ready`；
-- 触觉校准失败可以降级，但不会触发 home；
-- watchdog 的现有计数和 sticky global fault 行为；
-- `send_command()` 的 arm-then-hand 非原子传输顺序。
+### 阶段一：发布门收口（已大半落地，剩一项行为变更）
 
-这些基线不代表永远不改，而是保证每次提交只改变它声明要改变的行为。
+`88becfd` 已落地：fail-closed `_hand_feedback_snapshot`、删除全零回退与 `current_hand_qpos` 参数、`hand_qpos is None` 自然走纯 arm。**剩余**：
 
-### 阶段一：修复发布边界
+1. 迁移 `validate_hand_feedback` 到 `utils/hand_health.py`（含 `validate_arm_feedback`），保持签名/返回不变；
+2. 让 `_hand_feedback_snapshot` 委托该纯函数，补上 source 时间戳存在性、未来时间戳与 `max_age_s` 过期检查；
+3. **`max_age_s` 必须由 resolved runtime 配置显式传入**，贯穿所有直接调用方；不得在 helper 内硬编码或从 `SharedStorage` 猜默认值；
+4. 该过期检查是行为变更，波及三个 snapshot 消费者（耦合发布、`wait_applied` ack 循环 `safety.py:934-994`、hand-home `:1140/1225`），配独立 fake 测试。
 
-修改范围：`policy/safety.py` 及其直接调用方。
+不在此阶段改 transport 写入顺序、watchdog 或共享字段语义。
 
-1. 将已有 `validate_hand_feedback()` 迁移到中立模块，保持函数行为不变；
-2. 增加薄 adapter，一次读取并验证 hand record，生成供 qpos/delta/gate 共用的内部 snapshot；
-3. 所有包含 `hand_qpos` 的候选动作在第一次 IPC 写入前调用同一健康规则；
-4. 删除全零当前手姿态回退和裸 `current_hand_qpos` 健康旁路；
-5. `candidate.hand_qpos is None` 时自然走纯 arm 路径，不新增通用 arm-only 开关；
-6. 对健康/安全校验失败，保证 arm queue 和 hand ring 都没有新写入；
-7. 不在本阶段修改 transport 写入顺序、watchdog 或共享字段语义。
+### 阶段二：生命周期收口
 
-这是独立、风险最低且收益最大的修改，应首先完成。
+`robot/xhand.py`、`robot/hand_process.py`：
 
-### 阶段二：行为保持的生命周期收口
+1. `disconnect()` 幂等并覆盖所有初始化失败路径；
+2. 外层 `try/finally` 统一正常退出、初始化失败、异常退出的关闭路径；
+3. 删除 `clear_local_error()` 与相关"恢复成功"日志，**与"成功重置/失败累计、原 watchdog 阈值不变"的替代物同提交落地**；
+4. board error 出现/变化/消失记录精确数组、关节与十六进制值，重复相同值限频。
 
-修改范围：`robot/xhand.py`、`robot/hand_process.py`。
+不修改 shared dtype、readiness 顺序、触觉策略或通信协议。
 
-1. 让 `disconnect()` 幂等并覆盖所有初始化失败路径；
-2. 用一个外层 `try/finally` 统一正常退出、初始化失败和异常退出的关闭路径；
-3. 删除 `clear_local_error()` 及相关“恢复成功”日志，但保持成功重置、失败累计和原 watchdog 阈值；
-4. 对 board error 的出现、变化和消失记录精确数组、关节和十六进制值，并对重复相同值限频；
-5. 不修改 shared dtype、readiness 顺序、触觉策略或通信协议。
+### 阶段三：驱动内部简化
 
-### 阶段三：行为保持的驱动内部简化
+1. 引入固定 `XHandSample`，合并 `get_state(full=True/False)`，删除 NaN 状态字典与静默 resize；
+2. 统一抛局部读取异常，删除 `full` 双返回协议（`full=True` 的 `error_state` 一帧滞后陷阱须写进注释：worker 读对象字段故安全，未来读 merged sample 的调用方会看到滞后）；
+3. 保留公共方法名，先迁移唯一生产消费者；原始 SDK 示例在阶段五收紧；
+4. sample 数组恒 copy + `setflags(write=False)`；worker 每帧新建 shared dtype record；
+5. 删除经 `rg` 确认无调用的配置/诊断字段——**须先产出具体字段清单**（当前 `last_error_code`/`last_joint_limit_rejected`/`force_update_state` 等仍存活，`xhand.py:104/191/887/939`），并标注每个删除字段的读者（`_init_hand_state` 与 worker per-tick parse 是 `XHandSample` 合并的首个回归点）。
 
-1. 引入固定 `XHandSample`；
-2. 合并 `get_state(full=True/False)`；
-3. 删除 NaN 状态字典和静默 resize；
-4. 保留现有公共方法名，先迁移唯一生产消费者；原始 SDK 示例在阶段五单独收紧；
-5. 确保 sample 数组拥有独立副本，worker 每帧新建 shared dtype record；
-6. 删除经 `rg` 确认无调用的配置和诊断字段。
+本阶段保持 shared dtype 与可观察行为不变，不与 schema 变更混在一起。
 
-该阶段保持共享内存 dtype 和调用方可观察行为不变，避免把内部简化与 schema 变更混在一起。每删除一个字段或分支，都先确认生产 worker、示例和文档没有消费者。
+### 阶段四：独立运行行为变更（分别提交、分别验证）
 
-### 阶段四：逐项评审运行行为变化
+1. 触觉初始化从 `connect()` 拆出（保持原启动顺序与降级策略）；
+2. 失败命令计数改单调时间阈值（明确配置迁移，分别验证 16Hz 命令/30Hz worker/命令静默）；
+3. 裁决 EtherCAT-only 或正式双协议支持；
+4. 如需改 `HAND_STATE_DTYPE` 或字段含义，做 dtype → worker → 所有消费者 → recording/replay 的完整纵向审计；
+5. 定义 arm/hand transport 第二次写入失败的协调停止行为，不引入 commit/rollback 协议。
 
-以下事项不能与内部重构捆绑，应分别提交、分别验证：
-
-1. 把触觉初始化从 `connect()` 中拆出，同时保持原启动顺序和降级策略；
-2. 将失败命令计数改成单调时间阈值，并明确配置迁移；
-3. 决定 EtherCAT-only 或正式双协议支持；
-4. 如需修改 `HAND_STATE_DTYPE` 或字段含义，执行 dtype → worker → 所有消费者 → recording/replay 的完整纵向审计；
-5. 对 arm/hand transport 的意外第二次写入失败，定义协调停止行为，但不引入 commit/rollback 协议。
-
-这些变化需要独立风险评估；涉及真实 SDK 时还需要用户授权后的硬件验证。
+涉及真实 SDK 的须经用户授权后硬件验证。
 
 ### 阶段五：收紧示例与文档
 
-`examples/xhand_control_example.py` 默认只枚举、读取和打印状态；RS485 状态读取显式使用 `force_update=False`，避免“读取”重发 SDK 的最后命令。任何运动需要显式参数及人工确认，并使用 `try/finally` 保证 close。预设动作必须经过生产机械和运行范围校验，不能直接绕过安全层发送原始 SDK 命令。
+`examples/xhand_control_example.py` 默认只枚举、读取、打印状态；RS485 读取显式 `force_update=False`；任何运动需显式参数与人工确认，`try/finally` 保证 close；预设动作走生产机械与运行范围校验，不绕过安全层发原始 SDK 命令。同步更新 `README.md` 文件地图与 `CLAUDE.md` 路由说明。
 
-如实施改变了文件职责或关键所有权，应同步更新 `README.md` 文件地图和 `CLAUDE.md` 路由说明。
+## 6. 验收标准
 
-## 8. 验收标准
+### 6.1 离线检查（fake SDK/SharedStorage，不初始化硬件）
 
-### 8.1 必需离线检查
+1. 无 hand frame 且候选含手目标：拒绝；`connected=False`：拒绝，arm queue 与 hand ring 都不变；
+2. `state_valid=False`、当前 hand `error_state=True` 或 I/O watchdog 不健康：拒绝；
+3. qpos 含 NaN/Inf、shape 错误：拒绝；
+4. **状态过期/未来时间戳：拒绝（阶段一后）** —— 当前代码尚不满足，接上过期检查后方可通过；
+5. 无效/过期 hand record 不能被"调用方传有限数组"绕过；
+6. 同一次候选发布的 hand qpos、delta reference、健康元数据来自同一 verified snapshot；
+7. `candidate.hand_qpos is None` 且 arm 反馈健康：不读虚构全零手姿态，只发布 arm；
+8. **`candidate.hand_qpos is None` 且手离线（ring 空 / `connected=False`）：仍发布 arm 端点**（当前代码满足，需回归钉住）；
+9. 一次未达阈值的发送失败不永久禁止下一条恢复命令；
+10. SDK open 在每个初始化步骤抛错：底层 control 每个会话至多 close 一次；
+11. 重复 `disconnect()`：不报错、不重复访问失效资源；
+12. malformed/缺失/重复 joint ID：整帧失败；
+13. send 失败：`last_qpos_cmd` 不前移；
+14. fake SDK 返回后修改其内部数组：已构造的 `XHandSample` 不变化；
+15. 触觉初始化完成或明确降级、首个有效 hand frame 发布后，才设 `hand_ready`；
+16. RS485 只读不调用 send；EtherCAT 分支不依赖该参数；
+17. board error 出现/变化/消失：状态与日志一致，重复相同值不刷屏；
+18. 阶段二保持原 watchdog 触发点；只有阶段四改时间策略后才要求不同频率下按相同墙钟时长升级；
+19. 正常 shutdown、可捕获初始化/循环异常、e-stop 都进统一 close；对 SIGKILL/崩溃等无法执行 `finally` 的死亡，验证 supervisor 能检测、锁存故障、协调关闭，不伪称已 SDK close；
+20. **`validate_hand_feedback` 迁移后各调用方拒绝字符串逐字不变（黄金字符串测试）**；
+21. **hand-home 与 `wait_applied` 循环在 stale/unhealthy 下行为正确**；
+22. 如改 transport 异常处理：arm 已入队而 hand ring 写入异常时进协调停止/故障路径，不返回成功、不伪称回滚完成。
 
-建议新增或扩展以下 deterministic checks，全部使用 fake SDK/SharedStorage，不初始化真实硬件。每个阶段只启用与该阶段声明行为对应的检查：
-
-1. 无 hand frame 且候选含手目标：拒绝；
-2. `connected=False`：拒绝，arm queue 和 hand ring 都不变；
-3. `state_valid=False`、当前 hand `error_state=True` 或 I/O watchdog 不健康：按现有健康规则拒绝；
-4. qpos 含 NaN/Inf、shape 错误或状态过期：拒绝；
-5. 即使调用方提供有限的裸 `current_hand_qpos`，无效/过期 hand record 仍不能被绕过；
-6. 同一次候选发布的 hand qpos、last-command delta reference 和健康元数据来自同一 verified snapshot；
-7. `candidate.hand_qpos is None` 且 arm 反馈健康：不读取虚构的全零 hand 姿态，只发布 arm；
-8. 一次未达到 watchdog 阈值的发送失败不会永久禁止下一条恢复命令；
-9. SDK open 在每个初始化步骤抛错：底层 control 每个会话最多 close 一次；
-10. 重复 `disconnect()`：不报错、不重复访问失效资源；
-11. malformed、缺失或重复 joint ID：整帧失败；
-12. send 失败：`last_qpos_cmd` 不前移；
-13. fake SDK 返回后修改其内部数组：已经构造的 `XHandSample` 不发生变化；
-14. 触觉初始化完成或明确降级、首个有效 hand frame 已发布后，才能设置 `hand_ready`；
-15. RS485 read-only 读取不调用 send；EtherCAT 分支不依赖该参数；
-16. board error 出现、变化和消失：状态与日志一致，重复相同值不会刷屏；
-17. 阶段二保持原 watchdog 触发点；只有阶段四改成时间策略后，才要求不同 worker/control 频率下按相同墙钟时长升级；
-18. 正常 shutdown、可捕获的初始化/循环异常和 e-stop 都进入统一 close；对 SIGKILL、进程崩溃等无法执行 `finally` 的 worker death，不伪称已经调用 SDK close，验证 supervisor 能检测死亡、锁存故障并协调其他进程关闭；
-19. 如修改 transport 异常处理：在 arm 已入队而 hand ring 写入异常时进入协调停止/故障路径，不返回成功，也不伪造回滚完成。
-
-### 8.2 仓库级检查
-
-Python 修改完成后至少执行：
+### 6.2 仓库级检查
 
 ```bash
 conda run -n real_robot python -m compileall -q dexmani_real examples
 git diff --check
 ```
 
-并运行项目现有离线检查以及新增的 XHand fake 检查。`examples/test_*.py` 属于交互式硬件程序，不能当成自动化测试运行。
+并运行项目现有离线检查与新增 XHand fake 检查。`examples/test_*.py` 属交互式硬件程序，不能当自动化测试运行。
 
-### 8.3 硬件验证边界
+### 6.3 硬件验证边界
 
-以下项目需要用户明确授权、工作区清空和硬件就绪后单独执行：
+以下须用户明确授权、工作区清空、硬件就绪后单独执行：真实 EtherCAT/RS485 开关；触觉 reset/bias；home 或任意预设动作；板级错误复现；`tor_max`、PID、机械范围或实时调度调整。
 
-- 真实 EtherCAT/RS485 打开与关闭；
-- 触觉 reset/bias 行为；
-- home 或任意预设动作；
-- 板级错误复现；
-- `tor_max`、PID、机械范围或实时调度调整。
+## 7. 预期结果
 
-## 9. 预期结果
+完成上述方案后：不健康手反馈不能越过任何耦合动作发布边界（含过期帧）；SDK 生命周期只有一个所有者和一条 close 路径；驱动不再承担状态模型、恢复策略与共享内存语义；读写健康、持续失败与全局 sticky fault 各自只有一种含义；触觉校准是可见、可测试、可选择的步骤；EtherCAT 与 RS485 支持范围明确；现场异常日志精确说明"发生了什么"而非把相关性写成原因；不新增控制服务、线程、插值器或跨进程协议。
 
-完成上述方案后，XHand 控制链应具备以下性质：
-
-- 不健康手部反馈不能越过任何耦合动作发布边界；
-- SDK 生命周期只有一个所有者和一条 close 路径；
-- 驱动不再同时承担状态模型、恢复策略和共享内存语义；
-- 读写健康、持续失败和全局 sticky fault 各自只有一种含义；
-- 触觉校准是可见、可测试、可选择的步骤；
-- EtherCAT 与 RS485 的支持范围明确，不再存在隐式协议副作用；
-- 现场异常日志能精确说明“发生了什么”，但不会把相关性误写为原因；
-- 不增加新的控制服务、线程、插值器或跨进程协议。
-
-## 10. 参考材料
+## 8. 参考材料
 
 - [`docs/xhand/pi-r2-xhand.md`](xhand/pi-r2-xhand.md)
 - [`docs/xhand/lefranx_xhand.md`](xhand/lefranx_xhand.md)

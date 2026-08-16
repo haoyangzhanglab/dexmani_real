@@ -396,6 +396,20 @@ class HandParams:
     # watchdog, but do not issue a guessed set_firmware_state() request.
     ethercat_slave_position: int = -1
 
+    # ── Connection / transport ──
+    # Canonical transport protocol. Production is EtherCAT-only; "serial"
+    # (RS485) is retained for the diagnostic adapter. The value is validated to
+    # this closed set, so the driver never guesses a protocol from a fuzzy
+    # string (the former rs485/serial/usb/eth/ecat aliases are gone).
+    comm_type: str = "ethercat"
+    # Optional serial device name (e.g. /dev/ttyUSB0). None lets the driver
+    # enumerate the bus itself. Ignored for EtherCAT.
+    device_name: str | None = None
+    # RS485 baudrate. Ignored for EtherCAT.
+    baudrate: int = 3_000_000
+    # Vendor device id the driver must find among enumerated hands at connect.
+    device_id: int = 0
+
     # ── Home position (deg) — open-hand neutral ──
     home_qpos_deg: tuple[float, ...] = (
         0.0,
@@ -492,7 +506,10 @@ class HandParams:
     home_command_ack_timeout_s: float = 1.0
 
     # ── Send-error watchdog ──
-    send_err_watchdog_count: int = 30  # 1s @ 30Hz
+    # Frame-count threshold: only a failed *new* command send increments the
+    # counter, so 30 consecutive failures span ~1.875s at the 16 Hz command
+    # rate (not the 30 Hz worker loop rate).
+    send_err_watchdog_count: int = 30
 
     # ── Hand FK (fingertip positions in world frame) ──
     fingertip_link_names: tuple[str, ...] = (
@@ -521,6 +538,14 @@ class HandParams:
     def __post_init__(self) -> None:
         if self.ethercat_slave_position < -1:
             raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
+        if self.comm_type not in ("ethercat", "serial"):
+            raise ValueError("hand comm_type must be 'ethercat' or 'serial'")
+        if self.device_name is not None and not isinstance(self.device_name, str):
+            raise ValueError("hand device_name must be a string or null")
+        if not isinstance(self.baudrate, int) or self.baudrate <= 0:
+            raise ValueError("hand baudrate must be a positive integer")
+        if not isinstance(self.device_id, int) or self.device_id < 0:
+            raise ValueError("hand device_id must be a non-negative integer")
         limit_vectors = (
             self.mechanical_qpos_min_rad,
             self.mechanical_qpos_max_rad,

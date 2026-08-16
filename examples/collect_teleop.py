@@ -62,7 +62,7 @@ from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig
 from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.keyboard import validate_arm_feedback, validate_hand_feedback
+from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.teleop.loop import teleop_loop
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import get_logger
@@ -523,6 +523,7 @@ def run_teleop_experiment(
                 command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
                 mechanical_lower_rad=np.asarray(runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
                 mechanical_upper_rad=np.asarray(runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
+                hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
                 max_command_delta_rad=runtime.hand.max_delta_rad,
                 timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                 heartbeat=False,

@@ -67,6 +67,7 @@ def _coordinator_config(
         hand_max_delta_rad=(
             hand_defaults.max_delta_rad if hand_max_delta_rad is None else hand_max_delta_rad
         ),
+        hand_feedback_max_age_s=1.0,
         control_hz=control_hz,
     )
 
@@ -272,11 +273,13 @@ def main() -> int:
     shared2 = SharedStorage.create(prefix="check_plan_scheduler_seed")
     try:
         shared2.hand_state_ring.write(make_hand_state_frame(hand_mid))
-        seed = _seed_hand_reference(shared2)
+        seed = _seed_hand_reference(shared2, hand_feedback_max_age_s=1.0)
         assert seed is not None, "valid hand feedback must seed the reference"
         np.testing.assert_allclose(seed, hand_mid)
         shared2.hand_state_ring.write(make_hand_state_frame(hand_mid, send_healthy=0))
-        assert _seed_hand_reference(shared2) is None, "unhealthy command I/O must not seed"
+        assert (
+            _seed_hand_reference(shared2, hand_feedback_max_age_s=1.0) is None
+        ), "unhealthy command I/O must not seed"
     finally:
         shared2.close()
 

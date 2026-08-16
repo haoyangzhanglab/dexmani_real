@@ -72,6 +72,7 @@ def _coordinator_config(
         hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
         hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
         hand_max_delta_rad=hand_max_delta_rad,
+        hand_feedback_max_age_s=1.0,
         control_hz=100.0,
     )
 
@@ -207,7 +208,9 @@ def main() -> int:
         bad_arm = np.asarray(arm_defaults.joint_limit_upper, dtype=np.float64) + 10.0
         candidate = build_action_candidate(shared, bad_arm, None)
         assert candidate is not None
-        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0
+        )
         assert result.status == CommandPublishStatus.GATE_REJECTED, result
         assert result.gate_code == GateRejectCode.ARM_JOINT_LIMIT, result
         assert result.reason == "arm joint limit violation", result
@@ -221,7 +224,9 @@ def main() -> int:
         assert transition(shared2, SafetyState.ARMED)
         candidate = build_action_candidate(shared2, arm_mid, None)
         assert candidate is not None
-        result = validate_and_send_candidate(shared2, candidate, gate=gate)
+        result = validate_and_send_candidate(
+            shared2, candidate, gate=gate, hand_feedback_max_age_s=1.0
+        )
         assert result.status == CommandPublishStatus.ARM_FEEDBACK_UNAVAILABLE, result
     finally:
         shared2.close()
@@ -236,7 +241,7 @@ def main() -> int:
         candidate = build_action_candidate(shared3, arm_mid, None)
         assert candidate is not None
         result = validate_and_send_candidate(
-            shared3, candidate, gate=gate, prepare_timeout_s=0.05
+            shared3, candidate, gate=gate, hand_feedback_max_age_s=1.0, prepare_timeout_s=0.05
         )
         assert result.status == CommandPublishStatus.ARM_QUEUE_FULL, result
         _drain_arm_queue(shared3)

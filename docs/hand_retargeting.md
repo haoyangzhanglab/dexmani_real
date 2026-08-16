@@ -1,295 +1,237 @@
-# Hand Retarget 机制与代码实现深度解析
+# Hand Retarget 当前控制合同与实现说明
 
-> 适用版本：基于仓库当前工作树与提交 d97c436 的静态审计  
-> 审计日期：2026-08-15  
-> 范围：Quest 手部关键点进入共享内存后，到 XHand 命令被工作进程接收并发送给设备之前的完整链路  
-> 安全说明：本文分析与验证均为离线操作，没有连接、探测或驱动真实硬件
+> 最近静态审阅：2026-08-16
+>
+> 代码基线：HEAD `88becfd`，并核对了当时与本链路相关的未提交工作树内容
+>
+> 适用范围：Quest 右手关键点写入共享内存后，到 XHand 命令跨越 SDK 边界之前
+>
+> 安全说明：本文只描述静态实现；没有连接、探测或驱动真实硬件
 
-## 1. 结论先行
+## 1. 本文的用途与边界
 
-本仓库的 hand retarget 并不是一个孤立的“关键点到关节角”函数，而是一条带有明确所有权、时序约束、共享内存协议、失效语义与硬件边界的控制流水线：
+本文是 hand retarget 的**当前实现合同**，回答以下问题：
 
-~~~text
+- 输入观测如何进入求解器；
+- TAG 与 DexPilot 分别优化什么；
+- 求解结果经过哪些整形、验证和发布边界；
+- 各类时间状态在什么时候推进；
+- 失败时机械臂、手和记录分别发生什么；
+- 当前实现没有提供哪些碰撞、接触和可复现性保证。
+
+本文不把未来设计写成当前能力。所有尚未实现的建议集中在第 14 节，并明确标记为 backlog。
+
+源码和运行配置始终是最终事实来源。本文刻意不复制所有默认值、依赖版本和 dtype 字段，以减少实现变化后的文档漂移。
+
+## 2. 当前合同摘要
+
+当前链路为：
+
+```text
 Quest HTS 右手关键点
     │
     ▼
 Unity 坐标系 → FLU 坐标系
     │
     ▼
-VR_FRAME_DTYPE / vr_ring
+VR_FRAME_DTYPE / 历史可验证 VR ring
     │
     ▼
-16 Hz 因果采样与新鲜度检查
+16 Hz 因果观测选择与新鲜度检查
     │
-    ├── 无效或陈旧：命令静默、generation 失效、等待重新锚定
-    │
-    ▼
-几何合法性检查
+    ├── 陈旧、跨 generation 或未完成重锚：停止发布或 hold
     │
     ▼
-掌心局部坐标系 + MANO 轴约定
+21×3 shape / finite / 几何退化检查
     │
     ▼
-自适应小指长度增强
+掌心局部坐标系 → MANO 轴约定 → 自适应小指补偿
     │
-    ├── TAG：两阶段数值优化，默认后端
-    │
-    └── DexPilot：外部 dex-retargeting 优化器，可选后端
-    │
-    ▼
-外层 EMA → 启动 smoothstep 渐入
+    ├── TAG：两阶段 Pinocchio + NLopt，默认后端
+    └── DexPilot：外部 dex-retargeting，可选后端
     │
     ▼
-形状 / finite / 运行限位 / 机械限位 / 单步增量检查
+startup smoothstep ramp
     │
     ▼
-ActionCandidate → SafetyGate
+可选 command delta clamp → operational command-box clip
     │
     ▼
-HAND_COMMAND_DTYPE / latest-wins hand_cmd_ring
+结构 / finite / operational / mechanical / 可选 delta 复验
     │
     ▼
-30 Hz hand worker：generation / 过期 / 限位 / 增量再次检查
+ActionCandidate → SafetyGate → HAND_COMMAND_DTYPE
     │
     ▼
-XHand driver：第三次边界检查，原样下发目标关节角
-~~~
+latest-wins hand command ring
+    │
+    ▼
+30 Hz hand worker：generation / 过期 / 范围 / 可选 delta 复验
+    │
+    ▼
+XHand driver：最终范围 / 可选 delta 检查，原样发送 endpoint
+```
 
-几个最重要的设计事实是：
+最重要的当前事实是：
 
-1. **默认后端是 TAG，DexPilot 是兼容保留的可选后端。**
-2. **retarget 只使用右手 21 个关键点，不使用 Quest 手腕四元数。** 手腕四元数属于机械臂位姿映射；手指姿态由关键点几何重新建立掌心坐标系。
-3. **TAG 的核心是两阶段优化。** 第一阶段匹配五个指尖的腕心相对位置并保持时间连续；第二阶段只在检测到捏合时，用相对指尖 Jacobian 强化拇指与目标手指闭合。
-4. **系统拒绝非法整条手命令，而不是逐关节裁剪。** 这样不会在边界处悄悄改变手型，也不会把一个求解器错误伪装成合法动作。
-5. **时间状态按“已发布命令”推进，而不是按“求解器产生的候选”推进。** generation、因果采样、重锚、渐入和 worker 侧 last accepted command 一起防止暂停、相机重热、反馈故障后执行旧动作。
-6. **当前碰撞检查使用上一条已发布手姿态。** 新手型和新机械臂目标没有在同一个候选构型上做联合碰撞验证；手内自碰撞对也被禁用。这是当前实现边界，而不是 TAG 优化器的隐含能力。
-7. **记录链路足以分析最终动作，但尚不足以完全复现实验环境。** HDF5 保存了原始 VR 关键点、最终手命令和 TAG 的外层滤波前输出，但没有完整记录优化器状态、激活量、模型资产哈希和原生依赖版本。
+1. 正常控制只消费**右手 21 个关键点**；手腕四元数服务于机械臂映射，不参与手指 retarget。
+2. TAG 是默认后端；DexPilot 是兼容保留的可选后端。
+3. TAG 当前**没有输出级 EMA**。它的连续性来自 Stage 1 时间正则、pinch activation EMA 和启动 ramp。
+4. DexPilot 默认保留外部库内部 LPFilter；仓库包装层的 output EMA 当前为直通。
+5. operational command bounds 当前是**发布前逐关节投影**，不是求解器边界，也不是整条拒绝条件。
+6. `hand.max_delta_rad` 当前默认是 `None`。若显式配置，teleop 先 clamp，worker 与 driver 再做拒绝式复验。
+7. 结构错误、NaN/Inf、机械范围错误和 IPC/lifecycle 错误仍然 fail closed，不会被裁成合法动作。
+8. solver、ramp、published command 和 SDK accepted command 有不同的状态推进时机，不能统称为“按已发布命令推进”。
+9. teleop 的机械臂碰撞求解使用上一条已发布手姿态，不使用同周期新手候选。
+10. tactile 进入反馈与记录，但当前不闭环调节捏合。
 
-## 2. 阅读范围与代码地图
+## 3. 所有权、时钟和数据流
 
-### 2.1 主调用链
+### 3.1 进程所有权
 
-| 层次 | 主要文件 | 关键职责 |
-|---|---|---|
-| 入口与生命周期 | [examples/collect_teleop.py](../examples/collect_teleop.py) | 解析配置、生成 provenance、启动采集生命周期 |
-| VR 输入进程 | [sensor/vr_receiver_process.py](../dexmani_real/sensor/vr_receiver_process.py) | 接收 Quest HTS 帧、坐标转换、写入 VR ring |
-| 固定数据协议 | [utils/schema.py](../dexmani_real/utils/schema.py) | VR frame、hand command、记录样本的 NumPy dtype |
-| 因果读取 | [shm/causal_reader.py](../dexmani_real/shm/causal_reader.py) | 在控制网格锚点之前选择最新可用观测 |
-| 共享内存 | [shm/shared_storage.py](../dexmani_real/shm/shared_storage.py) | ring、flag、generation、生命周期 |
-| teleop 主循环 | [teleop/loop.py](../dexmani_real/teleop/loop.py) | 16 Hz 动作决策、重锚、候选发布、记录 |
-| retarget 包装与算法 | [teleop/hand_retarget.py](../dexmani_real/teleop/hand_retarget.py) | 几何检查、坐标变换、小指增强、TAG/DexPilot 包装 |
-| TAG 优化器 | [teleop/tag_retargeting/optimizer.py](../dexmani_real/teleop/tag_retargeting/optimizer.py) | 两阶段优化、捏合激活、warm start |
-| TAG 梯度 | [teleop/tag_retargeting/pin_grad.py](../dexmani_real/teleop/tag_retargeting/pin_grad.py) | Pinocchio FK、frame Jacobian、目标函数梯度 |
-| 动作整形 | [teleop/hand_control.py](../dexmani_real/teleop/hand_control.py) | 手命令提取、渐入、整条命令校验 |
-| 安全门 | [policy/safety.py](../dexmani_real/policy/safety.py) | ActionCandidate 的发布前结构与范围检查 |
-| 手工作进程 | [robot/hand_process.py](../dexmani_real/robot/hand_process.py) | 30 Hz latest-wins 消费、命令边界复验、反馈与故障 |
-| XHand 驱动 | [robot/xhand.py](../dexmani_real/robot/xhand.py) | SDK 本地所有权、最终限位/增量检查、设备发送 |
-| 关节与模型常量 | [planning/constants.py](../dexmani_real/planning/constants.py) | 12 关节顺序映射、19 DoF 模型索引 |
-| 手部 FK | [planning/hand_kinematics.py](../dexmani_real/planning/hand_kinematics.py) | 从测量关节角计算指尖位置 |
-| 碰撞模型 | [planning/collision_model.py](../dexmani_real/planning/collision_model.py) | 机械臂与手的联合碰撞几何 |
-| 记录样本 | [teleop/episode_samples.py](../dexmani_real/teleop/episode_samples.py) | 将控制网格状态和动作编码为样本 |
-| 记录读写 | [recording/](../dexmani_real/recording) | HDF5 v16 序列化、校验和读取 |
-
-### 2.2 模型与配置资产
-
-| 资产 | 用途 |
+| 层 | 当前所有权 |
 |---|---|
-| [xhand_right.urdf](../assets/robots/xhand/xhand_right.urdf) | TAG 独立右手模型 |
-| [xhand_right_teleop.urdf](../assets/robots/xhand/xhand_right_teleop.urdf) | DexPilot 使用的右手模型，部分远端关节下限体现运行下限 |
-| [xhand_right_dexpilot.yml](../assets/retargeting/xhand_right_dexpilot.yml) | DexPilot 关节、指尖、缩放和滤波参数 |
-| [defaults.py](../dexmani_real/config/defaults.py) | hand、policy、rate 的默认值 |
-| [runtime.py](../dexmani_real/config/runtime.py) | 配置解析、覆盖与跨字段约束 |
-| [teleop/config.py](../dexmani_real/teleop/config.py) | teleop 运行时上下文与派生参数 |
+| VR worker | 接收 HTS、Unity→FLU、基础 shape/finite 校验、写 VR ring |
+| teleop | 控制网格、因果观测、retarget、ramp、command shaping、候选发布和记录选择 |
+| hand worker | 消费固定 dtype 命令、生命周期复验、拥有 XHand driver |
+| XHand driver | 拥有 SDK、最终命令边界检查、设备发送和反馈读取 |
+| RecorderIO | 序列化、校验并发布 teleop 已选择的固定网格样本 |
+| main/lifecycle | readiness、监督、safety state、generation 边界和 shutdown |
 
-## 3. 系统所有权：retarget 在哪里，哪里不应该做
+因此：
 
-仓库的跨进程控制面遵循一个很严格的边界：
+- worker 不根据 VR 重新求手型；
+- RecorderIO 不按到达时间选择动作；
+- teleop、main 和 recorder 不持有 XHand SDK；
+- hand retarget 的控制决策不下放到设备进程。
 
-- VR 进程只负责产生经过基础坐标转换和 finite 检查的观测。
-- teleop 进程拥有控制网格、观测选择、retarget、动作候选和记录样本决策。
-- hand worker 只消费固定 dtype 命令、检查能否执行并拥有 SDK。
-- XHand driver 不做感知或 retarget，只验证并发送已经决定的 endpoint。
-- RecorderIO 不参与动作决策，只序列化 teleop 已经选定的样本。
+主要调用路径：
 
-这意味着 hand retarget 的语义不应被拆散到设备进程或记录进程中。特别是：
+| 职责 | Source of truth |
+|---|---|
+| VR 固定协议 | [utils/schema.py](../dexmani_real/utils/schema.py) |
+| 因果观测 | [shm/causal_reader.py](../dexmani_real/shm/causal_reader.py) |
+| teleop 决策 | [teleop/loop.py](../dexmani_real/teleop/loop.py) |
+| 手命令整形 | [teleop/hand_control.py](../dexmani_real/teleop/hand_control.py) |
+| retarget 包装 | [teleop/hand_retarget.py](../dexmani_real/teleop/hand_retarget.py) |
+| TAG 求解器 | [teleop/tag_retargeting/optimizer.py](../dexmani_real/teleop/tag_retargeting/optimizer.py) |
+| TAG 梯度 | [teleop/tag_retargeting/pin_grad.py](../dexmani_real/teleop/tag_retargeting/pin_grad.py) |
+| 发布与 worker 校验 | [policy/safety.py](../dexmani_real/policy/safety.py) |
+| hand worker | [robot/hand_process.py](../dexmani_real/robot/hand_process.py) |
+| XHand driver | [robot/xhand.py](../dexmani_real/robot/xhand.py) |
 
-- 不应让 worker 自己根据最新 VR 帧重新求手型，否则手动作与 16 Hz 的 arm action、observation id 和记录网格失去一致性。
-- 不应让 RecorderIO 按到达时间选择样本，否则 HDF5 中的 VR、机械臂和手动作不再属于同一个控制决策。
-- 不应让主进程或 teleop 进程持有 XHand SDK 实例；SDK 只能存在于 hand worker/driver。
+### 3.2 三个默认频率
 
-## 4. 三个时钟与两种数据流语义
-
-### 4.1 默认频率
-
-| 名称 | 默认值 | 作用 |
+| 时钟 | 默认频率 | 作用 |
 |---|---:|---|
-| coordinator rate | 64 Hz | teleop 协调、事件响应和健康检查的细粒度循环 |
-| control / record rate | 16 Hz | arm + hand 动作决策以及 episode 对齐网格 |
-| hand worker rate | 30 Hz | 消费最新命令、发送 XHand、读取反馈 |
+| coordinator | 64 Hz | 事件、健康检查和细粒度协调 |
+| control / record grid | 16 Hz | arm + hand 动作决策与 episode 对齐 |
+| hand worker | 30 Hz | 读取最新命令、发送 XHand、读取反馈 |
 
-retarget 不是在每个 64 Hz coordinator tick 上都产生一条记录动作，而是在 16 Hz 的控制网格上运行。30 Hz hand worker 也不会对 16 Hz 端点进行应用层插值；它读取并执行最新有效目标。
+频率定义在 [config/defaults.py](../dexmani_real/config/defaults.py)，运行时由 [config/runtime.py](../dexmani_real/config/runtime.py) 解析和校验。
 
-### 4.2 VR ring：历史可验证、因果读取
+### 3.3 两类 ring 语义
 
-VR ring 保存多个固定 dtype 帧。控制网格通过因果 reader 选择满足以下关系的最新帧：
+VR ring 保存可回看的观测历史。控制网格只选择锚点之前已经发布的最新观测，使用本机 monotonic time 保证因果关系。
 
-$$
-0 < t_{\mathrm{recv}} \le t_{\mathrm{publish}} \le t_{\mathrm{grid}}
-$$
+hand command ring 是 latest-wins：
 
-这里的时间是本机单调时钟。这个约束避免把网格锚点之后才发布的帧“倒灌”进较早动作，也避免用远端设备的墙钟作为实时控制依据。
+- teleop 发布 endpoint；
+- worker 只消费尚未处理的最新序号；
+- 中间 endpoint 可以被跳过；
+- 命令不会作为轨迹队列逐条回放。
 
-### 4.3 hand command ring：latest-wins
+这适合实时 servo endpoint，但意味着若配置 command delta，producer 的相邻发布差与 worker 的 last-accepted 差并不天然相同。worker 可能跳过中间命令，因此仍必须在设备边界复验。
 
-手命令 ring 的语义不同：
+### 3.4 generation 与命令寿命
 
-- producer 以 16 Hz 发布动作端点；
-- consumer 以 30 Hz 读取；
-- worker 只关心尚未处理的最新序号；
-- 中间命令可以被跳过；
-- 最终增量仍相对于 driver 最近一次接受的命令检查。
+`run_generation` 标识逻辑控制时代。begin、pause、home、反馈故障和相机重热等边界会使旧命令失效；worker 在 SDK 边界前拒绝旧 generation。
 
-这符合手部 servo 的实时目标语义：过时动作没有排队执行的价值。但它也意味着单步增量上限必须在 teleop 和 worker 两侧同时成立，否则 consumer 跳帧后可能看到比 producer 相邻帧更大的跨度。
+命令同时带 monotonic 有效期。当前 hand worker delivery window 由 [policy/safety.py](../dexmani_real/policy/safety.py) 编码为 target time 后 300 ms。
 
-### 4.4 generation：跨状态边界作废旧命令
+generation 与有效期解决不同问题：
 
-每条手命令带有 run_generation。begin、pause、home、反馈故障、相机重热等边界会推进 generation。worker 在命令跨过设备边界之前拒绝旧 generation，即使命令仍留在 ring 中。
+- generation 拒绝逻辑时代错误；
+- valid-until 拒绝同一时代内过晚到达的命令。
 
-generation 解决的是“逻辑时代”问题，expires_at 解决的是“时间寿命”问题，两者不可互相替代：
+不要把 worker delivery window 与 ActionCandidate 自身的 policy validity window 混为同一个期限。
 
-- generation 相同但延迟太久的命令会过期；
-- 时间戳仍新但属于暂停前 generation 的命令也会被拒绝。
+## 4. 状态推进合同
 
-## 5. 从 Quest HTS 到 VR_FRAME_DTYPE
+当前链路没有一个覆盖所有状态的事务提交点。各状态的推进时机如下：
 
-### 5.1 当前控制契约只使用右手
+| 状态 | 所有者 | 当前推进时机 | reset / 失效时机 |
+|---|---|---|---|
+| causal observation cursor | teleop reader | 控制网格选择观测时 | reanchor / reader reset |
+| TAG `last_qpos` | TAG optimizer | Stage 1 或 Stage 2 成功返回时 | retargeter reset |
+| TAG `pinch_factors` | TAG optimizer | Stage 1 成功后、Stage 2 判断前 | retargeter reset |
+| DexPilot warm start / internal LP | dex-retargeting | 外部 `retarget()` 成功调用时 | wrapper reset |
+| wrapper output EMA | DexPilot wrapper | 仅当 alpha < 1 时；当前默认直通 | wrapper reset |
+| hand ramp step | teleop | 进入 ramp shaping 分支时 | reanchor、ramp 完成或显式清理 |
+| `ctx.prev_hand_qpos` | teleop | 候选发布成功后 | home / reanchor seed |
+| worker consumed sequence | hand worker | 读取一个新 ring sequence 时 | worker 生命周期 |
+| driver `last_qpos_cmd` | XHand driver | SDK send 成功后 | connect / home 初始化 |
 
-VR receiver 请求双手数据，以便同时获得头部信息，但正常手动作契约只消费右手 HandFrame：
+由此得到三个必须区分的结论：
 
-- 左手 frame 被明确跳过；
-- teleop 初始化的 retargeter 也固定为 right；
-- schema 保留 side 字段，但当前控制逻辑不是双手通用实现；
-- 实现对非 left 的未知 side 没有在 producer 边界一律拒绝，因此这里描述的是预期契约，不是对异常输入的完备证明。
+1. 非法 landmarks 在调用求解器前被拒绝，不推进 solver 状态。
+2. 合法 landmarks 得到 solver 结果后，即使后续整形、SafetyGate 或发布失败，solver temporal state 也可能已经推进。
+3. `ctx.prev_hand_qpos` 和 driver `last_qpos_cmd` 分别表示最后发布成功和最后设备调用接受的目标，不等同于最新 solver 候选。
 
-因此，“支持 21 点手骨架”不等于“已支持左右手切换”。左手需要镜像/轴约定、URDF、关节顺序、配置和设备链路一起扩展。
+当前 ramp step 也在发布前推进。若 ramp 期间 retarget 返回 hold，或后续发布失败，该控制帧仍可能消耗一个 ramp step。分析启动阶段时不能假设 ramp 帧数等于成功发布数。
 
-### 5.2 Unity 到 FLU 的转换
+## 5. 输入、坐标系和小指补偿
 
-VR producer 在写共享内存前完成 Unity 左手坐标约定到 FLU 的转换。手腕位置、手腕四元数和 21 个 landmarks 都在 producer 边界完成转换并做形状/finite 检查。
+### 5.1 右手输入合同
 
-注意两类姿态信息的用途：
+[VR_FRAME_DTYPE](../dexmani_real/utils/schema.py) 保存：
 
-- 手腕位置与四元数：供机械臂 teleop 映射使用；
-- 21 个 landmarks：供手部 retarget 使用。
+- wrist position；
+- wrist quaternion；
+- 21×3 landmarks；
+- source/local monotonic 时间与 sequence；
+- side 和 head 元数据。
 
-hand retarget 不直接使用 Quest 提供的手腕四元数。它从 wrist、index MCP、middle MCP 等关键点重建掌心基，从而减小上游手腕 orientation 约定对手指求解的耦合。
+当前 VR publication 由右手 frame 驱动，teleop retargeter 也固定使用 right-hand 资产。schema 中保留 side 字段不代表系统已经实现左右手对称控制。
 
-### 5.3 VR schema
+schema 没有逐关键点 confidence、tracked bit 或遮挡标记，因此当前质量 gate 只能依据整帧新鲜度和几何一致性。
 
-VR_FRAME_DTYPE 的 hand 相关主要字段是：
+### 5.2 几何 gate
 
-- wrist position：3 维；
-- wrist quaternion：4 维；
-- landmarks：21 × 3；
-- local receive / publish 单调时间；
-- frame sequence、side 等元数据。
+`validate_landmarks()` 在任何 temporal solver state 之前检查：
 
-schema 没有逐关键点 confidence、tracked bit 或遮挡标记。因此当前 hand retarget 的输入质量判断只能依赖几何一致性和整帧新鲜度，无法区分“数值有限但追踪置信度很低”的单个关节。
+1. shape 必须为 21×3；
+2. 全部值必须 finite；
+3. wrist→index MCP 和 wrist→pinky MCP 至少 1 cm；
+4. 两条掌向量夹角正弦至少 0.1；
+5. 五条 landmark chain 上最短相邻骨段至少 2 mm。
 
-## 6. 输入几何合法性检查
+尚未覆盖：
 
-入口函数 validate_landmarks 先于掌心变换、pinkie adaptation 和优化器调用。它检查：
+- 最大手掌或骨段尺度；
+- 跨帧瞬移、冻结和速度；
+- 逐点追踪置信度；
+- chirality；
+- wrist/index/middle 三点 SVD 的直接 condition-number gate。
 
-1. 数组形状必须严格为 21 × 3；
-2. 所有元素必须 finite；
-3. wrist 到 index MCP 的距离至少 1 cm；
-4. wrist 到 pinky MCP 的距离至少 1 cm；
-5. index/pinky 两条掌向量夹角的正弦至少 0.1；
-6. 20 条连续骨段中最短一条至少 2 mm。
+几何 gate 使用 index/pinky，而实际 palm SVD 使用 wrist/index/middle。这是当前边界，不能把前者理解为后者的完整数值稳定性证明。
 
-令：
+### 5.3 掌心局部坐标系
 
-$$
-\mathbf{v}_i = \mathbf{p}_5-\mathbf{p}_0,\qquad
-\mathbf{v}_p = \mathbf{p}_{17}-\mathbf{p}_0
-$$
+掌心 frame 使用 wrist、index MCP 和 middle MCP：
 
-掌面退化指标为：
+- 三点中心化后做 SVD，取得掌面法向；
+- `wrist - middle MCP` 构造纵向轴；
+- Gram–Schmidt 正交化；
+- index/middle 横向参考统一法向符号；
+- 返回列向量基 `[x, normal, z]`。
 
-$$
-s_{\mathrm{palm}} =
-\frac{\lVert \mathbf{v}_i \times \mathbf{v}_p\rVert}
-{\lVert \mathbf{v}_i\rVert\lVert \mathbf{v}_p\rVert}
-$$
+源码中表达式 `wrist - middle` 的方向是从 middle 指向 wrist。理解实现时应以表达式为准。
 
-只有 $s_{\mathrm{palm}}\ge 0.1$ 才继续处理。
-
-### 6.1 为什么必须在优化前拒绝
-
-这个顺序有两个目的：
-
-- 防止 SVD 掌心基和目标向量在退化输入下产生任意方向；
-- 防止失败帧污染优化器 warm start、捏合激活 EMA 或输出 EMA。
-
-离线验证确认：全零 landmarks 会被拒绝，TAG 与 DexPilot 的上一目标状态不会因该失败输入推进。
-
-### 6.2 当前检查没有覆盖的情况
-
-以下不是已证实 bug，而是输入契约的边界：
-
-- 没有最大骨长或整体手掌尺度上限；
-- 没有跨帧速度、瞬移或冻结检测；
-- 没有显式 chirality 检查；
-- 没有逐关键点追踪置信度；
-- 掌心退化 gate 使用 index/pinky，实际 SVD 基使用 wrist/index/middle；没有直接检查 SVD 的次奇异值或 condition number；
-- producer 对未知 side 的编码能力与 teleop 固定右手的意图之间，还可以采用更严格的枚举拒绝。
-
-## 7. 掌心局部坐标系与 MANO 轴约定
-
-### 7.1 掌心基估计
-
-_estimate_palm_frame 使用：
-
-- wrist：landmark 0；
-- index MCP：landmark 5；
-- middle MCP：landmark 9。
-
-实现构造：
+右手 operator→MANO 旋转为：
 
 $$
-\mathbf{x}_0 = \mathbf{p}_0-\mathbf{p}_9
-$$
-
-然后对三个点中心化后的矩阵做 SVD，取掌面法向，再用 Gram–Schmidt 将法向与 x 轴正交化，最后：
-
-$$
-\mathbf{z} = \mathbf{x}\times\mathbf{n}
-$$
-
-通过 $\mathbf{z}\cdot(\mathbf{p}_5-\mathbf{p}_9)$ 的符号统一翻转方向，返回列向量基：
-
-$$
-\mathbf{R}_{\mathrm{wrist}} =
-\begin{bmatrix}\mathbf{x}&\mathbf{n}&\mathbf{z}\end{bmatrix}
-$$
-
-一个容易误读的细节：源码注释可被理解为“wrist 到 middle”的方向，但实际向量是 wrist 减 middle，即从 middle 指向 wrist。分析或重写时应以表达式为准。
-
-### 7.2 右手 operator 到 MANO
-
-landmarks 采用行向量变换：
-
-$$
-\mathbf{P}_{\mathrm{mano}} =
-\mathbf{P}_{\mathrm{FLU}}\,
-\mathbf{R}_{\mathrm{wrist}}\,
-\mathbf{R}_{\mathrm{operator\to mano}}
-$$
-
-其中：
-
-$$
-\mathbf{R}_{\mathrm{operator\to mano}} =
+R_{operator\to mano}=
 \begin{bmatrix}
 0&0&-1\\
 -1&0&0\\
@@ -297,1159 +239,519 @@ $$
 \end{bmatrix}
 $$
 
-对行向量 $[x,y,z]$，结果是 $[-y,z,-x]$。该矩阵是 determinant 为 +1 的正交旋转，不是镜像反射。Unity 到 FLU 的 chirality 处理已在 VR producer 中完成，retarget 层不应再做一次反射。
+其 determinant 为 +1，是 proper rotation。Unity→FLU 的 chirality 转换已经在 VR producer 完成，retarget 不应再次镜像。
 
-### 7.3 平移如何消失
+两种后端最终都使用相对位置或差向量，因此全局手腕平移不会进入手关节优化；空间手腕运动由机械臂映射处理。
 
-- TAG 显式使用 $\mathbf{p}_{tip}-\mathbf{p}_{wrist}$；
-- DexPilot 构造关键点对的差向量。
+### 5.4 自适应小指补偿
 
-所以两种后端都对全局平移不敏感。它们优化的是相对于手腕的手型，而不是让 XHand 跟随人手在空间中的位置；空间位置由机械臂 teleop 链处理。
+公共预处理依据 pinky MCP→TIP 距离，在 3–10 cm 区间把 scale 从 1.2 线性提升到 2.2，并用原始 MCP→PIP→DIP→TIP 骨段逐段重建。
 
-## 8. 自适应小指增强
+重建使用未修改的原始骨段方向，输入数组不会原地修改。TAG 和 DexPilot 后续主要消费 wrist 与 fingertips，因此中间小指点的直接作用是构造一致的最终 pinky tip。
 
-Quest 侧小指的有效长度和跟踪稳定性容易使机器人小指闭合不足。仓库在两个后端共用的预处理阶段做动态增强。
+该补偿会把 MCP→TIP 距离噪声同时带入 scale 和目标长度；在阈值附近还存在分段函数斜率变化。它是当前经验补偿，不是用户手型标定。
 
-### 8.1 动态比例
+## 6. TAG 后端
 
-使用 pinky MCP 到 TIP 的伸展距离：
+### 6.1 模型与关节顺序
 
-$$
-d=\lVert\mathbf{p}_{20}-\mathbf{p}_{17}\rVert
-$$
+TAG 使用 [xhand_right.urdf](../assets/robots/xhand/xhand_right.urdf)，通过 Pinocchio FreeFlyer 模型计算 FK 和 Jacobian：
 
-先计算：
+- generalized configuration 为 7 维 FreeFlyer + 12 维手关节；
+- FreeFlyer 固定为零平移和单位四元数；
+- 优化变量只有 12 个手关节；
+- Jacobian 丢弃前 6 个 floating-base velocity columns。
 
-$$
-r=\operatorname{clip}
-\left(\frac{d-0.03}{0.10-0.03},0,1\right)
-$$
+Pinocchio model order 与 XHand SDK order 不同。映射由关节名称在运行时构造，并使用逆置换完成 measured SDK qpos→optimizer warm start。
 
-再得到比例：
+固定的 model→SDK index 关系当前为：
 
-$$
-s=1.2+(2.2-1.2)r
-$$
-
-也就是：
-
-- 小指蜷缩、MCP–TIP 距离接近或低于 3 cm 时，比例接近 1.2；
-- 小指伸展、距离达到 10 cm 时，比例达到 2.2；
-- 中间状态线性插值。
-
-### 8.2 逐段重建
-
-实现先复制原始 landmarks，然后按照原始骨段向量逐段重建：
-
-$$
-\mathbf{p}'_{18}=\mathbf{p}_{17}
-+s(\mathbf{p}_{18}-\mathbf{p}_{17})
-$$
-
-$$
-\mathbf{p}'_{19}=\mathbf{p}'_{18}
-+s(\mathbf{p}_{19}-\mathbf{p}_{18})
-$$
-
-$$
-\mathbf{p}'_{20}=\mathbf{p}'_{19}
-+s(\mathbf{p}_{20}-\mathbf{p}_{19})
-$$
-
-这样每一段都使用未修改的原始方向，避免把已经移动的父节点混入下一段差分。输入数组本身不会被原地修改。
-
-### 8.3 对两个后端的实际影响
-
-当前 TAG 和 DexPilot 后续都只抽取 wrist 与五个 fingertips。因此 PIP、DIP 重建的直接意义，是为了得到一致的最终 pinky TIP；优化器并没有匹配中间骨节。
-
-TAG 的静态 pinky robot/human length ratio 被设为 1.0，避免在动态 1.2–2.2 之外再叠加一层固定小指尺度。动态增强仍然有效。
-
-## 9. 后端选择与公共接口
-
-运行时配置 policy.hand_retargeting_type 接受：
-
-- tag：默认；
-- dexpilot：可选兼容后端。
-
-二者向 teleop 暴露同一类接口：
-
-- retarget(landmarks)：从 21 × 3 关键点产生 12 维 SDK 顺序目标；
-- reset(qpos)：在 begin、重锚或恢复时用测量关节角重置时间状态；
-- is_initialized：依赖和模型是否可用；
-- smoothing 相关属性。
-
-公共包装层负责：
-
-1. 几何合法性检查；
-2. 掌心坐标变换；
-3. operator-to-MANO 旋转；
-4. pinky adaptation；
-5. 后端求解；
-6. 外层 EMA；
-7. SDK 顺序输出。
-
-后端内部状态的含义并不完全相同，这一点在调参和记录解释时必须注意，后文会专门比较。
-
-## 10. TAG 后端：模型、关节顺序与边界
-
-### 10.1 依赖与模型加载
-
-TAGHandRetargeter 延迟导入 SciPy、Pinocchio 和 NLopt，加载 xhand_right.urdf，并为 Pinocchio 模型添加 FreeFlyer。运行时通过私有 overrides 将以下配置注入优化器：
-
-- URDF 路径；
-- 5 个 fingertip frame 名称；
-- 五指 robot/human length；
-- 两阶段权重；
-- 捏合距离阈值与激活平滑；
-- 运行关节下上限。
-
-延迟导入允许模块静态检查不立刻初始化设备，也把原生依赖错误限制在创建所选 retargeter 时暴露。
-
-### 10.2 FreeFlyer 为什么存在
-
-Pinocchio 模型的 generalized configuration 包含：
-
-- 7 维 FreeFlyer 配置；
-- 12 维手关节配置。
-
-优化时 FreeFlyer 被固定在：
-
-- translation = 0；
-- quaternion = identity，其中 q[6] = 1。
-
-手腕到 MANO/URDF 的对齐在模型外部完成，所以优化变量只有 12 个手关节。对应 velocity Jacobian 的前 6 列属于自由基座，梯度实现取 $J[:3,6:]$ 作为手关节平移 Jacobian。
-
-### 10.3 优化边界是两个边界的交集
-
-TAG 不只使用 URDF joint limits。它把：
-
-- URDF 模型界；
-- runtime operational command bounds
-
-取交集作为 NLopt 上下界。
-
-配置加载还验证 operational bounds 必须嵌套在机械/额定范围内。这样优化器从源头尽量不产生设备策略不允许的目标；发布前 sanitizer 仍会独立复验。
-
-### 10.4 模型顺序与 SDK 顺序
-
-Pinocchio 模型内部 12 关节顺序与 XHand SDK 命令顺序不同。模型到 SDK 的映射为：
-
-~~~text
-SDK ← model indices:
+```text
 [9, 10, 11, 0, 1, 2, 3, 4, 7, 8, 5, 6]
-~~~
+```
 
-SDK 到模型的逆映射是 argsort：
+规划侧对应关系以 [planning/constants.py](../dexmani_real/planning/constants.py) 为准。
 
-~~~text
-model ← SDK indices:
-[3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2]
-~~~
+### 6.2 当前优化边界
 
-后者与 planning/constants.py 的 HAND_SDK_TO_URDF_IDX 一致。reset 时必须使用逆映射，否则 measured SDK qpos 会被错误地当成优化器顺序，warm start 会跳到另一种手型。
+TAG 当前使用独立 URDF 的机械 joint limits 作为 NLopt box bounds，不再与 operational command floor 取交集。
 
-### 10.5 映射表
+这样 measured warm start 可以位于 operator-set command floor 之下，例如设备对 5° 命令实际落在略低位置时，不会仅因反馈误差被投影到更严格的 optimizer box。
 
-下表将设备友好名称、默认 home、运行范围和模型索引对齐。角度仅为便于阅读的近似值；代码中以弧度为准。
+代价是 solver raw 结果可能位于 operational command floor 之外；teleop 随后把最终发布目标投影到 command box。因此：
 
-| SDK index | 关节 | home / deg | operational / deg | mechanical / deg | model index |
-|---:|---|---:|---:|---:|---:|
-| 0 | thumb abduction | 0.00 | [0.00, 104.97] | [0.00, 104.97] | 9 |
-| 1 | thumb joint 1 | 80.66 | [-39.99, 99.98] | [-39.99, 99.98] | 10 |
-| 2 | thumb joint 2 | 33.20 | [10.00, 99.98] | [0.00, 99.98] | 11 |
-| 3 | index abduction | 0.00 | [-9.97, 9.97] | [-9.97, 9.97] | 0 |
-| 4 | index joint 1 | 5.11 | [0.00, 109.95] | [0.00, 109.95] | 1 |
-| 5 | index joint 2 | 5.00 | [5.00, 109.95] | [0.00, 109.95] | 2 |
-| 6 | middle joint 1 | 6.53 | [0.00, 109.95] | [0.00, 109.95] | 3 |
-| 7 | middle joint 2 | 5.00 | [5.00, 109.95] | [0.00, 109.95] | 4 |
-| 8 | ring joint 1 | 6.76 | [0.00, 109.95] | [0.00, 109.95] | 7 |
-| 9 | ring joint 2 | 5.00 | [5.00, 109.95] | [0.00, 109.95] | 8 |
-| 10 | little joint 1 | 10.13 | [0.00, 109.95] | [0.00, 109.95] | 5 |
-| 11 | little joint 2 | 5.00 | [5.00, 109.95] | [0.00, 109.95] | 6 |
+- solver 的 FK/loss 对应 raw 姿态；
+- 设备实际收到的是 shaped command；
+- 两者在 bound saturation 时可能持续不同。
 
-## 11. TAG 后端：目标构造
+### 6.3 五指目标
 
-### 11.1 五个指尖
+TAG 使用 thumb/index/middle/ring/pinky 五个 fingertip，相对 wrist 居中，旋转到 URDF frame，然后按每指 robot/human length ratio 和全局 boost 缩放。
 
-TAG 使用 landmark：
+目标是整条 wrist-to-tip 向量的标量缩放，包括掌宽方向 offset；当前没有把掌宽、掌长和指骨长度拆成独立的人体标定参数。
 
-~~~text
-thumb 4, index 8, middle 12, ring 16, pinky 20
-~~~
+### 6.4 Stage 1：指尖位置与时间正则
 
-每个目标先减 wrist landmark 0，转入 URDF 对齐坐标，再按手指独立缩放。
-
-### 11.2 人手到机器人尺度
-
-默认长度：
-
-| 手指 | robot length / m | human length / m | 比例 |
-|---|---:|---:|---:|
-| thumb | 0.161 | 0.130 | 1.2385 |
-| index | 0.208 | 0.180 | 1.1556 |
-| middle | 0.206 | 0.190 | 1.0842 |
-| ring | 0.204 | 0.180 | 1.1333 |
-| pinky | 0.145 | 0.145 | 1.0000 |
-
-加上默认 global boost 1.0，目标为：
+Stage 1 最小化：
 
 $$
-\mathbf{t}_i =
-b\frac{\ell_i^{robot}}{\ell_i^{human}}
-\mathbf{R}_{mano\to urdf}^{T}
-(\mathbf{p}_{tip,i}-\mathbf{p}_{wrist})
+L_1(q)=
+\sum_{i=0}^{4}\|p_i(q)-t_i\|^2
++\lambda_s\|q-q_{prev}\|^2
 $$
 
-需要注意：这是对整条 wrist-to-tip 向量的标量缩放，包括掌部横向 offset，而不是只缩放指骨长度。若未来引入更精细的人手标定，可能需要把掌宽、掌长和手指链长度分开处理。
+当前默认 `smooth_weight` 为 0.02，solver 为 NLopt L-BFGS，最大 evaluation 80。
 
-### 11.3 指尖 frame 契约
-
-初始化要求：
-
-- 恰好 5 个 frame；
-- 名称互不重复；
-- 顺序固定为 thumb、index、middle、ring、pinky；
-- 每个 frame 都必须存在于 Pinocchio 模型。
-
-这使优化器的指尖 index、长度表和捏合关系不会因为 YAML 或 URDF 名称变化静默错位。
-
-## 12. TAG 第一阶段：几何匹配与时间正则
-
-### 12.1 目标函数
-
-第一阶段求解：
+解析梯度为：
 
 $$
-\mathcal{L}_1(\mathbf{q}) =
-\sum_{i=0}^{4}
-\lVert
-\mathbf{p}_i(\mathbf{q})-\mathbf{t}_i
-\rVert^2
-+\lambda_s
-\lVert\mathbf{q}-\mathbf{q}_{prev}\rVert^2
+\nabla L_1=
+2\sum_i J_i^T(p_i-t_i)
++2\lambda_s(q-q_{prev})
 $$
 
-默认 smooth weight：
+Stage 1 抛异常或返回非法数组时，本次 retarget 失败；调用者保持上一条手命令。
+
+### 6.5 pinch activation
+
+Stage 1 成功后，TAG 在**未做 robot/human length scaling**的 fingertip targets 上计算 thumb 与其余四指距离：
+
+- 距离 ≥30 mm：目标 activation 为 0；
+- 距离 ≤8 mm：目标 activation 为 1；
+- 中间线性变化；
+- activation 使用 alpha 0.4 的 EMA；
+- 最大 activation 小于 0.01 时跳过 Stage 2。
+
+这是连续权重，不是有独立 enter/exit threshold 的迟滞状态机。
+
+### 6.6 Stage 2：捏合精修
+
+Stage 2 从 Stage 1 解开始，优化：
 
 $$
-\lambda_s=0.02
+L_2(q)=
+w_a\|q-q_{s1}\|^2
++w_t\|q-q_{prev}\|^2
++\sum_{i=1}^{4}w_p a_i^2
+\|p_i(q)-p_{thumb}(q)\|^2
 $$
 
-第一项让机器人五个指尖接近缩放后的人手目标，第二项抑制相邻求解的关节跳变。这里 $\mathbf{q}_{prev}$ 是优化器上一次成功状态或 reset 注入的 measured pose。
+当前默认权重为：
 
-### 12.2 求解器
+- Stage 1 anchor：1.0；
+- temporal：0.8；
+- pinch base：2000。
 
-- NLopt algorithm：LD_LBFGS；
-- 最大 evaluation：80；
-- absolute function tolerance：$10^{-4}$；
-- 上下界：URDF 与 operational bounds 的交集；
-- 初值：有界的 last qpos。
+相对 Jacobian 使用 `J_i - J_thumb`。Stage 2 使用 SLSQP，最大 evaluation 100；失败时回退 Stage 1，不使整次 retarget 失败。
 
-### 12.3 解析梯度
+Stage 2 的目标是指尖 frame origin 的零距离，不包含：
 
-PinGrad 依次执行：
-
-1. 把 12 维手关节写入固定 FreeFlyer 的 full q；
-2. Pinocchio forward kinematics；
-3. 更新 frame placement；
-4. 为五个 fingertip 取得位置；
-5. 取得 LOCAL_WORLD_ALIGNED frame Jacobian；
-6. 丢弃 FreeFlyer 的 6 个 velocity columns；
-7. 累计目标误差梯度和时间正则梯度。
-
-梯度为：
-
-$$
-\nabla\mathcal{L}_1 =
-2\sum_i J_i^T
-\left(\mathbf{p}_i-\mathbf{t}_i\right)
-+2\lambda_s(\mathbf{q}-\mathbf{q}_{prev})
-$$
-
-离线中心差分检查得到最大绝对梯度误差约：
-
-$$
-9.3\times10^{-11}
-$$
-
-这表明当前测试点处的解析梯度与数值梯度高度一致。
-
-### 12.4 失败语义
-
-若 Stage 1：
-
-- 抛出异常；
-- 输出形状不对；
-- 包含非 finite；
-- 违反内部可接受条件，
-
-则本次 retarget 返回失败，teleop 使用上一条已发布手命令。失败不会把无效 q 写回 last qpos。
-
-## 13. TAG 捏合激活
-
-### 13.1 距离到激活量
-
-TAG 在未按机器人手长缩放的人手目标上，计算拇指与其余四个指尖的距离 $d_i$：
-
-$$
-a_i =
-\operatorname{clip}
-\left(
-\frac{0.030-d_i}{0.030-0.008},
-0,1
-\right)
-$$
-
-解释：
-
-- 距离大于等于 30 mm：激活 0；
-- 距离小于等于 8 mm：激活 1；
-- 中间线性变化。
-
-然后使用 EMA：
-
-$$
-p_i^{(t)} =
-0.6p_i^{(t-1)}+0.4a_i^{(t)}
-$$
-
-拇指自身激活固定为 0。若所有 $p_i<0.01$，直接跳过第二阶段。
-
-### 13.2 时序含义
-
-捏合激活有记忆：
-
-- 进入捏合时不会瞬间跳到最大权重；
-- 松开后权重也会逐帧衰减；
-- reset 会清空该状态。
-
-这是一种低成本抗抖手段，但它不是显式的进入/退出双阈值状态机。
-
-## 14. TAG 第二阶段：捏合精修
-
-### 14.1 目标函数
-
-Stage 2 从 Stage 1 解 $\mathbf{q}_{s1}$ 出发：
-
-$$
-\mathcal{L}_2(\mathbf{q}) =
-w_a\lVert\mathbf{q}-\mathbf{q}_{s1}\rVert^2
-+w_t\lVert\mathbf{q}-\mathbf{q}_{prev}\rVert^2
-+\sum_{i=1}^{4}
-w_p p_i^2
-\lVert
-\mathbf{p}_i(\mathbf{q})-\mathbf{p}_{thumb}(\mathbf{q})
-\rVert^2
-$$
-
-默认权重：
-
-| 项 | 权重 |
-|---|---:|
-| Stage 1 anchor $w_a$ | 1.0 |
-| temporal $w_t$ | 0.8 |
-| pinch $w_p$ | 2000 |
-
-激活量平方 $p_i^2$ 让较弱接近对优化的影响更小，而高激活时捏合项快速占主导。
-
-### 14.2 相对 Jacobian
-
-捏合差：
-
-$$
-\mathbf{e}_i =
-\mathbf{p}_i-\mathbf{p}_{thumb}
-$$
-
-对应 Jacobian：
-
-$$
-J_{\mathrm{rel},i}=J_i-J_{thumb}
-$$
-
-因此捏合梯度使用 $J_i-J_{thumb}$，而不是把两个指尖当作独立绝对目标。这个形式正好表达“让两点相互靠近”。
-
-### 14.3 求解器与回退
-
-- NLopt algorithm：LD_SLSQP；
-- 最大 evaluation：100；
-- absolute function tolerance：$10^{-6}$；
-- 边界与 Stage 1 相同。
-
-Stage 2 失败不会使整次 retarget 失败，而是退回 Stage 1 解。只有 Stage 1 都不能提供合法输出时，包装层才报告 retarget failure。
-
-### 14.4 当前捏合语义的边界
-
-Stage 2 的几何目标是零指尖距离：
-
-$$
-\mathbf{p}_i=\mathbf{p}_{thumb}
-$$
-
-它没有：
-
-- 非零接触间距；
+- 指腹几何或非零接触间距；
 - 接触法向；
-- 指腹几何；
-- tactile 闭环；
-- 力/力矩目标。
+- tactile；
+- 力或力矩目标；
+- 手内自碰项。
 
-因此它更准确地说是“指尖点闭合强化”，不是物理接触优化。真实设备最终会受机械结构、表面几何、限位和固件保护约束。
+多个 activation 同时为正时，多根手指会同时被吸引到 thumb。该目标更准确地称为视觉指尖闭合强化，而不是物理接触优化。
 
-## 15. TAG 输出、外层 EMA 与 reset
+### 6.7 TAG 输出和 reset
 
-### 15.1 输出路径
+当前 TAG 成功路径为：
 
-成功解按以下顺序处理：
+```text
+optimizer model-order q
+    → SDK order
+    → last_raw_qpos
+    → 返回 teleop
+```
 
-1. optimizer model order q；
-2. 映射到 SDK order；
-3. 保存为 last_raw_qpos；
-4. 外层 EMA；
-5. 返回 teleop；
-6. teleop 再执行启动 ramp 与 sanitizer。
+当前没有 TAG output EMA。`reset(measured_sdk_qpos)` 会：
 
-外层 EMA：
+- 清空 `last_raw_qpos`；
+- SDK order 映射到 model order；
+- 把 warm start 裁入 URDF mechanical bounds；
+- 清空 pinch activation 和 Stage 1 cache。
 
-$$
-\mathbf{q}_{out}^{(t)}
-=\alpha\mathbf{q}_{raw}^{(t)}
-+(1-\alpha)\mathbf{q}_{out}^{(t-1)}
-$$
+## 7. DexPilot 后端
 
-默认 $\alpha=0.5$。首帧没有历史时直接通过。
+DexPilot 使用：
 
-### 15.2 延迟直觉
+- [xhand_right_teleop.urdf](../assets/robots/xhand/xhand_right_teleop.urdf)；
+- [xhand_right_dexpilot.yml](../assets/retargeting/xhand_right_dexpilot.yml)；
+- 10 条 fingertip-to-fingertip vector；
+- 5 条 wrist-to-fingertip vector。
 
-一阶 EMA 的低频 group delay 近似为：
+公共 palm/MANO 和 pinky 预处理完成后，外部 dex-retargeting 构造 reference vector graph，并以 SLSQP、鲁棒几何误差和时间正则求解。
 
-$$
-\tau_{frames}\approx\frac{1-\alpha}{\alpha}
-$$
+DexPilot 的 optimizer 边界主要来自 `xhand_right_teleop.urdf` 和外部库处理；该 teleop URDF 已把若干 distal lower bound 写成 operational command floor。无论外部求解器如何处理微小边界扩展，仓库发布边界仍会对最终 shaped command 做独立复验。
 
-当 $\alpha=0.5$ 时约 1 个控制帧，即 16 Hz 下约 62.5 ms。它只是低频近似，不代表所有运动频率的固定延迟。
+当前滤波合同：
 
-### 15.3 reset
+| 层 | 当前默认 |
+|---|---:|
+| dex-retargeting internal LPFilter | alpha 0.6 |
+| 仓库 wrapper output EMA | alpha 1.0，直通 |
 
-reset 通常在 begin、恢复或新鲜数据重锚时执行：
+因此 DexPilot 当前不是文档历史版本中的“两层持续 EMA”。它仍然有外部库内部 LPFilter。
 
-- 清除外层 EMA 与 raw diagnostic；
-- measured SDK qpos 映射为 model order；
-- 交给 optimizer reset；
-- optimizer 把 warm start 裁入自身上下界；
-- 清空捏合激活。
+`reset()` 会清除外部 optimizer warm start、internal LPFilter、projected flags 和 wrapper EMA state，并尝试用 measured SDK qpos 重建内部顺序的 warm start。
 
-若反馈 qpos 不合法，优化器使用 bounds midpoint 作为保守初始值。正常链路尽量使用真实测量手型，避免从默认数值突然跃迁。
-
-优化器还会统计 warm-start 裁剪信息和固定 0.01 rad 的反馈偏差判据，但这些统计当前没有作为结构化 episode 字段持续记录。
-
-## 16. DexPilot 后端
-
-### 16.1 配置与依赖
-
-DexPilot 包装类是 XHandRetargeter。默认资产配置：
-
-- type：DexPilot；
-- URDF：xhand_right_teleop.urdf；
-- wrist link：right_hand_link；
-- 12 个关节；
-- 5 个 fingertips；
-- scaling factor：1.05；
-- dex-retargeting 内部 low-pass alpha：0.6；
-- 仓库包装层 smoothing alpha：运行配置默认覆盖为 0.5；
-- projection distance：30 mm；
-- escape distance：30 mm。
-
-离线审计环境中的版本：
-
-| 依赖 | 版本 |
-|---|---|
-| dex-retargeting | 0.4.6 |
-| nlopt | 2.7.1 |
-| pin | 2.7.0 |
-| torch | 2.4.1+cu124 |
-
-这些原生/机器人依赖由 conda real_robot 环境管理，不属于 pyproject.toml 的便携 Python 依赖集合。
-
-### 16.2 参考向量图
-
-外部 DexPilot 优化器为五指构造 15 条向量：
-
-- 5 个指尖两两组合，共 10 条 inter-fingertip vector；
-- wrist 到每个 fingertip，共 5 条 vector。
-
-关键点集合仍是：
-
-~~~text
-wrist 0; fingertips 4, 8, 12, 16, 20
-~~~
-
-仓库先做与 TAG 相同的 palm/MANO 转换和 pinky adaptation，再由 target-origin 配对相减构建 ref_value。平移因此自然抵消。
-
-### 16.3 求解目标
-
-外部 dex-retargeting 使用基于 SLSQP、Huber 型几何误差和时间正则的目标。对进入投影距离的拇指—其他指尖关系，优化器把相应向量投影并提高权重，使闭合关系更强。
-
-默认 project_dist 与 escape_dist 都是 30 mm，因此没有距离迟滞带；抗抖主要来自滤波、优化时间正则和上层控制时序。
-
-### 16.4 两层滤波
-
-DexPilot 默认有两层线性平滑：
-
-1. dex-retargeting SeqRetargeting 内部 low-pass，$\alpha_1=0.6$；
-2. 仓库包装层外部 EMA，$\alpha_2=0.5$。
-
-低频 group delay 粗略相加：
-
-$$
-\frac{1-0.6}{0.6}+\frac{1-0.5}{0.5}
-=1.667\ \mathrm{frames}
-$$
-
-16 Hz 下约 104 ms。这里还没有包含 0.5 s 启动渐入；渐入只发生在 begin/reanchor 后，并不是持续滤波延迟。
-
-### 16.5 关节边界差异
-
-xhand_right_teleop.urdf 相比 xhand_right.urdf，主要把几类 distal flexion 的下限写成 operational 下限：
-
-- thumb distal：约 10 deg；
-- index/middle/ring/pinky distal：约 5 deg。
-
-外部库设置 joint limit 时会做很小的 $\pm0.001$ 扩展。仓库自己的 sanitizer 仍以 runtime operational bounds 为权威，因此外部求解器偶尔给出的微小越界结果会被整条拒绝，而不是裁剪。
-
-### 16.6 reset
-
-DexPilot reset：
-
-- 重置 SeqRetargeting；
-- 重置内部 low-pass；
-- 清除 projected flags；
-- 清除仓库外层 EMA；
-- measured SDK qpos 通过逆映射转换为内部顺序；
-- 更新外部优化器的 last target qpos。
-
-### 16.7 raw 诊断语义
-
-TAG 暴露 last_raw_qpos，所以 action_hand_joint_raw 表示“优化器输出、SDK 顺序、外层 EMA 之前”的值。
-
-DexPilot 包装类当前没有对应 raw property，记录层会退回使用其返回值。该返回值已经经过外部 SeqRetargeting low-pass 和仓库外层 EMA。因此：
-
-- TAG 的 raw 与 final 可以用于分析外层 EMA 和 ramp；
-- DexPilot 的 raw 实际上已经是过滤结果，不能解释为相同阶段。
-
-这是记录字段跨后端语义不完全一致的地方。
-
-## 17. 两种后端对比
+### 7.1 两后端语义差异
 
 | 维度 | TAG | DexPilot |
 |---|---|---|
 | 默认状态 | 默认 | 可选 |
-| 模型 | 仓库 Pinocchio + NLopt 实现 | 外部 dex-retargeting |
-| 人手目标 | 5 条 wrist-to-tip | 10 条 tip-to-tip + 5 条 wrist-to-tip |
-| 第一目标 | 五指绝对腕心相对位置 | 向量图匹配 |
-| 捏合 | 独立 Stage 2，连续激活 EMA | 外部 projected vector 机制 |
-| 捏合终点 | 指尖点零距离 | 投影向量目标 |
-| 时间正则 | 两阶段显式 q 正则 | 外部优化器内部正则 |
-| 内部滤波 | 无额外 LP | SeqRetargeting LP，默认 0.6 |
-| 仓库外层 EMA | 默认 0.5 | 默认 0.5 |
-| 失败回退 | Stage 2 → Stage 1；Stage 1 失败 → hold | 外部求解失败 → hold |
-| raw 可观测性 | 有 pre-outer-EMA raw | 当前没有等价 raw |
-| 优化边界 | URDF ∩ runtime operational | teleop URDF / 外部边界，最终由仓库 sanitizer 复验 |
-| 调试可控性 | 仓库内完整实现，容易审计 | 一部分语义依赖安装版本 |
+| 目标 | 5 条 wrist-to-tip | 15 条 reference vectors |
+| pinch | 独立 Stage 2 | 外部 projected-vector 机制 |
+| 持续平滑 | 时间正则 + activation EMA | 外部 internal LPFilter |
+| wrapper output EMA | 无 | 当前直通 |
+| optimizer bounds 来源 | mechanical URDF | teleop URDF / 外部实现 |
+| Stage 2 回退 | 有 | 由外部实现决定 |
+| raw 可观测性 | 明确的 solver SDK-order 输出 | 当前只得到外部 retarget 返回值 |
+| 可审计性 | 目标和梯度在仓库内 | 部分语义依赖安装版本 |
 
-同名 low_pass_alpha 属性在两类包装上的含义也不完全相同：
+不要用同一个“raw”或“low-pass alpha”术语假设两个后端处于相同处理阶段。
 
-- TAG：控制仓库外层 EMA；
-- DexPilot：控制外部 SeqRetargeting 的内部 LP。
+## 8. 命令整形、验证和发布
 
-如果上层代码试图用同一属性统一调参，可能得到不同层级的效果。更明确的命名应区分 optimizer_filter_alpha 与 output_ema_alpha。
+### 8.1 五阶段术语
 
-## 18. 启动渐入与重新锚定
+本文统一使用：
 
-### 18.1 smoothstep ramp
+```text
+observed → solved → shaped → published → accepted / measured
+```
 
-默认渐入时间 0.5 s。在 16 Hz 控制网格上：
+- observed：控制网格选中的 VR landmarks；
+- solved：retargeter 返回的 SDK-order 候选；
+- shaped：ramp、可选 delta clamp 和 command-box clip 后的 endpoint；
+- published：通过候选验证并写入 hand command ring 的 endpoint；
+- accepted：XHand SDK send 成功后 driver 保存的 endpoint；
+- measured：设备反馈 qpos。
 
-$$
-N=0.5\times16=8\ \mathrm{frames}
-$$
+### 8.2 retarget failure
 
-第 k 帧：
+`_compute_hand_command()` 在以下情况返回上一条 published hand command，并令 `retarget_ok=False`：
+
+- hand 不可用；
+- retargeter 不存在；
+- landmarks 缺失或非法；
+- backend 抛异常或返回 `None`；
+- 输出长度不是 12。
+
+这类失败不是结构非法命令；它产生一个合法 hold endpoint。
+
+### 8.3 startup ramp
+
+默认 ramp duration 为 0.5 s，在 16 Hz 下通过四舍五入得到 8 个 shaping step。第 k 步使用 smoothstep：
 
 $$
 u=\frac{k+1}{N},\qquad
 w=u^2(3-2u)
 $$
 
-输出：
-
 $$
-\mathbf{q}_{ramp}
-=\mathbf{q}_{start}
-+w(\mathbf{q}_{live}-\mathbf{q}_{start})
+q_{ramp}=q_{start}+w(q_{live}-q_{start})
 $$
 
-最后一帧 $u=1$，准确到达当前 live target。
+`q_live` 每帧可以变化，因此这不是固定终点的离线轨迹。最后一个 configured step 到达该帧的 live target。
 
-这里的 live target 每帧都可以变化，所以 ramp 不是从起点到某个固定终点的离线轨迹，而是一个随时间放开的混合权重。它的用途是避免 begin/reanchor 后第一条视觉目标直接造成大步长。
+当前 ramp step 在发布前推进，不保证每一步都成为 published command。
 
-### 18.2 重锚序列
+### 8.4 command shaping
 
-当 VR stale、相机重热、反馈故障或运行状态切换触发 quiescence 时，典型语义是：
+ramp 后依次执行：
 
-~~~text
-停止发布新动作
-    ↓
-推进 run_generation
-    ↓
-等待 arm / VR / hand 反馈越过边界
-    ↓
-以测量手 qpos 重置 retargeter 与 prev_hand_qpos
-    ↓
-第一帧新鲜控制网格只做重新锚定
-    ↓
-后续网格开始发布，执行 8 帧 hand ramp
-~~~
+1. 若 `hand.max_delta_rad` 已配置，相对 `ctx.prev_hand_qpos` 做逐关节 delta clamp；
+2. 对 operational command lower/upper bounds 做 `np.clip`；
+3. 调用 sanitizer 复验 shape、finite、limit nesting、operational、mechanical 和可选 delta。
 
-第一帧只重锚而不立刻发布，是为了让 pose baseline、优化器时间状态和设备反馈属于同一个新鲜时代。
+当前默认 `hand.max_delta_rad=None`，因此步骤 1 默认不限制动作。
 
-## 19. 发布前手命令校验
+需要区分两种语义：
 
-### 19.1 _compute_hand_command
+- operational clip 是正常、确定性的策略整形；
+- 结构、finite、mechanical envelope 或配置合同错误触发 reject/hold。
 
-retarget 层返回：
+operational clip 会改变 solver 手型，尤其在 distal command floor 附近。当前 `retarget_ok` 仍表示 solver 是否成功，不表示 solved endpoint 被原样发布。
 
-- 12 维候选和 retarget_ok = true；
-- 或上一条已发布手命令的拷贝和 retarget_ok = false。
+### 8.5 SafetyGate 与发布边界
 
-以下都导致后者：
+shaped endpoint 进入 `ActionCandidate`，再通过统一发布边界：
 
-- hand disabled；
-- retargeter 不存在；
-- landmarks 缺失或非法；
-- optimizer 失败；
-- 输出不是 12 维。
+- generation；
+- shape 和 finite；
+- arm/hand joint limits；
+- workspace 等候选级检查；
+- hand mechanical envelope 和可选 command delta preflight；
+- runtime state 和反馈新鲜度。
 
-### 19.2 _sanitize_hand_command
+通过后，hand endpoint 编码为固定 `HAND_COMMAND_DTYPE` 并写 latest-wins ring。控制路径不使用 JSON、动态对象或 ACK/apply 事务。
 
-随后严格检查：
+## 9. 失败耦合语义
 
-1. shape 恰好 12；
-2. 全部 finite；
-3. operational bounds；
-4. mechanical/rated envelope 及嵌套关系；
-5. 相对 ctx.prev_hand_qpos 的最大单关节增量不超过 0.20 rad。
-
-默认增量上限换算为控制网格尺度：
-
-$$
-0.20\times16=3.2\ \mathrm{rad/s}
-\approx183.3\ \mathrm{deg/s}
-$$
-
-这只是端点差分对应的速率直觉，不是显式速度轨迹控制器。
-
-### 19.3 为什么整条拒绝而不是 clip
-
-逐关节 clip 会产生几个问题：
-
-- 改变优化器想表达的整体手型；
-- 可能使拇指和目标手指的相对几何更差；
-- 把模型、映射或配置错误隐藏成“看似合法”的动作；
-- 让记录的 raw 与设备动作之间出现难以解释的非线性修改。
-
-因此当前策略是 reject-whole，保持上一次已发布手目标。
-
-## 20. 手和机械臂的耦合失败矩阵
-
-hand retarget failure、hand command invalid 和 arm IK failure 是三种不同事件。
-
-| Arm IK | Retarget | Hand sanitizer | 发布行为 |
+| Arm IK | Retarget | shaped hand | 当前结果 |
 |---|---|---|---|
-| 成功 | 成功 | 合法 | 发布 arm + 新 hand |
-| 成功 | 失败 | 上一 hand 仍合法 | arm 可继续，重新发布上一 hand |
-| 成功 | 成功 | 非法 | 耦合候选被拒；arm hold，不发布非法 hand |
-| 失败 | 成功 | 合法 | arm hold，但允许 hand-only 动作 |
-| 失败 | 失败 | 上一 hand 合法 | arm hold，hand hold |
-| 任意 | 任意 | 结构/范围非法 | 非法 hand 不进入共享命令边界 |
+| 成功 | 成功 | 合法 | 发布新 arm + shaped hand |
+| 成功 | 失败 | 上一 hand 合法 | arm 可继续，hand hold，记录 retarget failure |
+| 成功 | 成功 | sanitizer 非法 | coupled action 不发布，发布 arm hold 路径 |
+| 失败 | 成功 | 合法 | arm hold，允许 hand-only 发布 |
+| 失败 | 失败 | 上一 hand 合法 | arm hold + hand hold |
+| 任意 | 任意 | IPC/lifecycle 非法 | 不跨越共享命令边界 |
 
-两个容易混淆的结论：
+重要区别：
 
-1. **retarget_ok = false 不等于手命令结构非法。** 包装层返回上一条合法命令，所以 arm 在 IK 成功时仍可继续。
-2. **arm IK 失败不必冻结手。** 只要 hand 候选独立合法，系统允许手指继续动作，同时机械臂保持。
+- `retarget_ok=False` 不等于 hand endpoint 非法；
+- `retarget_ok=True` 不等于 endpoint 未被 ramp 或 clip 修改；
+- arm IK 失败不必冻结手；
+- hand sanitizer 失败会阻止一个不一致的 coupled arm/hand 发布。
 
-这种策略强调子系统可降级运行，但也要求记录层准确标注 frame status，避免把 hold 当作成功重定向。
+## 10. hand worker 与 XHand driver
 
-## 21. SafetyGate 与最终发布
+hand worker 读取最新未处理 ring sequence，并在 SDK 边界前检查：
 
-ActionCandidate 包含：
-
+- 固定 dtype、shape 和 finite；
+- operational、mechanical 和 rated envelope 的嵌套与 endpoint；
 - generation；
-- observation/action id；
-- arm endpoint；
-- hand endpoint；
-- 观测与决策时间；
-- hold/valid 语义。
+- valid-until；
+- safety state、error state 和 e-stop；
+- 若配置了 delta limit，相对 driver last-accepted endpoint 的差值。
 
-SafetyGate 检查候选：
+worker 只在允许的 safety state 下发送。persistent send/read/board faults 进入共享 fault 路径；`error_state` 是 sticky 的系统错误标志。
 
-- 是否结构完整；
-- generation 是否匹配；
-- 数值是否 finite；
-- joint limits；
-- 可选机械臂 workspace 等。
+XHand driver 再次检查 shape、finite、范围，以及配置存在时的 delta。检查通过后 endpoint 原样写入 SDK command；应用层不在 driver 中插值。
 
-当前 SafetyGate 不对动作做平滑或裁剪，也不替代 hand_control 的单步增量检查。通过后，hand endpoint 被编码为固定 HAND_COMMAND_DTYPE，带有：
+只有 SDK send 成功，driver 才更新 `last_qpos_cmd`。因此 worker/driver delta reference 是设备调用接受的上一目标，不是 measured feedback，也不是 teleop 最新 solved target。
 
-- qpos；
-- run_generation；
-- command / observation sequence；
-- 产生与过期时间；
-- hold 标记。
+## 11. 碰撞与 tactile 边界
 
-默认命令有效期约 0.5 s。
+### 11.1 teleop 当前碰撞手姿态
 
-## 22. hand worker 与 XHand driver
+teleop 在计算本周期 hand target 之前调用：
 
-### 22.1 worker 侧复验
-
-30 Hz hand worker 读取最新尚未处理的命令，并在跨越 SDK 边界前再次检查：
-
-- 固定 dtype；
-- qpos shape 与 finite；
-- operational、mechanical、rated bounds；
-- 相对 driver last_qpos_cmd 的增量；
-- generation；
-- expires_at；
-- 当前 safety state；
-- error_state 与 estop。
-
-这不是重复浪费，而是进程边界防御：
-
-- producer 与 consumer 可以异步；
-- latest-wins 可能跳过中间帧；
-- shared memory 内容必须在消费者边界重新验证；
-- worker 才知道设备最近真正接受的目标。
-
-### 22.2 状态门控
-
-worker 只在 ARMED/RUNNING 等允许状态执行命令。e-stop 会退出执行路径；持久发送、读取或板级错误会锁存共享 error_state。error_state 是 sticky，不应被一次成功读写自动清除。
-
-### 22.3 driver 侧最终检查
-
-XHand driver 再次检查：
-
-- 12 维；
-- finite；
-- 关节范围；
-- 相对 last accepted target 的增量。
-
-通过后，关节 endpoint 原样交给 SDK。默认设备控制设置包括 mode 3、位置刚度和 torque maximum 等设备参数。应用层没有在这里生成插值轨迹。
-
-只有 SDK send 成功后，last_cmd_seq / last_cmd_qpos 才反映新命令。这使后续增量判断基于“设备调用已接受”的目标，而不是基于 producer 的愿望。
-
-## 23. 与 IK、碰撞和 tactile 的关系
-
-### 23.1 机械臂 IK 使用哪一个手型
-
-在机械臂候选 IK 前，teleop 调用：
-
-~~~text
+```text
 planner.set_hand_qpos(ctx.prev_hand_qpos)
-~~~
+```
 
-也就是把上一条已发布手命令写入 19 DoF 联合碰撞模型，再评估机械臂候选。
-
-因此当前时刻 t 的逻辑更接近：
+因此机械臂 IK/collision 使用：
 
 $$
-\text{collision check}
-\left(
-\mathbf{q}_{arm}^{candidate,t},
-\mathbf{q}_{hand}^{published,t-1}
-\right)
+collision(q_{arm}^{candidate,t}, q_{hand}^{published,t-1})
 $$
 
-而不是：
+而不是同周期的：
 
 $$
-\text{collision check}
-\left(
-\mathbf{q}_{arm}^{candidate,t},
-\mathbf{q}_{hand}^{candidate,t}
-\right)
+collision(q_{arm}^{candidate,t}, q_{hand}^{shaped,t})
 $$
 
-### 23.2 当前覆盖和未覆盖
+当前联合模型保留 arm–hand 活跃碰撞对，但 hand–hand 自碰对被禁用。hand retarget 目标本身也没有碰撞项。
 
-- 联合碰撞模型包含 arm–hand 活跃 pair；
-- hand–hand pair 被禁用；
-- 新 arm 与新 hand endpoint 没有作为一个同步候选再次做联合碰撞；
-- SafetyGate 当前不承担 transition collision；
-- hand retarget 本身没有碰撞项。
+[planning/collision_model.py](../dexmani_real/planning/collision_model.py) 已提供 arm/hand transition envelope 检查，并由 replay dense preflight 使用；teleop 16 Hz 在线路径当前没有调用它。
 
-所以 TAG 的 operational bounds 不是碰撞证明。对自碰、手掌贴近机械臂或新 arm/hand 同步过渡的最终保护仍依赖几何设计、保守范围、设备结构和固件。
+由于 arm queue 和 hand latest-wins ring 独立、执行频率和固件动态不同，未来在线检查若只沿同一个 interpolation alpha 检查“同步轨迹”，不能完整覆盖异步可达组合。
 
-### 23.3 tactile
+### 11.2 tactile
 
-XHand tactile/contact 数据会进入测量与记录链路，但当前：
+XHand tactile/contact 数据进入反馈和 episode，但当前不会：
 
-- 不驱动捏合激活；
-- 不修改 Stage 2 权重；
-- 不触发接触后停止闭合；
-- 不形成力闭环。
+- 改变 pinch activation；
+- 调整 Stage 2 权重；
+- 在接触后停止闭合；
+- 形成力或力矩闭环。
 
-这使 retarget 行为完全由视觉几何和关节边界决定，易于复现；代价是“视觉上已捏合”和“物理上已接触”之间没有闭环。
+所以视觉闭合、物理接触和稳定抓取是三件不同的事情。
 
-## 24. 记录、分析与 replay
+## 12. 记录、raw/final 和 replay
 
-### 24.1 HDF5 v16 中的相关字段
+HDF5 schema v16 保存与 hand retarget 相关的主要信息：
 
-固定 16 Hz 网格样本包含：
-
-| 字段 | 含义 |
+| 层 | 主要字段语义 |
 |---|---|
-| vr_landmarks | 原始、网格对齐的 21 × 3 VR landmarks |
-| hand_qpos | 对齐时刻的测量手关节角 |
-| hand_fingertip | 从测量 qpos 经 FK 得到的世界系指尖位置 |
-| action_hand_joint | 最终被 teleop 选中的手动作 |
-| action_hand_joint_raw | retarget raw 诊断，后端语义有差异 |
-| flag_retarget_ok | 本帧是否得到新的成功 retarget |
-| flag_frame_status | ok / held / IK failure / safety reject / retarget failure |
-| hand_retarget_time_ms | retarget 包装调用耗时 |
+| observed | 网格对齐的原始 VR landmarks |
+| solved diagnostic | 正常 active frame 的 `action_hand_joint_raw` |
+| published selection | 最终 `action_hand_joint` |
+| measured | `hand_qpos` 与 hand fingertip FK |
+| status | retarget flag、frame status、held/safety 标志 |
+| timing | hand retarget wrapper elapsed time |
 
-hand_retarget_time_ms 覆盖几何变换和优化器求解调用，不包括后续 ramp、sanitizer、SafetyGate、共享内存传递和设备发送。
+当前 raw 语义：
 
-### 24.2 raw、final 与 measured 三层
+- TAG：solver 输出，SDK order，ramp 和 command shaping 之前；
+- DexPilot：外部 retargeter 返回值，已经包含 external internal LPFilter；wrapper EMA 当前默认直通；
+- retarget failure：raw helper 回退为当前 hold endpoint。
+- held / safety-fallback frame：当前 held recorder path 没有接收被拒绝的 solver raw，字段会退回 hold action。
 
-对于 TAG，可用以下三层分析：
+因此两个后端的 raw 不能作为完全相同的优化阶段直接比较，也不能依靠 held frame 的 raw 恢复被拒绝候选。
 
-~~~text
-action_hand_joint_raw
-    = optimizer output, SDK order, before outer EMA
+`action_hand_joint` 表示 teleop 最终选择并记录的 endpoint。它可能与 raw 不同，原因包括：
 
-action_hand_joint
-    = after outer EMA, startup ramp and acceptance logic
+- startup ramp；
+- operational clip；
+- 配置存在时的 delta clamp；
+- normal active path 上的 retarget failure hold。
 
-hand_qpos
-    = device feedback aligned to the sample grid
-~~~
+当前没有单独记录每关节 clip/saturation bitmask；held path 也不保留 rejected solver raw。因此只有正常 active frame 能通过 raw/final 差值和 frame flags 间接解释 shaping。
 
-这能分别研究：
+replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 retarget。这复现的是采集时选择的 endpoint，而不是在当前依赖版本下重新解释人手动作。
 
-- 优化器本身的抖动；
-- 控制整形造成的延迟；
-- 设备跟踪误差。
+## 13. 可复现性和实时效率边界
 
-DexPilot 的 raw 当前已包含更多滤波，不能与 TAG 直接按同一语义比较。
+### 13.1 provenance
 
-### 24.3 failure 标注
+[examples/collect_teleop.py](../examples/collect_teleop.py) 当前记录联合机器人 URDF、SRDF 和 calibration 等资源哈希，但没有完整覆盖：
 
-当 retarget 失败但 arm IK 成功时：
-
-- action_hand_joint 通常仍是上一条手命令；
-- flag_retarget_ok 为 false；
-- frame status 标为 retarget failure；
-- arm action可以继续。
-
-分析代码不应只看 action 是否变化来推断求解成功，也不应只看整个 frame 是否 hold 来推断手失败。
-
-### 24.4 replay
-
-replay_episode.py 使用记录的最终 action_hand_joint，不会从 vr_landmarks 重新运行 retarget。这样 replay 重现的是采集时最终选中的控制 endpoint，而不是在当前软件/依赖版本下重新解释人手动作。
-
-原始 vr_landmarks 让离线重跑后端成为可能，但那属于单独的分析工具，不是运行时 replay 语义。
-
-## 25. 可复现性与 provenance 边界
-
-episode 会保存 resolved config、config SHA，以及联合机器人模型、SRDF、相机/VR calibration 等资源哈希。这对控制环境追踪很重要。
-
-但当前 collect provenance 没有完整覆盖：
-
-- TAG 独立模型 xhand_right.urdf 的精确哈希；
-- DexPilot 模型 xhand_right_teleop.urdf 的精确哈希；
-- xhand_right_dexpilot.yml 的哈希；
+- TAG 独立 `xhand_right.urdf`；
+- DexPilot `xhand_right_teleop.urdf`；
+- DexPilot YAML；
 - dex-retargeting、Pinocchio、NLopt 版本；
-- TAG optimizer 的逐帧 residual、status、activation；
-- 输出碰到上下界的饱和信息。
+- solver result code、loss、evaluation count；
+- pinch activation、bound saturation 和 warm-start clipping。
 
-因此：
+因此最终 action replay 有定义；只依赖 episode metadata 从 landmarks 位级重算相同 action，目前没有严格保证。
 
-- **最终动作 replay** 是有定义的，因为 action 已被记录；
-- **从 VR landmarks 完全重算相同 hand action** 还不能只依赖 episode 元数据严格保证。
+### 13.2 实时预算
 
-## 26. 配置参数与调参影响
+16 Hz 控制周期名义预算为 62.5 ms。当前记录了单帧 retarget elapsed time，但仓库合同没有把以下指标固化为回归门槛：
 
-下面只描述机制影响，不构成直接上真机的调参建议。任何范围、增量、捏合权重或滤波变更都应先离线回放和碰撞审计，再在明确授权的安全环境中验证。
+- Stage 1 / Stage 2 分项耗时；
+- P50/P95/P99；
+- maximum evaluation hit rate；
+- control deadline miss；
+- Stage 2 activation 与耗时的关系；
+- 日志洪泛对控制周期的影响。
 
-### 26.1 输出平滑
+单个 synthetic case 成功不能证明真实追踪分布下的实时性。
 
-| 参数 | 增大后的典型效果 | 风险 |
-|---|---|---|
-| output EMA alpha | 更快跟随、延迟更小 | 高频抖动与单步增量拒绝增加 |
-| DexPilot internal LP alpha | 外部优化结果更快通过 | 优化噪声更直接 |
-| hand ramp duration | begin 后更柔和 | 开始阶段意图响应更慢 |
+## 14. 后续实现 backlog（当前尚未实现）
 
-EMA alpha 越大越“快”，不是越“平滑”。该方向很容易被误解。
+本节只描述建议，不代表当前代码具有这些能力。
 
-### 26.2 TAG Stage 1
+### P1：正确性和可观测性
 
-| 参数 | 增大后的典型效果 |
-|---|---|
-| finger length boost | 所有目标 wrist-to-tip 向量更长 |
-| per-finger robot/human ratio | 对应指尖目标更远 |
-| Stage 1 smooth weight | q 更接近上一解，抖动小但跟随慢 |
-| max evaluations | 更可能收敛，但最坏时延增加 |
+1. 将 `solver_ok`、`command_shaped`、`published`、`accepted` 和 `measured` 分层记录或形成明确派生规则。
+2. 增加 per-joint operational/delta clip bitmask、raw-to-final delta 和 joint-at-bound 指标。
+3. 明确 solver temporal state 已推进但 publish 失败时的恢复政策：接受分叉、显式 reset，或设计 propose/commit 接口。
+4. 将实际选择后端的 URDF、YAML 和关键原生依赖版本纳入 episode provenance。
+5. 记录 Stage 1/2 result code、loss、evaluation count、Stage 2 是否运行/回退和 pinch activation。
 
-### 26.3 TAG pinch
+### P1：离线回归和效率
 
-| 参数 | 作用 |
-|---|---|
-| pinch enter / far distance | 决定何时开始产生激活 |
-| close distance | 决定何时达到满激活 |
-| activation EMA alpha | 决定进入/退出记忆速度 |
-| pinch weight | 决定 Stage 2 对零距离闭合的强度 |
-| Stage 1 anchor weight | 防止 Stage 2 偏离整体手型 |
-| temporal weight | 防止 Stage 2 相对上一帧跳变 |
+至少覆盖：
 
-pinch weight 与关节限位并不是独立的：权重再高，若零距离在 bounds 内不可达，解仍会停在边界附近；这时更高权重可能只增加饱和和其他手指姿态牺牲。
+- landmark 退化拒绝且 solver state 不推进；
+- 合法 solve 后 publish failure 的 temporal-state 语义；
+- palm basis 正交性、determinant 和 conditioning；
+- pinky scale 的阈值、同比重建和噪声响应；
+- SDK/model order round trip；
+- TAG Stage 1/2 梯度；
+- reset 后首帧连续性；
+- operational clip、可选 delta clamp 和机械范围 reject；
+- latest-wins 跳帧相对 last-accepted delta；
+- P50/P95/P99 solver 与完整 policy tick 延迟。
 
-### 26.4 命令范围和增量
+### P2：输入质量
 
-operational lower/upper bound 影响：
+1. 若 HTS 可提供，向固定 schema 增加 tracked/confidence；schema 变化必须协调所有 producer、consumer 和 HDF5 版本。
+2. 增加最大尺度、跨帧跳变、冻结和 chirality 检查。
+3. 直接检查 wrist/index/middle SVD conditioning。
+4. 评估用户掌宽、掌长和各指长度标定，避免只依赖固定 wrist-to-tip ratio。
 
-- TAG optimizer 的可行域；
-- teleop sanitizer；
-- SafetyGate；
-- hand worker；
-- driver。
+### P2：算法和接触质量
 
-它是跨层合同，不能只改一个位置。max command delta 同样必须检查 producer 与 consumer 两侧语义。
-
-## 27. 当前实现的优势
-
-### 27.1 边界清楚
-
-算法、控制决策、共享内存、设备 worker 和记录各自有明确所有者。设备 SDK 不泄漏到 teleop，retarget 不泄漏到 worker。
-
-### 27.2 失效默认保持
-
-无效关键点、求解失败、范围错误和 stale source 不会生成“猜测动作”。系统优先保持上一条合法手命令，并通过 flag/status 保留失败事实。
-
-### 27.3 端到端多层验证
-
-同一命令在：
-
-- retarget 输出；
-- teleop sanitizer；
-- SafetyGate；
-- hand worker；
-- driver
-
-经历不同职责的验证。尤其是 worker 使用 last accepted device target，而不是简单相信 producer history。
-
-### 27.4 可分析性较好
-
-原始 VR landmarks、raw/final action、测量 qpos、指尖 FK、成功标志和耗时都进入固定网格记录，比只保存设备目标更适合定位“输入、优化、滤波还是跟踪”哪一层出了问题。
-
-### 27.5 TAG 梯度可审计
-
-TAG 的目标函数和解析 Jacobian 都在仓库内，离线数值差分能够验证；Stage 2 失败回退 Stage 1，也避免捏合精修把整个手型链路拖垮。
-
-## 28. 审计观察与改进方向
-
-以下按优先级组织。它们是基于当前实现边界的工程建议，不代表仓库已经发生对应故障。
-
-### P1：可复现性和回归保护
-
-1. **补充 retarget provenance。** 将实际选择后端的 URDF、YAML 和关键原生依赖版本纳入 episode metadata。
-2. **建立专用离线回归检查。** 至少固定覆盖：
-   - landmark 退化拒绝且不污染状态；
-   - palm basis 正交性与 determinant；
-   - pinky 每段同比缩放；
-   - SDK/model 顺序 round-trip；
-   - TAG Stage 1/Stage 2 梯度；
-   - 两后端 reset 后首帧连续性；
-   - bounds 和 max-delta 整条拒绝；
-   - synthetic pinch activation / decay。
-3. **统一 raw 字段语义。** 两个后端都暴露明确的 optimizer_raw、backend_filtered 和 final_command，或在 schema/metadata 中标出可用阶段。
-
-### P1：输入质量
-
-1. 若 HTS 能提供，向 schema 增加 tracked/confidence 信息，并在 producer 边界固定形状验证。
-2. 增加合理的最大手掌/骨段尺度和跨帧跳变检查，防止 finite 但明显错误的骨架进入优化器。
-3. 直接检查 palm SVD conditioning，或让退化 gate 与实际使用的 wrist/index/middle 三点一致。
-4. 明确拒绝非右手/未知 side，而不是依赖上游正常行为。
+1. 评估中间关节、fingertip orientation 或 finger-pad frame 是否改善弱可观测关节和接触姿态。
+2. 评估非零接触距离与多指同时 activation 的冲突。
+3. tactile 若进入控制，先定义传感器失效、接触终止、sticky fault、记录和 replay 语义。
+4. 不允许 tactile 绕过 operational/mechanical command boundary。
 
 ### P2：碰撞语义
 
-1. 明确评估新 arm candidate 与新 hand candidate 的同步联合碰撞成本。
-2. 如果在控制预算内不可行，至少把“collision uses previous hand command”变成显式指标/文档合同。
-3. 对手内自碰是否可以继续全禁用进行模型级审计；若保持禁用，应说明由机械耦合、限位还是固件承担约束。
+1. 基准测试在线 arm/hand endpoint 或 transition-envelope 检查成本。
+2. 若增加在线检查，应覆盖独立执行的保守组合，而不只检查同步插值。
+3. 审计 hand–hand collision 全禁用的依据；若继续禁用，明确由机械耦合、command bounds 还是 firmware 承担约束。
+4. 任何新增规划检查仍由 teleop/planning 所有，不下放到 hand worker，也不增加应用侧 arm 插值。
 
-任何新增碰撞检查都必须保持 teleop 所有权，不应把规划逻辑下放到 hand worker，也不应增加应用侧 arm 插值。
+## 15. 修改检查清单
 
-### P2：优化诊断
-
-可记录或按采样率降频记录：
-
-- NLopt result code；
-- Stage 1 / Stage 2 loss；
-- evaluation count；
-- Stage 2 是否运行/是否回退；
-- 4 个 pinch activation；
-- joint-at-bound bitmask；
-- warm-start clipping；
-- raw-to-final delta。
-
-这些信息能区分“输入几何错”“优化未收敛”“目标不可达”“被滤波”“被安全拒绝”。
-
-### P2：API 语义
-
-1. 将 TAG 和 DexPilot 的 low_pass_alpha 拆成语义明确的字段。
-2. 明确 pinky dynamic scale 与 static finger ratio 的组合关系。
-3. 把右手固定选择从隐式实现条件提升为验证过的配置约束，或完整实现 left-hand 资产和映射。
-
-### P3：接触质量
-
-若任务确实需要稳定抓取而不只是视觉模仿，可研究：
-
-- 非零指腹接触距离；
-- 指腹 frame 和接触法向；
-- tactile 仅作为捏合终止/权重调节，而不是直接绕过安全范围；
-- 基于离线 recorded tactile 的策略评估。
-
-这会改变控制语义，必须先定义接触失败、传感器失效、sticky fault 和 replay 行为，不能只在 Stage 2 随手加一个力反馈项。
-
-## 29. 扩展或修改时的垂直检查清单
-
-### 29.1 修改关键点或坐标系
+### 15.1 修改关键点或坐标系
 
 - VR SDK 原始约定；
-- Unity → FLU；
-- VR_FRAME_DTYPE；
+- Unity→FLU；
+- `VR_FRAME_DTYPE`；
 - causal reader；
-- palm basis；
-- operator → MANO；
-- 后端 target index；
-- raw landmarks 记录和离线工具；
-- 左右手 chirality。
+- palm basis 与 MANO transform；
+- backend target indices；
+- 左右手 chirality；
+- raw landmarks 记录和离线工具。
 
-### 29.2 修改关节顺序或增加关节
+### 15.2 修改关节顺序或 shape
 
-- runtime shape 和上下限；
-- SDK order；
-- URDF model order；
-- TAG mapping 与 inverse；
-- DexPilot YAML joint_names；
-- HAND_SDK_TO_URDF_IDX；
-- HAND_COMMAND_DTYPE；
-- hand feedback dtype；
-- collision model 19 DoF 索引；
-- recorder/reader/replay schema。
+- runtime bounds；
+- SDK/model mapping；
+- DexPilot YAML joint names；
+- planning constants 和 collision-model order；
+- hand command/state dtype；
+- recorder、reader、visualization 和 replay。
 
-如果持久化 shape 改变，不能在 HDF5 v16 中静默改义；需要协调 schema marker 和所有消费者。
+持久化 shape 或含义变化不能静默写入 HDF5 v16。
 
-### 29.3 修改滤波或 ramp
+### 15.3 修改滤波、ramp 或 temporal state
 
-- reset 时是否清空全部后端状态；
-- reanchor 首帧；
+- solver state 的推进点；
+- reset 是否清除所有 backend state；
+- ramp step 是否按 attempt、publish 或 accept 推进；
 - raw 字段阶段；
-- max-delta 拒绝率；
-- worker latest-wins 跳帧后的有效增量；
-- episode 中 measured/action 的相位差；
-- replay 是否使用 final action。
+- latest-wins 跳帧；
+- measured/action 相位差；
+- replay 仍只消费 final action。
 
-### 29.4 修改捏合逻辑
+### 15.4 修改 bounds 或 delta
 
-- 原始目标还是缩放目标上计算激活；
-- enter/close/escape 阈值；
-- 激活是否有历史；
-- Stage 2 fallback；
-- bounds saturation；
-- tactile 缺失或异常；
-- 指尖 frame 几何；
-- 记录字段与离线可解释性。
+从 [config/defaults.py](../dexmani_real/config/defaults.py) 和 [config/runtime.py](../dexmani_real/config/runtime.py) 开始，再审计：
 
-### 29.5 修改范围
-
-必须从 config/defaults.py 与 runtime 验证开始，再审计：
-
-- TAG optimizer bounds；
-- DexPilot URDF/外部扩界；
-- teleop sanitizer；
-- SafetyGate；
-- worker；
-- driver；
-- home pose；
+- optimizer bounds；
+- teleop clamp/clip；
+- sanitizer；
+- SafetyGate/publication preflight；
+- hand worker；
+- XHand driver；
+- home；
 - replay preflight；
-- metadata。
+- metadata 和本文档。
 
-## 30. 离线验证记录
+## 16. 历史语义说明
 
-本次审计执行了一个不创建硬件 SDK、不访问设备地址的确定性检查，覆盖：
+旧审计基线 `d97c436` 曾具有以下行为：
 
-1. operator-to-MANO 矩阵 determinant 约为 1；
-2. 正交误差约为 $2.22\times10^{-16}$；
-3. pinky 三个骨段获得相同动态缩放比；
-4. TAG model/SDK 映射 round-trip 误差为 0；
-5. PinGrad 解析梯度与中心差分最大绝对误差约 $9.26\times10^{-11}$；
-6. TAG synthetic landmarks 输出 finite、shape 为 12；
-7. DexPilot synthetic landmarks 输出 finite，内部 reference index shape 为 2 × 15；
-8. 两个后端对退化输入拒绝且不推进 temporal last q；
-9. DexPilot 当前内部 low-pass alpha 为 0.6。
+- TAG 和 DexPilot wrapper output EMA 默认 alpha 0.5；
+- TAG optimizer bounds 为 URDF 与 operational bounds 的交集；
+- hand `max_delta_rad` 默认 0.20 rad；
+- teleop 对 operational/delta 违规采用整条拒绝而非正常 clip；
+- hand command delivery lifetime 的表述约为 0.5 s。
 
-检查结果：
+这些历史行为解释了旧 episode、旧日志和旧讨论中的术语，但不应再用于描述当前运行合同。
 
-~~~text
-coordinate det 1.0000000000000002
-orth_err 2.220446049250313e-16
-pinky segment ratios [1.4142857142857144, 1.4142857142857144, 1.4142857142857144]
-TAG mapping [9, 10, 11, 0, 1, 2, 3, 4, 7, 8, 5, 6]
-roundtrip_err 0.0
-PinGrad max_abs_gradient_error 9.263415555460508e-11
-TAG output finite True shape (12,)
-DexPilot output finite True indices (2, 15) internal_alpha 0.6
-offline hand-retarget audit: PASS
-~~~
+## 17. 总结
 
-这只能证明离线数学与接口契约在所选 synthetic case 下成立，不能替代：
+当前 hand retarget 的核心不是一个孤立优化器，而是：
 
-- Quest 真实追踪质量验证；
-- XHand 跟踪和温升验证；
-- 实体碰撞与抓取验证；
-- 人机延迟主观评估；
-- 固件错误恢复验证。
+```text
+因果观测
+→ 几何 gate
+→ backend solve
+→ deterministic shaping
+→ candidate validation
+→ latest-wins publication
+→ worker/driver boundary
+→ fixed-grid recording
+```
 
-这些都属于需要明确授权、清空工作区并准备硬件后的独立手工验证。
+TAG 提供仓库内可审计的五指位置匹配和条件式捏合精修；DexPilot 提供外部 vector-graph 路径。当前输出机制已经简化为：TAG 不再增加 output EMA，DexPilot wrapper 默认直通，启动阶段使用 ramp，operational command floor 通过发布前 clip 实现，应用侧 delta 默认关闭。
 
-## 31. 推荐阅读顺序
+需要长期保持清晰的不是某个默认数字，而是以下边界：
 
-如果要快速理解或修改 hand retarget，建议按以下顺序：
-
-1. teleop/hand_retarget.py：公共预处理、两个包装器和映射；
-2. teleop/tag_retargeting/optimizer.py：两阶段目标和状态；
-3. teleop/tag_retargeting/pin_grad.py：FK/Jacobian 细节；
-4. teleop/hand_control.py：ramp 与 reject-whole；
-5. teleop/loop.py：何时求解、何时 hold、如何与 arm 耦合；
-6. utils/schema.py 与 shm/causal_reader.py：数据与因果时间；
-7. robot/hand_process.py 与 robot/xhand.py：设备边界；
-8. teleop/episode_samples.py 与 recording/：可观测性；
-9. planning/collision_model.py：当前联合碰撞覆盖。
-
-## 32. 总结
-
-本仓库的 hand retarget 设计重点不是追求单个优化器的最大自由度，而是把视觉手型稳定地嵌入一个可监督、可记录、可失效的实时机器人系统。
-
-TAG 默认后端通过“五指目标匹配 + 时间正则 + 条件式捏合精修”提供了仓库内可审计的数学路径；DexPilot 通过更丰富的指尖向量图保留了成熟外部实现。两者共享关键点合法性、掌心坐标、小指补偿、外层平滑、启动渐入和严格命令边界。
-
-当前最值得继续加强的并不是再堆一层平滑，而是：
-
-- 把 retarget 资产和依赖纳入 provenance；
-- 固化离线数学/时序回归检查；
-- 统一两个后端的 raw 与滤波语义；
-- 提升关键点质量观测；
-- 明确同步 arm + hand 候选的碰撞合同；
-- 为优化状态、捏合激活和边界饱和增加可解释指标。
-
-这样才能在不破坏现有共享内存、控制网格和硬件所有权架构的前提下，让 hand retarget 从“可工作”进一步走向“可证明、可比较、可复现”。
+- observed、solved、shaped、published、accepted 和 measured 不同；
+- solver state、ramp state、published state 和 driver state 有不同推进点；
+- retarget success、command shaping、safety rejection 和 lifecycle invalidation 是不同事件；
+- 视觉指尖闭合不等于物理接触、碰撞安全或抓取稳定；
+- replay final action 有定义，从 landmarks 重算相同 action 仍受资产和依赖 provenance 限制。

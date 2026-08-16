@@ -44,12 +44,9 @@ from dexmani_real.shm.shared_storage import (
     read_arm_state_dict,
     read_hand_state_dict,
 )
-from dexmani_real.teleop.keyboard import (
-    GlobalKeyState,
-    eef_delta_from_keys,
-    validate_arm_feedback,
-    validate_hand_feedback,
-)
+from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
+from dexmani_real.utils.hand_health import (validate_arm_feedback,
+                                            validate_hand_feedback)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
@@ -409,6 +406,7 @@ def _run_control_loop(
                     mechanical_upper_rad=np.asarray(
                         runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
                     ),
+                    hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
                     max_command_delta_rad=runtime.hand.max_delta_rad,
                     timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                     heartbeat=False,
@@ -596,6 +594,7 @@ def _run_control_loop(
             result.qpos,
             prepare_timeout_s=float(policy.action_prepare_timeout_s),
             safety_gate=safety_gate,
+            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
         )
         candidate = published.candidate
         if not published.succeeded or candidate is None or candidate.arm_qpos is None:
@@ -683,6 +682,7 @@ def _run_keyboard_session(
             mechanical_upper_rad=np.asarray(
                 runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
             ),
+            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             max_command_delta_rad=runtime.hand.max_delta_rad,
             timeout_s=float(runtime.hand.home_command_ack_timeout_s),
             heartbeat=False,

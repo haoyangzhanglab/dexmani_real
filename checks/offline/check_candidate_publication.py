@@ -122,22 +122,30 @@ def main() -> int:
         candidate = build_action_candidate(shared, arm_mid, None)
         assert candidate is not None
         shared.estop_request.value = True
-        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0
+        )
         assert result.status == CommandPublishStatus.ESTOP_REQUESTED, result
         shared.estop_request.value = False
 
         shared.error_state.value = True
-        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0
+        )
         assert result.status == CommandPublishStatus.STICKY_FAULT, result
         shared.error_state.value = False
 
         shared.is_running.value = False
-        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0
+        )
         assert result.status == CommandPublishStatus.RUNTIME_STOPPED, result
         shared.is_running.value = True
 
         assert transition(shared, SafetyState.DISARMED)
-        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0
+        )
         assert result.status == CommandPublishStatus.SAFETY_STATE_GATED, result
         assert transition(shared, SafetyState.ARMED)
         assert _drain_arm_queue(shared) == 0, "runtime gate must not write transport"
@@ -145,7 +153,9 @@ def main() -> int:
         # ── validate_and_send_candidate: empty arm feedback ──
         candidate = build_action_candidate(shared, arm_mid, hand_mid)
         assert candidate is not None
-        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0, prepare_timeout_s=0.1
+        )
         assert result.status == CommandPublishStatus.ARM_FEEDBACK_UNAVAILABLE, result
         assert _drain_arm_queue(shared) == 0, "no transport write on unavailable feedback"
 
@@ -153,7 +163,9 @@ def main() -> int:
         shared.arm_state_ring.write(make_arm_state_frame(arm_mid, connected=1, state_valid=1))
         candidate = build_action_candidate(shared, arm_mid, hand_mid)
         assert candidate is not None
-        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0, prepare_timeout_s=0.1
+        )
         assert result.status == CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE, result
         assert _drain_arm_queue(shared) == 0, "missing hand feedback must block the arm endpoint"
 
@@ -162,7 +174,9 @@ def main() -> int:
         )
         candidate = build_action_candidate(shared, arm_mid, hand_mid)
         assert candidate is not None
-        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0, prepare_timeout_s=0.1
+        )
         assert result.status == CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY, result
         assert _drain_arm_queue(shared) == 0, "unhealthy hand must block the arm endpoint"
 
@@ -170,7 +184,9 @@ def main() -> int:
         shared.hand_state_ring.write(make_hand_state_frame(hand_mid, connected=1, state_valid=1))
         candidate = build_action_candidate(shared, arm_mid, hand_mid)
         assert candidate is not None
-        sent = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        sent = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0, prepare_timeout_s=0.1
+        )
         assert sent.status == CommandPublishStatus.PUBLISHED, sent
         published = sent.candidate
         assert published is not None
@@ -187,6 +203,7 @@ def main() -> int:
             shared,
             candidate,
             gate=gate,
+            hand_feedback_max_age_s=1.0,
             prepare_timeout_s=0.1,
             previous_hand_qpos=hand_mid,
             hand_mechanical_lower_rad=np.asarray(
@@ -204,7 +221,9 @@ def main() -> int:
         bad_arm = np.asarray(arm_defaults.joint_limit_upper, dtype=np.float64) + 10.0
         candidate = build_action_candidate(shared, bad_arm, None)
         assert candidate is not None
-        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        result = validate_and_send_candidate(
+            shared, candidate, gate=gate, hand_feedback_max_age_s=1.0, prepare_timeout_s=0.1
+        )
         assert result.status == CommandPublishStatus.GATE_REJECTED, result
         assert _drain_arm_queue(shared) == 0, "gate rejection must not write transport"
     finally:

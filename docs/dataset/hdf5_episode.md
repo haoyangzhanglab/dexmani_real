@@ -26,6 +26,7 @@ Real 部分以
 | 查 Sim HDF5 dataset 和 attributes | 11.4、11.5 |
 | 查 Sim Zarr array、chunk 和 episode 边界 | 11.7 |
 | 查 Sim 实测规模、问题和读取约束 | 11.8、11.10、11.11 |
+| 按处置优先级查看 Real 已确认问题 | 0.4 |
 
 ### 0.2 覆盖范围与复核状态
 
@@ -49,6 +50,28 @@ Real 部分以
 | 点云 | `/pointcloud` 为 `(N,2048,6)`，默认点数可配置 | 可见点云 `(N,1024,6)`，另有手部理想点云 `(N,512,6)` |
 | episode 元数据 | `data.h5` 的 `/meta` group attributes | HDF5 根 attributes；当前 Zarr 不保留这些属性 |
 | 发布完整性 | 临时目录写入、校验并原子 rename | HDF5 直接写最终文件；Zarr 以 `mode="w"` 直接覆盖目标 store |
+
+### 0.4 DexMani Real fact-check 问题优先级总表
+
+本表只覆盖 **DexMani Real schema v16**，不包含第 11 节的 DexMani Sim 数据集问题。
+优先级表示建议处置顺序：**P1** 应在依赖相关字段进行训练或回放前处理，**P2** 应在扩大
+数据用途或下一次 schema 修订时处理，**P3** 属于扩展边界维护。本轮没有发现需要列为 P0
+的现存 Real 数据不可逆损坏。运行复现均使用临时目录和 fake，不启动机器人、相机或 GUI。
+本表复核日期为 **2026-08-16**。
+
+| 顺序 | 优先级 | ID | 问题摘要 | 证据状态 | 主要影响 / 建议 |
+|---:|---|---|---|---|---|
+| 1 | P1 | H5-07 | `EpisodeReader.VALID` 只要求 37 个核心 dataset，不保证 97 个标准 `data.h5` dataset 齐全。 | 最小 v16 fixture 运行复现 | 缺 `arm_qpos`、`arm_qvel` 和多个质量标志仍可通过；统一标准字段清单并由 writer finalizer、reader 和消费方共用。 |
+| 2 | P1 | H5-01 | `arm_ee` 的直接生产者输出 arm base frame，但文档/消费端容易把它当作字段固有的 world frame。 | producer、FK 和默认 frame 配置静态交叉核查 | 当前默认 base/world 变换为单位矩阵时数值重合，配置变化后可能静默产生坐标误用；统一字段合同或显式持久化 frame 标识。 |
+| 3 | P1 | H5-04 | held/failure 路径未提供显式 raw 值，两个 `action_*_joint_raw` 都回退为当帧 hold/最终命令。 | recorder buffer 运行复现 | 不能把所有行都解释为原始 IK/retarget 输出；结合状态标志读取，并考虑增加 raw-valid 标志或用 NaN 表示不存在。 |
+| 4 | P2 | H5-02 | `/depth` 所在像素平面取决于 RealSense alignment 配置，并不天然与 RGB 同平面。 | camera producer 与 metadata 静态交叉核查 | 使用错误内参反投影会得到错误点云；reader 必须检查 `depth_alignment_target` 后选择相应内参。 |
+| 5 | P2 | H5-03 | XHand 触觉值经过 `0.1` 缩放和可选 bias 扣除，接触阈值单位尚不是经过验证的 SI 力单位。 | SDK 解析、bias 和 contact producer 静态追踪 | 不能把数值直接解释为 N 或反推出 SDK 原始值；读取时联合 freshness、calibration 和 unit code。 |
+| 6 | P2 | H5-05 | `arm_tau` 是 xArm SDK 基于电流估计的 `effort`，精确物理单位未由当前 API 合同确认。 | SDK 调用链 + 厂商公开说明交叉核查 | 不适合作为标定力矩真值或直接安全阈值；在厂商合同确认前仅用于同设备相对趋势。 |
+| 7 | P3 | H5-06 | 绕过标准 RecorderIO 直接调用底层 recorder 时，首帧额外 diagnostics 可形成非标准 dataset，且同名值可覆盖默认语义。 | writer/buffer 静态确认 | 第三方 episode 可能超出标准 97-field 合同；为长期扩展定义命名空间、版本和冲突检查。 |
+
+H5-07 不表示当前标准 RecorderIO 正常产生的 episode 已缺少字段：标准路径仍会创建第 4 节
+列出的 97 个 dataset。风险集中在手工构造、受损文件以及未来 writer/reader 字段漂移；在
+修复共享 schema 校验前，消费方仍须显式检查自己依赖的非核心字段。
 
 ## 1. Episode 不是单个 HDF5 文件
 
@@ -267,10 +290,10 @@ attribute。上表列出当前标准采集入口实际提供的全部键；未�
 
 | Dataset | Shape | dtype | 单位 | 物理意义 |
 |---|---:|---|---|---|
-| `action_arm_joint_raw` | `(N,A)` | float64 | rad | IK 求解器原始关节解，尚未经过 teleop 应用层的逐帧 delta clamp 和 joint-limit clip。 |
+| `action_arm_joint_raw` | `(N,A)` | float64 | rad | 正常 IK 路径保存应用层逐帧 delta clamp 和 joint-limit clip 之前的关节解；held/failure 路径没有显式 raw 解时回退为当帧 hold/最终 arm 命令。 |
 | `action_arm_joint` | `(N,A)` | float64 | rad | 经过 delta/joint-limit 处理并通过 SafetyGate 的有效机械臂命令；hold 槽保存有效 hold 目标。 |
 | `action_arm_joint_sent` | `(N,A)` | float64 | rad | 实际转发给 arm worker 的安全命令流。标准 RecorderIO v16 存在；手工构造且未启用 `arm_sent_stream` 时可缺省。 |
-| `action_hand_joint_raw` | `(N,H)` | float64 | rad | 位于 ramp、可选 delta clip、操作限位 clip 和后续校验之前；TAG 成功路径保存 SDK 关节序的优化器输出，其他路径保存 retargeter 返回的命令。详见第 10.4 节。 |
+| `action_hand_joint_raw` | `(N,H)` | float64 | rad | 正常 retarget 路径位于 ramp、可选 delta clip、操作限位 clip 和后续校验之前；held/failure 路径没有显式 raw 值时回退为当帧 hold/最终 hand 命令。详见第 10.4 节。 |
 | `action_hand_joint` | `(N,H)` | float64 | rad | 经过 ramp、可选 delta clip、操作限位 clip 和后续校验的有效手部命令。 |
 | `action_arm_ee` | `(N,9)` | float64 | 前 3 列 m | IK 实际追踪的 `[target_pos(3), target_rot6d(6)]`；没有目标时为 NaN，held 帧尽量沿用最后有效目标。 |
 | `target_eef_pos_raw` | `(N,3)` | float64 | m | VR 映射后的原始 EEF 位置目标，位于 EMA/workspace clamp 之前。 |
@@ -286,6 +309,9 @@ action_arm_joint_raw
     → 实际入队/hold endpoint
     → action_arm_joint_sent
 ```
+
+该顺序只描述存在显式 IK raw 解的正常路径。对 `flag_frame_status != OK` 的行，不得仅凭
+字段名把 `action_arm_joint_raw` 或 `action_hand_joint_raw` 解释为求解器原始输出。
 
 ### 4.5 Observation/action 因果协议
 
@@ -461,6 +487,13 @@ RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
 `flag_sample_valid`、`observation_valid`、`flag_camera_fresh`、
 `flag_pointcloud_valid`、`flag_frame_status`、连接状态及触觉 freshness。
 
+当前 reader 的“必需 dataset”集合只有 37 个核心字段，并不等于第 4 节的 97 个标准
+`data.h5` dataset。特别是 `arm_qpos`、`arm_qvel`、`flag_camera_fresh`、
+`flag_pointcloud_valid` 和 `flag_frame_status` 不属于当前 `VALID` 的存在性检查；消费方在
+依赖这些字段前仍须自行检查。`action_arm_joint_sent` 对未启用 `arm_sent_stream` 的底层
+recorder 调用本来就是可选字段，不应与前述标准状态/质量字段混为一谈。该校验缺口列为
+H5-07。
+
 ## 8. 读取示例
 
 ### 8.1 使用统一 reader
@@ -514,12 +547,12 @@ episode，应先检查 `"action_arm_joint_sent" in f`；标准 RecorderIO 录制
 
 ## 10. 已知问题与解释边界
 
-本节记录 2026-08-15 对 writer、producer、reader 和已安装设备 SDK 进行交叉核查后确认的
-问题。这里的“问题”包括已经在正文澄清的历史歧义，以及数据本身无法提供充分物理保证的
-边界。除非下文明确说明，否则这些问题不改变第 4 节列出的标准 v16 dataset 名称、shape
-或 dtype。
+本节记录 2026-08-15 初审及 2026-08-16 fact-check 对 writer、producer、reader 和已安装
+设备 SDK 进行交叉核查后确认的问题。这里的“问题”包括已经在正文澄清的历史歧义，以及
+数据本身无法提供充分物理保证的边界。除非下文明确说明，否则这些问题不改变第 4 节列出
+的标准 v16 dataset 名称、shape 或 dtype。
 
-> **严重度统计：** 高 1 项、中 4 项、低 1 项。状态中的“文档已澄清”不表示底层代码或
+> **严重度统计：** 高 2 项、中 4 项、低 1 项。状态中的“文档已澄清”不表示底层代码或
 > 文件合同已经迁移，只表示本文不再沿用已确认的错误表述。
 
 | ID | 级别 | 影响字段 | 类型 | 状态 | 核查结论 |
@@ -527,9 +560,10 @@ episode，应先检查 `"action_arm_joint_sent" in f`；标准 RecorderIO 录制
 | H5-01 | 高 | `arm_ee`、`hand_fingertip` | 坐标系契约 | 文档已澄清；代码合同待统一 | `arm_ee` 的直接生产者输出 arm base frame；当前默认 base/world 为单位变换，所以数值重合，但不能把“world”视为字段固有合同。 |
 | H5-02 | 中 | `/depth`、`/meta.camera_K` | 对齐语义 | 文档已澄清 | `/depth` 位于对齐后的 depth frame；只有 `depth_to_color` 才是 color/RGB 平面，`color_to_depth` 时是 depth 平面。 |
 | H5-03 | 中 | `hand_contact`、`hand_tactile_force`、`hand_tactile_contact` | 单位/处理语义 | 文档已补充 | 触觉值经过 `0.1` 缩放和可选软件 bias 扣除；接触由每指三轴汇总值的 L2 范数与阈值比较。 |
-| H5-04 | 中 | `action_hand_joint_raw` | 动作语义 | 文档已澄清 | TAG 成功路径保存 SDK 关节序的优化器输出；其他路径回退为 retargeter 返回的命令。 |
+| H5-04 | 中 | `action_arm_joint_raw`、`action_hand_joint_raw` | 动作语义 | 文档已修正；代码合同未区分 raw 有效性 | 正常路径保存显式 raw 值；held/failure 路径未提供 raw 时，录制层回退为当帧 hold/最终命令。 |
 | H5-05 | 中 | `arm_tau` | 单位/传感器来源 | 待厂商合同确认 | 数据是 xArm SDK `get_joint_states(..., num=3)` 的 `effort`；官方资料说明它是基于电流的估计值而非直接力矩传感器读数，API 未明确给出精确单位。 |
 | H5-06 | 低 | 非标准 diagnostics | 扩展边界 | 已确认；非标准 schema | 标准 RecorderIO 字段清单完整；直接调用底层 recorder 时，第一帧的额外 diagnostics key 可能形成自定义 `float64` dataset。 |
+| H5-07 | 高 | `EpisodeReader.validity`、标准 v16 datasets | 完整性校验 | 运行复现；代码待修复 | reader 只要求 37 个核心字段；缺少 `arm_qpos` 和多个标准质量字段的手工/受损 episode 仍可判为 `VALID`。 |
 
 ### 10.1 H5-01：`arm_ee` 与 `hand_fingertip` 的坐标系依赖
 
@@ -582,21 +616,27 @@ RGB 平面。
 代码定位：`robot/xhand.py::parse_tactile`、`robot/xhand.py::parse_tactile_sum`、
 `robot/xhand.py::detect_contact`。
 
-### 10.4 H5-04：`action_hand_joint_raw` 是分路径定义
+### 10.4 H5-04：两个 raw action 字段都是分路径定义
 
-`action_hand_joint_raw` 总是在启动 ramp、可选的单步 delta clip、操作限位 clip 和
-`_sanitize_hand_command()` 后续校验之前捕获，但“raw”的上游含义取决于 retargeter：
+正常 action 路径会显式传入 raw 值：`action_arm_joint_raw` 是应用层 delta clamp 和
+joint-limit clip 之前的 IK 关节解；`action_hand_joint_raw` 位于启动 ramp、可选的单步
+delta clip、操作限位 clip 和 `_sanitize_hand_command()` 后续校验之前，但其更上游含义
+取决于 retargeter：
 
 - TAG 成功且 `last_raw_qpos` 有效：保存 SDK joint order 下的优化器输出；
 - 非 TAG retargeter、retarget 失败、raw shape/finite 校验失败：保存 retargeter 返回的命令；
-- 调用方没有显式传值：录制层回退为当帧 `hand_cmd`。
+- 正常 action 调用方没有显式传值：录制层分别回退为当帧 `arm_cmd`/`hand_cmd`；
+- `_record_held()` 不提供两个 raw 字段，因此 IK failure、safety reject 和其他主动 hold 行
+  会把 hold/最终 arm、hand 命令写入对应的 `*_raw` dataset。
 
-因此该字段适合分析 ramp、delta clip 和操作限位 clip 造成的变化；只有结合
-retargeter 类型与 `flag_retarget_ok`，才能区分 TAG 优化器输出和其他 retargeter 的返回命令。
+因此只有正常路径的行适合用这两个字段分析 clamp/ramp 前后差异。读取时必须联合
+`flag_frame_status`、`flag_held`、`flag_ik_ok` 和 `flag_retarget_ok`；当前 schema 没有独立的
+raw-valid 标志，不能只凭 dataset 名称断言某一行存在求解器原始输出。
 
 代码定位：`teleop/hand_retarget.py::TAGHandRetargeter.last_raw_qpos`、
 `teleop/hand_control.py::_get_raw_hand_command`、`teleop/loop.py::teleop_loop`、
-`teleop/episode_samples.py::_record_frame`。
+`teleop/episode_samples.py::_record_frame`、`teleop/episode_samples.py::_record_held`、
+`recording/episode_recorder.py::EpisodeRecorder.add_frame`。
 
 ### 10.5 H5-05：`arm_tau` 是电流估算 effort，不是直接力矩测量
 
@@ -634,6 +674,27 @@ dataset 加上两个相机侧车 dataset 是完整的标准清单。若绕过 Re
 代码定位：`recording/io_process.py::_unpack_sample`、
 `recording/episode_recorder.py::EpisodeRecorder.add_frame`、
 `recording/timestamp_buffer.py::TimestampAlignedBuffer._allocate`。
+
+### 10.7 H5-07：`VALID` 不是完整 97-field schema 校验
+
+`EpisodeReader.validity` 当前硬编码 37 个核心 dataset，并对这些字段执行首维、时间因果、
+动作 shape/finite 等检查；它还检查 depth、pointcloud 和解码后的 RGB 帧数。但是 reader
+没有复用标准 RecorderIO 的完整字段清单，writer 发布前也只遍历并检查已经存在的
+dataset，不检查标准字段是否缺失。
+
+隔离复现构造了一个满足上述核心字段、相机侧车和 metadata 条件的 v16 episode，同时
+省略 `arm_qpos`、`arm_qvel`、`flag_camera_fresh`、`flag_pointcloud_valid` 和
+`flag_frame_status`，结果仍为 `VALID`。这主要影响手工构造、受损或未来发生 writer/reader
+漂移的 episode；当前标准 RecorderIO 正常路径仍会创建第 4 节列出的 97 个 dataset。
+
+修复时应让 writer、finalizer 和 reader 共享同一份标准字段定义，并把
+`action_arm_joint_sent` 的有条件可选规则单独编码。修复前，训练、可视化和回放入口应对其
+实际使用的非核心字段做显式存在性、shape 和 dtype 检查，不能把 `require_valid()` 当作完整
+schema 验证。
+
+代码定位：`recording/episode_reader.py::EpisodeReader.validity`、
+`recording/episode_recorder.py::EpisodeRecorder._validate_and_sync_temp_episode`、
+`recording/io_process.py::_unpack_sample`。
 
 ---
 

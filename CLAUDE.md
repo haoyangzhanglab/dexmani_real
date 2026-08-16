@@ -133,11 +133,16 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   path has no additional output EMA.  Optional DexPilot retains its own
   retargeting filters; the bundled outer EMA setting is `1.0` (pass-through).
   The EtherCAT firmware PID remains the execution-layer trajectory smoother.
-  Coupled hand paths run the centralized controller-side preflight
-  (`validate_and_send_candidate` → `validate_hand_command_delta`) on the rated
-  mechanical envelope before the arm endpoint is enqueued so a rejected or
-  unhealthy hand desyncs nothing; `worker_validate_hand` remains the
-  authoritative execution-layer backstop.
+  Coupled hand paths first take a fail-closed hand feedback snapshot
+  (`_hand_feedback_snapshot`: `connected`, `state_valid`, no `error_state`,
+  `send_healthy`/`read_healthy`, and finite `qpos`/`last_cmd_qpos`), then run the
+  centralized preflight (`validate_and_send_candidate` →
+  `validate_hand_command_delta`) on the rated mechanical envelope before the arm
+  endpoint is enqueued, so a rejected or unhealthy hand desyncs nothing;
+  `worker_validate_hand` remains the authoritative execution-layer backstop.
+  The snapshot does not yet reject a timestamp-expired frame: freshness is
+  enforced only in the keyboard `validate_hand_feedback` predicate, not on the
+  policy publish path.
 - `run_generation` tags commands and candidates. Begin, pause, home, feedback
   fault, and camera re-warm advance it; workers reject queued/ring commands from
   an older generation; this cannot retract an endpoint already accepted by
@@ -321,6 +326,11 @@ aligned samples → RecorderIO → temporary episode + stream verification
   source timestamps, worker heartbeat, board error registers, and SDK return
   codes for health. The v16 `qpos_stale` bit is retained as a reserved false
   compatibility field.
+- Hand `state_valid` mirrors `connected` (set from the last read's connection
+  flag; the first frame is set unconditionally). Hand feedback health has one
+  shared predicate — `validate_hand_feedback` (`utils/hand_health.py`) — invoked
+  from the teleop loop, the policy feedback snapshot, the coordinator hand-
+  reference seed, and the supervisor health summary. Don't add a divergent copy.
 - Return-home creates explicit bounded milestones from the worker's last
   accepted hand command to the configured hand-home endpoint. Every complete
   endpoint is published unchanged and matched to a successful SDK action ID;
@@ -343,7 +353,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
 | `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |
 | `examples/realsense_record_example.py` | — | Interactive RealSense RGB-D + point-cloud test; hardware read-only by default |
 | `examples/pointcloud_process_example.py` | `sensor/pointcloud_processor.py` | Production point-cloud pipeline diagnostic; explicit confirmation for desk-plane write |
-| `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; requires explicit hardware authorization for motion commands |
+| `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; read-only by default; motion requires `--move` + confirmation |
 | `examples/visualize_episode.py` | — | Offline Rerun 3D visualization; no hardware control; self-contained script |
 
 ## 8. Completion checklist

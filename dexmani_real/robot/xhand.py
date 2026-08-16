@@ -29,35 +29,18 @@ except ImportError:
     _SDK_AVAILABLE = False
 
 
-from dexmani_real.utils.array_utils import nan_array, safe_resize
 from dexmani_real.utils.log import capture_native_stdout, extract_native_diagnostics, get_logger
 from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
 
-JOINT_NAMES = [
-    "thumb_abduction",
-    "thumb_joint1",
-    "thumb_joint2",
-    "index_abduction",
-    "index_joint1",
-    "index_joint2",
-    "middle_joint1",
-    "middle_joint2",
-    "ring_joint1",
-    "ring_joint2",
-    "little_joint1",
-    "little_joint2",
-]
-
-
-SENSOR_NAMES = ["thumb", "index", "middle", "ring", "little"]
-
-
 @dataclass
 class XHandConfig:
-    comm_type: str = "EtherCAT"
+    # Canonical transport protocol: "ethercat" (production) or "serial" (RS485
+    # diagnostic adapter). Validated to this closed set in __post_init__ so the
+    # driver never guesses a protocol from a fuzzy alias.
+    comm_type: str = "ethercat"
     device_name: str | None = None
     baudrate: int = 3_000_000
     device_id: int = 0
@@ -137,6 +120,14 @@ class XHandConfig:
     tactile_contact_threshold: float = 1.0
 
     def __post_init__(self) -> None:
+        if self.comm_type not in ("ethercat", "serial"):
+            raise ValueError("XHand comm_type must be 'ethercat' or 'serial'")
+        if self.device_name is not None and not isinstance(self.device_name, str):
+            raise ValueError("XHand device_name must be a string or null")
+        if not isinstance(self.baudrate, int) or self.baudrate <= 0:
+            raise ValueError("XHand baudrate must be a positive integer")
+        if not isinstance(self.device_id, int) or self.device_id < 0:
+            raise ValueError("XHand device_id must be a non-negative integer")
         if self.ethercat_slave_position < -1:
             raise ValueError("ethercat_slave_position must be -1 (unknown) or non-negative")
         command_lower = np.asarray(self.qpos_min, dtype=np.float64)
@@ -175,12 +166,55 @@ class XHandConfig:
         return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
 
+@dataclass(frozen=True)
+class XHandSample:
+    """Immutable snapshot of one successful XHand read.
+
+    Field names mirror the shared ``HAND_STATE_DTYPE`` (``tactile_sum`` not
+    ``tactile_force_sum``) so the worker's per-tick parse is a straight copy.
+    Arrays are validated for shape/finite-ness, copied, and marked read-only on
+    construction, so a caller can never alias or mutate the driver's live
+    buffers.  ``error_state`` and liveness are object fields on :class:`XHand`,
+    not part of this snapshot — the snapshot is pure feedback.
+    """
+
+    qpos: np.ndarray  # (12,) rad
+    current: np.ndarray  # (12,) per-joint current
+    tactile_force: np.ndarray  # (5, 120, 3) raw force per sensor point
+    tactile_sum: np.ndarray  # (5, 3) combined force per finger
+    tactile_contact: np.ndarray  # (5,) bool per-finger contact
+    commboard_err: np.ndarray  # (12,) int32 comm board error register
+    jointboard_err: np.ndarray  # (12,) int32 joint board error register
+    tipboard_err: np.ndarray  # (12,) int32 tip board error register
+
+    _SPEC: tuple[tuple[str, tuple[int, ...], type], ...] = (
+        ("qpos", HAND_JOINT_SHAPE, np.float64),
+        ("current", HAND_JOINT_SHAPE, np.float64),
+        ("tactile_force", HAND_TACTILE_FORCE_SHAPE, np.float64),
+        ("tactile_sum", HAND_TACTILE_SUM_SHAPE, np.float64),
+        ("tactile_contact", HAND_CONTACT_SHAPE, bool),
+        ("commboard_err", HAND_JOINT_SHAPE, np.int32),
+        ("jointboard_err", HAND_JOINT_SHAPE, np.int32),
+        ("tipboard_err", HAND_JOINT_SHAPE, np.int32),
+    )
+
+    def __post_init__(self) -> None:
+        for name, shape, dtype in self._SPEC:
+            arr = np.asarray(getattr(self, name), dtype=dtype)
+            if arr.shape != shape:
+                raise ValueError(f"XHandSample.{name} must have shape {shape}, got {arr.shape}")
+            if name != "tactile_contact" and not np.all(np.isfinite(arr)):
+                raise ValueError(f"XHandSample.{name} must be finite")
+            arr = arr.copy()
+            arr.setflags(write=False)
+            object.__setattr__(self, name, arr)
+
+
 class XHand:
     def __init__(self, config: XHandConfig):
         self.connected_flag: bool = False
         self.error_state: bool = False
         self.last_error_message: str = ""
-        self.last_action_code: int | None = None
         self.config = config
         self.control: Any = None
         self.device_name: str | None = None
@@ -188,7 +222,6 @@ class XHand:
 
         self.last_qpos_cmd: np.ndarray | None = None
         self.last_error_code: int | None = None
-        self.last_joint_limit_rejected = False
 
         # reset_sensor() can leave an offset; subtract a fresh no-contact mean.
         self._tactile_bias_ft: np.ndarray | None = None  # (5, 3)   — calc_force bias
@@ -197,7 +230,8 @@ class XHand:
 
         self._stub_mode = False
         self.last_hand_ids: list[int] = []
-        self.cached_comm_type = self._resolve_comm_type()
+        # Canonical transport protocol (validated in XHandConfig.__post_init__).
+        self.cached_comm_type = self.config.comm_type
         self.device_identity: dict[str, str] = {
             "backend": "hardware" if _SDK_AVAILABLE else "unavailable",
             "hand_type": "unavailable",
@@ -228,7 +262,7 @@ class XHand:
             logger.warning("XHand SDK unavailable — explicit following simulation backend enabled")
             self._stub_mode = True
             self.connected_flag = True
-            self.last_qpos_cmd = self._array12(self.config.home_qpos)
+            self.last_qpos_cmd = np.asarray(self.config.home_qpos, dtype=np.float64)
             self.device_identity = {
                 "backend": "simulation",
                 "hand_type": "right",
@@ -251,7 +285,7 @@ class XHand:
                 )
             self.error_state = False
             self._verify_device()
-            self.hand_command = self.make_command(self._array12(self.config.home_qpos))
+            self.hand_command = self.make_command(np.asarray(self.config.home_qpos, dtype=np.float64))
             if not self._init_hand_state():
                 raise RuntimeError("initial XHand state is unavailable or invalid")
         except Exception:
@@ -283,7 +317,7 @@ class XHand:
         # slave to OP regardless of PDO/SDO outcome, and repeated transitions
         # compound state corruption without recovery value.
         retries = max(
-            1, int(self.config.open_ethercat_retries if comm_type == "EtherCAT" else self.config.open_serial_retries)
+            1, int(self.config.open_ethercat_retries if comm_type == "ethercat" else self.config.open_serial_retries)
         )
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
@@ -331,17 +365,19 @@ class XHand:
             open_capture = None
             try:
                 with capture_native_stdout() as open_capture:
-                    if comm_type == "RS485":
+                    if comm_type == "serial":
                         err = self.control.open_serial(device_name, int(self.config.baudrate))
-                    elif comm_type == "EtherCAT":
+                    elif comm_type == "ethercat":
                         err = self.control.open_ethercat(device_name)
                     else:
                         self.error_state = True
                         self.last_error_code = -3
                         self.last_error_message = f"unsupported comm_type: {self.config.comm_type}"
+                        self._close_control()
                         return False
             except Exception:
                 open_output = open_capture.text if open_capture is not None else ""
+                self._close_control()
                 logger.error(
                     "XHand open attempt %d/%d raised%s",
                     attempt,
@@ -389,7 +425,7 @@ class XHand:
                 # sufficient — if the slave was in OP, the first retry's wait
                 # already handled it; if not, it's a different error class.
                 _retry_delay = delay
-                if comm_type == "EtherCAT" and attempt == 1:
+                if comm_type == "ethercat" and attempt == 1:
                     _retry_delay = max(delay, self._STALE_OP_RECOVERY_WAIT_S)
                     logger.warning(
                         "XHand connect attempt %d/%d failed: %s — "
@@ -434,50 +470,73 @@ class XHand:
             self.control = None
 
     def _init_hand_state(self) -> bool:
-        """Force-refresh hardware state and read initial qpos.
+        """Force-refresh hardware state and read the initial qpos seed.
 
         Do not use SDK cache here — after open_serial() the cache
-        may be all zeros. Falls back to home_qpos if no valid state
-        is obtained.
+        may be all zeros. Returns False when no valid state can be read.
         """
-        valid_state: dict[str, Any] | None = None
         attempts = max(1, int(self.config.init_state_read_attempts))
         interval = max(0.0, float(self.config.init_state_read_interval))
 
+        sample: XHandSample | None = None
         for _ in range(attempts):
-            state = self.get_state(full=True, force_update=True)
-            if self.is_valid_qpos_state(state):
-                valid_state = state
+            try:
+                sample = self.get_state(force_update=True)
+                break
+            except (RuntimeError, ValueError):
+                sample = None
             if interval > 0:
                 time.sleep(interval)
 
-        if valid_state is not None:
-            measured_qpos = np.asarray(valid_state["qpos"], dtype=np.float64)
-            # This projects only the internal command-history seed. No command
-            # is published here, and raw measured feedback stays unchanged.
-            self.last_qpos_cmd = np.clip(measured_qpos, self.config.qpos_min, self.config.qpos_max)
-            logger.debug("Initial qpos from hand state: %s", measured_qpos)
-        else:
+        if sample is None:
             return False
 
-        # ── Tactile sensor initialisation ──
+        measured_qpos = sample.qpos
+        # This projects only the internal command-history seed. No command
+        # is published here, and raw measured feedback stays unchanged.
+        self.last_qpos_cmd = np.clip(measured_qpos, self.config.qpos_min, self.config.qpos_max)
+        logger.debug("Initial qpos from hand state: %s", measured_qpos)
+        return True
+
+    def initialize_tactile(self) -> bool:
+        """Reset fingertip sensors and estimate a no-contact software bias.
+
+        Explicit, worker-invoked step (split out of ``connect()``): connecting
+        only opens the device, confirms the device ID, and seeds the command
+        history.  Any failure here — contact/load at startup, a dead sensor, or
+        a read error — degrades to ``calibrated=False`` and returns False
+        without blocking joint control.
+        """
+        if self._stub_mode:
+            self.tactile_calibrated = True
+            return True
+
+        try:
+            sample = self.get_state(force_update=True)
+        except (RuntimeError, ValueError):
+            self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+            self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+            self.tactile_calibrated = False
+            logger.warning("Tactile initialization degraded: startup read failed", exc_info=True)
+            return False
+
         # Check the raw startup load before reset_sensor() can redefine the
         # loaded state as zero. Missing/malformed tactile feedback also fails
         # calibration closed while leaving non-tactile hand operation usable.
-        startup_force = valid_state.get("tactile_force_sum")
-        if self._tactile_load_present(startup_force):
+        if self._tactile_load_present(sample.tactile_sum):
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
             self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
             self.tactile_calibrated = False
             logger.error("Tactile calibration refused: contact/load or invalid tactile data detected at startup")
-            return True
+            return False
+
         # Reset all five fingertip sensors after power-on.  The SDK documents
         # that some sensors may need an explicit reset before they begin
         # reporting data (sensor IDs 17–21: thumb, index, middle, ring, little).
         # Failures are logged but do not block operation — a dead sensor is
         # less harmful than a refused connection.
         self._reset_tactile_sensors()
-        return True
+        return self.tactile_calibrated
 
     def _tactile_load_present(self, force_sum: Any) -> bool:
         """Fail-closed startup-load check in the SDK's unverified units."""
@@ -549,7 +608,7 @@ class XHand:
                     )
 
             # ── Verify: read fresh state (before bias) and check force magnitudes ──
-            err, hand_state = self._unpack_result(self.control.read_state(device_id, True))  # force_update=True
+            err, hand_state = self._unpack_result(self.control.read_state(device_id, self._effective_force_update(True)))
             if not self.error_ok(err):
                 logger.warning(
                     "Tactile verify read failed (iter %d/%d, code=%s) — retrying all sensors",
@@ -629,7 +688,7 @@ class XHand:
         raw_samples: list[np.ndarray] = []
 
         for _ in range(n_samples):
-            err, hand_state = self._unpack_result(self.control.read_state(device_id, True))  # force_update=True
+            err, hand_state = self._unpack_result(self.control.read_state(device_id, self._effective_force_update(True)))
             if not self.error_ok(err):
                 logger.warning(
                     "Tactile bias sample read failed (code=%s) — "
@@ -754,8 +813,8 @@ class XHand:
         """
         if self._stub_mode or self.control is None:
             return False
-        if self.cached_comm_type != "EtherCAT":
-            return False  # RS485 has no slave state machine
+        if self.cached_comm_type != "ethercat":
+            return False  # serial/RS485 has no slave state machine
         if self.config.ethercat_slave_position < 0:
             logger.warning(
                 "XHand: EtherCAT slave position is unknown; skipping explicit INIT request and using close/watchdog"
@@ -787,8 +846,8 @@ class XHand:
             )
         return False
 
-    def disconnect(self):
-        """Release the hardware connection.
+    def disconnect(self) -> None:
+        """Release the hardware connection (idempotent).
 
         Two-stage cleanup so the EtherCAT slave is left in a state that
         permits reconnection without a power cycle:
@@ -797,26 +856,28 @@ class XHand:
         2.  Call ``close_device()``.
         3.  Wait for the slave's internal SM-watchdog to expire so it
             auto-transitions out of OP before the next session starts.
+
+        A never-opened or already-closed control is closed at most once: the
+        close clears ``self.control``, so a repeated ``disconnect()`` is a
+        no-op rather than a second access to a freed device handle.
         """
         if self._stub_mode:
             self.connected_flag = False
             return
-        # Only perform EtherCAT cleanup when we actually connected successfully.
-        # After a failed connect() self.control is None on the handled failure
-        # paths (no-devices / discovery-raise / open-exhausted are cleared by
-        # _close_control); the residual non-None cases (open-raise, unsupported
-        # comm_type) leave a never-opened control, not a closed one.
-        # connected_flag stays False in every failure case, so this guard keeps
-        # _request_slave_init()/close_device() off any control that never
-        # finished opening.
-        if self.control is not None and self.connected_flag:
-            self._request_slave_init()
-            self.control.close_device()
-            time.sleep(self._POST_DISCONNECT_WATCHDOG_WAIT_S)
+        # Close whenever a control handle exists — including the residual
+        # open-raise / unsupported-comm_type paths that leave a never-opened
+        # control behind (see _retry_open_device).  The slave INIT request and
+        # post-close watchdog wait apply only when we actually connected.
+        if self.control is not None:
+            if self.connected_flag:
+                self._request_slave_init()
+            self._close_control()
+            if self.connected_flag:
+                time.sleep(self._POST_DISCONNECT_WATCHDOG_WAIT_S)
         self.connected_flag = False
 
     def _diagnose_connection_failure(self) -> None:
-        if self.cached_comm_type == "EtherCAT":
+        if self.cached_comm_type == "ethercat":
             if self.last_error_code == -2:
                 logger.warning(
                     "No XHand EtherCAT slave was enumerated — check 24V power, "
@@ -845,44 +906,33 @@ class XHand:
         else:
             logger.warning("XHand connection failed — check power, USB cable, and /dev/ttyUSB* permissions")
 
-    def _stub_state(self, full: bool = False) -> dict[str, Any]:
+    def _stub_sample(self) -> XHandSample:
         """Return following-simulation state with zero current/tactile data."""
-        state: dict[str, Any] = {
-            "qpos": np.array(
+        return XHandSample(
+            qpos=np.array(
                 self.last_qpos_cmd if self.last_qpos_cmd is not None else self.config.home_qpos,
                 dtype=np.float64,
                 copy=True,
             ),
-            "current": np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
-            "timestamp": time.time(),
-            "tactile_force": np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
-            "tactile_force_sum": np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
-            "tactile_contact": np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
-            "tipboard_err": np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
-        }
-        if full:
-            state.update(self._empty_state())
-        return state
+            current=np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
+            tactile_force=np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
+            tactile_sum=np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
+            tactile_contact=np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
+            commboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
+            jointboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
+            tipboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
+        )
 
-    def clear_local_error(self) -> bool:
-        """Reset the local driver latch only; no hardware/SDK call is made.
+    def get_state(self, force_update: bool | None = None) -> XHandSample:
+        """Read one hardware state and return an immutable ``XHandSample``.
 
-        Clears ``error_state``/``last_error_code``/``last_error_message`` so a
-        transient hand comm error can be retried.  This is not a controller
-        error clear (xArm's ``clean_error`` is a separate hardware call).
+        A failed read raises ``RuntimeError`` (the single failure protocol —
+        there is no NaN half-state or None return).  A malformed frame
+        (out-of-range/duplicate/missing joint, non-finite position) raises
+        ``ValueError`` from parsing.
         """
-        self.error_state = False
-        self.last_error_code = None
-        self.last_error_message = ""
-        return self.control is not None and self.connected_flag
-
-    def get_state(
-        self,
-        full: bool = False,
-        force_update: bool | None = None,
-    ) -> dict[str, Any]:
         if self._stub_mode:
-            return self._stub_state(full)
+            return self._stub_sample()
 
         if force_update is None:
             force_update = self.config.force_update_state
@@ -891,29 +941,26 @@ class XHand:
 
         if not self.error_ok(err) or hand_state is None:
             self._record_error(err)
-            state: dict[str, Any] = {
-                "qpos": nan_array(HAND_JOINT_SHAPE),
-                "current": nan_array(HAND_JOINT_SHAPE),
-                "timestamp": time.time(),
-            }
-            if full:
-                state.update(self._empty_state())
-            return state
+            raise RuntimeError(
+                f"XHand read failed: code={self.last_error_code} msg={self.last_error_message!r}"
+            )
 
-        state = self.parse_state(hand_state, full=full)
+        sample = self._parse_sample(hand_state)
         self.last_error_code = 0
         self.last_error_message = ""
         # Bridge board-status (Layer 2) into safety gate: per-joint hardware
         # board error registers gate commands on hardware-level faults.
         # Unlike send/read errors (tracked via _record_error), board errors are
-        # transient — auto-clear when hardware status returns to normal (no
-        # manual clear_local_error() needed after an RS485 glitch).
+        # transient and self-clear on the next healthy frame.  A single
+        # read/write result is decided by the current SDK return: ``error_state``
+        # is recomputed from the board registers on every successful read, so
+        # there is no separate "clear" step to invoke.
         self.error_state = bool(
-            np.any(np.asarray(state["commboard_err"], dtype=np.int32))
-            or np.any(np.asarray(state["jointboard_err"], dtype=np.int32))
-            or np.any(np.asarray(state["tipboard_err"], dtype=np.int32))
+            np.any(sample.commboard_err)
+            or np.any(sample.jointboard_err)
+            or np.any(sample.tipboard_err)
         )
-        return state
+        return sample
 
     def send_action(self, action: np.ndarray) -> bool:
         target_qpos = np.asarray(action, dtype=np.float64)
@@ -954,7 +1001,6 @@ class XHand:
         qpos_cmd = target_qpos.copy()
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)
-        self.last_action_code = self.error_code(err)
 
         if self.error_ok(err):
             self.last_qpos_cmd = qpos_cmd.copy()
@@ -972,7 +1018,7 @@ class XHand:
         Args:
             threshold: Override in the same unknown scaled units as force_sum.
             force_sum: Pre-parsed (5,3) force_sum array. When provided,
-                       skips get_state() call (used inside parse_state to
+                       skips get_state() call (used inside _parse_sample to
                        avoid recursion).
 
         Returns:
@@ -980,8 +1026,7 @@ class XHand:
         """
         thresh = threshold if threshold is not None else self.config.tactile_contact_threshold
         if force_sum is None:
-            state = self.get_state(full=False)
-            force_sum = np.asarray(state.get("tactile_force_sum", np.zeros(HAND_TACTILE_SUM_SHAPE)))
+            force_sum = self.get_state().tactile_sum
         norm = np.linalg.norm(force_sum, axis=1)  # (5,) L2 per finger
         return norm > thresh
 
@@ -1026,83 +1071,68 @@ class XHand:
     def read_raw_state(self, force_update: bool = False):
         if self.control is None or not self.connected_flag:
             return None, None
-        result = self.control.read_state(self.config.device_id, force_update)
+        result = self.control.read_state(self.config.device_id, self._effective_force_update(force_update))
         return self._unpack_result(result)
 
-    def parse_state(self, hand_state, full: bool = False) -> dict[str, Any]:
-        qpos = nan_array(HAND_JOINT_SHAPE)
-        current = nan_array(HAND_JOINT_SHAPE)
-        finger_ids = np.full(HAND_JOINT_SHAPE, -1, dtype=np.int32)
-        sensor_ids = np.full(HAND_JOINT_SHAPE, -1, dtype=np.int32)
-        raw_position = nan_array(HAND_JOINT_SHAPE)
-        finger_temperatures = np.zeros(HAND_JOINT_SHAPE, dtype=np.float64)
+    def _effective_force_update(self, force_update: bool) -> bool:
+        """Coerce the read-state force_update flag for the active transport.
+
+        RS485 ``read_state(force_update=True)`` first re-sends the last command
+        (vendored ``serial_communication.cpp``); a state poll must never
+        implicitly re-issue a motion command, so serial reads are always cached
+        (force_update=False).  EtherCAT ignores the parameter (returns the PDO
+        cache), so the requested value is passed through unchanged.
+        """
+        if self.cached_comm_type == "serial":
+            return False
+        return bool(force_update)
+
+    def _parse_sample(self, hand_state) -> XHandSample:
+        """Parse one raw SDK ``HandState_t`` into an immutable ``XHandSample``.
+
+        A malformed frame — out-of-range, negative, duplicate, or missing joint
+        id, or a non-finite position — fails the whole frame (``RuntimeError`` /
+        ``ValueError``) rather than silently emitting a partial or NaN half-state.
+        """
+        qpos = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
+        current = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
         commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
 
         finger_state = getattr(hand_state, "finger_state", [])
+        seen: set[int] = set()
         for item in finger_state:
             idx = int(getattr(item, "id", -1))
             if idx < 0 or idx >= HAND_DOF:
-                continue
+                raise RuntimeError(f"XHand parse: joint id {idx} out of range [0, {HAND_DOF})")
+            if idx in seen:
+                raise RuntimeError(f"XHand parse: duplicate joint id {idx}")
+            seen.add(idx)
 
-            finger_ids[idx] = idx
-            sensor_ids[idx] = int(getattr(item, "sensor_id", -1))
             qpos[idx] = float(getattr(item, "position", np.nan))
             current[idx] = float(getattr(item, "torque", np.nan))
-            raw_position[idx] = float(getattr(item, "raw_position", np.nan))
-            finger_temperatures[idx] = float(getattr(item, "temperature", 0.0))
             commboard_err[idx] = int(getattr(item, "commboard_err", 0))
             # SDK misspelling: "jonitboard_err" for "jointboard_err".
             jointboard_err[idx] = int(getattr(item, "jonitboard_err", getattr(item, "jointboard_err", 0)))
             tipboard_err[idx] = int(getattr(item, "tipboard_err", 0))
 
-        tactile_force_sum = self.parse_tactile_sum(hand_state)
-        state = {
-            "qpos": qpos,
-            "current": current,
-            "timestamp": time.time(),
-            # (5,120,3) raw force array + (5,3) combined force per finger.
-            "tactile_force": self.parse_tactile(hand_state),
-            "tactile_force_sum": tactile_force_sum,
-            "tactile_contact": self.detect_contact(force_sum=tactile_force_sum),
-            "commboard_err": commboard_err,
-            "jointboard_err": jointboard_err,
-            "tipboard_err": tipboard_err,
-        }
+        # A complete frame must enumerate every joint exactly once.
+        if len(seen) != HAND_DOF:
+            raise RuntimeError(f"XHand parse: {len(seen)}/{HAND_DOF} joints reported")
 
-        # Sensor-level diagnostics are populated only for full-state callers.
-        sensor_temperatures = np.zeros(HAND_CONTACT_SHAPE, dtype=np.float64)
-        if full:
-            sensor_data = getattr(hand_state, "sensor_data", None)
-            if sensor_data:
-                for j, sd in enumerate(sensor_data):
-                    if j >= HAND_FINGER_COUNT:
-                        break
-                    sensor_temperatures[j] = float(getattr(sd, "calc_temperature", 0.0))
-
-        if full:
-            state.update(
-                {
-                    "finger_ids": finger_ids,
-                    "sensor_ids": sensor_ids,
-                    "raw_position": raw_position,
-                    "finger_temperatures": finger_temperatures,
-                    "sensor_temperatures": sensor_temperatures,
-                    "connected_flag": self.connected_flag,
-                    "error_state": self.error_state,
-                    "last_action_code": self.last_action_code,
-                    "last_error_code": self.last_error_code,
-                    "last_error_message": self.last_error_message,
-                    "last_joint_limit_rejected": self.last_joint_limit_rejected,
-                    "last_hand_ids": self.last_hand_ids,
-                    "comm_type": self.cached_comm_type,
-                    "device_name": self.device_name,
-                    "joint_names": JOINT_NAMES,
-                    "sensor_names": SENSOR_NAMES,
-                }
-            )
-        return state
+        tactile_force = self.parse_tactile(hand_state)
+        tactile_sum = self.parse_tactile_sum(hand_state)
+        return XHandSample(
+            qpos=qpos,
+            current=current,
+            tactile_force=tactile_force,
+            tactile_sum=tactile_sum,
+            tactile_contact=self.detect_contact(force_sum=tactile_sum),
+            commboard_err=commboard_err,
+            jointboard_err=jointboard_err,
+            tipboard_err=tipboard_err,
+        )
 
     _MAX_SENSORS: int = 5  # thumb, index, middle, ring, little
 
@@ -1169,13 +1199,11 @@ class XHand:
         mechanical_violation = np.flatnonzero((qpos < mechanical_low - 1e-12) | (qpos > mechanical_high + 1e-12))
         violating = mechanical_violation if mechanical_violation.size else command_violation
         if violating.size == 0:
-            self.last_joint_limit_rejected = False
             return True
         joint_index = int(violating[0])
         boundary = "mechanical" if mechanical_violation.size else "command"
         lower = mechanical_low if mechanical_violation.size else command_low
         upper = mechanical_high if mechanical_violation.size else command_high
-        self.last_joint_limit_rejected = True
         self.last_error_message = (
             f"XHand.send_action rejected {boundary} joint limit violation: "
             f"joint={joint_index} target={qpos[joint_index]:.6f}rad "
@@ -1183,50 +1211,6 @@ class XHand:
         )
         logger.warning(self.last_error_message)
         return False
-
-    def is_valid_qpos_state(self, state: dict[str, Any]) -> bool:
-        qpos = state.get("qpos", None)
-        if qpos is None:
-            return False
-        qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
-        return qpos.size == HAND_DOF and bool(np.all(np.isfinite(qpos)))
-
-    def _array12(self, value) -> np.ndarray:
-        return safe_resize(value, HAND_DOF)
-
-    def _empty_state(self) -> dict[str, Any]:
-        return {
-            "finger_ids": np.full(HAND_JOINT_SHAPE, -1, dtype=np.int32),
-            "sensor_ids": np.full(HAND_JOINT_SHAPE, -1, dtype=np.int32),
-            "raw_position": nan_array(HAND_JOINT_SHAPE),
-            "finger_temperatures": np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
-            "sensor_temperatures": np.zeros(HAND_CONTACT_SHAPE, dtype=np.float64),
-            "commboard_err": np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
-            "jointboard_err": np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
-            "tipboard_err": np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
-            "tactile_force": np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
-            "tactile_force_sum": np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
-            "tactile_contact": np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
-            "connected_flag": self.connected_flag,
-            "error_state": self.error_state,
-            "last_action_code": self.last_action_code,
-            "last_error_code": self.last_error_code,
-            "last_error_message": self.last_error_message,
-            "last_joint_limit_rejected": self.last_joint_limit_rejected,
-            "last_hand_ids": self.last_hand_ids,
-            "comm_type": self.cached_comm_type,
-            "device_name": self.device_name,
-            "joint_names": JOINT_NAMES,
-            "sensor_names": SENSOR_NAMES,
-        }
-
-    def _resolve_comm_type(self) -> str:
-        name = str(self.config.comm_type).strip().lower()
-        if name in ["rs485", "serial", "usb"]:
-            return "RS485"
-        if name in ["ethercat", "ethernet", "eth", "ecat"]:
-            return "EtherCAT"
-        return self.config.comm_type
 
     def _unpack_result(self, result):
         # The SDK always returns tuple[ErrorStruct, HandState_t].

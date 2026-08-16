@@ -79,7 +79,8 @@ from dexmani_real.robot.safety import SafetyState, require_transition, transitio
 from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig, read_arm_state_dict
-from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys, validate_arm_feedback
+from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
+from dexmani_real.utils.hand_health import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
 
@@ -878,6 +879,7 @@ def _run_calibration(
                     prepare_timeout_s=float(policy.action_prepare_timeout_s),
                     safety_gate=safety_gate,
                     wait_applied=True, apply_timeout_s=float(policy.action_apply_timeout_s),
+                    hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
                 )
                 if not published.succeeded:
                     _set_fault(shared, f"measured quit hold was not applied: {published.reason}")
@@ -990,6 +992,7 @@ def _run_calibration(
                 prepare_timeout_s=float(policy.action_prepare_timeout_s),
                 safety_gate=safety_gate,
                 wait_applied=True, apply_timeout_s=float(policy.action_apply_timeout_s),
+                hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             )
             candidate = published.candidate
             if not published.succeeded or candidate is None or candidate.arm_qpos is None:

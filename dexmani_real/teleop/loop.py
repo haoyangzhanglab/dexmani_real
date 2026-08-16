@@ -47,9 +47,9 @@ from dexmani_real.teleop.hand_control import (_compute_hand_command,
 from dexmani_real.teleop.hand_retarget import (TAGHandRetargeter,
                                                XHandRetargeter,
                                                _tag_config_with_urdf)
-from dexmani_real.teleop.keyboard import (ControlSignal, KeyboardHandler,
-                                          validate_arm_feedback,
-                                          validate_hand_feedback)
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.utils.hand_health import (validate_arm_feedback,
+                                            validate_hand_feedback)
 from dexmani_real.teleop.recording_session import (
     QuitRecordingDecision, await_quit_recording_decision)
 from dexmani_real.teleop.safety import (_contact_stall_detected,
@@ -1131,6 +1131,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
+                    hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                 )
                 published_hold = hold_result.candidate
                 if not hold_result.succeeded or published_hold is None:
@@ -1232,6 +1233,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
+                    hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                 )
                 published_hold = hold_result.candidate
                 if not hold_result.succeeded or published_hold is None:
@@ -1345,6 +1347,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
                         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
                         hand_max_delta_rad=cfg.runtime.hand.max_delta_rad,
+                        hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                     )
                     published_candidate = publish_result.candidate
                     if not publish_result.succeeded or published_candidate is None:
@@ -1363,6 +1366,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                         safety_gate=gate,
+                        hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                     )
                     published_candidate = publish_result.candidate
                     if not publish_result.succeeded or published_candidate is None:
@@ -1422,6 +1426,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
+                    hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                 )
                 published_hold = hold_result.candidate
                 if not hold_result.succeeded or published_hold is None:
@@ -1464,6 +1469,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_mechanical_lower_rad=hand_mechanical_lower_rad,
                 hand_mechanical_upper_rad=hand_mechanical_upper_rad,
                 hand_max_delta_rad=cfg.runtime.hand.max_delta_rad,
+                hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
             )
             published_candidate = publish_result.candidate
             workspace_rejected = (
@@ -1481,6 +1487,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_id=int(vr_frame["ring_sequence"]),
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
+                    hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                 )
                 published_hold = hold_result.candidate
                 if not hold_result.succeeded or published_hold is None:
@@ -1618,6 +1625,7 @@ def _safe_arm_queue_put(
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     safety_gate: SafetyGate | None = None,
+    hand_feedback_max_age_s: float,
 ) -> CommandPublishResult:
     """Publish a single arm command through the safety gate (fire-and-forget)."""
     try:
@@ -1630,6 +1638,7 @@ def _safe_arm_queue_put(
             observation_id=observation_id,
             observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
             safety_gate=safety_gate,
+            hand_feedback_max_age_s=hand_feedback_max_age_s,
         )
     except (KeyError, TypeError, ValueError) as exc:
         logger.error("teleop_loop: rejected invalid arm action: %s", exc)
@@ -1650,6 +1659,7 @@ def _safe_joint_publish(
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
     hand_max_delta_rad: float | np.ndarray | None = None,
+    hand_feedback_max_age_s: float,
 ) -> CommandPublishResult:
     """Validate through SafetyGate and publish via fire-and-forget send_command."""
     if safety_gate is None:
@@ -1676,6 +1686,7 @@ def _safe_joint_publish(
         shared,
         candidate,
         gate=gate,
+        hand_feedback_max_age_s=hand_feedback_max_age_s,
         prepare_timeout_s=timeout,
         previous_hand_qpos=previous_hand_qpos,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,

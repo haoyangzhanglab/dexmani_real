@@ -4,14 +4,20 @@
 Usage::
 
     conda activate real_robot
-    python examples/xhand_control_example.py
+    python examples/xhand_control_example.py              # read-only diagnostic
+    python examples/xhand_control_example.py --move       # add home + preset motion (interactive confirm)
+    python examples/xhand_control_example.py --move --yes # motion without the interactive prompt
 
-Demonstrates enumerate, open, identify, read state, preset actions, and home.
+Default behaviour is read-only: enumerate, open, identify, and read/print state.
+Motion (home + preset actions) requires the explicit ``--move`` flag plus manual
+confirmation, so the diagnostic never moves the hand as a side effect.
+
 Uses the xhand_controller SDK directly -- no dexmani_real runtime dependencies.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 import time
@@ -26,6 +32,42 @@ HOME_QPOS_DEG = (0.0, 80.66, 33.2, 0.0, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 
 _BAUD_RATE_RS485 = 3_000_000
 _DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 _HAND_DOF = 12
+
+# Production command envelope (rad), duplicated from
+# dexmani_real.config.defaults.hand.qpos_min_rad / qpos_max_rad so the
+# diagnostic validates/clips presets against the same bounds the production
+# policy enforces.  The distal lower bounds are the operator-set anti-clogging
+# margins; the upper bounds are the rated mechanical max.  Presets are clipped
+# to this envelope (matching the production publish-clip) so the diagnostic
+# never sends an out-of-envelope raw SDK command.
+COMMAND_QPOS_MIN_RAD = (
+    0.0,
+    -0.698,
+    0.17453292519943295,
+    -0.174,
+    0.0,
+    0.08726646259971647,
+    0.0,
+    0.08726646259971647,
+    0.0,
+    0.08726646259971647,
+    0.0,
+    0.08726646259971647,
+)
+COMMAND_QPOS_MAX_RAD = (
+    1.832,
+    1.745,
+    1.745,
+    0.174,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+)
 
 # Fingertip sensor joint IDs (thumb, index, middle, ring, little).
 _FINGERTIP_IDS = frozenset({2, 5, 7, 9, 11})
@@ -112,9 +154,21 @@ class XHandControlExample:
         return cmd
 
     def _set_positions(self, qpos_deg: tuple[float, ...] | list[float]) -> None:
-        """Write joint positions (degrees -> radians) into the current command."""
+        """Write joint positions (deg -> rad) into the current command, clipped
+        to the production command envelope so the diagnostic never sends an
+        out-of-range raw SDK command."""
         for i in range(_HAND_DOF):
-            self._hand_command.finger_command[i].position = qpos_deg[i] * math.pi / 180.0
+            rad = qpos_deg[i] * math.pi / 180.0
+            lo = COMMAND_QPOS_MIN_RAD[i]
+            hi = COMMAND_QPOS_MAX_RAD[i]
+            if rad < lo or rad > hi:
+                clipped = max(lo, min(hi, rad))
+                print(
+                    f"  [clip] joint {i}: {rad:.4f} rad -> {clipped:.4f} rad "
+                    f"(production envelope [{lo:.4f}, {hi:.4f}])"
+                )
+                rad = clipped
+            self._hand_command.finger_command[i].position = rad
 
     @staticmethod
     def _header(title: str) -> None:
@@ -178,7 +232,10 @@ class XHandControlExample:
 
     # ── State ──
 
-    def read_state(self, finger_id: int = 2, force_update: bool = True) -> None:
+    def read_state(self, finger_id: int = 2, force_update: bool = False) -> None:
+        # Default to a cached read.  RS485 read_state(force_update=True) first
+        # re-sends the last command (vendored serial_communication.cpp), so a
+        # diagnostic state read must never request a fresh read on that bus.
         self._header(f"Read state (finger {finger_id})")
         error_struct, state = self._device.read_state(self._hand_id, force_update)
         if error_struct.error_code != 0:
@@ -279,22 +336,65 @@ def _select_preset_actions(serial_number: str) -> PresetActions:
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="XHand standalone diagnostic (read-only by default)."
+    )
+    parser.add_argument(
+        "--move",
+        action="store_true",
+        help="enable motion commands (home + preset actions); otherwise read-only",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm motion without the interactive prompt (implies --move)",
+    )
+    return parser.parse_args()
+
+
+def _confirm_motion(skip_prompt: bool) -> None:
+    """Refuse motion until the operator has explicitly acknowledged it."""
+    if skip_prompt:
+        return
+    answer = input(
+        "Motion commands will move the hand. Confirm the workspace is clear "
+        "and type 'yes' to continue: "
+    ).strip()
+    if answer.lower() != "yes":
+        print("Motion aborted.")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
+    args = _parse_args()
+    if args.yes and not args.move:
+        print("--yes requires --move (nothing to confirm in read-only mode).")
+        sys.exit(1)
+
     params = HandCommandParams()
     xhand_exam = XHandControlExample(hand_id=0, params=params)
 
-    _choose_communication(xhand_exam)
+    _choose_communication(xhand_exam)  # opens the device (sys.exit(1) on failure)
 
-    # Identity and diagnostics (read-only, safe).
-    xhand_exam.read_sdk_version()
-    xhand_exam.read_device_info()
-    serial_number = xhand_exam.read_serial_number()
-    xhand_exam.read_state(finger_id=5, force_update=True)
+    try:
+        # Identity and diagnostics (read-only, safe).
+        xhand_exam.read_sdk_version()
+        xhand_exam.read_device_info()
+        serial_number = xhand_exam.read_serial_number()
+        # Cached read: RS485 force_update=True would re-send the last command.
+        xhand_exam.read_state(finger_id=5, force_update=False)
 
-    # Motion commands. Confirm the workspace is clear before running this example.
-    xhand_exam.go_home()
-    actions = _select_preset_actions(serial_number)
-    xhand_exam.run_preset_actions(actions)
-    xhand_exam.go_home()
-
-    xhand_exam.close()
+        if args.move:
+            _confirm_motion(args.yes)
+            xhand_exam.go_home()
+            actions = _select_preset_actions(serial_number)
+            xhand_exam.run_preset_actions(actions)
+            xhand_exam.go_home()
+        else:
+            print(
+                "\n  Read-only diagnostic complete (motion skipped). "
+                "Re-run with --move to exercise home + preset actions."
+            )
+    finally:
+        xhand_exam.close()

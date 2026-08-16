@@ -37,8 +37,9 @@ from dexmani_real.policy.safety import (
 )
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.utils.hand_health import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import HAND_JOINT_SHAPE, MAX_POLICY_CHUNK_STEPS
+from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS
 
 logger = get_logger(__name__)
 
@@ -60,6 +61,7 @@ class CoordinatorConfig:
     hand_mechanical_lower_rad: tuple[float, ...]
     hand_mechanical_upper_rad: tuple[float, ...]
     hand_max_delta_rad: float | None
+    hand_feedback_max_age_s: float
     control_hz: float
 
     @classmethod
@@ -73,6 +75,7 @@ class CoordinatorConfig:
             hand_mechanical_lower_rad=tuple(runtime.hand.mechanical_qpos_min_rad),
             hand_mechanical_upper_rad=tuple(runtime.hand.mechanical_qpos_max_rad),
             hand_max_delta_rad=runtime.hand.max_delta_rad,
+            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
         )
 
@@ -144,30 +147,34 @@ def _select_due_step(
     return latest_due, latest_due + 1
 
 
-def _seed_hand_reference(shared: SharedStorage) -> np.ndarray | None:
+def _seed_hand_reference(shared: SharedStorage, *, hand_feedback_max_age_s: float) -> np.ndarray | None:
     """Seed the first hand-delta reference from measured hand feedback.
 
     Mirrors VR teleop (``ctx.prev_hand_qpos`` is seeded from feedback): the first
     coupled hand command is delta-bounded against the current measured pose, so a
     fresh run never aborts on a delta check that has no prior command. Returns
-    ``None`` when feedback is unavailable or unhealthy.
+    ``None`` when feedback is unavailable or unhealthy, using the same
+    fail-closed predicate as the publication boundary (including source-timestamp
+    freshness).
     """
     result = shared.hand_state_ring.read_latest()
     if result is None:
         return None
     record = result[0][0]
-    if (
-        not bool(record["connected"])
-        or not bool(record["state_valid"])
-        or bool(record["error_state"])
-        or not bool(record["send_healthy"])
-        or not bool(record["read_healthy"])
-    ):
+    issue = validate_hand_feedback(
+        connected=bool(record["connected"]),
+        error_state=bool(record["error_state"]),
+        state_valid=bool(record["state_valid"]),
+        send_healthy=bool(record["send_healthy"]),
+        read_healthy=bool(record["read_healthy"]),
+        source_monotonic_ns=int(record["source_monotonic_ns"]),
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=hand_feedback_max_age_s,
+        qpos=np.asarray(record["qpos"], dtype=np.float64),
+    )
+    if issue is not None:
         return None
-    qpos = np.asarray(record["qpos"], dtype=np.float64)
-    if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
-        return None
-    return qpos.copy()
+    return np.asarray(record["qpos"], dtype=np.float64).copy()
 
 
 def _abort_policy_run(
@@ -251,7 +258,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     last_adopted_observation_id = 0
     next_step = 0
     last_published_hand_cmd: np.ndarray | None = (
-        _seed_hand_reference(shared)
+        _seed_hand_reference(shared, hand_feedback_max_age_s=config.hand_feedback_max_age_s)
         if config.deployment.hand_enabled and config.hand_max_delta_rad is not None
         else None
     )
@@ -341,7 +348,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             # centralized publication boundary owns the actual preflight.
             if hand_qpos is not None and config.hand_max_delta_rad is not None:
                 if last_published_hand_cmd is None:
-                    last_published_hand_cmd = _seed_hand_reference(shared)
+                    last_published_hand_cmd = _seed_hand_reference(
+                        shared, hand_feedback_max_age_s=config.hand_feedback_max_age_s
+                    )
                     if last_published_hand_cmd is None:
                         _sleep_tick(period_s, tick_start)
                         continue
@@ -363,6 +372,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 shared,
                 candidate,
                 gate=gate,
+                hand_feedback_max_age_s=config.hand_feedback_max_age_s,
                 previous_hand_qpos=last_published_hand_cmd,
                 hand_mechanical_lower_rad=np.asarray(
                     config.hand_mechanical_lower_rad, dtype=np.float64

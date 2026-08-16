@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.utils.hand_health import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -182,8 +183,33 @@ def wait_subsystem_ready(
     return True
 
 
-def print_health_summary(shared: SharedStorage) -> None:
+def _hand_feedback_issue(hand_data: Any, *, max_age_s: float) -> str | None:
+    """Delegated fail-closed health check over one hand state record.
+
+    Single source of truth for "is this hand feedback usable" in the supervisor,
+    matching ``policy._hand_feedback_snapshot`` and the teleop predicates.
+    Returns the rejection reason, or ``None`` when healthy.
+    """
+    return validate_hand_feedback(
+        connected=bool(hand_data["connected"][0]),
+        error_state=bool(hand_data["error_state"][0]),
+        state_valid=bool(hand_data["state_valid"][0]),
+        send_healthy=bool(hand_data["send_healthy"][0]),
+        read_healthy=bool(hand_data["read_healthy"][0]),
+        source_monotonic_ns=int(hand_data["source_monotonic_ns"][0]),
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=max_age_s,
+        qpos=np.asarray(hand_data["qpos"][0], dtype=np.float64),
+    )
+
+
+def print_health_summary(
+    shared: SharedStorage, *, hand_feedback_max_age_s: float | None = None
+) -> None:
     """Print a pre-flight health summary from ring data (arm, hand, VR, camera)."""
+    if hand_feedback_max_age_s is None:
+        from dexmani_real.config.defaults import safety
+        hand_feedback_max_age_s = float(safety.heartbeat_timeouts["hand"])
     print("\n── Health Check ──")
 
     arm_result = shared.arm_state_ring.read_latest()
@@ -211,13 +237,7 @@ def print_health_summary(shared: SharedStorage) -> None:
         hand_io_healthy = bool(hand_data["send_healthy"][0]) and bool(hand_data["read_healthy"][0])
         hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
         hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
-        hand_ok = (
-            hand_connected
-            and not hand_error
-            and hand_state_valid
-            and hand_io_healthy
-            and bool(hand_qpos_ok)
-        )
+        hand_ok = _hand_feedback_issue(hand_data, max_age_s=hand_feedback_max_age_s) is None
         print(
             f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
             f"valid={int(hand_state_valid)}  io={int(hand_io_healthy)}  error={int(hand_error)}  "

@@ -75,9 +75,9 @@ from dexmani_real.shm.shared_storage import (SharedStorage,
                                              SharedStorageConfig,
                                              read_arm_state_dict,
                                              read_hand_state_dict)
-from dexmani_real.teleop.keyboard import (ControlSignal, KeyboardHandler,
-                                          validate_arm_feedback,
-                                          validate_hand_feedback)
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.utils.hand_health import (validate_arm_feedback,
+                                            validate_hand_feedback)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (ARM_EE_SHAPE, ARM_JOINT_SHAPE,
                                        HAND_JOINT_SHAPE)
@@ -1224,6 +1224,9 @@ class TrajectoryReplayer:
                         self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
                     ),
                     hand_max_delta_rad=self.runtime.hand.max_delta_rad,
+                    hand_feedback_max_age_s=float(
+                        self.runtime.safety.heartbeat_timeouts["hand"]
+                    ),
                 )
                 if not published.succeeded or published.candidate is None:
                     boundary = "publish/APPLIED" if is_final_frame else "publish"
@@ -1505,6 +1508,7 @@ def _offer_return_home(
                     command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
                     mechanical_lower_rad=np.asarray(runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
                     mechanical_upper_rad=np.asarray(runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
+                    hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
                     max_command_delta_rad=runtime.hand.max_delta_rad,
                     timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                     heartbeat=False,

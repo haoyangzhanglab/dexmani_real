@@ -21,6 +21,7 @@ from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.robot.safety import SafetyState
+from dexmani_real.utils.hand_health import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
     ARM_COMMAND_DTYPE,
@@ -205,8 +206,18 @@ def _arm_feedback_snapshot(
 def _hand_feedback_snapshot(
     shared: Any,
     candidate: ActionCandidate | None,
+    *,
+    hand_feedback_max_age_s: float,
 ) -> tuple[_HandFeedbackSnapshot | None, CommandPublishResult | None]:
-    """Read one fully healthy hand command/feedback snapshot fail-closed."""
+    """Read one fully healthy hand command/feedback snapshot fail-closed.
+
+    Delegates the five health flags, source-timestamp existence, future
+    timestamp, and ``max_age`` freshness to :func:`validate_hand_feedback`;
+    the worker's last accepted command is then shape/finite-checked on its own
+    (that predicate does not know about ``last_cmd_qpos``).
+    """
+    if not np.isfinite(hand_feedback_max_age_s) or hand_feedback_max_age_s <= 0.0:
+        raise ValueError("hand_feedback_max_age_s must be finite and positive")
     result = shared.hand_state_ring.read_latest()
     if result is None:
         return None, CommandPublishResult(
@@ -214,38 +225,32 @@ def _hand_feedback_snapshot(
             candidate=candidate,
         )
     record = result[0][0]
-    health = (
-        bool(record["connected"])
-        and bool(record["state_valid"])
-        and not bool(record["error_state"])
-        and bool(record["send_healthy"])
-        and bool(record["read_healthy"])
+    issue = validate_hand_feedback(
+        connected=bool(record["connected"]),
+        error_state=bool(record["error_state"]),
+        state_valid=bool(record["state_valid"]),
+        send_healthy=bool(record["send_healthy"]),
+        read_healthy=bool(record["read_healthy"]),
+        source_monotonic_ns=int(record["source_monotonic_ns"]),
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=hand_feedback_max_age_s,
+        qpos=np.asarray(record["qpos"], dtype=np.float64),
     )
-    if not health:
+    if issue is not None:
         return None, CommandPublishResult(
             CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
             candidate=candidate,
-            detail=(
-                "hand feedback/command path is unhealthy "
-                f"(connected={bool(record['connected'])}, "
-                f"state_valid={bool(record['state_valid'])}, "
-                f"error_state={bool(record['error_state'])}, "
-                f"send_healthy={bool(record['send_healthy'])}, "
-                f"read_healthy={bool(record['read_healthy'])})"
-            ),
+            detail=f"hand feedback is unhealthy: {issue}",
         )
-    qpos = np.asarray(record["qpos"], dtype=np.float64)
     last_cmd_qpos = np.asarray(record["last_cmd_qpos"], dtype=np.float64)
     if (
-        qpos.shape != HAND_JOINT_SHAPE
-        or last_cmd_qpos.shape != HAND_JOINT_SHAPE
-        or not np.all(np.isfinite(qpos))
+        last_cmd_qpos.shape != HAND_JOINT_SHAPE
         or not np.all(np.isfinite(last_cmd_qpos))
     ):
         return None, CommandPublishResult(
             CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
             candidate=candidate,
-            detail="hand feedback or last accepted command is malformed",
+            detail="hand last accepted command is malformed",
         )
     return (
         _HandFeedbackSnapshot(
@@ -504,6 +509,16 @@ def send_command(
                 candidate=candidate,
             )
 
+    # The arm endpoint is published before the hand endpoint, and the hand ring
+    # write cannot fail: ``hand_cmd_ring`` is a latest-wins seqlock
+    # (``SharedMemoryRingBuffer``) whose ``write`` only overwrites the oldest
+    # slot and returns the new sequence number — there is no ``Full``/backpressure
+    # and no error-return channel.  So there is deliberately no second
+    # write-failure path after the arm endpoint is enqueued, and no rollback or
+    # compensation is performed or claimed.  This arm-then-hand ordering is
+    # non-atomic by design; if the transport ever changes to one whose hand write
+    # can fail, a coordinated stop/fault path would be required here (doc §6.1
+    # item 22) instead of returning ``PUBLISHED``.
     if candidate.hand_qpos is not None:
         hand_frame = _make_hand_command(candidate, now_ns, target_ns)
         shared.hand_cmd_ring.write(hand_frame)
@@ -742,6 +757,7 @@ def validate_and_send_candidate(
     candidate: ActionCandidate,
     *,
     gate: SafetyGate,
+    hand_feedback_max_age_s: float,
     prepare_timeout_s: float = 0.06,
     previous_hand_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
@@ -800,7 +816,9 @@ def validate_and_send_candidate(
         )
 
     if candidate.hand_qpos is not None:
-        hand_feedback, feedback_rejection = _hand_feedback_snapshot(shared, candidate)
+        hand_feedback, feedback_rejection = _hand_feedback_snapshot(
+            shared, candidate, hand_feedback_max_age_s=hand_feedback_max_age_s
+        )
         if feedback_rejection is not None:
             logger.warning(
                 "validate_and_send_candidate: action_id=%d rejected: %s",
@@ -864,6 +882,7 @@ def publish_joint_targets(
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
     hand_max_delta_rad: float | np.ndarray | None = None,
+    hand_feedback_max_age_s: float,
 ) -> CommandPublishResult:
     """Validate a joint-space target through the gate and publish it.
 
@@ -918,6 +937,7 @@ def publish_joint_targets(
         shared,
         candidate,
         gate=gate,
+        hand_feedback_max_age_s=hand_feedback_max_age_s,
         prepare_timeout_s=prepare_timeout_s,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
@@ -961,7 +981,7 @@ def publish_joint_targets(
                     )
             else:
                 hand_feedback, feedback_rejection = _hand_feedback_snapshot(
-                    shared, published
+                    shared, published, hand_feedback_max_age_s=hand_feedback_max_age_s
                 )
                 if feedback_rejection is not None:
                     return feedback_rejection
@@ -1094,6 +1114,7 @@ def publish_hand_home_and_wait_applied(
     command_upper_rad: np.ndarray,
     mechanical_lower_rad: np.ndarray,
     mechanical_upper_rad: np.ndarray,
+    hand_feedback_max_age_s: float,
     max_command_delta_rad: float | np.ndarray | None = None,
     timeout_s: float = 1.0,
     heartbeat: bool = False,
@@ -1137,7 +1158,9 @@ def publish_hand_home_and_wait_applied(
     command_lower = np.asarray(command_lower_rad, dtype=np.float64)
     command_upper = np.asarray(command_upper_rad, dtype=np.float64)
     deadline_s = time.monotonic() + timeout_s
-    hand_feedback, feedback_rejection = _hand_feedback_snapshot(shared, None)
+    hand_feedback, feedback_rejection = _hand_feedback_snapshot(
+        shared, None, hand_feedback_max_age_s=hand_feedback_max_age_s
+    )
     if feedback_rejection is not None:
         logger.warning("hand home rejected: %s", feedback_rejection.reason)
         return False
@@ -1222,7 +1245,9 @@ def publish_hand_home_and_wait_applied(
             if heartbeat:
                 shared.set_heartbeat("policy", time.monotonic())
 
-            hand_feedback, feedback_rejection = _hand_feedback_snapshot(shared, None)
+            hand_feedback, feedback_rejection = _hand_feedback_snapshot(
+                shared, None, hand_feedback_max_age_s=hand_feedback_max_age_s
+            )
             if feedback_rejection is not None:
                 logger.warning("hand home acknowledgement stopped: %s", feedback_rejection.reason)
                 return False

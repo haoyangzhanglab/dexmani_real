@@ -192,7 +192,7 @@ python -m compileall -q dexmani_real examples
 | 文件 | 作用 |
 |---|---|
 | `policy/__init__.py` | 标识动作协议、安全校验与控制环计时包（原 learned-policy 已移除）。 |
-| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；发布边界统一检查运行态、arm/hand feedback 健康度和 coupled-hand 机械/增量预检，并返回类型化拒绝/传输结果，worker 在 SDK 前仍独立复核；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；发布边界统一检查运行态、arm/hand feedback 健康度（`_hand_feedback_snapshot` fail-closed：`connected`/`state_valid`/`error_state`/`send_healthy`/`read_healthy` + `qpos`/`last_cmd_qpos` shape+finite，暂未做时间戳过期检查）和 coupled-hand 机械/增量预检，并返回类型化拒绝/传输结果，worker 在 SDK 前仍独立复核；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
 | `policy/runtime.py` | 定义单 tick 动作候选 `ActionCandidate` 的数据契约，含 run generation、时效与只读数组封装。 |
 
@@ -329,7 +329,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
 | `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
-| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；动作命令需显式硬件授权。 |
+| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认只读（枚举/读取/打印），动作需 `--move` 加人工确认；预设动作按生产命令包络裁剪。 |
 | `examples/visualize_episode.py` | — | 离线 Rerun 3D 可视化；读取 HDF5 episode 并展示点云、图像、动作、触觉和元数据；无硬件控制。 |
 
 ## 配置、资源与延伸文档

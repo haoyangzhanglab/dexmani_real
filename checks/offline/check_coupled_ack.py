@@ -57,7 +57,12 @@ def main() -> int:
         # ── 1. arm-only success (action_id = 101) ──────────────────────
         shared.arm_state_ring.write(make_arm_state_frame(arm_mid, last_cmd_seq=101))
         result = publish_joint_targets(
-            shared, arm_mid, None, safety_gate=gate, wait_applied=True
+            shared,
+            arm_mid,
+            None,
+            safety_gate=gate,
+            hand_feedback_max_age_s=1.0,
+            wait_applied=True,
         )
         assert result.status == CommandPublishStatus.APPLIED, result
         assert result.candidate is not None and result.candidate.hand_qpos is None
@@ -69,7 +74,12 @@ def main() -> int:
             make_hand_state_frame(hand_mid, last_cmd_seq=102)
         )
         result = publish_joint_targets(
-            shared, arm_mid, hand_mid, safety_gate=gate, wait_applied=True
+            shared,
+            arm_mid,
+            hand_mid,
+            safety_gate=gate,
+            hand_feedback_max_age_s=1.0,
+            wait_applied=True,
         )
         assert result.status == CommandPublishStatus.APPLIED, result
         assert result.candidate is not None and result.candidate.hand_qpos is not None
@@ -83,7 +93,12 @@ def main() -> int:
             make_hand_state_frame(hand_mid, last_cmd_seq=103, error_state=1)
         )
         result = publish_joint_targets(
-            shared, arm_mid, hand_mid, safety_gate=gate, wait_applied=True
+            shared,
+            arm_mid,
+            hand_mid,
+            safety_gate=gate,
+            hand_feedback_max_age_s=1.0,
+            wait_applied=True,
         )
         assert result.status == CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY, result
         _drain_arm_queue(shared)
@@ -94,7 +109,12 @@ def main() -> int:
             make_hand_state_frame(hand_mid, last_cmd_seq=105)  # > 104 → superseded
         )
         result = publish_joint_targets(
-            shared, arm_mid, hand_mid, safety_gate=gate, wait_applied=True
+            shared,
+            arm_mid,
+            hand_mid,
+            safety_gate=gate,
+            hand_feedback_max_age_s=1.0,
+            wait_applied=True,
         )
         assert result.status == CommandPublishStatus.ACK_SUPERSEDED, result
         _drain_arm_queue(shared)

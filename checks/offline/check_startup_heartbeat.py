@@ -40,6 +40,7 @@ def _coordinator_config() -> CoordinatorConfig:
         hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
         hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
         hand_max_delta_rad=hand_defaults.max_delta_rad,
+        hand_feedback_max_age_s=1.0,
         control_hz=16.0,
     )
 
