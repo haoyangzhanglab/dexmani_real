@@ -225,6 +225,7 @@ python -m compileall -q dexmani_real examples
 |---|---|
 | `recording/__init__.py` | 导出 episode 读写器、时间信息和停止结果的公共接口。 |
 | `recording/camera_stream_writer.py` | 在独立写线程中编码并写入相机流，隔离视频 I/O 以免阻塞控制环。 |
+| `recording/episode_schema.py` | v16 的 96 个基础 dataset、条件 sent-command 字段、固定 diagnostics 和共享 layout 校验合同。 |
 | `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并分别提供内部有效性与最短时长质量视图。 |
 | `recording/episode_recorder.py` | 管理单个 episode 的 HDF5 数据集、相机写入器、停止校验与最终发布。 |
 | `recording/io_process.py` | `RecorderIO` 非阻塞事务 worker 及其客户端协议；固定 dtype 携带 generation、FINALIZING/终态和会话失败结果。 |
@@ -345,8 +346,9 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `AGENTS.md` | 面向代码修改者的仓库约定、硬件安全边界和跨模块变更检查清单。 |
 | `docs/ema_delta_clip_scale_reject_control_contract.md` | EMA、delta clip、scale 与 reject 在 arm、hand、replay、deployment 和 recording 中的实际顺序、默认状态与责任边界。 |
 | `docs/ab_runtime_freeze_report.md` | A/B 冻结运行时契约（Phase C 只能搭在其上，不得修改）。 |
-| `docs/hdf5_episode_schema_v16.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
-| `docs/dexmani_sim_hdf5_zarr_schema.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |
+| `docs/dataset/hdf5_episode.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
+| `docs/dataset/sim_hdf5_zarr.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |
+| `docs/dataset/real_to_sim_mapping.md` | Real v16 episode → Sim/Policy 标签映射表：仅登记字段来源、结构关系和语义差异，不修改录制数值。 |
 | `docs/phase-c-deployment-runtime.md` | Learned-Policy 部署运行时说明：不变量、模块地图、失败语义、metrics/provenance、backend-swap 边界，以及 H0–H6 硬件门手工清单。 |
 | `docs/collect_teleop审查记录.md` | `examples/collect_teleop.py` 上下游的 fact-check 基线，记录已确认问题、触发条件、根因、术语和修复验收条件。 |
 

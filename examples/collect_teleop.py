@@ -293,6 +293,7 @@ def _build_processes(
             control_hz=policy_config.runtime.policy.control_hz,
             min_frames=int(round(policy_config.runtime.policy.min_record_duration_s * policy_config.runtime.policy.control_hz)),
             resolved_config_sha256=runtime.sha256,
+            align_mode=camera_config.align_mode,
             provenance=provenance,
             writer_queue_size=int(runtime.camera.writer_queue_size),
         )
@@ -524,7 +525,6 @@ def run_teleop_experiment(
                 mechanical_lower_rad=np.asarray(runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
                 mechanical_upper_rad=np.asarray(runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
                 hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-                max_command_delta_rad=runtime.hand.max_delta_rad,
                 timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                 heartbeat=False,
             )

@@ -36,6 +36,7 @@ ENDPOINTS_DUE = "endpoints_due"
 ENDPOINTS_COALESCED = "endpoints_coalesced"
 ENDPOINTS_PUBLISHED = "endpoints_published"
 SAFETY_REJECTIONS = "safety_rejections"
+HAND_PREFLIGHT_REJECTIONS = "hand_preflight_rejections"
 POLICY_ABORTS = "policy_aborts"
 COMMAND_SILENCE_ABORT = "command_silence_abort"
 
@@ -53,10 +54,27 @@ _COUNTER_NAMES = frozenset(
         ENDPOINTS_COALESCED,
         ENDPOINTS_PUBLISHED,
         SAFETY_REJECTIONS,
+        HAND_PREFLIGHT_REJECTIONS,
         POLICY_ABORTS,
         COMMAND_SILENCE_ABORT,
+        # Per-gate-code reject counters (§10 D5) are derived from
+        # ``reject_counter_name`` and are therefore also counters, though their
+        # names cannot be enumerated statically here.
     }
 )
+
+
+def reject_counter_name(gate_code: str | None) -> str:
+    """Per-operation counter name for a safety-gate rejection (§10 D5).
+
+    ``gate_code`` is the machine-readable :class:`GateRejectCode` value string
+    (``None`` for the aggregate). The space-separated reason is normalized to a
+    snake_case counter name so each distinct rejection reason is attributed
+    separately in the flush log rather than folding into one aggregate total.
+    """
+    if gate_code is None:
+        return SAFETY_REJECTIONS
+    return "safety_reject_" + gate_code.replace(" ", "_")
 
 
 class Metrics:

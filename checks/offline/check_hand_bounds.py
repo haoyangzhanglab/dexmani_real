@@ -1,9 +1,9 @@
-"""A12: shared hand preflight validates operational + mechanical + delta.
+"""A12: shared hand preflight validates operational + mechanical bounds.
 
-``validate_hand_command_delta`` is the single reject-whole boundary for every
+``validate_hand_command_bounds`` is the single reject-whole boundary for every
 coupled hand path.  It must accept an in-envelope command (returning a copy,
-never clipping), and raise on an operational-limit, mechanical-envelope,
-command-delta, or limit-configuration violation.
+never clipping), and raise on an operational-limit, mechanical-envelope, or
+limit-configuration violation.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import numpy as np
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 
 from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.policy.safety import validate_hand_command_delta
+from dexmani_real.policy.safety import validate_hand_command_bounds
 
 
 def _raises(fn, label: str) -> None:
@@ -32,18 +32,11 @@ def main() -> int:
     op_lower = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
     op_upper = np.asarray(hand_defaults.qpos_max_rad, dtype=np.float64)
     mid = (op_lower + op_upper) / 2.0
-    prev = mid.copy()
 
     # ── Accept, return a copy, never clip ──────────────────────────────
-    out = validate_hand_command_delta(
-        mid, prev, op_lower, op_upper, rated_lower, rated_upper, None
-    )
+    out = validate_hand_command_bounds(mid, op_lower, op_upper, rated_lower, rated_upper)
     np.testing.assert_allclose(out, mid)
     assert out is not mid, "must return a copy, not the caller's array"
-    out = validate_hand_command_delta(
-        mid, prev, op_lower, op_upper, rated_lower, rated_upper, 0.20
-    )
-    np.testing.assert_allclose(out, mid)
 
     # ── Operational limit violation (isolated from the mechanical check) ─
     # The operational box is conservative only on the min side of some joints
@@ -56,28 +49,18 @@ def main() -> int:
     op_violation = mid.copy()
     op_violation[j] = rated_lower[j]  # inside mechanical, below operational min
     _raises(
-        lambda: validate_hand_command_delta(
-            op_violation, prev, op_lower, op_upper, rated_lower, rated_upper, None
+        lambda: validate_hand_command_bounds(
+            op_violation, op_lower, op_upper, rated_lower, rated_upper
         ),
         "operational limit violation",
-    )
-
-    # ── Command-to-command delta violation ─────────────────────────────
-    delta_violation = mid.copy()
-    delta_violation[0] = mid[0] + 0.5  # > 0.20, still inside operational box
-    _raises(
-        lambda: validate_hand_command_delta(
-            delta_violation, prev, op_lower, op_upper, rated_lower, rated_upper, 0.20
-        ),
-        "command delta violation",
     )
 
     # ── Mechanical envelope exceeding the rated device envelope ────────
     too_wide = rated_upper.copy()
     too_wide[0] = rated_upper[0] + 1.0
     _raises(
-        lambda: validate_hand_command_delta(
-            mid, prev, op_lower, op_upper, rated_lower, too_wide, None
+        lambda: validate_hand_command_bounds(
+            mid, op_lower, op_upper, rated_lower, too_wide
         ),
         "mechanical > rated",
     )
@@ -86,31 +69,23 @@ def main() -> int:
     narrow_mech = rated_upper.copy()
     narrow_mech[0] = op_upper[0] - 0.5
     _raises(
-        lambda: validate_hand_command_delta(
-            mid, prev, op_lower, op_upper, rated_lower, narrow_mech, None
+        lambda: validate_hand_command_bounds(
+            mid, op_lower, op_upper, rated_lower, narrow_mech
         ),
         "operational > mechanical",
-    )
-
-    # ── Delta requested without a previous accepted command ────────────
-    _raises(
-        lambda: validate_hand_command_delta(
-            mid, None, op_lower, op_upper, rated_lower, rated_upper, 0.20
-        ),
-        "delta without previous",
     )
 
     # ── Non-finite / malformed command ─────────────────────────────────
     nan_cmd = mid.copy()
     nan_cmd[3] = np.nan
     _raises(
-        lambda: validate_hand_command_delta(
-            nan_cmd, prev, op_lower, op_upper, rated_lower, rated_upper, None
+        lambda: validate_hand_command_bounds(
+            nan_cmd, op_lower, op_upper, rated_lower, rated_upper
         ),
         "non-finite command",
     )
 
-    print("check_hand_delta: PASS")
+    print("check_hand_bounds: PASS")
     return 0
 
 

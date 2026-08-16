@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from dexmani_real.utils.schema import HAND_JOINT_SHAPE
-from dexmani_real.policy.safety import validate_hand_command_delta
+from dexmani_real.policy.safety import validate_hand_command_bounds
 from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
@@ -17,10 +17,8 @@ _retarget_fail_warn = ThrottledWarner()
 
 def _sanitize_hand_command(
     hand_cmd: np.ndarray,
-    previous_hand_cmd: np.ndarray,
     lower: np.ndarray,
     upper: np.ndarray,
-    max_delta_rad: float | None,
     mechanical_lower: np.ndarray,
     mechanical_upper: np.ndarray,
 ) -> np.ndarray:
@@ -34,17 +32,15 @@ def _sanitize_hand_command(
     ``hand_cmd_valid=False`` and holds arm + hand together, instead of letting
     ``SafetyGate.validate`` turn an out-of-limit command into a sticky fault.
     (Other coupled paths — keyboard, replay, calibrate, return-home — still rely
-    on ``validate_hand_command_delta`` inside ``publish_joint_targets`` to
+    on ``validate_hand_command_bounds`` inside ``publish_joint_targets`` to
     reject, not clip.)
     """
-    return validate_hand_command_delta(
+    return validate_hand_command_bounds(
         hand_cmd,
-        previous_hand_cmd,
         lower,
         upper,
         mechanical_lower,
         mechanical_upper,
-        max_delta_rad,
     )
 
 

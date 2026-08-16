@@ -407,7 +407,6 @@ def _run_control_loop(
                         runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
                     ),
                     hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-                    max_command_delta_rad=runtime.hand.max_delta_rad,
                     timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                     heartbeat=False,
                     abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
@@ -683,7 +682,6 @@ def _run_keyboard_session(
                 runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
             ),
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-            max_command_delta_rad=runtime.hand.max_delta_rad,
             timeout_s=float(runtime.hand.home_command_ack_timeout_s),
             heartbeat=False,
             abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,

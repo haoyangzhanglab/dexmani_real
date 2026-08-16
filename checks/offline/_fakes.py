@@ -188,12 +188,14 @@ class FakeHand:
         connected: bool = False,
         error_state: bool = False,
         tactile_calibrated: bool = False,
+        tactile_valid: bool = True,
         qpos: np.ndarray | None = None,
         last_qpos_cmd: np.ndarray | None = None,
     ) -> None:
         self.connected_flag = connected
         self.error_state = error_state
         self.tactile_calibrated = tactile_calibrated
+        self.tactile_valid = tactile_valid
         self._qpos = (
             np.zeros(HAND_JOINT_SHAPE, dtype=np.float64)
             if qpos is None
@@ -259,6 +261,7 @@ class FakeHand:
             tactile_force=np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
             tactile_sum=np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
             tactile_contact=np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
+            tactile_valid=self.tactile_valid,
             commboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
             jointboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
             tipboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
@@ -284,9 +287,10 @@ class FakeHand:
         self._record("initialize_tactile", (), {})
         self._maybe_raise("initialize_tactile")
         if self._codes.get("initialize_tactile", 0) != 0:
+            self.tactile_calibrated = False
             return False
-        self.tactile_calibrated = True
-        return True
+        self.tactile_calibrated = bool(self.tactile_valid)
+        return self.tactile_calibrated
 
 
 def make_arm_state_frame(

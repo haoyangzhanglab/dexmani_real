@@ -62,7 +62,7 @@ observation
 | measured | 设备反馈，允许因接触、限流或跟踪滞后而不同于命令 |
 
 “raw” 只能相对相邻阶段解释。例如 `action_arm_joint_raw` 是 final IK output、
-pre-delta-clip，并不是未经筛选的 MPlib 解。
+pre-joint-limit-clip，并不是未经筛选的 MPlib 解。
 
 ### 1.2 操作语义
 
@@ -90,18 +90,15 @@ joint-range normalization 和 candidate weights 只影响规划评分。不得�
 | VR position/rotation scale | `1.0 / 1.0` | 数值直通 | reset-relative wrist motion | `VRMappingParams` |
 | VR rotation spike clip | `0.52 rad/map` | 启用 | 相邻有效 mapper input | `ArmWristMapper` 构造默认值 |
 | VR total rotation clip | `3.0 rad` | 启用 | reset-relative 总旋转 | `VRMappingParams` |
-| arm joint delta clip | `120 deg/s ÷ 16 Hz = 7.5 deg/tick` | 启用 | 上一成功发布 arm command | `teleop/loop.py` |
 | hand retargeter | `tag` | 启用 | 每个有效 landmarks snapshot | `PolicyParams` |
 | hand startup ramp | `0.5 s` | 启用 | control-grid step；重锚时的 hand pose | `PolicyParams` |
-| hand delta clip/reject | `None` | 关闭 | 每条命令；参考因边界而异 | `HandParams` |
 | TAG pinch-factor EMA | `0.4` | 启用 | 成功 Stage 1 的 retarget call | `TAGRetargetingParams` |
 | DexPilot internal low-pass | `0.6` | 选择 DexPilot 时启用 | retarget call | bundled YAML |
 | DexPilot outer output EMA | `1.0` | 直通、关闭 | retarget call | bundled YAML |
 
 固定 alpha 和 `rad/map` 都与调用频率耦合。修改 `control_hz` 会改变 EEF EMA、TAG
 pinch EMA 和 DexPilot low-pass 的实际时间常数；hand ramp 通过
-`round(duration_s * control_hz)` 保持近似时长；arm delta clip 显式由速度和
-`control_hz` 派生。可选 hand `max_delta_rad` 的单位是 rad/command，不是 rad/s。
+`round(duration_s * control_hz)` 保持近似时长。
 
 Pointcloud temporal EMA 当前不存在；相机点云只保留 median、speckle 等单帧空间
 滤波，不属于本控制链。
@@ -133,10 +130,10 @@ hand 问题转换成协调 hold；它不是第二个通用发布边界。
 |---|---|---|---|
 | Producer | mapping、EMA/ramp、必要的主动 clip、IK/retargeting | 可以 | 路径自有 hold/drop |
 | `SafetyGate` | representation/units/frame、generation、shape/finite、arm/hand command limits、可选 workspace segment | 不修改 | 返回 typed gate reject |
-| Publication boundary | runtime flags、SafetyState、arm feedback freshness/health、hand feedback health、hand operational/mechanical/optional delta preflight、传输 | 不修改 | 返回 `CommandPublishResult` |
+| Publication boundary | runtime flags、SafetyState、arm feedback freshness/health、hand feedback health、hand operational/mechanical preflight、传输 | 不修改 | 返回 `CommandPublishResult` |
 | Arm worker | dtype、finite、generation、expiry，SDK 前 safety-state gate | 不修改 | 丢弃或停止发送 |
-| Hand worker | arm-worker 同类检查，加 operational/mechanical/optional delta | 不修改 | 丢弃命令 |
-| XHand driver | shape/finite、operational/mechanical、optional delta、SDK send | 不修改 | reject whole / send failure |
+| Hand worker | arm-worker 同类检查，加 operational/mechanical | 不修改 | 丢弃命令 |
+| XHand driver | shape/finite、operational/mechanical、SDK send | 不修改 | reject whole / send failure |
 | xArm firmware | velocity、acceleration、collision/current 等设备限制 | 设备 backstop | controller error 进入 supervisor 合同 |
 
 `SafetyGate` 已删除 velocity、collision 和 transition geometry 检查。固件是最终物理
@@ -156,7 +153,6 @@ VR wrist observation
   -> contact-stall re-anchor/hold
   -> IK candidate reject/rank/canonicalize
   -> final IK limit/pose/collision reject
-  -> arm joint delta clip
   -> application joint-limit clip
   -> local candidate checks
   -> shared publication boundary
@@ -191,20 +187,20 @@ workspace reject 或发布失败不会提交本帧 EMA state。首次重锚后�
 
 Final IK output 已完成 canonicalization、joint-limit、pose-error 和 collision reject。随后：
 
-1. teleop 以 `ctx.prev_qpos_cmd`（上一成功发布命令）为参考执行逐 tick delta clip；
-2. 再投影到 application arm joint limits；
-3. `SafetyGate` 从最新 measured arm qpos 到 shaped command 做 workspace segment reject。
+1. 投影到 application arm joint limits（通常只处理 IK limit tolerance 内的微小越界）；
+2. `SafetyGate` 从最新 measured arm qpos 到 shaped command 做 workspace segment reject。
 
-第二步通常只处理 IK limit tolerance 内的微小越界。第一步会生成不同于 final IK
-output 的新端点。
+`RESOLVED`（2026-08-16，工作树未合入）：应用层逐 tick arm delta clip 已删除（见 D1），
+速度/加速度平滑由 Mode 6 固件独占（同一 `max_joint_velocity_deg_per_s` 经
+`joint_max_speed_rad_per_s` 下发，另 `set_joint_maxacc`）。v16 的
+`action_arm_joint_raw` vs `action_arm_joint` 现在只反映 joint-limit 投影的差异；
+collision 已按 2026-08-12 从 SafetyGate 移除，归 Mode 6 兜底。
 
-`GAP`：delta-clipped 端点没有重新执行 IK pose-error 或 collision check。它位于上一
-published command 与 final IK output 的逐关节线性方向上，但“两个端点安全”不能证明
-中间关节配置无碰撞。
-
-`GAP`：IK collision model 在求解前同步的是上一 published hand command；本帧 hand
-candidate 在 IK 之后计算。因此 final IK collision reject 不能解释为最终 arm+hand
-联合候选已经通过 19-DoF endpoint/segment collision 验证。
+`RESOLVED`（2026-08-16，工作树未合入）：手命令（retarget → ramp → delta/floor clip →
+sanitize）已前移到 arm IK 之前，`planner.set_hand_qpos` 现在同步本帧 post-shaping 的
+hand command，不再滞后一帧。final IK collision reject 现基于当前帧手构型；但最终
+arm+hand 联合候选仍不通过 19-DoF endpoint/segment collision 验证（collision/transition
+已按 2026-08-12 从 SafetyGate 移除，归 Mode 6 兜底）。
 
 ## 5. VR hand 控制链
 
@@ -240,41 +236,29 @@ DexPilot `SeqRetargeting` 内部 low-pass alpha 为 `0.6`。包装层仍支持�
 ```text
 retargeter output
   -> startup smoothstep ramp
-  -> optional delta clip (VR only, default off)
   -> operational command-box clip (VR only)
   -> local reject-whole sanitizer
   -> ActionCandidate / SafetyGate
-  -> centralized hand feedback + operational/mechanical/delta preflight
+  -> centralized hand feedback + operational/mechanical preflight
   -> latest-wins hand ring
   -> hand worker reject
   -> XHand driver reject
 ```
 
 VR 主动把 hand command 投影进 operational box。其他耦合发布路径依赖共享 preflight
-拒绝 operational、rated mechanical 和可选 delta 违规，避免 arm 已入队而 hand 被后级
-拒绝。Home 在启用 delta 时生成显式合法 milestones，不 clip 隐式改写最终 home 端点。
-
-`GAP`：可选 hand delta 的 reference 不统一：
-
-- VR teleop 和 deployment controller 使用 last-published command；
-- hand worker/driver 使用 last-SDK-accepted command；
-- replay/keyboard 等未显式传 reference 时，集中发布边界使用 worker feedback 中的
-  `last_cmd_qpos`。
-
-在 latest-wins ring 跳过中间命令或 worker 拒绝命令时，last-published 与
-last-SDK-accepted 可能分叉。默认 `max_delta_rad=None` 时该问题不激活；启用前必须先
-定义 reject 后的反馈、重同步和恢复合同。
+拒绝 operational、rated mechanical 违规，避免 arm 已入队而 hand 被后级拒绝。Home
+发布精确 home 端点（单条命令），不 clip 隐式改写最终 home 端点。
 
 ## 6. 其他控制源差异
 
 | 控制源 | 主动改变端点 | 应用层几何检查 | hand 边界 | 主要失败结果 |
 |---|---|---|---|---|
-| VR teleop | mapper scale/clip、EEF EMA、workspace clip、arm/optional hand delta、hand ramp/box clip | IK final endpoint collision；SafetyGate workspace segment | local sanitizer + shared preflight | mapper/IK/local reject hold；workspace gate reject hold；意外发布失败可 fault |
+| VR teleop | mapper scale/clip、EEF EMA、workspace clip、hand ramp/box clip | IK final endpoint collision；SafetyGate workspace segment | local sanitizer + shared preflight | mapper/IK/local reject hold；workspace gate reject hold；意外发布失败可 fault |
 | Keyboard | fixed Cartesian delta、workspace clip、measured position/rotation lead cap | IK final endpoint collision + SafetyGate workspace | 携带 hand 时用 shared preflight | block 当前按键目标或结束流程 |
 | Camera calibration | fixed Cartesian delta、workspace clip | IK final endpoint collision + SafetyGate workspace | 正常路径为 arm-only | reject 当前目标；不可恢复失败终止标定 |
 | Replay | 不修改录制端点 | 执行前 dense limits/workspace/collision preflight；运行时 SafetyGate workspace | 携带 hand 时用 shared preflight | preflight/publish failure abort |
-| Learned-policy deployment | 不插值、不主动 clip model endpoint；逾期 step 可 coalesce | 当前 `SafetyGate` 未安装 planner callback，也无应用层 collision preflight | shared preflight | gate/hand semantic reject abort policy；feedback/transport failure drop tick，silence watchdog 最终 abort |
-| Home | 显式 joint milestones | 独立 dense planned path checks | hand delta 启用时生成显式 milestones | unsafe path/acceptance failure hold 或 abort |
+| Learned-policy deployment | 不插值、不主动 clip model endpoint；逾期 step 可 coalesce | `SafetyGate` workspace segment（process-local planner，见 D2）；无应用层 collision preflight | shared preflight | gate/hand semantic reject abort policy；feedback/transport failure drop tick，silence watchdog 最终 abort |
+| Home | 显式 joint milestones | 独立 dense planned path checks | 发布精确 home 端点（bounds preflight） | unsafe path/acceptance failure hold 或 abort |
 
 Keyboard 具有 measured-lead cap；camera calibration 已删除从未生效的
 `target_lead_max_m`，两条路径不能表述为完全等价。
@@ -308,14 +292,10 @@ workspace、mechanical envelope 或数据质量检查。
 |---|---|---|---|---|
 | Mapper rotation spike baseline | 上一有效 raw wrist orientation | 完整 map 成功 | clear/re-anchor、quiescence | 不适用；非法 map 不推进 |
 | Cartesian EEF EMA | 上一成功发布对应的 EEF target | candidate 成功发布后 | begin/re-anchor、pause/home quiescence、contact-stall、feedback/camera re-warm 边界 | 是；发布前失败不提交 |
-| Arm delta clip | `ctx.prev_qpos_cmd` | arm candidate 成功发布后 | re-anchor/home/hold 分支按显式命令重设 | worker 未接受不会自动回滚 |
 | TAG optimizer regularization | 上一成功 optimizer output | TAG solve 成功 | retargeter reset，优先以 hand pose warm-start | 下游 reject 不回滚 |
 | TAG pinch EMA | 上一 pinch factor | Stage 1 成功后、Stage 2 前 | retargeter reset 为 0 | 下游 reject 不回滚 |
 | DexPilot filters | retargeter 内部上一输出 | 成功 retarget output | retargeter reset | 下游 reject 不回滚 |
 | Hand startup ramp | 重锚时 hand anchor + 当前 retarget target | 每次执行 ramp shaping 时 step 前进 | re-anchor/quiescence | 下游 reject 不回滚 step |
-| VR hand delta clip | `ctx.prev_hand_qpos` | hand candidate 成功发布后 | re-anchor/home seed | worker reject 不自动回滚 |
-| Deployment hand delta | coordinator last-published | publish success 后 | coordinator run restart/seed | worker reject 不自动回滚 |
-| Worker/driver hand delta | last SDK-accepted target | SDK accept 后 | device init/home accepted command | reject 保持 last accepted |
 
 `run_generation` 使旧 queue/ring command 失效，但不会自动 reset 所有进程内滤波器；拥有
 temporal state 的 producer 必须在 begin、pause、home、feedback fault、camera re-warm
@@ -327,17 +307,17 @@ temporal state 的 producer 必须在 begin、pause、home、feedback fault、ca
 |---|---|
 | `target_eef_pos_raw` / `target_eef_rot6d_raw` | mapper output，已包含 mapper scale/rotation clip，位于 Cartesian EMA 前 |
 | `target_pos_before_clamp` | Cartesian EMA 后、workspace position clip 前 |
-| `action_arm_ee` | 提供给 IK 的 desired EEF target；不是 delta-clipped `action_arm_joint` 的 FK 保证 |
-| `action_arm_joint_raw` | final IK validated output，位于 teleop arm delta/joint-limit clip 前 |
+| `action_arm_ee` | 提供给 IK 的 desired EEF target；不是 joint-limit-clipped `action_arm_joint` 的 FK 保证 |
+| `action_arm_joint_raw` | final IK validated output，位于 teleop joint-limit clip 前 |
 | `action_arm_joint` | 应用层 shaping 后、通过发布边界的 arm candidate；hold 槽保存 hold target |
 | `action_arm_joint_sent` | 实际转发给 arm worker 的命令流；部分非标准 episode 可缺省 |
-| `action_hand_joint_raw` | ramp/delta/operational clip 前；TAG 成功时为 optimizer SDK-order output，其他路径回退为 retargeter/held output |
+| `action_hand_joint_raw` | ramp/operational clip 前；TAG 成功时为 optimizer SDK-order output，其他路径回退为 retargeter/held output |
 | `action_hand_joint` | 通过 hand shaping 和发布边界的最终 hand candidate |
 | `arm_qpos` / `hand_qpos` | 网格对齐的 measured feedback，不等同于 accepted command |
 
 这些字段适合统计 arm clip 是否触发、shaped/accepted/measured 差异，但不能：
 
-- 分别还原 arm delta clip 与 joint-limit clip；
+- 还原 joint-limit clip；
 - 逐层还原 TAG/DexPilot filter、ramp 和内部 optimizer state；
 - 证明每次 temporal-state refactor 行为等价；
 - 区分每个 reject/status 原因。
@@ -350,40 +330,51 @@ temporal state 的 producer 必须在 begin、pause、home、feedback fault、ca
 
 ### D1 — Arm delta clip 的动态所有权
 
-- `CURRENT`：应用层按 `max_joint_velocity_deg_per_s / control_hz` clip，Mode 6 同时接收
-  同一速度配置并执行固件平滑。
-- `GAP`：clip 后的新端点没有重新做 pose/collision validation；应用层和固件存在双重
-  动态所有权。
-- `FUTURE`：优先用 v16 的 raw/accepted 字段统计触发率和幅度。若决定由 Mode 6 独占
-  平滑，再单独删除应用层 clip，并把硬件验证作为显式授权步骤；本文不预先改变行为。
+- `RESOLVED`（2026-08-16，工作树未合入）：应用层逐 tick arm delta clip 已删除；速度/
+  加速度平滑由 Mode 6 固件独占（`joint_max_speed_rad_per_s` + `set_joint_maxacc`）。
+  joint-limit 投影保留，是硬限位安全网，与速度所有权无关。
+- `PENDING`：真机验证 Mode 6 独占轨迹生成下的遥操作跟踪响应（快速反转过冲/滞后）。
+  验证通过后回填 commit、前移基线指针。
 
 ### D2 — Deployment geometry contract
 
-- `CURRENT`：deployment gate 没有 planner workspace callback，也没有 endpoint/segment
-  collision preflight。
-- `DECISION`：workspace 是所有控制源的全局物理 envelope，还是仅 teleop/脚本约束。
-- `FUTURE`：若为全局 envelope，接入 process-local planner-backed workspace 与必要的
-  endpoint/segment geometry checks；若有意依赖模型/固件，必须显式配置和记录 opt-out。
+- `DECISION → RESOLVED`（2026-08-16）：workspace 是所有控制源的全局物理 envelope。
+- `CURRENT`：coordinator 启动时构建 process-local `XArm7MotionPlanner`，经
+  `planner_action_safety_gate` 把 `workspace_check = planner.is_workspace_segment_safe`
+  接入 deployment gate；`workspace_bounds` 取自 `runtime.policy.workspace`，与 VR
+  teleop 使用同一 workspace 检查。endpoint/segment collision preflight 仍按
+  2026-08-12 决策移除，未恢复。
+- 本改动为工作树未合入改动；合入后需回填 commit 并把基线指针前移。
 
-### D3 — Hand delta reference 与恢复
+### D3 — Hand delta clip
 
-- `CURRENT`：功能默认关闭；controller last-published 与 worker last-accepted 语义不同。
-- `DECISION`：统一 reference，或定义 reject acknowledgement、resync 和重新 ramp。
-- `FUTURE`：在该合同完成前，不把 `max_delta_rad` 作为默认安全功能启用。
+- `RESOLVED`（2026-08-16，工作树未合入）：`hand.max_delta_rad` 命令间速率限位机制已
+  整体删除（config → 发布边界 → worker/driver → teleop → coordinator → hand-home
+  里程碑 → 4 个 example）。默认本就 `None`，运行时行为不变；手部速度保护现仅由固件
+  PID + per-joint `tor_max` 电流限位承担。原「统一 reference / resync / 重新 ramp」
+  的 DECISION 随功能一并关闭；若后续路径需要限速，需按原链路重新引入并先定义
+  reference 合同。
 
 ### D4 — Rate-dependent filter 配置
 
-- `CURRENT`：多个 alpha 按调用次数定义，只有 arm delta 和 hand ramp 显式考虑
+- `DECISION → RESOLVED`（2026-08-16，文档化，不改代码）：保持 rate-tuned 固定 alpha。
+  系数按 `control_hz=16` 的每 tick/每帧调用速率定义，只有 hand startup ramp 通过
+  `hand_ramp_duration_s × control_hz` 显式参数化；其余 EMA/scale/clip 均隐式耦合
   `control_hz`。
-- `DECISION`：保持 rate-tuned 固定 alpha，还是改用时间常数并在 runtime 解析为 alpha。
+- 耦合面（改 `control_hz` 必须同步重推导）：VR pos/rot scale（默认 1.0/1.0）、
+  per-frame 旋转尖峰 clip 与 total-from-reset 旋转 cap（`max_delta_rot_rad`）、
+  EEF 位置/姿态 EMA、TAG `pinch_ema_alpha`/`smooth_weight`/`reg_last_weight`
+  （0.4/0.02/0.8）、DexPilot low-pass/smoothing EMA、hand 启动 ramp。
 - `FUTURE`：任何调整必须同时更新默认值、派生率、metadata 和离线行为检查。
 
 ### D5 — Reject observability
 
-- `CURRENT`：typed runtime status、日志和少量 frame status 已能支持运行时 disposition；
-  v16 不能逐操作归因。
-- `DECISION`：工程诊断是否可由 metrics/log 完成，还是需要 episode 级持久化。
-- `FUTURE`：只有后者成立时才规划显式 schema 升级。
+- `DECISION → RESOLVED`（2026-08-16，metrics/log 归因）：工程诊断由 metrics/log 完成，
+  不升级 v16。coordinator 对 reject-whole 分支逐操作计数——gate 拒绝按 `GateRejectCode`
+  拆分为 `safety_reject_<code>` 计数器（叠加 aggregate `SAFETY_REJECTIONS`），hand
+  preflight 拒绝计入 `HAND_PREFLIGHT_REJECTIONS`（此前未计数）。
+- `FUTURE`：暂不规划 episode 级 schema 升级；若后续需要把逐操作归因写入训练数据，
+  再显式规划 v16 升级。
 
 ## 11. 后续修改检查表
 

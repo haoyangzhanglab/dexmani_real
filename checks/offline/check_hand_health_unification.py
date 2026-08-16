@@ -1,10 +1,12 @@
-"""H1: the remaining two hand health gates are the shared predicate.
+"""H1: the remaining hand health gate is the shared predicate.
 
-``coordinator._seed_hand_reference`` and ``supervisor._hand_feedback_issue``
-must produce the same fail-closed verdict as ``validate_hand_feedback`` (the
-single source of truth in ``utils/hand_health.py``): a stale, future,
-disconnected, hardware-errored, invalid, or I/O-unhealthy frame is rejected at
-the seed and reported identically in the pre-flight health summary.
+``supervisor._hand_feedback_issue`` must produce the same fail-closed verdict as
+``validate_hand_feedback`` (the single source of truth in
+``utils/hand_health.py``): a stale, future, disconnected, hardware-errored,
+invalid, or I/O-unhealthy frame is reported identically in the pre-flight
+health summary.  The coordinator hand-reference seed was removed with the hand
+delta clip (D3); the publication boundary reaches the same predicate through
+``_hand_feedback_snapshot``.
 
 The fixed rejection strings are locked verbatim; the timestamp branches are
 compared by keyword because their numeric age suffix depends on
@@ -22,10 +24,7 @@ import _bootstrap  # noqa: F401  (repo root on sys.path)
 from _fakes import make_hand_state_frame
 
 from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.deployment.coordinator import _seed_hand_reference
 from dexmani_real.runtime.supervisor import _hand_feedback_issue
-from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.utils.hand_health import validate_hand_feedback
 
 
@@ -101,24 +100,6 @@ def main() -> int:
                 assert name in got and name in expected, (name, got, expected)
         else:
             assert got == expected, (name, got, expected)
-
-    # ── coordinator seed agrees with the predicate ──
-    shared = SharedStorage.create(prefix="check_hand_health_unification")
-    try:
-        assert transition(shared, SafetyState.ARMED)
-        for name, frame in variants.items():
-            shared.hand_state_ring.write(frame)
-            unhealthy = validate_hand_feedback(
-                **_predicate_kwargs(frame, now_ns=time.monotonic_ns(), max_age_s=max_age_s)
-            )
-            seeded = _seed_hand_reference(shared, hand_feedback_max_age_s=max_age_s)
-            if unhealthy is not None:
-                assert seeded is None, (name, unhealthy)
-            else:
-                assert seeded is not None, name
-                np.testing.assert_array_equal(seeded, hand_mid)
-    finally:
-        shared.close()
 
     print("check_hand_health_unification: PASS")
     return 0

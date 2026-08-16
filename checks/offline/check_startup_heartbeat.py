@@ -17,6 +17,7 @@ import time
 
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 
+from dexmani_real.config.defaults import WorkspaceBounds
 from dexmani_real.config.defaults import arm as arm_defaults
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.deployment.config import DeploymentConfig
@@ -35,11 +36,11 @@ def _coordinator_config() -> CoordinatorConfig:
         deployment=DeploymentConfig(),
         arm_joint_lower_rad=arm_defaults.joint_limit_lower,
         arm_joint_upper_rad=arm_defaults.joint_limit_upper,
+        workspace_bounds=WorkspaceBounds().as_tuple(),
         hand_joint_lower_rad=hand_defaults.qpos_min_rad,
         hand_joint_upper_rad=hand_defaults.qpos_max_rad,
         hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
         hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
-        hand_max_delta_rad=hand_defaults.max_delta_rad,
         hand_feedback_max_age_s=1.0,
         control_hz=16.0,
     )

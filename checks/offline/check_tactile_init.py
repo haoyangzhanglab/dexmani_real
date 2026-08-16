@@ -111,6 +111,10 @@ def _test_order_and_ready() -> None:
         assert len(shared.hand_state_ring.frames) >= 1
         # A successful tactile init leaves the driver calibrated.
         assert hand.tactile_calibrated is True
+        assert shared.hand_tactile_ring.frames
+        tactile = shared.hand_tactile_ring.frames[0]
+        assert int(tactile["fresh"][0]) == 1
+        assert int(tactile["calibrated"][0]) == 1
         assert shared.error_state.value is False
     finally:
         _stop(thread, shared)
@@ -143,6 +147,25 @@ def _test_tactile_failure_degrades() -> None:
         _stop(thread2, shared2)
 
 
+def _test_invalid_payload_publishes_invalidation() -> None:
+    # Joint feedback still reaches ready, while malformed tactile immediately
+    # replaces any older valid ring entry with fresh=0/calibrated=0.
+    hand = FakeHand(tactile_calibrated=True, tactile_valid=False)
+    shared = _FakeShared()
+    thread = _run_until_ready(hand, shared)
+    try:
+        assert shared.error_state.value is False
+        assert shared.hand_state_ring.frames
+        assert int(shared.hand_state_ring.frames[0]["state_valid"][0]) == 1
+        _wait_until(lambda: bool(shared.hand_tactile_ring.frames))
+        tactile = shared.hand_tactile_ring.frames[-1]
+        assert int(tactile["fresh"][0]) == 0
+        assert int(tactile["calibrated"][0]) == 0
+        np.testing.assert_array_equal(tactile["tactile_force"][0], 0.0)
+    finally:
+        _stop(thread, shared)
+
+
 def _test_source_structural() -> None:
     hp_src = Path(hp.__file__).read_text()
     # The explicit tactile step precedes the first frame publish and hand_ready.
@@ -161,6 +184,7 @@ def _test_source_structural() -> None:
 def main() -> int:
     _test_order_and_ready()
     _test_tactile_failure_degrades()
+    _test_invalid_payload_publishes_invalidation()
     _test_source_structural()
 
     print("check_tactile_init: PASS")

@@ -586,8 +586,6 @@ def worker_validate_hand(
     qpos_upper_rad: np.ndarray,
     mechanical_lower_rad: np.ndarray,
     mechanical_upper_rad: np.ndarray,
-    previous_qpos_cmd: np.ndarray | None = None,
-    max_command_delta_rad: float | np.ndarray | None = None,
     expected_run_generation: int | None = None,
     now_monotonic_ns: int | None = None,
 ) -> bool:
@@ -595,9 +593,8 @@ def worker_validate_hand(
 
     Returns True when the command is well-formed, belongs to the active run,
     has not expired, and lies inside both operational and rated mechanical
-    limits. When supplied, the last SDK-accepted target and delta limit are
-    checked command-to-command as well. These redundant checks protect
-    direct/home publishers and IPC corruption; they never modify the endpoint.
+    limits. These redundant checks protect direct/home publishers and IPC
+    corruption; they never modify the endpoint.
     """
     command_lower = np.asarray(qpos_lower_rad, dtype=np.float64)
     command_upper = np.asarray(qpos_upper_rad, dtype=np.float64)
@@ -643,27 +640,6 @@ def worker_validate_hand(
         and np.all(qpos_cmd >= mechanical_lower - 1e-12)
         and np.all(qpos_cmd <= mechanical_upper + 1e-12)
     )
-    # The command-to-command delta check applies only when a rate limit is
-    # configured. When max_command_delta_rad is None (rate limiting disabled),
-    # the last accepted target is irrelevant to validity and must not turn the
-    # reference into NaN — np.asarray(None, float64) is nan — and reject every
-    # command. previous_qpos_cmd alone never triggers the delta branch.
-    if max_command_delta_rad is not None:
-        previous = np.asarray(previous_qpos_cmd, dtype=np.float64)
-        try:
-            max_delta = np.broadcast_to(
-                np.asarray(max_command_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE
-            )
-        except (TypeError, ValueError):
-            return False
-        delta_well_formed = (
-            previous.shape == HAND_JOINT_SHAPE
-            and np.all(np.isfinite(previous))
-            and np.all(np.isfinite(max_delta))
-            and np.all(max_delta > 0.0)
-            and np.all(np.abs(qpos_cmd - previous) <= max_delta + 1e-12)
-        )
-        well_formed = bool(well_formed and delta_well_formed)
     return bool(
         well_formed
         and _worker_command_is_current(
@@ -759,19 +735,15 @@ def validate_and_send_candidate(
     gate: SafetyGate,
     hand_feedback_max_age_s: float,
     prepare_timeout_s: float = 0.06,
-    previous_hand_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
-    hand_max_delta_rad: float | np.ndarray | None = None,
 ) -> CommandPublishResult:
     """Validate a pre-built candidate through the gate and publish it.
 
     Checks runtime and actuator feedback, runs :meth:`SafetyGate.validate`,
     preflights a coupled hand target, and publishes via :func:`send_command`.
     This is the publication tail shared by VR teleop, keyboard/replay, and the
-    learned-policy coordinator.  Callers may supply their last-published hand
-    command as the delta reference; otherwise the worker's last SDK-accepted
-    command is used.
+    learned-policy coordinator.
 
     Returns:
         A typed result that distinguishes policy-semantic gate rejection from
@@ -837,20 +809,13 @@ def validate_and_send_candidate(
             if hand_mechanical_upper_rad is None
             else np.asarray(hand_mechanical_upper_rad, dtype=np.float64)
         )
-        delta_reference = (
-            hand_feedback.last_cmd_qpos
-            if previous_hand_qpos is None
-            else np.asarray(previous_hand_qpos, dtype=np.float64)
-        )
         try:
-            validate_hand_command_delta(
+            validate_hand_command_bounds(
                 candidate.hand_qpos,
-                delta_reference,
                 gate.hand_low,
                 gate.hand_high,
                 mechanical_lower,
                 mechanical_upper,
-                hand_max_delta_rad,
             )
         except ValueError as exc:
             logger.warning(
@@ -881,7 +846,6 @@ def publish_joint_targets(
     apply_timeout_s: float = 0.5,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
-    hand_max_delta_rad: float | np.ndarray | None = None,
     hand_feedback_max_age_s: float,
 ) -> CommandPublishResult:
     """Validate a joint-space target through the gate and publish it.
@@ -890,15 +854,12 @@ def publish_joint_targets(
     builds an ``ActionCandidate`` from raw joint arrays, runs
     the full validation pipeline, and calls :func:`send_command`.  When the
     candidate carries a hand target, a coupled-hand preflight
-    (:func:`validate_hand_command_delta`) additionally rejects-whole the rated
-    mechanical envelope and the command-to-command delta *before* the arm
-    endpoint is enqueued, so a rejected hand command cannot desync the arm from
-    the hand.
+    (:func:`validate_hand_command_bounds`) additionally rejects-whole the rated
+    mechanical envelope *before* the arm endpoint is enqueued, so a rejected
+    hand command cannot desync the arm from the hand.
 
     ``hand_mechanical_lower_rad`` / ``hand_mechanical_upper_rad`` default to the
-    rated device envelope; ``hand_max_delta_rad`` is optional (``None`` skips
-    the command-to-command delta check while still enforcing operational +
-    mechanical bounds).
+    rated device envelope.
 
     Returns a typed validation/publication result. On success, ``candidate``
     contains the immutable target that was published (and, when
@@ -941,7 +902,6 @@ def publish_joint_targets(
         prepare_timeout_s=prepare_timeout_s,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
-        hand_max_delta_rad=hand_max_delta_rad,
     )
     if not publish_result.succeeded:
         return publish_result
@@ -1020,28 +980,19 @@ def publish_joint_targets(
 # ---------------------------------------------------------------------------
 
 
-def validate_hand_command_delta(
+def validate_hand_command_bounds(
     hand_cmd: np.ndarray,
-    previous: np.ndarray | None,
     operational_lower: np.ndarray,
     operational_upper: np.ndarray,
     mechanical_lower: np.ndarray,
     mechanical_upper: np.ndarray,
-    max_delta_rad: float | np.ndarray | None,
 ) -> np.ndarray:
-    """Validate one hand target against operational + rated mechanical bounds
-    and (optionally) a command-to-command delta; reject-whole, never clip.
+    """Validate one hand target against operational + rated mechanical bounds;
+    reject-whole, never clip.
 
     Shared preflight for every coupled hand path (teleop, replay, return-home).
     Normal action producers reach it through ``validate_and_send_candidate``;
-    hand-home also reuses it while constructing explicit milestones.
-    ``previous`` is the reference *command* for the delta bound and is always a
-    command, never measured feedback, so contact and torque-limited steady-state
-    lag are valid outcomes and must not reject a valid next command.  Which
-    command is the reference is path-dependent: replay/keyboard/calibrate pass
-    the worker's last *accepted* command (``last_cmd_qpos``), while VR teleop
-    passes the last *published* command (``ctx.prev_hand_qpos``).  The worker's
-    authoritative delta check remains the final backstop on either path.  Raises
+    hand-home also reuses it before publishing the exact home endpoint.  Raises
     ``ValueError`` on any violation and returns a copy otherwise.
     """
     command = np.asarray(hand_cmd, dtype=np.float64)
@@ -1079,25 +1030,6 @@ def validate_hand_command_delta(
     if np.any(command < mech_lower - 1e-12) or np.any(command > mech_upper + 1e-12):
         raise ValueError("hand command violates rated mechanical joint limits")
 
-    if max_delta_rad is not None:
-        if previous is None:
-            raise ValueError(
-                "hand command delta check requires a previous accepted command"
-            )
-        prev = np.asarray(previous, dtype=np.float64)
-        try:
-            max_delta = np.broadcast_to(
-                np.asarray(max_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE
-            )
-        except (TypeError, ValueError):
-            raise ValueError("hand max command delta must broadcast to twelve values") from None
-        if prev.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(prev)):
-            raise ValueError("hand previous command must be a finite 12-vector")
-        if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-            raise ValueError("hand max command delta must be finite and positive")
-        if np.any(np.abs(command - prev) > max_delta + 1e-12):
-            raise ValueError("hand command violates command-to-command delta limit")
-
     return command.copy()
 
 
@@ -1115,7 +1047,6 @@ def publish_hand_home_and_wait_applied(
     mechanical_lower_rad: np.ndarray,
     mechanical_upper_rad: np.ndarray,
     hand_feedback_max_age_s: float,
-    max_command_delta_rad: float | np.ndarray | None = None,
     timeout_s: float = 1.0,
     heartbeat: bool = False,
     check_is_running: bool = True,
@@ -1125,28 +1056,23 @@ def publish_hand_home_and_wait_applied(
     """Publish exact hand-home and wait only for worker/SDK acceptance.
 
     The configured endpoint must lie inside both the operational command box
-    and the rated mechanical box. When a command-delta limit is configured,
-    this function publishes explicit linear milestones from the worker's last
-    accepted command; it never clips a candidate. Success means every SDK send,
-    including the exact final home endpoint, was acknowledged. Measured qpos is
-    deliberately not compared with the target because contact and steady-state
-    position error are valid.
+    and the rated mechanical box. Success means every SDK send, including the
+    exact final home endpoint, was acknowledged. Measured qpos is deliberately
+    not compared with the target because contact and steady-state position
+    error are valid.
     """
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError(
             "hand home command acknowledgement timeout must be finite and positive"
         )
     # Bound validation is shared with the other coupled hand paths; a
-    # violation raises (reject-whole, never clip).  Delta is not checked here:
-    # the milestone loop below enforces the command-to-command bound explicitly.
-    target = validate_hand_command_delta(
+    # violation raises (reject-whole, never clip).
+    target = validate_hand_command_bounds(
         home_qpos,
-        None,
         command_lower_rad,
         command_upper_rad,
         mechanical_lower_rad,
         mechanical_upper_rad,
-        max_delta_rad=None,
     )
     runtime_rejection = _publication_runtime_gate(
         shared,
@@ -1172,25 +1098,12 @@ def publish_hand_home_and_wait_applied(
         )
         return False
 
-    if max_command_delta_rad is None:
-        max_delta = None
-        milestone_count = 1
-    else:
-        max_delta = np.broadcast_to(
-            np.asarray(max_command_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE
-        )
-        if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-            raise ValueError(
-                "hand max command delta must broadcast to twelve finite positive values"
-            )
-        milestone_count = max(
-            1, int(np.ceil(float(np.max(np.abs(target - start) / max_delta))))
-        )
+    # The exact home endpoint is published as a single command; there is no
+    # command-to-command delta bound to spread it over milestones.
+    milestone_count = 1
 
     last_action_id = 0
-    milestone_index = 0
     acknowledged = False
-    previous = start
     for milestone_index in range(1, milestone_count + 1):
         if time.monotonic() >= deadline_s:
             break
@@ -1201,19 +1114,7 @@ def publish_hand_home_and_wait_applied(
         if runtime_rejection is not None:
             logger.warning("hand home stopped by runtime gate: %s", runtime_rejection.reason)
             return False
-        alpha = milestone_index / milestone_count
-        milestone = (
-            target.copy()
-            if milestone_index == milestone_count
-            else start + alpha * (target - start)
-        )
-        if max_delta is not None and np.any(
-            np.abs(milestone - previous) > max_delta + 1e-12
-        ):
-            raise RuntimeError(
-                "generated hand-home milestone violates configured command delta"
-            )
-        previous = milestone
+        milestone = target.copy()
 
         with shared.arm_command_seq.get_lock():
             action_id = int(shared.arm_command_seq.value) + 1
@@ -1270,7 +1171,7 @@ def publish_hand_home_and_wait_applied(
     if last_action_id and milestone_index == milestone_count and acknowledged:
         if verbose:
             print(
-                f"  hand: home command accepted (action_id={last_action_id}, milestones={milestone_count})",
+                f"  hand: home command accepted (action_id={last_action_id})",
                 flush=True,
             )
         return True

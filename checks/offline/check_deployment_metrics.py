@@ -4,6 +4,8 @@ Locks the counter/gauge registry semantics and the provenance logging boundary:
 
   - ``Metrics`` increments counters, observes gauges, merges both into a
     snapshot, and ``flush`` resets counters but keeps gauges
+  - ``reject_counter_name`` maps a ``GateRejectCode`` value to a per-operation
+    counter name, so gate rejections are attributed per reason (§10 D5)
   - ``flush_every`` throttles on a monotonic-ns boundary
   - neither module imports Prometheus/OpenTelemetry/torch (§94), and provenance
     never touches SharedStorage (§96)
@@ -25,9 +27,12 @@ from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.metrics import (
     COMMAND_SILENCE_ABORT,
     ENDPOINTS_PUBLISHED,
+    HAND_PREFLIGHT_REJECTIONS,
     INFERENCE_MS,
+    SAFETY_REJECTIONS,
     Metrics,
     flush_every,
+    reject_counter_name,
 )
 from dexmani_real.deployment.provenance import log_deployment_provenance, sha256_file
 
@@ -65,6 +70,21 @@ def main() -> int:
     assert snap[ENDPOINTS_PUBLISHED] == 0, "flush must reset counters"
     assert snap[COMMAND_SILENCE_ABORT] == 0
     assert snap[INFERENCE_MS] == 3.5, "flush must keep gauges"
+
+    # ── per-operation reject attribution (§10 D5) ──
+    assert reject_counter_name(None) == SAFETY_REJECTIONS
+    assert (
+        reject_counter_name("arm joint limit violation")
+        == "safety_reject_arm_joint_limit_violation"
+    )
+    assert reject_counter_name("workspace") == "safety_reject_workspace"
+    assert HAND_PREFLIGHT_REJECTIONS == "hand_preflight_rejections"
+    m2 = Metrics()
+    m2.increment(reject_counter_name("workspace"))
+    m2.increment(HAND_PREFLIGHT_REJECTIONS)
+    snap2 = m2.snapshot()
+    assert snap2["safety_reject_workspace"] == 1
+    assert snap2[HAND_PREFLIGHT_REJECTIONS] == 1
 
     # ── flush_every throttling ──
     old = time.monotonic_ns() - 2_000_000_000  # 2 s ago

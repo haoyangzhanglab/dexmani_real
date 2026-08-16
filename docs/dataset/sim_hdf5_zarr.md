@@ -17,9 +17,10 @@
 | 查 Zarr array、chunk 和 episode 边界 | 7 |
 | 查现存数据规模和已定位问题 | 8、10 |
 | 实现防御性 reader | 11 |
+| 按 Sim/Policy 命名理解 Real v16 字段 | [Real→Sim/Policy 标签映射表](real_to_sim_mapping.md) |
 
 本独立版正文与统一数据字典的
-[`DexMani Sim` 第 11 节](hdf5_episode_schema_v16.md#sim-schema)
+[`DexMani Sim` 第 11 节](hdf5_episode.md#11-dexmani-sim-hdf5zarr-数据格式)
 保持同步。
 
 ---

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,6 +24,7 @@ from dexmani_real.config.defaults import ArmParams, SafetyParams, arm, safety
 from dexmani_real.robot.arm_loop import (
     _advance_mode_drift,
     _compute_command_latency,
+    _decode_joint_state_feedback,
     _parse_arm_action_metadata,
 )
 from dexmani_real.robot.arm_sdk import (
@@ -261,6 +263,44 @@ def _test_arm_state_dict_mode() -> None:
     assert state["mode"] == 6
 
 
+def _test_joint_state_feedback_decode() -> None:
+    qpos = np.arange(7, dtype=np.float64) + 0.1
+    qvel = np.arange(7, dtype=np.float64) + 10.1
+    effort = np.arange(7, dtype=np.float64) + 20.1
+    decoded = _decode_joint_state_feedback(0, [qpos, qvel, effort])
+    for actual, expected in zip(decoded, (qpos, qvel, effort)):
+        np.testing.assert_array_equal(actual, expected)
+        assert actual is not expected, "worker boundary must copy SDK arrays"
+
+    malformed = (
+        (1, [qpos, qvel, effort]),
+        (0, [qpos, qvel]),
+        (0, [qpos[:6], qvel, effort]),
+        (0, [qpos, qvel, np.full(7, np.nan)]),
+    )
+    for code, states in malformed:
+        try:
+            _decode_joint_state_feedback(code, states)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("incomplete/non-finite position, velocity, or effort must fail")
+
+
+def _test_startup_feedback_source_structural() -> None:
+    import dexmani_real.robot.arm_loop as arm_loop_mod
+
+    source = Path(arm_loop_mod.__file__).read_text()
+    startup = source[source.index("_STATE_READ_MAX_RETRIES = 10") : source.index("last_target = last_qpos.copy()")]
+    assert "get_joint_states(is_radian=True, num=3)" in startup
+    assert "_decode_joint_state_feedback" in startup
+    initial_publish = source[
+        source.index("# Publish initial state BEFORE arm_ready") : source.index('shared.set_ready("arm")')
+    ]
+    assert '_frame["qvel"][0] = initial_qvel' in initial_publish
+    assert '_frame["tau"][0] = initial_effort' in initial_publish
+
+
 def main() -> int:
     _test_speed_acc_config_bounds()
     _test_dynamics_intersection()
@@ -270,6 +310,8 @@ def main() -> int:
     _test_parse_metadata_clamp()
     _test_mode_drift()
     _test_arm_state_dict_mode()
+    _test_joint_state_feedback_decode()
+    _test_startup_feedback_source_structural()
     print("check_arm_config_identity_metrics: PASS")
     return 0
 

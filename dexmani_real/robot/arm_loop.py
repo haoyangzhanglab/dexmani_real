@@ -103,21 +103,13 @@ def _take_next_current_arm_action(
 
 
 def _decode_joint_state_feedback(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Validate one xArm feedback response at the worker boundary."""
+    """Validate position, velocity, and SDK effort at the worker boundary."""
     _require_sdk_ok("get_joint_states", code)
-    if not isinstance(states, (list, tuple)) or not states:
-        raise RuntimeError("get_joint_states returned no joint state")
-    qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
-    qvel = (
-        np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
-        if len(states) > 1
-        else np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
-    )
-    tau = (
-        np.asarray(states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
-        if len(states) > 2
-        else np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
-    )
+    if not isinstance(states, (list, tuple)) or len(states) < 3:
+        raise RuntimeError("get_joint_states(num=3) must return position, velocity, and effort")
+    qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
+    qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
+    tau = np.asarray(states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     for name, value in (("qpos", qpos), ("qvel", qvel), ("tau", tau)):
         if value.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(value)):
             raise RuntimeError(
@@ -559,18 +551,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _STATE_READ_MAX_RETRIES = 10
     for _attempt in range(_STATE_READ_MAX_RETRIES):
         try:
-            code, states = arm.get_joint_states(is_radian=True, num=1)
-            if code == 0 and len(states) > 0:
-                last_qpos = np.asarray(states[0], dtype=np.float64)[
-                    : ARM_JOINT_SHAPE[0]
-                ].copy()
-                break
-            logger.warning(
-                "arm_loop: initial joint state read attempt %d/%d: code=%d",
-                _attempt + 1,
-                _STATE_READ_MAX_RETRIES,
-                code,
+            code, states = arm.get_joint_states(is_radian=True, num=3)
+            last_qpos, initial_qvel, initial_effort = _decode_joint_state_feedback(
+                code, states
             )
+            break
         except Exception:
             logger.warning(
                 "arm_loop: initial joint state read attempt %d/%d raised exception",
@@ -628,8 +613,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         return
     _frame = new_frame(ARM_STATE_DTYPE)
     _frame["qpos"][0] = last_qpos
-    _frame["qvel"][0] = np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
-    _frame["tau"][0] = np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
+    _frame["qvel"][0] = initial_qvel
+    # Legacy field name: SDK current-estimated effort, precise SI unit unverified.
+    _frame["tau"][0] = initial_effort
     _frame["eef_pos"][0] = eef_pos_init
     _frame["eef_rot6d"][0] = eef_rot6d_init
     _frame["error_code"][0] = 0

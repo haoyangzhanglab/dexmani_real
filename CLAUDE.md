@@ -215,6 +215,10 @@ aligned samples → RecorderIO → temporary episode + stream verification
 - HDF5 schema v16 is the only runtime episode format. Readers, visualization, and replay
   accept only a published v16 directory; migrate historical data outside the
   runtime before using it.
+- `recording/episode_schema.py` is the shared v16 data-layout authority: 96
+  unconditional datasets plus `action_arm_joint_sent` iff
+  `meta.arm_sent_stream=True`. Writer source/flush/finalize and reader validity
+  must reuse it rather than maintaining local key lists.
 - Recorder control and the shared sample payload are fixed NumPy dtypes. The
   START boundary snapshots only task/operator and essential device/calibration
   metadata plus the required resolved-config SHA-256; per-grid fields are typed

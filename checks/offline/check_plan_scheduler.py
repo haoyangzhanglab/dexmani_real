@@ -6,8 +6,7 @@ Locks the coordinator's correctness guarantees without hardware:
     publishes nothing when no step is due yet (§76/§77), skipping invalid steps.
   - ``_adoptable`` drops stale-generation / stale-observation / expired / malformed
     plans (§75).
-  - the first optional hand-delta reference is seeded from healthy measured
-    feedback; the shared publication boundary owns the coupled preflight (§74).
+  - the shared publication boundary owns the coupled hand preflight (§74).
   - ``_abort_policy_run`` advances the generation and drops RUNNING -> ARMED
     (policy-semantic failure, not a hardware FAULT) (§80.2/§82).
 
@@ -26,8 +25,9 @@ from queue import Empty
 import numpy as np
 
 import _bootstrap  # noqa: F401  (repo root on sys.path)
-from _fakes import make_arm_state_frame, make_hand_state_frame
+from _fakes import make_arm_state_frame
 
+from dexmani_real.config.defaults import WorkspaceBounds
 from dexmani_real.config.defaults import arm as arm_defaults
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.deployment.config import DeploymentConfig
@@ -35,7 +35,6 @@ from dexmani_real.deployment.coordinator import (
     CoordinatorConfig,
     _abort_policy_run,
     _adoptable,
-    _seed_hand_reference,
     _select_due_step,
     coordinator_loop,
 )
@@ -44,15 +43,8 @@ from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS, POLICY_PLAN_DTYPE
 
 
-def _mid(low: tuple[float, ...], high: tuple[float, ...]) -> np.ndarray:
-    lo = np.asarray(low, dtype=np.float64)
-    hi = np.asarray(high, dtype=np.float64)
-    return (lo + hi) / 2.0
-
-
 def _coordinator_config(
     *,
-    hand_max_delta_rad: float | None = None,
     control_hz: float = 16.0,
     **deployment_overrides,
 ) -> CoordinatorConfig:
@@ -60,13 +52,11 @@ def _coordinator_config(
         deployment=DeploymentConfig(**deployment_overrides),
         arm_joint_lower_rad=arm_defaults.joint_limit_lower,
         arm_joint_upper_rad=arm_defaults.joint_limit_upper,
+        workspace_bounds=WorkspaceBounds().as_tuple(),
         hand_joint_lower_rad=hand_defaults.qpos_min_rad,
         hand_joint_upper_rad=hand_defaults.qpos_max_rad,
         hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
         hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
-        hand_max_delta_rad=(
-            hand_defaults.max_delta_rad if hand_max_delta_rad is None else hand_max_delta_rad
-        ),
         hand_feedback_max_age_s=1.0,
         control_hz=control_hz,
     )
@@ -125,14 +115,14 @@ def _adopt_args(**overrides) -> dict:
     return args
 
 
-def _test_end_to_end_publish(arm_mid: np.ndarray) -> None:
+def _test_end_to_end_publish(arm_good: np.ndarray) -> None:
     shared = SharedStorage.create(prefix="check_plan_scheduler_e2e")
     try:
         assert transition(shared, SafetyState.ARMED)
-        shared.arm_state_ring.write(make_arm_state_frame(arm_mid))
+        shared.arm_state_ring.write(make_arm_state_frame(arm_good))
 
         n = 4
-        arm_steps = arm_mid[None, :] + np.arange(n, dtype=np.float64)[:, None] * 0.001
+        arm_steps = arm_good[None, :] + np.arange(n, dtype=np.float64)[:, None] * 0.001
         target = np.asarray(time.monotonic_ns() - 1_000_000, dtype=np.uint64) + (
             np.arange(n, dtype=np.uint64) * np.uint64(1000)
         )
@@ -150,7 +140,12 @@ def _test_end_to_end_publish(arm_mid: np.ndarray) -> None:
         shared.policy_plan_ring.write(plan)
 
         thread = threading.Thread(
-            target=coordinator_loop, args=(shared, _coordinator_config()), daemon=True
+            target=coordinator_loop,
+            args=(
+                shared,
+                _coordinator_config(max_plan_age_s=30.0, max_observation_age_s=30.0),
+            ),
+            daemon=True,
         )
         thread.start()
         try:
@@ -176,11 +171,11 @@ def _test_end_to_end_publish(arm_mid: np.ndarray) -> None:
         shared.close()
 
 
-def _test_silence_abort(arm_mid: np.ndarray) -> None:
+def _test_silence_abort(arm_good: np.ndarray) -> None:
     shared = SharedStorage.create(prefix="check_plan_scheduler_silence")
     try:
         assert transition(shared, SafetyState.ARMED)
-        shared.arm_state_ring.write(make_arm_state_frame(arm_mid))
+        shared.arm_state_ring.write(make_arm_state_frame(arm_good))
 
         # Publish exactly one command (generation 2, single due step), then go
         # silent: the command-to-command silence watchdog must drop to ARMED.
@@ -188,13 +183,18 @@ def _test_silence_abort(arm_mid: np.ndarray) -> None:
             run_generation=2,
             observation_id=1,
             num_steps=1,
-            arm_qpos=arm_mid[None, :],
+            arm_qpos=arm_good[None, :],
             target_ns=np.asarray([time.monotonic_ns() - 1_000_000], dtype=np.uint64),
             hand_present=0,
         )
         shared.policy_plan_ring.write(plan)
 
-        cfg = _coordinator_config(max_command_silence_s=0.05, control_hz=100.0)
+        cfg = _coordinator_config(
+            max_command_silence_s=0.05,
+            control_hz=100.0,
+            max_plan_age_s=30.0,
+            max_observation_age_s=30.0,
+        )
         thread = threading.Thread(target=coordinator_loop, args=(shared, cfg), daemon=True)
         thread.start()
         try:
@@ -220,8 +220,10 @@ def _test_silence_abort(arm_mid: np.ndarray) -> None:
 
 
 def main() -> int:
-    arm_mid = _mid(arm_defaults.joint_limit_lower, arm_defaults.joint_limit_upper)
-    hand_mid = _mid(hand_defaults.qpos_min_rad, hand_defaults.qpos_max_rad)
+    # A fixed workspace-interior arm pose (EEF ≈ [0.48, 0.0, 0.29] m in the
+    # arm-base frame) so the coordinator's planner workspace gate (D2) accepts
+    # the endpoints this check publishes.
+    arm_good = np.array([0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.0], dtype=np.float64)
 
     # ── scheduler: coalesce / no-due / valid_mask skip ──
     target = np.array([100, 200, 300, 400], dtype=np.uint64)
@@ -269,23 +271,9 @@ def main() -> int:
     finally:
         shared.close()
 
-    # ── hand-delta reference seeding ──
-    shared2 = SharedStorage.create(prefix="check_plan_scheduler_seed")
-    try:
-        shared2.hand_state_ring.write(make_hand_state_frame(hand_mid))
-        seed = _seed_hand_reference(shared2, hand_feedback_max_age_s=1.0)
-        assert seed is not None, "valid hand feedback must seed the reference"
-        np.testing.assert_allclose(seed, hand_mid)
-        shared2.hand_state_ring.write(make_hand_state_frame(hand_mid, send_healthy=0))
-        assert (
-            _seed_hand_reference(shared2, hand_feedback_max_age_s=1.0) is None
-        ), "unhealthy command I/O must not seed"
-    finally:
-        shared2.close()
-
     # ── end-to-end wiring ──
-    _test_end_to_end_publish(arm_mid)
-    _test_silence_abort(arm_mid)
+    _test_end_to_end_publish(arm_good)
+    _test_silence_abort(arm_good)
 
     print("check_plan_scheduler: PASS")
     return 0

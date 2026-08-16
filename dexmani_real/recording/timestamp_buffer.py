@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -20,6 +20,10 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 __all__ = ["BufferAddResult", "FillReason", "TimestampAlignedBuffer"]
+
+_INTERNAL_DATASET_NAMES = frozenset(
+    {"flag_sample_valid", "source_sample_index", "source_timestamp", "fill_reason"}
+)
 
 
 class FillReason(IntEnum):
@@ -179,7 +183,11 @@ class TimestampAlignedBuffer:
                 raise ValueError("re-anchor timestamp must be newer than the previous stored slot")
         self.start_time = timestamp - self._next_global_idx * self.dt
 
-    def add(self, data: dict[str, np.ndarray | float | int], timestamp: float) -> BufferAddResult:
+    def add(
+        self,
+        data: Mapping[str, np.ndarray | np.generic | float | int],
+        timestamp: float,
+    ) -> BufferAddResult:
         """Add one multi-stream data point at the first causal grid deadline.
 
         On the first call the buffer allocates arrays based on the keys, shapes,
@@ -188,6 +196,11 @@ class TimestampAlignedBuffer:
         previous_size = self._size
         if self._recording_stopped:
             return BufferAddResult(previous_size, self._size, False, True)
+
+        # Validate before advancing source/grid indices so a malformed frame
+        # cannot partially mutate buffer state. The first accepted layout is
+        # the contract for every subsequent call.
+        self._validate_input_layout(data)
 
         source_index = self._next_source_index
         self._next_source_index += 1
@@ -283,7 +296,60 @@ class TimestampAlignedBuffer:
 
     # -- internal helpers -----------------------------------------------------
 
-    def _allocate(self, data: dict[str, Any]) -> None:
+    @staticmethod
+    def _field_layout(key: str, value: Any) -> tuple[tuple[int, ...], np.dtype[Any]]:
+        if isinstance(value, np.ndarray):
+            return value.shape, value.dtype
+        if isinstance(value, (float, int, np.generic)):
+            scalar = np.asarray(value)
+            return scalar.shape, scalar.dtype
+        raise TypeError(
+            f"TimestampAlignedBuffer field {key!r} must be a numpy array or numeric scalar, "
+            f"got {type(value).__name__}"
+        )
+
+    def _validate_input_layout(self, data: Mapping[str, Any]) -> None:
+        """Require stable source keys, shapes, and dtypes across ``add`` calls."""
+
+        reserved = sorted(set(data) & _INTERNAL_DATASET_NAMES)
+        if reserved:
+            raise ValueError(
+                f"TimestampAlignedBuffer input collides with internal fields: {reserved}"
+            )
+
+        actual_layout = {
+            key: self._field_layout(key, value) for key, value in data.items()
+        }
+        if self._data_buffer is None:
+            return
+
+        expected_keys = set(self._data_buffer) - _INTERNAL_DATASET_NAMES
+        actual_keys = set(actual_layout)
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        if missing or unexpected:
+            raise ValueError(
+                "TimestampAlignedBuffer field keys differ from the initial layout: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
+        for key in sorted(expected_keys):
+            actual_shape, actual_dtype = actual_layout[key]
+            target = self._data_buffer[key]
+            expected_shape = target.shape[1:]
+            expected_dtype = target.dtype
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"TimestampAlignedBuffer field {key!r} shape {actual_shape} "
+                    f"does not match initial shape {expected_shape}"
+                )
+            if actual_dtype != expected_dtype:
+                raise ValueError(
+                    f"TimestampAlignedBuffer field {key!r} dtype {actual_dtype} "
+                    f"does not match initial dtype {expected_dtype}"
+                )
+
+    def _allocate(self, data: Mapping[str, Any]) -> None:
         """Pre-allocate numpy arrays based on the shape/dtype of each field."""
         self._data_buffer = {}
         for key, value in data.items():
@@ -293,16 +359,21 @@ class TimestampAlignedBuffer:
                     self._data_buffer[key] = np.full(shape, np.nan, dtype=value.dtype)
                 else:
                     self._data_buffer[key] = np.zeros(shape, dtype=value.dtype)
-            elif isinstance(value, (float, int)):
-                if isinstance(value, float):
-                    self._data_buffer[key] = np.full(self.max_record_steps, np.nan, dtype=np.float64)
+            elif isinstance(value, (float, int, np.generic)):
+                scalar = np.asarray(value)
+                if np.issubdtype(scalar.dtype, np.floating):
+                    self._data_buffer[key] = np.full(
+                        self.max_record_steps, np.nan, dtype=scalar.dtype
+                    )
                 else:
-                    self._data_buffer[key] = np.zeros(self.max_record_steps, dtype=type(value))
+                    self._data_buffer[key] = np.zeros(
+                        self.max_record_steps, dtype=scalar.dtype
+                    )
             else:
-                logger.warning(
-                    "TimestampAlignedBuffer: skipping key=%r (unsupported type %s)",
-                    key,
-                    type(value).__name__,
+                # ``_validate_input_layout`` runs immediately before allocation.
+                raise TypeError(
+                    f"TimestampAlignedBuffer field {key!r} has unsupported type "
+                    f"{type(value).__name__}"
                 )
 
         self._data_buffer["flag_sample_valid"] = np.zeros(self.max_record_steps, dtype=bool)

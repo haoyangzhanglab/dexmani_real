@@ -1,6 +1,8 @@
 """Hand servo process — reads hand_cmd_ring, servos XHand, writes hand state and tactile rings.
 
-Every successful device read publishes tactile data, including release/no-contact;
+Every device-read result publishes a tactile frame: complete sensor payloads
+are fresh, while malformed/missing payloads immediately publish fresh=0 and
+calibrated=0 so consumers never keep treating an older tactile frame as valid.
 hand_state_ring publishes every tick and marks failed reads invalid.
 Error recovery: three independent counters for send failures, board error states,
 and read exceptions — each escalates to global error_state on persistent failure.
@@ -53,7 +55,6 @@ class HandProcessConfig:
     qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.qpos_max_rad)
     mechanical_qpos_lower_rad: tuple[float, ...] = field(default_factory=lambda: hand.mechanical_qpos_min_rad)
     mechanical_qpos_upper_rad: tuple[float, ...] = field(default_factory=lambda: hand.mechanical_qpos_max_rad)
-    max_command_delta_rad: float | None = field(default_factory=lambda: hand.max_delta_rad)
 
     # Servo gains (PID) and per-joint current limit, resolved from the
     # immutable runtime config (defaults + file/CLI overrides). ``kp`` and
@@ -107,10 +108,6 @@ class HandProcessConfig:
         )
         if np.any(home < lower - 1e-12) or np.any(home > upper + 1e-12):
             raise ValueError("hand process home must be inside command limits")
-        if self.max_command_delta_rad is not None and (
-            not np.isfinite(self.max_command_delta_rad) or self.max_command_delta_rad <= 0.0
-        ):
-            raise ValueError("hand process max command delta must be finite and positive")
         if len(self.kp) != HAND_JOINT_SHAPE[0] or any(
             not isinstance(value, int) or value <= 0 for value in self.kp
         ):
@@ -142,7 +139,6 @@ class HandProcessConfig:
             qpos_upper_rad=tuple(float(value) for value in cfg.qpos_max_rad),
             mechanical_qpos_lower_rad=tuple(float(value) for value in cfg.mechanical_qpos_min_rad),
             mechanical_qpos_upper_rad=tuple(float(value) for value in cfg.mechanical_qpos_max_rad),
-            max_command_delta_rad=None if cfg.max_delta_rad is None else float(cfg.max_delta_rad),
             kp=tuple(int(value) for value in cfg.kp),
             ki=int(cfg.ki),
             kd=int(cfg.kd),
@@ -195,6 +191,31 @@ def _log_board_error_transitions(
     return {name: current[name].copy() for name in previous}
 
 
+def _build_tactile_frame(
+    tactile_force: np.ndarray,
+    *,
+    source_monotonic_ns: int,
+    valid: bool,
+    calibrated: bool,
+) -> np.ndarray:
+    """Build one tactile publication, explicitly invalidating bad payloads."""
+    frame = np.zeros(1, dtype=HAND_TACTILE_DTYPE)
+    if valid:
+        force = np.asarray(tactile_force, dtype=np.float64)
+        if force.shape != HAND_TACTILE_FORCE_SHAPE or not np.all(np.isfinite(force)):
+            raise ValueError(
+                "valid tactile_force must be finite with shape "
+                f"{HAND_TACTILE_FORCE_SHAPE}"
+            )
+        frame["tactile_force"][0] = force
+    frame["source_monotonic_ns"][0] = max(0, int(source_monotonic_ns))
+    frame["fresh"][0] = int(valid)
+    frame["calibrated"][0] = int(valid and calibrated)
+    # SDK conversion provenance has not been independently established.
+    frame["unit_code"][0] = 0
+    return frame
+
+
 def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
     """Hand process entry point — reads shared.hand_cmd_ring, servos hand.
 
@@ -238,7 +259,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     qpos_max=np.asarray(cfg.qpos_upper_rad, dtype=np.float64),
                     mechanical_qpos_min=np.asarray(cfg.mechanical_qpos_lower_rad, dtype=np.float64),
                     mechanical_qpos_max=np.asarray(cfg.mechanical_qpos_upper_rad, dtype=np.float64),
-                    max_delta_rad=cfg.max_command_delta_rad,
                 )
             )
             if not hand.connect():
@@ -287,6 +307,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 "tactile_sum": st.tactile_sum,
                 "tactile_contact": st.tactile_contact,
             }
+            _initial_tactile_valid = bool(st.tactile_valid)
             if not bool(hand.connected_flag):
                 raise RuntimeError("initial hand feedback reports a disconnected device")
             if bool(hand.error_state):
@@ -325,6 +346,14 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _frame0["read_healthy"][0] = 1
         _frame0["timestamp"][0] = _initial_source_ns / 1e9
         shared.hand_state_ring.write(_frame0)
+        shared.hand_tactile_ring.write(
+            _build_tactile_frame(
+                st.tactile_force,
+                source_monotonic_ns=_initial_source_ns,
+                valid=_initial_tactile_valid,
+                calibrated=bool(hand.tactile_calibrated),
+            )
+        )
 
         # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
         # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
@@ -370,8 +399,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 qpos_upper_rad=np.asarray(cfg.qpos_upper_rad, dtype=np.float64),
                 mechanical_lower_rad=np.asarray(cfg.mechanical_qpos_lower_rad, dtype=np.float64),
                 mechanical_upper_rad=np.asarray(cfg.mechanical_qpos_upper_rad, dtype=np.float64),
-                previous_qpos_cmd=np.asarray(hand.last_qpos_cmd, dtype=np.float64),
-                max_command_delta_rad=cfg.max_command_delta_rad,
                 expected_run_generation=int(shared.run_generation.value),
                 now_monotonic_ns=time.monotonic_ns(),
             ):
@@ -421,6 +448,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 tactile_sum = st.tactile_sum
                 tactile_force = st.tactile_force
                 tactile_contact = st.tactile_contact
+                tactile_valid = bool(st.tactile_valid)
                 connected = hand.connected_flag
                 error_state = hand.error_state
                 _last_state_source_ns = time.monotonic_ns()
@@ -447,6 +475,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 tactile_sum = _last_tactile_sum.copy()
                 tactile_force = _last_tactile_force.copy()
                 tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
+                tactile_valid = False
                 connected = False
                 error_state = False  # transient comm glitch — do NOT fabricate error_state
                 commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
@@ -501,18 +530,16 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             frame["timestamp"][0] = _last_state_source_ns / 1e9
             shared.hand_state_ring.write(frame)
 
-            # Every successful read is a source sample, including release/no-contact.
-            if connected:
-                tf = _nf(HAND_TACTILE_DTYPE)
-                tf["tactile_force"][0] = tactile_force
-                tf["source_monotonic_ns"][0] = _last_state_source_ns
-                tf["fresh"][0] = 1
-                tf["calibrated"][0] = int(hand.tactile_calibrated)
-                # The SDK conversion provenance has not been independently
-                # established on hardware.  Preserve the values, but label their
-                # unit as unknown instead of guessing Newtons.
-                tf["unit_code"][0] = 0
-                shared.hand_tactile_ring.write(tf)
+            # Explicitly invalidate malformed tactile or failed reads so an
+            # older valid ring entry cannot masquerade as current data.
+            shared.hand_tactile_ring.write(
+                _build_tactile_frame(
+                    tactile_force,
+                    source_monotonic_ns=_last_state_source_ns,
+                    valid=bool(connected and tactile_valid),
+                    calibrated=bool(hand.tactile_calibrated),
+                )
+            )
 
             # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
             rate_mgr.wait()

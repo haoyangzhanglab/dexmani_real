@@ -119,7 +119,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     from dexmani_real.config import defaults
 
     def rebuild(template: Any, raw: Any, path: str, annotation: Any | None = None) -> Any:
-        if raw is None and path in {"hand.max_delta_rad", "environment.table.plane_path"}:
+        if raw is None and path in {"environment.table.plane_path"}:
             return None
         if dataclasses.is_dataclass(template):
             if not isinstance(raw, Mapping):

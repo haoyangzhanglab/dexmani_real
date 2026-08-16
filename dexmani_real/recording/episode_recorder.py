@@ -25,18 +25,27 @@ import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import camera
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.camera_stream_writer import CameraStreamWriter, CameraStreamWriterConfig
+from dexmani_real.recording.episode_schema import (
+    ARM_SENT_DATASET,
+    ARM_SENT_MARKER,
+    EPISODE_SCHEMA_VERSION,
+    SEMANTIC_META_ATTRS_V16,
+    normalize_diagnostics_v16,
+    validate_data_layout_v16,
+    validate_source_frame_keys_v16,
+)
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.recording.video_codec import VideoDecoder
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = EPISODE_SCHEMA_VERSION
 _CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
 _PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
 _PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
@@ -291,10 +300,15 @@ class EpisodeRecorder:
         for key, value in sorted(self._provenance.items()):
             meta.attrs[f"provenance_{key}"] = str(value)
 
-        # Opt-in schema v9 marker — written only when enabled so the default
-        # v8 file keeps its exact meta layout.
+        # Additive, self-describing semantics for fields whose numeric layout
+        # remains unchanged in v16. Historical readers may ignore these attrs.
+        for key, semantic_value in SEMANTIC_META_ATTRS_V16.items():
+            meta.attrs[key] = semantic_value
+
+        # The conditional sent-command dataset and this marker must agree.
+        # The marker remains absent when the optional v16 stream is disabled.
         if self.arm_sent_stream:
-            meta.attrs["arm_sent_stream"] = True
+            meta.attrs[ARM_SENT_MARKER] = True
 
         self._write_camera_meta_attrs(meta)
 
@@ -384,6 +398,7 @@ class EpisodeRecorder:
 
         # ── Non-camera streams → record-time aligned buffer ──
         sig = signals or {}
+        diagnostic_values = normalize_diagnostics_v16(diagnostics)
 
         ts = float(state.timestamp)
         run_generation = int(control_run_generation)
@@ -531,23 +546,26 @@ class EpisodeRecorder:
             "transition_check_time_ms": np.nan,
             "policy_compute_time_ms": np.nan,
         }
-        # ── Opt-in sent-command stream (schema v9) ──
+        # ── Conditional sent-command stream (schema v16) ──
         # None (kwarg unset) → NaN placeholder for this source sample; causal
         # alignment may only hold it into later slots, never backward-fill an
         # earlier slot. Gated on the constructor flag so
-        # an accidental kwarg can never add a dataset to a default (v8) recording.
+        # an accidental kwarg can never add a dataset when the stream is disabled.
         if self.arm_sent_stream:
             sent = (
                 np.asarray(arm_qpos_sent, dtype=np.float64)
                 if arm_qpos_sent is not None
                 else np.full(ARM_JOINT_SHAPE, np.nan)
             )
-            data["action_arm_joint_sent"] = sent
+            data[ARM_SENT_DATASET] = sent
 
-        # ── Diagnostics: caller values override the schema defaults above ──
-        if diagnostics:
-            for key, val in diagnostics.items():
-                data[key] = np.asarray(val, dtype=np.float64)
+        # Diagnostics are fixed-schema value overrides, never an extension
+        # mechanism. ``normalize_diagnostics_v16`` rejects unknown keys,
+        # reserved-field collisions, and incorrect tail shapes.
+        data.update(diagnostic_values)
+        source_layout_errors = validate_source_frame_keys_v16(set(data), arm_sent_stream=self.arm_sent_stream)
+        if source_layout_errors:
+            raise RuntimeError("schema-v16 source frame mismatch: " + "; ".join(source_layout_errors))
 
         add_result = self._buffer.add(data, timestamp=ts)
         if add_result.source_written:
@@ -684,6 +702,22 @@ class EpisodeRecorder:
         buf_data = self._buffer.data
         buf_size = self._buffer.size
         new_start = self._flushed_frames
+
+        # Validate the complete in-memory schema before creating or extending
+        # any HDF5 dataset. Timestamp is stored outside ``buf_data`` but belongs
+        # to the same 96/97-field contract.
+        buffer_shapes = {name: tuple(values.shape) for name, values in buf_data.items()}
+        buffer_dtypes = {name: values.dtype for name, values in buf_data.items()}
+        buffer_shapes["timestamp"] = tuple(self._buffer.timestamps.shape)
+        buffer_dtypes["timestamp"] = self._buffer.timestamps.dtype
+        layout_errors = validate_data_layout_v16(
+            buffer_shapes,
+            buffer_dtypes,
+            frame_count=buf_size,
+            arm_sent_stream=self.arm_sent_stream,
+        )
+        if layout_errors:
+            raise RuntimeError("schema-v16 recorder buffer mismatch: " + "; ".join(layout_errors))
 
         for h5_key, arr in buf_data.items():
             if h5_key not in self._datasets:
@@ -1022,10 +1056,24 @@ class EpisodeRecorder:
             meta = data_h5.get("meta")
             if meta is None or int(meta.attrs.get("num_frames", -1)) != expected_frames:
                 raise RuntimeError("data.h5 frame count metadata mismatch")
-            for key, dataset in data_h5.items():
-                if key != "meta" and isinstance(dataset, h5py.Dataset) and dataset.ndim >= 1:
-                    if int(dataset.shape[0]) != expected_frames:
-                        raise RuntimeError(f"data.h5 dataset {key!r} length mismatch")
+            dataset_shapes = {
+                key: tuple(dataset.shape)
+                for key, dataset in data_h5.items()
+                if isinstance(dataset, h5py.Dataset)
+            }
+            dataset_dtypes = {
+                key: dataset.dtype
+                for key, dataset in data_h5.items()
+                if isinstance(dataset, h5py.Dataset)
+            }
+            layout_errors = validate_data_layout_v16(
+                dataset_shapes,
+                dataset_dtypes,
+                frame_count=expected_frames,
+                arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
+            )
+            if layout_errors:
+                raise RuntimeError("data.h5 schema-v16 layout mismatch: " + "; ".join(layout_errors))
         for key in ("depth", "pointcloud"):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:

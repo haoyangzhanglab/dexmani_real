@@ -362,7 +362,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     logger.debug("teleop_loop: LOADING")
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
-    arm_cmd_max_step_rad = float(np.deg2rad(cfg.runtime.arm.max_joint_velocity_deg_per_s)) * ctrl_dt
     joint_lower_rad = np.asarray(cfg.runtime.arm.joint_limit_lower, dtype=np.float64)
     joint_upper_rad = np.asarray(cfg.runtime.arm.joint_limit_upper, dtype=np.float64)
     hand_home_qpos_rad = np.deg2rad(np.asarray(cfg.runtime.hand.home_qpos_deg, dtype=np.float64))
@@ -1263,15 +1262,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     )
                 continue
 
-            planner.set_hand_qpos(ctx.prev_hand_qpos)  # sync hand pose for collision checks
-            target_pose = Pose(p=target_pos, q=target_quat)
-            _ik_t0 = time.perf_counter()
-            ik_result = planner.solve_teleop_ik(target_pose, arm_qpos, ctx.prev_qpos_cmd)
-            ik_solve_time_ms = (time.perf_counter() - _ik_t0) * 1000.0
-            stage_timer.mark("ik")
-
-            # Compute hand retargeting before IK outcome handling. Hand-only motion
-            # remains allowed on IK failure; the hold arm publishes with well-formedness + joint-limit validation through SafetyGate.
+            # Compute the hand command first so the arm IK collision model sees
+            # the current-frame (post-shaping) hand pose, not the previous
+            # frame's applied command.  Hand-only motion stays independent of
+            # the IK outcome; the hand-only hold below still publishes on IK
+            # failure.
             _hand_retarget_t0 = time.perf_counter()
             hand_cmd, retarget_ok = _compute_hand_command(
                 ctx.hand_retargeter,
@@ -1298,28 +1293,16 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 ctx.hand_ramp_start = None
                 ctx.hand_ramp_step = 0
 
-            # Hand delta clamp (mirrors the arm clamp below): saturate fast
-            # finger motion at max_delta_rad instead of reject-whole, so a
-            # single fast frame cannot latch the action for good.
-            if cfg.runtime.hand.max_delta_rad is not None:
-                hand_cmd = ctx.prev_hand_qpos + np.clip(
-                    hand_cmd - ctx.prev_hand_qpos,
-                    -cfg.runtime.hand.max_delta_rad,
-                    cfg.runtime.hand.max_delta_rad,
-                )
-            # Hand command-floor clip (mirrors the arm limit clip below):
-            # project the command into the operator-set anti-clogging command
-            # box instead of rejecting the whole action; measured feedback is
-            # never clipped here.
+            # Hand command-floor clip: project the command into the
+            # operator-set anti-clogging command box instead of rejecting the
+            # whole action; measured feedback is never clipped here.
             hand_cmd = np.clip(hand_cmd, hand_qpos_lower_rad, hand_qpos_upper_rad)
             hand_cmd_valid = True
             try:
                 hand_cmd = _sanitize_hand_command(
                     hand_cmd,
-                    ctx.prev_hand_qpos,
                     hand_qpos_lower_rad,
                     hand_qpos_upper_rad,
-                    cfg.runtime.hand.max_delta_rad,
                     hand_mechanical_lower_rad,
                     hand_mechanical_upper_rad,
                 )
@@ -1328,6 +1311,13 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_cmd = ctx.prev_hand_qpos.copy()
                 hand_cmd_valid = False
                 retarget_ok = False
+
+            planner.set_hand_qpos(hand_cmd)  # current-frame hand pose for collision checks
+            target_pose = Pose(p=target_pos, q=target_quat)
+            _ik_t0 = time.perf_counter()
+            ik_result = planner.solve_teleop_ik(target_pose, arm_qpos, ctx.prev_qpos_cmd)
+            ik_solve_time_ms = (time.perf_counter() - _ik_t0) * 1000.0
+            stage_timer.mark("ik")
 
             if not ik_result.success or ik_result.qpos is None:
                 # Arm is held; hand motion proceeds independently.
@@ -1343,10 +1333,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                         safety_gate=gate,
-                        previous_hand_qpos=ctx.prev_hand_qpos,
                         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
                         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
-                        hand_max_delta_rad=cfg.runtime.hand.max_delta_rad,
                         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
                     )
                     published_candidate = publish_result.candidate
@@ -1397,12 +1385,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     )
                 continue
 
-            # IK delta clamp
             arm_cmd_raw = np.asarray(ik_result.qpos, dtype=np.float64).copy()
             arm_cmd = arm_cmd_raw.copy()
-            arm_cmd = ctx.prev_qpos_cmd + np.clip(arm_cmd - ctx.prev_qpos_cmd, -arm_cmd_max_step_rad, arm_cmd_max_step_rad)
 
             # Keep IK output inside the firmware-accepted joint limits.
+            # Velocity/acceleration smoothing is Mode 6 firmware's job; the
+            # application-layer delta clip was removed (D1 resolved).
             arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
             # Pre-flight checks specific to teleop command assembly. Joint
@@ -1465,10 +1453,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 observation_id=int(vr_frame["ring_sequence"]),
                 observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                 safety_gate=gate,
-                previous_hand_qpos=ctx.prev_hand_qpos,
                 hand_mechanical_lower_rad=hand_mechanical_lower_rad,
                 hand_mechanical_upper_rad=hand_mechanical_upper_rad,
-                hand_max_delta_rad=cfg.runtime.hand.max_delta_rad,
                 hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
             )
             published_candidate = publish_result.candidate
@@ -1655,10 +1641,8 @@ def _safe_joint_publish(
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     safety_gate: SafetyGate | None = None,
-    previous_hand_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
-    hand_max_delta_rad: float | np.ndarray | None = None,
     hand_feedback_max_age_s: float,
 ) -> CommandPublishResult:
     """Validate through SafetyGate and publish via fire-and-forget send_command."""
@@ -1688,10 +1672,8 @@ def _safe_joint_publish(
         gate=gate,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
         prepare_timeout_s=timeout,
-        previous_hand_qpos=previous_hand_qpos,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
-        hand_max_delta_rad=hand_max_delta_rad,
     )
 
 

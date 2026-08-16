@@ -1,10 +1,10 @@
-"""A14: perception config contract — desk-plane single source + align fail-closed.
+"""A14: perception config contract — desk-plane source + align fail-closed.
 
 Asserts ``CameraLoopConfig.from_runtime`` consumes the resolved
 ``environment.table.plane_abcd`` as the single desk-plane source (disabled
 table → no desk removal), the production align default is ``depth_to_color``,
-and ``camera_loop`` fails closed on ``align_mode="none"`` before touching
-shared state or the camera SDK.
+and both Camera/RecorderIO production boundaries reject any alignment other
+than ``depth_to_color`` before touching shared state or the camera SDK.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 
 from dexmani_real.config.defaults import camera, policy
+from dexmani_real.recording.io_process import RecorderIOConfig
 from dexmani_real.sensor.camera_process import CameraLoopConfig, camera_loop
 
 
@@ -47,9 +48,32 @@ def main() -> int:
     cfg_off = CameraLoopConfig.from_runtime(_runtime(enabled=False))
     assert cfg_off.desk_plane is None, cfg_off.desk_plane
 
-    # align_mode="none" is the dangerous value: production pointcloud requires
-    # aligned streams, so camera_loop must exit before connecting.
-    camera_loop(_Boom(), CameraLoopConfig(align_mode="none"))  # must not raise
+    # Production calibration is in the color optical frame. Both an unaligned
+    # stream and color aligned to depth must fail before camera SDK access.
+    for unsafe_mode in ("color_to_depth", "none"):
+        camera_loop(_Boom(), CameraLoopConfig(align_mode=unsafe_mode))  # type: ignore[arg-type]
+        try:
+            RecorderIOConfig(
+                data_dir="unused",
+                max_frames=16,
+                control_hz=16.0,
+                min_frames=1,
+                resolved_config_sha256="0" * 64,
+                align_mode=unsafe_mode,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"RecorderIO accepted unsafe align_mode={unsafe_mode!r}")
+
+    RecorderIOConfig(
+        data_dir="unused",
+        max_frames=16,
+        control_hz=16.0,
+        min_frames=1,
+        resolved_config_sha256="0" * 64,
+        align_mode="depth_to_color",
+    )
 
     print("check_perception_contract: PASS")
     return 0

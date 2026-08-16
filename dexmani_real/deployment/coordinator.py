@@ -17,27 +17,30 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real import ASSET_DIR
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.metrics import (
     COMMAND_SILENCE_ABORT,
     ENDPOINTS_COALESCED,
     ENDPOINTS_DUE,
     ENDPOINTS_PUBLISHED,
+    HAND_PREFLIGHT_REJECTIONS,
     POLICY_ABORTS,
     SAFETY_REJECTIONS,
     Metrics,
     flush_every,
+    reject_counter_name,
 )
+from dexmani_real.planning import XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.policy.safety import (
     CommandPublishStatus,
-    SafetyGate,
     advance_run_generation,
     build_action_candidate,
+    planner_action_safety_gate,
     validate_and_send_candidate,
 )
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import SharedStorage
-from dexmani_real.utils.hand_health import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS
 
@@ -56,11 +59,11 @@ class CoordinatorConfig:
     deployment: DeploymentConfig
     arm_joint_lower_rad: tuple[float, ...]
     arm_joint_upper_rad: tuple[float, ...]
+    workspace_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
     hand_joint_lower_rad: tuple[float, ...]
     hand_joint_upper_rad: tuple[float, ...]
     hand_mechanical_lower_rad: tuple[float, ...]
     hand_mechanical_upper_rad: tuple[float, ...]
-    hand_max_delta_rad: float | None
     hand_feedback_max_age_s: float
     control_hz: float
 
@@ -70,11 +73,11 @@ class CoordinatorConfig:
             deployment=deployment,
             arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
             arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+            workspace_bounds=runtime.policy.workspace.as_tuple(),
             hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
             hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
             hand_mechanical_lower_rad=tuple(runtime.hand.mechanical_qpos_min_rad),
             hand_mechanical_upper_rad=tuple(runtime.hand.mechanical_qpos_max_rad),
-            hand_max_delta_rad=runtime.hand.max_delta_rad,
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
         )
@@ -147,36 +150,6 @@ def _select_due_step(
     return latest_due, latest_due + 1
 
 
-def _seed_hand_reference(shared: SharedStorage, *, hand_feedback_max_age_s: float) -> np.ndarray | None:
-    """Seed the first hand-delta reference from measured hand feedback.
-
-    Mirrors VR teleop (``ctx.prev_hand_qpos`` is seeded from feedback): the first
-    coupled hand command is delta-bounded against the current measured pose, so a
-    fresh run never aborts on a delta check that has no prior command. Returns
-    ``None`` when feedback is unavailable or unhealthy, using the same
-    fail-closed predicate as the publication boundary (including source-timestamp
-    freshness).
-    """
-    result = shared.hand_state_ring.read_latest()
-    if result is None:
-        return None
-    record = result[0][0]
-    issue = validate_hand_feedback(
-        connected=bool(record["connected"]),
-        error_state=bool(record["error_state"]),
-        state_valid=bool(record["state_valid"]),
-        send_healthy=bool(record["send_healthy"]),
-        read_healthy=bool(record["read_healthy"]),
-        source_monotonic_ns=int(record["source_monotonic_ns"]),
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=hand_feedback_max_age_s,
-        qpos=np.asarray(record["qpos"], dtype=np.float64),
-    )
-    if issue is not None:
-        return None
-    return np.asarray(record["qpos"], dtype=np.float64).copy()
-
-
 def _abort_policy_run(
     shared: SharedStorage,
     reason: str,
@@ -207,7 +180,20 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     if config is None:
         raise ValueError("coordinator_loop requires a CoordinatorConfig")
 
-    gate = SafetyGate(
+    # The deployment path is machine-driven (no operator in the loop), so it must
+    # run the same arm-base Cartesian workspace check as VR teleop.  Build a
+    # planner wired to the configured workspace bounds and extend the shared
+    # SafetyGate boundary with it (D2).  Build before the first heartbeat/ready
+    # publish so a planner failure fails closed at readiness rather than mid-run.
+    planner = XArm7MotionPlanner(
+        XArm7PlannerConfig(
+            urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
+            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
+            workspace_bounds=np.asarray(config.workspace_bounds, dtype=np.float64),
+        ),
+    )
+    gate = planner_action_safety_gate(
+        planner=planner,
         arm_joint_lower_rad=config.arm_joint_lower_rad,
         arm_joint_upper_rad=config.arm_joint_upper_rad,
         hand_joint_lower_rad=config.hand_joint_lower_rad,
@@ -257,11 +243,6 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     active_plan_id = 0
     last_adopted_observation_id = 0
     next_step = 0
-    last_published_hand_cmd: np.ndarray | None = (
-        _seed_hand_reference(shared, hand_feedback_max_age_s=config.hand_feedback_max_age_s)
-        if config.deployment.hand_enabled and config.hand_max_delta_rad is not None
-        else None
-    )
     # Command-to-command silence reference. ``None`` until the first publish so
     # the slow first inference (forced reset + encode + infer after the
     # RUNNING-entry generation advance) is not charged against the silence
@@ -343,18 +324,6 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             if int(active_plan["hand_present"]) == 1:
                 hand_qpos = np.asarray(active_plan["hand_qpos"][selected], dtype=np.float64)
 
-            # When the optional delta bound is enabled, seed its first
-            # last-published reference from healthy measured feedback. The
-            # centralized publication boundary owns the actual preflight.
-            if hand_qpos is not None and config.hand_max_delta_rad is not None:
-                if last_published_hand_cmd is None:
-                    last_published_hand_cmd = _seed_hand_reference(
-                        shared, hand_feedback_max_age_s=config.hand_feedback_max_age_s
-                    )
-                    if last_published_hand_cmd is None:
-                        _sleep_tick(period_s, tick_start)
-                        continue
-
             candidate = build_action_candidate(
                 shared,
                 arm_qpos,
@@ -373,19 +342,26 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 candidate,
                 gate=gate,
                 hand_feedback_max_age_s=config.hand_feedback_max_age_s,
-                previous_hand_qpos=last_published_hand_cmd,
                 hand_mechanical_lower_rad=np.asarray(
                     config.hand_mechanical_lower_rad, dtype=np.float64
                 ),
                 hand_mechanical_upper_rad=np.asarray(
                     config.hand_mechanical_upper_rad, dtype=np.float64
                 ),
-                hand_max_delta_rad=config.hand_max_delta_rad,
             )
             if not publish_result.succeeded:
                 if publish_result.status == CommandPublishStatus.GATE_REJECTED:
                     # SafetyGate rejection is a policy-semantic failure (§80.2):
                     # the model proposed an invalid endpoint. Abort immediately.
+                    # Attribute the rejection per gate code (§10 D5) so the flush
+                    # log shows *which* operation rejected, not just a total.
+                    metrics.increment(
+                        reject_counter_name(
+                            publish_result.gate_code.value
+                            if publish_result.gate_code is not None
+                            else None
+                        )
+                    )
                     _abort_policy_run(
                         shared,
                         f"safety gate rejection: {publish_result.reason}",
@@ -396,6 +372,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                     active_plan = None
                     continue
                 if publish_result.status == CommandPublishStatus.HAND_PREFLIGHT_REJECTED:
+                    metrics.increment(HAND_PREFLIGHT_REJECTIONS)
                     _abort_policy_run(
                         shared,
                         f"hand command preflight rejection: {publish_result.reason}",
@@ -410,8 +387,6 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 continue
 
             metrics.increment(ENDPOINTS_PUBLISHED)
-            if hand_qpos is not None:
-                last_published_hand_cmd = hand_qpos.copy()
             last_valid_policy_command_ns = now_ns
 
             last_metrics_flush_ns = flush_every(

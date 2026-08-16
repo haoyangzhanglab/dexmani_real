@@ -29,10 +29,15 @@ from typing import Any
 import h5py
 import numpy as np
 
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.recording.episode_schema import (
+    ARM_SENT_MARKER,
+    EPISODE_SCHEMA_VERSION,
+    validate_data_layout_v16,
+)
 from dexmani_real.recording.timestamp_buffer import FillReason
 from dexmani_real.recording.video_codec import VideoDecoder
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
@@ -135,10 +140,10 @@ class EpisodeReader:
         )
         self._rgb_decoder: VideoDecoder | None = VideoDecoder(paths["rgb"])
         schema_version = self.schema_version
-        if schema_version != 16:
+        if schema_version != EPISODE_SCHEMA_VERSION:
             self.close()
             raise ValueError(
-                f"unsupported episode schema v{schema_version}; expected v16 "
+                f"unsupported episode schema v{schema_version}; expected v{EPISODE_SCHEMA_VERSION} "
                 "(migrate historical episodes outside the runtime)"
             )
 
@@ -173,55 +178,64 @@ class EpisodeReader:
         """Readable alias for :attr:`min_frames_met`."""
         return self.min_frames_met
 
+    def _raw_action_valid_mask(self, quality_key: str) -> np.ndarray:
+        """Return a conservative source-row mask for one stored raw action."""
+
+        names = ("flag_sample_valid", "flag_held", quality_key)
+        missing = [name for name in names if name not in self._data_h5f]
+        if missing:
+            raise ValueError(f"schema-v16 episode is missing raw-action validity fields: {missing}")
+        values = [np.asarray(self._data_h5f[name][:], dtype=bool) for name in names]
+        if any(value.ndim != 1 for value in values) or len({value.shape for value in values}) != 1:
+            shapes = {name: value.shape for name, value in zip(names, values)}
+            raise ValueError(f"schema-v16 raw-action validity fields have inconsistent shapes: {shapes}")
+        sample_valid, held, quality_ok = values
+        return sample_valid & ~held & quality_ok
+
+    @property
+    def action_arm_joint_raw_valid_mask(self) -> np.ndarray:
+        """Rows with a conservative, explicit arm IK raw value.
+
+        Equivalent to ``flag_sample_valid & ~flag_held & flag_ik_ok``. Stored
+        v16 values are not rewritten: held/failure rows remain readable but are
+        excluded from this interpretation mask.
+        """
+
+        return self._raw_action_valid_mask("flag_ik_ok")
+
+    @property
+    def action_hand_joint_raw_valid_mask(self) -> np.ndarray:
+        """Rows with a conservative, explicit hand retarget raw value.
+
+        Equivalent to ``flag_sample_valid & ~flag_held & flag_retarget_ok``.
+        """
+
+        return self._raw_action_valid_mask("flag_retarget_ok")
+
     @property
     def validity(self) -> ValidityState:
         """Return whether the current schema-v16 episode is internally consistent."""
         meta = self._h5f.get("meta")
         if meta is None:
             return ValidityState.INVALID
-        required = {
-            "timestamp",
-            "flag_sample_valid",
-            "source_sample_index",
-            "source_timestamp",
-            "fill_reason",
-            "observation_id",
-            "observation_anchor_monotonic_ns",
-            "arm_source_sequence",
-            "hand_source_sequence",
-            "vr_source_sequence",
-            "camera_source_sequence",
-            "arm_source_monotonic_ns",
-            "hand_source_monotonic_ns",
-            "vr_source_monotonic_ns",
-            "camera_source_monotonic_ns",
-            "arm_publish_monotonic_ns",
-            "hand_publish_monotonic_ns",
-            "vr_publish_monotonic_ns",
-            "camera_publish_monotonic_ns",
-            "observation_valid",
-            "observation_source_age_s",
-            "observation_source_skew_s",
-            "observation_source_receive_monotonic_ns",
-            "observation_history_valid_mask",
-            "action_id",
-            "action_created_monotonic_ns",
-            "action_target_monotonic_ns",
-            "action_valid_until_monotonic_ns",
-            "action_arm_joint",
-            "action_hand_joint",
-            "action_arm_joint_raw",
-            "action_hand_joint_raw",
-            "flag_action_queued",
-            "tactile_fresh",
-            "tactile_source_monotonic_ns",
-            "tactile_calibrated",
-            "tactile_unit_code",
-        }
-        if not required.issubset(self._h5f.keys()):
-            return ValidityState.INVALID
         frame_count = int(meta.attrs.get("num_frames", -1))
-        if frame_count < 0 or any(int(self._h5f[key].shape[0]) != frame_count for key in required):
+        dataset_shapes = {
+            key: tuple(dataset.shape)
+            for key, dataset in self._data_h5f.items()
+            if isinstance(dataset, h5py.Dataset)
+        }
+        dataset_dtypes = {
+            key: dataset.dtype
+            for key, dataset in self._data_h5f.items()
+            if isinstance(dataset, h5py.Dataset)
+        }
+        layout_errors = validate_data_layout_v16(
+            dataset_shapes,
+            dataset_dtypes,
+            frame_count=frame_count,
+            arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
+        )
+        if layout_errors:
             return ValidityState.INVALID
         config_hash = str(meta.attrs.get("resolved_config_sha256", ""))
         if len(config_hash) != 64:

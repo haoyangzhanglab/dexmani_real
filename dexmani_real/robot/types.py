@@ -39,9 +39,10 @@ class RobotState:
     # ── Arm joints ──
     arm_qpos: np.ndarray  # (7,)  float64  rad
     arm_qvel: np.ndarray  # (7,)  float64  rad/s
-    arm_tau: np.ndarray  # (7,)  float64  N·m (motor current)
+    # Legacy name: xArm SDK current-estimated effort; precise SI unit unverified.
+    arm_tau: np.ndarray  # (7,) float64
 
-    # ── EEF pose (dual representation) ──
+    # ── EEF pose (arm-base frame; standard runtime world == arm base) ──
     eef_pos: np.ndarray  # (3,)  float64  m
     eef_quat_wxyz: np.ndarray  # (4,)  float64
     eef_rot6d: np.ndarray  # (6,)  float64
@@ -67,7 +68,7 @@ class RobotState:
     hand_qpos_stale: bool
 
     # ── Derived (chained FK) ──
-    fingertip_pos: np.ndarray  # (5,3) float64  m (world frame)
+    fingertip_pos: np.ndarray  # (5,3) float64 m (arm-base frame)
 
     # ── Status ──
     arm_connected: bool

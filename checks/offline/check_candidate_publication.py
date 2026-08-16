@@ -194,25 +194,22 @@ def main() -> int:
         assert _drain_arm_queue(shared) == 1, "one arm endpoint must be queued"
         assert shared.hand_cmd_ring.read_latest() is not None, "one hand endpoint must be written"
 
-        # ── centralized hand delta preflight rejects before arm enqueue ──
+        # ── centralized hand preflight rejects before arm enqueue ──
+        # The gate only knows the operational box; a mechanical envelope that
+        # exceeds the rated device envelope passes the gate but is rejected by
+        # the shared hand preflight, before the arm endpoint is enqueued.
         hand_step = hand_mid.copy()
-        hand_step[0] += 0.01
         candidate = build_action_candidate(shared, arm_mid, hand_step)
         assert candidate is not None
+        too_wide = np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
+        too_wide[0] += 1.0
         result = validate_and_send_candidate(
             shared,
             candidate,
             gate=gate,
             hand_feedback_max_age_s=1.0,
             prepare_timeout_s=0.1,
-            previous_hand_qpos=hand_mid,
-            hand_mechanical_lower_rad=np.asarray(
-                hand_defaults.mechanical_qpos_min_rad, dtype=np.float64
-            ),
-            hand_mechanical_upper_rad=np.asarray(
-                hand_defaults.mechanical_qpos_max_rad, dtype=np.float64
-            ),
-            hand_max_delta_rad=0.001,
+            hand_mechanical_upper_rad=too_wide,
         )
         assert result.status == CommandPublishStatus.HAND_PREFLIGHT_REJECTED, result
         assert _drain_arm_queue(shared) == 0, "hand preflight must precede arm enqueue"

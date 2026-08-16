@@ -27,6 +27,7 @@ import numpy as np
 import _bootstrap  # noqa: F401  (repo root on sys.path)
 from _fakes import make_arm_state_frame, make_hand_state_frame
 
+from dexmani_real.config.defaults import WorkspaceBounds
 from dexmani_real.config.defaults import arm as arm_defaults
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.deployment.config import DeploymentConfig
@@ -61,18 +62,24 @@ def _gate() -> SafetyGate:
 def _coordinator_config(
     *,
     hand_enabled: bool = False,
-    hand_max_delta_rad: float | None = None,
+    hand_mechanical_upper_rad: tuple[float, ...] | None = None,
+    hand_feedback_max_age_s: float = 1.0,
+    **deployment_overrides,
 ) -> CoordinatorConfig:
     return CoordinatorConfig(
-        deployment=DeploymentConfig(hand_enabled=hand_enabled),
+        deployment=DeploymentConfig(hand_enabled=hand_enabled, **deployment_overrides),
         arm_joint_lower_rad=arm_defaults.joint_limit_lower,
         arm_joint_upper_rad=arm_defaults.joint_limit_upper,
+        workspace_bounds=WorkspaceBounds().as_tuple(),
         hand_joint_lower_rad=hand_defaults.qpos_min_rad,
         hand_joint_upper_rad=hand_defaults.qpos_max_rad,
         hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
-        hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
-        hand_max_delta_rad=hand_max_delta_rad,
-        hand_feedback_max_age_s=1.0,
+        hand_mechanical_upper_rad=(
+            hand_defaults.mechanical_qpos_max_rad
+            if hand_mechanical_upper_rad is None
+            else hand_mechanical_upper_rad
+        ),
+        hand_feedback_max_age_s=hand_feedback_max_age_s,
         control_hz=100.0,
     )
 
@@ -116,7 +123,12 @@ def _test_gate_reject_abort(arm_mid: np.ndarray) -> None:
         shared.policy_plan_ring.write(plan)
 
         thread = threading.Thread(
-            target=coordinator_loop, args=(shared, _coordinator_config()), daemon=True
+            target=coordinator_loop,
+            args=(
+                shared,
+                _coordinator_config(max_plan_age_s=30.0, max_observation_age_s=30.0),
+            ),
+            daemon=True,
         )
         thread.start()
         try:
@@ -140,16 +152,15 @@ def _test_gate_reject_abort(arm_mid: np.ndarray) -> None:
         shared.close()
 
 
-def _test_hand_preflight_abort(arm_mid: np.ndarray, hand_mid: np.ndarray) -> None:
-    """A coupled delta violation must abort before any arm endpoint is queued."""
+def _test_hand_preflight_abort(arm_good: np.ndarray, hand_mid: np.ndarray) -> None:
+    """A coupled-hand preflight rejection must abort before any arm endpoint is queued."""
     shared = SharedStorage.create(prefix="check_policy_hand_preflight_abort")
     try:
         assert transition(shared, SafetyState.ARMED)
-        shared.arm_state_ring.write(make_arm_state_frame(arm_mid))
+        shared.arm_state_ring.write(make_arm_state_frame(arm_good))
         shared.hand_state_ring.write(make_hand_state_frame(hand_mid))
 
         hand_step = hand_mid.copy()
-        hand_step[0] += 0.01
         plan = np.zeros(1, dtype=POLICY_PLAN_DTYPE)
         now_ns = time.monotonic_ns()
         plan["plan_id"][0] = 1
@@ -161,13 +172,24 @@ def _test_hand_preflight_abort(arm_mid: np.ndarray, hand_mid: np.ndarray) -> Non
         plan["num_steps"][0] = 1
         plan["arm_present"][0] = 1
         plan["hand_present"][0] = 1
-        plan["arm_qpos"][0, 0] = arm_mid
+        plan["arm_qpos"][0, 0] = arm_good
         plan["hand_qpos"][0, 0] = hand_step
         plan["target_monotonic_ns"][0, 0] = now_ns - 1_000_000
         plan["valid_mask"][0, 0] = 1
         shared.policy_plan_ring.write(plan)
 
-        config = _coordinator_config(hand_enabled=True, hand_max_delta_rad=0.001)
+        # A mechanical envelope wider than the rated device envelope passes the
+        # operational gate but is rejected by the shared hand preflight before
+        # the arm endpoint is enqueued (mechanical config error, D3 residual).
+        too_wide = np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
+        too_wide[0] += 1.0
+        config = _coordinator_config(
+            hand_enabled=True,
+            hand_mechanical_upper_rad=tuple(too_wide),
+            hand_feedback_max_age_s=30.0,
+            max_plan_age_s=30.0,
+            max_observation_age_s=30.0,
+        )
         thread = threading.Thread(
             target=coordinator_loop,
             args=(shared, config),
@@ -198,6 +220,10 @@ def _test_hand_preflight_abort(arm_mid: np.ndarray, hand_mid: np.ndarray) -> Non
 def main() -> int:
     arm_mid = _mid(arm_defaults.joint_limit_lower, arm_defaults.joint_limit_upper)
     hand_mid = _mid(hand_defaults.qpos_min_rad, hand_defaults.qpos_max_rad)
+    # A fixed workspace-interior arm pose (EEF ≈ [0.48, 0.0, 0.29] m) so the
+    # coordinator's planner workspace gate (D2) accepts the coupled-hand endpoint
+    # and the hand preflight (not the workspace check) is the rejection under test.
+    arm_good = np.array([0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.0], dtype=np.float64)
     gate = _gate()
 
     shared = SharedStorage.create(prefix="check_policy_failure_semantics")
@@ -250,7 +276,7 @@ def main() -> int:
 
     # ── end-to-end: gate rejection aborts the run to ARMED (not FAULT) ──
     _test_gate_reject_abort(arm_mid)
-    _test_hand_preflight_abort(arm_mid, hand_mid)
+    _test_hand_preflight_abort(arm_good, hand_mid)
 
     print("check_policy_failure_semantics: PASS")
     return 0

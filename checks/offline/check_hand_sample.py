@@ -62,9 +62,18 @@ class _Finger:
 
 
 class _Sensor:
-    def __init__(self) -> None:
-        self.calc_force = _Force()
-        self.raw_force: list[_Force] = []
+    def __init__(
+        self,
+        *,
+        calc_force: _Force | None = None,
+        raw_force: list[_Force] | None = None,
+    ) -> None:
+        self.calc_force = calc_force if calc_force is not None else _Force()
+        self.raw_force = (
+            raw_force
+            if raw_force is not None
+            else [_Force() for _ in range(HAND_TACTILE_FORCE_SHAPE[1])]
+        )
 
 
 class _HandState:
@@ -115,15 +124,33 @@ def _hand() -> XHand:
     return XHand(XHandConfig())
 
 
+def _sensors() -> list[_Sensor]:
+    return [_Sensor() for _ in range(HAND_TACTILE_FORCE_SHAPE[0])]
+
+
 def _test_parse_sample_valid() -> None:
     hand = _hand()
-    sample = hand._parse_sample(_HandState(_fingers()))
+    sensors = _sensors()
+    sensors[0].calc_force = _Force(10.0, 20.0, 30.0)
+    sensors[0].raw_force[0] = _Force(1.0, 2.0, 3.0)
+    sample = hand._parse_sample(_HandState(_fingers(), sensors))
 
     assert sample.qpos.shape == HAND_JOINT_SHAPE
     assert sample.current.shape == HAND_JOINT_SHAPE
     assert sample.tactile_force.shape == HAND_TACTILE_FORCE_SHAPE
     assert sample.tactile_sum.shape == HAND_TACTILE_SUM_SHAPE
     assert sample.tactile_contact.shape == HAND_CONTACT_SHAPE
+    assert sample.tactile_valid is True
+    np.testing.assert_allclose(sample.tactile_sum[0], [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(sample.tactile_force[0, 0], [0.1, 0.2, 0.3])
+
+    # The deployed 0.1 scale and software-bias subtraction remain unchanged;
+    # neither value is asserted to be an SI conversion.
+    hand._tactile_bias_ft = np.full(HAND_TACTILE_SUM_SHAPE, 0.25)
+    hand._tactile_bias_raw = np.full(HAND_TACTILE_FORCE_SHAPE, 0.05)
+    biased = hand._parse_sample(_HandState(_fingers(), sensors))
+    np.testing.assert_allclose(biased.tactile_sum[0], [0.75, 1.75, 2.75])
+    np.testing.assert_allclose(biased.tactile_force[0, 0], [0.05, 0.15, 0.25])
 
     for i in range(HAND_DOF):
         assert sample.qpos[i] == i * 0.01
@@ -131,6 +158,50 @@ def _test_parse_sample_valid() -> None:
         assert sample.commboard_err[i] == i
         assert sample.jointboard_err[i] == i + 1  # parsed from the SDK's "jonitboard_err"
         assert sample.tipboard_err[i] == i + 2
+
+
+def _assert_tactile_invalid(hand_state: _HandState) -> None:
+    sample = _hand()._parse_sample(hand_state)
+    assert sample.tactile_valid is False
+    np.testing.assert_array_equal(sample.qpos, np.arange(HAND_DOF) * 0.01)
+    np.testing.assert_array_equal(sample.tactile_force, 0.0)
+    np.testing.assert_array_equal(sample.tactile_sum, 0.0)
+    np.testing.assert_array_equal(sample.tactile_contact, False)
+
+
+def _test_tactile_payload_validation() -> None:
+    for sensors in ([], _sensors()[:4], _sensors() + [_Sensor()]):
+        _assert_tactile_invalid(_HandState(_fingers(), sensors))
+
+    for count in (119, 121):
+        sensors = _sensors()
+        sensors[2].raw_force = [_Force() for _ in range(count)]
+        _assert_tactile_invalid(_HandState(_fingers(), sensors))
+
+    sensors = _sensors()
+    sensors[1].calc_force.fx = float("nan")
+    _assert_tactile_invalid(_HandState(_fingers(), sensors))
+
+    sensors = _sensors()
+    sensors[3].raw_force[17].fz = float("inf")
+    _assert_tactile_invalid(_HandState(_fingers(), sensors))
+
+    sensors = _sensors()
+    del sensors[4].calc_force
+    _assert_tactile_invalid(_HandState(_fingers(), sensors))
+
+
+def _test_tactile_invalid_calibration_fails_closed() -> None:
+    hand = _hand()
+    invalid_sample = hand._parse_sample(_HandState(_fingers(), []))
+    assert invalid_sample.tactile_valid is False
+    hand.get_state = lambda force_update=None: invalid_sample  # type: ignore[method-assign]
+    assert hand.initialize_tactile() is False
+    assert hand.tactile_calibrated is False
+    assert hand._tactile_bias_ft is not None
+    assert hand._tactile_bias_raw is not None
+    np.testing.assert_array_equal(hand._tactile_bias_ft, 0.0)
+    np.testing.assert_array_equal(hand._tactile_bias_raw, 0.0)
 
 
 def _test_parse_sample_malformed() -> None:
@@ -211,6 +282,7 @@ def _test_sample_immutability() -> None:
         tactile_force=tactile_force,
         tactile_sum=tactile_sum,
         tactile_contact=tactile_contact,
+        tactile_valid=True,
         commboard_err=commboard_err,
         jointboard_err=commboard_err,
         tipboard_err=commboard_err,
@@ -221,6 +293,7 @@ def _test_sample_immutability() -> None:
     commboard_err[0] = 999
     assert sample.qpos[0] == 0.0
     assert sample.commboard_err[0] == 0
+    assert sample.tactile_valid is True
 
     # The sample's arrays are read-only.
     for name in ("qpos", "current", "tactile_force", "tactile_sum", "commboard_err"):
@@ -249,6 +322,8 @@ def _test_source_structural() -> None:
 
 def main() -> int:
     _test_parse_sample_valid()
+    _test_tactile_payload_validation()
+    _test_tactile_invalid_calibration_fails_closed()
     _test_parse_sample_malformed()
     _test_get_state_failure_protocol()
     _test_send_failure_does_not_advance()

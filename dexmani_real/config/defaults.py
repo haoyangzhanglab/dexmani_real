@@ -453,12 +453,6 @@ class HandParams:
         0.08726646259971647,
     )
     qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
-    # Command-to-command rate bound. None disables it: the EtherCAT firmware
-    # PID (with per-joint current limits) is the final velocity backstop,
-    # mirroring how the arm velocity envelope was removed. When configured,
-    # the controller clips the motion to this bound instead of rejecting the
-    # whole action.
-    max_delta_rad: float | None = None
 
     # ── Servo gains (PID) and current limit ──
     # Per-joint proportional gains. Index abduction (J3) is raised to 120 to
@@ -573,8 +567,6 @@ class HandParams:
             or np.any(home_rad > command_upper + limit_tolerance_rad)
         ):
             raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
-        if self.max_delta_rad is not None and (not np.isfinite(self.max_delta_rad) or self.max_delta_rad <= 0):
-            raise ValueError("hand max_delta_rad must be finite and > 0 when configured")
         if len(self.kp) != 12 or any(not isinstance(value, int) or value <= 0 for value in self.kp):
             raise ValueError("hand kp must contain twelve positive integer gains")
         if self.ki < 0 or self.kd < 0:

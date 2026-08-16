@@ -109,10 +109,6 @@ class XHandConfig:
     tor_max_per_joint: np.ndarray | None = None  # (12,) per-joint tor_max overrides
     mode: int = 3
 
-    # Whole-command rejection threshold. The driver never clips a delta; home
-    # and other multi-step flows must publish explicit legal milestones.
-    max_delta_rad: float | np.ndarray | None = field(default_factory=lambda: hand.max_delta_rad)
-
     # ── F1: Tactile contact detection ──
     # L2 threshold in the SDK's scaled tactile units.  The vendor/firmware
     # provenance for a physical SI conversion has not been validated on this
@@ -153,10 +149,6 @@ class XHandConfig:
         )
         if np.any(home_qpos < command_lower - 1e-12) or np.any(home_qpos > command_upper + 1e-12):
             raise ValueError("XHand home_qpos must be inside command limits")
-        if self.max_delta_rad is not None:
-            max_delta = np.broadcast_to(np.asarray(self.max_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE)
-            if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-                raise ValueError("XHand max_delta_rad must broadcast to twelve finite positive values")
         if not np.isfinite(self.tactile_contact_threshold) or self.tactile_contact_threshold < 0:
             raise ValueError("tactile_contact_threshold must be finite and non-negative")
 
@@ -174,7 +166,9 @@ class XHandSample:
     ``tactile_force_sum``) so the worker's per-tick parse is a straight copy.
     Arrays are validated for shape/finite-ness, copied, and marked read-only on
     construction, so a caller can never alias or mutate the driver's live
-    buffers.  ``error_state`` and liveness are object fields on :class:`XHand`,
+    buffers. ``tactile_valid`` is process-local provenance: malformed tactile
+    payloads degrade to shape-stable zeros without invalidating complete joint
+    feedback. ``error_state`` and liveness are object fields on :class:`XHand`,
     not part of this snapshot — the snapshot is pure feedback.
     """
 
@@ -183,6 +177,7 @@ class XHandSample:
     tactile_force: np.ndarray  # (5, 120, 3) raw force per sensor point
     tactile_sum: np.ndarray  # (5, 3) combined force per finger
     tactile_contact: np.ndarray  # (5,) bool per-finger contact
+    tactile_valid: bool  # exact 5 x (120 raw points + one calc force), all finite
     commboard_err: np.ndarray  # (12,) int32 comm board error register
     jointboard_err: np.ndarray  # (12,) int32 joint board error register
     tipboard_err: np.ndarray  # (12,) int32 tip board error register
@@ -199,8 +194,11 @@ class XHandSample:
     )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.tactile_valid, (bool, np.bool_)):
+            raise ValueError("XHandSample.tactile_valid must be boolean")
+        object.__setattr__(self, "tactile_valid", bool(self.tactile_valid))
         for name, shape, dtype in self._SPEC:
-            arr = np.asarray(getattr(self, name), dtype=dtype)
+            arr: np.ndarray = np.asarray(getattr(self, name), dtype=dtype)
             if arr.shape != shape:
                 raise ValueError(f"XHandSample.{name} must have shape {shape}, got {arr.shape}")
             if name != "tactile_contact" and not np.all(np.isfinite(arr)):
@@ -227,6 +225,7 @@ class XHand:
         self._tactile_bias_ft: np.ndarray | None = None  # (5, 3)   — calc_force bias
         self._tactile_bias_raw: np.ndarray | None = None  # (5, 120, 3) — raw_force bias
         self.tactile_calibrated: bool = False
+        self._last_tactile_payload_valid: bool | None = None
 
         self._stub_mode = False
         self.last_hand_ids: list[int] = []
@@ -507,13 +506,21 @@ class XHand:
         a read error — degrades to ``calibrated=False`` and returns False
         without blocking joint control.
         """
+        # Never reuse a previous calibration across a fresh initialization.
+        # An old bias must not hide a load in the startup read.
+        self._tactile_bias_ft = None
+        self._tactile_bias_raw = None
+        self.tactile_calibrated = False
+
         if self._stub_mode:
-            self.tactile_calibrated = True
-            return True
+            # Following simulation has no physical tactile payload.
+            self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+            self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+            return False
 
         try:
             sample = self.get_state(force_update=True)
-        except (RuntimeError, ValueError):
+        except Exception:
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
             self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
             self.tactile_calibrated = False
@@ -523,7 +530,7 @@ class XHand:
         # Check the raw startup load before reset_sensor() can redefine the
         # loaded state as zero. Missing/malformed tactile feedback also fails
         # calibration closed while leaving non-tactile hand operation usable.
-        if self._tactile_load_present(sample.tactile_sum):
+        if not sample.tactile_valid or self._tactile_load_present(sample.tactile_sum):
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
             self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
             self.tactile_calibrated = False
@@ -535,7 +542,13 @@ class XHand:
         # reporting data (sensor IDs 17–21: thumb, index, middle, ring, little).
         # Failures are logged but do not block operation — a dead sensor is
         # less harmful than a refused connection.
-        self._reset_tactile_sensors()
+        try:
+            self._reset_tactile_sensors()
+        except Exception:
+            self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+            self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+            self.tactile_calibrated = False
+            logger.warning("Tactile initialization degraded: reset/verification failed", exc_info=True)
         return self.tactile_calibrated
 
     def _tactile_load_present(self, force_sum: Any) -> bool:
@@ -557,7 +570,7 @@ class XHand:
         and rely on the subsequent measured verification and software bias.
         """
         if self._stub_mode:
-            self.tactile_calibrated = True
+            self.tactile_calibrated = False
             return
         device_id = self.config.device_id
 
@@ -618,7 +631,16 @@ class XHand:
                 )
                 continue  # retry all sensors next iteration
 
-            force_sum = self.parse_tactile_sum(hand_state)  # raw — bias is None during init
+            try:
+                _, force_sum = self._parse_tactile_payload(hand_state)  # raw — bias is None during init
+            except Exception:
+                logger.warning(
+                    "Tactile verify payload malformed (iter %d/%d) — retrying all sensors",
+                    outer + 1,
+                    MAX_OUTER_ITERS,
+                    exc_info=True,
+                )
+                continue
             mags = np.linalg.norm(force_sum, axis=1)  # (5,) — |F| per finger
             _last_mags = mags
 
@@ -681,7 +703,7 @@ class XHand:
         if self._stub_mode or self.control is None:
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
             self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
-            self.tactile_calibrated = bool(self._stub_mode)
+            self.tactile_calibrated = False
             return
 
         ft_samples: list[np.ndarray] = []
@@ -698,10 +720,23 @@ class XHand:
                 )
                 self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
                 self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+                self.tactile_calibrated = False
                 return
 
-            ft_samples.append(self.parse_tactile_sum(hand_state))
-            raw_samples.append(self.parse_tactile(hand_state))
+            try:
+                raw_force, force_sum = self._parse_tactile_payload(hand_state)
+            except Exception:
+                logger.warning(
+                    "Tactile bias sample payload malformed — bias will be zero (no correction)",
+                    exc_info=True,
+                )
+                self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+                self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+                self.tactile_calibrated = False
+                return
+
+            ft_samples.append(force_sum)
+            raw_samples.append(raw_force)
 
         # A loaded/contacting hand is not a valid zero reference. Refuse to
         # absorb the external load into the software bias.
@@ -918,6 +953,7 @@ class XHand:
             tactile_force=np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
             tactile_sum=np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
             tactile_contact=np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
+            tactile_valid=False,
             commboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
             jointboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
             tipboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
@@ -970,19 +1006,6 @@ class XHand:
             return False
         if not self._validate_joint_range(target_qpos):
             return False
-        if self.config.max_delta_rad is not None and self.last_qpos_cmd is not None:
-            max_delta = np.broadcast_to(np.asarray(self.config.max_delta_rad, dtype=np.float64), HAND_JOINT_SHAPE)
-            delta = np.abs(target_qpos - self.last_qpos_cmd)
-            violating = np.flatnonzero(delta > max_delta + 1e-12)
-            if violating.size:
-                joint_index = int(violating[0])
-                self.last_error_message = (
-                    "XHand.send_action rejected command delta violation: "
-                    f"joint={joint_index} delta={delta[joint_index]:.6f}rad "
-                    f"limit={max_delta[joint_index]:.6f}rad"
-                )
-                logger.warning(self.last_error_message)
-                return False
         if self._stub_mode:
             # Track the accepted request so following simulation mirrors the
             # same all-or-nothing command contract as hardware.
@@ -1121,30 +1144,103 @@ class XHand:
         if len(seen) != HAND_DOF:
             raise RuntimeError(f"XHand parse: {len(seen)}/{HAND_DOF} joints reported")
 
-        tactile_force = self.parse_tactile(hand_state)
-        tactile_sum = self.parse_tactile_sum(hand_state)
+        try:
+            tactile_force, tactile_sum = self._parse_tactile_payload(hand_state)
+        except Exception:
+            if self._last_tactile_payload_valid is not False:
+                logger.warning(
+                    "XHand tactile payload invalid — preserving joint feedback and publishing invalid zeros",
+                    exc_info=True,
+                )
+            tactile_force = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+            tactile_sum = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+            tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
+            tactile_valid = False
+        else:
+            if self._last_tactile_payload_valid is False:
+                logger.info("XHand tactile payload recovered")
+            tactile_contact = self.detect_contact(force_sum=tactile_sum)
+            tactile_valid = True
+        self._last_tactile_payload_valid = tactile_valid
         return XHandSample(
             qpos=qpos,
             current=current,
             tactile_force=tactile_force,
             tactile_sum=tactile_sum,
-            tactile_contact=self.detect_contact(force_sum=tactile_sum),
+            tactile_contact=tactile_contact,
+            tactile_valid=tactile_valid,
             commboard_err=commboard_err,
             jointboard_err=jointboard_err,
             tipboard_err=tipboard_err,
         )
 
-    _MAX_SENSORS: int = 5  # thumb, index, middle, ring, little
+    @staticmethod
+    def _force_xyz(force: Any, *, label: str) -> np.ndarray:
+        """Return one finite SDK force vector or raise a tactile-only error."""
+        if force is None:
+            raise ValueError(f"{label} is missing")
+        try:
+            value = np.asarray(
+                [float(getattr(force, axis)) for axis in ("fx", "fy", "fz")],
+                dtype=np.float64,
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label} must expose numeric fx/fy/fz") from exc
+        if value.shape != (3,) or not np.all(np.isfinite(value)):
+            raise ValueError(f"{label} must contain three finite values")
+        return value
 
-    def _iter_sensors(self, hand_state):
-        """Iterate sensor data entries by positional index (0-4 → thumb..little)."""
+    def _parse_tactile_payload(self, hand_state: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Strictly parse one complete five-sensor tactile payload."""
         sensor_data = getattr(hand_state, "sensor_data", None)
-        if not sensor_data:
-            return
-        for i, sensor in enumerate(sensor_data):
-            if i >= self._MAX_SENSORS:
-                break
-            yield i, sensor
+        if sensor_data is None:
+            raise ValueError("sensor_data is missing")
+        try:
+            sensors = list(sensor_data)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sensor_data must be iterable") from exc
+        if len(sensors) != HAND_FINGER_COUNT:
+            raise ValueError(
+                f"sensor_data must contain exactly {HAND_FINGER_COUNT} sensors, got {len(sensors)}"
+            )
+
+        tactile = np.empty(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+        force_sum = np.empty(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+        for sensor_index, sensor in enumerate(sensors):
+            force_sum[sensor_index] = self._force_xyz(
+                getattr(sensor, "calc_force", None),
+                label=f"sensor_data[{sensor_index}].calc_force",
+            )
+            raw_force = getattr(sensor, "raw_force", None)
+            if raw_force is None:
+                raise ValueError(f"sensor_data[{sensor_index}].raw_force is missing")
+            try:
+                raw_points = list(raw_force)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"sensor_data[{sensor_index}].raw_force must be iterable"
+                ) from exc
+            if len(raw_points) != TACTILE_POINTS_PER_FINGER:
+                raise ValueError(
+                    f"sensor_data[{sensor_index}].raw_force must contain exactly "
+                    f"{TACTILE_POINTS_PER_FINGER} points, got {len(raw_points)}"
+                )
+            for point_index, force in enumerate(raw_points):
+                tactile[sensor_index, point_index] = self._force_xyz(
+                    force,
+                    label=f"sensor_data[{sensor_index}].raw_force[{point_index}]",
+                )
+
+        # Preserve the deployed scale without claiming an SI conversion.
+        tactile *= 0.1
+        force_sum *= 0.1
+        if self._tactile_bias_raw is not None:
+            tactile -= self._tactile_bias_raw
+        if self._tactile_bias_ft is not None:
+            force_sum -= self._tactile_bias_ft
+        if not np.all(np.isfinite(tactile)) or not np.all(np.isfinite(force_sum)):
+            raise ValueError("scaled/bias-corrected tactile payload must remain finite")
+        return tactile, force_sum
 
     def parse_tactile(self, hand_state) -> np.ndarray:
         """Parse tactile force array (5 fingers × 120 points × 3 axes).
@@ -1154,19 +1250,7 @@ class XHand:
 
         A measured software bias is subtracted when available.
         """
-        tactile = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
-        for i, sensor in self._iter_sensors(hand_state):
-            raw_force = getattr(sensor, "raw_force", None)
-            if raw_force is None:
-                continue
-            for j, force in enumerate(raw_force):
-                if j >= TACTILE_POINTS_PER_FINGER:
-                    break
-                tactile[i, j, 0] = float(getattr(force, "fx", 0.0)) * 0.1
-                tactile[i, j, 1] = float(getattr(force, "fy", 0.0)) * 0.1
-                tactile[i, j, 2] = float(getattr(force, "fz", 0.0)) * 0.1
-        if self._tactile_bias_raw is not None:
-            tactile -= self._tactile_bias_raw
+        tactile, _ = self._parse_tactile_payload(hand_state)
         return tactile
 
     def parse_tactile_sum(self, hand_state) -> np.ndarray:
@@ -1177,16 +1261,7 @@ class XHand:
 
         A measured software bias is subtracted when available.
         """
-        force_sum = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
-        for i, sensor in self._iter_sensors(hand_state):
-            calc_force = getattr(sensor, "calc_force", None)
-            if calc_force is None:
-                continue
-            force_sum[i, 0] = float(getattr(calc_force, "fx", 0.0)) * 0.1
-            force_sum[i, 1] = float(getattr(calc_force, "fy", 0.0)) * 0.1
-            force_sum[i, 2] = float(getattr(calc_force, "fz", 0.0)) * 0.1
-        if self._tactile_bias_ft is not None:
-            force_sum -= self._tactile_bias_ft
+        _, force_sum = self._parse_tactile_payload(hand_state)
         return force_sum
 
     def _validate_joint_range(self, qpos: np.ndarray) -> bool:

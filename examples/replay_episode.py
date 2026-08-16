@@ -1223,7 +1223,6 @@ class TrajectoryReplayer:
                     hand_mechanical_upper_rad=np.asarray(
                         self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
                     ),
-                    hand_max_delta_rad=self.runtime.hand.max_delta_rad,
                     hand_feedback_max_age_s=float(
                         self.runtime.safety.heartbeat_timeouts["hand"]
                     ),
@@ -1509,7 +1508,6 @@ def _offer_return_home(
                     mechanical_lower_rad=np.asarray(runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
                     mechanical_upper_rad=np.asarray(runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
                     hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-                    max_command_delta_rad=runtime.hand.max_delta_rad,
                     timeout_s=float(runtime.hand.home_command_ack_timeout_s),
                     heartbeat=False,
                     check_is_running=False,

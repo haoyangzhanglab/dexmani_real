@@ -425,8 +425,9 @@ def _build_robot_state(
     """Build a RobotState from ring data for recording.
 
     Reads arm_state_ring + hand_state_ring + hand_tactile_ring and assembles
-    a complete RobotState.  Computes world-frame fingertip positions via hand FK
-    chain (handbase -> fingertip -> world via EEF transform).
+    a complete RobotState.  Computes arm-base-frame fingertip positions via the
+    hand FK chain.  The standard runtime defines robot world == arm base, so this
+    preserves the schema-v16 numeric convention without an extra transform.
 
     Hand hardware/error flags are forwarded to RobotState for recording.
     ``qpos_stale`` remains a reserved false compatibility field; runtime
@@ -510,23 +511,24 @@ def _build_robot_state(
     _eef_finite = np.all(np.isfinite(eef_rot6d))
     eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d) if _eef_finite else np.array([1.0, 0.0, 0.0, 0.0])
 
-    # Compute world-frame fingertip positions via hand FK.
+    # Compute arm-base-frame fingertip positions via hand FK.  Standard runtime
+    # world is the arm base, but keep the producer's native frame explicit here.
     fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
     if hk is not None and hk.is_ready() and hand_connected and np.all(np.isfinite(hand_qpos)):
         tips_in_handbase = hk.compute_tip_positions_in_handbase(hand_qpos)
         if np.all(np.isfinite(tips_in_handbase)) and _eef_finite and np.all(np.isfinite(eef_pos)):
-            T_world_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
+            T_base_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
             T_eef_handbase = Pose(
                 p=T_eef_handbase_pos if T_eef_handbase_pos is not None else np.zeros(3),
                 q=T_eef_handbase_quat_wxyz if T_eef_handbase_quat_wxyz is not None else np.array([1.0, 0.0, 0.0, 0.0]),
             )
-            T_world_handbase = compose_pose(T_world_eef, T_eef_handbase)
-            tips_world = np.zeros(HAND_FINGERTIP_SHAPE, dtype=np.float64)
+            T_base_handbase = compose_pose(T_base_eef, T_eef_handbase)
+            tips_base = np.zeros(HAND_FINGERTIP_SHAPE, dtype=np.float64)
             _id_quat = np.array([1.0, 0.0, 0.0, 0.0])
             for i in range(5):
-                T_world_tip = compose_pose(T_world_handbase, Pose(p=tips_in_handbase[i], q=_id_quat))
-                tips_world[i] = T_world_tip.p
-            fingertip_pos = tips_world
+                T_base_tip = compose_pose(T_base_handbase, Pose(p=tips_in_handbase[i], q=_id_quat))
+                tips_base[i] = T_base_tip.p
+            fingertip_pos = tips_base
 
     return RobotState(
         arm_qpos=arm_qpos,

@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from dexmani_real.config.defaults import camera, policy
 from dexmani_real.robot.safety import SafetyState
@@ -83,7 +83,11 @@ class CameraLoopConfig:
         # its own hardcoded desk_plane.json.  A disabled table means "no desk
         # removal" rather than "re-read the calibration file".
         table = getattr(getattr(runtime, "environment"), "table")
-        desk_plane = tuple(float(v) for v in table.plane_abcd) if table.enabled else None
+        desk_plane = (
+            cast(tuple[float, float, float, float], tuple(float(v) for v in table.plane_abcd))
+            if table.enabled
+            else None
+        )
         return cls(
             serial=cam.serial,
             width=int(cam.width),
@@ -204,14 +208,15 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     failed = False
     _logger.debug("camera_loop: LOADING")
 
-    # Production pointcloud recording requires depth and color aligned to one
-    # frame.  ``none`` leaves them at their native (mismatched) resolutions,
-    # silently producing an empty or misaligned pointcloud; fail closed before
-    # connecting so Main's readiness gate surfaces the misconfiguration.
-    if cfg.align_mode == "none":
+    # The persisted T_world_camera calibration is measured in the color optical
+    # frame.  Production pointclouds must therefore deproject aligned depth in
+    # that same frame.  ``color_to_depth`` would use depth-frame rays with the
+    # color-frame extrinsic, while ``none`` would leave RGB/depth unregistered.
+    # Fail closed before importing or constructing the device SDK.
+    if cfg.align_mode != "depth_to_color":
         _logger.error(
-            "camera_loop: align_mode=%r is unsupported for production pointcloud "
-            "recording (use 'depth_to_color' or 'color_to_depth')",
+            "camera_loop: align_mode=%r is unsupported for production recording; "
+            "the color-optical calibration requires 'depth_to_color'",
             cfg.align_mode,
         )
         _logger.info("camera_loop: exited")
@@ -264,7 +269,13 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             _sdk_version = "unknown"
         shared.camera_sdk_version.value = _sdk_version[:63].ljust(64, "\x00").encode()
         _profile_json = json.dumps(
-            {"streams": cam.get_active_profiles(), "align_mode": cam.config.align_mode},
+            {
+                "streams": cam.get_active_profiles(),
+                "align_mode": cam.config.align_mode,
+                "common_viewport": "color",
+                "output_optical_frame": cam.config.frame_name,
+                "output_intrinsics": cam.get_intrinsics_info(),
+            },
             separators=(",", ":"),
         )
         shared.camera_profile.value = _profile_json[:2047].ljust(2048, "\x00").encode()
@@ -284,7 +295,10 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             calib = CameraCalib()
             cam_name = calib.resolve_name_by_serial(str(cam.active_serial))
             T_world_camera = calib.get_extrinsics(cam_name)
-            pc_kwargs = {"num_points": cfg.pointcloud_num_points, "desk_plane": cfg.desk_plane}
+            pc_kwargs: dict[str, Any] = {
+                "num_points": cfg.pointcloud_num_points,
+                "desk_plane": cfg.desk_plane,
+            }
             if cfg.desk_plane is None:
                 # No resolved plane (table disabled): fall back to workspace
                 # z_min rather than the processor's own desk_plane.json auto-load.

@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.recording.episode_schema import normalize_diagnostics_v16
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
@@ -87,7 +88,7 @@ def _write_sample_metadata(
 ) -> None:
     """Populate the fixed recorder metadata fields at the policy/IO boundary."""
     signal_data = signals or {}
-    diagnostic_data = diagnostics or {}
+    diagnostic_data = normalize_diagnostics_v16(diagnostics)
 
     frame["arm_qpos_sent"][0] = (
         np.asarray(arm_qpos_sent, dtype=np.float64)
@@ -446,4 +447,3 @@ class RecorderClient:
             generation=self._generation,
             reason="finalization_timeout",
         )
-

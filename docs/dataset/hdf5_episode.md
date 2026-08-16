@@ -26,18 +26,19 @@ Real 部分以
 | 查 Sim HDF5 dataset 和 attributes | 11.4、11.5 |
 | 查 Sim Zarr array、chunk 和 episode 边界 | 11.7 |
 | 查 Sim 实测规模、问题和读取约束 | 11.8、11.10、11.11 |
+| 按 Sim/Policy 命名理解 Real episode | [Real→Sim/Policy 标签映射表](real_to_sim_mapping.md) |
 | 按处置优先级查看 Real 已确认问题 | 0.4 |
 
 ### 0.2 覆盖范围与复核状态
 
 | 合同 | 文档覆盖 | 复核基线 |
 |---|---|---|
-| Real v16 | 64 个 `/meta` attributes、97 个 `data.h5` datasets、2 个相机 HDF5 侧车 datasets，以及 `rgb.mp4` | writer、reader、producer、schema dtype 和离线 round-trip |
+| Real v16 | 96 个基础 `data.h5` datasets、1 个标准 RecorderIO 条件 dataset、`/meta` attributes、2 个相机 HDF5 侧车 datasets，以及 `rgb.mp4` | writer、reader、producer、schema dtype 和离线 round-trip |
 | Sim HDF5 | 13 个逐帧 datasets、46 个已观察根 attributes | 1113 个文件、237777 帧的只读 metadata 普查 |
 | Sim Zarr v2 | 13 个 `data/*` arrays 和 `meta/episode_ends` | 8 个 stores、1000 个 episodes、210083 帧；边界及每个 task 首末样本核对 |
 
 审计日期为 **2026-08-15**。Sim 的独立审计版位于
-[`dexmani_sim_hdf5_zarr_schema.md`](dexmani_sim_hdf5_zarr_schema.md)。
+[`sim_hdf5_zarr.md`](sim_hdf5_zarr.md)。
 
 ### 0.3 Real 与 Sim 快速区分
 
@@ -61,17 +62,18 @@ Real 部分以
 
 | 顺序 | 优先级 | ID | 问题摘要 | 证据状态 | 主要影响 / 建议 |
 |---:|---|---|---|---|---|
-| 1 | P1 | H5-07 | `EpisodeReader.VALID` 只要求 37 个核心 dataset，不保证 97 个标准 `data.h5` dataset 齐全。 | 最小 v16 fixture 运行复现 | 缺 `arm_qpos`、`arm_qvel` 和多个质量标志仍可通过；统一标准字段清单并由 writer finalizer、reader 和消费方共用。 |
-| 2 | P1 | H5-01 | `arm_ee` 的直接生产者输出 arm base frame，但文档/消费端容易把它当作字段固有的 world frame。 | producer、FK 和默认 frame 配置静态交叉核查 | 当前默认 base/world 变换为单位矩阵时数值重合，配置变化后可能静默产生坐标误用；统一字段合同或显式持久化 frame 标识。 |
-| 3 | P1 | H5-04 | held/failure 路径未提供显式 raw 值，两个 `action_*_joint_raw` 都回退为当帧 hold/最终命令。 | recorder buffer 运行复现 | 不能把所有行都解释为原始 IK/retarget 输出；结合状态标志读取，并考虑增加 raw-valid 标志或用 NaN 表示不存在。 |
-| 4 | P2 | H5-02 | `/depth` 所在像素平面取决于 RealSense alignment 配置，并不天然与 RGB 同平面。 | camera producer 与 metadata 静态交叉核查 | 使用错误内参反投影会得到错误点云；reader 必须检查 `depth_alignment_target` 后选择相应内参。 |
-| 5 | P2 | H5-03 | XHand 触觉值经过 `0.1` 缩放和可选 bias 扣除，接触阈值单位尚不是经过验证的 SI 力单位。 | SDK 解析、bias 和 contact producer 静态追踪 | 不能把数值直接解释为 N 或反推出 SDK 原始值；读取时联合 freshness、calibration 和 unit code。 |
-| 6 | P2 | H5-05 | `arm_tau` 是 xArm SDK 基于电流估计的 `effort`，精确物理单位未由当前 API 合同确认。 | SDK 调用链 + 厂商公开说明交叉核查 | 不适合作为标定力矩真值或直接安全阈值；在厂商合同确认前仅用于同设备相对趋势。 |
-| 7 | P3 | H5-06 | 绕过标准 RecorderIO 直接调用底层 recorder 时，首帧额外 diagnostics 可形成非标准 dataset，且同名值可覆盖默认语义。 | writer/buffer 静态确认 | 第三方 episode 可能超出标准 97-field 合同；为长期扩展定义命名空间、版本和冲突检查。 |
+| 1 | P1 | H5-07 | reader 与 writer finalizer 没有共享完整 v16 dataset 合同，受损文件可被误判为 `VALID`。 | 已复现并修复 | 96 个基础字段和 `action_arm_joint_sent` 条件规则现由同一 schema 模块校验；未知历史扩展也必须首维为 `N`。 |
+| 2 | P1 | H5-02 | align 会形成共同像素 viewport，但 aligned Z16 仍保留 source depth-camera 的轴向 Z；旧路径还允许把 depth-frame rays 套入 color 外参。 | producer、标定链及 librealsense 2.54.2 实现交叉核查；部分修复 | 生产已拒绝 `color_to_depth/none`，消除了更大的 frame mismatch；但当前 `depth_to_color` 点云仍是近似几何，严格修复需保存源 depth intrinsics、depth↔color extrinsic、distortion 并重投影。 |
+| 3 | P1 | H5-03 | XHand 数量不足/缺失的 `sensor_data` 被零填充，甚至可能被标成 fresh/calibrated；同时 `0.1` 缩放不是已验证 SI 换算。 | fake 缺失传感器帧运行复现；已修复 | 严查 5×120×3 有限 payload；失效触觉立即发布 `fresh=False`，但不丢弃同帧有效关节反馈。 |
+| 4 | P1 | H5-04 | held/failure 路径不存在求解器 raw 输出，但 v16 兼容 fallback 会把最终/hold 命令写入两个 `*_raw` 字段。 | recorder buffer 运行复现；已修复消费合同 | 保留 v16 存值，reader 提供 arm/hand 保守 raw-valid mask；不在 v16 内改成 NaN 或增加 dataset。 |
+| 5 | P2 | H5-05 | `arm_tau` 单位未经合同确认，且 arm worker 启动首帧曾把 qvel/effort 人工置零却标有效。 | SDK 调用链、厂商说明和启动路径核查；已修复可修部分 | 启动即读取 `num=3` 真实反馈；metadata 明示 current-estimated effort、单位未验证，不做 N·m 换算。 |
+| 6 | P2 | H5-01 | `arm_ee` 原生为 xArm base frame；当前 runtime 明确令 planner world 等于 base，因此不是现存数值 bug。 | FK、mapper、workspace 与 runtime 配置交叉核查；已加固 | 保持 v16 数值含义，修正误导命名并持久化 frame/invariant；未来支持非单位 base pose 必须升级合同并整体审计。 |
+| 7 | P3 | H5-06 | 底层 recorder 对任意 diagnostics 既可覆盖核心字段，又可能形成未声明 dataset。 | writer/buffer 静态确认；已修复 | 固定 diagnostics allowlist，并冻结 source key/shape/dtype；reader 仍可读取首维为 `N` 的历史扩展。 |
 
-H5-07 不表示当前标准 RecorderIO 正常产生的 episode 已缺少字段：标准路径仍会创建第 4 节
-列出的 97 个 dataset。风险集中在手工构造、受损文件以及未来 writer/reader 字段漂移；在
-修复共享 schema 校验前，消费方仍须显式检查自己依赖的非核心字段。
+H5-07 不表示既有标准 RecorderIO episode 普遍缺字段：标准路径启用
+`arm_sent_stream=True`，会创建 96 个基础 dataset 加 `action_arm_joint_sent`，合计 97 个。
+底层 `EpisodeRecorder(arm_sent_stream=False)` 的合法 v16 则只有 96 个基础字段。两种布局现均由
+共享 schema 校验，不再把第 97 个条件字段误写成所有 v16 文件的无条件要求。
 
 ## 1. Episode 不是单个 HDF5 文件
 
@@ -124,9 +126,9 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 ### 2.3 坐标和旋转
 
 - `arm_ee` 的直接生产者输出 xArm base frame；`hand_fingertip` 由该 pose 链接 hand FK，
-  因而继承相同基准。当前默认 `base_pose_world` 为单位变换，所以二者数值上与 world
-  重合，但这不是字段自身保证；详见第 10.1 节。
-- 目标 EEF 和点云使用机器人 `world` 坐标系。
+  因而继承相同基准。当前支持的 Real runtime 明确维持 `world == xarm_base`，所以状态、
+  目标 EEF 和点云位于同一数值坐标系；这是一项运行不变量，不是对任意非单位
+  `base_pose_world` 的支持。详见第 10.1 节。
 - `vr_*` 是从 Unity 左手坐标转换后的 **FLU**（Forward、Left、Up）操作者/VR
   坐标，位置和 landmark 单位为米；它们尚未变换到机器人 world。
 - 所有四元数字段均按 `[w,x,y,z]` 排列，无单位，正常值为单位四元数。
@@ -143,7 +145,7 @@ episode_YYYYMMDD_HHMMSS[_序号]/
   会重新锚定网格，因此真实暂停表现为 timestamp 跳变，而不是合成动作。
 - `camera_device_timestamp_s` 属于 RealSense 设备时钟；它与主机单调时钟不是同一原点。
 
-## 3. `data.h5` 的 `/meta` group（64 attributes）
+## 3. `data.h5` 的 `/meta` group
 
 `/meta` 本身没有 dataset，所有信息都是 HDF5 attribute。Python 字符串由 h5py
 写成 UTF-8 字符串 attribute；表中数值标量通常对应 HDF5 `int64`、`float64` 或
@@ -181,13 +183,17 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 | `camera_name` | UTF-8 字符串 | — | 条件存在；由在线序列号解析出的 `cameras.json` 条目名。 |
 | `camera_serial` | UTF-8 字符串 | — | 条件存在；实际 RealSense 序列号。 |
 | `camera_type` | 字符串 | — | 条件存在；`eye_to_hand` 或 `eye_in_hand`。 |
-| `camera_K` | float64 `(9,)` | pixel | 条件存在；按行展开的 3×3 内参矩阵 `[fx,0,cx;0,fy,cy;0,0,1]`。 |
-| `camera_T_world_camera` | float64 `(16,)` | 平移 m | eye-to-hand 时条件存在；按行展开的 4×4 齐次矩阵，camera → world。 |
-| `camera_T_eef_camera` | float64 `(16,)` | 平移 m | eye-in-hand 时条件存在；按行展开的 4×4 齐次矩阵，camera → EEF。 |
+| `camera_K` | float64 `(9,)` | pixel | 条件存在；aligned synthetic frame/共同像素 viewport 的 3×3 内参。标准生产模式下是 color K；它不表示 aligned Z16 已成为 color-optical Z，也不包含 distortion。 |
+| `camera_T_world_camera` | float64 `(16,)` | 平移 m | eye-to-hand 时条件存在；标定得到的 color-optical camera → world 变换。 |
+| `camera_T_eef_camera` | float64 `(16,)` | 平移 m | eye-in-hand 时条件存在；标定得到的 color-optical camera → EEF 变换。 |
 | `depth_scale` | float64 标量 | m/raw-unit | 条件存在；`depth * depth_scale` 得米，L515 常见值为 0.00025，但必须使用文件内值。 |
 | `camera_firmware` | 字符串 | — | 相机固件版本；不可用时为 `unknown`。 |
 | `camera_sdk_version` | 字符串 | — | pyrealsense2/SDK 版本；不可用时为 `unknown`。 |
-| `camera_actual_profile_json` | JSON 字符串 | — | 实际 RGB/depth stream profile 与 align mode。 |
+| `camera_actual_profile_json` | JSON 字符串 | — | 实际 RGB/depth stream profile 与 align mode；标准生产 episode 的 mode 必须为 `depth_to_color`。 |
+| `camera_alignment_mode` | 字符串 | — | 条件存在；标准生产值为 `depth_to_color`，并与实际 profile 交叉校验。 |
+| `camera_common_viewport` | 字符串 | — | 条件存在；标准生产值为 `color`，说明处理后 RGB/depth 共用 color viewport。 |
+| `camera_K_optical_frame` | 字符串 | — | 条件存在；标准生产值为 `camera_color_optical`。 |
+| `camera_output_optical_frame` | 字符串 | — | 条件存在；当前 writer 声明值为 `camera_color_optical`。由于 aligned Z16 仍是 source-depth Z，现有点云算法并未严格证明这一 3D frame；消费方应把它视为 producer 声明而非几何真值。 |
 | `camera_pointcloud_config_json` | JSON 字符串 | 多单位 | 点云过滤、裁剪和采样配置；若处理器未启用则通常为 `{}`。 |
 | `camera_writer_queue_size` | int64 标量 | 项 | Recorder 侧车 writer 的有界队列容量。 |
 | `camera_encoding_codec` | 字符串 | — | `rgb.mp4` 编码器名称。 |
@@ -230,9 +236,40 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 
 `EpisodeRecorder` 还允许调用方通过 `provenance` 添加任意
 `provenance_<key>` 字符串 attribute，并允许 START 时的 `camera_metadata` 添加小型
-attribute。上表列出当前标准采集入口实际提供的全部键；未知扩展键不能被当作跨版本固定合同。
+attribute。本节各表列出当前标准采集入口实际提供的全部键；未知扩展键不能被当作跨版本固定合同。
 
-## 4. `data.h5` datasets（97 个）
+### 3.4 Frame、raw action 与物理量 provenance
+
+下列 additive attributes 自 2026-08-16 的 v16 writer 起写入，用于把既有数值语义机器可读化；
+它们不改变 dataset layout，历史 v16 缺少这些属性仍可由 reader 读取。
+
+| Attribute | 类型 | 当前值/语义 |
+|---|---|---|
+| `robot_world_frame` | 字符串 | `xarm_base`。 |
+| `robot_world_equals_xarm_base` | bool | `True`；当前受支持 runtime 的显式不变量。 |
+| `arm_ee_frame` | 字符串 | `xarm_base`。 |
+| `action_arm_ee_frame` | 字符串 | `xarm_base`；等价于当前 runtime world。 |
+| `hand_fingertip_frame` | 字符串 | `xarm_base`。 |
+| `action_arm_joint_raw_validity_expression` | 字符串 | `flag_sample_valid & ~flag_held & flag_ik_ok`。 |
+| `action_hand_joint_raw_validity_expression` | 字符串 | `flag_sample_valid & ~flag_held & flag_retarget_ok`。 |
+| `tactile_sdk_scale_factor` | float64 | `0.1`；保持部署数值尺度，不声明为 SI conversion。 |
+| `tactile_unit` | 字符串 | `sdk_scaled_unknown_si`。 |
+| `tactile_si_unit_verified` | bool | `False`。 |
+| `tactile_bias_semantics` | 字符串 | 启动软件 bias 在可用时扣除；逐行看 `tactile_calibrated`。 |
+| `tactile_contact_metric` | 字符串 | 每指 `hand_contact` 三轴的 L2 norm。 |
+| `tactile_contact_threshold` | float64 | 当前生产值 `1.0`，单位同缩放后 SDK 值。 |
+| `tactile_contact_comparison` | 字符串 | `strict_greater_than`。 |
+| `arm_tau_source` | 字符串 | `xarm_get_joint_states_num_3_effort`。 |
+| `arm_tau_unit` | 字符串 | `unknown`。 |
+| `arm_tau_si_unit_verified` | bool | `False`。 |
+| `arm_tau_sensor_semantics` | 字符串 | current-estimated effort，不是 direct torque sensor。 |
+
+## 4. `data.h5` datasets（96 个基础字段 + 1 个条件字段）
+
+96 个基础 dataset 是所有合法 v16 episode 的无条件合同。仅当
+`/meta.arm_sent_stream=True` 时，第 97 个 `action_arm_joint_sent` 必须存在；该 dataset 存在而
+marker 缺失/为假同样是无效布局。标准 RecorderIO 总是启用此流，因此其正常输出仍为
+97 个 dataset。
 
 ### 4.1 控制网格与因果填充
 
@@ -253,8 +290,8 @@ attribute。上表列出当前标准采集入口实际提供的全部键；未�
 |---|---:|---|---|---|
 | `arm_qpos` | `(N,A)` | float64 | rad | xArm7 实测关节位置，SDK/模型关节顺序。 |
 | `arm_qvel` | `(N,A)` | float64 | rad/s | 实测关节速度。 |
-| `arm_tau` | `(N,A)` | float64 | SDK effort；精确 SI 单位未验证 | xArm `get_joint_states(num=3)` 返回的电流估算 effort；不是直接力矩传感器真值。读取失败的兼容路径可能写零；详见第 10.5 节。 |
-| `arm_ee` | `(N,9)` | float64 | 前 3 列 m | 实测 EEF pose：`[x,y,z,rot6d(6)]`，原生为 xArm base frame；当前默认 base/world 重合，详见第 10.1 节。 |
+| `arm_tau` | `(N,A)` | float64 | SDK effort；精确 SI 单位未验证 | xArm `get_joint_states(num=3)` 返回的电流估算 effort；不是直接力矩传感器真值。启动和正常反馈均读取真实 effort；失败占位只能结合无效状态使用。详见第 10.5 节。 |
+| `arm_ee` | `(N,9)` | float64 | 前 3 列 m | 实测 EEF pose：`[x,y,z,rot6d(6)]`，原生为 xArm base frame；当前受支持 runtime 明确令 base/world 重合，详见第 10.1 节。 |
 | `arm_connected` | `(N,)` | bool | — | 该状态构建时机械臂反馈是否连接/可读。 |
 | `arm_last_cmd_seq` | `(N,)` | int64 | 序号 | arm worker 最近成功处理的命令序号。 |
 | `arm_last_cmd_queue_latency_s` | `(N,)` | float64 | s | 命令创建到 arm queue 接收的延迟。 |
@@ -268,7 +305,7 @@ attribute。上表列出当前标准采集入口实际提供的全部键；未�
 |---|---:|---|---|---|
 | `hand_qpos` | `(N,H)` | float64 | rad | XHand 实测关节位置，SDK/模型关节顺序。 |
 | `hand_current` | `(N,H)` | float64 | mA | 每个手部电机的电流；不可用时为 `NaN`。 |
-| `hand_fingertip` | `(N,F,3)` | float64 | m | 由 `arm_ee` 和 hand FK 链式计算的 5 个指尖位置，继承 xArm base frame；当前默认与 world 重合。不可计算时为 `NaN`；详见第 10.1 节。 |
+| `hand_fingertip` | `(N,F,3)` | float64 | m | 由 `arm_ee` 和 hand FK 链式计算的 5 个指尖位置，继承 xArm base frame；当前 runtime world 与其相同。不可计算时为 `NaN`；详见第 10.1 节。 |
 | `hand_contact` | `(N,F,3)` | float64 | SDK-scaled，物理单位未验证 | 每指三轴触觉合力/汇总值，经过 `0.1` 缩放和可选 bias 扣除；不是布尔接触结果。详见第 10.3 节。 |
 | `hand_tactile_force` | `(N,F,T,3)` | float64 | SDK-scaled，物理单位未验证 | 每指 120 个触觉点的三轴值，经过 `0.1` 缩放和可选 bias 扣除；不得解释成 N。详见第 10.3 节。 |
 | `hand_tactile_contact` | `(N,F)` | bool | — | XHand `detect_contact` 给出的逐指接触判断。 |
@@ -311,7 +348,9 @@ action_arm_joint_raw
 ```
 
 该顺序只描述存在显式 IK raw 解的正常路径。对 `flag_frame_status != OK` 的行，不得仅凭
-字段名把 `action_arm_joint_raw` 或 `action_hand_joint_raw` 解释为求解器原始输出。
+字段名把 `action_arm_joint_raw` 或 `action_hand_joint_raw` 解释为求解器原始输出；优先使用
+`EpisodeReader.action_arm_joint_raw_valid_mask` 和
+`EpisodeReader.action_hand_joint_raw_valid_mask`。
 
 ### 4.5 Observation/action 因果协议
 
@@ -412,13 +451,14 @@ hold 槽会沿用上一 payload；没有历史时用全零图像。无论 RGB/de
 
 | HDF5 path | Shape | dtype | chunk | 压缩 | 单位与意义 |
 |---|---:|---|---|---|---|
-| `/depth` | `(N,IH,IW)` | uint16 | `(1,IH,IW)` | gzip level 1 | 对齐处理后的 Z16 深度值。`depth_to_color` 时位于 RGB/color 平面，`color_to_depth` 时位于 depth 平面；米值为 `depth.astype(float32) * /meta.depth_scale`。0 表示无有效深度/占位。 |
+| `/depth` | `(N,IH,IW)` | uint16 | `(1,IH,IW)` | gzip level 1 | 对齐处理后的 Z16。`depth_to_color` 时像素落点位于 RGB/color viewport，但数值仍是 source depth-camera 的轴向 Z；`color_to_depth` 时 viewport 为 depth。米值为 `depth.astype(float32) * /meta.depth_scale`，0 表示无效/占位。 |
 
 不得固定假设 1 raw unit = 1 mm；L515 当前常见 scale 是 0.00025 m，但每个 episode
 必须读取自己的 `/meta.depth_scale`。
 
-还必须读取 `/meta.camera_actual_profile_json` 的 `align_mode`，不能无条件把 `/depth`
-解释为 RGB 平面；详见第 10.2 节。
+还必须读取 `/meta.camera_actual_profile_json` 的 `align_mode`、两路 distortion，并区分
+pixel viewport 与 depth-value optical frame；不能把“对齐到 RGB 像素”解释为“已得到严格
+color-camera pinhole depth”。详见第 10.2 节。
 
 ### 5.2 `pointcloud.h5`
 
@@ -430,6 +470,10 @@ hold 槽会沿用上一 payload；没有历史时用全零图像。无论 RGB/de
 裁剪、体素/离群点过滤以及定长采样。点数多于 `M` 时下采样；少于 `M` 时随机重复
 已有点，因此 `pointcloud_padding_count>0` 不代表尾部元素是 0。只有
 `flag_pointcloud_valid=True` 才能把该槽解释为有效点云；否则整个 `(M,6)` 为 0。
+
+`flag_pointcloud_valid=True` 表示生产管线成功，不表示严格相机几何已经成立。当前管线用
+color K 的 ray 直接乘 aligned source-depth Z，且未把非零 color distortion 纳入反投影；
+因此历史 `/pointcloud` 应标为 approximate，不应作为标定级 world geometry 真值。
 
 ## 6. `rgb.mp4` 与 HDF5 的关系
 
@@ -487,12 +531,10 @@ RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
 `flag_sample_valid`、`observation_valid`、`flag_camera_fresh`、
 `flag_pointcloud_valid`、`flag_frame_status`、连接状态及触觉 freshness。
 
-当前 reader 的“必需 dataset”集合只有 37 个核心字段，并不等于第 4 节的 97 个标准
-`data.h5` dataset。特别是 `arm_qpos`、`arm_qvel`、`flag_camera_fresh`、
-`flag_pointcloud_valid` 和 `flag_frame_status` 不属于当前 `VALID` 的存在性检查；消费方在
-依赖这些字段前仍须自行检查。`action_arm_joint_sent` 对未启用 `arm_sent_stream` 的底层
-recorder 调用本来就是可选字段，不应与前述标准状态/质量字段混为一谈。该校验缺口列为
-H5-07。
+reader 与 writer finalizer 现复用 `recording.episode_schema`：无条件要求 96 个基础字段，
+再按 `/meta.arm_sent_stream` 校验 `action_arm_joint_sent`。历史自定义 dataset 可以继续读取，
+但也必须是逐帧 dataset 且首维等于 `N`。完整布局校验并不替代逐行质量筛选；例如 raw
+action 的语义有效性、触觉 freshness 和点云有效性仍须使用各自 mask。
 
 ## 8. 读取示例
 
@@ -534,6 +576,21 @@ with EpisodeReader(episode_dir) as reader:
 点云任务还应额外加入 `f["flag_pointcloud_valid"][:]`。如果读取的是手工创建的 v16
 episode，应先检查 `"action_arm_joint_sent" in f`；标准 RecorderIO 录制包含该流。
 
+### 8.3 只解释确实存在的 raw action
+
+```python
+with EpisodeReader(episode_dir) as reader:
+    reader.require_valid("raw-action analysis")
+    arm_raw_ok = reader.action_arm_joint_raw_valid_mask
+    hand_raw_ok = reader.action_hand_joint_raw_valid_mask
+
+    arm_raw = reader.h5f["action_arm_joint_raw"][:][arm_raw_ok]
+    hand_raw = reader.h5f["action_hand_joint_raw"][:][hand_raw_ok]
+```
+
+这两个 mask 是保守语义边界，不会改写 HDF5。被排除的 held/failure 行仍保留 v16 的兼容
+fallback 数值，但不能被解释为求解器/retargeter 的原始输出。
+
 ## 9. 容易混淆但未持久化的信息
 
 - `data.h5` 没有保存完整 resolved config，只保存 SHA-256；配置还原需依赖外部实验配置。
@@ -547,62 +604,81 @@ episode，应先检查 `"action_arm_joint_sent" in f`；标准 RecorderIO 录制
 
 ## 10. 已知问题与解释边界
 
-本节记录 2026-08-15 初审及 2026-08-16 fact-check 对 writer、producer、reader 和已安装
-设备 SDK 进行交叉核查后确认的问题。这里的“问题”包括已经在正文澄清的历史歧义，以及
-数据本身无法提供充分物理保证的边界。除非下文明确说明，否则这些问题不改变第 4 节列出
-的标准 v16 dataset 名称、shape 或 dtype。
+本节记录 2026-08-15 初审及 2026-08-16 fact-check 对 writer、producer、reader、标定程序、
+已安装 SDK 和厂商公开合同进行交叉核查后确认的问题及修复。7 项均只涉及 DexMani Real；
+未修改第 11 节的 DexMani Sim 合同。此次修复不改变 v16 dataset 的名称或数值含义，也不
+伪造无法由现有数据证明的物理单位。
 
-> **严重度统计：** 高 2 项、中 4 项、低 1 项。状态中的“文档已澄清”不表示底层代码或
-> 文件合同已经迁移，只表示本文不再沿用已确认的错误表述。
-
-| ID | 级别 | 影响字段 | 类型 | 状态 | 核查结论 |
+| ID | 优先级 | 影响字段 | 成因分类 | 修复状态 | 必要性结论 |
 |---|---|---|---|---|---|
-| H5-01 | 高 | `arm_ee`、`hand_fingertip` | 坐标系契约 | 文档已澄清；代码合同待统一 | `arm_ee` 的直接生产者输出 arm base frame；当前默认 base/world 为单位变换，所以数值重合，但不能把“world”视为字段固有合同。 |
-| H5-02 | 中 | `/depth`、`/meta.camera_K` | 对齐语义 | 文档已澄清 | `/depth` 位于对齐后的 depth frame；只有 `depth_to_color` 才是 color/RGB 平面，`color_to_depth` 时是 depth 平面。 |
-| H5-03 | 中 | `hand_contact`、`hand_tactile_force`、`hand_tactile_contact` | 单位/处理语义 | 文档已补充 | 触觉值经过 `0.1` 缩放和可选软件 bias 扣除；接触由每指三轴汇总值的 L2 范数与阈值比较。 |
-| H5-04 | 中 | `action_arm_joint_raw`、`action_hand_joint_raw` | 动作语义 | 文档已修正；代码合同未区分 raw 有效性 | 正常路径保存显式 raw 值；held/failure 路径未提供 raw 时，录制层回退为当帧 hold/最终命令。 |
-| H5-05 | 中 | `arm_tau` | 单位/传感器来源 | 待厂商合同确认 | 数据是 xArm SDK `get_joint_states(..., num=3)` 的 `effort`；官方资料说明它是基于电流的估计值而非直接力矩传感器读数，API 未明确给出精确单位。 |
-| H5-06 | 低 | 非标准 diagnostics | 扩展边界 | 已确认；非标准 schema | 标准 RecorderIO 字段清单完整；直接调用底层 recorder 时，第一帧的额外 diagnostics key 可能形成自定义 `float64` dataset。 |
-| H5-07 | 高 | `EpisodeReader.validity`、标准 v16 datasets | 完整性校验 | 运行复现；代码待修复 | reader 只要求 37 个核心字段；缺少 `arm_qpos` 和多个标准质量字段的手工/受损 episode 仍可判为 `VALID`。 |
+| H5-01 | P2 | `arm_ee`、`hand_fingertip`、`action_arm_ee` | 隐含 frame 不变量与误导命名 | 已修复 | 当前运行没有数值错误；为防未来非单位 base pose 被静默误用，需要自描述 metadata 和明确命名。 |
+| H5-02 | P1 | `/depth`、RGB、`camera_K`、世界点云 | pixel viewport、depth scalar frame、distortion 与外参合同不完整 | 部分修复 | 已拒绝 `color_to_depth/none`；`depth_to_color` 仍原样携带 source-depth Z，且 K 不编码 distortion，现有点云只能视为 approximate。 |
+| H5-03 | P1 | `hand_contact`、`hand_tactile_force`、`hand_tactile_contact` | 缺失 payload 被零填充；单位 provenance 不足 | 已修复可修部分 | 必须阻止缺失传感器被当作“有效零接触”；SI 换算仍无证据，故保留 unknown 而不是猜测。 |
+| H5-04 | P1 | `action_arm_joint_raw`、`action_hand_joint_raw` | v16 fallback 混合了 raw 与最终/hold 语义 | 已修复消费合同 | 训练 clamp/retarget 差异前必须有逐行 mask；改变存值或新增 valid dataset 会改变 v16 合同，本轮不做。 |
+| H5-05 | P2 | `arm_tau`、启动首帧 `arm_qvel` | 单位误注释；启动只读 position 后伪造零值 | 已修复可修部分 | 有效首帧不能包含人工 qvel/effort；精确物理单位仍待对应机型/固件的厂商合同。 |
+| H5-06 | P3 | diagnostics 扩展 | 开放 key 覆盖与首帧动态 schema | 已修复 | 标准入口风险低，但底层 API 必须拒绝未知 key、核心冲突和 shape 漂移。 |
+| H5-07 | P1 | 全部 `data.h5` datasets | reader/writer 各自维护不完整合同 | 已修复 | `VALID` 是所有消费入口的信任边界，必须覆盖完整 96+1 条件布局。 |
 
 ### 10.1 H5-01：`arm_ee` 与 `hand_fingertip` 的坐标系依赖
 
-事实链如下：
+成因事实链如下：
 
 1. arm worker 使用 `planning.kinematics.ArmFK.compute(qpos)` 生成 `eef_pos` 和
    `eef_rot6d`；该函数明确定义输出 arm base frame。
-2. 标准 teleop 创建 planner 时将 `base_pose_world` 设置为单位 pose，因此当前默认运行的
-   arm base 与 planner world 数值重合。
-3. `teleop.episode_samples._build_robot_state()` 将上述 `eef_pos` 直接作为
-   `T_world_eef`，再与 `T_eef_handbase` 和 hand FK 组合得到 `hand_fingertip`。
+2. 标准 teleop 将 `base_pose_world` 固定为单位 pose，arm mapper 也明确假定
+   `world == xarm_base`；workspace 和障碍定义在同一 base frame。
+3. `teleop.episode_samples._build_robot_state()` 的数值链正确，但局部变量曾误命名为
+   `T_world_*`，令读者误以为代码执行了额外 world 变换。
 
-因此，当前默认配置生成的 `arm_ee` 和 `hand_fingertip` 可按 world 数值使用，但更严格的
-字段合同是：`arm_ee` 原生属于 arm base frame，world 解释依赖当前单位
-`base_pose_world`。如果未来允许非单位 base pose，必须先统一 arm state 的坐标约定并审计
-指尖变换，不能只修改 metadata 标签。
+必要性评估为 P2：当前受支持 runtime 中这些数值一致，不应把 H5-01 当作现存数据损坏，
+更不能在 v16 内突然变换 `arm_ee`。实施上仅把局部变量改为 `T_base_*`，并为新 episode
+写入 `robot_world_frame=xarm_base`、`robot_world_equals_xarm_base=True`、
+`arm_ee_frame`、`action_arm_ee_frame` 和 `hand_fingertip_frame`。未来若支持非单位 base pose，
+必须升级坐标合同，并一起审计 mapper translation、指尖 FK、相机、点云和 replay。
 
 代码定位：`robot/arm_loop.py::_arm_fk.compute`、
 `planning/kinematics.py::ArmFK.compute`、`teleop/loop.py::XArm7PlannerConfig`、
 `teleop/episode_samples.py::_build_robot_state`。
 
-### 10.2 H5-02：`/depth` 的目标平面取决于 align mode
+### 10.2 H5-02：共同 pixel viewport 不等于共同 depth optical frame
 
-相机抓帧先执行 `aligner.process(frames)`，随后把处理后的 depth frame 的 Z16 buffer 写入
-`/depth`。生产 camera loop 禁止 `align_mode=none`，但允许：
+原问题表述“`color_to_depth` 时 RGB/depth 没有共同 viewport”不成立。RealSense align 会生成
+共享 resolution/像素 viewport：`depth_to_color` 的目标是 color pixels，`color_to_depth` 的
+目标是 depth pixels。[RealSense Projection 文档](https://github.com/realsenseai/librealsense/wiki/Projection-in-RealSense-SDK-2.0)
+说明了该投影关系。
 
-- `depth_to_color`：depth 对齐到 color，`/depth` 与 RGB/color 平面对应；
-- `color_to_depth`：color 对齐到 depth，`/depth` 保持在 depth 平面。
+但进一步核查本环境使用的 librealsense 2.54.2 实现后，发现共同 viewport 不能推出共同
+depth-value frame：
 
-消费方必须读取 `/meta.camera_actual_profile_json` 中的 `align_mode`，并将
-`/meta.camera_K` 理解为处理后 depth frame 对应的内参。不能无条件假设 `/depth` 已对齐到
-RGB 平面。
+1. `align_images()` 用 source depth intrinsics 和 depth→target extrinsic 计算目标 pixel；
+2. `align_z_to_other()` 随后把原 `z_pixels[z_pixel_index]` 直接复制到目标 pixel，并未写入
+   变换后 3D 点的 target-camera `z`；
+3. synthetic aligned profile 却改用 target color intrinsics；当前 Real producer 再用这个
+   color K 做 `K^-1 ray * source_depth_z`，忽略可能非零的 color distortion，最后应用
+   color-optical 外参。
 
-代码定位：`sensor/realsense.py::RealSense.create_aligner`、
-`sensor/realsense.py::RealSense.get_frame`、`sensor/camera_process.py::camera_loop`。
+官方实现证据见
+[librealsense v2.54.2 `align.cpp`](https://raw.githubusercontent.com/IntelRealSense/librealsense/v2.54.2/src/proc/align.cpp)
+的 `align_z_to_other()` 与 `create_aligned_profile()`。因此当前生产点云是近似几何，不能把
+`camera_output_optical_frame=camera_color_optical` 当作严格证明。
+
+本轮代码已让生产 `camera_loop` 和 `RecorderIOConfig` fail-closed 为 `depth_to_color`，从而
+消除了旧 `color_to_depth` 路径把 depth-frame rays 直接套入 color 外参的更大错误；START
+也会交叉核验 mode/profile 并记录四个 camera geometry attributes。但这只是**部分修复**。
+
+严格修复需要保存 source depth K、depth↔color extrinsic、两路 distortion 和未对齐 depth，
+逐像素恢复 depth-camera 3D 点、变换到 color frame 并重算 `z_C`，再进行遮挡处理；或在采集
+时保存 SDK 生成且 frame 明确的 3D vertices。现有历史 v16 缺少上述充分 provenance，无法
+离线恢复严格 color-optical depth/pointcloud。转换和训练必须将其标为 approximate。
+
+代码定位：`examples/calibrate_camera.py`、`sensor/realsense.py::RealSense.read`、
+`utils/pointcloud_utils.py::make_rays`、`sensor/camera_process.py::camera_loop`、
+`recording/io_process.py::_camera_geometry_from_profile`。
 
 ### 10.3 H5-03：触觉值不是未经处理的 SDK 原值
 
-`hand_tactile_force` 和作为 `hand_contact` 写入的逐指三轴汇总值都经过以下处理：
+这里有两个成因。第一，`hand_tactile_force` 和作为 `hand_contact` 写入的逐指三轴汇总值都
+经过以下处理：
 
 1. SDK 各轴读数乘以 `0.1`；该因子用于兼容现场阈值，不代表已验证的 SI 单位换算；
 2. 如果启动阶段成功估计了软件 bias，则逐点或逐指减去对应 bias；
@@ -610,11 +686,19 @@ RGB 平面。
    `norm(hand_contact[f, :], ord=2) > tactile_contact_threshold` 计算；
 4. 默认 `tactile_contact_threshold=1.0`，单位与缩放后的三轴汇总值相同，仍不得解释为 N。
 
-分析触觉数据时还应同时检查 `tactile_fresh`、`tactile_calibrated` 和
-`tactile_unit_code`；布尔接触结果不能反推出未经缩放或未经 bias 处理的 SDK 原始数据。
+第二，旧 `_iter_sensors()` 接受少于 5 个传感器，`parse_tactile*()` 又以零初始化；因此完整
+关节帧配上空 `sensor_data` 会被解释为全零力/无接触，甚至可能进入 calibration 流。这是
+真实的数据真实性 bug，而不只是单位文档问题。
 
-代码定位：`robot/xhand.py::parse_tactile`、`robot/xhand.py::parse_tactile_sum`、
-`robot/xhand.py::detect_contact`。
+实施上，XHand 边界要求恰好 5 个 sensor、每个 `raw_force` 恰好 120 点，且 calc/raw 的
+所有 xyz 有限。失败时进程内 `XHandSample.tactile_valid=False`，保留同帧完整关节反馈，
+hand worker 立即发布 `fresh=False, calibrated=False` 的触觉帧；启动 calibration 也
+fail-closed。v16 已有 freshness/calibration/unit 字段，因此无需新增 dataset。metadata 记录
+缩放、bias、阈值规则和 `tactile_si_unit_verified=False`；消费方仍必须联合三个逐行标志，
+不能把数值解释为 N。
+
+代码定位：`robot/xhand.py::_parse_tactile_payload`、
+`robot/xhand.py::XHandSample.tactile_valid`、`robot/hand_process.py::_build_tactile_frame`。
 
 ### 10.4 H5-04：两个 raw action 字段都是分路径定义
 
@@ -629,9 +713,21 @@ delta clip、操作限位 clip 和 `_sanitize_hand_command()` 后续校验之前
 - `_record_held()` 不提供两个 raw 字段，因此 IK failure、safety reject 和其他主动 hold 行
   会把 hold/最终 arm、hand 命令写入对应的 `*_raw` dataset。
 
-因此只有正常路径的行适合用这两个字段分析 clamp/ramp 前后差异。读取时必须联合
-`flag_frame_status`、`flag_held`、`flag_ik_ok` 和 `flag_retarget_ok`；当前 schema 没有独立的
-raw-valid 标志，不能只凭 dataset 名称断言某一行存在求解器原始输出。
+根因不只在 `_record_held()`：RecorderClient 和 EpisodeRecorder 都有兼容 fallback，而旧
+reader 又要求所有 source 行的 raw 数值有限，三者共同迫使“不存在的 raw”伪装成最终命令。
+
+必要性为 P1，但不能静默更改 v16 数值意义。实施上保留历史兼容存值，并由 reader 暴露
+两个保守 mask：
+
+```python
+arm_raw_ok = reader.action_arm_joint_raw_valid_mask
+hand_raw_ok = reader.action_hand_joint_raw_valid_mask
+# arm  = flag_sample_valid & ~flag_held & flag_ik_ok
+# hand = flag_sample_valid & ~flag_held & flag_retarget_ok
+```
+
+相同表达式也写入新 episode metadata。需要 NaN 语义或独立 raw-valid dataset 时，应升 schema
+并同步 writer、reader、训练、可视化与 replay，而不是在 v16 中就地修改。
 
 代码定位：`teleop/hand_retarget.py::TAGHandRetargeter.last_raw_qpos`、
 `teleop/hand_control.py::_get_raw_hand_command`、`teleop/loop.py::teleop_loop`、
@@ -642,8 +738,11 @@ raw-valid 标志，不能只凭 dataset 名称断言某一行存在求解器原�
 
 `arm_tau` 原样持久化 xArm SDK `get_joint_states(is_radian=True, num=3)` 返回值中的第三个
 数组。SDK 将其命名为 `effort`；UFACTORY 的 ROS 说明进一步指出 effort 是基于电流的估计
-值，而不是直接关节力矩传感器反馈，只适合参考。当前仓库内部按 N·m 标注，但已核查的
-SDK API 没有明确给出这个返回数组的精确单位。
+值，而不是直接关节力矩传感器反馈，只适合参考。旧 `RobotState` 注释错误地写成 N·m，
+但已核查的 SDK API 没有明确给出这个返回数组的精确单位。
+
+另一个窄窗 bug 是 arm worker 启动只请求 `num=1` position，随后把 qvel/effort 人工置零并
+发布 `state_valid=True`。标准人工开始录制通常晚于该窗口，但合法有效状态不应包含伪造值。
 
 在获得与当前 xArm7 机型、固件版本对应的厂商单位合同前：
 
@@ -651,50 +750,52 @@ SDK API 没有明确给出这个返回数组的精确单位。
 - 不应把它当成经过标定的关节力矩真值；
 - 不应直接用于跨设备动力学标定、接触力反演或安全阈值设计。
 
+实施上，启动 readiness 前即请求 `num=3`，通过与稳态相同的
+`_decode_joint_state_feedback()` 严查并发布真实 qvel/effort；失败继续使用原有有界重试，
+不再发布“有效零值”。注释与 metadata 改为 current-estimated effort、unit unknown、
+SI unverified，未做任何 N·m 换算。
+
 代码定位：`robot/arm_loop.py::_decode_joint_state_feedback`、
 `robot/arm_loop.py::arm_loop`、已安装 xArm SDK `XArmAPI.get_joint_states`。
-外部依据：[UFACTORY Python SDK `get_joint_states`](https://github.com/xArm-Developer/xArm-Python-SDK/blob/master/xarm/wrapper/xarm_api.py#L3908-L3921)、
+外部依据：[UFACTORY Python SDK `get_joint_states`](https://github.com/xArm-Developer/xArm-Python-SDK/blob/master/xarm/wrapper/xarm_api.py)、
 [UFACTORY xarm_ros 状态反馈说明](https://github.com/xArm-Developer/xarm_ros#obtaining-status-feedback)。
 
-### 10.6 H5-06：底层 recorder 支持非标准 diagnostics 扩展
+### 10.6 H5-06：diagnostics 不再是隐式 schema 扩展口
 
-标准 RecorderIO v16 传入固定 diagnostics 集，因此第 4 节列出的 97 个 `data.h5`
-dataset 加上两个相机侧车 dataset 是完整的标准清单。若绕过 RecorderIO 直接调用
-`EpisodeRecorder.add_frame(..., diagnostics=...)`：
+旧底层 API 将任意 diagnostics 直接 `data[key]=value`。首帧额外 key 会冻结成自定义
+dataset，后续新 key 被 buffer 静默忽略，而与核心字段同名的 key 还可覆盖默认语义。
 
-- 第一个成功 source sample 中的额外 key 会参与 `TimestampAlignedBuffer` 的一次性 schema
-  分配，并可能形成额外 `float64` dataset；
-- value 的第一帧 shape 成为该自定义 dataset 的固定尾部 shape；
-- 后续才出现的新 key 不会扩展已经分配的 buffer；
-- 与标准字段同名的 diagnostics value 会覆盖 recorder 为该帧建立的默认值。
-
-这些字段不属于稳定 v16 合同，通用消费方应容忍未知 dataset，但不能依赖其存在或语义。
-直接 recorder 调用方若需要长期交换这些字段，应另行定义扩展 schema、命名空间和版本。
+必要性为 P3，因为标准 RecorderIO 只传固定字段，但开放的底层边界会造成难以审计的 v16
+变体。现在 diagnostics 只允许 11 个已声明 value override，逐项转换为 float64 并检查固定
+tail shape；未知 key、其他核心字段碰撞和错误 shape 在进入 buffer 前立即抛错。writer 在
+buffer 首次接受 source layout 后，还会在每次写入前严格核对 key、shape 和 dtype，避免
+静默 broadcast/cast；flush/finalize 再校验完整布局。reader 为兼容已经存在的历史扩展仍
+允许未知 dataset，但要求其为逐帧数组且首维等于 `N`。
 
 代码定位：`recording/io_process.py::_unpack_sample`、
 `recording/episode_recorder.py::EpisodeRecorder.add_frame`、
-`recording/timestamp_buffer.py::TimestampAlignedBuffer._allocate`。
+`recording/episode_schema.py::normalize_diagnostics_v16`。
 
-### 10.7 H5-07：`VALID` 不是完整 97-field schema 校验
+### 10.7 H5-07：`VALID` 现覆盖完整 96+1 布局
 
-`EpisodeReader.validity` 当前硬编码 37 个核心 dataset，并对这些字段执行首维、时间因果、
-动作 shape/finite 等检查；它还检查 depth、pointcloud 和解码后的 RGB 帧数。但是 reader
-没有复用标准 RecorderIO 的完整字段清单，writer 发布前也只遍历并检查已经存在的
-dataset，不检查标准字段是否缺失。
+旧 `EpisodeReader.validity` 只硬编码 37 个核心 dataset；writer 发布前也只检查“已经存在”的
+dataset 长度，而不检查缺项。
 
 隔离复现构造了一个满足上述核心字段、相机侧车和 metadata 条件的 v16 episode，同时
 省略 `arm_qpos`、`arm_qvel`、`flag_camera_fresh`、`flag_pointcloud_valid` 和
 `flag_frame_status`，结果仍为 `VALID`。这主要影响手工构造、受损或未来发生 writer/reader
-漂移的 episode；当前标准 RecorderIO 正常路径仍会创建第 4 节列出的 97 个 dataset。
+漂移的 episode；当前标准 RecorderIO 正常路径本身仍会创建 97 个 dataset。
 
-修复时应让 writer、finalizer 和 reader 共享同一份标准字段定义，并把
-`action_arm_joint_sent` 的有条件可选规则单独编码。修复前，训练、可视化和回放入口应对其
-实际使用的非核心字段做显式存在性、shape 和 dtype 检查，不能把 `require_valid()` 当作完整
-schema 验证。
+必要性为 P1，因为所有训练/可视化/replay 都可能把 `VALID` 当信任边界。新
+`recording.episode_schema` 定义 96 个基础 dataset 的确切 tail shape/dtype，以及
+`arm_sent_stream=True ↔ action_arm_joint_sent 存在` 的条件规则。EpisodeRecorder 的 source
+frame、flush、发布 finalizer 和 EpisodeReader 复用同一 validator。缺字段、错误
+shape/dtype、marker 不一致或任意逐帧长度不等于 `N` 均会 fail-closed；不需要 schema bump，
+因为这是恢复 v16 原有合同，而非改变存储意义。
 
 代码定位：`recording/episode_reader.py::EpisodeReader.validity`、
 `recording/episode_recorder.py::EpisodeRecorder._validate_and_sync_temp_episode`、
-`recording/io_process.py::_unpack_sample`。
+`recording/episode_schema.py::validate_data_layout_v16`。
 
 ---
 
