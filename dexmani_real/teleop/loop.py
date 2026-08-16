@@ -19,9 +19,11 @@ from dexmani_real.planning.pose_utils import (normalize_quat_wxyz,
                                               quat_wxyz_to_rot6d,
                                               rot6d_to_quat_wxyz)
 from dexmani_real.policy.loop_timing import StageTimer
-from dexmani_real.policy.runtime import ActionCandidate
-from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
+from dexmani_real.policy.safety import (CommandPublishResult,
+                                        CommandPublishStatus, GateRejectCode,
+                                        SafetyGate, advance_run_generation,
                                         build_action_candidate,
+                                        planner_action_safety_gate,
                                         validate_and_send_candidate)
 from dexmani_real.recording.recorder_client import RecorderClient, RecorderPhase
 from dexmani_real.shm.shared_storage import SharedStorage
@@ -76,9 +78,10 @@ def _load_vr_transform(path: Path) -> tuple[np.ndarray, str]:
     return calibration.transform, f"{calibration.theta_deg:.6g}"
 
 
-def _build_safety_gate(config: TeleopConfig) -> SafetyGate:
+def _build_safety_gate(config: TeleopConfig, planner: XArm7MotionPlanner) -> SafetyGate:
     """Build the teleoperation safety gate from control-domain limits."""
-    return SafetyGate(
+    return planner_action_safety_gate(
+        planner=planner,
         arm_joint_lower_rad=tuple(config.runtime.arm.joint_limit_lower),
         arm_joint_upper_rad=tuple(config.runtime.arm.joint_limit_upper),
         hand_joint_lower_rad=tuple(config.runtime.hand.qpos_min_rad),
@@ -405,14 +408,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             base_to_world_rot=np.eye(3, dtype=np.float64),
         )
 
-        gate = _build_safety_gate(cfg)
+        gate = _build_safety_gate(cfg, planner)
         # SafetyGate validates well-formedness, joint limits, and workspace
         # only.  Collision and transition checks were removed (2026-08-12);
         # xArm Mode 6 firmware provides the hardware backstop (C22/C31/C24).
         # Collision-free homing paths are planned independently through
         # plan_joint_home_path / plan_band_alignment_path.
-        gate.workspace_check = planner.is_workspace_segment_safe
-
         recorder = RecorderClient(shared) if cfg.runtime.policy.recording_enabled else None
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
@@ -1123,7 +1124,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             _map_t0 = time.perf_counter()
             mapped = arm_mapper.map(vr_frame["wrist_pos"], vr_frame["wrist_quat_wxyz"])
             if mapped is None:
-                published_hold = _safe_arm_queue_put(
+                hold_result = _safe_arm_queue_put(
                     shared,
                     {"qpos": ctx.prev_qpos_cmd.copy(), "is_hold": True},
                     timeout=cfg.runtime.policy.action_prepare_timeout_s,
@@ -1131,7 +1132,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
                 )
-                if published_hold is None:
+                published_hold = hold_result.candidate
+                if not hold_result.succeeded or published_hold is None:
+                    logger.error("teleop_loop: mapper hold publish failed: %s", hold_result.reason)
                     shared.error_state.value = True
                     break
                 if recording_active:
@@ -1222,7 +1225,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 )
                 ctx.ema_prev_pos = ctx.ema_prev_quat = None
                 ctx.prev_qpos_cmd = hold_qpos
-                published_hold = _safe_arm_queue_put(
+                hold_result = _safe_arm_queue_put(
                     shared,
                     {"qpos": hold_qpos, "is_hold": True},
                     timeout=cfg.runtime.policy.action_prepare_timeout_s,
@@ -1230,7 +1233,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
                 )
-                if published_hold is None:
+                published_hold = hold_result.candidate
+                if not hold_result.succeeded or published_hold is None:
+                    logger.error("teleop_loop: contact hold publish failed: %s", hold_result.reason)
                     shared.error_state.value = True
                     break
                 if recording_active:
@@ -1327,7 +1332,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 # SafetyGate validates well-formedness + joint limits only for hand-only commands.
                 if hand_available:
                     safe_hand_cmd = hand_cmd if hand_cmd_valid else None
-                    published_candidate = _safe_joint_publish(
+                    publish_result = _safe_joint_publish(
                         shared,
                         ctx.prev_qpos_cmd.copy(),
                         safe_hand_cmd,
@@ -1336,8 +1341,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         observation_id=int(vr_frame["ring_sequence"]),
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                         safety_gate=gate,
+                        previous_hand_qpos=ctx.prev_hand_qpos,
+                        hand_mechanical_lower_rad=hand_mechanical_lower_rad,
+                        hand_mechanical_upper_rad=hand_mechanical_upper_rad,
+                        hand_max_delta_rad=cfg.runtime.hand.max_delta_rad,
                     )
-                    if published_candidate is None:
+                    published_candidate = publish_result.candidate
+                    if not publish_result.succeeded or published_candidate is None:
+                        logger.error("teleop_loop: IK-failure hold publish failed: %s", publish_result.reason)
                         shared.error_state.value = True
                         break
                     if published_candidate.arm_qpos is not None:
@@ -1345,7 +1356,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     if published_candidate.hand_qpos is not None:
                         ctx.prev_hand_qpos = np.asarray(published_candidate.hand_qpos, dtype=np.float64).copy()
                 else:
-                    published_candidate = _safe_arm_queue_put(
+                    publish_result = _safe_arm_queue_put(
                         shared,
                         {"qpos": ctx.prev_qpos_cmd.copy(), "is_hold": True},
                         timeout=cfg.runtime.policy.action_prepare_timeout_s,
@@ -1353,7 +1364,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                         safety_gate=gate,
                     )
-                    if published_candidate is None:
+                    published_candidate = publish_result.candidate
+                    if not publish_result.succeeded or published_candidate is None:
+                        logger.error("teleop_loop: IK-failure arm hold publish failed: %s", publish_result.reason)
                         shared.error_state.value = True
                         break
                 if recording_active:
@@ -1388,8 +1401,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             # Keep IK output inside the firmware-accepted joint limits.
             arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
-            # Pre-flight validation (NaN, health, workspace).
-            _arm_ok = arm_state is not None and bool(arm_state["connected"][0])
+            # Pre-flight checks specific to teleop command assembly. Joint
+            # limits and workspace are enforced once by SafetyGate.
             _reject = False
             _reject_reason = ""
             if not np.all(np.isfinite(arm_cmd)):
@@ -1398,15 +1411,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             elif not hand_cmd_valid:
                 _reject = True
                 _reject_reason = "hand command validation failed"
-            elif not _arm_ok:
-                _reject = True
-                _reject_reason = "arm disconnected"
-            elif not planner.is_workspace_segment_safe(arm_qpos, arm_cmd):
-                _reject = True
-                _reject_reason = "final arm transition leaves workspace"
             if _reject:
                 _validate_warn("teleop_loop: action rejected — %s", _reject_reason)
-                published_hold = _safe_joint_publish(
+                hold_result = _safe_joint_publish(
                     shared,
                     ctx.prev_qpos_cmd.copy(),
                     None,
@@ -1416,7 +1423,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
                     safety_gate=gate,
                 )
-                if published_hold is None:
+                published_hold = hold_result.candidate
+                if not hold_result.succeeded or published_hold is None:
+                    logger.error("teleop_loop: rejected-action hold publish failed: %s", hold_result.reason)
                     shared.error_state.value = True
                     break
                 if recording_active:
@@ -1443,8 +1452,41 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     )
                 continue
 
-            # FAULT gate: do not send actions when system is in fault state.
-            if shared.safety_state.value == SafetyState.FAULT:
+            publish_result = _safe_joint_publish(
+                shared,
+                arm_cmd.copy(),
+                hand_cmd.copy() if hand_available else None,
+                timeout=cfg.runtime.policy.action_prepare_timeout_s,
+                observation_id=int(vr_frame["ring_sequence"]),
+                observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                safety_gate=gate,
+                previous_hand_qpos=ctx.prev_hand_qpos,
+                hand_mechanical_lower_rad=hand_mechanical_lower_rad,
+                hand_mechanical_upper_rad=hand_mechanical_upper_rad,
+                hand_max_delta_rad=cfg.runtime.hand.max_delta_rad,
+            )
+            published_candidate = publish_result.candidate
+            workspace_rejected = (
+                publish_result.status == CommandPublishStatus.GATE_REJECTED
+                and publish_result.gate_code in (GateRejectCode.WORKSPACE, GateRejectCode.WORKSPACE_CHECK_FAILED)
+            )
+            if workspace_rejected:
+                _validate_warn("teleop_loop: action rejected — %s; publishing hold", publish_result.reason)
+                hold_result = _safe_joint_publish(
+                    shared,
+                    ctx.prev_qpos_cmd.copy(),
+                    None,
+                    is_hold=True,
+                    timeout=cfg.runtime.policy.action_prepare_timeout_s,
+                    observation_id=int(vr_frame["ring_sequence"]),
+                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                    safety_gate=gate,
+                )
+                published_hold = hold_result.candidate
+                if not hold_result.succeeded or published_hold is None:
+                    logger.error("teleop_loop: workspace-rejection hold publish failed: %s", hold_result.reason)
+                    shared.error_state.value = True
+                    break
                 if recording_active:
                     _record_held(
                         recorder,
@@ -1455,6 +1497,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         cam,
                         hand_state=hand_state,
                         hand_tactile=hand_tactile,
+                        frame_status=_FRAME_SAFETY_REJECT,
+                        retarget_ok=retarget_ok,
                         arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
                         target_eef_pos=_last_target_eef_pos,
                         target_eef_rot6d=_last_target_eef_rot6d,
@@ -1463,19 +1507,35 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
                         observation_anchor_monotonic_ns=_current_grid_anchor_ns,
                         shared=shared,
+                        action_candidate=published_hold,
                     )
                 continue
-            published_candidate = _safe_joint_publish(
-                shared,
-                arm_cmd.copy(),
-                hand_cmd.copy() if hand_available else None,
-                timeout=cfg.runtime.policy.action_prepare_timeout_s,
-                observation_id=int(vr_frame["ring_sequence"]),
-                observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                safety_gate=gate,
-            )
-            if published_candidate is None:
-                logger.error("teleop_loop: joint publish failed — actuator unresponsive")
+            if not publish_result.succeeded or published_candidate is None:
+                if publish_result.runtime_gated:
+                    logger.info("teleop_loop: joint publication stopped by runtime gate: %s", publish_result.reason)
+                    if publish_result.status == CommandPublishStatus.SAFETY_STATE_GATED:
+                        if recording_active:
+                            _record_held(
+                                recorder,
+                                arm_state,
+                                ctx.prev_qpos_cmd,
+                                ctx.prev_hand_qpos,
+                                vr_frame,
+                                cam,
+                                hand_state=hand_state,
+                                hand_tactile=hand_tactile,
+                                arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
+                                target_eef_pos=_last_target_eef_pos,
+                                target_eef_rot6d=_last_target_eef_rot6d,
+                                hand_fk=_hand_fk,
+                                T_eef_handbase_pos=_T_eef_handbase_pos,
+                                T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                                observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                                shared=shared,
+                            )
+                        continue
+                    break
+                logger.error("teleop_loop: joint publish failed: %s", publish_result.reason)
                 shared.error_state.value = True
                 break
             stage_timer.mark("send")
@@ -1558,7 +1618,7 @@ def _safe_arm_queue_put(
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     safety_gate: SafetyGate | None = None,
-) -> ActionCandidate | None:
+) -> CommandPublishResult:
     """Publish a single arm command through the safety gate (fire-and-forget)."""
     try:
         return _safe_joint_publish(
@@ -1573,7 +1633,7 @@ def _safe_arm_queue_put(
         )
     except (KeyError, TypeError, ValueError) as exc:
         logger.error("teleop_loop: rejected invalid arm action: %s", exc)
-        return None
+        return CommandPublishResult(CommandPublishStatus.INVALID_CANDIDATE, detail=str(exc))
 
 
 def _safe_joint_publish(
@@ -1586,29 +1646,41 @@ def _safe_joint_publish(
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     safety_gate: SafetyGate | None = None,
-) -> ActionCandidate | None:
+    previous_hand_qpos: np.ndarray | None = None,
+    hand_mechanical_lower_rad: np.ndarray | None = None,
+    hand_mechanical_upper_rad: np.ndarray | None = None,
+    hand_max_delta_rad: float | np.ndarray | None = None,
+) -> CommandPublishResult:
     """Validate through SafetyGate and publish via fire-and-forget send_command."""
     if safety_gate is None:
         logger.error("joint target rejected: SafetyGate is required")
-        return None
+        return CommandPublishResult(CommandPublishStatus.NO_SAFETY_GATE)
     gate = safety_gate
 
-    candidate = build_action_candidate(
-        shared,
-        arm_qpos,
-        hand_qpos,
-        is_hold=is_hold,
-        observation_id=observation_id,
-        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
-    )
+    try:
+        candidate = build_action_candidate(
+            shared,
+            arm_qpos,
+            hand_qpos,
+            is_hold=is_hold,
+            observation_id=observation_id,
+            observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning("joint target rejected: invalid candidate: %s", exc)
+        return CommandPublishResult(CommandPublishStatus.INVALID_CANDIDATE, detail=str(exc))
     if candidate is None:
-        return None
+        return CommandPublishResult(CommandPublishStatus.INVALID_OBSERVATION_ANCHOR)
 
     return validate_and_send_candidate(
         shared,
         candidate,
         gate=gate,
         prepare_timeout_s=timeout,
+        previous_hand_qpos=previous_hand_qpos,
+        hand_mechanical_lower_rad=hand_mechanical_lower_rad,
+        hand_mechanical_upper_rad=hand_mechanical_upper_rad,
+        hand_max_delta_rad=hand_max_delta_rad,
     )
 
 

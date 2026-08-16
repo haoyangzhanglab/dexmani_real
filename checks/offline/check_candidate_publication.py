@@ -7,9 +7,10 @@ construction + gate/transport tail:
   - ``build_action_candidate`` stamps a monotonic action_id, the target/validity
     timestamps, and copied joint targets; an invalid observation anchor yields
     ``None`` and never allocates a command.
-  - ``validate_and_send_candidate`` reads current feedback (or trusts the
-    caller's), runs ``SafetyGate.validate``, and publishes via ``send_command``;
-    rejection or unhealthy feedback yields ``None`` and writes no transport.
+  - ``validate_and_send_candidate`` reads authoritative arm/hand feedback,
+    runs ``SafetyGate.validate`` plus coupled-hand preflight, and publishes via
+    ``send_command``; rejection or unhealthy feedback yields a typed failure
+    and writes no transport.
 """
 
 from __future__ import annotations
@@ -25,8 +26,10 @@ from _fakes import make_arm_state_frame, make_hand_state_frame
 
 from dexmani_real.config.defaults import arm as arm_defaults
 from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.policy.safety import (SafetyGate, build_action_candidate,
+from dexmani_real.policy.safety import (CommandPublishStatus, SafetyGate,
+                                        build_action_candidate,
                                         validate_and_send_candidate)
+from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import SharedStorage
 
 
@@ -68,6 +71,7 @@ def main() -> int:
 
     shared = SharedStorage.create(prefix="check_candidate_publication")
     try:
+        assert transition(shared, SafetyState.ARMED)
         shared.arm_command_seq.value = 100
         shared.run_generation.value = 7
 
@@ -114,25 +118,94 @@ def main() -> int:
             is None
         ), "future anchor must be rejected"
 
-        # ── validate_and_send_candidate: empty arm feedback -> None ──
+        # ── centralized runtime gate runs before feedback/transport ──
+        candidate = build_action_candidate(shared, arm_mid, None)
+        assert candidate is not None
+        shared.estop_request.value = True
+        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        assert result.status == CommandPublishStatus.ESTOP_REQUESTED, result
+        shared.estop_request.value = False
+
+        shared.error_state.value = True
+        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        assert result.status == CommandPublishStatus.STICKY_FAULT, result
+        shared.error_state.value = False
+
+        shared.is_running.value = False
+        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        assert result.status == CommandPublishStatus.RUNTIME_STOPPED, result
+        shared.is_running.value = True
+
+        assert transition(shared, SafetyState.DISARMED)
+        result = validate_and_send_candidate(shared, candidate, gate=gate)
+        assert result.status == CommandPublishStatus.SAFETY_STATE_GATED, result
+        assert transition(shared, SafetyState.ARMED)
+        assert _drain_arm_queue(shared) == 0, "runtime gate must not write transport"
+
+        # ── validate_and_send_candidate: empty arm feedback ──
         candidate = build_action_candidate(shared, arm_mid, hand_mid)
-        assert validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1) is None
+        assert candidate is not None
+        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        assert result.status == CommandPublishStatus.ARM_FEEDBACK_UNAVAILABLE, result
         assert _drain_arm_queue(shared) == 0, "no transport write on unavailable feedback"
 
-        # ── validate_and_send_candidate: healthy publish path ──
+        # ── coupled command requires fully healthy hand feedback ──
         shared.arm_state_ring.write(make_arm_state_frame(arm_mid, connected=1, state_valid=1))
+        candidate = build_action_candidate(shared, arm_mid, hand_mid)
+        assert candidate is not None
+        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        assert result.status == CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE, result
+        assert _drain_arm_queue(shared) == 0, "missing hand feedback must block the arm endpoint"
+
+        shared.hand_state_ring.write(
+            make_hand_state_frame(hand_mid, connected=1, state_valid=1, send_healthy=0)
+        )
+        candidate = build_action_candidate(shared, arm_mid, hand_mid)
+        assert candidate is not None
+        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        assert result.status == CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY, result
+        assert _drain_arm_queue(shared) == 0, "unhealthy hand must block the arm endpoint"
+
+        # ── validate_and_send_candidate: healthy publish path ──
         shared.hand_state_ring.write(make_hand_state_frame(hand_mid, connected=1, state_valid=1))
         candidate = build_action_candidate(shared, arm_mid, hand_mid)
+        assert candidate is not None
         sent = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
-        assert sent is not None, "valid candidate must publish"
-        assert sent.action_id == candidate.action_id
+        assert sent.status == CommandPublishStatus.PUBLISHED, sent
+        published = sent.candidate
+        assert published is not None
+        assert published.action_id == candidate.action_id
         assert _drain_arm_queue(shared) == 1, "one arm endpoint must be queued"
         assert shared.hand_cmd_ring.read_latest() is not None, "one hand endpoint must be written"
 
-        # ── validate_and_send_candidate: gate rejection -> None, no write ──
+        # ── centralized hand delta preflight rejects before arm enqueue ──
+        hand_step = hand_mid.copy()
+        hand_step[0] += 0.01
+        candidate = build_action_candidate(shared, arm_mid, hand_step)
+        assert candidate is not None
+        result = validate_and_send_candidate(
+            shared,
+            candidate,
+            gate=gate,
+            prepare_timeout_s=0.1,
+            previous_hand_qpos=hand_mid,
+            hand_mechanical_lower_rad=np.asarray(
+                hand_defaults.mechanical_qpos_min_rad, dtype=np.float64
+            ),
+            hand_mechanical_upper_rad=np.asarray(
+                hand_defaults.mechanical_qpos_max_rad, dtype=np.float64
+            ),
+            hand_max_delta_rad=0.001,
+        )
+        assert result.status == CommandPublishStatus.HAND_PREFLIGHT_REJECTED, result
+        assert _drain_arm_queue(shared) == 0, "hand preflight must precede arm enqueue"
+
+        # ── validate_and_send_candidate: typed gate rejection, no write ──
         bad_arm = np.asarray(arm_defaults.joint_limit_upper, dtype=np.float64) + 10.0
         candidate = build_action_candidate(shared, bad_arm, None)
-        assert validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1) is None
+        assert candidate is not None
+        result = validate_and_send_candidate(shared, candidate, gate=gate, prepare_timeout_s=0.1)
+        assert result.status == CommandPublishStatus.GATE_REJECTED, result
         assert _drain_arm_queue(shared) == 0, "gate rejection must not write transport"
     finally:
         shared.close()

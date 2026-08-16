@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from enum import Enum
 from queue import Full
 from typing import Any
 
@@ -18,6 +19,8 @@ import numpy as np
 
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.config.defaults import policy as policy_defaults
+from dexmani_real.policy.runtime import ActionCandidate
+from dexmani_real.robot.safety import SafetyState
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
     ARM_COMMAND_DTYPE,
@@ -40,13 +43,217 @@ def advance_run_generation(shared: Any) -> int:
     return int(shared.run_generation.value)
 
 
+class GateRejectCode(str, Enum):
+    """Stable machine-readable reasons emitted by :class:`SafetyGate`."""
+
+    UNSUPPORTED_CONTRACT = "unsupported representation/units/frame"
+    RUN_GENERATION_MISMATCH = "run generation mismatch"
+    INVALID_CURRENT_ARM_SHAPE = "invalid current arm joint state shape"
+    NONFINITE_CURRENT_ARM = "current arm joint state contains NaN/Inf"
+    INVALID_CANDIDATE_SHAPE = "invalid candidate joint shape"
+    NONFINITE_CANDIDATE = "candidate contains NaN/Inf"
+    ARM_JOINT_LIMIT = "arm joint limit violation"
+    HAND_JOINT_LIMIT = "hand joint limit violation"
+    WORKSPACE = "workspace"
+    WORKSPACE_CHECK_FAILED = "workspace check failed"
+
+
 @dataclass(frozen=True)
 class GateResult:
     """Outcome of :meth:`SafetyGate.validate`."""
 
     accepted: bool
-    candidate: Any  # ActionCandidate (lazy import to avoid cycle)
-    reason: str = ""
+    code: GateRejectCode | None = None
+    detail: str = ""
+
+    @property
+    def reason(self) -> str:
+        """Human-readable rejection reason for logs and operator messages."""
+        if self.detail:
+            return self.detail
+        return "" if self.code is None else self.code.value
+
+
+class CommandPublishStatus(str, Enum):
+    """Result of the controller-side candidate/publication boundary."""
+
+    PUBLISHED = "published"
+    APPLIED = "applied"
+    NO_SAFETY_GATE = "no safety gate"
+    INVALID_CANDIDATE = "invalid candidate"
+    INVALID_OBSERVATION_ANCHOR = "invalid observation anchor"
+    RUNTIME_STOPPED = "runtime stopped"
+    ESTOP_REQUESTED = "e-stop requested"
+    STICKY_FAULT = "sticky fault"
+    SAFETY_STATE_GATED = "safety state gated"
+    ARM_FEEDBACK_UNAVAILABLE = "arm feedback unavailable"
+    ARM_FEEDBACK_UNHEALTHY = "arm feedback unhealthy"
+    HAND_FEEDBACK_UNAVAILABLE = "hand feedback unavailable"
+    HAND_FEEDBACK_UNHEALTHY = "hand feedback unhealthy"
+    HAND_PREFLIGHT_REJECTED = "hand preflight rejected"
+    GATE_REJECTED = "safety gate rejected"
+    TEMPORAL_WINDOW_CLOSED = "temporal window closed"
+    PREPARE_TIMEOUT = "prepare timeout"
+    ARM_QUEUE_FULL = "arm queue full"
+    ACK_SUPERSEDED = "acknowledgement superseded"
+    ACK_TIMEOUT = "acknowledgement timeout"
+
+
+@dataclass(frozen=True)
+class CommandPublishResult:
+    """Typed publication outcome; callers retain ownership of disposition."""
+
+    status: CommandPublishStatus
+    candidate: ActionCandidate | None = None
+    detail: str = ""
+    gate_code: GateRejectCode | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status in (
+            CommandPublishStatus.PUBLISHED,
+            CommandPublishStatus.APPLIED,
+        )
+
+    @property
+    def runtime_gated(self) -> bool:
+        return self.status in (
+            CommandPublishStatus.RUNTIME_STOPPED,
+            CommandPublishStatus.ESTOP_REQUESTED,
+            CommandPublishStatus.STICKY_FAULT,
+            CommandPublishStatus.SAFETY_STATE_GATED,
+        )
+
+    @property
+    def reason(self) -> str:
+        return self.detail or self.status.value
+
+
+def _publication_runtime_gate(
+    shared: Any,
+    *,
+    check_is_running: bool = True,
+) -> CommandPublishResult | None:
+    """Reject publication outside an active, non-faulted runtime.
+
+    This controller-side check reduces stale queue/ring traffic.  Workers still
+    re-check the same lifecycle state immediately before their SDK boundary.
+    """
+    if bool(shared.estop_request.value):
+        return CommandPublishResult(CommandPublishStatus.ESTOP_REQUESTED)
+    if bool(shared.error_state.value):
+        return CommandPublishResult(CommandPublishStatus.STICKY_FAULT)
+    if check_is_running and not bool(shared.is_running.value):
+        return CommandPublishResult(CommandPublishStatus.RUNTIME_STOPPED)
+    state_value = int(shared.safety_state.value)
+    if state_value not in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
+        try:
+            state_name = SafetyState(state_value).name
+        except ValueError:
+            state_name = f"UNKNOWN({state_value})"
+        return CommandPublishResult(
+            CommandPublishStatus.SAFETY_STATE_GATED,
+            detail=f"safety state {state_name} does not accept motion commands",
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class _ArmFeedbackSnapshot:
+    qpos: np.ndarray
+    last_cmd_seq: int
+
+
+@dataclass(frozen=True)
+class _HandFeedbackSnapshot:
+    last_cmd_qpos: np.ndarray
+    last_cmd_seq: int
+
+
+def _arm_feedback_snapshot(
+    shared: Any,
+    candidate: ActionCandidate | None,
+) -> tuple[_ArmFeedbackSnapshot | None, CommandPublishResult | None]:
+    """Read the arm fields required by publication and acknowledgement."""
+    result = shared.arm_state_ring.read_latest()
+    if result is None:
+        return None, CommandPublishResult(
+            CommandPublishStatus.ARM_FEEDBACK_UNAVAILABLE,
+            candidate=candidate,
+        )
+    record = result[0][0]
+    if not bool(record["connected"]) or not bool(record["state_valid"]):
+        return None, CommandPublishResult(
+            CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
+            candidate=candidate,
+            detail=(
+                "arm feedback is disconnected or marked invalid "
+                f"(connected={bool(record['connected'])}, "
+                f"state_valid={bool(record['state_valid'])})"
+            ),
+        )
+    qpos = np.asarray(record["qpos"], dtype=np.float64)
+    if qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
+        return None, CommandPublishResult(
+            CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
+            candidate=candidate,
+            detail="arm feedback has invalid shape or non-finite values",
+        )
+    return _ArmFeedbackSnapshot(qpos.copy(), int(record["last_cmd_seq"])), None
+
+
+def _hand_feedback_snapshot(
+    shared: Any,
+    candidate: ActionCandidate | None,
+) -> tuple[_HandFeedbackSnapshot | None, CommandPublishResult | None]:
+    """Read one fully healthy hand command/feedback snapshot fail-closed."""
+    result = shared.hand_state_ring.read_latest()
+    if result is None:
+        return None, CommandPublishResult(
+            CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
+            candidate=candidate,
+        )
+    record = result[0][0]
+    health = (
+        bool(record["connected"])
+        and bool(record["state_valid"])
+        and not bool(record["error_state"])
+        and bool(record["send_healthy"])
+        and bool(record["read_healthy"])
+    )
+    if not health:
+        return None, CommandPublishResult(
+            CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+            candidate=candidate,
+            detail=(
+                "hand feedback/command path is unhealthy "
+                f"(connected={bool(record['connected'])}, "
+                f"state_valid={bool(record['state_valid'])}, "
+                f"error_state={bool(record['error_state'])}, "
+                f"send_healthy={bool(record['send_healthy'])}, "
+                f"read_healthy={bool(record['read_healthy'])})"
+            ),
+        )
+    qpos = np.asarray(record["qpos"], dtype=np.float64)
+    last_cmd_qpos = np.asarray(record["last_cmd_qpos"], dtype=np.float64)
+    if (
+        qpos.shape != HAND_JOINT_SHAPE
+        or last_cmd_qpos.shape != HAND_JOINT_SHAPE
+        or not np.all(np.isfinite(qpos))
+        or not np.all(np.isfinite(last_cmd_qpos))
+    ):
+        return None, CommandPublishResult(
+            CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+            candidate=candidate,
+            detail="hand feedback or last accepted command is malformed",
+        )
+    return (
+        _HandFeedbackSnapshot(
+            last_cmd_qpos.copy(),
+            int(record["last_cmd_seq"]),
+        ),
+        None,
+    )
 
 
 class SafetyGate:
@@ -106,11 +313,9 @@ class SafetyGate:
 
     def validate(
         self,
-        candidate: Any,  # ActionCandidate
+        candidate: ActionCandidate,
         *,
         current_arm_qpos: np.ndarray,
-        current_hand_qpos: np.ndarray,
-        dt_s: float,
         run_generation: int,
     ) -> GateResult:
         """Run the full validation pipeline.
@@ -118,13 +323,10 @@ class SafetyGate:
         Args:
             candidate: The proposed ``ActionCandidate``.
             current_arm_qpos: Latest measured arm joint positions [rad].
-            current_hand_qpos: Latest measured hand joint positions [rad].
-            dt_s: Action period (``1 / control_hz``). Retained for API
-                stability; unused after velocity-envelope removal (2026-08-12).
             run_generation: Expected control-run generation.
 
         Returns:
-            ``GateResult`` with the unchanged accepted candidate.
+            A typed accept/reject result. The candidate is never modified.
         """
         # 1 ── Well-formed ────────────────────────────────────────────
         if (
@@ -132,19 +334,16 @@ class SafetyGate:
             or candidate.units != "rad"
             or candidate.frame != "robot_joint"
         ):
-            return GateResult(
-                False, candidate, "unsupported representation/units/frame"
-            )
+            return GateResult(False, GateRejectCode.UNSUPPORTED_CONTRACT)
 
         if candidate.run_generation != run_generation:
-            return GateResult(False, candidate, "run generation mismatch")
+            return GateResult(False, GateRejectCode.RUN_GENERATION_MISMATCH)
 
         arm_start = np.asarray(current_arm_qpos, dtype=np.float64)
-        hand_start = np.asarray(current_hand_qpos, dtype=np.float64)
-        if arm_start.shape != ARM_JOINT_SHAPE or hand_start.shape != HAND_JOINT_SHAPE:
-            return GateResult(False, candidate, "invalid current joint state shape")
-        if not np.all(np.isfinite(arm_start)) or not np.all(np.isfinite(hand_start)):
-            return GateResult(False, candidate, "current joint state contains NaN/Inf")
+        if arm_start.shape != ARM_JOINT_SHAPE:
+            return GateResult(False, GateRejectCode.INVALID_CURRENT_ARM_SHAPE)
+        if not np.all(np.isfinite(arm_start)):
+            return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
 
         arm_end = (
             arm_start.copy()
@@ -152,25 +351,29 @@ class SafetyGate:
             else np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
         )
         hand_end = (
-            hand_start.copy()
+            None
             if candidate.hand_qpos is None
             else np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
         )
-        if arm_end.shape != ARM_JOINT_SHAPE or hand_end.shape != HAND_JOINT_SHAPE:
-            return GateResult(False, candidate, "invalid candidate joint shape")
-        if not np.all(np.isfinite(arm_end)) or not np.all(np.isfinite(hand_end)):
-            return GateResult(False, candidate, "candidate contains NaN/Inf")
+        if arm_end.shape != ARM_JOINT_SHAPE or (
+            hand_end is not None and hand_end.shape != HAND_JOINT_SHAPE
+        ):
+            return GateResult(False, GateRejectCode.INVALID_CANDIDATE_SHAPE)
+        if not np.all(np.isfinite(arm_end)) or (
+            hand_end is not None and not np.all(np.isfinite(hand_end))
+        ):
+            return GateResult(False, GateRejectCode.NONFINITE_CANDIDATE)
 
         # 2 ── Joint limits (commanded actuators only) ─────────────────
         if candidate.arm_qpos is not None and (
             np.any(arm_end < self.arm_low) or np.any(arm_end > self.arm_high)
         ):
-            return GateResult(False, candidate, "arm joint limit violation")
-        if candidate.hand_qpos is not None and (
+            return GateResult(False, GateRejectCode.ARM_JOINT_LIMIT)
+        if hand_end is not None and (
             np.any(hand_end < self.hand_low - 1e-12)
             or np.any(hand_end > self.hand_high + 1e-12)
         ):
-            return GateResult(False, candidate, "hand joint limit violation")
+            return GateResult(False, GateRejectCode.HAND_JOINT_LIMIT)
 
         # (removed) Velocity envelope ────────────────────────────────────
         # Per the xArm Mode 6 contract the firmware is the final velocity,
@@ -183,14 +386,14 @@ class SafetyGate:
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
                 if not self.workspace_check(arm_start, arm_end):
-                    return GateResult(False, candidate, "workspace")
+                    return GateResult(False, GateRejectCode.WORKSPACE)
             except Exception:
                 logger.warning(
                     "SafetyGate: workspace check failed closed", exc_info=True
                 )
-                return GateResult(False, candidate, "workspace check failed")
+                return GateResult(False, GateRejectCode.WORKSPACE_CHECK_FAILED)
 
-        return GateResult(True, candidate)
+        return GateResult(True)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +402,7 @@ class SafetyGate:
 
 
 def _make_arm_command(
-    candidate: Any, now_monotonic_ns: int, target_monotonic_ns: int
+    candidate: ActionCandidate, now_monotonic_ns: int, target_monotonic_ns: int
 ) -> np.ndarray:
     """Serialize an ActionCandidate into an ARM_COMMAND_DTYPE record."""
     if candidate.arm_qpos is None:
@@ -217,7 +420,7 @@ def _make_arm_command(
 
 
 def _make_hand_command(
-    candidate: Any, now_monotonic_ns: int, target_monotonic_ns: int
+    candidate: ActionCandidate, now_monotonic_ns: int, target_monotonic_ns: int
 ) -> np.ndarray:
     """Serialize an ActionCandidate into a HAND_COMMAND_DTYPE record."""
     if candidate.hand_qpos is None:
@@ -236,20 +439,17 @@ def _make_hand_command(
 
 def send_command(
     shared: Any,
-    candidate: Any,  # ActionCandidate
+    candidate: ActionCandidate,
     *,
     prepare_timeout_s: float | None = None,
-) -> bool:
+) -> CommandPublishResult:
     """Publish arm and/or hand commands to the actuator IPC primitives.
 
     Fire-and-forget: the arm command goes into the bounded queue, the hand
     command overwrites the latest-wins ring.  No ACKs, no commit protocol.
 
-    Returns:
-        ``True`` when every enabled actuator's command was accepted by the
-        transport.  ``False`` when the arm queue is full (coordinator should
-        reject or enter command quiescence) or when the candidate's temporal
-        window has already closed.
+    Returns a typed transport outcome. Callers decide whether a rejection
+    means hold, drop, command quiescence, run abort, or global fault.
     """
     timeout = (
         prepare_timeout_s
@@ -258,6 +458,14 @@ def send_command(
     )
     if not np.isfinite(timeout) or timeout <= 0:
         raise ValueError("prepare_timeout_s must be finite and positive")
+
+    runtime_rejection = _publication_runtime_gate(shared)
+    if runtime_rejection is not None:
+        return CommandPublishResult(
+            runtime_rejection.status,
+            candidate=candidate,
+            detail=runtime_rejection.detail,
+        )
 
     now_ns = time.monotonic_ns()
     lead_time_s = float(getattr(shared, "action_lead_time_s", 0.05))
@@ -269,12 +477,18 @@ def send_command(
         logger.error(
             "send_command: action_id=%d temporal window closed", candidate.action_id
         )
-        return False
+        return CommandPublishResult(
+            CommandPublishStatus.TEMPORAL_WINDOW_CLOSED,
+            candidate=candidate,
+        )
 
     deadline_ns = now_ns + int(timeout * 1e9)
     remaining_s = (deadline_ns - time.monotonic_ns()) * 1e-9
     if remaining_s <= 0:
-        return False
+        return CommandPublishResult(
+            CommandPublishStatus.PREPARE_TIMEOUT,
+            candidate=candidate,
+        )
 
     if candidate.arm_qpos is not None:
         try:
@@ -285,13 +499,19 @@ def send_command(
                 "send_command: arm endpoint queue backpressure (action_id=%d)",
                 candidate.action_id,
             )
-            return False
+            return CommandPublishResult(
+                CommandPublishStatus.ARM_QUEUE_FULL,
+                candidate=candidate,
+            )
 
     if candidate.hand_qpos is not None:
         hand_frame = _make_hand_command(candidate, now_ns, target_ns)
         shared.hand_cmd_ring.write(hand_frame)
 
-    return True
+    return CommandPublishResult(
+        CommandPublishStatus.PUBLISHED,
+        candidate=candidate,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -444,20 +664,13 @@ def worker_validate_hand(
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class ActionSafetyGateConfig:
-    """Configuration for :func:`planner_action_safety_gate`."""
-
-    arm_joint_lower_rad: tuple[float, ...]
-    arm_joint_upper_rad: tuple[float, ...]
-    hand_joint_lower_rad: tuple[float, ...]
-    hand_joint_upper_rad: tuple[float, ...]
-
-
 def planner_action_safety_gate(
-    config: ActionSafetyGateConfig,
     *,
     planner: Any,
+    arm_joint_lower_rad: tuple[float, ...],
+    arm_joint_upper_rad: tuple[float, ...],
+    hand_joint_lower_rad: tuple[float, ...],
+    hand_joint_upper_rad: tuple[float, ...],
 ) -> SafetyGate:
     """Build a :class:`SafetyGate` wired to the planner's workspace callback.
 
@@ -467,10 +680,10 @@ def planner_action_safety_gate(
     ``plan_band_alignment_path``, which call the collision model directly.
     """
     gate = SafetyGate(
-        arm_joint_lower_rad=config.arm_joint_lower_rad,
-        arm_joint_upper_rad=config.arm_joint_upper_rad,
-        hand_joint_lower_rad=config.hand_joint_lower_rad,
-        hand_joint_upper_rad=config.hand_joint_upper_rad,
+        arm_joint_lower_rad=arm_joint_lower_rad,
+        arm_joint_upper_rad=arm_joint_upper_rad,
+        hand_joint_lower_rad=hand_joint_lower_rad,
+        hand_joint_upper_rad=hand_joint_upper_rad,
     )
     gate.workspace_check = planner.is_workspace_segment_safe
     return gate
@@ -491,7 +704,7 @@ def build_action_candidate(
     observation_anchor_monotonic_ns: int | None = None,
     now_ns: int | None = None,
     action_validity_s: float = 0.5,
-) -> Any | None:
+) -> ActionCandidate | None:
     """Build an ``ActionCandidate`` from raw joint targets.
 
     Allocates a fresh monotonic ``action_id`` from ``shared.arm_command_seq``
@@ -499,8 +712,6 @@ def build_action_candidate(
     ``shared.action_lead_time_s`` and ``action_validity_s``.  Returns ``None``
     when the optional observation anchor is non-positive or in the future.
     """
-    from dexmani_real.policy.runtime import ActionCandidate
-
     with shared.arm_command_seq.get_lock():
         action_id = int(shared.arm_command_seq.value) + 1
         shared.arm_command_seq.value = action_id
@@ -528,92 +739,114 @@ def build_action_candidate(
 
 def validate_and_send_candidate(
     shared: Any,
-    candidate: Any,  # ActionCandidate
+    candidate: ActionCandidate,
     *,
     gate: SafetyGate,
     prepare_timeout_s: float = 0.06,
-    current_arm_qpos: np.ndarray | None = None,
-    current_hand_qpos: np.ndarray | None = None,
-    dt_s: float | None = None,
-    reject_reason_out: list[str] | None = None,
-) -> Any | None:
+    previous_hand_qpos: np.ndarray | None = None,
+    hand_mechanical_lower_rad: np.ndarray | None = None,
+    hand_mechanical_upper_rad: np.ndarray | None = None,
+    hand_max_delta_rad: float | np.ndarray | None = None,
+) -> CommandPublishResult:
     """Validate a pre-built candidate through the gate and publish it.
 
-    Reads current arm/hand feedback when the caller does not supply it, runs
-    :meth:`SafetyGate.validate`, and publishes via :func:`send_command`.  This is
-    the publication tail shared by VR teleop, keyboard/replay, and the
-    learned-policy coordinator.
-
-    The coupled-hand mechanical/delta preflight is deliberately absent: its delta
-    reference and rejection policy are path-dependent (last-published vs
-    last-accepted command), so each caller runs it before calling this function.
-
-    A *gate* rejection is a policy-semantic failure (the model proposed an
-    invalid endpoint), distinct from a transient feedback/transport failure. To
-    let the learned-policy coordinator abort on the former but drop on the
-    latter (§80.2), pass a list in ``reject_reason_out``; it is appended with
-    the gate reason only when the gate rejects.
+    Checks runtime and actuator feedback, runs :meth:`SafetyGate.validate`,
+    preflights a coupled hand target, and publishes via :func:`send_command`.
+    This is the publication tail shared by VR teleop, keyboard/replay, and the
+    learned-policy coordinator.  Callers may supply their last-published hand
+    command as the delta reference; otherwise the worker's last SDK-accepted
+    command is used.
 
     Returns:
-        The accepted ``ActionCandidate`` on publication, or ``None`` when the
-        gate rejects or the transport fails.
+        A typed result that distinguishes policy-semantic gate rejection from
+        runtime, feedback, and transport failures.
     """
     action_id = int(candidate.action_id)
+    runtime_rejection = _publication_runtime_gate(shared)
+    if runtime_rejection is not None:
+        return CommandPublishResult(
+            runtime_rejection.status,
+            candidate=candidate,
+            detail=runtime_rejection.detail,
+        )
 
-    if current_arm_qpos is None:
-        arm_result = shared.arm_state_ring.read_latest()
-        if arm_result is None:
-            logger.warning("validate_and_send_candidate: arm feedback unavailable")
-            return None
-        arm_record = arm_result[0][0]
-        if not bool(arm_record["connected"]) or not bool(arm_record["state_valid"]):
-            logger.warning("validate_and_send_candidate: arm feedback unhealthy")
-            return None
-        current_arm = np.asarray(arm_record["qpos"], dtype=np.float64)
-        if current_arm.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(current_arm)):
-            return None
-    else:
-        current_arm = np.asarray(current_arm_qpos, dtype=np.float64)
+    arm_feedback, feedback_rejection = _arm_feedback_snapshot(shared, candidate)
+    if feedback_rejection is not None:
+        logger.warning(
+            "validate_and_send_candidate: action_id=%d rejected: %s",
+            action_id,
+            feedback_rejection.reason,
+        )
+        return feedback_rejection
+    assert arm_feedback is not None
 
-    if current_hand_qpos is None:
-        current_hand = np.zeros(HAND_JOINT_SHAPE, dtype=np.float64)
-        hand_result = shared.hand_state_ring.read_latest()
-        if hand_result is not None:
-            hand_record = hand_result[0][0]
-            if bool(hand_record["connected"]) and bool(hand_record["state_valid"]):
-                current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
-        elif candidate.hand_qpos is not None:
-            logger.warning("validate_and_send_candidate: hand feedback unavailable")
-            return None
-    else:
-        current_hand = np.asarray(current_hand_qpos, dtype=np.float64)
-
-    ctrl_dt = (
-        1.0 / float(getattr(shared, "action_control_hz", 16.0))
-        if dt_s is None
-        else float(dt_s)
-    )
     gate_result = gate.validate(
         candidate,
-        current_arm_qpos=current_arm,
-        current_hand_qpos=current_hand,
-        dt_s=ctrl_dt,
+        current_arm_qpos=arm_feedback.qpos,
         run_generation=int(shared.run_generation.value),
     )
-    if not gate_result.accepted or gate_result.candidate is None:
+    if not gate_result.accepted:
         reason = gate_result.reason or "unspecified"
         logger.warning(
             "validate_and_send_candidate: action_id=%d rejected by safety gate: %s",
             action_id,
             reason,
         )
-        if reject_reason_out is not None:
-            reject_reason_out.append(reason)
-        return None
+        return CommandPublishResult(
+            CommandPublishStatus.GATE_REJECTED,
+            candidate=candidate,
+            detail=reason,
+            gate_code=gate_result.code,
+        )
 
-    if not send_command(shared, gate_result.candidate, prepare_timeout_s=prepare_timeout_s):
-        return None
-    return gate_result.candidate
+    if candidate.hand_qpos is not None:
+        hand_feedback, feedback_rejection = _hand_feedback_snapshot(shared, candidate)
+        if feedback_rejection is not None:
+            logger.warning(
+                "validate_and_send_candidate: action_id=%d rejected: %s",
+                action_id,
+                feedback_rejection.reason,
+            )
+            return feedback_rejection
+        assert hand_feedback is not None
+        mechanical_lower = (
+            np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
+            if hand_mechanical_lower_rad is None
+            else np.asarray(hand_mechanical_lower_rad, dtype=np.float64)
+        )
+        mechanical_upper = (
+            np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
+            if hand_mechanical_upper_rad is None
+            else np.asarray(hand_mechanical_upper_rad, dtype=np.float64)
+        )
+        delta_reference = (
+            hand_feedback.last_cmd_qpos
+            if previous_hand_qpos is None
+            else np.asarray(previous_hand_qpos, dtype=np.float64)
+        )
+        try:
+            validate_hand_command_delta(
+                candidate.hand_qpos,
+                delta_reference,
+                gate.hand_low,
+                gate.hand_high,
+                mechanical_lower,
+                mechanical_upper,
+                hand_max_delta_rad,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "validate_and_send_candidate: action_id=%d rejected by hand preflight: %s",
+                action_id,
+                exc,
+            )
+            return CommandPublishResult(
+                CommandPublishStatus.HAND_PREFLIGHT_REJECTED,
+                candidate=candidate,
+                detail=str(exc),
+            )
+
+    return send_command(shared, candidate, prepare_timeout_s=prepare_timeout_s)
 
 
 def publish_joint_targets(
@@ -625,14 +858,13 @@ def publish_joint_targets(
     prepare_timeout_s: float = 0.05,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
-    dt_s: float | None = None,
     safety_gate: SafetyGate | None = None,
     wait_applied: bool = False,
     apply_timeout_s: float = 0.5,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
     hand_max_delta_rad: float | np.ndarray | None = None,
-) -> Any | None:
+) -> CommandPublishResult:
     """Validate a joint-space target through the gate and publish it.
 
     This is a convenience wrapper used by keyboard teleop, calibration, and replay — it
@@ -649,118 +881,56 @@ def publish_joint_targets(
     the command-to-command delta check while still enforcing operational +
     mechanical bounds).
 
-    Returns:
-        The accepted ``ActionCandidate`` that was published (and, when
-        ``wait_applied`` is true, acknowledged by arm feedback — plus hand
-        feedback when the candidate carries a hand target), or ``None``
-        when validation, publication, or acknowledgement failed.
+    Returns a typed validation/publication result. On success, ``candidate``
+    contains the immutable target that was published (and, when
+    ``wait_applied`` is true, acknowledged by arm feedback — plus hand
+    feedback when the candidate carries a hand target).
     """
     if safety_gate is None:
         logger.error("publish_joint_targets: no safety gate configured")
-        return None
+        return CommandPublishResult(CommandPublishStatus.NO_SAFETY_GATE)
     gate = safety_gate
 
-    candidate = build_action_candidate(
-        shared,
-        arm_qpos,
-        hand_qpos,
-        is_hold=is_hold,
-        observation_id=observation_id,
-        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
-    )
+    runtime_rejection = _publication_runtime_gate(shared)
+    if runtime_rejection is not None:
+        return runtime_rejection
+
+    try:
+        candidate = build_action_candidate(
+            shared,
+            arm_qpos,
+            hand_qpos,
+            is_hold=is_hold,
+            observation_id=observation_id,
+            observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning("publish_joint_targets: invalid candidate: %s", exc)
+        return CommandPublishResult(
+            CommandPublishStatus.INVALID_CANDIDATE,
+            detail=str(exc),
+        )
     if candidate is None:
-        return None
+        return CommandPublishResult(CommandPublishStatus.INVALID_OBSERVATION_ANCHOR)
     action_id = int(candidate.action_id)
 
-    # Read current arm feedback
-    arm_result = shared.arm_state_ring.read_latest()
-    if arm_result is None:
-        logger.warning(
-            "publish_joint_targets: action_id=%d rejected: arm state ring is empty",
-            action_id,
-        )
-        return None
-    arm_record = arm_result[0][0]
-    if not bool(arm_record["connected"]) or not bool(arm_record["state_valid"]):
-        logger.warning(
-            "publish_joint_targets: action_id=%d rejected: arm feedback invalid "
-            "(connected=%s state_valid=%s)",
-            action_id,
-            bool(arm_record["connected"]),
-            bool(arm_record["state_valid"]),
-        )
-        return None
-    # ``arm_record`` is a scalar structured record: its qpos field is already
-    # the full 7-DoF vector.  Indexing it again selects joint 0 and turns the
-    # safety gate input into a scalar.
-    current_arm = np.asarray(arm_record["qpos"], dtype=np.float64)
-
-    current_hand = np.zeros(12, dtype=np.float64)
-    previous_hand_cmd: np.ndarray | None = None
-    hand_result = shared.hand_state_ring.read_latest()
-    if hand_result is not None:
-        hand_record = hand_result[0][0]
-        if bool(hand_record["connected"]) and bool(hand_record["state_valid"]):
-            current_hand = np.asarray(hand_record["qpos"], dtype=np.float64)
-            # The command-to-command delta reference is the last *accepted
-            # command*, not measured feedback (which may legitimately lag).
-            last_cmd = np.asarray(hand_record["last_cmd_qpos"], dtype=np.float64)
-            if last_cmd.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(last_cmd)):
-                previous_hand_cmd = last_cmd
-    elif hand_qpos is not None:
-        logger.warning(
-            "publish_joint_targets: action_id=%d rejected: hand state ring is empty",
-            action_id,
-        )
-        return None
-
-    # Coupled hand preflight: the gate only enforces operational limits.  Check
-    # the rated mechanical envelope and the command-to-command delta here
-    # (reject-whole, never clip) before the arm endpoint is enqueued, so a
-    # rejected hand command cannot desync the arm from the hand.  The gate does
-    # not mutate the candidate, so running this before the gate/send tail is
-    # outcome-identical to the historical after-gate order.
-    if candidate.hand_qpos is not None:
-        mechanical_lower = (
-            np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
-            if hand_mechanical_lower_rad is None
-            else np.asarray(hand_mechanical_lower_rad, dtype=np.float64)
-        )
-        mechanical_upper = (
-            np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
-            if hand_mechanical_upper_rad is None
-            else np.asarray(hand_mechanical_upper_rad, dtype=np.float64)
-        )
-        try:
-            validate_hand_command_delta(
-                candidate.hand_qpos,
-                previous_hand_cmd,
-                gate.hand_low,
-                gate.hand_high,
-                mechanical_lower,
-                mechanical_upper,
-                hand_max_delta_rad,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "publish_joint_targets: action_id=%d hand command rejected by "
-                "mechanical/delta preflight: %s",
-                action_id,
-                exc,
-            )
-            return None
-
-    published = validate_and_send_candidate(
+    publish_result = validate_and_send_candidate(
         shared,
         candidate,
         gate=gate,
         prepare_timeout_s=prepare_timeout_s,
-        current_arm_qpos=current_arm,
-        current_hand_qpos=current_hand,
-        dt_s=dt_s,
+        hand_mechanical_lower_rad=hand_mechanical_lower_rad,
+        hand_mechanical_upper_rad=hand_mechanical_upper_rad,
+        hand_max_delta_rad=hand_max_delta_rad,
     )
+    if not publish_result.succeeded:
+        return publish_result
+    published = publish_result.candidate
     if published is None:
-        return None
+        return CommandPublishResult(
+            CommandPublishStatus.INVALID_CANDIDATE,
+            detail="successful publication omitted its candidate",
+        )
     if wait_applied:
         if not (np.isfinite(apply_timeout_s) and apply_timeout_s > 0):
             raise ValueError("apply_timeout_s must be finite and positive")
@@ -771,47 +941,62 @@ def publish_joint_targets(
         # existing arm last_cmd_seq >= action_id gate.
         with_hand = published.hand_qpos is not None
         while time.monotonic() < deadline_s:
-            if bool(shared.error_state.value) or not bool(shared.is_running.value):
-                break
-            latest = shared.arm_state_ring.read_latest()
-            arm_ok = latest is not None and int(latest[0][0]["last_cmd_seq"]) >= action_id
+            runtime_rejection = _publication_runtime_gate(shared)
+            if runtime_rejection is not None:
+                return CommandPublishResult(
+                    runtime_rejection.status,
+                    candidate=published,
+                    detail=runtime_rejection.detail,
+                )
+            arm_feedback, feedback_rejection = _arm_feedback_snapshot(shared, published)
+            if feedback_rejection is not None:
+                return feedback_rejection
+            assert arm_feedback is not None
+            arm_ok = arm_feedback.last_cmd_seq >= action_id
             if not with_hand:
                 if arm_ok:
-                    return published
+                    return CommandPublishResult(
+                        CommandPublishStatus.APPLIED,
+                        candidate=published,
+                    )
             else:
-                hand_latest = shared.hand_state_ring.read_latest()
-                if hand_latest is not None:
-                    hand_seq = int(hand_latest[0][0]["last_cmd_seq"])
-                    if hand_seq > action_id:
-                        logger.warning(
-                            "publish_joint_targets: action_id=%d was superseded by hand action_id=%d",
-                            action_id,
-                            hand_seq,
-                        )
-                        return None
-                    if arm_ok and hand_seq == action_id:
-                        hs = hand_latest[0][0]
-                        healthy = (
-                            bool(hs["connected"])
-                            and bool(hs["state_valid"])
-                            and not bool(hs["error_state"])
-                            and bool(hs["send_healthy"])
-                            and bool(hs["read_healthy"])
-                        )
-                        if healthy:
-                            return published
+                hand_feedback, feedback_rejection = _hand_feedback_snapshot(
+                    shared, published
+                )
+                if feedback_rejection is not None:
+                    return feedback_rejection
+                assert hand_feedback is not None
+                hand_seq = hand_feedback.last_cmd_seq
+                if hand_seq > action_id:
+                    logger.warning(
+                        "publish_joint_targets: action_id=%d was superseded by hand action_id=%d",
+                        action_id,
+                        hand_seq,
+                    )
+                    return CommandPublishResult(
+                        CommandPublishStatus.ACK_SUPERSEDED,
+                        candidate=published,
+                    )
+                if arm_ok and hand_seq == action_id:
+                    return CommandPublishResult(
+                        CommandPublishStatus.APPLIED,
+                        candidate=published,
+                    )
             time.sleep(0.005)
         logger.warning(
             "publish_joint_targets: action_id=%d was not acknowledged within %.3fs",
             action_id,
             apply_timeout_s,
         )
-        return None
-    return published
+        return CommandPublishResult(
+            CommandPublishStatus.ACK_TIMEOUT,
+            candidate=published,
+        )
+    return publish_result
 
 
 # ---------------------------------------------------------------------------
-# Hand command bound/delta preflight (shared by every coupled publish path)
+# Hand command bound/delta preflight (owned by the publication boundary)
 # ---------------------------------------------------------------------------
 
 
@@ -828,6 +1013,8 @@ def validate_hand_command_delta(
     and (optionally) a command-to-command delta; reject-whole, never clip.
 
     Shared preflight for every coupled hand path (teleop, replay, return-home).
+    Normal action producers reach it through ``validate_and_send_candidate``;
+    hand-home also reuses it while constructing explicit milestones.
     ``previous`` is the reference *command* for the delta bound and is always a
     command, never measured feedback, so contact and torque-limited steady-state
     lag are valid outcomes and must not reject a valid next command.  Which
@@ -940,29 +1127,22 @@ def publish_hand_home_and_wait_applied(
         mechanical_upper_rad,
         max_delta_rad=None,
     )
+    runtime_rejection = _publication_runtime_gate(
+        shared,
+        check_is_running=check_is_running,
+    )
+    if runtime_rejection is not None:
+        logger.warning("hand home rejected by runtime gate: %s", runtime_rejection.reason)
+        return False
     command_lower = np.asarray(command_lower_rad, dtype=np.float64)
     command_upper = np.asarray(command_upper_rad, dtype=np.float64)
     deadline_s = time.monotonic() + timeout_s
-    initial_result = shared.hand_state_ring.read_latest()
-    if initial_result is None:
-        logger.warning("hand home rejected: hand state ring is empty")
+    hand_feedback, feedback_rejection = _hand_feedback_snapshot(shared, None)
+    if feedback_rejection is not None:
+        logger.warning("hand home rejected: %s", feedback_rejection.reason)
         return False
-    initial_state = initial_result[0][0]
-    start = np.asarray(initial_state["last_cmd_qpos"], dtype=np.float64)
-    initial_healthy = (
-        start.shape == HAND_JOINT_SHAPE
-        and np.all(np.isfinite(start))
-        and bool(initial_state["connected"])
-        and bool(initial_state["state_valid"])
-        and not bool(initial_state["error_state"])
-        and bool(initial_state["send_healthy"])
-        and bool(initial_state["read_healthy"])
-    )
-    if not initial_healthy:
-        logger.warning(
-            "hand home rejected: last accepted hand command or worker health is invalid"
-        )
-        return False
+    assert hand_feedback is not None
+    start = hand_feedback.last_cmd_qpos
     if np.any(start < command_lower - 1e-12) or np.any(start > command_upper + 1e-12):
         logger.warning(
             "hand home rejected: last accepted hand command violates operational limits"
@@ -991,6 +1171,13 @@ def publish_hand_home_and_wait_applied(
     for milestone_index in range(1, milestone_count + 1):
         if time.monotonic() >= deadline_s:
             break
+        runtime_rejection = _publication_runtime_gate(
+            shared,
+            check_is_running=check_is_running,
+        )
+        if runtime_rejection is not None:
+            logger.warning("hand home stopped by runtime gate: %s", runtime_rejection.reason)
+            return False
         alpha = milestone_index / milestone_count
         milestone = (
             target.copy()
@@ -1027,37 +1214,30 @@ def publish_hand_home_and_wait_applied(
         while time.monotonic() < deadline_s:
             if abort_requested is not None and abort_requested():
                 return False
-            if bool(getattr(getattr(shared, "estop_request", None), "value", False)):
-                return False
-            if bool(shared.error_state.value):
-                return False
-            if check_is_running and not bool(shared.is_running.value):
+            if _publication_runtime_gate(
+                shared,
+                check_is_running=check_is_running,
+            ) is not None:
                 return False
             if heartbeat:
                 shared.set_heartbeat("policy", time.monotonic())
 
-            result = shared.hand_state_ring.read_latest()
-            if result is not None:
-                state = result[0][0]
-                applied_id = int(state["last_cmd_seq"])
-                if applied_id > action_id:
-                    logger.warning(
-                        "hand home action_id=%d was superseded by action_id=%d before acknowledgement",
-                        action_id,
-                        applied_id,
-                    )
-                    return False
-                if applied_id == action_id:
-                    healthy = (
-                        bool(state["connected"])
-                        and bool(state["state_valid"])
-                        and not bool(state["error_state"])
-                        and bool(state["send_healthy"])
-                        and bool(state["read_healthy"])
-                    )
-                    if healthy:
-                        acknowledged = True
-                        break
+            hand_feedback, feedback_rejection = _hand_feedback_snapshot(shared, None)
+            if feedback_rejection is not None:
+                logger.warning("hand home acknowledgement stopped: %s", feedback_rejection.reason)
+                return False
+            assert hand_feedback is not None
+            applied_id = hand_feedback.last_cmd_seq
+            if applied_id > action_id:
+                logger.warning(
+                    "hand home action_id=%d was superseded by action_id=%d before acknowledgement",
+                    action_id,
+                    applied_id,
+                )
+                return False
+            if applied_id == action_id:
+                acknowledged = True
+                break
             time.sleep(0.01)
         if not acknowledged:
             break

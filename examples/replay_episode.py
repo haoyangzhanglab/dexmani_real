@@ -52,8 +52,7 @@ from dexmani_real.config.runtime import (ResolvedRuntimeConfig,
 from dexmani_real.planning import (Pose, TeleopProfile, XArm7MotionPlanner,
                                    XArm7PlannerConfig)
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.safety import (ActionSafetyGateConfig, SafetyGate,
-                                        advance_run_generation,
+from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
                                         planner_action_safety_gate,
                                         publish_hand_home_and_wait_applied,
                                         publish_joint_targets)
@@ -970,13 +969,11 @@ class TrajectoryReplayer:
             table=self.runtime.environment.table,
         )
         self._action_safety_gate = planner_action_safety_gate(
-            ActionSafetyGateConfig(
-                arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
-                arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
-                hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
-                hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
-            ),
             planner=self._planner,
+            arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
+            arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
+            hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
+            hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
         )
         print("Replay safety gate ready")
 
@@ -1217,7 +1214,6 @@ class TrajectoryReplayer:
                     arm_cmd,
                     hand_cmd,
                     prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
-                    dt_s=period_s,
                     safety_gate=self._action_safety_gate,
                     wait_applied=is_final_frame,
                     apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
@@ -1229,14 +1225,15 @@ class TrajectoryReplayer:
                     ),
                     hand_max_delta_rad=self.runtime.hand.max_delta_rad,
                 )
-                if published is None:
+                if not published.succeeded or published.candidate is None:
                     boundary = "publish/APPLIED" if is_final_frame else "publish"
-                    self._fault(f"frame {frame_idx}: joint {boundary} boundary rejected")
+                    self._fault(f"frame {frame_idx}: joint {boundary} boundary rejected: {published.reason}")
                     break
-                assert published.arm_qpos is not None
-                sent_arm_cmd = np.asarray(published.arm_qpos, dtype=np.float64)
-                if published.hand_qpos is not None:
-                    hand_cmd = np.asarray(published.hand_qpos, dtype=np.float64)
+                candidate = published.candidate
+                assert candidate.arm_qpos is not None
+                sent_arm_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64)
+                if candidate.hand_qpos is not None:
+                    hand_cmd = np.asarray(candidate.hand_qpos, dtype=np.float64)
 
                 self._recorder.record(
                     frame_idx,

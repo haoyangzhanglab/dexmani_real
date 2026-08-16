@@ -112,6 +112,11 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   becomes a main-owned fault.
 - `SafetyGate` (in `policy/safety.py`) is the single validation boundary:
   well-formed → joint limits → workspace.
+- Controller-side publication checks `is_running`, e-stop, sticky fault,
+  `SafetyState`, required arm/hand feedback health, and coupled-hand preflight
+  in one boundary and returns a typed `CommandPublishResult`; each caller still
+  owns hold/drop/abort/fault disposition, and workers recheck lifecycle
+  metadata and safety state immediately before the SDK boundary.
   Velocity envelope checking was removed (2026-08-12); xArm Mode 6 firmware is
   the final velocity/acceleration/collision backstop.
   Collision and transition geometry checks were removed from SafetyGate
@@ -128,10 +133,10 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   path has no additional output EMA.  Optional DexPilot retains its own
   retargeting filters; the bundled outer EMA setting is `1.0` (pass-through).
   The EtherCAT firmware PID remains the execution-layer trajectory smoother.
-  Coupled hand paths still run a controller-side preflight
-  (`validate_hand_command_delta`)
-  on the rated mechanical envelope before the arm endpoint is enqueued so a
-  rejected hand command desyncs nothing, and `worker_validate_hand` remains the
+  Coupled hand paths run the centralized controller-side preflight
+  (`validate_and_send_candidate` → `validate_hand_command_delta`) on the rated
+  mechanical envelope before the arm endpoint is enqueued so a rejected or
+  unhealthy hand desyncs nothing; `worker_validate_hand` remains the
   authoritative execution-layer backstop.
 - `run_generation` tags commands and candidates. Begin, pause, home, feedback
   fault, and camera re-warm advance it; workers reject queued/ring commands from

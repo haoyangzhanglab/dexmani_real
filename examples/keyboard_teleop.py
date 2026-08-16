@@ -26,7 +26,6 @@ from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_c
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.policy.safety import (
-    ActionSafetyGateConfig,
     advance_run_generation,
     planner_action_safety_gate,
     publish_hand_home_and_wait_applied,
@@ -105,13 +104,11 @@ def _build_planner_and_gate(
         np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     )
     gate = planner_action_safety_gate(
-        ActionSafetyGateConfig(
-            arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
-            arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
-            hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
-            hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-        ),
         planner=planner,
+        arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+        arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+        hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
+        hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
     )
     return planner, gate
 
@@ -290,7 +287,6 @@ def _run_control_loop(
     cfg = runtime.keyboard_teleop
     policy = runtime.policy
     workspace = _workspace(runtime)
-    dt_s = 1.0 / float(cfg.control_hz)
     current_qpos = np.asarray(state["qpos"], dtype=np.float64)
     previous_command, target_pos, target_quat = _keyboard_command_anchor(
         planner,
@@ -599,16 +595,17 @@ def _run_control_loop(
             shared,
             result.qpos,
             prepare_timeout_s=float(policy.action_prepare_timeout_s),
-            dt_s=dt_s,
             safety_gate=safety_gate,
         )
-        if published is None or published.arm_qpos is None:
+        candidate = published.candidate
+        if not published.succeeded or candidate is None or candidate.arm_qpos is None:
             logger.warning(
-                "Keyboard motion command rejected — blocked until keys change"
+                "Keyboard motion command rejected (%s) — blocked until keys change",
+                published.reason,
             )
             blocked_keys = active_keys
             continue
-        previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
+        previous_command = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
 
         if frame % int(cfg.status_interval_frames) == 0:
             elapsed = time.monotonic() - started_s

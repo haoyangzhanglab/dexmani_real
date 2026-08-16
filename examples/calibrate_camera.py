@@ -67,7 +67,6 @@ from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_c
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import (
-    ActionSafetyGateConfig,
     advance_run_generation,
     planner_action_safety_gate,
     publish_joint_targets,
@@ -556,13 +555,11 @@ def _build_planner_and_gate(
     planner.workspace_bounds = workspace.copy()
     planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
     gate = planner_action_safety_gate(
-        ActionSafetyGateConfig(
-            arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
-            arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
-            hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
-            hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-        ),
         planner=planner,
+        arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+        arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+        hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
+        hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
     )
     return planner, gate, workspace
 
@@ -638,7 +635,6 @@ def _run_calibration(
     aruco_cfg: ArucoConfig,
 ) -> int:
     """Interactive calibration control loop.  Returns 0 on success."""
-    dt_s = 1.0 / float(runtime.keyboard_teleop.control_hz)
     heartbeat_timeout = float(runtime.safety.heartbeat_timeouts["arm"])
     policy = runtime.policy
     idle_interval = int(runtime.keyboard_teleop.idle_interval_frames)
@@ -880,11 +876,11 @@ def _run_calibration(
                 published = publish_joint_targets(
                     shared, current_qpos, is_hold=True,
                     prepare_timeout_s=float(policy.action_prepare_timeout_s),
-                    dt_s=dt_s, safety_gate=safety_gate,
+                    safety_gate=safety_gate,
                     wait_applied=True, apply_timeout_s=float(policy.action_apply_timeout_s),
                 )
-                if published is None:
-                    _set_fault(shared, "measured quit hold was not applied")
+                if not published.succeeded:
+                    _set_fault(shared, f"measured quit hold was not applied: {published.reason}")
                     return 1
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     require_transition(shared, SafetyState.ARMED)
@@ -992,14 +988,15 @@ def _run_calibration(
             published = publish_joint_targets(
                 shared, result.qpos,
                 prepare_timeout_s=float(policy.action_prepare_timeout_s),
-                dt_s=dt_s, safety_gate=safety_gate,
+                safety_gate=safety_gate,
                 wait_applied=True, apply_timeout_s=float(policy.action_apply_timeout_s),
             )
-            if published is None or published.arm_qpos is None:
-                logger.warning("arm motion command rejected — blocked until keys change")
+            candidate = published.candidate
+            if not published.succeeded or candidate is None or candidate.arm_qpos is None:
+                logger.warning("arm motion command rejected (%s) — blocked until keys change", published.reason)
                 blocked_keys = active_keys
                 continue
-            previous_command = np.asarray(published.arm_qpos, dtype=np.float64).copy()
+            previous_command = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
 
             if frame % calib_cfg.status_interval_frames == 0:
                 measured_pose = planner.kin.compute_eef_pose_world(current_qpos)

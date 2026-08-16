@@ -29,11 +29,11 @@ from dexmani_real.deployment.metrics import (
     flush_every,
 )
 from dexmani_real.policy.safety import (
+    CommandPublishStatus,
     SafetyGate,
     advance_run_generation,
     build_action_candidate,
     validate_and_send_candidate,
-    validate_hand_command_delta,
 )
 from dexmani_real.robot.safety import SafetyState, transition
 from dexmani_real.shm.shared_storage import SharedStorage
@@ -144,32 +144,6 @@ def _select_due_step(
     return latest_due, latest_due + 1
 
 
-def _preflight_hand(hand_qpos: np.ndarray, previous: np.ndarray | None, config: CoordinatorConfig) -> str | None:
-    """Run the coupled-hand mechanical/delta preflight; return an error or None.
-
-    The delta reference is the last *published* hand command (mirroring VR
-    teleop), so contact/torque-limit lag never stalls the operator.
-    """
-    # On the first coupled command there is no prior published command, so the
-    # command-to-command delta is skipped (bounds are still enforced). The seed
-    # reference is the measured hand pose, mirrored from VR teleop, so a valid
-    # seed means ``previous`` is non-None and the delta is enforced.
-    max_delta = config.hand_max_delta_rad if previous is not None else None
-    try:
-        validate_hand_command_delta(
-            hand_qpos,
-            previous,
-            np.asarray(config.hand_joint_lower_rad, dtype=np.float64),
-            np.asarray(config.hand_joint_upper_rad, dtype=np.float64),
-            np.asarray(config.hand_mechanical_lower_rad, dtype=np.float64),
-            np.asarray(config.hand_mechanical_upper_rad, dtype=np.float64),
-            max_delta,
-        )
-    except ValueError as exc:
-        return str(exc)
-    return None
-
-
 def _seed_hand_reference(shared: SharedStorage) -> np.ndarray | None:
     """Seed the first hand-delta reference from measured hand feedback.
 
@@ -182,7 +156,13 @@ def _seed_hand_reference(shared: SharedStorage) -> np.ndarray | None:
     if result is None:
         return None
     record = result[0][0]
-    if not bool(record["connected"]) or not bool(record["state_valid"]):
+    if (
+        not bool(record["connected"])
+        or not bool(record["state_valid"])
+        or bool(record["error_state"])
+        or not bool(record["send_healthy"])
+        or not bool(record["read_healthy"])
+    ):
         return None
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
@@ -271,7 +251,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     last_adopted_observation_id = 0
     next_step = 0
     last_published_hand_cmd: np.ndarray | None = (
-        _seed_hand_reference(shared) if config.deployment.hand_enabled else None
+        _seed_hand_reference(shared)
+        if config.deployment.hand_enabled and config.hand_max_delta_rad is not None
+        else None
     )
     # Command-to-command silence reference. ``None`` until the first publish so
     # the slow first inference (forced reset + encode + infer after the
@@ -354,23 +336,15 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             if int(active_plan["hand_present"]) == 1:
                 hand_qpos = np.asarray(active_plan["hand_qpos"][selected], dtype=np.float64)
 
-            # Coupled-hand preflight before the arm endpoint is enqueued, so a
-            # rejected hand command desyncs nothing (§74). Violation aborts.
-            if hand_qpos is not None:
+            # When the optional delta bound is enabled, seed its first
+            # last-published reference from healthy measured feedback. The
+            # centralized publication boundary owns the actual preflight.
+            if hand_qpos is not None and config.hand_max_delta_rad is not None:
                 if last_published_hand_cmd is None:
-                    # First coupled command: (re)seed the delta reference from
-                    # measured feedback. A coupled endpoint is never published
-                    # without a command-to-command delta bound (§74).
                     last_published_hand_cmd = _seed_hand_reference(shared)
                     if last_published_hand_cmd is None:
                         _sleep_tick(period_s, tick_start)
                         continue
-                error = _preflight_hand(hand_qpos, last_published_hand_cmd, config)
-                if error is not None:
-                    _abort_policy_run(shared, f"hand command delta violation: {error}", metrics)
-                    running = False
-                    active_plan = None
-                    continue
 
             candidate = build_action_candidate(
                 shared,
@@ -385,23 +359,37 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            reject_reason: list[str] = []
-            published = validate_and_send_candidate(
+            publish_result = validate_and_send_candidate(
                 shared,
                 candidate,
                 gate=gate,
-                dt_s=period_s,
-                reject_reason_out=reject_reason,
+                previous_hand_qpos=last_published_hand_cmd,
+                hand_mechanical_lower_rad=np.asarray(
+                    config.hand_mechanical_lower_rad, dtype=np.float64
+                ),
+                hand_mechanical_upper_rad=np.asarray(
+                    config.hand_mechanical_upper_rad, dtype=np.float64
+                ),
+                hand_max_delta_rad=config.hand_max_delta_rad,
             )
-            if published is None:
-                if reject_reason:
+            if not publish_result.succeeded:
+                if publish_result.status == CommandPublishStatus.GATE_REJECTED:
                     # SafetyGate rejection is a policy-semantic failure (§80.2):
                     # the model proposed an invalid endpoint. Abort immediately.
                     _abort_policy_run(
                         shared,
-                        f"safety gate rejection: {reject_reason[0]}",
+                        f"safety gate rejection: {publish_result.reason}",
                         metrics,
                         metric=SAFETY_REJECTIONS,
+                    )
+                    running = False
+                    active_plan = None
+                    continue
+                if publish_result.status == CommandPublishStatus.HAND_PREFLIGHT_REJECTED:
+                    _abort_policy_run(
+                        shared,
+                        f"hand command preflight rejection: {publish_result.reason}",
+                        metrics,
                     )
                     running = False
                     active_plan = None

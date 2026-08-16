@@ -6,9 +6,8 @@ Locks the coordinator's correctness guarantees without hardware:
     publishes nothing when no step is due yet (§76/§77), skipping invalid steps.
   - ``_adoptable`` drops stale-generation / stale-observation / expired / malformed
     plans (§75).
-  - ``_preflight_hand`` rejects a coupled-hand delta/mechanical violation before
-    the arm endpoint is enqueued (§74), with the first-command reference seeded
-    from measured feedback (VR-mirrored, no false delta abort).
+  - the first optional hand-delta reference is seeded from healthy measured
+    feedback; the shared publication boundary owns the coupled preflight (§74).
   - ``_abort_policy_run`` advances the generation and drops RUNNING -> ARMED
     (policy-semantic failure, not a hardware FAULT) (§80.2/§82).
 
@@ -36,7 +35,6 @@ from dexmani_real.deployment.coordinator import (
     CoordinatorConfig,
     _abort_policy_run,
     _adoptable,
-    _preflight_hand,
     _seed_hand_reference,
     _select_due_step,
     coordinator_loop,
@@ -257,15 +255,6 @@ def main() -> int:
     bad_mask["valid_mask"][0, 2] = 2
     assert not _adoptable(bad_mask[0], **_adopt_args())[0], "non-binary valid_mask"
 
-    # ── coupled-hand preflight ──
-    cfg = _coordinator_config()
-    assert _preflight_hand(hand_mid, None, cfg) is None, "first command skips delta, bounds ok"
-    assert _preflight_hand(hand_mid, hand_mid, cfg) is None, "zero delta is valid"
-    tight = _coordinator_config(hand_max_delta_rad=0.001)
-    assert _preflight_hand(hand_mid + 0.01, hand_mid, tight) is not None, "delta violation rejected"
-    below = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64) - 1.0
-    assert _preflight_hand(below, hand_mid, cfg) is not None, "operational limit violation rejected"
-
     # ── abort semantics: advance generation + RUNNING -> ARMED (no FAULT) ──
     shared = SharedStorage.create(prefix="check_plan_scheduler_abort")
     try:
@@ -286,6 +275,8 @@ def main() -> int:
         seed = _seed_hand_reference(shared2)
         assert seed is not None, "valid hand feedback must seed the reference"
         np.testing.assert_allclose(seed, hand_mid)
+        shared2.hand_state_ring.write(make_hand_state_frame(hand_mid, send_healthy=0))
+        assert _seed_hand_reference(shared2) is None, "unhealthy command I/O must not seed"
     finally:
         shared2.close()
 

@@ -169,6 +169,8 @@ python -m compileall -q dexmani_real examples
 | `config/defaults.py` | 所有数值默认值的单一来源：臂、手、VR、相机、策略、键盘、安全、碰撞与录制参数。 |
 | `config/runtime.py` | 将默认 dataclass 与 YAML/点路径覆盖合并、验证并冻结为可跨进程使用的运行时配置快照。 |
 
+> **法兰转接件补偿（已知几何决策）**：实体法兰转接件厚 0.033 m，但 `xarm7_xhand_right.urdf` 与 `xarm7_xhand_collision.urdf` 仍以 `flange_joint2` 固定关节编码 0.043 m。FK/规划路径经 `HandParams.T_eef_handbase_pos_xyz` 的 −0.010 m 修正精确对齐（residual 0 m）；碰撞模型直接加载原始 URDF、无等价修正，故手部碰撞网格残留 ±10 mm 系统偏移，已折入 `TableCollisionConfig.soft_clearance_m`（0.01 → 0.02 m）。`hand_safety_margin_m`（0.05 m，仅固定-Z 回退路径）无需改动。保留代码层补偿、不改 URDF，以免破坏 episode 的 URDF SHA-256 provenance。
+
 ### `planning/` — 运动学、IK、碰撞与轨迹规划
 
 | 文件 | 作用 |
@@ -190,7 +192,7 @@ python -m compileall -q dexmani_real examples
 | 文件 | 作用 |
 |---|---|
 | `policy/__init__.py` | 标识动作协议、安全校验与控制环计时包（原 learned-policy 已移除）。 |
-| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；发布边界统一检查运行态、arm/hand feedback 健康度和 coupled-hand 机械/增量预检，并返回类型化拒绝/传输结果，worker 在 SDK 前仍独立复核；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
 | `policy/runtime.py` | 定义单 tick 动作候选 `ActionCandidate` 的数据契约，含 run generation、时效与只读数组封装。 |
 

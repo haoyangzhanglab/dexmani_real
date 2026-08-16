@@ -164,7 +164,12 @@ class TableCollisionConfig:
     plane_abcd: tuple[float, float, float, float] = (0.0, 0.0, 1.0, -0.022)
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
-    soft_clearance_m: float = 0.01
+    # Nominal 10 mm mesh clearance plus the ~10 mm flange-adapter residual: the
+    # collision model loads the collision URDF with flange_joint2 at the raw
+    # 0.043 m, while the FK/planning path compensates it to 0.033 m (see
+    # HandParams.T_eef_handbase_pos_xyz). The collision model applies no
+    # equivalent correction, so that residual is folded into this clearance.
+    soft_clearance_m: float = 0.02
     allowed_contact_links: tuple[str, ...] = ("link_base",)
 
     def __post_init__(self) -> None:
@@ -505,6 +510,10 @@ class HandParams:
     #   Physical flange correction = -0.010 m  (URDF 0.043 m → measured 0.033 m, short 10 mm;
     #                              link_eef -Z = custom_eef_link +X, so compensated in -X)
     #   Total            = -0.015 m
+    #
+    #   NOTE: the collision model applies no equivalent flange correction (it
+    #   loads the collision URDF raw), so the same 10 mm residual is folded
+    #   into TableCollisionConfig.soft_clearance_m (0.01 → 0.02).
     #
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (0.707107, 0.0, 0.707107, 0.0)
