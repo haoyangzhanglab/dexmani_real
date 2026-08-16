@@ -21,12 +21,17 @@ from dexmani_real.robot.arm_sdk import (
     ArmLoopConfig,
     _read_live_error_code,
     _require_sdk_ok,
+    controller_state_allows_motion,
+    enter_mode6,
+    stop_controller,
 )
 from dexmani_real.robot.homing import run_planned_homing
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.shared_storage import (
     HOME_SENTINEL,
+    HomeOutcome,
     HomeRequest,
+    HomeResult,
     new_frame,
 )
 from dexmani_real.utils.log import (
@@ -53,11 +58,11 @@ def _recover_c24_measured_hold(
     _require_sdk_ok(f"{operation_prefix} clean_error", arm_api.clean_error())
     _require_sdk_ok(f"{operation_prefix} clean_warn", arm_api.clean_warn())
     # Collision disables motion at the controller; re-enable before re-entering
-    # Mode 6.  _enter_mode6_ready also verifies the controller reaches the
-    # ready State 2 before we read joints, so the measured hold never races an
-    # unready controller.
+    # Mode 6.  enter_mode6 also verifies the controller reaches a movable
+    # state before we read joints, so the measured hold never races an unready
+    # controller.
     _require_sdk_ok(f"{operation_prefix} motion_enable", arm_api.motion_enable(True))
-    _enter_mode6_ready(arm_api, operation_prefix=operation_prefix)
+    enter_mode6(arm_api)
     state_code, measured = arm_api.get_joint_states(is_radian=True, num=1)
     _require_sdk_ok(f"{operation_prefix} fresh get_joint_states", state_code)
     measured_hold = np.asarray(measured[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]]
@@ -91,13 +96,6 @@ def _parse_arm_action_metadata(
             created_s = received_s
         return command_seq, created_s, bool(action["is_hold"][0])
     return 0, received_s, False
-
-
-def _enter_mode6_ready(arm_api: Any, *, operation_prefix: str) -> None:
-    """Enter Mode 6/State 0 and verify the controller reports ready State 2."""
-    _require_sdk_ok(f"{operation_prefix} set_mode(6)", arm_api.set_mode(6))
-    _require_sdk_ok(f"{operation_prefix} set_state(0)", arm_api.set_state(0))
-    _wait_live_status(arm_api, expected_state=2, expected_mode=6)
 
 
 def _take_next_current_arm_action(action_q: Any, *, expected_run_generation: int) -> Any | None:
@@ -159,19 +157,6 @@ def _update_state_read_watchdog(counter: RetryCounter, *, succeeded: bool) -> bo
     return counter.triggered
 
 
-def _read_live_status(arm_api: Any) -> tuple[int, int, int]:
-    """Return live ``(state, mode, error)`` or raise on any failed read."""
-    if hasattr(arm_api, "get_state"):
-        code, state = arm_api.get_state()
-        _require_sdk_ok("get_state", code)
-    else:
-        state = getattr(arm_api, "state")
-    mode = int(getattr(arm_api, "mode"))
-    code, values = arm_api.get_err_warn_code()
-    _require_sdk_ok("get_err_warn_code", code)
-    return int(state), mode, int(values[0])
-
-
 def _read_live_error_or_fail(arm_api: Any) -> int:
     """Return the live controller error, or 1 (not-ready) if the read fails.
 
@@ -183,49 +168,6 @@ def _read_live_error_or_fail(arm_api: Any) -> int:
         return _read_live_error_code(arm_api)
     except Exception:
         return 1
-
-
-def _wait_live_status(
-    arm_api: Any,
-    *,
-    expected_state: int | tuple[int, ...],
-    expected_mode: int | None = None,
-    timeout_s: float = 1.0,
-    require_error_clear: bool = True,
-) -> int:
-    """Wait until the controller reports ``expected_state`` (and mode/error).
-
-    ``require_error_clear=False`` relaxes the error==0 postcondition so a
-    fault-path cleanup can confirm the physical stop without first clearing a
-    latched controller error.
-    """
-    expected_states = (
-        (expected_state,) if isinstance(expected_state, int) else tuple(expected_state)
-    )
-    if not expected_states or any(
-        not isinstance(value, int) for value in expected_states
-    ):
-        raise ValueError(
-            "expected_state must contain one or more integer controller states"
-        )
-    deadline = time.monotonic() + timeout_s
-    last: tuple[int, int, int] | None = None
-    while time.monotonic() < deadline:
-        last = _read_live_status(arm_api)
-        state, mode, error = last
-        if (
-            state in expected_states
-            and (not require_error_clear or error == 0)
-            and (expected_mode is None or mode == expected_mode)
-        ):
-            return state
-        time.sleep(0.03)
-    expected_label = (
-        expected_states[0] if len(expected_states) == 1 else expected_states
-    )
-    raise RuntimeError(
-        f"controller postcondition failed: expected state={expected_label} mode={expected_mode} error=0, got {last}"
-    )
 
 
 def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
@@ -264,6 +206,94 @@ def _latch_collision_fault(shared: Any, arm_api: Any, error_code: int) -> None:
     shared.error_state.value = True
 
 
+def _request_still_current_and_armed(shared: Any, request: HomeRequest) -> bool:
+    """True when the request's generation is current and safety is ARMED."""
+    return (
+        int(shared.run_generation.value) == request.run_generation
+        and int(shared.safety_state.value) == int(SafetyState.ARMED)
+        and not shared.error_state.value
+    )
+
+
+def _with_outcome(result: HomeResult, outcome: HomeOutcome, reason: str) -> HomeResult:
+    """Rebuild ``result`` with a new terminal outcome and reason."""
+    return HomeResult(
+        request_id=result.request_id,
+        outcome=outcome,
+        reason=reason,
+        final_qpos=np.asarray(result.final_qpos, dtype=np.float64).copy(),
+        completed_at_s=time.monotonic(),
+    )
+
+
+def _finalize_home_result(
+    shared: Any,
+    arm: Any,
+    request: HomeRequest,
+    provisional: HomeResult,
+    *,
+    on_poll: Callable[[], None],
+) -> tuple[HomeResult, bool]:
+    """Apply the single controller finalizer for a finished HOME.
+
+    The worker that owns ``arm_action_q`` is the only party that stops/restores
+    the controller and publishes the terminal outcome.  Returns
+    ``(terminal, accept_motion)``:
+
+    * FAILED → sticky ``error_state`` + stop; never accept motion.
+    * CANCELLED → stop; a failed stop confirmation upgrades to FAILED + sticky.
+    * SUCCESS → re-check generation/ARMED, re-enter Mode 6; any failure
+      upgrades to FAILED + sticky + state-4.
+
+    Only a confirmed SUCCESS Mode-6 restore yields ``accept_motion=True``.
+    """
+    outcome = provisional.outcome
+
+    if outcome is HomeOutcome.FAILED:
+        shared.error_state.value = True
+        stop_controller(arm, on_poll=on_poll)
+        return provisional, False
+
+    if outcome is HomeOutcome.CANCELLED:
+        stop = stop_controller(arm, on_poll=on_poll)
+        if not stop.confirmed:
+            shared.error_state.value = True
+            return (
+                _with_outcome(
+                    provisional,
+                    HomeOutcome.FAILED,
+                    f"{provisional.reason}; stop not confirmed: {stop.reason}",
+                ),
+                False,
+            )
+        return provisional, False
+
+    if not _request_still_current_and_armed(shared, request):
+        shared.error_state.value = True
+        stop_controller(arm, on_poll=on_poll)
+        return (
+            _with_outcome(
+                provisional,
+                HomeOutcome.FAILED,
+                "generation/safety boundary changed before Mode 6 restore",
+            ),
+            False,
+        )
+
+    try:
+        enter_mode6(arm, on_poll=on_poll)
+    except Exception as exc:
+        shared.error_state.value = True
+        stop_controller(arm, on_poll=on_poll)
+        return (
+            _with_outcome(
+                provisional, HomeOutcome.FAILED, f"Mode 6 restore failed: {exc}"
+            ),
+            False,
+        )
+    return provisional, True
+
+
 def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     """Arm process entry point — reads arm_action_q, servos arm via Mode 6.
 
@@ -287,6 +317,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
 
     def _publish_startup_fault(detail: str) -> None:
         logger.error("arm_loop: %s", detail)
+
+    def _heartbeat() -> None:
+        shared.set_heartbeat("arm", time.monotonic())
 
     # URDF-consistent FK (replaces arm.get_position_aa). xArm firmware uses a
     # different EEF coordinate definition — Pinocchio FK ensures all consumers
@@ -360,7 +393,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             # fall back to the cache and wrongly declare the controller ready.
             _err = _read_live_error_or_fail(arm)
             _state = getattr(arm, "state", -1)
-            if _err == 0 and _state == 2:
+            if _err == 0 and controller_state_allows_motion(_state):
                 break
             logger.warning(
                 "arm_loop: connect recovery attempt %d/%d: err=%s state=%s",
@@ -450,12 +483,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     last_target = last_qpos.copy()
     # Ready means connected/configured and physically STOPPED, not Mode-6
     # motion-enabled. Confirm state 4 before exposing arm_ready.
-    try:
-        _require_sdk_ok("startup set_state(4)", arm.set_state(4))
-        _wait_live_status(arm, expected_state=4)
-    except Exception:
+    _startup_stop = stop_controller(arm, on_poll=_heartbeat)
+    if not _startup_stop.confirmed:
         logger.error(
-            "arm_loop: failed to enter confirmed DISARMED state", exc_info=True
+            "arm_loop: failed to enter confirmed DISARMED state: %s",
+            _startup_stop.reason,
         )
         _publish_startup_fault("confirmed state-4 startup stop failed")
         shared.error_state.value = True
@@ -557,26 +589,28 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     SafetyState.DISARMED,
                     SafetyState.FAULT,
                 ):
-                    try:
-                        _require_sdk_ok("safety set_state(4)", arm.set_state(4))
-                        _wait_live_status(arm, expected_state=4)
-                    except Exception:
-                        logger.error("arm_loop: failed to confirm safe stop", exc_info=True)
+                    _safe_stop = stop_controller(arm, on_poll=_heartbeat)
+                    if not _safe_stop.confirmed:
+                        logger.error(
+                            "arm_loop: failed to confirm safe stop: %s",
+                            _safe_stop.reason,
+                        )
                         shared.error_state.value = True
                         break
                     accepts_motion_commands = False
-            elif _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not accepts_motion_commands:
+            elif (
+                _safety in (SafetyState.ARMED, SafetyState.RUNNING)
+                and not accepts_motion_commands
+                and not shared.error_state.value
+            ):
                 try:
-                    _enter_mode6_ready(arm, operation_prefix="armed")
+                    enter_mode6(arm, on_poll=_heartbeat)
                 except Exception:
                     logger.error(
                         "arm_loop: failed ARMED Mode-6 postcondition", exc_info=True
                     )
                     shared.error_state.value = True
-                    try:
-                        arm.set_state(4)
-                    except Exception:
-                        logger.error("arm_loop: fallback stop failed", exc_info=True)
+                    stop_controller(arm, on_poll=_heartbeat)
                     break
                 accepts_motion_commands = True
             last_safety_state = int(_safety)
@@ -595,6 +629,29 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                     _request = action[1]
                     if not isinstance(_request, HomeRequest):
                         logger.error("arm_loop: rejecting malformed HOME request")
+                        continue
+                    if int(shared.run_generation.value) != _request.run_generation:
+                        # A superseded request never started: publish a clean
+                        # cancellation and stay in the current mode (no stop).
+                        logger.warning(
+                            "arm_loop: discarding stale-generation HOME request"
+                        )
+                        _stale = HomeResult(
+                            request_id=_request.request_id,
+                            outcome=HomeOutcome.CANCELLED,
+                            reason="run generation changed before homing started",
+                            final_qpos=np.full(
+                                ARM_JOINT_SHAPE, np.nan, dtype=np.float64
+                            ),
+                            completed_at_s=time.monotonic(),
+                        )
+                        try:
+                            shared.arm_home_result_q.put(_stale, timeout=0.2)
+                        except Exception:
+                            logger.error(
+                                "arm_loop: failed to publish stale HOME result",
+                                exc_info=True,
+                            )
                         continue
                     logger.info(
                         "arm_loop: HOME sentinel — planned homing (%d validated milestones)",
@@ -644,34 +701,45 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                         _frame["timestamp"][0] = last_state_source_ns / 1e9
                         shared.arm_state_ring.write(_frame)
 
+                    accepts_motion_commands = False
                     _home_started_s = time.monotonic()
-                    _home_result = run_planned_homing(
+                    _provisional = run_planned_homing(
                         arm,
                         _request,
                         cfg,
                         shared=shared,
                         feedback_callback=_publish_homing_feedback,
                     )
+                    _terminal, _accept = _finalize_home_result(
+                        shared, arm, _request, _provisional, on_poll=_heartbeat
+                    )
+                    if _terminal.final_qpos.shape == ARM_JOINT_SHAPE and np.all(
+                        np.isfinite(_terminal.final_qpos)
+                    ):
+                        last_qpos = _terminal.final_qpos.copy()
+                        last_target = last_qpos.copy()
                     try:
-                        shared.arm_home_result_q.put(_home_result, timeout=0.2)
+                        shared.arm_home_result_q.put(_terminal, timeout=0.2)
                     except Exception:
                         logger.error(
                             "arm_loop: failed to publish HOME result", exc_info=True
                         )
-                    if _home_result.final_qpos.shape == ARM_JOINT_SHAPE and np.all(
-                        np.isfinite(_home_result.final_qpos)
-                    ):
-                        last_qpos = _home_result.final_qpos.copy()
-                        last_target = last_qpos.copy()
-                    if _home_result.success:
-                        accepts_motion_commands = True
+                        shared.error_state.value = True
+                        accepts_motion_commands = False
+                        stop_controller(arm, on_poll=_heartbeat)
+                        break
+                    accepts_motion_commands = _accept
+                    if _terminal.outcome is HomeOutcome.SUCCESS:
                         logger.info(
                             "arm_loop: HOME complete in %.2fs",
                             time.monotonic() - _home_started_s,
                         )
-                    elif shared.is_running.value:
-                        logger.error("arm_loop: HOME failed — %s", _home_result.reason)
-                        shared.error_state.value = True
+                    else:
+                        logger.error(
+                            "arm_loop: HOME %s — %s",
+                            _terminal.outcome.name,
+                            _terminal.reason,
+                        )
                     continue
 
                 elif action is not None and not isinstance(action, tuple):
@@ -914,14 +982,15 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             limiter.wait()
     finally:
         # Cleanup: best-effort state 4 + disconnect, even if the loop raised.
-        try:
-            _require_sdk_ok("cleanup set_state(4)", arm.set_state(4))
-            # A fault exit leaves a non-zero controller error; confirm the stop
-            # without requiring the error to be cleared (it is already latched).
-            _wait_live_status(arm, expected_state=4, require_error_clear=False)
+        # A fault exit leaves a non-zero controller error; confirm the stop
+        # without requiring the error to be cleared (it is already latched).
+        _cleanup_stop = stop_controller(arm, on_poll=_heartbeat)
+        if _cleanup_stop.confirmed:
             stopped_cleanly = True
-        except Exception:
-            logger.warning("arm_loop: cleanup failed", exc_info=True)
+        else:
+            logger.warning(
+                "arm_loop: cleanup failed: %s", _cleanup_stop.reason
+            )
             shared.error_state.value = True
         _disconnect_arm(arm)
         if terminal_feedback_detail is not None:

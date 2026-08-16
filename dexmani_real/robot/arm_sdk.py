@@ -11,8 +11,9 @@ them.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -187,3 +188,160 @@ def _read_live_error_code(arm_api: Any) -> int:
     code, values = arm_api.get_err_warn_code()
     _require_sdk_ok("get_err_warn_code", code)
     return int(values[0])
+
+
+# ── Controller state transitions (leaf helpers shared by arm_loop + homing) ──
+#
+# ``get_state()`` / ``get_err_warn_code()`` are synchronous reads; ``arm.mode``
+# and ``arm.connected`` are report-cache attributes (SDK 1.18.4 has no
+# synchronous ``get_mode()``).  The two are deliberately separate result types:
+# never present a combined read as one atomic live snapshot.
+
+
+@dataclass(frozen=True)
+class LiveStateError:
+    """Synchronous controller read: state and the (error, warn) register."""
+
+    state: int
+    error_code: int
+    warn_code: int
+
+
+@dataclass(frozen=True)
+class ReportSnapshot:
+    """Cached report attributes: connected flag and controller mode."""
+
+    connected: bool
+    mode: int
+
+
+@dataclass(frozen=True)
+class StopResult:
+    """Outcome of a :func:`stop_controller` attempt."""
+
+    confirmed: bool
+    reason: str
+
+
+def controller_state_allows_motion(state: Any) -> bool:
+    """Return whether a controller state permits motion (0/1/2).
+
+    State 2 is a legal idle state but not the only ready state; the fixed SDK
+    accepts 0/1/2 as "not suspended/stopped".  Unknown states fail closed.
+    """
+    return int(state) in (0, 1, 2)
+
+
+def read_live_state_and_error(arm_api: Any) -> LiveStateError:
+    """Synchronously read controller state and the (error, warn) register."""
+    code, state = arm_api.get_state()
+    _require_sdk_ok("get_state", code)
+    code, values = arm_api.get_err_warn_code()
+    _require_sdk_ok("get_err_warn_code", code)
+    return LiveStateError(
+        state=int(state), error_code=int(values[0]), warn_code=int(values[1])
+    )
+
+
+def read_report_mode_and_connection(arm_api: Any) -> ReportSnapshot:
+    """Read the cached ``connected``/``mode`` report attributes."""
+    connected = bool(getattr(arm_api, "connected", True))
+    mode = int(getattr(arm_api, "mode", 6))
+    return ReportSnapshot(connected=connected, mode=mode)
+
+
+def _wait_controller_ready(
+    arm_api: Any,
+    *,
+    expected_mode: int,
+    on_poll: Callable[[], None] | None,
+    timeout_s: float,
+) -> int:
+    """Bounded wait for ``error==0``, a movable state, and a settled mode.
+
+    A repeated read of the same cached ``mode`` is a single observation, not
+    several independent live samples; only the (possibly updated) report value
+    at each poll is evaluated.  ``on_poll`` keeps the caller's heartbeat fresh
+    while this helper sleeps.
+    """
+    deadline = time.monotonic() + timeout_s
+    last: LiveStateError | None = None
+    while time.monotonic() < deadline:
+        if on_poll is not None:
+            on_poll()
+        last = read_live_state_and_error(arm_api)
+        report = read_report_mode_and_connection(arm_api)
+        if (
+            report.connected
+            and last.error_code == 0
+            and report.mode == expected_mode
+            and controller_state_allows_motion(last.state)
+        ):
+            return last.state
+        time.sleep(0.03)
+    raise RuntimeError(
+        f"controller postcondition failed: expected mode={expected_mode} "
+        f"error=0 movable-state, got state={last.state if last else None} "
+        f"error={last.error_code if last else None}"
+    )
+
+
+def enter_mode0(arm_api: Any, *, on_poll: Callable[[], None] | None = None) -> None:
+    """Enter Mode 0 and wait for a movable state; raise on failure."""
+    _require_sdk_ok("set_mode(0)", arm_api.set_mode(0))
+    _require_sdk_ok("set_state(0) after Mode 0", arm_api.set_state(0))
+    _wait_controller_ready(
+        arm_api, expected_mode=0, on_poll=on_poll, timeout_s=1.0
+    )
+
+
+def enter_mode6(arm_api: Any, *, on_poll: Callable[[], None] | None = None) -> None:
+    """Enter Mode 6 and wait for a movable state; raise on failure."""
+    _require_sdk_ok("set_mode(6)", arm_api.set_mode(6))
+    _require_sdk_ok("set_state(0)", arm_api.set_state(0))
+    _wait_controller_ready(
+        arm_api, expected_mode=6, on_poll=on_poll, timeout_s=1.0
+    )
+
+
+def stop_controller(
+    arm_api: Any,
+    *,
+    emergency: bool = False,
+    on_poll: Callable[[], None] | None = None,
+    timeout_s: float = 1.0,
+) -> StopResult:
+    """Request State 4 and confirm it, without requiring a cleared error.
+
+    ``emergency=True`` first calls ``arm.emergency_stop()`` (no integer return
+    code in SDK 1.18.4; only exceptions are caught).  A failed ``set_state(4)``
+    does not skip the bounded synchronous ``get_state()`` confirmation: a
+    latched controller error must not prevent confirming the physical stop.
+    """
+    if emergency:
+        try:
+            arm_api.emergency_stop()
+        except Exception:
+            pass
+    try:
+        _require_sdk_ok("set_state(4)", arm_api.set_state(4))
+    except Exception:
+        pass
+    deadline = time.monotonic() + timeout_s
+    last_state: int | None = None
+    while time.monotonic() < deadline:
+        if on_poll is not None:
+            on_poll()
+        try:
+            code, state = arm_api.get_state()
+            _require_sdk_ok("get_state", code)
+        except Exception:
+            time.sleep(0.03)
+            continue
+        last_state = int(state)
+        if last_state == 4:
+            return StopResult(confirmed=True, reason="")
+        time.sleep(0.03)
+    return StopResult(
+        confirmed=False, reason=f"state-4 not confirmed (last={last_state})"
+    )

@@ -9,6 +9,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Any
 
 import numpy as np
@@ -153,9 +154,18 @@ class SharedStorageConfig:
 HOME_SENTINEL = "__HOME__"
 
 
+class HomeOutcome(IntEnum):
+    """Terminal outcome of one planned-homing execution."""
+
+    SUCCESS = 0
+    CANCELLED = 1
+    FAILED = 2
+
+
 @dataclass(frozen=True)
 class HomeRequest:
     request_id: int
+    run_generation: int
     waypoints: np.ndarray
     final_qpos: np.ndarray
     execution_timeout_s: float
@@ -164,10 +174,15 @@ class HomeRequest:
 @dataclass(frozen=True)
 class HomeResult:
     request_id: int
-    success: bool
+    outcome: HomeOutcome
     reason: str
     final_qpos: np.ndarray
     completed_at_s: float
+
+    @property
+    def success(self) -> bool:
+        """Compatibility view: True only for a converged SUCCESS outcome."""
+        return self.outcome is HomeOutcome.SUCCESS
 
 
 _RING_RESOURCE_NAMES = (

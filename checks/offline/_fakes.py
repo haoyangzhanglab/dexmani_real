@@ -35,16 +35,25 @@ class FakeArm:
         state: int = 4,
         mode: int = 6,
         error_code: int = 0,
+        connected: bool = True,
         joint_state: np.ndarray | None = None,
     ) -> None:
         self.state = state
         self.mode = mode
         self.error_code = error_code
+        self.connected = connected
         self.joint_state = (
             np.zeros(ARM_JOINT_SHAPE, dtype=np.float64)
             if joint_state is None
             else np.asarray(joint_state, dtype=np.float64)
         )
+        # Report-cache identity surface used by the arm worker's startup
+        # identity validation (safe defaults; checks may override them).
+        self.axis = 7
+        self.device_type = "xArm7"
+        self.sn = "FAKE"
+        self.version = "1.18.4"
+        self.version_number = (1, 18, 4)
         self.calls: list[tuple[str, tuple, dict]] = []
         self._codes: dict[str, int] = {}
         self._raise: dict[str, Exception] = {}
@@ -106,11 +115,16 @@ class FakeArm:
         self._maybe_raise("set_state")
         if self._code("set_state") != 0:
             return self._code("set_state")
-        # State 0 ("not ready") resolves to State 2 ("ready") once the
-        # controller acknowledges the motion-enable handshake; State 4 is the
-        # physically stopped state.
-        self.state = 2 if state == 0 else state
+        # Faithfully model the SDK: State 0 is "not ready", State 1 is moving,
+        # State 2 is idle, State 4 is stopped.  State 0 does NOT resolve to
+        # State 2 — that was a test-only assumption that masked the P0 bug.
+        self.state = state
         return 0
+
+    def emergency_stop(self) -> None:
+        self._record("emergency_stop", (), {})
+        self._maybe_raise("emergency_stop")
+        # SDK 1.18.4 returns no integer code; a successful call is a no-op here.
 
     def get_state(self) -> tuple[int, int]:
         self._record("get_state", (), {})
