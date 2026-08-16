@@ -51,8 +51,15 @@ class ArmLoopConfig:
     collision_sensitivity: int = field(
         default_factory=lambda: arm.collision_sensitivity
     )
-    max_consecutive_recoveries: int = field(
-        default_factory=lambda: safety.max_consecutive_recoveries
+    max_consecutive_arm_health_failures: int = field(
+        default_factory=lambda: safety.max_consecutive_arm_health_failures
+    )
+
+    expected_axis: int = field(default_factory=lambda: arm.expected_axis)
+    device_profile: str | None = field(default_factory=lambda: arm.device_profile)
+    serial_number: str | None = field(default_factory=lambda: arm.serial_number)
+    min_firmware: tuple[int, ...] | None = field(
+        default_factory=lambda: arm.min_firmware
     )
 
     homing_convergence_rad: float = field(
@@ -93,8 +100,22 @@ class ArmLoopConfig:
             lower > upper
         ):
             raise ValueError("arm loop joint limits/home must be finite and ordered")
-        if self.max_consecutive_recoveries <= 0:
-            raise ValueError("max_consecutive_recoveries must be positive")
+        if self.max_consecutive_arm_health_failures <= 0:
+            raise ValueError("max_consecutive_arm_health_failures must be positive")
+        if not isinstance(self.expected_axis, int) or self.expected_axis <= 0:
+            raise ValueError("expected_axis must be a positive integer")
+        if self.device_profile is not None and not self.device_profile:
+            raise ValueError("device_profile must be non-empty when set")
+        if self.serial_number is not None and not self.serial_number:
+            raise ValueError("serial_number must be non-empty when set")
+        if self.min_firmware is not None and (
+            not isinstance(self.min_firmware, tuple)
+            or not self.min_firmware
+            or any(not isinstance(v, int) or v < 0 for v in self.min_firmware)
+        ):
+            raise ValueError(
+                "min_firmware must be a non-empty tuple of non-negative integers"
+            )
         timing = (
             self.joint_max_speed_rad_per_s,
             self.joint_max_acc_rad_per_s2,
@@ -136,7 +157,13 @@ class ArmLoopConfig:
             arm_ip=str(cfg.ip),
             home_qpos=tuple(cfg.home_qpos),
             collision_sensitivity=int(cfg.collision_sensitivity),
-            max_consecutive_recoveries=int(runtime.safety.max_consecutive_recoveries),
+            max_consecutive_arm_health_failures=int(
+                runtime.safety.max_consecutive_arm_health_failures
+            ),
+            expected_axis=int(cfg.expected_axis),
+            device_profile=cfg.device_profile,
+            serial_number=cfg.serial_number,
+            min_firmware=tuple(cfg.min_firmware) if cfg.min_firmware is not None else None,
             homing_convergence_rad=float(cfg.homing.convergence_rad),
             homing_step_interval_s=float(cfg.homing.step_interval_s),
             homing_max_speed_rad_per_s=float(np.deg2rad(cfg.homing.max_speed_deg_s)),
@@ -324,3 +351,107 @@ def stop_controller(
     return StopResult(
         confirmed=False, reason=f"state-4 not confirmed (last={last_state})"
     )
+
+
+# ── Connect-time validation (config vs. the SDK report surface) ──
+#
+# ``set_servo_angle`` silently clamps speed to [0.0001, π] rad/s and mvacc to
+# [0.01, 20] rad/s² (SDK 1.18.4), so a configured value outside the effective
+# intersection of those hard clamps and the reported device limits would be
+# rewritten without any error.  Refuse such values at connect instead of
+# letting metadata claim an execution value the firmware cannot honor.
+
+SPEED_COMMAND_CLAMP_RAD_PER_S: tuple[float, float] = (0.0001, float(np.pi))
+ACC_COMMAND_CLAMP_RAD_PER_S2: tuple[float, float] = (0.01, 20.0)
+
+
+def _binding_device_limit(value: Any) -> float | None:
+    """Return the most restrictive positive finite reported device limit.
+
+    ``joint_speed_limit`` / ``joint_acc_limit`` are per-joint report lists; the
+    binding constraint is their minimum.  Returns ``None`` when the report is
+    absent or unusable so the caller falls back to the SDK hard clamp only.
+    """
+    if value is None:
+        return None
+    if np.isscalar(value):
+        value = [value]
+    try:
+        finite = [float(v) for v in value if np.isfinite(float(v)) and float(v) > 0.0]
+    except (TypeError, ValueError):
+        return None
+    return min(finite) if finite else None
+
+
+def validate_command_dynamics_intersection(
+    *,
+    config_speed_rad_per_s: float,
+    config_acc_rad_per_s2: float,
+    device_speed_limits: Any,
+    device_acc_limits: Any,
+) -> str | None:
+    """Return a reason string when the configured Mode 6 dynamics would be
+    silently clamped, or ``None`` when they fit the effective command range.
+
+    The effective upper bound is ``min(SDK hard clamp, reported device limit)``;
+    a missing device report falls back to the SDK hard clamp alone.  Both below
+    the lower clamp and above the effective upper bound are refused.
+    """
+    speed_upper = SPEED_COMMAND_CLAMP_RAD_PER_S[1]
+    acc_upper = ACC_COMMAND_CLAMP_RAD_PER_S2[1]
+    dev_speed = _binding_device_limit(device_speed_limits)
+    dev_acc = _binding_device_limit(device_acc_limits)
+    if dev_speed is not None:
+        speed_upper = min(speed_upper, dev_speed)
+    if dev_acc is not None:
+        acc_upper = min(acc_upper, dev_acc)
+    if not (
+        SPEED_COMMAND_CLAMP_RAD_PER_S[0] <= config_speed_rad_per_s <= speed_upper
+    ):
+        return (
+            f"configured speed {config_speed_rad_per_s} rad/s outside the effective "
+            f"command range [{SPEED_COMMAND_CLAMP_RAD_PER_S[0]}, {speed_upper}]"
+        )
+    if not (
+        ACC_COMMAND_CLAMP_RAD_PER_S2[0] <= config_acc_rad_per_s2 <= acc_upper
+    ):
+        return (
+            f"configured mvacc {config_acc_rad_per_s2} rad/s² outside the effective "
+            f"command range [{ACC_COMMAND_CLAMP_RAD_PER_S2[0]}, {acc_upper}]"
+        )
+    return None
+
+
+def validate_device_identity(
+    *,
+    axis: int,
+    device_type: str,
+    serial_number: str,
+    firmware: tuple[int, ...],
+    expected_axis: int,
+    expected_serial: str | None,
+    min_firmware: tuple[int, ...] | None,
+    device_profile: str | None,
+) -> str | None:
+    """Return a reason string when the reported device identity fails the
+    configured expectations, or ``None`` when it passes.
+
+    ``firmware`` is compared as an integer tuple (``version_number``), never as
+    a string.  ``device_profile=None`` performs no type check — the model is not
+    guessed without on-site confirmation (doc §8.5).  ``expected_serial=None``
+    and ``min_firmware=None`` skip their checks.
+    """
+    if axis != expected_axis:
+        return f"device reports {axis} axes, expected {expected_axis}"
+    if expected_serial is not None and serial_number != expected_serial:
+        return (
+            f"serial number mismatch: got {serial_number!r}, "
+            f"expected {expected_serial!r}"
+        )
+    if min_firmware is not None and firmware and firmware < min_firmware:
+        return f"firmware {firmware} below minimum {min_firmware}"
+    if device_profile is not None and device_type and device_type != device_profile:
+        return (
+            f"device type {device_type!r} does not match profile {device_profile!r}"
+        )
+    return None

@@ -257,6 +257,13 @@ class ArmParams:
     # ── Connection ──
     ip: str = "192.168.1.111"
 
+    # ── Device identity (validated against the SDK report at connect) ──
+    expected_axis: int = 7
+    # Explicit model check is opt-in: None means "don't guess the model" (doc §8.5).
+    device_profile: str | None = None
+    serial_number: str | None = None  # enforced only when configured
+    min_firmware: tuple[int, ...] | None = None  # integer-tuple compare via version_number
+
     # ── Environment ──
     # Compatibility fallback when calibrated environment.table is disabled.
     table_z_surface_m: float = 0.022
@@ -309,14 +316,33 @@ class ArmParams:
             raise ValueError("tracking_error_warn_rad must be finite and positive")
         if not (0 <= self.collision_sensitivity <= 5):
             raise ValueError(f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]")
-        if not (np.isfinite(self.max_joint_velocity_deg_per_s) and 0 < self.max_joint_velocity_deg_per_s <= 500):
-            raise ValueError(f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} out of range (0, 500]")
-        if not (
-            np.isfinite(self.max_joint_acceleration_deg_per_s2) and 0 < self.max_joint_acceleration_deg_per_s2 <= 50000
-        ):
+        # The Mode 6 command path hard-clamps speed to [0.0001, π] rad/s and
+        # mvacc to [0.01, 20] rad/s²; validate in radians (not degrees) so the
+        # configured value can never be silently rewritten by the firmware.
+        _max_speed_rad = self.max_joint_velocity_rad_per_s
+        _max_acc_rad = self.max_joint_acceleration_rad_per_s2
+        if not (np.isfinite(_max_speed_rad) and 0.0001 <= _max_speed_rad <= np.pi):
             raise ValueError(
-                f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} out of range (0, 50000]"
+                f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} "
+                f"resolves to {_max_speed_rad} rad/s, outside the SDK command range [0.0001, π]"
             )
+        if not (np.isfinite(_max_acc_rad) and 0.01 <= _max_acc_rad <= 20.0):
+            raise ValueError(
+                f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} "
+                f"resolves to {_max_acc_rad} rad/s², outside the SDK command range [0.01, 20]"
+            )
+        if not isinstance(self.expected_axis, int) or self.expected_axis <= 0:
+            raise ValueError("expected_axis must be a positive integer")
+        if self.device_profile is not None and not self.device_profile:
+            raise ValueError("device_profile must be non-empty when set")
+        if self.serial_number is not None and not self.serial_number:
+            raise ValueError("serial_number must be non-empty when set")
+        if self.min_firmware is not None and (
+            not isinstance(self.min_firmware, tuple)
+            or not self.min_firmware
+            or any(not isinstance(v, int) or v < 0 for v in self.min_firmware)
+        ):
+            raise ValueError("min_firmware must be a non-empty tuple of non-negative integers")
         if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
             raise ValueError("tcp_load_mass_kg must be finite and positive")
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
@@ -820,8 +846,8 @@ class SafetyParams:
     )
     shutdown_timeout_s: float = 65.0
 
-    # Consecutive recovery escalation threshold (arm_loop)
-    max_consecutive_recoveries: int = 30  # 1s @ 30Hz → FAULT
+    # Consecutive arm-health failure threshold (feedback/FK reads, arm_loop)
+    max_consecutive_arm_health_failures: int = 30  # 1s @ 30Hz → FAULT
 
     # Supervisor check rate (Main)
     supervisor_hz: float = 10.0
@@ -841,8 +867,10 @@ class SafetyParams:
             raise ValueError("readiness_timeouts_s is missing a runtime subsystem")
         if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be finite and positive")
-        if self.max_consecutive_recoveries <= 0:
-            raise ValueError(f"max_consecutive_recoveries={self.max_consecutive_recoveries} must be > 0")
+        if self.max_consecutive_arm_health_failures <= 0:
+            raise ValueError(
+                f"max_consecutive_arm_health_failures={self.max_consecutive_arm_health_failures} must be > 0"
+            )
         if not np.isfinite(self.supervisor_hz) or self.supervisor_hz <= 0:
             raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
         object.__setattr__(self, "heartbeat_timeouts", MappingProxyType(dict(self.heartbeat_timeouts)))
@@ -856,7 +884,7 @@ class SafetyParams:
                 dict(self.heartbeat_timeouts),
                 dict(self.readiness_timeouts_s),
                 self.shutdown_timeout_s,
-                self.max_consecutive_recoveries,
+                self.max_consecutive_arm_health_failures,
                 self.supervisor_hz,
             ),
         )

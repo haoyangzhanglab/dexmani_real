@@ -54,6 +54,10 @@ class FakeArm:
         self.sn = "FAKE"
         self.version = "1.18.4"
         self.version_number = (1, 18, 4)
+        # Report-cache rated dynamics limits (per-joint lists in radian units,
+        # matching a connected xArm7); safe defaults for the connect-time check.
+        self.joint_speed_limit = [float(np.pi)] * 7
+        self.joint_acc_limit = [20.0] * 7
         self.calls: list[tuple[str, tuple, dict]] = []
         self._codes: dict[str, int] = {}
         self._raise: dict[str, Exception] = {}

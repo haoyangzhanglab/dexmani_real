@@ -25,6 +25,8 @@ from dexmani_real.robot.arm_sdk import (
     enter_mode6,
     read_live_state_and_error,
     stop_controller,
+    validate_command_dynamics_intersection,
+    validate_device_identity,
 )
 from dexmani_real.robot.homing import run_planned_homing
 from dexmani_real.robot.safety import SafetyState
@@ -69,9 +71,13 @@ def _parse_arm_action_metadata(
     return 0, received_s, False
 
 
-def _take_next_current_arm_action(action_q: Any, *, expected_run_generation: int) -> Any | None:
-    """Drain invalidated endpoints and return one item from the active run.
+def _take_next_current_arm_action(
+    action_q: Any, *, expected_run_generation: int
+) -> tuple[Any, float] | None:
+    """Drain invalidated endpoints and return ``(item, received_s)``.
 
+    ``received_s`` is sampled immediately after ``get()`` returns so queue
+    latency is measured from the true dequeue time, not after validation.
     Generation checks can discard only endpoints still in this queue; an
     endpoint already accepted by the SDK remains owned by Mode 6 firmware.
     """
@@ -80,6 +86,7 @@ def _take_next_current_arm_action(action_q: Any, *, expected_run_generation: int
             queued_action = action_q.get(timeout=0.0)
         except Empty:
             return None
+        received_s = time.monotonic()
         now_ns = time.monotonic_ns()
         if isinstance(queued_action, np.ndarray):
             if worker_validate_arm(
@@ -87,12 +94,12 @@ def _take_next_current_arm_action(action_q: Any, *, expected_run_generation: int
                 expected_run_generation=expected_run_generation,
                 now_monotonic_ns=now_ns,
             ):
-                return queued_action
+                return queued_action, received_s
             logger.info(
                 "arm_loop: discarded malformed, stale-generation, or expired command"
             )
             continue
-        return queued_action
+        return queued_action, received_s
 
 
 def _decode_joint_state_feedback(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -126,6 +133,57 @@ def _update_state_read_watchdog(counter: RetryCounter, *, succeeded: bool) -> bo
         return False
     counter.inc()
     return counter.triggered
+
+
+def _compute_command_latency(
+    *,
+    created_s: float,
+    received_s: float,
+    applied_s: float,
+    sdk_started_s: float,
+) -> tuple[float, float, float]:
+    """Return ``(queue_latency, apply_latency, sdk_duration)`` from the three
+    monotonic samples, clamped to non-negative.
+
+    ``received_s`` is the dequeue time and ``applied_s`` the successful SDK
+    return time, so queue latency excludes the SDK call and apply latency
+    includes it — they are distinct quantities, never conflated.
+    """
+    return (
+        max(0.0, received_s - created_s),
+        max(0.0, applied_s - created_s),
+        max(0.0, applied_s - sdk_started_s),
+    )
+
+
+_MODE_DRIFT_TIMEOUT_S = 1.0  # bounded wall-clock window for a cached-mode mismatch
+
+
+def _advance_mode_drift(
+    *,
+    monitoring: bool,
+    report_mode: int,
+    expected_mode: int,
+    feedback_healthy: bool,
+    mismatch_since_s: float | None,
+    now_s: float,
+    timeout_s: float,
+) -> tuple[float | None, bool]:
+    """Advance the cached-mode drift window; return ``(mismatch_since_s, fault)``.
+
+    A repeated read of the same unchanged cached ``mode`` is one observation,
+    not a per-tick count: the mismatch must persist past ``timeout_s`` of
+    wall-clock while joint feedback stays healthy before ``fault`` becomes True.
+    ``monitoring`` gates on STREAMING, so an expected Mode 0/6 transition and a
+    single stale read are never treated as drift.
+    """
+    if not monitoring or report_mode == expected_mode:
+        return None, False
+    if mismatch_since_s is None:
+        return now_s, False
+    if feedback_healthy and now_s - mismatch_since_s >= timeout_s:
+        return mismatch_since_s, True
+    return mismatch_since_s, False
 
 
 _CONTROLLER_ERROR_LABELS: dict[int, str] = {
@@ -298,16 +356,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     """
     _tracking_warn = ThrottledWarner(interval_s=5.0)
     _fk_warn = ThrottledWarner(interval_s=5.0)
-    _state_read_warn = ThrottledWarner(interval_s=5.0)
     cfg = config or ArmLoopConfig()
-    _recovery_counter = RetryCounter(
-        max_consecutive=cfg.max_consecutive_recoveries, label="arm_servo"
-    )
     _state_error_counter = RetryCounter(
-        max_consecutive=cfg.max_consecutive_recoveries, label="arm_state"
+        max_consecutive=cfg.max_consecutive_arm_health_failures, label="arm_state"
     )
     _fk_error_counter = RetryCounter(
-        max_consecutive=cfg.max_consecutive_recoveries, label="arm_fk"
+        max_consecutive=cfg.max_consecutive_arm_health_failures, label="arm_fk"
     )
     _tracking_err_count = 0
     logger.debug("arm_loop: LOADING")
@@ -359,17 +413,73 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         shared.error_state.value = True
         return
 
+    # Device identity: wait (bounded) for the SDK report thread to populate the
+    # identity attributes, then sample + validate them once.  Sampling at
+    # connection time would permanently record "unavailable" placeholders.
+    _identity_deadline = time.monotonic() + 3.0
+    while time.monotonic() < _identity_deadline:
+        if isinstance(getattr(arm, "axis", None), int) and int(getattr(arm, "axis", 0) or 0) > 0:
+            break
+        _heartbeat()
+        time.sleep(0.05)
+    _identity_axis = int(getattr(arm, "axis", 0) or 0)
+    _identity_type = str(getattr(arm, "device_type", "") or "")
+    _identity_sn = str(getattr(arm, "sn", "") or "")
+    _identity_firmware = tuple(getattr(arm, "version_number", ()) or ())
+
+    _identity_error = validate_device_identity(
+        axis=_identity_axis,
+        device_type=_identity_type,
+        serial_number=_identity_sn,
+        firmware=_identity_firmware,
+        expected_axis=cfg.expected_axis,
+        expected_serial=cfg.serial_number,
+        min_firmware=cfg.min_firmware,
+        device_profile=cfg.device_profile,
+    )
+    if _identity_error is not None:
+        logger.error("arm_loop: device identity validation failed: %s", _identity_error)
+        _publish_startup_fault(_identity_error)
+        shared.error_state.value = True
+        stop_controller(arm, on_poll=_heartbeat)
+        _disconnect_arm(arm)
+        return
+
     if hasattr(shared, "arm_device_identity"):
+        _identity_firmware_str = (
+            ".".join(str(v) for v in _identity_firmware)
+            if _identity_firmware
+            else str(getattr(arm, "version", "unavailable") or "unavailable")
+        )
         identity = {
-            "device_type": str(getattr(arm, "device_type", "unavailable")),
-            "firmware_version": str(getattr(arm, "version", "unavailable")),
-            "model": "xArm7",
-            "serial_number": str(getattr(arm, "sn", "unavailable")),
+            "axis": _identity_axis,
+            "device_type": _identity_type or "unavailable",
+            "model": cfg.device_profile or _identity_type or "unavailable",
+            "serial_number": _identity_sn or "unavailable",
+            "firmware_version": _identity_firmware_str,
         }
         encoded_identity = json.dumps(
             identity, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         shared.arm_device_identity.value = encoded_identity[:1023].ljust(1024, b"\x00")
+
+    # Connect-time dynamics intersection: the configured Mode 6 speed/mvacc must
+    # fit within the SDK hard clamps AND the reported device limits, or the
+    # firmware would silently rewrite them.  Refuse before touching the motion
+    # controller so metadata never claims an execution value it cannot honor.
+    _dynamics_mismatch = validate_command_dynamics_intersection(
+        config_speed_rad_per_s=cfg.joint_max_speed_rad_per_s,
+        config_acc_rad_per_s2=cfg.joint_max_acc_rad_per_s2,
+        device_speed_limits=getattr(arm, "joint_speed_limit", None),
+        device_acc_limits=getattr(arm, "joint_acc_limit", None),
+    )
+    if _dynamics_mismatch is not None:
+        logger.error("arm_loop: %s", _dynamics_mismatch)
+        _publish_startup_fault(_dynamics_mismatch)
+        shared.error_state.value = True
+        stop_controller(arm, on_poll=_heartbeat)
+        _disconnect_arm(arm)
+        return
 
     # Connect/configure while the application remains DISARMED. Motion mode is
     # entered only on the ARMED edge below.  Startup never clears a pre-existing
@@ -431,8 +541,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 center_of_gravity=list(cfg.tcp_load_cog_mm),
             ),
         )
-        # Torque-based collision detection (level 1, least-sensitive enabled
-        # setting). Keep this firmware backstop enabled during intentional contact.
+        # Controller-global joint acceleration cap for Mode 6 trajectory
+        # generation — not collision detection (that is set_collision_sensitivity
+        # above).
         _require_sdk_ok(
             "set_joint_maxacc",
             arm.set_joint_maxacc(cfg.joint_max_acc_rad_per_s2, is_radian=True),
@@ -502,6 +613,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     last_safety_state = int(SafetyState.DISARMED)
     last_state_source_ns = time.monotonic_ns()
     terminal_feedback_detail: str | None = None
+    _mode_mismatch_since_s: float | None = None
 
     # Publish initial state BEFORE arm_ready — consumers wait on arm_ready and
     # expect the ring to already contain a valid frame.  Without this, there is
@@ -551,8 +663,6 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     )
 
     limiter = RateManager(cfg.arm_loop_hz)
-    low = np.asarray(cfg.joint_limit_lower, dtype=np.float64)
-    high = np.asarray(cfg.joint_limit_upper, dtype=np.float64)
 
     stopped_cleanly = False
     try:
@@ -561,9 +671,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             shared.set_heartbeat("arm", time.monotonic())
 
             if shared.estop_request.value:
-                # SDK emergency_stop() is the fastest path to kill motor power.
-                # Fall back to set_state(4) in cleanup if the SDK method is
-                # unavailable or fails (belt-and-suspenders per Xarm7-).
+                # SDK emergency_stop() requests an immediate stop and waits for
+                # controller State 4; it does not cut motor power.  Cleanup still
+                # re-confirms State 4 (belt-and-suspenders per XArm7).
                 try:
                     arm.emergency_stop()
                 except Exception:
@@ -610,10 +720,15 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 accepts_motion_commands = True
             last_safety_state = int(_safety)
             if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-                action = _take_next_current_arm_action(
+                _dequeued = _take_next_current_arm_action(
                     shared.arm_action_q,
                     expected_run_generation=int(shared.run_generation.value),
                 )
+                if _dequeued is None:
+                    action = None
+                    action_received_s = 0.0
+                else:
+                    action, action_received_s = _dequeued
 
                 # HOME sentinel — collision-validated path with request ID.
                 if (
@@ -756,64 +871,73 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                                 cfg.joint_limit_upper,
                             )
                         except ValueError:
-                            target = last_qpos.copy()
+                            # An endpoint that cannot be wrapped is discarded —
+                            # never replaced with a synthetic "hold current pose"
+                            # that Mode 6 would interpret as a real command.
+                            logger.warning(
+                                "arm_loop: discarded endpoint that failed joint wrapping"
+                            )
+                            continue
+                        last_target = target.copy()
+                        _sdk_started_s = time.monotonic()
+                        try:
+                            code = arm.set_servo_angle(
+                                angle=target,
+                                is_radian=True,
+                                speed=cfg.joint_max_speed_rad_per_s,
+                                mvacc=cfg.joint_max_acc_rad_per_s2,
+                                wait=False,
+                            )
+                        except Exception as exc:
+                            latch_arm_fault(
+                                shared,
+                                arm,
+                                f"set_servo_angle raised: {exc}",
+                                on_poll=_heartbeat,
+                            )
+                            break
+                        if code == 0:
+                            _applied_s = time.monotonic()
+                            last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = (
+                                _parse_arm_action_metadata(action, action_received_s)
+                            )
+                            last_cmd_received_s = action_received_s
+                            last_cmd_applied_s = _applied_s
+                            (
+                                last_cmd_queue_latency_s,
+                                last_cmd_apply_latency_s,
+                                last_cmd_sdk_duration_s,
+                            ) = _compute_command_latency(
+                                created_s=last_cmd_created_s,
+                                received_s=action_received_s,
+                                applied_s=_applied_s,
+                                sdk_started_s=_sdk_started_s,
+                            )
                         else:
-                            last_target = target.copy()
-                            _sdk_started_s = time.monotonic()
+                            # A non-zero setter return is a terminal command
+                            # failure even when the live controller error is
+                            # 0 — record both namespaces, never continue.
                             try:
-                                code = arm.set_servo_angle(
-                                    angle=target,
-                                    is_radian=True,
-                                    speed=cfg.joint_max_speed_rad_per_s,
-                                    mvacc=cfg.joint_max_acc_rad_per_s2,
-                                    wait=False,
-                                )
-                            except Exception as exc:
+                                err_code = _read_live_error_code(arm)
+                            except Exception:
                                 latch_arm_fault(
                                     shared,
                                     arm,
-                                    f"set_servo_angle raised: {exc}",
-                                    on_poll=_heartbeat,
-                                )
-                                break
-                            if code == 0:
-                                last_cmd_seq, last_cmd_created_s, last_cmd_is_hold = (
-                                    _parse_arm_action_metadata(action, _sdk_started_s)
-                                )
-                                last_cmd_received_s = time.monotonic()
-                                last_cmd_applied_s = last_cmd_received_s
-                                last_cmd_queue_latency_s = max(
-                                    0.0, last_cmd_received_s - last_cmd_created_s
-                                )
-                                last_cmd_apply_latency_s = max(
-                                    0.0, last_cmd_applied_s - last_cmd_created_s
-                                )
-                                last_cmd_sdk_duration_s = time.monotonic() - _sdk_started_s
-                            else:
-                                # A non-zero setter return is a terminal command
-                                # failure even when the live controller error is
-                                # 0 — record both namespaces, never continue.
-                                try:
-                                    err_code = _read_live_error_code(arm)
-                                except Exception:
-                                    latch_arm_fault(
-                                        shared,
-                                        arm,
-                                        f"set_servo_angle failed (code={code}); "
-                                        "live error read failed",
-                                        api_code=code,
-                                        on_poll=_heartbeat,
-                                    )
-                                    break
-                                latch_arm_fault(
-                                    shared,
-                                    arm,
-                                    f"set_servo_angle failed (code={code})",
+                                    f"set_servo_angle failed (code={code}); "
+                                    "live error read failed",
                                     api_code=code,
-                                    controller_error=err_code,
                                     on_poll=_heartbeat,
                                 )
                                 break
+                            latch_arm_fault(
+                                shared,
+                                arm,
+                                f"set_servo_angle failed (code={code})",
+                                api_code=code,
+                                controller_error=err_code,
+                                on_poll=_heartbeat,
+                            )
+                            break
                 elif action is not None:
                     logger.error(
                         "arm_loop: rejecting malformed action queue item %r", action
@@ -901,6 +1025,29 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                 )
                 break
 
+            # Mode-drift gate (STREAMING only).  The cached ``arm.mode`` has no
+            # synchronous getter, so a persistent mismatch must outlive a short
+            # bounded wall-clock window while joint feedback is still healthy —
+            # a single stale read or an expected Mode 0/6 transition is not drift.
+            _report_mode = int(getattr(arm, "mode", 6) or 6)
+            _mode_mismatch_since_s, _mode_drifted = _advance_mode_drift(
+                monitoring=accepts_motion_commands,
+                report_mode=_report_mode,
+                expected_mode=6,
+                feedback_healthy=arm_connected,
+                mismatch_since_s=_mode_mismatch_since_s,
+                now_s=time.monotonic(),
+                timeout_s=_MODE_DRIFT_TIMEOUT_S,
+            )
+            if _mode_drifted:
+                latch_arm_fault(
+                    shared,
+                    arm,
+                    f"controller mode drift (cached mode={_report_mode}, expected 6)",
+                    on_poll=_heartbeat,
+                )
+                break
+
             # Publish state
             _frame["qpos"][0] = qpos
             _frame["qvel"][0] = qvel
@@ -909,7 +1056,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             _frame["eef_rot6d"][0] = eef_rot6d
             _frame["error_code"][0] = int(error_code)
             _frame["connected"][0] = 1 if arm_connected else 0
-            _frame["mode"][0] = getattr(arm, "mode", 6)
+            _frame["mode"][0] = _report_mode
             _frame["tracking_err"][0] = tracking_err
             _frame["last_cmd_seq"][0] = last_cmd_seq
             _frame["last_cmd_created_s"][0] = last_cmd_created_s
