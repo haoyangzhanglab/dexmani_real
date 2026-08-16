@@ -1,6 +1,6 @@
 # DexMani Real
 
-> 面向 **xArm7（7 自由度）+ XHand（12 自由度）+ Quest VR + Intel RealSense L515** 的 VR 遥操作、数据采集与轨迹回放系统。
+> 面向 **xArm7（7 自由度）+ XHand（12 自由度）+ Quest VR + Intel RealSense L515** 的 VR 遥操作、数据采集、轨迹回放与策略部署系统。
 
 DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结构化状态和指令；主进程只负责创建资源、检查就绪、监督健康状态与有序退出。这样既避免跨进程共享 SDK 对象，也将控制、记录和安全职责放在明确的领域模块中。
 
@@ -16,11 +16,12 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 
 ## 系统概览
 
-项目覆盖三条相互衔接的工作流：
+项目覆盖四条相互衔接的工作流：
 
 1. **VR 遥操作与采集**：读取 Quest、相机和机器人状态，生成安全的臂/手指令，并按固定控制网格记录 episode。
 2. **标定与诊断**：标定相机外参和 VR 朝向；以受限、可观测的方式诊断 RealSense、点云和 XHand。
 3. **回放与离线分析**：检查 HDF5 episode、在启动前直接执行密集预检、运行受控 live replay，并评估或可视化数据质量。
+4. **策略部署**：通过 `examples/run_policy.py` 运行 learned-policy；推理 worker 只写 `policy_plan_ring`，coordinator 经同一安全边界发布机器人动作。
 
 ```text
                     ┌───────────── sensor/ ──────────────┐
@@ -51,6 +52,7 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 - **硬件边界**：xArm/XHand SDK 仅由各自的执行 worker 使用，RealSense SDK 由 `sensor/` 持有；其他进程不共享活的 SDK 对象。
 - **控制边界**：遥操作 worker 决定动作与采样网格；`RecorderIO` 只负责序列化、校验和事务式发布。录制的 START/STOP、状态与每格元数据使用固定 dtype，不在共享内存中嵌入 JSON；v16 episode 保存已解析配置的 SHA-256，而非整份配置文本。
 - **安全边界**：`SafetyState` 管理 `DISARMED → ARMED → RUNNING → FAULT`；固件仍是最后一道安全保护。
+- **策略边界**：`integrations/` 只依赖 `deployment/`，绝不反向；推理 worker 只写 `policy_plan_ring`，`deployment/coordinator.py` 是唯一的 learned-policy 机器人动作生产者，经共享 `SafetyGate` 边界发布。
 
 ## 运行模型与数据流
 
@@ -82,13 +84,14 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 |---|---|---|
 | VR 采集 | `examples/collect_teleop.py` | `teleop/loop.py` → `planning/`、`robot/`、`recording/`（实验生命周期自包含在 examples 中）|
 | 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 松键推进 generation / 命令静默 / 实测位姿重锚 → 安全动作协议 |
+| 策略部署 | `examples/run_policy.py` | `deployment/lifecycle.py` → `deployment/worker.py`（推理）→ `deployment/coordinator.py`（动作发布，经共享安全边界）|
 | Episode 回放 | `examples/replay_episode.py` | 自包含脚本；默认 live 完整回放并产出结果；`--dry-run` 仅离线校验 |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | `examples/visualize_episode.py` | Rerun 3D episode 可视化；`python examples/visualize_episode.py <episode>` |
 
-### 普通暂停的物理语义
+### 普通暂停与录制语义
 
-`collect_teleop` 的 C/S/D/Q、VR stale、手反馈异常和音频门控，以及键盘松键，采用同一条命令静默边界：
+普通暂停（C/S/D/Q、VR stale、手反馈异常、音频门控，以及键盘松键）统一采用“命令静默”：
 
 ```text
 推进 run_generation → 停止发布 arm/hand action
@@ -97,32 +100,9 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 → 恢复前从新鲜实测反馈重锚
 ```
 
-这不是急停，也不会调用 State 6 或发布“实测位置 hold”。generation 无法撤回已经被固件接受的
-endpoint。VR 恢复要求 arm、VR 和启用时的 hand 反馈严格晚于暂停边界，首个控制网格只重锚，下一网格
-才允许发布。C 只能恢复由 C 建立的暂停；S/D 和最大时长结束后的下一轮必须按 B。每次 B 都另开一个
-`run_generation`，替换旧暂停边界，并同样要求 B 之后的新鲜反馈完成首格重锚。若 S/D/时长触顶在
-C 暂停期间到达，它们不会重复推进 generation，但会立即取消 C 恢复资格。键盘空闲时持续用实测
-关节和 FK 更新基准。在自动门控已经静默时按 C，只把同一边界转为可 C 恢复的用户暂停，
-不二次推进 generation。State 4 只用于启动时的 DISARMED、FAULT、
-紧停后备、全局停止或故障打断的回零路径，以及最终验证式退出。
+这不是急停，也不会调用 State 6 或发布“实测位置 hold”。C 只能恢复 C 建立的暂停；S/D/时长触顶后的下一轮必须按 B，每次 B 另开一个 `run_generation`。命令静默期间不产生 action sample；恢复后的首个样本携带新 `control_run_generation`，RecorderIO 把下一个存储槽重锚到该样本真实时间（保留 wall-time 跳变，不补造 hold action）。`min_record_duration_s` 是质量标签而非发布硬门槛（短 episode 保持 v16 有效，标记 `min_frames_met=False`）。
 
-`is_hold` endpoint 并未从整个系统删除：IK/映射/工作空间拒绝等运行期安全回退仍可显式
-保持既有安全目标。这些分支不属于普通暂停。
-
-### 录制事务与时间语义
-
-命令静默期间不产生 action sample。恢复后的首个样本携带新的瞬态 `control_run_generation`，RecorderIO
-把下一个存储槽重锚到该样本的真实时间：episode 时间戳保留暂停造成的 wall-time 跳变，但不会把暂停补成
-虚假的 hold-last action。相同 generation 内真正错过的控制 deadline 仍按因果 hold-last 补齐。
-
-RecorderIO 以非阻塞 `FINALIZING` 状态完成编码、HDF5 校验、fsync 和原子发布，并在此期间持续 heartbeat。
-STOP 未得到终态前禁止新的 START。达到 `max_record_duration_s` 时自动保存、推进 generation 并进入
-`ARMED` 命令静默；用户需按 B 开始新的 session。只有终态确认后 UI 才显示“已保存”。录像错误不触发
-机器人 `FAULT`，但会累计会话失败并使采集 CLI 非零退出。终结超时只标记会话失败：后台线程真实结束前
-仍保持 `FINALIZING`，不会提前释放下一个 START。
-
-`min_record_duration_s` 是质量标签而非发布硬门槛：短 episode 可保持 v16 内部有效，但
-`min_frames_met=False`，回放和可视化会警告，由训练/分析入口显式过滤。
+完整语义见 `CLAUDE.md` §4（Critical behavior paths）；跨模块契约见 `AGENTS.md`。
 
 ## 从入口到核心模块
 
@@ -131,7 +111,7 @@ STOP 未得到终态前禁止新的 START。达到 `max_record_duration_s` 时�
 1. **配置与协议**：先读 `config/defaults.py`、`config/runtime.py`、`utils/schema.py`，了解默认参数与跨进程数据形状。
 2. **数据平面与生命周期**：再读 `shm/shared_storage.py`、`shm/ring_buffer.py`、`runtime/supervisor.py`，了解进程如何共享数据、就绪和停止。
 3. **设备和运动能力**：阅读 `sensor/`、`robot/` 与 `planning/`，它们分别产生观测、执行动作、计算 FK/IK/碰撞和路径。
-4. **业务控制环**：`teleop/` 是 VR 控制和记录决策中心。
+4. **业务控制环**：`teleop/` 是 VR 控制和记录决策中心；`deployment/` 是 learned-policy 部署的控制环。
 5. **持久化和事后工作流**：`recording/` 写入/读取 episode；`examples/replay_episode.py` 和 `examples/visualize_episode.py` 消费这些数据。
 
 ## 环境与安全边界
@@ -278,7 +258,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `shm/__init__.py` | 说明共享内存公共接口及其与回零/监督模块的职责边界。 |
 | `shm/camera_ring.py` | 大相机帧（RGB+depth+pointcloud）的变长槽共享内存环 `CameraRingBuffer`，复用同一 seqlock 提交/发布合同。 |
 | `shm/causal_reader.py` | 从各状态环读取因果帧（`0 < source <= publish <= anchor`）的公共读取器；不含 age threshold，供遥操作快照与 deployment 观测共用。 |
-| `shm/ring_buffer.py` | 通用共享内存 seqlock 环和相机专用环，提供零拷贝写入与已验证读取。 |
+| `shm/ring_buffer.py` | 通用共享内存 seqlock 环（`SeqlockSlot` + `SharedMemoryRingBuffer`），提供零拷贝写入与已验证读取；相机专用变长槽环见 `shm/camera_ring.py`。 |
 | `shm/shared_storage.py` | 创建并持有共享环、队列、标志和事件；默认仅分配遥操作/采集能力，`policy_plan_ring` 供 learned-policy 部署使用。 |
 
 ### `teleop/` — VR 映射、控制环与采集决策
@@ -291,8 +271,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/config.py` | 遥操作配置薄视图：仅持有 `runtime` 快照引用与 4 个会话专属字段（task_label/operator/hand_urdf_path/vr_transform_path），运行时值统一经 `config.runtime.<section>.<field>` 直读。 |
 | `teleop/control_state.py` | 表示 command quiescence 与回零交接状态，记录首次暂停原因和反馈新鲜度边界。 |
 | `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop 与主动安全回退的 held 样本；命令静默期间不补造样本。 |
-| `teleop/hand_control.py` | 对畸形重定向输出做 shape/finite 快速失败，并强制执行关节限位与命令间增量校验（控制器侧优雅 hold 边界）；区别于 SafetyGate 的粘滞 fault 与 worker/SDK 的跨进程丢弃。 |
-| `teleop/hand_retarget.py` | 校验手部 landmarks，并提供启发式 XHand 和 TAG 优化两类手部重定向器。 |
+| `teleop/hand_control.py` | 手部命令生成与重定向器状态辅助：每个 verified VR ring sequence 最多调用一次有状态 solver（成功/失败均缓存，ramp 仍按控制网格推进）；对 shaped 目标做后备校验，违规时优雅 hold 而非升级为粘滞 fault。 |
+| `teleop/hand_retarget.py` | 校验手部 landmarks，并提供 DexPilot 与 TAG 两类重定向器；二者输出统一为 schema 定义的 XHand SDK 关节顺序。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
 | `teleop/recording_session.py` | 处理退出时的保存、丢弃和停机决策。 |
@@ -340,16 +320,15 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 
 | 位置 | 内容 |
 |---|---|
-
 | `dexmani_real/config/cameras.json` | 物理相机序列号、类型和外参，是运行时校验的一部分。 |
 | `dexmani_real/config/desk_plane.json` | 点云过滤、在线动作安全与回零路径共同使用的桌面平面标定数据。 |
 | `dexmani_real/config/vr_transform.json` | schema-v1 VR 朝向标定；启动前校验 SO(3)、坐标约定与机器可读质量，POOR 质量拒绝运行。 |
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
-| `CLAUDE.md` | 更详细的架构、运行流程、安全/碰撞、录制 schema 与运维背景。 |
-| `AGENTS.md` | 面向代码修改者的仓库约定、硬件安全边界和跨模块变更检查清单。 |
+| `CLAUDE.md` | 实现导航：任务路由、所有权、数据契约、关键行为路径、硬件工程事实与命令入口。 |
+| `AGENTS.md` | 面向代码修改者的仓库契约：架构不变量、硬件安全边界和跨模块变更检查清单。 |
 | `docs/dataset/hdf5_episode.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
 | `docs/dataset/sim_hdf5_zarr.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |
 | `docs/dataset/real_to_sim_mapping.md` | Real v16 episode → Sim/Policy 标签映射表：仅登记字段来源、结构关系和语义差异，不修改录制数值。 |
-| `docs/hand_retargeting.md` | hand retarget 当前控制合同：TAG/DexPilot 两后端、命令整形/验证/发布边界、状态推进时机与碰撞/触觉边界。 |
+| `docs/hand_retargeting.md` | hand retarget 当前控制合同：逐 VR observation 求解缓存、TAG/DexPilot 两后端、命令整形/验证/发布边界、状态推进时机与碰撞/触觉边界。 |
 
-对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的“Cross-module change checklist”，再沿本 README 的关键路径追踪所有生产者和消费者。
+对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的跨模块变更清单，再沿本 README 的关键路径追踪所有生产者和消费者。

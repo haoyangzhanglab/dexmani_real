@@ -1,6 +1,8 @@
-"""Hand command generation and retargeter state helpers."""
+"""Hand command generation, observation caching, and retargeter state helpers."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -13,6 +15,31 @@ logger = get_logger(__name__)
 
 
 _retarget_fail_warn = ThrottledWarner()
+
+
+@dataclass
+class HandRetargetObservationCache:
+    """Cache one solver result per VR ring observation.
+
+    ``observation_id`` is the verified VR ring sequence, not an action id. The
+    control grid may causally select that same immutable frame more than once.
+    Both success and failure are remembered: a success reuses a copied solved
+    endpoint, while a failure holds the caller's *current* previous command.
+    This keeps shaping control-rate driven without advancing TAG/DexPilot
+    temporal state or retrying a partial failure on duplicate input.
+
+    Teleop clears this cache at command quiescence/reanchor boundaries before
+    the reset solver is allowed to process another observation.
+    """
+
+    observation_id: int | None = None
+    target_qpos: np.ndarray | None = None
+    succeeded: bool = False
+
+    def reset(self) -> None:
+        self.observation_id = None
+        self.target_qpos = None
+        self.succeeded = False
 
 
 def _sanitize_hand_command(
@@ -93,11 +120,15 @@ def _compute_hand_command(
     vr_frame: dict | None,
     prev_hand_cmd: np.ndarray,
     hand_available: bool,
+    observation_cache: HandRetargetObservationCache,
 ) -> tuple[np.ndarray, bool]:
-    """Compute hand joint command from VR landmarks via DexPilot retargeting.
+    """Compute at most one hand solve per VR ring observation.
 
-    Returns (hand_cmd, retarget_ok). On failure or hand unavailable,
-    returns prev_hand_cmd unchanged with retarget_ok=False.
+    A successful cache hit returns ``retarget_ok=True`` without calling the
+    stateful backend again. A cached failure returns the current
+    ``prev_hand_cmd`` with ``retarget_ok=False``. New observations are claimed
+    before entering the backend so an exception or partial failure is never
+    retried on a later control tick.
     """
     if not hand_available:
         return prev_hand_cmd.copy(), False
@@ -105,17 +136,47 @@ def _compute_hand_command(
     if retargeter is None:
         return prev_hand_cmd.copy(), False
 
-    landmarks = vr_frame.get("landmarks") if vr_frame is not None else None
+    if vr_frame is None:
+        return prev_hand_cmd.copy(), False
+
+    landmarks = vr_frame.get("landmarks")
     if landmarks is None:
         return prev_hand_cmd.copy(), False
 
+    observation_id = int(vr_frame.get("ring_sequence", 0))
+    if observation_id <= 0:
+        _retarget_fail_warn(
+            "Hand retargeting: VR frame has invalid ring_sequence=%d", observation_id
+        )
+        return prev_hand_cmd.copy(), False
+
+    if observation_cache.observation_id == observation_id:
+        cached = observation_cache.target_qpos
+        if observation_cache.succeeded and cached is not None:
+            return cached.copy(), True
+        return prev_hand_cmd.copy(), False
+
+    # Claim the observation before entering the stateful solver. A failed or
+    # partially failed solve is not retried on later control ticks.
+    observation_cache.observation_id = observation_id
+    observation_cache.target_qpos = None
+    observation_cache.succeeded = False
+
     try:
         target = retargeter.retarget(landmarks)  # validates shape + finiteness internally
-        if target is not None and len(target) == 12:
-            return np.asarray(target, dtype=np.float64), True
+        if target is None:
+            _retarget_fail_warn("Hand retargeting: retargeter.retarget() returned None")
+            return prev_hand_cmd.copy(), False
+        target_arr = np.asarray(target, dtype=np.float64)
+        if target_arr.shape == HAND_JOINT_SHAPE and np.all(
+            np.isfinite(target_arr)
+        ):
+            observation_cache.target_qpos = target_arr.copy()
+            observation_cache.succeeded = True
+            return target_arr, True
         _retarget_fail_warn(
-            "Hand retargeting: retargeter.retarget() returned %s",
-            "None" if target is None else f"len={len(target)}",
+            "Hand retargeting: retargeter.retarget() returned invalid shape/values (%s)",
+            target_arr.shape,
         )
     except Exception:
         logger.warning("Hand retargeting failed — holding position", exc_info=True)
@@ -131,6 +192,8 @@ def _reset_hand_retargeter(
 
     Seeds SLSQP warm-start from actual hardware pose so the first
     retarget() call converges from near-optimum instead of the neutral midpoint.
+    The teleop owner must clear its observation cache before retargeting resumes
+    with this reset backend.
     """
     if retargeter is not None:
         try:

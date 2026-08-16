@@ -1,8 +1,8 @@
 # Hand Retarget 当前控制合同与实现说明
 
-> 最近静态审阅：2026-08-16
+> 最近静态审阅：2026-08-17
 >
-> 代码基线：HEAD `88becfd`，并核对了当时与本链路相关的未提交工作树内容
+> 实现基线：当前工作树；源码与运行配置始终是最终事实来源
 >
 > 适用范围：Quest 右手关键点写入共享内存后，到 XHand 命令跨越 SDK 边界之前
 >
@@ -40,6 +40,8 @@ VR_FRAME_DTYPE / 历史可验证 VR ring
 16 Hz 因果观测选择与新鲜度检查
     │
     ├── 陈旧、跨 generation 或未完成重锚：停止发布或 hold
+    │
+    ├── 同一 VR ring sequence：复用上次 solve，不重复推进 solver state
     │
     ▼
 21×3 shape / finite / 几何退化检查
@@ -82,7 +84,7 @@ XHand driver：最终范围检查，原样发送 endpoint
 6. 应用侧 command-to-command delta clamp（`hand.max_delta_rad`）已移除；手部速度保护仅由 EtherCAT 固件 PID 与电流限位承担。
 7. 结构错误、NaN/Inf、机械范围错误和 IPC/lifecycle 错误仍然 fail closed，不会被裁成合法动作。
 8. solver、ramp、published command 和 SDK accepted command 有不同的状态推进时机，不能统称为“按已发布命令推进”。
-9. teleop 的机械臂碰撞求解使用上一条已发布手姿态，不使用同周期新手候选。
+9. teleop 先完成本周期 hand solve、ramp、clip 和 sanitizer，再把该 shaped hand endpoint 放入机械臂 IK/collision model。
 10. tactile 进入反馈与记录，但当前不闭环调节捏合。
 
 ## 3. 所有权、时钟和数据流
@@ -145,7 +147,7 @@ hand command ring 是 latest-wins：
 
 ### 3.4 generation 与命令寿命
 
-`run_generation` 标识逻辑控制时代。begin、pause、home、反馈故障和相机重热等边界会使旧命令失效；worker 在 SDK 边界前拒绝旧 generation。
+`run_generation` 标识逻辑控制时代。begin、pause、home 和反馈故障等命令静默边界会使旧命令失效；worker 在 SDK 边界前拒绝旧 generation。camera stall 会废弃当前 episode，但不会自行推进 generation；下一次显式 BEGIN 才推进。
 
 命令同时带 monotonic 有效期。当前 hand worker delivery window 由 [policy/safety.py](../dexmani_real/policy/safety.py) 编码为 target time 后 300 ms。
 
@@ -162,21 +164,24 @@ generation 与有效期解决不同问题：
 
 | 状态 | 所有者 | 当前推进时机 | reset / 失效时机 |
 |---|---|---|---|
-| causal observation cursor | teleop reader | 控制网格选择观测时 | reanchor / reader reset |
+| hand retarget observation cache | teleop | 新 VR ring sequence 首次进入 retarget 时 | command quiescence / reanchor |
 | TAG `last_qpos` | TAG optimizer | Stage 1 或 Stage 2 成功返回时 | retargeter reset |
 | TAG `pinch_factors` | TAG optimizer | Stage 1 成功后、Stage 2 判断前 | retargeter reset |
 | DexPilot warm start / internal LP | dex-retargeting | 外部 `retarget()` 成功调用时 | wrapper reset |
 | wrapper output EMA | DexPilot wrapper | 仅当 alpha < 1 时；当前默认直通 | wrapper reset |
 | hand ramp step | teleop | 进入 ramp shaping 分支时 | reanchor、ramp 完成或显式清理 |
 | `ctx.prev_hand_qpos` | teleop | 候选发布成功后 | home / reanchor seed |
-| worker consumed sequence | hand worker | 读取一个新 ring sequence 时 | worker 生命周期 |
+| worker command-ring cursor | hand worker | 读取一个新 hand command ring sequence 时 | worker 生命周期 |
 | driver `last_qpos_cmd` | XHand driver | SDK send 成功后 | connect / home 初始化 |
 
-由此得到三个必须区分的结论：
+由此得到四个必须区分的结论：
 
 1. 非法 landmarks 在调用求解器前被拒绝，不推进 solver 状态。
-2. 合法 landmarks 得到 solver 结果后，即使后续整形、SafetyGate 或发布失败，solver temporal state 也可能已经推进。
-3. `ctx.prev_hand_qpos` 和 driver `last_qpos_cmd` 分别表示最后发布成功和最后设备调用接受的目标，不等同于最新 solver 候选。
+2. 同一 VR ring sequence 即使被多个 16 Hz 控制网格选中，也只调用一次有状态 retargeter；后续网格复用 solve 结果，ramp 仍按控制网格推进。
+3. 合法 landmarks 得到 solver 结果后，即使后续整形、SafetyGate 或发布失败，solver temporal state 也可能已经推进。
+4. `ctx.prev_hand_qpos` 和 driver `last_qpos_cmd` 分别表示最后发布成功和最后设备调用接受的目标，不等同于最新 solver 候选。
+
+cache key 是 shared VR ring 的 verified `ring_sequence`。成功和失败都会占用该 sequence；成功命中返回 solved endpoint 的副本并保持 `retarget_ok=True`，失败命中则返回调用时最新的 `ctx.prev_hand_qpos`。每个控制 tick 仍创建新的 `action_id`，所以复用 observation 不等于重复 hand command ring publication。
 
 当前 ramp step 也在发布前推进。若 ramp 期间 retarget 返回 hold，或后续发布失败，该控制帧仍可能消耗一个 ramp step。分析启动阶段时不能假设 ramp 帧数等于成功发布数。
 
@@ -262,7 +267,7 @@ TAG 使用 [xhand_right.urdf](../assets/robots/xhand/xhand_right.urdf)，通过 
 - 优化变量只有 12 个手关节；
 - Jacobian 丢弃前 6 个 floating-base velocity columns。
 
-Pinocchio model order 与 XHand SDK order 不同。映射由关节名称在运行时构造，并使用逆置换完成 measured SDK qpos→optimizer warm start。
+Pinocchio model order 与 XHand SDK order 不同。跨进程手关节向量的 canonical SDK 名称与顺序由 [utils/schema.py](../dexmani_real/utils/schema.py) 定义；TAG 按运行时模型名称构造映射，并使用逆置换完成 measured SDK qpos→optimizer warm start。DexPilot YAML 的名称顺序在加载时必须与该常量精确一致，否则初始化 fail closed。
 
 固定的 model→SDK index 关系当前为：
 
@@ -376,14 +381,14 @@ optimizer model-order q
 
 DexPilot 使用：
 
-- [xhand_right_teleop.urdf](../assets/robots/xhand/xhand_right_teleop.urdf)；
+- 与 TAG 共用的机械范围 [xhand_right.urdf](../assets/robots/xhand/xhand_right.urdf)；
 - [xhand_right_dexpilot.yml](../assets/retargeting/xhand_right_dexpilot.yml)；
 - 10 条 fingertip-to-fingertip vector；
 - 5 条 wrist-to-fingertip vector。
 
 公共 palm/MANO 和 pinky 预处理完成后，外部 dex-retargeting 构造 reference vector graph，并以 SLSQP、鲁棒几何误差和时间正则求解。
 
-DexPilot 的 optimizer 边界主要来自 `xhand_right_teleop.urdf` 和外部库处理；该 teleop URDF 已把若干 distal lower bound 写成 operational command floor。无论外部求解器如何处理微小边界扩展，仓库发布边界仍会对最终 shaped command 做独立复验。
+DexPilot 的 optimizer 边界主要来自机械范围 `xhand_right.urdf` 和外部库处理，与 TAG 一样不把 operational command floor 混入求解器。仓库只在发布前对最终 shaped command 应用 operational clip 和独立复验。
 
 当前滤波合同：
 
@@ -405,7 +410,7 @@ DexPilot 的 optimizer 边界主要来自 `xhand_right_teleop.urdf` 和外部库
 | pinch | 独立 Stage 2 | 外部 projected-vector 机制 |
 | 持续平滑 | 时间正则 + activation EMA | 外部 internal LPFilter |
 | wrapper output EMA | 无 | 当前直通 |
-| optimizer bounds 来源 | mechanical URDF | teleop URDF / 外部实现 |
+| optimizer bounds 来源 | mechanical URDF | mechanical URDF / 外部实现 |
 | Stage 2 回退 | 有 | 由外部实现决定 |
 | raw 可观测性 | 明确的 solver SDK-order 输出 | 当前只得到外部 retarget 返回值 |
 | 可审计性 | 目标和梯度在仓库内 | 部分语义依赖安装版本 |
@@ -436,10 +441,13 @@ observed → solved → shaped → published → accepted / measured
 - hand 不可用；
 - retargeter 不存在；
 - landmarks 缺失或非法；
+- VR ring sequence 缺失或非法；
 - backend 抛异常或返回 `None`；
-- 输出长度不是 12。
+- 输出不是 finite `(12,)`。
 
 这类失败不是结构非法命令；它产生一个合法 hold endpoint。
+
+因果 reader 可能在相邻控制网格返回同一个 VR ring sequence。teleop 对每个 sequence 最多调用一次有状态 backend：成功结果被缓存供后续网格复用，失败结果也不会在同一观测上重试。该缓存只约束 solver；startup ramp 仍按 16 Hz 控制网格推进。
 
 ### 8.3 startup ramp
 
@@ -454,7 +462,7 @@ $$
 q_{ramp}=q_{start}+w(q_{live}-q_{start})
 $$
 
-`q_live` 每帧可以变化，因此这不是固定终点的离线轨迹。最后一个 configured step 到达该帧的 live target。
+`q_live` 在新 VR observation 成功 solve 时可以变化；重复选择同一 ring sequence 时保持为缓存值。因此这不是固定终点的离线轨迹，但也不会因同一观测被重复选中而反复滤波。最后一个 configured step 到达该控制帧使用的 live target。
 
 当前 ramp step 在发布前推进，不保证每一步都成为 published command。
 
@@ -505,7 +513,7 @@ shaped endpoint 进入 `ActionCandidate`，再通过统一发布边界：
 
 ## 10. hand worker 与 XHand driver
 
-hand worker 读取最新未处理 ring sequence，并在 SDK 边界前检查：
+hand worker 读取最新未处理 hand command ring sequence，并在 SDK 边界前检查：
 
 - 固定 dtype、shape 和 finite；
 - operational、mechanical 和 rated envelope 的嵌套与 endpoint；
@@ -515,6 +523,8 @@ hand worker 读取最新未处理 ring sequence，并在 SDK 边界前检查：
 
 worker 只在允许的 safety state 下发送。persistent send/read/board faults 进入共享 fault 路径；`error_state` 是 sticky 的系统错误标志。
 
+worker 的本地 consumed cursor 只表示 hand command ring publication；反馈字段 `HAND_STATE_DTYPE.last_cmd_seq` 表示最后一次 `XHand.send_action()` 成功对应的 `action_id`。两者名称相近但不属于同一序号空间。
+
 XHand driver 再次检查 shape、finite 和范围。检查通过后 endpoint 原样写入 SDK command；应用层不在 driver 中插值。
 
 只有 SDK send 成功，driver 才更新 `last_qpos_cmd`，其值为设备调用接受的上一目标，不是 measured feedback，也不是 teleop 最新 solved target。
@@ -523,23 +533,19 @@ XHand driver 再次检查 shape、finite 和范围。检查通过后 endpoint �
 
 ### 11.1 teleop 当前碰撞手姿态
 
-teleop 在计算本周期 hand target 之前调用：
+teleop 先计算本周期 hand target，并完成 ramp、operational clip 和 sanitizer，然后调用：
 
 ```text
-planner.set_hand_qpos(ctx.prev_hand_qpos)
+planner.set_hand_qpos(hand_cmd)
 ```
 
 因此机械臂 IK/collision 使用：
 
 $$
-collision(q_{arm}^{candidate,t}, q_{hand}^{published,t-1})
-$$
-
-而不是同周期的：
-
-$$
 collision(q_{arm}^{candidate,t}, q_{hand}^{shaped,t})
 $$
+
+如果本周期 retarget 失败，`hand_cmd` 是上一条 published hand endpoint；否则它是本周期 shaped endpoint。arm IK 失败时，合法 hand-only endpoint 仍可独立发布。
 
 当前联合模型保留 arm–hand 活跃碰撞对，但 hand–hand 自碰对被禁用。hand retarget 目标本身也没有碰撞项。
 
@@ -596,8 +602,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 
 [examples/collect_teleop.py](../examples/collect_teleop.py) 当前记录联合机器人 URDF、SRDF 和 calibration 等资源哈希，但没有完整覆盖：
 
-- TAG 独立 `xhand_right.urdf`；
-- DexPilot `xhand_right_teleop.urdf`；
+- hand retarget 共用的独立 `xhand_right.urdf`；
 - DexPilot YAML；
 - dex-retargeting、Pinocchio、NLopt 版本；
 - solver result code、loss、evaluation count；
@@ -607,7 +612,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 
 ### 13.2 实时预算
 
-16 Hz 控制周期名义预算为 62.5 ms。当前记录了单帧 retarget elapsed time，但仓库合同没有把以下指标固化为回归门槛：
+16 Hz 控制周期名义预算为 62.5 ms。当前记录了单帧 retarget elapsed time；复用同一 VR observation 的控制帧只计 cache lookup，不代表执行了一次 solver。仓库合同没有把以下指标固化为回归门槛：
 
 - Stage 1 / Stage 2 分项耗时；
 - P50/P95/P99；
@@ -635,6 +640,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 至少覆盖：
 
 - landmark 退化拒绝且 solver state 不推进；
+- 同一 VR ring sequence 的成功、失败和异常分支都只调用一次 backend，cache reset 后才允许重新调用；
 - 合法 solve 后 publish failure 的 temporal-state 语义；
 - palm basis 正交性、determinant 和 conditioning；
 - pinky scale 的阈值、同比重建和噪声响应；
@@ -693,6 +699,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 ### 15.3 修改滤波、ramp 或 temporal state
 
 - solver state 的推进点；
+- VR observation cache 是否保证每个 ring sequence 最多 solve 一次；
 - reset 是否清除所有 backend state；
 - ramp step 是否按 attempt、publish 或 accept 推进；
 - raw 字段阶段；
@@ -732,6 +739,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 
 ```text
 因果观测
+→ verified VR ring sequence 去重 / solve cache
 → 几何 gate
 → backend solve
 → deterministic shaping

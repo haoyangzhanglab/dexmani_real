@@ -20,6 +20,28 @@ HAND_FINGER_COUNT = 5
 TACTILE_POINTS_PER_FINGER = 120
 TACTILE_AXIS_COUNT = 3
 
+# Canonical order for every cross-process XHand joint vector.  Retargeting,
+# planning, recording, and the device boundary all consume this SDK order.
+XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
+    "right_hand_thumb_bend_joint",
+    "right_hand_thumb_rota_joint1",
+    "right_hand_thumb_rota_joint2",
+    "right_hand_index_bend_joint",
+    "right_hand_index_joint1",
+    "right_hand_index_joint2",
+    "right_hand_mid_joint1",
+    "right_hand_mid_joint2",
+    "right_hand_ring_joint1",
+    "right_hand_ring_joint2",
+    "right_hand_pinky_joint1",
+    "right_hand_pinky_joint2",
+)
+if (
+    len(XHAND_SDK_JOINT_NAMES) != HAND_DOF
+    or len(set(XHAND_SDK_JOINT_NAMES)) != HAND_DOF
+):
+    raise RuntimeError("XHand SDK joint names must be unique and match HAND_DOF")
+
 ARM_JOINT_SHAPE = (ARM_DOF,)
 HAND_JOINT_SHAPE = (HAND_DOF,)
 ARM_EE_SHAPE = (9,)
@@ -114,7 +136,8 @@ HAND_STATE_DTYPE = np.dtype(
         # feedback-freshness fault. Freshness comes from source timestamp and
         # read_healthy/state_valid.
         ("qpos_stale", "<u1"),
-        # Last command for which XHand.send_action() returned success.
+        # action_id of the last command for which XHand.send_action() returned
+        # success; this is not the hand command ring's internal sequence.
         ("last_cmd_seq", "<u8"),
         ("last_cmd_qpos", "<f8", HAND_JOINT_SHAPE),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
@@ -338,6 +361,8 @@ def make_record_sample_dtype(
             ("target_eef_pos_raw", "<f8", (3,)),
             ("target_eef_rot6d_raw", "<f8", (6,)),
             ("policy_map_time_ms", "<f8"),
+            # Full backend solve for a new VR sequence, or cache-lookup time
+            # when the causal control grid reuses an observation.
             ("hand_retarget_time_ms", "<f8"),
             ("transition_check_time_ms", "<f8"),  # reserved (always 0)
             ("policy_compute_time_ms", "<f8"),

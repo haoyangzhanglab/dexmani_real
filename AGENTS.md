@@ -3,7 +3,7 @@
 This is the repository-wide contract for coding agents. It applies below the
 repository root unless a deeper `AGENTS.md` overrides it. Read this file before
 editing; use [README.md](README.md) as the file-by-file project map and
-`CLAUDE.md` as the implementation navigation guide.
+[CLAUDE.md](CLAUDE.md) as the implementation navigation guide.
 
 ## 1. Fast start
 
@@ -27,8 +27,8 @@ conda run -n real_robot python -m compileall -q dexmani_real examples
 
 ## 2. System model
 
-DexMani Real is a VR teleoperation, data collection, and replay system for an xArm7
-(7 DoF), XHand (12 DoF), Quest, and RealSense L515.
+DexMani Real is a VR teleoperation, data collection, replay, and learned-policy
+deployment system for an xArm7 (7 DoF), XHand (12 DoF), Quest, and RealSense L515.
 
 ```text
 camera / VR / arm / hand ──shared-memory state──► teleop
@@ -45,6 +45,11 @@ The main/lifecycle process resolves immutable configuration, creates
 health, and shuts down. It does not map VR poses, publish actions, or choose
 recording samples.
 
+A second controller — the learned-policy deployment coordinator — consumes a
+`policy_plan_ring` written by an inference worker and publishes robot actions
+through the same shared safety boundary; it never touches the arm/hand transport
+or safety state directly. See `dexmani_real/deployment/`.
+
 ### Task router
 
 Start with the source of truth in this table, then follow only its direct
@@ -54,9 +59,10 @@ producers and consumers.
 |---|---|---|
 | Numeric default or runtime override | `config/defaults.py`, `config/runtime.py` | Derived rates, buffer capacities, timeouts, metadata, CLI overrides |
 | Cross-process state/action layout | `utils/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
-| Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers, readiness, heartbeat, shutdown |
+| Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers (including `policy_plan_ring`: `deployment/worker.py` → `deployment/coordinator.py`, latest-wins, maxlen 3), readiness, heartbeat, shutdown |
 | VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
-| Arm/hand safety or servo behavior | `robot/arm_loop.py`, `robot/hand_process.py` | `robot/safety.py`, action protocol, supervisor, homing and e-stop paths |
+| Arm/hand action or safety gate | `policy/safety.py` | `SafetyGate` validation → `send_command` → worker apply (`robot/arm_loop.py`, `robot/hand_process.py`), `robot/safety.py`, supervisor, homing and e-stop paths |
+| Learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` (inference loop), `deployment/config.py`, `deployment/contracts.py` (Protocols), `integrations/` adapter, `policy_plan_ring` producer/consumer |
 | FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
 | Episode schema or quality rule | `recording/` | reader, analysis, visualization, replay consumers, v16 schema contract |
 | Replay behavior | `examples/replay_episode.py` | provenance/dense preflight, session/runner, metrics, live safety path |
@@ -95,11 +101,17 @@ Preserve these unless the user explicitly requests an architectural redesign.
     validity, recovery, data quality, and coordinated stop—they do not replace
     firmware limits.
 13. `run_generation` invalidates stale queued/ring commands across begin, pause,
-    home, feedback fault, and camera re-warm. Workers reject a command from an
-    older generation before it crosses the command boundary.
+    home, and feedback fault. Workers reject a command from an older generation
+    before it crosses the command boundary. A camera stall or camera-writer
+    error discards the episode without advancing generation; only the next
+    explicit BEGIN advances it.
 14. Recorder START/STOP boundaries, recorder status, and aligned samples are
     fixed NumPy dtypes. Do not put JSON or an acknowledgement/apply protocol in
     the shared-memory control path.
+15. Learned-policy deployment is layered: `integrations/` may import
+    `deployment/`, never the reverse. The inference worker only writes
+    `policy_plan_ring`; `deployment/coordinator.py` is the sole robot-action
+    producer and routes through the shared `SafetyGate`/`send_command` boundary.
 
 ## 4. Hardware and operational safety
 
@@ -133,6 +145,7 @@ Use the smallest vertical slice that fully preserves a contract.
 | Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
 | Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
 | Change safety/fault transition | supervisor + policy + arm + hand + shutdown + e-stop, including sticky-fault behavior |
+| Change learned-policy deployment | `deployment/config.py` → `deployment/contracts.py` (Protocols, no torch) → `deployment/worker.py` → `deployment/coordinator.py` → `deployment/lifecycle.py` → `integrations/` adapter (integration → deployment only) |
 | Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
 Do not silently change HDF5 meaning in place. Runtime episodes use schema v16

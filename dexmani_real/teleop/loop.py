@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,8 @@ from dexmani_real.teleop.episode_samples import (_FRAME_IK_FAIL, _FRAME_OK,
                                                  _FRAME_SAFETY_REJECT,
                                                  _record_frame, _record_held,
                                                  _stop_recording)
-from dexmani_real.teleop.hand_control import (_compute_hand_command,
+from dexmani_real.teleop.hand_control import (HandRetargetObservationCache,
+                                              _compute_hand_command,
                                               _get_raw_hand_command,
                                               _hand_ramp_frame_count,
                                               _reset_hand_retargeter,
@@ -208,6 +209,11 @@ class TeleopLoopState:
     ema_prev_quat: np.ndarray | None = None
     hand_ramp_start: np.ndarray | None = None
     hand_ramp_step: int = 0
+    # Solver result/failure keyed by verified VR ring sequence. Unlike the
+    # ramp, this state advances only on a new observation.
+    hand_retarget_cache: HandRetargetObservationCache = field(
+        default_factory=HandRetargetObservationCache
+    )
     sigterm_requested: bool = False
 
 
@@ -304,6 +310,8 @@ def _enter_command_quiescence_impl(
     ctx.ema_prev_pos = ctx.ema_prev_quat = None
     ctx.hand_ramp_start = None
     ctx.hand_ramp_step = 0
+    # No cached observation may cross a generation/quiescence boundary.
+    ctx.hand_retarget_cache.reset()
 
 
 def _handoff_command_quiescence_to_home_impl(quiescence: CommandQuiescence) -> None:
@@ -340,6 +348,8 @@ def _complete_reanchor_impl(
         hand_anchor = ctx.prev_hand_qpos.copy()
     ctx.hand_ramp_start = hand_anchor
     ctx.hand_ramp_step = 0
+    # Keep the observation cursor and stateful backend on the same reset epoch.
+    ctx.hand_retarget_cache.reset()
     _reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
     return True
 
@@ -1193,7 +1203,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 vr_frame,
                 ctx.prev_hand_qpos,
                 hand_available,
+                ctx.hand_retarget_cache,
             )
+            # Cache hits intentionally measure lookup time, not a synthetic
+            # repeated solver duration; the recording data dictionary documents
+            # this distinction.
             hand_retarget_time_ms = (time.perf_counter() - _hand_retarget_t0) * 1000.0
             hand_cmd_raw = _get_raw_hand_command(ctx.hand_retargeter, hand_cmd, retarget_ok)
             # Rate-independent smoothstep ramp from the measured pose captured

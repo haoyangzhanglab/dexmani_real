@@ -366,7 +366,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         logger.info("hand_loop: ready")
 
         rate_mgr = RateManager(cfg.loop_hz)
-        last_cmd_seq = 0
+        last_consumed_ring_sequence = 0
         _send_error_counter = RetryCounter(max_consecutive=cfg.send_err_watchdog_frames, label="hand_send")
         _error_state_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_error_state")
         _read_error_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_read_error")
@@ -383,16 +383,22 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         }
 
         def _read_latest_command() -> np.ndarray | None:
-            """Read the latest-wins command if a new one is available."""
-            nonlocal last_cmd_seq
+            """Read one new latest-wins ring publication, if available.
+
+            ``last_consumed_ring_sequence`` is the hand command ring cursor;
+            it is unrelated to ``HAND_STATE_DTYPE.last_cmd_seq``, which exposes
+            the last SDK-accepted ``action_id``. Claim before validation/send so
+            a malformed or failed latest-wins publication is never replayed.
+            """
+            nonlocal last_consumed_ring_sequence
             result = shared.hand_cmd_ring.read_latest()
             if result is None:
                 return None
             data, _ts, seq = result
             seq_int = int(seq) if isinstance(seq, (int, np.integer)) else 0
-            if seq_int == last_cmd_seq:
+            if seq_int == last_consumed_ring_sequence:
                 return None
-            last_cmd_seq = seq_int
+            last_consumed_ring_sequence = seq_int
             if not worker_validate_hand(
                 data,
                 qpos_lower_rad=np.asarray(cfg.qpos_lower_rad, dtype=np.float64),

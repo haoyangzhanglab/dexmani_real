@@ -330,8 +330,8 @@ marker 缺失/为假同样是无效布局。标准 RecorderIO 总是启用此流
 | `action_arm_joint_raw` | `(N,A)` | float64 | rad | 正常 IK 路径保存应用层逐帧 delta clamp 和 joint-limit clip 之前的关节解；held/failure 路径没有显式 raw 解时回退为当帧 hold/最终 arm 命令。 |
 | `action_arm_joint` | `(N,A)` | float64 | rad | 经过 delta/joint-limit 处理并通过 SafetyGate 的有效机械臂命令；hold 槽保存有效 hold 目标。 |
 | `action_arm_joint_sent` | `(N,A)` | float64 | rad | 实际转发给 arm worker 的安全命令流。标准 RecorderIO v16 存在；手工构造且未启用 `arm_sent_stream` 时可缺省。 |
-| `action_hand_joint_raw` | `(N,H)` | float64 | rad | 正常 retarget 路径位于 ramp、可选 delta clip、操作限位 clip 和后续校验之前；held/failure 路径没有显式 raw 值时回退为当帧 hold/最终 hand 命令。详见第 10.4 节。 |
-| `action_hand_joint` | `(N,H)` | float64 | rad | 经过 ramp、可选 delta clip、操作限位 clip 和后续校验的有效手部命令。 |
+| `action_hand_joint_raw` | `(N,H)` | float64 | rad | 正常 retarget 路径位于 startup ramp、operational clip 和后续校验之前；cache hit 复用该 VR observation 的 solved 值。held/failure 路径没有显式 raw 值时回退为当帧 hold/最终 hand 命令。详见第 10.4 节。 |
+| `action_hand_joint` | `(N,H)` | float64 | rad | 经过 startup ramp、operational clip 和后续校验的有效手部命令；当前没有应用侧 hand command-to-command delta clamp。 |
 | `action_arm_ee` | `(N,9)` | float64 | 前 3 列 m | IK 实际追踪的 `[target_pos(3), target_rot6d(6)]`；没有目标时为 NaN，held 帧尽量沿用最后有效目标。 |
 | `target_eef_pos_raw` | `(N,3)` | float64 | m | VR 映射后的原始 EEF 位置目标，位于 EMA/workspace clamp 之前。 |
 | `target_eef_rot6d_raw` | `(N,6)` | float64 | — | 与上一字段配套的原始 EEF 旋转目标。 |
@@ -431,14 +431,14 @@ hold 槽会沿用上一 payload；没有历史时用全零图像。无论 RGB/de
 |---|---:|---|---|---|
 | `flag_ik_ok` | `(N,)` | bool | — | 此 source 槽 IK 是否成功。 |
 | `flag_ik_attempted` | `(N,)` | bool | — | 是否实际尝试 IK；普通主动帧默认 true，纯 hold 路径可为 false。 |
-| `flag_retarget_ok` | `(N,)` | bool | — | 手部 landmark retarget 是否成功。 |
+| `flag_retarget_ok` | `(N,)` | bool | — | 当前 VR ring sequence 是否有成功 solved hand endpoint；cache hit 可为 true，不表示本控制 tick 实际执行了 solver。 |
 | `flag_held` | `(N,)` | bool | — | 是否记录的是 hold/fallback 行为。 |
 | `flag_safety_reject` | `(N,)` | bool | — | SafetyGate/在线安全检查是否拒绝原动作。 |
 | `flag_frame_status` | `(N,)` | int64 | 枚举 | 综合帧状态，见第 7 节。 |
 | `tracking_error` | `(N,)` | float64 | rad | arm worker 的最大绝对关节跟踪误差。 |
 | `ik_solve_time_ms` | `(N,)` | float64 | ms | 单次 teleop IK 求解耗时。 |
 | `policy_map_time_ms` | `(N,)` | float64 | ms | VR wrist → EEF 映射、EMA 和 workspace clamp 阶段耗时。 |
-| `hand_retarget_time_ms` | `(N,)` | float64 | ms | 手部 landmarks → XHand qpos 的 retarget 阶段耗时。 |
+| `hand_retarget_time_ms` | `(N,)` | float64 | ms | 本控制 tick 的 hand retarget/cache lookup 阶段耗时；新 VR ring sequence 通常包含 solver，cache hit 只测复用开销。 |
 | `transition_check_time_ms` | `(N,)` | float64 | ms | 兼容保留字段；旧的 SafetyGate transition/collision 检查已移除，当前正常 source 帧写 0。 |
 | `policy_compute_time_ms` | `(N,)` | float64 | ms | 本控制 tick 从 policy compute 起点到准备录制前的累计计算耗时。 |
 
@@ -703,15 +703,18 @@ fail-closed。v16 已有 freshness/calibration/unit 字段，因此无需新增 
 ### 10.4 H5-04：两个 raw action 字段都是分路径定义
 
 正常 action 路径会显式传入 raw 值：`action_arm_joint_raw` 是应用层 delta clamp 和
-joint-limit clip 之前的 IK 关节解；`action_hand_joint_raw` 位于启动 ramp、可选的单步
-delta clip、操作限位 clip 和 `_sanitize_hand_command()` 后续校验之前，但其更上游含义
-取决于 retargeter：
+joint-limit clip 之前的 IK 关节解；`action_hand_joint_raw` 位于 startup ramp、operational
+clip 和 `_sanitize_hand_command()` 后续校验之前，但其更上游含义取决于 retargeter：
 
 - TAG 成功且 `last_raw_qpos` 有效：保存 SDK joint order 下的优化器输出；
 - 非 TAG retargeter、retarget 失败、raw shape/finite 校验失败：保存 retargeter 返回的命令；
 - 正常 action 调用方没有显式传值：录制层分别回退为当帧 `arm_cmd`/`hand_cmd`；
 - `_record_held()` 不提供两个 raw 字段，因此 IK failure、safety reject 和其他主动 hold 行
   会把 hold/最终 arm、hand 命令写入对应的 `*_raw` dataset。
+
+因果控制网格可以连续选择同一个 VR ring sequence。此时 stateful retargeter 不会再次运行：
+成功 solve 的 raw endpoint 被复用，失败则继续记录当前合法 hold；因此相邻 source 行可以有
+相同 `observation_id`/raw hand 值，而各自仍有独立 `action_id` 和 grid timestamp。
 
 根因不只在 `_record_held()`：RecorderClient 和 EpisodeRecorder 都有兼容 fallback，而旧
 reader 又要求所有 source 行的 raw 数值有限，三者共同迫使“不存在的 raw”伪装成最终命令。

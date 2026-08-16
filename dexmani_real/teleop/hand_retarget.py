@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.schema import HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import HAND_JOINT_SHAPE, XHAND_SDK_JOINT_NAMES
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -100,7 +100,7 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
 
     Uses wrist + index MCP + middle MCP to fit a palm plane via SVD, then
     constructs a right-handed orthonormal frame with x pointing from middle
-    MCP to wrist.  Returns the identity on any numerical failure.
+    MCP to wrist. The caller must first run ``validate_landmarks()``.
 
     Ref: LeFranX vr_hand_detector_adapter.py:293-342
     """
@@ -111,11 +111,7 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     eps = 1e-8
     points = keypoint_3d_array[[0, 5, 9], :].copy()
 
-    valid, reason = validate_landmarks(keypoint_3d_array)
-    if not valid:
-        raise ValueError(f"degenerate hand landmarks: {reason}")
-
-    x_vector = points[0] - points[2]  # wrist → middle MCP
+    x_vector = points[0] - points[2]  # middle MCP → wrist
     points_centered = points - np.mean(points, axis=0, keepdims=True)
 
     try:
@@ -223,20 +219,9 @@ class XHandRetargeter:
         )
         self._hand_ema_state: np.ndarray | None = None
 
-        self.urdf_joint_names = [
-            "right_hand_thumb_bend_joint",
-            "right_hand_thumb_rota_joint1",
-            "right_hand_thumb_rota_joint2",
-            "right_hand_index_bend_joint",
-            "right_hand_index_joint1",
-            "right_hand_index_joint2",
-            "right_hand_mid_joint1",
-            "right_hand_mid_joint2",
-            "right_hand_ring_joint1",
-            "right_hand_ring_joint2",
-            "right_hand_pinky_joint1",
-            "right_hand_pinky_joint2",
-        ]
+        # Every returned qpos follows the cross-process SDK order owned by
+        # utils.schema, independent of the backend model's internal order.
+        self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
 
         self.load_retargeter()
 
@@ -253,6 +238,15 @@ class XHandRetargeter:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
         cfg = yaml_config["retargeting"]
 
+        # The YAML list is required by dex-retargeting, but it may not define a
+        # competing qpos order. Fail closed if it drifts from the schema.
+        configured_joint_names = tuple(cfg.get("target_joint_names", ()))
+        if configured_joint_names != XHAND_SDK_JOINT_NAMES:
+            raise ValueError(
+                "DexPilot target_joint_names must exactly match the canonical "
+                "XHand SDK joint order"
+            )
+
         # Teleoperator-level EMA (our custom field, not a RetargetingConfig param)
         yaml_smoothing_alpha = float(cfg.pop("smoothing_alpha", 0.3))
         if self._smoothing_alpha is None:
@@ -266,7 +260,7 @@ class XHandRetargeter:
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
         self.retargeted_joint_order = np.array(
-            [retargeter_joint_names.index(name) for name in self.urdf_joint_names]
+            [retargeter_joint_names.index(name) for name in self.sdk_joint_names]
         ).astype(int)
         self.inverse_retargeted_joint_order = np.argsort(self.retargeted_joint_order)
 
@@ -386,7 +380,7 @@ class XHandRetargeter:
         if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE:
             qpos = np.asarray(initial_qpos, dtype=np.float32)
             if np.all(np.isfinite(qpos)):
-                # Remap from hardware joint order (urdf_joint_names) to
+                # Remap from canonical hardware/SDK joint order to
                 # retargeter internal order before subsetting by pin2target.
                 qpos_retargeter = qpos[self.inverse_retargeted_joint_order]
                 idx = self.retargeter.optimizer.idx_pin2target
@@ -471,21 +465,10 @@ class TAGHandRetargeter:
         #   pinky_j1, pinky_j2, ring_j1, ring_j2, thumb_bend, thumb_rota_j1, thumb_rota_j2
         # Canonical SDK order:    thumb_bend, thumb_rota_j1, thumb_rota_j2, index_bend, …
         model_names = list(model.names[2:])  # skip "universe" and "root_joint"
-        self.urdf_joint_names = [
-            "right_hand_thumb_bend_joint",
-            "right_hand_thumb_rota_joint1",
-            "right_hand_thumb_rota_joint2",
-            "right_hand_index_bend_joint",
-            "right_hand_index_joint1",
-            "right_hand_index_joint2",
-            "right_hand_mid_joint1",
-            "right_hand_mid_joint2",
-            "right_hand_ring_joint1",
-            "right_hand_ring_joint2",
-            "right_hand_pinky_joint1",
-            "right_hand_pinky_joint2",
-        ]
-        self._mapping_model_to_sdk = np.array([model_names.index(n) for n in self.urdf_joint_names], dtype=np.intp)
+        self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
+        self._mapping_model_to_sdk = np.array(
+            [model_names.index(name) for name in self.sdk_joint_names], dtype=np.intp
+        )
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
 
         # ── Optimizer ──
