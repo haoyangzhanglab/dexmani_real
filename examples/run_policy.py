@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin learned-policy deployment CLI (execution doc §84).
+"""Thin learned-policy deployment CLI.
 
 Contains only ``argparse -> config override -> resolve -> run lifecycle -> exit
 code``. It never carries model code, CUDA code, scheduling, a SafetyGate, or

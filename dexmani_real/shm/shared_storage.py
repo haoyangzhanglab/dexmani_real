@@ -200,8 +200,8 @@ _RING_RESOURCE_NAMES = (
 _QUEUE_RESOURCE_NAMES = ("arm_action_q", "arm_home_result_q")
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
-# Ordered heartbeat slots — one fixed array replaces the six per-subsystem
-# ``ctx.Value`` heartbeats. Index order is stable across processes.
+# Ordered heartbeat slots — one fixed array. Index order is stable across
+# processes.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
     "arm",
     "hand",
@@ -213,9 +213,9 @@ HEARTBEAT_FIELDS: tuple[str, ...] = (
 )
 HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
 
-# Ordered readiness slots — one fixed array replaces the six per-subsystem
-# ``ctx.Event`` ready flags. Per-element access on ``ctx.Array`` is atomic, so
-# each flag is a simple 0/1 store; the index order is stable across processes.
+# Ordered readiness slots — one fixed array. Per-element access on
+# ``ctx.Array`` is atomic, so each flag is a simple 0/1 store; the index order
+# is stable across processes.
 READY_FIELDS: tuple[str, ...] = (
     "arm",
     "hand",

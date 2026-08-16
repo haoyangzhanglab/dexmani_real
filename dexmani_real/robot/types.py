@@ -117,7 +117,7 @@ class RobotState:
 class RobotAction:
     """Action command sent to hardware.
 
-    arm_qpos_cmd / hand_qpos_cmd: final command after joint limit + delta limit.
+    arm_qpos_cmd / hand_qpos_cmd: final command after joint-limit and bounds validation.
     """
 
     arm_qpos_cmd: np.ndarray  # (7,)  float64  rad

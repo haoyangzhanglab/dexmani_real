@@ -1,10 +1,10 @@
-"""Deterministic, CPU-only, torch-free fake policy (execution doc §65/§66).
+"""Deterministic, CPU-only, torch-free fake policy.
 
 ``FakeObservationAdapter`` -> ``FakePolicyBackend`` -> ``FakeActionAdapter`` is
 a complete implementation of the three deployment Protocols that exercises the
 full obs -> backend -> chunk -> plan-ring path with no model, no torch, and no
-hardware. It is the reference for the real learned-policy integration (P11) and
-the swap fixture for backend-replacement verification (P12).
+hardware. It is the reference for the real learned-policy integration and the
+swap fixture for backend-replacement verification.
 
 Determinism contract: for a fixed observation and run_generation, ``infer``
 returns byte-identical arrays across calls and processes. The backend never
@@ -48,7 +48,7 @@ class FakeObservationAdapter:
 
     ``encode`` returns ``{"arm_qpos": [7], "hand_qpos": [12] | None}``. Absent
     modality windows become a zero vector rather than crashing, so the backend
-    never depends on a sensor being present (§54 absent = valid_mask 0).
+    never depends on a sensor being present (absent = valid_mask 0).
     """
 
     def __init__(self, config: Any = None) -> None:

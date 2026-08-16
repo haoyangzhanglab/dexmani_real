@@ -1,7 +1,7 @@
-"""Deployment provenance logging (execution doc §96).
+"""Deployment provenance logging.
 
-Provenance is a one-time startup log line, never a shared-memory payload (§96:
-do not put the full resolved config into high-frequency IPC). The lifecycle logs
+Provenance is a one-time startup log line, never a shared-memory payload (do not
+put the full resolved config into high-frequency IPC). The lifecycle logs
 it once, before any worker spawns, with everything it can resolve locally —
 deployment targets, checkpoint path, and the resolved runtime SHA-256. Commit
 hashes are optional (the CLI or CI can supply them); absence logs ``unknown``
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 def sha256_file(path: str | Path) -> str:
     """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
 
-    Best-effort: §96 logs the checkpoint/model-config hash "if available"; an
+    Best-effort: logs the checkpoint/model-config hash "if available"; an
     unreadable file logs empty rather than failing startup (the backend load is
     the authoritative check for a bad checkpoint).
     """

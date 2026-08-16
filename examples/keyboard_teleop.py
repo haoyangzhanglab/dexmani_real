@@ -754,8 +754,7 @@ def run_keyboard_experiment(
         exit_code = 1
     finally:
         # Keep the listener and terminal suppression active until all device
-        # processes and shared resources are closed. Restoring it here used to
-        # expose the remaining 1–2 s shutdown window to the shell.
+        # processes and shared resources are closed.
         keys.quiesce()
         started = [process for process in processes if process.pid is not None]
         if started:

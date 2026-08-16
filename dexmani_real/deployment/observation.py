@@ -1,6 +1,6 @@
 """Process-local immutable observation windows for the deployment runtime.
 
-These types never enter SharedStorage (execution doc §54) and therefore carry no
+These types never enter SharedStorage and therefore carry no
 IPC dtype. They are the ``ObservationAdapter`` input contract.
 """
 
@@ -113,7 +113,7 @@ class CameraWindow:
 class ObservationBatch:
     """One causal observation assembled from the arm/hand/tactile/camera rings.
 
-    Immutable and process-local (§54). ``arm_history``/``hand_history``/
+    Immutable and process-local. ``arm_history``/``hand_history``/
     ``tactile_history``/``camera_history`` are ``FrameWindow``/``CameraWindow``
     (or None when the modality is absent or not required by the adapter); each
     carries its own source/publish metadata because the rings advance

@@ -1018,9 +1018,8 @@ class XHand:
                 self.last_error_message = "hand_command is None (not initialized)"
             return False
 
-        # The policy boundary owns primary command-to-command validation. The
-        # driver redundantly checks bounds/delta and forwards the endpoint
-        # unchanged.
+        # The policy boundary owns primary command validation. The driver
+        # redundantly checks bounds and forwards the endpoint unchanged.
         qpos_cmd = target_qpos.copy()
         self.write_command_positions(qpos_cmd)
         err = self.control.send_command(self.config.device_id, self.hand_command)

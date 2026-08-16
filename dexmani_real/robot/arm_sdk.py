@@ -438,7 +438,7 @@ def validate_device_identity(
 
     ``firmware`` is compared as an integer tuple (``version_number``), never as
     a string.  ``device_profile=None`` performs no type check — the model is not
-    guessed without on-site confirmation (doc §8.5).  ``expected_serial=None``
+    guessed without on-site confirmation.  ``expected_serial=None``
     and ``min_firmware=None`` skip their checks.
     """
     if axis != expected_axis:

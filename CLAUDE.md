@@ -106,7 +106,7 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
 ```
 
 - Main owns `DISARMED ↔ ARMED`, `→ FAULT`, and shutdown.
-- Teleop owns `ARMED ↔ RUNNING`.
+- Policy owns `ARMED ↔ RUNNING`.
 - Arm and hand workers only gate command behavior on the state.
 - `error_state` is sticky. A process death or enabled-worker heartbeat timeout
   becomes a main-owned fault.
@@ -117,32 +117,28 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   in one boundary and returns a typed `CommandPublishResult`; each caller still
   owns hold/drop/abort/fault disposition, and workers recheck lifecycle
   metadata and safety state immediately before the SDK boundary.
-  Velocity envelope checking was removed (2026-08-12); xArm Mode 6 firmware is
-  the final velocity/acceleration/collision backstop.
-  Collision and transition geometry checks were removed from SafetyGate
-  (2026-08-12).  Collision-free homing paths are planned independently through
+  xArm Mode 6 firmware is the final velocity/acceleration/collision backstop.
+  Collision-free homing paths are planned independently through
   ``plan_joint_home_path`` / ``plan_band_alignment_path``, which call the
   collision model directly.  Hand velocity is command-to-command, never
   target-to-measured; workers additionally reject stale-generation, expired,
   operational-limit, and rated mechanical-limit violations without changing an
   endpoint. Runtime config may narrow, but cannot widen, the bundled rated
   mechanical envelope.
-  The command-to-command velocity clamp (`max_delta_rad`) now defaults to
-  ``None`` (disabled), and the runtime teleoperator output-EMA setting
-  (`hand_output_smoothing_alpha`) was removed (2026-08-15).  The default TAG
-  path has no additional output EMA.  Optional DexPilot retains its own
-  retargeting filters; the bundled outer EMA setting is `1.0` (pass-through).
+  The default TAG path has no additional output EMA.  Optional DexPilot retains
+  its own retargeting filters; the bundled outer EMA setting is `1.0`
+  (pass-through).
   The EtherCAT firmware PID remains the execution-layer trajectory smoother.
   Coupled hand paths first take a fail-closed hand feedback snapshot
   (`_hand_feedback_snapshot`: `connected`, `state_valid`, no `error_state`,
   `send_healthy`/`read_healthy`, and finite `qpos`/`last_cmd_qpos`), then run the
   centralized preflight (`validate_and_send_candidate` →
-  `validate_hand_command_delta`) on the rated mechanical envelope before the arm
+  `validate_hand_command_bounds`) on the rated mechanical envelope before the arm
   endpoint is enqueued, so a rejected or unhealthy hand desyncs nothing;
   `worker_validate_hand` remains the authoritative execution-layer backstop.
-  The snapshot does not yet reject a timestamp-expired frame: freshness is
-  enforced only in the keyboard `validate_hand_feedback` predicate, not on the
-  policy publish path.
+  The snapshot delegates source-timestamp existence, future timestamp, and
+  `max_age_s` freshness to `validate_hand_feedback`, so a timestamp-expired
+  frame is rejected on the policy publish path as in the keyboard predicate.
 - `run_generation` tags commands and candidates. Begin, pause, home, feedback
   fault, and camera re-warm advance it; workers reject queued/ring commands from
   an older generation; this cannot retract an endpoint already accepted by
@@ -333,8 +329,8 @@ aligned samples → RecorderIO → temporary episode + stream verification
 - Hand `state_valid` mirrors `connected` (set from the last read's connection
   flag; the first frame is set unconditionally). Hand feedback health has one
   shared predicate — `validate_hand_feedback` (`utils/hand_health.py`) — invoked
-  from the teleop loop, the policy feedback snapshot, the coordinator hand-
-  reference seed, and the supervisor health summary. Don't add a divergent copy.
+  from the teleop loop, the policy feedback snapshot, the teleop hand-reference
+  seed, and the supervisor health summary. Don't add a divergent copy.
 - Return-home creates explicit bounded milestones from the worker's last
   accepted hand command to the configured hand-home endpoint. Every complete
   endpoint is published unchanged and matched to a successful SDK action ID;
@@ -353,6 +349,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
 | `examples/collect_teleop.py` | — | Hardware control; self-contained script; explicit authorization required |
 | `examples/keyboard_teleop.py` | — | Hardware control; self-contained script; measured hand feedback by default |
 | `examples/replay_episode.py` | — | Dry-run by default; `--live` reruns dense preflight; self-contained script |
+| `examples/run_policy.py` | `deployment.lifecycle` | Learned-policy deployment entry; thin CLI wrapper over the shared supervisor |
 | `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |
 | `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |
 | `examples/realsense_record_example.py` | — | Interactive RealSense RGB-D + point-cloud test; hardware read-only by default |

@@ -270,10 +270,8 @@ class SafetyGate:
     2. **Joint limits** — commanded actuators only; hold actuators skip
     3. **Workspace** — optional segment check
 
-    Velocity envelope checking was removed (2026-08-12).  xArm Mode 6
-    firmware enforces velocity, acceleration, and collision limits as the
-    final backstop.  Collision and transition geometry checks were
-    removed (2026-08-12); collision-free homing paths are planned
+    xArm Mode 6 firmware enforces velocity, acceleration, and collision limits
+    as the final backstop.  Collision-free homing paths are planned
     independently through ``plan_joint_home_path`` /
     ``plan_band_alignment_path``, which call the collision model directly
     rather than through the SafetyGate.
@@ -379,13 +377,6 @@ class SafetyGate:
             or np.any(hand_end > self.hand_high + 1e-12)
         ):
             return GateResult(False, GateRejectCode.HAND_JOINT_LIMIT)
-
-        # (removed) Velocity envelope ────────────────────────────────────
-        # Per the xArm Mode 6 contract the firmware is the final velocity,
-        # acceleration, and collision backstop.  The software gate no longer
-        # rejects on command-to-command or command-to-measured speed so that
-        # Cartesian keyboard deltas never deadlock when the IK maps a fixed
-        # step to joint changes above the configured limit.
 
         # 3 ── Workspace (optional) ────────────────────────────────────
         if self.workspace_check is not None and candidate.arm_qpos is not None:
@@ -517,8 +508,8 @@ def send_command(
     # write-failure path after the arm endpoint is enqueued, and no rollback or
     # compensation is performed or claimed.  This arm-then-hand ordering is
     # non-atomic by design; if the transport ever changes to one whose hand write
-    # can fail, a coordinated stop/fault path would be required here (doc §6.1
-    # item 22) instead of returning ``PUBLISHED``.
+    # can fail, a coordinated stop/fault path would be required here instead of
+    # returning ``PUBLISHED``.
     if candidate.hand_qpos is not None:
         hand_frame = _make_hand_command(candidate, now_ns, target_ns)
         shared.hand_cmd_ring.write(hand_frame)
@@ -663,13 +654,7 @@ def planner_action_safety_gate(
     hand_joint_lower_rad: tuple[float, ...],
     hand_joint_upper_rad: tuple[float, ...],
 ) -> SafetyGate:
-    """Build a :class:`SafetyGate` wired to the planner's workspace callback.
-
-    Collision and transition geometry checks are **not** wired — they were
-    removed from SafetyGate (2026-08-12).  Collision-free homing paths are
-    planned independently through ``plan_joint_home_path`` and
-    ``plan_band_alignment_path``, which call the collision model directly.
-    """
+    """Build a :class:`SafetyGate` wired to the planner's workspace callback."""
     gate = SafetyGate(
         arm_joint_lower_rad=arm_joint_lower_rad,
         arm_joint_upper_rad=arm_joint_upper_rad,
@@ -976,7 +961,7 @@ def publish_joint_targets(
 
 
 # ---------------------------------------------------------------------------
-# Hand command bound/delta preflight (owned by the publication boundary)
+# Hand command bounds preflight (owned by the publication boundary)
 # ---------------------------------------------------------------------------
 
 
@@ -1098,8 +1083,8 @@ def publish_hand_home_and_wait_applied(
         )
         return False
 
-    # The exact home endpoint is published as a single command; there is no
-    # command-to-command delta bound to spread it over milestones.
+    # The exact home endpoint is published as a single command, not spread
+    # over milestones.
     milestone_count = 1
 
     last_action_id = 0

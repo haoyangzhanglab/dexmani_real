@@ -1,16 +1,16 @@
-"""Learned-policy deployment lifecycle (execution doc §83).
+"""Learned-policy deployment lifecycle.
 
-Composes the frozen A/B runtime primitives (``WorkerSpec`` +
+Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
 config -> create ``SharedStorage`` -> spawn arm (+ optional hand) -> inference
 -> coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
-carry ``arm``/``hand``/``inference``/``policy`` (§83).
+carry ``arm``/``hand``/``inference``/``policy``.
 
 The first deployment is joint-only: no VR worker (only an adapter that declares
-VR needs it, §85), no camera worker (only required by RGB/pointcloud adapters),
-and no recorder (Phase C leaves v16 recording to a separate migration, §95/§97).
+VR needs it), no camera worker (only required by RGB/pointcloud adapters),
+and no recorder.
 """
 
 from __future__ import annotations

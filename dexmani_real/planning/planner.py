@@ -143,8 +143,7 @@ class XArm7MotionPlanner:
         # post-hoc with dense interpolation (0.02 rad step), complementing
         # MPlib's internal FCL collision checking during RRT tree expansion.
         # Both use the same SRDF (xarm7_xhand.srdf) so collision pair rules
-        # are consistent.  See CLAUDE.md §Collision Detection Layers for the
-        # full architecture.
+        # are consistent.
         self.collision_model = CollisionModel(hand_dof=hand_dof, static_boxes=static_boxes, table=table)
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))

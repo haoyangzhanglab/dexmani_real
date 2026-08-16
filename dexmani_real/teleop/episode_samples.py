@@ -407,7 +407,7 @@ def _record_frame(
             ),
             "policy_map_time_ms": policy_map_time_ms,
             "hand_retarget_time_ms": hand_retarget_time_ms,
-            "transition_check_time_ms": 0.0,  # reserved (SafetyGate collision/transition removed 2026-08-12)
+            "transition_check_time_ms": 0.0,
             "policy_compute_time_ms": policy_compute_time_ms,
         },
     )

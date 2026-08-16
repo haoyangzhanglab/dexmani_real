@@ -32,7 +32,7 @@ HAND_TACTILE_FORCE_SHAPE = (
 HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
-# Learned-policy plan transport capacity (execution doc §61). This is a runtime
+# Learned-policy plan transport capacity. This is a runtime
 # IPC capacity, not a model horizon; an adapter that requests N > this must fail
 # rather than silently truncate.
 MAX_POLICY_CHUNK_STEPS = 32
@@ -54,9 +54,9 @@ HAND_COMMAND_DTYPE = np.dtype(
     _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
 )
 
-# Learned-policy plan payload (execution doc §60). The inference worker writes
+# Learned-policy plan payload. The inference worker writes
 # one of these per completed inference; the coordinator consumes the latest-wins
-# ring and never dumps the whole chunk into the arm queue or hand ring (§73/§74).
+# ring and never dumps the whole chunk into the arm queue or hand ring.
 POLICY_PLAN_DTYPE = np.dtype(
     [
         ("plan_id", "<u8"),
@@ -339,7 +339,7 @@ def make_record_sample_dtype(
             ("target_eef_rot6d_raw", "<f8", (6,)),
             ("policy_map_time_ms", "<f8"),
             ("hand_retarget_time_ms", "<f8"),
-            ("transition_check_time_ms", "<f8"),  # reserved (always 0; SafetyGate collision/transition removed 2026-08-12)
+            ("transition_check_time_ms", "<f8"),  # reserved (always 0)
             ("policy_compute_time_ms", "<f8"),
         ],
         align=True,

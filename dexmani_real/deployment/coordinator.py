@@ -6,8 +6,8 @@ plan, schedules the due endpoint (one per control tick), runs the shared
 candidate publication boundary (SafetyGate -> send_command), and owns the
 policy semantic watchdog and the ``RUNNING <-> ARMED`` control-source state.
 
-It never dumps a whole chunk into the arm queue or hand ring (§73/§74) and never
-interpolates between model steps (§78).
+It never dumps a whole chunk into the arm queue or hand ring and never
+interpolates between model steps.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class CoordinatorConfig:
 
     Mirrors ``TeleopConfig.from_runtime``: the deployment namespace supplies the
     model/boundary knobs, the runtime namespace supplies the joint limits, hand
-    mechanical envelope, delta bound, and control rate.
+    mechanical envelope, and control rate.
     """
 
     deployment: DeploymentConfig
@@ -100,7 +100,7 @@ def _adoptable(
     max_plan_age_ns: int,
     max_observation_age_ns: int,
 ) -> tuple[bool, str]:
-    """Adoption gate for a fresh plan record (§75). Any failure drops it."""
+    """Adoption gate for a fresh plan record. Any failure drops it."""
     if int(rec["run_generation"]) != current_generation:
         return False, "generation mismatch"
     if int(rec["observation_id"]) < last_observation_id:
@@ -127,12 +127,12 @@ def _select_due_step(
     next_step: int,
     now_ns: int,
 ) -> tuple[int | None, int]:
-    """Select the latest due step, coalescing overdue intermediate targets (§76).
+    """Select the latest due step, coalescing overdue intermediate targets.
 
     Walks the (strictly increasing) target timeline from ``next_step``, skipping
     invalid steps. Returns ``(selected_index, new_next_step)``; ``selected_index``
-    is ``None`` when no step is due yet (the coordinator then publishes nothing,
-    §77). ``new_next_step`` always advances past invalid/consumed steps.
+    is ``None`` when no step is due yet (the coordinator then publishes nothing).
+    ``new_next_step`` always advances past invalid/consumed steps.
     """
     latest_due: int | None = None
     i = next_step
@@ -157,7 +157,7 @@ def _abort_policy_run(
     *,
     metric: str | None = None,
 ) -> None:
-    """Advance the generation and drop RUNNING -> ARMED (§80.2/§82).
+    """Advance the generation and drop RUNNING -> ARMED.
 
     This is a policy-semantic failure, not a hardware fault: the robot is left
     ARMED (command quiescence) rather than FAULT. The abort counters are flushed
@@ -183,7 +183,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     # The deployment path is machine-driven (no operator in the loop), so it must
     # run the same arm-base Cartesian workspace check as VR teleop.  Build a
     # planner wired to the configured workspace bounds and extend the shared
-    # SafetyGate boundary with it (D2).  Build before the first heartbeat/ready
+    # SafetyGate boundary with it.  Build before the first heartbeat/ready
     # publish so a planner failure fails closed at readiness rather than mid-run.
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
@@ -246,7 +246,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     # Command-to-command silence reference. ``None`` until the first publish so
     # the slow first inference (forced reset + encode + infer after the
     # RUNNING-entry generation advance) is not charged against the silence
-    # budget (§82).
+    # budget.
     last_valid_policy_command_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
     running = True
@@ -265,7 +265,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            # Command silence watchdog (§82): command-to-command only, armed at
+            # Command silence watchdog: command-to-command only, armed at
             # the first publish, so first-command inference latency is not
             # charged against the budget.
             if (
@@ -351,9 +351,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             )
             if not publish_result.succeeded:
                 if publish_result.status == CommandPublishStatus.GATE_REJECTED:
-                    # SafetyGate rejection is a policy-semantic failure (§80.2):
+                    # SafetyGate rejection is a policy-semantic failure:
                     # the model proposed an invalid endpoint. Abort immediately.
-                    # Attribute the rejection per gate code (§10 D5) so the flush
+                    # Attribute the rejection per gate code so the flush
                     # log shows *which* operation rejected, not just a total.
                     metrics.increment(
                         reject_counter_name(

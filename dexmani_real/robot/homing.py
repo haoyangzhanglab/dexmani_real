@@ -567,7 +567,7 @@ def _shared_abort_reason_impl(
 
     FAILED wins over CANCELLED when both apply: SDK/controller failure and
     sticky/global fault are failures, while e-stop, shutdown, DISARMED, and a
-    changed generation are clean cancellations (see doc §8.4).
+    changed generation are clean cancellations.
     """
     if shared is None:
         return None

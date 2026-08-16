@@ -1,15 +1,15 @@
-"""DexMani Policy integration (execution doc §86–§91).
+"""DexMani Policy integration.
 
 Encapsulates the ``dexmani_policy`` model repository behind the three deployment
-Protocols so ``deployment/*`` never imports it (§86) and the parent process /
+Protocols so ``deployment/*`` never imports it and the parent process /
 loader never touches torch. ``dexmani_policy`` is imported lazily — inside
-:meth:`DexManiPolicyBackend.load` — so the architecture gate (§66) holds: the
+:meth:`DexManiPolicyBackend.load` — so the architecture gate holds: the
 core runs end-to-end on the fake without the model repository installed.
 
-First version (execution doc §90): only native joint action. An EE-action
+First version: only native joint action. An EE-action
 checkpoint without a validated EE->joint conversion is a startup reject. Any
 model-internal representation (FAAS, latent hand, …) must be converted back to
-native 12-DoF XHand by the model repository before this adapter sees it (§91).
+native 12-DoF XHand by the model repository before this adapter sees it.
 
 Expected ``dexmani_policy`` public API (the model repository must expose)::
 
@@ -43,7 +43,7 @@ def _last_valid(window: Any, dof: int) -> np.ndarray:
 
     Mirrors ``deployment.fake._last_valid``: the observation adapter never lets
     a missing window crash the backend — an absent/stale window becomes a zero
-    vector so the model still sees a well-typed input (§54). The hand is the one
+    vector so the model still sees a well-typed input. The hand is the one
     modality a joint-only first version may genuinely omit (see ``encode``).
     """
     if window is None:
@@ -55,13 +55,13 @@ def _last_valid(window: Any, dof: int) -> np.ndarray:
 
 
 class DexManiObservationAdapter:
-    """``ObservationBatch`` -> model-native joint observation dict (§88).
+    """``ObservationBatch`` -> model-native joint observation dict.
 
     Joint-only first version. ``arm_qpos`` is always a ``[7]`` vector (a zero
     vector when the arm window is absent/stale); ``hand_qpos`` is ``[12]`` when
     the hand window is present, else ``None``. Any history stacking,
     normalization, batch-dimension, or device transfer the real policy needs
-    belongs here, not in the deployment core (§88/§91).
+    belongs here, not in the deployment core.
     """
 
     def __init__(self, config: Any = None) -> None:
@@ -76,11 +76,11 @@ class DexManiObservationAdapter:
 
 
 class DexManiPolicyBackend:
-    """DexMani Policy model backend (§87): lazy load -> predict_action.
+    """DexMani Policy model backend: lazy load -> predict_action.
 
     ``load`` imports ``dexmani_policy``, builds the agent from the resolved
     ``DeploymentConfig`` (``model_config_path`` / ``checkpoint`` / ``device``),
-    and rejects an EE-action checkpoint (§90). A missing repository or entry
+    and rejects an EE-action checkpoint. A missing repository or entry
     point fails closed (raises) — the supervisor observes a process failure, not
     a dummy safe mode.
     """
@@ -98,14 +98,14 @@ class DexManiPolicyBackend:
         except ImportError as exc:
             raise ImportError(
                 "dexmani_policy is not installed; the DexMani Policy backend "
-                "cannot load (fail closed, §81)"
+                "cannot load (fail closed)"
             ) from exc
         build_agent = getattr(dexmani_policy, "build_agent", None)
         if build_agent is None:
             raise ImportError(
                 "dexmani_policy does not expose build_agent(model_config_path=..., "
                 "checkpoint=..., device=...) — update this integration to the "
-                "repository's entry point (§86)"
+                "repository's entry point"
             )
         agent = build_agent(
             model_config_path=model_config_path,
@@ -115,7 +115,7 @@ class DexManiPolicyBackend:
         if getattr(agent, "action_space", "joint") != "joint":
             raise ValueError(
                 "EE-action checkpoint requires a validated EE->joint conversion; "
-                "first version only supports native joint action (§90)"
+                "first version only supports native joint action"
             )
         self._agent = agent
 
@@ -138,13 +138,13 @@ class DexManiPolicyBackend:
 
 
 class DexManiActionAdapter:
-    """Model-native output -> denormalize -> ``JointActionChunk`` (§89).
+    """Model-native output -> denormalize -> ``JointActionChunk``.
 
     First version only native joint action. The model output is expected as
     ``{"arm_qpos": [N,7], "hand_qpos": [N,12]|None}`` in radians (any model-side
     denormalization is the repository's job; this adapter only shapes it into the
     canonical chunk). An EE-shaped output fails closed rather than silently
-    producing a bad chunk (§90).
+    producing a bad chunk.
     """
 
     def __init__(self, config: Any = None) -> None:
@@ -154,13 +154,13 @@ class DexManiActionAdapter:
         if not isinstance(raw_output, dict) or "arm_qpos" not in raw_output:
             raise ValueError(
                 "DexMani Policy output must be a dict with 'arm_qpos' [N, 7] native "
-                "joint (§89/§90: EE and non-dict outputs are unsupported)"
+                "joint (EE and non-dict outputs are unsupported)"
             )
         arm = np.asarray(raw_output["arm_qpos"], dtype=np.float64)
         if arm.ndim != 2 or arm.shape[1] != _ARM_DOF:
             raise ValueError(
                 f"DexMani Policy arm output must be [N, {_ARM_DOF}] native joint, "
-                f"got {arm.shape} (§90: EE action is unsupported)"
+                f"got {arm.shape} (EE action is unsupported)"
             )
         n = arm.shape[0]
         if n == 0:

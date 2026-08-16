@@ -1,10 +1,10 @@
-"""Immutable learned-policy deployment configuration (execution doc §92).
+"""Immutable learned-policy deployment configuration.
 
 Mirrors :func:`dexmani_real.config.runtime.resolve_runtime_config` for the
 deployment namespace: a frozen :class:`DeploymentConfig` template plus a
 ``CLI > file/data > defaults`` resolver that stamps a stable canonical-JSON
-SHA-256 identity for provenance (§96).  Model-internal parameters (§93 —
-transformer depth, hidden dim, diffusion schedule, etc.) never appear here.
+SHA-256 identity for provenance.  Model-internal parameters (transformer depth,
+hidden dim, diffusion schedule, etc.) never appear here.
 """
 
 from __future__ import annotations
@@ -124,7 +124,7 @@ def resolve_deployment_config(
     """Resolve ``CLI > file/data > defaults`` without mutating the template.
 
     Accepts either a flat mapping of deployment fields or a YAML document with a
-    top-level ``deployment:`` section (§58).  Raises when any of the three
+    top-level ``deployment:`` section.  Raises when any of the three
     ``*_target`` fields is absent; the three targets are the required entry
     points (the worker cannot run without all three).
     """

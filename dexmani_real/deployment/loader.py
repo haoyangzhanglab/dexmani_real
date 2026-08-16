@@ -1,4 +1,4 @@
-"""Lazy backend/adapter loader (execution doc §58–§59).
+"""Lazy backend/adapter loader.
 
 A ``module:symbol`` target is imported and instantiated only when the inference
 child calls these functions, so the parent process never imports torch or

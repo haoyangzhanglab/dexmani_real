@@ -264,7 +264,7 @@ class ArmParams:
 
     # ── Device identity (validated against the SDK report at connect) ──
     expected_axis: int = 7
-    # Explicit model check is opt-in: None means "don't guess the model" (doc §8.5).
+    # Explicit model check is opt-in: None means "don't guess the model".
     device_profile: str | None = None
     serial_number: str | None = None  # enforced only when configured
     min_firmware: tuple[int, ...] | None = None  # integer-tuple compare via version_number

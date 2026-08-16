@@ -5,7 +5,7 @@ causal observations from the shared rings, runs ``encode -> infer -> decode``,
 and publishes the resulting :class:`~dexmani_real.deployment.contracts.JointActionChunk`
 to the latest-wins ``policy_plan_ring``. It never writes ``arm_action_q``,
 ``hand_cmd_ring``, the SDK, ``SafetyState``, or ``run_generation`` — model output
-is a proposal, not a robot command (§48).
+is a proposal, not a robot command.
 
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle/supervision stays in the A/B runtime.
@@ -43,7 +43,7 @@ logger = get_logger(__name__)
 # Poll delay while a required modality has no causal feedback yet. Non-zero so
 # the no-feedback continue paths (arm_history/hand_history None) do not busy-spin
 # a CPU core during the startup transient; small so readiness is picked up
-# promptly (§81).
+# promptly.
 _NO_FEEDBACK_POLL_S = 0.005
 
 
@@ -54,12 +54,12 @@ def publish_plan(
     context: InferenceContext,
     chunk: JointActionChunk,
 ) -> bool:
-    """Publish a validated chunk to the latest-wins plan ring (§69/§70).
+    """Publish a validated chunk to the latest-wins plan ring.
 
     Re-reads ``shared.run_generation`` at publish time; if the generation has
     advanced since the observation was captured, the in-flight plan is dropped
-    (returns ``False`` without writing) rather than relabeled (§70). An
-    over-capacity chunk raises ``ValueError`` (§61: fail, never truncate).
+    (returns ``False`` without writing) rather than relabeled. An
+    over-capacity chunk raises ``ValueError`` (fail, never truncate).
     """
     if int(shared.run_generation.value) != int(context.run_generation):
         return False
@@ -168,11 +168,11 @@ def _build_observation(
 def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
-    Startup order (§68): heartbeat early -> lazy import -> instantiate -> load ->
+    Startup order: heartbeat early -> lazy import -> instantiate -> load ->
     mark ready. A load/import/instantiation failure raises out of this function
     and becomes a supervisor-observed process failure; there is no dummy safe
     mode. The main loop reads a fresh generation each tick and calls
-    ``backend.reset`` when it changes (§71).
+    ``backend.reset`` when it changes.
     """
     if config is None:
         raise ValueError("inference_loop requires a DeploymentConfig")
@@ -190,7 +190,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     shared.set_ready("inference")
     # Refresh right after ready: backend.load() can exceed the 5.0s inference
     # heartbeat timeout, and run_supervisor starts checking heartbeats
-    # immediately after wait_subsystem_ready returns (§81).
+    # immediately after wait_subsystem_ready returns.
     shared.set_heartbeat("inference", time.monotonic())
     logger.info("inference_loop: ready (backend=%s)", config.backend_target)
 
@@ -207,7 +207,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
             tick_start = time.monotonic()
             # Heartbeat every tick so the no-feedback continue paths and the
             # first (potentially slow) inference never leave a stale heartbeat
-            # that run_supervisor reads as a dead worker (§81).
+            # that run_supervisor reads as a dead worker.
             shared.set_heartbeat("inference", time.monotonic())
 
             run_generation = int(shared.run_generation.value)
@@ -251,7 +251,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 chunk = action_adapter.decode(raw_output, context=context)
             except ValueError as exc:
                 # Bad model result (NaN/Inf/shape/ordering) is a dropped proposal,
-                # not a process failure (§80.2); the coordinator's silence watchdog
+                # not a process failure; the coordinator's silence watchdog
                 # is the eventual abort backstop.
                 logger.warning("inference: bad model output dropped: %s", exc)
                 metrics.increment(INFERENCE_FAILURES)

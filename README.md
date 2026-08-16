@@ -152,7 +152,7 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`dexmani_real`
 
-以下清单覆盖当前包内的 **92 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
+以下清单覆盖当前包内的 **94 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
 
 ### 根包
 
@@ -191,33 +191,33 @@ python -m compileall -q dexmani_real examples
 
 | 文件 | 作用 |
 |---|---|
-| `policy/__init__.py` | 标识动作协议、安全校验与控制环计时包（原 learned-policy 已移除）。 |
-| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；发布边界统一检查运行态、arm/hand feedback 健康度（`_hand_feedback_snapshot` fail-closed：`connected`/`state_valid`/`error_state`/`send_healthy`/`read_healthy` + `qpos`/`last_cmd_qpos` shape+finite，暂未做时间戳过期检查）和 coupled-hand 机械/增量预检，并返回类型化拒绝/传输结果，worker 在 SDK 前仍独立复核；速度包络与碰撞/过渡几何检查已移除（2026-08-12，由 xArm Mode 6 固件兜底，回零路径经 `plan_joint_home_path`/`plan_band_alignment_path` 独立规划碰撞），不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
+| `policy/__init__.py` | 标识动作协议、安全校验与控制环计时包。 |
+| `policy/safety.py` | 单一安全门 (SafetyGate) — 良构→关节限位→工作空间；发布边界统一检查运行态、arm/hand feedback 健康度（`_hand_feedback_snapshot` fail-closed：`connected`/`state_valid`/`error_state`/`send_healthy`/`read_healthy` + `qpos`/`last_cmd_qpos` shape+finite）和 coupled-hand 机械/增量预检，并返回类型化拒绝/传输结果，worker 在 SDK 前仍独立复核，不裁剪 action；`run_generation` 使暂停前候选失效；hand-home 会生成显式合法里程碑并逐条等待 SDK 接受回执。 |
 | `policy/loop_timing.py` | 以滑动窗口统计控制环各阶段耗时的轻量 `StageTimer`。 |
 | `policy/runtime.py` | 定义单 tick 动作候选 `ActionCandidate` 的数据契约，含 run generation、时效与只读数组封装。 |
 
-### `deployment/` — Learned-Policy 部署运行时（Phase C 新增）
+### `deployment/` — Learned-Policy 部署运行时
 
 | 文件 | 作用 |
 |---|---|
 | `deployment/__init__.py` | 标识后端/观测/动作适配器边界与 learned-policy 部署运行时（模型输出只是 proposal，不是 robot command）。 |
-| `deployment/config.py` | `DeploymentConfig` 与 `resolve_deployment_config`（CLI > file/data > defaults + SHA-256）；模型内部参数绝不进配置（§93）。 |
+| `deployment/config.py` | `DeploymentConfig` 与 `resolve_deployment_config`（CLI > file/data > defaults + SHA-256）；模型内部参数绝不进配置。 |
 | `deployment/contracts.py` | `PolicyBackend` / `ObservationAdapter` / `ActionAdapter` 三个 Protocol + `JointActionChunk` / `InferenceContext`，均不 import torch 或 SharedStorage。 |
-| `deployment/observation.py` | 进程本地不可变观测窗 `ObservationBatch` / `FrameWindow` / `CameraWindow`（§54，不进 SharedStorage）。 |
+| `deployment/observation.py` | 进程本地不可变观测窗 `ObservationBatch` / `FrameWindow` / `CameraWindow`（不进 SharedStorage）。 |
 | `deployment/loader.py` | `module:symbol` 惰性加载器，实例化后 Protocol 校验，失败 fail-closed；parent 不 import torch。 |
-| `deployment/fake.py` | 确定性、无 torch、无硬件的 fake 后端（架构门 §66 与 backend-swap fixture）。 |
-| `deployment/worker.py` | `inference_loop`：观测 → encode → infer → decode → 只写 `policy_plan_ring`；不写 arm/hand transport、不碰 SafetyState（§48/§70）。 |
-| `deployment/coordinator.py` | `coordinator_loop`：唯一的 learned-policy robot-action producer——采纳计划、调度单个 due endpoint（latest-wins、不插值）、走共享 `build_action_candidate`/`validate_and_send_candidate` 发布边界、手部 delta 预检、命令静默 watchdog（§72–§82）。 |
-| `deployment/lifecycle.py` | `build_policy_worker_specs` + `run_policy_deployment`：组合 A/B 冻结的 `WorkerSpec`/`run_supervisor`/`shutdown_processes`，无第二套健康机制（§83）。 |
-| `deployment/metrics.py` | 无 Prometheus/OTel 的 counter/gauge 注册表 + 结构化 flush（§94）。 |
-| `deployment/provenance.py` | 一次性启动 provenance 日志（commit/target/checkpoint/runtime SHA-256），不进高频 IPC payload（§96）。 |
+| `deployment/fake.py` | 确定性、无 torch、无硬件的 fake 后端（backend-swap fixture）。 |
+| `deployment/worker.py` | `inference_loop`：观测 → encode → infer → decode → 只写 `policy_plan_ring`；不写 arm/hand transport、不碰 SafetyState。 |
+| `deployment/coordinator.py` | `coordinator_loop`：唯一的 learned-policy robot-action producer——采纳计划、调度单个 due endpoint（latest-wins、不插值）、走共享 `build_action_candidate`/`validate_and_send_candidate` 发布边界、手部 delta 预检、命令静默 watchdog。 |
+| `deployment/lifecycle.py` | `build_policy_worker_specs` + `run_policy_deployment`：组合 A/B 冻结的 `WorkerSpec`/`run_supervisor`/`shutdown_processes`，无第二套健康机制。 |
+| `deployment/metrics.py` | 无 Prometheus/OTel 的 counter/gauge 注册表 + 结构化 flush。 |
+| `deployment/provenance.py` | 一次性启动 provenance 日志（commit/target/checkpoint/runtime SHA-256），不进高频 IPC payload。 |
 
-### `integrations/` — 模型仓库适配器（Phase C 新增）
+### `integrations/` — 模型仓库适配器
 
 | 文件 | 作用 |
 |---|---|
 | `integrations/__init__.py` | 说明依赖方向：`deployment/*` 不得 import 本包；integration → deployment。 |
-| `integrations/dexmani_policy.py` | DexMani Policy 模型仓库适配器：`DexManiObservationAdapter`/`DexManiPolicyBackend`/`DexManiActionAdapter`；`load()` 内惰性 import，native-joint-only，EE checkpoint 启动即拒绝（§86–§91）。 |
+| `integrations/dexmani_policy.py` | DexMani Policy 模型仓库适配器：`DexManiObservationAdapter`/`DexManiPolicyBackend`/`DexManiActionAdapter`；`load()` 内惰性 import，native-joint-only，EE checkpoint 启动即拒绝。 |
 
 ### `recording/` — Episode 持久化与离线分析
 
@@ -229,13 +229,14 @@ python -m compileall -q dexmani_real examples
 | `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并分别提供内部有效性与最短时长质量视图。 |
 | `recording/episode_recorder.py` | 管理单个 episode 的 HDF5 数据集、相机写入器、停止校验与最终发布。 |
 | `recording/io_process.py` | `RecorderIO` 非阻塞事务 worker 及其客户端协议；固定 dtype 携带 generation、FINALIZING/终态和会话失败结果。 |
+| `recording/recorder_client.py` | policy 侧 `RecorderClient` 与共享控制面协议类型；持有录制决策与固定 sample 构造，与 RecorderIO 依赖单向。 |
 | `recording/timestamp_buffer.py` | 对同一控制段按 deadline 因果补帧，并在命令静默后的新 generation 上重锚时间网格。 |
 | `recording/transaction.py` | 目录 fsync 和原子发布工具，避免半成品 episode 被当作完成数据。 |
 | `recording/video_codec.py` | 基于 PyAV 的视频编码器/解码器及其配置，服务 HDF5 旁路视频流。 |
 
 ### `examples/replay_episode.py` — 检查、授权与受控回放
 
-Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.py` 中（约 2100 行）。默认执行离线检查（dry-run）；`--live --source sent` 跨越硬件安全边界，在启动 arm/hand worker 前执行密集几何和来源预检，通过 `SharedStorage` 回放轨迹，捕获回放状态并计算关节/末端跟踪一致性指标与时间延迟。
+Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.py` 中（约 2000 行）。默认执行离线检查（dry-run）；`--live --source sent` 跨越硬件安全边界，在启动 arm/hand worker 前执行密集几何和来源预检，通过 `SharedStorage` 回放轨迹，捕获回放状态并计算关节/末端跟踪一致性指标与时间延迟。
 
 ### `robot/` — xArm7、XHand 与安全状态
 
@@ -275,7 +276,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `shm/__init__.py` | 说明共享内存公共接口及其与回零/监督模块的职责边界。 |
-| `shm/causal_reader.py` | 从各状态环读取因果帧（`0 < source <= publish <= anchor`）的公共读取器；不含 age threshold，供遥操作快照与 deployment 观测共用（§51）。 |
+| `shm/camera_ring.py` | 大相机帧（RGB+depth+pointcloud）的变长槽共享内存环 `CameraRingBuffer`，复用同一 seqlock 提交/发布合同。 |
+| `shm/causal_reader.py` | 从各状态环读取因果帧（`0 < source <= publish <= anchor`）的公共读取器；不含 age threshold，供遥操作快照与 deployment 观测共用。 |
 | `shm/ring_buffer.py` | 通用共享内存 seqlock 环和相机专用环，提供零拷贝写入与已验证读取。 |
 | `shm/shared_storage.py` | 创建并持有共享环、队列、标志和事件；默认仅分配遥操作/采集能力，`policy_plan_ring` 供 learned-policy 部署使用。 |
 
@@ -294,7 +296,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
 | `teleop/recording_session.py` | 处理退出时的保存、丢弃和停机决策。 |
-| `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、arm-only hold、接触停滞与回零流程（臂-手过渡碰撞检查已移除，由 Mode 6 固件兜底）；return-home 逐条确认有界 hand-home 里程碑已被 SDK 接受，但不等待手指角度收敛。 |
+| `teleop/safety.py` | 遥操作安全辅助：候选动作生效性、arm-only hold、接触停滞与回零流程；return-home 逐条确认有界 hand-home 里程碑已被 SDK 接受，但不等待手指角度收敛。 |
 | `teleop/snapshot.py` | 从共享环读取同一因果锚点附近的臂、手、VR、触觉、相机快照，并跟踪相机新鲜度。 |
 | `teleop/vr_transform.py` | 定义 schema-v1 VR 朝向标定契约：加载/校验 SO(3) 旋转、坐标约定与机器可读质量，POOR 质量拒绝运行。 |
 | `teleop/tag_retargeting/__init__.py` | 导出 TAG 两阶段手部重定向的优化器与 Pinocchio 梯度计算器。 |
@@ -307,12 +309,13 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 |---|---|
 | `utils/__init__.py` | 标识日志、序列化、限速、信号、schema、数组和限位校验工具的公共包。 |
 | `utils/array_utils.py` | 提供 NaN 初始化数组与安全 resize 等数值数组小工具。 |
+| `utils/hand_health.py` | arm/hand 反馈健康谓词（`validate_arm_feedback` / `validate_hand_feedback`），供 teleop、policy 发布边界与 replay 共用。 |
 | `utils/limits.py` | 校验 XHand 三级关节限位层级（rated ⊇ mechanical ⊇ command），收敛 config/robot/hand_process 三处重复的嵌套校验。 |
 | `utils/log.py` | 创建统一 logger、可选文件日志和按时间节流的告警器。 |
 | `utils/pointcloud_utils.py` | 实现内参/变换/工作空间校验、RGB-D 到点云、裁剪、下采样、采样与深度可视化。 |
 | `utils/rate_manager.py` | 以单调时钟稳定控制循环频率，并报告周期统计信息。 |
 | `utils/retry.py` | 提供可重置的连续失败计数器，供设备读写 watchdog 使用。 |
-| `utils/schema.py` | 跨进程 NumPy dtype 与关节/末端尺寸常量的唯一定义源（原 `ipc/` 已合并至此）。 |
+| `utils/schema.py` | 跨进程 NumPy dtype 与关节/末端尺寸常量的唯一定义源。 |
 | `utils/serialization.py` | 按 dataclass 类型注解将字典安全转换为嵌套对象和 NumPy 数组。 |
 | `utils/signal_utils.py` | 提供四元数安全归一化和位姿 EMA 平滑。 |
 
@@ -323,7 +326,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
 | `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
-| `examples/run_policy.py` | `deployment.lifecycle` | learned-policy 部署入口：argparse → 解析 runtime/deployment 配置 → 运行生命周期 → 退出码（§84）；薄 CLI，无模型/调度/安全/存储逻辑。 |
+| `examples/run_policy.py` | `deployment.lifecycle` | learned-policy 部署入口：argparse → 解析 runtime/deployment 配置 → 运行生命周期 → 退出码；薄 CLI，无模型/调度/安全/存储逻辑。 |
 | `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键推进 generation 后停止发布，控制器自然完成最后一个已接受 endpoint，空闲期间持续从实测关节/FK 重建命令基准；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
 | `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检，退出时推进 generation 并停止发布。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
@@ -344,12 +347,9 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
 | `CLAUDE.md` | 更详细的架构、运行流程、安全/碰撞、录制 schema 与运维背景。 |
 | `AGENTS.md` | 面向代码修改者的仓库约定、硬件安全边界和跨模块变更检查清单。 |
-| `docs/ema_delta_clip_scale_reject_control_contract.md` | EMA、delta clip、scale 与 reject 在 arm、hand、replay、deployment 和 recording 中的实际顺序、默认状态与责任边界。 |
-| `docs/ab_runtime_freeze_report.md` | A/B 冻结运行时契约（Phase C 只能搭在其上，不得修改）。 |
 | `docs/dataset/hdf5_episode.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
 | `docs/dataset/sim_hdf5_zarr.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |
 | `docs/dataset/real_to_sim_mapping.md` | Real v16 episode → Sim/Policy 标签映射表：仅登记字段来源、结构关系和语义差异，不修改录制数值。 |
-| `docs/phase-c-deployment-runtime.md` | Learned-Policy 部署运行时说明：不变量、模块地图、失败语义、metrics/provenance、backend-swap 边界，以及 H0–H6 硬件门手工清单。 |
-| `docs/collect_teleop审查记录.md` | `examples/collect_teleop.py` 上下游的 fact-check 基线，记录已确认问题、触发条件、根因、术语和修复验收条件。 |
+| `docs/hand_retargeting.md` | hand retarget 当前控制合同：TAG/DexPilot 两后端、命令整形/验证/发布边界、状态推进时机与碰撞/触觉边界。 |
 
 对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的“Cross-module change checklist”，再沿本 README 的关键路径追踪所有生产者和消费者。

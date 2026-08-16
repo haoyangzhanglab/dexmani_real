@@ -1,14 +1,18 @@
 """DexMani Real — dexterous manipulation robot teleoperation & data collection.
 
 Subsystems:
-    robot/      — Hardware drivers (XArm7 7-DOF arm, XHand 12-DOF hand)
-    teleop/     — VR teleoperation (tracking, retargeting, control, safety)
-    planning/   — Motion planning (IK, kinematics, collision detection)
-
-    recording/  — HDF5 episode recording
-    sensor/     — RealSense camera driver
-    config/     — Camera calibration, pipeline config
-    utils/      — Shared utilities (arrays, signals, coordinate transforms, point clouds)
+    robot/        — Hardware drivers (xArm7 arm, XHand) and execution workers
+    teleop/       — VR teleoperation (mapping, retargeting, control loop)
+    planning/     — FK/IK, kinematics, collision and path planning
+    policy/       — Action protocol and safety validation
+    recording/    — HDF5 episode recording and offline readers
+    deployment/   — Learned-policy deployment runtime
+    integrations/ — Model-repository adapters
+    runtime/      — Process lifecycle, supervision, shutdown
+    shm/          — Shared-memory data plane (rings, queues, storage)
+    sensor/       — RealSense camera, VR receiver, point-cloud processing
+    config/       — Defaults, runtime snapshot, calibration
+    utils/        — Shared utilities (schema, limits, logging, arrays)
 """
 
 from __future__ import annotations

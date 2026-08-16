@@ -1,4 +1,4 @@
-"""Backend-neutral deployment contracts (execution doc §52–§56).
+"""Backend-neutral deployment contracts.
 
 The three Protocols define the model boundary; ``JointActionChunk`` is the
 runtime-canonical joint action. None of these import torch or SharedStorage.
@@ -19,8 +19,7 @@ from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE, MAX_POL
 class InferenceContext:
     """Timing/identity context passed to ``ActionAdapter.decode``.
 
-    Field shape is design latitude (the execution doc references the type but
-    does not enumerate its fields); these six suffice for generation checks and
+    Field shape is design latitude; these six suffice for generation checks and
     metric timing.
     """
 
@@ -48,7 +47,7 @@ class InferenceContext:
 
 @dataclass(frozen=True)
 class JointActionChunk:
-    """Runtime-canonical joint action chunk (execution doc §56).
+    """Runtime-canonical joint action chunk.
 
     Fixed representation: joint_position / rad / robot_joint. ``hand_qpos`` is
     None when the policy does not command the hand. All ``N`` steps share the
@@ -102,7 +101,7 @@ class JointActionChunk:
 
 @runtime_checkable
 class PolicyBackend(Protocol):
-    """Model-side inference; may import torch/checkpoint/CUDA (execution doc §53)."""
+    """Model-side inference; may import torch/checkpoint/CUDA."""
 
     def load(self) -> None: ...
 

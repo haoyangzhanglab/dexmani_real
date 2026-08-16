@@ -1,7 +1,7 @@
-"""Deployment observability counters (execution doc §94).
+"""Deployment observability counters.
 
 A minimal, dependency-free counter/gauge registry with structured logging —
-no Prometheus/OpenTelemetry (§94). Each worker process owns one :class:`Metrics`
+no Prometheus/OpenTelemetry. Each worker process owns one :class:`Metrics`
 instance and flushes it periodically so the H0–H6 hardware gates have live
 numbers without any external collector. The counters are ordinary Python dicts:
 each worker loop is single-threaded, so no locking is needed (a mutex would be
@@ -20,7 +20,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# §94 counter/guard names — the single source of truth used by both the
+# counter/guard names — the single source of truth used by both the
 # inference worker and the coordinator so they never diverge.
 OBSERVATIONS_BUILT = "observations_built"
 OBSERVATION_AGE_MS = "observation_age_ms"
@@ -57,7 +57,7 @@ _COUNTER_NAMES = frozenset(
         HAND_PREFLIGHT_REJECTIONS,
         POLICY_ABORTS,
         COMMAND_SILENCE_ABORT,
-        # Per-gate-code reject counters (§10 D5) are derived from
+        # Per-gate-code reject counters are derived from
         # ``reject_counter_name`` and are therefore also counters, though their
         # names cannot be enumerated statically here.
     }
@@ -65,7 +65,7 @@ _COUNTER_NAMES = frozenset(
 
 
 def reject_counter_name(gate_code: str | None) -> str:
-    """Per-operation counter name for a safety-gate rejection (§10 D5).
+    """Per-operation counter name for a safety-gate rejection.
 
     ``gate_code`` is the machine-readable :class:`GateRejectCode` value string
     (``None`` for the aggregate). The space-separated reason is normalized to a

@@ -47,8 +47,7 @@ def is_mplib_success(status: str) -> bool:
 
     Centralised here because MPlib's status string format (``"Success"``,
     ``"Success (closest)"``, etc.) is an implementation detail that could
-    change across MPlib versions.  Three call sites in ik.py, ik_candidates.py,
-    and planner.py previously duplicated ``status.lower().startswith("success")``.
+    change across MPlib versions.
     """
     return status.lower().startswith("success")
 

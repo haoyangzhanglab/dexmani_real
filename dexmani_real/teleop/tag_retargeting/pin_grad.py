@@ -1,7 +1,6 @@
 """Pinocchio analytical gradient engine for hand kinematics optimization.
 
 Ported from TAG/Retargeting/Hand_Retargeting/utils/pin_grad.py.
-Simplified: rotation gradient methods removed (unused by XHand new method).
 
 FreeFlyer convention:
   q = [tx, ty, tz, qx, qy, qz, qw | joint_0 ... joint_N-1]

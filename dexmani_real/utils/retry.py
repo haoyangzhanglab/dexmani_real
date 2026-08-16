@@ -1,8 +1,4 @@
 """Lightweight consecutive-event counter with threshold escalation.
-
-Shared by arm_loop and hand_loop — replaces scattered ``_consecutive_*``
-integer counters + ``_*_RETRY_MAX`` constants with a single consistent
-pattern.
 """
 
 from __future__ import annotations

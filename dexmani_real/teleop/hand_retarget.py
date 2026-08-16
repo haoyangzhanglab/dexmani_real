@@ -333,9 +333,8 @@ class XHandRetargeter:
             logger.warning("Retargeting returned None.")
             return None
 
-        # ── Teleoperator-level EMA smoothing (ref: LeFranX smoothing_alpha=0.3) ──
-        # Applied AFTER SeqRetargeting LPFilter for two-layer smoothing.
-        # Early-exit when alpha >= 1.0 (default config: pass-through, disabled).
+        # Optional teleoperator-level output EMA applied after the external
+        # LPFilter. Default alpha is 1.0 (pass-through), so this is a no-op.
         qpos_arr = np.asarray(qpos, dtype=float)
         assert self._smoothing_alpha is not None  # set by load_retargeter()
         if self._smoothing_alpha < 1.0:

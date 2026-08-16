@@ -1,8 +1,6 @@
 """Shared joint-limit hierarchy validation for the XHand device.
 
-The XHand has a three-level joint-limit hierarchy that three independent
-config constructors used to validate separately (``config.defaults.HandParams``,
-``robot.xhand.XHandConfig``, ``robot.hand_process.HandProcessConfig``)::
+The XHand has a three-level joint-limit hierarchy::
 
     rated (hardware hard-stop envelope) ⊇ mechanical (model envelope) ⊇ command (operational)
 

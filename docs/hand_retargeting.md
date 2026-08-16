@@ -54,10 +54,10 @@ VR_FRAME_DTYPE / 历史可验证 VR ring
 startup smoothstep ramp
     │
     ▼
-可选 command delta clamp → operational command-box clip
+operational command-box clip
     │
     ▼
-结构 / finite / operational / mechanical / 可选 delta 复验
+结构 / finite / operational / mechanical 复验
     │
     ▼
 ActionCandidate → SafetyGate → HAND_COMMAND_DTYPE
@@ -66,10 +66,10 @@ ActionCandidate → SafetyGate → HAND_COMMAND_DTYPE
 latest-wins hand command ring
     │
     ▼
-30 Hz hand worker：generation / 过期 / 范围 / 可选 delta 复验
+30 Hz hand worker：generation / 过期 / 范围复验
     │
     ▼
-XHand driver：最终范围 / 可选 delta 检查，原样发送 endpoint
+XHand driver：最终范围检查，原样发送 endpoint
 ```
 
 最重要的当前事实是：
@@ -79,7 +79,7 @@ XHand driver：最终范围 / 可选 delta 检查，原样发送 endpoint
 3. TAG 当前**没有输出级 EMA**。它的连续性来自 Stage 1 时间正则、pinch activation EMA 和启动 ramp。
 4. DexPilot 默认保留外部库内部 LPFilter；仓库包装层的 output EMA 当前为直通。
 5. operational command bounds 当前是**发布前逐关节投影**，不是求解器边界，也不是整条拒绝条件。
-6. `hand.max_delta_rad` 当前默认是 `None`。若显式配置，teleop 先 clamp，worker 与 driver 再做拒绝式复验。
+6. 应用侧 command-to-command delta clamp（`hand.max_delta_rad`）已移除；手部速度保护仅由 EtherCAT 固件 PID 与电流限位承担。
 7. 结构错误、NaN/Inf、机械范围错误和 IPC/lifecycle 错误仍然 fail closed，不会被裁成合法动作。
 8. solver、ramp、published command 和 SDK accepted command 有不同的状态推进时机，不能统称为“按已发布命令推进”。
 9. teleop 的机械臂碰撞求解使用上一条已发布手姿态，不使用同周期新手候选。
@@ -141,7 +141,7 @@ hand command ring 是 latest-wins：
 - 中间 endpoint 可以被跳过；
 - 命令不会作为轨迹队列逐条回放。
 
-这适合实时 servo endpoint，但意味着若配置 command delta，producer 的相邻发布差与 worker 的 last-accepted 差并不天然相同。worker 可能跳过中间命令，因此仍必须在设备边界复验。
+这适合实时 servo endpoint，但意味着 worker 可能跳过中间命令，因此仍必须在设备边界复验。
 
 ### 3.4 generation 与命令寿命
 
@@ -424,7 +424,7 @@ observed → solved → shaped → published → accepted / measured
 
 - observed：控制网格选中的 VR landmarks；
 - solved：retargeter 返回的 SDK-order 候选；
-- shaped：ramp、可选 delta clamp 和 command-box clip 后的 endpoint；
+- shaped：ramp 和 command-box clip 后的 endpoint；
 - published：通过候选验证并写入 hand command ring 的 endpoint；
 - accepted：XHand SDK send 成功后 driver 保存的 endpoint；
 - measured：设备反馈 qpos。
@@ -462,11 +462,8 @@ $$
 
 ramp 后依次执行：
 
-1. 若 `hand.max_delta_rad` 已配置，相对 `ctx.prev_hand_qpos` 做逐关节 delta clamp；
-2. 对 operational command lower/upper bounds 做 `np.clip`；
-3. 调用 sanitizer 复验 shape、finite、limit nesting、operational、mechanical 和可选 delta。
-
-当前默认 `hand.max_delta_rad=None`，因此步骤 1 默认不限制动作。
+1. 对 operational command lower/upper bounds 做 `np.clip`；
+2. 调用 sanitizer 复验 shape、finite、limit nesting、operational 和 mechanical。
 
 需要区分两种语义：
 
@@ -483,7 +480,7 @@ shaped endpoint 进入 `ActionCandidate`，再通过统一发布边界：
 - shape 和 finite；
 - arm/hand joint limits；
 - workspace 等候选级检查；
-- hand mechanical envelope 和可选 command delta preflight；
+- hand mechanical envelope；
 - runtime state 和反馈新鲜度。
 
 通过后，hand endpoint 编码为固定 `HAND_COMMAND_DTYPE` 并写 latest-wins ring。控制路径不使用 JSON、动态对象或 ACK/apply 事务。
@@ -514,14 +511,13 @@ hand worker 读取最新未处理 ring sequence，并在 SDK 边界前检查：
 - operational、mechanical 和 rated envelope 的嵌套与 endpoint；
 - generation；
 - valid-until；
-- safety state、error state 和 e-stop；
-- 若配置了 delta limit，相对 driver last-accepted endpoint 的差值。
+- safety state、error state 和 e-stop。
 
 worker 只在允许的 safety state 下发送。persistent send/read/board faults 进入共享 fault 路径；`error_state` 是 sticky 的系统错误标志。
 
-XHand driver 再次检查 shape、finite、范围，以及配置存在时的 delta。检查通过后 endpoint 原样写入 SDK command；应用层不在 driver 中插值。
+XHand driver 再次检查 shape、finite 和范围。检查通过后 endpoint 原样写入 SDK command；应用层不在 driver 中插值。
 
-只有 SDK send 成功，driver 才更新 `last_qpos_cmd`。因此 worker/driver delta reference 是设备调用接受的上一目标，不是 measured feedback，也不是 teleop 最新 solved target。
+只有 SDK send 成功，driver 才更新 `last_qpos_cmd`，其值为设备调用接受的上一目标，不是 measured feedback，也不是 teleop 最新 solved target。
 
 ## 11. 碰撞与 tactile 边界
 
@@ -588,7 +584,6 @@ HDF5 schema v16 保存与 hand retarget 相关的主要信息：
 
 - startup ramp；
 - operational clip；
-- 配置存在时的 delta clamp；
 - normal active path 上的 retarget failure hold。
 
 当前没有单独记录每关节 clip/saturation bitmask；held path 也不保留 rejected solver raw。因此只有正常 active frame 能通过 raw/final 差值和 frame flags 间接解释 shaping。
@@ -630,7 +625,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 ### P1：正确性和可观测性
 
 1. 将 `solver_ok`、`command_shaped`、`published`、`accepted` 和 `measured` 分层记录或形成明确派生规则。
-2. 增加 per-joint operational/delta clip bitmask、raw-to-final delta 和 joint-at-bound 指标。
+2. 增加 per-joint operational clip bitmask、raw-to-final 差值和 joint-at-bound 指标。
 3. 明确 solver temporal state 已推进但 publish 失败时的恢复政策：接受分叉、显式 reset，或设计 propose/commit 接口。
 4. 将实际选择后端的 URDF、YAML 和关键原生依赖版本纳入 episode provenance。
 5. 记录 Stage 1/2 result code、loss、evaluation count、Stage 2 是否运行/回退和 pinch activation。
@@ -646,8 +641,8 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 - SDK/model order round trip；
 - TAG Stage 1/2 梯度；
 - reset 后首帧连续性；
-- operational clip、可选 delta clamp 和机械范围 reject；
-- latest-wins 跳帧相对 last-accepted delta；
+- operational clip 和机械范围 reject；
+- latest-wins 跳帧相对 last-accepted 的跳变幅度；
 - P50/P95/P99 solver 与完整 policy tick 延迟。
 
 ### P2：输入质量
@@ -705,12 +700,12 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 - measured/action 相位差；
 - replay 仍只消费 final action。
 
-### 15.4 修改 bounds 或 delta
+### 15.4 修改 bounds 或 command shaping
 
 从 [config/defaults.py](../dexmani_real/config/defaults.py) 和 [config/runtime.py](../dexmani_real/config/runtime.py) 开始，再审计：
 
 - optimizer bounds；
-- teleop clamp/clip；
+- teleop clip；
 - sanitizer；
 - SafetyGate/publication preflight；
 - hand worker；
@@ -746,7 +741,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 → fixed-grid recording
 ```
 
-TAG 提供仓库内可审计的五指位置匹配和条件式捏合精修；DexPilot 提供外部 vector-graph 路径。当前输出机制已经简化为：TAG 不再增加 output EMA，DexPilot wrapper 默认直通，启动阶段使用 ramp，operational command floor 通过发布前 clip 实现，应用侧 delta 默认关闭。
+TAG 提供仓库内可审计的五指位置匹配和条件式捏合精修；DexPilot 提供外部 vector-graph 路径。当前输出机制已经简化为：TAG 不再增加 output EMA，DexPilot wrapper 默认直通，启动阶段使用 ramp，operational command floor 通过发布前 clip 实现，应用侧 command-to-command delta clamp 已移除。
 
 需要长期保持清晰的不是某个默认数字，而是以下边界：
 

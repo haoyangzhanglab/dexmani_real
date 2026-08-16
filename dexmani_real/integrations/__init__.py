@@ -1,4 +1,4 @@
-"""Model-repository integrations (execution doc §86).
+"""Model-repository integrations.
 
 ``dexmani_real/deployment`` must never import from this package; the dependency
 direction is integration -> deployment. Each integration encapsulates one model

@@ -408,11 +408,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
         gate = _build_safety_gate(cfg, planner)
-        # SafetyGate validates well-formedness, joint limits, and workspace
-        # only.  Collision and transition checks were removed (2026-08-12);
-        # xArm Mode 6 firmware provides the hardware backstop (C22/C31/C24).
-        # Collision-free homing paths are planned independently through
-        # plan_joint_home_path / plan_band_alignment_path.
         recorder = RecorderClient(shared) if cfg.runtime.policy.recording_enabled else None
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
@@ -1388,9 +1383,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             arm_cmd_raw = np.asarray(ik_result.qpos, dtype=np.float64).copy()
             arm_cmd = arm_cmd_raw.copy()
 
-            # Keep IK output inside the firmware-accepted joint limits.
-            # Velocity/acceleration smoothing is Mode 6 firmware's job; the
-            # application-layer delta clip was removed (D1 resolved).
+            # Keep IK output inside the firmware-accepted joint limits;
+            # velocity/acceleration smoothing is Mode 6 firmware's job.
             arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
             # Pre-flight checks specific to teleop command assembly. Joint
