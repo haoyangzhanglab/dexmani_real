@@ -16,8 +16,7 @@ from dexmani_real.planning import (PlanningProfile, Pose, TeleopProfile,
                                    XArm7MotionPlanner, XArm7PlannerConfig)
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import (normalize_quat_wxyz,
-                                              quat_wxyz_to_rot6d,
-                                              rot6d_to_quat_wxyz)
+                                              quat_wxyz_to_rot6d)
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.safety import (CommandPublishResult,
                                         CommandPublishStatus, GateRejectCode,
@@ -52,8 +51,7 @@ from dexmani_real.utils.hand_health import (validate_arm_feedback,
                                             validate_hand_feedback)
 from dexmani_real.teleop.recording_session import (
     QuitRecordingDecision, await_quit_recording_decision)
-from dexmani_real.teleop.safety import (_contact_stall_detected,
-                                        _do_configured_teleop_home,
+from dexmani_real.teleop.safety import (_do_configured_teleop_home,
                                         _reset_mapper_from_frames)
 from dexmani_real.teleop.snapshot import (CameraFreshnessTracker,
                                           _read_arm_state, _read_camera_frame,
@@ -364,6 +362,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
     joint_lower_rad = np.asarray(cfg.runtime.arm.joint_limit_lower, dtype=np.float64)
     joint_upper_rad = np.asarray(cfg.runtime.arm.joint_limit_upper, dtype=np.float64)
+    arm_max_delta_rad_per_tick = cfg.runtime.policy.arm_max_delta_rad_per_tick
+    if arm_max_delta_rad_per_tick is not None:
+        arm_max_delta_rad_per_tick = np.broadcast_to(
+            np.asarray(arm_max_delta_rad_per_tick, dtype=np.float64), joint_lower_rad.shape
+        )
     hand_home_qpos_rad = np.deg2rad(np.asarray(cfg.runtime.hand.home_qpos_deg, dtype=np.float64))
     hand_qpos_lower_rad = np.asarray(cfg.runtime.hand.qpos_min_rad, dtype=np.float64)
     hand_qpos_upper_rad = np.asarray(cfg.runtime.hand.qpos_max_rad, dtype=np.float64)
@@ -1179,84 +1182,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             policy_map_time_ms = (time.perf_counter() - _map_t0) * 1000.0
             stage_timer.mark("map")
 
-            # Intentional tabletop contact is allowed. If a downward target has
-            # accumulated substantial joint error while the arm is no longer
-            # closing that error, discard the buried target and re-anchor VR at
-            # the measured pose. This stops continued pushing without a table
-            # exclusion zone or any speed/acceleration change.
-            if (
-                cfg.runtime.policy.contact_stall_enabled
-                and arm_state is not None
-                and _contact_stall_detected(
-                    arm_qpos,
-                    arm_state["qvel"][0],
-                    ctx.prev_qpos_cmd,
-                    arm_state["eef_pos"][0],
-                    target_pos,
-                    table_z_surface_m=cfg.runtime.arm.table_z_surface_m,
-                    table_context_height_m=cfg.runtime.policy.contact_stall_table_context_height_m,
-                    min_downward_target_m=cfg.runtime.policy.contact_stall_min_downward_target_m,
-                    tracking_error_rad=cfg.runtime.policy.contact_stall_tracking_error_rad,
-                    max_closing_speed_rad_s=cfg.runtime.policy.contact_stall_max_closing_speed_rad_s,
-                )
-            ):
-                command_error = ctx.prev_qpos_cmd - arm_qpos
-                closing_speed = float(
-                    np.dot(arm_state["qvel"][0], command_error) / max(np.linalg.norm(command_error), 1e-12)
-                )
-                logger.warning(
-                    "teleop_loop: downward contact stall — resync measured pose "
-                    "(tracking_err=%.3frad closing_speed=%.3frad/s eef_z=%.3fm)",
-                    float(np.max(np.abs(command_error))),
-                    closing_speed,
-                    float(arm_state["eef_pos"][0][2]),
-                )
-                hold_qpos = arm_qpos.copy()
-                arm_mapper.reset(
-                    wrist_pos=vr_frame["wrist_pos"],
-                    wrist_quat_wxyz=vr_frame["wrist_quat_wxyz"],
-                    eef_pos=arm_state["eef_pos"][0],
-                    eef_quat_wxyz=rot6d_to_quat_wxyz(arm_state["eef_rot6d"][0]),
-                )
-                ctx.ema_prev_pos = ctx.ema_prev_quat = None
-                ctx.prev_qpos_cmd = hold_qpos
-                hold_result = _safe_arm_queue_put(
-                    shared,
-                    {"qpos": hold_qpos, "is_hold": True},
-                    timeout=cfg.runtime.policy.action_prepare_timeout_s,
-                    observation_id=int(vr_frame["ring_sequence"]),
-                    observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                    safety_gate=gate,
-                    hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
-                )
-                published_hold = hold_result.candidate
-                if not hold_result.succeeded or published_hold is None:
-                    logger.error("teleop_loop: contact hold publish failed: %s", hold_result.reason)
-                    shared.error_state.value = True
-                    break
-                if recording_active:
-                    _record_held(
-                        recorder,
-                        arm_state,
-                        hold_qpos,
-                        ctx.prev_hand_qpos,
-                        vr_frame,
-                        cam,
-                        hand_state=hand_state,
-                        hand_tactile=hand_tactile,
-                        frame_status=_FRAME_SAFETY_REJECT,
-                        arm_qpos_sent=hold_qpos.copy(),
-                        target_eef_pos=_last_target_eef_pos,
-                        target_eef_rot6d=_last_target_eef_rot6d,
-                        hand_fk=_hand_fk,
-                        T_eef_handbase_pos=_T_eef_handbase_pos,
-                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
-                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-                        shared=shared,
-                        action_candidate=published_hold,
-                    )
-                continue
-
             # Compute the hand command first so the arm IK collision model sees
             # the current-frame (post-shaping) hand pose, not the previous
             # frame's applied command.  Hand-only motion stays independent of
@@ -1386,6 +1311,24 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             # Keep IK output inside the firmware-accepted joint limits;
             # velocity/acceleration smoothing is Mode 6 firmware's job.
             arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
+
+            # Arm delta-clip fallback: cap the command-to-command joint step so
+            # a distant IK solution (multi-seed fallback / nullspace jump)
+            # degrades to a bounded ramp instead of an incoherent jerk. This is
+            # NOT application-side interpolation — it edits the single Mode-6
+            # endpoint per grid tick and Mode 6 still owns trajectory
+            # smoothing. compute_qpos_delta wraps J1/J3/J5/J7 into (-pi, pi],
+            # so crossing the +-pi seam is never mistaken for a ~2pi jump, and
+            # re-adding keeps the command in prev_qpos_cmd's unwrapped frame.
+            if (
+                arm_max_delta_rad_per_tick is not None
+                and ctx.prev_qpos_cmd is not None
+                and np.all(np.isfinite(ctx.prev_qpos_cmd))
+            ):
+                _arm_delta = planner.compute_qpos_delta(arm_cmd, ctx.prev_qpos_cmd)
+                _arm_delta = np.clip(_arm_delta, -arm_max_delta_rad_per_tick, arm_max_delta_rad_per_tick)
+                arm_cmd = ctx.prev_qpos_cmd + _arm_delta
+                arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
             # Pre-flight checks specific to teleop command assembly. Joint
             # limits and workspace are enforced once by SafetyGate.

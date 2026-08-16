@@ -82,7 +82,7 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 |---|---|---|
 | VR 采集 | `examples/collect_teleop.py` | `teleop/loop.py` → `planning/`、`robot/`、`recording/`（实验生命周期自包含在 examples 中）|
 | 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 松键推进 generation / 命令静默 / 实测位姿重锚 → 安全动作协议 |
-| Episode 回放 | `examples/replay_episode.py` | 自包含脚本；默认 dry-run；`--live` 会重新执行密集预检 |
+| Episode 回放 | `examples/replay_episode.py` | 自包含脚本；默认 live 完整回放并产出结果；`--dry-run` 仅离线校验 |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | `examples/visualize_episode.py` | Rerun 3D episode 可视化；`python examples/visualize_episode.py <episode>` |
 
@@ -106,7 +106,7 @@ C 暂停期间到达，它们不会重复推进 generation，但会立即取消 
 不二次推进 generation。State 4 只用于启动时的 DISARMED、FAULT、
 紧停后备、全局停止或故障打断的回零路径，以及最终验证式退出。
 
-`is_hold` endpoint 并未从整个系统删除：IK/映射/工作空间拒绝、接触 stall 等运行期安全回退仍可显式
+`is_hold` endpoint 并未从整个系统删除：IK/映射/工作空间拒绝等运行期安全回退仍可显式
 保持既有安全目标。这些分支不属于普通暂停。
 
 ### 录制事务与时间语义
@@ -148,7 +148,7 @@ python -m compileall -q dexmani_real examples
 ```
 
 > [!WARNING]
-> `examples/` 下的所有入口都可能影响硬件。不要仅为“试一下”而运行遥操作、回放、标定或设备诊断；执行前应确认工作空间清空、设备状态正常，并获得相应操作授权。`replay_episode.py` 默认为离线检查，但 `--live` 会跨越硬件安全边界。
+> `examples/` 下的所有入口都可能影响硬件。不要仅为“试一下”而运行遥操作、回放、标定或设备诊断；执行前应确认工作空间清空、设备状态正常，并获得相应操作授权。`replay_episode.py` 默认会跨越硬件安全边界，重新执行完整轨迹；仅 `--dry-run` 是离线检查。
 
 ## 项目地图：`dexmani_real`
 
@@ -179,7 +179,7 @@ python -m compileall -q dexmani_real examples
 | `planning/collision_model.py` | 基于 Pinocchio 的 xArm7+XHand 自碰撞/环境碰撞模型；把标定桌面构造成倾斜碰撞几何，允许基座安装接触，并提供真实网格距离与路径段检测。 |
 | `planning/constants.py` | 集中定义 XHand SDK 关节序与 URDF/Pinocchio 关节序之间的重排常量。 |
 | `planning/hand_kinematics.py` | 用 Pinocchio 计算手部正向运动学和五指指尖位置，并处理关节顺序重映射。 |
-| `planning/ik.py` | 遥操作位置 IK 求解器：确定性种子、快速接受、多候选回退、误差/碰撞检查与零空间优化。 |
+| `planning/ik.py` | 遥操作位置 IK 求解器：确定性种子、快速接受、多候选回退（归一化可操作度与位姿误差加权评分）、误差/碰撞检查、零空间优化，并按拒绝门输出结构化失败分类（unreachable/delta/collision/…）。 |
 | `planning/ik_candidates.py` | 生成、过滤、评分和规范化 IK 候选，输出结构化拒绝原因诊断。 |
 | `planning/kinematics.py` | 提供不依赖 MPlib 的臂 FK，以及带 MPlib 集成的完整 xArm7 运动学/雅可比能力。 |
 | `planning/path_utils.py` | 关节路径插值、稠密化、角度等价包裹，以及两阶段回零和 band 对齐路径规划。 |
@@ -236,7 +236,7 @@ python -m compileall -q dexmani_real examples
 
 ### `examples/replay_episode.py` — 检查、授权与受控回放
 
-Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.py` 中（约 2000 行）。默认执行离线检查（dry-run）；`--live --source sent` 跨越硬件安全边界，在启动 arm/hand worker 前执行密集几何和来源预检，通过 `SharedStorage` 回放轨迹，捕获回放状态并计算关节/末端跟踪一致性指标与时间延迟。
+Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.py` 中（约 2000 行）。默认执行 live 完整回放：跨越硬件安全边界，在启动 arm/hand worker 前执行密集几何和来源预检，通过 `SharedStorage` 回放完整 `sent` 轨迹，捕获回放状态并计算关节/末端跟踪一致性指标与时间延迟；`--dry-run` 退化为纯离线检查。
 
 ### `robot/` — xArm7、XHand 与安全状态
 
@@ -328,12 +328,12 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/collect_teleop.py` | — | 标准 VR 遥操作与数据采集入口；实验生命周期自包含；会启动真实设备 worker。 |
 | `examples/run_policy.py` | `deployment.lifecycle` | learned-policy 部署入口：argparse → 解析 runtime/deployment 配置 → 运行生命周期 → 退出码；薄 CLI，无模型/调度/安全/存储逻辑。 |
 | `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键推进 generation 后停止发布，控制器自然完成最后一个已接受 endpoint，空闲期间持续从实测关节/FK 重建命令基准；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
-| `examples/replay_episode.py` | — | episode 检查/回放入口；默认 dry-run，`--live` 会在启动 worker 前执行密集预检，退出时推进 generation 并停止发布。 |
+| `examples/replay_episode.py` | — | episode 回放入口；默认 live 完整回放，`--dry-run` 仅离线校验；退出时推进 generation 并停止发布。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
 | `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
-| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认只读（枚举/读取/打印），动作需 `--move` 加人工确认；预设动作按生产命令包络裁剪。 |
+| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认运行 home + 预设动作（枚举/读取/打印后直接动作），无 CLI 参数门控；预设动作按生产命令包络裁剪。 |
 | `examples/visualize_episode.py` | — | 离线 Rerun 3D 可视化；读取 HDF5 episode 并展示点云、图像、动作、触觉和元数据；无硬件控制。 |
 
 ## 配置、资源与延伸文档

@@ -75,6 +75,17 @@ class IKCandidateManager:
     def call_mplib_ik(
         self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
     ) -> tuple[str, Any]:
+        # MPlib semantics (installed mplib/planner.py): return_closest only
+        # re-selects among q_goals that already converged within threshold; a
+        # CLIK solution that converges above threshold is discarded ("IK Failed!
+        # Distance ... greater than threshold") and the qpos is lost. So
+        # return_closest does NOT rescue near-miss solves. threshold=1e-3 is
+        # deliberately far tighter than the downstream FK pose-error gate
+        # (max_pose_error_pos_m / max_pose_error_rot_rad); any future near-miss
+        # acceptance must raise threshold, with the downstream FK gate as the
+        # authority. n_init_qpos restarts MPlib from whole-space random
+        # configurations (not local perturbations), so it trades basin
+        # diversity for extra solve cost.
         return self.mp_planner.IK(
             goal_pose=self.kin.to_mplib_pose(target_pose_base),
             start_qpos=seed_qpos,

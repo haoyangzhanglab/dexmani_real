@@ -204,7 +204,14 @@
       "Bash(echo \"exit: $?\")",
       "Bash(echo \"EXIT_CODE=$?\")",
       "Bash(PYTHONPATH=. python3 *)",
-      "Bash(PYTHONPATH=. conda run *)"
+      "Bash(PYTHONPATH=. conda run *)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest tests/test_arm_sdk.py -q)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest tests/test_arm_sdk.py -v)",
+      "Bash(echo \"=== HELP EXIT=$? ===\")",
+      "Bash(echo \"no-episode EXIT=$?\")",
+      "Bash(echo \"dry-run+output EXIT=$?\")",
+      "Bash(xargs -I{} sh -c 'grep -n \"error_state.value *= *True\" \"{}\"')",
+      "Bash(pdftotext -layout \"/home/zhanghaoyang/Desktop/硬件/Xhand/SDK/C++/XHAND SDK接口说明文档.pdf\" sdk_cpp.txt)"
     ]
   }
 }

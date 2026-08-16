@@ -190,28 +190,37 @@ class PlanningProfile:
 class TeleopProfile:
     """Online teleoperation IK/servo configuration."""
 
-    max_ik_jump_deg: tuple[float, ...] = (90, 90, 90, 90, 90, 90, 90)
-    # max_ik_jump_deg is a discontinuity guard, not a velocity clamp. arm_loop
-    # passes speed/acceleration limits to Mode 6; firmware owns smoothing.
+    # Per-tick joint jump gate (rad): a candidate whose wrapped delta vs the
+    # previous command exceeds this is rejected (hold), so an IK branch switch
+    # degrades to a smooth Mode-6 finish instead of an executed jump. It is a
+    # discontinuity guard, not a velocity clamp — firmware owns smoothing.
+    max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
 
     # Skip extra seeds when the first valid solution is near measured state.
-    position_ik_fast_accept_rad: float = np.deg2rad(15.0)
+    position_ik_fast_accept_rad: float = np.deg2rad(8.0)
 
     # Multi-seed scoring balances motion, manipulability, limits, and pose accuracy.
     position_ik_num_random_seeds: int = 3
     position_ik_seed_offset_deg: float = 5.0
     teleop_ik_seed: int | None = 42
-    position_ik_manipulability_weight: float = 0.05
+    # Multiplies a manipulability term normalized to the measured posture's
+    # conditioning (unitless, bounded [0, 1]) rather than raw Yoshikawa μ —
+    # see TeleopIKSolver._score_candidate for the normalization.
+    position_ik_manipulability_weight: float = 0.02
     position_ik_limit_penalty_weight: float = 0.01
-    position_ik_velocity_weight: float = 0.03
-    position_ik_pose_accuracy_weight: float = 0.05
+    position_ik_velocity_weight: float = 0.25
+    position_ik_pose_accuracy_weight: float = 0.1
+    # Rotation residuals are the user-perceived wrist-orientation tracking axis;
+    # weight them separately from position so orientation tracking can be tuned
+    # independently. Keep <= 1 to avoid cross-basin churn within the jump gate.
+    position_ik_pose_rot_weight: float = 0.5
     # Zero disables hard rejection by Yoshikawa manipulability.
     position_ik_min_manipulability: float = 0.0
     # Dampen the heavy base/shoulder while leaving wrist joints responsive.
-    velocity_joint_weights: tuple[float, ...] | None = (5.0, 1.5, 0.8, 0.5, 0.2, 0.3, 0.1)
+    velocity_joint_weights: tuple[float, ...] | None = (10.0, 4.0, 2.0, 1.0, 0.5, 0.6, 0.1)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "TeleopProfile":
@@ -219,7 +228,7 @@ class TeleopProfile:
         return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
     # Range-normalized weights keep the base stable and favor wrist motion.
-    joint_weights: tuple[float, ...] = (3.0, 1.2, 1.0, 0.5, 0.5, 0.8, 0.3)
+    joint_weights: tuple[float, ...] = (4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35)
 
     # Post-IK null-space projection that adjusts the redundant DOF to repel
     # joints from their limits while preserving the EEF pose to first order

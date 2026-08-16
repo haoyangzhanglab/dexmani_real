@@ -475,10 +475,11 @@ class HandParams:
     ki: int = 0
     kd: int = 0
 
-    # Per-joint torque (current) limit in mA. Index abduction (J3) is raised
-    # to 360 mA to handle sideways loading; all other joints use 300 mA.
+    # Per-joint torque (current) limit in mA. Thumb bend (J0) and index
+    # abduction (J3) are raised to 360 mA (thumb opposition loading during
+    # grasp; index sideways loading); all other joints use 300 mA.
     tor_max_ma: tuple[int, ...] = (
-        300,
+        360,
         300,
         300,
         360,
@@ -631,15 +632,13 @@ class PolicyParams:
     ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
     ik_nullspace_step_rate_deg_s: float = 50.0
 
-    # ── Contact-stall resync ──
-    # This is not a table exclusion zone. Near the tabletop, a downward target
-    # is resynchronised to measured pose only when the previous Mode-6 joint
-    # target has accumulated error and the arm is no longer closing that error.
-    contact_stall_enabled: bool = True
-    contact_stall_table_context_height_m: float = 0.18
-    contact_stall_min_downward_target_m: float = 0.003
-    contact_stall_tracking_error_rad: float = 0.18
-    contact_stall_max_closing_speed_rad_s: float = 0.05
+    # ── Arm motion coherence ──
+    # Command-to-command per-tick joint step bound (rad). A safety fallback,
+    # not interpolation: it caps the single Mode-6 endpoint per grid tick so an
+    # IK jump degrades to a bounded ramp; Mode 6 still owns trajectory
+    # smoothing. 8 deg/tick at 16 Hz ~ 128 deg/s, just above the 120 deg/s
+    # Mode-6 trajectory speed so smooth following is never clipped. None disables.
+    arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
 
     # ── Hand retargeting ──
     hand_enabled: bool = True
@@ -693,17 +692,11 @@ class PolicyParams:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
         if not np.isfinite(self.hand_disconnect_timeout_s) or self.hand_disconnect_timeout_s <= 0:
             raise ValueError("hand_disconnect_timeout_s must be finite and positive")
-        if not np.isfinite(self.contact_stall_table_context_height_m) or self.contact_stall_table_context_height_m <= 0:
-            raise ValueError("contact_stall_table_context_height_m must be finite and > 0")
-        if not np.isfinite(self.contact_stall_min_downward_target_m) or self.contact_stall_min_downward_target_m <= 0:
-            raise ValueError("contact_stall_min_downward_target_m must be finite and > 0")
-        if not np.isfinite(self.contact_stall_tracking_error_rad) or self.contact_stall_tracking_error_rad <= 0:
-            raise ValueError("contact_stall_tracking_error_rad must be finite and > 0")
         if (
-            not np.isfinite(self.contact_stall_max_closing_speed_rad_s)
-            or self.contact_stall_max_closing_speed_rad_s < 0
+            self.arm_max_delta_rad_per_tick is not None
+            and (not np.isfinite(self.arm_max_delta_rad_per_tick) or self.arm_max_delta_rad_per_tick <= 0)
         ):
-            raise ValueError("contact_stall_max_closing_speed_rad_s must be finite and >= 0")
+            raise ValueError("arm_max_delta_rad_per_tick must be finite and > 0 or None")
 
 
 @dataclass(frozen=True)

@@ -114,6 +114,18 @@ class TeleopIKSolver:
         fast_accept_rad = profile.position_ik_fast_accept_rad
         weights = self.ik_mgr.profile_array(profile.joint_weights, "joint_weights")
 
+        # Baseline manipulability at the measured posture, computed once per
+        # solve tick. Normalizes the scoring term so a candidate is penalized
+        # relative to the current posture's conditioning rather than by raw
+        # (unit-mixed, posture-dependent) Yoshikawa magnitude.
+        try:
+            mu_current = self.kin.compute_manipulability(current_qpos)
+        except (ValueError, RuntimeError):
+            # Non-finite measured qpos should never reach here (the caller
+            # validates arm-state finiteness), but fail closed to a constant
+            # term rather than crashing the teleop loop.
+            mu_current = 0.0
+
         seeds = self._make_teleop_seeds(previous_qpos_cmd, current_qpos, profile)
 
         attempts: list[str] = []
@@ -130,7 +142,18 @@ class TeleopIKSolver:
             )
             _solve_ms = (time.perf_counter() - _tik0) * 1000.0
             if not is_mplib_success(status) or raw_qpos is None:
-                attempts.append(f"{seed_name}:mplib_failed({_solve_ms:.1f}ms)")
+                # Distinguish MPlib failure modes (telemetry-only — every case
+                # yields raw_qpos=None and holds identically). A CLIK solution
+                # that converged above threshold ("Distance ... greater than
+                # threshold") or was rejected internally ("Cannot find valid
+                # solution") is not the same as a non-convergent solve.
+                if "Cannot find valid solution" in status:
+                    tag = "mplib_no_solution"
+                elif "Distance" in status:
+                    tag = "mplib_distance_fail"
+                else:
+                    tag = "mplib_failed"
+                attempts.append(f"{seed_name}:{tag}({_solve_ms:.1f}ms)")
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
@@ -213,7 +236,16 @@ class TeleopIKSolver:
 
             attempts.append(f"{seed_name}:ok({_solve_ms:.1f}ms)")
 
-            if seed_name == "prev_cmd" and hw_dist <= fast_accept_rad:
+            if (
+                seed_name == "prev_cmd"
+                and hw_dist <= fast_accept_rad
+                # Fast-accept only when the prev_cmd-basin solution genuinely
+                # tracks the (possibly moved) target; otherwise fall through to
+                # multi-seed scoring so a better-tracking candidate can win.
+                # pos_err/rot_err are already computed above (never a new gate).
+                and pos_err <= 0.5 * profile.max_pose_error_pos_m
+                and rot_err <= 0.5 * profile.max_pose_error_rot_rad
+            ):
                 return qpos, {"method": "position_ik", "seed": seed_name, "attempts": attempts}
 
             score = self._score_candidate(
@@ -224,6 +256,7 @@ class TeleopIKSolver:
                 qpos=qpos,
                 previous_qpos_cmd=previous_qpos_cmd,
                 profile=profile,
+                mu_current=mu_current,
             )
             candidates.append((qpos.copy(), seed_name, score, mu))
 
@@ -239,7 +272,11 @@ class TeleopIKSolver:
                 "attempts": attempts,
             }
 
-        return None, {"method": "position_ik", "failure_reason": f"all failed: {attempts}"}
+        return None, {
+            "method": "position_ik",
+            "failure_reason": f"all failed: {attempts}",
+            "attempts": attempts,
+        }
 
     def _validate_ik_candidate(
         self,
@@ -308,11 +345,13 @@ class TeleopIKSolver:
         qpos: np.ndarray,
         previous_qpos_cmd: np.ndarray,
         profile: TeleopProfile,
+        mu_current: float,
     ) -> float:
         """Score an IK candidate (lower is better).
 
         = weighted_joint_distance + velocity_weight*velocity_dist
-          - manipulability_weight*mu + limit_penalty_weight*penalty + pose_accuracy_weight*pose_cost.
+          - manipulability_weight*normalized_mu + limit_penalty_weight*penalty
+          + pose_accuracy_weight*pose_cost.
         """
         limit_penalty = self.ik_mgr.joint_limit_penalty(qpos, self.ik_mgr.joint_limits)
 
@@ -321,14 +360,19 @@ class TeleopIKSolver:
         )
         velocity_dist = self.ik_mgr.weighted_joint_distance(qpos, previous_qpos_cmd, vel_weights)
 
-        pose_cost = pos_err / max(profile.max_pose_error_pos_m, 1e-6) + rot_err / max(
-            profile.max_pose_error_rot_rad, 1e-6
+        # Normalize raw Yoshikawa manipulability to the measured posture so the
+        # term is unitless and bounded to [0, 1]; raw mu is posture-dependent
+        # and otherwise too small (weight 0.02) to ever re-rank candidates.
+        normalized_mu = min(manipulability / max(mu_current, 1e-9), 1.0)
+
+        pose_cost = pos_err / max(profile.max_pose_error_pos_m, 1e-6) + profile.position_ik_pose_rot_weight * (
+            rot_err / max(profile.max_pose_error_rot_rad, 1e-6)
         )
 
         return (
             weighted_dist
             + profile.position_ik_velocity_weight * velocity_dist
-            - profile.position_ik_manipulability_weight * manipulability
+            - profile.position_ik_manipulability_weight * normalized_mu
             + profile.position_ik_limit_penalty_weight * limit_penalty
             + profile.position_ik_pose_accuracy_weight * pose_cost
         )
@@ -346,30 +390,68 @@ class TeleopIKSolver:
         return False
 
     @staticmethod
-    def _build_diagnostic(report: dict[str, Any]) -> dict[str, Any]:
-        """Build structured IK failure diagnostic."""
-        diagnostic: dict[str, Any] = {"classification": "unknown", "summary": ""}
+    def _attempt_tag(attempt: str) -> str:
+        """Extract the gate/failure tag from an attempt string ``seed:tag(...)``."""
+        if ":" not in attempt:
+            return attempt
+        return attempt.split(":", 1)[1].split("(", 1)[0]
 
+    @classmethod
+    def _classify_attempts(cls, attempts: list[str]) -> str:
+        """Classify a failed IK run from its per-attempt tags.
+
+        ``unreachable`` is reserved for when *every* seed failed to converge.
+        Otherwise the operative gate tag is reported, so holds separate into
+        coherence (delta), collision, hardware-distance, joint-limit,
+        pose-error, and near-miss buckets instead of collapsing to
+        ``unreachable``.
+        """
+        tag_set = {cls._attempt_tag(a) for a in attempts}
+        if not tag_set:
+            return "unknown"
+        non_convergent = {"mplib_failed", "mplib_no_solution", "nan_qpos"}
+        if tag_set <= non_convergent:
+            return "unreachable"
+        if tag_set & {"jump", "elbow_flip", "branch_jump_l2"}:
+            return "delta"
+        if tag_set & {"collision", "collision_check_failed"}:
+            return "collision"
+        if tag_set & {"hw_dist", "band_switch"}:
+            return "hw_dist"
+        if "limits" in tag_set:
+            return "limits"
+        if "pose_err" in tag_set:
+            return "pose_error"
+        if "manipulability" in tag_set:
+            return "manipulability"
+        if "mplib_distance_fail" in tag_set:
+            return "near_miss"
+        return "all_filtered"
+
+    @classmethod
+    def _build_diagnostic(cls, report: dict[str, Any]) -> dict[str, Any]:
+        """Build structured IK failure diagnostic.
+
+        Classifies from the per-attempt tags (``report["attempts"]``) rather
+        than scanning the free-form ``failure_reason`` string. The previous
+        string-scan was dead: a ``:ok`` attempt always precedes a successful
+        return, so the None path can only carry gate/failure tags, and every
+        hold collapsed to ``unreachable`` (the ``all_filtered`` branch was
+        unreachable).
+        """
+        attempts = report.get("attempts")
+        if attempts is None or isinstance(attempts, str):
+            # Fallback for reports assembled without a structured attempts
+            # list: classify the failure_reason string best-effort, defaulting
+            # to a no-op list so downstream classification degrades to
+            # "unknown" rather than misreading a bare reason string.
+            attempts = []
+        classification = cls._classify_attempts(list(attempts))
         failure_reason = str(report.get("failure_reason", ""))
-        if "all failed" in failure_reason:
-            attempts_str = str(report.get("attempts", failure_reason))
-            if "mplib_failed" in attempts_str and "ok" not in attempts_str:
-                diagnostic["classification"] = "unreachable"
-            elif "ok" in attempts_str:
-                diagnostic["classification"] = "all_filtered"
-            else:
-                diagnostic["classification"] = "unreachable"
-        elif "mplib_failed" in failure_reason:
-            diagnostic["classification"] = "unreachable"
-        elif "pose_err" in failure_reason:
-            diagnostic["classification"] = "pose_error"
-        elif "jump" in failure_reason:
-            diagnostic["classification"] = "delta"
-        else:
-            diagnostic["classification"] = "other"
-
-        diagnostic["summary"] = f"Position IK [{diagnostic['classification']}]: {failure_reason}"
-        return diagnostic
+        return {
+            "classification": classification,
+            "summary": f"Position IK [{classification}]: {failure_reason}",
+        }
 
     def _check_teleop_collision_gate(
         self,
@@ -580,4 +662,14 @@ def apply_nullspace_optimization(
     if dq_max > step_size_rad and dq_max > 1e-12:
         dq *= step_size_rad / dq_max
 
-    return qpos + dq
+    qpos_new = qpos + dq
+    # Guard: the rank-1 null-space projector can push a near-limit joint across
+    # its hard limit (dq is clamped only by its max element, never per-joint),
+    # which the post-nullspace limit_violation gate would turn into a false hold
+    # of an otherwise valid candidate. Skip the refinement on those frames
+    # rather than invalidate the candidate. tol matches limit_violation
+    # (ik_candidates.py) so a joint landing within (0, 1e-5) past the limit
+    # cannot slip through this guard only to fail the downstream gate.
+    if np.any(qpos_new < joint_limits[:, 0] - 1e-5) or np.any(qpos_new > joint_limits[:, 1] + 1e-5):
+        return qpos
+    return qpos_new

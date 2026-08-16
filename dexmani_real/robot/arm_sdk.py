@@ -196,6 +196,38 @@ def _read_live_error_code(arm_api: Any) -> int:
     return int(values[0])
 
 
+# ── Controller error descriptions (startup diagnostics) ──
+#
+# A startup controller error is never cleared implicitly (see arm_loop), so the
+# operator must act before the next run.  The bare vendor code ("C2") is not
+# actionable — these mirror the vendor ``ControllerErrorCodeMap`` titles plus a
+# recovery action, so the startup log states both the fault and what to do.
+
+_CONTROLLER_ERROR_HELP: dict[int, str] = {
+    1: "Emergency Stop button pressed — release the E-stop button, then re-enable the robot",
+    2: "Emergency IO of the control box triggered — ground the 2 EI pins, then re-enable the robot",
+    3: "Three-state switch E-stop pressed — release the three-state switch, then re-enable the robot",
+    10: "servo motor error",
+    11: "servo motor 1 error",
+    12: "servo motor 2 error",
+    13: "servo motor 3 error",
+    14: "servo motor 4 error",
+    15: "servo motor 5 error",
+    16: "servo motor 6 error",
+    17: "servo motor 7 error",
+    21: "kinematic error",
+    22: "self-collision error",
+    23: "joints angle exceed limit",
+    24: "speed exceeds limit",
+    31: "collision caused abnormal current",
+}
+
+
+def describe_controller_error(code: int) -> str:
+    """Return a human-readable description for a controller error code."""
+    return _CONTROLLER_ERROR_HELP.get(int(code), "controller error")
+
+
 # ── Controller state transitions (leaf helpers shared by arm_loop + homing) ──
 #
 # ``get_state()`` / ``get_err_warn_code()`` are synchronous reads; ``arm.mode``
@@ -366,11 +398,12 @@ ACC_COMMAND_CLAMP_RAD_PER_S2: tuple[float, float] = (0.01, 20.0)
 
 
 def _binding_device_limit(value: Any) -> float | None:
-    """Return the most restrictive positive finite reported device limit.
+    """Return the reported device upper limit (max speed/acc).
 
-    ``joint_speed_limit`` / ``joint_acc_limit`` are per-joint report lists; the
-    binding constraint is their minimum.  Returns ``None`` when the report is
-    absent or unusable so the caller falls back to the SDK hard clamp only.
+    ``joint_speed_limit`` / ``joint_acc_limit`` report a ``[min, max]`` pair
+    (``xarm.x3.base``), not a per-joint list; the command upper bound is the
+    ``max`` element.  Returns ``None`` when the report is absent or unusable so
+    the caller falls back to the SDK hard clamp only.
     """
     if value is None:
         return None
@@ -380,7 +413,21 @@ def _binding_device_limit(value: Any) -> float | None:
         finite = [float(v) for v in value if np.isfinite(float(v)) and float(v) > 0.0]
     except (TypeError, ValueError):
         return None
-    return min(finite) if finite else None
+    return max(finite) if finite else None
+
+
+# Floating-point tolerance for the effective-upper-bound comparison.  The
+# reported device limit and the configured value can express the same nominal
+# limit through different float paths (e.g. 900 °/s² = 5π rad/s² arrives as
+# 15.707963267948966 from np.deg2rad but 15.707962989807129 from the firmware),
+# differing by ~1e-8 relative.  A strict ``<=`` refuses a valid config over that
+# rounding noise; the tolerance still rejects real mismatches (≳1e-4 relative).
+_DYNAMICS_UBOUND_RTOL = 1e-6
+
+
+def _exceeds_upper_bound(value: float, upper: float) -> bool:
+    """True when ``value`` is meaningfully above ``upper`` (float-tolerant)."""
+    return value > upper + abs(upper) * _DYNAMICS_UBOUND_RTOL
 
 
 def validate_command_dynamics_intersection(
@@ -397,6 +444,8 @@ def validate_command_dynamics_intersection(
     a missing device report falls back to the SDK hard clamp alone.  Both below
     the lower clamp and above the effective upper bound are refused.
     """
+    speed_lower = SPEED_COMMAND_CLAMP_RAD_PER_S[0]
+    acc_lower = ACC_COMMAND_CLAMP_RAD_PER_S2[0]
     speed_upper = SPEED_COMMAND_CLAMP_RAD_PER_S[1]
     acc_upper = ACC_COMMAND_CLAMP_RAD_PER_S2[1]
     dev_speed = _binding_device_limit(device_speed_limits)
@@ -405,19 +454,19 @@ def validate_command_dynamics_intersection(
         speed_upper = min(speed_upper, dev_speed)
     if dev_acc is not None:
         acc_upper = min(acc_upper, dev_acc)
-    if not (
-        SPEED_COMMAND_CLAMP_RAD_PER_S[0] <= config_speed_rad_per_s <= speed_upper
+    if config_speed_rad_per_s < speed_lower or _exceeds_upper_bound(
+        config_speed_rad_per_s, speed_upper
     ):
         return (
             f"configured speed {config_speed_rad_per_s} rad/s outside the effective "
-            f"command range [{SPEED_COMMAND_CLAMP_RAD_PER_S[0]}, {speed_upper}]"
+            f"command range [{speed_lower}, {speed_upper}]"
         )
-    if not (
-        ACC_COMMAND_CLAMP_RAD_PER_S2[0] <= config_acc_rad_per_s2 <= acc_upper
+    if config_acc_rad_per_s2 < acc_lower or _exceeds_upper_bound(
+        config_acc_rad_per_s2, acc_upper
     ):
         return (
             f"configured mvacc {config_acc_rad_per_s2} rad/s² outside the effective "
-            f"command range [{ACC_COMMAND_CLAMP_RAD_PER_S2[0]}, {acc_upper}]"
+            f"command range [{acc_lower}, {acc_upper}]"
         )
     return None
 

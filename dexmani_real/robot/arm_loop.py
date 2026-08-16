@@ -15,12 +15,12 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.planning.kinematics import ArmFK
-from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import worker_validate_arm
 from dexmani_real.robot.arm_sdk import (
     ArmLoopConfig,
     _read_live_error_code,
     _require_sdk_ok,
+    describe_controller_error,
     enter_mode0,
     enter_mode6,
     read_live_state_and_error,
@@ -487,13 +487,17 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         return
     if _live.error_code != 0:
         logger.error(
-            "arm_loop: startup controller error C%d (warn=%d, state=%d) — "
+            "arm_loop: startup controller error C%d (warn=%d, state=%d): %s — "
             "refusing to clear",
             _live.error_code,
             _live.warn_code,
             _live.state,
+            describe_controller_error(_live.error_code),
         )
-        _publish_startup_fault(f"startup controller error C{_live.error_code}")
+        _publish_startup_fault(
+            f"startup controller error C{_live.error_code}: "
+            f"{describe_controller_error(_live.error_code)}"
+        )
         shared.error_state.value = True
         stop_controller(arm, on_poll=_heartbeat)
         _disconnect_arm(arm)
@@ -849,21 +853,9 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
                         logger.warning("arm_loop: discarded endpoint while controller motion is disabled")
                     else:
                         target = np.asarray(action["qpos_cmd"][0], dtype=np.float64)
-                        try:
-                            target = wrap_nearest_equivalent(
-                                target,
-                                last_qpos,
-                                cfg.joint_limit_lower,
-                                cfg.joint_limit_upper,
-                            )
-                        except ValueError:
-                            # An endpoint that cannot be wrapped is discarded —
-                            # never replaced with a synthetic "hold current pose"
-                            # that Mode 6 would interpret as a real command.
-                            logger.warning(
-                                "arm_loop: discarded endpoint that failed joint wrapping"
-                            )
-                            continue
+                        # 2π-canonicalized by the producer (IK-stage
+                        # canonicalize_qpos at planning/ik.py:147 and :454 against
+                        # arm_state_ring current_qpos); this worker no longer wraps.
                         last_target = target.copy()
                         _sdk_started_s = time.monotonic()
                         try:

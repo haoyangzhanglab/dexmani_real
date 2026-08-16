@@ -182,6 +182,10 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
   a new `run_generation` re-anchors the recorder's next contiguous storage slot;
   its wall-time jump is retained, but no pause-time hold action is synthesized.
 - Mode 6 firmware smooths arm targets. Application-side interpolation is unsafe.
+  The teleop arm path additionally caps the command-to-command per-tick joint
+  delta (`arm_max_delta_rad_per_tick`) as a coherence fallback: it edits the
+  single per-tick Mode-6 endpoint (never inserts intermediate targets), so an
+  IK jump degrades to a bounded ramp rather than an incoherent jerk.
 - Ordinary pause is command quiescence: advance `run_generation`, stop
   publishing, and let Mode 6 finish the last endpoint already accepted by the
   controller. No delayed measured endpoint is sent. Keyboard idle continuously
@@ -194,7 +198,7 @@ VR frame → causal snapshot → ArmWristMapper / hand retargeter → IK candida
   remains reserved for DISARMED, FAULT, e-stop fallback, and verified final
   shutdown.
 - Command quiescence is not a ban on every `is_hold` endpoint. IK/mapping/
-  workspace rejection and contact-stall recovery may still publish an explicit
+  workspace rejection may still publish an explicit
   safe fallback endpoint. Those are active safety/error-recovery actions, not
   ordinary pause behavior.
 - VR transform schema v1 is validated in Main before SharedStorage/process
@@ -233,8 +237,9 @@ aligned samples → RecorderIO → temporary episode + stream verification
   consistent episodes keep schema-v16 validity and expose `min_frames_met=False`;
   replay and visualization warn so downstream training can filter explicitly.
 - `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
-- `examples/replay_episode.py` defaults to dry-run. Live replay reruns fail-closed
-  provenance and dense geometry checks immediately before worker startup.
+- `examples/replay_episode.py` defaults to live replay of the full recorded
+  trajectory; it reruns fail-closed provenance and dense geometry checks
+  immediately before worker startup. `--dry-run` opts into offline validation.
 
 ## 5. Edit recipes
 
@@ -348,13 +353,13 @@ aligned samples → RecorderIO → temporary episode + stream verification
 |---|---|---|
 | `examples/collect_teleop.py` | — | Hardware control; self-contained script; explicit authorization required |
 | `examples/keyboard_teleop.py` | — | Hardware control; self-contained script; measured hand feedback by default |
-| `examples/replay_episode.py` | — | Dry-run by default; `--live` reruns dense preflight; self-contained script |
+| `examples/replay_episode.py` | — | Live by default (full replay + results); `--dry-run` for offline validation; self-contained script |
 | `examples/run_policy.py` | `deployment.lifecycle` | Learned-policy deployment entry; thin CLI wrapper over the shared supervisor |
 | `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |
 | `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |
 | `examples/realsense_record_example.py` | — | Interactive RealSense RGB-D + point-cloud test; hardware read-only by default |
 | `examples/pointcloud_process_example.py` | `sensor/pointcloud_processor.py` | Production point-cloud pipeline diagnostic; explicit confirmation for desk-plane write |
-| `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; read-only by default; motion requires `--move` + confirmation |
+| `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; runs home + preset motion by default; no CLI flags |
 | `examples/visualize_episode.py` | — | Offline Rerun 3D visualization; no hardware control; self-contained script |
 
 ## 8. Completion checklist

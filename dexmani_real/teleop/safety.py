@@ -19,7 +19,6 @@ from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.hand_control import _reset_hand_retargeter
 from dexmani_real.teleop.snapshot import _read_arm_state
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
@@ -75,45 +74,6 @@ def _reset_mapper_from_frames(
         eef_quat_wxyz=rot6d_to_quat_wxyz(eef_rot6d),
     )
     return mapper.is_ready()
-
-
-def _contact_stall_detected(
-    arm_qpos: np.ndarray,
-    arm_qvel: np.ndarray,
-    previous_arm_cmd: np.ndarray,
-    eef_pos: np.ndarray,
-    target_pos: np.ndarray,
-    *,
-    table_z_surface_m: float,
-    table_context_height_m: float,
-    min_downward_target_m: float,
-    tracking_error_rad: float,
-    max_closing_speed_rad_s: float,
-) -> bool:
-    """Detect a blocked downward command without treating the table as forbidden."""
-    qpos = np.asarray(arm_qpos, dtype=np.float64)
-    qvel = np.asarray(arm_qvel, dtype=np.float64)
-    command = np.asarray(previous_arm_cmd, dtype=np.float64)
-    eef = np.asarray(eef_pos, dtype=np.float64)
-    target = np.asarray(target_pos, dtype=np.float64)
-    if qpos.shape != ARM_JOINT_SHAPE or qvel.shape != ARM_JOINT_SHAPE or command.shape != ARM_JOINT_SHAPE:
-        return False
-    if eef.shape != (3,) or target.shape != (3,):
-        return False
-    if not all(np.all(np.isfinite(values)) for values in (qpos, qvel, command, eef, target)):
-        return False
-
-    near_table = eef[2] <= table_z_surface_m + table_context_height_m
-    downward_intent = target[2] <= eef[2] - min_downward_target_m
-    command_error = command - qpos
-    if not near_table or not downward_intent or np.max(np.abs(command_error)) < tracking_error_rad:
-        return False
-
-    error_norm = float(np.linalg.norm(command_error))
-    if error_norm <= 1e-12:
-        return False
-    closing_speed = float(np.dot(qvel, command_error) / error_norm)
-    return closing_speed <= max_closing_speed_rad_s
 
 
 def _do_teleop_home(

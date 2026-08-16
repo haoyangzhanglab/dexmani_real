@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""XHand control example -- standalone vendor diagnostic using raw xhand_controller SDK.
+"""XHand control example -- standalone vendor exercise using raw xhand_controller SDK.
 
 Usage::
 
     conda activate real_robot
-    python examples/xhand_control_example.py              # read-only diagnostic
-    python examples/xhand_control_example.py --move       # add home + preset motion (interactive confirm)
-    python examples/xhand_control_example.py --move --yes # motion without the interactive prompt
+    python examples/xhand_control_example.py              # home + preset motion
 
-Default behaviour is read-only: enumerate, open, identify, and read/print state.
-Motion (home + preset actions) requires the explicit ``--move`` flag plus manual
-confirmation, so the diagnostic never moves the hand as a side effect.
+Default behaviour: enumerate, open, identify, read/print state, then run home +
+preset actions.  The script always moves the hand when it runs -- there is no
+read-only mode and no CLI flag gate.  Keep the workspace clear before running.
 
 Uses the xhand_controller SDK directly -- no dexmani_real runtime dependencies.
 """
 
 from __future__ import annotations
 
-import argparse
 import math
 import sys
 import time
@@ -107,11 +104,14 @@ class PresetActions:
         yield "ok", self.ok
 
 
-# XHand 1 (serial digit "3").
+# XHand 1 (serial digit "3").  Preset angles are kept inside the production
+# command envelope above so the diagnostic never emits a [clip] line: distal
+# joints sit at the 5° anti-clogging lower bound and full-flexion at 109.5°
+# (the rated upper bound is 1.919 rad ≈ 109.95°).
 PRESET_XHAND1 = PresetActions(
-    fist=(11.85, 74.58, 40, -3.08, 106.02, 110, 109.75, 107.56, 107.66, 110, 109.1, 109.15),
-    palm=(0, 80.66, 33.2, 0.00, 5.11, 0, 6.53, 0, 6.76, 4.41, 10.13, 0),
-    v=(38.32, 90, 52.08, 6.21, 2.6, 0, 2.1, 0, 110, 110, 110, 109.23),
+    fist=(11.85, 74.58, 40, -3.08, 106.02, 109.5, 109.75, 107.56, 107.66, 109.5, 109.1, 109.15),
+    palm=(0, 80.66, 33.2, 0.00, 5.11, 5.0, 6.53, 5.0, 6.76, 5.0, 10.13, 5.0),
+    v=(38.32, 90, 52.08, 6.21, 2.6, 5.0, 2.1, 5.0, 109.5, 109.5, 109.5, 109.23),
     ok=(45.88, 41.54, 67.35, 2.22, 80.45, 70.82, 31.37, 10.39, 13.69, 16.88, 1.39, 10.55),
 )
 
@@ -261,24 +261,6 @@ class XHandControlExample:
               f"(error_code={error_struct.error_code} msg={error_struct.error_message})")
         time.sleep(sleep_s)
 
-    def set_mode(self, mode: int) -> None:
-        """Set hand mode (0=powerless, 3=position, 5=powerful)."""
-        self._header(f"Set hand mode -> {mode}")
-        cmd = xhand_control.HandCommand_t()
-        for i in range(_HAND_DOF):
-            fc = cmd.finger_command[i]
-            fc.id = i
-            fc.kp = self._params.kp
-            fc.ki = self._params.ki
-            fc.kd = self._params.kd
-            fc.position = 0.5
-            fc.tor_max = self._params.tor_max
-            fc.mode = mode
-        error_struct = self._device.send_command(self._hand_id, cmd)
-        print(f"  {'OK' if error_struct.error_code == 0 else 'FAILED'}  "
-              f"(error_code={error_struct.error_code})")
-        time.sleep(1.0)
-
     def run_preset_actions(self, actions: PresetActions) -> None:
         """Run preset actions (fist, palm, v, ok) with 1 s dwell each."""
         self._header("Preset actions")
@@ -336,65 +318,24 @@ def _select_preset_actions(serial_number: str) -> PresetActions:
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="XHand standalone diagnostic (read-only by default)."
-    )
-    parser.add_argument(
-        "--move",
-        action="store_true",
-        help="enable motion commands (home + preset actions); otherwise read-only",
-    )
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="confirm motion without the interactive prompt (implies --move)",
-    )
-    return parser.parse_args()
-
-
-def _confirm_motion(skip_prompt: bool) -> None:
-    """Refuse motion until the operator has explicitly acknowledged it."""
-    if skip_prompt:
-        return
-    answer = input(
-        "Motion commands will move the hand. Confirm the workspace is clear "
-        "and type 'yes' to continue: "
-    ).strip()
-    if answer.lower() != "yes":
-        print("Motion aborted.")
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    args = _parse_args()
-    if args.yes and not args.move:
-        print("--yes requires --move (nothing to confirm in read-only mode).")
-        sys.exit(1)
-
     params = HandCommandParams()
     xhand_exam = XHandControlExample(hand_id=0, params=params)
 
     _choose_communication(xhand_exam)  # opens the device (sys.exit(1) on failure)
 
     try:
-        # Identity and diagnostics (read-only, safe).
+        # Identity and diagnostics.
         xhand_exam.read_sdk_version()
         xhand_exam.read_device_info()
         serial_number = xhand_exam.read_serial_number()
         # Cached read: RS485 force_update=True would re-send the last command.
         xhand_exam.read_state(finger_id=5, force_update=False)
 
-        if args.move:
-            _confirm_motion(args.yes)
-            xhand_exam.go_home()
-            actions = _select_preset_actions(serial_number)
-            xhand_exam.run_preset_actions(actions)
-            xhand_exam.go_home()
-        else:
-            print(
-                "\n  Read-only diagnostic complete (motion skipped). "
-                "Re-run with --move to exercise home + preset actions."
-            )
+        # Motion: home, then preset actions, then return home.
+        xhand_exam.go_home()
+        actions = _select_preset_actions(serial_number)
+        xhand_exam.run_preset_actions(actions)
+        xhand_exam.go_home()
     finally:
         xhand_exam.close()

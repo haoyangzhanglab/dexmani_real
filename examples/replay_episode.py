@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Inspect or replay one DexMani HDF5 episode.
+"""Replay one DexMani HDF5 episode on the real robot.
 
 Spawn-only architecture: arm_loop + hand_loop processes with SharedStorage
 and the SafetyState machine. Commands flow through arm_action_q / hand_cmd_ring;
 state is read from arm_state_ring / hand_state_ring. No direct SDK access from
 the main process.
 
-Two modes, both performed by this single self-contained script:
+Live replay is the default: this script reruns dense geometry and provenance
+preflight, spawns arm/hand workers, replays the full recorded joint command
+stream (the exact submitted ``sent`` stream) on the real robot, captures actual
+robot state, and evaluates consistency metrics (joint MAE/RMSE, EEF
+position/orientation error, tracking lag).
 
-- **Dry-run (default)**: offline validation — checks array shapes, finite values,
-  and performs a fast shape-only pass. No hardware, no workers.
-- **Live** (``--live --source sent``): reruns dense geometry and provenance
-  preflight, spawns arm/hand workers, replays the recorded joint commands on the
-  real robot, captures actual robot state, and evaluates consistency metrics
-  (joint MAE/RMSE, EEF position/orientation error, tracking lag).
+Pass ``--dry-run`` for offline validation only — array shapes, finite values,
+and a fast shape-only pass, with no hardware and no workers.
+
+Live replay always replays the recorded hand command stream. If the episode was
+recorded with non-default ``--acc``/``--speed``, pass the same values here so the
+resolved-config provenance matches.
 
 Usage:
     python examples/replay_episode.py episodes/episode_20260729_213332
-    python examples/replay_episode.py episodes/episode_20260729_213332 --max-frames 200
-    python examples/replay_episode.py episodes/episode_20260729_213332 --source sent --live
-    python examples/replay_episode.py episodes/episode_20260729_213332 --source sent --live --output results/my_replay/
+    python examples/replay_episode.py episodes/episode_20260729_213332 --output results/my_replay/
+    python examples/replay_episode.py episodes/episode_20260729_213332 --acc 900 --speed 120
+    python examples/replay_episode.py episodes/episode_20260729_213332 --dry-run
 
 Live replay controls:
     Q     clean exit (save partial results)
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import multiprocessing as mp
 import os
 import sys
@@ -52,6 +57,7 @@ from dexmani_real.config.runtime import (ResolvedRuntimeConfig,
 from dexmani_real.planning import (Pose, TeleopProfile, XArm7MotionPlanner,
                                    XArm7PlannerConfig)
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
                                         planner_action_safety_gate,
                                         publish_hand_home_and_wait_applied,
@@ -111,22 +117,6 @@ _MIN_TRACKING_SEQUENCE_FRAMES = 20
 _SAFETY_REASON_BYTES = 256
 
 _TRACKING_ERROR_PERCENTILE = 95.0
-
-
-def _positive_finite_float(value: str) -> float:
-    """Validate and return a finite positive float for argparse."""
-    parsed = float(value)
-    if not np.isfinite(parsed) or parsed <= 0:
-        raise argparse.ArgumentTypeError(f"must be finite and > 0, got {value!r}")
-    return parsed
-
-
-def _positive_int(value: str) -> int:
-    """Validate and return a positive integer for argparse."""
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError(f"must be > 0, got {value!r}")
-    return parsed
 
 
 def _is_sha256(value: str | None) -> bool:
@@ -194,15 +184,12 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 
 def load_trajectory(
     episode_path: str,
-    max_frames: int | None = None,
     source: str = "cmd",
     *,
     require_live_validity: bool = False,
     require_exact_source: bool = False,
 ) -> TrajectoryData:
     """Load one command trajectory from a schema-v16 episode."""
-    if max_frames is not None and max_frames <= 0:
-        raise ValueError("max_frames must be positive when provided")
     if source not in {"cmd", "sent"}:
         raise ValueError("source must be 'cmd' or 'sent'")
 
@@ -259,8 +246,6 @@ def load_trajectory(
 
         source_frames = int(h5[arm_action_key].shape[0])
         total_frames = source_frames if num_frames_attr == 0 else min(source_frames, num_frames_attr)
-        if max_frames is not None:
-            total_frames = min(total_frames, max_frames)
 
         action_arm_joint = np.asarray(h5[arm_action_key][:total_frames], dtype=np.float64)
         arm_qpos = np.asarray(h5["arm_qpos"][:total_frames], dtype=np.float64)
@@ -328,29 +313,29 @@ class ReplayRecorder:
     Single-threaded (main loop), so no locking is needed.
     """
 
-    def __init__(self, max_frames: int, has_hand: bool = False) -> None:
-        self.max_frames = max_frames
+    def __init__(self, capacity: int, has_hand: bool = False) -> None:
+        self.capacity = capacity
         self.has_hand = has_hand
         self._count = 0
 
-        self.arm_qpos = np.full((max_frames, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.eef_pos = np.full((max_frames, 3), np.nan, dtype=np.float64)
-        self.eef_quat_wxyz = np.full((max_frames, 4), np.nan, dtype=np.float64)
-        self.eef_rot6d = np.full((max_frames, 6), np.nan, dtype=np.float64)
-        self.arm_cmd = np.full((max_frames, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.arm_sent_cmd = np.full((max_frames, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.arm_tracking_error = np.full((max_frames,), np.nan, dtype=np.float64)
-        self.timestamps = np.full((max_frames,), np.nan, dtype=np.float64)
+        self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.eef_pos = np.full((capacity, 3), np.nan, dtype=np.float64)
+        self.eef_quat_wxyz = np.full((capacity, 4), np.nan, dtype=np.float64)
+        self.eef_rot6d = np.full((capacity, 6), np.nan, dtype=np.float64)
+        self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.arm_sent_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.arm_tracking_error = np.full((capacity,), np.nan, dtype=np.float64)
+        self.timestamps = np.full((capacity,), np.nan, dtype=np.float64)
 
         # A rejected frame keeps state/candidate data but leaves arm_sent_cmd NaN.
-        self.flag_safety_reject = np.zeros(max_frames, dtype=bool)
-        self.safety_reject_reason: list[str | None] = [None] * max_frames
+        self.flag_safety_reject = np.zeros(capacity, dtype=bool)
+        self.safety_reject_reason: list[str | None] = [None] * capacity
 
         self.hand_qpos: np.ndarray | None = None
         self.hand_cmd: np.ndarray | None = None
         if has_hand:
-            self.hand_qpos = np.full((max_frames, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
-            self.hand_cmd = np.full((max_frames, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
+            self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
+            self.hand_cmd = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
     def record(
         self,
@@ -376,7 +361,7 @@ class ReplayRecorder:
         """
         if idx < 0:
             raise ValueError("replay frame index must be non-negative")
-        if idx >= self.max_frames:
+        if idx >= self.capacity:
             return
         self.arm_qpos[idx] = arm_qpos
         self.eef_pos[idx] = eef_pos
@@ -685,33 +670,17 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
 # ========================================================================
 
 
-def modeled_hand_actions(
-    trajectory: TrajectoryData,
-    *,
-    no_hand: bool,
-    home_qpos_rad: np.ndarray,
-) -> np.ndarray:
-    """Return the hand action stream used for geometry preflight.
-
-    When a recorded hand action stream is available and *no_hand* is false,
-    returns the recorded actions. Otherwise tiles the configured home pose
-    across all frames so collision/table checks degrade safely.
-    """
-    if not no_hand and trajectory.has_hand:
-        assert trajectory.action_hand_joint is not None
-        return np.asarray(trajectory.action_hand_joint, dtype=np.float64)
-    home = np.asarray(home_qpos_rad, dtype=np.float64)
-    if home.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(home)):
-        raise ValueError(f"configured hand home must be finite shape {HAND_JOINT_SHAPE}")
-    return np.repeat(home[None, :], trajectory.num_frames, axis=0)
+def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
+    """Return the recorded hand action stream used for geometry preflight."""
+    if trajectory.action_hand_joint is None:
+        raise ValueError("episode has no hand action stream; live replay requires recorded hand data")
+    return np.asarray(trajectory.action_hand_joint, dtype=np.float64)
 
 
-def require_explicit_hand_mode(trajectory: TrajectoryData, *, no_hand: bool) -> None:
-    """Fail closed when an episode cannot prove that live hand data was recorded."""
-    if no_hand:
-        return
+def require_explicit_hand_mode(trajectory: TrajectoryData) -> None:
+    """Fail closed when an episode has no recorded hand action stream."""
     if not trajectory.has_hand_actions:
-        raise ValueError("episode has no hand action stream; pass --no-hand only after securing the physical hand")
+        raise ValueError("episode has no hand action stream; live replay requires recorded hand data")
 
 
 def _verify_trajectory_provenance(trajectory: TrajectoryData, *, provenance_sha256: str) -> None:
@@ -746,25 +715,20 @@ def verify_live_replay_preflight(
     trajectory: TrajectoryData,
     runtime: ResolvedRuntimeConfig,
     *,
-    no_hand: bool,
     provenance_sha256: str,
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
-    Checks: hand-mode attestation, provenance (source/config/models), every
+    Checks: hand-data attestation, provenance (source/config/models), every
     adjacent-frame pair via dense sub-step interpolation for workspace,
     self-collision, and table penetration. Called once before worker startup;
     any rejection prevents hardware access entirely.
     """
-    require_explicit_hand_mode(trajectory, no_hand=no_hand)
-    if not no_hand and not bool(runtime.policy.hand_enabled):
-        raise ValueError("runtime policy.hand_enabled=false requires explicit no-hand acknowledgement")
+    require_explicit_hand_mode(trajectory)
+    if not bool(runtime.policy.hand_enabled):
+        raise ValueError("live replay requires policy.hand_enabled=true")
     _verify_trajectory_provenance(trajectory, provenance_sha256=provenance_sha256)
-    modeled_hand = modeled_hand_actions(
-        trajectory,
-        no_hand=no_hand,
-        home_qpos_rad=np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)),
-    )
+    modeled_hand = modeled_hand_actions(trajectory)
     workspace = np.array(
         [
             [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
@@ -906,20 +870,15 @@ class TrajectoryReplayer:
         trajectory: TrajectoryData,
         shared: SharedStorage | None,
         *,
-        speed: float = 1.0,
         dry_run: bool = False,
-        no_hand: bool = False,
-        max_frames: int | None = None,
         runtime: ResolvedRuntimeConfig | None = None,
         health_check: Callable[[], str | None] | None = None,
     ) -> None:
         self.traj = trajectory
         self.shared = shared
-        self.speed = speed
         self.dry_run = dry_run
-        self.no_hand = no_hand
         self.runtime = runtime
-        self.replay_hz = trajectory.fps * speed
+        self.replay_hz = trajectory.fps
         if not np.isfinite(self.replay_hz) or self.replay_hz <= 0:
             raise ValueError("replay rate must be finite and positive")
 
@@ -932,8 +891,8 @@ class TrajectoryReplayer:
         self._live_motion_started = False
         self._status = ReplayStatus.COMPLETED
         self._reason = ""
-        self._hand_available = trajectory.has_hand and not no_hand
-        self._frame_count = trajectory.num_frames if max_frames is None else min(trajectory.num_frames, max_frames)
+        self._hand_available = trajectory.has_hand
+        self._frame_count = trajectory.num_frames
 
     def setup(self) -> None:
         """Create the action safety gate without connecting to hardware."""
@@ -1085,7 +1044,7 @@ class TrajectoryReplayer:
     def run(self) -> ReplayOutcome:
         """Execute the replay loop and report its explicit terminal outcome."""
         frame_count = self._frame_count
-        print(f"\nReplay: {frame_count} frames @ {self.replay_hz:.1f} Hz (speed={self.speed}x)")
+        print(f"\nReplay: {frame_count} frames @ {self.replay_hz:.1f} Hz")
         print(f"  Source: {self.traj.episode_path}")
         if self.traj.task_label:
             print(f"  Task:   {self.traj.task_label}")
@@ -1208,6 +1167,14 @@ class TrajectoryReplayer:
                         next_deadline_s = now_s + period_s
                     continue
 
+                # 2π-canonicalize the replayed command to the measured arm pose
+                # (defense-in-depth; the worker no longer wraps).
+                arm_cmd = wrap_nearest_equivalent(
+                    arm_cmd,
+                    arm_state["qpos"],
+                    tuple(self.runtime.arm.joint_limit_lower),
+                    tuple(self.runtime.arm.joint_limit_upper),
+                )
                 is_final_frame = frame_idx == frame_count - 1
                 published = publish_joint_targets(
                     self.shared,
@@ -1285,7 +1252,7 @@ class TrajectoryReplayer:
         arm = self.traj.action_arm_joint[:frame_count]
         if arm.shape != (frame_count, *ARM_JOINT_SHAPE) or not np.all(np.isfinite(arm)):
             raise ValueError("arm replay actions must be finite with shape (T, 7)")
-        if not self.no_hand and self.traj.action_hand_joint is not None:
+        if self.traj.action_hand_joint is not None:
             hand = self.traj.action_hand_joint[:frame_count]
             if hand.shape != (frame_count, *HAND_JOINT_SHAPE) or not np.all(np.isfinite(hand)):
                 raise ValueError("hand replay actions must be finite with shape (T, 12)")
@@ -1316,10 +1283,7 @@ class TrajectoryReplayer:
 
 @dataclass(frozen=True)
 class LiveReplayConfig:
-    """Bundles CLI-level live-replay overrides (speed, joint limits, hand mode, dry-run flag)."""
-    speed: float
-    no_hand: bool
-    max_frames: int | None
+    """Bundles CLI-level live-replay overrides (output, evaluation)."""
     output_dir: str
     evaluate_consistency: bool
     config_sha256: str
@@ -1445,7 +1409,7 @@ def _evaluate_replay(
             replay_hand_qpos=replay_data.get("hand_qpos"),
             episode_path=trajectory.episode_path,
             task_label=trajectory.task_label,
-            speed_factor=config.speed,
+            speed_factor=1.0,
         )
     except Exception:
         logger.error("replay consistency evaluation failed; saving raw replay data", exc_info=True)
@@ -1579,7 +1543,6 @@ def run_live_replay(
         verify_live_replay_preflight(
             trajectory,
             runtime,
-            no_hand=config.no_hand,
             provenance_sha256=config.config_sha256,
         )
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
@@ -1603,7 +1566,7 @@ def run_live_replay(
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="replay did not start")
     try:
         arm_config = ArmLoopConfig.from_runtime(runtime)
-        hand_available = trajectory.has_hand and not config.no_hand
+        hand_available = trajectory.has_hand
         specs = [WorkerSpec("arm", _arm_loop, (shared, arm_config), ready_name="arm")]
         if hand_available:
             from dexmani_real.robot.hand_process import HandProcessConfig
@@ -1635,9 +1598,6 @@ def run_live_replay(
             replayer = TrajectoryReplayer(
                 trajectory,
                 shared,
-                speed=config.speed,
-                no_hand=config.no_hand,
-                max_frames=config.max_frames,
                 runtime=runtime,
                 health_check=health_check,
             )
@@ -1737,45 +1697,37 @@ def run_live_replay(
 
 @dataclass(frozen=True)
 class ReplayRuntimeSelection:
-    """Resolved runtime config with per-session derived values and provenance hashes."""
+    """Resolved runtime config with per-session derived values and provenance hash."""
     runtime: ResolvedRuntimeConfig
     acceleration_deg_s2: float
     joint_speed_deg_s: float
-    acceleration_source: str
     config_sha256: str
 
 
 def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
-    """Resolve runtime config with CLI overrides and the recording-equivalent config provenance hash."""
-    base_runtime = resolve_runtime_config(yaml_path=args.config)
-    if args.acc is not None:
-        acceleration = float(args.acc)
-        acceleration_source = " (--acc override)"
-    else:
-        acceleration = float(base_runtime.arm.max_joint_acceleration_deg_per_s2)
-        acceleration_source = " (from runtime config)"
+    """Resolve runtime config and its provenance hash.
 
-    joint_speed = float(
-        args.joint_speed
-        if args.joint_speed is not None
-        else base_runtime.arm.max_joint_velocity_deg_per_s
-    )
+    Arm IP and joint limits come from the resolved config, never the CLI. Joint
+    speed/acceleration are reproduced from ``--speed``/``--acc`` (defaulting to
+    the YAML/default values) so a live replay matches the recording's resolved
+    config identity exactly.
+    """
     runtime = resolve_runtime_config(
         yaml_path=args.config,
         cli_overrides={
-            "arm.ip": args.arm_ip,
-            "arm.max_joint_acceleration_deg_per_s2": acceleration,
-            "arm.max_joint_velocity_deg_per_s": joint_speed,
-            "policy.hand_enabled": False if args.no_hand else None,
+            "arm.max_joint_acceleration_deg_per_s2": args.acc,
+            "arm.max_joint_velocity_deg_per_s": args.speed,
         },
     )
-    if not args.no_hand and not bool(runtime.policy.hand_enabled):
-        raise ValueError("policy.hand_enabled=false requires explicit --no-hand confirmation")
-    # Provenance is the resolved config the replay actually runs (all CLI
-    # overrides included), so it matches the recorder's runtime.sha256 exactly
-    # when --acc/--joint-speed/--no-hand/--arm-ip agree with recording.
+    if not bool(runtime.policy.hand_enabled):
+        raise ValueError("live replay requires policy.hand_enabled=true")
     config_sha256 = runtime.sha256
-    return ReplayRuntimeSelection(runtime, acceleration, joint_speed, acceleration_source, config_sha256)
+    return ReplayRuntimeSelection(
+        runtime=runtime,
+        acceleration_deg_s2=float(runtime.arm.max_joint_acceleration_deg_per_s2),
+        joint_speed_deg_s=float(runtime.arm.max_joint_velocity_deg_per_s),
+        config_sha256=config_sha256,
+    )
 
 
 def _run_offline(
@@ -1786,39 +1738,37 @@ def _run_offline(
     replayer = TrajectoryReplayer(
         trajectory,
         None,
-        speed=args.speed,
         dry_run=True,
-        no_hand=args.no_hand,
-        max_frames=args.max_frames,
         runtime=selection.runtime,
     )
     replayer.validate_offline()
 
 
+def _positive_float(value: str) -> float:
+    """Argparse type: positive finite float."""
+    v = float(value)
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"must be finite and > 0, got {value}")
+    return v
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate a DexMani trajectory offline or run a fail-closed live replay.",
+        description="Replay a DexMani trajectory on the real robot (live by default).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Offline inspection is the default; --live is the hardware boundary.
+  # Live replay: rerun the full recorded trajectory and write results
   python examples/replay_episode.py episodes/episode_20260729_213332
 
-  # Validate only a bounded prefix
-  python examples/replay_episode.py episodes/episode_20260729_213332 --max-frames 200
+  # Reproduce a recording made with non-default acc/speed (must match the episode)
+  python examples/replay_episode.py episodes/episode_20260729_213332 --acc 900 --speed 120
 
-  # Validate trajectory without hardware (dry-run)
+  # Custom capture/metrics directory
+  python examples/replay_episode.py episodes/episode_20260729_213332 --output results/my_replay/
+
+  # Offline validation only (no hardware, no workers)
   python examples/replay_episode.py episodes/episode_20260729_213332 --dry-run
-
-  # Arm-only (skip hand even if episode has hand data)
-  python examples/replay_episode.py episodes/episode_20260729_213332 --no-hand
-
-  # Live replay re-runs dense geometry and provenance checks before workers start
-  python examples/replay_episode.py episodes/episode_20260729_213332 --source sent --live
-
-  # Live replay with a custom capture/metrics directory
-  python examples/replay_episode.py episodes/episode_20260729_213332 --source sent --live \
-    --output results/my_replay/
 
 Live replay controls:
   Q     clean exit (save partial results)
@@ -1833,101 +1783,49 @@ Live replay controls:
         help="Published schema-v16 episode directory.",
     )
     parser.add_argument(
-        "--h5",
-        dest="episode_h5",
-        metavar="PATH",
-        help="Legacy alias for the episode path; use the positional path in new commands.",
-    )
-    parser.add_argument(
-        "--speed",
-        type=_positive_finite_float,
-        default=1.0,
-        help="Speed factor used by live replay (1.0=recorded speed).",
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=_positive_int,
-        default=None,
-        help="Maximum number of frames to replay (default: all).",
-    )
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
         "--dry-run",
         action="store_true",
-        help="Offline validation only (default; retained for explicit scripts).",
-    )
-    mode_group.add_argument(
-        "--live",
-        action="store_true",
-        help="Run dense preflight checks, then cross the hardware boundary.",
+        help="Offline validation only (default is live hardware replay).",
     )
     parser.add_argument("--config", type=str, default=None, help="Validated experiment YAML overrides.")
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Live-only directory for captured replay data and optional consistency metrics.",
-    )
-    parser.add_argument(
-        "--no-hand",
-        action="store_true",
-        help="Skip hand commands; live use requires the physical hand to be absent or secured at its configured home.",
-    )
-    parser.add_argument(
-        "--arm-ip",
-        type=str,
-        default=None,
-        help="XArm controller IP (experiment YAML/defaults when omitted).",
-    )
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="cmd",
-        choices=["cmd", "sent"],
-        help="Arm stream: policy target (cmd) or exact submitted target (sent).",
-    )
-    parser.add_argument(
-        "--joint-speed",
-        type=_positive_finite_float,
-        default=None,
-        metavar="DEG_S",
-        help="Mode-6 joint speed in °/s (defaults to the runtime config value).",
+        help="Directory for captured replay data and consistency metrics (live only).",
     )
     parser.add_argument(
         "--acc",
-        type=_positive_finite_float,
+        type=_positive_float,
         default=None,
-        metavar="DEG_S2",
-        help="Joint max acceleration in °/s² (defaults to the runtime config value).",
+        help="Joint max acceleration (°/s²); must match the recording's resolved config (defaults to YAML/defaults).",
+    )
+    parser.add_argument(
+        "--speed",
+        type=_positive_float,
+        default=None,
+        help="Joint max speed (°/s); must match the recording's resolved config (defaults to YAML/defaults).",
     )
     args = parser.parse_args(argv)
-    args.dry_run = not args.live
 
-    if args.episode is not None and args.episode_h5 is not None:
-        parser.error("provide the episode path either positionally or with --h5, not both")
-    args.episode = args.episode if args.episode is not None else args.episode_h5
     if args.episode is None:
-        parser.error("an episode path is required (positional path or --h5 PATH)")
-    if not args.live and args.output is not None:
-        parser.error("--output is only used with --live; offline validation does not produce replay metrics")
-    if args.live and args.source != "sent":
-        parser.error("--live requires --source sent; raw policy candidates are never replayed on hardware")
-    if args.live and args.speed > 1.0:
-        print("Warning: speed-up increases commanded joint velocities; live safety gates may reject the replay")
+        parser.error("an episode path is required")
+    if args.dry_run and args.output is not None:
+        parser.error("--output is only used for live replay; dry-run does not produce replay data")
 
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    live = not args.dry_run
 
     try:
         traj = load_trajectory(
             args.episode,
-            max_frames=args.max_frames,
-            source=args.source,
-            require_live_validity=args.live,
-            require_exact_source=args.live,
+            source="sent" if live else "cmd",
+            require_live_validity=live,
+            require_exact_source=live,
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"Error loading episode: {exc}")
@@ -1949,7 +1847,7 @@ def main(argv: list[str] | None = None) -> int:
     hand_metadata = "yes" if traj.has_hand_actions else "no"
     print(f"  Hand available: {hand_metadata}  action dataset: {'yes' if traj.has_hand_actions else 'no'}")
     print(f"  EE data: {'yes' if traj.arm_ee is not None else 'no'}")
-    print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²{selection.acceleration_source}")
+    print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
     print(f"  Replay config: {selection.config_sha256[:12]}")
 
@@ -1977,9 +1875,6 @@ def main(argv: list[str] | None = None) -> int:
             traj,
             selection.runtime,
             LiveReplayConfig(
-                speed=args.speed,
-                no_hand=args.no_hand,
-                max_frames=args.max_frames,
                 output_dir=output_dir,
                 evaluate_consistency=bool(eval_available),
                 config_sha256=selection.config_sha256,

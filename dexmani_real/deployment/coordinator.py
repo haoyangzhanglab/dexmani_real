@@ -32,6 +32,7 @@ from dexmani_real.deployment.metrics import (
     reject_counter_name,
 )
 from dexmani_real.planning import XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import (
     CommandPublishStatus,
     advance_run_generation,
@@ -40,7 +41,7 @@ from dexmani_real.policy.safety import (
     validate_and_send_candidate,
 )
 from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.shm.shared_storage import SharedStorage, read_arm_state_dict
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS
 
@@ -320,6 +321,16 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 metrics.increment(ENDPOINTS_COALESCED, coalesced)
 
             arm_qpos = np.asarray(active_plan["arm_qpos"][selected], dtype=np.float64)
+            # 2π-canonicalize the plan target to the freshest measured arm pose;
+            # the worker no longer wraps, so the producer owns band safety here.
+            _arm_state = read_arm_state_dict(shared)
+            if _arm_state is not None and np.all(np.isfinite(_arm_state["qpos"])):
+                arm_qpos = wrap_nearest_equivalent(
+                    arm_qpos,
+                    _arm_state["qpos"],
+                    config.arm_joint_lower_rad,
+                    config.arm_joint_upper_rad,
+                )
             hand_qpos: np.ndarray | None = None
             if int(active_plan["hand_present"]) == 1:
                 hand_qpos = np.asarray(active_plan["hand_qpos"][selected], dtype=np.float64)

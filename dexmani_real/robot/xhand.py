@@ -34,6 +34,16 @@ from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
+# The vendor SDK matches the transport string case-sensitively: it accepts
+# "EtherCAT"/"RS485", not our canonical lowercase "ethercat"/"serial".
+# ``enumerate_devices("ethercat")`` silently returns [] (no slaves found) and
+# the connect path reports a spurious "no slave enumerated" — map the canonical
+# value to the SDK spelling at the single SDK boundary.
+_SDK_ENUMERATE_PROTOCOL = {
+    "ethercat": "EtherCAT",
+    "serial": "RS485",
+}
+
 
 @dataclass
 class XHandConfig:
@@ -334,7 +344,9 @@ class XHand:
                 discovery_capture = None
                 try:
                     with capture_native_stdout() as discovery_capture:
-                        devices = self.control.enumerate_devices(comm_type)
+                        devices = self.control.enumerate_devices(
+                            _SDK_ENUMERATE_PROTOCOL[comm_type]
+                        )
                     discovery_output = discovery_capture.text
                     discovery_diagnostics = extract_native_diagnostics(discovery_output)
                     if discovery_diagnostics:
