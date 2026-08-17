@@ -19,6 +19,7 @@ Typical usage (decode)::
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -220,22 +221,29 @@ class VideoDecoder:
 
     def read_all(self) -> np.ndarray:
         """Decode all frames and return as a ``(T, H, W, 3)`` uint8 array."""
+        frames = list(self.iter_frames())
+        if not frames:
+            raise ValueError(f"No frames decoded from {self._path}")
+        return np.stack(frames, axis=0)
+
+    def iter_frames(self) -> Iterator[np.ndarray]:
+        """Yield decoded RGB frames sequentially without retaining the video.
+
+        The iterator rewinds the stream before decoding.  It is intended for
+        offline transforms that write selected frames directly to another
+        container and must not materialize a full recording in memory.
+        """
         if not self._opened:
             self._open()
-        frames: list[np.ndarray] = []
         if self._container is None:
             raise RuntimeError("VideoDecoder: container is None after _open()")
-        self._container.seek(0)  # rewind to start
-        # Demux + decode in one pass (no seeking — pure sequential).
+        self._container.seek(0)
         for packet in self._container.demux(self._stream):
             for frame in packet.decode():
                 # PyAV stubs include subtitle types in the decode union;
                 # filter to VideoFrame (the only type we care about).
                 if isinstance(frame, av.VideoFrame):
-                    frames.append(frame.to_ndarray(format="rgb24"))
-        if not frames:
-            raise ValueError(f"No frames decoded from {self._path}")
-        return np.stack(frames, axis=0)
+                    yield frame.to_ndarray(format="rgb24")
 
     def count_decoded_frames(self) -> int:
         """Fully decode the stream and count frames without retaining pixels."""

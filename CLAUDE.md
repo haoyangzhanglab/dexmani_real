@@ -256,6 +256,14 @@ aligned samples → RecorderIO → temporary episode + stream verification
 - `examples/replay_episode.py` defaults to live replay of the full recorded
   trajectory; it reruns fail-closed provenance and dense geometry checks
   immediately before worker startup. `--dry-run` opts into offline validation.
+- Offline training-data processing is a separate versioned view:
+  `examples/process_episodes.py` is a thin wrapper over `data_processing/`.
+  The pipeline keeps v16 sources immutable, resolves a modality-dependent hard
+  mask, splits at every invalid row or time/source discontinuity, and writes
+  `dexmani-real-simlabel-hdf5/v1` through a directory transaction. It never
+  stitches gaps, fabricates absent Sim labels, or relabels real point clouds as
+  SAPIEN-world data. Start with `data_processing/cleaning.py` for quality rules,
+  `transforms.py` for numeric transforms, and `pipeline.py` for publication.
 
 ## 5. Edit recipes
 

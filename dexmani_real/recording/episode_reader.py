@@ -21,6 +21,7 @@ Usage::
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -488,6 +489,18 @@ class EpisodeReader:
 
         self._cache[key] = data
         return data
+
+    def iter_camera_frames(self, key: str) -> Iterator[np.ndarray]:
+        """Yield one camera modality sequentially without caching the episode.
+
+        Streaming is currently meaningful for the MP4-backed RGB modality.
+        HDF5 camera modalities remain directly sliceable through :attr:`h5f`.
+        """
+        if key != "rgb":
+            raise ValueError("iter_camera_frames currently supports only MP4-backed RGB")
+        if self._rgb_decoder is None:
+            raise RuntimeError("EpisodeReader has no RGB decoder")
+        yield from self._rgb_decoder.iter_frames()
 
     # -- context manager --------------------------------------------------
 

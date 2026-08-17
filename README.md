@@ -22,6 +22,7 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 2. **标定与诊断**：标定相机外参和 VR 朝向；以受限、可观测的方式诊断 RealSense、点云和 XHand。
 3. **回放与离线分析**：检查 HDF5 episode、在启动前直接执行密集预检、运行受控 live replay，并评估或可视化数据质量。
 4. **策略部署**：通过 `examples/run_policy.py` 运行 learned-policy；推理 worker 只写 `policy_plan_ring`，coordinator 经同一安全边界发布机器人动作。
+5. **离线数据处理**：保持 Real v16 原始 episode 只读，按输出模态清洗和切分连续轨迹，生成 real-domain 的 Sim-label HDF5。
 
 ```text
                     ┌───────────── sensor/ ──────────────┐
@@ -86,6 +87,7 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 | 键盘控制 | `examples/keyboard_teleop.py` | `teleop/keyboard.py` → 松键推进 generation / 命令静默 / 实测位姿重锚 → 安全动作协议 |
 | 策略部署 | `examples/run_policy.py` | `deployment/lifecycle.py` → `deployment/worker.py`（推理）→ `deployment/coordinator.py`（动作发布，经共享安全边界）|
 | Episode 回放 | `examples/replay_episode.py` | 自包含脚本；默认 live 完整回放并产出结果；`--dry-run` 仅离线校验 |
+| Episode 清洗/映射 | `examples/process_episodes.py` | `data_processing/` → profile-aware hard mask/切段 → 事务式 Sim-label HDF5；纯离线，不访问硬件 |
 | 相机标定 | `examples/calibrate_camera.py` | 自包含 ArUco 手眼标定；会采集设备数据并原子写入 cameras.json |
 | 离线数据分析 | `examples/visualize_episode.py` | Rerun 3D episode 可视化；`python examples/visualize_episode.py <episode>` |
 | Hand retarget 调参 | `examples/tune_hand_retarget.py` | 离线顺序重放 TAG/DexPilot，输出关节/指尖/平滑/耗时指标与前 4 帧 home 估计；不访问硬件 |
@@ -133,7 +135,7 @@ python -m compileall -q dexmani_real examples
 
 ## 项目地图：`dexmani_real`
 
-以下清单覆盖当前包内的 **95 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
+以下清单覆盖当前包内的 **101 个 Python 源文件**（包含各包的 `__init__.py`）。除根包外，表中路径均相对于 `dexmani_real/`；`__init__.py` 若只负责导出接口，也会单独列出，便于从导入路径反查实现位置。
 
 ### 根包
 
@@ -200,6 +202,17 @@ python -m compileall -q dexmani_real examples
 | `integrations/__init__.py` | 说明依赖方向：`deployment/*` 不得 import 本包；integration → deployment。 |
 | `integrations/dexmani_policy.py` | DexMani Policy 模型仓库适配器：`DexManiObservationAdapter`/`DexManiPolicyBackend`/`DexManiActionAdapter`；`load()` 内惰性 import，native-joint-only，EE checkpoint 启动即拒绝。 |
 
+### `data_processing/` — Real episode 清洗与 Sim-label HDF5
+
+| 文件 | 作用 |
+|---|---|
+| `data_processing/__init__.py` | 导出处理 profile、不可变配置/决策合同和批处理入口。 |
+| `data_processing/contracts.py` | 定义 profile-aware 配置、人工 annotation、连续 segment 与 episode 决策。 |
+| `data_processing/cleaning.py` | 纯决策层：按 core/模态 hard gate 生成 mask，不拼接缺口，计算训练窗口和软质量指标。 |
+| `data_processing/transforms.py` | RGB/K resize 与 point-cloud 确定性 FPS/补点；不改变 real 坐标 frame。 |
+| `data_processing/pipeline.py` | 发现/审计源 episode，流式写多个 HDF5，写后 fail-closed 校验并目录级原子发布。 |
+| `data_processing/cli.py` | argparse、profile 对比、dry-run 和批处理编排；不包含数据处理业务逻辑。 |
+
 ### `recording/` — Episode 持久化与离线分析
 
 | 文件 | 作用 |
@@ -207,7 +220,7 @@ python -m compileall -q dexmani_real examples
 | `recording/__init__.py` | 导出 episode 读写器、时间信息和停止结果的公共接口。 |
 | `recording/camera_stream_writer.py` | 在独立写线程中编码并写入相机流，隔离视频 I/O 以免阻塞控制环。 |
 | `recording/episode_schema.py` | v16 的 96 个基础 dataset、条件 sent-command 字段、固定 diagnostics 和共享 layout 校验合同。 |
-| `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并分别提供内部有效性与最短时长质量视图。 |
+| `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并提供内部有效性、最短时长质量视图及顺序 RGB iterator。 |
 | `recording/episode_recorder.py` | 管理单个 episode 的 HDF5 数据集、相机写入器、停止校验与最终发布。 |
 | `recording/io_process.py` | `RecorderIO` 非阻塞事务 worker 及其客户端协议；固定 dtype 携带 generation、FINALIZING/终态和会话失败结果。 |
 | `recording/recorder_client.py` | policy 侧 `RecorderClient` 与共享控制面协议类型；持有录制决策与固定 sample 构造，与 RecorderIO 依赖单向。 |
@@ -303,7 +316,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 
 ## 项目地图：`examples`
 
-`examples/` 目前有 **11 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
+`examples/` 目前有 **12 个 Python 文件**。入口点专有逻辑（如实验生命周期、控制循环）直接放在 examples 中；共享库代码留在 `dexmani_real` 包内。
 
 | 文件 | 调用的领域入口 | 作用与风险 |
 |---|---|---|
@@ -311,6 +324,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/run_policy.py` | `deployment.lifecycle` | learned-policy 部署入口：argparse → 解析 runtime/deployment 配置 → 运行生命周期 → 退出码；薄 CLI，无模型/调度/安全/存储逻辑。 |
 | `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键推进 generation 后停止发布，控制器自然完成最后一个已接受 endpoint，空闲期间持续从实测关节/FK 重建命令基准；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
 | `examples/replay_episode.py` | — | episode 回放入口；默认 live 完整回放，`--dry-run` 仅离线校验；退出时推进 generation 并停止发布。 |
+| `examples/process_episodes.py` | `data_processing.cli` | 纯离线薄 CLI：比较 profile、dry-run 或把 Real v16 批量清洗为 real-domain Sim-label HDF5。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
@@ -332,6 +346,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `docs/dataset/hdf5_episode.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
 | `docs/dataset/sim_hdf5_zarr.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |
 | `docs/dataset/real_to_sim_mapping.md` | Real v16 episode → Sim/Policy 标签映射表：仅登记字段来源、结构关系和语义差异，不修改录制数值。 |
+| `docs/dataset/processed_hdf5.md` | Real v16 清洗、模态相关切段、数值转换与 `dexmani-real-simlabel-hdf5/v1` 输出合同。 |
 | `docs/hand_retargeting.md` | hand retarget 当前控制合同：逐 VR observation 求解缓存、TAG/DexPilot 两后端、命令整形/验证/发布边界、状态推进时机与碰撞/触觉边界。 |
 
 对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的跨模块变更清单，再沿本 README 的关键路径追踪所有生产者和消费者。

@@ -65,6 +65,10 @@ MP4 解码属于读取 Real 容器，不属于图像数值处理；映射得到�
 若后续数据清洗确实需要这些操作，应建立另一份带版本和 provenance 的数值转换规范，不能
 把结果归入本文的 `label_only` 映射。
 
+仓库现已提供这层独立数值转换规范与实现，见
+[Real 清洗与 Sim-label HDF5 格式](processed_hdf5.md)。其输出明确标记为
+`domain=real`，不会改变本文对 label-only 映射边界的定义。
+
 ## 2. 两端容器
 
 一个 Real v16 episode 是四件套目录：
