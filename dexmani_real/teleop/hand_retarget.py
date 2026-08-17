@@ -207,7 +207,6 @@ class XHandRetargeter:
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
-        smoothing_alpha: float | None = None,
         dexpilot_config: Any | None = None,
     ):
         self.hand_type = hand_type
@@ -216,10 +215,6 @@ class XHandRetargeter:
         self.debug_adapters = bool(debug_adapters)
         self._dexpilot_config = dexpilot_config
         self.last_debug: dict[str, float | str] = {}
-        self._smoothing_alpha: float | None = (
-            float(np.clip(smoothing_alpha, 0.0, 1.0)) if smoothing_alpha is not None else None
-        )
-        self._hand_ema_state: np.ndarray | None = None
 
         # Every returned qpos follows the cross-process SDK order owned by
         # utils.schema, independent of the backend model's internal order.
@@ -235,7 +230,6 @@ class XHandRetargeter:
 
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
 
-        # Read YAML — extract custom smoothing_alpha before passing to RetargetingConfig
         with open(str(config_path), "r") as f:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
         cfg = yaml_config["retargeting"]
@@ -255,13 +249,7 @@ class XHandRetargeter:
                 low_pass_alpha=float(self._dexpilot_config.low_pass_alpha),
                 project_dist=float(self._dexpilot_config.project_dist_m),
                 escape_dist=float(self._dexpilot_config.escape_dist_m),
-                smoothing_alpha=float(self._dexpilot_config.output_ema_alpha),
             )
-
-        # Teleoperator-level EMA (our custom field, not a RetargetingConfig param)
-        yaml_smoothing_alpha = float(cfg.pop("smoothing_alpha", 0.3))
-        if self._smoothing_alpha is None:
-            self._smoothing_alpha = yaml_smoothing_alpha
 
         # Standard build (same path as LeFranX)
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
@@ -339,16 +327,7 @@ class XHandRetargeter:
             logger.warning("Retargeting returned None.")
             return None
 
-        # Optional teleoperator-level output EMA applied after the external
-        # LPFilter. Default alpha is 1.0 (pass-through), so this is a no-op.
         qpos_arr = np.asarray(qpos, dtype=float)
-        assert self._smoothing_alpha is not None  # set by load_retargeter()
-        if self._smoothing_alpha < 1.0:
-            if self._hand_ema_state is not None:
-                qpos_arr = self._smoothing_alpha * qpos_arr + (1.0 - self._smoothing_alpha) * self._hand_ema_state
-            self._hand_ema_state = qpos_arr.copy()
-        else:
-            self._hand_ema_state = None
 
         # Joint order remap
         qpos_arr = qpos_arr[self.retargeted_joint_order]
@@ -365,8 +344,8 @@ class XHandRetargeter:
     def reset(self, initial_qpos: np.ndarray | None = None) -> None:
         """Reset retargeter state for a clean episode start.
 
-        Resets the SLSQP warm-start seed, the LPFilter EMA accumulator,
-        the teleoperator EMA state, and the DexPilot projection indicators.
+        Resets the SLSQP warm-start seed, the LPFilter accumulator, and the
+        DexPilot projection indicators.
 
         Args:
             initial_qpos: Optional (12,) array of current hand joint positions.
@@ -381,7 +360,6 @@ class XHandRetargeter:
         if self.retargeter.filter is not None:
             self.retargeter.filter.reset()  # LPFilter: clears EMA accumulator
         self.retargeter.optimizer.projected[:] = False  # DexPilot: clears projection state
-        self._hand_ema_state = None  # Teleoperator EMA: clear for fresh episode
 
         # ── Smart warm-start: seed with actual hardware pose ──
         # Without this, last_qpos is joint_limits.mean(1) — a neutral pose that

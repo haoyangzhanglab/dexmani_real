@@ -243,7 +243,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `robot/homing.py` | 回零编排与执行：`send_arm_home` 编排候选路径，`run_planned_homing` 为执行入口（Mode 0 里程碑执行，返回 provisional 结果；Mode 6 恢复由 arm loop 单点 finalize）；包含状态/心跳检查、路径候选拒绝信息和 e-stop 处理。 |
 | `robot/safety.py` | 定义 `SafetyState` 与合法状态迁移/强制迁移检查。 |
 | `robot/types.py` | 定义文档化的机器人状态、动作、臂/手/触觉 dataclass；实际 IPC 格式由 `utils/schema.py` 决定。 |
-| `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放；超过运行或厂商机械限位的命令整条拒绝，绝不隐式 clip，运行配置只能收紧而不能放宽额定机械包络；成功初始化时汇总原生 SDK 噪声，连接失败时回放完整诊断。 |
+| `robot/xhand.py` | 封装 XHand SDK 的连接、配置、关节/触觉读写和安全的资源释放；生产默认通过 `/dev/ttyUSB0` 上的 3 Mbps RS485（配置值 `serial`）连接，EtherCAT 仅作为显式配置回退；RS485 打开后默认稳定等待 1 秒，反馈使用只刷新状态、不重放动作的 `read_state(..., True)`；1501070 CRC 对相同绝对位置目标默认只重试一次，而只读实时状态事务默认重试两次（均退避 80 ms），耗尽后仍按失败处理；1501018–1501020 保留有效关节反馈并按字段降级传感数据（合力失败保守失效、分布力失败保留合力/接触、温度失败保留全部力数据），下一次成功读取立即恢复，超时和板卡错误仍立即失败；超过运行或厂商机械限位的命令整条拒绝，绝不隐式 clip，运行配置只能收紧而不能放宽额定机械包络；成功初始化时汇总原生 SDK 噪声，连接失败时回放完整诊断。 |
 
 ### `runtime/` — 进程生命周期与状态码
 
@@ -329,7 +329,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
 | `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
-| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认运行 home + 预设动作（枚举/读取/打印后直接动作），无 CLI 参数门控；预设动作按生产命令包络裁剪。 |
+| `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认运行 home + 预设动作（读取/打印后直接动作），无 CLI 参数门控；RS485 固定使用 `/dev/ttyUSB0`，打开前只读检查设备节点与当前用户权限，完整 SDK 会话在隔离子进程中运行，厂商串口线程异常退出会转换为可操作诊断且不让启动进程 core dump；复用生产的 1 秒打开稳定等待、动作 CRC 单次同目标重试、实时读取 CRC 两次重试及触觉字段错误分类；命令响应报告触觉降级时，驻留后仅用实时只读状态请求有限验证恢复，绝不为传感错误重放动作；未解决的初始关节读取或动作事务失败会中止后续预设，传感恢复失败则明确标记而不改变已接受的动作。 |
 | `examples/visualize_episode.py` | — | 离线 Rerun 3D 可视化；读取 HDF5 episode 并展示点云、图像、动作、触觉和元数据；无硬件控制。 |
 | `examples/tune_hand_retarget.py` | `teleop.hand_retarget_eval` | 离线 TAG/DexPilot 基准、有界搜索和 home 估计；只读 episode，输出 JSON，无硬件控制。 |
 

@@ -79,7 +79,6 @@ def main() -> int:
             dexpilot_retargeting,
             scaling_factor=recommended.parameters["scaling_factor"],
             low_pass_alpha=recommended.parameters["low_pass_alpha"],
-            output_ema_alpha=recommended.parameters["output_ema_alpha"],
             project_dist_m=recommended.parameters["project_dist_m"],
             escape_dist_m=recommended.parameters["escape_dist_m"],
         )

@@ -391,41 +391,51 @@ _XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
 class HandParams:
     """XHand hardware parameters — single source of truth."""
 
-    # Vendor EtherCAT slave position has not been independently validated for
-    # this installation. -1 means unknown: close the device and wait for the
-    # watchdog, but do not issue a guessed set_firmware_state() request.
+    # Optional EtherCAT fallback. The slave position has not been independently
+    # validated for this installation. -1 means unknown: close the device and
+    # wait for the watchdog, but do not issue a guessed firmware-state request.
     ethercat_slave_position: int = -1
 
     # ── Connection / transport ──
-    # Canonical transport protocol. Production is EtherCAT-only; "serial"
-    # (RS485) is retained for the diagnostic adapter. The value is validated to
-    # this closed set, so the driver never guesses a protocol from a fuzzy
-    # string (the former rs485/serial/usb/eth/ecat aliases are gone).
-    comm_type: str = "ethercat"
-    # Optional serial device name (e.g. /dev/ttyUSB0). None lets the driver
-    # enumerate the bus itself. Ignored for EtherCAT.
-    device_name: str | None = None
+    # Canonical transport protocol. Production uses "serial" (RS485);
+    # "ethercat" remains an explicit runtime override. The value is validated
+    # to this closed set, so the driver never guesses a protocol from a fuzzy
+    # string (the former rs485/usb/eth/ecat aliases are gone).
+    comm_type: str = "serial"
+    # Fixed RS485 serial device. Ignored for EtherCAT.
+    device_name: str | None = "/dev/ttyUSB0"
     # RS485 baudrate. Ignored for EtherCAT.
     baudrate: int = 3_000_000
     # Vendor device id the driver must find among enumerated hands at connect.
     device_id: int = 0
+    # Give the native USB/RS485 receive thread time to settle before the first
+    # identity or live-state transaction.
+    rs485_post_open_settle_s: float = 1.0
+    # A send CRC cannot prove whether the absolute position command was
+    # applied, so retry the same endpoint once. A live state transaction is
+    # read-only and may be retried twice to absorb the observed first-read CRC
+    # transient without accepting an unverified frame.
+    rs485_crc_retry_count: int = 1
+    rs485_read_crc_retry_count: int = 2
+    rs485_crc_retry_backoff_s: float = 0.08
 
-    # ── Home position (deg) — open-hand neutral ──
-    # Estimated from the median converged DexPilot pose of the first four
-    # stable operator frames in episode_20260816_234045.  The eight finger
-    # flexion joints retain at least a 5 deg lower-stop margin.
+    # ── Home position (deg) — Dexora right-hand initial pose ──
+    # Dexora deploy/xhand_forwarder.py ``INIT_JOINTS_DEG["right_hand"]`` in
+    # XHand SDK joint order, projected onto this project's stricter operational
+    # command floors. J2 is raised from 3° to 10°; J5/J7/J9/J11 are raised to
+    # 5° so home remains clear of the rated mechanical lower stops.
     home_qpos_deg: tuple[float, ...] = (
-        0.67,
-        15.51,
-        65.18,
-        2.11,
+        30.0,
+        55.33,
+        10.0,
+        0.17,
+        1.08,
         5.0,
+        1.25,
         5.0,
+        1.33,
         5.0,
-        5.0,
-        5.0,
-        9.23,
-        18.89,
+        1.33,
         5.0,
     )
 
@@ -544,6 +554,14 @@ class HandParams:
             raise ValueError("hand baudrate must be a positive integer")
         if not isinstance(self.device_id, int) or self.device_id < 0:
             raise ValueError("hand device_id must be a non-negative integer")
+        if not np.isfinite(self.rs485_post_open_settle_s) or self.rs485_post_open_settle_s < 0:
+            raise ValueError("hand rs485_post_open_settle_s must be finite and non-negative")
+        if not isinstance(self.rs485_crc_retry_count, int) or self.rs485_crc_retry_count < 0:
+            raise ValueError("hand rs485_crc_retry_count must be a non-negative integer")
+        if not isinstance(self.rs485_read_crc_retry_count, int) or self.rs485_read_crc_retry_count < 0:
+            raise ValueError("hand rs485_read_crc_retry_count must be a non-negative integer")
+        if not np.isfinite(self.rs485_crc_retry_backoff_s) or self.rs485_crc_retry_backoff_s < 0:
+            raise ValueError("hand rs485_crc_retry_backoff_s must be finite and non-negative")
         limit_vectors = (
             self.mechanical_qpos_min_rad,
             self.mechanical_qpos_max_rad,
@@ -830,19 +848,17 @@ class DexPilotRetargetingParams:
     the backend used by :class:`teleop.hand_retarget.XHandRetargeter`.
     """
 
-    # Bounded offline sweep on episode_20260816_234045.  The asymmetric
-    # project/escape thresholds add hysteresis and suppress projection chatter.
-    scaling_factor: float = 1.05
-    low_pass_alpha: float = 0.35
-    output_ema_alpha: float = 1.0
-    project_dist_m: float = 0.025
-    escape_dist_m: float = 0.035
+    # Match the LeFranX XHand DexPilot configuration.  LeFranX leaves scaling
+    # unspecified and therefore uses dex-retargeting's 1.0 default.
+    scaling_factor: float = 1.0
+    low_pass_alpha: float = 0.6
+    project_dist_m: float = 0.03
+    escape_dist_m: float = 0.03
 
     def __post_init__(self) -> None:
         numeric = (
             self.scaling_factor,
             self.low_pass_alpha,
-            self.output_ema_alpha,
             self.project_dist_m,
             self.escape_dist_m,
         )
@@ -852,8 +868,6 @@ class DexPilotRetargetingParams:
             raise ValueError("DexPilot scaling_factor must be positive")
         if not 0.0 <= self.low_pass_alpha <= 1.0:
             raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
-        if not 0.0 <= self.output_ema_alpha <= 1.0:
-            raise ValueError("DexPilot output_ema_alpha must be in [0, 1]")
         if self.project_dist_m <= 0 or self.escape_dist_m < self.project_dist_m:
             raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
 

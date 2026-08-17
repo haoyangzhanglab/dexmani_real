@@ -261,7 +261,6 @@ def run_dexpilot(
         {
             "scaling_factor": float(config.scaling_factor),
             "low_pass_alpha": float(config.low_pass_alpha),
-            "output_ema_alpha": float(config.output_ema_alpha),
             "project_dist_m": float(config.project_dist_m),
             "escape_dist_m": float(config.escape_dist_m),
         },
@@ -480,8 +479,8 @@ def estimate_home_qpos(
 ) -> HomeEstimate:
     """Estimate a stable, bounded home from independently converged frames.
 
-    Each source landmark frame is solved repeatedly after a reset, with output
-    filters disabled for DexPilot.  Taking the per-joint median therefore
+    Each source landmark frame is solved repeatedly after a reset, with the
+    DexPilot internal LPFilter disabled.  Taking the per-joint median therefore
     estimates the static backend target instead of averaging a warm-start
     transient.  Only the eight finger-flexion joints receive the explicit
     lower-stop margin; thumb opposition and index abduction retain their
@@ -502,7 +501,7 @@ def estimate_home_qpos(
         raise TypeError("DexPilot home estimation requires DexPilotRetargetingParams")
 
     seed = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
-    static_retargeter = _make_retargeter(backend, config, disable_output_filters=True)
+    static_retargeter = _make_retargeter(backend, config, disable_low_pass_filter=True)
     converged = np.empty((source_frame_count, *HAND_JOINT_SHAPE), dtype=np.float64)
     residuals = np.empty(source_frame_count, dtype=np.float64)
     for frame_index, landmarks in enumerate(data.landmarks[:source_frame_count]):
@@ -539,7 +538,9 @@ def estimate_home_qpos(
     safe_upper = np.asarray(hand.qpos_max_rad, dtype=np.float64)
     estimated = np.clip(unconstrained, safe_lower, safe_upper)
 
-    startup_retargeter = _make_retargeter(backend, config, disable_output_filters=False)
+    startup_retargeter = _make_retargeter(
+        backend, config, disable_low_pass_filter=False
+    )
     startup_retargeter.reset(estimated.copy())
     startup_outputs = []
     for landmarks in data.landmarks[:source_frame_count]:
@@ -664,7 +665,7 @@ def _make_retargeter(
     backend: str,
     config: TAGRetargetingParams | DexPilotRetargetingParams,
     *,
-    disable_output_filters: bool,
+    disable_low_pass_filter: bool,
 ) -> TAGHandRetargeter | XHandRetargeter:
     if backend == "tag":
         if not isinstance(config, TAGRetargetingParams):
@@ -675,9 +676,7 @@ def _make_retargeter(
     if not isinstance(config, DexPilotRetargetingParams):
         raise TypeError("DexPilot retargeter requires DexPilotRetargetingParams")
     effective = (
-        replace(config, low_pass_alpha=1.0, output_ema_alpha=1.0)
-        if disable_output_filters
-        else config
+        replace(config, low_pass_alpha=1.0) if disable_low_pass_filter else config
     )
     return XHandRetargeter(dexpilot_config=effective)
 

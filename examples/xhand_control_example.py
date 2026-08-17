@@ -6,9 +6,11 @@ Usage::
     conda activate real_robot
     python examples/xhand_control_example.py              # home + preset motion
 
-Default behaviour: enumerate, open, identify, read/print state, then run home +
-preset actions.  The script always moves the hand when it runs -- there is no
-read-only mode and no CLI flag gate.  Keep the workspace clear before running.
+Default behaviour: open, identify, read/print state, then run home + preset
+actions.  The script always moves the hand when it runs -- there is no read-only
+mode and no CLI flag gate.  Keep the workspace clear before running.  The native
+SDK session runs in an isolated worker because its receive thread can abort the
+process when a device disconnects.
 
 Uses the xhand_controller SDK directly -- no dexmani_real runtime dependencies.
 """
@@ -16,19 +18,58 @@ Uses the xhand_controller SDK directly -- no dexmani_real runtime dependencies.
 from __future__ import annotations
 
 import math
+import os
+import signal
+import stat
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
-
-from xhand_controller import xhand_control
+from pathlib import Path
+from typing import Any
 
 # Matches dexmani_real.config.defaults.hand.home_qpos_deg -- duplicated here
 # so this script stays usable without a full dexmani_real import chain.
-HOME_QPOS_DEG = (0.67, 15.51, 65.18, 2.11, 5.0, 5.0, 5.0, 5.0, 5.0, 9.23, 18.89, 5.0)
+HOME_QPOS_DEG = (
+    30.0,
+    55.33,
+    10.0,
+    0.17,
+    1.08,
+    5.0,
+    1.25,
+    5.0,
+    1.33,
+    5.0,
+    1.33,
+    5.0,
+)
 
 _BAUD_RATE_RS485 = 3_000_000
 _DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 _HAND_DOF = 12
+_RS485_COMBINED_FORCE_ERROR_CODE = 1_501_018
+_RS485_DISTRIBUTED_FORCE_ERROR_CODE = 1_501_019
+_RS485_TEMPERATURE_ERROR_CODE = 1_501_020
+_RS485_TACTILE_STATUS_CODES = frozenset(
+    {
+        _RS485_COMBINED_FORCE_ERROR_CODE,
+        _RS485_DISTRIBUTED_FORCE_ERROR_CODE,
+        _RS485_TEMPERATURE_ERROR_CODE,
+    }
+)
+_RS485_TACTILE_STATUS_DETAIL = {
+    _RS485_COMBINED_FORCE_ERROR_CODE: "combined force unavailable; force frame invalidated conservatively",
+    _RS485_DISTRIBUTED_FORCE_ERROR_CODE: "distributed force unavailable; combined force retained",
+    _RS485_TEMPERATURE_ERROR_CODE: "temperature unavailable; force fields retained",
+}
+_RS485_CRC_ERROR_CODE = 1_501_070
+_RS485_POST_OPEN_SETTLE_S = 1.0
+_RS485_CRC_RETRY_COUNT = 1
+_RS485_READ_CRC_RETRY_COUNT = 2
+_RS485_SENSOR_VERIFY_RETRY_COUNT = 2
+_RS485_CRC_RETRY_BACKOFF_S = 0.08
+_HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 
 # Production command envelope (rad), duplicated from
 # dexmani_real.config.defaults.hand.qpos_min_rad / qpos_max_rad so the
@@ -76,6 +117,7 @@ _FINGERTIP_TO_SENSOR_IDX = {2: 0, 5: 1, 7: 2, 9: 3, 11: 4}
 # Configuration dataclasses
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @dataclass(frozen=True)
 class HandCommandParams:
     """Default servo parameters for diagnostic hand commands."""
@@ -104,15 +146,41 @@ class PresetActions:
         yield "ok", self.ok
 
 
-# XHand 1 (serial digit "3").  Preset angles are kept inside the production
-# command envelope above so the diagnostic never emits a [clip] line: distal
-# joints sit at the 5° anti-clogging lower bound and full-flexion at 109.5°
-# (the rated upper bound is 1.919 rad ≈ 109.95°).
+# XHand 1 (serial digit "3"). Preset angles are kept inside the production
+# command envelope above so the diagnostic never emits a [clip] line. The
+# Dexora right-hand init has already been projected onto the anti-clogging floors;
+# full-flexion uses 109.5° (the rated upper bound is 1.919 rad ≈ 109.95°).
 PRESET_XHAND1 = PresetActions(
-    fist=(11.85, 74.58, 40, -3.08, 106.02, 109.5, 109.75, 107.56, 107.66, 109.5, 109.1, 109.15),
-    palm=(0.67, 15.51, 65.18, 2.11, 5.0, 5.0, 5.0, 5.0, 5.0, 9.23, 18.89, 5.0),
+    fist=(
+        11.85,
+        74.58,
+        40,
+        -3.08,
+        106.02,
+        109.5,
+        109.75,
+        107.56,
+        107.66,
+        109.5,
+        109.1,
+        109.15,
+    ),
+    palm=HOME_QPOS_DEG,
     v=(38.32, 90, 52.08, 6.21, 2.6, 5.0, 2.1, 5.0, 109.5, 109.5, 109.5, 109.23),
-    ok=(45.88, 41.54, 67.35, 2.22, 80.45, 70.82, 31.37, 10.39, 13.69, 16.88, 1.39, 10.55),
+    ok=(
+        45.88,
+        41.54,
+        67.35,
+        2.22,
+        80.45,
+        70.82,
+        31.37,
+        10.39,
+        13.69,
+        16.88,
+        1.39,
+        10.55,
+    ),
 )
 
 # XHand 1 Lite (serial digit "6").
@@ -128,20 +196,30 @@ PRESET_XHAND1_LITE = PresetActions(
 # XHand control example
 # ═══════════════════════════════════════════════════════════════════════
 
+
 class XHandControlExample:
     """Thin wrapper around xhand_controller SDK for diagnostic exercises."""
 
-    def __init__(self, hand_id: int = 0, params: HandCommandParams | None = None) -> None:
+    def __init__(
+        self, hand_id: int = 0, params: HandCommandParams | None = None
+    ) -> None:
+        # Import the native SDK only in the isolated hardware worker.  Version
+        # 1.1.8 can call std::terminate() from its serial receive thread, which
+        # cannot be caught by Python in the process that loaded the extension.
+        from xhand_controller import xhand_control  # type: ignore[import-untyped]  # isort: skip
+
+        self._sdk = xhand_control
         self._hand_id = hand_id
         self._params = params or HandCommandParams()
-        self._device = xhand_control.XHandControl()
+        self._device = self._sdk.XHandControl()
         self._hand_command = self._build_command(self._params.default_position)
+        self._protocol: str | None = None
 
     # ── Command builders ──
 
-    def _build_command(self, position: float) -> xhand_control.HandCommand_t:
+    def _build_command(self, position: float) -> Any:
         """Build a homogeneous hand command with the configured servo params."""
-        cmd = xhand_control.HandCommand_t()
+        cmd = self._sdk.HandCommand_t()
         for i in range(_HAND_DOF):
             fc = cmd.finger_command[i]
             fc.id = i
@@ -182,9 +260,17 @@ class XHandControlExample:
         print(f"  ports: {ports}")
         return ports
 
-    def open_device(self, protocol: str, serial_port: str = _DEFAULT_SERIAL_PORT) -> bool:
+    def open_device(
+        self, protocol: str, serial_port: str = _DEFAULT_SERIAL_PORT
+    ) -> bool:
         self._header(f"Open device ({protocol})")
         if protocol == "RS485":
+            problem = _serial_port_problem(serial_port)
+            if problem is not None:
+                print(f"  FAILED: {problem}")
+                print("  The native SDK was not asked to open the serial port.")
+                return False
+            print(f"  serial_port: {serial_port}")
             rsp = self._device.open_serial(serial_port, _BAUD_RATE_RS485)
             ok = rsp.error_code == 0
         elif protocol == "EtherCAT":
@@ -199,7 +285,13 @@ class XHandControlExample:
             return False
 
         if ok:
+            self._protocol = protocol
             print("  OK")
+            if protocol == "RS485":
+                print(
+                    f"  Waiting {_RS485_POST_OPEN_SETTLE_S:.1f}s for the RS485 receive path to settle..."
+                )
+                time.sleep(_RS485_POST_OPEN_SETTLE_S)
         else:
             err = rsp.error_message if rsp else "no response"
             print(f"  FAILED: {err}")
@@ -232,48 +324,245 @@ class XHandControlExample:
 
     # ── State ──
 
-    def read_state(self, finger_id: int = 2, force_update: bool = False) -> None:
-        # Default to a cached read.  RS485 read_state(force_update=True) first
-        # re-sends the last command (vendored serial_communication.cpp), so a
-        # diagnostic state read must never request a fresh read on that bus.
-        self._header(f"Read state (finger {finger_id})")
+    def _read_state_response(
+        self, force_update: bool, *, label: str
+    ) -> tuple[Any, Any]:
+        """Read state and retry only an RS485 CRC on a live transaction."""
         error_struct, state = self._device.read_state(self._hand_id, force_update)
-        if error_struct.error_code != 0:
-            print(f"  read_state error: {error_struct.error_message}")
-            return
+        code = int(error_struct.error_code)
+        if self._protocol == "RS485" and force_update:
+            for retry_index in range(1, _RS485_READ_CRC_RETRY_COUNT + 1):
+                if code != _RS485_CRC_ERROR_CODE:
+                    break
+                print(
+                    f"  {label}: CRC ERROR; retrying the live state request "
+                    f"({retry_index}/{_RS485_READ_CRC_RETRY_COUNT}) after "
+                    f"{_RS485_CRC_RETRY_BACKOFF_S:.2f}s"
+                )
+                time.sleep(_RS485_CRC_RETRY_BACKOFF_S)
+                error_struct, state = self._device.read_state(
+                    self._hand_id, force_update
+                )
+                code = int(error_struct.error_code)
+        return error_struct, state
+
+    def read_state(self, finger_id: int = 2, force_update: bool = True) -> bool:
+        # The vendor 1.1.8 API documents True as a read-only state-refresh
+        # request.  Cached mode is useful immediately after send_command(), but
+        # this standalone diagnostic needs a live frame before its first send.
+        self._header(f"Read state (finger {finger_id})")
+        error_struct, state = self._read_state_response(
+            force_update, label="read_state"
+        )
+        code = int(error_struct.error_code)
+        tactile_status = (
+            self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
+        )
+        if code != 0 and not tactile_status:
+            print(
+                f"  read_state error: {error_struct.error_message} "
+                f"(error_code={code})"
+            )
+            return False
+        if state is None:
+            print(
+                "  read_state error: SDK returned no state "
+                f"(error_code={code} msg={error_struct.error_message})"
+            )
+            return False
+        combined_force_valid = code == 0 or (
+            self._protocol == "RS485"
+            and code
+            in {
+                _RS485_DISTRIBUTED_FORCE_ERROR_CODE,
+                _RS485_TEMPERATURE_ERROR_CODE,
+            }
+        )
+        distributed_force_valid = code == 0 or (
+            self._protocol == "RS485" and code == _RS485_TEMPERATURE_ERROR_CODE
+        )
+        temperature_valid = code != _RS485_TEMPERATURE_ERROR_CODE
+        if tactile_status:
+            print(
+                "  read_state: JOINTS OK; SENSOR PARTIALLY DEGRADED  "
+                f"(error_code={code} msg={error_struct.error_message}; "
+                f"{_RS485_TACTILE_STATUS_DETAIL[code]})"
+            )
 
         f = state.finger_state[finger_id]
         print(f"  id={f.id}  temp={f.temperature}  temp&0xFF={f.temperature & 0xFF}")
-        print(f"  comm_err={f.commboard_err}  joint_err={f.jonitboard_err}  tip_err={f.tipboard_err}")
+        print(
+            f"  comm_err={f.commboard_err}  joint_err={f.jonitboard_err}  tip_err={f.tipboard_err}"
+        )
 
         if f.id in _FINGERTIP_IDS:
-            sensor = state.sensor_data[_FINGERTIP_TO_SENSOR_IDX[f.id]]
-            calc = sensor.calc_force
-            print(f"  calc_pressure:     fx={calc.fx:.3f} fy={calc.fy:.3f} fz={calc.fz:.3f}")
-            print(f"  sensor_temperature: {sensor.calc_temperature}")
+            try:
+                sensor = state.sensor_data[_FINGERTIP_TO_SENSOR_IDX[f.id]]
+                if combined_force_valid:
+                    calc = sensor.calc_force
+                    print(
+                        f"  calc_pressure:       fx={calc.fx:.3f} fy={calc.fy:.3f} fz={calc.fz:.3f}"
+                    )
+                else:
+                    print("  calc_pressure:       unavailable")
+                if distributed_force_valid:
+                    raw_force = list(sensor.raw_force)
+                    raw_values = [
+                        float(value)
+                        for force in raw_force
+                        for value in (force.fx, force.fy, force.fz)
+                    ]
+                    raw_finite = all(math.isfinite(value) for value in raw_values)
+                    raw_abs_max = max((abs(value) for value in raw_values), default=0.0)
+                    print(
+                        "  raw_pressure:        "
+                        f"points={len(raw_force)} finite={raw_finite} max_abs={raw_abs_max:.3f}"
+                    )
+                else:
+                    print("  raw_pressure:        unavailable")
+                if temperature_valid:
+                    print(f"  sensor_temperature: {sensor.calc_temperature}")
+                else:
+                    print("  sensor_temperature: unavailable")
+            except (
+                AttributeError,
+                IndexError,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ) as exc:
+                print(f"  sensor payload malformed: {exc}")
+        return True
+
+    def _verify_sensor_response_after_send(self, finger_id: int = 5) -> bool:
+        """Verify a degraded command response without replaying the command."""
+        error_struct, state = self._read_state_response(True, label="sensor_refresh")
+        code = int(error_struct.error_code)
+        for retry_index in range(1, _RS485_SENSOR_VERIFY_RETRY_COUNT + 1):
+            if code not in _RS485_TACTILE_STATUS_CODES:
+                break
+            print(
+                "  sensor_refresh: sensor fields still incomplete; retrying the "
+                f"read-only request ({retry_index}/"
+                f"{_RS485_SENSOR_VERIFY_RETRY_COUNT}) after "
+                f"{_RS485_CRC_RETRY_BACKOFF_S:.2f}s"
+            )
+            time.sleep(_RS485_CRC_RETRY_BACKOFF_S)
+            error_struct, state = self._read_state_response(
+                True, label="sensor_refresh"
+            )
+            code = int(error_struct.error_code)
+
+        if code != 0:
+            detail = _RS485_TACTILE_STATUS_DETAIL.get(
+                code, str(error_struct.error_message)
+            )
+            status = (
+                "STILL PARTIALLY DEGRADED"
+                if code in _RS485_TACTILE_STATUS_CODES
+                else "FAILED"
+            )
+            print(
+                f"  sensor_refresh: {status}  "
+                f"(error_code={code} msg={error_struct.error_message}; {detail})"
+            )
+            return False
+        if state is None:
+            print("  sensor_refresh: FAILED  (SDK returned no state)")
+            return False
+
+        try:
+            finger = state.finger_state[finger_id]
+            sensor_index = _FINGERTIP_TO_SENSOR_IDX[int(finger.id)]
+            sensor = state.sensor_data[sensor_index]
+            calc_values = tuple(
+                float(value)
+                for value in (
+                    sensor.calc_force.fx,
+                    sensor.calc_force.fy,
+                    sensor.calc_force.fz,
+                )
+            )
+            raw_force = list(sensor.raw_force)
+            raw_values = [
+                float(value)
+                for force in raw_force
+                for value in (force.fx, force.fy, force.fz)
+            ]
+            temperature = float(sensor.calc_temperature)
+            if len(raw_force) != 120 or not all(
+                math.isfinite(value)
+                for value in (*calc_values, *raw_values, temperature)
+            ):
+                raise ValueError(
+                    "expected 120 finite distributed-force points and finite "
+                    "combined-force/temperature fields"
+                )
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            print(f"  sensor_refresh: FAILED  (malformed sensor payload: {exc})")
+            return False
+
+        print(
+            "  sensor_refresh: RECOVERED; LIVE SENSOR FRAME OK  "
+            f"(finger={int(finger.id)} raw_points={len(raw_force)} "
+            f"temperature={temperature:g})"
+        )
+        return True
 
     # ── Motion commands ──
 
-    def send_command(self, sleep_s: float = 1.0) -> None:
+    def send_command(self, sleep_s: float = 1.0) -> bool:
         error_struct = self._device.send_command(self._hand_id, self._hand_command)
-        ok = error_struct.error_code == 0
-        print(f"  send_command: {'OK' if ok else 'FAILED'}  "
-              f"(error_code={error_struct.error_code} msg={error_struct.error_message})")
+        code = int(error_struct.error_code)
+        if self._protocol == "RS485":
+            for retry_index in range(1, _RS485_CRC_RETRY_COUNT + 1):
+                if code != _RS485_CRC_ERROR_CODE:
+                    break
+                print(
+                    "  send_command: CRC ERROR; retrying the same absolute target "
+                    f"({retry_index}/{_RS485_CRC_RETRY_COUNT}) after "
+                    f"{_RS485_CRC_RETRY_BACKOFF_S:.2f}s"
+                )
+                time.sleep(_RS485_CRC_RETRY_BACKOFF_S)
+                error_struct = self._device.send_command(
+                    self._hand_id, self._hand_command
+                )
+                code = int(error_struct.error_code)
+        tactile_only = self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
+        if tactile_only:
+            print(
+                "  send_command: MOTION SENT; SENSOR PARTIALLY DEGRADED  "
+                f"(error_code={code} msg={error_struct.error_message}; "
+                f"{_RS485_TACTILE_STATUS_DETAIL[code]})"
+            )
+        else:
+            print(
+                f"  send_command: {'OK' if code == 0 else 'FAILED'}  "
+                f"(error_code={code} msg={error_struct.error_message})"
+            )
         time.sleep(sleep_s)
+        if tactile_only:
+            self._verify_sensor_response_after_send()
+        return code == 0 or tactile_only
 
-    def run_preset_actions(self, actions: PresetActions) -> None:
+    def run_preset_actions(self, actions: PresetActions) -> bool:
         """Run preset actions (fist, palm, v, ok) with 1 s dwell each."""
         self._header("Preset actions")
         for name, qpos_deg in actions.iter_actions():
             print(f"  -> {name}")
             self._set_positions(qpos_deg)
-            self.send_command()
+            if not self.send_command():
+                print(
+                    "  Aborting remaining presets after an unresolved command failure."
+                )
+                return False
+        return True
 
-    def go_home(self) -> None:
+    def go_home(self) -> bool:
         """Return to home position (matches hand.home_qpos_deg)."""
         self._header("Return to home")
         self._set_positions(HOME_QPOS_DEG)
-        self.send_command()
+        return self.send_command()
 
     # ── Cleanup ──
 
@@ -287,22 +576,36 @@ class XHandControlExample:
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def _choose_communication(xhand_exam: XHandControlExample) -> None:
+
+def _serial_port_problem(serial_port: str) -> str | None:
+    """Return a preflight error without opening or otherwise touching a TTY."""
+    port = Path(serial_port)
+    try:
+        mode = port.stat().st_mode
+    except FileNotFoundError:
+        return f"serial port {serial_port} does not exist (or its symlink target disappeared)"
+    except OSError as exc:
+        return f"cannot stat serial port {serial_port}: {exc}"
+
+    if not stat.S_ISCHR(mode):
+        return f"serial port {serial_port} is not a character device"
+    if not os.access(port, os.R_OK | os.W_OK):
+        return f"serial port {serial_port} is not readable and writable by the current user"
+    return None
+
+
+def _choose_communication(xhand_exam: XHandControlExample) -> bool:
     """Prompt user to choose EtherCAT or RS485 and open the device."""
     while True:
         choice = input("Communication method (1=EtherCAT, 2=RS485): ").strip()
         if choice == "1":
             if xhand_exam.open_device("EtherCAT"):
-                return
-            sys.exit(1)
+                return True
+            return False
         elif choice == "2":
-            ports = xhand_exam.enumerate_devices("RS485")
-            if not ports:
-                print("  No RS485 devices found.")
-                sys.exit(1)
-            if xhand_exam.open_device("RS485", ports[0]):
-                return
-            sys.exit(1)
+            if xhand_exam.open_device("RS485", _DEFAULT_SERIAL_PORT):
+                return True
+            return False
         print("Invalid choice -- enter '1' or '2'.")
 
 
@@ -315,27 +618,79 @@ def _select_preset_actions(serial_number: str) -> PresetActions:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Main
+# Hardware worker and parent-side crash containment
 # ═══════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+
+def _run_hardware_session() -> int:
+    """Run one SDK session inside the crash-isolated worker process."""
     params = HandCommandParams()
     xhand_exam = XHandControlExample(hand_id=0, params=params)
 
-    _choose_communication(xhand_exam)  # opens the device (sys.exit(1) on failure)
+    if not _choose_communication(xhand_exam):
+        return 1
 
     try:
         # Identity and diagnostics.
         xhand_exam.read_sdk_version()
         xhand_exam.read_device_info()
         serial_number = xhand_exam.read_serial_number()
-        # Cached read: RS485 force_update=True would re-send the last command.
-        xhand_exam.read_state(finger_id=5, force_update=False)
+        # No command has been sent yet, so explicitly request a live state.
+        if not xhand_exam.read_state(finger_id=5, force_update=True):
+            print("Aborting: no valid initial joint state was received.")
+            return 2
 
         # Motion: home, then preset actions, then return home.
-        xhand_exam.go_home()
+        if not xhand_exam.go_home():
+            print("Aborting: initial home command failed after the bounded retry.")
+            return 2
         actions = _select_preset_actions(serial_number)
-        xhand_exam.run_preset_actions(actions)
-        xhand_exam.go_home()
+        if not xhand_exam.run_preset_actions(actions):
+            return 2
+        if not xhand_exam.go_home():
+            print("Final home command failed after the bounded retry.")
+            return 2
+        return 0
     finally:
         xhand_exam.close()
+
+
+def _disable_worker_core_dump() -> None:
+    """Do not leave a large core file when the closed-source SDK aborts."""
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
+def _run_isolated_hardware_session() -> int:
+    """Keep a native SDK abort from terminating the user's launcher process."""
+    command = [sys.executable, str(Path(__file__).resolve()), _HARDWARE_WORKER_ARG]
+    completed = subprocess.run(command, check=False)
+    if completed.returncode == -signal.SIGABRT:
+        print(
+            "\nXHand SDK worker aborted while its native communication thread was running.\n"
+            "The launcher remained alive and no core file was written. For RS485, check that\n"
+            f"{_DEFAULT_SERIAL_PORT} still exists, the hand is powered, USB/RS485 wiring is stable,\n"
+            "and no other process owns the serial port, then reconnect and retry.",
+            file=sys.stderr,
+        )
+        return 1
+    if completed.returncode < 0:
+        signal_number = -completed.returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"signal {signal_number}"
+        print(f"\nXHand SDK worker terminated by {signal_name}.", file=sys.stderr)
+        return 1
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    if _HARDWARE_WORKER_ARG in sys.argv[1:]:
+        _disable_worker_core_dump()
+        raise SystemExit(_run_hardware_session())
+    raise SystemExit(_run_isolated_hardware_session())

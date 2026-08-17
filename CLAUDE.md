@@ -130,10 +130,10 @@ DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
   additionally reject stale-generation, expired, operational-limit, and rated
   mechanical-limit violations without changing an endpoint. Runtime config may
   narrow, but cannot widen, the bundled rated mechanical envelope.
-  The default TAG path has no additional output EMA. Optional DexPilot retains
-  its own retargeting filters; the bundled outer EMA setting is `1.0`
-  (pass-through).
-  The EtherCAT firmware PID remains the execution-layer trajectory smoother.
+  Neither hand backend has a wrapper-level output EMA. DexPilot retains only
+  dex-retargeting's internal LPFilter, configured to match LeFranX.
+  The XHand firmware PID remains the execution-layer trajectory smoother,
+  independent of the configured transport.
   Coupled hand paths first take a fail-closed hand feedback snapshot
   (`_hand_feedback_snapshot`: `connected`, `state_valid`, no `error_state`,
   `send_healthy`/`read_healthy`, and finite `qpos`/`last_cmd_qpos`), then run the
@@ -349,15 +349,33 @@ Cross-module obligations for each change are the contract in `AGENTS.md` §5
   represents it as a tilted finite box, excludes only configured mounting-link
   contact, and uses mesh distance for soft clearance; fixed-Z frame padding is
   a compatibility fallback only.
-- XHand is a 12-DoF EtherCAT position servo; its command ring is latest-wins.
+- XHand is a 12-DoF position servo. Production defaults to 3 Mbps RS485
+  (`hand.comm_type="serial"`) on the fixed `/dev/ttyUSB0` device; EtherCAT is
+  retained as an explicit runtime override. Its command ring is latest-wins.
   The default keyboard/data-collection path requires measured hand feedback;
   `--no-hand` is an explicit secured/open-pose assumption.
 - XHand contact, backlash, and torque-limited steady-state error are valid
   execution outcomes. Unchanged qpos or failure to converge to a requested
-  angle is diagnostic data, not a freshness fault; use forced-read success,
+  angle is diagnostic data, not a freshness fault; use successful SDK reads,
   source timestamps, worker heartbeat, board error registers, and SDK return
-  codes for health. The v16 `qpos_stale` bit is retained as a reserved false
-  compatibility field.
+  codes for health. RS485 feedback uses a live `read_state(..., True)` state
+  refresh; it does not replay the last motion command. The SDK also refreshes
+  its cache as part of `send_command`, but startup and disarmed reads do not
+  rely on that cache. After `open_serial`, the driver waits 1 s before its
+  first transaction. A 1501070 CRC response retries the exact same absolute
+  target once after 80 ms; a second CRC remains an actuator-send failure. A
+  live, read-only state transaction retries CRC twice with the same backoff and
+  accepts only a subsequently verified response; retry exhaustion remains a
+  read failure.
+  RS485 status codes 1501018–1501020 describe field-specific sensor failures
+  while preserving the valid joint portion (and, for `send_command`, the
+  transmitted absolute target). 1501018 invalidates the force frame
+  conservatively; 1501019 invalidates only distributed force while retaining
+  combined force/contact; 1501020 invalidates only temperature, which is not
+  part of the runtime schema, so both force fields remain usable. Statuses are
+  transaction-local and the next successful read recovers immediately. Timeout
+  and board errors remain immediate transaction failures. The v16
+  `qpos_stale` bit is retained as a reserved false compatibility field.
 - Hand `state_valid` mirrors `connected` (set from the last read's connection
   flag; the first frame is set unconditionally). Hand feedback health has one
   shared predicate — `validate_hand_feedback` (`utils/hand_health.py`) — invoked

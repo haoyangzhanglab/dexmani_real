@@ -78,8 +78,8 @@ XHand driver：最终范围检查，原样发送 endpoint
 
 1. 正常控制只消费**右手 21 个关键点**；手腕四元数服务于机械臂映射，不参与手指 retarget。
 2. DexPilot 是当前默认后端；TAG 是仓库内可审计的备选后端。
-3. TAG 当前**没有输出级 EMA**。它的连续性来自 Stage 1 时间正则、pinch activation EMA 和启动 ramp。
-4. DexPilot 默认保留外部库内部 LPFilter；仓库包装层的 output EMA 当前为直通。
+3. 两个后端都**没有 wrapper 输出级 EMA**。TAG 的连续性来自 Stage 1 时间正则、pinch activation EMA 和启动 ramp。
+4. DexPilot 只保留外部库内部 LPFilter，参数与 LeFranX 对齐。
 5. operational command bounds 当前是**发布前逐关节投影**，不是求解器边界，也不是整条拒绝条件。
 6. 应用侧 command-to-command delta clamp（`hand.max_delta_rad`）已移除；手部速度保护仅由 EtherCAT 固件 PID 与电流限位承担。
 7. 结构错误、NaN/Inf、机械范围错误和 IPC/lifecycle 错误仍然 fail closed，不会被裁成合法动作。
@@ -168,7 +168,6 @@ generation 与有效期解决不同问题：
 | TAG `last_qpos` | TAG optimizer | Stage 1 或 Stage 2 成功返回时 | retargeter reset |
 | TAG `pinch_factors` | TAG optimizer | Stage 1 成功后、Stage 2 判断前 | retargeter reset |
 | DexPilot warm start / internal LP | dex-retargeting | 外部 `retarget()` 成功调用时 | wrapper reset |
-| wrapper output EMA | DexPilot wrapper | 仅当 alpha < 1 时；当前默认直通 | wrapper reset |
 | hand ramp step | teleop | 进入 ramp shaping 分支时 | reanchor、ramp 完成或显式清理 |
 | `ctx.prev_hand_qpos` | teleop | 候选发布成功后 | home / reanchor seed |
 | worker command-ring cursor | hand worker | 读取一个新 hand command ring sequence 时 | worker 生命周期 |
@@ -394,16 +393,17 @@ DexPilot 的 optimizer 边界主要来自机械范围 `xhand_right.urdf` 和外�
 
 | 层 | 当前默认 |
 |---|---:|
-| vector scaling factor | 1.05 |
-| projected enter / escape | 25 mm / 35 mm |
-| dex-retargeting internal LPFilter | alpha 0.35 |
-| 仓库 wrapper output EMA | alpha 1.0，直通 |
+| vector scaling factor | 1.0 |
+| projected enter / escape | 30 mm / 30 mm |
+| dex-retargeting internal LPFilter | alpha 0.6 |
 
-不对称的 enter/escape 距离构成迟滞，用于降低 projected-vector 在阈值附近的往返切换。DexPilot 当前不是文档历史版本中的“两层持续 EMA”；它仅保留外部库内部 LPFilter。
+这些值与 LeFranX 的 XHand DexPilot 有效配置一致。`project_dist` 控制指尖间距缩小时何时进入 projected 状态；进入后，相关参考向量会被替换为很短的固定长度并大幅提高优化权重，从而强化捏合/指间靠近。`escape_dist` 控制距离增大时何时退出该状态。当前二者同为 30 mm，因此没有迟滞区间：低于 30 mm 进入，高于 30 mm 退出，恰好等于 30 mm 时保持上一状态。
+
+DexPilot 当前只有一层持续输出滤波，即外部库内部 LPFilter；仓库 wrapper 不再维护第二层 EMA。
 
 这些字段通过 runtime config 的 `dexpilot_retargeting` section 注入 wrapper。当前安装的 `dex-retargeting==0.4.6` 没有把 config-level Huber/temporal 参数接入 `DexPilotOptimizer` 的实际优化路径，因此 runtime 不暴露无效调参项。
 
-`reset()` 会清除外部 optimizer warm start、internal LPFilter、projected flags 和 wrapper EMA state，并尝试用 measured SDK qpos 重建内部顺序的 warm start。
+`reset()` 会清除外部 optimizer warm start、internal LPFilter 和 projected flags，并尝试用 measured SDK qpos 重建内部顺序的 warm start。
 
 ### 7.1 两后端语义差异
 
@@ -413,7 +413,7 @@ DexPilot 的 optimizer 边界主要来自机械范围 `xhand_right.urdf` 和外�
 | 目标 | 5 条 wrist-to-tip | 15 条 reference vectors |
 | pinch | 独立 Stage 2 | 外部 projected-vector 机制 |
 | 持续平滑 | 时间正则 + activation EMA | 外部 internal LPFilter |
-| wrapper output EMA | 无 | 当前直通 |
+| wrapper output EMA | 无 | 无 |
 | optimizer bounds 来源 | mechanical URDF | mechanical URDF / 外部实现 |
 | Stage 2 回退 | 有 | 由外部实现决定 |
 | raw 可观测性 | 明确的 solver SDK-order 输出 | 当前只得到外部 retarget 返回值 |
@@ -454,6 +454,8 @@ observed → solved → shaped → published → accepted / measured
 因果 reader 可能在相邻控制网格返回同一个 VR ring sequence。teleop 对每个 sequence 最多调用一次有状态 backend：成功结果被缓存供后续网格复用，失败结果也不会在同一观测上重试。该缓存只约束 solver；startup ramp 仍按 16 Hz 控制网格推进。
 
 ### 8.3 startup ramp
+
+这是 begin/reanchor 后的一次性发布侧过渡，不是 DexPilot 内部滤波，也不会在正常持续控制中一直叠加。`q_start` 优先取重锚时刚读到的 measured hand qpos，必要时回退到上一条已发布手命令；两者都不可用时才不能完成重锚。它的目的，是避免真实手当前姿态与第一帧 live retarget target 不同而造成单周期命令跳变。
 
 默认 ramp duration 为 0.5 s，在 16 Hz 下通过四舍五入得到 8 个 shaping step。第 k 步使用 smoothstep：
 
@@ -584,7 +586,7 @@ HDF5 schema v16 保存与 hand retarget 相关的主要信息：
 当前 raw 语义：
 
 - TAG：solver 输出，SDK order，ramp 和 command shaping 之前；
-- DexPilot：外部 retargeter 返回值，已经包含 external internal LPFilter；wrapper EMA 当前默认直通；
+- DexPilot：外部 retargeter 返回值，已经包含 external internal LPFilter；
 - retarget failure：raw helper 回退为当前 hold endpoint。
 - held / safety-fallback frame：当前 held recorder path 没有接收被拒绝的 solver raw，字段会退回 hold action。
 
@@ -637,16 +639,17 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 - mechanical-bound/operational-clip 占用率、solver P95/P99 耗时和失败数；
 - DexPilot projected bit 切换数，以及 thumb-index 近接召回/误闭合率。
 
-对 `episodes/episode_20260816_234045` 的 960 帧、16 Hz 数据进行有界搜索后，当前默认 DexPilot 候选为 `scale=1.05, LP alpha=0.35, project=25 mm, escape=35 mm`。关节相关、指尖几何和步长均以发布前 operational clip 后的有效 endpoint 计算；离线结果为：平均 lag 1.375 帧，8 关节平均/min 相关 0.875/0.766，指尖距离相关 0.736，P95/P99 步长 23.69°/28.42°，静止区间 P95 1.01°，projected bit 切换 193 次，P95 solver 耗时约 4.3 ms。该 episode 上的调优 TAG (`smooth_weight=0.003`) 平均 lag 同为 1.375 帧，但指尖距离相关为 0.690，静止区间 P95 步长为 4.43°，因此保留为备选而非默认。
+历史上对 `episodes/episode_20260816_234045` 的 960 帧、16 Hz 数据进行有界搜索，曾得到 `scale=1.05, LP alpha=0.35, project=25 mm, escape=35 mm`。该候选的离线结果为：平均 lag 1.375 帧，8 关节平均/min 相关 0.875/0.766，指尖距离相关 0.736，P95/P99 步长 23.69°/28.42°，静止区间 P95 1.01°，projected bit 切换 193 次，P95 solver 耗时约 4.3 ms。当前运行默认已按控制基线要求恢复为 LeFranX 的有效参数 `scale=1.0, LP alpha=0.6, project=30 mm, escape=30 mm`，因此上述指标只保留为历史调参记录，不能作为当前默认值的接受结果。
 
-home 不直接平均 episode 中前 4 帧的 recorded raw/final：它们仍包含 warm-start 和 startup ramp 过渡。离线工具对每个初始 landmark 独立 reset，关闭 DexPilot 输出滤波后重复求解 512 次，对 4 个静态收敛解取 per-joint median，然后投影到 operational bounds，并为 8 个手指弯曲关节保留至少 5° 下限余量。当前 home（SDK order，deg）为：
+home 使用 Dexora `deploy/xhand_forwarder.py` 的右手 `INIT_JOINTS_DEG`（XHand SDK order），再投影到本项目既有的 operational command bounds。它是独立的设备回零端点，不是 DexPilot 求解器参数：
 
 ```text
-[0.67, 15.51, 65.18, 2.11, 5.00, 5.00,
- 5.00,  5.00,  5.00, 9.23, 18.89, 5.00]
+[30.00, 55.33, 10.00, 0.17,
+  1.08,  5.00,  1.25, 5.00,
+  1.33,  5.00,  1.33, 5.00]
 ```
 
-4 个静态解的最大跨帧离散为 0.36°，最终 settle residual 约 0.00023°。受 5° 防硬限余量约束，该 home 与前 4 帧 solver raw 输出的最大差为 5.06°；clip 后这些下限关节与 home 一致。这些都是单个 episode 上的离线接受结果，不代替低速真机观察、跨用户/跨 episode 验证和触觉抓取验证。
+Dexora 原始右手 init 为 `[30, 55.33, 3, 0.17, 1.08, 0.92, 1.25, 1.25, 1.33, 0.33, 1.33, -0.08]°`。其中 thumb distal（SDK 索引 2）低于本项目 10° 下限，index/middle/ring/pinky distal（SDK 索引 5/7/9/11）低于本项目 5° 防机械卡死下限，因此只把这五维提升到对应下限；其余七维保持 Dexora 值，operational bounds 本身不变。该参考项目数值不代替低速真机观察和触觉抓取验证。
 
 ## 14. 后续实现 backlog（当前尚未实现）
 
@@ -774,7 +777,7 @@ home 不直接平均 episode 中前 4 帧的 recorded raw/final：它们仍包�
 → fixed-grid recording
 ```
 
-TAG 提供仓库内可审计的五指位置匹配和条件式捏合精修；DexPilot 提供外部 vector-graph 路径。当前输出机制已经简化为：TAG 不再增加 output EMA，DexPilot wrapper 默认直通，启动阶段使用 ramp，operational command floor 通过发布前 clip 实现，应用侧 command-to-command delta clamp 已移除。
+TAG 提供仓库内可审计的五指位置匹配和条件式捏合精修；DexPilot 提供外部 vector-graph 路径。两个 wrapper 都不再增加 output EMA；DexPilot 只保留内部 LPFilter，启动阶段使用 ramp，operational command floor 通过发布前 clip 实现，应用侧 command-to-command delta clamp 已移除。
 
 需要长期保持清晰的不是某个默认数字，而是以下边界：
 

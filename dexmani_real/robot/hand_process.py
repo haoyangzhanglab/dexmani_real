@@ -47,6 +47,10 @@ class HandProcessConfig:
     device_name: str | None = field(default_factory=lambda: hand.device_name)
     baudrate: int = field(default_factory=lambda: hand.baudrate)
     device_id: int = field(default_factory=lambda: hand.device_id)
+    rs485_post_open_settle_s: float = field(default_factory=lambda: hand.rs485_post_open_settle_s)
+    rs485_crc_retry_count: int = field(default_factory=lambda: hand.rs485_crc_retry_count)
+    rs485_read_crc_retry_count: int = field(default_factory=lambda: hand.rs485_read_crc_retry_count)
+    rs485_crc_retry_backoff_s: float = field(default_factory=lambda: hand.rs485_crc_retry_backoff_s)
 
     home_qpos_rad: tuple[float, ...] = field(
         default_factory=lambda: tuple(float(value) for value in np.deg2rad(hand.home_qpos_deg))
@@ -85,6 +89,14 @@ class HandProcessConfig:
             raise ValueError("hand process baudrate must be a positive integer")
         if not isinstance(self.device_id, int) or self.device_id < 0:
             raise ValueError("hand process device_id must be a non-negative integer")
+        if not np.isfinite(self.rs485_post_open_settle_s) or self.rs485_post_open_settle_s < 0:
+            raise ValueError("hand process rs485_post_open_settle_s must be finite and non-negative")
+        if not isinstance(self.rs485_crc_retry_count, int) or self.rs485_crc_retry_count < 0:
+            raise ValueError("hand process rs485_crc_retry_count must be a non-negative integer")
+        if not isinstance(self.rs485_read_crc_retry_count, int) or self.rs485_read_crc_retry_count < 0:
+            raise ValueError("hand process rs485_read_crc_retry_count must be a non-negative integer")
+        if not np.isfinite(self.rs485_crc_retry_backoff_s) or self.rs485_crc_retry_backoff_s < 0:
+            raise ValueError("hand process rs485_crc_retry_backoff_s must be finite and non-negative")
         home = np.asarray(self.home_qpos_rad, dtype=np.float64)
         lower = np.asarray(self.qpos_lower_rad, dtype=np.float64)
         upper = np.asarray(self.qpos_upper_rad, dtype=np.float64)
@@ -134,6 +146,10 @@ class HandProcessConfig:
             device_name=None if cfg.device_name is None else str(cfg.device_name),
             baudrate=int(cfg.baudrate),
             device_id=int(cfg.device_id),
+            rs485_post_open_settle_s=float(cfg.rs485_post_open_settle_s),
+            rs485_crc_retry_count=int(cfg.rs485_crc_retry_count),
+            rs485_read_crc_retry_count=int(cfg.rs485_read_crc_retry_count),
+            rs485_crc_retry_backoff_s=float(cfg.rs485_crc_retry_backoff_s),
             home_qpos_rad=tuple(float(value) for value in np.deg2rad(cfg.home_qpos_deg)),
             qpos_lower_rad=tuple(float(value) for value in cfg.qpos_min_rad),
             qpos_upper_rad=tuple(float(value) for value in cfg.qpos_max_rad),
@@ -249,6 +265,10 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     device_name=cfg.device_name,
                     baudrate=cfg.baudrate,
                     device_id=cfg.device_id,
+                    rs485_post_open_settle_s=cfg.rs485_post_open_settle_s,
+                    rs485_crc_retry_count=cfg.rs485_crc_retry_count,
+                    rs485_read_crc_retry_count=cfg.rs485_read_crc_retry_count,
+                    rs485_crc_retry_backoff_s=cfg.rs485_crc_retry_backoff_s,
                     kp_per_joint=np.asarray(cfg.kp, dtype=np.int32),
                     ki=cfg.ki,
                     kd=cfg.kd,
