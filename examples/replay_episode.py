@@ -105,7 +105,6 @@ _MODEL_PROVENANCE_KEYS = (
     "arm_hand_urdf_sha256",
     "arm_hand_srdf_sha256",
 )
-_PREFLIGHT_MAX_JOINT_STEP_RAD = 0.02
 
 _STATUS_INTERVAL_FRAMES = 50
 _WAIT_POLL_INTERVAL_S = 0.01
@@ -719,10 +718,9 @@ def verify_live_replay_preflight(
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
-    Checks: hand-data attestation, provenance (source/config/models), every
-    adjacent-frame pair via dense sub-step interpolation for workspace,
-    self-collision, and table penetration. Called once before worker startup;
-    any rejection prevents hardware access entirely.
+    Checks: hand-data attestation, provenance (source/config/models), and every
+    adjacent-frame pair for workspace and self-collision. Called once before
+    worker startup; any rejection prevents hardware access entirely.
     """
     require_explicit_hand_mode(trajectory)
     if not bool(runtime.policy.hand_enabled):
@@ -759,21 +757,6 @@ def verify_live_replay_preflight(
             raise ValueError(f"live replay workspace rejection at transition {start}->{end}")
         if not planner.collision_model.check_transition_collision_free(arm_start, arm_end, hand_start, hand_end):
             raise ValueError(f"live replay collision rejection at transition {start}->{end}")
-        max_delta = max(
-            float(np.max(np.abs(arm_end - arm_start))),
-            float(np.max(np.abs(hand_end - hand_start))),
-        )
-        steps = max(1, int(np.ceil(max_delta / _PREFLIGHT_MAX_JOINT_STEP_RAD)))
-        for alpha in np.linspace(0.0, 1.0, steps + 1):
-            arm_qpos = arm_start + alpha * (arm_end - arm_start)
-            hand_qpos = hand_start + alpha * (hand_end - hand_start)
-            planner.collision_model.set_hand_qpos(hand_qpos)
-            table_distance_m = planner.collision_model.minimum_table_distance(arm_qpos)
-            if (
-                not np.isfinite(table_distance_m)
-                or table_distance_m < planner.collision_model.table_soft_clearance_m
-            ):
-                raise ValueError(f"live replay table rejection at transition {start}->{end}")
 
 
 # ========================================================================

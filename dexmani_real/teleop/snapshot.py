@@ -70,7 +70,22 @@ class CameraFreshnessTracker:
                 self.last_frame_number = frame_number
             frame["camera_age_s"] = age_s
             frame["camera_fresh"] = fresh
-            frame["pointcloud_valid"] = bool(frame.get("pointcloud_valid", False)) and fresh
+            # A FRAME_GAP frame still carries a fresh, geometrically valid
+            # depth/pointcloud — only the device frame counter jumped, which
+            # means the loop briefly overran its deadline, not that the pixels
+            # are stale. Keep that pointcloud rather than zeroing it; only the
+            # genuinely untrustworthy health states invalidate it.
+            # CameraHealth enum (sensor/camera_process.py): 0=OK, 1=CLOCK_RESET,
+            # 2=DUPLICATE, 3=FRAME_GAP, 4=BACKLOG.
+            _health = int(frame.get("camera_health", 0))
+            _pointcloud_trustworthy = _health in (0, 3)
+            frame["pointcloud_valid"] = (
+                bool(frame.get("pointcloud_valid", False))
+                and is_new
+                and after_episode_start
+                and age_s <= self.max_age_s
+                and _pointcloud_trustworthy
+            )
 
         if fresh:
             self.stale_since_s = None

@@ -323,6 +323,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         # ── Main capture loop ──
         rate_mgr = RateManager(cfg.publish_hz)
         ready_published = False
+        _pointcloud_warmed_up = False
 
         while shared.is_running.value:
             # Pointcloud is only consumed by RecorderIO, so compute it only when
@@ -415,6 +416,26 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                         _logger.info("camera_loop: ready after first verified frame @ %.1f Hz", cfg.publish_hz)
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
+
+            # --- one-time pointcloud warmup (DISARMED) ---
+            # The pointcloud pipeline lazily imports open3d on its first
+            # process() call (~hundreds of ms).  Pay that cost now, while still
+            # DISARMED, so the first recording tick isn't stalled by it and the
+            # episode doesn't open with a run of invalid zero-pointcloud frames.
+            if (
+                processor is not None
+                and ready_published
+                and not _pointcloud_warmed_up
+                and not _needs_pointcloud
+            ):
+                try:
+                    _warm_frame = cam.read(timeout_ms=300, compute_depth=True)
+                    processor.process(_warm_frame.depth, _warm_frame.rgb, cam.get_rays())
+                    _logger.info("camera_loop: pointcloud pipeline warmed up")
+                except Exception:
+                    _logger.warning("camera_loop: pointcloud warmup failed", exc_info=True)
+                finally:
+                    _pointcloud_warmed_up = True
 
             # --- maintain target rate (absolute-deadline scheduling, consistent with other loops) ---
             rate_mgr.wait()

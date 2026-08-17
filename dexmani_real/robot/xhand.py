@@ -150,6 +150,12 @@ class XHandConfig:
     # provenance for a physical SI conversion has not been validated on this
     # installation, so recordings deliberately label the unit unknown.
     tactile_contact_threshold: float = 1.0
+    # Per-point raw-force magnitude threshold (same scaled units) for the
+    # startup "genuine contact" gate.  calc_force can carry a residual DC
+    # offset on some sensors, so genuine contact is judged from the raw
+    # 120-point force field instead; a raw force above this threshold means a
+    # real contact, not an offset.  Requires per-hardware calibration.
+    raw_force_contact_threshold: float = 1.0
 
     def __post_init__(self) -> None:
         if self.comm_type not in ("ethercat", "serial"):
@@ -195,6 +201,8 @@ class XHandConfig:
             raise ValueError("XHand home_qpos must be inside command limits")
         if not np.isfinite(self.tactile_contact_threshold) or self.tactile_contact_threshold < 0:
             raise ValueError("tactile_contact_threshold must be finite and non-negative")
+        if not np.isfinite(self.raw_force_contact_threshold) or self.raw_force_contact_threshold < 0:
+            raise ValueError("raw_force_contact_threshold must be finite and non-negative")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "XHandConfig":
@@ -595,7 +603,11 @@ class XHand:
         # Check the raw startup load before reset_sensor() can redefine the
         # loaded state as zero. Missing/malformed tactile feedback also fails
         # calibration closed while leaving non-tactile hand operation usable.
-        if not sample.tactile_sum_valid or self._tactile_load_present(sample.tactile_sum):
+        if not sample.tactile_sum_valid or self._tactile_load_present(
+            sample.tactile_sum,
+            raw_force=sample.tactile_force,
+            raw_valid=sample.tactile_valid,
+        ):
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
             self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
             self.tactile_calibrated = False
@@ -616,8 +628,27 @@ class XHand:
             logger.warning("Tactile initialization degraded: reset/verification failed", exc_info=True)
         return self.tactile_calibrated
 
-    def _tactile_load_present(self, force_sum: Any) -> bool:
-        """Fail-closed startup-load check in the SDK's unverified units."""
+    def _tactile_load_present(
+        self,
+        force_sum: Any,
+        raw_force: Any = None,
+        raw_valid: bool = True,
+    ) -> bool:
+        """Fail-closed startup-load check in the SDK's unverified units.
+
+        ``force_sum`` (calc_force) can carry a residual DC offset on some
+        sensors, so genuine contact is judged from the raw per-point force
+        field when it is available; a calc_force-only offset then no longer
+        blocks calibration.  When the raw field is unavailable or invalid, fall
+        back to the calc_force threshold (fail closed).
+        """
+        if raw_valid and raw_force is not None:
+            raw = np.asarray(raw_force, dtype=np.float64)
+            if raw.shape != HAND_TACTILE_FORCE_SHAPE or not np.all(np.isfinite(raw)):
+                return True
+            return bool(
+                np.any(np.linalg.norm(raw, axis=2) > self.config.raw_force_contact_threshold)
+            )
         value = np.asarray(force_sum, dtype=np.float64)
         if value.shape != HAND_TACTILE_SUM_SHAPE or not np.all(np.isfinite(value)):
             return True
@@ -807,9 +838,12 @@ class XHand:
             raw_samples.append(raw_force)
 
         # A loaded/contacting hand is not a valid zero reference. Refuse to
-        # absorb the external load into the software bias.
-        pre_bias_magnitude = np.linalg.norm(np.stack(ft_samples, axis=0), axis=2)
-        if float(np.max(pre_bias_magnitude)) > self.config.tactile_contact_threshold:
+        # absorb the external load into the software bias. Judge contact from
+        # the raw force field, not calc_force, so a residual calc_force DC
+        # offset doesn't refuse calibration (the calc_force bias below still
+        # absorbs that offset).
+        raw_magnitude = np.linalg.norm(np.stack(raw_samples, axis=0), axis=3)
+        if float(np.max(raw_magnitude)) > self.config.raw_force_contact_threshold:
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
             self._tactile_bias_raw = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
             self.tactile_calibrated = False

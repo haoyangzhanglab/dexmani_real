@@ -214,7 +214,16 @@
       "Bash(pdftotext -layout \"/home/zhanghaoyang/Desktop/硬件/Xhand/SDK/C++/XHAND SDK接口说明文档.pdf\" sdk_cpp.txt)",
       "Bash(claude --version)",
       "Bash(npm view *)",
-      "WebFetch(domain:registry.npmjs.org)"
+      "WebFetch(domain:registry.npmjs.org)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/diag_table_reject.py)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/diag_sweep.py)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/diag_fingertips.py)",
+      "Bash(PYTHONPATH=. $PY *)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/diag_replay_metrics.py)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/dump_episode_meta.py)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/dump_episode2.py)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/analyze_episode.py)",
+      "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python *)"
     ]
   }
 }

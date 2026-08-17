@@ -257,7 +257,8 @@ attribute。本节各表列出当前标准采集入口实际提供的全部键�
 | `tactile_si_unit_verified` | bool | `False`。 |
 | `tactile_bias_semantics` | 字符串 | 启动软件 bias 在可用时扣除；逐行看 `tactile_calibrated`。 |
 | `tactile_contact_metric` | 字符串 | 每指 `hand_contact` 三轴的 L2 norm。 |
-| `tactile_contact_threshold` | float64 | 当前生产值 `1.0`，单位同缩放后 SDK 值。 |
+| `tactile_contact_threshold` | float64 | 逐帧 `hand_tactile_contact` 判定阈值，当前生产值 `1.0`，单位同缩放后 SDK 值。 |
+| `raw_force_contact_threshold` | float64 | 启动标定“真接触”门禁用逐点 raw force，当前生产值 `1.0`，单位同缩放后 SDK 值。 |
 | `tactile_contact_comparison` | 字符串 | `strict_greater_than`。 |
 | `arm_tau_source` | 字符串 | `xarm_get_joint_states_num_3_effort`。 |
 | `arm_tau_unit` | 字符串 | `unknown`。 |
@@ -406,7 +407,7 @@ HTS sequence id；上述四个 dataset 是 v16 中持久化的 VR 内容全集�
 |---|---:|---|---|---|
 | `camera_health` | `(N,)` | int64 | 枚举 | 当前相机帧健康分类，见第 7 节；没有 camera frame 时默认 1。 |
 | `flag_camera_fresh` | `(N,)` | bool | — | 帧为新 ring sequence、新 frame number、录制开始后、health=OK 且年龄不超阈值；合成槽清 false。 |
-| `flag_pointcloud_valid` | `(N,)` | bool | — | 此槽点云是真实且 fresh 的处理结果；false 时 `pointcloud` 对应帧为全零。 |
+| `flag_pointcloud_valid` | `(N,)` | bool | — | 此槽点云是真实处理结果：要求新 ring sequence、新 frame number、录制开始后、年龄不超阈值、`camera_health` 为 OK 或 FRAME_GAP；CLOCK_RESET/DUPLICATE/BACKLOG 或非新帧/超龄清 false。false 时 `pointcloud` 对应帧为全零。 |
 | `camera_frame_number` | `(N,)` | int64 | 设备帧号 | RealSense depth frame number。 |
 | `camera_ring_sequence` | `(N,)` | int64 | ring sequence | shared camera ring 的 verified 序号。 |
 | `camera_device_timestamp_s` | `(N,)` | float64 | device s | RealSense `get_timestamp()` 从 ms 转成 s；设备时钟域。 |
@@ -505,6 +506,11 @@ RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
 | 2 | `DUPLICATE` | 重复设备帧。 |
 | 3 | `FRAME_GAP` | 检测到设备帧号间隙。 |
 | 4 | `BACKLOG` | backlog 超过运行时最大帧年龄阈值。 |
+
+`camera_health` 同时门控 `flag_camera_fresh` 与 `flag_pointcloud_valid`，但判据不同：
+`flag_camera_fresh` 要求 health=OK；`flag_pointcloud_valid` 要求 health 为 OK 或 FRAME_GAP，
+因为 FRAME_GAP 只是设备帧号跳号（相机循环短暂超预算），其深度/点云仍新鲜有效，故保留
+点云而 `flag_camera_fresh` 仍记 false，以保留跳号信号供下游过滤。
 
 ### 7.3 `flag_frame_status`
 
@@ -685,6 +691,11 @@ depth-value frame：
 3. `hand_tactile_contact[f]` 按
    `norm(hand_contact[f, :], ord=2) > tactile_contact_threshold` 计算；
 4. 默认 `tactile_contact_threshold=1.0`，单位与缩放后的三轴汇总值相同，仍不得解释为 N。
+
+启动标定的“真接触”门禁不用 `calc_force`，而用逐点 raw force（`raw_force_contact_threshold`，
+默认 1.0）：部分传感器的 `calc_force` 通道带残余 DC 偏移，会把未加载的手误判为“有接触”
+而拒绝标定。raw force 无该偏移，是更可靠的判据；raw force 缺失或无效时回退 `calc_force`
+判据（fail-closed）。标定通过后，软件 bias 仍从 `calc_force` 均值扣除以吸收该 DC 偏移。
 
 第二，旧 `_iter_sensors()` 接受少于 5 个传感器，`parse_tactile*()` 又以零初始化；因此完整
 关节帧配上空 `sensor_data` 会被解释为全零力/无接触，甚至可能进入 calibration 流。这是

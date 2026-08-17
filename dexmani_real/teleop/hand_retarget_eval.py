@@ -39,13 +39,20 @@ _TIP_INDICES = (4, 8, 12, 16, 20)
 _TIP_PAIRS = tuple(
     (first, second) for first in range(5) for second in range(first + 1, 5)
 )
-# Human MCP flex and combined PIP+DIP flex mapped to the two robot flexion
-# joints for index, middle, ring, and pinky. Thumb metrics stay separate until
-# its opposition convention is calibrated explicitly.
-_FLEXION_JOINT_INDICES = (4, 5, 6, 7, 8, 9, 10, 11)
+# Human flexion mapped to the robot flexion joints.  Index/mid/ring/pinky:
+# human MCP → j1, human PIP+DIP → j2.  Thumb: human CMC → thumb_bend,
+# human MCP+IP → thumb_rota2 (the IP joint is fixed, so rota2 carries both).
+# thumb_rota1 (CMC opposition rotation) has no landmark-flexion mapping and is
+# scored only through fingertip geometry.
+_FLEXION_JOINT_INDICES = (0, 2, 4, 5, 6, 7, 8, 9, 10, 11)
 _FLEXION_JOINT_NAMES = tuple(
     XHAND_SDK_JOINT_NAMES[index] for index in _FLEXION_JOINT_INDICES
 )
+
+# Finger-flexion joints only (no thumb/abduction) — the subset that receives the
+# explicit lower-stop margin when estimating home. Thumb opposition and index
+# abduction keep their configured operational envelope there.
+_HOME_MARGIN_JOINT_INDICES = (4, 5, 6, 7, 8, 9, 10, 11)
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,8 @@ class RetargetMetrics:
     min_best_flexion_rho: float
     best_lag_frames_by_joint: dict[str, int]
     best_flexion_rho_by_joint: dict[str, float]
+    flexion_bias_deg_by_joint: dict[str, float]
+    mean_abs_flexion_bias_deg: float
     fingertip_distance_mean_rho: float
     max_step_p95_deg: float
     max_step_p99_deg: float
@@ -204,12 +213,16 @@ def extract_hand_features(landmarks: np.ndarray) -> HandFeatures:
 
     flexion = np.column_stack(
         [
-            feature
-            for finger_index in range(1, 5)
-            for feature in (
-                angles[:, finger_index, 0],
-                angles[:, finger_index, 1] + angles[:, finger_index, 2],
-            )
+            angles[:, 0, 0],
+            angles[:, 0, 1] + angles[:, 0, 2],
+            *[
+                feature
+                for finger_index in range(1, 5)
+                for feature in (
+                    angles[:, finger_index, 0],
+                    angles[:, finger_index, 1] + angles[:, finger_index, 2],
+                )
+            ],
         ]
     )
     tips = points[:, _TIP_INDICES]
@@ -333,7 +346,7 @@ def evaluate_run(
 
     expected_feature_shapes = (
         ("chain_angles_rad", features.chain_angles_rad, (frame_count, 5, 3)),
-        ("flexion_features_rad", features.flexion_features_rad, (frame_count, 8)),
+        ("flexion_features_rad", features.flexion_features_rad, (frame_count, 10)),
         ("fingertip_distances_m", features.fingertip_distances_m, (frame_count, 10)),
         ("max_angle_step_rad", features.max_angle_step_rad, (frame_count - 1,)),
     )
@@ -362,6 +375,7 @@ def evaluate_run(
 
     best_lags: list[int] = []
     best_rhos: list[float] = []
+    flexion_bias_deg: dict[str, float] = {}
     for feature_index, joint_index in enumerate(_FLEXION_JOINT_INDICES):
         lag, rho = _best_nonnegative_lag(
             features.flexion_features_rad[:, feature_index],
@@ -371,6 +385,16 @@ def evaluate_run(
         )
         best_lags.append(lag)
         best_rhos.append(rho)
+        reference = features.flexion_features_rad[:, feature_index]
+        response = qpos[:, joint_index]
+        stop = len(reference) - lag
+        bias_rad = float(
+            np.mean(response[startup_skip_frames + lag:] - reference[startup_skip_frames:stop])
+        )
+        flexion_bias_deg[_FLEXION_JOINT_NAMES[feature_index]] = float(np.rad2deg(bias_rad))
+    mean_abs_flexion_bias_deg = float(
+        np.mean(np.abs(np.asarray(list(flexion_bias_deg.values()), dtype=np.float64)))
+    )
 
     kinematics = kinematics or HandKinematics(
         _HAND_URDF_PATH, list(hand.fingertip_link_names)
@@ -436,6 +460,8 @@ def evaluate_run(
         min_best_flexion_rho=float(np.min(best_rhos)),
         best_lag_frames_by_joint=dict(zip(_FLEXION_JOINT_NAMES, best_lags)),
         best_flexion_rho_by_joint=dict(zip(_FLEXION_JOINT_NAMES, best_rhos)),
+        flexion_bias_deg_by_joint=flexion_bias_deg,
+        mean_abs_flexion_bias_deg=mean_abs_flexion_bias_deg,
         fingertip_distance_mean_rho=float(np.mean(pair_rhos)),
         max_step_p95_deg=float(
             np.quantile(max_step_deg[max(0, startup_skip_frames - 1) :], 0.95)
@@ -531,9 +557,9 @@ def estimate_home_qpos(
     safe_lower = np.asarray(hand.qpos_min_rad, dtype=np.float64).copy()
     mechanical_lower = np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64)
     flexion_margin_rad = np.deg2rad(flexion_lower_margin_deg)
-    safe_lower[list(_FLEXION_JOINT_INDICES)] = np.maximum(
-        safe_lower[list(_FLEXION_JOINT_INDICES)],
-        mechanical_lower[list(_FLEXION_JOINT_INDICES)] + flexion_margin_rad,
+    safe_lower[list(_HOME_MARGIN_JOINT_INDICES)] = np.maximum(
+        safe_lower[list(_HOME_MARGIN_JOINT_INDICES)],
+        mechanical_lower[list(_HOME_MARGIN_JOINT_INDICES)] + flexion_margin_rad,
     )
     safe_upper = np.asarray(hand.qpos_max_rad, dtype=np.float64)
     estimated = np.clip(unconstrained, safe_lower, safe_upper)
@@ -774,6 +800,7 @@ def _selection_key(metrics: RetargetMetrics) -> tuple[float, ...]:
         max(0.0, metrics.max_step_p95_deg - 25.0),
         max(0.0, metrics.stationary_step_p95_deg - 3.0),
         -(metrics.mean_best_flexion_rho + metrics.fingertip_distance_mean_rho),
+        metrics.mean_abs_flexion_bias_deg,
         metrics.mean_best_lag_frames,
         metrics.operational_clip_occupancy,
         metrics.projected_transition_frames / metrics.frame_count,

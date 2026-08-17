@@ -203,6 +203,7 @@ SEMANTIC_META_ATTRS_V16: dict[str, str | float | bool] = {
     "tactile_bias_semantics": "startup_software_bias_subtracted_when_available;see_tactile_calibrated",
     "tactile_contact_metric": "per_finger_l2_norm_hand_contact",
     "tactile_contact_threshold": 1.0,
+    "raw_force_contact_threshold": 1.0,
     "tactile_contact_comparison": "strict_greater_than",
     "arm_tau_source": "xarm_get_joint_states_num_3_effort",
     "arm_tau_unit": "unknown",
