@@ -1,4 +1,4 @@
-"""Transactional HDF5 v16 episode serialization.
+"""Transactional schema-v17 HDF5 episode serialization.
 
 State, action, VR, and camera rows are written one-for-one on the policy grid.
 The recorder verifies all sidecars before atomically publishing an episode.
@@ -300,12 +300,12 @@ class EpisodeRecorder:
             meta.attrs[f"provenance_{key}"] = str(value)
 
         # Additive, self-describing semantics for fields whose numeric layout
-        # remains unchanged in v16. Historical readers may ignore these attrs.
+        # remains unchanged in v17. Historical readers may ignore these attrs.
         for key, semantic_value in SEMANTIC_META_ATTRS_V17.items():
             meta.attrs[key] = semantic_value
 
         # The conditional sent-command dataset and this marker must agree.
-        # The marker remains absent when the optional v16 stream is disabled.
+        # The marker remains absent when the optional stream is disabled.
         if self.arm_sent_stream:
             meta.attrs[ARM_SENT_MARKER] = True
 
@@ -540,7 +540,7 @@ class EpisodeRecorder:
             "transition_check_time_ms": np.nan,
             "policy_compute_time_ms": np.nan,
         }
-        # ── Conditional sent-command stream (schema v16) ──
+        # ── Conditional sent-command stream (schema v17) ──
         # None (kwarg unset) → NaN placeholder for this source sample; causal
         # alignment may only hold it into later slots, never backward-fill an
         # earlier slot. Gated on the constructor flag so
@@ -559,7 +559,7 @@ class EpisodeRecorder:
         data.update(diagnostic_values)
         source_layout_errors = validate_source_frame_keys_v17(set(data), arm_sent_stream=self.arm_sent_stream)
         if source_layout_errors:
-            raise RuntimeError("schema-v16 source frame mismatch: " + "; ".join(source_layout_errors))
+            raise RuntimeError("schema-v17 source frame mismatch: " + "; ".join(source_layout_errors))
 
         add_result = self._buffer.add(data, timestamp=ts)
         if add_result.source_written:
@@ -701,7 +701,7 @@ class EpisodeRecorder:
             arm_sent_stream=self.arm_sent_stream,
         )
         if layout_errors:
-            raise RuntimeError("schema-v16 recorder buffer mismatch: " + "; ".join(layout_errors))
+            raise RuntimeError("schema-v17 recorder buffer mismatch: " + "; ".join(layout_errors))
 
         for h5_key, arr in buf_data.items():
             if h5_key not in self._datasets:

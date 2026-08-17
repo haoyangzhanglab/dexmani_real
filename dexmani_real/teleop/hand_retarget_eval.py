@@ -1,6 +1,6 @@
 """Deterministic offline evaluation for XHand retargeting backends.
 
-The module reads only recorded schema-v16 hand data.  It never creates shared
+The module reads recorded schema-v17 hand data.  It never creates shared
 memory, starts a worker, or imports a hardware SDK.  Backend-native losses are
 intentionally excluded from the primary score: TAG and DexPilot are compared
 through the same human-joint, fingertip-geometry, timing, and bound metrics.

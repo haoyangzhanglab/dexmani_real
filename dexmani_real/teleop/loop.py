@@ -24,7 +24,7 @@ from dexmani_real.policy.safety import (CommandPublishResult,
                                         build_action_candidate,
                                         planner_action_safety_gate,
                                         validate_and_send_candidate)
-from dexmani_real.recording.recorder_client import RecorderClient, RecorderPhase
+from dexmani_real.recording.recorder_client import DirectRecorderClient, RecorderClient, RecorderPhase
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import (AudioFeedback,
@@ -373,7 +373,13 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
     joint_lower_rad = np.asarray(cfg.runtime.arm.joint_limit_lower, dtype=np.float64)
     joint_upper_rad = np.asarray(cfg.runtime.arm.joint_limit_upper, dtype=np.float64)
-    arm_max_delta_rad_per_tick = cfg.runtime.policy.arm_max_delta_rad_per_tick
+    arm_max_delta_rad_per_tick: np.ndarray | float | None = cfg.runtime.policy.arm_max_delta_rad_per_tick
+    recording_enabled = bool(cfg.runtime.policy.recording_enabled)
+    recording_mode = cfg.runtime.policy.recording_mode
+    # The simplified direct backend keeps the complete v17 data contract.  A
+    # recording session therefore always starts the RGB-D path; mechanism
+    # simplification must not silently remove modalities or metadata.
+    camera_recording_enabled = recording_enabled
     if arm_max_delta_rad_per_tick is not None:
         arm_max_delta_rad_per_tick = np.broadcast_to(
             np.asarray(arm_max_delta_rad_per_tick, dtype=np.float64), joint_lower_rad.shape
@@ -422,7 +428,25 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
         gate = _build_safety_gate(cfg, planner)
-        recorder = RecorderClient(shared) if cfg.runtime.policy.recording_enabled else None
+        recorder: Any
+        if not recording_enabled:
+            recorder = None
+        elif recording_mode == "v17":
+            recorder = RecorderClient(shared)
+        else:
+            recorder = DirectRecorderClient(
+                shared,
+                data_dir=str(Path(__file__).resolve().parents[2] / cfg.runtime.policy.episodes_dir),
+                max_frames=int(round(cfg.runtime.policy.max_record_duration_s * cfg.runtime.policy.control_hz)),
+                control_hz=cfg.runtime.policy.control_hz,
+                min_frames=int(round(cfg.runtime.policy.min_record_duration_s * cfg.runtime.policy.control_hz)),
+                resolved_config_sha256=cfg.runtime.sha256,
+                align_mode=cfg.runtime.camera.align_mode,
+                provenance=dict(cfg.recording_provenance),
+                rgb_shape=tuple(cfg.runtime.camera.rgb_shape),
+                depth_shape=tuple(cfg.runtime.camera.depth_shape),
+                writer_queue_size=int(cfg.runtime.camera.writer_queue_size),
+            )
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
         shared.error_state.value = True
@@ -453,7 +477,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     _hand_fk: HandKinematics | None = None
     _T_eef_handbase_pos = np.array(cfg.runtime.hand.T_eef_handbase_pos_xyz, dtype=np.float64)
     _T_eef_handbase_quat_wxyz = np.array(cfg.runtime.hand.T_eef_handbase_quat_wxyz, dtype=np.float64)
-    if cfg.runtime.policy.recording_enabled and cfg.hand_urdf_path:
+    if recording_enabled and cfg.hand_urdf_path:
         try:
             _hand_fk = HandKinematics(cfg.hand_urdf_path, list(cfg.runtime.hand.fingertip_link_names))
             if _hand_fk.is_ready():
@@ -465,8 +489,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     logger.info("Teleop: waiting for enabled capabilities...")
     _ready_names = ["arm", "vr"]
-    if cfg.runtime.policy.recording_enabled:
-        _ready_names += ["camera", "recorder"]
+    if camera_recording_enabled:
+        _ready_names += ["camera"]
+    if recording_mode == "v17" and recording_enabled:
+        _ready_names += ["recorder"]
     if cfg.runtime.policy.hand_enabled:
         _ready_names.insert(1, "hand")
     for name in _ready_names:
@@ -575,7 +601,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     ) -> bool:
         return _complete_reanchor_impl(ctx, arm_mapper, _validate_warn, hand_available, current_arm_state, current_vr_frame, current_hand_state)
 
-    # SIGTERM is intercepted so RecorderIO can finish its episode transaction.
+    # SIGTERM is intercepted so the active direct/v17 recorder can finish its
+    # episode transaction before the policy process exits.
     def _on_sigterm(signum: int, frame: object) -> None:
         ctx.sigterm_requested = True
 
@@ -1538,8 +1565,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     finally:
         if recording_active:
             _stop_recording(recorder, True, save=False, shared=shared, reason="policy_shutdown")
-        # RecorderIO owns the asynchronous transaction and keeps its own
-        # heartbeat alive. Policy shutdown must not block on HDF5/codec I/O.
+        # Direct finalization lives in this process; join its bounded writer
+        # before policy exits so a published episode is never truncated.
+        if isinstance(recorder, DirectRecorderClient) and recorder.stop_pending:
+            result = recorder.join_stop(timeout=60.0)
+            if result.error:
+                logger.error("direct recorder finalization failed: %s", result.error)
         kb.stop()
         audio.play("end")
         time.sleep(_END_AUDIO_GRACE_S)

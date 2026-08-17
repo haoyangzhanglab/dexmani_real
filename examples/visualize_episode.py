@@ -636,7 +636,7 @@ class EpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes with Rerun 3D.")
-    parser.add_argument("episode", type=str, help="Path to episode (.h5 file or directory).")
+    parser.add_argument("episode", type=str, help="Path to an episode (.h5 file or directory).")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
     parser.add_argument(
         "--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale)."

@@ -50,7 +50,7 @@ class ValidityState(str, Enum):
 
 @dataclass(frozen=True)
 class EpisodeTiming:
-    """Timing metadata from a schema-v16 episode."""
+    """Timing metadata from a schema-v17 episode."""
 
     rate_hz: float
     grid_dt_s: float
@@ -183,11 +183,11 @@ class EpisodeReader:
         names = ("flag_sample_valid", "flag_held", quality_key)
         missing = [name for name in names if name not in self._data_h5f]
         if missing:
-            raise ValueError(f"schema-v16 episode is missing raw-action validity fields: {missing}")
+            raise ValueError(f"schema-v17 episode is missing raw-action validity fields: {missing}")
         values = [np.asarray(self._data_h5f[name][:], dtype=bool) for name in names]
         if any(value.ndim != 1 for value in values) or len({value.shape for value in values}) != 1:
             shapes = {name: value.shape for name, value in zip(names, values)}
-            raise ValueError(f"schema-v16 raw-action validity fields have inconsistent shapes: {shapes}")
+            raise ValueError(f"schema-v17 raw-action validity fields have inconsistent shapes: {shapes}")
         sample_valid, held, quality_ok = values
         return sample_valid & ~held & quality_ok
 
@@ -196,7 +196,7 @@ class EpisodeReader:
         """Rows with a conservative, explicit arm IK raw value.
 
         Equivalent to ``flag_sample_valid & ~flag_held & flag_ik_ok``. Stored
-        v16 values are not rewritten: held/failure rows remain readable but are
+        v17 values are not rewritten: held/failure rows remain readable but are
         excluded from this interpretation mask.
         """
 
@@ -213,7 +213,7 @@ class EpisodeReader:
 
     @property
     def validity(self) -> ValidityState:
-        """Return whether the current schema-v16 episode is internally consistent."""
+        """Return whether the current schema-v17 episode is internally consistent."""
         meta = self._h5f.get("meta")
         if meta is None:
             return ValidityState.INVALID
@@ -256,7 +256,7 @@ class EpisodeReader:
             if self._rgb_decoder.count_decoded_frames() != frame_count:
                 return ValidityState.INVALID
         except Exception:
-            logger.warning("failed to decode schema-v16 RGB stream", exc_info=True)
+            logger.warning("failed to decode schema-v17 RGB stream", exc_info=True)
             return ValidityState.INVALID
         timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
         sample_valid = np.asarray(self._h5f["flag_sample_valid"][:], dtype=bool)
@@ -385,13 +385,13 @@ class EpisodeReader:
         state = self.validity
         if state is not ValidityState.VALID:
             raise ValueError(
-                f"episode validity is {state.value}; {purpose} requires schema-v16 VALID data "
-                "(the runtime only accepts schema-v16 episodes)"
+                f"episode validity is {state.value}; {purpose} requires schema-v17 VALID data "
+                "(the runtime only accepts schema-v17 episodes)"
             )
 
     @property
     def timing(self) -> EpisodeTiming:
-        """Return timing recorded by the schema-v16 fixed control grid."""
+        """Return timing recorded by the schema-v17 fixed control grid."""
         meta = self._h5f.get("meta")
         attrs = meta.attrs if meta is not None else {}
 
@@ -419,7 +419,7 @@ class EpisodeReader:
         control_hz = _positive(attrs.get("control_hz"))
         grid_dt_s = _positive(attrs.get("grid_dt_s"))
         if control_hz is None or grid_dt_s is None:
-            raise ValueError("schema-v16 episode has invalid control-grid metadata")
+            raise ValueError("schema-v17 episode has invalid control-grid metadata")
         rate_hz = control_hz
         explicit_grid_duration_s = attrs.get("grid_duration_s")
         try:
@@ -428,7 +428,7 @@ class EpisodeReader:
             grid_duration_s = float("nan")
         if not np.isfinite(grid_duration_s) or grid_duration_s < 0:
             if timestamp_duration_s is None:
-                raise ValueError("schema-v16 episode has invalid grid_duration_s")
+                raise ValueError("schema-v17 episode has invalid grid_duration_s")
             grid_duration_s = timestamp_duration_s
 
         wall_duration_s = float(attrs.get("wall_duration_s", grid_duration_s))
@@ -451,7 +451,7 @@ class EpisodeReader:
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
         """Read a single camera frame by index.
 
-        The schema-v16 MP4 sidecar must have exactly one frame per grid slot.
+        The schema-v17 MP4 sidecar must have exactly one frame per grid slot.
         """
         if key == "rgb" and self._rgb_decoder is not None:
             n = self._rgb_decoder.frame_count
@@ -474,7 +474,7 @@ class EpisodeReader:
             data = self._rgb_decoder.read_all()
             grid_len = int(self._h5f["meta"].attrs.get("num_frames", 0))
             if grid_len != data.shape[0]:
-                raise ValueError(f"schema-v16 RGB length {data.shape[0]} does not match grid length {grid_len}")
+                raise ValueError(f"schema-v17 RGB length {data.shape[0]} does not match grid length {grid_len}")
         elif key in self._h5f:
             data = np.asarray(self._h5f[key][:])
         else:

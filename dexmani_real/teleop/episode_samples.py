@@ -19,7 +19,6 @@ from dexmani_real.planning import Pose
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.policy.runtime import ActionCandidate
-from dexmani_real.recording.recorder_client import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.utils.array_utils import nan_array
@@ -38,7 +37,7 @@ _NS_PER_SECOND = 1_000_000_000
 
 
 def _stop_recording(
-    recorder: RecorderClient | None,
+    recorder: Any | None,
     was_active: bool,
     *,
     save: bool,
@@ -194,7 +193,7 @@ def _recording_provenance(
 
 
 def _record_held(
-    recorder: RecorderClient | None,
+    recorder: Any | None,
     arm_state: np.ndarray | None,
     hold_arm: np.ndarray,
     hold_hand: np.ndarray,
@@ -286,7 +285,7 @@ def _record_held(
 
 
 def _record_frame(
-    recorder: RecorderClient | None,
+    recorder: Any | None,
     arm_state: np.ndarray | None,
     hand_state: np.ndarray | None,
     arm_cmd: np.ndarray,
@@ -425,7 +424,7 @@ def _build_robot_state(
     Reads arm_state_ring + hand_state_ring + hand_tactile_ring and assembles
     a complete RobotState.  Computes arm-base-frame fingertip positions via the
     hand FK chain.  The standard runtime defines robot world == arm base, so this
-    preserves the schema-v16 numeric convention without an extra transform.
+    preserves the schema-v17 numeric convention without an extra transform.
 
     Hand hardware/error flags are forwarded to RobotState for recording.
     ``qpos_stale`` remains a reserved false compatibility field; runtime

@@ -1,4 +1,4 @@
-"""Offline cleaning and Sim-label HDF5 views for recorded episodes."""
+"""Offline cleaning and Sim-label HDF5 views for schema-v17 episodes."""
 
 from dexmani_real.data_processing.contracts import (
     EpisodeAnnotation,

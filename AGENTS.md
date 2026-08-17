@@ -35,9 +35,10 @@ camera / VR / arm / hand ──shared-memory state──► teleop
                                                      │
                        arm queue ◄──────────────────┼──► hand command ring
                                                      │
-                                         aligned sample ring
+                                         fixed-grid samples
                                                      ▼
-                                            RecorderIO ──► HDF5 episode v17
+                                  direct EpisodeRecorder ──► HDF5 episode v17
+                                                     └──► RecorderIO transport
 ```
 
 The main/lifecycle process resolves immutable configuration, creates
@@ -83,7 +84,8 @@ Preserve these unless the user explicitly requests an architectural redesign.
    share a live SDK instance across processes.
 4. Teleoperation owns control-grid, action, and episode/sample decisions.
    `RecorderIO` only serializes, verifies, and transactionally publishes what
-   it receives.
+   it receives. The direct backend uses the same `EpisodeRecorder` contract
+   locally and bypasses only the transport process.
 5. Recording is grid-aligned to `1 / control_hz` (normally 16 Hz), never
    arrival-time sampled.
 6. The arm queue is ordered and intentionally bounded (`maxsize=2`). The hand
@@ -106,8 +108,9 @@ Preserve these unless the user explicitly requests an architectural redesign.
     error discards the episode without advancing generation; only the next
     explicit BEGIN advances it.
 14. Recorder START/STOP boundaries, recorder status, and aligned samples are
-    fixed NumPy dtypes. Do not put JSON or an acknowledgement/apply protocol in
-    the shared-memory control path.
+    fixed NumPy dtypes. The direct backend keeps only its lifecycle local; the
+    v17 transport uses the shared control path. Do not put JSON or an
+    acknowledgement/apply protocol in the shared-memory control path.
 15. Learned-policy deployment is layered: `integrations/` may import
     `deployment/`, never the reverse. The inference worker only writes
     `policy_plan_ring`; `deployment/coordinator.py` is the sole robot-action
@@ -149,9 +152,9 @@ Use the smallest vertical slice that fully preserves a contract.
 | Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
 Do not silently change HDF5 meaning in place. Runtime episodes use schema v17
-only: coordinate a format change across writer, reader, visualization, replay, and the
-schema marker. Migrate historical episodes outside the runtime before
-using them.
+only: coordinate format changes across writer, reader, visualization, replay,
+and the schema marker. The direct recording backend must remain field-for-field
+compatible with the RecorderIO backend.
 
 ## 6. Implementation rules
 

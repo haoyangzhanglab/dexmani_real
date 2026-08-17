@@ -8,7 +8,9 @@ complete file-by-file map.
 ## 1. Sixty-second orientation
 
 DexMani Real controls an xArm7 (7 DoF) and XHand (12 DoF) from Quest VR, records
-HDF5 episodes, replays an episode, and deploys learned policies. Python 3.10 runs
+schema-v17 HDF5 episodes, replays an episode, and deploys learned policies.
+The default direct backend uses the same writer locally; explicit v17 mode
+retains the RecorderIO transport. Python 3.10 runs
 in conda `real_robot`; commands run from the repo root with `PYTHONPATH=.`.
 Standard pre-edit commands and environment details live in `AGENTS.md` §1.
 
@@ -26,7 +28,7 @@ entry points, not test fixtures.
 | Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
 | Change learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` → `deployment/config.py` → `deployment/observation.py` → `deployment/contracts.py` → `integrations/` adapter → `policy_plan_ring` |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, homing path planning |
-| Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
+| Change episode I/O | `recording/episode_recorder.py`, `recording/io_process.py` | direct/RecorderIO writer → reader → analysis → replay |
 | Change replay | `examples/replay_episode.py` | — Self-contained script; preflight → session → runner → metrics |
 | Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and calibration JSON contract |
 
@@ -46,7 +48,8 @@ Hand worker ───┘                         fire-and-forget command publica
                                                     ├──► bounded arm endpoint/HOME queue → Arm worker
                                                     └──► latest-wins hand ring → Hand worker
 
-Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v17
+Teleop / coordinator ── fixed-grid samples ──► direct EpisodeRecorder ──► HDF5 v17
+                                      └──────► RecorderIO transport ──► HDF5 v17
 ```
 
 A parallel learned-policy controller runs the same shape: an inference worker
@@ -56,10 +59,12 @@ actions through the same shared safety boundary.
 | Owner | Owns | Must not own |
 |---|---|---|
 | Main / lifecycle module | Config snapshot, storage, process creation, read-only readiness, health, shutdown | Mapping, actions, sample selection |
-| `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | HDF5 serialization or direct SDK use |
+| `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | serialization policy or direct SDK use |
 | `deployment/coordinator.py` | Adopting learned-policy plans; scheduling one due endpoint per tick through the shared safety boundary | Direct arm/hand transport writes, `SafetyState` mutation, interpolation |
 | `deployment/worker.py` | Inference only: causal/valid observation → encode → infer → decode → `policy_plan_ring` | arm/hand transport, `SafetyState`, robot actions |
-| `recording/io_process.py` | Record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
+| `recording/episode_recorder.py` | Full schema-v17 HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
+| `recording/recorder_client.py` | Direct policy-local adapter and RecorderIO client protocol | Hardware control or sample selection |
+| `recording/io_process.py` | RecorderIO transport, record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
 | `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application | Policy decisions or cross-worker calls |
 | `sensor/` workers | Device acquisition and source-freshness metadata | Motion/control decisions |
 | `runtime/` | Readiness, heartbeat/process supervision, verified teardown | Domain mapping or command production |
@@ -181,7 +186,7 @@ the SafetyGate validation boundary.
 VR frame → causal snapshot → ArmWristMapper / per-VR-sequence hand solve cache
          → shaped current-frame hand pose + IK/collision candidate
          → SafetyGate.validate() → send_command() → workers apply immediately
-         → grid-aligned state/action/VR/camera sample → RecorderIO
+         → grid-aligned state/action/VR/camera sample → direct EpisodeRecorder or RecorderIO
 ```
 
 - `teleop/snapshot.py` creates a causal snapshot; do not mix arrivals from
@@ -231,13 +236,18 @@ VR frame → causal snapshot → ArmWristMapper / per-VR-sequence hand solve cac
 ### Episode write, read, analyse, replay
 
 ```text
-aligned samples → RecorderIO → temporary episode + stream verification
-                → fsync + atomic publish → EpisodeReader / visualize / replay
+aligned samples → direct/RecorderIO → temporary HDF5/camera episode
+                → stream verification → fsync + atomic publish
+                → EpisodeReader / visualize / replay
 ```
 
-- HDF5 schema v17 is the only runtime episode format (see `AGENTS.md` §5 for the
-  format-change contract). Readers, visualization, and replay accept only a
-  published v17 directory.
+- HDF5 schema v17 is the only runtime episode format (see `AGENTS.md` §5 for
+  its format-change contract). Direct and RecorderIO modes use the same
+  `EpisodeRecorder`, reader, camera sidecars, metadata, and provenance.
+- `policy.recording_mode: direct` is the default personal-research mechanism:
+  it removes the RecorderIO transport process and writes from the policy-owned
+  fixed-grid sample path. `v17` preserves the original shared-ring transport
+  for compatibility and diagnostics; it does not change the episode format.
 - `recording/episode_schema.py` is the shared v17 data-layout authority: 93
   unconditional datasets plus `action_arm_joint_sent` iff
   `meta.arm_sent_stream=True`. Writer source/flush/finalize and reader validity
@@ -255,16 +265,16 @@ aligned samples → RecorderIO → temporary episode + stream verification
   fire-and-forget worker protocol records no fabricated ACK or apply status.
 - Writer failure, stream mismatch, overflow, codec failure, or ENOSPC aborts
   the episode rather than silently publishing partial data.
-- RecorderIO finalization is polled from its heartbeat loop; it never blocks
-  that loop on HDF5/codec completion. A max-duration boundary saves the episode
-  and moves teleop to ARMED command quiescence. Recording errors remain separate
-  from robot FAULT but make the collection CLI fail through `failure_count`.
+- Direct finalization is polled from the teleop loop and joins the same bounded
+  writer during process shutdown; RecorderIO finalization is polled from its
+  heartbeat loop. A max-duration boundary saves the episode and moves teleop to
+  ARMED command quiescence. Recording errors remain separate from robot FAULT.
   A timeout remains non-terminal while the stop thread is alive: status stays
   `FINALIZING`, START remains rejected, and the eventual terminal status is
   `ERROR`.
 - `min_record_duration_s` is a quality label, not a publication gate. Short
-  consistent episodes keep schema-v17 validity and expose `min_frames_met=False`;
-  replay and visualization warn so downstream training can filter explicitly.
+  consistent episodes expose `min_frames_met=False`; replay and visualization
+  warn so downstream training can filter the metadata explicitly.
 - `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
 - `examples/replay_episode.py` defaults to live replay of the full recorded
   trajectory; it reruns fail-closed provenance and dense geometry checks
@@ -306,10 +316,10 @@ Cross-module obligations for each change are the contract in `AGENTS.md` §5
 
 ### Changing recording or replay
 
-1. Keep v17 dataset meanings stable. Coordinate any format change across
-   recorder, reader, visualization, and replay in the same change.
-2. Update producer, reader, offline quality/visualization, replay loader, and
-   provenance/schema marker together.
+1. Keep v17 dataset meanings stable. Direct and RecorderIO modes must remain
+   field-for-field compatible.
+2. Update the shared producer/reader, offline quality, visualization, replay,
+   and provenance/schema marker together.
 3. For replay, verify provenance, dense geometry and explicit hand mode before
    worker startup. Do not weaken a check to make dry-run or a fixture pass.
 

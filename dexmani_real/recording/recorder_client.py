@@ -1,10 +1,11 @@
 """Policy-side recorder client and shared control-plane protocol types.
 
 ``RecorderClient`` is the policy-side owner of recording decisions and fixed
-sample construction.  This module also holds the control-plane types shared
-with the RecorderIO process (``recorder_io_loop`` in ``io_process.py``), which
-imports them from here.  This module never imports ``io_process``, keeping the
-dependency one-way.
+sample construction for the RecorderIO transport. ``DirectRecorderClient``
+uses the same sample contract with a policy-local ``EpisodeRecorder``. This
+module also holds the control-plane types shared with the RecorderIO process
+(``recorder_io_loop`` in ``io_process.py``), which imports them from here. The
+module never imports ``io_process``, keeping that dependency one-way.
 """
 
 from __future__ import annotations
@@ -17,6 +18,9 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.recording.episode_schema import normalize_diagnostics_v17
+from dexmani_real.recording.camera_stream_writer import CameraStreamWriterConfig
+from dexmani_real.recording.episode_recorder import EpisodeRecorder
+from dexmani_real.recording.start_metadata import build_start_metadata
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
@@ -441,3 +445,180 @@ class RecorderClient:
             generation=self._generation,
             reason="finalization_timeout",
         )
+
+
+class DirectRecorderClient:
+    """Policy-local adapter over :class:`EpisodeRecorder`.
+
+    This is the simplified recording mechanism: policy still constructs the
+    exact same full sample and the existing ``EpisodeRecorder`` still writes
+    schema-v17 HDF5 plus RGB/depth sidecars.  Only the fixed shared-memory
+    sample/control/status transport and the dedicated RecorderIO process are
+    removed from the hot path.
+    """
+
+    record_extended_metadata = True
+
+    def __init__(
+        self,
+        shared: Any,
+        *,
+        data_dir: str,
+        max_frames: int,
+        control_hz: float,
+        min_frames: int,
+        resolved_config_sha256: str,
+        align_mode: str,
+        provenance: dict[str, str] | None = None,
+        rgb_shape: tuple[int, int, int],
+        depth_shape: tuple[int, int],
+        writer_queue_size: int,
+    ) -> None:
+        self.shared = shared
+        self._recorder = EpisodeRecorder(
+            data_dir=data_dir,
+            max_frames=max_frames,
+            control_hz=control_hz,
+            min_frames=min_frames,
+            arm_sent_stream=True,
+            resolved_config_hash=resolved_config_sha256,
+            provenance=provenance,
+            camera_writer_config=CameraStreamWriterConfig(
+                rgb_shape=rgb_shape,
+                depth_shape=depth_shape,
+                fps=control_hz,
+                queue_size=writer_queue_size,
+            ),
+        )
+        self._align_mode = align_mode
+        self._recording = False
+        self._stop_pending = False
+        self._stop_save = False
+        self._stop_reason = ""
+        self._stop_path: str | None = None
+        self._stop_frame_count = 0
+        self._last_stop_result: RecorderStopResult | None = None
+
+    @property
+    def frame_count(self) -> int:
+        return self._recorder.frame_count
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    @property
+    def stop_pending(self) -> bool:
+        return self._stop_pending
+
+    @property
+    def camera_writer_error(self) -> str | None:
+        return self._recorder.camera_writer_error
+
+    def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
+        if self._recording:
+            return False
+        if self._stop_pending:
+            result = self.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S)
+            if not result.done:
+                return False
+        if not self._recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S) and self._recorder.stop_error is None:
+            logger.error("direct recorder: previous episode did not finish: %s", self._recorder.stop_error)
+            return False
+        try:
+            metadata = build_start_metadata(
+                self.shared,
+                task_label=task_label,
+                operator=operator,
+                align_mode=self._align_mode,
+            )
+            started = self._recorder.start_episode(**metadata)
+        except Exception:
+            logger.error("direct recorder: episode start failed", exc_info=True)
+            return False
+        if started:
+            self._recording = True
+            self._last_stop_result = None
+        return started
+
+    def add_frame(
+        self,
+        state: Any,
+        action: RobotAction,
+        vr_frame: dict[str, Any],
+        camera_frame: dict[str, Any] | None = None,
+        signals: dict[str, Any] | None = None,
+        arm_qpos_sent: np.ndarray | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> bool:
+        if not self._recording:
+            return False
+        try:
+            added = self._recorder.add_frame(
+                state,
+                action,
+                vr_frame,
+                camera_frame=camera_frame,
+                signals=signals,
+                arm_qpos_sent=arm_qpos_sent,
+                diagnostics=diagnostics,
+                control_run_generation=int(self.shared.run_generation.value),
+            )
+        except Exception as exc:
+            logger.error("direct recorder: sample write failed", exc_info=True)
+            self.stop_episode(success=False, reason="sample_write_error")
+            return False
+        if not added and self._recorder.max_frames_reached:
+            self.stop_episode(success=True, reason="max_frames")
+        return added
+
+    def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
+        if not self._recording or self._stop_pending:
+            return None
+        self._recording = False
+        self._stop_pending = True
+        self._stop_save = bool(success)
+        self._stop_reason = reason or ("max_frames" if self._recorder.max_frames_reached else "manual")
+        self._stop_frame_count = self.frame_count
+        self._stop_path = self._recorder.stop_episode(success=success, reason=reason)
+        return self._stop_path
+
+    def _stop_result(self, result: Any, *, done: bool) -> RecorderStopResult:
+        error = result.error or self._recorder.stop_error
+        return RecorderStopResult(
+            done=done,
+            phase=RecorderPhase.ERROR if error else (RecorderPhase.COMPLETED if done else RecorderPhase.FINALIZING),
+            saved=bool(done and self._stop_save and not error),
+            error=error,
+            path=result.path or self._stop_path,
+            frame_count=int(result.frame_count or self._stop_frame_count or self.frame_count),
+            reason=self._stop_reason,
+            min_frames_met=int(result.frame_count or self._stop_frame_count or self.frame_count)
+            >= self._recorder.min_frames,
+        )
+
+    def poll_stop(self) -> RecorderStopResult:
+        if not self._stop_pending:
+            return self._last_stop_result or RecorderStopResult(done=True)
+        result = self._recorder.poll_stop()
+        if not result.done:
+            return self._stop_result(result, done=False)
+        mapped = self._stop_result(result, done=True)
+        self._stop_pending = False
+        self._last_stop_result = mapped
+        return mapped
+
+    def join_stop(self, timeout: float | None = None) -> RecorderStopResult:
+        if not self._stop_pending:
+            return self._last_stop_result or RecorderStopResult(done=True)
+        timeout_s = _RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
+        if not np.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("recorder stop timeout must be finite and non-negative")
+        done = self._recorder.join_stop(timeout=timeout_s)
+        if not done:
+            return self._stop_result(self._recorder.poll_stop(), done=False)
+        result = self._recorder.poll_stop()
+        mapped = self._stop_result(result, done=True)
+        self._stop_pending = False
+        self._last_stop_result = mapped
+        return mapped

@@ -1,4 +1,4 @@
-"""Transactional batch pipeline from Real v16 directories to Sim-label HDF5."""
+"""Transactional batch pipeline from Real schema-v17 episodes to Sim-label HDF5."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ import json
 import shutil
 import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import h5py
 import numpy as np
@@ -136,6 +137,13 @@ def _output_name(source_name: str, segment_index: int, segment_count: int) -> st
     return f"{source_name}__seg{segment_index:03d}.h5"
 
 
+@contextmanager
+def _open_episode(path: Path) -> Iterator[EpisodeReader]:
+    """Open one published schema-v17 episode directory."""
+    with EpisodeReader(path) as reader:
+        yield reader
+
+
 def _dataset_kwargs(config: ProcessingConfig, *, chunks: tuple[int, ...]) -> dict[str, Any]:
     return {
         "compression": "gzip",
@@ -155,13 +163,14 @@ def _write_common_attrs(
     source_hashes: dict[str, str],
 ) -> None:
     segment = decision.segments[segment_index]
-    meta = reader.h5f["meta"].attrs
+    meta = {key: reader.h5f["meta"].attrs[key] for key in reader.h5f["meta"].attrs}
     source_task = str(meta.get("task_label", "")).strip()
     task_name = annotation.task_name or source_task or "unknown"
     segment_task_outcome = annotation.task_outcome if len(decision.segments) == 1 else "unknown"
     output.attrs["schema_name"] = _SCHEMA_NAME
     output.attrs["schema_version"] = _SCHEMA_VERSION
     output.attrs["domain"] = "real"
+    output.attrs["source_format"] = "dexmani_v17"
     output.attrs["source_schema_version"] = EPISODE_SCHEMA_VERSION
     output.attrs["profile"] = config.profile.value
     output.attrs["episode_steps"] = segment.length
@@ -332,6 +341,8 @@ def _write_episode_segments(
                 output["camera_intrinsic"][:] = camera_k[None, :]
 
             if config.profile.needs_pointcloud:
+                assert pointcloud_processor is not None
+                assert pointcloud_rays is not None
                 for target_index, source_index in enumerate(range(segment.start, segment.end)):
                     depth_m = depth_to_meters(
                         np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16),
@@ -456,6 +467,9 @@ def validate_processed_hdf5(path: str | Path, config: ProcessingConfig) -> dict[
             raise ValueError(f"{artifact.name}: invalid schema_version")
         if str(source.attrs.get("domain", "")) != "real":
             raise ValueError(f"{artifact.name}: domain must remain real")
+        source_format = str(source.attrs.get("source_format", ""))
+        if source_format != "dexmani_v17":
+            raise ValueError(f"{artifact.name}: unsupported source_format {source_format!r}")
         if int(source.attrs.get("source_schema_version", -1)) != EPISODE_SCHEMA_VERSION:
             raise ValueError(f"{artifact.name}: invalid source_schema_version")
         if str(source.attrs.get("profile", "")) != config.profile.value:
@@ -490,7 +504,8 @@ def validate_processed_hdf5(path: str | Path, config: ProcessingConfig) -> dict[
         if parsed_attrs["processing_config_json"] != config.to_dict():
             raise ValueError(f"{artifact.name}: processing_config_json does not match validation config")
         source_hashes = parsed_attrs["source_member_sha256_json"]
-        if set(source_hashes) != set(_SOURCE_MEMBERS) or any(
+        expected_members = _SOURCE_MEMBERS
+        if set(source_hashes) != set(expected_members) or any(
             not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
             for value in source_hashes.values()
         ):
@@ -533,7 +548,7 @@ def process_episode_root(
     for episode in episodes:
         annotation = annotations.get(episode.name, EpisodeAnnotation())
         try:
-            with EpisodeReader(episode) as reader:
+            with _open_episode(episode) as reader:
                 decisions.append(analyze_episode(reader, config, annotation))
         except (FileNotFoundError, OSError, ValueError) as exc:
             logger.warning("episode analysis rejected %s", episode, exc_info=True)
@@ -594,7 +609,7 @@ def process_episode_root(
             if not decision.accepted:
                 continue
             annotation = annotations.get(decision.source_path.name, EpisodeAnnotation())
-            with EpisodeReader(decision.source_path) as reader:
+            with _open_episode(decision.source_path) as reader:
                 outputs.extend(_write_episode_segments(reader, decision, staging, config, annotation))
         validation = [validate_processed_hdf5(staging / item["path"], config) for item in outputs]
         report["outputs"] = outputs

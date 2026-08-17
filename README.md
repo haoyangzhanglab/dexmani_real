@@ -20,9 +20,9 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 
 1. **VR 遥操作与采集**：读取 Quest、相机和机器人状态，生成安全的臂/手指令，并按固定控制网格记录 episode。
 2. **标定与诊断**：标定相机外参和 VR 朝向；以受限、可观测的方式诊断 RealSense、点云和 XHand。
-3. **回放与离线分析**：检查 HDF5 episode、在启动前直接执行密集预检、运行受控 live replay，并评估或可视化数据质量。
+3. **回放与离线分析**：检查 schema-v17 episode、在启动前执行密集预检、运行受控 live replay，并评估或可视化数据质量。
 4. **策略部署**：通过 `examples/run_policy.py` 运行 learned-policy；推理 worker 只写 `policy_plan_ring`，coordinator 经同一安全边界发布机器人动作。
-5. **离线数据处理**：保持 Real v17 原始 episode 只读，按输出模态清洗和切分连续轨迹，生成 real-domain 的 Sim-label HDF5；点云在消费边界从 depth 确定性地派生。
+5. **离线数据处理**：保持 v17 原始 episode 只读，按输出模态清洗并从 depth 确定性派生点云。
 
 ```text
                     ┌───────────── sensor/ ──────────────┐
@@ -41,17 +41,18 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
                                                     │ aligned samples
                                                     ▼
                                     ┌────────── recording/ ──────────┐
-                                    │ RecorderIO → HDF5 episode v17  │
+                                    │ direct EpisodeRecorder → HDF5 │
+                                    │ v17 RecorderIO transport      │
                                     └───────────────────┬───────────┘
                                                         ▼
-                                               examples/visualize_episode.py
+                                      EpisodeReader consumers
 ```
 
 ### 设计边界
 
 - **IPC 边界**：所有跨进程数据经 `SharedStorage` 传递；有效负载由 `utils/schema.py` 的固定 NumPy dtype 定义。
 - **硬件边界**：xArm/XHand SDK 仅由各自的执行 worker 使用，RealSense SDK 由 `sensor/` 持有；其他进程不共享活的 SDK 对象。
-- **控制边界**：遥操作 worker 决定动作与采样网格；`RecorderIO` 只负责序列化、校验和事务式发布。录制的 START/STOP、状态与每格元数据使用固定 dtype，不在共享内存中嵌入 JSON；v17 episode 保存已解析配置的 SHA-256，而非整份配置文本。
+- **控制边界**：遥操作 worker 决定动作与固定采样网格；默认 direct recorder 与 `RecorderIO` 共用完整 `EpisodeRecorder`、HDF5 schema v17 和相机 sidecar。direct 只移除中转进程，不改变字段、格式或元数据；v17 的录制 START/STOP、状态与每格元数据使用固定 dtype，不在共享内存中嵌入 JSON。
 - **安全边界**：`SafetyState` 管理 `DISARMED → ARMED → RUNNING → FAULT`；固件仍是最后一道安全保护。
 - **策略边界**：`integrations/` 只依赖 `deployment/`，绝不反向；推理 worker 只写 `policy_plan_ring`，`deployment/coordinator.py` 是唯一的 learned-policy 机器人动作生产者，经共享 `SafetyGate` 边界发布。
 
@@ -59,7 +60,7 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 
 ### 进程职责
 
-标准遥操作运行时包含五个控制/设备 worker；开始录制后增加一个 `RecorderIO` worker：
+标准遥操作运行时包含控制/设备 worker。默认 direct 录制不增加 RecorderIO 进程；相机 worker 始终保留以维持完整数据合同，显式选择 v17 时再增加 RecorderIO：
 
 ```text
 camera ────────┐
@@ -69,7 +70,8 @@ hand state ────┤          └────────────► h
                │
                └──► shared-memory state
 
-teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
+teleop ──► fixed-grid samples ──► direct EpisodeRecorder ──► HDF5 v17
+                         └──────► v17 RecorderIO transport ──► HDF5 v17
 ```
 
 | 通道 | 语义 | 关键约束 |
@@ -77,7 +79,7 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 | 臂动作队列 | 有序、短队列的未来关节目标 | `maxsize=2` 的反压是有意设计；worker 丢弃非当前 generation 的待消费 endpoint |
 | 手动作环 | 最新目标覆盖旧目标 | latest-wins，避免手部控制滞后；worker 同样复核 generation 与有效期 |
 | 状态环 | 相机、VR、臂、手的共享快照 | seqlock 验证读，跨进程不传可变对象图 |
-| 录制采样环 | 对齐后的机器人、动作与传感器样本 | 固定为 `1 / control_hz` 网格，不以到达时间采样 |
+| 录制采样 | 完整对齐的机器人、动作、VR、相机和质量/provenance 样本 | 固定为 `1 / control_hz` 网格，不以到达时间采样；direct 直写，v17 经共享环传给 RecorderIO |
 
 ### 关键路径
 
@@ -103,7 +105,7 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 → 恢复前从新鲜实测反馈重锚
 ```
 
-这不是急停，也不会调用 State 6 或发布“实测位置 hold”。C 只能恢复 C 建立的暂停；S/D/时长触顶后的下一轮必须按 B，每次 B 另开一个 `run_generation`。命令静默期间不产生 action sample；恢复后的首个样本携带新 `control_run_generation`，RecorderIO 把下一个存储槽重锚到该样本真实时间（保留 wall-time 跳变，不补造 hold action）。`min_record_duration_s` 是质量标签而非发布硬门槛（短 episode 保持 v17 有效，标记 `min_frames_met=False`）。
+这不是急停，也不会调用 State 6 或发布“实测位置 hold”。C 只能恢复 C 建立的暂停；S/D/时长触顶后的下一轮必须按 B，每次 B 另开一个 `run_generation`。命令静默期间不产生 action sample；恢复后的首个样本携带新 `control_run_generation`，direct 与 v17 RecorderIO 都把下一个存储槽重锚到该样本真实时间（保留 wall-time 跳变，不补造 hold action）。`min_record_duration_s` 是质量标签而非发布硬门槛（短 episode 标记 `min_frames_met=False`）。默认 `policy.recording_mode=direct`，输出仍是完整的 `episodes/episode_XXXXXX/` schema-v17 HDF5、RGB 视频和 depth sidecar；需要排查共享录制传输时可显式设置 `policy.recording_mode=v17`。
 
 完整语义见 `CLAUDE.md` §4（Critical behavior paths）；跨模块契约见 `AGENTS.md`。
 
@@ -229,10 +231,11 @@ python -m compileall -q dexmani_real examples
 | `recording/episode_reader.py` | 读取已原子发布的 v17 episode、合并流和元数据，并提供内部有效性、最短时长质量视图及顺序 RGB iterator。 |
 | `recording/episode_recorder.py` | 管理单个 episode 的 HDF5 数据集、相机写入器、停止校验与最终发布。 |
 | `recording/io_process.py` | `RecorderIO` 非阻塞事务 worker 及其客户端协议；固定 dtype 携带 generation、FINALIZING/终态和会话失败结果。 |
-| `recording/recorder_client.py` | policy 侧 `RecorderClient` 与共享控制面协议类型；持有录制决策与固定 sample 构造，与 RecorderIO 依赖单向。 |
+| `recording/start_metadata.py` | direct/RecorderIO 共用的录制起始相机几何、标定和设备 provenance 快照。 |
+| `recording/recorder_client.py` | policy 侧 `DirectRecorderClient`、旧版 `RecorderClient` 与共享控制面协议类型；持有录制决策与固定 sample 构造。 |
 | `recording/timestamp_buffer.py` | 对同一控制段按 deadline 因果补帧，并在命令静默后的新 generation 上重锚时间网格。 |
 | `recording/transaction.py` | 目录 fsync 和原子发布工具，避免半成品 episode 被当作完成数据。 |
-| `recording/video_codec.py` | 基于 PyAV 的视频编码器/解码器及其配置，服务 HDF5 旁路视频流。 |
+| `recording/video_codec.py` | 基于 PyAV 的视频编码器/解码器及其配置，服务 schema-v17 RGB sidecar。 |
 
 ### `examples/replay_episode.py` — 检查、授权与受控回放
 
@@ -336,8 +339,8 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
 | `examples/pointcloud_process_example.py` | `sensor.pointcloud_processor` | 生产点云管道诊断与桌面平面标定；显式确认后才写入标定。 |
 | `examples/xhand_control_example.py` | — | 独立 XHand SDK 诊断；默认运行 home + 预设动作（读取/打印后直接动作），无 CLI 参数门控；RS485 固定使用 `/dev/ttyUSB0`，打开前只读检查设备节点与当前用户权限，完整 SDK 会话在隔离子进程中运行，厂商串口线程异常退出会转换为可操作诊断且不让启动进程 core dump；复用生产的 1 秒打开稳定等待、动作 CRC 单次同目标重试、实时读取 CRC 两次重试及触觉字段错误分类；命令响应报告触觉降级时，驻留后仅用实时只读状态请求有限验证恢复，绝不为传感错误重放动作；未解决的初始关节读取或动作事务失败会中止后续预设，传感恢复失败则明确标记而不改变已接受的动作。 |
-| `examples/visualize_episode.py` | — | 离线 Rerun 3D 可视化；读取 HDF5 episode 并展示点云、图像、动作、触觉和元数据；无硬件控制。 |
-| `examples/tune_hand_retarget.py` | `teleop.hand_retarget_eval` | 离线 TAG/DexPilot 基准、有界搜索和 home 估计；只读 episode，输出 JSON，无硬件控制。 |
+| `examples/visualize_episode.py` | — | 用 Rerun 展示 v17 点云、图像、动作、触觉和元数据；无硬件控制。 |
+| `examples/tune_hand_retarget.py` | `teleop.hand_retarget_eval` | 离线 TAG/DexPilot 基准、有界搜索和 home 估计；只读 v17 episode，输出 JSON，无硬件控制。 |
 
 ## 配置、资源与延伸文档
 

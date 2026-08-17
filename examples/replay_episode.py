@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay one DexMani HDF5 episode on the real robot.
+"""Replay one DexMani schema-v17 episode on the real robot.
 
 Spawn-only architecture: arm_loop + hand_loop processes with SharedStorage
 and the SafetyState machine. Commands flow through arm_action_q / hand_cmd_ring;
@@ -174,10 +174,12 @@ class TrajectoryData:
 
 
 def resolve_episode_path(raw_path: str) -> tuple[str, str]:
-    """Validate and name one schema-v17 episode directory."""
+    """Validate and name one published schema-v17 episode directory."""
     path = Path(raw_path)
     if not path.is_dir():
         raise ValueError(f"episode must be a schema-v17 directory: {path}")
+    if not (path / "data.h5").is_file():
+        raise ValueError(f"episode is not a schema-v17 directory: {path}")
     return str(path), path.name
 
 
@@ -1737,7 +1739,7 @@ def _positive_float(value: str) -> float:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay a DexMani trajectory on the real robot (live by default).",
+        description="Replay a schema-v17 trajectory on the real robot (live by default).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

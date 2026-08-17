@@ -13,7 +13,7 @@ from dexmani_real.data_processing.pipeline import process_episode_root
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Clean Real v16 episodes and write real-domain Sim-label HDF5 segments."
+        description="Clean schema-v17 Real episodes and write real-domain Sim-label HDF5 segments."
     )
     parser.add_argument("--input-root", type=Path, default=Path("episodes"))
     parser.add_argument("--output-root", type=Path, default=Path("episode_processed"))

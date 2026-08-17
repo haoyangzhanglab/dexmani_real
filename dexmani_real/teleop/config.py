@@ -20,6 +20,7 @@ class TeleopConfig:
     runtime: ResolvedRuntimeConfig = field(default_factory=resolve_runtime_config)
     task_label: str = ""
     operator: str = ""
+    recording_provenance: tuple[tuple[str, str], ...] = ()
     hand_urdf_path: str = field(default_factory=lambda: str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"))
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
 
@@ -35,11 +36,13 @@ class TeleopConfig:
         task_label: str = "",
         operator: str = "",
         hand_urdf_path: str | None = None,
+        recording_provenance: tuple[tuple[str, str], ...] = (),
     ) -> "TeleopConfig":
         return cls(
             runtime=runtime,
             task_label=task_label,
             operator=operator,
+            recording_provenance=recording_provenance,
             hand_urdf_path=(
                 str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf") if hand_urdf_path is None else hand_urdf_path
             ),

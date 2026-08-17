@@ -638,6 +638,9 @@ class PolicyParams:
 
     # ── Recording ──
     recording_enabled: bool = True
+    # "direct" keeps the complete schema-v17 recorder in the teleop process;
+    # "v17" retains the RecorderIO transport for compatibility and diagnosis.
+    recording_mode: Literal["direct", "v17"] = "direct"
     max_record_duration_s: float = 60.0
     # Quality label only: short, internally consistent episodes are published
     # with min_frames_met=False and left to downstream filtering policy.
@@ -702,6 +705,8 @@ class PolicyParams:
             raise ValueError("recording durations must be finite, ordered, and non-negative")
         if not self.episodes_dir or self.status_print_interval <= 0 or self.max_consecutive_errors <= 0:
             raise ValueError("policy output path and diagnostic intervals must be valid")
+        if self.recording_mode not in {"direct", "v17"}:
+            raise ValueError("recording_mode must be 'direct' or 'v17'")
         if (
             not np.isfinite(self.ik_max_pose_error_pos_m)
             or not np.isfinite(self.ik_max_pose_error_rot_rad)
