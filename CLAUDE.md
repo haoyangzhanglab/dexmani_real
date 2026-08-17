@@ -46,7 +46,7 @@ Hand worker ───┘                         fire-and-forget command publica
                                                     ├──► bounded arm endpoint/HOME queue → Arm worker
                                                     └──► latest-wins hand ring → Hand worker
 
-Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v16
+Teleop / coordinator ── aligned sample ring ──► RecorderIO ──► HDF5 episode v17
 ```
 
 A parallel learned-policy controller runs the same shape: an inference worker
@@ -187,8 +187,9 @@ VR frame → causal snapshot → ArmWristMapper / per-VR-sequence hand solve cac
 - `utils/schema.py::XHAND_SDK_JOINT_NAMES` owns every cross-process hand-qpos
   order. TAG and DexPilot share the mechanical `xhand_right.urdf`; teleop, not
   either solver URDF, applies the operational anti-clogging command floor.
-- DexPilot is the current default hand backend. Its effective runtime parameters
-  live in `dexpilot_retargeting`; TAG remains the repository-owned fallback.
+- TAG is the current default hand backend. Its effective runtime parameters live
+  in `tag_retargeting`; DexPilot (via `dexpilot_retargeting`) remains the
+  external fallback.
 - `teleop/arm_mapper.py` applies frame transforms and workspace/rotation bounds.
 - `planning/ik.py` and `planning/ik_candidates.py` solve and filter; failure
   holds rather than inventing a new command.
@@ -228,13 +229,19 @@ aligned samples → RecorderIO → temporary episode + stream verification
                 → fsync + atomic publish → EpisodeReader / visualize / replay
 ```
 
-- HDF5 schema v16 is the only runtime episode format (see `AGENTS.md` §5 for the
+- HDF5 schema v17 is the only runtime episode format (see `AGENTS.md` §5 for the
   format-change contract). Readers, visualization, and replay accept only a
-  published v16 directory.
-- `recording/episode_schema.py` is the shared v16 data-layout authority: 96
+  published v17 directory.
+- `recording/episode_schema.py` is the shared v17 data-layout authority: 93
   unconditional datasets plus `action_arm_joint_sent` iff
   `meta.arm_sent_stream=True`. Writer source/flush/finalize and reader validity
   must reuse it rather than maintaining local key lists.
+- The episode carries RGB (`rgb.mp4`) and depth (`depth.h5`) only. The world
+  point cloud is a deterministic pure function of depth, derived at the
+  consumption boundary — offline in `data_processing` (`PointCloudProcessor`
+  over `depth.h5`) and online in a future vision adapter — never stored as a
+  `pointcloud.h5` sidecar. The derivation is seed-free: `depth + intrinsics +
+  extrinsics + desk_plane + config` fully determines the 2048×6 cloud.
 - Recorder control and the shared sample payload are fixed NumPy dtypes. The
   START boundary snapshots only task/operator and essential device/calibration
   metadata plus the required resolved-config SHA-256; per-grid fields are typed
@@ -250,7 +257,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
   `FINALIZING`, START remains rejected, and the eventual terminal status is
   `ERROR`.
 - `min_record_duration_s` is a quality label, not a publication gate. Short
-  consistent episodes keep schema-v16 validity and expose `min_frames_met=False`;
+  consistent episodes keep schema-v17 validity and expose `min_frames_met=False`;
   replay and visualization warn so downstream training can filter explicitly.
 - `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
 - `examples/replay_episode.py` defaults to live replay of the full recorded
@@ -258,7 +265,7 @@ aligned samples → RecorderIO → temporary episode + stream verification
   immediately before worker startup. `--dry-run` opts into offline validation.
 - Offline training-data processing is a separate versioned view:
   `examples/process_episodes.py` is a thin wrapper over `data_processing/`.
-  The pipeline keeps v16 sources immutable, resolves a modality-dependent hard
+  The pipeline keeps v17 sources immutable, resolves a modality-dependent hard
   mask, splits at every invalid row or time/source discontinuity, and writes
   `dexmani-real-simlabel-hdf5/v1` through a directory transaction. It never
   stitches gaps, fabricates absent Sim labels, or relabels real point clouds as
@@ -277,7 +284,7 @@ Cross-module obligations for each change are the contract in `AGENTS.md` §5
 2. Allocate it through `SharedStorage`; write it in the owning worker and read
    it in each consumer.
 3. Decide whether recording persists it. If yes, update recorder, reader,
-   quality/visualization/replay consumers and the v16 schema contract together.
+   quality/visualization/replay consumers and the v17 schema contract together.
 4. Check finite values, units, initial/invalid values, and process cleanup.
 
 ### Changing control, IK, or collision behavior
@@ -293,7 +300,7 @@ Cross-module obligations for each change are the contract in `AGENTS.md` §5
 
 ### Changing recording or replay
 
-1. Keep v16 dataset meanings stable. Coordinate any format change across
+1. Keep v17 dataset meanings stable. Coordinate any format change across
    recorder, reader, visualization, and replay in the same change.
 2. Update producer, reader, offline quality/visualization, replay loader, and
    provenance/schema marker together.
@@ -374,7 +381,7 @@ Cross-module obligations for each change are the contract in `AGENTS.md` §5
   combined force/contact; 1501020 invalidates only temperature, which is not
   part of the runtime schema, so both force fields remain usable. Statuses are
   transaction-local and the next successful read recovers immediately. Timeout
-  and board errors remain immediate transaction failures. The v16
+  and board errors remain immediate transaction failures. The v17
   `qpos_stale` bit is retained as a reserved false compatibility field.
 - Hand `state_valid` mirrors `connected` (set from the last read's connection
   flag; the first frame is set unconditionally). Hand feedback health has one

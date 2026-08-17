@@ -5,8 +5,8 @@ Reads camera frames from DexMani episodes. Non-camera datasets
 :attr:`h5f` — a merged view of the episode HDF5 sidecars.
 
 An episode is one published directory containing ``data.h5``, ``depth.h5``,
-``pointcloud.h5`` and ``rgb.mp4``. Older flat HDF5 files and pre-v16 episode
-directories intentionally require an external migration tool.
+and ``rgb.mp4``. Older flat HDF5 files and pre-v17 episode directories
+intentionally require an external migration tool.
 
 Usage::
 
@@ -33,7 +33,7 @@ import numpy as np
 from dexmani_real.recording.episode_schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
-    validate_data_layout_v16,
+    validate_data_layout_v17,
 )
 from dexmani_real.recording.timestamp_buffer import FillReason
 from dexmani_real.recording.video_codec import VideoDecoder
@@ -112,7 +112,7 @@ class EpisodeReader:
 
     :attr:`h5f` returns a merged dict-like view over ``data.h5`` and camera
     sidecars so downstream code can access datasets by key
-    (``f["arm_qpos"]``, ``f["depth"]``, ``f["pointcloud"]``).
+    (``f["arm_qpos"]``, ``f["depth"]``).
     """
 
     def __init__(self, h5_path: str | Path) -> None:
@@ -120,24 +120,22 @@ class EpisodeReader:
         self._closed = False
         self._cache: dict[str, np.ndarray] = {}
         if not self._path.is_dir():
-            raise ValueError(f"episode must be a schema-v16 directory: {self._path}")
+            raise ValueError(f"episode must be a schema-v17 directory: {self._path}")
 
         paths = {
             "data": self._path / "data.h5",
             "depth": self._path / "depth.h5",
-            "pointcloud": self._path / "pointcloud.h5",
             "rgb": self._path / "rgb.mp4",
         }
         missing = [name for name, path in paths.items() if not path.is_file()]
         if missing:
-            raise FileNotFoundError(f"schema-v16 episode is missing required files {missing}: {self._path}")
+            raise FileNotFoundError(f"schema-v17 episode is missing required files {missing}: {self._path}")
 
         self._data_h5f = h5py.File(paths["data"], "r")
         depth_h5f = h5py.File(paths["depth"], "r")
-        pointcloud_h5f = h5py.File(paths["pointcloud"], "r")
         self._h5f = MergedH5File(
             self._data_h5f,
-            {"depth": depth_h5f, "pointcloud": pointcloud_h5f},
+            {"depth": depth_h5f},
         )
         self._rgb_decoder: VideoDecoder | None = VideoDecoder(paths["rgb"])
         schema_version = self.schema_version
@@ -230,7 +228,7 @@ class EpisodeReader:
             for key, dataset in self._data_h5f.items()
             if isinstance(dataset, h5py.Dataset)
         }
-        layout_errors = validate_data_layout_v16(
+        layout_errors = validate_data_layout_v17(
             dataset_shapes,
             dataset_dtypes,
             frame_count=frame_count,
@@ -243,20 +241,15 @@ class EpisodeReader:
             return ValidityState.INVALID
         if not bool(meta.attrs.get("success", False)) or str(meta.attrs.get("camera_writer_error", "")):
             return ValidityState.INVALID
-        if self._rgb_decoder is None or "depth" not in self._h5f or "pointcloud" not in self._h5f:
+        if self._rgb_decoder is None or "depth" not in self._h5f:
             return ValidityState.INVALID
         depth = self._h5f["depth"]
-        pointcloud = self._h5f["pointcloud"]
         height = int(meta.attrs.get("camera_encoding_height", -1))
         width = int(meta.attrs.get("camera_encoding_width", -1))
         if (
             depth.shape != (frame_count, height, width)
             or depth.dtype != np.dtype(np.uint16)
             or depth.shape[0] != frame_count
-            or pointcloud.ndim != 3
-            or pointcloud.shape[0] != frame_count
-            or pointcloud.shape[-1] != 6
-            or pointcloud.dtype != np.dtype(np.float32)
         ):
             return ValidityState.INVALID
         try:

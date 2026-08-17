@@ -50,19 +50,6 @@ def _range_mask(length: int, ranges: tuple[tuple[int, int], ...], *, default: bo
     return mask
 
 
-def _pointcloud_numeric_mask(reader: EpisodeReader, frame_count: int, *, chunk_size: int = 64) -> np.ndarray:
-    dataset = reader.h5f["pointcloud"]
-    valid = np.ones(frame_count, dtype=bool)
-    for start in range(0, frame_count, chunk_size):
-        end = min(frame_count, start + chunk_size)
-        chunk = np.asarray(dataset[start:end], dtype=np.float32)
-        finite = np.all(np.isfinite(chunk), axis=(1, 2))
-        nonzero = np.any(np.linalg.norm(chunk[:, :, :3], axis=2) > 0.0, axis=1)
-        color_range = np.all((chunk[:, :, 3:] >= 0.0) & (chunk[:, :, 3:] <= 1.0), axis=(1, 2))
-        valid[start:end] = finite & nonzero & color_range
-    return valid
-
-
 def _segment_quality(
     arrays: Mapping[str, np.ndarray],
     start: int,
@@ -90,9 +77,7 @@ def _segment_quality(
         quality["camera_age_s"] = _finite_stats(arrays["camera_age_s"][start:end])
         quality["camera_frame_gap_count"] = int(np.count_nonzero(arrays["camera_frame_gap"][start:end] > 1))
         quality["camera_duplicate_count"] = int(np.count_nonzero(arrays["camera_duplicate"][start:end]))
-    if "pointcloud_source_point_count" in arrays:
-        quality["pointcloud_source_point_count"] = _finite_stats(arrays["pointcloud_source_point_count"][start:end])
-        quality["pointcloud_padding_count"] = _finite_stats(arrays["pointcloud_padding_count"][start:end])
+    if "pointcloud_valid_depth_ratio" in arrays:
         quality["pointcloud_valid_depth_ratio"] = _finite_stats(arrays["pointcloud_valid_depth_ratio"][start:end])
     return quality
 
@@ -250,28 +235,13 @@ def analyze_episode(
         )
 
     if config.profile.needs_pointcloud:
-        pointcloud_capacity = int(reader.h5f["pointcloud"].shape[1])
-        arrays.update(
-            {
-                "pointcloud_source_point_count": _as_i64(reader, "pointcloud_source_point_count"),
-                "pointcloud_padding_count": _as_i64(reader, "pointcloud_padding_count"),
-                "pointcloud_valid_depth_ratio": _as_f64(reader, "pointcloud_valid_depth_ratio"),
-            }
-        )
-        pointcloud_meta_valid = (
-            _as_bool(reader, "flag_pointcloud_valid")
-            & (arrays["pointcloud_source_point_count"] > 0)
-            & (arrays["pointcloud_padding_count"] >= 0)
-            & (arrays["pointcloud_padding_count"] <= pointcloud_capacity)
-            & (
-                arrays["pointcloud_padding_count"]
-                == np.maximum(pointcloud_capacity - arrays["pointcloud_source_point_count"], 0)
-            )
-            & np.isfinite(arrays["pointcloud_valid_depth_ratio"])
-            & (arrays["pointcloud_valid_depth_ratio"] >= 0.0)
-            & (arrays["pointcloud_valid_depth_ratio"] <= 1.0)
-        )
-        reason_masks["pointcloud_invalid"] = ~(pointcloud_meta_valid & _pointcloud_numeric_mask(reader, frame_count))
+        # The point cloud is now derived from the recorded depth at write time
+        # (see pipeline), so there is no stored pointcloud to validate here.
+        # A pointcloud frame is valid iff its depth/camera source is valid,
+        # which the ``camera_invalid`` reason already captures — the two were
+        # frame-identical in practice.  We only retain the depth-derived
+        # quality ratio as a per-segment diagnostic.
+        arrays["pointcloud_valid_depth_ratio"] = _as_f64(reader, "pointcloud_valid_depth_ratio")
 
     include_mask = _range_mask(
         frame_count,
@@ -352,10 +322,6 @@ def analyze_episode(
     }
     if "camera_age_s" in arrays:
         overall_quality["camera_age_s"] = _finite_stats(arrays["camera_age_s"][selected_indices])
-    if "pointcloud_padding_count" in arrays:
-        overall_quality["pointcloud_padding_count"] = _finite_stats(
-            arrays["pointcloud_padding_count"][selected_indices]
-        )
 
     rejected_reason = None if segments else "no contiguous segment satisfies the configured training window"
     return EpisodeDecision(

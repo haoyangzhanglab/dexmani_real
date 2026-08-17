@@ -1,7 +1,7 @@
-"""Shared memory ring buffer for large camera frames (RGB + depth + pointcloud).
+"""Shared memory ring buffer for large camera frames (RGB + depth).
 
-``CameraRingBuffer`` uses a variable-size slot layout (header + RGB + depth +
-optional pointcloud) rather than the fixed-dtype layout of
+``CameraRingBuffer`` uses a variable-size slot layout (header + RGB + depth)
+rather than the fixed-dtype layout of
 :class:`~dexmani_real.shm.ring_buffer.SharedMemoryRingBuffer`.  It shares the
 same seqlock commit/publish contract — ``SeqlockSlot``, torn-read defence, and
 deferred publish timestamp — via a one-way import of the shared helpers, so this
@@ -36,29 +36,25 @@ class CameraRingBuffer:
       - Header: CAMERA_FRAME_HEADER_DTYPE (metadata)
       - RGB raw bytes
       - Depth raw bytes
-      - Optional pointcloud block (fixed-size float32 (N, 6), pc_shape != None)
 
     Layout of shared memory:
         [0:8)     write_idx  (uint64, atomic)
         [8:16)    sequence   (uint64)
         [16:24)   max_rgb_bytes (uint64, max RGB bytes per frame)
         [24:32)   max_depth_bytes (uint64, max depth bytes per frame)
-        [32:40)   max_pc_bytes (uint64, pointcloud bytes per frame, 0 = none)
-        [40:64)   padding
+        [32:64)   padding
         [64:)     N slots, each of:
                     [0:8)   timestamp_ns (uint64)
                     [8:16)  sequence (uint64)
                     [16:16+header.itemsize) CAMERA_FRAME_HEADER_DTYPE
                     [...:...+max_rgb_bytes) RGB data
                     [...:...+max_depth_bytes) Depth data
-                    [...:...+max_pc_bytes) Pointcloud data (float32)
     """
 
     _OFF_WRITE_IDX = 0
     _OFF_SEQUENCE = 8
     _OFF_MAX_RGB = 16
     _OFF_MAX_DEPTH = 24
-    _OFF_MAX_PC = 32
     _HEADER_SIZE = 64  # cache-line aligned
 
     def __init__(
@@ -68,7 +64,6 @@ class CameraRingBuffer:
         depth_shape: tuple[int, int] | None = None,
         maxlen: int = 5,
         create: bool = True,
-        pc_shape: tuple[int, int] | None = None,
     ) -> None:
         self.name = name
         self.maxlen = maxlen
@@ -81,11 +76,9 @@ class CameraRingBuffer:
                 raise ValueError("rgb_shape and depth_shape are required when create=True")
             self._rgb_shape: tuple[int, int, int] | None = rgb_shape
             self._depth_shape: tuple[int, int] | None = depth_shape
-            self._pc_shape: tuple[int, int] | None = pc_shape
             self._max_rgb_bytes = rgb_shape[0] * rgb_shape[1] * rgb_shape[2]
             self._max_depth_bytes = depth_shape[0] * depth_shape[1] * 2
-            self._max_pc_bytes = pc_shape[0] * pc_shape[1] * 4 if pc_shape else 0
-            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
+            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
             self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
 
             self._shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_size)
@@ -99,15 +92,11 @@ class CameraRingBuffer:
             self._max_depth_bytes = int(
                 np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH)[0]
             )
-            self._max_pc_bytes = int(
-                np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_PC)[0]
-            )
-            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes + self._max_pc_bytes
+            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
             self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
             # Reconstruct shapes from byte counts for attach-mode consumers.
             self._rgb_shape = None
             self._depth_shape = None
-            self._pc_shape = (self._max_pc_bytes // (6 * 4), 6) if self._max_pc_bytes > 0 else None
 
         self._last_torn_warn_ns = 0
 
@@ -130,24 +119,20 @@ class CameraRingBuffer:
             "maxlen": self.maxlen,
             "rgb_shape": self._rgb_shape,
             "depth_shape": self._depth_shape,
-            "pc_shape": self._pc_shape,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         CameraRingBuffer.__init__(self, state["name"], maxlen=int(state["maxlen"]), create=False)
         rgb_shape = state["rgb_shape"]
         depth_shape = state["depth_shape"]
-        pc_shape = state["pc_shape"]
         self._rgb_shape = (int(rgb_shape[0]), int(rgb_shape[1]), int(rgb_shape[2])) if rgb_shape is not None else None
         self._depth_shape = (int(depth_shape[0]), int(depth_shape[1])) if depth_shape is not None else None
-        self._pc_shape = (int(pc_shape[0]), int(pc_shape[1])) if pc_shape is not None else None
 
     def write(
         self,
         header: np.ndarray,
         rgb: np.ndarray,
         depth: np.ndarray,
-        pointcloud: np.ndarray | None = None,
     ) -> int:
         """Write a camera frame into the ring buffer.
 
@@ -155,9 +140,6 @@ class CameraRingBuffer:
             header: 1-d array of CAMERA_FRAME_HEADER_DTYPE (1 element).
             rgb: Raw RGB bytes (uint8 array, flattened).
             depth: Raw depth bytes (uint16 array, flattened).
-            pointcloud: Contiguous float32 array matching pc_shape (pass a
-                zeros block when no valid cloud); ignored when the buffer was
-                created without pc_shape.
         Returns:
             New sequence number.
         """
@@ -178,17 +160,6 @@ class CameraRingBuffer:
             raise ValueError(f"camera depth shape {depth.shape} does not match ring capacity {self._depth_shape}")
         if rgb.nbytes != self._max_rgb_bytes or depth.nbytes != self._max_depth_bytes:
             raise ValueError("camera rgb/depth payload must exactly fill its configured ring capacity")
-        if self._max_pc_bytes > 0:
-            if pointcloud is None or pointcloud.dtype != np.float32 or pointcloud.shape != self._pc_shape:
-                raise ValueError(
-                    f"camera pointcloud must be {self._pc_shape} float32, "
-                    f"got shape={getattr(pointcloud, 'shape', None)} dtype={getattr(pointcloud, 'dtype', None)}"
-                )
-            if pointcloud.nbytes != self._max_pc_bytes:
-                raise ValueError("camera pointcloud payload must exactly fill its configured ring capacity")
-            if not pointcloud.flags.c_contiguous:
-                raise ValueError("camera pointcloud payload must be C-contiguous")
-
         h = header[0]
         if int(h["rgb_size"]) != rgb.nbytes or int(h["depth_size"]) != depth.nbytes:
             raise ValueError("camera header byte sizes do not match payloads")
@@ -196,19 +167,9 @@ class CameraRingBuffer:
             raise ValueError("camera header RGB shape does not match payload")
         if (int(h["depth_shape_h"]), int(h["depth_shape_w"])) != depth.shape:
             raise ValueError("camera header depth shape does not match payload")
-        pc_num_points = int(h["pc_num_points"])
-        if self._pc_shape is not None and not 0 <= pc_num_points <= self._pc_shape[0]:
-            raise ValueError(f"pc_num_points={pc_num_points} exceeds ring capacity {self._pc_shape[0]}")
-        if self._pc_shape is None and (pointcloud is not None or pc_num_points != 0):
-            raise ValueError("pointcloud payload/header provided to a ring without pointcloud capacity")
-        if bool(h["pointcloud_valid"]) != (pc_num_points > 0):
-            raise ValueError("pointcloud_valid must agree with pc_num_points")
         valid_depth_ratio = float(h["pc_valid_depth_ratio"])
-        padding_count = int(h["pc_padding_count"])
         if not np.isfinite(valid_depth_ratio) or not 0.0 <= valid_depth_ratio <= 1.0:
             raise ValueError("pc_valid_depth_ratio must be finite and in [0, 1]")
-        if self._pc_shape is not None and not 0 <= padding_count <= self._pc_shape[0]:
-            raise ValueError("pc_padding_count exceeds ring capacity")
 
         seq = int(self._write_seq[0]) + 1
 
@@ -245,18 +206,9 @@ class CameraRingBuffer:
         )
         depth_dest[:] = depth.view(np.uint8).ravel()[:depth_len]
 
-        # Write pointcloud bytes (fixed-size block; validity is header-flagged)
-        if self._max_pc_bytes > 0 and pointcloud is not None:
-            pc_offset = depth_offset + self._max_depth_bytes
-            pc_len = pointcloud.nbytes
-            pc_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
-                (pc_len,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset
-            )
-            pc_dest[:] = pointcloud.view(np.uint8).ravel()[:pc_len]
-
         # ── Commit: stamp the timestamp only after the payload is fully copied,
         # so both the seqlock timestamp and the header publish field reflect the
-        # true commit time, not the start of a long RGB/depth/pointcloud copy.
+        # true commit time, not the start of a long RGB/depth copy.
         now_ns = time.monotonic_ns()
         seqlock.stamp_timestamp(now_ns)
         header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
@@ -272,13 +224,11 @@ class CameraRingBuffer:
 
     def read_latest(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, int] | None:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
         """Read the latest camera frame.
 
-        Returns (header, rgb, depth, pointcloud, sequence) or None if no frame
-        available. ``pointcloud`` is a shaped float32 copy (pc_shape), or None
-        when the buffer was created without pc_shape. All returned arrays are
-        copies.
+        Returns (header, rgb, depth, sequence) or None if no frame available.
+        All returned arrays are copies.
         """
         idx = int(self._write_idx_view()[0])
 
@@ -349,24 +299,12 @@ class CameraRingBuffer:
             .reshape((depth_h, depth_w))
         )
 
-        # Read pointcloud block — fixed size, so no torn-read size guard needed
-        # beyond the seqlock re-check below.
-        pointcloud = None
-        if self._max_pc_bytes > 0 and self._pc_shape is not None:
-            pc_offset = depth_offset + self._max_depth_bytes
-            pointcloud = (
-                np.ndarray((self._max_pc_bytes,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset)
-                .copy()
-                .view(np.float32)
-                .reshape(self._pc_shape)
-            )
-
         # ── Seqlock: reject writer-active or torn reads ──
         # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
         if not seqlock.verify(slot_seq):
             return None
 
-        return header, rgb, depth, pointcloud, _seqlock_to_logical(slot_seq)
+        return header, rgb, depth, _seqlock_to_logical(slot_seq)
 
     def get_last_metadata(self, k: int) -> list[tuple[np.ndarray, int, int]]:
         """Return up to *k* verified camera headers without copying payloads.
@@ -401,10 +339,10 @@ class CameraRingBuffer:
         self,
         sequence: int,
         *,
-        modalities: tuple[str, ...] = ("rgb", "depth", "pointcloud"),
+        modalities: tuple[str, ...] = ("rgb", "depth"),
     ) -> dict[str, np.ndarray] | None:
         """Copy selected payloads for one still-resident verified sequence."""
-        allowed = {"rgb", "depth", "pointcloud"}
+        allowed = {"rgb", "depth"}
         unknown = set(modalities) - allowed
         if unknown:
             raise ValueError(f"unknown camera modalities: {sorted(unknown)}")
@@ -443,14 +381,6 @@ class CameraRingBuffer:
                 .view(np.uint16)
                 .reshape(depth_shape)
             )
-        if "pointcloud" in modalities and self._max_pc_bytes > 0 and self._pc_shape is not None:
-            pc_offset = depth_offset + self._max_depth_bytes
-            output["pointcloud"] = (
-                np.ndarray((self._max_pc_bytes,), dtype=np.uint8, buffer=self._shm.buf, offset=pc_offset)
-                .copy()
-                .view(np.float32)
-                .reshape(self._pc_shape)
-            )
         if not seqlock.verify(marker1):
             return None
         return output
@@ -472,9 +402,6 @@ class CameraRingBuffer:
         )
         np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH)[0] = np.uint64(
             self._max_depth_bytes
-        )
-        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_PC)[0] = np.uint64(
-            self._max_pc_bytes
         )
 
     def _write_idx_view(self) -> np.ndarray:

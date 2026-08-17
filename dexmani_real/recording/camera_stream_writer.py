@@ -29,7 +29,6 @@ class CameraStreamWriterConfig:
 
     rgb_shape: tuple[int, int, int]
     depth_shape: tuple[int, int]
-    pointcloud_shape: tuple[int, int]
     fps: float
     queue_size: int
     video: VideoEncoderConfig = field(default_factory=VideoEncoderConfig)
@@ -39,8 +38,6 @@ class CameraStreamWriterConfig:
             raise ValueError(f"rgb_shape must be (H, W, 3), got {self.rgb_shape}")
         if len(self.depth_shape) != 2 or self.depth_shape != self.rgb_shape[:2]:
             raise ValueError("depth_shape must match the RGB image plane")
-        if len(self.pointcloud_shape) != 2 or self.pointcloud_shape[1] != 6:
-            raise ValueError(f"pointcloud_shape must be (N, 6), got {self.pointcloud_shape}")
         if self.fps <= 0 or self.queue_size <= 0:
             raise ValueError("writer fps and queue_size must be > 0")
 
@@ -49,11 +46,10 @@ class CameraStreamWriterConfig:
 class _CameraWriteItem:
     rgb: np.ndarray
     depth: np.ndarray
-    pointcloud: np.ndarray
 
 
 class CameraStreamWriter:
-    """Write RGB, depth, and pointcloud from a bounded worker queue.
+    """Write RGB and depth from a bounded worker queue.
 
     ``submit`` never waits for disk or encoding.  A full queue, worker crash,
     codec failure, or filesystem error is fatal and latched in :attr:`error`;
@@ -114,7 +110,7 @@ class CameraStreamWriter:
             **summarize("camera_hdf5", self._hdf5_durations_s),
         }
 
-    def submit(self, rgb: np.ndarray, depth: np.ndarray, pointcloud: np.ndarray) -> bool:
+    def submit(self, rgb: np.ndarray, depth: np.ndarray) -> bool:
         """Copy and enqueue one complete grid slot without blocking."""
         if self._closed:
             self._set_error("submit attempted after writer close")
@@ -125,14 +121,8 @@ class CameraStreamWriter:
         try:
             rgb_frame = self._validated_copy(rgb, np.uint8, self.config.rgb_shape, "rgb")
             depth_frame = self._validated_copy(depth, np.uint16, self.config.depth_shape, "depth")
-            pointcloud_frame = self._validated_copy(
-                pointcloud,
-                np.float32,
-                self.config.pointcloud_shape,
-                "pointcloud",
-            )
             queue_depth_before = self._queue.qsize()
-            self._queue.put_nowait(_CameraWriteItem(rgb_frame, depth_frame, pointcloud_frame))
+            self._queue.put_nowait(_CameraWriteItem(rgb_frame, depth_frame))
             self._queue_high_watermark = max(
                 self._queue_high_watermark,
                 min(self.config.queue_size, queue_depth_before + 1),
@@ -201,7 +191,6 @@ class CameraStreamWriter:
     def _run(self) -> None:
         encoder: VideoEncoder | None = None
         depth_file: h5py.File | None = None
-        pointcloud_file: h5py.File | None = None
         try:
             height, width, _ = self.config.rgb_shape
             encoder = self._encoder_factory(
@@ -212,22 +201,12 @@ class CameraStreamWriter:
                 height=height,
             )
             depth_file = h5py.File(self.directory / "depth.h5", "w")
-            pointcloud_file = h5py.File(self.directory / "pointcloud.h5", "w")
             depth_ds = depth_file.create_dataset(
                 "depth",
                 shape=(0,) + self.config.depth_shape,
                 maxshape=(None,) + self.config.depth_shape,
                 chunks=(1,) + self.config.depth_shape,
                 dtype=np.uint16,
-                compression="gzip",
-                compression_opts=1,
-            )
-            pointcloud_ds = pointcloud_file.create_dataset(
-                "pointcloud",
-                shape=(0,) + self.config.pointcloud_shape,
-                maxshape=(None,) + self.config.pointcloud_shape,
-                chunks=(1,) + self.config.pointcloud_shape,
-                dtype=np.float32,
                 compression="gzip",
                 compression_opts=1,
             )
@@ -244,7 +223,6 @@ class CameraStreamWriter:
                     self._encode_durations_s.append(time.perf_counter() - encode_started_s)
                     hdf5_started_s = time.perf_counter()
                     self._append(depth_ds, item.depth)
-                    self._append(pointcloud_ds, item.pointcloud)
                     self._hdf5_durations_s.append(time.perf_counter() - hdf5_started_s)
                     self._frame_count += 1
                 finally:
@@ -253,7 +231,7 @@ class CameraStreamWriter:
             self._set_error(f"{type(exc).__name__}: {exc}")
             logger.error("CameraStreamWriter worker failed", exc_info=True)
         finally:
-            for resource in (encoder, depth_file, pointcloud_file):
+            for resource in (encoder, depth_file):
                 if resource is None:
                     continue
                 try:

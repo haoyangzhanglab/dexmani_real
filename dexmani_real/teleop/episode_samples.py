@@ -189,9 +189,7 @@ def _recording_provenance(
         "tactile_source_monotonic_ns": tactile_source_ns,
         "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
         "tactile_unit_code": _field(hand_tactile, "unit_code"),
-        "pointcloud_source_point_count": (int(cam.get("pointcloud_source_point_count", 0)) if cam is not None else 0),
         "pointcloud_valid_depth_ratio": float(cam.get("valid_depth_ratio", np.nan)) if cam is not None else np.nan,
-        "pointcloud_padding_count": int(cam.get("pointcloud_padding_count", 0)) if cam is not None else 0,
     }
 
 

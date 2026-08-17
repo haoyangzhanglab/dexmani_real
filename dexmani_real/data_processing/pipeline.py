@@ -20,13 +20,15 @@ from dexmani_real.data_processing.transforms import resize_camera_intrinsic, res
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.episode_schema import EPISODE_SCHEMA_VERSION
 from dexmani_real.recording.transaction import atomic_publish
+from dexmani_real.sensor.pointcloud_processor import PointCloudProcessor, PointCloudProcessorConfig
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.pointcloud_utils import depth_to_meters, make_rays
 
 logger = get_logger(__name__)
 
 _SCHEMA_NAME = "dexmani-real-simlabel-hdf5"
 _SCHEMA_VERSION = 1
-_SOURCE_MEMBERS = ("data.h5", "depth.h5", "pointcloud.h5", "rgb.mp4")
+_SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _OMITTED_SIM_LABELS = (
     "depth",
     "segmentation",
@@ -292,6 +294,26 @@ def _write_episode_segments(
                 target_width=config.target_rgb_width,
             )
 
+        # ── Point cloud derivation (schema v17: derived, not recorded) ──
+        # Reconstruct the exact processor used at recording time from the
+        # persisted pc_* metadata, then deproject the recorded depth with the
+        # same intrinsics/extrinsics/desk plane.  The processor is fully
+        # deterministic (no RNG), so training and deployment derive an
+        # identical cloud from the same depth.
+        pointcloud_processor: PointCloudProcessor | None = None
+        pointcloud_rays: np.ndarray | None = None
+        depth_scale: float = 0.0
+        if config.profile.needs_pointcloud:
+            source_k = np.asarray(meta["camera_K"], dtype=np.float64).reshape(3, 3)
+            t_world_camera = np.asarray(meta["camera_T_world_camera"], dtype=np.float64).reshape(4, 4)
+            pc_meta = json.loads(str(meta.get("camera_pointcloud_config_json", "{}")) or "{}")
+            pointcloud_processor = PointCloudProcessor(
+                t_world_camera,
+                PointCloudProcessorConfig.from_meta_dict(pc_meta),
+            )
+            pointcloud_rays = make_rays(source_height, source_width, source_k).numpy()
+            depth_scale = float(meta["depth_scale"])
+
         for segment_index, (_, output) in enumerate(outputs):
             segment = decision.segments[segment_index]
             arm_state = np.asarray(reader.h5f["arm_qpos"][segment.start : segment.end], dtype=np.float32)
@@ -310,15 +332,18 @@ def _write_episode_segments(
                 output["camera_intrinsic"][:] = camera_k[None, :]
 
             if config.profile.needs_pointcloud:
-                source_counts = np.asarray(
-                    reader.h5f["pointcloud_source_point_count"][segment.start : segment.end],
-                    dtype=np.int64,
-                )
-                source_cloud = reader.h5f["pointcloud"]
                 for target_index, source_index in enumerate(range(segment.start, segment.end)):
+                    depth_m = depth_to_meters(
+                        np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16),
+                        depth_scale=depth_scale,
+                    )
+                    rgb = reader.read_camera_frame("rgb", source_index)
+                    cloud = pointcloud_processor.process(depth_m, rgb, pointcloud_rays)
+                    if cloud is None:
+                        raise ValueError(f"{reader.h5_path.name}: derived point cloud empty at frame {source_index}")
                     output["point_cloud"][target_index] = resize_point_cloud(
-                        np.asarray(source_cloud[source_index], dtype=np.float32),
-                        source_point_count=int(source_counts[target_index]),
+                        cloud,
+                        source_point_count=int(pointcloud_processor.last_source_point_count),
                         target_point_count=config.target_point_count,
                     )
 

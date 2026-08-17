@@ -1,13 +1,14 @@
-# DexMani Real v16 与 DexMani Sim HDF5/Zarr 完整数据字典
+# DexMani Real v17 与 DexMani Sim HDF5/Zarr 完整数据字典
 
 本文档同时记录两个彼此独立的数据合同：第 1–10 节描述 DexMani Real 当前运行时唯一
-支持的录制格式 **schema v16**；第 11 节描述 DexMani Sim 当前 HDF5 episode、HDF5→Zarr
+支持的录制格式 **schema v17**；第 11 节描述 DexMani Sim 当前 HDF5 episode、HDF5→Zarr
 转换格式和现存数据审计。
 
 Real 部分以
 `recording/episode_recorder.py`、`recording/camera_stream_writer.py`、
 `recording/episode_reader.py`、`recording/timestamp_buffer.py` 和实际生产端为准。
-历史的单文件 HDF5 或 v16 以前格式不在本文档的兼容范围内，必须在运行时之外迁移。
+历史的单文件 HDF5 或 v17 以前格式不在本文档的兼容范围内，必须在运行时之外迁移
+（旧 v16 episode 只需 bump `schema_version` 即可被新 reader/pipeline 处理，点云由 depth 无损重算）。
 
 > **合同边界：** Real 与 Sim 的同名字段不能直接互换。读取方必须先识别容器来源，再应用
 > 对应章节的 shape、单位、坐标系、时序和有效性规则。
@@ -33,7 +34,7 @@ Real 部分以
 
 | 合同 | 文档覆盖 | 复核基线 |
 |---|---|---|
-| Real v16 | 96 个基础 `data.h5` datasets、1 个标准 RecorderIO 条件 dataset、`/meta` attributes、2 个相机 HDF5 侧车 datasets，以及 `rgb.mp4` | writer、reader、producer、schema dtype 和离线 round-trip |
+| Real v17 | 93 个基础 `data.h5` datasets、1 个标准 RecorderIO 条件 dataset、`/meta` attributes、1 个相机 HDF5 侧车 dataset（`depth.h5`），以及 `rgb.mp4` | writer、reader、producer、schema dtype 和离线 round-trip |
 | Sim HDF5 | 13 个逐帧 datasets、46 个已观察根 attributes | 1113 个文件、237777 帧的只读 metadata 普查 |
 | Sim Zarr v2 | 13 个 `data/*` arrays 和 `meta/episode_ends` | 8 个 stores、1000 个 episodes、210083 帧；边界及每个 task 首末样本核对 |
 
@@ -42,19 +43,19 @@ Real 部分以
 
 ### 0.3 Real 与 Sim 快速区分
 
-| 维度 | DexMani Real v16 | DexMani Sim 当前格式 |
+| 维度 | DexMani Real v17 | DexMani Sim 当前格式 |
 |---|---|---|
-| episode 发布单元 | 一个目录：`data.h5`、`depth.h5`、`pointcloud.h5`、`rgb.mp4` | 一个 `.h5` 文件；也可将同 task 的成功 episode 聚合成一个 Zarr store |
-| schema 标记 | `/meta` attribute `schema_version=16` | HDF5 与 Zarr 均无 schema name/version |
+| episode 发布单元 | 一个目录：`data.h5`、`depth.h5`、`rgb.mp4` | 一个 `.h5` 文件；也可将同 task 的成功 episode 聚合成一个 Zarr store |
+| schema 标记 | `/meta` attribute `schema_version=17` | HDF5 与 Zarr 均无 schema name/version |
 | 行语义 | 固定控制网格上的对齐 sample，带逐行 timestamp 和有效性/质量信息 | `obs[t]` 为动作前状态，`action[t]` 驱动下一状态，`done[t]` 是动作后结果；无逐帧 timestamp |
 | 当前默认/实测图像 shape | 默认 `(N,480,640,...)`，可由运行配置改变 | 实测固定为 `(N,240,320,...)` |
-| 点云 | `/pointcloud` 为 `(N,2048,6)`，默认点数可配置 | 可见点云 `(N,1024,6)`，另有手部理想点云 `(N,512,6)` |
+| 点云 | 不在 episode 中存储；从 `/depth` + 元数据确定性派生为 `(N,2048,6)`，默认点数可配置 | 可见点云 `(N,1024,6)`，另有手部理想点云 `(N,512,6)` |
 | episode 元数据 | `data.h5` 的 `/meta` group attributes | HDF5 根 attributes；当前 Zarr 不保留这些属性 |
 | 发布完整性 | 临时目录写入、校验并原子 rename | HDF5 直接写最终文件；Zarr 以 `mode="w"` 直接覆盖目标 store |
 
 ### 0.4 DexMani Real fact-check 问题优先级总表
 
-本表只覆盖 **DexMani Real schema v16**，不包含第 11 节的 DexMani Sim 数据集问题。
+本表只覆盖 **DexMani Real schema v17**，不包含第 11 节的 DexMani Sim 数据集问题。
 优先级表示建议处置顺序：**P1** 应在依赖相关字段进行训练或回放前处理，**P2** 应在扩大
 数据用途或下一次 schema 修订时处理，**P3** 属于扩展边界维护。本轮没有发现需要列为 P0
 的现存 Real 数据不可逆损坏。运行复现均使用临时目录和 fake，不启动机器人、相机或 GUI。
@@ -62,18 +63,18 @@ Real 部分以
 
 | 顺序 | 优先级 | ID | 问题摘要 | 证据状态 | 主要影响 / 建议 |
 |---:|---|---|---|---|---|
-| 1 | P1 | H5-07 | reader 与 writer finalizer 没有共享完整 v16 dataset 合同，受损文件可被误判为 `VALID`。 | 已复现并修复 | 96 个基础字段和 `action_arm_joint_sent` 条件规则现由同一 schema 模块校验；未知历史扩展也必须首维为 `N`。 |
+| 1 | P1 | H5-07 | reader 与 writer finalizer 没有共享完整 v17 dataset 合同，受损文件可被误判为 `VALID`。 | 已复现并修复 | 93 个基础字段和 `action_arm_joint_sent` 条件规则现由同一 schema 模块校验；未知历史扩展也必须首维为 `N`。 |
 | 2 | P1 | H5-02 | align 会形成共同像素 viewport，但 aligned Z16 仍保留 source depth-camera 的轴向 Z；旧路径还允许把 depth-frame rays 套入 color 外参。 | producer、标定链及 librealsense 2.54.2 实现交叉核查；部分修复 | 生产已拒绝 `color_to_depth/none`，消除了更大的 frame mismatch；但当前 `depth_to_color` 点云仍是近似几何，严格修复需保存源 depth intrinsics、depth↔color extrinsic、distortion 并重投影。 |
 | 3 | P1 | H5-03 | XHand 数量不足/缺失的 `sensor_data` 被零填充，甚至可能被标成 fresh/calibrated；同时 `0.1` 缩放不是已验证 SI 换算。 | fake 缺失传感器帧运行复现；已修复 | 严查 5×120×3 有限 payload；失效触觉立即发布 `fresh=False`，但不丢弃同帧有效关节反馈。 |
-| 4 | P1 | H5-04 | held/failure 路径不存在求解器 raw 输出，但 v16 兼容 fallback 会把最终/hold 命令写入两个 `*_raw` 字段。 | recorder buffer 运行复现；已修复消费合同 | 保留 v16 存值，reader 提供 arm/hand 保守 raw-valid mask；不在 v16 内改成 NaN 或增加 dataset。 |
+| 4 | P1 | H5-04 | held/failure 路径不存在求解器 raw 输出，但 v17 兼容 fallback 会把最终/hold 命令写入两个 `*_raw` 字段。 | recorder buffer 运行复现；已修复消费合同 | 保留 v17 存值，reader 提供 arm/hand 保守 raw-valid mask；不在 v17 内改成 NaN 或增加 dataset。 |
 | 5 | P2 | H5-05 | `arm_tau` 单位未经合同确认，且 arm worker 启动首帧曾把 qvel/effort 人工置零却标有效。 | SDK 调用链、厂商说明和启动路径核查；已修复可修部分 | 启动即读取 `num=3` 真实反馈；metadata 明示 current-estimated effort、单位未验证，不做 N·m 换算。 |
-| 6 | P2 | H5-01 | `arm_ee` 原生为 xArm base frame；当前 runtime 明确令 planner world 等于 base，因此不是现存数值 bug。 | FK、mapper、workspace 与 runtime 配置交叉核查；已加固 | 保持 v16 数值含义，修正误导命名并持久化 frame/invariant；未来支持非单位 base pose 必须升级合同并整体审计。 |
+| 6 | P2 | H5-01 | `arm_ee` 原生为 xArm base frame；当前 runtime 明确令 planner world 等于 base，因此不是现存数值 bug。 | FK、mapper、workspace 与 runtime 配置交叉核查；已加固 | 保持 v17 数值含义，修正误导命名并持久化 frame/invariant；未来支持非单位 base pose 必须升级合同并整体审计。 |
 | 7 | P3 | H5-06 | 底层 recorder 对任意 diagnostics 既可覆盖核心字段，又可能形成未声明 dataset。 | writer/buffer 静态确认；已修复 | 固定 diagnostics allowlist，并冻结 source key/shape/dtype；reader 仍可读取首维为 `N` 的历史扩展。 |
 
 H5-07 不表示既有标准 RecorderIO episode 普遍缺字段：标准路径启用
-`arm_sent_stream=True`，会创建 96 个基础 dataset 加 `action_arm_joint_sent`，合计 97 个。
-底层 `EpisodeRecorder(arm_sent_stream=False)` 的合法 v16 则只有 96 个基础字段。两种布局现均由
-共享 schema 校验，不再把第 97 个条件字段误写成所有 v16 文件的无条件要求。
+`arm_sent_stream=True`，会创建 93 个基础 dataset 加 `action_arm_joint_sent`，合计 94 个。
+底层 `EpisodeRecorder(arm_sent_stream=False)` 的合法 v17 则只有 93 个基础字段。两种布局现均由
+共享 schema 校验，不再把第 94 个条件字段误写成所有 v17 文件的无条件要求。
 
 ## 1. Episode 不是单个 HDF5 文件
 
@@ -83,15 +84,16 @@ H5-07 不表示既有标准 RecorderIO episode 普遍缺字段：标准路径启
 episode_YYYYMMDD_HHMMSS[_序号]/
 ├── data.h5          # 控制网格、机器人、VR、动作、质量和元数据
 ├── depth.h5         # 原始深度图
-├── pointcloud.h5    # 预处理后的定长世界坐标系点云
 └── rgb.mp4          # 与 HDF5 逐帧对齐的 RGB 视频；不是 HDF5
 ```
 
 录制期间先写入同级 `.tmp_episode_*` 目录；保存成功后经 fsync 和原子 rename
-发布为 `episode_*`。失败或明确丢弃的录制不会保留部分 episode。四个文件在 v16
-中都是必需文件，帧数必须一致。`EpisodeReader.h5f` 将 `data.h5`、`depth.h5` 和
-`pointcloud.h5` 暴露为一个只读的合并键空间；`rgb` 不属于该键空间，必须通过
-`EpisodeReader.read_camera_frame()` 或 `read_camera_all()` 解码。
+发布为 `episode_*`。失败或明确丢弃的录制不会保留部分 episode。三个文件在 v17
+中都是必需文件，帧数必须一致。`EpisodeReader.h5f` 将 `data.h5` 和 `depth.h5`
+暴露为一个只读的合并键空间；`rgb` 不属于该键空间，必须通过
+`EpisodeReader.read_camera_frame()` 或 `read_camera_all()` 解码。世界点云不单独存储，
+而是在消费边界从 `depth.h5`（配合内参/外参、desk-plane 和 `PointCloudProcessor` 配置）
+确定性地派生。
 
 ## 2. 记号、坐标和存储约定
 
@@ -114,7 +116,7 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 
 - `data.h5` dataset 使用产生它的 NumPy dtype，均为可沿第 0 维扩展的 chunked
   dataset，并使用 h5py 默认级别的 gzip 压缩。
-- `depth.h5` 和 `pointcloud.h5` 每帧一个 chunk，使用 gzip level 1。
+- `depth.h5` 每帧一个 chunk，使用 gzip level 1。
 - 表中的 `float64`、`float32`、`int64`、`int32`、`uint8`、`uint16` 对应 NumPy/HDF5
   数值类型。`bool` 是 HDF5 可识别的 NumPy 布尔类型。
 - 多数标识和纳秒时间在 IPC 边界是 `uint64`，但 `EpisodeRecorder` 将其转成 Python
@@ -155,7 +157,7 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 
 | Attribute | 类型/shape | 单位 | 物理意义 |
 |---|---|---|---|
-| `schema_version` | int 标量 | — | 固定为 `16`；读取器拒绝其他版本。 |
+| `schema_version` | int 标量 | — | 固定为 `17`；读取器拒绝其他版本。 |
 | `task_label` | UTF-8 字符串 | — | START 边界传入的任务标签。 |
 | `operator` | UTF-8 字符串 | — | 操作者标识。 |
 | `control_hz` | float64 标量 | Hz | 名义控制/录制网格频率。 |
@@ -172,9 +174,9 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 | `truncated` | bool 标量 | — | 是否因达到 `max_frames` 截断。 |
 | `stop_reason` | UTF-8 字符串 | — | 停止原因；未显式给出时通常为 `manual` 或 `max_frames`。 |
 | `skip_initial_frames` | int64 标量 | 帧 | START 后跳过的过渡帧数；这些帧完全不进入网格。 |
-| `has_timestamps` | bool 标量 | — | `data.h5` 是否含 `timestamp`，有效 v16 应为真。 |
+| `has_timestamps` | bool 标量 | — | `data.h5` 是否含 `timestamp`，有效 v17 应为真。 |
 | `resolved_config_sha256` | 64 字符字符串 | — | 已解析运行配置的 SHA-256，不是配置正文。 |
-| `arm_sent_stream` | bool 标量，条件存在 | — | 表示存在 `action_arm_joint_sent`。标准 RecorderIO v16 录制会写 `True`。 |
+| `arm_sent_stream` | bool 标量，条件存在 | — | 表示存在 `action_arm_joint_sent`。标准 RecorderIO v17 录制会写 `True`。 |
 
 ### 3.2 相机身份、标定和编码
 
@@ -204,10 +206,8 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 | `camera_encoding_height` | int64 标量 | pixel | `IH`。 |
 | `camera_encoding_fps` | float64 标量 | 帧/s | RGB 侧车写入率，必须等于 `control_hz`。 |
 | `camera_depth_storage` | 字符串 | — | 当前固定说明 `uint16/gzip-1`。 |
-| `camera_pointcloud_storage` | 字符串 | — | 当前固定说明 `float32/gzip-1`。 |
 | `camera_health_taxonomy_json` | JSON 字符串 | — | 相机健康码表，当前为 `0..4`，见第 7 节。 |
 | `has_camera` | bool 标量 | — | 是否写入了相机网格帧；不等价于每帧都 fresh。 |
-| `has_pointcloud` | bool 标量 | — | 是否至少有一个 `flag_pointcloud_valid=True` 的槽。 |
 | `camera_stream_frames` | int64 标量 | 帧 | 每个相机侧车实际写入帧数，必须等于 `N`。 |
 | `camera_writer_error` | 字符串 | — | 已发布 episode 中应为空；非空会使 reader 判为 INVALID。 |
 
@@ -229,10 +229,10 @@ episode_YYYYMMDD_HHMMSS[_序号]/
 | `camera_encode_p95_s` | float64 | s/帧 | RGB 单帧编码耗时的 95 百分位。 |
 | `camera_encode_p99_s` | float64 | s/帧 | RGB 单帧编码耗时的 99 百分位。 |
 | `camera_encode_max_s` | float64 | s/帧 | RGB 单帧编码耗时最大值。 |
-| `camera_hdf5_p50_s` | float64 | s/帧 | depth 与 pointcloud 单帧 HDF5 append 合计耗时的 50 百分位。 |
-| `camera_hdf5_p95_s` | float64 | s/帧 | depth 与 pointcloud 单帧 HDF5 append 合计耗时的 95 百分位。 |
-| `camera_hdf5_p99_s` | float64 | s/帧 | depth 与 pointcloud 单帧 HDF5 append 合计耗时的 99 百分位。 |
-| `camera_hdf5_max_s` | float64 | s/帧 | depth 与 pointcloud 单帧 HDF5 append 合计耗时最大值。 |
+| `camera_hdf5_p50_s` | float64 | s/帧 | depth 单帧 HDF5 append 耗时的 50 百分位。 |
+| `camera_hdf5_p95_s` | float64 | s/帧 | depth 单帧 HDF5 append 耗时的 95 百分位。 |
+| `camera_hdf5_p99_s` | float64 | s/帧 | depth 单帧 HDF5 append 耗时的 99 百分位。 |
+| `camera_hdf5_max_s` | float64 | s/帧 | depth 单帧 HDF5 append 耗时最大值。 |
 
 `EpisodeRecorder` 还允许调用方通过 `provenance` 添加任意
 `provenance_<key>` 字符串 attribute，并允许 START 时的 `camera_metadata` 添加小型
@@ -265,12 +265,12 @@ attribute。本节各表列出当前标准采集入口实际提供的全部键�
 | `arm_tau_si_unit_verified` | bool | `False`。 |
 | `arm_tau_sensor_semantics` | 字符串 | current-estimated effort，不是 direct torque sensor。 |
 
-## 4. `data.h5` datasets（96 个基础字段 + 1 个条件字段）
+## 4. `data.h5` datasets（93 个基础字段 + 1 个条件字段）
 
-96 个基础 dataset 是所有合法 v16 episode 的无条件合同。仅当
-`/meta.arm_sent_stream=True` 时，第 97 个 `action_arm_joint_sent` 必须存在；该 dataset 存在而
+93 个基础 dataset 是所有合法 v17 episode 的无条件合同。仅当
+`/meta.arm_sent_stream=True` 时，第 94 个 `action_arm_joint_sent` 必须存在；该 dataset 存在而
 marker 缺失/为假同样是无效布局。标准 RecorderIO 总是启用此流，因此其正常输出仍为
-97 个 dataset。
+94 个 dataset。
 
 ### 4.1 控制网格与因果填充
 
@@ -315,7 +315,7 @@ marker 缺失/为假同样是无效布局。标准 RecorderIO 总是启用此流
 | `hand_jointboard_err` | `(N,H)` | int32 | SDK error code | 每关节 motor-driver/joint board 错误寄存器。 |
 | `hand_connected` | `(N,)` | bool | — | 手部反馈是否连接/可读。 |
 | `hand_error_state` | `(N,)` | bool | — | 是否检测到手部板级硬件错误。 |
-| `hand_qpos_stale` | `(N,)` | bool | — | v16 兼容保留位；当前正常运行保持 false，真实 freshness 应看 source 时间和 observation mask。 |
+| `hand_qpos_stale` | `(N,)` | bool | — | v17 兼容保留位；当前正常运行保持 false，真实 freshness 应看 source 时间和 observation mask。 |
 | `tactile_fresh` | `(N,)` | bool | — | 独立 tactile ring 数据在 anchor 前且年龄不超过 250 ms；合成 hold 槽会清为 false。 |
 | `tactile_source_monotonic_ns` | `(N,)` | int64 | monotonic ns | 触觉帧的 source 时间；`0` 表示无来源。 |
 | `tactile_calibrated` | `(N,)` | bool | — | SDK/driver 是否声明触觉已标定。 |
@@ -330,7 +330,7 @@ marker 缺失/为假同样是无效布局。标准 RecorderIO 总是启用此流
 |---|---:|---|---|---|
 | `action_arm_joint_raw` | `(N,A)` | float64 | rad | 正常 IK 路径保存应用层逐帧 delta clamp 和 joint-limit clip 之前的关节解；held/failure 路径没有显式 raw 解时回退为当帧 hold/最终 arm 命令。 |
 | `action_arm_joint` | `(N,A)` | float64 | rad | 经过 delta/joint-limit 处理并通过 SafetyGate 的有效机械臂命令；hold 槽保存有效 hold 目标。 |
-| `action_arm_joint_sent` | `(N,A)` | float64 | rad | 实际转发给 arm worker 的安全命令流。标准 RecorderIO v16 存在；手工构造且未启用 `arm_sent_stream` 时可缺省。 |
+| `action_arm_joint_sent` | `(N,A)` | float64 | rad | 实际转发给 arm worker 的安全命令流。标准 RecorderIO v17 存在；手工构造且未启用 `arm_sent_stream` 时可缺省。 |
 | `action_hand_joint_raw` | `(N,H)` | float64 | rad | 正常 retarget 路径位于 startup ramp、operational clip 和后续校验之前；cache hit 复用该 VR observation 的 solved 值。held/failure 路径没有显式 raw 值时回退为当帧 hold/最终 hand 命令。详见第 10.4 节。 |
 | `action_hand_joint` | `(N,H)` | float64 | rad | 经过 startup ramp、operational clip 和后续校验的有效手部命令；当前没有应用侧 hand command-to-command delta clamp。 |
 | `action_arm_ee` | `(N,9)` | float64 | 前 3 列 m | IK 实际追踪的 `[target_pos(3), target_rot6d(6)]`；没有目标时为 NaN，held 帧尽量沿用最后有效目标。 |
@@ -399,15 +399,14 @@ held source 槽可以有明确 hold action，也可以有意不发布新动作�
 | `head_quat_wxyz` | `(N,4)` | float64 | — | 最近的头部 FLU 单位四元数，用于 heading/诊断；缺失时为 NaN。 |
 
 HDF5 没有保存 VR 的 `head_pos`、原始 wrist quaternion、远端 source timestamp 或
-HTS sequence id；上述四个 dataset 是 v16 中持久化的 VR 内容全集。
+HTS sequence id；上述四个 dataset 是 v17 中持久化的 VR 内容全集。
 
-### 4.7 相机逐槽状态与点云质量
+### 4.7 相机逐槽状态与 depth 质量
 
 | Dataset | Shape | dtype | 单位 | 物理意义 |
 |---|---:|---|---|---|
 | `camera_health` | `(N,)` | int64 | 枚举 | 当前相机帧健康分类，见第 7 节；没有 camera frame 时默认 1。 |
 | `flag_camera_fresh` | `(N,)` | bool | — | 帧为新 ring sequence、新 frame number、录制开始后、health=OK 且年龄不超阈值；合成槽清 false。 |
-| `flag_pointcloud_valid` | `(N,)` | bool | — | 此槽点云是真实处理结果：要求新 ring sequence、新 frame number、录制开始后、年龄不超阈值、`camera_health` 为 OK 或 FRAME_GAP；CLOCK_RESET/DUPLICATE/BACKLOG 或非新帧/超龄清 false。false 时 `pointcloud` 对应帧为全零。 |
 | `camera_frame_number` | `(N,)` | int64 | 设备帧号 | RealSense depth frame number。 |
 | `camera_ring_sequence` | `(N,)` | int64 | ring sequence | shared camera ring 的 verified 序号。 |
 | `camera_device_timestamp_s` | `(N,)` | float64 | device s | RealSense `get_timestamp()` 从 ms 转成 s；设备时钟域。 |
@@ -418,13 +417,12 @@ HTS sequence id；上述四个 dataset 是 v16 中持久化的 VR 内容全集�
 | `camera_duplicate` | `(N,)` | bool | — | 本帧是否被设备帧号/时钟分类为重复。 |
 | `camera_frame_gap` | `(N,)` | int64 | 帧 | 相对预期序列缺少的设备帧数，0 表示连续。 |
 | `camera_backlog_s` | `(N,)` | float64 | s | host receive 与映射 source time 的积压/传输延迟。 |
-| `pointcloud_source_point_count` | `(N,)` | int64 | 点 | 过滤后、补齐/降采样到 `M` 之前的有效点数。 |
-| `pointcloud_valid_depth_ratio` | `(N,)` | float64 | 比例 `[0,1]` | 原深度图中有限且大于 0 的像素比例，位于后续深度/空间过滤之前。 |
-| `pointcloud_padding_count` | `(N,)` | int64 | 点 | 有效点不足 `M` 时随机重复补齐的点数；不是全零 padding 数。 |
+| `pointcloud_valid_depth_ratio` | `(N,)` | float64 | 比例 `[0,1]` | 原深度图中有限且大于 0 的像素比例，位于后续深度/空间过滤之前。它是 depth 派生质量指标，不是存储点云的有效性标志。 |
 
 相机 payload 始终逐网格槽写入：真实 source 槽写当前 RGB/depth；因调度产生的 causal
-hold 槽会沿用上一 payload；没有历史时用全零图像。无论 RGB/depth 是否沿用，只有
-`flag_pointcloud_valid=True` 的槽才保留非零预计算点云。
+hold 槽会沿用上一 payload；没有历史时用全零图像。点云不再作为 `pointcloud.h5` 存储；
+消费方在需要时从 `depth.h5` 配合 `/meta` 内参/外参与 `camera_pointcloud_config_json`
+确定性派生。
 
 ### 4.8 IK、安全、retarget 与性能诊断
 
@@ -446,7 +444,7 @@ hold 槽会沿用上一 payload；没有历史时用全零图像。无论 RGB/de
 诊断在某些 hold/错误路径不可用时会保留 `NaN`。分析耗时分布前应先筛选 finite 值，
 再结合 `flag_sample_valid` 与 `flag_frame_status`。
 
-## 5. 相机 HDF5 侧车（2 个 datasets）
+## 5. 相机 HDF5 侧车（1 个 dataset）
 
 ### 5.1 `depth.h5`
 
@@ -461,29 +459,31 @@ hold 槽会沿用上一 payload；没有历史时用全零图像。无论 RGB/de
 pixel viewport 与 depth-value optical frame；不能把“对齐到 RGB 像素”解释为“已得到严格
 color-camera pinhole depth”。详见第 10.2 节。
 
-### 5.2 `pointcloud.h5`
+### 5.2 派生点云（不再存储为 `pointcloud.h5`）
 
-| HDF5 path | Shape | dtype | chunk | 压缩 | 单位与意义 |
-|---|---:|---|---|---|---|
-| `/pointcloud` | `(N,M,6)` | float32 | `(1,M,6)` | gzip level 1 | 每点 `[x_world,y_world,z_world,r,g,b]`；XYZ 为 m，颜色为 `[0,1]`。 |
+schema v17 不再保存 `pointcloud.h5`。世界点云是 `depth.h5` 的纯派生函数，由消费边界按需
+计算：训练在 `data_processing` 离线派生，推理在视觉观测适配层在线派生。两者复用同一个
+`PointCloudProcessor`，且派生是确定性的（无 RNG/seed）：
+
+```text
+depth + /meta 内参/外参 + desk_plane + camera_pointcloud_config_json
+    → PointCloudProcessor → (M,6) float32，每点 [x_world,y_world,z_world,r,g,b]
+```
 
 处理流程包括深度有效性/范围与边缘过滤、camera→world 标定变换、桌面和 workspace
-裁剪、体素/离群点过滤以及定长采样。点数多于 `M` 时下采样；少于 `M` 时随机重复
-已有点，因此 `pointcloud_padding_count>0` 不代表尾部元素是 0。只有
-`flag_pointcloud_valid=True` 才能把该槽解释为有效点云；否则整个 `(M,6)` 为 0。
-
-`flag_pointcloud_valid=True` 表示生产管线成功，不表示严格相机几何已经成立。当前管线用
-color K 的 ray 直接乘 aligned source-depth Z，且未把非零 color distortion 纳入反投影；
-因此历史 `/pointcloud` 应标为 approximate，不应作为标定级 world geometry 真值。
+裁剪、体素/离群点过滤以及定长采样。点数多于 `M` 时确定性下采样；少于 `M` 时按固定顺序
+循环补点（不再是随机重复）。派生点云仍标为 approximate：当前管线用 color K 的 ray 直接乘
+aligned source-depth Z，且未把非零 color distortion 纳入反投影，因此不应作为标定级 world
+geometry 真值（详见第 10.2 节）。
 
 ## 6. `rgb.mp4` 与 HDF5 的关系
 
-RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
+RGB 不是 HDF5 dataset，但属于 v17 episode 必需侧车：
 
 - 解码后逻辑 shape 为 `(N,IH,IW,3)`，输入 dtype 为 `uint8` RGB，数值 0–255。
 - 编码 codec、CRF、preset、pixel format、宽高和网格 FPS 记录在 `/meta`。
-- 编码帧数必须等于 `/meta.num_frames`、`/depth.shape[0]` 和
-  `/pointcloud.shape[0]`，否则 `EpisodeReader.validity` 为 INVALID。
+- 编码帧数必须等于 `/meta.num_frames` 和 `/depth.shape[0]`，否则
+  `EpisodeReader.validity` 为 INVALID。
 - 有效性/新鲜度由 `flag_camera_fresh` 等逐槽字段表达；不能仅凭 MP4 中存在非黑图像
   推断它是该槽的新 source frame。
 
@@ -507,10 +507,10 @@ RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
 | 3 | `FRAME_GAP` | 检测到设备帧号间隙。 |
 | 4 | `BACKLOG` | backlog 超过运行时最大帧年龄阈值。 |
 
-`camera_health` 同时门控 `flag_camera_fresh` 与 `flag_pointcloud_valid`，但判据不同：
-`flag_camera_fresh` 要求 health=OK；`flag_pointcloud_valid` 要求 health 为 OK 或 FRAME_GAP，
-因为 FRAME_GAP 只是设备帧号跳号（相机循环短暂超预算），其深度/点云仍新鲜有效，故保留
-点云而 `flag_camera_fresh` 仍记 false，以保留跳号信号供下游过滤。
+`camera_health` 门控 `flag_camera_fresh`：`flag_camera_fresh` 要求 health=OK。FRAME_GAP 只是
+设备帧号跳号（相机循环短暂超预算），其 depth 仍新鲜有效，但 `flag_camera_fresh` 记 false，
+以保留跳号信号供下游过滤。点云有效性由 depth 派生质量（`pointcloud_valid_depth_ratio`）与
+相机 freshness 共同决定，不再有独立的 `flag_pointcloud_valid` 标志。
 
 ### 7.3 `flag_frame_status`
 
@@ -526,8 +526,8 @@ RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
 
 `EpisodeReader.validity == VALID` 至少要求：
 
-1. schema 为 16，配置 SHA-256 长度正确，保存成功且 writer 无错误；
-2. 必需 dataset 全部存在、首维等于 `N`，三个相机流/MP4 帧数一致；
+1. schema 为 17，配置 SHA-256 长度正确，保存成功且 writer 无错误；
+2. 必需 dataset 全部存在、首维等于 `N`，depth 与 MP4 帧数一致；
 3. `timestamp` 有限、严格递增，填充理由与 source index/timestamp 自洽；
 4. 有效 observation 满足四阶段因果时间链；
 5. queued action 有非零 ID 且 action 时间有序；
@@ -535,12 +535,12 @@ RGB 不是 HDF5 dataset，但属于 v16 episode 必需侧车：
 
 `VALID` 只表示格式和核心因果合同成立。训练时仍应根据任务筛选
 `flag_sample_valid`、`observation_valid`、`flag_camera_fresh`、
-`flag_pointcloud_valid`、`flag_frame_status`、连接状态及触觉 freshness。
+`flag_frame_status`、连接状态及触觉 freshness。
 
-reader 与 writer finalizer 现复用 `recording.episode_schema`：无条件要求 96 个基础字段，
+reader 与 writer finalizer 现复用 `recording.episode_schema`：无条件要求 93 个基础字段，
 再按 `/meta.arm_sent_stream` 校验 `action_arm_joint_sent`。历史自定义 dataset 可以继续读取，
 但也必须是逐帧 dataset 且首维等于 `N`。完整布局校验并不替代逐行质量筛选；例如 raw
-action 的语义有效性、触觉 freshness 和点云有效性仍须使用各自 mask。
+action 的语义有效性、触觉 freshness 和 depth 派生质量仍须使用各自字段。
 
 ## 8. 读取示例
 
@@ -579,7 +579,7 @@ with EpisodeReader(episode_dir) as reader:
     actions = f["action_arm_joint_sent"][:][keep]
 ```
 
-点云任务还应额外加入 `f["flag_pointcloud_valid"][:]`。如果读取的是手工创建的 v16
+点云任务应从 `depth.h5` 派生点云，并按 `pointcloud_valid_depth_ratio` 筛选。如果读取的是手工创建的 v17
 episode，应先检查 `"action_arm_joint_sent" in f`；标准 RecorderIO 录制包含该流。
 
 ### 8.3 只解释确实存在的 raw action
@@ -594,7 +594,7 @@ with EpisodeReader(episode_dir) as reader:
     hand_raw = reader.h5f["action_hand_joint_raw"][:][hand_raw_ok]
 ```
 
-这两个 mask 是保守语义边界，不会改写 HDF5。被排除的 held/failure 行仍保留 v16 的兼容
+这两个 mask 是保守语义边界，不会改写 HDF5。被排除的 held/failure 行仍保留 v17 的兼容
 fallback 数值，但不能被解释为求解器/retargeter 的原始输出。
 
 ## 9. 容易混淆但未持久化的信息
@@ -612,7 +612,7 @@ fallback 数值，但不能被解释为求解器/retargeter 的原始输出。
 
 本节记录 2026-08-15 初审及 2026-08-16 fact-check 对 writer、producer、reader、标定程序、
 已安装 SDK 和厂商公开合同进行交叉核查后确认的问题及修复。7 项均只涉及 DexMani Real；
-未修改第 11 节的 DexMani Sim 合同。此次修复不改变 v16 dataset 的名称或数值含义，也不
+未修改第 11 节的 DexMani Sim 合同。此次修复不改变 v17 dataset 的名称或数值含义，也不
 伪造无法由现有数据证明的物理单位。
 
 | ID | 优先级 | 影响字段 | 成因分类 | 修复状态 | 必要性结论 |
@@ -620,10 +620,10 @@ fallback 数值，但不能被解释为求解器/retargeter 的原始输出。
 | H5-01 | P2 | `arm_ee`、`hand_fingertip`、`action_arm_ee` | 隐含 frame 不变量与误导命名 | 已修复 | 当前运行没有数值错误；为防未来非单位 base pose 被静默误用，需要自描述 metadata 和明确命名。 |
 | H5-02 | P1 | `/depth`、RGB、`camera_K`、世界点云 | pixel viewport、depth scalar frame、distortion 与外参合同不完整 | 部分修复 | 已拒绝 `color_to_depth/none`；`depth_to_color` 仍原样携带 source-depth Z，且 K 不编码 distortion，现有点云只能视为 approximate。 |
 | H5-03 | P1 | `hand_contact`、`hand_tactile_force`、`hand_tactile_contact` | 缺失 payload 被零填充；单位 provenance 不足 | 已修复可修部分 | 必须阻止缺失传感器被当作“有效零接触”；SI 换算仍无证据，故保留 unknown 而不是猜测。 |
-| H5-04 | P1 | `action_arm_joint_raw`、`action_hand_joint_raw` | v16 fallback 混合了 raw 与最终/hold 语义 | 已修复消费合同 | 训练 clamp/retarget 差异前必须有逐行 mask；改变存值或新增 valid dataset 会改变 v16 合同，本轮不做。 |
+| H5-04 | P1 | `action_arm_joint_raw`、`action_hand_joint_raw` | v17 fallback 混合了 raw 与最终/hold 语义 | 已修复消费合同 | 训练 clamp/retarget 差异前必须有逐行 mask；改变存值或新增 valid dataset 会改变 v17 合同，本轮不做。 |
 | H5-05 | P2 | `arm_tau`、启动首帧 `arm_qvel` | 单位误注释；启动只读 position 后伪造零值 | 已修复可修部分 | 有效首帧不能包含人工 qvel/effort；精确物理单位仍待对应机型/固件的厂商合同。 |
 | H5-06 | P3 | diagnostics 扩展 | 开放 key 覆盖与首帧动态 schema | 已修复 | 标准入口风险低，但底层 API 必须拒绝未知 key、核心冲突和 shape 漂移。 |
-| H5-07 | P1 | 全部 `data.h5` datasets | reader/writer 各自维护不完整合同 | 已修复 | `VALID` 是所有消费入口的信任边界，必须覆盖完整 96+1 条件布局。 |
+| H5-07 | P1 | 全部 `data.h5` datasets | reader/writer 各自维护不完整合同 | 已修复 | `VALID` 是所有消费入口的信任边界，必须覆盖完整 93+1 条件布局。 |
 
 ### 10.1 H5-01：`arm_ee` 与 `hand_fingertip` 的坐标系依赖
 
@@ -637,7 +637,7 @@ fallback 数值，但不能被解释为求解器/retargeter 的原始输出。
    `T_world_*`，令读者误以为代码执行了额外 world 变换。
 
 必要性评估为 P2：当前受支持 runtime 中这些数值一致，不应把 H5-01 当作现存数据损坏，
-更不能在 v16 内突然变换 `arm_ee`。实施上仅把局部变量改为 `T_base_*`，并为新 episode
+更不能在 v17 内突然变换 `arm_ee`。实施上仅把局部变量改为 `T_base_*`，并为新 episode
 写入 `robot_world_frame=xarm_base`、`robot_world_equals_xarm_base=True`、
 `arm_ee_frame`、`action_arm_ee_frame` 和 `hand_fingertip_frame`。未来若支持非单位 base pose，
 必须升级坐标合同，并一起审计 mapper translation、指尖 FK、相机、点云和 replay。
@@ -704,7 +704,7 @@ depth-value frame：
 实施上，XHand 边界要求恰好 5 个 sensor、每个 `raw_force` 恰好 120 点，且 calc/raw 的
 所有 xyz 有限。失败时进程内 `XHandSample.tactile_valid=False`，保留同帧完整关节反馈，
 hand worker 立即发布 `fresh=False, calibrated=False` 的触觉帧；启动 calibration 也
-fail-closed。v16 已有 freshness/calibration/unit 字段，因此无需新增 dataset。metadata 记录
+fail-closed。v17 已有 freshness/calibration/unit 字段，因此无需新增 dataset。metadata 记录
 缩放、bias、阈值规则和 `tactile_si_unit_verified=False`；消费方仍必须联合三个逐行标志，
 不能把数值解释为 N。
 
@@ -730,7 +730,7 @@ clip 和 `_sanitize_hand_command()` 后续校验之前，但其更上游含义�
 根因不只在 `_record_held()`：RecorderClient 和 EpisodeRecorder 都有兼容 fallback，而旧
 reader 又要求所有 source 行的 raw 数值有限，三者共同迫使“不存在的 raw”伪装成最终命令。
 
-必要性为 P1，但不能静默更改 v16 数值意义。实施上保留历史兼容存值，并由 reader 暴露
+必要性为 P1，但不能静默更改 v17 数值意义。实施上保留历史兼容存值，并由 reader 暴露
 两个保守 mask：
 
 ```python
@@ -741,7 +741,7 @@ hand_raw_ok = reader.action_hand_joint_raw_valid_mask
 ```
 
 相同表达式也写入新 episode metadata。需要 NaN 语义或独立 raw-valid dataset 时，应升 schema
-并同步 writer、reader、训练、可视化与 replay，而不是在 v16 中就地修改。
+并同步 writer、reader、训练、可视化与 replay，而不是在 v17 中就地修改。
 
 代码定位：`teleop/hand_retarget.py::TAGHandRetargeter.last_raw_qpos`、
 `teleop/hand_control.py::_get_raw_hand_command`、`teleop/loop.py::teleop_loop`、
@@ -779,7 +779,7 @@ SI unverified，未做任何 N·m 换算。
 旧底层 API 将任意 diagnostics 直接 `data[key]=value`。首帧额外 key 会冻结成自定义
 dataset，后续新 key 被 buffer 静默忽略，而与核心字段同名的 key 还可覆盖默认语义。
 
-必要性为 P3，因为标准 RecorderIO 只传固定字段，但开放的底层边界会造成难以审计的 v16
+必要性为 P3，因为标准 RecorderIO 只传固定字段，但开放的底层边界会造成难以审计的 v17
 变体。现在 diagnostics 只允许 11 个已声明 value override，逐项转换为 float64 并检查固定
 tail shape；未知 key、其他核心字段碰撞和错误 shape 在进入 buffer 前立即抛错。writer 在
 buffer 首次接受 source layout 后，还会在每次写入前严格核对 key、shape 和 dtype，避免
@@ -788,28 +788,28 @@ buffer 首次接受 source layout 后，还会在每次写入前严格核对 key
 
 代码定位：`recording/io_process.py::_unpack_sample`、
 `recording/episode_recorder.py::EpisodeRecorder.add_frame`、
-`recording/episode_schema.py::normalize_diagnostics_v16`。
+`recording/episode_schema.py::normalize_diagnostics_v17`。
 
-### 10.7 H5-07：`VALID` 现覆盖完整 96+1 布局
+### 10.7 H5-07：`VALID` 现覆盖完整 93+1 布局
 
 旧 `EpisodeReader.validity` 只硬编码 37 个核心 dataset；writer 发布前也只检查“已经存在”的
 dataset 长度，而不检查缺项。
 
-隔离复现构造了一个满足上述核心字段、相机侧车和 metadata 条件的 v16 episode，同时
-省略 `arm_qpos`、`arm_qvel`、`flag_camera_fresh`、`flag_pointcloud_valid` 和
-`flag_frame_status`，结果仍为 `VALID`。这主要影响手工构造、受损或未来发生 writer/reader
-漂移的 episode；当前标准 RecorderIO 正常路径本身仍会创建 97 个 dataset。
+隔离复现构造了一个满足上述核心字段、相机侧车和 metadata 条件的 v17 episode，同时
+省略 `arm_qpos`、`arm_qvel`、`flag_camera_fresh` 和 `flag_frame_status`，结果仍为
+`VALID`。这主要影响手工构造、受损或未来发生 writer/reader
+漂移的 episode；当前标准 RecorderIO 正常路径本身仍会创建 94 个 dataset。
 
 必要性为 P1，因为所有训练/可视化/replay 都可能把 `VALID` 当信任边界。新
-`recording.episode_schema` 定义 96 个基础 dataset 的确切 tail shape/dtype，以及
+`recording.episode_schema` 定义 93 个基础 dataset 的确切 tail shape/dtype，以及
 `arm_sent_stream=True ↔ action_arm_joint_sent 存在` 的条件规则。EpisodeRecorder 的 source
 frame、flush、发布 finalizer 和 EpisodeReader 复用同一 validator。缺字段、错误
 shape/dtype、marker 不一致或任意逐帧长度不等于 `N` 均会 fail-closed；不需要 schema bump，
-因为这是恢复 v16 原有合同，而非改变存储意义。
+因为这是恢复 v17 原有合同，而非改变存储意义。
 
 代码定位：`recording/episode_reader.py::EpisodeReader.validity`、
 `recording/episode_recorder.py::EpisodeRecorder._validate_and_sync_temp_episode`、
-`recording/episode_schema.py::validate_data_layout_v16`。
+`recording/episode_schema.py::validate_data_layout_v17`。
 
 ---
 
@@ -817,9 +817,9 @@ shape/dtype、marker 不一致或任意逐帧长度不等于 `N` 均会 fail-clo
 
 ## 11. DexMani Sim HDF5/Zarr 数据格式
 
-本节是与前述 **DexMani Real schema v16 完全独立** 的 Sim 数据合同。为避免名称冲突，
+本节是与前述 **DexMani Real schema v17 完全独立** 的 Sim 数据合同。为避免名称冲突，
 本节沿用 `N` 表示单个 Sim episode 的动作数，使用 `T` 表示 Zarr 中拼接后的总帧数；
-这里的 shape、单位、时序、压缩和 metadata 不能套用到第 1–10 节的 Real v16，反之亦然。
+这里的 shape、单位、时序、压缩和 metadata 不能套用到第 1–10 节的 Real v17，反之亦然。
 
 > **审计对象：** `/home/zhanghaoyang/Desktop/dexmani_sim`  
 > **审计日期：** 2026-08-15  

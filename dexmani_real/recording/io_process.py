@@ -314,7 +314,6 @@ def _unpack_sample(
     camera_frame: dict[str, Any] = {
         "camera_health": int(record["camera_health"]),
         "camera_fresh": bool(record["camera_fresh"]),
-        "pointcloud_valid": bool(record["pointcloud_valid"]),
         "frame_number": int(record["camera_frame_number"]),
         "ring_sequence": int(record["camera_ring_sequence"]),
         "device_timestamp_s": float(record["camera_device_timestamp_s"]),
@@ -330,7 +329,6 @@ def _unpack_sample(
         camera_frame.update(
             rgb=np.array(record["camera_rgb"], copy=True),
             depth=np.array(record["camera_depth"], copy=True),
-            pointcloud=np.array(record["camera_pointcloud"], copy=True),
         )
     signal_names = (
         "observation_id",
@@ -362,9 +360,7 @@ def _unpack_sample(
         "tactile_source_monotonic_ns",
         "tactile_calibrated",
         "tactile_unit_code",
-        "pointcloud_source_point_count",
         "pointcloud_valid_depth_ratio",
-        "pointcloud_padding_count",
     )
 
     def _copy_field(name: str) -> Any:
@@ -415,10 +411,8 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         sample_dtype = shared.record_sample_ring.dtype
         rgb_dims = sample_dtype.fields["camera_rgb"][0].shape
         depth_dims = sample_dtype.fields["camera_depth"][0].shape
-        pointcloud_dims = sample_dtype.fields["camera_pointcloud"][0].shape
         rgb_shape = (int(rgb_dims[0]), int(rgb_dims[1]), int(rgb_dims[2]))
         depth_shape = (int(depth_dims[0]), int(depth_dims[1]))
-        pointcloud_shape = (int(pointcloud_dims[0]), int(pointcloud_dims[1]))
         recorder = EpisodeRecorder(
             data_dir=config.data_dir,
             max_frames=config.max_frames,
@@ -430,7 +424,6 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             camera_writer_config=CameraStreamWriterConfig(
                 rgb_shape=rgb_shape,
                 depth_shape=depth_shape,
-                pointcloud_shape=pointcloud_shape,
                 fps=config.control_hz,
                 queue_size=config.writer_queue_size,
             ),

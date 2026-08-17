@@ -22,11 +22,11 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 2. **标定与诊断**：标定相机外参和 VR 朝向；以受限、可观测的方式诊断 RealSense、点云和 XHand。
 3. **回放与离线分析**：检查 HDF5 episode、在启动前直接执行密集预检、运行受控 live replay，并评估或可视化数据质量。
 4. **策略部署**：通过 `examples/run_policy.py` 运行 learned-policy；推理 worker 只写 `policy_plan_ring`，coordinator 经同一安全边界发布机器人动作。
-5. **离线数据处理**：保持 Real v16 原始 episode 只读，按输出模态清洗和切分连续轨迹，生成 real-domain 的 Sim-label HDF5。
+5. **离线数据处理**：保持 Real v17 原始 episode 只读，按输出模态清洗和切分连续轨迹，生成 real-domain 的 Sim-label HDF5；点云在消费边界从 depth 确定性地派生。
 
 ```text
                     ┌───────────── sensor/ ──────────────┐
-                    │  RealSense / VR receiver / pointcloud│
+                    │   RealSense (RGB-D) / VR receiver   │
                     └──────────────┬──────────────────────┘
                                    │ state frames
                                    ▼
@@ -41,7 +41,7 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
                                                     │ aligned samples
                                                     ▼
                                     ┌────────── recording/ ──────────┐
-                                    │ RecorderIO → HDF5 episode v16  │
+                                    │ RecorderIO → HDF5 episode v17  │
                                     └───────────────────┬───────────┘
                                                         ▼
                                                examples/visualize_episode.py
@@ -51,7 +51,7 @@ DexMani Real 将硬件能力封装在独立进程中，以共享内存传递结�
 
 - **IPC 边界**：所有跨进程数据经 `SharedStorage` 传递；有效负载由 `utils/schema.py` 的固定 NumPy dtype 定义。
 - **硬件边界**：xArm/XHand SDK 仅由各自的执行 worker 使用，RealSense SDK 由 `sensor/` 持有；其他进程不共享活的 SDK 对象。
-- **控制边界**：遥操作 worker 决定动作与采样网格；`RecorderIO` 只负责序列化、校验和事务式发布。录制的 START/STOP、状态与每格元数据使用固定 dtype，不在共享内存中嵌入 JSON；v16 episode 保存已解析配置的 SHA-256，而非整份配置文本。
+- **控制边界**：遥操作 worker 决定动作与采样网格；`RecorderIO` 只负责序列化、校验和事务式发布。录制的 START/STOP、状态与每格元数据使用固定 dtype，不在共享内存中嵌入 JSON；v17 episode 保存已解析配置的 SHA-256，而非整份配置文本。
 - **安全边界**：`SafetyState` 管理 `DISARMED → ARMED → RUNNING → FAULT`；固件仍是最后一道安全保护。
 - **策略边界**：`integrations/` 只依赖 `deployment/`，绝不反向；推理 worker 只写 `policy_plan_ring`，`deployment/coordinator.py` 是唯一的 learned-policy 机器人动作生产者，经共享 `SafetyGate` 边界发布。
 
@@ -103,7 +103,7 @@ teleop ──► fixed-grid sample ring ──► RecorderIO ──► HDF5
 → 恢复前从新鲜实测反馈重锚
 ```
 
-这不是急停，也不会调用 State 6 或发布“实测位置 hold”。C 只能恢复 C 建立的暂停；S/D/时长触顶后的下一轮必须按 B，每次 B 另开一个 `run_generation`。命令静默期间不产生 action sample；恢复后的首个样本携带新 `control_run_generation`，RecorderIO 把下一个存储槽重锚到该样本真实时间（保留 wall-time 跳变，不补造 hold action）。`min_record_duration_s` 是质量标签而非发布硬门槛（短 episode 保持 v16 有效，标记 `min_frames_met=False`）。
+这不是急停，也不会调用 State 6 或发布“实测位置 hold”。C 只能恢复 C 建立的暂停；S/D/时长触顶后的下一轮必须按 B，每次 B 另开一个 `run_generation`。命令静默期间不产生 action sample；恢复后的首个样本携带新 `control_run_generation`，RecorderIO 把下一个存储槽重锚到该样本真实时间（保留 wall-time 跳变，不补造 hold action）。`min_record_duration_s` 是质量标签而非发布硬门槛（短 episode 保持 v17 有效，标记 `min_frames_met=False`）。
 
 完整语义见 `CLAUDE.md` §4（Critical behavior paths）；跨模块契约见 `AGENTS.md`。
 
@@ -210,7 +210,7 @@ python -m compileall -q dexmani_real examples
 | `data_processing/contracts.py` | 定义 profile-aware 配置、人工 annotation、连续 segment 与 episode 决策。 |
 | `data_processing/cleaning.py` | 纯决策层：按 core/模态 hard gate 生成 mask，不拼接缺口，计算训练窗口和软质量指标。 |
 | `data_processing/transforms.py` | RGB/K resize 与 point-cloud 确定性 FPS/补点；不改变 real 坐标 frame。 |
-| `data_processing/pipeline.py` | 发现/审计源 episode，流式写多个 HDF5，写后 fail-closed 校验并目录级原子发布。 |
+| `data_processing/pipeline.py` | 发现/审计源 episode，流式写多个 HDF5（点云从 depth 逐帧派生），写后 fail-closed 校验并目录级原子发布。 |
 | `data_processing/cli.py` | argparse、profile 对比、dry-run 和批处理编排；不包含数据处理业务逻辑。 |
 
 ### `recording/` — Episode 持久化与离线分析
@@ -219,8 +219,8 @@ python -m compileall -q dexmani_real examples
 |---|---|
 | `recording/__init__.py` | 导出 episode 读写器、时间信息和停止结果的公共接口。 |
 | `recording/camera_stream_writer.py` | 在独立写线程中编码并写入相机流，隔离视频 I/O 以免阻塞控制环。 |
-| `recording/episode_schema.py` | v16 的 96 个基础 dataset、条件 sent-command 字段、固定 diagnostics 和共享 layout 校验合同。 |
-| `recording/episode_reader.py` | 读取已原子发布的 v16 episode、合并流和元数据，并提供内部有效性、最短时长质量视图及顺序 RGB iterator。 |
+| `recording/episode_schema.py` | v17 的 93 个基础 dataset、条件 sent-command 字段、固定 diagnostics 和共享 layout 校验合同。 |
+| `recording/episode_reader.py` | 读取已原子发布的 v17 episode、合并流和元数据，并提供内部有效性、最短时长质量视图及顺序 RGB iterator。 |
 | `recording/episode_recorder.py` | 管理单个 episode 的 HDF5 数据集、相机写入器、停止校验与最终发布。 |
 | `recording/io_process.py` | `RecorderIO` 非阻塞事务 worker 及其客户端协议；固定 dtype 携带 generation、FINALIZING/终态和会话失败结果。 |
 | `recording/recorder_client.py` | policy 侧 `RecorderClient` 与共享控制面协议类型；持有录制决策与固定 sample 构造，与 RecorderIO 依赖单向。 |
@@ -261,7 +261,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `sensor/__init__.py` | 标识 RealSense、VR 接收与点云处理能力所在包。 |
 | `sensor/camera_process.py` | 相机 worker：采集、打包并发布 RGB-D 帧，维护相机健康状态和心跳。 |
 | `sensor/clock_sync.py` | 将设备时钟映射到主机单调时钟，检测重置/漂移，供帧新鲜度判断使用。 |
-| `sensor/pointcloud_processor.py` | 将 RGB-D、内外参和工作空间裁剪转换为采样/下采样后的点云观测。 |
+| `sensor/pointcloud_processor.py` | 将 RGB-D、内外参和工作空间裁剪确定性地派生为采样/下采样后的点云观测（depth 的纯函数，无 RNG）；由消费边界（`data_processing` 离线、未来视觉适配器在线）调用，相机循环不再内联计算。 |
 | `sensor/realsense.py` | RealSense D400/L515 驱动：设备发现、配置、对齐、时钟映射、帧采集和生命周期管理。 |
 | `sensor/vr_receiver_process.py` | Quest/VR 接收 worker：校验姿态与关键点数据、转换四元数顺序并发布 VR 帧。 |
 
@@ -270,7 +270,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | 文件 | 作用 |
 |---|---|
 | `shm/__init__.py` | 说明共享内存公共接口及其与回零/监督模块的职责边界。 |
-| `shm/camera_ring.py` | 大相机帧（RGB+depth+pointcloud）的变长槽共享内存环 `CameraRingBuffer`，复用同一 seqlock 提交/发布合同。 |
+| `shm/camera_ring.py` | 大相机帧（RGB+depth）的变长槽共享内存环 `CameraRingBuffer`，复用同一 seqlock 提交/发布合同。 |
 | `shm/causal_reader.py` | 从各状态环读取因果帧（`0 < source <= publish <= anchor`）的公共读取器；不含 age threshold，供遥操作快照与 deployment 观测共用。 |
 | `shm/ring_buffer.py` | 通用共享内存 seqlock 环（`SeqlockSlot` + `SharedMemoryRingBuffer`），提供零拷贝写入与已验证读取；相机专用变长槽环见 `shm/camera_ring.py`。 |
 | `shm/shared_storage.py` | 创建并持有共享环、队列、标志和事件；默认仅分配遥操作/采集能力，`policy_plan_ring` 供 learned-policy 部署使用。 |
@@ -286,7 +286,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `teleop/control_state.py` | 表示 command quiescence 与回零交接状态，记录首次暂停原因和反馈新鲜度边界。 |
 | `teleop/episode_samples.py` | 将因果状态、动作、VR/相机数据对齐为记录帧，并处理 start/stop 与主动安全回退的 held 样本；命令静默期间不补造样本。 |
 | `teleop/hand_control.py` | 手部命令生成与重定向器状态辅助：每个 verified VR ring sequence 最多调用一次有状态 solver（成功/失败均缓存，ramp 仍按控制网格推进）；对 shaped 目标做后备校验，违规时优雅 hold 而非升级为粘滞 fault。 |
-| `teleop/hand_retarget.py` | 校验手部 landmarks，并提供 DexPilot 与 TAG 两类重定向器；二者输出统一为 schema 定义的 XHand SDK 关节顺序。 |
+| `teleop/hand_retarget.py` | 校验手部 landmarks，并提供 TAG（默认）与 DexPilot 两类重定向器；二者输出统一为 schema 定义的 XHand SDK 关节顺序。 |
 | `teleop/hand_retarget_eval.py` | 纯离线 episode 重放、有界参数搜索、后端中立指标和静态收敛 home 估计；不启动设备或 shared-memory 生命周期。 |
 | `teleop/keyboard.py` | 处理终端/全局键盘输入、运动活动锁存、臂手反馈检查和末端位姿增量；终端输入抑制持续到设备进程退出，恢复终端时丢弃积压的 canonical 输入；停止回调后不为 Linux/XRecord 守护线程的延迟退出阻塞停机。 |
 | `teleop/loop.py` | 核心 VR policy worker：读取快照、映射/IK、动作安全门、记录决策、状态机与错误恢复。 |
@@ -324,7 +324,7 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `examples/run_policy.py` | `deployment.lifecycle` | learned-policy 部署入口：argparse → 解析 runtime/deployment 配置 → 运行生命周期 → 退出码；薄 CLI，无模型/调度/安全/存储逻辑。 |
 | `examples/keyboard_teleop.py` | — | 以有界前视目标执行键盘 Cartesian jog（默认目标速度 0.24 m/s、最大前视 40 mm）；松键推进 generation 后停止发布，控制器自然完成最后一个已接受 endpoint，空闲期间持续从实测关节/FK 重建命令基准；R 会先确认 hand-home SDK 接受、再执行 arm home；终端输入抑制保持到 worker 完全退出；硬件相关。 |
 | `examples/replay_episode.py` | — | episode 回放入口；默认 live 完整回放，`--dry-run` 仅离线校验；退出时推进 generation 并停止发布。 |
-| `examples/process_episodes.py` | `data_processing.cli` | 纯离线薄 CLI：比较 profile、dry-run 或把 Real v16 批量清洗为 real-domain Sim-label HDF5。 |
+| `examples/process_episodes.py` | `data_processing.cli` | 纯离线薄 CLI：比较 profile、dry-run 或把 Real v17 批量清洗为 real-domain Sim-label HDF5。 |
 | `examples/calibrate_camera.py` | — | ArUco 眼到手标定入口；自包含脚本，会采集设备数据并原子写入 cameras.json。 |
 | `examples/calibrate_vr_heading.py` | — | VR 朝向标定入口；自包含脚本，会读取 VR 数据并在确认后写入 vr_transform.json。 |
 | `examples/realsense_record_example.py` | — | 交互式 RealSense RGB-D 实时采集与点云生成测试；默认只读。 |
@@ -343,10 +343,10 @@ Episode 回放功能整体位于单一自包含脚本 `examples/replay_episode.p
 | `assets/` | URDF/SRDF、网格、手部重定向配置和音频资源。 |
 | `CLAUDE.md` | 实现导航：任务路由、所有权、数据契约、关键行为路径、硬件工程事实与命令入口。 |
 | `AGENTS.md` | 面向代码修改者的仓库契约：架构不变量、硬件安全边界和跨模块变更检查清单。 |
-| `docs/dataset/hdf5_episode.md` | Real v16 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
+| `docs/dataset/hdf5_episode.md` | Real v17 与 Sim HDF5/Zarr 统一中文数据字典：metadata、dataset、shape、dtype、单位、坐标/时序、转换规则、实测普查与已知问题。 |
 | `docs/dataset/sim_hdf5_zarr.md` | DexMani Sim HDF5/Zarr 独立审计版；相同内容已并入上述统一数据字典第 11 节。 |
-| `docs/dataset/real_to_sim_mapping.md` | Real v16 episode → Sim/Policy 标签映射表：仅登记字段来源、结构关系和语义差异，不修改录制数值。 |
-| `docs/dataset/processed_hdf5.md` | Real v16 清洗、模态相关切段、数值转换与 `dexmani-real-simlabel-hdf5/v1` 输出合同。 |
+| `docs/dataset/real_to_sim_mapping.md` | Real v17 episode → Sim/Policy 标签映射表：仅登记字段来源、结构关系和语义差异，不修改录制数值。 |
+| `docs/dataset/processed_hdf5.md` | Real v17 清洗、模态相关切段、数值转换与 `dexmani-real-simlabel-hdf5/v1` 输出合同。 |
 | `docs/hand_retargeting.md` | hand retarget 当前控制合同：逐 VR observation 求解缓存、TAG/DexPilot 两后端、命令整形/验证/发布边界、状态推进时机与碰撞/触觉边界。 |
 
 对于涉及 dtype、共享内存、录制 schema、IK/碰撞、安全状态机或速率默认值的改动，请先阅读 `AGENTS.md` 的跨模块变更清单，再沿本 README 的关键路径追踪所有生产者和消费者。

@@ -1,6 +1,6 @@
 # DexMani Real 清洗与 Sim-label HDF5 格式
 
-> 本文描述离线处理格式 `dexmani-real-simlabel-hdf5/v1`。源 Real v16
+> 本文描述离线处理格式 `dexmani-real-simlabel-hdf5/v1`。源 Real v17
 > episode 始终只读；输出是 real-domain 的 Sim-label 数据视图，不是可在
 > SAPIEN 中回放的标准 Sim episode。
 
@@ -36,7 +36,7 @@ conda run -n real_robot python examples/process_episodes.py \
 
 默认拒绝覆盖已存在的 `episode_processed`。实现会先在同一父目录写临时
 目录，重新打开并验证全部 HDF5，再通过 fsync + rename 原子发布整批结果。
-输入根目录下每个非隐藏的直接子目录都会被审计；缺少四件套或 schema 损坏的
+输入根目录下每个非隐藏的直接子目录都会被审计；缺少三件套或 schema 损坏的
 目录会作为 rejected source 写入报告，不会被静默跳过。
 
 ## 2. 输出布局
@@ -109,19 +109,20 @@ K 缺失、非有限、非 pinhole 形式或与源 viewport 不一致时 fail cl
 
 ### 3.4 `point_cloud`
 
+点云在写段时从源 depth 逐帧确定性派生（`PointCloudProcessor`，无 RNG）：
+
 ```text
-Real (2048,6) XYZRGB → (1024,6) float32
+depth + K + 外参 + desk_plane + pc config → (2048,6) XYZRGB → (1024,6) float32
 ```
 
-- 使用 `pointcloud_source_point_count` 识别 producer 的唯一点前缀；
+- 使用派生时的 `last_source_point_count` 识别唯一点前缀；
 - 唯一点不少于目标数时做确定性 FPS；
 - 唯一点不足时按固定顺序循环补点；
 - RGB 保持 `[0,1]`；
 - 不做额外 crop、voxel、坐标旋转或颜色缩放；
 - XYZ 始终标为 `xarm_base`，`frame_compatibility_with_sim_world=False`。
 
-全零、非有限、颜色越界、无真实源点，或 source-point-count 与 padding metadata
-不一致的行不可输出。
+全零、非有限、颜色越界或无真实源点的行不可输出（派生时顺带做数值校验）。
 
 ## 4. 明确省略的 Sim 字段
 
@@ -146,8 +147,8 @@ contact force 表示无接触，`done=False` 表示 transition 未终止；它�
 ### 5.1 Episode 级准入
 
 - `EpisodeReader.require_valid()`；
-- schema v16；
-- 四个源成员和帧数一致；
+- schema v17；
+- 三个源成员和帧数一致；
 - sent action stream 存在；
 - 请求的模态完整；
 - 至少一个 segment 满足训练窗口要求。
@@ -170,8 +171,8 @@ contact force 表示无接触，`done=False` 表示 transition 未终止；它�
 ### 5.3 模态硬无效
 
 RGB 要求 camera fresh、causal source chain、无 clock reset，且
-`camera_age_s <= 0.25`。Point cloud 还要求 validity marker、正 source point count、
-合法 padding/depth ratio，以及数组 finite/nonzero/RGB-range 检查。
+`camera_age_s <= 0.25`。Point cloud 还要求合法 `pointcloud_valid_depth_ratio`
+（depth 派生质量）、正 source point count，以及派生数组 finite/nonzero/RGB-range 检查。
 
 有效当前帧上的 `camera_frame_gap` 是软诊断，不单独删除。
 
@@ -208,7 +209,7 @@ Recorder 的保存成功不等于任务成功。没有人工 annotation 时，�
 - action step、velocity、acceleration、jerk；
 - idle step ratio；
 - camera age/gap/duplicate；
-- point count、padding 和 valid-depth ratio。
+- point count 和 valid-depth ratio。
 
 `action[t]-joint_state[t]` 是 command delta，不是 post-action tracking error；idle 也
 可能是稳定抓取阶段。两者均不能作为无任务上下文的自动删帧依据。
@@ -243,7 +244,7 @@ episodes:
 schema_name = dexmani-real-simlabel-hdf5
 schema_version = 1
 domain = real
-source_schema_version = 16
+source_schema_version = 17
 profile
 episode_steps
 dt
@@ -261,7 +262,7 @@ source_member_sha256_json
 ```
 
 所有 datasets 使用 gzip level 4。写后 validator 检查精确 key 集合、shape、dtype、
-首维、压缩、finite、点云颜色/非零帧、K、source range/segment、处理配置、四件套
+首维、压缩、finite、点云颜色/非零帧、K、source range/segment、处理配置、三件套
 SHA-256、schema 版本以及 real-domain/frame 标记。
 
 ## 9. 当前样例基线

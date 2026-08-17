@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.recording.episode_schema import normalize_diagnostics_v16
+from dexmani_real.recording.episode_schema import normalize_diagnostics_v17
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
@@ -88,7 +88,7 @@ def _write_sample_metadata(
 ) -> None:
     """Populate the fixed recorder metadata fields at the policy/IO boundary."""
     signal_data = signals or {}
-    diagnostic_data = normalize_diagnostics_v16(diagnostics)
+    diagnostic_data = normalize_diagnostics_v17(diagnostics)
 
     frame["arm_qpos_sent"][0] = (
         np.asarray(arm_qpos_sent, dtype=np.float64)
@@ -133,8 +133,6 @@ def _write_sample_metadata(
         default = field_name == "flag_ik_attempted"
         frame[field_name][0] = int(bool(signal_data.get(signal_name, default)))
     frame["tactile_unit_code"][0] = int(signal_data.get("tactile_unit_code", 0))
-    frame["pointcloud_source_point_count"][0] = int(signal_data.get("pointcloud_source_point_count", 0))
-    frame["pointcloud_padding_count"][0] = int(signal_data.get("pointcloud_padding_count", 0))
     frame["flag_frame_status"][0] = int(signal_data.get("frame_status", 0))
     frame["observation_source_receive_monotonic_ns"][0] = np.asarray(
         signal_data.get("observation_source_receive_monotonic_ns", np.zeros(4)), dtype=np.uint64
@@ -163,7 +161,6 @@ def _write_sample_metadata(
     cam = camera_frame or {}
     frame["camera_health"][0] = int(cam.get("camera_health", 1))
     frame["camera_fresh"][0] = int(bool(cam.get("camera_fresh", False)))
-    frame["pointcloud_valid"][0] = int(bool(cam.get("pointcloud_valid", False)))
     camera_integer_fields = {
         "camera_frame_number": "frame_number",
         "camera_ring_sequence": "ring_sequence",
@@ -359,9 +356,6 @@ class RecorderClient:
             frame["camera_present"][0] = 1
             frame["camera_rgb"][0] = camera_frame.get("rgb", np.zeros(frame["camera_rgb"][0].shape, np.uint8))
             frame["camera_depth"][0] = camera_frame.get("depth", np.zeros(frame["camera_depth"][0].shape, np.uint16))
-            frame["camera_pointcloud"][0] = camera_frame.get(
-                "pointcloud", np.zeros(frame["camera_pointcloud"][0].shape, np.float32)
-            )
         _write_sample_metadata(
             frame,
             action=action,

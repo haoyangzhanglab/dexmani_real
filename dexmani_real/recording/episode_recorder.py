@@ -31,10 +31,10 @@ from dexmani_real.recording.episode_schema import (
     ARM_SENT_DATASET,
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
-    SEMANTIC_META_ATTRS_V16,
-    normalize_diagnostics_v16,
-    validate_data_layout_v16,
-    validate_source_frame_keys_v16,
+    SEMANTIC_META_ATTRS_V17,
+    normalize_diagnostics_v17,
+    validate_data_layout_v17,
+    validate_source_frame_keys_v17,
 )
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.recording.transaction import atomic_publish
@@ -124,11 +124,10 @@ class EpisodeRecorder:
         self._file: Any = None  # h5py.File | None — data.h5 (control streams + metadata)
         self._camera_writer: CameraStreamWriter | None = None
         self._camera_writer_metrics: dict[str, float | int] = {}
-        self._last_camera_payload: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._last_camera_payload: tuple[np.ndarray, np.ndarray] | None = None
         self._camera_writer_config = camera_writer_config or CameraStreamWriterConfig(
             rgb_shape=camera.rgb_shape,
             depth_shape=camera.depth_shape,
-            pointcloud_shape=camera.pointcloud_shape,
             fps=self.control_hz,
             queue_size=camera.writer_queue_size,
         )
@@ -302,7 +301,7 @@ class EpisodeRecorder:
 
         # Additive, self-describing semantics for fields whose numeric layout
         # remains unchanged in v16. Historical readers may ignore these attrs.
-        for key, semantic_value in SEMANTIC_META_ATTRS_V16.items():
+        for key, semantic_value in SEMANTIC_META_ATTRS_V17.items():
             meta.attrs[key] = semantic_value
 
         # The conditional sent-command dataset and this marker must agree.
@@ -332,7 +331,6 @@ class EpisodeRecorder:
             separators=(",", ":"),
         )
         meta.attrs["camera_depth_storage"] = "uint16/gzip-1"
-        meta.attrs["camera_pointcloud_storage"] = "float32/gzip-1"
 
     def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
         """Camera identity/geometry attrs from _pending_meta (None entries skipped).
@@ -398,7 +396,7 @@ class EpisodeRecorder:
 
         # ── Non-camera streams → record-time aligned buffer ──
         sig = signals or {}
-        diagnostic_values = normalize_diagnostics_v16(diagnostics)
+        diagnostic_values = normalize_diagnostics_v17(diagnostics)
 
         ts = float(state.timestamp)
         run_generation = int(control_run_generation)
@@ -412,7 +410,6 @@ class EpisodeRecorder:
 
         camera_health = int(camera_frame.get("camera_health", 1)) if camera_frame is not None else 1
         camera_fresh = bool(camera_frame.get("camera_fresh", False)) if camera_frame is not None else False
-        pointcloud_valid = bool(camera_frame.get("pointcloud_valid", False)) if camera_frame is not None else False
 
         data: dict[str, np.ndarray | float] = {
             # ── Observables ──
@@ -500,9 +497,7 @@ class EpisodeRecorder:
             "tactile_source_monotonic_ns": int(sig.get("tactile_source_monotonic_ns", 0)),
             "tactile_calibrated": bool(sig.get("tactile_calibrated", False)),
             "tactile_unit_code": int(sig.get("tactile_unit_code", 0)),
-            "pointcloud_source_point_count": int(sig.get("pointcloud_source_point_count", 0)),
             "pointcloud_valid_depth_ratio": float(sig.get("pointcloud_valid_depth_ratio", np.nan)),
-            "pointcloud_padding_count": int(sig.get("pointcloud_padding_count", 0)),
             # ── Flags ──
             "flag_ik_ok": bool(sig.get("ik_ok", False)),
             "flag_ik_attempted": bool(sig.get("ik_attempted", True)),  # default True: normal frames
@@ -511,7 +506,6 @@ class EpisodeRecorder:
             "flag_safety_reject": bool(sig.get("flag_safety_reject", False)),
             "camera_health": camera_health,
             "flag_camera_fresh": camera_fresh,
-            "flag_pointcloud_valid": pointcloud_valid,
             "camera_frame_number": int(camera_frame.get("frame_number", 0)) if camera_frame is not None else 0,
             "camera_ring_sequence": int(camera_frame.get("ring_sequence", 0)) if camera_frame is not None else 0,
             "camera_device_timestamp_s": (
@@ -560,10 +554,10 @@ class EpisodeRecorder:
             data[ARM_SENT_DATASET] = sent
 
         # Diagnostics are fixed-schema value overrides, never an extension
-        # mechanism. ``normalize_diagnostics_v16`` rejects unknown keys,
+        # mechanism. ``normalize_diagnostics_v17`` rejects unknown keys,
         # reserved-field collisions, and incorrect tail shapes.
         data.update(diagnostic_values)
-        source_layout_errors = validate_source_frame_keys_v16(set(data), arm_sent_stream=self.arm_sent_stream)
+        source_layout_errors = validate_source_frame_keys_v17(set(data), arm_sent_stream=self.arm_sent_stream)
         if source_layout_errors:
             raise RuntimeError("schema-v16 source frame mismatch: " + "; ".join(source_layout_errors))
 
@@ -576,8 +570,8 @@ class EpisodeRecorder:
         k = add_result.slots_written  # grid slots advanced (usually 1; 0 = dup bucket)
 
         # A single live camera observation may advance across several skipped
-        # grid deadlines. Only its causal source slot can be fresh/pointcloud-
-        # valid; earlier synthetic slots retain shape but carry false validity.
+        # grid deadlines. Only its causal source slot can be fresh; earlier
+        # synthetic slots retain shape but carry false validity.
         if k > 0:
             new_slice = slice(prev_size, self._buffer.size)
             source_valid = np.asarray(self._buffer.data["flag_sample_valid"][new_slice], dtype=bool)
@@ -601,7 +595,6 @@ class EpisodeRecorder:
             self._buffer.data["observation_valid"][new_slice] &= source_valid
             self._buffer.data["tactile_fresh"][new_slice] &= source_valid
             self._buffer.data["flag_camera_fresh"][new_slice] &= source_valid
-            self._buffer.data["flag_pointcloud_valid"][new_slice] &= source_valid
             # Synthetic gap/hold slots inherit the last source's effective
             # target but must not claim a send event: clear the action-queue
             # flag and zero action identity/timing on non-source slots so
@@ -622,33 +615,28 @@ class EpisodeRecorder:
             self._flush_buffered()
 
         # ── Camera streams → bounded background writer ──
-        # A complete payload is submitted for every grid slot, including stale
-        # RGB/depth and zero invalid pointcloud placeholders.  This keeps every
-        # sidecar exactly aligned with data.h5 without retaining image arrays in
-        # EpisodeRecorder memory.
+        # A complete RGB-D payload is submitted for every grid slot, including
+        # stale RGB/depth.  This keeps every sidecar exactly aligned with
+        # data.h5 without retaining image arrays in EpisodeRecorder memory.
         if k > 0:
             current_payload = self._camera_payload(camera_frame)
             zero_payload = self._camera_payload(None)
-            zero_pointcloud = np.zeros(self._camera_writer_config.pointcloud_shape, dtype=np.float32)
             writer = self._camera_writer
             if writer is None:
                 logger.error("EpisodeRecorder: camera writer missing during add_frame")
                 return False
             sample_valid_slots = self._buffer.data["flag_sample_valid"][prev_size : self._buffer.size]
-            pointcloud_valid_slots = self._buffer.data["flag_pointcloud_valid"][prev_size : self._buffer.size]
-            for sample_valid_slot, pointcloud_valid_slot in zip(sample_valid_slots, pointcloud_valid_slots):
+            for sample_valid_slot in sample_valid_slots:
                 if sample_valid_slot:
                     payload = current_payload
                     self._last_camera_payload = (
                         np.array(current_payload[0], copy=True),
                         np.array(current_payload[1], copy=True),
-                        np.array(current_payload[2], copy=True),
                     )
                 else:
                     payload = self._last_camera_payload or zero_payload
-                rgb, depth, pointcloud = payload
-                slot_pointcloud = pointcloud if pointcloud_valid_slot else zero_pointcloud
-                if not writer.submit(rgb, depth, slot_pointcloud):
+                rgb, depth = payload
+                if not writer.submit(rgb, depth):
                     return False
 
         if add_result.capacity_reached:
@@ -657,26 +645,22 @@ class EpisodeRecorder:
             return False
         return True
 
-    def _camera_payload(self, camera_frame: dict[str, Any] | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _camera_payload(self, camera_frame: dict[str, Any] | None) -> tuple[np.ndarray, np.ndarray]:
         """Return shape-stable camera arrays, using explicit zero placeholders."""
         cfg = self._camera_writer_config
         if camera_frame is None:
             return (
                 np.zeros(cfg.rgb_shape, dtype=np.uint8),
                 np.zeros(cfg.depth_shape, dtype=np.uint16),
-                np.zeros(cfg.pointcloud_shape, dtype=np.float32),
             )
 
         rgb = camera_frame.get("rgb")
         depth = camera_frame.get("depth")
-        pointcloud = camera_frame.get("pointcloud")
         if rgb is None:
             rgb = np.zeros(cfg.rgb_shape, dtype=np.uint8)
         if depth is None:
             depth = np.zeros(cfg.depth_shape, dtype=np.uint16)
-        if pointcloud is None or not camera_frame.get("pointcloud_valid", False):
-            pointcloud = np.zeros(cfg.pointcloud_shape, dtype=np.float32)
-        return rgb, depth, pointcloud
+        return rgb, depth
 
     def _ensure_hdf5(self) -> None:
         """Lazily create ``data.h5`` in the temp directory."""
@@ -710,7 +694,7 @@ class EpisodeRecorder:
         buffer_dtypes = {name: values.dtype for name, values in buf_data.items()}
         buffer_shapes["timestamp"] = tuple(self._buffer.timestamps.shape)
         buffer_dtypes["timestamp"] = self._buffer.timestamps.dtype
-        layout_errors = validate_data_layout_v16(
+        layout_errors = validate_data_layout_v17(
             buffer_shapes,
             buffer_dtypes,
             frame_count=buf_size,
@@ -917,13 +901,6 @@ class EpisodeRecorder:
         # ── Flush remaining buffered non-camera streams ──
         self._flush_buffered()
         buf_size = self._buffer.size if self._buffer is not None else 0
-        # ``flag_pointcloud_valid`` is True only for source slots carrying a
-        # genuinely non-zero pointcloud; gap/hold slots are masked False.  Count
-        # it before dropping the buffer below so ``has_pointcloud`` reflects
-        # valid pointcloud presence rather than "any camera stream was written".
-        pointcloud_valid_frames = (
-            int(np.count_nonzero(self._buffer.data["flag_pointcloud_valid"])) if self._buffer is not None else 0
-        )
         self._ensure_hdf5()
 
         if camera_frame_count != buf_size:
@@ -953,7 +930,6 @@ class EpisodeRecorder:
             meta.attrs["wall_fps"] = self._frame_count / duration if duration > 0 else self.control_hz
             meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
             meta.attrs["has_camera"] = _had_rgb
-            meta.attrs["has_pointcloud"] = pointcloud_valid_frames > 0
             meta.attrs["has_timestamps"] = "timestamp" in self._datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["camera_writer_error"] = ""
@@ -1042,11 +1018,10 @@ class EpisodeRecorder:
 
     @staticmethod
     def _validate_and_sync_temp_episode(temp_dir: Path, expected_frames: int) -> None:
-        """Reopen/decode all four modalities, then fsync before publication."""
+        """Reopen/decode all three modalities, then fsync before publication."""
         paths = {
             "data": temp_dir / "data.h5",
             "depth": temp_dir / "depth.h5",
-            "pointcloud": temp_dir / "pointcloud.h5",
             "rgb": temp_dir / "rgb.mp4",
         }
         missing = [name for name, path in paths.items() if not path.is_file()]
@@ -1066,15 +1041,15 @@ class EpisodeRecorder:
                 for key, dataset in data_h5.items()
                 if isinstance(dataset, h5py.Dataset)
             }
-            layout_errors = validate_data_layout_v16(
+            layout_errors = validate_data_layout_v17(
                 dataset_shapes,
                 dataset_dtypes,
                 frame_count=expected_frames,
                 arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
             )
             if layout_errors:
-                raise RuntimeError("data.h5 schema-v16 layout mismatch: " + "; ".join(layout_errors))
-        for key in ("depth", "pointcloud"):
+                raise RuntimeError("data.h5 schema-v17 layout mismatch: " + "; ".join(layout_errors))
+        for key in ("depth",):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:
                     raise RuntimeError(f"{key} sidecar length mismatch")

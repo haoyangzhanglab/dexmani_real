@@ -37,7 +37,7 @@ camera / VR / arm / hand ──shared-memory state──► teleop
                                                      │
                                          aligned sample ring
                                                      ▼
-                                            RecorderIO ──► HDF5 episode v16
+                                            RecorderIO ──► HDF5 episode v17
 ```
 
 The main/lifecycle process resolves immutable configuration, creates
@@ -64,7 +64,7 @@ producers and consumers.
 | Arm/hand action or safety gate | `policy/safety.py` | `SafetyGate` validation → `send_command` → worker apply (`robot/arm_loop.py`, `robot/hand_process.py`), `robot/safety.py`, supervisor, homing and e-stop paths |
 | Learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` (inference loop), `deployment/config.py`, `deployment/contracts.py` (Protocols), `integrations/` adapter, `policy_plan_ring` producer/consumer |
 | FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
-| Episode schema or quality rule | `recording/` | reader, analysis, visualization, replay consumers, v16 schema contract |
+| Episode schema or quality rule | `recording/` | reader, analysis, visualization, replay consumers, v17 schema contract |
 | Replay behavior | `examples/replay_episode.py` | provenance/dense preflight, session/runner, metrics, live safety path |
 | Episode visualization | `examples/visualize_episode.py` | Rerun integration, EpisodeReader, point cloud, time-series views |
 | Calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit write/confirmation path and calibration JSON contract |
@@ -140,7 +140,7 @@ Use the smallest vertical slice that fully preserves a contract.
 | Change | Required impact check |
 |---|---|
 | Add/change arm or hand state | dtype → documentation dataclass → worker write → policy read → recording path → reader/analysis if persisted |
-| Add/change a recording dataset | schema dtype → recorder → reader → analysis/visualization → replay consumer → v16 schema contract |
+| Add/change a recording dataset | schema dtype → recorder → reader → analysis/visualization → replay consumer → v17 schema contract |
 | Add/change a ring or queue | `SharedStorage` create/close → producer → consumer → readiness/heartbeat → failure/shutdown behavior |
 | Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
 | Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
@@ -148,7 +148,7 @@ Use the smallest vertical slice that fully preserves a contract.
 | Change learned-policy deployment | `deployment/config.py` → `deployment/contracts.py` (Protocols, no torch) → `deployment/worker.py` → `deployment/coordinator.py` → `deployment/lifecycle.py` → `integrations/` adapter (integration → deployment only) |
 | Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
 
-Do not silently change HDF5 meaning in place. Runtime episodes use schema v16
+Do not silently change HDF5 meaning in place. Runtime episodes use schema v17
 only: coordinate a format change across writer, reader, visualization, replay, and the
 schema marker. Migrate historical episodes outside the runtime before
 using them.

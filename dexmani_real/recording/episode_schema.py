@@ -1,7 +1,7 @@
-"""Pure schema-v16 contracts shared by episode writers and readers.
+"""Pure schema-v17 contracts shared by episode writers and readers.
 
-The HDF5 data file has 96 unconditional per-grid datasets.  The exact command
-actually submitted to the arm worker is a 97th, conditional dataset controlled
+The HDF5 data file has 93 unconditional per-grid datasets.  The exact command
+actually submitted to the arm worker is a 94th, conditional dataset controlled
 by the ``arm_sent_stream`` metadata marker.  Unknown datasets are tolerated by
 the reader for historical diagnostic extensions, but they must remain aligned
 to the episode grid.
@@ -23,7 +23,7 @@ from dexmani_real.utils.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-EPISODE_SCHEMA_VERSION = 16
+EPISODE_SCHEMA_VERSION = 17
 ARM_SENT_DATASET = "action_arm_joint_sent"
 ARM_SENT_MARKER = "arm_sent_stream"
 
@@ -45,10 +45,10 @@ def _spec(dtype: Any, tail_shape: tuple[int, ...] = ()) -> DatasetSpec:
     return DatasetSpec(tail_shape=tail_shape, dtype=np.dtype(dtype))
 
 
-# The 96 fields that every schema-v16 data.h5 produced by EpisodeRecorder has.
+# The 96 fields that every schema-v17 data.h5 produced by EpisodeRecorder has.
 # Keep the grouping aligned with the public data dictionary and writer data
 # construction so a review can compare each producer category directly.
-BASE_DATASET_SPECS_V16: dict[str, DatasetSpec] = {
+BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     # Fixed control grid and causal fill.
     "timestamp": _spec(np.float64),
     "flag_sample_valid": _spec(np.bool_),
@@ -126,7 +126,6 @@ BASE_DATASET_SPECS_V16: dict[str, DatasetSpec] = {
     # Camera state and point-cloud quality.
     "camera_health": _spec(np.int64),
     "flag_camera_fresh": _spec(np.bool_),
-    "flag_pointcloud_valid": _spec(np.bool_),
     "camera_frame_number": _spec(np.int64),
     "camera_ring_sequence": _spec(np.int64),
     "camera_device_timestamp_s": _spec(np.float64),
@@ -137,9 +136,7 @@ BASE_DATASET_SPECS_V16: dict[str, DatasetSpec] = {
     "camera_duplicate": _spec(np.bool_),
     "camera_frame_gap": _spec(np.int64),
     "camera_backlog_s": _spec(np.float64),
-    "pointcloud_source_point_count": _spec(np.int64),
     "pointcloud_valid_depth_ratio": _spec(np.float64),
-    "pointcloud_padding_count": _spec(np.int64),
     # IK, retargeting, safety, and performance diagnostics.
     "flag_ik_ok": _spec(np.bool_),
     "flag_ik_attempted": _spec(np.bool_),
@@ -155,11 +152,11 @@ BASE_DATASET_SPECS_V16: dict[str, DatasetSpec] = {
     "policy_compute_time_ms": _spec(np.float64),
 }
 
-CONDITIONAL_DATASET_SPECS_V16: dict[str, DatasetSpec] = {
+CONDITIONAL_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     ARM_SENT_DATASET: _spec(np.float64, ARM_JOINT_SHAPE),
 }
 
-ALIGNMENT_DATASET_NAMES_V16 = frozenset(
+ALIGNMENT_DATASET_NAMES_V17 = frozenset(
     {
         "timestamp",
         "flag_sample_valid",
@@ -168,13 +165,13 @@ ALIGNMENT_DATASET_NAMES_V16 = frozenset(
         "fill_reason",
     }
 )
-SOURCE_FRAME_DATASET_NAMES_V16 = (
-    frozenset(BASE_DATASET_SPECS_V16) - ALIGNMENT_DATASET_NAMES_V16
+SOURCE_FRAME_DATASET_NAMES_V17 = (
+    frozenset(BASE_DATASET_SPECS_V17) - ALIGNMENT_DATASET_NAMES_V17
 )
 
 # These are value overrides for fields already present in the base contract,
 # never an extension mechanism.  NaN is valid for unavailable diagnostics.
-DIAGNOSTIC_TAIL_SHAPES_V16: dict[str, tuple[int, ...]] = {
+DIAGNOSTIC_TAIL_SHAPES_V17: dict[str, tuple[int, ...]] = {
     "tracking_error": (),
     "ik_solve_time_ms": (),
     "target_pos_before_clamp": (3,),
@@ -188,8 +185,8 @@ DIAGNOSTIC_TAIL_SHAPES_V16: dict[str, tuple[int, ...]] = {
     "policy_compute_time_ms": (),
 }
 
-# Additive metadata only: older schema-v16 readers may ignore every key here.
-SEMANTIC_META_ATTRS_V16: dict[str, str | float | bool] = {
+# Additive metadata only: older schema-v17 readers may ignore every key here.
+SEMANTIC_META_ATTRS_V17: dict[str, str | float | bool] = {
     "robot_world_frame": "xarm_base",
     "robot_world_equals_xarm_base": True,
     "arm_ee_frame": "xarm_base",
@@ -212,20 +209,20 @@ SEMANTIC_META_ATTRS_V16: dict[str, str | float | bool] = {
 }
 
 
-def expected_source_frame_dataset_names_v16(*, arm_sent_stream: bool) -> frozenset[str]:
+def expected_source_frame_dataset_names_v17(*, arm_sent_stream: bool) -> frozenset[str]:
     """Return the exact keys accepted from one low-level recorder source frame."""
 
     if arm_sent_stream:
-        return SOURCE_FRAME_DATASET_NAMES_V16 | frozenset({ARM_SENT_DATASET})
-    return SOURCE_FRAME_DATASET_NAMES_V16
+        return SOURCE_FRAME_DATASET_NAMES_V17 | frozenset({ARM_SENT_DATASET})
+    return SOURCE_FRAME_DATASET_NAMES_V17
 
 
-def validate_source_frame_keys_v16(
+def validate_source_frame_keys_v17(
     keys: set[str], *, arm_sent_stream: bool
 ) -> tuple[str, ...]:
     """Validate exact writer-input keys before the timestamp buffer freezes them."""
 
-    expected = expected_source_frame_dataset_names_v16(arm_sent_stream=arm_sent_stream)
+    expected = expected_source_frame_dataset_names_v17(arm_sent_stream=arm_sent_stream)
     missing = sorted(expected - keys)
     unexpected = sorted(keys - expected)
     errors: list[str] = []
@@ -236,20 +233,20 @@ def validate_source_frame_keys_v16(
     return tuple(errors)
 
 
-def normalize_diagnostics_v16(
+def normalize_diagnostics_v17(
     diagnostics: Mapping[str, Any] | None,
 ) -> dict[str, np.ndarray]:
-    """Validate and normalize the fixed schema-v16 diagnostic override set."""
+    """Validate and normalize the fixed schema-v17 diagnostic override set."""
 
     if not diagnostics:
         return {}
     keys = set(diagnostics)
-    allowed = set(DIAGNOSTIC_TAIL_SHAPES_V16)
+    allowed = set(DIAGNOSTIC_TAIL_SHAPES_V17)
     unexpected = keys - allowed
     if unexpected:
         reserved = sorted(
             unexpected
-            & (set(BASE_DATASET_SPECS_V16) | set(CONDITIONAL_DATASET_SPECS_V16))
+            & (set(BASE_DATASET_SPECS_V17) | set(CONDITIONAL_DATASET_SPECS_V17))
         )
         unknown = sorted(unexpected - set(reserved))
         details: list[str] = []
@@ -257,7 +254,7 @@ def normalize_diagnostics_v16(
             details.append(f"reserved dataset collisions={reserved}")
         if unknown:
             details.append(f"unsupported keys={unknown}")
-        raise ValueError("schema-v16 diagnostics rejected: " + "; ".join(details))
+        raise ValueError("schema-v17 diagnostics rejected: " + "; ".join(details))
 
     normalized: dict[str, np.ndarray] = {}
     for name in sorted(keys):
@@ -265,18 +262,18 @@ def normalize_diagnostics_v16(
             value = np.asarray(diagnostics[name], dtype=np.float64)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"schema-v16 diagnostic {name!r} must be float64-compatible"
+                f"schema-v17 diagnostic {name!r} must be float64-compatible"
             ) from exc
-        expected_shape = DIAGNOSTIC_TAIL_SHAPES_V16[name]
+        expected_shape = DIAGNOSTIC_TAIL_SHAPES_V17[name]
         if value.shape != expected_shape:
             raise ValueError(
-                f"schema-v16 diagnostic {name!r} has shape {value.shape}, expected {expected_shape}"
+                f"schema-v17 diagnostic {name!r} has shape {value.shape}, expected {expected_shape}"
             )
         normalized[name] = value
     return normalized
 
 
-def validate_data_layout_v16(
+def validate_data_layout_v17(
     dataset_shapes: Mapping[str, tuple[int, ...]],
     dataset_dtypes: Mapping[str, Any],
     *,
@@ -287,7 +284,7 @@ def validate_data_layout_v16(
 
     Unknown historical diagnostic datasets are accepted, but—like every
     writer-produced data stream—they must have a grid dimension equal to
-    ``frame_count``.  Known fields additionally require their exact v16 tail
+    ``frame_count``.  Known fields additionally require their exact v17 tail
     shape and dtype.
     """
 
@@ -296,7 +293,7 @@ def validate_data_layout_v16(
         errors.append(f"num_frames must be non-negative, got {frame_count}")
 
     names = set(dataset_shapes)
-    missing = sorted(set(BASE_DATASET_SPECS_V16) - names)
+    missing = sorted(set(BASE_DATASET_SPECS_V17) - names)
     if missing:
         errors.append(f"missing required data.h5 datasets: {missing}")
 
@@ -306,8 +303,8 @@ def validate_data_layout_v16(
     elif sent_present and not arm_sent_stream:
         errors.append(f"dataset {ARM_SENT_DATASET!r} requires {ARM_SENT_MARKER}=True")
 
-    known_specs = dict(BASE_DATASET_SPECS_V16)
-    known_specs.update(CONDITIONAL_DATASET_SPECS_V16)
+    known_specs = dict(BASE_DATASET_SPECS_V17)
+    known_specs.update(CONDITIONAL_DATASET_SPECS_V17)
     for name in sorted(names):
         shape = tuple(int(dim) for dim in dataset_shapes[name])
         if not shape:
@@ -344,20 +341,20 @@ def validate_data_layout_v16(
 
 
 __all__ = [
-    "ALIGNMENT_DATASET_NAMES_V16",
+    "ALIGNMENT_DATASET_NAMES_V17",
     "ARM_RAW_ACTION_VALIDITY_EXPRESSION",
     "ARM_SENT_DATASET",
     "ARM_SENT_MARKER",
-    "BASE_DATASET_SPECS_V16",
-    "CONDITIONAL_DATASET_SPECS_V16",
-    "DIAGNOSTIC_TAIL_SHAPES_V16",
+    "BASE_DATASET_SPECS_V17",
+    "CONDITIONAL_DATASET_SPECS_V17",
+    "DIAGNOSTIC_TAIL_SHAPES_V17",
     "DatasetSpec",
     "EPISODE_SCHEMA_VERSION",
     "HAND_RAW_ACTION_VALIDITY_EXPRESSION",
-    "SEMANTIC_META_ATTRS_V16",
-    "SOURCE_FRAME_DATASET_NAMES_V16",
-    "expected_source_frame_dataset_names_v16",
-    "normalize_diagnostics_v16",
-    "validate_data_layout_v16",
-    "validate_source_frame_keys_v16",
+    "SEMANTIC_META_ATTRS_V17",
+    "SOURCE_FRAME_DATASET_NAMES_V17",
+    "expected_source_frame_dataset_names_v17",
+    "normalize_diagnostics_v17",
+    "validate_data_layout_v17",
+    "validate_source_frame_keys_v17",
 ]

@@ -53,6 +53,15 @@ class HandOptimizer:
         Skip Stage 2 when max(pinch_factors) < this value.
     reg_stage1_weight / reg_last_weight:
         Stage 2 regularization: anchor to Stage 1 solution / previous frame.
+    prior_weight:
+        Human-flexion prior weight γ: pulls the solved joints toward the
+        per-frame human flexion reference (``q_prior`` passed to ``solve``) in
+        both stages, masked to the 10 flexion joints by ``prior_mask``. 0.0
+        disables the prior.
+    prior_mask:
+        (dof,) 0/1 weight mask selecting which joints the prior applies to
+        (1 = flexion joints, 0 = unmapped joints such as thumb_rota1 /
+        index_bend).  Required when ``prior_weight > 0``.
     """
 
     def __init__(
@@ -77,6 +86,8 @@ class HandOptimizer:
         pinch_skip_threshold: float = 0.01,
         reg_stage1_weight: float = 1.0,
         reg_last_weight: float = 0.8,
+        prior_weight: float = 0.0,
+        prior_mask: np.ndarray | None = None,
     ) -> None:
         # ── Kinematics ──
         self.pin_grad = PinGrad(urdf_path, fingertip_frame_names)
@@ -144,24 +155,39 @@ class HandOptimizer:
         self.reg_s1_weight = reg_stage1_weight
         self.reg_last_weight = reg_last_weight
 
+        # ── Human-flexion prior ──
+        self.prior_weight = float(prior_weight)
+        if not np.isfinite(self.prior_weight) or self.prior_weight < 0:
+            raise ValueError("prior_weight must be finite and non-negative")
+        if prior_mask is not None:
+            prior_mask = np.asarray(prior_mask, dtype=np.float64)
+            if prior_mask.shape != (self.dof,):
+                raise ValueError(f"prior_mask must have shape ({self.dof},)")
+            if not np.all(np.isfinite(prior_mask)):
+                raise ValueError("prior_mask must be finite")
+        self.prior_mask = prior_mask
+
         # ── State ──
         self._default_qpos = (self.joint_limits_lower + self.joint_limits_upper) / 2.0
         self.last_qpos: np.ndarray = self._default_qpos.copy()
         self.qpos_stage1: np.ndarray | None = None
         self.pinch_factors: np.ndarray = np.zeros(self.finger_num, dtype=np.float64)
         self._current_target: np.ndarray | None = None  # (finger_num, 3) scaled targets
+        self._current_q_prior: np.ndarray | None = None  # (dof,) per-frame human flexion reference
         self._stage1_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._stage2_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
 
     # ── Public API ──────────────────────────────────────────────
 
-    def solve(self, fingertip_positions: np.ndarray) -> np.ndarray | None:
+    def solve(self, fingertip_positions: np.ndarray, q_prior: np.ndarray | None = None) -> np.ndarray | None:
         """Solve one frame: fingertip positions → joint angles.
 
         Args:
             fingertip_positions: (finger_num, 3) target positions in URDF frame,
                 centered at wrist origin.
+            q_prior: Optional (dof,) per-frame human-flexion reference in
+                Pinocchio model order.  Only used when ``prior_weight > 0``.
 
         Returns:
             (dof,) joint angles in Pinocchio model order, or ``None`` when
@@ -172,6 +198,14 @@ class HandOptimizer:
             raise ValueError(f"fingertip_positions must have shape ({self.finger_num}, 3)")
         if not np.all(np.isfinite(fingertip_positions)):
             raise ValueError("fingertip_positions must be finite")
+
+        if q_prior is not None:
+            q_prior = np.asarray(q_prior, dtype=np.float64)
+            if q_prior.shape != (self.dof,):
+                raise ValueError(f"q_prior must have shape ({self.dof},)")
+            if not np.all(np.isfinite(q_prior)):
+                raise ValueError("q_prior must be finite")
+        self._current_q_prior = q_prior
 
         # Scale targets (1.2× boost discourages over-flexing)
         self._current_target = fingertip_positions * self.finger_scale[:, np.newaxis]
@@ -260,16 +294,25 @@ class HandOptimizer:
 
     # ── NLopt callbacks ─────────────────────────────────────────
 
+    def _compute_prior_gradient(self, qpos: np.ndarray) -> tuple[np.ndarray, float]:
+        """Human-flexion prior gradient/loss (zeros when disabled)."""
+        if self._current_q_prior is None or self.prior_mask is None or self.prior_weight <= 0:
+            return np.zeros(self.dof, dtype=np.float64), 0.0
+        diff = qpos - self._current_q_prior
+        w = self.prior_weight * self.prior_mask
+        return 2.0 * w * diff, float(np.sum(w * diff * diff))
+
     def _obj_s1(self, qpos: np.ndarray, grad: np.ndarray) -> float:
-        """Stage 1 objective: position error + temporal smoothness."""
+        """Stage 1 objective: position error + temporal smoothness + natural-hand prior."""
         self.qpos_floating[7:] = qpos
         # _current_target is set by solve() before any NLopt callback fires;
         # mypy sees np.ndarray|None but runtime is always np.ndarray here.
         g_pos, loss_pos = self.pin_grad.compute_position_gradient(self.qpos_floating, self._current_target)  # type: ignore[arg-type]
         g_smooth, loss_smooth = PinGrad.compute_smoothness_gradient(qpos, self.last_qpos, self._smooth_weight)
+        g_prior, loss_prior = self._compute_prior_gradient(qpos)
         if grad.size > 0:
-            grad[:] = g_pos + g_smooth
-        return float(loss_pos + loss_smooth)
+            grad[:] = g_pos + g_smooth + g_prior
+        return float(loss_pos + loss_smooth + loss_prior)
 
     def _obj_s2(self, qpos: np.ndarray, grad: np.ndarray) -> float:
         """Stage 2 objective: pinch refinement with regularization."""
@@ -290,6 +333,11 @@ class HandOptimizer:
             g, l = PinGrad.compute_smoothness_gradient(qpos, ref, weight)
             total_loss += l
             total_grad += g
+
+        # Natural-hand prior
+        g_prior, loss_prior = self._compute_prior_gradient(qpos)
+        total_loss += loss_prior
+        total_grad += g_prior
 
         # Per-finger pinch penalty: attract each fingertip to thumb
         thumb_fid = self.pin_grad.tip_frame_ids[0]

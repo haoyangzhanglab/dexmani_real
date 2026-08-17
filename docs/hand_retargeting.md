@@ -47,10 +47,10 @@ VR_FRAME_DTYPE / 历史可验证 VR ring
 21×3 shape / finite / 几何退化检查
     │
     ▼
-掌心局部坐标系 → MANO 轴约定 → 自适应小指补偿
+掌心局部坐标系 → MANO 轴约定 → 小指链缩放补偿
     │
-    ├── DexPilot：外部 dex-retargeting，当前默认后端
-    └── TAG：两阶段 Pinocchio + NLopt，仓库内可审计备选
+    ├── TAG：两阶段 Pinocchio + NLopt，仓库内可审计，当前默认后端
+    └── DexPilot：外部 dex-retargeting，备选后端
     │
     ▼
 startup smoothstep ramp
@@ -77,7 +77,7 @@ XHand driver：最终范围检查，原样发送 endpoint
 最重要的当前事实是：
 
 1. 正常控制只消费**右手 21 个关键点**；手腕四元数服务于机械臂映射，不参与手指 retarget。
-2. DexPilot 是当前默认后端；TAG 是仓库内可审计的备选后端。
+2. TAG 是当前默认后端；DexPilot 是外部备选后端。
 3. 两个后端都**没有 wrapper 输出级 EMA**。TAG 的连续性来自 Stage 1 时间正则、pinch activation EMA 和启动 ramp。
 4. DexPilot 只保留外部库内部 LPFilter，参数与 LeFranX 对齐。
 5. operational command bounds 当前是**发布前逐关节投影**，不是求解器边界，也不是整条拒绝条件。
@@ -247,13 +247,13 @@ $$
 
 两种后端最终都使用相对位置或差向量，因此全局手腕平移不会进入手关节优化；空间手腕运动由机械臂映射处理。
 
-### 5.4 自适应小指补偿
+### 5.4 小指链缩放补偿
 
-公共预处理依据 pinky MCP→TIP 距离，在 3–10 cm 区间把 scale 从 1.2 线性提升到 2.2，并用原始 MCP→PIP→DIP→TIP 骨段逐段重建。
+公共预处理用一个常量 `pinky_scale` 缩放 pinky 链（MCP→PIP→DIP→TIP），并用 `pinky_palm_scale` 独立缩放 pinky wrist→MCP 基线；两后端注入各自 calibration 后的常量（TAG `pinky_scale=1.3` / `pinky_palm_scale=1.25`，DexPilot `pinky_scale=1.15` / `pinky_palm_scale=1.0`）。原始的 LeFranX 按 pinky MCP→TIP 距离在 3–10 cm 区间把 scale 从 1.2 线性提升到 2.2 的 extension-dependent 插值已被移除。
 
 重建使用未修改的原始骨段方向，输入数组不会原地修改。TAG 和 DexPilot 后续主要消费 wrist 与 fingertips，因此中间小指点的直接作用是构造一致的最终 pinky tip。
 
-该补偿会把 MCP→TIP 距离噪声同时带入 scale 和目标长度；在阈值附近还存在分段函数斜率变化。它是当前经验补偿，不是用户手型标定。
+该补偿仍是经验常数补偿，不是用户手型标定。
 
 ## 6. TAG 后端
 
@@ -304,7 +304,7 @@ L_1(q)=
 +\lambda_s\|q-q_{prev}\|^2
 $$
 
-当前默认 `smooth_weight` 为 0.003，solver 为 NLopt L-BFGS，最大 evaluation 80。该值保留 TAG 作为低延迟备选，但 TAG 不是当前默认后端。
+当前默认 `smooth_weight` 为 0.003，solver 为 NLopt L-BFGS，最大 evaluation 80。TAG 是当前默认后端。
 
 解析梯度为：
 
@@ -409,7 +409,7 @@ DexPilot 当前只有一层持续输出滤波，即外部库内部 LPFilter；�
 
 | 维度 | TAG | DexPilot |
 |---|---|---|
-| 默认状态 | 备选 | 默认 |
+| 默认状态 | 默认 | 备选 |
 | 目标 | 5 条 wrist-to-tip | 15 条 reference vectors |
 | pinch | 独立 Stage 2 | 外部 projected-vector 机制 |
 | 持续平滑 | 时间正则 + activation EMA | 外部 internal LPFilter |
@@ -572,7 +572,7 @@ XHand tactile/contact 数据进入反馈和 episode，但当前不会：
 
 ## 12. 记录、raw/final 和 replay
 
-HDF5 schema v16 保存与 hand retarget 相关的主要信息：
+HDF5 schema v17 保存与 hand retarget 相关的主要信息：
 
 | 层 | 主要字段语义 |
 |---|---|
@@ -631,7 +631,7 @@ replay 使用记录的最终 hand action，不从 VR landmarks 重新执行 reta
 
 ### 13.3 离线调参与 home 估计
 
-[examples/tune_hand_retarget.py](../examples/tune_hand_retarget.py) 只读 schema-v16 episode，顺序重放 TAG 和 DexPilot，不创建 shared memory，不导入设备 SDK，不发布任何硬件命令。主要指标为：
+[examples/tune_hand_retarget.py](../examples/tune_hand_retarget.py) 只读 schema-v17 episode，顺序重放 TAG 和 DexPilot，不创建 shared memory，不导入设备 SDK，不发布任何硬件命令。主要指标为：
 
 - 8 个非拇指弯曲关节的最佳因果 lag 和 Spearman 相关；
 - 10 组指尖间距离的平均 Spearman 相关；
@@ -722,7 +722,7 @@ Dexora 原始右手 init 为 `[30, 55.33, 3, 0.17, 1.08, 0.92, 1.25, 1.25, 1.33,
 - hand command/state dtype；
 - recorder、reader、visualization 和 replay。
 
-持久化 shape 或含义变化不能静默写入 HDF5 v16。
+持久化 shape 或含义变化不能静默写入 HDF5 v17。
 
 ### 15.3 修改滤波、ramp 或 temporal state
 

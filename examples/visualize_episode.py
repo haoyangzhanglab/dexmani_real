@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rerun-based visualizer for schema-v16 DexMani episodes.
+"""Rerun-based visualizer for schema-v17 DexMani episodes.
 
 Usage:
   python examples/visualize_episode.py episode_dir/
@@ -47,7 +47,6 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
         "flag_retarget_ok",
         "flag_held",
         "flag_camera_fresh",
-        "flag_pointcloud_valid",
         "camera_age_s",
         "camera_frame_number",
     },
@@ -145,9 +144,6 @@ def print_episode_info(h5_path: str) -> None:
         if "flag_camera_fresh" in f:
             fresh = f["flag_camera_fresh"][:]
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
-        if "flag_pointcloud_valid" in f:
-            valid = f["flag_pointcloud_valid"][:]
-            print(f"flag_pointcloud_valid rate: {valid.mean():.2%}")
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +197,7 @@ class EpisodeVisualizer:
                 if meta is not None and "depth_scale" in meta.attrs:
                     depth_scale = float(meta.attrs["depth_scale"])
                 elif "depth" in self._h5f:
-                    raise ValueError("schema-v16 episode is missing /meta depth_scale")
+                    raise ValueError("schema-v17 episode is missing /meta depth_scale")
             self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
             self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
     
@@ -247,19 +243,8 @@ class EpisodeVisualizer:
                     logger.warning("Point cloud disabled: no camera_K in /meta")
                     self._pc_enabled = False
     
-            # Pre-computed world-frame /pointcloud (preferred over depth back-projection).
-            self._has_precomputed_pc = (
-                point_cloud and "pointcloud" in self._h5f and isinstance(self._h5f["pointcloud"], h5py.Dataset)
-            )
-            if self._has_precomputed_pc:
-                pc_shape = self._h5f["pointcloud"].shape
-                logger.info(
-                    "Pre-computed /pointcloud: shape=%s, dtype=%s (world-frame, skip back-projection)",
-                    pc_shape,
-                    self._h5f["pointcloud"].dtype,
-                )
-            elif self._pc_enabled:
-                logger.info("No /pointcloud — falling back to depth back-projection + camera_K.")
+            if self._pc_enabled:
+                logger.info("Point cloud derived from depth back-projection + camera_K (schema v17).")
     
             self._T = self._resolve_frame_count(max_frames)
             self._C = self._resolve_camera_count()
@@ -399,7 +384,7 @@ class EpisodeVisualizer:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
         # 3D view: point cloud and/or fingertip keypoints
-        _has_3d = self._pc_enabled or self._has_precomputed_pc or "hand_fingertip" in self._state
+        _has_3d = self._pc_enabled or "hand_fingertip" in self._state
         if _has_3d:
             columns.append(
                 rrb.Spatial3DView(
@@ -544,18 +529,9 @@ class EpisodeVisualizer:
                 "camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000))
             )  # clamp outliers to stabilize colormap
 
-        # 3D point cloud: /pointcloud (world-frame, grid-aligned) > depth back-projection.
-        if self._has_precomputed_pc:
-            # Skip frames the recorder marked as having no valid point cloud
-            # (flag_pointcloud_valid=False): the all-zero placeholder rows are
-            # not real geometry.
-            valid = self._state.get("flag_pointcloud_valid")
-            if valid is None or bool(valid[step_idx]):
-                pc_frame = self._h5f["pointcloud"][step_idx]  # (N, 6): xyz + float rgb
-                positions = pc_frame[:, :3]
-                colors = (np.clip(pc_frame[:, 3:6], 0, 1) * 255).astype(np.uint8)
-                rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
-        elif self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
+        # 3D point cloud: derived from depth back-projection (schema v17 has no
+        # pre-computed pointcloud sidecar).
+        if self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
                 depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
                 rgb = (

@@ -174,10 +174,10 @@ class TrajectoryData:
 
 
 def resolve_episode_path(raw_path: str) -> tuple[str, str]:
-    """Validate and name one schema-v16 episode directory."""
+    """Validate and name one schema-v17 episode directory."""
     path = Path(raw_path)
     if not path.is_dir():
-        raise ValueError(f"episode must be a schema-v16 directory: {path}")
+        raise ValueError(f"episode must be a schema-v17 directory: {path}")
     return str(path), path.name
 
 
@@ -188,7 +188,7 @@ def load_trajectory(
     require_live_validity: bool = False,
     require_exact_source: bool = False,
 ) -> TrajectoryData:
-    """Load one command trajectory from a schema-v16 episode."""
+    """Load one command trajectory from a schema-v17 episode."""
     if source not in {"cmd", "sent"}:
         raise ValueError("source must be 'cmd' or 'sent'")
 
@@ -1763,7 +1763,7 @@ Live replay controls:
         "episode",
         nargs="?",
         type=str,
-        help="Published schema-v16 episode directory.",
+        help="Published schema-v17 episode directory.",
     )
     parser.add_argument(
         "--dry-run",

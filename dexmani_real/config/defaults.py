@@ -663,7 +663,9 @@ class PolicyParams:
 
     # ── Hand retargeting ──
     hand_enabled: bool = True
-    hand_retargeting_type: str = "dexpilot"
+    # Default hand backend.  "tag" is the in-repo two-stage NLopt solver (default);
+    # "dexpilot" selects the external dex-retargeting backend.
+    hand_retargeting_type: str = "tag"
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
@@ -776,7 +778,7 @@ class TAGRetargetingParams:
     # ── Finger length scaling ──
     robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
     """XHand finger lengths (thumb..pinky, meters). Pinky set equal to human — adaptive_retargeting_xhand
-    already handles pinky chain scaling (1.2-2.2x), so finger_scale for pinky must be 1.0 to avoid
+    already handles pinky chain scaling (see pinky_scale), so finger_scale for pinky must be 1.0 to avoid
     double-compensation."""
 
     human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
@@ -785,6 +787,22 @@ class TAGRetargetingParams:
     finger_scale_boost: float = 1.0
     """Multiplier on robot/human length ratio.  1.0 = no extra boost — VR landmarks
     are already at robot scale after MANO transform + adaptive_retargeting_xhand."""
+
+    pinky_scale: float = 1.3
+    """Constant pinky-chain (MCP→PIP/PIP→DIP/DIP→TIP) scale applied by
+    adaptive_retargeting_xhand.  TAG's pinky finger_scale is pinned to 1.0 (see
+    robot_finger_lengths), so this + pinky_palm_scale are the pinky's length
+    levers.  Offline sweep (episode_20260817_220802): 1.3 with palm 1.25 drives
+    pinky PIP distal over-flexion +8.7°→~0° and mean-abs bias 8.47→7.40°; the
+    earlier single-lever 1.5 left the distal over-flexed."""
+
+    pinky_palm_scale: float = 1.25
+    """Scale on the pinky wrist→MCP baseline applied by adaptive_retargeting_xhand.
+    The robot pinky MCP sits proportionally farther from the wrist than the human's
+    (URDF pinky_joint1 origin ≈0.1085 m vs human ≈0.0865 m ≈ 1.25×).  1.25 matches
+    that ratio and, with pinky_scale=1.3, removes the pinky distal over-flexion the
+    distal-only lever left.  The pinky MCP proximal residual (~+20°) is a
+    null-space distribution and persists at any scale (see DexPilot note)."""
 
     # ── Coordinate alignment: MANO → XHand URDF frame (Euler XYZ, rad) ──
     mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -807,6 +825,16 @@ class TAGRetargetingParams:
     pinch_skip_threshold: float = 0.01
     reg_stage1_weight: float = 1.0
     reg_last_weight: float = 0.8
+    prior_weight: float = 0.01
+    """Human-flexion prior weight γ: pulls the 10 flexion joints toward the
+    per-frame human flexion reference (the operator's CMC/MCP/PIP+DIP angles,
+    remapped to Pinocchio model order) in both NLopt stages.  0.0 disables it.
+    thumb_rota1 and index_bend (no landmark-flexion mapping) are masked out.
+    Offline sweep (episode_20260817_220802): 0.01 halves mean-abs flexion bias
+    7.40→3.48° and cuts pinky MCP +19.9→+8.7° / thumb rota2 −21.2→−2.5° while
+    holding fingertip-distance ρ ≥ 0.74 (gate).  Higher γ keeps cutting bias but
+    degrades fingertip ρ (0.02 → 0.686).  Single-episode fit; re-sweep on new
+    data and hardware-smoke before trusting."""
 
     def __post_init__(self) -> None:
         robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
@@ -818,6 +846,8 @@ class TAGRetargetingParams:
             raise ValueError("TAG finger lengths/Euler alignment must be finite and lengths positive")
         positive = (
             self.finger_scale_boost,
+            self.pinky_scale,
+            self.pinky_palm_scale,
             self.ftol_abs_s1,
             self.ftol_abs_s2,
             self.pinch_base_weight,
@@ -830,6 +860,8 @@ class TAGRetargetingParams:
             raise ValueError("TAG scales, tolerances, distances, and regularization weights must be positive")
         if not np.isfinite(self.smooth_weight) or self.smooth_weight < 0:
             raise ValueError("TAG smooth_weight must be finite and non-negative")
+        if not np.isfinite(self.prior_weight) or self.prior_weight < 0:
+            raise ValueError("TAG prior_weight must be finite and non-negative")
         if self.maxeval_s1 <= 0 or self.maxeval_s2 <= 0:
             raise ValueError("TAG optimizer maxeval values must be positive")
         if self.pinch_full_dist_m > self.pinch_start_dist_m:
@@ -848,28 +880,64 @@ class DexPilotRetargetingParams:
     the backend used by :class:`teleop.hand_retarget.XHandRetargeter`.
     """
 
-    # Match the LeFranX XHand DexPilot configuration.  LeFranX leaves scaling
-    # unspecified and therefore uses dex-retargeting's 1.0 default.
-    scaling_factor: float = 1.0
+    # Human↔robot size compensation.  LeFranX leaves this unspecified (1.0), but
+    # the XHand fingers are 15-38% longer than the recorded human hand, so a
+    # longer finger reaching a shorter target over-flexes distally.  1.15 is the
+    # vendor's own inspire_hand value and matches the offline sweep (thumb_rota2
+    # +43°→~0°, index/ring distal →~0° at scaling_factor=1.15).
+    scaling_factor: float = 1.15
+    # Constant pinky-chain scale applied by adaptive_retargeting_xhand *before*
+    # scaling_factor (effective pinky scale ≈ scaling_factor × pinky_scale).
+    # Recalibrated from LeFranX's 1.2-2.2 down to the physical pinky ratio: the
+    # 2.2 max over-scaled the pinky into proximal (MCP) over-flexion.
+    pinky_scale: float = 1.15
+    # Scale on the pinky wrist→MCP baseline, applied before scaling_factor.  The
+    # robot pinky MCP is ~1.25× farther from the wrist than the human's; the
+    # distal-only pinky_scale leaves this palm offset unscaled, so the wrist→tip
+    # reference is ~6% short of the robot's straight reach and the solver curls the
+    # MCP to compensate.  >1.0 lengthens the reference palm offset.
+    pinky_palm_scale: float = 1.0
     low_pass_alpha: float = 0.6
+    # Grasp-projection hysteresis.  project_dist_m engages the high-weight
+    # projected regime; escape_dist_m releases it.  A band [0.03, 0.05] (the
+    # dex-retargeting package default) stops adjacent fingertip pairs flapping
+    # between the normal and projected loss regimes as their distance dithers
+    # around 3 cm — offline this lowers mean-abs flexion bias 7.49→6.86° and
+    # the P95 joint step 14.1→11.9°.
     project_dist_m: float = 0.03
-    escape_dist_m: float = 0.03
+    escape_dist_m: float = 0.05
+    prior_weight: float = 0.05
+    """Human-flexion prior weight γ, injected into the in-repo
+    ``PriorDexPilotOptimizer`` wrapper.  Pulls the 10 flexion joints toward the
+    per-frame human flexion reference (target/SDK order) as a full
+    value+gradient objective term.  0.0 disables it.  dex-retargeting 0.4.6
+    dropped the paper's open-hand regularizer; this restores a per-frame
+    variant.  Offline sweep (episode_20260817_220802): 0.05 cuts pinky distal
+    (PIP) +18.0→+6.6° and thumb rota2 −7.1→−3.9°, lifts flexion ρ 0.612→0.926,
+    and passes default gates with fingertip ρ ≈0.84 (baseline 0.832).  The pinky
+    MCP proximal residual (~+15°) persists — a length-mismatch, not null-space.
+    Single-episode fit; re-sweep on new data and hardware-smoke before trusting."""
 
     def __post_init__(self) -> None:
         numeric = (
             self.scaling_factor,
+            self.pinky_scale,
+            self.pinky_palm_scale,
             self.low_pass_alpha,
             self.project_dist_m,
             self.escape_dist_m,
+            self.prior_weight,
         )
         if not all(np.isfinite(value) for value in numeric):
             raise ValueError("DexPilot retargeting parameters must be finite")
-        if self.scaling_factor <= 0:
-            raise ValueError("DexPilot scaling_factor must be positive")
+        if self.scaling_factor <= 0 or self.pinky_scale <= 0 or self.pinky_palm_scale <= 0:
+            raise ValueError("DexPilot scaling_factor, pinky_scale, and pinky_palm_scale must be positive")
         if not 0.0 <= self.low_pass_alpha <= 1.0:
             raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
         if self.project_dist_m <= 0 or self.escape_dist_m < self.project_dist_m:
             raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
+        if self.prior_weight < 0:
+            raise ValueError("DexPilot prior_weight must be non-negative")
 
 
 # VR receiver parameters

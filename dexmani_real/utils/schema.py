@@ -203,12 +203,8 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("rgb_shape_c", "<u4"),
         ("depth_shape_h", "<u4"),
         ("depth_shape_w", "<u4"),
-        ("pc_num_points", "<u4"),
-        ("pc_source_point_count", "<u4"),
         ("pc_valid_depth_ratio", "<f4"),
-        ("pc_padding_count", "<u4"),
         ("camera_health", "<u1"),
-        ("pointcloud_valid", "<u1"),
         ("pad", "<u1", (4,)),
     ],
     align=True,
@@ -250,7 +246,6 @@ RECORD_STATUS_DTYPE = np.dtype(
 def make_record_sample_dtype(
     rgb_shape: tuple[int, int, int],
     depth_shape: tuple[int, int],
-    pointcloud_shape: tuple[int, int],
 ) -> np.dtype:
     """Return the fixed recorder sample schema for configured camera shapes."""
     return np.dtype(
@@ -296,7 +291,6 @@ def make_record_sample_dtype(
             ("camera_present", "<u1"),
             ("camera_rgb", "<u1", rgb_shape),
             ("camera_depth", "<u2", depth_shape),
-            ("camera_pointcloud", "<f4", pointcloud_shape),
             # Typed per-grid metadata required to reconstruct recorder input.
             # Legacy HDF5-only defaults stay inside RecorderIO rather than
             # becoming permanent cross-process fields.
@@ -332,9 +326,7 @@ def make_record_sample_dtype(
             ("tactile_source_monotonic_ns", "<u8"),
             ("tactile_calibrated", "<u1"),
             ("tactile_unit_code", "<u1"),
-            ("pointcloud_source_point_count", "<u4"),
             ("pointcloud_valid_depth_ratio", "<f8"),
-            ("pointcloud_padding_count", "<u4"),
             ("flag_ik_ok", "<u1"),
             ("flag_ik_attempted", "<u1"),
             ("flag_retarget_ok", "<u1"),
@@ -343,7 +335,6 @@ def make_record_sample_dtype(
             ("flag_frame_status", "<u1"),
             ("camera_health", "<u1"),
             ("camera_fresh", "<u1"),
-            ("pointcloud_valid", "<u1"),
             ("camera_frame_number", "<u8"),
             ("camera_ring_sequence", "<u8"),
             ("camera_device_timestamp_s", "<f8"),

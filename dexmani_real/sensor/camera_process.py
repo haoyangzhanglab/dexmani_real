@@ -114,10 +114,7 @@ def pack_camera_frame(
     timestamp: float,
     capture_monotonic_s: float,
     frame_id: int,
-    pc_num_points: int = 0,
-    pc_source_point_count: int = 0,
     pc_valid_depth_ratio: float = 0.0,
-    pc_padding_count: int = 0,
     camera_health: int = 0,
     source_monotonic_ns: int = 0,
     camera_generation: int = 0,
@@ -144,9 +141,6 @@ def pack_camera_frame(
         raise ValueError("pc_valid_depth_ratio must be in [0, 1]")
     integers = (
         frame_id,
-        pc_num_points,
-        pc_source_point_count,
-        pc_padding_count,
         source_monotonic_ns,
         camera_generation,
     )
@@ -169,12 +163,8 @@ def pack_camera_frame(
     header["clock_reset"] = np.uint8(clock_reset)
     header["duplicate"] = np.uint8(duplicate)
     header["backlog_s"] = np.float64(backlog_s)
-    header["pc_num_points"] = np.uint32(pc_num_points)
-    header["pc_source_point_count"] = np.uint32(pc_source_point_count)
     header["pc_valid_depth_ratio"] = np.float32(pc_valid_depth_ratio)
-    header["pc_padding_count"] = np.uint32(pc_padding_count)
     header["camera_health"] = np.uint8(camera_health)
-    header["pointcloud_valid"] = np.uint8(pc_num_points > 0)
 
     header["rgb_size"] = np.uint64(rgb_arr.nbytes)
     header["depth_size"] = np.uint64(depth_arr.nbytes)
@@ -282,19 +272,20 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         if cam.K is not None:
             shared.camera_K[:] = cam.K.flatten().tolist()
 
-        # ── Build pointcloud processor (best-effort) ──
-        processor: Any = None  # PointCloudProcessor when enabled
-        # The ring layout is fixed from configuration.  Even when calibration
-        # or the pointcloud processor cannot initialize, publish the configured
-        # zero placeholder so RGB-D remains usable and PC validity stays false.
-        pc_shape: tuple[int, int] = (cfg.pointcloud_num_points, 6)
+        # ── Publish the resolved pointcloud derivation config (best-effort) ──
+        # The point cloud is no longer computed in this loop: it is derived at
+        # the consumption boundary (offline in data_processing, online in the
+        # deployment observation adapter) from the recorded depth.  We still
+        # publish the resolved processor parameters so both derivation sites can
+        # reconstruct an identical point cloud from the same depth/intrinsics/
+        # extrinsics (train/inference distribution consistency).
         try:
             from dexmani_real.config.camera_calib import CameraCalib
-            from dexmani_real.sensor.pointcloud_processor import PointCloudProcessor, PointCloudProcessorConfig
+            from dexmani_real.sensor.pointcloud_processor import PointCloudProcessorConfig
 
             calib = CameraCalib()
             cam_name = calib.resolve_name_by_serial(str(cam.active_serial))
-            T_world_camera = calib.get_extrinsics(cam_name)
+            _t_world_camera = calib.get_extrinsics(cam_name)
             pc_kwargs: dict[str, Any] = {
                 "num_points": cfg.pointcloud_num_points,
                 "desk_plane": cfg.desk_plane,
@@ -304,42 +295,35 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 # z_min rather than the processor's own desk_plane.json auto-load.
                 pc_kwargs["desk_plane_path"] = ""
             pc_config = PointCloudProcessorConfig(**pc_kwargs)
-            processor = PointCloudProcessor(T_world_camera, pc_config)
-            if pc_config.num_points != pc_shape[0]:
-                raise ValueError("pointcloud processor size does not match SharedStorage capacity")
-            _logger.info(
-                "camera_loop: pointcloud enabled, T pos=%s",
-                T_world_camera[:3, 3].round(3).tolist(),
-            )
             _pc_meta = json.dumps(pc_config.to_meta_dict(), separators=(",", ":"))
             shared.camera_pointcloud_config.value = _pc_meta[:2047].ljust(2048, "\x00").encode()
+            _logger.info(
+                "camera_loop: pointcloud derivation config published, T pos=%s",
+                _t_world_camera[:3, 3].round(3).tolist(),
+            )
         except Exception:
-            _logger.warning("camera_loop: pointcloud DISABLED", exc_info=True)
+            _logger.warning("camera_loop: pointcloud derivation config DISABLED", exc_info=True)
             shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
-
-        # Zero pointcloud fallback — used when process() returns None during recording.
-        zero_pc = np.zeros(pc_shape, dtype=np.float32)
 
         # ── Main capture loop ──
         rate_mgr = RateManager(cfg.publish_hz)
         ready_published = False
-        _pointcloud_warmed_up = False
 
         while shared.is_running.value:
-            # Pointcloud is only consumed by RecorderIO, so compute it only when
-            # recording.  Frame publication, by contrast, must continue through
-            # the DISARMED startup phase so Main's preflight health gate
-            # (source_monotonic_ns within max_frame_age_s) sees a recent frame
-            # instead of the single stale ready probe.
-            _needs_pointcloud = bool(shared.is_recording.value)
+            # Publish the raw RGB-D payload during the DISARMED startup phase
+            # (so Main's preflight health gate observes a recent source frame)
+            # and whenever RecorderIO consumes it; otherwise avoid sustained
+            # ~1.6 MB/frame SHM copies.  The point cloud is no longer computed
+            # here — publishing depth immediately keeps the camera observation
+            # fresh (~1 tick instead of ~2).
             _publish_payload = (
                 not ready_published
                 or int(shared.safety_state.value) == int(SafetyState.DISARMED)
-                or _needs_pointcloud
+                or bool(shared.is_recording.value)
             )
             # --- read frame ---
             try:
-                frame = cam.read(timeout_ms=300, compute_depth=processor is not None and _needs_pointcloud)
+                frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
                 # This heartbeat represents worker liveness.  Source freshness
@@ -351,29 +335,9 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 continue
             shared.set_heartbeat("camera", time.monotonic())
 
-            # --- pointcloud (only when a consumer needs it) ---
-            # Pointcloud processing (~46 ms) is the dominant cost in the pipeline.
-            # Computing it every tick — even when no one consumes the data — would
-            # needlessly burn CPU.  Each episode starts without a cross-episode
-            # cache: processing failure is represented by a zero placeholder and
-            # pointcloud_valid=False.
-            pc: np.ndarray | None = None
             # --- write to SharedStorage ring ---
-            # Bridge frames during the DISARMED startup phase (so the preflight
-            # health gate observes a fresh source frame) and whenever RecorderIO
-            # consumes them; otherwise avoid sustained ~1.6 MB/frame SHM copies.
             if _publish_payload:
-                pc_source_point_count = 0
                 pc_valid_depth_ratio = float(np.count_nonzero(frame.depth_raw) / frame.depth_raw.size)
-                pc_padding_count = cfg.pointcloud_num_points
-                if _needs_pointcloud and processor is not None:
-                    try:
-                        pc = processor.process(frame.depth, frame.rgb, cam.get_rays())
-                        pc_source_point_count = processor.last_source_point_count
-                        pc_valid_depth_ratio = processor.last_valid_depth_ratio
-                        pc_padding_count = processor.last_padding_count if pc is not None else cfg.pointcloud_num_points
-                    except Exception:
-                        _logger.warning("camera_loop: pointcloud processing failed", exc_info=True)
                 if frame.clock_reset:
                     camera_health = CameraHealth.CLOCK_RESET
                 elif frame.duplicate:
@@ -391,10 +355,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                         frame.timestamp,
                         frame.capture_monotonic_s,
                         frame.frame_id,
-                        pc_num_points=pc.shape[0] if pc is not None else 0,
-                        pc_source_point_count=pc_source_point_count,
                         pc_valid_depth_ratio=pc_valid_depth_ratio,
-                        pc_padding_count=pc_padding_count,
                         camera_health=int(camera_health),
                         source_monotonic_ns=frame.source_monotonic_ns,
                         camera_generation=frame.camera_generation,
@@ -403,12 +364,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                         duplicate=frame.duplicate,
                         backlog_s=frame.backlog_s,
                     )
-                    shared.camera_ring.write(
-                        header,
-                        rgb,
-                        depth,
-                        pointcloud=pc if pc is not None else zero_pc,
-                    )
+                    shared.camera_ring.write(header, rgb, depth)
                     if not ready_published:
                         ready_published = True
                         shared.set_ready("camera")
@@ -416,26 +372,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                         _logger.info("camera_loop: ready after first verified frame @ %.1f Hz", cfg.publish_hz)
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
-
-            # --- one-time pointcloud warmup (DISARMED) ---
-            # The pointcloud pipeline lazily imports open3d on its first
-            # process() call (~hundreds of ms).  Pay that cost now, while still
-            # DISARMED, so the first recording tick isn't stalled by it and the
-            # episode doesn't open with a run of invalid zero-pointcloud frames.
-            if (
-                processor is not None
-                and ready_published
-                and not _pointcloud_warmed_up
-                and not _needs_pointcloud
-            ):
-                try:
-                    _warm_frame = cam.read(timeout_ms=300, compute_depth=True)
-                    processor.process(_warm_frame.depth, _warm_frame.rgb, cam.get_rays())
-                    _logger.info("camera_loop: pointcloud pipeline warmed up")
-                except Exception:
-                    _logger.warning("camera_loop: pointcloud warmup failed", exc_info=True)
-                finally:
-                    _pointcloud_warmed_up = True
 
             # --- maintain target rate (absolute-deadline scheduling, consistent with other loops) ---
             rate_mgr.wait()

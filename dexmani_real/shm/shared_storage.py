@@ -79,9 +79,6 @@ class SharedStorageConfig:
     camera_depth_shape: tuple[int, int] = field(
         default_factory=lambda: camera.depth_shape
     )
-    camera_pc_shape: tuple[int, int] = field(
-        default_factory=lambda: camera.pointcloud_shape
-    )
 
     arm_action_q_maxsize: int = 2
 
@@ -140,7 +137,6 @@ class SharedStorageConfig:
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
-            camera_pc_shape=(int(cam.pointcloud_num_points), 6),
             control_hz=float(pol.control_hz),
             arm_loop_hz=float(arm_cfg.loop_hz),
             hand_loop_hz=float(hand_cfg.loop_hz),
@@ -355,7 +351,6 @@ class SharedStorage:
             name=f"{prefix}_camera",
             rgb_shape=rgb_shape,
             depth_shape=depth_shape,
-            pc_shape=cfg.camera_pc_shape,
             maxlen=cfg.camera_ring_maxlen,
             create=True,
         )
@@ -391,7 +386,7 @@ class SharedStorage:
         )
         storage.record_sample_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_record_sample",
-            dtype=make_record_sample_dtype(rgb_shape, depth_shape, cfg.camera_pc_shape),
+            dtype=make_record_sample_dtype(rgb_shape, depth_shape),
             maxlen=cfg.record_sample_ring_maxlen,
         )
         storage.record_status_ring = SharedMemoryRingBuffer.create_or_replace(

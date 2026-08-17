@@ -1,15 +1,15 @@
-# DexMani Real v16 → DexMani Sim 标签映射表
+# DexMani Real v17 → DexMani Sim 标签映射表
 
 > **用途：** 面向熟悉 DexMani Sim / DexMani Policy 命名的使用者，说明一个
-> DexMani Real v16 episode 中哪些标签对应 Sim 的 13 个字段，以及哪些同名候选实际上
+> DexMani Real v17 episode 中哪些标签对应 Sim 的 13 个字段，以及哪些同名候选实际上
 > 不等价。
 >
 > **硬约束：** 本文只描述标签和来源关系，不修改任何已录制数值。
 >
-> **事实核查基线：** 2026-08-16；DexMani Sim `fac5e770`、DexMani Policy
-> `8ce8be59`、DexMani Real schema v16 当前工作树。
+> **事实核查基线：** 2026-08-17；DexMani Sim `fac5e770`、DexMani Policy
+> `8ce8be59`、DexMani Real schema v17 当前工作树。
 
-相关完整字典见 [Real v16 与 Sim 统一数据字典](hdf5_episode.md) 和
+相关完整字典见 [Real v17 与 Sim 统一数据字典](hdf5_episode.md) 和
 [Sim HDF5/Zarr 独立说明](sim_hdf5_zarr.md)。
 
 ## 1. 范围与结论
@@ -71,18 +71,20 @@ MP4 解码属于读取 Real 容器，不属于图像数值处理；映射得到�
 
 ## 2. 两端容器
 
-一个 Real v16 episode 是四件套目录：
+一个 Real v17 episode 是三件套目录：
 
 ```text
 episode_.../
 ├── data.h5
 ├── depth.h5          # /depth
-├── pointcloud.h5     # /pointcloud
 └── rgb.mp4
 ```
 
-合法 v16 有 96 个基础 `data.h5` dataset。标准 RecorderIO 还设置
-`/meta.arm_sent_stream=True` 并写第 97 个 `action_arm_joint_sent`。
+合法 v17 有 93 个基础 `data.h5` dataset。标准 RecorderIO 还设置
+`/meta.arm_sent_stream=True` 并写第 94 个 `action_arm_joint_sent`。
+
+点云不再作为 `pointcloud.h5` 侧车存储，而是在消费边界从 `/depth`（配合内参/外参、
+desk-plane 和 `PointCloudProcessor` 配置）确定性地派生，输出 `(2048,6)` `float32`。
 
 标准 Sim HDF5 有 13 个逐帧 dataset；Policy Zarr 使用 `data/<key>` 和
 `meta/episode_ends`。本文逐一以这 13 个 Sim label 为索引，但不会为了凑齐 schema 生成
@@ -102,7 +104,7 @@ episode_.../
 | `rgb` | `(240,320,3)` `uint8` | `EpisodeReader.read_camera_all("rgb")` | **Real-native 候选。** RGB 通道和解码值可原样关联；Real H/W 由 episode 决定，默认通常是 `480×640`。不 resize 时不能声称满足标准 Sim shape。建议保留 `rgb` label，同时声明 `domain=real` 和实际 H/W。 |
 | `depth` | `(240,320)` `uint16`，数值为 mm | `/depth`，并携带 `/meta.depth_scale` | **不等价候选。** Real `uint16` 是设备 raw unit，数值单位由逐 episode `depth_scale` 决定；aligned Z16 也仍携带 source-depth optical Z。原值只能标为 `depth_raw_real`，不能直接改标为标准 Sim `depth`。 |
 | `segmentation` | `(240,320)` `uint8` | 无 | **无来源。** 禁止全零伪造；全零在 Sim 中表示 background，不表示 unknown。 |
-| `point_cloud` | `(1024,6)` `float32`，SAPIEN world XYZRGB | `/pointcloud`，默认 `(2048,6)` `float32` | **Real-native 候选。** 数值可原样关联为 `point_cloud_real_native`；Real 使用 `xarm_base`/当前 producer world、真实滤波和不同点数，不能仅改名后宣称是 Sim-world 点云。 |
+| `point_cloud` | `(1024,6)` `float32`，SAPIEN world XYZRGB | 从 `/depth` 确定性派生（`PointCloudProcessor`），默认 `(2048,6)` `float32` | **Real-native 候选。** 数值可原样关联为 `point_cloud_real_native`；Real 使用 `xarm_base`/当前 producer world、真实滤波和不同点数，不能仅改名后宣称是 Sim-world 点云。 |
 | `camera_intrinsic` | `(9,)` `float32`，逐帧 pinhole K | `/meta.camera_K`，`(9,)` `float64` | **Real-native 候选。** 可登记静态 metadata 来源；若使用 structural view，可 unchanged repeat。它只适用于未修改的 Real pixel viewport，不能声称满足 Sim dtype、分辨率或理想 pinhole 合同。 |
 | `camera_extrinsic` | `(12,)` `float32`，OpenCV world→camera | `/meta.camera_T_world_camera` 或 `/meta.camera_T_eef_camera`，均为 camera→world/EEF `4×4` | **不等价候选。** 方向、基准 frame 和存储 shape 均不同；获得 Sim 语义必须求逆或组合逐帧 EEF pose，已超出标签映射。保留原字段名和方向，禁止直接 rename。 |
 | `joint_state` | `(19,)` `float32`，arm 7 + hand 12，rad | `arm_qpos` `(7,)` + `hand_qpos` `(12,)`，均为 `float64` rad | **值保持结构关系。** `joint_state ↔ [arm_qpos, hand_qpos]`，顺序和单位一致。只允许登记有序 components，或形成不 cast 的 `concat_view`；因此仍不是标准 Sim `float32` array。 |
@@ -143,7 +145,7 @@ action      ↔ [action_arm_joint_sent, action_hand_joint]
 
 | Real 字段 | 原生 frame / 方向 | 不能直接对应的 Sim label |
 |---|---|---|
-| `/pointcloud[...,0:3]` | 当前 producer world，数值等于 `xarm_base` | `point_cloud` 的 SAPIEN-world XYZ |
+| 派生 `point_cloud[...,0:3]` | 当前 producer world，数值等于 `xarm_base` | `point_cloud` 的 SAPIEN-world XYZ |
 | `hand_fingertip` | `xarm_base` | `fingertip_points` 的 SAPIEN-world XYZ |
 | `arm_ee`、`action_arm_ee` | `xarm_base` / 当前 runtime world | Sim world-frame EE pose / `action_ee` |
 | `camera_T_world_camera` | camera→Real world | `camera_extrinsic` 的 Sim world→camera |
@@ -186,7 +188,7 @@ Sim 标准 episode 没有以下逐行字段。它们应保留为 Real provenance
 | observation 总体质量 | `flag_sample_valid`、`flag_observation_valid`、`flag_frame_status` |
 | 动作边界 | `flag_action_queued`、`flag_held`、`flag_ik_ok`、`flag_retarget_ok` |
 | arm/hand 状态 | `arm_connected`、`arm_state_valid`、`hand_connected`、`hand_error_state` |
-| 相机/点云 | `flag_camera_fresh`、`flag_pointcloud_valid`、camera source/receive/publish timestamps |
+| 相机/点云 | `flag_camera_fresh`、`pointcloud_valid_depth_ratio`、camera source/receive/publish timestamps |
 | 触觉 | `tactile_fresh`、`tactile_calibrated`、`hand_tactile_unit_code` |
 | raw action 解释 | reader 的 arm/hand raw-valid masks 及其 metadata expression |
 
@@ -215,7 +217,7 @@ Policy `ReplayBuffer` 只加载 config 请求的 keys，并不要求凑齐 Sim �
 |---|---|---|
 | joint | `joint_state`、`action` | 最可信；存储仍为 Real `float64`，不是标准 Sim dtype |
 | RGB | 上述字段 + 原生 `rgb` | 不 resize；consumer 必须接受实际 H/W |
-| point cloud | 上述字段 + 原生 `/pointcloud` | 保留点数和 `xarm_base`；consumer 必须明确接受 Real-native frame |
+| point cloud | 上述字段 + 从 depth 派生的 `point_cloud` | 保留点数和 `xarm_base`；consumer 必须明确接受 Real-native frame |
 | RGBPC | 不支持标准 Sim 合同 | depth 单位/几何和 camera extrinsic 方向不能只靠改标签解决 |
 | EE action / auxiliary EE | 不支持 | 没有语义正确、数值不变的 Sim `action_ee` 来源 |
 
@@ -232,7 +234,7 @@ fail closed。
 {
   "schema": "dexmani-real-label-map/v1",
   "domain": "real",
-  "source_schema_version": 16,
+  "source_schema_version": 17,
   "mapping_profile": "value_preserving_structural_view",
   "frame_profile": "real_native",
   "frame_compatibility_with_sim_world": false,
@@ -286,7 +288,7 @@ fail closed。
 
 实际 manifest 还应原样记录：
 
-- source episode ID 和四个成员文件 hash；
+- source episode ID 和三个成员文件 hash；
 - source `/meta` snapshot/hash、recorder commit（未知写 `unknown`）；
 - 每个 label 的 source path、operation、shape、dtype、unit、frame 和等价等级；
 - `arm_sent_stream` marker，以及 arm/hand command boundary；
@@ -300,7 +302,7 @@ fail closed。
 
 | 类别 | 必须验证 |
 |---|---|
-| source | 先通过 `EpisodeReader.require_valid()`；四个成员、N 和 sent-stream marker 一致。 |
+| source | 先通过 `EpisodeReader.require_valid()`；三个成员、N 和 sent-stream marker 一致。 |
 | 操作白名单 | 每个关系只能是 `alias/copy/concat_view/reshape_view/repeat_metadata/omit`。 |
 | 数值守恒 | copy 与 source shape/dtype/元素一致；concat 可按 slices 无损拆回 source；reshape 反向恢复后逐元素一致。 |
 | 行守恒 | 所有逐帧关系保持原 N、原行序和原 episode 边界；不删行、不切段、不压紧。 |
@@ -317,10 +319,10 @@ fail closed。
 
 | 合同 | 代码 / 文档来源 |
 |---|---|
-| Real v16 writer/reader/schema | `dexmani_real/recording/episode_recorder.py`、`episode_reader.py`、`episode_schema.py` |
+| Real v17 writer/reader/schema | `dexmani_real/recording/episode_recorder.py`、`episode_reader.py`、`episode_schema.py` |
 | Real sample producer | `dexmani_real/teleop/episode_samples.py`、`teleop/loop.py` |
 | Real arm base-frame FK | `dexmani_real/planning/kinematics.py` |
-| Real camera/pointcloud | `dexmani_real/sensor/realsense.py`、`sensor/camera_process.py` |
+| Real camera/pointcloud（派生） | `dexmani_real/sensor/realsense.py`、`sensor/camera_process.py`、`sensor/pointcloud_processor.py` |
 | Sim 13 fields | sibling `dexmani_sim/mimic_gen/utils/env_recorder.py`、`envs/base_env.py` |
 | Sim root/world FK | sibling `dexmani_sim/envs/base_env.py`、`robots/xarm7_xhand.py` |
 | Sim camera/contact/hand cloud | sibling `dexmani_sim/sensors/camera.py`、`contact.py`、`imagine_point_cloud.py` |

@@ -1,8 +1,8 @@
-"""VR-to-XHand retargeting via dex_retargeting + adaptive finger scaling.
+"""VR-to-XHand retargeting: TAG (in-repo NLopt) and DexPilot (dex_retargeting).
 
-One landmark-space adaptation compensates human-robot kinematic mismatch:
-``adaptive_retargeting_xhand`` scales the pinky chain (MCP→PIP→DIP→TIP) by
-extension state.
+One landmark-space adaptation compensates the human-robot kinematic mismatch:
+``adaptive_retargeting_xhand`` scales the pinky chain (MCP→PIP→DIP→TIP) by a
+constant per-backend ``pinky_scale`` (plus an optional palm-baseline offset).
 """
 
 from __future__ import annotations
@@ -41,13 +41,13 @@ _PINKY_PIP = 18
 _PINKY_DIP = 19
 _PINKY_TIP = 20
 
-# Pinky adaptive scaling — 1:1 match with LeFranX reference values.
+# Pinky scale.  Production injects the recalibrated per-backend ``pinky_scale``
+# (see config defaults); this fallback matches the DexPilot default so a no-config
+# ``XHandRetargeter`` stays stable.  The original LeFranX extension-dependent
+# interpolation (a 1.2→2.2 range keyed on the pinky extension ratio) is removed.
 # Ref: LeFranX vr_hand_detector_adapter.py:27-84
 
-_PINKY_MIN_EXTENSION = 0.03  # fully curled pinky MCP→TIP distance
-_PINKY_MAX_EXTENSION = 0.10  # fully extended pinky MCP→TIP distance
-_PINKY_BASE_SCALE = 1.2  # minimum scaling for curled state
-_PINKY_MAX_SCALE = 2.2  # maximum scaling for extended state
+_PINKY_SCALE_FALLBACK = 1.15
 
 _CONTIGUOUS_BONES = tuple(
     (parent, child)
@@ -60,6 +60,68 @@ _CONTIGUOUS_BONES = tuple(
     )
     for parent, child in zip(chain, chain[1:])
 )
+
+_FINGER_CHAINS = (
+    (0, 1, 2, 3, 4),
+    (0, 5, 6, 7, 8),
+    (0, 9, 10, 11, 12),
+    (0, 13, 14, 15, 16),
+    (0, 17, 18, 19, 20),
+)
+
+# Human-flexion → robot-joint mapping (feature_index → SDK joint index).  Mirrors
+# hand_retarget_eval._FLEXION_FEATURE_JOINT_PAIRS: the human CMC/MCP/PIP+DIP
+# flexion angles map onto the robot flexion joints.  thumb_rota1 and index_bend
+# have no landmark-flexion mapping and are excluded from the prior.
+_HUMAN_FLEXION_JOINT_PAIRS = (
+    (0, 0), (1, 2),  # thumb CMC→bend, MCP+IP→rota2
+    (2, 4), (3, 5),  # index MCP→j1, PIP+DIP→j2
+    (4, 6), (5, 7),  # middle
+    (6, 8), (7, 9),  # ring
+    (8, 10), (9, 11),  # pinky
+)
+_SDK_FLEXION_MASK = np.zeros(12, dtype=np.float64)
+for _feature_index, _sdk_index in _HUMAN_FLEXION_JOINT_PAIRS:
+    _SDK_FLEXION_MASK[_sdk_index] = 1.0
+
+
+def _human_flexion_rad(landmarks: np.ndarray) -> np.ndarray:
+    """Human flexion reference (10,) from one (21, 3) landmark frame.
+
+    Rotation-invariant per-finger angles: thumb CMC + MCP+IP, then per finger
+    (index/mid/ring/pinky) MCP + PIP+DIP — the same feature order as
+    ``_HUMAN_FLEXION_JOINT_PAIRS`` and ``hand_retarget_eval.extract_hand_features``.
+    """
+    pts = np.asarray(landmarks, dtype=np.float64)
+    if pts.shape != (21, 3):
+        raise ValueError(f"landmarks must have shape (21, 3), got {pts.shape}")
+    flex = np.empty(10, dtype=np.float64)
+    for finger_index, chain in enumerate(_FINGER_CHAINS):
+        bones = [pts[chain[index + 1]] - pts[chain[index]] for index in range(4)]
+        ang = np.empty(3, dtype=np.float64)
+        for joint_index, (first, second) in enumerate(zip(bones, bones[1:])):
+            denominator = np.linalg.norm(first) * np.linalg.norm(second)
+            if denominator <= 1e-12:
+                raise ValueError("landmarks contain a degenerate hand bone")
+            ang[joint_index] = np.arccos(np.clip(np.sum(first * second) / denominator, -1.0, 1.0))
+        if finger_index == 0:
+            flex[0] = ang[0]
+            flex[1] = ang[1] + ang[2]
+        else:
+            base = 2 * finger_index
+            flex[base] = ang[0]
+            flex[base + 1] = ang[1] + ang[2]
+    return flex
+
+
+def _human_flexion_sdk_reference(landmarks: np.ndarray) -> np.ndarray:
+    """(12,) SDK-order prior reference: human flexion at the 10 flexion joints, 0 elsewhere."""
+    flex = _human_flexion_rad(landmarks)
+    reference = np.zeros(12, dtype=np.float64)
+    for feature_index, sdk_index in _HUMAN_FLEXION_JOINT_PAIRS:
+        reference[sdk_index] = flex[feature_index]
+    return reference
+
 
 # Operator→MANO coordinate transform (right hand).
 # det = +1: this is a proper rotation.  Unity left-handed → FLU chirality conversion
@@ -146,12 +208,20 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     return np.stack([x, normal, z], axis=1)
 
 
-def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
-    """Apply adaptive pinky scaling for XHand robot (LeFranX approach).
+def adaptive_retargeting_xhand(
+    landmarks: np.ndarray,
+    *,
+    scale: float = _PINKY_SCALE_FALLBACK,
+    palm_scale: float = 1.0,
+) -> np.ndarray:
+    """Apply constant pinky-chain scaling for the XHand (LeFranX-derived).
 
-    Compensates for human-to-robot finger length differences by adaptively
-    scaling pinky chain segments based on finger extension state.
-    Scales more when extended (for reaching), less when curled (for fist-making).
+    Compensates the human-to-robot finger length mismatch by scaling the pinky
+    chain (MCP→PIP→DIP→TIP) by ``scale`` and, when ``palm_scale != 1.0``, the
+    pinky wrist→MCP baseline independently.  The original LeFranX
+    extension-dependent interpolation (a 1.2→2.2 range keyed on the pinky
+    extension ratio) has been superseded by a constant per-backend
+    ``pinky_scale``; ``scale`` is applied uniformly.
 
     Operates on MANO-space landmarks — modifies pinky PIP/DIP/TIP positions
     in-place on a copy. The scaled landmarks are then used directly by the
@@ -161,6 +231,12 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
 
     Args:
         landmarks: (21, 3) array in MANO coordinate space.
+        scale: Pinky-chain scale.  The backends inject their resolved
+            ``pinky_scale`` (a constant); the module constant is only the
+            no-config fallback.
+        palm_scale: Scale on the pinky wrist→MCP baseline (1.0 = no-op).  The
+            backends inject their resolved ``pinky_palm_scale``; the module
+            fallback is 1.0.
 
     Returns:
         (21, 3) array with pinky chain scaled (new copy, input unchanged).
@@ -173,29 +249,25 @@ def adaptive_retargeting_xhand(landmarks: np.ndarray) -> np.ndarray:
     # is not a kinematic scaling of the original pinky.
     raw = landmarks.copy()
 
-    # Finger extension: distance from MCP to TIP
-    pinky_extension = float(np.linalg.norm(landmarks[_PINKY_TIP] - landmarks[_PINKY_MCP]))
+    # Palm offset: scale the wrist→MCP baseline independently of the finger chain.
+    # The robot pinky MCP is proportionally farther from the wrist than the human's
+    # (URDF pinky_joint1 origin ≈0.1085 m vs human ≈0.0865 m ≈ 1.25×), which the
+    # distal-only scale cannot express.  Moving the MCP landmark radially from the
+    # wrist lengthens the wrist→tip reference so the solver need not over-flex the
+    # MCP to shorten reach.  palm_scale == 1.0 is a no-op.
+    if palm_scale != 1.0:
+        landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
 
-    # Normalize extension ratio (0.0 = fully curled, 1.0 = fully extended)
-    extension_ratio = np.clip(
-        (pinky_extension - _PINKY_MIN_EXTENSION) / (_PINKY_MAX_EXTENSION - _PINKY_MIN_EXTENSION),
-        0.0,
-        1.0,
-    )
-
-    # Adaptive scaling: more when extended, less when curled
-    adaptive_scale = _PINKY_BASE_SCALE + (_PINKY_MAX_SCALE - _PINKY_BASE_SCALE) * extension_ratio
-
-    # Apply progressive scaling along the kinematic chain (MCP→PIP→DIP→TIP).
+    # Apply uniform scaling along the kinematic chain (MCP→PIP→DIP→TIP).
     # Each segment is extended from the (possibly modified) parent joint.
     mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
-    landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * adaptive_scale
+    landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * scale
 
     pip_to_dip = raw[_PINKY_DIP] - raw[_PINKY_PIP]
-    landmarks[_PINKY_DIP] = landmarks[_PINKY_PIP] + pip_to_dip * adaptive_scale
+    landmarks[_PINKY_DIP] = landmarks[_PINKY_PIP] + pip_to_dip * scale
 
     dip_to_tip = raw[_PINKY_TIP] - raw[_PINKY_DIP]
-    landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * adaptive_scale
+    landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * scale
 
     return landmarks
 
@@ -214,6 +286,12 @@ class XHandRetargeter:
         self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
         self.debug_adapters = bool(debug_adapters)
         self._dexpilot_config = dexpilot_config
+        if dexpilot_config is not None:
+            self._pinky_scale = float(dexpilot_config.pinky_scale)
+            self._pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
+        else:
+            self._pinky_scale = _PINKY_SCALE_FALLBACK
+            self._pinky_palm_scale = 1.0
         self.last_debug: dict[str, float | str] = {}
 
         # Every returned qpos follows the cross-process SDK order owned by
@@ -227,6 +305,8 @@ class XHandRetargeter:
         # not load dex-retargeting, its native dependencies, or model assets.
         import yaml
         from dex_retargeting.retargeting_config import RetargetingConfig
+
+        from dexmani_real.teleop.dexpilot_prior import build_dexpilot_retargeting
 
         config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
 
@@ -251,9 +331,16 @@ class XHandRetargeter:
                 escape_dist=float(self._dexpilot_config.escape_dist_m),
             )
 
-        # Standard build (same path as LeFranX)
+        self._prior_weight = float(self._dexpilot_config.prior_weight) if self._dexpilot_config is not None else 0.0
+        prior_mask = _SDK_FLEXION_MASK  # target order == SDK order
+
+        # Build with the human-flexion prior (in-repo subclass; same path as LeFranX)
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
-        self.retargeter = RetargetingConfig.from_dict(cfg).build()
+        self.retargeter = build_dexpilot_retargeting(
+            RetargetingConfig.from_dict(cfg),
+            prior_weight=self._prior_weight,
+            prior_mask=prior_mask,
+        )
 
         self.indices = self.retargeter.optimizer.target_link_human_indices
 
@@ -279,16 +366,17 @@ class XHandRetargeter:
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
         """Build reference value from hand landmarks for retargeting.
 
-        Applies adaptive_retargeting_xhand (LeFranX pinky chain scaling)
-        before computing origin→task difference vectors.
+        Applies adaptive_retargeting_xhand (pinky chain scaling) before
+        computing origin→task difference vectors.
         """
-        if self.retargeting_type == "position":
-            return hand_joint_pos[self.indices, :]
-
-        # LeFranX: scale pinky chain on landmarks before computing ref vectors.
-        # This directly modifies PIP/DIP/TIP positions along the MCP→TIP chain,
+        # Scale the pinky chain on landmarks before computing ref vectors.  This
+        # directly modifies PIP/DIP/TIP positions along the MCP→TIP chain,
         # compensating for human-robot finger length differences.
-        scaled_landmarks = adaptive_retargeting_xhand(hand_joint_pos)
+        scaled_landmarks = adaptive_retargeting_xhand(
+            hand_joint_pos,
+            scale=self._pinky_scale,
+            palm_scale=self._pinky_palm_scale,
+        )
 
         origin_indices = self.indices[0, :]
         task_indices = self.indices[1, :]
@@ -319,6 +407,10 @@ class XHandRetargeter:
             return None
 
         start_time = time.time()
+
+        # Human-flexion prior reference (before pinky scaling).
+        if self._prior_weight > 0:
+            self.retargeter.optimizer.set_prior_reference(_human_flexion_sdk_reference(mano_landmarks))
 
         ref_value = self._build_ref_value(mano_landmarks)
         qpos = self.retargeter.retarget(ref_value, fixed_qpos=self.fixed_joint_values)
@@ -488,11 +580,16 @@ class TAGHandRetargeter:
             pinch_skip_threshold=tag_cfg.pinch_skip_threshold,
             reg_stage1_weight=tag_cfg.reg_stage1_weight,
             reg_last_weight=tag_cfg.reg_last_weight,
+            prior_weight=tag_cfg.prior_weight,
+            prior_mask=_SDK_FLEXION_MASK[self._mapping_sdk_to_model],
         )
 
         # ── Pre-computed transforms (avoid per-frame allocation) ──
         self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
         # MANO and URDF both use +Z for finger extension.
+        self._pinky_scale = float(tag_cfg.pinky_scale)
+        self._pinky_palm_scale = float(tag_cfg.pinky_palm_scale)
+        self._prior_weight = float(tag_cfg.prior_weight)
 
         # ── State & debug ──
         self._last_raw_qpos: np.ndarray | None = None
@@ -528,17 +625,27 @@ class TAGHandRetargeter:
             logger.warning("TAGHandRetargeter: coordinate transform failed — holding position")
             return None
 
-        # 2. Adaptive pinky chain scaling (reuse existing)
-        mano = adaptive_retargeting_xhand(mano)
+        # 2. Human-flexion prior reference (before pinky scaling — the
+        #    reference is the operator's actual flexion, not the robot-scaled chain)
+        q_prior_model = None
+        if self._prior_weight > 0:
+            q_prior_model = _human_flexion_sdk_reference(mano)[self._mapping_sdk_to_model]
 
-        # 3. Extract 5 fingertip positions → wrist-centered → rotate to URDF frame
+        # 3. Pinky chain scaling (reuse existing)
+        mano = adaptive_retargeting_xhand(
+            mano,
+            scale=self._pinky_scale,
+            palm_scale=self._pinky_palm_scale,
+        )
+
+        # 4. Extract 5 fingertip positions → wrist-centered → rotate to URDF frame
         tips = mano[_FINGERTIP_INDICES].copy()  # (5, 3) in MANO frame
         tips -= mano[0]  # center at wrist
         tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
 
-        # 4. Two-stage NLopt optimization
+        # 5. Two-stage NLopt optimization
         try:
-            qpos_model = self._optimizer.solve(tips_urdf)  # (12,) in Pinocchio model order
+            qpos_model = self._optimizer.solve(tips_urdf, q_prior=q_prior_model)  # (12,) in Pinocchio model order
         except Exception:
             logger.warning("TAGHandRetargeter: optimizer.solve() crashed — holding position", exc_info=True)
             return None

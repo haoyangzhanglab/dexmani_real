@@ -39,14 +39,30 @@ _TIP_INDICES = (4, 8, 12, 16, 20)
 _TIP_PAIRS = tuple(
     (first, second) for first in range(5) for second in range(first + 1, 5)
 )
-# Human flexion mapped to the robot flexion joints.  Index/mid/ring/pinky:
-# human MCP → j1, human PIP+DIP → j2.  Thumb: human CMC → thumb_bend,
-# human MCP+IP → thumb_rota2 (the IP joint is fixed, so rota2 carries both).
-# thumb_rota1 (CMC opposition rotation) has no landmark-flexion mapping and is
-# scored only through fingertip geometry.
-_FLEXION_JOINT_INDICES = (0, 2, 4, 5, 6, 7, 8, 9, 10, 11)
-_FLEXION_JOINT_NAMES = tuple(
-    XHAND_SDK_JOINT_NAMES[index] for index in _FLEXION_JOINT_INDICES
+# (feature_index, joint_index) pairs mapping flexion_features_rad columns to the
+# robot flexion joints.  Column order: thumb CMC, thumb MCP+IP, then for
+# index/mid/ring/pinky (human MCP, human PIP+DIP) each.  Index/mid/ring/pinky:
+# human MCP → j1, PIP+DIP → j2.  Thumb: human CMC → thumb_bend, human MCP+IP →
+# thumb_rota2 (the IP joint is fixed, so rota2 carries both).  thumb_rota1 (CMC
+# opposition rotation) has no landmark-flexion mapping and is scored only through
+# fingertip geometry.
+_FLEXION_FEATURE_JOINT_PAIRS = (
+    (0, 0), (1, 2),  # thumb: CMC→bend, MCP+IP→rota2
+    (2, 4), (3, 5),  # index: MCP→j1, PIP+DIP→j2
+    (4, 6), (5, 7),  # middle
+    (6, 8), (7, 9),  # ring
+    (8, 10), (9, 11),  # pinky
+)
+# Finger flexion is the primary tracking metric (the original 8-joint gate); the
+# thumb is scored separately because its rho is structurally low (opposition /
+# rota1 null-space) and would otherwise confound the finger mean.
+_FINGER_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[2:]
+_THUMB_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[:2]
+_FINGER_JOINT_NAMES = tuple(
+    XHAND_SDK_JOINT_NAMES[joint_index] for _, joint_index in _FINGER_FEATURE_JOINT_PAIRS
+)
+_THUMB_JOINT_NAMES = tuple(
+    XHAND_SDK_JOINT_NAMES[joint_index] for _, joint_index in _THUMB_FEATURE_JOINT_PAIRS
 )
 
 # Finger-flexion joints only (no thumb/abduction) — the subset that receives the
@@ -104,6 +120,8 @@ class RetargetMetrics:
     min_best_flexion_rho: float
     best_lag_frames_by_joint: dict[str, int]
     best_flexion_rho_by_joint: dict[str, float]
+    thumb_flexion_rho: float
+    thumb_flexion_rho_by_joint: dict[str, float]
     flexion_bias_deg_by_joint: dict[str, float]
     mean_abs_flexion_bias_deg: float
     fingertip_distance_mean_rho: float
@@ -254,8 +272,11 @@ def run_tag(
         data,
         {
             "smooth_weight": float(config.smooth_weight),
+            "pinky_scale": float(config.pinky_scale),
+            "pinky_palm_scale": float(config.pinky_palm_scale),
             "pinch_start_dist_m": float(config.pinch_start_dist_m),
             "pinch_full_dist_m": float(config.pinch_full_dist_m),
+            "prior_weight": float(config.prior_weight),
         },
     )
 
@@ -273,9 +294,12 @@ def run_dexpilot(
         data,
         {
             "scaling_factor": float(config.scaling_factor),
+            "pinky_scale": float(config.pinky_scale),
+            "pinky_palm_scale": float(config.pinky_palm_scale),
             "low_pass_alpha": float(config.low_pass_alpha),
             "project_dist_m": float(config.project_dist_m),
             "escape_dist_m": float(config.escape_dist_m),
+            "prior_weight": float(config.prior_weight),
         },
     )
 
@@ -375,26 +399,32 @@ def evaluate_run(
 
     best_lags: list[int] = []
     best_rhos: list[float] = []
+    thumb_rhos: list[float] = []
     flexion_bias_deg: dict[str, float] = {}
-    for feature_index, joint_index in enumerate(_FLEXION_JOINT_INDICES):
+    for feature_index, joint_index in _FLEXION_FEATURE_JOINT_PAIRS:
         lag, rho = _best_nonnegative_lag(
             features.flexion_features_rad[:, feature_index],
             qpos[:, joint_index],
             start=startup_skip_frames,
             max_lag=max_lag_frames,
         )
-        best_lags.append(lag)
-        best_rhos.append(rho)
+        if (feature_index, joint_index) in _FINGER_FEATURE_JOINT_PAIRS:
+            best_lags.append(lag)
+            best_rhos.append(rho)
+        else:
+            thumb_rhos.append(rho)
+        name = XHAND_SDK_JOINT_NAMES[joint_index]
         reference = features.flexion_features_rad[:, feature_index]
         response = qpos[:, joint_index]
         stop = len(reference) - lag
         bias_rad = float(
             np.mean(response[startup_skip_frames + lag:] - reference[startup_skip_frames:stop])
         )
-        flexion_bias_deg[_FLEXION_JOINT_NAMES[feature_index]] = float(np.rad2deg(bias_rad))
+        flexion_bias_deg[name] = float(np.rad2deg(bias_rad))
     mean_abs_flexion_bias_deg = float(
         np.mean(np.abs(np.asarray(list(flexion_bias_deg.values()), dtype=np.float64)))
     )
+    thumb_flexion_rho = float(np.mean(thumb_rhos))
 
     kinematics = kinematics or HandKinematics(
         _HAND_URDF_PATH, list(hand.fingertip_link_names)
@@ -458,8 +488,10 @@ def evaluate_run(
         max_best_lag_frames=int(np.max(best_lags)),
         mean_best_flexion_rho=float(np.mean(best_rhos)),
         min_best_flexion_rho=float(np.min(best_rhos)),
-        best_lag_frames_by_joint=dict(zip(_FLEXION_JOINT_NAMES, best_lags)),
-        best_flexion_rho_by_joint=dict(zip(_FLEXION_JOINT_NAMES, best_rhos)),
+        best_lag_frames_by_joint=dict(zip(_FINGER_JOINT_NAMES, best_lags)),
+        best_flexion_rho_by_joint=dict(zip(_FINGER_JOINT_NAMES, best_rhos)),
+        thumb_flexion_rho=thumb_flexion_rho,
+        thumb_flexion_rho_by_joint=dict(zip(_THUMB_JOINT_NAMES, thumb_rhos)),
         flexion_bias_deg_by_joint=flexion_bias_deg,
         mean_abs_flexion_bias_deg=mean_abs_flexion_bias_deg,
         fingertip_distance_mean_rho=float(np.mean(pair_rhos)),

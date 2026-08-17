@@ -144,26 +144,23 @@ def read_camera_frame_causal(
                 if 0 < source_ns <= receive_ns <= publish_ns <= int(anchor_monotonic_ns):
                     payload = shared.camera_ring.read_sequence(
                         int(sequence),
-                        modalities=("rgb", "depth", "pointcloud"),
+                        modalities=("rgb", "depth"),
                     )
                     if payload is not None:
                         result = (
                             header,
                             payload["rgb"],
                             payload["depth"],
-                            payload["pointcloud"],
                             int(sequence),
                         )
                         break
         if result is not None:
-            header, rgb, depth, pointcloud, ring_sequence = result
+            header, rgb, depth, ring_sequence = result
             rec = header[0]
-            pointcloud_valid = bool(rec["pointcloud_valid"]) and int(rec["pc_num_points"]) > 0
             return {
                 "header": header,
                 "rgb": rgb,
                 "depth": depth,
-                "pointcloud": pointcloud,
                 "ring_sequence": ring_sequence,
                 "frame_number": int(rec["frame_number"]),
                 "device_timestamp_s": float(rec["timestamp"]),
@@ -177,11 +174,7 @@ def read_camera_frame_causal(
                 "frame_gap": int(rec["frame_gap"]),
                 "backlog_s": float(rec["backlog_s"]),
                 "camera_health": int(rec["camera_health"]),
-                "pointcloud_valid": pointcloud_valid,
-                "pc_num_points": int(rec["pc_num_points"]),
-                "pointcloud_source_point_count": int(rec["pc_source_point_count"]),
                 "valid_depth_ratio": float(rec["pc_valid_depth_ratio"]),
-                "pointcloud_padding_count": int(rec["pc_padding_count"]),
             }
     except Exception:
         logger.warning("causal_reader: camera ring read failed", exc_info=True)

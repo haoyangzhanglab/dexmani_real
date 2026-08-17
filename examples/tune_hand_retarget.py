@@ -42,7 +42,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Offline TAG/DexPilot retarget evaluation"
     )
-    parser.add_argument("episode", type=Path, help="Schema-v16 episode directory")
+    parser.add_argument("episode", type=Path, help="Schema-v17 episode directory")
     parser.add_argument(
         "--search",
         action="store_true",

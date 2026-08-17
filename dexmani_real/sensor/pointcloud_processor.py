@@ -17,7 +17,7 @@ the config in the parent process stays lightweight.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 __all__ = ["PointCloudProcessor", "PointCloudProcessorConfig"]
 
@@ -63,20 +63,16 @@ class PointCloudProcessorConfig:
     dbscan_eps: float = 0.015  # 3× voxel_size; catches sparse noise clusters
     dbscan_min_points: int = 5  # core-point threshold for DBSCAN
     dbscan_min_cluster_size: int = 25  # drop clusters + noise < 25 points
-    # The open3d pipeline (voxel → dbscan → radius → stat → FPS) is O(N); limiting input to
-    # a fixed ceiling keeps point-cloud latency predictable regardless of scene
-    # complexity. 6 000 is enough for a dense 5 mm grid across the workspace
-    # while bounding worst-case open3d cost.
-    max_open3d_input: int = 6000
     # "o3d": open3d CPU farthest_point_down_sample (~6.6 ms @ 5.3k -> 2048,
     # colors preserved — verified on open3d 0.19). "pytorch3d": GPU
     # sample_farthest_points (~9 ms, B=1 underutilizes the GPU); only safe in
     # camera_loop if the parent never initialized CUDA pre-fork.
     fps_backend: Literal["o3d", "pytorch3d"] = "o3d"
     # Pre-FPS hybrid sampling: when post-radius points exceed this threshold,
-    # use uniform random sampling instead of FPS.  FPS preferentially selects
-    # extreme outlier (noise) points; random sampling provides adequate spatial
-    # coverage without noise amplification when the point cloud is already dense.
+    # use deterministic uniform strided sampling instead of FPS.  FPS
+    # preferentially selects extreme outlier (noise) points; strided sampling
+    # provides adequate spatial coverage without noise amplification when the
+    # point cloud is already dense.
     # 0 = disabled (always use FPS).  Set to ~3000 to enable — covers the common
     # case (post-voxel 3000-6000 points, ~95 % of frames) and saves ~5 ms.
     hybrid_fps_threshold: int = 0
@@ -149,20 +145,74 @@ class PointCloudProcessorConfig:
         d["pc_desk_plane_path"] = str(self.desk_plane_path)
         return d
 
+    @classmethod
+    def from_meta_dict(cls, meta: Mapping[str, Any]) -> "PointCloudProcessorConfig":
+        """Reconstruct a config from its :meth:`to_meta_dict` snapshot.
+
+        Missing keys fall back to the dataclass defaults, so historical
+        episodes that predate a field still derive a valid (if slightly
+        different) point cloud.  ``desk_plane``/``fps_backend`` are special:
+        absent ``pc_desk_plane`` means ``None`` (auto-load), and ``fps_backend``
+        is a plain string literal.
+        """
+
+        def _float(key: str, default: float) -> float:
+            value = meta.get(key, default)
+            return float(value) if value is not None else default
+
+        def _int(key: str, default: int) -> int:
+            return int(meta.get(key, default))
+
+        def _tuple(key: str, default: tuple[float, ...]) -> tuple[float, ...]:
+            value = meta.get(key, default)
+            return tuple(float(v) for v in value) if value is not None else default
+
+        desk_plane = meta.get("pc_desk_plane")
+        if desk_plane is not None:
+            desk_plane = tuple(float(v) for v in desk_plane)
+
+        return cls(
+            num_points=_int("pc_num_points", 2048),
+            depth_min_m=_float("pc_depth_min_m", 0.3),
+            depth_max_m=_float("pc_depth_max_m", 1.5),
+            workspace=_tuple("pc_workspace", (0.25, -0.6, 0.005, 0.85, 0.6, 0.8)),
+            voxel_size=_float("pc_voxel_size", 0.005),
+            radius_outlier_min_points=_int("pc_radius_outlier_min_points", 0),
+            radius_outlier_radius=_float("pc_radius_outlier_radius", 0.01),
+            stat_outlier_nb_neighbors=_int("pc_stat_outlier_nb_neighbors", 0),
+            stat_outlier_std_ratio=_float("pc_stat_outlier_std_ratio", 1.0),
+            dbscan_eps=_float("pc_dbscan_eps", 0.015),
+            dbscan_min_points=_int("pc_dbscan_min_points", 5),
+            dbscan_min_cluster_size=_int("pc_dbscan_min_cluster_size", 25),
+            fps_backend=str(meta.get("pc_fps_backend", "o3d")),
+            hybrid_fps_threshold=_int("pc_hybrid_fps_threshold", 0),
+            depth_edge_threshold_m=_float("pc_depth_edge_threshold_m", 0.030),
+            depth_edge_dilate_px=_int("pc_depth_edge_dilate_px", 1),
+            depth_edge_relative_ratio=_float("pc_depth_edge_relative_ratio", 0.02),
+            depth_median_enabled=bool(meta.get("pc_depth_median_enabled", True)),
+            speckle_min_pixels=_int("pc_speckle_min_pixels", 5),
+            desk_plane=desk_plane,
+            desk_clearance_m=_float("pc_desk_clearance_m", 0.008),
+            desk_plane_path=str(meta.get("pc_desk_plane_path", "dexmani_real/config/desk_plane.json")),
+        )
+
 
 class PointCloudProcessor:
-    """Stateless-per-frame processor; extrinsics and RNG precomputed once."""
+    """Stateless-per-frame processor; extrinsics precomputed once."""
 
     _timing_log_every: int = 16
 
-    def __init__(self, T_world_camera: np.ndarray, config: PointCloudProcessorConfig | None = None) -> None:
+    def __init__(
+        self,
+        T_world_camera: np.ndarray,
+        config: PointCloudProcessorConfig | None = None,
+    ) -> None:
         T = np.asarray(T_world_camera, dtype=np.float64)
         if T.shape != (4, 4) or not np.allclose(T[3], [0.0, 0.0, 0.0, 1.0]):
             raise ValueError(f"T_world_camera must be a (4,4) homogeneous transform, got shape {T.shape}.")
         self.config = config or PointCloudProcessorConfig()
         self._R = T[:3, :3]
         self._t = T[:3, 3]
-        self._rng = np.random.default_rng()
         # Auto-load desk plane from persisted JSON if not explicitly provided.
         self._desk_plane: tuple[float, float, float, float] | None = self.config.desk_plane
         if self._desk_plane is None and self.config.desk_plane_path:
@@ -318,15 +368,6 @@ class PointCloudProcessor:
             return None
         cols = cols[crop]
 
-        # Cap open3d input so the pipeline stays fast regardless of scene
-        # complexity.  Uniform random subsample preserves spatial coverage
-        # without bias; the subsequent voxel grid + FPS are the definitive
-        # quality gates.
-        if pts.shape[0] > cfg.max_open3d_input:
-            idx = self._rng.choice(pts.shape[0], cfg.max_open3d_input, replace=False)
-            pts = pts[idx]
-            cols = cols[idx]
-
         import open3d as o3d  # lazy: keep parent-process imports light
 
         n_in = pts.shape[0]
@@ -387,17 +428,18 @@ class PointCloudProcessor:
 
         _t_stat_end = _time.monotonic()
 
-        # Fixed-size output: FPS when enough points, random duplicate pad otherwise.
-        # Pre-FPS hybrid: when the point cloud is already dense enough (post-radius
-        # points > hybrid_fps_threshold), uniform random sampling provides adequate
-        # spatial coverage without FPS's noise amplification bias.  Falls back to
-        # FPS when sparse or when hybrid_fps_threshold is 0 (disabled).
+        # Fixed-size output: FPS when enough points, deterministic cyclic pad
+        # otherwise.  Pre-FPS hybrid: when the point cloud is already dense
+        # enough (post-radius points > hybrid_fps_threshold), deterministic
+        # strided sampling provides adequate spatial coverage without FPS's
+        # noise amplification bias.  Falls back to FPS when sparse or when
+        # hybrid_fps_threshold is 0 (disabled).
         n = len(pcd.points)
         self.last_source_point_count = int(n)
         self.last_padding_count = max(0, int(cfg.num_points - n))
         if n >= cfg.num_points:
             if cfg.hybrid_fps_threshold > 0 and n > cfg.hybrid_fps_threshold:
-                idx = self._rng.choice(n, cfg.num_points, replace=False)
+                idx = np.linspace(0, n - 1, cfg.num_points).round().astype(np.int64)
                 pts_out = np.asarray(pcd.points)[idx]
                 cols_out = np.asarray(pcd.colors)[idx]
             elif cfg.fps_backend == "pytorch3d":
@@ -407,8 +449,7 @@ class PointCloudProcessor:
                 pts_out = np.asarray(pcd.points)
                 cols_out = np.asarray(pcd.colors)
         else:
-            pad = self._rng.integers(0, n, cfg.num_points - n)
-            idx = np.concatenate([np.arange(n), pad])
+            idx = np.resize(np.arange(n, dtype=np.int64), cfg.num_points)
             pts_out = np.asarray(pcd.points)[idx]
             cols_out = np.asarray(pcd.colors)[idx]
 
