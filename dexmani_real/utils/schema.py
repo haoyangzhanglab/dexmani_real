@@ -129,6 +129,9 @@ HAND_STATE_DTYPE = np.dtype(
         ("qpos", "<f8", HAND_JOINT_SHAPE),
         ("current", "<f8", HAND_JOINT_SHAPE),
         ("tactile_sum", "<f8", HAND_TACTILE_SUM_SHAPE),
+        # Combined tactile values are zero-filled on read failure; this bit
+        # distinguishes an invalid sample from a valid zero-contact sample.
+        ("tactile_sum_valid", "<u1"),
         ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
         ("error_state", "<u1"),
         ("connected", "<u1"),

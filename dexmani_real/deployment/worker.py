@@ -33,7 +33,11 @@ from dexmani_real.deployment.metrics import (
     Metrics,
     flush_every,
 )
-from dexmani_real.deployment.observation import FrameWindow, ObservationBatch
+from dexmani_real.deployment.observation import (
+    FrameWindow,
+    ObservationBatch,
+    parse_observation_fields,
+)
 from dexmani_real.shm.shared_storage import SharedStorage, new_frame
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS, POLICY_PLAN_DTYPE
@@ -93,6 +97,7 @@ def _read_state_history(
     horizon: int,
     anchor_ns: int,
     values_field: str,
+    required_true_fields: tuple[str, ...] = (),
 ) -> FrameWindow | None:
     """Read the causal (source <= publish <= anchor) state frames, oldest-first."""
     try:
@@ -107,6 +112,8 @@ def _read_state_history(
     publishes: list[int] = []
     for data, ring_publish_ns, sequence in history:
         names = data.dtype.names or ()
+        if any(field not in names or not bool(data[field][0]) for field in required_true_fields):
+            continue
         source_ns = int(data["source_monotonic_ns"][0])
         publish_ns = (
             int(data["publish_monotonic_ns"][0])
@@ -140,28 +147,81 @@ def _build_observation(
     run_generation: int,
     anchor_ns: int,
 ) -> ObservationBatch:
-    """Assemble one causal observation from the arm (and, if enabled, hand) rings."""
+    """Assemble requested causal modalities from the arm/hand rings.
+
+    The hand state and tactile rings are read only when their corresponding
+    ``observation_fields`` are requested. Every selected frame is additionally
+    gated by its source/publish timestamps and modality-specific health flags.
+    """
     horizon = int(config.observation_horizon)
     arm_history = _read_state_history(
         shared.arm_state_ring,
         horizon=horizon,
         anchor_ns=anchor_ns,
         values_field="qpos",
+        required_true_fields=("state_valid",),
     )
     hand_history: FrameWindow | None = None
+    hand_current_history: FrameWindow | None = None
+    hand_tactile_sum_history: FrameWindow | None = None
+    tactile_history: FrameWindow | None = None
+    requested = set(
+        parse_observation_fields(getattr(config, "observation_fields", "arm_qpos,hand_qpos"))
+    )
+    hand_state_requested = bool(
+        requested
+        & {
+            "hand_qpos",
+            "hand_joint_position",
+            "hand_current",
+            "hand_joint_torque",
+            "hand_tactile_sum",
+            "fingertip_force",
+        }
+    )
+    tactile_requested = bool(requested & {"hand_tactile_force", "xhand_tactile"})
     if config.hand_enabled:
-        hand_history = _read_state_history(
-            shared.hand_state_ring,
-            horizon=horizon,
-            anchor_ns=anchor_ns,
-            values_field="qpos",
-        )
+        if hand_state_requested:
+            hand_history = _read_state_history(
+                shared.hand_state_ring,
+                horizon=horizon,
+                anchor_ns=anchor_ns,
+                values_field="qpos",
+                required_true_fields=("state_valid", "read_healthy"),
+            )
+            if requested & {"hand_current", "hand_joint_torque"}:
+                hand_current_history = _read_state_history(
+                    shared.hand_state_ring,
+                    horizon=horizon,
+                    anchor_ns=anchor_ns,
+                    values_field="current",
+                    required_true_fields=("state_valid", "read_healthy"),
+                )
+            if requested & {"hand_tactile_sum", "fingertip_force"}:
+                hand_tactile_sum_history = _read_state_history(
+                    shared.hand_state_ring,
+                    horizon=horizon,
+                    anchor_ns=anchor_ns,
+                    values_field="tactile_sum",
+                    required_true_fields=("state_valid", "read_healthy", "tactile_sum_valid"),
+                )
+        if tactile_requested:
+            tactile_history = _read_state_history(
+                shared.hand_tactile_ring,
+                horizon=horizon,
+                anchor_ns=anchor_ns,
+                values_field="tactile_force",
+                required_true_fields=("fresh",),
+            )
     return ObservationBatch(
         observation_id=observation_id,
         run_generation=run_generation,
         anchor_monotonic_ns=anchor_ns,
         arm_history=arm_history,
         hand_history=hand_history,
+        hand_current_history=hand_current_history,
+        hand_tactile_sum_history=hand_tactile_sum_history,
+        tactile_history=tactile_history,
     )
 
 

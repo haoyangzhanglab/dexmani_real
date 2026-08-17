@@ -24,7 +24,7 @@ entry points, not test fixtures.
 | Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → safety gate → samples |
 | Tune hand retargeting | `teleop/hand_retarget_eval.py`, `examples/tune_hand_retarget.py` | runtime TAG/DexPilot sections → wrapper → startup home/ramp |
 | Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
-| Change learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` → `deployment/config.py` → `deployment/contracts.py` → `integrations/` adapter → `policy_plan_ring` |
+| Change learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` → `deployment/config.py` → `deployment/observation.py` → `deployment/contracts.py` → `integrations/` adapter → `policy_plan_ring` |
 | Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, homing path planning |
 | Change episode I/O | `recording/io_process.py` | recorder → reader → analysis → replay |
 | Change replay | `examples/replay_episode.py` | — Self-contained script; preflight → session → runner → metrics |
@@ -58,7 +58,7 @@ actions through the same shared safety boundary.
 | Main / lifecycle module | Config snapshot, storage, process creation, read-only readiness, health, shutdown | Mapping, actions, sample selection |
 | `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | HDF5 serialization or direct SDK use |
 | `deployment/coordinator.py` | Adopting learned-policy plans; scheduling one due endpoint per tick through the shared safety boundary | Direct arm/hand transport writes, `SafetyState` mutation, interpolation |
-| `deployment/worker.py` | Inference only: observation → encode → infer → decode → `policy_plan_ring` | arm/hand transport, `SafetyState`, robot actions |
+| `deployment/worker.py` | Inference only: causal/valid observation → encode → infer → decode → `policy_plan_ring` | arm/hand transport, `SafetyState`, robot actions |
 | `recording/io_process.py` | Record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
 | `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application | Policy decisions or cross-worker calls |
 | `sensor/` workers | Device acquisition and source-freshness metadata | Motion/control decisions |
@@ -99,6 +99,12 @@ discover a dtype.
 Read a ring with its documented seqlock API. `get_last_k(k)` returns verified
 frames oldest-first, may be shorter than `k`, and raises for `k > maxlen`.
 Never store arbitrary mutable Python graphs in shared memory.
+
+Learned-policy observations are declared by `DeploymentConfig.observation_fields`
+and assembled causally by `deployment/worker.py`. XHand current/combined/raw
+tactile windows are optional; `tactile_sum_valid` must gate combined tactile
+values because invalid reads are zero-filled. The default remains joint-only,
+and this internal validity bit does not alter HDF5 v17.
 
 ### Safety state and command lifetime
 

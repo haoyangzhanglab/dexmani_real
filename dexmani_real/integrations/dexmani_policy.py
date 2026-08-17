@@ -6,7 +6,7 @@ loader never touches torch. ``dexmani_policy`` is imported lazily — inside
 :meth:`DexManiPolicyBackend.load` — so the architecture gate holds: the
 core runs end-to-end on the fake without the model repository installed.
 
-First version: only native joint action. An EE-action
+First version: native joint action. An EE-action
 checkpoint without a validated EE->joint conversion is a startup reject. Any
 model-internal representation (FAAS, latent hand, …) must be converted back to
 native 12-DoF XHand by the model repository before this adapter sees it.
@@ -31,7 +31,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
-from dexmani_real.deployment.observation import ObservationBatch
+from dexmani_real.deployment.observation import ObservationBatch, parse_observation_fields
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 _ARM_DOF = ARM_JOINT_SHAPE[0]
@@ -54,25 +54,53 @@ def _last_valid(window: Any, dof: int) -> np.ndarray:
     return np.asarray(window.values[idx[-1]], dtype=np.float64).reshape(dof)
 
 
+def _last_valid_optional(window: Any) -> np.ndarray | None:
+    """Return an optional modality's latest valid frame, or None."""
+    if window is None:
+        return None
+    idx = np.flatnonzero(np.asarray(window.valid_mask).astype(bool))
+    if idx.size == 0:
+        return None
+    return np.asarray(window.values[idx[-1]], dtype=np.float64).copy()
+
+
 class DexManiObservationAdapter:
     """``ObservationBatch`` -> model-native joint observation dict.
 
-    Joint-only first version. ``arm_qpos`` is always a ``[7]`` vector (a zero
-    vector when the arm window is absent/stale); ``hand_qpos`` is ``[12]`` when
-    the hand window is present, else ``None``. Any history stacking,
-    normalization, batch-dimension, or device transfer the real policy needs
-    belongs here, not in the deployment core.
+    The default remains joint-only. ``observation_fields`` can opt into current
+    and tactile modalities; all optional fields are omitted as ``None`` when no
+    causally valid frame is available. Any history stacking, normalization,
+    batch-dimension, or device transfer the real policy needs belongs here.
     """
 
     def __init__(self, config: Any = None) -> None:
         self.config = config
+        spec = getattr(config, "observation_fields", "arm_qpos,hand_qpos")
+        self.observation_fields = parse_observation_fields(spec)
 
     def encode(self, observation: ObservationBatch) -> dict[str, np.ndarray | None]:
-        arm = _last_valid(observation.arm_history, _ARM_DOF)
-        hand: np.ndarray | None = None
-        if observation.hand_history is not None:
-            hand = _last_valid(observation.hand_history, _HAND_DOF)
-        return {"arm_qpos": arm, "hand_qpos": hand}
+        encoded: dict[str, np.ndarray | None] = {}
+        for field in self.observation_fields:
+            if field in {"arm_qpos", "arm_joint_position"}:
+                encoded[field] = _last_valid(observation.arm_history, _ARM_DOF)
+            elif field in {"hand_qpos", "hand_joint_position"}:
+                encoded[field] = (
+                    None
+                    if observation.hand_history is None
+                    else _last_valid(observation.hand_history, _HAND_DOF)
+                )
+            elif field in {"hand_current", "hand_joint_torque"}:
+                # XHand exposes the vendor joint ``torque`` reading through
+                # DexMani's established ``current`` state field; no unit or
+                # scale conversion is applied at this boundary.
+                encoded[field] = _last_valid_optional(observation.hand_current_history)
+            elif field in {"hand_tactile_sum", "fingertip_force"}:
+                encoded[field] = _last_valid_optional(observation.hand_tactile_sum_history)
+            elif field in {"hand_tactile_force", "xhand_tactile"}:
+                encoded[field] = _last_valid_optional(observation.tactile_history)
+            else:  # pragma: no cover - parse_observation_fields rejects this first
+                raise ValueError(f"unsupported observation field: {field}")
+        return encoded
 
 
 class DexManiPolicyBackend:

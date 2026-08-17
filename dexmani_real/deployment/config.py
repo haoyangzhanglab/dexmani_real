@@ -33,9 +33,10 @@ class DeploymentConfig:
     """Frozen learned-policy deployment parameters.
 
     The three ``*_target`` fields name ``module:symbol`` factories resolved by
-    :mod:`dexmani_real.deployment.loader`; ``checkpoint`` / ``model_config_path``
-    / ``device`` are the only model-facing values that cross the deployment
-    boundary (everything else model-internal stays in the model repository).
+    :mod:`dexmani_real.deployment.loader`; ``checkpoint`` /
+    ``model_config_path`` / ``device`` and the explicit ``observation_fields``
+    contract are the model-facing values that cross the deployment boundary
+    (everything else model-internal stays in the model repository).
     """
 
     backend_target: str = ""
@@ -51,6 +52,9 @@ class DeploymentConfig:
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
     hand_enabled: bool = False
+    # Comma-separated DexMani observation keys; the default preserves the
+    # original joint-only adapter contract.
+    observation_fields: str = "arm_qpos,hand_qpos"
 
     def __post_init__(self) -> None:
         if self.observation_horizon <= 0:
@@ -59,6 +63,9 @@ class DeploymentConfig:
             value = getattr(self, name)
             if not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        from dexmani_real.deployment.observation import parse_observation_fields
+
+        parse_observation_fields(self.observation_fields)
 
 
 # Frozen template; never mutated (resolve() copies it).

@@ -12,6 +12,37 @@ from typing import Any
 import numpy as np
 
 
+POLICY_OBSERVATION_FIELDS = frozenset(
+    {
+        "arm_qpos",
+        "hand_qpos",
+        "hand_current",
+        "hand_tactile_sum",
+        "hand_tactile_force",
+        "arm_joint_position",
+        "hand_joint_position",
+        "hand_joint_torque",
+        "fingertip_force",
+        "xhand_tactile",
+    }
+)
+
+
+def parse_observation_fields(spec: str) -> tuple[str, ...]:
+    """Parse and validate the comma-separated policy observation contract."""
+    if not isinstance(spec, str):
+        raise TypeError("observation_fields must be a comma-separated string")
+    fields = tuple(part.strip() for part in spec.split(",") if part.strip())
+    if not fields:
+        raise ValueError("observation_fields must contain at least one field")
+    unknown = sorted(set(fields) - POLICY_OBSERVATION_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown observation field(s): {', '.join(unknown)}")
+    if len(set(fields)) != len(fields):
+        raise ValueError("observation_fields must not contain duplicates")
+    return fields
+
+
 def _freeze(
     arr: Any,
     *,
@@ -114,11 +145,12 @@ class ObservationBatch:
     """One causal observation assembled from the arm/hand/tactile/camera rings.
 
     Immutable and process-local. ``arm_history``/``hand_history``/
-    ``tactile_history``/``camera_history`` are ``FrameWindow``/``CameraWindow``
-    (or None when the modality is absent or not required by the adapter); each
-    carries its own source/publish metadata because the rings advance
-    independently. ``anchor_monotonic_ns`` is the causal cut: no frame with
-    ``publish > anchor`` may be included.
+    ``hand_current_history``/``hand_tactile_sum_history``/``tactile_history``/
+    ``camera_history`` are ``FrameWindow``/``CameraWindow`` (or None when the
+    modality is absent or not required by the adapter); each carries its own
+    source/publish metadata because the rings advance independently.
+    ``anchor_monotonic_ns`` is the causal cut: no frame published after the
+    anchor may be included.
     """
 
     observation_id: int
@@ -129,6 +161,10 @@ class ObservationBatch:
     hand_history: FrameWindow | None = None
     tactile_history: FrameWindow | None = None
     camera_history: CameraWindow | None = None
+    # Appended after the original fields to preserve positional construction
+    # compatibility for existing adapters and offline callers.
+    hand_current_history: FrameWindow | None = None
+    hand_tactile_sum_history: FrameWindow | None = None
 
     def __post_init__(self) -> None:
         if self.observation_id < 0 or self.run_generation < 0:

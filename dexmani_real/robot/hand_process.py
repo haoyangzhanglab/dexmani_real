@@ -328,6 +328,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 "tactile_contact": st.tactile_contact,
             }
             _initial_tactile_valid = bool(st.tactile_valid)
+            _initial_tactile_sum_valid = bool(st.tactile_sum_valid)
             if not bool(hand.connected_flag):
                 raise RuntimeError("initial hand feedback reports a disconnected device")
             if bool(hand.error_state):
@@ -348,6 +349,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _frame0["qpos"][0] = _init_qpos
         _frame0["current"][0] = _initial_values["current"]
         _frame0["tactile_sum"][0] = _initial_values["tactile_sum"]
+        _frame0["tactile_sum_valid"][0] = int(_initial_tactile_sum_valid)
         _frame0["tactile_contact"][0] = _initial_values["tactile_contact"]
         _frame0["error_state"][0] = int(bool(hand.error_state))
         _frame0["connected"][0] = int(bool(hand.connected_flag))
@@ -473,6 +475,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 current = st.current
                 tactile_sum = st.tactile_sum
                 tactile_force = st.tactile_force
+                tactile_sum_valid = bool(st.tactile_sum_valid)
                 tactile_contact = st.tactile_contact
                 tactile_valid = bool(st.tactile_valid)
                 connected = hand.connected_flag
@@ -500,6 +503,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 current = np.zeros(HAND_JOINT_SHAPE)
                 tactile_sum = _last_tactile_sum.copy()
                 tactile_force = _last_tactile_force.copy()
+                tactile_sum_valid = False
                 tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
                 tactile_valid = False
                 connected = False
@@ -539,6 +543,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             frame["qpos"][0] = qpos
             frame["current"][0] = current
             frame["tactile_sum"][0] = tactile_sum
+            frame["tactile_sum_valid"][0] = int(tactile_sum_valid)
             frame["tactile_contact"][0] = tactile_contact
             frame["error_state"][0] = int(error_state)
             frame["connected"][0] = int(connected)

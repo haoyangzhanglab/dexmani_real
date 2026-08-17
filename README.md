@@ -184,12 +184,12 @@ python -m compileall -q dexmani_real examples
 | 文件 | 作用 |
 |---|---|
 | `deployment/__init__.py` | 标识后端/观测/动作适配器边界与 learned-policy 部署运行时（模型输出只是 proposal，不是 robot command）。 |
-| `deployment/config.py` | `DeploymentConfig` 与 `resolve_deployment_config`（CLI > file/data > defaults + SHA-256）；模型内部参数绝不进配置。 |
+| `deployment/config.py` | `DeploymentConfig` 与 `resolve_deployment_config`（CLI > file/data > defaults + SHA-256）；模型内部参数绝不进配置；`observation_fields` 显式声明模型需要的观测键。 |
 | `deployment/contracts.py` | `PolicyBackend` / `ObservationAdapter` / `ActionAdapter` 三个 Protocol + `JointActionChunk` / `InferenceContext`，均不 import torch 或 SharedStorage。 |
-| `deployment/observation.py` | 进程本地不可变观测窗 `ObservationBatch` / `FrameWindow` / `CameraWindow`（不进 SharedStorage）。 |
+| `deployment/observation.py` | 进程本地不可变观测窗 `ObservationBatch` / `FrameWindow` / `CameraWindow`，包含关节、电流、合并触觉和原始触觉窗口（不进 SharedStorage）。 |
 | `deployment/loader.py` | `module:symbol` 惰性加载器，实例化后 Protocol 校验，失败 fail-closed；parent 不 import torch。 |
 | `deployment/fake.py` | 确定性、无 torch、无硬件的 fake 后端（backend-swap fixture）。 |
-| `deployment/worker.py` | `inference_loop`：观测 → encode → infer → decode → 只写 `policy_plan_ring`；不写 arm/hand transport、不碰 SafetyState。 |
+| `deployment/worker.py` | `inference_loop`：按因果时间和有效性读取观测 → encode → infer → decode → 只写 `policy_plan_ring`；不写 arm/hand transport、不碰 SafetyState。 |
 | `deployment/coordinator.py` | `coordinator_loop`：唯一的 learned-policy robot-action producer——采纳计划、调度单个 due endpoint（latest-wins、不插值）、走共享 `build_action_candidate`/`validate_and_send_candidate` 发布边界、手部 delta 预检、命令静默 watchdog。 |
 | `deployment/lifecycle.py` | `build_policy_worker_specs` + `run_policy_deployment`：组合 A/B 冻结的 `WorkerSpec`/`run_supervisor`/`shutdown_processes`，无第二套健康机制。 |
 | `deployment/metrics.py` | 无 Prometheus/OTel 的 counter/gauge 注册表 + 结构化 flush。 |
@@ -200,7 +200,13 @@ python -m compileall -q dexmani_real examples
 | 文件 | 作用 |
 |---|---|
 | `integrations/__init__.py` | 说明依赖方向：`deployment/*` 不得 import 本包；integration → deployment。 |
-| `integrations/dexmani_policy.py` | DexMani Policy 模型仓库适配器：`DexManiObservationAdapter`/`DexManiPolicyBackend`/`DexManiActionAdapter`；`load()` 内惰性 import，native-joint-only，EE checkpoint 启动即拒绝。 |
+| `integrations/dexmani_policy.py` | DexMani Policy 模型仓库适配器：`DexManiObservationAdapter`/`DexManiPolicyBackend`/`DexManiActionAdapter`；支持默认关节观测及显式 opt-in 的电流/触觉键，`load()` 内惰性 import，native-joint-only，EE checkpoint 启动即拒绝。 |
+
+部署观测默认保持 `arm_qpos,hand_qpos`。需要多模态输入时，在 deployment YAML 中显式配置，例如
+`observation_fields: arm_qpos,hand_qpos,hand_current,fingertip_force`；其中
+`hand_current`/`hand_joint_torque` 是 XHand 电流观测，`fingertip_force`/`xhand_tactile`
+分别对应合并触觉和原始触觉，只有通过因果时间及有效性检查的帧才会传给模型。
+`tactile_sum_valid` 仅是共享状态中的有效性标记，不改变 HDF5 v17 数据合同。
 
 ### `data_processing/` — Real episode 清洗与 Sim-label HDF5
 
