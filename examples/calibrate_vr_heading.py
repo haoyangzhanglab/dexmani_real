@@ -55,16 +55,8 @@ from dexmani_real.teleop.vr_transform import (
     VR_TRANSFORM_SCHEMA_VERSION,
 )
 
-# ═══════════════════════════════════════════════════════════════════════
-# Paths
-# ═══════════════════════════════════════════════════════════════════════
-
 _OUTPUT_PATH = PACKAGE_DIR / "config" / "vr_transform.json"
 _AUDIO_PATH = ASSET_DIR / "audio" / "轴向已标定.wav"
-
-# ═══════════════════════════════════════════════════════════════════════
-# Constants
-# ═══════════════════════════════════════════════════════════════════════
 
 _MIN_FORWARD_NORM = 1e-6
 _POLL_INTERVAL_S = 0.01
@@ -72,11 +64,6 @@ _PRINT_INTERVAL_S = 5.0
 _JOIN_TIMEOUT_S = 5.0
 _TERMINATE_TIMEOUT_S = 1.0
 _COUNTDOWN_DWELL_S = 1.0
-
-# ═══════════════════════════════════════════════════════════════════════
-# Configuration dataclass
-# ═══════════════════════════════════════════════════════════════════════
-
 
 @dataclass(frozen=True)
 class HeadingCalibrationConfig:
@@ -99,11 +86,6 @@ class HeadingCalibrationConfig:
             raise ValueError("min_frames must be at least 5")
         if self.excellent_std_deg >= self.good_std_deg:
             raise ValueError("excellent_std_deg must be less than good_std_deg")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Heading estimation
-# ═══════════════════════════════════════════════════════════════════════
 
 
 def _circular_mean(
@@ -188,11 +170,6 @@ def _quality_grade(
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def _wait_for_vr_tracking(shared: SharedStorage, timeout_s: float) -> bool:
     """Block until VR tracking data is observed, or return False on timeout."""
     deadline = time.monotonic() + timeout_s
@@ -221,11 +198,6 @@ def _fatal_exit(shared: SharedStorage, vr_proc: mp.Process, message: str) -> Non
     vr_proc.join(timeout=_JOIN_TIMEOUT_S)
     shared.close()
     sys.exit(1)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════
 
 
 def main() -> None:
@@ -258,7 +230,7 @@ def main() -> None:
     print(f"  port:       {args.port}")
     print("=" * 55)
 
-    # ── Start VR receiver ──
+    # Start VR receiver.
     ctx = mp.get_context("spawn")
     shared = SharedStorage.create(prefix="dexmani_vr_calib", config=SharedStorageConfig(), mp_context=ctx)
     specs = [WorkerSpec("vr-calib", vr_loop, (shared, VRReceiverConfig(port=args.port)), ready_name="vr", daemon=True)]
@@ -276,13 +248,13 @@ def main() -> None:
     if not _wait_for_vr_tracking(shared, cfg.tracking_data_timeout_s):
         _fatal_exit(shared, vr_proc, "no VR tracking data received")
 
-    # ── Settle / countdown / collect (guarded so SharedStorage is always cleaned) ──
+    # Settle, count down, and collect.
     try:
-        # ── Settle period ──
+        # Settle period.
         print(f"  Settling ({cfg.settle_s:.0f} s) — fine-tune your pose...", flush=True)
         time.sleep(cfg.settle_s)
 
-        # ── Countdown ──
+        # Countdown.
         if args.ref == "head":
             print("  Face the robot +X direction, hold your head still...")
         else:
@@ -291,7 +263,7 @@ def main() -> None:
             print(f"  {i}...")
             time.sleep(_COUNTDOWN_DWELL_S)
 
-        # ── Collect ──
+        # Collect samples.
         quat_field = "wrist_quat_wxyz" if args.ref == "wrist" else "head_quat_wxyz"
         forwards: list[np.ndarray] = []
         deadline = time.monotonic() + args.duration
@@ -334,7 +306,7 @@ def main() -> None:
                 last_print = now
             time.sleep(_POLL_INTERVAL_S)
     finally:
-        # ── Shutdown VR (always run, even on KeyboardInterrupt) ──
+        # Shut down VR.
         shared.is_running.value = False
         vr_proc.join(timeout=_JOIN_TIMEOUT_S)
         if vr_proc.is_alive():
@@ -346,7 +318,7 @@ def main() -> None:
         print(f"ERROR: only {len(forwards)} frames collected (< {cfg.min_frames} required)")
         sys.exit(1)
 
-    # ── Compute ──
+    # Compute heading.
     forwards_arr = np.array(forwards, dtype=np.float64)
     theta_rad, mean_fwd, inlier = _circular_mean(forwards_arr, outlier_sigma=cfg.outlier_sigma)
     inlier_frames = int(np.sum(inlier))
@@ -387,7 +359,7 @@ def main() -> None:
     print(f"    [{T[2, 0]:.4f}, {T[2, 1]:.4f}, {T[2, 2]:.4f}]")
     print(f"{'=' * 55}")
 
-    # ── Write config ──
+    # Write configuration.
     if quality["grade"] == "poor" and not args.force:
         print(
             f"\n  NOT written: quality grade is 'poor' "
@@ -413,7 +385,7 @@ def main() -> None:
     atomic_json_dump(config, _OUTPUT_PATH)
     print(f"\nSaved to: {_OUTPUT_PATH}")
 
-    # ── Audio feedback ──
+    # Audio feedback.
     if _AUDIO_PATH.exists():
         player = "aplay" if sys.platform == "linux" else "afplay"
         subprocess.run([player, str(_AUDIO_PATH)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

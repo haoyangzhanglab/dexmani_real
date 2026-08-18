@@ -44,10 +44,7 @@ from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS, POLICY_PLAN_DTYPE
 
 logger = get_logger(__name__)
 
-# Poll delay while a required modality has no causal feedback yet. Non-zero so
-# the no-feedback continue paths (arm_history/hand_history None) do not busy-spin
-# a CPU core during the startup transient; small so readiness is picked up
-# promptly.
+# Poll delay while required causal feedback is unavailable.
 _NO_FEEDBACK_POLL_S = 0.005
 
 

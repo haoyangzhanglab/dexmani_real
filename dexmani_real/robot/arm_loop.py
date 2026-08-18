@@ -618,7 +618,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     _frame = new_frame(ARM_STATE_DTYPE)
     _frame["qpos"][0] = last_qpos
     _frame["qvel"][0] = initial_qvel
-    # Legacy field name: SDK current-estimated effort, precise SI unit unverified.
+    # SDK current-estimated effort; precise SI unit is unverified.
     _frame["tau"][0] = initial_effort
     _frame["eef_pos"][0] = eef_pos_init
     _frame["eef_rot6d"][0] = eef_rot6d_init
@@ -971,11 +971,8 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
             else:
                 _tracking_err_count = 0
 
-            # arm.error_code is an SDK cached property (background report thread
-            # ~every 200ms), not a per-access network call.  A cached non-zero
-            # read drives a fault decision, so confirm it against the live
-            # controller register before acting; a failed live read fails closed
-            # (latches the fault) rather than trusting the cache.
+            # The cached error code drives a fault decision, so confirm it
+            # against the live controller register before acting.
             try:
                 error_code = arm.error_code
             except Exception:

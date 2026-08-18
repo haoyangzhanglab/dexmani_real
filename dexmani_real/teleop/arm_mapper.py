@@ -54,7 +54,7 @@ class ArmWristMapper:
         base_to_world_rot: np.ndarray | None = None,
         T_vr_to_robot: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
-        max_per_frame_rot_rad: float = 0.52,  # ~30°/frame at the default 16 Hz
+        max_per_frame_rot_rad: float = 0.52,
     ) -> None:
         if not np.isfinite(pos_scale):
             raise ValueError("pos_scale must be finite")
@@ -66,31 +66,25 @@ class ArmWristMapper:
             raise ValueError("max_per_frame_rot_rad must be finite and > 0")
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
-        # ── Position: heading-dependent (set by set_heading) ──
         self.vr_to_base_rot = (
             np.eye(3)
             if vr_to_base_rot is None
             else validate_rotation_matrix(vr_to_base_rot, name="vr_to_base_rot")
         )
-        # ── Position + Rotation: base → world ──
         self.base_to_world_rot = (
             np.eye(3)
             if base_to_world_rot is None
             else validate_rotation_matrix(base_to_world_rot, name="base_to_world_rot")
         )
-        # ── Rotation: fixed VR→robot axis mapping (heading-INDEPENDENT) ──
-        # LeFranX-style: a constant similarity transform mapping VR hand axes to
-        # robot base axes.  Identity means VR FLU axes = robot base axes.
+        # Fixed VR→robot rotation; identity means both frames use FLU axes.
         self.T_vr_to_robot = (
             np.eye(3)
             if T_vr_to_robot is None
             else validate_rotation_matrix(T_vr_to_robot, name="T_vr_to_robot")
         )
-        # Total-from-reset rotation delta cap (rad). ~57° default — catches accumulated
-        # drift from the reset pose before it reaches IK.
+        # Total-from-reset rotation cap.
         self.max_delta_rot_rad = max_delta_rot_rad
-        # Per-frame rotation delta cap (rad). ~30°/frame default — catches single-frame
-        # VR tracking glitches (spike-and-recover) that the total-delta cap misses.
+        # Per-frame rotation cap for tracking spikes.
         self.max_per_frame_rot_rad = max_per_frame_rot_rad
 
         self.wrist_pos0: np.ndarray | None = None
@@ -144,14 +138,8 @@ class ArmWristMapper:
             logger.warning("ArmWristMapper.map: invalid wrist pose — holding", exc_info=True)
             return None
 
-        # F2: Per-frame rotation delta gate — catches single-frame VR tracking
-        # glitches (spike-and-recover) that the total-from-reset clip misses.
-        # At the default 16 Hz, normal wrist rotation is <20°/frame; the 30°/frame
-        # default (~480°/s) is ~2× the fastest plausible motion.
-        #
-        # _last_wrist_rot tracks the RAW wrist orientation as the delta reference
-        # for the next frame.  Using the clamped output as reference caused the
-        # baseline to drift after a spike, distorting recovery-frame deltas
+        # Compare each raw frame with the previous raw frame so a clamped spike
+        # does not shift the recovery baseline.
         wrist_rot_gated = wrist_rot
         if self._last_wrist_rot is not None:
             frame_delta = wrist_rot @ self._last_wrist_rot.T
@@ -176,10 +164,8 @@ class ArmWristMapper:
         delta_rot_vr = wrist_rot_gated @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
         delta_rot_vr = self.scale_rot(delta_rot_vr)
         delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
-        # Rotation: fixed VR→robot axis mapping (heading-INDEPENDENT, LeFranX-style).
-        # Similarity transform re-expresses the VR-frame rotation delta in robot-base axes.
+        # Re-express the VR rotation delta in robot-base axes.
         delta_rot_base = self.T_vr_to_robot @ delta_rot_vr @ self.T_vr_to_robot.T
-        # Similarity-transform rotation delta from base frame → world frame.
         delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
 
         # Convert eef reference from base frame → world frame so both
@@ -231,8 +217,8 @@ class ArmWristMapper:
     def set_heading(self, head_quat_wxyz: np.ndarray) -> None:
         """Calibrate ``vr_to_base_rot`` so the user's facing direction → robot +X.
 
-        **Only affects position mapping.** Rotation uses the fixed
-        ``T_vr_to_robot`` transform (heading-independent, LeFranX-style).
+        Only position mapping uses the calibrated heading. Rotation uses the
+        fixed ``T_vr_to_robot`` transform.
 
         Call once per teleop session (on B-press), before :meth:`reset`.
         """

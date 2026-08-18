@@ -28,8 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Matches dexmani_real.config.defaults.hand.home_qpos_deg -- duplicated here
-# so this script stays usable without a full dexmani_real import chain.
+# Diagnostic default kept local so this script can run without the full package.
 HOME_QPOS_DEG = (
     30.0,
     55.33,
@@ -71,13 +70,10 @@ _RS485_SENSOR_VERIFY_RETRY_COUNT = 2
 _RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 
-# Production command envelope (rad), duplicated from
+# Command envelope (rad), duplicated from
 # dexmani_real.config.defaults.hand.qpos_min_rad / qpos_max_rad so the
-# diagnostic validates/clips presets against the same bounds the production
-# policy enforces.  The distal lower bounds are the operator-set anti-clogging
-# margins; the upper bounds are the rated mechanical max.  Presets are clipped
-# to this envelope (matching the production publish-clip) so the diagnostic
-# never sends an out-of-envelope raw SDK command.
+# diagnostic validates/clips presets against the worker's bounds. Presets are
+# clipped before sending.
 COMMAND_QPOS_MIN_RAD = (
     0.0,
     -0.698,
@@ -113,11 +109,6 @@ _FINGERTIP_IDS = frozenset({2, 5, 7, 9, 11})
 _FINGERTIP_TO_SENSOR_IDX = {2: 0, 5: 1, 7: 2, 9: 3, 11: 4}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Configuration dataclasses
-# ═══════════════════════════════════════════════════════════════════════
-
-
 @dataclass(frozen=True)
 class HandCommandParams:
     """Default servo parameters for diagnostic hand commands."""
@@ -146,10 +137,7 @@ class PresetActions:
         yield "ok", self.ok
 
 
-# XHand 1 (serial digit "3"). Preset angles are kept inside the production
-# command envelope above so the diagnostic never emits a [clip] line. The
-# Dexora right-hand init has already been projected onto the anti-clogging floors;
-# full-flexion uses 109.5° (the rated upper bound is 1.919 rad ≈ 109.95°).
+# XHand 1 (serial digit "3"). Preset angles stay inside the command envelope.
 PRESET_XHAND1 = PresetActions(
     fist=(
         11.85,
@@ -192,11 +180,6 @@ PRESET_XHAND1_LITE = PresetActions(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# XHand control example
-# ═══════════════════════════════════════════════════════════════════════
-
-
 class XHandControlExample:
     """Thin wrapper around xhand_controller SDK for diagnostic exercises."""
 
@@ -215,7 +198,7 @@ class XHandControlExample:
         self._hand_command = self._build_command(self._params.default_position)
         self._protocol: str | None = None
 
-    # ── Command builders ──
+    # Command builders.
 
     def _build_command(self, position: float) -> Any:
         """Build a homogeneous hand command with the configured servo params."""
@@ -233,7 +216,7 @@ class XHandControlExample:
 
     def _set_positions(self, qpos_deg: tuple[float, ...] | list[float]) -> None:
         """Write joint positions (deg -> rad) into the current command, clipped
-        to the production command envelope so the diagnostic never sends an
+        to the command envelope so the diagnostic never sends an
         out-of-range raw SDK command."""
         for i in range(_HAND_DOF):
             rad = qpos_deg[i] * math.pi / 180.0
@@ -243,7 +226,7 @@ class XHandControlExample:
                 clipped = max(lo, min(hi, rad))
                 print(
                     f"  [clip] joint {i}: {rad:.4f} rad -> {clipped:.4f} rad "
-                    f"(production envelope [{lo:.4f}, {hi:.4f}])"
+                    f"(command envelope [{lo:.4f}, {hi:.4f}])"
                 )
                 rad = clipped
             self._hand_command.finger_command[i].position = rad
@@ -252,7 +235,7 @@ class XHandControlExample:
     def _header(title: str) -> None:
         print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
-    # ── Device enumeration and open ──
+    # Device enumeration and open.
 
     def enumerate_devices(self, protocol: str) -> list[str]:
         self._header(f"Enumerate devices ({protocol})")
@@ -297,7 +280,7 @@ class XHandControlExample:
             print(f"  FAILED: {err}")
         return ok
 
-    # ── Identity and version ──
+    # Identity and version.
 
     def read_sdk_version(self) -> None:
         self._header("SDK versions")
@@ -322,7 +305,7 @@ class XHandControlExample:
         print(f"  serial_number: {sn}")
         return sn
 
-    # ── State ──
+    # State.
 
     def _read_state_response(
         self, force_update: bool, *, label: str
@@ -509,7 +492,7 @@ class XHandControlExample:
         )
         return True
 
-    # ── Motion commands ──
+    # Motion commands.
 
     def send_command(self, sleep_s: float = 1.0) -> bool:
         error_struct = self._device.send_command(self._hand_id, self._hand_command)
@@ -564,17 +547,12 @@ class XHandControlExample:
         self._set_positions(HOME_QPOS_DEG)
         return self.send_command()
 
-    # ── Cleanup ──
+    # Cleanup.
 
     def close(self) -> None:
         self._header("Close device")
         self._device.close_device()
         print("  Device closed.")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════
 
 
 def _serial_port_problem(serial_port: str) -> str | None:
@@ -615,11 +593,6 @@ def _select_preset_actions(serial_number: str) -> PresetActions:
     if variant_code == "6":
         return PRESET_XHAND1_LITE
     return PRESET_XHAND1  # default (includes variant "3")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Hardware worker and parent-side crash containment
-# ═══════════════════════════════════════════════════════════════════════
 
 
 def _run_hardware_session() -> int:

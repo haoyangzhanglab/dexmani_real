@@ -57,27 +57,20 @@ class L515DepthConfig:
 
     enabled: bool = True
 
-    # --- visual preset (applied FIRST — loads the factory base table) ---
-    visual_preset: int = 5  # L500: 5 = Short Range (< 1 m); was 3 = Low Ambient
+    # Visual preset.
+    visual_preset: int = 5  # L500 Short Range preset.
 
-    # --- explicit overrides (applied AFTER preset, flips label to 0=Custom) ---
+    # Explicit overrides.
     laser_power: int = 100  # 0-100, full power (MEMS eye-safe at all levels)
     receiver_gain: int = 9  # 8-18; numerically higher = *lower* actual gain.
-    # At close range the reflected signal is strong — lower gain (higher number)
-    # reduces shot noise with plenty of margin on dark/absorbing surfaces.
+    # Higher receiver-gain values reduce the configured analog gain.
     confidence_threshold: int = 1  # 0-3 firmware confidence cull; 1 = keep more
-    # pixels (thin fingertip structures survive).  Short Range preset already
-    # has a tighter confidence mapping than Low Ambient.
-    noise_filtering: int = 1  # 0-6; 1 = light temporal smoothing.  Short Range's
-    # native noise floor is ~2-3× lower at 0.5 m than Low Ambient, so we can
-    # back off the filter and preserve fine edge detail.
-    min_distance: int = 150  # mm; was 190.  15 cm gives headroom for the hand
-    # operating close to the camera without clipping valid near-field depth.
+    # Pixels with confidence below this threshold are discarded.
+    noise_filtering: int = 1  # 0-6; light temporal smoothing.
+    min_distance: int = 150  # mm.
 
-    # --- gains & sharpening (newly exposed — were at hardware defaults) ---
-    digital_gain: int = 1  # 1-2; post-ADC digital amplification.  1 = no extra
-    # gain → less noise amplification.  Strong close-range signal makes the
-    # extra 6 dB unnecessary.
+    # Gains and sharpening.
+    digital_gain: int = 1  # 1-2; post-ADC digital amplification.
     depth_offset: float = 4.5  # mm; expected read-only per-unit calibration.
     # This is verified at startup, not written and not used as a tuning knob.
     post_processing_sharpening: int = 2  # 0-3; edge-enhancement on the firmware
@@ -516,7 +509,7 @@ class RealSense:
         if compute_depth:
             depth = depth_raw.astype(np.float32) * float(self.depth_scale)
         else:
-            depth = depth_raw  # skip float32 allocation (~1.2 MB/frame); SHM path only needs raw
+            depth = depth_raw  # shared-memory path keeps raw depth
 
         rgb = None
         if color_frame is not None:

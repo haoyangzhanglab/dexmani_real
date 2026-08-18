@@ -86,15 +86,7 @@ from dexmani_real.utils.rate_manager import RateManager
 
 logger = get_logger(__name__)
 
-# ═══════════════════════════════════════════════════════════════════════
-# Paths
-# ═══════════════════════════════════════════════════════════════════════
-
 _CAMERAS_JSON_PATH = PACKAGE_DIR / "config" / "cameras.json"
-
-# ═══════════════════════════════════════════════════════════════════════
-# Constants
-# ═══════════════════════════════════════════════════════════════════════
 
 _WINDOW_NAME = "ArUco Calibration"
 _INITIAL_STATE_POLL_S = 0.05
@@ -121,11 +113,6 @@ _HAND_EYE_METHODS = {
     "ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
     "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
 }
-
-# ═══════════════════════════════════════════════════════════════════════
-# Configuration dataclasses
-# ═══════════════════════════════════════════════════════════════════════
-
 
 @dataclass(frozen=True)
 class ArucoConfig:
@@ -160,11 +147,6 @@ class CalibrationConfig:
         for name in ("delta_pos_m", "delta_rpy_rad", "max_consistency_std_mm"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# ArUco detection
-# ═══════════════════════════════════════════════════════════════════════
 
 
 def _detect_aruco_pose(
@@ -282,11 +264,6 @@ def _draw_overlay(
     return image, detected
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Hand-eye calibration
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def _calibrate_eye_to_hand(
     tvec_ee2base: list[np.ndarray],
     rpy_ee2base: list[np.ndarray],
@@ -400,11 +377,6 @@ def _calibrate_and_select(
     return T_best, name_best, errors_mm_best, errors_deg_best, table
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Camera helpers
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def _start_camera(serial: str | None = None) -> tuple[Any, str, np.ndarray, np.ndarray]:
     """Start RealSense color stream and return (pipeline, serial, K, dist)."""
     import pyrealsense2 as rs
@@ -428,11 +400,6 @@ def _start_camera(serial: str | None = None) -> tuple[Any, str, np.ndarray, np.n
         pipeline.wait_for_frames()
 
     return pipeline, serial, intrinsics, distortion
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Sample store
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -480,11 +447,6 @@ class _Samples:
         return (self.tvec_ee2base, self.rpy_ee2base, self.rvec_marker2cam, self.tvec_marker2cam)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# JSON output
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def _save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path) -> None:
     """Write calibration result to cameras.json, preserving other entries."""
     rot = Rotation.from_matrix(T_world_camera[:3, :3])
@@ -529,11 +491,6 @@ def _save_cameras_json(T_world_camera: np.ndarray, serial: str, json_path: Path)
     existing[cam_name] = entry
     atomic_json_dump(existing, json_path, ensure_ascii=False)
     print(f"  calibration written → {json_path} (camera: {cam_name})")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Lifecycle helpers
-# ═══════════════════════════════════════════════════════════════════════
 
 
 def _workspace_bounds(runtime: ResolvedRuntimeConfig) -> np.ndarray:
@@ -619,11 +576,6 @@ def _eef_rpy_from_state(arm_state: dict[str, Any]) -> np.ndarray:
     return np.asarray(rpy, dtype=np.float64)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Main control loop
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def _run_calibration(
     shared: SharedStorage,
     runtime: ResolvedRuntimeConfig,
@@ -645,20 +597,20 @@ def _run_calibration(
         _set_fault(shared, "initial arm feedback is unavailable or unhealthy")
         return 1
 
-    # ── Camera ──
+    # Camera state.
     pipeline, serial, intrinsics, distortion = _start_camera(camera_serial)
     print(f"  Camera serial: {serial}")
     print(f"  Intrinsics: fx={intrinsics[0, 0]:.1f} fy={intrinsics[1, 1]:.1f} "
           f"({_CAMERA_WIDTH}x{_CAMERA_HEIGHT})")
 
-    # ── Keyboard ──
+    # Keyboard state.
     keys = GlobalKeyState(
         suppress_echo=True,
         estop_callback=lambda: _set_fault(shared, "operator e-stop callback", estop=True),
     )
     keys.start()
 
-    # ── State ──
+    # Runtime state.
     samples = _Samples()
     T_world_camera: np.ndarray | None = None
     marker_corners = _marker_corners_3d(aruco_cfg.marker_size_m)
@@ -792,7 +744,7 @@ def _run_calibration(
             rate.wait()
             frame += 1
 
-            # ── Preview (non-blocking) ──
+            # Non-blocking preview.
             frames = pipeline.poll_for_frames()
             color_frame = frames.get_color_frame() if frames else None
             if color_frame:
@@ -807,7 +759,7 @@ def _run_calibration(
                 cv2.imshow(_WINDOW_NAME, display_img)
             cv2.waitKey(1)
 
-            # ── Events ──
+            # Input events.
             event = keys.pop_event()
             while event is not None:
                 if event == "space":
@@ -829,7 +781,7 @@ def _run_calibration(
                     _event_solve()
                 event = keys.pop_event()
 
-            # ── Exit / e-stop ──
+            # Exit and e-stop.
             if keys.is_pressed("esc"):
                 _set_fault(shared, "operator e-stop", estop=True)
                 return 1
@@ -888,7 +840,7 @@ def _run_calibration(
                     require_transition(shared, SafetyState.ARMED)
                 return 0 if T_world_camera is not None else 2
 
-            # ── Home (R, edge-triggered) ──
+            # Edge-triggered home.
             home_pressed = keys.is_pressed("r")
             if home_pressed and not home_key_down:
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
@@ -930,7 +882,7 @@ def _run_calibration(
                 continue
             home_key_down = home_pressed
 
-            # ── Keyboard deltas ──
+            # Keyboard deltas.
             dx, drpy = eef_delta_from_keys(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
             moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
             active_keys = keys.pressed_keys()
@@ -1020,11 +972,6 @@ def _run_calibration(
     return 0
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Main entry point
-# ═══════════════════════════════════════════════════════════════════════
-
-
 def main(argv: list[str] | None = None) -> int:
     calib_cfg = CalibrationConfig()
     aruco_cfg = ArucoConfig()
@@ -1045,7 +992,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  hand geometry assertion: {args.hand_geometry}")
     print("=" * 60)
 
-    # ── Runtime config ──
+    # Resolve runtime configuration.
     try:
         runtime = resolve_runtime_config(
             yaml_path=args.config, cli_overrides={"camera.serial": args.serial},
@@ -1054,11 +1001,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Invalid calibration config: {exc}", file=sys.stderr)
         return 2
 
-    # ── Planner and safety gate ──
+    # Planner and safety gate.
     planner, safety_gate, workspace = _build_planner_and_gate(runtime)
     print(f"  XHand: not required ({args.hand_geometry} geometry used for collision checks)")
 
-    # ── SharedStorage + arm worker ──
+    # Shared storage and arm worker.
     ctx = mp.get_context("spawn")
     shared = SharedStorage.create(
         prefix=f"dexmani_calib_{os.getpid()}",
@@ -1084,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
     require_transition(shared, SafetyState.ARMED)
     print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
 
-    # ── Run ──
+    # Run calibration.
     exit_code = 1
     try:
         exit_code = _run_calibration(

@@ -31,9 +31,6 @@ _FORMATTER = logging.Formatter(
 _file_handler: logging.FileHandler | None = None
 _file_handler_init = False
 
-# Module-level logger — used by ThrottledWarner (initialized after get_logger below).
-
-
 def _get_file_handler() -> logging.FileHandler | None:
     """Create (once) a shared file handler for on-disk session logs.
 

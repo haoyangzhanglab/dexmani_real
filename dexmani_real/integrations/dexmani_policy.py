@@ -6,7 +6,7 @@ loader never touches torch. ``dexmani_policy`` is imported lazily — inside
 :meth:`DexManiPolicyBackend.load` — so the architecture gate holds: the
 core runs end-to-end on the fake without the model repository installed.
 
-First version: native joint action. An EE-action
+This adapter currently supports native joint action. An EE-action
 checkpoint without a validated EE->joint conversion is a startup reject. Any
 model-internal representation (FAAS, latent hand, …) must be converted back to
 native 12-DoF XHand by the model repository before this adapter sees it.
@@ -44,7 +44,7 @@ def _last_valid(window: Any, dof: int) -> np.ndarray:
     Mirrors ``deployment.fake._last_valid``: the observation adapter never lets
     a missing window crash the backend — an absent/stale window becomes a zero
     vector so the model still sees a well-typed input. The hand is the one
-    modality a joint-only first version may genuinely omit (see ``encode``).
+    modality a joint-only deployment may genuinely omit (see ``encode``).
     """
     if window is None:
         return np.zeros(dof, dtype=np.float64)
@@ -143,7 +143,7 @@ class DexManiPolicyBackend:
         if getattr(agent, "action_space", "joint") != "joint":
             raise ValueError(
                 "EE-action checkpoint requires a validated EE->joint conversion; "
-                "first version only supports native joint action"
+                "only native joint action is supported"
             )
         self._agent = agent
 
@@ -168,7 +168,7 @@ class DexManiPolicyBackend:
 class DexManiActionAdapter:
     """Model-native output -> denormalize -> ``JointActionChunk``.
 
-    First version only native joint action. The model output is expected as
+    This adapter supports native joint action only. The model output is expected as
     ``{"arm_qpos": [N,7], "hand_qpos": [N,12]|None}`` in radians (any model-side
     denormalization is the repository's job; this adapter only shapes it into the
     canonical chunk). An EE-shaped output fails closed rather than silently

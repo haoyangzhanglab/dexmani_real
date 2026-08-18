@@ -10,15 +10,6 @@ A single unified SRDF controls collision pair filtering:
   disabled. The 19-DOF model retains 255 active pairs: 17 arm-arm and
   238 arm-hand; no hand-hand pairs remain active.
 
-Performance (post-optimisation, measured on i9-13900K):
-
-=============  ==========  ============  ===========================================
-Operation       7-DOF       19-DOF        Notes
-=============  ==========  ============  ===========================================
-self-collision    ~30 μs     ~35 μs      ``pin.computeCollisions(stop_at_first)``
-segment (Δ=0.5)     —      ~870 μs      step_size=0.02 rad, 25 samples × ~35 μs
-=============  ==========  ============  ===========================================
-
 Usage::
 
     from dexmani_real.planning.collision_model import CollisionModel
@@ -53,9 +44,7 @@ _HAND_HOME_QPOS: np.ndarray = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np
 _warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # warn every 30s if hand_qpos never set
 _collision_detail_warn = ThrottledWarner(interval_s=60.0)
 
-# ---------------------------------------------------------------------------
-# Collision URDF / SRDF paths
-# ---------------------------------------------------------------------------
+# Collision model assets.
 _XHAND_DIR = ASSET_DIR / "robots" / "xhand"
 _COLLISION_URDF = str(_XHAND_DIR / "xarm7_xhand_collision.urdf")  # 7-DOF (hand fixed)
 _FULL_URDF = str(_XHAND_DIR / "xarm7_xhand_right.urdf")  # 19-DOF (7 arm + 12 hand)
@@ -76,11 +65,11 @@ class CollisionModel:
 
     - **7-DOF** (default, ``hand_dof=False``): arm-only collision model from the
       collision URDF (hand joints merged as fixed).  Accepts ``qpos`` of shape
-      ``(7,)``.  Self-collision ~30μs.
+      ``(7,)``.
 
     - **19-DOF** (``hand_dof=True``): full arm + hand collision model from the
       full URDF (hand joints active).  Accepts ``qpos`` of shape ``(19,)`` —
-      first 7 are arm joints, last 12 are hand joints.  Self-collision ~35μs.
+      first 7 are arm joints, last 12 are hand joints.
 
     Both modes use ``xarm7_xhand.srdf``, which enables arm-wrist
     to hand collision detection and keeps hand self-collision disabled.
@@ -110,20 +99,16 @@ class CollisionModel:
         _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
         _srdf = srdf_path or _COLLISION_SRDF
 
-        # --- Build model ---
+        # Build model.
         self._model = pin.buildModelFromUrdf(_urdf)
         self._data = self._model.createData()
 
-        # --- Build collision geometry ---
+        # Build collision geometry.
         self._collision_model = pin.buildGeomFromUrdf(
             self._model, _urdf, pin.GeometryType.COLLISION, package_dirs=[pkg]
         )
 
-        # --- Collision pair setup ---
-        # Both modes: URDFs have 0 default collision pairs.  Add all N*(N-1)/2
-        # possible pairs, then let the SRDF remove Adjacent + Never pairs.
-        # 7-DOF:  34 geometries, 233 active pairs after SRDF filtering.
-        # 19-DOF: 40 geometries, 255 active pairs (17 arm-arm + 238 arm-hand).
+        # Add all pairs, then apply SRDF exclusions.
         import itertools
 
         n = self._collision_model.ngeoms
@@ -209,7 +194,7 @@ class CollisionModel:
             len(self._environment_collision_model.collisionPairs),
         )
 
-        # --- qpos shape cache for validation ---
+        # Cache qpos shape for validation.
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
 
         # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF).
@@ -306,9 +291,7 @@ class CollisionModel:
             dtype=np.float64,
         )
 
-    # ------------------------------------------------------------------
-    # qpos handling
-    # ------------------------------------------------------------------
+    # qpos handling.
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         """Set the current hand joint configuration for auto-expansion.
@@ -360,9 +343,7 @@ class CollisionModel:
             )
         return qpos
 
-    # ------------------------------------------------------------------
-    # Core collision evaluation
-    # ------------------------------------------------------------------
+    # Core collision evaluation.
 
     def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
         """Compute self-collisions for a validated full configuration."""
@@ -373,9 +354,7 @@ class CollisionModel:
             )
         )
 
-    # ------------------------------------------------------------------
-    # Self-collision
-    # ------------------------------------------------------------------
+    # Self-collision.
 
     def check_self_collision(self, qpos: np.ndarray) -> bool:
         """Check if qpos is in self-collision (fast bool, single point).
@@ -450,9 +429,7 @@ class CollisionModel:
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))
 
-    # ------------------------------------------------------------------
-    # Static environment and combined collision checks
-    # ------------------------------------------------------------------
+    # Static environment and combined collision checks.
 
     @property
     def has_static_environment(self) -> bool:
@@ -556,9 +533,7 @@ class CollisionModel:
         self_info = self.check_self_collision_details(qpos)
         return self_info if self_info else self.check_environment_collision_details(qpos)
 
-    # ------------------------------------------------------------------
-    # Segment collision checking
-    # ------------------------------------------------------------------
+    # Segment collision checking.
 
     @staticmethod
     def _validate_step_size(step_size: float) -> float:
@@ -651,9 +626,7 @@ class CollisionModel:
     def _user_hand_to_urdf(self, hand_qpos: np.ndarray, name: str) -> np.ndarray:
         return self._validate_vector(hand_qpos, _HAND_DOF_COUNT, name)[list(_HAND_USER_TO_URDF)]
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # Helpers.
 
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
@@ -670,9 +643,7 @@ class CollisionModel:
             return self._model.frames[parent_frame].name
         return geom.name
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+    # Properties.
 
     @property
     def hand_dof(self) -> bool:

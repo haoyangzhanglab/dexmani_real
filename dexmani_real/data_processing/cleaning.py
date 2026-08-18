@@ -301,10 +301,10 @@ def analyze_episode(
     retarget_ok = _as_bool(reader, "flag_retarget_ok")
     frame_ok = arrays["frame_status"] == 0
     if np.count_nonzero(frame_ok & ~ik_ok) > frame_count // 2:
-        warnings.append("flag_ik_ok conflicts with mostly-OK frame_status; historical recorder alias bug suspected")
+        warnings.append("flag_ik_ok conflicts with mostly-OK frame_status; inspect recorder provenance")
     if np.count_nonzero(frame_ok & ~retarget_ok) > frame_count // 2:
         warnings.append(
-            "flag_retarget_ok conflicts with mostly-OK frame_status; historical recorder alias bug suspected"
+            "flag_retarget_ok conflicts with mostly-OK frame_status; inspect recorder provenance"
         )
 
     selected_frames = sum(segment.length for segment in segments)

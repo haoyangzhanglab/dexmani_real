@@ -523,7 +523,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             kb.stop()
             return
 
-    # Publish before policy_ready so Main never observes a ready worker with a zero heartbeat.
+    # Publish the heartbeat before marking policy ready.
     shared.set_heartbeat("policy", time.monotonic())
     shared.set_ready("policy")
     logger.debug("teleop_loop: READY")
@@ -1282,8 +1282,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             stage_timer.mark("ik")
 
             if not ik_result.success or ik_result.qpos is None:
-                # Arm is held; hand motion proceeds independently.
-                # SafetyGate validates well-formedness + joint limits only for hand-only commands.
+                # Arm is held; hand motion proceeds independently through SafetyGate.
                 if hand_available:
                     safe_hand_cmd = hand_cmd if hand_cmd_valid else None
                     publish_result = _safe_joint_publish(
@@ -1670,7 +1669,7 @@ def _print_status(
     arm_q_depth: int = -1,
     arm_state_age_s: float = -1.0,
 ) -> None:
-    """Periodic status print (~1 Hz)."""
+    """Periodic status print."""
     if arm_state is not None:
         _e = arm_state["eef_pos"][0]
         eef_str = f"eef={_e[0]:.3f},{_e[1]:.3f},{_e[2]:.3f}"

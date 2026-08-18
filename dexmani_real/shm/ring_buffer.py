@@ -26,9 +26,7 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
-# ---------------------------------------------------------------------------
-# Seqlock protocol helpers (odd/even markers for lock-free torn-read defence)
-# ---------------------------------------------------------------------------
+# Seqlock protocol helpers.
 
 
 def _seqlock_odd(seq: int) -> int:
@@ -221,9 +219,7 @@ class SharedMemoryRingBuffer:
             stale.unlink()
             return cls(name, dtype, maxlen=maxlen, create=True)
 
-    # ------------------------------------------------------------------
-    # Producer API
-    # ------------------------------------------------------------------
+    # Producer API.
 
     def write(self, data: np.ndarray) -> int:
         """Write one frame into the ring buffer (producer-side).
@@ -261,9 +257,7 @@ class SharedMemoryRingBuffer:
 
         return seq
 
-    # ------------------------------------------------------------------
-    # Consumer API
-    # ------------------------------------------------------------------
+    # Consumer API.
 
     def read_latest(self) -> tuple[np.ndarray, int, int] | None:
         """Return a verified ``(data, timestamp_ns, logical_sequence)`` frame."""
@@ -326,9 +320,7 @@ class SharedMemoryRingBuffer:
     def latest_sequence(self) -> int:
         return int(self._write_seq[0])
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # Lifecycle.
 
     def close(self) -> None:
         """Close the shared memory file descriptor (does NOT destroy)."""
@@ -355,9 +347,7 @@ class SharedMemoryRingBuffer:
             self, state["name"], np.dtype(state["dtype"]), maxlen=int(state["maxlen"]), create=False
         )
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+    # Internal helpers.
 
     def _init_header(self) -> None:
         """Initialize the header region with zeros."""

@@ -32,9 +32,7 @@ os.environ["RUST_LOG"] = "error"
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Known dataset categories for auto-detection
-# ---------------------------------------------------------------------------
+# Known dataset categories for auto-detection.
 
 _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "arm": {"arm_qpos", "arm_ee"},
@@ -76,9 +74,7 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
     return classified
 
 
-# ---------------------------------------------------------------------------
-# Info mode (no Rerun needed)
-# ---------------------------------------------------------------------------
+# Info mode (no Rerun needed).
 
 
 def print_episode_info(h5_path: str) -> None:
@@ -146,9 +142,7 @@ def print_episode_info(h5_path: str) -> None:
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
 
 
-# ---------------------------------------------------------------------------
-# Main visualizer
-# ---------------------------------------------------------------------------
+# Main visualizer.
 
 
 class EpisodeVisualizer:
@@ -171,7 +165,7 @@ class EpisodeVisualizer:
                 logger.warning("Episode is below the configured minimum recording duration")
             self._h5f = self._reader.h5f
     
-            # Pre-decode camera frames (~50 MB for 960 frames @ 640×480).
+            # Pre-decode camera sidecars once for interactive playback.
             self._rgb_cache: np.ndarray | None = None
             self._depth_cache: np.ndarray | None = None
             # RGB lives in the MP4 sidecar, so query the reader rather than the
@@ -213,7 +207,7 @@ class EpisodeVisualizer:
             else:
                 logger.info("No camera extrinsics in /meta — camera frame = world frame (identity)")
     
-            # ── Point cloud config ──
+            # Point-cloud configuration.
             self._pc_enabled = point_cloud and "depth" in (self._available.get("camera") or [])
             self._pc_stride = max(1, pc_stride)
             self._pc_min_depth = pc_min_depth
@@ -272,9 +266,7 @@ class EpisodeVisualizer:
             self.close()
             raise
 
-    # ------------------------------------------------------------------
-    # Init helpers
-    # ------------------------------------------------------------------
+    # Init helpers.
 
     def _resolve_frame_count(self, max_frames: int | None) -> int:
         """Return T = min(arm_qpos.shape[0], max_frames) falling back through meta keys."""
@@ -324,9 +316,7 @@ class EpisodeVisualizer:
 
         return state
 
-    # ------------------------------------------------------------------
-    # Point cloud generation
-    # ------------------------------------------------------------------
+    # Point cloud generation.
 
     @staticmethod
     def _depth_to_pointcloud(
@@ -362,9 +352,7 @@ class EpisodeVisualizer:
 
         return points, colors
 
-    # ------------------------------------------------------------------
-    # Blueprint
-    # ------------------------------------------------------------------
+    # Blueprint.
 
     def _build_blueprint(self) -> rrb.Blueprint:
         """Build Rerun view layout from detected data categories."""
@@ -431,9 +419,7 @@ class EpisodeVisualizer:
 
         return rrb.Blueprint(rrb.Horizontal(contents=columns))
 
-    # ------------------------------------------------------------------
-    # Static metadata
-    # ------------------------------------------------------------------
+    # Static metadata.
 
     def _log_static(self) -> None:
         """Log per-series labels, camera pinhole, and extrinsics once."""
@@ -496,9 +482,7 @@ class EpisodeVisualizer:
             return f"state/{key}"
         return f"{category}/{key}"
 
-    # ------------------------------------------------------------------
-    # Per-step logging
-    # ------------------------------------------------------------------
+    # Per-step logging.
 
     def log_step(self, step_idx: int) -> None:
         """Log camera, fingertips, and time series for one timestep."""
@@ -509,9 +493,7 @@ class EpisodeVisualizer:
         self._log_fingertips(step_idx)
         self._log_time_series(step_idx)
 
-    # ------------------------------------------------------------------
-    # Camera + point cloud
-    # ------------------------------------------------------------------
+    # Camera and point cloud.
 
     def _log_camera(self, step_idx: int) -> None:
         camera_keys = self._available.get("camera", [])
@@ -557,9 +539,7 @@ class EpisodeVisualizer:
                     points = points @ self._cam_R.T + self._cam_t
                 rr.log("pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
 
-    # ------------------------------------------------------------------
-    # Fingertip keypoints
-    # ------------------------------------------------------------------
+    # Fingertip keypoints.
 
     def _log_fingertips(self, step_idx: int) -> None:
         """Render hand_fingertip FK positions as per-finger colored keypoints."""
@@ -581,9 +561,7 @@ class EpisodeVisualizer:
             ),
         )
 
-    # ------------------------------------------------------------------
-    # Time series logging
-    # ------------------------------------------------------------------
+    # Time-series logging.
 
     def _log_time_series(self, step_idx: int) -> None:
         for category, keys in self._available.items():
@@ -609,9 +587,7 @@ class EpisodeVisualizer:
                 for i in range(arr.shape[1]):
                     rr.log(f"state/{fkey}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-    # ------------------------------------------------------------------
-    # Public helpers
-    # ------------------------------------------------------------------
+    # Public helpers.
 
     @property
     def num_steps(self) -> int:
@@ -629,19 +605,19 @@ class EpisodeVisualizer:
             pass
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# CLI.
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes with Rerun 3D.")
-    parser.add_argument("episode", type=str, help="Path to an episode (.h5 file or directory).")
+    parser.add_argument("episode", type=str, help="Path to a schema-v17 episode directory.")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
     parser.add_argument(
         "--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale)."
     )
-    parser.add_argument("--info", action="store_true", help="Print HDF5 structure summary and exit (no Rerun needed).")
+    parser.add_argument(
+        "--info", action="store_true", help="Print structure summary and exit without starting a Rerun viewer."
+    )
     parser.add_argument(
         "--point-cloud", action=argparse.BooleanOptionalAction, default=True, help="Enable 3D point cloud from depth."
     )

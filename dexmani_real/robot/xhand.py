@@ -34,22 +34,14 @@ from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
-# The vendor SDK matches the transport string case-sensitively: it accepts
-# "EtherCAT"/"RS485", not our canonical lowercase "ethercat"/"serial".
-# ``enumerate_devices("ethercat")`` silently returns [] (no slaves found) and
-# the connect path reports a spurious "no slave enumerated" — map the canonical
-# value to the SDK spelling at the single SDK boundary.
+# Map canonical transport names at the SDK boundary.
 _SDK_ENUMERATE_PROTOCOL = {
     "ethercat": "EtherCAT",
     "serial": "RS485",
 }
 
-# RS485 control/state transactions also refresh the five fingertip sensors.
-# These statuses identify which sensor sub-field failed while the joint portion
-# (and, for send_command, the absolute position target) remains usable. Keep
-# them field-specific: temperature is not part of our tactile schema, and a
-# distributed-force failure does not invalidate the independently reported
-# combined force. CRC/timeout/board errors still invalidate the transaction.
+# RS485 status codes can invalidate tactile fields without invalidating an
+# otherwise usable joint/endpoint transaction; CRC, timeout and board errors do.
 _RS485_COMBINED_FORCE_ERROR_CODE = 1_501_018
 _RS485_DISTRIBUTED_FORCE_ERROR_CODE = 1_501_019
 _RS485_TEMPERATURE_ERROR_CODE = 1_501_020
@@ -70,10 +62,7 @@ _RS485_CRC_ERROR_CODE = 1_501_070
 
 @dataclass
 class XHandConfig:
-    # Canonical transport protocol: "serial" (production RS485) or "ethercat"
-    # (explicit fallback). Validated to this closed set in __post_init__ so the
-    # driver never guesses a protocol from a fuzzy alias. Hardware defaults
-    # come from HandParams so direct driver use and production workers agree.
+    # Canonical transport: "serial" (RS485) or "ethercat".
     comm_type: str = field(default_factory=lambda: hand.comm_type)
     device_name: str | None = field(default_factory=lambda: hand.device_name)
     baudrate: int = field(default_factory=lambda: hand.baudrate)
@@ -81,17 +70,10 @@ class XHandConfig:
     ethercat_slave_position: int = field(default_factory=lambda: hand.ethercat_slave_position)
     simulation_backend: bool = False
 
-    # RS485 connection retry. A fresh XHandControl + open_serial() handles
-    # intermittent USB/serial cold-start failures without reusing a failed
-    # native handle.
+    # RS485 connection retries use a fresh native handle.
     open_serial_retries: int = 3
-    # EtherCAT retries (separate from RS485).  Each failed open_ethercat() call
-    # transitions the slave to OP even on error — the SDK's internal ec_init →
-    # PRE_OP → SAFE_OP → OP sequence runs to completion regardless of PDO/SDO
-    # outcome.  Repeated retries multiply slave-state corruption without recovery
-    # value when the failure is persistent (CoE dictionary lock).  One retry
-    # after the stale-OP wait covers transient SDO glitches; beyond that the
-    # failure requires a power cycle.
+    # EtherCAT retries are capped separately because failed opens can leave the
+    # slave state inconsistent.
     open_ethercat_retries: int = 2
     open_serial_retry_delay_s: float = 2.0
     rs485_post_open_settle_s: float = field(default_factory=lambda: hand.rs485_post_open_settle_s)
@@ -99,14 +81,10 @@ class XHandConfig:
     rs485_read_crc_retry_count: int = field(default_factory=lambda: hand.rs485_read_crc_retry_count)
     rs485_crc_retry_backoff_s: float = field(default_factory=lambda: hand.rs485_crc_retry_backoff_s)
 
-    # Request a live state transaction instead of returning the SDK cache.
-    # The vendor 1.1.8 API documents that serial send_command() refreshes the
-    # cache and read_state(..., True) sends a separate state-refresh request.
+    # Request live state instead of returning the SDK cache.
     force_update_state: bool = True
 
-    # Connect-time state initialization.
-    # Always request fresh feedback so a newly opened RS485 connection never
-    # seeds command history from the SDK's zero/uninitialized cache.
+    # Seed command history only from fresh feedback.
     init_state_read_attempts: int = 3
     init_state_read_interval: float = 0.02
 
@@ -124,37 +102,23 @@ class XHandConfig:
         default_factory=lambda: np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64)
     )
 
-    # Scalar fallback gains, applied to every joint when the per-joint
-    # overrides below are not supplied. The production hand worker supplies
-    # per-joint gains resolved from config.defaults.HandParams.
+    # Scalar fallback gains.
     kp: int = 100
     ki: int = 0
     kd: int = 0
-    # Per-joint overrides replace the scalar gains when configured.
-    # When set (shape (12,)), individual joint gains replace the scalar
-    # kp/ki/kd. The deployed config raises index abduction (J3) kp to 120.
+    # Optional per-joint gain overrides.
     kp_per_joint: np.ndarray | None = None  # (12,) per-joint kp overrides
     ki_per_joint: np.ndarray | None = None  # (12,) per-joint ki overrides
     kd_per_joint: np.ndarray | None = None  # (12,) per-joint kd overrides
-    # Scalar fallback current limit, applied to every joint when the per-joint
-    # overrides below are not supplied.
+    # Scalar fallback current limit.
     tor_max: int = 300  # mA
-    # Per-joint tor_max overrides. When set (shape (12,)), individual joint
-    # current limits replace the scalar tor_max. The deployed config raises
-    # index abduction (J3) to 360 mA to handle sideways loading.
+    # Optional per-joint current-limit overrides.
     tor_max_per_joint: np.ndarray | None = None  # (12,) per-joint tor_max overrides
     mode: int = 3
 
-    # ── F1: Tactile contact detection ──
-    # L2 threshold in the SDK's scaled tactile units.  The vendor/firmware
-    # provenance for a physical SI conversion has not been validated on this
-    # installation, so recordings deliberately label the unit unknown.
+    # Tactile thresholds use SDK-scaled units; SI conversion is unverified.
     tactile_contact_threshold: float = 1.0
-    # Per-point raw-force magnitude threshold (same scaled units) for the
-    # startup "genuine contact" gate.  calc_force can carry a residual DC
-    # offset on some sensors, so genuine contact is judged from the raw
-    # 120-point force field instead; a raw force above this threshold means a
-    # real contact, not an offset.  Requires per-hardware calibration.
+    # The startup contact gate uses the raw force field.
     raw_force_contact_threshold: float = 1.0
 
     def __post_init__(self) -> None:
@@ -284,14 +248,12 @@ class XHand:
         self._tactile_bias_raw: np.ndarray | None = None  # (5, 120, 3) — raw_force bias
         self.tactile_calibrated: bool = False
         self._last_tactile_payload_valid: bool | None = None
-        # Send-side status is retained only to de-duplicate transition logs. It
-        # must never invalidate later read_state() tactile frames.
+        # Retain send-side status only for transition-log de-duplication.
         self._rs485_send_tactile_status_code: int | None = None
         self._rs485_read_tactile_status_code: int | None = None
 
         self._stub_mode = False
         self.last_hand_ids: list[int] = []
-        # Canonical transport protocol (validated in XHandConfig.__post_init__).
         self.cached_comm_type = self.config.comm_type
         self.device_identity: dict[str, str] = {
             "backend": "hardware" if _SDK_AVAILABLE else "unavailable",
@@ -300,7 +262,7 @@ class XHand:
             "serial_number": "unavailable",
         }
 
-    # ── Connect lifecycle ──
+    # Connect lifecycle.
 
     def connect(self) -> bool:
         """Connect to XHand hardware.
@@ -380,18 +342,13 @@ class XHand:
         moving it to Main would violate the process boundary and make clean
         shutdown harder to prove.
         """
-        # RS485 may need several attempts after cold start; EtherCAT uses a
-        # lower retry cap because each failed open_ethercat() transitions the
-        # slave to OP regardless of PDO/SDO outcome, and repeated transitions
-        # compound state corruption without recovery value.
+        # Keep EtherCAT retry count lower because failed opens can compound
+        # slave-state corruption.
         retries = max(
             1, int(self.config.open_ethercat_retries if comm_type == "ethercat" else self.config.open_serial_retries)
         )
         delay = max(0.0, float(self.config.open_serial_retry_delay_s))
 
-        # device_name stays None only while the config supplies no name and we
-        # have not discovered one this connect.  Discovery runs on the same
-        # control that will open (no throwaway discovery control).
         device_name = self.config.device_name
         self.device_name = device_name
 
@@ -487,13 +444,7 @@ class XHand:
             # Close the failed control before retry
             self._close_control()
             if attempt < retries:
-                # On EtherCAT, the first failure may be a stale-slave-state
-                # condition (previous session exited without clean disconnect,
-                # leaving the slave in OP).  A longer wait gives the slave's
-                # SM-watchdog time to expire so the retry sees a clean INIT
-                # slave.  On later attempts the standard retry delay is
-                # sufficient — if the slave was in OP, the first retry's wait
-                # already handled it; if not, it's a different error class.
+                # Give EtherCAT a longer first retry window for stale slave state.
                 _retry_delay = delay
                 if comm_type == "ethercat" and attempt == 1:
                     _retry_delay = max(delay, self._STALE_OP_RECOVERY_WAIT_S)
@@ -515,7 +466,6 @@ class XHand:
                     )
                 time.sleep(_retry_delay)
 
-        # All retries exhausted
         self.error_state = True
         logger.error(
             "XHand connect failed after %s attempts: %s",
@@ -614,11 +564,8 @@ class XHand:
             logger.error("Tactile calibration refused: contact/load or invalid tactile data detected at startup")
             return False
 
-        # Reset all five fingertip sensors after power-on.  The SDK documents
-        # that some sensors may need an explicit reset before they begin
-        # reporting data (sensor IDs 17–21: thumb, index, middle, ring, little).
-        # Failures are logged but do not block operation — a dead sensor is
-        # less harmful than a refused connection.
+        # Reset fingertip sensors after power-on. Reset failures are logged but
+        # do not block joint operation.
         try:
             self._reset_tactile_sensors()
         except Exception:
@@ -679,7 +626,7 @@ class XHand:
         unsupported_reset_count = 0
 
         for outer in range(MAX_OUTER_ITERS):
-            # ── Reset only sensors that still have residual offset ──
+            # Reset sensors with residual offset.
             for idx in bad_indices:
                 sensor_id = 17 + idx
                 for attempt in range(3):
@@ -716,7 +663,7 @@ class XHand:
                         FINGER_LABELS[idx],
                     )
 
-            # ── Verify: read fresh state (before bias) and check force magnitudes ──
+            # Verify fresh state and force magnitudes.
             err, hand_state = self.read_raw_state(force_update=True)
             if not self._status_allows_combined_force(err):
                 logger.warning(
@@ -837,11 +784,8 @@ class XHand:
             ft_samples.append(force_sum)
             raw_samples.append(raw_force)
 
-        # A loaded/contacting hand is not a valid zero reference. Refuse to
-        # absorb the external load into the software bias. Judge contact from
-        # the raw force field, not calc_force, so a residual calc_force DC
-        # offset doesn't refuse calibration (the calc_force bias below still
-        # absorbs that offset).
+        # Do not absorb an external load into the software bias. Judge startup
+        # contact from the raw force field, not the biased aggregate.
         raw_magnitude = np.linalg.norm(np.stack(raw_samples, axis=0), axis=3)
         if float(np.max(raw_magnitude)) > self.config.raw_force_contact_threshold:
             self._tactile_bias_ft = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
@@ -883,14 +827,12 @@ class XHand:
         """
         device_id = self.config.device_id
 
-        # SDK version
         try:
             ver = self.control.get_sdk_version()
             self.device_identity["sdk_version"] = str(ver)
         except Exception:
             logger.warning("XHand SDK version: unavailable", exc_info=True)
 
-        # Hand type (left / right)
         try:
             err, hand_type = self.control.get_hand_type(device_id)
             if self.error_ok(err):
@@ -902,7 +844,6 @@ class XHand:
         except Exception:
             logger.warning("XHand get_hand_type: unavailable", exc_info=True)
 
-        # Serial number
         try:
             err, serial = self.control.get_serial_number(device_id)
             if self.error_ok(err):
@@ -922,21 +863,13 @@ class XHand:
             device_id,
         )
 
-    # ── EtherCAT slave state management ──
-
-    # AL state constants (EtherCAT standard / SOEM convention). Only INIT is
-    # used here: disconnect requests the slave transition back to INIT.
+    # EtherCAT INIT state used during disconnect.
     _EC_STATE_INIT = 1
 
-    # Post-disconnect watchdog wait (seconds).  After close_device() the slave
-    # firmware has no more master frames; its internal SM-watchdog must expire
-    # before it auto-transitions to SAFE_OP+Error and then INIT.  Typical
-    # EtherCAT watchdogs are 100–1000 ms; 2.0 s gives a comfortable margin.
+    # After close_device(), wait for the slave to return to INIT.
     _POST_DISCONNECT_WATCHDOG_WAIT_S = 2.0
 
-    # Extra wait on the first EtherCAT connect retry when the slave may still be
-    # in OP from a previous session whose disconnect path was skipped (kill -9,
-    # power blip, SDK crash, etc.).  Combine with the standard retry delay.
+    # Extra wait for a stale EtherCAT slave on the first connect retry.
     _STALE_OP_RECOVERY_WAIT_S = 3.0
 
     def _request_slave_init(self) -> bool:
@@ -1002,10 +935,7 @@ class XHand:
         if self._stub_mode:
             self.connected_flag = False
             return
-        # Close whenever a control handle exists — including the residual
-        # open-raise / unsupported-comm_type paths that leave a never-opened
-        # control behind (see _retry_open_device). The slave INIT request and
-        # post-close watchdog wait apply only to a connected EtherCAT device.
+        # Close any residual handle; EtherCAT cleanup also requests INIT.
         if self.control is not None:
             connected_ethercat = self.connected_flag and self.cached_comm_type == "ethercat"
             if connected_ethercat:
@@ -1032,10 +962,8 @@ class XHand:
                     "ec_init/socket creation reports a permission failure."
                 )
             if self.last_error_code != -2:
-                # SDO write failures during open_ethercat (e.g. "write sdo
-                # failed 1,0,13") indicate that a previous unclean exit may
-                # have left the slave state inconsistent. No-slave discovery
-                # (-2) occurs before SDO traffic, so this advice would be noise.
+                # SDO failures may indicate stale EtherCAT slave state; discovery
+                # failures occur earlier and are reported separately.
                 logger.error(
                     "If SDO errors appeared above: the previous session may not "
                     "have called disconnect() cleanly (e.g. kill -9 or SDK crash). "
@@ -1116,13 +1044,8 @@ class XHand:
             tactile_force_expected=self._status_allows_distributed_force(err),
             tactile_sum_expected=self._status_allows_combined_force(err),
         )
-        # Bridge board-status (Layer 2) into safety gate: per-joint hardware
-        # board error registers gate commands on hardware-level faults.
-        # Unlike send/read errors (tracked via _record_error), board errors are
-        # transient and self-clear on the next healthy frame.  A single
-        # read/write result is decided by the current SDK return: ``error_state``
-        # is recomputed from the board registers on every successful read, so
-        # there is no separate "clear" step to invoke.
+        # Board registers gate commands on hardware faults; their state is
+        # recomputed on each successful read.
         self.error_state = bool(
             np.any(sample.commboard_err)
             or np.any(sample.jointboard_err)
@@ -1139,8 +1062,6 @@ class XHand:
         if not self._validate_joint_range(target_qpos):
             return False
         if self._stub_mode:
-            # Track the accepted request so following simulation mirrors the
-            # same all-or-nothing command contract as hardware.
             self.last_qpos_cmd = target_qpos.copy()
             return True
 
@@ -1150,8 +1071,7 @@ class XHand:
                 self.last_error_message = "hand_command is None (not initialized)"
             return False
 
-        # The policy boundary owns primary command validation. The driver
-        # redundantly checks bounds and forwards the endpoint unchanged.
+        # Recheck bounds at the SDK boundary and forward the endpoint unchanged.
         qpos_cmd = target_qpos.copy()
         self.write_command_positions(qpos_cmd)
         err = self._send_command_with_crc_retry()
@@ -1252,7 +1172,6 @@ class XHand:
         for i in range(HAND_DOF):
             cmd = command.finger_command[i]
             cmd.id = i
-            # Per-joint gains replace scalar defaults when configured.
             cmd.kp = int(self.config.kp_per_joint[i]) if self.config.kp_per_joint is not None else int(kp)
             cmd.ki = int(self.config.ki_per_joint[i]) if self.config.ki_per_joint is not None else int(ki)
             cmd.kd = int(self.config.kd_per_joint[i]) if self.config.kd_per_joint is not None else int(kd)
@@ -1540,7 +1459,6 @@ class XHand:
         return False
 
     def _unpack_result(self, result):
-        # The SDK always returns tuple[ErrorStruct, HandState_t].
         if isinstance(result, (tuple, list)) and len(result) >= 2:
             return result[0], result[1]
         return None, None

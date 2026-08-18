@@ -103,11 +103,6 @@ class CameraLoopConfig:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Camera frame packing helper
-# ═══════════════════════════════════════════════════════════════════
-
-
 def pack_camera_frame(
     rgb: "np.ndarray",
     depth_raw: "np.ndarray",
@@ -177,11 +172,6 @@ def pack_camera_frame(
     return header, rgb_arr, depth_arr
 
 
-# ═══════════════════════════════════════════════════════════════════
-# camera_loop — mp.Process target
-# ═══════════════════════════════════════════════════════════════════
-
-
 def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None) -> None:
     """Run RealSense camera → write frames directly to ``shared.camera_ring``.
 
@@ -198,21 +188,18 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     failed = False
     _logger.debug("camera_loop: LOADING")
 
-    # The persisted T_world_camera calibration is measured in the color optical
-    # frame.  Production pointclouds must therefore deproject aligned depth in
-    # that same frame.  ``color_to_depth`` would use depth-frame rays with the
-    # color-frame extrinsic, while ``none`` would leave RGB/depth unregistered.
-    # Fail closed before importing or constructing the device SDK.
+    # Calibration and aligned depth must use the same color-optical frame.
+    # Reject incompatible alignment before opening the device SDK.
     if cfg.align_mode != "depth_to_color":
         _logger.error(
-            "camera_loop: align_mode=%r is unsupported for production recording; "
+            "camera_loop: align_mode=%r is unsupported for recording; "
             "the color-optical calibration requires 'depth_to_color'",
             cfg.align_mode,
         )
         _logger.info("camera_loop: exited")
         return
 
-    # ── Thread pool limit ──
+    # Thread pool limit.
     # OpenCV/NumPy default to multi-threading on many-core machines, competing
     # for CPU with the configured policy loop. We rely on process-level parallelism
     # (arm/hand/camera each in its own process), not per-library thread pools.
@@ -225,7 +212,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
 
     cam = None
     try:
-        # ── Create and connect camera ──
+        # Create and connect camera.
         from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
 
         rs_config = RealSenseConfig(
@@ -244,7 +231,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             failed = True
             return
 
-        # ── Publish metadata to SharedStorage ──
+        # Publish metadata.
         shared.camera_depth_scale.value = float(cam.get_depth_scale())
         _serial_raw = str(cam.active_serial or "")
         shared.camera_serial.value = _serial_raw[:31].ljust(32, "\x00").encode()
@@ -272,7 +259,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         if cam.K is not None:
             shared.camera_K[:] = cam.K.flatten().tolist()
 
-        # ── Publish the resolved pointcloud derivation config (best-effort) ──
+        # Publish point-cloud derivation metadata.
         # The point cloud is no longer computed in this loop: it is derived at
         # the consumption boundary (offline in data_processing, online in the
         # deployment observation adapter) from the recorded depth.  We still
@@ -305,23 +292,19 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             _logger.warning("camera_loop: pointcloud derivation config DISABLED", exc_info=True)
             shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
 
-        # ── Main capture loop ──
+        # Main capture loop.
         rate_mgr = RateManager(cfg.publish_hz)
         ready_published = False
 
         while shared.is_running.value:
-            # Publish the raw RGB-D payload during the DISARMED startup phase
-            # (so Main's preflight health gate observes a recent source frame)
-            # and whenever RecorderIO consumes it; otherwise avoid sustained
-            # ~1.6 MB/frame SHM copies.  The point cloud is no longer computed
-            # here — publishing depth immediately keeps the camera observation
-            # fresh (~1 tick instead of ~2).
+            # Publish startup/recording RGB-D payloads; publish metadata-only
+            # frames during steady operation to keep the camera ring current.
             _publish_payload = (
                 not ready_published
                 or int(shared.safety_state.value) == int(SafetyState.DISARMED)
                 or bool(shared.is_recording.value)
             )
-            # --- read frame ---
+            # Read frame.
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
@@ -335,7 +318,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 continue
             shared.set_heartbeat("camera", time.monotonic())
 
-            # --- write to SharedStorage ring ---
+            # Write to the shared ring.
             if _publish_payload:
                 pc_valid_depth_ratio = float(np.count_nonzero(frame.depth_raw) / frame.depth_raw.size)
                 if frame.clock_reset:
@@ -373,7 +356,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
 
-            # --- maintain target rate (absolute-deadline scheduling, consistent with other loops) ---
+            # Maintain the target rate.
             rate_mgr.wait()
 
     except Exception:

@@ -26,7 +26,7 @@ _READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "policy"
 class HomingParams:
     """Firmware-planned execution parameters for validated home milestones."""
 
-    convergence_rad: float = 0.002618  # final canonical-home tolerance (~0.15°)
+    convergence_rad: float = 0.002618  # final canonical-home tolerance
     step_interval_s: float = 0.04  # controller-state polling interval
     max_speed_deg_s: float = 30.0  # conservative Mode 0 joint speed; hardware validation required before tuning
     target_timeout_s: float = 0.5  # settling allowance added after distance/speed timing
@@ -86,10 +86,10 @@ class WorkspaceBounds:
 
 @dataclass(frozen=True)
 class EMAParams:
-    """Cartesian-space EMA smoothing parameters (tuned for the default 16 Hz grid)."""
+    """Cartesian-space EMA smoothing parameters."""
 
-    alpha_pos: float = 0.6  # τ≈65 ms at 16 Hz
-    alpha_rot: float = 0.25  # τ≈223 ms at 16 Hz
+    alpha_pos: float = 0.6
+    alpha_rot: float = 0.25
 
     def __post_init__(self) -> None:
         if not (np.isfinite(self.alpha_pos) and np.isfinite(self.alpha_rot)):
@@ -104,7 +104,7 @@ class VRMappingParams:
 
     pos_scale: float = 1.0
     rot_scale: float = 1.0
-    max_delta_rot_rad: float = 3.0  # ~172° total-from-reset rotation cap
+    max_delta_rot_rad: float = 3.0  # total-from-reset rotation cap
     stale_threshold_s: float = 0.5
 
     def __post_init__(self) -> None:
@@ -164,11 +164,7 @@ class TableCollisionConfig:
     plane_abcd: tuple[float, float, float, float] = (0.0, 0.0, 1.0, -0.022)
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
-    # Nominal 10 mm mesh clearance plus the ~10 mm flange-adapter residual: the
-    # collision model loads the collision URDF with flange_joint2 at the raw
-    # 0.043 m, while the FK/planning path compensates it to 0.033 m (see
-    # HandParams.T_eef_handbase_pos_xyz). The collision model applies no
-    # equivalent correction, so that residual is folded into this clearance.
+    # Includes the calibrated flange-model residual.
     soft_clearance_m: float = 0.02
     allowed_contact_links: tuple[str, ...] = ("link_base",)
 
@@ -222,18 +218,18 @@ class EnvironmentConfig:
 class ArmParams:
     """xArm7 hardware parameters — single source of truth."""
 
-    # ── Home position (rad) — neutral pose ──
+    # Home position in radians.
     home_qpos: tuple[float, ...] = (
-        0.0,  # J1: 0.0°
-        0.041888,  # J2: 2.4°
-        0.001745,  # J3: 0.1°
-        0.417134,  # J4: 23.9°
-        -3.138102,  # J5: -179.8°
-        1.195551,  # J6: 68.5°
-        0.0,  # J7: 0.0°
+        0.0,
+        0.041888,
+        0.001745,
+        0.417134,
+        -3.138102,
+        1.195551,
+        0.0,
     )
 
-    # ── Joint limits (rad) — mirrors xarm7 URDF ──
+    # Joint limits (rad), mirrored from the xArm URDF.
     # URDF source: assets/robots/xhand/xarm7_xhand_collision.urdf
     joint_limit_lower: tuple[float, ...] = (
         -6.28318530718,
@@ -254,43 +250,35 @@ class ArmParams:
         6.28318530718,
     )
 
-    # ── Dynamics (Mode 6 firmware) ──
+    # Mode 6 firmware limits.
     max_joint_velocity_deg_per_s: float = 120.0  # firmware trajectory speed
     max_joint_acceleration_deg_per_s2: float = 900.0  # firmware trajectory acceleration
     loop_hz: float = 30.0  # arm_loop servo rate
 
-    # ── Connection ──
     ip: str = "192.168.1.111"
 
-    # ── Device identity (validated against the SDK report at connect) ──
+    # Device identity checks at connect.
     expected_axis: int = 7
     # Explicit model check is opt-in: None means "don't guess the model".
     device_profile: str | None = None
     serial_number: str | None = None  # enforced only when configured
     min_firmware: tuple[int, ...] | None = None  # integer-tuple compare via version_number
 
-    # ── Environment ──
-    # Compatibility fallback when calibrated environment.table is disabled.
+    # Fixed-Z fallback when calibrated table geometry is disabled.
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
-    # ── Safety ──
+    # Safety thresholds.
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
-    # UFACTORY semantics: 0 disables detection; 1 is the least-sensitive
-    # enabled level and sensitivity increases through level 5.
+    # UFACTORY collision sensitivity, 0–5.
     collision_sensitivity: int = 1
 
-    # ── TCP load (end-effector mass/COG for firmware dynamics) ──
-    # XHand (1.1 kg). COG in tool-flange frame (link_eef) from URDF weighted-COM
-    # of all end-effector links; flange_joint2 corrected 0.043→0.033 m per
-    # physical measurement.
+    # TCP load for firmware dynamics; COG is in the tool-flange frame.
     tcp_load_mass_kg: float = 1.1
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
-    # ── Homing ──
     homing: HomingParams = field(default_factory=HomingParams)
 
-    # ── Derived ──
     @property
     def max_joint_velocity_rad_per_s(self) -> float:
         return float(np.deg2rad(self.max_joint_velocity_deg_per_s))
@@ -391,16 +379,10 @@ _XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
 class HandParams:
     """XHand hardware parameters — single source of truth."""
 
-    # Optional EtherCAT fallback. The slave position has not been independently
-    # validated for this installation. -1 means unknown: close the device and
-    # wait for the watchdog, but do not issue a guessed firmware-state request.
+    # -1 means unknown; EtherCAT is closed without a guessed state request.
     ethercat_slave_position: int = -1
 
-    # ── Connection / transport ──
-    # Canonical transport protocol. Production uses "serial" (RS485);
-    # "ethercat" remains an explicit runtime override. The value is validated
-    # to this closed set, so the driver never guesses a protocol from a fuzzy
-    # string (the former rs485/usb/eth/ecat aliases are gone).
+    # Explicit transport protocol: serial or ethercat.
     comm_type: str = "serial"
     # Fixed RS485 serial device. Ignored for EtherCAT.
     device_name: str | None = "/dev/ttyUSB0"
@@ -408,22 +390,14 @@ class HandParams:
     baudrate: int = 3_000_000
     # Vendor device id the driver must find among enumerated hands at connect.
     device_id: int = 0
-    # Give the native USB/RS485 receive thread time to settle before the first
-    # identity or live-state transaction.
+    # Allow the receive thread to settle after opening the port.
     rs485_post_open_settle_s: float = 1.0
-    # A send CRC cannot prove whether the absolute position command was
-    # applied, so retry the same endpoint once. A live state transaction is
-    # read-only and may be retried twice to absorb the observed first-read CRC
-    # transient without accepting an unverified frame.
+    # Send/read retry counts for transient serial CRC errors.
     rs485_crc_retry_count: int = 1
     rs485_read_crc_retry_count: int = 2
     rs485_crc_retry_backoff_s: float = 0.08
 
-    # ── Home position (deg) — Dexora right-hand initial pose ──
-    # Dexora deploy/xhand_forwarder.py ``INIT_JOINTS_DEG["right_hand"]`` in
-    # XHand SDK joint order, projected onto this project's stricter operational
-    # command floors. J2 is raised from 3° to 10°; J5/J7/J9/J11 are raised to
-    # 5° so home remains clear of the rated mechanical lower stops.
+    # Home position in canonical SDK order (degrees).
     home_qpos_deg: tuple[float, ...] = (
         30.0,
         55.33,
@@ -439,18 +413,11 @@ class HandParams:
         5.0,
     )
 
-    # Rated mechanical ranges from the bundled vendor-derived XHand right-hand
-    # URDF. These describe the model/hard-stop envelope and cannot be widened
-    # by a runtime override for this device model.
+    # Rated mechanical envelope from the bundled XHand URDF.
     mechanical_qpos_min_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MIN_RAD
     mechanical_qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
 
-    # Operational command bounds. The distal lower bounds are an operator-set
-    # anti-clogging margin (thumb_rota_j2 +10°, index/mid/ring/pinky_j2 +5°)
-    # that keeps *commands* away from the 0° hard stop. They are enforced by
-    # clipping the command on publish — never by rejecting the action, and never
-    # against measured feedback: the hand settles imprecisely (a 5° command
-    # lands ~4.6°) and contact can pull the measured angle far from the command.
+    # Command-only operational bounds; applied at publication, not feedback validation.
     qpos_min_rad: tuple[float, ...] = (
         0.0,
         -0.698,
@@ -467,10 +434,8 @@ class HandParams:
     )
     qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
 
-    # ── Servo gains (PID) and current limit ──
-    # Per-joint proportional gains. Index abduction (J3) is raised to 120 to
-    # compensate for sideways loading; all other joints use 100. Integral and
-    # derivative gains are uniform (0) across all joints.
+    # Servo gains and current limit.
+    # Per-joint proportional gains.
     kp: tuple[int, ...] = (
         100,
         100,
@@ -488,9 +453,7 @@ class HandParams:
     ki: int = 0
     kd: int = 0
 
-    # Per-joint torque (current) limit in mA. Thumb bend (J0) and index
-    # abduction (J3) are raised to 360 mA (thumb opposition loading during
-    # grasp; index sideways loading); all other joints use 300 mA.
+    # Per-joint current limits in mA.
     tor_max_ma: tuple[int, ...] = (
         360,
         300,
@@ -508,18 +471,16 @@ class HandParams:
 
     loop_hz: float = 30.0
 
-    # ── Homing ──
+    # Homing.
     # Return-home waits only for the hand worker/SDK to accept the configured
     # home command. It never waits for measured joint convergence.
     home_command_ack_timeout_s: float = 1.0
 
-    # ── Send-error watchdog ──
-    # Frame-count threshold: only a failed *new* command send increments the
-    # counter, so 30 consecutive failures span ~1.875s at the 16 Hz command
-    # rate (not the 30 Hz worker loop rate).
+    # Send-error watchdog.
+    # Only a failed new-command send increments this counter.
     send_err_watchdog_count: int = 30
 
-    # ── Hand FK (fingertip positions in world frame) ──
+    # Hand FK (world-frame fingertip positions).
     fingertip_link_names: tuple[str, ...] = (
         "right_hand_thumb_rota_tip",
         "right_hand_index_rota_tip",
@@ -527,18 +488,9 @@ class HandParams:
         "right_hand_ring_tip",
         "right_hand_pinky_tip",
     )
-    # Static transform from planning EEF (custom_eef_link) to hand base (right_hand_link).
-    # quat = RotY(+π/2) — hand_base Z points palm-forward in URDF; EEF X is link_eef Z.
-    #
-    # T_eef_handbase_pos breakdown:
-    #   URDF raw value  = -0.005 m  (right_hand_mount_joint origin in custom_eef_link)
-    #   Physical flange correction = -0.010 m  (URDF 0.043 m → measured 0.033 m, short 10 mm;
-    #                              link_eef -Z = custom_eef_link +X, so compensated in -X)
-    #   Total            = -0.015 m
-    #
-    #   NOTE: the collision model applies no equivalent flange correction (it
-    #   loads the collision URDF raw), so the same 10 mm residual is folded
-    #   into TableCollisionConfig.soft_clearance_m (0.01 → 0.02).
+    # Planning EEF (custom_eef_link) to hand base (right_hand_link).
+    # Position includes the URDF mount and measured flange correction; collision
+    # uses the raw URDF model and folds that correction into table clearance.
     #
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (0.707107, 0.0, 0.707107, 0.0)
@@ -627,47 +579,33 @@ class PolicyParams:
     quit_save_timeout_s: float = 30.0
     post_teleop_timeout_s: float = 60.0
 
-    # ── Cartesian EMA ──
     ema: EMAParams = field(default_factory=EMAParams)
 
-    # ── VR mapping ──
     vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
 
-    # ── Workspace bounds (arm base frame, meters) ──
+    # Arm-base workspace bounds (meters).
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
 
-    # ── Recording ──
     recording_enabled: bool = True
-    # "direct" keeps the complete schema-v17 recorder in the teleop process;
-    # "v17" retains the RecorderIO transport for compatibility and diagnosis.
+    # "direct" records in teleop; "v17" uses the RecorderIO transport.
     recording_mode: Literal["direct", "v17"] = "direct"
     max_record_duration_s: float = 60.0
-    # Quality label only: short, internally consistent episodes are published
-    # with min_frames_met=False and left to downstream filtering policy.
+    # Quality label only; filtering remains downstream.
     min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 
-    # ── Diagnostics ──
     status_print_interval: int = 16  # status print interval (ticks)
     max_consecutive_errors: int = 10
 
-    # ── VR teleoperation IK ──
     ik_max_pose_error_pos_m: float = 0.02
     ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
     ik_nullspace_step_rate_deg_s: float = 50.0
 
-    # ── Arm motion coherence ──
-    # Command-to-command per-tick joint step bound (rad). A safety fallback,
-    # not interpolation: it caps the single Mode-6 endpoint per grid tick so an
-    # IK jump degrades to a bounded ramp; Mode 6 still owns trajectory
-    # smoothing. 8 deg/tick at 16 Hz ~ 128 deg/s, just above the 120 deg/s
-    # Mode-6 trajectory speed so smooth following is never clipped. None disables.
+    # Endpoint bound per control tick; this is not arm interpolation.
     arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
 
-    # ── Hand retargeting ──
     hand_enabled: bool = True
-    # Default hand backend.  "tag" is the in-repo two-stage NLopt solver (default);
-    # "dexpilot" selects the external dex-retargeting backend.
+    # "tag" is in-repo; "dexpilot" uses the external backend.
     hand_retargeting_type: str = "tag"
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
@@ -729,18 +667,13 @@ class PolicyParams:
 
 @dataclass(frozen=True)
 class KeyboardTeleopParams:
-    """Keyboard teleoperation parameters — single source of truth.
-
-    At 30 Hz, the 8 mm translation step requests 0.24 m/s Cartesian target
-    motion. Mode 6 following distance is expected at this rate and is exposed
-    by the arm command timing diagnostics.
-    """
+    """Keyboard teleoperation parameters — single source of truth."""
 
     control_hz: float = 30.0
-    delta_pos_m: float = 0.008  # 240 mm/s at 30 Hz
-    delta_rpy_rad: float = 0.03  # 1.7 deg/frame, 51 deg/s at 30 Hz
-    command_lookahead_frames: int = 5  # bounded 40 mm / 0.15 rad firmware-following lead
-    workspace_command_margin_m: float = 0.005  # > ik_max_pose_error_pos_m (0.002) so a clipped target's FK stays in-bounds
+    delta_pos_m: float = 0.008
+    delta_rpy_rad: float = 0.03
+    command_lookahead_frames: int = 5
+    workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
     status_interval_frames: int = 50
@@ -780,47 +713,31 @@ class KeyboardTeleopParams:
 class TAGRetargetingParams:
     """TAG two-stage NLopt hand retargeting parameters (``retargeting_type="tag"``)."""
 
-    # ── Finger length scaling ──
     robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
-    """XHand finger lengths (thumb..pinky, meters). Pinky set equal to human — adaptive_retargeting_xhand
-    already handles pinky chain scaling (see pinky_scale), so finger_scale for pinky must be 1.0 to avoid
-    double-compensation."""
+    """XHand finger lengths (thumb through pinky, meters)."""
 
     human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
-    """Human finger lengths from TAG glove calibration (thumb..pinky, meters)."""
+    """Human finger lengths (thumb through pinky, meters)."""
 
     finger_scale_boost: float = 1.0
-    """Multiplier on robot/human length ratio.  1.0 = no extra boost — VR landmarks
-    are already at robot scale after MANO transform + adaptive_retargeting_xhand."""
+    """Multiplier on the robot/human length ratio."""
 
     pinky_scale: float = 1.3
-    """Constant pinky-chain (MCP→PIP/PIP→DIP/DIP→TIP) scale applied by
-    adaptive_retargeting_xhand.  TAG's pinky finger_scale is pinned to 1.0 (see
-    robot_finger_lengths), so this + pinky_palm_scale are the pinky's length
-    levers.  Offline sweep (episode_20260817_220802): 1.3 with palm 1.25 drives
-    pinky PIP distal over-flexion +8.7°→~0° and mean-abs bias 8.47→7.40°; the
-    earlier single-lever 1.5 left the distal over-flexed."""
+    """Scale the pinky MCP→TIP chain before TAG optimization."""
 
     pinky_palm_scale: float = 1.25
-    """Scale on the pinky wrist→MCP baseline applied by adaptive_retargeting_xhand.
-    The robot pinky MCP sits proportionally farther from the wrist than the human's
-    (URDF pinky_joint1 origin ≈0.1085 m vs human ≈0.0865 m ≈ 1.25×).  1.25 matches
-    that ratio and, with pinky_scale=1.3, removes the pinky distal over-flexion the
-    distal-only lever left.  The pinky MCP proximal residual (~+20°) is a
-    null-space distribution and persists at any scale (see DexPilot note)."""
+    """Scale the pinky wrist→MCP baseline before TAG optimization."""
 
-    # ── Coordinate alignment: MANO → XHand URDF frame (Euler XYZ, rad) ──
+    # MANO → XHand URDF frame (Euler XYZ, radians).
     mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    """Identity because MANO and URDF both use +Z for finger extension."""
+    """Frame alignment rotation."""
 
-    # ── Stage 1: Global position matching (L-BFGS) ──
-    # Offline sweep on episode_20260816_234045: 0.003 removes roughly 2.6
-    # frames of mean lag versus 0.02 while keeping the P95 joint step < 25 deg.
+    # Stage 1: global fingertip position matching.
     smooth_weight: float = 0.003
     ftol_abs_s1: float = 1e-4
     maxeval_s1: int = 80
 
-    # ── Stage 2: Pinch refinement (SLSQP) ──
+    # Stage 2 pinch refinement.
     ftol_abs_s2: float = 1e-6
     maxeval_s2: int = 100
     pinch_base_weight: float = 2000.0
@@ -831,15 +748,7 @@ class TAGRetargetingParams:
     reg_stage1_weight: float = 1.0
     reg_last_weight: float = 0.8
     prior_weight: float = 0.01
-    """Human-flexion prior weight γ: pulls the 10 flexion joints toward the
-    per-frame human flexion reference (the operator's CMC/MCP/PIP+DIP angles,
-    remapped to Pinocchio model order) in both NLopt stages.  0.0 disables it.
-    thumb_rota1 and index_bend (no landmark-flexion mapping) are masked out.
-    Offline sweep (episode_20260817_220802): 0.01 halves mean-abs flexion bias
-    7.40→3.48° and cuts pinky MCP +19.9→+8.7° / thumb rota2 −21.2→−2.5° while
-    holding fingertip-distance ρ ≥ 0.74 (gate).  Higher γ keeps cutting bias but
-    degrades fingertip ρ (0.02 → 0.686).  Single-episode fit; re-sweep on new
-    data and hardware-smoke before trusting."""
+    """Weight for the optional human-flexion prior in both NLopt stages."""
 
     def __post_init__(self) -> None:
         robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
@@ -877,51 +786,20 @@ class TAGRetargetingParams:
 
 @dataclass(frozen=True)
 class DexPilotRetargetingParams:
-    """Effective dex-retargeting parameters for the DexPilot backend.
+    """Runtime parameters for the DexPilot backend."""
 
-    ``dex-retargeting==0.4.6`` does not wire its config-level Huber and
-    temporal weights into ``DexPilotOptimizer``.  They are deliberately not
-    exposed here: every field in this runtime section has a verified effect on
-    the backend used by :class:`teleop.hand_retarget.XHandRetargeter`.
-    """
-
-    # Human↔robot size compensation.  LeFranX leaves this unspecified (1.0), but
-    # the XHand fingers are 15-38% longer than the recorded human hand, so a
-    # longer finger reaching a shorter target over-flexes distally.  1.15 is the
-    # vendor's own inspire_hand value and matches the offline sweep (thumb_rota2
-    # +43°→~0°, index/ring distal →~0° at scaling_factor=1.15).
+    # Human-to-robot size compensation.
     scaling_factor: float = 1.15
-    # Constant pinky-chain scale applied by adaptive_retargeting_xhand *before*
-    # scaling_factor (effective pinky scale ≈ scaling_factor × pinky_scale).
-    # Recalibrated from LeFranX's 1.2-2.2 down to the physical pinky ratio: the
-    # 2.2 max over-scaled the pinky into proximal (MCP) over-flexion.
+    # Pinky-chain scale applied before scaling_factor.
     pinky_scale: float = 1.15
-    # Scale on the pinky wrist→MCP baseline, applied before scaling_factor.  The
-    # robot pinky MCP is ~1.25× farther from the wrist than the human's; the
-    # distal-only pinky_scale leaves this palm offset unscaled, so the wrist→tip
-    # reference is ~6% short of the robot's straight reach and the solver curls the
-    # MCP to compensate.  >1.0 lengthens the reference palm offset.
+    # Pinky wrist→MCP baseline scale, applied before scaling_factor.
     pinky_palm_scale: float = 1.0
     low_pass_alpha: float = 0.6
-    # Grasp-projection hysteresis.  project_dist_m engages the high-weight
-    # projected regime; escape_dist_m releases it.  A band [0.03, 0.05] (the
-    # dex-retargeting package default) stops adjacent fingertip pairs flapping
-    # between the normal and projected loss regimes as their distance dithers
-    # around 3 cm — offline this lowers mean-abs flexion bias 7.49→6.86° and
-    # the P95 joint step 14.1→11.9°.
+    # Enter/exit thresholds for the projected grasp regime.
     project_dist_m: float = 0.03
     escape_dist_m: float = 0.05
     prior_weight: float = 0.05
-    """Human-flexion prior weight γ, injected into the in-repo
-    ``PriorDexPilotOptimizer`` wrapper.  Pulls the 10 flexion joints toward the
-    per-frame human flexion reference (target/SDK order) as a full
-    value+gradient objective term.  0.0 disables it.  dex-retargeting 0.4.6
-    dropped the paper's open-hand regularizer; this restores a per-frame
-    variant.  Offline sweep (episode_20260817_220802): 0.05 cuts pinky distal
-    (PIP) +18.0→+6.6° and thumb rota2 −7.1→−3.9°, lifts flexion ρ 0.612→0.926,
-    and passes default gates with fingertip ρ ≈0.84 (baseline 0.832).  The pinky
-    MCP proximal residual (~+15°) persists — a length-mismatch, not null-space.
-    Single-episode fit; re-sweep on new data and hardware-smoke before trusting."""
+    """Weight for the optional human-flexion prior."""
 
     def __post_init__(self) -> None:
         numeric = (
@@ -996,7 +874,7 @@ class SafetyParams:
     shutdown_timeout_s: float = 65.0
 
     # Consecutive arm-health failure threshold (feedback/FK reads, arm_loop)
-    max_consecutive_arm_health_failures: int = 30  # 1s @ 30Hz → FAULT
+    max_consecutive_arm_health_failures: int = 30
 
     # Supervisor check rate (Main)
     supervisor_hz: float = 10.0

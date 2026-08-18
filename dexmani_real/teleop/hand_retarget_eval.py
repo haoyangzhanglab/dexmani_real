@@ -39,13 +39,8 @@ _TIP_INDICES = (4, 8, 12, 16, 20)
 _TIP_PAIRS = tuple(
     (first, second) for first in range(5) for second in range(first + 1, 5)
 )
-# (feature_index, joint_index) pairs mapping flexion_features_rad columns to the
-# robot flexion joints.  Column order: thumb CMC, thumb MCP+IP, then for
-# index/mid/ring/pinky (human MCP, human PIP+DIP) each.  Index/mid/ring/pinky:
-# human MCP → j1, PIP+DIP → j2.  Thumb: human CMC → thumb_bend, human MCP+IP →
-# thumb_rota2 (the IP joint is fixed, so rota2 carries both).  thumb_rota1 (CMC
-# opposition rotation) has no landmark-flexion mapping and is scored only through
-# fingertip geometry.
+# (feature_index, joint_index) pairs for flexion features. Finger MCP/PIP+DIP map
+# to j1/j2; thumb CMC and MCP+IP map to thumb_bend/thumb_rota2.
 _FLEXION_FEATURE_JOINT_PAIRS = (
     (0, 0), (1, 2),  # thumb: CMC→bend, MCP+IP→rota2
     (2, 4), (3, 5),  # index: MCP→j1, PIP+DIP→j2
@@ -53,9 +48,7 @@ _FLEXION_FEATURE_JOINT_PAIRS = (
     (6, 8), (7, 9),  # ring
     (8, 10), (9, 11),  # pinky
 )
-# Finger flexion is the primary tracking metric (the original 8-joint gate); the
-# thumb is scored separately because its rho is structurally low (opposition /
-# rota1 null-space) and would otherwise confound the finger mean.
+# Finger flexion is primary; thumb opposition is scored separately.
 _FINGER_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[2:]
 _THUMB_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[:2]
 _FINGER_JOINT_NAMES = tuple(

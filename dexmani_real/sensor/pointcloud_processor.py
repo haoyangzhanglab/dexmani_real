@@ -1,13 +1,13 @@
-"""Fixed-size world-frame point cloud from aligned RGB-D — production pipeline.
+"""Fixed-size world-frame point cloud from aligned RGB-D.
 
 Driver-precomputed rays deprojection → camera-frame depth gate → depth edge
 filter (LoG gradient) → speckle filter → world transform → desk-plane removal
 → workspace crop → 5 mm voxel → DBSCAN two-in-one outlier filter (noise-point
-removal + small-cluster cull) → fixed-size output via FPS/random.
+removal + small-cluster cull) → deterministic FPS or ordered padding.
 
-Runs inside ``camera_loop`` at ``policy.control_hz`` (16 Hz by default); the
-(num_points, 6) float32 output is published on the camera ring and recorded to
-HDF5 (/pointcloud) by RecorderIO.
+Used by the offline processing pipeline to derive a fixed-size view from the
+Real v17 depth sidecar. Runtime recording stores depth and point-cloud quality
+metadata; it does not write a ``/pointcloud`` dataset.
 
 Module-level imports are numpy-only (open3d / torch imported lazily inside
 methods, same pattern as pointcloud_utils._voxel_down_sample_o3d) so importing
@@ -29,91 +29,42 @@ class PointCloudProcessorConfig:
     """Parameters of the depth-to-point-cloud pipeline."""
 
     num_points: int = 2048
-    # Camera-frame z gate: 0.3 m near (min-Z + margin), 1.5 m far (workspace corner)
-    # workspace corner under the current cameras.json extrinsics + ~0.15 m margin.
+    # Camera-frame depth gate.
     depth_min_m: float = 0.3
     depth_max_m: float = 1.5
-    # World-frame axis-aligned crop, (x_min, y_min, z_min, x_max, y_max, z_max)
-    # — same ordering as pointcloud_utils.check_workspace. z_min = 0.005 removes
-    # the desk surface itself.
+    # World-frame crop: (x_min, y_min, z_min, x_max, y_max, z_max).
     workspace: tuple[float, float, float, float, float, float] = (0.25, -0.6, 0.005, 0.85, 0.6, 0.8)
     voxel_size: float = 0.005
-    # Radius outlier removal: drop points with fewer than min_points neighbours
-    # within radius.  O(N) radius search.  Disabled by default (0) — the DBSCAN
-    # noise-point removal (label=-1) and small-cluster cull catch the same
-    # outlier classes (isolated specks + thin noise strings) in a single pass
-    # without a separate radius or k-NN scan.
+    # Optional radius outlier filter; 0 disables it.
     radius_outlier_min_points: int = 0
     radius_outlier_radius: float = 0.01
-    # Statistical outlier removal: drops points whose mean k-NN distance deviates
-    # > std_ratio·σ from the global mean.  Disabled by default (0) — DBSCAN
-    # noise-point removal + small-cluster cull (enabled via dbscan_min_cluster_size)
-    # cover the same noise classes (isolated specks + thin strings) at a single
-    # DBSCAN cost, eliminating the separate O(N·k·log N) k-NN pass (~22 ms).
-    # Keep available as a fallback for scenes with unusual noise characteristics.
+    # Optional statistical outlier filter; 0 neighbours disables it.
     stat_outlier_nb_neighbors: int = 0
     stat_outlier_std_ratio: float = 1.0
-    # DBSCAN two-in-one outlier filter: (a) noise-point removal — points with
-    # < min_points neighbours within eps (label=-1) are isolated specks / thin
-    # noise strings, removed directly; (b) small-cluster cull — clusters of
-    # ≥ min_points but < min_cluster_size points are small dense floating patches
-    # from desk-edge reflections or multipath interference, also removed.
-    # Together this replaces radius + statistical outlier at a single DBSCAN cost.
-    # Set min_cluster_size=0 to disable the entire filter.
-    dbscan_eps: float = 0.015  # 3× voxel_size; catches sparse noise clusters
-    dbscan_min_points: int = 5  # core-point threshold for DBSCAN
-    dbscan_min_cluster_size: int = 25  # drop clusters + noise < 25 points
-    # "o3d": open3d CPU farthest_point_down_sample (~6.6 ms @ 5.3k -> 2048,
-    # colors preserved — verified on open3d 0.19). "pytorch3d": GPU
-    # sample_farthest_points (~9 ms, B=1 underutilizes the GPU); only safe in
-    # camera_loop if the parent never initialized CUDA pre-fork.
+    # DBSCAN noise and small-cluster filter; size 0 disables cluster culling.
+    dbscan_eps: float = 0.015
+    dbscan_min_points: int = 5
+    dbscan_min_cluster_size: int = 25
+    # Farthest-point sampling backend.
     fps_backend: Literal["o3d", "pytorch3d"] = "o3d"
-    # Pre-FPS hybrid sampling: when post-radius points exceed this threshold,
-    # use deterministic uniform strided sampling instead of FPS.  FPS
-    # preferentially selects extreme outlier (noise) points; strided sampling
-    # provides adequate spatial coverage without noise amplification when the
-    # point cloud is already dense.
-    # 0 = disabled (always use FPS).  Set to ~3000 to enable — covers the common
-    # case (post-voxel 3000-6000 points, ~95 % of frames) and saves ~5 ms.
+    # 0 disables the dense-cloud strided pre-pass.
     hybrid_fps_threshold: int = 0
-    # Depth edge filter: remove pixels at depth discontinuities before
-    # deprojection.  A pixel is on an edge when the magnitude of the depth
-    # gradient exceeds depth_edge_threshold_m.  The edge mask is dilated by
-    # depth_edge_dilate_px to widen the rejection band.
-    # Set threshold <= 0 to disable.
+    # Depth discontinuity filter; threshold <= 0 disables it.
     depth_edge_threshold_m: float = 0.030
     depth_edge_dilate_px: int = 1
-    # When > 0, the edge threshold becomes max(absolute, depth * ratio),
-    # so edges at greater distances need proportionally larger depth jumps.
-    # Default 0.02: at 1.5 m far field, threshold rises from 30 mm to 30+30=60 mm,
-    # matching the L515 noise floor (~5-10 mm RMS) and avoiding false edge
-    # detections on slanted surfaces; at 0.3 m near field, threshold stays
-    # at 30 mm (absolute dominates) where noise is ~1 mm.
+    # Relative component of the depth-edge threshold; 0 disables it.
     depth_edge_relative_ratio: float = 0.02
 
-    # Pre-calibrated desk plane: (a, b, c, d) in world frame, ax+by+cz+d=0
-    # with normal pointing upward (c > 0).  Points with signed distance below
-    # desk_clearance_m are removed.  When None, the plane is auto-loaded from
-    # desk_plane_path (if the file exists).  Falls back to workspace z_min
-    # when no plane is available.
+    # Optional desk plane: ax+by+cz+d=0 in world frame.
     desk_plane: tuple[float, float, float, float] | None = None
     desk_clearance_m: float = 0.008
-    # Path to a JSON file containing {"a": ..., "b": ..., "c": ..., "d": ...}.
-    # Auto-loaded at init when desk_plane is None and the file exists.
-    # Use PointCloudProcessor.calibrate_desk_plane() to fit + save.
-    # Relative paths are resolved from the repo root (two parents up from this file).
+    # Auto-loaded when desk_plane is None and the file exists.
     desk_plane_path: str = "dexmani_real/config/desk_plane.json"
 
-    # 3x3 median filter on raw depth (pre-deprojection).  Eliminates L515
-    # salt-and-pepper noise (isolated 1-2 px hot pixels) in a single pass
-    # without temporal state or motion artifacts.  Edge-preserving — unlike
-    # Gaussian blur, median does not soften depth edges.
+    # Apply a 3x3 median filter before deprojection.
     depth_median_enabled: bool = True
 
-    # Speckle filter: connected-components on the valid-depth mask before
-    # deprojection.  Components smaller than this many pixels are removed.
-    # 0 = disabled.  Default 5 drops isolated noise specks (1-5 px) that
-    # survive the median filter — single-frame spatial, no temporal state.
+    # Remove valid-depth components smaller than this size; 0 disables it.
     speckle_min_pixels: int = 5
 
     def to_meta_dict(self) -> dict:
@@ -147,14 +98,7 @@ class PointCloudProcessorConfig:
 
     @classmethod
     def from_meta_dict(cls, meta: Mapping[str, Any]) -> "PointCloudProcessorConfig":
-        """Reconstruct a config from its :meth:`to_meta_dict` snapshot.
-
-        Missing keys fall back to the dataclass defaults, so historical
-        episodes that predate a field still derive a valid (if slightly
-        different) point cloud.  ``desk_plane``/``fps_backend`` are special:
-        absent ``pc_desk_plane`` means ``None`` (auto-load), and ``fps_backend``
-        is a plain string literal.
-        """
+        """Reconstruct a config from a persisted ``to_meta_dict`` snapshot."""
 
         def _float(key: str, default: float) -> float:
             value = meta.get(key, default)
@@ -268,36 +212,20 @@ class PointCloudProcessor:
 
         _tn0 = _time.monotonic()
 
-        # ── 3x3 median filter (first operation on depth) ──
-        # Eliminates L515 salt-and-pepper noise (isolated 1-2 px hot pixels)
-        # in a single pass without temporal state.  Invalid pixels (NaN or <= 0)
-        # are zeroed before the blur and naturally filtered out by the subsequent
-        # depth gate (depth_min_m=0.3 > 0).
+        # Median filter before the depth gate.
         depth_m = self.apply_depth_median(depth_m, cfg.depth_median_enabled)
 
-        # Gate on raw depth BEFORE deprojection — skip ~270k invalid pixels
-        # instead of deprojecting all 307k then throwing most away.
+        # Gate raw depth before deprojection.
         z_flat = depth_m.ravel()
         mask = np.isfinite(z_flat) & (z_flat > cfg.depth_min_m) & (z_flat < cfg.depth_max_m)
         if not np.any(mask):
             return None
 
-        # Depth edge filter: remove pixels near depth discontinuities.
-        # Pixels straddling object boundaries mix foreground/background depth
-        # and produce 3-D points with large systematic error.  Gradient
-        # magnitude on the 2-D depth image reliably finds these edges.
-        # When depth_edge_relative_ratio > 0, the threshold becomes
-        # max(absolute, depth * ratio) — deeper edges need proportionally
-        # larger jumps to be considered discontinuities.
+        # Remove pixels near depth discontinuities.
         if cfg.depth_edge_threshold_m > 0:
             import cv2
 
-            # LoG (Laplacian of Gaussian) edge detector: GaussianBlur (sigma=0.8)
-            # reduces sensor noise amplification in the derivative by ~2x, and the
-            # Laplacian's 3x3 support gives more isotropic edge response than
-            # np.gradient's 1-D central differences (which have strong directional
-            # bias along pixel axes).  NaN pixels produce NaN in the output and are
-            # implicitly rejected by the mask gate (NaN > thresh → False).
+            # Use a smoothed Laplacian to detect depth edges.
             depth_blur = cv2.GaussianBlur(depth_m, (3, 3), sigmaX=0.8)
             laplacian = cv2.Laplacian(depth_blur, cv2.CV_32F, ksize=3)
             edge_mag = np.abs(laplacian)
@@ -315,10 +243,7 @@ class PointCloudProcessor:
         if not np.any(mask):
             return None
 
-        # Speckle filter.
-        # L515 produces isolated single-pixel or few-pixel "speckles" of valid
-        # depth surrounded by invalid pixels.  Connected-components on the 2-D
-        # valid mask drops components smaller than speckle_min_pixels.
+        # Remove small connected components from the valid-depth mask.
         if cfg.speckle_min_pixels > 0:
             import cv2
 
@@ -337,7 +262,7 @@ class PointCloudProcessor:
         # Convert colors only for gate survivors (o3d float64 path).
         cols = rgb.reshape(-1, 3)[mask].astype(np.float64) / 255.0
 
-        # World transform + single workspace crop (no RANSAC in production).
+        # Transform to world coordinates and apply the workspace crop.
         pts = pts_cam @ self._R.T + self._t
 
         # Desk-plane removal.
@@ -384,18 +309,11 @@ class PointCloudProcessor:
 
         _t1 = _time.monotonic()
 
-        # DBSCAN two-in-one outlier filter: (a) noise points (label=-1,
-        # <min_points neighbours within eps) are isolated specks / thin noise
-        # strings — removed; (b) clusters smaller than min_cluster_size are
-        # small dense floating patches — also removed.  Together this replaces
-        # radius + statistical outlier at a single DBSCAN cost (~10 ms).
-        # 0 disables the filter.
+        # Remove DBSCAN noise and clusters below the configured size.
         if cfg.dbscan_min_cluster_size > 0:
             labels = np.asarray(
                 pcd.cluster_dbscan(eps=cfg.dbscan_eps, min_points=cfg.dbscan_min_points, print_progress=False)
             )
-            # Remove noise points (label=-1) — isolated specks / thin strings.
-            # Remove points in small clusters (label>=0, count<min_cluster_size).
             unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
             small_labels = set(unique_labels[counts < cfg.dbscan_min_cluster_size])
             keep = np.array([(lbl >= 0 and lbl not in small_labels) for lbl in labels])
@@ -405,8 +323,7 @@ class PointCloudProcessor:
 
         _t_dbscan_end = _time.monotonic()
 
-        # Radius outlier removal (disabled by default — DBSCAN two-in-one above
-        # already removes isolated specks + thin noise strings at no extra cost).
+        # Optional radius outlier removal.
         if cfg.radius_outlier_min_points > 0:
             pcd, _ = pcd.remove_radius_outlier(
                 nb_points=cfg.radius_outlier_min_points, radius=cfg.radius_outlier_radius
@@ -417,8 +334,7 @@ class PointCloudProcessor:
 
         _t2 = _time.monotonic()
 
-        # Statistical outlier removal (disabled by default — kept as a fallback
-        # for scenes where DBSCAN alone is insufficient; ~22 ms k-NN cost).
+        # Optional statistical outlier removal.
         if cfg.stat_outlier_nb_neighbors > 0 and len(pcd.points) > cfg.stat_outlier_nb_neighbors:
             pcd, _ = pcd.remove_statistical_outlier(
                 nb_neighbors=cfg.stat_outlier_nb_neighbors, std_ratio=cfg.stat_outlier_std_ratio
@@ -428,12 +344,7 @@ class PointCloudProcessor:
 
         _t_stat_end = _time.monotonic()
 
-        # Fixed-size output: FPS when enough points, deterministic cyclic pad
-        # otherwise.  Pre-FPS hybrid: when the point cloud is already dense
-        # enough (post-radius points > hybrid_fps_threshold), deterministic
-        # strided sampling provides adequate spatial coverage without FPS's
-        # noise amplification bias.  Falls back to FPS when sparse or when
-        # hybrid_fps_threshold is 0 (disabled).
+        # Select or deterministically pad to the configured point count.
         n = len(pcd.points)
         self.last_source_point_count = int(n)
         self.last_padding_count = max(0, int(cfg.num_points - n))
@@ -455,7 +366,6 @@ class PointCloudProcessor:
 
         _t3 = _time.monotonic()
 
-        # Periodic timing log
         self._t_numpy += (_t0 - _tn0) * 1000
         self._t_voxel += (_t1 - _t0) * 1000
         self._t_dbscan += (_t_dbscan_end - _t1) * 1000
@@ -581,9 +491,7 @@ class PointCloudProcessor:
             path: JSON file path (relative paths resolved from the calling
                   process's working directory).
         """
-        # Lazy import keeps the parent-process import (numpy-only) light; this
-        # helper is only invoked by the diagnostic calibration example, never
-        # by the production camera worker.
+        # Keep the parent-process import path lightweight.
         from dexmani_real.recording.transaction import atomic_json_dump
 
         a, b, c, d = [float(v) for v in plane]

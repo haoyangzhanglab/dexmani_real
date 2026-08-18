@@ -44,7 +44,7 @@ from dexmani_real.utils.pointcloud_utils import (
     rgbd_to_pointcloud,
 )
 
-# ── Constants ──
+# Constants.
 
 # Point-cloud defaults.
 _DEFAULT_PCD_NPOINTS = 1024
@@ -63,10 +63,6 @@ _SAMPLING_MODES: tuple[str, ...] = ("random", "fps", "none")
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Configuration dataclasses
-# ═══════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class CameraTestConfig:
@@ -125,10 +121,6 @@ class FrameStats:
     total_ms: float = 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Point-cloud config builder
-# ═══════════════════════════════════════════════════════════════════════
-
 def _make_pcd_config(state: PCDDisplayState) -> PointCloudConfig:
     """Build PointCloudConfig from current display state."""
     return PointCloudConfig(
@@ -142,10 +134,6 @@ def _make_pcd_config(state: PCDDisplayState) -> PointCloudConfig:
         return_tensor=False,
     )
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Non-blocking point cloud viewer (open3d)
-# ═══════════════════════════════════════════════════════════════════════
 
 class NonBlockingPCDViewer:
     """Non-blocking open3d point-cloud window -- create on first frame, update thereafter."""
@@ -203,10 +191,6 @@ class NonBlockingPCDViewer:
             self._created = False
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Display utilities
-# ═══════════════════════════════════════════════════════════════════════
-
 def _overlay_text(img: np.ndarray, lines: list[str],
                   x: int = 10, y_start: int = 22, step: int = 22) -> None:
     """Draw green HUD text lines on an image."""
@@ -229,10 +213,6 @@ def _make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.nd
     vis[~valid] = 0
     return vis
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Step 0: enumerate cameras
-# ═══════════════════════════════════════════════════════════════════════
 
 def _list_cameras() -> list[dict[str, str]]:
     """Enumerate connected RealSense cameras with retry."""
@@ -259,10 +239,6 @@ def _list_cameras() -> list[dict[str, str]]:
               f"PL={cam.get('product_line', '')}")
     return cameras
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Step 1: lifecycle test
-# ═══════════════════════════════════════════════════════════════════════
 
 def _test_lifecycle(test_cfg: CameraTestConfig) -> bool:
     """Connect, verify intrinsics, disconnect (idempotent checks included)."""
@@ -306,10 +282,6 @@ def _test_lifecycle(test_cfg: CameraTestConfig) -> bool:
     return True
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Step 2: RGB-D live capture + interactive point cloud
-# ═══════════════════════════════════════════════════════════════════════
-
 def _compute_rolling_stats(history: deque[FrameStats]) -> dict[str, float]:
     """Compute rolling averages from frame stats history."""
     if not history:
@@ -342,7 +314,7 @@ def _build_hud_lines(frame: "CameraFrame", frame_count: int, stats: dict[str, fl
     return lines
 
 
-# ── Keyboard action handlers ──
+# Keyboard action handlers.
 
 def _build_key_actions(state: PCDDisplayState, viewer: NonBlockingPCDViewer) -> dict[int, Callable[[], None]]:
     """Build the key-action dispatch table for the current loop state."""
@@ -522,10 +494,6 @@ def _run_rgbd_test(camera: RealSense, test_cfg: CameraTestConfig) -> dict:
                 avg_total_ms=0, avg_valid_ratio=0, drops=0)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Step 3: config variant comparison
-# ═══════════════════════════════════════════════════════════════════════
-
 def _build_variants() -> list[tuple[str, PointCloudConfig]]:
     """Build the set of point-cloud config variants for comparison."""
     base = dict(min_depth=0.05, max_depth=1.5, return_tensor=False)
@@ -576,10 +544,6 @@ def _run_pcd_variants(camera: RealSense) -> None:
     print("  Variant comparison complete")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════
-
 def main() -> None:
     test_cfg = CameraTestConfig()
 
@@ -595,17 +559,17 @@ def main() -> None:
         print("pyrealsense2 : NOT INSTALLED")
         sys.exit(1)
 
-    # 0. Enumerate.
+    # Enumerate.
     cameras = _list_cameras()
     if not cameras:
         sys.exit(1)
 
-    # 1. Lifecycle.
+    # Lifecycle.
     if not _test_lifecycle(test_cfg):
         print("Lifecycle test failed, exiting.")
         sys.exit(1)
 
-    # 2. Main test.
+    # Main loop.
     config = RealSenseConfig(
         depth_resolution=test_cfg.depth_resolution,
         color_resolution=test_cfg.color_resolution,

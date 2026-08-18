@@ -4,7 +4,7 @@
   - Connects RealSense L515, reads back depth config parameters
   - Captures one aligned RGB-D frame, visualizes RGB + depth + edge filter
   - Calibrates desk plane via RANSAC, persists to desk_plane.json
-  - Runs the production PointCloudProcessor pipeline end-to-end
+  - Runs the PointCloudProcessor pipeline end-to-end
   - Prints per-stage timing with ASCII bar charts
   - Visualizes final world-frame point cloud (open3d)
 
@@ -36,10 +36,6 @@ from dexmani_real.sensor.pointcloud_processor import PointCloudProcessor, PointC
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
 from dexmani_real.utils.pointcloud_utils import make_depth_vis
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class DiagConfig:
@@ -75,10 +71,6 @@ _SENSOR_OPTIONS: list[tuple[str, rs.option]] = [
     ("noise_estimation", rs.option.noise_estimation),
 ]
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════
 
 def _show_rgbd_panels(rgb: np.ndarray, depth_m: np.ndarray,
                       edge_vis: np.ndarray | None, cfg: DiagConfig) -> None:
@@ -149,10 +141,6 @@ def _stage_label(key: str) -> str:
         "p_fps": "FPS sampling",
     }.get(key, key)
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Pipeline stages
-# ═══════════════════════════════════════════════════════════════════════
 
 def _connect_camera(cfg: DiagConfig) -> tuple[RealSense, dict[str, float]]:
     """Connect camera, return (camera, {timings})."""
@@ -229,7 +217,7 @@ def _capture_frame(camera: RealSense) -> tuple[np.ndarray, np.ndarray, np.ndarra
 
 
 def _run_2d_filters(depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray | None, dict[str, float]]:
-    """Run 2-D depth pre-filtering (gate, edge, speckle) matching production pipeline.
+    """Run the 2-D depth pre-filtering stages used by the processor.
 
     Returns (mask, edge_vis, timings).
     """
@@ -243,14 +231,14 @@ def _run_2d_filters(depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray | None,
     print("2-D Depth Filtering (before deprojection)")
     print("=" * 60)
 
-    # 0. Median filter (first operation, byte-identical to production).
+    # Median filter.
     t0 = time.perf_counter()
     depth_m = PointCloudProcessor.apply_depth_median(depth_m, cfg.depth_median_enabled)
     timings["2d_median"] = (time.perf_counter() - t0) * 1000.0
     print(f"  0. Median filter ({'ON' if cfg.depth_median_enabled else 'OFF'}):  "
           f"{timings['2d_median']:.2f}ms")
 
-    # 1. Depth range gate.
+    # Depth range gate.
     t0 = time.perf_counter()
     z_flat = depth_m.ravel()
     mask = np.isfinite(z_flat) & (z_flat > cfg.depth_min_m) & (z_flat < cfg.depth_max_m)
@@ -259,7 +247,7 @@ def _run_2d_filters(depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray | None,
     print(f"  1. Depth gate [{cfg.depth_min_m}, {cfg.depth_max_m}]m:  "
           f"{n_gate:6d} / {total_pixels} pixels  ({timings['2d_depth_gate']:.2f}ms)")
 
-    # 2. Depth edge filter (LoG, byte-identical to production).
+    # Depth edge filter.
     t0 = time.perf_counter()
     edge_vis = None
     n_before_edge = 0
@@ -305,7 +293,7 @@ def _run_2d_filters(depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray | None,
     else:
         print("  2. Edge filter:  DISABLED")
 
-    # 3. Speckle filter.
+    # Speckle filter.
     t0 = time.perf_counter()
     if cfg.speckle_min_pixels > 0:
         mask_2d = mask.reshape(depth_m.shape).astype(np.uint8)
@@ -401,7 +389,7 @@ def _calibrate_desk(depth_m: np.ndarray, rgb: np.ndarray, camera: RealSense,
 
 def _run_pipeline(depth_m: np.ndarray, rgb: np.ndarray, T_world_camera: np.ndarray,
                   desk_plane: tuple[float, ...], camera: RealSense) -> tuple[np.ndarray, dict[str, float]]:
-    """Run production PointCloudProcessor pipeline and extract stage timings."""
+    """Run PointCloudProcessor and extract stage timings."""
     print("\n" + "=" * 60)
     print("3-D Outlier Removal Pipeline (post-deprojection)")
     print("=" * 60)
@@ -516,14 +504,10 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
         if title.startswith("3-D"):
             pipeline_ms = timings.get("pipeline_total", 0.0)
             print(f"  {'  3-D subtotal':<30s} {section_total:6.1f} ms")
-            print(f"  {'Pipeline total':<30s} {pipeline_ms:6.1f} ms  (budget: 62.5ms @ 16Hz)")
+            print(f"  {'Pipeline total':<30s} {pipeline_ms:6.1f} ms")
         elif title.startswith("2-D"):
             print(f"  {'2-D total':<30s} {section_total:6.1f} ms")
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Visualization
-# ═══════════════════════════════════════════════════════════════════════
 
 def _build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet":
     """Build a green wireframe box for the workspace crop volume."""
@@ -563,14 +547,10 @@ def _visualize_result(result: np.ndarray, T_world_camera: np.ndarray,
     print("  World-frame point cloud + workspace crop box (green) + coordinate frames")
     o3d.visualization.draw_geometries(
         [pcd, crop_box, world_frame, camera_frame],
-        window_name="Point Cloud (production pipeline)",
+        window_name="Point Cloud",
         point_show_normal=False,
     )
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     cfg = DiagConfig()
@@ -600,7 +580,7 @@ def main() -> None:
         desk_plane, desk_ms = _calibrate_desk(depth_m, rgb, camera, T_world_camera)
         all_timings["desk_calib"] = desk_ms
 
-        # Production pipeline.
+        # Point-cloud pipeline.
         result, t = _run_pipeline(depth_m, rgb, T_world_camera, desk_plane, camera)
         all_timings.update(t)
 

@@ -165,8 +165,7 @@ HAND_TACTILE_DTYPE = np.dtype(
     ]
 )
 
-# A ring publication is driven by a right-hand frame. ``head_*`` pose fields
-# are the latest cached HeadFrame, identified by its own sequence and receive time.
+# A ring publication is driven by a right-hand frame; ``head_*`` fields cache the latest HeadFrame.
 VR_FRAME_DTYPE = np.dtype(
     [
         ("wrist_pos", "<f8", (3,)),
@@ -294,9 +293,7 @@ def make_record_sample_dtype(
             ("camera_present", "<u1"),
             ("camera_rgb", "<u1", rgb_shape),
             ("camera_depth", "<u2", depth_shape),
-            # Typed per-grid metadata required to reconstruct recorder input.
-            # Legacy HDF5-only defaults stay inside RecorderIO rather than
-            # becoming permanent cross-process fields.
+            # Typed per-grid metadata used by the recorder.
             ("arm_qpos_sent", "<f8", ARM_JOINT_SHAPE),
             ("observation_id", "<u8"),
             ("observation_anchor_monotonic_ns", "<u8"),

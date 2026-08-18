@@ -36,21 +36,21 @@ def _validate_field_shapes(
 class RobotState:
     """Recording state assembled from the arm, hand, and tactile rings."""
 
-    # ── Arm joints ──
+    # Arm joints.
     arm_qpos: np.ndarray  # (7,)  float64  rad
     arm_qvel: np.ndarray  # (7,)  float64  rad/s
-    # Legacy name: xArm SDK current-estimated effort; precise SI unit unverified.
+    # xArm SDK current-estimated effort; precise SI unit is unverified.
     arm_tau: np.ndarray  # (7,) float64
 
-    # ── EEF pose (arm-base frame; standard runtime world == arm base) ──
+    # EEF pose in the arm-base frame.
     eef_pos: np.ndarray  # (3,)  float64  m
     eef_quat_wxyz: np.ndarray  # (4,)  float64
     eef_rot6d: np.ndarray  # (6,)  float64
 
-    # ── Hand joints ──
+    # Hand joints.
     hand_qpos: np.ndarray  # (12,) float64  rad
 
-    # ── Tactile ──
+    # Tactile.
     hand_tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
     hand_tactile_force: (
         np.ndarray
@@ -67,15 +67,15 @@ class RobotState:
     # freshness fault; runtime health uses timestamps and read/state validity.
     hand_qpos_stale: bool
 
-    # ── Derived (chained FK) ──
+    # Derived FK.
     fingertip_pos: np.ndarray  # (5,3) float64 m (arm-base frame)
 
-    # ── Status ──
+    # Status.
     arm_connected: bool
     hand_connected: bool
     timestamp: float  # seconds
 
-    # ── Hand motor current (optional, recorded for offline safety analysis) ──
+    # Optional hand motor current.
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
     hand_error_state: bool = (
@@ -123,7 +123,7 @@ class RobotAction:
     arm_qpos_cmd: np.ndarray  # (7,)  float64  rad
     hand_qpos_cmd: np.ndarray  # (12,) float64  rad
 
-    # ── Intent (pre-IK Cartesian EEF target the arm command tracks) ──
+    # Pre-IK Cartesian intent.
     # Populated by the teleop loop; recorded so EE-space policies can train.
     target_eef_pos: np.ndarray | None = field(default=None)  # (3,)  float64  m
     target_eef_rot6d: np.ndarray | None = field(default=None)  # (6,)  float64

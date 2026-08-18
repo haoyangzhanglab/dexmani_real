@@ -392,9 +392,7 @@ class SafetyGate:
         return GateResult(True)
 
 
-# ---------------------------------------------------------------------------
-# Command serialization and publication
-# ---------------------------------------------------------------------------
+# Command serialization and publication.
 
 
 def _make_arm_command(
@@ -520,9 +518,7 @@ def send_command(
     )
 
 
-# ---------------------------------------------------------------------------
-# Worker-side validation (minimal — trust the gate)
-# ---------------------------------------------------------------------------
+# Worker-side validation.
 
 
 def _worker_command_is_current(
@@ -641,9 +637,7 @@ def worker_validate_hand(
     )
 
 
-# ---------------------------------------------------------------------------
-# Gate factory — wires SafetyGate to a planner's geometry callbacks
-# ---------------------------------------------------------------------------
+# Gate factory.
 
 
 def planner_action_safety_gate(
@@ -665,9 +659,7 @@ def planner_action_safety_gate(
     return gate
 
 
-# ---------------------------------------------------------------------------
-# Convenience publication — build an ActionCandidate, validate, and send
-# ---------------------------------------------------------------------------
+# Convenience publication.
 
 
 def build_action_candidate(
@@ -960,9 +952,7 @@ def publish_joint_targets(
     return publish_result
 
 
-# ---------------------------------------------------------------------------
-# Hand command bounds preflight (owned by the publication boundary)
-# ---------------------------------------------------------------------------
+# Hand command bounds preflight.
 
 
 def validate_hand_command_bounds(
@@ -1018,9 +1008,7 @@ def validate_hand_command_bounds(
     return command.copy()
 
 
-# ---------------------------------------------------------------------------
-# Hand homing utility (command acceptance only; no execution convergence gate)
-# ---------------------------------------------------------------------------
+# Hand homing utility.
 
 
 def publish_hand_home_and_wait_applied(

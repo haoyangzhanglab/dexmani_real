@@ -1,438 +1,107 @@
-# CLAUDE.md — DexMani Real Implementation Guide
+# DexMani Real：实现导航
 
-`AGENTS.md` is the binding working contract. This document is the fast path for
-understanding a behavior change: choose the correct owner, trace the control or
-data path, and make the smallest safe edit. [README.md](README.md) is the
-complete file-by-file map.
+`AGENTS.md` 是本仓库的绑定工作合同；本文件只提供快速定位和修改闭环。README 负责用户入口，`docs/` 负责较稳定的领域/数据合同。遇到冲突时以代码、schema 和 `AGENTS.md` 为准。
 
-## 1. Sixty-second orientation
+## 60 秒定位
 
-DexMani Real controls an xArm7 (7 DoF) and XHand (12 DoF) from Quest VR, records
-schema-v17 HDF5 episodes, replays an episode, and deploys learned policies.
-The default direct backend uses the same writer locally; explicit v17 mode
-retains the RecorderIO transport. Python 3.10 runs
-in conda `real_robot`; commands run from the repo root with `PYTHONPATH=.`.
-Standard pre-edit commands and environment details live in `AGENTS.md` §1.
-
-Do not run `examples/` without explicit hardware authorization. They are
-entry points, not test fixtures.
-
-### Task-to-code router
-
-| Goal | Start with | Follow next |
+| 任务 | 起点 | 必须继续检查 |
 |---|---|---|
-| Change a runtime value | `config/defaults.py` | `config/runtime.py`, every derived duration/capacity/metadata field |
-| Change a shared field or command | `utils/schema.py` | `shm/shared_storage.py`, producer, consumer, recorder/reader |
-| Change VR behavior | `teleop/loop.py` | snapshot → mapper/retargeting → planner → safety gate → samples |
-| Tune hand retargeting | `teleop/hand_retarget_eval.py`, `examples/tune_hand_retarget.py` | runtime TAG/DexPilot sections → wrapper → startup home/ramp |
-| Change an arm/hand action | `policy/safety.py` | gate validation → send_command → worker apply, `robot/safety.py`, supervisor |
-| Change learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` → `deployment/config.py` → `deployment/observation.py` → `deployment/contracts.py` → `integrations/` adapter → `policy_plan_ring` |
-| Change FK/IK/collision | `planning/` | teleop fallback/hold, replay preflight, homing path planning |
-| Change episode I/O | `recording/episode_recorder.py`, `recording/io_process.py` | direct/RecorderIO writer → reader → analysis → replay |
-| Change replay | `examples/replay_episode.py` | — Self-contained script; preflight → session → runner → metrics |
-| Change calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit confirmation/write paths and calibration JSON contract |
+| 默认值/运行时覆盖 | `config/defaults.py` | `config/runtime.py`、派生容量/超时/metadata |
+| 跨进程字段 | `utils/schema.py` | `shm/shared_storage.py`、所有 producer/consumer、recording |
+| ring/queue/flag/event | `shm/shared_storage.py` | 分配、读写、ready/heartbeat、close/unlink、故障路径 |
+| VR 遥操作 | `teleop/loop.py` | snapshot → mapper/retarget → planning → safety → samples |
+| 手部 retarget | `teleop/hand_control.py` | `hand_retarget.py`、`docs/hand_retargeting.md`、worker |
+| arm/hand action 或安全 | `policy/safety.py` | `send_command`、arm/hand worker、supervisor、home/e-stop |
+| FK/IK/碰撞/路径 | `planning/` | teleop hold/fallback、delta clamp、replay dense preflight |
+| episode schema/质量 | `recording/episode_schema.py` | writer → reader → processing/visualization/replay |
+| 回放 | `examples/replay_episode.py` | provenance、dense preflight、live safety path |
+| learned policy | `deployment/coordinator.py` | worker、config、contracts、lifecycle、integration adapter |
+| CLI/生命周期 | 对应 `examples/*.py` | domain lifecycle、readiness、supervision、shutdown |
 
-## 2. Ownership map
-
-The system is spawn-only: workers receive `SharedStorage` plus an optional
-config, never a live SDK object or another worker object.
+## 所有权
 
 ```text
-Main / domain lifecycle
-  resolve immutable config → create SharedStorage → spawn → readiness → supervise → verified shutdown
-
-Camera worker ─┐
-VR worker ─────┼── shared state rings ──► Teleop coordinator
-Arm worker ────┤                                  │
-Hand worker ───┘                         fire-and-forget command publication
-                                                    ├──► bounded arm endpoint/HOME queue → Arm worker
-                                                    └──► latest-wins hand ring → Hand worker
-
-Teleop / coordinator ── fixed-grid samples ──► direct EpisodeRecorder ──► HDF5 v17
-                                      └──────► RecorderIO transport ──► HDF5 v17
+main/lifecycle: config → SharedStorage → spawn → readiness → supervise → shutdown
+sensor workers: device input → shared state
+teleop: observation selection → mapping/IK/retarget → action → fixed-grid sample
+deployment worker: observation → model → policy_plan_ring
+deployment coordinator: plan → shared SafetyGate → robot action
+robot workers: shared command → SDK → measured feedback
+recorder: received sample → validate/write/publish
 ```
 
-A parallel learned-policy controller runs the same shape: an inference worker
-writes `policy_plan_ring`, and a coordinator adopts those plans and publishes
-actions through the same shared safety boundary.
+- main 不映射 VR、不生产 action、不选择 recording sample。
+- hardware SDK 不跨进程传递；拥有 SDK 的 worker 不做策略决策。
+- `deployment/` 不依赖 `integrations/`；适配器只能反向依赖 deployment contracts。
+- `recording/` 不改变采样时机和业务语义；direct 与 RecorderIO 共用 `EpisodeRecorder`。
 
-| Owner | Owns | Must not own |
-|---|---|---|
-| Main / lifecycle module | Config snapshot, storage, process creation, read-only readiness, health, shutdown | Mapping, actions, sample selection |
-| `teleop/loop.py` | VR mapping, IK, action candidates, safety gating, recording/grid decisions | serialization policy or direct SDK use |
-| `deployment/coordinator.py` | Adopting learned-policy plans; scheduling one due endpoint per tick through the shared safety boundary | Direct arm/hand transport writes, `SafetyState` mutation, interpolation |
-| `deployment/worker.py` | Inference only: causal/valid observation → encode → infer → decode → `policy_plan_ring` | arm/hand transport, `SafetyState`, robot actions |
-| `recording/episode_recorder.py` | Full schema-v17 HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
-| `recording/recorder_client.py` | Direct policy-local adapter and RecorderIO client protocol | Hardware control or sample selection |
-| `recording/io_process.py` | RecorderIO transport, record consumption, HDF5/video write, verification, fsync, atomic publish | Choosing what or when to sample |
-| `robot/arm_loop.py` / `robot/hand_process.py` | Vendor-device I/O, measured feedback, command application | Policy decisions or cross-worker calls |
-| `sensor/` workers | Device acquisition and source-freshness metadata | Motion/control decisions |
-| `runtime/` | Readiness, heartbeat/process supervision, verified teardown | Domain mapping or command production |
+## 不可破坏的协议
 
-### Canonical process targets
+### 数据与时钟
 
-```python
-arm_loop(shared, config)          # xArm Mode 6 servo and FK state
-hand_loop(shared, config)         # XHand servo, state/tactile feedback
-camera_loop(shared, config)       # RealSense frames → camera_ring
-vr_loop(shared, config)           # Quest/HTS frames → vr_ring
-teleop_loop(shared, config)       # VR → candidate → safe arm/hand commands
-recorder_io_loop(shared, config)  # aligned samples → transactional episode
-# learned-policy deployment (run_policy.py): inference_loop + coordinator_loop
+- `utils/schema.py` 是共享 NumPy payload 的单一来源；边界检查 shape、dtype、finite 和单位。
+- ring 使用 seqlock；`get_last_k(k)` 返回已验证、oldest-first 的结果，可能少于 `k`，且拒绝 `k > maxlen`。
+- arm queue 是有序 `maxsize=2`；hand command ring 是 latest-wins，`policy_plan_ring` 也是 latest-wins 且 `maxlen=3`。
+- `is_running`、`is_recording`、`error_state`、`estop_request` 是简单 flag；只有 `safety_state` 存 `SafetyState`。
+- heartbeat 使用 `time.monotonic()`；`error_state` sticky。
+- recording 以 `1 / control_hz` 固定网格采样，不按传感器到达时间采样。
+
+### 生命周期与命令
+
+- main 管理 `DISARMED ↔ ARMED`、`→ FAULT` 和 shutdown；policy 管理 `ARMED ↔ RUNNING`。
+- `run_generation` 标记控制时代；BEGIN、pause、home、feedback fault 使旧命令失效。camera stall/写盘错误丢弃 episode，但等待下一次显式 BEGIN 才推进 generation。
+- worker 在共享命令跨越 SDK 边界前再次检查 generation、有效期、状态和 payload。
+- 普通 pause 是 command quiescence：不发送 measured hold，不调用 State 6；让固件完成已接受的 endpoint。
+- xArm Mode 6 已负责 arm trajectory smoothing；不要加入应用侧插值。
+- SafetyGate 是 action publish 的统一边界；固件仍是最后 backstop。
+
+### Episode 与策略
+
+- runtime episode 只接受 schema v17；目录包含 `data.h5`、`depth.h5`、`rgb.mp4`，失败不原子发布。
+- `recording/episode_schema.py` 同时约束 writer、reader 和 finalizer；不要维护第二份 dataset 列表。
+- point cloud 不作为独立 sidecar 保存，由 depth 和 metadata 在消费边界确定性派生。
+- direct 是默认 recorder backend；`v17` 只改变 RecorderIO transport，不改变 episode 字段语义。
+- learned-policy inference worker 只写 `policy_plan_ring`；coordinator 是唯一 robot-action producer。
+- 模型输出是 proposal，不是 command；必须经过共享 SafetyGate/发送边界。
+
+## 修改配方
+
+### 新增共享字段或 ring
+
+1. 在 `utils/schema.py` 定义 shape/dtype、单位和 invalid value。
+2. 更新 `SharedStorage` 的创建、清理和 readiness。
+3. 更新唯一 producer、所有 consumer 和 failure/shutdown 路径。
+4. 若要持久化，同步 `episode_schema`、writer、reader、processing、visualization、replay。
+5. 用 fake/offline payload 覆盖有限值、shape、旧 generation 和关闭路径。
+
+### 修改控制、IK 或碰撞
+
+1. 先改纯 helper，并保留明确的 frame/unit/shape 校验。
+2. 追踪候选拒绝、hold/fallback、delta clamp、worker recheck 和 replay preflight。
+3. 不用应用插值替代固件能力，不为通过离线检查而削弱安全门。
+4. 至少验证 unreachable、collision、stale input、feedback fault 和正常恢复。
+
+### 修改 recording/replay
+
+1. 先读 `episode_schema.py` 和 `episode_reader.py`，确认是不是 schema 变更。
+2. direct 与 RecorderIO 必须 field-for-field 一致；START/STOP/status/sample 保持固定 dtype。
+3. 写入仍需临时目录、校验、fsync 和原子发布；任何 stream/codec/overflow 错误 fail closed。
+4. 同步 reader、质量规则、可视化、数据处理和 replay；不要“只改 writer”。
+
+### 新增 worker/CLI
+
+1. CLI 只解析参数并调用 domain lifecycle。
+2. lifecycle 统一负责 config、storage、spawn、readiness、supervision、worker death 和 shutdown。
+3. 通过共享数据面通信，不传 SDK、可变对象图或跨进程业务回调。
+
+## 开发与交付检查
+
+```bash
+git status --short
+rg -n "<symbol-or-config-key>" dexmani_real examples
+conda run -n real_robot python -m compileall -q dexmani_real examples
+git diff --check
+git diff --stat
 ```
 
-## 3. Data contracts that matter
-
-### Shared storage and IPC
-
-`utils/schema.py` is the authority for cross-process NumPy dtypes and fixed
-shapes. `SharedStorage` owns allocation, names, close/unlink, flags, events,
-and transport instances; it must not import policy or recorder code merely to
-discover a dtype.
-
-| Transport | Direction | Semantics |
-|---|---|---|
-| `arm_action_q` | controller → arm | Ordered `mp.Queue(maxsize=2)`; carries fixed endpoints plus correlated HOME requests; endpoint backpressure is intentional |
-| `hand_cmd_ring` | controller → hand | Seqlock, latest-wins servo target |
-| `policy_plan_ring` | inference → coordinator | Seqlock, latest-wins plan, maxlen 3 |
-| arm/hand/VR/camera rings | worker → controller | Seqlock state; source and publish freshness are distinct |
-| `record_control_ring` | controller → RecorderIO | Latest immutable fixed-field START/STOP boundary; client refuses START until the prior STOP terminal is harvested |
-| `record_sample_ring` | controller → RecorderIO | Fixed-grid sample plus transient control generation; overflow aborts the episode |
-| `record_status_ring` | RecorderIO → controller/main | READY/RECORDING/FINALIZING/terminal phase, bounded reason/error/path, minimum-duration label, and sticky session failure count |
-| flags and heartbeats | lifecycle/workers | Flags are simple values; heartbeats use `time.monotonic()` |
-
-Read a ring with its documented seqlock API. `get_last_k(k)` returns verified
-frames oldest-first, may be shorter than `k`, and raises for `k > maxlen`.
-Never store arbitrary mutable Python graphs in shared memory.
-
-Learned-policy observations are declared by `DeploymentConfig.observation_fields`
-and assembled causally by `deployment/worker.py`. XHand current/combined/raw
-tactile windows are optional; `tactile_sum_valid` must gate combined tactile
-values because invalid reads are zero-filled. The default remains joint-only,
-and this internal validity bit does not alter HDF5 v17.
-
-### Safety state and command lifetime
-
-```text
-DISARMED -- Main readiness --> ARMED -- teleop operator action --> RUNNING
-    ^                               ^                                  |
-    └------- Main shutdown ---------┴-------------- Main fault ---------┘
-                                                     ▼
-                                                   FAULT
-```
-
-- Main owns `DISARMED ↔ ARMED`, `→ FAULT`, and shutdown.
-- Policy owns `ARMED ↔ RUNNING`.
-- Arm and hand workers only gate command behavior on the state.
-- `error_state` is sticky. A process death or enabled-worker heartbeat timeout
-  becomes a main-owned fault.
-- `SafetyGate` (in `policy/safety.py`) is the single validation boundary:
-  well-formed → joint limits → workspace.
-- Controller-side publication checks `is_running`, e-stop, sticky fault,
-  `SafetyState`, required arm/hand feedback health, and coupled-hand preflight
-  in one boundary and returns a typed `CommandPublishResult`; each caller still
-  owns hold/drop/abort/fault disposition, and workers recheck lifecycle
-  metadata and safety state immediately before the SDK boundary.
-  xArm Mode 6 firmware is the final velocity/acceleration/collision backstop.
-  Collision-free homing paths are planned independently through
-  `plan_joint_home_path` / `plan_band_alignment_path`, which call the
-  collision model directly. Hand velocity protection is firmware PID plus
-  current limit only (the command-to-command rate-limit was removed); workers
-  additionally reject stale-generation, expired, operational-limit, and rated
-  mechanical-limit violations without changing an endpoint. Runtime config may
-  narrow, but cannot widen, the bundled rated mechanical envelope.
-  Neither hand backend has a wrapper-level output EMA. DexPilot retains only
-  dex-retargeting's internal LPFilter, configured to match LeFranX.
-  The XHand firmware PID remains the execution-layer trajectory smoother,
-  independent of the configured transport.
-  Coupled hand paths first take a fail-closed hand feedback snapshot
-  (`_hand_feedback_snapshot`: `connected`, `state_valid`, no `error_state`,
-  `send_healthy`/`read_healthy`, and finite `qpos`/`last_cmd_qpos`), then run the
-  centralized preflight (`validate_and_send_candidate` →
-  `validate_hand_command_bounds`) on the rated mechanical envelope before the arm
-  endpoint is enqueued, so a rejected or unhealthy hand desyncs nothing;
-  `worker_validate_hand` remains the authoritative execution-layer backstop.
-  The snapshot delegates source-timestamp existence, future timestamp, and
-  `max_age_s` freshness to `validate_hand_feedback`, so a timestamp-expired
-  frame is rejected on the policy publish path as in the keyboard predicate.
-- `run_generation` tags commands and candidates. Begin, pause, home, and
-  feedback fault advance it; a camera stall or camera-writer error discards the
-  current episode without advancing. Workers reject queued/ring commands from an
-  older generation; this cannot retract an endpoint already accepted by
-  firmware. Ordinary pause paths publish no replacement endpoint. Repeated
-  observations of one pause do not advance again; every explicit VR BEGIN opens
-  a distinct generation and supersedes an earlier STOP/DISCARD/max-duration
-  boundary. VR teleop requires feedback newer than its pause or BEGIN boundary
-  and spends one full grid re-anchoring. A session-ending signal received during
-  a C pause preserves the existing generation boundary but makes that pause
-  non-resumable. Conversely, C received during an automatic gate reclassifies
-  the same boundary as a C-resumable pause without advancing again.
-- `publish_joint_targets(..., wait_applied=True)` (opt-in; the default is
-  `False`) is the synchronous coupled-action confirmation. Arm-only actions
-  require arm `last_cmd_seq >= action_id`; arm+hand actions share one
-  `action_id` and additionally require hand `last_cmd_seq == action_id` (hand
-  `>` action_id means superseded and fails immediately), gated on hand health
-  (connected, `state_valid`, no `error_state`, `send_healthy`/`read_healthy`).
-  Ordinary 16 Hz actions never block on this.
-
-Do not turn a simple flag into an enum, add a second state writer, or bypass
-the SafetyGate validation boundary.
-
-## 4. Critical behavior paths
-
-### VR teleoperation and recording
-
-```text
-VR frame → causal snapshot → ArmWristMapper / per-VR-sequence hand solve cache
-         → shaped current-frame hand pose + IK/collision candidate
-         → SafetyGate.validate() → send_command() → workers apply immediately
-         → grid-aligned state/action/VR/camera sample → direct EpisodeRecorder or RecorderIO
-```
-
-- `teleop/snapshot.py` creates a causal snapshot; do not mix arrivals from
-  unrelated times.
-- A causal grid may reuse one verified VR ring sequence. `teleop/hand_control.py`
-  calls stateful TAG/DexPilot at most once per sequence and caches both success
-  and failure; command shaping/ramp remain control-grid driven. Quiescence and
-  reanchor clear the cache before retargeting resumes.
-- `utils/schema.py::XHAND_SDK_JOINT_NAMES` owns every cross-process hand-qpos
-  order. TAG and DexPilot share the mechanical `xhand_right.urdf`; teleop, not
-  either solver URDF, applies the operational anti-clogging command floor.
-- TAG is the current default hand backend. Its effective runtime parameters live
-  in `tag_retargeting`; DexPilot (via `dexpilot_retargeting`) remains the
-  external fallback.
-- `teleop/arm_mapper.py` applies frame transforms and workspace/rotation bounds.
-- `planning/ik.py` and `planning/ik_candidates.py` solve and filter; failure
-  holds rather than inventing a new command.
-- `teleop/episode_samples.py` owns recording sample construction. One sample is
-  emitted per `control_hz` grid tick (normally 16 Hz), not per sensor arrival.
-- A command-silent pause is not a sampled grid interval. The first sample from
-  a new `run_generation` re-anchors the recorder's next contiguous storage slot;
-  its wall-time jump is retained, but no pause-time hold action is synthesized.
-- Mode 6 firmware smooths arm targets. Application-side interpolation is unsafe.
-  The teleop arm path additionally caps the command-to-command per-tick joint
-  delta (`arm_max_delta_rad_per_tick`) as a coherence fallback: it edits the
-  single per-tick Mode-6 endpoint (never inserts intermediate targets), so an
-  IK jump degrades to a bounded ramp rather than an incoherent jerk.
-- Ordinary pause is command quiescence: advance `run_generation`, stop
-  publishing, and let Mode 6 finish the last endpoint already accepted by the
-  controller. No delayed measured endpoint is sent. Keyboard idle continuously
-  rebuilds its joint and Cartesian baselines from feedback; VR resume accepts
-  only feedback newer than pause entry and uses its first grid solely to
-  re-anchor. C only resumes a C-created pause; STOP, DISCARD, and max-duration
-  completion require a new BEGIN, which advances generation again and replaces
-  the freshness boundary. If one of those endings arrives during a C pause, it
-  cancels C resumability without a redundant generation advance. State 4
-  remains reserved for DISARMED, FAULT, e-stop fallback, global-stop /
-  fault-interrupted homing, and verified final shutdown.
-- Command quiescence is not a ban on every `is_hold` endpoint. IK/mapping/
-  workspace rejection may still publish an explicit
-  safe fallback endpoint. Those are active safety/error-recovery actions, not
-  ordinary pause behavior.
-- VR transform schema v1 is validated in Main before SharedStorage/process
-  creation and again in the teleop worker. It must be a proper SO(3) rotation
-  with the declared convention and machine-readable non-POOR quality metadata.
-
-### Episode write, read, analyse, replay
-
-```text
-aligned samples → direct/RecorderIO → temporary HDF5/camera episode
-                → stream verification → fsync + atomic publish
-                → EpisodeReader / visualize / replay
-```
-
-- HDF5 schema v17 is the only runtime episode format (see `AGENTS.md` §5 for
-  its format-change contract). Direct and RecorderIO modes use the same
-  `EpisodeRecorder`, reader, camera sidecars, metadata, and provenance.
-- `policy.recording_mode: direct` is the default personal-research mechanism:
-  it removes the RecorderIO transport process and writes from the policy-owned
-  fixed-grid sample path. `v17` preserves the original shared-ring transport
-  for compatibility and diagnostics; it does not change the episode format.
-- `recording/episode_schema.py` is the shared v17 data-layout authority: 93
-  unconditional datasets plus `action_arm_joint_sent` iff
-  `meta.arm_sent_stream=True`. Writer source/flush/finalize and reader validity
-  must reuse it rather than maintaining local key lists.
-- The episode carries RGB (`rgb.mp4`) and depth (`depth.h5`) only. The world
-  point cloud is a deterministic pure function of depth, derived at the
-  consumption boundary — offline in `data_processing` (`PointCloudProcessor`
-  over `depth.h5`) and online in a future vision adapter — never stored as a
-  `pointcloud.h5` sidecar. The derivation is seed-free: `depth + intrinsics +
-  extrinsics + desk_plane + config` fully determines the 2048×6 cloud.
-- Recorder control and the shared sample payload are fixed NumPy dtypes. The
-  START boundary snapshots only task/operator and essential device/calibration
-  metadata plus the required resolved-config SHA-256; per-grid fields are typed
-  rather than JSON-encoded. The
-  fire-and-forget worker protocol records no fabricated ACK or apply status.
-- Writer failure, stream mismatch, overflow, codec failure, or ENOSPC aborts
-  the episode rather than silently publishing partial data.
-- Direct finalization is polled from the teleop loop and joins the same bounded
-  writer during process shutdown; RecorderIO finalization is polled from its
-  heartbeat loop. A max-duration boundary saves the episode and moves teleop to
-  ARMED command quiescence. Recording errors remain separate from robot FAULT.
-  A timeout remains non-terminal while the stop thread is alive: status stays
-  `FINALIZING`, START remains rejected, and the eventual terminal status is
-  `ERROR`.
-- `min_record_duration_s` is a quality label, not a publication gate. Short
-  consistent episodes expose `min_frames_met=False`; replay and visualization
-  warn so downstream training can filter the metadata explicitly.
-- `examples/visualize_episode.py` is an offline episode consumer (Rerun 3D visualization).
-- `examples/replay_episode.py` defaults to live replay of the full recorded
-  trajectory; it reruns fail-closed provenance and dense geometry checks
-  immediately before worker startup. `--dry-run` opts into offline validation.
-- Offline training-data processing is a separate versioned view:
-  `examples/process_episodes.py` is a thin wrapper over `data_processing/`.
-  The pipeline keeps v17 sources immutable, resolves a modality-dependent hard
-  mask, splits at every invalid row or time/source discontinuity, and writes
-  `dexmani-real-simlabel-hdf5/v1` through a directory transaction. It never
-  stitches gaps, fabricates absent Sim labels, or relabels real point clouds as
-  SAPIEN-world data. Start with `data_processing/cleaning.py` for quality rules,
-  `transforms.py` for numeric transforms, and `pipeline.py` for publication.
-
-## 5. Edit recipes
-
-Cross-module obligations for each change are the contract in `AGENTS.md` §5
-(change playbooks); the concrete steps below trace the implementation path.
-
-### Adding a shared state field
-
-1. Define shape/dtype in `utils/schema.py`; add the corresponding explanatory
-   dataclass field in `robot/types.py`.
-2. Allocate it through `SharedStorage`; write it in the owning worker and read
-   it in each consumer.
-3. Decide whether recording persists it. If yes, update recorder, reader,
-   quality/visualization/replay consumers and the v17 schema contract together.
-4. Check finite values, units, initial/invalid values, and process cleanup.
-
-### Changing control, IK, or collision behavior
-
-1. Change the pure planning/mapper helper first, with explicit unit/shape
-   validation.
-2. Trace candidate rejection to hold-on-failure, upstream teleop delta shaping,
-   whole-action gate rejection, frame-quality flags, and replay preflight.
-3. Keep arm behavior as one Mode 6 endpoint per grid tick; never insert an
-   interpolation layer.
-4. Exercise invalid target, stale feedback, collision/rejection, and normal
-   hold recovery with fakes before any hardware validation.
-
-### Changing recording or replay
-
-1. Keep v17 dataset meanings stable. Direct and RecorderIO modes must remain
-   field-for-field compatible.
-2. Update the shared producer/reader, offline quality, visualization, replay,
-   and provenance/schema marker together.
-3. For replay, verify provenance, dense geometry and explicit hand mode before
-   worker startup. Do not weaken a check to make dry-run or a fixture pass.
-
-### Adding a worker or CLI
-
-1. Put the worker target in its domain package as a plain `*_loop(shared, config)`
-   function.
-2. Extend the owning lifecycle module for storage, spawn, readiness, heartbeat,
-   shutdown, and failure behavior.
-3. Keep the `examples/` script as a one-import `main()` wrapper.
-4. Update README’s project map and this guide when ownership/routing changes.
-
-## 6. High-value conventions and footguns
-
-| Do | Avoid |
-|---|---|
-| Validate finite shapes at module/process boundaries | Letting malformed numeric commands reach a worker |
-| Use `field(default_factory=...)` and copy before publication | Mutable dataclass defaults or in-place mutation after publication |
-| Put `logger = get_logger(__name__)` after imports; log operational exceptions with `exc_info=True` | `except: pass` or context-free warning logs |
-| Use `control_hz` and derived config values | Hard-coded timing/buffer assumptions |
-| Keep file/network/UI work out of control loops | Blocking I/O in servo or control loops |
-| Use `TYPE_CHECKING`/lazy imports to break cycles and isolate SDKs | Circular imports or SDK objects crossing process boundaries |
-| Check measured hand feedback and SDK return codes | Assuming hand connection or command application |
-| Keep new logic in the domain owner | Business logic in a thin main/CLI wrapper |
-
-### Hardware facts that change engineering decisions
-
-- xArm Mode 6 is the normal servo mode; firmware is the final collision/current
-  safety backstop. Any runtime controller error (a non-zero error code, e.g.
-  C31, or a terminal setter/API failure) enters the single sticky fault path;
-  the arm worker never clears a controller error implicitly. Homing uses a
-  separately validated Mode 0 milestone path.
-- Control decisions that depend on the controller error register (capturing the
-  controller error behind a setter failure, confirming a cached non-zero error,
-  the homing restore decision, the homing milestone check) read the live
-  `get_err_warn_code()` via `_read_live_error_code`, never the cached
-  `arm.error_code`; a live-read failure fails closed. Steady-state telemetry
-  may still report the cached value.
-- Arm cleanup confirms the physical stop (state 4) without requiring a zero
-  controller error: a fault exit leaves a latched non-zero error, so
-  `stop_controller` confirms the stop rather than hanging on the latched error.
-- Arm feedback is valid only when both the SDK state read and URDF FK succeed.
-  FK failure publishes NaN EEF with `state_valid=0`; persistent failure uses the
-  same bounded device-I/O escalation as repeated feedback-read failure.
-- Successful vendor SDK startup chatter may be captured only within the owning
-  device worker's bounded initialization calls. Project readiness logs remain
-  visible, and failed SDK calls replay their captured native diagnostics.
-- `config/desk_plane.json` is shared calibration input for point-cloud filtering,
-  online collision checks, replay preflight, and homing. The collision model
-  represents it as a tilted finite box, excludes only configured mounting-link
-  contact, and uses mesh distance for soft clearance; fixed-Z frame padding is
-  a compatibility fallback only.
-- XHand is a 12-DoF position servo. Production defaults to 3 Mbps RS485
-  (`hand.comm_type="serial"`) on the fixed `/dev/ttyUSB0` device; EtherCAT is
-  retained as an explicit runtime override. Its command ring is latest-wins.
-  The default keyboard/data-collection path requires measured hand feedback;
-  `--no-hand` is an explicit secured/open-pose assumption.
-- XHand contact, backlash, and torque-limited steady-state error are valid
-  execution outcomes. Unchanged qpos or failure to converge to a requested
-  angle is diagnostic data, not a freshness fault; use successful SDK reads,
-  source timestamps, worker heartbeat, board error registers, and SDK return
-  codes for health. RS485 feedback uses a live `read_state(..., True)` state
-  refresh; it does not replay the last motion command. The SDK also refreshes
-  its cache as part of `send_command`, but startup and disarmed reads do not
-  rely on that cache. After `open_serial`, the driver waits 1 s before its
-  first transaction. A 1501070 CRC response retries the exact same absolute
-  target once after 80 ms; a second CRC remains an actuator-send failure. A
-  live, read-only state transaction retries CRC twice with the same backoff and
-  accepts only a subsequently verified response; retry exhaustion remains a
-  read failure.
-  RS485 status codes 1501018–1501020 describe field-specific sensor failures
-  while preserving the valid joint portion (and, for `send_command`, the
-  transmitted absolute target). 1501018 invalidates the force frame
-  conservatively; 1501019 invalidates only distributed force while retaining
-  combined force/contact; 1501020 invalidates only temperature, which is not
-  part of the runtime schema, so both force fields remain usable. Statuses are
-  transaction-local and the next successful read recovers immediately. Timeout
-  and board errors remain immediate transaction failures. The v17
-  `qpos_stale` bit is retained as a reserved false compatibility field.
-- Hand `state_valid` mirrors `connected` (set from the last read's connection
-  flag; the first frame is set unconditionally). Hand feedback health has one
-  shared predicate — `validate_hand_feedback` (`utils/hand_health.py`) — invoked
-  from the teleop loop, the policy feedback snapshot, the teleop hand-reference
-  seed, and the supervisor health summary. Don't add a divergent copy.
-- Return-home creates explicit bounded milestones from the worker's last
-  accepted hand command to the configured hand-home endpoint. Every complete
-  endpoint is published unchanged and matched to a successful SDK action ID;
-  no measured-angle convergence is tested. After the exact final-home ACK, arm
-  homing uses configured hand-home geometry and the existing validated path.
-- A stalled L515 can appear healthy when frames are forward-filled. Source
-  freshness, not just worker heartbeat, determines frame quality.
-- Quest HTS is TCP port 8000; USB commonly needs `adb reverse tcp:8000 tcp:8000`.
-- Calibration JSON carries physical coordinate-frame conventions. Do not
-  regenerate or delete it casually.
-
-## 7. Current command surface
-
-| Entry point | Domain owner | Default safety posture |
-|---|---|---|
-| `examples/collect_teleop.py` | — | Hardware control; self-contained script; explicit authorization required |
-| `examples/keyboard_teleop.py` | — | Hardware control; self-contained script; measured hand feedback by default |
-| `examples/replay_episode.py` | — | Live by default (full replay + results); `--dry-run` for offline validation; self-contained script |
-| `examples/run_policy.py` | `deployment.lifecycle` | Learned-policy deployment entry; thin CLI wrapper over the shared supervisor |
-| `examples/calibrate_camera.py` | — | Hardware/data-writing operation; self-contained ArUco hand-eye calibration |
-| `examples/calibrate_vr_heading.py` | — | Hardware read; transform write is gated; self-contained VR heading calibration |
-| `examples/realsense_record_example.py` | — | Interactive RealSense RGB-D + point-cloud test; hardware read-only by default |
-| `examples/pointcloud_process_example.py` | `sensor/pointcloud_processor.py` | Production point-cloud pipeline diagnostic; explicit confirmation for desk-plane write |
-| `examples/xhand_control_example.py` | — | Standalone XHand SDK diagnostic; runs home + preset motion by default; no CLI flags |
-| `examples/visualize_episode.py` | — | Offline Rerun 3D visualization; no hardware control; self-contained script |
-| `examples/tune_hand_retarget.py` | `teleop.hand_retarget_eval` | Read-only offline TAG/DexPilot sweep and home estimate; emits JSON |
-
-## 8. Completion checklist
-
-See `AGENTS.md` §7 (finish definition): focused-diff review, offline
-validation plus `compileall`, and an explicit statement of what was not run
-(especially hardware validation).
+只运行与改动匹配的离线检查；不要启动硬件入口代替测试。交付时说明：改了什么、运行了什么、哪些硬件验证未运行。若改变用户入口或实现导航，再同步 README/本文件；若改变数据字段，更新 `docs/dataset/` 对应合同。

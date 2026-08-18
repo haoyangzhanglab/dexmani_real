@@ -34,7 +34,7 @@ def validate_camera_geometry(
     """Validate the live RGB-D profile against the v17 geometry contract."""
     if configured_align_mode != "depth_to_color":
         raise ValueError(
-            "production camera metadata requires align_mode='depth_to_color'"
+            "camera metadata requires align_mode='depth_to_color'"
         )
     try:
         profile = json.loads(camera_profile_json)
@@ -53,7 +53,7 @@ def validate_camera_geometry(
         )
     if common_viewport != "color" or output_optical_frame != "camera_color_optical":
         raise RuntimeError(
-            "production camera profile must use the color common viewport and "
+            "camera profile must use the color common viewport and "
             "camera_color_optical output frame"
         )
     output_intrinsics = profile.get("output_intrinsics")

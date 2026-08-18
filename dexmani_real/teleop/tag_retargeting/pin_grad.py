@@ -67,7 +67,7 @@ class PinGrad:
             raise ValueError(f"fingertip frames not found in URDF {urdf_path!r}: {missing}")
         self.tip_frame_ids = [int(self.model.getFrameId(name)) for name in names]
 
-    # ── Kinematics ──────────────────────────────────────────────
+    # Kinematics.
 
     def update_kinematics(self, qpos_floating: np.ndarray) -> None:
         """Run FK, update frame placements, and compute joint Jacobians.
@@ -79,7 +79,7 @@ class PinGrad:
         pin.updateFramePlacements(self.model, self.data)
         pin.computeJointJacobians(self.model, self.data, qpos_floating)
 
-    # ── Position gradient ───────────────────────────────────────
+    # Position gradient.
 
     def compute_position_gradient(self, qpos_floating: np.ndarray, target_pos: np.ndarray) -> tuple[np.ndarray, float]:
         """Analytic gradient of squared fingertip position error.
@@ -111,7 +111,7 @@ class PinGrad:
 
         return grad, loss
 
-    # ── Temporal smoothness gradient (static — no Pinocchio needed) ─
+    # Temporal smoothness gradient.
 
     @staticmethod
     def compute_smoothness_gradient(q: np.ndarray, q_last: np.ndarray, weight: float) -> tuple[np.ndarray, float]:

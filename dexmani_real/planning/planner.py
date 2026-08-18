@@ -31,13 +31,8 @@ _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
 
-# Cartesian workspace checks tolerate a small outward excursion at the box
-# boundary. The dense joint-space interpolation (interpolate_waypoints) feeds a
-# nonlinear FK, so a commanded pair whose endpoints both map to positions *at*
-# the boundary can bow a few tens of micrometers outside it purely from
-# interpolation curvature — not a real workspace exit. 1 mm is far below the
-# configured box's own safety margin and the IK pose error tolerance (0.02 m),
-# but ~40× the observed ~24 µm overshoot.
+# Allow a small outward tolerance because nonlinear FK can move a dense
+# interpolation slightly outside the endpoint box.
 _WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
 
 

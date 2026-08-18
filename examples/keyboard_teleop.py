@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keyboard teleoperation entry point with measured XHand feedback by default.
 
-Uses production workers (arm_loop, hand_loop), the action safety gate, and
+Uses runtime workers (arm_loop, hand_loop), the action safety gate, and
 the SharedStorage IPC plane.  The full experiment logic lives here rather
 than in the ``dexmani_real`` package — that keeps the package focused on
 reusable library code and avoids accumulating entry-point logic.
@@ -491,7 +491,7 @@ def _run_control_loop(
                     )
                 continue
             blocked_keys = None
-        # ── Idle: no keys pressed ──────────────────────────────────
+        # Idle: no keys pressed.
         # Mode 6 is a position servo: after publication stops, firmware may
         # still converge to its last accepted endpoint. No measured-hold,
         # explicit stop, or explicit resume command is sent here.
@@ -517,7 +517,7 @@ def _run_control_loop(
                 )
             continue
 
-        # ── Moving: keys are held ──────────────────────────────────
+        # Moving: keys are held.
         if not motion_active:
             require_transition(shared, SafetyState.RUNNING)
             motion_active = True

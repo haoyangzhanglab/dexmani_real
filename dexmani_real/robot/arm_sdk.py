@@ -196,7 +196,7 @@ def _read_live_error_code(arm_api: Any) -> int:
     return int(values[0])
 
 
-# ── Controller error descriptions (startup diagnostics) ──
+# Controller error descriptions.
 #
 # A startup controller error is never cleared implicitly (see arm_loop), so the
 # operator must act before the next run.  The bare vendor code ("C2") is not
@@ -228,11 +228,11 @@ def describe_controller_error(code: int) -> str:
     return _CONTROLLER_ERROR_HELP.get(int(code), "controller error")
 
 
-# ── Controller state transitions (leaf helpers shared by arm_loop + homing) ──
+# Controller state transitions.
 #
 # ``get_state()`` / ``get_err_warn_code()`` are synchronous reads; ``arm.mode``
-# and ``arm.connected`` are report-cache attributes (SDK 1.18.4 has no
-# synchronous ``get_mode()``).  The two are deliberately separate result types:
+# and ``arm.connected`` are report-cache attributes; there is no synchronous
+# ``get_mode()`` read. The two are deliberately separate result types:
 # never present a combined read as one atomic live snapshot.
 
 
@@ -351,8 +351,8 @@ def stop_controller(
 ) -> StopResult:
     """Request State 4 and confirm it, without requiring a cleared error.
 
-    ``emergency=True`` first calls ``arm.emergency_stop()`` (no integer return
-    code in SDK 1.18.4; only exceptions are caught).  A failed ``set_state(4)``
+    ``emergency=True`` first calls ``arm.emergency_stop()`` (only exceptions are
+    caught). A failed ``set_state(4)``
     does not skip the bounded synchronous ``get_state()`` confirmation: a
     latched controller error must not prevent confirming the physical stop.
     """
@@ -385,13 +385,10 @@ def stop_controller(
     )
 
 
-# ── Connect-time validation (config vs. the SDK report surface) ──
+# Connect-time validation.
 #
-# ``set_servo_angle`` silently clamps speed to [0.0001, π] rad/s and mvacc to
-# [0.01, 20] rad/s² (SDK 1.18.4), so a configured value outside the effective
-# intersection of those hard clamps and the reported device limits would be
-# rewritten without any error.  Refuse such values at connect instead of
-# letting metadata claim an execution value the firmware cannot honor.
+# ``set_servo_angle`` silently clamps speed and acceleration. Reject values
+# outside the effective command and device limits before connecting.
 
 SPEED_COMMAND_CLAMP_RAD_PER_S: tuple[float, float] = (0.0001, float(np.pi))
 ACC_COMMAND_CLAMP_RAD_PER_S2: tuple[float, float] = (0.01, 20.0)
@@ -416,12 +413,7 @@ def _binding_device_limit(value: Any) -> float | None:
     return max(finite) if finite else None
 
 
-# Floating-point tolerance for the effective-upper-bound comparison.  The
-# reported device limit and the configured value can express the same nominal
-# limit through different float paths (e.g. 900 °/s² = 5π rad/s² arrives as
-# 15.707963267948966 from np.deg2rad but 15.707962989807129 from the firmware),
-# differing by ~1e-8 relative.  A strict ``<=`` refuses a valid config over that
-# rounding noise; the tolerance still rejects real mismatches (≳1e-4 relative).
+# Tolerance for comparing configured and reported dynamics limits.
 _DYNAMICS_UBOUND_RTOL = 1e-6
 
 

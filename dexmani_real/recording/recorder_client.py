@@ -457,8 +457,6 @@ class DirectRecorderClient:
     removed from the hot path.
     """
 
-    record_extended_metadata = True
-
     def __init__(
         self,
         shared: Any,

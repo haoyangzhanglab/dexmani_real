@@ -145,7 +145,7 @@ def plan_joint_home_path(
         home_qpos:          Target home joint positions (7,).
         planner:            Planner with collision model.  When None, only
                             joint-limit-aware wrapping is performed.
-        table_z_surface_m:  Legacy fixed-Z fallback used only when the planner
+        table_z_surface_m:  Fixed-Z fallback used only when the planner
                             has no calibrated table geometry.  With
                             ``environment.table`` enabled, every waypoint uses
                             exact robot-mesh distance to the tilted table box.
@@ -189,7 +189,7 @@ def plan_joint_home_path(
         # then fail.  Raw delta returns None only when encoders read canonical.
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        # ── Wrap home_qpos to nearest equivalent of current qpos ──
+        # Wrap home target to the nearest equivalent.
         # Prevents interpolate_waypoints from generating up to 360° of
         # unnecessary rotation for equivalent joints (J1/J3/J5/J7 on xArm7,
         # 720° range).  Wrapping home→qpos (not qpos→home) keeps all waypoints
@@ -224,7 +224,7 @@ def plan_joint_home_path(
         }
         report["candidates"].append(candidate)
 
-        # ── Self-collision check (Pinocchio mesh-based) ──
+        # Self-collision check.
         if have_collision:
             assert planner is not None
             _path_check = getattr(
@@ -269,7 +269,7 @@ def plan_joint_home_path(
                 candidate.update(safe=False, reason="workspace_check_error", detail=str(exc))
                 return False
 
-        # ── Table clearance check ─────────────────────────────────────
+        # Table-clearance check.
         # Prefer the calibrated, tilted table box and exact mesh distance.
         # The fixed-Z hand-frame proxy remains only as a compatibility fallback
         # for planners constructed without calibrated table geometry.
@@ -353,13 +353,13 @@ def plan_joint_home_path(
     # 1° validation sample would add arm-side interpolation and force repeated
     # deceleration at artificial stops.
 
-    # ── Attempt 1: direct linear joint-space segment ──
+    # Attempt 1: direct joint-space segment.
     direct_milestones = np.stack([qpos, target])
     if _validate_milestones(direct_milestones, "direct"):
         report.update(status="safe", selected_candidate="direct")
         return direct_milestones
 
-    # ── Attempt 2: two-stage detour (proximal → wrist) ──
+    # Attempt 2: proximal-to-wrist detour.
     # Move shoulder/elbow joints to home first while keeping wrist fixed,
     # then move wrist joints.  This avoids the hand swinging through the body.
     mid = qpos.copy()
@@ -461,7 +461,7 @@ def plan_band_alignment_path(
         bool(getattr(planner.collision_model, "has_table", False)) or table_z_surface_m is not None
     )
 
-    # ── Safety checks (same as plan_joint_home_path._check_safe) ──
+    # Safety checks.
     if have_collision:
         assert planner is not None
         _path_check = getattr(

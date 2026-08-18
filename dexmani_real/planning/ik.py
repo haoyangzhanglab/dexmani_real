@@ -67,7 +67,7 @@ class TeleopIKSolver:
                 profile=profile,
                 report=report,
             )
-            # Propagate total solve time to success path (failure path already has it at line 103).
+            # Include total solve time in success diagnostics.
             result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
         else:
             dt_total_ms = (time.perf_counter() - t_start) * 1000
@@ -199,10 +199,7 @@ class TeleopIKSolver:
             hw_dist = float(np.max(np.abs(delta_current)))
             weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights, delta=delta_current)
 
-            # Band-mismatch gate: detect 2π band shift vs physical arm position.
-            # J1/J3/J5/J7 wrap at 2π; canonicalize_qpos can be defeated at joint
-            # limits.  raw - wrapped delta > 90° → reject (else arm rotates
-            # ~328° physically while wrapped check sees only 32°).
+            # Reject a large physical move hidden by equivalent-angle wrapping.
             _hw_band_mismatch = hw_dist_raw - hw_dist
             _hw_band_limit_rad = np.deg2rad(90.0)
             if _hw_band_mismatch > _hw_band_limit_rad:
@@ -211,9 +208,7 @@ class TeleopIKSolver:
                 )
                 continue
 
-            # Hardware-distance gate: reject candidates too far from the
-            # physical arm position (genuine tracking lag, not band mismatch).
-            # Threshold 150° allows normal lag but blocks ~172° branch jumps.
+            # Reject candidates too far from the measured arm position.
             _hw_limit_rad = np.deg2rad(150.0)
             if hw_dist > _hw_limit_rad:
                 attempts.append(f"{seed_name}:hw_dist({_solve_ms:.1f}ms, {np.rad2deg(hw_dist):.0f}deg)")
@@ -305,8 +300,7 @@ class TeleopIKSolver:
         if self._has_elbow_flip(qpos, previous_qpos_cmd):
             return False, "elbow_flip"
 
-        # L2 catch-all for multi-joint branch jumps the J4-only elbow check misses.
-        # 120° L2 is 4–8× normal frame motion at the default 16 Hz (<30°).
+        # Catch multi-joint branch jumps that the J4-only elbow check misses.
         if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
             return False, "branch_jump_l2"
 
@@ -320,7 +314,6 @@ class TeleopIKSolver:
     ) -> list[tuple[str, np.ndarray, int]]:
         """Generate teleop IK seeds: prev_cmd (n_init_qpos=1) first, then current_qpos + random perturbations.
 
-        n_init_qpos=1 avoids 3× MPlib perturbation overhead (~18 ms → ~6 ms).
         """
         seeds: list[tuple[str, np.ndarray, int]] = [
             ("prev_cmd", prev_cmd.copy(), 1),

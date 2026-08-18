@@ -1,8 +1,7 @@
 """Camera freshness tracking for the recording grid.
 
-The causal ring readers moved to ``shm/causal_reader.py``; they are re-exported
-here under their historical private names so ``teleop/loop.py`` and
-``teleop/safety.py`` keep working unchanged.
+The causal ring readers live in ``shm/causal_reader.py``; compatibility aliases
+remain here for existing teleop imports.
 """
 
 from __future__ import annotations

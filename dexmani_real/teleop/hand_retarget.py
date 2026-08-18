@@ -35,17 +35,13 @@ def _tag_config_with_urdf(config: Any | None, urdf_path: str) -> _TAGRuntimeOver
     return _TAGRuntimeOverrides(config, urdf_path)
 
 
-# ── Pinky landmark indices (MediaPipe convention) ──
+# MediaPipe pinky landmark indices.
 _PINKY_MCP = 17
 _PINKY_PIP = 18
 _PINKY_DIP = 19
 _PINKY_TIP = 20
 
-# Pinky scale.  Production injects the recalibrated per-backend ``pinky_scale``
-# (see config defaults); this fallback matches the DexPilot default so a no-config
-# ``XHandRetargeter`` stays stable.  The original LeFranX extension-dependent
-# interpolation (a 1.2→2.2 range keyed on the pinky extension ratio) is removed.
-# Ref: LeFranX vr_hand_detector_adapter.py:27-84
+# Per-backend config supplies this value; keep a stable no-config fallback.
 
 _PINKY_SCALE_FALLBACK = 1.15
 
@@ -69,10 +65,7 @@ _FINGER_CHAINS = (
     (0, 17, 18, 19, 20),
 )
 
-# Human-flexion → robot-joint mapping (feature_index → SDK joint index).  Mirrors
-# hand_retarget_eval._FLEXION_FEATURE_JOINT_PAIRS: the human CMC/MCP/PIP+DIP
-# flexion angles map onto the robot flexion joints.  thumb_rota1 and index_bend
-# have no landmark-flexion mapping and are excluded from the prior.
+# Human flexion feature index → SDK joint index; unmapped joints are excluded.
 _HUMAN_FLEXION_JOINT_PAIRS = (
     (0, 0), (1, 2),  # thumb CMC→bend, MCP+IP→rota2
     (2, 4), (3, 5),  # index MCP→j1, PIP+DIP→j2
@@ -164,7 +157,6 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     constructs a right-handed orthonormal frame with x pointing from middle
     MCP to wrist. The caller must first run ``validate_landmarks()``.
 
-    Ref: LeFranX vr_hand_detector_adapter.py:293-342
     """
     keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
     if keypoint_3d_array.shape != (21, 3):
@@ -200,7 +192,7 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
         raise ValueError("palm lateral axis is degenerate")
     z = z / z_norm
 
-    # LeFranX: use index_mcp → middle_mcp as lateral reference
+    # Keep the lateral axis sign consistent with index→middle.
     if np.sum(z * (points[1] - points[2])) < 0:
         normal *= -1.0
         z *= -1.0
@@ -214,29 +206,12 @@ def adaptive_retargeting_xhand(
     scale: float = _PINKY_SCALE_FALLBACK,
     palm_scale: float = 1.0,
 ) -> np.ndarray:
-    """Apply constant pinky-chain scaling for the XHand (LeFranX-derived).
-
-    Compensates the human-to-robot finger length mismatch by scaling the pinky
-    chain (MCP→PIP→DIP→TIP) by ``scale`` and, when ``palm_scale != 1.0``, the
-    pinky wrist→MCP baseline independently.  The original LeFranX
-    extension-dependent interpolation (a 1.2→2.2 range keyed on the pinky
-    extension ratio) has been superseded by a constant per-backend
-    ``pinky_scale``; ``scale`` is applied uniformly.
-
-    Operates on MANO-space landmarks — modifies pinky PIP/DIP/TIP positions
-    in-place on a copy. The scaled landmarks are then used directly by the
-    existing retargeting pipeline.
-
-    Ref: LeFranX vr_hand_detector_adapter.py:27-84
+    """Scale the pinky chain and optional wrist-to-MCP baseline on a copy.
 
     Args:
         landmarks: (21, 3) array in MANO coordinate space.
-        scale: Pinky-chain scale.  The backends inject their resolved
-            ``pinky_scale`` (a constant); the module constant is only the
-            no-config fallback.
-        palm_scale: Scale on the pinky wrist→MCP baseline (1.0 = no-op).  The
-            backends inject their resolved ``pinky_palm_scale``; the module
-            fallback is 1.0.
+        scale: Uniform MCP→TIP segment scale.
+        palm_scale: Wrist→MCP baseline scale; 1.0 is a no-op.
 
     Returns:
         (21, 3) array with pinky chain scaled (new copy, input unchanged).
@@ -244,22 +219,14 @@ def adaptive_retargeting_xhand(
     landmarks = np.asarray(landmarks, dtype=np.float64).copy()
     if landmarks.shape != (21, 3) or not np.all(np.isfinite(landmarks)):
         raise ValueError("landmarks must be a finite (21, 3) array")
-    # Preserve every parent→child vector from the unmodified input.  Computing
-    # distal segments after moving their parent compounds the translation and
-    # is not a kinematic scaling of the original pinky.
+    # Compute every segment from the original landmarks.
     raw = landmarks.copy()
 
-    # Palm offset: scale the wrist→MCP baseline independently of the finger chain.
-    # The robot pinky MCP is proportionally farther from the wrist than the human's
-    # (URDF pinky_joint1 origin ≈0.1085 m vs human ≈0.0865 m ≈ 1.25×), which the
-    # distal-only scale cannot express.  Moving the MCP landmark radially from the
-    # wrist lengthens the wrist→tip reference so the solver need not over-flex the
-    # MCP to shorten reach.  palm_scale == 1.0 is a no-op.
+    # Scale the wrist→MCP baseline independently.
     if palm_scale != 1.0:
         landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
 
-    # Apply uniform scaling along the kinematic chain (MCP→PIP→DIP→TIP).
-    # Each segment is extended from the (possibly modified) parent joint.
+    # Apply uniform scaling along MCP→PIP→DIP→TIP.
     mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
     landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * scale
 
@@ -294,15 +261,13 @@ class XHandRetargeter:
             self._pinky_palm_scale = 1.0
         self.last_debug: dict[str, float | str] = {}
 
-        # Every returned qpos follows the cross-process SDK order owned by
-        # utils.schema, independent of the backend model's internal order.
+        # Keep the public output in the schema-owned SDK order.
         self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
 
         self.load_retargeter()
 
     def load_retargeter(self):
-        # Import only the selected DexPilot backend.  TAG deployments should
-        # not load dex-retargeting, its native dependencies, or model assets.
+        # Load the selected backend lazily.
         import yaml
         from dex_retargeting.retargeting_config import RetargetingConfig
 
@@ -334,7 +299,6 @@ class XHandRetargeter:
         self._prior_weight = float(self._dexpilot_config.prior_weight) if self._dexpilot_config is not None else 0.0
         prior_mask = _SDK_FLEXION_MASK  # target order == SDK order
 
-        # Build with the human-flexion prior (in-repo subclass; same path as LeFranX)
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
         self.retargeter = build_dexpilot_retargeting(
             RetargetingConfig.from_dict(cfg),
@@ -352,10 +316,7 @@ class XHandRetargeter:
 
     @property
     def low_pass_alpha(self) -> float:
-        """Current LPFilter alpha (new-value weight: 1.0 = pass-through, →0 = freeze).
-
-        The YAML fallback is 0.6; production injects the resolved runtime value.
-        """
+        """Current LPFilter alpha (1.0 passes through; 0.0 freezes)."""
         return float(self.retargeter.filter.alpha)
 
     @low_pass_alpha.setter
@@ -369,9 +330,6 @@ class XHandRetargeter:
         Applies adaptive_retargeting_xhand (pinky chain scaling) before
         computing origin→task difference vectors.
         """
-        # Scale the pinky chain on landmarks before computing ref vectors.  This
-        # directly modifies PIP/DIP/TIP positions along the MCP→TIP chain,
-        # compensating for human-robot finger length differences.
         scaled_landmarks = adaptive_retargeting_xhand(
             hand_joint_pos,
             scale=self._pinky_scale,
@@ -398,7 +356,6 @@ class XHandRetargeter:
             logger.warning("VR landmarks rejected (%s) — holding hand position", reason)
             return None
 
-        # ── Coordinate transform: operator → MANO ──
         try:
             wrist_rot = _estimate_palm_frame(landmarks)
             mano_landmarks = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
@@ -408,7 +365,7 @@ class XHandRetargeter:
 
         start_time = time.time()
 
-        # Human-flexion prior reference (before pinky scaling).
+        # Use the unscaled landmarks for the human-flexion prior.
         if self._prior_weight > 0:
             self.retargeter.optimizer.set_prior_reference(_human_flexion_sdk_reference(mano_landmarks))
 
@@ -421,49 +378,29 @@ class XHandRetargeter:
 
         qpos_arr = np.asarray(qpos, dtype=float)
 
-        # Joint order remap
         qpos_arr = qpos_arr[self.retargeted_joint_order]
 
         if self.debug_adapters:
             self.last_debug = {
                 "retarget_ms": 1000 * (time.time() - start_time),
-                "adaptives": "pinky(LeFranX chain scaling)",
+                "adaptives": "pinky_chain_scaling",
             }
             logger.info("retarget_debug: %s", self.last_debug)
 
         return qpos_arr
 
     def reset(self, initial_qpos: np.ndarray | None = None) -> None:
-        """Reset retargeter state for a clean episode start.
-
-        Resets the SLSQP warm-start seed, the LPFilter accumulator, and the
-        DexPilot projection indicators.
-
-        Args:
-            initial_qpos: Optional (12,) array of current hand joint positions.
-                When provided, seeds the SLSQP warm-start with the actual hardware
-                pose instead of joint_limits.mean(1) (neutral).  This eliminates
-                the first-frame NLP convergence cost — the seed is already near
-                the optimum, so SLSQP converges in 1-2 iterations instead of
-                potentially dozens.  Reduces between-session timing variance from
-                ~2.4× to near-zero.
-        """
-        self.retargeter.reset()  # SeqRetargeting: resets last_qpos + counters
+        """Reset optimizer, filter, projection state, and optional warm start."""
+        self.retargeter.reset()
         if self.retargeter.filter is not None:
-            self.retargeter.filter.reset()  # LPFilter: clears EMA accumulator
-        self.retargeter.optimizer.projected[:] = False  # DexPilot: clears projection state
+            self.retargeter.filter.reset()
+        self.retargeter.optimizer.projected[:] = False
 
-        # ── Smart warm-start: seed with actual hardware pose ──
-        # Without this, last_qpos is joint_limits.mean(1) — a neutral pose that
-        # can be far from the operator's current hand shape.  SLSQP must then
-        # converge from neutral → actual, costing more iterations (and wall time)
-        # on the first frame.  Seeding with the real hardware position makes the
-        # first-frame optimization nearly trivial.
+        # Seed the optimizer with the current hardware pose when available.
         if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE:
             qpos = np.asarray(initial_qpos, dtype=np.float32)
             if np.all(np.isfinite(qpos)):
-                # Remap from canonical hardware/SDK joint order to
-                # retargeter internal order before subsetting by pin2target.
+                # Convert SDK order to the optimizer's internal order.
                 qpos_retargeter = qpos[self.inverse_retargeted_joint_order]
                 idx = self.retargeter.optimizer.idx_pin2target
                 self.retargeter.last_qpos = qpos_retargeter[idx]
@@ -521,7 +458,7 @@ class TAGHandRetargeter:
             tag_config = tag_config.config
         tag_cfg = default_tag_cfg if tag_config is None else tag_config
 
-        # ── Load URDF, read joint limits ──
+        # Load URDF and joint limits.
         resolved_urdf_path = (
             str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
             if runtime_urdf_path is None
@@ -534,31 +471,13 @@ class TAGHandRetargeter:
         joint_lo = model.lowerPositionLimit[7:].copy()
         joint_hi = model.upperPositionLimit[7:].copy()
 
-        # ── Joint order mapping ──────────────────────────────────────────
-        # Pinocchio parses URDF joints in a different order than the canonical
-        # SDK order used by XHand driver.  We build two mapping arrays:
-        #
-        #   _mapping_model_to_sdk:  for each SDK joint i, its Pinocchio model index.
-        #     Usage: qpos_model[_mapping_model_to_sdk] → SDK-order qpos (retarget output).
-        #   _mapping_sdk_to_model:  for each model joint i, its SDK index.
-        #     Usage: qpos_sdk[_mapping_sdk_to_model] → model-order qpos (reset warm-start).
-        #
-        # Pinocchio model order:  index_bend, index_j1, index_j2, mid_j1, mid_j2,
-        #   pinky_j1, pinky_j2, ring_j1, ring_j2, thumb_bend, thumb_rota_j1, thumb_rota_j2
-        # Canonical SDK order:    thumb_bend, thumb_rota_j1, thumb_rota_j2, index_bend, …
+        # Pinocchio and SDK use different joint orders.
         model_names = list(model.names[2:])  # skip "universe" and "root_joint"
         self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
         self._mapping_model_to_sdk = np.array(
             [model_names.index(name) for name in self.sdk_joint_names], dtype=np.intp
         )
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
-
-        # ── Optimizer ──
-        # NLopt bounds are the URDF mechanical range, not the operator-set
-        # anti-clogging command floor. The measured warm-start pose is real
-        # hardware state (e.g. ~4.4° below a 5° command floor) and must not be
-        # projected into a stricter box; the command floor is applied later by
-        # clipping the published command.
 
         self._optimizer = HandOptimizer(
             urdf_path=resolved_urdf_path,
@@ -584,14 +503,12 @@ class TAGHandRetargeter:
             prior_mask=_SDK_FLEXION_MASK[self._mapping_sdk_to_model],
         )
 
-        # ── Pre-computed transforms (avoid per-frame allocation) ──
+        # Precompute frame transforms and resolved scales.
         self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
-        # MANO and URDF both use +Z for finger extension.
         self._pinky_scale = float(tag_cfg.pinky_scale)
         self._pinky_palm_scale = float(tag_cfg.pinky_palm_scale)
         self._prior_weight = float(tag_cfg.prior_weight)
 
-        # ── State & debug ──
         self._last_raw_qpos: np.ndarray | None = None
         self.debug = bool(debug)
 
@@ -600,8 +517,6 @@ class TAGHandRetargeter:
             resolved_urdf_path,
             tag_cfg.mano_to_urdf_euler,
         )
-
-    # ── Public API (compatible with XHandRetargeter) ────────────
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
         """Retarget VR landmarks (operator-frame, 21×3) to XHand joint qpos (12,).
@@ -617,7 +532,6 @@ class TAGHandRetargeter:
 
         t0 = time.perf_counter() if self.debug else 0.0
 
-        # 1. Coordinate transform: operator → MANO (reuse existing helpers)
         try:
             wrist_rot = _estimate_palm_frame(landmarks)
             mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
@@ -625,25 +539,22 @@ class TAGHandRetargeter:
             logger.warning("TAGHandRetargeter: coordinate transform failed — holding position")
             return None
 
-        # 2. Human-flexion prior reference (before pinky scaling — the
-        #    reference is the operator's actual flexion, not the robot-scaled chain)
+        # Use the unscaled landmarks for the human-flexion prior.
         q_prior_model = None
         if self._prior_weight > 0:
             q_prior_model = _human_flexion_sdk_reference(mano)[self._mapping_sdk_to_model]
 
-        # 3. Pinky chain scaling (reuse existing)
         mano = adaptive_retargeting_xhand(
             mano,
             scale=self._pinky_scale,
             palm_scale=self._pinky_palm_scale,
         )
 
-        # 4. Extract 5 fingertip positions → wrist-centered → rotate to URDF frame
+        # Extract wrist-centered fingertips in the URDF frame.
         tips = mano[_FINGERTIP_INDICES].copy()  # (5, 3) in MANO frame
         tips -= mano[0]  # center at wrist
         tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
 
-        # 5. Two-stage NLopt optimization
         try:
             qpos_model = self._optimizer.solve(tips_urdf, q_prior=q_prior_model)  # (12,) in Pinocchio model order
         except Exception:
@@ -653,7 +564,7 @@ class TAGHandRetargeter:
         if qpos_model is None:
             return None
 
-        # 5. Joint order remap: model order → canonical SDK order
+        # Remap model order to canonical SDK order.
         qpos_sdk = qpos_model[self._mapping_model_to_sdk]
         self._last_raw_qpos = qpos_sdk.copy()
 
@@ -664,14 +575,7 @@ class TAGHandRetargeter:
         return qpos_sdk
 
     def reset(self, initial_qpos: np.ndarray | None = None) -> None:
-        """Reset retargeter state for a clean episode start.
-
-        Args:
-            initial_qpos: Optional (12,) current hand joint positions in SDK order.
-                When provided, seeds the NLopt warm-start from the actual hardware
-                pose so the first-frame optimization converges from near-optimum.
-        """
-        # Clear last raw output state
+        """Reset optimizer state and optional SDK-order warm start."""
         self._last_raw_qpos = None
 
         if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(initial_qpos)):
@@ -687,7 +591,7 @@ class TAGHandRetargeter:
         return self._last_raw_qpos.copy() if self._last_raw_qpos is not None else None
 
 
-# ── Lazy Pinocchio URDF loader (avoids import at module level) ──
+# Lazy Pinocchio URDF loader.
 
 
 def pin_loading(urdf_path: str):

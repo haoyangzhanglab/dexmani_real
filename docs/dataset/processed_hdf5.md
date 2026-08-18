@@ -45,7 +45,7 @@ conda run -n real_robot python examples/process_episodes.py \
 
 ```text
 episode_processed/
-├── episode_20260816_234045.h5
+├── <source_stem>.h5
 └── processing_index.json
 ```
 
@@ -53,8 +53,8 @@ episode_processed/
 
 ```text
 episode_processed/
-├── episode_20260816_234045__seg000.h5
-├── episode_20260816_234045__seg001.h5
+├── <source_stem>__seg000.h5
+├── <source_stem>__seg001.h5
 └── processing_index.json
 ```
 
@@ -126,7 +126,7 @@ depth + K + 外参 + desk_plane + pc config → (2048,6) XYZRGB → (1024,6) flo
 
 ## 4. 明确省略的 Sim 字段
 
-第一版不生成：
+当前不生成：
 
 ```text
 depth
@@ -220,7 +220,7 @@ Recorder 的保存成功不等于任务成功。没有人工 annotation 时，�
 
 ```yaml
 episodes:
-  episode_20260816_234045:
+  <source_stem>:
     include: true
     task_name: pick_bottle
     task_outcome: success
@@ -265,15 +265,8 @@ source_member_sha256_json
 首维、压缩、finite、点云颜色/非零帧、K、source range/segment、处理配置、三件套
 SHA-256、schema 版本以及 real-domain/frame 标记。
 
-## 9. 当前样例基线
+## 9. 验证方式
 
-`episode_20260816_234045` 在默认 horizon 16 下：
-
-| Profile | 源帧 | 输出帧 | Segments | 完整窗口 |
-|---|---:|---:|---:|---:|
-| `joint` | 960 | 960 | 1 | 945 |
-| `rgb_pc` | 960 | 939 | 13 | 744 |
-
-RGB/点云版本删除 9 个开头空点云帧和 12 个中间无效点云帧；没有按全局
-`observation_valid` 将数据误缩到 344 帧，也没有按历史损坏的 IK/retarget flags
-删除 frame-status 为 OK 的数据。
+不要把某次 episode 的帧数或质量统计写入格式合同。运行处理命令生成
+`processing_index.json`，以其中的 source decision、segment 范围、质量摘要和
+写后验证结果判断本次输入；需要复现时保存处理配置和源文件哈希。

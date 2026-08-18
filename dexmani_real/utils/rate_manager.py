@@ -116,7 +116,7 @@ class RateManager:
                 self._next_deadline = now + self.period
                 self._overdue_throttle = 0
             else:
-                # Short overrun: emit throttled warning (every ~50 occurrences)
+                # Short overrun: emit a throttled warning.
                 if self._overdue_throttle <= 0:
                     logger.warning(
                         "Control loop over budget: actual=%.1fms target=%.1fms",

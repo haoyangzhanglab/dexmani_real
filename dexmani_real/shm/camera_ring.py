@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 
 
 class CameraRingBuffer:
-    """Shared memory ring buffer for large camera frames (~1.5MB each).
+    """Shared memory ring buffer for large camera frames.
 
     Uses a different layout than SharedMemoryRingBuffer because camera
     frames contain variable-size RGB and depth arrays. Each slot stores:
@@ -176,7 +176,7 @@ class CameraRingBuffer:
         idx = seq % self.maxlen
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
-        # ── Seqlock write protocol: odd→data→even ──
+        # Seqlock write protocol: odd → data → even.
         # Write an odd marker BEFORE the payload so concurrent readers see
         # "writer active" and bail out.  The timestamp is stamped only after the
         # payload is committed below, so it reflects the true commit time.
@@ -206,14 +206,14 @@ class CameraRingBuffer:
         )
         depth_dest[:] = depth.view(np.uint8).ravel()[:depth_len]
 
-        # ── Commit: stamp the timestamp only after the payload is fully copied,
+        # Commit after the payload is fully copied.
         # so both the seqlock timestamp and the header publish field reflect the
         # true commit time, not the start of a long RGB/depth copy.
         now_ns = time.monotonic_ns()
         seqlock.stamp_timestamp(now_ns)
         header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
 
-        # ── Seqlock: write even marker — payload is now consistent ──
+        # Publish the even marker.
         seqlock.end_write(seq)
 
         # Publish the logical sequence only after the payload is committed.
@@ -299,7 +299,7 @@ class CameraRingBuffer:
             .reshape((depth_h, depth_w))
         )
 
-        # ── Seqlock: reject writer-active or torn reads ──
+        # Reject writer-active or torn reads.
         # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
         if not seqlock.verify(slot_seq):
             return None

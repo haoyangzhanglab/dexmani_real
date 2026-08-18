@@ -188,7 +188,7 @@ class XArm7Kinematics:
         """Yoshikawa manipulability measure: sqrt(det(J * J^T)).
 
         If you already have the Jacobian, use :meth:`manipulability_from_jacobian`
-        to avoid a redundant FK+Jacobian computation (~0.3 ms).
+        to avoid a redundant FK+Jacobian computation.
         """
         J = self.compute_eef_jacobian(qpos)
         return self.manipulability_from_jacobian(J)

@@ -370,7 +370,7 @@ class IKCandidateManager:
         upper = np.maximum(path - limits[None, :, 1], 0.0)
         return outside, np.maximum(lower, upper)
 
-    # ── Collision check wrappers (delegate to CollisionModel) ──
+    # Collision-check wrappers.
 
     def _require_collision_model(self) -> None:
         if self._cm is None:

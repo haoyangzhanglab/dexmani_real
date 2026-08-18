@@ -11,7 +11,7 @@ failure raises (fail closed) rather than falling back to a dummy safe mode.
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from dexmani_real.deployment.contracts import (
     ActionAdapter,

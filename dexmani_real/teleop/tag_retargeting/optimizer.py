@@ -89,7 +89,7 @@ class HandOptimizer:
         prior_weight: float = 0.0,
         prior_mask: np.ndarray | None = None,
     ) -> None:
-        # ── Kinematics ──
+        # Kinematics.
         self.pin_grad = PinGrad(urdf_path, fingertip_frame_names)
         self.dof: int = self.pin_grad.dof
         self.finger_num: int = len(self.pin_grad.tip_frame_ids)
@@ -107,7 +107,7 @@ class HandOptimizer:
         self.joint_limits_lower = lower.copy()
         self.joint_limits_upper = upper.copy()
 
-        # ── Finger length scaling ──
+        # Finger-length scaling.
         robot_lengths = np.asarray(finger_lengths_robot, dtype=np.float64)
         human_lengths = np.asarray(finger_lengths_human, dtype=np.float64)
         if (
@@ -124,12 +124,12 @@ class HandOptimizer:
         ratio = robot_lengths / human_lengths
         self.finger_scale: np.ndarray = ratio * finger_scale_boost  # (finger_num,)
 
-        # ── FreeFlyer buffer: base translation always zero, rotation always identity ──
+        # Fixed FreeFlyer base.
         # Frame alignment is handled externally via R_mano_to_urdf on target positions.
         self.qpos_floating = np.zeros(3 + 4 + self.dof, dtype=np.float64)
         self.qpos_floating[6] = 1.0  # w=1 → identity quaternion (x, y, z, w)
 
-        # ── NLopt Stage 1: L-BFGS ──
+        # NLopt Stage 1.
         self.opt_s1 = nlopt.opt(nlopt.LD_LBFGS, self.dof)
         self.opt_s1.set_lower_bounds(self.joint_limits_lower.tolist())
         self.opt_s1.set_upper_bounds(self.joint_limits_upper.tolist())
@@ -138,7 +138,7 @@ class HandOptimizer:
         self.opt_s1.set_min_objective(self._obj_s1)
         self._smooth_weight = smooth_weight
 
-        # ── NLopt Stage 2: SLSQP (pinch refinement) ──
+        # NLopt Stage 2.
         self.opt_s2 = nlopt.opt(nlopt.LD_SLSQP, self.dof)
         self.opt_s2.set_lower_bounds(self.joint_limits_lower.tolist())
         self.opt_s2.set_upper_bounds(self.joint_limits_upper.tolist())
@@ -146,7 +146,7 @@ class HandOptimizer:
         self.opt_s2.set_maxeval(maxeval_s2)
         self.opt_s2.set_min_objective(self._obj_s2)
 
-        # ── Pinch parameters ──
+        # Pinch parameters.
         self.pinch_base_weight = pinch_base_weight
         self.pinch_start_dist = pinch_start_dist_m
         self.pinch_full_dist = pinch_full_dist_m
@@ -155,7 +155,7 @@ class HandOptimizer:
         self.reg_s1_weight = reg_stage1_weight
         self.reg_last_weight = reg_last_weight
 
-        # ── Human-flexion prior ──
+        # Human-flexion prior.
         self.prior_weight = float(prior_weight)
         if not np.isfinite(self.prior_weight) or self.prior_weight < 0:
             raise ValueError("prior_weight must be finite and non-negative")
@@ -167,7 +167,7 @@ class HandOptimizer:
                 raise ValueError("prior_mask must be finite")
         self.prior_mask = prior_mask
 
-        # ── State ──
+        # State.
         self._default_qpos = (self.joint_limits_lower + self.joint_limits_upper) / 2.0
         self.last_qpos: np.ndarray = self._default_qpos.copy()
         self.qpos_stage1: np.ndarray | None = None
@@ -178,7 +178,7 @@ class HandOptimizer:
         self._stage2_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
 
-    # ── Public API ──────────────────────────────────────────────
+    # Public API.
 
     def solve(self, fingertip_positions: np.ndarray, q_prior: np.ndarray | None = None) -> np.ndarray | None:
         """Solve one frame: fingertip positions → joint angles.
@@ -210,7 +210,7 @@ class HandOptimizer:
         # Scale targets (1.2× boost discourages over-flexing)
         self._current_target = fingertip_positions * self.finger_scale[:, np.newaxis]
 
-        # ── Stage 1: Global position matching ──
+        # Stage 1: global position matching.
         warm_start = self._bounded_qpos(self.last_qpos, "Stage 1 warm start")
         self.last_qpos = warm_start.copy()
         try:
@@ -230,7 +230,7 @@ class HandOptimizer:
             )
             return None
 
-        # ── Pinch detection (on UNscaled targets) ──
+        # Pinch detection on unscaled targets.
         vecs = fingertip_positions[1:] - fingertip_positions[0]  # (finger_num-1, 3)
         dists = np.linalg.norm(vecs, axis=1)  # (finger_num-1,)
         target_factors = np.clip(
@@ -247,7 +247,7 @@ class HandOptimizer:
             self.last_qpos = q_s1.copy()
             return q_s1
 
-        # ── Stage 2: Pinch refinement ──
+        # Stage 2: pinch refinement.
         self.qpos_stage1 = q_s1
         try:
             q_s2 = self.opt_s2.optimize(q_s1)
@@ -292,7 +292,7 @@ class HandOptimizer:
             self._bounds_warn("HandOptimizer: projected %s into NLopt bounds", label)
         return bounded
 
-    # ── NLopt callbacks ─────────────────────────────────────────
+    # NLopt callbacks.
 
     def _compute_prior_gradient(self, qpos: np.ndarray) -> tuple[np.ndarray, float]:
         """Human-flexion prior gradient/loss (zeros when disabled)."""

@@ -14,7 +14,6 @@ last observed value (age/latency), which overwrites each tick.
 from __future__ import annotations
 
 import time
-from typing import Any
 
 from dexmani_real.utils.log import get_logger
 

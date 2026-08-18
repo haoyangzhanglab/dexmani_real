@@ -77,7 +77,7 @@ class RecorderIOConfig:
             raise ValueError("RecorderIO requires the resolved config SHA-256")
         if self.align_mode != "depth_to_color":
             raise ValueError(
-                "RecorderIO production recording requires align_mode='depth_to_color' "
+                "RecorderIO recording requires align_mode='depth_to_color' "
                 "so camera_K and T_world_camera share the color optical frame"
             )
         provenance_names = [name for name, _value in self.provenance]

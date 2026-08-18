@@ -16,7 +16,7 @@ import numpy as np
 import yaml
 
 from dexmani_real.data_processing.cleaning import analyze_episode
-from dexmani_real.data_processing.contracts import EpisodeAnnotation, EpisodeDecision, OutputProfile, ProcessingConfig
+from dexmani_real.data_processing.contracts import EpisodeAnnotation, EpisodeDecision, ProcessingConfig
 from dexmani_real.data_processing.transforms import resize_camera_intrinsic, resize_point_cloud, resize_rgb
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.episode_schema import EPISODE_SCHEMA_VERSION
@@ -303,7 +303,7 @@ def _write_episode_segments(
                 target_width=config.target_rgb_width,
             )
 
-        # ── Point cloud derivation (schema v17: derived, not recorded) ──
+        # Derive point clouds; v17 stores depth, not point clouds.
         # Reconstruct the exact processor used at recording time from the
         # persisted pc_* metadata, then deproject the recorded depth with the
         # same intrinsics/extrinsics/desk plane.  The processor is fully

@@ -20,10 +20,10 @@ recorded with non-default ``--acc``/``--speed``, pass the same values here so th
 resolved-config provenance matches.
 
 Usage:
-    python examples/replay_episode.py episodes/episode_20260729_213332
-    python examples/replay_episode.py episodes/episode_20260729_213332 --output results/my_replay/
-    python examples/replay_episode.py episodes/episode_20260729_213332 --acc 900 --speed 120
-    python examples/replay_episode.py episodes/episode_20260729_213332 --dry-run
+    python examples/replay_episode.py episodes/<episode_dir>
+    python examples/replay_episode.py episodes/<episode_dir> --output results/my_replay/
+    python examples/replay_episode.py episodes/<episode_dir> --acc 900 --speed 120
+    python examples/replay_episode.py episodes/<episode_dir> --dry-run
 
 Live replay controls:
     Q     clean exit (save partial results)
@@ -90,10 +90,6 @@ from dexmani_real.utils.schema import (ARM_EE_SHAPE, ARM_JOINT_SHAPE,
 
 logger = get_logger(__name__)
 
-# ========================================================================
-# Constants & helpers (shared across all sections)
-# ========================================================================
-
 DEFAULT_OUTPUT_DIR = "replay_results"
 
 _MIN_EPISODE_RATE_HZ = 1.0
@@ -137,11 +133,6 @@ def preflight_model_paths() -> tuple[Path, ...]:
         model_dir / "xarm7_xhand_right.urdf",
         model_dir / "xarm7_xhand.srdf",
     )
-
-
-# ========================================================================
-# Section 1: Trajectory data loading
-# ========================================================================
 
 
 @dataclass
@@ -301,11 +292,6 @@ def load_trajectory(
         "yes" if trajectory.arm_ee is not None else "no",
     )
     return trajectory
-
-
-# ========================================================================
-# Section 2: Replay metrics
-# ========================================================================
 
 
 class ReplayRecorder:
@@ -566,7 +552,7 @@ def compute_metrics(
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
                 metrics.hand_joint_rmse_overall_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
 
-    # Per-joint position RMSE gives physical following lag; median rejects a noisy joint.
+    # Aggregate per-joint position RMSE with a noise-robust median.
     if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
         max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
         joint_lags: list[int] = []
@@ -666,11 +652,6 @@ def save_results(metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], out
     save_replay_data(replay_data, output_dir)
 
 
-# ========================================================================
-# Section 3: Preflight validation
-# ========================================================================
-
-
 def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
     """Return the recorded hand action stream used for geometry preflight."""
     if trajectory.action_hand_joint is None:
@@ -759,11 +740,6 @@ def verify_live_replay_preflight(
             raise ValueError(f"live replay workspace rejection at transition {start}->{end}")
         if not planner.collision_model.check_transition_collision_free(arm_start, arm_end, hand_start, hand_end):
             raise ValueError(f"live replay collision rejection at transition {start}->{end}")
-
-
-# ========================================================================
-# Section 4: Replay runner
-# ========================================================================
 
 
 class ReplayStatus(str, Enum):
@@ -1261,11 +1237,6 @@ class TrajectoryReplayer:
             self.shared.is_running.value = False
 
 
-# ========================================================================
-# Section 5: Live replay session
-# ========================================================================
-
-
 @dataclass(frozen=True)
 class LiveReplayConfig:
     """Bundles CLI-level live-replay overrides (output, evaluation)."""
@@ -1675,11 +1646,6 @@ def run_live_replay(
     return outcome
 
 
-# ========================================================================
-# Section 6: CLI & main
-# ========================================================================
-
-
 @dataclass(frozen=True)
 class ReplayRuntimeSelection:
     """Resolved runtime config with per-session derived values and provenance hash."""
@@ -1744,16 +1710,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog="""
 Examples:
   # Live replay: rerun the full recorded trajectory and write results
-  python examples/replay_episode.py episodes/episode_20260729_213332
+  python examples/replay_episode.py episodes/<episode_dir>
 
   # Reproduce a recording made with non-default acc/speed (must match the episode)
-  python examples/replay_episode.py episodes/episode_20260729_213332 --acc 900 --speed 120
+  python examples/replay_episode.py episodes/<episode_dir> --acc 900 --speed 120
 
   # Custom capture/metrics directory
-  python examples/replay_episode.py episodes/episode_20260729_213332 --output results/my_replay/
+  python examples/replay_episode.py episodes/<episode_dir> --output results/my_replay/
 
   # Offline validation only (no hardware, no workers)
-  python examples/replay_episode.py episodes/episode_20260729_213332 --dry-run
+  python examples/replay_episode.py episodes/<episode_dir> --dry-run
 
 Live replay controls:
   Q     clean exit (save partial results)

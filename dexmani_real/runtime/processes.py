@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import multiprocessing as mp
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping

@@ -36,7 +36,7 @@ class HandProcessConfig:
 
     loop_hz: float = field(default_factory=lambda: hand.loop_hz)
 
-    # Production entry points keep this fail-closed. The non-fatal mode is
+    # Runtime entry points keep this fail-closed. The non-fatal mode is
     # retained only for explicit offline fault-injection tests.
     startup_failure_is_fatal: bool = True
     ethercat_slave_position: int = field(default_factory=lambda: hand.ethercat_slave_position)
@@ -572,7 +572,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 )
             )
 
-            # Rate limit (absolute-deadline scheduling, consistent with arm_loop/teleop_loop)
+            # Keep absolute-deadline scheduling.
             rate_mgr.wait()
     finally:
         # Shutdown never creates new motion. Homing is an explicit, correlated
