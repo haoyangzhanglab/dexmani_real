@@ -89,7 +89,7 @@ class EMAParams:
     """Cartesian-space EMA smoothing parameters."""
 
     alpha_pos: float = 0.6
-    alpha_rot: float = 0.25
+    alpha_rot: float = 0.4
 
     def __post_init__(self) -> None:
         if not (np.isfinite(self.alpha_pos) and np.isfinite(self.alpha_rot)):
