@@ -1,16 +1,23 @@
-"""Pure decision logic for cleaning one schema-v17 episode."""
+"""Pure one-source-to-one-artifact cleaning decisions for schema-v17 episodes."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, hand
-from dexmani_real.data_processing.contracts import EpisodeAnnotation, EpisodeDecision, ProcessingConfig, SegmentDecision
+from dexmani_real.data_processing.contracts import (
+    BridgePolicy,
+    EpisodeAnnotation,
+    EpisodeDecision,
+    ProcessingConfig,
+)
+from dexmani_real.data_processing.quality import assess_temporal_quality
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.timestamp_buffer import FillReason
+from dexmani_real.sensor.camera_process import CameraHealth
 
 
 def _as_bool(reader: EpisodeReader, name: str) -> np.ndarray:
@@ -39,7 +46,9 @@ def _finite_stats(values: np.ndarray) -> dict[str, float | int | None]:
     }
 
 
-def _range_mask(length: int, ranges: tuple[tuple[int, int], ...], *, default: bool) -> np.ndarray:
+def _range_mask(
+    length: int, ranges: tuple[tuple[int, int], ...], *, default: bool
+) -> np.ndarray:
     mask = np.full(length, default, dtype=bool)
     if ranges and default:
         for start, end in ranges:
@@ -50,74 +59,202 @@ def _range_mask(length: int, ranges: tuple[tuple[int, int], ...], *, default: bo
     return mask
 
 
-def _segment_quality(
+def _empty_decision(
+    path: Path,
+    frame_count: int,
+    config: ProcessingConfig,
+    reason: str,
+    *,
+    hard_reason_counts: dict[str, int] | None = None,
+) -> EpisodeDecision:
+    return EpisodeDecision(
+        source_path=path,
+        source_frames=frame_count,
+        profile=config.profile,
+        selected_indices=np.empty(0, dtype=np.int64),
+        keep_mask=np.zeros(frame_count, dtype=bool),
+        drop_reason_bits=np.zeros(frame_count, dtype=np.uint64),
+        drop_reason_names=(),
+        hard_reason_counts=hard_reason_counts or {},
+        boundary_counts={},
+        selected_frames=0,
+        quality={},
+        rejected_reason=reason,
+    )
+
+
+def _inside(
+    values: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    return np.all((values >= lower - tolerance) & (values <= upper + tolerance), axis=1)
+
+
+def _quality_summary(
     arrays: Mapping[str, np.ndarray],
-    start: int,
-    end: int,
+    selected: np.ndarray,
     *,
     grid_dt_s: float,
+    tracking_error_warn_rad: float,
+    horizon: int,
 ) -> dict[str, Any]:
-    action = np.concatenate((arrays["action_arm"], arrays["action_hand"]), axis=1)[start:end]
+    action = np.concatenate((arrays["action_arm"], arrays["action_hand"]), axis=1)[
+        selected
+    ]
     steps = np.diff(action, axis=0)
-    max_step = np.max(np.abs(steps), axis=1) if steps.size else np.empty(0, dtype=np.float64)
-    velocity = max_step / grid_dt_s
-    acceleration = np.diff(steps / grid_dt_s, axis=0) / grid_dt_s if len(steps) >= 2 else np.empty((0, 19))
-    jerk = np.diff(acceleration, axis=0) / grid_dt_s if len(acceleration) >= 2 else np.empty((0, 19))
-    quality: dict[str, Any] = {
-        "tracking_error_rad": _finite_stats(arrays["tracking_error"][start:end]),
+    max_step = (
+        np.max(np.abs(steps), axis=1) if steps.size else np.empty(0, dtype=np.float64)
+    )
+    acceleration = (
+        np.diff(steps / grid_dt_s, axis=0) / grid_dt_s
+        if len(steps) >= 2
+        else np.empty((0, 19), dtype=np.float64)
+    )
+    summary: dict[str, Any] = {
+        "tracking_error_rad": _finite_stats(arrays["tracking_error"][selected]),
+        "high_tracking_error_count": int(
+            np.count_nonzero(
+                arrays["tracking_error"][selected] > tracking_error_warn_rad
+            )
+        ),
         "max_abs_action_step_rad": _finite_stats(max_step),
-        "max_abs_action_velocity_rad_s": _finite_stats(velocity),
+        "max_abs_action_velocity_rad_s": _finite_stats(max_step / grid_dt_s),
         "max_abs_action_acceleration_rad_s2": _finite_stats(
             np.max(np.abs(acceleration), axis=1) if acceleration.size else np.empty(0)
         ),
-        "max_abs_action_jerk_rad_s3": _finite_stats(np.max(np.abs(jerk), axis=1) if jerk.size else np.empty(0)),
         "idle_step_ratio": float(np.mean(max_step <= 1e-4)) if max_step.size else 1.0,
+        "full_window_count": max(0, int(len(selected)) - horizon + 1),
     }
     if "camera_age_s" in arrays:
-        quality["camera_age_s"] = _finite_stats(arrays["camera_age_s"][start:end])
-        quality["camera_frame_gap_count"] = int(np.count_nonzero(arrays["camera_frame_gap"][start:end] > 1))
-        quality["camera_duplicate_count"] = int(np.count_nonzero(arrays["camera_duplicate"][start:end]))
+        summary["camera_age_s"] = _finite_stats(arrays["camera_age_s"][selected])
     if "pointcloud_valid_depth_ratio" in arrays:
-        quality["pointcloud_valid_depth_ratio"] = _finite_stats(arrays["pointcloud_valid_depth_ratio"][start:end])
-    return quality
+        summary["pointcloud_valid_depth_ratio"] = _finite_stats(
+            arrays["pointcloud_valid_depth_ratio"][selected]
+        )
+    return summary
+
+
+def _bridge_findings(
+    arrays: Mapping[str, np.ndarray],
+    selected: np.ndarray,
+    reason_masks: Mapping[str, np.ndarray],
+    temporal_excluded: np.ndarray,
+    config: ProcessingConfig,
+    *,
+    grid_dt_s: float,
+) -> tuple[dict[str, Any], ...]:
+    """Audit every adjacency that differs from the original one-step grid.
+
+    Findings never create output segments.  ``BridgePolicy`` decides whether
+    the complete compacted episode is accepted or rejected.
+    """
+
+    findings: list[dict[str, Any]] = []
+    if len(selected) < 2:
+        return ()
+    for left, right in zip(selected[:-1], selected[1:], strict=True):
+        timestamp_delta_s = float(
+            arrays["timestamp"][right] - arrays["timestamp"][left]
+        )
+        sample_delta = int(arrays["source_index"][right] - arrays["source_index"][left])
+        row_delta = int(right - left)
+        has_boundary = (
+            row_delta != 1
+            or sample_delta != 1
+            or abs(timestamp_delta_s - grid_dt_s)
+            > max(1e-7, grid_dt_s * config.grid_dt_relative_tolerance)
+        )
+        if not has_boundary:
+            continue
+        arm_delta = float(
+            np.max(np.abs(arrays["action_arm"][right] - arrays["action_arm"][left]))
+        )
+        hand_delta = float(
+            np.max(np.abs(arrays["action_hand"][right] - arrays["action_hand"][left]))
+        )
+        removed_slice = slice(int(left + 1), int(right))
+        removed_reasons = [
+            name
+            for name, mask in reason_masks.items()
+            if right > left + 1 and np.any(mask[removed_slice])
+        ]
+        if right > left + 1 and np.any(temporal_excluded[removed_slice]):
+            removed_reasons.append("temporal_high_confidence")
+        risky = bool(
+            sample_delta != row_delta
+            or abs(timestamp_delta_s - row_delta * grid_dt_s)
+            > max(1e-7, grid_dt_s * config.grid_dt_relative_tolerance)
+            or arm_delta > config.temporal_quality.abrupt_arm_step_rad
+            or hand_delta > config.temporal_quality.abrupt_hand_step_rad
+        )
+        findings.append(
+            {
+                "source_row_before": int(left),
+                "source_row_after": int(right),
+                "removed_frame_count": max(0, row_delta - 1),
+                "source_sample_delta": sample_delta,
+                "source_timestamp_delta_s": timestamp_delta_s,
+                "max_arm_action_delta_rad": arm_delta,
+                "max_hand_action_delta_rad": hand_delta,
+                "removed_reasons": sorted(set(removed_reasons)),
+                "risky": risky,
+            }
+        )
+    return tuple(findings)
+
+
+def _reason_bits(
+    reason_masks: Mapping[str, np.ndarray], temporal_excluded: np.ndarray
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Encode all source-row deletion reasons; kept rows remain exactly zero."""
+
+    names = tuple(reason_masks) + ("temporal_high_confidence",)
+    if len(names) > 64:
+        raise ValueError("drop-reason contract exceeds uint64 capacity")
+    length = len(temporal_excluded)
+    bits = np.zeros(length, dtype=np.uint64)
+    for bit, name in enumerate(names[:-1]):
+        bits[np.asarray(reason_masks[name], dtype=bool)] |= np.uint64(1) << np.uint64(
+            bit
+        )
+    bits[np.asarray(temporal_excluded, dtype=bool)] |= np.uint64(1) << np.uint64(
+        len(names) - 1
+    )
+    return bits, names
 
 
 def analyze_episode(
     reader: EpisodeReader,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation | None = None,
+    *,
+    depth_valid_mask: np.ndarray | None = None,
+    pointcloud_valid_mask: np.ndarray | None = None,
+    source_already_validated: bool = False,
 ) -> EpisodeDecision:
-    """Return a deterministic cleaning decision without writing output."""
+    """Return a deterministic compact-row decision without writing output."""
 
-    reader.require_valid(purpose="offline processing")
+    if not source_already_validated:
+        reader.require_valid(purpose="offline processing")
     annotation = annotation or EpisodeAnnotation()
-    meta = reader.h5f["meta"]
-    frame_count = int(meta.attrs["num_frames"])
+    frame_count = int(reader.h5f["meta"].attrs["num_frames"])
     if not annotation.include:
-        return EpisodeDecision(
-            source_path=reader.h5_path,
-            source_frames=frame_count,
-            profile=config.profile,
-            segments=(),
+        return _empty_decision(
+            reader.h5_path,
+            frame_count,
+            config,
+            "excluded by annotation",
             hard_reason_counts={"annotation_excluded_episode": frame_count},
-            boundary_counts={},
-            dropped_short_segment_frames=0,
-            selected_frames=0,
-            quality={},
-            rejected_reason="excluded by annotation",
         )
     if "action_arm_joint_sent" not in reader.h5f:
-        return EpisodeDecision(
-            source_path=reader.h5_path,
-            source_frames=frame_count,
-            profile=config.profile,
-            segments=(),
+        return _empty_decision(
+            reader.h5_path,
+            frame_count,
+            config,
+            "action_arm_joint_sent is required; unsafe fallback is disabled",
             hard_reason_counts={"missing_arm_sent_stream": frame_count},
-            boundary_counts={},
-            dropped_short_segment_frames=0,
-            selected_frames=0,
-            quality={},
-            rejected_reason="action_arm_joint_sent is required; unsafe fallback is disabled",
         )
     for label, ranges in (
         ("include_ranges", annotation.include_ranges),
@@ -139,7 +276,9 @@ def analyze_episode(
         "hand_connected": _as_bool(reader, "hand_connected"),
         "hand_error": _as_bool(reader, "hand_error_state"),
         "hand_stale": _as_bool(reader, "hand_qpos_stale"),
-        "history_valid": np.asarray(reader.h5f["observation_history_valid_mask"][:], dtype=bool)[:, :, 0],
+        "history_valid": np.asarray(
+            reader.h5f["observation_history_valid_mask"][:], dtype=bool
+        )[:, :, 0],
         "action_created": _as_i64(reader, "action_created_monotonic_ns"),
         "action_target": _as_i64(reader, "action_target_monotonic_ns"),
         "action_valid_until": _as_i64(reader, "action_valid_until_monotonic_ns"),
@@ -147,16 +286,19 @@ def analyze_episode(
         "hand_qpos": _as_f64(reader, "hand_qpos"),
         "action_arm": _as_f64(reader, "action_arm_joint_sent"),
         "action_hand": _as_f64(reader, "action_hand_joint"),
+        "action_arm_ee": _as_f64(reader, "action_arm_ee"),
+        "contact_force": _as_f64(reader, "hand_contact"),
+        "fingertip_points": _as_f64(reader, "hand_fingertip"),
         "tracking_error": _as_f64(reader, "tracking_error"),
+        "arm_last_cmd_seq": _as_i64(reader, "arm_last_cmd_seq"),
     }
-
     is_source = arrays["fill_reason"] == int(FillReason.SOURCE)
     timing_valid = (
         (arrays["action_created"] > 0)
         & (arrays["action_created"] <= arrays["action_target"])
         & (arrays["action_target"] <= arrays["action_valid_until"])
     )
-    numeric = np.concatenate(
+    joint_numeric = np.concatenate(
         (
             arrays["arm_qpos"],
             arrays["hand_qpos"],
@@ -165,52 +307,61 @@ def analyze_episode(
         ),
         axis=1,
     )
-    finite = np.all(np.isfinite(numeric), axis=1)
-
-    tolerance = config.joint_limit_tolerance_rad
-    arm_lower = np.asarray(arm.joint_limit_lower, dtype=np.float64)
-    arm_upper = np.asarray(arm.joint_limit_upper, dtype=np.float64)
-    hand_state_lower = np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64)
-    hand_state_upper = np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64)
-    hand_action_lower = np.asarray(hand.qpos_min_rad, dtype=np.float64)
-    hand_action_upper = np.asarray(hand.qpos_max_rad, dtype=np.float64)
-
-    def _inside(
-        values: np.ndarray,
-        lower: np.ndarray,
-        upper: np.ndarray,
-        *,
-        value_tolerance: float = tolerance,
-    ) -> np.ndarray:
-        return np.all(
-            (values >= lower - value_tolerance) & (values <= upper + value_tolerance),
-            axis=1,
-        )
-
+    real_modalities_finite = (
+        np.all(np.isfinite(arrays["action_arm_ee"]), axis=1)
+        & np.all(np.isfinite(arrays["contact_force"]), axis=(1, 2))
+        & np.all(np.isfinite(arrays["fingertip_points"]), axis=(1, 2))
+    )
+    arm_lower = np.asarray(config.arm_joint_limit_lower_rad, dtype=np.float64)
+    arm_upper = np.asarray(config.arm_joint_limit_upper_rad, dtype=np.float64)
+    hand_state_lower = np.asarray(config.hand_state_limit_lower_rad, dtype=np.float64)
+    hand_state_upper = np.asarray(config.hand_state_limit_upper_rad, dtype=np.float64)
+    hand_action_lower = np.asarray(config.hand_action_limit_lower_rad, dtype=np.float64)
+    hand_action_upper = np.asarray(config.hand_action_limit_upper_rad, dtype=np.float64)
     limits_valid = (
-        _inside(arrays["arm_qpos"], arm_lower, arm_upper)
-        & _inside(arrays["action_arm"], arm_lower, arm_upper)
+        _inside(
+            arrays["arm_qpos"], arm_lower, arm_upper, config.joint_limit_tolerance_rad
+        )
+        & _inside(
+            arrays["action_arm"], arm_lower, arm_upper, config.joint_limit_tolerance_rad
+        )
         & _inside(
             arrays["hand_qpos"],
             hand_state_lower,
             hand_state_upper,
-            value_tolerance=config.hand_state_limit_tolerance_rad,
+            config.hand_state_limit_tolerance_rad,
         )
-        & _inside(arrays["action_hand"], hand_action_lower, hand_action_upper)
+        & _inside(
+            arrays["action_hand"],
+            hand_action_lower,
+            hand_action_upper,
+            config.joint_limit_tolerance_rad,
+        )
     )
-
+    tactile_valid = (
+        _as_bool(reader, "tactile_fresh")
+        & _as_bool(reader, "tactile_calibrated")
+        & (_as_i64(reader, "tactile_source_monotonic_ns") > 0)
+    )
     reason_masks: dict[str, np.ndarray] = {
         "not_source_sample": ~(arrays["sample_valid"] & is_source),
         "action_not_queued": ~arrays["queued"],
         "held": arrays["held"],
         "safety_reject": arrays["safety_reject"],
         "frame_status_not_ok": arrays["frame_status"] != 0,
-        "arm_source_invalid": ~(arrays["arm_connected"] & arrays["history_valid"][:, 0]),
-        "hand_source_invalid": ~(
-            arrays["hand_connected"] & ~arrays["hand_error"] & ~arrays["hand_stale"] & arrays["history_valid"][:, 1]
+        "arm_source_invalid": ~(
+            arrays["arm_connected"] & arrays["history_valid"][:, 0]
         ),
+        "hand_source_invalid": ~(
+            arrays["hand_connected"]
+            & ~arrays["hand_error"]
+            & ~arrays["hand_stale"]
+            & arrays["history_valid"][:, 1]
+        ),
+        "tactile_invalid": ~tactile_valid,
         "action_timing_invalid": ~timing_valid,
-        "nonfinite_joint_or_action": ~finite,
+        "nonfinite_joint_or_action": ~np.all(np.isfinite(joint_numeric), axis=1),
+        "nonfinite_real_modality": ~real_modalities_finite,
         "joint_limit_violation": ~limits_valid,
     }
 
@@ -220,6 +371,7 @@ def analyze_episode(
                 "camera_age_s": _as_f64(reader, "camera_age_s"),
                 "camera_frame_gap": _as_i64(reader, "camera_frame_gap"),
                 "camera_duplicate": _as_bool(reader, "camera_duplicate"),
+                "camera_health": _as_i64(reader, "camera_health"),
             }
         )
         camera_age_valid = (
@@ -231,17 +383,33 @@ def analyze_episode(
             _as_bool(reader, "flag_camera_fresh")
             & arrays["history_valid"][:, 3]
             & ~_as_bool(reader, "camera_clock_reset")
+            & (arrays["camera_health"] == int(CameraHealth.OK))
             & camera_age_valid
         )
-
+    if config.profile.needs_rgb:
+        if depth_valid_mask is None:
+            raise ValueError("RGB profile requires a derived depth_valid_mask")
+        depth_valid = np.asarray(depth_valid_mask, dtype=bool)
+        if depth_valid.shape != (frame_count,):
+            raise ValueError(
+                f"depth_valid_mask must have shape ({frame_count},), got {depth_valid.shape}"
+            )
+        reason_masks["depth_invalid"] = ~depth_valid
     if config.profile.needs_pointcloud:
-        # The point cloud is now derived from the recorded depth at write time
-        # (see pipeline), so there is no stored pointcloud to validate here.
-        # A pointcloud frame is valid iff its depth/camera source is valid,
-        # which the ``camera_invalid`` reason already captures — the two were
-        # frame-identical in practice.  We only retain the depth-derived
-        # quality ratio as a per-segment diagnostic.
-        arrays["pointcloud_valid_depth_ratio"] = _as_f64(reader, "pointcloud_valid_depth_ratio")
+        arrays["pointcloud_valid_depth_ratio"] = _as_f64(
+            reader, "pointcloud_valid_depth_ratio"
+        )
+        if pointcloud_valid_mask is None:
+            raise ValueError("pointcloud profile requires a derived validity mask")
+        derived_valid = np.asarray(pointcloud_valid_mask, dtype=bool)
+        if derived_valid.shape != (frame_count,):
+            raise ValueError(
+                f"pointcloud_valid_mask must have shape ({frame_count},), got {derived_valid.shape}"
+            )
+        ratio = arrays["pointcloud_valid_depth_ratio"]
+        reason_masks["pointcloud_invalid"] = ~(
+            derived_valid & np.isfinite(ratio) & (ratio > 0.0) & (ratio <= 1.0)
+        )
 
     include_mask = _range_mask(
         frame_count,
@@ -249,94 +417,93 @@ def analyze_episode(
         default=not bool(annotation.include_ranges),
     )
     exclude_mask = _range_mask(frame_count, annotation.exclude_ranges, default=True)
-    annotation_selected = include_mask & exclude_mask
-    reason_masks["annotation_excluded_row"] = ~annotation_selected
-
+    reason_masks["annotation_excluded_row"] = ~(include_mask & exclude_mask)
     hard_invalid = np.zeros(frame_count, dtype=bool)
     for mask in reason_masks.values():
         hard_invalid |= mask
-    valid = ~hard_invalid
+    base_valid = ~hard_invalid
 
     timing = reader.timing
-    dt = arrays["timestamp"][1:] - arrays["timestamp"][:-1]
-    timestamp_gap = np.abs(dt - timing.grid_dt_s) > max(1e-7, timing.grid_dt_s * config.grid_dt_relative_tolerance)
+    dt = np.diff(arrays["timestamp"])
+    timestamp_gap = np.abs(dt - timing.grid_dt_s) > max(
+        1e-7, timing.grid_dt_s * config.grid_dt_relative_tolerance
+    )
     source_gap = np.diff(arrays["source_index"]) != 1
     break_before = np.zeros(frame_count, dtype=bool)
     break_before[1:] = timestamp_gap | source_gap
-
-    candidate_ranges: list[tuple[int, int]] = []
-    start: int | None = None
-    for index in range(frame_count):
-        if valid[index] and (start is None or not break_before[index]):
-            if start is None:
-                start = index
-            continue
-        if start is not None:
-            candidate_ranges.append((start, index))
-            start = None
-        if valid[index]:
-            start = index
-    if start is not None:
-        candidate_ranges.append((start, frame_count))
-
-    segments: list[SegmentDecision] = []
-    dropped_short = 0
-    for range_start, range_end in candidate_ranges:
-        length = range_end - range_start
-        full_windows = max(0, length - config.horizon + 1)
-        if full_windows < config.min_full_windows:
-            dropped_short += length
-            continue
-        segments.append(
-            SegmentDecision(
-                start=range_start,
-                end=range_end,
-                full_window_count=full_windows,
-                quality=_segment_quality(arrays, range_start, range_end, grid_dt_s=timing.grid_dt_s),
-            )
-        )
-
-    warnings: list[str] = []
-    ik_ok = _as_bool(reader, "flag_ik_ok")
-    retarget_ok = _as_bool(reader, "flag_retarget_ok")
-    frame_ok = arrays["frame_status"] == 0
-    if np.count_nonzero(frame_ok & ~ik_ok) > frame_count // 2:
-        warnings.append("flag_ik_ok conflicts with mostly-OK frame_status; inspect recorder provenance")
-    if np.count_nonzero(frame_ok & ~retarget_ok) > frame_count // 2:
-        warnings.append(
-            "flag_retarget_ok conflicts with mostly-OK frame_status; inspect recorder provenance"
-        )
-
-    selected_frames = sum(segment.length for segment in segments)
-    selected_indices = (
-        np.concatenate([np.arange(segment.start, segment.end) for segment in segments])
-        if segments
-        else np.empty(0, dtype=np.int64)
+    temporal_assessment = assess_temporal_quality(
+        arrays,
+        base_valid,
+        break_before,
+        config.temporal_quality,
+        tracking_error_warn_rad=config.tracking_error_warn_rad,
     )
-    overall_quality: dict[str, Any] = {
-        "tracking_error_rad": _finite_stats(arrays["tracking_error"][selected_indices]),
-        "high_tracking_error_count": int(
-            np.count_nonzero(arrays["tracking_error"][selected_indices] > arm.tracking_error_warn_rad)
-        ),
-        "full_window_count": int(sum(segment.full_window_count for segment in segments)),
-    }
-    if "camera_age_s" in arrays:
-        overall_quality["camera_age_s"] = _finite_stats(arrays["camera_age_s"][selected_indices])
+    keep_mask = base_valid & ~temporal_assessment.excluded_mask
+    selected = np.flatnonzero(keep_mask).astype(np.int64)
+    bits, reason_names = _reason_bits(reason_masks, temporal_assessment.excluded_mask)
+    bridges = _bridge_findings(
+        arrays,
+        selected,
+        reason_masks,
+        temporal_assessment.excluded_mask,
+        config,
+        grid_dt_s=timing.grid_dt_s,
+    )
+    risky_bridges = [item for item in bridges if bool(item["risky"])]
+    warnings: list[str] = []
+    if risky_bridges:
+        warnings.append(
+            f"row compaction creates {len(risky_bridges)} risky transition(s)"
+        )
+    frame_ok = arrays["frame_status"] == 0
+    if np.count_nonzero(frame_ok & ~_as_bool(reader, "flag_ik_ok")) > frame_count // 2:
+        warnings.append("flag_ik_ok conflicts with mostly-OK frame_status")
+    if (
+        np.count_nonzero(frame_ok & ~_as_bool(reader, "flag_retarget_ok"))
+        > frame_count // 2
+    ):
+        warnings.append("flag_retarget_ok conflicts with mostly-OK frame_status")
 
-    rejected_reason = None if segments else "no contiguous segment satisfies the configured training window"
+    rejected_reason: str | None = None
+    if len(selected) < config.min_episode_frames:
+        rejected_reason = (
+            f"compact episode has {len(selected)} frames; requires "
+            f"{config.min_episode_frames}"
+        )
+    elif risky_bridges and config.bridge_policy is BridgePolicy.REJECT:
+        rejected_reason = (
+            f"row compaction creates {len(risky_bridges)} risky transition(s); "
+            "use bridge_policy=audit only after manual review"
+        )
+
+    quality = _quality_summary(
+        arrays,
+        selected,
+        grid_dt_s=timing.grid_dt_s,
+        tracking_error_warn_rad=config.tracking_error_warn_rad,
+        horizon=config.horizon,
+    )
+    quality["bridge_count"] = len(bridges)
+    quality["risky_bridge_count"] = len(risky_bridges)
     return EpisodeDecision(
         source_path=reader.h5_path,
         source_frames=frame_count,
         profile=config.profile,
-        segments=tuple(segments),
-        hard_reason_counts={name: int(np.count_nonzero(mask)) for name, mask in reason_masks.items()},
+        selected_indices=selected,
+        keep_mask=keep_mask,
+        drop_reason_bits=bits,
+        drop_reason_names=reason_names,
+        hard_reason_counts={
+            name: int(np.count_nonzero(mask)) for name, mask in reason_masks.items()
+        },
         boundary_counts={
             "timestamp_discontinuity": int(np.count_nonzero(timestamp_gap)),
             "source_index_discontinuity": int(np.count_nonzero(source_gap)),
         },
-        dropped_short_segment_frames=dropped_short,
-        selected_frames=selected_frames,
-        quality=overall_quality,
+        selected_frames=int(len(selected)),
+        quality=quality,
+        bridge_findings=bridges,
+        temporal_quality=temporal_assessment.to_dict(config.temporal_quality.policy),
         warnings=tuple(warnings),
         rejected_reason=rejected_reason,
     )

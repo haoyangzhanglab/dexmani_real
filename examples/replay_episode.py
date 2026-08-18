@@ -20,10 +20,10 @@ recorded with non-default ``--acc``/``--speed``, pass the same values here so th
 resolved-config provenance matches.
 
 Usage:
-    python examples/replay_episode.py episodes/<episode_dir>
-    python examples/replay_episode.py episodes/<episode_dir> --output results/my_replay/
-    python examples/replay_episode.py episodes/<episode_dir> --acc 900 --speed 120
-    python examples/replay_episode.py episodes/<episode_dir> --dry-run
+    python examples/replay_episode.py episodes/<task_name>/<episode_dir>
+    python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output results/my_replay/
+    python examples/replay_episode.py episodes/<task_name>/<episode_dir> --acc 900 --speed 120
+    python examples/replay_episode.py episodes/<task_name>/<episode_dir> --dry-run
 
 Live replay controls:
     Q     clean exit (save partial results)
@@ -104,6 +104,9 @@ _MODEL_PROVENANCE_KEYS = (
 
 _STATUS_INTERVAL_FRAMES = 50
 _WAIT_POLL_INTERVAL_S = 0.01
+# The arm worker's ``enter_mode6`` postcondition poll blocks up to 1.0s on the
+# ARMED/RUNNING edge; allow headroom before giving up waiting for Mode 6.
+_ARM_STREAMING_WAIT_TIMEOUT_S = 2.0
 
 _TRACKING_LAG_WINDOW_S = 0.4
 _MIN_TRACKING_LAG_FRAMES = 6
@@ -1002,6 +1005,39 @@ class TrajectoryReplayer:
                 return False
         return False
 
+    def _wait_arm_streaming(self, keyboard: KeyboardHandler) -> bool:
+        """Block until the arm worker is accepting servo commands before the first publish.
+
+        The arm worker issues a non-blocking Mode-6 entry on the ARMED/RUNNING
+        edge and confirms it over subsequent ticks; the ring reports
+        ``accepts_motion_commands == 1`` only once Mode 6 is movable.  The replay
+        publishes into a bounded arm queue (maxsize=2), so firing the first
+        frames during that transition can fill the queue and fault as
+        ``ARM_QUEUE_FULL``.  Waiting for ``mode == 6`` AND
+        ``accepts_motion_commands`` makes the consumer ready before the producer
+        starts (``mode`` alone is not enough across a re-arm, where the cached
+        mode is still 6 during the entry).
+
+        Returns False (with a fault/quit already latched) if the run is stopped
+        or the arm never accepts servo commands within the bounded window.
+        """
+        assert self.shared is not None
+        deadline = time.perf_counter() + _ARM_STREAMING_WAIT_TIMEOUT_S
+        while time.perf_counter() < deadline:
+            if not self._poll_control(keyboard, 0.0):
+                return False
+            arm_state = read_arm_state_dict(self.shared)
+            if (
+                arm_state is not None
+                and int(arm_state.get("mode", 0)) == 6
+                and bool(arm_state.get("accepts_motion_commands", False))
+                and bool(arm_state.get("state_valid", False))
+            ):
+                return True
+            time.sleep(_WAIT_POLL_INTERVAL_S)
+        self._fault("arm worker did not reach Mode 6 before the replay start deadline")
+        return False
+
     def run(self) -> ReplayOutcome:
         """Execute the replay loop and report its explicit terminal outcome."""
         frame_count = self._frame_count
@@ -1061,6 +1097,8 @@ class TrajectoryReplayer:
         try:
             require_transition(self.shared, SafetyState.RUNNING)
             self._live_motion_started = True
+            if not self._wait_arm_streaming(keyboard):
+                return self._outcome()
             while frame_idx < frame_count and self._wait_until_deadline(keyboard, next_deadline_s):
                 arm_cmd = self.traj.action_arm_joint[frame_idx].copy()
                 hand_cmd = None
@@ -1710,16 +1748,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog="""
 Examples:
   # Live replay: rerun the full recorded trajectory and write results
-  python examples/replay_episode.py episodes/<episode_dir>
+  python examples/replay_episode.py episodes/<task_name>/<episode_dir>
 
   # Reproduce a recording made with non-default acc/speed (must match the episode)
-  python examples/replay_episode.py episodes/<episode_dir> --acc 900 --speed 120
+  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --acc 900 --speed 120
 
   # Custom capture/metrics directory
-  python examples/replay_episode.py episodes/<episode_dir> --output results/my_replay/
+  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output results/my_replay/
 
   # Offline validation only (no hardware, no workers)
-  python examples/replay_episode.py episodes/<episode_dir> --dry-run
+  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --dry-run
 
 Live replay controls:
   Q     clean exit (save partial results)
@@ -1731,7 +1769,7 @@ Live replay controls:
         "episode",
         nargs="?",
         type=str,
-        help="Published schema-v17 episode directory.",
+        help="Published schema-v17 directory: episodes/<task_name>/episode_*.",
     )
     parser.add_argument(
         "--dry-run",

@@ -9,14 +9,27 @@ Sim 数据请读独立的 [`sim_hdf5_zarr.md`](sim_hdf5_zarr.md)，Real→Sim �
 
 ## 1. 发布单元
 
-一个已发布 episode 是目录而不是单个 HDF5：
+采集根目录按任务分组；一个已发布 episode 是目录而不是单个 HDF5：
 
 ```text
-episode_.../
-├── data.h5     # 控制网格、状态、命令、质量和 metadata
-├── depth.h5    # 与控制网格对齐的 depth 侧车
-└── rgb.mp4     # 与控制网格对齐的 RGB 侧车
+episodes/
+└── <task_name>/
+    └── episode_.../
+        ├── data.h5     # 控制网格、状态、命令、质量和 metadata
+        ├── depth.h5    # 与控制网格对齐的 depth 侧车
+        └── rgb.mp4     # 与控制网格对齐的 RGB 侧车
 ```
+
+`examples/collect_teleop.py` 中 `TASK_NAME="test"` 是默认值，CLI
+`--task-name` 可覆盖。目录名与 `/meta.task_label` 使用同一个已校验值；task name
+不能包含路径分隔符。旧版本产生的 `episodes/episode_*` 平铺数据保持只读，不会被
+自动移动或改写。
+
+正式离线产物与 `episodes/` 同级：清洗结果写入
+`episodes_processed/<task_name>/`，Policy Zarr 写入 `dataset/<task_name>.zarr`。
+raw episode 始终只读；清洗只在 processed HDF5 中保存删除行、压紧映射和质量决定，
+不会回写或重命名 raw 目录。任务失败/不可用轨迹由操作者删除，不从 recorder 的
+发布成功状态推断。
 
 writer 先写临时目录，完成帧数、schema、相机侧车和 metadata 校验后再原子发布。失败、相机写盘错误、队列溢出、codec 错误或磁盘错误不能发布半成品。
 
@@ -117,7 +130,7 @@ rows = (
 )
 ```
 
-具体任务应按使用的模态补充 arm/hand feedback、camera freshness、point-cloud quality 和 continuity 条件。不要删除坏行后把两侧时间序列拼成一条新轨迹；离线清洗由 [`data_processing/`](../../dexmani_real/data_processing) 负责切段并记录 source range。
+具体任务应按使用的模态补充 arm/hand feedback、tactile、camera freshness、depth 和 point-cloud quality。离线清洗由 [`data_processing/`](../../dexmani_real/data_processing) 统一生成 keep mask：删除坏行后压紧为一个 episode，并在 processed HDF5 provenance 中保留 source row/time/drop reason。跨删除区间的异常 action 跳变默认拒绝整条，不切成多个训练 episode。
 
 ## 8. Metadata 中容易误读的字段
 
@@ -127,13 +140,17 @@ rows = (
 - `/meta.ik_hold_frame_count`、`camera_invalid_frame_count`、
   `observation_invalid_frame_count`、`sample_invalid_frame_count`、
   `safety_reject_frame_count` 汇总逐帧质量标志；
-  `command_quiescence_count` 统计 timestamp 中明确保留的静默分段。
+  `command_quiescence_count` 统计采样网格相邻 timestamp 中的 command-quiescence gap，
+  与 processed output 的 episode 拆分无关。
 - `/meta.hand_read_error_count` 和 `hand_overcurrent_count` 是本 episode 录制窗口内
   XHand worker 的累计事件差值；瞬态事件即使未被 16 Hz 帧命中也不会从摘要消失。
   是否升级为运行时 sticky fault 由 resolved config 中的 XHand 过流次数/时间窗阈值决定。
 - `resolved_config_sha256` 不能还原完整配置；需要外部配置文件。
 - 触觉和 effort 的未知单位必须保留为 unknown，不能为了训练方便补写 SI 单位。
 - `flag_sample_valid=True` 不等于 `flag_observation_valid`、IK、retarget、camera 或 tactile 都有效。
+
+任务是否完成不由 recorder 或清洗代码判断。采集后由操作者检查并删除失败/不可用的
+完整 `episode_*` 目录；必须在清洗和 Zarr 导出前完成这一步。
 
 ## 9. 修改格式时
 

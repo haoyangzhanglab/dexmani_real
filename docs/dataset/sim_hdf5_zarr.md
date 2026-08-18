@@ -4,7 +4,10 @@
 Sim producer；文件没有可靠的 schema version，读取器必须检查实际 keys、shape、
 dtype 和 episode boundary。
 
-Real v17 不是 Sim 数据的别名。需要把 Real 字段映射到 Sim/Policy label 时，先读 [`real_to_sim_mapping.md`](real_to_sim_mapping.md)。
+Real v17 不是 Sim 数据的别名。当前约束是 Real 数据只用于真机训练/评测，Sim 数据只
+用于仿真训练/评测；不同 domain 的 Zarr 不拼接、不共同拟合 normalizer。需要比较字段
+名字或 Policy 读取接口时，先读 [`real_to_sim_mapping.md`](real_to_sim_mapping.md)，不能
+把该对照表当作跨 domain 转换许可。
 
 ## 1. 两种容器
 
@@ -28,7 +31,9 @@ data/<key>             # 拼接后的数组
 meta/episode_ends      # exclusive cumulative end indices
 ```
 
-Zarr 当前不保留 HDF5 root attributes、文件名、seed 或 episode provenance；这些信息必须由外部 manifest 补充。
+此处描述的是 Sim converter 的常见行为：Zarr 可能不保留 HDF5 root attributes、文件名、
+seed 或 episode provenance，需要按 Sim producer 的合同管理。Real Policy Zarr 的独立
+最小合同见 [`processed_hdf5.md`](processed_hdf5.md)，两者不能混用。
 
 ## 2. HDF5 数据语义
 

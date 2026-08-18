@@ -2,8 +2,9 @@ bin
 logs
 wandb
 outputs
-data_local
 episodes/
+episodes_processed/
+dataset/
 .vscode
 _wandb
 

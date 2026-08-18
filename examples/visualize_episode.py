@@ -2,9 +2,9 @@
 """Rerun-based visualizer for schema-v17 DexMani episodes.
 
 Usage:
-  python examples/visualize_episode.py episode_dir/
-  python examples/visualize_episode.py episode_dir/ --info
-  python examples/visualize_episode.py episode_dir/ --max-frames 500
+  python examples/visualize_episode.py episodes/<task_name>/<episode_dir>
+  python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --info
+  python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --max-frames 500
 """
 
 from __future__ import annotations
@@ -610,7 +610,11 @@ class EpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Visualize DexMani HDF5 teleop episodes with Rerun 3D.")
-    parser.add_argument("episode", type=str, help="Path to a schema-v17 episode directory.")
+    parser.add_argument(
+        "episode",
+        type=str,
+        help="Path to episodes/<task_name>/episode_* (schema v17).",
+    )
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
     parser.add_argument(
         "--depth-scale", type=float, default=None, help="Raw depth units in meters (overrides /meta depth_scale)."

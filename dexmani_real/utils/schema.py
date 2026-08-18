@@ -120,6 +120,13 @@ ARM_STATE_DTYPE = np.dtype(
         ("source_monotonic_ns", "<u8"),
         ("publish_monotonic_ns", "<u8"),
         ("state_valid", "<u1"),
+        # Truthful "the arm worker is currently accepting servo commands" signal.
+        # 0 during DISARMED/FAULT, homing, and the whole non-blocking Mode-6
+        # entry window; 1 only in the frame that first confirms the movable
+        # Mode-6 postcondition.  Consumers must gate on this *and* ``mode == 6``:
+        # ``mode`` alone stays 6 across a re-arm because stop_controller never
+        # resets the cached mode, so it is necessary but not sufficient.
+        ("accepts_motion_commands", "<u1"),
         ("timestamp", "<f8"),
     ]
 )
@@ -135,9 +142,10 @@ HAND_STATE_DTYPE = np.dtype(
         ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
         ("error_state", "<u1"),
         ("connected", "<u1"),
-        # Reserved compatibility bit: execution non-convergence is not a
-        # feedback-freshness fault. Freshness comes from source timestamp and
-        # read_healthy/state_valid.
+        # Set to 1 when the most recent single-frame read failed and the
+        # published qpos is the last-known (held) value, not a fresh read.
+        # Feedback *age* (staleness) is tracked separately via the source
+        # timestamp and read_healthy/state_valid.
         ("qpos_stale", "<u1"),
         # action_id of the last command for which XHand.send_action() returned
         # success; this is not the hand command ring's internal sequence.
@@ -155,8 +163,6 @@ HAND_STATE_DTYPE = np.dtype(
         # consumer can still observe and classify the event.
         ("read_error_count", "<u8"),
         ("overcurrent_error_count", "<u8"),
-        ("last_read_error_code", "<i4"),
-        ("last_read_error_monotonic_ns", "<u8"),
         ("timestamp", "<f8"),
     ]
 )

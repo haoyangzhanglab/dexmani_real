@@ -11,7 +11,7 @@ package — that keeps the package focused on reusable library code and avoids
 accumulating entry-point logic.
 
 Usage:
-    python examples/collect_teleop.py [--task T] [--operator O] [--acc A] [--speed S]
+    python examples/collect_teleop.py [--task-name T] [--operator O] [--acc A] [--speed S]
                      [--no-hand] [--no-record] [--config PATH] [--print-config]
 Controls:
     B=teleop(+record when enabled)  C=pause  S=stop/save  D=discard  H=home  Q=quit  ESC=estop
@@ -66,8 +66,37 @@ from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_
 from dexmani_real.teleop.loop import teleop_loop
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import RECORD_TASK_LABEL_BYTES
 
 logger = get_logger(__name__)
+
+# Operator-editable default. Published recordings live below
+# ``episodes/<task_name>/episode_*`` and carry the same value in metadata.
+# The name groups data; it is not a success label. Operators delete failed or
+# unusable episode directories before offline processing.
+TASK_NAME = "test"
+
+
+def _validate_task_name(value: str) -> str:
+    """Validate one task name for both a directory component and fixed metadata."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("task_name must be a non-empty string without surrounding whitespace")
+    if value in {".", ".."} or value.startswith("."):
+        raise ValueError("task_name must not be a hidden or relative directory name")
+    if "/" in value or "\\" in value or any(ord(char) < 32 for char in value):
+        raise ValueError("task_name must be one safe directory component")
+    if len(value.encode("utf-8")) > RECORD_TASK_LABEL_BYTES:
+        raise ValueError(
+            f"task_name exceeds the {RECORD_TASK_LABEL_BYTES}-byte recording metadata limit"
+        )
+    return value
+
+
+def _task_name_arg(value: str) -> str:
+    try:
+        return _validate_task_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _resource_provenance(repo_root: Path) -> tuple[tuple[str, str], ...]:
@@ -229,7 +258,7 @@ def _preflight_health_issues(
 def _print_session_header(
     runtime: ResolvedRuntimeConfig,
     *,
-    task_label: str,
+    task_name: str,
     operator: str,
     hand_enabled: bool,
     recording_enabled: bool,
@@ -240,8 +269,7 @@ def _print_session_header(
     if hand_enabled:
         process_labels.append("hand")
     session_meta = []
-    if task_label:
-        session_meta.append(f"task={task_label}")
+    session_meta.append(f"task={task_name}")
     if operator:
         session_meta.append(f"operator={operator}")
     session_meta.extend(
@@ -265,7 +293,7 @@ def _build_processes(
     runtime: ResolvedRuntimeConfig,
     *,
     repo_root: Path,
-    task_label: str,
+    task_name: str,
     operator: str,
     provenance: tuple[tuple[str, str], ...],
     hand_enabled: bool,
@@ -273,7 +301,7 @@ def _build_processes(
 ) -> list[WorkerSpec]:
     policy_config = TeleopConfig.from_runtime(
         runtime,
-        task_label=task_label,
+        task_label=task_name,
         operator=operator,
         hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
     )
@@ -288,8 +316,10 @@ def _build_processes(
     if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
         specs.append(WorkerSpec("camera", _camera_loop, (shared, camera_config), ready_name="camera"))
+        # Recorder still owns only episode serialization; the entry point
+        # selects the already-validated task parent directory.
         recorder_config = RecorderIOConfig(
-            data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir),
+            data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir / task_name),
             max_frames=int(round(policy_config.runtime.policy.max_record_duration_s * policy_config.runtime.policy.control_hz)),
             control_hz=policy_config.runtime.policy.control_hz,
             min_frames=int(round(policy_config.runtime.policy.min_record_duration_s * policy_config.runtime.policy.control_hz)),
@@ -330,7 +360,17 @@ def _recording_session_issue(shared: SharedStorage) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     """Spawn enabled child capabilities, supervise them, and clean up."""
     parser = argparse.ArgumentParser(description="VR Teleop xArm7 + XHand with recording")
-    parser.add_argument("--task", type=str, default="", help="Task label for recording metadata")
+    parser.add_argument(
+        "--task-name",
+        "--task",
+        dest="task_name",
+        type=_task_name_arg,
+        default=TASK_NAME,
+        help=(
+            "Task name used for recording metadata and episodes/<task_name>/; "
+            f"default: {TASK_NAME!r}. --task is a compatibility alias."
+        ),
+    )
     parser.add_argument("--operator", type=str, default="", help="Operator name for recording metadata")
     parser.add_argument(
         "--acc", type=_positive_float, default=None, help="Joint max acceleration (°/s²; defaults to YAML/defaults)"
@@ -374,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run_teleop_experiment(
             runtime,
-            task_label=args.task,
+            task_name=args.task_name,
             operator=args.operator,
             allow_no_hand=args.no_hand,
         )
@@ -386,13 +426,18 @@ def main(argv: list[str] | None = None) -> int:
 def run_teleop_experiment(
     runtime: ResolvedRuntimeConfig,
     *,
-    task_label: str = "",
+    task_name: str = TASK_NAME,
     operator: str = "",
     allow_no_hand: bool = False,
 ) -> int:
     """Run one resolved teleoperation experiment lifecycle."""
     hand_enabled = bool(runtime.policy.hand_enabled)
     recording_enabled = bool(runtime.policy.recording_enabled)
+    try:
+        task_name = _validate_task_name(task_name)
+    except ValueError as exc:
+        logger.error("invalid task_name: %s", exc)
+        return 1
     if not hand_enabled and not allow_no_hand:
         logger.error("disabled hand requires explicit allow_no_hand acknowledgement")
         return 1
@@ -412,7 +457,7 @@ def run_teleop_experiment(
 
     _print_session_header(
         runtime,
-        task_label=task_label,
+        task_name=task_name,
         operator=operator,
         hand_enabled=hand_enabled,
         recording_enabled=recording_enabled,
@@ -433,7 +478,7 @@ def run_teleop_experiment(
             shared,
             runtime,
             repo_root=repo_root,
-            task_label=task_label,
+            task_name=task_name,
             operator=operator,
             provenance=provenance,
             hand_enabled=hand_enabled,

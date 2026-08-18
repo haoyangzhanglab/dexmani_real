@@ -1,4 +1,4 @@
-"""Deterministic numerical transforms for the Sim-label HDF5 view."""
+"""Deterministic numerical transforms for the Real-native processed view."""
 
 from __future__ import annotations
 
@@ -12,14 +12,38 @@ def resize_rgb(frame: np.ndarray, *, height: int, width: int) -> np.ndarray:
 
     value = np.asarray(frame)
     if value.ndim != 3 or value.shape[2] != 3 or value.dtype != np.uint8:
-        raise ValueError(f"RGB frame must be uint8 [H,W,3], got {value.shape} {value.dtype}")
+        raise ValueError(
+            f"RGB frame must be uint8 [H,W,3], got {value.shape} {value.dtype}"
+        )
     if height <= 0 or width <= 0:
         raise ValueError("target RGB height and width must be positive")
     if value.shape[:2] == (height, width):
         return np.ascontiguousarray(value)
-    interpolation = cv2.INTER_AREA if height <= value.shape[0] and width <= value.shape[1] else cv2.INTER_LINEAR
+    interpolation = (
+        cv2.INTER_AREA
+        if height <= value.shape[0] and width <= value.shape[1]
+        else cv2.INTER_LINEAR
+    )
     resized = cv2.resize(value, (width, height), interpolation=interpolation)
     return np.ascontiguousarray(resized, dtype=np.uint8)
+
+
+def resize_depth(frame: np.ndarray, *, height: int, width: int) -> np.ndarray:
+    """Resize aligned RealSense Z16 depth without inventing intermediate values."""
+
+    import cv2
+
+    value = np.asarray(frame)
+    if value.ndim != 2 or value.dtype != np.uint16:
+        raise ValueError(
+            f"depth frame must be uint16 [H,W], got {value.shape} {value.dtype}"
+        )
+    if height <= 0 or width <= 0:
+        raise ValueError("target depth height and width must be positive")
+    if value.shape == (height, width):
+        return np.ascontiguousarray(value)
+    resized = cv2.resize(value, (width, height), interpolation=cv2.INTER_NEAREST)
+    return np.ascontiguousarray(resized, dtype=np.uint16)
 
 
 def resize_camera_intrinsic(
@@ -38,7 +62,9 @@ def resize_camera_intrinsic(
     if value.shape != (3, 3) or not np.all(np.isfinite(value)):
         raise ValueError("camera_K must be a finite 3x3 matrix or length-9 vector")
     if min(source_height, source_width, target_height, target_width) <= 0:
-        raise ValueError("camera intrinsic source and target dimensions must be positive")
+        raise ValueError(
+            "camera intrinsic source and target dimensions must be positive"
+        )
     if not np.allclose(value[2], np.array([0.0, 0.0, 1.0]), rtol=0.0, atol=1e-8):
         raise ValueError("camera_K must have the canonical pinhole last row [0,0,1]")
     scale_x = target_width / source_width
@@ -104,7 +130,9 @@ def resize_point_cloud(
         cloud.points = o3d.utility.Vector3dVector(source[:, :3].astype(np.float64))
         cloud.colors = o3d.utility.Vector3dVector(source[:, 3:].astype(np.float64))
         sampled = cloud.farthest_point_down_sample(target_point_count)
-        result = np.concatenate((np.asarray(sampled.points), np.asarray(sampled.colors)), axis=1)
+        result = np.concatenate(
+            (np.asarray(sampled.points), np.asarray(sampled.colors)), axis=1
+        )
         if result.shape != (target_point_count, 6):
             raise ValueError(f"Open3D FPS returned unexpected shape {result.shape}")
         return np.ascontiguousarray(result, dtype=np.float32)

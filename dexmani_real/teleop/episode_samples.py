@@ -428,8 +428,9 @@ def _build_robot_state(
     preserves the schema-v17 numeric convention without an extra transform.
 
     Hand hardware/error flags are forwarded to RobotState for recording.
-    ``qpos_stale`` remains a reserved false compatibility field; runtime
-    freshness comes from the source timestamp and read/state validity.
+    ``qpos_stale`` is set when the most recent single-frame read failed and the
+    published qpos is the last-known (held) value; feedback *age* (staleness) is
+    tracked separately via the source timestamp and read/state validity.
     """
     if arm_state is not None:
         r = arm_state[0]

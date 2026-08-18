@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.10",
     "PyYAML>=6",
     "h5py>=3.8",
+    "zarr>=2.16,<3",
     "av>=10",
     "opencv-python>=4.8",
     "transforms3d>=0.4",

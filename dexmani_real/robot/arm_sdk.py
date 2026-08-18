@@ -1,12 +1,9 @@
-"""Shared xArm SDK surface for the arm servo loop and homing execution.
+"""Shared xArm SDK surface for ``arm_loop.py`` (servo loop) and ``homing.py``.
 
-Holds the pieces both ``arm_loop.py`` (servo loop) and ``homing.py`` (homing
-execution) need without either owning them: the resolved ``ArmLoopConfig``, the
-live-read primitives, and the controller state-transition leaf helpers
-(``enter_mode0`` / ``enter_mode6`` / ``stop_controller``).  ``arm_loop`` imports
-from here, and so does ``homing``; neither imports the other for these, so the
-dependency graph stays acyclic.  None of these helpers read or write
-``SharedStorage`` or make policy decisions.
+Holds the resolved ``ArmLoopConfig``, the live-read primitives, and the
+controller state-transition leaf helpers (``enter_mode0``/``enter_mode6``/
+``stop_controller``).  Neither consumer imports the other for these, so the
+dependency graph stays acyclic; none touch ``SharedStorage`` or policy.
 """
 
 from __future__ import annotations
@@ -18,7 +15,6 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.config.defaults import arm, safety
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 
 @dataclass
@@ -57,10 +53,6 @@ class ArmLoopConfig:
 
     expected_axis: int = field(default_factory=lambda: arm.expected_axis)
     device_profile: str | None = field(default_factory=lambda: arm.device_profile)
-    serial_number: str | None = field(default_factory=lambda: arm.serial_number)
-    min_firmware: tuple[int, ...] | None = field(
-        default_factory=lambda: arm.min_firmware
-    )
 
     homing_convergence_rad: float = field(
         default_factory=lambda: arm.homing.convergence_rad
@@ -84,62 +76,6 @@ class ArmLoopConfig:
         default_factory=lambda: arm.tcp_load_cog_mm
     )
 
-    def __post_init__(self) -> None:
-        lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
-        upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
-        home = np.asarray(self.home_qpos, dtype=np.float64)
-        if (
-            lower.shape != ARM_JOINT_SHAPE
-            or upper.shape != ARM_JOINT_SHAPE
-            or home.shape != ARM_JOINT_SHAPE
-        ):
-            raise ValueError(
-                f"arm loop joint limits/home must have shape {ARM_JOINT_SHAPE}"
-            )
-        if not np.all(np.isfinite(np.concatenate((lower, upper, home)))) or np.any(
-            lower > upper
-        ):
-            raise ValueError("arm loop joint limits/home must be finite and ordered")
-        if self.max_consecutive_arm_health_failures <= 0:
-            raise ValueError("max_consecutive_arm_health_failures must be positive")
-        if not isinstance(self.expected_axis, int) or self.expected_axis <= 0:
-            raise ValueError("expected_axis must be a positive integer")
-        if self.device_profile is not None and not self.device_profile:
-            raise ValueError("device_profile must be non-empty when set")
-        if self.serial_number is not None and not self.serial_number:
-            raise ValueError("serial_number must be non-empty when set")
-        if self.min_firmware is not None and (
-            not isinstance(self.min_firmware, tuple)
-            or not self.min_firmware
-            or any(not isinstance(v, int) or v < 0 for v in self.min_firmware)
-        ):
-            raise ValueError(
-                "min_firmware must be a non-empty tuple of non-negative integers"
-            )
-        timing = (
-            self.joint_max_speed_rad_per_s,
-            self.joint_max_acc_rad_per_s2,
-            self.arm_loop_hz,
-            self.tracking_error_warn_rad,
-            self.homing_convergence_rad,
-            self.homing_step_interval_s,
-            self.homing_max_speed_rad_per_s,
-            self.homing_target_timeout_s,
-            self.homing_velocity_convergence_rad_s,
-            self.homing_dwell_s,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in timing):
-            raise ValueError(
-                "arm loop motion/homing parameters must be finite and positive"
-            )
-        if not self.arm_ip or not (0 <= self.collision_sensitivity <= 5):
-            raise ValueError("arm loop IP/collision sensitivity is invalid")
-        if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
-            raise ValueError("arm loop tcp_load_mass_kg must be finite and positive")
-        cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
-        if cog.shape != (3,) or not np.all(np.isfinite(cog)):
-            raise ValueError("arm loop tcp_load_cog_mm must be a finite (3,) vector")
-
     @classmethod
     def from_runtime(cls, runtime: Any) -> "ArmLoopConfig":
         cfg = runtime.arm
@@ -162,8 +98,6 @@ class ArmLoopConfig:
             ),
             expected_axis=int(cfg.expected_axis),
             device_profile=cfg.device_profile,
-            serial_number=cfg.serial_number,
-            min_firmware=tuple(cfg.min_firmware) if cfg.min_firmware is not None else None,
             homing_convergence_rad=float(cfg.homing.convergence_rad),
             homing_step_interval_s=float(cfg.homing.step_interval_s),
             homing_max_speed_rad_per_s=float(np.deg2rad(cfg.homing.max_speed_deg_s)),
@@ -184,37 +118,19 @@ def _require_sdk_ok(operation: str, code: Any) -> None:
 
 
 def _read_live_error_code(arm_api: Any) -> int:
-    """Return the live controller error code; raise if the live read fails.
-
-    Unlike the cached ``arm.error_code`` property (updated by a background
-    report thread), this synchronously reads ``get_err_warn_code``.  Control
-    decisions that follow a setter failure or a homing run must use this and
-    treat a raise as a fault — never fall back to the cached value.
-    """
+    """Synchronous live error code; raise on failure (never the cached value)."""
     code, values = arm_api.get_err_warn_code()
     _require_sdk_ok("get_err_warn_code", code)
     return int(values[0])
 
 
-# Controller error descriptions.
-#
-# A startup controller error is never cleared implicitly (see arm_loop), so the
-# operator must act before the next run.  The bare vendor code ("C2") is not
-# actionable — these mirror the vendor ``ControllerErrorCodeMap`` titles plus a
-# recovery action, so the startup log states both the fault and what to do.
-
+# Vendor ``ControllerErrorCodeMap`` titles plus a recovery action — a startup
+# controller error is never cleared implicitly (see arm_loop).
 _CONTROLLER_ERROR_HELP: dict[int, str] = {
     1: "Emergency Stop button pressed — release the E-stop button, then re-enable the robot",
     2: "Emergency IO of the control box triggered — ground the 2 EI pins, then re-enable the robot",
     3: "Three-state switch E-stop pressed — release the three-state switch, then re-enable the robot",
     10: "servo motor error",
-    11: "servo motor 1 error",
-    12: "servo motor 2 error",
-    13: "servo motor 3 error",
-    14: "servo motor 4 error",
-    15: "servo motor 5 error",
-    16: "servo motor 6 error",
-    17: "servo motor 7 error",
     21: "kinematic error",
     22: "self-collision error",
     23: "joints angle exceed limit",
@@ -225,15 +141,10 @@ _CONTROLLER_ERROR_HELP: dict[int, str] = {
 
 def describe_controller_error(code: int) -> str:
     """Return a human-readable description for a controller error code."""
-    return _CONTROLLER_ERROR_HELP.get(int(code), "controller error")
-
-
-# Controller state transitions.
-#
-# ``get_state()`` / ``get_err_warn_code()`` are synchronous reads; ``arm.mode``
-# and ``arm.connected`` are report-cache attributes; there is no synchronous
-# ``get_mode()`` read. The two are deliberately separate result types:
-# never present a combined read as one atomic live snapshot.
+    code = int(code)
+    if 11 <= code <= 17:
+        return f"servo motor {code - 10} error"
+    return _CONTROLLER_ERROR_HELP.get(code, "controller error")
 
 
 @dataclass(frozen=True)
@@ -246,28 +157,11 @@ class LiveStateError:
 
 
 @dataclass(frozen=True)
-class ReportSnapshot:
-    """Cached report attributes: connected flag and controller mode."""
-
-    connected: bool
-    mode: int
-
-
-@dataclass(frozen=True)
 class StopResult:
     """Outcome of a :func:`stop_controller` attempt."""
 
     confirmed: bool
     reason: str
-
-
-def controller_state_allows_motion(state: Any) -> bool:
-    """Return whether a controller state permits motion (0/1/2).
-
-    State 2 is a legal idle state but not the only ready state; the fixed SDK
-    accepts 0/1/2 as "not suspended/stopped".  Unknown states fail closed.
-    """
-    return int(state) in (0, 1, 2)
 
 
 def read_live_state_and_error(arm_api: Any) -> LiveStateError:
@@ -281,13 +175,6 @@ def read_live_state_and_error(arm_api: Any) -> LiveStateError:
     )
 
 
-def read_report_mode_and_connection(arm_api: Any) -> ReportSnapshot:
-    """Read the cached ``connected``/``mode`` report attributes."""
-    connected = bool(getattr(arm_api, "connected", True))
-    mode = int(getattr(arm_api, "mode", 6))
-    return ReportSnapshot(connected=connected, mode=mode)
-
-
 def _wait_controller_ready(
     arm_api: Any,
     *,
@@ -295,12 +182,11 @@ def _wait_controller_ready(
     on_poll: Callable[[], None] | None,
     timeout_s: float,
 ) -> int:
-    """Bounded wait for ``error==0``, a movable state, and a settled mode.
+    """Bounded wait for error==0, a movable state, and a settled mode.
 
-    A repeated read of the same cached ``mode`` is a single observation, not
-    several independent live samples; only the (possibly updated) report value
-    at each poll is evaluated.  ``on_poll`` keeps the caller's heartbeat fresh
-    while this helper sleeps.
+    ``mode``/``connected`` are cached report attributes (no synchronous
+    ``get_mode`` read), so a repeated read is one observation; ``on_poll``
+    keeps the caller's heartbeat fresh while this helper sleeps.
     """
     deadline = time.monotonic() + timeout_s
     last: LiveStateError | None = None
@@ -308,12 +194,11 @@ def _wait_controller_ready(
         if on_poll is not None:
             on_poll()
         last = read_live_state_and_error(arm_api)
-        report = read_report_mode_and_connection(arm_api)
         if (
-            report.connected
+            bool(getattr(arm_api, "connected", True))
             and last.error_code == 0
-            and report.mode == expected_mode
-            and controller_state_allows_motion(last.state)
+            and int(getattr(arm_api, "mode", 6)) == expected_mode
+            and int(last.state) in (0, 1, 2)
         ):
             return last.state
         time.sleep(0.03)
@@ -324,21 +209,54 @@ def _wait_controller_ready(
     )
 
 
+def _enter_mode(
+    arm_api: Any, mode: int, *, on_poll: Callable[[], None] | None = None
+) -> None:
+    """Enter a controller mode and wait for a movable state; raise on failure."""
+    _require_sdk_ok(f"set_mode({mode})", arm_api.set_mode(mode))
+    _require_sdk_ok(f"set_state(0) after Mode {mode}", arm_api.set_state(0))
+    _wait_controller_ready(arm_api, expected_mode=mode, on_poll=on_poll, timeout_s=1.0)
+
+
 def enter_mode0(arm_api: Any, *, on_poll: Callable[[], None] | None = None) -> None:
     """Enter Mode 0 and wait for a movable state; raise on failure."""
-    _require_sdk_ok("set_mode(0)", arm_api.set_mode(0))
-    _require_sdk_ok("set_state(0) after Mode 0", arm_api.set_state(0))
-    _wait_controller_ready(
-        arm_api, expected_mode=0, on_poll=on_poll, timeout_s=1.0
-    )
+    _enter_mode(arm_api, 0, on_poll=on_poll)
 
 
 def enter_mode6(arm_api: Any, *, on_poll: Callable[[], None] | None = None) -> None:
     """Enter Mode 6 and wait for a movable state; raise on failure."""
-    _require_sdk_ok("set_mode(6)", arm_api.set_mode(6))
-    _require_sdk_ok("set_state(0)", arm_api.set_state(0))
-    _wait_controller_ready(
-        arm_api, expected_mode=6, on_poll=on_poll, timeout_s=1.0
+    _enter_mode(arm_api, 6, on_poll=on_poll)
+
+
+def issue_mode_enter(arm_api: Any, mode: int) -> None:
+    """Issue the Mode-enter setters without blocking on the postcondition.
+
+    Split from :func:`_enter_mode` for the non-blocking Mode-6 entry: two
+    ms-scale SDK RPCs (``set_mode`` + ``set_state(0)``) are issued here, and the
+    movable-state postcondition is confirmed on later ticks via
+    :func:`mode_enter_ready`.  Raises on a setter failure (fail-closed).
+    """
+    _require_sdk_ok(f"set_mode({mode})", arm_api.set_mode(mode))
+    _require_sdk_ok(f"set_state(0) after Mode {mode}", arm_api.set_state(0))
+
+
+def mode_enter_ready(arm_api: Any, expected_mode: int) -> bool:
+    """One non-blocking probe of the Mode-enter movable-state postcondition.
+
+    Mirrors a single iteration of :func:`_wait_controller_ready` without the
+    sleep or deadline: True only when connected, error==0, the cached mode
+    matches, and the controller state is movable.  A transient SDK failure is
+    caught and reported as not-ready so the caller retries next tick.
+    """
+    try:
+        last = read_live_state_and_error(arm_api)
+    except Exception:
+        return False
+    return (
+        bool(getattr(arm_api, "connected", True))
+        and last.error_code == 0
+        and int(getattr(arm_api, "mode", 6)) == expected_mode
+        and int(last.state) in (0, 1, 2)
     )
 
 
@@ -349,13 +267,8 @@ def stop_controller(
     on_poll: Callable[[], None] | None = None,
     timeout_s: float = 1.0,
 ) -> StopResult:
-    """Request State 4 and confirm it, without requiring a cleared error.
-
-    ``emergency=True`` first calls ``arm.emergency_stop()`` (only exceptions are
-    caught). A failed ``set_state(4)``
-    does not skip the bounded synchronous ``get_state()`` confirmation: a
-    latched controller error must not prevent confirming the physical stop.
-    """
+    """Request State 4 and confirm it; a latched error must not block the stop
+    confirmation (``emergency=True`` also calls ``emergency_stop`` first)."""
     if emergency:
         try:
             arm_api.emergency_stop()
@@ -385,114 +298,7 @@ def stop_controller(
     )
 
 
-# Connect-time validation.
-#
-# ``set_servo_angle`` silently clamps speed and acceleration. Reject values
-# outside the effective command and device limits before connecting.
-
-SPEED_COMMAND_CLAMP_RAD_PER_S: tuple[float, float] = (0.0001, float(np.pi))
-ACC_COMMAND_CLAMP_RAD_PER_S2: tuple[float, float] = (0.01, 20.0)
-
-
-def _binding_device_limit(value: Any) -> float | None:
-    """Return the reported device upper limit (max speed/acc).
-
-    ``joint_speed_limit`` / ``joint_acc_limit`` report a ``[min, max]`` pair
-    (``xarm.x3.base``), not a per-joint list; the command upper bound is the
-    ``max`` element.  Returns ``None`` when the report is absent or unusable so
-    the caller falls back to the SDK hard clamp only.
-    """
-    if value is None:
-        return None
-    if np.isscalar(value):
-        value = [value]
-    try:
-        finite = [float(v) for v in value if np.isfinite(float(v)) and float(v) > 0.0]
-    except (TypeError, ValueError):
-        return None
-    return max(finite) if finite else None
-
-
-# Tolerance for comparing configured and reported dynamics limits.
-_DYNAMICS_UBOUND_RTOL = 1e-6
-
-
-def _exceeds_upper_bound(value: float, upper: float) -> bool:
-    """True when ``value`` is meaningfully above ``upper`` (float-tolerant)."""
-    return value > upper + abs(upper) * _DYNAMICS_UBOUND_RTOL
-
-
-def validate_command_dynamics_intersection(
-    *,
-    config_speed_rad_per_s: float,
-    config_acc_rad_per_s2: float,
-    device_speed_limits: Any,
-    device_acc_limits: Any,
-) -> str | None:
-    """Return a reason string when the configured Mode 6 dynamics would be
-    silently clamped, or ``None`` when they fit the effective command range.
-
-    The effective upper bound is ``min(SDK hard clamp, reported device limit)``;
-    a missing device report falls back to the SDK hard clamp alone.  Both below
-    the lower clamp and above the effective upper bound are refused.
-    """
-    speed_lower = SPEED_COMMAND_CLAMP_RAD_PER_S[0]
-    acc_lower = ACC_COMMAND_CLAMP_RAD_PER_S2[0]
-    speed_upper = SPEED_COMMAND_CLAMP_RAD_PER_S[1]
-    acc_upper = ACC_COMMAND_CLAMP_RAD_PER_S2[1]
-    dev_speed = _binding_device_limit(device_speed_limits)
-    dev_acc = _binding_device_limit(device_acc_limits)
-    if dev_speed is not None:
-        speed_upper = min(speed_upper, dev_speed)
-    if dev_acc is not None:
-        acc_upper = min(acc_upper, dev_acc)
-    if config_speed_rad_per_s < speed_lower or _exceeds_upper_bound(
-        config_speed_rad_per_s, speed_upper
-    ):
-        return (
-            f"configured speed {config_speed_rad_per_s} rad/s outside the effective "
-            f"command range [{speed_lower}, {speed_upper}]"
-        )
-    if config_acc_rad_per_s2 < acc_lower or _exceeds_upper_bound(
-        config_acc_rad_per_s2, acc_upper
-    ):
-        return (
-            f"configured mvacc {config_acc_rad_per_s2} rad/s² outside the effective "
-            f"command range [{acc_lower}, {acc_upper}]"
-        )
-    return None
-
-
-def validate_device_identity(
-    *,
-    axis: int,
-    device_type: str,
-    serial_number: str,
-    firmware: tuple[int, ...],
-    expected_axis: int,
-    expected_serial: str | None,
-    min_firmware: tuple[int, ...] | None,
-    device_profile: str | None,
-) -> str | None:
-    """Return a reason string when the reported device identity fails the
-    configured expectations, or ``None`` when it passes.
-
-    ``firmware`` is compared as an integer tuple (``version_number``), never as
-    a string.  ``device_profile=None`` performs no type check — the model is not
-    guessed without on-site confirmation.  ``expected_serial=None``
-    and ``min_firmware=None`` skip their checks.
-    """
-    if axis != expected_axis:
-        return f"device reports {axis} axes, expected {expected_axis}"
-    if expected_serial is not None and serial_number != expected_serial:
-        return (
-            f"serial number mismatch: got {serial_number!r}, "
-            f"expected {expected_serial!r}"
-        )
-    if min_firmware is not None and firmware and firmware < min_firmware:
-        return f"firmware {firmware} below minimum {min_firmware}"
-    if device_profile is not None and device_type and device_type != device_profile:
-        return (
-            f"device type {device_type!r} does not match profile {device_profile!r}"
-        )
-    return None
+# ``joint_speed_limit`` / ``joint_acc_limit`` are the firmware's *persisted*
+# config registers (set_joint_maxacc + save_conf), not hardware bounds.  The
+# Mode 6 hard clamps (speed ≤ π, acc ≤ 20) live in the SDK and are enforced by
+# ``ArmParams.__post_init__``.

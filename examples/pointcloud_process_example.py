@@ -133,12 +133,7 @@ def _stage_label(key: str) -> str:
         "2d_depth_gate": "Depth gate",
         "2d_edge_filter": "Edge filter (LoG + dilate)",
         "2d_speckle": "Speckle filter",
-        "p_numpy": "2-D gates + deproject + crop",
-        "p_voxel": "5mm voxel downsample",
-        "p_dbscan": "DBSCAN two-in-one filter",
-        "p_radius": "Radius outlier removal",
-        "p_stat": "Statistical outlier",
-        "p_fps": "FPS sampling",
+        "p_pipeline": "Complete point-cloud pipeline",
     }.get(key, key)
 
 
@@ -429,47 +424,16 @@ def _run_pipeline(depth_m: np.ndarray, rgb: np.ndarray, T_world_camera: np.ndarr
         print("  6. Statistical outlier     -> DISABLED")
     print(f"  7. FPS sampling            -> {cfg.num_points} points")
 
-    # Warm-up frame.
+    # Warm-up frame, then time the public operation. PointCloudProcessor keeps
+    # no diagnostic state; profiling individual stages belongs in a profiler.
     rays = camera.get_rays()
     rays_2d = rays.reshape(depth_m.shape[0], depth_m.shape[1], 3)
     _ = processor.process(depth_m, rgb, rays_2d)
 
-    # Save accumulators, run one timed frame, extract single-frame timings.
-    saved = (
-        processor._t_numpy, processor._t_voxel, processor._t_dbscan,
-        processor._t_radius, processor._t_stat, processor._t_fps,
-        processor._t_in_n, processor._t_voxel_n, processor._t_radius_n, processor._t_n,
-    )
-    for attr in ("_t_numpy", "_t_voxel", "_t_dbscan", "_t_radius", "_t_stat", "_t_fps"):
-        setattr(processor, attr, 0.0)
-    processor._t_in_n = processor._t_voxel_n = processor._t_radius_n = 0
-    processor._t_n = 0
-
     t0 = time.perf_counter()
     result = processor.process(depth_m, rgb, rays_2d)
-    timings = {"pipeline_total": (time.perf_counter() - t0) * 1000.0}
-
-    if result is None:
-        # process() returned early (no pointcloud survived the depth gate); the
-        # per-stage accumulators were never updated, so mark them unavailable
-        # (NaN) so the summary renders "(unavailable)" instead of "(disabled)".
-        print("\n  process() early-returned (no pointcloud); per-stage timing unavailable")
-        for _key in ("p_numpy", "p_voxel", "p_dbscan", "p_radius", "p_stat", "p_fps"):
-            timings[_key] = float("nan")
-    else:
-        timings.update({
-            "p_numpy": processor._t_numpy,
-            "p_voxel": processor._t_voxel,
-            "p_dbscan": processor._t_dbscan,
-            "p_radius": processor._t_radius,
-            "p_stat": processor._t_stat,
-            "p_fps": processor._t_fps,
-        })
-
-    # Restore accumulators.
-    (processor._t_numpy, processor._t_voxel, processor._t_dbscan,
-     processor._t_radius, processor._t_stat, processor._t_fps,
-     processor._t_in_n, processor._t_voxel_n, processor._t_radius_n, processor._t_n) = saved
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    timings = {"pipeline_total": elapsed_ms, "p_pipeline": elapsed_ms}
 
     if result is not None:
         print(f"\n  Output: {result.shape[0]} points  ({timings['pipeline_total']:.1f} ms)")
@@ -488,8 +452,7 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
     sections = [
         ("Setup", ["connect", "capture", "extrinsics", "desk_calib"]),
         ("2-D Pre-deprojection Filters", ["2d_median", "2d_depth_gate", "2d_edge_filter", "2d_speckle"]),
-        ("3-D Pipeline (per-frame steady-state)",
-         ["p_numpy", "p_voxel", "p_dbscan", "p_radius", "p_stat", "p_fps"]),
+        ("3-D Pipeline (per-frame steady-state)", ["p_pipeline"]),
     ]
 
     for title, keys in sections:

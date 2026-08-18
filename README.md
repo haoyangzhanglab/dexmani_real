@@ -10,12 +10,25 @@
 | 采集遥操作 episode | `teleop/loop.py`、`teleop/episode_samples.py` | `examples/collect_teleop.py` |
 | 回放或检查 episode | `recording/episode_reader.py`、`examples/replay_episode.py` | `examples/replay_episode.py` |
 | 读取 v17 数据 | `recording/episode_schema.py`、`recording/episode_reader.py` | [`docs/dataset/hdf5_episode.md`](docs/dataset/hdf5_episode.md) |
-| 清洗并生成训练视图 | `data_processing/` | [`docs/dataset/processed_hdf5.md`](docs/dataset/processed_hdf5.md) |
+| 清洗并生成训练视图/Zarr | `data_processing/` | [`docs/dataset/processed_hdf5.md`](docs/dataset/processed_hdf5.md) |
 | 修改手部 retarget | `teleop/hand_control.py`、`teleop/hand_retarget.py` | [`docs/hand_retargeting.md`](docs/hand_retargeting.md) |
 | 部署 learned policy | `deployment/coordinator.py`、`deployment/worker.py` | `examples/run_policy.py` |
 | 对照 Sim 数据 | — | [`docs/dataset/sim_hdf5_zarr.md`](docs/dataset/sim_hdf5_zarr.md)、[`docs/dataset/real_to_sim_mapping.md`](docs/dataset/real_to_sim_mapping.md) |
 
 完整文档索引见 [`docs/README.md`](docs/README.md)。代码是运行行为的最终事实来源；文档只记录跨模块边界、读取合同和稳定的使用方式。
+
+正式数据目录与仓库根目录同级组织：
+
+```text
+episodes/<task_name>/episode_*                 # raw v17
+episodes_processed/<task_name>/episode_*.h5   # 每个 raw 对应一个压紧 HDF5 + processing_index.json
+dataset/<task_name>.zarr                       # dexmani_policy 训练容器
+```
+
+不使用额外的 `inputs/` staging 层；旧平铺 episode 只通过显式迁移/annotation 兼容。
+任务失败由操作者删除整条 raw episode，不由处理代码推断。Policy Zarr 只包含
+`data/*` 与 `meta/episode_ends`；不写 `task_success` 或 raw episode provenance。
+清洗默认审计停滞/抖动，只自动删除硬无效行；压紧产生危险动作跳变时拒绝整条轨迹。
 
 ## 系统边界
 
@@ -47,12 +60,13 @@ camera / VR / arm / hand
 
 | 用途 | 命令 | 性质 |
 |---|---|---|
-| 遥操作采集 | `python examples/collect_teleop.py` | 硬件 |
+| 遥操作采集 | `python examples/collect_teleop.py --task-name <task>` | 硬件；写入 `episodes/<task>/episode_*` |
 | 键盘控制 | `python examples/keyboard_teleop.py` | 硬件 |
 | learned policy | `python examples/run_policy.py --help` | 离线（仅帮助） |
 | 回放预检 | `python examples/replay_episode.py <episode> --dry-run` | 离线 |
 | 真实回放 | `python examples/replay_episode.py <episode>` | 硬件 |
-| 数据清洗 | `python examples/process_episodes.py --help` | 离线 |
+| 数据清洗 | `python examples/process_episodes.py --input-root episodes/<task> --profile rgb_pc --dry-run` | 离线；先审计、不写输出 |
+| 导出 Policy Zarr | `python examples/export_policy_zarr.py --help` | 离线 |
 | 手部调参 | `python examples/tune_hand_retarget.py --help` | 离线 |
 | episode 可视化 | `python examples/visualize_episode.py <episode>` | 离线/GUI |
 | 相机标定 | `python examples/calibrate_camera.py` | 硬件/写标定文件 |
@@ -87,7 +101,7 @@ git diff --check
 | `policy/` | action candidate 与统一安全门 |
 | `deployment/` | learned-policy 推理和动作协调 |
 | `recording/` | v17 episode 写入、读取和相机 sidecar |
-| `data_processing/` | v17 → real-domain Sim-label 离线视图 |
+| `data_processing/` | v17 → real-domain 离线视图，以及 processed HDF5 → Policy Zarr |
 | `examples/` | 薄 CLI/实验入口，不承载通用合同 |
 
 ### 修改闭环

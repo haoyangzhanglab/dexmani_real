@@ -22,7 +22,7 @@ from dexmani_real.utils.hand_health import XHAND_OVERCURRENT_ERROR_CODE
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.utils.retry import EventWindowCounter, RetryCounter
+from dexmani_real.utils.retry import RetryCounter
 from dexmani_real.utils.schema import (HAND_CONTACT_SHAPE, HAND_JOINT_SHAPE,
                                        HAND_STATE_DTYPE, HAND_TACTILE_DTYPE,
                                        HAND_TACTILE_FORCE_SHAPE,
@@ -78,8 +78,6 @@ class HandProcessConfig:
     # error_state ticks (persistent board faults).  Shared with the
     # get_state-exception counter for consistent escalation behaviour.
     error_state_watchdog_frames: int = 5
-    overcurrent_fault_count: int = field(default_factory=lambda: hand.overcurrent_fault_count)
-    overcurrent_fault_window_s: float = field(default_factory=lambda: hand.overcurrent_fault_window_s)
 
     def __post_init__(self) -> None:
         if self.ethercat_slave_position < -1:
@@ -137,13 +135,6 @@ class HandProcessConfig:
             raise ValueError("hand process loop_hz must be finite and positive")
         if self.send_err_watchdog_frames <= 0 or self.error_state_watchdog_frames <= 0:
             raise ValueError("hand process watchdog thresholds must be positive")
-        if not isinstance(self.overcurrent_fault_count, int) or self.overcurrent_fault_count <= 0:
-            raise ValueError("hand process overcurrent_fault_count must be a positive integer")
-        if (
-            not np.isfinite(self.overcurrent_fault_window_s)
-            or self.overcurrent_fault_window_s <= 0
-        ):
-            raise ValueError("hand process overcurrent_fault_window_s must be finite and positive")
 
     @classmethod
     def from_runtime(cls, runtime: object, *, startup_failure_is_fatal: bool = True) -> "HandProcessConfig":
@@ -170,8 +161,6 @@ class HandProcessConfig:
             kd=int(cfg.kd),
             tor_max_ma=tuple(int(value) for value in cfg.tor_max_ma),
             send_err_watchdog_frames=int(cfg.send_err_watchdog_count),
-            overcurrent_fault_count=int(cfg.overcurrent_fault_count),
-            overcurrent_fault_window_s=float(cfg.overcurrent_fault_window_s),
         )
 
 
@@ -331,7 +320,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         # a one-tick window where hand_ready is set but hand_state_ring is empty.
         # (Same pattern as arm_loop arm_ready.)
         try:
-            st = hand.get_state(force_update=True)
+            st = hand.get_state()
             # shape + finite are already validated by XHandSample construction.
             _init_qpos = st.qpos
             _initial_values: dict[str, np.ndarray] = {
@@ -380,8 +369,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _frame0["read_healthy"][0] = 1
         _frame0["read_error_count"][0] = 0
         _frame0["overcurrent_error_count"][0] = 0
-        _frame0["last_read_error_code"][0] = 0
-        _frame0["last_read_error_monotonic_ns"][0] = 0
         _frame0["timestamp"][0] = _initial_source_ns / 1e9
         shared.hand_state_ring.write(_frame0)
         shared.hand_tactile_ring.write(
@@ -408,11 +395,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _send_error_counter = RetryCounter(max_consecutive=cfg.send_err_watchdog_frames, label="hand_send")
         _error_state_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_error_state")
         _read_error_counter = RetryCounter(max_consecutive=cfg.error_state_watchdog_frames, label="hand_read_error")
-        _overcurrent_window = EventWindowCounter(
-            max_events=cfg.overcurrent_fault_count,
-            window_s=cfg.overcurrent_fault_window_s,
-        )
-        _overcurrent_fault_logged = False
 
         last_known_qpos = _init_qpos.copy()
         last_known_current = np.asarray(_initial_values["current"], dtype=np.float64).copy()
@@ -422,7 +404,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
         _read_error_count_total = 0
         _overcurrent_error_count_total = 0
         _last_read_error_code = 0
-        _last_read_error_ns = 0
         last_applied_action_id = 0
 
         _prev_board_errs: dict[str, np.ndarray] = {
@@ -497,7 +478,7 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             # Read state (always — even when safety-gated)
             read_failed = False
             try:
-                st = hand.get_state(force_update=True)
+                st = hand.get_state()
                 qpos = st.qpos
                 current = st.current
                 tactile_sum = st.tactile_sum
@@ -526,18 +507,15 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                     },
                 )
             except Exception as exc:
-                read_failed = True
-                _read_error_count_total += 1
-                _last_read_error_ns = time.monotonic_ns()
                 _last_read_error_code = int(exc.code) if isinstance(exc, XHandReadError) else -1
-                logger.warning(
-                    "hand_loop: get_state failed code=%d connected=%d action_id=%d",
-                    _last_read_error_code,
-                    int(bool(hand.connected_flag)),
-                    last_applied_action_id,
-                    exc_info=True,
-                )
-                if _last_read_error_code == XHAND_OVERCURRENT_ERROR_CODE:
+                is_overcurrent = _last_read_error_code == XHAND_OVERCURRENT_ERROR_CODE
+                if is_overcurrent:
+                    # Overcurrent is a recoverable firmware warning, not a read
+                    # failure: the hand stays connected and joint feedback stays
+                    # valid. Keep the last-known current so the stall load stays
+                    # observable (firmware tor_max already bounds it) and record
+                    # the event as an observation only — no pause, no fault.
+                    read_failed = False
                     _overcurrent_error_count_total += 1
                     logger.warning(
                         "hand_loop: overcurrent context last_current_ma=%s tor_max_ma=%s "
@@ -554,18 +532,23 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                             4,
                         ).tolist(),
                     )
-                    if _overcurrent_window.record(time.monotonic()):
-                        shared.error_state.value = True
-                        if not _overcurrent_fault_logged:
-                            _overcurrent_fault_logged = True
-                            logger.error(
-                                "hand_loop: %d overcurrent events within %.1fs — "
-                                "latching global error_state",
-                                _overcurrent_window.count,
-                                cfg.overcurrent_fault_window_s,
-                            )
+                else:
+                    read_failed = True
+                    _read_error_count_total += 1
+                    logger.warning(
+                        "hand_loop: get_state failed code=%d connected=%d action_id=%d",
+                        _last_read_error_code,
+                        int(bool(hand.connected_flag)),
+                        last_applied_action_id,
+                        exc_info=True,
+                    )
+
                 qpos = last_known_qpos.copy()
-                current = np.zeros(HAND_JOINT_SHAPE)
+                current = (
+                    last_known_current.copy()
+                    if is_overcurrent
+                    else np.zeros(HAND_JOINT_SHAPE)
+                )
                 tactile_sum = _last_tactile_sum.copy()
                 tactile_force = _last_tactile_force.copy()
                 tactile_sum_valid = False
@@ -577,17 +560,18 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
                 jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
                 tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
 
-                # Read-error escalation: persistent get_state exceptions (SDK crash,
-                # USB disconnect) bypass the normal error_state retry path because
-                # error_state is forced to False above.  A dedicated counter ensures
-                # this silent-dead-hand scenario still escalates to global error_state.
-                _read_error_counter.inc()
-                if _read_error_counter.triggered:
-                    shared.error_state.value = True
-                    logger.error(
-                        "hand_loop: %d consecutive get_state exceptions — latching global error_state",
-                        _read_error_counter.max_consecutive,
-                    )
+                if not is_overcurrent:
+                    # Read-error escalation: persistent get_state exceptions (SDK crash,
+                    # USB disconnect) bypass the normal error_state retry path because
+                    # error_state is forced to False above.  A dedicated counter ensures
+                    # this silent-dead-hand scenario still escalates to global error_state.
+                    _read_error_counter.inc()
+                    if _read_error_counter.triggered:
+                        shared.error_state.value = True
+                        logger.error(
+                            "hand_loop: %d consecutive get_state exceptions — latching global error_state",
+                            _read_error_counter.max_consecutive,
+                        )
 
             # Retry transient hand errors only for the configured bounded window.
             # ``error_state`` is recomputed from the board registers on every read,
@@ -625,8 +609,6 @@ def hand_loop(shared, config: HandProcessConfig | None = None) -> None:
             frame["read_healthy"][0] = int(not read_failed and not _read_error_counter.triggered)
             frame["read_error_count"][0] = _read_error_count_total
             frame["overcurrent_error_count"][0] = _overcurrent_error_count_total
-            frame["last_read_error_code"][0] = _last_read_error_code
-            frame["last_read_error_monotonic_ns"][0] = _last_read_error_ns
             frame["timestamp"][0] = _last_state_source_ns / 1e9
             shared.hand_state_ring.write(frame)
 

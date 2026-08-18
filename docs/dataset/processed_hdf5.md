@@ -1,272 +1,226 @@
-# DexMani Real 清洗与 Sim-label HDF5 格式
+# DexMani Real processed HDF5 v3 与 Policy Zarr
 
-> 本文描述离线处理格式 `dexmani-real-simlabel-hdf5/v1`。源 Real v17
-> episode 始终只读；输出是 real-domain 的 Sim-label 数据视图，不是可在
-> SAPIEN 中回放的标准 Sim episode。
+本文定义 schema-v17 raw episode 的离线清洗、Real-native processed HDF5 和
+dexmani_policy Zarr 合同。Sim 格式只用于参考键名；Real 与 Sim 数据不会混用，数值、
+frame 和单位不要求相同。
 
-## 1. 使用方式
+## 1. 目录和一对一规则
 
-先比较不同模态对数据保留率和切段的影响：
+```text
+episodes/<task_name>/episode_xxx/
+    data.h5 + depth.h5 + rgb.mp4
 
-```bash
-conda run -n real_robot python examples/process_episodes.py \
-  --input-root episodes \
-  --output-root episode_processed \
-  --compare-profiles
+episodes_processed/<task_name>/
+    episode_xxx.h5
+    processing_index.json
+
+dataset/<task_name>.zarr/
+    data/*
+    meta/episode_ends
 ```
 
-实际写入前可对选定 profile 做 dry-run：
+- 一个 accepted raw episode 只产生一个同名 processed HDF5。
+- 不产生 `__segNNN`，不把一条 demo 变成多个训练 episode。
+- 所有模态共用一个 keep mask；删除行后保持原顺序并压紧。
+- 失败或不可用 demo 由操作者在处理前删除；代码不判断任务成功，不维护
+  `task_outcome` 或 `task_success`。
+- 不使用 `inputs/` staging 目录。
+
+## 2. 命令
+
+推荐先 dry-run，检查每条轨迹的 retained rows、reason counts 和 bridge：
 
 ```bash
 conda run -n real_robot python examples/process_episodes.py \
-  --input-root episodes \
-  --output-root episode_processed \
+  --input-root episodes/pick_apple_messy \
   --profile rgb_pc \
   --dry-run
+
+# 报告无 rejection 后再去掉 --dry-run 发布 HDF5。
+conda run -n real_robot python examples/process_episodes.py \
+  --input-root episodes/pick_apple_messy \
+  --profile rgb_pc
+
+conda run -n real_robot python examples/export_policy_zarr.py \
+  --input-root episodes_processed/pick_apple_messy \
+  --output dataset/pick_apple_messy.zarr \
+  --task-name pick_apple_messy
 ```
 
-确认报告后执行：
+处理器和导出器都拒绝覆盖已存在的目标。它们在目标同一父目录中写 staging，完成
+重新打开、shape/dtype/finite/语义校验后再原子发布。
+
+批处理中任何未被 annotation 显式排除的 raw episode 若校验或 bridge 策略拒绝，
+整个批次都不发布；错误会列出 episode 与拒绝原因，不能静默漏掉坏轨迹。
+
+## 3. Processed HDF5 v3
+
+root attrs：
+
+```text
+schema_name = dexmani-real-processed-hdf5
+schema_version = 3
+domain = real
+profile = joint | rgb | pointcloud | rgb_pc
+episode_steps = M
+source_frames = N
+dt = 1 / control_hz
+time_semantics = logical_control_grid_after_row_compaction
+task_name = <task>
+```
+
+所有 profile 的核心逐帧 dataset：
+
+| key | shape | dtype | Real 语义 |
+|---|---:|---|---|
+| `joint_state` | `(M,19)` | `float32` | `arm_qpos[7] + hand_qpos[12]` |
+| `action` | `(M,19)` | `float32` | arm sent-to-worker target + queued XHand target；不是硬件 ACK |
+| `action_ee` | `(M,21)` | `float32` | xArm-base EEF position/rot6d `[9]` + queued XHand target `[12]` |
+| `contact_force` | `(M,5,3)` | `float32` | XHand per-finger SDK-scaled tactile summary；SI 未验证 |
+| `fingertip_points` | `(M,5,3)` | `float32` | xArm-base FK fingertip，m |
+
+`rgb` / `rgb_pc` 增加：
+
+| key | shape | dtype | Real 语义 |
+|---|---:|---|---|
+| `rgb` | `(M,240,320,3)` | `uint8` | MP4 RGB，无 crop resize |
+| `depth` | `(M,240,320)` | `uint16` | aligned Z16，nearest resize，0 invalid |
+| `camera_intrinsic` | `(M,9)` | `float32` | resize 后 row-major K |
+| `camera_extrinsic` | `(M,4,4)` | `float32` | `T_xarm_base_camera`，camera optical → xArm base |
+
+`pointcloud` / `rgb_pc` 增加：
+
+| key | shape | dtype | Real 语义 |
+|---|---:|---|---|
+| `point_cloud` | `(M,1024,6)` | `float32` | xArm-base XYZ[m] + RGB `[0,1]` |
+
+eye-to-hand 相机逐行重复静态 `T_xarm_base_camera`；eye-in-hand 相机使用
+`T_xarm_base_eef(obs[t]) @ T_eef_camera`。齐次矩阵、SO(3) 和 finite 都必须通过
+validator。depth 的真实米制比例由 HDF5/Zarr 的 `depth_scale_m_per_unit` 声明，不能
+默认套用 Sim 的 `1/1000`。
+
+## 4. HDF5 provenance
+
+provenance 只在 processed HDF5 中存在：
+
+```text
+provenance/source_row_index          int64[M]
+provenance/source_sample_index       int64[M]
+provenance/source_timestamp_s        float64[M]
+provenance/source_keep_mask          bool[N]
+provenance/source_drop_reason_bits   uint64[N]
+```
+
+`drop_reason_bit_names_json` 定义位到原因名的映射。`source_row_index` 必须严格递增并
+等于 `flatnonzero(source_keep_mask)`；kept row 的 reason bits 必须为 0。
+
+`processing_index.json` 是批处理审计报告，保存阈值、每条轨迹的 reason counts、
+selected source ranges、bridge findings 和写后验证结果。它不会进入 Zarr。
+
+## 5. 行清洗
+
+硬无效条件包括：
+
+- 非 source/invalid control-grid row；
+- action 未 queued、held、frame status 非 OK 或 safety rejection；
+- arm/hand source、history、timing、finite 或 joint limits 无效；
+- `action_ee`、tactile summary 或 fingertip 非 finite；
+- tactile 不 fresh、未校准或没有有效 source timestamp；
+- camera profile 下 freshness、causal history、health、clock reset 或 age 无效；
+- RGB profile 下 depth 全 invalid；
+- point-cloud profile 下点云派生失败或 depth ratio 无效；
+- annotation 显式排除的行。
+
+时序检测分三种策略：
+
+- `hard_only`：不运行停滞/抖动 detector；
+- `audit`：只报告 suspect/high-confidence；
+- `strict`：额外删除高置信度可逆 impulse、arm feedback stall 和 command-apply stall。
+
+abrupt step 和 persistent tracking error 本身只作为 suspect，防止误删有意快速动作或
+任务所需静止。
+
+压紧后只按 `M >= horizon + min_full_windows - 1` 判断窗口数量，不按原连续段分别准入。
+
+## 6. Bridge 风险
+
+删除区间会把两端变成相邻训练帧。每个 bridge 记录：
+
+```text
+source rows、removed count/reasons、source sample/time delta、
+max arm action delta、max hand action delta、risky
+```
+
+默认 `--bridge-policy reject`：若 source continuity 损坏，或压紧后 arm/hand action
+超过配置的 abrupt threshold，整条 raw 被拒绝/要求人工复核。仍然不会切段。
+
+人工确认逻辑时间压缩可接受后，可以显式使用：
 
 ```bash
-conda run -n real_robot python examples/process_episodes.py \
-  --input-root episodes \
-  --output-root episode_processed \
-  --profile rgb_pc
+--bridge-policy audit
 ```
 
-默认拒绝覆盖已存在的 `episode_processed`。实现会先在同一父目录写临时
-目录，重新打开并验证全部 HDF5，再通过 fsync + rename 原子发布整批结果。
-输入根目录下每个非隐藏的直接子目录都会被审计；缺少三件套或 schema 损坏的
-目录会作为 rejected source 写入报告，不会被静默跳过。
+该选择会写入 `processing_config_json` 和 index，不能静默放宽。
 
-## 2. 输出布局
+## 7. Annotation 边界
 
-只有一个连续有效段时保留源 episode stem：
-
-```text
-episode_processed/
-├── <source_stem>.h5
-└── processing_index.json
-```
-
-中间存在硬无效帧时不能删行后拼紧，而是写成独立 episode：
-
-```text
-episode_processed/
-├── <source_stem>__seg000.h5
-├── <source_stem>__seg001.h5
-└── processing_index.json
-```
-
-`processing_index.json` 保存源 episode 决策、丢弃原因、segment 范围、质量指标、
-输出文件和写后验证结果。Sim 的 HDF5→Zarr 转换器只枚举顶层 `.h5/.hdf5`，
-因此会自然忽略该 JSON。
-
-## 3. Profile 与字段合同
-
-Profile 参与 hard-valid mask；它不是单纯的“写哪些字段”选项。点云无效不会
-破坏 joint-only 轨迹，但会切断 `pointcloud`/`rgb_pc` episode。
-
-| Profile | 顶层 datasets |
-|---|---|
-| `joint` | `joint_state`, `action` |
-| `rgb` | 上述字段 + `rgb`, `camera_intrinsic` |
-| `pointcloud` | joint 字段 + `point_cloud` |
-| `rgb_pc` | `joint_state`, `action`, `rgb`, `camera_intrinsic`, `point_cloud` |
-
-同一个待聚合批次必须使用一个 profile，保证所有 HDF5 的 key、tail shape 和 dtype
-一致。
-
-### 3.1 `joint_state`
-
-```text
-concat(arm_qpos[7], hand_qpos[12]) → (N,19) float32 rad
-```
-
-它是控制网格锚点因果选择的实测状态。源数组是 `float64`；输出显式转换为 Sim
-数据管线惯用的 `float32`。
-
-### 3.2 `action`
-
-```text
-concat(action_arm_joint_sent[7], action_hand_joint[12])
-→ (N,19) float32 rad
-```
-
-必须同时满足 `meta.arm_sent_stream=True` 和 sent dataset 存在。禁止回退到
-`action_arm_joint`。arm 字段表示已转发给 worker 的命令，不是硬件 ACK；hand 字段
-表示 queued target，没有 sent/ACK stream。
-
-### 3.3 `rgb` 与 `camera_intrinsic`
-
-- RGB 顺序解码 MP4，一次遍历直接写入被选择的 segment，不把整段视频缓存到内存。
-- `(H,W,3)` 使用无 crop resize 输出 `(240,320,3) uint8`。
-- 缩小时使用 OpenCV `INTER_AREA`，放大时使用 `INTER_LINEAR`。
-- `camera_K` 按 `sx=target_w/source_w`、`sy=target_h/source_h` 调整
-  `fx/cx` 与 `fy/cy`，输出 `(N,9) float32`。
-
-K 缺失、非有限、非 pinhole 形式或与源 viewport 不一致时 fail closed，不生成单位阵。
-
-### 3.4 `point_cloud`
-
-点云在写段时从源 depth 逐帧确定性派生（`PointCloudProcessor`，无 RNG）：
-
-```text
-depth + K + 外参 + desk_plane + pc config → (2048,6) XYZRGB → (1024,6) float32
-```
-
-- 使用派生时的 `last_source_point_count` 识别唯一点前缀；
-- 唯一点不少于目标数时做确定性 FPS；
-- 唯一点不足时按固定顺序循环补点；
-- RGB 保持 `[0,1]`；
-- 不做额外 crop、voxel、坐标旋转或颜色缩放；
-- XYZ 始终标为 `xarm_base`，`frame_compatibility_with_sim_world=False`。
-
-全零、非有限、颜色越界或无真实源点的行不可输出（派生时顺带做数值校验）。
-
-## 4. 明确省略的 Sim 字段
-
-当前不生成：
-
-```text
-depth
-segmentation
-camera_extrinsic
-contact_force
-fingertip_points
-imagine_point_cloud
-action_ee
-done
-```
-
-省略比全零/末帧常量占位更安全：Sim 的全零 segmentation 表示 background，全零
-contact force 表示无接触，`done=False` 表示 transition 未终止；它们都不表示 unknown。
-
-## 5. 清洗和切段
-
-### 5.1 Episode 级准入
-
-- `EpisodeReader.require_valid()`；
-- schema v17；
-- 三个源成员和帧数一致；
-- sent action stream 存在；
-- 请求的模态完整；
-- 至少一个 segment 满足训练窗口要求。
-
-### 5.2 Core 行级硬无效
-
-- 非 source sample；
-- action 未 queued；
-- held、安全拒绝或非 OK frame status；
-- arm/hand 来源链、连接或手状态无效；
-- action timing 非法；
-- joint/action 非有限；
-- arm 状态/动作超硬限位；
-- hand action 超命令限位；
-- hand 实测状态超额定机械包络加 3° 反馈容差。
-
-手部反馈容差只适用于 measured qpos。命令仍使用严格 `1e-6 rad` 容差；不能以
-伺服落点、接触回弹的正常小幅超调为由放宽 action。
-
-### 5.3 模态硬无效
-
-RGB 要求 camera fresh、causal source chain、无 clock reset，且
-`camera_age_s <= 0.25`。Point cloud 还要求合法 `pointcloud_valid_depth_ratio`
-（depth 派生质量）、正 source point count，以及派生数组 finite/nonzero/RGB-range 检查。
-
-有效当前帧上的 `camera_frame_gap` 是软诊断，不单独删除。
-
-### 5.4 连续性和短段
-
-相邻 source index 不是 `+1`，或 timestamp delta 偏离 `grid_dt_s` 超过配置容差时，
-只在两行之间建立边界，不删除两侧有效数据。任意硬无效行也会结束当前 segment。
-
-默认：
-
-```text
-horizon = 16
-min_full_windows = 1
-min_segment_frames = horizon + min_full_windows - 1 = 16
-```
-
-短段不会写出。报告同时保留每段长度和完整训练窗口数。
-
-## 6. 质量解释
-
-技术有效性和任务结果分开：
-
-```text
-technical validity = schema + row gates + continuity + segment admission
-task outcome        = success / failure / unknown
-```
-
-Recorder 的保存成功不等于任务成功。没有人工 annotation 时，输出
-`task_outcome=unknown`，也不生成 `done`。
-
-以下是软指标，不逐行删除数据：
-
-- recorder `tracking_error` p50/p95/p99/max；
-- action step、velocity、acceleration、jerk；
-- idle step ratio；
-- camera age/gap/duplicate；
-- point count 和 valid-depth ratio。
-
-`action[t]-joint_state[t]` 是 command delta，不是 post-action tracking error；idle 也
-可能是稳定抓取阶段。两者均不能作为无任务上下文的自动删帧依据。
-
-## 7. Annotation YAML
-
-可选文件采用源 episode 名作为 key，range 为 source-grid 半开区间：
+正常工作流中，任务失败或不可用 demo 应由操作者删除整个 raw episode。Annotation 仅用于
+显式审计过的 row override、整条排除或兼容旧平铺数据：
 
 ```yaml
 episodes:
-  <source_stem>:
+  episode_20260818_192648:
     include: true
-    task_name: pick_bottle
-    task_outcome: success
-    include_ranges:
-      - [20, 900]
-    exclude_ranges:
-      - [400, 420]
+    task_name: pick_apple_messy
+    include_ranges: [[0, 221]]
+    exclude_ranges: [[40, 42]]
 ```
 
-支持字段只有 `include/task_name/task_outcome/include_ranges/exclude_ranges`；未知字段
-直接报错；布尔值不能写成字符串，range 边界必须是整数且不能超过源帧数。若一个
-标注为成功的源 episode 被切成多段，每个 segment 的
-`task_outcome` 仍为 `unknown`，仅 `source_task_outcome` 保留源级标注，避免把所有
-片段错误标成成功。
+只允许 `include`、`task_name`、`include_ranges`、`exclude_ranges`；未知字段直接拒绝。
+不存在 `task_outcome` 或 `task_success`。Range 使用 source-row 半开区间，所有模态共同
+应用；annotation 删除行造成的 bridge 仍受默认 reject 策略约束。
 
-## 8. HDF5 attributes
+## 8. 最小 Policy Zarr
 
-每个文件至少包含：
+Zarr v2 只包含：
 
 ```text
-schema_name = dexmani-real-simlabel-hdf5
-schema_version = 1
-domain = real
-source_schema_version = 17
-profile
-episode_steps
-dt
-action_dim = 19
-action_space = joint
-obs_alignment = obs[t]_before_action[t]
-source_episode
-source_frame_start
-source_frame_end_exclusive
-task_name
-task_outcome
-processing_config_json
-quality_summary_json
-source_member_sha256_json
+<task>.zarr/
+├── data/<profile datasets>
+└── meta/episode_ends
 ```
 
-所有 datasets 使用 gzip level 4。写后 validator 检查精确 key 集合、shape、dtype、
-首维、压缩、finite、点云颜色/非零帧、K、source range/segment、处理配置、三件套
-SHA-256、schema 版本以及 real-domain/frame 标记。
+明确不包含：
 
-## 9. 验证方式
+```text
+meta/task_success
+dataset_manifest.json
+source episode/file/path/hash
+source groups/segments
+processing_index
+HDF5 provenance
+```
 
-不要把某次 episode 的帧数或质量统计写入格式合同。运行处理命令生成
-`processing_index.json`，以其中的 source decision、segment 范围、质量摘要和
-写后验证结果判断本次输入；需要复现时保存处理配置和源文件哈希。
+root attrs 只保存 dataset-level schema 语义：domain、profile、task name、dt、depth
+scale、camera extrinsic 方向和 tactile unit/frame。一个 processed HDF5 对应一个
+`episode_ends` 条目；所有 data arrays 的首维必须等于最后一个 episode end。
+
+当前 `dexmani_policy` 的 ReplayBuffer/BaseDataset 能直接读取这些 arrays；
+`action_ee` 是 21D；`camera_extrinsic` 的 4×4 shape 可被其 RGB-D 数据路径读取，但
+数值语义始终是 camera-to-xArm-base，不能忽略 root attr 后泛化成任意 Sim world。
+若启用 depth 几何反投影，必须从 Real 数据配置实际 depth scale，而不是使用 Sim
+常见默认值。
+
+`RGBPCDataset` 默认读取 joint/RGB/depth/point-cloud/K/extrinsic；`contact_force`、
+`fingertip_points` 和以 `action_ee` 为 action 需要在训练配置中显式选择。直接可读不代表
+训练配置会自动使用所有导出的键。
+
+## 9. 已核对目标 episode
+
+`episode_20260818_192648` 有 221 个 raw rows。`rgb_pc` 清洗删除 3 个 camera-invalid
+rows 和 6 个 held/IK-fail rows，压紧候选为一个 212-row HDF5。五个新增模态没有增加
+丢帧：tactile 全程 fresh/calibrated，action EE、fingertip 和 depth 完整。
+
+但 row 120→127 跨过 6 个 held rows 后，hand action 最大变化为约 `0.547 rad`，超过
+默认 `0.2 rad` bridge threshold。因此默认 reject；只有人工接受该逻辑时间压缩后才
+应以 `--bridge-policy audit` 发布。

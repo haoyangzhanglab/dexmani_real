@@ -8,7 +8,7 @@
 |---|---|---|
 | 工作约束与任务路由 | [`../AGENTS.md`](../AGENTS.md)、[`../CLAUDE.md`](../CLAUDE.md) | 所有代码修改前 |
 | Real v17 episode | [`dataset/hdf5_episode.md`](dataset/hdf5_episode.md) | writer、reader、replay、数据读取 |
-| Real 清洗输出 | [`dataset/processed_hdf5.md`](dataset/processed_hdf5.md) | 生成训练视图或改质量规则 |
+| Real 清洗输出与 Policy Zarr | [`dataset/processed_hdf5.md`](dataset/processed_hdf5.md) | 生成训练视图、改质量规则或核对 Zarr 合同 |
 | Real → Sim label 边界 | [`dataset/real_to_sim_mapping.md`](dataset/real_to_sim_mapping.md) | 设计字段映射，避免伪造等价关系 |
 | Sim HDF5/Zarr | [`dataset/sim_hdf5_zarr.md`](dataset/sim_hdf5_zarr.md) | 读取或审计 Sim 数据 |
 | Hand retarget | [`hand_retargeting.md`](hand_retargeting.md) | 改输入、求解、整形、缓存或 hand worker |
@@ -20,3 +20,4 @@
 - “当前合同”只写已经实现且有代码路径支持的行为；未来想法放 issue/design note，不放在运行指南中。
 - 带日期、样本数量或外部依赖版本的内容属于审计快照，变更实现后必须重新核对，不能当作永久默认值。
 - 数据格式文档必须说明 shape、dtype、单位、frame、时间语义和缺失值语义；不确定时写 `unknown`，不要猜测。
+- Real 与 Sim 数据按 domain 分开；共享键名只表示各自已声明的语义，不证明 frame、单位或物理来源等价。

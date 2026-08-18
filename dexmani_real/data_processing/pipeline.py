@@ -1,4 +1,4 @@
-"""Transactional batch pipeline from Real schema-v17 episodes to Sim-label HDF5."""
+"""Transactional one-episode-to-one-HDF5 processing for Real schema v17."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -16,30 +17,34 @@ import numpy as np
 import yaml
 
 from dexmani_real.data_processing.cleaning import analyze_episode
-from dexmani_real.data_processing.contracts import EpisodeAnnotation, EpisodeDecision, ProcessingConfig
-from dexmani_real.data_processing.transforms import resize_camera_intrinsic, resize_point_cloud, resize_rgb
+from dexmani_real.data_processing.contracts import (
+    EpisodeAnnotation,
+    EpisodeDecision,
+    ProcessingConfig,
+)
+from dexmani_real.data_processing.transforms import (
+    resize_camera_intrinsic,
+    resize_depth,
+    resize_point_cloud,
+    resize_rgb,
+)
+from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat, rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.episode_schema import EPISODE_SCHEMA_VERSION
 from dexmani_real.recording.transaction import atomic_publish
-from dexmani_real.sensor.pointcloud_processor import PointCloudProcessor, PointCloudProcessorConfig
+from dexmani_real.sensor.pointcloud_processor import (
+    PointCloudProcessor,
+    PointCloudProcessorConfig,
+)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.pointcloud_utils import depth_to_meters, make_rays
 
 logger = get_logger(__name__)
 
-_SCHEMA_NAME = "dexmani-real-simlabel-hdf5"
-_SCHEMA_VERSION = 1
+PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
+PROCESSED_SCHEMA_VERSION = 3
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
-_OMITTED_SIM_LABELS = (
-    "depth",
-    "segmentation",
-    "camera_extrinsic",
-    "contact_force",
-    "fingertip_points",
-    "imagine_point_cloud",
-    "action_ee",
-    "done",
-)
+_VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def _json(value: Any) -> str:
@@ -54,28 +59,185 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_transform(transform: np.ndarray, *, label: str) -> np.ndarray:
+    value = np.asarray(transform, dtype=np.float64).reshape(4, 4)
+    if not np.all(np.isfinite(value)):
+        raise ValueError(f"{label} must be finite")
+    if not np.allclose(value[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8, rtol=0.0):
+        raise ValueError(f"{label} must be homogeneous")
+    rotation = value[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5, rtol=0.0):
+        raise ValueError(f"{label} rotation must be orthonormal")
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5, rtol=0.0):
+        raise ValueError(f"{label} rotation determinant must be +1")
+    return value
+
+
+def _camera_transform_for_index(reader: EpisodeReader, source_index: int) -> np.ndarray:
+    meta = reader.h5f["meta"].attrs
+    camera_type = str(meta.get("camera_type", ""))
+    if camera_type == "eye_to_hand":
+        return _validate_transform(
+            np.asarray(meta["camera_T_world_camera"]),
+            label="camera_T_world_camera",
+        )
+    if camera_type != "eye_in_hand":
+        raise ValueError(f"unsupported camera_type {camera_type!r}")
+    t_eef_camera = _validate_transform(
+        np.asarray(meta["camera_T_eef_camera"]), label="camera_T_eef_camera"
+    )
+    arm_ee = np.asarray(reader.h5f["arm_ee"][source_index], dtype=np.float64)
+    if arm_ee.shape != (9,) or not np.all(np.isfinite(arm_ee)):
+        raise ValueError(f"arm_ee[{source_index}] must be finite (9,)")
+    t_base_eef = np.eye(4, dtype=np.float64)
+    t_base_eef[:3, :3] = quat_wxyz_to_rotmat(rot6d_to_quat_wxyz(arm_ee[3:]))
+    t_base_eef[:3, 3] = arm_ee[:3]
+    return _validate_transform(t_base_eef @ t_eef_camera, label="T_xarm_base_camera")
+
+
+@dataclass
+class _PointCloudDeriver:
+    """Resolved deterministic point-cloud state for one source."""
+
+    reader: EpisodeReader
+    processor_config: PointCloudProcessorConfig
+    rays: np.ndarray
+    depth_scale: float
+    target_point_count: int
+    static_processor: PointCloudProcessor | None
+
+    @classmethod
+    def from_reader(
+        cls, reader: EpisodeReader, config: ProcessingConfig
+    ) -> _PointCloudDeriver:
+        meta = reader.h5f["meta"].attrs
+        source_height = int(meta["camera_encoding_height"])
+        source_width = int(meta["camera_encoding_width"])
+        if source_height <= 0 or source_width <= 0:
+            raise ValueError("camera encoding dimensions must be positive")
+        source_k = np.asarray(meta["camera_K"], dtype=np.float64).reshape(3, 3)
+        if not np.all(np.isfinite(source_k)) or not np.allclose(
+            source_k[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9
+        ):
+            raise ValueError("camera_K must be a finite canonical pinhole matrix")
+        raw_pc_meta = meta.get("camera_pointcloud_config_json", "")
+        if isinstance(raw_pc_meta, bytes):
+            raw_pc_meta = raw_pc_meta.decode("utf-8")
+        try:
+            pc_meta = json.loads(str(raw_pc_meta))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "camera_pointcloud_config_json must be valid JSON"
+            ) from exc
+        if not isinstance(pc_meta, dict):
+            raise ValueError("camera_pointcloud_config_json must encode an object")
+        optional_keys = {"pc_desk_plane", "pc_desk_clearance_m"}
+        required_keys = {
+            f"pc_{item.name}" for item in fields(PointCloudProcessorConfig)
+        } - optional_keys
+        missing_keys = sorted(required_keys - set(pc_meta))
+        if missing_keys:
+            raise ValueError(f"point-cloud metadata missing keys: {missing_keys}")
+        processor_config = PointCloudProcessorConfig.from_meta_dict(pc_meta)
+        depth_scale = float(meta["depth_scale"])
+        if not np.isfinite(depth_scale) or depth_scale <= 0.0:
+            raise ValueError("depth_scale must be finite and positive")
+        static_processor = None
+        if str(meta.get("camera_type", "")) == "eye_to_hand":
+            static_processor = PointCloudProcessor(
+                _camera_transform_for_index(reader, 0), processor_config
+            )
+        return cls(
+            reader=reader,
+            processor_config=processor_config,
+            rays=make_rays(source_height, source_width, source_k).numpy(),
+            depth_scale=depth_scale,
+            target_point_count=config.target_point_count,
+            static_processor=static_processor,
+        )
+
+    def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
+        depth_m = depth_to_meters(
+            np.asarray(self.reader.h5f["depth"][source_index], dtype=np.uint16),
+            depth_scale=self.depth_scale,
+        )
+        processor = self.static_processor or PointCloudProcessor(
+            _camera_transform_for_index(self.reader, source_index),
+            self.processor_config,
+        )
+        cloud = processor.process(depth_m, rgb, self.rays)
+        if cloud is None:
+            return None
+        return resize_point_cloud(
+            cloud,
+            source_point_count=int(processor.last_source_point_count),
+            target_point_count=self.target_point_count,
+        )
+
+
+def _derive_depth_valid_mask(reader: EpisodeReader) -> np.ndarray:
+    depth = reader.h5f["depth"]
+    frame_count = int(reader.h5f["meta"].attrs["num_frames"])
+    if depth.shape[0] != frame_count:
+        raise ValueError("depth length does not match source grid")
+    valid = np.zeros(frame_count, dtype=bool)
+    for index in range(frame_count):
+        frame = np.asarray(depth[index], dtype=np.uint16)
+        valid[index] = frame.ndim == 2 and bool(np.any(frame > 0))
+    return valid
+
+
+def _derive_pointcloud_valid_mask(
+    reader: EpisodeReader, config: ProcessingConfig
+) -> np.ndarray:
+    frame_count = int(reader.h5f["meta"].attrs["num_frames"])
+    valid = np.zeros(frame_count, dtype=bool)
+    deriver = _PointCloudDeriver.from_reader(reader, config)
+    decoded_count = 0
+    logged_value_error = False
+    for source_index, rgb in enumerate(reader.iter_camera_frames("rgb")):
+        if source_index >= frame_count:
+            raise ValueError("decoded RGB frame count exceeds source grid")
+        decoded_count += 1
+        try:
+            valid[source_index] = deriver.derive(source_index, rgb) is not None
+        except ValueError:
+            if not logged_value_error:
+                logger.warning(
+                    "point-cloud preflight rejected malformed frame %d in %s",
+                    source_index,
+                    reader.h5_path,
+                    exc_info=True,
+                )
+                logged_value_error = True
+    if decoded_count != frame_count:
+        raise ValueError(
+            f"decoded RGB frame count {decoded_count} != source grid {frame_count}"
+        )
+    return valid
+
+
 def _parse_ranges(value: Any, *, label: str) -> tuple[tuple[int, int], ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
         raise ValueError(f"{label} must be a list of [start, end] ranges")
-    ranges: list[tuple[int, int]] = []
+    result: list[tuple[int, int]] = []
     for item in value:
         if not isinstance(item, (list, tuple)) or len(item) != 2:
             raise ValueError(f"{label} entries must be [start, end]")
         if any(not isinstance(bound, int) or isinstance(bound, bool) for bound in item):
             raise ValueError(f"{label} bounds must be integers")
-        ranges.append((item[0], item[1]))
-    return tuple(ranges)
+        result.append((item[0], item[1]))
+    return tuple(result)
 
 
 def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
-    """Load strict optional per-episode annotations from YAML."""
+    """Load explicit row/task overrides; outcome labels are not accepted."""
 
     if path is None:
         return {}
-    annotation_path = Path(path)
-    with annotation_path.open("r", encoding="utf-8") as stream:
+    with Path(path).open("r", encoding="utf-8") as stream:
         payload = yaml.safe_load(stream) or {}
     if not isinstance(payload, dict):
         raise ValueError("annotation YAML root must be a mapping")
@@ -83,68 +245,62 @@ def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
     if not isinstance(raw_episodes, dict):
         raise ValueError("annotation episodes must be a mapping")
     result: dict[str, EpisodeAnnotation] = {}
-    allowed = {
-        "include",
-        "task_name",
-        "task_outcome",
-        "include_ranges",
-        "exclude_ranges",
-    }
+    allowed = {"include", "task_name", "include_ranges", "exclude_ranges"}
     for episode_name, raw in raw_episodes.items():
         if not isinstance(episode_name, str) or not episode_name:
             raise ValueError("annotation episode names must be non-empty strings")
-        if raw is None:
-            raw = {}
+        raw = {} if raw is None else raw
         if not isinstance(raw, dict):
             raise ValueError(f"annotation for {episode_name} must be a mapping")
         unknown = set(raw) - allowed
         if unknown:
-            raise ValueError(f"annotation for {episode_name} has unknown keys: {sorted(unknown)}")
+            raise ValueError(
+                f"annotation for {episode_name} has unknown keys: {sorted(unknown)}"
+            )
         include = raw.get("include", True)
-        if not isinstance(include, bool):
-            raise ValueError(f"{episode_name}.include must be a boolean")
         task_name = raw.get("task_name")
+        if not isinstance(include, bool):
+            raise ValueError(f"{episode_name}.include must be boolean")
         if task_name is not None and not isinstance(task_name, str):
-            raise ValueError(f"{episode_name}.task_name must be a string or null")
-        task_outcome = raw.get("task_outcome", "unknown")
-        if not isinstance(task_outcome, str):
-            raise ValueError(f"{episode_name}.task_outcome must be a string")
+            raise ValueError(f"{episode_name}.task_name must be string or null")
         result[episode_name] = EpisodeAnnotation(
             include=include,
             task_name=task_name,
-            task_outcome=task_outcome,
-            include_ranges=_parse_ranges(raw.get("include_ranges"), label=f"{episode_name}.include_ranges"),
-            exclude_ranges=_parse_ranges(raw.get("exclude_ranges"), label=f"{episode_name}.exclude_ranges"),
+            include_ranges=_parse_ranges(
+                raw.get("include_ranges"), label=f"{episode_name}.include_ranges"
+            ),
+            exclude_ranges=_parse_ranges(
+                raw.get("exclude_ranges"), label=f"{episode_name}.exclude_ranges"
+            ),
         )
     return result
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
-    """Return sorted visible direct child directories for explicit auditing."""
-
     root = Path(input_root)
     if not root.is_dir():
         raise NotADirectoryError(root)
-    episodes = tuple(sorted(child for child in root.iterdir() if child.is_dir() and not child.name.startswith(".")))
+    episodes = tuple(
+        sorted(
+            child
+            for child in root.iterdir()
+            if child.is_dir() and not child.name.startswith(".")
+        )
+    )
     if not episodes:
         raise FileNotFoundError(f"no episode directories found in {root}")
     return episodes
 
 
-def _output_name(source_name: str, segment_index: int, segment_count: int) -> str:
-    if segment_count == 1:
-        return f"{source_name}.h5"
-    return f"{source_name}__seg{segment_index:03d}.h5"
-
-
 @contextmanager
 def _open_episode(path: Path) -> Iterator[EpisodeReader]:
-    """Open one published schema-v17 episode directory."""
     with EpisodeReader(path) as reader:
         yield reader
 
 
-def _dataset_kwargs(config: ProcessingConfig, *, chunks: tuple[int, ...]) -> dict[str, Any]:
+def _dataset_kwargs(
+    config: ProcessingConfig, *, chunks: tuple[int, ...]
+) -> dict[str, Any]:
     return {
         "compression": "gzip",
         "compression_opts": config.gzip_level,
@@ -152,149 +308,199 @@ def _dataset_kwargs(config: ProcessingConfig, *, chunks: tuple[int, ...]) -> dic
     }
 
 
-def _write_common_attrs(
+def _create_data_datasets(
+    output: h5py.File, length: int, config: ProcessingConfig
+) -> None:
+    numeric_chunk = min(length, 256)
+    specs: dict[str, tuple[tuple[int, ...], Any, tuple[int, ...]]] = {
+        "joint_state": ((length, 19), np.float32, (numeric_chunk, 19)),
+        "action": ((length, 19), np.float32, (numeric_chunk, 19)),
+        "action_ee": ((length, 21), np.float32, (numeric_chunk, 21)),
+        "contact_force": ((length, 5, 3), np.float32, (numeric_chunk, 5, 3)),
+        "fingertip_points": ((length, 5, 3), np.float32, (numeric_chunk, 5, 3)),
+    }
+    if config.profile.needs_rgb:
+        specs.update(
+            {
+                "rgb": (
+                    (length, config.target_rgb_height, config.target_rgb_width, 3),
+                    np.uint8,
+                    (1, config.target_rgb_height, config.target_rgb_width, 3),
+                ),
+                "depth": (
+                    (length, config.target_rgb_height, config.target_rgb_width),
+                    np.uint16,
+                    (1, config.target_rgb_height, config.target_rgb_width),
+                ),
+                "camera_intrinsic": ((length, 9), np.float32, (numeric_chunk, 9)),
+                "camera_extrinsic": (
+                    (length, 4, 4),
+                    np.float32,
+                    (numeric_chunk, 4, 4),
+                ),
+            }
+        )
+    if config.profile.needs_pointcloud:
+        specs["point_cloud"] = (
+            (length, config.target_point_count, 6),
+            np.float32,
+            (1, config.target_point_count, 6),
+        )
+    for name in config.profile.dataset_keys:
+        shape, dtype, chunks = specs[name]
+        output.create_dataset(
+            name,
+            shape=shape,
+            dtype=dtype,
+            **_dataset_kwargs(config, chunks=chunks),
+        )
+
+
+def _write_attrs(
     output: h5py.File,
-    *,
     reader: EpisodeReader,
     decision: EpisodeDecision,
-    segment_index: int,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation,
-    source_hashes: dict[str, str],
 ) -> None:
-    segment = decision.segments[segment_index]
-    meta = {key: reader.h5f["meta"].attrs[key] for key in reader.h5f["meta"].attrs}
-    source_task = str(meta.get("task_label", "")).strip()
-    task_name = annotation.task_name or source_task or "unknown"
-    segment_task_outcome = annotation.task_outcome if len(decision.segments) == 1 else "unknown"
-    output.attrs["schema_name"] = _SCHEMA_NAME
-    output.attrs["schema_version"] = _SCHEMA_VERSION
-    output.attrs["domain"] = "real"
-    output.attrs["source_format"] = "dexmani_v17"
-    output.attrs["source_schema_version"] = EPISODE_SCHEMA_VERSION
-    output.attrs["profile"] = config.profile.value
-    output.attrs["episode_steps"] = segment.length
-    output.attrs["dt"] = float(reader.timing.grid_dt_s)
-    output.attrs["action_dim"] = 19
-    output.attrs["action_space"] = "joint"
-    output.attrs["obs_alignment"] = "obs[t]_before_action[t]"
-    output.attrs["observation_boundary"] = "real_causal_sources_at_control_grid_anchor"
-    output.attrs["arm_action_boundary"] = "forwarded_to_worker_not_hardware_ack"
-    output.attrs["hand_action_boundary"] = "queued_target_without_ack"
-    output.attrs["source_episode"] = reader.h5_path.name
-    output.attrs["source_frame_start"] = segment.start
-    output.attrs["source_frame_end_exclusive"] = segment.end
-    output.attrs["source_segment_index"] = segment_index
-    output.attrs["source_segment_count"] = len(decision.segments)
-    output.attrs["task_name"] = task_name
-    output.attrs["task_outcome"] = segment_task_outcome
-    output.attrs["source_task_outcome"] = annotation.task_outcome
-    output.attrs["point_cloud_frame"] = "xarm_base" if config.profile.needs_pointcloud else "omitted"
-    output.attrs["frame_compatibility_with_sim_world"] = False
-    output.attrs["processing_config_json"] = _json(config.to_dict())
-    output.attrs["quality_summary_json"] = _json(segment.quality)
-    output.attrs["source_decision_json"] = _json(
+    meta = reader.h5f["meta"].attrs
+    task_name = (
+        annotation.task_name or str(meta.get("task_label", "")).strip() or "unknown"
+    )
+    output.attrs.update(
         {
-            "hard_reason_counts": decision.hard_reason_counts,
-            "boundary_counts": decision.boundary_counts,
-            "warnings": list(decision.warnings),
+            "schema_name": PROCESSED_SCHEMA_NAME,
+            "schema_version": PROCESSED_SCHEMA_VERSION,
+            "domain": "real",
+            "source_format": "dexmani_v17",
+            "source_schema_version": EPISODE_SCHEMA_VERSION,
+            "source_episode": reader.h5_path.name,
+            "source_frames": decision.source_frames,
+            "profile": config.profile.value,
+            "episode_steps": decision.selected_frames,
+            "dt": float(reader.timing.grid_dt_s),
+            "time_semantics": "logical_control_grid_after_row_compaction",
+            "action_dim": 19,
+            "action_ee_dim": 21,
+            "action_space": "joint",
+            "obs_alignment": "obs[t]_before_action[t]",
+            "task_name": task_name,
+            "point_cloud_frame": (
+                "xarm_base" if config.profile.needs_pointcloud else "omitted"
+            ),
+            "fingertip_points_frame": "xarm_base",
+            "fingertip_points_unit": "m",
+            "action_ee_frame": "xarm_base",
+            "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
+            "contact_force_source": "schema_v17.hand_contact",
+            "contact_force_unit": str(
+                meta.get("tactile_unit", "sdk_scaled_unknown_si")
+            ),
+            "contact_force_si_verified": bool(
+                meta.get("tactile_si_unit_verified", False)
+            ),
+            "contact_force_frame": "xhand_sensor_native_axes_per_finger",
+            "frame_compatibility_with_sim_world": False,
+            "processing_config_json": _json(config.to_dict()),
+            "quality_summary_json": _json(decision.quality),
+            "source_decision_json": _json(decision.to_dict()),
+            "source_member_sha256_json": _json(
+                {
+                    member: _sha256_file(reader.h5_path / member)
+                    for member in _SOURCE_MEMBERS
+                }
+            ),
+            "source_resolved_config_sha256": str(
+                meta.get("resolved_config_sha256", "unknown")
+            ),
         }
     )
-    output.attrs["source_member_sha256_json"] = _json(source_hashes)
-    output.attrs["source_resolved_config_sha256"] = str(meta.get("resolved_config_sha256", "unknown"))
-    output.attrs["omitted_sim_labels_json"] = _json(_OMITTED_SIM_LABELS)
     if config.profile.needs_rgb:
-        output.attrs["rgb_transform"] = "resize_no_crop"
-        output.attrs["rgb_interpolation"] = "INTER_AREA_down_INTER_LINEAR_up"
+        output.attrs.update(
+            {
+                "rgb_transform": "resize_no_crop",
+                "depth_transform": "resize_no_crop_nearest",
+                "depth_unit": "sensor_unit",
+                "depth_scale_m_per_unit": float(meta["depth_scale"]),
+                "depth_invalid_value": 0,
+                "camera_extrinsic_semantics": "T_xarm_base_camera;camera_optical_to_xarm_base",
+            }
+        )
     if config.profile.needs_pointcloud:
-        output.attrs["point_cloud_transform"] = "source_unique_prefix_then_deterministic_fps_or_cyclic_pad"
+        output.attrs["point_cloud_transform"] = (
+            "real_rgbd_to_xarm_base_then_deterministic_fps_or_cyclic_pad"
+        )
 
 
-def _create_output_files(
+def _write_processed_episode(
     reader: EpisodeReader,
     decision: EpisodeDecision,
     output_root: Path,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation,
-) -> list[tuple[Path, h5py.File]]:
-    source_hashes = {member: _sha256_file(reader.h5_path / member) for member in _SOURCE_MEMBERS}
-    outputs: list[tuple[Path, h5py.File]] = []
-    try:
-        for segment_index, segment in enumerate(decision.segments):
-            path = output_root / _output_name(reader.h5_path.name, segment_index, len(decision.segments))
-            output = h5py.File(path, "w")
-            try:
-                _write_common_attrs(
-                    output,
-                    reader=reader,
-                    decision=decision,
-                    segment_index=segment_index,
-                    config=config,
-                    annotation=annotation,
-                    source_hashes=source_hashes,
-                )
-                length = segment.length
-                numeric_chunk = (min(length, 256),)
-                output.create_dataset(
-                    "joint_state",
-                    shape=(length, 19),
-                    dtype=np.float32,
-                    **_dataset_kwargs(config, chunks=(*numeric_chunk, 19)),
-                )
-                output.create_dataset(
-                    "action",
-                    shape=(length, 19),
-                    dtype=np.float32,
-                    **_dataset_kwargs(config, chunks=(*numeric_chunk, 19)),
-                )
-                if config.profile.needs_rgb:
-                    output.create_dataset(
-                        "rgb",
-                        shape=(length, config.target_rgb_height, config.target_rgb_width, 3),
-                        dtype=np.uint8,
-                        **_dataset_kwargs(
-                            config,
-                            chunks=(1, config.target_rgb_height, config.target_rgb_width, 3),
-                        ),
-                    )
-                    output.create_dataset(
-                        "camera_intrinsic",
-                        shape=(length, 9),
-                        dtype=np.float32,
-                        **_dataset_kwargs(config, chunks=(*numeric_chunk, 9)),
-                    )
-                if config.profile.needs_pointcloud:
-                    output.create_dataset(
-                        "point_cloud",
-                        shape=(length, config.target_point_count, 6),
-                        dtype=np.float32,
-                        **_dataset_kwargs(config, chunks=(1, config.target_point_count, 6)),
-                    )
-            except BaseException:
-                output.close()
-                raise
-            outputs.append((path, output))
-    except BaseException:
-        for _, output in outputs:
-            output.close()
-        raise
-    return outputs
+) -> dict[str, Any]:
+    path = output_root / f"{reader.h5_path.name}.h5"
+    selected = decision.selected_indices
+    with h5py.File(path, "w") as output:
+        _write_attrs(output, reader, decision, config, annotation)
+        _create_data_datasets(output, decision.selected_frames, config)
+        arm_state = np.asarray(reader.h5f["arm_qpos"][selected], dtype=np.float32)
+        hand_state = np.asarray(reader.h5f["hand_qpos"][selected], dtype=np.float32)
+        arm_action = np.asarray(
+            reader.h5f["action_arm_joint_sent"][selected], dtype=np.float32
+        )
+        hand_action = np.asarray(
+            reader.h5f["action_hand_joint"][selected], dtype=np.float32
+        )
+        arm_action_ee = np.asarray(
+            reader.h5f["action_arm_ee"][selected], dtype=np.float32
+        )
+        output["joint_state"][:] = np.concatenate((arm_state, hand_state), axis=1)
+        output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
+        output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
+        output["contact_force"][:] = np.asarray(
+            reader.h5f["hand_contact"][selected], dtype=np.float32
+        )
+        output["fingertip_points"][:] = np.asarray(
+            reader.h5f["hand_fingertip"][selected], dtype=np.float32
+        )
 
+        provenance = output.create_group("provenance")
+        provenance.attrs["drop_reason_bit_names_json"] = _json(
+            {str(bit): name for bit, name in enumerate(decision.drop_reason_names)}
+        )
+        provenance.create_dataset(
+            "source_row_index",
+            data=selected,
+            **_dataset_kwargs(config, chunks=(min(len(selected), 256),)),
+        )
+        provenance.create_dataset(
+            "source_sample_index",
+            data=np.asarray(
+                reader.h5f["source_sample_index"][selected], dtype=np.int64
+            ),
+            **_dataset_kwargs(config, chunks=(min(len(selected), 256),)),
+        )
+        provenance.create_dataset(
+            "source_timestamp_s",
+            data=np.asarray(reader.h5f["timestamp"][selected], dtype=np.float64),
+            **_dataset_kwargs(config, chunks=(min(len(selected), 256),)),
+        )
+        provenance.create_dataset(
+            "source_keep_mask",
+            data=decision.keep_mask,
+            **_dataset_kwargs(config, chunks=(min(decision.source_frames, 256),)),
+        )
+        provenance.create_dataset(
+            "source_drop_reason_bits",
+            data=decision.drop_reason_bits,
+            **_dataset_kwargs(config, chunks=(min(decision.source_frames, 256),)),
+        )
 
-def _write_episode_segments(
-    reader: EpisodeReader,
-    decision: EpisodeDecision,
-    output_root: Path,
-    config: ProcessingConfig,
-    annotation: EpisodeAnnotation,
-) -> list[dict[str, Any]]:
-    outputs = _create_output_files(reader, decision, output_root, config, annotation)
-    try:
-        meta = reader.h5f["meta"].attrs
-        source_height = int(meta["camera_encoding_height"])
-        source_width = int(meta["camera_encoding_width"])
-        camera_k = None
         if config.profile.needs_rgb:
+            meta = reader.h5f["meta"].attrs
+            source_height = int(meta["camera_encoding_height"])
+            source_width = int(meta["camera_encoding_width"])
             camera_k = resize_camera_intrinsic(
                 np.asarray(meta["camera_K"]),
                 source_height=source_height,
@@ -302,192 +508,174 @@ def _write_episode_segments(
                 target_height=config.target_rgb_height,
                 target_width=config.target_rgb_width,
             )
-
-        # Derive point clouds; v17 stores depth, not point clouds.
-        # Reconstruct the exact processor used at recording time from the
-        # persisted pc_* metadata, then deproject the recorded depth with the
-        # same intrinsics/extrinsics/desk plane.  The processor is fully
-        # deterministic (no RNG), so training and deployment derive an
-        # identical cloud from the same depth.
-        pointcloud_processor: PointCloudProcessor | None = None
-        pointcloud_rays: np.ndarray | None = None
-        depth_scale: float = 0.0
-        if config.profile.needs_pointcloud:
-            source_k = np.asarray(meta["camera_K"], dtype=np.float64).reshape(3, 3)
-            t_world_camera = np.asarray(meta["camera_T_world_camera"], dtype=np.float64).reshape(4, 4)
-            pc_meta = json.loads(str(meta.get("camera_pointcloud_config_json", "{}")) or "{}")
-            pointcloud_processor = PointCloudProcessor(
-                t_world_camera,
-                PointCloudProcessorConfig.from_meta_dict(pc_meta),
-            )
-            pointcloud_rays = make_rays(source_height, source_width, source_k).numpy()
-            depth_scale = float(meta["depth_scale"])
-
-        for segment_index, (_, output) in enumerate(outputs):
-            segment = decision.segments[segment_index]
-            arm_state = np.asarray(reader.h5f["arm_qpos"][segment.start : segment.end], dtype=np.float32)
-            hand_state = np.asarray(reader.h5f["hand_qpos"][segment.start : segment.end], dtype=np.float32)
-            arm_action = np.asarray(
-                reader.h5f["action_arm_joint_sent"][segment.start : segment.end],
-                dtype=np.float32,
-            )
-            hand_action = np.asarray(
-                reader.h5f["action_hand_joint"][segment.start : segment.end],
-                dtype=np.float32,
-            )
-            output["joint_state"][:] = np.concatenate((arm_state, hand_state), axis=1)
-            output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
-            if camera_k is not None:
-                output["camera_intrinsic"][:] = camera_k[None, :]
-
-            if config.profile.needs_pointcloud:
-                assert pointcloud_processor is not None
-                assert pointcloud_rays is not None
-                for target_index, source_index in enumerate(range(segment.start, segment.end)):
-                    depth_m = depth_to_meters(
-                        np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16),
-                        depth_scale=depth_scale,
-                    )
-                    rgb = reader.read_camera_frame("rgb", source_index)
-                    cloud = pointcloud_processor.process(depth_m, rgb, pointcloud_rays)
-                    if cloud is None:
-                        raise ValueError(f"{reader.h5_path.name}: derived point cloud empty at frame {source_index}")
-                    output["point_cloud"][target_index] = resize_point_cloud(
-                        cloud,
-                        source_point_count=int(pointcloud_processor.last_source_point_count),
-                        target_point_count=config.target_point_count,
-                    )
-
-        if config.profile.needs_rgb:
-            segment_index = 0
-            decoded_count = 0
-            written_counts = [0] * len(decision.segments)
-            for source_index, frame in enumerate(reader.iter_camera_frames("rgb")):
-                decoded_count += 1
-                while segment_index < len(decision.segments) and source_index >= decision.segments[segment_index].end:
-                    segment_index += 1
-                if segment_index >= len(decision.segments):
-                    continue
-                segment = decision.segments[segment_index]
-                if source_index < segment.start:
-                    continue
-                outputs[segment_index][1]["rgb"][source_index - segment.start] = resize_rgb(
-                    frame,
+            output["camera_intrinsic"][:] = camera_k[None, :]
+            output["camera_extrinsic"][:] = np.stack(
+                [_camera_transform_for_index(reader, int(index)) for index in selected]
+            ).astype(np.float32)
+            for target_index, source_index in enumerate(selected):
+                depth = np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16)
+                output["depth"][target_index] = resize_depth(
+                    depth,
                     height=config.target_rgb_height,
                     width=config.target_rgb_width,
                 )
-                written_counts[segment_index] += 1
-            if decoded_count != decision.source_frames:
+
+        pointcloud_deriver = (
+            _PointCloudDeriver.from_reader(reader, config)
+            if config.profile.needs_pointcloud
+            else None
+        )
+        if config.profile.needs_rgb or config.profile.needs_pointcloud:
+            target_by_source = {
+                int(source_index): target_index
+                for target_index, source_index in enumerate(selected)
+            }
+            decoded_count = 0
+            written_count = 0
+            for source_index, frame in enumerate(reader.iter_camera_frames("rgb")):
+                decoded_count += 1
+                target_row = target_by_source.get(source_index)
+                if target_row is None:
+                    continue
+                if config.profile.needs_rgb:
+                    output["rgb"][target_row] = resize_rgb(
+                        frame,
+                        height=config.target_rgb_height,
+                        width=config.target_rgb_width,
+                    )
+                if pointcloud_deriver is not None:
+                    cloud = pointcloud_deriver.derive(source_index, frame)
+                    if cloud is None:
+                        raise ValueError(
+                            f"derived point cloud empty at source row {source_index}"
+                        )
+                    output["point_cloud"][target_row] = cloud
+                written_count += 1
+            if decoded_count != decision.source_frames or written_count != len(
+                selected
+            ):
                 raise ValueError(
-                    f"decoded RGB frame count {decoded_count} does not match source grid {decision.source_frames}"
+                    f"RGB alignment mismatch decoded={decoded_count}, written={written_count}, "
+                    f"source={decision.source_frames}, selected={len(selected)}"
                 )
-            expected_counts = [segment.length for segment in decision.segments]
-            if written_counts != expected_counts:
-                raise ValueError(f"written RGB counts {written_counts} do not match segments {expected_counts}")
-
-        result: list[dict[str, Any]] = []
-        for segment_index, (path, output) in enumerate(outputs):
-            output.flush()
-            segment = decision.segments[segment_index]
-            result.append(
-                {
-                    "path": path.name,
-                    "source_episode": reader.h5_path.name,
-                    "source_frame_start": segment.start,
-                    "source_frame_end_exclusive": segment.end,
-                    "frames": segment.length,
-                    "full_window_count": segment.full_window_count,
-                }
-            )
-        return result
-    finally:
-        for _, output in outputs:
-            output.close()
+        output.flush()
+    return {
+        "path": path.name,
+        "source_episode": reader.h5_path.name,
+        "source_frames": decision.source_frames,
+        "frames": decision.selected_frames,
+        "dropped_frames": decision.source_frames - decision.selected_frames,
+        "full_window_count": decision.quality["full_window_count"],
+    }
 
 
-def validate_processed_hdf5(path: str | Path, config: ProcessingConfig) -> dict[str, Any]:
-    """Fail closed on a written Sim-label HDF5 artifact."""
+def _dataset_row_slices(dataset: h5py.Dataset) -> Iterator[slice]:
+    row_bytes = int(dataset.dtype.itemsize * np.prod(dataset.shape[1:], dtype=np.int64))
+    rows_per_chunk = max(1, _VALIDATION_CHUNK_BYTES // max(1, row_bytes))
+    for start in range(0, dataset.shape[0], rows_per_chunk):
+        yield slice(start, min(dataset.shape[0], start + rows_per_chunk))
+
+
+def _expected_specs(
+    length: int, config: ProcessingConfig
+) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
+    specs: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
+        "joint_state": ((length, 19), np.dtype(np.float32)),
+        "action": ((length, 19), np.dtype(np.float32)),
+        "action_ee": ((length, 21), np.dtype(np.float32)),
+        "contact_force": ((length, 5, 3), np.dtype(np.float32)),
+        "fingertip_points": ((length, 5, 3), np.dtype(np.float32)),
+    }
+    if config.profile.needs_rgb:
+        specs.update(
+            {
+                "rgb": (
+                    (length, config.target_rgb_height, config.target_rgb_width, 3),
+                    np.dtype(np.uint8),
+                ),
+                "depth": (
+                    (length, config.target_rgb_height, config.target_rgb_width),
+                    np.dtype(np.uint16),
+                ),
+                "camera_intrinsic": ((length, 9), np.dtype(np.float32)),
+                "camera_extrinsic": ((length, 4, 4), np.dtype(np.float32)),
+            }
+        )
+    if config.profile.needs_pointcloud:
+        specs["point_cloud"] = (
+            (length, config.target_point_count, 6),
+            np.dtype(np.float32),
+        )
+    return specs
+
+
+def validate_processed_hdf5(
+    path: str | Path, config: ProcessingConfig
+) -> dict[str, Any]:
+    """Fail closed on a processed Real HDF5 v3 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
-        top_level = tuple(sorted(source.keys()))
-        expected = tuple(sorted(config.profile.dataset_keys))
-        if top_level != expected:
-            raise ValueError(f"{artifact.name}: top-level keys {top_level} do not match {expected}")
+        expected_top = set(config.profile.dataset_keys) | {"provenance"}
+        if set(source.keys()) != expected_top:
+            raise ValueError(f"{artifact.name}: top-level keys do not match v3 profile")
         length = int(source.attrs.get("episode_steps", -1))
-        if length < config.min_segment_frames:
-            raise ValueError(f"{artifact.name}: episode_steps={length} is below {config.min_segment_frames}")
-        for key in expected:
+        if length < config.min_episode_frames:
+            raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
+        specs = _expected_specs(length, config)
+        for key, (shape, dtype) in specs.items():
             dataset = source[key]
-            if not isinstance(dataset, h5py.Dataset) or dataset.shape[0] != length:
-                raise ValueError(f"{artifact.name}: {key} is not an aligned dataset")
-            if dataset.compression != "gzip" or int(dataset.compression_opts) != config.gzip_level:
-                raise ValueError(f"{artifact.name}: {key} compression does not match gzip-{config.gzip_level}")
-        expected_shapes: dict[str, tuple[int, ...]] = {
-            "joint_state": (length, 19),
-            "action": (length, 19),
-        }
-        expected_dtypes: dict[str, np.dtype[Any]] = {
-            "joint_state": np.dtype(np.float32),
-            "action": np.dtype(np.float32),
-        }
+            if (
+                not isinstance(dataset, h5py.Dataset)
+                or dataset.shape != shape
+                or dataset.dtype != dtype
+            ):
+                raise ValueError(f"{artifact.name}: invalid {key} shape/dtype")
+            if (
+                dataset.compression != "gzip"
+                or int(dataset.compression_opts) != config.gzip_level
+            ):
+                raise ValueError(f"{artifact.name}: invalid {key} compression")
+            if np.issubdtype(dtype, np.floating):
+                for row_slice in _dataset_row_slices(dataset):
+                    if not np.all(np.isfinite(dataset[row_slice])):
+                        raise ValueError(f"{artifact.name}: {key} contains NaN/Inf")
         if config.profile.needs_rgb:
-            expected_shapes.update(
-                {
-                    "rgb": (
-                        length,
-                        config.target_rgb_height,
-                        config.target_rgb_width,
-                        3,
-                    ),
-                    "camera_intrinsic": (length, 9),
-                }
-            )
-            expected_dtypes.update({"rgb": np.dtype(np.uint8), "camera_intrinsic": np.dtype(np.float32)})
+            for row_slice in _dataset_row_slices(source["depth"]):
+                depth = np.asarray(source["depth"][row_slice], dtype=np.uint16)
+                if np.any(~np.any(depth > 0, axis=(1, 2))):
+                    raise ValueError(
+                        f"{artifact.name}: depth contains an all-invalid frame"
+                    )
+            k = np.asarray(source["camera_intrinsic"][:], dtype=np.float32)
+            if np.any(k[:, (0, 4)] <= 0.0) or not np.allclose(k[:, 8], 1.0):
+                raise ValueError(f"{artifact.name}: invalid camera_intrinsic")
+            for transform in source["camera_extrinsic"]:
+                _validate_transform(transform, label="camera_extrinsic")
+            scale = float(source.attrs.get("depth_scale_m_per_unit", np.nan))
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError(f"{artifact.name}: invalid depth scale")
         if config.profile.needs_pointcloud:
-            expected_shapes["point_cloud"] = (length, config.target_point_count, 6)
-            expected_dtypes["point_cloud"] = np.dtype(np.float32)
-        for key in expected:
-            if source[key].shape != expected_shapes[key] or source[key].dtype != expected_dtypes[key]:
-                raise ValueError(
-                    f"{artifact.name}: {key} got {source[key].shape}/{source[key].dtype}, "
-                    f"expected {expected_shapes[key]}/{expected_dtypes[key]}"
-                )
-            if np.issubdtype(source[key].dtype, np.floating) and not np.all(np.isfinite(source[key][:])):
-                raise ValueError(f"{artifact.name}: {key} contains non-finite values")
-        if config.profile.needs_pointcloud:
-            cloud = np.asarray(source["point_cloud"][:], dtype=np.float32)
-            if np.any(cloud[:, :, 3:] < 0.0) or np.any(cloud[:, :, 3:] > 1.0):
-                raise ValueError(f"{artifact.name}: point_cloud RGB is outside [0,1]")
-            if np.any(~np.any(np.linalg.norm(cloud[:, :, :3], axis=2) > 0.0, axis=1)):
-                raise ValueError(f"{artifact.name}: point_cloud contains an all-zero frame")
-        if str(source.attrs.get("schema_name", "")) != _SCHEMA_NAME:
+            for row_slice in _dataset_row_slices(source["point_cloud"]):
+                cloud = np.asarray(source["point_cloud"][row_slice], dtype=np.float32)
+                if np.any(cloud[..., 3:] < 0.0) or np.any(cloud[..., 3:] > 1.0):
+                    raise ValueError(f"{artifact.name}: point-cloud RGB outside [0,1]")
+                if np.any(
+                    ~np.any(np.linalg.norm(cloud[..., :3], axis=2) > 0.0, axis=1)
+                ):
+                    raise ValueError(f"{artifact.name}: all-zero point-cloud frame")
+        if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{artifact.name}: invalid schema_name")
-        if int(source.attrs.get("schema_version", -1)) != _SCHEMA_VERSION:
+        if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
             raise ValueError(f"{artifact.name}: invalid schema_version")
         if str(source.attrs.get("domain", "")) != "real":
-            raise ValueError(f"{artifact.name}: domain must remain real")
-        source_format = str(source.attrs.get("source_format", ""))
-        if source_format != "dexmani_v17":
-            raise ValueError(f"{artifact.name}: unsupported source_format {source_format!r}")
-        if int(source.attrs.get("source_schema_version", -1)) != EPISODE_SCHEMA_VERSION:
-            raise ValueError(f"{artifact.name}: invalid source_schema_version")
+            raise ValueError(f"{artifact.name}: domain must be real")
         if str(source.attrs.get("profile", "")) != config.profile.value:
-            raise ValueError(f"{artifact.name}: profile does not match validation config")
-        if int(source.attrs.get("action_dim", -1)) != 19 or str(source.attrs.get("action_space", "")) != "joint":
-            raise ValueError(f"{artifact.name}: invalid joint action contract")
-        dt = float(source.attrs.get("dt", np.nan))
-        source_start = int(source.attrs.get("source_frame_start", -1))
-        source_end = int(source.attrs.get("source_frame_end_exclusive", -1))
-        if not np.isfinite(dt) or dt <= 0.0 or source_start < 0 or source_end - source_start != length:
-            raise ValueError(f"{artifact.name}: invalid time or source-range provenance")
-        source_segment_index = int(source.attrs.get("source_segment_index", -1))
-        source_segment_count = int(source.attrs.get("source_segment_count", -1))
-        if not 0 <= source_segment_index < source_segment_count:
-            raise ValueError(f"{artifact.name}: invalid source segment provenance")
-        if not str(source.attrs.get("source_episode", "")).strip():
-            raise ValueError(f"{artifact.name}: source_episode is missing")
-        parsed_attrs: dict[str, Any] = {}
+            raise ValueError(f"{artifact.name}: profile mismatch")
+        if str(source.attrs.get("task_name", "")).strip() in {"", "unknown"}:
+            raise ValueError(f"{artifact.name}: explicit task_name required")
+        if str(source.attrs.get("obs_alignment", "")) != "obs[t]_before_action[t]":
+            raise ValueError(f"{artifact.name}: invalid observation/action alignment")
         for key in (
             "processing_config_json",
             "quality_summary_json",
@@ -495,37 +683,88 @@ def validate_processed_hdf5(path: str | Path, config: ProcessingConfig) -> dict[
             "source_member_sha256_json",
         ):
             try:
-                parsed = json.loads(str(source.attrs[key]))
+                value = json.loads(str(source.attrs[key]))
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise ValueError(f"{artifact.name}: invalid {key}") from exc
-            if not isinstance(parsed, dict):
-                raise ValueError(f"{artifact.name}: {key} must encode a JSON object")
-            parsed_attrs[key] = parsed
-        if parsed_attrs["processing_config_json"] != config.to_dict():
-            raise ValueError(f"{artifact.name}: processing_config_json does not match validation config")
-        source_hashes = parsed_attrs["source_member_sha256_json"]
-        expected_members = _SOURCE_MEMBERS
-        if set(source_hashes) != set(expected_members) or any(
-            not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
-            for value in source_hashes.values()
-        ):
-            raise ValueError(f"{artifact.name}: invalid source member hashes")
-        if config.profile.needs_rgb:
-            intrinsic = np.asarray(source["camera_intrinsic"][:], dtype=np.float32)
-            if np.any(intrinsic[:, (0, 4)] <= 0.0) or not np.allclose(intrinsic[:, 8], 1.0):
-                raise ValueError(f"{artifact.name}: invalid camera intrinsic")
-            if not np.allclose(intrinsic, intrinsic[0], rtol=0.0, atol=0.0):
-                raise ValueError(f"{artifact.name}: camera intrinsic changes within a segment")
-        if config.profile.needs_pointcloud:
-            if str(source.attrs.get("point_cloud_frame", "")) != "xarm_base" or bool(
-                source.attrs.get("frame_compatibility_with_sim_world", True)
-            ):
-                raise ValueError(f"{artifact.name}: invalid real point-cloud frame contract")
-        return {
-            "path": artifact.name,
-            "frames": length,
-            "keys": list(expected),
+            if not isinstance(value, dict):
+                raise ValueError(f"{artifact.name}: {key} must encode an object")
+        if json.loads(str(source.attrs["processing_config_json"])) != config.to_dict():
+            raise ValueError(f"{artifact.name}: processing config mismatch")
+        provenance = source["provenance"]
+        expected_provenance = {
+            "source_row_index",
+            "source_sample_index",
+            "source_timestamp_s",
+            "source_keep_mask",
+            "source_drop_reason_bits",
         }
+        if set(provenance.keys()) != expected_provenance:
+            raise ValueError(f"{artifact.name}: invalid provenance keys")
+        source_frames = int(source.attrs.get("source_frames", -1))
+        rows = np.asarray(provenance["source_row_index"][:], dtype=np.int64)
+        samples = np.asarray(provenance["source_sample_index"][:], dtype=np.int64)
+        timestamps = np.asarray(provenance["source_timestamp_s"][:], dtype=np.float64)
+        keep = np.asarray(provenance["source_keep_mask"][:], dtype=bool)
+        reasons = np.asarray(provenance["source_drop_reason_bits"][:], dtype=np.uint64)
+        if (
+            rows.shape != (length,)
+            or samples.shape != (length,)
+            or timestamps.shape != (length,)
+            or keep.shape != (source_frames,)
+            or reasons.shape != (source_frames,)
+            or not np.array_equal(rows, np.flatnonzero(keep))
+            or np.any(reasons[keep] != 0)
+            or np.any(reasons[~keep] == 0)
+            or np.any(np.diff(rows) <= 0)
+            or np.any(np.diff(samples) <= 0)
+            or not np.all(np.isfinite(timestamps))
+            or np.any(np.diff(timestamps) <= 0.0)
+        ):
+            raise ValueError(f"{artifact.name}: provenance row mapping mismatch")
+        try:
+            reason_names = json.loads(
+                str(provenance.attrs["drop_reason_bit_names_json"])
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"{artifact.name}: invalid drop-reason name mapping"
+            ) from exc
+        if (
+            not isinstance(reason_names, dict)
+            or set(reason_names) != {str(bit) for bit in range(len(reason_names))}
+            or len(reason_names) > 64
+            or any(
+                not isinstance(name, str) or not name for name in reason_names.values()
+            )
+        ):
+            raise ValueError(f"{artifact.name}: invalid drop-reason name mapping")
+        valid_reason_bits = (
+            np.uint64((1 << len(reason_names)) - 1)
+            if len(reason_names) < 64
+            else np.iinfo(np.uint64).max
+        )
+        if np.any(reasons & ~valid_reason_bits):
+            raise ValueError(f"{artifact.name}: unknown provenance reason bit")
+        return {"path": artifact.name, "frames": length, "keys": sorted(specs)}
+
+
+def _rejected_decision(
+    episode: Path, config: ProcessingConfig, reason: str
+) -> EpisodeDecision:
+    return EpisodeDecision(
+        source_path=episode,
+        source_frames=0,
+        profile=config.profile,
+        selected_indices=np.empty(0, dtype=np.int64),
+        keep_mask=np.empty(0, dtype=bool),
+        drop_reason_bits=np.empty(0, dtype=np.uint64),
+        drop_reason_names=(),
+        hard_reason_counts={},
+        boundary_counts={},
+        selected_frames=0,
+        quality={},
+        rejected_reason=reason,
+    )
 
 
 def process_episode_root(
@@ -536,73 +775,93 @@ def process_episode_root(
     annotations_path: str | Path | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Analyze and optionally transactionally publish one processed batch."""
+    """Publish a complete one-to-one batch, or publish nothing on rejection."""
 
     episodes = discover_episode_dirs(input_root)
     annotations = load_annotations(annotations_path)
     unknown_annotations = set(annotations) - {episode.name for episode in episodes}
     if unknown_annotations:
-        raise ValueError(f"annotations reference unknown episodes: {sorted(unknown_annotations)}")
-
+        raise ValueError(
+            f"annotations reference unknown episodes: {sorted(unknown_annotations)}"
+        )
     decisions: list[EpisodeDecision] = []
     for episode in episodes:
         annotation = annotations.get(episode.name, EpisodeAnnotation())
         try:
             with _open_episode(episode) as reader:
-                decisions.append(analyze_episode(reader, config, annotation))
+                reader.require_valid(purpose="offline processing")
+                decisions.append(
+                    analyze_episode(
+                        reader,
+                        config,
+                        annotation,
+                        depth_valid_mask=(
+                            _derive_depth_valid_mask(reader)
+                            if config.profile.needs_rgb and annotation.include
+                            else None
+                        ),
+                        pointcloud_valid_mask=(
+                            _derive_pointcloud_valid_mask(reader, config)
+                            if config.profile.needs_pointcloud and annotation.include
+                            else None
+                        ),
+                        source_already_validated=True,
+                    )
+                )
         except (FileNotFoundError, OSError, ValueError) as exc:
             logger.warning("episode analysis rejected %s", episode, exc_info=True)
             decisions.append(
-                EpisodeDecision(
-                    source_path=episode,
-                    source_frames=0,
-                    profile=config.profile,
-                    segments=(),
-                    hard_reason_counts={},
-                    boundary_counts={},
-                    dropped_short_segment_frames=0,
-                    selected_frames=0,
-                    quality={},
-                    rejected_reason=f"{type(exc).__name__}: {exc}",
-                )
+                _rejected_decision(episode, config, f"{type(exc).__name__}: {exc}")
             )
-
-    planned_output_names = [
-        _output_name(decision.source_path.name, segment_index, len(decision.segments))
-        for decision in decisions
-        if decision.accepted
-        for segment_index in range(len(decision.segments))
+    planned_names = [
+        f"{decision.source_path.name}.h5" for decision in decisions if decision.accepted
     ]
-    duplicate_output_names = sorted(name for name, count in Counter(planned_output_names).items() if count > 1)
-    if duplicate_output_names:
-        raise ValueError(f"source names produce colliding output files: {duplicate_output_names}")
-
+    collisions = sorted(
+        name for name, count in Counter(planned_names).items() if count > 1
+    )
+    if collisions:
+        raise ValueError(f"source names produce colliding outputs: {collisions}")
     report: dict[str, Any] = {
-        "schema_name": _SCHEMA_NAME,
-        "schema_version": _SCHEMA_VERSION,
+        "schema_name": PROCESSED_SCHEMA_NAME,
+        "schema_version": PROCESSED_SCHEMA_VERSION,
         "input_root": str(Path(input_root).resolve()),
         "output_root": str(Path(output_root).resolve()),
         "dry_run": dry_run,
         "config": config.to_dict(),
         "source_episode_count": len(decisions),
-        "accepted_source_episode_count": sum(decision.accepted for decision in decisions),
-        "rejected_source_episode_count": sum(not decision.accepted for decision in decisions),
-        "output_segment_count": sum(len(decision.segments) for decision in decisions),
-        "source_frame_count": sum(decision.source_frames for decision in decisions),
-        "selected_frame_count": sum(decision.selected_frames for decision in decisions),
-        "episodes": [decision.to_dict() for decision in decisions],
+        "accepted_source_episode_count": sum(d.accepted for d in decisions),
+        "rejected_source_episode_count": sum(not d.accepted for d in decisions),
+        "output_episode_count": sum(d.accepted for d in decisions),
+        "source_frame_count": sum(d.source_frames for d in decisions),
+        "selected_frame_count": sum(d.selected_frames for d in decisions),
+        "episodes": [d.to_dict() for d in decisions],
         "outputs": [],
     }
     if dry_run:
         return report
+    blocking_rejections = [
+        decision
+        for decision in decisions
+        if not decision.accepted
+        and annotations.get(decision.source_path.name, EpisodeAnnotation()).include
+    ]
+    if blocking_rejections:
+        details = "; ".join(
+            f"{decision.source_path.name}: {decision.rejected_reason}"
+            for decision in blocking_rejections
+        )
+        raise ValueError(f"processing batch rejected; no output published: {details}")
     if not any(decision.accepted for decision in decisions):
-        raise ValueError("processing produced no accepted episode segments")
-
+        raise ValueError("processing produced no included episodes")
     target = Path(output_root)
     if target.exists():
-        raise FileExistsError(f"refusing to overwrite existing processed root: {target}")
+        raise FileExistsError(
+            f"refusing to overwrite existing processed root: {target}"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=str(target.parent)))
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=str(target.parent))
+    )
     try:
         outputs: list[dict[str, Any]] = []
         for decision in decisions:
@@ -610,12 +869,17 @@ def process_episode_root(
                 continue
             annotation = annotations.get(decision.source_path.name, EpisodeAnnotation())
             with _open_episode(decision.source_path) as reader:
-                outputs.extend(_write_episode_segments(reader, decision, staging, config, annotation))
-        validation = [validate_processed_hdf5(staging / item["path"], config) for item in outputs]
+                outputs.append(
+                    _write_processed_episode(
+                        reader, decision, staging, config, annotation
+                    )
+                )
+        validation = [
+            validate_processed_hdf5(staging / item["path"], config) for item in outputs
+        ]
         report["outputs"] = outputs
         report["validation"] = validation
-        index_path = staging / "processing_index.json"
-        with index_path.open("w", encoding="utf-8") as stream:
+        with (staging / "processing_index.json").open("w", encoding="utf-8") as stream:
             json.dump(report, stream, ensure_ascii=False, indent=2)
             stream.flush()
         atomic_publish(staging, target)

@@ -81,7 +81,6 @@ from dexmani_real.teleop.snapshot import (
 )
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.hand_health import (
-    HandOvercurrentGate,
     validate_arm_feedback,
     validate_hand_feedback,
 )
@@ -498,9 +497,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     hand_available = False
     _hand_disconnected_at: float | None = None  # monotonic timestamp of first bad frame
-    _hand_overcurrent_gate = HandOvercurrentGate(
-        cfg.runtime.policy.hand_overcurrent_recovery_frames
-    )
     _hand_ramp_total_frames = _hand_ramp_frame_count(
         cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
     )
@@ -1011,20 +1007,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         resumable_reason = (
                             _quiescence.reason if _quiescence.active else None
                         )
-                        if resumable_reason not in {"pause", "hand_overcurrent"}:
+                        if resumable_reason != "pause":
                             print(
                                 "\nC: 没有可恢复的暂停 session — 请按 B 开始新的遥操作 session"
-                            )
-                            skip_rest = True
-                            continue
-                        if (
-                            resumable_reason == "hand_overcurrent"
-                            and not _hand_overcurrent_gate.can_resume
-                        ):
-                            print(
-                                "\nC: XHand 过流恢复尚未满足健康反馈门槛 "
-                                f"({_hand_overcurrent_gate.healthy_frames}/"
-                                f"{cfg.runtime.policy.hand_overcurrent_recovery_frames})"
                             )
                             skip_rest = True
                             continue
@@ -1037,11 +1022,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         if not _transition_or_fault(SafetyState.RUNNING, "resume"):
                             break
                         teleop_active = True
-                        if resumable_reason == "hand_overcurrent":
-                            if not _hand_overcurrent_gate.acknowledge_resume():
-                                raise RuntimeError(
-                                    "overcurrent resume gate changed during C handling"
-                                )
                     state_str = "恢复" if teleop_active else "暂停"
                     print(f"\nC: {state_str}遥操作")
                     if teleop_active:
@@ -1221,29 +1201,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             )
 
             hand_issue = _hand_feedback_issue(hand_state)
-            overcurrent_count = (
-                int(hand_state["overcurrent_error_count"][0])
-                if hand_state is not None
-                and "overcurrent_error_count" in hand_state.dtype.names
-                else 0
-            )
-            if _hand_overcurrent_gate.observe(
-                event_count=overcurrent_count,
-                feedback_healthy=hand_issue is None,
-            ):
-                logger.warning(
-                    "XHand overcurrent detected — motion requires explicit C resume "
-                    "after %d healthy frames",
-                    cfg.runtime.policy.hand_overcurrent_recovery_frames,
-                )
-                _enter_command_quiescence(
-                    "hand_overcurrent", replace_existing_reason=True
-                )
-                if teleop_active:
-                    teleop_active = False
-                    if not _transition_or_fault(SafetyState.ARMED, "hand_overcurrent"):
-                        break
-                audio.play("pause")
             if cfg.runtime.policy.hand_enabled and hand_issue is not None:
                 now_s = time.monotonic()
                 if _hand_disconnected_at is None:
@@ -1316,6 +1273,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     and not vr_stale
                     and not _hold_for_audio
                     and _quiescence.active
+                    and bool(arm_state["accepts_motion_commands"][0])
                     and vr_frame is not None
                     and (not hand_available or hand_state is not None)
                     and (not hand_available or hand_issue is None)
@@ -1585,6 +1543,33 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         frame_status=_FRAME_IK_FAIL,
                         retarget_ok=retarget_ok,
                         arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
+                        diagnostics={
+                            "tracking_error": (
+                                float(arm_state["tracking_err"][0])
+                                if arm_state is not None
+                                and "tracking_err" in arm_state.dtype.names
+                                else 0.0
+                            ),
+                            "ik_solve_time_ms": ik_solve_time_ms,
+                            "target_pos_before_clamp": target_pos_before_clamp.copy(),
+                            "head_quat_wxyz": (
+                                np.asarray(vr_frame["head_quat_wxyz"], dtype=np.float64)
+                                if "head_quat_wxyz" in vr_frame
+                                else np.full(4, np.nan)
+                            ),
+                            "target_eef_pos_raw": target_pos_raw.copy(),
+                            "target_eef_rot6d_raw": quat_wxyz_to_rot6d(
+                                normalize_quat_wxyz(target_quat_raw)
+                            ),
+                            "action_hand_joint_raw": hand_cmd_raw.copy(),
+                            "policy_map_time_ms": policy_map_time_ms,
+                            "hand_retarget_time_ms": hand_retarget_time_ms,
+                            "transition_check_time_ms": 0.0,
+                            "policy_compute_time_ms": (
+                                time.perf_counter() - _policy_compute_t0
+                            )
+                            * 1000.0,
+                        },
                         target_eef_pos=_last_target_eef_pos,
                         target_eef_rot6d=_last_target_eef_rot6d,
                         hand_fk=_hand_fk,
@@ -1759,38 +1744,52 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     )
                 continue
             if not publish_result.succeeded or published_candidate is None:
+                # Recoverable "hold" statuses keep the loop alive with arm+hand
+                # held in place instead of latching a fault: safety-state gating,
+                # transient hand-feedback unavailability/unhealth, and a transient
+                # arm "not accepting yet" (Mode-6 entry / homing / re-arm window).
+                # A single stale hand frame must not kill the session — the
+                # debounced per-frame hand check (hand_disconnect_timeout_s) above
+                # is the sole fault path for sustained hand-unhealthy.
+                hold_status = publish_result.status in (
+                    CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+                    CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
+                    CommandPublishStatus.ARM_NOT_READY,
+                )
                 if publish_result.runtime_gated:
                     logger.info(
                         "teleop_loop: joint publication stopped by runtime gate: %s",
                         publish_result.reason,
                     )
-                    if publish_result.status == CommandPublishStatus.SAFETY_STATE_GATED:
-                        if recording_active:
-                            _record_held(
-                                recorder,
-                                arm_state,
-                                ctx.prev_qpos_cmd,
-                                ctx.prev_hand_qpos,
-                                vr_frame,
-                                cam,
-                                hand_state=hand_state,
-                                hand_tactile=hand_tactile,
-                                arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
-                                target_eef_pos=_last_target_eef_pos,
-                                target_eef_rot6d=_last_target_eef_rot6d,
-                                hand_fk=_hand_fk,
-                                T_eef_handbase_pos=_T_eef_handbase_pos,
-                                T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
-                                observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-                                shared=shared,
-                            )
-                        continue
+                    if publish_result.status != CommandPublishStatus.SAFETY_STATE_GATED:
+                        break
+                    hold_status = True
+                if not hold_status:
+                    logger.error(
+                        "teleop_loop: joint publish failed: %s", publish_result.reason
+                    )
+                    shared.error_state.value = True
                     break
-                logger.error(
-                    "teleop_loop: joint publish failed: %s", publish_result.reason
-                )
-                shared.error_state.value = True
-                break
+                if recording_active:
+                    _record_held(
+                        recorder,
+                        arm_state,
+                        ctx.prev_qpos_cmd,
+                        ctx.prev_hand_qpos,
+                        vr_frame,
+                        cam,
+                        hand_state=hand_state,
+                        hand_tactile=hand_tactile,
+                        arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
+                        target_eef_pos=_last_target_eef_pos,
+                        target_eef_rot6d=_last_target_eef_rot6d,
+                        hand_fk=_hand_fk,
+                        T_eef_handbase_pos=_T_eef_handbase_pos,
+                        T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
+                        observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                        shared=shared,
+                    )
+                continue
             stage_timer.mark("send")
 
             if published_candidate.arm_qpos is not None:

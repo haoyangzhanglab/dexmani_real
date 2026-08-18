@@ -144,9 +144,8 @@ def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:
     :func:`_convert_field_value` using the resolved type hint, and returns
     a ``dict[str, object]`` suitable for ``cls(**kwargs)``.
 
-    This is the shared implementation behind all ``from_dict(cls, d)``
-    classmethods in the codebase (``PlanningProfile``, ``TeleopProfile``,
-    ``XHandConfig``).
+    This is the shared implementation behind configuration ``from_dict(cls,
+    d)`` classmethods such as ``PlanningProfile`` and ``TeleopProfile``.
 
     Fields that are not present in *d* are skipped (they keep their
     dataclass defaults). Extra keys in *d* that have no matching field

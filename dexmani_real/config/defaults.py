@@ -261,8 +261,6 @@ class ArmParams:
     expected_axis: int = 7
     # Explicit model check is opt-in: None means "don't guess the model".
     device_profile: str | None = None
-    serial_number: str | None = None  # enforced only when configured
-    min_firmware: tuple[int, ...] | None = None  # integer-tuple compare via version_number
 
     # Fixed-Z fallback when calibrated table geometry is disabled.
     table_z_surface_m: float = 0.022
@@ -328,14 +326,6 @@ class ArmParams:
             raise ValueError("expected_axis must be a positive integer")
         if self.device_profile is not None and not self.device_profile:
             raise ValueError("device_profile must be non-empty when set")
-        if self.serial_number is not None and not self.serial_number:
-            raise ValueError("serial_number must be non-empty when set")
-        if self.min_firmware is not None and (
-            not isinstance(self.min_firmware, tuple)
-            or not self.min_firmware
-            or any(not isinstance(v, int) or v < 0 for v in self.min_firmware)
-        ):
-            raise ValueError("min_firmware must be a non-empty tuple of non-negative integers")
         if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
             raise ValueError("tcp_load_mass_kg must be finite and positive")
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
@@ -479,9 +469,6 @@ class HandParams:
     # Send-error watchdog.
     # Only a failed new-command send increments this counter.
     send_err_watchdog_count: int = 30
-    # Repeated non-consecutive hardware overcurrent reports still latch fault.
-    overcurrent_fault_count: int = 3
-    overcurrent_fault_window_s: float = 10.0
 
     # Hand FK (world-frame fingertip positions).
     fingertip_link_names: tuple[str, ...] = (
@@ -558,13 +545,6 @@ class HandParams:
             raise ValueError("hand home_command_ack_timeout_s must be finite and positive")
         if self.send_err_watchdog_count <= 0:
             raise ValueError("hand send_err_watchdog_count must be positive")
-        if not isinstance(self.overcurrent_fault_count, int) or self.overcurrent_fault_count <= 0:
-            raise ValueError("hand overcurrent_fault_count must be a positive integer")
-        if (
-            not np.isfinite(self.overcurrent_fault_window_s)
-            or self.overcurrent_fault_window_s <= 0
-        ):
-            raise ValueError("hand overcurrent_fault_window_s must be finite and positive")
         if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
             raise ValueError("hand fingertip_link_names must contain five non-empty names")
         transform = np.asarray(self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz, dtype=np.float64)
@@ -618,9 +598,6 @@ class PolicyParams:
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
-    # A hardware overcurrent requires this many healthy control-grid samples
-    # before C may explicitly resume motion.
-    hand_overcurrent_recovery_frames: int = 5
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
@@ -667,8 +644,6 @@ class PolicyParams:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
         if not np.isfinite(self.hand_disconnect_timeout_s) or self.hand_disconnect_timeout_s <= 0:
             raise ValueError("hand_disconnect_timeout_s must be finite and positive")
-        if self.hand_overcurrent_recovery_frames <= 0:
-            raise ValueError("hand_overcurrent_recovery_frames must be positive")
         if (
             self.arm_max_delta_rad_per_tick is not None
             and (not np.isfinite(self.arm_max_delta_rad_per_tick) or self.arm_max_delta_rad_per_tick <= 0)

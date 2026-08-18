@@ -565,7 +565,8 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
     Fields: qpos(7), qvel(7), tau(7), eef_pos(3), eef_rot6d(6),
-            error_code, connected, mode, tracking_err, and last-command timing.
+            error_code, connected, mode, tracking_err, state_valid,
+            accepts_motion_commands, and last-command timing.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
     """
     data = read_arm_state(shared)
@@ -592,6 +593,7 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
         "state_valid": bool(data["state_valid"][0]),
+        "accepts_motion_commands": bool(data["accepts_motion_commands"][0]),
     }
 
 

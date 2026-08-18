@@ -89,6 +89,9 @@ class CommandPublishStatus(str, Enum):
     SAFETY_STATE_GATED = "safety state gated"
     ARM_FEEDBACK_UNAVAILABLE = "arm feedback unavailable"
     ARM_FEEDBACK_UNHEALTHY = "arm feedback unhealthy"
+    # Transient "not accepting servo commands yet" (Mode-6 entry window, homing
+    # Mode 0, or a re-arm) — producers should hold/retry, not fault.
+    ARM_NOT_READY = "arm not ready"
     HAND_FEEDBACK_UNAVAILABLE = "hand feedback unavailable"
     HAND_FEEDBACK_UNHEALTHY = "hand feedback unhealthy"
     HAND_PREFLIGHT_REJECTED = "hand preflight rejected"
@@ -175,7 +178,16 @@ def _arm_feedback_snapshot(
     shared: Any,
     candidate: ActionCandidate | None,
 ) -> tuple[_ArmFeedbackSnapshot | None, CommandPublishResult | None]:
-    """Read the arm fields required by publication and acknowledgement."""
+    """Read the arm fields required by publication and acknowledgement.
+
+    Fails closed on two distinct signals: ``ARM_FEEDBACK_UNHEALTHY`` for a
+    genuinely disconnected/invalid frame, and ``ARM_NOT_READY`` when the arm is
+    simply not accepting servo commands yet — ``mode != 6`` OR the truthful
+    ``accepts_motion_commands`` bit is 0 (during the non-blocking Mode-6 entry
+    window, homing's Mode 0 window, or a re-arm where the cached mode is still
+    6).  The transient ``ARM_NOT_READY`` lets producers hold/retry instead of
+    faulting and never overruns the bounded arm queue.
+    """
     result = shared.arm_state_ring.read_latest()
     if result is None:
         return None, CommandPublishResult(
@@ -191,6 +203,18 @@ def _arm_feedback_snapshot(
                 "arm feedback is disconnected or marked invalid "
                 f"(connected={bool(record['connected'])}, "
                 f"state_valid={bool(record['state_valid'])})"
+            ),
+        )
+    mode = int(record["mode"])
+    accepts = bool(record["accepts_motion_commands"])
+    if mode != 6 or not accepts:
+        return None, CommandPublishResult(
+            CommandPublishStatus.ARM_NOT_READY,
+            candidate=candidate,
+            detail=(
+                "arm is not accepting servo commands "
+                f"(mode={mode}, accepts_motion_commands={accepts}); "
+                "command rejected at publication boundary"
             ),
         )
     qpos = np.asarray(record["qpos"], dtype=np.float64)

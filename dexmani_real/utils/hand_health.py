@@ -10,8 +10,6 @@ fail-closed predicates has a single home.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
@@ -19,54 +17,10 @@ from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 XHAND_OVERCURRENT_ERROR_CODE = 1_501_035
 
 __all__ = [
-    "HandOvercurrentGate",
     "XHAND_OVERCURRENT_ERROR_CODE",
     "validate_arm_feedback",
     "validate_hand_feedback",
 ]
-
-
-@dataclass
-class HandOvercurrentGate:
-    """Latch an observed overcurrent until healthy feedback and operator ack."""
-
-    recovery_frames: int
-    last_event_count: int = 0
-    resume_required: bool = False
-    healthy_frames: int = 0
-
-    def __post_init__(self) -> None:
-        if self.recovery_frames <= 0:
-            raise ValueError("overcurrent recovery_frames must be positive")
-
-    @property
-    def can_resume(self) -> bool:
-        return self.resume_required and self.healthy_frames >= self.recovery_frames
-
-    def observe(self, *, event_count: int, feedback_healthy: bool) -> bool:
-        """Consume cumulative telemetry and return whether a new event arrived."""
-        count = int(event_count)
-        if count < 0:
-            raise ValueError("overcurrent event_count must be non-negative")
-        new_event = count > self.last_event_count
-        self.last_event_count = max(self.last_event_count, count)
-        if new_event:
-            self.resume_required = True
-            self.healthy_frames = 0
-        if self.resume_required:
-            if feedback_healthy:
-                self.healthy_frames = min(self.recovery_frames, self.healthy_frames + 1)
-            else:
-                self.healthy_frames = 0
-        return new_event
-
-    def acknowledge_resume(self) -> bool:
-        """Clear the latch only after the configured healthy window."""
-        if not self.can_resume:
-            return False
-        self.resume_required = False
-        self.healthy_frames = 0
-        return True
 
 
 def validate_arm_feedback(

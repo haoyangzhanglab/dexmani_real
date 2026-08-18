@@ -19,24 +19,24 @@ Real episode 合同见 [`hdf5_episode.md`](hdf5_episode.md)，Sim 容器见 [`si
 
 ### numeric processing
 
-resize、dtype cast、单位缩放、坐标变换、FK/IK、点云派生、插值、切段和采样都属于数值处理，必须有独立版本和 provenance。它们不能被写成“label mapping”。
+resize、dtype cast、单位缩放、坐标变换、FK/IK、点云派生、插值、删行压紧和采样都属于数值处理，必须有独立版本和 provenance。它们不能被写成“label mapping”。当前 Real pipeline 不把一条 demo 切成多个 episode。
 
 ## 2. 13 个 Sim label 的 Real 来源
 
 | Sim label | Real 候选 | 结论 |
 |---|---|---|
-| `rgb` | `rgb.mp4` 解码 | 可作为 Real-native RGB；分辨率和 dtype 以 Real episode 为准，不自动满足 Sim `(240,320,3)`。 |
-| `depth` | `depth.h5` | raw unit、aligned Z 和 frame 语义不同；不能直接改名为 Sim depth。 |
+| `rgb` | `rgb.mp4` 解码 | processed Real view 做 no-crop resize，写 `(N,240,320,3) uint8`；shape 相同不代表成像域与 Sim 相同。 |
+| `depth` | `depth.h5` | processed Real view 保留 uint16 sensor unit、0 invalid 与独立 `depth_scale_m_per_unit`；不是 Sim depth 的单位别名。 |
 | `segmentation` | 无 | 不用全零伪造；Sim 的 0 表示 background，不表示 unknown。 |
-| `point_cloud` | 从 depth 派生 | 可生成 Real-native view；点数、滤波和坐标 frame 不等于 Sim world。 |
-| `camera_intrinsic` | `/meta.camera_K` | 可重复 metadata；Real viewport、dtype 和 frame 必须单独声明。 |
-| `camera_extrinsic` | `/meta.camera_T_world_camera` / `camera_T_eef_camera` | 方向、frame 和 shape 不同；不能直接 rename。 |
+| `point_cloud` | 从 depth 派生 | processed Real view 写 `(N,1024,6) float32` xArm-base XYZ+RGB；滤波和坐标 frame 不等于 Sim world。 |
+| `camera_intrinsic` | `/meta.camera_K` | processed Real view 按 resize 比例更新 K，写 `(N,9) float32`；不是原始 viewport K 的原样别名。 |
+| `camera_extrinsic` | `/meta.camera_T_world_camera` / `camera_T_eef_camera` | processed Real view 写 `(N,4,4)` `T_xarm_base_camera`；不是 Sim world→camera `(N,12)`。 |
 | `joint_state` | `arm_qpos + hand_qpos` | 唯一稳定的结构关系之一；保持组件顺序，dtype conversion 另记。 |
-| `contact_force` | `hand_contact` | 不等价：Real 是 SDK-scaled tactile 汇总，Sim 是 world-frame physics force。 |
-| `fingertip_points` | `hand_fingertip` | frame、模型和 shape 语义不同；不能直接 rename。 |
+| `contact_force` | `hand_contact` | processed Real view 写 `(N,5,3)` SDK-scaled tactile 汇总；SI 未验证且不是 world-frame physics force。 |
+| `fingertip_points` | `hand_fingertip` | processed Real view 写 `(N,5,3)` xArm-base FK 点，单位 m。 |
 | `imagine_point_cloud` | 无 | 需要 Sim mesh/FK 派生，不能用 Real cloud 冒充。 |
 | `action` | `action_arm_joint_sent + action_hand_joint` | 仅在 sent stream 存在时可作有序 Real-native joint action；不是硬件 ACK。 |
-| `action_ee` | `action_arm_ee + action_hand_joint` | shape 相似但 frame 和 action 语义不同，不能直接 concat 后改名。 |
+| `action_ee` | `action_arm_ee + action_hand_joint` | processed Real view 可写 `(N,21)`，但语义明确为 xArm-base tracking intent + queued hand target，不冒充 Sim action。 |
 | `done` | 无 | Real `/meta.success`、`truncated`、recorder status 都不是 Sim transition outcome。 |
 
 最小可信结构关系只有：
@@ -72,9 +72,10 @@ action_arm_joint_raw_valid_mask, action_hand_joint_raw_valid_mask
 
 映射阶段不删行、不压紧 episode、不猜 `done`。下游如果不能消费质量字段，应在 admission 层拒绝 episode 或创建有版本的 processed view。
 
-## 5. 建议的 manifest
+## 5. Provenance 所在层
 
-任何 label-only 或数值视图都应保存独立 manifest，至少包含：
+数值处理 provenance 保存于 processed HDF5 v3 的 attrs、`provenance/` 组和同批次
+`processing_index.json`，至少覆盖：
 
 ```yaml
 source:
@@ -83,20 +84,21 @@ source:
   data_path: data.h5
 target:
   domain: real
-  representation: label_only  # or numeric_view
+  representation: numeric_view
   profile: joint
 mapping:
   joint_state: [arm_qpos, hand_qpos]
   action: [action_arm_joint_sent, action_hand_joint]
 compatibility:
   frame_compatible_with_sim_world: false
-  task_outcome_source: unknown
 provenance:
-  rule_version: 1
+  processed_schema_version: 3
   source_config_sha256: ...
 ```
 
-缺失的 task、scene、object、seed、done 或 contact semantics 写 `unknown`/`omit`，不要用零、NaN、末帧常量或 recorder status 补造。
+Policy Zarr 不复制 source episode、路径、hash、index 或 manifest，只保留 dataset-level
+schema/单位/frame attrs。缺失的 scene、object、seed、done 等语义写 `unknown`/`omit`，
+不要用零、NaN、末帧常量或 recorder status 补造。
 
 ## 6. 验收清单
 
