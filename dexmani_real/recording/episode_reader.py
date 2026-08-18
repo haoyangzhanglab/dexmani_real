@@ -5,7 +5,7 @@ Reads camera frames from DexMani episodes. Non-camera datasets
 :attr:`h5f` — a merged view of the episode HDF5 sidecars.
 
 An episode is one published directory containing ``data.h5``, ``depth.h5``,
-and ``rgb.mp4``. Flat HDF5 files and pre-v17 episode directories
+and ``rgb.mp4``. Older flat HDF5 files and pre-v17 episode directories
 intentionally require an external migration tool.
 
 Usage::
@@ -143,7 +143,7 @@ class EpisodeReader:
             self.close()
             raise ValueError(
                 f"unsupported episode schema v{schema_version}; expected v{EPISODE_SCHEMA_VERSION} "
-                "(migrate episodes outside the runtime)"
+                "(migrate historical episodes outside the runtime)"
             )
 
     # -- public properties ------------------------------------------------

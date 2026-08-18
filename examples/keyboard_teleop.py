@@ -291,7 +291,7 @@ def _run_control_loop(
     )
 
     heartbeat_timeouts = dict(runtime.safety.heartbeat_timeouts)
-    rate = RateManager(float(cfg.control_hz))
+    rate = RateManager(float(cfg.control_hz), label="keyboard_teleop")
     state_failures = 0
     home_key_down = False
     motion_active = False

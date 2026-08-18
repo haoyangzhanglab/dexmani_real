@@ -151,6 +151,12 @@ HAND_STATE_DTYPE = np.dtype(
         ("state_valid", "<u1"),
         ("send_healthy", "<u1"),
         ("read_healthy", "<u1"),
+        # Cumulative failure telemetry survives a one-tick error so a slower
+        # consumer can still observe and classify the event.
+        ("read_error_count", "<u8"),
+        ("overcurrent_error_count", "<u8"),
+        ("last_read_error_code", "<i4"),
+        ("last_read_error_monotonic_ns", "<u8"),
         ("timestamp", "<f8"),
     ]
 )

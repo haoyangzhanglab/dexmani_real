@@ -622,7 +622,7 @@ def _run_calibration(
     pose = planner.kin.compute_eef_pose_world(current_qpos)
     target_pos = pose.p.copy()
     target_quat = pose.q.copy()
-    rate = RateManager(float(runtime.keyboard_teleop.control_hz))
+    rate = RateManager(float(runtime.keyboard_teleop.control_hz), label="camera_calibration")
     home_key_down = False
     motion_active = False
     frame = 0

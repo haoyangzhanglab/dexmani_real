@@ -63,7 +63,7 @@ class RobotState:
     hand_jointboard_err: (
         np.ndarray
     )  # (12,) int32 — joint motor-driver board error registers per joint
-    # Reserved v16 compatibility flag. Normal contact/non-convergence is not a
+    # Reserved compatibility flag. Normal contact/non-convergence is not a
     # freshness fault; runtime health uses timestamps and read/state validity.
     hand_qpos_stale: bool
 

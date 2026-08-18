@@ -1,4 +1,4 @@
-"""Transactional schema-v17 HDF5 episode serialization.
+"""Transactional HDF5 v16 episode serialization.
 
 State, action, VR, and camera rows are written one-for-one on the policy grid.
 The recorder verifies all sidecars before atomically publishing an episode.
@@ -44,6 +44,10 @@ from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
+_RUNTIME_QUALITY_METRIC_NAMES = frozenset(
+    {"hand_read_error_count", "hand_overcurrent_count"}
+)
+
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
 SCHEMA_VERSION = EPISODE_SCHEMA_VERSION
 _CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
@@ -51,7 +55,10 @@ _PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
 _PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
 
 
-# Join live stop threads at interpreter exit.
+# The episode-stop thread is a daemon: if an entry point exits without
+# join_stop() (estop path, second Ctrl-C inside a finally prompt), the
+# interpreter kills it mid-flush and truncates the HDF5.  One hook joins
+# every live recorder at interpreter exit.  No-op on SIGTERM/SIGKILL.
 _LIVE_RECORDERS: weakref.WeakSet = weakref.WeakSet()
 
 
@@ -67,6 +74,60 @@ def _flush_all_recorders() -> None:
 
 
 atexit.register(_flush_all_recorders)
+
+
+def _episode_quality_metrics(
+    datasets: dict[str, Any],
+    *,
+    frame_count: int,
+    control_hz: float,
+    runtime_metrics: dict[str, int],
+) -> dict[str, int]:
+    """Summarize persisted frame flags plus runtime-only event counters."""
+    if frame_count < 0 or not np.isfinite(control_hz) or control_hz <= 0:
+        raise ValueError("invalid episode quality dimensions")
+    unknown_metrics = set(runtime_metrics) - _RUNTIME_QUALITY_METRIC_NAMES
+    if unknown_metrics:
+        raise ValueError(f"unknown runtime quality metrics: {sorted(unknown_metrics)}")
+    normalized_runtime_metrics = {
+        name: int(value) for name, value in runtime_metrics.items()
+    }
+    if any(value < 0 for value in normalized_runtime_metrics.values()):
+        raise ValueError("runtime quality metrics must be non-negative")
+    if frame_count == 0:
+        return {
+            "ik_hold_frame_count": 0,
+            "camera_invalid_frame_count": 0,
+            "observation_invalid_frame_count": 0,
+            "sample_invalid_frame_count": 0,
+            "safety_reject_frame_count": 0,
+            "command_quiescence_count": 0,
+            **normalized_runtime_metrics,
+        }
+
+    def _bool_dataset(name: str) -> np.ndarray:
+        if name not in datasets:
+            raise KeyError(f"required quality dataset missing: {name}")
+        return np.asarray(datasets[name][:frame_count], dtype=bool)
+
+    held = _bool_dataset("flag_held")
+    ik_ok = _bool_dataset("flag_ik_ok")
+    observation_valid = _bool_dataset("observation_valid")
+    camera_fresh = _bool_dataset("flag_camera_fresh")
+    sample_valid = _bool_dataset("flag_sample_valid")
+    safety_reject = _bool_dataset("flag_safety_reject")
+    if "timestamp" not in datasets:
+        raise KeyError("required quality dataset missing: timestamp")
+    timestamps = np.asarray(datasets["timestamp"][:frame_count], dtype=np.float64)
+    return {
+        "ik_hold_frame_count": int(np.count_nonzero(held & ~ik_ok)),
+        "camera_invalid_frame_count": int(np.count_nonzero(~camera_fresh)),
+        "observation_invalid_frame_count": int(np.count_nonzero(~observation_valid)),
+        "sample_invalid_frame_count": int(np.count_nonzero(~sample_valid)),
+        "safety_reject_frame_count": int(np.count_nonzero(safety_reject)),
+        "command_quiescence_count": int(np.count_nonzero(np.diff(timestamps) > (1.5 / control_hz))),
+        **normalized_runtime_metrics,
+    }
 
 
 @dataclass
@@ -138,10 +199,11 @@ class EpisodeRecorder:
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._datasets: dict[str, Any] = {}
         self._pending_meta: dict[str, Any] = {}  # deferred metadata until HDF5 created
+        self._runtime_quality_metrics: dict[str, int] = {}
 
-        # Record-time aligned buffer for non-camera streams.
+        # Record-time aligned buffer for non-camera streams + periodic flush.
         self._buffer: TimestampAlignedBuffer | None = None
-        self._flush_interval: int = max(1, int(round(10.0 * self.control_hz)))  # periodic flush
+        self._flush_interval: int = max(1, int(round(10.0 * self.control_hz)))  # frames (~10s)
         self._flushed_frames: int = 0
 
         # Skip the first N add_frame() calls per episode (begin-transition noise).
@@ -151,13 +213,15 @@ class EpisodeRecorder:
         self._skipped_so_far: int = 0
         self._last_control_run_generation: int | None = None
 
-        # Pending async stop_episode thread; start_episode() prevents overlap.
+        # Pending async stop_episode thread (None = no pending stop).
+        # Guarded by start_episode() to prevent overlapping episodes.
         self._stop_thread: threading.Thread | None = None
 
-        # Error from the last stop thread; callers read it after join_stop().
+        # Error from the last _stop_episode_impl (ENOSPC, etc.) — set inside
+        # the daemon thread; callers poll via stop_error after join_stop().
         self._stop_error: str | None = None
 
-        # Non-blocking stop result harvested by poll_stop().
+        # Non-blocking stop tracking (harvested by poll_stop()).
         self._stop_success: bool = False
         self._stop_path: str | None = None
         self._stop_frame_count: int = 0
@@ -171,6 +235,20 @@ class EpisodeRecorder:
     @property
     def frame_count(self) -> int:
         return self._frame_count
+
+    def set_runtime_quality_metrics(self, metrics: dict[str, int]) -> None:
+        """Attach non-negative episode-level counters before stop."""
+        if not self._recording:
+            raise RuntimeError("runtime quality metrics require an active episode")
+        normalized: dict[str, int] = {}
+        for name, value in metrics.items():
+            if name not in _RUNTIME_QUALITY_METRIC_NAMES:
+                raise ValueError(f"unknown runtime quality metric: {name!r}")
+            count = int(value)
+            if count < 0:
+                raise ValueError(f"runtime quality metric {name!r} must be non-negative")
+            normalized[name] = count
+        self._runtime_quality_metrics = normalized
 
     @property
     def max_frames_reached(self) -> bool:
@@ -247,12 +325,12 @@ class EpisodeRecorder:
         self._datasets = {}
         self._flushed_frames = 0
 
-        # Skip-initial-frames gate; never drop the whole episode.
+        # Skip-initial-frames gate — clamp below max_frames so we never drop all.
         self._skip_initial_frames = max(0, min(int(skip_initial_frames), self.max_frames - 1))
         self._skipped_so_far = 0
         self._last_control_run_generation = None
 
-        # Store metadata until HDF5 creation.
+        # Store metadata for deferred write (HDF5 is created lazily).
         self._pending_meta = {
             "task_label": task_label,
             "operator": operator,
@@ -265,7 +343,8 @@ class EpisodeRecorder:
             "skip_initial_frames": self._skip_initial_frames,
         }
 
-        # Create data.h5 on the first flush or stop; begin grid alignment now.
+        # Defer data.h5 creation to the first periodic flush / stop_episode();
+        # start the record-time aligned buffer for non-camera streams.
         dt = 1.0 / self.control_hz
         self._buffer = TimestampAlignedBuffer(
             start_time=self._start_time,
@@ -294,12 +373,12 @@ class EpisodeRecorder:
             meta.attrs[f"provenance_{key}"] = str(value)
 
         # Additive, self-describing semantics for fields whose numeric layout
-        # remains unchanged in v17.
+        # remains unchanged in v16. Historical readers may ignore these attrs.
         for key, semantic_value in SEMANTIC_META_ATTRS_V17.items():
             meta.attrs[key] = semantic_value
 
         # The conditional sent-command dataset and this marker must agree.
-        # The marker remains absent when the optional stream is disabled.
+        # The marker remains absent when the optional v16 stream is disabled.
         if self.arm_sent_stream:
             meta.attrs[ARM_SENT_MARKER] = True
 
@@ -356,7 +435,8 @@ class EpisodeRecorder:
         if camera_K is not None:
             meta.attrs["camera_K"] = camera_K.flatten().tolist()
 
-        # Store the raw-depth scale for offline conversion.
+        # Raw uint16 depth units in meters (L515: 0.00025) — without this,
+        # offline consumers cannot convert /depth correctly.
         depth_scale = p.get("depth_scale")
         if depth_scale is not None:
             meta.attrs["depth_scale"] = float(depth_scale)
@@ -380,14 +460,14 @@ class EpisodeRecorder:
             self._max_frames_reached = True
             return False
 
-        # Skip initial begin-transition frames.
+        # ── Skip initial frames (begin-transition pose noise) ──
         # Return False (not recorded) so the caller's frame counter stays
         # consistent with the HDF5 num_frames — skipped frames touch no buffer.
         if self._skipped_so_far < self._skip_initial_frames:
             self._skipped_so_far += 1
             return False
 
-        # Align non-camera streams to the record grid.
+        # ── Non-camera streams → record-time aligned buffer ──
         sig = signals or {}
         diagnostic_values = normalize_diagnostics_v17(diagnostics)
 
@@ -405,6 +485,7 @@ class EpisodeRecorder:
         camera_fresh = bool(camera_frame.get("camera_fresh", False)) if camera_frame is not None else False
 
         data: dict[str, np.ndarray | float] = {
+            # ── Observables ──
             "arm_qpos": np.asarray(state.arm_qpos, dtype=np.float64),
             "arm_ee": np.concatenate([state.eef_pos, state.eef_rot6d]).astype(np.float64),
             "arm_qvel": np.asarray(state.arm_qvel, dtype=np.float64),
@@ -422,18 +503,25 @@ class EpisodeRecorder:
                 if state.hand_current is not None
                 else np.full(HAND_JOINT_SHAPE, np.nan)
             ),
+            # ── Connection status ──
+            # Distinguishes "physically disconnected (NaN qpos + connected=False)"
+            # from "connected but read failed (NaN qpos + connected=True)".
             "arm_connected": bool(state.arm_connected),
             "hand_connected": bool(state.hand_connected),
+            # ── Hand health/compatibility flags ──
             "hand_qpos_stale": bool(state.hand_qpos_stale),
             "hand_error_state": bool(state.hand_error_state),
+            # Arm command timing.
             "arm_last_cmd_seq": int(state.arm_last_cmd_seq),
             "arm_last_cmd_queue_latency_s": float(state.arm_last_cmd_queue_latency_s),
             "arm_last_cmd_apply_latency_s": float(state.arm_last_cmd_apply_latency_s),
             "arm_last_cmd_sdk_duration_s": float(state.arm_last_cmd_sdk_duration_s),
             "arm_last_cmd_is_hold": bool(state.arm_last_cmd_is_hold),
+            # ── Actions ──
             "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
             "action_arm_ee": self._build_action_ee(action),
             "action_hand_joint": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
+            # ── Causal/action protocol provenance ──
             "observation_id": int(sig.get("observation_id", 0)),
             "observation_anchor_monotonic_ns": int(sig.get("observation_anchor_monotonic_ns", 0)),
             "arm_source_sequence": int(sig.get("arm_source_sequence", 0)),
@@ -483,6 +571,7 @@ class EpisodeRecorder:
             "tactile_calibrated": bool(sig.get("tactile_calibrated", False)),
             "tactile_unit_code": int(sig.get("tactile_unit_code", 0)),
             "pointcloud_valid_depth_ratio": float(sig.get("pointcloud_valid_depth_ratio", np.nan)),
+            # ── Flags ──
             "flag_ik_ok": bool(sig.get("ik_ok", False)),
             "flag_ik_attempted": bool(sig.get("ik_attempted", True)),  # default True: normal frames
             "flag_retarget_ok": bool(sig.get("retarget_ok", False)),
@@ -504,10 +593,14 @@ class EpisodeRecorder:
             "camera_duplicate": bool(camera_frame.get("duplicate", False)) if camera_frame is not None else False,
             "camera_frame_gap": int(camera_frame.get("frame_gap", 0)) if camera_frame is not None else 0,
             "camera_backlog_s": (float(camera_frame.get("backlog_s", np.nan)) if camera_frame is not None else np.nan),
+            # ── Frame quality (schema v11) ──
+            # 0=ok, 1=held (gate reject), 2=ik_fail, 3=safety_reject
             "flag_frame_status": int(sig.get("frame_status", 0)),
+            # ── VR ──
             "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
             "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
             "vr_landmarks": np.asarray(vr_frame["landmarks"], dtype=np.float64),
+            # ── Optional policy diagnostics (NaN when unavailable) ──
             "tracking_error": np.nan,
             "ik_solve_time_ms": np.nan,
             "target_pos_before_clamp": np.full(3, np.nan),
@@ -520,7 +613,11 @@ class EpisodeRecorder:
             "transition_check_time_ms": np.nan,
             "policy_compute_time_ms": np.nan,
         }
-        # The sent-command stream is optional and follows causal alignment.
+        # ── Conditional sent-command stream (schema v17) ──
+        # None (kwarg unset) → NaN placeholder for this source sample; causal
+        # alignment may only hold it into later slots, never backward-fill an
+        # earlier slot. Gated on the constructor flag so
+        # an accidental kwarg can never add a dataset when the stream is disabled.
         if self.arm_sent_stream:
             sent = (
                 np.asarray(arm_qpos_sent, dtype=np.float64)
@@ -545,12 +642,15 @@ class EpisodeRecorder:
         prev_size = add_result.previous_size
         k = add_result.slots_written  # grid slots advanced (usually 1; 0 = dup bucket)
 
-        # Only the causal source slot can be fresh when one observation spans
-        # several grid deadlines.
+        # A single live camera observation may advance across several skipped
+        # grid deadlines. Only its causal source slot can be fresh; earlier
+        # synthetic slots retain shape but carry false validity.
         if k > 0:
             new_slice = slice(prev_size, self._buffer.size)
             source_valid = np.asarray(self._buffer.data["flag_sample_valid"][new_slice], dtype=bool)
-            # Give each synthesized slot its own grid deadline.
+            # Policy supplies its exact monotonic grid deadline as
+            # ``state.timestamp``. Give every synthesized gap slot its own
+            # deadline rather than retaining the previous source's anchor.
             grid_anchor_ns = np.rint(self._buffer.timestamps[new_slice] * 1e9).astype(np.uint64)
             self._buffer.data["observation_anchor_monotonic_ns"][new_slice] = grid_anchor_ns
             history_valid = np.asarray(self._buffer.data["observation_history_valid_mask"][new_slice, :, 0], dtype=bool)
@@ -568,7 +668,10 @@ class EpisodeRecorder:
             self._buffer.data["observation_valid"][new_slice] &= source_valid
             self._buffer.data["tactile_fresh"][new_slice] &= source_valid
             self._buffer.data["flag_camera_fresh"][new_slice] &= source_valid
-            # Synthetic slots must not claim a send event or replay identity.
+            # Synthetic gap/hold slots inherit the last source's effective
+            # target but must not claim a send event: clear the action-queue
+            # flag and zero action identity/timing on non-source slots so
+            # replay does not republish commands that were never sent.
             hold_slots = ~source_valid
             self._buffer.data["flag_action_queued"][new_slice] &= source_valid
             for name in (
@@ -579,11 +682,15 @@ class EpisodeRecorder:
             ):
                 self._buffer.data[name][new_slice][hold_slots] = 0
 
+        # ── Periodic non-camera flush: write buffered streams to HDF5 ──
         if self._buffer.size - self._flushed_frames >= self._flush_interval:
             self._ensure_hdf5()
             self._flush_buffered()
 
-        # Submit one RGB-D payload per grid slot so sidecars stay aligned.
+        # ── Camera streams → bounded background writer ──
+        # A complete RGB-D payload is submitted for every grid slot, including
+        # stale RGB/depth.  This keeps every sidecar exactly aligned with
+        # data.h5 without retaining image arrays in EpisodeRecorder memory.
         if k > 0:
             current_payload = self._camera_payload(camera_frame)
             zero_payload = self._camera_payload(None)
@@ -655,7 +762,7 @@ class EpisodeRecorder:
 
         # Validate the complete in-memory schema before creating or extending
         # any HDF5 dataset. Timestamp is stored outside ``buf_data`` but belongs
-        # to the same schema-v17 contract.
+        # to the same schema-v17 field contract.
         buffer_shapes = {name: tuple(values.shape) for name, values in buf_data.items()}
         buffer_dtypes = {name: values.dtype for name, values in buf_data.items()}
         buffer_shapes["timestamp"] = tuple(self._buffer.timestamps.shape)
@@ -683,6 +790,7 @@ class EpisodeRecorder:
                 ds.resize(buf_size, axis=0)
                 ds[new_start:buf_size] = arr[new_start:buf_size]
 
+        # Timestamp (stored separately from buf_data)
         ts = self._buffer.timestamps
         if "timestamp" not in self._datasets:
             self._datasets["timestamp"] = self._file.create_dataset(
@@ -730,10 +838,11 @@ class EpisodeRecorder:
         self._stop_success = success
         self._stop_path = path
         self._stop_frame_count = self._frame_count
+        runtime_quality_metrics = dict(self._runtime_quality_metrics)
 
         t = threading.Thread(
             target=self._stop_episode_impl,
-            args=(success, reason, truncated),
+            args=(success, reason, truncated, runtime_quality_metrics),
             daemon=False,
             name="episode-stop",
         )
@@ -812,7 +921,9 @@ class EpisodeRecorder:
         self._stop_frame_count = 0
         return result
 
-    def _stop_episode_impl(self, success: bool, reason: str, truncated: bool) -> None:
+    def _stop_episode_impl(
+        self, success: bool, reason: str, truncated: bool, runtime_quality_metrics: dict[str, int]
+    ) -> None:
         """Background: finalize sidecars, flush buffers, write metadata, and publish.
 
         ENOSPC / OSError at any h5py call site is captured into ``_stop_error``
@@ -820,7 +931,7 @@ class EpisodeRecorder:
         or announcing a truncated episode.
         """
         try:
-            self._stop_episode_impl_inner(success, reason, truncated)
+            self._stop_episode_impl_inner(success, reason, truncated, runtime_quality_metrics)
         except Exception as exc:
             self._stop_error = f"{type(exc).__name__}: {exc}"
             logger.error("stop_episode failed: %s — HDF5 may be truncated", self._stop_error)
@@ -849,12 +960,14 @@ class EpisodeRecorder:
                 self._discard_temp_files(_tmp)
             self._reset_episode_state()
 
-    def _stop_episode_impl_inner(self, success: bool, reason: str, truncated: bool) -> None:
+    def _stop_episode_impl_inner(
+        self, success: bool, reason: str, truncated: bool, runtime_quality_metrics: dict[str, int]
+    ) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
         can reset state on any exception without duplicating the reset list."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
-        # Finalize camera streams before publishing.
+        # ── Drain/finalize camera writer before publishing the episode ──
         writer = self._camera_writer
         if writer is None:
             raise RuntimeError("camera writer missing at episode stop")
@@ -863,6 +976,7 @@ class EpisodeRecorder:
         self._camera_writer_metrics = writer.metrics
         self._camera_writer = None
 
+        # ── Flush remaining buffered non-camera streams ──
         self._flush_buffered()
         buf_size = self._buffer.size if self._buffer is not None else 0
         self._ensure_hdf5()
@@ -872,9 +986,16 @@ class EpisodeRecorder:
 
         self._buffer = None
         self._frame_count = buf_size
+        quality_metrics = _episode_quality_metrics(
+            self._datasets,
+            frame_count=self._frame_count,
+            control_hz=self.control_hz,
+            runtime_metrics=runtime_quality_metrics,
+        )
 
         _had_rgb = camera_frame_count > 0
 
+        # ── Write final metadata ──
         if self._file is not None:
             meta = self._file["meta"]
             grid_dt_s = 1.0 / self.control_hz
@@ -898,20 +1019,43 @@ class EpisodeRecorder:
             meta.attrs["camera_writer_error"] = ""
             for metric_name, metric_value in self._camera_writer_metrics.items():
                 meta.attrs[metric_name] = metric_value
+            for metric_name, metric_value in quality_metrics.items():
+                meta.attrs[metric_name] = int(metric_value)
             meta.attrs["truncated"] = bool(truncated)
             meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
-            # Backfill metadata published after camera startup.
+            # Camera meta backfill: the initial lazy write may have run
+            # before the camera child finished connect — re-write so late
+            # values land in the file.
             self._write_camera_meta_attrs(meta)
 
         if self._file is not None:
             self._file.close()
         self._file = None
+        # ── Atomic finalise ──
+        # success: rename temp dir → final dir.
+        # discard:  remove temp dir.
         _final = self._episode_dir
         _tmp = self._temp_dir
         if _tmp is not None and _final is not None:
             if success:
                 self._validate_and_sync_temp_episode(Path(_tmp), self._frame_count)
                 atomic_publish(_tmp, _final)
+                logger.info(
+                    "Episode quality: path=%s frames=%d ik_hold=%d camera_invalid=%d "
+                    "observation_invalid=%d "
+                    "sample_invalid=%d safety_reject=%d quiescence=%d "
+                    "hand_read_errors=%d hand_overcurrent=%d",
+                    _final,
+                    self._frame_count,
+                    quality_metrics["ik_hold_frame_count"],
+                    quality_metrics["camera_invalid_frame_count"],
+                    quality_metrics["observation_invalid_frame_count"],
+                    quality_metrics["sample_invalid_frame_count"],
+                    quality_metrics["safety_reject_frame_count"],
+                    quality_metrics["command_quiescence_count"],
+                    quality_metrics.get("hand_read_error_count", 0),
+                    quality_metrics.get("hand_overcurrent_count", 0),
+                )
             else:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
                 self._discard_temp_files(_tmp)
@@ -934,8 +1078,9 @@ class EpisodeRecorder:
         self._camera_writer_metrics = {}
         self._last_camera_payload = None
         self._last_control_run_generation = None
+        self._runtime_quality_metrics = {}
 
-    # Atomic file finalization.
+    # ── Atomic file finalisation ──────────────────────────────────────
 
     def _write_aborted_manifest(self, *, reason: str, error: str) -> Path:
         """Persist only small failure provenance; never retain partial payloads."""

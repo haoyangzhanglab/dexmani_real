@@ -35,10 +35,9 @@ camera / VR / arm / hand ──shared-memory state──► teleop
                                                      │
                        arm queue ◄──────────────────┼──► hand command ring
                                                      │
-                                         fixed-grid samples
+                                         aligned sample ring
                                                      ▼
-                                  direct EpisodeRecorder ──► HDF5 episode v17
-                                                     └──► RecorderIO transport
+                                            RecorderIO ──► HDF5 episode v17
 ```
 
 The main/lifecycle process resolves immutable configuration, creates
@@ -84,8 +83,7 @@ Preserve these unless the user explicitly requests an architectural redesign.
    share a live SDK instance across processes.
 4. Teleoperation owns control-grid, action, and episode/sample decisions.
    `RecorderIO` only serializes, verifies, and transactionally publishes what
-   it receives. The direct backend uses the same `EpisodeRecorder` contract
-   locally and bypasses only the transport process.
+   it receives.
 5. Recording is grid-aligned to `1 / control_hz` (normally 16 Hz), never
    arrival-time sampled.
 6. The arm queue is ordered and intentionally bounded (`maxsize=2`). The hand
@@ -108,9 +106,8 @@ Preserve these unless the user explicitly requests an architectural redesign.
     error discards the episode without advancing generation; only the next
     explicit BEGIN advances it.
 14. Recorder START/STOP boundaries, recorder status, and aligned samples are
-    fixed NumPy dtypes. The direct backend keeps only its lifecycle local; the
-    v17 transport uses the shared control path. Do not put JSON or an
-    acknowledgement/apply protocol in the shared-memory control path.
+    fixed NumPy dtypes. Do not put JSON or an acknowledgement/apply protocol
+    in the shared-memory control path.
 15. Learned-policy deployment is layered: `integrations/` may import
     `deployment/`, never the reverse. The inference worker only writes
     `policy_plan_ring`; `deployment/coordinator.py` is the sole robot-action

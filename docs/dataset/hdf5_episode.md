@@ -32,7 +32,7 @@ version attribute 伪装成 v17。
 | 基础 dataset | `BASE_DATASET_SPECS_V17` 定义的 93 个无条件字段 |
 | sent arm stream | `/meta.arm_sent_stream=True` 且存在 `action_arm_joint_sent` 时增加；不是所有 v17 都无条件拥有 |
 | dtype/shape | 由 `episode_schema.py` 统一定义；writer、reader、finalizer 共用校验器 |
-| recorder backend | `direct` 和 `v17` 只区别 RecorderIO transport，输出字段和含义一致 |
+| recorder backend | RecorderIO 消费固定共享内存控制/样本 payload，并输出 schema-v17 episode |
 | point cloud | 不写 `pointcloud.h5`；从 depth、相机 metadata 和点云配置在消费边界确定性派生 |
 
 不要根据 dataset 数量猜 schema；先读 `/meta.schema_version`、`arm_sent_stream` 和实际 keys，再调用 `EpisodeReader.require_valid()`。
@@ -124,6 +124,13 @@ rows = (
 - `/meta.success` 是 episode 保存/发布结果，不是任务成功。
 - `/meta.min_frames_met` 是质量标签，不单独决定 episode 是否可读。
 - `/meta.duration`/`wall_duration_s` 包含未采样时段；`grid_duration_s` 只描述网格槽。
+- `/meta.ik_hold_frame_count`、`camera_invalid_frame_count`、
+  `observation_invalid_frame_count`、`sample_invalid_frame_count`、
+  `safety_reject_frame_count` 汇总逐帧质量标志；
+  `command_quiescence_count` 统计 timestamp 中明确保留的静默分段。
+- `/meta.hand_read_error_count` 和 `hand_overcurrent_count` 是本 episode 录制窗口内
+  XHand worker 的累计事件差值；瞬态事件即使未被 16 Hz 帧命中也不会从摘要消失。
+  是否升级为运行时 sticky fault 由 resolved config 中的 XHand 过流次数/时间窗阈值决定。
 - `resolved_config_sha256` 不能还原完整配置；需要外部配置文件。
 - 触觉和 effort 的未知单位必须保留为 unknown，不能为了训练方便补写 SI 单位。
 - `flag_sample_valid=True` 不等于 `flag_observation_valid`、IK、retarget、camera 或 tactile 都有效。

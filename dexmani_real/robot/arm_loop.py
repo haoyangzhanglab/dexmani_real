@@ -652,7 +652,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         cfg.arm_loop_hz,
     )
 
-    limiter = RateManager(cfg.arm_loop_hz)
+    limiter = RateManager(cfg.arm_loop_hz, label="arm")
 
     stopped_cleanly = False
     try:

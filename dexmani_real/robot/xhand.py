@@ -60,6 +60,19 @@ _RS485_TACTILE_STATUS_DETAIL = {
 _RS485_CRC_ERROR_CODE = 1_501_070
 
 
+class XHandReadError(RuntimeError):
+    """Structured failure from one XHand state transaction."""
+
+    def __init__(self, code: int, message: str, *, connected: bool) -> None:
+        self.code = int(code)
+        self.message = str(message)
+        self.connected = bool(connected)
+        super().__init__(
+            f"XHand read failed: code={self.code} msg={self.message!r} "
+            f"connected={int(self.connected)}"
+        )
+
+
 @dataclass
 class XHandConfig:
     # Canonical transport: "serial" (RS485) or "ethercat".
@@ -1013,8 +1026,10 @@ class XHand:
         tactile_status = self._is_rs485_tactile_status(err)
         if (not self.error_ok(err) and not tactile_status) or hand_state is None:
             self._record_error(err)
-            raise RuntimeError(
-                f"XHand read failed: code={self.last_error_code} msg={self.last_error_message!r}"
+            raise XHandReadError(
+                -1 if self.last_error_code is None else int(self.last_error_code),
+                self.last_error_message,
+                connected=self.connected_flag,
             )
 
         if tactile_status:

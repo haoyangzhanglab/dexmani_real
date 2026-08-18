@@ -33,7 +33,7 @@ recorder: received sample → validate/write/publish
 - main 不映射 VR、不生产 action、不选择 recording sample。
 - hardware SDK 不跨进程传递；拥有 SDK 的 worker 不做策略决策。
 - `deployment/` 不依赖 `integrations/`；适配器只能反向依赖 deployment contracts。
-- `recording/` 不改变采样时机和业务语义；direct 与 RecorderIO 共用 `EpisodeRecorder`。
+- `recording/` 不改变采样时机和业务语义；RecorderIO 只序列化、校验并事务式发布固定网格样本。
 
 ## 不可破坏的协议
 
@@ -52,6 +52,11 @@ recorder: received sample → validate/write/publish
 - `run_generation` 标记控制时代；BEGIN、pause、home、feedback fault 使旧命令失效。camera stall/写盘错误丢弃 episode，但等待下一次显式 BEGIN 才推进 generation。
 - worker 在共享命令跨越 SDK 边界前再次检查 generation、有效期、状态和 payload。
 - 普通 pause 是 command quiescence：不发送 measured hold，不调用 State 6；让固件完成已接受的 endpoint。
+- `KeyboardHandler` 控制键按下—释放边沿触发；长按/自动连发不得重复触发 BEGIN、pause、HOME 等状态变更。HOME 是一次性阻塞操作，返回后必须丢弃积压的 HOME 事件；ESC 仍独立即时锁存。
+- `AudioFeedback` 只有一个串行播放 worker：`play()` 抢占当前提示并清空队列，`queue()` 必须在当前提示完成后才播放，提示音不得重叠。
+- `AudioFeedback` 必须记录播放器启动、返回码和截断 stderr；退出提示使用有界 idle wait，不能依靠固定 sleep 猜测播放完成。
+- XHand 单帧读取失败保留真实连接状态，并发布 `state_valid=0`、`read_healthy=0`、`qpos_stale=1`。过流事件使用累计计数跨速率传递，运动保持 ARMED，达到健康帧门槛后仍须操作者按 C 恢复；短窗内重复过流必须升级为 sticky `error_state`。
+- `RateManager` 的运行实例带 loop label；共享环历史读取先复制最易被覆盖的最旧槽。
 - xArm Mode 6 已负责 arm trajectory smoothing；不要加入应用侧插值。
 - SafetyGate 是 action publish 的统一边界；固件仍是最后 backstop。
 
@@ -60,7 +65,7 @@ recorder: received sample → validate/write/publish
 - runtime episode 只接受 schema v17；目录包含 `data.h5`、`depth.h5`、`rgb.mp4`，失败不原子发布。
 - `recording/episode_schema.py` 同时约束 writer、reader 和 finalizer；不要维护第二份 dataset 列表。
 - point cloud 不作为独立 sidecar 保存，由 depth 和 metadata 在消费边界确定性派生。
-- direct 是默认 recorder backend；`v17` 只改变 RecorderIO transport，不改变 episode 字段语义。
+- RecorderIO 是唯一 recorder backend；START/STOP、status 与 sample 均走固定共享 dtype 控制路径。
 - learned-policy inference worker 只写 `policy_plan_ring`；coordinator 是唯一 robot-action producer。
 - 模型输出是 proposal，不是 command；必须经过共享 SafetyGate/发送边界。
 
@@ -84,7 +89,7 @@ recorder: received sample → validate/write/publish
 ### 修改 recording/replay
 
 1. 先读 `episode_schema.py` 和 `episode_reader.py`，确认是不是 schema 变更。
-2. direct 与 RecorderIO 必须 field-for-field 一致；START/STOP/status/sample 保持固定 dtype。
+2. START/STOP/status/sample 保持固定 dtype，并经 RecorderIO 共享控制路径传递。
 3. 写入仍需临时目录、校验、fsync 和原子发布；任何 stream/codec/overflow 错误 fail closed。
 4. 同步 reader、质量规则、可视化、数据处理和 replay；不要“只改 writer”。
 

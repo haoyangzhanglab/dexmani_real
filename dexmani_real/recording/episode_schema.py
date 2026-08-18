@@ -3,7 +3,7 @@
 The HDF5 data file has 93 unconditional per-grid datasets.  The exact command
 actually submitted to the arm worker is a 94th, conditional dataset controlled
 by the ``arm_sent_stream`` metadata marker.  Unknown datasets are tolerated by
-the reader for forward-compatible diagnostics, but they must remain aligned
+the reader for historical diagnostic extensions, but they must remain aligned
 to the episode grid.
 """
 
@@ -45,8 +45,9 @@ def _spec(dtype: Any, tail_shape: tuple[int, ...] = ()) -> DatasetSpec:
     return DatasetSpec(tail_shape=tail_shape, dtype=np.dtype(dtype))
 
 
-# The unconditional schema-v17 fields. Keep the grouping aligned with the
-# public data dictionary and writer construction.
+# The 96 fields that every schema-v17 data.h5 produced by EpisodeRecorder has.
+# Keep the grouping aligned with the public data dictionary and writer data
+# construction so a review can compare each producer category directly.
 BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     # Fixed control grid and causal fill.
     "timestamp": _spec(np.float64),
@@ -184,7 +185,7 @@ DIAGNOSTIC_TAIL_SHAPES_V17: dict[str, tuple[int, ...]] = {
     "policy_compute_time_ms": (),
 }
 
-# Metadata extensions are additive and may be ignored by readers.
+# Additive metadata only: older schema-v17 readers may ignore every key here.
 SEMANTIC_META_ATTRS_V17: dict[str, str | float | bool] = {
     "robot_world_frame": "xarm_base",
     "robot_world_equals_xarm_base": True,
@@ -281,7 +282,7 @@ def validate_data_layout_v17(
 ) -> tuple[str, ...]:
     """Return deterministic errors for one ``data.h5`` or in-memory layout.
 
-    Unknown diagnostic datasets are accepted, but—like every
+    Unknown historical diagnostic datasets are accepted, but—like every
     writer-produced data stream—they must have a grid dimension equal to
     ``frame_count``.  Known fields additionally require their exact v17 tail
     shape and dtype.

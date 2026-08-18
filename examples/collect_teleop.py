@@ -2,10 +2,9 @@
 """VR teleoperation and data-collection entry point.
 
 Spawn-only capability model: VR, teleop, arm, measured hand (unless explicitly
-disabled), camera, and optional RecorderIO transport.
+disabled), camera, and RecorderIO (only when recording is enabled).
 Safety: DISARMED/ARMED/RUNNING/FAULT state machine + enabled-capability heartbeats.
-Recording defaults to the in-process schema-v17 writer; use
-``policy.recording_mode=v17`` to retain the RecorderIO transport.
+Recording: one causal configured-rate grid published as HDF5 schema v17.
 
 The full experiment lifecycle lives here rather than in the ``dexmani_real``
 package — that keeps the package focused on reusable library code and avoids
@@ -116,11 +115,8 @@ def _preflight_health_issues(
     enabled_heartbeats = ["arm", "vr", "policy"]
     if hand_enabled:
         enabled_heartbeats.append("hand")
-    camera_recording_enabled = recording_enabled
-    if camera_recording_enabled:
-        enabled_heartbeats.append("camera")
-    if recording_enabled and runtime.policy.recording_mode == "v17":
-        enabled_heartbeats.append("recorder")
+    if recording_enabled:
+        enabled_heartbeats += ["camera", "recorder"]
     heartbeat_timeouts = runtime.safety.heartbeat_timeouts
     for name in enabled_heartbeats:
         last_s = shared.get_heartbeat(name)
@@ -193,7 +189,7 @@ def _preflight_health_issues(
         if not vr_ok:
             issues.append("VR hand feedback is invalid or stale")
 
-    if camera_recording_enabled:
+    if recording_enabled:
         camera_result = shared.camera_ring.read_latest()
         if camera_result is None:
             issues.append("camera frame is unavailable")
@@ -239,11 +235,8 @@ def _print_session_header(
     recording_enabled: bool,
 ) -> None:
     process_labels = ["arm", "vr", "policy"]
-    camera_recording_enabled = recording_enabled
-    if camera_recording_enabled:
-        process_labels.append("camera")
-    if recording_enabled and runtime.policy.recording_mode == "v17":
-        process_labels.append("recorder")
+    if recording_enabled:
+        process_labels.extend(("camera", "recorder"))
     if hand_enabled:
         process_labels.append("hand")
     session_meta = []
@@ -257,7 +250,6 @@ def _print_session_header(
             f"speed={float(runtime.arm.max_joint_velocity_deg_per_s)}deg/s",
             f"hand={'ON' if hand_enabled else 'OFF'}",
             f"record={'ON' if recording_enabled else 'OFF'}",
-            f"format={runtime.policy.recording_mode if recording_enabled else 'off'}",
             f"config={runtime.sha256[:12]}",
         )
     )
@@ -284,7 +276,6 @@ def _build_processes(
         task_label=task_label,
         operator=operator,
         hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
-        recording_provenance=provenance,
     )
     # Readiness order is the single source of truth for build order and for the
     # readiness/heartbeat names derived from it (arm → vr → policy → camera →
@@ -294,11 +285,9 @@ def _build_processes(
         WorkerSpec("vr", _vr_loop, (shared, VRReceiverConfig.from_runtime(runtime)), ready_name="vr"),
         WorkerSpec("policy", teleop_loop, (shared, policy_config), ready_name="policy"),
     ]
-    camera_recording_enabled = recording_enabled
-    if camera_recording_enabled:
+    if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
         specs.append(WorkerSpec("camera", _camera_loop, (shared, camera_config), ready_name="camera"))
-    if recording_enabled and runtime.policy.recording_mode == "v17":
         recorder_config = RecorderIOConfig(
             data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir),
             max_frames=int(round(policy_config.runtime.policy.max_record_duration_s * policy_config.runtime.policy.control_hz)),
@@ -357,13 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-record",
         action="store_true",
-        help="Run VR teleoperation without recording; recording capabilities are not started.",
-    )
-    parser.add_argument(
-        "--recording-mode",
-        choices=("direct", "v17"),
-        default=None,
-        help="Recording transport (default: direct schema-v17 writer; v17 uses RecorderIO).",
+        help="Run VR teleoperation without recording; camera and RecorderIO are not started.",
     )
     parser.add_argument("--config", type=str, default=None, help="YAML file with experiment overrides")
     parser.add_argument("--print-config", action="store_true", help="Print all config values and exit")
@@ -377,7 +360,6 @@ def main(argv: list[str] | None = None) -> int:
                 "arm.max_joint_velocity_deg_per_s": args.speed,
                 "policy.hand_enabled": False if args.no_hand else None,
                 "policy.recording_enabled": False if args.no_record else None,
-                "policy.recording_mode": args.recording_mode,
             },
         )
     except (KeyError, OSError, TypeError, UnicodeError, ValueError, yaml.YAMLError) as exc:
@@ -422,11 +404,8 @@ def run_teleop_experiment(
     except (OSError, TypeError, ValueError) as exc:
         print(f"Preflight failed: invalid VR transform: {exc}")
         return 1
-    # Both backends persist the same resource provenance; only the transport
-    # differs. Direct mode keeps this snapshot in the policy-owned recorder.
-    recording_provenance_required = recording_enabled
     try:
-        provenance = _resource_provenance(repo_root) if recording_provenance_required else ()
+        provenance = _resource_provenance(repo_root) if recording_enabled else ()
     except (FileNotFoundError, OSError) as exc:
         print(f"Preflight failed: {exc}")
         return 1
@@ -571,11 +550,7 @@ def run_teleop_experiment(
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
-        recording_issue = (
-            _recording_session_issue(shared)
-            if recording_enabled and runtime.policy.recording_mode == "v17"
-            else None
-        )
+        recording_issue = _recording_session_issue(shared) if recording_enabled else None
         shutdown_report = shutdown_processes(
             shared,
             procs,
@@ -611,8 +586,7 @@ def run_teleop_experiment(
         require_transition(shared, SafetyState.FAULT)
         return 1
     finally:
-        # A direct writer or RecorderIO may still be validating and publishing
-        # an episode transaction while the worker set is being torn down.
+        # RecorderIO may still be validating and publishing an episode transaction.
         if shutdown_report is None:
             started = [process for process in procs if process.pid is not None]
             if started:

@@ -34,12 +34,16 @@ class RateManager:
         self,
         target_hz: float,
         *,
+        label: str = "unnamed",
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
         if not isinstance(target_hz, (int, float)) or not math.isfinite(float(target_hz)) or target_hz <= 0:
             raise ValueError(f"target_hz must be positive, got {target_hz}")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("rate manager label must be a non-empty string")
         self.target_hz = float(target_hz)
+        self.label = label.strip()
         self.period = 1.0 / target_hz
         self._clock = time.perf_counter if clock is None else clock
         self._sleep = time.sleep if sleep is None else sleep
@@ -119,9 +123,13 @@ class RateManager:
                 # Short overrun: emit a throttled warning.
                 if self._overdue_throttle <= 0:
                     logger.warning(
-                        "Control loop over budget: actual=%.1fms target=%.1fms",
+                        "Control loop over budget: loop=%s actual=%.1fms "
+                        "target=%.1fms lateness=%.1fms missed_total=%d",
+                        self.label,
                         (self.period - remaining) * 1000,
                         self.period * 1000,
+                        lateness * 1000,
+                        self._missed_slot_count,
                     )
                     self._overdue_throttle = 50
                 else:

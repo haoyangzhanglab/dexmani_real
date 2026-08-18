@@ -293,7 +293,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
 
         # Main capture loop.
-        rate_mgr = RateManager(cfg.publish_hz)
+        rate_mgr = RateManager(cfg.publish_hz, label="camera")
         ready_published = False
 
         while shared.is_running.value:

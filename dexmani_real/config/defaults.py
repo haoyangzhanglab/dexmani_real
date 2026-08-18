@@ -88,8 +88,8 @@ class WorkspaceBounds:
 class EMAParams:
     """Cartesian-space EMA smoothing parameters."""
 
-    alpha_pos: float = 0.6
-    alpha_rot: float = 0.4
+    alpha_pos: float = 0.5
+    alpha_rot: float = 0.5
 
     def __post_init__(self) -> None:
         if not (np.isfinite(self.alpha_pos) and np.isfinite(self.alpha_rot)):
@@ -251,8 +251,8 @@ class ArmParams:
     )
 
     # Mode 6 firmware limits.
-    max_joint_velocity_deg_per_s: float = 120.0  # firmware trajectory speed
-    max_joint_acceleration_deg_per_s2: float = 900.0  # firmware trajectory acceleration
+    max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
+    max_joint_acceleration_deg_per_s2: float = 1031.324031235482  # 18 rad/s²; 90% of the 20 rad/s² SDK limit
     loop_hz: float = 30.0  # arm_loop servo rate
 
     ip: str = "192.168.1.111"
@@ -479,6 +479,9 @@ class HandParams:
     # Send-error watchdog.
     # Only a failed new-command send increments this counter.
     send_err_watchdog_count: int = 30
+    # Repeated non-consecutive hardware overcurrent reports still latch fault.
+    overcurrent_fault_count: int = 3
+    overcurrent_fault_window_s: float = 10.0
 
     # Hand FK (world-frame fingertip positions).
     fingertip_link_names: tuple[str, ...] = (
@@ -555,6 +558,13 @@ class HandParams:
             raise ValueError("hand home_command_ack_timeout_s must be finite and positive")
         if self.send_err_watchdog_count <= 0:
             raise ValueError("hand send_err_watchdog_count must be positive")
+        if not isinstance(self.overcurrent_fault_count, int) or self.overcurrent_fault_count <= 0:
+            raise ValueError("hand overcurrent_fault_count must be a positive integer")
+        if (
+            not np.isfinite(self.overcurrent_fault_window_s)
+            or self.overcurrent_fault_window_s <= 0
+        ):
+            raise ValueError("hand overcurrent_fault_window_s must be finite and positive")
         if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
             raise ValueError("hand fingertip_link_names must contain five non-empty names")
         transform = np.asarray(self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz, dtype=np.float64)
@@ -587,8 +597,6 @@ class PolicyParams:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
 
     recording_enabled: bool = True
-    # "direct" records in teleop; "v17" uses the RecorderIO transport.
-    recording_mode: Literal["direct", "v17"] = "direct"
     max_record_duration_s: float = 60.0
     # Quality label only; filtering remains downstream.
     min_record_duration_s: float = 1.0
@@ -610,6 +618,9 @@ class PolicyParams:
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
     hand_disconnect_timeout_s: float = 1.0
+    # A hardware overcurrent requires this many healthy control-grid samples
+    # before C may explicitly resume motion.
+    hand_overcurrent_recovery_frames: int = 5
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
@@ -643,8 +654,6 @@ class PolicyParams:
             raise ValueError("recording durations must be finite, ordered, and non-negative")
         if not self.episodes_dir or self.status_print_interval <= 0 or self.max_consecutive_errors <= 0:
             raise ValueError("policy output path and diagnostic intervals must be valid")
-        if self.recording_mode not in {"direct", "v17"}:
-            raise ValueError("recording_mode must be 'direct' or 'v17'")
         if (
             not np.isfinite(self.ik_max_pose_error_pos_m)
             or not np.isfinite(self.ik_max_pose_error_rot_rad)
@@ -658,6 +667,8 @@ class PolicyParams:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
         if not np.isfinite(self.hand_disconnect_timeout_s) or self.hand_disconnect_timeout_s <= 0:
             raise ValueError("hand_disconnect_timeout_s must be finite and positive")
+        if self.hand_overcurrent_recovery_frames <= 0:
+            raise ValueError("hand_overcurrent_recovery_frames must be positive")
         if (
             self.arm_max_delta_rad_per_tick is not None
             and (not np.isfinite(self.arm_max_delta_rad_per_tick) or self.arm_max_delta_rad_per_tick <= 0)

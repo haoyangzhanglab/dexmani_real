@@ -287,8 +287,11 @@ class SharedMemoryRingBuffer:
             return []
         frames: list[tuple[np.ndarray, int, int]] = []
         dropped = False
-        for offset in range(min(k, latest_seq)):
-            target_seq = latest_seq - offset
+        count = min(k, latest_seq)
+        first_seq = latest_seq - count + 1
+        # Copy the oldest (next-to-be-overwritten) slot first. Reading newest
+        # first needlessly left that vulnerable slot until the end.
+        for target_seq in range(first_seq, latest_seq + 1):
             slot = self._data_buf[target_seq % self.maxlen]
             seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + (target_seq % self.maxlen) * self._slot_size)
             accepted = False
@@ -299,7 +302,7 @@ class SharedMemoryRingBuffer:
                 if _seqlock_to_logical(marker1) != target_seq:
                     # This slot has already been overwritten by a newer write
                     # (its marker now belongs to a later sequence).  Skip it and
-                    # keep walking older sequences rather than discarding the
+                    # keep walking the requested range rather than discarding the
                     # still-valid history we already collected.
                     dropped = True
                     break
@@ -311,7 +314,6 @@ class SharedMemoryRingBuffer:
                     break
             if not accepted:
                 dropped = True
-        frames.reverse()
         if dropped:
             self._warn_torn_read_k(k, len(frames))
         return frames

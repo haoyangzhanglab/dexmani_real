@@ -88,8 +88,12 @@ def _do_teleop_home(
     table_z_surface_m: float,
     hand_command_lower_rad: tuple[float, ...] | np.ndarray = hand.qpos_min_rad,
     hand_command_upper_rad: tuple[float, ...] | np.ndarray = hand.qpos_max_rad,
-    hand_mechanical_lower_rad: tuple[float, ...] | np.ndarray = hand.mechanical_qpos_min_rad,
-    hand_mechanical_upper_rad: tuple[float, ...] | np.ndarray = hand.mechanical_qpos_max_rad,
+    hand_mechanical_lower_rad: (
+        tuple[float, ...] | np.ndarray
+    ) = hand.mechanical_qpos_min_rad,
+    hand_mechanical_upper_rad: (
+        tuple[float, ...] | np.ndarray
+    ) = hand.mechanical_qpos_max_rad,
     hand_home_ack_timeout_s: float = hand.home_command_ack_timeout_s,
     arm_home_convergence_timeout_s: float = arm.homing.convergence_timeout_s,
     arm_home_request_queue_timeout_s: float = arm.homing.request_queue_timeout_s,
@@ -127,15 +131,21 @@ def _do_teleop_home(
             np.asarray(hand_home_qpos, dtype=np.float64),
             command_lower_rad=np.asarray(hand_command_lower_rad, dtype=np.float64),
             command_upper_rad=np.asarray(hand_command_upper_rad, dtype=np.float64),
-            mechanical_lower_rad=np.asarray(hand_mechanical_lower_rad, dtype=np.float64),
-            mechanical_upper_rad=np.asarray(hand_mechanical_upper_rad, dtype=np.float64),
+            mechanical_lower_rad=np.asarray(
+                hand_mechanical_lower_rad, dtype=np.float64
+            ),
+            mechanical_upper_rad=np.asarray(
+                hand_mechanical_upper_rad, dtype=np.float64
+            ),
             hand_feedback_max_age_s=hand_feedback_max_age_s,
             timeout_s=hand_home_ack_timeout_s,
             heartbeat=heartbeat,
             abort_requested=estop_requested,
         )
         if not hand_accepted:
-            logger.warning("arm home cancelled: hand-home command was not accepted by the worker/SDK")
+            logger.warning(
+                "arm home cancelled: hand-home command was not accepted by the worker/SDK"
+            )
             return prev_hand_qpos
         prev_hand_qpos = np.asarray(hand_home_qpos, dtype=np.float64).copy()
         planner.set_hand_qpos(prev_hand_qpos)
@@ -144,7 +154,9 @@ def _do_teleop_home(
         planner.set_hand_qpos(prev_hand_qpos)
         print("  hand: using explicitly acknowledged fixed-home geometry", flush=True)
     else:
-        print("  hand: not connected — arm home cancelled (hand pose unknown)", flush=True)
+        print(
+            "  hand: not connected — arm home cancelled (hand pose unknown)", flush=True
+        )
         return prev_hand_qpos
 
     # Step 2: arm home (collision-checked path via HOME_SENTINEL). Planning uses
@@ -161,10 +173,15 @@ def _do_teleop_home(
         or int(_arm_state["error_code"][0]) != 0
         or not np.all(np.isfinite(_arm_state["qpos"][0]))
     ):
-        logger.warning("arm home cancelled: arm state is stale or unhealthy (age=%.3fs)", _state_age_s)
+        logger.warning(
+            "arm home cancelled: arm state is stale or unhealthy (age=%.3fs)",
+            _state_age_s,
+        )
         return prev_hand_qpos
     arm_qpos = np.asarray(_arm_state["qpos"][0], dtype=np.float64).copy()
-    _home_qpos = np.array(arm.home_qpos if arm_home_qpos is None else arm_home_qpos, dtype=np.float64)
+    _home_qpos = np.array(
+        arm.home_qpos if arm_home_qpos is None else arm_home_qpos, dtype=np.float64
+    )
     _ok = send_arm_home(
         shared,
         _home_qpos,
@@ -184,10 +201,14 @@ def _do_teleop_home(
         verbose=True,
     )
     if _ok:
-        audio.play("home_done")
+        # Keep the departure cue intact; AudioFeedback.queue() serializes this
+        # completion cue after it instead of cancelling it mid-sentence.
+        audio.queue("home_done")
         print("  arm: home reached", flush=True)
     else:
-        logger.warning("arm home failed or was cancelled; see correlated HOME result above")
+        logger.warning(
+            "arm home failed or was cancelled; see correlated HOME result above"
+        )
 
     return prev_hand_qpos
 
@@ -212,16 +233,28 @@ def _do_configured_teleop_home(
         prev_hand_qpos=prev_hand_qpos,
         planner=planner,
         audio=audio,
-        hand_home_qpos=np.deg2rad(np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)),
-        hand_command_lower_rad=np.asarray(config.runtime.hand.qpos_min_rad, dtype=np.float64),
-        hand_command_upper_rad=np.asarray(config.runtime.hand.qpos_max_rad, dtype=np.float64),
-        hand_mechanical_lower_rad=np.asarray(config.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64),
-        hand_mechanical_upper_rad=np.asarray(config.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64),
+        hand_home_qpos=np.deg2rad(
+            np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)
+        ),
+        hand_command_lower_rad=np.asarray(
+            config.runtime.hand.qpos_min_rad, dtype=np.float64
+        ),
+        hand_command_upper_rad=np.asarray(
+            config.runtime.hand.qpos_max_rad, dtype=np.float64
+        ),
+        hand_mechanical_lower_rad=np.asarray(
+            config.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+        ),
+        hand_mechanical_upper_rad=np.asarray(
+            config.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+        ),
         hand_home_ack_timeout_s=config.runtime.hand.home_command_ack_timeout_s,
         arm_home_convergence_timeout_s=config.runtime.arm.homing.convergence_timeout_s,
         arm_home_request_queue_timeout_s=config.runtime.arm.homing.request_queue_timeout_s,
         arm_home_state_max_age_s=config.runtime.arm.homing.state_max_age_s,
-        arm_home_max_speed_rad_s=float(np.deg2rad(config.runtime.arm.homing.max_speed_deg_s)),
+        arm_home_max_speed_rad_s=float(
+            np.deg2rad(config.runtime.arm.homing.max_speed_deg_s)
+        ),
         arm_home_target_timeout_s=config.runtime.arm.homing.target_timeout_s,
         arm_home_velocity_convergence_rad_s=config.runtime.arm.homing.velocity_convergence_rad_s,
         arm_home_result_tolerance_rad=config.runtime.arm.homing.convergence_rad,

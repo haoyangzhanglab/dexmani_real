@@ -115,7 +115,7 @@ class KeyboardHandler:
 
     def __init__(
         self,
-        debounce_s: float = 0.5,
+        debounce_s: float = 0.0,
         *,
         estop_callback: Callable[[], None] | None = None,
         startup_timeout_s: float = 2.0,
@@ -134,7 +134,33 @@ class KeyboardHandler:
         self._estop_latched = threading.Event()
         self._listener_failure_reported = False
         self._last_signal_time: dict[ControlSignal, float] = {}
+        self._pressed_signals: set[ControlSignal] = set()
         self._saved_termios: list | None = None
+
+    def _accept_control_press(self, signal: ControlSignal, now_s: float) -> bool:
+        """Return whether a physical key-down edge should emit *signal*.
+
+        ``pynput`` delivers operating-system auto-repeat as repeated press
+        callbacks.  A control is therefore emitted only once until its matching
+        release callback arrives.  Optional time debounce remains available for
+        callers that need it, but the default is edge-triggered with no added
+        operator latency.
+        """
+        with self._lock:
+            if signal in self._pressed_signals:
+                return False
+            self._pressed_signals.add(signal)
+            last = self._last_signal_time.get(signal, float("-inf"))
+            if now_s - last < self._debounce_s:
+                return False
+            self._last_signal_time[signal] = now_s
+            self._buffer.append(signal)
+            return True
+
+    def _release_control(self, signal: ControlSignal) -> None:
+        """Mark the matching physical key as released."""
+        with self._lock:
+            self._pressed_signals.discard(signal)
 
     def _latch_emergency_stop(self) -> None:
         callback: Callable[[], None] | None = None
@@ -169,35 +195,44 @@ class KeyboardHandler:
             from pynput import keyboard  # type: ignore[import-untyped]
         except ImportError:
             raise ImportError(
-                "pynput is required for global keyboard capture. " "Install with: pip install pynput"
+                "pynput is required for global keyboard capture. "
+                "Install with: pip install pynput"
             ) from None
 
         self._suppress_terminal_echo()
         self._estop_latched.clear()
         self._listener_failure_reported = False
+        with self._lock:
+            self._buffer.clear()
+            self._last_signal_time.clear()
+            self._pressed_signals.clear()
+
+        def control_signal(key: object) -> ControlSignal | None:
+            if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
+                return _KEY_MAP.get(key.char.lower())  # type: ignore[union-attr]
+            return None
 
         def on_press(key: object) -> None:
             try:
-                if hasattr(key, "char") and key.char is not None:  # type: ignore[union-attr]
-                    sig = _KEY_MAP.get(key.char.lower())  # type: ignore[union-attr]
-                elif key == keyboard.Key.esc:
+                sig = control_signal(key)
+                if sig is None and key == keyboard.Key.esc:
                     self._latch_emergency_stop()
                     return
-                else:
-                    return
                 if sig is not None:
-                    now = time.perf_counter()
-                    with self._lock:
-                        last = self._last_signal_time.get(sig, 0.0)
-                        if now - last < self._debounce_s:
-                            return
-                        self._last_signal_time[sig] = now
-                        self._buffer.append(sig)
+                    self._accept_control_press(sig, time.perf_counter())
             except Exception:
                 logger.warning("keyboard press callback failed", exc_info=True)
 
+        def on_release(key: object) -> None:
+            try:
+                sig = control_signal(key)
+                if sig is not None:
+                    self._release_control(sig)
+            except Exception:
+                logger.warning("keyboard release callback failed", exc_info=True)
+
         try:
-            self._listener = keyboard.Listener(on_press=on_press)
+            self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
             self._listener.start()
             ready = threading.Event()
             startup_errors: list[BaseException] = []
@@ -206,18 +241,26 @@ class KeyboardHandler:
                 try:
                     listener = self._listener
                     if listener is None:
-                        raise RuntimeError("keyboard listener disappeared during startup")
+                        raise RuntimeError(
+                            "keyboard listener disappeared during startup"
+                        )
                     listener.wait()
                 except BaseException as exc:
                     startup_errors.append(exc)
                 finally:
                     ready.set()
 
-            threading.Thread(target=wait_until_ready, name="keyboard-events-ready", daemon=True).start()
+            threading.Thread(
+                target=wait_until_ready, name="keyboard-events-ready", daemon=True
+            ).start()
             if not ready.wait(timeout=self._startup_timeout_s):
-                raise RuntimeError(f"keyboard listener startup timed out after {self._startup_timeout_s:.1f}s")
+                raise RuntimeError(
+                    f"keyboard listener startup timed out after {self._startup_timeout_s:.1f}s"
+                )
             if startup_errors:
-                raise RuntimeError("keyboard listener failed during startup") from startup_errors[0]
+                raise RuntimeError(
+                    "keyboard listener failed during startup"
+                ) from startup_errors[0]
             if not self._listener.is_alive():
                 raise RuntimeError("keyboard listener exited during startup")
         except Exception:
@@ -231,7 +274,9 @@ class KeyboardHandler:
             try:
                 listener_alive = bool(listener is not None and listener.is_alive())
             except Exception:
-                logger.warning("keyboard listener rollback health check failed", exc_info=True)
+                logger.warning(
+                    "keyboard listener rollback health check failed", exc_info=True
+                )
                 listener_alive = True
             if not listener_alive:
                 self._listener = None
@@ -254,6 +299,7 @@ class KeyboardHandler:
         finally:
             with self._lock:
                 self._buffer.clear()
+                self._pressed_signals.clear()
             self._last_signal_time.clear()
             self._estop_latched.clear()
             self._restore_terminal_echo()
@@ -483,11 +529,15 @@ class GlobalKeyState:
         if self._running:
             return
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-            raise RuntimeError("GlobalKeyState requires an X11/Wayland graphical session")
+            raise RuntimeError(
+                "GlobalKeyState requires an X11/Wayland graphical session"
+            )
         try:
             from pynput import keyboard  # type: ignore[import-untyped]
         except ImportError:
-            raise ImportError("pynput is required for global keyboard capture") from None
+            raise ImportError(
+                "pynput is required for global keyboard capture"
+            ) from None
 
         if self._suppress_echo:
             self._saved_termios = _suppress_terminal_echo()
@@ -515,11 +565,17 @@ class GlobalKeyState:
                 finally:
                     ready.set()
 
-            threading.Thread(target=wait_until_ready, name="keyboard-ready", daemon=True).start()
+            threading.Thread(
+                target=wait_until_ready, name="keyboard-ready", daemon=True
+            ).start()
             if not ready.wait(timeout=self._startup_timeout_s):
-                raise RuntimeError(f"global keyboard listener startup timed out after {self._startup_timeout_s:.1f}s")
+                raise RuntimeError(
+                    f"global keyboard listener startup timed out after {self._startup_timeout_s:.1f}s"
+                )
             if startup_errors:
-                raise RuntimeError("global keyboard listener failed during startup") from startup_errors[0]
+                raise RuntimeError(
+                    "global keyboard listener failed during startup"
+                ) from startup_errors[0]
             if not listener.is_alive():
                 raise RuntimeError("global keyboard listener exited during startup")
             self._running = True
@@ -530,7 +586,9 @@ class GlobalKeyState:
                     rollback_listener.stop()
                     rollback_listener.join(timeout=1.0)
             except Exception:
-                logger.warning("global keyboard listener rollback failed", exc_info=True)
+                logger.warning(
+                    "global keyboard listener rollback failed", exc_info=True
+                )
             if rollback_listener is None or not rollback_listener.is_alive():
                 self._listener = None
             else:
