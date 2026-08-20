@@ -30,3 +30,6 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "dexmani_real.config" = ["*.json"]
+
+[tool.isort]
+profile = "black"

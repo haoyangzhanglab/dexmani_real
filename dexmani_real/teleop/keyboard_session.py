@@ -10,6 +10,8 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import numpy as np
@@ -26,7 +28,7 @@ from dexmani_real.policy.safety import (
 )
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.robot.hand_process import hand_loop
-from dexmani_real.robot.homing import send_arm_home
+from dexmani_real.robot.homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
@@ -251,6 +253,292 @@ def _keyboard_command_anchor(
     return qpos, pose.p.copy(), pose.q.copy()
 
 
+@dataclass(frozen=True)
+class _KeyboardFeedback:
+    arm_state: dict[str, Any] | None
+    arm_qpos_rad: np.ndarray | None
+    hand_qpos_rad: np.ndarray | None
+    issue: str | None
+    retryable: bool = False
+
+
+@dataclass(frozen=True)
+class _KeyboardTargetUpdate:
+    target_pos_world_m: np.ndarray
+    target_quat_wxyz: np.ndarray
+    boundary_text: str
+
+
+class _KeyboardPublishStatus(str, Enum):
+    PUBLISHED = "published"
+    IK_REJECTED = "ik_rejected"
+    SAFETY_REJECTED = "safety_rejected"
+
+
+@dataclass(frozen=True)
+class _KeyboardPublishResult:
+    status: _KeyboardPublishStatus
+    arm_qpos_rad: np.ndarray | None = None
+    detail: str = ""
+
+
+def _read_keyboard_feedback(
+    shared: SharedStorage,
+    runtime: ResolvedRuntimeConfig,
+    *,
+    hand_enabled: bool,
+) -> _KeyboardFeedback:
+    """Read and validate one arm/hand feedback snapshot without policy changes."""
+    arm_state = read_arm_state_dict(shared)
+    if arm_state is None:
+        return _KeyboardFeedback(
+            None,
+            None,
+            None,
+            "arm state ring is empty",
+            retryable=True,
+        )
+
+    arm_qpos_rad = np.asarray(arm_state["qpos"], dtype=np.float64)
+    arm_issue = validate_arm_feedback(
+        connected=arm_state["connected"],
+        state_valid=arm_state["state_valid"],
+        source_monotonic_ns=arm_state["source_monotonic_ns"],
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
+        qpos=arm_qpos_rad,
+        qvel=arm_state["qvel"],
+    )
+    if arm_issue is not None:
+        return _KeyboardFeedback(
+            arm_state,
+            arm_qpos_rad,
+            None,
+            arm_issue,
+            retryable=True,
+        )
+    error_code = int(arm_state["error_code"])
+    if error_code != 0:
+        return _KeyboardFeedback(
+            arm_state,
+            arm_qpos_rad,
+            None,
+            f"arm controller error C{error_code}",
+        )
+    if not hand_enabled:
+        return _KeyboardFeedback(arm_state, arm_qpos_rad, None, None)
+
+    hand_state = read_hand_state_dict(shared)
+    hand_issue = _hand_feedback_issue(
+        hand_state,
+        now_ns=time.monotonic_ns(),
+        max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+    )
+    if hand_issue is not None:
+        return _KeyboardFeedback(arm_state, arm_qpos_rad, None, hand_issue)
+    assert hand_state is not None
+    return _KeyboardFeedback(
+        arm_state,
+        arm_qpos_rad,
+        np.asarray(hand_state["qpos"], dtype=np.float64),
+        None,
+    )
+
+
+def _compute_keyboard_target_update(
+    measured_pose_world: Pose,
+    target_pos_world_m: np.ndarray,
+    target_quat_wxyz: np.ndarray,
+    delta_pos_world_m: np.ndarray,
+    delta_rpy_rad: np.ndarray,
+    workspace_world_m: np.ndarray,
+    *,
+    workspace_margin_m: float,
+    command_lookahead_frames: float,
+    position_step_m: float,
+    rotation_step_rad: float,
+) -> _KeyboardTargetUpdate:
+    """Advance and bound the virtual keyboard target without side effects."""
+    command_low_world_m = workspace_world_m[:, 0] + workspace_margin_m
+    command_high_world_m = workspace_world_m[:, 1] - workspace_margin_m
+    desired_pos_world_m = target_pos_world_m + delta_pos_world_m
+    bounded_pos_world_m = np.clip(
+        desired_pos_world_m,
+        command_low_world_m,
+        command_high_world_m,
+    )
+
+    clipped = np.abs(desired_pos_world_m - bounded_pos_world_m) > 1e-9
+    boundary_parts: list[str] = []
+    for axis_index, axis_name in enumerate(("x", "y", "z")):
+        if clipped[axis_index]:
+            side = (
+                "⁺"
+                if desired_pos_world_m[axis_index] > bounded_pos_world_m[axis_index]
+                else "⁻"
+            )
+            boundary_parts.append(
+                f"{axis_name}{side}{bounded_pos_world_m[axis_index]:.3f}"
+            )
+
+    position_lead_world_m = bounded_pos_world_m - measured_pose_world.p
+    max_position_lead_m = command_lookahead_frames * position_step_m
+    position_lead_norm_m = float(np.linalg.norm(position_lead_world_m))
+    if position_lead_norm_m > max_position_lead_m > 0.0:
+        bounded_pos_world_m = measured_pose_world.p + position_lead_world_m * (
+            max_position_lead_m / position_lead_norm_m
+        )
+
+    bounded_quat_wxyz = np.asarray(target_quat_wxyz, dtype=np.float64).copy()
+    if np.any(delta_rpy_rad != 0.0):
+        delta_quat_wxyz = Rotation.from_euler("xyz", delta_rpy_rad).as_quat(
+            scalar_first=True
+        )
+        bounded_quat_wxyz = quat_multiply(delta_quat_wxyz, bounded_quat_wxyz)
+
+    measured_rotation = Rotation.from_quat(
+        measured_pose_world.q,
+        scalar_first=True,
+    )
+    target_rotation = Rotation.from_quat(bounded_quat_wxyz, scalar_first=True)
+    rotation_lead_rad = (target_rotation * measured_rotation.inv()).as_rotvec()
+    rotation_lead_norm_rad = float(np.linalg.norm(rotation_lead_rad))
+    max_rotation_lead_rad = command_lookahead_frames * rotation_step_rad
+    if rotation_lead_norm_rad > max_rotation_lead_rad > 0.0:
+        target_rotation = (
+            Rotation.from_rotvec(
+                rotation_lead_rad * (max_rotation_lead_rad / rotation_lead_norm_rad)
+            )
+            * measured_rotation
+        )
+        bounded_quat_wxyz = target_rotation.as_quat(scalar_first=True)
+
+    return _KeyboardTargetUpdate(
+        target_pos_world_m=np.asarray(bounded_pos_world_m, dtype=np.float64),
+        target_quat_wxyz=np.asarray(bounded_quat_wxyz, dtype=np.float64),
+        boundary_text=" ".join(boundary_parts),
+    )
+
+
+def _run_keyboard_home(
+    shared: SharedStorage,
+    runtime: ResolvedRuntimeConfig,
+    planner: XArm7MotionPlanner,
+    keys: GlobalKeyState,
+    current_qpos_rad: np.ndarray,
+    *,
+    hand_enabled: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Home enabled actuators and rebuild command anchors from fresh feedback."""
+    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+        require_transition(shared, SafetyState.ARMED)
+
+    hand_home_accepted = True
+    if hand_enabled:
+        hand_home_qpos_rad = np.deg2rad(
+            np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
+        )
+        hand_home_accepted = publish_hand_home_and_wait_applied(
+            shared,
+            hand_home_qpos_rad,
+            command_lower_rad=np.asarray(
+                runtime.hand.qpos_min_rad,
+                dtype=np.float64,
+            ),
+            command_upper_rad=np.asarray(
+                runtime.hand.qpos_max_rad,
+                dtype=np.float64,
+            ),
+            mechanical_lower_rad=np.asarray(
+                runtime.hand.mechanical_qpos_min_rad,
+                dtype=np.float64,
+            ),
+            mechanical_upper_rad=np.asarray(
+                runtime.hand.mechanical_qpos_max_rad,
+                dtype=np.float64,
+            ),
+            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+            timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+            heartbeat=False,
+            abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+        )
+        if hand_home_accepted:
+            planner.set_hand_qpos(hand_home_qpos_rad)
+
+    if hand_home_accepted:
+        home_result = execute_arm_home(
+            shared,
+            np.asarray(runtime.arm.home_qpos, dtype=np.float64),
+            planner=planner,
+            config=ArmHomeConfig.from_runtime(
+                runtime,
+                publish_policy_heartbeat=False,
+            ),
+            table_z_surface_m=float(runtime.arm.table_z_surface_m),
+            current_qpos=current_qpos_rad,
+            estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+            progress=lambda message: print(f"  {message}", flush=True),
+        )
+    else:
+        logger.warning("Return-home cancelled: hand-home command was not accepted")
+        home_result = None
+
+    if shared.estop_request.value:
+        _set_fault(shared, "operator e-stop during homing")
+        return None
+    refreshed = _read_initial_arm(shared, runtime)
+    if refreshed is None:
+        _set_fault(shared, "fresh arm feedback unavailable after homing")
+        return None
+    if home_result is not None and not home_result.succeeded:
+        logger.warning("Return-home request was not executed: %s", home_result.detail)
+    return _keyboard_command_anchor(
+        planner,
+        np.asarray(refreshed["qpos"], dtype=np.float64),
+    )
+
+
+def _publish_keyboard_target(
+    shared: SharedStorage,
+    runtime: ResolvedRuntimeConfig,
+    planner: XArm7MotionPlanner,
+    safety_gate: Any,
+    target_pos_world_m: np.ndarray,
+    target_quat_wxyz: np.ndarray,
+    current_qpos_rad: np.ndarray,
+    previous_command_qpos_rad: np.ndarray,
+) -> _KeyboardPublishResult:
+    """Solve and publish one keyboard target through the shared safety boundary."""
+    ik_result = planner.solve_teleop_ik(
+        Pose(p=target_pos_world_m, q=target_quat_wxyz),
+        current_qpos_rad,
+        previous_command_qpos_rad,
+    )
+    if not ik_result.success or ik_result.qpos is None:
+        return _KeyboardPublishResult(
+            _KeyboardPublishStatus.IK_REJECTED,
+            detail=ik_result.reason or "unknown",
+        )
+
+    publish_result = publish_joint_targets(
+        shared,
+        ik_result.qpos,
+        prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
+        safety_gate=safety_gate,
+        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+    )
+    candidate = publish_result.candidate
+    if not publish_result.succeeded or candidate is None or candidate.arm_qpos is None:
+        return _KeyboardPublishResult(
+            _KeyboardPublishStatus.SAFETY_REJECTED,
+            detail=publish_result.reason,
+        )
+    return _KeyboardPublishResult(
+        _KeyboardPublishStatus.PUBLISHED,
+        arm_qpos_rad=np.asarray(candidate.arm_qpos, dtype=np.float64).copy(),
+    )
+
+
 def _run_control_loop(
     shared: SharedStorage,
     runtime: ResolvedRuntimeConfig,
@@ -321,46 +609,26 @@ def _run_control_loop(
             # remaining feedback/fault classification work in this iteration.
             advance_run_generation(shared)
             quit_quiesced = True
-        state = read_arm_state_dict(shared)
-        feedback_issue: str | None
-        if state is None:
-            feedback_issue = "arm state ring is empty"
-        else:
-            current_qpos = np.asarray(state["qpos"], dtype=np.float64)
-            feedback_issue = validate_arm_feedback(
-                connected=state["connected"],
-                state_valid=state["state_valid"],
-                source_monotonic_ns=state["source_monotonic_ns"],
-                now_monotonic_ns=time.monotonic_ns(),
-                max_age_s=float(policy.arm_state_stale_threshold_s),
-                qpos=current_qpos,
-                qvel=state["qvel"],
-            )
-        if feedback_issue is not None:
+        feedback = _read_keyboard_feedback(
+            shared,
+            runtime,
+            hand_enabled=hand_enabled,
+        )
+        if feedback.issue is not None:
+            if not feedback.retryable:
+                _set_fault(shared, feedback.issue)
+                return False
             state_failures += 1
             if state_failures >= int(policy.max_consecutive_errors):
-                _set_fault(shared, feedback_issue)
+                _set_fault(shared, feedback.issue)
                 return False
             continue
-        assert state is not None
-
         state_failures = 0
-        error_code = int(state["error_code"])
-        if error_code != 0:
-            _set_fault(shared, f"arm controller error C{error_code}")
-            return False
-        if hand_enabled:
-            hand_state = read_hand_state_dict(shared)
-            hand_issue = _hand_feedback_issue(
-                hand_state,
-                now_ns=time.monotonic_ns(),
-                max_age_s=float(heartbeat_timeouts["hand"]),
-            )
-            if hand_issue is not None:
-                _set_fault(shared, hand_issue)
-                return False
-            assert hand_state is not None
-            planner.set_hand_qpos(np.asarray(hand_state["qpos"], dtype=np.float64))
+        assert feedback.arm_state is not None
+        assert feedback.arm_qpos_rad is not None
+        current_qpos = feedback.arm_qpos_rad
+        if feedback.hand_qpos_rad is not None:
+            planner.set_hand_qpos(feedback.hand_qpos_rad)
 
         if quit_requested:
             if int(shared.safety_state.value) == int(SafetyState.RUNNING):
@@ -369,82 +637,18 @@ def _run_control_loop(
 
         home_pressed = keys.is_pressed("r")
         if home_pressed and not home_key_down:
-            if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-                require_transition(shared, SafetyState.ARMED)
-            hand_home_accepted = True
-            if hand_enabled:
-                hand_home = np.deg2rad(
-                    np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
-                )
-                hand_home_accepted = publish_hand_home_and_wait_applied(
-                    shared,
-                    hand_home,
-                    command_lower_rad=np.asarray(
-                        runtime.hand.qpos_min_rad, dtype=np.float64
-                    ),
-                    command_upper_rad=np.asarray(
-                        runtime.hand.qpos_max_rad, dtype=np.float64
-                    ),
-                    mechanical_lower_rad=np.asarray(
-                        runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-                    ),
-                    mechanical_upper_rad=np.asarray(
-                        runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-                    ),
-                    hand_feedback_max_age_s=float(
-                        runtime.safety.heartbeat_timeouts["hand"]
-                    ),
-                    timeout_s=float(runtime.hand.home_command_ack_timeout_s),
-                    heartbeat=False,
-                    abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
-                )
-                if hand_home_accepted:
-                    planner.set_hand_qpos(hand_home)
-
-            home_ok = False
-            if hand_home_accepted:
-                home_ok = send_arm_home(
-                    shared,
-                    np.asarray(runtime.arm.home_qpos, dtype=np.float64),
-                    planner=planner,
-                    table_z_surface_m=float(runtime.arm.table_z_surface_m),
-                    current_qpos=current_qpos,
-                    queue_timeout=float(runtime.arm.homing.request_queue_timeout_s),
-                    converge_timeout_s=float(runtime.arm.homing.convergence_timeout_s),
-                    state_max_age_s=float(runtime.arm.homing.state_max_age_s),
-                    heartbeat=False,
-                    estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
-                    homing_max_speed_rad_s=float(
-                        np.deg2rad(runtime.arm.homing.max_speed_deg_s)
-                    ),
-                    homing_target_timeout_s=float(runtime.arm.homing.target_timeout_s),
-                    arm_heartbeat_max_age_s=float(
-                        runtime.safety.heartbeat_timeouts["arm"]
-                    ),
-                    preplan_velocity_rad_s=float(
-                        runtime.arm.homing.velocity_convergence_rad_s
-                    ),
-                    result_tolerance_rad=float(runtime.arm.homing.convergence_rad),
-                    verbose=True,
-                )
-            else:
-                logger.warning(
-                    "Return-home cancelled: hand-home command was not accepted"
-                )
-            if shared.estop_request.value:
-                _set_fault(shared, "operator e-stop during homing")
-                return False
-            refreshed = _read_initial_arm(shared, runtime)
-            if refreshed is None:
-                _set_fault(shared, "fresh arm feedback unavailable after homing")
-                return False
-            current_qpos = np.asarray(refreshed["qpos"], dtype=np.float64)
-            previous_command, target_pos, target_quat = _keyboard_command_anchor(
+            home_anchor = _run_keyboard_home(
+                shared,
+                runtime,
                 planner,
+                keys,
                 current_qpos,
+                hand_enabled=hand_enabled,
             )
-            if not home_ok:
-                logger.warning("Return-home request was not executed")
+            if home_anchor is None:
+                return False
+            current_qpos, target_pos, target_quat = home_anchor
+            previous_command = current_qpos.copy()
             motion_active = False
             rate.reset()
             home_key_down = home_pressed
@@ -505,83 +709,56 @@ def _run_control_loop(
             motion_active = True
             rate.reset()
 
-        # Advance the virtual command at delta/dt while capping its lead over feedback.
         measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
-        workspace_margin_m = float(cfg.workspace_command_margin_m)
-        command_low = workspace[:, 0] + workspace_margin_m
-        command_high = workspace[:, 1] - workspace_margin_m
-        _desired_pos = target_pos + dx
-        target_pos = np.clip(_desired_pos, command_low, command_high)
-        boundary_indicator = ""
-        _clipped = np.abs(_desired_pos - target_pos) > 1e-9
-        if np.any(_clipped):
-            _axis_names = ("x", "y", "z")
-            _parts: list[str] = []
-            for _i in range(3):
-                if _clipped[_i]:
-                    _side = "⁺" if _desired_pos[_i] > target_pos[_i] else "⁻"
-                    _parts.append(f"{_axis_names[_i]}{_side}{target_pos[_i]:.3f}")
-            boundary_indicator = "  " + " ".join(_parts)
-            _now_s = time.monotonic()
-            if _now_s - last_boundary_warn_s >= _BOUNDARY_WARN_INTERVAL_S:
-                logger.warning("Workspace boundary: %s", " ".join(_parts))
-                last_boundary_warn_s = _now_s
-        position_lead = target_pos - measured_pose.p
-        max_position_lead_m = float(cfg.command_lookahead_frames) * float(
-            cfg.delta_pos_m
+        target_update = _compute_keyboard_target_update(
+            measured_pose,
+            target_pos,
+            target_quat,
+            dx,
+            drpy,
+            workspace,
+            workspace_margin_m=float(cfg.workspace_command_margin_m),
+            command_lookahead_frames=float(cfg.command_lookahead_frames),
+            position_step_m=float(cfg.delta_pos_m),
+            rotation_step_rad=float(cfg.delta_rpy_rad),
         )
-        position_lead_norm = float(np.linalg.norm(position_lead))
-        if position_lead_norm > max_position_lead_m:
-            target_pos = measured_pose.p + position_lead * (
-                max_position_lead_m / position_lead_norm
-            )
-        if np.any(drpy != 0.0):
-            delta_quat = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
-            target_quat = quat_multiply(delta_quat, target_quat)
-        measured_rotation = Rotation.from_quat(measured_pose.q, scalar_first=True)
-        target_rotation = Rotation.from_quat(target_quat, scalar_first=True)
-        rotation_lead = (target_rotation * measured_rotation.inv()).as_rotvec()
-        rotation_lead_norm = float(np.linalg.norm(rotation_lead))
-        max_rotation_lead_rad = float(cfg.command_lookahead_frames) * float(
-            cfg.delta_rpy_rad
+        target_pos = target_update.target_pos_world_m
+        target_quat = target_update.target_quat_wxyz
+        boundary_indicator = (
+            f"  {target_update.boundary_text}" if target_update.boundary_text else ""
         )
-        if rotation_lead_norm > max_rotation_lead_rad:
-            target_rotation = (
-                Rotation.from_rotvec(
-                    rotation_lead * (max_rotation_lead_rad / rotation_lead_norm)
-                )
-                * measured_rotation
-            )
-            target_quat = target_rotation.as_quat(scalar_first=True)
+        if target_update.boundary_text:
+            now_s = time.monotonic()
+            if now_s - last_boundary_warn_s >= _BOUNDARY_WARN_INTERVAL_S:
+                logger.warning("Workspace boundary: %s", target_update.boundary_text)
+                last_boundary_warn_s = now_s
 
-        result = planner.solve_teleop_ik(
-            Pose(p=target_pos, q=target_quat), current_qpos, previous_command
+        publish_result = _publish_keyboard_target(
+            shared,
+            runtime,
+            planner,
+            safety_gate,
+            target_pos,
+            target_quat,
+            current_qpos,
+            previous_command,
         )
-        if not result.success or result.qpos is None:
+        if publish_result.status is _KeyboardPublishStatus.IK_REJECTED:
             now_s = time.monotonic()
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
-                logger.warning("IK rejected target: %s", result.reason or "unknown")
+                logger.warning("IK rejected target: %s", publish_result.detail)
                 last_ik_warning_s = now_s
-            # Keep the last valid endpoint active and block this key combination.
             blocked_keys = active_keys
             continue
-
-        published = publish_joint_targets(
-            shared,
-            result.qpos,
-            prepare_timeout_s=float(policy.action_prepare_timeout_s),
-            safety_gate=safety_gate,
-            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-        )
-        candidate = published.candidate
-        if not published.succeeded or candidate is None or candidate.arm_qpos is None:
+        if publish_result.status is _KeyboardPublishStatus.SAFETY_REJECTED:
             logger.warning(
                 "Keyboard motion command rejected (%s) — blocked until keys change",
-                published.reason,
+                publish_result.detail,
             )
             blocked_keys = active_keys
             continue
-        previous_command = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
+        assert publish_result.arm_qpos_rad is not None
+        previous_command = publish_result.arm_qpos_rad
 
         if frame % int(cfg.status_interval_frames) == 0:
             elapsed = time.monotonic() - started_s

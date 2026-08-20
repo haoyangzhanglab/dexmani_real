@@ -16,18 +16,15 @@ resolved-config provenance matches.
 
 from __future__ import annotations
 
-import hashlib
 import multiprocessing as mp
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.planning import (
@@ -38,12 +35,10 @@ from dexmani_real.planning import (
 )
 from dexmani_real.planning.constants import (
     XARM7_XHAND_COLLISION_URDF_PATH,
-    XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
 from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
-from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import (
     SafetyGate,
     advance_run_generation,
@@ -51,11 +46,25 @@ from dexmani_real.policy.safety import (
     publish_hand_home_and_wait_applied,
     publish_joint_targets,
 )
-from dexmani_real.recording.episode_reader import EpisodeReader
-from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
-from dexmani_real.robot.homing import send_arm_home
+from dexmani_real.robot.homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.robot.replay_evaluation import (
+    ReplayMetrics,
+    ReplayRecorder,
+    compute_metrics,
+    save_replay_data,
+    save_results,
+)
+from dexmani_real.robot.replay_trajectory import (
+    TrajectoryData,
+    load_trajectory,
+    modeled_hand_actions,
+    preflight_model_paths,
+    require_hand_actions,
+    resolve_episode_path,
+    verify_replay_preflight,
+)
 from dexmani_real.robot.safety import SafetyState, require_transition
 from dexmani_real.runtime.processes import (
     ShutdownReport,
@@ -73,723 +82,18 @@ from dexmani_real.shm.shared_storage import (
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import ARM_EE_SHAPE, ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
 DEFAULT_OUTPUT_DIR = "replay_results"
-
-_MIN_EPISODE_RATE_HZ = 1.0
-_MAX_EPISODE_RATE_HZ = 100.0
-_MODEL_PROVENANCE_KEYS = (
-    "arm_hand_collision_urdf_sha256",
-    "arm_hand_urdf_sha256",
-    "arm_hand_srdf_sha256",
-)
 
 _STATUS_INTERVAL_FRAMES = 50
 _WAIT_POLL_INTERVAL_S = 0.01
 # Allow startup headroom for the arm worker's blocking Mode 6 postcondition poll.
 _ARM_STREAMING_WAIT_TIMEOUT_S = 2.0
 
-_TRACKING_LAG_WINDOW_S = 0.4
-_MIN_TRACKING_LAG_FRAMES = 6
-_MIN_TRACKING_OVERLAP_FRAMES = 10
-_MIN_TRACKING_SEQUENCE_FRAMES = 20
-_SAFETY_REASON_BYTES = 256
-
 _TRACKING_ERROR_PERCENTILE = 95.0
-
-
-def _is_sha256(value: str | None) -> bool:
-    """Return True if *value* is a 64-character hex SHA-256 string."""
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def preflight_model_paths() -> tuple[Path, ...]:
-    """Return the three URDF/SRDF model paths used for geometry provenance checks."""
-    return (
-        XARM7_XHAND_COLLISION_URDF_PATH,
-        XARM7_XHAND_RIGHT_URDF_PATH,
-        XARM7_XHAND_SRDF_PATH,
-    )
-
-
-@dataclass
-class TrajectoryData:
-    """Preloaded state and command streams used by replay and evaluation."""
-
-    episode_path: str
-    num_frames: int
-    fps: float
-    task_label: str
-    action_arm_joint: np.ndarray
-    action_hand_joint: np.ndarray | None
-    arm_qpos: np.ndarray
-    hand_qpos: np.ndarray | None
-    arm_ee: np.ndarray | None
-    action_source: str | None = None
-    resolved_config_sha256: str | None = None
-    model_provenance: tuple[tuple[str, str], ...] = ()
-    send_mask: np.ndarray | None = None
-
-    @property
-    def has_hand(self) -> bool:
-        """Whether a fixed-shape hand action stream is present."""
-        return self.has_hand_actions
-
-    @property
-    def has_hand_actions(self) -> bool:
-        """Whether a fixed-shape hand action dataset is present."""
-        return self.action_hand_joint is not None
-
-
-def resolve_episode_path(raw_path: str) -> tuple[str, str]:
-    """Validate and name one published episode directory."""
-    path = Path(raw_path)
-    if not path.is_dir():
-        raise ValueError(f"episode must be a published directory: {path}")
-    if not (path / "data.h5").is_file():
-        raise ValueError(f"episode directory is missing data.h5: {path}")
-    return str(path), path.name
-
-
-def load_trajectory(
-    episode_path: str,
-) -> TrajectoryData:
-    """Load the exact submitted command stream for physical replay."""
-    resolved_path, _episode_name = resolve_episode_path(episode_path)
-    if not Path(resolved_path).exists():
-        raise FileNotFoundError(f"Episode not found: {episode_path}")
-
-    with EpisodeReader(resolved_path) as reader:
-        if not reader.meets_min_duration:
-            logger.warning(
-                "Episode %s is internally readable but below the configured minimum recording duration",
-                resolved_path,
-            )
-        reader.require_valid(purpose="physical replay")
-        h5 = reader.h5f
-        meta = h5.get("meta")
-        num_frames_attr = (
-            int(meta.attrs.get("num_frames", 0)) if meta is not None else 0
-        )
-        fps = float(reader.timing.rate_hz)
-        if not _MIN_EPISODE_RATE_HZ <= fps <= _MAX_EPISODE_RATE_HZ:
-            raise ValueError(
-                f"physical replay requires a valid episode rate, got {fps!r} Hz"
-            )
-        task_label = str(meta.attrs.get("task_label", "")) if meta is not None else ""
-        resolved_config_sha256 = None
-        model_provenance: tuple[tuple[str, str], ...] = ()
-        if meta is not None:
-            raw_hash = meta.attrs.get("resolved_config_sha256")
-            resolved_config_sha256 = None if raw_hash is None else str(raw_hash)
-            model_provenance = tuple(
-                sorted(
-                    (name.removeprefix("provenance_"), str(meta.attrs[name]))
-                    for name in meta.attrs
-                    if name.startswith("provenance_arm_hand_")
-                )
-            )
-
-        arm_action_key = "action_arm_joint_sent"
-        action_source = "sent"
-        if arm_action_key not in h5:
-            raise ValueError("physical replay requires /action_arm_joint_sent")
-        for key in (arm_action_key, "arm_qpos"):
-            if key not in h5:
-                raise ValueError(f"episode missing required dataset: /{key}")
-
-        source_frames = int(h5[arm_action_key].shape[0])
-        total_frames = (
-            source_frames
-            if num_frames_attr == 0
-            else min(source_frames, num_frames_attr)
-        )
-
-        action_arm_joint = np.asarray(
-            h5[arm_action_key][:total_frames], dtype=np.float64
-        )
-        arm_qpos = np.asarray(h5["arm_qpos"][:total_frames], dtype=np.float64)
-        action_hand_joint = (
-            np.asarray(h5["action_hand_joint"][:total_frames], dtype=np.float64)
-            if "action_hand_joint" in h5
-            else None
-        )
-        hand_qpos = (
-            np.asarray(h5["hand_qpos"][:total_frames], dtype=np.float64)
-            if "hand_qpos" in h5
-            else None
-        )
-        arm_ee = (
-            np.asarray(h5["arm_ee"][:total_frames], dtype=np.float64)
-            if "arm_ee" in h5
-            else None
-        )
-        send_mask = (
-            np.asarray(h5["flag_action_queued"][:total_frames], dtype=bool)
-            if "flag_action_queued" in h5
-            else None
-        )
-
-    arrays: dict[str, tuple[np.ndarray, tuple[int, ...]]] = {
-        "arm action": (action_arm_joint, (total_frames, *ARM_JOINT_SHAPE)),
-        "arm state": (arm_qpos, (total_frames, *ARM_JOINT_SHAPE)),
-    }
-    if action_hand_joint is not None:
-        arrays["hand action"] = (action_hand_joint, (total_frames, *HAND_JOINT_SHAPE))
-    if hand_qpos is not None:
-        arrays["hand state"] = (hand_qpos, (total_frames, *HAND_JOINT_SHAPE))
-    if arm_ee is not None:
-        arrays["arm EEF"] = (arm_ee, (total_frames, *ARM_EE_SHAPE))
-    if send_mask is not None:
-        arrays["send mask"] = (send_mask, (total_frames,))
-    for name, (array, expected_shape) in arrays.items():
-        if array.shape != expected_shape:
-            raise ValueError(
-                f"episode {name} has shape {array.shape}, expected {expected_shape}"
-            )
-
-    trajectory = TrajectoryData(
-        episode_path=resolved_path,
-        num_frames=total_frames,
-        fps=fps,
-        task_label=task_label,
-        action_arm_joint=action_arm_joint,
-        action_hand_joint=action_hand_joint,
-        arm_qpos=arm_qpos,
-        hand_qpos=hand_qpos,
-        arm_ee=arm_ee,
-        action_source=action_source,
-        resolved_config_sha256=resolved_config_sha256,
-        model_provenance=model_provenance,
-        send_mask=send_mask,
-    )
-    logger.info(
-        "Loaded trajectory: %d frames, fps=%.1f, task=%s, hand=%s, ee=%s",
-        trajectory.num_frames,
-        trajectory.fps,
-        trajectory.task_label or "(none)",
-        ("yes" if trajectory.has_hand_actions else "no"),
-        "yes" if trajectory.arm_ee is not None else "no",
-    )
-    return trajectory
-
-
-class ReplayRecorder:
-    """Pre-allocated buffer capturing robot state during replay.
-
-    Single-threaded (main loop), so no locking is needed.
-    """
-
-    def __init__(self, capacity: int, has_hand: bool = False) -> None:
-        self.capacity = capacity
-        self.has_hand = has_hand
-        self._count = 0
-
-        self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.eef_pos = np.full((capacity, 3), np.nan, dtype=np.float64)
-        self.eef_quat_wxyz = np.full((capacity, 4), np.nan, dtype=np.float64)
-        self.eef_rot6d = np.full((capacity, 6), np.nan, dtype=np.float64)
-        self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.arm_sent_cmd = np.full(
-            (capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64
-        )
-        self.arm_tracking_error = np.full((capacity,), np.nan, dtype=np.float64)
-        self.timestamps = np.full((capacity,), np.nan, dtype=np.float64)
-
-        # A rejected frame keeps state/candidate data but leaves arm_sent_cmd NaN.
-        self.flag_safety_reject = np.zeros(capacity, dtype=bool)
-        self.safety_reject_reason: list[str | None] = [None] * capacity
-
-        self.hand_qpos: np.ndarray | None = None
-        self.hand_cmd: np.ndarray | None = None
-        if has_hand:
-            self.hand_qpos = np.full(
-                (capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64
-            )
-            self.hand_cmd = np.full(
-                (capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64
-            )
-
-    def record(
-        self,
-        idx: int,
-        arm_qpos: np.ndarray,
-        eef_pos: np.ndarray,
-        eef_rot6d: np.ndarray,
-        arm_cmd: np.ndarray,
-        hand_cmd: np.ndarray | None,
-        ts: float,
-        arm_sent_cmd: np.ndarray | None = None,
-        arm_tracking_error: float | None = None,
-        safety_reject_reason: str | None = None,
-        hand_qpos: np.ndarray | None = None,
-    ) -> None:
-        """Record one frame of replay state.
-
-        When *safety_reject_reason* is set the frame is marked as a safety
-        gate rejection: observables + cmd are preserved (the action that was
-        *attempted*), but ``arm_sent_cmd`` is left at its pre-allocated NaN
-        (nothing was sent to the robot).  Downstream scripts can filter on
-        ``flag_safety_reject`` or ``safety_reject_reason``.
-        """
-        if idx < 0:
-            raise ValueError("replay frame index must be non-negative")
-        if idx >= self.capacity:
-            return
-        self.arm_qpos[idx] = arm_qpos
-        self.eef_pos[idx] = eef_pos
-        self.eef_rot6d[idx] = eef_rot6d
-        try:
-            rotation_matrix = _rot6d_to_matrix(eef_rot6d)
-            quat_xyzw = Rotation.from_matrix(rotation_matrix).as_quat()
-            self.eef_quat_wxyz[idx] = np.array(
-                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-            )
-        except ValueError:
-            self.eef_quat_wxyz[idx] = np.full(4, np.nan)
-        self.arm_cmd[idx] = arm_cmd
-        self.timestamps[idx] = ts
-        if arm_sent_cmd is not None:
-            self.arm_sent_cmd[idx] = arm_sent_cmd
-        if arm_tracking_error is not None:
-            self.arm_tracking_error[idx] = arm_tracking_error
-        if self.has_hand and self.hand_qpos is not None and hand_qpos is not None:
-            self.hand_qpos[idx] = hand_qpos
-        if self.has_hand and self.hand_cmd is not None and hand_cmd is not None:
-            self.hand_cmd[idx] = hand_cmd
-        if safety_reject_reason is not None:
-            self.flag_safety_reject[idx] = True
-            self.safety_reject_reason[idx] = safety_reject_reason
-        self._count = idx + 1
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-    def to_dict(self) -> dict[str, np.ndarray]:
-        """Return truncated arrays as a dict."""
-        n = self._count
-        # Fixed bytes keep the NPZ readable with allow_pickle=False.
-        reasons = np.array(
-            [r.encode() if r else b"" for r in self.safety_reject_reason[:n]],
-            dtype=f"S{_SAFETY_REASON_BYTES}",
-        )
-        result: dict[str, np.ndarray] = {
-            "arm_qpos": self.arm_qpos[:n].copy(),
-            "eef_pos": self.eef_pos[:n].copy(),
-            "eef_quat_wxyz": self.eef_quat_wxyz[:n].copy(),
-            "eef_rot6d": self.eef_rot6d[:n].copy(),
-            "arm_cmd": self.arm_cmd[:n].copy(),
-            "arm_sent_cmd": self.arm_sent_cmd[:n].copy(),
-            "arm_tracking_error": self.arm_tracking_error[:n].copy(),
-            "timestamp": self.timestamps[:n].copy(),
-            "flag_safety_reject": self.flag_safety_reject[:n].copy(),
-            "safety_reject_reason": reasons,
-        }
-        if self.hand_qpos is not None:
-            result["hand_qpos"] = self.hand_qpos[:n].copy()
-        if self.hand_cmd is not None:
-            result["hand_cmd"] = self.hand_cmd[:n].copy()
-        return result
-
-
-@dataclass
-class ReplayMetrics:
-    """Evaluated consistency between replayed and original trajectory."""
-
-    episode_path: str = ""
-    task_label: str = ""
-    speed_factor: float = 1.0
-    original_frames: int = 0
-    replayed_frames: int = 0
-    matching_frames: int = 0
-
-    arm_joint_mae_deg: np.ndarray = field(
-        default_factory=lambda: np.zeros(ARM_JOINT_SHAPE)
-    )
-    arm_joint_rmse_deg: np.ndarray = field(
-        default_factory=lambda: np.zeros(ARM_JOINT_SHAPE)
-    )
-    arm_joint_mae_overall_deg: float = 0.0
-    arm_joint_rmse_overall_deg: float = 0.0
-
-    eef_pos_error_mean_mm: float = 0.0
-    eef_pos_error_max_mm: float = 0.0
-    eef_pos_error_rmse_mm: float = 0.0
-
-    eef_rot_error_mean_deg: float = 0.0
-    eef_rot_error_max_deg: float = 0.0
-
-    eef_pos_error_per_frame_mm: np.ndarray | None = None
-    eef_rot_error_per_frame_deg: np.ndarray | None = None
-
-    hand_joint_mae_overall_deg: float | None = None
-    hand_joint_rmse_overall_deg: float | None = None
-
-    tracking_lag_frames: int = 0
-    tracking_lag_seconds: float = 0.0
-
-    arm_tracking_error_mean_deg: float = 0.0
-    arm_tracking_error_p95_deg: float = 0.0
-    arm_tracking_error_max_deg: float = 0.0
-
-
-def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
-    """Convert (6,) rot6d to (3,3) rotation matrix via rot6d→quat→matrix."""
-    q_wxyz = rot6d_to_quat_wxyz(rot6d)
-    return Rotation.from_quat(np.roll(q_wxyz, -1)).as_matrix()  # wxyz→xyzw
-
-
-def _geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
-    """Geodesic angular distance between two rotation matrices in degrees."""
-    cos_angle = 0.5 * (np.trace(rotation_a @ rotation_b.T) - 1.0)
-    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-    return float(np.rad2deg(np.arccos(cos_angle)))
-
-
-def compute_metrics(
-    original_arm_qpos: np.ndarray,
-    replay_arm_qpos: np.ndarray,
-    original_arm_ee: np.ndarray | None,
-    replay_arm_ee_pos: np.ndarray,
-    replay_arm_ee_rot6d: np.ndarray,
-    fps: float,
-    original_hand_qpos: np.ndarray | None = None,
-    replay_hand_qpos: np.ndarray | None = None,
-    episode_path: str = "",
-    task_label: str = "",
-    speed_factor: float = 1.0,
-) -> ReplayMetrics:
-    """Compare matching frame indices from the recorded and replayed streams."""
-    if not np.isfinite(fps) or fps <= 0:
-        raise ValueError("fps must be finite and positive")
-    original_frames = original_arm_qpos.shape[0]
-    replayed_frames = replay_arm_qpos.shape[0]
-    frame_count = min(original_frames, replayed_frames)
-
-    metrics = ReplayMetrics(
-        episode_path=episode_path,
-        task_label=task_label,
-        speed_factor=speed_factor,
-        original_frames=original_frames,
-        replayed_frames=replayed_frames,
-        matching_frames=frame_count,
-    )
-
-    if frame_count == 0:
-        logger.warning("No frames to compare")
-        return metrics
-
-    orig_q = original_arm_qpos[:frame_count]
-    rep_q = replay_arm_qpos[:frame_count]
-    valid = np.all(np.isfinite(orig_q), axis=1) & np.all(np.isfinite(rep_q), axis=1)
-    if valid.sum() > 0:
-        diff = np.abs(orig_q[valid] - rep_q[valid])
-        metrics.arm_joint_mae_deg = np.rad2deg(np.mean(diff, axis=0))
-        metrics.arm_joint_rmse_deg = np.rad2deg(np.sqrt(np.mean(diff**2, axis=0)))
-        metrics.arm_joint_mae_overall_deg = float(np.mean(metrics.arm_joint_mae_deg))
-        metrics.arm_joint_rmse_overall_deg = float(np.mean(metrics.arm_joint_rmse_deg))
-
-    if original_arm_ee is not None and original_arm_ee.shape[0] >= frame_count:
-        orig_ee_pos = original_arm_ee[:frame_count, :3]
-        rep_ee_pos = replay_arm_ee_pos[:frame_count]
-        valid_ee = np.all(np.isfinite(orig_ee_pos), axis=1) & np.all(
-            np.isfinite(rep_ee_pos), axis=1
-        )
-        if valid_ee.sum() > 0:
-            pos_err = np.linalg.norm(
-                orig_ee_pos[valid_ee] - rep_ee_pos[valid_ee], axis=1
-            )
-            metrics.eef_pos_error_per_frame_mm = pos_err * 1000.0
-            metrics.eef_pos_error_mean_mm = float(np.mean(pos_err) * 1000.0)
-            metrics.eef_pos_error_max_mm = float(np.max(pos_err) * 1000.0)
-            metrics.eef_pos_error_rmse_mm = float(np.sqrt(np.mean(pos_err**2)) * 1000.0)
-
-    if (
-        original_arm_ee is not None
-        and original_arm_ee.shape[0] >= frame_count
-        and replay_arm_ee_rot6d.shape[0] >= frame_count
-    ):
-        orig_rot6d = original_arm_ee[:frame_count, 3:9]
-        rep_rot6d = replay_arm_ee_rot6d[:frame_count]
-        valid_rot = np.all(np.isfinite(orig_rot6d), axis=1) & np.all(
-            np.isfinite(rep_rot6d), axis=1
-        )
-        if valid_rot.sum() > 0:
-            rot_errs = []
-            for i in np.where(valid_rot)[0]:
-                try:
-                    rotation_a = _rot6d_to_matrix(orig_rot6d[i])
-                    rotation_b = _rot6d_to_matrix(rep_rot6d[i])
-                    rot_errs.append(_geodesic_distance_deg(rotation_a, rotation_b))
-                except ValueError:
-                    rot_errs.append(np.nan)
-            rot_errs_arr = np.array(rot_errs)
-            finite = np.isfinite(rot_errs_arr)
-            if finite.sum() > 0:
-                metrics.eef_rot_error_per_frame_deg = rot_errs_arr
-                metrics.eef_rot_error_mean_deg = float(np.mean(rot_errs_arr[finite]))
-                metrics.eef_rot_error_max_deg = float(np.max(rot_errs_arr[finite]))
-
-    if original_hand_qpos is not None and replay_hand_qpos is not None:
-        hand_frame_count = min(original_hand_qpos.shape[0], replay_hand_qpos.shape[0])
-        if hand_frame_count > 0:
-            orig_h = original_hand_qpos[:hand_frame_count]
-            rep_h = replay_hand_qpos[:hand_frame_count]
-            valid_h = np.all(np.isfinite(orig_h), axis=1) & np.all(
-                np.isfinite(rep_h), axis=1
-            )
-            if valid_h.sum() > 0:
-                diff_h = np.abs(orig_h[valid_h] - rep_h[valid_h])
-                metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
-                metrics.hand_joint_rmse_overall_deg = float(
-                    np.rad2deg(np.sqrt(np.mean(diff_h**2)))
-                )
-
-    if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
-        max_lag = max(
-            int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES
-        )
-        joint_lags: list[int] = []
-        for joint_index in range(ARM_JOINT_SHAPE[0]):
-            best_lag, best_rmse = 0, float("inf")
-            for lag in range(-max_lag, max_lag + 1):
-                if lag < 0:
-                    original = orig_q[-lag:, joint_index]
-                    replayed = rep_q[:lag, joint_index]
-                elif lag > 0:
-                    original = orig_q[:-lag, joint_index]
-                    replayed = rep_q[lag:, joint_index]
-                else:
-                    original = orig_q[:, joint_index]
-                    replayed = rep_q[:, joint_index]
-                finite = np.isfinite(original) & np.isfinite(replayed)
-                if int(np.count_nonzero(finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
-                    continue
-                rmse = float(
-                    np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2))
-                )
-                if rmse < best_rmse:
-                    best_rmse = rmse
-                    best_lag = lag
-            joint_lags.append(best_lag)
-        peak_lag = int(np.median(joint_lags))
-        metrics.tracking_lag_frames = peak_lag
-        metrics.tracking_lag_seconds = float(peak_lag) / fps
-
-    return metrics
-
-
-def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Path:
-    """Persist captured replay samples even when consistency metrics are unavailable."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    npz_path = output_path / "replay_data.npz"
-    # Write to a sibling temp file that already ends in ".npz" (numpy appends
-    # ".npz" to any name that does not), then atomically move it into place.
-    tmp_path = npz_path.with_suffix(".tmp.npz")
-    np.savez_compressed(tmp_path, **replay_data)
-    os.replace(tmp_path, npz_path)
-    print(f"Replay data saved: {npz_path}  ({replay_data['arm_qpos'].shape[0]} frames)")
-    return npz_path
-
-
-def save_results(
-    metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], output_dir: str
-) -> None:
-    """Save replay data and consistency metrics to output directory.
-
-    Produces:
-        <output_dir>/metrics.json   — human-readable scalar metrics
-        <output_dir>/replay_data.npz — full time-series arrays
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    metrics_dict: dict[str, object] = {
-        "episode_path": metrics.episode_path,
-        "task_label": metrics.task_label,
-        "speed_factor": metrics.speed_factor,
-        "original_frames": metrics.original_frames,
-        "replayed_frames": metrics.replayed_frames,
-        "matching_frames": metrics.matching_frames,
-        "arm_joint": {
-            "mae_per_joint_deg": np.round(metrics.arm_joint_mae_deg, 4).tolist(),
-            "rmse_per_joint_deg": np.round(metrics.arm_joint_rmse_deg, 4).tolist(),
-            "mae_overall_deg": round(metrics.arm_joint_mae_overall_deg, 4),
-            "rmse_overall_deg": round(metrics.arm_joint_rmse_overall_deg, 4),
-        },
-        "eef_position": {
-            "mean_error_mm": round(metrics.eef_pos_error_mean_mm, 2),
-            "max_error_mm": round(metrics.eef_pos_error_max_mm, 2),
-            "rmse_error_mm": round(metrics.eef_pos_error_rmse_mm, 2),
-        },
-        "eef_orientation": {
-            "mean_error_deg": round(metrics.eef_rot_error_mean_deg, 2),
-            "max_error_deg": round(metrics.eef_rot_error_max_deg, 2),
-        },
-        "tracking_lag": {
-            "peak_lag_frames": metrics.tracking_lag_frames,
-            "peak_lag_seconds": round(metrics.tracking_lag_seconds, 3),
-        },
-    }
-    if metrics.arm_tracking_error_mean_deg > 0:
-        metrics_dict["tracking_error"] = {
-            "mean_deg": round(metrics.arm_tracking_error_mean_deg, 2),
-            "p95_deg": round(metrics.arm_tracking_error_p95_deg, 2),
-            "max_deg": round(metrics.arm_tracking_error_max_deg, 2),
-        }
-    if (
-        metrics.hand_joint_mae_overall_deg is not None
-        and metrics.hand_joint_rmse_overall_deg is not None
-    ):
-        metrics_dict["hand_joint"] = {
-            "mae_overall_deg": round(metrics.hand_joint_mae_overall_deg, 4),
-            "rmse_overall_deg": round(metrics.hand_joint_rmse_overall_deg, 4),
-        }
-
-    metrics_path = atomic_json_dump(
-        metrics_dict, output_path / "metrics.json", ensure_ascii=False
-    )
-    print(f"\nMetrics saved: {metrics_path}")
-
-    save_replay_data(replay_data, output_dir)
-
-
-def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
-    """Return the recorded hand action stream used for geometry preflight."""
-    if trajectory.action_hand_joint is None:
-        raise ValueError(
-            "episode has no hand action stream; physical replay requires recorded hand data"
-        )
-    actions = np.asarray(trajectory.action_hand_joint, dtype=np.float64)
-    expected_shape = (trajectory.num_frames, *HAND_JOINT_SHAPE)
-    if actions.shape != expected_shape or not np.all(np.isfinite(actions)):
-        raise ValueError(
-            f"physical replay hand actions must be finite shape {expected_shape}"
-        )
-    return actions
-
-
-def require_hand_actions(trajectory: TrajectoryData) -> None:
-    """Fail closed when an episode has no recorded hand action stream."""
-    if not trajectory.has_hand_actions:
-        raise ValueError(
-            "episode has no hand action stream; physical replay requires recorded hand data"
-        )
-
-
-def _verify_trajectory_provenance(
-    trajectory: TrajectoryData, *, provenance_sha256: str
-) -> None:
-    """Fail-closed provenance gate: source stream, config hash, and model hashes."""
-    if trajectory.action_source != "sent":
-        raise ValueError(
-            "physical replay requires the exact submitted action stream ('sent')"
-        )
-    if trajectory.num_frames <= 0:
-        raise ValueError("physical replay trajectory is empty")
-    arm_actions = np.asarray(trajectory.action_arm_joint)
-    expected_arm_shape = (trajectory.num_frames, *ARM_JOINT_SHAPE)
-    if arm_actions.shape != expected_arm_shape or not np.all(np.isfinite(arm_actions)):
-        raise ValueError(
-            f"physical replay arm actions must be finite shape {expected_arm_shape}"
-        )
-    if not _is_sha256(trajectory.resolved_config_sha256):
-        raise ValueError(
-            "physical replay recording provenance lacks a valid resolved_config_sha256"
-        )
-    if trajectory.resolved_config_sha256 != provenance_sha256:
-        raise ValueError(
-            "physical replay config provenance mismatch: recorded config differs from replay config"
-        )
-
-    recorded_models = dict(trajectory.model_provenance)
-    missing_models = [
-        name
-        for name in _MODEL_PROVENANCE_KEYS
-        if not _is_sha256(recorded_models.get(name))
-    ]
-    if missing_models:
-        raise ValueError(
-            f"physical replay model provenance is incomplete: {missing_models}"
-        )
-    current_models = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in zip(_MODEL_PROVENANCE_KEYS, preflight_model_paths())
-    }
-    mismatched_models = [
-        name
-        for name in _MODEL_PROVENANCE_KEYS
-        if recorded_models[name] != current_models[name]
-    ]
-    if mismatched_models:
-        raise ValueError(
-            f"physical replay model provenance mismatch: {mismatched_models}"
-        )
-
-
-def verify_replay_preflight(
-    trajectory: TrajectoryData,
-    runtime: ResolvedRuntimeConfig,
-    *,
-    provenance_sha256: str,
-) -> None:
-    """Fail-closed validation immediately before spawning hardware workers.
-
-    Checks: hand-data attestation, provenance (source/config/models), and every
-    adjacent-frame pair for workspace and self-collision. Called once before
-    worker startup; any rejection prevents hardware access entirely.
-    """
-    require_hand_actions(trajectory)
-    if not bool(runtime.policy.hand_enabled):
-        raise ValueError("physical replay requires policy.hand_enabled=true")
-    _verify_trajectory_provenance(trajectory, provenance_sha256=provenance_sha256)
-    modeled_hand = modeled_hand_actions(trajectory)
-    workspace = np.array(
-        [
-            [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
-            [runtime.policy.workspace.y_min, runtime.policy.workspace.y_max],
-            [runtime.policy.workspace.z_min, runtime.policy.workspace.z_max],
-        ],
-        dtype=np.float64,
-    )
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf_path=str(XARM7_XHAND_SRDF_PATH),
-            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
-            workspace_bounds=workspace,
-        ),
-        hand_dof=True,
-        static_boxes=tuple(runtime.environment.static_boxes),
-        table=runtime.environment.table,
-    )
-    arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
-    for index in range(max(1, trajectory.num_frames - 1)):
-        start = min(index, trajectory.num_frames - 1)
-        end = min(index + 1, trajectory.num_frames - 1)
-        arm_start, arm_end = arm_actions[start], arm_actions[end]
-        hand_start, hand_end = modeled_hand[start], modeled_hand[end]
-        if not planner.is_workspace_segment_safe(arm_start, arm_end):
-            raise ValueError(
-                f"physical replay workspace rejection at transition {start}->{end}"
-            )
-        if not planner.collision_model.check_transition_collision_free(
-            arm_start, arm_end, hand_start, hand_end
-        ):
-            raise ValueError(
-                f"physical replay collision rejection at transition {start}->{end}"
-            )
 
 
 class ReplayStatus(str, Enum):
@@ -1589,28 +893,19 @@ def _offer_return_home(
                 assert replayer.planner is not None
                 replayer.planner.set_hand_qpos(hand_home)
 
-            arm_reached = send_arm_home(
+            home_result = execute_arm_home(
                 shared,
                 np.asarray(arm_config.home_qpos, dtype=np.float64),
                 planner=replayer.planner,
+                config=ArmHomeConfig.from_runtime(
+                    runtime,
+                    publish_policy_heartbeat=False,
+                ),
                 table_z_surface_m=float(runtime.arm.table_z_surface_m),
-                queue_timeout=float(runtime.arm.homing.request_queue_timeout_s),
-                converge_timeout_s=float(runtime.arm.homing.convergence_timeout_s),
-                state_max_age_s=float(runtime.arm.homing.state_max_age_s),
-                homing_max_speed_rad_s=float(
-                    np.deg2rad(runtime.arm.homing.max_speed_deg_s)
-                ),
-                homing_target_timeout_s=float(runtime.arm.homing.target_timeout_s),
-                preplan_velocity_rad_s=float(
-                    runtime.arm.homing.velocity_convergence_rad_s
-                ),
-                result_tolerance_rad=float(runtime.arm.homing.convergence_rad),
-                arm_heartbeat_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
                 estop_requested=lambda: keyboard.estop_latched or not keyboard.healthy,
-                heartbeat=False,
-                verbose=True,
+                progress=lambda message: print(f"  {message}", flush=True),
             )
-            if not arm_reached:
+            if not home_result.succeeded:
                 if shared.estop_request.value:
                     shared.error_state.value = True
                     require_transition(shared, SafetyState.FAULT)

@@ -1,7 +1,8 @@
-"""Transactional HDF5 v16 episode serialization.
+"""Transactional raw v18 episode serialization from owned ``EpisodeFrame`` rows.
 
-State, action, VR, and camera rows are written one-for-one on the policy grid.
-The recorder verifies all sidecars before atomically publishing an episode.
+State, action, VR, and camera rows are causally aligned to the policy grid.
+The recorder owns HDF5/video sidecars and verifies them before atomically
+publishing an episode; it neither reads shared memory nor controls hardware.
 """
 
 from __future__ import annotations
@@ -16,31 +17,33 @@ import tempfile
 import threading
 import time
 import weakref
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import h5py
+import h5py  # type: ignore[import-untyped]
 import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.defaults import camera
-from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
-from dexmani_real.recording.camera_stream_writer import CameraStreamWriter, CameraStreamWriterConfig
+from dexmani_real.recording.camera_stream_writer import (
+    CameraStreamWriter,
+    CameraStreamWriterConfig,
+)
+from dexmani_real.recording.episode_frame import EpisodeFrame, build_episode_frame
 from dexmani_real.recording.episode_schema import (
-    ARM_SENT_DATASET,
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
     SEMANTIC_META_ATTRS_V17,
-    normalize_diagnostics_v17,
     validate_data_layout_v17,
     validate_source_frame_keys_v17,
 )
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.recording.video_codec import VideoDecoder
+from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
@@ -67,7 +70,9 @@ def _flush_all_recorders() -> None:
             if not rec.join_stop(timeout=_PROCESS_EXIT_STOP_TIMEOUT_S):
                 logger.error("recorder did not finish before interpreter shutdown")
         except Exception:
-            logger.warning("recorder cleanup failed during interpreter shutdown", exc_info=True)
+            logger.warning(
+                "recorder cleanup failed during interpreter shutdown", exc_info=True
+            )
 
 
 atexit.register(_flush_all_recorders)
@@ -122,7 +127,9 @@ def _episode_quality_metrics(
         "observation_invalid_frame_count": int(np.count_nonzero(~observation_valid)),
         "sample_invalid_frame_count": int(np.count_nonzero(~sample_valid)),
         "safety_reject_frame_count": int(np.count_nonzero(safety_reject)),
-        "command_quiescence_count": int(np.count_nonzero(np.diff(timestamps) > (1.5 / control_hz))),
+        "command_quiescence_count": int(
+            np.count_nonzero(np.diff(timestamps) > (1.5 / control_hz))
+        ),
         **normalized_runtime_metrics,
     }
 
@@ -165,7 +172,6 @@ class EpisodeRecorder:
         if resolved_config_hash is None or len(resolved_config_hash) != 64:
             raise ValueError("EpisodeRecorder requires a resolved config SHA-256")
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
         self.min_frames = int(min_frames)
@@ -174,7 +180,9 @@ class EpisodeRecorder:
 
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
-        self._file: Any = None  # h5py.File | None — data.h5 (control streams + metadata)
+        self._file: Any = (
+            None  # h5py.File | None — data.h5 (control streams + metadata)
+        )
         self._camera_writer: CameraStreamWriter | None = None
         self._camera_writer_metrics: dict[str, float | int] = {}
         self._last_camera_payload: tuple[np.ndarray, np.ndarray] | None = None
@@ -233,7 +241,9 @@ class EpisodeRecorder:
                 raise ValueError(f"unknown runtime quality metric: {name!r}")
             count = int(value)
             if count < 0:
-                raise ValueError(f"runtime quality metric {name!r} must be non-negative")
+                raise ValueError(
+                    f"runtime quality metric {name!r} must be non-negative"
+                )
             normalized[name] = count
         self._runtime_quality_metrics = normalized
 
@@ -250,15 +260,6 @@ class EpisodeRecorder:
     def camera_writer_error(self) -> str | None:
         """Latched camera sidecar error requiring episode discard."""
         return self._camera_writer.error if self._camera_writer is not None else None
-
-    @staticmethod
-    def _build_action_ee(action) -> "np.ndarray":
-        """Build a (9,) array [eef_pos(3), eef_rot6d(6)] from a RobotAction."""
-        pos = action.target_eef_pos
-        rot6d = action.target_eef_rot6d
-        p = np.asarray(pos, dtype=np.float64) if pos is not None else np.full(3, np.nan)
-        r = np.asarray(rot6d, dtype=np.float64) if rot6d is not None else np.full(6, np.nan)
-        return np.concatenate([p, r])
 
     def start_episode(
         self,
@@ -280,12 +281,15 @@ class EpisodeRecorder:
                 )
                 self._stop_thread = None
             else:
-                logger.error("Previous episode still flushing — refusing to start a new one")
+                logger.error(
+                    "Previous episode still flushing — refusing to start a new one"
+                )
                 return False
 
         if self._recording:
             return False
 
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         ep_dir = self.data_dir / f"episode_{stamp}"
         tmp_dir = self.data_dir / f".tmp_episode_{stamp}"
@@ -306,7 +310,9 @@ class EpisodeRecorder:
         self._datasets = {}
         self._flushed_frames = 0
 
-        self._skip_initial_frames = max(0, min(int(skip_initial_frames), self.max_frames - 1))
+        self._skip_initial_frames = max(
+            0, min(int(skip_initial_frames), self.max_frames - 1)
+        )
         self._skipped_so_far = 0
         self._last_control_run_generation = None
 
@@ -341,7 +347,9 @@ class EpisodeRecorder:
         p = self._pending_meta
         meta.attrs["task_label"] = p.get("task_label", "")
         meta.attrs["operator"] = p.get("operator", "")
-        meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
+        meta.attrs["control_hz"] = (
+            self.control_hz
+        )  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
         if self._resolved_config_hash is not None:
             meta.attrs["resolved_config_sha256"] = self._resolved_config_hash
@@ -372,7 +380,13 @@ class EpisodeRecorder:
         meta.attrs["camera_encoding_height"] = self._camera_writer_config.rgb_shape[0]
         meta.attrs["camera_encoding_fps"] = self._camera_writer_config.fps
         meta.attrs["camera_health_taxonomy_json"] = json.dumps(
-            {"0": "OK", "1": "CLOCK_RESET", "2": "DUPLICATE", "3": "FRAME_GAP", "4": "BACKLOG"},
+            {
+                "0": "OK",
+                "1": "CLOCK_RESET",
+                "2": "DUPLICATE",
+                "3": "FRAME_GAP",
+                "4": "BACKLOG",
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -398,7 +412,9 @@ class EpisodeRecorder:
             meta.attrs["camera_serial"] = calib_meta.get("camera_serial", "")
             meta.attrs["camera_type"] = calib_meta.get("camera_type", "")
             if "camera_T_world_camera" in calib_meta:
-                meta.attrs["camera_T_world_camera"] = calib_meta["camera_T_world_camera"]
+                meta.attrs["camera_T_world_camera"] = calib_meta[
+                    "camera_T_world_camera"
+                ]
             if "camera_T_eef_camera" in calib_meta:
                 meta.attrs["camera_T_eef_camera"] = calib_meta["camera_T_eef_camera"]
 
@@ -414,166 +430,70 @@ class EpisodeRecorder:
 
     def add_frame(
         self,
-        state,
-        action,
-        vr_frame: dict[str, Any],
-        camera_frame: dict[str, Any] | None = None,
-        signals: dict[str, Any] | None = None,
+        state: RobotState,
+        action: RobotAction,
+        vr_frame: Mapping[str, object],
+        camera_frame: Mapping[str, object] | None = None,
+        signals: Mapping[str, object] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
-        diagnostics: dict[str, Any] | None = None,
+        diagnostics: Mapping[str, object] | None = None,
         control_run_generation: int = 0,
     ) -> bool:
+        """Compatibility adapter from component inputs to :class:`EpisodeFrame`."""
+        if not self._accept_source_frame():
+            return False
+        frame = build_episode_frame(
+            state,
+            action,
+            vr_frame,
+            camera_frame=camera_frame,
+            signals=signals,
+            arm_qpos_sent=arm_qpos_sent,
+            diagnostics=diagnostics,
+            control_run_generation=control_run_generation,
+            arm_sent_stream=self.arm_sent_stream,
+        )
+        return self._add_episode_frame(frame)
+
+    def add_episode_frame(self, frame: EpisodeFrame) -> bool:
+        """Align and serialize one already-normalized recording frame."""
+        if not self._accept_source_frame():
+            return False
+        return self._add_episode_frame(frame)
+
+    def _accept_source_frame(self) -> bool:
+        """Apply lifecycle, capacity, and initial-skip admission policy."""
         if not self._recording or self._buffer is None:
             return False
 
         if self._frame_count >= self.max_frames:
-            logger.warning("Episode reached max_frames=%d, auto-stopping.", self.max_frames)
+            logger.warning(
+                "Episode reached max_frames=%d, auto-stopping.", self.max_frames
+            )
             self._max_frames_reached = True
             return False
 
         if self._skipped_so_far < self._skip_initial_frames:
             self._skipped_so_far += 1
             return False
+        return True
 
-        sig = signals or {}
-        diagnostic_values = normalize_diagnostics_v17(diagnostics)
-
-        ts = float(state.timestamp)
-        run_generation = int(control_run_generation)
-        if run_generation < 0:
-            raise ValueError("control_run_generation must be non-negative")
+    def _add_episode_frame(self, frame: EpisodeFrame) -> bool:
+        """Write an admitted typed frame to the aligned control grid."""
+        assert self._buffer is not None
+        ts = frame.timestamp_s
+        run_generation = frame.control_run_generation
         # The first source and each quiescence boundary start a wall-time segment.
-        if self._last_control_run_generation is None or run_generation != self._last_control_run_generation:
+        if (
+            self._last_control_run_generation is None
+            or run_generation != self._last_control_run_generation
+        ):
             self._buffer.reanchor(ts)
 
-        camera_health = int(camera_frame.get("camera_health", 1)) if camera_frame is not None else 1
-        camera_fresh = bool(camera_frame.get("camera_fresh", False)) if camera_frame is not None else False
-
-        data: dict[str, np.ndarray | float] = {
-            "arm_qpos": np.asarray(state.arm_qpos, dtype=np.float64),
-            "arm_ee": np.concatenate([state.eef_pos, state.eef_rot6d]).astype(np.float64),
-            "arm_qvel": np.asarray(state.arm_qvel, dtype=np.float64),
-            "arm_tau": np.asarray(state.arm_tau, dtype=np.float64),
-            "hand_qpos": np.asarray(state.hand_qpos, dtype=np.float64),
-            "hand_fingertip": np.asarray(state.fingertip_pos, dtype=np.float64),
-            "hand_contact": np.asarray(state.hand_tactile_sum, dtype=np.float64),
-            "hand_tactile_force": np.asarray(state.hand_tactile_force, dtype=np.float64),
-            "hand_tactile_contact": np.asarray(state.hand_tactile_contact, dtype=bool),
-            "hand_tipboard_err": np.asarray(state.hand_tipboard_err, dtype=np.int32),
-            "hand_commboard_err": np.asarray(state.hand_commboard_err, dtype=np.int32),
-            "hand_jointboard_err": np.asarray(state.hand_jointboard_err, dtype=np.int32),
-            "hand_current": (
-                np.asarray(state.hand_current, dtype=np.float64)
-                if state.hand_current is not None
-                else np.full(HAND_JOINT_SHAPE, np.nan)
-            ),
-            "arm_connected": bool(state.arm_connected),
-            "hand_connected": bool(state.hand_connected),
-            "hand_qpos_stale": bool(state.hand_qpos_stale),
-            "hand_error_state": bool(state.hand_error_state),
-            "arm_last_cmd_seq": int(state.arm_last_cmd_seq),
-            "arm_last_cmd_is_hold": bool(state.arm_last_cmd_is_hold),
-            "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
-            "action_arm_ee": self._build_action_ee(action),
-            "action_hand_joint": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
-            "observation_id": int(sig.get("observation_id", 0)),
-            "observation_anchor_monotonic_ns": int(sig.get("observation_anchor_monotonic_ns", 0)),
-            "arm_source_sequence": int(sig.get("arm_source_sequence", 0)),
-            "hand_source_sequence": int(sig.get("hand_source_sequence", 0)),
-            "vr_source_sequence": int(sig.get("vr_source_sequence", 0)),
-            "camera_source_sequence": int(sig.get("camera_source_sequence", 0)),
-            "arm_source_monotonic_ns": int(sig.get("arm_source_monotonic_ns", 0)),
-            "hand_source_monotonic_ns": int(sig.get("hand_source_monotonic_ns", 0)),
-            "vr_source_monotonic_ns": int(sig.get("vr_source_monotonic_ns", 0)),
-            "camera_source_monotonic_ns": int(
-                sig.get(
-                    "camera_source_monotonic_ns",
-                    camera_frame.get("source_monotonic_ns", 0) if camera_frame is not None else 0,
-                )
-            ),
-            "arm_publish_monotonic_ns": int(sig.get("arm_publish_monotonic_ns", 0)),
-            "hand_publish_monotonic_ns": int(sig.get("hand_publish_monotonic_ns", 0)),
-            "vr_publish_monotonic_ns": int(sig.get("vr_publish_monotonic_ns", 0)),
-            "camera_publish_monotonic_ns": int(
-                sig.get(
-                    "camera_publish_monotonic_ns",
-                    camera_frame.get("publish_monotonic_ns", 0) if camera_frame is not None else 0,
-                )
-            ),
-            "observation_source_receive_monotonic_ns": np.asarray(
-                sig.get("observation_source_receive_monotonic_ns", np.zeros(4)), dtype=np.uint64
-            ),
-            "observation_source_age_s": np.asarray(
-                sig.get("observation_source_age_s", np.full(4, np.nan)), dtype=np.float64
-            ),
-            "observation_source_skew_s": np.asarray(
-                sig.get("observation_source_skew_s", np.full(4, np.nan)), dtype=np.float64
-            ),
-            "observation_history_valid_mask": np.asarray(
-                sig.get("observation_history_valid_mask", np.zeros((4, 1), dtype=bool)), dtype=bool
-            ),
-            "observation_valid": bool(sig.get("observation_valid", False)),
-            "observation_skew_s": float(sig.get("observation_skew_s", np.nan)),
-            "action_id": int(sig.get("action_id", 0)),
-            "action_created_monotonic_ns": int(sig.get("action_created_monotonic_ns", 0)),
-            "action_target_monotonic_ns": int(sig.get("action_target_monotonic_ns", 0)),
-            "action_valid_until_monotonic_ns": int(sig.get("action_valid_until_monotonic_ns", 0)),
-            "action_arm_joint_raw": np.asarray(sig.get("action_arm_joint_raw", action.arm_qpos_cmd), dtype=np.float64),
-            "flag_action_queued": bool(sig.get("action_queued", False)),
-            "tactile_fresh": bool(sig.get("tactile_fresh", False)),
-            "tactile_source_monotonic_ns": int(sig.get("tactile_source_monotonic_ns", 0)),
-            "tactile_calibrated": bool(sig.get("tactile_calibrated", False)),
-            "tactile_unit_code": int(sig.get("tactile_unit_code", 0)),
-            "pointcloud_valid_depth_ratio": float(sig.get("pointcloud_valid_depth_ratio", np.nan)),
-            "flag_ik_ok": bool(sig.get("ik_ok", False)),
-            "flag_ik_attempted": bool(sig.get("ik_attempted", True)),  # default True: normal frames
-            "flag_retarget_ok": bool(sig.get("retarget_ok", False)),
-            "flag_held": bool(sig.get("held", False)),
-            "flag_safety_reject": bool(sig.get("flag_safety_reject", False)),
-            "camera_health": camera_health,
-            "flag_camera_fresh": camera_fresh,
-            "camera_frame_number": int(camera_frame.get("frame_number", 0)) if camera_frame is not None else 0,
-            "camera_ring_sequence": int(camera_frame.get("ring_sequence", 0)) if camera_frame is not None else 0,
-            "camera_device_timestamp_s": (
-                float(camera_frame.get("device_timestamp_s", np.nan)) if camera_frame is not None else np.nan
-            ),
-            "camera_capture_monotonic_s": (
-                float(camera_frame.get("capture_monotonic_s", np.nan)) if camera_frame is not None else np.nan
-            ),
-            "camera_age_s": float(camera_frame.get("camera_age_s", np.nan)) if camera_frame is not None else np.nan,
-            "camera_generation": int(camera_frame.get("camera_generation", 0)) if camera_frame is not None else 0,
-            "camera_clock_reset": bool(camera_frame.get("clock_reset", False)) if camera_frame is not None else False,
-            "camera_duplicate": bool(camera_frame.get("duplicate", False)) if camera_frame is not None else False,
-            "camera_frame_gap": int(camera_frame.get("frame_gap", 0)) if camera_frame is not None else 0,
-            "camera_backlog_s": (float(camera_frame.get("backlog_s", np.nan)) if camera_frame is not None else np.nan),
-            # 0=ok, 1=held (gate reject), 2=ik_fail, 3=safety_reject
-            "flag_frame_status": int(sig.get("frame_status", 0)),
-            "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
-            "vr_wrist_rot6d": quat_wxyz_to_rot6d(np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)),
-            "vr_landmarks": np.asarray(vr_frame["landmarks"], dtype=np.float64),
-            "tracking_error": np.nan,
-            "ik_solve_time_ms": np.nan,
-            "target_pos_before_clamp": np.full(3, np.nan),
-            "head_quat_wxyz": np.full(4, np.nan),
-            "target_eef_pos_raw": np.full(3, np.nan),
-            "target_eef_rot6d_raw": np.full(6, np.nan),
-            "action_hand_joint_raw": np.asarray(action.hand_qpos_cmd, dtype=np.float64),
-            "policy_map_time_ms": np.nan,
-            "hand_retarget_time_ms": np.nan,
-            "transition_check_time_ms": np.nan,
-            "policy_compute_time_ms": np.nan,
-        }
-        if self.arm_sent_stream:
-            sent = (
-                np.asarray(arm_qpos_sent, dtype=np.float64)
-                if arm_qpos_sent is not None
-                else np.full(ARM_JOINT_SHAPE, np.nan)
-            )
-            data[ARM_SENT_DATASET] = sent
-
-        # Diagnostics override fixed-schema fields; unknown keys are rejected.
-        data.update(diagnostic_values)
-        source_layout_errors = validate_source_frame_keys_v17(set(data), arm_sent_stream=self.arm_sent_stream)
+        data = frame.data
+        source_layout_errors = validate_source_frame_keys_v17(
+            set(data), arm_sent_stream=self.arm_sent_stream
+        )
         if source_layout_errors:
             raise RuntimeError(
                 "episode source frame mismatch: " + "; ".join(source_layout_errors)
@@ -589,79 +509,108 @@ class EpisodeRecorder:
 
         # A live camera observation may cross skipped deadlines; only its causal slot is fresh.
         if k > 0:
-            new_slice = slice(prev_size, self._buffer.size)
-            source_valid = np.asarray(self._buffer.data["flag_sample_valid"][new_slice], dtype=bool)
-            # Use the policy's exact monotonic grid deadline from state.timestamp.
-            grid_anchor_ns = np.rint(self._buffer.timestamps[new_slice] * 1e9).astype(np.uint64)
-            self._buffer.data["observation_anchor_monotonic_ns"][new_slice] = grid_anchor_ns
-            history_valid = np.asarray(self._buffer.data["observation_history_valid_mask"][new_slice, :, 0], dtype=bool)
-            source_monotonic_ns = np.column_stack(
-                [
-                    self._buffer.data[f"{name}_source_monotonic_ns"][new_slice]
-                    for name in ("arm", "hand", "vr", "camera")
-                ]
-            ).astype(np.uint64)
-            source_age_s = np.full(history_valid.shape, np.nan, dtype=np.float64)
-            causal = history_valid & (source_monotonic_ns <= grid_anchor_ns[:, None])
-            source_age_delta_ns = grid_anchor_ns[:, None].astype(np.float64) - source_monotonic_ns.astype(np.float64)
-            source_age_s[causal] = source_age_delta_ns[causal] / 1e9
-            self._buffer.data["observation_source_age_s"][new_slice] = source_age_s
-            self._buffer.data["observation_valid"][new_slice] &= source_valid
-            self._buffer.data["tactile_fresh"][new_slice] &= source_valid
-            self._buffer.data["flag_camera_fresh"][new_slice] &= source_valid
-            # Synthetic slots inherit the effective target but do not claim a send.
-            hold_slots = ~source_valid
-            self._buffer.data["flag_action_queued"][new_slice] &= source_valid
-            for name in (
-                "action_id",
-                "action_created_monotonic_ns",
-                "action_target_monotonic_ns",
-                "action_valid_until_monotonic_ns",
-            ):
-                self._buffer.data[name][new_slice][hold_slots] = 0
+            self._update_aligned_causality(slice(prev_size, self._buffer.size))
 
         if self._buffer.size - self._flushed_frames >= self._flush_interval:
             self._ensure_hdf5()
             self._flush_buffered()
 
         if k > 0:
-            current_payload = self._camera_payload(camera_frame)
-            zero_payload = self._camera_payload(None)
-            writer = self._camera_writer
-            if writer is None:
-                logger.error("EpisodeRecorder: camera writer missing during add_frame")
+            if not self._submit_aligned_camera_frames(frame, prev_size):
                 return False
-            sample_valid_slots = self._buffer.data["flag_sample_valid"][prev_size : self._buffer.size]
-            for sample_valid_slot in sample_valid_slots:
-                if sample_valid_slot:
-                    payload = current_payload
-                    self._last_camera_payload = (
-                        np.array(current_payload[0], copy=True),
-                        np.array(current_payload[1], copy=True),
-                    )
-                else:
-                    payload = self._last_camera_payload or zero_payload
-                rgb, depth = payload
-                if not writer.submit(rgb, depth):
-                    return False
 
         if add_result.capacity_reached:
             self._max_frames_reached = True
-            logger.info("Episode reached max_frames=%d after aligned camera submission", self.max_frames)
+            logger.info(
+                "Episode reached max_frames=%d after aligned camera submission",
+                self.max_frames,
+            )
             return False
         return True
 
-    def _camera_payload(self, camera_frame: dict[str, Any] | None) -> tuple[np.ndarray, np.ndarray]:
+    def _update_aligned_causality(self, new_slice: slice) -> None:
+        """Recompute causal metadata for source and synthetic grid slots."""
+        assert self._buffer is not None
+        buffer_data = self._buffer.data
+        source_valid = np.asarray(
+            buffer_data["flag_sample_valid"][new_slice], dtype=bool
+        )
+        grid_anchor_ns = np.rint(self._buffer.timestamps[new_slice] * 1e9).astype(
+            np.uint64
+        )
+        buffer_data["observation_anchor_monotonic_ns"][new_slice] = grid_anchor_ns
+        history_valid = np.asarray(
+            buffer_data["observation_history_valid_mask"][new_slice, :, 0],
+            dtype=bool,
+        )
+        source_monotonic_ns = np.column_stack(
+            [
+                buffer_data[f"{name}_source_monotonic_ns"][new_slice]
+                for name in ("arm", "hand", "vr", "camera")
+            ]
+        ).astype(np.uint64)
+        source_age_s = np.full(history_valid.shape, np.nan, dtype=np.float64)
+        causal = history_valid & (source_monotonic_ns <= grid_anchor_ns[:, None])
+        age_delta_ns = grid_anchor_ns[:, None].astype(
+            np.float64
+        ) - source_monotonic_ns.astype(np.float64)
+        source_age_s[causal] = age_delta_ns[causal] / 1e9
+        buffer_data["observation_source_age_s"][new_slice] = source_age_s
+        buffer_data["observation_valid"][new_slice] &= source_valid
+        buffer_data["tactile_fresh"][new_slice] &= source_valid
+        buffer_data["flag_camera_fresh"][new_slice] &= source_valid
+
+        # Synthetic slots inherit the effective target but do not claim a send.
+        hold_slots = ~source_valid
+        buffer_data["flag_action_queued"][new_slice] &= source_valid
+        for name in (
+            "action_id",
+            "action_created_monotonic_ns",
+            "action_target_monotonic_ns",
+            "action_valid_until_monotonic_ns",
+        ):
+            buffer_data[name][new_slice][hold_slots] = 0
+
+    def _submit_aligned_camera_frames(
+        self, frame: EpisodeFrame, previous_size: int
+    ) -> bool:
+        """Submit one payload per newly materialized causal grid slot."""
+        assert self._buffer is not None
+        writer = self._camera_writer
+        if writer is None:
+            logger.error("EpisodeRecorder: camera writer missing during add_frame")
+            return False
+        current_payload = self._camera_payload(frame)
+        zero_payload = self._camera_payload(None)
+        sample_valid_slots = self._buffer.data["flag_sample_valid"][
+            previous_size : self._buffer.size
+        ]
+        for sample_valid in sample_valid_slots:
+            if sample_valid:
+                payload = current_payload
+                self._last_camera_payload = (
+                    np.array(current_payload[0], copy=True),
+                    np.array(current_payload[1], copy=True),
+                )
+            else:
+                payload = self._last_camera_payload or zero_payload
+            if not writer.submit(*payload):
+                return False
+        return True
+
+    def _camera_payload(
+        self, frame: EpisodeFrame | None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return shape-stable camera arrays, using explicit zero placeholders."""
         cfg = self._camera_writer_config
-        if camera_frame is None:
+        if frame is None:
             return (
                 np.zeros(cfg.rgb_shape, dtype=np.uint8),
                 np.zeros(cfg.depth_shape, dtype=np.uint16),
             )
 
-        rgb = camera_frame.get("rgb")
-        depth = camera_frame.get("depth")
+        rgb = frame.camera_rgb
+        depth = frame.camera_depth
         if rgb is None:
             rgb = np.zeros(cfg.rgb_shape, dtype=np.uint8)
         if depth is None:
@@ -799,7 +748,9 @@ class EpisodeRecorder:
         if t.is_alive():
             t.join(timeout=timeout)
             if t.is_alive():
-                logger.warning("episode-stop still flushing after %.0fs — keeping handle", timeout)
+                logger.warning(
+                    "episode-stop still flushing after %.0fs — keeping handle", timeout
+                )
                 return False
         ok = self._stop_error is None
         if self._stop_error is not None:
@@ -848,7 +799,11 @@ class EpisodeRecorder:
         return result
 
     def _stop_episode_impl(
-        self, success: bool, reason: str, truncated: bool, runtime_quality_metrics: dict[str, int]
+        self,
+        success: bool,
+        reason: str,
+        truncated: bool,
+        runtime_quality_metrics: dict[str, int],
     ) -> None:
         """Background: finalize sidecars, flush buffers, write metadata, and publish.
 
@@ -857,25 +812,36 @@ class EpisodeRecorder:
         or announcing a truncated episode.
         """
         try:
-            self._stop_episode_impl_inner(success, reason, truncated, runtime_quality_metrics)
+            self._stop_episode_impl_inner(
+                success, reason, truncated, runtime_quality_metrics
+            )
         except Exception as exc:
             self._stop_error = f"{type(exc).__name__}: {exc}"
-            logger.error("stop_episode failed: %s — HDF5 may be truncated", self._stop_error)
+            logger.error(
+                "stop_episode failed: %s — HDF5 may be truncated", self._stop_error
+            )
             try:
                 self._write_aborted_manifest(reason=reason, error=self._stop_error)
             except Exception:
-                logger.error("failed to publish aborted episode manifest", exc_info=True)
+                logger.error(
+                    "failed to publish aborted episode manifest", exc_info=True
+                )
             try:
                 if self._camera_writer is not None:
                     self._camera_writer.close(timeout=5.0)
             except Exception:
-                logger.warning("camera writer cleanup failed after episode stop error", exc_info=True)
+                logger.warning(
+                    "camera writer cleanup failed after episode stop error",
+                    exc_info=True,
+                )
             self._camera_writer = None
             try:
                 if self._file is not None:
                     self._file.close()
             except Exception:
-                logger.warning("HDF5 cleanup failed after episode stop error", exc_info=True)
+                logger.warning(
+                    "HDF5 cleanup failed after episode stop error", exc_info=True
+                )
             self._file = None
         finally:
             # Always clean up the temp directory and reset state after stopping.
@@ -885,7 +851,11 @@ class EpisodeRecorder:
             self._reset_episode_state()
 
     def _stop_episode_impl_inner(
-        self, success: bool, reason: str, truncated: bool, runtime_quality_metrics: dict[str, int]
+        self,
+        success: bool,
+        reason: str,
+        truncated: bool,
+        runtime_quality_metrics: dict[str, int],
     ) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
         can reset state on any exception without duplicating the reset list."""
@@ -904,7 +874,9 @@ class EpisodeRecorder:
         self._ensure_hdf5()
 
         if camera_frame_count != buf_size:
-            raise RuntimeError(f"camera/control grid length mismatch: camera={camera_frame_count}, control={buf_size}")
+            raise RuntimeError(
+                f"camera/control grid length mismatch: camera={camera_frame_count}, control={buf_size}"
+            )
 
         self._buffer = None
         self._frame_count = buf_size
@@ -932,7 +904,9 @@ class EpisodeRecorder:
             meta.attrs["num_frames"] = self._frame_count
             meta.attrs["success"] = success
             meta.attrs["fps"] = self.control_hz
-            meta.attrs["wall_fps"] = self._frame_count / duration if duration > 0 else self.control_hz
+            meta.attrs["wall_fps"] = (
+                self._frame_count / duration if duration > 0 else self.control_hz
+            )
             meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
             meta.attrs["has_camera"] = _had_rgb
             meta.attrs["has_timestamps"] = "timestamp" in self._datasets
@@ -943,7 +917,9 @@ class EpisodeRecorder:
             for metric_name, metric_value in quality_metrics.items():
                 meta.attrs[metric_name] = int(metric_value)
             meta.attrs["truncated"] = bool(truncated)
-            meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
+            meta.attrs["stop_reason"] = reason or (
+                "max_frames" if truncated else "manual"
+            )
             # Backfill camera metadata if the child connected after the lazy write.
             self._write_camera_meta_attrs(meta)
 
@@ -1016,10 +992,18 @@ class EpisodeRecorder:
             "created_wall_time_ns": time.time_ns(),
             "resolved_config_sha256": self._resolved_config_hash or "",
         }
-        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=self.data_dir)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.tmp-", dir=self.data_dir
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                json.dump(
+                    payload,
+                    stream,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
                 stream.flush()
                 os.fsync(stream.fileno())
             os.rename(temp_name, target)
@@ -1078,7 +1062,9 @@ class EpisodeRecorder:
         with VideoDecoder(paths["rgb"]) as decoder:
             decoded_frames = decoder.count_decoded_frames()
             if decoded_frames != expected_frames:
-                raise RuntimeError(f"RGB decoded frame count {decoded_frames} != {expected_frames}")
+                raise RuntimeError(
+                    f"RGB decoded frame count {decoded_frames} != {expected_frames}"
+                )
         for path in paths.values():
             fd = os.open(path, os.O_RDONLY)
             try:

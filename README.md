@@ -24,13 +24,13 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 目标 | 入口 | 主要实现 |
 |---|---|---|
 | 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md) |
-| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py) |
+| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py) |
-| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py) |
-| raw episode 读取/录制 | — | [`recording/episode_reader.py`](dexmani_real/recording/episode_reader.py)、[`recording/episode_recorder.py`](dexmani_real/recording/episode_recorder.py) |
+| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/replay_trajectory.py`](dexmani_real/robot/replay_trajectory.py)、[`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py)、[`robot/replay_evaluation.py`](dexmani_real/robot/replay_evaluation.py) |
+| raw episode 读取/录制 | — | [`recording/episode_frame.py`](dexmani_real/recording/episode_frame.py)、[`recording/episode_recorder.py`](dexmani_real/recording/episode_recorder.py)、[`recording/episode_reader.py`](dexmani_real/recording/episode_reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data_processing/`](dexmani_real/data_processing) |
 | learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
-| 相机、点云与 VR 标定 | [`examples/`](examples) | [`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
+| 相机、点云与 VR 标定 | [`examples/`](examples) | [`sensor/camera_calibration.py`](dexmani_real/sensor/camera_calibration.py)、[`sensor/camera_calibration_session.py`](dexmani_real/sensor/camera_calibration_session.py)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 
 完整的逐文件职责见 [`repo_map.md`](repo_map.md)。
 
@@ -70,6 +70,20 @@ RealSense / Quest-HTS / xArm7 / XHand
 - Recorder 只持久化选定的固定网格样本，不拥有机器人控制。
 - `run_generation`、freshness、heartbeat、safety state 与 worker 侧检查共同使
   暂停、回零或故障前的旧命令失效。
+
+### 控制与录制边界
+
+- [`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) 只计算并限幅
+  EEF、arm 与 hand proposal；它不发布命令、不访问 shared memory，也不写录制数据。
+- [`teleop/loop.py`](dexmani_real/teleop/loop.py) 在 pause、VR/hand feedback 异常、
+  BEGIN audio gate 或录制终结时进入 command-quiescence。恢复发布前必须用边界之后的
+  arm、VR 和已启用 hand feedback 重新锚定，期间不发布任何命令。
+- RecorderIO 从 fixed-size shared-memory record 解码为不可变、拥有自身数组副本的
+  `EpisodeFrame`；它拥有 HDF5/video 写入、sidecar 验证和有界 transaction finalize，
+  但不拥有机器人命令或 episode 的开始/停止决策。
+- 相机标定的纯 ArUco/hand-eye 计算在
+  [`sensor/camera_calibration.py`](dexmani_real/sensor/camera_calibration.py)；设备、GUI
+  和 cleanup 只由 `camera_calibration_session.py` 持有。
 
 ## 环境
 
@@ -111,7 +125,7 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 预检后控制 xArm7/XHand；写 `results/` |
 | learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator |
-| 相机标定 | `python examples/calibrate_camera.py` | 连接 xArm/RealSense；更新相机标定 |
+| 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 诊断 | `python examples/realsense_record_example.py` | 打开相机与 GUI |
 | 点云/桌面平面诊断 | `python examples/pointcloud_process_example.py` | 打开相机与 GUI；确认后写桌面平面 |
@@ -120,6 +134,9 @@ python examples/collect_teleop.py --print-config
 支持 argparse 的入口应先用 `--help` 查看当前参数；
 `examples/xhand_control_example.py` 没有 `--help` 模式，执行即进入硬件流程。
 不要从旧文档复制硬件地址或运动参数。
+
+相机标定的 `--hand-geometry` 是物理事实声明：未安装 XHand 时使用 `absent`；已安装时，
+只有在它实际固定于配置的 home 姿态时才能使用 `secured-home`。它不绕过碰撞检查。
 
 ### 离线数据工作流
 
